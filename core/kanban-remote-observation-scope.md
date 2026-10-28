@@ -51,6 +51,14 @@ Files above. Tests listed next.
 
 Do not widen observation scope back to descendants: it inflates counts and makes shepherds claim dependency work.
 
+**Ghost links (0543).** The remembered remote-link snapshot used to keep a (session, card) pair forever once the
+replica stopped carrying that link, so a chat whose link was dropped on the owner kept showing the card. Now
+`_read_remote_links(..., owners_out=)` collects every (gateway, board, card) whose owner row a FRESH replica carries;
+`_legacy_remote_links` drops a remembered pair whose card is in that set but whose link is gone. A stale replica, or
+one missing the owner row, still keeps the remembered pair (unknown is not "unlinked"). Tests:
+`test_kanban_remote_inventory_cache.py::test_dropped_link_on_fresh_replica_expires_ghost`,
+`::test_missing_owner_keeps_stale_ghost`.
+
 ## Plugin?
 
 No: core projection and Desktop store code.

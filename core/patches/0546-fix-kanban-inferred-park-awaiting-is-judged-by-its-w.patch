@@ -1,0 +1,280 @@
+From ca802186f125ab6d3cbac7f38617f0c14e443459 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:50:34 +0000
+Subject: [PATCH] fix(kanban): inferred park awaiting is judged by its wake
+ mechanism; trackers don't re-wake for a handled status [daveey]
+
+Review fixes for owner wake / visible waits:
+- kanban_wait_info.describe: main's "no producer, no park" records an inferred awaiting on every park
+  ({kind: clock, inferred} for a plain schedule/continuation). An inferred clock/external guess now falls through to
+  the wake_check / wake_at logic (a continuation checkpoint is a clock wait, not "no producer"); a declared clock
+  window is a live producer; awaiting.gateway is in the label and the premise.
+- wait-check: implicit --from. Run as a dispatcher probe (HERMES_KANBAN_TASK/HERMES_KANBAN_DB), a task check is not
+  met while the target still sits in the status the waiter's last condition_met already reported, so a tracker
+  re-parked after handling review/triage/parked-agent waits for the next change instead of waking every interval.
+- parked_waits: a failed remote read skips remote cards (logged) instead of dropping the whole owner-wake tick.
+- remote stalled counts use the same status test as parked (a legacy unknown row is never stalled).
+---
+ hermes_cli/kanban_session_activity.py     | 14 ++++-
+ hermes_cli/kanban_wait_check.py           | 33 +++++++++++
+ hermes_cli/kanban_wait_info.py            | 35 +++++++++---
+ tests/hermes_cli/test_kanban_wait_info.py | 69 +++++++++++++++++++++++
+ 4 files changed, 140 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index ac6d293454..07810d03ab 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1069,7 +1069,9 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         # replicated todo waits on a parent (parked). Held needs those links, so remote cards are never held.
+         if bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo"):
+             parked[sid] = parked.get(sid, 0) + 1
+-        if (_remote_wait(card) or {}).get("wait_state") == "stalled":
++        # Same status test as parked/blocked above: a legacy row whose live status is unknown (reported_status is
++        # only its last report) is never counted stalled, so stalled can't exceed what the row shows parked.
++        if card.get("status") != "unknown" and (_remote_wait(card) or {}).get("wait_state") == "stalled":
+             stalled[sid] = stalled.get(sid, 0) + 1
+         if card.get("stale"):
+             stale[sid] = stale.get(sid, 0) + 1
+@@ -1192,7 +1194,8 @@ def parked_waits(now: float | None = None) -> list[dict[str, Any]]:
+     """[daveey] Every parked card a session created or shepherds, local and on other gateways, with its wait info
+     (``kanban_wait_info``): ``{session, id, board, key, title, remote, gateway, wait}``. For the owner wake (the
+     chat-closeout plugin), which starts a supervise turn in the owning chat when a card parks for an agent-owned
+-    reason. Local read failures skip that board; a failed remote read propagates (unknown is not "none")."""
++    reason. Local read failures skip that board; a failed remote read skips the remote cards for this
++    call (logged), so the local cards still wake."""
+     out: list[dict[str, Any]] = []
+     for path in _board_db_paths():
+         try:
+@@ -1218,7 +1221,12 @@ def parked_waits(now: float | None = None) -> list[dict[str, Any]]:
+             if tid in info:
+                 out.append({"session": sid, "id": tid, "board": board, "key": f"{board}/{tid}",
+                             "title": titles.get(tid, ""), "remote": False, "gateway": None, "wait": info[tid]})
+-    for card in _remote_links():
++    try:
++        remote = _remote_links()
++    except Exception as exc:
++        _log.warning("kanban parked waits: remote links unreadable, local cards only this pass: %s", exc)
++        remote = []
++    for card in remote:
+         if card.get("stale"):
+             continue
+         wait = _remote_wait(card)
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index 924c4cd28f..78f239fbb3 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -11,6 +11,7 @@ never gets re-split by a remote shell.
+ """
+ from __future__ import annotations
+ 
++import json
+ import os
+ import shlex
+ import sqlite3
+@@ -113,9 +114,41 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+     return 2, f"error: remote wait-check on {host} exited {p.returncode}: {out[-300:]}"
+ 
+ 
++def handled_status(waiter: Optional[str], db_path: Optional[str], target: str) -> Optional[str]:
++    """The target status this probe's waiter already woke for: the newest ``condition_met`` on the waiter whose probe
++    names ``target`` and whose output read ``<target> <status>``. A tracker that handled that wake and re-parked
++    with the same probe must not be met again while the target still sits in that status (review or triage can
++    last hours; each probe run would wake it again). Read from the probe env the dispatcher sets
++    (``HERMES_KANBAN_TASK`` = the waiter, ``HERMES_KANBAN_DB`` = its board); None outside a probe or on any error."""
++    if not (waiter and db_path and target):
++        return None
++    try:
++        rows = _query(Path(db_path), "select payload from task_events where task_id=? and kind='condition_met' "
++                                     "order by id desc limit 5", (waiter,))
++    except Exception:
++        return None
++    for (raw,) in rows:
++        try:
++            payload = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        if target not in str(payload.get("wake_check") or ""):
++            continue
++        for line in str(payload.get("output") or "").splitlines():
++            words = line.split()
++            if len(words) >= 2 and words[0] == target:
++                return words[1]
++        return None
++    return None
++
++
+ def run(args) -> int:
+     until = tuple(u for u in (args.until or "").split(",") if u) or DEFAULT_UNTIL
+     since = tuple(u for u in (getattr(args, "since", None) or "").split(",") if u)
++    if not since and args.check == "task":
++        # Implicit --from: the status the waiter already handled (see handled_status).
++        seen = handled_status(os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_DB"), args.target)
++        since = (seen,) if seen else ()
+     gw = getattr(args, "gateway", None)
+     if args.check == "capability-owner":
+         # Owner cards live on another gateway; the hermes-hub replica on THIS gateway is the
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index 609de3f682..1a573b9518 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -76,13 +76,24 @@ def _json(value: Any) -> Any:
+     return value
+ 
+ 
+-def parse_awaiting(value: Any) -> Optional[dict[str, str]]:
+-    """A valid ``awaiting`` object (kind + ref + why strings) or None."""
++def parse_awaiting(value: Any) -> Optional[dict[str, Any]]:
++    """A valid ``awaiting`` object (kind, ref, why, gateway strings; ``inferred`` when core guessed it from the park's
++    text rather than the parker declaring it) or None."""
+     data = _json(value)
+     if not isinstance(data, dict) or not isinstance(data.get("kind"), str):
+         return None
+     return {"kind": data["kind"].strip().lower(), "ref": str(data.get("ref") or "").strip(),
+-            "why": str(data.get("why") or "").strip()}
++            "why": str(data.get("why") or "").strip(), "gateway": str(data.get("gateway") or "").strip(),
++            "inferred": bool(data.get("inferred"))}
++
++
++def _awaiting_label(awaited: dict[str, Any]) -> str:
++    where = f" on {awaited['gateway']}" if awaited.get("gateway") else ""
++    return f"{awaited['kind']} {awaited['ref']}{where}"
++
++
++def _clock_label(wake_at: float) -> str:
++    return "the clock until " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(wake_at))
+ 
+ 
+ def producer_from_wake_check(cmd: Any) -> Optional[tuple[str, str]]:
+@@ -127,7 +138,8 @@ def premise_key(kind: str, status: str, reason: Any = "", awaiting: Optional[dic
+     """Stable id of WHY a card waits: structured fields first (kind, status, reason code, awaiting kind/ref); the
+     free-text reason only when nothing structured names it."""
+     structured = [kind, status, str(reason_code or ""),
+-                  [awaiting.get("kind"), _norm(awaiting.get("ref"))] if awaiting else None]
++                  [awaiting.get("kind"), _norm(awaiting.get("ref")), awaiting.get("gateway") or ""]
++                  if awaiting else None]
+     text = "" if (reason_code or awaiting) else _norm(reason)
+     basis = json.dumps([structured, text], sort_keys=True)
+     return f"{kind}:{hashlib.sha1(basis.encode()).hexdigest()[:12]}"
+@@ -184,12 +196,21 @@ def describe(status: Any, *, block_kind: Any = None, human: bool = False, park:
+             # needs_input (or another human kind) without a validated ask: the user's move, just not visible.
+             return out(f"blocked:{kind}", f"an unvalidated ask ({kind})", False)
+     # scheduled, or blocked kind=time: a park. Who produces what it waits for?
++    wake_at = epoch_s(payload.get("wake_at"))
++    if awaited and awaited["inferred"] and not (awaited["kind"] == "card" and awaited["ref"]):
++        # Core's guess from the park text (every park on the "no producer, no park" core records one): an inferred
++        # clock/external wait is just the legacy wake mechanism, judged below like a park with no ``awaiting``.
++        awaited = None
+     if awaited:
+         if awaited["kind"] == "human":
+             # A human ask hidden in a park: nobody sees it, so no one will produce the answer.
+             return out("scheduled:hidden_ask", "a hidden ask (not visible to you)", True)
+         if awaited["kind"] in LIVE_PRODUCER_KINDS and awaited["ref"]:
+-            return out("scheduled", f"{awaited['kind']} {awaited['ref']}", False)
++            return out("scheduled", _awaiting_label(awaited), False)
++        if awaited["kind"] == "clock":
++            # A declared window (a soak, a cooldown, a release slot): the clock produces it.
++            label = _clock_label(wake_at) if wake_at else "a declared window"
++            return out("scheduled", label + (f" ({awaited['why'][:80]})" if awaited["why"] else ""), False)
+         return out("scheduled:no_producer", f"{awaited['kind'] or 'something'} with no named producer", True)
+     found = producer_from_wake_check(payload.get("wake_check"))
+     if found and found[0] in ("card", "ci"):
+@@ -197,10 +218,8 @@ def describe(status: Any, *, block_kind: Any = None, human: bool = False, park:
+     if found:
+         # An opaque probe proves only that something polls, not that anything will make it true.
+         return out("scheduled:probe", f"probe {found[1]}", True, certain=False)
+-    wake_at = epoch_s(payload.get("wake_at"))
+     if wake_at:
+-        return out("scheduled", "the clock until " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(wake_at)),
+-                   False)
++        return out("scheduled", _clock_label(wake_at), False)
+     if payload.get("unknown_producer"):
+         return out("scheduled:unknown", "a producer the owner did not publish", False)
+     return out("scheduled:no_producer", "nothing named", True, certain=False)
+diff --git a/tests/hermes_cli/test_kanban_wait_info.py b/tests/hermes_cli/test_kanban_wait_info.py
+index 601d3de16b..ce945cd714 100644
+--- a/tests/hermes_cli/test_kanban_wait_info.py
++++ b/tests/hermes_cli/test_kanban_wait_info.py
+@@ -20,6 +20,12 @@ NOW = 1_793_140_000.0
+ H = 3600
+ 
+ 
++@pytest.fixture(autouse=True)
++def _not_a_probe_run(monkeypatch):
++    # wait-check reads the waiter from HERMES_KANBAN_TASK (set for dispatcher probes and kanban workers).
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++
++
+ def d(status, **kw) -> dict:
+     info = kwi.describe(status, now=NOW, **kw)
+     assert info is not None
+@@ -347,3 +353,66 @@ def test_stale_remote_rows_have_no_wait(kanban_root, monkeypatch):
+     monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: rows)
+     assert ksa._remote_wait(rows[0]) is None
+     assert [r for r in ksa.parked_waits() if r["remote"]] == []
++
++
++# ---- review fixes: main's park payloads carry an inferred ``awaiting`` on every park ----------------------------
++def test_inferred_clock_awaiting_is_judged_by_the_wake_mechanism():
++    # kanban_awaiting._infer on a plain schedule / continuation: {"kind": "clock", "inferred": True}, no ref.
++    park = {"status": "scheduled", "wake_at": NOW + 600, "continuation": 2,
++            "awaiting": {"kind": "clock", "inferred": True, "premise": "abc"}}
++    info = d("scheduled", park=park, park_kind="continued", since=NOW - 9 * H)
++    assert info["agent_owned"] is False and info["wait_state"] == "waiting"
++    assert info["waiting_on"].startswith("the clock until ")
++
++
++def test_inferred_external_awaiting_falls_back_to_the_probe():
++    cmd = "python3 aws_hub_ec2_probe.py"
++    park = {"wake_check": cmd, "awaiting": {"kind": "external", "ref": cmd, "inferred": True}}
++    info = d("scheduled", park=park, since=NOW - 3 * H)
++    assert info["agent_owned"] is True and info["agent_owned_certain"] is False and info["wait_state"] == "stalled"
++    ci = {"wake_check": "gh run watch 9", "awaiting": {"kind": "external", "ref": "gh run watch 9", "inferred": True}}
++    assert d("scheduled", park=ci, since=NOW - 9 * H)["agent_owned"] is False
++
++
++def test_inferred_card_awaiting_and_declared_clock_are_live_producers():
++    card = d("scheduled", park={"awaiting": {"kind": "card", "ref": "t_abc12345", "inferred": True}},
++             since=NOW - 9 * H)
++    assert card["agent_owned"] is False and card["waiting_on"] == "card t_abc12345"
++    soak = d("scheduled", park={"wake_at": NOW + 600, "awaiting": {"kind": "clock", "why": "24h soak"}},
++             since=NOW - 9 * H)
++    assert soak["agent_owned"] is False and "24h soak" in soak["waiting_on"]
++    remote = d("scheduled", park={"awaiting": {"kind": "card", "ref": "t_abc12345", "gateway": "hub"}})
++    assert remote["waiting_on"] == "card t_abc12345 on hub"
++
++
++def test_tracker_does_not_rewake_for_a_status_it_already_handled(tmp_path, monkeypatch):
++    """A tracker woken because its owner went to review re-parks with the same default probe: the probe (run with
++    the dispatcher's HERMES_KANBAN_TASK/HERMES_KANBAN_DB) is not met again until the owner's status changes."""
++    db = tmp_path / "kanban.db"
++    probe = "hermes kanban wait-check task t_owner"
++    _board(db, [{"id": "t_owner", "status": "review", "session": "s"},
++                {"id": "t_tracker", "status": "scheduled", "session": "s",
++                 "events": [("condition_met", {"wake_check": probe, "output": "t_owner review"}, 1),
++                            ("scheduled", {"wake_check": probe}, 2)]}])
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    ns = SimpleNamespace(check="task", target="t_owner", board=None, until=None, since=None, gateway=None)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    assert kwc.run(ns) == 0  # not a probe run: plain default
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_tracker")
++    assert kwc.run(ns) == 1  # same status the tracker already handled
++    with sqlite3.connect(db) as c:
++        c.execute("UPDATE tasks SET status='triage' WHERE id='t_owner'")
++    assert kwc.run(ns) == 0  # a new status wakes it
++    assert kwc.handled_status("t_other", str(db), "t_owner") is None
++
++
++def test_parked_waits_keeps_local_cards_when_the_remote_read_fails(kanban_root, monkeypatch):
++    import time as _time
++    _board(kanban_root / "kanban.db", [
++        {"id": "t_b", "status": "blocked", "kind": "transient", "session": "s1",
++         "events": [("blocked", {"kind": "transient", "reason": "x"}, int(_time.time() - 60))]}])
++
++    def boom(stale_ok=False):
++        raise sqlite3.OperationalError("replica locked")
++    monkeypatch.setattr(ksa, "_remote_links", boom)
++    assert [r["id"] for r in ksa.parked_waits()] == ["t_b"]
+-- 
+2.55.0
+

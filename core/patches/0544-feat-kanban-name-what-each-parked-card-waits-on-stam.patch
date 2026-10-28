@@ -1,0 +1,1135 @@
+From 74fc53ca7fdd16bb00cbd74f2beb54d15aa51ddf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:21:09 +0000
+Subject: [PATCH] feat(kanban): name what each parked card waits on; stamp
+ agent-owned stalls; tracker wake covers owner parks [daveey]
+
+A park was described only by its wake mechanism, so "waiting on N cards, 0 blocked" hid cards whose awaited
+condition nothing was producing (10-26/27 orphan waits, kanban/evidence/orphan-waits-20261027/5whys.md).
+
+- hermes_cli/kanban_wait_info.py: per parked card, `waiting_on` (from the park's structured `awaiting`
+  {kind, ref, why} when recorded, else the wake check: wait-check task -> "card t_x on hub", gh run -> CI,
+  opaque script -> "probe x.py", clock-only -> "the clock until ..."), `waiting_since`, `agent_owned`
+  (transient/capability/assignment block, triage, continuation_exhausted, a park with no named producer),
+  `wait_state` waiting|stalled|human (stalled = agent-owned for > 2 h) and a timestamp-free `premise` key.
+- Session list: `kanban_stalled` per row (local boards and hub-replica cards, the latter from the replicated
+  run outcome/ended_at). `/api/session-kanban-tasks` rows and origin-projection rows carry `wait`.
+- `parked_waits()`: every parked card a session owns with its wait info, for the chat-closeout owner wake.
+- `hermes kanban wait-check` default --until is now done,review,blocked,triage,parked-agent,archived: a
+  tracker wakes when its owner blocks, goes to triage, or parks on something only an agent can do
+  (`parked-agent` = scheduled with no live producer; plain `scheduled` is excluded because continuation
+  checkpoints park running cards between runs, and an older remote never matches the new token). `--from
+  STATUS` (applied on the caller's side for remote checks) lets a tracker re-park without waking at once.
+- Classification per independent review: needs_input without a validated ask, block-loop and intake triage,
+  continuation checkpoints and remote parks with no published producer are NOT agent-owned; premises use
+  structured fields (reason_code, awaiting) and strip uuids/hex ids; stale remote rows carry no wait; remote
+  rows keep only bounded run fields (`park`) and wait info is recomputed at read time.
+
+Tests: tests/hermes_cli/test_kanban_wait_info.py (replays of the incident parks, controls, sidebar count,
+strip rows, tracker defaults). RED without the change: 6 failing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_origin_ledger.py        |  12 +
+ hermes_cli/kanban_parser.py               |   8 +-
+ hermes_cli/kanban_session_activity.py     | 199 +++++++++++-
+ hermes_cli/kanban_wait_check.py           |  51 +++-
+ hermes_cli/kanban_wait_info.py            | 253 ++++++++++++++++
+ tests/hermes_cli/test_kanban_wait_info.py | 349 ++++++++++++++++++++++
+ 6 files changed, 862 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_wait_info.py
+ create mode 100644 tests/hermes_cli/test_kanban_wait_info.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index ab7fc89c88..382fc4d6e9 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -195,6 +195,15 @@ def _recent(observed_at: object, now: float, window: float = 180) -> bool:
+     return type(observed_at) in (int, float) and 0 <= now - observed_at <= window
+ 
+ 
++def _park_of(task: dict) -> dict | None:
++    """[daveey] Display-only run fields of an owner record (``kanban_wait_info.park_fields``); never raises."""
++    try:
++        from hermes_cli.kanban_wait_info import park_fields
++        return park_fields(task.get('run')) if isinstance(task, dict) else None
++    except Exception:
++        return None
++
++
+ def _owner_evidence(task: dict) -> dict:
+     evidence = task.get('origin_observation')
+     if not isinstance(evidence, dict) or type(evidence.get('schema')) is not int or evidence['schema'] != 1:
+@@ -361,6 +370,9 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     'stale': not current, 'synced_at': last_ok,
+                     'remote': True, 'via': 'origin',
+                     'legacy_aliases': aliases_for_projection(alias_receipts.get(binding_hash(binding), []), binding),
++                    # [daveey] Bounded run fields for what the card waits on (kanban_wait_info, display only).
++                    'park': _park_of(task),
++                    **{k: task[k] for k in ('awaiting', 'wake_check', 'human_request') if task.get(k)},
+                 })
+         return result
+     finally:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 445020bd7b..8f28bd34f8 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -305,7 +305,13 @@ _SPECS = [
+         _arg("target", help="Task id (task), board slug (board-empty) or owner request ids (capability-owner)"),
+         _arg("--gateway", default=None, help="Gateway to read via ssh (e.g. hub); omit for this machine"),
+         _arg("--board", default=None, help="Board slug for `task` (default board if omitted)"),
+-        _arg("--until", default="done,blocked,archived", help="Comma-separated statuses that count as met"),
++        _arg("--until", default=None,
++             help="Comma-separated statuses that count as met (default: done,review,blocked,triage,parked-agent,archived "
++                  "-- a tracker wakes when its owner finishes, wants review, blocks, goes to triage, or parks on "
++                  "something only an agent can do; parked-agent = scheduled with no live producer)"),
++        _arg("--from", dest="since", default=None,
++             help="Comma-separated statuses the card had when you parked: not met while it is still in one of them "
++                  "(re-park after handling a wake without waking again at once)"),
+     ], help="Wake-probe primitive: exit 0 met, 1 not yet, 2 cannot tell. The only supported cross-gateway wait idiom"),
+     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
+          help="Show a task with comments + events"),
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 72c0c24129..ac6d293454 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -42,6 +42,9 @@ _waiting_cache: list[dict[str, frozenset[str]]] = [{}]
+ # ``_all_counts`` reads local boards, like ``_pairs_sink``. [daveey]
+ _parked_cache: list[tuple[dict[str, int], dict[str, int]]] = [({}, {})]
+ _parked_sink = threading.local()  # .maps: (parked, held) or None; per thread, so concurrent reads never mix
++# [daveey] Per session, parked cards whose agent-owned wait is older than kanban_wait_info.STALL_AFTER_S (amber
++# "stalled" in the sidebar), from the same snapshot as ``_cache``.
++_stalled_cache: list[dict[str, int]] = [{}]
+ _pairs_lock = threading.Lock()
+ # _all_counts single flight: held for a whole recompute; the generation bumps when one publishes.
+ _counts_flight = threading.Lock()
+@@ -184,6 +187,57 @@ PARKED_STATUSES = ("scheduled",) + BLOCKED_STATUSES
+ _FINISHED_STATUSES = ("done", "archived")
+ 
+ 
++def _local_wait_info(conn: sqlite3.Connection, task_ids: Iterable[str], now: float | None = None,
++                     ) -> dict[str, dict[str, Any]]:
++    """[daveey] ``{task_id: wait info}`` (``kanban_wait_info.describe``) for the parked cards among ``task_ids``: what
++    each waits on, since when, and whether only an agent can end it. One query for the cards, one for their newest
++    park events. Missing columns/tables degrade to status-only info."""
++    from hermes_cli import kanban_wait_info as kwi
++
++    ids = [str(t) for t in dict.fromkeys(task_ids)]
++    if not ids:
++        return {}
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    pick = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in ("id", "status", "block_kind", "human_request",
++                                                                          "awaiting"))
++    out: dict[str, dict[str, Any]] = {}
++    parked: dict[str, tuple] = {}
++    for i in range(0, len(ids), 500):
++        chunk = ids[i:i + 500]
++        ph = ",".join("?" for _ in chunk)
++        for tid, status, kind, request, awaiting in conn.execute(
++                f"SELECT {pick} FROM tasks t WHERE t.id IN ({ph}) AND t.status IN ('scheduled', 'blocked', 'triage')",
++                chunk):
++            parked[str(tid)] = (status, kind, request, awaiting)
++    if not parked:
++        return {}
++    events: dict[str, tuple] = {}
++    keys = list(parked)
++    kph = ",".join("?" for _ in kwi.PARK_EVENT_KINDS)
++    for i in range(0, len(keys), 500):
++        chunk = keys[i:i + 500]
++        ph = ",".join("?" for _ in chunk)
++        try:
++            for tid, kind, payload, at in conn.execute(
++                    f"SELECT e.task_id, e.kind, e.payload, e.created_at FROM task_events e WHERE e.id IN ("
++                    f"SELECT MAX(id) FROM task_events WHERE task_id IN ({ph}) AND kind IN ({kph}) GROUP BY task_id)",
++                    (*chunk, *kwi.PARK_EVENT_KINDS)):
++                events[str(tid)] = (kind, payload, at)
++        except sqlite3.Error:  # board predates task_events
++            break
++    for tid, (status, kind, request, awaiting) in parked.items():
++        ev_kind, payload, at = events.get(tid, (None, None, None))
++        try:
++            human = _stored_needs_human(request, kind)
++        except Exception:
++            human = False
++        info = kwi.describe(status, block_kind=kind, human=human, park=payload, park_kind=ev_kind, since=at,
++                            awaiting=awaiting, now=now)
++        if info is not None:
++            out[tid] = info
++    return out
++
++
+ def _read_parked(path: Path) -> tuple[dict[str, int], dict[str, int]]:
+     """``(parked, held)`` per session over the same (session, task) pairs ``_read_counts`` counts as active.
+ 
+@@ -258,6 +312,43 @@ def _read_parked(path: Path) -> tuple[dict[str, int], dict[str, int]]:
+     return parked, held
+ 
+ 
++def _parked_pairs(conn: sqlite3.Connection) -> set[tuple[str, str]]:
++    """(session, task) for every parked card (scheduled/blocked/triage) a session created or shepherds."""
++    if "session_id" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++        return set()
++    parked = "t.status IN ('scheduled', 'blocked', 'triage')"
++    pairs: set[tuple[str, str]] = {
++        (str(sid), str(tid)) for sid, tid in conn.execute(
++            f"SELECT session_id, id FROM tasks t WHERE session_id IS NOT NULL AND session_id != '' AND {parked}")}
++    try:
++        pairs.update(
++            (str(sid), str(tid)) for sid, tid in conn.execute(
++                f"SELECT s.chat_id, t.id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++                f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)} AND {parked}"))
++    except sqlite3.Error:  # board predates notify subscriptions
++        pass
++    return pairs
++
++
++def _read_stalled(path: Path, now: float | None = None) -> dict[str, int]:
++    """[daveey] Per session, its parked cards whose wait is agent-owned and older than
++    ``kanban_wait_info.STALL_AFTER_S`` (nothing outside the agents will end it): the sidebar's amber "stalled".
++    Same (session, task) pairs as the counts."""
++    conn = _open_ro(path)
++    try:
++        pairs = _parked_pairs(conn)
++        if not pairs:
++            return {}
++        info = _local_wait_info(conn, (tid for _, tid in pairs), now=now)
++    finally:
++        conn.close()
++    out: dict[str, int] = {}
++    for sid, tid in pairs:
++        if (info.get(tid) or {}).get("wait_state") == "stalled":
++            out[sid] = out.get(sid, 0) + 1
++    return out
++
++
+ # Terminal kinds that produce a visible notice (mirrors tui_gateway.session_notifications; silent kinds such as
+ # archived/unblocked never leave a notice waiting).
+ UNSEEN_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status")
+@@ -617,10 +708,22 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                 "synced_at": synced, "stale": stale,
+                 "legacy_record": legacy_records.get((gw, owner_profile, board, tid)),
+                 "legacy_key": t.get('_legacy_key'),
++                # [daveey] What the card waits on is recomputed at read time from these (``_remote_wait``).
++                "park": _park_of(t),
++                **{k: t[k] for k in ("awaiting", "wake_check") if t.get(k)},
+             }
+     return list(found.values())
+ 
+ 
++def _park_of(task: dict[str, Any]) -> dict[str, Any] | None:
++    """[daveey] The bounded run fields a replicated card's wait info needs (``kanban_wait_info.park_fields``)."""
++    try:
++        from hermes_cli import kanban_wait_info as kwi
++        return kwi.park_fields(task.get("run"))
++    except Exception:  # display-only
++        return None
++
++
+ def _activity_fingerprint() -> tuple:
+     """Invalidate on cross-process commits, including WAL writes and board replacement."""
+     paths = _board_db_paths()
+@@ -944,11 +1047,14 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+     stale: dict[str, int] = {}
+     parked: dict[str, int] = {}
+     held: dict[str, int] = {}
++    stalled: dict[str, int] = {}
+     _parked_sink.maps = (parked, held)
++    _parked_sink.stalled = stalled
+     try:
+         pairs = _read_local_pairs_into(active, blocked, unseen)
+     finally:
+         _parked_sink.maps = None
++        _parked_sink.stalled = None
+     waiting: dict[str, set[str]] = {}
+     for sid, tid in pairs:
+         waiting.setdefault(sid, set()).add(tid)
+@@ -963,6 +1069,8 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         # replicated todo waits on a parent (parked). Held needs those links, so remote cards are never held.
+         if bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo"):
+             parked[sid] = parked.get(sid, 0) + 1
++        if (_remote_wait(card) or {}).get("wait_state") == "stalled":
++            stalled[sid] = stalled.get(sid, 0) + 1
+         if card.get("stale"):
+             stale[sid] = stale.get(sid, 0) + 1
+     with _cache_lock:
+@@ -972,6 +1080,7 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         _counts_generation += 1
+         _waiting_cache[0] = {sid: frozenset(ids) for sid, ids in waiting.items()}
+         _parked_cache[0] = (parked, held)
++        _stalled_cache[0] = stalled
+     counts = (active, blocked, unseen, stale)
+     return (*counts, {sid: frozenset(ids) for sid, ids in waiting.items()}) if include_waiting else counts
+ 
+@@ -1005,6 +1114,13 @@ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen:
+             for src, into in zip((board_parked, board_held), sink):
+                 for sid, n in src.items():
+                     into[sid] = into.get(sid, 0) + n
++        stalled = getattr(_parked_sink, "stalled", None)
++        if stalled is not None:
++            try:
++                for sid, n in _read_stalled(path).items():
++                    stalled[sid] = stalled.get(sid, 0) + n
++            except Exception as exc:  # display-only: a failed read never fails the counts
++                _log.debug("kanban stalled read failed for %s: %s", path, exc)
+ 
+ 
+ # [daveey] Extra "this chat still waits" sources (plugins): name -> fn() -> {session_id: iterable of task ids}. A
+@@ -1052,6 +1168,68 @@ def parked_task_counts() -> tuple[dict[str, int], dict[str, int]]:
+         return _parked_cache[0]
+ 
+ 
++def stalled_task_counts() -> dict[str, int]:
++    """``{session_id: stalled count}``: parked cards whose agent-owned wait passed ``STALL_AFTER_S``. Same cache as
++    the counts. [daveey]"""
++    _all_counts()
++    with _cache_lock:
++        return _stalled_cache[0]
++
++
++def _remote_wait(card: dict[str, Any]) -> dict[str, Any] | None:
++    """Wait info of a remote card row, computed now from its fields (never a stored copy, which would freeze the
++    age). Stale (last-known) rows get none: they prove nothing about how long a wait has run."""
++    if card.get("stale"):
++        return None
++    try:
++        from hermes_cli import kanban_wait_info as kwi
++        return kwi.describe_replica(card)
++    except Exception:
++        return None
++
++
++def parked_waits(now: float | None = None) -> list[dict[str, Any]]:
++    """[daveey] Every parked card a session created or shepherds, local and on other gateways, with its wait info
++    (``kanban_wait_info``): ``{session, id, board, key, title, remote, gateway, wait}``. For the owner wake (the
++    chat-closeout plugin), which starts a supervise turn in the owning chat when a card parks for an agent-owned
++    reason. Local read failures skip that board; a failed remote read propagates (unknown is not "none")."""
++    out: list[dict[str, Any]] = []
++    for path in _board_db_paths():
++        try:
++            conn = _open_ro(path)
++        except sqlite3.Error:
++            continue
++        try:
++            pairs = _parked_pairs(conn)
++            info = _local_wait_info(conn, {tid for _, tid in pairs}, now=now) if pairs else {}
++            titles: dict[str, str] = {}
++            ids = list(info)
++            for i in range(0, len(ids), 500):
++                chunk = ids[i:i + 500]
++                titles.update((str(t), str(n or "")) for t, n in conn.execute(
++                    f"SELECT id, title FROM tasks WHERE id IN ({','.join('?' for _ in chunk)})", chunk))
++        except Exception as exc:
++            _log.debug("kanban parked waits read failed for %s: %s", path, exc)
++            continue
++        finally:
++            conn.close()
++        board = _board_slug(path)
++        for sid, tid in sorted(pairs):
++            if tid in info:
++                out.append({"session": sid, "id": tid, "board": board, "key": f"{board}/{tid}",
++                            "title": titles.get(tid, ""), "remote": False, "gateway": None, "wait": info[tid]})
++    for card in _remote_links():
++        if card.get("stale"):
++            continue
++        wait = _remote_wait(card)
++        if wait is None:
++            continue
++        out.append({"session": str(card.get("session")), "id": str(card.get("id")), "board": card.get("board"),
++                    "key": str(card.get("key")), "title": str(card.get("title") or ""), "remote": True,
++                    "gateway": card.get("gateway"), "wait": wait})
++    return out
++
++
+ def blocked_task_counts() -> dict[str, int]:
+     """``{session_id: blocked task count}`` across every kanban board."""
+     return _all_counts()[1]
+@@ -1096,6 +1274,11 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+         except sqlite3.Error:  # board predates notify subscriptions
+             pass
+         _add_card_details(conn, found)
++        try:
++            for tid, info in _local_wait_info(conn, found).items():
++                found[tid]["wait"] = info
++        except Exception as exc:  # display-only: never fails the task list
++            _log.debug("kanban wait info read failed for %s: %s", path, exc)
+     board = _board_slug(path)
+     return [{**t, "board": board} for t in found.values()]
+ 
+@@ -1191,7 +1374,11 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+         listed = card.get('status') in statuses or (card.get('status') == 'unknown' and card.get('unfinished'))
+         if belongs and listed and card['key'] not in seen:
+             seen.add(card["key"])
+-            out.append({**card, "session_id": card["session"]})
++            row = {**card, "session_id": card["session"]}
++            wait = _remote_wait(card)
++            if wait is not None:
++                row["wait"] = wait
++            out.append(row)
+     return out
+ 
+ 
+@@ -1324,6 +1511,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         active, blocked, unseen, remote_stale, waiting = _all_counts(include_waiting=True)
+         with _cache_lock:  # the snapshot that call just read or wrote: never a second projection
+             parked, held = _parked_cache[0]
++            stalled = _stalled_cache[0]
+         extra = _extra_waiting()
+     except Exception:
+         # [daveey] A failed read is "unknown", never "no work": stamp ``kanban_unknown`` (the sidebar keeps the
+@@ -1331,7 +1519,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         _log.warning("kanban activity unavailable; rows marked kanban_unknown", exc_info=True)
+         for row in rows:
+             for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale",
+-                        "kanban_parked", "kanban_held"):
++                        "kanban_parked", "kanban_held", "kanban_stalled"):
+                 row.pop(key, None)
+             row.pop("kanban_observed_at", None)
+             row.pop("kanban_waiting_on", None)
+@@ -1371,6 +1559,12 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+             row["kanban_held"] = n_held
+         else:
+             row.pop("kanban_held", None)
++        # [daveey] Stalled: parked cards whose agent-owned wait passed 2 h (amber, not grey waiting or red needs-you).
++        n_stalled = sum(stalled.get(sid, 0) for sid in ids)
++        if n_stalled and row.get("kanban_active"):
++            row["kanban_stalled"] = n_stalled
++        else:
++            row.pop("kanban_stalled", None)
+         ids_waiting = sorted(open_ids | pending)
+         if ids_waiting:
+             row["kanban_waiting_on"] = ids_waiting[:WAITING_ON_CAP]
+@@ -1391,6 +1585,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+             _snapshot_saved = None
+         _waiting_cache[0] = {}
+         _parked_cache[0] = ({}, {})
++        _stalled_cache[0] = {}
+     with _RO_CACHE_LOCK:
+         held = [entry[0] for entry in _RO_CACHE.values()]
+         _RO_CACHE.clear()
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index 040a88a817..924c4cd28f 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -5,7 +5,8 @@ unreadable DB). The wake-check scheduler treats 2 as broken (3 in a row wakes th
+ never as "not yet". Arguments travel as argv (``shlex.join`` for ssh), so SQL/quoting
+ never gets re-split by a remote shell.
+ 
+-    hermes kanban wait-check task t_x [--gateway hub] [--board SLUG] [--until done,blocked,archived]
++    hermes kanban wait-check task t_x [--gateway hub] [--board SLUG] [--until done,review,blocked,triage,scheduled,archived]
++                                     [--from running]
+     hermes kanban wait-check board-empty SLUG [--gateway hub]
+ """
+ from __future__ import annotations
+@@ -18,7 +19,14 @@ import sys
+ from pathlib import Path
+ from typing import Optional
+ 
+-DEFAULT_UNTIL = ("done", "blocked", "archived")
++# [daveey] The default is a tracker's wake: the owner finished, wants review, blocked, went to triage, or parked on
++# something only an agent can do (``parked-agent``: a scheduled card whose wait has no live producer, per
++# kanban_wait_info). A narrower list (done/review/triage) left a chat asleep for hours while its remote owner sat
++# parked. Plain ``scheduled`` is not in the default: continuation checkpoints park a running card ``scheduled``
++# between runs, and a tracker woken by each of them would loop. An older remote that does not know
++# ``parked-agent`` just never matches it (exactly the old behaviour).
++PARKED_AGENT = "parked-agent"
++DEFAULT_UNTIL = ("done", "review", "blocked", "triage", PARKED_AGENT, "archived")
+ GATEWAY_SSH = {"hub": "ubuntu@hub.example.com"}
+ SSH_TIMEOUT = 25
+ 
+@@ -44,13 +52,23 @@ def _query(path: Path, sql: str, args=()):
+     raise last  # type: ignore[misc]
+ 
+ 
+-def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DEFAULT_UNTIL) -> tuple[int, str]:
++def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DEFAULT_UNTIL,
++                since=()) -> tuple[int, str]:
++    """``since``: statuses the target had when the waiter parked; still in one of them = not yet (exit 1), so a
++    tracker that re-parks after handling a wake waits for the NEXT change instead of waking again at once."""
+     try:
+         if kind == "task":
+             rows = _query(_db(board), "select status from tasks where id=?", (target,))
+             if not rows:
+                 return 2, f"error: {target} not found"
+-            return (0 if rows[0][0] in set(until) else 1), f"{target} {rows[0][0]}"
++            status = rows[0][0]
++            if status in set(since or ()):
++                return 1, f"{target} {status} (unchanged since park)"
++            if status in set(until):
++                return 0, f"{target} {status}"
++            if PARKED_AGENT in set(until) and status in ("scheduled", "blocked") and _agent_owned_park(board, target):
++                return 0, f"{target} {status} (agent-owned park: nothing else will produce what it waits for)"
++            return 1, f"{target} {status}"
+         if kind == "board-empty":
+             n = _query(_db(target), "select count(*) from tasks where status not in ('done','archived')")[0][0]
+             return (0 if n == 0 else 1), f"{target} open={n}"
+@@ -59,8 +77,22 @@ def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DE
+     return 2, f"error: unknown check {kind!r}"
+ 
+ 
+-def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] = None, until=DEFAULT_UNTIL) -> tuple[int, str]:
++def _agent_owned_park(board: Optional[str], target: str) -> bool:
++    """The target parked on something only an agent can end (certain, or a legacy park that has stalled)."""
++    from hermes_cli.kanban_session_activity import _local_wait_info, _open_ro
++
++    conn = _open_ro(_db(board))
++    try:
++        info = _local_wait_info(conn, [target]).get(target) or {}
++    finally:
++        conn.close()
++    return bool(info.get("agent_owned") and (info.get("agent_owned_certain") or info.get("wait_state") == "stalled"))
++
++
++def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] = None, until=DEFAULT_UNTIL,
++                 since=()) -> tuple[int, str]:
+     inner = ["hermes", "kanban", "wait-check", kind, target, "--until", ",".join(until)]
++    # ``since`` (--from) is applied here, on the reply, so an older remote never sees a flag it would reject.
+     if board:
+         inner += ["--board", board]
+     host = GATEWAY_SSH.get(gateway, gateway)
+@@ -72,6 +104,10 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+     except (OSError, subprocess.TimeoutExpired) as exc:
+         return 2, f"error: ssh {host}: {exc}"
+     out = (p.stdout + p.stderr).strip()
++    if p.returncode == 0 and since and kind == "task":
++        words = (p.stdout or "").split()
++        if len(words) >= 2 and words[0] == target and words[1] in set(since):
++            return 1, f"{out} (unchanged since park)"
+     if p.returncode in (0, 1):
+         return p.returncode, out
+     return 2, f"error: remote wait-check on {host} exited {p.returncode}: {out[-300:]}"
+@@ -79,6 +115,7 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+ 
+ def run(args) -> int:
+     until = tuple(u for u in (args.until or "").split(",") if u) or DEFAULT_UNTIL
++    since = tuple(u for u in (getattr(args, "since", None) or "").split(",") if u)
+     gw = getattr(args, "gateway", None)
+     if args.check == "capability-owner":
+         # Owner cards live on another gateway; the hermes-hub replica on THIS gateway is the
+@@ -88,8 +125,8 @@ def run(args) -> int:
+         print(msg, file=sys.stderr if rc == 2 else sys.stdout)
+         return rc
+     if gw in (None, "", "local"):
+-        rc, msg = check_local(args.check, args.target, board=args.board, until=until)
++        rc, msg = check_local(args.check, args.target, board=args.board, until=until, since=since)
+     else:
+-        rc, msg = check_remote(gw, args.check, args.target, board=args.board, until=until)
++        rc, msg = check_remote(gw, args.check, args.target, board=args.board, until=until, since=since)
+     print(msg, file=sys.stderr if rc == 2 else sys.stdout)
+     return rc
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+new file mode 100644
+index 0000000000..609de3f682
+--- /dev/null
++++ b/hermes_cli/kanban_wait_info.py
+@@ -0,0 +1,253 @@
++"""What an open, parked kanban card waits on, who produces it, and whether that wait has stalled. [daveey]
++
++A park used to be described only by its wake mechanism (a clock, a probe, a parent). The sidebar showed "waiting on
++N cards" while nothing was going to produce what those cards waited for, and nobody noticed for hours. This module
++names the producer of each wait and marks the ones only an agent can end:
++
++- ``waiting_on``: a short label of what the card waits on, from the park's structured ``awaiting``
++  (``{kind: card|ci|deploy|external|clock|human, ref, why}``, recorded by the core "no producer, no park" guard)
++  or, for older parks, from the wake check (``hermes kanban wait-check task t_x`` -> ``card t_x``).
++- ``agent_owned``: nothing outside the agents will end this wait. Transient/capability/assignment blocks, triage
++  (gave up / block loop), continuation_exhausted, and a schedule with no named producer.
++- ``wait_state``: ``human`` (a validated ask: the user's move), ``stalled`` (agent-owned for longer than
++  ``STALL_AFTER_S``), or ``waiting`` (anything else parked).
++- ``premise``: a stable key of the reason (status, kind and the reason text, never timestamps), so a wake that
++  fires "once per premise" does not fire again when the same card re-parks on the same reason.
++
++Pure functions over plain values: used by the session list (local boards and the hub replica), the task strip API
++and the chat-closeout plugin's owner wake.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import time
++from typing import Any, Optional
++
++
++STALL_AFTER_S = 2 * 3600
++
++# Producers that change the awaited condition without an agent acting (a card that runs, a CI run, a deploy, a
++# vendor/ticket, the clock).
++LIVE_PRODUCER_KINDS = ("card", "ci", "deploy", "external", "clock")
++# Block kinds only an agent clears (core kanban_block_policy.AGENT_OWNED_KINDS, plus assignment routing). Untyped
++# (None/legacy) blocks are agent-owned too, but uncertain: they only count once stalled.
++AGENT_BLOCK_KINDS = ("transient", "capability", "assignment")
++# Events that put a card into its current parked state; the newest one dates the wait and carries its reason.
++# ``continued`` is a continuation checkpoint parking the card ``scheduled`` with a ``wake_at``.
++PARK_EVENT_KINDS = ("scheduled", "blocked", "gave_up", "continuation_exhausted", "block_loop_detected",
++                    "triage_swept", "supervisor_escalated", "continued", "status", "dependency_wait",
++                    "agent_block_escalated")
++# Triage reached this way is agent work (the worker gave up / ran out of budget / was escalated to a supervisor).
++# Triage after a block loop waits on a human or a shared blocker; triage from intake (no park event) belongs to
++# its specifier.
++AGENT_TRIAGE_EVENTS = ("gave_up", "continuation_exhausted", "supervisor_escalated", "triage_swept")
++# A replicated card carries only its last run's outcome; these outcomes mean a run failed into triage.
++_FAILED_RUN_OUTCOMES = ("gave_up", "reclaimed", "crashed", "timed_out", "oom_killed", "continuation_exhausted")
++
++_WAIT_CHECK_TASK = re.compile(r"wait-check\s+task\s+(\S+)")
++_WAIT_CHECK_BOARD = re.compile(r"wait-check\s+board-empty\s+(\S+)")
++_GATEWAY = re.compile(r"--gateway[=\s]+(\S+)")
++_CI = re.compile(r"\bgh\s+(?:run|pr\s+checks|workflow)\b|actions/runs|/check-runs|/statuses\b")
++_SCRIPT = re.compile(r"([\w.-]+\.(?:py|sh|mjs|js))\b")
++_TASK_ID = re.compile(r"\bt_[0-9a-f]{6,}\b")
++_SHELL_NOISE = {"[", "[[", "test", "!", "if", "then", "set", "export", "env", "timeout", "sh", "bash", "-c", "exec"}
++_SCHEDULED_UNTIL = re.compile(r"SCHEDULED_UNTIL=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z?)")
++
++
++def epoch_s(value: Any) -> Optional[float]:
++    """Seconds since the epoch; millisecond stamps (some boards wrote them) are scaled down."""
++    try:
++        v = float(value)
++    except (TypeError, ValueError):
++        return None
++    if v <= 0:
++        return None
++    return v / 1000.0 if v > 1e11 else v
++
++
++def _json(value: Any) -> Any:
++    if isinstance(value, str):
++        try:
++            return json.loads(value)
++        except ValueError:
++            return None
++    return value
++
++
++def parse_awaiting(value: Any) -> Optional[dict[str, str]]:
++    """A valid ``awaiting`` object (kind + ref + why strings) or None."""
++    data = _json(value)
++    if not isinstance(data, dict) or not isinstance(data.get("kind"), str):
++        return None
++    return {"kind": data["kind"].strip().lower(), "ref": str(data.get("ref") or "").strip(),
++            "why": str(data.get("why") or "").strip()}
++
++
++def producer_from_wake_check(cmd: Any) -> Optional[tuple[str, str]]:
++    """``(kind, ref)`` named by a legacy wake check: a wait-check on a card (or a probe that reads one card's
++    status), a CI read, or an opaque probe."""
++    if not isinstance(cmd, str) or not cmd.strip():
++        return None
++    gw = _GATEWAY.search(cmd)
++    where = f" on {gw.group(1)}" if gw else ""
++    m = _WAIT_CHECK_TASK.search(cmd)
++    if m:
++        return "card", f"{m.group(1)}{where}"
++    m = _WAIT_CHECK_BOARD.search(cmd)
++    if m:
++        return "card", f"board {m.group(1)}{where}"
++    if _CI.search(cmd):
++        return "ci", "CI run"
++    tid = _TASK_ID.search(cmd)
++    if tid and ("kanban" in cmd or "status" in cmd):
++        return "card", tid.group(0)
++    script = _SCRIPT.search(cmd)
++    if script:
++        return "probe", script.group(1)
++    for token in cmd.replace("$(", " ").replace("`", " ").split():
++        word = token.rsplit("/", 1)[-1].strip("'\";()")
++        if word and word not in _SHELL_NOISE and not word.startswith("-") and "=" not in word:
++            return "probe", word[:40]
++    return "probe", "shell check"
++
++
++def _norm(text: Any) -> str:
++    """Reason text without volatile parts (uuids, hex ids, numbers, whitespace), for the premise hash."""
++    s = str(text or "").lower()
++    s = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{20,}", "#", s)
++    s = re.sub(r"\b[0-9a-f]*\d[0-9a-f]{5,}\b", "#", s)
++    s = re.sub(r"\d+", "#", s)
++    return re.sub(r"\s+", " ", s).strip()[:300]
++
++
++def premise_key(kind: str, status: str, reason: Any = "", awaiting: Optional[dict] = None,
++                reason_code: Any = None) -> str:
++    """Stable id of WHY a card waits: structured fields first (kind, status, reason code, awaiting kind/ref); the
++    free-text reason only when nothing structured names it."""
++    structured = [kind, status, str(reason_code or ""),
++                  [awaiting.get("kind"), _norm(awaiting.get("ref"))] if awaiting else None]
++    text = "" if (reason_code or awaiting) else _norm(reason)
++    basis = json.dumps([structured, text], sort_keys=True)
++    return f"{kind}:{hashlib.sha1(basis.encode()).hexdigest()[:12]}"
++
++
++def describe(status: Any, *, block_kind: Any = None, human: bool = False, park: Any = None,
++             park_kind: Any = None, since: Any = None, awaiting: Any = None, reason: Any = None,
++             now: Optional[float] = None) -> Optional[dict[str, Any]]:
++    """Wait info for one card, or None when it is not parked (running, ready, review, todo, done).
++
++    ``park`` is the newest park event's payload (dict or JSON text) and ``park_kind`` its event kind; ``since``
++    when the card parked (defaults to nothing: no age, never stalled). ``awaiting`` overrides the payload's.
++    """
++    status = str(status or "")
++    if status not in ("scheduled", "blocked", "triage"):
++        return None
++    now = time.time() if now is None else now
++    payload = _json(park) if park is not None else None
++    payload = payload if isinstance(payload, dict) else {}
++    kind = str(block_kind or payload.get("kind") or "") or None
++    reason = reason if reason is not None else payload.get("reason") or payload.get("error") or ""
++    reason_code = payload.get("reason_code")
++    awaited = parse_awaiting(awaiting) or parse_awaiting(payload.get("awaiting"))
++    since_s = epoch_s(since)
++    exhausted = park_kind == "continuation_exhausted" or reason_code == "continuation_exhausted" or (
++        status == "blocked" and str(reason).lstrip().startswith("continuation_exhausted"))
++
++    def out(state_kind: str, label: str, agent_owned: bool, certain: bool = True) -> dict[str, Any]:
++        stalled = agent_owned and since_s is not None and now - since_s >= STALL_AFTER_S
++        return {"wait_state": "stalled" if stalled else "waiting", "waiting_on": label,
++                "waiting_since": since_s, "agent_owned": agent_owned, "agent_owned_certain": certain,
++                "premise": premise_key(state_kind, status, reason, awaited, reason_code) if agent_owned else None}
++
++    if human:
++        return {"wait_state": "human", "waiting_on": "you", "waiting_since": since_s, "agent_owned": False,
++                "agent_owned_certain": True, "premise": None}
++    if exhausted and status in ("blocked", "triage"):
++        return out("continuation_exhausted", "an agent to split the work (continuation budget exhausted)", True)
++    if status == "triage":
++        if park_kind in AGENT_TRIAGE_EVENTS:
++            label = "an agent to triage it (worker gave up)" if park_kind == "gave_up" else "an agent to triage it"
++            return out("triage", label, True)
++        if park_kind == "block_loop_detected":
++            return out("triage:block_loop", "a human or shared blocker (block loop)", False)
++        return out("triage:intake", "triage", False)
++    if status == "blocked":
++        if kind in AGENT_BLOCK_KINDS:
++            return out(f"blocked:{kind}", f"an agent to clear a {kind} block", True)
++        if kind == "dependency":
++            return out("dependency", "a parent card", False)
++        if kind is None:
++            return out("blocked:untyped", "an agent to clear an untyped block", True, certain=False)
++        if kind != "time":
++            # needs_input (or another human kind) without a validated ask: the user's move, just not visible.
++            return out(f"blocked:{kind}", f"an unvalidated ask ({kind})", False)
++    # scheduled, or blocked kind=time: a park. Who produces what it waits for?
++    if awaited:
++        if awaited["kind"] == "human":
++            # A human ask hidden in a park: nobody sees it, so no one will produce the answer.
++            return out("scheduled:hidden_ask", "a hidden ask (not visible to you)", True)
++        if awaited["kind"] in LIVE_PRODUCER_KINDS and awaited["ref"]:
++            return out("scheduled", f"{awaited['kind']} {awaited['ref']}", False)
++        return out("scheduled:no_producer", f"{awaited['kind'] or 'something'} with no named producer", True)
++    found = producer_from_wake_check(payload.get("wake_check"))
++    if found and found[0] in ("card", "ci"):
++        return out("scheduled", f"{found[0]} {found[1]}", False)
++    if found:
++        # An opaque probe proves only that something polls, not that anything will make it true.
++        return out("scheduled:probe", f"probe {found[1]}", True, certain=False)
++    wake_at = epoch_s(payload.get("wake_at"))
++    if wake_at:
++        return out("scheduled", "the clock until " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(wake_at)),
++                   False)
++    if payload.get("unknown_producer"):
++        return out("scheduled:unknown", "a producer the owner did not publish", False)
++    return out("scheduled:no_producer", "nothing named", True, certain=False)
++
++
++def park_fields(run: Any) -> Optional[dict[str, Any]]:
++    """The few run fields a replicated card's wait needs (outcome, ended_at, a bounded reason, a parsed
++    SCHEDULED_UNTIL), small enough to keep on cached remote rows. Recomputed into wait info at read time."""
++    if not isinstance(run, dict):
++        return None
++    summary = str(run.get("summary") or "")
++    until = _SCHEDULED_UNTIL.search(summary)
++    wake_at = None
++    if until:
++        import calendar
++        text = until.group(1).rstrip("Z")
++        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
++            try:
++                wake_at = calendar.timegm(time.strptime(text, fmt))
++                break
++            except ValueError:
++                continue
++    return {"outcome": run.get("outcome"), "ended_at": run.get("ended_at"), "reason": summary[:300],
++            "wake_at": wake_at}
++
++
++def describe_replica(card: dict[str, Any], *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
++    """Wait info for a card on another gateway (status, block_kind, human_request and its last run, either as the
++    replica's ``run`` or the cached ``park`` fields). A remote schedule names a producer only when the owner
++    published one (``awaiting`` / ``wake_check``); otherwise it is shown as unknown and never counted as stalled,
++    because a clock park and an orphan wait look identical from here."""
++    from hermes_cli.kanban_human_request import needs_human
++
++    status = card.get("reported_status") or card.get("status")
++    raw_park = card.get("park")
++    park: dict[str, Any] = (raw_park if isinstance(raw_park, dict) else park_fields(card.get("run"))) or {}
++    try:
++        human = needs_human(_json(card.get("human_request")), kind=card.get("block_kind"))
++    except Exception:
++        human = False
++    published = bool(card.get("awaiting") or card.get("wake_check"))
++    outcome = park.get("outcome")
++    if status == "triage":
++        outcome = "gave_up" if outcome in _FAILED_RUN_OUTCOMES else (
++            "block_loop_detected" if outcome == "blocked" else outcome)
++    return describe(status, block_kind=card.get("block_kind"), human=human,
++                    park={"wake_check": card.get("wake_check"), "reason": park.get("reason") or "",
++                          "wake_at": park.get("wake_at"), "unknown_producer": not published},
++                    park_kind=outcome, since=card.get("parked_at") or park.get("ended_at"),
++                    awaiting=card.get("awaiting"), now=now)
+diff --git a/tests/hermes_cli/test_kanban_wait_info.py b/tests/hermes_cli/test_kanban_wait_info.py
+new file mode 100644
+index 0000000000..601d3de16b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_info.py
+@@ -0,0 +1,349 @@
++"""What a parked card waits on, who produces it, and when an agent-owned wait counts as stalled. [daveey]
++
++Replays the 10-26/27 orphan waits (evidence: kanban/evidence/orphan-waits-20261027/5whys.md): a card parked on an
++opaque IAM probe, a timed park whose reason needs a supervisor, a hidden human ask, a continuation_exhausted
++owner and a gave_up->triage card all read as agent-owned and turn amber after 2 h; real producers (a CI run, a card,
++the clock) stay grey.
++"""
++import json
++import sqlite3
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_wait_check as kwc
++from hermes_cli import kanban_wait_info as kwi
++
++NOW = 1_793_140_000.0
++H = 3600
++
++
++def d(status, **kw) -> dict:
++    info = kwi.describe(status, now=NOW, **kw)
++    assert info is not None
++    return info
++
++
++# ---- classification -------------------------------------------------------------------------------------------
++def test_not_parked_statuses_have_no_wait():
++    for status in ("running", "ready", "todo", "review", "done", "archived", ""):
++        assert kwi.describe(status, now=NOW) is None
++
++
++def test_iam_probe_park_is_agent_owned_and_stalls_after_two_hours():
++    park = {"reason": "waiting for EC2 describe on the hub role", "wake_check": "python3 ~/.hermes/scripts/aws_hub_ec2_probe.py"}
++    fresh = d("scheduled", park=park, park_kind="scheduled", since=NOW - 600)
++    assert fresh["agent_owned"] is True and fresh["wait_state"] == "waiting"
++    assert fresh["waiting_on"] == "probe aws_hub_ec2_probe.py"
++    old = d("scheduled", park=park, park_kind="scheduled", since=NOW - 2 * H - 1)
++    assert old["wait_state"] == "stalled" and old["waiting_since"] == NOW - 2 * H - 1
++
++
++def test_awaiting_with_live_producer_is_never_stalled():
++    for kind, ref in (("ci", "run 40577358595"), ("card", "t_abc on hub"), ("deploy", "release 93ed6b10"),
++                      ("external", "AWS support case 123"), ("clock", "24h soak")):
++        info = d("scheduled", awaiting={"kind": kind, "ref": ref, "why": "x"}, since=NOW - 30 * H)
++        assert info["agent_owned"] is False and info["wait_state"] == "waiting", kind
++        assert info["waiting_on"] == f"{kind} {ref}"
++
++
++def test_awaiting_read_from_park_payload_json():
++    payload = json.dumps({"reason": "r", "awaiting": {"kind": "ci", "ref": "run 1", "why": "w"}})
++    assert d("scheduled", park=payload, since=NOW - 9 * H)["waiting_on"] == "ci run 1"
++
++
++def test_hidden_human_ask_and_producerless_awaiting_are_agent_owned():
++    hidden = d("scheduled", awaiting={"kind": "human", "ref": "", "why": "David's decision on attachment180"},
++               since=NOW - 3 * H)
++    assert hidden["agent_owned"] is True and hidden["wait_state"] == "stalled"
++    assert "hidden ask" in hidden["waiting_on"]
++    nobody = d("scheduled", awaiting={"kind": "ci", "ref": "", "why": "grant"}, since=NOW - 3 * H)
++    assert nobody["agent_owned"] is True and nobody["wait_state"] == "stalled"
++
++
++def test_legacy_wait_check_on_card_or_ci_names_a_live_producer():
++    card = d("scheduled", park={"wake_check": "hermes kanban wait-check task t_b11f0591 --gateway hub"},
++             since=NOW - 9 * H)
++    assert card["waiting_on"] == "card t_b11f0591 on hub" and card["agent_owned"] is False
++    ci = d("scheduled", park={"wake_check": "gh run view 123 --json status | jq -e '.status==\"completed\"'"},
++           since=NOW - 9 * H)
++    assert ci["waiting_on"] == "ci CI run" and ci["wait_state"] == "waiting"
++
++
++def test_clock_only_park_is_a_clock_wait():
++    info = d("scheduled", park={"timed_park": True, "wake_at": NOW + 3600}, since=NOW - 9 * H)
++    assert info["agent_owned"] is False and info["waiting_on"].startswith("the clock until ")
++
++
++def test_transient_and_capability_blocks_are_agent_owned():
++    for kind in ("transient", "capability", "assignment"):
++        info = d("blocked", block_kind=kind, park={"reason": "hub role denied ec2:Describe*"}, since=NOW - 3 * H)
++        assert info["agent_owned"] is True and info["wait_state"] == "stalled", kind
++        assert info["premise"].startswith(f"blocked:{kind}:")
++
++
++def test_human_block_is_the_users_move_not_stalled():
++    info = d("blocked", block_kind="needs_input", human=True, since=NOW - 30 * H)
++    assert info["wait_state"] == "human" and info["agent_owned"] is False and info["premise"] is None
++
++
++def test_triage_gave_up_and_continuation_exhausted():
++    gave_up = d("triage", block_kind="transient", park={"reason_code": "worker_failures_exhausted"},
++                park_kind="gave_up", since=NOW - 3 * H)
++    assert gave_up["agent_owned"] and gave_up["wait_state"] == "stalled" and "gave up" in gave_up["waiting_on"]
++    exhausted = d("blocked", block_kind="transient",
++                  park={"reason": "continuation_exhausted: split the work or reset the continuation budget"},
++                  park_kind="blocked", since=NOW - 60)
++    assert exhausted["premise"].startswith("continuation_exhausted:") and exhausted["wait_state"] == "waiting"
++
++
++def test_dependency_block_waits_on_a_parent():
++    info = d("blocked", block_kind="dependency", since=NOW - 30 * H)
++    assert info["agent_owned"] is False and info["waiting_on"] == "a parent card"
++
++
++def test_premise_is_stable_across_reparks_and_changes_with_the_reason():
++    a = d("blocked", block_kind="transient", park={"reason": "denied at 2026-10-27T03:35Z, attempt 3"}, since=NOW - 9)
++    b = d("blocked", block_kind="transient", park={"reason": "denied at 2026-10-27T05:12Z, attempt 4"}, since=NOW - 1)
++    c = d("blocked", block_kind="transient", park={"reason": "ssh to the mini refused"}, since=NOW - 1)
++    assert a["premise"] == b["premise"] != c["premise"]
++
++
++def test_millisecond_stamps_are_scaled():
++    info = d("blocked", block_kind="transient", since=(NOW - 3 * H) * 1000)
++    assert info["waiting_since"] == pytest.approx(NOW - 3 * H) and info["wait_state"] == "stalled"
++
++
++def test_replica_card_uses_run_outcome_and_human_request():
++    # A remote schedule whose owner published no producer is unknown, never stalled: from here a clock park and an
++    # orphan wait look the same. SCHEDULED_UNTIL in the run summary reads as the clock.
++    card = {"status": "scheduled", "block_kind": None, "human_request": None,
++            "run": {"outcome": "scheduled", "ended_at": NOW - 5 * H,
++                    "summary": "waiting for a scope only an AWS SSO owner session can create"}}
++    info = kwi.describe_replica(card, now=NOW) or {}
++    assert info["agent_owned"] is False and info["wait_state"] == "waiting"
++    timed = {**card, "run": {**card["run"], "summary": "SCHEDULED_UNTIL=2026-10-30T00:00:00Z - waiting"}}
++    assert (kwi.describe_replica(timed, now=NOW) or {})["waiting_on"] == "the clock until 2026-10-30 00:00 UTC"
++    published = {**card, "awaiting": {"kind": "human", "ref": "", "why": "decision"}}
++    assert (kwi.describe_replica(published, now=NOW) or {})["agent_owned"] is True
++    blocked = {"status": "blocked", "block_kind": "transient", "run": {"outcome": "blocked", "ended_at": NOW - 3 * H,
++                                                                       "summary": "ssh to the mini refused"}}
++    assert (kwi.describe_replica(blocked, now=NOW) or {})["wait_state"] == "stalled"
++    reclaimed = {"status": "triage", "block_kind": "transient", "run": {"outcome": "reclaimed", "ended_at": NOW - 60}}
++    assert (kwi.describe_replica(reclaimed, now=NOW) or {})["agent_owned"] is True
++    loop = {"status": "triage", "block_kind": "capability", "run": {"outcome": "blocked", "ended_at": NOW - 9 * H}}
++    assert (kwi.describe_replica(loop, now=NOW) or {})["agent_owned"] is False
++    human = {"status": "blocked", "block_kind": "needs_input", "human_request": json.dumps({
++        "action": "Pick a window.", "why_human": "Owner decision.", "interaction": "reply", "scope": "deploy",
++        "evidence": "No window chosen."}), "run": {"outcome": "blocked", "ended_at": NOW - 9 * H}}
++    assert (kwi.describe_replica(human, now=NOW) or {})["wait_state"] == "human"
++
++
++# ---- session activity: sidebar count + strip rows --------------------------------------------------------------
++def _board(path: Path, cards: list[dict]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    c = sqlite3.connect(path)
++    c.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL, session_id TEXT, "
++              "block_kind TEXT, human_request TEXT)")
++    c.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
++              "payload TEXT, created_at INTEGER)")
++    for card in cards:
++        c.execute("INSERT INTO tasks (id, title, status, session_id, block_kind) VALUES (?,?,?,?,?)",
++                  (card["id"], card["id"], card["status"], card["session"], card.get("kind")))
++        for kind, payload, at in card.get("events", []):
++            c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
++                      (card["id"], kind, json.dumps(payload), at))
++    c.commit()
++    c.close()
++
++
++@pytest.fixture
++def kanban_root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    ksa._reset_cache_for_tests()
++    yield tmp_path
++    ksa._reset_cache_for_tests()
++
++
++def test_sidebar_stamps_stalled_only_for_old_agent_owned_waits(kanban_root, monkeypatch):
++    import time as _time
++    now = _time.time()
++    _board(kanban_root / "kanban.db", [
++        {"id": "t_old_probe", "status": "scheduled", "session": "s_stalled",
++         "events": [("scheduled", {"reason": "grant", "wake_check": "python3 probe.py"}, int(now - 3 * H))]},
++        {"id": "t_ci", "status": "scheduled", "session": "s_ci",
++         "events": [("scheduled", {"reason": "ci", "wake_check": "gh run watch 1"}, int(now - 30 * H))]},
++        {"id": "t_new_block", "status": "blocked", "kind": "transient", "session": "s_fresh",
++         "events": [("blocked", {"kind": "transient", "reason": "flaky"}, int(now - 60))]},
++        {"id": "t_running", "status": "running", "session": "s_stalled"},
++    ])
++    rows = [{"id": "s_stalled"}, {"id": "s_ci"}, {"id": "s_fresh"}]
++    ksa.annotate_kanban_activity(rows)
++    got = {r["id"]: r for r in rows}
++    assert got["s_stalled"]["kanban_stalled"] == 1
++    assert "kanban_stalled" not in got["s_ci"] and "kanban_stalled" not in got["s_fresh"]
++    assert ksa.stalled_task_counts() == {"s_stalled": 1}
++
++
++def test_session_tasks_rows_carry_what_each_card_waits_on(kanban_root):
++    import time as _time
++    now = _time.time()
++    _board(kanban_root / "kanban.db", [
++        {"id": "t_wait", "status": "scheduled", "session": "s1",
++         "events": [("blocked", {"kind": "transient"}, int(now - 9 * H)),
++                    ("scheduled", {"reason": "waiting on hub card",
++                                   "wake_check": "hermes kanban wait-check task t_x --gateway hub"}, int(now - H))]},
++        {"id": "t_run", "status": "running", "session": "s1"},
++    ])
++    rows = {t["id"]: t for t in ksa.session_tasks(["s1"])}
++    assert rows["t_wait"]["wait"]["waiting_on"] == "card t_x on hub"
++    assert rows["t_wait"]["wait"]["waiting_since"] == pytest.approx(int(now - H))
++    assert rows["t_wait"]["wait"]["wait_state"] == "waiting"
++    assert "wait" not in rows["t_run"]
++
++
++# ---- tracker wake default --------------------------------------------------------------------------------------
++@pytest.mark.parametrize("status,met", [("scheduled", 1), ("triage", 0), ("review", 0), ("blocked", 0),
++                                        ("done", 0), ("running", 1), ("ready", 1)])
++def test_default_tracker_wake_includes_owner_parking_blocking_and_triage(tmp_path, monkeypatch, status, met):
++    db = tmp_path / "kanban.db"
++    _board(db, [{"id": "t_owner", "status": status, "session": "s"}])
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    rc, _ = kwc.check_local("task", "t_owner")
++    assert rc == met
++
++
++def test_default_tracker_wake_on_scheduled_only_when_the_park_is_agent_owned(tmp_path, monkeypatch):
++    import time as _time
++    now = _time.time()
++    db = tmp_path / "kanban.db"
++    _board(db, [
++        {"id": "t_checkpoint", "status": "scheduled", "session": "s",  # a continuation checkpoint between runs
++         "events": [("blocked", {"kind": "transient"}, int(now - 9 * H)),
++                    ("continued", {"status": "scheduled", "wake_at": int(now + 600)}, int(now - 60))]},
++        {"id": "t_orphan", "status": "scheduled", "session": "s",
++         "events": [("scheduled", {"reason": "grant", "wake_check": "python3 aws_hub_ec2_probe.py"}, int(now - 3 * H))]},
++        {"id": "t_ci", "status": "scheduled", "session": "s",
++         "events": [("scheduled", {"wake_check": "gh run watch 9"}, int(now - 9 * H))]},
++    ])
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    assert kwc.check_local("task", "t_checkpoint")[0] == 1
++    assert kwc.check_local("task", "t_ci")[0] == 1
++    rc, msg = kwc.check_local("task", "t_orphan")
++    assert rc == 0 and "agent-owned" in msg
++    assert kwc.check_local("task", "t_orphan", since=("scheduled",))[0] == 1
++
++
++def test_remote_from_is_applied_locally(monkeypatch):
++    import subprocess as sp
++    seen = {}
++
++    def fake_run(argv, **kw):
++        seen["remote"] = argv[-1]
++        return sp.CompletedProcess(argv, 0, stdout="t_x scheduled (agent-owned park)\n", stderr="")
++    monkeypatch.setattr(kwc.subprocess, "run", fake_run)
++    assert kwc.check_remote("hub", "task", "t_x", since=("scheduled",))[0] == 1
++    assert "--from" not in seen["remote"] and "parked-agent" in seen["remote"]
++    assert kwc.check_remote("hub", "task", "t_x")[0] == 0
++
++
++def test_from_baseline_waits_for_the_next_change(tmp_path, monkeypatch):
++    db = tmp_path / "kanban.db"
++    _board(db, [{"id": "t_owner", "status": "scheduled", "session": "s"}])
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    assert kwc.check_local("task", "t_owner", until=("scheduled", "triage"), since=("scheduled",))[0] == 1
++    assert kwc.run(SimpleNamespace(check="task", target="t_owner", board=None, until="scheduled,triage",
++                                   since="scheduled", gateway=None)) == 1
++    with sqlite3.connect(db) as c:
++        c.execute("UPDATE tasks SET status='triage'")
++    assert kwc.check_local("task", "t_owner", since=("scheduled",))[0] == 0
++
++
++def test_unknown_card_is_cannot_tell(tmp_path, monkeypatch):
++    db = tmp_path / "kanban.db"
++    _board(db, [])
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    ns = SimpleNamespace(check="task", target="t_missing", board=None, until=None, since=None, gateway=None)
++    assert kwc.run(ns) == 2  # unknown card is "cannot tell", never "not yet"
++
++
++def test_parked_waits_lists_each_owning_session_with_wait_info(kanban_root):
++    import time as _time
++    now = _time.time()
++    _board(kanban_root / "kanban.db", [
++        {"id": "t_cap", "status": "blocked", "kind": "capability", "session": "s_owner",
++         "events": [("blocked", {"kind": "capability", "reason": "hub role denied ec2:Describe*"}, int(now - 60))]},
++        {"id": "t_run", "status": "running", "session": "s_owner"},
++        {"id": "t_ci", "status": "scheduled", "session": "s_other",
++         "events": [("scheduled", {"wake_check": "gh run watch 7"}, int(now - 60))]},
++    ])
++    rows = {r["id"]: r for r in ksa.parked_waits()}
++    assert set(rows) == {"t_cap", "t_ci"}
++    assert rows["t_cap"]["session"] == "s_owner" and rows["t_cap"]["key"] == "default/t_cap"
++    assert rows["t_cap"]["wait"]["agent_owned"] is True and rows["t_cap"]["title"] == "t_cap"
++    assert rows["t_ci"]["wait"]["agent_owned"] is False
++
++
++# ---- review fixes: false positives that must not wake anyone ------------------------------------------------------
++def test_needs_input_without_a_validated_ask_is_not_agent_owned():
++    info = d("blocked", block_kind="needs_input", human=False, park={"reason": "Two decisions for David"},
++             since=NOW - 30 * H)
++    assert info["agent_owned"] is False and info["wait_state"] == "waiting" and "unvalidated ask" in info["waiting_on"]
++
++
++def test_untyped_legacy_block_counts_only_once_stalled():
++    fresh = d("blocked", since=NOW - 60)
++    assert fresh["agent_owned"] is True and fresh["agent_owned_certain"] is False and fresh["wait_state"] == "waiting"
++    assert d("blocked", since=NOW - 3 * H)["wait_state"] == "stalled"
++
++
++def test_continuation_checkpoint_is_a_clock_park():
++    info = d("scheduled", park={"status": "scheduled", "wake_at": NOW + 600, "continuation": 2},
++             park_kind="continued", since=NOW - 9 * H)
++    assert info["agent_owned"] is False and info["waiting_on"].startswith("the clock until ")
++
++
++def test_triage_only_agent_owned_after_a_failed_run():
++    assert d("triage", park_kind="gave_up", since=NOW - 60)["agent_owned"] is True
++    assert d("triage", park_kind="supervisor_escalated", since=NOW - 60)["agent_owned"] is True
++    assert d("triage", park_kind=None, since=NOW - 30 * H)["agent_owned"] is False  # intake
++    loop = d("triage", block_kind="capability", park_kind="block_loop_detected", since=NOW - 30 * H)
++    assert loop["agent_owned"] is False and "block loop" in loop["waiting_on"]
++
++
++def test_stale_exhausted_event_does_not_outlive_a_later_continuation():
++    info = d("scheduled", park={"wake_at": NOW + 60}, park_kind="continued", since=NOW - 60)
++    assert info["agent_owned"] is False
++
++
++def test_premise_ignores_hex_ids_and_prefers_reason_codes():
++    a = d("triage", block_kind="transient", park={"reason_code": "worker_failures_exhausted",
++                                                  "error": "stale_lock=hermes-hub:1861942"}, park_kind="gave_up")
++    b = d("triage", block_kind="transient", park={"reason_code": "worker_failures_exhausted",
++                                                  "error": "stale_lock=hermes-hub:2002020 run 01a17f93-3883-77bc"},
++          park_kind="gave_up")
++    assert a["premise"] == b["premise"]
++    c = d("blocked", block_kind="transient", park={"reason": "run 01a17f93-3883-77bc-83b0-da01a927d1b2 died"})
++    e = d("blocked", block_kind="transient", park={"reason": "run 01a17f99-1111-77bc-83b0-da01a927ffff died"})
++    assert c["premise"] == e["premise"]
++
++
++@pytest.mark.parametrize("cmd,want", [
++    ("[ -f ~/.done ]", ("probe", ".done")),
++    ("s=$(sqlite3 ~/.hermes/kanban.db \"select status from tasks where id='t_01a17f2a6cc05d46'\"); [ $s = done ]",
++     ("card", "t_01a17f2a6cc05d46")),
++    ("test -e /tmp/x", ("probe", "x")),
++])
++def test_probe_labels_skip_shell_noise(cmd, want):
++    assert kwi.producer_from_wake_check(cmd) == want
++
++
++def test_stale_remote_rows_have_no_wait(kanban_root, monkeypatch):
++    rows = [{"session": "s1", "id": "t_r", "key": "hub/default/default/t_r", "board": "default", "status": "blocked",
++             "block_kind": "transient", "stale": True, "park": {"outcome": "blocked", "ended_at": 1, "reason": "x"}}]
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: rows)
++    assert ksa._remote_wait(rows[0]) is None
++    assert [r for r in ksa.parked_waits() if r["remote"]] == []
+-- 
+2.55.0
+
