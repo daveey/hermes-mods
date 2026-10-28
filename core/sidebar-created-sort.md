@@ -3,6 +3,7 @@
 Patches:
 
 - `patches/0158-fix-desktop-created-sidebar-sort-stops-reshuffling-o.patch`: the created sort key drives the base sort, branch-cluster order and the date buckets from `started_at`.
+- `patches/0571-fix-desktop-created-sidebar-sort-keeps-projects-in-p.patch`: under the created sort, projects stop moving too.
 
 What you see: with the sidebar sorted by Created, a reply in an old chat no longer lifts it to the top or into the newest date bucket.
 
@@ -10,12 +11,14 @@ What you see: with the sidebar sorted by Created, a reply in an old chat no long
 
 - Before: under date grouping the created sort only re-slotted rows inside date buckets cut by `last_active`, so activity in an old chat moved it into the newest bucket.
 - Now the created key (`started_at`) decides the base sort, branch-cluster (root/sibling) order and the date buckets. The default sort still uses last activity.
+- Projects (0571): under the created sort the project list no longer hoists the active project or re-sorts by last activity. Order is Home, explicit projects, then auto repos, each by label, with a hand-dragged order layered on top; projects new to that order append below it instead of jumping above it. The default sort keeps the activity order and active-project hoist.
 
 ## How it works
 
 - `lib/session-branch-tree.ts`: new `SessionTime` type, `sessionActivityAt` (`last_active || started_at`) and `sessionCreatedAt` (`started_at`); `FlattenSessionsOptions.timeOf` picks the clock for roots and sibling branches.
 - `lib/session-date-groups.ts`: `groupEntriesByRecency(..., timeOf)` and `headRunCutoffMs` bucket by that clock.
 - `app/chat/sidebar/index.tsx` and `sessions-section.tsx` pass `sessionCreatedAt` when the sort key is created.
+- `app/chat/sidebar/projects/model.ts`: `sortProjectsForOverview(..., { stable })` and `orderProjectsByIds(..., { stable })`; `index.tsx` passes `stable: ordering === 'created'`.
 
 ## Code
 
@@ -24,6 +27,7 @@ What you see: with the sidebar sorted by Created, a reply in an old chat no long
 ## Tests
 
 - `lib/session-date-groups.test.ts` ('groupEntriesByRecency with the created clock'): an old chat replied to an hour ago buckets by `started_at`, with a control for the default clock.
+- `app/chat/sidebar/projects/model.test.ts` ('stable project order (created sort)'): no active hoist or activity order, same order after activity changes, explicit above auto with Home on top, default sort still activity-led, a fresh active project appends below the drag order.
 - `app/chat/sidebar/sessions-section-created-sort.test.tsx`: under the created sort rows order by `started_at`, a row does not move when an older session gets activity, and the default 'updated' sort still orders by activity.
 
 ## Applying

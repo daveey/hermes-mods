@@ -84,7 +84,28 @@ request, `default` was cut over to `primary` on all three gateways ahead of the 
 clean samples on the final code, plus the end-to-end test); every claim since goes through a Board lease, with no
 rejected ops and clean diffs. Known: a claim can race the push of its card's creation
 (one deferred tick); the service stalled 15–18 s around a deploy (likely the Durable Object restarting onto new
-code); a lease granted outside a local claim is requeued by the orphan sweep and waits out one TTL.
+code). A lease granted for a claim whose local CAS then lost is handed back at once (`ClaimGate`), and the Board's
+release ends the run the grant created.
+
+Run rows left `running` (fixed 2026-10-27, kanban t_01a17fd938a6621c). Child rows have no per-field clocks, so the
+last write wins wherever it lands, and child rows push whole. A run that ended within one sync round of an earlier
+write of the same row came back `running`: the pull applied the feed copy of an older state of the row (our own
+earlier op, whose outbox row the push had already deleted, or the Board's lease-grant copy) over the newer local
+row, and the push then sent the clobbered row to the Board. The card had moved on, so nothing reached the run again;
+the MacBook, hub and mini had 12, 5 and 1 such rows. Fixed on both sides:
+- core: the apply path skips a feed copy of a child row while a local edit of it is still in the outbox, and a
+  `task_runs` copy at or below `task_runs.sync_version` (the Board version this gateway last applied or had
+  acknowledged; local-only column). The dispatcher's orphan pass also closes any run still `running` that is no
+  longer its card's current run and is over 10 min old (`close_dangling_runs`), and the sync pushes that close.
+  Tests: `test_kanban_sync_run_rows.py` (stale-lock reclaim, orphan sweep, a run ending before its first push, a
+  grant whose local CAS lost, a newer Board write still landing, the sweep).
+- Board (hermes-hub#32): `expireLease` ends the lease's run even when the card already moved on, and a holder's row
+  op that moves its card out of `running` ends the lease's run before clearing the lease (the gateway's own end of
+  the run, normally in the same batch, overwrites it). `wake_at` in `scheduled`/`continued` payloads and run
+  metadata is now seconds, as core reads it. Tests: `worker/test/lease-runs.test.ts`.
+The claim kill that made these races common (an older feed copy dropping the lease mirror, plus a stale
+`last_heartbeat_at` from the previous run, reclaimed fresh workers about 5 s after spawn) was fixed earlier in core
+36df211821 (`test_kanban_sync_lease_fencing.py`, `test_kanban_claim_heartbeat_reset.py`).
 
 After the cutover the hourly diffs caught one real defect: every process's first connect dropped and recreated
 the capture triggers with no transaction around it, so a write from another process in that window (a claim's run
