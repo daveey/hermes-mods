@@ -422,3 +422,18 @@ def test_automatic_reask_revision_loses_to_a_recorded_decision(tmp_path):
     with pytest.raises(core.ActionError):
         store.revise(OWNER, r['requestId'], 1, dict(r, title='Approve the notify fix?'), undecided=True)
     assert store.get(OWNER, r['requestId'])['resolution']['choiceId'] == 'approve'
+
+
+def test_a_model_marked_repeat_is_framed_onto_the_existing_tile(tmp_path):
+    # Live MacBook chat 20261027_232651_5eab92: the reworded re-ask came back only as a repeat of us_...
+    store, ledger = env(tmp_path)
+    first = reply(store, ledger, 'One question first: should the demo label use blue or green?', [{
+        'text': 'Choose the demo label color: blue or green', 'kind': 'choose',
+        'verbatim_span': 'should the demo label use blue or green?', 'options': ['blue', 'green']}])
+    tile = first['steps'][0]
+    span = 'Which colour do you want for the demo label, blue or green?'
+    payload = {'steps': [], 'resolved': [], 'repeats': [{'id': tile['id'], 'verbatim_span': span}]}
+    out = core.process_reply('I am still blocked on the scratch demo. ' + span, 'session-a', ledger=ledger,
+                             action_store=store, action_owner=OWNER, llm=lambda *a: json.dumps(payload))
+    assert [s['id'] for s in out['steps']] == [tile['id']] and tile['id'] in out['text']
+    assert len(live(store)) == 1 and len(ledger.read('session-a')['steps']) == 1

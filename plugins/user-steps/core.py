@@ -940,6 +940,15 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 seen.add(_norm(candidate["text"]))
                 budget -= 1
                 changed = True
+    if action_store is not None and text != HELD_REPLY and res.get("repeats"):
+        # A sentence the model marked as a repeat of an open extracted tile is framed onto that tile too, so the
+        # message points at the existing tile instead of reading as a new ask. Framing only: nothing is created.
+        by_id = {s.get("id"): s for s in ledger.open_steps(session_id) if s.get("requestId")}
+        for r in res["repeats"]:
+            step = by_id.get(r["id"])
+            if step is not None and all(p.get("id") != step["id"] for p in published) \
+                    and locate(text, r["verbatim_span"]) is not None:
+                published.append({**step, "verbatim_span": r["verbatim_span"]})
     if published and framed:
         text = frame(text, published, session_id)
     if changed or resolved:
