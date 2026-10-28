@@ -188,6 +188,15 @@ is what is built and what tests prove:
   node, state in S3), and `enroll.sh <name>` does the rest: deploy key, the fork, the token-broker client, Board
   enrollment, registry labels, config and the gateway service. That repo's README is the runbook.
 
+Measured 2026-10-28 with one 16-vCPU spot worker next to the 16-vCPU always-on gateway (cap 16 card runs), 24
+identical synthetic cards (a fixed one-minute CPU and disk program run by a real agent): hub alone, 4 load-test
+cards ran at once and the batch took 554 s (claim p50 194 s); with the worker, 18 ran at once and it took 196 s
+(claim p50 52 s); card runs across both machines peaked at 32 against 16; the hub's load average fell from 14.0 to
+10.8 and its IO pressure from 25% to 18%. Across all 120 load-test cards no card had two overlapping runs or more
+than one completed run (checked on the Board). Two limits showed up: a card created on a gateway reaches the Board
+only through that gateway's sync, so while the creator restarts (a core update, ~3 min) nobody can claim it; and
+the creator's core-update drain holds its own new claims, but not a worker's.
+
 Not built: operator actions do not yet need a user-device signature (no device keys exist before W1); the
 operator path is the Access login or the admin key. Workspace jobs keep their own registry. Sessions do not run on
 worker nodes. Desktop still reads whole boards only from each card's own gateway.
