@@ -1,0 +1,119 @@
+From 565d7be3eaa87568e776914acc4b6609772a7bbf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:25:08 -0700
+Subject: [PATCH] perf(tui): kanban poll reads only this chat's notify
+ subscriptions [daveey]
+
+Every open chat's notification poller polls each board every 5 s and called
+list_notify_subs(conn) with no filter: every subscription row on the board
+(2,465 on this install), filtered to its own chat in Python. sqlite's fetchall
+releases and re-takes the GIL per row, so ~20 pollers doing that at once kept
+~10 threads queued in take_gil and a Desktop backend at ~240% CPU, ~210% of it
+system time in the GIL convoy (2026-10-27, after the bounce fix).
+
+list_notify_subs gains platform (case-insensitive) and chat_id (exact) SQL
+filters, matching count_notify_subs; _kb_poll_board passes them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_db_notify.py                | 10 +++++
+ .../tui_gateway/test_kanban_notify_poller.py  | 38 +++++++++++++++++++
+ tui_gateway/session_notifications.py          |  2 +-
+ 3 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index f85857ddcb..9b39d46e90 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -169,12 +169,18 @@ def list_notify_subs(
+     *,
+     notifier_profiles: Optional[Iterable[str]] = None,
+     include_unowned: bool = False,
++    platform: Optional[str] = None,
++    chat_id: Optional[str] = None,
+ ) -> list[dict]:
+     """List subscriptions, optionally restricted to notifier profile owners.
+ 
+     No ``notifier_profiles`` -> all subscriptions. Gateway notifiers pass the
+     profiles they own so they cannot claim another gateway's events;
+     ``include_unowned`` (dispatch owner) covers legacy rows without a stamp.
++    ``platform`` (case-insensitive) and ``chat_id`` (exact) filter in SQL, as
++    :func:`count_notify_subs` does: a per-chat poller that fetched every row and
++    filtered in Python stepped thousands of rows each poll, re-taking the GIL per
++    row, from every open chat at once. [daveey]
+     """
+     owner_where, owner_params = _notify_profile_filter(
+         notifier_profiles, include_unowned=include_unowned,
+@@ -187,6 +193,10 @@ def list_notify_subs(
+     if owner_where:
+         where.append(owner_where)
+         params.extend(owner_params)
++    for clause, value in (("LOWER(platform) = LOWER(?)", platform), ("chat_id = ?", chat_id)):
++        if value is not None:
++            where.append(clause)
++            params.append(value)
+     sql = "SELECT * FROM kanban_notify_subs"
+     if where:
+         sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
+diff --git a/tests/tui_gateway/test_kanban_notify_poller.py b/tests/tui_gateway/test_kanban_notify_poller.py
+index c4703e56cc..691b36bc27 100644
+--- a/tests/tui_gateway/test_kanban_notify_poller.py
++++ b/tests/tui_gateway/test_kanban_notify_poller.py
+@@ -347,3 +347,41 @@ class TestNotificationPollerLoopKanbanWiring:
+         assert any(tid in text for text in submits), submits
+         assert session["_kanban_pending"] == []
+         assert session["running"] is True
++
++
++class TestPollerReadsOnlyItsOwnSubscriptions:
++    """Every open chat's poller polls the board every 5 s. It used to fetch every subscription row on the board
++    and filter in Python: 2,465 rows per poll, each row re-taking the GIL, from ~20 pollers at once, which kept a
++    Desktop backend at ~200% system CPU in a GIL convoy (2026-10-27)."""
++
++    def test_list_notify_subs_filters_platform_and_chat_in_sql(self):
++        mine = _create_subscribed_task(platform="TUI")
++        _create_subscribed_task(chat_id="someone-else")
++        _create_subscribed_task(platform="telegram")
++        conn = kbc.connect()
++        try:
++            rows = kbn.list_notify_subs(conn, platform="tui", chat_id=SESSION_KEY)
++            everything = kbn.list_notify_subs(conn)
++        finally:
++            conn.close()
++        assert [r["task_id"] for r in rows] == [mine]
++        assert len(everything) == 3
++
++    def test_poller_fetches_only_this_sessions_rows_and_still_delivers(self):
++        tid = _create_subscribed_task()
++        for n in range(40):
++            _create_subscribed_task(chat_id=f"other-chat-{n}")
++        _complete(tid, summary="mine finished")
++        fetched: list = []
++        real = kbn.list_notify_subs
++
++        def _spy(conn, *args, **kwargs):
++            rows = real(conn, *args, **kwargs)
++            fetched.append(len(rows))
++            return rows
++
++        with patch.object(kbn, "list_notify_subs", _spy):
++            texts = _collect_kanban_notifications(_session())
++
++        assert fetched == [1]
++        assert len(texts) == 1 and tid in texts[0] and "mine finished" in texts[0]
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index f50269bcb5..f32e3b99f4 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -436,7 +436,7 @@ def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None)
+     texts: list = []
+     with contextlib.closing(conn):
+         try:
+-            subs = _kbn.list_notify_subs(conn)
++            subs = _kbn.list_notify_subs(conn, platform="tui", chat_id=session_key)
+         except Exception:
+             return []
+         for sub in subs:
+-- 
+2.55.0
+
