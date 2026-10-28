@@ -705,7 +705,11 @@ class JobDomain:
         if job['provider_run_id'] is not None:
             cred, repo = private['credential_ref'], record['repository']
             run = self.github.run(cred, repo, job['provider_run_id'])
-            if ('[%s]' % job['request_id']) not in str(run.get('display_title', '')):
+            title = str(run.get('display_title', ''))
+            if ('[%s]' % job['request_id']) not in title:
+                if not REQUEST_ID.search(title) and run.get('status') != 'completed':
+                    # run-name not rendered yet: unknown, not foreign. Nothing is persisted.
+                    raise JobError('dependency_unavailable', 'run_title_pending', retryable=True)
                 raise JobError('owner_conflict', 'run_request_mismatch')
             latest = int(run['run_attempt'])
             broker = self.claims.status(job['request_id']) or {}
