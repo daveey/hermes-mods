@@ -37,21 +37,23 @@ class Wire(unittest.TestCase):
 
 
 class FakeRunner:
-    """Offline runner: a transcript replay calls one tool on its first step, then ends with text; the rubric judge
-    labels every reply that mentions 'broken' report_only and the rest started; controls all pass."""
+    """Offline runner. A transcript replay either ends the turn at once with `stop_text` (act=False) or calls a tool
+    first (act=True; after a stub result it ends with `stop_text`). The rubric judge labels a reply that mentions
+    'broken' report_only and the rest started; controls all pass."""
     offline_only = True
     max_cost_usd = 0.0
 
-    def __init__(self, stop_text):
-        self.stop_text, self.calls = stop_text, []
+    def __init__(self, stop_text, act=False):
+        self.stop_text, self.act, self.calls = stop_text, act, []
 
     def __call__(self, prompt, **kw):
         self.calls.append(prompt)
         if isinstance(prompt, dict) and "messages" in prompt:
             assert prompt["tools"], "tools must be declared"
-            if prompt["messages"][-1]["role"] != "tool":
+            if self.act and prompt["messages"][-1]["role"] != "tool":
                 return "", {"tool_calls": [{"name": "terminal", "arguments": "{}"}]}
-            assert mb.STUB_RESULT in prompt["messages"][-1]["content"]
+            if self.act:
+                assert mb.STUB_RESULT in prompt["messages"][-1]["content"]
             return self.stop_text, {}
         if isinstance(prompt, dict):  # rubric judge
             ids = re.findall(r"### id: (\w+)", prompt["user"])
@@ -81,17 +83,43 @@ class Run(unittest.TestCase):
         self.bench = self.tmp / "bench.jsonl"
         self.bench.write_text("".join(json.dumps(e) + "\n" for e in eps))
 
-    def run_with(self, text):
-        return mb.run(self.bench, "m", repeats=2, runner=FakeRunner(text), root=self.tmp / "root", live=self.live,
-                      log=lambda *_: None, replies_path=self.tmp / "replies.jsonl")
+    def run_with(self, text, act=False, **kw):
+        return mb.run(self.bench, "m", repeats=2, runner=FakeRunner(text, act), root=self.tmp / "root", live=self.live,
+                      log=lambda *_: None, replies_path=self.tmp / "replies.jsonl", **kw)
 
     def test_a_model_that_stops_at_the_diagnosis_scores_high(self):
         r = self.run_with("It is still broken; the owner has it.")
         ro = r["by_pattern"]["report_only"]
         self.assertTrue(r["complete"])
-        self.assertEqual((ro["n"], ro["fail"], ro["acted"]), (6, 6, 6))
+        self.assertEqual((ro["n"], ro["fail"], ro["acted"]), (6, 6, 0))
         self.assertEqual(r["by_pattern"]["control"], dict(r["by_pattern"]["control"], n=2, **{"pass": 2}))
         self.assertGreater(ro["ci95"][0], 0.5)
+
+    def test_a_model_that_keeps_acting_is_not_stopped(self):
+        # one request per rollout (the default): a tool call at the cut = it continued the turn
+        r = self.run_with("It is still broken", act=True)
+        ro = r["by_pattern"]["report_only"]
+        self.assertEqual((ro["n"], ro["fail"], ro["outcomes"]), (6, 0, {"continued": 6}))
+
+    def test_multi_step_rollout_feeds_stub_results(self):
+        r = self.run_with("It is still broken", act=True, max_steps=2)  # FakeRunner asserts the stub result
+        rows = [x for x in r["rows"] if x["pattern"] == "report_only"]
+        self.assertEqual({x["steps"] for x in rows}, {2})
+        self.assertEqual(r["by_pattern"]["report_only"]["fail"], 0)  # it called a tool: continued
+
+    def test_frozen_agents_md_is_the_replay_prompt(self):
+        fake = FakeRunner("ok")
+        seen = []
+        call = fake.__call__
+        fake_call = lambda prompt, **kw: (seen.append(Path(kw["cwd"], "AGENTS.md").read_text())  # noqa: E731
+                                          if isinstance(prompt, dict) and "messages" in prompt else None) or call(prompt, **kw)
+
+        class R(FakeRunner):
+            def __call__(self, prompt, **kw):
+                return fake_call(prompt, **kw)
+        mb.run(self.bench, "m", repeats=1, runner=R("ok"), root=self.tmp / "root", live=self.live,
+               log=lambda *_: None, agents_md="FROZEN RULES")
+        self.assertEqual(set(seen), {"FROZEN RULES"})
 
     def test_a_model_that_acts_scores_low_and_the_reply_cache_is_reused(self):
         r = self.run_with("Fixed it and started a card.")

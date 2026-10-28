@@ -76,7 +76,7 @@ an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix
 status check or FYI).
 """
 
-MAX_STEPS = 4
+MAX_STEPS = 1
 STUB_RESULT = ("[replay: this call ran and succeeded; its output is not shown in this replay. Do not treat the missing "
                "output as a problem or mention it. Assume it showed what you expected, and continue the turn.]")
 OUTCOMES = ("fixed", "started", "proposed", "offered", "report_only", "na")
@@ -390,7 +390,7 @@ def render_reply(text, calls):
 
 
 def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root=None, live=None, runner=None,
-        limit=None, log=print, replies_path=None):
+        limit=None, log=print, replies_path=None, max_steps=None, agents_md=None):
     """replies_path: a JSON-lines cache of finished replays; a rerun after a crash reuses them (no new spend)."""
     lines = [json.loads(x) for x in Path(bench).read_text().splitlines() if x.strip()]
     meta = next(e for e in lines if e.get("id") == "_meta")
@@ -406,6 +406,12 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
     t0 = time.time()
     try:
         cwd = ce.prepare_home(root, live, [])
+        # the frozen global AGENTS.md of the benchmark (the instructions in force when the live turns happened), else
+        # an override for an ablation, else the live one
+        agents = agents_md if agents_md is not None else meta.get("agents_md")
+        if agents is not None:
+            (Path(cwd) / "AGENTS.md").write_text(agents)
+        steps_cap = max_steps or meta.get("max_steps") or MAX_STEPS
         work = [(ep, k) for k in range(repeats) for ep in eps]
 
         def one(item):
@@ -429,7 +435,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
             """Let the model run up to MAX_STEPS requests: each tool call gets STUB_RESULT, until it ends the turn
             with text (or the cap). None when a request failed or the budget stopped it."""
             msgs, calls, text, cost = list(ep["messages"]), [], "", 0.0
-            for step in range(MAX_STEPS):
+            for step in range(steps_cap):
                 for attempt in range(3):  # a failed request (dropped or stalled stream) is retried as a new request
                     try:
                         got = budget.call(runner, {"messages": msgs, "tools": meta["tools"]}, home=root, cwd=cwd,
@@ -451,7 +457,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
                 calls += new
                 msgs += [{"role": "assistant", "content": text, "tool_calls": new}] + \
                         [{"role": "tool", "tool_call_id": c["id"], "content": STUB_RESULT} for c in new]
-            return {"text": text.strip(), "calls": calls, "steps": MAX_STEPS, "capped": True, "cost": round(cost, 4)}
+            return {"text": text.strip(), "calls": calls, "steps": steps_cap, "capped": True, "cost": round(cost, 4)}
 
         replies = {}
         cache = Path(replies_path) if replies_path else None
@@ -493,7 +499,8 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
                 iid = hashlib.sha1(f"{ep['id']}|{k}|{random.random()}".encode()).hexdigest()[:12]
                 key[iid] = (ep, k)
                 if ep["kind"] == "transcript":
-                    ro_items.append((iid, ep, rep))
+                    if not rep["calls"]:
+                        ro_items.append((iid, ep, rep))
                 else:
                     ctl_items.append((iid, ep, rep["text"]))
         random.Random(11).shuffle(ro_items)
@@ -506,9 +513,12 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
             row = {"episode": ep["id"], "pattern": ep["pattern"], "repeat": k, "steps": rep["steps"],
                    "reply": render_reply(rep["text"], rep["calls"])[:1500]}
             if ep["kind"] == "transcript":
-                if iid not in labels:
+                if rep["calls"]:
+                    outcome = "continued"  # it kept acting instead of ending the turn here: not stopped
+                elif iid in labels:
+                    outcome = labels[iid]["outcome"]
+                else:
                     continue  # ungraded
-                outcome = labels[iid]["outcome"]
                 ro["n"] += 1
                 ro["outcomes"][outcome] = ro["outcomes"].get(outcome, 0) + 1
                 ro["fail"] += outcome == "report_only"
@@ -580,6 +590,8 @@ def main(argv=None):
     r.add_argument("--jobs", type=int, default=4)
     r.add_argument("--limit", type=int)
     r.add_argument("--out")
+    r.add_argument("--max-steps", type=int, help="requests per rollout (default: the bench's, else 1)")
+    r.add_argument("--agents-md", help="ablation: use this file as the global AGENTS.md instead of the bench's")
     a = ap.parse_args(argv)
     if a.cmd == "build":
         if Path(a.out).exists():
@@ -588,7 +600,8 @@ def main(argv=None):
         return 0
     res = run(a.bench, a.model, a.repeats, a.budget, a.jobs, limit=a.limit,
               log=lambda s: print(s, file=sys.stderr, flush=True),
-              replies_path=Path(a.out).with_suffix(".replies.jsonl") if a.out else None)
+              replies_path=Path(a.out).with_suffix(".replies.jsonl") if a.out else None, max_steps=a.max_steps,
+              agents_md=Path(a.agents_md).read_text() if a.agents_md else None)
     md = markdown(res)
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
