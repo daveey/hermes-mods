@@ -1,5 +1,7 @@
 // Isolated real Chromium layout/keyboard test; fake REST, real Desktop Markdown renderer.
 // HERMES_DESKTOP_DIR=<core apps/desktop checkout with dependencies> node --test this-file
+// No playwright headless shell installed ("chromium_headless_shell-NNNN not installed")? Use the system Chrome:
+// CHROME_PATH='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' node --test this-file
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
