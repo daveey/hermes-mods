@@ -47,6 +47,10 @@ def test_failed_dispatch_rest_recovery_without_approval_leak(owner, tmp_path, mo
     sid = next(sid for sid, s in server._sessions.items() if s is session)
     assert 'result' in call('prompt.submit', {'session_id': sid, 'text': 'Please prepare a replacement plan'})
     assert [row['content'] for row in db.get_messages(own['storedSessionId'])] == ['Please prepare a replacement plan']
+    # The user's own typed prompt is ordinary work (current core schedules it via
+    # _start_session_work); only that one start is allowed from here on.
+    assert len(started) <= 1
+    typed_starts = len(started)
     replacement = copy.deepcopy(r)
     replacement['scope']['markdown'] = 'Fresh exact scope'
     revised = st.revise(own, r['requestId'], 1, replacement)
@@ -55,4 +59,4 @@ def test_failed_dispatch_rest_recovery_without_approval_leak(owner, tmp_path, mo
                               choiceId='approve', idempotencyKey='fresh-key'))
     assert fresh['operation']['operationId'] != oid
     # No implicit execution or approval reuse merely from publishing a revision.
-    assert len(attempts) == 1 and not started
+    assert len(attempts) == 1 and len(started) == typed_starts

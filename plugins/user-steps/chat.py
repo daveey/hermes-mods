@@ -29,6 +29,14 @@ def llm(system, user):
     return reply.choices[0].message.content or ''
 
 
+def verdict_json(raw):
+    """Parse the judge's object. Models often fence JSON in ```json; accept exactly
+    one fenced or bare object and nothing else (no prose extraction)."""
+    text = (raw or '').strip()
+    m = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', text, re.S)
+    return json.loads(m[1] if m else text)
+
+
 def plain(text):
     # Memory appended by the runtime is reference material, not the user's answer.
     return (text or '').split('<memory-context>', 1)[0].strip()
@@ -114,7 +122,7 @@ def reconcile(core, store, owner, judge=llm, db=None, *, request_id=None, expect
         if key in _UNMATCHED and request_id is None:
             continue
         try:
-            verdict = json.loads(judge(SYSTEM, json.dumps({k: ev[k] for k in ('question', 'answer', 'completion')})))
+            verdict = verdict_json(judge(SYSTEM, json.dumps({k: ev[k] for k in ('question', 'answer', 'completion')})))
         except Exception:
             continue
         if not isinstance(verdict, dict):

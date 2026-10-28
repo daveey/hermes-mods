@@ -224,3 +224,27 @@ def test_repair_rest_rejects_client_evidence_and_stale_revision(env, monkeypatch
     result = client.post(path, json=body)
     assert result.status_code == 200 and result.json()['request']['state'] == 'superseded'
     assert client.get(f'/requests/{r["requestId"]}', params={'session':'session'}).json()['request']['state'] == 'superseded'
+
+
+@pytest.mark.parametrize('wrap', [
+    lambda j: '```json\n' + j + '\n```',   # observed live (Diplomacy request bedaa07f, 2026-10-27)
+    lambda j: '```\n' + j + '\n```',
+    lambda j: '  ' + j + '\n',
+])
+def test_fenced_judge_output_still_reconciles(env, wrap):
+    st, r, db = env
+    out = chat.reconcile(core, st, OWNER, lambda s, u: wrap(judged(s, u)), db)
+    assert out and out[0]['request']['state'] == 'superseded'
+    assert out[0]['chatEvidence']['executionAuthorized'] is False
+
+
+@pytest.mark.parametrize('raw', [
+    'Sure! ```json\n{"outcome":"answered","quote":"make the changes you want"}\n```',
+    '```json\n{"outcome":"answered","quote":"make the changes you want"}\n``` trailing',
+    '{"outcome":"answered","quote":"make the changes you want"} {"outcome":"unmatched"}',
+    '```json\n["answered"]\n```',
+])
+def test_judge_prose_or_extra_objects_fail_closed(env, raw):
+    st, r, db = env
+    assert chat.reconcile(core, st, OWNER, lambda s, u: raw, db) == []
+    assert st.get(OWNER, r['requestId'])['state'] == 'open'
