@@ -1,11 +1,13 @@
-# New sessions on a saved gateway (device switcher right-click)
+# New sessions on a saved gateway (device switcher "New sessions on ▸")
 
-Patch **0722** (`066b48864d`).
+Patches **0722** (`066b48864d`), **0724** (`0c7f598467`).
 
 ## Behavior
-- Right-click a gateway in the status-bar device switcher → **Use for new sessions**. It saves that gateway
-  (profile `default`) as the app-wide new-session route. It does not switch what is on screen. The saved row shows a
-  small home mark ("New sessions start here"); its right-click item shows the checked state.
+- The status-bar device switcher keeps its menu (gateways, Manage gateways…) and gains one row above Manage:
+  **New sessions on: <gateway> ▸**, a submenu listing the gateways as radio choices. Picking one saves it (profile
+  `default`) as the app-wide new-session route. It does not switch what is on screen. The saved gateway's row in the
+  main list shows a small home mark ("New sessions start here"). 0722 first shipped this as a per-row right-click;
+  0724 moved it into the menu because the right-click replaced the row's existing context menu.
 - The choice is sticky: Electron persists it (`active-profile.json` → `defaultRoute`), so it survives a relaunch.
   Opening or clicking a session on another gateway (sidebar, Inbox, search, deep link) never changes it.
 - Generic new sessions use it: the sidebar **New session** row (upstream), `/new` (upstream), the tab-strip "+" /
@@ -29,15 +31,16 @@ generic new sessions. The fork adds the switcher entry point, routes ⌘N/palett
 generic "Failed to open profile" toast for a routed target with `notifyNewSessionTargetUnreachable`.
 
 ## Code
-- `apps/desktop/src/app/chat/sidebar/connection-switcher.tsx` — per-row `ContextMenu`, home mark
+- `apps/desktop/src/app/chat/sidebar/connection-switcher.tsx` — `DropdownMenuSub` "New sessions on", home mark
 - `apps/desktop/src/app/hooks/use-keybinds.ts` — `session.new` uses the saved route when there is one
 - `apps/desktop/src/app/session/new-session-route.ts` — `notifyNewSessionTargetUnreachable`
 - `apps/desktop/src/app/command-palette/index.tsx`, `apps/desktop/src/app/context-menu/shell-menu-items.tsx` —
   `runBuiltinAction('session.new')`, navigation fallback
-- i18n: `profiles.useForNewSessions` … `profiles.createOnThisDevice` (en; other locales in `overlay-gaps.json`)
+- i18n: `profiles.newSessionsOn` … `profiles.createOnThisDevice` (en; other locales in `overlay-gaps.json`)
 
 ## Tests
-- Device switcher right-click saves without switching, marks the row: `src/app/chat/sidebar/connection-switcher.test.tsx`
+- Device menu keeps its rows, the New sessions on submenu saves without switching, trigger names the target, row is
+  marked: `src/app/chat/sidebar/connection-switcher.test.tsx`
 - Sidebar row after opening a session on another gateway still creates on the saved gateway; no-saved-gateway control
   follows the gateway on screen; unreachable notice + This-device action; no action for a local target:
   `src/app/session/hooks/new-session-target.test.tsx`
@@ -49,7 +52,7 @@ generic "Failed to open profile" toast for a routed target with `notifyNewSessio
 - Untested: the Inbox/search/deep-link open paths individually (they share the resume path the sidebar test drives).
 
 ## Applying
-After 0042. `git am -3 --empty=keep core/patches/0722-*.patch`.
+After 0042. `git am -3 --empty=keep core/patches/0722-*.patch core/patches/0724-*.patch`.
 
 ## Gotchas
 - The route's profile is `default` when picked from the switcher; use the profile row's "Set as default" for another.
