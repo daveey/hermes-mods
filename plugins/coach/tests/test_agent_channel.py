@@ -39,6 +39,24 @@ def term(c, cmd, result=OK, sid="s1", **args):
     c.observe(sid, "terminal", {"command": cmd, **args}, result)
 
 
+# ── kanban_db_down: the session's last Kanban call failed on an unreadable board ──
+KDB_ERR = json.dumps({"error": "kanban_show: Refusing to open corrupt kanban DB at /home/ubuntu/.hermes/kanban.db: "
+                               "integrity_check returned 'Rowid 1997 out of order'. Original preserved; backup at /x."})
+
+
+def test_kanban_db_down_tracks_last_kanban_call_across_turns(tmp_path):
+    c = coach(tmp_path)
+    assert c.kanban_db_down("s1") is False
+    c.observe("s1", "kanban_show", {"task_id": "t_x"}, KDB_ERR)
+    c.turn_start("s1", "next turn")
+    term(c, "ls")  # a non-Kanban call doesn't clear it
+    assert c.kanban_db_down("s1") is True
+    c.observe("s1", "kanban_show", {"task_id": "t_x"}, json.dumps({"task": {"id": "t_x"}}))
+    assert c.kanban_db_down("s1") is False
+    c.observe("s1", "kanban_show", {"task_id": "t_x"}, json.dumps({"error": "task t_x not found"}))
+    assert c.kanban_db_down("s1") is False  # other Kanban errors are not a down board
+
+
 # ── repeat_failure ──
 def test_repeat_failure_fires_on_third_identical_failure(tmp_path):
     c = coach(tmp_path)

@@ -279,6 +279,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             rc = _load("reply_check")
             cfg = rc.settings()
             ask, log_lines = coach.turn_context(session_id)
+            # this session's Kanban tools can't read the board: kanban_create fails too, so nudges don't ask for it
+            kanban_down = coach.kanban_db_down(session_id) or rc.kanban_db_down(log_lines)
             so = _load("second_opinion")
             # unverified + this turn changed a git repo -> one bounded diff review on the strong model. The rule
             # joins the judged set only for such turns, so diff_review off (default) = the old behaviour exactly.
@@ -321,6 +323,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            wake=lambda: rc.wake_sources(session_id, log_lines),
                            screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log,
                            confirm=confirm, confirm_floor=rc.CONFIRM_FLOOR,
+                           kanban_down=kanban_down,
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
@@ -335,7 +338,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     if rest:
                         r = max(rest, key=lambda x: v[x])
                         hit = {"rule": r, "p": v[r], "evidence": v["evidence"],
-                               "nudge": rc.NUDGES[r].format(evidence=v["evidence"] or "see your last message")}
+                               "nudge": rc.nudge_for(r, v["evidence"], kanban_down=kanban_down)}
             if not hit:
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response)})
