@@ -60,6 +60,8 @@ _POLL_WAIT_S = 0.75
 # even though each read takes under 0.1 s.
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="hub-sync")
 _SLOW_LOG_S = 1.0
+_BOOT_LOG_S = 60.0
+_LOADED_AT = time.monotonic()
 log = logging.getLogger(__name__)
 
 
@@ -85,6 +87,12 @@ async def _run_timed(key, fn):
         return await loop.run_in_executor(_EXECUTOR, call)
     finally:
         done = time.monotonic()
+        if entered - _LOADED_AT < _BOOT_LOG_S:
+            # Boot window: entry time vs. the Desktop's send time tells a blocked loop from a slow read.
+            wall = time.time() - (done - entered)
+            log.warning("hub-sync boot poll key=%r entered=%s.%03d total=%.2fs default_backlog=%s",
+                        key, time.strftime("%H:%M:%S", time.localtime(wall)), int(wall * 1000) % 1000,
+                        done - entered, _default_backlog(loop))
         if done - entered >= _SLOW_LOG_S:
             t0 = started.get("t", done)
             log.warning("hub-sync slow poll key=%r total=%.2fs queue=%.2fs run=%.2fs default_backlog=%s",
