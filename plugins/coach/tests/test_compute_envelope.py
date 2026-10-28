@@ -141,3 +141,10 @@ def test_classifier_cases():
     assert not ce.classify("May I rent a 4x A100 node for 2 hours ($18)?")  # multi-GPU
     assert not ce.classify("Want me to merge the PR?")
     assert not ce.classify("If the run needs more than $25 I will ask you first.")
+    # Live false faults (sessions 20261028_045926_ce1a18, 20261028_045950_e52a72): replies quoting or explaining the
+    # note are not asks.
+    assert not ce.classify("Compute envelope: you are asking a human to approve compute/spend that is NOTED")
+    assert not ce.classify("The guard acted on the call's reason text: it read it as asking you to approve compute "
+                           "that's within the default $25, single-GPU limit.")
+    assert not ce.classify("The coach flagged my last reply too, because it quoted the approval question word for "
+                           "word. Nothing is being asked here and nothing is being rented.")

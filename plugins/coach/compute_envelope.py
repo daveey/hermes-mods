@@ -41,6 +41,10 @@ CREDENTIAL_RE = re.compile(
     r"token-?broker|\bgrant\b|\bcredential|\bpassword|\bpasscode|\b2fa\b|\bsudo\b|\bssh key|\blog ?in\b|\bsign in\b",
     re.I)
 GPU_HOURS_RE = re.compile(r"\bgpu[- ]?h(?:ours?|rs?)?\b", re.I)
+# A sentence about the guard itself (quoting or explaining this note) is not an ask. Live false faults:
+# "Compute envelope: you are asking a human to approve compute/spend that is NOTED",
+# "The guard acted on the call's reason text: it read it as asking you to approve compute ... $25".
+META_RE = re.compile(r"\bcompute envelope\b|\bcoach\b|\bguard\b|\benvelope\b", re.I)
 MULTI_RE = re.compile(
     r"\b(?:[2-9]|[1-9]\d+)\s*(?:x|×|-)?\s*(?:gpus?|h100s?|h200s?|a100s?|b200s?|b300s?|4090s?|l40s?|a6000s?)\b|"
     r"\b(?:h100|h200|a100|b200|b300|4090|gpu)s?\s*[x×]\s*(?:[2-9]|[1-9]\d+)\b|"
@@ -84,7 +88,8 @@ def classify(text: str, envelope: Optional[float] = None) -> Optional[dict]:
     if MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", text)):
         return None
     for sent in SENTENCE_SPLIT_RE.split(text):
-        if ASK_RE.search(sent) and COMPUTE_RE.search(sent) and not CREDENTIAL_RE.search(sent):
+        if (ASK_RE.search(sent) and COMPUTE_RE.search(sent) and not CREDENTIAL_RE.search(sent)
+                and not META_RE.search(sent)):
             return {"sentence": sent.strip()[:300], "usd": max(money) if money else None, "cap": cap}
     return None
 
