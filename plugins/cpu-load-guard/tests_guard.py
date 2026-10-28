@@ -534,3 +534,60 @@ def test_flat_list_replaces_default_without_pyyaml(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "hermes-hub")
     assert plugin.guard.protected_hosts() == ["only-this-host"]
     assert not plugin.guard.enabled()
+
+
+# --- data files named in code: open("x.txt"), path = "x.txt" are not executed ----------------
+
+def _data_txt(tmp_path):
+    t = tmp_path / "call-spill.txt"
+    t.write_text(BURN_SH)  # a dump that merely mentions a load generator
+    return t
+
+
+def test_exec_burn_sh_and_inline_still_block(tmp_path):
+    p = tmp_path / "burn.sh"
+    p.write_text(BURN_SH)
+    for cmd in (f"bash {p}", f"cd {tmp_path} && bash burn.sh", f"nohup {p} &", f". {p}"):
+        r = run("terminal", {"command": cmd, "workdir": str(tmp_path)})
+        assert r and r["action"] == "block", cmd
+    r = run("write_file", {"path": str(tmp_path / "burn2.sh"), "content": BURN_SH})
+    assert r and r["action"] == "block"
+    code = f'import subprocess\nsubprocess.run(["bash", "{p}"])\n'
+    assert run("execute_code", {"code": code})["action"] == "block"
+
+
+def test_execute_code_opening_data_file_allows(tmp_path):
+    t = _data_txt(tmp_path)
+    code = f'import json\npath = "{t}"\nwith open(path) as f: data = f.read()\n'
+    assert run("execute_code", {"code": code}) is None
+    assert run("execute_code", {"code": f'print(open("{t}").read())'}) is None
+    assert run("execute_code", {"code": f'from pathlib import Path\nPath("{t}").read_text()'}) is None
+
+
+def test_terminal_python_c_opening_data_file_allows(tmp_path):
+    t = _data_txt(tmp_path)
+    for cmd in (
+        f"python3 -c 'print(open(\"{t}\").read())'",
+        f"python3 -c \"path='{t}'; import json; d=open(path).read()\"",
+    ):
+        assert run("terminal", {"command": cmd, "workdir": str(tmp_path)}) is None, cmd
+
+
+def test_write_file_of_py_reading_data_file_allows(tmp_path):
+    t = _data_txt(tmp_path)
+    content = f'src = "{t}"\ntext = open(src).read()\n'
+    assert run("write_file", {"path": str(tmp_path / "show_ctx.py"), "content": content}) is None
+
+
+@pytest.mark.parametrize("fmt", [
+    "git bisect run {p}",
+    "git bisect run bash {p}",
+    "xargs {p}",
+    "find . -name x -exec {p} {{}} \\;",
+])
+def test_exec_style_operand_blocks(tmp_path, fmt):
+    p = tmp_path / "burn.sh"
+    p.write_text(BURN_SH)
+    p.chmod(0o755)
+    r = run("terminal", {"command": fmt.format(p=p), "workdir": str(tmp_path)})
+    assert r and r["action"] == "block", fmt

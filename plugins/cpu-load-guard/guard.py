@@ -77,6 +77,20 @@ CMD_POS_RE = re.compile(
     r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*)\s+)*"
     r"(?:'((?:~|\.{1,2})?/[^']+)'|\"((?:~|\.{1,2})?/[^\"]+)\"|((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+))"
 )
+# Operands that a command hands to exec: `git bisect run ./x`, `xargs ./x`, `find . -exec ./x {} \;`.
+EXEC_OPERAND_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`'\"]))(?:git\s+bisect\s+run|xargs(?:\s+-[-\w=]+)*|"
+    r"find\b[^;&|\n]*?\s-exec(?:dir)?)\s+" + _QTOKEN,
+    re.M,
+)
+# What sits before a quote/paren that makes a path "data": an assignment (`src = "/x.txt"`) or
+# the argument of a call that reads or inspects a file (`open("/x")`, `Path("/x").read_text()`).
+_DATA_PREFIX_RE = re.compile(
+    r"(?:(?<![=!<>])=|\b(?:open|read_text|read_bytes|load|loads|Path|PurePath|exists|isfile|isdir|"
+    r"getsize|getmtime|stat|abspath|realpath|basename|dirname|splitext|readlines|read_file|"
+    r"fromfile|loadtxt|read_csv|read_json|expanduser|glob|iglob)\s*\()\s*$"
+)
+
 # Readers and file tools. A path they are given is data, never a script this command runs, even
 # when an interpreter name happens to sit in their arguments (`grep python burn.py`).
 _READERS = frozenset({
@@ -341,6 +355,8 @@ def _operand_of_reader(text: str, pos: int) -> bool:
     words = _words_before(text, pos)
     if not words:
         return False
+    if words[:3] == ["git", "bisect", "run"]:
+        return False  # git bisect run executes its operand
     i = 0
     while i < len(words) and words[i] in _WRAPPERS:
         i += 1
@@ -354,17 +370,34 @@ def _operand_of_reader(text: str, pos: int) -> bool:
     return argv0 in _READERS or nearest in _READERS
 
 
+def _is_data_path(text: str, m: re.Match) -> bool:
+    """A CMD_POS_RE hit whose quote/paren boundary is not a command position.
+
+    `path = "/x.txt"` and `open("/x.txt")` name a file without running it. Only the ambiguous
+    boundaries (a quote or an opening paren) are checked; `;`, `&`, `|`, newline and a bare line
+    start stay command positions.
+    """
+    b = m.start()
+    if b >= len(text) or text[b] not in "'\"(":
+        return False
+    return bool(_DATA_PREFIX_RE.search(text[: b + 1] if text[b] == "(" else text[:b]))
+
+
 def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
     if depth >= MAX_DEPTH:
         return None
     base = cwd or os.getcwd()
     cds = [(m.start(), _word(m)[1]) for m in CD_RE.finditer(text)]
-    hits = sorted(_word(m) for r in (INTERP_RE, PY_FILE_RE, CMD_POS_RE) for m in r.finditer(text))
+    hits = sorted(
+        [_word(m) + (False,) for r in (INTERP_RE, PY_FILE_RE) for m in r.finditer(text)]
+        + [_word(m) + (False,) for m in CMD_POS_RE.finditer(text) if not _is_data_path(text, m)]
+        + [_word(m) + (True,) for m in EXEC_OPERAND_RE.finditer(text)]
+    )
     seen = set()
-    for pos, tok in hits:
+    for pos, tok, execs in hits:
         # grep/cat/sed/git/cp/... never execute the file they are handed. An interpreter word in
         # their arguments (`grep python burn.py`, `echo "python3 x.py"`) is data too.
-        if _operand_of_reader(text, pos):
+        if not execs and _operand_of_reader(text, pos):
             continue
         here = _cwd_at(pos, cds, base)
         p = _resolve(tok, here)
