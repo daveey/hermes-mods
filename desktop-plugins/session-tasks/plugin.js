@@ -477,19 +477,19 @@ async function lineageIds(storedId, connection, profile = 'default') {
     try {
       const row = await api(`/api/sessions/${encodeURIComponent(cur)}`, connection, 5_000, profile)
       if (!row || row.id !== cur || (row.parent_session_id != null && typeof row.parent_session_id !== 'string')) {
-        ids.incomplete = true
+        ids.incomplete = `malformed row from GET /api/sessions/${cur}`
         return ids
       }
       ids.add(row.id)
       cur = str(row.parent_session_id)
       if (cur) ids.add(cur)
-    } catch {
-      ids.incomplete = true
+    } catch (error) {
+      ids.incomplete = `GET /api/sessions/${cur} failed: ${String(error?.message ?? error).slice(0, 200)}`
       return ids
     }
   }
   if (cur) {
-    ids.incomplete = true
+    ids.incomplete = 'ancestry deeper than 12 hops'
     return ids
   }
   lineageCache.set(cacheKey, { at: Date.now(), ids })
@@ -616,7 +616,12 @@ export async function archiveGuard({ sessionId, ids, profile, connectionId } = {
   }
   const lineage = new Set(ids || [])
   const resolved = await lineageIds(sessionId, connectionId, profile || 'default')
-  if (resolved.incomplete) return [{ label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }]
+  if (resolved.incomplete) {
+    // The dialog line cannot say which owner was asked or why it failed, and
+    // hermes:api never logs an expected 404; error level reaches desktop.log.
+    console.error(`[session-tasks archive-guard] ancestry unavailable for ${sessionId} via ${connectionId || '(no owner)'}/${profile || 'default'}: ${resolved.incomplete}`)
+    return [{ label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }]
+  }
   for (const id of resolved) lineage.add(id)
   const inv = await api('/api/plugins/compute-rentals/inventory?session_id=&profile=&gateway_id=', connectionId, 2_000, profile || 'default')
   if (!inv || !Array.isArray(inv.machines)) return []

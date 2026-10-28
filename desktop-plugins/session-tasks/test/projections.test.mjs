@@ -586,6 +586,18 @@ test('archive guard warns when session ancestry is unavailable and retries recov
   } finally { delete globalThis.window }
 })
 
+test('unavailable ancestry logs the owner it asked and why, so the dialog is traceable', async () => {
+  const logged = []
+  const original = console.error
+  console.error = line => logged.push(String(line))
+  globalThis.window = { hermesDesktop: { api: async () => { throw new Error('404: {"detail":"Session not found"}') } } }
+  try {
+    const target = { sessionId: 's_archive_traced', connectionId: 'local', profile: 'default' }
+    assert.ok((await m.archiveGuard(target)).some(line => /ancestry unavailable/i.test(line.value)))
+    assert.deepEqual(logged, ['[session-tasks archive-guard] ancestry unavailable for s_archive_traced via local/default: GET /api/sessions/s_archive_traced failed: 404: {"detail":"Session not found"}'])
+  } finally { console.error = original; delete globalThis.window }
+})
+
 test('malformed ancestry cannot certify a root or poison the lineage cache', async () => {
   const invalid = [null, {}, { id: 'wrong', parent_session_id: null }, { id: 's_invalid_3', parent_session_id: {} }]
   let response
