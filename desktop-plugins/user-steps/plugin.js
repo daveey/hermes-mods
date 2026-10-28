@@ -4,13 +4,15 @@
  * request for complete context. Authorization uses durable owner-routed REST operations,
  * never composer.submit plus resolve or generic card unblocking. Existing links,
  * preview navigation and separately collapsed agent issues remain available.
+ * Withdrawn (moot) asks leave the queue; "Not needed" withdraws an undecided ask
+ * on its owner without deciding it, so nothing is sent to the agent.
  */
 import { COMPOSER_AREAS, TRANSCRIPT_DIRECTIVE_AREA, host, useValue, MessageTextContent } from '@hermes/plugin-sdk'
 import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 12
+const VERSION = 13
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -97,6 +99,18 @@ export const directiveIds = attrs => str(attrs?.id).split(',').map(x => x.trim()
 const short = (s, n = 140) => {
   const t = str(s).replace(/\s+/g, ' ').trim()
   return t.length > n ? `${t.slice(0, n - 1)}…` : t
+}
+
+/** "asked 5 min ago" for a request's ISO-8601 createdAt; '' when absent or unparseable (legacy rows).
+ *  Clock skew (a createdAt in the future) reads as just now. */
+export function askedAgo(createdAt, now = Date.now()) {
+  const at = typeof createdAt === 'string' && createdAt.trim() ? Date.parse(createdAt) : NaN
+  if (!Number.isFinite(at) || !Number.isFinite(now)) return ''
+  const min = Math.floor(Math.max(0, now - at) / 60_000)
+  if (min < 1) return 'asked just now'
+  if (min < 60) return `asked ${min} min ago`
+  const h = Math.floor(min / 60)
+  return h < 24 ? `asked ${h} h ago` : `asked ${Math.floor(h / 24)} d ago`
 }
 
 /** The buttons a step offers. kind 'submit' sends `text` as a visible user turn then resolves with `resolution`;
@@ -494,17 +508,22 @@ export function StepBox({ attrs, streaming, deps }) {
       }),
       jsx('div', { key: 't', 'data-user-step-text': '', style: { whiteSpace: 'pre-wrap', lineHeight: 1.5 }, children: jsx(Linked, { text }) }),
       state.loading && jsx('div', { key: 'l', style: { fontSize: 11, opacity: 0.6 }, children: 'Loading\u2026' }),
-      ...state.steps.map(s =>
-        (s.status || 'open') === 'open'
-          ? jsxs('div', {
-              style: { display: 'flex', flexDirection: 'column', gap: 4 },
-              children: [
-                state.steps.length > 1 && jsx('div', { style: { fontSize: 12, opacity: 0.85 }, children: jsx(Linked, { text: s.text }) }),
-                jsx('small', { children: receiptStatus({ ...attrs, gatewayId: attrs?.gatewayId || s.requestOwner?.gatewayId, profile: attrs?.profile || s.requestOwner?.profile, requestId: attrs?.requestId || s.requestId }, ids, scope) })
-              ]
-            }, s.id)
-          : jsx('div', { 'data-user-step-resolved': s.id, style: { fontSize: 11.5, opacity: 0.65 }, children: `\u2713 ${s.resolution || 'Resolved'}${state.steps.length > 1 ? ` \u2014 ${s.text}` : ''}` }, s.id)
-      )
+      ...state.steps.map(s => {
+        // Each step's receipt follows its own request: a withdrawn sibling in the same directive never relabels it.
+        const receipt = { ...attrs, gatewayId: attrs?.gatewayId || s.requestOwner?.gatewayId, profile: attrs?.profile || s.requestOwner?.profile, requestId: attrs?.requestId || s.requestId }
+        if ((s.status || 'open') === 'open')
+          return jsxs('div', {
+            style: { display: 'flex', flexDirection: 'column', gap: 4 },
+            children: [
+              state.steps.length > 1 && jsx('div', { style: { fontSize: 12, opacity: 0.85 }, children: jsx(Linked, { text: s.text }) }),
+              jsx('small', { children: receiptStatus(receipt, [s.id], scope) })
+            ]
+          }, s.id)
+        // A withdrawal also retires the ledger step; it reads as no longer needed, never as a completed (✓) decision.
+        const linked = linkedRequest(receipt, [s.id], scope)
+        const status = linked?.state === 'withdrawn' ? withdrawnReceipt(linked) : `\u2713 ${s.resolution || 'Resolved'}`
+        return jsx('div', { 'data-user-step-resolved': s.id, style: { fontSize: 11.5, opacity: 0.65 }, children: `${status}${state.steps.length > 1 ? ` \u2014 ${s.text}` : ''}` }, s.id)
+      })
     ]
   })
 }
@@ -598,7 +617,7 @@ export function validRequest(r) {
   return !!requestKey(r) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(r.requestId) &&
     r.schemaVersion === 2 && Number.isInteger(r.revision) && r.revision >= 1 && text(r.owner.storedSessionId) &&
     ['approval','choice','input','external_step'].includes(r.kind) && text(r.title) &&
-    ['needs_context','open','resolved','superseded','cancelled'].includes(r.state) &&
+    ['needs_context','open','resolved','superseded','cancelled','withdrawn'].includes(r.state) &&
     typeof r.scope?.markdown === 'string' && typeof r.scope.complete === 'boolean' &&
     Array.isArray(r.scope.sourceRefs) && r.scope.sourceRefs.every(sourceKey) &&
     Array.isArray(r.aliases) && r.aliases.every(sourceKey) &&
@@ -621,7 +640,11 @@ export function requestForSource(requests, source) {
   const key = sourceKey(source)
   if (!key) return null
   const matches = projectRequests(requests).filter(r => (r.aliases || []).some(a => sourceKey(a) === key))
-  return matches.length === 1 ? matches[0] : null // ambiguous provenance never suppresses another request
+  // A withdrawn ask still retires its own references (they never resurface as legacy asks or blocked chips),
+  // but never competes with a live request that claims the same source.
+  const live = matches.filter(r => r.state !== 'withdrawn')
+  const pool = live.length ? live : matches
+  return pool.length === 1 ? pool[0] : null // ambiguous provenance never suppresses another request
 }
 function decisionRoute() {
   const owner = host.state?.focusedSessionOwner?.get?.()
@@ -645,9 +668,19 @@ let canonical = { scope: null, requests: [], error: null }
 const canonicalSubs = new Set()
 const readbacks = new Set()
 let requestRead = 0
+/** The canonical request a transcript directive refers to: exact owner plus request ID or a qualified user_step alias. */
+function linkedRequest(attrs, ids, scope) {
+  if (canonical.scope !== scope) return null
+  return canonical.requests.find(r => r.owner.storedSessionId === attrs?.s && r.owner.gatewayId === attrs?.gatewayId && r.owner.profile === attrs?.profile && (r.requestId === attrs?.requestId || (r.aliases || []).some(a => a.type === 'user_step' && ids.includes(a.id) && a.gatewayId === attrs.gatewayId && a.profile === attrs.profile))) || null
+}
+const withdrawnReceipt = r => {
+  const reason = typeof r?.withdrawal?.reason === 'string' ? short(r.withdrawal.reason, 300) : ''
+  return reason ? `No longer needed \u2014 ${reason}` : 'No longer needed.'
+}
 function receiptStatus(attrs, ids, scope) {
   if (canonical.scope !== scope) return 'Reference only — review and decide above the composer.'
-  const linked = canonical.requests.find(r => r.owner.storedSessionId === attrs?.s && r.owner.gatewayId === attrs?.gatewayId && r.owner.profile === attrs?.profile && (r.requestId === attrs?.requestId || (r.aliases || []).some(a => a.type === 'user_step' && ids.includes(a.id) && a.gatewayId === attrs.gatewayId && a.profile === attrs.profile)))
+  const linked = linkedRequest(attrs, ids, scope)
+  if (linked?.state === 'withdrawn') return withdrawnReceipt(linked)
   const state = linked && operations.get(`${scope}:${requestKey(linked)}`)
   if (state?.phase === 'cancelled') return 'Decision not started — no permission was delivered. A replacement revision requires a fresh decision.'
   return state?.phase === 'confirmed' ? 'Confirmed — decision delivered.' : linked?.resolution || state?.decision ? 'Decision recorded; delivery status is above the composer.' : 'Reference only — review and decide above the composer.'
@@ -656,18 +689,51 @@ function signalDecisionChanges() {
   if (typeof window !== 'undefined' && window.dispatchEvent) window.dispatchEvent(new window.Event('hermes:user-steps-changed'))
 }
 const publishCanonical = () => { canonicalSubs.forEach(fn => fn(canonical)); signalDecisionChanges(); emit() }
+// Owner capabilities: GET /ping at most once per route scope per FEATURE_TTL_MS. A failed ping is not cached (the
+// next tile mount asks again) and an answer expires, so an owner that restarts onto a newer plugin is noticed.
+const FEATURE_TTL_MS = 5 * 60_000
+const pings = new Map() // routeKey -> { at, promise: Promise<string[]> }
+const pinged = new Map() // routeKey -> { at, list: string[] } once answered
+const freshFeatures = scope => { const p = pinged.get(scope); return p && Date.now() - p.at <= FEATURE_TTL_MS ? p.list : null }
+function ownerFeatures(route, call = api) {
+  const scope = routeKey(route), cached = pings.get(scope)
+  if (cached && Date.now() - cached.at <= FEATURE_TTL_MS) return cached.promise
+  const entry = { at: Date.now(), promise: null }
+  entry.promise = (async () => {
+    try {
+      if (host.state?.focusedSessionOwner && !route.connectionId) throw Error('Session owner unavailable')
+      const r = await call(`${BASE}/ping`, { ...route, timeoutMs: 6_000 })
+      const list = Array.isArray(r?.features) ? r.features.filter(f => typeof f === 'string') : []
+      pinged.set(scope, { at: Date.now(), list })
+      return list
+    } catch (e) {
+      log('ping failed', e?.message || e)
+      if (pings.get(scope) === entry) pings.delete(scope)
+      return []
+    }
+  })()
+  pings.set(scope, entry)
+  return entry.promise
+}
+export const clearFeatureCache = () => { pings.clear(); pinged.clear() }
 export async function refreshRequests(call = api) {
   const generation = ++requestRead
   const route = decisionRoute(), scope = routeKey(route)
   if (!route.session) return
   try {
     if (host.state?.focusedSessionOwner && !route.connectionId) throw Error('Session owner unavailable')
-    const result = await call(`${BASE}/requests?session=${encodeURIComponent(route.session)}`, route)
+    // Withdrawn rows are requested so receipts and alias suppression know them; the queue never shows them.
+    const result = await call(`${BASE}/requests?session=${encodeURIComponent(route.session)}&include=withdrawn`, route)
     if (!currentRoute(route) || generation !== requestRead) return
     if (!Array.isArray(result?.requests)) throw Error('Invalid action queue response')
     const requests = projectRequests(result.requests)
     if (requests.length !== new Set(result.requests.map(requestKey)).size || requests.some(r => r.owner.storedSessionId !== route.session || r.owner.profile !== route.profile)) throw Error('Invalid action request owner or schema')
     canonical = { scope, requests, error: null }
+    // A withdrawn request can carry no decision for its revision: a retry intent saved for it is dead.
+    for (const r of requests) {
+      const key = `${scope}:${requestKey(r)}`
+      if (r.state === 'withdrawn' && !r.resolution && recoverIntent(key, r)) { try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {} }
+    }
     publishCanonical()
     readbacks.forEach(check => check())
   } catch (e) {
@@ -693,6 +759,9 @@ const needsText = c => c.effect === 'revise' || (c.effect === 'answer' && c.id =
 // Missing plan/step = agent work. It never counts as something "for you".
 export const agentPending = r => !['choice','input'].includes(r.kind) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !(r.choices || []).some(c => c.effect === 'approve')))
 const choiceLabel = (c, choices, kind) => kind !== 'approval' ? c.label : c.effect === 'approve' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
+const WITHDRAW_REASON = 'Dismissed in Desktop as not needed'
+const WITHDRAW_TITLE = 'Remove this ask without deciding; nothing is sent to the agent'
+const withdrawing = new Set() // tile keys with a withdraw POST in flight: one per tile, also across two mounted tiles
 
 function saveReadback(route, request) {
   if (!currentRoute(route)) return
@@ -717,7 +786,8 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     return operations.get(key) || { request, phase: decision ? 'unknown' : 'idle', decision, text: decision?.revisionText || '' }
   })
   const [editing, setEditing] = useState(null)
-  const input = useRef(null), trigger = useRef(null), live = useRef(true)
+  const input = useRef(null), trigger = useRef(null), live = useRef(true), article = useRef(null)
+  const [dismissal, setDismissal] = useState({ busy: false, note: '', error: '' })
   const latest = useRef(request)
   latest.current = request
   useEffect(() => { live.current = true; const fn = () => { const s = operations.get(key); if (s) setState(s) }; canonicalSubs.add(fn); return () => { live.current = false; canonicalSubs.delete(fn) } }, [key])
@@ -734,6 +804,18 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     }
   }, [request.revision])
   const locked = !!state.decision || !!r.resolution || !['open','needs_context'].includes(r.state)
+  // "Not needed" retires an undecided ask on its owner. It is offered only when no decision is recorded or in
+  // flight, no decision card is bound to it (that card decides it), and the owner's ping advertises withdraw.
+  const withdrawable = !locked && ['open','needs_context'].includes(r.state) && !['submitting','checking'].includes(state.phase)
+    && !(r.aliases || []).some(a => a?.type === 'kanban')
+  const [features, setFeatures] = useState(() => freshFeatures(routeKey(route)))
+  useEffect(() => {
+    if (!withdrawable || features) return
+    let on = true
+    void ownerFeatures(route, call).then(list => { if (on) setFeatures(list) })
+    return () => { on = false }
+  }, [routeKey(route), withdrawable])
+  const canWithdraw = withdrawable && !!features?.includes('withdraw')
   const close = () => { setEditing(null); queueMicrotask(() => trigger.current?.focus()) }
   useEffect(() => { if (editing) input.current?.focus() }, [editing])
   const query = `?session=${encodeURIComponent(route.session)}`
@@ -783,7 +865,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     window.addEventListener('storage', onStorage); return () => window.removeEventListener('storage', onStorage)
   }, [key, request.revision])
   const send = async (choice, retry = false) => {
-    if (!currentRoute(route) || unavailable || ['submitting','checking'].includes(operations.get(key)?.phase)) return
+    if (!currentRoute(route) || unavailable || withdrawing.has(key) || ['submitting','checking'].includes(operations.get(key)?.phase)) return
     if (!retry && (locked || operations.get(key)?.decision || !choice || (['approve','answer'].includes(choice.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')))) return
     const text = choice?.effect === 'answer' && !needsText(choice) ? choice.label : state.text || ''
     if (!retry && needsText(choice) && !text.trim()) return
@@ -843,6 +925,36 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     const t = setInterval(() => { if (live.current && currentRoute(route) && operations.get(key)?.phase === 'failed') void send(null, true) }, autoRetry.ms)
     return () => clearInterval(t)
   }, [failedId, unavailable, key])
+  // Withdraw through the same owner route as decisions. It records no decision and delivers nothing.
+  const withdraw = async () => {
+    if (!canWithdraw || unavailable || withdrawing.has(key) || operations.get(key)?.decision || ['submitting','checking'].includes(operations.get(key)?.phase) || !currentRoute(route)) return
+    withdrawing.add(key) // synchronous lock: a double click (or a second tile) sends one request
+    const node = article.current, hadFocus = !!node?.contains(document.activeElement)
+    const outcome = { busy: false, note: '', error: '' }
+    setDismissal({ ...outcome, busy: true })
+    try {
+      const result = await call(`${BASE}/requests/${encodeURIComponent(r.requestId)}/withdraw`, { ...route, method: 'POST', body: { session: route.session, expectedRevision: r.revision, reason: WITHDRAW_REASON } })
+      if (!currentRoute(route)) return
+      // The tile is leaving: keep keyboard focus in the queue (or hand it back to the composer).
+      const active = document.activeElement
+      if (hadFocus && (!active || active === document.body || node.contains(active))) {
+        const next = [node.nextElementSibling, node.previousElementSibling].find(x => x?.matches?.('[data-action-request]'))
+        if (next) next.focus(); else host.composer?.focus?.(route.session)
+      }
+      const done = result?.request
+      if (validRequest(done) && done.state === 'withdrawn' && requestKey(done) === requestKey(r) && done.owner.storedSessionId === route.session) saveReadback(route, done)
+      await refreshRequests(call)
+    } catch (e) {
+      if (!currentRoute(route)) return
+      if (errorStatus(e) === 409) {
+        await refreshRequests(call)
+        outcome.note = 'This ask changed or was already decided; refreshed.'
+      } else outcome.error = `Couldn\u2019t remove this ask: ${e?.message || e}. It is still in your queue.`
+    } finally {
+      withdrawing.delete(key)
+      if (live.current) setDismissal(outcome)
+    }
+  }
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
   // Pre-v2 migrations stored one placeholder choice; it is agent work, never a user-facing control.
@@ -856,8 +968,12 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     : 'The agent asked you to do this without a complete step. Nothing is needed until it posts one; no permission is granted.')
     : question && !shown.length ? 'Answer in chat — this question closes once your reply is recorded there. No permission is granted.' : ''
   const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: sessionBusy(state.operation) ? 'Decision recorded; waiting for the session to finish its current turn.' : 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
-  return jsxs('article', { 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
-    jsx('h3', { style: { margin: '4px 0 0', fontSize: 14, overflowWrap: 'anywhere' }, children: r.title }),
+  const age = askedAgo(r.createdAt)
+  return jsxs('article', { ref: article, 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
+    jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 8, rowGap: 2, minWidth: 0 }, children: [
+      jsx('h3', { style: { margin: '4px 0 0', fontSize: 14, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
+      age && jsx('time', { 'data-asked-age': '', dateTime: r.createdAt, title: new Date(r.createdAt).toLocaleString(), style: { color: 'var(--muted-foreground)', fontSize: 11, flex: 'none' }, children: age })
+    ] }),
     jsx('small', { style: { color: 'var(--muted-foreground)', fontSize: 11 }, children: `Revision ${r.revision}` }),
     !locked && jsx('h4', { style: sectionLabel, children: 'Read this' }),
     !locked && jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) }),
@@ -870,15 +986,19 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : r.outcomes?.[selected.effect] || ''}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [
-      ...shown.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.effect), disabled: unavailable || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id)),
+      ...shown.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.effect), disabled: unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id)),
       ...(approvalPending ? [
         jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),
-        jsx('button', { type: 'button', 'data-dismiss-request': '', style: actionStyle, title: 'Hide this until the agent posts a new revision', onClick: () => dismissRequest(r), children: 'Dismiss' }, 'dismiss')
-      ] : [])
+        // An owner without the withdraw route (older backend) can only hide it on this device.
+        !canWithdraw && jsx('button', { type: 'button', 'data-dismiss-request': '', style: actionStyle, title: 'Hide this until the agent posts a new revision', onClick: () => dismissRequest(r), children: 'Dismiss' }, 'dismiss')
+      ] : []),
+      canWithdraw && jsx('button', { type: 'button', 'data-withdraw-request': '', style: { ...actionStyle, marginLeft: 'auto' }, title: WITHDRAW_TITLE, disabled: unavailable || dismissal.busy, onClick: () => void withdraw(), children: dismissal.busy ? 'Removing\u2026' : 'Not needed' })
     ] }),
+    dismissal.note && jsx('div', { role: 'status', 'data-withdraw-note': '', style: { fontSize: 12 }, children: dismissal.note }),
+    dismissal.error && jsx('div', { role: 'alert', 'data-withdraw-error': '', children: dismissal.error }),
     editing && jsxs('div', { onKeyDown: e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close() } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void send(editing) } }, children: [
       jsx('label', { children: jsxs('span', { children: ['Revision or answer', jsx('textarea', { ref: input, 'aria-label': 'Revision or answer', value: state.text || '', disabled: locked, onChange: e => update({ text: e.target.value }), rows: 3, style: { width: '100%', boxSizing: 'border-box', font: 'inherit', color: 'var(--foreground)', background: 'var(--card)', ...planStyle } })] }) }),
-      jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, disabled: locked || !state.text?.trim(), onClick: () => send(editing), children: editing.effect === 'answer' ? 'Send answer' : 'Send revision' }), jsx('button', { type: 'button', style: actionStyle, onClick: close, children: 'Cancel' })] })
+      jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, disabled: locked || dismissal.busy || !state.text?.trim(), onClick: () => send(editing), children: editing.effect === 'answer' ? 'Send answer' : 'Send revision' }), jsx('button', { type: 'button', style: actionStyle, onClick: close, children: 'Cancel' })] })
     ] }),
     ['pending','failed','unknown'].includes(state.phase) && jsxs('div', { style: flowStyle, children: [jsx('button', { type: 'button', style: actionStyle, onClick: check, children: 'Check status' }), jsx('button', { type: 'button', style: actionStyle, onClick: () => send(null, true), children: 'Retry' })] })
   ] })
@@ -921,7 +1041,10 @@ export function ActionQueue() {
   useEffect(() => { canonicalSubs.add(setSnap); return () => canonicalSubs.delete(setSnap) }, [])
   useEffect(() => { void refreshRequests() }, [scope])
   if (!route.session || snap.scope !== scope) return null
+  // Closed requests, including withdrawn (moot) asks, are not shown or counted; they still suppress their
+  // own legacy references through requestForSource.
   const needsReadback = r => {
+    if (r.state === 'withdrawn' && !r.resolution) return false // nothing can be pending on a withdrawn revision
     const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
     if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
     return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))

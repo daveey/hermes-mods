@@ -427,3 +427,310 @@ test('reported PR question renders its real option as a button plus a free-text 
  assert.equal(el().querySelector('[data-agent-completion-pending]'),null)
  assert.doesNotMatch(el().textContent,/full exact plan|Work stays blocked/)
 })
+
+// ── Withdrawn asks: retired without a decision; nothing is sent to the agent ──
+const withdrawnBy = (by, reason) => ({ by, reason, at: '2026-10-27T11:00:00+00:00' })
+const pingWithdraw = { ok: true, api: 2, features: ['withdraw'] }
+const offered = () => [...el().querySelectorAll('button')].some(b => b.textContent === 'Not needed')
+// Withdrawable asks carry a user_step alias; a kanban alias means a bound decision card, which decides it instead.
+const askable = extra => freshRequest({ aliases: [{ gatewayId: 'G1', profile: 'default', type: 'user_step', id: `us_${++serial}` }], ...extra })
+const QUEUE_READ = '/api/plugins/user-steps/requests?session=S1&include=withdrawn'
+
+test('validRequest accepts withdrawn requests carrying createdAt and withdrawal; unknown states still fail closed', () => {
+ const gone = freshRequest({ state: 'withdrawn', createdAt: '2026-10-27T10:00:00+00:00', withdrawal: withdrawnBy('system', 'Card t_1418b643 finished') })
+ assert.equal(m.validRequest(gone), true)
+ assert.equal(m.projectRequests([gone]).length, 1)
+ assert.equal(m.validRequest(freshRequest({ createdAt: '2026-10-27T10:00:00+00:00' })), true)
+ assert.equal(m.validRequest(freshRequest({ state: 'withdrawn' })), true, 'a withdrawn row without its record still grants nothing')
+ assert.equal(m.validRequest(freshRequest({ state: 'dismissed' })), false)
+})
+
+test('withdrawn requests are read explicitly but never rendered or counted; all withdrawn renders nothing', async () => {
+ const live = freshRequest({ title: 'Still needed' }), context = freshRequest({ title: 'Needs context', state: 'needs_context' })
+ const gone = freshRequest({ title: 'Moot ask', state: 'withdrawn', withdrawal: withdrawnBy('system', 'Card t_1418b643 finished') })
+ const paths = []; let list = [live, gone, context]
+ window.hermesDesktop = { api: async ({ path }) => { paths.push(path); return path.includes('/requests?') ? { requests: list } : {} } }
+ await show(React.createElement(m.ActionQueue, { key: 'withdrawn-hidden' }))
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ assert.ok(paths.includes(QUEUE_READ), paths.join('\n'))
+ assert.ok(paths.filter(p => p.includes('/requests?')).every(p => p === QUEUE_READ), 'every queue read asks for withdrawn rows')
+ assert.deepEqual([...el().querySelectorAll('[data-action-request]')].map(a => a.getAttribute('aria-label')), ['Still needed', 'Needs context'])
+ // v10: an approval still waiting for its plan is agent work, shown but not counted For you.
+ assert.equal(el().querySelector('[data-action-queue] h2').textContent, 'For you (1)')
+ assert.doesNotMatch(el().textContent, /Moot ask|Action queue unavailable/)
+ list = [gone]
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ assert.equal(el().querySelector('[data-action-queue]'), null)
+ assert.equal(el().innerHTML, '')
+ await show(null); delete window.hermesDesktop
+})
+
+test('a withdrawn ask still retires its own aliases but never shadows a live request for the same source', () => {
+ const gone = freshRequest({ state: 'withdrawn', withdrawal: withdrawnBy('user', 'Dismissed in Desktop as not needed') }), live = freshRequest()
+ assert.equal(m.requestForSource([gone], alias), gone)
+ assert.equal(m.requestForSource([gone, live], alias), live)
+ assert.equal(m.requestForSource([live, freshRequest()], alias), null, 'two live claims stay ambiguous')
+})
+
+test('transcript receipts of a withdrawn ask read No longer needed, never decide above the composer', async () => {
+ m.clearStepCache()
+ const gone = freshRequest({ state: 'withdrawn', withdrawal: withdrawnBy('system', 'Card t_1418b643 finished') })
+ const bare = freshRequest({ state: 'withdrawn', withdrawal: withdrawnBy('agent', '') })
+ const settled = freshRequest({ state: 'withdrawn', withdrawal: withdrawnBy('agent', 'Answered in chat') })
+ const steps = {}
+ for (const [r, id, status] of [[gone, 'us_0d0d0d01', 'open'], [bare, 'us_0d0d0d02', 'open'], [settled, 'us_0d0d0d03', 'resolved']]) {
+  r.aliases.push({ gatewayId: 'G1', profile: 'default', type: 'user_step', id })
+  steps[id] = { id, status, text: `ask ${id}`, requestId: r.requestId, requestOwner: owner, ...(status === 'resolved' ? { resolution: 'withdrawn: Answered in chat' } : {}) }
+ }
+ await m.refreshRequests(async () => ({ requests: [gone, bare, settled] }))
+ const call = async path => ({ step: steps[new URL(path, 'http://x').searchParams.get('id')] || null })
+ await show(React.createElement('div', {}, Object.keys(steps).map(id => React.createElement(m.StepBox, { key: id, attrs: { id, s: 'S1', t: `Original ${id}` }, deps: { call } }))))
+ const box = id => el().querySelector(`[data-user-step="${id}"]`)
+ assert.equal(box('us_0d0d0d01').querySelector('small').textContent, 'No longer needed \u2014 Card t_1418b643 finished')
+ assert.equal(box('us_0d0d0d02').querySelector('small').textContent, 'No longer needed.')
+ assert.equal(box('us_0d0d0d03').querySelector('[data-user-step-resolved]').textContent, 'No longer needed \u2014 Answered in chat')
+ assert.equal(box('us_0d0d0d01').querySelector('[data-user-step-text]').textContent, 'Original us_0d0d0d01')
+ assert.doesNotMatch(el().textContent, /decide above the composer|\u2713/)
+ assert.equal(el().querySelectorAll('button').length, 0)
+})
+
+test('a multi-step directive marks only the withdrawn step as no longer needed', async () => {
+ m.clearStepCache()
+ const gone = freshRequest({ state: 'withdrawn', withdrawal: withdrawnBy('agent', 'Answered in chat') }), live = freshRequest()
+ gone.aliases.push({ gatewayId: 'G1', profile: 'default', type: 'user_step', id: 'us_0e0e0e01' })
+ live.aliases.push({ gatewayId: 'G1', profile: 'default', type: 'user_step', id: 'us_0e0e0e02' })
+ await m.refreshRequests(async () => ({ requests: [gone, live] }))
+ const steps = { us_0e0e0e01: { id: 'us_0e0e0e01', status: 'open', text: 'First ask', requestOwner: owner }, us_0e0e0e02: { id: 'us_0e0e0e02', status: 'open', text: 'Second ask', requestOwner: owner } }
+ const call = async path => ({ step: steps[new URL(path, 'http://x').searchParams.get('id')] || null })
+ await show(React.createElement(m.StepBox, { key: 'two-steps', attrs: { id: 'us_0e0e0e01,us_0e0e0e02', s: 'S1', t: 'Two asks' }, deps: { call } }))
+ assert.deepEqual([...el().querySelectorAll('[data-user-step] small')].map(s => s.textContent), ['No longer needed \u2014 Answered in chat', 'Reference only \u2014 review and decide above the composer.'])
+})
+
+test('a withdrawn ask does not resurface as a legacy reference or a blocked progress chip', async () => {
+ const gone = freshRequest({ title: 'Dismissed ask', state: 'withdrawn', withdrawal: withdrawnBy('user', 'Dismissed in Desktop as not needed') })
+ const card = { id: 'same', board: 'ops', gatewayId: 'G1', profile: 'default', loaded: true, title: 'Stage A', text: 'Original card', human_request: { interaction: 'approval', action: 'Approve', why_human: 'owner', scope: 'stage', evidence: 'record' } }
+ window.__blockedPanel = { snapshot: { stored: 'S1', items: [card] } }
+ window.hermesDesktop = { api: async ({ path }) => path.includes('/requests?') ? { requests: [gone] } : path.includes('/steps?') ? { steps: [] } : {} }
+ const registrations = []; const dispose = m.default.register({ register: c => registrations.push(c) })
+ await React.act(async () => { await m.refreshRequests(); await m.refresh() })
+ await show(registrations[0].render())
+ assert.equal(el().querySelector('[data-action-request]'), null)
+ assert.equal(el().querySelector('[data-user-steps-card]'), null, 'its aliased card stays suppressed')
+ assert.equal(el().textContent, '')
+ const progress = await import('../session-tasks/plugin.js')
+ assert.equal(progress.progressChips([{ kind: 'kanban', gatewayId: 'G1', profile: 'default', board: 'ops', id: 'same', state: 'blocked' }]).length, 0)
+ await show(null); dispose(); delete window.hermesDesktop; delete window.__blockedPanel
+})
+
+test('Not needed withdraws once through the owner route even on double click, then refreshes', async () => {
+ m.clearFeatureCache?.()
+ const r = askable({ title: 'Stale ask' }), keep = askable({ title: 'Live ask' })
+ const calls = []; let finish, list = [r, keep]
+ window.hermesDesktop = { api: async ({ path, ...opts }) => {
+  calls.push([path, opts])
+  if (path === '/api/plugins/user-steps/ping') return pingWithdraw
+  if (opts.method === 'POST') return new Promise(resolve => { finish = resolve })
+  return path.startsWith('/api/plugins/user-steps/requests?') ? { requests: list } : {}
+ } }
+ await show(React.createElement(m.ActionQueue, { key: 'withdraw-once' }))
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ const tile = [...el().querySelectorAll('article')].find(a => a.getAttribute('aria-label') === 'Stale ask')
+ const button = [...tile.querySelectorAll('button')].find(b => b.textContent === 'Not needed')
+ assert.ok(button, 'an open ask offers Not needed')
+ assert.deepEqual([...button.parentElement.children].map(b => b.textContent), ['Approve', 'Request changes', 'Decline', 'Not needed'], 'after the decision buttons')
+ assert.equal(button.style.minHeight, '44px'); assert.equal(button.style.whiteSpace, 'normal')
+ assert.equal(button.title, 'Remove this ask without deciding; nothing is sent to the agent')
+ button.focus()
+ await React.act(async () => { button.click(); button.click(); await flush() })
+ const posts = () => calls.filter(([, o]) => o.method === 'POST')
+ assert.equal(posts().length, 1, 'double click withdraws once')
+ const [path, opts] = posts()[0]
+ assert.equal(path, `/api/plugins/user-steps/requests/${r.requestId}/withdraw`)
+ assert.equal(opts.connectionId, 'C1'); assert.equal(opts.profile, 'default')
+ assert.deepEqual(opts.body, { session: 'S1', expectedRevision: 1, reason: 'Dismissed in Desktop as not needed' })
+ assert.equal(button.disabled, true)
+ assert.ok([...tile.querySelectorAll('[data-decision-effect]')].every(b => b.disabled), 'no decision while withdrawing')
+ await click('Approve')
+ assert.equal(posts().length, 1)
+ const sent = calls.length
+ const gone = { ...r, state: 'withdrawn', withdrawal: withdrawnBy('user', 'Dismissed in Desktop as not needed') }
+ list = [gone, keep]
+ await React.act(async () => { finish({ request: gone }); await flush(); await flush() })
+ assert.ok(calls.slice(sent).some(([p, o]) => p === QUEUE_READ && !o.method), 'refreshes the queue after withdrawing')
+ assert.deepEqual([...el().querySelectorAll('article')].map(a => a.getAttribute('aria-label')), ['Live ask'])
+ assert.equal(el().querySelector('[data-action-queue] h2').textContent, 'For you (1)')
+ assert.equal(document.activeElement.getAttribute('aria-label'), 'Live ask', 'keyboard focus stays in the queue')
+ assert.equal(posts().length, 1)
+ assert.equal(calls.filter(([p]) => p.endsWith('/ping')).length, 1, 'one ping for the scope')
+ await show(null); delete window.hermesDesktop
+})
+
+test('Not needed is not offered while a decision is submitting, pending or recorded', async () => {
+ m.clearFeatureCache?.()
+ const r = askable(); const calls = []; let finish
+ const pending = { operation: { operationId: 'op-lock', state: 'pending' }, request: r }
+ const call = async (path, opts = {}) => { calls.push([path, opts]); if (path.endsWith('/ping')) return pingWithdraw; if (opts.method === 'POST') return new Promise(resolve => { finish = resolve }); return pending }
+ await show(React.createElement(m.DecisionRow, { key: 'withdraw-lock', request: r, route, call }))
+ assert.equal(offered(), true, 'offered while undecided')
+ await click('Approve')
+ assert.equal(offered(), false, 'hidden while the decision is submitting')
+ await React.act(async () => { finish(pending); await flush() })
+ assert.match(el().textContent, /delivery pending/)
+ assert.equal(offered(), false, 'hidden while delivery is pending')
+ const resolution = { operationId: 'op-recorded', choiceId: 'yes', revision: 1 }
+ for (const recorded of [askable({ resolution }), askable({ state: 'resolved', resolution }), askable({ state: 'superseded' }), askable({ state: 'cancelled' })]) {
+  const readback = async path => path.endsWith('/ping') ? pingWithdraw : { operation: { operationId: 'op-recorded', state: 'pending' }, request: recorded }
+  await show(React.createElement(m.DecisionRow, { key: `recorded-${recorded.requestId}`, request: recorded, route, call: readback }))
+  assert.equal(offered(), false, `${recorded.state}${recorded.resolution ? ' with a recorded decision' : ''}`)
+ }
+ assert.equal(calls.filter(([p]) => p.endsWith('/withdraw')).length, 0)
+})
+
+test('Not needed appears only when the owner ping advertises withdraw; one ping per scope', async () => {
+ for (const [label, ping, expected] of [
+  ['older backend', async () => ({ ok: true, api: 2 }), false],
+  ['ping error', async () => { throw Error('ping failed') }, false],
+  ['other features', async () => ({ ok: true, api: 2, features: ['other'] }), false],
+  ['withdraw feature', async () => pingWithdraw, true]
+ ]) {
+  m.clearFeatureCache?.()
+  const pings = []
+  const call = async (path, opts = {}) => { if (path === '/api/plugins/user-steps/ping') { pings.push(opts); return ping() } return {} }
+  await show(React.createElement('div', { key: label }, [React.createElement(m.DecisionRow, { key: 'a', request: askable(), route, call }), React.createElement(m.DecisionRow, { key: 'b', request: askable(), route, call })]))
+  assert.equal(offered(), expected, label)
+  assert.equal(pings.length, 1, `${label}: one ping for two tiles`)
+  assert.equal(pings[0].connectionId, 'C1'); assert.equal(pings[0].profile, 'default')
+  await show(React.createElement(m.DecisionRow, { key: `${label}-again`, request: askable(), route, call }))
+  assert.equal(offered(), expected, `${label} after remount`)
+  assert.equal(pings.length, label === 'ping error' ? 2 : 1, `${label}: an answer is cached for the scope, a failure is not`)
+ }
+})
+
+test('Not needed: a 409 refreshes with an inline note; other failures keep the tile with an inline error', async () => {
+ m.clearFeatureCache?.()
+ const r = askable({ title: 'Contested ask' }); const calls = []; let failure = Object.assign(Error('conflict'), { status: 409 })
+ const call = async (path, opts = {}) => {
+  calls.push([path, opts])
+  if (path.endsWith('/ping')) return pingWithdraw
+  if (opts.method === 'POST') throw failure
+  return path.includes('/requests?') ? { requests: [r] } : {}
+ }
+ await show(React.createElement(m.DecisionRow, { key: 'withdraw-409', request: r, route, call }))
+ await click('Not needed')
+ assert.ok(calls.some(([p, o]) => p === QUEUE_READ && !o.method), 'refreshed after the 409')
+ assert.equal(el().querySelector('[data-withdraw-note]')?.textContent, 'This ask changed or was already decided; refreshed.')
+ assert.equal(el().querySelector('[role="alert"]'), null)
+ failure = Error('backend unavailable')
+ await click('Not needed')
+ assert.match(el().querySelector('[role="alert"]')?.textContent || '', /backend unavailable/)
+ assert.equal(el().querySelector('[data-withdraw-note]'), null)
+ assert.ok(el().querySelector('[data-action-request]'), 'tile kept')
+ assert.equal([...el().querySelectorAll('button')].find(b => b.textContent === 'Not needed')?.disabled, false, 'can try again')
+ assert.equal(calls.filter(([, o]) => o.method === 'POST').length, 2)
+})
+
+test('askedAgo reads just now, minutes, hours and days; the tile shows it beside the title only when createdAt is known', async () => {
+ const now = Date.parse('2026-10-27T12:00:00Z'), ago = ms => new Date(now - ms).toISOString()
+ const cases = [[0, 'asked just now'], [59_999, 'asked just now'], [60_000, 'asked 1 min ago'], [59 * 60_000 + 59_000, 'asked 59 min ago'], [3_600_000, 'asked 1 h ago'], [23 * 3_600_000 + 3_599_000, 'asked 23 h ago'], [86_400_000, 'asked 1 d ago'], [9 * 86_400_000 + 5_000, 'asked 9 d ago'], [-120_000, 'asked just now']]
+ for (const [ms, text] of cases) assert.equal(m.askedAgo?.(ago(ms), now), text, `${ms} ms`)
+ assert.equal(m.askedAgo?.('2026-10-27T10:59:59.123456+00:00', now), 'asked 1 h ago', 'backend isoformat parses')
+ for (const missing of [undefined, null, '', 'not a date', now]) assert.equal(m.askedAgo?.(missing, now), '', String(missing))
+ const aged = freshRequest({ title: 'Aged ask', createdAt: new Date(Date.now() - 5 * 60_000 - 5_000).toISOString() })
+ await show(React.createElement(m.DecisionRow, { key: 'aged', request: aged, route, call: async () => ({}) }))
+ const age = el().querySelector('[data-asked-age]')
+ assert.equal(age?.textContent, 'asked 5 min ago')
+ assert.equal(age.parentElement, el().querySelector('h3').parentElement, 'beside the title')
+ assert.equal(age.getAttribute('datetime'), aged.createdAt)
+ assert.equal(el().querySelector('h3').textContent, 'Aged ask')
+ await show(React.createElement(m.DecisionRow, { key: 'unaged', request: freshRequest({ title: 'Legacy row' }), route, call: async () => ({}) }))
+ assert.equal(el().querySelector('[data-asked-age]'), null)
+})
+
+test('a cached owner answer expires, so an owner that restarts onto a newer plugin gets Not needed', async () => {
+ m.clearFeatureCache?.()
+ let answer = { ok: true, api: 2 }; const pings = []
+ const call = async (path, opts = {}) => { if (path.endsWith('/ping')) { pings.push(opts); return answer } return {} }
+ await show(React.createElement(m.DecisionRow, { key: 'ttl-1', request: askable(), route, call }))
+ assert.equal(offered(), false)
+ answer = pingWithdraw
+ const realNow = Date.now
+ try {
+  Date.now = () => realNow() + 6 * 60_000
+  await show(React.createElement(m.DecisionRow, { key: 'ttl-2', request: askable(), route, call }))
+  assert.equal(pings.length, 2, 'the expired answer is asked again')
+  assert.equal(offered(), true)
+ } finally { Date.now = realNow }
+ await show(null)
+})
+
+const intents = () => Array.from({ length: window.localStorage.length }, (_, i) => window.localStorage.key(i)).filter(k => k.startsWith('hermes.actionIntent.v2:'))
+
+test('a withdrawn ask with a stranded retry intent never renders Check status or Retry; the dead intent is dropped', async () => {
+ m.clearFeatureCache?.(); window.localStorage.clear()
+ const r = freshRequest({ title: 'Will be withdrawn' })
+ let list = [r]; const posts = []
+ window.hermesDesktop = { api: async ({ path, ...o }) => {
+  if (path.endsWith('/ping')) return pingWithdraw
+  if (o.method === 'POST') { posts.push(path); throw Error('network down') }
+  if (path.includes('/operations?')) throw Object.assign(Error('nf'), { status: 404 })
+  if (path.includes('/requests?')) return { requests: list }
+  if (path.includes(`/requests/${r.requestId}?`)) return { request: list[0] }
+  return {}
+ } }
+ await show(React.createElement(m.ActionQueue, { key: 'stranded' }))
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ await React.act(async () => { [...el().querySelectorAll('button')].find(b => b.textContent === 'Approve').click(); await flush(); await flush() })
+ assert.equal(intents().length, 1, 'the lost POST left a retry intent')
+ list = [{ ...r, state: 'withdrawn', withdrawal: withdrawnBy('system', 'Card finished') }]
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ assert.equal(el().querySelector('article'), null, 'no tile, so no Check status or Retry')
+ assert.deepEqual(intents(), [], 'the dead intent is dropped')
+ await show(null); await show(React.createElement(m.ActionQueue, { key: 'stranded-2' }))
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ assert.equal(el().querySelector('article'), null, 'still gone after a remount')
+ assert.equal(posts.length, 1, 'no further decision POST')
+ await show(null); delete window.hermesDesktop; window.localStorage.clear()
+})
+
+test('a plan-less ask offers Ask agent for the plan plus Not needed when the owner can withdraw, else the local Dismiss', async () => {
+ const planless = askable({ title: 'Approve without a plan', state: 'needs_context', scope: { complete: false, markdown: 'Do you mean **open a pull request**, or something else?', sourceRefs: [] }, outcomes: { revise: 'Request complete action; keep work blocked.' }, exclusions: [], choices: [{ id: 'request-context', label: 'Request complete action', effect: 'revise' }] })
+ for (const [ping, want] of [[pingWithdraw, ['Ask agent for the plan', 'Not needed']], [{ ok: true, api: 2 }, ['Ask agent for the plan', 'Dismiss']]]) {
+  m.clearFeatureCache?.()
+  const call = async path => path.endsWith('/ping') ? ping : {}
+  await show(React.createElement(m.DecisionRow, { key: want.join('+'), request: planless, route, call }))
+  assert.deepEqual([...el().querySelectorAll('button')].map(b => b.textContent), want)
+ }
+ await show(null)
+})
+
+test('Not needed is never offered for a request bound to a decision card', async () => {
+ m.clearFeatureCache?.()
+ const base = freshRequest({ title: 'Card-bound ask' })
+ const bound = { ...base, aliases: [{ gatewayId: base.owner.gatewayId, profile: base.owner.profile, type: 'kanban', board: 'default', id: 't_f6f6f6f6' }] }
+ const call = async path => path.endsWith('/ping') ? pingWithdraw : {}
+ await show(React.createElement(m.DecisionRow, { key: 'bound', request: bound, route, call }))
+ assert.ok([...el().querySelectorAll('button')].some(b => b.textContent === 'Approve'), 'still decidable')
+ assert.equal(offered(), false)
+ await show(null)
+})
+
+test('withdrawing the last tile hands keyboard focus back to the composer', async () => {
+ m.clearFeatureCache?.()
+ const r = askable({ title: 'Only ask' }); let list = [r]; const focused = []
+ const prev = host.composer.focus; host.composer.focus = sid => focused.push(sid)
+ window.hermesDesktop = { api: async ({ path, ...o }) => {
+  if (path.endsWith('/ping')) return pingWithdraw
+  if (o.method === 'POST' && path.endsWith('/withdraw')) { list = [{ ...r, state: 'withdrawn', withdrawal: withdrawnBy('user', 'Dismissed in Desktop as not needed') }]; return { request: list[0] } }
+  if (path.includes('/requests?')) return { requests: list }
+  return {}
+ } }
+ try {
+  await show(React.createElement(m.ActionQueue, { key: 'last-tile' }))
+  await React.act(async () => { await m.refreshRequests(); await flush() })
+  const button = [...el().querySelectorAll('button')].find(b => b.textContent === 'Not needed')
+  button.focus()
+  await React.act(async () => { button.click(); await flush(); await flush() })
+  assert.equal(el().querySelector('article'), null)
+  assert.deepEqual(focused, ['S1'])
+ } finally { host.composer.focus = prev; await show(null); delete window.hermesDesktop }
+})

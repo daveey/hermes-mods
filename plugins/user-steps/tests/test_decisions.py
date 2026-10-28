@@ -168,7 +168,9 @@ def test_api_owner_isolation_and_retry(tmp_path):
         owner_resolver=lambda session: dict(OWNER, storedSessionId=session),
         receiver=cards.DecisionInbox(tmp_path / 'inbox.db')))
     client = TestClient(app)
-    assert client.get('/requests', params={'session':'session-a'}).json() == {'requests':[r]}
+    # GET /requests is the presentation view: the exact frozen body plus when it was asked (additive).
+    assert client.get('/requests', params={'session':'session-a'}).json() == {
+        'requests':[dict(r, createdAt=s.view(OWNER, r['requestId'])['createdAt'])]}
     assert client.get('/requests/'+r['requestId'], params={'session':'branch'}).status_code == 404
     body = dict(session='session-a', expectedRevision=1, choiceId='approve', idempotencyKey='api')
     assert client.post('/requests/'+r['requestId']+'/decisions', json=dict(body, owner=OWNER)).status_code == 422

@@ -184,15 +184,86 @@ compression/profile isolation, budgets, regex fallback, forged reopen fields,
 whole-draft holds and actual transform-wrapper write/card failures. These are
 isolated tests, not live deployment or full final-gate ordering proof.
 
+## Lifecycle: withdrawn asks
+
+An ask that is no longer needed leaves the queue through `withdrawn`, a terminal
+state that is **not a decision**: it grants nothing, admits no turn and delivers
+nothing. It is refused (409) once a decision is recorded for the current revision,
+so a decision always wins a race, and it is never available for a request bound to
+a decision card (that card decides it). The legacy ledger step behind it is marked
+resolved (`No longer needed: <reason>`, `withdrawn: true`), which keeps the passive
+strip and ask-gate consistent. A withdrawal is not a decline: asking the same thing
+again later is a fresh ask, never held as a repeat. Lifecycle data (ask time and
+the revision it belongs to, the withdrawal record, notification state) lives in the
+`lifecycle` side table, so older processes' positional `requests` inserts keep
+working. `_get` keeps the exact frozen body (card bindings compare it byte for
+byte); `view()` adds `createdAt` / `withdrawal` for REST and hook readers.
+
+Ask time: a producer revision (and any revival of a withdrawn request) is a fresh
+ask; a server-side re-render of a legacy row keeps the original time; a revision
+written by a process that predates the stamp is treated as fresh. Each errs toward
+keeping an ask.
+
+Three triggers:
+
+- **system**: `reconcile_moot` runs on every `GET /requests` and every
+  `pre_llm_call`, in one deferred read with a 2 s busy timeout (no write lock
+  unless something retires). It watches the Kanban ids in the ask itself (request
+  title and the extracted step's text, plus explicit same-owner `kanban`
+  `sourceRefs`; never the evidence sentence or surrounding markdown, which name
+  context too) on live local boards (`kanban/boards/_*` skipped). A card counts
+  only if it was **waiting** on someone when the ask was made: its last relevant
+  event before the ask was `blocked`, `review_requested`, `block_loop_detected` or
+  `gave_up` (a reviewer's claim keeps the review wait; a worker's claim, an unblock
+  or a manual promote ends it). The ask is withdrawn only when every counted card
+  is done or archived after the ask, and every other named card is finished too.
+  Unblocking does not retire an ask: agents unblock to retry, and the retry often
+  hits the same wall. An unknown, ambiguous or unreadable id, a named card still
+  in flight, or a card that was running when asked ("check the screenshots when it
+  finishes") keeps the ask. A stale tile is recoverable; a wrongly retired ask is lost.
+- **agent**: only the owning chat, explicitly:
+  `action_request {"withdraw": {"requestId", "reason"}}`. The extractor's
+  `resolved` list never withdraws a canonical ask (it retires legacy steps only, as
+  before). The per-turn context says how to withdraw, and reports each system/user
+  withdrawal to the chat once.
+- **user**: `POST /requests/{id}/withdraw` (Desktop "Not needed").
+
+`GET /requests` omits withdrawn rows unless `include=withdrawn`, and so does
+`ActionStore.requests()` by default: route bodies mounted before this state existed
+call it, and renderers before v13 reject a whole queue that holds an unknown state.
+`GET /ping` advertises `features: ["withdraw"]`.
+
+Extraction precision: a reply whose sentence, in full, declares that nothing is
+needed from the user ("Nothing is currently assigned to you.", "No action is
+required.") cannot also carry an ask in a plain status line; in such a reply only
+evidence that directly asks (question, please, can you, I need your..., an
+imperative) survives, and quoted text (someone else's words) does not count. A
+scoped declaration ("nothing is needed from you for the deploy", "t_A: nothing for
+you") switches nothing off; "nothing else for you" never counts. This also keeps the
+final-reply plan gate from holding such a reply. The extractor prompt says status
+lines and Kanban review lanes are not asks.
+
+`tests/test_withdrawal.py` covers the transition, refusal once decided, card-bound
+refusal, revival, the tool and user paths, the extractor never withdrawing, re-asks
+after a withdrawal, card done / retried after an unblock / triage / already done /
+running when asked / reviewer vs worker claims / still in flight / named only in the
+evidence / unknown / unreadable board / all-cards, millisecond event times, archived
+boards, ask time across re-renders, producer revisions and older-process revisions,
+the lock-free pass, `requests()` hiding withdrawn rows, REST filtering and dismissal,
+hook context, the plan gate, and the extraction guard (scoped and unscoped
+declarations, quoted questions, and the exact reply that produced a stale approval ask).
+
 ## Limits
 
 Routes under `/api/plugins/user-steps`:
 
 - `GET /ping`
-- `GET /requests?session=...`
+- `GET /requests?session=...[&include=withdrawn]`
 - `GET /requests/{requestId}?session=...`
 - `POST /requests/{requestId}/decisions` with `session`, `expectedRevision`,
   `choiceId`, optional `revisionText`, and `idempotencyKey`
+- `POST /requests/{requestId}/withdraw` with `session`, `expectedRevision` and an
+  optional `reason`: the user removes an undecided ask; not a decision, nothing delivered.
 - `POST /requests/{requestId}/reconcile-chat` with only `session` and
   `expectedRevision`: verifies stored evidence; accepts no caller-supplied answer
   or desired result. New router mounts expose this route; existing mounts can use
@@ -249,6 +320,16 @@ failure/retry and confirmed states share the sheet. A local filter handles many
 requests. Qualified aliases suppress matching blocked-panel controls and task
 chips without conflating unrelated cards. Late responses are guarded by owner and
 session. Failed backend reads preserve text and do not enable authorization.
+Queue reads ask for withdrawn rows (`include=withdrawn`) so transcript receipts
+read "No longer needed — <reason>" and their references stay suppressed, but
+withdrawn requests are never shown or counted, and a retry intent left for one is
+dropped (nothing can be pending on a withdrawn revision). Each undecided tile shows
+when it was asked and, when the owner's `/ping` advertises `withdraw` and no
+decision card is bound to it, a **Not needed** button that withdraws it on the owner
+(one POST per tile; no decision recorded, nothing sent to the agent; a 409 refreshes
+the queue). A plan-less ask offers **Ask agent for the plan** plus Not needed; an
+owner without withdraw gets the local, per-revision **Dismiss** instead. Ping answers
+are cached per route scope for 5 minutes; a failed ping is not cached.
 
 Desktop disk code can hot-reload. Backend router/module activation must be verified
 separately through the normal deployment route; no ad hoc restart is required by

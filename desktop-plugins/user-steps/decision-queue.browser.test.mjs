@@ -20,8 +20,8 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
  import React from 'react';import {createRoot} from 'react-dom/client';import {ActionQueue,refreshRequests} from './plugin.js';
  const owner={gatewayId:'fixture',profile:'default',storedSessionId:'S1'};
  const long='Exact files, tests, acceptance criteria and deliverables. '+('long-unbroken-identifier'.repeat(60));
- let requests=Array.from({length:8},(_,i)=>({schemaVersion:2,owner,requestId:'00000000-0000-4000-8000-'+String(i+1).padStart(12,'0'),revision:1,kind:'approval',title:'Request '+i,scope:{complete:true,markdown:long+'\\n'+('Complete plan paragraph.\\n'.repeat(60)),sourceRefs:[]},limits:[{key:'CPU',value:'≤4 CPU core-hours'},{key:'RAM',value:'≤4 GiB RAM'},{key:'GPU',value:'≤2 existing GPU-hours',permissionRequired:'owner permission'}],exclusions:['No rentals or new spend','Full training requires separate budget approval'],outcomes:{approve:'Stage A only',revise:'Work remains blocked',decline:'No execution'},choices:[{id:'yes',label:'Approve Stage A',effect:'approve'},{id:'revise',label:'Request changes',effect:'revise'},{id:'no',label:'Decline',effect:'decline'}],aliases:[],state:'open'}));
- window.setRequests=async value=>{requests=value;await refreshRequests()};window.fixtureOwner=owner;window.posts=[];window.hermesDesktop={api:async({path,...opts})=>{if(opts.method==='POST'){window.posts.push(opts.body);return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]}}if(path.includes('/operations/'))return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]};return {requests}}};
+ let requests=Array.from({length:8},(_,i)=>({schemaVersion:2,owner,requestId:'00000000-0000-4000-8000-'+String(i+1).padStart(12,'0'),revision:1,kind:'approval',title:'Request '+i,createdAt:new Date(Date.now()-305000).toISOString(),scope:{complete:true,markdown:long+'\\n'+('Complete plan paragraph.\\n'.repeat(60)),sourceRefs:[]},limits:[{key:'CPU',value:'≤4 CPU core-hours'},{key:'RAM',value:'≤4 GiB RAM'},{key:'GPU',value:'≤2 existing GPU-hours',permissionRequired:'owner permission'}],exclusions:['No rentals or new spend','Full training requires separate budget approval'],outcomes:{approve:'Stage A only',revise:'Work remains blocked',decline:'No execution'},choices:[{id:'yes',label:'Approve Stage A',effect:'approve'},{id:'revise',label:'Request changes',effect:'revise'},{id:'no',label:'Decline',effect:'decline'}],aliases:[],state:'open'}));
+ window.setRequests=async value=>{requests=value;await refreshRequests()};window.fixtureOwner=owner;window.posts=[];window.withdraws=[];window.hermesDesktop={api:async({path,...opts})=>{if(path.endsWith('/ping'))return {ok:true,api:2,features:['withdraw']};if(opts.method==='POST'&&path.endsWith('/withdraw')){window.withdraws.push({path,connectionId:opts.connectionId,profile:opts.profile,body:opts.body});const id=decodeURIComponent(path.split('/').at(-2));requests=requests.map(r=>r.requestId===id?{...r,state:'withdrawn',withdrawal:{by:'user',reason:opts.body.reason,at:new Date().toISOString()}}:r);return {request:requests.find(r=>r.requestId===id)}}if(opts.method==='POST'){window.posts.push(opts.body);return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]}}if(path.includes('/operations/'))return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]};return {requests}}};
  await refreshRequests();createRoot(document.getElementById('root')).render(React.createElement(ActionQueue));
  `,resolveDir:here,sourcefile:'fixture.mjs'},bundle:true,format:'esm',write:false,outdir:'fixture-output',nodePaths:[resolve(desktopDir,'node_modules'),resolve(desktopDir,'../../node_modules')],define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"PROD":true}'},plugins:[{name:'sdk-test-only',setup(b){b.onResolve({filter:/^@hermes\/plugin-sdk$/},()=>({path:'sdk',namespace:'test'}));b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:`const atom=v=>({get:()=>v});export const COMPOSER_AREAS={top:'composer.top'},TRANSCRIPT_DIRECTIVE_AREA='directives',host={state:{focusedStoredSessionId:atom('S1'),connectionId:atom('C1'),profile:atom('default'),focusedSessionOwner:atom({connectionId:'C1',profile:'default'})}},useValue=a=>a?.get();export {MessageTextContent} from ${JSON.stringify(resolve(desktopDir,'src/components/assistant-ui/markdown-text.tsx'))};`,loader:'js',resolveDir:desktopDir}))}}]})
  const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH ? {executablePath:process.env.CHROME_PATH} : {}),args:['--no-sandbox']})
@@ -34,6 +34,10 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   await page.addScriptTag({type:'module',content:bundle.outputFiles[0].text})
   await page.waitForSelector('[data-action-request]')
   assert.equal(await page.locator('[data-action-request]').count(),8)
+  // Not needed and the age label are part of every layout check below (owner ping advertises withdraw).
+  await page.waitForSelector('[data-withdraw-request]')
+  assert.equal(await page.locator('[data-withdraw-request]').count(),8,'every undecided tile offers Not needed')
+  assert.match(await page.locator('[data-action-request]').first().locator('[data-asked-age]').innerText(),/^asked \d+ min ago$/)
   for(const zoom of [1,2]){
    await page.evaluate(z=>document.body.style.zoom=z,zoom)
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,`overflow at zoom ${zoom}`)
@@ -87,9 +91,10 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   await page.evaluate(value=>window.setRequests([value]),incomplete)
   const blocked=page.getByRole('article',{name:incomplete.title})
   await blocked.locator('[data-action-scope] [data-streamdown="strong"]').waitFor()
-  // desktop-1321064734: a plan-less ask offers exactly two things to do, never a greyed-out Approve
+  // desktop-1321064734: a plan-less ask offers exactly two things to do, never a greyed-out Approve. This owner
+  // advertises withdraw, so the second is the owner-side Not needed (older owners get the local Dismiss).
   assert.equal(await blocked.getByRole('button',{name:'Approve',exact:true}).count(),0)
-  assert.deepEqual(await blocked.getByRole('button').allInnerTexts(),['Ask agent for the plan','Dismiss'])
+  assert.deepEqual(await blocked.getByRole('button').allInnerTexts(),['Ask agent for the plan','Not needed'])
   assert.match(await blocked.locator('[data-approval-blocked]').innerText(),/without a plan/)
   for(const width of [640,360]){
    await page.setViewportSize({width,height:1000})
@@ -111,6 +116,31 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   await page.waitForFunction(()=>window.posts.length===3)
   assert.equal(await page.evaluate(()=>window.posts[2].revisionText),'JSON document')
   assert.equal(await page.evaluate(()=>window.posts[2].choiceId),'json')
+  // Not needed: keyboard-reachable right after the decision buttons with a visible focus ring; one withdraw POST
+  // through the owner route; the tile leaves, focus stays in the queue, and no decision is recorded.
+  const stale={...fixture,requestId:'00000000-0000-4000-8000-000000000094',title:'Stale ask to dismiss',createdAt:new Date(Date.now()-3*3600e3-60e3).toISOString()}
+  const kept={...fixture,requestId:'00000000-0000-4000-8000-000000000095',title:'Ask that stays'}
+  await page.evaluate(value=>window.setRequests(value),[stale,kept])
+  const staleCard=page.getByRole('article',{name:stale.title})
+  await staleCard.getByRole('button',{name:'Not needed'}).waitFor()
+  assert.equal(await staleCard.locator('[data-asked-age]').innerText(),'asked 3 h ago')
+  for(const width of [640,360]){
+   await page.setViewportSize({width,height:1000})
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`overflow at ${width}px with Not needed`)
+   if(screenshots)await page.locator('[data-action-queue]').screenshot({path:resolve(screenshots,`withdraw-${width}.png`)})
+  }
+  await staleCard.getByRole('button',{name:'Decline',exact:true}).focus()
+  await page.keyboard.press('Tab')
+  const focused=await page.evaluate(()=>{const a=document.activeElement,s=getComputedStyle(a);return {text:a.textContent,title:a.title,outline:s.outlineStyle,width:s.outlineWidth,height:a.getBoundingClientRect().height}})
+  assert.equal(focused.text,'Not needed');assert.match(focused.title,/without deciding; nothing is sent to the agent/)
+  assert.equal(focused.outline,'solid');assert.equal(focused.width,'2px');assert.ok(focused.height>=44)
+  await page.keyboard.press('Enter')
+  await page.waitForFunction(()=>window.withdraws.length===1)
+  assert.deepEqual(await page.evaluate(()=>window.withdraws),[{path:`/api/plugins/user-steps/requests/${stale.requestId}/withdraw`,connectionId:'C1',profile:'default',body:{session:'S1',expectedRevision:1,reason:'Dismissed in Desktop as not needed'}}])
+  await page.waitForFunction(()=>document.querySelectorAll('[data-action-request]').length===1)
+  assert.equal(await page.evaluate(()=>document.activeElement.getAttribute('aria-label')),kept.title,'focus moves to the remaining ask')
+  assert.equal(await page.locator('[data-action-queue] h2').innerText(),'For you (1)')
+  assert.equal(await page.evaluate(()=>window.posts.length),3,'Not needed records no decision')
   assert.deepEqual(errors,[])
  } finally {await browser.close()}
 })

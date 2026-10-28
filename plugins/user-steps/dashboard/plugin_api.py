@@ -55,8 +55,16 @@ class ChatReconcileBody(BaseModel):
     expectedRevision: StrictInt
 
 
+class WithdrawBody(BaseModel):
+    """The person removes an ask without deciding it: nothing is delivered and no turn starts."""
+    model_config = ConfigDict(extra='forbid')
+    session: StrictStr
+    expectedRevision: StrictInt
+    reason: Optional[StrictStr] = None
+
+
 def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
-                  cards=None, *, action_store=None, owner_resolver=None, receiver=None):
+                  cards=None, *, action_store=None, owner_resolver=None, receiver=None, kanban_boards=None):
     recovered = set()
     recovery_lock = threading.Lock()
 
@@ -173,9 +181,17 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
 
     router.retry_pending = retry_pending
 
+    def retire_moot(st, own):
+        # The queue is never staler than the board: settle-linked asks are withdrawn before listing.
+        # A failure here must not hide the queue itself.
+        try:
+            _load('core').reconcile_moot(st, ledger(), own, boards=kanban_boards)
+        except Exception:
+            logging.getLogger('user-steps').exception('Moot-ask reconciliation failed')
+
     @router.get('/ping')
     def ping():
-        out = {'ok': True, 'api': API_VERSION}
+        out = {'ok': True, 'api': API_VERSION, 'features': ['withdraw']}
         try:
             # Requests still up after their question was answered (desktop-1321064734); >0 needs a look.
             out['stale'] = _load('chat').stale_counts(_load('core'), store(), db=state_db)
@@ -184,17 +200,28 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return out
 
     @router.get('/requests')
-    def requests(session: str):
+    def requests(session: str, include: str = ''):
+        # Withdrawn requests are omitted unless asked for: older Desktop builds reject unknown states.
         def action():
             own = owner(session)
             st = migrate(own)
             _load('chat').reconcile(_load('core'), st, own, db=state_db)
-            return {'requests': st.requests(own)}
+            retire_moot(st, own)
+            return {'requests': st.views(own, include_withdrawn=include == 'withdrawn')}
         return run(action)
 
     @router.get('/requests/{request_id}')
     def request(request_id: str, session: str):
-        return run(lambda: {'request': store().get(owner(session), request_id)})
+        return run(lambda: {'request': store().view(owner(session), request_id)})
+
+    @router.post('/requests/{request_id}/withdraw')
+    def withdraw(request_id: str, body: WithdrawBody):
+        def action():
+            own = owner(body.session)
+            return {'request': _load('core').withdraw_request(
+                store(), ledger(), own, request_id, by='user', expected_revision=body.expectedRevision,
+                reason=(body.reason or '').strip() or 'Dismissed as not needed')}
+        return run(action)
 
     @router.post('/requests/{request_id}/decisions')
     def decide(request_id: str, body: DecisionBody):

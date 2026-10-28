@@ -353,6 +353,9 @@ Rules:
 - One step per distinct ask; at most 5.
 - "resolved": ids from OPEN STEPS that the USER'S LAST MESSAGE answered, did, declined or made moot, or that the
   reply says are now done. Leave a step out when unsure.
+- Status reports are not asks: "X is in review", "not yet approved", "still open", "waiting on CI/a worker/a
+  reviewer". A Kanban card in review is checked by an automated reviewer, not by the user.
+- If the reply says nothing is needed from the user, return no steps unless a sentence explicitly asks the user.
 - No asks: {"steps":[],"resolved":[...]}."""
 
 
@@ -515,12 +518,66 @@ def action_identity(step: dict) -> tuple:
             tuple(step.get("options") or []))
 
 
+# A reply that itself says nothing is waiting on the user cannot also carry an ask in a plain status line
+# ("The card is in review, not yet approved."). Only an unscoped declaration counts: a whole sentence that is
+# the declaration ("Nothing is currently assigned to you."). A scoped one ("nothing is needed from you for the
+# deploy", "t_A: nothing for you") says nothing about the rest of the reply, whose real asks may carry no
+# request marker ("I need the new live key"). Deliberately NOT "nothing else for you" (one item remains).
+_NO_USER_ACTION = re.compile(
+    r"(?:(?:so|and|right now|for now|currently),? )?(?:"
+    r"(?:there is |there's )?nothing (?:is )?(?:currently )?"
+    r"(?:assigned to|needed from|required from|waiting on|waiting for|pending (?:on|for)) you"
+    r"|nothing (?:is )?(?:needed|required) (?:from|of) you"
+    r"|no (?:user |human )?(?:action|input) (?:is )?(?:needed|required)(?: (?:from|of) you)?"
+    r"|you (?:don't|do not) (?:need|have) to do anything"
+    r"|there's nothing (?:you need to do|for you to do)"
+    r")(?: (?:right now|currently|at the moment|for now))?",
+    re.I)
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
+_LIST_MARK = re.compile(r"^(?:[-*\u2022>]\s*|\d+[.)]\s*|#+\s*)+")
+_QUOTED = re.compile(r'"[^"\n]*"')
+_DIRECT_REQUEST = re.compile(
+    r"\?"
+    r"|\b(?:please|kindly)\b"
+    r"|\b(?:can|could|would|will) you\b"
+    r"|\byou(?:'ll| will)? (?:need to|must|have to|should)\b"
+    r"|\b(?:let me know|tell me|your call|up to you)\b"
+    r"|\b(?:i|we) (?:still )?need (?:you|your|the|a|an|one)\b|\bneeds? your\b|\bwaiting (?:on|for) (?:you|your)\b"
+    r"|\b(?:until|once) you\b|\byour (?:sign-?off|approval|go-ahead|ok)\b"
+    r"|(?:^|[.!:;,\u2014\u2013]\s*|\n\s*(?:[-*\u2022]|\d+[.)])\s*)(?:please\s+)?"
+    r"(?:approve|confirm|decide|choose|pick|select|reply|answer|say|sign in|log in|tap|click|scan|plug|open|"
+    r"authorize|grant|allow|enter|paste|type|record|send|go to|run|install|restart|unlock|press|connect|buy|"
+    r"accept|review|check|test|try)\b(?!\s+of\b)",
+    re.I)
+
+
+def _plain(text: str) -> str:
+    """Markdown emphasis and smart quotes off; line structure kept (bullets/sentence starts matter)."""
+    t = re.sub(r"[*_`~]", "", text or "").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+    return re.sub(r"[ \t]+", " ", t).strip()
+
+
+def declares_no_user_action(reply: str) -> bool:
+    """Some sentence of the reply is, in full, an unscoped "nothing is needed from you" declaration."""
+    for sentence in _SENTENCE_BREAK.split(_plain(_strip_noise(reply))):
+        s = _LIST_MARK.sub("", sentence.strip()).rstrip(" .!").strip()
+        if s and _NO_USER_ACTION.fullmatch(s):
+            return True
+    return False
+
+
+def directly_asks(span: str) -> bool:
+    """The evidence is phrased as a request of the user. Quoted text (someone else's words) does not count."""
+    return bool(_DIRECT_REQUEST.search(_QUOTED.sub('""', _plain(span))))
+
+
 def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None,
              *, continuity: bool = False) -> list[dict]:
     out: list[dict] = []
     # The creation boundary needs repeats too, including those resolved while the
     # model runs. Ordinary extractor callers retain their old deduplication.
     seen: set[Any] = set() if continuity else {_norm(s.get("text", "")) for s in open_steps}
+    quiet = declares_no_user_action(reply)
     for s in raw_steps if isinstance(raw_steps, list) else []:
         if not isinstance(s, dict):
             continue
@@ -540,6 +597,8 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             opts = []
         if _NOT_ASK.search(span):
             continue  # hypothetical / mention-only, whatever the model said
+        if quiet and not directly_asks(span):
+            continue  # the reply says nothing waits on the user; a status line is not an ask
         block = locate(reply, span)
         if block is None or _norm(span) not in _norm(block["text"]):
             continue  # full evidence required; locate's framing prefix is not validation
@@ -752,6 +811,8 @@ def resolve(ledger: Ledger, root: str, ids: list[str], resolution: str, by: str)
 
 
 HELD_REPLY = "This reply has been held because it repeats a retired request. No new action is requested."
+# Resolution text of a step whose request was withdrawn: no decision; older renderers prefix it with a check.
+NO_LONGER_NEEDED = "No longer needed"
 
 
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
@@ -799,7 +860,13 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             for step in d["steps"]:
                 if action_store is not None and step.get('requestId') and step.get('session') == session_id:
                     current = action_store.get(action_owner, step['requestId'])
-                    if current['state'] in ('superseded', 'resolved', 'cancelled'):
+                    if current['state'] == 'withdrawn':
+                        # Retired without a decision: a later re-ask is a fresh ask, never a held repeat.
+                        if step.get('status') == 'open':
+                            step.update(status='resolved', resolution=f'{NO_LONGER_NEEDED}.',
+                                        resolved_by='canonical', resolved_at=now)
+                        step['withdrawn'] = True
+                    elif current['state'] in ('superseded', 'resolved', 'cancelled'):
                         step.update(status='resolved', resolution='canonical request retired',
                                     resolved_by='canonical', resolved_at=now)
                 if step.get("id") in res["resolved"] and step.get("status") == "open" and not step.get("requestId"):
@@ -808,7 +875,9 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                     resolved.append(step["id"])
             matches = [(s, [old for old in d["steps"] if action_identity(old) == action_identity(s)])
                        for s in res["steps"]]
-            suppressed = [s for s, old in matches if any(x.get("status") == "resolved" for x in old)]
+            # A withdrawn ask was never answered or declined, so asking it again is not a repeat.
+            suppressed = [s for s, old in matches
+                          if any(x.get("status") == "resolved" and not x.get("withdrawn") for x in old)]
             held = False
             if suppressed:
                 # Evidence does not delimit dependent instructions in other blocks.
@@ -889,6 +958,15 @@ class ActionError(ValueError):
         self.status = status
 
 
+# Who may withdraw an ask: the board/reconciler (system), the owning chat (agent), the person (user).
+WITHDRAW_BY = ('system', 'agent', 'user')
+
+
+def _iso(ts) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(float(ts), timezone.utc).isoformat()
+
+
 def _object(value, required, optional=()):
     if not isinstance(value, dict) or set(value) - set(required) - set(optional) or set(required) - set(value):
         raise ActionError('Invalid object fields')
@@ -958,7 +1036,7 @@ def validate_action(value):
         if choice['effect'] in ('approve', 'decline') and choice['effect'] not in value['outcomes']:
             raise ActionError('Choice requires a stated outcome')
     if not ids: raise ActionError('At least one choice is required')
-    if value['state'] not in ('needs_context', 'open', 'resolved', 'superseded', 'cancelled'):
+    if value['state'] not in ('needs_context', 'open', 'resolved', 'superseded', 'cancelled', 'withdrawn'):
         raise ActionError('Invalid state')
     if value['state'] == 'open' and not scope['complete']:
         raise ActionError('Incomplete requests must need context')
@@ -1041,7 +1119,13 @@ class ActionStore:
                 CREATE TABLE IF NOT EXISTS clarification_upgrades (
                   namespace TEXT, request TEXT, revision INTEGER, body TEXT,
                   PRIMARY KEY(namespace,request,revision));
+                -- Side table, not new request columns: older processes INSERT into requests positionally.
+                CREATE TABLE IF NOT EXISTS lifecycle (
+                  namespace TEXT, id TEXT, created_at REAL, withdrawal TEXT, notified_at REAL,
+                  asked_revision INTEGER, PRIMARY KEY(namespace,id));
             ''')
+            if 'asked_revision' not in {row[1] for row in c.execute('PRAGMA table_info(lifecycle)')}:
+                c.execute('ALTER TABLE lifecycle ADD COLUMN asked_revision INTEGER')
 
     def _connect(self):
         c = sqlite3.connect(self.path, timeout=30)
@@ -1078,11 +1162,13 @@ class ActionStore:
     def get(self, owner, rid):
         with self._tx() as c: return self._get(c, owner, rid)
 
-    def requests(self, owner):
+    def requests(self, owner, *, include_withdrawn=False):
+        # Withdrawn rows are omitted by default: route bodies mounted before this state existed call this, and
+        # renderers that predate it reject a whole queue that holds an unknown state.
         with self._tx() as c:
-            ids = c.execute('SELECT id FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
+            ids = c.execute('SELECT id, state FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
                             (self._ns(owner), owner['storedSessionId'])).fetchall()
-            return [self._get(c, owner, row[0]) for row in ids]
+            return [self._get(c, owner, row[0]) for row in ids if include_withdrawn or row[1] != 'withdrawn']
 
     def _aliases(self, c, owner, r):
         ns = self._ns(owner)
@@ -1093,7 +1179,7 @@ class ActionStore:
                 raise ActionError('Alias already belongs to another request', 409)
             c.execute('INSERT OR IGNORE INTO aliases VALUES (?,?,?)', (_json(ref), ns, r['requestId']))
 
-    def create(self, owner, value, *, bind=None):
+    def create(self, owner, value, *, bind=None, created_at=None):
         r = validate_action(value); ns = self._ns(owner)
         if r['owner'] != owner: raise ActionError('Owner mismatch', 403)
         if r['revision'] != 1 or 'resolution' in r or r['state'] not in ('open', 'needs_context'):
@@ -1104,6 +1190,8 @@ class ActionStore:
                           (ns, r['requestId'], owner['storedSessionId'], 1, r['state']))
                 self._aliases(c, owner, r)
                 c.execute('INSERT INTO revisions VALUES (?,?,?,?)', (ns, r['requestId'], 1, _json(r)))
+                c.execute('INSERT OR IGNORE INTO lifecycle(namespace,id,created_at,asked_revision) VALUES (?,?,?,1)',
+                          (ns, r['requestId'], float(created_at) if created_at else time.time()))
                 if bind is not None: bind(r, 0)
         except sqlite3.IntegrityError: raise ActionError('Request already exists', 409)
         return r
@@ -1114,7 +1202,7 @@ class ActionStore:
             return [json.loads(row[0]) for row in c.execute(
                 'SELECT body FROM revisions WHERE namespace=? AND id=? ORDER BY revision', (self._ns(owner), rid))]
 
-    def revise(self, owner, rid, expected, replacement, *, bind=None):
+    def revise(self, owner, rid, expected, replacement, *, bind=None, fresh=True):
         with self._tx() as c:
             old = self._get(c, owner, rid); ns = self._ns(owner)
             if type(expected) is not int or old['revision'] != expected: raise ActionError('Stale revision', 409)
@@ -1134,6 +1222,16 @@ class ActionStore:
             c.execute('INSERT INTO revisions VALUES (?,?,?,?)', (ns, rid, r['revision'], _json(r)))
             c.execute('UPDATE requests SET revision=?,state=?,resolution=NULL WHERE namespace=? AND id=?',
                       (r['revision'], r['state'], ns, rid))
+            if fresh or old['state'] == 'withdrawn':
+                # A producer revision is a fresh ask (a revival too): its age restarts, so card movement before
+                # it cannot retire it. A server-side re-render (fresh=False) keeps the original ask time.
+                c.execute('INSERT INTO lifecycle(namespace,id,created_at,asked_revision) VALUES (?,?,?,?) '
+                          'ON CONFLICT(namespace,id) DO UPDATE SET created_at=excluded.created_at, '
+                          'asked_revision=excluded.asked_revision, withdrawal=NULL, notified_at=NULL',
+                          (ns, rid, time.time(), r['revision']))
+            else:
+                c.execute('INSERT INTO lifecycle(namespace,id,asked_revision) VALUES (?,?,?) ON CONFLICT(namespace,id) '
+                          'DO UPDATE SET asked_revision=excluded.asked_revision', (ns, rid, r['revision']))
             if bind is not None: bind(r, expected)
             return r
 
@@ -1251,6 +1349,129 @@ class ActionStore:
                 and (max_attempts is None or op.get('attempts', 0) < max_attempts)]
         return [self.dispatch(owner, oid, receiver) for oid in ids]
 
+    # ---- lifecycle: withdrawal (a moot ask leaves the queue; NOT a decision) ----------------------------
+
+    def _life(self, c, owner, rid):
+        return c.execute('SELECT created_at, withdrawal, notified_at FROM lifecycle WHERE namespace=? AND id=?',
+                         (self._ns(owner), rid)).fetchone()
+
+    def _view(self, c, owner, rid):
+        """Presentation copy for REST/hook readers. Internal callers keep _get's exact frozen body
+        (card bindings compare it byte for byte), so lifecycle fields never enter decisions."""
+        body = self._get(c, owner, rid)
+        life = self._life(c, owner, rid)
+        if life is not None and life['created_at'] is not None:
+            body['createdAt'] = _iso(life['created_at'])
+        if body['state'] == 'withdrawn' and life is not None and life['withdrawal']:
+            body['withdrawal'] = json.loads(life['withdrawal'])
+        return body
+
+    def view(self, owner, rid):
+        with self._tx() as c: return self._view(c, owner, rid)
+
+    def views(self, owner, *, include_withdrawn=False):
+        with self._tx() as c:
+            rows = c.execute('SELECT id, state FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
+                             (self._ns(owner), owner['storedSessionId'])).fetchall()
+            return [self._view(c, owner, row['id']) for row in rows
+                    if include_withdrawn or row['state'] != 'withdrawn']
+
+    def created_at(self, owner, rid):
+        with self._tx() as c:
+            life = self._life(c, owner, rid)
+            return life['created_at'] if life is not None else None
+
+    def stamp_ask(self, owner, rid, ts, revision, *, fresh=False):
+        """Record when ``revision`` was asked; return the stored ask time.
+
+        Backfill (fresh=False) never moves a known time. fresh=True: a process that predates the stamp wrote
+        this revision (an older producer re-asked), so it is a fresh ask. A request that moved on since it was
+        read is left alone; the next pass re-reads it."""
+        ns = self._ns(owner)
+        with self._tx() as c:
+            row = c.execute('SELECT state, revision FROM requests WHERE namespace=? AND id=?', (ns, rid)).fetchone()
+            if row is not None and row['revision'] == revision and row['state'] in ('open', 'needs_context'):
+                if fresh:
+                    c.execute('INSERT INTO lifecycle(namespace,id,created_at,asked_revision) VALUES (?,?,?,?) '
+                              'ON CONFLICT(namespace,id) DO UPDATE SET created_at=excluded.created_at, '
+                              'asked_revision=excluded.asked_revision, withdrawal=NULL, notified_at=NULL',
+                              (ns, rid, float(ts), revision))
+                else:
+                    c.execute('INSERT INTO lifecycle(namespace,id,created_at,asked_revision) VALUES (?,?,?,?) '
+                              'ON CONFLICT(namespace,id) DO UPDATE SET '
+                              'created_at=COALESCE(lifecycle.created_at, excluded.created_at), '
+                              'asked_revision=excluded.asked_revision', (ns, rid, float(ts), revision))
+            life = c.execute('SELECT created_at FROM lifecycle WHERE namespace=? AND id=?', (ns, rid)).fetchone()
+            return life['created_at'] if life is not None and life['created_at'] is not None else float(ts)
+
+    def moot_candidates(self, owner):
+        """[(request, lifecycle row or None)] for this session's undecided requests with no bound decision card,
+        in ONE deferred read with a 2 s busy timeout: the best-effort pass that runs on every queue read and
+        agent turn takes no write lock and never waits long behind a writer."""
+        c = sqlite3.connect(self.path, timeout=2)
+        c.row_factory = sqlite3.Row
+        try:
+            c.execute('BEGIN')
+            ns = self._ns(owner)
+            rows = c.execute("SELECT id FROM requests WHERE namespace=? AND session=? AND state IN ('open','needs_context') "
+                             'AND resolution IS NULL ORDER BY rowid', (ns, owner['storedSessionId'])).fetchall()
+            out = []
+            for row in rows:
+                r = self._get(c, owner, row['id'])
+                if any(a.get('type') == 'kanban' for a in r.get('aliases', [])):
+                    continue  # decided on its own decision card; withdrawing it would strand that card
+                life = c.execute('SELECT created_at, asked_revision FROM lifecycle WHERE namespace=? AND id=?',
+                                 (ns, row['id'])).fetchone()
+                out.append((r, dict(life) if life is not None else None))
+            c.commit()
+            return out
+        finally:
+            c.close()
+
+    def withdraw(self, owner, rid, *, by, reason, evidence=None, expected_revision=None, now=None):
+        """open/needs_context -> withdrawn. Grants nothing, admits no turn, delivers nothing.
+
+        Refused once a decision is recorded for the current revision (the decision wins), for a closed
+        request, or for a stale expected revision. Repeating it returns the first withdrawal unchanged.
+        """
+        if by not in WITHDRAW_BY: raise ActionError('Invalid withdrawal actor')
+        if not isinstance(reason, str) or not reason.strip(): raise ActionError('Withdrawal reason required')
+        if expected_revision is not None and type(expected_revision) is not int:
+            raise ActionError('Invalid expectedRevision')
+        record = {'by': by, 'reason': re.sub(r'\s+', ' ', reason).strip()[:300], 'at': _iso(now or time.time())}
+        if evidence: record['evidence'] = str(evidence)[:500]
+        with self._tx() as c:
+            r = self._get(c, owner, rid); ns = self._ns(owner)
+            if r['state'] == 'withdrawn': return self._view(c, owner, rid)
+            if r['state'] not in ('open', 'needs_context'): raise ActionError('Request is already closed', 409)
+            if any(a.get('type') == 'kanban' for a in r.get('aliases', [])):
+                raise ActionError('This request is decided on its decision card', 409)
+            if expected_revision is not None and r['revision'] != expected_revision:
+                raise ActionError('Stale revision', 409)
+            if r.get('resolution') or c.execute('SELECT 1 FROM operations WHERE namespace=? AND request=? AND revision=?',
+                                                (ns, rid, r['revision'])).fetchone():
+                raise ActionError('A decision is already recorded for this revision', 409)
+            c.execute("UPDATE requests SET state='withdrawn' WHERE namespace=? AND id=? AND revision=?",
+                      (ns, rid, r['revision']))
+            c.execute('INSERT INTO lifecycle(namespace,id,withdrawal) VALUES (?,?,?) ON CONFLICT(namespace,id) '
+                      'DO UPDATE SET withdrawal=excluded.withdrawal, notified_at=NULL', (ns, rid, _json(record)))
+            return self._view(c, owner, rid)
+
+    def unnotified_withdrawals(self, owner):
+        """Withdrawals the owning chat did not make itself (system/user) and has not been told about."""
+        with self._tx() as c:
+            rows = c.execute("SELECT r.id FROM requests r JOIN lifecycle l ON l.namespace=r.namespace AND l.id=r.id "
+                             "WHERE r.namespace=? AND r.session=? AND r.state='withdrawn' AND l.notified_at IS NULL "
+                             "ORDER BY r.rowid", (self._ns(owner), owner['storedSessionId'])).fetchall()
+            views = [self._view(c, owner, row['id']) for row in rows]
+            return [v for v in views if (v.get('withdrawal') or {}).get('by') in ('system', 'user')]
+
+    def mark_notified(self, owner, rids, now=None):
+        with self._tx() as c:
+            for rid in rids:
+                c.execute('UPDATE lifecycle SET notified_at=? WHERE namespace=? AND id=?',
+                          (now or time.time(), self._ns(owner), rid))
+
     def migrate_step(self, owner, step):
         if step.get('session') != owner['storedSessionId']: raise ActionError('Legacy session association unproven', 403)
         _string(step.get('id')); _string(step.get('text'))
@@ -1281,7 +1502,7 @@ class ActionStore:
                     or r['title'] != previous['title']):
                 return previous
             r['requestId'] = previous['requestId']
-            upgraded = self.revise(owner, previous['requestId'], previous['revision'], r)
+            upgraded = self.revise(owner, previous['requestId'], previous['revision'], r, fresh=False)
             # This marker proves a mechanical, server-side re-render, not an agent scope
             # revision. Missing/racing markers fail closed in chat. Approvals never get one:
             # they stay agent-incomplete until the producer publishes the exact plan.
@@ -1291,7 +1512,7 @@ class ActionStore:
                         c.execute('INSERT INTO clarification_upgrades VALUES (?,?,?,?)',
                                   (self._ns(owner), upgraded['requestId'], upgraded['revision'], _json(upgraded)))
             return upgraded
-        try: return self.create(owner, r)
+        try: return self.create(owner, r, created_at=step.get('created'))
         except ActionError as exc:
             if exc.status != 409: raise
             with self._tx() as c:
@@ -1427,3 +1648,238 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
         r['outcomes'] = {'revise': 'Waiting for the agent to publish the full exact plan. Nothing can be '
                                    'approved yet and no permission is granted.'}
     return r
+
+# ---- moot-ask lifecycle: retire asks whose work settled, or that their chat/user withdrew -------------
+
+def _retire_steps(ledger: "Ledger", session: str, ids: list[str], resolution: str, by: str) -> None:
+    """Mark this session's legacy ledger steps behind a withdrawn request resolved, so the passive strip, steps
+    payload and ask-gate see the ask as retired (status stays a known value). ``withdrawn`` records that no
+    decision was made: asking the same thing again later is a fresh ask, not a repeat to hold."""
+    root = ledger.root(session)
+    def hit(s):
+        return s.get("id") in ids and s.get("session") == session and s.get("status") == "open"
+    if not any(hit(s) for s in ledger._read(root).get("steps", [])):
+        return
+    with ledger.edit(root) as d:
+        for s in d.get("steps", []):
+            if hit(s):
+                s.update(status="resolved", resolution=resolution[:200], resolved_by=by, resolved_at=time.time(),
+                         withdrawn=True)
+
+
+def withdraw_request(store: "ActionStore", ledger: Optional["Ledger"], owner: dict, rid: str, *, by: str,
+                     reason: str, evidence: Optional[str] = None, expected_revision: Optional[int] = None,
+                     now: Optional[float] = None) -> dict:
+    """Withdraw one canonical request (ActionStore.withdraw), then retire its ledger step(s)."""
+    view = store.withdraw(owner, rid, by=by, reason=reason, evidence=evidence,
+                          expected_revision=expected_revision, now=now)
+    ids = [a["id"] for a in view.get("aliases", []) if a.get("type") == "user_step"
+           and a.get("gatewayId") == owner["gatewayId"] and a.get("profile") == owner["profile"]]
+    if ids and ledger is not None:
+        w = view.get("withdrawal") or {}
+        try:
+            _retire_steps(ledger, owner["storedSessionId"], ids, f"{NO_LONGER_NEEDED}: " + (w.get("reason") or reason),
+                          w.get("by") or by)
+        except Exception:  # the canonical request is already withdrawn; the legacy mirror is best effort
+            logging.getLogger("user-steps").exception("withdrawn request %s: ledger step not retired", rid)
+    return view
+
+
+_CARD_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")
+_TERMINAL = ("done", "archived")
+
+
+def kanban_root() -> Path:
+    """Boards are install-shared (core kanban_home), not per profile; fall back to this home."""
+    try:
+        from hermes_cli.kanban_db import kanban_home  # type: ignore
+        return Path(kanban_home())
+    except Exception:
+        return home()
+
+
+def kanban_boards(root: Optional[Path] = None) -> list[tuple[str, Path]]:
+    """Live boards only: `kanban/boards/_archived/...` holds retired copies, whose duplicate ids would
+    make every card look ambiguous (and ambiguous ids never retire anything)."""
+    r = root or kanban_root()
+    out = [("default", r / "kanban.db")] + [(p.parent.name, p) for p in sorted((r / "kanban" / "boards").glob("*/kanban.db"))
+                                            if not p.parent.name.startswith("_")]
+    return [(b, p) for b, p in out if p.is_file()]
+
+
+def _ts(value) -> Optional[float]:
+    """Kanban timestamps are mixed: epoch seconds from the local writer, milliseconds from synced holders."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v / 1000.0 if v > 1e11 else v
+
+
+# A card the ask is about counts only if it was WAITING on someone when the ask was made: blocked, in review,
+# or escalated to triage. The ask is moot once every such card is done or archived after the ask. Unblocking
+# does NOT end the wait: agents unblock to retry, and the retry often hits the same wall. A card that was
+# merely running when asked is not counted: the ask may be about what happens after it finishes.
+_WAIT_KINDS = ("blocked", "review_requested", "block_loop_detected", "gave_up")
+_RELEASE_KINDS = ("unblocked", "completed", "archived", "changes_requested", "claimed", "promoted_manual")
+_EVENT_KINDS = _WAIT_KINDS + _RELEASE_KINDS
+
+
+def _card_facts(task_id: str, boards: list[tuple[str, Path]], board: Optional[str] = None,
+                conns: Optional[dict] = None) -> Optional[dict]:
+    """{board, status, completed_at, events: [(ts, kind, payload)]} for a card on exactly one local board.
+
+    None when the id is unknown or ambiguous, or when a board could not be read (it could hold a duplicate).
+    ``conns`` caches one read-only connection per board for a whole pass (the caller closes them)."""
+    found = []
+    marks = ",".join("?" * len(_EVENT_KINDS))
+    for slug, path in boards:
+        if board and slug != board:
+            continue
+        try:
+            c = conns.get(path) if conns is not None else None
+            if c is None:
+                c = _ro_connect(path, timeout=2)
+                if conns is not None:
+                    conns[path] = c
+            try:
+                row = c.execute("SELECT status, completed_at FROM tasks WHERE id=?", (task_id,)).fetchone()
+                events = c.execute(f"SELECT created_at, kind, payload FROM task_events WHERE task_id=? AND kind IN ({marks}) "
+                                   "ORDER BY created_at, id", (task_id, *_EVENT_KINDS)).fetchall() if row else []
+            finally:
+                if conns is None:
+                    c.close()
+        except sqlite3.Error:
+            return None
+        if not row:
+            continue
+        timed = sorted(((_ts(ts), kind, payload) for ts, kind, payload in events if _ts(ts) is not None),
+                       key=lambda e: e[0])
+        found.append({"board": slug, "status": row[0], "completed_at": _ts(row[1]), "events": timed})
+    return found[0] if len(found) == 1 else None
+
+
+def _releases(kind: str, payload) -> bool:
+    if kind != "claimed":
+        return True
+    try:  # a reviewer claiming a card in review continues the review wait
+        return (json.loads(payload or "{}") or {}).get("source_status") != "review"
+    except (ValueError, AttributeError):
+        return True
+
+
+def _waiting_at(facts: dict, at: float) -> bool:
+    state = False
+    for ts, kind, payload in facts["events"]:
+        if ts > at:
+            break
+        if kind in _WAIT_KINDS:
+            state = True
+        elif _releases(kind, payload):
+            state = False
+    return state
+
+
+def _card_verdict(facts: dict, asked_at: float) -> Optional[str]:
+    """None = not counted (not waiting when asked), 'open' = its wait has not ended, else why it ended."""
+    if not _waiting_at(facts, asked_at):
+        return None
+    status = facts["status"]
+    if status in _TERMINAL and (any(kind in ("completed", "archived") for ts, kind, _ in facts["events"] if ts > asked_at)
+                                or (facts["completed_at"] or 0) > asked_at):
+        return f"is {status}"
+    return "open"
+
+
+def _watched_cards(request: dict, owner: dict, steps: dict) -> list[tuple[Optional[str], str]]:
+    """Cards the ask is about: ids in its title and its extracted step's text (the ask itself), plus explicit
+    same-owner kanban sourceRefs. Never the evidence sentence or its paragraph, which name context too
+    ("t_X is blocked on CI; meanwhile, pick the pricing tier")."""
+    texts = [request.get("title") or ""]
+    for a in request.get("aliases", []):
+        if a.get("type") == "user_step" and a.get("gatewayId") == owner["gatewayId"] and a.get("profile") == owner["profile"]:
+            texts.append((steps.get(a.get("id")) or {}).get("text") or "")
+    out: list[tuple[Optional[str], str]] = []
+    for t in texts:
+        out += [(None, m) for m in _CARD_ID.findall(t)]
+    for ref in (request.get("scope") or {}).get("sourceRefs", []):
+        if ref.get("type") == "kanban" and ref.get("gatewayId") == owner["gatewayId"] and ref.get("profile") == owner["profile"]:
+            out.append((ref.get("board"), ref.get("id")))
+    seen, uniq = set(), []
+    for board, tid in out:
+        if tid and tid not in seen:
+            seen.add(tid)
+            uniq.append((board, tid))
+    return uniq
+
+
+def _asked_at(store: "ActionStore", owner: dict, request: dict, life: Optional[dict], steps: dict, now: float) -> float:
+    """When the current revision was asked. A row from before the lifecycle table takes its ledger step's time;
+    a revision nothing stamped (an older process re-asked) is a fresh ask as of now."""
+    if life is None or life.get("created_at") is None:
+        ts = next((steps[a["id"]].get("created") for a in request.get("aliases", [])
+                   if a.get("type") == "user_step" and (steps.get(a.get("id")) or {}).get("created")), None)
+        return store.stamp_ask(owner, request["requestId"], ts or now, request["revision"])
+    if life.get("asked_revision") != request["revision"]:
+        return store.stamp_ask(owner, request["requestId"], now, request["revision"], fresh=True)
+    return life["created_at"]
+
+
+def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, boards=None,
+                   now: Optional[float] = None) -> list[dict]:
+    """Withdraw (by=system) each undecided ask whose linked work is over.
+
+    Every card the ask names must resolve on exactly one readable local board; at least one of them was
+    waiting on someone when the ask was made; every such card is done or archived after the ask; and no named
+    card is still in flight. Anything else (unknown, ambiguous or unreadable ids, a card still waiting or
+    running, a recorded decision, a bound decision card) leaves the ask alone: a stale tile is recoverable
+    ("Not needed"), a wrongly retired ask is lost. Runs on every For-you read and agent turn.
+    """
+    now = now or time.time()
+    out: list[dict] = []
+    conns: dict = {}
+    steps: Optional[dict] = None
+    try:
+        for r, life in store.moot_candidates(owner):
+            if steps is None and any(a.get("type") == "user_step" for a in r.get("aliases", [])):
+                try:
+                    steps = {s.get("id"): s for s in ledger.read(owner["storedSessionId"]).get("steps", []) if s.get("id")}
+                except Exception:
+                    steps = {}
+            watched = _watched_cards(r, owner, steps or {})
+            if not watched:
+                continue
+            if boards is None:
+                boards = kanban_boards()  # lazily: no board I/O when no ask names a card
+            asked_at = _asked_at(store, owner, r, life, steps or {}, now)
+            settled, keep = [], False
+            for board, tid in watched:
+                facts = _card_facts(tid, boards, board, conns)
+                if facts is None:
+                    keep = True  # unknown, ambiguous or unreadable: never retire on partial knowledge
+                    break
+                verdict = _card_verdict(facts, asked_at)
+                if verdict is None:
+                    if facts["status"] not in _TERMINAL:
+                        keep = True  # a named card is still in flight
+                        break
+                    continue
+                if verdict == "open":
+                    keep = True
+                    break
+                settled.append(f"{tid} {verdict}")
+            if keep or not settled:
+                continue
+            reason = ("Linked card " if len(settled) == 1 else "Linked cards: ") + "; ".join(settled)
+            try:
+                out.append(withdraw_request(store, ledger, owner, r["requestId"], by="system", reason=reason,
+                                            expected_revision=r["revision"], now=now))
+            except ActionError:
+                continue  # raced with a decision or a new revision: the next pass re-evaluates
+        return out
+    finally:
+        for c in conns.values():
+            try:
+                c.close()
+            except sqlite3.Error:
+                pass

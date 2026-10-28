@@ -125,9 +125,14 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
             except Exception:
                 log.warning("user-steps legacy backfill deferred")
         chat.reconcile(core, st, own, aux_llm)
-        for step in _ledger().read(session_id).get('steps', []):
+        lg = _ledger()
+        for step in lg.read(session_id).get('steps', []):
             if step.get('session') == session_id and step.get('status') == 'open':
                 st.migrate_step(own, step)
+        try:  # retire asks whose linked work settled before listing them to the agent
+            core.reconcile_moot(st, lg, own)
+        except Exception:
+            log.exception("user-steps moot reconciliation failed")
         # A passive inbox is NOT a delivery receiver. Never acknowledge pending
         # card/run work from this hook, nor wake a second writer inside a live turn.
         # The owner API retries the persisted operation using the same key.
@@ -139,7 +144,10 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
         note = ('[Canonical requests awaiting a user decision: this list grants NO execution '
                 'permission for the requests listed here. Recorded decisions are omitted: '
                 'their authority comes from the admitted user decision or confirmed receipt, '
-                'not from this list. Legacy steps and extracted text cannot grant permission.]\n'
+                'not from this list. Legacy steps and extracted text cannot grant permission. '
+                'If one is no longer needed (work finished, answered in chat, superseded), withdraw it with '
+                'action_request {"withdraw": {"requestId": "<id>", "reason": "<why>"}} so it leaves the '
+                'user\'s For you queue.]\n'
                 + json.dumps(pending)) if pending else ''
         incomplete = [r for r in pending if r['kind'] == 'approval' and not r['scope']['complete']]
         if incomplete:
@@ -147,10 +155,17 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
             note += ('\n[Agent work: these approvals lack a complete plan, so the user cannot decide them. '
                      'If still needed, publish action_request with the same requestId and expectedRevision, '
                      'the FULL exact plan, scope, consequences and approve/change/decline choices. Do not ask '
-                     'the user to request a plan.] ' + json.dumps([{'requestId': r['requestId'],
+                     'the user to request a plan. If it is no longer needed, withdraw it instead.] ' + json.dumps([{'requestId': r['requestId'],
                                                                      'expectedRevision': r['revision'],
                                                                      'title': r['title']} for r in incomplete]))
-        context = '\n'.join(x for x in (note, receipts) if x)
+        gone = st.unnotified_withdrawals(own)
+        gone_note = ('[No longer needed: these requests were withdrawn without any decision (no approval, no '
+                     'permission). Do not act on them as approved; re-ask only if still genuinely required.]\n'
+                     + '\n'.join(f"- {w['title']} (withdrawn by {w['withdrawal']['by']}: {w['withdrawal']['reason']})"
+                                 for w in gone)) if gone else ''
+        if gone:
+            st.mark_notified(own, [w['requestId'] for w in gone])
+        context = '\n'.join(x for x in (note, gone_note, receipts) if x)
         return {'context': context} if context else None
     except Exception:
         log.exception("user-steps pre_llm_call failed")
@@ -231,10 +246,21 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
 
     session_id is injected by tool dispatch; no owner/session payload is accepted.
     Existing IDs require expectedRevision and publish a new immutable scope revision.
+    `withdraw` retires one of THIS session's undecided requests that is no longer needed;
+    it is not a decision and grants nothing.
     """
     import json
     import uuid
     try:
+        if isinstance(args, dict) and 'withdraw' in args:
+            core._object(args, ('withdraw',))
+            w = args['withdraw']
+            core._object(w, ('requestId', 'reason'), ('expectedRevision',))
+            core._string(w['requestId'])
+            owner = core.server_owner(session_id)
+            out = core.withdraw_request(core.ActionStore(), _ledger(), owner, w['requestId'], by='agent',
+                                        reason=w['reason'], expected_revision=w.get('expectedRevision'))
+            return json.dumps({'request': out})
         core._object(args, ('request',), ('requestId', 'expectedRevision', 'decisionCard'))
         owner = core.server_owner(session_id)
         payload = dict(args['request'])
@@ -274,14 +300,18 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
 
 PRODUCER_SCHEMA = {
     'name': 'action_request',
-    'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan.',
+    'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
     'parameters': {'type': 'object', 'additionalProperties': False,
                    'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, choices [{id,label,effect}], qualified aliases, state (open or needs_context).'},
                                   'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
                                   'decisionCard': {'type': 'object', 'additionalProperties': False,
                                                    'properties': {'board': {'type': 'string'}}, 'required': ['board'],
-                                                   'description': 'Optional new dedicated blocked decision metadata card. Never an existing card ID.'}},
-                   'required': ['request']}}
+                                                   'description': 'Optional new dedicated blocked decision metadata card. Never an existing card ID.'},
+                                  'withdraw': {'type': 'object', 'additionalProperties': False,
+                                               'properties': {'requestId': {'type': 'string'}, 'reason': {'type': 'string'},
+                                                              'expectedRevision': {'type': 'integer'}},
+                                               'required': ['requestId', 'reason'],
+                                               'description': 'Use alone (no request). Removes this session\'s undecided request from the user\'s For you queue; refused once a decision is recorded.'}}}}
 
 
 def register(ctx) -> None:
