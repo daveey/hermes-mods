@@ -74,6 +74,12 @@ active. On each wakeup:
    links, running/idle, PR state), under 30 lines.
 5. Reschedule. Set `noop: true` when nothing changed.
 
+## Restarting the app sessions run in
+
+If the user has given standing approval to quit/kill and relaunch an app or backend (record it in
+memory), use it when updates are stuck waiting for in-flight turns to end. First check that no
+update/sync is mid-run and note any work the restart interrupts; tell the user after.
+
 ## Speed
 
 - "What are we working on" / status questions: `cat ~/.claude/dispatcher/status.md` and answer
