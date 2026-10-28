@@ -104,6 +104,28 @@ def test_library_warning_traceback_is_not_a_defect_but_ours_is():
     assert len(sg.parse_errors(rec("ERROR", "mcp.os.posix.utilities", lib))) == 1
 
 
+def test_process_exit_scheduling_traceback_is_not_a_defect():
+    """agent-9a2a3cc05d: a turn finishing while the backend exits logs CPython's shutdown refusal from our own
+    frames (pre_final_gate). That is exit noise, not a defect; any other RuntimeError there still files."""
+    own = "/home/you/.hermes/hermes-agent/agent/pre_final_gate.py"
+    pool = "/home/you/.hermes/tools/python-3.14.7/lib/python3.14/concurrent/futures/thread.py"
+
+    def rec(exc_line):
+        return ["2026-10-27 15:55:01,000 WARNING [20261027_152740_fa067b] agent.conversation_loop: "
+                "pre_final_gate hook pre_final_gate raised",
+                "Traceback (most recent call last):",
+                f'  File "{own}", line 235, in _invoke',
+                "    return _call(cb, call_kwargs, limit)",
+                f'  File "{own}", line 220, in _call',
+                "    return pool.submit(copy_context().run, cb, **kwargs).result(timeout=limit)",
+                f'  File "{pool}", line 207, in submit',
+                "    raise RuntimeError('cannot schedule new futures after '",
+                exc_line]
+    assert sg.parse_errors(rec("RuntimeError: cannot schedule new futures after interpreter shutdown")) == []
+    assert sg.parse_errors(rec("RuntimeError: can't register atexit after shutdown")) == []
+    assert len(sg.parse_errors(rec("RuntimeError: dictionary changed size during iteration"))) == 1
+
+
 LIB = "/home/you/.hermes/installs/x/venv/lib/python3.14/site-packages"
 RECONNECT_TAILS = {
     "close-1000": [f'  File "{LIB}/discord/client.py", line 731, in connect',

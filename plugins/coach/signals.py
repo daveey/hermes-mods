@@ -67,6 +67,9 @@ TRANSIENT_RE = re.compile(r"RateLimitError|rate_limit_error|\b429\b|overloaded_e
                           r"APITimeoutError|ReadTimeout|ConnectTimeout|RemoteProtocolError|CancelledError|"
                           r"KeyboardInterrupt|InternalServerError.*\b5\d\d\b", re.I)
 PLUGIN_PATH_RE = re.compile(r"/plugins/([\w.\-]+)/")
+# CPython refusing new work while the process exits (Desktop quit, update, restart mid-turn): the turn's thread
+# outlived the main thread. Exit noise, not a defect (agent-9a2a3cc05d); core logs it as one line since c5153adda1.
+EXIT_NOISE_RE = re.compile(r"cannot schedule new futures after|can't register atexit after shutdown", re.I)
 # A network library that logs its own auto-reconnect at ERROR with the traceback, then reconnects by itself
 # (discord.py client.py:769-781: "sometimes, discord sends us 1000 for unknown reasons so we should reconnect").
 # Not a defect unless a Hermes logger or frame is involved; a storm of them on one host/profile still files one.
@@ -208,7 +211,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None) -> List[di
                                    "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
                                                                    + block))[-1500:]})
             continue
-        if TRANSIENT_RE.search(text):
+        if TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line):
             continue
         comp, plug = component_of([f[0] for f in frames])
         if r["level"] == "WARNING" and not any(_own_frame(p) for p, _fn in frames):
