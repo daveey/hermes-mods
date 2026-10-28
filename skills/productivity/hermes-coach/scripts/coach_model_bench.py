@@ -215,7 +215,7 @@ def rebuild_turn(con, session, ts, red, prior=3, max_chars=70000):
     return hist + out, red(final), counts
 
 
-def build(eval_set, state_db, control_bench, tools_file, out, seed=7, per_family=20):
+def build(eval_set, state_db, control_bench, tools_file, out, seed=7, per_family=20, agents_md=None):
     red = ce._redactor()
     rows = []
     for line in Path(eval_set).read_text().splitlines():
@@ -270,6 +270,10 @@ def build(eval_set, state_db, control_bench, tools_file, out, seed=7, per_family
             "built": time.strftime("%Y-%m-%d"), "selection": "eval-set human turns, agent_fixable=true, "
             "user_wanted_action=false; per_family contexts from each model family; controls = bench-v2 control",
             "per_family": per_family, "seed": seed, "skipped": skipped}
+    if agents_md is not None:
+        # the global AGENTS.md in force when the live turns happened: replays see the instructions the failures
+        # happened under, and a later edit of the live file can't silently change the benchmark
+        meta["agents_md"] = agents_md
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in [meta] + eps + ctl))
     return {"report_only": len(eps), "control": len(ctl), "skipped": len(skipped), "extra_tools": extra}
@@ -582,6 +586,7 @@ def main(argv=None):
     b.add_argument("--tools", required=True, help="JSON list of the Hermes tool schemas to declare")
     b.add_argument("--out", required=True)
     b.add_argument("--per-family", type=int, default=20)
+    b.add_argument("--agents-md", help="freeze this global AGENTS.md into the benchmark (the one in force at the time)")
     r = sub.add_parser("run")
     r.add_argument("--bench", required=True)
     r.add_argument("--model", required=True)
@@ -592,16 +597,18 @@ def main(argv=None):
     r.add_argument("--out")
     r.add_argument("--max-steps", type=int, help="requests per rollout (default: the bench's, else 1)")
     r.add_argument("--agents-md", help="ablation: use this file as the global AGENTS.md instead of the bench's")
+    r.add_argument("--root", help="private eval home (default ~/.cache/coach-eval/root-v3); one per concurrent run")
     a = ap.parse_args(argv)
     if a.cmd == "build":
         if Path(a.out).exists():
             raise SystemExit(f"{a.out} exists: the benchmark is frozen")
-        print(json.dumps(build(a.eval_set, a.state_db, a.control, a.tools, a.out, per_family=a.per_family)))
+        print(json.dumps(build(a.eval_set, a.state_db, a.control, a.tools, a.out, per_family=a.per_family,
+                               agents_md=Path(a.agents_md).read_text() if a.agents_md else None)))
         return 0
     res = run(a.bench, a.model, a.repeats, a.budget, a.jobs, limit=a.limit,
               log=lambda s: print(s, file=sys.stderr, flush=True),
               replies_path=Path(a.out).with_suffix(".replies.jsonl") if a.out else None, max_steps=a.max_steps,
-              agents_md=Path(a.agents_md).read_text() if a.agents_md else None)
+              agents_md=Path(a.agents_md).read_text() if a.agents_md else None, root=a.root)
     md = markdown(res)
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
