@@ -100,7 +100,13 @@ Only the request's own `evidence` (optionally prefixed `Checked:`) can satisfy t
 Unrelated Checked lines in body/reason cannot supply it. The complete five-field object is then one judge item,
 without prose detection or sentence truncation. A tool-name match is only a preliminary check: the judge must
 verify that the output supports the actual action, scope and need for a human. Explicit requests fail closed on
-judge errors, malformed/missing verdicts or non-ok verdicts. Ordinary final replies and legacy prose keep their
+malformed/missing verdicts or non-ok verdicts. A judge OUTAGE (ModelRoutingError, timeout, provider error: no
+verdict was produced) is not a refusal: the gate retries on routing classes `fast`, then `standard`, then `deep`
+(each only with an eligible subscription route, skipping the class the configured judge uses), and when none is
+reachable it accepts the ask, which already passed the deterministic checks (schema, evidence matching a tool call
+this turn, reconciliation, retirement), and logs `judge_unavailable`. Outages and internal gate errors never get
+the "keep operational failures parked without a human_request" advice, which turned real asks into hidden waits.
+Ordinary final replies and legacy prose keep their
 existing failure behavior; this is not a replacement for core authorization/security enforcement.
 
 An initial blocked status, capability label, or `sudo -n` authentication failure alone is an operational issue,
@@ -110,8 +116,9 @@ flow with the precise command/host and step; never request passwords or secret c
 neither authorizes execution, bypasses security denials, completes work nor automatically unblocks a card.
 
 `tests/test_human_request.py` exercises create/block hooks, required fields, supported interactions, unrelated
-prose/evidence, operational failures, open-asks marker smuggling, judge outages, and ordinary clarification
-preservation. Security prompt delivery and refusal handling are tested with a stub judge; real-model semantic
+prose/evidence, operational failures, open-asks marker smuggling, malformed verdicts, and ordinary clarification
+preservation; `tests/test_judge_unavailable.py` covers outages (class fallback, `judge_unavailable` acceptance,
+deterministic checks still enforced, real refusals unchanged, no park advice on gate errors). Security prompt delivery and refusal handling are tested with a stub judge; real-model semantic
 accuracy and live UI/REST/CLI paths are not established by these plugin unit tests.
 
 ## Approval-store reconciliation adapters

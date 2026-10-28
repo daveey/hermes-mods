@@ -16,6 +16,11 @@ MIN_CONFIDENCE_GROUNDED = 0.6  # agent_can_do whose `how` names something that i
 _GENERIC = {"token-broker", "browser_exec", "terminal", "https", "http", "ssh", "chrome", "browser", "token", "scope"}
 VERDICTS = ("ok", "already_answered", "already_done", "unverified", "agent_can_do")
 
+
+class JudgeUnavailable(Exception):
+    """The judge model could not be reached (ModelRoutingError, timeout, provider error). Not a verdict,
+    and deliberately not a ValueError: ModelRoutingError is one, and ValueErrors read as refusals."""
+
 SYSTEM = """You audit a draft chat reply BEFORE the user (David) sees it. It contains sentences that ask David \
 to do, decide or provide something, or say something is waiting on him. A wrong hold is costly (it delays and \
 confuses the reply); a wrong pass is also costly (David gets asked something that is stale, already answered, \
@@ -96,7 +101,12 @@ This item is an explicit human_request, not a draft's incidental prose. Judge th
 def structured_llm(llm: Callable[[str, str], str]) -> Callable[[str, str], str]:
     """Require an actual verdict for the single explicit request; ordinary chats stay fail-open."""
     def call(system: str, user: str) -> str:
-        raw = llm(system + "\n" + STRUCTURED_SYSTEM, user)
+        try:
+            raw = llm(system + "\n" + STRUCTURED_SYSTEM, user)
+        except JudgeUnavailable:
+            raise
+        except Exception as e:  # routing/timeout/provider failure: no verdict was produced
+            raise JudgeUnavailable(f"{type(e).__name__}: {e}") from e
         text = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
         data = json.loads(text)
         items = data.get("asks") if isinstance(data, dict) else data

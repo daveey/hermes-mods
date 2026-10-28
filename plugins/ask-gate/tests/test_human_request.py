@@ -71,12 +71,12 @@ def test_body_checked_line_cannot_supply_request_evidence(gate):
     assert call(gate, h)["action"] == "block"
 
 
-@pytest.mark.parametrize("output", [None, "not JSON", '{"asks": []}'])
+@pytest.mark.parametrize("output", ["not JSON", '{"asks": []}'])
 def test_explicit_request_judge_unavailable_fails_closed(gate, output):
+    """A reachable judge with no usable verdict still refuses. An unreachable one (raise) is an outage, not a
+    verdict: see test_judge_unavailable.py (fallback classes, then judge_unavailable acceptance)."""
     gate.LOG.add("s1", "terminal", "backup list", "archive A")
     def llm(s, u):
-        if output is None:
-            raise RuntimeError("offline")
         return output
     gate.LLM = llm
     assert call(gate, human())["action"] == "block"

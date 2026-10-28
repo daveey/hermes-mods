@@ -128,6 +128,40 @@ def default_llm(system: str, user: str) -> str:
 
 LLM = default_llm  # tests replace this
 
+_FALLBACK_CLASSES = ("fast", "standard", "deep")
+
+
+def fallback_llms() -> list[tuple[str, Any]]:
+    """Judges to retry an explicit ask on when the configured one is unreachable: class fast, then standard,
+    then deep, each only when the routing policy has an eligible SUBSCRIPTION route for it (no paid fallback).
+    Skips the class the configured judge already uses. Empty when routing is off or unreadable."""
+    try:
+        from agent.model_routing import eligible_routes  # type: ignore
+        from hermes_cli.config import load_config_readonly  # type: ignore
+        cfg = load_config_readonly()
+        policy = cfg.get("model_routing") or {}
+        if not policy.get("enabled"):
+            return []
+        own = ((cfg.get("auxiliary") or {}).get("ask_gate") or {}).get("model") or ""
+    except Exception as e:
+        core.log_event("judge_fallback_unknown", error=repr(e))
+        return []
+    out = []
+    for level in _FALLBACK_CLASSES:
+        selector = "class:" + level
+        if selector == own:
+            continue
+        try:
+            if not any(r.get("billing") == "subscription" for r in eligible_routes(policy, level)):
+                continue
+        except Exception:
+            continue
+        out.append((selector, lambda s, u, m=selector: judge_mod.aux_llm(s, u, provider="auto", model=m)))
+    return out
+
+
+FALLBACKS = fallback_llms  # tests replace this
+
 
 def _llm():
     return LLM
@@ -179,7 +213,8 @@ def _user_msgs(session_id: str) -> list[str]:
         return []
 
 
-def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "", *, structured: bool = False) -> list[dict]:
+def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = "", *, structured: bool = False,
+              llm=None) -> list[dict]:
     ids = core.card_ids(" ".join(asks) + " " + reply)
     statuses = core.card_status(ids)
     led = ledger().relevant(session_id, limit=20)
@@ -189,9 +224,10 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
         return [retired[i] for i in range(len(asks))]
     ledger_text = "\n".join(f"- {a['topic']} -> {a['answer']} ({core.fmt_ts(a['ts'])})" for a in led)
     pending = [asks[i] for i in remaining]
+    base = llm or _llm()
     verdicts = judge_mod.judge(pending, tools_text=core.render_tools(tools), user_msgs=_user_msgs(session_id),
                               card_status=statuses, ledger_text=ledger_text, caps=core.capability_sheet(force=True),
-                              reply=reply, llm=judge_mod.structured_llm(_llm()) if structured else _llm(),
+                              reply=reply, llm=judge_mod.structured_llm(base) if structured else base,
                               ledger=[a for a in led if not a.get('retired')],
                               soft=[core.is_soft_ask(a) for a in pending])
     for v in verdicts:
@@ -490,17 +526,48 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         # Keep the complete contract in the ask itself: prose detectors and their sentence/length
         # caps must not select an unrelated sentence or drop a late field from this explicit ask.
         text = json.dumps(request, ensure_ascii=False)
-        verdicts = run_judge(session_id, [text], tools, text, structured=True)
+        verdicts = _judge_explicit(session_id, tool_name, text, tools)
+        if verdicts is None:
+            # Every reachable judge failed: no verdict exists. The deterministic checks above (schema,
+            # evidence matching a tool call this turn, reconciliation, retirement) passed, so the ask goes
+            # through visibly rather than turning into a hidden wait.
+            core.log_event("l3_human_request", tool=tool_name, session=session_id, verdict="judge_unavailable")
+            return None
         if not verdicts or judge_mod.bad(verdicts):
             raise ValueError("human_request was not verified: " + judge_mod.nudge([text], verdicts))
         core.log_event("l3_human_request", tool=tool_name, session=session_id, verdict="ok")
         return None
-    except Exception as e:
+    except ValueError as e:  # a validation failure or a real verdict: the ask itself was refused
         core.log_event("l3_human_request_held", tool=tool_name, session=session_id, error=repr(e))
         return {"action": "block", "message": "ask-gate: human_request refused. " + str(e)
                 + " Keep operational failures parked without a human_request; supply the actual action, why_human, "
                   "scope, evidence and interaction only when a human step is verified. Metadata is not authorization. "
                   "OS authentication is distinct from approval; use the supported user-terminal flow, never passwords in chat."}
+    except Exception as e:  # the gate itself broke: say so, and never advise dropping the ask
+        core.log_event("l3_human_request_gate_error", tool=tool_name, session=session_id, error=repr(e))
+        return {"action": "block", "message": "ask-gate: could not check this human_request because the gate hit an "
+                f"internal error ({type(e).__name__}). This is not a verdict on the ask: keep it, and retry the "
+                "same call once. Do not park the card without it."}
+
+
+def _judge_explicit(session_id: str, tool_name: str, text: str, tools: list[dict]) -> list[dict] | None:
+    """Verdicts from the configured judge, else from the class fallbacks (fast, standard, deep; subscription
+    only). None when no judge was reachable. A verdict, good or bad, is final: it never falls back."""
+    errors = []
+    try:
+        return run_judge(session_id, [text], tools, text, structured=True)
+    except judge_mod.JudgeUnavailable as e:
+        errors.append(("configured", str(e)))
+    for name, llm in FALLBACKS():
+        try:
+            verdicts = run_judge(session_id, [text], tools, text, structured=True, llm=llm)
+        except judge_mod.JudgeUnavailable as e:
+            errors.append((name, str(e)))
+            continue
+        core.log_event("judge_fallback", tool=tool_name, session=session_id, judge=name, errors=errors)
+        return verdicts
+    core.log_event("judge_unavailable", tool=tool_name, session=session_id, errors=errors)
+    return None
 
 
 def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any) -> dict | None:
