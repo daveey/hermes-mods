@@ -148,10 +148,87 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual((restored / 'a').read_text(), 'dirty')
         self.assertEqual((restored / 'untracked').read_text(), 'unsaved')
 
+    def _commit_ignore(self, patterns):
+        """Commit a .gitignore on the tree's branch and 'push' it, so the tree is clean and on a remote."""
+        (self.tree / '.gitignore').write_text(''.join(p + '\n' for p in patterns))
+        git(self.tree, 'add', '.gitignore')
+        git(self.tree, 'commit', '-qm', 'ignore')
+        git(self.tree, 'update-ref', 'refs/remotes/origin/topic', 'HEAD')
+
+    def _add_caches(self):
+        (self.tree / 'pkg/__pycache__').mkdir(parents=True)
+        (self.tree / 'pkg/__pycache__/m.cpython-314.pyc').write_bytes(b'\0pyc')
+        for d in ('.pytest_cache', '.ruff_cache', '.mypy_cache'):
+            (self.tree / d).mkdir()
+            (self.tree / d / 'CACHEDIR.TAG').write_text('Signature: 8a477f597d28d172789f06886806bc55\n')
+            (self.tree / d / 'data').write_text('x')
+        (self.tree / 'node_modules/.bin').mkdir(parents=True)
+        (self.tree / 'node_modules/left-pad').mkdir()
+        (self.tree / 'node_modules/left-pad/index.js').write_text('module.exports = 1')
+        (self.tree / 'node_modules/.bin/left-pad').symlink_to('../left-pad/index.js')  # npm makes these
+        (self.tree / 'out').mkdir()  # any tool's cache dir that carries the standard CACHEDIR.TAG
+        (self.tree / 'out/CACHEDIR.TAG').write_text('Signature: 8a477f597d28d172789f06886806bc55\n')
+        (self.tree / 'out/blob').write_text('rebuildable')
+
+    def test_rebuildable_caches_do_not_keep_tree(self):
+        self._commit_ignore(['__pycache__/', '.pytest_cache/', '.ruff_cache/', '.mypy_cache/', 'node_modules/', 'out/'])
+        self._add_caches()
+        result = self.call(self.result)
+        self.assertEqual([r['action'] for r in result], ['removed'])
+        self.assertFalse(self.tree.exists())
+        self.assertIn('REMOVED', self.m.LOG.read_text())
+
+    def test_real_ignored_file_keeps_tree_and_logs_why(self):
+        self._commit_ignore(['__pycache__/', '.env'])
+        self._add_caches()
+        (self.tree / '.env').write_text('TOKEN=fixture')
+        result = self.call(self.result)
+        self.assertTrue(self.tree.exists())
+        self.assertEqual((self.tree / '.env').read_text(), 'TOKEN=fixture')
+        self.assertIn('ignored', result[0]['action'])
+        log = self.m.LOG.read_text()
+        self.assertRegex(log, r'KEEP .*tree .*ignored.*\.env')
+
+    def test_real_file_beside_cache_in_ignored_dir_keeps_tree(self):
+        self._commit_ignore(['scratch/'])
+        (self.tree / 'scratch/__pycache__').mkdir(parents=True)
+        (self.tree / 'scratch/__pycache__/x.pyc').write_bytes(b'\0')
+        (self.tree / 'scratch/notes.md').write_text('only copy')
+        result = self.call(self.result)
+        self.assertTrue(self.tree.exists())
+        self.assertEqual(result[0]['action'], 'kept: ignored files: scratch/')
+
+    def test_tree_from_earlier_run_of_same_card_removed(self):
+        # made in run 1, review/retry loop, card completes in run 3
+        gd = Path(git(self.tree, 'rev-parse', '--absolute-git-dir').strip())
+        rec = json.loads((gd / self.m.MARKER).read_text())
+        rec['run_id'] = '1'
+        (gd / self.m.MARKER).write_text(json.dumps(rec))
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('delete from task_runs')
+            c.executemany('insert into task_runs values (?, ?, ?, ?, ?)',
+                          [('1', 'task', 'done', 'blocked', 1), ('2', 'task', 'done', 'reclaimed', 2),
+                           ('3', 'task', 'done', 'completed', 3)])
+        self.env['HERMES_KANBAN_RUN_ID'] = '3'
+        self.call(dict(self.result, run_id=3))
+        self.assertFalse(self.tree.exists())
+
+    def test_marker_run_of_another_card_still_kept(self):
+        gd = Path(git(self.tree, 'rev-parse', '--absolute-git-dir').strip())
+        rec = json.loads((gd / self.m.MARKER).read_text())
+        rec['run_id'] = '99'  # a run id that is not one of this card's runs
+        (gd / self.m.MARKER).write_text(json.dumps(rec))
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("insert into task_runs values ('99', 'other', 'done', 'completed', 1)")
+        result = self.call(self.result)
+        self.assertTrue(self.tree.exists())
+        self.assertIn('not a run of', self.m.LOG.read_text())
+        self.assertEqual(result, [])
+
     def test_complex_content_preserved(self):
         for kind in ('ignored', 'symlink', 'nested'):
             with self.subTest(kind=kind):
-                if kind == 'ignored':
+                if kind == 'ignored':  # a real file (not a cache) that git ignores
                     (self.tree / '.gitignore').write_text('secret\n')
                     (self.tree / 'secret').write_text('valuable')
                 elif kind == 'symlink':

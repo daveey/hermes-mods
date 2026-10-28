@@ -340,6 +340,37 @@ def _in_scratch(path: str, ws: str) -> bool:
     return rp.startswith(rw + "/")
 
 
+# Rebuildable caches: tools recreate them, so they never make a tree worth keeping. Any OTHER git-ignored file
+# (.env, notes, local data) still keeps the tree. Directories carrying the standard CACHEDIR.TAG count too
+# (https://bford.info/cachedir/: pytest, ruff, mypy, cargo and others write it).
+CACHE_NAMES = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", "node_modules"})
+CACHEDIR_TAG = "CACHEDIR.TAG"
+
+
+def _is_cache_dir(p: str) -> bool:
+    return os.path.basename(p.rstrip("/")) in CACHE_NAMES or os.path.isfile(os.path.join(p, CACHEDIR_TAG))
+
+
+def _is_cache_entry(path: str, rel: str) -> bool:
+    """True if ignored entry *rel* (relative to tree *path*) is, or is inside, a rebuildable cache dir. A collapsed
+    directory entry (`pkg/` holding only `__pycache__`) counts when every file under it is in a cache."""
+    parts = [x for x in rel.rstrip("/").split("/") if x]
+    if any(x in CACHE_NAMES for x in parts):
+        return True
+    cur = path
+    for x in parts:
+        cur = os.path.join(cur, x)
+        if os.path.isdir(cur) and not os.path.islink(cur) and os.path.isfile(os.path.join(cur, CACHEDIR_TAG)):
+            return True
+    if not (rel.endswith("/") and os.path.isdir(cur) and not os.path.islink(cur)):
+        return False
+    for root, dirs, files in os.walk(cur, followlinks=False):
+        dirs[:] = [d for d in dirs if not _is_cache_dir(os.path.join(root, d))]
+        if files or any(os.path.islink(os.path.join(root, d)) for d in dirs):
+            return False
+    return True
+
+
 def _complex_reason(path: str) -> str | None:
     if os.path.realpath(path) != os.path.abspath(path):
         return 'symlink target'
@@ -349,15 +380,20 @@ def _complex_reason(path: str) -> str | None:
         for name in dirs + files:
             p = os.path.join(root, name)
             if os.path.islink(p) or (name == '.git' and root != path):
-                return 'nested git or symlink'
+                return f'nested git or symlink: {os.path.relpath(p, path)}'
             if not os.path.isdir(p) and not os.path.isfile(p):
-                return 'special file'
+                return f'special file: {os.path.relpath(p, path)}'
+        # Don't descend into caches (node_modules/.bin is all symlinks); `git worktree remove` unlinks, never follows.
+        dirs[:] = [d for d in dirs if not _is_cache_dir(os.path.join(root, d))]
     staged = _git(path, 'diff', '--cached', '--quiet', 'HEAD')
     if staged.returncode != 0:
         return 'staged changes or unreadable index'
-    ignored = _git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
-    if ignored.returncode or ignored.stdout:
-        return 'ignored files or unreadable listing'
+    ignored = _git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z')
+    if ignored.returncode:
+        return 'unreadable ignored-file listing'
+    real = [e for e in ignored.stdout.split('\0') if e and not _is_cache_entry(path, e)]
+    if real:
+        return 'ignored files: ' + ', '.join(real[:5]) + (f' (+{len(real) - 5} more)' if len(real) > 5 else '')
     return None
 
 
@@ -368,6 +404,7 @@ def _remove(path: str, why_owned: str, ws: str = "") -> dict:
         return dict(path=path, action="kept: live process")
     complex_reason = _complex_reason(path)
     if complex_reason:
+        _log(f"KEEP {path} ({why_owned}): {complex_reason}")
         return dict(path=path, action=f'kept: {complex_reason}')
     keep = _removable(path)
     archived = None
@@ -414,7 +451,10 @@ def teardown(task_id: str, env) -> list[dict]:
             return []
         live = {os.path.realpath(r[0]) for r in c.execute(
             "select workspace_path from tasks where status not in ('done','archived') and id != ? and coalesce(workspace_path,'') != ''", (task_id,))}
-        return _teardown_locked(task_id, env, row[2] or '', live)
+        # A tree made by ANY run of this card counts: review/retry loops finish in a later run than the one that
+        # created the tree. The completing run was just verified to be the card's latest run.
+        runs = {str(r[0]) for r in c.execute('select id from task_runs where task_id=?', (task_id,))}
+        return _teardown_locked(task_id, env, row[2] or '', live, runs)
 
 
 def _overlap(a: str, b: str) -> bool:
@@ -422,10 +462,23 @@ def _overlap(a: str, b: str) -> bool:
     return a == b or a.startswith(b + '/') or b.startswith(a + '/')
 
 
-def _teardown_locked(task_id: str, env, ws: str, live: set[str]) -> list[dict]:
+def _marker_fence(rec: dict, task_id: str, env, runs: set[str] | None) -> str | None:
+    """None when marker *rec* proves this card made the tree (this board, one of its runs); else why not."""
+    if rec.get('board_db') != os.path.realpath(env['HERMES_KANBAN_DB']):
+        return f"marker board {rec.get('board_db')} is not this board"
+    run = rec.get('run_id')
+    if run is None:
+        return 'legacy marker without a run id'
+    if str(run) not in {str(env.get('HERMES_KANBAN_RUN_ID'))} | (runs or set()):
+        return f'marker run {run} is not a run of {task_id}'
+    return None
+
+
+def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] | None = None) -> list[dict]:
     results = []
     def remove(path, why, scratch=''):
         if any(_overlap(path, other) for other in live):
+            _log(f"KEEP {path} ({why}): shared with an open card")
             return dict(path=path, action='kept: shared with an open card')
         return _remove(path, why, scratch)
     for common in _common_dirs([ws]):
@@ -435,10 +488,16 @@ def _teardown_locked(task_id: str, env, ws: str, live: set[str]) -> list[dict]:
             except (OSError, ValueError):
                 continue
             path = rec.get("path") or _wt_path(gd)
-            if (rec.get('task_id') == task_id and rec.get('run_id') == env.get('HERMES_KANBAN_RUN_ID')
-                    and rec.get('board_db') == os.path.realpath(env['HERMES_KANBAN_DB'])
-                    and path and os.path.isdir(path) and os.path.realpath(path) == os.path.realpath(_wt_path(gd) or '/')):
-                results.append(remove(path, f"registered to {task_id}", ws))
+            if rec.get('task_id') != task_id or not path or not os.path.isdir(path):
+                continue
+            if os.path.realpath(path) != os.path.realpath(_wt_path(gd) or '/'):
+                _log(f"KEEP {path} (registered to {task_id}): marker path is not git's path for this worktree")
+                continue
+            fence = _marker_fence(rec, task_id, env, runs)
+            if fence:
+                _log(f"KEEP {path} (registered to {task_id}): {fence}")
+                continue
+            results.append(remove(path, f"registered to {task_id}", ws))
     # the card's own dir: workspace, when it is a linked worktree (a .git FILE) that no other open card uses
     if ws and os.path.isfile(os.path.join(ws, ".git")) and \
             not any(os.path.realpath(r["path"]) == os.path.realpath(ws) for r in results):
@@ -451,10 +510,12 @@ def _teardown_locked(task_id: str, env, ws: str, live: set[str]) -> list[dict]:
                 rec = json.loads(marker.read_text())
             except (OSError, ValueError):
                 return results
-            if rec.get('task_id') and (rec.get('task_id') != task_id
-                    or rec.get('run_id') != env.get('HERMES_KANBAN_RUN_ID')
-                    or rec.get('board_db') != os.path.realpath(env['HERMES_KANBAN_DB'])):
-                return results  # own workspace fallback must not bypass marker fence
+            if rec.get('task_id'):
+                fence = (f"marker belongs to {rec.get('task_id')}" if rec.get('task_id') != task_id
+                         else _marker_fence(rec, task_id, env, runs))
+                if fence:
+                    _log(f"KEEP {ws} (dir workspace of {task_id}): {fence}")
+                    return results  # own workspace fallback must not bypass marker fence
         results.append(remove(ws, f"dir workspace of {task_id}"))
     return results
 
