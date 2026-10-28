@@ -1,0 +1,394 @@
+From e0a59093482434b5a9a9d243cd6df08e5ec20da2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:08:50 +0000
+Subject: [PATCH] fix(anthropic): pre-request token check stays on the pinned
+ pool account [daveey]
+
+The per-request Anthropic credential check re-resolved "the" token as the first
+credential-pool entry and swapped it in whenever it differed. After rotation or
+401 recovery had moved a session to account B, every request swapped account A's
+(expired) token back; recovery refreshed B, the next pre-check put A back, and after
+two refreshes of B the turn gave up ("Non-retryable client error" / fallback model),
+burning B's single-use refresh tokens (hermes-hub, 2026-10-27 19:00 PT).
+
+- client_lifecycle: a session pinned to a pool entry (_credential_pool_entry_id)
+  only gets that entry's latest token (adopt a peer's persisted rotation, refresh
+  when expiring), never another account's. The unpinned path rebinds the entry id to
+  the adopted key and warns when that moves the session off its entry.
+- anthropic_credentials: model-aware pool resolution skips entries whose access
+  token is past its stamped expiry (diagnostic, model-less calls unchanged).
+- 401 recovery warns when the failing key belongs to another entry than the one the
+  session is attributed to (the signature of this drift).
+
+Regression: tests/agent/test_anthropic_pool_pin.py (7 tests, all red on the base).
+---
+ agent/agent_runtime_helpers.py         |   6 +-
+ agent/anthropic_credentials.py         |  14 ++-
+ agent/client_lifecycle.py              |  39 +++++-
+ agent/credential_pool_pin.py           |  59 +++++++++
+ tests/agent/test_anthropic_pool_pin.py | 167 +++++++++++++++++++++++++
+ 5 files changed, 274 insertions(+), 11 deletions(-)
+ create mode 100644 agent/credential_pool_pin.py
+ create mode 100644 tests/agent/test_anthropic_pool_pin.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 024b2d5488..8bc2238bc9 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -943,9 +943,9 @@ def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_co
+         return False, has_retried_429
+     # Refresh the entry that supplied the failing key, not current(): refreshing a healthy entry
+     # burns its single-use refresh token for a failure it never had.
+-    refresh_kwargs = {"api_key_hint": api_key_hint}
+-    if credential_id:
+-        refresh_kwargs["credential_id"] = credential_id
++    refresh_kwargs = {"api_key_hint": api_key_hint, **({"credential_id": credential_id} if credential_id else {})}
++    from agent.credential_pool_pin import warn_foreign_failing_key
++    warn_foreign_failing_key(pool, api_key_hint, credential_id)
+     refreshed = pool.try_refresh_matching(**refresh_kwargs)
+     if refreshed is None:
+         # Refresh failed; rotate (the failed entry is already marked exhausted).
+diff --git a/agent/anthropic_credentials.py b/agent/anthropic_credentials.py
+index be1df48e29..1949ceefe5 100644
+--- a/agent/anthropic_credentials.py
++++ b/agent/anthropic_credentials.py
+@@ -648,10 +648,14 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[dict[s
+     return None
+ 
+ 
+-def _resolve_anthropic_pool_token(*, skip_borrowed: bool = False) -> Optional[str]:
++def _resolve_anthropic_pool_token(*, skip_borrowed: bool = False, model: Optional[str] = None) -> Optional[str]:
+     """First available Anthropic OAuth token from credential_pool, read-only: enumerates with ``clear_expired=False,
+     refresh=False`` (never ``select()``) so diagnostic call sites (account_usage, ``hermes models``) never mutate
+-    auth.json or hit the network; refresh-on-expiry belongs to the API call path's pool recovery."""
++    auth.json or hit the network; refresh-on-expiry belongs to the API call path's pool recovery.
++
++    With *model* (an API-call path) an entry whose access token is past its stamped expiry is skipped: sending
++    it can only 401, and recovery would then refresh whichever account the session is on, not this one."""
++    now_ms = int(time.time() * 1000)
+     try:
+         from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
+         entries, _pending = load_pool("anthropic")._available_entries(clear_expired=False, refresh=False)
+@@ -665,6 +669,10 @@ def _resolve_anthropic_pool_token(*, skip_borrowed: bool = False) -> Optional[st
+         token = (getattr(entry, "access_token", None) or "").strip()
+         if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH or not token:
+             continue
++        expires_at_ms = getattr(entry, "expires_at_ms", None) or 0
++        if model and expires_at_ms and expires_at_ms <= now_ms:
++            logger.debug("Skipping Anthropic pool entry %s: access token expired", getattr(entry, "id", "?"))
++            continue
+         # load_pool() re-seeds rows from the singleton files, so a spent-but-uncommitted rotation
+         # (possibly from another process) looks healthy here.
+         entry_source_path = spent_rotation_source_path(getattr(entry, "source", None))
+@@ -713,7 +721,7 @@ def resolve_anthropic_token(*, model: Optional[str] = None) -> Optional[str]:
+         return _available_anthropic_token(api_key, model)
+     # The pool's claude_code row mirrors the same externally owned refresh grant.
+     return _available_anthropic_token(
+-        _resolve_anthropic_pool_token(skip_borrowed=True) or _resolve_claude_code_token_from_credentials(_read_creds()),
++        _resolve_anthropic_pool_token(skip_borrowed=True, model=model) or _resolve_claude_code_token_from_credentials(_read_creds()),
+         model,
+     )
+ 
+diff --git a/agent/client_lifecycle.py b/agent/client_lifecycle.py
+index 88f0cde5ec..6482ba869b 100644
+--- a/agent/client_lifecycle.py
++++ b/agent/client_lifecycle.py
+@@ -902,23 +902,52 @@ class ClientLifecycleMixin:
+         if not official_host and not (current_key.startswith("sk-ant-") or getattr(self, "_is_anthropic_oauth", False)):
+             return False
+         try:
+-            from agent.anthropic_credentials import resolve_anthropic_token
+-            from agent.model_routing_runtime import refresh_class_anthropic_token
+-            new_token = (refresh_class_anthropic_token(self) if getattr(self, "model_routing", None)
+-                         else resolve_anthropic_token(model=self.model))
++            new_token, rebind = self._resolve_anthropic_refresh_token()
+         except Exception as exc:
+             logger.debug("Anthropic credential refresh failed: %s", exc)
+             return False
+         new_token = new_token.strip() if isinstance(new_token, str) else ""
+         if not new_token or new_token == self._anthropic_api_key:
+             return False
++        if not self._adopt_anthropic_token(new_token):
++            return False
++        if rebind:
++            # Keep the pool entry id attributed to the adopted key, or the next 401/429 recovers the wrong account.
++            from agent.agent_runtime_helpers import sync_credential_pool_entry_id
++            prior_id = getattr(self, "_credential_pool_entry_id", None)
++            sync_credential_pool_entry_id(self)
++            if prior_id and self._credential_pool_entry_id != prior_id:
++                logger.warning(
++                    "Anthropic pre-request credential check moved the session off pool entry %s (now %s)",
++                    prior_id, self._credential_pool_entry_id or "unattributed")
++        return True
++
++    def _resolve_anthropic_refresh_token(self) -> tuple:
++        """``(token, rebind)`` for the pre-request check. A session pinned to a pool entry only ever gets that
++        entry's latest token (never "the first pool entry", which may be another, expired account);
++        ``rebind`` says the token came from an unpinned resolver and the entry id must follow it."""
++        pool = getattr(self, "_credential_pool", None)
++        pinned_id = getattr(self, "_credential_pool_entry_id", None)
++        if pool is not None and pinned_id and getattr(pool, "provider", None) == "anthropic":
++            from agent.credential_pool_pin import pinned_anthropic_pool_token
++            found, token = pinned_anthropic_pool_token(pool, pinned_id)
++            if found:
++                return token, False
++            logger.warning("Anthropic pool entry %s left the pool; re-resolving the session's credential", pinned_id)
++        from agent.anthropic_credentials import resolve_anthropic_token
++        from agent.model_routing_runtime import refresh_class_anthropic_token
++        token = (refresh_class_anthropic_token(self) if getattr(self, "model_routing", None)
++                 else resolve_anthropic_token(model=self.model))
++        return token, pool is not None or getattr(self, "_credential_pool", None) is not None
++
++    def _adopt_anthropic_token(self, new_token: str) -> bool:
+         with suppress(Exception):
+             self._anthropic_client.close()
+         try:
+             base_url = getattr(self, "_anthropic_base_url", None)
+             self._anthropic_client = self._build_direct_anthropic_client(new_token, base_url)
+         except Exception as exc:
+-            logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
++            logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc, exc_info=True)
+             return False
+         old_token = self._anthropic_api_key
+         self._anthropic_api_key, self._is_anthropic_oauth = new_token, self._anthropic_oauth_flag(new_token)
+diff --git a/agent/credential_pool_pin.py b/agent/credential_pool_pin.py
+new file mode 100644
+index 0000000000..3c3a816093
+--- /dev/null
++++ b/agent/credential_pool_pin.py
+@@ -0,0 +1,59 @@
++"""Pool-entry pinning for credential refresh: the pinned Anthropic token, and a drift warning for 401 recovery.
++
++The pre-request credential check (``client_lifecycle._try_refresh_anthropic_client_credentials``) used to
++re-resolve "the" Anthropic token as the FIRST pool entry. Once pool rotation or 401 recovery had moved the
++agent to another account, every request swapped the first entry's token back in; when that token had
++expired, refresh-then-retry looped on the wrong account until the refresh cap gave up on the right one.
++This module reads only the pinned entry: it adopts a rotation another process persisted for it and
++refreshes it when it is expiring, and never returns another account's token.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++
++def pinned_anthropic_pool_token(pool: Any, credential_id: str) -> tuple[bool, Optional[str]]:
++    """``(found, token)`` for pool entry *credential_id*.
++
++    ``found`` is False when the pool no longer holds that entry (the caller may then re-resolve and
++    rebind). ``token`` is None when the entry has no usable token (its refresh failed); the caller keeps
++    the key it has and lets 401 recovery decide, rather than jumping to another account.
++    """
++    from agent.credential_pool import AUTH_TYPE_OAUTH
++
++    entry = next((e for e in pool.entries() if e.id == credential_id), None)
++    if entry is None:
++        return False, None
++    if entry.auth_type == AUTH_TYPE_OAUTH:
++        # Token authority: the shared Claude Code file for the borrowed row, the pool store otherwise.
++        if entry.source == "claude_code":
++            entry = pool._sync_anthropic_entry_from_credentials_file(entry)
++        else:
++            entry = pool._sync_entry_from_pool_store(entry)
++        if pool._entry_needs_refresh(entry):
++            refreshed = pool._refresh_entry(entry, force=False)
++            if refreshed is None:
++                logger.warning(
++                    "Anthropic pool entry %s is expiring and its refresh failed; keeping the current key",
++                    credential_id)
++                return True, None
++            entry = refreshed
++    token = (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None) or "").strip()
++    return True, token or None
++
++
++def warn_foreign_failing_key(pool: Any, api_key_hint: Optional[str], credential_id: Optional[str]) -> None:
++    """Warn when the key that just failed belongs to a different pool entry than the one the session is
++    attributed to: refreshing the attributed entry cannot fix that 401, and it spends the entry's
++    single-use refresh token. This is the signature of the pre-request check drifting off the pin."""
++    if not (credential_id and api_key_hint):
++        return
++    key_owner = next((e.id for e in pool.entries() if e.runtime_api_key == api_key_hint), None)
++    if key_owner and key_owner != credential_id:
++        logger.warning(
++            "Credential auth failure: the failing key belongs to pool entry %s, but the session is "
++            "attributed to entry %s", key_owner, credential_id)
+diff --git a/tests/agent/test_anthropic_pool_pin.py b/tests/agent/test_anthropic_pool_pin.py
+new file mode 100644
+index 0000000000..d7405fa6e6
+--- /dev/null
++++ b/tests/agent/test_anthropic_pool_pin.py
+@@ -0,0 +1,167 @@
++"""The per-request Anthropic credential check stays on the pool account the agent is pinned to.
++
++Regression for a hermes-hub incident: the agent ran on pool account B (``_credential_pool_entry_id``),
++account A sat ahead of it in the pool with an expired access token, and the pre-request refresh
++(``_try_refresh_anthropic_client_credentials``) re-resolved "the" Anthropic token as the first pool
++entry, so every request swapped A's expired token back in. Recovery refreshed B and swapped it in,
++the next request's pre-check swapped A back, and after two refreshes of B the turn gave up.
++
++Real pool store under the sandboxed HERMES_HOME; only the OAuth token endpoint and the SDK client
++builder are stubbed.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from unittest.mock import patch
++
++import pytest
++
++from run_agent import AIAgent
++
++A_OLD = "sk-ant-oat01-account-A-expired"
++B_1 = "sk-ant-oat01-account-B-gen1"
++B_2 = "sk-ant-oat01-account-B-gen2"
++
++
++class _StubClient:
++    def __init__(self, key=None):
++        self.key = key
++        self.is_closed = False
++
++    def close(self):
++        self.is_closed = True
++
++
++def _row(id_, token, refresh, expires_at_ms, priority):
++    return {
++        "id": id_, "label": id_, "auth_type": "oauth", "priority": priority, "source": "manual",
++        "access_token": token, "refresh_token": refresh, "expires_at_ms": expires_at_ms,
++    }
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    hermes_home = tmp_path / "hermes"
++    hermes_home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: pid == "anthropic")
++    monkeypatch.setattr("agent.anthropic_credentials.read_hermes_oauth_credentials", lambda: None)
++    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
++    now_ms = int(time.time() * 1000)
++    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"anthropic": [
++        _row("acct-A", A_OLD, "rt-A", now_ms - 3_600_000, 0),   # first, expired
++        _row("acct-B", B_1, "rt-B-1", now_ms + 3_600_000, 1),   # the pinned one
++    ]}}))
++    return hermes_home
++
++
++def _pinned_agent():
++    from agent.credential_pool import load_pool
++    pool = load_pool("anthropic")
++    entry = next(e for e in pool.entries() if e.id == "acct-B")
++    agent = AIAgent.__new__(AIAgent)
++    agent.provider, agent.model, agent.api_mode = "anthropic", "claude-opus-4-5", "anthropic_messages"
++    agent.base_url = agent._anthropic_base_url = "https://api.anthropic.com"
++    agent._oauth_1m_beta_disabled = False
++    agent.model_routing = None
++    agent._credential_pool = pool
++    agent._anthropic_client = _StubClient()
++    # Adopt B the way pool rotation does.
++    with patch("agent.anthropic_adapter.build_anthropic_client", side_effect=lambda k, *a, **kw: _StubClient(k)):
++        assert agent._swap_credential(entry) is True
++    assert agent._credential_pool_entry_id == "acct-B" and agent._anthropic_api_key == B_1
++    return agent
++
++
++def _request_key(agent):
++    with patch("agent.anthropic_adapter.build_anthropic_client", side_effect=lambda k, *a, **kw: _StubClient(k)), \
++            patch.object(agent, "_force_close_tcp_sockets", return_value=0, create=True):
++        client = agent._create_request_anthropic_client(reason="chat_completion_request")
++    return client.key
++
++
++def test_pre_request_check_keeps_the_pinned_account_over_an_expired_first_entry(home):
++    agent = _pinned_agent()
++    assert _request_key(agent) == B_1
++    assert agent._anthropic_api_key == B_1 and agent.api_key == B_1
++    assert agent._credential_pool_entry_id == "acct-B"
++
++
++def test_after_recovery_refreshes_the_pinned_account_the_next_request_carries_its_new_token(home):
++    agent = _pinned_agent()
++    # Pool recovery after a 401: refresh B (the failing entry) and swap it in.
++    refreshed = {"access_token": B_2, "refresh_token": "rt-B-2", "expires_at_ms": int(time.time() * 1000) + 3_600_000}
++    with patch("agent.anthropic_credentials.refresh_anthropic_oauth_pure", return_value=refreshed) as post:
++        entry = agent._credential_pool.try_refresh_matching(api_key_hint=B_1, credential_id="acct-B")
++    assert entry is not None and entry.access_token == B_2 and post.call_count == 1
++    with patch("agent.anthropic_adapter.build_anthropic_client", side_effect=lambda k, *a, **kw: _StubClient(k)):
++        assert agent._swap_credential(entry) is True
++    assert _request_key(agent) == B_2
++    assert agent._credential_pool_entry_id == "acct-B"
++
++
++def test_pinned_account_rotated_by_another_process_is_adopted(home):
++    agent = _pinned_agent()
++    data = json.loads((home / "auth.json").read_text())
++    for row in data["credential_pool"]["anthropic"]:
++        if row["id"] == "acct-B":
++            row.update(access_token=B_2, refresh_token="rt-B-2")
++    (home / "auth.json").write_text(json.dumps(data))
++    assert _request_key(agent) == B_2
++    assert agent._credential_pool_entry_id == "acct-B"
++
++
++def test_expired_pinned_account_is_refreshed_not_swapped_for_another(home):
++    from dataclasses import replace
++    agent = _pinned_agent()
++    pool = agent._credential_pool
++    live_b = next(e for e in pool.entries() if e.id == "acct-B")
++    pool._replace_entry(live_b, replace(live_b, expires_at_ms=int(time.time() * 1000) - 1000))  # B's hour ran out
++    data = json.loads((home / "auth.json").read_text())
++    for row in data["credential_pool"]["anthropic"]:
++        if row["id"] == "acct-B":
++            row["expires_at_ms"] = int(time.time() * 1000) - 1000
++    (home / "auth.json").write_text(json.dumps(data))
++    refreshed = {"access_token": B_2, "refresh_token": "rt-B-2", "expires_at_ms": int(time.time() * 1000) + 3_600_000}
++    with patch("agent.anthropic_credentials.refresh_anthropic_oauth_pure", return_value=refreshed) as post:
++        assert _request_key(agent) == B_2
++    assert post.call_count == 1 and post.call_args.args[0] == "rt-B-1"
++    assert agent._credential_pool_entry_id == "acct-B"
++
++
++def test_model_aware_pool_resolution_skips_an_expired_entry(home):
++    from agent.anthropic_credentials import _resolve_anthropic_pool_token, resolve_anthropic_token
++    assert resolve_anthropic_token(model="claude-opus-4-5") == B_1
++    # Diagnostics (no model) keep the read-only first-entry behaviour.
++    assert _resolve_anthropic_pool_token() == A_OLD
++
++
++def test_pinned_entry_removed_from_pool_rebinds_the_id_to_the_adopted_key(home, caplog):
++    agent = _pinned_agent()
++    agent._credential_pool._entries = [e for e in agent._credential_pool._entries if e.id != "acct-B"]
++    agent._credential_pool._current_id = None
++    data = json.loads((home / "auth.json").read_text())
++    data["credential_pool"]["anthropic"] = [r for r in data["credential_pool"]["anthropic"] if r["id"] != "acct-B"]
++    data["credential_pool"]["anthropic"][0]["expires_at_ms"] = int(time.time() * 1000) + 3_600_000
++    (home / "auth.json").write_text(json.dumps(data))
++    with caplog.at_level("WARNING"):
++        assert _request_key(agent) == A_OLD
++    assert agent._credential_pool_entry_id == "acct-A"
++    assert "moved the session off pool entry acct-B" in caplog.text
++
++
++def test_recovery_warns_when_the_failing_key_is_another_accounts(home, caplog):
++    from agent.agent_runtime_helpers import _recover_auth_failure
++    agent = _pinned_agent()
++    refreshed = {"access_token": B_2, "refresh_token": "rt-B-2", "expires_at_ms": int(time.time() * 1000) + 3_600_000}
++    with caplog.at_level("WARNING"), \
++            patch("agent.anthropic_credentials.refresh_anthropic_oauth_pure", return_value=refreshed), \
++            patch("agent.anthropic_adapter.build_anthropic_client", side_effect=lambda k, *a, **kw: _StubClient(k)):
++        _recover_auth_failure(
++            agent, agent._credential_pool, status_code=401, has_retried_429=False, error_context=None,
++            api_key_hint=A_OLD, credential_id="acct-B", rotate_and_swap=lambda *a: False)
++    assert "failing key belongs to pool entry acct-A" in caplog.text
+-- 
+2.55.0
+

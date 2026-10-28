@@ -1,0 +1,482 @@
+From 5ac187bacafd34cf6cadd4b7690e2f3f6298c130 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:08:48 +0000
+Subject: [PATCH] feat(kanban): placement carries kanban_create options through
+ hermes-hub create-task --option [daveey]
+
+hermes-hub 1.8.0 adds create-task --option KEY=JSON. When create-task --help lists it, default placement passes
+skills, max_runtime_seconds, priority, model/provider, goal_mode, goal_max_turns, completion_contract,
+requires and triage as fields, so model pins, goal mode, triage and PR contracts no longer pin a card local and
+skills/runtime no longer ride as body text. An older client keeps the old rule and the body-text fallback.
+The client probe is cached 10 min and runs only when a legacy-uncarried option is used.
+
+Also: hermes kanban create --reasoning-effort (hermes-hub maps a plain create's reasoning_effort onto it), and
+the BOM/FURB167 lint in scripts/run_tests_host_slots.py that kept scripts/check red on main.
+---
+ hermes_cli/kanban.py                       |   1 +
+ hermes_cli/kanban_parser.py                |   2 +
+ hermes_cli/kanban_placement.py             | 121 +++++++++++++++----
+ scripts/run_tests_host_slots.py            |   4 +-
+ tests/hermes_cli/test_kanban_placement.py  | 132 ++++++++++++++++++++-
+ website/docs/user-guide/configuration.md   |   2 +-
+ website/docs/user-guide/features/kanban.md |   1 +
+ 7 files changed, 236 insertions(+), 27 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index db06a25a79..3dccc0431a 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -441,6 +441,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 provider_override=getattr(args, "provider_override", None),
+                 goal_mode=bool(getattr(args, "goal_mode", False)),
+                 goal_max_turns=getattr(args, "goal_max_turns", None),
++                reasoning_effort=getattr(args, "reasoning_effort", None),
+                 completion_contract=getattr(args, "completion_contract", None),
+                 initial_status=getattr(args, "initial_status", "running"),
+                 human_request=getattr(args, "human_request", None),
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 8f28bd34f8..e0d42c3a3f 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -267,6 +267,8 @@ _SPECS = [
+                   "review). Best for open-ended cards one shot rarely finishes."),
+         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
+              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
++        _arg("--reasoning-effort", metavar="EFFORT", dest="reasoning_effort",
++             help="Worker reasoning effort (e.g. low, medium, high, none); default: the profile's."),
+         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
+              help="Initial card status. Use 'blocked' for cards "
+                   "that must stay parked. Human asks additionally require explicit --human-request evidence."),
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index dad135a0f7..bdd9f6c7b2 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -12,8 +12,11 @@ A card stays local when any of these holds:
+ * the caller pinned it: ``placement="local"``;
+ * it cannot be expressed remotely: parents (dependencies are local links), a project, a ``dir`` or
+   ``worktree`` workspace, a non-default board or assignee, courier (origin) creation, or creation
+-  options ``hermes-hub create-task`` cannot carry (model/provider pin, goal mode, triage, a non-local
+-  completion contract, an initial status, a human request);
++  options ``hermes-hub create-task`` cannot carry (an initial status, a human request, a tenant). A
++  hermes-hub client with ``create-task --option`` (1.8.0+) carries skills, the runtime budget, priority,
++  model/provider pins, goal mode, triage, the completion contract and the rest of
++  :data:`CARRIED_OPTIONS`; with an older client a model/provider pin, goal mode, triage or a non-local
++  completion contract keeps the card local, and skills and the runtime budget ride in the body text;
+ * it declares a ``requires`` capability this gateway holds and the target does not;
+ * its title, body or skills match a local marker (``kanban.placement.local_markers`` replaces the
+   built-in list, ``extra_local_markers`` extends it): Chrome, Keychain, TCC, Apple apps, launchd,
+@@ -58,8 +61,15 @@ DEFAULT_LOCAL_SKILL_MARKERS = (
+     r"^local-chrome-remote-debugging$", r"^computer-use$", r"^myapp", r"^bb-", r"^ios-",
+ )
+ # kanban_create options hermes-hub create-task cannot carry: a card using them stays local.
+-UNCARRIED_OPTIONS = ("model", "provider", "goal_mode", "triage", "initial_status", "human_request",
+-                     "workspace_path", "project", "project_id", "tenant")
++UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "project", "project_id", "tenant")
++# kanban_create options a hermes-hub client with `create-task --option KEY=JSON` carries to the card.
++# (hermes-hub also allows reasoning_effort, but kanban_create has no such parameter.)
++CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provider", "goal_mode",
++                   "goal_max_turns", "completion_contract", "idempotency_key", "requires", "triage")
++# Of those, the ones an older client (no --option) cannot express at all: the card stays local.
++LEGACY_UNCARRIED = ("model", "provider", "goal_mode", "triage")
++HELP_CACHE_SECONDS = 600
++_help_cache: dict = {}
+ 
+ 
+ class _Cfg:
+@@ -82,7 +92,7 @@ class _Cfg:
+         out = []
+         for p in pats:
+             try:
+-                out.append(re.compile(str(p), re.I))
++                out.append(re.compile(str(p), re.IGNORECASE))
+             except re.error:
+                 continue
+         return out
+@@ -90,7 +100,7 @@ class _Cfg:
+     def skill_markers(self) -> list[re.Pattern]:
+         base = self.raw.get("local_skill_markers")
+         pats = list(base) if isinstance(base, list) else list(DEFAULT_LOCAL_SKILL_MARKERS)
+-        return [re.compile(str(p), re.I) for p in pats]
++        return [re.compile(str(p), re.IGNORECASE) for p in pats]
+ 
+     def creator_session(self, target: str) -> str:
+         v = self.raw.get("creator_session")
+@@ -166,9 +176,74 @@ def _hub_meta() -> dict:
+         db.close()
+ 
+ 
++def hub_carries_options(hub_cli: str) -> bool:
++    """True when ``hermes-hub create-task --help`` lists ``--option`` (client 1.8.0+). Cached briefly:
++    the client self-updates hourly."""
++    hit = _help_cache.get(hub_cli)
++    if hit and time.monotonic() - hit[0] < HELP_CACHE_SECONDS:
++        return hit[1]
++    rc, out, _ = hub_runner([hub_cli, "create-task", "--help"])
++    ok = rc == 0 and "--option" in out
++    _help_cache[hub_cli] = (time.monotonic(), ok)
++    return ok
++
++
++def _hub_cli(c: _Cfg) -> str:
++    return reg.hub_cli_path(c.raw.get("hub_cli"))
++
++
++def _bool(v) -> bool:
++    if isinstance(v, str):
++        return v.strip().lower() in ("1", "true", "yes", "on")
++    return bool(v)
++
++
++def carried_options(args: dict) -> dict:
++    """The set :data:`CARRIED_OPTIONS` of a kanban_create call, as JSON types hermes-hub accepts.
++    Defaults (False, 0, local-only, empty) are left out. Raises on a value kanban_create would refuse.
++    ``idempotency_key`` is not sent: it already fixes the request id, which the hub dedupes on."""
++    out: dict = {}
++    for k in CARRIED_OPTIONS:
++        v = args.get(k)
++        if k == "idempotency_key":
++            continue
++        if v in (None, "", [], False):
++            continue
++        if k in ("goal_mode", "triage"):
++            if _bool(v):
++                out[k] = True
++        elif k in ("max_runtime_seconds", "priority", "goal_max_turns"):
++            n = int(v)
++            if n or k != "priority":
++                out[k] = n
++        elif k in ("skills", "requires"):
++            vals = [str(x) for x in ([v] if isinstance(v, str) else v) if str(x).strip()]
++            if vals:
++                out[k] = vals
++        elif k == "completion_contract" and str(v).strip() == "local-only":
++            continue
++        else:
++            out[k] = str(v)
++    return out
++
++
++def _uncarried(args: dict, c: _Cfg, carries: Optional[bool]) -> list[str]:
++    """The options of ``args`` hermes-hub cannot carry. ``carries`` None probes the client, only
++    when an option an older client lacks is actually used."""
++    used = [k for k in UNCARRIED_OPTIONS if args.get(k) not in (None, "", False, [])]
++    legacy = [k for k in LEGACY_UNCARRIED if args.get(k) not in (None, "", False, [])]
++    if (args.get("completion_contract") or "local-only") != "local-only":
++        legacy.append("completion_contract")
++    if used or not legacy:
++        return used
++    if carries is None:
++        carries = hub_carries_options(_hub_cli(c))
++    return [] if carries else legacy
++
++
+ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+            self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
+-           locate: Optional[Callable[[str], dict]] = None) -> dict:
++           locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None) -> dict:
+     """``{"where": "local"|<gateway>, "why": str}`` for a ``kanban_create`` call. Never raises."""
+     try:
+         c = _Cfg(config() if cfg is None else cfg)
+@@ -196,9 +271,7 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         assignee = args.get("assignee") or "default"
+         if assignee not in c.assignees():
+             return {"where": "local", "why": f"assignee {assignee!r} is not placed remotely"}
+-        used = [k for k in UNCARRIED_OPTIONS if args.get(k) not in (None, "", False, [])]
+-        if (args.get("completion_contract") or "local-only") != "local-only":
+-            used.append("completion_contract")
++        used = _uncarried(args, c, carries)
+         if used:
+             return {"where": "local", "why": f"uses {', '.join(used)} (not carried by hermes-hub create-task)"}
+         needs = [r for r in (args.get("requires") or []) if reg.is_gateway_need(r)]
+@@ -236,21 +309,25 @@ def _default_runner(argv: list[str]) -> tuple[int, str, str]:
+ hub_runner: Callable[[list[str]], tuple[int, str, str]] = _default_runner
+ 
+ 
+-def request_id(self_gw: str, args: dict, origin_session: str) -> str:
+-    """Stable per (gateway, idempotency key | title+body+origin): exact retries reuse it."""
+-    key = args.get("idempotency_key") or json.dumps(
+-        [args.get("title"), args.get("body"), args.get("assignee"), origin_session, args.get("skills")],
+-        sort_keys=True)
++def request_id(self_gw: str, args: dict, origin_session: str, options: Optional[dict] = None) -> str:
++    """Stable per (gateway, idempotency key | title+body+origin+options): exact retries reuse it."""
++    fields = [args.get("title"), args.get("body"), args.get("assignee"), origin_session, args.get("skills")]
++    extra = {k: v for k, v in (options or {}).items() if k not in ("skills", "idempotency_key")}
++    if extra:  # only then, so a card without options keeps the id older clients computed
++        fields.append(extra)
++    key = args.get("idempotency_key") or json.dumps(fields, sort_keys=True)
+     return f"placement:{self_gw}:{hashlib.sha256(str(key).encode()).hexdigest()[:24]}"
+ 
+ 
+-def remote_body(args: dict, *, self_gw: str, target: str) -> str:
++def remote_body(args: dict, *, self_gw: str, target: str, carried: bool = False) -> str:
++    """The body sent to ``target``. ``carried`` (the client passes options as fields) drops the
++    body-text fallback for skills and the runtime budget."""
+     body = (args.get("body") or "").rstrip()
+     extra = []
+-    skills = args.get("skills") or []
++    skills = [] if carried else args.get("skills") or []
+     if skills:
+         extra.append(f"Skills to load first: {', '.join(str(s) for s in skills)}.")
+-    if args.get("max_runtime_seconds"):
++    if args.get("max_runtime_seconds") and not carried:
+         extra.append(f"Runtime budget asked by the creator: {int(args['max_runtime_seconds'])} s.")
+     extra.append(
+         f"Placed on {target} by {self_gw}'s default placement rule (kanban.placement): nothing in the card "
+@@ -266,10 +343,14 @@ def create_remote(args: dict, *, target: str, origin_session: Optional[str], ori
+                   self_gw: str, cfg: Optional[dict] = None, hub_cli: str = "hermes-hub") -> dict:
+     """Queue the card on ``target``. Returns ``{ok, request_id, rc, ...}``; ok False means create locally."""
+     c = _Cfg(config() if cfg is None else cfg)
+-    rid = request_id(self_gw, args, origin_session or "")
++    carried = hub_carries_options(hub_cli)
++    options = carried_options(args) if carried else {}
++    rid = request_id(self_gw, args, origin_session or "", options)
+     argv = [hub_cli, "create-task", target, str(args.get("title") or "untitled").strip()[:300],
+-            "--body", remote_body(args, self_gw=self_gw, target=target),
++            "--body", remote_body(args, self_gw=self_gw, target=target, carried=carried),
+             "--assignee", str(args.get("assignee") or "default"), "--id", rid]
++    for k, v in options.items():
++        argv += ["--option", f"{k}={json.dumps(v)}"]
+     if origin_session:
+         argv += ["--origin-session", origin_session, "--origin-profile", origin_profile,
+                  "--creator-session", c.creator_session(target)]
+diff --git a/scripts/run_tests_host_slots.py b/scripts/run_tests_host_slots.py
+index e3f8060170..e02189c50b 100644
+--- a/scripts/run_tests_host_slots.py
++++ b/scripts/run_tests_host_slots.py
+@@ -38,7 +38,7 @@ def _config_slots() -> int | None:
+     """
+     path = os.environ.get("HERMES_TEST_SLOT_CONFIG") or os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
+     try:
+-        with open(path, encoding="utf-8") as fh:
++        with open(path, encoding="utf-8-sig") as fh:
+             text = fh.read()
+     except OSError:
+         return None
+@@ -47,7 +47,7 @@ def _config_slots() -> int | None:
+ 
+         value = ((yaml.safe_load(text) or {}).get("tests") or {}).get("host_slots")
+     except Exception:  # no PyYAML in this interpreter, or a config it cannot parse: read the one key
+-        m = re.search(r"^tests:[ \t]*\n(?:[ \t]+.*\n|[ \t]*\n)*?[ \t]+host_slots:[ \t]*(\d+)", text, re.M)
++        m = re.search(r"^tests:[ \t]*\n(?:[ \t]+.*\n|[ \t]*\n)*?[ \t]+host_slots:[ \t]*(\d+)", text, re.MULTILINE)
+         value = m.group(1) if m else None
+     try:
+         return max(0, int(value)) if value is not None and not isinstance(value, bool) else None
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index feb17450ae..db683af112 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -18,8 +18,8 @@ from hermes_cli import kanban_capability_registry as reg
+ from hermes_cli import kanban_placement as kp
+ 
+ ROUTE = {"route": {"macbook": "hub"}, "creator_session": {"hub": "20261023_052109_5b3dee"}}
+-ALIVE = lambda target: None  # noqa: E731
+-NOWHERE = lambda need: {"need": need, "local": "absent", "holders": [], "stale": []}  # noqa: E731
++ALIVE = lambda target: None
++NOWHERE = lambda need: {"need": need, "local": "absent", "holders": [], "stale": []}
+ 
+ 
+ def decide(args, **kw):
+@@ -27,6 +27,7 @@ def decide(args, **kw):
+     kw.setdefault("self_gw", "macbook")
+     kw.setdefault("live", ALIVE)
+     kw.setdefault("locate", NOWHERE)
++    kw.setdefault("carries", False)  # a hermes-hub client without create-task --option (< 1.8.0)
+     return kp.decide(args, **kw)
+ 
+ 
+@@ -63,6 +64,68 @@ def test_cards_hub_create_cannot_express_stay_local(extra, why):
+     assert d["where"] == "local" and why in d["why"], d
+ 
+ 
++@pytest.mark.parametrize("extra", [
++    {"model": "claude-opus-5-5", "provider": "anthropic"},
++    {"goal_mode": True, "goal_max_turns": 5},
++    {"triage": True},
++    {"completion_contract": "daveey/hermes"},
++    {"skills": ["x"], "max_runtime_seconds": 3600, "priority": 2},
++])
++def test_options_a_new_client_carries_go_to_the_target(extra):
++    assert decide({"title": "Fix the flaky test", **extra}, carries=True)["where"] == "hub"
++
++
++@pytest.mark.parametrize("extra,why", [
++    ({"initial_status": "blocked"}, "initial_status"),
++    ({"human_request": {"action": "x"}}, "human_request"),
++    ({"tenant": "acme"}, "tenant"),
++    ({"goal_mode": True, "tenant": "acme"}, "tenant"),
++])
++def test_options_no_client_carries_stay_local(extra, why):
++    d = decide({"title": "Fix the flaky test", **extra}, carries=True)
++    assert d["where"] == "local" and why in d["why"], d
++
++
++def test_decide_probes_the_client_only_when_a_legacy_option_is_used(monkeypatch):
++    seen = []
++    monkeypatch.setattr(kp, "hub_carries_options", lambda cli: seen.append(cli) or True)
++    assert decide({"title": "Fix the flaky test"}, carries=None)["where"] == "hub"
++    assert seen == []
++    assert decide({"title": "Fix the flaky test", "goal_mode": True}, carries=None)["where"] == "hub"
++    assert len(seen) == 1
++
++
++def test_carried_options_are_json_typed_and_skip_defaults():
++    got = kp.carried_options({
++        "title": "t", "skills": ["x", ""], "goal_mode": "true", "triage": False, "priority": 0,
++        "max_runtime_seconds": "900", "goal_max_turns": 3, "model": "m", "provider": "p",
++        "completion_contract": "local-only", "idempotency_key": "k", "requires": "ssh:mini",
++        "initial_status": "blocked"})
++    assert got == {"skills": ["x"], "goal_mode": True, "max_runtime_seconds": 900, "goal_max_turns": 3,
++                   "model": "m", "provider": "p", "requires": ["ssh:mini"]}
++    assert kp.carried_options({"title": "t"}) == {}
++    with pytest.raises(ValueError):
++        kp.carried_options({"max_runtime_seconds": "2h"})
++
++
++def test_hub_carries_options_reads_create_task_help_and_caches(monkeypatch):
++    calls = []
++    out = {"text": "usage: ... [--id ID] [--option KEY=JSON]"}
++
++    def runner(argv):
++        calls.append(argv)
++        return 0, out["text"], ""
++    monkeypatch.setattr(kp, "hub_runner", runner)
++    monkeypatch.setattr(kp, "_help_cache", {})
++    assert kp.hub_carries_options("/x/hermes-hub") is True
++    assert calls == [["/x/hermes-hub", "create-task", "--help"]]
++    out["text"] = "usage: ... [--id ID]"
++    assert kp.hub_carries_options("/x/hermes-hub") is True and len(calls) == 1  # cached
++    assert kp.hub_carries_options("/y/hermes-hub") is False
++    monkeypatch.setattr(kp, "hub_runner", lambda argv: (127, "", "not found"))
++    assert kp.hub_carries_options("/z/hermes-hub") is False
++
++
+ @pytest.mark.parametrize("text", [
+     "Sign in to X in the agent Chrome and buy credits",
+     "Read the token from the login Keychain",
+@@ -182,9 +245,11 @@ def mac(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+     sdb.create_session("20261027_183000_abc123", source="desktop")
+     sdb.close()
+     calls: list[list[str]] = []
+-    result = {"rc": 0}
++    result = {"rc": 0, "help": "usage: hermes-hub create-task [--id ID]"}  # pre-1.8.0 client by default
+ 
+     def fake_hub(argv):
++        if argv[1:] == ["create-task", "--help"]:
++            return 0, result["help"], ""
+         calls.append(argv)
+         rid = argv[argv.index("--id") + 1]
+         if result["rc"] in (0, 3):
+@@ -197,6 +262,7 @@ def mac(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+         return result["rc"], rid, "" if result["rc"] == 0 else "boom"
+ 
+     monkeypatch.setattr(kp, "hub_runner", fake_hub)
++    monkeypatch.setattr(kp, "_help_cache", {})
+     monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 0})
+     kb.init_db()
+     yield {"hub": hub, "calls": calls, "result": result}
+@@ -228,6 +294,61 @@ def test_chat_card_is_created_on_the_hub_bound_to_its_chat(mac):
+     assert "Skills to load first: github-pr-workflow." in body and "needs=[" in body
+ 
+ 
++NEW_HELP = "usage: hermes-hub create-task [--id ID] [--option KEY=JSON]"
++
++
++def _options(argv) -> dict:
++    out = {}
++    for i, a in enumerate(argv):
++        if a == "--option":
++            k, _, v = argv[i + 1].partition("=")
++            out[k] = json.loads(v)
++    return out
++
++
++def test_new_client_carries_skills_goal_mode_and_pins_as_fields(mac):
++    """MacBook drill shape: skills=['x'] + goal_mode=true lands on the hub with both fields set."""
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = NEW_HELP
++    out = json.loads(kt._handle_create({
++        "title": "Regenerate the plugin index", "body": "Do it.", "skills": ["x"], "goal_mode": True,
++        "goal_max_turns": 6, "model": "claude-opus-5-5", "provider": "anthropic", "max_runtime_seconds": 1800,
++        "priority": 3, "session_id": "20261027_183000_abc123"}))
++    assert out["ok"] and out["placed"]["gateway"] == "hub", out
++    assert _local_count() == 0
++    argv = mac["calls"][0]
++    assert _options(argv) == {"skills": ["x"], "goal_mode": True, "goal_max_turns": 6, "model": "claude-opus-5-5",
++                              "provider": "anthropic", "max_runtime_seconds": 1800, "priority": 3}
++    body = argv[argv.index("--body") + 1]
++    assert "Skills to load first" not in body and "Runtime budget" not in body and "needs=[" in body
++
++
++def test_old_client_keeps_a_goal_card_local_and_skills_in_the_body(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "goal_mode": True}))
++    assert out["ok"] and "placed" not in out and mac["calls"] == [] and _local_count() == 1
++    out = json.loads(kt._handle_create({"title": "Regenerate the docs index", "skills": ["x"],
++                                        "max_runtime_seconds": 600}))
++    argv = mac["calls"][0]
++    assert out["placed"]["gateway"] == "hub" and "--option" not in argv
++    body = argv[argv.index("--body") + 1]
++    assert "Skills to load first: x." in body and "Runtime budget asked by the creator: 600 s." in body
++
++
++def test_kanban_cli_create_takes_reasoning_effort(mac):
++    """hermes-hub maps a plain create's reasoning_effort onto `hermes kanban create --reasoning-effort`."""
++    import argparse
++    from hermes_cli import kanban as kcli
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    root = argparse.ArgumentParser()
++    kcli.build_parser(root.add_subparsers())
++    args = root.parse_args(["kanban", "create", "plain card", "--reasoning-effort", "high", "--json"])
++    assert kcli._cmd_create(args) == 0
++    with kbc.connect_closing() as conn:
++        assert [t.reasoning_effort for t in kb.list_tasks(conn)] == ["high"]
++
++
+ def test_hub_task_id_is_returned_once_the_hub_applies_it(mac, monkeypatch):
+     from tools import kanban_tools as kt
+     monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 2})
+@@ -273,6 +394,9 @@ def test_retry_reuses_the_request_id():
+     assert kp.request_id("macbook", {"title": "t", "idempotency_key": "k"}, "s1") == \
+         kp.request_id("macbook", {"title": "other", "idempotency_key": "k"}, "s1")
+     assert len(a) <= 128 and reg.is_gateway_need("x:y")  # ids fit hermes-hub's alphabet/length
++    # Options join the key only when present, so a card without them keeps its pre-1.8.0 id.
++    assert kp.request_id("macbook", {"title": "t", "body": "b"}, "s1", {}) == a
++    assert kp.request_id("macbook", {"title": "t", "body": "b"}, "s1", {"goal_mode": True}) != a
+ 
+ 
+ def test_hub_cli_resolves_without_the_login_shell_path(tmp_path, monkeypatch):
+@@ -287,7 +411,7 @@ def test_hub_cli_resolves_without_the_login_shell_path(tmp_path, monkeypatch):
+     assert reg.hub_cli_path() == str(exe)
+     assert reg.hub_cli_path(str(tmp_path / "custom")) == str(tmp_path / "custom")  # configured wins
+     from hermes_cli import kanban_capability_routing as kcr
+-    monkeypatch.setattr(reg, "_config", lambda: {})
++    monkeypatch.setattr(reg, "_config", dict)
+     assert kcr._hub_cli() == str(exe)
+ 
+ 
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index b059e8ad53..f1d51ded80 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3142,4 +3142,4 @@ kanban:
+       macbook: hub   # cards created on gateway "macbook" run on gateway "hub"
+ ```
+ 
+-`kanban.placement` (default `{}`: every card is created locally) lets a gateway send cards that have no local-only need to another gateway. `kanban_create` creates such a card on the `route` target via `hermes-hub create-task` and binds it to the chat that asked for it. A card stays local when the caller passes `placement="local"`, when it uses options a remote create can't carry (parents, a project, a `dir`/`worktree` workspace, a model pin and similar), when it needs a capability only this gateway holds, when its text matches a local marker (`local_markers` replaces the built-in list, `extra_local_markers` extends it), or when the target isn't live. Other keys: `creator_session`, `local_skill_markers`, `assignees`, `hub_live_seconds`, `wait_seconds`, `hub_cli`.
++`kanban.placement` (default `{}`: every card is created locally) lets a gateway send cards that have no local-only need to another gateway. `kanban_create` creates such a card on the `route` target via `hermes-hub create-task` and binds it to the chat that asked for it. A card stays local when the caller passes `placement="local"`, when it uses options a remote create can't carry (parents, a project, a `dir`/`worktree` workspace, an initial status, a human request, a tenant; with a hermes-hub client older than 1.8.0, which lacks `create-task --option`, also a model pin, goal mode, triage or a non-local completion contract), when it needs a capability only this gateway holds, when its text matches a local marker (`local_markers` replaces the built-in list, `extra_local_markers` extends it), or when the target isn't live. Other keys: `creator_session`, `local_skill_markers`, `assignees`, `hub_live_seconds`, `wait_seconds`, `hub_cli`.
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 34347b07d5..00635d12c2 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1107,6 +1107,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
+                                 [--max-runtime 30m|2h|1d|<seconds>]
+                                 [--max-retries N]
+                                 [--goal] [--goal-max-turns N]
++                                [--reasoning-effort low|medium|high|none]
+                                 [--skill <name>]...
+                                 [--json]
+ hermes kanban list [--mine] [--assignee P] [--status S] [--tenant T] [--archived]
+-- 
+2.55.0
+

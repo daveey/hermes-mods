@@ -1,7 +1,7 @@
 # Kanban default placement: a card with no local-only need is created on the routed gateway
 
-Patches **0565** (source `89b72a8684`), **0567** (`8d1ca16533`, `hub_cli_path()` fix-up) and **0569** (`d57aebb0cb`,
-configuration docs). Companion: [kanban-capability-routing.md](kanban-capability-routing.md) (the route back).
+Patches **0565** (source `89b72a8684`), **0567** (`8d1ca16533`, `hub_cli_path()` fix-up), **0569** (`d57aebb0cb`,
+configuration docs) and **0572** (`5ac187baca`, carried options). Companion: [kanban-capability-routing.md](kanban-capability-routing.md) (the route back).
 
 ## Behavior
 
@@ -26,8 +26,9 @@ The card stays local (created here as before) when any of these holds:
 - it has parents, a project, a `dir`/`worktree` workspace, a non-default board or a non-default assignee
   (`kanban.placement.assignees`, default `["default"]`);
 - it is courier creation for another gateway (`origin_intent`);
-- it uses options `hermes-hub create-task` cannot carry: `model`, `provider`, `goal_mode`, `triage`,
-  `initial_status`, `human_request`, `tenant`, a non-`local-only` `completion_contract`;
+- it uses options `hermes-hub create-task` cannot carry: `initial_status`, `human_request`, `tenant` (and, with a
+  hermes-hub client older than 1.8.0, `model`, `provider`, `goal_mode`, `triage` or a non-`local-only`
+  `completion_contract`; see "Carried options" below);
 - a `requires` need that this gateway holds is not held by the target, or it names a profile tool that only this gateway validates;
 - its title/body matches a local marker regex (Chrome, Keychain, TCC, Apple apps, launchd, Desktop app, this Mac,
   the mini, AWS SSO profiles...) or one of its skills matches a local skill marker. `local_markers` replaces the
@@ -78,6 +79,35 @@ gateway has, so capability routing opens an owner card back there.
 - 0567: `test_hub_cli_resolves_without_the_login_shell_path` (PATH without the install dir, `~/.local/bin` fallback, configured value wins, routing uses it) and `test_remote_body_names_the_capability_to_route_back_with`.
 
 Untested: the CLI (`hermes kanban create`) and `execute_code` creation paths do not call placement (only the `kanban_create` tool does), and `test_kanban_create_entry_parity.py` has no placement case.
+
+## Carried options (0572)
+
+hermes-hub 1.8.0 adds `create-task --option KEY=JSON`. When `hermes-hub create-task --help` lists `--option`,
+placement passes `skills`, `max_runtime_seconds`, `priority`, `model`, `provider`, `goal_mode`, `goal_max_turns`,
+`completion_contract`, `requires` and `triage` as card fields (`CARRIED_OPTIONS`; defaults such as `False`, `0`,
+`local-only` are left out; `idempotency_key` is not sent because it already fixes the request id). So a model pin,
+goal mode, triage or PR contract no longer pins the card local, and skills and the runtime budget no longer ride as
+body text (`remote_body(..., carried=True)`). An older client keeps the previous rule: `model`, `provider`,
+`goal_mode`, `triage` and a non-local contract (`LEGACY_UNCARRIED`) keep the card local and skills/runtime stay in
+the body.
+
+- `hub_carries_options(hub_cli)` probes `create-task --help` and caches the answer 10 min (`HELP_CACHE_SECONDS`);
+  `decide()` probes only when a legacy-uncarried option is actually used (`carries=` can be injected).
+- `request_id()` folds the carried options into the hash only when there are any, so a card without options keeps
+  the id older clients computed (exact retries still dedupe).
+- `hermes kanban create --reasoning-effort EFFORT` (parser, `_cmd_create`) is new; hermes-hub maps a plain create's
+  reasoning_effort onto the hub option. `kanban_create` has no such parameter.
+- The same commit fixes the BOM/FURB167 lint in `scripts/run_tests_host_slots.py` that kept `scripts/check` red.
+
+Tests (`tests/hermes_cli/test_kanban_placement.py`, run on the mirror host: with `test_state_db_darwin_fd_scan_hang.py`
+and `test_anthropic_pool_pin.py`, 68 passed): `test_options_a_new_client_carries_go_to_the_target`,
+`test_options_no_client_carries_stay_local`, `test_decide_probes_the_client_only_when_a_legacy_option_is_used`,
+`test_carried_options_are_json_typed_and_skip_defaults`, `test_hub_carries_options_reads_create_task_help_and_caches`,
+`test_new_client_carries_skills_goal_mode_and_pins_as_fields`, `test_old_client_keeps_a_goal_card_local_and_skills_in_the_body`,
+`test_kanban_cli_create_takes_reasoning_effort`. Untested: the real `hermes-hub` binary (the runner is stubbed).
+
+Applying: `git am -3` 0572 after 0565–0569. Gotcha: a gateway whose hub client is older than 1.8.0 behaves as before
+until the client self-updates (up to an hour plus the 10 min cache).
 
 ## Applying
 

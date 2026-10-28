@@ -1,0 +1,1660 @@
+From 6daea0b0076f6e60df8916732cdd7ec17f161e65 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:59:54 -0700
+Subject: [PATCH] feat(desktop): [daveey] sidebar paints from a boot snapshot
+ before the backend is up
+
+Cold start showed a blank window for ~7.7 s: the full-screen CONNECTING
+overlay waits for the local backend (~6 s to boot), and every sidebar row
+(hub-sync replica rows, the projects tree) is served by that backend.
+
+- electron/sidebar-boot-snapshot.ts: Electron main reads hub.db read-only
+  (a port of hub-sync hubview.py sessions(): published + replica rows,
+  pending requests, primary-mode shared-field overlay, activity order) and
+  the last projects tree (userData/sidebar-boot-snapshot.json). The first
+  window reads both over sync IPC (hermes:boot-snapshot:read).
+- src/store/boot-snapshot.ts: seeds the sidebar fallback inputs with every
+  gateway's rows, this one's included, and the projects tree while empty.
+  Live lists replace them per owner (mergeOfflineFallback freshness). The
+  live tree is saved (debounced, no running state) for the next launch.
+- The CONNECTING overlay stays down on a cold boot whose sidebar painted from
+  the snapshot (same as a post-boot reconnect).
+- hub-sync plugin: a failed replica read publishes nothing, so it never
+  wipes rows already showing.
+- [sidebar-timing] log line: ms from process start to first sidebar rows and
+  to the first live list, and the rows' source.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/main.ts                 |  14 +
+ apps/desktop/electron/preload.ts              |   5 +
+ .../electron/sidebar-boot-snapshot.test.ts    | 208 ++++++++++
+ .../desktop/electron/sidebar-boot-snapshot.ts | 365 ++++++++++++++++++
+ apps/desktop/src/app/chat/sidebar/index.tsx   |  11 +
+ .../app/chat/sidebar/use-offline-fallback.ts  |   6 +-
+ .../session/hooks/use-session-list-actions.ts |   6 +
+ .../gateway-connecting-overlay.test.tsx       |  30 +-
+ .../components/gateway-connecting-overlay.tsx |  23 +-
+ apps/desktop/src/global.d.ts                  |  17 +
+ apps/desktop/src/main.tsx                     |   8 +
+ apps/desktop/src/plugins/hub-sync/api.test.ts |  12 +
+ apps/desktop/src/plugins/hub-sync/api.ts      |  13 +-
+ .../src/plugins/hub-sync/plugin.test.ts       |  40 +-
+ apps/desktop/src/plugins/hub-sync/plugin.tsx  |   2 +-
+ apps/desktop/src/store/boot-snapshot.test.ts  | 249 ++++++++++++
+ apps/desktop/src/store/boot-snapshot.ts       | 235 +++++++++++
+ .../src/store/offline-session-owner.ts        |   5 +-
+ apps/desktop/src/store/offline-sessions.ts    |  10 +-
+ apps/desktop/src/store/projects.ts            |   3 +
+ 20 files changed, 1241 insertions(+), 21 deletions(-)
+ create mode 100644 apps/desktop/electron/sidebar-boot-snapshot.test.ts
+ create mode 100644 apps/desktop/electron/sidebar-boot-snapshot.ts
+ create mode 100644 apps/desktop/src/store/boot-snapshot.test.ts
+ create mode 100644 apps/desktop/src/store/boot-snapshot.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index ddae006b2a..a430e43389 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -581,6 +581,7 @@ import {
+   SESSION_WINDOW_MIN_WIDTH
+ } from './session-windows'
+ import { ensureLoginShellPath } from './shell-path'
++import { installSidebarBootSnapshot } from './sidebar-boot-snapshot'
+ import { removeStaleSingletonLock } from './singleton-lock'
+ import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
+ import { resolveSourcePython } from './source-python'
+@@ -19503,6 +19504,19 @@ app.whenReady().then(() => {
+   mainProcessLagWatchdog.start()
+   f12Blocked = readPersistedDisableF12()
+ 
++  // [daveey] Sidebar boot snapshot (cold start): hub.db sessions + the last projects tree,
++  // read by the first window over sync IPC so the sidebar paints before the backend is up.
++  try {
++    installSidebarBootSnapshot({
++      appStartMs: Math.round(Date.now() - process.uptime() * 1000),
++      ipcMain,
++      log: line => rememberLog(`[sidebar-boot] ${line}`),
++      userDataDir: app.getPath('userData')
++    })
++  } catch (error) {
++    rememberLog(`[sidebar-boot] disabled: ${(error as Error)?.message || error}`)
++  }
++
+   // [daveey] Local transcript cache + prefetch (instant session loads, C1). Before the
+   // first window: the renderer's cache read is a sync IPC. Prefetch waits out boot.
+   try {
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index a7482dccf0..0de76cdd06 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -44,6 +44,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
+   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
+   touchBackend: (profile, options) => ipcRenderer.invoke('hermes:backend:touch', profile, options),
++  // [daveey] Sidebar boot snapshot (cold start): read once, synchronously, before the backend is up.
++  bootSnapshot: {
++    read: () => ipcRenderer.sendSync('hermes:boot-snapshot:read'),
++    saveTree: payload => ipcRenderer.send('hermes:boot-snapshot:save-tree', payload)
++  },
+   // [daveey] Local transcript cache (instant session loads). `read` is synchronous so a
+   // click paints the cached transcript in the same tick; writes are fire-and-forget.
+   transcriptCache: {
+diff --git a/apps/desktop/electron/sidebar-boot-snapshot.test.ts b/apps/desktop/electron/sidebar-boot-snapshot.test.ts
+new file mode 100644
+index 0000000000..66e1d1fd6c
+--- /dev/null
++++ b/apps/desktop/electron/sidebar-boot-snapshot.test.ts
+@@ -0,0 +1,208 @@
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++import { DatabaseSync } from 'node:sqlite'
++
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import {
++  hubDbPath,
++  installSidebarBootSnapshot,
++  readHubSessions,
++  readTreeSnapshot,
++  writeTreeSnapshot
++} from './sidebar-boot-snapshot'
++
++// [daveey] Sidebar boot snapshot: Electron main reads hub.db the way hub-sync's hubview.py `sessions()` does, so the
++// first window can paint every gateway's rows (this one's included) before the local backend is up.
++
++// The hermes-hub client's tables this reader touches (hermes_hub.SCHEMA).
++const SCHEMA = `
++CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
++CREATE TABLE published (coll TEXT, key TEXT, sha TEXT, data TEXT, version INTEGER, seq INTEGER, PRIMARY KEY (coll, key));
++CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT, updated_at INTEGER,
++  PRIMARY KEY (gw, coll, key));
++CREATE TABLE sent (id TEXT PRIMARY KEY, body TEXT, state TEXT, result TEXT, created_at REAL, done_at REAL, posted INTEGER DEFAULT 0);
++CREATE TABLE overrides (gw TEXT, coll TEXT, key TEXT, field TEXT, value TEXT, hlc TEXT, by_gw TEXT, seq INTEGER,
++  PRIMARY KEY (gw, coll, key, field));
++`
++
++const NOW = 1_800_000_000
++
++let dir: string
++let dbFile: string
++
++function buildDb(opts: { lastOk?: number; shared?: string } = {}) {
++  const db = new DatabaseSync(dbFile)
++  db.exec(SCHEMA)
++  const meta = db.prepare('INSERT INTO meta (k, v) VALUES (?, ?)')
++  meta.run('gateway', 'macbook')
++  meta.run('last_ok', String(opts.lastOk ?? NOW - 5))
++
++  if (opts.shared) {
++    meta.run('shared_fields', opts.shared)
++  }
++
++  const pub = db.prepare("INSERT INTO published (coll, key, data, version) VALUES ('sessions', ?, ?, ?)")
++  pub.run('default/s_own', JSON.stringify({ activity: NOW - 10, id: 's_own', profile: 'default', title: 'Own chat' }), 3)
++  pub.run('default/s_arch', JSON.stringify({ activity: NOW, archived: true, id: 's_arch', title: 'Archived' }), 1)
++  pub.run('default/s_bad', 'not json', 1)
++
++  const rep = db.prepare("INSERT INTO replica (gw, coll, key, version, data, updated_at) VALUES (?, 'sessions', ?, ?, ?, ?)")
++  rep.run('mini', 'default/s_mini', 7, JSON.stringify({ activity: NOW - 1, id: 's_mini', title: 'Mini chat' }), (NOW - 60) * 1000)
++  rep.run('hub', 'default/s_hub', 2, JSON.stringify({ activity: NOW - 100, id: 's_hub', title: 'Hub chat' }), (NOW - 600) * 1000)
++  // A replica copy of this gateway's own row is never shown twice.
++  rep.run('macbook', 'default/s_own', 3, JSON.stringify({ id: 's_own', title: 'Own chat (echo)' }), NOW * 1000)
++
++  db.prepare("INSERT INTO sent (id, body, state, created_at) VALUES ('r1', ?, 'queued', ?)").run(
++    JSON.stringify({ action: 'pin', args: {}, coll: 'sessions', key: 'default/s_mini', to_gw: 'mini' }),
++    NOW - 3
++  )
++  db.prepare("INSERT INTO sent (id, body, state, created_at) VALUES ('r2', ?, 'done', ?)").run(
++    JSON.stringify({ action: 'pin', coll: 'sessions', key: 'default/s_hub', to_gw: 'hub' }),
++    NOW - 3
++  )
++  db.prepare(
++    "INSERT INTO overrides (gw, coll, key, field, value, hlc, by_gw, seq) VALUES ('mini', 'sessions', 'default/s_mini', 'title', ?, 'h', 'macbook', 1)"
++  ).run(JSON.stringify('Renamed on the hub'))
++  db.close()
++}
++
++beforeEach(() => {
++  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'boot-snapshot-'))
++  dbFile = path.join(dir, 'hub.db')
++})
++
++afterEach(() => {
++  fs.rmSync(dir, { force: true, recursive: true })
++})
++
++describe('readHubSessions', () => {
++  it('returns own (published) and other gateways (replica) rows, newest activity first, archived and torn rows dropped', () => {
++    buildDb()
++    const snap = readHubSessions(dbFile, NOW)!
++
++    expect(snap.gateway).toBe('macbook')
++    expect(snap.stale).toBe(false)
++    expect(snap.sessions.map(r => [r.gateway, r.id, r.local])).toEqual([
++      ['mini', 's_mini', false],
++      ['macbook', 's_own', true],
++      ['hub', 's_hub', false]
++    ])
++  })
++
++  it('stamps synced_at like hubview: now for own rows, min(owner publish, last pull) for replica rows', () => {
++    buildDb({ lastOk: NOW - 5 })
++    const byId = Object.fromEntries(readHubSessions(dbFile, NOW)!.sessions.map(r => [r.id, r]))
++
++    expect(byId.s_own.synced_at).toBe(NOW)
++    expect(byId.s_mini.synced_at).toBe(NOW - 60)
++    expect(byId.s_hub.synced_at).toBe(NOW - 600)
++    expect(byId.s_mini.updated_at_hub).toBe(NOW - 60)
++  })
++
++  it('marks every replica row stale when the last pull is older than the stale window', () => {
++    buildDb({ lastOk: NOW - 1000 })
++    const snap = readHubSessions(dbFile, NOW)!
++
++    expect(snap.stale).toBe(true)
++    expect(snap.sessions.filter(r => !r.local).every(r => r.stale === true)).toBe(true)
++    expect(snap.sessions.find(r => r.local)!.stale).toBe(false)
++  })
++
++  it('attaches pending (local/queued) requests to their row', () => {
++    buildDb()
++    const byId = Object.fromEntries(readHubSessions(dbFile, NOW)!.sessions.map(r => [r.id, r]))
++
++    expect(byId.s_mini.pending).toEqual([{ action: 'pin', args: {}, created_at: NOW - 3, id: 'r1', state: 'queued' }])
++    expect(byId.s_hub.pending).toEqual([]) // its request is done
++  })
++
++  it('applies shared-field overrides only in primary mode, marking a value the owner has not applied', () => {
++    buildDb({ shared: JSON.stringify({ sessions: 'primary' }) })
++    const primary = readHubSessions(dbFile, NOW)!.sessions.find(r => r.id === 's_mini')!
++
++    expect(primary.title).toBe('Renamed on the hub')
++    expect(primary.shared).toEqual({ title: { by: 'macbook', owner_value: 'Mini chat' } })
++
++    fs.rmSync(dbFile)
++    buildDb({ shared: JSON.stringify('shadow') })
++    const shadow = readHubSessions(dbFile, NOW)!.sessions.find(r => r.id === 's_mini')!
++
++    expect(shadow.title).toBe('Mini chat')
++    expect(shadow.shared).toBeUndefined()
++  })
++
++  it('answers null for a missing db and never creates one', () => {
++    expect(readHubSessions(dbFile, NOW)).toBeNull()
++    expect(fs.existsSync(dbFile)).toBe(false)
++  })
++
++  it('caps the row count', () => {
++    buildDb()
++
++    expect(readHubSessions(dbFile, NOW, 1)!.sessions.map(r => r.id)).toEqual(['s_mini'])
++  })
++})
++
++describe('hubDbPath', () => {
++  it('follows HERMES_HUB_STATE like hubview, else ~/.local/state/hermes-hub', () => {
++    expect(hubDbPath({}, '/home/me')).toBe('/home/me/.local/state/hermes-hub/hub.db')
++    expect(hubDbPath({ HERMES_HUB_STATE: '~/hub' }, '/home/me')).toBe('/home/me/hub/hub.db')
++  })
++})
++
++describe('tree snapshot file', () => {
++  it('round-trips and rejects a torn or foreign file', () => {
++    const file = path.join(dir, 'tree.json')
++    writeTreeSnapshot(file, { activeProjectId: 'p_1', connectionId: 'local', tree: [{ id: 'p_1' }] }, 123)
++
++    expect(readTreeSnapshot(file)).toEqual({ activeProjectId: 'p_1', connectionId: 'local', savedAt: 123, tree: [{ id: 'p_1' }] })
++
++    fs.writeFileSync(file, '{"v":1,"tree":')
++    expect(readTreeSnapshot(file)).toBeNull()
++    fs.writeFileSync(file, JSON.stringify({ connectionId: 'local', tree: [], v: 99 }))
++    expect(readTreeSnapshot(file)).toBeNull()
++    expect(readTreeSnapshot(path.join(dir, 'missing.json'))).toBeNull()
++  })
++})
++
++describe('installSidebarBootSnapshot IPC', () => {
++  function install() {
++    const handlers = new Map<string, (event: any, payload?: any) => void>()
++    const ipcMain = { on: vi.fn((channel: string, fn: any) => void handlers.set(channel, fn)) }
++    installSidebarBootSnapshot({ appStartMs: 42, hubDb: dbFile, ipcMain: ipcMain as any, log: () => {}, userDataDir: dir })
++
++    return handlers
++  }
++
++  it('read (sendSync) returns the process start, hub rows and the saved tree', () => {
++    buildDb()
++    const handlers = install()
++    handlers.get('hermes:boot-snapshot:save-tree')!({}, { activeProjectId: null, connectionId: 'local', tree: [{ id: 'p' }] })
++    const event: { returnValue?: any } = {}
++    handlers.get('hermes:boot-snapshot:read')!(event)
++
++    expect(event.returnValue.appStartMs).toBe(42)
++    expect(event.returnValue.hub.gateway).toBe('macbook')
++    expect(event.returnValue.hub.sessions.length).toBe(3)
++    expect(event.returnValue.tree.tree).toEqual([{ id: 'p' }])
++    expect(typeof event.returnValue.readMs).toBe('number')
++  })
++
++  it('read without hub.db or a saved tree still answers (nothing to paint)', () => {
++    const handlers = install()
++    const event: { returnValue?: any } = {}
++    handlers.get('hermes:boot-snapshot:read')!(event)
++
++    expect(event.returnValue).toMatchObject({ appStartMs: 42, hub: null, tree: null })
++  })
++
++  it('save-tree ignores a malformed payload', () => {
++    const handlers = install()
++    handlers.get('hermes:boot-snapshot:save-tree')!({}, { tree: 'nope' })
++    handlers.get('hermes:boot-snapshot:save-tree')!({}, null)
++
++    expect(fs.existsSync(path.join(dir, 'sidebar-boot-snapshot.json'))).toBe(false)
++  })
++})
+diff --git a/apps/desktop/electron/sidebar-boot-snapshot.ts b/apps/desktop/electron/sidebar-boot-snapshot.ts
+new file mode 100644
+index 0000000000..5943ae7ab4
+--- /dev/null
++++ b/apps/desktop/electron/sidebar-boot-snapshot.ts
+@@ -0,0 +1,365 @@
++/**
++ * [daveey] Sidebar boot snapshot (instant session loads, cold start).
++ *
++ * The sidebar's rows come from the local Python backend, which takes ~6 s to
++ * boot. This module lets the first window paint them before that, from two
++ * sources Electron main can read synchronously:
++ *
++ *  - hub sessions: this gateway's hermes-hub replica (`hub.db`), read
++ *    read-only. Same rows the hub-sync plugin's `GET /sessions` serves
++ *    (published = this gateway's own, replica = every other gateway's,
++ *    pending requests attached, shared-field overrides on top in primary
++ *    mode); `hub-sync/hubview.py` View.rows is the reference.
++ *  - projects tree: the last tree a live backend answered, saved by the
++ *    renderer to `sidebar-boot-snapshot.json` in userData.
++ *
++ * IPC (preload exposes it as `hermesDesktop.bootSnapshot`):
++ *   hermes:boot-snapshot:read       sendSync  -> BootSnapshot
++ *   hermes:boot-snapshot:save-tree  send      {tree, activeProjectId, connectionId}
++ */
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++import { DatabaseSync } from 'node:sqlite'
++
++import type { IpcMain } from 'electron'
++
++// hubview.py: STALE_AFTER_S, PENDING_STATES, SHARED["sessions"].
++export const HUB_STALE_AFTER_S = 180
++const PENDING_STATES = ['local', 'queued']
++const SHARED_SESSION_FIELDS = new Set(['title', 'pinned', 'archived', 'hidden'])
++export const HUB_SESSIONS_LIMIT = 2000
++const TREE_FILE = 'sidebar-boot-snapshot.json'
++const TREE_VERSION = 1
++
++export interface HubSessionsSnapshot {
++  available: true
++  gateway: null | string
++  sessions: Record<string, unknown>[]
++  stale: boolean
++  synced_at: null | number
++}
++
++export interface TreeSnapshot {
++  activeProjectId: null | string
++  connectionId: string
++  savedAt: number
++  tree: unknown[]
++}
++
++export interface BootSnapshot {
++  /** Epoch ms the Electron main process started (cold-start timing base). */
++  appStartMs: number
++  hub: HubSessionsSnapshot | null
++  readMs: number
++  tree: TreeSnapshot | null
++}
++
++export function hubDbPath(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
++  const base = env.HERMES_HUB_STATE?.trim() || path.join(home, '.local', 'state', 'hermes-hub')
++
++  return path.join(base.replace(/^~(?=$|\/)/, home), 'hub.db')
++}
++
++const parseObject = (text: unknown): null | Record<string, any> => {
++  try {
++    const value = JSON.parse(String(text))
++
++    return value && typeof value === 'object' && !Array.isArray(value) ? value : null
++  } catch {
++    return null
++  }
++}
++
++const parseJson = (text: unknown): unknown => {
++  try {
++    return JSON.parse(String(text))
++  } catch {
++    return null
++  }
++}
++
++const toFloat = (value: unknown): null | number => {
++  if (value === null || value === undefined || value === '' || value === 'None') {
++    return null
++  }
++
++  const n = Number(value)
++
++  return Number.isFinite(n) ? n : null
++}
++
++/**
++ * hubview.py `sessions(include_archived=False)` against `dbPath`, read-only:
++ * null when the db is missing or unreadable (the caller paints nothing).
++ */
++export function readHubSessions(
++  dbPath: string,
++  nowS: number = Date.now() / 1000,
++  limit: number = HUB_SESSIONS_LIMIT
++): HubSessionsSnapshot | null {
++  if (!fs.existsSync(dbPath)) {
++    return null
++  }
++
++  let db: DatabaseSync | null = null
++
++  try {
++    // hubview.ro_connect: rw + query_only, because a readOnly open fails on a WAL db whose -wal/-shm are missing.
++    // The existsSync above means this never creates the file.
++    db = new DatabaseSync(dbPath, { timeout: 500 })
++    db.exec('PRAGMA query_only = ON')
++    const conn = db
++
++    const has = (table: string) =>
++      Boolean(conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table))
++
++    const meta = (key: string): null | string => {
++      if (!has('meta')) {
++        return null
++      }
++
++      const row = conn.prepare('SELECT v FROM meta WHERE k = ?').get(key) as { v?: unknown } | undefined
++      const v = row?.v
++
++      return v === null || v === undefined || v === 'None' ? null : String(v)
++    }
++
++    const gateway = meta('gateway')
++    const lastOk = toFloat(meta('last_ok'))
++    const stale = lastOk === null || nowS - lastOk > HUB_STALE_AFTER_S
++
++    const ownerSeen = new Map<string, number>()
++
++    if (has('replica')) {
++      for (const r of conn.prepare('SELECT gw, MAX(updated_at) AS t FROM replica GROUP BY gw').all() as any[]) {
++        ownerSeen.set(String(r.gw), (Number(r.t) || 0) / 1000)
++      }
++    }
++
++    const syncedAt = (gw: string): null | number => {
++      const seen = ownerSeen.get(gw)
++
++      if (seen === undefined) {
++        return lastOk
++      }
++
++      return lastOk ? Math.min(seen, lastOk) : seen
++    }
++
++    const pending = new Map<string, unknown[]>()
++
++    if (has('sent')) {
++      const rows = conn
++        .prepare(
++          `SELECT id, body, state, created_at FROM sent WHERE state IN (${PENDING_STATES.map(() => '?').join(',')}) ORDER BY created_at`
++        )
++        .all(...PENDING_STATES) as any[]
++
++      for (const r of rows) {
++        const b = parseObject(r.body)
++
++        if (!b || b.coll !== 'sessions') {
++          continue
++        }
++
++        const k = `${b.to_gw}\u0000${b.key}`
++        const list = pending.get(k) ?? []
++        list.push({ action: b.action, args: b.args || {}, created_at: r.created_at, id: r.id, state: r.state })
++        pending.set(k, list)
++      }
++    }
++
++    let sharedPrimary = false
++
++    try {
++      const raw = parseJson(meta('shared_fields') ?? '"off"')
++      const mode = raw && typeof raw === 'object' ? (raw as Record<string, unknown>).sessions : raw
++      sharedPrimary = mode === 'primary'
++    } catch {
++      sharedPrimary = false
++    }
++
++    const overrides = new Map<string, Map<string, { by: unknown; value: unknown }>>()
++
++    if (sharedPrimary && has('overrides')) {
++      const rows = conn
++        .prepare("SELECT gw, key, field, value, by_gw FROM overrides WHERE coll = 'sessions' AND value IS NOT NULL")
++        .all() as any[]
++
++      for (const r of rows) {
++        if (SHARED_SESSION_FIELDS.has(r.field) || r.field === 'pending_action') {
++          const k = `${r.gw}\u0000${r.key}`
++          const fields = overrides.get(k) ?? new Map()
++          fields.set(String(r.field), { by: r.by_gw, value: parseJson(r.value) })
++          overrides.set(k, fields)
++        }
++      }
++    }
++
++    const overlay = (d: Record<string, any>) => {
++      const ovr = overrides.get(`${d.gateway}\u0000${d.key}`)
++
++      if (!ovr) {
++        return d
++      }
++
++      for (const [field, o] of ovr) {
++        if (field === 'pending_action') {
++          d.pending_action = o.value
++
++          continue
++        }
++
++        if (d[field] !== o.value) {
++          d.shared = { ...(d.shared ?? {}), [field]: { by: o.by, owner_value: d[field] } }
++        }
++
++        d[field] = o.value
++      }
++
++      return d
++    }
++
++    const out: Record<string, any>[] = []
++
++    if (has('published')) {
++      for (const r of conn.prepare("SELECT key, data, version FROM published WHERE coll = 'sessions'").all() as any[]) {
++        const d = parseObject(r.data)
++
++        if (d) {
++          Object.assign(d, {
++            gateway,
++            key: r.key,
++            local: true,
++            pending: pending.get(`${gateway}\u0000${r.key}`) ?? [],
++            stale: false,
++            synced_at: nowS,
++            version: r.version
++          })
++          out.push(overlay(d))
++        }
++      }
++    }
++
++    if (has('replica')) {
++      const rows = conn
++        .prepare("SELECT gw, key, data, version, updated_at FROM replica WHERE coll = 'sessions' AND gw IS NOT ?")
++        .all(gateway) as any[]
++
++      for (const r of rows) {
++        const d = parseObject(r.data)
++
++        if (d) {
++          Object.assign(d, {
++            gateway: r.gw,
++            key: r.key,
++            local: false,
++            pending: pending.get(`${r.gw}\u0000${r.key}`) ?? [],
++            stale,
++            synced_at: syncedAt(String(r.gw)),
++            updated_at_hub: (Number(r.updated_at) || 0) / 1000,
++            version: r.version
++          })
++          out.push(overlay(d))
++        }
++      }
++    }
++
++    const sessions = out
++      .filter(d => !d.archived)
++      .sort((a, b) => (Number(b.activity || b.started_at) || 0) - (Number(a.activity || a.started_at) || 0))
++      .slice(0, Math.max(1, Math.min(limit, 5000)))
++
++    return { available: true, gateway, sessions, stale, synced_at: lastOk }
++  } catch {
++    return null
++  } finally {
++    try {
++      db?.close()
++    } catch {
++      // already closed
++    }
++  }
++}
++
++export function readTreeSnapshot(file: string): TreeSnapshot | null {
++  try {
++    const raw = parseObject(fs.readFileSync(file, 'utf8'))
++
++    if (!raw || raw.v !== TREE_VERSION || !Array.isArray(raw.tree) || typeof raw.connectionId !== 'string') {
++      return null
++    }
++
++    return {
++      activeProjectId: typeof raw.activeProjectId === 'string' ? raw.activeProjectId : null,
++      connectionId: raw.connectionId,
++      savedAt: Number(raw.savedAt) || 0,
++      tree: raw.tree
++    }
++  } catch {
++    return null
++  }
++}
++
++/** Atomic replace (tmp + rename) so a crash mid-write never leaves a torn snapshot. */
++export function writeTreeSnapshot(file: string, snapshot: Omit<TreeSnapshot, 'savedAt'>, nowMs = Date.now()): void {
++  const tmp = `${file}.${process.pid}.tmp`
++  fs.writeFileSync(tmp, JSON.stringify({ v: TREE_VERSION, savedAt: nowMs, ...snapshot }))
++  fs.renameSync(tmp, file)
++}
++
++export interface SidebarBootSnapshotDeps {
++  appStartMs: number
++  hubDb?: string
++  ipcMain: IpcMain
++  log: (line: string) => void
++  userDataDir: string
++}
++
++export function installSidebarBootSnapshot(deps: SidebarBootSnapshotDeps) {
++  const treeFile = path.join(deps.userDataDir, TREE_FILE)
++  const hubDb = deps.hubDb ?? hubDbPath()
++
++  const read = (): BootSnapshot => {
++    const t0 = performance.now()
++    let hub: HubSessionsSnapshot | null = null
++    let tree: TreeSnapshot | null = null
++
++    try {
++      hub = readHubSessions(hubDb)
++    } catch (error) {
++      deps.log(`hub read failed: ${(error as Error)?.message || error}`)
++    }
++
++    try {
++      tree = readTreeSnapshot(treeFile)
++    } catch (error) {
++      deps.log(`tree read failed: ${(error as Error)?.message || error}`)
++    }
++
++    return { appStartMs: deps.appStartMs, hub, readMs: Math.round(performance.now() - t0), tree }
++  }
++
++  deps.ipcMain.on('hermes:boot-snapshot:read', event => {
++    event.returnValue = read()
++  })
++
++  deps.ipcMain.on('hermes:boot-snapshot:save-tree', (_event, payload) => {
++    if (!payload || !Array.isArray(payload.tree) || typeof payload.connectionId !== 'string') {
++      return
++    }
++
++    try {
++      writeTreeSnapshot(treeFile, {
++        activeProjectId: typeof payload.activeProjectId === 'string' ? payload.activeProjectId : null,
++        connectionId: payload.connectionId,
++        tree: payload.tree
++      })
++    } catch (error) {
++      deps.log(`tree save failed: ${(error as Error)?.message || error}`)
++    }
++  })
++
++  return { read }
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index 98019bce24..b171eb814b 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -30,6 +30,7 @@ import { sessionCreatedAt } from '@/lib/session-branch-tree'
+ import { sessionMatchesSearch } from '@/lib/session-search'
+ import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
+ import { cn } from '@/lib/utils'
++import { markSidebarFirstRows } from '@/store/boot-snapshot'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $activeConnectionId } from '@/store/connections'
+ import { $cronJobs } from '@/store/cron'
+@@ -1600,6 +1601,16 @@ export function ChatSidebar({
+   // every background refresh instead of the empty state.
+   const showSessionSkeletons = sessionsLoading && scopedSessions.length === 0
+ 
++  // [daveey] Cold-start timing: when this launch's sidebar first drew rows, and whether they were live or the boot
++  // snapshot (hub.db rows / last projects tree) painted before the backend was up.
++  const drawnRows = sortedSessions.length + (projectOverview?.length ?? 0)
++
++  useEffect(() => {
++    if (drawnRows > 0) {
++      markSidebarFirstRows(drawnRows, !sessionsLoading)
++    }
++  }, [drawnRows, sessionsLoading])
++
+   // Filtered down to nothing still renders the section: the empty state is what
+   // tells you the filter — not an empty account — is why the list is bare.
+   // Messaging threads and cron jobs live inside this area too: a profile whose
+diff --git a/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts b/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
+index 80081ab664..bfd54e263c 100644
+--- a/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
++++ b/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
+@@ -10,15 +10,17 @@ import { useCallback, useMemo } from 'react'
+ import type { SessionInfo } from '@/hermes'
+ import { markOpenClick } from '@/lib/open-timing'
+ import { clearAsleepOpen, hasCachedTranscriptFor, markAsleepOpen } from '@/store/asleep-session'
++import { $sidebarFallbackSessions } from '@/store/boot-snapshot'
+ import { notify } from '@/store/notifications'
+ import { offlineOpenNotice } from '@/store/offline-session-actions'
+-import { $offlineSessions, $sessionListFreshness, mergeOfflineFallback } from '@/store/offline-sessions'
++import { $sessionListFreshness, mergeOfflineFallback } from '@/store/offline-sessions'
+ 
+ export function useOfflineFallback(
+   liveSessions: SessionInfo[],
+   resumeSession: (sessionId: string, session?: SessionInfo) => void
+ ) {
+-  const offlineSessions = useStore($offlineSessions)
++  // [daveey] Plugin rows of unreachable gateways + the cold-start boot snapshot's rows.
++  const offlineSessions = useStore($sidebarFallbackSessions)
+   const freshness = useStore($sessionListFreshness)
+ 
+   const sessions = useMemo(
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+index b796d8af04..967ffb2261 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+@@ -8,6 +8,7 @@ import {
+   normalizeSessionSource,
+   SIDEBAR_EXCLUDED_SOURCES
+ } from '@/lib/session-source'
++import { markSidebarLive } from '@/store/boot-snapshot'
+ import { gatewayActivationEpoch, primaryGatewayConnectionId } from '@/store/gateway'
+ import {
+   $pinnedSessionIds,
+@@ -81,6 +82,11 @@ function recordSidebarFreshness(result: Awaited<ReturnType<typeof listSidebarSes
+             ],
+             recents.failed === true || recents.retry === true
+           )
++
++  // [daveey] Cold-start timing: the first live list this launch.
++  if (recents.failed !== true && recents.retry !== true) {
++    markSidebarLive()
++  }
+ }
+ 
+ // The messaging slice is the inverse: drop cron + every local source so only
+diff --git a/apps/desktop/src/components/gateway-connecting-overlay.test.tsx b/apps/desktop/src/components/gateway-connecting-overlay.test.tsx
+index efaffa7d2a..18f45c7d17 100644
+--- a/apps/desktop/src/components/gateway-connecting-overlay.test.tsx
++++ b/apps/desktop/src/components/gateway-connecting-overlay.test.tsx
+@@ -2,6 +2,7 @@ import { act, cleanup, render, screen } from '@testing-library/react'
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+ 
+ import { $desktopBoot } from '@/store/boot'
++import { $bootSnapshot, _resetBootSnapshotForTests } from '@/store/boot-snapshot'
+ import { $gatewaySwitching } from '@/store/gateway-switch'
+ import { $desktopOnboarding } from '@/store/onboarding'
+ import { setGatewayState } from '@/store/session'
+@@ -49,7 +50,10 @@ function resetStores() {
+   })
+ }
+ 
+-beforeEach(resetStores)
++beforeEach(() => {
++  resetStores()
++  _resetBootSnapshotForTests()
++})
+ afterEach(cleanup)
+ 
+ // The connecting overlay renders "CONN" + a scrambled tail inside one
+@@ -174,3 +178,27 @@ describe('connecting overlay vs recovery surface', () => {
+     expect(isConnectingShown()).toBe(false)
+   })
+ })
++
++// [daveey] Cold start with a boot snapshot (hub.db rows / last projects tree already painted in the sidebar): the shell
++// stays visible while the backend starts, exactly like a post-boot reconnect. Without one, cold boot still covers.
++describe('connecting overlay vs the sidebar boot snapshot', () => {
++  const coldBoot = () =>
++    $desktopBoot.set({ ...$desktopBoot.get(), progress: 10, running: true, visible: true, error: null })
++
++  it('a cold boot with no snapshot still shows CONNECTING', () => {
++    setGatewayState('connecting')
++    coldBoot()
++    render(<GatewayConnectingOverlay />)
++
++    expect(isConnectingShown()).toBe(true)
++  })
++
++  it('a cold boot whose sidebar painted from the snapshot keeps the shell visible', () => {
++    setGatewayState('connecting')
++    coldBoot()
++    $bootSnapshot.set({ ...$bootSnapshot.get(), painted: true })
++    render(<GatewayConnectingOverlay />)
++
++    expect(isConnectingShown()).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/components/gateway-connecting-overlay.tsx b/apps/desktop/src/components/gateway-connecting-overlay.tsx
+index 255f178c87..0b9c5f9b94 100644
+--- a/apps/desktop/src/components/gateway-connecting-overlay.tsx
++++ b/apps/desktop/src/components/gateway-connecting-overlay.tsx
+@@ -9,6 +9,7 @@ import { useI18n } from '@/i18n'
+ import { isOnboardingEnabled } from '@/lib/onboarding-enabled'
+ import { cn } from '@/lib/utils'
+ import { $desktopBoot, type DesktopBootState } from '@/store/boot'
++import { $bootSnapshot } from '@/store/boot-snapshot'
+ import { $gatewaySwitching } from '@/store/gateway-switch'
+ import { $onboardingStateRead } from '@/store/onboarding-gate'
+ import { $introStartExit, $introView } from '@/store/onboarding-intro'
+@@ -48,15 +49,21 @@ function forcedPreview(): boolean {
+ // gateway state back to closed/error while the app reconnects. Do not cover
+ // the chat then — users should still be able to type drafts, open settings,
+ // and recover instead of staring at a modal CONNECTING screen.
+-function isInitialConnect(
++//
++// [daveey] A cold boot whose sidebar already painted from the boot snapshot (hub.db rows / last projects tree) is
++// treated the same way: the shell shows those rows while the backend starts, instead of a blank CONNECTING screen.
++export function isInitialConnect(
+   boot: DesktopBootState,
+   gatewaySwitching: boolean,
+   gatewayState: ConnectionState,
+-  coldBootDone: boolean
++  coldBootDone: boolean,
++  snapshotPainted = false
+ ): boolean {
+   const initialBootActive = boot.visible || boot.running || boot.progress < 100
+ 
+-  return !coldBootDone && !gatewaySwitching && gatewayState !== 'open' && !boot.error && initialBootActive
++  return (
++    !coldBootDone && !snapshotPainted && !gatewaySwitching && gatewayState !== 'open' && !boot.error && initialBootActive
++  )
+ }
+ 
+ interface ConnectingOverlayViewProps {
+@@ -136,7 +143,8 @@ export function GatewayConnectingOverlay() {
+     coldBootDoneRef.current = true
+   }
+ 
+-  const connecting = isInitialConnect(boot, gatewaySwitching, gatewayState, coldBootDoneRef.current)
++  const snapshotPainted = useStore($bootSnapshot).painted
++  const connecting = isInitialConnect(boot, gatewaySwitching, gatewayState, coldBootDoneRef.current, snapshotPainted)
+ 
+   // Latches once we've actually shown the overlay, so the brief frame where
+   // gatewayState flips to "open" (connecting -> false) before the exit phase
+@@ -149,8 +157,13 @@ export function GatewayConnectingOverlay() {
+ 
+   // The first-run intro's `starting` screen is this overlay: it stays up until the backend says
+   // whether the intro runs and, if it does, until the setup chat is open.
++  // A painted boot snapshot means this Desktop has run before (a live backend saved it), so no first-run hold.
+   const introHolds =
+-    !previewing && isMainWindow() && isOnboardingEnabled() && (!onboardingStateRead || introView === 'starting')
++    !previewing &&
++    !snapshotPainted &&
++    isMainWindow() &&
++    isOnboardingEnabled() &&
++    (!onboardingStateRead || introView === 'starting')
+ 
+   // Kick off the exit when connected: real connect, or a faked timer in preview.
+   useEffect(() => {
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index 0f249eb483..d4b6d09834 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -73,6 +73,23 @@ declare global {
+       // a prompt turn leases the backend (early skip for cooperative
+       // retirement; the backend probe is the proof).
+       touchBackend: (profile?: string | null, options?: { activeTurn?: boolean }) => Promise<{ ok: boolean }>
++      // [daveey] Sidebar boot snapshot (Electron main): hub.db session rows + the last projects tree, read once
++      // by the first window so the sidebar paints before the backend is up.
++      bootSnapshot?: {
++        read: () => null | {
++          appStartMs: number
++          hub: null | {
++            available: true
++            gateway: null | string
++            sessions: Record<string, unknown>[]
++            stale: boolean
++            synced_at: null | number
++          }
++          readMs: number
++          tree: null | { activeProjectId: null | string; connectionId: string; savedAt: number; tree: unknown[] }
++        }
++        saveTree: (payload: { activeProjectId: null | string; connectionId: string; tree: unknown[] }) => void
++      }
+       // [daveey] Local transcript cache (Electron main, SQLite). Raw /messages rows keyed by
+       // (connection, profile, stored session id); '' connection means the registry primary.
+       transcriptCache?: {
+diff --git a/apps/desktop/src/main.tsx b/apps/desktop/src/main.tsx
+index ba7996e704..07ba41f2d8 100644
+--- a/apps/desktop/src/main.tsx
++++ b/apps/desktop/src/main.tsx
+@@ -31,6 +31,8 @@ import { installClipboardShim } from './lib/clipboard'
+ import { queryClient } from './lib/query-client'
+ import { installRendererAnimationPauseState } from './lib/renderer-loop-pause'
+ import { installSelectionCopyColorGuard } from './lib/selection-copy-colors'
++import { applyBootSnapshot } from './store/boot-snapshot'
++import { isMainWindow } from './store/windows'
+ import { ThemeProvider } from './themes/context'
+ 
+ installClipboardShim()
+@@ -86,6 +88,12 @@ if (winParam === 'overlay') {
+   // animations stop producing frames when nobody can see them.
+   installRendererAnimationPauseState()
+ 
++  // [daveey] Paint the sidebar from the boot snapshot (hub.db rows + last projects tree) before the
++  // backend is up. Main window only: secondary windows open after boot, against a live backend.
++  if (isMainWindow()) {
++    applyBootSnapshot()
++  }
++
+   createRoot(document.getElementById('root')!).render(
+     <StrictMode>
+       <RootErrorBoundary>
+diff --git a/apps/desktop/src/plugins/hub-sync/api.test.ts b/apps/desktop/src/plugins/hub-sync/api.test.ts
+index 9528784865..a9b9ba1233 100644
+--- a/apps/desktop/src/plugins/hub-sync/api.test.ts
++++ b/apps/desktop/src/plugins/hub-sync/api.test.ts
+@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
+ // probes (each one is an SSH round trip); a live owner list hides them only once it is fresh.
+ 
+ const sdk = vi.hoisted(() => ({
++  down: false,
+   fresh: new Set<string>(),
+   statusCalls: 0,
+   unavailable: [] as string[]
+@@ -17,6 +18,10 @@ vi.mock('@hermes/plugin-sdk', () => ({
+   hubGatewayForConnection: (c: string) => (c === 'local' ? 'macbook' : undefined),
+   hubGet: vi.fn(async (path: string, conn: string) => {
+     if (path.startsWith('/sessions')) {
++      if (sdk.down) {
++        return null
++      }
++
+       return { sessions: [ROW('mini', 's_m'), ROW('hub', 's_h'), ROW('macbook', 's_l')] }
+     }
+ 
+@@ -35,6 +40,7 @@ import { loadReplicaSidebarRows } from './api'
+ 
+ describe('loadReplicaSidebarRows', () => {
+   beforeEach(() => {
++    sdk.down = false
+     sdk.fresh.clear()
+     sdk.statusCalls = 0
+   })
+@@ -56,4 +62,10 @@ describe('loadReplicaSidebarRows', () => {
+ 
+     expect(rows.map(r => r.id)).toEqual(['s_h'])
+   })
++
++  it('answers null (publish nothing) when the replica read has no answer, never an empty list', async () => {
++    sdk.down = true
++
++    expect(await loadReplicaSidebarRows()).toBeNull()
++  })
+ })
+diff --git a/apps/desktop/src/plugins/hub-sync/api.ts b/apps/desktop/src/plugins/hub-sync/api.ts
+index 3a0c60754e..ce9afc8665 100644
+--- a/apps/desktop/src/plugins/hub-sync/api.ts
++++ b/apps/desktop/src/plugins/hub-sync/api.ts
+@@ -59,8 +59,13 @@ export async function replicaCursor(): Promise<null | number> {
+ /**
+  * Status failure invalidates retained lists. Status success cannot repair a
+  * failed owner list: only its next successful sidebar refresh can do that.
++ *
++ * [daveey] null = no answer (backend still starting, hub-sync unavailable): publish nothing, so a failed read never
++ * wipes rows already showing (the cold-start boot snapshot's, or the last good poll's).
+  */
+-export async function loadReplicaSidebarRows(shouldPublish: () => boolean = () => true): Promise<HubSessionRow[]> {
++export async function loadReplicaSidebarRows(
++  shouldPublish: () => boolean = () => true
++): Promise<HubSessionRow[] | null> {
+   const primary = hubReplicaConnectionId()
+ 
+   // The replica read is local and answers in milliseconds; never wait on the reachability probes (each one goes over
+@@ -68,11 +73,11 @@ export async function loadReplicaSidebarRows(shouldPublish: () => boolean = () =
+   void markUnreachableGateways(primary)
+   const result = await hubGet<{ sessions?: HubSessionRow[] }>(`/sessions?limit=${REPLICA_LIMIT}`, primary)
+ 
+-  if (!shouldPublish()) {
+-    return []
++  if (!shouldPublish() || !result || !Array.isArray(result.sessions)) {
++    return null
+   }
+ 
+-  const rows = Array.isArray(result?.sessions) ? result.sessions : []
++  const rows = result.sessions
+   const primaryName = hubGatewayForConnection(primary)
+ 
+   // A live owner list wins over the replica only once it is fresh; until then (a cold start) the replica rows show.
+diff --git a/apps/desktop/src/plugins/hub-sync/plugin.test.ts b/apps/desktop/src/plugins/hub-sync/plugin.test.ts
+index b51e6fbb11..a88974f5a6 100644
+--- a/apps/desktop/src/plugins/hub-sync/plugin.test.ts
++++ b/apps/desktop/src/plugins/hub-sync/plugin.test.ts
+@@ -6,13 +6,23 @@ import plugin from './plugin'
+ // [daveey] The hub-sync Desktop half is a service now: cached sessions flow
+ // into the ordinary sidebar list; it contributes no sidebar section of its own.
+ 
+-const api = vi.hoisted(() => ({ cursor: 1 as null | number, loads: 0 }))
++const api = vi.hoisted(() => ({
++  cursor: 1 as null | number,
++  loads: 0,
++  published: [] as unknown[][],
++  rows: [] as unknown[] | null
++}))
++
++vi.mock('@hermes/plugin-sdk', async importOriginal => ({
++  ...(await importOriginal<object>()),
++  publishOfflineSessions: (rows: unknown[]) => void api.published.push(rows)
++}))
+ 
+ vi.mock('./api', () => ({
+   loadReplicaSidebarRows: vi.fn(async () => {
+     api.loads++
+ 
+-    return []
++    return api.rows
+   }),
+   replicaCursor: vi.fn(async () => api.cursor)
+ }))
+@@ -71,3 +81,29 @@ describe('hub-sync plugin: replica cursor polling (instant loads)', () => {
+     }
+   })
+ })
++
++describe('hub-sync plugin: a failed replica read publishes nothing (cold start)', () => {
++  it('publishes nothing while the read has no answer, and publishes once it does', async () => {
++    vi.useFakeTimers()
++
++    try {
++      api.published = []
++      api.rows = null // backend still starting: hub-sync answers nothing
++      const { ctx, disposers } = fakeContext()
++      plugin.register(ctx as never)
++      await vi.advanceTimersByTimeAsync(0)
++
++      expect(api.published).toEqual([]) // the rows already showing (boot snapshot / last poll) stay
++
++      api.rows = [{ id: 's_mini' }]
++      api.cursor = 99
++      await vi.advanceTimersByTimeAsync(2_000)
++
++      expect(api.published).toEqual([[{ id: 's_mini' }]])
++      disposers.forEach(dispose => dispose())
++    } finally {
++      api.rows = []
++      vi.useRealTimers()
++    }
++  })
++})
+diff --git a/apps/desktop/src/plugins/hub-sync/plugin.tsx b/apps/desktop/src/plugins/hub-sync/plugin.tsx
+index 91113c9879..b02c56c87c 100644
+--- a/apps/desktop/src/plugins/hub-sync/plugin.tsx
++++ b/apps/desktop/src/plugins/hub-sync/plugin.tsx
+@@ -38,7 +38,7 @@ const plugin: HermesPlugin = {
+       try {
+         const records = await loadReplicaSidebarRows(() => !disposed)
+ 
+-        if (!disposed) {
++        if (!disposed && records) {
+           publishOfflineSessions(records)
+         }
+       } catch {
+diff --git a/apps/desktop/src/store/boot-snapshot.test.ts b/apps/desktop/src/store/boot-snapshot.test.ts
+new file mode 100644
+index 0000000000..90641b558f
+--- /dev/null
++++ b/apps/desktop/src/store/boot-snapshot.test.ts
+@@ -0,0 +1,249 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { SessionInfo } from '@/hermes'
++
++import {
++  $bootSessions,
++  $bootSnapshot,
++  $sidebarFallbackSessions,
++  _resetBootSnapshotForTests,
++  applyBootSnapshot,
++  markSidebarFirstRows,
++  markSidebarLive,
++  saveBootTree
++} from './boot-snapshot'
++import { $connectionsRegistry } from './connection-registry-state'
++import { rememberHubGatewayName } from './hub-sync'
++import {
++  $offlineSessions,
++  _resetOfflineSessionsForTests,
++  mergeOfflineFallback,
++  recordSessionListResult
++} from './offline-sessions'
++import { $projectTree } from './project-tree'
++
++// [daveey] Cold start: the first window paints the sidebar from the boot snapshot (hub.db rows of every gateway, this
++// one's included, plus the last projects tree) before the backend is up; live lists replace it per owner.
++
++const NOW_S = 1_800_000_000
++
++const record = (gateway: string, id: string, extra: Record<string, unknown> = {}) => ({
++  activity: NOW_S - 30,
++  gateway,
++  id,
++  key: `default/${id}`,
++  local: gateway === 'macbook',
++  message_count: 4,
++  profile: 'default',
++  source: 'desktop',
++  stale: false,
++  synced_at: NOW_S - 5,
++  title: `Chat ${id}`,
++  version: 1,
++  ...extra
++})
++
++const registry = () =>
++  ({
++    connections: [
++      { id: 'local', kind: 'local', label: 'This device' },
++      { id: 'mac-mini', kind: 'ssh', label: 'Mac Mini' }
++    ],
++    primary: 'local',
++    version: 2
++  }) as never
++
++const snapshot = (over: Record<string, unknown> = {}) => ({
++  appStartMs: 1_000,
++  hub: {
++    available: true as const,
++    gateway: 'macbook',
++    sessions: [record('macbook', 's_own'), record('mini', 's_mini', { running: true })],
++    stale: false,
++    synced_at: NOW_S - 5
++  },
++  readMs: 12,
++  tree: null,
++  ...over
++})
++
++beforeEach(() => {
++  _resetBootSnapshotForTests()
++  _resetOfflineSessionsForTests()
++  $projectTree.set([])
++  $connectionsRegistry.set(null)
++  localStorage.clear()
++})
++
++afterEach(() => {
++  vi.useRealTimers()
++  delete (window as { hermesDesktop?: unknown }).hermesDesktop
++})
++
++describe('applyBootSnapshot', () => {
++  it("shows this gateway's own rows at once, under the replica connection, never as offline", () => {
++    applyBootSnapshot(() => snapshot(), NOW_S * 1000)
++    const own = $bootSessions.get().find(row => row.id === 's_own')!
++
++    expect($bootSnapshot.get().painted).toBe(true)
++    expect(own.connection_id).toBe('local')
++    expect(own.offline_cached).toBe(false)
++    expect(own.title).toBe('Chat s_own')
++  })
++
++  it("shows another gateway's rows once the registry can map its hub name, with its running state", () => {
++    applyBootSnapshot(() => snapshot(), NOW_S * 1000)
++    expect($bootSessions.get().map(row => row.id)).toEqual(['s_own']) // no registry yet: mini is unmapped
++
++    $connectionsRegistry.set(registry())
++    rememberHubGatewayName('mac-mini', 'mini')
++    $connectionsRegistry.set(registry())
++    const mini = $bootSessions.get().find(row => row.id === 's_mini')!
++
++    expect(mini.connection_id).toBe('mac-mini')
++    expect(mini.is_active).toBe(true)
++  })
++
++  it('marks an asleep owner (no publish in the asleep window) as cached and never running', () => {
++    const asleep = snapshot({
++      hub: { ...snapshot().hub, sessions: [record('mini', 's_old', { running: true, synced_at: NOW_S - 3600 })] }
++    })
++
++    $connectionsRegistry.set(registry())
++    rememberHubGatewayName('mac-mini', 'mini')
++    applyBootSnapshot(() => asleep, NOW_S * 1000)
++    const row = $bootSessions.get()[0]
++
++    expect(row.offline_cached).toBe(true)
++    expect(row.is_active).toBe(false)
++  })
++
++  it('seeds the projects tree only while it is empty', () => {
++    applyBootSnapshot(
++      () => snapshot({ tree: { activeProjectId: null, connectionId: 'local', savedAt: 1, tree: [{ id: 'p_saved' }] } }),
++      NOW_S * 1000
++    )
++    expect($projectTree.get()).toEqual([{ id: 'p_saved' }])
++    expect($bootSnapshot.get().treeProjects).toBe(1)
++
++    _resetBootSnapshotForTests()
++    $projectTree.set([{ id: 'p_live' }] as never)
++    applyBootSnapshot(
++      () => snapshot({ tree: { activeProjectId: null, connectionId: 'local', savedAt: 1, tree: [{ id: 'p_saved' }] } }),
++      NOW_S * 1000
++    )
++    expect($projectTree.get()).toEqual([{ id: 'p_live' }])
++  })
++
++  it('paints nothing without the bridge, an empty snapshot, or a failing read', () => {
++    expect(applyBootSnapshot(() => undefined).painted).toBe(false)
++    expect(applyBootSnapshot(() => snapshot({ hub: null, tree: null })).painted).toBe(false)
++    expect(
++      applyBootSnapshot(() => {
++        throw new Error('ipc down')
++      }).painted
++    ).toBe(false)
++    expect($bootSessions.get()).toEqual([])
++  })
++})
++
++describe('boot rows in the sidebar fallback', () => {
++  it('a plugin row of the same identity wins over the boot row', () => {
++    applyBootSnapshot(() => snapshot(), NOW_S * 1000)
++    const pluginRow = { ...$bootSessions.get()[0], title: 'From the plugin poll' } as SessionInfo
++    $offlineSessions.set([pluginRow])
++
++    const fallback = $sidebarFallbackSessions.get()
++
++    expect(fallback.filter(row => row.id === 's_own').map(row => row.title)).toEqual(['From the plugin poll'])
++  })
++
++  it("drops this gateway's boot rows once its own live list is fresh", () => {
++    applyBootSnapshot(() => snapshot(), NOW_S * 1000)
++
++    // Before any live list: the boot rows are the sidebar.
++    expect(mergeOfflineFallback([], $sidebarFallbackSessions.get()).map(row => row.id)).toEqual(['s_own'])
++
++    const live = [{ id: 's_new', profile: 'default', title: 'Live chat' } as SessionInfo]
++    recordSessionListResult([], live, undefined, 'default')
++
++    expect(mergeOfflineFallback(live, $sidebarFallbackSessions.get()).map(row => row.id)).toEqual(['s_new'])
++  })
++})
++
++describe('saveBootTree', () => {
++  it('saves the tree debounced, with no running state, for the next cold start', () => {
++    vi.useFakeTimers()
++
++    const saveTree = vi.fn()
++
++    ;(window as { hermesDesktop?: unknown }).hermesDesktop = { bootSnapshot: { read: () => null, saveTree } }
++    $projectTree.set([{ id: 'p', previewSessions: [{ id: 's', is_active: true }] }] as never)
++
++    saveBootTree('local', 'p')
++    saveBootTree('local', 'p')
++    expect(saveTree).not.toHaveBeenCalled()
++
++    vi.advanceTimersByTime(3_000)
++    expect(saveTree).toHaveBeenCalledTimes(1)
++    expect(saveTree.mock.calls[0][0]).toEqual({
++      activeProjectId: 'p',
++      connectionId: 'local',
++      tree: [{ id: 'p', previewSessions: [{ id: 's', is_active: false }] }]
++    })
++  })
++
++  it('saves the primary as an empty connection id when the owner has none', () => {
++    vi.useFakeTimers()
++
++    const saveTree = vi.fn()
++
++    ;(window as { hermesDesktop?: unknown }).hermesDesktop = { bootSnapshot: { read: () => null, saveTree } }
++
++    saveBootTree(null, null)
++    vi.advanceTimersByTime(3_000)
++
++    expect(saveTree.mock.calls[0][0].connectionId).toBe('')
++  })
++})
++
++describe('[sidebar-timing]', () => {
++  it('writes one line with first rows and first live list, measured from process start', () => {
++    const logLine = vi.fn()
++
++    ;(window as { hermesDesktop?: unknown }).hermesDesktop = { logLine }
++    applyBootSnapshot(() => snapshot(), NOW_S * 1000)
++
++    markSidebarFirstRows(12, false, 1_450)
++    markSidebarFirstRows(40, true, 9_000) // only the first paint counts
++    expect(logLine).not.toHaveBeenCalled()
++
++    markSidebarLive(7_200)
++    markSidebarLive(8_000)
++
++    expect(logLine).toHaveBeenCalledTimes(1)
++    const line = logLine.mock.calls[0][0] as string
++
++    expect(line.startsWith('[sidebar-timing] ')).toBe(true)
++    expect(JSON.parse(line.slice('[sidebar-timing] '.length))).toEqual({
++      firstRowsMs: 450,
++      liveMs: 6_200,
++      readMs: 12,
++      rows: 12,
++      snapshotProjects: 0,
++      snapshotRows: 2,
++      source: 'snapshot'
++    })
++  })
++
++  it('records nothing without a process start time (no snapshot bridge)', () => {
++    const logLine = vi.fn()
++
++    ;(window as { hermesDesktop?: unknown }).hermesDesktop = { logLine }
++
++    markSidebarFirstRows(3, true, 5_000)
++    markSidebarLive(6_000)
++
++    expect(logLine).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/store/boot-snapshot.ts b/apps/desktop/src/store/boot-snapshot.ts
+new file mode 100644
+index 0000000000..0e27bb3c72
+--- /dev/null
++++ b/apps/desktop/src/store/boot-snapshot.ts
+@@ -0,0 +1,235 @@
++/**
++ * [daveey] Sidebar boot snapshot (instant session loads, cold start).
++ *
++ * The first window reads, synchronously from Electron main, this gateway's
++ * hermes-hub replica rows (every gateway's sessions, its own included) and the
++ * last projects tree a live backend answered. They paint the sidebar before
++ * the local backend is up (~6 s on a cold start); live data replaces them per
++ * owner as it arrives:
++ *
++ *  - session rows join the offline fallback inputs (`mergeOfflineFallback`),
++ *    which already drops an owner's fallback rows once its live list is fresh;
++ *  - the tree seeds `$projectTree` only while it is empty, and the first live
++ *    payload replaces it.
++ *
++ * `[sidebar-timing]` reports, once per launch, ms from process start to the
++ * first sidebar rows and to the first live list, and where the rows came from.
++ */
++import { atom, computed } from 'nanostores'
++
++import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
++import type { SessionInfo } from '@/hermes'
++
++import { $connectionsRegistry } from './connection-registry-state'
++import { connectionForHubGateway, hubReplicaConnectionId } from './hub-sync'
++import {
++  $offlineSessions,
++  offlineIdentity,
++  type OfflineReplicaRecord,
++  offlineSessionsFromReplica
++} from './offline-sessions'
++import { $projectTree } from './project-tree'
++
++type BootSnapshotWire = NonNullable<ReturnType<NonNullable<NonNullable<Window['hermesDesktop']>['bootSnapshot']>['read']>>
++
++interface BootState {
++  appStartMs: null | number
++  hubGateway: null | string
++  /** The snapshot gave the sidebar something to show (rows or a tree). */
++  painted: boolean
++  readMs: null | number
++  records: OfflineReplicaRecord[]
++  /** Epoch seconds the snapshot was read: row freshness (asleep) is judged at this moment. */
++  readAtS: number
++  treeProjects: number
++}
++
++const EMPTY: BootState = {
++  appStartMs: null,
++  hubGateway: null,
++  painted: false,
++  readAtS: 0,
++  readMs: null,
++  records: [],
++  treeProjects: 0
++}
++
++export const $bootSnapshot = atom<BootState>(EMPTY)
++
++/** Boot rows as sidebar `SessionInfo`; other gateways' rows resolve once the registry is known. */
++export const $bootSessions = computed([$bootSnapshot, $connectionsRegistry], (boot): SessionInfo[] => {
++  if (!boot.records.length) {
++    return []
++  }
++
++  const own = boot.hubGateway
++
++  return offlineSessionsFromReplica(
++    boot.records,
++    gateway => (gateway === own ? hubReplicaConnectionId() : connectionForHubGateway(gateway)),
++    boot.readAtS,
++    { includeLocal: true }
++  )
++})
++
++/** The sidebar's fallback inputs: the hub-sync plugin's rows, then boot rows it does not have (plugin rows win). */
++export const $sidebarFallbackSessions = computed([$offlineSessions, $bootSessions], (offline, boot): SessionInfo[] => {
++  if (!boot.length) {
++    return offline
++  }
++
++  const have = new Set(offline.map(offlineIdentity))
++  const extra = boot.filter(row => !have.has(offlineIdentity(row)))
++
++  return extra.length ? [...offline, ...extra] : offline
++})
++
++/** Read and apply the snapshot. Main window only; a no-op without the bridge or on any failure. */
++export function applyBootSnapshot(
++  read: () => BootSnapshotWire | null | undefined = () => window.hermesDesktop?.bootSnapshot?.read?.(),
++  nowMs: number = Date.now()
++): BootState {
++  let snap: BootSnapshotWire | null | undefined
++
++  try {
++    snap = read()
++  } catch {
++    snap = null
++  }
++
++  if (!snap) {
++    return $bootSnapshot.get()
++  }
++
++  const records = (snap.hub?.sessions ?? []) as unknown as OfflineReplicaRecord[]
++  const tree = Array.isArray(snap.tree?.tree) ? (snap.tree.tree as SidebarProjectTree[]) : []
++
++  if (tree.length && !$projectTree.get().length) {
++    $projectTree.set(tree)
++  }
++
++  const state: BootState = {
++    appStartMs: snap.appStartMs ?? null,
++    hubGateway: snap.hub?.gateway ?? null,
++    painted: records.length > 0 || tree.length > 0,
++    readAtS: nowMs / 1000,
++    readMs: snap.readMs ?? null,
++    records,
++    treeProjects: tree.length
++  }
++
++  $bootSnapshot.set(state)
++
++  return state
++}
++
++/** Running state is never snapshotted: a boot row must not claim a turn is running from a past launch. */
++const withoutRunning = (tree: readonly SidebarProjectTree[]): unknown[] =>
++  JSON.parse(JSON.stringify(tree, (key, value) => (key === 'is_active' ? false : value)))
++
++const SAVE_DEBOUNCE_MS = 3_000
++let saveTimer: ReturnType<typeof setTimeout> | undefined
++
++/** Save the live tree for the next cold start (debounced; trees refresh on every sessions.changed). */
++export function saveBootTree(connectionId: null | string, activeProjectId: null | string): void {
++  const save = window.hermesDesktop?.bootSnapshot?.saveTree
++
++  if (!save) {
++    return
++  }
++
++  clearTimeout(saveTimer)
++  saveTimer = setTimeout(() => {
++    try {
++      save({ activeProjectId, connectionId: connectionId ?? '', tree: withoutRunning($projectTree.get()) })
++    } catch {
++      // best effort: the next cold start just paints from hub rows only
++    }
++  }, SAVE_DEBOUNCE_MS)
++}
++
++// ── [sidebar-timing] ────────────────────────────────────────────────────────
++
++interface SidebarTiming {
++  firstRowsMs?: number
++  liveMs?: number
++  rows?: number
++  source?: 'live' | 'snapshot'
++}
++
++const timing: SidebarTiming = {}
++let timingWritten = false
++
++const sinceStart = (nowMs: number) => {
++  const start = $bootSnapshot.get().appStartMs
++
++  return start ? Math.round(nowMs - start) : null
++}
++
++function writeTimingIfDone(): void {
++  if (timingWritten || timing.firstRowsMs === undefined || timing.liveMs === undefined) {
++    return
++  }
++
++  timingWritten = true
++  const boot = $bootSnapshot.get()
++
++  const line = `[sidebar-timing] ${JSON.stringify({
++    ...timing,
++    readMs: boot.readMs,
++    snapshotRows: boot.records.length,
++    snapshotProjects: boot.treeProjects
++  })}`
++
++  try {
++    console.info(line)
++    window.hermesDesktop?.logLine?.(line)
++  } catch {
++    // logging must never break the sidebar
++  }
++}
++
++/** The sidebar drew rows for the first time this launch. */
++export function markSidebarFirstRows(rows: number, live: boolean, nowMs: number = Date.now()): void {
++  if (timing.firstRowsMs !== undefined || rows <= 0) {
++    return
++  }
++
++  const ms = sinceStart(nowMs)
++
++  if (ms === null) {
++    return
++  }
++
++  timing.firstRowsMs = ms
++  timing.rows = rows
++  timing.source = live ? 'live' : 'snapshot'
++  writeTimingIfDone()
++}
++
++/** The first live session list landed this launch. */
++export function markSidebarLive(nowMs: number = Date.now()): void {
++  if (timing.liveMs !== undefined) {
++    return
++  }
++
++  const ms = sinceStart(nowMs)
++
++  if (ms === null) {
++    return
++  }
++
++  timing.liveMs = ms
++  writeTimingIfDone()
++}
++
++/** Test seam. */
++export function _resetBootSnapshotForTests(): void {
++  clearTimeout(saveTimer)
++  $bootSnapshot.set(EMPTY)
++  delete timing.firstRowsMs
++  delete timing.liveMs
++  delete timing.rows
++  delete timing.source
++  timingWritten = false
++}
+diff --git a/apps/desktop/src/store/offline-session-owner.ts b/apps/desktop/src/store/offline-session-owner.ts
+index 1beb3ece8e..4861b3eba4 100644
+--- a/apps/desktop/src/store/offline-session-owner.ts
++++ b/apps/desktop/src/store/offline-session-owner.ts
+@@ -1,13 +1,14 @@
+ import type { SessionInfo } from '@/hermes'
+ 
+-import { $offlineSessions, mergeOfflineFallback, offlineIdentity } from './offline-sessions'
++import { $sidebarFallbackSessions } from './boot-snapshot'
++import { mergeOfflineFallback, offlineIdentity } from './offline-sessions'
+ import { $sessions, sessionMatchesStoredId } from './session'
+ 
+ /** Resolve the clicked owner, never the first cached row sharing a bare id.
+  * Use the sidebar's effective rows so reconnect wins even before the cache poll.
+  */
+ export function sessionActionRow(storedSessionId: string, selectedRow?: SessionInfo): SessionInfo | undefined {
+-  const effective = mergeOfflineFallback($sessions.get(), $offlineSessions.get())
++  const effective = mergeOfflineFallback($sessions.get(), $sidebarFallbackSessions.get())
+   const matches = effective.filter(row => sessionMatchesStoredId(row, storedSessionId))
+ 
+   if (selectedRow) {
+diff --git a/apps/desktop/src/store/offline-sessions.ts b/apps/desktop/src/store/offline-sessions.ts
+index 1c24843ac2..1f025bfe74 100644
+--- a/apps/desktop/src/store/offline-sessions.ts
++++ b/apps/desktop/src/store/offline-sessions.ts
+@@ -156,7 +156,9 @@ export function recordSessionListResult(
+ export function offlineSessionsFromReplica(
+   records: readonly OfflineReplicaRecord[],
+   connectionForGateway: (gateway: string) => string | undefined,
+-  nowS: number = Date.now() / 1000
++  nowS: number = Date.now() / 1000,
++  // [daveey] The cold-start boot snapshot also shows this gateway's own (`local`) rows until its live list arrives.
++  { includeLocal = false }: { includeLocal?: boolean } = {}
+ ): SessionInfo[] {
+   // Read lazily: callers that mock @/lib/session-source never reach the conversion.
+   const excluded = new Set<string>(SIDEBAR_EXCLUDED_SOURCES)
+@@ -186,7 +188,7 @@ export function offlineSessionsFromReplica(
+   for (const record of byId.values()) {
+     const connectionId = connectionForGateway(record.gateway)
+ 
+-    if (connectionId && isRecentsEligible(record, excluded) && !superseded.has(record)) {
++    if (connectionId && isRecentsEligible(record, excluded, includeLocal) && !superseded.has(record)) {
+       out.push(rowFromRecord(record, connectionId, lineageOf(record, parentOf), nowS))
+     }
+   }
+@@ -200,11 +202,11 @@ const recordKey = (record: OfflineReplicaRecord, id: string) =>
+ const isCompressionAncestor = (record: OfflineReplicaRecord) => record.end_reason === 'compression'
+ 
+ /** The normal recents rule: no excluded source, not empty/archived/hidden, has a title. */
+-function isRecentsEligible(record: OfflineReplicaRecord, excluded: ReadonlySet<string>): boolean {
++function isRecentsEligible(record: OfflineReplicaRecord, excluded: ReadonlySet<string>, includeLocal: boolean): boolean {
+   const source = normalizeSessionSource(record.source)
+ 
+   return !(
+-    record.local ||
++    (record.local && !includeLocal) ||
+     record.archived ||
+     record.hidden ||
+     (source && excluded.has(source)) ||
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index cf2c551a57..650d9b8c8f 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -75,6 +75,7 @@ export const $projects = atom<ProjectInfo[]>([])
+ 
+ // The atom itself lives in ./project-tree (a leaf); re-exported here so every
+ // existing import path keeps working — projects.ts remains its only writer.
++import { saveBootTree } from './boot-snapshot'
+ import { $projectTree } from './project-tree'
+ export { $projectTree }
+ export const $activeProjectId = atom<null | string>(null)
+@@ -638,6 +639,8 @@ function applyProjectTreePayload(res: ProjectTreePayload, owner: ProjectRowOwner
+     )
+   )
+   $activeProjectId.set(res.active_id ?? null)
++  // [daveey] The next cold start paints this tree before the backend is up.
++  saveBootTree(owner.connectionId, res.active_id ?? null)
+   const tombstones = $removedSessionIds.get()
+ 
+   if (tombstones.size) {
+-- 
+2.55.0
+

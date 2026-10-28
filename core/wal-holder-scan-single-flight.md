@@ -4,6 +4,7 @@ Patches:
 
 - `patches/0550-perf-state-cache-clean-macOS-deleted-WAL-holder-scan.patch` (cache plus a first lock)
 - `patches/0551-fix-state-one-deleted-WAL-holder-scan-in-flight-per-.patch` (shared pass, deadline, identity-keyed cache)
+- `patches/0574-fix-state-darwin-holder-scan-caches-clean-verdicts-b.patch` (race fix: clean verdicts are cached before the pass leaves flight)
 
 Before every `state.db` open, `refuse_deleted_wal_generation` checks that no process still holds a deleted
 `-wal` / `-shm` generation. On macOS that check walks every pid's descriptors through libproc (`ctypes`). Each call
@@ -78,9 +79,21 @@ is taken before the walk, so a change during the walk makes the entry miss next 
 Untested: behavior under real GIL contention in a running Desktop backend. The tests drive the walk with a fake
 enumeration.
 
+## Race fix (0574, source `d563fb1463`)
+
+A caller that missed the clean cache and then found no pass in flight started a second libproc pass: the finished
+pass cleared `_DARWIN_SCAN_IN_FLIGHT` before any waiter had cached its verdict. Now each joiner registers its
+`(key, watched)` in `scan.watchers`; the pass, still holding `_DARWIN_SCAN_LOCK`, records a clean verdict for every
+registered waiter (only if it neither errored nor expired) and then clears the slot. `_join_darwin_fd_scan(base, key,
+watched)` re-checks the cache under that lock and returns the `_DARWIN_SCAN_CACHED` sentinel when a verdict appeared.
+`_darwin_holders` is the shared holder filter. Test: `tests/hermes_state/test_state_db_darwin_fd_scan_hang.py::
+test_caller_arriving_after_pass_but_before_cache_write_reuses_it` (deterministic; the older single-flight test failed 1
+in 3 to 2 in 8 runs before, 0 in 15 after). That file passes on the mirror host (68 passed across the three files
+checked for 0572-0574). Gotcha: a pass that errors or expires still caches nothing.
+
 ## Apply
 
-`git am core/patches/0550-*.patch core/patches/0551-*.patch`. Takes effect when the backend or gateway restarts.
+`git am core/patches/0550-*.patch core/patches/0551-*.patch core/patches/0574-*.patch`. Takes effect when the backend or gateway restarts.
 
 ## Gotchas
 

@@ -1,0 +1,102 @@
+From 51ae32d755e632641c43b302a9a941862460109d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:26:36 -0700
+Subject: [PATCH] fix(terminal): graceful exit kill waits for spawns not yet
+ registered [daveey]
+
+test_exit_cleanup_kills_foreground_command_still_running flaked on loaded EC2
+runners (gwgen3 run 40582043662; gwgen4-3 run 40615214781, passed on retry).
+
+Five whys:
+1. Why did the sleep survive? kill_live_foreground_processes() signalled
+   nothing, and nothing was logged: 3458007706 made a raising kill log at
+   WARNING, and the failure's captured logs were empty.
+2. Why nothing signalled? The kill path can't refuse the live leader on Linux
+   (/proc start ticks since boot don't drift), so the registry snapshot was empty.
+3. Why empty while the child ran? execute() publishes the child to
+   _live_foreground only after _run_bash returns (Popen, start-time read,
+   stdin pipe). The child is already running inside that window, and a busy
+   6-worker runner can widen it.
+4. Why did the exit kill not wait? Only the now=True path waited on
+   _spawns_in_flight. The graceful path, which every process-exit funnel
+   (gateway shutdown, terminal atexit, compute host) uses, snapshotted
+   right away. That also orphans a real command started just before exit.
+5. Why not caught? The test polled for the child process as a stand-in for
+   "registered", and the window only opens under load. No test held the
+   window open.
+
+Fix: the graceful path waits (bounded 5 s, no fence) for in-flight spawns to
+register before snapshotting. New test holds a spawn between Popen and
+registration. It fails before the fix (Mac + Linux) and passes after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/tools/test_local_interrupt_cleanup.py | 32 +++++++++++++++++++++
+ tools/environments/base.py                  |  4 +++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/tests/tools/test_local_interrupt_cleanup.py b/tests/tools/test_local_interrupt_cleanup.py
+index 77a66379ae..efd6fba406 100644
+--- a/tests/tools/test_local_interrupt_cleanup.py
++++ b/tests/tools/test_local_interrupt_cleanup.py
+@@ -332,3 +332,35 @@ def test_failed_exit_cleanup_kill_is_logged_as_a_warning(monkeypatch, caplog):
+         assert base.kill_live_foreground_processes() == 1
+     assert any(r.levelname == "WARNING" and "exit-time kill" in r.getMessage() and r.exc_info
+                for r in caplog.records), caplog.text
++
++
++def test_exit_cleanup_waits_for_a_spawn_not_yet_registered(monkeypatch):
++    """The child runs before ``execute`` publishes it to ``_live_foreground`` (Popen returns, then
++    the start-time read, then registration). A loaded host can exit inside that window; the
++    graceful kill must wait for the spawn to land instead of snapshotting an empty registry."""
++    from tools.environments import base
++
++    released = threading.Event()
++    real_run_bash = LocalEnvironment._run_bash
++
++    def _slow_to_return(self, *a, **kw):
++        proc = real_run_bash(self, *a, **kw)
++        released.wait(10.0)  # child is live, not yet registered
++        return proc
++
++    monkeypatch.setattr(LocalEnvironment, "_run_bash", _slow_to_return)
++    env = LocalEnvironment(cwd="/tmp")
++    threading.Thread(target=lambda: env.execute("sleep 3518", timeout=600), daemon=True).start()
++    try:
++        deadline = time.monotonic() + 20.0
++        while (proc := _descendant_running("sleep 3518")) is None and time.monotonic() < deadline:
++            time.sleep(0.05)
++        assert proc is not None, "test setup: foreground sleep never started"
++        pgid = os.getpgid(proc.pid)
++        threading.Timer(0.3, released.set).start()
++
++        assert base.kill_live_foreground_processes() == 1
++        assert _wait_for_pgid_exit(pgid, timeout=15.0), _process_group_snapshot(pgid)
++    finally:
++        released.set()
++        env.cleanup()
+diff --git a/tools/environments/base.py b/tools/environments/base.py
+index 9e20750cf8..da1ee6f7ad 100644
+--- a/tools/environments/base.py
++++ b/tools/environments/base.py
+@@ -63,6 +63,7 @@ _live_foreground_cond = threading.Condition(threading.RLock())
+ _exit_fenced = False  # one-way, set by the hard-exit kill: no foreground command spawns after it
+ _spawns_in_flight = 0  # past the fence check, child maybe alive, not yet in _live_foreground
+ _HARD_KILL_BUDGET_S = 0.5
++_GRACEFUL_SPAWN_WAIT_S = 5.0  # a spawn is Popen + a /proc read; this only bounds a wedged one
+ 
+ 
+ def _enter_foreground_spawn() -> bool:
+@@ -103,6 +104,9 @@ def kill_live_foreground_processes(*, now: bool = False) -> int:
+     global _exit_fenced
+     if not now:
+         with _live_foreground_cond:
++            # A spawn past the fence check already has a live child that is not yet registered; a
++            # snapshot taken now would miss it and orphan its tree. No fence here: callers may go on.
++            _live_foreground_cond.wait_for(lambda: _spawns_in_flight == 0, _GRACEFUL_SPAWN_WAIT_S)
+             live = list(_live_foreground.values())
+         for env, proc in live:
+             # A failed kill here orphans the command's tree to init, so it must leave a trace. The
+-- 
+2.55.0
+
