@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [serve-update-wait.md](serve-update-wait.md) | 0697 | `hermes serve` waits out a live core update (600 s) or hermes-sync's admission hold (60 s) before loading the agent, so no backend boots on a tree about to be swapped. |
 | [kanban-delegate-child-terminal-isolation.md](kanban-delegate-child-terminal-isolation.md) | 0692 | Delegate children keep their own terminal env; `--board` works from worker shells; `boards list` counts each board. |
 | [kanban-blocked-create-needs-input.md](kanban-blocked-create-needs-input.md) | 0693 | A card created blocked with a human_request is classified `needs_input`. |
 | [pm-range-server-threaded.md](pm-range-server-threaded.md) | 0694 | Test range server is threaded so a paused download stops in 0.04 s, not 3.7 s. |
