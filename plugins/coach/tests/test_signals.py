@@ -104,6 +104,26 @@ def test_library_warning_traceback_is_not_a_defect_but_ours_is():
     assert len(sg.parse_errors(rec("ERROR", "mcp.os.posix.utilities", lib))) == 1
 
 
+def test_api_worker_stream_error_carries_its_session_id():
+    """agent-1572c64e24: the API worker thread's "Streaming failed before delivery" traceback filed with an
+    empty session id, so the self-heal card could not link the session. Core now tags the worker thread's log
+    lines with the caller's session (agent/chat_completion_helpers._context_thread_target); the signal row
+    must carry that id."""
+    lib = "/home/you/.hermes/installs/x/venv/lib/python3.14/site-packages/openai/_base_client.py"
+    own = "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py"
+    lines = ["2026-10-27 22:00:17,031 ERROR [20261027_220000_5326d3] agent.chat_completion_helpers: "
+             "Streaming failed before delivery: Error code: 400",
+             "Traceback (most recent call last):",
+             f'  File "{own}", line 3640, in _call',
+             "    stream = request_client.chat.completions.create(**stream_kwargs)",
+             f'  File "{lib}", line 1070, in request',
+             "    raise self._make_status_error_from_response(err.response) from None",
+             "openai.BadRequestError: Error code: 400 - {'error': {'message': 'claude-opus-5-5 is not a valid "
+             "model ID', 'code': 400}}"]
+    rows = sg.parse_errors(lines)
+    assert [r["session_id"] for r in rows] == ["20261027_220000_5326d3"]
+
+
 def test_process_exit_scheduling_traceback_is_not_a_defect():
     """agent-9a2a3cc05d: a turn finishing while the backend exits logs CPython's shutdown refusal from our own
     frames (pre_final_gate). That is exit noise, not a defect; any other RuntimeError there still files."""
