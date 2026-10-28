@@ -393,6 +393,32 @@ def test_run_with_foreign_request_id_is_refused(env):
     assert code_of(lambda: env.domain.reconcile(job_id))[1] == 'run_request_mismatch'
 
 
+def test_run_title_not_yet_rendered_is_retryable_not_a_conflict(env):
+    # Live G canary: one early reconcile of a just-dispatched run returned a title without the
+    # request token. Until the run is complete that is "not yet known", not a foreign run.
+    job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    rid = env.domain.details(job_id)['job']['request_id']
+    env.github.runs['9001']['display_title'] = 'runners canary'
+    with pytest.raises(J.JobError) as exc:
+        env.domain.reconcile(job_id)
+    assert exc.value.error() == dict(code='dependency_unavailable', retryable=True, reason_code='run_title_pending')
+    assert env.domain.details(job_id)['job']['status'] != 'concluded'
+    env.github.runs['9001'].update(display_title='runners canary [%s]' % rid, status='in_progress')
+    assert env.domain.reconcile(job_id)['data']['provider_run_id'] == '9001'
+
+
+def test_completed_run_without_request_token_is_still_a_conflict(env):
+    job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    env.github.runs['9001'].update(display_title='runners canary', status='completed', conclusion='success')
+    assert code_of(lambda: env.domain.reconcile(job_id)) == ('owner_conflict', 'run_request_mismatch')
+
+
+def test_in_progress_run_with_foreign_request_id_is_a_conflict(env):
+    job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
+    env.github.runs['9001'].update(display_title='x [request_%s]' % ('0' * 32), status='queued')
+    assert code_of(lambda: env.domain.reconcile(job_id)) == ('owner_conflict', 'run_request_mismatch')
+
+
 def test_retry_attempts_and_crashed_winner_need_a_new_request(env):
     job_id = env.domain.submit(env.request(), principal=PRINCIPAL)['data']['id']
     old_rid = env.domain.details(job_id)['job']['request_id']
