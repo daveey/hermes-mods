@@ -580,6 +580,29 @@ def test_write_file_of_py_reading_data_file_allows(tmp_path):
 
 
 @pytest.mark.parametrize("fmt", [
+    "sudo {p}",
+    "sudo -E {p}",
+    "sudo -u root {p}",
+    "cd {d} && sudo ./burn.sh",
+    "env {p}",
+    "env FOO=1 {p}",
+    "env -i FOO=1 BAR=2 {p}",
+])
+def test_sudo_env_wrapped_argv0_blocks(tmp_path, fmt):
+    p = tmp_path / "burn.sh"
+    p.write_text(BURN_SH)
+    p.chmod(0o755)
+    r = run("terminal", {"command": fmt.format(p=p, d=tmp_path), "workdir": str(tmp_path)})
+    assert r and r["action"] == "block", fmt
+
+
+@pytest.mark.parametrize("fmt", ["sudo cat {t}", "env FOO=1 grep x {t}", "sudo -u root head {t}"])
+def test_sudo_env_wrapped_reader_allows(tmp_path, fmt):
+    t = _data_txt(tmp_path)
+    assert run("terminal", {"command": fmt.format(t=t), "workdir": str(tmp_path)}) is None, fmt
+
+
+@pytest.mark.parametrize("fmt", [
     "git bisect run {p}",
     "git bisect run bash {p}",
     "xargs {p}",

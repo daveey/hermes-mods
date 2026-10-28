@@ -74,7 +74,9 @@ PY_FILE_RE = re.compile(
 # A quote still counts as a boundary so `terminal('"/abs/x" &')` inside execute_code is
 # found. A path that is only an argument of a reader is dropped later, not here.
 CMD_POS_RE = re.compile(
-    r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*)\s+)*"
+    r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*"
+    # sudo [-E] [-u user] /x and env [-i] [VAR=val ...] /x run /x as argv0.
+    r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s/.~-]\S*|\s+-[-\w=]+)*|env(?:\s+-[-\w=]+)*(?:\s+\w+=\S*)*)\s+)*"
     r"(?:'((?:~|\.{1,2})?/[^']+)'|\"((?:~|\.{1,2})?/[^\"]+)\"|((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+))"
 )
 # Operands that a command hands to exec: `git bisect run ./x`, `xargs ./x`, `find . -exec ./x {} \;`.
