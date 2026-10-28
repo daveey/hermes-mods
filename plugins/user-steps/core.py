@@ -1007,6 +1007,11 @@ def validate_admission_text(value):
         raise ActionError('Decision text must be sanitized before recording')
 
 
+# A decision recorded while its session is mid-turn: the runtime refuses admission until the turn ends. The
+# dashboard's background retrier and the Desktop row both re-dispatch the SAME operation until it lands.
+BUSY_ERROR = 'Session is busy with another turn; this decision is delivered automatically when it ends.'
+
+
 class ActionStore:
     """SQLite FULL-sync transaction commits decision + frozen delivery intent before dispatch.
 
@@ -1204,13 +1209,14 @@ class ActionStore:
             c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
         receipt = None
         confirmed = False
+        busy = False
         try:
             if receiver is None: raise RuntimeError('No durable delivery receiver configured')
             receipt = receiver.deliver(op)
             confirmed = bool(receiver.readback(op, receipt))
-        except Exception:
-            # Never expose credentials, receiver URLs or raw transport bodies.
-            pass
+        except Exception as exc:
+            # Never expose credentials, receiver URLs or raw transport bodies: only classify.
+            busy = 'session is busy' in str(exc).lower()
         with self._tx() as c:
             result = self._operation(c, owner, oid); op = result['operation']
             # A slow failed retry cannot downgrade a concurrently confirmed delivery.
@@ -1226,7 +1232,7 @@ class ActionStore:
                 c.execute('UPDATE requests SET state=?,resolution=? WHERE namespace=? AND id=? AND revision=?',
                           (state, _json(resolution), self._ns(owner), op['requestId'], op['revision']))
             else:
-                op.update(dispatchState='failed', error='Delivery unconfirmed; retry the same idempotency key.')
+                op.update(dispatchState='failed', error=BUSY_ERROR if busy else 'Delivery unconfirmed; retry the same idempotency key.')
             c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
             return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
@@ -1236,12 +1242,13 @@ class ActionStore:
                       if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')}
             return list(owners.values())
 
-    def reconcile(self, owner, receiver):
+    def reconcile(self, owner, receiver, *, max_attempts=None):
         with self._tx() as c:
             ids = [row['id'] for row in c.execute(
                 'SELECT id,body FROM operations WHERE namespace=? AND session=? ORDER BY rowid',
                 (self._ns(owner), owner['storedSessionId']))
-                if json.loads(row['body'])['dispatchState'] not in ('delivered', 'cancelled')]
+                if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')
+                and (max_attempts is None or op.get('attempts', 0) < max_attempts)]
         return [self.dispatch(owner, oid, receiver) for oid in ids]
 
     def migrate_step(self, owner, step):

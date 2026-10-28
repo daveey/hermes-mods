@@ -374,3 +374,27 @@ test('panel minimizes to one header line, stays minimized across remount, and re
  assert.equal(el().querySelectorAll('[data-action-request]').length,2,'expand restores body')
  await show(null);delete window.hermesDesktop;window.localStorage.clear()
 })
+
+test('busy session: approve collapses the row, auto-retries the same operation until delivered, then confirms',async()=>{
+ m.autoRetry && (m.autoRetry.ms=20)
+ const r=freshRequest(); const calls=[]; let delivered=false
+ const busyOp={operationId:'busy-op',dispatchState:'failed',error:'Session is busy with another turn; this decision is delivered automatically when it ends.'}
+ const resolved={...r,state:'resolved',resolution:{choiceId:'yes',operationId:'busy-op',revision:1}}
+ const call=async(path,opts={})=>{calls.push([path,opts])
+  if(path.includes('/retry')){delivered=true;return {}}
+  if(opts.method==='POST') return {operation:busyOp,request:{...r,resolution:{choiceId:'yes',operationId:'busy-op',revision:1}}}
+  return delivered?{operation:{...busyOp,dispatchState:'delivered',error:undefined},request:resolved}:{operation:busyOp,request:{...r,resolution:{choiceId:'yes',operationId:'busy-op',revision:1}}}}
+ await show(React.createElement(m.DecisionRow,{key:'busy',request:r,route,call}))
+ assert.ok(el().querySelector('[data-action-scope]'),'plan shown before deciding')
+ await click('Approve')
+ assert.match(el().textContent,/session is busy/i)
+ assert.equal(el().querySelector('[data-action-scope]'),null,'plan collapses once decided')
+ assert.doesNotMatch(el().textContent,/≤4 GiB RAM/)
+ await React.act(async()=>{await new Promise(res=>setTimeout(res,80))})
+ const retries=calls.filter(([p])=>p.includes('/retry'))
+ assert.equal(retries.length,1,'one automatic retry of the same operation')
+ assert.match(retries[0][0],/operations\/busy-op\/retry/)
+ assert.equal(calls.filter(([p,o])=>o.method==='POST'&&p.includes('/decisions')).length,1,'no second decision')
+ assert.match(el().textContent,/Confirmed/)
+ m.autoRetry && (m.autoRetry.ms=15000)
+})

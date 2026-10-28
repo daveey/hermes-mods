@@ -10,7 +10,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 10
+const VERSION = 11
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -702,6 +702,14 @@ function saveReadback(route, request) {
   }
 }
 
+// A decision recorded while its session is mid-turn fails delivery ("busy"). The row retries the SAME operation on a
+// timer until it lands, so an Approve never sits waiting for a manual Retry. Tests shorten the interval.
+export const autoRetry = { ms: 15_000 }
+const sessionBusy = op => /busy/i.test(str(op?.error))
+const failedText = op => sessionBusy(op)
+  ? 'Decision recorded. The session is busy with another turn; it is delivered automatically when that turn ends.'
+  : 'Decision recorded; delivery unconfirmed. Work may have started. Retrying automatically with the same operation.'
+
 export function DecisionRow({ request, route, call = api, unavailable = false }) {
   const key = `${routeKey(route)}:${requestKey(request)}`
   const [state, setState] = useState(() => {
@@ -743,7 +751,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     const status = operationState(data.operation)
     if (['delivered','cancelled'].includes(status) && data.request.resolution?.operationId !== operationId(data.operation)) throw Error('Delivery not yet confirmed by request readback')
     if (status === 'cancelled' && data.request.state !== 'cancelled') throw Error('Cancellation not yet confirmed by request readback')
-    update({ request: data.request, operation: data.operation, phase: status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? 'Decision recorded; delivery unconfirmed. Work may have started. Retry uses the same operation.' : '' })
+    update({ request: data.request, operation: data.operation, phase: status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? failedText(data.operation) : '' })
     if (['delivered','cancelled'].includes(status)) { try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {} }
     saveReadback(route, data.request)
   }
@@ -829,6 +837,12 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
       update({ phase: 'unknown', error: `Outcome unknown: ${e.message}. Check status or retry safely.` })
     }
   }
+  const failedId = state.phase === 'failed' ? operationId(state.operation) : null
+  useEffect(() => {
+    if (!failedId || unavailable) return
+    const t = setInterval(() => { if (live.current && currentRoute(route) && operations.get(key)?.phase === 'failed') void send(null, true) }, autoRetry.ms)
+    return () => clearInterval(t)
+  }, [failedId, unavailable, key])
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
   // Pre-v2 migrations stored one placeholder choice; it is agent work, never a user-facing control.
@@ -840,16 +854,16 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     ? 'Agent completion pending — the agent must provide the full exact plan and approvable action. Work stays blocked; no action is needed from you.'
     : 'Agent completion pending — the agent must provide the complete step. Work stays blocked; no action is needed from you.')
     : question && !shown.length ? 'Answer in chat — this question closes once your reply is recorded there. No permission is granted.' : ''
-  const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
+  const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: sessionBusy(state.operation) ? 'Decision recorded; waiting for the session to finish its current turn.' : 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
   return jsxs('article', { 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
     jsx('h3', { style: { margin: '4px 0 0', fontSize: 14, overflowWrap: 'anywhere' }, children: r.title }),
     jsx('small', { style: { color: 'var(--muted-foreground)', fontSize: 11 }, children: `Revision ${r.revision}` }),
-    jsx('h4', { style: sectionLabel, children: 'Read this' }),
-    jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) }),
-    !!r.limits?.length && jsxs('div', { children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] }),
-    !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] }),
-    jsx('h4', { style: { ...sectionLabel, paddingTop: 10, borderTop: '1px solid var(--border)' }, children: 'Your decision' }),
-    jsx('div', { style: { ...planStyle, lineHeight: 1.5 }, children: shown.map(c => r.outcomes?.[c.effect] && jsxs('div', { 'data-decision-outcome': '', children: [jsx('strong', { children: `${choiceLabel(c, choices, r.kind)}: ` }), jsx(MessageTextContent, { media: false, text: `${c.label}. ${r.outcomes[c.effect]}` })] }, c.id)) }),
+    !locked && jsx('h4', { style: sectionLabel, children: 'Read this' }),
+    !locked && jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) }),
+    !locked && !!r.limits?.length && jsxs('div', { children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] }),
+    !locked && !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] }),
+    !locked && jsx('h4', { style: { ...sectionLabel, paddingTop: 10, borderTop: '1px solid var(--border)' }, children: 'Your decision' }),
+    !locked && jsx('div', { style: { ...planStyle, lineHeight: 1.5 }, children: shown.map(c => r.outcomes?.[c.effect] && jsxs('div', { 'data-decision-outcome': '', children: [jsx('strong', { children: `${choiceLabel(c, choices, r.kind)}: ` }), jsx(MessageTextContent, { media: false, text: `${c.label}. ${r.outcomes[c.effect]}` })] }, c.id)) }),
     !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', 'data-agent-completion-pending': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
     jsx('div', { role: 'status', 'aria-live': 'polite', children: phaseText }),
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : r.outcomes?.[selected.effect] || ''}` }),
@@ -906,7 +920,7 @@ export function ActionQueue() {
     ] }),
     !minimized && snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
     !minimized && requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
-    !minimized && jsx('div', { onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
+    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
   ] })
 }
 

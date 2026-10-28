@@ -278,3 +278,50 @@ def test_registered_producer_revise_and_consumer_hook(tmp_path, monkeypatch):
     assert revised['revision'] == 2
     assert op['operationId'] not in plugin.pre_llm_call(session_id='session-a', platform='desktop')['context']
     assert 'error' in json.loads(plugin.publish_action_request({'request':dict(payload, owner=OWNER)}, session_id='session-a'))
+
+
+class BusyReceiver:
+    """Models the owning runtime refusing admission while the session is mid-turn."""
+    def __init__(self): self.busy = True; self.delivered = []
+    def deliver(self, operation):
+        if self.busy:
+            raise RuntimeError('exact session is busy or has pending input; retry later with the same operation')
+        self.delivered.append(operation['operationId'])
+        return {'deliveryId': operation['operationId']}
+    def readback(self, operation, receipt):
+        return receipt['deliveryId'] in self.delivered
+
+
+def test_busy_session_is_classified_and_background_retry_delivers_same_operation(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    api = load_module('decisions_api_busy', ROOT / 'dashboard' / 'plugin_api.py')
+    s = store(tmp_path); r = s.create(OWNER, request())
+    receiver = BusyReceiver()
+    router = api.create_router(ledger_dir=tmp_path / 'ledger', state_db=tmp_path / 'state.db', action_store=s,
+                               owner_resolver=lambda session: dict(OWNER, storedSessionId=session), receiver=receiver)
+    app = FastAPI(); app.include_router(router); client = TestClient(app)
+    body = dict(session='session-a', expectedRevision=1, choiceId='approve', idempotencyKey='busy')
+    first = client.post('/requests/' + r['requestId'] + '/decisions', json=body).json()
+    assert first['operation']['dispatchState'] == 'failed'
+    assert first['operation']['error'] == core.BUSY_ERROR
+    assert first['request']['state'] == 'open'
+    assert router.retry_pending() == 1  # still busy: attempted, stays failed
+    assert s.operation(OWNER, key='busy')['operation']['dispatchState'] == 'failed'
+    receiver.busy = False  # the session's turn ended
+    assert router.retry_pending() == 1
+    done = s.operation(OWNER, key='busy')
+    assert done['operation']['dispatchState'] == 'delivered'
+    assert done['operation']['operationId'] == first['operation']['operationId']
+    assert done['request']['state'] == 'resolved'
+    assert receiver.delivered == [first['operation']['operationId']]
+    assert router.retry_pending() == 0  # nothing left to deliver
+
+
+def test_reconcile_stops_after_max_attempts(tmp_path):
+    s = store(tmp_path); r = s.create(OWNER, request())
+    op = s.decide(OWNER, decision(r))['operation']
+    receiver = BusyReceiver()
+    for _ in range(3): s.dispatch(OWNER, op['operationId'], receiver)
+    assert s.reconcile(OWNER, receiver, max_attempts=3) == []
+    assert len(s.reconcile(OWNER, receiver, max_attempts=4)) == 1

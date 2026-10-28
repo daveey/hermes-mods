@@ -5,8 +5,11 @@ from server configuration, never a payload. The optional owner_resolver is a ser
 integration seam for authenticated connection principals, not an HTTP parameter.
 Legacy reads remain passive; generic resolve is intentionally gone (410).
 """
+import contextvars
 import importlib.util
+import os
 import sys
+import time
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -18,6 +21,9 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
 
 API_VERSION = 2
+# Background re-delivery of decisions refused because the session was mid-turn. ~1h of attempts, then manual Retry.
+RETRY_INTERVAL_S = float(os.environ.get('HERMES_USER_STEPS_RETRY_S', '15'))
+RETRY_MAX_ATTEMPTS = 240
 
 
 def _load(name: str):
@@ -65,6 +71,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                 return
             recover()
             recovered.add(key)
+            start_retrier(key)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -135,6 +142,36 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             store().backfill_legacy(ledger(), gateway=core.server_owner('backfill')['gatewayId'])
         except Exception:
             logging.getLogger('user-steps').warning('Legacy request backfill deferred')
+
+    def retry_pending(max_attempts=RETRY_MAX_ATTEMPTS):
+        # Re-dispatch failed/pending operations (same operation + idempotency key) for owners this profile serves.
+        # A decision made while its session was mid-turn lands here once the turn ends; nobody has to click Retry.
+        st = store(); done = 0
+        for recorded_owner in st.pending_owners():
+            try:
+                own = owner(recorded_owner['storedSessionId'])
+                if own == recorded_owner:
+                    done += len(st.reconcile(own, delivery(), max_attempts=max_attempts))
+            except Exception:
+                continue
+        return done
+
+    retriers = set()
+
+    def start_retrier(key):
+        if RETRY_INTERVAL_S <= 0 or key in retriers: return
+        retriers.add(key)
+        ctx = contextvars.copy_context()  # keep the request's profile scope for owner/store resolution
+
+        def loop():
+            while True:
+                time.sleep(RETRY_INTERVAL_S)
+                try: ctx.run(retry_pending)
+                except Exception:
+                    logging.getLogger('user-steps').warning('Decision delivery retry pass failed')
+        threading.Thread(target=loop, name='user-steps-retrier', daemon=True).start()
+
+    router.retry_pending = retry_pending
 
     @router.get('/ping')
     def ping():
