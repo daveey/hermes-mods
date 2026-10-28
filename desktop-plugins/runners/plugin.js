@@ -81,7 +81,22 @@ export function merge(sources, now = Date.now()) {
     if (best.error) return { ...best, state: 'stale', reason: `last update ${ago(now - best.at)} · ${best.error}` }
     return best
   }
-  return { gateways: pick('gateways'), ci: pick('ci'), at: now }
+  return { gateways: withOwnCaps(pick('gateways'), sources), ci: pick('ci'), at: now }
+}
+
+// A gateway knows its own dispatcher cap; others only see the registry. Take each machine's
+// local cap from the route that is that machine, so the view never flips between gateways.
+function withOwnCaps(section, sources) {
+  const own = new Map()
+  for (const s of sources)
+    for (const m of s.body?.gateways?.machines || [])
+      if (m.me && m.slots_source === 'local') own.set(m.name, m.slots)
+  if (!own.size) return section
+  return {
+    ...section,
+    machines: section.machines.map((m) =>
+      m.slots == null && own.has(m.name) ? { ...m, slots: own.get(m.name), slots_source: 'local' } : m)
+  }
 }
 
 export function ago(ms) {

@@ -182,15 +182,20 @@ def _gateway_section():
 
 
 def _local_cap():
-    """This gateway's dispatcher cap. Read from the raw config file: inside the dashboard,
-    load_config() is request/profile scoped and can miss kanban settings (it showed the
-    memory-derived default 8 on a hub configured for 16)."""
-    from hermes_cli.config import read_raw_config
+    """This machine's dispatcher cap: ``kanban.max_in_progress`` in the kanban home's config.yaml.
+
+    The dispatcher and the board are machine-wide (kanban_home), not per profile. Reading the
+    active profile's config gave the memory-derived default (8 on the hub) to every non-default
+    profile route, and the panel showed whichever profile answered last.
+    """
+    import yaml
+    from hermes_cli.kanban_db import kanban_home
     from hermes_cli.kanban_db_dispatch import resolve_max_in_progress
-    raw = ((read_raw_config() or {}).get('kanban') or {}).get('max_in_progress')
     try:
+        raw = (yaml.safe_load((kanban_home() / 'config.yaml').read_text()) or {})
+        raw = (raw.get('kanban') or {}).get('max_in_progress')
         configured = int(raw) if raw is not None and int(raw) > 0 else None
-    except (TypeError, ValueError):
+    except (OSError, yaml.YAMLError, AttributeError, TypeError, ValueError):
         configured = None
     return resolve_max_in_progress(configured)
 

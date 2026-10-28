@@ -414,16 +414,20 @@ def test_fleet_route_builds_once_per_cache_window(disk_api, monkeypatch):
     assert len(calls) == 2
 
 
-def test_local_cap_reads_the_raw_config_file(api, monkeypatch):
+def test_local_cap_reads_the_kanban_home_config_for_every_profile(api, monkeypatch, tmp_path):
     module, _, _ = api
-    config = types.ModuleType('hermes_cli.config')
+    kdb = types.ModuleType('hermes_cli.kanban_db')
+    kdb.kanban_home = lambda: tmp_path
     dispatch = types.ModuleType('hermes_cli.kanban_db_dispatch')
     dispatch.resolve_max_in_progress = lambda configured: configured if configured is not None else 8
-    monkeypatch.setitem(sys.modules, 'hermes_cli.config', config)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_db', kdb)
     monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_db_dispatch', dispatch)
-    config.read_raw_config = lambda: {'kanban': {'max_in_progress': 16}}
+    (tmp_path / 'config.yaml').write_text('kanban:\n  max_in_progress: 16\n')
+    # A profile's own config (no kanban section) must not matter.
+    (tmp_path / 'profiles' / 'other').mkdir(parents=True)
+    (tmp_path / 'profiles' / 'other' / 'config.yaml').write_text('model: x\n')
     assert module._local_cap() == 16
-    config.read_raw_config = lambda: {'kanban': {'max_in_progress': 'lots'}}
+    (tmp_path / 'config.yaml').write_text('kanban:\n  max_in_progress: lots\n')
     assert module._local_cap() == 8
-    config.read_raw_config = lambda: {}
+    (tmp_path / 'config.yaml').unlink()
     assert module._local_cap() == 8

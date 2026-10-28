@@ -61,6 +61,20 @@ test('registry: gateway machines show fixed slots, flags and unset slot counts',
   await ui.close()
 })
 
+test('registry: each machine keeps its own cap whichever gateway answered last', () => {
+  const hubView = fleet()
+  const macView = fleet()
+  macView.gateways.machines = macView.gateways.machines.map((m) =>
+    m.name === 'hub' ? { ...m, me: false, slots: null, slots_source: null } : m)
+  const view = P.merge([
+    { route, body: hubView, at: NOW - 5000 },
+    { route: { ...route, connectionId: 'local' }, body: macView, at: NOW }
+  ], NOW)
+  const hub = view.gateways.machines.find((m) => m.name === 'hub')
+  assert.equal(hub.slots, 4)
+  assert.equal(hub.slots_source, 'local')
+})
+
 test('live leases: busy slots name the card and open it on click', async () => {
   const opened = []
   globalThis.__hermesKanbanOpenTask = (id, board) => (opened.push([id, board]), true)
