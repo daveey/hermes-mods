@@ -428,6 +428,15 @@ test('reported PR question renders its real option as a button plus a free-text 
  assert.doesNotMatch(el().textContent,/full exact plan|Work stays blocked/)
 })
 
+test('run-timing question marks its go options as approving (self-heal agent-aa8d66631c)',async()=>{
+ const r=freshRequest({kind:'choice',title:'When should I run the migration?',scope:{complete:true,markdown:'When should I run the Mac mini launcher migration: now, when idle, or later?',sourceRefs:[]},outcomes:{answer:'Send this answer to the agent. Options marked ✓ approve running exactly the scope above; any other answer (and free text) grants no execution permission.'},choices:[{id:'answer-0',label:'now',effect:'answer',authorizes:true},{id:'answer-1',label:'later',effect:'answer'},{id:'answer-text',label:'Answer in your own words',effect:'answer'}]})
+ assert.equal(m.validRequest(r),true)
+ await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>({})}))
+ const labels=[...el().querySelectorAll('button[data-decision-effect]')].map(b=>b.textContent)
+ assert.deepEqual(labels,['✓ now','later','Answer in your own words'])
+ assert.match(el().textContent,/Options marked ✓ approve running exactly the scope above/)
+})
+
 // ── Withdrawn asks: retired without a decision; nothing is sent to the agent ──
 const withdrawnBy = (by, reason) => ({ by, reason, at: '2026-10-27T11:00:00+00:00' })
 const pingWithdraw = { ok: true, api: 2, features: ['withdraw'] }

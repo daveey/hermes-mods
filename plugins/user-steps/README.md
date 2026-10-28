@@ -27,7 +27,11 @@ approval choices retain distinct labels. No choice IDs or authorization routes
 change.
 
 Clarifications preserve literal source choice labels and provide a free-text
-answer, without approval/plan controls. Answers never grant execution permission.
+answer, without approval/plan controls. Answers grant no execution permission,
+with one exception: on a question about when or whether to run something, a go
+option ("now", "when idle", "yes") is marked `authorizes: true` (shown as ✓) and
+picking it records `executionAuthorized: true` for exactly the frozen scope on the
+tile. "later", "wait", "no" and free text grant nothing (`tests/test_decisions.py`).
 The question's own "A, or B?" alternatives are buttons; a model option found
 verbatim is added when it is not already part of one. An "other" tail
 ("something else", "neither") is never a button: the free-text answer covers it

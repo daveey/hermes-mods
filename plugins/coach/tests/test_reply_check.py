@@ -171,6 +171,13 @@ REPORT_ONLY_ENDINGS = [
     "Both posts are still hidden: the blog index doesn't mention either of them.",
     "The outcome baseline remains unmeasured; no new analytics automation was deployed.",
     "Nothing needs you here; the existing card owns it.",
+    # bot-dc58243931 (2026-10-27 MacBook): a known leftover plus a "press this button" workaround, no fix.
+    "O-7 through O-11 have the same old-approval problem. If the scheduled job holds one of them, pressing "
+    "'Post now' on its missed-post card will work now.",
+    "The same problem applies to the nightly export.",
+    "The staging and canary hosts are also affected.",
+    "If it stalls again, running hermes-sync run will work.",
+    "You can click Retry on the card to post it.",
 ]
 FINISHED_WORK = [
     "Fixed: the sidebar now scrolls. I reloaded Desktop and checked it on your session.",
@@ -187,6 +194,19 @@ def test_prefilter_report_only_catches_real_endings():
 def test_prefilter_report_only_skips_finished_work():
     for s in FINISHED_WORK:
         assert "report_only" not in rc.prefilter(s), s
+
+
+# Finished work that mentions the same problem: the prefilter may pass it on (recall-oriented), but the judge stage
+# must score it low, so check() never nudges it.
+SAME_PROBLEM_FIXED = "O-7 through O-11 had the same problem; I fixed them too and the check now returns post."
+
+
+def test_same_problem_fixed_is_not_nudged_by_the_judge_stage():
+    llm, calls = _judge({"handoff": 0, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0.05,
+                         "evidence": ""})
+    hit = rc.check(SAME_PROBLEM_FIXED, "so, can you fix it please", ["-> terminal(python3 fix.py)"], llm,
+                   threshold=0.7, thresholds=rc.settings()["thresholds"])
+    assert hit is None
 
 
 def test_prefilter_report_only_reads_only_the_tail():

@@ -1175,8 +1175,12 @@ def validate_action(value):
     for text in value['outcomes'].values(): _string(text)
     ids = set()
     for choice in value['choices']:
-        _object(choice, ('id', 'label', 'effect'))
+        _object(choice, ('id', 'label', 'effect'), ('authorizes',))
         _string(choice['id']); _string(choice['label'])
+        # 'authorizes' marks a go answer ("now") to a run-timing question: only on answers, only True.
+        if 'authorizes' in choice and (choice['authorizes'] is not True or choice['effect'] != 'answer'
+                                       or value['kind'] not in ('choice', 'input')):
+            raise ActionError('authorizes is only valid as true on an answer choice')
         if choice['id'] in ids or choice['effect'] not in ('approve', 'revise', 'decline', 'answer'):
             raise ActionError('Invalid or duplicate choice')
         ids.add(choice['id'])
@@ -1430,7 +1434,9 @@ class ActionStore:
                   'idempotencyKey': decision['idempotencyKey'], 'decision': decision,
                   'recordedAt': stamp, 'dispatchState': 'pending', 'attempts': 0,
                   'intent': {'request': r, 'effect': effect, 'revisionText': text,
-                             'executionAuthorized': effect == 'approve',
+                             # A go answer to a run question authorizes exactly this frozen scope; free text never.
+                             'executionAuthorized': effect == 'approve' or (
+                                 effect == 'answer' and choice.get('authorizes') is True and text == choice['label']),
                              'permissionGrants': []}}
             validate_admission_text({'operationId': oid, **op['intent']})
             try:
@@ -1769,6 +1775,25 @@ def literal_options(step: dict) -> list[str]:
 
 ANSWER_TEXT = {'id': 'answer-text', 'label': 'Answer in your own words', 'effect': 'answer'}
 
+# A question about WHEN or WHETHER to run/do something (not "which colour"): its go options authorize.
+_RUN_Q = re.compile(r"\b(?:when|whether|should\s+I|shall\s+I|ok(?:ay)?\s+to|go\s+ahead|want\s+me\s+to|can\s+I)\b", re.I)
+_RUN_VERB = re.compile(r"\b(?:run|start|do|restart|migrate|migration|ship|deploy|merge|apply|proceed|execute|kick\s+off|"
+                       r"launch|install|update|upgrade|reboot|rollout|roll\s+out|cut\s?over|switch|push|release)\w*\b", re.I)
+_GO = re.compile(r"^(?:now|right\s+now|yes|yes,?\s+\w.*|go(?:\s+ahead)?|do\s+it(?:\s+now)?|run\s+it(?:\s+now)?|proceed|asap|"
+                 r"when\s+(?:it'?s\s+)?idle|(?:once|after)\s+(?:it'?s\s+)?idle|tonight|immediately|start\s+now)[.!]?$", re.I)
+_NO_GO = re.compile(r"\b(?:no|not|don'?t|later|wait|hold|skip|never|cancel|stop|pause|defer|tomorrow)\b", re.I)
+
+
+def run_question(*texts) -> bool:
+    text = ' '.join(t for t in texts if isinstance(t, str))
+    return bool(_RUN_Q.search(text) and _RUN_VERB.search(text))
+
+
+def go_option(label: str) -> bool:
+    """'now', 'when idle', 'yes' approve; 'later', 'wait', 'no' and anything hedged do not."""
+    label = _ws(label).strip()
+    return bool(_GO.match(label)) and not _NO_GO.search(label)
+
 
 def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
     """Canonical v2 shape for an extracted step. Never a generic 'request' button:
@@ -1785,8 +1810,19 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
         # Completeness here describes the QUESTION, never executable scope.
         r['choices'] = [{'id': f'answer-{i}', 'label': label, 'effect': 'answer'}
                         for i, label in enumerate(literal_options(step))] + [dict(ANSWER_TEXT)]
-        r['outcomes'] = {'answer': f'Send this answer to the agent. {no_grant}',
-                         'revise': f'Clarify the question; {no_grant[0].lower() + no_grant[1:]}'}
+        go = run_question(markdown, step.get('text')) and [c for c in r['choices'] if go_option(c['label'])]
+        for c in go or []:
+            c['authorizes'] = True
+        if go:
+            # A "when/whether should I run X" question: picking "now"/"when idle"/"yes" IS the go-ahead for
+            # exactly the frozen scope above (self-heal agent-aa8d66631c: "now" was read as timing only).
+            r['outcomes'] = {'answer': 'Send this answer to the agent. Options marked ✓ approve running exactly '
+                                       'the scope above; any other answer (and free text) grants no execution '
+                                       'permission.',
+                             'revise': f'Clarify the question; {no_grant[0].lower() + no_grant[1:]}'}
+        else:
+            r['outcomes'] = {'answer': f'Send this answer to the agent. {no_grant}',
+                             'revise': f'Clarify the question; {no_grant[0].lower() + no_grant[1:]}'}
     elif kind == 'external_step':
         r['choices'] = [{'id': 'answer-done', 'label': 'Done', 'effect': 'answer'},
                         dict(ANSWER_TEXT, label="Can't do it / reply in your own words")]

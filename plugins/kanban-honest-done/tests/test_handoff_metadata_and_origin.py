@@ -214,6 +214,17 @@ def test_create_without_remote_origin_allowed(body):
     assert plugin.classify_create("kanban_create", {"title": "x", "body": body}, NAMES, env={}) is None
 
 
+def test_origin_inside_multiline_quote_is_not_this_cards_origin():
+    """Self-heal card t_01a1815abd46d030 quoted the user's two-line message, which named "Origin @session:...";
+    the 400-char single-line quote skip missed it, and Gate D demanded a send into David's chat that the worker
+    send guard then refused."""
+    body = (f'- Quote: "David requests this work spun out as a NEW SESSION. You are the new chat. Origin '
+            f'@session:default@macbook/{ORIGIN}. User approved it.\nFirst verify existing ownership{"x" * 300}"\n'
+            "## Do this\n1. Reproduce it.")
+    assert core.origin_sessions(body) == []
+    assert core.origin_sessions(f"Origin chat: @session:default@macbook/{ORIGIN}\n{body}") == [ORIGIN]
+
+
 def test_create_fails_open_without_gateway_names():
     assert plugin.classify_create("kanban_create", CREATE_ARGS, lambda: None, env={}) is None
     assert plugin.classify_create("kanban_create", CREATE_ARGS, lambda: ("", set()), env={}) is None

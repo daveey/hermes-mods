@@ -56,7 +56,7 @@ SCHEMA = {
             "target": {"type": "string", "description": "Session link (`@session:...`) or `<gateway>:<session_id>` for read/send."},
             "query": {"type": "string", "description": "list: title search terms."},
             "gateway": {"type": "string", "description": "list: only this gateway (name or id)."},
-            "message": {"type": "string", "description": "send: the text to deliver."},
+            "message": {"type": "string", "description": "send: the text to deliver. Relaying a standing instruction of the user (e.g. \"don't wait\")? Put it on its own line as `standing: <exact words>`; quoted user directives get one automatically."},
             "limit": {"type": "integer", "description": "list: max rows (default 20); read: max messages (default 40)."},
             "wait_for_reply": {"type": "integer", "description": "send: seconds to wait for the target's reply (0 = don't wait)."},
         },
@@ -120,6 +120,32 @@ def normalize_args(args: dict | None) -> dict:
     return args
 
 
+import re as _re
+
+# Same directive class as core agent/standing_instructions.py (kept local: hosts on older cores lack it).
+_DONT_WAIT = _re.compile(r"\b(?:do\s*not|don['’]?t|dont|never)\s+(?:stop\s+to\s+)?(?:block|wait|pause|ask|stop)\b"
+                         r"|\bno\s+(?:check[\s-]?ins?|waiting|pausing)\b", _re.I)
+_USER_ATTRIBUTED = _re.compile(r"\b(?:David|the user|user (?:said|says|wrote)|you said|he said|she said)\b", _re.I)
+_QUOTE = _re.compile(r"'([^'\n]{4,400})'|\"([^\"\n]{4,400})\"|“([^”\n]{4,400})”|‘([^’\n]{4,400})’")
+_STANDING_LINE = _re.compile(r"^[\s>*\-•]*standing:\s*(\S.*?)\s*$", _re.I | _re.M)
+
+
+def tag_standing(message: str) -> str:
+    """Append `standing: <exact words>` for each quoted user directive not to block/wait (self-heal
+    agent-aa8d66631c). Core compaction and Kanban worker context keep `standing:` lines word for word, so a
+    relayed "dont block, dont wait" cannot be summarized away in the receiving session."""
+    if not _DONT_WAIT.search(message) or not _USER_ATTRIBUTED.search(message):
+        return message
+    have = {" ".join(m.group(1).split()).casefold() for m in _STANDING_LINE.finditer(message)}
+    add = []
+    for q in _QUOTE.finditer(message):
+        words = " ".join(next(g for g in q.groups() if g is not None).split())
+        if _DONT_WAIT.search(words) and words.casefold() not in have:
+            have.add(words.casefold())
+            add.append(f"standing: {words}")
+    return message + ("\n\n" + "\n".join(add) if add else "")
+
+
 def handle(args: dict, session_id: str | None = None, **_kw) -> str:
     args = normalize_args(args)
     action = str(args.get("action") or "").strip()
@@ -137,6 +163,7 @@ def handle(args: dict, session_id: str | None = None, **_kw) -> str:
         refusal = rf.worker_send_refusal(args.get("target"))
         if refusal:
             return _err(refusal)
+        args["message"] = tag_standing(str(args["message"]))
 
     wait = 0
     if action == "send":
