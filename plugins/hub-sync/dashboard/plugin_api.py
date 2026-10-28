@@ -53,6 +53,9 @@ def _split(v: Optional[str]):
 _snapshots: Dict[Any, Any] = {}
 _flights: Dict[Any, asyncio.Task] = {}
 _POLL_WAIT_S = 0.75
+# Longest a poll with no snapshot waits for its first read (Desktop times out at 4 s).
+_COLD_WAIT_S = 2.0
+WARMING: Dict[str, Any] = {"available": False, "warming": True}
 
 # The reads run on hub-sync's own pool, not asyncio's shared default executor. At backend boot
 # other work fills that executor (min(32, cpu+4) threads, ~370 core call sites), and the
@@ -99,11 +102,22 @@ async def _run_timed(key, fn):
                         key, done - entered, t0 - entered, done - t0, _default_backlog(loop))
 
 
+async def _cold_answer(flight: asyncio.Task):
+    """A key with no snapshot yet waits at most ``_COLD_WAIT_S`` for its first read, then answers
+    ``WARMING`` while the read finishes in the background and fills the snapshot. At backend boot
+    the first cold reads ran 6.5 s (hubview's decode cache built under boot CPU contention), past
+    the Desktop's 4 s timeout. The Desktop treats ``available: false`` as "no answer" and re-polls."""
+    try:
+        return await asyncio.wait_for(asyncio.shield(flight), timeout=_COLD_WAIT_S)
+    except asyncio.TimeoutError:
+        return dict(WARMING)
+
+
 async def _poll(key, fn):
     flight = _flights.get(key)
     last = _snapshots.get(key)
     if flight is not None and not flight.done():
-        return last if last is not None else await flight
+        return last if last is not None else await _cold_answer(flight)
 
     async def run():
         try:
@@ -116,7 +130,7 @@ async def _poll(key, fn):
     task = asyncio.create_task(run())
     _flights[key] = task
     if last is None:
-        return await task
+        return await _cold_answer(task)
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=_POLL_WAIT_S)
     except asyncio.TimeoutError:
