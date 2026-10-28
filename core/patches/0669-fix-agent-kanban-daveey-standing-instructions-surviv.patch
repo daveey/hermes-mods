@@ -1,0 +1,403 @@
+From 967159043230783c5c77827876b0abced1185f8a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 08:10:55 +0000
+Subject: [PATCH] fix(agent,kanban): [daveey] standing instructions survive
+ compaction, reach workers, and hold don't-wait blocks
+
+A relayed 'dont block, dont wait' was paraphrased by compaction into its opposite and the agent later
+blocked on the user (self-heal agent-aa8d66631c).
+
+- agent/standing_instructions.py: shared extractor for explicit 'standing: <words>' lines and
+  don't-wait directives in real/relayed user messages.
+- context compressor: every summary (lean and legacy) ends with a 'Standing instructions (still in
+  force)' section, word for word; standing: lines are re-read from earlier summaries so they survive
+  repeated compaction.
+- build_worker_context: standing: lines from the body and ANY comment render up front (the comment
+  thread is tail-capped).
+- kanban_block: a needs_input/human_request block on a card with a standing don't-wait is held once
+  with the words quoted back and a standing_wait_hold event; a second call lands it.
+---
+ agent/context_compressor.py               |  28 +++++-
+ agent/standing_instructions.py            | 110 +++++++++++++++++++++
+ hermes_cli/kanban_db.py                   |  20 ++++
+ tests/agent/test_standing_instructions.py | 111 ++++++++++++++++++++++
+ tools/kanban_tools.py                     |  37 ++++++++
+ 5 files changed, 305 insertions(+), 1 deletion(-)
+ create mode 100644 agent/standing_instructions.py
+ create mode 100644 tests/agent/test_standing_instructions.py
+
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 13b1d4a08b..5816a2d432 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -983,6 +983,31 @@ def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
+     )
+ 
+ 
++def _append_standing_section(summary: str, turns: list[dict[str, Any]]) -> str:
++    """Carry the user's standing instructions word for word into the summary. [daveey]
++
++    Sources: ``standing:`` lines in ANY compacted row (including an earlier summary, so they survive
++    repeated compaction) and "don't wait"-class directives in real or relayed user messages. The
++    verbatim-user section is newest-first under a budget and the summarizer paraphrases freely (a relayed
++    "dont block, dont wait" once became "urgency does not waive safeguards"), so neither keeps them.
++    """
++    from agent import standing_instructions as si
++
++    found: list[str] = si.explicit_lines(summary)
++    for msg in turns:
++        content = _content_text_for_contains(msg.get("content"))
++        if not content:
++            continue
++        user_authored = msg.get("role") == "user" and not _synthetic_user_row(content)
++        found += si.extract(content, user_authored=user_authored)
++    section = si.render_section(found)
++    if not section:
++        return summary
++    if si.STANDING_HEADING in summary:  # the summarizer copied an earlier section: replace it, never stack
++        summary = si.strip_section(summary)
++    return summary + _redact_compaction_text(section)
++
++
+ def _build_recovery_footer(session_id: str, region_len: int) -> str:
+     """Deterministic pointer to the compacted region in session history.
+     state.db keeps every pre-compaction message; naming the session_search re-access path lets the model
+@@ -3679,7 +3704,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+         return result
+ 
+     def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
+-        """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
++        """Append deterministic lean-mode sections to a summary; legacy mode gets only standing instructions."""
++        summary = _append_standing_section(summary, turns_to_summarize)  # every mode [daveey]
+         if getattr(self, "tail_mode", "lean") != "lean":
+             return summary
+         for heading, build in (
+diff --git a/agent/standing_instructions.py b/agent/standing_instructions.py
+new file mode 100644
+index 0000000000..919e252e72
+--- /dev/null
++++ b/agent/standing_instructions.py
+@@ -0,0 +1,110 @@
++"""Standing instructions: the user's lasting directives ("don't block, don't wait"), kept word for word. [daveey]
++
++A standing instruction governs every later decision in a session or card, so it must survive context
++compaction and reach Kanban workers verbatim. Two shapes count:
++
++* an explicit ``standing: <exact words>`` line (written by agents on cards, by the session-mentions relay,
++  and by the compaction summary itself, so a later compaction re-reads it);
++* a "don't wait"-class directive inside a REAL user message (or a relayed one), taken as the quoted span
++  or sentence that holds it, unchanged.
++
++Pure text helpers, no I/O: the context compressor, ``build_worker_context`` and the kanban_block guard
++share them so all three agree on what is standing.
++"""
++from __future__ import annotations
++
++import re
++from typing import Iterable
++
++STANDING_HEADING = "## Standing instructions (still in force)"
++_MAX_LINES = 20
++_MAX_CHARS = 400
++
++# An explicit marker line: "standing: ...", optionally bulleted/quoted.
++_STANDING_LINE = re.compile(r"^[\s>*\-•]*standing:\s*(?P<words>\S.*?)\s*$", re.IGNORECASE | re.MULTILINE)
++# "don't block / dont wait / do not pause / never stop to ask / no check-ins" etc.
++DONT_WAIT = re.compile(
++    r"\b(?:do\s*not|don['’]?t|dont|never)\s+(?:stop\s+to\s+)?(?:block|wait|pause|ask|stop)\b"
++    r"|\bno\s+(?:check[\s-]?ins?|waiting|pausing)\b",
++    re.IGNORECASE,
++)
++_QUOTED = re.compile(r"'([^'\n]{4,400})'|\"([^\"\n]{4,400})\"|“([^”\n]{4,400})”|‘([^’\n]{4,400})’")
++_SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
++
++
++def _clean(words: str) -> str:
++    return " ".join(words.split())[:_MAX_CHARS]
++
++
++def explicit_lines(text: str) -> list[str]:
++    """``standing:`` lines in any text, words unchanged (whitespace collapsed)."""
++    if not isinstance(text, str) or "standing:" not in text.lower():
++        return []
++    return [_clean(m.group("words")) for m in _STANDING_LINE.finditer(text)]
++
++
++def directive_spans(text: str) -> list[str]:
++    """"Don't wait"-class directives in user-authored text: the quote or sentence holding each, unchanged."""
++    if not isinstance(text, str) or not DONT_WAIT.search(text):
++        return []
++    out: list[str] = []
++    taken: list[tuple[int, int]] = []
++    for q in _QUOTED.finditer(text):
++        inner = next(g for g in q.groups() if g is not None)
++        if DONT_WAIT.search(inner):
++            out.append(_clean(inner))
++            taken.append(q.span())
++    pos = 0
++    for part in _SENTENCE_END.split(text):
++        start = text.find(part, pos)
++        pos = start + len(part)
++        if not part.strip() or any(a <= start < b or a < pos <= b for a, b in taken):
++            continue
++        if DONT_WAIT.search(part) and not _STANDING_LINE.match(part):
++            out.append(_clean(part))
++    return out
++
++
++def extract(text: str, *, user_authored: bool) -> list[str]:
++    """Standing words in one message: explicit lines always; directives only from user-authored text."""
++    found = explicit_lines(text)
++    if user_authored:
++        found += directive_spans(text)
++    return found
++
++
++def dedupe(lines: Iterable[str], limit: int = _MAX_LINES) -> list[str]:
++    """Keep first-seen order, drop repeats (case-insensitive) and keep the newest ``limit``."""
++    seen: set[str] = set()
++    out: list[str] = []
++    for line in lines:
++        key = line.casefold().strip(" .")
++        if line and key not in seen:
++            seen.add(key)
++            out.append(line)
++    return out[-limit:]
++
++
++def says_dont_wait(lines: Iterable[str]) -> list[str]:
++    """The standing lines that forbid waiting/blocking on the user."""
++    return [line for line in lines if DONT_WAIT.search(line)]
++
++
++_SECTION_NOTE = ("(The user's own standing instructions, word for word. Unlike the rest of this summary they are "
++                 "ACTIVE: they still govern every decision, including whether to block, pause or wait on the user.)")
++_SECTION_RE = re.compile(r"\n*" + re.escape(STANDING_HEADING) + r"\n(?:[ \t]*standing:.*\n?)*(?:[ \t]*\(The user's own "
++                         r"standing instructions[^)]*\))?")
++
++
++def strip_section(text: str) -> str:
++    """Remove a rendered section (lines are re-collected first), keeping whatever follows it."""
++    return _SECTION_RE.sub("", text)
++
++
++def render_section(lines: Iterable[str]) -> str:
++    """Summary/context section: one ``standing:`` line each, so the next compaction re-reads them."""
++    lines = dedupe(lines)
++    if not lines:
++        return ""
++    body = "\n".join(f"standing: {line}" for line in lines)
++    return f"\n\n{STANDING_HEADING}\n{body}\n{_SECTION_NOTE}"
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 764231e8e7..ac4646c316 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -4070,6 +4070,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     now = int(time.time())
+     lines: list[str] = []
+     _ctx_header(lines, task)
++    _ctx_standing(lines, task, list_comments(conn, task_id))  # [daveey]
+     from hermes_cli.kanban_continuation import render_checkpoint_context
+     checkpoint = render_checkpoint_context(conn, task_id)
+     if checkpoint:
+@@ -4226,6 +4227,25 @@ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, no
+     lines.append("")
+ 
+ 
++def _ctx_standing(lines: list[str], task: Task, comments: list[Comment]) -> None:
++    """Every ``standing:`` line in the body or ANY comment, word for word, ahead of everything else. [daveey]
++
++    The comment thread is tail-capped (``_CTX_MAX_COMMENTS``), so a standing "don't wait" written early on a
++    busy card would otherwise drop out of the worker's prompt."""
++    from agent import standing_instructions as si
++    found = si.explicit_lines(task.body or "")
++    for c in comments:
++        found += si.explicit_lines(c.body or "")
++    found = si.dedupe(found)
++    if not found:
++        return
++    lines.append("## Standing instructions (from the user; in force for this card)")
++    lines += [f"standing: {line}" for line in found]
++    lines.append("(These still govern this run: e.g. a standing \"don't wait\" means decide it yourself instead "
++                 "of blocking on the user, unless only a human can act — a credential, a physical step.)")
++    lines.append("")
++
++
+ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
+     """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
+     worker" framing stops an operator-controlled HERMES_PROFILE like
+diff --git a/tests/agent/test_standing_instructions.py b/tests/agent/test_standing_instructions.py
+new file mode 100644
+index 0000000000..c0709c6160
+--- /dev/null
++++ b/tests/agent/test_standing_instructions.py
+@@ -0,0 +1,111 @@
++"""Standing instructions survive compaction word for word, reach Kanban workers, and hold a don't-wait block.
++
++Regression for self-heal defect agent-aa8d66631c: a relayed "dont block, dont wait" was paraphrased by
++compaction into "urgency does not waive safeguards" and the agent later blocked on the user.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent.context_compressor import ContextCompressor
++
++WORDS = "get this session work done. dont block, dont wait. dont accept tasks that are waiting for something"
++RELAYED = ('[Message from another Hermes session "Balance subscription routing" (@session:default@macbook/x)]\n\n'
++           f"David DIRECT NOW: '{WORDS}'. I directly inspected hub: B t_ae11c0bc todo gated PR44.")
++
++
++def _compact(turns, summary="## Goal\nRouting work; urgency does not waive safeguards."):
++    fake = SimpleNamespace(tail_mode="lean", _session_id="")
++    return ContextCompressor._augment_summary_lean(fake, summary, turns)
++
++
++def test_relayed_standing_words_survive_two_compactions_verbatim():
++    # Enough later user chatter to push the relay out of the newest-first verbatim-user budget.
++    later = [{"role": "user", "content": f"status check {i}: " + "x" * 900} for i in range(40)]
++    first = _compact([{"role": "user", "content": RELAYED}, *later])
++    assert f"standing: {WORDS}" in first
++    # The next compaction sees only the previous summary row (synthetic) plus new turns.
++    second = _compact([{"role": "assistant", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] " + first},
++                       {"role": "user", "content": "what are we blocked on"}])
++    assert f"standing: {WORDS}" in second
++    assert "ACTIVE" in second
++
++
++def test_legacy_tail_mode_also_carries_standing_lines():
++    fake = SimpleNamespace(tail_mode="legacy", _session_id="")
++    out = ContextCompressor._augment_summary_lean(fake, "summary", [{"role": "user", "content": "please, don't wait on me"}])
++    assert "standing: please, don't wait on me" in out
++
++
++def test_assistant_prose_is_not_a_standing_instruction():
++    out = _compact([{"role": "assistant", "content": "I will not block; don't wait for me."}])
++    assert "standing:" not in out
++
++
++@pytest.fixture
++def worker_env(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="migrate launchers", assignee="test-worker")
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++        kb.add_comment(conn, tid, "coordinator", f"standing: {WORDS}")
++        for i in range(40):  # push the standing comment out of the newest-30 comment tail
++            kb.add_comment(conn, tid, "worker", f"progress note {i}")
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return tid
++
++
++def test_worker_context_always_shows_standing_comments(worker_env):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        text = kb.build_worker_context(conn, worker_env)
++    finally:
++        conn.close()
++    assert "## Standing instructions" in text
++    assert f"standing: {WORDS}" in text
++    assert text.index("## Standing instructions") < text.index("## Comment thread")
++
++
++ASK = {"action": "Pick when to restart the mini gateways", "why_human": "restart needs consent",
++       "interaction": "reply", "scope": "mini launcher migration", "evidence": "card comments"}
++
++
++def test_needs_input_block_under_standing_dont_wait_is_held_once_with_hint(worker_env):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    args = {"reason": "1) Choose now, when idle or later for the restart. 2) Then unblock this card",
++            "kind": "needs_input", "human_request": ASK}
++    first = json.loads(kt._handle_block(dict(args)))
++    blob = json.dumps(first)
++    assert "error" in first and "standing" in blob and "decide" in blob.lower()
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, worker_env).status == "running"
++        kinds = [e.kind for e in kb.list_events(conn, worker_env)]
++    finally:
++        conn.close()
++    assert "standing_wait_hold" in kinds  # logged for the coach/self-heal
++    # A genuine human-only need (credential, physical step) still lands on the second call.
++    second = json.loads(kt._handle_block(dict(args)))
++    assert "error" not in second, second
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index ec4e3b0022..b656ab1527 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1056,6 +1056,42 @@ def _route_needs(op: str, args: dict, tid: str, reason: Optional[str]) -> Option
+                                 "the approved scope. End your turn."))
+ 
+ 
++STANDING_WAIT_EVENT = "standing_wait_hold"
++
++
++def _standing_wait_guard(kb, conn, tid: str, kind: Optional[str], human_request: Any, reason: str) -> None:
++    """Hold a block on the user ONCE when the card carries a standing "don't wait". [daveey]
++
++    A needs_input block (or one with a human_request) under such a standing line is refused with the
++    words quoted back and a ``standing_wait_hold`` event (coach/self-heal read it). Calling again with
++    the block lands it: a genuine human-only need (a credential, a physical step) is never trapped.
++    """
++    if kind != "needs_input" and not human_request:
++        return
++    from agent import standing_instructions as si
++    task = kb.get_task(conn, tid)
++    found = si.explicit_lines(getattr(task, "body", "") or "")
++    for c in kb.list_comments(conn, tid):
++        found += si.explicit_lines(c.body or "")
++    dont_wait = si.says_dont_wait(si.dedupe(found))
++    if not dont_wait:
++        return
++    run_id = _worker_run_id(tid)
++    if any(e.kind == STANDING_WAIT_EVENT and (run_id is None or e.run_id in (None, run_id))
++           for e in kb.list_events(conn, tid)):
++        return  # already held once this run: the agent re-confirmed a human-only need
++    with kb.write_txn(conn, allow_nested=True):
++        kb._append_event(conn, tid, STANDING_WAIT_EVENT,
++                         {"kind": kind, "standing": dont_wait[:3], "reason": (reason or "")[:300]}, run_id=run_id)
++    quoted = "; ".join(f'"{w}"' for w in dont_wait[:3])
++    raise _Reject(
++        f"Not blocked: this card carries the user's standing instruction {quoted}. Decide it yourself and keep "
++        "going (pick the option the user's goal implies, record the choice in a kanban_comment). A timing or "
++        "consent question is not a reason to wait. Only if this truly needs a human (a credential, a physical "
++        "step, money beyond the approved budget) call kanban_block again with the same reason; that lands it.",
++        "standing_dont_wait")
++
++
+ @_kanban_handler("kanban_block")
+ def _handle_block(args: dict, **kw) -> str:
+     """Transition the task to blocked with a reason a human will read."""
+@@ -1092,6 +1128,7 @@ def _handle_block(args: dict, **kw) -> str:
+         _policy = block_policy_error(kind, human_request=args.get("human_request"), wake_check=wake[0],
+                                      clock_only=wake[2], blocker_id=blocker_id, reason=reason)
+         _check(_policy is None, _policy or "", ERROR_CODE)
++        _standing_wait_guard(kb, conn, tid, kind, args.get("human_request"), reason)
+         _park_guard(conn, tid, "block", wake, reason=reason, kind=kind, blocker_id=blocker_id)
+         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+                            blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1], awaiting=awaiting,
+-- 
+2.55.0
+

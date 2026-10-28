@@ -16,6 +16,9 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md) | 0670 | A model pin the managed routing registry cannot serve is refused at create and set-model (code `model_pin_not_in_routing_registry`), not at worker startup. |
+| [standing-instructions.md](standing-instructions.md) | 0669 | Standing instructions survive compaction word for word, reach workers ahead of the comment cap, and hold a don't-wait block once. |
+| [bare-checkout-recover.md](bare-checkout-recover.md) | 0667–0668 | `hermes update` resets `core.bare` on a work tree that `git init --bare` flipped; a genuine bare repo is left alone. The `.git` marker is read as utf-8-sig. |
 | [model-id-whitespace-entry-parity.md](model-id-whitespace-entry-parity.md) | 0666 | `-m`/`-z`/`--tui` and Kanban model pins refuse spaced cloud model ids like `/model` does (exit 2 before any API call); Anthropic 404 `model: <id>` classifies as model_not_found. |
 | [cron-script-sane-path.md](cron-script-sane-path.md) | 0665 | Cron scripts and the cron worker get the terminal's sane PATH (`~/.local/bin` and the standard dirs) whichever process won the tick lock; run docs name the runner process. |
 | [spotlight-noindex-scratch.md](spotlight-noindex-scratch.md) | 0664 | On macOS cache/scratch and cache/uv live in `*.noindex` dirs behind symlinks, so Hermes's temp churn stays out of Spotlight. |

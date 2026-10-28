@@ -1,0 +1,228 @@
+From 2aa3397018ca34324cc964811105709445bceef9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 07:49:09 +0000
+Subject: [PATCH] fix(update): recover a work tree whose core.bare was flipped
+ [daveey]
+
+Problem: 2026-10-28 06:26Z the hub update died with
+"git status --porcelain -z / fatal: this operation must be run in a work tree"
+after ~/.hermes/hermes-agent reported --is-bare-repository=true at 06:16:45Z.
+The 05:54:18 update had succeeded, so the flip is inside that window.
+
+Why: on git 2.55, `git init --bare` with no path writes core.bare=true when
+the cwd is the repo's .git or a worktree gitdir under it, or when GIT_DIR
+names that directory. `git init --bare <path>` does not. Reproduced here.
+No Hermes tool call from 04:00-06:17 contains that command (every state.db
+searched); the config mtime was overwritten at 06:29 by the later
+`git --git-dir` inspection, and this host has no exec audit. The specific
+process is therefore undetermined. The gap we control is that hermes update
+treated the flipped flag as fatal instead of recovering a checkout that
+still has a work tree.
+
+Recurrence: same symptom as 2026-10-27. c431bbb32e (pytest drops inherited
+GIT_DIR and restores core.bare) landed at 07:24Z, after this flip, and does
+not cover a non-pytest writer or an already-flipped checkout.
+
+The git step now resets core.bare=false and logs a WARNING when the
+directory it is standing in has a .git and reports bare. A genuine bare
+repo (no .git child) is left alone.
+---
+ hermes_cli/update_cmd.py                      |  3 +-
+ hermes_cli/update_cmd_stash.py                | 51 ++++++++++
+ .../test_update_bare_checkout_guard.py        | 95 +++++++++++++++++++
+ 3 files changed, 148 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_update_bare_checkout_guard.py
+
+diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
+index 8595344bdf..46bbd259c1 100644
+--- a/hermes_cli/update_cmd.py
++++ b/hermes_cli/update_cmd.py
+@@ -82,7 +82,7 @@ from hermes_cli.update_cmd_stash import (
+     _reject_unsafe_stash_restore, _resolve_stash_selector, _restore_stashed_changes,
+     _restored_python_paths, _stash_apply_failed_only_on_existing_untracked,
+     _stash_local_changes_if_needed, _unrestored_autostash_notice,
+-    _warn_orphaned_update_autostashes)
++    _warn_orphaned_update_autostashes, recover_flipped_bare_checkout)
+ from hermes_cli.update_cmd_config import (
+     _LAST_SIBLING_SNAPSHOTS, _check_and_apply_config_migration, _migrate_sibling_profile_configs,
+     _print_items, _reload_config_modules, _run_config_check_fresh, _run_migrate_config_fresh)
+@@ -1871,6 +1871,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
+         return
+ 
+     try:
++        recover_flipped_bare_checkout(git_cmd, _m().PROJECT_ROOT)
+         _check.report_pack_tidy(_m().PROJECT_ROOT)
+         # Shallow installer checkouts collect one `.git/shallow` graft per past depth-1 fetch
+         # (#105951); stale grafts break merge-base and push this run into the divergence path.
+diff --git a/hermes_cli/update_cmd_stash.py b/hermes_cli/update_cmd_stash.py
+index b73e140a54..ca350eae07 100644
+--- a/hermes_cli/update_cmd_stash.py
++++ b/hermes_cli/update_cmd_stash.py
+@@ -85,12 +85,63 @@ def _print_first_line(text: str) -> None:
+         print(f"  {text.strip().splitlines()[0]}")
+ 
+ 
++def recover_flipped_bare_checkout(git_cmd: list[str], cwd: Path) -> bool:
++    """Reset ``core.bare`` on a work tree that ``git init --bare`` flipped. True if it reset.
++
++    A genuine bare repo has no ``.git`` inside the directory the updater is standing in
++    and is left alone. A checkout whose config says ``bare=true`` but still has a work
++    tree cannot ``git status`` (``fatal: this operation must be run in a work tree``).
++    On git 2.55 that flag is written by ``git init --bare`` with no path when ``GIT_DIR``,
++    or the cwd, names this repo's ``.git`` or a worktree gitdir under it
++    (``<repo>/.git/worktrees/<name>``). ``git init --bare <path>`` does not.
++    """
++    git_marker = cwd / ".git"
++    if not git_marker.exists():
++        return False
++    from hermes_cli.update_cmd_git import _git_run
++
++    probe = _git_run(git_cmd, ["rev-parse", "--is-bare-repository"], cwd)
++    if probe.returncode != 0 or probe.stdout.strip() != "true":
++        return False
++    resolved = git_marker
++    if git_marker.is_file():
++        pointed = ""
++        for line in git_marker.read_text(encoding="utf-8", errors="replace").splitlines():
++            if line.strip().lower().startswith("gitdir:"):
++                pointed = line.split(":", 1)[1].strip()
++                break
++        if not pointed:
++            logger.warning("checkout %s has core.bare=true but its .git file has no gitdir", cwd)
++            return False
++        raw = Path(pointed)
++        resolved = raw if raw.is_absolute() else (cwd / raw).resolve()
++    reset = _git_run(git_cmd, ["--git-dir", str(resolved), "config", "core.bare", "false"], cwd)
++    if reset.returncode != 0:
++        logger.warning(
++            "checkout %s has core.bare=true but resetting it failed: %s",
++            cwd, (reset.stderr or "").strip(),
++        )
++        return False
++    message = (
++        f"WARNING: {cwd} is a work tree whose git config said core.bare=true "
++        "(git init --bare with no path, when GIT_DIR or the cwd names this repo "
++        "or a worktree gitdir under it, writes that). Reset core.bare=false so "
++        "the update can run."
++    )
++    logger.warning(message)
++    print(f"  ⚠ {message}")
++    return True
++
++
+ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path, *, checkout_move=None) -> Optional[str]:
+     """Stash local changes before the update moves the checkout; the stash commit, or None when clean.
+     ``checkout_move`` binds the push (and its cleanup reset) to the paused gateways' tree gate."""
+     global _pending_autostash
+     from hermes_cli.update_cmd_git import _git_run, _no_move
+     _pending_autostash = None
++    # A flipped core.bare makes the status below die with "must be run in a work tree"
++    # and aborts the update. Recover before the first work-tree command.
++    recover_flipped_bare_checkout(git_cmd, cwd)
+     status = _git_run(git_cmd, ["status", "--porcelain", "-z"], cwd, check=True)
+     if not status.stdout.strip():
+         return None
+diff --git a/tests/hermes_cli/test_update_bare_checkout_guard.py b/tests/hermes_cli/test_update_bare_checkout_guard.py
+new file mode 100644
+index 0000000000..a26c111fda
+--- /dev/null
++++ b/tests/hermes_cli/test_update_bare_checkout_guard.py
+@@ -0,0 +1,95 @@
++"""hermes update must recover a work tree whose config was flipped to core.bare=true.
++
++2026-10-28 06:16Z the live checkout at ~/.hermes/hermes-agent reported
++``rev-parse --is-bare-repository`` = true. The 06:26 hub update then died in
++``_stash_local_changes_if_needed``:
++
++    git status --porcelain -z
++    fatal: this operation must be run in a work tree
++
++On git 2.55 the flag is written by ``git init --bare`` with no path when the
++cwd is the repo's .git (or a worktree gitdir under it), or when GIT_DIR names
++that directory. A genuine bare repo has no ``.git`` inside the directory the
++updater is standing in and must be left alone.
++"""
++from pathlib import Path
++import subprocess
++
++import pytest
++
++from hermes_cli.update_cmd_stash import (
++    _stash_local_changes_if_needed,
++    recover_flipped_bare_checkout,
++)
++
++
++def _git(cwd, *args, check=True):
++    return subprocess.run(
++        ["git", *args], cwd=cwd, check=check, capture_output=True, text=True,
++    )
++
++
++def _worktree(tmp_path: Path) -> Path:
++    repo = tmp_path / "install"
++    repo.mkdir()
++    _git(repo, "init", "-q", "-b", "main")
++    _git(repo, "config", "user.email", "t@example.invalid")
++    _git(repo, "config", "user.name", "t")
++    (repo / "f").write_text("x\n", encoding="utf-8")
++    _git(repo, "add", "f")
++    _git(repo, "-c", "commit.gpgsign=false", "commit", "-qm", "c")
++    return repo
++
++
++def _flip_bare(repo: Path) -> None:
++    """The verified writer: ``git init --bare`` with no path and cwd = .git."""
++    flipped = _git(repo / ".git", "init", "-q", "--bare", check=False)
++    assert flipped.returncode == 0, flipped.stderr
++    assert _git(repo, "rev-parse", "--is-bare-repository").stdout.strip() == "true"
++
++
++def test_stash_recovers_a_flipped_work_tree_and_warns(tmp_path, capsys):
++    repo = _worktree(tmp_path)
++    _flip_bare(repo)
++    (repo / "f").write_text("dirty\n", encoding="utf-8")
++    status = _git(repo, "status", "--porcelain", "-z", check=False)
++    assert status.returncode != 0
++    assert "work tree" in status.stderr
++
++    ref = _stash_local_changes_if_needed(["git"], repo)
++
++    assert _git(repo, "rev-parse", "--is-bare-repository").stdout.strip() == "false"
++    assert ref
++    assert "core.bare=true" in capsys.readouterr().out
++    assert _git(repo, "status", "--porcelain", "-z").returncode == 0
++
++
++def test_recover_is_a_noop_when_already_non_bare(tmp_path, capsys):
++    repo = _worktree(tmp_path)
++    assert recover_flipped_bare_checkout(["git"], repo) is False
++    assert "core.bare=true" not in capsys.readouterr().out
++    assert _git(repo, "config", "--get", "core.bare").stdout.strip() == "false"
++
++
++def test_recover_leaves_a_genuine_bare_repo_alone(tmp_path, capsys):
++    bare = tmp_path / "origin.git"
++    bare.mkdir()
++    _git(bare, "init", "-q", "--bare", "-b", "main")
++    assert recover_flipped_bare_checkout(["git"], bare) is False
++    assert _git(bare, "rev-parse", "--is-bare-repository").stdout.strip() == "true"
++    assert "core.bare=true" not in capsys.readouterr().out
++
++
++def test_recover_resets_via_worktree_gitdir_flip(tmp_path, capsys):
++    """``git init --bare`` with cwd = ``.git/worktrees/<name>`` flips the shared config."""
++    repo = _worktree(tmp_path)
++    wt = tmp_path / "wt"
++    _git(repo, "worktree", "add", "--detach", str(wt), "HEAD")
++    gitdir = Path(_git(wt, "rev-parse", "--absolute-git-dir").stdout.strip())
++    flipped = _git(gitdir, "init", "-q", "--bare", check=False)
++    assert flipped.returncode == 0, flipped.stderr
++    assert _git(repo, "rev-parse", "--is-bare-repository").stdout.strip() == "true"
++
++    assert recover_flipped_bare_checkout(["git"], repo) is True
++    assert _git(repo, "rev-parse", "--is-bare-repository").stdout.strip() == "false"
++    assert "WARNING" in capsys.readouterr().out
+-- 
+2.55.0
+
