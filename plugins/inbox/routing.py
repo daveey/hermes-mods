@@ -105,17 +105,27 @@ def within(path: Optional[str], folder: Optional[str]) -> bool:
     return p == f or p.startswith(f.rstrip("/") + "/")
 
 
-def route_cwd(home: Path, *, explicit: Optional[str], inherited: Optional[str], social: bool) -> Optional[str]:
+def poster_slug(poster: Optional[str]) -> Optional[str]:
+    """Project slug a poster name maps to ('self-heal' -> 'self-heal', 'Self Heal' -> 'self-heal')."""
+    s = re.sub(r"[^a-z0-9]+", "-", str(poster or "").lower()).strip("-")
+    return s or None
+
+
+def route_cwd(home: Path, *, explicit: Optional[str], inherited: Optional[str], social: bool,
+              poster: Optional[str] = None) -> Optional[str]:
     """Pick the cwd for a new card.
 
     explicit (caller passed cwd) always wins. A social card with no explicit cwd goes to the host's
-    `pr` project folder, except that an inherited cwd already inside that folder is kept (a worktree
-    or the twitter/ subdir stays where it is). Anything else keeps the inherited cwd.
+    `pr` project folder; otherwise a card whose poster names a live project on this host (poster
+    'self-heal' -> project slug 'self-heal') goes to that project's folder. In both cases an
+    inherited cwd already inside the target folder is kept (a worktree or subdir stays where it is).
+    Anything else keeps the inherited cwd.
     """
     if explicit:
         return explicit
-    if social:
-        target = project_path(home)
+    slug = poster_slug(poster)
+    for target in ((project_path(home) if social else None),
+                   (project_path(home, slug) if slug else None)):
         if target:
             return inherited if within(inherited, target) else target
     return inherited

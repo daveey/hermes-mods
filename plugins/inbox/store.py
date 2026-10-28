@@ -368,7 +368,7 @@ class Inbox:
                 rt = routing_module()
                 cwd_explicit = int(cwd is not None)
                 cwd = rt.route_cwd(self.home, explicit=cwd, inherited=inherited_cwd, social=rt.is_social(
-                    key=key, type=type, title=title, body=body, poster=poster))
+                    key=key, type=type, title=title, body=body, poster=poster), poster=poster)
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
                 db.set_session_hidden(sid, True)
                 text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy
@@ -484,7 +484,8 @@ class Inbox:
                 rt = routing_module()
                 routed = rt.route_cwd(self.home, explicit=cwd, inherited=inherited_cwd,
                                       social=rt.is_social(key=key, type=snap["name"], title=title,
-                                                          body=body, poster=poster))
+                                                          body=body, poster=poster),
+                                      poster=poster)
                 type(db)._insert_session_row(writer, sid, "desktop", model=model,
                                              cwd=routed or str(Path.home()))
                 conn.execute("UPDATE sessions SET hidden=1 WHERE id=?", (sid,))

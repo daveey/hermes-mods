@@ -248,3 +248,39 @@ def test_backfill_archived_opt_in_still_requires_ended_session(env, monkeypatch)
 def test_card_type_alone_classifies():
     assert rt.is_social(type="x-dm", title="anything") and rt.is_social(type="bsky-post")
     assert not rt.is_social(type="default", title="Deploy", key="deploy:1")
+
+
+def _add_project(home: Path, slug: str, path: str, pid: str):
+    conn = sqlite3.connect(home / "projects.db")
+    conn.execute("INSERT INTO projects VALUES (?,?,?,?,?,?,?,?,?,0)", (pid, slug, slug, None, None, None, None, path, 1))
+    conn.execute("INSERT INTO project_folders VALUES (?,?,?,?,?)", (pid, path, None, 1, 1))
+    conn.commit()
+    conn.close()
+
+
+def test_poster_named_project_routes_new_card(env):
+    inbox, db, pr = env
+    sh = str(Path(pr).parent / "self-heal")
+    _add_project(Path(inbox.home), "self-heal", sh, "p_sh")
+    r = inbox.post("Kanban goes unknown", "b", "p", key="selfheal:k1", poster="self-heal", inherited_cwd="/Users/me")
+    assert cwd_of(db, r) == sh
+
+
+def test_poster_named_project_routes_conditional_post(env):
+    inbox, db, pr = env
+    sh = str(Path(pr).parent / "self-heal")
+    _add_project(Path(inbox.home), "self-heal", sh, "p_sh")
+    r = inbox.post("Cron fails hourly", "b", "p", key="selfheal:k2", poster="Self Heal",
+                   inherited_cwd="/Users/me", if_absent=True)
+    assert cwd_of(db, r) == sh
+
+
+def test_poster_project_explicit_cwd_and_unknown_poster(env):
+    inbox, db, pr = env
+    sh = str(Path(pr).parent / "self-heal")
+    _add_project(Path(inbox.home), "self-heal", sh, "p_sh")
+    r = inbox.post("A", "b", "p", key="selfheal:k3", poster="self-heal", cwd="/tmp/x", inherited_cwd="/Users/me")
+    assert cwd_of(db, r) == "/tmp/x"
+    r = inbox.post("B", "b", "p", key="other:k4", poster="nightly-audit", inherited_cwd="/Users/me")
+    assert cwd_of(db, r) == "/Users/me"
+    assert rt.route_cwd(Path(inbox.home), explicit=None, inherited=sh + "/wt", social=False, poster="self-heal") == sh + "/wt"
