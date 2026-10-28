@@ -24,7 +24,7 @@ def verdict(disposition='abandoned'):
 @pytest.fixture
 def environment(tmp_path, monkeypatch):
     import socket
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli.plugins import get_plugin_manager, PluginContext
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_VERIFY_ON_STOP', '0')

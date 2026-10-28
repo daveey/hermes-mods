@@ -43,7 +43,7 @@ def child_main():
         fixture.main()
         return
     from http.server import ThreadingHTTPServer
-    import yaml
+    import hermes_yaml as yaml
     server = ThreadingHTTPServer(('127.0.0.1', 0), HeldProvider)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = yaml.safe_load((fixture.HOME / 'config.yaml').read_text())

@@ -116,7 +116,7 @@ def _visible(frames):
 def test_production_serve_auth_and_next_turn(tmp_path, queued):
     from websockets.exceptions import InvalidStatus
     from websockets.sync.client import connect
-    import yaml
+    import hermes_yaml as yaml
     home = tmp_path / 'home'
     env = isolated_env(home)
     token = 'synthetic-serve-acceptance-token'

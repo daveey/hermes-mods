@@ -91,7 +91,7 @@ def auxiliary(*args, **kwargs):
 def main():
     provider = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     threading.Thread(target=provider.serve_forever, daemon=True).start()
-    import yaml
+    import hermes_yaml as yaml
     config = yaml.safe_load((HOME / 'config.yaml').read_text())
     config['model'] = {'default': 'transport-test', 'provider': 'custom',
                        'base_url': f'http://127.0.0.1:{provider.server_port}/v1'}

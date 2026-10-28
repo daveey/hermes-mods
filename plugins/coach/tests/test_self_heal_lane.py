@@ -604,7 +604,12 @@ def test_do_it_creates_the_fix_card_with_red_green_acceptance(store, monkeypatch
 def test_inbox_type_do_it_is_a_resolve_the_hub_cron_acts_on():
     """Do it must not be a Kanban `task` action: a worker is fenced from creating cards via the CLI, so the hub
     cron's sync (outside any worker) files the fix card from the resolved outcome."""
-    import yaml
+    try:
+        import hermes_yaml as yaml
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_yaml":
+            raise
+        import yaml  # Standalone tests; Hermes itself ships hermes_yaml.
     t = yaml.safe_load((REPO / "skills/productivity/hermes-coach/inbox-types/selfheal.yaml").read_text())
     acts = {a["id"]: a for a in t["actions"]}
     assert set(acts) == {"do_it", "not_now", "never"}

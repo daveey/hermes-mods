@@ -575,9 +575,23 @@ The brief model is set with `auxiliary.coach.provider` / `.model` (default: the 
 
 ## Tests
 
+Run the full Python suite through a current Hermes core checkout (set `CORE` and
+`MODS` to your checkout paths):
+
+```bash
+CORE="$HOME/.hermes/hermes-agent"
+MODS="$HOME/code/hermes-mods"
+(cd "$CORE" && scripts/run_tests.sh -j 2 "$MODS/plugins/coach/tests")
+```
+
+This uses the core's locked test dependencies and per-file isolation. Core-dependent
+tests and transport children use `hermes_yaml`, the runtime parser: PyYAML stopped
+being a core dependency in core commit `284dbaf537`. The Inbox action contract test
+keeps its assertions unchanged and can also run without core using PyYAML:
+
 ```bash
 cd plugins/coach
-uv run --with pytest --with fastapi --with httpx python -m pytest -q -p no:cacheprovider tests
+uv run --with pytest --with pyyaml python -m pytest -q -p no:cacheprovider tests/test_self_heal_lane.py -k do_it_is_a_resolve
 PATH=~/.nvm/versions/node/v20.20.2/bin:$PATH bash tests/desktop/run.sh   # desktop flow, mocked SDK + real spin-out
 # miner adoption over real data (Hermes venv has ruamel.yaml):
 ~/.hermes/hermes-agent/venv/bin/python ../../skills/productivity/hermes-coach/scripts/coach_mine.py --data ~/code/hermes-coach-data --top 0 --write-adoption

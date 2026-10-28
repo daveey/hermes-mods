@@ -11,7 +11,7 @@ import sys
 import threading
 import shutil
 from http.server import ThreadingHTTPServer
-import yaml
+import hermes_yaml as yaml
 import pytest
 from test_goal_disposition_transport import isolated_env, TEXTS
 from test_goal_serve_acceptance import _ready

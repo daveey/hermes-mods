@@ -96,7 +96,7 @@ def test_diagnosis_only_text_stop_is_held_before_delivery(tmp_path, monkeypatch,
 
 @pytest.mark.parametrize('order', [('coach', 'ask-gate', 'chat-closeout'), ('chat-closeout', 'ask-gate', 'coach')])
 def test_normal_discovery_coexists_and_reloads(tmp_path, monkeypatch, order):
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli.plugins import PluginManager
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('COACH_LESSONS', '0')
