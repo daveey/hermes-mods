@@ -16,7 +16,8 @@ Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call`
 | Gate | Refuses | Paths |
 |---|---|---|
 | A | editing your **own** card's title/body (`--priority`, other cards, comments stay allowed) | `hermes kanban edit <own id or $HERMES_KANBAN_TASK> --title/--body` via `terminal`, `process`, `execute_code`, `tool_call` |
-| B | completing your own card when the summary (or a title that says "split to follow-up" / "dropped from scope" / "deferred") admits dropped, deferred, unrun or unverified work, unless the summary names a follow-up card `t_xxxxxxxx` that exists (any board), is open or done (not archived), and was created by this card (`creator_task_id`) or is linked to it | `kanban_complete` tool (direct or via `tool_call`), `hermes kanban complete <own> --summary/--result` via shell or `execute_code` |
+| B | completing your own card when the handoff, meaning the summary **and every text value in its `metadata`** (`not_done`, `remaining`, nested lists), (or a title that says "split to follow-up" / "dropped from scope" / "deferred") admits dropped, deferred, unrun or unverified work (incl. plain "not verified / not performed / not checked / not confirmed / not tested"), unless the handoff names a follow-up card `t_xxxxxxxx` that exists (any board), is open or done (not archived), and was created by this card (`creator_task_id`) or is linked to it | `kanban_complete` tool (direct or via `tool_call`), `hermes kanban complete <own> --summary/--result/--metadata` via shell or `execute_code` |
+| D | completing your own card when its body or comments name an origin chat (`origin … @session:X`, e.g. "Origin chat: @session:default@macbook/X") that is not linked to the card: no unreleased `task_chat_links` row, no notify subscription (`tui` X, or `hub` `<gw>/<profile>/X`), and no `follow-through: SENT … X` comment. The refusal gives the exact `hermes kanban notify-subscribe` command for a same- or cross-gateway chat. Double-quoted text is skipped | same paths as B |
 
 Each refusal says what to do: finish the missing part, or `kanban_create` the follow-up (`parents=[<this card>]`)
 and name its id, or `kanban_block` with the exact physical step. Completing another card (a reviewer approving a
@@ -44,6 +45,13 @@ no follow-up card; spot-check precision of those 37 was about 85 % (misses: doma
 unverified", scoping notes like "the other test files were not run").
 
 ## Tests
+
+Replay with metadata, "not verified" and Gate D (hub, Oct 28 2026, 14 days, 399 completed cards): B would refuse 15
+(was 2; the new ones are real admissions such as "CI not yet checked", about 2 false); D would refuse 16, every one a
+card naming an origin chat that was never linked to it (1 is a self-heal write-up that only describes the chat).
+
+Why D: a card whose plan said "report to origin chat @session:…" finished with that chat named only in prose. The
+done ping went to the supervisor chat, and the origin chat kept saying "waiting on CI" for 14 h.
 
 ```
 cd plugins/kanban-honest-done && uv run -q --with pytest python -m pytest -q -p no:cacheprovider tests

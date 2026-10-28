@@ -4,9 +4,12 @@ Inside a dispatcher-spawned worker (``HERMES_KANBAN_TASK`` set), a ``pre_tool_ca
 
 A. editing its OWN card's title/body (``hermes kanban edit <own id> --title/--body`` from terminal, process or
    execute_code) — narrowing your own scope is how a goal judge gets talked into accepting unfinished work;
-B. completing its own card (``kanban_complete`` tool, or ``hermes kanban complete`` from a shell) with a summary
-   or title that admits dropped / deferred / unrun work, unless the summary names a follow-up card
+B. completing its own card (``kanban_complete`` tool, or ``hermes kanban complete`` from a shell) with a handoff
+   (summary, every metadata text value, or title) that admits dropped / deferred / unrun / "not verified" work,
+   unless it names a follow-up card
    (``t_xxxxxxxx``) that exists, is open (or already done), and was created by or is linked to this card.
+D. completing its own card while the body/comments name an origin chat (``origin ... @session:X``) that is not
+   linked to the card (chat link, notify subscription, or ``follow-through: SENT`` comment), so it never hears.
 
 The refusal says what to do instead.
 
@@ -73,7 +76,7 @@ def classify(tool_name: str, args: Any, own: str, paths_fn=None) -> Optional[str
         if target != own:
             return None
         summary = str(args.get("summary") or args.get("result") or "")
-        return core.check_complete(own, summary, paths_fn())
+        return core.check_complete(own, summary, paths_fn(), metadata=args.get("metadata"))
     if name in SHELL_TOOLS:
         cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
         return core.check_shell(cmd, own, paths_fn)

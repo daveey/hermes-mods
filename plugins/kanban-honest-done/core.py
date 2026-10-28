@@ -28,6 +28,10 @@ DROP_PATTERNS: tuple[tuple[str, str], ...] = (
                  r"|\bdeferred (?:to|until|for) (?:a |the )?(?:follow[- ]?up|later|next)\b"),
     ("unverified", r"\b(?:is|are|was|were|remains?|stays?|still|left|went) (?:still |as )?unverified\b"
                    r"|\bunverified\s*[:)]"),
+    # The most common handoff wording: "acceptance b not verified", "DOM check not performed".
+    ("not verified", r"\bnot (?:yet )?(?:be(?:en)? )?(?:independently |directly |live[- ])?"
+                     r"(?:verified|performed|checked|confirmed|tested|exercised|validated)\b"
+                     r"(?! (?:in|into|out|off)\b)"),
     ("out of scope", r"\b(?:moved|left|ruled|declared|marked|treated as|is|was) out of scope\b"
                      r"|\bout of scope for this card\b"),
     ("follow-up", r"^\W*(?:[\w-]+ )?follow[- ]?ups?\s*(?:\([^)]{0,40}\))?\s*:"
@@ -52,7 +56,7 @@ DONE_FOLLOWUP_RE = re.compile(r"\bfollow[- ]?up (?:commit|pr|fix|patch|push|merg
 _COMPILED = tuple((kind, re.compile(rx, re.I)) for kind, rx in DROP_PATTERNS)
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?;])\s+|\n+")
 # Quoted text is someone else's words (an error message, a user utterance), not the worker's own admission.
-_QUOTED = re.compile(r"\"[^\"\n]{0,400}\"|\u201c[^\u201d\n]{0,400}\u201d|`[^`\n]{0,400}`")
+_QUOTED = re.compile(r"\"[^\"\n]{0,400}\"|\u201c[^\u201d\n]{0,400}\u201d|`[^`\n]{0,400}`|(?<!\w)'[^'\n]{1,120}'(?!\w)")
 
 OPEN_STATUSES = ("triage", "todo", "ready", "running", "scheduled", "blocked", "review")
 # A follow-up that already finished also proves the work was handled.
@@ -81,6 +85,32 @@ def dropped_work(text: str, kinds: Optional[set[str]] = None) -> list[tuple[str,
 
 def dropped_work_in_handoff(summary: str, title: str = "") -> list[tuple[str, str]]:
     return dropped_work(title, TITLE_KINDS) + dropped_work(summary)
+
+
+def metadata_text(metadata: Any) -> str:
+    """Every text value in a completion's ``metadata`` (``not_done``, ``remaining``, nested lists…), one per line as
+    ``key: value``. Handoffs put the honest caveats there, out of the one-line summary. Accepts a dict or its JSON."""
+    if isinstance(metadata, str):
+        try:
+            import json
+
+            metadata = json.loads(metadata)
+        except ValueError:
+            return metadata
+    lines: list[str] = []
+
+    def walk(v: Any, key: str = "") -> None:
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, str(k))
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x, key)
+        elif isinstance(v, str) and v.strip():
+            lines.append(f"{key}: {v}" if key else v)
+
+    walk(metadata)
+    return chr(10).join(lines)
 
 
 # --- board access -------------------------------------------------------------------------------------------------
@@ -230,18 +260,87 @@ def own_task_id(env=None) -> Optional[str]:
     return env.get("HERMES_KANBAN_TASK") or None
 
 
-def check_complete(task_id: str, summary: str, paths: list[Path], title: Optional[str] = None) -> Optional[str]:
-    """Refusal message for completing ``task_id`` with ``summary``, or None to allow."""
+def check_complete(task_id: str, summary: str, paths: list[Path], title: Optional[str] = None,
+                   metadata: Any = None) -> Optional[str]:
+    """Refusal message for completing ``task_id`` with ``summary`` (+ ``metadata``), or None to allow.
+
+    B: the handoff (summary AND every metadata text value) admits unfinished work with no follow-up card.
+    D: the card names an origin chat in prose that is neither linked to the card nor reported to."""
+    found = find_task(task_id, paths)
     if title is None:
-        found = find_task(task_id, paths)
         title = found[1].get("title") if found else ""
-    hits = dropped_work_in_handoff(summary or "", title or "")
-    if not hits:
+    handoff = "\n".join(x for x in (summary or "", metadata_text(metadata) if metadata else "") if x)
+    hits = dropped_work_in_handoff(handoff, title or "")
+    if hits and not valid_followups(task_id, handoff, paths):
+        named = [t for t in dict.fromkeys(TASK_ID_RE.findall(handoff)) if t != task_id]
+        return complete_refusal(task_id, hits, named)
+    if found:
+        return check_origin_reached(task_id, found[0], found[1].get("body") or "")
+    return None
+
+
+# --- D: an origin chat named only in prose ------------------------------------------------------------------------
+
+# "Origin chat: @session:default@macbook/20261025_233046_d48ade", "report ... to origin @session:X",
+# "origin_session=@session:X". The id group is the bare session id (what task_chat_links / notify subs store).
+ORIGIN_SESSION_RE = re.compile(
+    r"\borigin(?:_session)?\b[^\n@]{0,60}@session:(?:[\w.-]+(?:@[\w.-]+)?/)?([A-Za-z0-9][\w-]{5,})", re.I)
+REPORTED_RE = re.compile(r"\bfollow-through:\s*SENT\b", re.I)
+_DQUOTED = re.compile(r"\"[^\"\n]{0,400}\"|\u201c[^\u201d\n]{0,400}\u201d")
+
+
+def origin_sessions(text: str) -> list[str]:
+    """Session ids a card's prose names as its origin chat (quoted text is someone else's words: skipped)."""
+    return list(dict.fromkeys(ORIGIN_SESSION_RE.findall(_DQUOTED.sub('""', text or ""))))
+
+
+def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
+    """Refusal when the card body/comments name an origin chat that will not hear this completion: no unreleased
+    ``task_chat_links`` row, no ``kanban_notify_subs`` subscription, and no ``follow-through: SENT`` comment naming
+    it. Fails open (None) on any board read error."""
+    try:
+        conn = ro_connect(board)
+    except sqlite3.Error:
         return None
-    if valid_followups(task_id, summary or "", paths):
+    try:
+        comments = [r[0] or "" for r in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id=?", (task_id,))] if _has_table(conn, "task_comments") else []
+        wanted = origin_sessions("\n".join([body] + comments))
+        if not wanted:
+            return None
+        reached: set[str] = set()
+        if _has_table(conn, "task_chat_links"):
+            reached |= {r[0] for r in conn.execute(
+                "SELECT chat_session FROM task_chat_links WHERE task_id=? AND released=0", (task_id,))}
+        if _has_table(conn, "kanban_notify_subs"):
+            # tui subs store the bare session; cross-gateway ('hub') subs store <gateway>/<profile>/<session>.
+            reached |= {(r[0] or "").rsplit("/", 1)[-1] for r in conn.execute(
+                "SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (task_id,))}
+        for c in comments:
+            if REPORTED_RE.search(c):
+                reached |= {s for s in wanted if s in c}
+        missing = [s for s in wanted if s not in reached]
+    except sqlite3.Error:
         return None
-    named = [t for t in dict.fromkeys(TASK_ID_RE.findall(summary or "")) if t != task_id]
-    return complete_refusal(task_id, hits, named)
+    finally:
+        conn.close()
+    return origin_refusal(task_id, missing) if missing else None
+
+
+def origin_refusal(task_id: str, sessions: list[str]) -> str:
+    s = sessions[0]
+    return (
+        f"[kanban-honest-done] Refused: {task_id} names origin chat @session:{s} (body/comments), but that chat is "
+        "not linked to this card, so it will never see that the card finished. Link it, then complete again:\n"
+        f"1) Chat on this gateway: `hermes kanban notify-subscribe {task_id} --platform tui --chat-id {s}`.\n"
+        f"2) Chat on another gateway (@session:<profile>@<gateway>/{s}): `hermes kanban notify-subscribe {task_id} "
+        f"--platform hub --chat-id <gateway>/<profile>/{s}` (add `--board <slug>` before `notify-subscribe` when "
+        "the card is not on the default board); hermes-hub publishes it to that chat's task list.\n"
+        "3) Or send it the result yourself (cross_session action=send) and record it with `kanban_comment`: "
+        f"\"follow-through: SENT via cross_session to @session:{s} at <time>; delivery verified|not verified\". "
+        "If none of these work, kanban_block this card with the exact step instead."
+        + (f" Other unlinked origin chats: {', '.join(sessions[1:])}." if len(sessions) > 1 else "")
+    )
 
 
 _OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}")
@@ -324,7 +423,7 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
             return EDIT_REFUSAL
         if verb in ("complete", "done"):
             summary = _opt(args, "--summary") or _opt(args, "--result") or ""
-            why = check_complete(own, summary, paths_fn())
+            why = check_complete(own, summary, paths_fn(), metadata=_opt(args, "--metadata"))
             if why:
                 return why
     return None

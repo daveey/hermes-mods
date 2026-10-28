@@ -22,19 +22,41 @@ core = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(core)
 
 
-def latest_summary(conn, tid):
-    row = conn.execute("SELECT summary FROM task_runs WHERE task_id=? AND summary IS NOT NULL AND summary != '' "
+def latest_handoff(conn, tid):
+    """Latest run's summary + every metadata text value (what Gate B reads at completion)."""
+    row = conn.execute("SELECT summary, metadata FROM task_runs WHERE task_id=? AND "
+                       "((summary IS NOT NULL AND summary != '') OR (metadata IS NOT NULL AND metadata != '')) "
                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
     if row:
-        return row[0]
+        return "\n".join(x for x in (row[0] or "", core.metadata_text(row[1]) if row[1] else "") if x)
     row = conn.execute("SELECT result FROM tasks WHERE id=?", (tid,)).fetchone()
     return (row[0] if row else "") or ""
+
+
+def origin_unreached(conn, tid):
+    """Gate D replayed: origin chats the card's prose names with no link / subscription / SENT comment. Released
+    links count as reached here (they are usually released AFTER completion), so this is a lower bound."""
+    body = (conn.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone() or [""])[0] or ""
+    comments = [r[0] or "" for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))]
+    wanted = core.origin_sessions("\n".join([body] + comments))
+    if not wanted:
+        return [], []
+    reached = {r[0] for r in conn.execute("SELECT chat_session FROM task_chat_links WHERE task_id=?", (tid,))}
+    try:
+        reached |= {(r[0] or "").rsplit("/", 1)[-1] for r in conn.execute(
+            "SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (tid,))}
+    except Exception:
+        pass
+    for c in comments:
+        if core.REPORTED_RE.search(c):
+            reached |= {s for s in wanted if s in c}
+    return wanted, [s for s in wanted if s not in reached]
 
 
 def replay(days: float, only: str | None = None):
     since = time.time() - days * 86400
     paths = core.board_paths()
-    total, out = 0, []
+    total, out, origin = 0, [], {"named": 0, "unreached": []}
     for p in paths:
         try:
             conn = core.ro_connect(p)
@@ -46,7 +68,14 @@ def replay(days: float, only: str | None = None):
             if only and tid != only:
                 continue
             total += 1
-            summary = latest_summary(conn, tid)
+            try:
+                wanted, missing = origin_unreached(conn, tid)
+            except Exception:
+                wanted, missing = [], []
+            origin["named"] += bool(wanted)
+            if missing:
+                origin["unreached"].append((tid, title, missing))
+            summary = latest_handoff(conn, tid)
             hits = core.dropped_work_in_handoff(summary, title or "")
             if not hits:
                 continue
@@ -58,7 +87,7 @@ def replay(days: float, only: str | None = None):
                             gate_would_pass=bool(core.valid_followups(tid, summary, paths)),
                             false_done=not (named or related)))
         conn.close()
-    return total, out
+    return total, out, origin
 
 
 def main(argv=None):
@@ -66,10 +95,18 @@ def main(argv=None):
     ap.add_argument("--days", type=float, default=14)
     ap.add_argument("--json")
     ap.add_argument("--task")
+    ap.add_argument("--kinds", help="comma-separated: only report hits of these classifier kinds")
     a = ap.parse_args(argv)
-    total, out = replay(a.days, a.task)
+    total, out, origin = replay(a.days, a.task)
+    if a.kinds:
+        keep = set(a.kinds.split(","))
+        out = [o for o in out if keep & set(o["kinds"])]
     false = [o for o in out if o["false_done"]]
     print(f"completed cards scanned: {total}; admitted dropped work: {len(out)}; no follow-up card: {len(false)}")
+    print(f"gate D: cards naming an origin chat: {origin['named']}; origin never linked/reported: "
+          f"{len(origin['unreached'])}")
+    for tid, title, missing in origin["unreached"]:
+        print(f"  D {tid}  {(title or '')[:70]}  -> {', '.join(missing)}")
     for o in sorted(false, key=lambda o: -o["completed_at"]):
         day = time.strftime("%m-%d", time.localtime(o["completed_at"]))
         print(f"{o['id']}  {day}  {','.join(o['kinds']):<22} {o['title'][:70]}\n      \"{o['evidence'][:160]}\"")
