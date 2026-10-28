@@ -1,0 +1,207 @@
+From fc317cf6f754457ef3ebbd489ef4ee6b18e1b883 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:02:08 +0000
+Subject: [PATCH] fix(kanban): kanban_create placement=<gateway> that cannot be
+ honoured is refused, never a silent local card [daveey]
+
+---
+ hermes_cli/kanban_placement.py            | 29 ++++++++++++
+ tests/hermes_cli/test_kanban_placement.py | 57 +++++++++++++++++++++--
+ tools/kanban_tools.py                     | 24 +++++++++-
+ tools/kanban_tools_schemas.py             |  5 +-
+ 4 files changed, 109 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index bdd9f6c7b2..c57a43e931 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -241,9 +241,38 @@ def _uncarried(args: dict, c: _Cfg, carries: Optional[bool]) -> list[str]:
+     return [] if carries else legacy
+ 
+ 
++def explicit_foreign_pin(args: dict, self_gw: Optional[str]) -> str:
++    """The gateway the caller pinned that is neither this gateway nor 'local'/'auto', else ''."""
++    pin = str(args.get("placement") or "auto").strip().lower()
++    if pin in ("", "auto", "local", "here", (self_gw or "").lower()):
++        return ""
++    return pin
++
++
+ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+            self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
+            locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None) -> dict:
++    """``_decide`` plus one rule: a caller who pinned another gateway never gets a silent local card.
++
++    Any local outcome for such a pin (no route to that gateway, a structural limit, target not live)
++    becomes ``{"where": "refuse", "why": ..., "pin": <gateway>}``, which ``kanban_create`` returns as a
++    typed error. Never raises.
++    """
++    try:
++        sg = reg.self_gateway() if self_gw is None else self_gw
++        out = _decide(args, origin_intent=origin_intent, now=now, cfg=cfg, self_gw=sg, live=live,
++                      locate=locate, carries=carries)
++        pin = explicit_foreign_pin(args, sg)
++        if pin and origin_intent is None and out.get("where") == "local":
++            return {"where": "refuse", "why": out.get("why", ""), "pin": pin}
++        return out
++    except Exception as exc:
++        return {"where": "local", "why": f"placement check failed: {exc}"}
++
++
++def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
++            self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
++            locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None) -> dict:
+     """``{"where": "local"|<gateway>, "why": str}`` for a ``kanban_create`` call. Never raises."""
+     try:
+         c = _Cfg(config() if cfg is None else cfg)
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index db683af112..a40d43c34b 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -159,10 +159,15 @@ def test_caller_pin_wins_both_ways():
+     assert decide({"title": "CI fix", "placement": "local"})["where"] == "local"
+     # An explicit pin to the target skips the marker heuristic (the caller knows).
+     assert decide({"title": "Chrome-free MacBook docs", "placement": "hub"})["where"] == "hub"
+-    # ...but never the structural limits.
+-    assert decide({"title": "x", "placement": "hub", "parents": ["t_1"]})["where"] == "local"
+-    # A gateway with no route is not a destination.
+-    assert decide({"title": "x", "placement": "mini"})["where"] == "local"
++    # ...but never the structural limits: a pinned gateway that cannot be honoured is refused, not local.
++    assert decide({"title": "x", "placement": "hub", "parents": ["t_1"]})["where"] == "refuse"
++    # A gateway with no route is not a destination, and never silently becomes a local card.
++    assert decide({"title": "x", "placement": "mini"})["where"] == "refuse"
++    assert decide({"title": "x", "placement": "mini"}, cfg={})["where"] == "refuse"
++    # Own gateway name and 'here' still mean local, with or without a route.
++    assert decide({"title": "x", "placement": "macbook"})["where"] == "local"
++    assert decide({"title": "x", "placement": "macbook"}, cfg={})["where"] == "local"
++    assert decide({"title": "x", "placement": "local"}, cfg={})["where"] == "local"
+ 
+ 
+ def test_courier_creation_is_never_re_placed():
+@@ -372,6 +377,50 @@ def test_mac_card_stays_local_and_never_calls_the_hub(mac):
+     assert mac["calls"] == [] and _local_count() == 1
+ 
+ 
++@pytest.mark.parametrize("pin", ["mini", "macbook-typo", "hub-typo"])
++def test_pin_to_an_unrouted_gateway_is_refused_not_created_locally(mac, pin):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Run the MacBook-only drill", "placement": pin}))
++    assert not out.get("ok"), out
++    assert out["code"] == "placement_unavailable" and out["created"] is False and out["placement"] == pin
++    assert "placement='local'" in out["error"]
++    assert mac["calls"] == [] and _local_count() == 0
++
++
++def test_pin_to_a_gateway_when_no_route_is_configured_is_refused(mac, monkeypatch):
++    # The reported case: a hub worker (no route on the hub) pinned placement='macbook'.
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {})
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    out = json.loads(kt._handle_create({"title": "MacBook-only drill", "placement": "macbook"}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable", out
++    assert _local_count() == 0
++
++
++def test_pin_to_the_routed_target_that_the_hub_refuses_is_an_error_not_local(mac):
++    from tools import kanban_tools as kt
++    mac["result"]["rc"] = 2
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hub"}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable", out
++    assert _local_count() == 0
++
++
++@pytest.mark.parametrize("pin", ["local", "here", "macbook"])
++def test_pin_local_or_own_gateway_still_creates_locally(mac, pin):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": pin}))
++    assert out["ok"] and out["task_id"] and "placed" not in out
++    assert mac["calls"] == [] and _local_count() == 1
++
++
++def test_own_gateway_pin_creates_locally_with_no_route_configured(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {})
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    out = json.loads(kt._handle_create({"title": "Hub drill", "placement": "hub"}))
++    assert out["ok"] and out["task_id"] and _local_count() == 1
++
++
+ def test_hub_refusal_falls_back_to_a_local_card(mac):
+     from tools import kanban_tools as kt
+     mac["result"]["rc"] = 2
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 7b633995fa..b49cd63729 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1416,6 +1416,15 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+         state.close()
+ 
+ 
++def _placement_refused(pin: str, why: str) -> str:
++    """[daveey] A caller-pinned gateway cannot be honoured: say so instead of creating the card here."""
++    return tool_error(
++        f"placement={pin!r} was not honoured and no card was created: {why}. A pinned gateway is never "
++        "silently replaced by a local card. Use placement='local' (or omit it) to create the card on this "
++        "gateway, or create it on the target with `hermes-hub create-task <gateway> ...`.",
++        code="placement_unavailable", placement=pin, created=False)
++
++
+ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id) -> Optional[str]:
+     """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
+ 
+@@ -1431,6 +1440,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                 "project_id": project_id}
+         decision = kp.decide(view)
+         target = decision["where"]
++        if target == "refuse":
++            return _placement_refused(decision["pin"], decision.get("why", ""))
+         if target == "local":
+             if decision.get("why", "").startswith(("local marker", "placement pinned", "needs ")):
+                 logger.debug("kanban placement: local (%s)", decision["why"])
+@@ -1443,6 +1454,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         if not placed.get("ok"):
+             logger.warning("kanban placement: %s refused the card (%s); creating it locally",
+                            target, placed.get("error"))
++            if kp.explicit_foreign_pin(view, reg.self_gateway()):
++                return _placement_refused(target, f"{target} refused the card: {placed.get('error')}")
+             return None
+         tid = None
+         deadline = time.monotonic() + float(cfg.get("wait_seconds", 8) or 0)
+@@ -1460,8 +1473,17 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                                         "task_id": tid, "origin_session": session_id,
+                                         "queued_only": bool(placed.get("queued_only"))},
+                    note=note)
+-    except Exception:
++    except Exception as exc:
+         logger.warning("kanban placement failed; creating the card locally", exc_info=True)
++        try:
++            from hermes_cli import kanban_placement as kp2
++            from hermes_cli import kanban_capability_registry as reg2
++            pin = kp2.explicit_foreign_pin(args, reg2.self_gateway())
++        except Exception:
++            pin = str(args.get("placement") or "").strip().lower()
++            pin = "" if pin in ("", "auto", "local", "here") else pin
++        if pin:
++            return _placement_refused(pin, f"placement failed: {exc}")
+         return None
+ 
+ 
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index c312907989..3e61ad3ed3 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -669,7 +669,10 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "gateway, still linked to this chat. 'local' pins it here "
+                 "(use it when the work needs this machine: its Chrome, "
+                 "Keychain, Apple apps, launchd/Desktop state, local "
+-                "checkouts). A gateway name pins it there."
++                "checkouts). A gateway name pins it there; if that gateway "
++                "cannot be reached by a placement route the call fails with "
++                "code placement_unavailable and creates nothing (never a "
++                "silent local card). Your own gateway's name means local."
+         )),
+         "max_runtime_seconds": _prop("integer", (
+                 "Per-task runtime cap. When exceeded, the "
+-- 
+2.55.0
+

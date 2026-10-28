@@ -1,0 +1,119 @@
+From 2ddf72b986896a6c69231aed63d3e0c8757b62f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:06:08 +0000
+Subject: [PATCH] fix(kanban): refuse origin-bound pinned creates; more
+ tool-level tests [daveey]
+
+---
+ tests/hermes_cli/test_kanban_placement.py | 39 +++++++++++++++++++++++
+ tools/kanban_tools.py                     | 11 +++++--
+ tools/kanban_tools_schemas.py             | 10 +++---
+ 3 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index a40d43c34b..6fb4143c9a 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -467,3 +467,42 @@ def test_hub_cli_resolves_without_the_login_shell_path(tmp_path, monkeypatch):
+ def test_remote_body_names_the_capability_to_route_back_with():
+     body = kp.remote_body({"body": "Do it."}, self_gw="macbook", target="hub")
+     assert "needs=['host:macbook']" in body and reg.is_gateway_need("host:macbook")
++
++
++def test_pin_with_an_origin_session_is_refused_not_created_locally(mac):
++    # An origin-bound card is created on this gateway by design; a pin elsewhere cannot be honoured.
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "MacBook-only drill", "placement": "mini",
++                                        "origin_session": "hub:abc123"}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable", out
++    assert _local_count() == 0
++
++
++def test_pin_with_a_structural_limit_is_refused_through_the_tool(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "x", "placement": "hub", "workspace_kind": "dir",
++                                        "workspace_path": "/tmp/x"}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable", out
++    assert _local_count() == 0 and mac["calls"] == []
++
++
++def test_pin_to_a_target_that_is_not_live_is_refused_through_the_tool(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "target_live", lambda *a, **k: "hub's capability record is stale or missing")
++    out = json.loads(kt._handle_create({"title": "x", "placement": "hub"}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable", out
++    assert _local_count() == 0
++
++
++def test_pin_is_case_insensitive_for_the_own_gateway(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "x", "placement": "MacBook"}))
++    assert out["ok"] and out["task_id"] and _local_count() == 1
++
++
++def test_exception_while_placing_a_pinned_card_is_refused(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "create_remote", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
++    out = json.loads(kt._handle_create({"title": "x", "placement": "hub"}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable", out
++    assert _local_count() == 0
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index b49cd63729..ec107d94b5 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1452,7 +1452,7 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                                   origin_profile=current_profile_name("default") or "default",
+                                   self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")))
+         if not placed.get("ok"):
+-            logger.warning("kanban placement: %s refused the card (%s); creating it locally",
++            logger.warning("kanban placement: %s refused the card (%s)",
+                            target, placed.get("error"))
+             if kp.explicit_foreign_pin(view, reg.self_gateway()):
+                 return _placement_refused(target, f"{target} refused the card: {placed.get('error')}")
+@@ -1474,7 +1474,7 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                                         "queued_only": bool(placed.get("queued_only"))},
+                    note=note)
+     except Exception as exc:
+-        logger.warning("kanban placement failed; creating the card locally", exc_info=True)
++        logger.warning("kanban placement failed", exc_info=True)
+         try:
+             from hermes_cli import kanban_placement as kp2
+             from hermes_cli import kanban_capability_registry as reg2
+@@ -1563,6 +1563,13 @@ def _handle_create(args: dict, **kw) -> str:
+                                    project_id=project_id, session_id=session_id)
+             if remote is not None:
+                 return remote
++        elif origin_intent is None and args.get("placement"):
++            # An origin-bound card is created here by design, so a pin to another gateway cannot be honoured.
++            from hermes_cli import kanban_capability_registry as _reg
++            from hermes_cli import kanban_placement as _kp
++            _pin = _kp.explicit_foreign_pin(args, _reg.self_gateway())
++            if _pin:
++                return _placement_refused(_pin, "an origin-bound card is created on this gateway")
+         new_tid = kb.create_task(
+             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+             parents=tuple(parents), tenant=(args.get("tenant") if origin_intent is not None
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 3e61ad3ed3..e3b7dc60a8 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -669,10 +669,12 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "gateway, still linked to this chat. 'local' pins it here "
+                 "(use it when the work needs this machine: its Chrome, "
+                 "Keychain, Apple apps, launchd/Desktop state, local "
+-                "checkouts). A gateway name pins it there; if that gateway "
+-                "cannot be reached by a placement route the call fails with "
+-                "code placement_unavailable and creates nothing (never a "
+-                "silent local card). Your own gateway's name means local."
++                "checkouts). A gateway name pins it there; if the card cannot be "
++                "placed there (no placement route to it, a parent link, a "
++                "non-scratch workspace, a non-default board, an origin-bound "
++                "card, target not live, ...) the call fails with code "
++                "placement_unavailable and creates nothing (never a silent "
++                "local card). Your own gateway's name means local."
+         )),
+         "max_runtime_seconds": _prop("integer", (
+                 "Per-task runtime cap. When exceeded, the "
+-- 
+2.55.0
+
