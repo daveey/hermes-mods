@@ -246,6 +246,12 @@ Countermeasures:
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
 - Treating a filesystem timestamp as creation evidence without checking platform semantics. Linux `st_ctime` is metadata-change time, not birth time; Git activity can make old worktrees look newly created. Compare true birth (`stat -c %W` on GNU systems) with creation-call history before attributing a burst. A generic safety GC or written cleanup instruction does not prove that a creator reaps its own trees; require lifecycle tests and live plugin discovery before suppressing its alerts.
+- Recovering a damaged SQLite database by hand as the symptom fix. Several agents chasing the same alert
+  each swap a rebuilt copy in, and every `mv` or sidecar `rm` under open WAL connections corrupts the next
+  copy (hub kanban.db, 2026-10-28). For a Kanban board, the symptom fix is `hermes kanban [--board <slug>]
+  recover` (single-owner lock; a second run names the holder's card, so comment there), proven by
+  `sqlite3 -readonly <db> 'pragma integrity_check'` = `ok` plus its loss report. Other databases: the
+  sqlite-live-guard `swap_db.py` helper. Never hand-run dump/`.recover` then `mv`.
 - Fixing the copy you can reach when another copy is the source of truth (a mirrored dir, a synced host, a vendored
   file). The next sync silently reverts the fix. Before editing, check what syncs into the file (rsync jobs, mtimes
   with whole-second precision, a "mirror" note). Land the fix at the source, or hand it to whoever owns the source.
