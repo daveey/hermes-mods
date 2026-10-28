@@ -4,7 +4,7 @@ Patches:
 
 - `patches/0549-fix-state-name-call-sites-that-keep-opening-writable.patch`
 - `patches/0579-perf-tui-kanban-notify-poller-skips-boards-whose-fil.patch`
-- `patches/0596-perf-kanban-GET-board-reuses-its-read-while-the-boar.patch`
+- `patches/0598-perf-kanban-GET-board-reuses-its-read-while-the-boar.patch`
 
 Plugin change (no patch, same commit): `plugins/chat-closeout/__init__.py` (`_lineage`, `_compression_tip`).
 
@@ -60,7 +60,7 @@ CPU-minutes in its first three hours. Its REST calls timed out ("Timed out conne
     `_overlay`. `tasks()` 161 -> 31 ms, `sessions()` 87 -> 42 ms per call against the live 16k-row replica.
 
 - Follow-up 2 (backend pid 85854 reloaded with all of the above at 21:32, still 36-47 s CPU per minute): the top
-  REST cost was `GET /api/plugins/kanban/board?board=default` at ~1 s CPU per call (6.5 MB payload). Core 0596
+  REST cost was `GET /api/plugins/kanban/board?board=default` at ~1 s CPU per call (6.5 MB payload). Core 0598
   caches `get_board` per board path + query while `kanban.db`/`-wal` are unchanged (file signature taken before
   the read), at most 15 s old because diagnostics depend on the clock and config; a hit returns a copy with a
   fresh `now`. The endpoint returns `json.dumps` of the board directly (byte-identical to FastAPI's
@@ -104,7 +104,7 @@ is older than `_WRITABLE_OPEN_WARN_INTERVAL_S`. `SessionDB.__init__` calls it wi
   - `TestUnchangedBoardSkip::test_unchanged_board_is_not_reopened_and_a_commit_is_delivered` (fails on the old
     code): no `connect`/`count_notify_subs` on an unchanged board; a completion is delivered on the next tick.
   - `TestUnchangedBoardSkip::test_skip_is_per_session`: one chat's signature never suppresses another's poll.
-- `tests/plugins/test_kanban_board_read_cache.py` (core 0596)
+- `tests/plugins/test_kanban_board_read_cache.py` (core 0598)
   - `test_unchanged_board_is_read_once_and_a_write_is_seen`, `test_query_params_are_cached_separately`,
     `test_cache_expires_after_ttl`. The other 115 kanban dashboard plugin tests pass on the new endpoint body.
 - hermes-mods `plugins/hub-sync/tests/test_hubview.py` (fails on the old code)
