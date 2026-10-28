@@ -1,0 +1,725 @@
+From cb924b52fd6b68d84b97e0a5fa6ec081bb14d136 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:43:33 -0700
+Subject: [PATCH] feat(kanban): defer placement of cards with parents to the
+ routed gateway [daveey]
+
+A card with parents stayed on the creating gateway because dependencies are local
+links, so every orchestrator fan-out child (parents=[self]) and every follow-up of a
+MacBook card ran on the MacBook (15 of 175 cards created in 24 h stayed local only for
+that reason). decide() now applies every other rule first and answers defer=<target>
+for such a card; kanban_create records a placement_deferred event. When its parents
+finish, the dispatcher spawns hermes_cli.kanban_placement_forward instead of a worker:
+it creates the card on the target through hermes-hub (parent handoffs in the body,
+same origin chat), parks the local card on a wait-check probe of the remote card, and
+completes it when the remote card is done, so local grandchildren still wait for the
+real work. Not live / refused / error before the target accepted it -> the deferral is
+cancelled and the forwarder execs the normal worker. kanban.placement.defer_parents
+(default true) turns it off.
+---
+ hermes_cli/kanban_db_dispatch.py          |   8 +
+ hermes_cli/kanban_placement.py            |  20 +-
+ hermes_cli/kanban_placement_forward.py    | 292 ++++++++++++++++++++++
+ tests/hermes_cli/test_kanban_placement.py | 270 +++++++++++++++++++-
+ tools/kanban_tools.py                     |  16 +-
+ 5 files changed, 601 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_placement_forward.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 8c31fae825..f44433e708 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -3201,6 +3201,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
+     # The module argv must carry the import context that made it resolvable:
+     # the shim's in-process path injection is invisible to the bare child.
+     _propagate_module_import_root(cmd, env)
++    # [daveey] Deferred placement: a card with parents that nothing pins here runs on the routed gateway.
++    # Its forwarder (seconds, no LLM) replaces the worker; on any failure it execs ``cmd`` itself.
++    from hermes_cli.kanban_placement_forward import forward_argv
++    forward = forward_argv(task, board, cmd)
++    if forward:
++        from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
++        pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
++        cmd = forward
+     # A worker spawned by a managed systemd gateway must leave the gateway's
+     # cgroup before startup; otherwise restarting the service kills the worker
+     # that is performing the handoff.
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 8048976cc2..8207b7e02c 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -10,7 +10,13 @@ for it, and it runs (and burns CPU) on the target.
+ A card stays local when any of these holds:
+ 
+ * the caller pinned it: ``placement="local"``;
+-* it cannot be expressed remotely: parents (dependencies are local links), a project, a ``dir`` or
++* it has parents and ``defer_parents`` is off. With it on (the default) a card with parents and no
++  other local-only need is created here as a local dependency and returns ``{"where": "local",
++  "defer": <target>}``: ``kanban_create`` records a ``placement_deferred`` event, and when its parents
++  finish the dispatcher runs :mod:`hermes_cli.kanban_placement_forward` instead of a worker, which
++  creates the card on the target (parent handoffs in the body, same origin chat) and parks the local
++  card until the target's card is done, so local grandchildren still wait for the real work;
++* it cannot be expressed remotely: a project, a ``dir`` or
+   ``worktree`` workspace, a non-default board or assignee, courier (origin) creation, or creation
+   options ``hermes-hub create-task`` cannot carry (an initial status, a human request, a tenant). A
+   hermes-hub client with ``create-task --option`` (1.8.0+) carries skills, the runtime budget, priority,
+@@ -316,7 +322,7 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         out = _decide(args, origin_intent=origin_intent, now=now, cfg=cfg, self_gw=sg, live=live,
+                       locate=locate, carries=carries)
+         pin = explicit_foreign_pin(args, sg)
+-        if pin and origin_intent is None and out.get("where") == "local":
++        if pin and origin_intent is None and out.get("where") == "local" and not out.get("defer"):
+             return {"where": "refuse", "why": out.get("why", ""), "pin": pin}
+         return out
+     except Exception as exc:
+@@ -350,7 +356,11 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+             return {"where": "local", "why": f"placement {pin!r} is not a routed gateway (only {target!r})"}
+         if origin_intent is not None:
+             return {"where": "local", "why": "courier creation for another gateway"}
+-        if args.get("parents"):
++        # Parents are local links, so the card is created here; with ``defer_parents`` (default on) it
++        # still runs on the target: the dispatcher forwards it there once its parents finish
++        # (:mod:`hermes_cli.kanban_placement_forward`). Every other rule still applies first.
++        has_parents = bool(args.get("parents"))
++        if has_parents and not _bool(c.raw.get("defer_parents", True)):
+             return {"where": "local", "why": "has parents (dependencies are local links)"}
+         if (args.get("workspace_kind") or "scratch") != "scratch":
+             return {"where": "local", "why": f"{args.get('workspace_kind')} workspace"}
+@@ -377,6 +387,10 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+                                 args.get("skills"), c)
+             if hit:
+                 return {"where": "local", "why": f"local marker: {hit}"}
++        if has_parents:
++            # Liveness is checked when the card is forwarded, not now: its parents may run for hours.
++            return {"where": "local", "defer": target,
++                    "why": f"has parents: created here and forwarded to {target} once they finish"}
+         dead = (live or (lambda t: target_live(t, now=now, live_seconds=c.live_seconds())))(target)
+         if dead:
+             return {"where": "local", "why": f"{target} not live: {dead}"}
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+new file mode 100644
+index 0000000000..ef7d79105e
+--- /dev/null
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -0,0 +1,292 @@
++"""Deferred placement: a card with parents runs on the routed gateway once its parents finish. [daveey]
++
++:func:`hermes_cli.kanban_placement.decide` keeps a card with parents here (parents are local links),
++but when nothing else pins it to this machine it answers ``defer=<target>`` and ``kanban_create``
++records a ``placement_deferred`` event (:func:`record_deferral`). The card waits in ``todo`` like any
++child. When its parents finish and the dispatcher claims it, ``_default_spawn`` runs this module
++instead of an LLM worker (:func:`forward_argv`); it costs seconds, not a worker:
++
++1. Forward: create the card on the target through ``hermes-hub create-task`` (the same origin-bound
++   path :func:`kanban_placement.create_remote` uses, so it shows in the chat that asked for it), with
++   the parents' handoffs in the body. Then park the local card ``scheduled`` with a wake probe on the
++   target's card (``hermes kanban wait-check task <id> --gateway <target> --until done,archived``).
++   The local card stays open, so local cards that depend on it keep waiting for the real work.
++2. Settle (woken by that probe): the target's card is done -> complete the local card with a pointer
++   to it, which releases the local children. Archived there -> block here for a decision. Anything
++   else -> park again.
++
++Any failure before the target accepted the card (target not live for :data:`MAX_NOT_LIVE` attempts,
++refused, an exception) cancels the deferral (``placement_deferred_cancelled``) and ``exec``s the
++normal worker command, so the card still runs, here. Never a silent stall.
++"""
++from __future__ import annotations
++
++import json
++import os
++import shlex
++import sqlite3
++import sys
++import time
++from datetime import datetime, timezone, UTC
++from typing import Callable, Optional
++
++DEFERRED = "placement_deferred"
++FORWARDED = "placement_forwarded"
++CANCELLED = "placement_deferred_cancelled"
++NOT_LIVE = "placement_forward_not_live"
++MAX_NOT_LIVE = 3
++REQUEUE_SECONDS = 600          # retry a not-live target / a still-queued request after this long
++SETTLE_PARK_SECONDS = 14 * 86400  # timer backstop of the settle park; the wake probe ends it first
++CHECK_EVERY = 300
++AWAIT_BUDGET = 45.0
++UNTIL = ("done", "archived")
++MODULE = "hermes_cli.kanban_placement_forward"
++
++
++# --- state -------------------------------------------------------------------------------------
++
++def record_deferral(conn: sqlite3.Connection, task_id: str, *, target: str, origin_session: Optional[str],
++                    origin_profile: str) -> None:
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        kb._append_event(conn, task_id, DEFERRED, {
++            "target": target, "origin_session": origin_session or None, "origin_profile": origin_profile})
++
++
++def state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """The active deferral of ``task_id`` (``target``, origin, and once forwarded ``request_id`` /
++    ``remote_task_id``), or None when there is none or it was cancelled."""
++    rows = conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN (?, ?, ?, ?) ORDER BY id",
++        (task_id, DEFERRED, FORWARDED, CANCELLED, NOT_LIVE)).fetchall()
++    out: Optional[dict] = None
++    for kind, raw in rows:
++        try:
++            payload = json.loads(raw or "{}")
++        except ValueError:
++            payload = {}
++        if kind == DEFERRED:
++            out = {**payload, "not_live": 0}
++        elif kind == CANCELLED:
++            out = None
++        elif out is not None and kind == FORWARDED:
++            out.update({k: v for k, v in payload.items() if v})
++        elif out is not None and kind == NOT_LIVE:
++            out["not_live"] = int(out.get("not_live") or 0) + 1
++    return out if out and out.get("target") else None
++
++
++def forward_argv(task, board: Optional[str], worker_cmd: list) -> Optional[list]:
++    """The command the dispatcher runs for ``task`` instead of ``worker_cmd`` when its placement is
++    deferred, else None. Review-lane spawns and any error return None (the normal worker). Never raises."""
++    try:
++        if "sdlc-review" in (getattr(task, "skills", None) or []):
++            return None
++        from hermes_cli import kanban_db as kb
++        path = kb.kanban_db_path(board=board)
++        if not os.path.exists(path):
++            return None
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
++        try:
++            st = state(conn, task.id)
++        finally:
++            conn.close()
++        if not st:
++            return None
++        return [sys.executable, "-m", MODULE, "--", *[str(x) for x in worker_cmd]]
++    except Exception:
++        return None
++
++
++# --- the forwarder -----------------------------------------------------------------------------
++
++def _iso(ts: float) -> str:
++    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def wake_probe(target: str, remote_tid: str) -> str:
++    return shlex.join(["hermes", "kanban", "wait-check", "task", remote_tid, "--gateway", target,
++                       "--until", ",".join(UNTIL)])
++
++
++def remote_args(conn: sqlite3.Connection, task, *, self_gw: str) -> dict:
++    """The ``kanban_create`` view of the local card sent to the target: its options, and the body with
++    the parents' handoffs (the target cannot read this board)."""
++    from hermes_cli import kanban_db as kb
++    parents = kb.parent_ids(conn, task.id)
++    summaries = kb.latest_summaries(conn, parents) if parents else {}
++    lines = []
++    for pid in parents:
++        p = kb.get_task(conn, pid)
++        handoff = (summaries.get(pid) or (p.result if p else None) or "(no handoff)").strip()
++        lines.append(f"- {pid} ({p.title if p else '?'}): {handoff[:1500]}")
++    body = (task.body or "").rstrip()
++    if lines:
++        body += (f"\n\n---\nParent handoffs (the parents ran on {self_gw}; read them there with "
++                 f"cross_task @task:default@{self_gw}/<id>):\n" + "\n".join(lines))
++    body += f"\n\nThis card was {self_gw} card {task.id}; it completes there when this one is done."
++    return {
++        "title": task.title, "body": body, "assignee": task.assignee or "default",
++        "skills": task.skills or None, "requires": task.requires or None,
++        "max_runtime_seconds": task.max_runtime_seconds, "priority": task.priority or None,
++        "model": task.model_override, "provider": task.provider_override if task.model_override else None,
++        "goal_mode": bool(task.goal_mode), "goal_max_turns": task.goal_max_turns if task.goal_mode else None,
++        "completion_contract": task.completion_contract,
++        # One request per local card: a re-forward after a crash maps to the same hub request.
++        "idempotency_key": f"placement-forward:{self_gw}:{task.id}",
++    }
++
++
++class Forwarder:
++    """One forwarder run for one claimed card. The collaborators are attributes so tests swap them."""
++
++    def __init__(self, conn: sqlite3.Connection, task_id: str, run_id: Optional[int], *,
++                 now: Optional[Callable[[], float]] = None):
++        from hermes_cli import kanban_capability_registry as reg
++        from hermes_cli import kanban_placement as kp
++        from hermes_cli import kanban_wait_check as kwait
++        self.conn, self.task_id, self.run_id = conn, task_id, run_id
++        self.now = now or time.time
++        self.cfg = kp.config()
++        self.self_gw = reg.self_gateway() or "local"
++        self.hub_cli = reg.hub_cli_path(self.cfg.get("hub_cli"))
++        self.live = lambda t: kp.target_live(t, now=self.now(), live_seconds=kp._Cfg(self.cfg).live_seconds())
++        self.create = kp.create_remote
++        self.await_id = kp.await_task_id
++        self.remote_task_id = kp.remote_task_id
++        self.check = lambda gw, tid: kwait.check_remote(gw, "task", tid, until=UNTIL)
++
++    # Each step returns a short action word; "fallback" means: exec the normal worker.
++    def run(self) -> str:
++        from hermes_cli import kanban_db as kb
++        task = kb.get_task(self.conn, self.task_id)
++        st = state(self.conn, self.task_id)
++        if task is None or st is None:
++            return "fallback"
++        target = st["target"]
++        rtid = st.get("remote_task_id")
++        if not rtid and st.get("request_id"):
++            rtid = self.remote_task_id(st["request_id"])
++            if rtid:
++                self._event(FORWARDED, {"request_id": st["request_id"], "remote_task_id": rtid})
++        if rtid:
++            return self._settle(task, target, rtid)
++        if st.get("request_id"):
++            # Sent earlier, the target has not applied it yet: wait for it, never send a second card.
++            return self._await(task, target, st["request_id"])
++        return self._forward(task, target, st)
++
++    def _forward(self, task, target: str, st: dict) -> str:
++        dead = self.live(target)
++        if dead:
++            if int(st.get("not_live") or 0) + 1 >= MAX_NOT_LIVE:
++                return self._cancel(f"{target} not live {MAX_NOT_LIVE} times: {dead}")
++            self._event(NOT_LIVE, {"why": dead})
++            return self._park_clock(f"{target} is not live yet ({dead}); retrying the forward")
++        args = remote_args(self.conn, task, self_gw=self.self_gw)
++        placed = self.create(args, target=target, origin_session=st.get("origin_session"),
++                             origin_profile=st.get("origin_profile") or "default", self_gw=self.self_gw,
++                             cfg=self.cfg, hub_cli=self.hub_cli)
++        if not placed.get("ok"):
++            return self._cancel(f"{target} refused the card: {placed.get('error')}")
++        rid = placed["request_id"]
++        self._event(FORWARDED, {"request_id": rid, "queued_only": bool(placed.get("queued_only"))})
++        return self._await(task, target, rid)
++
++    def _await(self, task, target: str, rid: str) -> str:
++        tid, _status = self.await_id(rid, hub_cli=self.hub_cli, budget=AWAIT_BUDGET)
++        if not tid:
++            return self._park_clock(f"request {rid} is queued for {target}; waiting for {target} to make the card")
++        self._event(FORWARDED, {"request_id": rid, "remote_task_id": tid})
++        from hermes_cli import kanban_db as kb
++        kb.add_comment(self.conn, self.task_id, "placement",
++                       f"Forwarded to {target} as {tid} (kanban.placement: its parents finished and nothing "
++                       f"here needs this machine). This card completes when {tid} is done.")
++        return self._park_remote(target, tid)
++
++    def _settle(self, task, target: str, rtid: str) -> str:
++        from hermes_cli import kanban_db as kb
++        rc, out = self.check(target, rtid)
++        words = (out or "").split()
++        status = words[1] if rc == 0 and len(words) >= 2 and words[0] == rtid else ""
++        if status == "done":
++            ok = kb.complete_task(
++                self.conn, self.task_id, expected_run_id=self.run_id,
++                summary=(f"Ran on {target} as {rtid} (deferred placement), which is done. Its handoff is on "
++                         f"that card: cross_task @task:default@{target}/{rtid}."),
++                metadata={"placement": {"gateway": target, "remote_task_id": rtid}})
++            return "completed" if ok else "complete-refused"
++        if status == "archived":
++            ok = kb.block_task(
++                self.conn, self.task_id, kind="needs_input", expected_run_id=self.run_id,
++                reason=(f"This card ran on {target} as {rtid}, which was archived there without finishing. "
++                        "1) If the work is still wanted, unblock this card: it then runs here. "
++                        "2) Otherwise archive this card."))
++            if ok:
++                self._event(CANCELLED, {"why": f"{rtid} archived on {target}"})
++            return "blocked"
++        return self._park_remote(target, rtid)
++
++    # --- transitions ---------------------------------------------------------------------------
++
++    def _event(self, kind: str, payload: dict) -> None:
++        from hermes_cli import kanban_db as kb
++        with kb.write_txn(self.conn):
++            kb._append_event(self.conn, self.task_id, kind, payload)
++
++    def _cancel(self, why: str) -> str:
++        self._event(CANCELLED, {"why": why})
++        return "fallback"
++
++    def _park_remote(self, target: str, rtid: str) -> str:
++        from hermes_cli import kanban_awaiting as kaw
++        from hermes_cli import kanban_db as kb
++        awaiting = {"kind": "card", "ref": rtid, "gateway": target}
++        kaw.confirm_remote(awaiting)  # ssh, before the write txn
++        ok = kb.schedule_task(
++            self.conn, self.task_id, expected_run_id=self.run_id, awaiting=awaiting,
++            wake_check=wake_probe(target, rtid), check_every=CHECK_EVERY,
++            reason=(f"SCHEDULED_UNTIL={_iso(self.now() + SETTLE_PARK_SECONDS)} running on {target} as {rtid} "
++                    "(deferred placement); this card completes when that one is done"))
++        return "parked" if ok else "park-refused"
++
++    def _park_clock(self, why: str) -> str:
++        from hermes_cli import kanban_db as kb
++        ok = kb.schedule_task(
++            self.conn, self.task_id, expected_run_id=self.run_id, clock_only=True,
++            awaiting={"kind": "clock"},
++            reason=f"SCHEDULED_UNTIL={_iso(self.now() + REQUEUE_SECONDS)} {why} (deferred placement)")
++        return "requeued" if ok else "park-refused"
++
++
++def main(argv: Optional[list] = None) -> int:
++    argv = list(sys.argv[1:] if argv is None else argv)
++    worker_cmd = argv[argv.index("--") + 1:] if "--" in argv else []
++    task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
++    run_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
++    action = "fallback"
++    try:
++        from hermes_cli import kanban_db_connect as kbc
++        with kbc.connect_closing() as conn:
++            fwd = Forwarder(conn, task_id, int(run_raw) if run_raw else None)
++            try:
++                action = fwd.run()
++            except Exception as exc:  # before the target accepted it: run it here instead
++                print(f"placement forward failed: {exc!r}", flush=True)
++                st = state(conn, task_id)
++                if st and (st.get("request_id") or st.get("remote_task_id")):
++                    # Already sent: a local run would duplicate it. Retry the forward later.
++                    action = fwd._park_clock(f"forward step failed ({type(exc).__name__}); retrying")
++                else:
++                    action = fwd._cancel(f"forward failed: {exc!r}"[:400])
++    except Exception as exc:
++        print(f"placement forward could not open the board: {exc!r}", flush=True)
++        action = "fallback"
++    print(f"placement forward {task_id}: {action}", flush=True)
++    if action == "fallback" and worker_cmd:
++        os.execvp(worker_cmd[0], worker_cmd)
++    return 0 if action != "fallback" else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index b65f339eff..3c39e19e2d 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -8,6 +8,7 @@ every one ran there. ``kanban.placement.route`` sends such cards to the hub thro
+ from __future__ import annotations
+ 
+ import json
++import os
+ import sqlite3
+ import time
+ from pathlib import Path
+@@ -160,7 +161,8 @@ def test_caller_pin_wins_both_ways():
+     # An explicit pin to the target skips the marker heuristic (the caller knows).
+     assert decide({"title": "Chrome-free MacBook docs", "placement": "hub"})["where"] == "hub"
+     # ...but never the structural limits: a pinned gateway that cannot be honoured is refused, not local.
+-    assert decide({"title": "x", "placement": "hub", "parents": ["t_1"]})["where"] == "refuse"
++    # Parents no longer keep a hub-pinned card from the hub: it is deferred there (not refused).
++    assert decide({"title": "x", "placement": "hub", "parents": ["t_1"]}).get("defer") == "hub"
+     # A gateway with no route is not a destination, and never silently becomes a local card.
+     assert decide({"title": "x", "placement": "mini"})["where"] == "refuse"
+     assert decide({"title": "x", "placement": "mini"}, cfg={})["where"] == "refuse"
+@@ -713,3 +715,269 @@ def test_local_marker_decision_is_in_the_create_result(mac):
+     assert hub.get("placed", {}).get("gateway") == "hub" and "placement" not in hub, hub
+     structural = json.loads(kt._handle_create({"title": "Keep this one here", "goal_mode": True}))
+     assert structural["ok"] and "placed" not in structural and "placement" not in structural, structural
++
++
++
++# --- deferred placement: cards with parents run on the target once the parents finish ---------
++
++def test_child_with_parents_and_no_local_need_is_deferred_to_the_target():
++    d = decide({"title": "Fix the flaky lint", "body": "Push it.", "parents": ["t_1"]})
++    assert d["where"] == "local" and d["defer"] == "hub" and "parents" in d["why"], d
++
++
++@pytest.mark.parametrize("extra,why", [
++    ({"title": "Read the Chrome tab"}, "local marker"),
++    ({"skills": ["apple-notes"]}, "skill apple-notes"),
++    ({"workspace_kind": "dir", "workspace_path": "/tmp/x"}, "dir"),
++    ({"board": "links"}, "board"),
++    ({"initial_status": "blocked"}, "initial_status"),
++])
++def test_child_with_parents_and_a_local_need_stays_local_and_is_not_deferred(extra, why):
++    d = decide({"title": "Fix the flaky lint", "parents": ["t_1"], **extra})
++    assert d["where"] == "local" and not d.get("defer") and why in d["why"], d
++
++
++def test_defer_parents_off_keeps_children_local():
++    d = decide({"title": "Fix the flaky lint", "parents": ["t_1"]}, cfg={**ROUTE, "defer_parents": False})
++    assert d["where"] == "local" and not d.get("defer") and "parents" in d["why"], d
++
++
++def test_deferral_does_not_need_the_target_live_now():
++    d = decide({"title": "Fix the flaky lint", "parents": ["t_1"]}, live=lambda t: "down")
++    assert d.get("defer") == "hub", d
++
++
++def test_pin_to_the_target_with_parents_is_deferred_not_refused():
++    d = decide({"title": "Fix the flaky lint", "parents": ["t_1"], "placement": "hub"})
++    assert d["where"] == "local" and d.get("defer") == "hub", d
++
++
++HUB_TID = "t_01a1ffff00000001"
++
++
++def _done_parent(kb, conn, title="Parent work"):
++    pid = kb.create_task(conn, title=title, assignee="default")
++    kb.complete_task(conn, pid, summary=f"{title}: did the thing", force=True)
++    return pid
++
++
++def _forwarder(conn, tid, mac, monkeypatch, *, check=(1, "x"), await_tid=HUB_TID):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_placement_forward as kpf
++    from hermes_cli import kanban_wait_check as kwait
++    monkeypatch.setattr(kwait, "check_remote", lambda gw, kind, tid_, **kw: (1, f"{tid_} ready"))
++    claimed = kb.claim_task(conn, tid)
++    assert claimed is not None
++    f = kpf.Forwarder(conn, tid, claimed.current_run_id)
++    f.live = lambda t: None
++    f.await_id = lambda rid, **kw: (await_tid, "ready")
++    f.check = lambda gw, rtid: check
++    return f
++
++
++def test_kanban_create_with_parents_creates_a_local_deferred_card(mac):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="Orchestrate", assignee="default")
++    out = json.loads(kt._handle_create({"title": "Fix the flaky lint", "body": "Push it.", "parents": [parent],
++                                        "session_id": "20261027_183000_abc123"}))
++    assert out["ok"] and out["placement"]["defer"] == "hub" and "placed" not in out, out
++    assert mac["calls"] == []  # nothing sent to the hub yet
++    with kbc.connect_closing() as conn:
++        st = kpf.state(conn, out["task_id"])
++        assert st["target"] == "hub" and st["origin_session"] == "20261027_183000_abc123"
++        assert kb.get_task(conn, out["task_id"]).status == "todo"
++        task = kb.get_task(conn, out["task_id"])
++        assert kpf.forward_argv(task, None, ["hermes", "chat"])[1:4] == ["-m", kpf.MODULE, "--"]
++        task.skills = ["sdlc-review"]  # the review lane always runs a real reviewer
++        assert kpf.forward_argv(task, None, ["hermes", "chat"]) is None
++    marked = json.loads(kt._handle_create({"title": "Read the Chrome tab", "parents": [parent]}))
++    with kbc.connect_closing() as conn:
++        assert kpf.state(conn, marked["task_id"]) is None
++        assert kpf.forward_argv(kb.get_task(conn, marked["task_id"]), None, ["hermes"]) is None
++
++
++def test_forwarder_sends_the_card_with_parent_handoffs_and_parks_until_the_hub_card_is_done(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="Orchestrate", assignee="default")
++    created = json.loads(kt._handle_create({"title": "Fix the flaky lint", "body": "Push it.", "parents": [parent],
++                                          "max_runtime_seconds": 900,
++                                          "session_id": "20261027_183000_abc123"}))
++    assert created.get("task_id"), created
++    child = created["task_id"]
++    with kbc.connect_closing() as conn:
++        grandchild = kb.create_task(conn, title="Verify the lint fix live", assignee="default", parents=(child,))
++        kb.complete_task(conn, parent, summary="fanned out; lint fix is the child", force=True)
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, child).status == "ready"
++        assert kb.get_task(conn, grandchild).status == "todo"
++        f = _forwarder(conn, child, mac, monkeypatch)
++        assert f.run() == "parked"
++        argv = mac["calls"][0]
++        assert argv[1:3] == ["create-task", "hub"]
++        assert argv[argv.index("--origin-session") + 1] == "20261027_183000_abc123"
++        body = argv[argv.index("--body") + 1]
++        assert body.startswith("Push it.") and "fanned out; lint fix is the child" in body and child in body
++        assert "Runtime budget asked by the creator: 900 s." in body  # options travel with the card
++        t = kb.get_task(conn, child)
++        assert t.status == "scheduled"
++        ev = [e for e in kb.list_events(conn, child) if e.kind == "scheduled"][-1]
++        assert f"wait-check task {HUB_TID} --gateway hub --until done,archived" in json.dumps(ev.payload)
++        assert kpf.state(conn, child)["remote_task_id"] == HUB_TID
++        # Woken while the hub card still runs: park again, the grandchild keeps waiting.
++        kb.unblock_task(conn, child)
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, check=(1, HUB_TID + " running"))
++        assert f.run() == "parked" and len(mac["calls"]) == 1  # never a second card
++        assert kb.get_task(conn, grandchild).status == "todo"
++        # The hub card is done: the local card completes and releases the grandchild.
++        kb.unblock_task(conn, child)
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, check=(0, HUB_TID + " done"))
++        assert f.run() == "completed"
++        assert kb.get_task(conn, child).status == "done"
++        assert HUB_TID in (kb.latest_summary(conn, child) or "")
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, grandchild).status == "ready"
++        assert len(mac["calls"]) == 1
++
++
++def test_forwarder_falls_back_to_a_local_worker_when_the_hub_refuses(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    mac["result"]["rc"] = 1
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch)
++        assert f.run() == "fallback"
++        assert kpf.state(conn, child) is None
++        assert kb.get_task(conn, child).status == "running"  # the exec'd worker owns this claim
++        assert kpf.forward_argv(kb.get_task(conn, child), None, ["hermes"]) is None
++
++
++def test_forwarder_retries_a_target_that_is_not_live_then_runs_it_here(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        actions = []
++        for _ in range(kpf.MAX_NOT_LIVE):
++            f = _forwarder(conn, child, mac, monkeypatch)
++            f.live = lambda t: "sync stale"
++            actions.append(f.run())
++            if kb.get_task(conn, child).status == "scheduled":
++                kb.unblock_task(conn, child)
++                kb.recompute_ready(conn)
++        assert actions == ["requeued"] * (kpf.MAX_NOT_LIVE - 1) + ["fallback"], actions
++        assert mac["calls"] == [] and kpf.state(conn, child) is None
++
++
++def test_forwarder_waits_for_a_queued_request_without_sending_it_twice(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++        assert f.run() == "requeued" and kb.get_task(conn, child).status == "scheduled"
++        kb.unblock_task(conn, child)
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=HUB_TID)
++        assert f.run() == "parked"
++        assert len(mac["calls"]) == 1
++
++
++def test_hub_card_archived_blocks_the_local_card_for_a_decision(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        assert _forwarder(conn, child, mac, monkeypatch).run() == "parked"
++        kb.unblock_task(conn, child)
++        kb.recompute_ready(conn)
++        assert _forwarder(conn, child, mac, monkeypatch, check=(0, HUB_TID + " archived")).run() == "blocked"
++        assert kb.get_task(conn, child).status == "blocked"
++        assert kpf.state(conn, child) is None  # an unblock runs it here
++
++
++def test_main_execs_the_worker_when_forwarding_falls_back(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    mac["result"]["rc"] = 1
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        claimed = kb.claim_task(conn, child)
++    monkeypatch.setattr(kpf.Forwarder, "__init__", _patched_init(kpf.Forwarder.__init__))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
++    execs = []
++    monkeypatch.setattr(kpf.os, "execvp", lambda f, argv: execs.append(argv))
++    kpf.main(["--", "hermes", "-p", "default", "chat"])
++    assert execs == [["hermes", "-p", "default", "chat"]]
++
++
++def _patched_init(orig):
++    def init(self, *a, **kw):
++        orig(self, *a, **kw)
++        self.live = lambda t: None
++    return init
++
++
++def test_dispatcher_spawns_the_forwarder_for_a_deferred_card(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as kdd
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    plain = json.loads(kt._handle_create({"title": "Read the Chrome tab", "parents": [parent]}))["task_id"]
++    spawned = {}
++
++    class P:
++        pid = 4242
++
++    def popen(cmd, **kw):
++        spawned[kw["env"]["HERMES_KANBAN_TASK"]] = cmd
++        return P()
++
++    monkeypatch.setattr(kdd.subprocess, "Popen", popen)
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        for tid in (child, plain):
++            claimed = kb.claim_task(conn, tid)
++            kdd._default_spawn(claimed, str(Path(os.environ["HERMES_HOME"])))
++    assert "hermes_cli.kanban_placement_forward" in spawned[child], spawned[child]
++    tail = spawned[child][spawned[child].index("--") + 1:]
++    assert "chat" in tail  # the worker it execs on fallback
++    assert "hermes_cli.kanban_placement_forward" not in spawned[plain]
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index f6617d775c..74b6e358fd 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1508,6 +1508,9 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             return _placement_refused(decision["pin"], decision.get("why", "")), None
+         if target == "local":
+             why = decision.get("why") or ""
++            if decision.get("defer"):
++                # Parents are local links: created here, forwarded to the target once they finish.
++                return None, {"where": "local", "defer": decision["defer"], "why": why}
+             if why.startswith("local marker"):
+                 logger.info("kanban placement: local (%s)", why)
+                 return None, {"where": "local", "why": why, "remedy": kp.LOCAL_MARKER_REMEDY}
+@@ -1698,7 +1701,18 @@ def _handle_create(args: dict, **kw) -> str:
+             }}
+         if origin is not None:
+             extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
+-        if marker_placement:
++        if marker_placement and marker_placement.get("defer"):
++            # [daveey] Run on the routed gateway once the parents finish (kanban_placement_forward).
++            from hermes_cli import kanban_placement_forward as _kpf
++            from hermes_cli.profiles import current_profile_name as _cpn
++            _kpf.record_deferral(conn, new_tid, target=marker_placement["defer"], origin_session=session_id,
++                                 origin_profile=_cpn("default") or "default")
++            extra["placement"] = {"where": "local", "defer": marker_placement["defer"],
++                                  "why": marker_placement["why"]}
++            extra["note"] = (f"Created here as {new_tid} so it can wait on its parents; it runs on "
++                             f"{marker_placement['defer']}, not here: when the parents finish the dispatcher "
++                             f"forwards it there and this card completes when that one does.")
++        elif marker_placement:
+             extra["placement"] = {"where": marker_placement["where"], "why": marker_placement["why"]}
+             extra["remedy"] = marker_placement["remedy"]
+         if origin_intent is None and args.get("requires"):
+-- 
+2.55.0
+

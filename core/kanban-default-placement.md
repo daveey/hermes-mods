@@ -29,8 +29,10 @@ result has `placed.retry: true` and returns the same card.
 The card stays local (created here as before) when any of these holds:
 
 - the caller passed `placement="local"` (new `placement` parameter on `kanban_create`; `placement=<target>` pins it remote and skips the marker check);
-- it has parents, a project, a `dir`/`worktree` workspace, a non-default board or a non-default assignee
-  (`kanban.placement.assignees`, default `["default"]`);
+- it has a project, a `dir`/`worktree` workspace, a non-default board or a non-default assignee
+  (`kanban.placement.assignees`, default `["default"]`); a card with parents is created here but, since
+  **0695**, still runs on the target once its parents finish (see "Deferred placement" below), unless
+  `kanban.placement.defer_parents: false` or another rule here keeps it local;
 - it is courier creation for another gateway (`origin_intent`);
 - it uses options `hermes-hub create-task` cannot carry: `initial_status`, `human_request`, `tenant` (and, with a
   hermes-hub client older than 1.8.0, `model`, `provider`, `goal_mode`, `triage` or a non-`local-only`
@@ -155,6 +157,62 @@ gateway has, so capability routing opens an owner card back there.
   coverage claimed here. These test descriptions come from the commits; no tests were run for this doc update.
 
 Untested: the CLI (`hermes kanban create`) and `execute_code` creation paths do not call placement (only the `kanban_create` tool does), and `test_kanban_create_entry_parity.py` has no placement case.
+
+## Deferred placement for cards with parents (0695)
+
+Why: parents are local links, so a card with parents was always created and run on the creating gateway. Every
+orchestrator fan-out child (`parents=[self]`) and every follow-up of a laptop card ran on the laptop: on the
+MacBook, 15 of the 175 cards created in the 24 h before the change stayed local only because of `parents`
+(replayed through `decide()` with the parents dropped).
+
+Behavior:
+
+- `decide()` applies every other rule first. A card with parents and no other local-only need returns
+  `{"where": "local", "defer": <target>, "why": "has parents: ..."}`. Target liveness is not checked then (the
+  parents may run for hours), and an explicit `placement=<target>` with parents is deferred, not refused.
+- `kanban_create` creates the card here (it waits in `todo` on its parents as usual), records a
+  `placement_deferred` event `{target, origin_session, origin_profile}` and returns
+  `placement: {where: "local", defer, why}` plus a note.
+- When the parents finish and the dispatcher claims the card, `_default_spawn` runs
+  `python -m hermes_cli.kanban_placement_forward -- <worker argv>` instead of the LLM worker
+  (`forward_argv()`; review-lane spawns always get the real reviewer). The forwarder:
+  1. creates the card on the target through `create_remote()` (same origin chat; options carried as before),
+     with the parents' latest handoffs appended to the body and idempotency key `placement-forward:<gw>:<task>`,
+     waits up to 45 s for the target's task id, comments on the local card, and parks it `scheduled` with
+     `awaiting={kind: card, ref: <remote id>, gateway: <target>}` and wake probe
+     `hermes kanban wait-check task <remote id> --gateway <target> --until done,archived`;
+  2. when woken: remote `done` → completes the local card (summary points at the remote card), which releases
+     local children; remote `archived` → blocks the local card `needs_input` and cancels the deferral (an unblock
+     runs it here); otherwise parks again. A request still queued after the wait parks 10 min and waits for
+     the same request, never sending a second card.
+- Fallback: a target that is not live 3 times, a refusal, or an exception before the target accepted the card
+  appends `placement_deferred_cancelled` and `exec`s the normal worker with the same claim, so the card runs here
+  rather than stalling. After the target accepted it, an exception parks and retries instead (a local run would
+  duplicate it).
+
+Code: `hermes_cli/kanban_placement.py` (`_decide` defer branch, `decide` does not refuse a deferral),
+`hermes_cli/kanban_placement_forward.py` (new: `record_deferral`, `state`, `forward_argv`, `Forwarder`, `main`),
+`hermes_cli/kanban_db_dispatch.py` (`_default_spawn` hook), `tools/kanban_tools.py` (`_place_remote` defer result,
+`_handle_create` records it).
+
+Tests (`tests/hermes_cli/test_kanban_placement.py`, 105 pass; 17 RED with the source change stashed):
+`test_child_with_parents_and_no_local_need_is_deferred_to_the_target`,
+`test_child_with_parents_and_a_local_need_stays_local_and_is_not_deferred` (marker, skill, dir, board,
+initial_status), `test_defer_parents_off_keeps_children_local`, `test_deferral_does_not_need_the_target_live_now`,
+`test_pin_to_the_target_with_parents_is_deferred_not_refused`, `test_caller_pin_wins_both_ways` (updated: a hub pin
+with parents is deferred), the tool path `test_kanban_create_with_parents_creates_a_local_deferred_card`, the forwarder
+`test_forwarder_sends_the_card_with_parent_handoffs_and_parks_until_the_hub_card_is_done` (a local grandchild waits
+until the remote card is done), `test_forwarder_falls_back_to_a_local_worker_when_the_hub_refuses`,
+`test_forwarder_retries_a_target_that_is_not_live_then_runs_it_here`,
+`test_forwarder_waits_for_a_queued_request_without_sending_it_twice`,
+`test_hub_card_archived_blocks_the_local_card_for_a_decision`, `test_main_execs_the_worker_when_forwarding_falls_back`
+and the dispatcher path `test_dispatcher_spawns_the_forwarder_for_a_deferred_card`. Untested: the real `hermes-hub`
+binary and the ssh wait-check (both stubbed); the CLI `hermes kanban create` path does not defer (it never placed).
+
+Gotchas: the local card stays open (`scheduled`) while the remote one runs, so the creating chat shows two rows
+for the work: the local stub and the remote card. A `kanban.sync.pickup` worker node (see
+[kanban-central-service.md](kanban-central-service.md)) could run such a card under a Board lease instead of a
+forwarded copy; this patch does not depend on it.
 
 ## Carried options (0572)
 
