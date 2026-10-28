@@ -82,7 +82,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           prev or _last_assistant(conversation_history), platform, parent_session_id,
                           list(coach.loop_state(session_id).get("last_log") or []))
             loop_hint = _fix_loop(session_id, user_message, turn)
-            hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "") if h)
+            stall_hint = _stalled_goal(session_id, platform)
+            hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", stall_hint or "") if h)
             return {"context": hint} if hint else None
         except Exception as exc:
             log.debug("coach pre_llm_call: %s", exc)
@@ -191,6 +192,21 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             return " ".join(h for h in (hit["hint"], _fixloop_card(session_id, st, hit, user_message, turn)) if h)
         except Exception as exc:
             log.debug("coach fix_loop: %s", exc)
+            return None
+
+    def _stalled_goal(session_id, platform=""):
+        """This chat's card graph has a delivery card that hasn't moved for a day while the rest of the graph keeps
+        spending runs -> one "take over" line per incident (stalled_goal.py). Fail-open."""
+        try:
+            if platform in ("cron",):
+                return None
+            sg = _load("stalled_goal")
+            if not sg.enabled():
+                return None
+            ids = _load("reply_check")._lineage(session_id)
+            return sg.session_hint(ids, store.root, log=store.log)
+        except Exception as exc:
+            log.debug("coach stalled_goal: %s", exc)
             return None
 
     def _fixloop_card(session_id, st, hit, user_message, turn):

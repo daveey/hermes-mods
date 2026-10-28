@@ -138,8 +138,86 @@ def unverified_owner(reply: str, tool_log: Optional[list] = None) -> Optional[st
     return m.group(0).strip()
 
 
-RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only")
-DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only")
+# status_only: the user asks why it's waiting / what's going on / to finish it, and the turn only reopened, unblocked,
+# commented on or looked at cards (defect agent-38a817308d: four "reopened the card / verified ready" replies while the
+# rollout card sat unstarted for 4 days). Deterministic, before the judge: the report_only owner-check exemption
+# counts exactly those card operations as acting, so the judge path let all four through.
+PROGRESS_ASK_RE = re.compile(
+    r"\bwhya?\b[^.?!\n]{0,40}\b(?:wait\w*|block\w*|stuck|slow|tak\w+ so long|still|stall\w*|not (?:done|finished|"
+    r"started|running|moving))\b"
+    r"|\bwhat(?:'s|’s| is| are)? (?:you |we |it )?(?:doing|going on|happening|the (?:status|hold-?up|delay))\b"
+    r"|\bwhats going on\b|\b(?:status|progress)\b\s*\??\s*$|\bany (?:update|news|progress)\b"
+    r"|\bis (?:it|this|that) (?:done|finished|live|deployed|merged) yet\b|\bhow long\b|\bwhere are we\b"
+    r"|\bstill (?:waiting|blocked|not)\b|\bwhy (?:hasn'?t|isn'?t|aren'?t|haven'?t)\b"
+    r"|\b(?:finish|complete|ship|deploy|land) (?:it|this|that|them)\b|\bjust (?:finish|complete|ship|deploy|land)\b"
+    r"|\bcan you just\b"
+    r"|\bget (?:it|this) done\b|\bmake (?:all )?the (?:corrections|changes|fix(?:es)?)\b", re.I | re.M)
+# A wall only the user (or an outside party) can clear, named in the reply: then a status turn is the right answer.
+WALL_RE = re.compile(
+    r"\bonly you\b|\bneeds? (?:you|your)\b|\byour (?:password|approval|login|2fa|decision|click|hands)\b"
+    r"|\b(?:billing|payment|spending limit|outage)\b|\bphysical(?:ly)?\b|\bsign(?:ed)? in\b|\blog(?:ged)? in\b", re.I)
+# Card bookkeeping (reopen/unblock/comment/show/list, cross-gateway reads) and reads: not a step on the work itself.
+CARD_TOOLS = ("kanban_show", "kanban_list", "kanban_comment", "kanban_unblock", "kanban_heartbeat", "kanban_link",
+              "kanban_unlink", "kanban_block", "kanban_schedule", "kanban_attachments", "cross_task", "cross_session",
+              "session_mentions")
+READ_TOOLS = ("read_file", "search_files", "skill_view", "skills_list", "todo_list", "chat_history_lookup",
+              "process_manage", "process", "tool_search", "tool_describe", "memory", "context_notes")
+_CARD_CMD = re.compile(r"^(?:hermes(?:-hub)?\s+(?:-p\s+\S+\s+)?(?:kanban|tasks|request|links|requests|outcomes|"
+                       r"where|sessions\s+list|status|sync)\b)")
+_READ_CMD = re.compile(r"^(?:cd|ls|cat|head|tail|grep|rg|wc|jq|echo|date|sleep|true|sqlite3\s+-readonly|"
+                       r"gh\s+(?:run|pr|api)\s+(?:view|list|checks|watch|repos/\S+/(?:actions|commits|pulls))|"
+                       r"git\s+(?:status|log|show|diff|fetch|branch|rev-parse))\b")
+_LINE = re.compile(r"^\s*->\s*([A-Za-z_][\w.]*)\((.*)\)\s*$", re.S)
+
+
+def _tool_kind(line: str) -> Optional[str]:
+    """'card' | 'read' | 'work' for one tool-log line (None = not a call line, e.g. an `<- ERROR` line)."""
+    m = _LINE.match(line or "")
+    if not m:
+        return None
+    tool, arg = m.group(1), m.group(2)
+    if tool == "tool_call":
+        names = re.findall(r"[\"']name[\"']\s*:\s*[\"']([\w.]+)[\"']", arg)
+        kinds = {("card" if n in CARD_TOOLS else "read" if n in READ_TOOLS else "work") for n in names} or {"work"}
+        return "work" if "work" in kinds else "card" if "card" in kinds else "read"
+    if tool in CARD_TOOLS:
+        return "card"
+    if tool in READ_TOOLS:
+        return "read"
+    if tool == "terminal":
+        kinds = set()
+        for seg in re.split(r"&&|\|\||;|\|", arg):
+            seg = re.sub(r"^\s*(?:[A-Z_]+=\S+\s+)*", "", seg).strip()
+            if not seg:
+                continue
+            kinds.add("card" if _CARD_CMD.match(seg) else "read" if _READ_CMD.match(seg) else "work")
+        return "work" if "work" in kinds or not kinds else "card" if "card" in kinds else "read"
+    return "work"
+
+
+def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """Evidence string when a progress/finish ask got a turn of card bookkeeping only, else None."""
+    if not PROGRESS_ASK_RE.search(user_ask or "") or not (reply or "").strip():
+        return None
+    kinds = [k for k in (_tool_kind(l) for l in tool_log or []) if k]
+    if "work" in kinds or "card" not in kinds:
+        return None
+    if WALL_RE.search(reply[-1500:]):
+        return None
+    ops = [l.strip()[3:].split("(", 1)[0] for l in tool_log or [] if _tool_kind(l) == "card"]
+    return f"asked \"{(user_ask or '').strip()[:80]}\"; this turn only ran {', '.join(dict.fromkeys(ops))}"
+
+
+STATUS_ONLY_NUDGE = (
+    "[coach] status_only: the user asked about progress or to finish ({evidence}), and this turn only reopened, "
+    "unblocked, commented on or looked at cards. A card being ready or a worker being alive is not progress. Before "
+    "ending: do the next real step on the work yourself now (edit, test, commit, merge, deploy, prove it on the real "
+    "path), or name the one specific wall that stops you (the exact error, or the decision only the user can make). "
+    "Do not reopen, re-review or add another watcher card.")
+
+
+RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only")
+DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85}
@@ -564,6 +642,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "report_only", "p": 1.0, "evidence": phrase, "reason": "unverified_owner",
                     "verdict": {"report_only": 1.0, "report_only_src": "unverified_owner", "evidence": phrase},
                     "nudge": OWNER_NUDGE.format(evidence=phrase[:200]) + (OWNER_KANBAN_DOWN if down else "")}
+    if (not only or "status_only" in only) and not scoped:
+        ev = status_only(user_ask, reply, tool_log)
+        if ev:  # deterministic: the judge path's owner-check exemption counts card bookkeeping as acting
+            return {"rule": "status_only", "p": 1.0, "evidence": ev, "reason": "status_only",
+                    "verdict": {"status_only": 1.0, "evidence": ev},
+                    "nudge": STATUS_ONLY_NUDGE.format(evidence=ev[:200])}
     cands = [r for r in prefilter(reply) if not only or r in only]
     if "report_only" in cands and scoped:
         cands.remove("report_only")
