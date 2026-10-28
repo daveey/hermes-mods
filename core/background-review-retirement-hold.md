@@ -1,7 +1,8 @@
 # A running background review holds backend retirement
 
 Patches: [`patches/0700-fix-retirement-a-running-background-review-holds-the.patch`](patches/0700-fix-retirement-a-running-background-review-holds-the.patch) (fork commit `4101ef7442`),
-[`patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch`](patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch) (fork commit `2d9f16aa2c`, the `hermes update` stop path)
+[`patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch`](patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch) (fork commit `2d9f16aa2c`, the `hermes update` stop path),
+[`patches/0706-fix-retirement-expose-background-reviews-to-cross-pr.patch`](patches/0706-fix-retirement-expose-background-reviews-to-cross-pr.patch) (fork commit `a75e611b06`, the cross-process admission reservation)
 
 ## Why
 
@@ -35,8 +36,20 @@ change, which was lost.
   `⏳ PID <n> is running a background review (background_review:1); waiting for it before stopping …`, then
   `✓ PID <n> finished its background review after <s>s; retirement fence committed, stopping it` (or
   `⚠ … stopping it anyway` at the deadline). `hermes dashboard --stop` keeps its immediate stop.
-- Unchanged: the hermes-sync drain-window probe. The tree move did not kill the reviews; the backend retirement
-  2 minutes later did. Gating the drain on reviews would bring back update starvation.
+- `begin_background_review` also takes an installation-root cross-process admission reservation
+  (`admission_fence.reserve` on `get_default_hermes_root`, not the profile home) before the review is admitted, and
+  keeps it until `end_background_review`. A review with no turn lease still counts as one reservation, so an update
+  hold that already reads reservations sees it. Patch 0700 left the drain probe unchanged on purpose; this patch
+  does not add a probe either. The review now holds the reservation that reader already counts.
+- A new review is refused while an update hold stands (`reserve` returns None because the hold is set). Another
+  review's reservation does not by itself refuse a new one; each review takes its own. `OSError` or `TimeoutError`
+  from `reserve` also admits nothing, and the process count stays 0.
+- If retirement is already preparing when the reservation lands, the reservation is closed and the review is not
+  admitted. If the review thread fails to start, both the process hold and the reservation are released.
+  `end_background_review` closes the reservation outside the process lock; close is idempotent.
+- A live drain-window apply, and a bounded window expiring instead of cutting a long call, are untested in this
+  patch. Those windows already wait on admission reservations and expire on their own bound; this patch does not
+  change that.
 
 ## Tests
 
@@ -61,3 +74,40 @@ still running:
 - A review past the wait bound winds down at a call boundary, and then the backend is stopped.
 - A wedged review: the update gives up at its deadline and stops the backend as before.
 - Controls: a backend with no review, and one with no reachable fence, are stopped at once as before.
+
+`tests/hermes_cli/test_background_review_update_admission.py` (patch 0706; 6 tests, posix):
+
+- A review with no turn lease holds one installation-root reservation until end. `set_hold` sees `reservations == 1`
+  while `active_count() == 0`. After that hold is set, a second `begin_background_review` returns None and the
+  reservation count stays 1. Ending the review twice leaves zero reservations, and a successor can begin after the
+  hold is cleared.
+- A review started with `HERMES_HOME` under `profiles/writer` reserves the installation root, not the profile directory.
+- `reserve` raising `OSError` or `TimeoutError` admits nothing and leaves the process count at 0.
+- If retirement starts preparing after `reserve` succeeds, the reservation is released and begin returns None.
+- A review thread that fails to start releases both the process hold and the reservation, and clears the agent's run token.
+
+## How it works
+
+`RetirementFence.begin_background_review` calls `admission_fence.reserve` before taking the process lock. The
+reservation is stored on `BackgroundReviewHold` and closed in `end_background_review` after the process set drops
+the hold. `reserve` returns None while an update hold stands, which refuses the review. Another review's reservation
+does not. The drain probe is the existing admission reader; it is not a new poll.
+
+## Code
+
+`hermes_cli/backend_retirement.py` (`begin_background_review`, `end_background_review`, `BackgroundReviewHold.reservation`).
+
+## Applying
+
+`git am -3 core/patches/0706-fix-retirement-expose-background-reviews-to-cross-pr.patch` after 0700. It touches
+`hermes_cli/backend_retirement.py`, which 0700 and 0703 also touch.
+
+## Gotchas
+
+The reservation is on the installation root even when `HERMES_HOME` is a profile directory. A lock error fails
+closed: the review does not start. A long call keeps the reservation; this patch does not cut it off, and it does
+not prove that a drain window expires instead.
+
+## Plugin?
+
+No: it sits inside core retirement and admission.

@@ -1,0 +1,173 @@
+From a75e611b065f2d645e6745981d347b08fcf468c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 07:18:34 -0700
+Subject: [PATCH] fix(retirement): expose background reviews to cross-process
+ update admission [daveey] (#160)
+
+---
+ hermes_cli/backend_retirement.py              | 31 ++++++-
+ ...test_background_review_update_admission.py | 89 +++++++++++++++++++
+ 2 files changed, 117 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_background_review_update_admission.py
+
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index 2812b71c604..1e14b914f17 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -23,9 +23,10 @@ BACKGROUND_REVIEW_HARD_CAP_S = 900.0
+ class BackgroundReviewHold:
+     """One running review's claim on the fence; ``wind_down`` asks the fork to stop between calls."""
+ 
+-    def __init__(self, started_at):
++    def __init__(self, started_at, reservation=None):
+         self.started_at = started_at
+         self.wind_down = threading.Event()
++        self.reservation = reservation
+ 
+ 
+ class RetirementFence:
+@@ -66,20 +67,44 @@ class RetirementFence:
+             return self._active
+ 
+     def begin_background_review(self):
+-        """Admit a background review, or None once retirement holds a permit (or is preparing)."""
++        """Admit a review under BOTH the process and cross-process update fences.
++
++        The sync drainer cannot see this process's review set. Keep a locked
++        admission reservation until the review thread exits, including mid-call
++        waits. A drain window closes new admissions and waits for this claim;
++        if the call outlasts the window, the window expires rather than killing it.
++        """
++        from hermes_constants import get_default_hermes_root, get_hermes_home
++        from hermes_cli.admission_fence import reserve, SUPPORTED
++
++        pending = None
++        if SUPPORTED:
++            try:
++                pending = reserve(get_default_hermes_root(home=get_hermes_home()))
++            except (OSError, TimeoutError):
++                logging.getLogger(__name__).warning("Review update admission unavailable", exc_info=True)
++                return None
++            if pending is None:
++                return None
+         with self._lock:
+             self._expire()
+             if self._preparing or self._token is not None:
++                if pending is not None:
++                    pending.close()
+                 return None
+-            hold = BackgroundReviewHold(self._now())
++            hold = BackgroundReviewHold(self._now(), pending)
+             self._reviews.add(hold)
+             return hold
+ 
+     def end_background_review(self, hold):
+         if hold is None:
+             return
++        # Close outside the process lock. Reservation.close is idempotent and
++        # keeps the file locked until unlink, so there is no false-idle gap.
+         with self._lock:
+             self._reviews.discard(hold)
++        if hold.reservation is not None:
++            hold.reservation.close()
+ 
+     def _blocking_reviews(self):
+         now = self._now()
+diff --git a/tests/hermes_cli/test_background_review_update_admission.py b/tests/hermes_cli/test_background_review_update_admission.py
+new file mode 100644
+index 00000000000..9bf25af123a
+--- /dev/null
++++ b/tests/hermes_cli/test_background_review_update_admission.py
+@@ -0,0 +1,89 @@
++"""Background review claims are visible to the cross-process drain apply gate."""
++from unittest.mock import MagicMock
++
++import pytest
++
++from hermes_cli import admission_fence, backend_retirement
++from hermes_cli.backend_retirement import RetirementFence
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def root(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    return tmp_path
++
++
++def test_review_claim_blocks_drain_until_end_even_without_a_turn_lease(root):
++    fence = RetirementFence()
++    hold = fence.begin_background_review()
++    assert hold is not None
++    try:
++        assert fence.active_count() == 0
++        assert admission_fence.set_hold(root)["reservations"] == 1
++        assert fence.begin_background_review() is None
++        assert admission_fence.state(root)["reservations"] == 1
++    finally:
++        fence.end_background_review(hold)
++        fence.end_background_review(hold)
++        admission_fence.clear_hold(root)
++    assert admission_fence.state(root)["reservations"] == 0
++    successor = fence.begin_background_review()
++    assert successor is not None
++    fence.end_background_review(successor)
++
++
++def test_named_profile_review_claim_uses_installation_root(root, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "writer"))
++    fence = RetirementFence()
++    hold = fence.begin_background_review()
++    try:
++        assert admission_fence.state(root)["reservations"] == 1
++        assert not (root / "profiles" / "writer" / "core-update").exists()
++    finally:
++        fence.end_background_review(hold)
++
++
++@pytest.mark.parametrize("error", [OSError("unreadable"), TimeoutError("busy")])
++def test_review_admission_fails_closed(root, monkeypatch, error):
++    def unavailable(_root):
++        raise error
++    monkeypatch.setattr(admission_fence, "reserve", unavailable)
++    fence = RetirementFence()
++    assert fence.begin_background_review() is None
++    assert fence.background_review_count() == 0
++
++
++def test_retirement_race_releases_cross_process_claim(root, monkeypatch):
++    fence = RetirementFence()
++    reserve = admission_fence.reserve
++
++    def race(home):
++        pending = reserve(home)
++        fence._preparing = True
++        return pending
++
++    monkeypatch.setattr(admission_fence, "reserve", race)
++    assert fence.begin_background_review() is None
++    assert admission_fence.state(root)["reservations"] == 0
++
++
++def test_failed_review_thread_start_releases_both_claims(root, monkeypatch):
++    import threading
++    from agent import background_review
++    from run_agent import AIAgent
++
++    fence = RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    agent = MagicMock()
++    agent._background_review_lock = threading.Lock()
++    agent._background_review_run = None
++    monkeypatch.setattr(background_review, "spawn_background_review_thread",
++                        lambda *a, **k: (lambda: None, "prompt"))
++    monkeypatch.setattr(threading.Thread, "start", MagicMock(side_effect=RuntimeError("start failed")))
++    with pytest.raises(RuntimeError, match="start failed"):
++        AIAgent._spawn_background_review_now(agent, messages_snapshot=[], review_skills=True)
++    assert admission_fence.state(root)["reservations"] == 0
++    assert fence.background_review_count() == 0
++    assert agent._background_review_run is None
+-- 
+2.55.0
+
