@@ -67,11 +67,30 @@ PY_FILE_RE = re.compile(
     r"(?:'([^']+\.py)'|\"([^\"]+\.py)\"|([^\s;&|<>()'\"`]+\.py)\b)",
     re.M,
 )
-# A path in command position: `./x.sh`, `/abs/load-suite`, `nohup ~/x &`.
+# A path in command position: `./x.sh`, `/abs/load-suite`, `nohup ~/x &`, `"/abs/x"`.
+# A quote still counts as a boundary so `terminal('"/abs/x" &')` inside execute_code is
+# found. A path that is only an argument of a reader is dropped later, not here.
 CMD_POS_RE = re.compile(
     r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*)\s+)*"
     r"(?:'((?:~|\.{1,2})?/[^']+)'|\"((?:~|\.{1,2})?/[^\"]+)\"|((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+))"
 )
+# Readers and file tools. A path they are given is data, never a script this command runs, even
+# when an interpreter name happens to sit in their arguments (`grep python burn.py`).
+_READERS = frozenset({
+    "grep", "egrep", "fgrep", "rg", "ag",
+    "cat", "sed", "awk", "gawk",
+    "head", "tail", "less", "more", "wc",
+    "diff", "cmp", "git",
+    "cp", "mv", "ln", "ls",
+    "echo", "printf",
+    "cut", "sort", "uniq", "tr", "tee",
+    "stat", "file", "basename", "dirname", "realpath", "readlink",
+})
+_WRAPPERS = frozenset({
+    "nohup", "exec", "time", "nice", "setsid", "caffeinate",
+    "command", "sudo", "env", "stdbuf", "ionice", "chrt",
+})
+_CMD_SEP_RE = re.compile(r"&&|\|\||[;&|\n(`]")
 
 # `cd DIR` / `pushd DIR`: later relative script paths in the same command resolve against DIR.
 CD_RE = re.compile(r"(?:^|(?<=[\s;&|(`'\"]))(?:cd|pushd)(?:\s+-[LPe@]+)*\s+" + _QTOKEN, re.M)
@@ -267,6 +286,37 @@ def _cwd_at(pos: int, cds: list[tuple[int, str]], base: str) -> str:
     return cwd
 
 
+def _words_before(text: str, pos: int) -> list[str]:
+    """Shell words of the simple command before *pos* (quotes and separators stripped)."""
+    start = 0
+    for m in _CMD_SEP_RE.finditer(text, 0, pos):
+        start = m.end()
+    segment = re.sub(r"'[^']*'|" + r'"[^"]*"', " ", text[start:pos])
+    return [w.strip("'\"") for w in re.findall(r"[^\s;&|<>()]+", segment) if w.strip("'\"")]
+
+
+def _operand_of_reader(text: str, pos: int) -> bool:
+    """True when the file at *pos* is data to grep/cat/sed/git/cp/... rather than a script being run.
+
+    Checks both the simple command's argv0 (`git log -S python3 -- x.py`) and the nearest word
+    (`terminal('grep x.py')`, where the shell command is nested in a Python string).
+    """
+    words = _words_before(text, pos)
+    if not words:
+        return False
+    i = 0
+    while i < len(words) and words[i] in _WRAPPERS:
+        i += 1
+        while i < len(words) and (words[i].startswith("-") or "=" in words[i] or words[i].lstrip("-").isdigit()):
+            i += 1
+    argv0 = words[i] if i < len(words) else ""
+    j = len(words) - 1
+    while j >= 0 and words[j].startswith("-"):
+        j -= 1
+    nearest = words[j] if j >= 0 else ""
+    return argv0 in _READERS or nearest in _READERS
+
+
 def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
     if depth >= MAX_DEPTH:
         return None
@@ -275,6 +325,10 @@ def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
     hits = sorted(_word(m) for r in (INTERP_RE, PY_FILE_RE, CMD_POS_RE) for m in r.finditer(text))
     seen = set()
     for pos, tok in hits:
+        # grep/cat/sed/git/cp/... never execute the file they are handed. An interpreter word in
+        # their arguments (`grep python burn.py`, `echo "python3 x.py"`) is data too.
+        if _operand_of_reader(text, pos):
+            continue
         here = _cwd_at(pos, cds, base)
         p = _resolve(tok, here)
         if not p or p in seen:

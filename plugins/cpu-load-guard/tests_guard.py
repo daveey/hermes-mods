@@ -381,3 +381,67 @@ def test_nested_script_relative_path_uses_caller_cwd(tmp_path, monkeypatch):
     monkeypatch.chdir("/")
     r = run("terminal", {"command": f"cd {d} && bash {scripts}/outer.sh"})
     assert r and r["action"] == "block"
+
+
+# --- a file named to a reader is data, not a script the command runs -----------------------
+# Incident: `grep -nE "follow-through" ~/code/hermes-mods/README.md` was refused because the
+# closing quote was treated as a command separator and README.md (which documents stress-ng) was
+# scanned as if it had been executed.
+
+BURN_SH = "#!/bin/bash\nstress-ng --cpu 16\n"
+README_DOCS = "hub load: stress-ng --cpu 16; also `stress-ng --cpu`/`openssl speed -multi`\n"
+
+
+def test_executing_burn_sh_still_blocks(tmp_path):
+    p = tmp_path / "burn.sh"
+    p.write_text(BURN_SH)
+    p.chmod(0o755)
+    for cmd in (f"bash {p}", "bash burn.sh", f"sh {p}", f"./{p.name}"):
+        r = run("terminal", {"command": cmd, "workdir": str(tmp_path)})
+        assert r and r["action"] == "block", cmd
+    assert run("terminal", {"command": "stress-ng --cpu 16"})["action"] == "block"
+    assert run("terminal", {"command": "for i in $(seq 1 16); do yes >/dev/null & done"})["action"] == "block"
+
+
+@pytest.mark.parametrize("fmt", [
+    "grep stress {p}",
+    'grep "stress" {p}',
+    "grep stress '{p}'",
+    'grep stress "{p}"',
+    "grep stress burn.sh",
+    "cat {p}",
+    'cat "{p}"',
+    "cat '{p}'",
+    "cat burn.sh",
+    "sed -n 1p {p}",
+    "sed -n '1p' {p}",
+    'sed -n "1p" {p}',
+    "sed -n 1p burn.sh",
+    "awk '{{print}}' {p}",
+    "head -n 1 {p}",
+    "tail -n 1 {p}",
+    'less "{p}"',
+    "wc -l '{p}'",
+    "diff '{p}' '{readme}'",
+    "git diff -- {p}",
+    'cp "{p}" {dest}',
+    "mv '{p}' {dest}",
+    'grep -nE "follow-through" {readme} | head -3',
+    'grep "x" {readme}',
+    "grep x README.md",
+    "grep x '{readme}'",
+    "git merge --ff-only && grep -nE 'follow-through' {readme} | head -3",
+    "grep python {py}",
+    "git log -S python3 -- {py}",
+    'echo "python3 {py}"',
+])
+def test_reader_naming_load_file_allows(tmp_path, fmt):
+    burn = tmp_path / "burn.sh"
+    burn.write_text(BURN_SH)
+    readme = tmp_path / "README.md"
+    readme.write_text(README_DOCS)
+    py = tmp_path / "burn.py"
+    py.write_text(PY_LOADER)
+    cmd = fmt.format(p=burn, readme=readme, py=py, dest=tmp_path / "copy.sh")
+    r = run("terminal", {"command": cmd, "workdir": str(tmp_path)})
+    assert r is None, (cmd, r)
