@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [borrowed-home-bootstrap.md](borrowed-home-bootstrap.md) | 0655 | Bootstrap checkout dependencies before isolated borrowed-home user code; avoid re-exec on the store interpreter. |
 | [kanban-pin-provider.md](kanban-pin-provider.md) | 0653 | Bind concrete model pins to a serving provider at create/set time; refuse missing or ambiguous providers; resolve legacy NULL-provider pins at dispatch. |
 | [kanban-board-recovery.md](kanban-board-recovery.md) | 0633–0637 0639–0640 0648–0649 0652 | Out-of-process table b-tree salvage and in-place SQLite backup install, tombstone-aware reconcile, shared recovery lock with holder identity, contention/deleted-sidecar refusal and forensic reports. |
 | [backend-activity-quiet-hint.md](backend-activity-quiet-hint.md) | 0632 | Backend last_active, not a window's event silence, decides a running turn's quiet hint. |

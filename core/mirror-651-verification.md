@@ -56,6 +56,10 @@ The final source refresh added `a934e39df2` (0652, safe recovery pid probe and w
 
 Another publisher appended `599752f5c9` as 0652 while 0652–0653 were being verified here. Its patch and docs were retained, merged and renumbered to **0654**, following the actual fork order after `9c943cbd2f`; all its feature references were updated. Applied 0654 with `git am -3` at `9c943cbd2f` and ran `tests/hermes_cli/test_kanban_origin_projection_contention.py`: **5 passed**. The throwaway worktree was removed. The final series is contiguous through **0654** (`599752f5c9`), with no duplicate numbers or appended source commits.
 
+## Final source refresh: 0655
+
+`bcf47021db` was added during the publish verification and is mirrored as **0655**. Its public patch applied with `git am -3` at `599752f5c9`; the canonical borrowed-home launch suite passed **7 tests**. The worktree was removed. The published series is contiguous through this source snapshot, with every commit after `7f117fa465` represented once.
+
 ## Recovery reporting precision
 
 The recovery implementation writes a JSON report file and emits markdown-style summary/card content. It does not create a separate `.md` file alongside every JSON report. The feature doc reflects that distinction rather than implying an artifact the implementation does not write.
