@@ -120,8 +120,9 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
 
 
 def _pass_reader() -> Callable[[list[str]], dict]:
-    """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) is read
-    once and reused for every row, not once per pending row. A failed read fails every row the same way."""
+    """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) and the
+    local boards are read once and reused for every row, not once per pending row. A failed read fails every row
+    the same way."""
     memo: list[tuple[Optional[list[dict]], Optional[BaseException]]] = []
 
     def inventory() -> list[dict]:
@@ -135,7 +136,25 @@ def _pass_reader() -> Callable[[list[str]], dict]:
             raise exc
         return rows
 
-    return lambda ids: read_cards(ids, remote_inventory=inventory)
+    # Boards are read once per pass too: the first call reads every id the ledger's pending rows hold (one open per
+    # board) and later rows take their subset. core.read_cards judges each id on its own, so the subset equals a
+    # per-row read; ids outside the pass's union (a row written mid-pass) are read directly.
+    union: dict[str, Any] = {}
+
+    def read(ids: list[str]) -> dict:
+        if "ids" not in union:
+            try:
+                union["ids"] = {i for row in ledger().pending() for i in row["batch"]}
+            except Exception:
+                union["ids"] = set()
+        want = set(ids)
+        if not want or not want <= union["ids"]:
+            return read_cards(ids, remote_inventory=inventory)
+        if "cards" not in union:
+            union["cards"] = read_cards(sorted(union["ids"]), remote_inventory=inventory)
+        return {key: card for key, card in union["cards"].items() if key in want}
+
+    return read
 
 
 def state_dbs() -> list[Path]:

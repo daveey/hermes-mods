@@ -83,3 +83,32 @@ def test_watchdog_tick_reads_remote_inventory_once(pending, tmp_path):
         led.write(sid, settled_sig=f'sig-{sid}', settled_at=1)
     plugin.watchdog_tick(now=10_000, mono=10_000, unseen={}, post=lambda *a: None, force=True)
     assert calls['n'] == 1
+
+
+def test_local_boards_read_once_per_pass_with_the_same_answer(tmp_path, monkeypatch):
+    """Five chats on one local board: one board open per pass (not one per chat), and each chat sees its own cards."""
+    import sqlite3
+    board = tmp_path / 'kanban.db'
+    with sqlite3.connect(board) as db:
+        db.execute('CREATE TABLE tasks (id TEXT, title TEXT, status TEXT)')
+        db.executemany('INSERT INTO tasks VALUES (?,?,?)', [(f't_{n}', f'card {n}', 'done') for n in range(5)])
+    led = core.Ledger(tmp_path / 'ledger.db')
+    for n in range(5):
+        led.write(f'chat{n}', batch=[f't_{n}'], open=[])
+    opens = []
+    real = core.ro_connect
+    monkeypatch.setattr(core, 'ro_connect', lambda p: opens.append(p) or real(p))
+    monkeypatch.setattr(plugin, 'ledger', lambda: led)
+    monkeypatch.setattr(plugin, 'board_paths', lambda: [board])
+    monkeypatch.setattr(plugin, 'remote_cards', lambda: [])
+    monkeypatch.setattr(plugin, 'session_proof', lambda *a: False)
+    monkeypatch.delenv('CHAT_CLOSEOUT_OFF', raising=False)
+    monkeypatch.delitem(plugin._state, 'waiting_cache', raising=False)
+    expected = {f'chat{n}': [f't_{n}'] for n in range(5)}
+    assert core.pending_closeouts(led, plugin.read_cards) == expected  # the per-row reader, for comparison
+    assert len(opens) == 5
+    opens.clear()
+    assert plugin.waiting_source() == expected
+    assert len(opens) == 1
+    read = plugin._pass_reader()
+    assert read(['t_3']) == plugin.read_cards(['t_3']) and read(['t_absent']) == {}

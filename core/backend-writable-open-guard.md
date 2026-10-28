@@ -38,6 +38,9 @@ CPU-minutes in its first three hours. Its REST calls timed out ("Timed out conne
 
 - `chat-closeout` looks up a chat's compression tip with `SessionDB(read_only=True)` and closes it, in both the
   sidebar waiting source (`_lineage`) and the owner-wake tick (`_compression_tip`).
+- `chat-closeout` reads the local boards once per pass (`_pass_reader`): the first row reads every id the ledger's
+  pending rows hold and later rows take their subset, instead of opening every board once per pending row (45 rows
+  on 2026-10-27). Ids outside the pass's union are read directly.
 - Core counts writable `SessionDB()` constructions per call site (`module.function:line`). A site that makes 30 or
   more within 60 s gets one WARNING naming it, the count, and the fix (read-only for reads,
   `hermes_state_registry.acquire()` for a long-lived writer); it is named again at most every 10 min while it stays
@@ -53,7 +56,7 @@ is older than `_WRITABLE_OPEN_WARN_INTERVAL_S`. `SessionDB.__init__` calls it wi
 ## Code
 
 - `hermes_state.py`: `_note_writable_open`, `_WRITABLE_OPEN_*`, the call in `SessionDB.__init__`.
-- hermes-mods `plugins/chat-closeout/__init__.py`: `_lineage`, `_compression_tip`.
+- hermes-mods `plugins/chat-closeout/__init__.py`: `_lineage`, `_compression_tip`, `_pass_reader`.
 
 ## Tests
 
@@ -64,6 +67,20 @@ is older than `_WRITABLE_OPEN_WARN_INTERVAL_S`. `SessionDB.__init__` calls it wi
 - hermes-mods `plugins/chat-closeout/tests/test_lineage_readonly.py` (fails on the old code)
   - `test_lineage_follows_compression_with_a_closed_read_only_open`: the sidebar path, real `state.db`.
   - `test_owner_wake_tip_lookup_is_read_only_and_closed`: the owner-wake path.
+- hermes-mods `plugins/chat-closeout/tests/test_waiting_source.py` (fails on the old code)
+  - `test_local_boards_read_once_per_pass_with_the_same_answer`: one board open per sidebar pass, same answer as
+    the per-row reader.
+
+## Measured (replaying `/api/profiles/sessions/sidebar` every 2 s for 60 s in-process against the live `~/.hermes`)
+
+| Plugin | Writable opens / min | CPU (one core = 100%) |
+|---|---|---|
+| before | 150 | 30% |
+| read-only lineage | 0 | 22% |
+| + boards once per pass | 0 | 17% |
+
+The replay has no GIL contention from other threads, so it understates the live cost of each writable open. What
+remains per poll is core `kanban_session_activity._legacy_remote_links` (~0.3 s CPU), outside this change.
 
 ## Gotchas
 
