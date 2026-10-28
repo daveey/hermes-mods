@@ -1,6 +1,6 @@
 # Desktop: keep remote gateways warm (always-on dashboard, prewarm, probe skip)
 
-Patch **0526** (`4dbfb50490`). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
+Patches **0526** (`4dbfb50490`) and **0534** (`7c62393349`, named-profile prewarm). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
 
 ## Behavior
 
@@ -20,7 +20,9 @@ Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a
   forwards the port and runs the existing `/api/ssh/ownership` proof. Stale or down while installed: it polls up to
   20 s for the supervisor restart rather than spawning beside it, then falls back to the owned-backend lockfile
   path. It never kills it, writes a lockfile for it or rotates its token. Named profiles keep owned backends.
-- **Prewarm + hold.** `remote-prewarm.ts` dials every SSH connection in `connections.json` at app ready, then every
+- **Prewarm + hold.** `remote-prewarm.ts` dials every SSH connection in `connections.json` (its default profile,
+  plus each named profile a user dispatch reached in the last 24 h, at most 4 per connection, recorded by
+  `RecentRemoteProfiles` in `userData/remote-prewarm-profiles.json`; 0534) at app ready, then every
   15 s forces a health probe through `ensureRegistryBackend(…, { forceProbe })`; a failure retires the dead tunnel
   and reconnects, with 2/5/15/30/60 s backoff. `ControlPersist` 300 → 3600 s. `HERMES_DESKTOP_REMOTE_PREWARM=0`
   turns it off.
@@ -48,7 +50,8 @@ Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a
   not installed / named profile skip it; malformed record rejected.
 - `apps/desktop/electron/remote-warm-dispatch.test.ts`: probe skipped within 30 s and run after 30 s; forced probe
   on a dropped tunnel retires + reconnects; prewarmer backoff reconnect; startup prewarm dials all connections in
-  parallel and schedules the keepalive; removed connections drop; `main.ts` call sites (start on ready, stop on
+  parallel and schedules the keepalive; removed connections drop; recently used named profiles join the targets,
+  expire after 24 h, cap at 4, survive a restart, and are held like default ones (0534); `main.ts` call sites (start on ready, stop on
   quit, forced keepalive through `ensureRegistryBackend`, ledger wiring) pinned by source.
 
 The `main.ts` wiring is checked by source assertions, not by booting Electron; the live behavior is proved from
@@ -60,8 +63,8 @@ Apply after 0448–0450. Then on each remote host: `hermes always-on-dashboard i
 
 ## Gotchas
 
-- The always-on backend serves the default profile; a Desktop connection pinned to a named remote profile still
-  spawns its own backend.
+- The always-on backend serves the default profile; a named remote profile still has its own owned backend, kept
+  warm by the prewarm once it was opened in the last 24 h (the first open of a new profile still pays the spawn).
 - A host's HERMES_HOME seen by the SSH shell must match the record's (`$HOME/.hermes` in the unit), or Desktop logs
   `always-on dashboard serves X, not Y` and spawns as before.
 - Rotate the token by uninstalling, deleting `~/.hermes/desktop-ssh/always-on`, and installing again.

@@ -1,0 +1,443 @@
+From 7c62393349f75aca61325883a914256c5b943426 Mon Sep 17 00:00:00 2001
+From: x <x@example.com>
+Date: Tue, 27 Oct 2026 17:03:18 -0700
+Subject: [PATCH] perf(desktop): prewarm also holds remote named profiles used
+ in the last 24 h [daveey]
+
+Part B only held each SSH gateway's default profile, so opening a session in a named profile
+on the mini (bb-dev, api-*) still waited 9-11 s on a cold per-profile backend (C1 measurement).
+RecentRemoteProfiles records every user dispatch's named profile per SSH connection (24 h TTL,
+4 per connection, persisted in userData/remote-prewarm-profiles.json); the prewarmer targets
+default + those. Also types the always-on lifecycle test results (tsc).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/main.ts                 |  32 +++--
+ .../remote-lifecycle-always-on.test.ts        |   4 +-
+ apps/desktop/electron/remote-prewarm.ts       | 128 ++++++++++++++++--
+ .../electron/remote-warm-dispatch.test.ts     | 105 ++++++++++++--
+ 4 files changed, 239 insertions(+), 30 deletions(-)
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 19901d4fd4..ddae006b2a 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -545,7 +545,7 @@ import {
+ } from './remote-liveness'
+ import { resolveRemoteOauthTicket, rosterSourceEnumerationTimeoutMs } from './remote-oauth-ticket'
+ import { createRemoteOwnerCache } from './remote-owner-cache'
+-import { RemotePrewarmer } from './remote-prewarm'
++import { prewarmTargets, RecentRemoteProfiles, RemotePrewarmer } from './remote-prewarm'
+ import { remoteSessionCookies } from './remote-session-cookies'
+ import {
+   attachRemoteRequestHeaderListener,
+@@ -11066,16 +11066,28 @@ async function ensureBackend(
+ // a genuinely-local child when the v1 mode says remote; non-local connections
+ // pool under the composite key from backendScopeKey() and reuse the same pool
+ // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
+-// Part B (instant session loads): dial every SSH gateway at startup and keep it warm (remote-prewarm.ts).
++// Part B (instant session loads): dial every SSH gateway at startup and keep it warm (remote-prewarm.ts): its
++// default profile plus each named profile dispatched to in the last 24 h (one remote backend per profile).
++const recentRemoteProfiles = new RecentRemoteProfiles({
++  load: () => JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'remote-prewarm-profiles.json'), 'utf8')),
++  save: data =>
++    fs.writeFileSync(path.join(app.getPath('userData'), 'remote-prewarm-profiles.json'), JSON.stringify(data), {
++      mode: 0o600
++    })
++})
++
+ const remotePrewarmer = new RemotePrewarmer({
+-  listConnectionIds: () =>
++  listTargets: () =>
+     process.env.HERMES_DESKTOP_REMOTE_PREWARM === '0'
+       ? []
+-      : readDesktopConnectionsRegistry()
+-          .connections.filter(connection => connection.kind === 'ssh')
+-          .map(connection => connection.id),
+-  ensure: (connectionId, { forceProbe }) =>
+-    ensureRegistryBackend(connectionId, 'default', '', { forceProbe, spawnPriority: 'background' }),
++      : prewarmTargets(
++          readDesktopConnectionsRegistry()
++            .connections.filter(connection => connection.kind === 'ssh')
++            .map(connection => connection.id),
++          recentRemoteProfiles
++        ),
++  ensure: ({ connectionId, profile }, { forceProbe }) =>
++    ensureRegistryBackend(connectionId, profile, '', { forceProbe, spawnPriority: 'background' }),
+   log: line => rememberLog(line)
+ })
+ 
+@@ -11110,6 +11122,10 @@ async function ensureRegistryBackend(
+     throw new Error(`Profile '${profileKey}' does not exist.`)
+   }
+ 
++  if (source.kind === 'ssh' && !passive && !opts.forceProbe) {
++    recentRemoteProfiles.touch(id, profileKey)
++  }
++
+   let resolvedRegistrySshConfig
+   let registryEffectiveFingerprintPromise: null | Promise<string> = null
+ 
+diff --git a/apps/desktop/electron/remote-lifecycle-always-on.test.ts b/apps/desktop/electron/remote-lifecycle-always-on.test.ts
+index 1185d96615..7fedcad2fd 100644
+--- a/apps/desktop/electron/remote-lifecycle-always-on.test.ts
++++ b/apps/desktop/electron/remote-lifecycle-always-on.test.ts
+@@ -84,7 +84,7 @@ const KILLS = /\bkill (-9 |-TERM )?4242\b|os\.kill\(/
+ test('connect() reuses the always-on dashboard: no spawn, no lockfile, nothing killed', async () => {
+   const ssh = fakeHost([['ALIVE', record()]])
+   const d = deps(ssh)
+-  const result = await connect(d)
++  const result: any = await connect(d)
+ 
+   assert.equal(result.alwaysOn, true)
+   assert.equal(result.reused, true)
+@@ -108,7 +108,7 @@ test('after a core update, connect() waits for the supervisor restart and reuses
+     probeReuseProof: async () => (++probes === 1 ? 'authenticated-stale' : 'authenticated-ok')
+   })
+ 
+-  const result = await connect(d)
++  const result: any = await connect(d)
+ 
+   assert.equal(result.alwaysOn, true)
+   assert.equal(result.pid, 5151)
+diff --git a/apps/desktop/electron/remote-prewarm.ts b/apps/desktop/electron/remote-prewarm.ts
+index 537bf30685..2b308ca0b1 100644
+--- a/apps/desktop/electron/remote-prewarm.ts
++++ b/apps/desktop/electron/remote-prewarm.ts
+@@ -1,17 +1,120 @@
+ // Hold every remote gateway warm: at startup, dial each SSH connection in connections.json (SSH ControlMaster +
+-// tunnel + backend reuse), then keep it up with a forced health probe every tickMs and a backoff reconnect when it
++// tunnel + backend reuse) for its default profile and every named profile opened in the last 24 h, then keep it up with a forced health probe every tickMs and a backoff reconnect when it
+ // drops. A dispatch then finds a pooled, recently-answered descriptor and never waits on an SSH dial or a spawn.
+ //
+ // Electron-free: main.ts injects the registry read, the ensure call and the clock.
+ 
+ export const PREWARM_TICK_MS = 15_000
+ export const PREWARM_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000]
++// Named remote profiles are held warm while they were opened recently: each one is its own remote backend, so the
++// set stays bounded to what the user actually uses.
++export const RECENT_PROFILE_TTL_MS = 24 * 60 * 60_000
++export const RECENT_PROFILES_PER_CONNECTION = 4
++
++export interface PrewarmTarget {
++  connectionId: string
++  profile: string
++}
++
++export function prewarmTargetKey(target: PrewarmTarget): string {
++  return `${target.connectionId}::${target.profile}`
++}
++
++type RecentProfileMap = Record<string, Record<string, number>>
++
++/** Named remote profiles the user dispatched to recently, per SSH connection; persisted so a cold start warms them. */
++export class RecentRemoteProfiles {
++  readonly #load: () => unknown
++  readonly #save: (data: RecentProfileMap) => void
++  readonly #now: () => number
++  #data: RecentProfileMap | null = null
++
++  constructor(opts: { load: () => unknown; save: (data: RecentProfileMap) => void; now?: () => number }) {
++    this.#load = opts.load
++    this.#save = opts.save
++    this.#now = opts.now ?? Date.now
++  }
++
++  #read(): RecentProfileMap {
++    if (!this.#data) {
++      let raw: unknown
++
++      try {
++        raw = this.#load()
++      } catch {
++        raw = null
++      }
++
++      this.#data = {}
++
++      if (raw && typeof raw === 'object') {
++        for (const [id, profiles] of Object.entries(raw as Record<string, unknown>)) {
++          if (profiles && typeof profiles === 'object') {
++            this.#data[id] = Object.fromEntries(
++              Object.entries(profiles as Record<string, unknown>).filter(([, at]) => typeof at === 'number')
++            ) as Record<string, number>
++          }
++        }
++      }
++    }
++
++    return this.#data
++  }
++
++  // The default profile is always warm; only named profiles are recorded. Writes at most once a minute per profile.
++  touch(connectionId: string, profile: string): void {
++    if (!connectionId || !profile || profile === 'default') {
++      return
++    }
++
++    const data = this.#read()
++    const now = this.#now()
++    const profiles = (data[connectionId] ??= {})
++
++    if (now - (profiles[profile] ?? 0) < 60_000) {
++      return
++    }
++
++    profiles[profile] = now
++
++    const kept = Object.entries(profiles)
++      .filter(([, at]) => now - at < RECENT_PROFILE_TTL_MS)
++      .sort((a, b) => b[1] - a[1])
++      .slice(0, RECENT_PROFILES_PER_CONNECTION)
++
++    data[connectionId] = Object.fromEntries(kept)
++
++    try {
++      this.#save(data)
++    } catch {
++      void 0
++    }
++  }
++
++  profilesFor(connectionId: string): string[] {
++    const now = this.#now()
++
++    return Object.entries(this.#read()[connectionId] ?? {})
++      .filter(([, at]) => now - at < RECENT_PROFILE_TTL_MS)
++      .sort((a, b) => b[1] - a[1])
++      .slice(0, RECENT_PROFILES_PER_CONNECTION)
++      .map(([profile]) => profile)
++  }
++}
++
++// Every SSH connection's default profile plus its recently used named profiles.
++export function prewarmTargets(connectionIds: string[], recent: RecentRemoteProfiles): PrewarmTarget[] {
++  return connectionIds.flatMap(connectionId => [
++    { connectionId, profile: 'default' },
++    ...recent.profilesFor(connectionId).map(profile => ({ connectionId, profile }))
++  ])
++}
+ 
+ export interface RemotePrewarmDeps {
+-  // SSH connection ids from connections.json, re-read every tick so added/removed connections converge.
+-  listConnectionIds: () => string[]
+-  // Dial or revalidate one connection; `forceProbe` bypasses the dispatch probe skip so a dropped tunnel is noticed.
+-  ensure: (connectionId: string, opts: { forceProbe: boolean }) => Promise<unknown>
++  // Re-read every tick so added/removed connections and newly used profiles converge.
++  listTargets: () => PrewarmTarget[]
++  // Dial or revalidate one target; `forceProbe` bypasses the dispatch probe skip so a dropped tunnel is noticed.
++  ensure: (target: PrewarmTarget, opts: { forceProbe: boolean }) => Promise<unknown>
+   log: (line: string) => void
+   now?: () => number
+   setTimer?: (fn: () => void, ms: number) => { unref?: () => void }
+@@ -40,8 +143,9 @@ export class RemotePrewarmer {
+     return !this.#stopped
+   }
+ 
+-  isWarm(connectionId: string): boolean {
+-    return this.#states.get(connectionId)?.warm === true
++  // `key` is a connection id (its default profile) or a prewarmTargetKey().
++  isWarm(key: string): boolean {
++    return this.#states.get(key.includes('::') ? key : `${key}::default`)?.warm === true
+   }
+ 
+   // Dial every connection now (in parallel) and start the keepalive loop. Resolves when the first round settles.
+@@ -67,16 +171,18 @@ export class RemotePrewarmer {
+   // One round. The first round dials (no probe to force); later rounds force the probe on warm connections.
+   async tick(initial = false): Promise<void> {
+     const now = (this.#deps.now ?? Date.now)()
+-    const ids = this.#deps.listConnectionIds()
++    const targets = this.#deps.listTargets()
++    const keys = targets.map(prewarmTargetKey)
+ 
+     for (const known of [...this.#states.keys()]) {
+-      if (!ids.includes(known)) {
++      if (!keys.includes(known)) {
+         this.#states.delete(known)
+       }
+     }
+ 
+     await Promise.all(
+-      ids.map(async id => {
++      targets.map(async target => {
++        const id = prewarmTargetKey(target)
+         const state = this.#states.get(id) ?? { failures: 0, nextAttemptAt: 0, warm: false }
+         this.#states.set(id, state)
+ 
+@@ -88,7 +194,7 @@ export class RemotePrewarmer {
+         const startedAt = (this.#deps.now ?? Date.now)()
+ 
+         try {
+-          await this.#deps.ensure(id, { forceProbe: !initial && state.warm })
++          await this.#deps.ensure(target, { forceProbe: !initial && state.warm })
+ 
+           if (!state.warm || state.failures) {
+             this.#deps.log(
+diff --git a/apps/desktop/electron/remote-warm-dispatch.test.ts b/apps/desktop/electron/remote-warm-dispatch.test.ts
+index 1909f78bfd..356e6d0ca9 100644
+--- a/apps/desktop/electron/remote-warm-dispatch.test.ts
++++ b/apps/desktop/electron/remote-warm-dispatch.test.ts
+@@ -8,7 +8,14 @@ import {
+   ensureHealthyPooledRemoteBackendForDispatch,
+   RemoteAnswerLedger
+ } from './remote-liveness'
+-import { PREWARM_BACKOFF_MS, RemotePrewarmer } from './remote-prewarm'
++import {
++  PREWARM_BACKOFF_MS,
++  prewarmTargets,
++  RECENT_PROFILE_TTL_MS,
++  RECENT_PROFILES_PER_CONNECTION,
++  RecentRemoteProfiles,
++  RemotePrewarmer
++} from './remote-prewarm'
+ 
+ // Part B (instant session loads): Desktop prewarms every SSH gateway at startup, holds it with a forced keepalive
+ // probe, reconnects when the tunnel drops, and skips the per-dispatch /api/health probe while the backend answered
+@@ -95,7 +102,7 @@ describe('reconnect after a dropped tunnel', () => {
+     })
+ 
+     const prewarmer = new RemotePrewarmer({
+-      listConnectionIds: () => ['mac-mini'],
++      listTargets: () => [{ connectionId: 'mac-mini', profile: 'default' }],
+       ensure,
+       log: line => logs.push(line),
+       now: () => now,
+@@ -108,7 +115,7 @@ describe('reconnect after a dropped tunnel', () => {
+     up = false
+     now += 15_000
+     await prewarmer.tick()
+-    expect(ensure).toHaveBeenLastCalledWith('mac-mini', { forceProbe: true })
++    expect(ensure).toHaveBeenLastCalledWith({ connectionId: 'mac-mini', profile: 'default' }, { forceProbe: true })
+     expect(prewarmer.isWarm('mac-mini')).toBe(false)
+ 
+     now += PREWARM_BACKOFF_MS[0] - 1
+@@ -120,7 +127,7 @@ describe('reconnect after a dropped tunnel', () => {
+     await prewarmer.tick()
+     expect(ensure).toHaveBeenCalledTimes(3)
+     expect(prewarmer.isWarm('mac-mini')).toBe(true)
+-    expect(logs.some(line => /mac-mini reconnected/.test(line))).toBe(true)
++    expect(logs.some(line => /mac-mini::default reconnected/.test(line))).toBe(true)
+     prewarmer.stop()
+   })
+ })
+@@ -133,9 +140,12 @@ describe('prewarm at startup', () => {
+     const gate = new Promise<void>(resolve => (release = resolve))
+ 
+     const prewarmer = new RemotePrewarmer({
+-      listConnectionIds: () => ['mac-mini', 'hermes-hub'],
+-      ensure: async (id, opts) => {
+-        order.push(`${id}:${opts.forceProbe}`)
++      listTargets: () => [
++        { connectionId: 'mac-mini', profile: 'default' },
++        { connectionId: 'hermes-hub', profile: 'default' }
++      ],
++      ensure: async (target, opts) => {
++        order.push(`${target.connectionId}:${opts.forceProbe}`)
+         await gate
+       },
+       log: () => {},
+@@ -158,7 +168,13 @@ describe('prewarm at startup', () => {
+   it('drops a connection removed from connections.json', async () => {
+     let ids = ['mac-mini', 'hermes-hub']
+     const ensure = vi.fn(async () => {})
+-    const prewarmer = new RemotePrewarmer({ listConnectionIds: () => ids, ensure, log: () => {}, setTimer: () => ({}) })
++
++    const prewarmer = new RemotePrewarmer({
++      listTargets: () => ids.map(connectionId => ({ connectionId, profile: 'default' })),
++      ensure,
++      log: () => {},
++      setTimer: () => ({})
++    })
+ 
+     await prewarmer.start()
+     ids = ['mac-mini']
+@@ -170,6 +186,70 @@ describe('prewarm at startup', () => {
+   })
+ })
+ 
++describe('recently used named profiles stay warm', () => {
++  function store(now: () => number, initial: unknown = null) {
++    const saved: any[] = []
++    const recent = new RecentRemoteProfiles({ load: () => initial, save: data => saved.push(structuredClone(data)), now })
++
++    return { recent, saved }
++  }
++
++  it('prewarms each connection default plus its named profiles used in the last 24 h', () => {
++    let now = 1_000_000
++    const { recent, saved } = store(() => now)
++    recent.touch('mac-mini', 'bb-dev')
++    recent.touch('mac-mini', 'default') // always warm, never recorded
++    now += 1000
++    recent.touch('mac-mini', 'api-e1628a809db4c3f7')
++
++    expect(prewarmTargets(['mac-mini', 'hermes-hub'], recent)).toEqual([
++      { connectionId: 'mac-mini', profile: 'default' },
++      { connectionId: 'mac-mini', profile: 'api-e1628a809db4c3f7' },
++      { connectionId: 'mac-mini', profile: 'bb-dev' },
++      { connectionId: 'hermes-hub', profile: 'default' }
++    ])
++    expect(saved).toHaveLength(2)
++
++    now += RECENT_PROFILE_TTL_MS
++    expect(recent.profilesFor('mac-mini')).toEqual([])
++  })
++
++  it('caps the named profiles per connection and survives a restart from the persisted file', () => {
++    let now = 0
++    const { recent, saved } = store(() => now)
++
++    for (let i = 0; i < RECENT_PROFILES_PER_CONNECTION + 2; i++) {
++      now += 120_000
++      recent.touch('mac-mini', `p${i}`)
++    }
++
++    expect(recent.profilesFor('mac-mini')).toHaveLength(RECENT_PROFILES_PER_CONNECTION)
++    expect(recent.profilesFor('mac-mini')[0]).toBe(`p${RECENT_PROFILES_PER_CONNECTION + 1}`)
++
++    const restarted = store(() => now, saved.at(-1)).recent
++    expect(restarted.profilesFor('mac-mini')).toEqual(recent.profilesFor('mac-mini'))
++    expect(store(() => now, 'garbage').recent.profilesFor('mac-mini')).toEqual([])
++  })
++
++  it('the prewarmer holds a named-profile target like a default one', async () => {
++    const ensure = vi.fn(async () => {})
++
++    const prewarmer = new RemotePrewarmer({
++      listTargets: () => [{ connectionId: 'mac-mini', profile: 'bb-dev' }],
++      ensure,
++      log: () => {},
++      setTimer: () => ({})
++    })
++
++    await prewarmer.start()
++    await prewarmer.tick()
++
++    expect(ensure).toHaveBeenLastCalledWith({ connectionId: 'mac-mini', profile: 'bb-dev' }, { forceProbe: true })
++    expect(prewarmer.isWarm('mac-mini::bb-dev')).toBe(true)
++    prewarmer.stop()
++  })
++})
++
+ describe('main.ts wiring', () => {
+   // The Electron main process cannot boot under vitest; pin the call sites the behaviour above depends on.
+   const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
+@@ -182,7 +262,14 @@ describe('main.ts wiring', () => {
+ 
+   it('prewarms registry SSH connections through ensureRegistryBackend with a forced keepalive probe', () => {
+     expect(main).toMatch(/connection\.kind === 'ssh'/)
+-    expect(main).toMatch(/ensureRegistryBackend\(connectionId, 'default', '', \{ forceProbe, spawnPriority: 'background' \}\)/)
++    expect(main).toMatch(/ensureRegistryBackend\(connectionId, profile, '', \{ forceProbe, spawnPriority: 'background' \}\)/)
++    expect(main).toMatch(/prewarmTargets\(\n\s+readDesktopConnectionsRegistry\(\)/)
++  })
++
++  it('records a named profile on every user dispatch to an SSH connection, not on prewarm or passive calls', () => {
++    expect(main).toMatch(
++      /if \(source\.kind === 'ssh' && !passive && !opts\.forceProbe\) \{\n\s+recentRemoteProfiles\.touch\(id, profileKey\)/
++    )
+   })
+ 
+   it('pooled dispatch skips the probe from the shared answer ledger unless forced', () => {
+-- 
+2.55.0
+
