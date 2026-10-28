@@ -1168,12 +1168,12 @@ def _store(store=None):
     return _S()
 
 
-ADOPT_STATUSES = ("ready", "running", "blocked", "todo")
+ADOPT_STATUSES = ("ready", "running", "blocked", "todo", "review", "done")  # finished fixes count: the work exists
 ADOPT_LOOKBACK_S = 2 * 3600  # no `complaint_at` on the defect: the complaint turn is at most this long before detection
 
 
 def session_owned_cards(session_id: Optional[str], since: float, home: Optional[Path] = None) -> list:
-    """Active kanban cards (ready/running/blocked/todo) the origin session created (tasks.session_id) or subscribed
+    """Kanban cards (ADOPT_STATUSES: active, review or done) the origin session created (tasks.session_id) or subscribed
     to (kanban_notify_subs.chat_id), created at/after `since`, newest first, across the default and named boards.
     -> [{id, title, status, created_at, board}]. Unreadable boards are skipped."""
     if not session_id:
@@ -1209,6 +1209,42 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
     return rows
 
 
+_CARD_ID = re.compile(r"\bt_[0-9a-f]{6,}\b")
+
+
+def digest_owner_cards(d: dict, since: float, data: Optional[Path] = None) -> list:
+    """Cards the origin session itself names after the complaint, read from its coach digest (it may be a session on
+    another host, whose board the hub cannot open): t_<hex> ids in user turns newer than `since` (their `prev` agent
+    reply and the text, e.g. a chat-closeout notice) and in `last_reply` when the session moved on after `since`.
+    -> [{id, title, status, created_at, board: '<host>:default'}], newest mention first. Unreadable digest -> []."""
+    sid, host = d.get("session_id"), d.get("host")
+    if not sid:
+        return []
+    root = Path(data) if data else Path(os.environ.get("COACH_DATA") or Path.home() / "code" / "hermes-coach-data")
+    paths = sorted(root.glob(f"{host}/*/{sid}.json")) if host else sorted(root.glob(f"*/*/{sid}.json"))
+    for path in paths:
+        try:
+            dg = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        origin = dg.get("host") or path.parts[-3]
+        mentions = []
+        for t in dg.get("user_turns") or []:
+            ts = t.get("t") or 0
+            if ts <= since:
+                continue
+            mentions += [(ts, x) for k in ("prev", "text") for x in _CARD_ID.findall(str(t.get(k) or ""))]
+        if (dg.get("last_activity_at") or 0) > since:
+            mentions += [(dg["last_activity_at"], x) for x in _CARD_ID.findall(str(dg.get("last_reply") or ""))]
+        found: dict = {}
+        for ts, cid in sorted(mentions, key=lambda m: m[0], reverse=True):
+            found.setdefault(cid, {"id": cid, "title": None, "status": None, "created_at": ts,
+                                   "board": f"{origin}:default"})
+        if found:
+            return list(found.values())
+    return []
+
+
 def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[Callable] = None) -> Optional[dict]:
     """If the defect's origin session created/subscribed an active card after the complaint, record the newest as the
     lane's fix_card (approved) and log `selfheal_adopted_owner`. -> result dict, or None to go on and file."""
@@ -1218,6 +1254,8 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     since = d.get("complaint_at") or ((d.get("at") or now) - ADOPT_LOOKBACK_S)
     try:
         cards = (owner_fn or session_owned_cards)(sid, since)
+        if not cards and owner_fn is None:  # not on this hub's boards: the origin host's cards, named in its digest
+            cards = digest_owner_cards(d, d.get("complaint_at") or d.get("at") or since)
     except Exception as exc:
         store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
         return None

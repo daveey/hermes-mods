@@ -896,4 +896,64 @@ def test_session_owned_cards_reads_creator_and_subscription(tmp_path):
     db.commit()
     db.close()
     got = sh.session_owned_cards("S", 90, home=tmp_path)
-    assert [c["id"] for c in got] == ["t_3", "t_1"]
+    assert [c["id"] for c in got][0] == "t_3" and {c["id"] for c in got} == {"t_1", "t_2", "t_3"}  # done counts; t_4 predates, t_5 other session
+
+
+# ── adoption sees other hosts' cards (via the origin digest) and finished (review/done) cards ──
+def _real_adoption_env(monkeypatch, tmp_path):
+    """Run the real owner lookup (no owner_fn) against a throwaway HERMES_HOME and coach-data dir."""
+    monkeypatch.delenv("COACH_SELFHEAL_NO_EXEC", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COACH_DATA", str(tmp_path / "data"))
+    (tmp_path / "home").mkdir(exist_ok=True)
+
+
+def _turns_digest(tmp_path, sid, turns, last_reply=None):
+    p = tmp_path / "data" / "macbook" / "default" / f"{sid}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"id": sid, "host": "macbook", "profile": "default", "source": "desktop",
+                             "user_turns": turns, "last_reply": last_reply}))
+
+
+def test_remote_host_card_named_in_the_origin_digest_after_the_complaint_is_adopted(store, tmp_path, monkeypatch):
+    _real_adoption_env(monkeypatch, tmp_path)
+    d = defect(at=NOW - 60, host="macbook")
+    _turns_digest(tmp_path, d["session_id"], [
+        {"t": NOW - 500, "text": "earlier work", "prev": "see t_0000aaaa1111 for the old thing"},
+        {"t": NOW - 60, "text": "this panel makes no sense", "prev": "ok"},
+        {"t": NOW - 30, "text": "next", "prev": "I filed t_01a17f83116946fd for the panel fix"}])
+    r = Runner()
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "skip" and out["adopted"] and out["card"] == "t_01a17f83116946fd"
+    assert not r.creates()
+    (e,) = ev(store, "selfheal_adopted_owner")
+    assert e["board"] == "macbook:default" and e["card"] == "t_01a17f83116946fd"
+
+
+@pytest.mark.parametrize("status", ["done", "review"])
+def test_local_card_in_review_or_done_is_adopted(store, tmp_path, monkeypatch, status):
+    import sqlite3
+    _real_adoption_env(monkeypatch, tmp_path)
+    d = defect()
+    db = sqlite3.connect(tmp_path / "home" / "kanban.db")
+    db.executescript("create table tasks(id text, title text, status text, created_at int, session_id text);"
+                     "create table kanban_notify_subs(task_id text, chat_id text);")
+    db.execute("insert into tasks values('t_ffff0001','fix','%s',?,?)" % status, (int(NOW - 30), d["session_id"]))
+    db.commit()
+    db.close()
+    r = Runner()
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "skip" and out["adopted"] and out["card"] == "t_ffff0001"
+    assert not r.creates()
+
+
+def test_digest_card_mentioned_only_before_the_complaint_is_not_adopted(store, tmp_path, monkeypatch):
+    _real_adoption_env(monkeypatch, tmp_path)
+    d = defect(at=NOW - 60, host="macbook")
+    _turns_digest(tmp_path, d["session_id"], [
+        {"t": NOW - 500, "text": "earlier", "prev": "see t_0000aaaa1111 for the old thing"},
+        {"t": NOW - 60, "text": "this panel makes no sense", "prev": "t_0000bbbb2222 is done"}],
+        last_reply=None)
+    r = Runner()
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and len(r.creates()) == 1
