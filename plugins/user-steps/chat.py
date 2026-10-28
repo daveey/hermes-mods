@@ -126,6 +126,43 @@ def stale_counts(core, store, db=None, limit=500):
     return {'answeredOpen': len(answered), 'planPending': len(pending), 'answeredOpenIds': answered[:20]}
 
 
+def answered_open(core, store, db=None, limit=500):
+    """Per-request detail for stale_counts' answeredOpen set (read-only).
+
+    Each item: requestId, session, question, reply, replyAt (epoch seconds of the user reply
+    message, None if the transcript has no timestamp)."""
+    db = db or core._state_db()
+    with store._tx() as c:
+        rows = c.execute(
+            'SELECT r.state, v.body FROM requests r JOIN revisions v ON v.namespace=r.namespace AND v.id=r.id '
+            "AND v.revision=r.revision WHERE r.state IN ('open','needs_context') AND r.resolution IS NULL "
+            'ORDER BY r.rowid DESC LIMIT ?', (limit,)).fetchall()
+    out = []
+    for row in rows:
+        r = json.loads(row['body'])
+        r['state'] = row['state']
+        if r['kind'] not in ('choice', 'input'):
+            continue
+        try:
+            ev = evidence(core, r, db, store)
+            if not ev:
+                continue
+            reply_at = None
+            c = core._ro_connect(db)
+            try:
+                got = c.execute('SELECT timestamp FROM messages WHERE id=?', (ev['messageIds'][1],)).fetchone()
+                reply_at = float(got[0]) if got and got[0] is not None else None
+            except (sqlite3.Error, TypeError, ValueError):
+                pass
+            finally:
+                c.close()
+        except (sqlite3.Error, OSError, KeyError, ValueError):
+            continue
+        out.append({'requestId': r['requestId'], 'session': r['owner']['storedSessionId'],
+                    'question': ev['question'], 'reply': ev['answer'], 'replyAt': reply_at})
+    return out
+
+
 def reconcile(core, store, owner, judge=llm, db=None, *, request_id=None, expected_revision=None):
     """Read authentic evidence, judge scope, then CAS and recheck evidence.
 

@@ -293,3 +293,10 @@ delivery recovery, actual FastAPI router startup/manual reconciliation, owner
 isolation, and producer creation/binding/revision/publication rollback against
 isolated SQLite adapters. Real-core card tests preserve delegated mutation fences;
 skips are not live mutation or end-to-end verification.
+
+## Stale-request detector
+
+`stale_watch.py` opens one Kanban card (idempotency key `user-steps-stale:<requestId>`) for each open clarification whose
+user reply is older than 1 h (the `/ping` `stale.answeredOpen` set). Run it periodically on every gateway, since action
+stores are per host: `python3 ~/.hermes/plugins/user-steps/stale_watch.py` (`--dry-run`, `--min-age SECONDS`).
+Tests: `tests/test_stale_watch.py` (2 h reply -> one card; rerun -> no duplicate; retired -> none; CLI args).
