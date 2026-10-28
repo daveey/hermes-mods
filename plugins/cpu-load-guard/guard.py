@@ -75,8 +75,10 @@ PY_FILE_RE = re.compile(
 # found. A path that is only an argument of a reader is dropped later, not here.
 CMD_POS_RE = re.compile(
     r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*"
-    # sudo [-E] [-u user] /x and env [-i] [VAR=val ...] /x run /x as argv0.
-    r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s/.~-]\S*|\s+-[-\w=]+)*|env(?:\s+-[-\w=]+)*(?:\s+\w+=\S*)*)\s+)*"
+    # sudo [-E] [-u user] /x and env [-i] [-u NAME] [-C DIR] [VAR=val ...] /x run /x as argv0.
+    # env -u/--unset take a name (not a path, so the command is not swallowed).
+    # env -C/--chdir take a directory, including -C/tmp and --chdir=/tmp.
+    r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s/.~-]\S*|\s+-[-\w=]+)*|env(?:\s+(?:-u|--unset)\s+[^\s/.~-]\S*|\s+-C(?:\s+)?\S+|\s+--chdir(?:=\S+|\s+\S+)|\s+-[-\w=]+)*(?:\s+\w+=\S*)*)\s+)*"
     r"(?:'((?:~|\.{1,2})?/[^']+)'|\"((?:~|\.{1,2})?/[^\"]+)\"|((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+))"
 )
 # Operands that a command hands to exec: `git bisect run ./x`, `xargs ./x`, `find . -exec ./x {} \;`.

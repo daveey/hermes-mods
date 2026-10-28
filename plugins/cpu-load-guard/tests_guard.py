@@ -587,6 +587,16 @@ def test_write_file_of_py_reading_data_file_allows(tmp_path):
     "env {p}",
     "env FOO=1 {p}",
     "env -i FOO=1 BAR=2 {p}",
+    # -u/--unset and -C/--chdir take the next word. A bare-flag scan leaves the
+    # script unexamined (`env -u FOO ./x`) or scans the chdir target instead.
+    "env -u FOO {p}",
+    "env -u FOO BAR=1 {p}",
+    "env --unset FOO {p}",
+    "env -C /tmp {p}",
+    "env -C/tmp {p}",
+    "env --chdir /tmp {p}",
+    "env --chdir=/tmp {p}",
+    "env -u FOO -C /tmp {p}",
 ])
 def test_sudo_env_wrapped_argv0_blocks(tmp_path, fmt):
     p = tmp_path / "burn.sh"
@@ -596,7 +606,14 @@ def test_sudo_env_wrapped_argv0_blocks(tmp_path, fmt):
     assert r and r["action"] == "block", fmt
 
 
-@pytest.mark.parametrize("fmt", ["sudo cat {t}", "env FOO=1 grep x {t}", "sudo -u root head {t}"])
+@pytest.mark.parametrize("fmt", [
+    "sudo cat {t}",
+    "env FOO=1 grep x {t}",
+    "sudo -u root head {t}",
+    "env -u FOO cat {t}",
+    "env -C /tmp cat {t}",
+    "env --chdir=/tmp head {t}",
+])
 def test_sudo_env_wrapped_reader_allows(tmp_path, fmt):
     t = _data_txt(tmp_path)
     assert run("terminal", {"command": fmt.format(t=t), "workdir": str(tmp_path)}) is None, fmt
