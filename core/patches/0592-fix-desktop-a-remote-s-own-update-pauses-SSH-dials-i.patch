@@ -1,0 +1,470 @@
+From fa1b6c5cfc59a7f4b6cdc28e1b9bb6f255354062 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:33:37 -0700
+Subject: [PATCH] fix(desktop): a remote's own update pauses SSH dials instead
+ of redialing per request [daveey]
+
+While hermes-hub ran its own `hermes update` (2026-10-27 20:58-21:00 PDT), every renderer request opened a
+new SSH control master, hit the preflight's "SSH startup is paused" refusal and closed it: 53 dials in 108 s,
+5 failed session opens. ensureRegistryBackend drops the pool entry on failure and nothing remembered the
+refusal; only remote-prewarm had a backoff.
+
+- remote-update-pause.ts: RemoteUpdatePause, keyed by remote install (user@host:port|hermes path). An
+  'update-in-progress' refusal pauses the key; callers fail fast from the cached error (code
+  remote-update-paused, retryAt) until the window (2/5/10/20/30 s) opens, then one caller probes; a success
+  clears the pause and logs [remote-update-pause] ... reconnected once; any other failure ends the pause.
+- main.ts: bootstrapSshConnection (every SSH dial) runs through the gate; managed update restores bypass it.
+- remote-prewarm.ts: follow an error's retryAt instead of a second backoff, so prewarm is the probe that sees
+  the update finish.
+- remote-update-pause.test.ts: renderer-request and prewarm paths each prove at most one dial per backoff
+  window during the update and a single reconnect after it; main.ts wiring pinned.
+
+Includes fork follow-up 469b0731ea (test uses a documentation address).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/main.ts                 |  25 +-
+ apps/desktop/electron/remote-prewarm.ts       |  12 +-
+ .../electron/remote-update-pause.test.ts      | 230 ++++++++++++++++++
+ apps/desktop/electron/remote-update-pause.ts  | 117 +++++++++
+ 4 files changed, 376 insertions(+), 8 deletions(-)
+ create mode 100644 apps/desktop/electron/remote-update-pause.test.ts
+ create mode 100644 apps/desktop/electron/remote-update-pause.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index a430e43389..22e13aec7a 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -547,6 +547,7 @@ import { resolveRemoteOauthTicket, rosterSourceEnumerationTimeoutMs } from './re
+ import { createRemoteOwnerCache } from './remote-owner-cache'
+ import { prewarmTargets, RecentRemoteProfiles, RemotePrewarmer } from './remote-prewarm'
+ import { remoteSessionCookies } from './remote-session-cookies'
++import { RemoteUpdatePause, remoteUpdatePauseKey } from './remote-update-pause'
+ import {
+   attachRemoteRequestHeaderListener,
+   collectRemoteHeaderSources,
+@@ -10090,6 +10091,9 @@ async function effectiveSshConfigFingerprint(sshConfig) {
+   return crypto.createHash('sha256').update(output).digest('hex')
+ }
+ 
++// Remembers a remote install's own-update refusal so requests and prewarm stop redialing (remote-update-pause.ts).
++const remoteUpdatePause = new RemoteUpdatePause({ log: line => rememberLog(line) })
++
+ async function bootstrapSshConnection(
+   profile,
+   sshConfig,
+@@ -10103,12 +10107,21 @@ async function bootstrapSshConnection(
+   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
+   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
+ 
+-  return sshBootstrapCoordinator.start(
+-    scope,
+-    fingerprint,
+-    lease => bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, metadata, fingerprint, lease),
+-    metadata
+-  )
++  const start = () =>
++    sshBootstrapCoordinator.start(
++      scope,
++      fingerprint,
++      lease => bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, metadata, fingerprint, lease),
++      metadata
++    )
++
++  // A managed update restore owns its own gate and dials right after updating the install itself.
++  if (metadata?.managedUpdateCorrelation) {
++    return start()
++  }
++
++  // While the remote runs its own update, fail fast instead of dialing per request (remote-update-pause.ts).
++  return remoteUpdatePause.run(remoteUpdatePauseKey(resolvedConfig), start)
+ }
+ 
+ // Tear down a bootstrap result whose publication lost the managed-update
+diff --git a/apps/desktop/electron/remote-prewarm.ts b/apps/desktop/electron/remote-prewarm.ts
+index 2b308ca0b1..37b0759fc3 100644
+--- a/apps/desktop/electron/remote-prewarm.ts
++++ b/apps/desktop/electron/remote-prewarm.ts
+@@ -206,10 +206,18 @@ export class RemotePrewarmer {
+           state.failures = 0
+           state.nextAttemptAt = 0
+         } catch (error: any) {
+-          const delay = PREWARM_BACKOFF_MS[Math.min(state.failures, PREWARM_BACKOFF_MS.length - 1)]
++          const failedAt = (this.#deps.now ?? Date.now)()
++          // A remote paused for its own update (remote-update-pause.ts) names when its one probe may run; follow
++          // that schedule instead of a second backoff, so prewarm is the probe that sees the update finish.
++          const retryAt = Number(error?.retryAt)
++
++          const delay = Number.isFinite(retryAt)
++            ? Math.max(0, retryAt - failedAt)
++            : PREWARM_BACKOFF_MS[Math.min(state.failures, PREWARM_BACKOFF_MS.length - 1)]
++
+           state.warm = false
+           state.failures += 1
+-          state.nextAttemptAt = (this.#deps.now ?? Date.now)() + delay
++          state.nextAttemptAt = failedAt + delay
+           this.#deps.log(
+             `[remote-prewarm] ${id} unavailable (${error?.message || error}); retry ${state.failures} in ${delay} ms`
+           )
+diff --git a/apps/desktop/electron/remote-update-pause.test.ts b/apps/desktop/electron/remote-update-pause.test.ts
+new file mode 100644
+index 0000000000..0601e11b39
+--- /dev/null
++++ b/apps/desktop/electron/remote-update-pause.test.ts
+@@ -0,0 +1,230 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it } from 'vitest'
++
++import { RemotePrewarmer } from './remote-prewarm'
++import { RemoteUpdatePause, remoteUpdatePauseKey, UPDATE_PAUSE_BACKOFF_MS } from './remote-update-pause'
++
++// 2026-10-27 20:58–21:00 PDT: the hub ran its own `hermes update`; every renderer request and prewarm tick dialed a
++// new SSH control master, hit the remote preflight's "SSH startup is paused" refusal and closed it again.
++
++const HUB = { user: 'ubuntu', host: '192.0.2.10', port: 22, remoteHermesPath: '' }
++const KEY = remoteUpdatePauseKey(HUB)
++
++function updateRefusal(): Error {
++  const error: any = new Error('Remote Hermes update process 1219818 is still running; SSH startup is paused.')
++  error.kind = 'update-in-progress'
++
++  return error
++}
++
++// A remote host plus the slice of main.ts the requests go through: ensureRegistryBackend() pools one entry per
++// (connection, profile) while its dial is in flight and drops it when the dial fails; the dial itself is
++// bootstrapSshConnection() wrapped in the pause gate. `dials` counts SSH control masters opened.
++function harness() {
++  let now = 1_000_000
++  const logs: string[] = []
++  const remote = { updating: true, dials: [] as number[] }
++  const pause = new RemoteUpdatePause({ log: line => logs.push(line), now: () => now })
++  const pool = new Map<string, Promise<{ baseUrl: string }>>()
++
++  const dial = async () => {
++    remote.dials.push(now)
++    await Promise.resolve()
++
++    if (remote.updating) {
++      throw updateRefusal()
++    }
++
++    return { baseUrl: 'http://127.0.0.1:50001' }
++  }
++
++  const ensure = (connectionId: string, profile: string) => {
++    const poolKey = `conn:${connectionId}::${profile}`
++    const existing = pool.get(poolKey)
++
++    if (existing) {
++      return existing
++    }
++
++    const entry = pause.run(KEY, dial).catch(error => {
++      if (pool.get(poolKey) === entry) {
++        pool.delete(poolKey)
++      }
++
++      throw error
++    })
++
++    pool.set(poolKey, entry)
++
++    return entry
++  }
++
++  return {
++    advance: (ms: number) => (now += ms),
++    ensure,
++    logs,
++    now: () => now,
++    pause,
++    remote
++  }
++}
++
++// The fewest dials a backoff schedule allows over `spanMs`: the first refusal, then one probe per window.
++function dialsAllowed(spanMs: number): number {
++  let at = 0
++  let count = 1
++
++  for (let i = 0; ; i++) {
++    at += UPDATE_PAUSE_BACKOFF_MS[Math.min(i, UPDATE_PAUSE_BACKOFF_MS.length - 1)]
++
++    if (at > spanMs) {
++      return count
++    }
++
++    count += 1
++  }
++}
++
++// Before the first refusal nothing knows the host is updating, so parallel first dials (one per profile) may share
++// t0. After it, probes are one per window, each window at least the next backoff step.
++function expectSpacedByBackoff(dials: number[]) {
++  const probes = dials.filter(at => at !== dials[0])
++  expect(dials.length - probes.length).toBeLessThanOrEqual(2)
++
++  for (let i = 0; i < probes.length; i++) {
++    expect(probes[i] - (i ? probes[i - 1] : dials[0])).toBeGreaterThanOrEqual(
++      UPDATE_PAUSE_BACKOFF_MS[Math.min(i, UPDATE_PAUSE_BACKOFF_MS.length - 1)]
++    )
++  }
++}
++
++describe('renderer API requests during a remote update', () => {
++  it('fail fast from the cached refusal, dial at most once per backoff window, and recover once', async () => {
++    const h = harness()
++    const outcomes: string[] = []
++
++    // Two minutes of renderer traffic like the incident: a session load, the kanban boards poll and a
++    // session-kanban lookup every second, each its own pool key.
++    for (let second = 0; second < 120; second++) {
++      const results = await Promise.allSettled([
++        h.ensure('hermes-hub', 'default'),
++        h.ensure('hermes-hub', 'default'),
++        h.ensure('hermes-hub', 'bb-dev')
++      ])
++
++      for (const result of results) {
++        outcomes.push(result.status === 'rejected' ? (result.reason as any).message : 'ok')
++      }
++
++      h.advance(1_000)
++    }
++
++    expect(outcomes).toHaveLength(360)
++    expect(outcomes.every(message => /SSH startup is paused/.test(message))).toBe(true)
++    expect(h.remote.dials.length).toBeLessThanOrEqual(dialsAllowed(120_000) + 1) // + the parallel bb-dev first dial
++    expect(h.remote.dials.length).toBeLessThan(10) // 360 requests, not 360 (or 60) SSH dials
++    expectSpacedByBackoff(h.remote.dials)
++    expect(h.pause.paused(KEY)).toBe(true)
++
++    // The update ends: the next request after the window probes once, succeeds, and the connection is back.
++    h.remote.updating = false
++    const dialsBefore = h.remote.dials.length
++    h.advance(UPDATE_PAUSE_BACKOFF_MS.at(-1)!)
++    await expect(h.ensure('hermes-hub', 'default')).resolves.toEqual({ baseUrl: 'http://127.0.0.1:50001' })
++    await expect(h.ensure('hermes-hub', 'default')).resolves.toEqual({ baseUrl: 'http://127.0.0.1:50001' })
++    expect(h.remote.dials.length).toBe(dialsBefore + 1)
++    expect(h.pause.paused(KEY)).toBe(false)
++    expect(h.logs.filter(line => /remote update finished; reconnected/.test(line))).toHaveLength(1)
++
++    // Other profiles dial normally again once the pause is gone.
++    await expect(h.ensure('hermes-hub', 'bb-dev')).resolves.toBeTruthy()
++    expect(h.remote.dials.length).toBe(dialsBefore + 2)
++  })
++
++  it('the paused error keeps the refusal text and says when the next probe may run', async () => {
++    const h = harness()
++    await expect(h.ensure('hermes-hub', 'default')).rejects.toThrow(/process 1219818/)
++
++    const error: any = await h.ensure('hermes-hub', 'default').catch(e => e)
++    expect(error.kind).toBe('update-in-progress')
++    expect(error.code).toBe('remote-update-paused')
++    expect(error.retryAt).toBe(h.now() + UPDATE_PAUSE_BACKOFF_MS[0])
++    expect(h.remote.dials).toHaveLength(1)
++  })
++
++  it('a probe that fails some other way ends the pause instead of masking the new failure', async () => {
++    const h = harness()
++    await h.ensure('hermes-hub', 'default').catch(() => {})
++    h.advance(UPDATE_PAUSE_BACKOFF_MS[0])
++
++    await expect(
++      h.pause.run(KEY, async () => {
++        throw new Error('ssh: connect to host 192.0.2.10 port 22: Connection refused')
++      })
++    ).rejects.toThrow(/Connection refused/)
++    expect(h.pause.paused(KEY)).toBe(false)
++  })
++})
++
++describe('remote-prewarm during a remote update', () => {
++  it('follows the pause window instead of redialing, shares it with renderer requests, and reconnects once', async () => {
++    const h = harness()
++    const prewarmLogs: string[] = []
++
++    const prewarmer = new RemotePrewarmer({
++      listTargets: () => [{ connectionId: 'hermes-hub', profile: 'default' }],
++      ensure: target => h.ensure(target.connectionId, target.profile),
++      log: line => prewarmLogs.push(line),
++      now: h.now,
++      setTimer: () => ({})
++    })
++
++    await prewarmer.start() // first round hits the refusal
++    expect(h.remote.dials).toHaveLength(1)
++    expect(prewarmLogs.at(-1)).toMatch(/retry 1 in 2000 ms/)
++
++    // Three minutes: prewarm ticks every 15 s and the renderer keeps asking every second in between.
++    for (let second = 1; second <= 180; second++) {
++      h.advance(1_000)
++      await h.ensure('hermes-hub', 'default').catch(() => {})
++
++      if (second % 15 === 0) {
++        await prewarmer.tick()
++      }
++    }
++
++    expect(h.remote.dials.length).toBeLessThanOrEqual(dialsAllowed(181_000))
++    expectSpacedByBackoff(h.remote.dials)
++    expect(prewarmer.isWarm('hermes-hub')).toBe(false)
++
++    // No renderer traffic now: prewarm alone is the probe that sees the update finish.
++    h.remote.updating = false
++    const dialsBefore = h.remote.dials.length
++
++    for (let i = 0; i < 4 && !prewarmer.isWarm('hermes-hub'); i++) {
++      h.advance(15_000)
++      await prewarmer.tick()
++    }
++
++    expect(prewarmer.isWarm('hermes-hub')).toBe(true)
++    expect(h.remote.dials.length).toBe(dialsBefore + 1)
++    expect(prewarmLogs.filter(line => /hermes-hub::default reconnected/.test(line))).toHaveLength(1)
++    expect(h.logs.filter(line => /remote update finished; reconnected/.test(line))).toHaveLength(1)
++    prewarmer.stop()
++  })
++})
++
++describe('main.ts wiring', () => {
++  // The Electron main process cannot boot under vitest; pin the chokepoint the behaviour above depends on.
++  const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
++  const bootstrap = main.slice(main.indexOf('async function bootstrapSshConnection('))
++  const body = bootstrap.slice(0, bootstrap.indexOf('\n}\n'))
++
++  it('every non-managed SSH dial goes through the pause gate, keyed by the remote install', () => {
++    expect(body).toMatch(/return remoteUpdatePause\.run\(remoteUpdatePauseKey\(resolvedConfig\), start\)/)
++    expect(body).toMatch(/if \(metadata\?\.managedUpdateCorrelation\) \{\n\s+return start\(\)/)
++    expect(main).toMatch(/const remoteUpdatePause = new RemoteUpdatePause\(/)
++  })
++})
+diff --git a/apps/desktop/electron/remote-update-pause.ts b/apps/desktop/electron/remote-update-pause.ts
+new file mode 100644
+index 0000000000..e58af35a14
+--- /dev/null
++++ b/apps/desktop/electron/remote-update-pause.ts
+@@ -0,0 +1,117 @@
++// While a remote host runs its own `hermes update`, the SSH preflight refuses to start a backend there
++// (remote-lifecycle `assertRemoteInstallUpdateClear` throws kind 'update-in-progress'). Without memory of that
++// refusal every renderer request and prewarm tick dialed a fresh SSH control master, ran the preflight, got the
++// same refusal and closed it again: ~60 dials in 2 minutes against the hub on 2026-10-27. This gate remembers the
++// refusal per remote install: callers fail fast from the cached error (no dial) until the backoff window opens,
++// then exactly one caller probes; a successful dial clears the pause and the connection comes back once.
++//
++// Electron-free: main.ts wraps bootstrapSshConnection() (the one chokepoint every SSH dial goes through) in run().
++
++export const UPDATE_PAUSE_BACKOFF_MS = [2_000, 5_000, 10_000, 20_000, 30_000]
++
++interface PauseState {
++  error: any
++  failures: number
++  pausedAt: number
++  probing: boolean
++  retryAt: number
++}
++
++// One remote install: the update marker lives under the remote hermes home, shared by every profile on the host.
++export function remoteUpdatePauseKey(config: {
++  host?: string
++  port?: number | string
++  remoteHermesPath?: string
++  user?: string
++}): string {
++  return `${config.user || ''}@${config.host || ''}:${config.port || 22}|${config.remoteHermesPath || ''}`
++}
++
++export function isRemoteUpdatePausedError(error: any): boolean {
++  return error?.code === 'remote-update-paused'
++}
++
++export class RemoteUpdatePause {
++  readonly #states = new Map<string, PauseState>()
++  readonly #now: () => number
++  readonly #log: (line: string) => void
++
++  constructor(opts: { log: (line: string) => void; now?: () => number }) {
++    this.#log = opts.log
++    this.#now = opts.now ?? Date.now
++  }
++
++  paused(key: string): boolean {
++    return this.#states.has(key)
++  }
++
++  async run<T>(key: string, dial: () => Promise<T>): Promise<T> {
++    const state = this.#states.get(key)
++
++    if (state) {
++      if (state.probing || this.#now() < state.retryAt) {
++        throw this.#pausedError(state)
++      }
++
++      state.probing = true
++    }
++
++    try {
++      const result = await dial()
++
++      if (state && this.#states.get(key) === state) {
++        this.#states.delete(key)
++        this.#log(
++          `[remote-update-pause] ${key} remote update finished; reconnected after ${state.failures} refused probe(s), paused ${this.#now() - state.pausedAt} ms`
++        )
++      }
++
++      return result
++    } catch (error: any) {
++      if (error?.kind === 'update-in-progress' && !isRemoteUpdatePausedError(error)) {
++        const existing = this.#states.get(key)
++
++        // A dial that started before another caller recorded the pause (a parallel first dial for another profile
++        // of the same host) confirms it; only the first refusal and each probe advance the backoff.
++        if (!state && existing) {
++          existing.error = error
++
++          throw error
++        }
++
++        const current = existing ?? {
++          error,
++          failures: 0,
++          pausedAt: this.#now(),
++          probing: false,
++          retryAt: 0
++        }
++
++        const delay = UPDATE_PAUSE_BACKOFF_MS[Math.min(current.failures, UPDATE_PAUSE_BACKOFF_MS.length - 1)]
++        current.error = error
++        current.failures += 1
++        current.probing = false
++        current.retryAt = this.#now() + delay
++        this.#states.set(key, current)
++        this.#log(
++          `[remote-update-pause] ${key} ${current.failures === 1 ? 'paused' : 'still paused'} (${error?.message || error}); requests fail fast, next probe in ${delay} ms`
++        )
++      } else if (state && this.#states.get(key) === state) {
++        // The probe failed some other way: the update gate no longer explains the failure, so stop answering for it.
++        this.#states.delete(key)
++      }
++
++      throw error
++    }
++  }
++
++  #pausedError(state: PauseState): Error {
++    const error: any = new Error(state.error?.message || 'Remote Hermes update in progress; SSH startup is paused.')
++    error.kind = 'update-in-progress'
++    error.code = 'remote-update-paused'
++    error.retryAt = state.retryAt
++    error.cause = state.error
++
++    return error
++  }
++}
+-- 
+2.55.0
+
