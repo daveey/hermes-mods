@@ -46,7 +46,7 @@ S=<this skill dir>/scripts/wait_for_ci.py
 python3 -B $S <sha>                                   # every workflow that ran on a commit containing <sha> passes
 python3 -B $S <sha> --workflow ci.yml                 # just this workflow (repeatable)
 python3 -B $S <sha> --workflow release.yml --tag-glob 'v*'   # released: a v* tag contains <sha>
-python3 -B $S <sha> --once                            # one check: exit 0 done, 2 not yet
+python3 -B $S <sha> --once                            # one check: exit 0 done, 1 finished red, 2 not yet
 ```
 
 Exit codes: 0 done (prints the run URLs or tags); 1 stalled (nothing queued or running will finish it,

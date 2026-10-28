@@ -228,5 +228,19 @@ class BoundedCallTests(unittest.TestCase):
     def test_gh_error_under_once_is_not_yet(self):
         self.assertEqual(self._main([RuntimeError("gh run list: HTTP 502")], "--once"), 2)
 
+    def test_finished_failure_under_once_is_stalled_not_not_yet(self):
+        # A wake probe using --once must see a finished red run as final (1); returning 2 forever
+        # left a card parked until its clock although its CI had already failed.
+        red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
+        self.assertEqual(self._main([[red]], "--once"), 1)
+
+    def test_failure_with_a_rerun_active_under_once_is_not_yet(self):
+        red = dict(run("c" * 40, conclusion="failure"), _wf="ci.yml")
+        rerun = dict(run("c" * 40, status="in_progress", conclusion=""), _wf="ci.yml")
+        self.assertEqual(self._main([[rerun, red]], "--once"), 2)
+
+    def test_no_run_yet_under_once_is_not_yet(self):
+        self.assertEqual(self._main([[]], "--once"), 2)
+
     def test_gh_that_keeps_failing_ends_the_wait(self):
         self.assertEqual(self._main([RuntimeError("gh: auth")] * getattr(w, "MAX_CALL_ERRORS", 5)), 1)
