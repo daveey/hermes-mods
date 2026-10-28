@@ -377,6 +377,16 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   on the hub over ssh, so dedupe, recurrence, suppression and budget live in one place (`coach/selfheal_lane.json`).
 - **Shadow** (`COACH_SELFHEAL=shadow`, else `mode` in `coach/selfheal-config.json`, default shadow) logs `selfheal_would_file` with the full card args and creates
   nothing. **Live** creates the investigation card.
+- **SQLite incidents:** `database disk image is malformed`, `KanbanDbCorruptError`, and `file is not a database`
+  share a fingerprint by source host, normalized DB path and UTC event-hour. Explicit `db_path` wins, then a path
+  in evidence; pathless Kanban tracebacks default to `~/.hermes/kanban.db`. Other pathless SQLite errors are not
+  merged. Hub filing is locked across concurrent corruption detections. Later hits comment on the incident card;
+  a running local card with `corrupt` and that DB in its title is adopted (oldest matching owner first). Different
+  source hosts, DB paths and hours remain distinct. Remote-board owner lookup is not implemented.
+  `event duplicate <fp> --card <duplicate-id> --owner <owner-id>` adopts real-defect ownership instead of imposing
+  the seven-day `not_defect` suppression. Its brief directs investigators to this event.
+  `tests/test_sqlite_corruption.py` replays six sanitized actual traceback tails (one card, five comments), concurrent
+  filing, path/hour/host isolation, real owner-query filtering, comment failures, shadow safety and duplicate CLI.
 - **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
   hermes-mods-repo (Baby Bear: board `bb`, five-whys + bb-self-fix). Its brief makes it investigate live, with a
   per-component checklist (Kanban events/runs, surface writer + backing state, processes/launchd/logs, git log), write

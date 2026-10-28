@@ -815,7 +815,10 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
    detector fired on. Then write the five-whys chain from evidence (five-whys skill): one causal step per why, each
    with a file:line, log line, db row or quote; label guesses `(hypothesis)`; branch "why it happened" and "why
    nothing caught it"; stop at a process/guard/design gap Hermes controls. Post the chain as a comment on this card.
-3. Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Only after you
+3. A real defect already owned by another card is a duplicate, NOT not_defect. Record
+   `python3 {SELF} event duplicate {fp} --card $HERMES_KANBAN_TASK --owner <owner-card> --note "<evidence>"`,
+   then complete this card as a duplicate. Post nothing to the Inbox; the owner retains the real defect.
+   Not a real defect (expected behaviour, user's own setting, outside world with nothing to guard)? Only after you
    checked the user's complaint itself, not just the detector's trigger. Run
    `python3 {SELF} event not_defect {fp} --card $HERMES_KANBAN_TASK --note "<why>"` and complete this card with a
    result that starts with "not a defect:". Post nothing to the Inbox.
@@ -1301,6 +1304,14 @@ def signature_matches(sig: dict, text: str) -> bool:
     """Specific enough to adopt: the identical symptom string, or the exception (class, plus its message when the
     defect has one) AND the function or file it was raised in. Same exception elsewhere is not a match."""
     t = (text or "").lower()
+    if sig.get("corruption_db"):
+        if "corrupt" not in t:
+            return False
+        db = sig["corruption_db"].lower()
+        # A bare kanban.db means only the default DB; never a named board's path.
+        tokens = re.findall(r"(?:[~\w./-]+\.(?:db|sqlite3?))", t)
+        tokens = [re.sub(r"^(?:/home/[^/]+|/users/[^/]+)(?=/\.hermes/)", "~", x) for x in tokens]
+        return db in tokens or (db == "~/.hermes/kanban.db" and "kanban.db" in tokens)
     if len(sig.get("symptom") or "") >= 20 and sig["symptom"].lower() in t:
         return True
     msg = sig.get("exc_msg")
@@ -1334,13 +1345,21 @@ def signature_owned_cards(sig: dict, home: Optional[Path] = None) -> list:
         try:
             for r in db.execute("SELECT id, title, body, status, created_at FROM tasks "
                                 "WHERE status NOT IN ('done', 'archived')"):
-                if signature_matches(sig, f"{r[1] or ''}\n{r[2] or ''}"):
+                if sig.get("corruption_db"):
+                    # Local incident ownership only: remote hosts' equally named DBs are unrelated.
+                    matches = (r[3] == "running" and r[0] != os.environ.get("HERMES_KANBAN_TASK")
+                               and sig.get("host") == host_name()
+                               and signature_matches(sig, r[1] or ""))
+                else:
+                    matches = signature_matches(sig, f"{r[1] or ''}\n{r[2] or ''}")
+                if matches:
                     rows.append({"id": r[0], "title": r[1], "status": r[3], "created_at": r[4], "board": board})
         except sqlite3.Error:
             pass
         finally:
             db.close()
-    rows.sort(key=lambda r: r["created_at"] or 0, reverse=True)
+    # Prefer the original incident owner over later running dedupe/follow-up cards.
+    rows.sort(key=lambda r: r["created_at"] or 0, reverse=not bool(sig.get("corruption_db")))
     return rows
 
 
@@ -1350,7 +1369,8 @@ def _adopt_signature_card(d: dict, fp: str, store, now: float,
     error signature (exception + function/file, or the identical symptom). Logs `selfheal_adopted_owner` via=signature."""
     if sig_owner_fn is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":
         return None
-    sig = error_signature(d)
+    sig = ({"corruption_db": d["incident"]["db"], "host": d["incident"]["host"]}
+           if d.get("incident") else error_signature(d))
     if not sig:
         return None
     lane = LaneState(store.root)
@@ -1374,7 +1394,66 @@ def _adopt_signature_card(d: dict, fp: str, store, now: float,
             "adopted": True, "via": "signature"}
 
 
+def corruption_incident(d: dict, now: float) -> Optional[dict]:
+    """One SQLite incident per source host, DB identity and UTC event-hour, not per callsite.
+    Pathless kanban tracebacks refer to the source's default board, never the hub's env override.
+    Other pathless SQLite errors are left alone rather than merging unrelated databases.
+    """
+    text = "\n".join(str(d.get(k) or "") for k in ("symptom", "details", "quote"))
+    if not re.search(r"database disk image is malformed|KanbanDbCorruptError|file is not a database", text, re.I):
+        return None
+    paths = re.findall(r"(?:~?/|[A-Za-z]:[/\\])[^\s\"'<>():,;]*\.(?:db|sqlite3?|sqlite)", text)
+    path = d.get("db_path") or (paths[0] if paths else None)
+    if not path and d.get("component") == "kanban":
+        path = "~/.hermes/kanban.db"
+    if not path:
+        return None
+    # The source home may not be the collector's home. Do not expand ~ on this host.
+    path = re.sub(r"^(?:/home/[^/]+|/Users/[^/]+)(?=/\.hermes/)", "~", str(path))
+    return {"db": os.path.normpath(path), "host": d.get("host") or host_name(),
+            "hour": int(d.get("at") or now) // 3600}
+
+
+def _corruption_comment(d: dict, st: dict, store, runner=None) -> dict:
+    card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card"))
+    card = card or st.get("fix_card") or st.get("card")
+    if not card:
+        return {"action": "skip", "why": "incident suppressed"}
+    board = st.get("board")
+    argv = ["hermes", "kanban"] + (["--board", board] if board else [])
+    body = (f"SQLite corruption occurrence ({d['incident']['db']}, host {d['incident']['host']}): "
+            f"{d.get('symptom') or ''}\n{str(d.get('details') or '')[-1500:]}")
+    rc, out, err = _run(argv + ["comment", card, body], runner)
+    store.log({"event": "selfheal_incident_comment", "fingerprint": d["fingerprint"], "card": card,
+               "ok": rc == 0, "error": (err or out)[-200:] if rc else None})
+    return {"action": "skip" if rc == 0 else "error", "card": card,
+            "why": "existing SQLite incident" if rc == 0 else "incident comment failed"}
+
+
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
+                cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
+                owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
+    store = _store(store)
+    now = now or time.time()
+    incident = corruption_incident(d, now)
+    if incident:
+        key = json.dumps(incident, sort_keys=True)
+        d = {**d, "incident": incident, "host": incident["host"],
+             "fingerprint": "sqlitecorrupt-" + hashlib.sha1(key.encode()).hexdigest()[:16]}
+    def run():
+        return _file_defect(d, store, m, runner, now, cfg, budget_fn, owner_fn, sig_owner_fn)
+    if not incident or (m or mode()) != "live" or not is_hub(cfg):
+        return run()
+    # Lane JSON is a read/check/create/write transaction. One lock also protects different
+    # incident fingerprints from losing each other's updates in the shared lane file.
+    import fcntl
+    Path(store.root).mkdir(parents=True, exist_ok=True)
+    with (Path(store.root) / "sqlite-incidents.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return run()
+
+
+def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
                 owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
     """File one defect: {fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at,
@@ -1404,12 +1483,20 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
     st = lane.get(fp)
     dec = decide(d, st, now)
     if dec["action"] == "skip":
+        if (d.get("incident") and m == "live" and hub and not st.get("suppressed")
+                and (st.get("snooze_until") or 0) <= now and st.get("status") in ("filed", "approved", "proposed")):
+            return _corruption_comment(d, st, store, runner)
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
         return {"action": "skip", "why": dec["why"]}
     if m == "live" and hub:  # the origin session already queued its own fix card: adopt it, file nothing
-        owner = _adopt_session_card(d, fp, store, now, owner_fn) or _adopt_signature_card(d, fp, store, now,
-                                                                                          sig_owner_fn)
+        owner = (_adopt_signature_card(d, fp, store, now, sig_owner_fn) if d.get("incident") else
+                 (_adopt_session_card(d, fp, store, now, owner_fn) or
+                  _adopt_signature_card(d, fp, store, now, sig_owner_fn)))
         if owner:
+            if d.get("incident"):
+                commented = _corruption_comment(d, lane.get(fp), store, runner)
+                if commented["action"] == "error":
+                    return commented
             return owner
     args = card_args(d, dec["key"], dec.get("previous"), cfg)
     b = (budget_fn or budget)(args.get("board"), now)
@@ -1507,18 +1594,26 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
 
 
 EVENT_STATUS = {"proposed": "proposed", "fixed": "fixed", "not_defect": "not_defect", "reverted": "reverted",
-                "declined": "declined"}
+                "declined": "declined", "duplicate": "approved"}
 
 
-def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None) -> dict:
+def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None, now: Optional[float] = None,
+                 owner: str = "") -> dict:
     """`self_heal.py event <kind> <fp>`: cards report their lifecycle; logged as selfheal_<kind>."""
     store = _store(store)
     now = now or time.time()
     if kind not in EVENT_STATUS:
         raise ValueError(f"unknown event {kind}; one of {sorted(EVENT_STATUS)}")
+    if kind == "duplicate" and (not _CARD_ID.fullmatch(owner) or owner == card):
+        raise ValueError("duplicate requires a distinct --owner t_<hex> card")
     lane = LaneState(store.root)
     st = lane.get(fp)
-    kw = {"status": EVENT_STATUS[kind]}
+    kw: dict = {"status": EVENT_STATUS[kind]}
+    if kind == "duplicate":
+        kw.update(fix_card=owner, approved_at=now, closed_at=None,
+                  cards=sorted(known_cards(st) | {c for c in (card, owner) if c}))
+        store.log({"event": "selfheal_adopted_owner", "via": "duplicate", "fingerprint": fp,
+                   "card": owner, "duplicate_card": card, "note": note[:300]})
     if kind == "proposed":
         kw["proposed_at"] = now
     if kind == "fixed":
@@ -1731,6 +1826,7 @@ def main(argv=None) -> int:
     e.add_argument("fp")
     e.add_argument("--card", default="")
     e.add_argument("--note", default="")
+    e.add_argument("--owner", default="", help="existing owner card for event duplicate")
     sub.add_parser("sync", help="act on Inbox outcomes (Do it / Not now / Never)")
     b = sub.add_parser("backstop", help="detector over new user turns in the coach digests")
     b.add_argument("--data", default=os.environ.get("COACH_DATA") or str(Path.home() / "code/hermes-coach-data"))
@@ -1745,7 +1841,7 @@ def main(argv=None) -> int:
     elif a.cmd == "fix":
         print(json.dumps(file_fix(a.fp)))
     elif a.cmd == "event":
-        e = record_event(a.kind, a.fp, a.card, a.note)
+        e = record_event(a.kind, a.fp, a.card, a.note, owner=a.owner)
         print(json.dumps({"fingerprint": a.fp, "status": e.get("status")}))
     elif a.cmd == "sync":
         for fp, what in sync():
