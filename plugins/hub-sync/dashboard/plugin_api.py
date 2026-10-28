@@ -18,8 +18,11 @@ POST /request  {gateway, coll, key, action, args?, base_version?} -> {id, queued
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib.util
+import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -51,6 +54,42 @@ _snapshots: Dict[Any, Any] = {}
 _flights: Dict[Any, asyncio.Task] = {}
 _POLL_WAIT_S = 0.75
 
+# The reads run on hub-sync's own pool, not asyncio's shared default executor. At backend boot
+# other work fills that executor (min(32, cpu+4) threads, ~370 core call sites), and the
+# Desktop's first cold polls, which have no snapshot to fall back on, queued past the 4 s timeout
+# even though each read takes under 0.1 s.
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="hub-sync")
+_SLOW_LOG_S = 1.0
+log = logging.getLogger(__name__)
+
+
+def _default_backlog(loop) -> Any:
+    ex = getattr(loop, "_default_executor", None)
+    q = getattr(ex, "_work_queue", None)
+    try:
+        return q.qsize() if q is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _run_timed(key, fn):
+    loop = asyncio.get_running_loop()
+    entered = time.monotonic()
+    started = {}
+
+    def call():
+        started["t"] = time.monotonic()
+        return fn()
+
+    try:
+        return await loop.run_in_executor(_EXECUTOR, call)
+    finally:
+        done = time.monotonic()
+        if done - entered >= _SLOW_LOG_S:
+            t0 = started.get("t", done)
+            log.warning("hub-sync slow poll key=%r total=%.2fs queue=%.2fs run=%.2fs default_backlog=%s",
+                        key, done - entered, t0 - entered, done - t0, _default_backlog(loop))
+
 
 async def _poll(key, fn):
     flight = _flights.get(key)
@@ -60,7 +99,7 @@ async def _poll(key, fn):
 
     async def run():
         try:
-            result = await asyncio.to_thread(fn)
+            result = await _run_timed(key, fn)
             _snapshots[key] = result
             return result
         finally:
@@ -140,6 +179,6 @@ async def get_requests(limit: int = 50) -> Dict[str, Any]:
 async def post_request(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     hv = _hv()
     try:
-        return await asyncio.to_thread(hv.request, body)
+        return await asyncio.get_running_loop().run_in_executor(_EXECUTOR, hv.request, body)
     except hv.RequestError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
