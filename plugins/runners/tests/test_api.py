@@ -412,3 +412,18 @@ def test_fleet_route_builds_once_per_cache_window(disk_api, monkeypatch):
     module._fleet_cache['at'] -= module.FLEET_CACHE_S + 1
     client.get(PREFIX + '/fleet', headers=TOKEN)
     assert len(calls) == 2
+
+
+def test_local_cap_reads_the_raw_config_file(api, monkeypatch):
+    module, _, _ = api
+    config = types.ModuleType('hermes_cli.config')
+    dispatch = types.ModuleType('hermes_cli.kanban_db_dispatch')
+    dispatch.resolve_max_in_progress = lambda configured: configured if configured is not None else 8
+    monkeypatch.setitem(sys.modules, 'hermes_cli.config', config)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_db_dispatch', dispatch)
+    config.read_raw_config = lambda: {'kanban': {'max_in_progress': 16}}
+    assert module._local_cap() == 16
+    config.read_raw_config = lambda: {'kanban': {'max_in_progress': 'lots'}}
+    assert module._local_cap() == 8
+    config.read_raw_config = lambda: {}
+    assert module._local_cap() == 8

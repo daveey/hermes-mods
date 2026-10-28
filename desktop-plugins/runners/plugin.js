@@ -15,7 +15,9 @@ import { createElement as h, useState, useEffect, useMemo } from 'react'
 const BAR =
   'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
 export const POLL_OPEN_MS = 15000
-export const POLL_CLOSED_MS = 60000
+// Closed too, so opening the panel always shows data at most 15s old. Cheap: the gateway
+// serves a 5s cached build; nothing polls while the window is hidden.
+export const POLL_CLOSED_MS = 15000
 export const BACKOFF_MAX_MS = 300000
 export const REQUEST_TIMEOUT_MS = 5000
 const text = (v) => String(v ?? '').slice(0, 300)
@@ -180,7 +182,7 @@ export function Panel({ view, now }) {
     view.ci.hidden_deregistered
       ? h('div', { className: 'hermes-fleet-note' }, `${view.ci.hidden_deregistered} deregistered runners (history) hidden`)
       : null,
-    h('div', { className: 'hermes-fleet-foot' }, `Updated ${ago(now - view.at)} · every ${POLL_OPEN_MS / 1000}s while open`)
+    h('div', { className: 'hermes-fleet-foot' }, `Updated ${ago(now - view.at)} · every ${POLL_OPEN_MS / 1000}s`)
   )
 }
 

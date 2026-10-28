@@ -114,13 +114,17 @@ test('unreachable: a failing gateway backs off and keeps last data marked stale,
   assert.notEqual(P.summarize(v).tone, 'bad')
 })
 
-test('open panel updates in place on each poll and stops polling while hidden', async () => {
+test('polls every 15s open or closed, updates the open panel in place, stops while hidden', async () => {
   const later = fleet()
   later.gateways.machines[1].running = [{ board: 'default', task: 't_bbbb2222', title: 'New card', started_at: NOW / 1000 }]
+  assert.equal(P.POLL_CLOSED_MS, 15000)
+  assert.equal(P.POLL_OPEN_MS, 15000)
   // mount fetch, then the refetch on open, then the next poll brings a new card
   const ctx = ctxWith([fleet(), fleet(), later])
   const ui = await mount(React.createElement(P.Runners, { ctx }))
   try {
+  const observer = () => ui.client.getQueryCache().find({ queryKey: ['runners', 'fleet'] }).observers[0]
+  assert.equal(observer().options.refetchInterval, 15000, 'closed panel still polls')
   window.dispatchEvent(new window.Event('hermes-show-runners'))
   await ui.flush()
   const row = () => document.querySelector('[data-machine="worker-1"]')

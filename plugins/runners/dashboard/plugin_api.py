@@ -172,14 +172,27 @@ def _gateway_section():
     import time
     fleet = _fleet()
     from hermes_cli import kanban_sync_client as ksc, kanban_worker_node as node
-    from hermes_cli.kanban_db_dispatch import configured_max_in_progress, resolve_max_in_progress
     now_ms = int(time.time() * 1000)
     leases = fleet.live_leases(ksc.shadow_path('x').parent, now_ms)
     registry = node.registry()  # core caches it for REGISTRY_TTL_S; a failed read keeps the last value
     read_at = node._REGISTRY.get('at')
     age = time.monotonic() - read_at if registry is not None and read_at is not None else None
     return fleet.gateway_workers(registry, leases, now_ms, registry_age_s=age,
-                                 local_cap=resolve_max_in_progress(configured_max_in_progress()))
+                                 local_cap=_local_cap())
+
+
+def _local_cap():
+    """This gateway's dispatcher cap. Read from the raw config file: inside the dashboard,
+    load_config() is request/profile scoped and can miss kanban settings (it showed the
+    memory-derived default 8 on a hub configured for 16)."""
+    from hermes_cli.config import read_raw_config
+    from hermes_cli.kanban_db_dispatch import resolve_max_in_progress
+    raw = ((read_raw_config() or {}).get('kanban') or {}).get('max_in_progress')
+    try:
+        configured = int(raw) if raw is not None and int(raw) > 0 else None
+    except (TypeError, ValueError):
+        configured = None
+    return resolve_max_in_progress(configured)
 
 
 def _ci_section():

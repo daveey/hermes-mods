@@ -21,7 +21,8 @@ The server builds one result per 5 s per profile, single-flight, so any number o
 registry read (core caches it 60 s), indexed reads of each board replica (~30 ms on the hub) and one
 inventory projection. A registry older than 3 min marks gateway liveness unknown (Board not answering).
 
-The panel polls every 15 s while open, 60 s while closed, and not at all while the window is hidden. One poll
+The panel polls every 15 s, open or closed (so opening it always shows data at most 15 s old), and not at
+all while the window is hidden. One poll
 runs at a time; each request times out after 5 s. The React Query cache keeps the last view during refetches,
 so an open panel updates in place. A failing gateway is retried after 15 s, 30 s, 60 s … capped at 5 min, and
 its last data stays on screen marked "Stale: last update … · <error>". Each section comes from the connected
