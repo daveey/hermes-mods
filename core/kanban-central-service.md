@@ -1288,7 +1288,24 @@ to it.
   - The Inbox `archived` field accepts only `true`, because the store cannot unarchive.
   - First enable and resync use `/v2/sync/overrides`. The full snapshot (about 30 MB) does not fit through a DO call; it returned 500 and stalled every gateway's sync for about 10 minutes. Its paging is a separate task.
   - Desktop needed no patch: it reads and writes through the hub-sync plugin, and its existing tests cover the mapped fields. Nothing in the Desktop sets `hidden` yet.
-- **Not done:** the 7-day shadow soak, primary mode on all gateways, and deleting the request path for these fields.
+- **Not done (as of the first note):** the 7-day shadow soak, primary mode on all gateways, and deleting the request
+  path for these fields.
+
+#### Primary is live (2026-10-28)
+
+- **Cut over early, at David's request**, after a clean shadow soak: 20/20 hourly `diff-shared` runs across the three
+  gateways from 2026-10-27T20:57Z, 0 mismatches over about 580 real field changes (396 session archives, 175 renames,
+  4 hides, 1 pin, 8 Inbox fields).
+- **Canary:** mini primary at 03:23Z, 30 minutes with a check every 5 (6/6 clean); then the MacBook (03:53Z) and the
+  hub (03:54Z). A MacBook rename of a mini session reached mini in 0.6 s; mini applied and published it back in 7.7 s.
+  A hub pin and unpin of a MacBook session: 0.3–0.5 s to the MacBook, 27.6–27.8 s to its own store, because the
+  MacBook's periodic sync holds `hub.lock`. Every gateway's view shows a set at once through the overlay.
+- **Bug found and fixed:** `hermes-hub watch` read its config only at start, so after a mode switch it kept the old
+  mode until restarted (mini's first owner-side apply took 52.4 s, on the 60 s poll). Since client 1.8.1
+  (daveey/hermes-hub #34, #35) the watcher exits when its config file changes, as on a self-update, and its supervisor
+  restarts it; both later switches restarted their watch on their own.
+- **Next:** a one-shot task on 2026-11-04 checks 7 days of clean primary soak on all three gateways, then opens the PR
+  that removes the request path for rename, pin, unpin, archive and unarchive (sessions) and archive (Inbox).
 
 Approved by David 2026-10-27. Owner: the Claude Code session "Hermes cloud sync status"; the Kanban primary soak and phase 5 stay with "Hermes gateway restart". Nothing below is built yet. Building starts when the `default` board's primary soak is clean.
 
