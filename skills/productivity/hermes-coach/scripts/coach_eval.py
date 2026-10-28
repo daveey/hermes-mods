@@ -32,7 +32,8 @@ Two modes. Both print a markdown report (or JSON with --json) and exit 0 on PASS
              tokens count against max_tokens). The system prompt is
              layered like Hermes's: SOUL.md -> cwd AGENTS.md (project context) -> skills index -> MEMORY.md/USER.md,
              plus the full body of any skill the candidate edits (both variants). Credentials and the price table
-             come from Hermes (COACH_EVAL_PROVIDER, default anthropic). A provider refusal (stop_reason refusal) is
+             come from Hermes (COACH_EVAL_PROVIDER, default anthropic; also openai-codex = the Codex Responses wire, where the
+             output cap is enforced client-side; the judge stays on COACH_JUDGE_PROVIDER, default anthropic for a claude judge). A provider refusal (stop_reason refusal) is
              the model's real behavior on that turn: it is graded as a refusal reply and counted in `refusals`.
              Hard cost bound: before dispatch each call reserves its worst case = (utf-8 bytes of prefix + system +
              user + 512) x max(input, cache-write price) + max_tokens x output price, appended durably to
@@ -55,7 +56,7 @@ report for the new model:
 
 Roots (env): COACH_DATA (~/code/hermes-coach-data; benchmark = eval/bench-v1.jsonl, reports = eval/reports/),
 COACH_SETS (~/.hermes/coach; replyset/, fixloop/), COACH_MODS (~/code/hermes-mods), HERMES_HOME (~/.hermes),
-COACH_EVAL_MODEL (claude-sonnet-5-5), COACH_JUDGE_MODEL (same).
+COACH_EVAL_MODEL (claude-sonnet-5-5), COACH_JUDGE_MODEL (same model on the Anthropic wire, else claude-sonnet-5-5).
 """
 import argparse, datetime as dt, hashlib, importlib.util, json, os, random, re, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
@@ -538,7 +539,7 @@ def usage_cost(u, model=""):
         c = float(u.get("total_including_auxiliary", {}).get("estimated_cost_usd") or u.get("estimated_cost_usd") or 0)
     except (TypeError, ValueError, AttributeError):
         c = 0.0
-    if c > 0:
+    if c > 0 or (u.get("cost_source") == "price_table" and c == 0):  # a $0 subscription route is a price, not a gap
         return c
     m = (u.get("model") or model or "").lower()
     pi, po, pw, pr = next((v for k, v in PRICES.items() if k in m), PRICES["sonnet"])
@@ -849,7 +850,7 @@ JUDGE_SYSTEM = "You are a strict, careful grader. Follow the instructions in the
 
 
 class DirectRequest:
-    __slots__ = ("model", "system", "user", "max_tokens", "bound_usd", "price", "thinking")
+    __slots__ = ("model", "system", "user", "max_tokens", "bound_usd", "price", "thinking", "provider")
 
 
 class DirectRunner:
@@ -890,6 +891,7 @@ class DirectRunner:
             self.close()
             raise errs[0]
         self.prices, self.plock = {}, threading.Lock()
+        self.provider = os.environ.get("COACH_EVAL_PROVIDER") or "anthropic"
 
     def close(self):
         for w in self.workers:
@@ -903,19 +905,29 @@ class DirectRunner:
         finally:
             self.pool.put(w)
 
-    def price(self, model):
+    def price(self, model, provider=None):
+        provider = provider or self.provider
         with self.plock:
-            if model not in self.prices:
-                p = self._with_worker({"op": "price", "model": model})
-                if p.get("error") or not p.get("input") or not p.get("output"):
-                    raise SystemExit(f"no provider price for {model}: {p.get('error')}")
-                self.prices[model] = p
-            return self.prices[model]
+            if (provider, model) not in self.prices:
+                p = self._with_worker({"op": "price", "model": model, "provider": provider})
+                # 0.0 is a real price (a subscription route is "included"); a missing one is not.
+                if p.get("error") or p.get("input") is None or p.get("output") is None:
+                    raise SystemExit(f"no provider price for {model} ({provider}): {p.get('error')}")
+                self.prices[(provider, model)] = p
+            return self.prices[(provider, model)]
+
+    def provider_for(self, model, judge):
+        """Replays use COACH_EVAL_PROVIDER. The judge uses COACH_JUDGE_PROVIDER, else anthropic for a claude judge
+        (so a codex-wire model is graded by the same fixed judge as every other model), else the replay provider."""
+        if not judge:
+            return self.provider
+        return os.environ.get("COACH_JUDGE_PROVIDER") or ("anthropic" if str(model).startswith("claude") else self.provider)
 
     def prepare(self, prompt, home=None, cwd=None, model=None, toolsets=None, ignore_rules=False):
         from decimal import Decimal
-        p = self.price(model)
         r = DirectRequest()
+        r.provider = self.provider_for(model, ignore_rules)
+        p = self.price(model, r.provider)
         r.model, r.user, r.price = model, prompt, p
         r.system = JUDGE_SYSTEM if ignore_rules else compose_system(home, cwd, self.preload)
         r.max_tokens = self.judge_max_tokens if ignore_rules else self.max_tokens
@@ -928,15 +940,23 @@ class DirectRunner:
 
     def dispatch(self, r):
         out = self._with_worker({"op": "call", "model": r.model, "system": r.system, "user": r.user,
-                                 "max_tokens": r.max_tokens, "thinking": r.thinking})
+                                 "max_tokens": r.max_tokens, "thinking": r.thinking,
+                                 "provider": r.provider})
         if "error" in out:
             raise RuntimeError(f"provider request failed: {out['error']}")
         u, p = out.get("usage") or {}, r.price
         cost = ((u.get("input_tokens") or 0) * p["input"] + (u.get("output_tokens") or 0) * p["output"]
                 + (u.get("cache_write_tokens") or 0) * (p.get("cache_write") or p["input"])
                 + (u.get("cache_read_tokens") or 0) * (p.get("cache_read") or p["input"])) / 1e6 + (p.get("request") or 0)
-        usage = dict(u, model=r.model, estimated_cost_usd=round(cost, 6), stop_reason=out.get("stop_reason"))
+        usage = dict(u, model=r.model, estimated_cost_usd=round(cost, 6), cost_source="price_table", stop_reason=out.get("stop_reason"))
         return out.get("text") or "", usage
+
+
+def default_judge_model(model, provider=None):
+    """The judge model when COACH_JUDGE_MODEL is unset: the replayed model itself on the Anthropic wire, else the
+    fixed claude-sonnet-5-5 judge (the Codex wire's judge is never the model under test)."""
+    provider = provider or os.environ.get("COACH_EVAL_PROVIDER") or "anthropic"
+    return model if provider == "anthropic" else "claude-sonnet-5-5"
 
 
 def hermes_runner(hermes_bin=None, timeout=900):
@@ -1250,7 +1270,7 @@ def run_behavior(cand, bench, target=None, budget_usd=5.0, runner=None, root=Non
     if hasattr(runner, "preload"):
         runner.preload = preload  # an edited skill is shown in full to both variants
     model = model or os.environ.get("COACH_EVAL_MODEL") or "claude-sonnet-5-5"
-    judge_model = judge_model or os.environ.get("COACH_JUDGE_MODEL") or model
+    judge_model = judge_model or os.environ.get("COACH_JUDGE_MODEL") or default_judge_model(model)
     _validated_edits(live, cand.get("edits") or [])
     # Paid (bounded) runners also stop at the engine's $20/day total; offline test runners spend nothing real.
     budget = Budget(budget_usd, engine=live_engine() if getattr(runner, "bounded", False) is True else None)
@@ -1308,7 +1328,10 @@ def _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner
             "reasons": reasons, "by_pattern": by_pattern, "rows": rows, "cost_usd": round(budget.spent, 4),
             "calls": budget.calls, "minutes": round((time.time() - t0) / 60, 1), "model": model,
             "provider": os.environ.get("COACH_EVAL_PROVIDER") or "anthropic", "finished_at": int(time.time()),
-            "judge_model": judge_model, "bench": str(bench), "episodes": len(eps), "repeats": repeats,
+            "judge_model": judge_model,
+            "judge_provider": (runner.provider_for(judge_model, True) if hasattr(runner, "provider_for")
+                               else os.environ.get("COACH_JUDGE_PROVIDER") or "anthropic"),
+            "bench": str(bench), "episodes": len(eps), "repeats": repeats,
             "edits": cand.get("edits") or [], "complete": complete, "manifest": manifest,
             "refusals": {"base": sum(v == REFUSAL_TEXT for v in base.values()),
                          "cand": sum(v == REFUSAL_TEXT for v in candr.values())},

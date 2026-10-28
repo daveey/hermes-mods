@@ -442,6 +442,9 @@ for line in sys.stdin:
     if req["op"] == "price":
         if req["model"] == "unpriced":
             print(json.dumps({"error": "no price"}), flush=True); continue
+        if req.get("provider") == "included":  # a subscription route: the price table says $0
+            print(json.dumps({"input": 0.0, "output": 0.0, "cache_write": 0.0, "cache_read": 0.0, "request": 0.0,
+                              "source": "none included-route", "prefix": ""}), flush=True); continue
         print(json.dumps({"input": 2.0, "output": 10.0, "cache_write": 2.5, "cache_read": 0.1, "request": 0.0,
                           "source": "fake", "prefix": "PFX"}), flush=True)
     elif "FAIL" in req["user"] or "FAIL" in req["system"]:
@@ -453,7 +456,7 @@ for line in sys.stdin:
         n = (len(req["system"]) + len(req["user"])) // 4
         out = 999999 if "OVERRUN" in req["user"] else min(100, req["max_tokens"])
         sys.stderr.write("SYSTEM=" + req["system"][:20])
-        print(json.dumps({"text": "SYS:" + req["system"] + "\nMAXTOK:" + str(req["max_tokens"])
+        print(json.dumps({"text": "SYS:" + req["system"] + "\nMAXTOK:" + str(req["max_tokens"]) + "\nPROV:" + str(req.get("provider"))
                           + "\nTHINK:" + json.dumps(req.get("thinking")),
                           "stop_reason": "end_turn", "usage": {"input_tokens": n, "output_tokens": out,
                           "cache_write_tokens": 0, "cache_read_tokens": 0}}), flush=True)
@@ -766,6 +769,155 @@ class Trial(Base):
         rep.write_text("".join("```coach-proposal\n" + json.dumps(x) + "\n```\n" for x in (TRIAL, alt)))
         cp.cmd_add(type("A", (), {"data": str(self.env.data), "report": str(rep)})())
         self.assertEqual(len([p for p in cp.state(self.env.data).values() if p["kind"] == "trial"]), 1)
+
+
+class FakeStream:
+    """Iterable Responses event stream; records close()."""
+
+    def __init__(self, events):
+        self.events, self.closed, self.consumed = events, False, 0
+
+    def __iter__(self):
+        for e in self.events:
+            self.consumed += 1
+            yield e
+
+    def close(self):
+        self.closed = True
+
+
+class FakeResponses:
+    def __init__(self, events):
+        self.events, self.calls, self.stream = events, [], None
+
+    def create(self, **kw):
+        self.calls.append(kw)
+        self.stream = FakeStream(self.events)
+        return self.stream
+
+
+class FakeCodexClient:
+    def __init__(self, events):
+        self.responses = FakeResponses(events)
+
+
+def codex_events(text="Hello", usage=(120, 7, 20), extra=()):
+    ev = [{"type": "response.created"}, *extra, *({"type": "response.output_text.delta", "delta": c} for c in text)]
+    ev.append({"type": "response.completed", "response": {"usage": {
+        "input_tokens": usage[0], "output_tokens": usage[1], "input_tokens_details": {"cached_tokens": usage[2]}}}})
+    return ev
+
+
+class CodexWire(unittest.TestCase):
+    """coach_llm_worker's Codex Responses wire (COACH_EVAL_PROVIDER=openai-codex) against an injected client: no network."""
+
+    def setUp(self):
+        import coach_llm_worker as w
+        self.w = w
+        self.base = "https://chatgpt.com/backend-api/codex"
+        self.req = {"op": "call", "model": "gpt-6-astra", "system": "SYS", "user": "USER", "max_tokens": 50, "thinking": None}
+
+    def backend(self, events, base=None):
+        c = FakeCodexClient(events)
+        return self.w.CodexBackend(c, "openai-codex", base or self.base, lambda *a: None), c
+
+    def test_one_bounded_request_no_tools_no_retries_text_and_usage(self):
+        be, c = self.backend(codex_events("Hello!"))
+        out = be.call(self.req)
+        self.assertEqual(len(c.responses.calls), 1)
+        kw = c.responses.calls[0]
+        self.assertEqual((kw["model"], kw["instructions"], kw["store"], kw["stream"]), ("gpt-6-astra", "SYS", False, True))
+        self.assertEqual(kw["input"], [{"role": "user", "content": [{"type": "input_text", "text": "USER"}]}])
+        for banned in ("tools", "tool_choice", "reasoning", "max_output_tokens"):  # the ChatGPT endpoint 400s on the last
+            self.assertNotIn(banned, kw)
+        self.assertEqual(out["text"], "Hello!")
+        self.assertEqual(out["stop_reason"], "end_turn")
+        # cached tokens are billed as cache reads, not input
+        self.assertEqual(out["usage"], {"input_tokens": 100, "output_tokens": 7, "cache_write_tokens": 0, "cache_read_tokens": 20})
+
+    def test_max_output_tokens_on_the_wire_where_the_route_takes_it(self):
+        be, c = self.backend(codex_events("ok"), base="https://api.openai.com/v1")
+        be.call(self.req)
+        self.assertEqual(c.responses.calls[0]["max_output_tokens"], 50)
+
+    def test_output_cap_is_enforced_client_side_on_the_chatgpt_route(self):
+        be, c = self.backend(codex_events("x" * 1000))
+        out = be.call(self.req)  # cap = 50 tokens * 4 chars
+        self.assertEqual(out["stop_reason"], "max_tokens")
+        self.assertTrue(c.responses.stream.closed)
+        self.assertLess(c.responses.stream.consumed, 400)
+        self.assertEqual(out["usage"]["output_tokens"], 50)  # an aborted stream is charged the cap, not zero
+        self.assertLessEqual(len(out["text"]), 50 * 4 + 1)
+
+    def test_reasoning_stream_counts_against_the_cap(self):
+        be, c = self.backend(codex_events("hi", extra=[{"type": "response.reasoning_summary_text.delta", "delta": "r" * 300}]))
+        self.assertEqual(be.call(self.req)["stop_reason"], "max_tokens")
+
+    def test_refusal_and_failure(self):
+        be, _ = self.backend([{"type": "response.refusal.delta", "delta": "no"}, *codex_events("")[1:]])
+        out = be.call(self.req)
+        self.assertEqual((out["stop_reason"], out["text"]), ("refusal", ""))
+        be, _ = self.backend([{"type": "response.failed", "response": {"error": {"message": "overloaded"}}}])
+        with self.assertRaisesRegex(RuntimeError, "overloaded"):
+            be.call(self.req)
+
+    def test_price_is_the_tables_including_a_zero_subscription_route(self):
+        from decimal import Decimal
+        from types import SimpleNamespace as NS
+        z = Decimal(0)
+        entry = NS(input_cost_per_million=z, output_cost_per_million=z, cache_read_cost_per_million=z,
+                   cache_write_cost_per_million=z, request_cost=None, source="none", pricing_version="included-route")
+        be = self.w.CodexBackend(FakeCodexClient([]), "openai-codex", self.base, lambda m, p, u: entry)
+        self.assertEqual(be.price("gpt-6-astra")["source"], "none included-route")
+        self.assertEqual(be.price("gpt-6-astra")["input"], 0.0)
+        be = self.w.CodexBackend(FakeCodexClient([]), "openai-codex", self.base, lambda m, p, u: None)
+        self.assertIn("no price", be.price("nope")["error"])
+
+    def test_serve_routes_each_request_to_its_provider_and_builds_lazily(self):
+        import io
+        from contextlib import redirect_stdout
+        cx, _ = self.backend(codex_events("from codex"))
+
+        class Anth:
+            def call(self, r):
+                return {"text": "from anthropic", "stop_reason": "end_turn", "usage": {}}
+
+            def price(self, m):
+                return {"input": 3.0}
+        built = []
+
+        def build(p):
+            built.append(p)
+            return Anth(), {}
+        lines = [json.dumps(self.req), json.dumps(dict(self.req, provider="anthropic")),
+                 json.dumps(dict(self.req, provider="anthropic", op="price")), json.dumps(dict(self.req, op="nope"))]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.w.serve("openai-codex", {"openai-codex": cx}, build=build, lines=lines)
+        out = [json.loads(x) for x in buf.getvalue().splitlines()]
+        self.assertEqual([out[0]["text"], out[1]["text"], out[2]["input"], out[3]["error"]],
+                         ["from codex", "from anthropic", 3.0, "unknown op"])
+        self.assertEqual(built, ["anthropic"])
+
+    def test_runner_prices_a_zero_route_and_sends_the_judge_to_anthropic(self):
+        from unittest.mock import patch
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        (tmp / "w.py").write_text(FAKE_WORKER)
+        home = tmp / "home"
+        (home / "memories").mkdir(parents=True)
+        cwd = home / "work"
+        cwd.mkdir()
+        with patch.dict(os.environ, {"COACH_EVAL_PROVIDER": "included"}):
+            runner = _DirectRunnerReal(jobs=1, worker_cmd=[sys.executable, str(tmp / "w.py")], live=tmp)
+            self.addCleanup(runner.close)
+            req = runner.prepare("hello", home=home, cwd=cwd, model="gpt-6-astra")
+            self.assertEqual((req.provider, req.bound_usd), ("included", 0))
+            self.assertIn("PROV:included", ce.Budget(5, ledger=tmp / "l.jsonl").call(runner, "hi", home=home, cwd=cwd,
+                                                                                 model="gpt-6-astra")[0])
+            text, _ = ce.Budget(5, ledger=tmp / "l.jsonl").call(runner, "grade", model="claude-sonnet-5-5", ignore_rules=True)
+            self.assertIn("PROV:anthropic", text)  # a claude judge never rides the replay provider
+        self.assertEqual(ce.default_judge_model("gpt-6-astra", "openai-codex"), "claude-sonnet-5-5")
+        self.assertEqual(ce.default_judge_model("claude-opus-5-5", "anthropic"), "claude-opus-5-5")
 
 
 if __name__ == "__main__":
