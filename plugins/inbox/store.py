@@ -54,7 +54,7 @@ class AgentFixablePost(ValueError):
 
 
 # Posters that report board state an agent can fix: never the Inbox, always a Kanban comment/card.
-AGENT_FIXABLE_POSTERS = frozenset({"kanban-dispatcher"})
+AGENT_FIXABLE_POSTERS = frozenset({"kanban-dispatcher", "chat-closeout"})
 # A "Do it" that tells an agent to fix a Kanban card and unblock it is not a decision for David.
 _AGENT_FIX_PROMPT = re.compile(r"kanban\s+card\b.*\bfix\b.*\bunblock", re.I | re.S)
 

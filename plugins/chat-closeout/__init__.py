@@ -7,7 +7,7 @@ they finish. Logic lives in core.py; this file wires Hermes hooks and the backen
   thread (serve)    owner wake (owner_wake.py): a card parked for an agent-owned reason starts one supervise turn in
                     its owning chat (archived/reaped/gone chat -> board-supervisor card), once per card per premise
   thread (serve)    close-out waker: wake an idle chat whose cards all settled, once per batch state (in-process
-                    resume via server._wake_session_turn), at most MAX_WAKES_PER_HOUR per chat; watchdog every 15 min: Inbox item + WARNING for a chat
+                    resume via server._wake_session_turn), at most MAX_WAKES_PER_HOUR per chat; watchdog every 15 min: Kanban card + WARNING for a chat
                     with unseen kanban results > 30 min or a settled batch with no close-out > 30 min
 Every hook fails open. [daveey]
 """
@@ -516,24 +516,41 @@ def _canonical_session(sid: str) -> str:
         return sid
 
 
-def post_inbox(title: str, body: str, key: str) -> None:
-    store_py = _kanban_root() / "plugins" / "inbox" / "store.py"
-    spec = importlib.util.spec_from_file_location("chat_closeout_inbox_store", store_py)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    mod.Inbox().post(title, body, key=key, poster="chat-closeout")
+MAX_POST_ATTEMPTS = 3  # failed card filings per incident key before one ERROR and no more retries
+
+
+def file_card(title: str, body: str, key: str) -> str:
+    """One Kanban card per stuck-chat incident on this gateway's default board (agent-fixable state belongs on the
+    board, never the Inbox). ``key`` is the idempotency key, so a repeat of the same incident reuses the card."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    assignee = "default"
+    try:
+        from hermes_cli.config import load_config_readonly
+        assignee = (load_config_readonly().get("kanban") or {}).get("orchestrator_profile") or "default"
+    except Exception:
+        pass
+    text = (f"{body}\n\nchat-closeout watchdog incident `{key}`.\n\nFix: open the chat (resume it) and run its "
+            "close-out turn, or find why the close-out waker / unseen-result sweeper did not deliver to it "
+            "(gui.log, errors.log). Complete this card once the chat has reported its cards' results.")
+    with connect_closing() as conn:
+        return kb.create_task(conn, title=f"chat-closeout: {title}"[:200], body=text, assignee=assignee,
+                              created_by="chat-closeout", idempotency_key=key)
 
 
 def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
-                  unseen: Optional[dict[str, int]] = None, post: Callable[[str, str, str], None] = post_inbox,
+                  unseen: Optional[dict[str, int]] = None, post: Optional[Callable[[str, str, str], Any]] = None,
                   force: bool = False, read: Optional[Callable[[list[str]], dict]] = None) -> list[str]:
     """Flag stuck pipelines (once per chat+state): unseen kanban results > 30 min, or a settled batch with no
     close-out > 30 min. Conditions are observed every tick; flagging runs in one process per 15 min.
 
     Ages: the persisted wall-clock stamp must be > 30 min AND this process must have seen the condition for
     > 30 min of monotonic time, so a lid sleep (monotonic clock stops) or a restart never fakes a stale pipeline.
-    The flag is recorded only after the Inbox post succeeded, so a failed post retries next run.
+    The flag is recorded only after the Kanban card was filed, so a failed filing retries next run, up to
+    MAX_POST_ATTEMPTS per key; then one ERROR and no more retries until the condition changes.
     Returns the flag keys raised. One remote-inventory read per tick, shared by every pending row."""
+    post = post or file_card
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
     read = read or _pass_reader()
@@ -567,10 +584,12 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                f"(last wake: {row.get('wake_result') or 'none'}).")
         candidates.append((key, f"No close-out for chat {row['session_id']}", msg))
     live = {k for k, _, _ in candidates}
+    failures: dict[str, int] = _state.setdefault("post_failures", {})
     for k in [k for k in seen_mono if k not in live]:
         if not _still_observed(k, unseen, led):
             seen_mono.pop(k, None)
-    candidates = [c for c in candidates if not led.has_flag(c[0])]
+            failures.pop(k, None)
+    candidates = [c for c in candidates if not led.has_flag(c[0]) and failures.get(c[0], 0) < MAX_POST_ATTEMPTS]
     if not candidates or (not force and not led.lease("watchdog", core.WATCHDOG_EVERY_S, now)):
         return []
     raised: list[str] = []
@@ -579,8 +598,15 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
         try:
             post(title, msg, key)
         except Exception:
-            logger.warning("chat-closeout: Inbox post failed for %s (retrying next run)", key, exc_info=True)
+            failures[key] = failures.get(key, 0) + 1
+            if failures[key] >= MAX_POST_ATTEMPTS:
+                logger.error("chat-closeout: filing the Kanban card for %s failed %d times; giving up until the "
+                             "condition changes", key, failures[key], exc_info=True)
+            else:
+                logger.warning("chat-closeout: Kanban card filing failed for %s (retrying next run)", key,
+                               exc_info=True)
             continue
+        failures.pop(key, None)
         led.flag_once(key, now)
         raised.append(key)
     return raised
