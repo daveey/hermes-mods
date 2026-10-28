@@ -81,6 +81,8 @@ def main():
                     help="omit for models that reject thinking=disabled")
     ap.add_argument("--splits", default="train,test,fixture",
                     help="which rows to judge (tune prompts on train,fixture; score test once at the end)")
+    ap.add_argument("--no-judge", action="store_true",
+                    help="no LLM calls: score only the deterministic unverified-owner check (needs no credentials)")
     a = ap.parse_args()
     if a.profile:
         os.environ["COACH_REPLY_PROFILE"] = a.profile
@@ -96,6 +98,14 @@ def main():
     for i, f in enumerate(fixtures):
         items.append({"id": f"scope{i}", "user": f["user"], "reply": f["reply"], "log": f.get("log", []),
                       "split": "fixture", "trigger": "fixture", "pos": False, "quote": ""})
+    # unverified-owner fixtures (the 2026-10-27 hub turn and its controls): expect = the deterministic check fires
+    owners = json.loads((COACH / "tests" / "fixtures" / "report_only_unverified_owner.json").read_text())
+    by_id = {f["id"]: f for f in owners}
+    for f in owners:
+        items.append({"id": f["id"], "user": f["user"],
+                      "reply": f.get("reply") or by_id.get(f.get("reply_from"), {}).get("reply", ""),
+                      "log": f.get("log") or by_id.get(f.get("log_from"), {}).get("log", []),
+                      "split": "owner_fixture", "trigger": "owner_fixture", "pos": bool(f["expect"]), "quote": ""})
 
     system = rc.judge_system()
     cache_p = out / "verdicts.jsonl"
@@ -109,6 +119,25 @@ def main():
     for it in items:
         it["cand"] = "report_only" in rc.prefilter(it["reply"])
         it["scoped"] = rc.scope_limited(it["user"])
+        # production order: the deterministic unverified-owner check runs before the judge and fires at p 1.0
+        it["owner"] = not it["scoped"] and rc.unverified_owner(it["reply"], it["log"]) is not None
+
+    def owner_metrics(rows):
+        f = [r for r in rows if r["owner"]]
+        tp = sum(1 for r in f if r["pos"])
+        return {"n": len(rows), "fires": len(f), "tp": tp, "fp": len(f) - tp,
+                "precision": round(tp / len(f), 3) if f else None, "fp_ids": [r["id"] for r in f if not r["pos"]]}
+
+    owner_report = {f"{s}_{t}": owner_metrics([it for it in items if it["split"] == s and it["trigger"] == t])
+                    for s, t in (("train", "human"), ("test", "human"), ("train", "event"), ("test", "event"),
+                                 ("fixture", "fixture"), ("owner_fixture", "owner_fixture"))}
+    ofx = [it for it in items if it["split"] == "owner_fixture"]
+    owner_report["owner_fixture_mismatches"] = [it["id"] for it in ofx if it["owner"] != it["pos"]]
+    print("unverified_owner (deterministic):", json.dumps(owner_report, indent=2), flush=True)
+    if a.no_judge:
+        (out / "owner_report.json").write_text(json.dumps(owner_report, indent=2))
+        return
+    items = [it for it in items if it["split"] != "owner_fixture"]  # judged metrics keep the labeled set only
     # fixtures are judged even though the guard drops them, to report the judge alone
     todo = [it for it in items if it["cand"] and (not it["scoped"] or it["split"] == "fixture")
             and it["id"] not in cache and it["split"] in a.splits.split(",")]
@@ -159,7 +188,7 @@ def main():
         v = (cache.get(it["id"]) or {}).get("verdict")
         it["judge_p"] = v["report_only"] if v and it["cand"] else None
         it["evidence"] = v["evidence"] if v else ""
-        it["fire_p"] = None if it["scoped"] else it["judge_p"]
+        it["fire_p"] = None if it["scoped"] else (1.0 if it["owner"] else it["judge_p"])
 
     def sel(split_, trig):
         return [it for it in items if it["split"] == split_ and it["trigger"] == trig]

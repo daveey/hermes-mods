@@ -11,7 +11,8 @@ Five anti-patterns, measured in the user's own history (coach gap report 2026-10
 - report_only: the agent describes or diagnoses a problem it could fix and ends there: no fix, no started fix
                (card, worker, PR), no concrete proposal ("Not fixed. No action is needed from you."). An explicit
                scope limit in the user's ask ("analysis only", "just tell me", "don't change anything") skips it
-               before the judge runs.
+               before the judge runs. A reply that hands the problem to another owner (session/card/worker) this
+               turn never checked or messaged fires deterministically, before the judge (`unverified_owner`).
 
 Layer 1 (here, zero latency) are cheap regex prefilters; Layer 2 is an LLM judge (aux task
 `coach_reply`) that sees the user's ask, the turn's tool log and the reply. Only a judge verdict
@@ -89,6 +90,53 @@ SCOPE_LIMIT_RE = re.compile(
     r"|\b(?:make |with )?no (?:edits|changes|fixes|code changes|mutations)\b|\bwithout (?:changing|fixing|editing) (?:anything|it)\b"
     r"|\bdon'?t fix\b|\bnot (?:to )?fix (?:it|anything)\b",
     re.I)
+
+# report_only, unverified owner: the reply hands a problem to another session/card/worker/agent ("I'm leaving them to
+# that session", "not from my change", "another session is landing that work", "the owner has it"). Fixed patterns,
+# checked before the judge: the judge reads these right but scored the real 2026-10-27 case 0.60 and 0.75 against a
+# 0.75 bar. Fires only when the turn's tool log has no check of, or message to, an owner (OWNER_CHECK_RE).
+_WHO = r"(?:that|the other|another|other|a different|the owning|its|their)\s+(?:session|agent|worker|card|chat|lane|owner)s?"
+OWNER_HANDOFF_RE = re.compile(
+    r"\b(?:I'?m |I am |I'll |I will )?(?:leav(?:e|ing)|hand(?:ing)? (?:it|them|this|that) (?:back|off|over)|"
+    r"defer(?:ring)?) (?:it|them|this|that|those|these)?\s*(?:to|for|with) " + _WHO + r"\b"
+    r"|\bnot (?:from|caused by|due to|related to) my (?:own )?(?:change|fix|edit|commit|deploy|work|patch)e?s?\b"
+    r"|\b" + _WHO + r" (?:is |are )?(?:still )?(?:landing|handling|fixing|working on|owns?|has|on) (?:it|them|this|that|those)\b"
+    r"|\b(?:another|the other|a different) (?:session|agent|worker) (?:is|are) (?:still )?"
+    r"(?:landing|handling|fixing|working on|changing|editing)\b"
+    r"|\bthe (?:existing )?owner (?:has|owns|is (?:on|handling)) (?:it|this|that|them)\b"
+    r"|\b(?:that'?s|it'?s|this is) (?:for )?" + _WHO + r"(?:'s)? (?:to fix|problem|job|change)\b",
+    re.I)
+# Tool-log evidence that the agent checked or messaged an owner this turn: the tool itself (`-> kanban_show(`), the
+# deferred `tool_call` wrapper (`"name": "cross_task"`), or the CLI form in a terminal call (`hermes kanban show`).
+_OWNER_TOOLS = (r"(?:cross_session|cross_task|session_mentions|kanban_(?:show|comment|create|list|link|block|unblock)|"
+                r"delegate_task|process_manage|process|chat_history_lookup|inbox_post)")
+OWNER_CHECK_RE = re.compile(
+    r"^\s*->\s*" + _OWNER_TOOLS + r"\("
+    r"|[\"']name[\"']\s*:\s*[\"']" + _OWNER_TOOLS + r"[\"']"
+    r"|^\s*->\s*terminal\(.*\bhermes kanban\b.*\b(?:show|comment|create|list|tail)\b"
+    r"|^\s*->\s*terminal\(.*\bhermes sessions?\b", re.I)
+_QUOTES = "\"“”`"
+
+
+def _quoted(text: str, start: int, end: int) -> bool:
+    """The match sits inside a quotation (a reply quoting the phrase, e.g. a postmortem), not a handoff: it opens or
+    closes on a quote mark, or an odd number of quote marks precede it on its line."""
+    line = text[text.rfind("\n", 0, start) + 1:start]
+    after = text[end:end + 2].lstrip(" .,;:!?")[:1]
+    return bool(sum(line.count(q) for q in _QUOTES) % 2 == 1 or line.rstrip().endswith(("'", "‘"))
+                or line.endswith(tuple(_QUOTES)) or (after and after in _QUOTES))
+
+
+def unverified_owner(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The handoff phrase when the reply's ending hands a problem to an owner this turn never checked, else None."""
+    tail = (reply or "")[-1500:]
+    m = next((m for m in OWNER_HANDOFF_RE.finditer(tail) if not _quoted(tail, m.start(), m.end())), None)
+    if not m:
+        return None
+    if any(OWNER_CHECK_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return m.group(0).strip()
+
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only")
@@ -411,6 +459,11 @@ NUDGES = {
                     "criteria, linked to this chat) and name the card. If it really is the user's call, propose the "
                     "exact fix. Don't end on the diagnosis."),
 }
+OWNER_NUDGE = ("[coach] Your message hands a problem to another owner (\"{evidence}\"), but this turn never checked that "
+               "owner or sent it anything (no cross_session, kanban_show/kanban_comment or process poll in the tool "
+               "log), so nobody may own it. Before ending: rerun the failing check once. If it is green now, say so. "
+               "If it is still red, either fix it yourself, or look the owner up (cross_session read, kanban_show) and "
+               "send it the exact failure (cross_session send / kanban_comment), then say what you sent.")
 
 
 def settings() -> dict:
@@ -475,8 +528,15 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     (no wake callable = can't tell, so `unwatched` is skipped).
     `screen(candidates) -> {rule: p} | None` (a System One model) drops screened candidates below `screen_below`
     before the LLM judge; when no candidate survives, the LLM is skipped. `shadow` = log only, drop nothing."""
+    scoped = scope_limited(user_ask)
+    if (not only or "report_only" in only) and not scoped:
+        phrase = unverified_owner(reply, tool_log)
+        if phrase:  # deterministic: no judge call, no AI score at the edge of its bar
+            return {"rule": "report_only", "p": 1.0, "evidence": phrase, "reason": "unverified_owner",
+                    "verdict": {"report_only": 1.0, "report_only_src": "unverified_owner", "evidence": phrase},
+                    "nudge": OWNER_NUDGE.format(evidence=phrase[:200])}
     cands = [r for r in prefilter(reply) if not only or r in only]
-    if "report_only" in cands and scope_limited(user_ask):
+    if "report_only" in cands and scoped:
         cands.remove("report_only")
     if "unwatched" in cands:
         try:

@@ -78,6 +78,17 @@ Earlier passes (same day): the original target (precision >= 0.85, recall >= 0.6
 was not reached by a single judge; Sonnet 0.67 / 0.43, Opus 0.82 / 0.39 at 0.75 on original labels, and the prompt rule
 about named gaps in finished work moved Opus to 0.69 / 0.47 at 0.75 on consensus labels. Eval spend was not metered per call: the labeling passes alone used 1.17M input tokens (0.51M Sonnet, 0.66M Opus), the
 cascade eval added one Sonnet screen call per candidate and one Opus call per screen p >= floor, so no dollar figure is claimed.
+Unverified owner (deterministic, runs before the screen and judge, no AI call): when the reply's last 1,500 chars hand
+the problem to another owner ("I'm leaving them to that session", "not from my change", "another session is landing
+it", "the owner has it", "that's that card's to fix") outside a quotation, and this turn's tool log has no check of or
+message to an owner (`cross_session`, `cross_task`, `kanban_show`/`comment`/`create`/`list`, `delegate_task`, a process
+poll, or `hermes kanban ... show|comment` / `hermes sessions` in a terminal call), report_only fires with
+`reason=unverified_owner` (logged on the `reply_nudge` event) and the nudge says: rerun once, report green, or fix it /
+look the owner up and send it the exact failure. Built from a hub turn (2026-10-27) that handed 6 red tests to "that
+session" without checking it; the judge scored that reply 0.60 and 0.75 against a 0.75 bar. Fixtures:
+`tests/fixtures/report_only_unverified_owner.json`; `eval/report_only_eval.py --no-judge` scores the check alone
+(762-row labeled set: 1 fire, a gold positive, 0 held-out fires; 30 days of hub replies: 1 fire, the incident). The
+explicit scope-limit guard and `COACH_REPLY_RULES` without `report_only` turn it off.
 Six explicit scope-limit fixtures (`tests/fixtures/report_only_scope_limits.json`) never fire; the deterministic
 `scope_limited()` guard drops them and the judge alone scores them <= 0.1.
 Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` and `COACH_REPLY_THRESHOLDS`

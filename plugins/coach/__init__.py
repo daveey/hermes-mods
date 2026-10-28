@@ -341,7 +341,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            "candidates": rc.prefilter(final_response)})
                 return None
             store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
-                       "p": hit["p"], "evidence": hit["evidence"]})
+                       "p": hit["p"], "evidence": hit["evidence"],
+                       **({"reason": hit["reason"]} if hit.get("reason") else {})})
             return {"action": "continue", "message": hit["nudge"]}
         except Exception as exc:
             log.debug("coach pre_verify: %s", exc)

@@ -340,3 +340,93 @@ def test_pre_verify_hook_runs_the_confirm_with_real_args_and_honours_the_daily_c
     logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
     assert sum(r["event"] == "report_only_confirm" for r in logged) == 2
     assert sum(r["event"] == "report_only_confirm_capped" for r in logged) == 1
+
+
+# --- report_only, unverified owner: the reply hands a problem to another session/card/worker that this turn never
+# checked or messaged. A deterministic check fires before the judge (the judge scored the real case 0.60 / 0.75).
+def owner_fixtures():
+    rows = json.loads((HERE / "tests" / "fixtures" / "report_only_unverified_owner.json").read_text())
+    by_id = {r["id"]: r for r in rows}
+    for r in rows:
+        r.setdefault("reply", by_id.get(r.get("reply_from"), {}).get("reply", ""))
+        r.setdefault("log", by_id.get(r.get("log_from"), {}).get("log", []))
+    return rows
+
+
+def _owner(fid):
+    return next(r for r in owner_fixtures() if r["id"] == fid)
+
+
+def test_unverified_owner_handoff_fires_without_the_judge():
+    """Replays the 2026-10-27 hub turn: a stub judge at 0.6 (below every bar) used to let it end."""
+    f = _owner("owner-real-20261027")
+    llm, calls = _judge(_ro_verdict(0.6))
+    hit = rc.check(f["reply"], f["user"], f["log"], llm, threshold=0.7, thresholds=rc.settings()["thresholds"],
+                   confirm=lambda: None, confirm_floor=rc.CONFIRM_FLOOR)
+    assert hit and hit["rule"] == "report_only" and hit.get("reason") == "unverified_owner"
+    assert calls == []  # no AI call
+    assert "leaving them to that session" in hit["evidence"].lower() or "not from my change" in hit["evidence"].lower()
+    assert "rerun" in hit["nudge"].lower() and "cross_session" in hit["nudge"]
+
+
+def test_unverified_owner_fixtures_match_expectations():
+    llm, _ = _judge(_ro_verdict(0.6))
+    for f in owner_fixtures():
+        hit = rc.check(f["reply"], f["user"], f["log"], llm, threshold=0.7, thresholds=rc.settings()["thresholds"])
+        assert bool(hit and hit.get("reason") == "unverified_owner") is f["expect"], f["id"]
+
+
+def test_unverified_owner_with_a_send_leaves_it_to_the_judge():
+    f = _owner("owner-real-with-send")
+    llm, calls = _judge(_ro_verdict(0.6))
+    assert rc.check(f["reply"], f["user"], f["log"], llm, thresholds=rc.settings()["thresholds"]) is None
+    assert len(calls) == 1  # fell through to the normal judge, which scored it below the bar
+
+
+def test_unverified_owner_respects_analysis_only_and_the_rule_switch():
+    f = _owner("owner-real-analysis-only")
+    llm, calls = _judge(_ro_verdict(0.6))
+    assert rc.check(f["reply"], f["user"], f["log"], llm, thresholds=rc.settings()["thresholds"]) is None
+    real = _owner("owner-real-20261027")
+    assert rc.check(real["reply"], real["user"], real["log"], llm, only=["handoff", "confirm"]) is None
+
+
+def test_pre_verify_logs_unverified_owner_and_normal_endings_stay_quiet(tmp_path, monkeypatch):
+    monkeypatch.delenv("COACH_REPLY_RULES", raising=False)
+    spec = importlib.util.spec_from_file_location("coach_init_owner", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcl = mod._load("reply_check")
+    judged = []
+    monkeypatch.setattr(rcl, "aux_judge", lambda s, p: judged.append(p) or json.dumps(_ro_verdict(0.6)))
+    monkeypatch.setattr(rcl, "aux_confirm", lambda s, p: json.dumps({"outcome": "na", "agent_fixable": None}))
+    store = core.Store(root=tmp_path / "coach")
+    coach, hooks = mod.build(store=store, checkout=None)
+    f = _owner("owner-real-20261027")
+    hooks["pre_llm_call"](session_id="so1", user_message=f["user"])
+    for cmd in ("python3 -m unittest discover -s tests", "cat state.json"):
+        hooks["post_tool_call"](session_id="so1", tool_name="terminal", args={"command": cmd}, result='{"exit_code": 0}')
+    out = hooks["pre_verify"](session_id="so1", attempt=0, final_response=f["reply"])
+    assert out and out["action"] == "continue" and "cross_session" in out["message"]
+    hooks["pre_llm_call"](session_id="so2", user_message="rerun the tests")
+    green = _owner("all-green")
+    assert hooks["pre_verify"](session_id="so2", attempt=0, final_response=green["reply"]) is None
+    logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    nudges = [r for r in logged if r["event"] == "reply_nudge"]
+    assert [(r["session_id"], r["rule"], r.get("reason")) for r in nudges] == [("so1", "report_only", "unverified_owner")]
+    assert any(r["event"] == "reply_checked" and r["session_id"] == "so2" for r in logged)
+
+
+def test_unverified_owner_skips_quoted_phrases_and_counts_cli_owner_checks():
+    # a postmortem quoting the phrase is not a handoff (real hub reply 189017, the self-heal proposal for this rule)
+    quoted = 'The reply said "not from my change ... I\'m leaving them to that session" and stopped.'
+    assert rc.unverified_owner(quoted, []) is None
+    # the 1500-char tail can start mid-quote: the closing quote mark still marks it quoted (real hub reply 189017)
+    assert rc.unverified_owner('t session", "not from my change", "another session is landing"), and', []) is None
+    # `hermes kanban --board runners comment t_x` in a terminal call is an owner message (real hub reply 133352)
+    reply = "All three fixes belong to the t_26e528fa worker; it's that card's to fix."
+    assert rc.unverified_owner(reply, []) is not None
+    assert rc.unverified_owner(reply, ["-> terminal(hermes kanban --board runners comment t_26e528fa 'repro: ...')"]) is None
+    # a plain terminal call that only mentions a tool name is not an owner check
+    assert rc.unverified_owner(reply, ["-> terminal(grep -rn kanban_show plugins/)"]) is not None
