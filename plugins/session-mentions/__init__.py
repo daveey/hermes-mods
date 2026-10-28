@@ -68,8 +68,11 @@ def _sender_info(session_id: str | None) -> dict:
         return info
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
-        info["title"] = db.get_session_title(session_id) or ""
+        db = SessionDB(read_only=True)  # a read: writable opens run schema init + a system-wide fd scan
+        try:
+            info["title"] = db.get_session_title(session_id) or ""
+        finally:
+            db.close()
     except Exception:
         pass
     try:

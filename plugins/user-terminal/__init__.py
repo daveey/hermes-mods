@@ -499,7 +499,11 @@ def caller_surfaces(session_id: str | None) -> list[str]:
         try:
             from hermes_state import SessionDB  # type: ignore
 
-            row = SessionDB().get_session(session_id) or {}
+            db = SessionDB(read_only=True)  # a read: writable opens run schema init + a system-wide fd scan
+            try:
+                row = db.get_session(session_id) or {}
+            finally:
+                db.close()
             ids.append(str(row.get("source") or ""))
         except Exception:
             pass
@@ -605,7 +609,11 @@ def _sender(session_id: str | None) -> dict:
         try:
             from hermes_state import SessionDB  # type: ignore
 
-            info["title"] = SessionDB().get_session_title(session_id) or ""
+            db = SessionDB(read_only=True)
+            try:
+                info["title"] = db.get_session_title(session_id) or ""
+            finally:
+                db.close()
         except Exception:
             pass
     try:

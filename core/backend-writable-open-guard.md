@@ -41,6 +41,8 @@ CPU-minutes in its first three hours. Its REST calls timed out ("Timed out conne
 - `chat-closeout` reads the local boards once per pass (`_pass_reader`): the first row reads every id the ledger's
   pending rows hold and later rows take their subset, instead of opening every board once per pending row (45 rows
   on 2026-10-27). Ids outside the pass's union are read directly.
+- The inbox list (`Inbox.list`, own home and `Inbox.for_home`), `session-mentions._sender_info` and
+  `user-terminal._sender` / `caller_surfaces` read state.db read-only and close it.
 - Core counts writable `SessionDB()` constructions per call site (`module.function:line`). A site that makes 30 or
   more within 60 s gets one WARNING naming it, the count, and the fix (read-only for reads,
   `hermes_state_registry.acquire()` for a long-lived writer); it is named again at most every 10 min while it stays
@@ -57,6 +59,8 @@ is older than `_WRITABLE_OPEN_WARN_INTERVAL_S`. `SessionDB.__init__` calls it wi
 
 - `hermes_state.py`: `_note_writable_open`, `_WRITABLE_OPEN_*`, the call in `SessionDB.__init__`.
 - hermes-mods `plugins/chat-closeout/__init__.py`: `_lineage`, `_compression_tip`, `_pass_reader`.
+- hermes-mods `plugins/inbox/store.py`: `Inbox._reader`, `read_factory`, `for_home`; `plugins/session-mentions/__init__.py`:
+  `_sender_info`; `plugins/user-terminal/__init__.py`: `caller_surfaces`, `_sender`.
 
 ## Tests
 
@@ -70,6 +74,13 @@ is older than `_WRITABLE_OPEN_WARN_INTERVAL_S`. `SessionDB.__init__` calls it wi
 - hermes-mods `plugins/chat-closeout/tests/test_waiting_source.py` (fails on the old code)
   - `test_local_boards_read_once_per_pass_with_the_same_answer`: one board open per sidebar pass, same answer as
     the per-row reader.
+
+- hermes-mods `plugins/inbox/tests/test_list_read_only.py` (fails on the old code)
+  - `test_list_is_read_only_and_closed[own-home|other-profile]`: both list paths Desktop polls.
+- hermes-mods `plugins/session-mentions/tests/test_state_reads_read_only.py` (fails on the old code)
+  - `test_sender_info_title_is_read_only`.
+- hermes-mods `plugins/user-terminal/tests/test_state_reads_read_only.py` (fails on the old code)
+  - `test_sender_title_is_read_only`, `test_caller_surfaces_session_source_is_read_only`.
 
 ## Measured (replaying `/api/profiles/sessions/sidebar` every 2 s for 60 s in-process against the live `~/.hermes`)
 
@@ -86,7 +97,8 @@ remains per poll is core `kanban_session_activity._legacy_remote_links` (~0.3 s 
 
 - Core `883b05f36b` (another session, same evening) caches a clean macOS holder-scan result and single-flights
   the scan, which caps the scan's share of the cost; this guard and the plugin fix remove the opens that drove it.
-- Other plugins still construct writable `SessionDB()` for one-off reads (`user-terminal`, `session-mentions`,
-  `inbox/store.py`). They run per tool call, not per poll, so they are left alone; the guard names them if that changes.
+- The other plugins that opened a writable `SessionDB()` only to read now read read-only and close: the inbox
+  list (polled per profile by Desktop), `session-mentions` sender titles, `user-terminal` caller surfaces and
+  sender titles. Writers (inbox actions, slack-workspace escalations, runners repair) stay writable.
 - `py-spy` needs root on macOS and `sys.remote_exec` needs a task port, so attribution used `sample` (C stacks with
   thread names) plus an in-process replay of the polled endpoints with the scan spied.

@@ -175,10 +175,12 @@ class Inbox:
 
     def __init__(self, home: Optional[Path] = None, db_factory: Optional[Callable[[], Any]] = None,
                  clock: Callable[[], float] = time.time, types: Any = None,
-                 task_creator: Optional[Callable[..., str]] = None):
+                 task_creator: Optional[Callable[..., str]] = None,
+                 read_factory: Optional[Callable[[], Any]] = None):
         self.home = Path(home) if home else _home()
         self.path = self.home / "inbox" / "inbox.db"
         self._db_factory = db_factory
+        self._read_factory = read_factory
         self.clock = clock
         self._types = types
         self._task_creator = task_creator
@@ -198,6 +200,11 @@ class Inbox:
         def factory():
             from hermes_state import SessionDB
             return SessionDB(db_path=home / "state.db")
+
+        def reader():
+            from hermes_state import SessionDB
+            return SessionDB(db_path=home / "state.db", read_only=True)
+        kw.setdefault("read_factory", reader)
         return cls(home=home, db_factory=factory, **kw)
 
     # ── plumbing ────────────────────────────────────────────────────────────
@@ -221,6 +228,17 @@ class Inbox:
             return self._db_factory()
         from hermes_state import SessionDB
         return SessionDB()
+
+    def _reader(self):
+        """state.db for list(), which Desktop polls once per profile: read-only, because a writable SessionDB()
+        runs schema init plus a system-wide open-file scan (core/backend-writable-open-guard.md). An injected
+        db_factory without a read_factory (tests, custom stores) is used as given."""
+        if self._read_factory is not None:
+            return self._read_factory()
+        if self._db_factory is not None:
+            return self._db_factory()
+        from hermes_state import SessionDB
+        return SessionDB(read_only=True)
 
     @staticmethod
     def _close(db) -> None:
@@ -621,7 +639,7 @@ class Inbox:
             return []
         with _lock:
             side = self._side()
-            db = self._sessions()
+            db = self._reader()
             try:
                 return self._open_items(side, db)
             finally:
