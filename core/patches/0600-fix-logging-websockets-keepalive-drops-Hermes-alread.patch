@@ -1,0 +1,679 @@
+From 52ea3523cd1cfc93fdf9b378b9b6fa75b70769da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:57:39 +0000
+Subject: [PATCH] fix(logging): websockets keepalive drops Hermes already
+ handles log one INFO line, not ERROR + traceback [daveey]
+
+websockets' keepalive thread/task logs a peer that stopped answering pings as
+`ERROR websockets.client: keepalive ping failed` + traceback, even though the
+connection is already failed and the caller handles it (Kanban sync's FeedWatcher
+reconnects in 1 s and polling covers the gap). errors.log then reads like an
+unhandled crash and self-heal files it as a defect (agent-ac35b4d534: hub
+2026-10-27 20:49:20Z, MacBook 16:08 PT; the Board drops every feed socket
+together several times a day).
+
+- hermes_cli/ws_logging.py: ws_logger(side) wraps the library's own
+  `websockets.<side>` logger (level/handler config unchanged) and turns that one
+  message into an INFO line naming the cause; every other record keeps its level.
+- Every websockets connect()/serve() in production code passes logger=ws_logger():
+  kanban_sync_client FeedWatcher, tui_gateway event_publisher, transcription and
+  TTS streaming, browser CDP tool + supervisor, relay ws_transport, buzz, simplex,
+  google_meet (realtime, node client/server). yuanbao dials with
+  ping_interval=None (no keepalive), so it stays as is (grandfathered).
+- code_health HX015: a websockets connect()/serve() without logger= in production
+  code is a new finding, so the next call site cannot reintroduce the ERROR
+  (a pytest source scanner is banned by tests/AGENTS.md).
+
+Tests: tests/hermes_cli/test_kanban_feed_keepalive.py (real server behind a relay
+that goes silent after the upgrade: FeedWatcher reconnects, zero ERROR records;
+red on fd394a4611 with the production traceback), test_ws_logging.py,
+tests/scripts/test_code_health_ws_rule.py.
+---
+ gateway/relay/ws_transport.py                 |   3 +-
+ hermes_cli/kanban_sync_client.py              |   3 +-
+ hermes_cli/ws_logging.py                      |  37 ++++++
+ plugins/google_meet/node/client.py            |   4 +-
+ plugins/google_meet/node/server.py            |   4 +-
+ plugins/google_meet/realtime/openai_client.py |   6 +-
+ plugins/platforms/buzz/adapter.py             |   6 +-
+ plugins/platforms/simplex/adapter.py          |   8 +-
+ scripts/code_health/config.py                 |   5 +
+ scripts/code_health/py_rules.py               |   2 +
+ scripts/code_health/py_rules_websockets.py    |  43 ++++++
+ .../hermes_cli/test_kanban_feed_keepalive.py  | 124 ++++++++++++++++++
+ tests/hermes_cli/test_ws_logging.py           |  46 +++++++
+ tests/scripts/test_code_health_ws_rule.py     |  46 +++++++
+ tools/browser_cdp_tool.py                     |   3 +-
+ tools/browser_supervisor.py                   |   3 +-
+ tools/transcription_streaming.py              |   3 +-
+ tools/tts_streaming.py                        |   3 +-
+ tui_gateway/event_publisher.py                |   4 +-
+ 19 files changed, 336 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/ws_logging.py
+ create mode 100644 scripts/code_health/py_rules_websockets.py
+ create mode 100644 tests/hermes_cli/test_kanban_feed_keepalive.py
+ create mode 100644 tests/hermes_cli/test_ws_logging.py
+ create mode 100644 tests/scripts/test_code_health_ws_rule.py
+
+diff --git a/gateway/relay/ws_transport.py b/gateway/relay/ws_transport.py
+index 581fd69990..a78ab78494 100644
+--- a/gateway/relay/ws_transport.py
++++ b/gateway/relay/ws_transport.py
+@@ -20,6 +20,7 @@ import uuid
+ from dataclasses import dataclass
+ from typing import Any, Awaitable, Callable, Dict, List, Optional
+ 
++from hermes_cli.ws_logging import ws_logger
+ from gateway.platforms.event import MessageEvent, MessageType
+ from gateway.session import SessionSource
+ from gateway.relay.descriptor import CapabilityDescriptor
+@@ -432,7 +433,7 @@ class WebSocketRelayTransport:
+         headers = self._upgrade_headers()
+         if headers:
+             kwargs["additional_headers"] = headers
+-        self._ws = await websockets.connect(self._url, **kwargs)  # type: ignore[union-attr]
++        self._ws = await websockets.connect(self._url, logger=ws_logger(), **kwargs)  # type: ignore[union-attr]
+         if self._auth_retry_pending:
+             # The upgrade was ACCEPTED, so this connection's freshly minted token
+             # reached an auth outcome: it is the fresh-token retry generation. A
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index b7e30556db..56fe043e30 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -594,12 +594,13 @@ class FeedWatcher:
+         except ImportError:  # optional: without it the loop polls
+             _log.info("kanban sync: websockets not installed; %s is polled only", self.board)
+             return
++        from hermes_cli.ws_logging import ws_logger
+         backoff = 1.0
+         while self.keep_running():
+             try:
+                 with connect(self.url(), additional_headers={"authorization": f"Bearer {self.ident.key}",
+                                                              "user-agent": "hermes-kanban-sync/1"},
+-                             open_timeout=HTTP_TIMEOUT_S) as ws:
++                             open_timeout=HTTP_TIMEOUT_S, logger=ws_logger()) as ws:
+                     backoff = 1.0
+                     while self.keep_running():
+                         try:
+diff --git a/hermes_cli/ws_logging.py b/hermes_cli/ws_logging.py
+new file mode 100644
+index 0000000000..fe720f382b
+--- /dev/null
++++ b/hermes_cli/ws_logging.py
+@@ -0,0 +1,37 @@
++"""The logger every Hermes websockets connection passes as ``logger=``.
++
++websockets' keepalive thread/task reports a peer that stopped answering pings with
++``logger.error("keepalive ping failed", exc_info=True)``. By then the library has already failed the
++connection, and the caller's next ``recv``/``send`` raises ``ConnectionClosed``, which every Hermes call
++site handles (reconnect, end the stream, fall back to polling). Logged at ERROR with a traceback, that
++handled drop reads in errors.log like an unhandled crash, and self-heal files it as a defect.
++
++``ws_logger()`` wraps the library's own logger (same name, so level and handler config still apply),
++turns that one message into a single INFO line naming the cause, and passes every other record through at
++its real level. ``scripts/code_health`` rule HX015 flags a websockets ``connect()`` without ``logger=``,
++so a new call site cannot reintroduce the ERROR.
++"""
++
++from __future__ import annotations
++
++import logging
++import sys
++from typing import Any
++
++_HANDLED = frozenset({"keepalive ping failed"})
++
++
++class _HandledDropAdapter(logging.LoggerAdapter):
++    def log(self, level: int, msg: Any, *args: Any, **kwargs: Any) -> None:
++        if level >= logging.ERROR and isinstance(msg, str) and msg in _HANDLED:
++            exc = sys.exc_info()[1]
++            kwargs.pop("exc_info", None)
++            level, msg, args = logging.INFO, "%s (%s: %s); the connection is closed and the caller handles it", (
++                msg, type(exc).__name__ if exc else "no exception", exc)
++        super().log(level, msg, *args, **kwargs)
++
++
++def ws_logger(side: str = "client") -> logging.LoggerAdapter:
++    """Logger for one websockets connection (``connect(..., logger=ws_logger())``; ``serve(..., logger=
++    ws_logger("server"))``)."""
++    return _HandledDropAdapter(logging.getLogger(f"websockets.{side}"), {})
+diff --git a/plugins/google_meet/node/client.py b/plugins/google_meet/node/client.py
+index 5a62ababda..d26ad80804 100644
+--- a/plugins/google_meet/node/client.py
++++ b/plugins/google_meet/node/client.py
+@@ -28,7 +28,9 @@ class NodeClient:
+             raise RuntimeError("NodeClient requires the 'websockets' package. "
+                                "Install it with: pip install websockets") from exc
+         req = _proto.make_request(type, self.token, payload)
+-        with connect(self.url, open_timeout=self.timeout, close_timeout=self.timeout) as ws:
++        from hermes_cli.ws_logging import ws_logger
++
++        with connect(self.url, open_timeout=self.timeout, close_timeout=self.timeout, logger=ws_logger()) as ws:
+             ws.send(_proto.encode(req))
+             resp = _proto.decode(ws.recv(timeout=self.timeout))
+         if resp.get("type") == "error":
+diff --git a/plugins/google_meet/node/server.py b/plugins/google_meet/node/server.py
+index 4017690b8d..5593f2acff 100644
+--- a/plugins/google_meet/node/server.py
++++ b/plugins/google_meet/node/server.py
+@@ -126,5 +126,7 @@ class NodeServer:
+                     continue
+                 await ws.send(_proto.encode(await self._handle_request(msg)))
+ 
+-        async with websockets.serve(_handler, self.host, self.port):
++        from hermes_cli.ws_logging import ws_logger
++
++        async with websockets.serve(_handler, self.host, self.port, logger=ws_logger("server")):
+             await asyncio.Future()  # run until cancelled
+diff --git a/plugins/google_meet/realtime/openai_client.py b/plugins/google_meet/realtime/openai_client.py
+index a4b9ed7ef5..72247fe581 100644
+--- a/plugins/google_meet/realtime/openai_client.py
++++ b/plugins/google_meet/realtime/openai_client.py
+@@ -54,11 +54,13 @@ class RealtimeSession:
+                                "install with: pip install websockets") from exc
+         url = f"{REALTIME_URL}?model={self.model}"
+         headers = [("Authorization", f"Bearer {self.api_key}"), ("OpenAI-Beta", "realtime=v1")]
++        from hermes_cli.ws_logging import ws_logger
++
+         # Newer websockets takes additional_headers=, older extra_headers=.
+         try:
+-            self._ws = connect(url, additional_headers=headers)
++            self._ws = connect(url, additional_headers=headers, logger=ws_logger())
+         except TypeError:
+-            self._ws = connect(url, extra_headers=headers)
++            self._ws = connect(url, extra_headers=headers, logger=ws_logger())
+         self._send_json({"type": "session.update", "session": {
+             "voice": self.voice, "instructions": self.instructions, "modalities": ["audio", "text"],
+             "output_audio_format": "pcm16", "input_audio_format": "pcm16"}})
+diff --git a/plugins/platforms/buzz/adapter.py b/plugins/platforms/buzz/adapter.py
+index 739368dec9..6ebbcc3281 100644
+--- a/plugins/platforms/buzz/adapter.py
++++ b/plugins/platforms/buzz/adapter.py
+@@ -31,9 +31,9 @@ from urllib.parse import urlsplit, urlunsplit
+ from agent.secret_scope import is_multiplex_active as _is_multiplex_active
+ from gateway.platforms._shared import (
+     apply_yaml_bridge as _apply_yaml_bridge, get_scoped_secret as _shared_scoped_secret, profile_scoped as _profile_scoped,
+-    seed_extra_from_env as _seed_extra_from_env,
++    seed_extra_from_env as _seed_extra_from_env, send_error,
+ )
+-from gateway.platforms._shared import send_error
++from hermes_cli.ws_logging import ws_logger
+ 
+ 
+ def _get_scoped_secret(name, default=None):
+@@ -1106,7 +1106,7 @@ class BuzzAdapter(BasePlatformAdapter):
+         while True:
+             try:
+                 async with websockets.connect(
+-                    self._websocket_url(), open_timeout=_WS_AUTH_TIMEOUT, close_timeout=5,
++                    self._websocket_url(), open_timeout=_WS_AUTH_TIMEOUT, close_timeout=5, logger=ws_logger(),
+                     ping_interval=20, ping_timeout=20, max_size=_WS_MAX_MESSAGE_BYTES,
+                     happy_eyeballs_delay=0.25,  # race IPv6/IPv4 in loop.create_connection (#114265)
+                 ) as websocket:
+diff --git a/plugins/platforms/simplex/adapter.py b/plugins/platforms/simplex/adapter.py
+index 4591bdc429..fde830de28 100644
+--- a/plugins/platforms/simplex/adapter.py
++++ b/plugins/platforms/simplex/adapter.py
+@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
+ 
+ from urllib.parse import unquote
+ 
++from hermes_cli.ws_logging import ws_logger
+ from gateway.platforms._shared import (
+     decode_json_list_literal as _decode_json_list_literal, get_scoped_secret as _get_scoped_secret,
+     platform_gate_env as _platform_gate_env, seed_extra_from_env as _seed_extra_from_env, send_error
+@@ -161,7 +162,7 @@ class SimplexAdapter(BasePlatformAdapter):
+             return False
+         _warn_name_allowlist_entries()  # before the probe so a daemon-down cold boot still warns
+         try:  # quick connectivity check — open and immediately close
+-            async with _wsclient.connect(self.ws_url, open_timeout=10):
++            async with _wsclient.connect(self.ws_url, open_timeout=10, logger=ws_logger()):
+                 pass
+         except Exception as e:
+             logger.error("SimpleX: cannot reach daemon at %s: %s", self.ws_url, e)
+@@ -200,7 +201,8 @@ class SimplexAdapter(BasePlatformAdapter):
+         while self._running:
+             try:
+                 logger.debug("SimpleX WS: connecting to %s", self.ws_url)
+-                async with _wsclient.connect(self.ws_url, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
++                async with _wsclient.connect(self.ws_url, ping_interval=20, ping_timeout=20, close_timeout=10,
++                                             logger=ws_logger()) as ws:
+                     self._ws = ws
+                     backoff = WS_RETRY_DELAY_INITIAL
+                     self._last_ws_activity = time.time()
+@@ -659,7 +661,7 @@ async def _standalone_send(
+         payload = {
+             "corrId": f"{_CORR_PREFIX}snd-{int(time.time() * 1000)}",
+             "cmd": _send_cmd(chat_id, [{"msgContent": {"type": "text", "text": message}}])}
+-        async with _wsclient.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
++        async with _wsclient.connect(ws_url, open_timeout=10, close_timeout=5, logger=ws_logger()) as ws:
+             await ws.send(json.dumps(payload))
+             await asyncio.sleep(0.5)  # let the daemon process the command before closing
+         return {"success": True, "platform": "simplex", "chat_id": chat_id}
+diff --git a/scripts/code_health/config.py b/scripts/code_health/config.py
+index f07e9f6473..c31fbc2e5a 100644
+--- a/scripts/code_health/config.py
++++ b/scripts/code_health/config.py
+@@ -153,6 +153,11 @@ RULES: tuple[Rule, ...] = (
+          " around `yield` eats the `with` block's own error and, on a second yield, becomes \"generator"
+          " didn't stop after throw()\". Find the resource inside the `try`, then yield it outside any"
+          " handler (keep what it opened alive with `contextlib.ExitStack`), or re-raise", "ast"),
++    # Logs: websockets reports a handled keepalive drop as ERROR + traceback unless the caller owns the logger.
++    Rule("HX015", "websockets connection without logger=", "pass `logger=ws_logger()`"
++         " (`hermes_cli.ws_logging`; `ws_logger(\"server\")` for `serve`): the library logs a peer that stopped"
++         " answering pings as `ERROR keepalive ping failed` + traceback even when this code handles the drop",
++         "ast", exclude=TESTS + ("scripts/*", "evals/*")),
+ )
+ 
+ RULES_BY_ID = {rule.id: rule for rule in RULES}
+diff --git a/scripts/code_health/py_rules.py b/scripts/code_health/py_rules.py
+index f083413f84..ef8715f144 100644
+--- a/scripts/code_health/py_rules.py
++++ b/scripts/code_health/py_rules.py
+@@ -16,6 +16,7 @@ import itertools
+ from scripts.code_health.py_ast import _FUNCS, Ctx, _call_name, _deferred_parts, _dotted, _eager
+ from scripts.code_health.py_rules_contextmanager import swallowed_yield
+ from scripts.code_health.py_rules_sleep import wall_clock_sleep
++from scripts.code_health.py_rules_websockets import ws_without_logger
+ 
+ _CAPTURE_CALLS = {
+     "get_hermes_home",
+@@ -876,4 +877,5 @@ CHECKERS: dict[str, Callable[[ast.Module, Ctx], Iterable[int]]] = {
+     "HX012": raw_thread,
+     "HX013": wall_clock_sleep,
+     "HX014": swallowed_yield,
++    "HX015": ws_without_logger,
+ }
+diff --git a/scripts/code_health/py_rules_websockets.py b/scripts/code_health/py_rules_websockets.py
+new file mode 100644
+index 0000000000..9aaffac699
+--- /dev/null
++++ b/scripts/code_health/py_rules_websockets.py
+@@ -0,0 +1,43 @@
++"""HX015: a websockets connection opened without ``logger=`` (registered in ``py_rules.CHECKERS``).
++
++websockets logs a peer that stops answering pings as ``ERROR keepalive ping failed`` + traceback from its own
++keepalive thread, even when the caller handles the drop (reconnect, end the stream). Every Hermes call site
++passes ``logger=hermes_cli.ws_logging.ws_logger()`` so that handled drop is one INFO line.
++"""
++
++from __future__ import annotations
++
++import ast
++from collections.abc import Iterable
++
++from scripts.code_health.py_ast import Ctx, _call_name
++
++# Canonical names (``canonical_tree`` resolves import aliases) of the calls that open a websockets connection.
++_OPENERS = frozenset({
++    "websockets.connect", "websockets.serve",
++    "websockets.client.connect", "websockets.server.serve",
++    "websockets.sync.client.connect", "websockets.sync.server.serve",
++    "websockets.asyncio.client.connect", "websockets.asyncio.server.serve",
++    "websockets.legacy.client.connect", "websockets.legacy.server.serve",
++})
++
++
++def _imported_openers(tree: ast.Module) -> dict[str, str]:
++    """Local names bound by ``from websockets... import connect/serve``. ``canonical_tree`` leaves a name alone
++    when the module also rebinds it (``except ImportError: connect = None``), so match those by name."""
++    names: dict[str, str] = {}
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "websockets":
++            for alias in node.names:
++                if f"{node.module}.{alias.name}" in _OPENERS:
++                    names[alias.asname or alias.name] = f"{node.module}.{alias.name}"
++    return names
++
++
++def ws_without_logger(tree: ast.Module, ctx: Ctx) -> Iterable[int]:
++    local = _imported_openers(tree)
++    for node in ast.walk(tree):
++        if not isinstance(node, ast.Call) or any(kw.arg == "logger" for kw in node.keywords):
++            continue
++        if _call_name(node) in _OPENERS or (isinstance(node.func, ast.Name) and node.func.id in local):
++            yield node.lineno
+diff --git a/tests/hermes_cli/test_kanban_feed_keepalive.py b/tests/hermes_cli/test_kanban_feed_keepalive.py
+new file mode 100644
+index 0000000000..670bb9c302
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_feed_keepalive.py
+@@ -0,0 +1,124 @@
++"""A Board feed socket that goes silent is a handled drop: FeedWatcher reconnects, and nothing logs at ERROR.
++
++Regression for self-heal defect agent-ac35b4d534: websockets' sync keepalive thread logged
++``ERROR websockets.client: keepalive ping failed`` + traceback when the Board stopped answering pings, one
++millisecond before FeedWatcher's own INFO "feed socket closed ... reconnecting" line. errors.log then read like an
++unhandled crash and self-heal filed it as a defect. Hermes now passes its own logger (``hermes_cli.ws_logging``),
++so that case is one INFO line.
++"""
++
++from __future__ import annotations
++
++import functools
++import logging
++import socket
++import threading
++
++import pytest
++
++from hermes_cli import kanban_sync_client as ksc
++from tests.waiting import wait_until
++
++pytest.importorskip("websockets")
++
++
++class _SilentRelay:
++    """TCP relay in front of a real websocket server: forwards the HTTP upgrade both ways, then reads and drops
++    every later byte, like a Board that stops answering pings without closing the socket."""
++
++    def __init__(self, upstream_port: int) -> None:
++        self.upstream_port = upstream_port
++        self.listener = socket.create_server(("127.0.0.1", 0))
++        self.listener.settimeout(0.1)
++        self.port = self.listener.getsockname()[1]
++        self.connections = 0
++        self._stop = threading.Event()
++        self._socks: list[socket.socket] = []
++        threading.Thread(target=self._accept, daemon=True).start()
++
++    def _accept(self) -> None:
++        while not self._stop.is_set():
++            try:
++                client, _ = self.listener.accept()
++            except OSError:  # accept timeout (TimeoutError is an OSError) or the listener closed
++                continue
++            self.connections += 1
++            upstream = socket.create_connection(("127.0.0.1", self.upstream_port))
++            self._socks += [client, upstream]
++            for src, dst in ((client, upstream), (upstream, client)):
++                threading.Thread(target=self._pipe, args=(src, dst), daemon=True).start()
++
++    def _pipe(self, src: socket.socket, dst: socket.socket) -> None:
++        head = b""  # bytes seen so far while the HTTP upgrade is still in flight
++        while not self._stop.is_set():
++            try:
++                data = src.recv(65536)
++            except OSError:
++                return
++            if not data:
++                return
++            if head is None:
++                continue  # upgraded: swallow the frame
++            seen, head = len(head), head + data
++            end = head.find(b"\r\n\r\n")
++            upto = len(head) if end < 0 else end + 4
++            try:
++                dst.sendall(head[seen:upto])
++            except OSError:
++                return
++            if end >= 0:
++                head = None
++
++    def close(self) -> None:
++        self._stop.set()
++        for s in [self.listener, *self._socks]:
++            s.close()
++
++
++def test_silent_board_socket_reconnects_without_an_error_record(monkeypatch, caplog):
++    import websockets.sync.client as ws_client
++    from websockets.sync.server import serve
++
++    # Library keepalive at 0.3 s (production keeps the library's 20 s default). Every other kwarg, logger
++    # included, is whatever FeedWatcher passes.
++    monkeypatch.setattr(ws_client, "connect", functools.partial(ws_client.connect, ping_interval=0.3,
++                                                                ping_timeout=0.3, close_timeout=0.3))
++    stop = threading.Event()
++
++    def handler(ws):
++        ws.send('{"type": "hello", "head": 1}')
++        while not stop.is_set():
++            try:
++                ws.recv(timeout=0.2)
++            except TimeoutError:
++                continue
++            except Exception:  # the client dropped the socket; the test server just ends
++                return
++
++    caplog.set_level(logging.DEBUG)
++    caplog.set_level(logging.DEBUG, logger="websockets.client")  # hermes_logging pins it at WARNING in production
++    with serve(handler, "127.0.0.1", 0, logger=logging.getLogger("test.board_server")) as server:
++        threading.Thread(target=server.serve_forever, daemon=True).start()
++        relay = _SilentRelay(server.socket.getsockname()[1])
++        ident = ksc.Identity(url=f"http://127.0.0.1:{relay.port}", key="gw-key", gateway="gw-test")
++        watcher = ksc.FeedWatcher(ident, "keepalive-board", threading.Event(), lambda: not stop.is_set(), ping_s=0.5)
++        t = threading.Thread(target=watcher.run, daemon=True)
++        t.start()
++        try:
++            wait_until(lambda: relay.connections >= 2, timeout=15, what="the silent socket dropped and reconnected")
++            wait_until(lambda: any("keepalive ping failed" in r.getMessage() for r in caplog.records), timeout=5,
++                       what="the library's keepalive failure record")
++        finally:
++            stop.set()
++            relay.close()
++            server.shutdown()
++            t.join(timeout=5)
++
++    closed = [r for r in caplog.records if "feed socket closed" in r.getMessage()]
++    assert closed and all(r.levelno == logging.INFO for r in closed), "FeedWatcher logs the drop at INFO"
++    errors = [f"{r.name}: {r.getMessage()}" for r in caplog.records
++              if r.levelno >= logging.ERROR and not r.name.startswith("test.")]
++    assert errors == [], f"a handled keepalive drop must not log at ERROR: {errors}"
++    keepalive = [r for r in caplog.records if "keepalive ping failed" in r.getMessage()]
++    assert all(r.levelno == logging.INFO and not r.exc_info for r in keepalive), \
++        "the keepalive failure is one INFO line without a traceback"
+diff --git a/tests/hermes_cli/test_ws_logging.py b/tests/hermes_cli/test_ws_logging.py
+new file mode 100644
+index 0000000000..a0be87abd7
+--- /dev/null
++++ b/tests/hermes_cli/test_ws_logging.py
+@@ -0,0 +1,46 @@
++"""hermes_cli.ws_logging: the one handled websockets failure becomes an INFO line; everything else keeps its level."""
++
++from __future__ import annotations
++
++import logging
++
++from hermes_cli.ws_logging import ws_logger
++
++
++def _raise_and_log(log, msg):
++    try:
++        raise TimeoutError("timed out while closing connection")
++    except TimeoutError:
++        log.error(msg, exc_info=True)
++
++
++def test_keepalive_failure_is_one_info_line_naming_the_cause(caplog):
++    caplog.set_level(logging.DEBUG, logger="websockets.client")
++    _raise_and_log(ws_logger(), "keepalive ping failed")
++    [rec] = caplog.records
++    assert rec.name == "websockets.client" and rec.levelno == logging.INFO and not rec.exc_info
++    assert "keepalive ping failed (TimeoutError: timed out while closing connection)" in rec.getMessage()
++
++
++def test_other_errors_keep_their_level_and_traceback(caplog):
++    caplog.set_level(logging.DEBUG)
++    caplog.set_level(logging.DEBUG, logger="websockets")  # hermes_logging pins it at WARNING
++    _raise_and_log(ws_logger("server"), "unexpected internal error")
++    log = ws_logger()
++    log.warning("keepalive ping failed")  # below ERROR: untouched
++    log.debug("% sent keepalive ping")
++    recs = [(r.name, r.levelno, bool(r.exc_info)) for r in caplog.records]
++    assert recs == [("websockets.server", logging.ERROR, True), ("websockets.client", logging.WARNING, False),
++                    ("websockets.client", logging.DEBUG, False)]
++
++
++def test_level_config_of_the_library_logger_still_applies(caplog):
++    caplog.set_level(logging.DEBUG)
++    logging.getLogger("websockets.client").setLevel(logging.WARNING)
++    try:
++        log = ws_logger()
++        assert not log.isEnabledFor(logging.INFO)  # websockets reads this to decide on debug output
++        _raise_and_log(log, "keepalive ping failed")
++        assert caplog.records == []  # demoted to INFO, below the library logger's WARNING floor
++    finally:
++        logging.getLogger("websockets.client").setLevel(logging.NOTSET)
+diff --git a/tests/scripts/test_code_health_ws_rule.py b/tests/scripts/test_code_health_ws_rule.py
+new file mode 100644
+index 0000000000..8bf2c4fe52
+--- /dev/null
++++ b/tests/scripts/test_code_health_ws_rule.py
+@@ -0,0 +1,46 @@
++"""HX015: a websockets connection opened without ``logger=`` (the library then logs a handled keepalive drop as
++ERROR + traceback; regression for self-heal defect agent-ac35b4d534)."""
++
++from __future__ import annotations
++
++import ast
++
++import pytest
++
++from scripts.code_health.config import RULES_BY_ID, rule_applies
++from scripts.code_health.py_rules import CHECKERS, Ctx, canonical_tree
++
++
++def _hits(src: str) -> list[int]:
++    return sorted(set(CHECKERS["HX015"](canonical_tree(ast.parse(src)), Ctx())))
++
++
++@pytest.mark.parametrize("src, flagged", [
++    ("from websockets.sync.client import connect\nconnect('ws://x')\n", True),
++    ("def f():\n    from websockets.sync.client import connect\n    with connect('ws://x') as ws:\n        pass\n", True),
++    ("import websockets\nasync def f():\n    async with websockets.connect('ws://x') as ws:\n        pass\n", True),
++    ("import websockets as w\nasync def f():\n    await w.connect('ws://x', **kw)\n", True),  # a splat is not a logger
++    ("import websockets.asyncio.client as c\nasync def f():\n    await c.connect('ws://x')\n", True),
++    ("import websockets\nasync def f():\n    async with websockets.serve(h, 'h', 1):\n        pass\n", True),
++    ("from websockets.sync.server import serve\nserve(h, 'h', 1)\n", True),
++    # optional import with a None fallback: the name is rebound, still the library's connect
++    ("try:\n    from websockets.sync.client import connect as ws_connect\nexcept ImportError:\n"
++     "    ws_connect = None\nws_connect('ws://x')\n", True),
++    # the fix shape
++    ("from websockets.sync.client import connect\nconnect('ws://x', logger=ws_logger())\n", False),
++    ("import websockets\nasync def f():\n    await websockets.connect('ws://x', logger=lg, **kw)\n", False),
++    ("from websockets.sync.server import serve\nserve(h, 'h', 1, logger=ws_logger('server'))\n", False),
++    # not websockets
++    ("import sqlite3\nsqlite3.connect('db')\n", False),
++    ("def connect(u):\n    return u\nconnect('ws://x')\n", False),
++])
++def test_ws_without_logger_shapes(src, flagged):
++    assert bool(_hits(src)) is flagged, src
++
++
++def test_scope_is_production_code():
++    rule = RULES_BY_ID["HX015"]
++    assert rule_applies(rule, "hermes_cli/kanban_sync_client.py")
++    assert rule_applies(rule, "plugins/platforms/buzz/adapter.py")
++    assert not rule_applies(rule, "tests/hermes_cli/test_kanban_feed_keepalive.py")
++    assert not rule_applies(rule, "evals/liveness/ws_orphan_reconnect.py")
+diff --git a/tools/browser_cdp_tool.py b/tools/browser_cdp_tool.py
+index c4aad27ee6..cb1e288d67 100644
+--- a/tools/browser_cdp_tool.py
++++ b/tools/browser_cdp_tool.py
+@@ -13,6 +13,7 @@ import json
+ import logging
+ from typing import Any, Dict, Optional
+ 
++from hermes_cli.ws_logging import ws_logger
+ from tools.registry import registry, tool_error
+ from tools.browser_extension_router import routed_browser_handler
+ 
+@@ -177,7 +178,7 @@ async def _cdp_call(ws_url: str, method: str, params: dict[str, Any], target_id:
+     # max_size=None: CDP responses (e.g. DOM.getDocument) can be large; ping_interval=None: CDP
+     # servers don't expect pings.
+     async with websockets.connect(ws_url, max_size=None, open_timeout=timeout, close_timeout=5,
+-                                  ping_interval=None, **loopback_connect_kwargs(ws_url)) as ws:
++                                  ping_interval=None, logger=ws_logger(), **loopback_connect_kwargs(ws_url)) as ws:
+         next_id = 1
+ 
+         async def _send(req: dict[str, Any], what: str) -> dict[str, Any]:
+diff --git a/tools/browser_supervisor.py b/tools/browser_supervisor.py
+index d19b93d2a4..80c68360f4 100644
+--- a/tools/browser_supervisor.py
++++ b/tools/browser_supervisor.py
+@@ -20,6 +20,7 @@ import time
+ from dataclasses import dataclass
+ from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+ 
++from hermes_cli.ws_logging import ws_logger
+ from tools.browser_supervisor_dialogs import (
+     DEFAULT_DIALOG_POLICY, DEFAULT_DIALOG_TIMEOUT_S, RECENT_DIALOGS_MAX, _VALID_POLICIES, DialogRecord,
+     DialogSupervisionMixin, PendingDialog,
+@@ -378,7 +379,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
+         connect_kwargs = {"max_size": 50 * 1024 * 1024, **loopback_connect_kwargs(self.cdp_url)}
+         while not self._stop_requested:
+             try:
+-                self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, **connect_kwargs), timeout=10.0)
++                self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, logger=ws_logger(), **connect_kwargs), timeout=10.0)
+             except Exception as e:
+                 if self._fail_start(e):
+                     return
+diff --git a/tools/transcription_streaming.py b/tools/transcription_streaming.py
+index e29e9c567e..89d35286e9 100644
+--- a/tools/transcription_streaming.py
++++ b/tools/transcription_streaming.py
+@@ -33,6 +33,7 @@ from array import array
+ from typing import Any, Callable, Dict, Optional
+ from urllib.parse import urlencode, urlsplit, urlunsplit
+ 
++from hermes_cli.ws_logging import ws_logger
+ from agent.memory_provider import spawn_context_thread
+ from utils import is_truthy_value
+ 
+@@ -187,7 +188,7 @@ class _WebSocketSession(StreamingSession):
+         from websockets.sync.client import connect
+ 
+         ws = connect(self.url, additional_headers=self.headers, open_timeout=_CONNECT_TIMEOUT_S,
+-                     close_timeout=1, max_size=None)
++                     close_timeout=1, max_size=None, logger=ws_logger())
+         try:
+             return self._loop(ws)
+         finally:
+diff --git a/tools/tts_streaming.py b/tools/tts_streaming.py
+index af9ccf7b84..f21e462fbc 100644
+--- a/tools/tts_streaming.py
++++ b/tools/tts_streaming.py
+@@ -17,6 +17,7 @@ import time
+ from abc import ABC, abstractmethod
+ from typing import Any, Callable, Dict, Iterator, List, Optional
+ 
++from hermes_cli.ws_logging import ws_logger
+ from agent.think_scrubber import THINK_TAG_NAMES
+ from tools.tool_backend_helpers import resolve_openai_audio_api_key
+ from tools.tts_tool import _get_provider, _load_tts_config
+@@ -502,7 +503,7 @@ class XAIStreamer(StreamingTTSProvider):
+         ws_url = f"{base}{sep}{params}"
+ 
+         async with websockets.connect(
+-            ws_url, additional_headers={"Authorization": f"Bearer {api_key}"}
++            ws_url, additional_headers={"Authorization": f"Bearer {api_key}"}, logger=ws_logger(),
+         ) as ws:
+             await ws.send(_json.dumps({"type": "text.delta", "delta": text}))
+             await ws.send(_json.dumps({"type": "text.done"}))
+diff --git a/tui_gateway/event_publisher.py b/tui_gateway/event_publisher.py
+index c0ea1f2ad9..d6ae90566d 100644
+--- a/tui_gateway/event_publisher.py
++++ b/tui_gateway/event_publisher.py
+@@ -17,6 +17,8 @@ import queue
+ import threading
+ from typing import Optional
+ 
++from hermes_cli.ws_logging import ws_logger
++
+ try:
+     from websockets.sync.client import connect as ws_connect
+ except ImportError:  # pragma: no cover - websockets is a required install path
+@@ -41,7 +43,7 @@ class WsPublisherTransport:
+         if self._dead:
+             return
+         try:
+-            self._ws = ws_connect(url, open_timeout=connect_timeout, max_size=None)
++            self._ws = ws_connect(url, open_timeout=connect_timeout, max_size=None, logger=ws_logger())
+         except Exception as exc:
+             _log.debug("event publisher connect failed: %s", exc)
+             self._dead = True
+-- 
+2.55.0
+
