@@ -1,6 +1,6 @@
 # Kanban remote observation scope, replica read path and retained-row evidence
 
-Patches **0461**, **0462**, **0490**, **0497**, **0498**, **0500**, **0501**, **0505**, **0598** (backend) and **0483**, **0484**, **0485**,
+Patches **0461**, **0462**, **0490**, **0497**, **0498**, **0500**, **0501**, **0505**, **0599** (backend) and **0483**, **0484**, **0485**,
 **0525** (Desktop). Sources: `4695da764b`, `e90c1654a4`, `236b07480e`, `d121f4c697`, `b23a0d382e`, `12758cf08f`,
 `78130169e3`, `ca4285335f`, `5803147af6`, `ffeb8f66fc`, `589534bac5`, `98906dadc7`. Extends
 [retention-observation.md](retention-observation.md) and [kanban-all-gateways.md](kanban-all-gateways.md).
