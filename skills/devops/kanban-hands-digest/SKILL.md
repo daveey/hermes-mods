@@ -129,3 +129,10 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
   it `-readonly` with a busy timeout.
 - Inside a Kanban worker the `hermes kanban` CLI refuses mutations, so auto-unblock only works from cron or
   a normal session; run on-demand with `--no-unblock` there.
+- **Your own reply text can become an ask.** On Desktop, the user-steps output transform publishes any reply
+  sentence that tells the user to do or decide something as a "For you" prompt, and agents can't close those.
+  - Two sentences that did this: "Answering either with 'no action needed' clears it", and a closing note that
+    an option was deliberately not taken.
+  - State settled facts as statements. Put a genuine decision in one `action_request`.
+  - To fix a stale prompt you posted, call `action_request` with its `requestId` and `expectedRevision` = its
+    current revision. Give it accurate text and a "No action needed" choice. Revising works; closing doesn't.
