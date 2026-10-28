@@ -1,0 +1,676 @@
+From 59a927377a753f622621841d8d1b845d24f80f30 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:49:06 -0700
+Subject: [PATCH] fix(desktop): a down remote fails fast instead of redialing
+ SSH per request [daveey]
+
+On 2026-10-27 16:53-16:55 PDT the mini stopped answering: every renderer request opened its own SSH control
+master and waited out the 15 s timeout, the next one dialing ~20 ms after the last failed (11 dials, 36 stalled
+requests in 2 min). 0592's gate remembered only a remote's own-update refusal.
+
+- remote-update-pause.ts: second failure class 'unreachable' with a written rule (classifyRemoteDialFailure):
+  network (unreachable, timeout, transient-transport-error) and SSH refusals (auth-failed, interactive-auth,
+  host-key-changed) are remembered per remote install with a 2/5/15/30/60 s backoff (prewarm's own steps);
+  ssh-client-failed (#103288), superseded, post-dial remote states and untagged errors pass through. Cached
+  errors keep message/kind/sshError so boot classifies them the same, plus code remote-unreachable-backoff and
+  retryAt; the recorded error gets retryAt too. One probe per window; recovery logs once. clear(why) for
+  explicit retries.
+- main.ts: Reload and retry, Repair, connection apply/save and a reachable Test clear the gate so they dial at
+  once; registry Reconnect and managed restores keep bypassing it via their correlation id.
+- remote-dial-backoff.test.ts: renderer requests, prewarm and explicit reconnect paths, the classification table
+  and the main.ts wiring.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/main.ts                 |  11 +-
+ .../electron/remote-dial-backoff.test.ts      | 375 ++++++++++++++++++
+ apps/desktop/electron/remote-prewarm.ts       |   5 +-
+ apps/desktop/electron/remote-update-pause.ts  | 111 +++++-
+ 4 files changed, 484 insertions(+), 18 deletions(-)
+ create mode 100644 apps/desktop/electron/remote-dial-backoff.test.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 22e13aec7a..3953fbec8b 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -10091,7 +10091,8 @@ async function effectiveSshConfigFingerprint(sshConfig) {
+   return crypto.createHash('sha256').update(output).digest('hex')
+ }
+ 
+-// Remembers a remote install's own-update refusal so requests and prewarm stop redialing (remote-update-pause.ts).
++// Remembers a remote install's own-update refusal, or that it cannot be dialed at all, so requests and prewarm stop
++// redialing per call (remote-update-pause.ts). Explicit user retries clear it.
+ const remoteUpdatePause = new RemoteUpdatePause({ log: line => rememberLog(line) })
+ 
+ async function bootstrapSshConnection(
+@@ -10120,7 +10121,8 @@ async function bootstrapSshConnection(
+     return start()
+   }
+ 
+-  // While the remote runs its own update, fail fast instead of dialing per request (remote-update-pause.ts).
++  // While the remote runs its own update or cannot be dialed, fail fast instead of dialing per request
++  // (remote-update-pause.ts).
+   return remoteUpdatePause.run(remoteUpdatePauseKey(resolvedConfig), start)
+ }
+ 
+@@ -15964,6 +15966,7 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
+   // reset connection state so the next startHermes() call restarts the
+   // full backend flow (including a fresh runBootstrap pass).
+   rememberLog('[bootstrap] reset requested by renderer; clearing latched failure')
++  remoteUpdatePause.clear('reload and retry')
+   await teardownPrimaryBackendAndWait()
+   bootstrapFailure = null
+   backendStartFailure = null
+@@ -16032,6 +16035,7 @@ ipcMain.handle('hermes:bootstrap:repair', async (): Promise<{ ok: boolean; bundl
+   backendStartFailure = null
+   remoteReauthFailure = null
+   getFirstRunSetupGate().resetForRepair()
++  remoteUpdatePause.clear('repair')
+   await teardownPrimaryBackendAndWait()
+ 
+   return { ok: true }
+@@ -16216,6 +16220,7 @@ const registryReconnectService = wireRegistryReconnect({
+ ipcMain.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
+ ipcMain.handle('hermes:connections:save', async (_event, payload) => {
+   const saved = await saveRegistryConnection(payload)
++  remoteUpdatePause.clear('connection saved')
+ 
+   return { ok: true, connection: saved, registry: sanitizeConnectionsRegistry() }
+ })
+@@ -16279,6 +16284,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
+     })
+ 
+     if (result?.reachable) {
++      remoteUpdatePause.clear('reachable connection test')
+       sshInventoryAttemptedAt.delete(entry.id)
+       sshRosterCache.delete(entry.id)
+       await probeSshProfileInventory(entry)
+@@ -17074,6 +17080,7 @@ ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
+ })
+ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
+   assertCanMutateManagedPrimaryRouting()
++  remoteUpdatePause.clear('connection applied')
+   const previousConfig = readDesktopConnectionConfig()
+   const previousRegistry = readDesktopConnectionsRegistry()
+   const config = coerceDesktopConnectionConfig(payload, previousConfig)
+diff --git a/apps/desktop/electron/remote-dial-backoff.test.ts b/apps/desktop/electron/remote-dial-backoff.test.ts
+new file mode 100644
+index 0000000000..791df5fed8
+--- /dev/null
++++ b/apps/desktop/electron/remote-dial-backoff.test.ts
+@@ -0,0 +1,375 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it } from 'vitest'
++
++import {
++  isRetryableRemoteBootFailure,
++  isSshAuthFailedBootFailure,
++  isSshClientFailedBootFailure,
++  sshClientFailedError
++} from './backend-start-failure'
++import { RemotePrewarmer } from './remote-prewarm'
++import {
++  classifyRemoteDialFailure,
++  RemoteUpdatePause,
++  remoteUpdatePauseKey,
++  UNREACHABLE_BACKOFF_MS
++} from './remote-update-pause'
++
++// 2026-10-27 16:53–16:55 PDT: the mini stopped answering on its tailnet address. Every renderer request opened its
++// own SSH control master and waited out the 15 s SSH timeout; the next request dialed again the moment one failed:
++// 11 dials and 36 stalled requests in 2 minutes. remote-update-pause.ts now remembers a down remote the same way it
++// remembers a remote's own update.
++
++const MINI = { user: 'daveey', host: '192.0.2.20', port: 22, remoteHermesPath: '' }
++const KEY = remoteUpdatePauseKey(MINI)
++
++function sshFailure(kind: string, message: string): Error {
++  const error: any = new Error(message)
++  error.kind = kind
++
++  return error
++}
++
++const timeout = () =>
++  sshFailure(
++    'timeout',
++    'SSH operation to daveey@192.0.2.20 timed out. The connection may be half-open (e.g. after sleep); reconnecting.'
++  )
++
++// A remote host plus the slice of main.ts the requests go through: ensureRegistryBackend() pools one entry per
++// (connection, profile) while its dial is in flight and drops it when the dial fails; the dial itself is
++// bootstrapSshConnection(), which runs through the gate unless the caller is a managed restore (a correlation id:
++// the registry Reconnect action and managed updates). `dials` counts SSH control masters opened.
++function harness(failure: () => Error = timeout) {
++  let now = 1_000_000
++  const logs: string[] = []
++  const remote = { down: true, dials: [] as number[], failure }
++  const gate = new RemoteUpdatePause({ log: line => logs.push(line), now: () => now })
++  const pool = new Map<string, Promise<{ baseUrl: string }>>()
++
++  const dial = async () => {
++    remote.dials.push(now)
++    await Promise.resolve()
++
++    if (remote.down) {
++      throw remote.failure()
++    }
++
++    return { baseUrl: 'http://127.0.0.1:50002' }
++  }
++
++  const ensure = (connectionId: string, profile: string, managedUpdateCorrelation = '') => {
++    const poolKey = `conn:${connectionId}::${profile}`
++    const existing = pool.get(poolKey)
++
++    if (existing) {
++      return existing
++    }
++
++    const entry = (managedUpdateCorrelation ? dial() : gate.run(KEY, dial)).catch(error => {
++      if (pool.get(poolKey) === entry) {
++        pool.delete(poolKey)
++      }
++
++      throw error
++    })
++
++    pool.set(poolKey, entry)
++
++    return entry
++  }
++
++  return { advance: (ms: number) => (now += ms), ensure, gate, logs, now: () => now, remote }
++}
++
++// The most dials the unreachable schedule allows over `spanMs`: the first failure, then one probe per window.
++function dialsAllowed(spanMs: number): number {
++  let at = 0
++  let count = 1
++
++  for (let i = 0; ; i++) {
++    at += UNREACHABLE_BACKOFF_MS[Math.min(i, UNREACHABLE_BACKOFF_MS.length - 1)]
++
++    if (at > spanMs) {
++      return count
++    }
++
++    count += 1
++  }
++}
++
++// Parallel first dials (one per profile, before anything knows the host is down) may share t0; after that each
++// probe waits at least the next backoff step.
++function expectSpacedByBackoff(dials: number[]) {
++  const probes = dials.filter(at => at !== dials[0])
++  expect(dials.length - probes.length).toBeLessThanOrEqual(2)
++
++  for (let i = 0; i < probes.length; i++) {
++    expect(probes[i] - (i ? probes[i - 1] : dials[0])).toBeGreaterThanOrEqual(
++      UNREACHABLE_BACKOFF_MS[Math.min(i, UNREACHABLE_BACKOFF_MS.length - 1)]
++    )
++  }
++}
++
++describe('renderer API requests against a down remote', () => {
++  it('fail fast from the cached failure, dial at most once per backoff window, and reconnect once', async () => {
++    const h = harness()
++    const outcomes: any[] = []
++
++    // Three minutes of renderer polling like the incident: two default-profile calls and one bb-dev call a second.
++    for (let second = 0; second < 180; second++) {
++      const results = await Promise.allSettled([
++        h.ensure('mac-mini', 'default'),
++        h.ensure('mac-mini', 'default'),
++        h.ensure('mac-mini', 'bb-dev')
++      ])
++
++      for (const result of results) {
++        outcomes.push(result.status === 'rejected' ? result.reason : 'ok')
++      }
++
++      h.advance(1_000)
++    }
++
++    expect(outcomes).toHaveLength(540)
++    expect(outcomes.every(error => /timed out/.test(error.message) && error.kind === 'timeout')).toBe(true)
++    expect(outcomes.filter(error => error.code === 'remote-unreachable-backoff').length).toBeGreaterThan(500)
++    expect(h.remote.dials.length).toBeLessThanOrEqual(dialsAllowed(180_000) + 1) // + the parallel bb-dev first dial
++    expect(h.remote.dials.length).toBeLessThan(10) // 540 requests, not 540 SSH dials
++    expectSpacedByBackoff(h.remote.dials)
++    expect(h.gate.reason(KEY)).toBe('unreachable')
++    expect(h.logs.filter(line => /\[remote-dial-backoff\] \S+ unreachable \(timeout:/.test(line))).toHaveLength(1)
++
++    // The host comes back: the first request after the window dials once, and the connection stays up.
++    h.remote.down = false
++    const dialsBefore = h.remote.dials.length
++    h.advance(UNREACHABLE_BACKOFF_MS.at(-1)!)
++    await expect(h.ensure('mac-mini', 'default')).resolves.toEqual({ baseUrl: 'http://127.0.0.1:50002' })
++
++    for (let i = 0; i < 20; i++) {
++      await expect(h.ensure('mac-mini', 'default')).resolves.toBeTruthy()
++    }
++
++    expect(h.remote.dials.length).toBe(dialsBefore + 1)
++    expect(h.gate.paused(KEY)).toBe(false)
++    expect(h.logs.filter(line => /reachable again; reconnected after/.test(line))).toHaveLength(1)
++
++    // Other profiles of the host dial normally again.
++    await expect(h.ensure('mac-mini', 'bb-dev')).resolves.toBeTruthy()
++    expect(h.remote.dials.length).toBe(dialsBefore + 2)
++  })
++
++  it('the cached error keeps the dial failure readable by boot and names the next probe', async () => {
++    const h = harness(() =>
++      sshFailure(
++        'auth-failed',
++        'SSH authentication to daveey@192.0.2.20 failed. Original error: Permission denied (publickey).'
++      )
++    )
++
++    await h.ensure('mac-mini', 'default').catch(() => {})
++
++    const error: any = await h.ensure('mac-mini', 'default').catch(e => e)
++    expect(error.code).toBe('remote-unreachable-backoff')
++    expect(error.kind).toBe('auth-failed')
++    expect(error.retryAt).toBe(h.now() + UNREACHABLE_BACKOFF_MS[0])
++    // Boot still latches it as an SSH credential failure, not a retryable one (#72698 unchanged).
++    expect(isSshAuthFailedBootFailure(error)).toBe(true)
++    expect(isRetryableRemoteBootFailure({ attemptedRemote: true, isReauth: false, isSshAuthFailed: true })).toBe(false)
++    expect(h.remote.dials).toHaveLength(1)
++  })
++
++  it('remembers only the failures the rule names; everything else dials per request as before', async () => {
++    for (const kind of [
++      'unreachable',
++      'timeout',
++      'transient-transport-error',
++      'auth-failed',
++      'interactive-auth',
++      'host-key-changed'
++    ]) {
++      expect(classifyRemoteDialFailure({ kind })).toBe('unreachable')
++    }
++
++    expect(classifyRemoteDialFailure({ kind: 'update-in-progress' })).toBe('update')
++
++    const passThrough = [
++      sshClientFailedError('/usr/bin/ssh', new Error('ssh: command not found')),
++      sshFailure('superseded', 'SSH operation was cancelled.'),
++      sshFailure('spawn-failed', 'remote dashboard exited during startup'),
++      sshFailure('ready-timeout', 'remote dashboard did not become ready'),
++      sshFailure('ownership-changed', 'remote backend ownership changed'),
++      sshFailure('remote-lockfile-skew', 'remote lockfile written by another version'),
++      sshFailure('remote-profile-missing', "Profile 'bb-dev' does not exist on the remote."),
++      sshFailure('hermes-not-found', 'hermes not found on the remote'),
++      sshFailure('update-required', 'remote hermes is too old'),
++      sshFailure('unknown', 'SSH error connecting to daveey@192.0.2.20: ssh process exited from signal SIGKILL'),
++      new Error('something nobody tagged')
++    ]
++
++    for (const failure of passThrough) {
++      expect(classifyRemoteDialFailure(failure)).toBe(null)
++
++      const h = harness(() => failure)
++
++      for (let i = 0; i < 5; i++) {
++        await h.ensure('mac-mini', 'default').catch(() => {})
++      }
++
++      expect(h.remote.dials).toHaveLength(5)
++      expect(h.gate.paused(KEY)).toBe(false)
++    }
++
++    // The terminal local ssh-client failure (#103288) reaches boot untouched.
++    const clientFailure = sshClientFailedError('/usr/bin/ssh', new Error('ssh: command not found'))
++    const h = harness(() => clientFailure)
++    await expect(h.ensure('mac-mini', 'default')).rejects.toBe(clientFailure)
++    expect(isSshClientFailedBootFailure(clientFailure)).toBe(true)
++  })
++
++  it('a probe that fails some other way ends the backoff instead of masking the new failure', async () => {
++    const h = harness()
++    await h.ensure('mac-mini', 'default').catch(() => {})
++    h.advance(UNREACHABLE_BACKOFF_MS[0])
++    h.remote.failure = () => sshFailure('spawn-failed', 'remote dashboard exited during startup')
++
++    await expect(h.ensure('mac-mini', 'default')).rejects.toThrow(/exited during startup/)
++    expect(h.gate.paused(KEY)).toBe(false)
++  })
++
++  it('a remote that goes down while paused for its own update switches to the unreachable schedule', async () => {
++    const h = harness(() => {
++      const error: any = new Error('Remote Hermes update process 1219818 is still running; SSH startup is paused.')
++      error.kind = 'update-in-progress'
++
++      return error
++    })
++
++    await h.ensure('mac-mini', 'default').catch(() => {})
++    expect(h.gate.reason(KEY)).toBe('update')
++    h.advance(2_000)
++    h.remote.failure = timeout
++    await expect(h.ensure('mac-mini', 'default')).rejects.toThrow(/timed out/)
++    expect(h.gate.reason(KEY)).toBe('unreachable')
++
++    const error: any = await h.ensure('mac-mini', 'default').catch(e => e)
++    expect(error.code).toBe('remote-unreachable-backoff')
++    expect(error.retryAt).toBe(h.now() + UNREACHABLE_BACKOFF_MS[0])
++    expect(h.remote.dials).toHaveLength(2)
++  })
++})
++
++describe('remote-prewarm against a down remote', () => {
++  it('follows the gate window instead of its own redials, shares it with requests, and reconnects once', async () => {
++    const h = harness()
++    const prewarmLogs: string[] = []
++
++    const prewarmer = new RemotePrewarmer({
++      listTargets: () => [{ connectionId: 'mac-mini', profile: 'default' }],
++      ensure: target => h.ensure(target.connectionId, target.profile),
++      log: line => prewarmLogs.push(line),
++      now: h.now,
++      setTimer: () => ({})
++    })
++
++    await prewarmer.start() // first round hits the timeout
++    expect(h.remote.dials).toHaveLength(1)
++    expect(prewarmLogs.at(-1)).toMatch(/retry 1 in 2000 ms/)
++
++    // Three minutes: prewarm ticks every 15 s and the renderer keeps asking every second in between.
++    for (let second = 1; second <= 180; second++) {
++      h.advance(1_000)
++      await h.ensure('mac-mini', 'default').catch(() => {})
++
++      if (second % 15 === 0) {
++        await prewarmer.tick()
++      }
++    }
++
++    expect(h.remote.dials.length).toBeLessThanOrEqual(dialsAllowed(181_000))
++    expectSpacedByBackoff(h.remote.dials)
++    expect(prewarmer.isWarm('mac-mini')).toBe(false)
++
++    // No renderer traffic now: prewarm alone is the probe that sees the host come back.
++    h.remote.down = false
++    const dialsBefore = h.remote.dials.length
++
++    for (let i = 0; i < 6 && !prewarmer.isWarm('mac-mini'); i++) {
++      h.advance(15_000)
++      await prewarmer.tick()
++    }
++
++    expect(prewarmer.isWarm('mac-mini')).toBe(true)
++    expect(h.remote.dials.length).toBe(dialsBefore + 1)
++    expect(prewarmLogs.filter(line => /mac-mini::default reconnected/.test(line))).toHaveLength(1)
++    expect(h.logs.filter(line => /reachable again; reconnected after/.test(line))).toHaveLength(1)
++    prewarmer.stop()
++  })
++})
++
++describe('explicit user reconnect during a backoff', () => {
++  it('Reload and retry (or a saved, applied or reachable-tested connection) dials right away', async () => {
++    const h = harness()
++    await h.ensure('mac-mini', 'default').catch(() => {})
++    h.advance(UNREACHABLE_BACKOFF_MS[0])
++    await h.ensure('mac-mini', 'default').catch(() => {}) // probe 2: next window is 5 s out
++    expect(h.remote.dials).toHaveLength(2)
++
++    // Still down: inside the window a request does not dial, but the user's retry does, and the schedule restarts.
++    h.advance(1_000)
++    await h.ensure('mac-mini', 'default').catch(() => {})
++    expect(h.remote.dials).toHaveLength(2)
++    h.gate.clear('reload and retry')
++    await expect(h.ensure('mac-mini', 'default')).rejects.toThrow(/timed out/)
++    expect(h.remote.dials).toHaveLength(3)
++    expect((await h.ensure('mac-mini', 'default').catch(e => e)).retryAt).toBe(h.now() + UNREACHABLE_BACKOFF_MS[0])
++
++    // Host back: the retry reconnects with exactly one dial, and requests then reuse it.
++    h.remote.down = false
++    h.advance(500)
++    h.gate.clear('reload and retry')
++    await expect(h.ensure('mac-mini', 'default')).resolves.toBeTruthy()
++    await expect(h.ensure('mac-mini', 'default')).resolves.toBeTruthy()
++    expect(h.remote.dials).toHaveLength(4)
++    expect(
++      h.logs.filter(line => /cleared .* for reload and retry; the next request dials now/.test(line))
++    ).toHaveLength(2)
++  })
++
++  it('the registry Reconnect action and managed restores still bypass the gate and dial right away', async () => {
++    const h = harness()
++    await h.ensure('mac-mini', 'default').catch(() => {})
++    expect(h.remote.dials).toHaveLength(1)
++
++    h.remote.down = false
++    h.advance(100) // well inside the 2 s window
++    await expect(h.ensure('mac-mini', 'default', 'reconnect-correlation')).resolves.toBeTruthy()
++    expect(h.remote.dials).toHaveLength(2)
++    // The reconnected entry serves requests without another dial.
++    await expect(h.ensure('mac-mini', 'default')).resolves.toBeTruthy()
++    expect(h.remote.dials).toHaveLength(2)
++  })
++})
++
++describe('main.ts wiring', () => {
++  // The Electron main process cannot boot under vitest; pin the explicit-retry paths that clear the gate.
++  const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
++
++  const handler = (channel: string) => {
++    const start = main.indexOf(`ipcMain.handle('${channel}'`)
++
++    return main.slice(start, main.indexOf('\n})\n', start))
++  }
++
++  it('every explicit user retry clears the gate before it dials', () => {
++    expect(handler('hermes:bootstrap:reset')).toMatch(/remoteUpdatePause\.clear\('reload and retry'\)/)
++    expect(handler('hermes:bootstrap:repair')).toMatch(/remoteUpdatePause\.clear\('repair'\)/)
++    expect(handler('hermes:connection-config:apply')).toMatch(/remoteUpdatePause\.clear\('connection applied'\)/)
++    expect(handler('hermes:connections:save')).toMatch(/remoteUpdatePause\.clear\('connection saved'\)/)
++    expect(handler('hermes:connections:test')).toMatch(
++      /if \(result\?\.reachable\) \{\n\s+remoteUpdatePause\.clear\('reachable connection test'\)/
++    )
++  })
++})
+diff --git a/apps/desktop/electron/remote-prewarm.ts b/apps/desktop/electron/remote-prewarm.ts
+index 37b0759fc3..1ff04ba289 100644
+--- a/apps/desktop/electron/remote-prewarm.ts
++++ b/apps/desktop/electron/remote-prewarm.ts
+@@ -207,8 +207,9 @@ export class RemotePrewarmer {
+           state.nextAttemptAt = 0
+         } catch (error: any) {
+           const failedAt = (this.#deps.now ?? Date.now)()
+-          // A remote paused for its own update (remote-update-pause.ts) names when its one probe may run; follow
+-          // that schedule instead of a second backoff, so prewarm is the probe that sees the update finish.
++          // A remote the dial gate remembers (remote-update-pause.ts: its own update, or unreachable) names when its
++          // one probe may run; follow that schedule instead of a second backoff, so prewarm is the probe that sees
++          // the remote come back.
+           const retryAt = Number(error?.retryAt)
+ 
+           const delay = Number.isFinite(retryAt)
+diff --git a/apps/desktop/electron/remote-update-pause.ts b/apps/desktop/electron/remote-update-pause.ts
+index e58af35a14..7d2c100eca 100644
+--- a/apps/desktop/electron/remote-update-pause.ts
++++ b/apps/desktop/electron/remote-update-pause.ts
+@@ -5,15 +5,57 @@
+ // refusal per remote install: callers fail fast from the cached error (no dial) until the backoff window opens,
+ // then exactly one caller probes; a successful dial clears the pause and the connection comes back once.
+ //
++// The same gate covers a remote that cannot be dialed at all (host down, connection refused, an SSH timeout,
++// rejected credentials): each renderer request used to open its own control master and wait out the 15 s SSH
++// timeout (11 dials and 36 stalled requests to the mini in 2 min on 2026-10-27). See classifyRemoteDialFailure for
++// which failures are remembered and why.
++//
+ // Electron-free: main.ts wraps bootstrapSshConnection() (the one chokepoint every SSH dial goes through) in run().
+ 
+ export const UPDATE_PAUSE_BACKOFF_MS = [2_000, 5_000, 10_000, 20_000, 30_000]
++// Same steps as remote-prewarm's own backoff for a down host, so prewarm's schedule is unchanged by the gate.
++export const UNREACHABLE_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000]
++
++export type RemoteDialFailureClass = 'unreachable' | 'update'
++
++// SSH dial failures the gate remembers as 'unreachable'. Each is decided outside this process and a redial seconds
++// later gets the same answer, but the remote can fix itself (or the user fixes it outside Desktop: ssh-add,
++// known_hosts, a Tailscale check), so a bounded probe keeps looking:
++// - network: 'unreachable' (resolve/refused/no route), 'timeout' (dial or exec hit the SSH timeout),
++//   'transient-transport-error' (the transport dropped mid-preflight);
++// - SSH refused us: 'auth-failed', 'interactive-auth', 'host-key-changed'. Boot latches these as terminal on the
++//   primary path; the gate only keeps pool and prewarm dials from repeating them per request.
++// Everything else passes through uncached: 'ssh-client-failed' (#103288, raised before the gate and latched by
++// boot), 'superseded' (a caller cancelled), and failures after a successful dial that the next attempt is meant to
++// act on (ownership, lockfile skew, spawn, ready timeout, missing profile or hermes). Untagged and 'unknown'
++// errors pass too: an unrecognised failure must never be masked by a cached one.
++const UNREACHABLE_KINDS = new Set([
++  'unreachable',
++  'timeout',
++  'transient-transport-error',
++  'auth-failed',
++  'interactive-auth',
++  'host-key-changed'
++])
++
++export function classifyRemoteDialFailure(error: any): RemoteDialFailureClass | null {
++  if (isRemoteUpdatePausedError(error) || isRemoteUnreachableBackoffError(error)) {
++    return null
++  }
++
++  if (error?.kind === 'update-in-progress') {
++    return 'update'
++  }
++
++  return UNREACHABLE_KINDS.has(error?.kind) ? 'unreachable' : null
++}
+ 
+ interface PauseState {
+   error: any
+   failures: number
+   pausedAt: number
+   probing: boolean
++  reason: RemoteDialFailureClass
+   retryAt: number
+ }
+ 
+@@ -31,6 +73,10 @@ export function isRemoteUpdatePausedError(error: any): boolean {
+   return error?.code === 'remote-update-paused'
+ }
+ 
++export function isRemoteUnreachableBackoffError(error: any): boolean {
++  return error?.code === 'remote-unreachable-backoff'
++}
++
+ export class RemoteUpdatePause {
+   readonly #states = new Map<string, PauseState>()
+   readonly #now: () => number
+@@ -45,6 +91,21 @@ export class RemoteUpdatePause {
+     return this.#states.has(key)
+   }
+ 
++  reason(key: string): RemoteDialFailureClass | null {
++    return this.#states.get(key)?.reason ?? null
++  }
++
++  // An explicit user action (Reload and retry, apply or save a connection, a reachable Test) dials right away.
++  clear(why: string): void {
++    if (this.#states.size === 0) {
++      return
++    }
++
++    const keys = [...this.#states.keys()]
++    this.#states.clear()
++    this.#log(`[remote-dial-backoff] cleared ${keys.join(', ')} for ${why}; the next request dials now`)
++  }
++
+   async run<T>(key: string, dial: () => Promise<T>): Promise<T> {
+     const state = this.#states.get(key)
+ 
+@@ -62,42 +123,52 @@ export class RemoteUpdatePause {
+       if (state && this.#states.get(key) === state) {
+         this.#states.delete(key)
+         this.#log(
+-          `[remote-update-pause] ${key} remote update finished; reconnected after ${state.failures} refused probe(s), paused ${this.#now() - state.pausedAt} ms`
++          state.reason === 'update'
++            ? `[remote-update-pause] ${key} remote update finished; reconnected after ${state.failures} refused probe(s), paused ${this.#now() - state.pausedAt} ms`
++            : `[remote-dial-backoff] ${key} reachable again; reconnected after ${state.failures} failed dial(s), down ${this.#now() - state.pausedAt} ms`
+         )
+       }
+ 
+       return result
+     } catch (error: any) {
+-      if (error?.kind === 'update-in-progress' && !isRemoteUpdatePausedError(error)) {
++      const reason = classifyRemoteDialFailure(error)
++
++      if (reason) {
+         const existing = this.#states.get(key)
+ 
+         // A dial that started before another caller recorded the pause (a parallel first dial for another profile
+-        // of the same host) confirms it; only the first refusal and each probe advance the backoff.
++        // of the same host) confirms it; only the first failure and each probe advance the backoff.
+         if (!state && existing) {
+-          existing.error = error
++          if (existing.reason === reason) {
++            existing.error = error
++          }
++
++          error.retryAt = existing.retryAt
+ 
+           throw error
+         }
+ 
+-        const current = existing ?? {
+-          error,
+-          failures: 0,
+-          pausedAt: this.#now(),
+-          probing: false,
+-          retryAt: 0
+-        }
++        const current =
++          existing && existing.reason === reason
++            ? existing
++            : { error, failures: 0, pausedAt: this.#now(), probing: false, reason, retryAt: 0 }
+ 
+-        const delay = UPDATE_PAUSE_BACKOFF_MS[Math.min(current.failures, UPDATE_PAUSE_BACKOFF_MS.length - 1)]
++        const schedule = reason === 'update' ? UPDATE_PAUSE_BACKOFF_MS : UNREACHABLE_BACKOFF_MS
++        const delay = schedule[Math.min(current.failures, schedule.length - 1)]
+         current.error = error
+         current.failures += 1
+         current.probing = false
+         current.retryAt = this.#now() + delay
++        // Callers that pace themselves (remote-prewarm) wait for the same window the gate opens.
++        error.retryAt = current.retryAt
+         this.#states.set(key, current)
+         this.#log(
+-          `[remote-update-pause] ${key} ${current.failures === 1 ? 'paused' : 'still paused'} (${error?.message || error}); requests fail fast, next probe in ${delay} ms`
++          reason === 'update'
++            ? `[remote-update-pause] ${key} ${current.failures === 1 ? 'paused' : 'still paused'} (${error?.message || error}); requests fail fast, next probe in ${delay} ms`
++            : `[remote-dial-backoff] ${key} ${current.failures === 1 ? 'unreachable' : 'still unreachable'} (${error?.kind}: ${error?.message || error}); requests fail fast, next probe in ${delay} ms`
+         )
+       } else if (state && this.#states.get(key) === state) {
+-        // The probe failed some other way: the update gate no longer explains the failure, so stop answering for it.
++        // The probe failed some other way: the cached failure no longer explains it, so stop answering for it.
+         this.#states.delete(key)
+       }
+ 
+@@ -106,6 +177,18 @@ export class RemoteUpdatePause {
+   }
+ 
+   #pausedError(state: PauseState): Error {
++    if (state.reason === 'unreachable') {
++      // Same message and kind as the dial failure, so boot's classifiers (auth, host key, retryable) read it alike.
++      const error: any = new Error(state.error?.message || 'Remote host is unreachable over SSH.')
++      error.kind = state.error?.kind
++      error.sshError = state.error?.sshError
++      error.code = 'remote-unreachable-backoff'
++      error.retryAt = state.retryAt
++      error.cause = state.error
++
++      return error
++    }
++
+     const error: any = new Error(state.error?.message || 'Remote Hermes update in progress; SSH startup is paused.')
+     error.kind = 'update-in-progress'
+     error.code = 'remote-update-paused'
+-- 
+2.55.0
+

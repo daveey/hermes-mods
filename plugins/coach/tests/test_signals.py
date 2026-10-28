@@ -104,6 +104,28 @@ def test_library_warning_traceback_is_not_a_defect_but_ours_is():
     assert len(sg.parse_errors(rec("ERROR", "mcp.os.posix.utilities", lib))) == 1
 
 
+def test_process_exit_scheduling_traceback_is_not_a_defect():
+    """agent-9a2a3cc05d: a turn finishing while the backend exits logs CPython's shutdown refusal from our own
+    frames (pre_final_gate). That is exit noise, not a defect; any other RuntimeError there still files."""
+    own = "/home/you/.hermes/hermes-agent/agent/pre_final_gate.py"
+    pool = "/home/you/.hermes/tools/python-3.14.7/lib/python3.14/concurrent/futures/thread.py"
+
+    def rec(exc_line):
+        return ["2026-10-27 15:55:01,000 WARNING [20261027_152740_fa067b] agent.conversation_loop: "
+                "pre_final_gate hook pre_final_gate raised",
+                "Traceback (most recent call last):",
+                f'  File "{own}", line 235, in _invoke',
+                "    return _call(cb, call_kwargs, limit)",
+                f'  File "{own}", line 220, in _call',
+                "    return pool.submit(copy_context().run, cb, **kwargs).result(timeout=limit)",
+                f'  File "{pool}", line 207, in submit',
+                "    raise RuntimeError('cannot schedule new futures after '",
+                exc_line]
+    assert sg.parse_errors(rec("RuntimeError: cannot schedule new futures after interpreter shutdown")) == []
+    assert sg.parse_errors(rec("RuntimeError: can't register atexit after shutdown")) == []
+    assert len(sg.parse_errors(rec("RuntimeError: dictionary changed size during iteration"))) == 1
+
+
 LIB = "/home/you/.hermes/installs/x/venv/lib/python3.14/site-packages"
 RECONNECT_TAILS = {
     "close-1000": [f'  File "{LIB}/discord/client.py", line 731, in connect',
@@ -488,3 +510,48 @@ def test_recovered_cron_failures_older_than_24h_do_not_accumulate(home):
     for t in (NOW - 3 * 86400, NOW - 2 * 86400, NOW - 600):
         _write_jobs(home, _cron_job("slow", 0, "ok", _iso(t)))
         assert sg.collect_cron(home, cur, t + 300, "hubhost") == []
+
+
+def _gw_rows(home, *offsets, tag="gateway.exit_signal"):
+    """Append exit-diag rows `offsets` seconds before NOW (UTC ISO ts, as core writes them)."""
+    from datetime import datetime, timezone
+    with open(home / "logs" / "gateway-exit-diag.log", "a") as f:
+        for off in offsets:
+            row = {"ts": datetime.fromtimestamp(NOW - off, timezone.utc).isoformat(), "tag": tag,
+                   "level": "info", "pid": 200 + off}
+            if tag == "gateway.exit_signal":
+                row.update(signal="SIGTERM", ppid=1, parent={"pid": 1})
+            f.write(json.dumps(row) + "\n")
+
+
+def test_single_exit_signal_is_a_bounce_not_a_defect(home):
+    """A planned launchd bounce (kickstart -k / bootout) logs one gateway.exit_signal: nothing filed."""
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _gw_rows(home, 120)
+    assert kinds(sg.collect(home, {}, "mini", NOW), "gateway") == []
+
+
+def test_exit_signal_storm_files_one_card(home):
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    cur = {}
+    _gw_rows(home, 500, 300)
+    assert kinds(sg.collect(home, cur, "mini", NOW - 100), "gateway") == []  # two: still a bounce
+    _gw_rows(home, 60)
+    gw = kinds(sg.collect(home, cur, "mini", NOW), "gateway")  # the third within 10 min, across sweeps
+    assert len(gw) == 1
+    assert "restart storm: 3 stop signals" in gw[0]["symptom"] and "SIGTERM" in gw[0]["symptom"]
+    _gw_rows(home, 30)
+    assert kinds(sg.collect(home, cur, "mini", NOW), "gateway") == []  # filed once; the counter reset
+
+
+def test_exit_signals_spread_out_never_file(home):
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _gw_rows(home, 3000, 1500, 60)  # three, but never three within 10 min
+    assert kinds(sg.collect(home, {}, "mini", NOW), "gateway") == []
+
+
+def test_bare_exit_nonzero_still_files(home):
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _gw_rows(home, 60, tag="gateway.exit_nonzero")
+    gw = kinds(sg.collect(home, {}, "mini", NOW), "gateway")
+    assert len(gw) == 1 and "gateway.exit_nonzero" in gw[0]["symptom"]

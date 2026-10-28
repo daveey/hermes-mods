@@ -1,0 +1,614 @@
+From c0b2d599a4e8d972f5ae34def63d18254599ef66 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:48:00 +0000
+Subject: [PATCH] fix(kanban): a chat mid-turn defers the unloaded-chat notice
+ instead of crashing the sweep; HX014 flags swallowed contextmanager yields
+ [daveey]
+
+find_session_db caught the caller's own error at its yield (a chat mid-turn refusing the
+notice row: "Session has an active turn lease"), yielded again and Python raised
+"generator didn't stop after throw()". The sweeper logged that with a traceback every
+30 s until the turn ended (hub 10-27: 277x over 2h20m; kanban-e5babca565).
+
+- find_session_db opens/locates the store inside the try, yields outside any handler
+  (ExitStack keeps the store open across the yield): caller errors propagate as themselves.
+- _persist_notice: SessionTurnLeaseLostError = busy -> rewind, one INFO "deferred: chat
+  busy", retried next pass (passive and wake-worker paths). Other failures unchanged.
+- Overdue guard: a notice whose claim was rewound and is still waiting >15 min logs ONE
+  WARNING per board/card/chat with the reason.
+- scripts/code_health HX014: a @contextmanager whose broad except around a yield doesn't
+  re-raise and can yield again. 0 hits on main after this fix; one-shot suppress-and-log
+  helpers are not flagged.
+
+Tests: tests/tui_gateway/test_kanban_unloaded_busy.py (real opener + real turn lease; red
+3/4 on base), tests/scripts/test_code_health_contextmanager_rule.py.
+---
+ scripts/code_health/config.py                 |   5 +
+ scripts/code_health/py_rules.py               |   2 +
+ .../code_health/py_rules_contextmanager.py    |  75 +++++++++
+ .../test_code_health_contextmanager_rule.py   |  96 +++++++++++
+ .../tui_gateway/test_kanban_unloaded_busy.py  | 154 ++++++++++++++++++
+ tui_gateway/kanban_unloaded.py                | 120 ++++++++++++--
+ 6 files changed, 435 insertions(+), 17 deletions(-)
+ create mode 100644 scripts/code_health/py_rules_contextmanager.py
+ create mode 100644 tests/scripts/test_code_health_contextmanager_rule.py
+ create mode 100644 tests/tui_gateway/test_kanban_unloaded_busy.py
+
+diff --git a/scripts/code_health/config.py b/scripts/code_health/config.py
+index e52dccd3ef..f07e9f6473 100644
+--- a/scripts/code_health/config.py
++++ b/scripts/code_health/config.py
+@@ -148,6 +148,11 @@ RULES: tuple[Rule, ...] = (
+          " blocks on an Event the test sets at teardown."
+          " `sleep(0)` to yield is fine. A delay that IS the behaviour under test takes"
+          " `# health: allow HX013 -- <why>`", "ast", include=TESTS, exclude=()),
++    # Error handling: the caller's exception is thrown in at a contextmanager's yield.
++    Rule("HX014", "@contextmanager swallows the caller's error at a yield it can reach again", "a broad `except`"
++         " around `yield` eats the `with` block's own error and, on a second yield, becomes \"generator"
++         " didn't stop after throw()\". Find the resource inside the `try`, then yield it outside any"
++         " handler (keep what it opened alive with `contextlib.ExitStack`), or re-raise", "ast"),
+ )
+ 
+ RULES_BY_ID = {rule.id: rule for rule in RULES}
+diff --git a/scripts/code_health/py_rules.py b/scripts/code_health/py_rules.py
+index f53a46c33c..f083413f84 100644
+--- a/scripts/code_health/py_rules.py
++++ b/scripts/code_health/py_rules.py
+@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
+ import itertools
+ 
+ from scripts.code_health.py_ast import _FUNCS, Ctx, _call_name, _deferred_parts, _dotted, _eager
++from scripts.code_health.py_rules_contextmanager import swallowed_yield
+ from scripts.code_health.py_rules_sleep import wall_clock_sleep
+ 
+ _CAPTURE_CALLS = {
+@@ -874,4 +875,5 @@ CHECKERS: dict[str, Callable[[ast.Module, Ctx], Iterable[int]]] = {
+     "HX011": elif_ladder,
+     "HX012": raw_thread,
+     "HX013": wall_clock_sleep,
++    "HX014": swallowed_yield,
+ }
+diff --git a/scripts/code_health/py_rules_contextmanager.py b/scripts/code_health/py_rules_contextmanager.py
+new file mode 100644
+index 0000000000..ac2bcd5eeb
+--- /dev/null
++++ b/scripts/code_health/py_rules_contextmanager.py
+@@ -0,0 +1,75 @@
++"""HX014: a ``@contextmanager`` that swallows the caller's error at its ``yield`` and can then yield again
++(registered in ``py_rules.CHECKERS``).
++
++An exception raised in the caller's ``with`` block is thrown INTO the generator at the ``yield``. A broad
++``except`` around that ``yield`` that does not re-raise eats the real error; when the generator then yields
++again (a loop's next candidate, a fallback ``yield None``) Python raises "generator didn't stop after
++throw()" and the real cause is gone (kanban-e5babca565: a chat mid-turn logged as a crash every 30 s for 2h).
++A one-shot suppressor (one ``yield`` in a ``try``, outside any loop: ``contextlib.suppress`` that logs) is a
++deliberate design and is not flagged. The fix shape: find the resource inside the ``try``, then yield it
++outside any handler (an ``ExitStack`` keeps what was opened alive across the ``yield``).
++"""
++
++from __future__ import annotations
++
++import ast
++from collections.abc import Iterable, Iterator
++
++from scripts.code_health.py_ast import _FUNCS, Ctx, _dotted
++
++_CM_DECORATORS = {"contextmanager", "asynccontextmanager"}
++_BROAD = {"Exception", "BaseException"}
++
++
++def _is_cm(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
++    for dec in func.decorator_list:
++        name = _dotted(dec.func if isinstance(dec, ast.Call) else dec)
++        if name.rsplit(".", 1)[-1] in _CM_DECORATORS:
++            return True
++    return False
++
++
++def _own(nodes: list[ast.stmt]) -> Iterator[ast.AST]:
++    """Every node under ``nodes`` that runs in this frame (nested defs/lambdas/classes are other frames)."""
++    stack: list[ast.AST] = list(nodes)
++    while stack:
++        node = stack.pop()
++        yield node
++        stack.extend(child for child in ast.iter_child_nodes(node)
++                     if not isinstance(child, (*_FUNCS, ast.Lambda, ast.ClassDef)))
++
++
++def _broad(handler: ast.ExceptHandler) -> bool:
++    if handler.type is None:
++        return True
++    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
++    return any(_dotted(t).rsplit(".", 1)[-1] in _BROAD for t in types)
++
++
++def _yields(nodes: list[ast.stmt]) -> bool:
++    return any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in _own(nodes))
++
++
++def _reraises(handler: ast.ExceptHandler) -> bool:
++    return any(isinstance(n, ast.Raise) for n in _own(handler.body))
++
++
++def _can_yield_again(func: ast.FunctionDef | ast.AsyncFunctionDef, try_node: ast.AST) -> bool:
++    """More than one ``yield`` in the frame, or the ``try`` sits in a loop (its next pass yields again)."""
++    if sum(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in _own(func.body)) > 1:
++        return True
++    loops = (n for n in _own(func.body) if isinstance(n, (ast.For, ast.AsyncFor, ast.While)))
++    return any(try_node in set(_own(loop.body)) for loop in loops)
++
++
++def swallowed_yield(tree: ast.Module, ctx: Ctx) -> Iterable[int]:
++    for func in ast.walk(tree):
++        if not isinstance(func, _FUNCS) or not _is_cm(func):
++            continue
++        for node in _own(func.body):
++            if (not isinstance(node, (ast.Try, ast.TryStar)) or not _yields(node.body)
++                    or not _can_yield_again(func, node)):
++                continue
++            for handler in node.handlers:
++                if _broad(handler) and not _reraises(handler):
++                    yield handler.lineno
+diff --git a/tests/scripts/test_code_health_contextmanager_rule.py b/tests/scripts/test_code_health_contextmanager_rule.py
+new file mode 100644
+index 0000000000..f751666b35
+--- /dev/null
++++ b/tests/scripts/test_code_health_contextmanager_rule.py
+@@ -0,0 +1,96 @@
++"""HX014: a ``@contextmanager`` whose broad ``except`` around ``yield`` swallows the caller's error.
++
++kanban-e5babca565: ``tui_gateway.kanban_unloaded.find_session_db`` caught the ``with`` block's own
++"Session has an active turn lease" at its ``yield``, yielded again, and the sweeper logged "generator didn't
++stop after throw()" every 30 s for 2h. The rule flags the shape; the behaviour itself is pinned in
++tests/tui_gateway/test_kanban_unloaded_busy.py.
++"""
++
++from __future__ import annotations
++
++import ast
++import contextlib
++
++import pytest
++
++from scripts.code_health.config import RULES_BY_ID, rule_applies
++from scripts.code_health.py_rules import CHECKERS, Ctx, canonical_tree
++
++_FIXED_FIND = '''
++import contextlib
++@contextlib.contextmanager
++def find(stores):
++    with contextlib.ExitStack() as stack:
++        found = None
++        for s in stores:
++            try:
++                found = stack.enter_context(s.open())
++                break
++            except Exception:
++                pass
++        yield found
++'''
++
++
++def _hits(src: str) -> list[int]:
++    return sorted(set(CHECKERS["HX014"](canonical_tree(ast.parse(src)), Ctx())))
++
++
++@pytest.mark.parametrize("src, flagged", [
++    # the original find_session_db shape
++    ("import contextlib\n@contextlib.contextmanager\ndef f(ps):\n    for p in ps:\n        try:\n"
++     "            with p.open() as db:\n                yield db\n                return\n"
++     "        except Exception:\n            pass\n    yield None\n", True),
++    ("from contextlib import contextmanager\n@contextmanager\ndef f():\n    try:\n        yield 1\n"
++     "    except:\n        log()\n    yield None\n", True),
++    ("from contextlib import asynccontextmanager\n@asynccontextmanager\nasync def f(ps):\n    for p in ps:\n"
++     "        try:\n            yield p\n            return\n        except (ValueError, BaseException):\n"
++     "            pass\n", True),  # one yield, but the loop's next pass reaches it again
++    # a one-shot suppressor (suppress-and-log) yields once and ends: deliberate, not flagged
++    ("from contextlib import contextmanager\n@contextmanager\ndef quiet(label):\n    try:\n        yield\n"
++     "    except Exception:\n        log(label)\n", False),
++    # re-raising, a narrow catch, a finally, or a yield outside the try are all fine
++    ("from contextlib import contextmanager\n@contextmanager\ndef f():\n    try:\n        yield 1\n"
++     "    except Exception:\n        cleanup()\n        raise\n", False),
++    ("from contextlib import contextmanager\n@contextmanager\ndef f():\n    try:\n        yield 1\n"
++     "    except KeyError:\n        pass\n", False),
++    ("from contextlib import contextmanager\n@contextmanager\ndef f():\n    try:\n        yield 1\n"
++     "    finally:\n        close()\n", False),
++    (_FIXED_FIND, False),
++    # not a context manager: a plain generator may legitimately catch around yield
++    ("def gen():\n    try:\n        yield 1\n    except Exception:\n        pass\n", False),
++    # a yield in a nested def is another frame
++    ("from contextlib import contextmanager\n@contextmanager\ndef f():\n    try:\n"
++     "        def g():\n            yield 1\n        x = g()\n    except Exception:\n        pass\n"
++     "    yield x\n", False),
++])
++def test_swallowed_yield_shapes(src, flagged):
++    assert bool(_hits(src)) is flagged, src
++
++
++def test_flagged_shape_really_hides_the_callers_error():
++    """The contract the rule encodes: the flagged shape turns the caller's error into RuntimeError."""
++    ns: dict = {"contextlib": contextlib}
++
++    class _Store:
++        @contextlib.contextmanager
++        def open(self):
++            yield "db"
++
++    exec("@contextlib.contextmanager\ndef f(ps):\n    for p in ps:\n        try:\n"
++         "            with p.open() as db:\n                yield db\n                return\n"
++         "        except Exception:\n            pass\n    yield None\n", ns)
++    exec(_FIXED_FIND, ns)
++    with pytest.raises(RuntimeError, match="didn't stop after throw"):
++        with ns["f"]([_Store()]):
++            raise KeyError("busy")
++    with pytest.raises(KeyError):
++        with ns["find"]([_Store()]):
++            raise KeyError("busy")
++
++
++def test_rule_covers_product_code_not_tests():
++    rule = RULES_BY_ID["HX014"]
++    assert rule_applies(rule, "tui_gateway/kanban_unloaded.py")
++    assert rule_applies(rule, "hermes_cli/kanban_db.py")
++    assert not rule_applies(rule, "tests/tui_gateway/test_x.py")
+diff --git a/tests/tui_gateway/test_kanban_unloaded_busy.py b/tests/tui_gateway/test_kanban_unloaded_busy.py
+new file mode 100644
+index 0000000000..4e4a01f29c
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_unloaded_busy.py
+@@ -0,0 +1,154 @@
++"""The unloaded-chat sweeper through the REAL store opener, and a chat mid-turn. [daveey]
++
++2026-10-27: a card finished while its chat ran a 2h turn. ``append_kanban_notice`` correctly refused
++("Session has an active turn lease"), but ``find_session_db`` caught that error at its ``yield``, yielded a
++second time and Python raised "generator didn't stop after throw()". The sweeper logged that as a
++failure with a traceback every 30 s for 2h20m (277 WARNINGs, kanban-e5babca565). The older tests swapped in a
++fake opener, so the real one never saw an error from the caller's block.
++"""
++
++import contextlib
++import logging
++import os
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_state import SessionDB
++from hermes_state_errors import SessionTurnLeaseLostError
++from tui_gateway import kanban_unloaded as ku
++
++CHAT = "20261027_085427_ac4078"
++HOLDER = f"pid={os.getpid()}:test-turn"  # a live holder: never reclaimed as dead
++LOGGER = "tui_gateway.kanban_unloaded"
++
++
++@pytest.fixture
++def db(tmp_path, monkeypatch):
++    from tui_gateway import server
++    from tui_gateway import session_notifications as sn
++
++    d = SessionDB(tmp_path / "state.db")
++    d.create_session(CHAT, "desktop")
++    d.append_message(CHAT, "user", "run the long job")
++
++    @contextlib.contextmanager
++    def profile_db(params=None, *, writer=False):
++        yield d if not params else None  # launch store holds the chat; the named profile has none
++
++    monkeypatch.setattr(server, "_profile_db", profile_db)
++    monkeypatch.setattr(sn, "_readopt_wake_profiles", lambda: [None, "other"])
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "0")
++    ku._reset_overdue_for_tests()
++    yield d
++    ku._reset_overdue_for_tests()
++
++
++def _card():
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="long card", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT)
++        kb.complete_task(conn, tid, summary="shipped")
++        return tid
++    finally:
++        conn.close()
++
++
++def _cursor(tid):
++    conn = kbc.connect()
++    try:
++        return kbn.list_notify_subs(conn, task_id=tid)[0]["last_event_id"]
++    finally:
++        conn.close()
++
++
++def _notices(db):
++    return [m for m in db.get_messages(CHAT) if m.get("display_kind") == "kanban_notice"]
++
++
++def _records(caplog, level):
++    return [r for r in caplog.records if r.name == LOGGER and r.levelno == level]
++
++
++def test_error_inside_the_real_opener_comes_out_as_itself(db):
++    """The caller's own error must not become "generator didn't stop after throw()"."""
++    with pytest.raises(SessionTurnLeaseLostError, match="active turn lease"):
++        with ku.find_session_db(CHAT) as (store, tip):
++            assert store is db and tip == CHAT
++            raise SessionTurnLeaseLostError("Session has an active turn lease; refusing transcript mutation")
++
++
++def test_store_open_errors_are_still_skipped(db, monkeypatch):
++    from tui_gateway import server
++
++    @contextlib.contextmanager
++    def broken_then_ok(params=None, *, writer=False):
++        if not params:
++            raise OSError("launch store unavailable")
++        yield db
++
++    monkeypatch.setattr(server, "_profile_db", broken_then_ok)
++    with ku.find_session_db(CHAT) as (store, tip):
++        assert store is db and tip == CHAT
++
++
++def test_busy_chat_defers_quietly_and_lands_after_the_turn(db, caplog):
++    tid = _card()
++    before = _cursor(tid)
++    assert db.try_acquire_session_turn_lease(CHAT, HOLDER, ttl_seconds=300.0)
++    soon = time.time() + 60  # past the grace window, well inside the overdue window
++
++    with caplog.at_level(logging.INFO, logger=LOGGER):
++        assert ku.sweep_once(set(), now=soon) == []
++        assert ku.sweep_once(set(), now=soon) == []
++    assert _cursor(tid) == before and _notices(db) == []  # rewound: retried, not lost
++    assert _records(caplog, logging.WARNING) == []
++    assert not any(r.exc_info for r in caplog.records if r.name == LOGGER)
++    assert [r.getMessage() for r in _records(caplog, logging.INFO) if "deferred: chat busy" in r.getMessage()]
++
++    db.release_session_turn_lease(CHAT, HOLDER)
++    out = ku.sweep_once(set(), now=soon)
++    assert [d["task_id"] for d in out] == [tid]
++    assert len(_notices(db)) == 1
++
++
++def test_a_notice_stalled_past_the_overdue_window_warns_once(db, caplog):
++    tid = _card()
++    assert db.try_acquire_session_turn_lease(CHAT, HOLDER, ttl_seconds=300.0)
++    later = time.time() + 3600
++
++    with caplog.at_level(logging.INFO, logger=LOGGER):
++        for _ in range(3):
++            assert ku.sweep_once(set(), now=later) == []
++    warned = [r.getMessage() for r in _records(caplog, logging.WARNING)]
++    assert len(warned) == 1, warned
++    assert "overdue" in warned[0] and tid in warned[0] and CHAT in warned[0] and "chat busy" in warned[0]
++
++    db.release_session_turn_lease(CHAT, HOLDER)
++    assert len(ku.sweep_once(set(), now=later)) == 1
++
++
++def test_wake_path_refused_then_busy_row_defers_quietly(db, monkeypatch, caplog):
++    """Same deferral when the notice goes through the wake worker (wake refused -> passive row -> chat busy)."""
++    monkeypatch.delenv("HERMES_KANBAN_UNLOADED_WAKE", raising=False)
++    ku._reset_wake_budget_for_tests()
++    tid = _card()
++    before = _cursor(tid)
++    assert db.try_acquire_session_turn_lease(CHAT, HOLDER, ttl_seconds=300.0)
++    results = []
++
++    def inline(job):
++        results.append(job())
++        return "dispatched"
++
++    with caplog.at_level(logging.INFO, logger=LOGGER):
++        ku.sweep_once(set(), now=time.time() + 60, wake=lambda *a: "refused:attached", holders=list,
++                      spawn=inline)
++    assert results == ["deferred"]
++    assert _cursor(tid) == before and _notices(db) == []
++    assert _records(caplog, logging.WARNING) == []
++    assert any("deferred: chat busy" in r.getMessage() for r in _records(caplog, logging.INFO))
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index c1aa4409a9..5f093e5794 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -23,6 +23,9 @@ A chat another live backend holds reaching the sweeper means that backend's poll
+ holder ("poller miss"). Claimed events always end as a turn or a row: any error after the claim falls back to the row,
+ and a failed row rewinds the claim. Once woken, the chat is live in that process, so later notices go through its live
+ poller like any open chat's. Residual: if submit raises after the turn thread already started, the row is written too.
++A chat mid-turn refuses the row (``SessionTurnLeaseLostError``): that is "busy, try later", so the claim is rewound
++with one INFO line and the next pass retries; a notice still stalled after ``OVERDUE_S`` logs one WARNING per card
++and chat with the reason (kanban-e5babca565).
+ [daveey]
+ """
+ 
+@@ -51,12 +54,54 @@ _wake_lock = threading.Lock()
+ _wake_times: dict[str, list[float]] = {}  # chat -> recent started wakes (this process)
+ _wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
+ 
++# A chat mid-turn refuses notice rows (SessionTurnLeaseLostError): a normal "busy, try later", not a failure.
++# Each claim that had to be rewound records why; a notice still waiting OVERDUE_S after its event logs ONE warning
++# per (board, card, chat) with that reason, instead of a traceback every pass (kanban-e5babca565: 277 in 2h20m).
++OVERDUE_S = 900.0
++_stall_lock = threading.Lock()
++_stalls: dict[tuple[str, str, str], str] = {}  # (board, task, chat) -> why the last claim was rewound
++_overdue_warned: set[tuple[str, str, str]] = set()
++
+ 
+ def _reset_wake_budget_for_tests() -> None:
+     with _wake_lock:
+         _wake_times.clear()
+ 
+ 
++def _reset_overdue_for_tests() -> None:
++    with _stall_lock:
++        _stalls.clear()
++        _overdue_warned.clear()
++
++
++def _stall_key(slug: str, ident: dict) -> tuple[str, str, str]:
++    return (slug, ident["task_id"], ident["chat_id"])
++
++
++def _note_stall(key: tuple[str, str, str], reason: str) -> bool:
++    """Record why a claim was rewound; True the first time this notice stalls (log it at INFO once)."""
++    with _stall_lock:
++        first = key not in _stalls
++        _stalls[key] = reason
++        return first
++
++
++def _clear_stall(key: tuple[str, str, str]) -> None:
++    with _stall_lock:
++        _stalls.pop(key, None)
++        _overdue_warned.discard(key)
++
++
++def _warn_if_overdue(key: tuple[str, str, str], age_s: float) -> None:
++    with _stall_lock:
++        reason = _stalls.get(key)
++        if reason is None or age_s < OVERDUE_S or key in _overdue_warned:
++            return
++        _overdue_warned.add(key)
++    slug, task_id, chat_id = key
++    logger.warning("kanban notice for %s/%s to chat %s overdue %dm: %s", slug, task_id, chat_id, age_s // 60, reason)
++
++
+ def _env_float(name: str, default: float) -> float:
+     try:
+         return float(os.environ.get(name, default))
+@@ -101,18 +146,26 @@ def live_session_ids() -> set[str]:
+ @contextlib.contextmanager
+ def find_session_db(chat_id: str) -> Iterator[tuple[Any, Optional[str]]]:
+     """Yield ``(writable SessionDB, lineage tip id)`` for the store holding ``chat_id``, or ``(None, None)``.
+-    Launch store first, then each named profile that has a state.db."""
++    Launch store first, then each named profile that has a state.db. An unopenable store is skipped; an error
++    raised by the caller's block propagates unchanged (it is never caught here: catching at the ``yield`` and
++    yielding again turns it into "generator didn't stop after throw()", kanban-e5babca565)."""
+     from tui_gateway import server
+     from tui_gateway.session_notifications import _readopt_wake_profiles
+-    for profile in _readopt_wake_profiles():
+-        try:
+-            with server._profile_db({"profile": profile} if profile else None, writer=True) as db:
++    with contextlib.ExitStack() as stack:
++        found: tuple[Any, Optional[str]] = (None, None)
++        for profile in _readopt_wake_profiles():
++            scope = contextlib.ExitStack()
++            try:
++                db = scope.enter_context(server._profile_db({"profile": profile} if profile else None, writer=True))
+                 if db is not None and db.get_session(chat_id) is not None:
+-                    yield db, (db.get_compression_tip(chat_id) or chat_id)
+-                    return
+-        except Exception:
+-            logger.debug("kanban unloaded sweep: profile %s store unavailable", profile, exc_info=True)
+-    yield None, None
++                    found = (db, db.get_compression_tip(chat_id) or chat_id)
++                    stack.push(scope.pop_all())  # held open until the caller's block ends
++                    break
++            except Exception:
++                logger.debug("kanban unloaded sweep: profile %s store unavailable", profile, exc_info=True)
++            with contextlib.suppress(Exception):
++                scope.close()
++        yield found
+ 
+ 
+ def wake_turn(session_id: str, text: str, metadata: dict) -> str:
+@@ -205,7 +258,8 @@ def _wake_job(wake, session_db, slug, ident, tip, text, metadata, old, new, now)
+             from hermes_cli import kanban_db_connect as _kbc
+             from hermes_cli import kanban_db_notify as _kbn
+             with contextlib.closing(_kbc.connect(board=slug)) as conn:
+-                _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new)
++                if not _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new):
++                    return "deferred"
+         logger.info("kanban sweep wake of %s for %s/%s: %s", tip, slug, ident["task_id"],
+                     "turn started" if verdict == "started" else f"{verdict}, notice row written")
+         return verdict
+@@ -264,9 +318,26 @@ def sweep_once(
+ def _sweep_sub(conn, slug, sub, grace_s, now, session_db, _kb, _kbn, kinds, fmt, wake, holders, spawn) -> Optional[dict]:
+     ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                  thread_id=sub.get("thread_id") or "")
++    key = _stall_key(slug, ident)
+     _cursor, events = _kbn.unseen_events_for_sub(conn, kinds=kinds, **ident)
+-    if not events or min(float(getattr(e, "created_at", 0) or 0) for e in events) > now - grace_s:
+-        return None  # nothing waiting, or a live poller still has time to take it
++    if not events:
++        _clear_stall(key)  # delivered (by us or a live poller): a later stall starts its own clock
++        return None
++    oldest = min(float(getattr(e, "created_at", 0) or 0) for e in events)
++    if oldest > now - grace_s:
++        return None  # a live poller still has time to take it
++    done = None
++    try:
++        done = _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, kinds, fmt, wake, holders,
++                            spawn)
++        return done
++    finally:
++        if done is None:
++            _warn_if_overdue(key, now - oldest)
++
++
++def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, kinds, fmt, wake, holders,
++                 spawn) -> Optional[dict]:
+     task = _kb.get_task(conn, sub["task_id"])
+     with session_db(sub["chat_id"]) as (db, tip):
+         if db is None or tip is None:
+@@ -284,6 +355,7 @@ def _sweep_sub(conn, slug, sub, grace_s, now, session_db, _kb, _kbn, kinds, fmt,
+     metadata = {"notice_id": f"{slug}:{ident['task_id']}:{old}-{new}", "board": slug, "display_text": text,
+                 "task_id": ident["task_id"], "event_ids": [int(e.id) for e in claimed]}
+     held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s)
++    persisted = True
+     if verdict is None:  # a worker slot is ours: the job wakes, or writes the row itself
+         try:
+             verdict = spawn(lambda: _wake_job(wake, session_db, slug, ident, tip, text, metadata, old, new, now))
+@@ -291,9 +363,11 @@ def _sweep_sub(conn, slug, sub, grace_s, now, session_db, _kb, _kbn, kinds, fmt,
+             _wake_slots.release()
+             logger.warning("kanban sweep could not start a wake for %s", tip, exc_info=True)
+             verdict = "error"
+-            _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new)
++            persisted = _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new)
+     else:
+-        _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new)
++        persisted = _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new)
++    if not persisted:
++        return None  # chat busy: the claim is rewound and the next pass retries
+     logger.info("kanban notice for unloaded session %s (board=%s task=%s events=%d wake=%s)",
+                 tip, slug, ident["task_id"], len(texts), verdict)
+     return {"board": slug, "task_id": ident["task_id"], "chat_id": ident["chat_id"], "session_id": tip,
+@@ -318,16 +392,28 @@ def _route_notice(holders, ident, tip, slug, task, texts, now, grace_s) -> tuple
+     return (held_by, None) if _wake_slots.acquire(blocking=False) else (held_by, "skipped:slots")
+ 
+ 
+-def _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new) -> None:
+-    """The passive transcript row; a failure rewinds the claim so the notice is retried, not lost."""
++def _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new) -> bool:
++    """The passive transcript row; True once written. A chat mid-turn refuses it: rewind and return False (one INFO
++    line, retried next pass). Any other failure rewinds and raises, so the notice is retried, not lost."""
++    from hermes_state_errors import SessionTurnLeaseLostError
++    key = _stall_key(metadata["board"], ident)
+     try:
+         with session_db(ident["chat_id"]) as (db, _tip):
+             if db is None:
+                 raise RuntimeError(f"chat {ident['chat_id']} disappeared before its notice was written")
+             db.append_kanban_notice(tip, text, metadata)
+-    except Exception:
++        return True
++    except SessionTurnLeaseLostError:
++        with contextlib.suppress(Exception):
++            _kbn.rewind_notify_cursor(conn, claimed_cursor=new, old_cursor=old, **ident)
++        first = _note_stall(key, "chat busy (a turn is running in it)")
++        logger.log(logging.INFO if first else logging.DEBUG, "kanban notice for %s/%s to chat %s deferred: chat busy "
++                   "(active turn); retrying next pass", key[0], key[1], tip)
++        return False
++    except Exception as exc:
+         with contextlib.suppress(Exception):
+             _kbn.rewind_notify_cursor(conn, claimed_cursor=new, old_cursor=old, **ident)
++        _note_stall(key, f"{type(exc).__name__}: {exc}")
+         raise
+ 
+ 
+-- 
+2.55.0
+

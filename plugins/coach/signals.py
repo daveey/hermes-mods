@@ -9,7 +9,8 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               24 h (cursor `cron_fails`); a one-off failure the next run recovered from is only counted;
 - kanban      a card with >= 2 runs that crashed / timed out / failed to spawn (every board db);
 - gateway     gateway crash-restarts: `gateway.previous_unclean_exit`, `asyncio.run.exception`,
-              `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log;
+              `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log; a `gateway.exit_signal`
+              (unplanned SIGTERM bounce) only as a storm: 3+ in 10 min per profile;
 - coach       coach `fixloop_card` (2nd confirmed failure of a fix) and `reply_nudge` handoff events.
 Profiles (<home>/profiles/*) are swept too, except the coach log, which lives in <home>/coach only.
 
@@ -46,7 +47,10 @@ BACKFILL_S = 7 * 86400
 MAX_READ = 4 * 1024 * 1024        # never read more than this from one log per pass (start at the tail instead)
 MAX_PER_KIND = 25                 # cap per collector per pass: a log storm files a handful, not hundreds
 FAIL_OUTCOMES = ("crashed", "timed_out", "spawn_failed")
-GATEWAY_TAGS = ("gateway.previous_unclean_exit", "asyncio.run.exception", "gateway.exit_nonzero")
+GATEWAY_TAGS = ("gateway.previous_unclean_exit", "asyncio.run.exception", "gateway.exit_nonzero", "gateway.exit_signal")
+# gateway.exit_signal = an unplanned stop signal (bootout, kickstart -k, systemctl stop): exit 1 on purpose
+# so the supervisor revives it. One is a bounce, not a defect; only a storm is filed.
+SIGNAL_STORM_N, SIGNAL_STORM_S = 3, 600
 KINDS = ("errors", "hook", "cron", "kanban", "gateway", "coach", "monitor")
 SELF_DIR = Path(__file__).resolve().parent
 HUB_CMD = "python3 ~/code/hermes-mods/plugins/coach/signals.py ingest"
@@ -63,6 +67,9 @@ TRANSIENT_RE = re.compile(r"RateLimitError|rate_limit_error|\b429\b|overloaded_e
                           r"APITimeoutError|ReadTimeout|ConnectTimeout|RemoteProtocolError|CancelledError|"
                           r"KeyboardInterrupt|InternalServerError.*\b5\d\d\b", re.I)
 PLUGIN_PATH_RE = re.compile(r"/plugins/([\w.\-]+)/")
+# CPython refusing new work while the process exits (Desktop quit, update, restart mid-turn): the turn's thread
+# outlived the main thread. Exit noise, not a defect (agent-9a2a3cc05d); core logs it as one line since c5153adda1.
+EXIT_NOISE_RE = re.compile(r"cannot schedule new futures after|can't register atexit after shutdown", re.I)
 # A network library that logs its own auto-reconnect at ERROR with the traceback, then reconnects by itself
 # (discord.py client.py:769-781: "sometimes, discord sends us 1000 for unknown reasons so we should reconnect").
 # Not a defect unless a Hermes logger or frame is involved; a storm of them on one host/profile still files one.
@@ -204,7 +211,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None) -> List[di
                                    "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
                                                                    + block))[-1500:]})
             continue
-        if TRANSIENT_RE.search(text):
+        if TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line):
             continue
         comp, plug = component_of([f[0] for f in frames])
         if r["level"] == "WARNING" and not any(_own_frame(p) for p, _fn in frames):
@@ -388,6 +395,20 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
     return out
 
 
+def _signal_storm(cur: dict, prof: str, r: dict, at: float, host: str) -> Optional[dict]:
+    """Count one ``gateway.exit_signal``; return a signal only for the SIGNAL_STORM_N-th within SIGNAL_STORM_S."""
+    recent = [t for t in cur.setdefault("gw_signals", {}).get(prof, []) if t > at - SIGNAL_STORM_S] + [at]
+    if len(recent) < SIGNAL_STORM_N:
+        cur["gw_signals"][prof] = recent
+        return None
+    cur["gw_signals"].pop(prof, None)  # one card per storm; the fp dedupes repeats anyway
+    return {"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
+            "symptom": f"gateway ({prof}) on {host} restart storm: {len(recent)} stop signals in "
+                       f"{SIGNAL_STORM_S // 60} min (last {r.get('signal') or 'UNKNOWN'})",
+            "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
+            "fp": fp("gateway", host, prof, "gateway.exit_signal", "storm")}
+
+
 def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
     out = []
     for prof, h in homes(home):
@@ -401,6 +422,10 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                 continue
             at = _iso_ts(r.get("ts"))
             if at < now - BACKFILL_S:
+                continue
+            if tag == "gateway.exit_signal":
+                if (sig := _signal_storm(cur, prof, r, at, host)) is not None:
+                    out.append(sig)
                 continue
             why = r.get("exc_type") or ("suspected OOM" if r.get("suspected_oom") else "") or tag.split(".")[-1]
             out.append({"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
