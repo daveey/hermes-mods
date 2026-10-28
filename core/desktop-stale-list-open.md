@@ -16,6 +16,13 @@ One sidebar session list failed, so `$sessionListFreshness` marked the local con
 - **Stale-list stamp.** A row that `mergeOfflineFallback` (`src/store/offline-sessions.ts`) keeps from a failed
   list, and that has no replica copy, gets `offline_stale_list: true` (a new `SessionInfo` field) as well as
   `offline_cached` and `is_active: false`. Replica rows never get it.
+- **This Mac's own rows never yield to a replica copy.** The cold-start boot snapshot (`src/store/boot-snapshot.ts`)
+  feeds this Mac's own gateway's replica rows into the same fallback, connection = the registry primary, and judges
+  them asleep at the moment it was read. A retained row of the primary backend therefore always takes the stale-list
+  stamp, even when such a copy exists: the copy says nothing about whether the local backend is up now. Rows of the
+  primary carry no `connection_id` while replica copies name the primary, so the merge treats an empty
+  `connection_id` as the primary when matching identities (otherwise the copy was added as a refused duplicate).
+  A remote row with a replica copy keeps the copy (an asleep owner stays read-only or refused).
 - **Open still tries.** Clicking a stale-list row (`useOfflineFallback`, `src/app/chat/sidebar/use-offline-fallback.ts`)
   shows "<connection> is not responding (its last session list failed). Trying to open this chat anyway." and then
   calls `resumeSession` live (`clearAsleepOpen`, never the read-only asleep open from
@@ -32,8 +39,10 @@ One sidebar session list failed, so `$sessionListFreshness` marked the local con
 - `src/app/chat/sidebar/offline-fallback.integration.test.tsx`: a stale-list row of a busy local backend opens
   (resume is called), and the notice and tooltip name "This computer". A remote stale-list row that has a cached
   transcript resumes live, not read-only. A replica row with no cached transcript stays refused while its owner's
-  list is also failing.
-- `src/store/offline-sessions.test.ts`: only rows without a replica copy get `offline_stale_list`.
+  list is also failing. A local row with an asleep boot-snapshot copy (with and without `connection_id`) still opens
+  live, as one row, when the local list fails; a remote row whose replica says its owner is asleep stays refused.
+- `src/store/offline-sessions.test.ts`: only rows without a replica copy get `offline_stale_list`, except this Mac's
+  own rows, which get it over their boot copies with no duplicate row.
 - `src/store/offline-session-actions.test.ts`: the notice names the connection and never says "offline",
   "never synced" or "its gateway".
 
