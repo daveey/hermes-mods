@@ -4,6 +4,7 @@ An updater (for example a sync job that keeps a fork checkout current) writes
 ``$HERMES_HOME/cache/core-update/state.json``:
 
     {"status": "building" | "ready" | "failed", "sha": "<commit being packed>",
+     "serves_sha": "<newer head the ready build also serves (no desktop input changed)>",
      "app_path": "<prebuilt Hermes.app>", "built_at": "<iso>", "started_at": "<iso>",
      "waiter_cmd": ["<argv that waits for Desktop to quit, then applies the update>"]}
 
@@ -84,6 +85,11 @@ def status(home: Optional[Path] = None, checkout: Optional[Path] = None,
     root = checkout or running_checkout()
     running = git(root, "rev-parse", "HEAD")
     sha = st.get("sha") if isinstance(st.get("sha"), str) else None
+    served = st.get("serves_sha")
+    if st.get("status") == "ready" and isinstance(served, str) and served:
+        # The updater kept an older build because the newer head changed no desktop input; that
+        # build is what the update to ``serves_sha`` installs, so the update offered is that head.
+        sha = served
     out: Dict[str, Any] = {
         "state": "idle", "sha": sha, "running": running, "built_at": st.get("built_at"),
         "started_at": st.get("started_at"), "error": st.get("error"),
