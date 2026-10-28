@@ -332,7 +332,8 @@ or decide right now. Also say which previously-open steps are now resolved.
 
 Return ONLY JSON:
 {"steps":[{"text":"...","kind":"approve|do|choose|input","verbatim_span":"...","options":["..."]}],
- "resolved":["<open step id>", ...]}
+ "resolved":["<open step id>", ...],
+ "repeats":[{"id":"<open step id>","verbatim_span":"..."}]}
 
 Kinds:
 - approve: the assistant proposes an action and waits for a go/no ("Want me to deploy it?", "OK to delete X?").
@@ -351,12 +352,17 @@ Rules:
 - "text": one short imperative line for the user (<= 120 chars), e.g. "Approve deploying build 412 to prod".
 - "verbatim_span": an EXACT substring copied from the reply (one sentence or line) where the ask is made.
 - One step per distinct ask; at most 5.
+- The user already sees every OPEN STEP as a tile. A sentence that only restates, reminds about or points at an
+  OPEN STEP (the same decision, even reworded or summarised: "X is still waiting for your approval", "they stay in
+  your list until you answer them", or the approve/change/decline menu of an open approval) is NOT a new step: put
+  {"id": <that open step id>, "verbatim_span": <exact sentence>} in "repeats" instead. When unsure whether it is
+  the same decision, list it as a new step.
 - "resolved": ids from OPEN STEPS that the USER'S LAST MESSAGE answered, did, declined or made moot, or that the
   reply says are now done. Leave a step out when unsure.
 - Status reports are not asks: "X is in review", "not yet approved", "still open", "waiting on CI/a worker/a
   reviewer". A Kanban card in review is checked by an automated reviewer, not by the user.
 - If the reply says nothing is needed from the user, return no steps unless a sentence explicitly asks the user.
-- No asks: {"steps":[],"resolved":[...]}."""
+- No asks: {"steps":[],"resolved":[...],"repeats":[...]}."""
 
 
 def build_prompt(reply: str, open_steps: list[dict], user_msg: str) -> str:
@@ -630,8 +636,11 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
         try:
             d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg)))
             resolved = [str(x) for x in (d.get("resolved") or []) if str(x) in ids]
+            repeats = [{"id": str(x["id"]), "verbatim_span": str(x["verbatim_span"])}
+                       for x in (d.get("repeats") or []) if isinstance(x, dict) and str(x.get("id")) in ids
+                       and isinstance(x.get("verbatim_span"), str) and locate(reply, x["verbatim_span"]) is not None]
             return {"steps": validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), "resolved": resolved,
-                    "source": "model", "dropped": dropped}
+                    "repeats": repeats, "source": "model", "dropped": dropped}
         except Exception as exc:  # fall back to the regex detector; resolution then only comes from buttons
             err = f"{type(exc).__name__}: {exc}"[:200]
             dropped.clear()
@@ -848,7 +857,14 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     opened = ledger.open_steps(session_id)
     if not opened and not _worth_asking(reply):
         return {"text": None, "steps": [], "resolved": [], "source": "skip"}
-    res = extract(reply, opened, user_msg, llm, continuity=True)
+    # Producer-published asks are tiles too: the model must see them to report a restatement as a repeat.
+    # Their ids only feed "repeats"; ledger resolution below ignores any step that has a requestId.
+    listed = list(opened)
+    if action_store is not None:
+        mirrored = {s.get('requestId') for s in opened}
+        listed += [{'id': a['id'], 'kind': a['kind'], 'text': a['title']}
+                   for a in open_asks(action_store, action_owner) if a['id'] not in mirrored]
+    res = extract(reply, listed, user_msg, llm, continuity=True)
     published, resolved = [], []
     text = reply
     changed = False
@@ -886,6 +902,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 text, held = HELD_REPLY, True
             recent = sum(1 for s in d["steps"] if now - s.get("created", 0) < 3600)
             budget = min(MAX_NEW_PER_REPLY, max(0, MAX_NEW_PER_HOUR - recent))
+            asks = open_asks(action_store, action_owner, d["steps"]) if action_store is not None else []
+            mapped: dict[str, dict] = {}
             # Retain old label dedup only for genuinely new actions, never use it
             # as an authority binding or to bypass exact retirement/reuse.
             for candidate, prior in matches:
@@ -893,12 +911,13 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 if held or candidate in suppressed or block is None:
                     continue
                 if action_store is not None:
-                    kind = {'approve': 'approval', 'choose': 'choice', 'input': 'input', 'do': 'external_step'}[candidate['kind']]
-                    if any(r['kind'] == kind and r['title'] == candidate['text']
-                           and r['scope']['complete'] and r['state'] == 'open'
-                           and not any(ref['type'] == 'user_step' for ref in r['aliases'])
-                           for r in action_store.requests(action_owner)):
-                        continue  # explicit producer already owns this exact ask
+                    same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped)
+                    if same is not None:
+                        # A re-ask of an open tile: frame it onto that tile, never mint a second one.
+                        mapped.setdefault(ask_key(candidate["verbatim_span"]), same)
+                        if same["step"] is not None and all(p.get("id") != same["step"]["id"] for p in published):
+                            published.append(dict(same["step"]))
+                        continue
                 existing = next((s for s in prior if s.get("status") == "open"), None)
                 if existing is not None:
                     published.append(dict(existing))
@@ -911,6 +930,10 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                     canonical = action_store.migrate_step(action_owner, step)
                     step.update(requestId=canonical["requestId"], requestOwner=canonical["owner"],
                                 requestRevision=canonical["revision"])
+                    made = {'id': canonical['requestId'], 'kind': canonical['kind'], 'title': canonical['title'],
+                            'step': step, 'fresh': True}
+                    asks.append(made)
+                    mapped.setdefault(ask_key(candidate["verbatim_span"]), made)
                 d["steps"].append(step)
                 published.append(dict(step))
                 seen.add(_norm(candidate["text"]))
@@ -948,6 +971,89 @@ def reminder(open_steps: list[dict]) -> str:
     lines.append("Act on any the user's message answers. Don't re-ask an open step verbatim; the strip already "
                  "shows it. Steps are marked resolved automatically from the user's reply.")
     return "\n".join(lines)
+
+
+# ---- one decision, one open request ----------------------------------------------------------------------
+# The aux model rewords every restatement of an ask, so exact action identity alone re-minted a tile per reply
+# (hub chats 37ae77/67cb2d, MacBook 6212f7/f0271d). These rules map a re-ask to the ONE open, undecided request
+# of the same session it repeats. They only ever prevent a new tile; they never decide, resolve or withdraw
+# anything, and a decided/withdrawn/closed request is never a target. When a rule is not sure, the ask is kept.
+
+_EXTRACTED_KIND = {'approve': 'approval', 'choose': 'choice', 'input': 'input', 'do': 'external_step'}
+_MENU = re.compile(r"\bapprov\w*\b.*\b(?:chang|revis)\w*\b.*\bdeclin\w*", re.I | re.S)
+_ASK_KEY_MIN = 8
+
+
+def ask_key(text) -> str:
+    """Comparison key for a title or evidence sentence: markdown, list marks and end punctuation off."""
+    return _LIST_MARK.sub("", _norm(str(text or ""))).strip(" ?.!:;,")
+
+
+def open_asks(store, owner, steps=()) -> list[dict]:
+    """[{id, kind, title, step}] for this session's open, undecided canonical requests, oldest first.
+    ``step`` is the open legacy ledger step mirroring the request (extracted asks), else None."""
+    sid = owner['storedSessionId']
+    by_rid = {s['requestId']: s for s in steps
+              if s.get('requestId') and s.get('status') == 'open' and s.get('session') == sid}
+    return [{'id': r['requestId'], 'kind': r['kind'], 'title': r['title'], 'step': by_rid.get(r['requestId'])}
+            for r in store.requests(owner)
+            if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
+
+
+def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None) -> Optional[dict]:
+    """The open ask ``candidate`` (an extracted step) repeats, or None (it is a new ask).
+
+    Same decision when: its text or evidence sentence IS an open ask's title, or the same evidence sentence an
+    open ask was extracted from; the model marked that sentence as a repeat of an open id; it names exactly one
+    Kanban card and every open ask of the same kind naming only that card; or it is the approve/change/decline
+    menu and exactly one open approval exists (or its sentence was already read as one approval). With
+    several candidates, the newest open ask wins (older duplicates are left for withdrawal, not merged)."""
+    text, span = ask_key(candidate.get('text')), ask_key(candidate.get('verbatim_span'))
+
+    def pick(xs):
+        return xs[-1] if xs else None
+
+    hit = pick([a for a in asks if (len(text) >= _ASK_KEY_MIN and text == ask_key(a['title']))
+                or (len(span) >= _ASK_KEY_MIN and span == ask_key(a['title']))
+                # One sentence can carry two different asks: the same-sentence rule is for LATER replies only.
+                or (a['step'] is not None and not a.get('fresh') and len(span) >= _ASK_KEY_MIN
+                    and span == ask_key(a['step'].get('verbatim_span')))])
+    if hit:
+        return hit
+    ids = {a['id']: a for a in asks}
+    for r in repeats or ():
+        if r.get('id') in ids and len(span) >= _ASK_KEY_MIN and ask_key(r.get('verbatim_span')) == span:
+            return ids[r['id']]
+    kind = _EXTRACTED_KIND.get(candidate.get('kind'), 'input')
+    cards = set(_CARD_ID.findall(f"{candidate.get('text') or ''} {candidate.get('verbatim_span') or ''}"))
+    if len(cards) == 1:
+        hit = pick([a for a in asks if a['kind'] == kind and set(_CARD_ID.findall(a['title'])) == cards])
+        if hit:
+            return hit
+    menu = ' '.join([str(candidate.get('text') or '')] + [str(o) for o in candidate.get('options') or []])
+    if candidate.get('kind') == 'choose' and _MENU.search(menu):
+        approvals = [a for a in asks if a['kind'] == 'approval']
+        if len(approvals) == 1:
+            return approvals[0]
+        prior = (mapped or {}).get(span)  # the same sentence already read as that approval in this reply
+        if prior is not None and prior['kind'] == 'approval':
+            return prior
+    return None
+
+
+_NOOP_ASK = re.compile(
+    r"^(?:no (?:decision|action|answer|input|reply|choice)s? (?:is |are )?(?:needed|required)"
+    r"|nothing (?:to (?:decide|answer|approve|do)|(?:is )?(?:needed|required|waiting)|for you)"
+    r"|settled\b[,:;.]? nothing)\b", re.I)
+
+
+def declares_no_ask(request: dict) -> bool:
+    """The request itself says there is nothing to decide ("No decision needed: ...", "Settled, nothing to
+    decide."). Such a tile is a status note, never an ask: it is withdrawn, not published."""
+    title = _LIST_MARK.sub("", _plain(request.get('title') or "")).strip()
+    md = _LIST_MARK.sub("", _plain((request.get('scope') or {}).get('markdown') or "")).strip()
+    first = _SENTENCE_BREAK.split(md)[0] if md else ""
+    return bool(_NOOP_ASK.match(title) or _NOOP_ASK.match(first))
 
 
 # ---- ActionRequest v2: immutable scope versions + durable decision outbox -----

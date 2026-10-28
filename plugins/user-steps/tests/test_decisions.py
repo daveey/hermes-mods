@@ -234,7 +234,10 @@ def test_readback_failure_never_success_and_other_request_not_locked(tmp_path):
     with pytest.raises(core.ActionError): s.revise(OWNER, a['requestId'], 1, a)
 
 
-def test_identical_extracted_titles_do_not_merge_and_model_cannot_decide(tmp_path):
+def test_identical_extracted_titles_share_one_open_tile_and_model_cannot_decide(tmp_path):
+    # Was "do not merge" (2 requests). That default minted a For-you tile per restatement of one open ask
+    # (hub chat 37ae77: 3 tiles for t_54aa263b). An exact re-ask of an OPEN, undecided request reuses it;
+    # the model's "resolved" still decides nothing, and the request stays incomplete.
     s = store(tmp_path); lg = core.Ledger(tmp_path / 'ledger', tmp_path / 'missing-state.db')
     reply = 'Should I change the example?'
     payload = {'steps':[{'text':'Same title', 'kind':'approve', 'verbatim_span':reply}], 'resolved':[]}
@@ -246,7 +249,8 @@ def test_identical_extracted_titles_do_not_merge_and_model_cannot_decide(tmp_pat
     second = core.process_reply(reply2, 'session-a', ledger=lg, action_store=s, action_owner=OWNER,
                                 llm=lambda *a: json.dumps(payload))
     assert second['resolved'] == []
-    assert len(s.requests(OWNER)) == 2
+    assert len(s.requests(OWNER)) == 1
+    assert [x['requestId'] for x in second['steps']] == [first['steps'][0]['requestId']]
     assert all(not r['scope']['complete'] for r in s.requests(OWNER))
 
 

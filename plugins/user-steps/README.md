@@ -94,7 +94,9 @@ still fail closed; durable admission is not proof that execution completed.
 Identity is `(gatewayId, profile, requestId)`; gateway identity comes from the core
 install identity, not a client-supplied owner or an invented environment variable.
 Stored session association is exact. Aliases are qualified by gateway, profile,
-type, ID and board where applicable. Similar titles are never deduplicated.
+type, ID and board where applicable. Similar titles are never merged across sessions or into a decided,
+withdrawn or closed request. Within one session a re-ask of an OPEN, undecided request reuses its tile
+(see "One decision, one tile" below).
 
 Requests carry immutable scope revisions, limits, exclusions, outcomes and explicit
 semantic choices. Incomplete scope cannot be approved. Extraction and legacy
@@ -252,6 +254,38 @@ boards, ask time across re-renders, producer revisions and older-process revisio
 the lock-free pass, `requests()` hiding withdrawn rows, REST filtering and dismissal,
 hook context, the plan gate, and the extraction guard (scoped and unscoped
 declarations, quoted questions, and the exact reply that produced a stale approval ask).
+
+## One decision, one tile
+
+The aux model rewords every restatement of an ask ("Decide on t_X: ..." becomes
+"Decide whether to ... (t_X)"), so exact action identity alone minted a new request
+and tile for every reply that mentioned an open ask (3-5 tiles per decision in live
+chats). `same_open_ask` (core.py) maps a re-ask to the ONE open, undecided request
+of the same session it repeats, and the reply is framed onto that tile instead:
+
+- its text or evidence sentence IS an open request's title (markdown, list marks and
+  end punctuation ignored), or the same evidence sentence an open ask was extracted
+  from in an earlier reply;
+- the model listed that sentence under `repeats` for an open id (the prompt now lists
+  producer-published requests as open steps and says a restatement is a repeat);
+- it names exactly one Kanban card, and an open request of the same kind names only
+  that card;
+- it is the approve/change/decline menu and exactly one open approval exists (or
+  that sentence was already read as one approval).
+
+Anything else stays a separate ask: a different kind on the same card, a menu next
+to two open approvals, two asks read from one sentence of one reply. Decided,
+withdrawn and closed requests are never a target, so asking again after a decision
+or withdrawal is still a fresh ask. The final-reply plan gate uses the same matcher,
+so a reworded restatement of a published approval no longer holds the reply.
+
+`action_request`: a new request whose title matches an open, undecided, card-free
+request of the session revises that request (newest one) and withdraws older
+duplicates (`by: agent`, `Duplicate of <id>`); a decided request is never touched.
+A request that says it asks nothing ("No decision needed: ...", scope "Settled,
+nothing to decide") is never published: a revision withdraws the request, a new one
+is refused with the withdraw instruction. None of this records a decision or grants
+anything. `tests/test_one_open_ask.py` replays each live duplicate.
 
 ## Limits
 

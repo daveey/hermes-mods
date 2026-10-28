@@ -155,7 +155,8 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
             note += ('\n[Agent work: these approvals lack a complete plan, so the user cannot decide them. '
                      'If still needed, publish action_request with the same requestId and expectedRevision, '
                      'the FULL exact plan, scope, consequences and approve/change/decline choices. Do not ask '
-                     'the user to request a plan. If it is no longer needed, withdraw it instead.] ' + json.dumps([{'requestId': r['requestId'],
+                     'the user to request a plan. If it is no longer needed, withdraw it instead. If several ask '
+                     'the same decision, complete ONE and withdraw the others as duplicates.] ' + json.dumps([{'requestId': r['requestId'],
                                                                      'expectedRevision': r['revision'],
                                                                      'title': r['title']} for r in incomplete]))
         gone = st.unnotified_withdrawals(own)
@@ -209,20 +210,33 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     """Return missing plan work to the agent, never to a user-facing button."""
     if not _eligible(session_id, platform) or not core._worth_asking(final_response):
         return None
-    asks = core.extract(final_response, [], '', aux_llm).get('steps', [])
-    approvals = [s for s in asks if s['kind'] == 'approve']
+    owner = core.server_owner(session_id)
+    store = core.ActionStore()
+    # The open asks go to the extractor and the matcher: a reply restating a published approval in other
+    # words is covered by it. Without them every paraphrase held the reply and pushed the agent to publish
+    # the same approval again (hub chat 67cb2d).
+    open_asks = core.open_asks(store, owner, _ledger().read(session_id).get('steps', []))
+    res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks],
+                       '', aux_llm)
+    approvals = [s for s in res.get('steps', []) if s['kind'] == 'approve']
     if not approvals:
         return None
-    owner = core.server_owner(session_id)
-    requests = core.ActionStore().requests(owner)
-    complete = [r for r in requests if r['kind'] == 'approval' and r['state'] == 'open'
-                and r['scope']['complete'] and not r.get('resolution')
-                and {'approve', 'revise', 'decline'} <= {c['effect'] for c in r['choices']}]
-    if all(any(core._norm(s['text']) == core._norm(r['title']) for r in complete) for s in approvals):
+    ready = {r['requestId'] for r in store.requests(owner)
+             if r['kind'] == 'approval' and r['state'] == 'open' and r['scope']['complete'] and not r.get('resolution')
+             and {'approve', 'revise', 'decline'} <= {c['effect'] for c in r['choices']}}
+    mapped: dict = {}
+
+    def covered(step):
+        same = core.same_open_ask(step, open_asks, res.get('repeats') or (), mapped)
+        if same is not None:
+            mapped.setdefault(core.ask_key(step.get('verbatim_span')), same)
+        return same is not None and same['id'] in ready
+
+    if all([covered(s) for s in approvals]):
         return None
     if attempt >= hold_budget:
         return {'replace': 'The approval request is not ready: the agent has not provided a complete exact plan. No approval is requested and no permission has been granted.'}
-    return {'hold': True, 'nudge': 'Complete the missing agent work now: publish action_request with the FULL EXACT inline plan, scope, consequences, limits, exclusions and approve/change/decline choices. Use the same question as its title. Do not ask the user to request a plan, and do not invent approval. If this is only a clarification, publish kind choice/input with concrete answer labels instead. Then present the decision.'}
+    return {'hold': True, 'nudge': 'Complete the missing agent work now: publish action_request with the FULL EXACT inline plan, scope, consequences, limits, exclusions and approve/change/decline choices. Use the same question as its title. If an open request already asks this, revise THAT one (its requestId and expectedRevision) instead of creating another, and withdraw any duplicates. Do not ask the user to request a plan, and do not invent approval. If this is only a clarification, publish kind choice/input with concrete answer labels instead. Then present the decision.'}
 
 
 publication_buffer.needs_buffer = True
@@ -264,6 +278,18 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         core._object(args, ('request',), ('requestId', 'expectedRevision', 'decisionCard'))
         owner = core.server_owner(session_id)
         payload = dict(args['request'])
+        st = core.ActionStore()
+        if core.declares_no_ask(payload):
+            # "No decision needed: ..." is a status note, not an ask: it must leave For you, not become a tile.
+            if not args.get('requestId'):
+                raise core.ActionError('Nothing to ask: this request says no decision is needed, so it is not '
+                                       'published. If an open request is moot, withdraw it with '
+                                       '{"withdraw": {"requestId": "<id>", "reason": "<why>"}}.')
+            out = core.withdraw_request(st, _ledger(), owner, args['requestId'], by='agent',
+                                        reason=payload.get('title') or 'No decision needed',
+                                        expected_revision=args.get('expectedRevision'))
+            return json.dumps({'request': out, 'note': 'Not published: it says no decision is needed, so the '
+                               'request was withdrawn instead (no decision, nothing granted).'})
         if payload.get('kind') == 'approval' and not (payload.get('scope') or {}).get('complete'):
             raise core.ActionError('Complete the full exact inline plan, scope and consequences before publishing approval. This is agent work; do not ask the user to request a plan.')
         if payload.get('kind') == 'approval' and not {'approve', 'revise', 'decline'} <= {
@@ -272,7 +298,6 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         if any(key in payload for key in ('owner', 'requestId', 'revision', 'resolution')):
             raise core.ActionError('Producer identity is server-owned')
         rid = args.get('requestId') or str(uuid.uuid4())
-        st = core.ActionStore()
         payload.update(owner=owner, requestId=rid, revision=1)
         adapter = cards_mod.QualifiedCardDelivery()
         # Aliases alone never authorize adopting a card. Only producer-created
@@ -287,6 +312,33 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         else:
             if 'expectedRevision' in args: raise core.ActionError('New requests have no expectedRevision')
             if refs: raise core.ActionError('Card aliases must be created by decisionCard, not supplied')
+            same = [] if 'decisionCard' in args else [
+                r for r in st.requests(owner)
+                if r['state'] in ('open', 'needs_context') and not r.get('resolution')
+                and not any(a['type'] == 'kanban' for a in r['aliases'])
+                and core.ask_key(r['title']) == core.ask_key(payload.get('title'))]
+            if same:
+                # A re-ask of an open, undecided request with the same title revises that tile (newest one)
+                # and withdraws older duplicates, instead of publishing another tile. Never a decision.
+                target = same[-1]
+                payload.update(requestId=target['requestId'],
+                               aliases=target['aliases'] + [a for a in payload.get('aliases', [])
+                                                            if a not in target['aliases']])
+                out = st.revise(owner, target['requestId'], target['revision'], payload, bind=adapter.bind_request)
+                gone = []
+                for r in same[:-1]:
+                    try:
+                        core.withdraw_request(st, _ledger(), owner, r['requestId'], by='agent',
+                                              reason=f"Duplicate of {target['requestId']}",
+                                              expected_revision=r['revision'])
+                        gone.append(r['requestId'])
+                    except core.ActionError:
+                        pass  # decided or moved on meanwhile: the decision wins, keep it
+                note = (f"An open request with this title already existed, so it was revised in place: "
+                        f"{target['requestId']} revision {out['revision']}.")
+                if gone:
+                    note += ' Withdrew duplicates: ' + ', '.join(gone) + '.'
+                return json.dumps({'request': out, 'note': note})
             payload = core.validate_action(payload)
             if 'decisionCard' in args:
                 core._object(args['decisionCard'], ('board',))
@@ -300,7 +352,7 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
 
 PRODUCER_SCHEMA = {
     'name': 'action_request',
-    'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
+    'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one revises that one. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
     'parameters': {'type': 'object', 'additionalProperties': False,
                    'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, choices [{id,label,effect}], qualified aliases, state (open or needs_context).'},
                                   'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
