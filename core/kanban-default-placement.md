@@ -78,6 +78,8 @@ gateway has, so capability routing opens an owner card back there.
 - a Mac-only card never calls the hub; a hub refusal falls back to a local card; an offline hub is queued, not duplicated; a retry reuses the request id;
 - 0567: `test_hub_cli_resolves_without_the_login_shell_path` (PATH without the install dir, `~/.local/bin` fallback, configured value wins, routing uses it) and `test_remote_body_names_the_capability_to_route_back_with`.
 
+- 0590–0591 (`fc317cf6f7`, `2ddf72b986`): `placement=<gateway>` that cannot be honoured returns `tool_error` code `placement_unavailable` and creates no card (never a silent local card). Tests: unrouted pin (`mini`, typos); no route configured (the hub-worker case, `placement='macbook'` on `hub`); hub refusal of a pinned card; structural limit and non-live target through the tool; exception while placing; `origin_session` set; `decide()` returns `refuse`. Controls: `placement` `local`, `here`, the own gateway name (any case, with or without a route) still create locally.
+
 Untested: the CLI (`hermes kanban create`) and `execute_code` creation paths do not call placement (only the `kanban_create` tool does), and `test_kanban_create_entry_parity.py` has no placement case.
 
 ## Carried options (0572)
