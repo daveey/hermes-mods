@@ -1,0 +1,180 @@
+From 3fb26ab729b713b7e12f6d70a6111e3da2ef58cf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 01:39:04 -0700
+Subject: [PATCH] fix(kanban): replica human asks paint their chat red;
+ unverified cards wait [daveey]
+
+Under kanban.sync.links_reader=replica the sidebar counts read
+kanban_chat_links.replica_cards, which passed the replica's human_request
+column through as JSON text. needs_human() only accepts the dict, so every
+remote card blocked on the user counted as open work: its chat painted
+waiting (grey) instead of stuck (red). Two runners-board approvals sat
+unanswered ~18 h this way.
+
+- replica_cards decodes human_request to the dict the ledger rows carry
+  (malformed text = no evidence, as needs_human already rules).
+- _replica_bucket reads either shape via _stored_needs_human.
+- A remote card in status unknown (done/archived, release unverified) has no
+  worker: count it parked, so a chat whose other cards are parked paints
+  waiting rather than no stripe. test_unverified_completion_* expectation
+  changes from parked 0 to 13 accordingly (that 0 was incidental in
+  cde62e1cf4, not a design rule).
+---
+ hermes_cli/kanban_chat_links.py               | 16 +++++-
+ hermes_cli/kanban_session_activity.py         | 11 ++--
+ tests/hermes_cli/test_kanban_chat_links.py    | 53 +++++++++++++++++++
+ .../test_kanban_session_activity.py           |  3 +-
+ 4 files changed, 76 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index ecc3c5b363..a16c7162e7 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -17,6 +17,7 @@ with one local query.
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import sqlite3
+ import time
+@@ -270,7 +271,8 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             out[pair] = {
+                 "title": r["title"], "status": UNKNOWN if unknown else status, "assignee": r["assignee"],
+                 "created_at": r["created_at"], "started_at": r["started_at"], "priority": r["priority"],
+-                "block_kind": r["block_kind"], "human_request": r["human_request"], "id": tid, "board": board,
++                "block_kind": r["block_kind"], "human_request": _decoded_request(r["human_request"]), "id": tid,
++                "board": board,
+                 "gateway": owner, "key": key, "session": r["chat_session"], "session_id": r["chat_session"],
+                 "via": "origin" if r["kind"] == "created" else "shepherd", "remote": True,
+                 "profile": owner_profile, "owner_profile": owner_profile, "origin_gateway": gateway,
+@@ -282,6 +284,18 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+     return list(out.values())
+ 
+ 
++def _decoded_request(value: Any) -> Any:
++    """[daveey] The replica stores ``human_request`` as JSON text; the ledger rows (and ``needs_human``) carry the dict.
++    Undecoded, a card blocked on the user read as open work and its chat painted waiting instead of red. Malformed
++    text is no evidence (None), the same verdict ``needs_human`` gives it."""
++    if isinstance(value, (bytes, str)):
++        try:
++            value = json.loads(value)
++        except ValueError:
++            return None
++    return value if isinstance(value, dict) else None
++
++
+ def _ledger_obligation(card: dict[str, Any], statuses: tuple[str, ...]) -> bool:
+     """An unreleased ledger row the sidebar counts: open, or ``unknown`` and unfinished (done, release unverified)."""
+     if card.get("released"):
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 60a89f55a7..38894a559b 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -564,14 +564,13 @@ def _self_gateway(conn: sqlite3.Connection) -> str:
+ 
+ 
+ def _replica_bucket(task: dict[str, Any]) -> str | None:
+-    """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards."""
+-    from hermes_cli.kanban_human_request import needs_human
+-
++    """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards. ``human_request`` may be
++    the decoded dict or the stored JSON text (``_stored_needs_human`` reads both). [daveey]"""
+     status = task.get("status")
+     if status == "unknown" and task.get("unfinished"):
+         return "active"
+     if status in BLOCKED_STATUSES:
+-        return "blocked" if needs_human(task.get("human_request"), kind=task.get("block_kind")) else "active"
++        return "blocked" if _stored_needs_human(task.get("human_request"), task.get("block_kind")) else "active"
+     return "active" if status in ACTIVE_STATUSES else None
+ 
+ 
+@@ -1379,7 +1378,9 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         into[sid] = into.get(sid, 0) + 1
+         # A replica row has no parent links; its owner promotes a todo whose parents finished on the next tick, so a
+         # replicated todo waits on a parent (parked). Held needs those links, so remote cards are never held.
+-        is_parked = bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo")
++        # [daveey] An ``unknown`` card (done, release unverified) has no worker either: it waits like a parked one,
++        # or a chat whose other cards are all parked painted no stripe at all instead of waiting.
++        is_parked = bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo", "unknown")
+         if is_parked:
+             parked[sid] = parked.get(sid, 0) + 1
+         remote_keys.setdefault(sid, set()).add((str(card.get("key")), str(bucket), is_parked))
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 3b3a783297..ac8e33b43b 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -198,3 +198,56 @@ def test_replica_reads_stay_fresh_through_the_shared_connection(tmp_path):
+     conn.close()
+     assert [c["id"] for c in links.replica_cards(["s1"], ME, replicas=[("default", rep)])] == ["t_b"]
+     ksa._reset_cache_for_tests()
++
++
++_ASK = {"action": "Reply with the runner host", "why_human": "approval-gated", "interaction": "reply",
++        "scope": "one runner", "evidence": "runners API shows none"}
++
++
++def _switch_to_replica(kanban_home, monkeypatch, rep):
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", ME))
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", kanban_home / "kanban.db")])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: rep)
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
++    (kanban_home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n    links_reader: replica\n")
++    ksa._reset_cache_for_tests()
++
++
++def test_replica_human_ask_paints_the_chat_blocked(live, kanban_home, monkeypatch, tmp_path):
++    """[daveey] The replica stores ``human_request`` as JSON text. Passed through undecoded, ``needs_human`` saw a
++    string, so a remote card blocked on David counted as open work: the chat painted waiting, not red, and two
++    runner approvals sat unanswered ~18 h. Decoded, it counts blocked; a non-human block stays open work."""
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_ask", "ask", "blocked", OTHER), ("t_ops", "ops", "blocked", OTHER),
++                   ("t_kind", "time wait", "blocked", OTHER), ("t_junk", "junk", "blocked", OTHER)],
++             [("t_ask", ME, "s1", "shepherd", 0), ("t_ops", ME, "s2", "shepherd", 0),
++              ("t_kind", ME, "s3", "shepherd", 0), ("t_junk", ME, "s4", "shepherd", 0)])
++    conn = sqlite3.connect(rep)
++    conn.execute("UPDATE tasks SET human_request = ? WHERE id IN ('t_ask', 't_kind')", (json.dumps(_ASK),))
++    conn.execute("UPDATE tasks SET block_kind = 'time' WHERE id = 't_kind'")
++    conn.execute("UPDATE tasks SET human_request = '{not json' WHERE id = 't_junk'")
++    conn.commit()
++    conn.close()
++    got = {c["id"]: c for c in links.replica_cards(None, ME, ksa.LISTED_STATUSES, replicas=[("default", rep)])}
++    assert got["t_ask"]["human_request"] == _ASK  # same shape as the ledger rows
++    assert got["t_ops"]["human_request"] is None and got["t_junk"]["human_request"] is None
++    _switch_to_replica(kanban_home, monkeypatch, rep)
++    assert ksa.blocked_task_counts() == {"s1": 1}
++    active = ksa.active_task_counts()
++    assert active.get("s1") is None and active["s2"] == 1 and active["s3"] == 1 and active["s4"] == 1
++    # ``_replica_bucket`` itself tolerates JSON text from any other reader.
++    assert ksa._replica_bucket({"status": "blocked", "human_request": json.dumps(_ASK)}) == "blocked"
++
++
++def test_unknown_replica_card_waits_like_a_parked_one(live, kanban_home, monkeypatch, tmp_path):
++    """[daveey] A done card whose link was never released is ``unknown``: nobody works it, so it is parked (the chat
++    paints waiting), not live (which left the row with no stripe at all)."""
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_done", "done", "done", OTHER), ("t_sched", "later", "scheduled", OTHER),
++                   ("t_run", "running", "running", OTHER)],
++             [("t_done", ME, "s1", "shepherd", 0), ("t_sched", ME, "s1", "shepherd", 0),
++              ("t_run", ME, "s2", "shepherd", 0)])
++    _switch_to_replica(kanban_home, monkeypatch, rep)
++    assert ksa.active_task_counts() == {"s1": 2, "s2": 1}
++    parked, held = ksa.parked_task_counts()
++    assert parked == {"s1": 2} and held == {}
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index c04b3ac81e..2be5a2d8fb 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -600,7 +600,8 @@ def test_unverified_completion_keeps_origin_and_other_sessions_finish_normally(k
+     ann = [{"id": "s_origin"}, {"id": "s_other"}]
+     ksa.annotate_kanban_activity(ann)
+     assert [{k: v for k, v in row.items() if k != 'kanban_observed_at'} for row in ann] == [
+-        {"id": "s_origin", "kanban_active": 13, "kanban_parked": 0}, {"id": "s_other"}]  # unverified = live, not parked
++        # [daveey] Unverified = still the chat's (counted active) but nobody works it: parked, so it paints waiting.
++        {"id": "s_origin", "kanban_active": 13, "kanban_parked": 13}, {"id": "s_other"}]
+     cards = ksa.session_tasks(["s_origin"])
+     assert len(cards) == 13
+     assert all(c['status'] == 'unknown' and c['reported_status'] == terminal_status for c in cards)
+-- 
+2.55.0
+

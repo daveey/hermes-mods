@@ -1,0 +1,520 @@
+From 45a6fbe63e6d488ade48f88690731f1e597c4a90 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 08:51:02 +0000
+Subject: [PATCH] fix(kanban): [daveey] refuse a pinned skill the assignee
+ cannot load; a stale pin never kills or retries a worker
+
+A card created with skills=["x"] was accepted, every worker died at start with
+'Error: Unknown skill(s): x', and the dispatcher retried it as a crash (escalating the
+retry model) until the breaker gave up (hub card t_01a180e04c0b3a83).
+
+- create time: kanban_create and 'hermes kanban create' check skills against the
+  ASSIGNEE profile with the worker's own lookup (hermes_cli/kanban_skill_check.py);
+  refusal code unknown_skill names close matches and creates nothing.
+- start time (#119619): a dispatcher-owned kanban worker whose pins all miss starts
+  with a prompt note naming them instead of exiting rc=1; interactive -s typo still fails.
+- dispatcher: a worker that dies of 'Unknown skill(s)' is blocked kind=assignment on the
+  first death, sticky, never retried.
+
+Tests: tests/hermes_cli/test_kanban_create_skill_validation.py (9; 6 red on base);
+e2e worker contract KNOWN gate for #119619 removed (now passes).
+---
+ cli.py                                        |  10 +-
+ hermes_cli/kanban.py                          |   5 +-
+ hermes_cli/kanban_db.py                       |  10 +-
+ hermes_cli/kanban_db_dispatch.py              |  24 +--
+ hermes_cli/kanban_skill_check.py              |  92 +++++++++
+ .../kanban/test_kanban_worker_contract.py     |   3 -
+ .../test_kanban_create_skill_validation.py    | 180 ++++++++++++++++++
+ tools/kanban_tools.py                         |   7 +-
+ 8 files changed, 306 insertions(+), 25 deletions(-)
+ create mode 100644 hermes_cli/kanban_skill_check.py
+ create mode 100644 tests/hermes_cli/test_kanban_create_skill_validation.py
+
+diff --git a/cli.py b/cli.py
+index 375f42661d..698af35663 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1027,11 +1027,15 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin,
+         skills_prompt, loaded_skills, missing_skills = result
+         if missing_skills:
+             from agent.skill_commands import format_missing_skills
+-            # A typo'd name must not crash a kanban worker; only a fully-missing set fails loudly.
+-            if not loaded_skills:
++            from hermes_cli.kanban_skill_check import missing_pin_note
++            # A typo'd name must not crash a kanban worker: it starts with a note naming the missing pins
++            # (#119619). Outside a worker, a fully-missing set still fails loudly.
++            note = missing_pin_note(missing_skills)
++            if not loaded_skills and not note:
+                 raise ValueError(format_missing_skills(missing_skills))
+             logger.warning("Skipping %s. Continuing with: %s. List available skills with `hermes skills list`.",
+-                           format_missing_skills(missing_skills), ", ".join(loaded_skills))
++                           format_missing_skills(missing_skills), ", ".join(loaded_skills) or "no pinned skills")
++            skills_prompt = "\n\n".join(p for p in (skills_prompt, note) if p)
+         if skills_prompt:
+             self.system_prompt = "\n\n".join(p for p in (self.system_prompt, skills_prompt) if p).strip()
+         self.preloaded_skills += [name for name in loaded_skills if name not in self.preloaded_skills]
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index cf6dd8136c..5db8e2d376 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -430,6 +430,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_capabilities import CapabilityMismatchError
+         from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError
+         from hermes_cli.kanban_model_assignment import ModelProviderMismatchError
++        from hermes_cli.kanban_skill_check import UnknownSkillError
+         try:
+             task_id = kb.create_task(
+                 conn, title=args.title, body=body,
+@@ -452,11 +453,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 human_request=getattr(args, "human_request", None),
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+-                validate_workspace=True, runs_on=getattr(args, "runs_on", None),
++                validate_workspace=True, validate_skills=True, runs_on=getattr(args, "runs_on", None),
+             )
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
+-        except CapabilityMismatchError as exc:
++        except (CapabilityMismatchError, UnknownSkillError) as exc:
+             return _err(f"kanban: {exc.code}: {exc}", 2)
+         except (PinProviderUnresolvedError, ModelProviderMismatchError) as exc:
+             return _err(f"kanban: {exc}", 2)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 29adbf222c..05cbc633bc 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1214,7 +1214,7 @@ def create_task(
+     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
+     project_source_task_id: Optional[str] = None, creator_task_id: Optional[str] = None,
+     completion_contract: Optional[str] = None,
+-    validate_workspace: bool = False,
++    validate_workspace: bool = False, validate_skills: bool = False,
+     human_request: Optional[dict] = None,
+     origin_intent: Optional[dict] = None,
+     requires: Optional[list[str]] = None,
+@@ -1228,7 +1228,8 @@ def create_task(
+     ``validate_workspace=True`` (agent/CLI create surfaces) rejects a non-project
+     ``worktree`` workspace that could never resolve at spawn with
+     ``WorktreeWorkspaceConfigError`` naming the fix, instead of letting the
+-    dispatcher discover it later. [daveey] ``runs_on``: placement labels.
++    dispatcher discover it later. ``validate_skills=True`` rejects a pinned skill
++    the assignee cannot load (``UnknownSkillError``). [daveey] ``runs_on``: placement labels.
+ 
+     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
+     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
+@@ -1311,9 +1312,10 @@ def create_task(
+         from hermes_cli.kanban_db_workspace import (
+             WorktreeWorkspaceConfigError, worktree_workspace_problem,
+         )
+-        problem = worktree_workspace_problem(workspace_path, board=board)
+-        if problem:
++        if problem := worktree_workspace_problem(workspace_path, board=board):
+             raise WorktreeWorkspaceConfigError(problem)
++    from hermes_cli.kanban_skill_check import check_task_skills
++    check_task_skills(skills_list, assignee, enabled=validate_skills)
+ 
+     now = int(time.time())
+ 
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index ffe3f4612d..03a768fa19 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1215,8 +1215,8 @@ class _DeadWorker:
+     protocol_violation: bool = False
+     rate_limited: bool = False
+     terminal_provider: bool = False
+-    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
+-    credential/model — trips the breaker on this first occurrence."""
++    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's credential/model — trips at once."""
++    unknown_skill: bool = False  # died of ``Unknown skill(s)``: blocked as ``assignment`` at once [daveey]
+ 
+     @property
+     def run_outcome(self) -> str:
+@@ -1252,6 +1252,7 @@ def _classify_dead_worker(
+         if worker_output:
+             dead.error_text += f" Worker's last output: {worker_output!r}"
+             dead.event_payload["worker_output"] = worker_output
++            dead.unknown_skill = dead.kind == "nonzero_exit" and "Unknown skill(s):" in worker_output
+     return dead
+ 
+ 
+@@ -1459,11 +1460,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                     "protocol_violation_limit": violation_limit,
+                 },
+             )
+-        elif dead.terminal_provider:
+-            # A retry cannot heal a revoked credential or a missing model, so
+-            # the whole ``failure_limit`` budget would be spent on identical
+-            # failures. ``force_trip`` blocks now, sticky: ``recompute_ready``
+-            # must not auto-resume it before the operator fixes the provider.
++        elif dead.terminal_provider or dead.unknown_skill:
++            # No retry heals a revoked credential, a gone model or a missing pinned skill: block now, sticky.
+             tripped = _record_task_failure(
+                 conn, tid,
+                 error=error_text,
+@@ -1471,7 +1469,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                 force_trip=True,
+                 release_claim=False,
+                 end_run=False,
+-                event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
++                event_payload_extra={"pid": pid, "claimer": claimer,
++                                     "unknown_skill" if dead.unknown_skill else "terminal_provider": True},
++                block_kind="assignment" if dead.unknown_skill else "transient",
+             )
+         else:
+             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+@@ -1540,7 +1540,7 @@ def _record_task_failure(
+     release_claim: bool = False,
+     end_run: bool = False,
+     event_payload_extra: Optional[dict] = None,
+-    infrastructure: bool = False,
++    infrastructure: bool = False, block_kind: str = "transient",
+ ) -> bool:
+     """Record a non-success outcome and maybe trip the circuit breaker; every
+     non-success path funnels through here so ``consecutive_failures`` stays
+@@ -1614,15 +1614,15 @@ def _record_task_failure(
+         # Spawn path (release_claim) is still running and also clears claim
+         # state; the timeout/crash path already did.
+         conn.execute(
+-            "UPDATE tasks SET status = 'triage', block_kind = 'transient', human_request = NULL, "
++            "UPDATE tasks SET status = 'triage', block_kind = ?, human_request = NULL, "
+             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                if release_claim else "")
+             + "consecutive_failures = ?, last_failure_error = ? "
+             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+-            (failures, error, task_id),
++            (block_kind, failures, error, task_id),
+         )
+         payload = {
+-            "kind": "transient",
++            "kind": block_kind,
+             "reason_code": "worker_failures_exhausted",
+             "failures": failures,
+             "effective_limit": effective_limit,
+diff --git a/hermes_cli/kanban_skill_check.py b/hermes_cli/kanban_skill_check.py
+new file mode 100644
+index 0000000000..1dd7481db5
+--- /dev/null
++++ b/hermes_cli/kanban_skill_check.py
+@@ -0,0 +1,92 @@
++"""Create-time check of a card's pinned skills against the ASSIGNEE profile. [daveey]
++
++A pinned skill the assignee cannot load used to be accepted at create time and only fail when the
++worker started (``Error: Unknown skill(s): x``), after which the dispatcher retried a run that could
++never succeed. The check uses the worker's own lookup (``build_preloaded_skills_prompt``: same name
++normalization, disabled list and external dirs) under the assignee's home, so "refused here" and
++"missing in the worker" are the same answer.
++"""
++
++from __future__ import annotations
++
++import difflib
++from typing import Iterable, Optional
++
++
++class UnknownSkillError(ValueError):
++    """A create refused because the assignee profile cannot load a pinned skill."""
++
++    code = "unknown_skill"
++
++    def __init__(self, message: str, *, assignee: str, missing: list[str], suggestions: dict[str, list[str]]):
++        super().__init__(message)
++        self.assignee, self.missing, self.suggestions = assignee, missing, suggestions
++
++
++def _assignee_home(assignee: str) -> Optional[str]:
++    """The home the dispatcher would run the assignee's worker under, or None when it has none
++    (an unknown assignee is the assignment checks' problem, not this one's)."""
++    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
++    try:
++        return resolve_profile_env(normalize_profile_name(assignee))
++    except (FileNotFoundError, ValueError, OSError):
++        return None
++
++
++def _unresolved(skills: list[str], home: str) -> tuple[list[str], list[str]]:
++    """(missing labels, loadable names) for *skills* as a worker under *home* would see them."""
++    from agent.skill_commands import build_preloaded_skills_prompt
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    from tools.skills_tool import _find_all_skills
++    token = set_hermes_home_override(home)
++    try:
++        _prompt, _loaded, missing = build_preloaded_skills_prompt(skills)
++        names = [s["name"] for s in _find_all_skills()] if missing else []
++    finally:
++        reset_hermes_home_override(token)
++    return missing, names
++
++
++def missing_pin_note(missing: list[str]) -> str:
++    """The prompt note a dispatcher-owned kanban worker starts with when pinned skills did not load,
++    or "" outside such a worker (an interactive ``hermes -s typo`` keeps failing loudly). Exiting
++    instead only made the dispatcher retry a run that could never load them (#119619)."""
++    import os
++
++    from agent.delegation_context import is_dispatcher_owned_worker_context
++    if not missing or not os.environ.get("HERMES_KANBAN_TASK") or not is_dispatcher_owned_worker_context():
++        return ""
++    from agent.skill_commands import format_missing_skills
++    return (f"[Kanban: this card pins skills this profile could not load ({format_missing_skills(missing)}). "
++            "Work without them if the task allows it; if it cannot be done without them, call kanban_block "
++            "with kind='assignment' naming the missing skill.]")
++
++
++def check_task_skills(skills: Optional[Iterable[str]], assignee: Optional[str], *, enabled: bool = True) -> None:
++    """Raise :class:`UnknownSkillError` when *assignee* (unset: the default ready assignee) cannot
++    load one of *skills*. ``enabled=False`` is a no-op (internal creates that skip the check).
++
++    Plugin-qualified names (``plugin:skill``) are left to the worker: they resolve through the
++    plugin registry of the worker's own process, which this process may not have loaded.
++    """
++    names = [s for s in (skills or ()) if s and ":" not in s]
++    if not enabled or not names:
++        return
++    if not assignee:
++        from hermes_cli.kanban_db import _default_ready_assignee
++        assignee = _default_ready_assignee()
++    home = _assignee_home(assignee)
++    if home is None:
++        return
++    missing, available = _unresolved(names, home)
++    if not missing:
++        return
++    from agent.skill_commands import format_missing_skills
++    suggestions = {m: difflib.get_close_matches(m, available, n=3, cutoff=0.6) for m in missing}
++    hints = "; ".join(f"{m!r}: did you mean {', '.join(s)}?" for m, s in suggestions.items() if s)
++    raise UnknownSkillError(
++        f"{format_missing_skills(missing)} for assignee profile {assignee!r}: its worker could not load "
++        f"{'it' if len(missing) == 1 else 'them'}." + (f" {hints}" if hints else "")
++        + " Fix the name (`hermes -p <assignee> skills list`), drop it, or assign a profile that has it. "
++          "Nothing was created.",
++        assignee=assignee, missing=missing, suggestions=suggestions)
+diff --git a/tests/e2e/core/kanban/test_kanban_worker_contract.py b/tests/e2e/core/kanban/test_kanban_worker_contract.py
+index b6d8d1d924..e7dc953d45 100644
+--- a/tests/e2e/core/kanban/test_kanban_worker_contract.py
++++ b/tests/e2e/core/kanban/test_kanban_worker_contract.py
+@@ -31,9 +31,6 @@ pytestmark = [
+ KNOWN: dict[str, tuple[str, str]] = {
+     "outside": (r"card done with its declared outside-workspace artifact never attached",
+                 "#120647 kanban_complete artifact outside the workspace is silently never attached"),
+-    "test_worker_with_unresolvable_pinned_skill_still_starts_its_session": (
+-        r"worker died before its session \(exits=",
+-        "#119619 dispatcher-owned worker with a stale --skill pin exits rc=1 before its session"),
+ }
+ 
+ _TASK_RE = re.compile(r"work kanban task (t_[0-9a-f]+)")
+diff --git a/tests/hermes_cli/test_kanban_create_skill_validation.py b/tests/hermes_cli/test_kanban_create_skill_validation.py
+new file mode 100644
+index 0000000000..0fec51d361
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_create_skill_validation.py
+@@ -0,0 +1,180 @@
++"""Kanban cards pinned to a skill the assignee cannot load. [daveey]
++
++A card created with ``skills=["x"]`` used to be accepted, then every worker died at start
++with ``Error: Unknown skill(s): x`` and the dispatcher retried it as a crash (escalating the
++retry model) until the breaker gave up. Contracts:
++
++* create time (kanban_create tool and ``hermes kanban create``) refuses a name the ASSIGNEE
++  profile cannot load, with close matches, and creates nothing;
++* a dispatcher-owned worker whose pins are all missing still starts its session (#119619);
++* a worker that does die of ``Unknown skill(s)`` is parked as an ``assignment`` block on the
++  first death, never retried.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++_SESSION_ENV = ("HERMES_SESSION_KEY", "HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD")
++
++
++def _write_skill(skills_root: Path, name: str) -> None:
++    d = skills_root / "testing" / name
++    d.mkdir(parents=True)
++    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: test skill {name}\n---\n\n# {name}\nBody.\n",
++                                encoding="utf-8")
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in _SESSION_ENV:
++        monkeypatch.delenv(var, raising=False)
++    _write_skill(home / "skills", "real-skill")
++    other = home / "profiles" / "other"
++    (other / "skills").mkdir(parents=True)
++    (other / "config.yaml").write_text("{}\n", encoding="utf-8")
++    _write_skill(other / "skills", "other-only")
++    kb.init_db()
++    return home
++
++
++def _count() -> int:
++    with kbc.connect_closing() as conn:
++        return len(kb.list_tasks(conn))
++
++
++def _tool_create(**args) -> dict:
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_create({"title": "skill card", **args}))
++
++
++def _cli_create(*argv: str) -> int:
++    from hermes_cli import kanban as kc
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    return kc._cmd_create(root.parse_args(["kanban", "create", "skill card", *argv]))
++
++
++# create time: tool path ----------------------------------------------------------------------
++
++
++def test_tool_refuses_unknown_skill_and_creates_nothing(board):
++    out = _tool_create(assignee="default", skills=["x"])
++    assert "error" in out, out
++    assert out.get("code") == "unknown_skill", out
++    assert "x" in out["error"] and "default" in out["error"], out
++    assert _count() == 0
++
++
++def test_tool_names_close_matches(board):
++    out = _tool_create(assignee="default", skills=["real-skil"])
++    assert out.get("code") == "unknown_skill", out
++    assert "real-skill" in out["error"], out
++
++
++def test_tool_accepts_a_skill_the_assignee_has(board):
++    out = _tool_create(assignee="default", skills=["real-skill"])
++    assert out.get("ok"), out
++    assert _count() == 1
++
++
++def test_tool_checks_the_assignee_profile_not_the_caller(board):
++    assert _tool_create(assignee="default", skills=["other-only"]).get("code") == "unknown_skill"
++    out = _tool_create(assignee="other", skills=["other-only"])
++    assert out.get("ok"), out
++    assert _count() == 1
++
++
++# create time: CLI path -----------------------------------------------------------------------
++
++
++def test_cli_refuses_unknown_skill_and_creates_nothing(board, capsys):
++    rc = _cli_create("--assignee", "default", "--skill", "x")
++    assert rc == 2
++    assert "Unknown skill" in capsys.readouterr().err
++    assert _count() == 0
++
++
++def test_cli_accepts_a_real_skill(board):
++    assert _cli_create("--assignee", "default", "--skill", "real-skill") == 0
++    assert _count() == 1
++
++
++# start time: a stale pin must not kill a dispatcher-owned worker (#119619) ---------------------
++
++
++class _DummyCLI:
++    def __init__(self):
++        self.session_id = "s"
++        self.system_prompt = "base prompt"
++        self.preloaded_skills = []
++        self._preload_skills_thread = None
++
++
++def _finalize(cli_obj, result):
++    import threading
++
++    import cli as cli_mod
++    cli_obj._preload_skills_result = result
++    cli_obj._preload_skills_thread = threading.Thread(target=lambda: None)
++    cli_obj._preload_skills_thread.start()
++    return cli_mod.HermesCLI.__dict__["finalize_preloaded_skills"](cli_obj)
++
++
++def test_kanban_worker_with_all_pins_missing_still_starts(monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
++    cli_obj = _DummyCLI()
++    _finalize(cli_obj, ("", [], ["x"]))  # must not raise
++    assert "x" in cli_obj.system_prompt and "base prompt" in cli_obj.system_prompt
++
++
++def test_interactive_session_with_all_pins_missing_still_fails_loudly(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    with pytest.raises(ValueError, match=r"Unknown skill\(s\): x"):
++        _finalize(_DummyCLI(), ("", [], ["x"]))
++
++
++# dispatcher: an Unknown-skill death is an assignment block, not a retry ------------------------
++
++
++def test_unknown_skill_exit_blocks_as_assignment_without_retry(board, monkeypatch):
++    import hermes_cli.kanban_db as _kb
++
++    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    with kbc.connect() as conn:
++        host = _kb._claimer_id().split(":", 1)[0]
++        tid = kb.create_task(conn, title="stale pin", assignee="default", max_retries=5)
++        kb.claim_task(conn, tid, claimer=f"{host}:w0")
++        pid = 72000
++        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
++        conn.commit()
++        log = _kb.worker_log_path(tid)
++        log.parent.mkdir(parents=True, exist_ok=True)
++        log.write_text("Error: Unknown skill(s): x\n", encoding="utf-8")
++        kbd._record_worker_exit(pid, 1 << 8)
++
++        assert tid in kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "triage", task.status
++        assert task.block_kind == "assignment", task.block_kind
++        assert task.consecutive_failures == 1
++        gave_up = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)).fetchone()
++        assert json.loads(gave_up["payload"])["unknown_skill"] is True
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, tid).status == "triage"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 5dce102229..5d4bb01841 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -230,6 +230,11 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                     return tool_error(str(e), code=e.code)
+                 if isinstance(e, CapabilityMismatchError):
+                     return tool_error(str(e), code=e.code, assignee=e.assignee, missing=e.missing)
++                from hermes_cli.kanban_skill_check import UnknownSkillError
++                if isinstance(e, UnknownSkillError):  # the worker could never load it: refuse, don't create [daveey]
++                    return tool_error(str(e), code=e.code, rejection="invalid_args", assignee=e.assignee,
++                                      unknown_skills=e.missing, suggestions=e.suggestions)
++
+                 if not isinstance(e, ValueError):
+                     logger.exception(f"{tool_name} failed")
+                 if classify_rejections:
+@@ -1657,7 +1662,7 @@ def _handle_create(args: dict, **kw) -> str:
+             origin_intent=origin_intent,
+             # Reject a worktree path the dispatcher could never resolve now, to the
+             # creator, instead of burning spawn retries on it later. [daveey]
+-            validate_workspace=True)
++            validate_workspace=True, validate_skills=True)
+         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+-- 
+2.55.0
+

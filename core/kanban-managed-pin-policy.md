@@ -79,3 +79,5 @@ so the context lines match this series.
 ## plugin?
 
 No. The check must run inside `kanban_db.create_task` and the dispatcher's guard, which plugins cannot wrap.
+
+Skill pins are a separate check: [kanban-skill-pin-validation.md](kanban-skill-pin-validation.md) (0681).

@@ -47,6 +47,19 @@ def test_ready_when_a_newer_build_exists(repo):
     assert s["state"] == "ready" and s["commits"] == 2 and s["can_restart"]
 
 
+def test_ready_for_the_newer_head_an_older_build_serves(repo):
+    """The updater keeps a build of next-1 for next-2 when next-2 changes no desktop input."""
+    root, home, running, ahead, app = repo
+    older = _git(root, "rev-parse", f"{ahead}~1")
+    _write(home, status="ready", sha=older, serves_sha=ahead, app_path=str(app), waiter_cmd=["true"])
+    s = core.status(home, checkout=root)
+    assert s["state"] == "ready" and s["sha"] == ahead and s["commits"] == 2
+    _write(home, status="ready", sha=running, serves_sha=ahead, app_path=str(app), waiter_cmd=["true"])
+    assert core.status(home, checkout=root)["state"] == "ready"  # built from what runs, serving next-2
+    _write(home, status="building", sha=older, serves_sha=ahead, pid=1, updated_at="2099-01-01T00:00:00+00:00")
+    assert core.status(home, checkout=root)["sha"] == older  # only a ready build serves another head
+
+
 def test_building_and_failed_are_reported_for_newer_shas(repo):
     root, home, _running, ahead, _app = repo
     _write(home, status="building", sha=ahead, pid=1, updated_at="2099-01-01T00:00:00+00:00")

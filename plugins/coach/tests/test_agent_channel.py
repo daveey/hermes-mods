@@ -491,6 +491,80 @@ def test_plan_first_execute_code_first_edit_and_session_cap(tmp_path, code_templ
     assert len([r for r in log if r.get("rule") == "plan_first"]) == 1
 
 
+# Faithful reduction of the incident call (session 20261028_000322_b6a7ab): a dict of files written in a loop under a
+# literal repo root, so every path is `R + <loop variable>`.
+INCIDENT_CODE = '''from hermes_tools import write_file
+R="{root}/"
+files={{
+"todo/__init__.py":'"""Tiny command-line todo app backed by a JSON file."""\\n\\n__version__ = "0.1.0"\\n',
+"todo/__main__.py":'import sys\\n\\nfrom todo.cli import main\\n\\nsys.exit(main())\\n',
+}}
+for k,v in files.items(): print(k, write_file(R+k, v).get("error"))
+'''
+
+DYNAMIC_TAIL_SHAPES = [
+    INCIDENT_CODE,
+    "from hermes_tools import write_file\nR = {root!r}\nfor k in ['a.py', 'b.py']:\n    write_file(R + '/' + k, 'x')",
+    "from hermes_tools import write_file\nimport os\nfor k in names():\n    write_file(os.path.join({root!r}, k), 'x')",
+    "from hermes_tools import write_file\nimport os\nwrite_file(os.path.join({root!r}, 'a.py'), 'x')",
+    "from hermes_tools import write_file\nimport os.path as osp\nB = osp.expanduser({tilde!r})\nwrite_file(B + '/a.py', 'x')",
+    "from hermes_tools import write_file\nfrom pathlib import Path\nB = Path({root!r})\nfor k in names():\n"
+    "    write_file(str(B / k), 'x')",
+    "from hermes_tools import write_file\nfrom pathlib import Path\nwrite_file(str(Path({tilde!r}).expanduser() / 'a.py'), 'x')",
+    "from hermes_tools import write_file\nR = {root!r}\nfor k in names():\n    write_file(f'{{R}}/{{k}}', 'x')",
+    "from hermes_tools import write_file\nfor p in [{root!r} + '/a.py', {root!r} + '/b.py']:\n    write_file(p, 'x')",
+    "from hermes_tools import patch\nimport os\nfor k in names():\n    patch(path=os.path.join({root!r}, k), old_string='a', new_string='b')",
+]
+
+
+@pytest.mark.parametrize("code_template", DYNAMIC_TAIL_SHAPES)
+def test_plan_first_execute_code_classifies_dynamic_paths_by_known_prefix(tmp_path, code_template):
+    """The incident shape and the os.path.join / expanduser / Path / f-string / literal-loop shapes fire once."""
+    root = Path.home() / "plan-first-probe-coach-test"  # outside scratch; never created, nothing is executed
+    code = code_template.format(root=str(root), tilde="~/plan-first-probe-coach-test")
+    assert rules.is_file_change("execute_code", {"code": code})
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    out = _edit(hooks, "execute_code", {"code": code})
+    assert out and "Plan Before You Build" in json.loads(out)["coach_hint"]
+    assert _edit(hooks, "execute_code", {"code": code}) is None
+    log = [json.loads(line) for line in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert len([r for r in log if r.get("rule") == "plan_first"]) == 1
+
+
+@pytest.mark.parametrize("code_template", DYNAMIC_TAIL_SHAPES + [
+    "from hermes_tools import write_file\nimport os\nfor k in names():\n    write_file(os.environ['TMPDIR'] + '/' + k, 'x')",
+    "from hermes_tools import write_file\nimport os\nfor k in names():\n"
+    "    write_file(os.path.join(os.getenv('TMPDIR'), k), 'x')",
+])
+def test_plan_first_execute_code_scratch_prefix_with_dynamic_tail_is_quiet(tmp_path, code_template):
+    """The same shapes rooted in scratch (custom root or $TMPDIR) plus a loop variable must not fire."""
+    root = tmp_path / "scratch" / "probe"
+    code = code_template.format(root=str(root), tilde=str(root))
+    assert not rules.is_file_change("execute_code", {"code": code})
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    assert _edit(hooks, "execute_code", {"code": code}) is None
+
+
+def test_plan_first_execute_code_tmp_literal_prefix_loop_is_quiet(tmp_path, monkeypatch):
+    monkeypatch.delenv("COACH_SCRATCH_ROOTS")
+    code = "from hermes_tools import write_file\nR = '/tmp/'\nfor k in names():\n    write_file(R + k, 'x')"
+    assert not rules.is_file_change("execute_code", {"code": code})
+
+
+def test_plan_first_execute_code_verbatim_incident_call(tmp_path):
+    """The exact execute_code call from session 20261028_000322_b6a7ab (writes into ~/plan-first-probe)."""
+    code = (Path(__file__).parent / "fixtures" / "plan_first_execute_code_incident.py.txt").read_text()
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    out = _edit(hooks, "execute_code", {"code": code})
+    assert out and "Plan Before You Build" in json.loads(out)["coach_hint"]
+    assert _edit(hooks, "execute_code", {"code": code}) is None
+    log = [json.loads(line) for line in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert len([r for r in log if r.get("rule") == "plan_first"]) == 1
+
+
 @pytest.mark.parametrize("kind", ["custom", "tmpdir", "cache", "plans"])
 def test_plan_first_execute_code_scratch_exemptions(tmp_path, monkeypatch, kind):
     if kind in ("cache", "plans"):

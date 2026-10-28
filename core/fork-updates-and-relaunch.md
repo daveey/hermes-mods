@@ -18,6 +18,7 @@ and you work in Desktop.
 | 0012 | `hermes serve --stop` / `hermes dashboard --stop` skip Desktop-owned backends | none, always on |
 | 0016 | no "Switch to This device?" dialog when the local runtime is installed | none, always on |
 | 0066 | `hermes update` swaps in a desktop app you prebuilt from the new HEAD instead of packing it | env `HERMES_DESKTOP_PREBUILT_APP` (unset) |
+| 0672 | The update keeps (or swaps in) a desktop app stamped with an ancestor of HEAD when no desktop input changed since that commit | always on |
 
 ## The fork workflow
 
@@ -384,15 +385,15 @@ pushes before calling `hermes update`. You lose the off-tree merge and the confl
 can add UI but can't remove an existing confirmation dialog, so it has to stay a core patch.
 
 
-## Prebuilt desktop app (0066)
+## Prebuilt desktop app (0066, 0672)
 
 **Behavior.** With `HERMES_DESKTOP_PREBUILT_APP=<path to Hermes.app>` in its environment, `hermes update`'s desktop
 step installs that bundle instead of running `npm run build` + electron-builder, which takes a few minutes. That
 makes an update cheap to apply at the moment you choose, for example right after Desktop quits.
 
 **How it works.** `install_prebuilt_desktop_app` in `hermes_cli/main_desktop.py` checks the bundle against the
-same bar `_packaged_desktop_current_for_head` uses: the baked `install-stamp.json` commit is the new HEAD, the
-renderer is intact, node-pty is present, and the build receipt (`scripts/build/freshness.mjs`) matches this
+same bar `_packaged_desktop_current_for_head` uses: the baked `install-stamp.json` commit is the new HEAD (or, with
+0672, an ancestor of HEAD that no desktop input changed since), the renderer is intact, node-pty is present, and the build receipt (`scripts/build/freshness.mjs`) matches this
 checkout's desktop inputs. It must also pass `codesign --verify --deep --strict` and must not downgrade the live
 app's signing team. It is then copied (`ditto`) into a staging dir and promoted with the existing stage-and-swap
 (`_swap_staged_desktop_app`). Any mismatch prints `Prebuilt desktop app not used (<reason>)` and the normal build
@@ -408,6 +409,20 @@ content-hashed, so a bundle built in another checkout at the same commit is acce
 `install_prebuilt_desktop_app`), `hermes_cli/source_build.py::_build_desktop_product`. Tests are in
 `tests/hermes_cli/test_source_build.py` (`-k prebuilt`): a match swaps in with no npm call; a wrong commit, a failed
 signature, or no env var each builds.
+
+**Unchanged ancestors (0672).** Most new heads touch no desktop input, so the app a fresh pack would produce differs
+only in the commit its stamp names. `_stamp_commit_serves_head` accepts a stamp commit that is HEAD, or an ancestor of
+HEAD where `git diff --quiet <stamp> HEAD -- DESKTOP_SOURCE_INPUT_PATHS` holds (the same input list as
+`sourceHash('desktop')` in `scripts/build/freshness.mjs`; a test keeps the two equal). Both the prebuilt check and
+`_packaged_desktop_current_for_head` use it, so an "Already up to date" re-run or the next update with no desktop
+change keeps the installed app, and `hermes desktop` launch (`_desktop_build_needed`, receipt only) does not rebuild.
+bundle-skew and bundle-swap already accept such an app. hermes-sync's core-prebuild uses this: a skipped head is
+recorded as `serves_sha` in `state.json` and the old build is handed to `hermes update` for it, with no later pack.
+Tests (`tests/hermes_cli/test_source_build.py`): `test_update_swaps_in_a_prebuilt_from_an_ancestor_with_unchanged_desktop_inputs`
+(installed, then the real HEAD gate and the launch gate keep it and a re-entered update does not build),
+`test_update_builds_when_a_desktop_input_changed_since_the_prebuilt_commit` (apps/desktop, apps/shared,
+package-lock.json each refused), `test_packaged_desktop_is_reused_only_while_it_names_head` (unrelated history refused),
+`test_desktop_input_paths_mirror_the_desktop_source_hash`.
 
 **Plugin?** No. The desktop build step has no plugin hook. The companion
 [core-update](../plugins/core-update/) plugin only shows the state.

@@ -61,3 +61,17 @@ Core: the block/schedule transitions, create preflight and the dispatcher tick a
 **0561** is a lint fix (ruff FURB167/RUF100 and Windows-footgun rules) in `kanban_awaiting.py`, `kanban_capability_registry.py`, `kanban_capability_routing.py` and `tests/cron/test_cron_model_provider_pairing.py`; no behavior change. **0567** adds `hub_cli_path()` (configured value, then `PATH`, then `~/.local/bin`) and routing's `_hub_cli` uses it; see [kanban-default-placement.md](kanban-default-placement.md).
 
 **0593** (source `a2c2b3eba8`), test-only: the capability-routing fixture drops PATH entries that contain a real `hermes-hub`, so `hub_cli_path()` assertions do not depend on the host having the client installed (`test_replay_t5bc8e125_block_opens_macbook_owner_card_and_parks`). The same commit lets the real-home guard read the checkout's sibling `manifest.json`; that exemption is covered in [kanban-origin-ownership-snapshot.md](kanban-origin-ownership-snapshot.md).
+
+## Follow-up patch (0686)
+
+**0686** (`41a1d7ce4d`): `owner_status()` used to read the owner card id only from `result['task']`. An applied create that came back as `{"output": <hermes kanban create --json text>}` (clipped, so often not valid JSON) made the wait-check exit 2 `done without a task id` and wake the waiting card even though the owner card was done.
+
+`owner_task_id` reads, in order: `task`, `task_id`, `id`, then `output`'s JSON `id` / `task_id`, then the first `"id": "t_…"` in the output text. rc 2 only when none of those holds an id.
+
+Tests in `tests/hermes_cli/test_kanban_capability_routing.py`:
+
+- `test_owner_status_reads_the_owner_id_from_every_applier_shape`
+- `test_owner_status_without_any_id_is_cannot_tell`
+- `test_woken_card_needing_another_gateway_is_claimed_here_once_its_owner_is_done`
+
+This mirror did not re-run that file. A live hermes-hub applier returning a clipped `output` is untested; the tests feed the shapes directly.
