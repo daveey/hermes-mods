@@ -9,6 +9,12 @@ Hermes backend"; this names the code that held it.
 
 Config: ``HERMES_LOOP_WATCH=off`` disables; ``HERMES_LOOP_WATCH=all`` also watches non-serve
 processes; ``HERMES_LOOP_WATCH_STALL_S`` (default 1.0) sets the stall threshold.
+
+It also wraps the serve app with a slow-request tracer (reqtrace.py): a request that waits >= 1 s for
+its response start has its asyncio await chain sampled; if it answers after >= 2 s
+(``HERMES_LOOP_WATCH_SLOW_S``; 0 disables) it gets one ``loop-watch: slow request …`` line and a
+``kind: slow_request`` report in the same jsonl. That covers the case a stall can't: the loop is
+responsive but the request is parked on an await (executor queue, lock, child task).
 """
 
 from __future__ import annotations
@@ -48,6 +54,14 @@ def _stall_s(env=None) -> float:
         return watch.STALL_S
 
 
+def _slow_s(env=None) -> float:
+    env = os.environ if env is None else env
+    try:
+        return float(env.get("HERMES_LOOP_WATCH_SLOW_S", 2.0))
+    except ValueError:
+        return 2.0
+
+
 def register(ctx) -> None:
     if not wanted():
         return
@@ -56,4 +70,4 @@ def register(ctx) -> None:
         home = Path(get_hermes_home())
     except Exception:  # noqa: BLE001
         home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    watch.start(home, stall_s=_stall_s())
+    watch.start(home, stall_s=_stall_s(), slow_s=_slow_s())

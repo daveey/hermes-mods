@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import sys
 import threading
 import time
 from pathlib import Path
@@ -108,3 +109,31 @@ def test_gate_serve_only_by_default():
     assert not lw.wanted({}, ["/x/hermes", "gateway", "run"])
     assert lw.wanted({"HERMES_LOOP_WATCH": "all"}, ["/x/hermes", "chat"])
     assert not lw.wanted({"HERMES_LOOP_WATCH": "off"}, ["-c", "serve"])
+
+
+def test_start_wires_request_tracer_into_serve_app(tmp_path, monkeypatch):
+    import types
+    from starlette.applications import Starlette
+
+    app = Starlette()
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", types.SimpleNamespace(app=app))
+    trace = watch._install_reqtrace(tmp_path, 2.0)
+    assert trace is not None
+    assert getattr(app.middleware_stack, "__loop_watch_traced__", False)
+    assert watch._install_reqtrace(tmp_path, 0) is None  # 0 disables
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", types.SimpleNamespace())
+    assert watch._install_reqtrace(tmp_path, 2.0) is None  # not a web server process
+
+
+def test_run_calls_on_tick():
+    lp = _Loop()
+    try:
+        w = watch.LoopWatch(lp.loop, lp.th.ident, sink=lambda r: None, stall_s=0.3, period_s=0.05)
+        ticks = []
+        w.on_tick = lambda: (ticks.append(1), w.stop.set() if len(ticks) >= 3 else None)
+        t = threading.Thread(target=w.run, daemon=True)
+        t.start()
+        t.join(3)
+        assert len(ticks) >= 3
+    finally:
+        lp.close()

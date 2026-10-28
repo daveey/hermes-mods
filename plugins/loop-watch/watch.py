@@ -70,6 +70,7 @@ class LoopWatch:
         self.clock, self.frames = clock, frames
         self.stop = threading.Event()
         self.reports = 0
+        self.on_tick: Optional[Callable[[], None]] = None
 
     def _names(self) -> dict:
         return {t.ident: t.name for t in threading.enumerate()}
@@ -120,6 +121,11 @@ class LoopWatch:
 
     def run(self) -> None:
         while not self.stop.is_set():
+            if self.on_tick is not None:
+                try:
+                    self.on_tick()
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("loop-watch tick failed: %s", exc)
             try:
                 rep = self.check_once()
             except Exception as exc:  # noqa: BLE001 - a watcher must never take the process down
@@ -166,7 +172,42 @@ def default_sink(path: Path) -> Callable[[dict], None]:
 _STARTED_ATTR = "_hermes_loop_watch_started"
 
 
-def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.0) -> Optional[threading.Thread]:
+def _reqtrace_mod():
+    try:
+        from . import reqtrace  # type: ignore[attr-defined]
+        return reqtrace
+    except ImportError:
+        import importlib.util
+        mod = sys.modules.get("loop_watch_reqtrace")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location("loop_watch_reqtrace", Path(__file__).with_name("reqtrace.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules["loop_watch_reqtrace"] = mod
+        return mod
+
+
+def _install_reqtrace(home: Path, slow_s: Optional[float]):
+    """Wrap the serve process's FastAPI app with the slow-request tracer. None when not a web server."""
+    if slow_s is None or slow_s <= 0:
+        return None
+    ws = sys.modules.get("hermes_cli.web_server")
+    app = getattr(ws, "app", None) if ws is not None else None
+    if app is None:
+        return None
+    try:
+        rt = _reqtrace_mod()
+        trace = rt.ReqTrace(sink=rt.default_sink(home / "logs" / "loop-watch.jsonl"), slow_s=slow_s)
+        if rt.install_on_app(app, trace):
+            log.info("loop-watch: tracing requests slower than %.1fs", slow_s)
+            return trace
+    except Exception as exc:  # noqa: BLE001
+        log.info("loop-watch: request tracer not installed: %s", exc)
+    return None
+
+
+def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.0,
+          slow_s: Optional[float] = 2.0) -> Optional[threading.Thread]:
     """Start the watcher once per process. Waits (in its own thread) for the main-thread loop."""
     if getattr(sys, _STARTED_ATTR, False):
         return None
@@ -184,7 +225,11 @@ def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.
             log.info("loop-watch: no running main-thread event loop; not watching")
             return
         log.info("loop-watch: watching event loop of pid %d (stall >= %.1fs)", os.getpid(), stall_s)
-        LoopWatch(loop, getattr(loop, "_thread_id"), sink=sink, stall_s=stall_s).run()
+        lw = LoopWatch(loop, getattr(loop, "_thread_id"), sink=sink, stall_s=stall_s)
+        trace = _install_reqtrace(home, slow_s)
+        if trace is not None:
+            lw.on_tick = lambda: trace.tick(loop)
+        lw.run()
 
     th = threading.Thread(target=body, name="loop-watch", daemon=True)
     th.start()
