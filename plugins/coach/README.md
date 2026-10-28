@@ -390,7 +390,7 @@ Replay evals:
 - `eval/selfheal_replay.py`: per-turn catch rate / precision on a hand-labeled set (`--mode admission` for the audit).
 The real sets hold your own words, so they live in the private coach data repo.
 
-### Self-heal lane (`self_heal.py file_defect` → investigation → Inbox proposal → Do it → fix)
+### Self-heal lane (`self_heal.py file_defect` → investigation → proposal → auto-approve → fix → Inbox "Fixed:")
 
 Every new fingerprint (first time that UTC day) goes to `file_defect(d)`, from any entry path: the two hooks above
 (complaint, admission, turn-end machine signal), the digest backstop, and direct callers (machine-signal sweepers,
@@ -423,13 +423,20 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
 - **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
   hermes-mods-repo (Baby Bear: board `bb`, five-whys + bb-self-fix). Its brief makes it investigate live, with a
   per-component checklist (Kanban events/runs, surface writer + backing state, processes/launchd/logs, git log), write
-  the five-whys chain, and post ONE Inbox card of type `selfheal` (key `selfheal:<fp>`): **What happened** (symptom,
-  PT time, `@session` link, quote), **Why** (the chain with evidence), **Plan** (changes, regression test, detection
-  guard, live check), cost/risk, undo. It never ships the fix. Not a defect → `event not_defect`, no Inbox card.
-- **Do it** resolves the Inbox card; the hub cron (every 5 min) sees the outcome and runs `file_fix` (also `self_heal.py fix <fp>` by hand): fix card `selfheal:<fp>:fix` whose acceptance is the
-  regression test red before / green after, ship under the standing approval, verify live, and re-post the same key
-  as a `selfheal-result` card "Fixed: …" with the proof (OK / Undo). **Not now** snoozes the fingerprint 14 days,
-  **Never** suppresses it. (Do it is not a Kanban `task` action because a worker is fenced from creating cards via the CLI.)
+  the five-whys chain, and write `coach/selfheal/<fp>/proposal.md`: **What happened** (symptom, PT time, `@session`
+  link, quote), **Why** (the chain with evidence), **Plan** (changes, regression test, detection guard, live check),
+  cost/risk, undo; then `event proposed`. It posts nothing to the Inbox and never ships the fix. Not a defect →
+  `event not_defect`.
+- **Auto-approve** (default; `auto_approve` in `selfheal-config.json`, env `COACH_SELFHEAL_AUTO_APPROVE`): the hub
+  cron (every 5 min) runs `file_fix` for every `proposed` fingerprint (also `self_heal.py fix <fp>` by hand): fix
+  card `selfheal:<fp>:fix` whose acceptance is the regression test red before / green after, ship under the standing
+  approval, verify live, and post the key `selfheal:<fp>` as a `selfheal-result` card "Fixed: …" with the proof
+  (OK / Undo). That result is the only self-heal card in the Inbox. A legacy open `selfheal` proposal card is resolved
+  as Do it by the same pass; an explicit Not now / Never on it is still honoured. Budget/concurrency denials leave the
+  fingerprint `proposed`, so the next pass retries.
+- **`auto_approve: false`**: proposals wait in `proposed` until `self_heal.py fix <fp>`; Inbox outcomes on an existing
+  `selfheal` card still decide (**Do it** → fix card, **Not now** snoozes 14 days, **Never** suppresses). (Do it is
+  not a Kanban `task` action because a worker is fenced from creating cards via the CLI.)
 - **Recurrence**: a fixed fingerprint that comes back files `selfheal:<fp>:r<n>`, whose brief says "previous fix <id>
   didn't hold" and requires a detection-level guard.
 - **Budget**: engine_budget lane `selfheal` ($200/UTC day, its own cap outside the $20 engine total; spend = these

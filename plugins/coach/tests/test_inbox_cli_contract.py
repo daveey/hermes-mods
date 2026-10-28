@@ -17,11 +17,15 @@ spec.loader.exec_module(sh)
 
 
 def briefs():
-    return [sh.investigation_brief({"fingerprint": "desktop-12345678"}),
-            sh.fix_brief("desktop-12345678", {})]
+    # Only the fix brief posts (the "Fixed:" result); proposals are auto-approved and never reach the Inbox.
+    return [sh.fix_brief("desktop-12345678", {})]
 
 
-@pytest.mark.parametrize("index", [0, 1], ids=["investigation", "fix"])
+def test_investigation_brief_runs_no_inbox_command():
+    assert not re.findall(r"`([^`]*hermes inbox[^`]*)`", sh.investigation_brief({"fingerprint": "desktop-12345678"}))
+
+
+@pytest.mark.parametrize("index", [0], ids=["fix"])
 def test_post_and_preflight_pin_the_lane_home(index):
     text = briefs()[index]
     commands = re.findall(r"`([^`]*hermes inbox[^`]*)`", text)
@@ -34,7 +38,7 @@ def test_post_and_preflight_pin_the_lane_home(index):
 
 
 @pytest.mark.skipif(not shutil.which("hermes"), reason="installed Hermes CLI required")
-@pytest.mark.parametrize("index", [0, 1], ids=["investigation", "fix"])
+@pytest.mark.parametrize("index", [0], ids=["fix"])
 def test_real_generated_preflight_with_contaminated_home(tmp_path, index):
     # Real discovery, not an import of inbox.register or a mocked subprocess. Never posts data.
     text = briefs()[index]

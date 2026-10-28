@@ -94,9 +94,10 @@ def test_shadow_logs_would_file_with_full_card_args_and_creates_nothing(store):
     assert a["idempotency_key"] == f"selfheal:{w['fingerprint']}" and a["model"] == "claude-opus-5-5"
     assert a["max_runtime"] == 3600 and a["skills"] == ["five-whys", "hermes-mods-repo"]
     assert a["created_by"] == "self-heal" and a["board"] is None
-    for part in ("What happened", "Why", "Plan", "Undo", "hermes inbox post --type selfheal", "@session:",
+    for part in ("What happened", "Why", "Plan", "Undo", "event proposed", "@session:",
                  "i think the sort is broken", "LIVE", "C10"):
         assert part in a["body"], part
+    assert "hermes inbox post" not in a["body"]  # proposals never reach the Inbox (auto-approved)
     assert not sh.LaneState(store.root).read()  # shadow leaves no lane state
 
 
@@ -641,7 +642,7 @@ def test_sync_do_it_backstop_not_now_and_never(store):
                   f"selfheal:{b}": {"state": "resolved", "outcome": "not_now"},
                   f"selfheal:{c}": {"state": "resolved", "outcome": "never"}}
     fixed = []
-    done = dict(sh.sync(store, runner=r, now=NOW + 500,
+    done = dict(sh.sync(store, runner=r, now=NOW + 500, auto=False,
                         fixer=lambda fp, **kw: fixed.append(fp) or {**sh.file_fix(fp, budget_fn=OPEN, **kw),
                                                                      "card": "t_fix"}))
     assert fixed == [a] and done[a] == "do_it -> t_fix" and done[b] == "not_now" and done[c] == "never"
@@ -658,7 +659,62 @@ def test_sync_do_it_backstop_not_now_and_never(store):
                           now=later, cfg=HUB, budget_fn=OPEN)
     assert back["action"] == "filed" and back["key"].endswith(":r2")
     # acted once: a second sync pass does nothing
-    assert sh.sync(store, runner=r, now=NOW + 600, fixer=lambda fp, **kw: fixed.append(fp) or {}) == []
+    assert sh.sync(store, runner=r, now=NOW + 600, auto=False, fixer=lambda fp, **kw: fixed.append(fp) or {}) == []
+
+
+# ── auto-approve (default): no proposal reaches the Inbox; only the "Fixed:" result does ──
+def test_auto_approve_files_the_fix_with_no_inbox_decision(store, monkeypatch):
+    monkeypatch.delenv("COACH_SELFHEAL_AUTO_APPROVE", raising=False)
+    monkeypatch.setattr(sh, "coach_root", lambda: Path(store.root))
+    r = Runner()
+    fp = proposed(store, r)
+    assert sh.auto_approve({}) is True
+    done = dict(sh.sync(store, runner=r, now=NOW + 500,
+                        fixer=lambda fp, **kw: sh.file_fix(fp, budget_fn=OPEN, **kw)))
+    assert done[fp].startswith("auto -> t_")
+    st = sh.LaneState(store.root).get(fp)
+    assert st["status"] == "approved" and opt(r.creates()[-1], "--idempotency-key") == f"selfheal:{fp}:fix"
+    (a,) = ev(store, "selfheal_approved")
+    assert a["trigger"] == "auto"
+    assert not [c for c, _ in r.calls if c[:3] == ["hermes", "inbox", "act"]]  # nothing open to resolve
+    assert sh.sync(store, runner=r, now=NOW + 600, fixer=lambda fp, **kw: 1 / 0) == []  # acted once
+
+
+def test_auto_approve_resolves_an_open_legacy_proposal_and_respects_not_now(store):
+    r = Runner()
+    a = proposed(store, r)
+    b = proposed(store, r, defect("kanban", "card parked without reason"))
+    r.outcomes = {f"selfheal:{a}": {"state": "open", "outcome": None, "session_id": "20261028_000000_aaaaaa"},
+                  f"selfheal:{b}": {"state": "resolved", "outcome": "not_now"}}
+    fixed = []
+    done = dict(sh.sync(store, runner=r, now=NOW + 500, auto=True,
+                        fixer=lambda fp, **kw: fixed.append((fp, kw["trigger"])) or {"card": "t_fix"}))
+    assert fixed == [(a, "auto")] and done[a] == "auto -> t_fix" and done[b] == "not_now"
+    acts = [c for c, _ in r.calls if c[:3] == ["hermes", "inbox", "act"]]
+    assert acts == [["hermes", "inbox", "act", "20261028_000000_aaaaaa", "do_it"]]
+
+
+def test_auto_approve_ignores_an_earlier_generations_decision(store):
+    b = Board()
+    fp, ids = lifecycle(store, b, ["file", "proposed", "declined", "file", "proposed"])
+    b.outcomes = {f"selfheal:{fp}": {"state": "resolved", "outcome": "not_now", "at": NOW + 600}}  # gen 1's card
+    done = dict(sh.sync(store, runner=b, now=NOW + 30 * 86400, auto=True,
+                        fixer=lambda fp, **kw: sh.file_fix(fp, budget_fn=OPEN, **kw)))
+    assert done[fp].startswith("auto -> t_") and len(b.creates()) == 3
+
+
+def test_auto_approve_config_and_env(monkeypatch):
+    monkeypatch.delenv("COACH_SELFHEAL_AUTO_APPROVE", raising=False)
+    assert sh.auto_approve({}) and not sh.auto_approve({"auto_approve": False})
+    monkeypatch.setenv("COACH_SELFHEAL_AUTO_APPROVE", "0")
+    assert not sh.auto_approve({"auto_approve": True})
+
+
+def test_investigation_brief_posts_nothing_to_the_inbox():
+    b = sh.investigation_brief({"fingerprint": "fp1", "component": "agent", "symptom": "x", "at": NOW})
+    assert "hermes inbox post" not in b and "Post NOTHING to the Inbox" in b and "event proposed" in b
+    fx = sh.fix_brief("agent-0123456789", {"component": "agent"})
+    assert "--type selfheal-result" in fx and "Do it" not in fx
 
 
 def test_not_a_defect_closes_without_inbox_and_is_not_refiled_for_a_week(store):
@@ -817,7 +873,7 @@ def test_sync_ignores_an_earlier_generations_decision_on_the_same_inbox_key(stor
     b = Board()
     fp, ids = lifecycle(store, b, ["file", "proposed", "declined", "file", "proposed"])
     b.outcomes = {f"selfheal:{fp}": {"state": "resolved", "outcome": "do_it", "at": NOW + 600}}  # gen 1's card
-    assert sh.sync(store, runner=b, now=NOW + 30 * 86400) == []
+    assert sh.sync(store, runner=b, now=NOW + 30 * 86400, auto=False) == []
     assert len(b.creates()) == 2
 
 

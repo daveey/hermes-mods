@@ -602,7 +602,8 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
-# Lane: defect -> investigation card (hub) -> ONE Inbox proposal (What happened / Why / Plan) -> Do it -> fix card
+# Lane: defect -> investigation card (hub) -> proposal file (What happened / Why / Plan) -> auto-approve -> fix card
+#       -> ONE Inbox card "Fixed: ..." (selfheal-result). auto_approve false restores the Inbox proposal + Do it gate.
 #
 #   file_defect(d)    any entry path (complaint, admission, machine signal, digest backstop, monitors). On the hub it
 #                     decides locally; elsewhere (live) it pipes `d` to `self_heal.py file` on the hub over ssh, so
@@ -786,12 +787,13 @@ def investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[
     if previous:
         rec = (f"\n## Recurrence\nThis fingerprint was fixed before by card {previous.get('fix_card') or '?'} "
                f"({_pt(previous.get('fixed_at') or 0)}). The previous fix {previous.get('fix_card') or ''} didn't "
-               "hold. Say so in the Inbox card's first line, find why the earlier fix and its test didn't catch the "
+               "hold. Say so in the proposal's first line, find why the earlier fix and its test didn't catch the "
                "return (five-whys step 5), and the Plan MUST add a detection-level guard (test, assertion, alert or "
                "gate) that fails if it comes back.\n")
     proposal = f"~/.hermes/coach/selfheal/{fp}/proposal.md"
-    return f"""Self-heal investigation for defect `{fp}`. Nothing here needs a human; David's approval of this lane
-covers the investigation. You do NOT ship the fix: you post ONE Inbox proposal, and his Do it starts the fix card.
+    return f"""Self-heal investigation for defect `{fp}`. Nothing here needs a human; David's standing approval of this
+lane covers the investigation AND the fix. You do NOT ship the fix yourself: you write the proposal, and the lane's
+next pass auto-approves it and starts the fix card. Post NOTHING to the Inbox (David only wants finished fixes there).
 Budget for this card <= ${INVESTIGATION_BUDGET}.
 
 ## Evidence (from the detector)
@@ -828,14 +830,9 @@ Budget for this card <= ${INVESTIGATION_BUDGET}.
    **Why**: the five-whys chain, one line per why, each with its evidence.
    **Plan**: the exact changes (files/skills/config), the regression test (fails before, passes after), the
    detection guard, and what gets verified live after shipping.
-   **Cost / risk**, then **Undo**: how to revert.
-   The lane posts to the default home on this host, not a diagnostic HERMES_HOME exported by a test.
-   Preflight immediately before posting: `env HERMES_HOME="$HOME/.hermes" hermes inbox post --help`.
-   If it fails, repair CLI discovery or use the inbox_post tool; do not record proposed until posting succeeds.
-   Do not pipe the post through tail/grep: preserve its exit status. Verify the returned session/key with
-   inbox_outcome before recording the event. Then post it (one card; a re-post of the same key updates it):
-   `env HERMES_HOME="$HOME/.hermes" hermes inbox post --type {INBOX_TYPE} --field fp={fp} --key selfheal:{fp} --poster "self-heal" --body - "<one-line title: what is broken>" < {proposal}`
-   and record it: `python3 {SELF} event proposed {fp} --card $HERMES_KANBAN_TASK`.
+   **Cost / risk**, then **Undo**: how to revert. The first line is a one-line title: what is broken.
+   Do NOT post it to the Inbox. Record it: `python3 {SELF} event proposed {fp} --card $HERMES_KANBAN_TASK`
+   (the lane auto-approves it within 5 minutes and files the fix card from this proposal).
 5. Complete this card with the proposal's first line as the summary. Do not start the fix.
 """
 
@@ -852,7 +849,8 @@ def fix_brief(fp: str, st: dict) -> str:
             "Ship it under David's standing merge/deploy approval: hermes-mods commit + push (pre-commit hook, never "
             "--no-verify), core changes through a hermes-core-wt worktree + ship, settings through shared-config.json "
             "(hermes-mods-repo skill).")
-    return f"""Self-heal FIX for defect `{fp}`. David pressed Do it on the Inbox proposal below: that is the approval.
+    return f"""Self-heal FIX for defect `{fp}`. The proposal below is approved (David's standing self-heal approval;
+the lane auto-approves every proposal). The Inbox card you post at the end is the first thing David sees of it.
 Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGET}.
 
 ## Approved proposal
@@ -1835,20 +1833,44 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
     return done
 
 
-def sync(store=None, runner=None, now: Optional[float] = None, fixer: Optional[Callable] = None) -> list:
-    """Act once on each proposal's Inbox outcome: do_it (backstop for the Do-it task), not_now (snooze), never
+def auto_approve(cfg: Optional[dict] = None) -> bool:
+    """Every proposal is approved without a human (David's standing approval): `auto_approve` in
+    selfheal-config.json, env COACH_SELFHEAL_AUTO_APPROVE=0/1 overrides; default on."""
+    env = os.environ.get("COACH_SELFHEAL_AUTO_APPROVE", "").strip().lower()
+    if env:
+        return env not in ("0", "false", "off", "no")
+    cfg = lane_config() if cfg is None else cfg
+    return bool(cfg.get("auto_approve", True))
+
+
+def sync(store=None, runner=None, now: Optional[float] = None, fixer: Optional[Callable] = None,
+         auto: Optional[bool] = None) -> list:
+    """Act once on each proposal. Auto-approve (default): every `proposed` fingerprint gets its fix card unless an
+    Inbox decision of this generation said Not now / Never; an open legacy proposal card is resolved as Do it so it
+    leaves the Inbox. Manual (auto_approve false): the Inbox outcome decides: do_it, not_now (snooze), never
     (suppress). Returns [(fp, what)]."""
     store = _store(store)
     now = now or time.time()
+    auto = auto_approve() if auto is None else auto
     lane = LaneState(store.root)
     done = reconcile(store, runner, now)
     for fp, st in lane.read().items():
         if st.get("status") != "proposed":
             continue
         o = inbox_outcome(fp, runner)
-        if not o or o.get("state") == "open":
+        stale = bool(o) and (o.get("at") or now) < (st.get("filed_at") or 0)  # an earlier generation's decision
+        undecided = not o or o.get("state") == "open" or stale
+        if auto and (undecided or o.get("outcome") == "do_it"):
+            if o and o.get("state") == "open" and not stale and o.get("session_id"):
+                try:  # take the legacy proposal card out of the Inbox
+                    _run(["hermes", "inbox", "act", str(o["session_id"]), "do_it"], runner)
+                except Exception as exc:
+                    store.log({"event": "selfheal_inbox_resolve_error", "fingerprint": fp, "error": str(exc)[:200]})
+            how = "do_it" if (o and not stale and o.get("outcome") == "do_it") else "auto"
+            r = (fixer or file_fix)(fp, store=store, runner=runner, now=now, trigger=how)
+            done.append((fp, f"{how} -> {r.get('card') or r.get('why')}"))
             continue
-        if (o.get("at") or now) < (st.get("filed_at") or 0):  # an earlier generation's decision on the same key
+        if undecided:
             continue
         what = o.get("outcome")
         if what == "do_it":
