@@ -150,6 +150,14 @@ def test_core_interrupt_placeholder_reply_is_still_interrupted():
         assert hit and hit["kind"] == "interrupted" and hit["fingerprint"] == "gateway-a8b8d01aa4", reply
 
 
+def test_finished_reply_quoting_a_placeholder_is_not_interrupted():
+    # live check 20261028_082017_634f4b: the agent grepped core and quoted the match in its finished reply
+    for reply in ('It found 1 match, on line 64: `content = f"[Turn stopped by {label} before it finished.]"`.',
+                  "Not a real incident: the detector misread 'Operation interrupted: waiting for model response'.",
+                  "**Self-heal flags finished turns** when a log mentions turn lease lost."):
+        assert sh.machine_signal(reply, ["-> terminal(grep -rn x)"]) is None, reply
+
+
 def test_resume_note_user_turn_files_backend_stopped_signal():
     note = ("[System note: Your previous turn was interrupted mid-run — the app or its backend process stopped "
             "before the turn could finish. Some of the work may already be complete; check the current state "

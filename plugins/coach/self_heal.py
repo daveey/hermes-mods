@@ -60,11 +60,12 @@ ACK_RE = re.compile(
 # replay's telemetry (api_err / interrupted / repeat): a provider error reply, an interrupted turn, or the same tool
 # error three times in one turn.
 API_ERR_RE = re.compile(r"not processed|API call failed|provider error|rate limit(?:ed)? .{0,40}(?:retry|exhaust)", re.I)
-# Core's interrupt placeholders, matched in the REPLY only. The tool log carries every command's arguments (a grep
-# for "Turn stopped" is not an interruption) and errors of cancelled tools the agent recovered from, so it is read
-# only for a turn that produced no reply and ended on a cancelled tool (gateway-a8b8d01aa4).
-INTERRUPT_RE = re.compile(r"Operation interrupted|turn lease lost|Turn stopped by|"
-                          r"turn stopped while a tool result was still pending", re.I)
+# Core's interrupt placeholders, matched at the START of the reply only (core writes them as the whole reply; a
+# finished reply that quotes one mid-sentence is not an interruption). The tool log carries every command's arguments
+# (a grep for "Turn stopped" is not an interruption) and errors of cancelled tools the agent recovered from, so it is
+# read only for a turn that produced no reply and ended on a cancelled tool (gateway-a8b8d01aa4).
+INTERRUPT_RE = re.compile(r"^[\W_]{0,8}(?:No reply:\s*)?(?:Operation interrupted|(?:Session )?turn lease lost|"
+                          r"Turn stopped by|the turn stopped while a tool result was still pending)", re.I)
 CANCEL_LINE_RE = re.compile(r"^\s*<-\s*ERROR\b.*(?:Tool execution cancelled|Operation interrupted|turn lease lost)",
                             re.I)
 # Core's crash-recovery note (tui_gateway/session_history.py _AUTO_CONTINUE_NOTE_PREFIX): the next user turn after a

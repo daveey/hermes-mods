@@ -391,7 +391,7 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   counts a fix/root-cause request for a Hermes defect the agent's own message described, and a product problem the
   agent's own work caused; Hermes itself is never a `product_bug`. Outside-world problems (`kind: external`) never count.
 - **Turn end** (`post_llm_call`): machine signals first, no judge (a provider-error reply, an interrupted turn, one
-  tool error repeated 3×). "Interrupted" is read from the reply only (core's placeholders: `Operation interrupted`,
+  tool error repeated 3×). "Interrupted" is read from the start of the reply only (core's placeholders: `Operation interrupted`,
   `turn lease lost`, `Turn stopped by`, `the turn stopped while a tool result was still pending`); the tool log counts
   only for an empty reply whose last line is a cancelled tool, since its `-> tool(args)` lines carry command text.
   A backend that stops mid-turn never reaches this hook: the next user turn, core's `[System note: Your previous turn
