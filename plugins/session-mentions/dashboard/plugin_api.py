@@ -2,7 +2,8 @@
                                                     -> {"requests": [...]}  (claims the ones this courier may serve)
 POST /api/plugins/session-mentions/result  {id, result}  -> {"ok": true}
 GET  /api/plugins/session-mentions/ping    -> {"ok": true, "home_courier": bool, "forwarding": true, "targeting": true,
-                                                "device": "<this machine's courier name>", "aliases": [...]}
+                                                "device": "<this machine's courier name>", "aliases": [...],
+                                                "gateway": "<hermes-hub registry name, '' if none>"}
 POST /api/plugins/session-mentions/enqueue {request}     -> {"ok": bool}  (forwarded by another Desktop)
 GET  /api/plugins/session-mentions/status/{id}           -> {"state": pending|claimed|done|unknown, "result"?}
 POST /api/plugins/session-mentions/cancel  {id}          -> {"ok": bool}  (only while unclaimed)
@@ -47,7 +48,8 @@ def _rf():
 async def ping() -> Dict[str, Any]:
     rf = _rf()
     info = rf.device_info() if hasattr(rf, "device_info") else {}
-    return {"ok": True, "home_courier": bool(rf.home_courier_alive()), "forwarding": True, "targeting": True, **info}
+    return {"ok": True, "home_courier": bool(rf.home_courier_alive()), "forwarding": True, "targeting": True,
+            "gateway": "", **info}
 
 
 @router.get("/outbox")

@@ -110,7 +110,20 @@ def device_info() -> dict:
         pass
     host = norm_name(socket.gethostname().split(".")[0])
     device = norm_name(configured) or host or "this-device"
-    return {"device": device, "aliases": sorted({device, host} - {""})}
+    # `gateway` rides here (not only in /ping) because /ping is mounted once per backend while this
+    # file hot-reloads: a running backend's old ping spreads device_info() and so reports it too.
+    return {"device": device, "aliases": sorted({device, host} - {""}), "gateway": gateway_name()}
+
+
+def gateway_name() -> str:
+    """This gateway's hermes-hub registry name (``self_gateway()``), slugged; '' when unknown.
+    Hermes writes cross-gateway links with it (``@task:default@hub/t_..``), and a Desktop may know
+    the gateway under another connection label (``hub-ec2``), so /ping reports it for the courier."""
+    try:
+        from hermes_cli.kanban_capability_registry import self_gateway  # type: ignore
+        return norm_name(self_gateway())
+    except Exception:
+        return ""
 
 
 def safe_id(raw: Any) -> str:

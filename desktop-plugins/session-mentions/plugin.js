@@ -103,18 +103,49 @@ export function score(row, query) {
 
 let connCache = { at: 0, rows: [] }
 
-export function gatewayKeys(conns, device = null) {
+export function gatewayKeys(conns, device = null, registry = {}) {
   // Prefer the slugged label (`nous-1`); fall back to the id when labels collide. This Mac's own
   // connection (kind local, labelled "This device" on EVERY Mac) is keyed by its device name
   // (`macbook`) once known: a `@this-device` ref handed to an agent on a shared gateway names
   // whichever Desktop happens to drain it.
+  // `registry` maps connection id -> that gateway's hermes-hub registry name (its /ping `gateway`).
+  // Hermes writes cross-gateway links with it (`@task:default@hub/t_..` for the `hub-ec2`
+  // connection), so it is an extra alias; findGateway still prefers exact id/key/label matches.
   const name = c => (c.kind === 'local' && device?.device ? device.device : slug(c.label))
   const counts = new Map()
   for (const c of conns) counts.set(name(c), (counts.get(name(c)) || 0) + 1)
   return conns.map(c => {
     const key = name(c) && counts.get(name(c)) === 1 ? name(c) : c.id
-    return c.kind === 'local' && device?.device ? { ...c, key, device: device.device, aliases: device.aliases } : { ...c, key }
+    const own = slug(registry?.[c.id])
+    if (c.kind === 'local' && device?.device) {
+      return { ...c, key, device: device.device, aliases: [...new Set([...(device.aliases || []), ...(own ? [own] : [])])] }
+    }
+    return own ? { ...c, key, aliases: [own] } : { ...c, key }
   })
+}
+
+// Each gateway's registry name, from its own session-mentions /ping. A gateway without the agent
+// plugin (or the hub client) reports none; a failed ping keeps the last known name.
+const registryCache = new Map() // connection id -> { at, ttl, name }
+const REGISTRY_TTL_MS = 10 * STALE_MS
+const REGISTRY_RETRY_MS = 5 * STALE_MS
+
+function noteRegistryName(connectionId, ping) {
+  if (!ping) return
+  registryCache.set(connectionId, { at: Date.now(), ttl: REGISTRY_TTL_MS, name: slug(ping.gateway) })
+}
+
+async function registryNames(conns) {
+  await Promise.all(
+    conns.map(async c => {
+      const hit = registryCache.get(c.id)
+      if (hit && Date.now() - hit.at < hit.ttl) return
+      const ping = await api(c.id, `/api/plugins/${PLUGIN_ID}/ping`, { timeoutMs: 3_000 }).catch(() => null)
+      if (ping) noteRegistryName(c.id, ping)
+      else registryCache.set(c.id, { at: Date.now(), ttl: REGISTRY_RETRY_MS, name: hit?.name || '' })
+    })
+  )
+  return Object.fromEntries([...registryCache].filter(([, v]) => v.name).map(([id, v]) => [id, v.name]))
 }
 
 // This Mac's courier name, from its own backend's /ping (config `session_mentions.device_name`,
@@ -126,6 +157,7 @@ async function deviceInfo(conns) {
   const home = conns.find(c => c.kind === 'local')
   if (!home) return null
   const ping = await api(home.id, `/api/plugins/${PLUGIN_ID}/ping`, { timeoutMs: 8_000 }).catch(() => null)
+  noteRegistryName(home.id, ping)
   let device = slug(ping?.device)
   let aliases = (ping?.aliases || []).map(slug).filter(Boolean)
   if (!device && ping) {
@@ -160,7 +192,9 @@ async function connections(force = false) {
       .filter(r => r && r.id)
       .map(r => ({ id: String(r.id), label: String(r.label || r.name || r.id), kind: String(r.kind || ''), primary: !!r.primary }))
     const base = list.length ? list : FALLBACK_CONNS
-    connCache = { at: Date.now(), rows: gatewayKeys(base, await deviceInfo(base).catch(() => null)) }
+    const device = await deviceInfo(base).catch(() => null)
+    const registry = await registryNames(base).catch(() => ({}))
+    connCache = { at: Date.now(), rows: gatewayKeys(base, device, registry) }
   } catch {
     if (!connCache.rows.length) connCache = { at: Date.now(), rows: gatewayKeys(FALLBACK_CONNS) }
   }

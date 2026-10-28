@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import { test } from 'node:test'
-const source = await fs.readFile(process.env.HOME + '/.hermes/desktop-plugins/session-mentions/plugin.js', 'utf8')
+const source = await fs.readFile(new URL('../../../desktop-plugins/session-mentions/plugin.js', import.meta.url), 'utf8')
 Error.stackTraceLimit = 1
 async function load(host) {
  globalThis.__smHost = host

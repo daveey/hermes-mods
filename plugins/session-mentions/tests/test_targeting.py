@@ -107,10 +107,11 @@ def test_device_info_prefers_config_then_hostname(monkeypatch):
     import types
     monkeypatch.setitem(sys.modules, "hermes_cli.config", types.SimpleNamespace(load_config=lambda: {"session_mentions": {"device_name": "MacBook"}}))
     monkeypatch.setattr("socket.gethostname", lambda: "David-MBP.local")
-    assert rf.device_info() == {"device": "macbook", "aliases": ["david-mbp", "macbook"]}
+    monkeypatch.setattr(rf, "gateway_name", lambda: "")
+    assert rf.device_info() == {"device": "macbook", "aliases": ["david-mbp", "macbook"], "gateway": ""}
     monkeypatch.setitem(sys.modules, "hermes_cli.config", types.SimpleNamespace(load_config=lambda: {}))
     monkeypatch.delenv("HERMES_DEVICE_NAME", raising=False)
-    assert rf.device_info() == {"device": "david-mbp", "aliases": ["david-mbp"]}
+    assert rf.device_info() == {"device": "david-mbp", "aliases": ["david-mbp"], "gateway": ""}
 
 
 @pytest.fixture
@@ -183,3 +184,59 @@ def test_dashboard_routes_pass_courier_and_reach(tmp_path, monkeypatch):
     assert client.get("/outbox", params={"courier": "mac-mini", "aliases": "mac-mini", "reach": "macbook"}).json()["requests"] == []
     assert client.get("/outbox").json()["requests"] == []  # legacy drain doesn't steal it either
     assert [r["id"] for r in client.get("/outbox", params={"courier": "macbook", "reach": ""}).json()["requests"]] == ["for-mbp-2"]
+
+
+# Links Hermes writes for cards forwarded across gateways name the target by its hermes-hub
+# registry name (`@task:default@hub/t_..`), which can differ from the Desktop connection label
+# (`hub-ec2`). Each gateway reports that name on /ping; couriers add it to their reach.
+
+def _api(tmp_path, monkeypatch, gateway):
+    import types
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: tmp_path))
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_capability_registry",
+                        types.SimpleNamespace(self_gateway=lambda: gateway))
+    spec = importlib.util.spec_from_file_location("sm_api_gw", Path(__file__).resolve().parent.parent / "dashboard" / "plugin_api.py")
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)  # type: ignore[union-attr]
+    monkeypatch.delitem(sys.modules, "_session_mentions_relay_files", raising=False)
+    app = FastAPI()
+    app.include_router(api.router)
+    return TestClient(app)
+
+
+def test_ping_reports_the_gateways_registry_name(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    assert _api(tmp_path, monkeypatch, "Hub").get("/ping").json()["gateway"] == "hub"
+    # No registry name (hub client not installed): the field is empty, nothing breaks.
+    assert _api(tmp_path / "x", monkeypatch, None).get("/ping").json()["gateway"] == ""
+
+
+def test_gateway_name_survives_a_broken_registry(monkeypatch):
+    import types
+    def boom():
+        raise RuntimeError("no hub db")
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_capability_registry", types.SimpleNamespace(self_gateway=boom))
+    assert rf.gateway_name() == ""
+
+
+def test_request_routed_to_a_registry_name_is_claimed_by_the_courier_reaching_that_gateway(tmp_path, monkeypatch):
+    """`cross_task read @task:default@hub/t_..` on the MacBook: the MacBook Desktop (home) reaches the
+    hub connection labelled `hub-ec2`, whose /ping reports `hub`, so its reach carries both names.
+    The mini's Desktop also drains the MacBook gateway but is not connected to the hub."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    client = _api(tmp_path, monkeypatch, "macbook")
+    base = tmp_path / "session_mentions"
+    mbp = {"home": "1", "courier": "macbook", "aliases": "macbook,david-mbp", "reach": "hub,hub-ec2,mac-mini"}
+    mini = {"courier": "mac-mini", "aliases": "mac-mini", "reach": "macbook,nous-1"}
+    for q in (mbp, mini):
+        client.get("/outbox", params=q)  # both couriers registered
+    _req(base, "via-registry", rf.route_of_target("@task:default@hub/t_01a182b1a147aa45"))
+    _req(base, "via-label", rf.route_of_target("@task:default@hub-ec2/t_01a182b1a147aa45"))
+    _req(base, "for-mbp", rf.route_of_target("@session:default@macbook/20261028_072000_abcdef"))
+    assert client.get("/outbox", params=mini).json()["requests"] == []
+    got = [r["id"] for r in client.get("/outbox", params=mbp).json()["requests"]]
+    assert sorted(got) == ["for-mbp", "via-label", "via-registry"]

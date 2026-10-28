@@ -148,7 +148,8 @@ def test_real_kanban_db_gets_exactly_one_row(tmp_path, monkeypatch):
 
 def test_default_add_sub_refuses_a_task_this_board_does_not_own(monkeypatch, tmp_path):
     """enqueue() sees foreign worker cards; a refusal must not leave an orphan row in this DB."""
-    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    kb = pytest.importorskip("hermes_cli.kanban_db")  # needs the Hermes runtime, like the test above
+    kbc = pytest.importorskip("hermes_cli.kanban_db_connect")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with kbc.connect_closing() as conn:

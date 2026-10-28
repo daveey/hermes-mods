@@ -105,7 +105,11 @@ test('courier learns the device name from its own backend ping', async () => {
   const outbox = Object.fromEntries(paths.filter(([, p]) => p.includes('/outbox')).map(([c, p]) => [c, p]))
   assert.match(outbox.local, /outbox\?home=1&courier=macbook&/)
   assert.match(outbox['skint-polycentrism'], /outbox\?courier=macbook&/)
-  assert.deepEqual(paths.filter(([, p]) => p.endsWith('/ping')).map(([c]) => c), ['local'])
+  // The device name comes from the home backend's ping; every other gateway is pinged once too,
+  // only for its registry name (registry-names.test.mjs).
+  const pinged = paths.filter(([, p]) => p.endsWith('/ping')).map(([c]) => c)
+  assert.equal(pinged[0], 'local')
+  assert.deepEqual([...pinged].sort(), raw.map(c => c.id).sort())
 })
 
 test('backend predating targeting: the device name falls back to its hostname', async () => {
