@@ -555,3 +555,38 @@ def test_bare_exit_nonzero_still_files(home):
     _gw_rows(home, 60, tag="gateway.exit_nonzero")
     gw = kinds(sg.collect(home, {}, "mini", NOW), "gateway")
     assert len(gw) == 1 and "gateway.exit_nonzero" in gw[0]["symptom"]
+
+
+def _refused(home, off, alive=True, reason="already_running", owner=4242):
+    from datetime import datetime, timezone
+    row = {"ts": datetime.fromtimestamp(NOW - off, timezone.utc).isoformat(), "tag": "gateway.start_refused",
+           "level": "info", "pid": 300 + off, "reason": reason, "owner_pid": owner, "owner_alive": alive}
+    with open(home / "logs" / "gateway-exit-diag.log", "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def test_start_refused_next_to_live_gateway_is_not_a_defect(home):
+    """A second `gateway run` refused because a live gateway owns the home (MacBook, gateway-6efc15a270)."""
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _refused(home, 120)
+    _refused(home, 90, alive=None, reason="pid_claim", owner=None)  # runtime lock held: a live holder
+    assert kinds(sg.collect(home, {}, "macbook", NOW), "gateway") == []
+
+
+def test_start_refused_by_a_dead_owner_files(home):
+    """Refused by a pid that is not running: a stale record blocks every start, which is a defect."""
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _refused(home, 60, alive=False)
+    gw = kinds(sg.collect(home, {}, "macbook", NOW), "gateway")
+    assert len(gw) == 1
+    assert "start refused by a gateway that is not running" in gw[0]["symptom"]
+    assert "already_running" in gw[0]["symptom"]
+
+
+def test_signals_and_refused_starts_share_one_restart_storm(home):
+    """3+ bounces or refused starts within 10 min on one host+profile is a restart storm: one card."""
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _gw_rows(home, 400, 200)
+    _refused(home, 100)
+    gw = kinds(sg.collect(home, {}, "macbook", NOW), "gateway")
+    assert len(gw) == 1 and "restart storm" in gw[0]["symptom"]
