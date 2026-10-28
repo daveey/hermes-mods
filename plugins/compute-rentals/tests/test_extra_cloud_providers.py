@@ -1,5 +1,6 @@
 """Synthetic schema fixtures, NOT populated live observations."""
 import importlib
+import os
 import json
 import sys
 from pathlib import Path
@@ -162,7 +163,7 @@ def test_factories_are_lazy_and_broker_cache_is_process_only(monkeypatch):
     assert collector.collect() == collector.collect()
     assert len(calls) == 1
     argv, kw = calls[0]
-    assert argv[:4] == ['token-broker','exec','--scope','user/runpod']
+    assert os.path.basename(argv[0]) == 'token-broker' and argv[1:4] == ['exec','--scope','user/runpod']
     assert '--worker' in argv and kw['timeout'] == 70
 
 
@@ -192,3 +193,30 @@ def test_modal_refresh_deadline_retains_known_tasks():
     assert out['status'] == 'partial' and len(out['machines']) == 1
 
 
+
+
+def test_broker_worker_and_ssh_spawn_without_forking_the_backend(monkeypatch, tmp_path):
+    """fork() of a ~2 GB, ~170-thread Desktop backend held the GIL ~1.6 s per 20 s on inventory refreshes
+    (2026-10-27). With an absolute program, no cwd and close_fds=False, CPython starts the child with posix_spawn;
+    fork_exec is made to fail here so any fork path breaks the test."""
+    import subprocess
+    import sys
+    import providers.runpod as rp
+    from providers.common import command_json, spawn_argv
+
+    def no_fork(*a, **kw):
+        raise AssertionError('subprocess fell back to fork_exec')
+    monkeypatch.setattr(subprocess, '_fork_exec', no_fork)
+
+    class Echo(rp.BrokerCollector):
+        provider = 'runpod'
+        def worker_argv(self):  # the worker reaches providers/ through PYTHONPATH, not cwd
+            return [os.path.basename(sys.executable), '-c',
+                    'import json, providers.common; print(json.dumps({"provider": "runpod", "machines": []}))']
+    monkeypatch.setenv('PATH', os.path.dirname(sys.executable) + os.pathsep + os.environ.get('PATH', ''))
+    monkeypatch.chdir(tmp_path)  # not the plugin dir: imports must not depend on the backend's cwd
+    out = Echo().broker_collect()
+    assert out['provider'] == 'runpod' and out['machines'] == [] and not out.get('errors')
+
+    assert command_json([os.path.basename(sys.executable), '-c', 'print("{}")']) == {}
+    assert os.path.isabs(spawn_argv(['ssh', '-V'])[0]) or not __import__('shutil').which('ssh')

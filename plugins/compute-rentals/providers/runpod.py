@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import time
 from datetime import datetime, timezone
-from .common import machine, money, result
+from .common import machine, money, result, spawn_argv
 
 
 
@@ -88,9 +88,11 @@ class BrokerCollector:
         if self._cached is not None and time.monotonic() - self._at < 60:
             return copy.deepcopy(self._cached)
         try:
-            proc = subprocess.run(self.worker_argv(),
-                cwd=str(Path(__file__).resolve().parents[1]), capture_output=True,
-                text=True, timeout=70, check=False)
+            # PYTHONPATH, not cwd=, finds providers/: a cwd forces fork() (see spawn_argv).
+            plugin_dir = str(Path(__file__).resolve().parents[1])
+            pythonpath = os.pathsep.join(p for p in (plugin_dir, os.environ.get('PYTHONPATH')) if p)
+            proc = subprocess.run(spawn_argv(self.worker_argv()), env={**os.environ, 'PYTHONPATH': pythonpath},
+                capture_output=True, text=True, timeout=70, check=False, close_fds=False)
             if proc.returncode or len(proc.stdout) > 8_000_000:
                 raise ValueError()
             out = json.loads(proc.stdout)

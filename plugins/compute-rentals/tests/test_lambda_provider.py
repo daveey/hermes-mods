@@ -2,6 +2,7 @@
 response (2026-10, API v1) with ids, IPs, hostname, workspace, key names and Jupyter token scrubbed."""
 import copy
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,7 +105,7 @@ def test_worker_module_differs_from_provider_id_and_broker_scope(monkeypatch, tm
     collector = LambdaCollector()
     assert collector.collect() == collector.collect() and len(calls) == 1
     argv, kw = calls[0]
-    assert argv[:4] == ['token-broker', 'exec', '--scope', 'user/lambda']
+    assert os.path.basename(argv[0]) == 'token-broker' and argv[1:4] == ['exec', '--scope', 'user/lambda']
     assert argv[-3:] == ['-m', 'providers.lambdacloud', '--worker'] and kw['timeout'] == 70
 
 

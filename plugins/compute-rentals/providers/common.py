@@ -110,12 +110,26 @@ class HttpGet:
                 raise RuntimeError('HTTP read failed') from None
 
 
+def spawn_argv(argv):
+    """``argv`` with its program resolved to an absolute path, for ``subprocess`` with ``close_fds=False`` and no
+    ``cwd``. With all three, CPython on macOS starts the child with posix_spawn; otherwise it fork()s the whole
+    calling process while holding the GIL. Inside a Desktop backend (~2 GB, ~170 threads) each inventory refresh's
+    fork held the GIL ~1.6 s per 20 s (2026-10-27). Python opens fds non-inheritable, so ``close_fds=False`` passes
+    the child nothing but its stdio. [daveey]"""
+    argv = list(argv)
+    if argv and not os.path.dirname(argv[0]):
+        import shutil
+        argv[0] = shutil.which(argv[0]) or argv[0]
+    return argv
+
+
 def command_json(argv, timeout=40, env=None):
     """Bound stdout in memory; discard stderr without logging or disk spooling."""
     proc = None
     try:
         deadline = time.monotonic() + timeout
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+        proc = subprocess.Popen(spawn_argv(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                                close_fds=False)
         body = bytearray()
         with selectors.DefaultSelector() as selector:
             selector.register(proc.stdout, selectors.EVENT_READ)

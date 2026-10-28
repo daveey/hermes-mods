@@ -8,7 +8,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from .common import machine, now, result
+from .common import machine, now, result, spawn_argv
 
 # Load the core's canonical identity validator without depending on sys.path.
 _spec = importlib.util.spec_from_file_location('_internal_ownership', Path(__file__).resolve().parents[1] / 'ownership.py')
@@ -88,7 +88,7 @@ def ssh_read(host, command, timeout=15, byte_limit=2_000_000, *, config=None, ex
     target = cfg['user'] + '@' + host if cfg.get('user') else host
     argv = ['ssh', '-n', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
             '-o', 'StrictHostKeyChecking=yes', target, command]
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(spawn_argv(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=False)
     data = bytearray()
     deadline = time.monotonic() + timeout
     try:
