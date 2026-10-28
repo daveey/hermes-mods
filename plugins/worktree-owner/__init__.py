@@ -21,6 +21,7 @@ Log: ~/.hermes/logs/worktree-owner.log.
 """
 from __future__ import annotations
 
+import fnmatch
 import glob
 import re
 import sys
@@ -342,21 +343,44 @@ def _in_scratch(path: str, ws: str) -> bool:
 
 # Rebuildable caches: tools recreate them, so they never make a tree worth keeping. Any OTHER git-ignored file
 # (.env, notes, local data) still keeps the tree. Directories carrying the standard CACHEDIR.TAG count too
-# (https://bford.info/cachedir/: pytest, ruff, mypy, cargo and others write it).
+# (https://bford.info/cachedir/: pytest, ruff, mypy, cargo and others write it). A host can add repo-specific
+# build/test artifacts as globs in <HERMES_HOME>/worktree-owner.json `disposable_ignored` (matched against each
+# path component and each leading relative path, e.g. "test_durations.json", ".hermes/bin").
 CACHE_NAMES = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache", "node_modules"})
+DISPOSABLE_GLOBS = ("*.egg-info",)
 CACHEDIR_TAG = "CACHEDIR.TAG"
 
 
-def _is_cache_dir(p: str) -> bool:
-    return os.path.basename(p.rstrip("/")) in CACHE_NAMES or os.path.isfile(os.path.join(p, CACHEDIR_TAG))
+def _disposable_globs() -> tuple[str, ...]:
+    home = Path(os.environ.get('HERMES_HOME') or H / '.hermes')
+    try:
+        extra = json.loads((home / 'worktree-owner.json').read_text()).get('disposable_ignored') or []
+    except (OSError, ValueError, AttributeError):
+        extra = []
+    return DISPOSABLE_GLOBS + tuple(str(g) for g in extra if isinstance(g, str) and g.strip('/*'))
 
 
-def _is_cache_entry(path: str, rel: str) -> bool:
+def _named_disposable(rel: str, globs: tuple[str, ...]) -> bool:
+    parts = [x for x in rel.strip("/").split("/") if x]
+    for i, name in enumerate(parts):
+        prefix = "/".join(parts[:i + 1])
+        if name in CACHE_NAMES or any(fnmatch.fnmatch(name, g) or fnmatch.fnmatch(prefix, g.strip("/")) for g in globs):
+            return True
+    return False
+
+
+def _is_cache_dir(p: str, root: str = "", globs: tuple[str, ...] = ()) -> bool:
+    if os.path.basename(p.rstrip("/")) in CACHE_NAMES or os.path.isfile(os.path.join(p, CACHEDIR_TAG)):
+        return True
+    return bool(root and globs and _named_disposable(os.path.relpath(p, root), globs))
+
+
+def _is_cache_entry(path: str, rel: str, globs: tuple[str, ...] = ()) -> bool:
     """True if ignored entry *rel* (relative to tree *path*) is, or is inside, a rebuildable cache dir. A collapsed
     directory entry (`pkg/` holding only `__pycache__`) counts when every file under it is in a cache."""
-    parts = [x for x in rel.rstrip("/").split("/") if x]
-    if any(x in CACHE_NAMES for x in parts):
+    if _named_disposable(rel, globs):
         return True
+    parts = [x for x in rel.rstrip("/").split("/") if x]
     cur = path
     for x in parts:
         cur = os.path.join(cur, x)
@@ -365,8 +389,9 @@ def _is_cache_entry(path: str, rel: str) -> bool:
     if not (rel.endswith("/") and os.path.isdir(cur) and not os.path.islink(cur)):
         return False
     for root, dirs, files in os.walk(cur, followlinks=False):
-        dirs[:] = [d for d in dirs if not _is_cache_dir(os.path.join(root, d))]
-        if files or any(os.path.islink(os.path.join(root, d)) for d in dirs):
+        dirs[:] = [d for d in dirs if not _is_cache_dir(os.path.join(root, d), path, globs)]
+        if any(not _named_disposable(os.path.relpath(os.path.join(root, f), path), globs) for f in files) \
+                or any(os.path.islink(os.path.join(root, d)) for d in dirs):
             return False
     return True
 
@@ -374,24 +399,31 @@ def _is_cache_entry(path: str, rel: str) -> bool:
 def _complex_reason(path: str) -> str | None:
     if os.path.realpath(path) != os.path.abspath(path):
         return 'symlink target'
+    globs = _disposable_globs()
+    # Symlinks committed to the repo (mode 120000) are restored by any checkout: not data at risk.
+    staged_links = _git(path, 'ls-files', '-s', '-z')
+    if staged_links.returncode:
+        return 'unreadable index'
+    tracked_links = {e.split('\t', 1)[1] for e in staged_links.stdout.split('\0') if e.startswith('120000 ')}
     def fail(error):
         raise error
     for root, dirs, files in os.walk(path, onerror=fail, followlinks=False):
         for name in dirs + files:
             p = os.path.join(root, name)
-            if os.path.islink(p) or (name == '.git' and root != path):
-                return f'nested git or symlink: {os.path.relpath(p, path)}'
-            if not os.path.isdir(p) and not os.path.isfile(p):
-                return f'special file: {os.path.relpath(p, path)}'
+            rel = os.path.relpath(p, path)
+            if (os.path.islink(p) and rel not in tracked_links) or (name == '.git' and root != path):
+                return f'nested git or symlink: {rel}'
+            if not os.path.islink(p) and not os.path.isdir(p) and not os.path.isfile(p):
+                return f'special file: {rel}'
         # Don't descend into caches (node_modules/.bin is all symlinks); `git worktree remove` unlinks, never follows.
-        dirs[:] = [d for d in dirs if not _is_cache_dir(os.path.join(root, d))]
+        dirs[:] = [d for d in dirs if not _is_cache_dir(os.path.join(root, d), path, globs)]
     staged = _git(path, 'diff', '--cached', '--quiet', 'HEAD')
     if staged.returncode != 0:
         return 'staged changes or unreadable index'
     ignored = _git(path, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z')
     if ignored.returncode:
         return 'unreadable ignored-file listing'
-    real = [e for e in ignored.stdout.split('\0') if e and not _is_cache_entry(path, e)]
+    real = [e for e in ignored.stdout.split('\0') if e and not _is_cache_entry(path, e, globs)]
     if real:
         return 'ignored files: ' + ', '.join(real[:5]) + (f' (+{len(real) - 5} more)' if len(real) > 5 else '')
     return None

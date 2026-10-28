@@ -198,6 +198,31 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(self.tree.exists())
         self.assertEqual(result[0]['action'], 'kept: ignored files: scratch/')
 
+    def test_tracked_symlink_does_not_keep_tree(self):
+        # babybear commits AppIcon-1024.png as a symlink: a checkout restores it, so it is not data at risk
+        (self.tree / 'icon.png').symlink_to('a')
+        git(self.tree, 'add', 'icon.png'); git(self.tree, 'commit', '-qm', 'link')
+        git(self.tree, 'update-ref', 'refs/remotes/origin/topic', 'HEAD')
+        self.call(self.result)
+        self.assertFalse(self.tree.exists())
+
+    def test_host_disposable_globs(self):
+        # repo-specific build/test artifacts declared per host in <HERMES_HOME>/worktree-owner.json
+        home = self.root / 'hh'; home.mkdir()
+        (home / 'worktree-owner.json').write_text(json.dumps({'disposable_ignored': ['test_durations.json', '.hermes/bin']}))
+        self._commit_ignore(['test_durations.json', '.hermes/', 'pkg.egg-info/'])
+        (self.tree / 'test_durations.json').write_text('{}')
+        (self.tree / '.hermes/bin').mkdir(parents=True)
+        (self.tree / '.hermes/bin/hermes').write_text('#!/bin/sh')
+        (self.tree / 'pkg.egg-info').mkdir()
+        (self.tree / 'pkg.egg-info/PKG-INFO').write_text('x')
+        with patch.dict(os.environ, {'HERMES_HOME': str(home)}):
+            (self.tree / '.hermes/config.yaml').write_text('real: setting')  # outside the declared bin/
+            self.assertEqual(self.call(self.result)[0]['action'], 'kept: ignored files: .hermes/')
+            (self.tree / '.hermes/config.yaml').unlink()
+            self.call(self.result)
+        self.assertFalse(self.tree.exists())
+
     def test_tree_from_earlier_run_of_same_card_removed(self):
         # made in run 1, review/retry loop, card completes in run 3
         gd = Path(git(self.tree, 'rev-parse', '--absolute-git-dir').strip())
