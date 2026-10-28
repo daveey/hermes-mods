@@ -61,6 +61,16 @@ this user's agents can reach). A hit keeps the turn going with a nudge the user 
 | `unwatched` | the reply promises to continue after outside work finishes ("I'll write the report once the runs finish", "waiting on CI") and `wake_sources()` finds nothing armed: no live background process for the session or its compression ancestors, no open kanban card, no active goal, and no delegate/kanban/cron call this turn. A row like this gets painted done and its follow-up never runs | arm one `terminal(background=true, notify=true)` watcher on the real completion signal with a time cap (a kanban card for multi-hour work), or say plainly that the user owns the follow-up |
 | `report_only` | the reply describes or diagnoses a problem the agent could fix and ends there: no fix, no started fix (card, worker or PR this turn) and no concrete proposal ("Not fixed. No action is needed from you.", "relayed to the existing owner", an "Open:" list). An explicit scope limit in the user's ask ("analysis only", "just tell me why", "plan first", "don't change anything", "no edits", "read-only") drops it before the judge runs. Two-stage: the Sonnet screen at 0.75 hands the reply to a second opinion on claude-opus-5-5 (aux task `coach_report_only`, real tool arguments); only the second opinion nudges (see below) | fix it now if small or reversible; otherwise start it (`kanban_create` with acceptance criteria, linked to the chat) and name the card; if it really is the user's call, propose the exact fix |
 | `unverified` (off by default) | "done/fixed" with no check on the user's real path | verify on the user's path or say what's unchecked. With `diff_review` on it is also judged on turns that changed a git repo, and a hit there runs an Opus review of the diff (see Second opinions) |
+| `status_only` (deterministic, no AI call) | the user asks about progress or to finish ("why are we waiting", "what are you doing", "whats going on", "can you just finish it", "make the corrections") and this turn's tool calls were only card bookkeeping (`kanban_show`/`list`/`comment`/`unblock`, `cross_task`/`cross_session`, `hermes kanban ...`/`hermes-hub request ...` in a terminal) plus reads, and the reply's last 1,500 chars name no wall only the user can clear (billing, a sign-in, "only you") | do the next real step on the work now (edit, test, commit, merge, deploy, prove), or name the one specific wall; don't reopen, re-review or add another watcher card |
+
+`status_only` (defect agent-38a817308d, 2026-10-28): four replies in one chat said "reopened the card / verified
+**ready**" to "why are we waiting for 8h?" and similar asks while the chat's rollout card sat unstarted for 4 days, until
+the user wrote "can you just finish it please?". The report_only owner check counts exactly that bookkeeping
+(`kanban_show`, `cross_task`) as acting, and the judge scored none of the four. Any other tool call (patch, write_file,
+a git commit, a test run, `kanban_create`, `delegate_task`) counts as work and keeps it quiet, as does an explicit scope
+limit. It runs before the judge, logs `reply_nudge` with `rule=status_only`, and `COACH_REPLY_RULES` without it turns
+it off. Tests: `tests/test_status_only.py` (the four real asks and replies; their tool logs are rebuilt from what each
+reply says it did, because the coach digest keeps replies but not tool logs).
 
 Measured on 360 real replies against hindsight labels (the labeler also saw the user's next message). At
 threshold 0.7: `handoff` precision 0.91, recall 0.33; `confirm` precision 1.0 on 4 fires, recall 0.11. Held-out
@@ -269,6 +279,36 @@ Backtest on 313 real (reply → user) pairs against hindsight labels (the labele
 0.8: precision 0.84, recall 0.35. The old regex scored 0.47 / 0.15. Held-out fired only 3 times, so its 0.33
 says little; most of the disagreements were cases the hindsight labeler excused, like "it turned out to be the
 old GIF".
+
+### Stalled goals (`pre_llm_call`, `stalled_goal.py`)
+
+A chat's card graph can look busy while the card that delivers the user's result never moves: watcher, review and
+recovery cards spawn, comment and reschedule, and every supervisor checks that an owner is *alive*, not that the
+delivery card *moved*. Defect agent-38a817308d: the rollout card of a 5-card graph sat in `todo` for 4 days
+(Oct 23 to 28) while the chat's other cards started 168 runs.
+
+`stalled_goal.py` reads the board read-only. A chat's graph is every card with an unreleased chat link to the session
+(any `task_chat_links` kind) plus everything downstream of them (`task_links` children; not parents or siblings,
+because boards share parents and an undirected walk merges unrelated graphs). A delivery card is an open sink of
+that graph with at least one parent. It is stalled when its status is `todo`/`ready`/`triage`/`blocked`/`review`
+(not running, not `scheduled`, not a `needs_input`/`time` block, which are intended waits), its last status event and
+last run start are older than `COACH_STALLED_GOAL_HOURS` (default 24), and the graph's other cards started at least
+`COACH_STALLED_GOAL_RUNS` (default 20) runs since then.
+
+- **Hook.** On the next user turn of a linked chat (lineage-aware), `pre_llm_call` adds one context line naming the
+  card, its idle hours and the busy cards, and telling the agent to take the next step over itself or name the one
+  wall; it says not to reopen, re-review or add another watcher. One line per chat per incident (`card@since`), and
+  one Kanban comment per incident on the card (local boards only, in a background thread). Ledger:
+  `<coach root>/stalled_goal.json`; logged as `agent_hint` with `rule=stalled_goal`. Board reads are cached per chat
+  for 10 minutes. An idle chat gets it on its next turn (no push into an idle chat). `COACH_STALLED_GOAL=0` turns it
+  off; cron turns are skipped.
+- **CLI (read-only).** `python3 stalled_goal.py [--db PATH ...] [--replicas] [--session SID] [--now TS] [--json]`.
+  Without `--db` it scans this home's boards; `--replicas` adds `kanban/sync-shadow/*.db` (other gateways' boards).
+  `--comment` comments once per stall on boards this home owns.
+
+Measured 2026-10-28 on the hub (its own boards plus the MacBook replica): 8 distinct stalled delivery cards, among
+them this defect's rollout card (122 h, 168 runs by its own chat's cards). Tests: `tests/test_stalled_goal.py`, on the
+real graph's rows copied from the replica (`tests/fixtures/stalled_goal_balancer.json`, titles scrubbed).
 
 ### Second opinions that run (`second_opinion.py`)
 
@@ -601,6 +641,8 @@ Both calls fail open when coach isn't loaded.
 - `core.py`: the file store under `<HERMES_HOME>/coach/` (`sessions/<id>.json`, `bugs.jsonl`, `log.jsonl`), the gate, the user-rule evaluation, the briefs (spin-out's transcript reader + aux task `coach`) and stats.
 - `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the
   neutral reviewer prompt); `eval/second_opinion_replay.py` counts how often each would fire over `state.db`.
+- `stalled_goal.py`: the stalled-goal detector (a chat's delivery card idle while its graph spends runs), hook helper
+  and read-only CLI.
 - `curriculum.py` + `curriculum.yaml`: the tips (loading/overlay, live triggers, spacing, adoption read).
 - `dashboard/plugin_api.py`: `/state`, `/offer`, `/event`, `/restart`, `/board`, `/file-bug`, `/stats`.
 - `desktop-plugins/coach/plugin.js`: the panel. It checks after each finished turn, every 60 s while a turn runs, and on screenshot sends.
