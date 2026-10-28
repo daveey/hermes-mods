@@ -85,6 +85,18 @@ def _as_dict(result: Any) -> Optional[dict]:
     return None
 
 
+# A Kanban call refused because the board couldn't be read (core's "corrupt" refusal, PR #125's unreliable view).
+KANBAN_DB_DOWN = re.compile(r"Refusing to open corrupt kanban DB|attached to a deleted WAL/SHM generation"
+                            r"|integrity probe disagrees with an independent process|KanbanDbUnreliableViewError")
+
+
+def is_kanban_call(tool: str, args: Any) -> bool:
+    name = (tool or "").rsplit("__", 1)[-1]
+    if name == "tool_call":  # deferred kanban tools go through the tool_call bridge
+        return "kanban_" in json.dumps(args, default=str)
+    return name.startswith("kanban_")
+
+
 def failed(tool: str, result: Any, status: Optional[str]) -> bool:
     if status in ("error", "timeout"):
         return True
@@ -473,6 +485,10 @@ class AgentCoach:
         s = self._s(sid)
         return s["ask"], list(s["turn_log"])
 
+    def kanban_db_down(self, sid: str) -> bool:
+        """The session's last Kanban call was refused because the board couldn't be read (stale view or damage)."""
+        return bool(self._s(sid).get("kanban_db_down"))
+
     def turn_rich(self, sid: str) -> list[str]:
         """This turn's tool log with real arguments (kanban_create title and body, delegate goals, patch paths), for the
         report_only second opinion."""
@@ -516,6 +532,8 @@ class AgentCoach:
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
         if failed(tool, result, status):
             s["turn_log"].append(f"   <- ERROR {str(result)[:120]}")
+        if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers
+            s["kanban_db_down"] = bool(failed(tool, result, status) and KANBAN_DB_DOWN.search(str(result)))
 
         # repeat_failure
         key = command_key(tool, args)

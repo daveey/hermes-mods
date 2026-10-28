@@ -459,6 +459,33 @@ NUDGES = {
                     "criteria, linked to this chat) and name the card. If it really is the user's call, propose the "
                     "exact fix. Don't end on the diagnosis."),
 }
+# The session's Kanban tools can't read the board (core's "corrupt" refusal or PR #125's unreliable-view error), so
+# kanban_create from this session fails too: asking for it leaves the agent with no action that works.
+KANBAN_DB_DOWN = re.compile(r"Refusing to open corrupt kanban DB|attached to a deleted WAL/SHM generation"
+                            r"|integrity probe disagrees with an independent process|KanbanDbUnreliableViewError")
+REPORT_ONLY_KANBAN_DOWN = (
+    "[coach] Your message ends on a problem you could fix ({evidence}) without fixing it, starting a fix or proposing "
+    "one. This session's Kanban tools can't read the board, so kanban_create here fails too: don't try it. Instead: "
+    "run `sqlite3 -readonly <board db> 'pragma quick_check'` from the terminal (read-only, no approval). If it says "
+    "ok, the board is fine and this backend has a stale view: name the owner card (`hermes kanban list`/`show` in "
+    "the terminal still works) or ask for the restart of this backend with action_request. If it is not ok, report "
+    "that output and ask for recovery with action_request. Don't end on the diagnosis.")
+
+
+def kanban_db_down(tool_log: list[str]) -> bool:
+    """True when this turn's tool log shows a Kanban call refused because the board couldn't be read."""
+    return any(KANBAN_DB_DOWN.search(line or "") for line in tool_log or [])
+
+
+def nudge_for(rule: str, evidence: str, kanban_down: bool = False) -> str:
+    tmpl = REPORT_ONLY_KANBAN_DOWN if rule == "report_only" and kanban_down else NUDGES[rule]
+    return tmpl.format(evidence=evidence or "see your last message")
+
+
+OWNER_KANBAN_DOWN = (" This session's Kanban tools can't read the board, so look cards up with `hermes kanban show "
+                     "<id>` in the terminal (a fresh process) instead of kanban_show.")
+
+
 OWNER_NUDGE = ("[coach] Your message hands a problem to another owner (\"{evidence}\"), but this turn never checked that "
                "owner or sent it anything (no cross_session, kanban_show/kanban_comment or process poll in the tool "
                "log), so nobody may own it. Before ending: rerun the failing check once. If it is green now, say so. "
@@ -516,7 +543,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           screen: Optional[Callable[[list], Optional[dict]]] = None, screen_below: float = 0.2,
           shadow: bool = False, log: Optional[Callable[[dict], None]] = None,
           thresholds: Optional[dict] = None,
-          confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = 0.5) -> Optional[dict]:
+          confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = 0.5,
+          kanban_down: Optional[bool] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
     `thresholds` ({rule: th}) overrides `threshold` per rule; with it, the top rule among those over their own
     threshold wins.
@@ -532,9 +560,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     if (not only or "report_only" in only) and not scoped:
         phrase = unverified_owner(reply, tool_log)
         if phrase:  # deterministic: no judge call, no AI score at the edge of its bar
+            down = kanban_db_down(tool_log) if kanban_down is None else kanban_down
             return {"rule": "report_only", "p": 1.0, "evidence": phrase, "reason": "unverified_owner",
                     "verdict": {"report_only": 1.0, "report_only_src": "unverified_owner", "evidence": phrase},
-                    "nudge": OWNER_NUDGE.format(evidence=phrase[:200])}
+                    "nudge": OWNER_NUDGE.format(evidence=phrase[:200]) + (OWNER_KANBAN_DOWN if down else "")}
     cands = [r for r in prefilter(reply) if not only or r in only]
     if "report_only" in cands and scoped:
         cands.remove("report_only")
@@ -594,5 +623,6 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         best = max(cands, key=lambda r: v[r])
         if v[best] < threshold:
             return None
+    down = kanban_db_down(tool_log) if kanban_down is None else kanban_down
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
-            "nudge": NUDGES[best].format(evidence=v["evidence"] or "see your last message")}
+            "nudge": nudge_for(best, v["evidence"], kanban_down=down)}

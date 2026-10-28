@@ -59,3 +59,5 @@ Core: the block/schedule transitions, create preflight and the dispatcher tick a
 ## Follow-up patches (0561, 0567)
 
 **0561** is a lint fix (ruff FURB167/RUF100 and Windows-footgun rules) in `kanban_awaiting.py`, `kanban_capability_registry.py`, `kanban_capability_routing.py` and `tests/cron/test_cron_model_provider_pairing.py`; no behavior change. **0567** adds `hub_cli_path()` (configured value, then `PATH`, then `~/.local/bin`) and routing's `_hub_cli` uses it; see [kanban-default-placement.md](kanban-default-placement.md).
+
+**0593** (source `a2c2b3eba8`), test-only: the capability-routing fixture drops PATH entries that contain a real `hermes-hub`, so `hub_cli_path()` assertions do not depend on the host having the client installed (`test_replay_t5bc8e125_block_opens_macbook_owner_card_and_parks`). The same commit lets the real-home guard read the checkout's sibling `manifest.json`; that exemption is covered in [kanban-origin-ownership-snapshot.md](kanban-origin-ownership-snapshot.md).

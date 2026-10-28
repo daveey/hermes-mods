@@ -216,6 +216,49 @@ def test_check_fires_report_only_with_spec_nudge():
     assert "kanban_create with acceptance criteria" in hit["nudge"] and "Don't end on the diagnosis." in hit["nudge"]
 
 
+# Replay of Desktop chat 20261027_210007_45baaa's 23:41Z turn: its kanban_show failed with the stale-view "corrupt"
+# error (state.db message 191294), and the reply ended on a report. kanban_create from that process fails the same
+# way, so the nudge must not ask for it.
+KDB_ERR = ('{"error": "kanban_show: Refusing to open corrupt kanban DB at /home/ubuntu/.hermes/kanban.db: '
+           'integrity_check returned \'*** in database main ***\\\\nTree 13 page 13 cell 45: Rowid 1997 out of order\'. '
+           'Original preserved; backup at /home/ubuntu/.hermes/kanban.db.corrupt.a18094adddde6e53.bak."}')
+KDB_LOG = ["-> process_manage(proc_38da1880ef4b)", "-> kanban_show({\"task_id\": \"t_01a17f92364bdd8e\"})",
+           f"   <- ERROR {KDB_ERR[:120]}"]
+KDB_REPLY = ("Separately, since about 4:28pm PT the hub's task board database has been failing its integrity checks, "
+             "on both the main board and the runners board. Every failed read saves a 50 MB backup copy; that's about "
+             "500 MB so far, with 95 GB free. Several other hub sessions are already on it. I haven't touched it.")
+
+
+def test_report_only_nudge_when_kanban_db_is_down_asks_for_owner_or_restart():
+    assert rc.kanban_db_down(KDB_LOG)
+    llm, _ = _judge({"report_only": 0.9, "evidence": "reports corrupt kanban DB, I haven't touched it"})
+    hit = rc.check(KDB_REPLY, "follow emmett's instructions", KDB_LOG, llm, threshold=0.7,
+                   thresholds=rc.settings()["thresholds"])
+    assert hit["rule"] == "report_only"
+    assert "kanban_create with acceptance criteria" not in hit["nudge"]
+    assert "name the owner card" in hit["nudge"] and "ask for the restart" in hit["nudge"]
+    assert "pragma quick_check" in hit["nudge"] and "action_request" in hit["nudge"]
+
+
+def test_report_only_nudge_unchanged_without_kanban_failure():
+    assert not rc.kanban_db_down(["-> kanban_show(t_x)", "-> terminal(ls)", "   <- ERROR {\"error\": \"not found\"}"])
+    assert rc.nudge_for("report_only", "e") == rc.NUDGES["report_only"].format(evidence="e")
+    assert "kanban_create with acceptance criteria" in rc.nudge_for("report_only", "e", kanban_down=False)
+    assert rc.nudge_for("handoff", "e", kanban_down=True) == rc.NUDGES["handoff"].format(evidence="e")
+
+
+def test_owner_nudge_points_to_terminal_lookup_when_kanban_db_is_down():
+    reply = "The board errors are another session's problem; the existing owner has it."
+    log = ["-> terminal(ls)", f"   <- ERROR {KDB_ERR[:120]}"]
+    llm, _ = _judge({"report_only": 0.0, "evidence": ""})
+    hit = rc.check(reply, "why is it red?", log, llm, threshold=0.7)
+    assert hit is not None and hit.get("reason") == "unverified_owner"
+    assert "hermes kanban show" in hit["nudge"]
+    plain = rc.check(reply, "why is it red?", ["-> terminal(ls)"], llm, threshold=0.7)
+    assert plain is not None and plain.get("reason") == "unverified_owner"
+    assert "hermes kanban show" not in plain["nudge"]
+
+
 def test_check_report_only_respects_its_own_threshold():
     th = rc.settings()["thresholds"]["report_only_screen"]  # no second opinion: the screen's own threshold
     llm, _ = _judge({"report_only": max(0.0, th - 0.05), "evidence": "e"})
