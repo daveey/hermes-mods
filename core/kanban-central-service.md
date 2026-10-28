@@ -174,7 +174,10 @@ is what is built and what tests prove:
 - **Core** (patches in the core/README row): `runs_on` is a synced task column (`kanban create --runs-on linux,...`,
   `kanban_create(runs_on=[...])`), and `ready_since` comes from the Board. `placement=<gateway>` naming an enrolled
   machine, on a primary board, creates the card here with `runs_on=[machine:<gateway>]`; an unknown name is still
-  refused `placement_unavailable` (card t_01a18094c9791eea). A gateway with `kanban.sync.pickup` set copies eligible
+  refused `placement_unavailable` (card t_01a18094c9791eea). The `kanban_create` result then carries `runs_on`,
+  `placement: {where: local, runs_on, machine}` and a note "created here, runs on <machine> via the board lease", so a
+  caller doesn't read the pin as ignored and re-create the card (0699, test
+  `test_tool_create_runs_on_and_placement_to_an_enrolled_machine`). A gateway with `kanban.sync.pickup` set copies eligible
   `ready` cards that other gateways created from its replica into its live board each dispatcher tick (no capture, so
   nothing is pushed), and the normal claim path takes the Board lease. `pickup: explicit` (what worker nodes run)
   takes only cards whose `runs_on` is set, so a hub's default-placement cards (often about the hub itself) stay on
