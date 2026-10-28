@@ -79,3 +79,50 @@ def test_cli_uses_kanban_create_with_idempotency_key(tmp_path, monkeypatch):
     cmd, body = seen[0]
     assert cmd[:3] == ['hermes', 'kanban', 'create'] and 'user-steps-stale:' + r['requestId'] in cmd
     assert '--assignee' in cmd and r['requestId'] in body
+
+
+# ---- duplicate-open detection ----------------------------------------------------------------------------
+
+def _approval(title):
+    import uuid
+    return dict(schemaVersion=2, owner=OWNER.copy(), requestId=str(uuid.uuid4()), revision=1, kind='approval',
+                title=title, scope=dict(markdown='Change example.py.', complete=True, sourceRefs=[]), limits=[],
+                exclusions=[], outcomes=dict(approve='Do it', revise='Block', decline='Cancel'),
+                choices=[dict(id=e, label=l, effect=e) for e, l in
+                         zip(('approve', 'revise', 'decline'), ('Approve', 'Revise', 'Decline'))],
+                aliases=[], state='open')
+
+
+def test_duplicate_pair_opens_one_card_and_rerun_adds_none(tmp_path):
+    st = core.ActionStore(tmp_path / 'actions.sqlite3')
+    a = st.create(OWNER, _approval('Approve fix A for the build?'))
+    b = st.create(OWNER, _approval('Approve fix A for the build?!'))
+    board = Board()
+    go(st, tmp_path / 'missing.db', board)
+    go(st, tmp_path / 'missing.db', board)
+    assert len(board.cards) == 1
+    key, c = next(iter(board.cards.items()))
+    assert key.startswith('user-steps:dup:') and key.endswith(':session')
+    assert a['requestId'] in c['body'] and b['requestId'] in c['body']
+    assert chat.stale_counts(core, st, tmp_path / 'missing.db')['duplicateOpen'] == 1
+
+
+def test_distinct_asks_open_no_dup_card(tmp_path):
+    st = core.ActionStore(tmp_path / 'actions.sqlite3')
+    st.create(OWNER, _approval('Approve fix A for the build?'))
+    st.create(OWNER, _approval('Approve fix B for the build?'))
+    st.create(OWNER, _approval('Approve?'))
+    st.create(OWNER, _approval('Approve?!'))  # too short to identify an ask: kept, as same_open_ask does
+    board = Board()
+    go(st, tmp_path / 'missing.db', board)
+    assert board.cards == {}
+    assert chat.stale_counts(core, st, tmp_path / 'missing.db')['duplicateOpen'] == 0
+
+
+def test_decided_or_withdrawn_twin_is_not_a_duplicate(tmp_path):
+    st = core.ActionStore(tmp_path / 'actions.sqlite3')
+    a = st.create(OWNER, _approval('Approve fix A for the build?'))
+    st.decide(OWNER, dict(requestId=a['requestId'], expectedRevision=1, choiceId='approve',
+                          idempotencyKey='k1', revisionText=None))
+    st.create(OWNER, _approval('Approve fix A for the build?'))
+    assert chat.duplicate_open(core, st) == []

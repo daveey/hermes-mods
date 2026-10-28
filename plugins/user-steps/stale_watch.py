@@ -41,6 +41,19 @@ def card(item):
             'body': body, 'idempotency_key': 'user-steps-stale:' + rid, 'assignee': 'default'}
 
 
+def dup_card(d):
+    lines = '\n'.join('- ' + ', '.join(g) for g in d['groups'])
+    body = (f"A session holds more than one open user-steps request for the same decision (the one-tile rule, "
+            f"core.same_open_ask, was bypassed: a regression).\n\n- Namespace: {d['namespace']}\n"
+            f"- Session: {d['session']}\n- Duplicate groups (request ids, oldest first):\n{lines}\n\n"
+            f"Find which path minted the extra request (extractor, action_request tool, plan gate) and fix it, "
+            f"then withdraw the newer duplicates with a reason. This watcher never withdraws anything.\n"
+            f"Source: plugins/user-steps/stale_watch.py. Done when /ping stale.duplicateOpen no longer counts "
+            f"this session.")
+    return {'title': f"user-steps: duplicate open requests in session {d['session']}", 'body': body,
+            'idempotency_key': f"user-steps:dup:{d['namespace']}:{d['session']}", 'assignee': 'default'}
+
+
 def create_card(c):
     cmd = ['hermes', 'kanban', 'create', c['title'], '--body-file', '-', '--assignee', c['assignee'],
            '--idempotency-key', c['idempotency_key'], '--json']
@@ -58,6 +71,9 @@ def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_car
             continue
         create(card(item))  # idempotent on the key: a rerun returns the existing card
         opened.append(item['requestId'])
+    for d in chat.duplicate_open(core, store):
+        create(dup_card(d))  # one card per session; idempotent on its key
+        opened.append('dup:' + d['session'])
     return opened
 
 

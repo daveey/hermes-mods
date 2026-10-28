@@ -123,7 +123,60 @@ def stale_counts(core, store, db=None, limit=500):
                 continue
         elif not r['scope']['complete'] or r['state'] != 'open':
             pending.append(r['requestId'])
-    return {'answeredOpen': len(answered), 'planPending': len(pending), 'answeredOpenIds': answered[:20]}
+    dups = duplicate_open(core, store)
+    return {'answeredOpen': len(answered), 'planPending': len(pending), 'answeredOpenIds': answered[:20],
+            'duplicateOpen': sum(len(g) - 1 for d in dups for g in d['groups']),
+            'duplicateSessions': len(dups)}
+
+
+_BACK_KIND = {'approval': 'approve', 'choice': 'choose', 'input': 'input', 'external_step': 'do'}
+
+
+def duplicate_open(core, store, limit=2000):
+    """Sessions holding more than one open request for one decision (the one-tile rule, core.same_open_ask).
+
+    Each open/needs_context undecided request is a candidate (text = title, kind mapped back to
+    approve/choose/input/do) against the earlier open ones of its session; an exact ask_key(title) match
+    also groups. Returns [{namespace, session, groups: [[requestId, ...], ...]}]. Read-only."""
+    with store._tx() as c:
+        rows = c.execute(
+            'SELECT r.namespace, r.session, r.state, v.body FROM requests r JOIN revisions v '
+            'ON v.namespace=r.namespace AND v.id=r.id AND v.revision=r.revision '
+            "WHERE r.state IN ('open','needs_context') AND r.resolution IS NULL "
+            'ORDER BY r.rowid LIMIT ?', (limit,)).fetchall()
+    by_session = {}
+    for row in rows:
+        try:
+            r = json.loads(row['body'])
+        except ValueError:
+            continue
+        by_session.setdefault((row['namespace'], row['session']), []).append(r)
+    out = []
+    for (ns, session), reqs in by_session.items():
+        asks, groups, root = [], {}, {}
+        for r in reqs:
+            ask = {'id': r['requestId'], 'kind': r['kind'], 'title': r.get('title', ''), 'step': None,
+                   'labels': [x.get('label') for x in r.get('choices', [])]}
+            key = core.ask_key(ask['title'])
+            hit = None
+            if len(key) >= core._ASK_KEY_MIN:
+                hit = next((a for a in reversed(asks) if core.ask_key(a['title']) == key), None)
+            if hit is None:
+                cand = {'text': ask['title'], 'kind': _BACK_KIND.get(r['kind'], 'input'),
+                        'options': ask['labels'], 'verbatim_span': ''}
+                hit = core.same_open_ask(cand, asks)
+            if hit is not None:
+                head = root[hit['id']]
+                root[ask['id']] = head
+                groups[head].append(ask['id'])
+            else:
+                root[ask['id']] = ask['id']
+                groups[ask['id']] = [ask['id']]
+            asks.append(ask)
+        dup = [g for g in groups.values() if len(g) > 1]
+        if dup:
+            out.append({'namespace': ns, 'session': session, 'groups': dup})
+    return out
 
 
 def answered_open(core, store, db=None, limit=500):
