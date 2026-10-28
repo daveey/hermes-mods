@@ -2,6 +2,8 @@
 // HERMES_DESKTOP_DIR=<core apps/desktop checkout with dependencies> node --test this-file
 // No playwright headless shell installed ("chromium_headless_shell-NNNN not installed")? Use the system Chrome:
 // CHROME_PATH='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' node --test this-file
+// Needs Node >= 20 (Playwright); Node 18 exits at once with no assertions. e.g. PATH=~/.hermes/tools/node-26.7.0-darwin-arm64/bin:$PATH
+
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
