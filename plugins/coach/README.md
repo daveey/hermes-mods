@@ -429,7 +429,7 @@ Raw machine signals become `file_defect` calls with `source: signal` and stable 
 | `hook` | `Hook '<hook>' callback <cb> raised: …` (plugin hook exceptions) | hook + callback + exception type (no) |
 | `cron` | a job whose sticky `last_failure.at` is new (`cron/jobs.json`), even if it has recovered since | job name (yes) |
 | `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped | board + card id (yes) |
-| `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash) | tag + exception type (yes) |
+| `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash); `gateway.exit_signal` (an unplanned SIGTERM bounce: bootout, `kickstart -k`) only as a restart storm, 3+ in 10 min per profile | tag + exception type (yes) |
 | `coach` | coach `fixloop_card` (2nd confirmed failure of a fix) and `reply_nudge` with rule `handoff` | session (+ issue) (no) |
 | `monitor` | a propose-only monitor's finding (`route-monitor`, below) | the monitor's own dedupe key |
 

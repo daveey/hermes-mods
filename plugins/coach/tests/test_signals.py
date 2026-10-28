@@ -488,3 +488,48 @@ def test_recovered_cron_failures_older_than_24h_do_not_accumulate(home):
     for t in (NOW - 3 * 86400, NOW - 2 * 86400, NOW - 600):
         _write_jobs(home, _cron_job("slow", 0, "ok", _iso(t)))
         assert sg.collect_cron(home, cur, t + 300, "hubhost") == []
+
+
+def _gw_rows(home, *offsets, tag="gateway.exit_signal"):
+    """Append exit-diag rows `offsets` seconds before NOW (UTC ISO ts, as core writes them)."""
+    from datetime import datetime, timezone
+    with open(home / "logs" / "gateway-exit-diag.log", "a") as f:
+        for off in offsets:
+            row = {"ts": datetime.fromtimestamp(NOW - off, timezone.utc).isoformat(), "tag": tag,
+                   "level": "info", "pid": 200 + off}
+            if tag == "gateway.exit_signal":
+                row.update(signal="SIGTERM", ppid=1, parent={"pid": 1})
+            f.write(json.dumps(row) + "\n")
+
+
+def test_single_exit_signal_is_a_bounce_not_a_defect(home):
+    """A planned launchd bounce (kickstart -k / bootout) logs one gateway.exit_signal: nothing filed."""
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _gw_rows(home, 120)
+    assert kinds(sg.collect(home, {}, "mini", NOW), "gateway") == []
+
+
+def test_exit_signal_storm_files_one_card(home):
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    cur = {}
+    _gw_rows(home, 500, 300)
+    assert kinds(sg.collect(home, cur, "mini", NOW - 100), "gateway") == []  # two: still a bounce
+    _gw_rows(home, 60)
+    gw = kinds(sg.collect(home, cur, "mini", NOW), "gateway")  # the third within 10 min, across sweeps
+    assert len(gw) == 1
+    assert "restart storm: 3 stop signals" in gw[0]["symptom"] and "SIGTERM" in gw[0]["symptom"]
+    _gw_rows(home, 30)
+    assert kinds(sg.collect(home, cur, "mini", NOW), "gateway") == []  # filed once; the counter reset
+
+
+def test_exit_signals_spread_out_never_file(home):
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _gw_rows(home, 3000, 1500, 60)  # three, but never three within 10 min
+    assert kinds(sg.collect(home, {}, "mini", NOW), "gateway") == []
+
+
+def test_bare_exit_nonzero_still_files(home):
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    _gw_rows(home, 60, tag="gateway.exit_nonzero")
+    gw = kinds(sg.collect(home, {}, "mini", NOW), "gateway")
+    assert len(gw) == 1 and "gateway.exit_nonzero" in gw[0]["symptom"]
