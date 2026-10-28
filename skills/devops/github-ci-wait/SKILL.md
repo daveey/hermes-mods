@@ -58,11 +58,14 @@ until one run or tag contains all of them.
 How to run it from an agent:
 - Start it with `terminal(background=true, notify=true)` and end the turn. Don't run a foreground sleep loop:
   it hits the tool timeout. Don't poll a background job either.
-- A Hermes update that pauses and restarts the chat kills its background jobs (`termination_source:
-  agent_close`), and no notice arrives. After a resume note saying the turn was paused for a Hermes update,
-  check each job you started once with `process_manage poll`, and restart any that died. If a deploy or a
-  promised report hangs on the result, put that step on a Kanban card with a `wake_check` instead; cards
-  survive updates.
+- Core with the update-pause job-receipt fix (549b7f1e71b) explicitly stops owned non-persist background
+  jobs at the pause boundary (`termination_source: core_update_pause`). The resumed turn lists each job's
+  id, command head and UTC start, says to restart it if still needed, and includes a completion notice
+  saying "killed by the Hermes update" for notify jobs. Inspect each stopped job and restart required waits;
+  a completion notice does not mean the wait succeeded. `persist_on_release` is unchanged. Older running
+  cores may still kill silently: after an update-pause resume, check each job once with `process_manage poll`.
+  If a deploy or promised report depends on the wait, put that step on a durable Kanban card with a
+  `wake_check` instead of relying on a chat-owned chain.
 - When a script chains steps after the wait, send the wait's output to a log file (`>> log 2>&1`), never
   through `| tail -n`. tail prints nothing until the wait exits, so a killed or hung wait leaves no record of
   what it was waiting on.
