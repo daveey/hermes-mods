@@ -165,6 +165,11 @@ Before exempting a creator from burst monitoring, verify its reaper is discovere
 runtime and exercises cleanup safely on an isolated fixture. Source code existing on disk or a healthy generic
 GC timer does not prove creator-owned teardown works. Scope exemptions to that verified creator, not a shared
 scratch or code root that also contains unmanaged work; retain leak detection for exempted creators.
+When a reaper kept a tree but logged no reason, load the reaper module by path, stub only its remove/archive
+function to print, and replay its decision code against the live record (board row, marker, `git status`): the
+silent early `return` shows up directly, where reading the log cannot show it. A reaper that fires once on an
+event (completion) must have a later retry for every reason it can decline (open children, a live process, a
+close path that skips the hook), or each decline lasts until the age-based backstop.
 
 Each countermeasure is concrete and verifiable: a regression test that fails before and passes after, a guard you
 can trigger, a doc or skill change with its path. "Be more careful" is not a countermeasure. If a root-level fix is
