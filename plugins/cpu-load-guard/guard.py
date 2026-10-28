@@ -248,7 +248,8 @@ def _fan_out_wide(text: str) -> bool:
 
 
 def _count_flag(text: str, flags: str) -> list[str]:
-    return re.findall(r"(?:" + flags + r")[= ]?\s*(\$\(\s*[^)]*\)|`[^`]*`|\$\{?\w+\}?|\d+)", text)
+    # `--cpu 16`, `--cpu=16`, and an argv list `'--cpu', '16'`
+    return re.findall(r"(?:" + flags + r")(?:[= ]|['\"]\s*,\s*['\"])?\s*(\$\(\s*[^)]*\)|`[^`]*`|\$\{?\w+\}?|\d+)", text)
 
 
 def _wide_arg(arg: str) -> bool:

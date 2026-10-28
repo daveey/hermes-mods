@@ -591,3 +591,19 @@ def test_exec_style_operand_blocks(tmp_path, fmt):
     p.chmod(0o755)
     r = run("terminal", {"command": fmt.format(p=p), "workdir": str(tmp_path)})
     assert r and r["action"] == "block", fmt
+
+
+def test_spawn_argv_list_with_wide_cpu_count_blocks():
+    s = "stress" + "-ng"
+    for code in (
+        f"import subprocess\nsubprocess.run(['{s}', '--cpu', '16', '--timeout', '1s'])\n",
+        f"import subprocess\nsubprocess.Popen([\"{s}\", \"--cpu\", \"0\"])\n",
+    ):
+        r = run("execute_code", {"code": code})
+        assert r and r["action"] == "block", code
+
+
+def test_spawn_argv_list_with_small_cpu_count_allows():
+    s = "stress" + "-ng"
+    code = f"import subprocess\nsubprocess.run(['{s}', '--cpu', '2', '--timeout', '1s'])\n"
+    assert run("execute_code", {"code": code}) is None
