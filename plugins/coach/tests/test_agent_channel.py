@@ -420,3 +420,106 @@ def test_pre_tool_call_hook_returns_block(tmp_path):
     out = hooks["pre_tool_call"](tool_name="terminal", args={"command": f"cd {live} && git commit -am x"})
     assert out and out["action"] == "block" and "hermes-core-wt" in out["message"]
     assert hooks["pre_tool_call"](tool_name="terminal", args={"command": f"cd {live} && git status"}) is None
+
+
+# ── plan_first: a new build ask, then a file edit before the user has seen any plan ──
+# Shape of the 2026-10-27 ask that the agent built on for 77 min without posting a plan.
+BUILD_ASK = ("Let's extend the system: build a cosplay kit for the persona, a memory index over her past answers, "
+             "and an eval harness that asks each model the same identity questions in fresh sessions. Implement the "
+             "generator, add tests for each part, and iterate until every model passes the identity check.")
+PLAN_REPLY = "Plan: 1) generator in kit/gen.py 2) index in mem/ 3) harness in evals/. Tests per part. Go?"
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _plan_scratch(tmp_path, monkeypatch):
+    """pytest's tmp_path lives under /tmp or $TMPDIR, both scratch by default; scope scratch to tmp_path/scratch."""
+    monkeypatch.setenv("COACH_SCRATCH_ROOTS", str(tmp_path / "scratch"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "scratch"))
+
+
+def _plan_hooks(tmp_path):
+    store = core.Store(tmp_path / "coach")
+    _, hooks = plugin.build(store=store, checkout=None)
+    return store, hooks
+
+
+def _edit(hooks, tool, args, sid="s1"):
+    res = json.dumps({"success": True})
+    out = hooks["transform_tool_result"](tool_name=tool, args=args, result=res, session_id=sid)
+    hooks["post_tool_call"](tool_name=tool, args=args, result=res, session_id=sid)
+    return out
+
+
+def test_plan_first_fires_on_first_edit_of_an_unplanned_build_ask(tmp_path):
+    store, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    assert _edit(hooks, "read_file", {"path": str(tmp_path / "a.py")}) is None  # reading is fine
+    out = _edit(hooks, "write_file", {"path": str(tmp_path / "repo" / "gen.py"), "content": "x"})
+    assert out and "Plan Before You Build" in json.loads(out)["coach_hint"]
+    assert _edit(hooks, "patch", {"path": str(tmp_path / "repo" / "gen.py")}) is None  # once per session
+    log = [json.loads(line) for line in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert [r for r in log if r.get("rule") == "plan_first"]
+
+
+def test_plan_first_quiet_for_a_fix_request(tmp_path):
+    _, hooks = _plan_hooks(tmp_path)
+    fix = ("Fix the login page: it throws a TypeError when the email field is empty and the submit button stays "
+           "disabled after the error. Add a test that covers the empty-email case and make sure the build passes.")
+    hooks["pre_llm_call"](session_id="s1", user_message=fix, platform="cli")
+    assert _edit(hooks, "patch", {"path": str(tmp_path / "login.ts")}) is None
+
+
+def test_plan_first_quiet_after_a_plan_reply(tmp_path):
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    hooks["post_llm_call"](session_id="s1", assistant_response=PLAN_REPLY)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK + " Also add a dashboard page.", platform="cli")
+    assert _edit(hooks, "write_file", {"path": str(tmp_path / "gen.py"), "content": "x"}) is None
+
+
+def test_plan_first_shell_edits_and_exemptions(tmp_path, monkeypatch):
+    repo = (tmp_path / "repo").resolve()
+    (repo / ".git").mkdir(parents=True)
+    ch = rules.is_file_change
+    for args in ({"command": f"cd {repo} && git commit -am wip"},
+                 {"command": f"git -C {repo} worktree add ../wt -b feat"},
+                 {"command": f"echo x > {repo}/gen.py"},
+                 {"command": "cat > gen.py <<'EOF'\nx\nEOF", "workdir": str(repo)}):
+        assert ch("terminal", args), args
+    for args in ({"command": f"cd {repo} && git status && git log -3"},
+                 {"command": f"grep -rn foo {repo} > /tmp/out.txt"},
+                 {"command": f"cd {repo} && pytest -q 2>&1 | tail"}):
+        assert not ch("terminal", args), args
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "scratch"))
+    assert not ch("write_file", {"path": str(tmp_path / "scratch" / "probe.py")})
+    assert ch("write_file", {"path": str(repo / "gen.py")})
+    # not a build ask: short, a go, a system note, a kanban worker prompt
+    for msg in ("build it", "go, " + BUILD_ASK, "Approved. " + BUILD_ASK,
+                "[IMPORTANT: Background process done] " + BUILD_ASK, "work kanban task t_123"):
+        assert not rules.is_build_ask(msg), msg
+    assert rules.is_build_ask(BUILD_ASK)
+
+
+def test_plan_first_skips_cron_subagents_and_resumed_sessions(tmp_path):
+    for kw in ({"platform": "cron"}, {"parent_session_id": "p1"},
+               {"conversation_history": [{"role": "assistant", "content": PLAN_REPLY}]}):
+        _, hooks = _plan_hooks(tmp_path)
+        hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, **kw)
+        assert _edit(hooks, "write_file", {"path": str(tmp_path / "gen.py"), "content": "x"}) is None, kw
+
+
+def test_plan_first_answered_clarify_counts_as_a_shown_plan(tmp_path):
+    """Live run 20261028_051013_c28772: the agent asked for plan approval via clarify. An unanswered clarify
+    (single-query mode) leaves the plan unseen; one the user answered is a shown plan and disarms the hint."""
+    unanswered = json.dumps({"outcome": "undelivered", "responses": [{"status": "unanswered", "user_response": None}]})
+    answered = json.dumps({"outcome": "submitted", "responses": [{"status": "answered", "user_response": "Approve"}]})
+    for res, fires in ((unanswered, True), (answered, False)):
+        _, hooks = _plan_hooks(tmp_path)
+        hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+        hooks["post_tool_call"](tool_name="clarify", args={"questions": [{"question": PLAN_REPLY}]}, result=res,
+                                session_id="s1")
+        out = _edit(hooks, "write_file", {"path": str(tmp_path / "gen.py"), "content": "x"})
+        assert bool(out and "Plan Before You Build" in out) is fires, res

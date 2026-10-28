@@ -37,7 +37,98 @@ HINTS = {
     "live_checkout": ("You just changed the LIVE Hermes checkout ({path}) that running backends execute from. "
                       "Core work goes in a worktree: `~/.hermes/bin/hermes-core-wt new <slug>` -> edit/test/commit "
                       "there -> `hermes-core-wt ship <slug>`. Revert the change in the live tree if you can."),
+    "plan_first": ("Plan Before You Build: this is a new build request and the user has not seen a plan yet. Stop "
+                   "editing, post the plan (approach, files, how it gets tested) as your reply and end the turn for "
+                   "the user's go. Someone else's approval (a reviewer, a cut PR) does not replace it."),
 }
+
+# plan_first: a new build ask (a build verb plus a real spec), not a fix/bug report and not already a go.
+BUILD_ASK_RE = re.compile(r"\b(build|implement|extend|create|add|make|write|design|develop|set\s+up|scaffold|"
+                          r"port|migrate|integrate|new\s+feature)\b", re.I)
+FIX_ASK_RE = re.compile(r"\b(fix\w*|bugs?|broken|regression|crash\w*|errors?|exceptions?|traceback|"
+                        r"(not|isn'?t|doesn'?t|didn'?t)\s+work\w*|fail\w*|why\s+(is|does|did|was|are))\b", re.I)
+GO_ASK_RE = re.compile(r"^\W*(go|go\s+ahead|do\s+it|yes|yep|approved|ship\s+it|lgtm|sounds\s+good|proceed)\b"
+                       r"|\b(skip\s+the\s+plan|no\s+plan\s+needed|no\s+need\s+for\s+a\s+plan|just\s+(build|do)\s+it)\b",
+                       re.I)
+NOT_USER_ASK_RE = re.compile(r"^\s*(\[(System note|IMPORTANT|SYSTEM)|work kanban task\b)", re.I)
+OOB_RE = re.compile(r"\[/?OUT-OF-BAND USER MESSAGE[^\]]*\]")
+BUILD_ASK_MIN_WORDS = 25
+GIT_EDIT_RE = re.compile(r"\bgit\b[^;&|\n]*?\s(commit|worktree\s+add|apply|am|cherry-pick)(?![-\w])")
+INPLACE_RE = re.compile(r"\bsed\s+-i\b|\bperl\s+-pi\b")
+
+
+def is_build_ask(text: Any) -> bool:
+    """True for a user message that asks for a new build with a substantial spec (the Plan Before You Build case)."""
+    if not isinstance(text, str):
+        return False
+    t = OOB_RE.sub(" ", text).strip()
+    if not t or NOT_USER_ASK_RE.match(t) or GO_ASK_RE.search(t) or FIX_ASK_RE.search(t):
+        return False
+    return bool(BUILD_ASK_RE.search(t)) and len(t.split()) >= BUILD_ASK_MIN_WORDS
+
+
+def _scratch_roots() -> list[str]:
+    """Where edits are probes or plan drafts, not implementation. `COACH_SCRATCH_ROOTS` (os.pathsep list) replaces
+    the defaults; $TMPDIR always counts."""
+    env = os.environ.get("COACH_SCRATCH_ROOTS")
+    roots = ([r for r in env.split(os.pathsep) if r] if env is not None else
+             ["/tmp", "/private/tmp", "/var/folders", str(Path.home() / ".hermes" / "cache"),
+              str(Path.home() / ".hermes" / "plans")])
+    if os.environ.get("TMPDIR"):
+        roots.append(os.environ["TMPDIR"].rstrip("/"))
+    out = []
+    for r in roots:
+        try:
+            out.append(str(Path(r).expanduser().resolve()))
+        except Exception:
+            out.append(r)
+    return out
+
+
+def _is_scratch(p: str) -> bool:
+    return any(_inside(p, r) for r in _scratch_roots())
+
+
+def _in_git_repo(p: str) -> bool:
+    try:
+        cur = Path(p).expanduser().resolve()
+    except Exception:
+        return False
+    for d in [cur, *cur.parents]:
+        if (d / ".git").exists():
+            return True
+    return False
+
+
+def is_file_change(tool: str, args: Any) -> bool:
+    """A call that changes project files: write_file/patch outside scratch, or a terminal git commit / worktree add /
+    in-place edit / output redirect into a git repo. Reads, tests and scratch probes don't count."""
+    a = args if isinstance(args, dict) else {}
+    if tool in ("write_file", "patch"):
+        p = str(a.get("path") or "")
+        return bool(p) and not _is_scratch(p)
+    if tool != "terminal":
+        return False
+    cmd = shell_code(str(a.get("command") or ""))
+    wd = str(a.get("workdir") or "")
+    for m in list(GIT_EDIT_RE.finditer(cmd)) + list(INPLACE_RE.finditer(cmd)):
+        g = GIT_C_RE.match(_segment(cmd, m.start()))
+        d = _target_dir(cmd, m.start(), g.group(1) if g else "", wd)
+        if d is None or not _is_scratch(d):
+            return True
+    for m in REDIRECT_RE.finditer(cmd):
+        target = m.group(1).strip("\"'")
+        if not target or target.startswith(("&", "$")) or target.startswith("/dev/"):
+            continue
+        t = os.path.expanduser(target)
+        if not os.path.isabs(t):
+            base = _target_dir(cmd, m.start(), "", wd)
+            if not base:
+                continue
+            t = os.path.join(base, t)
+        if not _is_scratch(t) and _in_git_repo(os.path.dirname(t) or t):
+            return True
+    return False
 
 SLEEP_RE = re.compile(r"\bsleep\s+(\d+(?:\.\d+)?)")
 LOOP_SLEEP_RE = re.compile(r"\b(while|until|for)\b[^\n]*?(;|\n|\bdo\b)[\s\S]*?\bsleep\s+\d", re.I)
@@ -453,9 +544,20 @@ class AgentCoach:
         if self.signals:
             self.signals.log({"event": "agent_hint", "session_id": sid, "rule": rule})
 
-    def turn_start(self, sid: str, user_message: Any = None) -> Optional[str]:
+    def turn_start(self, sid: str, user_message: Any = None, platform: str = "", parent_session_id: str = "",
+                   replied_before: bool = False) -> Optional[str]:
         s = self._s(sid)
         s["turn"] += 1
+        # plan_first arms on a new build ask while the user has seen no reply in this session; a reply (turn_end)
+        # or a go message disarms it. Cron runs and subagents (spec already decided by the parent) never arm it.
+        if replied_before:
+            s["replied"] = True
+        if platform == "cron" or parent_session_id or s.get("replied"):
+            s["plan_due"] = False
+        elif is_build_ask(user_message):
+            s["plan_due"] = True
+        elif isinstance(user_message, str) and GO_ASK_RE.search(user_message):
+            s["plan_due"] = False
         s["turn_tools"] = 0
         s["turn_log"].clear()
         s["turn_rich"].clear()
@@ -471,6 +573,9 @@ class AgentCoach:
     def turn_end(self, sid: str, reply: str) -> None:
         """Remember the turn's final answer and tool log: the fix-loop judge reads them on the next user turn."""
         s = self._s(sid)
+        if isinstance(reply, str) and reply.strip():
+            s["replied"] = True
+            s["plan_due"] = False
         s["loop"]["last_reply"] = reply[-4000:]
         s["loop"]["last_log"] = list(s["turn_log"])[-25:]
 
@@ -515,6 +620,14 @@ class AgentCoach:
         if hit:
             self._fire(self._s(sid), sid, "live_checkout", "session", path=hit.replace(str(Path.home()), "~", 1))
 
+    def check_plan_first(self, sid: str, tool: str, args: Any) -> None:
+        """plan_first rule for one call (also run from transform_tool_result, so the hint lands on this call)."""
+        if not sid:
+            return
+        s = self._s(sid)
+        if s.get("plan_due") and is_file_change(tool, args):
+            self._fire(s, sid, "plan_first", "session")
+
     def observe(self, sid: str, tool: str, args: Any, result: Any = None, status: Optional[str] = None,
                 duration_ms: int = 0, error_type: Optional[str] = None, error_message: Optional[str] = None) -> None:
         if not sid:
@@ -558,6 +671,14 @@ class AgentCoach:
 
         # live_checkout (once per session)
         self.check_live(sid, tool, args)
+        # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
+        if tool == "clarify":
+            d = _as_dict(result) or {}
+            if d.get("outcome") == "submitted" or any(
+                    isinstance(r, dict) and r.get("status") == "answered" for r in d.get("responses") or []):
+                s["replied"] = True
+                s["plan_due"] = False
+        self.check_plan_first(sid, tool, args)
 
         if not self.signals:
             return
