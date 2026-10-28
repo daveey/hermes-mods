@@ -1,6 +1,6 @@
 # The sidebar re-reads hub.db's task rows only when they change
 
-Patch **PATCHNO** (source `SOURCESHA`). Follows [kanban-replica-decode-memo.md](kanban-replica-decode-memo.md) (0557).
+Patch **0580** (source `512f93867f`). Follows [kanban-replica-decode-memo.md](kanban-replica-decode-memo.md) (0557).
 
 After the chat-closeout fix ([backend-writable-open-guard.md](backend-writable-open-guard.md)), replaying
 `GET /api/profiles/sessions/sidebar` every 2 s against the live `~/.hermes` still spent most of its kanban time in the

@@ -1,0 +1,352 @@
+From 512f93867f7bfb45cb7ab0990265040eb7ed0675 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:34:22 -0700
+Subject: [PATCH] perf(kanban): reuse the replica read while hub.db task rows
+ are unchanged [daveey]
+
+The sidebar's remote-links projection rebuilds on every local board write, and each rebuild re-read all ~6k
+replica task rows (~23 MB) from hub.db even though they change only when a hub pull lands (hub.db's WAL itself
+moves ~45x/min from outbox/cursor writes, so a file-stat key would not help).
+
+_read_remote_links now keys a memo on an index-only probe of the task rows (count, max/total seq, total version,
+total octet_length) plus identity, heartbeat and meta rows, read in the same transaction as the rows; hermes-hub
+stamps every replica write with a new feed seq. Reuse also ends at the next stale/heartbeat cut-off. Explicit
+`now`, seq-less replicas and NULL seqs always read. _project_remote_links indexes receipt rows for `superseded`
+instead of scanning all of them per legacy card.
+
+Live replay, 30 polls: remote projection 49 -> 25 ms/poll, replica read 34 -> 13 ms/poll; 79/79 memoized reads
+identical to explicit-now reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_session_activity.py         |  92 +++++++--
+ .../test_kanban_replica_read_memo.py          | 179 ++++++++++++++++++
+ 2 files changed, 259 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_read_memo.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 07810d03ab..b8cc592931 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -601,6 +601,19 @@ def _decode_replica_task(record_key: str, data: Any) -> tuple[dict[str, Any], st
+     return t, digest, evidence
+ 
+ 
++# [daveey] Last live (``now=None``) replica read: (key, read_at, valid_until, cards, qualified, owners). The remote
++# projection rebuilds on every local board write (its fingerprint covers every kanban.db), and hub.db itself is
++# written ~45 times a minute (outbox, ledger, cursor), but its task rows change only when a pull lands. Re-reading
++# ~6k replica rows (~23 MB of JSON) cost ~0.1 s CPU per sidebar poll for an unchanged answer. hermes-hub stamps
++# every replica write with the hub feed's monotonic ``seq``, so an insert or update raises ``max(seq)`` and a
++# delete lowers ``count``: ``_REPLICA_PROBE`` (index-only, ~6 ms) plus the small identity/heartbeat rows is the
++# whole input. Reused while that key and the origin profile are unchanged and wall time stays inside the window
++# where no hub-staleness or scope-heartbeat cut-off can flip (``valid_until``).
++_remote_read_memo: tuple | None = None
++_REPLICA_PROBE = ("SELECT count(*), count(seq), max(seq), total(seq), total(version), total(octet_length(data)) "
++                  "FROM replica WHERE coll = 'tasks'")
++
++
+ def _read_remote_links(path: Path, now: float | None = None, *,
+                        qualified_out: set | None = None,
+                        owners_out: set | None = None) -> list[dict[str, Any]]:
+@@ -608,22 +621,69 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+ 
+     Open and unproven cards come back ``unfinished``; cards their owner attests closed
+     (``_owner_attests_terminal``) come back as explicit ``released`` rows, so a durable snapshot sees them
+-    as present-and-closed rather than missing."""
++    as present-and-closed rather than missing. A live read (``now=None``) of unchanged replica task rows is
++    served from ``_remote_read_memo``; an explicit ``now`` always reads every row."""
++    global _remote_read_memo
++    from hermes_cli.profiles import get_active_profile_name
++
++    live = now is None
++    now = time.time() if now is None else now
+     conn = _open_ro(path)
+     try:
++        conn.execute("BEGIN")  # one snapshot: the memo key must describe the rows it maps to
+         me = _self_gateway(conn)
+         if not me:
+             return []
+         # Old replicas can still be displayed, but cannot prove an exact revision.
+-        version_column = 'version' if any(r[1] == 'version' for r in conn.execute('PRAGMA table_info(replica)')) else 'NULL'
+-        rows = conn.execute(f"SELECT gw, key, data, updated_at, {version_column} FROM replica WHERE coll = 'tasks'").fetchall()
++        columns = {r[1] for r in conn.execute('PRAGMA table_info(replica)')}
++        version_column = 'version' if 'version' in columns else 'NULL'
+         info_rows = conn.execute("SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'").fetchall()
+         last_ok, offline = _meta_float(conn, "last_ok"), _meta_float(conn, "offline_since")
++        key = None
++        if live and {'seq', 'version'} <= columns:
++            probe = conn.execute(_REPLICA_PROBE).fetchone()
++            if probe[0] == probe[1]:  # a row without seq proves nothing about its text: never memoize it
++                key = (str(path), me, version_column, tuple(info_rows), last_ok, offline, probe,
++                       get_active_profile_name())
++            memo = _remote_read_memo
++            if key is not None and memo is not None and memo[0] == key and memo[1] <= now < memo[2]:
++                if qualified_out is not None:
++                    qualified_out.update(memo[4])
++                if owners_out is not None:
++                    owners_out.update(memo[5])
++                return list(memo[3])  # cards are read-only, as in ``_links_cache``
++        rows = conn.execute(f"SELECT gw, key, data, updated_at, {version_column} FROM replica WHERE coll = 'tasks'").fetchall()
+     finally:
+         conn.close()
+-    now = time.time() if now is None else now
++    if key is None:
++        return _project_replica(path, now, me, rows, info_rows, last_ok, offline,
++                                qualified_out=qualified_out, owners_out=owners_out)
++    qualified: set = set()
++    owners: set = set()
++    horizon: list[float] = []
++    cards = _project_replica(path, now, me, rows, info_rows, last_ok, offline,
++                             qualified_out=qualified, owners_out=owners, horizon_out=horizon)
++    _remote_read_memo = (key, now, min(horizon, default=float('inf')), list(cards),
++                         frozenset(qualified), frozenset(owners))
++    if qualified_out is not None:
++        qualified_out.update(qualified)
++    if owners_out is not None:
++        owners_out.update(owners)
++    return cards
++
++
++def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: list, last_ok: float | None,
++                     offline: float | None, *, qualified_out: set | None = None, owners_out: set | None = None,
++                     horizon_out: list[float] | None = None) -> list[dict[str, Any]]:
++    """``_read_remote_links`` of rows already read. ``horizon_out`` collects every wall time after ``now`` at which
++    the same rows could project differently (hub-sync staleness, scope-heartbeat freshness)."""
+     stale = offline is not None or last_ok is None or now - last_ok > HUB_STALE_AFTER_S
+     heartbeats = _scope_heartbeats(info_rows)
++    if horizon_out is not None:
++        cutoffs = [beat + d for beat in heartbeats.values() for d in (0.0, SCOPE_HEARTBEAT_FRESH_S)]
++        if not stale:
++            cutoffs.append(last_ok + HUB_STALE_AFTER_S)
++        horizon_out.extend(t for t in cutoffs if t > now)
+     tasks: dict[tuple[str, str | None, str, str], dict[str, Any]] = {}
+     raw: dict[tuple[str, str | None, str, str], dict[str, Any]] = {}
+     released: set[tuple[str, str | None, str, str]] = set()
+@@ -934,15 +994,22 @@ def _project_remote_links() -> list[dict[str, Any]]:
+                 tips[sid] = None
+         return tips[sid]
+ 
++    # [daveey] Both tests below need an exact identity match, so index the receipt rows by it: scanning every
++    # row per legacy card was ~2.4k x ~200 ``supersedes`` calls (~45 ms) per projection.
++    by_origin: dict[tuple, list[dict[str, Any]]] = {}
++    by_key: dict[tuple, list[dict[str, Any]]] = {}
++    if legacy:
++        for row in rows:
++            by_origin.setdefault((row['gateway'], row['origin_gateway'], row['origin_profile'],
++                                  row['origin_session']), []).append(row)
++            by_key.setdefault((row['key'], row['origin_gateway'], row['origin_profile']), []).append(row)
++
+     def superseded(card: dict[str, Any]) -> bool:
+         from hermes_cli.kanban_origin_legacy import supersedes
+-        for row in rows:
+-            if supersedes(card, row):
+-                return True
+-            if (card.get('key') != row['key']
+-                    or card.get('origin_gateway') != row['origin_gateway']
+-                    or card.get('origin_profile') != row['origin_profile']):
+-                continue
++        origin = (card.get('gateway'), card.get('origin_gateway'), card.get('origin_profile'), card.get('session'))
++        if any(supersedes(card, row) for row in by_origin.get(origin, ())):
++            return True
++        for row in by_key.get((card.get('key'), card.get('origin_gateway'), card.get('origin_profile')), ()):
+             aliases = (row['origin_session'], row['session'])
+             if card['session'] in aliases:
+                 return True
+@@ -1582,7 +1649,8 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+ 
+ 
+ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+-    global _cache, _attention_cache, _remote_last, _links_cache, _snapshot_saved
++    global _cache, _attention_cache, _remote_last, _links_cache, _snapshot_saved, _remote_read_memo
++    _remote_read_memo = None
+     with _links_lock:
+         _links_cache = None
+     with _cache_lock:
+diff --git a/tests/hermes_cli/test_kanban_replica_read_memo.py b/tests/hermes_cli/test_kanban_replica_read_memo.py
+new file mode 100644
+index 0000000000..1b4754f6ac
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_read_memo.py
+@@ -0,0 +1,179 @@
++"""A live replica read reuses the last projection while the replica's task rows are unchanged, and only then.
++
++Every case compares the memoized live read with an explicit-``now`` read (which always reads every row) at the
++same wall time, so a hit can never answer differently from a fresh read."""
++import json
++import sqlite3
++import time
++import types
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import profiles
++
++ROWS_SQL = 'SELECT gw, key, data, updated_at'
++
++
++def card(tid, **extra):
++    return {'id': tid, 'board': 'build', 'profile': 'work', 'gateway': 'owner', 'status': 'running',
++            'sessions': [{'gw': 'origin', 'profile': 'default', 'session': 's1', 'rel': 'shepherd'}], **extra}
++
++
++def fake_clock(monkeypatch, now):
++    """Wall time for this module only (``time.time`` itself stays real for pytest and sqlite)."""
++    monkeypatch.setattr(activity, 'time', types.SimpleNamespace(time=now, monotonic=time.monotonic, sleep=time.sleep))
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch):
++    """hermes-hub's replica schema: every write carries the feed's monotonic ``seq``."""
++    path = tmp_path / 'hub.db'
++    with sqlite3.connect(path) as db:
++        db.executescript('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);'
++                         'CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT,'
++                         ' updated_at INTEGER, PRIMARY KEY (gw, coll, key));'
++                         'CREATE TABLE outbox(id INTEGER PRIMARY KEY, data TEXT);')
++        db.executemany('INSERT INTO meta VALUES (?,?)', [('gateway', 'origin'), ('last_ok', '1000'), ('cursor', '0')])
++    seq = {'n': 0}
++
++    def put(tid, **extra):
++        seq['n'] += 1
++        with sqlite3.connect(path) as db:
++            db.execute("INSERT INTO replica VALUES ('owner','tasks',?,1,?,?,1000000) ON CONFLICT(gw, coll, key) DO UPDATE"
++                       " SET version=version+1, seq=excluded.seq, data=excluded.data",
++                       (f'work/build/{tid}', seq['n'], json.dumps(card(tid, **extra))))
++
++    statements = []
++    real_open = activity._open_ro
++
++    def traced_open(p, check_same_thread=True):
++        conn = real_open(p, check_same_thread)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    clock = {'now': 1000.0}
++    monkeypatch.setattr(activity, '_open_ro', traced_open)
++    fake_clock(monkeypatch, lambda: clock['now'])
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    activity._reset_cache_for_tests()
++    yield path, put, statements, clock
++    activity._reset_cache_for_tests()
++
++
++def live_and_fresh(path, clock):
++    """(live read, explicit read at the same instant, live owners_out, explicit owners_out)."""
++    owners_live, owners_fresh = set(), set()
++    live = activity._read_remote_links(path, owners_out=owners_live)
++    fresh = activity._read_remote_links(path, now=clock['now'], owners_out=owners_fresh)
++    return live, fresh, owners_live, owners_fresh
++
++
++def row_reads(statements):
++    return sum(1 for s in statements if s.startswith(ROWS_SQL))
++
++
++def test_unchanged_rows_are_read_once_and_answer_the_same(hub):
++    path, put, statements, clock = hub
++    put('t_one')
++    put('t_two', status='blocked')
++    first = activity._read_remote_links(path)
++    with sqlite3.connect(path) as db:  # hub-sync's other writes (outbox, cursor) leave the task rows alone
++        db.execute("INSERT INTO outbox (data) VALUES ('x')")
++        db.execute("UPDATE meta SET v = '7' WHERE k = 'cursor'")
++    clock['now'] += 2
++    statements.clear()
++    for _ in range(5):
++        assert activity._read_remote_links(path) == first
++    assert row_reads(statements) == 0
++    live, fresh, owners_live, owners_fresh = live_and_fresh(path, clock)
++    assert live == fresh and owners_live == owners_fresh == {('owner', 'build', 't_one'), ('owner', 'build', 't_two')}
++
++
++@pytest.mark.parametrize('change', ['update', 'insert', 'delete'])
++def test_any_task_row_change_rereads(hub, change):
++    path, put, statements, clock = hub
++    put('t_one')
++    put('t_two')
++    before = activity._read_remote_links(path)
++    if change == 'update':
++        put('t_one', status='blocked')
++    elif change == 'insert':
++        put('t_three')
++    else:
++        with sqlite3.connect(path) as db:
++            db.execute("DELETE FROM replica WHERE key = 'work/build/t_two'")
++    statements.clear()
++    live, fresh, owners_live, owners_fresh = live_and_fresh(path, clock)
++    assert row_reads(statements) == 2  # the live read missed, then the explicit read
++    assert live == fresh and owners_live == owners_fresh
++    assert live != before
++
++
++def test_hub_staleness_cutoff_is_never_served_from_the_memo(hub):
++    path, put, _, clock = hub
++    put('t_one')
++    assert [r['stale'] for r in activity._read_remote_links(path)] == [False]
++    clock['now'] = 1000 + activity.HUB_STALE_AFTER_S + 1  # no row changed, but the hub sync is now too old
++    live, fresh, _, _ = live_and_fresh(path, clock)
++    assert live == fresh and [r['stale'] for r in live] == [True]
++
++
++def test_meta_and_heartbeat_changes_reread(hub):
++    path, put, statements, clock = hub
++    put('t_one')
++    activity._read_remote_links(path)
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO meta VALUES ('offline_since', '1001')")
++    statements.clear()
++    live, fresh, _, _ = live_and_fresh(path, clock)
++    assert row_reads(statements) == 2 and live == fresh and live[0]['stale'] is True
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO replica VALUES ('owner','gateway','info',1,99,?,0)",
++                   (json.dumps({'gateway': 'owner', 'task_scopes': []}),))
++    statements.clear()
++    activity._read_remote_links(path)
++    assert row_reads(statements) == 1
++
++
++def test_heartbeat_freshness_bounds_the_reuse_window(hub):
++    """Each scope heartbeat flips release eligibility at ``beat`` and ``beat + SCOPE_HEARTBEAT_FRESH_S``."""
++    info = [('owner', json.dumps({'gateway': 'owner', 'task_scopes': [
++        {'profile': 'work', 'board': 'build', 'state': 'ok', 'observed_at': 1100.0}]}))]
++    horizon = []
++    activity._project_replica(hub[0], 1000.0, 'origin', [], info, 1000.0, None, horizon_out=horizon)
++    assert sorted(horizon) == [1100.0, 1000 + activity.HUB_STALE_AFTER_S, 1100 + activity.SCOPE_HEARTBEAT_FRESH_S]
++
++
++def test_a_replica_without_seq_is_read_every_time(tmp_path, monkeypatch):
++    path = tmp_path / 'hub.db'
++    with sqlite3.connect(path) as db:
++        db.executescript('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);'
++                         'CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER);')
++        db.executemany('INSERT INTO meta VALUES (?,?)', [('gateway', 'origin'), ('last_ok', '1000')])
++        db.execute("INSERT INTO replica VALUES ('owner','tasks','work/build/t_one',?,0)", (json.dumps(card('t_one')),))
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    fake_clock(monkeypatch, lambda: 1000.0)
++    activity._reset_cache_for_tests()
++    first = activity._read_remote_links(path)
++    with sqlite3.connect(path) as db:
++        db.execute("UPDATE replica SET data = ?", (json.dumps(card('t_one', status='blocked')),))
++    assert activity._read_remote_links(path) != first
++    assert activity._remote_read_memo is None
++
++
++def test_origin_profile_is_part_of_the_key(hub, monkeypatch):
++    path, put, _, clock = hub
++    put('t_one')
++    assert activity._read_remote_links(path)
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'work')
++    live, fresh, _, _ = live_and_fresh(path, clock)
++    assert live == fresh == []
++
++
++def test_extending_the_returned_list_never_reaches_the_memo(hub):
++    """``_legacy_remote_links`` appends ghost rows to the list it gets back."""
++    path, put, _, _ = hub
++    put('t_one')
++    activity._read_remote_links(path).append({'bogus': True})
++    assert [r['id'] for r in activity._read_remote_links(path)] == ['t_one']
+-- 
+2.55.0
+
