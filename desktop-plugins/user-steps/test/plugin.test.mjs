@@ -200,10 +200,12 @@ test('strip: lists open steps + other blocked cards for the focused chat, hides 
   const unblocked = []
   window.__blockedPanel.unblockCard = async (item, note) => unblocked.push([item.id, note])
   composer.sent = []
-  const requestBtn = [...strip.querySelectorAll('[data-user-steps-card="t_human001"] button')].find(b => b.textContent === 'Request complete action')
-  await React.act(async () => { requestBtn.click(); await flush() })
+  // No button asks the user to request agent work; legacy rows answer in chat.
+  assert.doesNotMatch(strip.textContent, /Request complete action/)
+  const replyBtn = [...strip.querySelectorAll('[data-user-steps-step="us_eeeeee01"] button')].find(b => b.textContent === 'Reply in chat')
+  await React.act(async () => { replyBtn.click(); await flush() })
   assert.deepEqual(unblocked, [])
-  assert.match(composer.drafts.at(-1)[1], /complete versioned action request/)
+  assert.match(composer.drafts.at(-1)[1], /^Re: /)
   assert.deepEqual(composer.sent, [])
   // everything resolved, no other cards -> no strip at all
   steps[0].status = 'resolved'
@@ -357,7 +359,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   assert.equal(strip.querySelector('[data-user-steps-card="t_failed01"]'), null)
   const human = strip.querySelector('[data-user-steps-card="t_human002"]')
   assert.match(human.textContent, /Approve the plan in the doc/)
-  assert.ok([...human.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
+  assert.ok(![...human.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
   const loading = strip.querySelector('[data-user-steps-issue="t_loading03"]')
   assert.match(loading.textContent, /No actionable human request/)
   assert.deepEqual([...loading.querySelectorAll('button')].map(b => b.textContent), ['Open card', 'Dismiss'])
@@ -418,7 +420,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await show(React.createElement(m.Strip, { key: 'human-after-pause' }))
   assert.equal(el().querySelector('[data-user-steps-issue="t_failed01"]'), null)
   const actionable = el().querySelector('[data-user-steps-card="t_failed01"]')
-  assert.ok([...actionable.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
+  assert.ok(actionable && ![...actionable.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
   delete window.__blockedPanel
 })
 
@@ -475,7 +477,7 @@ test('strip: an external-event wait (kind=time, classified in place) shows no Fo
   await m.refresh(fakeRest([], {}))
   await show(React.createElement(m.Strip, { key: 'time-wait-ask' }))
   const card = el().querySelector('[data-user-steps-card="t_tracker1"]')
-  assert.ok(card && [...card.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
+  assert.ok(card && ![...card.querySelectorAll('button')].some(b => b.textContent === 'Request complete action'))
   delete window.__blockedPanel
 })
 

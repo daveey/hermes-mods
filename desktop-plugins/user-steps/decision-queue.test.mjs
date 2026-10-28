@@ -275,6 +275,30 @@ test('incomplete approvals await agent completion while legacy clarification lab
  }
 })
 
+test('legacy "Request complete action" placeholder never renders for any kind (Diplomacy repro)',async()=>{
+ const legacy=[{id:'request-context',label:'Request complete action',effect:'revise'}]
+ for(const kind of ['approval','external_step','choice','input']) {
+  const r=freshRequest({kind,state:'needs_context',title:'Decide whether web Diplomacy gets a labeled animation',scope:{complete:false,markdown:"Should it make a clearly labeled animation rebuilt from the replay's recorded moves, or should web Diplomacy be left out of the clip set?",sourceRefs:[]},outcomes:{revise:'Request complete action; keep work blocked.'},choices:legacy})
+  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>assert.fail('no submission')}))
+  assert.doesNotMatch(el().textContent,/Request complete action/,kind)
+  const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
+  if(kind==='approval') assert.deepEqual(labels,['Approve'])
+  else assert.deepEqual(labels,[],kind)
+  if(['approval','external_step'].includes(kind)) assert.match(el().querySelector('[data-agent-completion-pending]').textContent,/Agent completion pending/)
+  else assert.match(el().querySelector('[data-approval-blocked]').textContent,/Answer in chat/)
+ }
+})
+
+test('incomplete external steps await agent completion; complete external steps keep their choices',async()=>{
+ const pending=freshRequest({kind:'external_step',state:'needs_context',scope:{complete:false,markdown:'Plug in the cable',sourceRefs:[]},choices:[{id:'ctx',label:'Explain',effect:'revise'}]})
+ await show(React.createElement(m.DecisionRow,{key:pending.requestId,request:pending,route,call:async()=>assert.fail('no submission')}))
+ assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),[])
+ const done=freshRequest({kind:'external_step',choices:[{id:'did',label:'I did it',effect:'approve'},{id:'edit',label:'Change it',effect:'revise'}]})
+ await show(React.createElement(m.DecisionRow,{key:done.requestId,request:done,route,call:async()=>assert.fail('no submission')}))
+ assert.deepEqual([...el().querySelectorAll('button')].map(b=>b.textContent),['I did it','Change it'])
+ assert.equal(el().querySelector('[data-agent-completion-pending]'),null)
+})
+
 test('For you hides closed and superseded requests but retains operation readback until terminal confirmation',async()=>{
  const closed=freshRequest({state:'resolved',title:'Old resolved'}),superseded=freshRequest({state:'superseded',title:'Old superseded'}),cancelled=freshRequest({state:'cancelled',title:'Old cancelled'})
  const pending=freshRequest({state:'resolved',title:'Pending receipt',resolution:{operationId:'queue-readback',choiceId:'yes',revision:1}})
@@ -302,5 +326,26 @@ test('backend failure and malformed owner render inline errors and disable cache
  window.hermesDesktop.api=async()=>({requests:[{...r,owner:{...owner,storedSessionId:'sibling-session'}}]})
  await React.act(async()=>{await m.refreshRequests();await flush()})
  assert.match(el().textContent,/Invalid action request owner/)
+ await show(null);delete window.hermesDesktop
+})
+
+test('backfilled legacy rows: real Diplomacy options, Done for user steps, agent-pending approvals not counted For you',async()=>{
+ const span="Should it make a clearly labeled animation rebuilt from the replay's recorded moves, or should web Diplomacy be left out of the clip set?"
+ const diplo=freshRequest({kind:'choice',title:'Decide whether web Diplomacy gets a labeled animation',revision:2,scope:{complete:true,markdown:span,sourceRefs:[]},outcomes:{answer:'Send this answer to the agent. This does not grant execution permission.'},choices:[{id:'answer-0',label:"Make a clearly labeled animation rebuilt from the replay's recorded moves",effect:'answer'},{id:'answer-1',label:'Should web Diplomacy be left out of the clip set',effect:'answer'},{id:'answer-text',label:'Answer in your own words',effect:'answer'}]})
+ const step=freshRequest({kind:'external_step',title:'Record your voice',revision:2,scope:{complete:true,markdown:'Record your voice, then say ready.',sourceRefs:[]},outcomes:{answer:'Tell the agent. This does not grant execution permission.'},choices:[{id:'answer-done',label:'Done',effect:'answer'},{id:'answer-text',label:"Can't do it / reply in your own words",effect:'answer'}]})
+ const ap=freshRequest({kind:'approval',title:'Consent to a disconnect',revision:2,state:'needs_context',scope:{complete:false,markdown:'That disruption needs consent.',sourceRefs:[]},outcomes:{revise:'Waiting for the agent to publish the full exact plan.'},choices:[{id:'revise',label:'Request changes',effect:'revise'}]})
+ window.hermesDesktop={api:async()=>({requests:[diplo,step,ap]})}
+ await show(React.createElement(m.ActionQueue,{key:'backfilled'}))
+ assert.doesNotMatch(el().textContent,/Request complete action/)
+ assert.match(el().querySelector('h2').textContent,/^For you \(2\)$/)
+ const labels=[...el().querySelectorAll('button')].map(b=>b.textContent)
+ for(const want of ["Make a clearly labeled animation rebuilt from the replay's recorded moves",'Should web Diplomacy be left out of the clip set','Answer in your own words','Done',"Can't do it / reply in your own words"]) assert.ok(labels.includes(want),want)
+ assert.ok(!labels.includes('Request changes'),'agent-pending approval has no revise button')
+ const apRow=[...el().querySelectorAll('[data-action-request]')].find(a=>a.getAttribute('aria-label')==='Consent to a disconnect')
+ assert.match(apRow.textContent,/Agent completion pending/)
+ assert.doesNotMatch(apRow.textContent,/Request changes:/,'no revise outcome line while the plan is missing')
+ window.hermesDesktop={api:async()=>({requests:[ap]})}
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.match(el().querySelector('h2').textContent,/^Waiting on the agent \(1\)/)
  await show(null);delete window.hermesDesktop
 })

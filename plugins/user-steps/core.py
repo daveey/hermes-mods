@@ -27,6 +27,9 @@ MAX_NEW_PER_REPLY = 5
 MAX_NEW_PER_HOUR = 12
 ATTR_BUDGET = 1024
 DIRECTIVE = "user-step"
+OPTION_MAX = 200
+# Retired migration fallback: one generic button that asked the USER to request agent work.
+LEGACY_FALLBACK = [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}]
 
 
 def home() -> Path:
@@ -524,7 +527,9 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
         text = re.sub(r"\s+", " ", str(s.get("text") or "")).strip()[:300]
         span = str(s.get("verbatim_span") or "").strip()
         kind = str(s.get("kind") or "").strip().lower()
-        opts = [re.sub(r"\s+", " ", str(o)).strip()[:60] for o in (s.get("options") or []) if str(o).strip()][:4]
+        # Options keep their full text: migration only turns ones literally present in the
+        # source into buttons, so a cut-off label would never match (or would show mid-word).
+        opts = [re.sub(r"\s+", " ", str(o)).strip()[:OPTION_MAX] for o in (s.get("options") or []) if str(o).strip()][:4]
         if not text or not span:
             continue
         if kind not in KINDS:
@@ -1162,7 +1167,7 @@ class ActionStore:
             if effect in ('approve', 'answer') and not r['scope']['complete']: raise ActionError('Scope is incomplete')
             if effect == 'revise': _string(text)
             if effect == 'answer':
-                if r['kind'] not in ('choice', 'input'): raise ActionError('Answers require a clarification')
+                if r['kind'] not in ('choice', 'input', 'external_step'): raise ActionError('Answers require a clarification or user step')
                 if choice['id'] == 'answer-text': _string(text)
                 elif text != choice['label']: raise ActionError('Answer must match the exact choice label')
             from datetime import datetime, timezone
@@ -1244,49 +1249,40 @@ class ActionStore:
         _string(step.get('id')); _string(step.get('text'))
         ref = dict(gatewayId=owner['gatewayId'], profile=owner['profile'], type='user_step', id=step['id'])
         previous = None
+        r = legacy_request(owner, step, ref)
         with self._tx() as c:
             old = c.execute('SELECT namespace,id FROM aliases WHERE ref=?', (_json(ref),)).fetchone()
             if old:
                 if old['namespace'] != self._ns(owner): raise ActionError('Alias owner mismatch', 403)
                 previous = self._get(c, owner, old['id'])
-                legacy = [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}]
-                if not (previous['kind'] in ('choice', 'input') and previous['revision'] == 1
-                        and previous['state'] == 'needs_context' and not previous.get('resolution')
-                        and previous['choices'] == legacy):
+                if previous['state'] not in ('open', 'needs_context') or previous.get('resolution'):
                     return previous
-        r = {'schemaVersion': 2, 'owner': owner, 'requestId': str(uuid.uuid4()), 'revision': 1,
-             'kind': {'approve': 'approval', 'choose': 'choice', 'do': 'external_step'}.get(step.get('kind'), 'input'),
-             'title': step['text'], 'scope': {'markdown': step.get('paragraph') or step['text'],
-                                             'complete': False, 'sourceRefs': [ref]},
-             'limits': [], 'exclusions': [], 'outcomes': {'revise': 'Request complete action; keep work blocked.'},
-             'choices': [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}],
-             'aliases': [ref], 'state': 'needs_context'}
-        if r['kind'] in ('choice', 'input'):
-            # Completeness here describes the QUESTION, never executable scope.
-            # Only literal source options become buttons; no invented Yes/No or
-            # inferred permission. Free text is always available.
-            source = step.get('paragraph') or step['text']
-            options = list(dict.fromkeys(x for x in step.get('options', [])
-                                        if isinstance(x, str) and x.strip() and x in source))
-            r.update(state='open', choices=[
-                {'id': f'answer-{i}', 'label': label, 'effect': 'answer'}
-                for i, label in enumerate(options)
-            ] + [{'id': 'answer-text', 'label': 'Answer in your own words', 'effect': 'answer'}])
-            r['scope']['complete'] = True
-            r['outcomes'] = {'answer': 'Send this answer to the agent. This does not grant execution permission.',
-                             'revise': 'Clarify the question; no execution permission is granted.'}
+                if previous['choices'] == LEGACY_FALLBACK and previous['revision'] == 1:
+                    pass  # retired generic fallback: always re-render (any kind)
+                else:
+                    # A prior mechanical upgrade (server-recorded marker) may be refreshed when
+                    # the derivation improves; agent/producer revisions are never touched.
+                    marker = c.execute('SELECT body FROM clarification_upgrades WHERE namespace=? AND request=? '
+                                       'AND revision=?', (self._ns(owner), previous['requestId'],
+                                                          previous['revision'])).fetchone()
+                    shape = ('choices', 'outcomes', 'state', 'scope')
+                    if (not marker or json.loads(marker[0]) != previous
+                            or all(previous[k] == r[k] for k in shape)):
+                        return previous
         if previous:
             if (r['kind'] != previous['kind'] or r['scope']['markdown'] != previous['scope']['markdown']
                     or r['title'] != previous['title']):
                 return previous
             r['requestId'] = previous['requestId']
-            upgraded = self.revise(owner, previous['requestId'], 1, r)
-            # This marker proves a mechanical question-only migration, not an
-            # agent scope revision. Missing/racing markers fail closed in chat.
-            with self._tx() as c:
-                if self._get(c, owner, upgraded['requestId']) == upgraded:
-                    c.execute('INSERT INTO clarification_upgrades VALUES (?,?,?,?)',
-                              (self._ns(owner), upgraded['requestId'], upgraded['revision'], _json(upgraded)))
+            upgraded = self.revise(owner, previous['requestId'], previous['revision'], r)
+            # This marker proves a mechanical, server-side re-render, not an agent scope
+            # revision. Missing/racing markers fail closed in chat. Approvals never get one:
+            # they stay agent-incomplete until the producer publishes the exact plan.
+            if upgraded['kind'] != 'approval':
+                with self._tx() as c:
+                    if self._get(c, owner, upgraded['requestId']) == upgraded:
+                        c.execute('INSERT INTO clarification_upgrades VALUES (?,?,?,?)',
+                                  (self._ns(owner), upgraded['requestId'], upgraded['revision'], _json(upgraded)))
             return upgraded
         try: return self.create(owner, r)
         except ActionError as exc:
@@ -1295,3 +1291,125 @@ class ActionStore:
                 old = c.execute('SELECT id FROM aliases WHERE ref=?', (_json(ref),)).fetchone()
                 if not old: raise
                 return self._get(c, owner, old['id'])
+
+    def backfill_legacy(self, ledger=None, *, gateway=None):
+        """One-shot server-side re-render of every request still carrying the retired
+        generic fallback. Uses only server-stored owners and their own session ledger
+        entry (exact alias id + session); takes no caller input and grants nothing."""
+        ledger = ledger or Ledger()
+        with self._tx() as c:
+            rows = c.execute('SELECT r.namespace,r.id,r.session,v.body FROM requests r JOIN revisions v '
+                             'ON v.namespace=r.namespace AND v.id=r.id AND v.revision=r.revision '
+                             "WHERE r.state IN ('open','needs_context') AND r.resolution IS NULL").fetchall()
+        out = []
+        for row in rows:
+            body = json.loads(row['body'])
+            owner = body.get('owner') or {}
+            if body.get('choices') != LEGACY_FALLBACK or owner.get('storedSessionId') != row['session']:
+                continue
+            if gateway and owner.get('gatewayId') != gateway:
+                continue
+            try:
+                if self._ns(owner) != row['namespace']: continue
+                refs = [a for a in body['aliases'] if a['type'] == 'user_step'
+                        and a['gatewayId'] == owner['gatewayId'] and a['profile'] == owner['profile']]
+                if len(refs) != 1: continue
+                step = next((s for s in ledger.read(row['session']).get('steps', [])
+                             if s.get('id') == refs[0]['id'] and s.get('session') == row['session']), None)
+                if step is None: continue
+                after = self.migrate_step(owner, step)
+                if after['revision'] != body['revision']:
+                    out.append(after)
+            except (ActionError, OSError, ValueError, KeyError, sqlite3.Error):
+                continue
+        return out
+
+
+_ALT_LEAD = re.compile(r"^(?:do you (?:mean|want(?: me)? to|prefer(?: to)?)|would you (?:like|prefer)(?: me)? to|"
+                       r"should (?:i|we|it)|shall (?:i|we)|can (?:i|we)|want me to|is it)\b\s*", re.I)
+_ALT_OTHER = re.compile(r"^(?:something else|anything else|other|not|neither|none(?: of (?:these|them))?)$", re.I)
+_WH = re.compile(r"^(?:which|what|who|whom|whose|where|when|how|why)\b", re.I)
+
+
+def _ws(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
+def _cap(s: str) -> str:
+    return s[:1].upper() + s[1:]
+
+
+def _question_alternatives(span: str, source: str) -> list[str]:
+    """Literal alternatives of ONE 'A, or B?' question in the source span. Nothing
+    is paraphrased: each label is a verbatim slice of the question (case of the first
+    letter aside); 'something else' tails are left to the free-text answer."""
+    if not span or span.casefold() not in source.casefold():
+        return []
+    questions = [q for q in re.findall(r"[^.?!\n]*\?", span) if re.search(r"\bor\b", q, re.I)]
+    if len(questions) != 1:
+        return []
+    # Markup and a leading 'Ask:'-style label are framing, not part of an option.
+    q = re.sub(r"[*_`]+", "", questions[0]).strip()
+    q = re.sub(r"^[A-Za-z][\w ]{0,20}:\s*", "", q)
+    parts = re.split(r",?\s+or\s+", q.rstrip('?').strip(), flags=re.I)
+    if len(parts) != 2:
+        return []
+    out = []
+    for part in parts:
+        part = _ALT_LEAD.sub('', part.strip(' ,;:')).strip(' ,;:')
+        if _ALT_OTHER.match(part):
+            continue
+        if _WH.match(part) or len(part.split()) < 2 or len(part) > OPTION_MAX:
+            return []  # open questions ('which model ID…') are not pickable options
+        out.append(_cap(part))
+    return out
+
+
+def literal_options(step: dict) -> list[str]:
+    """Answer buttons for a legacy clarification: only text literally in the source."""
+    source = _ws(step.get('paragraph') or step.get('text'))
+    low = source.casefold()
+    out = []
+    for o in step.get('options') or []:
+        o = _ws(o)
+        if o and o.casefold() in low:
+            i = low.index(o.casefold())
+            out.append(source[i:i + len(o)])
+    if len(out) < 2:
+        derived = _question_alternatives(_ws(step.get('verbatim_span')), source)
+        if len(derived) > len(out):
+            out = derived
+    return list(dict.fromkeys(out))[:4]
+
+
+ANSWER_TEXT = {'id': 'answer-text', 'label': 'Answer in your own words', 'effect': 'answer'}
+
+
+def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
+    """Canonical v2 shape for an extracted step. Never a generic 'request' button:
+    clarifications get their literal options + free text, user steps get Done + free
+    text, approvals stay agent-incomplete (no user button) until a producer publishes
+    the exact plan. Nothing here grants execution permission."""
+    kind = {'approve': 'approval', 'choose': 'choice', 'do': 'external_step'}.get(step.get('kind'), 'input')
+    markdown = step.get('paragraph') or step['text']
+    r = {'schemaVersion': 2, 'owner': owner, 'requestId': str(uuid.uuid4()), 'revision': 1, 'kind': kind,
+         'title': step['text'], 'scope': {'markdown': markdown, 'complete': True, 'sourceRefs': [ref]},
+         'limits': [], 'exclusions': [], 'aliases': [ref], 'state': 'open'}
+    no_grant = 'This does not grant execution permission.'
+    if kind in ('choice', 'input'):
+        # Completeness here describes the QUESTION, never executable scope.
+        r['choices'] = [{'id': f'answer-{i}', 'label': label, 'effect': 'answer'}
+                        for i, label in enumerate(literal_options(step))] + [dict(ANSWER_TEXT)]
+        r['outcomes'] = {'answer': f'Send this answer to the agent. {no_grant}',
+                         'revise': f'Clarify the question; {no_grant[0].lower() + no_grant[1:]}'}
+    elif kind == 'external_step':
+        r['choices'] = [{'id': 'answer-done', 'label': 'Done', 'effect': 'answer'},
+                        dict(ANSWER_TEXT, label="Can't do it / reply in your own words")]
+        r['outcomes'] = {'answer': f'Tell the agent. {no_grant}'}
+    else:
+        r['scope']['complete'] = False
+        r['state'] = 'needs_context'
+        r['choices'] = [{'id': 'revise', 'label': 'Request changes', 'effect': 'revise'}]
+        r['outcomes'] = {'revise': 'Waiting for the agent to publish the full exact plan. Nothing can be '
+                                   'approved yet and no permission is granted.'}
+    return r

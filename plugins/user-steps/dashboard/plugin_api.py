@@ -129,6 +129,12 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                     logging.getLogger('user-steps').warning('Startup reconciliation deferred for an unavailable owner')
         except Exception:
             logging.getLogger('user-steps').warning('Startup reconciliation unavailable; manual retry remains available')
+        try:
+            # Re-render every row still on the retired generic fallback, idle sessions too.
+            core = _load('core')
+            store().backfill_legacy(ledger(), gateway=core.server_owner('backfill')['gatewayId'])
+        except Exception:
+            logging.getLogger('user-steps').warning('Legacy request backfill deferred')
 
     @router.get('/ping')
     def ping():

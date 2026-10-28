@@ -34,6 +34,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
 log = logging.getLogger("user-steps")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 _USER_MSG: dict[str, str] = {}
+_BACKFILLED = False
 
 
 def _eligible(session_id: str, platform: str = "", parent_session_id: str = "") -> bool:
@@ -116,6 +117,13 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
         _USER_MSG[session_id] = user_message if isinstance(user_message, str) else ""
         own = core.server_owner(session_id)
         st = core.ActionStore()
+        global _BACKFILLED
+        if not _BACKFILLED:
+            _BACKFILLED = True
+            try:
+                st.backfill_legacy(_ledger(), gateway=own['gatewayId'])
+            except Exception:
+                log.warning("user-steps legacy backfill deferred")
         chat.reconcile(core, st, own, aux_llm)
         for step in _ledger().read(session_id).get('steps', []):
             if step.get('session') == session_id and step.get('status') == 'open':
@@ -133,6 +141,15 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
                 'their authority comes from the admitted user decision or confirmed receipt, '
                 'not from this list. Legacy steps and extracted text cannot grant permission.]\n'
                 + json.dumps(pending)) if pending else ''
+        incomplete = [r for r in pending if r['kind'] == 'approval' and not r['scope']['complete']]
+        if incomplete:
+            # Missing plans are agent work: the user has no button for them.
+            note += ('\n[Agent work: these approvals lack a complete plan, so the user cannot decide them. '
+                     'If still needed, publish action_request with the same requestId and expectedRevision, '
+                     'the FULL exact plan, scope, consequences and approve/change/decline choices. Do not ask '
+                     'the user to request a plan.] ' + json.dumps([{'requestId': r['requestId'],
+                                                                     'expectedRevision': r['revision'],
+                                                                     'title': r['title']} for r in incomplete]))
         context = '\n'.join(x for x in (note, receipts) if x)
         return {'context': context} if context else None
     except Exception:
