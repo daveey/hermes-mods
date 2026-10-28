@@ -1,6 +1,6 @@
 # Desktop: keep remote gateways warm (always-on dashboard, prewarm, probe skip)
 
-Patches **0526** (`4dbfb50490`) and **0534** (`7c62393349`, named-profile prewarm). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
+Patches **0526** (`4dbfb50490`) and **0535** (`7c62393349`, named-profile prewarm). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
 
 ## Behavior
 
@@ -22,7 +22,7 @@ Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a
   path. It never kills it, writes a lockfile for it or rotates its token. Named profiles keep owned backends.
 - **Prewarm + hold.** `remote-prewarm.ts` dials every SSH connection in `connections.json` (its default profile,
   plus each named profile a user dispatch reached in the last 24 h, at most 4 per connection, recorded by
-  `RecentRemoteProfiles` in `userData/remote-prewarm-profiles.json`; 0534) at app ready, then every
+  `RecentRemoteProfiles` in `userData/remote-prewarm-profiles.json`; 0535) at app ready, then every
   15 s forces a health probe through `ensureRegistryBackend(…, { forceProbe })`; a failure retires the dead tunnel
   and reconnects, with 2/5/15/30/60 s backoff. `ControlPersist` 300 → 3600 s. `HERMES_DESKTOP_REMOTE_PREWARM=0`
   turns it off.
@@ -51,7 +51,7 @@ Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a
 - `apps/desktop/electron/remote-warm-dispatch.test.ts`: probe skipped within 30 s and run after 30 s; forced probe
   on a dropped tunnel retires + reconnects; prewarmer backoff reconnect; startup prewarm dials all connections in
   parallel and schedules the keepalive; removed connections drop; recently used named profiles join the targets,
-  expire after 24 h, cap at 4, survive a restart, and are held like default ones (0534); `main.ts` call sites (start on ready, stop on
+  expire after 24 h, cap at 4, survive a restart, and are held like default ones (0535); `main.ts` call sites (start on ready, stop on
   quit, forced keepalive through `ensureRegistryBackend`, ledger wiring) pinned by source.
 
 The `main.ts` wiring is checked by source assertions, not by booting Electron; the live behavior is proved from
