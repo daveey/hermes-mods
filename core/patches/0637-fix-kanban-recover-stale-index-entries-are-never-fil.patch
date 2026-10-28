@@ -1,0 +1,419 @@
+From 949f16241e792a9fe5e2c78d2478e639b69f1d0b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:08:34 +0000
+Subject: [PATCH] fix(kanban-recover): stale index entries are never filled
+ back in; writes in every pass or a process on deleted sidecars install
+ nothing; unverified installs and timeouts still report and clean up [daveey]
+
+---
+ hermes_cli/kanban_db_recover.py            | 128 +++++++++++++++----
+ tests/hermes_cli/test_kanban_db_recover.py | 142 +++++++++++++++++++++
+ 2 files changed, 246 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index 31bc251646..43fe38e40c 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -82,13 +82,20 @@ class TableLoss:
+     possibly_lost: int = 0
+     lost_keys: list[Any] = field(default_factory=list)
+     unreadable_paths: int = 0
++    # Index entries whose rowid a point lookup cleanly found absent (no read error): stale entries
++    # of deleted rows, so they are neither filled from the backup nor counted as lost.
++    stale_index_entries: int = 0
+ 
+ 
+ @dataclass
+ class RecoveryResult:
+     """``status``: ``recovered`` (rebuilt and installed), ``healthy`` (a clean process found no
+     damage: nothing written), ``index_only`` (REINDEX is enough; left to the guard), ``busy``
+-    (another recovery holds the lock), ``missing`` (no file), ``failed`` (nothing installed)."""
++    (another recovery holds the lock), ``missing`` (no file), ``contended`` (the board was written
++    during every rebuild pass: nothing installed, retried later), ``stranded_holders`` (a process
++    still maps deleted -wal/-shm files of the board, so its checkpoint could overwrite an install:
++    nothing installed), ``installed_unverified`` (written, but the post-install check failed),
++    ``failed`` (nothing installed)."""
+ 
+     status: str
+     db_path: str
+@@ -102,6 +109,7 @@ class RecoveryResult:
+     tables: dict[str, TableLoss] = field(default_factory=dict)
+     lost_rows: int = 0
+     concurrent_writes: bool = False
++    stranded_pids: list[int] = field(default_factory=list)
+     started_at: float = 0.0
+     finished_at: float = 0.0
+ 
+@@ -239,17 +247,19 @@ Listed = dict[str, tuple[list[str], dict[int, tuple]]]
+ 
+ 
+ def _salvage_table(src: sqlite3.Connection, table: str, sql: Optional[str]
+-                   ) -> tuple[dict[Any, tuple], list[str], int, Listed]:
++                   ) -> tuple[dict[Any, tuple], list[str], int, Listed, set[int]]:
+     """Every readable row of ``table``: ``(rows by key, column names, failed read paths, listed)``.
+     The key is the rowid (or the whole row for WITHOUT ROWID tables). ``listed`` maps each index to
+     the rowids it still lists (with the index's key columns, for the report): a covering scan reads
+-    only the index b-tree, so it names rows whose table page may be unreadable."""
++    only the index b-tree, so it names rows whose table page may be unreadable. The last element
++    holds listed rowids a point lookup found cleanly absent (no read error): stale index entries
++    of deleted rows, dropped from ``listed`` so they are never filled back in from a backup."""
+     try:
+         columns = [str(r[1]) for r in src.execute(f"PRAGMA table_info({_q(table)})")]
+     except sqlite3.DatabaseError:
+         columns = []
+     if not columns:
+-        return {}, [], 1, {}
++        return {}, [], 1, {}, set()
+     cols = ", ".join(_q(c) for c in columns)
+     rowid = not _is_without_rowid(sql)
+     rows: dict[Any, tuple] = {}
+@@ -271,6 +281,7 @@ def _salvage_table(src: sqlite3.Connection, table: str, sql: Optional[str]
+             else:
+                 rows.setdefault(row, row)
+     listed: Listed = {}
++    stale: set[int] = set()
+     if rowid:
+         for index, icols in indexes:
+             if not icols:
+@@ -281,10 +292,15 @@ def _salvage_table(src: sqlite3.Connection, table: str, sql: Optional[str]
+         # Point lookups for every listed row no scan produced: a scan that stops on a damaged page
+         # can also drop the row it was holding, while a lookup reaches any intact leaf directly.
+         for rid in sorted({rid for _cols, entries in listed.values() for rid in entries} - set(rows)):
+-            got, _ = _read_rows(src, f"{select} WHERE rowid = ?", (rid,))
++            got, stopped = _read_rows(src, f"{select} WHERE rowid = ?", (rid,))
++            if not got and not stopped:
++                stale.add(rid)
+             for row in got:
+                 rows.setdefault(row[0], row[1:])
+-    return rows, columns, failed, listed
++        for _cols, entries in listed.values():
++            for rid in stale:
++                entries.pop(rid, None)
++    return rows, columns, failed, listed, stale
+ 
+ 
+ def _healthy_fill_source(db_path: Path, exclude: set[Path]) -> Optional[Path]:
+@@ -293,7 +309,13 @@ def _healthy_fill_source(db_path: Path, exclude: set[Path]) -> Optional[Path]:
+     candidates = [p for p in parent.glob(f"{base}.*") if p.is_file() and p not in exclude
+                   and (p.name.endswith(".bak") or ".pre-recover-" in p.name)
+                   and not p.name.endswith((".damaged.bak", "-wal", "-shm"))]
+-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
++    def _mtime(p: Path) -> float:
++        try:
++            return p.stat().st_mtime
++        except OSError:  # rotated away while we list
++            return -1.0
++    candidates = [p for p in candidates if _mtime(p) >= 0]
++    candidates.sort(key=_mtime, reverse=True)
+     for cand in candidates[:12]:
+         try:
+             conn = sqlite3.connect(f"{cand.resolve().as_uri()}?immutable=1", uri=True)
+@@ -338,10 +360,11 @@ def _build(snapshot: Path, out: Path, fill: Optional[Path], result: RecoveryResu
+             dst.execute(str(sql))
+         listed_by_table: dict[str, Listed] = {}
+         for name, sql in tables:
+-            rows, columns, failed, listed = _salvage_table(src, name, sql)
++            rows, columns, failed, listed, stale = _salvage_table(src, name, sql)
+             listed_by_table[name] = listed
+             loss = result.tables.setdefault(name, TableLoss())
+             loss.unreadable_paths = failed
++            loss.stale_index_entries = len(stale)
+             if not columns:
+                 continue
+             names = ", ".join(_q(c) for c in columns)
+@@ -510,6 +533,32 @@ def _snapshot(watch: sqlite3.Connection, live: Path, dest: Path) -> tuple[sqlite
+         return watch, -1
+ 
+ 
++def stranded_holders(live: Path, proc_root: Path = Path("/proc")) -> list[int]:
++    """Pids of processes that still hold an fd on a DELETED ``-wal``/``-shm`` of ``live`` (Linux
++    ``/proc``; empty elsewhere). Such a process keeps writing into its unlinked WAL and its next
++    checkpoint copies those pages into the main file, over anything installed meanwhile: the
++    install must wait until it is gone, or the board is corrupted again."""
++    targets = {f"{live.resolve()}{suffix} (deleted)" for suffix in ("-wal", "-shm")}
++    pids: list[int] = []
++    try:
++        procs = [p for p in proc_root.iterdir() if p.name.isdigit()]
++    except OSError:
++        return pids
++    for proc in procs:
++        try:
++            fds = list((proc / "fd").iterdir())
++        except OSError:
++            continue
++        for fd in fds:
++            try:
++                if os.readlink(fd) in targets:
++                    pids.append(int(proc.name))
++                    break
++            except OSError:
++                continue
++    return sorted(pids)
++
++
+ class InstalledUnverified(RuntimeError):
+     """The rebuilt board was written into the live file but the post-install check failed."""
+ 
+@@ -553,6 +602,8 @@ def recover(db_path: Path, *, fill: bool = True, file_card: bool = True, reconci
+     """Recover ``db_path`` in THIS process. Run it in a process that holds no connection to the
+     board (the CLI and :func:`spawn_recovery` do); see the module docstring for the steps."""
+     path = Path(db_path).expanduser()
++    with contextlib.suppress(OSError):
++        path = path.resolve()  # one lock file per board, however the path was spelled
+     result = RecoveryResult(status="failed", db_path=str(path), started_at=time.time())
+     try:
+         if not path.exists() or path.stat().st_size == 0:
+@@ -584,34 +635,53 @@ def recover(db_path: Path, *, fill: bool = True, file_card: bool = True, reconci
+                     _build(snapshot, rebuilt, fill_src, result)
+                     result.snapshot_path, result.fill_source = str(snapshot), str(fill_src) if fill_src else None
+                     # A commit after the snapshot would be overwritten by the install: rebuild again.
++                    # (Residual window: a commit between this check and the backup taking the write
++                    # lock is still overwritten; the backup API can't check and lock atomically.)
+                     if version >= 0 and _data_version(watch) == version:
+                         break
+                     _log.warning("kanban recovery: %s was written during rebuild pass %d; rebuilding again",
+                                  path, attempt + 1)
+                 else:
+-                    result.concurrent_writes = True  # still changing after the last pass: installed anyway
+-                if dry_run:
++                    # Still changing after the last pass: installing would drop those commits.
++                    result.concurrent_writes = True
++                    result.status = "contended"
++                    result.reason = (f"the board was written during all {_MAX_SALVAGE_PASSES} rebuild passes; "
++                                     "nothing installed (the next automatic attempt retries)")
++                if result.status != "contended" and not dry_run:
++                    result.stranded_pids = stranded_holders(path)
++                    if result.stranded_pids:
++                        result.status = "stranded_holders"
++                        result.reason = (f"pid(s) {result.stranded_pids} still hold deleted -wal/-shm files of this "
++                                         "board; their checkpoint would overwrite the install. Restart them, "
++                                         "then run `hermes kanban recover` again. Nothing installed.")
++                if dry_run and result.status not in ("contended",):
+                     result.status = "dry_run"
+                     return result
+-                try:
+-                    _install(rebuilt, path)
+-                    result.status = "recovered"
+-                except InstalledUnverified:
+-                    result.status = "installed_unverified"
+-                    raise
++                if result.status == "failed":
++                    try:
++                        _install(rebuilt, path)
++                        result.status = "recovered"
++                    except InstalledUnverified as exc:
++                        result.status = "installed_unverified"
++                        result.reason = str(exc)
+             finally:
+                 watch.close()
+                 import shutil
+                 shutil.rmtree(work, ignore_errors=True)
+                 _rotate_snapshots(path)
+-            _invalidate_init_cache(path)
++            if result.status in ("recovered", "installed_unverified"):
++                _invalidate_init_cache(path)
+             result.finished_at = time.time()
+             result.report_path = str(_write_report(path, result, stamp))
+-        _log.error("kanban board %s recovered from b-tree corruption: %d known lost row(s); report %s",
+-                   path, result.lost_rows, result.report_path)
+-        if reconcile_sync:
++        if result.status in ("recovered", "installed_unverified"):
++            _log.error("kanban board %s %s after b-tree corruption: %d known lost row(s); report %s",
++                       path, result.status, result.lost_rows, result.report_path)
++        else:
++            _log.error("kanban board %s NOT recovered (%s): %s; report %s",
++                       path, result.status, result.reason, result.report_path)
++        if reconcile_sync and result.status == "recovered":
+             result.sync = _reconcile_sync(path)
+-        if file_card:
++        if file_card and result.status in ("recovered", "installed_unverified"):
+             result.card_id = _file_card(path, result)
+         if result.report_path:
+             Path(result.report_path).write_text(json.dumps(result.to_dict(), indent=2, default=str))
+@@ -659,10 +729,14 @@ def _reconcile_sync(path: Path) -> Optional[dict]:
+ def _summary_lines(result: RecoveryResult) -> list[str]:
+     lines = []
+     for name, loss in sorted(result.tables.items()):
+-        if loss.known_lost or loss.possibly_lost or loss.filled_from_backup or loss.unreadable_paths:
++        if (loss.known_lost or loss.possibly_lost or loss.filled_from_backup or loss.unreadable_paths
++                or loss.stale_index_entries):
+             keys = f" e.g. {loss.lost_keys[:5]}" if loss.lost_keys else ""
++            unmeasured = (f", {loss.unreadable_paths} read path(s) stopped on damage (rows no index lists "
++                          "are not counted)" if loss.unreadable_paths else "")
++            stale = f", {loss.stale_index_entries} stale index entr(ies) ignored" if loss.stale_index_entries else ""
+             lines.append(f"- {name}: {loss.recovered} read, {loss.filled_from_backup} filled from backup, "
+-                         f"{loss.known_lost} known lost ({loss.possibly_lost} possibly){keys}")
++                         f"{loss.known_lost} known lost ({loss.possibly_lost} possibly){keys}{unmeasured}{stale}")
+     return lines or ["- no table lost a row an index still lists"]
+ 
+ 
+@@ -770,9 +844,15 @@ def main(argv: Optional[list[str]] = None) -> int:
+                               "reason": "delegated child contexts may not rewrite a Kanban board"}))
+             return 1
+     # Bounded: a writer that never releases its lock would otherwise keep the backup retrying forever
+-    # (holding the recovery lock). SIGALRM's default action ends the process; nothing half-written lands.
++    # (holding the recovery lock). The handler raises so ``recover``'s cleanup (work dir, report)
++    # runs; an unfinished backup is one uncommitted transaction, so nothing half-written lands.
+     if args.timeout > 0 and hasattr(__import__("signal"), "SIGALRM"):
+         import signal
++
++        def _timed_out(_signum, _frame):
++            raise TimeoutError(f"recovery exceeded {args.timeout}s")
++
++        signal.signal(signal.SIGALRM, _timed_out)
+         signal.alarm(args.timeout)
+     result = recover(Path(args.db), fill=not args.no_fill, file_card=not args.no_card,
+                      reconcile_sync=not args.no_sync, dry_run=args.dry_run)
+diff --git a/tests/hermes_cli/test_kanban_db_recover.py b/tests/hermes_cli/test_kanban_db_recover.py
+index bc44ae3a73..8d15623eca 100644
+--- a/tests/hermes_cli/test_kanban_db_recover.py
++++ b/tests/hermes_cli/test_kanban_db_recover.py
+@@ -375,3 +375,145 @@ def test_quarantine_rotation_keeps_manual_and_recovery_copies(tmp_path):
+     kbc._prune_corrupt_backups(tmp_path, base.name)
+     assert manual.exists(), "a quarantine burst must not delete a manual forensic copy"
+     assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == kbc._CORRUPT_BACKUP_RETENTION + 1
++
++
++def _delete_behind_the_indexes(path: Path, ids: list[int]) -> None:
++    """Delete ``task_events`` rows while its named indexes are hidden from the schema, so those index
++    b-trees keep listing the deleted rows (index pages older than the table pages, as in the incident)."""
++    conn = sqlite3.connect(path)
++    conn.execute("PRAGMA writable_schema=ON")
++    hidden = conn.execute("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
++                          "WHERE type='index' AND tbl_name='task_events' AND sql IS NOT NULL").fetchall()
++    assert hidden, "task_events must have a named index"
++    conn.execute("DELETE FROM sqlite_master WHERE type='index' AND tbl_name='task_events' AND sql IS NOT NULL")
++    conn.commit()
++    conn.close()
++    conn = sqlite3.connect(path)
++    conn.execute(f"DELETE FROM task_events WHERE id IN ({','.join('?' * len(ids))})", ids)
++    conn.commit()
++    conn.execute("PRAGMA writable_schema=ON")
++    conn.executemany("INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) VALUES (?, ?, ?, ?, ?)", hidden)
++    version = conn.execute("PRAGMA schema_version").fetchone()[0]
++    conn.execute(f"PRAGMA schema_version={version + 1}")
++    conn.commit()
++    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
++    conn.close()
++
++
++def test_stale_index_entries_of_deleted_rows_are_not_filled_back_in(home):
++    """An index that still lists deleted rows must not make the backup fill resurrect them."""
++    path = home / "kanban.db"
++    _make_board(path)
++    shutil.copy2(path, path.with_name(path.name + ".corrupt.0123456789abcdef.bak"))
++    conn = sqlite3.connect(path)
++    deleted = [r[0] for r in conn.execute("SELECT id FROM task_events ORDER BY id DESC LIMIT 40")]
++    conn.close()
++    _delete_behind_the_indexes(path, deleted)
++    before = _payloads(path)
++    assert not set(deleted) & set(before)
++    lost = _damage_table(path, "task_events")
++    assert not set(lost) & set(deleted)
++
++    result = rec.recover(path, file_card=False, reconcile_sync=False)
++
++    assert result.status == "recovered", result.reason
++    events = result.tables["task_events"]
++    assert events.filled_from_backup == len(lost) and events.stale_index_entries >= len(deleted)
++    after = _payloads(path)
++    assert not set(deleted) & set(after), "rows deleted after the backup came back"
++    assert after == before
++
++
++def test_writes_during_every_pass_install_nothing(home, monkeypatch):
++    """A board written through all rebuild passes is left as is (status contended), never overwritten."""
++    path = home / "kanban.db"
++    _make_board(path)
++    _damage_table(path, "task_events")
++    real_build, calls = rec._build, []
++
++    def build_then_write(*args, **kwargs):
++        calls.append(1)
++        real_build(*args, **kwargs)
++        writer = sqlite3.connect(path)
++        writer.execute("UPDATE tasks SET title = ? WHERE rowid = 1", (f"write {len(calls)}",))
++        writer.commit()
++        writer.close()
++
++    monkeypatch.setattr(rec, "_build", build_then_write)
++    result = rec.recover(path, file_card=False, reconcile_sync=False)
++
++    assert result.status == "contended" and result.concurrent_writes, result
++    assert len(calls) == rec._MAX_SALVAGE_PASSES
++    conn = sqlite3.connect(path)
++    assert conn.execute("SELECT title FROM tasks WHERE rowid = 1").fetchone()[0] == f"write {len(calls)}"
++    conn.close()
++    assert rec.classify(path)[0] == "corrupt", "nothing was installed"
++    assert result.report_path and Path(result.report_path).exists()
++    assert not list(home.glob("kanban-recover-*")), "the work dir is cleaned up"
++
++
++def test_stranded_holders_finds_processes_on_deleted_sidecars(tmp_path):
++    db = tmp_path / "kanban.db"
++    db.write_bytes(b"")
++    proc = tmp_path / "proc"
++    for pid, target in ((101, f"{db.resolve()}-wal (deleted)"), (102, f"{db.resolve()}-wal"),
++                        (103, f"{db.resolve()}-shm (deleted)"), (104, "/elsewhere/kanban.db-wal (deleted)")):
++        (proc / str(pid) / "fd").mkdir(parents=True)
++        os.symlink(target, proc / str(pid) / "fd" / "7")
++    assert rec.stranded_holders(db, proc_root=proc) == [101, 103]
++
++
++def test_a_process_on_deleted_sidecars_blocks_the_install(home, monkeypatch):
++    path = home / "kanban.db"
++    _make_board(path)
++    _damage_table(path, "task_events")
++    digest = path.read_bytes()
++    monkeypatch.setattr(rec, "stranded_holders", lambda p: [4242])
++    result = rec.recover(path, file_card=False, reconcile_sync=False)
++    assert result.status == "stranded_holders" and "4242" in result.reason
++    assert result.stranded_pids == [4242]
++    assert path.read_bytes() == digest
++    assert json.loads(Path(result.report_path).read_text())["status"] == "stranded_holders"
++
++
++def test_installed_unverified_still_writes_the_report(home, monkeypatch):
++    path = home / "kanban.db"
++    _make_board(path)
++    _damage_table(path, "task_events")
++
++    def bad_install(rebuilt, live):
++        raise rec.InstalledUnverified("installed board fails integrity_check: ['x']")
++
++    monkeypatch.setattr(rec, "_install", bad_install)
++    result = rec.recover(path, file_card=False, reconcile_sync=False)
++    assert result.status == "installed_unverified"
++    report = json.loads(Path(result.report_path).read_text())
++    assert report["status"] == "installed_unverified" and "task_events" in report["tables"]
++
++
++def test_the_child_timeout_cleans_up_its_work_dir(home):
++    """SIGALRM raises instead of killing the child, so ``recover``'s cleanup runs."""
++    import subprocess
++    import sys
++    path = home / "kanban.db"
++    _make_board(path)
++    _damage_table(path, "task_events")
++    probe = home / "slow_recover.py"
++    probe.write_text(
++        "import sys, time\n"
++        "from hermes_cli import kanban_db_recover as rec\n"
++        "real = rec._build\n"
++        "def slow(*a, **k):\n"
++        "    real(*a, **k)\n"
++        "    time.sleep(30)\n"
++        "rec._build = slow\n"
++        "sys.exit(rec.main(sys.argv[1:]))\n")
++    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN")}
++    repo = str(Path(rec.__file__).resolve().parents[1])
++    env["PYTHONPATH"] = repo
++    done = subprocess.run([sys.executable, str(probe), "--db", str(path), "--json", "--no-card", "--no-sync",
++                           "--timeout", "3"], capture_output=True, text=True, timeout=60, env=env, cwd=repo)
++    payload = json.loads(done.stdout.strip().splitlines()[-1])
++    assert done.returncode == 1 and payload["status"] == "failed" and "TimeoutError" in payload["reason"]
++    assert not list(home.glob("kanban-recover-*")), "the rebuild work dir leaked"
++    assert rec.classify(path)[0] == "corrupt"
+-- 
+2.55.0
+

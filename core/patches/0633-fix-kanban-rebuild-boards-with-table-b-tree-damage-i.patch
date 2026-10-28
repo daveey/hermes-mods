@@ -1,0 +1,1598 @@
+From c0ca2b2922db54ed6cff5d8ae009de755a77cc69 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:23:46 +0000
+Subject: [PATCH] fix(kanban): rebuild boards with table b-tree damage in
+ place, reconcile sync, keep forensic copies [daveey]
+
+hermes kanban recover (and the gateway dispatcher, automatically, when it pauses a damaged
+board) salvages a board REINDEX cannot fix: out of process, under a per-board recovery lock,
+from a backup-API snapshot; every table read forward, backward, through each index and by
+point lookup; missing rows filled from the newest healthy quarantine; per-table loss report;
+written back INTO the live file with the backup API so open connections stay valid; follow-up
+card; sync reconcile. Replaces the manual dump/load + mv that raced three times on the hub
+(2026-10-28) and corrupted the copies it installed.
+
+- kanban sync reconcile: upload rows the service lacks (lost outbox), restore own rows the
+  file lost from the service snapshot, never overwrite rows still present.
+- Quarantine rotation only prunes content-addressed copies; a burst no longer deletes
+  manual forensic copies.
+- conftest drops HERMES_KANBAN_* before collection, not only per test.
+---
+ gateway/kanban_watchers_dispatcher.py         |  16 +
+ hermes_cli/config_defaults.py                 |   7 +
+ hermes_cli/kanban.py                          |   7 +-
+ hermes_cli/kanban_db_connect.py               |   7 +-
+ hermes_cli/kanban_db_recover.py               | 720 ++++++++++++++++++
+ hermes_cli/kanban_ops.py                      |  31 +-
+ hermes_cli/kanban_parser.py                   |  20 +
+ hermes_cli/kanban_sync_cli.py                 |  13 +-
+ hermes_cli/kanban_sync_client.py              |  86 ++-
+ tests/conftest.py                             |   9 +
+ tests/hermes_cli/test_kanban_db_recover.py    | 304 ++++++++
+ .../hermes_cli/test_kanban_sync_reconcile.py  | 108 +++
+ tests/test_conftest_kanban_env_scrub.py       |  33 +
+ 13 files changed, 1348 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_recover.py
+ create mode 100644 tests/hermes_cli/test_kanban_db_recover.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_reconcile.py
+ create mode 100644 tests/test_conftest_kanban_env_scrub.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 061a670bba..baf97ee638 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -218,6 +218,7 @@ class _KanbanDispatcher:
+                     "then run `hermes kanban init` if you need a fresh board.",
+                     slug, fingerprint[0],
+                 )
++                self._start_auto_recovery(slug, fingerprint[0])
+                 return None
+             logger.exception("kanban dispatcher: tick failed on board %s", slug)
+             return None
+@@ -226,6 +227,21 @@ class _KanbanDispatcher:
+                 with contextlib.suppress(Exception):
+                     conn.close()
+ 
++    @staticmethod
++    def _start_auto_recovery(slug: str, db_path: str) -> None:
++        """A board with table b-tree damage stays down until it is rebuilt: start the rebuild now
++        (``hermes_cli.kanban_db_recover``) instead of waiting for someone to notice. It runs in a
++        detached child (this process may itself be stranded on deleted sidecars, and its raw reads
++        would cancel its own locks), re-checks the damage from a clean process, holds the board's
++        recovery lock, and writes the board back in place, which changes the fingerprint and
++        lifts this pause. Rate-limited per board; ``kanban.auto_recover_corruption: false`` opts out."""
++        try:
++            from hermes_cli import kanban_db_recover as rec
++            if db_path and rec.auto_recover_enabled():
++                rec.spawn_recovery(Path(db_path))
++        except Exception:  # health: allow BLE001 -- the pause and its ERROR log above still stand
++            logger.exception("kanban dispatcher: could not start automatic recovery of board %s", slug)
++
+     def tick_once(self, *, suppress_spawn: bool = False) -> list[tuple[str, Optional[object]]]:
+         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+         self.successful_scopes = []
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 8dbff035fb..70626c79ab 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1896,6 +1896,13 @@ DEFAULT_CONFIG = {
+     "kanban": {
+         # Central sync (core patch 0193): true = boards opened afterwards get sync tables + outbox triggers. [daveey]
+         "sync": {"enabled": False},
++        # A board whose TABLE b-trees fail integrity_check (REINDEX can't fix it) pauses dispatch; true = the
++        # gateway dispatcher also starts `hermes kanban recover` for it (salvage in a child process, fill from
++        # the newest healthy backup, write back in place, loss report + follow-up card + sync reconcile). On
++        # here: fail-closed alone left a board down until an agent noticed by chance. [daveey]
++        "auto_recover_corruption": True,
++        # Assignee of the follow-up card an automatic recovery files on the recovered board. [daveey]
++        "recovery_card_assignee": "default",
+         # Opt-in per-profile broker argv before gh (empty = ordinary login); never include tokens.
+         "pr_acceptance": {"gh_command_prefix": []},
+         # Calendar retention for terminal worktrees; archive commits to recovery
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 3dccc0431a..2aab2c8c2f 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -30,7 +30,7 @@ from hermes_cli.kanban_output import (
+ )
+ from hermes_cli.kanban_boards import _dispatch_boards
+ from hermes_cli.kanban_ops import (
+-    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
++    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_recover, _cmd_repair, _cmd_tail, _cmd_watch,
+ )
+ from hermes_cli.kanban_parser import build_parser
+ from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
+@@ -194,6 +194,9 @@ def kanban_command(args: argparse.Namespace) -> int:
+         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
+         if action == "repair":
+             return _cmd_repair(args)
++        # `recover` too: it exists for boards init refuses.
++        if action == "recover":
++            return _cmd_recover(args)
+         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
+         # "no such table: tasks" on first use from a fresh HERMES_HOME.
+         try:
+@@ -242,7 +245,7 @@ def _profile_author() -> str:
+ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
++    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review",
+     "gc", "origin-bind", "origin-create", "origin-adopt", "sync",
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index d7a36b3e45..c8a52ae385 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -40,7 +40,8 @@ DEFAULT_BUSY_TIMEOUT_MS = 120_000
+ # time (one user hit 124). Oldest-by-mtime beyond the cap are pruned after each
+ # new backup.
+ _CORRUPT_BACKUP_RETENTION = 10
+-
++# The suffix ``_backup_corrupt_db`` mints (``.corrupt.<sha256[:16]>.bak``); only those rotate.
++_CONTENT_ADDRESSED_BACKUP = re.compile(r"\.corrupt\.[0-9a-f]{16}\.bak")
+ # Bounded init-lock acquire: a bare blocking flock let a wedged holder block the
+ # dispatcher's next-tick connect forever. Poll non-blocking until the deadline,
+ # then proceed without the lock (in-process _INIT_LOCK + idempotent init backstop).
+@@ -330,10 +331,14 @@ def _prune_corrupt_backups(parent: Path, base_name: str, keep: Optional[Path] =
+     existing backups. Best-effort: prune failures never mask the corruption
+     error the caller is about to raise."""
+     try:
++        # Only the guard's own content-addressed copies (``corrupt.<16 hex>.bak``) rotate: a burst of
++        # quarantines (14 in one minute on the hub, 2026-10-28) must not delete a manual forensic copy
++        # (``corrupt.manual-<ts>.bak``) or the first damaged original along with the newer duplicates.
+         backups = [
+             candidate
+             for candidate in parent.glob(f"{base_name}.corrupt.*.bak")
+             if candidate.is_file() and candidate != keep
++            and _CONTENT_ADDRESSED_BACKUP.fullmatch(candidate.name[len(base_name):])
+         ]
+     except OSError:
+         return
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+new file mode 100644
+index 0000000000..bd68226dd4
+--- /dev/null
++++ b/hermes_cli/kanban_db_recover.py
+@@ -0,0 +1,720 @@
++"""Automatic recovery of a Kanban board whose table b-trees are corrupt. [daveey]
++
++The connect-time guard (:mod:`hermes_cli.kanban_db_connect`) repairs index-only damage with
++REINDEX and fails closed on everything else, so a board whose *table* pages are damaged stays
++down until an agent notices and rebuilds it by hand. Done by hand, that rebuild went wrong on
++the hub on 2026-10-28: three agents each built a salvage and ``mv``'d it over ``kanban.db``
++while the gateway and Desktop backends still had WAL connections open, and every swap stranded
++those connections and corrupted the next copy. This module is the supported path:
++
++1. **Out of process.** :func:`spawn_recovery` runs ``python -m hermes_cli.kanban_db_recover``.
++   The recovery reads and copies the database file, and a raw read in a process that has a
++   connection to it cancels that process's POSIX locks (see ``sqlite_safe_read``). A child that
++   opened nothing has nothing to lose. The child also re-checks the file from a clean process:
++   a caller stranded on deleted ``-wal``/``-shm`` files sees "corruption" that is not on disk,
++   and the child then reports ``healthy`` instead of rebuilding a good board.
++2. **One recovery at a time.** ``<db>.recover.lock`` (non-blocking flock). A second recovery,
++   automatic or ``hermes kanban recover``, exits ``busy`` instead of racing the first.
++3. **Snapshot through SQLite.** The damaged board is copied with the backup API (consistent with
++   its WAL), kept as ``<db>.recover-<ts>.damaged.bak``, and salvaged from that copy: every table
++   is read forward and backward by rowid and through each of its indexes, so only rows on pages
++   no path reaches are lost. Rows still missing are filled from the newest quarantine backup
++   that passes ``quick_check`` (never outbox/state rows, never tombstoned uids).
++4. **Loss accounting.** Per table: rows read, rows filled from the backup, and the keys an index
++   still lists whose row could not be read (known lost). Written to
++   ``<db>.recovery-<ts>.json`` and logged.
++5. **Installed in place.** The rebuilt file is written into ``kanban.db`` with the backup API,
++   under SQLite's own locking, so connections other processes hold stay valid and see the new
++   content. The file is never renamed or unlinked.
++6. **Follow-up.** A card on the recovered board carries the loss report, and boards attached to
++   the sync service are reconciled with it (:func:`kanban_sync_client.reconcile`).
++"""
++
++from __future__ import annotations
++
++# An entry point (``python -m hermes_cli.kanban_db_recover``): the bootstrap activates the
++# dependency environment first. A no-op when imported by an already-bootstrapped process.
++try:
++    import hermes_bootstrap  # noqa: F401
++except ModuleNotFoundError as exc:  # a partial ``hermes update`` can leave the bootstrap unregistered
++    if exc.name != "hermes_bootstrap":
++        raise
++
++import argparse
++import contextlib
++import json
++import logging
++import os
++import re
++import sqlite3
++import subprocess
++import sys
++import tempfile
++import time
++from dataclasses import asdict, dataclass, field
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++_log = logging.getLogger(__name__)
++
++# Rows of these tables are never filled from an older backup: a sent outbox op filled back in would
++# be re-sent with stale fields, and sync state/cursors must reflect the live file only.
++_NO_FILL_TABLES = frozenset({"kanban_sync_outbox", "kanban_sync_state", "sqlite_sequence"})
++# Keys listed per table in the report (the counts are always complete).
++_REPORT_KEY_CAP = 200
++# How long a spawned recovery may run before the parent stops waiting for it.
++RECOVERY_TIMEOUT_SECONDS = 600
++# Re-salvage when the live file changed while we were salvaging, at most this many times.
++_MAX_SALVAGE_PASSES = 3
++
++
++@dataclass
++class TableLoss:
++    """What happened to one table. Rows an index still lists but no read path (nor the backup
++    fill) produced are lost: ``known_lost`` counts those listed by EVERY index of the table (a
++    lower bound, robust to one damaged index listing stale rows), ``possibly_lost`` those listed
++    by ANY index (an upper bound). ``unreadable_paths`` counts read paths that stopped on an error."""
++
++    recovered: int = 0
++    filled_from_backup: int = 0
++    known_lost: int = 0
++    possibly_lost: int = 0
++    lost_keys: list[Any] = field(default_factory=list)
++    unreadable_paths: int = 0
++
++
++@dataclass
++class RecoveryResult:
++    """``status``: ``recovered`` (rebuilt and installed), ``healthy`` (a clean process found no
++    damage: nothing written), ``index_only`` (REINDEX is enough; left to the guard), ``busy``
++    (another recovery holds the lock), ``missing`` (no file), ``failed`` (nothing installed)."""
++
++    status: str
++    db_path: str
++    reason: str = ""
++    messages: list[str] = field(default_factory=list)
++    snapshot_path: Optional[str] = None
++    fill_source: Optional[str] = None
++    report_path: Optional[str] = None
++    card_id: Optional[str] = None
++    sync: Optional[dict] = None
++    tables: dict[str, TableLoss] = field(default_factory=dict)
++    lost_rows: int = 0
++    concurrent_writes: bool = False
++    started_at: float = 0.0
++    finished_at: float = 0.0
++
++    def to_dict(self) -> dict[str, Any]:
++        out = asdict(self)
++        out["tables"] = {k: asdict(v) for k, v in self.tables.items()}
++        return out
++
++
++# --- locking ----------------------------------------------------------------------------------
++
++def _lock_path(db_path: Path) -> Path:
++    return db_path.with_name(db_path.name + ".recover.lock")
++
++
++@contextlib.contextmanager
++def recovery_lock(db_path: Path) -> Iterator[bool]:
++    """Non-blocking exclusive lock for one board's recovery. Yields False when another process
++    holds it. The holder's pid is written into the lock file for the ``busy`` message."""
++    lock_path = _lock_path(db_path)
++    lock_path.parent.mkdir(parents=True, exist_ok=True)
++    handle = lock_path.open("a+")
++    try:
++        try:
++            import fcntl
++            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except ImportError:  # pragma: no cover - Windows: msvcrt byte lock
++            import msvcrt
++            try:
++                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
++            except OSError:
++                yield False
++                return
++        except OSError:
++            yield False
++            return
++        with contextlib.suppress(OSError):
++            handle.seek(0)
++            handle.truncate()
++            handle.write(f"{os.getpid()}\n")
++            handle.flush()
++        yield True
++    finally:
++        handle.close()
++
++
++def recovery_lock_holder(db_path: Path) -> Optional[str]:
++    try:
++        return _lock_path(db_path).read_text().strip() or None
++    except OSError:
++        return None
++
++
++# --- probing ----------------------------------------------------------------------------------
++
++def _integrity(conn: sqlite3.Connection) -> list[str]:
++    return [str(r[0]) for r in conn.execute("PRAGMA integrity_check").fetchall()]
++
++
++def classify(path: Path) -> tuple[str, list[str]]:
++    """``(state, messages)`` for the file as THIS process sees it: ``ok``, ``index_only`` or
++    ``corrupt``. Call from a process with no other connection to ``path``."""
++    from hermes_cli.kanban_db_connect import _repairable_index_names
++    try:
++        conn = sqlite3.connect(str(path), timeout=30)
++        try:
++            messages = _integrity(conn)
++        finally:
++            conn.close()
++    except sqlite3.OperationalError:
++        raise
++    except sqlite3.DatabaseError as exc:
++        return "corrupt", [f"sqlite refused to open file: {exc}"]
++    if len(messages) == 1 and messages[0].strip().lower() == "ok":
++        return "ok", messages
++    if _repairable_index_names(messages):
++        return "index_only", messages
++    return "corrupt", messages
++
++
++# --- salvage ----------------------------------------------------------------------------------
++
++def _q(name: str) -> str:
++    return '"' + name.replace('"', '""') + '"'
++
++
++def _schema(conn: sqlite3.Connection) -> list[tuple[str, str, str, Optional[str]]]:
++    rows = conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master").fetchall()
++    return [(str(t), str(n), str(tb), s) for t, n, tb, s in rows]
++
++
++def _is_without_rowid(sql: Optional[str]) -> bool:
++    return bool(sql and re.search(r"\)\s*WITHOUT\s+ROWID\s*;?\s*$", sql, re.I))
++
++
++def _read_rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> tuple[list[tuple], bool]:
++    """Rows of ``sql`` up to the first read error; ``(rows, stopped_on_error)``."""
++    rows: list[tuple] = []
++    try:
++        cur = conn.execute(sql, params)
++        while True:
++            try:
++                row = cur.fetchone()
++            except sqlite3.DatabaseError:
++                return rows, True
++            if row is None:
++                return rows, False
++            rows.append(tuple(row))
++    except sqlite3.DatabaseError:
++        return rows, True
++
++
++def _index_columns(conn: sqlite3.Connection, index: str) -> list[str]:
++    try:
++        return [str(r[2]) for r in conn.execute(f"PRAGMA index_info({_q(index)})") if r[2] is not None]
++    except sqlite3.DatabaseError:
++        return []
++
++
++def _table_indexes(conn: sqlite3.Connection, table: str) -> list[tuple[str, bool]]:
++    """``(index_name, unique)`` for every index on ``table`` (auto-indexes included)."""
++    try:
++        return [(str(r[1]), bool(r[2])) for r in conn.execute(f"PRAGMA index_list({_q(table)})")]
++    except sqlite3.DatabaseError:
++        return []
++
++
++def _salvage_table(src: sqlite3.Connection, table: str, sql: Optional[str]
++                   ) -> tuple[dict[Any, tuple], list[str], int, dict[str, dict[int, tuple]]]:
++    """Every readable row of ``table``: ``(rows by key, column names, failed read paths, listed)``.
++    The key is the rowid (or the whole row for WITHOUT ROWID tables). ``listed`` maps each index to
++    the rowids it still lists (with the index's key columns, for the report): a covering scan reads
++    only the index b-tree, so it names rows whose table page may be unreadable."""
++    try:
++        columns = [str(r[1]) for r in src.execute(f"PRAGMA table_info({_q(table)})")]
++    except sqlite3.DatabaseError:
++        columns = []
++    if not columns:
++        return {}, [], 1, {}
++    cols = ", ".join(_q(c) for c in columns)
++    rowid = not _is_without_rowid(sql)
++    rows: dict[Any, tuple] = {}
++    failed = 0
++    select = f"SELECT rowid, {cols} FROM {_q(table)}" if rowid else f"SELECT {cols} FROM {_q(table)}"
++    paths = [select, select + (" ORDER BY rowid DESC" if rowid else " ORDER BY 1 DESC")]
++    indexes = [(index, _index_columns(src, index)) for index, _unique in _table_indexes(src, table)]
++    for index, icols in indexes:
++        if icols:
++            paths.append(f"{select} INDEXED BY {_q(index)} ORDER BY {', '.join(_q(c) for c in icols)}")
++            paths.append(f"{select} INDEXED BY {_q(index)} ORDER BY "
++                         f"{', '.join(_q(c) + ' DESC' for c in icols)}")
++    for path in paths:
++        got, stopped = _read_rows(src, path)
++        failed += int(stopped)
++        for row in got:
++            if rowid:
++                rows.setdefault(row[0], row[1:])
++            else:
++                rows.setdefault(row, row)
++    listed: dict[str, dict[int, tuple]] = {}
++    if rowid:
++        for index, icols in indexes:
++            if not icols:
++                continue
++            order = ", ".join(_q(c) for c in icols)
++            got, _ = _read_rows(src, f"SELECT rowid, {order} FROM {_q(table)} INDEXED BY {_q(index)} ORDER BY {order}")
++            listed[index] = {int(r[0]): tuple(r[1:]) for r in got if isinstance(r[0], int)}
++        # Point lookups for every listed row no scan produced: a scan that stops on a damaged page
++        # can also drop the row it was holding, while a lookup reaches any intact leaf directly.
++        for rid in sorted({rid for entries in listed.values() for rid in entries} - set(rows)):
++            got, _ = _read_rows(src, f"{select} WHERE rowid = ?", (rid,))
++            for row in got:
++                rows.setdefault(row[0], row[1:])
++    return rows, columns, failed, listed
++
++
++def _healthy_fill_source(db_path: Path, exclude: set[Path]) -> Optional[Path]:
++    """The newest quarantine/pre-recover backup of this board that passes ``quick_check``."""
++    parent, base = db_path.parent, db_path.name
++    candidates = [p for p in parent.glob(f"{base}.*") if p.is_file() and p not in exclude
++                  and (p.name.endswith(".bak") or ".pre-recover-" in p.name)
++                  and not p.name.endswith((".damaged.bak", "-wal", "-shm"))]
++    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
++    for cand in candidates[:12]:
++        try:
++            conn = sqlite3.connect(f"{cand.resolve().as_uri()}?immutable=1", uri=True)
++            try:
++                if conn.execute("PRAGMA quick_check").fetchone()[0] == "ok" and conn.execute(
++                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone():
++                    return cand
++            finally:
++                conn.close()
++        except sqlite3.DatabaseError:
++            continue
++    return None
++
++
++def _tombstoned(dst: sqlite3.Connection) -> set[tuple[str, str]]:
++    try:
++        return {(str(t), str(u)) for t, u in dst.execute("SELECT table_name, uid FROM kanban_sync_tombstones")}
++    except sqlite3.DatabaseError:
++        return set()
++
++
++def _build(snapshot: Path, out: Path, fill: Optional[Path], result: RecoveryResult) -> None:
++    """Rebuild ``snapshot`` into a fresh ``out`` (WAL, same page size) and account per table."""
++    src = sqlite3.connect(f"{snapshot.resolve().as_uri()}?mode=ro", uri=True)
++    src.execute("PRAGMA cell_size_check=ON")
++    out.unlink(missing_ok=True)
++    dst = sqlite3.connect(str(out), isolation_level=None)
++    try:
++        page_size = src.execute("PRAGMA page_size").fetchone()[0]
++        user_version = src.execute("PRAGMA user_version").fetchone()[0]
++        application_id = src.execute("PRAGMA application_id").fetchone()[0]
++        dst.execute(f"PRAGMA page_size={int(page_size)}")
++        dst.execute(f"PRAGMA user_version={int(user_version)}")
++        dst.execute(f"PRAGMA application_id={int(application_id)}")
++        schema = _schema(src)
++        tables: list[tuple[str, Optional[str]]] = [
++            (n, s) for t, n, _tb, s in schema if t == "table" and s and not n.startswith("sqlite_")]
++        later = [s for t, n, _tb, s in schema if t in ("index", "trigger", "view") and s]
++        has_seq = any(n == "sqlite_sequence" for t, n, _tb, _s in schema)
++        dst.execute("BEGIN")
++        for name, sql in tables:
++            dst.execute(str(sql))
++        listed_by_table: dict[str, dict[str, dict[int, tuple]]] = {}
++        for name, sql in tables:
++            rows, columns, failed, listed = _salvage_table(src, name, sql)
++            listed_by_table[name] = listed
++            loss = result.tables.setdefault(name, TableLoss())
++            loss.unreadable_paths = failed
++            if not columns:
++                continue
++            names = ", ".join(_q(c) for c in columns)
++            if _is_without_rowid(sql):
++                dst.executemany(f"INSERT OR IGNORE INTO {_q(name)} ({names}) VALUES ({', '.join('?' * len(columns))})",
++                                list(rows.values()))
++            else:
++                dst.executemany(f"INSERT OR IGNORE INTO {_q(name)} (rowid, {names}) "
++                                f"VALUES ({', '.join('?' * (len(columns) + 1))})", [(k, *v) for k, v in rows.items()])
++            loss.recovered = len(rows)
++        if fill is not None:
++            _fill_from_backup(dst, fill, tables, result)
++        # Lost: rowids an index still lists that neither the salvage nor the fill produced.
++        for name, _sql in tables:
++            listed = listed_by_table.get(name) or {}
++            if not listed:
++                continue
++            have = {r[0] for r in dst.execute(f"SELECT rowid FROM {_q(name)}")}
++            per_index = [set(entries) - have for entries in listed.values()]
++            union = set().union(*per_index)
++            both = set.intersection(*per_index) if per_index else set()
++            keys: dict[int, tuple] = {}
++            for entries in listed.values():
++                for rid in union:
++                    if rid in entries and rid not in keys:
++                        keys[rid] = entries[rid]
++            loss = result.tables[name]
++            loss.known_lost, loss.possibly_lost = len(both), len(union)
++            loss.lost_keys = [[rid, *keys.get(rid, ())] for rid in sorted(both or union)[:_REPORT_KEY_CAP]]
++        if has_seq:
++            floors = {name: max((rid for entries in (listed_by_table.get(name) or {}).values() for rid in entries),
++                                default=0) for name, _sql in tables}
++            _rebuild_sequence(src, dst, tables, fill, floors)
++        dst.execute("COMMIT")
++        for sql in later:
++            with contextlib.suppress(sqlite3.Error):  # an index the data now violates is reported by the check below
++                dst.execute(sql)
++        dst.commit()
++        messages = _integrity(dst)
++        if messages != ["ok"]:
++            raise RuntimeError(f"rebuilt board fails integrity_check: {messages[:3]}")
++        missing_objects = {n for t, n, _tb, s in schema if s and not n.startswith("sqlite_")} - {
++            n for (n,) in dst.execute("SELECT name FROM sqlite_master")}
++        if missing_objects:
++            raise RuntimeError(f"rebuilt board is missing schema objects: {sorted(missing_objects)[:10]}")
++    finally:
++        dst.close()
++        src.close()
++    # A fresh connection: a statement a cursor above still holds would make the checkpoint fail
++    # with "database table is locked".
++    wal = sqlite3.connect(str(out), isolation_level=None)
++    try:
++        wal.execute("PRAGMA journal_mode=WAL").fetchall()
++        wal.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
++    finally:
++        wal.close()
++    result.lost_rows = sum(t.known_lost for t in result.tables.values())
++
++
++def _fill_from_backup(dst: sqlite3.Connection, fill: Path, tables: list[tuple[str, Optional[str]]],
++                      result: RecoveryResult) -> None:
++    bak = sqlite3.connect(f"{fill.resolve().as_uri()}?immutable=1", uri=True)
++    try:
++        tomb = _tombstoned(dst)
++        for name, sql in tables:
++            if name in _NO_FILL_TABLES or _is_without_rowid(sql):
++                continue
++            try:
++                bcols = [str(r[1]) for r in bak.execute(f"PRAGMA table_info({_q(name)})")]
++            except sqlite3.DatabaseError:
++                continue
++            dcols = [str(r[1]) for r in dst.execute(f"PRAGMA table_info({_q(name)})")]
++            common = [c for c in dcols if c in bcols]
++            if not common:
++                continue
++            have = {r[0] for r in dst.execute(f"SELECT rowid FROM {_q(name)}")}
++            got, _ = _read_rows(bak, f"SELECT rowid, {', '.join(_q(c) for c in common)} FROM {_q(name)}")
++            uid_at = common.index("uid") if "uid" in common else None
++            id_at = common.index("id") if "id" in common else None
++            filled = 0
++            for row in got:
++                if row[0] in have:
++                    continue
++                values = row[1:]
++                if (uid_at is not None and (name, str(values[uid_at])) in tomb) or (
++                        name == "tasks" and id_at is not None and (name, str(values[id_at])) in tomb):
++                    continue
++                cur = dst.execute(f"INSERT OR IGNORE INTO {_q(name)} (rowid, {', '.join(_q(c) for c in common)}) "
++                                  f"VALUES ({', '.join('?' * (len(common) + 1))})", row)
++                filled += cur.rowcount
++            result.tables.setdefault(name, TableLoss()).filled_from_backup = filled
++    finally:
++        bak.close()
++
++
++def _rebuild_sequence(src: sqlite3.Connection, dst: sqlite3.Connection, tables: list[tuple[str, Optional[str]]],
++                      fill: Optional[Path], floors: dict[str, int]) -> None:
++    """``sqlite_sequence`` = max(old seq where readable, backup seq, max rowid now, highest rowid an
++    index still lists) per AUTOINCREMENT table, so a lost row's id is never handed out again."""
++    seqs: dict[str, int] = {}
++    for conn in [src] + ([sqlite3.connect(f"{fill.resolve().as_uri()}?immutable=1", uri=True)] if fill else []):
++        got, _ = _read_rows(conn, "SELECT name, seq FROM sqlite_sequence")
++        for name, seq in got:
++            with contextlib.suppress(TypeError, ValueError):
++                seqs[str(name)] = max(seqs.get(str(name), 0), int(seq))
++        if conn is not src:
++            conn.close()
++    dst.execute("DELETE FROM sqlite_sequence")
++    for name, sql in tables:
++        if not sql or "AUTOINCREMENT" not in sql.upper():
++            continue
++        top = dst.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {_q(name)}").fetchone()[0]
++        dst.execute("INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)",
++                    (name, max(int(top), seqs.get(name, 0), floors.get(name, 0))))
++
++
++# --- install ----------------------------------------------------------------------------------
++
++def _snapshot(live: Path, dest: Path) -> int:
++    """Consistent copy of the live board (main file + WAL) through the backup API; returns the
++    live connection's ``data_version`` at copy time. Falls back to a page-for-page raw copy when
++    SQLite refuses to read the file (this process holds no other connection to it)."""
++    dest.unlink(missing_ok=True)
++    src = sqlite3.connect(str(live), timeout=30)
++    try:
++        version = src.execute("PRAGMA data_version").fetchone()[0]
++        out = sqlite3.connect(str(dest))
++        try:
++            src.backup(out)
++        finally:
++            out.close()
++        return int(version)
++    except sqlite3.DatabaseError:
++        import shutil
++        shutil.copyfile(live, dest)
++        wal = live.with_name(live.name + "-wal")
++        if wal.exists():
++            shutil.copyfile(wal, dest.with_name(dest.name + "-wal"))
++        return -1
++    finally:
++        src.close()
++
++
++def _live_version(live: Path) -> int:
++    conn = sqlite3.connect(str(live), timeout=30)
++    try:
++        return int(conn.execute("PRAGMA data_version").fetchone()[0])
++    except sqlite3.DatabaseError:
++        return -1
++    finally:
++        conn.close()
++
++
++def _install(rebuilt: Path, live: Path) -> None:
++    """Write ``rebuilt`` into ``live`` page by page with the backup API, inside SQLite's locking:
++    the inode, the WAL and every other process's connection survive; they see the new content
++    on their next read. Verified with integrity_check through a fresh connection."""
++    src = sqlite3.connect(f"{rebuilt.resolve().as_uri()}?mode=ro", uri=True)
++    dst = sqlite3.connect(str(live), timeout=60)
++    try:
++        src.backup(dst)
++        dst.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
++    finally:
++        dst.close()
++        src.close()
++    state, messages = classify(live)
++    if state != "ok":
++        raise RuntimeError(f"installed board fails integrity_check: {messages[:3]}")
++
++
++def _stamp() -> str:
++    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
++
++
++def recover(db_path: Path, *, fill: bool = True, file_card: bool = True, reconcile_sync: bool = True,
++            dry_run: bool = False) -> RecoveryResult:
++    """Recover ``db_path`` in THIS process. Run it in a process that holds no connection to the
++    board (the CLI and :func:`spawn_recovery` do); see the module docstring for the steps."""
++    path = Path(db_path).expanduser()
++    result = RecoveryResult(status="failed", db_path=str(path), started_at=time.time())
++    try:
++        if not path.exists() or path.stat().st_size == 0:
++            result.status = "missing"
++            return result
++        with recovery_lock(path) as held:
++            if not held:
++                result.status = "busy"
++                result.reason = f"another recovery of this board is running (pid {recovery_lock_holder(path)})"
++                return result
++            state, messages = classify(path)
++            result.messages = messages[:20]
++            if state != "corrupt":
++                result.status = "healthy" if state == "ok" else "index_only"
++                result.reason = ("a clean process reads this board without errors; the caller may be "
++                                 "stranded on deleted -wal/-shm files" if state == "ok" else
++                                 "index-only damage: the connect-time guard repairs it with REINDEX")
++                return result
++            work = Path(tempfile.mkdtemp(prefix="kanban-recover-", dir=str(path.parent)))
++            try:
++                stamp = _stamp()
++                snapshot = path.with_name(f"{path.name}.recover-{stamp}.damaged.bak")
++                rebuilt = work / "rebuilt.db"
++                for _attempt in range(_MAX_SALVAGE_PASSES):
++                    version = _snapshot(path, snapshot)
++                    fill_src = _healthy_fill_source(path, {snapshot}) if fill else None
++                    result.tables = {}
++                    _build(snapshot, rebuilt, fill_src, result)
++                    result.snapshot_path, result.fill_source = str(snapshot), str(fill_src) if fill_src else None
++                    if version < 0 or _live_version(path) == version:
++                        break
++                else:
++                    result.concurrent_writes = True
++                if dry_run:
++                    result.status = "dry_run"
++                    return result
++                _install(rebuilt, path)
++                result.status = "recovered"
++            finally:
++                import shutil
++                shutil.rmtree(work, ignore_errors=True)
++            _invalidate_init_cache(path)
++            result.finished_at = time.time()
++            result.report_path = str(_write_report(path, result, stamp))
++        _log.error("kanban board %s recovered from b-tree corruption: %d known lost row(s); report %s",
++                   path, result.lost_rows, result.report_path)
++        if reconcile_sync:
++            result.sync = _reconcile_sync(path)
++        if file_card:
++            result.card_id = _file_card(path, result)
++        if result.report_path:
++            Path(result.report_path).write_text(json.dumps(result.to_dict(), indent=2, default=str))
++    except Exception as exc:  # health: allow BLE001 -- the result carries the failure; nothing was installed
++        result.status = "failed" if result.status != "recovered" else result.status
++        result.reason = f"{type(exc).__name__}: {exc}"
++        _log.exception("kanban board %s recovery %s", path, result.status)
++    result.finished_at = result.finished_at or time.time()
++    return result
++
++
++def _invalidate_init_cache(path: Path) -> None:
++    with contextlib.suppress(Exception):
++        from hermes_cli import kanban_db_connect as kbc
++        with kbc._INIT_LOCK:
++            kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
++
++
++def _write_report(path: Path, result: RecoveryResult, stamp: str) -> Path:
++    report = path.with_name(f"{path.name}.recovery-{stamp}.json")
++    report.write_text(json.dumps(result.to_dict(), indent=2, default=str))
++    return report
++
++
++def _board_slug(path: Path) -> Optional[str]:
++    with contextlib.suppress(Exception):
++        from hermes_cli import kanban_db_sync as sync
++        return sync.board_slug_for_path(str(path.resolve()))
++    return None
++
++
++def _reconcile_sync(path: Path) -> Optional[dict]:
++    """Bring the sync service and the recovered board back in step (best effort, never raises)."""
++    try:
++        from hermes_cli import kanban_db_sync as sync
++        if not sync.sync_enabled() or not sync.board_selected(str(path.resolve())):
++            return None
++        from hermes_cli import kanban_sync_client as ksc
++        return ksc.reconcile(_board_slug(path) or "default", path)
++    except Exception as exc:  # health: allow BLE001 -- reported in the card; reconcile can be rerun by hand
++        return {"error": f"{type(exc).__name__}: {exc}"}
++
++
++def _summary_lines(result: RecoveryResult) -> list[str]:
++    lines = []
++    for name, loss in sorted(result.tables.items()):
++        if loss.known_lost or loss.possibly_lost or loss.filled_from_backup or loss.unreadable_paths:
++            keys = f" e.g. {loss.lost_keys[:5]}" if loss.lost_keys else ""
++            lines.append(f"- {name}: {loss.recovered} read, {loss.filled_from_backup} filled from backup, "
++                         f"{loss.known_lost} known lost ({loss.possibly_lost} possibly){keys}")
++    return lines or ["- no table lost a row an index still lists"]
++
++
++def _file_card(path: Path, result: RecoveryResult) -> Optional[str]:
++    """A card on the recovered board so the loss is reconciled, not discovered by chance."""
++    try:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.config import load_config
++        from hermes_cli.kanban_db_connect import connect
++        assignee = str(((load_config() or {}).get("kanban") or {}).get("recovery_card_assignee") or "default")
++        body = "\n".join([
++            f"The board file `{path}` failed integrity_check with table b-tree damage and was rebuilt "
++            "automatically (hermes_cli/kanban_db_recover.py) and written back in place.",
++            "",
++            f"- Known lost rows: {result.lost_rows}. Report: `{result.report_path}`",
++            f"- Damaged copy kept at `{result.snapshot_path}`; rows filled from `{result.fill_source}`.",
++            f"- Concurrent writes during the rebuild: {result.concurrent_writes}. Sync reconcile: {result.sync}",
++            "",
++            *_summary_lines(result),
++            "",
++            "Do: 1) read the report and recreate each known-lost card or run from its other copies (sync replica "
++            "`hermes kanban sync diff`, peer gateways, task_events); 2) if sync reconcile failed, run "
++            "`hermes kanban sync reconcile`; 3) use the five-whys skill on why the board was damaged (look "
++            "for processes holding deleted kanban.db-wal/-shm files).",
++        ])
++        conn = connect(path)
++        try:
++            return kb.create_task(
++                conn, title=f"Kanban board auto-recovered from corruption: {result.lost_rows} known lost row(s)",
++                body=body, assignee=assignee, created_by="kanban-recover",
++                idempotency_key=f"kanban-recover:{path.name}:{Path(result.report_path or '').name}",
++            )
++        finally:
++            conn.close()
++    except Exception as exc:  # health: allow BLE001 -- the report and the ERROR log still carry the loss
++        _log.warning("kanban recovery: could not file the follow-up card (%s: %s)", type(exc).__name__, exc)
++        return None
++
++
++# --- spawning from a live process ---------------------------------------------------------------
++
++_SPAWNED: dict[str, float] = {}
++# One automatic attempt per board per this many seconds (a failed rebuild is not retried in a loop).
++AUTO_RETRY_SECONDS = 1800
++
++
++def auto_recover_enabled() -> bool:
++    try:
++        from hermes_cli.config import load_config
++        value = ((load_config() or {}).get("kanban") or {}).get("auto_recover_corruption", True)
++    except Exception:  # health: allow BLE001 -- unreadable config: keep the default
++        value = True
++    return bool(value)
++
++
++def spawn_recovery(db_path: Path, *, wait: bool = False, timeout: float = RECOVERY_TIMEOUT_SECONDS,
++                   extra_args: Optional[list[str]] = None) -> Optional[dict]:
++    """Run :func:`recover` in a fresh interpreter (see module docstring, step 1). With ``wait`` the
++    parsed result is returned; otherwise the child runs detached and ``None`` is returned.
++    Rate-limited to one automatic start per board per :data:`AUTO_RETRY_SECONDS`."""
++    key = str(Path(db_path).expanduser().resolve())
++    now = time.monotonic()
++    if not wait and now - _SPAWNED.get(key, -AUTO_RETRY_SECONDS) < AUTO_RETRY_SECONDS:
++        return None
++    _SPAWNED[key] = now
++    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN_TASK")}
++    cmd = [sys.executable, "-m", "hermes_cli.kanban_db_recover", "--db", key, "--json", *(extra_args or [])]
++    repo_root = str(Path(__file__).resolve().parents[1])
++    env["PYTHONPATH"] = repo_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
++    if not wait:
++        log = Path(key).with_name(Path(key).name + ".recover.log")
++        with open(log, "ab") as out:
++            subprocess.Popen(cmd, stdout=out, stderr=out, stdin=subprocess.DEVNULL, env=env,
++                             cwd=repo_root, start_new_session=True)
++        _log.error("kanban board %s has table b-tree damage; started automatic recovery (log %s)", key, log)
++        return None
++    done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=repo_root,
++                          stdin=subprocess.DEVNULL)
++    try:
++        return json.loads(done.stdout.strip().splitlines()[-1])
++    except (ValueError, IndexError):
++        return {"status": "failed", "db_path": key, "reason": (done.stderr or done.stdout)[-2000:]}
++
++
++def main(argv: Optional[list[str]] = None) -> int:
++    parser = argparse.ArgumentParser(prog="python -m hermes_cli.kanban_db_recover")
++    parser.add_argument("--db", required=True)
++    parser.add_argument("--json", action="store_true")
++    parser.add_argument("--dry-run", action="store_true")
++    parser.add_argument("--no-fill", action="store_true")
++    parser.add_argument("--no-card", action="store_true")
++    parser.add_argument("--no-sync", action="store_true")
++    args = parser.parse_args(argv)
++    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
++    result = recover(Path(args.db), fill=not args.no_fill, file_card=not args.no_card,
++                     reconcile_sync=not args.no_sync, dry_run=args.dry_run)
++    if args.json:
++        print(json.dumps(result.to_dict(), default=str))
++    else:
++        print(f"{result.status}: {result.db_path} {result.reason}".rstrip())
++        print("\n".join(_summary_lines(result)))
++        if result.report_path:
++            print(f"report: {result.report_path}")
++    return 0 if result.status in ("recovered", "healthy", "dry_run") else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index c13a9600f3..46d72353cd 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -408,9 +408,32 @@ def _cmd_repair(args: argparse.Namespace) -> int:
+     if report.backup_path:
+         err(f"  corrupt copy quarantined at: {report.backup_path}")
+     err(
+-        "  Recover manually (copy kanban.db aside FIRST, then run "
+-        "`sqlite3 <copy> \".recover\"` into a fresh file — never against "
+-        "the live path, a WAL-reset-vulnerable sqlite3 CLI can corrupt it "
+-        "further) or move the file aside to start a new board."
++        "  Not index-only: rebuild it in place with `hermes kanban recover` (salvages every readable row, "
++        "fills from the newest healthy backup, writes a loss report). Never `mv` a rebuilt copy over the "
++        "live kanban.db while any process has it open."
+     )
+     return 1
++
++
++def _cmd_recover(args: argparse.Namespace) -> int:
++    """Rebuild a board with table b-tree damage in place (``hermes_cli.kanban_db_recover``), in a
++    fresh process so this CLI's own state can't strand anything. Exit 0 = recovered / healthy /
++    dry run, 1 otherwise (busy, failed)."""
++    from hermes_cli import kanban_db_recover as rec
++    path = kb.kanban_db_path()
++    extra = (["--dry-run"] if args.dry_run else []) + (["--no-fill"] if args.no_fill else [])
++    result = rec.spawn_recovery(path, wait=True, extra_args=extra)
++    if result is None:  # pragma: no cover - wait=True always returns a result
++        return _err("kanban recover: no result from the recovery process")
++    if getattr(args, "json", False):
++        _print_json(result, ascii=True)
++    else:
++        print(f"{result.get('db_path')}: {result.get('status')} {result.get('reason') or ''}".rstrip())
++        for name, loss in sorted((result.get("tables") or {}).items()):
++            if loss.get("known_lost") or loss.get("possibly_lost") or loss.get("filled_from_backup"):
++                print(f"  {name}: {loss.get('recovered')} read, {loss.get('filled_from_backup')} filled, "
++                      f"{loss.get('known_lost')} known lost ({loss.get('possibly_lost')} possibly)")
++        for key in ("report_path", "snapshot_path", "fill_source", "card_id", "sync"):
++            if result.get(key):
++                print(f"  {key}: {result[key]}")
++    return 0 if result.get("status") in ("recovered", "healthy", "dry_run") else 1
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index e0d42c3a3f..5ca3117ea3 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -540,7 +540,27 @@ _SPECS = [
+         _cmd("links", help="Reconcile this gateway's chat links (which chats each card belongs to) now"),
+         _cmd("links-diff", [_json_flag()],
+              help="Compare chat links from the origin ledger with the synced links in the replicas (exit 1 if not clean)"),
++        _cmd("reconcile", [_json_flag()],
++             help="After the board file lost rows (a recovery): upload rows the service lacks, restore this "
++                  "gateway's rows the file lost from the service snapshot, then diff (exit 1 if not clean)"),
+     ]), help="Central Kanban sync (kanban.sync.*): attach, import, status, diff"),
++    _cmd("recover", [
++        _json_flag(help="Emit the recovery report as JSON"),
++        _arg("--dry-run", action="store_true", help="Rebuild and report the loss, but do not write the board"),
++        _arg("--no-fill", action="store_true",
++             help="Do not fill rows the damaged file lost from the newest healthy quarantine backup"),
++    ], help="Rebuild a board whose table b-trees are corrupt (what `repair` refuses), in place, with a loss report",
++         description=(
++             "For integrity_check failures that REINDEX cannot fix. Runs in a fresh process under the board's "
++             "recovery lock (a concurrent recovery exits 'busy'): snapshots the damaged file with the SQLite "
++             "backup API (kept as <db>.recover-<ts>.damaged.bak), reads every table forward, backward and through "
++             "each index, fills rows still missing from the newest quarantine backup that passes quick_check, "
++             "writes <db>.recovery-<ts>.json with per-table loss counts, and writes the rebuilt board back INTO "
++             "the live file with the backup API, so open connections stay valid. Never `mv` a rebuilt copy over a "
++             "live kanban.db: every process with the old file open keeps writing to it. Also files a follow-up "
++             "card and runs `sync reconcile` for synced boards. The gateway dispatcher starts it automatically "
++             "when kanban.auto_recover_corruption is true (default)."
++         )),
+     _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
+          help="Check kanban.db integrity and auto-repair index-only corruption",
+          description=(
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 1b94c985ac..eb3e00226b 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -5,6 +5,8 @@
+ - ``import``  queue every existing row for upload (idempotent; run once after the first attach).
+ - ``diff``    this gateway's live cards against the shadow copy of the service (exit 1 when not clean).
+ - ``run``     one sync round now (the gateway runs it continuously while ``kanban.sync.enabled`` is on).
++- ``reconcile`` after the board file lost rows: upload what the service lacks, restore this gateway's rows the
++  file lost, then diff (``hermes kanban recover`` runs it after a rebuild).
+ """
+ 
+ from __future__ import annotations
+@@ -139,14 +141,21 @@ def _links_diff(args: argparse.Namespace) -> int:
+     return 0 if report["clean"] else 1
+ 
+ 
++def _reconcile(args: argparse.Namespace) -> int:
++    slug = _board(args)
++    report = ksc.reconcile(slug, _path(slug))
++    _print(report, args.json)
++    return 0 if report.get("clean") or report.get("mode") == "off" else 1
++
++
+ _ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
+-            "links": _links, "links-diff": _links_diff}
++            "links": _links, "links-diff": _links_diff, "reconcile": _reconcile}
+ 
+ 
+ def cmd_sync(args: argparse.Namespace) -> int:
+     action = getattr(args, "sync_action", None)
+     if action not in _ACTIONS:
+-        print("usage: hermes kanban sync {status,attach,import,diff,run,links,links-diff} [--board B]")
++        print("usage: hermes kanban sync {status,attach,import,diff,run,links,links-diff,reconcile} [--board B]")
+         return 2
+     try:
+         return _ACTIONS[action](args)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 4618812e5f..134c9586de 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -33,7 +33,7 @@ import urllib.error
+ import urllib.request
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Callable, Iterable, Optional
++from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
+ 
+@@ -749,8 +749,10 @@ def _row_uid(table: str, row: sqlite3.Row) -> str:
+     return row["uid"]
+ 
+ 
+-def import_board(conn: sqlite3.Connection, *, tables: Iterable[str] = IMPORT_ORDER) -> dict[str, int]:
+-    """Queue every existing row of a synced board for upload (idempotent: the service keys rows by uid)."""
++def import_board(conn: sqlite3.Connection, *, tables: Iterable[str] = IMPORT_ORDER,
++                 only: Optional[Mapping[str, set[str]]] = None) -> dict[str, int]:
++    """Queue every existing row of a synced board for upload (idempotent: the service keys rows by uid).
++    ``only`` restricts each table to those row uids (``reconcile`` re-sends just what the service lacks)."""
+     from hermes_cli.kanban_db_connect import write_txn
+     if sync.board_mode(conn) == "off":
+         raise SyncUnavailable("this board does not sync (kanban.sync.enabled / kanban.sync.boards / mode off)")
+@@ -758,13 +760,20 @@ def import_board(conn: sqlite3.Connection, *, tables: Iterable[str] = IMPORT_ORD
+     now = time.time_ns() // 1_000_000
+     with write_txn(conn):
+         # Rows the service refused before the import (edits of cards it had not seen) are superseded by the full rows.
+-        counts["cleared_rejected"] = conn.execute("DELETE FROM kanban_sync_outbox WHERE state = 'rejected'").rowcount
++        counts["cleared_rejected"] = (0 if only is not None else
++                                      conn.execute("DELETE FROM kanban_sync_outbox WHERE state = 'rejected'").rowcount)
+         for table in tables:
++            wanted = None if only is None else only.get(table, set())
++            if wanted is not None and not wanted:
++                counts[table] = 0
++                continue
+             order = "created_at, id" if table == "tasks" else ("parent_id, child_id" if table == "task_links" else "id")
+             n = 0
+             # The service drops events older than its retention window; importing them would only churn the feed.
+             where = f" WHERE created_at >= {int(time.time()) - EVENT_IMPORT_WINDOW_S}" if table == "task_events" else ""
+             for row in conn.execute(f"SELECT * FROM {table}{where} ORDER BY {order}").fetchall():
++                if wanted is not None and _row_uid(table, row) not in wanted:
++                    continue
+                 op = "import" if table == "tasks" else "upsert"
+                 conn.execute(
+                     "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+@@ -776,6 +785,75 @@ def import_board(conn: sqlite3.Connection, *, tables: Iterable[str] = IMPORT_ORD
+     return counts
+ 
+ 
++# --- reconcile after a recovery -------------------------------------------------------------------
++
++def _live_uids(conn: sqlite3.Connection, table: str) -> set[str]:
++    if table == "tasks":
++        return {str(r[0]) for r in conn.execute("SELECT id FROM tasks")}
++    if table == "task_links":
++        return {f"{p}>{c}" for p, c in conn.execute("SELECT parent_id, child_id FROM task_links")}
++    where = f" AND created_at >= {int(time.time()) - EVENT_IMPORT_WINDOW_S}" if table == "task_events" else ""
++    return {str(r[0]) for r in conn.execute(f"SELECT uid FROM {table} WHERE uid IS NOT NULL{where}")}
++
++
++def reconcile(slug: str, path: Optional[Path] = None, hub: Optional[Hub] = None) -> dict[str, Any]:
++    """Bring a board and the service back in step after its file lost rows (a corruption rebuild, a
++    restore from backup) — including the unsent outbox, which a rebuild cannot recover.
++
++    Reads the service snapshot of every table once. Rows this board has and the service lacks are
++    queued for upload (tasks as ``import``, which the service refuses for an id it already holds) and
++    pushed. On a ``primary`` board, rows of this gateway's cards that the service has and the file
++    lost are applied back from the snapshot; rows the file still has are never overwritten, so local
++    edits whose outbox entry was lost are not reverted. Returns counts and the post-reconcile ``diff``."""
++    from hermes_cli import kanban_db
++    ident = load_identity() if hub is None else hub.ident
++    hub = hub or Hub(ident)
++    if path is None:
++        path = dict(board_paths()).get(slug) or kanban_db.kanban_db_path(board=slug)
++    live = _connect(Path(path))
++    try:
++        mode = sync.board_mode(live)
++        if mode == "off":
++            return {"board": slug, "mode": "off"}
++        ensure_identity(live, slug, ident.gateway)
++        live_uids = {table: _live_uids(live, table) for table in IMPORT_ORDER}
++        service_uids: dict[str, set[str]] = {table: set() for table in IMPORT_ORDER}
++        restored: dict[str, int] = {}
++        for table in IMPORT_ORDER:
++            after = ""
++            while True:
++                page = hub.snapshot_page(slug, table, after)
++                rows = page.get("rows", [])
++                service_uids[table].update(str(r["uid"]) for r in rows)
++                if mode == "primary":
++                    lost = own_partition(live, [_row_change(table, r) for r in rows
++                                                if str(r["uid"]) not in live_uids[table]], ident.gateway)
++                    if lost:
++                        cursor = int((sync.sync_state(live) or {}).get("cursor") or 0)
++                        sync.apply_remote_changes(live, lost, new_cursor=cursor, board=slug, observers=False)
++                        restored[table] = restored.get(table, 0) + len(lost)
++                if not page.get("more"):
++                    break
++                after = str(page["next"])
++        missing = {table: live_uids[table] - service_uids[table] for table in IMPORT_ORDER}
++        queued = import_board(live, only=missing)
++        queued.pop("cleared_rejected", None)
++        pushed = push(live, hub, slug, ident.gateway, primary=mode == "primary")
++        _pull_replica(slug, hub, ident.gateway)
++        shadow = open_shadow(slug, ident.gateway)
++        try:
++            report = diff(live, shadow, ident.gateway)
++        finally:
++            shadow.close()
++        return {"board": slug, "mode": mode, "queued": {k: v for k, v in queued.items() if v},
++                "restored": restored, "pushed": pushed.sent, "rejected": pushed.rejected,
++                "deferred": pushed.deferred, "clean": report.get("clean"),
++                "field_mismatch": len(report.get("field_mismatch") or {}),
++                "missing_in_shadow": len(report.get("missing_in_shadow") or [])}
++    finally:
++        live.close()
++
++
+ # --- status and diff ------------------------------------------------------------------------------
+ 
+ def status(conn: sqlite3.Connection) -> dict[str, Any]:
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 6d7c3ca169..923bf6aabd 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -153,6 +153,15 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
+     os.environ["HERMES_TEST_SANDBOX_HOME"] = _SESSION_HERMES_HOME
+     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+ 
++# Kanban board pins. A Kanban worker that runs pytest hands it HERMES_KANBAN_DB=<the LIVE
++# ~/.hermes/kanban.db>, HERMES_KANBAN_BOARD, HERMES_KANBAN_HOME, ... and kanban_db_path() resolves
++# HERMES_KANBAN_DB before HERMES_HOME. The per-test env filter blanks them, but only once fixtures
++# run: collection-time imports, module-level code and subprocesses started before that saw the
++# production board (hub incident 2026-10-28 put the suite under suspicion; this closes the window).
++# Tests that exercise these variables set them themselves.
++for _key in [k for k in os.environ if k.startswith("HERMES_KANBAN_")]:
++    del os.environ[_key]
++
+ # PYTHONPYCACHEPREFIX is a bytecode-mirror escape hatch: when set (the
+ # bundled desktop app exports it as %LOCALAPPDATA%\hermes\pycache),
+ # importlib/pytest write .pyc files to <prefix>/<absolute source path>
+diff --git a/tests/hermes_cli/test_kanban_db_recover.py b/tests/hermes_cli/test_kanban_db_recover.py
+new file mode 100644
+index 0000000000..e19306abdd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_db_recover.py
+@@ -0,0 +1,304 @@
++"""Automatic recovery of a Kanban board with table b-tree damage (hermes_cli/kanban_db_recover.py). [daveey]
++
++Every test damages a real board file on purpose: one leaf page of ``task_events`` is overwritten, so the table
++b-tree fails integrity_check (REINDEX cannot fix it) while the table's indexes still list the rows that were on
++that page. That is the hub's 2026-10-28 incident shape: rows unreadable in the table, still named by indexes.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import sqlite3
++import struct
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_recover as rec
++
++N_EVENTS = 1500
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    return home
++
++
++def _forget(path: Path) -> None:
++    """Make this process re-probe ``path`` on its next connect (as a fresh process would)."""
++    with kbc._INIT_LOCK:
++        kbc._INITIALIZED_PATHS.discard(str(path.resolve()))
++
++
++def _make_board(path: Path) -> list[str]:
++    conn = kbc.connect(path)
++    try:
++        tids = [kb.create_task(conn, title=f"card {i}", assignee="default") for i in range(3)]
++        with kbc.write_txn(conn):
++            conn.executemany(
++                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'note', ?, ?)",
++                [(tids[i % 3], json.dumps({"i": i, "pad": "x" * 200}), 1_800_000_000 + i) for i in range(N_EVENTS)])
++        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
++    finally:
++        conn.close()
++    _forget(path)
++    return tids
++
++
++def _varint(buf: bytes, at: int) -> tuple[int, int]:
++    value = 0
++    for i in range(9):
++        byte = buf[at + i]
++        if i == 8:
++            return (value << 8) | byte, at + 9
++        value = (value << 7) | (byte & 0x7F)
++        if not byte & 0x80:
++            return value, at + i + 1
++    raise AssertionError("unreachable")
++
++
++def _table_leaves(data: bytes, page_size: int, root: int) -> list[int]:
++    """Leaf pages of a table b-tree, left to right (SQLite file format, section 1.6)."""
++    off = (root - 1) * page_size
++    hdr = off + (100 if root == 1 else 0)
++    kind = data[hdr]
++    if kind == 0x0D:
++        return [root]
++    assert kind == 0x05, f"page {root} is not a table b-tree page ({kind:#x})"
++    ncells, = struct.unpack(">H", data[hdr + 3:hdr + 5])
++    right, = struct.unpack(">I", data[hdr + 8:hdr + 12])
++    children = []
++    for i in range(ncells):
++        ptr, = struct.unpack(">H", data[hdr + 12 + 2 * i:hdr + 14 + 2 * i])
++        children.append(struct.unpack(">I", data[off + ptr:off + ptr + 4])[0])
++    return [leaf for child in children + [right] for leaf in _table_leaves(data, page_size, child)]
++
++
++def _leaf_rowids(data: bytes, page_size: int, page: int) -> list[int]:
++    off = (page - 1) * page_size
++    ncells, = struct.unpack(">H", data[off + 3:off + 5])
++    out = []
++    for i in range(ncells):
++        ptr, = struct.unpack(">H", data[off + 8 + 2 * i:off + 10 + 2 * i])
++        _size, at = _varint(data, off + ptr)
++        rowid, _ = _varint(data, at)
++        out.append(rowid)
++    return out
++
++
++def _damage_table(path: Path, table: str) -> list[int]:
++    """Overwrite the cell area of a middle leaf page of ``table``; return the rowids it held."""
++    conn = sqlite3.connect(path)
++    root = conn.execute("SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
++    conn.close()
++    data = path.read_bytes()
++    page_size, = struct.unpack(">H", data[16:18])
++    leaves = _table_leaves(data, page_size, root)
++    assert len(leaves) >= 5, "the table must span several leaf pages"
++    page = leaves[len(leaves) // 2]
++    rowids = _leaf_rowids(data, page_size, page)
++    off = (page - 1) * page_size
++    with open(path, "r+b") as fh:
++        fh.seek(off + 8)
++        fh.write(b"\xff" * (page_size - 8))
++    return rowids
++
++
++def _payloads(path: Path) -> dict[int, str]:
++    conn = sqlite3.connect(path)
++    try:
++        return dict(conn.execute("SELECT id, payload FROM task_events"))
++    finally:
++        conn.close()
++
++
++def test_damaged_board_fails_closed_then_recovers_in_place_with_a_loss_report(home):
++    path = home / "kanban.db"
++    tids = _make_board(path)
++    before = _payloads(path)
++    top_id = max(before)
++    lost = _damage_table(path, "task_events")
++    assert lost
++    with pytest.raises(kbc.KanbanDbCorruptError):  # the guard refuses table damage: REINDEX cannot fix it
++        kbc.connect(path)
++    _forget(path)
++    inode = os.stat(path).st_ino
++    # A connection another process would hold across the recovery: it must stay usable.
++    holder = sqlite3.connect(path)
++    holder.execute("SELECT count(*) FROM tasks").fetchone()
++
++    result = rec.spawn_recovery(path, wait=True, extra_args=["--no-sync"])
++
++    assert result["status"] == "recovered", result
++    events = result["tables"]["task_events"]
++    assert events["known_lost"] == len(lost) and events["possibly_lost"] == len(lost)
++    assert {k[0] for k in events["lost_keys"]} == set(lost)
++    assert result["tables"]["tasks"]["known_lost"] == 0
++    assert os.stat(path).st_ino == inode, "the board must be written in place, never replaced"
++    report = json.loads(Path(result["report_path"]).read_text())
++    assert report["tables"]["task_events"]["known_lost"] == len(lost)
++    assert Path(result["snapshot_path"]).exists()
++    # The held connection sees the rebuilt board.
++    assert holder.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
++    after = dict(holder.execute("SELECT id, payload FROM task_events"))
++    assert {k: v for k, v in before.items() if k not in lost}.items() <= after.items()
++    assert not set(lost) & set(after)
++    holder.close()
++    # A lost row's id is never handed out again.
++    conn = kbc.connect(path)
++    try:
++        seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='task_events'").fetchone()[0]
++        assert seq >= top_id
++        assert {t.id for t in kb.list_tasks(conn)} >= set(tids)
++        card = conn.execute("SELECT id, title, body, assignee FROM tasks WHERE created_by='kanban-recover'").fetchone()
++        assert card is not None and result["card_id"] == card[0]
++        assert f"Known lost rows: {len(lost)}" in card[2] and card[3] == "default"
++        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
++    finally:
++        conn.close()
++
++
++def test_rows_the_damage_took_are_filled_from_the_newest_healthy_backup(home):
++    path = home / "kanban.db"
++    _make_board(path)
++    before = _payloads(path)
++    # What the connect-time guard leaves behind: a content-addressed copy taken while the board was still healthy.
++    shutil.copy2(path, path.with_name(path.name + ".corrupt.0123456789abcdef.bak"))
++    lost = _damage_table(path, "task_events")
++
++    result = rec.recover(path, file_card=False, reconcile_sync=False)
++
++    assert result.status == "recovered", result.reason
++    events = result.tables["task_events"]
++    assert events.filled_from_backup == len(lost) and events.known_lost == 0
++    assert result.fill_source and result.fill_source.endswith(".corrupt.0123456789abcdef.bak")
++    assert _payloads(path) == before
++
++
++def test_a_second_recovery_of_the_same_board_is_refused_busy(home):
++    path = home / "kanban.db"
++    _make_board(path)
++    _damage_table(path, "task_events")
++    digest = path.read_bytes()
++    with rec.recovery_lock(path) as held:
++        assert held
++        result = rec.recover(path, file_card=False, reconcile_sync=False)
++    assert result.status == "busy" and str(os.getpid()) in result.reason
++    assert path.read_bytes() == digest, "a refused recovery writes nothing"
++
++
++def test_a_board_a_clean_process_reads_fine_is_left_untouched(home):
++    """A caller stranded on deleted -wal/-shm files sees "corruption" that is not on disk: the child re-checks."""
++    path = home / "kanban.db"
++    _make_board(path)
++    digest = path.read_bytes()
++    result = rec.recover(path, file_card=False, reconcile_sync=False)
++    assert result.status == "healthy"
++    assert path.read_bytes() == digest
++    assert not list(home.glob("kanban.db.recovery-*.json"))
++
++
++def test_dry_run_reports_the_loss_and_writes_nothing(home):
++    path = home / "kanban.db"
++    _make_board(path)
++    lost = _damage_table(path, "task_events")
++    digest = path.read_bytes()
++    result = rec.recover(path, file_card=False, reconcile_sync=False, dry_run=True)
++    assert result.status == "dry_run" and result.tables["task_events"].known_lost == len(lost)
++    assert path.read_bytes() == digest
++
++
++def _dispatcher(kb_module):
++    from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
++    settings = _DispatcherSettings(interval=60, max_spawn=None, max_in_progress=None, failure_limit=2,
++                                   stale_timeout_seconds=0, reconcile_orphans=True, default_assignee=None,
++                                   max_in_progress_per_profile=None)
++    return _KanbanDispatcher(kb_module, settings)
++
++
++@pytest.mark.parametrize("enabled", [True, False])
++def test_dispatcher_starts_recovery_when_it_pauses_a_damaged_board(home, monkeypatch, enabled):
++    path = home / "kanban.db"
++    _make_board(path)
++    _damage_table(path, "task_events")
++    started = []
++    monkeypatch.setattr(rec, "spawn_recovery", lambda p, **kw: started.append(Path(p)))
++    monkeypatch.setattr(rec, "auto_recover_enabled", lambda: enabled)
++    dispatcher = _dispatcher(kb)
++
++    assert dispatcher.tick_once_for_board("default") is None
++
++    assert "default" in dispatcher.disabled_corrupt_boards
++    assert started == ([path.resolve()] if enabled else [])
++
++
++def test_auto_recover_follows_config(home):
++    assert rec.auto_recover_enabled() is True  # default on
++    (home / "config.yaml").write_text("kanban:\n  auto_recover_corruption: false\n")
++    assert rec.auto_recover_enabled() is False
++
++
++def test_spawn_recovery_is_rate_limited_per_board(home, monkeypatch):
++    calls = []
++
++    class _Popen:
++        def __init__(self, cmd, **kw):
++            calls.append(cmd)
++
++    monkeypatch.setattr(rec.subprocess, "Popen", _Popen)
++    monkeypatch.setattr(rec, "_SPAWNED", {})
++    path = home / "kanban.db"
++    path.write_bytes(b"")
++    rec.spawn_recovery(path)
++    rec.spawn_recovery(path)
++    assert len(calls) == 1 and calls[0][1:4] == ["-m", "hermes_cli.kanban_db_recover", "--db"]
++
++
++def _run_kanban_cli(argv: list[str]) -> int:
++    import argparse
++
++    from hermes_cli import kanban as kc
++    parser = argparse.ArgumentParser()
++    sub = parser.add_subparsers(dest="command")
++    kc.build_parser(sub)
++    return kc.kanban_command(parser.parse_args(["kanban", *argv]))
++
++
++def test_cli_recover_rebuilds_a_board_init_refuses(home, capsys):
++    path = kb.kanban_db_path()
++    _make_board(path)
++    lost = _damage_table(path, "task_events")
++    rc = _run_kanban_cli(["recover", "--json"])
++    payload = json.loads(capsys.readouterr().out)
++    assert rc == 0 and payload["status"] == "recovered"
++    assert payload["tables"]["task_events"]["known_lost"] == len(lost)
++    _forget(path)
++    kbc.connect(path).close()  # the guard now opens it
++
++
++def test_cli_recover_reports_busy_while_another_recovery_runs(home, capsys):
++    path = kb.kanban_db_path()
++    _make_board(path)
++    _damage_table(path, "task_events")
++    with rec.recovery_lock(path):
++        rc = _run_kanban_cli(["recover"])
++    assert rc == 1 and "busy" in capsys.readouterr().out
++
++
++def test_quarantine_rotation_keeps_manual_and_recovery_copies(tmp_path):
++    base = tmp_path / "kanban.db"
++    manual = tmp_path / "kanban.db.corrupt.manual-20261028T035603Z.bak"
++    manual.write_bytes(b"forensic")
++    for i in range(kbc._CORRUPT_BACKUP_RETENTION + 5):
++        (tmp_path / f"kanban.db.corrupt.{i:016x}.bak").write_bytes(b"x")
++    kbc._prune_corrupt_backups(tmp_path, base.name)
++    assert manual.exists(), "a quarantine burst must not delete a manual forensic copy"
++    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == kbc._CORRUPT_BACKUP_RETENTION + 1
+diff --git a/tests/hermes_cli/test_kanban_sync_reconcile.py b/tests/hermes_cli/test_kanban_sync_reconcile.py
+new file mode 100644
+index 0000000000..72c53a5536
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_reconcile.py
+@@ -0,0 +1,108 @@
++"""``kanban_sync_client.reconcile``: after a board file lost rows (a corruption rebuild), the board and the
++Board service are brought back in step, including the unsent outbox the rebuild could not recover. [daveey]"""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = "hub", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _without_capture(conn, sql, params=()):
++    """A row vanishing from the file the way a rebuild loses it: no trigger, no outbox entry."""
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        conn.execute(sql, params)
++        conn.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++def test_reconcile_restores_lost_rows_and_resends_the_lost_outbox(live, svc, kanban_home):
++    tid = kb.create_task(live, title="card", assignee="worker")
++    kb.add_comment(live, tid, "me", "synced note")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    # The rebuild lost a synced comment row and every pending outbox op (an unsent comment and a new card).
++    _without_capture(live, "DELETE FROM task_comments WHERE body = 'synced note'")
++    kb.add_comment(live, tid, "me", "unsent note")
++    unsent = kb.create_task(live, title="unsent card", assignee="worker")
++    live.execute("DELETE FROM kanban_sync_outbox")
++    live.commit()
++
++    report = ksc.reconcile(BOARD, kanban_home / "kanban.db", hub=svc.hub(ME))
++
++    assert report["restored"] == {"task_comments": 1}
++    assert report["queued"]["tasks"] == 1 and report["queued"]["task_comments"] == 1
++    assert report["rejected"] == 0 and report["clean"] is True
++    bodies = {r[0] for r in live.execute("SELECT body FROM task_comments")}
++    assert {"synced note", "unsent note"} <= bodies
++    rows = svc.board(BOARD)["rows"]
++    assert unsent in rows["tasks"]
++    assert any(r["body"] == "unsent note" for r in rows["task_comments"].values())
++
++
++def test_reconcile_never_reverts_a_local_edit_whose_outbox_entry_was_lost(live, svc, kanban_home):
++    tid = kb.create_task(live, title="before", assignee="worker")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    live.execute("UPDATE tasks SET title = 'after' WHERE id = ?", (tid,))
++    live.execute("DELETE FROM kanban_sync_outbox")
++    live.commit()
++
++    ksc.reconcile(BOARD, kanban_home / "kanban.db", hub=svc.hub(ME))
++
++    assert live.execute("SELECT title FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "after"
++
++
++def test_reconcile_is_a_no_op_on_a_board_in_step(live, svc, kanban_home):
++    tid = kb.create_task(live, title="card", assignee="worker")
++    kb.add_comment(live, tid, "me", "note")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    calls = len(svc.calls)
++    report = ksc.reconcile(BOARD, kanban_home / "kanban.db", hub=svc.hub(ME))
++    assert report["queued"] == {} and report["restored"] == {} and report["clean"] is True
++    assert not [c for c in svc.calls[calls:] if c[0] == "ops"]
++
++
++def test_cli_sync_reconcile_runs_against_the_service(live, svc, kanban_home, monkeypatch, capsys):
++    import argparse
++    import json
++
++    from hermes_cli import kanban as kc
++    tid = kb.create_task(live, title="card", assignee="worker")
++    live.execute("DELETE FROM kanban_sync_outbox WHERE 1 = 1")
++    live.commit()
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: svc.hub(ME).ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident, timeout=None: svc.hub(ident.gateway))
++    parser = argparse.ArgumentParser()
++    kc.build_parser(parser.add_subparsers(dest="command"))
++    rc = kc.kanban_command(parser.parse_args(["kanban", "sync", "reconcile", "--json"]))
++    out = json.loads(capsys.readouterr().out)
++    assert rc == 0 and out["queued"] == {"tasks": 1, "task_events": 1} and out["clean"] is True
++    assert tid in svc.board(BOARD)["rows"]["tasks"]
+diff --git a/tests/test_conftest_kanban_env_scrub.py b/tests/test_conftest_kanban_env_scrub.py
+new file mode 100644
+index 0000000000..02b4ab2e42
+--- /dev/null
++++ b/tests/test_conftest_kanban_env_scrub.py
+@@ -0,0 +1,33 @@
++"""A pytest launched by a Kanban worker inherits HERMES_KANBAN_DB=<the live board> and friends. conftest must drop
++them before any test module is imported, not only per test: collection-time code and subprocesses started early
++would otherwise resolve the production board (hub incident 2026-10-28). [daveey]"""
++
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++#: The HERMES_KANBAN_* variables visible while this module was being collected (after conftest ran).
++COLLECTION_TIME_KANBAN_ENV = sorted(k for k in os.environ if k.startswith("HERMES_KANBAN_"))
++_PROBE = "HERMES_TEST_KANBAN_SCRUB_PROBE"
++
++
++def test_collection_time_env_has_no_kanban_pins():
++    if not os.environ.get(_PROBE):
++        return  # meaningful only in the child below, which is started WITH the pins
++    assert COLLECTION_TIME_KANBAN_ENV == []
++
++
++def test_worker_kanban_pins_never_reach_collection(tmp_path):
++    live = tmp_path / "live" / "kanban.db"
++    env = {**os.environ, _PROBE: "1", "HERMES_KANBAN_DB": str(live), "HERMES_KANBAN_BOARD": "default",
++           "HERMES_KANBAN_HOME": str(live.parent), "HERMES_KANBAN_TASK": "t_probe"}
++    root = Path(__file__).resolve().parents[1]
++    done = subprocess.run(
++        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:xdist",
++         f"{Path(__file__).resolve()}::test_collection_time_env_has_no_kanban_pins"],
++        cwd=root, env=env, capture_output=True, text=True, timeout=240)
++    assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-2000:]
++    assert not live.exists(), "nothing may create the pinned board"
+-- 
+2.55.0
+

@@ -1,0 +1,141 @@
+From 1bc374222c78e37910c25dfc12dd91d68a5ed8ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:37:44 +0000
+Subject: [PATCH] fix(ci): synchronize downloader test counters and finish
+ recovery lint fixes [daveey]
+
+---
+ hermes_cli/kanban_db_recover.py            | 10 +++----
+ tests/hermes_cli/test_kanban_db_recover.py |  2 +-
+ tests/pm/test_downloader_integrity.py      | 31 +++++++++++++++-------
+ tests/test_conftest_kanban_env_scrub.py    |  2 +-
+ 4 files changed, 28 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index b11327b5f2..53d2c62165 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -149,7 +149,7 @@ def recovery_lock(db_path: Path) -> Iterator[bool]:
+             yield False
+             return
+         with contextlib.suppress(OSError):
+-            _pid_path(db_path).write_text(f"{os.getpid()}\n")
++            _pid_path(db_path).write_text(f"{os.getpid()}\n", encoding="utf-8")
+         yield True
+     finally:
+         handle.close()
+@@ -161,7 +161,7 @@ def _pid_path(db_path: Path) -> Path:
+ 
+ def recovery_lock_holder(db_path: Path) -> Optional[str]:
+     try:
+-        return _pid_path(db_path).read_text().strip() or None
++        return _pid_path(db_path).read_text(encoding="utf-8-sig").strip() or None
+     except OSError:
+         return None
+ 
+@@ -684,7 +684,7 @@ def recover(db_path: Path, *, fill: bool = True, file_card: bool = True, reconci
+         if file_card and result.status in ("recovered", "installed_unverified"):
+             result.card_id = _file_card(path, result)
+         if result.report_path:
+-            Path(result.report_path).write_text(json.dumps(result.to_dict(), indent=2, default=str))
++            Path(result.report_path).write_text(json.dumps(result.to_dict(), indent=2, default=str), encoding="utf-8")
+     except Exception as exc:  # health: allow BLE001 -- the result carries the failure and the status says what was written
+         if result.status not in ("recovered", "installed_unverified"):
+             result.status = "failed"  # nothing was written to the live board
+@@ -703,7 +703,7 @@ def _invalidate_init_cache(path: Path) -> None:
+ 
+ def _write_report(path: Path, result: RecoveryResult, stamp: str) -> Path:
+     report = path.with_name(f"{path.name}.recovery-{stamp}.json")
+-    report.write_text(json.dumps(result.to_dict(), indent=2, default=str))
++    report.write_text(json.dumps(result.to_dict(), indent=2, default=str), encoding="utf-8")
+     return report
+ 
+ 
+@@ -852,7 +852,7 @@ def main(argv: Optional[list[str]] = None) -> int:
+         def _timed_out(_signum, _frame):
+             raise TimeoutError(f"recovery exceeded {args.timeout}s")
+ 
+-        signal.signal(signal.SIGALRM, _timed_out)
++        signal.signal(signal.SIGALRM, _timed_out)  # windows-footgun: ok — guarded by hasattr above
+         signal.alarm(args.timeout)
+     result = recover(Path(args.db), fill=not args.no_fill, file_card=not args.no_card,
+                      reconcile_sync=not args.no_sync, dry_run=args.dry_run)
+diff --git a/tests/hermes_cli/test_kanban_db_recover.py b/tests/hermes_cli/test_kanban_db_recover.py
+index 8d15623eca..3b638d2864 100644
+--- a/tests/hermes_cli/test_kanban_db_recover.py
++++ b/tests/hermes_cli/test_kanban_db_recover.py
+@@ -512,7 +512,7 @@ def test_the_child_timeout_cleans_up_its_work_dir(home):
+     repo = str(Path(rec.__file__).resolve().parents[1])
+     env["PYTHONPATH"] = repo
+     done = subprocess.run([sys.executable, str(probe), "--db", str(path), "--json", "--no-card", "--no-sync",
+-                           "--timeout", "3"], capture_output=True, text=True, timeout=60, env=env, cwd=repo)
++                           "--timeout", "3"], capture_output=True, text=True, timeout=60, env=env, cwd=repo, check=False)
+     payload = json.loads(done.stdout.strip().splitlines()[-1])
+     assert done.returncode == 1 and payload["status"] == "failed" and "TimeoutError" in payload["reason"]
+     assert not list(home.glob("kanban-recover-*")), "the rebuild work dir leaked"
+diff --git a/tests/pm/test_downloader_integrity.py b/tests/pm/test_downloader_integrity.py
+index 36612c6ac2..d1a559fb79 100644
+--- a/tests/pm/test_downloader_integrity.py
++++ b/tests/pm/test_downloader_integrity.py
+@@ -119,11 +119,18 @@ def test_fragmented_resume_obeys_connection_limit(tmp_path):
+                     maximum = max(maximum, active)
+                     entered.set()
+                 release.wait(timeout=8)
+-            try:
++            if is_probe:
+                 self.wfile.write(payload[start:end + 1])
+-            finally:
+-                if not is_probe:
+-                    with lock:
++            else:
++                # Once the bytes reach the client it can start the next
++                # request, even before this handler is scheduled again.
++                # Make delivery and bookkeeping atomic to new handlers;
++                # the pending-response wait above stays outside the lock
++                # so genuinely concurrent requests are still counted.
++                with lock:
++                    try:
++                        self.wfile.write(payload[start:end + 1])
++                    finally:
+                         active -= 1
+ 
+         def log_message(self, *args):
+@@ -203,13 +210,17 @@ def test_processes_share_partial_ownership_without_losing_destinations(tmp_path)
+                     if active > 1:
+                         both.set()
+                 release.wait(timeout=15)
+-            try:
++            if probe:
+                 self.wfile.write(payload[start:end + 1])
+-            except (BrokenPipeError, ConnectionResetError):
+-                pass
+-            finally:
+-                if not probe:
+-                    with lock:
++            else:
++                # Count pending responses, not a completed handler waiting
++                # to be scheduled for its final bookkeeping (see above).
++                with lock:
++                    try:
++                        self.wfile.write(payload[start:end + 1])
++                    except (BrokenPipeError, ConnectionResetError):
++                        pass
++                    finally:
+                         active -= 1
+ 
+         def log_message(self, *args):
+diff --git a/tests/test_conftest_kanban_env_scrub.py b/tests/test_conftest_kanban_env_scrub.py
+index 02b4ab2e42..00e8b55012 100644
+--- a/tests/test_conftest_kanban_env_scrub.py
++++ b/tests/test_conftest_kanban_env_scrub.py
+@@ -28,6 +28,6 @@ def test_worker_kanban_pins_never_reach_collection(tmp_path):
+     done = subprocess.run(
+         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:xdist",
+          f"{Path(__file__).resolve()}::test_collection_time_env_has_no_kanban_pins"],
+-        cwd=root, env=env, capture_output=True, text=True, timeout=240)
++        cwd=root, env=env, capture_output=True, text=True, timeout=240, check=False)
+     assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-2000:]
+     assert not live.exists(), "nothing may create the pinned board"
+-- 
+2.55.0
+

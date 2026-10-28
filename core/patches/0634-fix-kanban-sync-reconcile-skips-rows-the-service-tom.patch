@@ -1,0 +1,99 @@
+From 96fa4223aba152f48bced8c683da4f0c57832acc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:31:14 +0000
+Subject: [PATCH] fix(kanban-sync): reconcile skips rows the service tombstoned
+ and re-checks before restoring; recover honors sync tombstones [daveey]
+
+---
+ hermes_cli/kanban_db_recover.py               |  2 +-
+ hermes_cli/kanban_sync_client.py              | 20 ++++++++++++++++---
+ .../hermes_cli/test_kanban_sync_reconcile.py  | 15 ++++++++++++++
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index bd68226dd4..8cd0412185 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -300,7 +300,7 @@ def _healthy_fill_source(db_path: Path, exclude: set[Path]) -> Optional[Path]:
+ 
+ def _tombstoned(dst: sqlite3.Connection) -> set[tuple[str, str]]:
+     try:
+-        return {(str(t), str(u)) for t, u in dst.execute("SELECT table_name, uid FROM kanban_sync_tombstones")}
++        return {(str(t), str(u)) for t, u in dst.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones")}
+     except sqlite3.DatabaseError:
+         return set()
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 134c9586de..9c7ad994d2 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -816,6 +816,16 @@ def reconcile(slug: str, path: Optional[Path] = None, hub: Optional[Hub] = None)
+         if mode == "off":
+             return {"board": slug, "mode": "off"}
+         ensure_identity(live, slug, ident.gateway)
++        # Rows the service deleted on purpose (its event GC of done cards, deletes) come back as tombstones in
++        # the replica: never re-send those.
++        _pull_replica(slug, hub, ident.gateway)
++        shadow = open_shadow(slug, ident.gateway)
++        try:
++            tombstoned: dict[str, set[str]] = {}
++            for table, uid in shadow.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones"):
++                tombstoned.setdefault(str(table), set()).add(str(uid))
++        finally:
++            shadow.close()
+         live_uids = {table: _live_uids(live, table) for table in IMPORT_ORDER}
+         service_uids: dict[str, set[str]] = {table: set() for table in IMPORT_ORDER}
+         restored: dict[str, int] = {}
+@@ -826,8 +836,11 @@ def reconcile(slug: str, path: Optional[Path] = None, hub: Optional[Hub] = None)
+                 rows = page.get("rows", [])
+                 service_uids[table].update(str(r["uid"]) for r in rows)
+                 if mode == "primary":
+-                    lost = own_partition(live, [_row_change(table, r) for r in rows
+-                                                if str(r["uid"]) not in live_uids[table]], ident.gateway)
++                    candidates = [r for r in rows if str(r["uid"]) not in live_uids[table]]
++                    # Rows written locally since live_uids was read reached the service meanwhile: re-check.
++                    now_live = _live_uids(live, table) if candidates else set()
++                    lost = own_partition(live, [_row_change(table, r) for r in candidates
++                                                if str(r["uid"]) not in now_live], ident.gateway)
+                     if lost:
+                         cursor = int((sync.sync_state(live) or {}).get("cursor") or 0)
+                         sync.apply_remote_changes(live, lost, new_cursor=cursor, board=slug, observers=False)
+@@ -835,7 +848,8 @@ def reconcile(slug: str, path: Optional[Path] = None, hub: Optional[Hub] = None)
+                 if not page.get("more"):
+                     break
+                 after = str(page["next"])
+-        missing = {table: live_uids[table] - service_uids[table] for table in IMPORT_ORDER}
++        missing = {table: live_uids[table] - service_uids[table] - tombstoned.get(table, set())
++                   for table in IMPORT_ORDER}
+         queued = import_board(live, only=missing)
+         queued.pop("cleared_rejected", None)
+         pushed = push(live, hub, slug, ident.gateway, primary=mode == "primary")
+diff --git a/tests/hermes_cli/test_kanban_sync_reconcile.py b/tests/hermes_cli/test_kanban_sync_reconcile.py
+index 72c53a5536..9c72283efe 100644
+--- a/tests/hermes_cli/test_kanban_sync_reconcile.py
++++ b/tests/hermes_cli/test_kanban_sync_reconcile.py
+@@ -80,6 +80,21 @@ def test_reconcile_never_reverts_a_local_edit_whose_outbox_entry_was_lost(live,
+     assert live.execute("SELECT title FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "after"
+ 
+ 
++def test_reconcile_never_resends_a_row_the_service_deleted(live, svc, kanban_home):
++    """The service's event GC tombstones old events of done cards; the file may still hold them."""
++    tid = kb.create_task(live, title="card", assignee="worker")
++    kb.add_comment(live, tid, "me", "gc'd on the service")
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    uid = live.execute("SELECT uid FROM task_comments").fetchone()[0]
++    svc.hub("mini").ops(BOARD, [{"client_op_id": "del-1", "op": "delete", "table": "task_comments", "uid": uid,
++                                 "hlc": f"{9:013d}-0000-mini", "fields": {}}])
++
++    report = ksc.reconcile(BOARD, kanban_home / "kanban.db", hub=svc.hub(ME))
++
++    assert "task_comments" not in report["queued"]
++    assert svc.board(BOARD)["rows"]["task_comments"][uid].get("deleted_at")
++
++
+ def test_reconcile_is_a_no_op_on_a_board_in_step(live, svc, kanban_home):
+     tid = kb.create_task(live, title="card", assignee="worker")
+     kb.add_comment(live, tid, "me", "note")
+-- 
+2.55.0
+

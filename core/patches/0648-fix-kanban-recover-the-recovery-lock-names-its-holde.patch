@@ -1,0 +1,229 @@
+From 86dba5f9a3d074247e9480562e5cf6afec6ded52 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:31:24 +0000
+Subject: [PATCH] fix(kanban-recover): the recovery lock names its holder (pid,
+ session, card); a second recover prints it; the record is cleared on release
+ [daveey]
+
+Problem: in the 2026-10-28 03:49Z hub incident three agents recovered kanban.db by hand within two
+minutes, none aware of the others (t_01a180cfd048ffcc). `hermes kanban recover` now serialises on
+<db>.recovery.lock, but a refused second recovery only printed a pid, and spawn_recovery stripped
+HERMES_KANBAN_TASK, so nothing could tell which card owned the running recovery.
+
+Fix: recovery_lock writes {pid, session_id, task_id, started_at} as JSON to <db>.recover.pid and
+removes it on release; recovery_lock_holder_info() returns it only while that pid is alive (old
+plain-pid records still parse). The busy reason names pid, session and card. spawn_recovery passes
+the caller's card to the child as HERMES_RECOVERY_HOLDER_TASK. The sqlite-live-guard refusal and the
+coach self-heal incident dedupe (hermes-mods) read the same record.
+
+Tests: second CLI recover vs a lock-holding child process exits 1 and names pid/session/card;
+holder record set while held and cleared on release; dead-pid record ignored; spawned child gets
+the holder card. test_kanban_db_recover.py 26 passed.
+---
+ hermes_cli/kanban_db_recover.py            | 72 ++++++++++++++++++--
+ tests/hermes_cli/test_kanban_db_recover.py | 77 ++++++++++++++++++++++
+ 2 files changed, 143 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index 53d2c62165..cb4f3a0b1f 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -129,7 +129,9 @@ def _lock_path(db_path: Path) -> Path:
+ def recovery_lock(db_path: Path) -> Iterator[bool]:
+     """Non-blocking exclusive lock for one board's recovery. Yields False when another process
+     holds it. The lock file itself is never written (a Windows byte lock must stay on byte 0); the
+-    holder's pid goes to ``<db>.recover.pid`` for the ``busy`` message."""
++    holder (pid, session, card, start time) goes to ``<db>.recover.pid`` as JSON for the ``busy``
++    message, the sqlite-live-guard refusal and the self-heal incident dedupe, and is removed on
++    release."""
+     lock_path = _lock_path(db_path)
+     lock_path.parent.mkdir(parents=True, exist_ok=True)
+     handle = lock_path.open("a+")
+@@ -148,9 +150,16 @@ def recovery_lock(db_path: Path) -> Iterator[bool]:
+         except OSError:
+             yield False
+             return
++        record = {"pid": os.getpid(), "started_at": time.time(),
++                  "session_id": os.environ.get("HERMES_SESSION_ID") or None,
++                  "task_id": os.environ.get(HOLDER_TASK_ENV) or os.environ.get("HERMES_KANBAN_TASK") or None}
+         with contextlib.suppress(OSError):
+-            _pid_path(db_path).write_text(f"{os.getpid()}\n", encoding="utf-8")
+-        yield True
++            _pid_path(db_path).write_text(json.dumps(record) + "\n", encoding="utf-8")
++        try:
++            yield True
++        finally:
++            with contextlib.suppress(OSError):
++                _pid_path(db_path).unlink()
+     finally:
+         handle.close()
+ 
+@@ -159,11 +168,58 @@ def _pid_path(db_path: Path) -> Path:
+     return db_path.with_name(db_path.name + ".recover.pid")
+ 
+ 
+-def recovery_lock_holder(db_path: Path) -> Optional[str]:
++# The card a recovery runs for. spawn_recovery strips HERMES_KANBAN_TASK from its child (the child
++# is not that card's worker), so the caller's card travels in this variable instead.
++HOLDER_TASK_ENV = "HERMES_RECOVERY_HOLDER_TASK"
++
++
++def _pid_alive(pid: int) -> bool:
+     try:
+-        return _pid_path(db_path).read_text(encoding="utf-8-sig").strip() or None
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    except (OSError, OverflowError):
++        return False
++    return True
++
++
++def recovery_lock_holder_info(db_path: Path) -> Optional[dict]:
++    """``{pid, session_id, task_id, started_at}`` of the live process holding this board's
++    recovery lock, or None (no record, or its process is gone). An old plain-pid record reads as
++    ``{pid}``."""
++    try:
++        raw = _pid_path(db_path).read_text(encoding="utf-8-sig").strip()
+     except OSError:
+         return None
++    try:
++        info = json.loads(raw)
++    except ValueError:
++        info = {"pid": raw}
++    if not isinstance(info, dict):
++        info = {"pid": info}
++    try:
++        info["pid"] = int(info.get("pid"))
++    except (TypeError, ValueError):
++        return None
++    return info if _pid_alive(info["pid"]) else None
++
++
++def describe_holder(info: Optional[dict]) -> str:
++    if not info:
++        return "holder unknown"
++    parts = [f"pid {info['pid']}"]
++    if info.get("session_id"):
++        parts.append(f"session {info['session_id']}")
++    if info.get("task_id"):
++        parts.append(f"card {info['task_id']}")
++    return ", ".join(parts)
++
++
++def recovery_lock_holder(db_path: Path) -> Optional[str]:
++    info = recovery_lock_holder_info(db_path)
++    return describe_holder(info) if info else None
+ 
+ 
+ # --- probing ----------------------------------------------------------------------------------
+@@ -612,7 +668,8 @@ def recover(db_path: Path, *, fill: bool = True, file_card: bool = True, reconci
+         with recovery_lock(path) as held:
+             if not held:
+                 result.status = "busy"
+-                result.reason = f"another recovery of this board is running (pid {recovery_lock_holder(path)})"
++                result.reason = ("another recovery of this board is running "
++                                 f"({describe_holder(recovery_lock_holder_info(path))})")
+                 return result
+             state, messages = classify(path)
+             result.messages = messages[:20]
+@@ -803,6 +860,9 @@ def spawn_recovery(db_path: Path, *, wait: bool = False, timeout: float = RECOVE
+         return None
+     _SPAWNED[key] = now
+     env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN_TASK")}
++    holder_task = os.environ.get(HOLDER_TASK_ENV) or os.environ.get("HERMES_KANBAN_TASK")
++    if holder_task:
++        env[HOLDER_TASK_ENV] = holder_task
+     cmd = [sys.executable, "-m", "hermes_cli.kanban_db_recover", "--db", key, "--json", *(extra_args or [])]
+     repo_root = str(Path(__file__).resolve().parents[1])
+     env["PYTHONPATH"] = repo_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+diff --git a/tests/hermes_cli/test_kanban_db_recover.py b/tests/hermes_cli/test_kanban_db_recover.py
+index 3b638d2864..47697432a1 100644
+--- a/tests/hermes_cli/test_kanban_db_recover.py
++++ b/tests/hermes_cli/test_kanban_db_recover.py
+@@ -517,3 +517,80 @@ def test_the_child_timeout_cleans_up_its_work_dir(home):
+     assert done.returncode == 1 and payload["status"] == "failed" and "TimeoutError" in payload["reason"]
+     assert not list(home.glob("kanban-recover-*")), "the rebuild work dir leaked"
+     assert rec.classify(path)[0] == "corrupt"
++
++
++# --- single owner: the lock names its holder (t_01a180cfd048ffcc) -----------------------------------
++
++_HOLD_LOCK = """
++import sys, time
++from pathlib import Path
++from hermes_cli import kanban_db_recover as rec
++path, ready = Path(sys.argv[1]), Path(sys.argv[2])
++with rec.recovery_lock(path) as held:
++    ready.write_text("held" if held else "busy")
++    time.sleep(60)
++"""
++
++
++def _hold_lock_in_child(path: Path, tmp: Path, **env: str):
++    import subprocess
++    import sys
++    import time
++    ready = tmp / "lock-ready"
++    child_env = {**os.environ, **env, "PYTHONPATH": str(Path(rec.__file__).resolve().parents[1])}
++    proc = subprocess.Popen([sys.executable, "-c", _HOLD_LOCK, str(path), str(ready)], env=child_env)
++    deadline = time.monotonic() + 30
++    while not ready.exists() and time.monotonic() < deadline:
++        time.sleep(0.05)
++    assert ready.read_text() == "held"
++    return proc
++
++
++def test_a_second_cli_recover_exits_nonzero_and_names_the_holder_pid_session_and_card(home, capsys, tmp_path):
++    path = kb.kanban_db_path()
++    _make_board(path)
++    _damage_table(path, "task_events")
++    proc = _hold_lock_in_child(path, tmp_path, HERMES_KANBAN_TASK="t_holdercard01", HERMES_SESSION_ID="sess_holder01")
++    try:
++        rc = _run_kanban_cli(["recover"])
++        out = capsys.readouterr().out
++    finally:
++        proc.kill()
++        proc.wait()
++    assert rc == 1 and "busy" in out
++    assert f"pid {proc.pid}" in out and "sess_holder01" in out and "t_holdercard01" in out
++
++
++def test_holder_info_is_recorded_while_held_and_cleared_on_release(home, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_holdercard02")
++    monkeypatch.setenv("HERMES_SESSION_ID", "sess_holder02")
++    path = home / "kanban.db"
++    path.write_bytes(b"")
++    with rec.recovery_lock(path) as held:
++        assert held
++        info = rec.recovery_lock_holder_info(path)
++        assert info and info["pid"] == os.getpid()
++        assert info["task_id"] == "t_holdercard02" and info["session_id"] == "sess_holder02"
++    assert rec.recovery_lock_holder_info(path) is None, "a released lock leaves no holder behind"
++
++
++def test_holder_info_ignores_a_record_whose_process_is_gone(home):
++    path = home / "kanban.db"
++    path.with_name("kanban.db.recover.pid").write_text(json.dumps({"pid": 2 ** 22 + 12345, "task_id": "t_x"}))
++    assert rec.recovery_lock_holder_info(path) is None
++
++
++def test_spawned_recovery_records_the_callers_card_as_holder(home, monkeypatch):
++    """spawn_recovery strips HERMES_KANBAN_TASK from the child's env; the holder card still reaches it."""
++    import subprocess
++    seen = {}
++
++    def fake_run(cmd, **kw):
++        seen["env"] = kw["env"]
++        return subprocess.CompletedProcess(cmd, 1, stdout=json.dumps({"status": "busy"}), stderr="")
++
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_holdercard03")
++    monkeypatch.setattr(rec.subprocess, "run", fake_run)
++    rec.spawn_recovery(home / "kanban.db", wait=True)
++    assert "HERMES_KANBAN_TASK" not in seen["env"]
++    assert seen["env"]["HERMES_RECOVERY_HOLDER_TASK"] == "t_holdercard03"
+-- 
+2.55.0
+

@@ -1,0 +1,110 @@
+From a595876fe8fddb7bdcde7472fe4666d2e4feecb0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:41:39 +0000
+Subject: [PATCH] fix(kanban): stranded_in_ready ages from the last wake/claim,
+ not the first promotion [daveey]
+
+A card cycling claim -> scheduled -> condition_met -> ready read as 'Ready for
+18.2h with no worker' (critical) from its 11:31 promotion although it had 14
+runs since, sending session-idle and a fix card after a non-existent outage.
+Claims, spawns, condition/continuation wakes and continue-to-ready checkpoints
+now floor the ready-since time.
+---
+ hermes_cli/kanban_diagnostics.py            | 24 +++++++++++++--
+ tests/hermes_cli/test_kanban_diagnostics.py | 34 +++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index a138c28280..77efbe3ebb 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -120,7 +120,7 @@ def _first_field(task, primary: str, legacy: str, default=None):
+     return v if v is not None else _task_field(task, legacy, default)
+ 
+ 
+-def _latest_event_ts(events: Iterable[Any], kinds: set[str]) -> int:
++def _latest_event_ts(events: Iterable[Any], kinds: set[str] | frozenset[str]) -> int:
+     """Max ``created_at`` over events whose kind is in ``kinds`` (0 if none)."""
+     return max([0, *(_event_ts(ev) for ev in events if _event_kind(ev) in kinds)])
+ 
+@@ -694,6 +694,22 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
+     )]
+ 
+ 
++# Events after which a now-ready, unclaimed task must have (re-)entered ready:
++# the classic ready transitions plus every claim/park/wake on the way back.
++_READY_WAIT_FLOOR_KINDS = frozenset({
++    "created", "promoted", "reclaimed", "unblocked",
++    "claimed", "spawned", "continuation_woken", "condition_met",
++})
++
++
++def _last_ready_entry_ts(events: Iterable[Any]) -> int:
++    """Latest ready-entry floor; a ``continued`` checkpoint counts only when it resumed straight to ready."""
++    events = list(events)
++    continued_ready = [_event_ts(ev) for ev in events
++                       if _event_kind(ev) == "continued" and _parse_payload(ev).get("status") == "ready"]
++    return max([_latest_event_ts(events, _READY_WAIT_FLOOR_KINDS), *continued_ready])
++
++
+ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
+     (default 30 min). Deliberately age-based and identity-agnostic so it
+@@ -713,7 +729,11 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     # Most recent event that put the task into ready; with none (old task /
+     # truncated events) fall back to created_at — over-flagging an ancient
+     # task beats missing a stranded one.
+-    last_ready_ts = _latest_event_ts(events, {"created", "promoted", "reclaimed", "unblocked"})
++    # A task that is ready and unclaimed NOW re-entered ready after its last
++    # claim/park, so those events bound the wait from below too. Without them a
++    # card cycling claim -> scheduled -> condition_met -> ready all day read as
++    # "ready 18h with no worker" from its first promotion. [daveey]
++    last_ready_ts = _last_ready_entry_ts(events)
+     if last_ready_ts == 0:
+         last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+     if last_ready_ts == 0:
+diff --git a/tests/hermes_cli/test_kanban_diagnostics.py b/tests/hermes_cli/test_kanban_diagnostics.py
+index 65958203b0..2c6dacfa85 100644
+--- a/tests/hermes_cli/test_kanban_diagnostics.py
++++ b/tests/hermes_cli/test_kanban_diagnostics.py
+@@ -249,3 +249,37 @@ def test_overdue_wake_ignores_kanban_schedule_parks():
+     assert "overdue_wake" not in kinds
+     # A park with no wake is its own signal now (the dispatcher wakes it at the implied time). [daveey]
+     assert kinds == ["scheduled_without_wake"]
++
++
++def test_stranded_in_ready_measures_from_last_wake_not_first_promotion():
++    """A card that cycled claim -> scheduled -> condition_met -> ready all day is
++    only stranded since its last wake, not since its first promotion (runners
++    t_8aa95edb read "ready 18.2h" while it had 14 runs in that window). [daveey]"""
++    now = 100_000
++    task = _task(status="ready", assignee="bb-tuner", claim_lock=None)
++    events = [
++        _event("promoted", ts=now - 18 * 3600),
++        _event("claimed", ts=now - 3 * 3600),
++        _event("spawned", ts=now - 3 * 3600),
++        _event("scheduled", ts=now - 3 * 3600 + 60),
++        _event("condition_met", ts=now - 10 * 60),
++    ]
++    assert [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
++            if d.kind == "stranded_in_ready"] == []
++    # Still flagged once the post-wake wait itself passes the threshold, aged from the wake.
++    stranded = [d for d in kd.compute_task_diagnostics(task, events, [], now=now + 50 * 60)
++                if d.kind == "stranded_in_ready"]
++    assert len(stranded) == 1 and stranded[0].data["age_seconds"] == 60 * 60
++    # A continuation wake counts the same way.
++    woken = events[:4] + [_event("continuation_woken", ts=now - 5 * 60)]
++    assert [d for d in kd.compute_task_diagnostics(task, woken, [], now=now)
++            if d.kind == "stranded_in_ready"] == []
++
++
++def test_stranded_in_ready_counts_a_continue_that_resumed_straight_to_ready():
++    now = 100_000
++    task = _task(status="ready", assignee="bb-tuner", claim_lock=None)
++    events = [_event("promoted", ts=now - 18 * 3600), _event("claimed", ts=now - 3 * 3600),
++              _event("continued", ts=now - 5 * 60, status="ready", resume_status="ready")]
++    assert [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
++            if d.kind == "stranded_in_ready"] == []
+-- 
+2.55.0
+

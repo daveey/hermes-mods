@@ -1,0 +1,198 @@
+From 371e91ded46db9eb54de6253460602163d6967c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:09:15 -0700
+Subject: [PATCH] fix(desktop): backend last_active decides the quiet (red)
+ hint on a running turn, not this window's event silence [daveey]
+
+A turn no pane streams (resumed by the backend after a restart, or started by a
+background-process notice) sends this window no events, so the 5-min renderer
+watchdog painted it 'stalled' -> sidebar stripe 'stuck' (red) while the backend
+showed activity seconds ago. The 45 s silence check already asks session.active_list;
+it now reads the runtime's last_active: fresh clears the hint and restarts the
+watchdog, quiet past the window sets it (same rule as rehydrateLiveSessionStatuses),
+absent leaves the renderer watchdog in charge (older backends).
+
+Found by the session status auditor (false_red, session 20261023_204423_b85a94).
+---
+ apps/desktop/src/store/session-states.ts      | 61 +++++++++++++++++--
+ .../src/store/session-watchdog.test.ts        | 60 ++++++++++++++++++
+ 2 files changed, 115 insertions(+), 6 deletions(-)
+
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index 9f231934fe..2e971419ac 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -395,7 +395,7 @@ export function isLiveTurnAwaitingEvents(state: ClientSessionState | undefined):
+ export type LiveTurnVerdict = 'ended' | 'running' | 'unknown'
+ 
+ interface LiveTurnStatusResponse {
+-  sessions?: { id?: string; status?: string }[]
++  sessions?: { id?: string; last_active?: number | null; status?: string }[]
+ }
+ 
+ /** What one `session.active_list` snapshot says about `runtimeId`'s turn. A
+@@ -418,11 +418,56 @@ export function liveTurnVerdict(
+   return status === 'starting' || status === 'waiting' || status === 'working' ? 'running' : 'unknown'
+ }
+ 
+-async function checkLiveTurn(runtimeId: string): Promise<LiveTurnVerdict> {
++/** [daveey] When `runtimeId`'s turn last did anything, per the backend (ms), or
++ *  null when the snapshot doesn't say (older backend, runtime absent). */
++export function liveTurnLastActiveMs(
++  response: LiveTurnStatusResponse | null | undefined,
++  runtimeId: string
++): null | number {
++  const lastActive = response?.sessions?.find(session => session.id?.trim() === runtimeId)?.last_active
++  const ms = Number(lastActive) * 1000
++
++  return lastActive != null && Number.isFinite(ms) && ms > 0 ? ms : null
++}
++
++/** [daveey] The backend's activity decides the quiet hint for a running turn.
++ *  The renderer watchdog only measures events reaching THIS window, and a turn
++ *  no pane streams (resumed by the backend after a restart, a background chat)
++ *  sends none: it painted red `stuck` on turns active seconds ago. Fresh →
++ *  clear the hint and restart the watchdog; quiet past the window → stalled,
++ *  the same rule `rehydrateLiveSessionStatuses` applies. No timestamp leaves
++ *  the renderer watchdog in charge. */
++function applyBackendActivity(runtimeId: string, lastActiveMs: null | number) {
++  if (lastActiveMs === null) {
++    return
++  }
++
++  const current = $sessionStates.get()[runtimeId]
++
++  if (!current?.busy) {
++    return
++  }
++
++  if (Date.now() - lastActiveMs >= SESSION_WATCHDOG_TIMEOUT_MS) {
++    setSessionStalled(current.storedSessionId, true)
++
++    return
++  }
++
++  setSessionStalled(current.storedSessionId, false)
++  armWatchdog(runtimeId)
++}
++
++interface LiveTurnCheck {
++  lastActiveMs: null | number
++  verdict: LiveTurnVerdict
++}
++
++async function checkLiveTurn(runtimeId: string): Promise<LiveTurnCheck> {
+   const backend = liveTurnBackend
+ 
+   if (!backend) {
+-    return 'unknown'
++    return { lastActiveMs: null, verdict: 'unknown' }
+   }
+ 
+   try {
+@@ -437,9 +482,9 @@ async function checkLiveTurn(runtimeId: string): Promise<LiveTurnVerdict> {
+       LIVE_TURN_PROBE_TIMEOUT_MS
+     )
+ 
+-    return liveTurnVerdict(response, runtimeId)
++    return { lastActiveMs: liveTurnLastActiveMs(response, runtimeId), verdict: liveTurnVerdict(response, runtimeId) }
+   } catch {
+-    return 'unknown'
++    return { lastActiveMs: null, verdict: 'unknown' }
+   }
+ }
+ 
+@@ -577,7 +622,7 @@ async function onEventSilence(runtimeId: string) {
+ 
+   const check = {}
+   silentTurnChecks.set(runtimeId, check)
+-  const verdict = await checkLiveTurn(runtimeId)
++  const { lastActiveMs, verdict } = await checkLiveTurn(runtimeId)
+ 
+   if (silentTurnChecks.get(runtimeId) !== check) {
+     return
+@@ -586,6 +631,10 @@ async function onEventSilence(runtimeId: string) {
+   silentTurnChecks.delete(runtimeId)
+ 
+   if (verdict !== 'ended') {
++    if (verdict === 'running') {
++      applyBackendActivity(runtimeId, lastActiveMs)
++    }
++
+     noteSessionEvent(runtimeId)
+ 
+     return
+diff --git a/apps/desktop/src/store/session-watchdog.test.ts b/apps/desktop/src/store/session-watchdog.test.ts
+index 4124ad91ab..e12fc7aaad 100644
+--- a/apps/desktop/src/store/session-watchdog.test.ts
++++ b/apps/desktop/src/store/session-watchdog.test.ts
+@@ -226,6 +226,66 @@ describe('live turn event silence', () => {
+     expect(card('rt-quiet')).toBeUndefined()
+   })
+ 
++  // [daveey] A turn this window gets no events for (resumed by the backend after a restart, or run in a
++  // chat no pane streams) is silent HERE while the backend shows it busy. The silence check already asks the
++  // backend every window; its `last_active` decides the quiet hint, not the renderer's own silence. Red
++  // `stuck` on a turn that was active seconds ago was the sidebar auditor's false_red.
++  it('keeps a turn the backend reports recently active out of the quiet hint', async () => {
++    publishSessionState('rt-bgturn', partial('resumed turn', { storedSessionId: 's-bgturn' }))
++    backend(async () => ({
++      sessions: [{ id: 'rt-bgturn', last_active: Date.now() / 1000, session_key: 's-bgturn', status: 'working' }]
++    }))
++    noteSessionEvent('rt-bgturn')
++
++    await vi.advanceTimersByTimeAsync(WATCHDOG_MS * 3)
++
++    expect($workingSessionIds.get()).toContain('s-bgturn')
++    expect($stalledSessionIds.get()).not.toContain('s-bgturn')
++  })
++
++  it('clears a quiet hint the moment the backend reports fresh activity', async () => {
++    let lastActive = Date.now() / 1000
++    publishSessionState('rt-revive', partial('quiet tool call', { storedSessionId: 's-revive' }))
++    backend(async () => ({
++      sessions: [{ id: 'rt-revive', last_active: lastActive, session_key: 's-revive', status: 'working' }]
++    }))
++    noteSessionEvent('rt-revive')
++
++    // Backend quiet too: the hint is right.
++    await vi.advanceTimersByTimeAsync(WATCHDOG_MS + SILENCE_MS)
++    expect($stalledSessionIds.get()).toContain('s-revive')
++
++    // The backend's turn moves again; the next check clears the hint.
++    lastActive = Date.now() / 1000
++    await vi.advanceTimersByTimeAsync(SILENCE_MS)
++    expect($stalledSessionIds.get()).not.toContain('s-revive')
++    expect($workingSessionIds.get()).toContain('s-revive')
++  })
++
++  it('still paints a turn quiet on the backend as stalled', async () => {
++    const startedAt = Date.now() / 1000
++    publishSessionState('rt-hung', partial('hung tool call', { storedSessionId: 's-hung' }))
++    backend(async () => ({
++      sessions: [{ id: 'rt-hung', last_active: startedAt, session_key: 's-hung', status: 'working' }]
++    }))
++    noteSessionEvent('rt-hung')
++
++    await vi.advanceTimersByTimeAsync(WATCHDOG_MS + SILENCE_MS)
++
++    expect($workingSessionIds.get()).toContain('s-hung')
++    expect($stalledSessionIds.get()).toContain('s-hung')
++  })
++
++  it('keeps the renderer watchdog when the backend reports no last_active', async () => {
++    publishSessionState('rt-old', partial('older backend', { storedSessionId: 's-old' }))
++    backend(async () => listing('rt-old', 'working'))
++    noteSessionEvent('rt-old')
++
++    await vi.advanceTimersByTimeAsync(WATCHDOG_MS)
++
++    expect($stalledSessionIds.get()).toContain('s-old')
++  })
++
+   it('keeps the turn when the check fails, and asks again next window', async () => {
+     publishSessionState('rt-down', partial('partial', { storedSessionId: 's-down' }))
+ 
+-- 
+2.55.0
+

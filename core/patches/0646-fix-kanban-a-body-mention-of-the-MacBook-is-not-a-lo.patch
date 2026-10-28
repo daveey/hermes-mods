@@ -1,0 +1,557 @@
+From 4f6e223fe846a02f63c90eeb01b35af4690ac73f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:14:48 +0000
+Subject: [PATCH] fix(kanban): a body mention of the MacBook is not a
+ local-only need [daveey]
+
+A core-code card that only names the MacBook as a verification step was
+pinned to this machine, and the creator could not see why or archive the
+copy. Host-name markers now scan the title only. A marker-local create
+result includes placement and the remedy. A worker may archive an
+unclaimed card its own task created.
+---
+ agent/prompt_builder.py                       |  5 +-
+ hermes_cli/kanban.py                          | 46 ++++++++++
+ hermes_cli/kanban_placement.py                | 28 ++++--
+ .../fixtures/t_01a180aae388e142_body.txt      | 25 ++++++
+ tests/hermes_cli/test_kanban_placement.py     | 52 +++++++++++
+ tests/tools/test_kanban_creator_archive.py    | 88 +++++++++++++++++++
+ tools/kanban_tools.py                         | 63 +++++++++----
+ tools/kanban_tools_schemas.py                 | 18 ++++
+ toolsets.py                                   |  2 +-
+ website/docs/user-guide/configuration.md      |  2 +-
+ 10 files changed, 303 insertions(+), 26 deletions(-)
+ create mode 100644 tests/hermes_cli/fixtures/t_01a180aae388e142_body.txt
+ create mode 100644 tests/tools/test_kanban_creator_archive.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index e16f54274a..df2f318b74 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -346,7 +346,10 @@ KANBAN_GUIDANCE = (
+     "(base64) or `kanban_attach_url` (server-side public http(s) fetch); 25 MB cap, `kanban_attachments` lists them. "
+     "Workers may only attach to their own task.\n"
+     "- **Created cards.** List ids in `kanban_complete(created_cards=[...])` ONLY when captured from a successful "
+-    "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id.\n"
++    "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id. "
++    "If that result has `placement.where` `local` because of a text marker and the work does not need this "
++    "machine, `kanban_archive` the unclaimed card (only one your task created) and re-create it with "
++    "`placement='hub'`.\n"
+     "- **Orchestrating: discover profiles first.** The dispatcher SILENTLY drops a card with an unknown assignee (it "
+     "sits in `ready` forever). Ground every assignee in a real profile (`hermes profile list`, or ask the user), and "
+     "express dependencies via `parents=[...]` on `kanban_create`, not prose.\n"
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 2aab2c8c2f..e34ae9734b 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -993,6 +993,48 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
+         return None
+ 
+ 
++def _creator_task_id(conn, task_id: str) -> Optional[str]:
++    """The task that created ``task_id``, from the created-event payload (not a column)."""
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
++        "ORDER BY id ASC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if not row or not row[0]:
++        return None
++    try:
++        return json.loads(row[0]).get("creator_task_id")
++    except (TypeError, ValueError):
++        return None
++
++
++def worker_may_archive(conn, task_id: str) -> Optional[str]:
++    """None if this process may archive ``task_id``, else the refusal.
++
++    A dispatcher worker may archive an unclaimed card its own task created
++    (``creator_task_id`` is ``HERMES_KANBAN_TASK``). Every other foreign card is
++    refused — that is the "scoped worker can't archive it" wall. No env task
++    (a human or an orchestrator) may archive any card, as before.
++    """
++    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    if not env_tid:
++        return None
++    if env_tid == task_id:
++        return ("refusing to archive the assigned task; finish it with kanban_complete")
++    task = kb.get_task(conn, task_id)
++    if task is None:
++        return f"no such task: {task_id}"
++    if _creator_task_id(conn, task_id) != env_tid:
++        return (f"worker is scoped to task {env_tid}; refusing to archive {task_id}. "
++                "A worker may archive only an unclaimed card its own task created.")
++    if task.status == "running" or task.claim_lock or task.worker_pid:
++        return (f"cannot archive {task_id}: it is claimed (status={task.status}). "
++                "A worker may archive only an unclaimed card its own task created.")
++    if task.status in ("done", "archived"):
++        return f"cannot archive {task_id}: status={task.status}"
++    return None
++
++
+ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
+                                  handoff_tool: str = "kanban_complete", *, verified=None):
+     """Goal judge for every terminal worker handoff (including review).
+@@ -1409,6 +1451,10 @@ def _cmd_archive(args: argparse.Namespace) -> int:
+         if purge_ids:
+             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
+                                lambda tid: f"cannot delete {tid} (must already be archived)")
++        for tid in ids:
++            refusal = worker_may_archive(conn, tid)
++            if refusal:
++                return _err(refusal)
+         return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
+                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+ 
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index c534c3c026..8048976cc2 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -20,7 +20,9 @@ A card stays local when any of these holds:
+ * it declares a ``requires`` capability this gateway holds and the target does not;
+ * its title, body or skills match a local marker (``kanban.placement.local_markers`` replaces the
+   built-in list, ``extra_local_markers`` extends it): Chrome, Keychain, TCC, Apple apps, launchd,
+-  the Desktop app, this Mac, the mini, AWS SSO profiles...;
++  the Desktop app, a Desktop DOM/CDP readback, this Mac's Keychain... A bare host name (MacBook,
++  the mini) pins only when it is the subject of the title. A body mention — a repro, or "verify
++  live on the hub and the MacBook" — is not a local-only need;
+ * the target is not live: this gateway's hermes-hub sync has not succeeded recently, or the
+   target's capability record is stale.
+ 
+@@ -57,11 +59,20 @@ DEFAULT_LOCAL_MARKERS = (
+     r"\bphotos\.app\b", r"\bimessage\b", r"\bfind ?my\b", r"\bremindctl\b", r"\bshortcuts? app\b",
+     r"\blaunchd\b", r"\blaunchctl\b", r"launchagents", r"~/library/", r"\bhermes\.app\b",
+     r"\bhermes desktop\b", r"\bdesktop (app|backend|backends|renderer|window|chat|chats|sidebar|ui)\b",
++    r"\bdesktop\s+dom\b",
+     r"\bmacbook\b", r"\bmac ?os\b", r"\bmac ?mini\b", r"\bthe mini\b", r"\bdavids-mac-mini\b",
+     r"\bbaby ?bear\b", r"\bxcode\b", r"\bsimulator\b", r"\bwhatsapp\b", r"\bscreen ?shot",
+     r"\bexample-org\b", r"\bexample-sso\b", r"--profile example",
+ )
+-# Skills whose presence alone pins a card to a Mac.
++# Host names that mean "the work is on that machine" only when they are the subject of the
++# title. A body mention is a repro or a verification step ("verify live on the hub and the
++# MacBook"), which is not a reason to keep a core-code card on the laptop. A caller who replaces
++# ``local_markers`` owns the list and every pattern scans the whole text.
++TITLE_ONLY_LOCAL_MARKERS = frozenset({
++    r"\bmacbook\b", r"\bmac ?mini\b", r"\bthe mini\b", r"\bdavids-mac-mini\b",
++})
++LOCAL_MARKER_REMEDY = (
++    "if the work doesn't need this machine, archive and re-create with placement='hub'")
+ DEFAULT_LOCAL_SKILL_MARKERS = (
+     r"^apple", r"^imessage$", r"^findmy$", r"^macos-", r"^mac-", r"^invisible-chrome-agent$",
+     r"^local-chrome-remote-debugging$", r"^computer-use$", r"^myapp", r"^bb-", r"^ios-",
+@@ -135,11 +146,16 @@ def config() -> dict:
+         return {}
+ 
+ 
+-def _local_marker(text: str, skills, cfg: _Cfg) -> Optional[str]:
++def _local_marker(title: str, body: str, skills, cfg: _Cfg) -> Optional[str]:
++    """The first local-only hit, or None. Host-name markers (see
++    :data:`TITLE_ONLY_LOCAL_MARKERS`) scan the title only, unless the caller replaced the list."""
++    full = f"{title or ''}\n{body or ''}"
++    replaced = isinstance(cfg.raw.get("local_markers"), list)
+     for rx in cfg.markers():
+-        m = rx.search(text or "")
++        text = (title or "") if (not replaced and rx.pattern in TITLE_ONLY_LOCAL_MARKERS) else full
++        m = rx.search(text)
+         if m:
+-            return f"mentions {m.group(0)!r}"
++            return f"mentions {m.group(0).lower()!r}"
+     for s in skills or []:
+         for rx in cfg.skill_markers():
+             if rx.search(str(s)):
+@@ -357,7 +373,7 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+             if not on_target:
+                 return {"where": "local", "why": f"needs {need}, which {target} does not hold"}
+         if not explicit:
+-            hit = _local_marker(f"{args.get('title') or ''}\n{args.get('body') or ''}",
++            hit = _local_marker(args.get("title") or "", args.get("body") or "",
+                                 args.get("skills"), c)
+             if hit:
+                 return {"where": "local", "why": f"local marker: {hit}"}
+diff --git a/tests/hermes_cli/fixtures/t_01a180aae388e142_body.txt b/tests/hermes_cli/fixtures/t_01a180aae388e142_body.txt
+new file mode 100644
+index 0000000000..bf852593c8
+--- /dev/null
++++ b/tests/hermes_cli/fixtures/t_01a180aae388e142_body.txt
+@@ -0,0 +1,25 @@
++Found by the MacBook acceptance run for hub t_b11f0591 (card t_159f0063, run 5380, 2026-10-27 ~21:00 PDT). The evidence is on the hub at /home/ubuntu/.hermes/kanban/evidence/upkeep-system-20261022/t159f0063-run5380/ (READBACK.md first, neutral-review.log has the independent Opus confirmation).
++
++## Repro (live, MacBook, build 23b3a53bf3, which contains 236b07480e)
++- MacBook ~/.hermes/config.yaml has kanban.sync.links_reader: replica (RFC phase 5, core da1a3a8443).
++- Origin chat 20261022_204322_4d8ce1 (Upkeep): the sidebar row says kanban_active 14, "Waiting on 14 cards". GET /api/session-kanban-tasks returns 9 rows, and the session-tasks plugin's sessionTaskChips() turns those into 9 chips.
++- The 5 counted but unlisted cards are origin-ledger rows (via=origin, status unknown, reported_status done, unfinished=True, no verified release): hub t_ea3ff077, t_dcd9d210, t_23947fd6, t_1d83c05d, t_37fb8c09. All 5 are done on hub.
++- Read-only repro command on the MacBook: `cd ~/.hermes/hermes-agent && venv/bin/python -c "from hermes_cli import kanban_session_activity as k; s='20261022_204322_4d8ce1'; print(k._all_counts()[0].get(s), len(k.session_tasks([s])))"` prints `14 9`.
++- Fabric 20261023_231233_1ccf1c agrees (count 1+1 blocked, 2 rows). It has no done-unverified rows.
++- The neutral review counted 20 unknown+unfinished ledger rows across all chats. Each one is counted but never listed.
++
++## Root mechanism (file:line in core hermes_cli)
++1. kanban_session_activity._recompute_all_counts counts _remote_links(), the origin-ledger projection (~L1063). _replica_bucket counts unknown+unfinished as active (L466-467).
++2. session_tasks() reads _remote_cards() (L1347-1360). Under links_reader=replica, _remote_cards returns kanban_chat_links.replica_cards(), which filters `t.status IN (statuses)` (kanban_chat_links.py:135). A done-unverified card therefore never gets the `unknown` status that would keep it listed. The comment at L474-476 says both readers come from _remote_links and "can never disagree"; since da1a3a8443 that is false.
++3. Why it wasn't caught: links_diff (kanban_chat_links.py:167), the gate for switching the reader, skips ledger rows whose status is not open. It drops unknown+unfinished rows and reported clean (771/771). No test compares counts with the list in replica mode.
++4. Related replica-mode gaps, found by reading the source: replica_cards hard-codes stale=False and synced_at=now (L153), so an offline or old replica shows as fresh. It silently skips an unreadable replica (L136-138), so rows vanish instead of going stale. It hard-codes profile "default" in the key (L142), so the same id on two profiles of one gateway would collide.
++
++## Required fix (decided; do not re-litigate)
++- Counts and list must come from ONE projection for each links_reader mode. Either route the counts through the same reader, or keep the ledger's unknown+unfinished obligations in the replica path. The non-negotiable invariant: a done-without-verified-release card stays an `unknown` chip AND counts in both places, or (after verified release) disappears from both.
++- links_diff must compare unknown+unfinished rows, so it can't report clean while counts and list disagree.
++- replica_cards must mark rows stale from the replica's real sync age, mark an unreadable replica stale/unknown instead of dropping its rows, and carry the owner profile in the key.
++- Tests (RED first): counts vs session_tasks parity under links_reader=replica for every case: 1 active + 12 todo; blocked for review; done-unverified; offline/old replica; unreadable replica; same task id on two gateways and on two profiles; compression lineage; verified release; another chat still turns done.
++- Ship through the normal core patch-mirror/CI route and get the exact-head CI green. After it is installed on the MacBook, the readback must show the Upkeep count equal to the API row count.
++
++## After shipping
++Comment on t_159f0063 on the MacBook (cross_task) with the merged head, so the MacBook acceptance can rerun the live readback, the rendered-strip check and the final send. Do not close t_b11f0591 or tracker t_0d7a7294.
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 80e921a1cf..b65f339eff 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -661,3 +661,55 @@ def test_identity_lookup_failure_without_a_pin_still_creates_locally(mac, monkey
+     out = json.loads(kt._handle_create({"title": "unpinned card"}))
+     assert out["ok"] and out["task_id"] and "placed" not in out, out
+     assert _local_count() == 1
++
++
++# --- marker tuning: a passing MacBook mention is not a local-only need [daveey] ---
++
++_SIDEBAR_TITLE = (
++    "Fix sidebar count vs task strip split under kanban.sync.links_reader=replica (Upkeep 14 vs 9)")
++_SIDEBAR_BODY = (Path(__file__).parent / "fixtures" / "t_01a180aae388e142_body.txt").read_text()
++_MARKER_REMEDY = "if the work doesn't need this machine, archive and re-create with placement='hub'"
++
++
++def test_marker_cases_a_through_e():
++    """The five cases the marker tune is pinned to, verbatim."""
++    # (a) the work itself is a live verify on the MacBook.
++    a = decide({"title": "Verify 57094b7a60 live on the MacBook"})
++    assert a["where"] == "local" and a["why"].startswith("local marker"), a
++    assert "macbook" in a["why"].lower()
++    # (b) a hermes_cli fix that only names the MacBook as a verification step.
++    b = decide({"title": "Fix the hermes_cli session-activity projection",
++                "body": "Ship the hermes_cli fix, then verify live on the hub and the MacBook."})
++    assert b["where"] == "hub", b
++    # (c) Desktop DOM, CDP readback, or Chrome still needs this machine.
++    for text in ("Needs a Desktop DOM readback of the composer",
++                 "Needs a CDP readback of the sidebar",
++                 "Sign in with Chrome and read the cookie"):
++        c = decide({"title": "Read the live UI", "body": text})
++        assert c["where"] == "local" and c["why"].startswith("local marker"), (text, c)
++    # (d) t_01a180aae388e142 title and body, verbatim.
++    d = decide({"title": _SIDEBAR_TITLE, "body": _SIDEBAR_BODY})
++    assert d["where"] == "hub", d
++    # (e) a local-only skill still pins, even with no marker in the text.
++    e = decide({"title": "Weekly digest", "skills": ["apple-notes"]})
++    assert e["where"] == "local" and "skill apple-notes" in e["why"], e
++
++
++def test_local_marker_decision_is_in_the_create_result(mac):
++    """Auto-placement that stays local because of a text marker says so, with the remedy."""
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({
++        "title": "Verify 57094b7a60 live on the MacBook",
++        "body": "Read the live sidebar on this machine.",
++    }))
++    assert out["ok"] and out.get("task_id") and _local_count() == 1, out
++    assert out["placement"] == {
++        "where": "local",
++        "why": "local marker: mentions 'macbook'",
++    }, out
++    assert out["remedy"] == _MARKER_REMEDY
++    # A card that goes to the hub, and one kept local for a structural reason, do not get that note.
++    hub = json.loads(kt._handle_create({"title": "Fix the flaky lint", "body": "Push it."}))
++    assert hub.get("placed", {}).get("gateway") == "hub" and "placement" not in hub, hub
++    structural = json.loads(kt._handle_create({"title": "Keep this one here", "goal_mode": True}))
++    assert structural["ok"] and "placed" not in structural and "placement" not in structural, structural
+diff --git a/tests/tools/test_kanban_creator_archive.py b/tests/tools/test_kanban_creator_archive.py
+new file mode 100644
+index 0000000000..ad67bf30ff
+--- /dev/null
++++ b/tests/tools/test_kanban_creator_archive.py
+@@ -0,0 +1,88 @@
++"""A worker may archive an unclaimed card its own task created. [daveey]
++
++The scoped-worker mutation gate refuses every other task. That left a creator
++unable to delete a card kanban_create had just pinned local by mistake
++("the scoped worker can't archive it"). Archive is the exception: creator_task_id
++is the caller's task, and the card has not been claimed.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++
++
++def _board(tmp_path, monkeypatch):
++    db = tmp_path / "board.db"
++    conn = connect(db)
++    owner = kb.create_task(conn, title="owner")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    monkeypatch.setenv("HOME", str(tmp_path))
++    return conn, owner
++
++
++def _created(conn, owner, title="misplaced"):
++    return kb.create_task(conn, title=title, creator_task_id=owner)
++
++
++def test_worker_tool_archives_an_unclaimed_card_it_created(tmp_path, monkeypatch):
++    from tools import kanban_tools as kt
++
++    conn, owner = _board(tmp_path, monkeypatch)
++    child = _created(conn, owner)
++    assert kb.get_task(conn, child).claim_lock is None
++    out = json.loads(kt._handle_archive({"task_id": child}))
++    assert out["ok"] and out["task_id"] == child, out
++    assert kb.get_task(conn, child).status == "archived"
++    conn.close()
++
++
++def test_worker_tool_refuses_a_claimed_card_and_someone_elses(tmp_path, monkeypatch):
++    from tools import kanban_tools as kt
++
++    conn, owner = _board(tmp_path, monkeypatch)
++    claimed = _created(conn, owner, "claimed")
++    kb.claim_task(conn, claimed)
++    foreign = kb.create_task(conn, title="foreign")
++    claimed_out = json.loads(kt._handle_archive({"task_id": claimed}))
++    foreign_out = json.loads(kt._handle_archive({"task_id": foreign}))
++    assert claimed_out.get("ok") is not True and "claim" in claimed_out["error"].lower(), claimed_out
++    assert foreign_out.get("ok") is not True and owner in foreign_out["error"], foreign_out
++    assert kb.get_task(conn, claimed).status == "running"
++    assert kb.get_task(conn, foreign).status == "ready"
++    conn.close()
++
++
++def test_worker_cli_archives_only_an_unclaimed_card_it_created(tmp_path, monkeypatch, capsys):
++    from hermes_cli.kanban import _cmd_archive
++
++    conn, owner = _board(tmp_path, monkeypatch)
++    child = _created(conn, owner)
++    foreign = kb.create_task(conn, title="foreign")
++    assert _cmd_archive(SimpleNamespace(task_ids=[child], purge_ids=[])) == 0
++    assert kb.get_task(conn, child).status == "archived"
++    capsys.readouterr()
++    assert _cmd_archive(SimpleNamespace(task_ids=[foreign], purge_ids=[])) != 0
++    err = capsys.readouterr().err
++    assert owner in err and "archive" in err.lower()
++    assert kb.get_task(conn, foreign).status == "ready"
++    conn.close()
++
++
++def test_orchestrator_cli_can_still_archive_any_card(tmp_path, monkeypatch):
++    from hermes_cli.kanban import _cmd_archive
++
++    conn, _owner = _board(tmp_path, monkeypatch)
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    foreign = kb.create_task(conn, title="foreign")
++    assert _cmd_archive(SimpleNamespace(task_ids=[foreign], purge_ids=[])) == 0
++    assert kb.get_task(conn, foreign).status == "archived"
++    conn.close()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8c01c445d9..f90dcb7df4 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -24,7 +24,7 @@ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+     KANBAN_COMPLETE_SCHEMA, KANBAN_CONTINUE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+     KANBAN_LIST_SCHEMA, KANBAN_ORIGIN_ADOPT_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+-    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
++    KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_ARCHIVE_SCHEMA)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -1425,11 +1425,14 @@ def _placement_refused(pin: str, why: str) -> str:
+         code="placement_unavailable", placement=pin, created=False)
+ 
+ 
+-def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id) -> Optional[str]:
++def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id
++                  ) -> tuple[Optional[str], Optional[dict]]:
+     """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
+ 
+-    Returns the tool result when the card was queued there, None to create it locally (no route,
+-    a local-only need, the target not live, or hermes-hub refused). Never raises.
++    Returns ``(tool_result, None)`` when the card was queued there or the pin was refused,
++    ``(None, None)`` to create it locally for any other reason, or ``(None, placement)`` when a
++    text marker kept it here. ``placement`` is ``{where, why, remedy}`` so the create result can
++    say so. Never raises.
+     """
+     try:
+         from hermes_cli import kanban_placement as kp
+@@ -1441,11 +1444,15 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         decision = kp.decide(view)
+         target = decision["where"]
+         if target == "refuse":
+-            return _placement_refused(decision["pin"], decision.get("why", ""))
++            return _placement_refused(decision["pin"], decision.get("why", "")), None
+         if target == "local":
+-            if decision.get("why", "").startswith(("local marker", "placement pinned", "needs ")):
+-                logger.debug("kanban placement: local (%s)", decision["why"])
+-            return None
++            why = decision.get("why") or ""
++            if why.startswith("local marker"):
++                logger.info("kanban placement: local (%s)", why)
++                return None, {"where": "local", "why": why, "remedy": kp.LOCAL_MARKER_REMEDY}
++            if why.startswith(("placement pinned", "needs ")):
++                logger.debug("kanban placement: local (%s)", why)
++            return None, None
+         self_gw = reg.self_gateway() or "local"
+         cfg = kp.config()
+         placed = kp.create_remote(view, target=target, origin_session=session_id,
+@@ -1455,8 +1462,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             logger.warning("kanban placement: %s refused the card (%s)",
+                            target, placed.get("error"))
+             if kp.explicit_foreign_pin(view, reg.self_gateway()):
+-                return _placement_refused(target, f"{target} refused the card: {placed.get('error')}")
+-            return None
++                return _placement_refused(target, f"{target} refused the card: {placed.get('error')}"), None
++            return None, None
+         rid = placed["request_id"]
+         # A chat model reads task_id null as "not created" and calls kanban_create again, which made a
+         # duplicate card (10-27 drill). Fetch the target's answer for a bounded wait so the id comes
+@@ -1472,14 +1479,14 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             note = (f"{retry}Created on {target} as {tid}, not here: {decision['why']} (kanban.placement). It runs "
+                     f"there{shows}. Read it with cross_task @task:default@{target}/{tid} or "
+                     f"`hermes-hub tasks --gw {target}`.")
+-            return _ok(task_id=tid, status=remote_status or "created", **fields, note=note)
++            return _ok(task_id=tid, status=remote_status or "created", **fields, note=note), None
+         note = (f"{retry}The card IS created: it is queued on {target} as request {rid} and {target} makes the "
+                 f"card from it (it runs there, not here: {decision['why']}). Do NOT call kanban_create again "
+                 "for this card: an identical call returns this same request, and any changed call creates a "
+                 f"second, duplicate card. Its task id appears once {target} applies the request "
+                 + ("(this chat's tasks, " if session_id else "(")
+                 + "`hermes-hub requests`).")
+-        return _ok(task_id=None, status="queued", **fields, note=note)
++        return _ok(task_id=None, status="queued", **fields, note=note), None
+     except Exception as exc:
+         logger.warning("kanban placement failed", exc_info=True)
+         try:
+@@ -1490,8 +1497,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             pin = str(args.get("placement") or "").strip().lower()
+             pin = "" if pin in ("", "auto", "local", "here") else pin
+         if pin:
+-            return _placement_refused(pin, f"placement failed: {exc}")
+-        return None
++            return _placement_refused(pin, f"placement failed: {exc}"), None
++        return None, None
+ 
+ 
+ @_kanban_handler("kanban_create")
+@@ -1564,10 +1571,12 @@ def _handle_create(args: dict, **kw) -> str:
+         if project_id is None and workspace_kind is None and workspace_path is None:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
++        marker_placement = None
+         if origin_intent is None and origin is None:
+             # Default placement: no local-only need -> the card runs on the routed gateway. [daveey]
+-            remote = _place_remote(args, assignee=str(assignee), skills=skills, parents=parents,
+-                                   project_id=project_id, session_id=session_id)
++            remote, marker_placement = _place_remote(
++                args, assignee=str(assignee), skills=skills, parents=parents,
++                project_id=project_id, session_id=session_id)
+             if remote is not None:
+                 return remote
+         elif origin_intent is None and args.get("placement"):
+@@ -1617,6 +1626,9 @@ def _handle_create(args: dict, **kw) -> str:
+             }}
+         if origin is not None:
+             extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
++        if marker_placement:
++            extra["placement"] = {"where": marker_placement["where"], "why": marker_placement["why"]}
++            extra["remedy"] = marker_placement["remedy"]
+         if origin_intent is None and args.get("requires"):
+             # Placement preflight: declared gateway needs this gateway lacks are owned first. [daveey]
+             from hermes_cli.kanban_capability_routing import preflight
+@@ -1771,6 +1783,22 @@ def _handle_unblock(args: dict, **kw) -> str:
+                    **({"subscribed": True} if subscribed else {}))
+ 
+ 
++@_kanban_handler("kanban_archive")
++def _handle_archive(args: dict, **kw) -> str:
++    """Archive an unclaimed card this worker's task created, or any card for an orchestrator."""
++    _reject_delegated_child_mutation("kanban_archive")
++    tid = args.get("task_id")
++    _check(tid, "task_id is required")
++    tid = str(tid)
++    with _board(args.get("board")) as (kb, conn):
++        from hermes_cli.kanban import worker_may_archive
++        refusal = worker_may_archive(conn, tid)
++        if refusal:
++            raise _Reject(refusal)
++        _check(kb.archive_task(conn, tid), f"cannot archive {tid}")
++        return _ok(task_id=tid, status="archived")
++
++
+ @_kanban_handler("kanban_link")
+ def _handle_link(args: dict, **kw) -> str:
+     """Add a parent→child dependency edge after the fact (cycles/self-links/running
+@@ -1834,7 +1862,8 @@ _TOOLS = (
+     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
+     ("kanban_origin_adopt", KANBAN_ORIGIN_ADOPT_SCHEMA, _handle_origin_adopt, "🔗"),
+     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
++    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
++    ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"))
+ 
+ for _name, _sch, _handler, _emoji in _TOOLS:
+     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 830ff50c73..6fb16179c6 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -785,3 +785,21 @@ KANBAN_LINK_SCHEMA = _schema(
+     },
+     ["parent_id", "child_id"],
+ )
++
++KANBAN_ARCHIVE_SCHEMA = _schema(
++    "kanban_archive",
++    (
++        "Archive a card. A dispatcher worker may archive an unclaimed card "
++        "its own task created (creator_task_id is the caller's task) — the "
++        "cleanup when kanban_create kept a card local because of a text "
++        "marker and the work does not need this machine. Re-create it with "
++        "placement='hub'. A claimed card, a card another task created, and "
++        "the worker's own assigned task are refused. With no "
++        "HERMES_KANBAN_TASK (an orchestrator or a human) any card may be "
++        "archived."
++    ),
++    {
++        "task_id": _prop("string", "Task id to archive. Required; does not default to the assigned task."),
++    },
++    ["task_id"],
++)
+diff --git a/toolsets.py b/toolsets.py
+index 7d457447ec..2d81be2354 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -31,7 +31,7 @@ _HERMES_CORE_TOOLS = [
+     "kanban_request_changes",
+     "kanban_heartbeat",
+     "kanban_comment", "kanban_create", "kanban_link",
+-    "kanban_unblock",
++    "kanban_unblock", "kanban_archive",
+     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+     "computer_use",
+     # Service-gated connector account status and authorization links.
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index f1d51ded80..7bf95573cf 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3142,4 +3142,4 @@ kanban:
+       macbook: hub   # cards created on gateway "macbook" run on gateway "hub"
+ ```
+ 
+-`kanban.placement` (default `{}`: every card is created locally) lets a gateway send cards that have no local-only need to another gateway. `kanban_create` creates such a card on the `route` target via `hermes-hub create-task` and binds it to the chat that asked for it. A card stays local when the caller passes `placement="local"`, when it uses options a remote create can't carry (parents, a project, a `dir`/`worktree` workspace, an initial status, a human request, a tenant; with a hermes-hub client older than 1.8.0, which lacks `create-task --option`, also a model pin, goal mode, triage or a non-local completion contract), when it needs a capability only this gateway holds, when its text matches a local marker (`local_markers` replaces the built-in list, `extra_local_markers` extends it), or when the target isn't live. Other keys: `creator_session`, `local_skill_markers`, `assignees`, `hub_live_seconds`, `wait_seconds`, `hub_cli`.
++`kanban.placement` (default `{}`: every card is created locally) lets a gateway send cards that have no local-only need to another gateway. `kanban_create` creates such a card on the `route` target via `hermes-hub create-task` and binds it to the chat that asked for it. A card stays local when the caller passes `placement="local"`, when it uses options a remote create can't carry (parents, a project, a `dir`/`worktree` workspace, an initial status, a human request, a tenant; with a hermes-hub client older than 1.8.0, which lacks `create-task --option`, also a model pin, goal mode, triage or a non-local completion contract), when it needs a capability only this gateway holds, when its text matches a local marker (`local_markers` replaces the built-in list, `extra_local_markers` extends it; a bare MacBook or mini mention pins only from the title, not from a body verification step), or when the target isn't live. A text-marker local decision is reported on the `kanban_create` result as `placement` plus a one-line remedy. Other keys: `creator_session`, `local_skill_markers`, `assignees`, `hub_live_seconds`, `wait_seconds`, `hub_cli`.
+-- 
+2.55.0
+

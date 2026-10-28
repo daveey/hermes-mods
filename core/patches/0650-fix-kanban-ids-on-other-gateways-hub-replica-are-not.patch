@@ -1,0 +1,231 @@
+From 63ab7b706acc979bcfbdc4c273f0173a94694211 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:46:42 +0000
+Subject: [PATCH] fix(kanban): ids on other gateways (hub replica) are not
+ phantom refs in completion prose [daveey]
+
+---
+ hermes_cli/kanban_db.py                       |  20 +++-
+ hermes_cli/kanban_diagnostics.py              |  11 +-
+ hermes_cli/kanban_session_activity.py         |  30 +++++
+ tests/hermes_cli/test_kanban_false_signals.py | 105 ++++++++++++++++++
+ 4 files changed, 162 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_false_signals.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 1e9f13e389..2554368b18 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2567,10 +2567,26 @@ _TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+ 
+ 
+ def _scan_prose_for_phantom_ids(conn: sqlite3.Connection, text: str) -> list[str]:
+-    """``t_<hex>`` references in ``text`` that don't resolve to a task (deduped; advisory)."""
++    """``t_<hex>`` references in ``text`` that resolve neither to a local task nor to a card in the hermes-hub
++    replica of other gateways (deduped; advisory). An unreadable/stale replica leaves them unflagged."""
+     if not text:
+         return []
+-    return _missing_task_ids(conn, dict.fromkeys(_TASK_ID_PROSE_RE.findall(text)))
++    missing = _missing_task_ids(conn, dict.fromkeys(_TASK_ID_PROSE_RE.findall(text)))
++    return unresolved_after_replica(missing)
++
++
++def unresolved_after_replica(missing: list[str]) -> list[str]:
++    """``missing`` (not on the local board) minus ids the hub replica knows; [] when the replica cannot say."""
++    if not missing:
++        return []
++    try:
++        from hermes_cli.kanban_session_activity import replica_task_resolution
++        found, authoritative = replica_task_resolution(missing)
++    except Exception:  # health: allow BLE001 -- advisory scan; an unusable replica means "unknown", never a flag
++        return []
++    if not authoritative:
++        return []
++    return [p for p in missing if p not in found]
+ 
+ 
+ class HallucinatedCardsError(ValueError):
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 77efbe3ebb..127786b8cd 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -360,15 +360,22 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
+     hits = _active_hallucination_events(events, "suspected_hallucinated_references")
+     if not hits:
+         return []
++    # Re-resolve at read time: ids that were unknown when the summary landed may be real cards on another
++    # gateway (hub replica), so old false warnings clear. Unknown/stale replica = don't flag.
++    from hermes_cli.kanban_db import unresolved_after_replica
++    phantom = unresolved_after_replica(_unique_payload_ids(hits, "phantom_refs"))
++    if not phantom:
++        return []
+     return [Diagnostic(
+         kind="prose_phantom_refs", severity="warning",
+         title="Completion summary references unknown task ids",
+-        detail="The completion summary mentions task ids that don't resolve in this board's database. "
++        detail="The completion summary mentions task ids that don't resolve on this board or in the hub replica "
++               "of other gateways. "
+                "The completion itself succeeded, but downstream consumers parsing the summary may be "
+                "pointed at cards that never existed.",
+         actions=_generic_recovery_actions(task, running=_is_running(task)),
+         first_seen_at=_event_ts(hits[0]), last_seen_at=_event_ts(hits[-1]), count=len(hits),
+-        data={"phantom_refs": _unique_payload_ids(hits, "phantom_refs")},
++        data={"phantom_refs": phantom},
+     )]
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8092e9dcdf..b715a462e6 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -427,6 +427,36 @@ def _hub_db_path() -> Path | None:
+     return path if path.is_file() else None
+ 
+ 
++def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[set[str], bool]:
++    """Which ``t_<hex>`` ids exist as tasks in the hermes-hub replica of any gateway (same file ``_remote_links``
++    reads; replica keys are ``[profile/]board/<id>``, so qualified ``@task:p@gw/<id>`` refs resolve by id).
++
++    Returns ``(found, authoritative)``. ``authoritative`` is False when a replica exists but cannot answer
++    (unreadable, offline, or not synced within ``HUB_STALE_AFTER_S``): an id absent from it is then *unknown*,
++    not missing, and callers must not flag it. No replica at all (no hub installed) is authoritative: nothing
++    exists beyond the local board."""
++    path = _hub_db_path()
++    if path is None or not ids:
++        return set(), True
++    try:
++        conn = _open_ro(path)
++        try:
++            offline = _meta_float(conn, "offline_since")
++            synced = max(filter(None, (_meta_float(conn, "last_ok"), _meta_float(conn, "last_digest"))), default=None)
++            found = {
++                tid for tid in ids
++                if conn.execute("SELECT 1 FROM replica WHERE coll = 'tasks' AND substr(key, -?) = ? LIMIT 1",
++                                (len(tid) + 1, "/" + tid)).fetchone()
++            }
++        finally:
++            conn.close()
++    except sqlite3.Error:
++        return set(), False
++    now = time.time() if now is None else now
++    fresh = offline is None and synced is not None and now - synced <= HUB_STALE_AFTER_S
++    return found, fresh
++
++
+ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+     """Read-only open that survives a WAL db whose -wal/-shm were just removed (plain ``mode=ro`` then fails);
+     never creates the file."""
+diff --git a/tests/hermes_cli/test_kanban_false_signals.py b/tests/hermes_cli/test_kanban_false_signals.py
+new file mode 100644
+index 0000000000..45360a9244
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_false_signals.py
+@@ -0,0 +1,105 @@
++"""Kanban false signals: cross-gateway card ids are not "hallucinated"."""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_diagnostics as kd
++from tests.hermes_cli import kanban_sync_support as support
++
++REMOTE_ID = "t_5bc8e125aa"
++UNKNOWN_ID = "t_deadbeef00ff"
++
++
++def _make_hub_db(state_dir, *, fresh=True, offline=False):
++    state_dir.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(state_dir / "hub.db")
++    conn.execute("CREATE TABLE replica (coll TEXT, gw TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++    conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    conn.execute("INSERT INTO replica VALUES ('tasks', 'hub', 'default/default/' || ?, '{}', 0)", (REMOTE_ID,))
++    conn.execute("INSERT INTO meta VALUES ('gateway', 'macbook')")
++    conn.execute("INSERT INTO meta VALUES ('last_digest', ?)", (str(time.time() - (5 if fresh else 3600)),))
++    if offline:
++        conn.execute("INSERT INTO meta VALUES ('offline_since', ?)", (str(time.time()),))
++    conn.commit()
++    conn.close()
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hubstate"))
++    conn = kbc.connect(home / "kanban.db")
++    yield conn, tmp_path / "hubstate"
++    conn.close()
++
++
++def _complete_with_summary(conn, summary):
++    tid = kb.create_task(conn, title="tracker", assignee="worker")
++    kb.claim_task(conn, tid)
++    kb.complete_task(conn, tid, summary=summary)
++    return tid
++
++
++def _phantom_events(conn, tid):
++    return [r for r in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = "
++                                    "'suspected_hallucinated_references'", (tid,))]
++
++
++def test_id_only_in_hub_replica_is_not_flagged_but_unknown_id_still_is(board):
++    conn, hub = board
++    _make_hub_db(hub)
++    tid = _complete_with_summary(conn, f"see @task:default@hub/{REMOTE_ID} and {UNKNOWN_ID}")
++    payloads = [r[0] for r in _phantom_events(conn, tid)]
++    assert len(payloads) == 1
++    assert UNKNOWN_ID in payloads[0] and REMOTE_ID not in payloads[0]
++
++
++def test_replica_only_id_raises_no_event(board):
++    conn, hub = board
++    _make_hub_db(hub)
++    assert _phantom_events(conn, _complete_with_summary(conn, f"hub card {REMOTE_ID}")) == []
++
++
++def test_unknown_id_flagged_without_any_replica(board):
++    conn, _ = board
++    tid = _complete_with_summary(conn, f"ghost {UNKNOWN_ID}")
++    assert len(_phantom_events(conn, tid)) == 1
++
++
++@pytest.mark.parametrize("kw", [{"fresh": False}, {"offline": True}])
++def test_stale_or_offline_replica_does_not_flag(board, kw):
++    conn, hub = board
++    _make_hub_db(hub, **kw)
++    assert _phantom_events(conn, _complete_with_summary(conn, f"{REMOTE_ID} {UNKNOWN_ID}")) == []
++
++
++def test_unreadable_replica_does_not_flag(board):
++    conn, hub = board
++    hub.mkdir(parents=True)
++    (hub / "hub.db").write_bytes(b"not a database" * 100)
++    assert _phantom_events(conn, _complete_with_summary(conn, UNKNOWN_ID)) == []
++
++
++def test_diagnostic_re_resolves_old_warning_at_read_time(board):
++    conn, hub = board
++    tid = _complete_with_summary(conn, f"{REMOTE_ID} {UNKNOWN_ID}")  # no replica yet: both flagged
++    events = kb.list_events(conn, tid)
++    task = kb.get_task(conn, tid)
++    diags = kd.compute_task_diagnostics(task, events, [], now=int(time.time()))
++    assert [d.data["phantom_refs"] for d in diags if d.kind == "prose_phantom_refs"] == [[REMOTE_ID, UNKNOWN_ID]]
++    _make_hub_db(hub)  # the replica now knows the hub card: the warning narrows, then clears
++    diags = kd.compute_task_diagnostics(task, events, [], now=int(time.time()))
++    assert [d.data["phantom_refs"] for d in diags if d.kind == "prose_phantom_refs"] == [[UNKNOWN_ID]]
++    stale = hub / "hub.db"
++    stale.unlink()
++    _make_hub_db(hub, fresh=False)
++    diags = kd.compute_task_diagnostics(task, events, [], now=int(time.time()))
++    assert not [d for d in diags if d.kind == "prose_phantom_refs"]
++
++
+-- 
+2.55.0
+

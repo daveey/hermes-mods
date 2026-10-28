@@ -1,6 +1,6 @@
 # One sidebar poll reads each store once
 
-Patch **0631** (source `2bc039b9bf`). Follows [kanban-replica-read-memo.md](kanban-replica-read-memo.md) (0580) and
+Patch **0647** (source `2bc039b9bf`). Follows [kanban-replica-read-memo.md](kanban-replica-read-memo.md) (0580) and
 [sessions-list-preview-page-only.md](sessions-list-preview-page-only.md) (0554).
 
 After 0580, replaying `GET /api/profiles/sessions/sidebar` every 2 s against the live `~/.hermes` still cost

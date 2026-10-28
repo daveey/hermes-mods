@@ -1,0 +1,94 @@
+From 42769fa2b4b7e6070e064cce4002effec7184aca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:41:39 +0000
+Subject: [PATCH] fix(kanban): rotate the dispatcher's board order per spawning
+ tick so default's backlog can't starve other boards [daveey]
+
+max_in_progress is host-wide and boards drew on it in a fixed default-first
+order. On hermes-hub default kept 15-17 ready cards, so every slot freed after a
+core-update drain hold (05:05-05:25, 05:36-05:45, 06:06-06:26 on 2026-10-28) went
+to default: runners t_8aa95edb waited 69 min (05:21->06:30) and
+unconventional-collab t_01a17f1c7838f076 85+ min while default spawned 96 runs.
+Spawning ticks now rotate the start board; drain-hold ticks keep plain order.
+---
+ gateway/kanban_watchers_dispatcher.py         | 19 +++++++++++++-
+ .../gateway/test_kanban_dispatcher_health.py  | 25 +++++++++++++++++++
+ 2 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index baf97ee638..253a7eae11 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -134,6 +134,7 @@ class _KanbanDispatcher:
+         self.settings = settings
+         self.successful_scopes: list = []
+         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
++        self._rr_offset = 0  # round-robin start board for spawning ticks (_fair_board_order)
+ 
+     def _board_slugs(self) -> list:
+         return _board_slugs(self.kb)
+@@ -242,11 +243,27 @@ class _KanbanDispatcher:
+         except Exception:  # health: allow BLE001 -- the pause and its ERROR log above still stand
+             logger.exception("kanban dispatcher: could not start automatic recovery of board %s", slug)
+ 
++    def _fair_board_order(self) -> list:
++        """Boards for this tick, rotated one place per tick (round-robin start). [daveey]
++
++        ``kanban.max_in_progress`` is a HOST-wide budget that boards draw on in
++        tick order. A fixed order (``default`` first, then alphabetical) let a
++        standing backlog on ``default`` take every slot freed after a core-update
++        drain hold or a worker exit, so ready cards on other boards waited behind
++        it indefinitely. Rotating the start gives each board first pick in turn.
++        """
++        slugs = list(self._board_slugs())
++        if len(slugs) < 2:
++            return slugs
++        start = self._rr_offset % len(slugs)
++        self._rr_offset += 1
++        return slugs[start:] + slugs[:start]
++
+     def tick_once(self, *, suppress_spawn: bool = False) -> list[tuple[str, Optional[object]]]:
+         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+         self.successful_scopes = []
+         if not suppress_spawn:
+-            return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
++            return [(slug, self.tick_once_for_board(slug)) for slug in self._fair_board_order()]
+         return [(slug, self.tick_once_for_board(slug, suppress_spawn=True)) for slug in self._board_slugs()]
+ 
+     @staticmethod
+diff --git a/tests/gateway/test_kanban_dispatcher_health.py b/tests/gateway/test_kanban_dispatcher_health.py
+index bd47d14cc6..d7ea765ad1 100644
+--- a/tests/gateway/test_kanban_dispatcher_health.py
++++ b/tests/gateway/test_kanban_dispatcher_health.py
+@@ -219,3 +219,28 @@ def test_slow_later_board_does_not_rejuvenate_earlier_scope(owner, monkeypatch):
+     producer.publish(dispatcher.successful_scopes)
+     assert not health.available(root, kb.kanban_db_path("default"), "alice", "ready")
+     assert health.available(root, kb.kanban_db_path("later"), "alice", "ready")
++
++
++def test_spawning_ticks_rotate_board_order_so_default_cannot_starve_others(tmp_path, monkeypatch):
++    """max_in_progress is host-wide and boards draw on it in tick order; a fixed
++    default-first order let default's backlog take every freed slot. [daveey]"""
++    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher, _resolve_dispatcher_settings
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    dispatcher = _KanbanDispatcher(kb, _resolve_dispatcher_settings({}, kb))
++    monkeypatch.setattr(dispatcher, "_board_slugs", lambda: ["default", "runners", "uc"])
++    order: list = []
++    monkeypatch.setattr(dispatcher, "tick_once_for_board", lambda slug, **kw: order.append(slug))
++    firsts = []
++    for _ in range(6):
++        order.clear()
++        dispatcher.tick_once()
++        assert sorted(order) == ["default", "runners", "uc"]  # every board still ticks once
++        firsts.append(order[0])
++    assert firsts == ["default", "runners", "uc", "default", "runners", "uc"]
++    # Drain-hold (suppress_spawn) ticks claim nothing, so they keep the plain order.
++    order.clear()
++    dispatcher.tick_once(suppress_spawn=True)
++    assert order == ["default", "runners", "uc"]
+-- 
+2.55.0
+

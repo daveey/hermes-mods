@@ -1,0 +1,142 @@
+From ae139f8d31c8c71813afe7158f9cac83060c5d68 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:41:26 +0000
+Subject: [PATCH] fix(kanban): explicit placement pin fails closed when
+ identity lookup raises [daveey]
+
+decide()'s outer except returned where=local if self_gateway() raised before
+the pin check, so kanban_create wrote a local row for a named gateway. Use the
+same raw-pin fallback as _place_remote: an explicit name other than
+auto/local/here is refused. local/here and a pin already known to be this
+gateway stay local.
+---
+ hermes_cli/kanban_placement.py            | 28 ++++++++++-
+ tests/hermes_cli/test_kanban_placement.py | 59 +++++++++++++++++++++++
+ 2 files changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 2606334e15..c534c3c026 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -269,6 +269,19 @@ def explicit_foreign_pin(args: dict, self_gw: Optional[str]) -> str:
+     return pin
+ 
+ 
++def _raw_explicit_pin(args: dict) -> str:
++    """Explicit pin when identity is unknown: not auto/local/here, else ''.
++
++    Same fallback ``tools.kanban_tools._place_remote`` uses when ``self_gateway()`` itself
++    fails. A name is not treated as this gateway — that needs a successful identity lookup.
++    """
++    try:
++        pin = str(args.get("placement") or "").strip().lower()
++    except Exception:
++        return ""
++    return "" if pin in ("", "auto", "local", "here") else pin
++
++
+ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+            self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
+            locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None) -> dict:
+@@ -276,10 +289,14 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+ 
+     Any local outcome for such a pin (no route to that gateway, a structural limit, target not live)
+     becomes ``{"where": "refuse", "why": ..., "pin": <gateway>}``, which ``kanban_create`` returns as a
+-    typed error. Never raises.
++    typed error. If identity lookup (or the pin check) raises before that rule runs, an explicit name
++    other than auto/local/here is refused the same way; local/here and a pin already known to be this
++    gateway stay local. Never raises.
+     """
++    known = ""
+     try:
+         sg = reg.self_gateway() if self_gw is None else self_gw
++        known = sg.strip().lower() if isinstance(sg, str) else ""
+         out = _decide(args, origin_intent=origin_intent, now=now, cfg=cfg, self_gw=sg, live=live,
+                       locate=locate, carries=carries)
+         pin = explicit_foreign_pin(args, sg)
+@@ -287,7 +304,14 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+             return {"where": "refuse", "why": out.get("why", ""), "pin": pin}
+         return out
+     except Exception as exc:
+-        return {"where": "local", "why": f"placement check failed: {exc}"}
++        why = f"placement check failed: {exc}"
++        # Do not accept a foreign pin in this catch-all. Identity may have failed before we
++        # could tell own-gateway from a name; only a pin we already resolved as ours stays local.
++        if origin_intent is None:
++            raw = _raw_explicit_pin(args)
++            if raw and raw != known:
++                return {"where": "refuse", "why": why, "pin": raw}
++        return {"where": "local", "why": why}
+ 
+ 
+ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index fd1a3e2364..80e921a1cf 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -602,3 +602,62 @@ def test_exception_while_placing_a_pinned_card_is_refused(mac, monkeypatch):
+     out = json.loads(kt._handle_create({"title": "x", "placement": "hub"}))
+     assert not out.get("ok") and out["code"] == "placement_unavailable", out
+     assert _local_count() == 0
++
++
++def _identity_raises():
++    raise RuntimeError("identity lookup failed")
++
++
++def test_decide_refuses_explicit_pin_when_identity_lookup_raises(monkeypatch):
++    """A raise before pin checking must not turn an explicit pin into a local card."""
++    monkeypatch.setattr(reg, "self_gateway", _identity_raises)
++    refused = kp.decide({"title": "x", "placement": "mini"}, cfg={})
++    assert refused["where"] == "refuse" and refused["pin"] == "mini" and "failed" in refused["why"], refused
++    # The fixture's own name is not "known" when the lookup itself raised.
++    assert kp.decide({"title": "x", "placement": "MacBook"}, cfg={})["where"] == "refuse"
++    for pin in (None, "local", "here", "auto", "LOCAL", " Here "):
++        args = {"title": "x"} if pin is None else {"title": "x", "placement": pin}
++        assert kp.decide(args, cfg={})["where"] == "local", pin
++    # Courier creation is local by contract; the tool layer refuses an origin-bound pin itself.
++    courier = kp.decide({"title": "x", "placement": "mini"}, cfg={}, origin_intent={"request_id": "r"})
++    assert courier["where"] == "local", courier
++
++
++def test_decide_keeps_a_known_own_gateway_local_when_a_later_step_raises(monkeypatch):
++    def boom(*_a, **_k):
++        raise RuntimeError("pin check failed")
++    monkeypatch.setattr(kp, "explicit_foreign_pin", boom)
++    own = kp.decide({"title": "x", "placement": "Hub"}, self_gw="hub", cfg={})
++    assert own["where"] == "local", own
++    foreign = kp.decide({"title": "x", "placement": "mini"}, self_gw="hub", cfg={})
++    assert foreign["where"] == "refuse" and foreign["pin"] == "mini", foreign
++
++
++@pytest.mark.parametrize("pin", ["mini", "macbook", "MacBook"])
++def test_identity_lookup_failure_refuses_explicit_pin_and_creates_no_row(mac, monkeypatch, pin):
++    """Tool-level: self_gateway raising must not write a local row for an explicit pin."""
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(reg, "self_gateway", _identity_raises)
++    out = json.loads(kt._handle_create({"title": "MacBook-only drill", "placement": pin}))
++    assert not out.get("ok"), out
++    assert out["code"] == "placement_unavailable" and out["created"] is False
++    assert out["placement"] == pin.strip().lower()
++    assert "placement='local'" in out["error"]
++    assert mac["calls"] == [] and _local_count() == 0
++
++
++@pytest.mark.parametrize("pin", ["local", "here", "LOCAL", " Here "])
++def test_identity_lookup_failure_still_creates_local_and_here(mac, monkeypatch, pin):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(reg, "self_gateway", _identity_raises)
++    out = json.loads(kt._handle_create({"title": "stay here", "placement": pin}))
++    assert out["ok"] and out["task_id"] and "placed" not in out, out
++    assert mac["calls"] == [] and _local_count() == 1
++
++
++def test_identity_lookup_failure_without_a_pin_still_creates_locally(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(reg, "self_gateway", _identity_raises)
++    out = json.loads(kt._handle_create({"title": "unpinned card"}))
++    assert out["ok"] and out["task_id"] and "placed" not in out, out
++    assert _local_count() == 1
+-- 
+2.55.0
+
