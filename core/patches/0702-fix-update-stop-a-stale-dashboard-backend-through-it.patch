@@ -1,0 +1,482 @@
+From 2d9f16aa2cba9b6c652ea848f719cc00f1650018 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:15:20 +0000
+Subject: [PATCH] fix(update): stop a stale dashboard backend through its
+ retirement fence, never mid background review [daveey]
+
+hermes update's dashboard step (_kill_stale_dashboard_processes, restart_managed)
+sent a plain SIGTERM. The serve's shutdown then finalized sessions and
+tui_gateway.session_lifecycle cancelled any running background review mid
+provider call. The drain window applies an update at the first idle gap, and
+a review starts right after every turn, so one is often in flight then
+(David-MBP 2026-10-28 06:37:41 stopped pid 91625 this way). 4101ef7442 made
+the RetirementFence review-aware, but this kill path never consulted it.
+
+Now, on the update path only, each stale backend whose port and session token
+are known (spawn ledger / host rendezvous / argv; env token or rendezvous
+token) is asked POST /api/health/retirement prepare. While GET
+/api/health/idle reports background_review:<n> the update keeps asking: the
+fence lets the review finish, asks it to stop between API calls past 300 s,
+and stops counting it past 900 s, which is also the update's own deadline.
+On a permit the update commits (admission closed, no new review starts) and
+then SIGTERMs. Any other answer (idle, other busy, old backend, no token) is
+stopped exactly as before. `hermes dashboard --stop` keeps its immediate stop.
+
+Tests (real child backend with a real RetirementFence over HTTP):
+- review mid-call: stopped only after the review completes (RED: cancelled mid-call)
+- review past the wait bound: winds down at a call boundary, then stopped
+- wedged review: update gives up at its deadline and stops as before
+- controls: no review, and no reachable fence, are stopped as today
+---
+ hermes_cli/dashboard_procs.py                 | 133 +++++++++
+ .../test_update_stale_dashboard_review.py     | 273 ++++++++++++++++++
+ 2 files changed, 406 insertions(+)
+ create mode 100644 tests/hermes_cli/test_update_stale_dashboard_review.py
+
+diff --git a/hermes_cli/dashboard_procs.py b/hermes_cli/dashboard_procs.py
+index df9ed4961a..7c5a5c3ae3 100644
+--- a/hermes_cli/dashboard_procs.py
++++ b/hermes_cli/dashboard_procs.py
+@@ -5,6 +5,8 @@ call time so imports stay one-way (both of those modules import this one lazily)
+ """
+ 
+ import contextlib
++import json
++import logging
+ import os
+ import subprocess
+ import sys
+@@ -12,6 +14,7 @@ from pathlib import Path
+ 
+ from hermes_cli._startup_fast import is_desktop_ssh_backend_argv
+ 
++logger = logging.getLogger(__name__)
+ _PS_RUN_KWARGS = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
+ 
+ 
+@@ -593,6 +596,128 @@ def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int,
+                   for pid in survivors)
+ 
+ 
++# [daveey] The update's stop goes through the backend's own retirement fence first
++# (``POST /api/health/retirement``, ``hermes_cli/backend_retirement.py``). A plain SIGTERM made the
++# serve finalize its sessions, and ``tui_gateway.session_lifecycle`` then cancelled a running
++# background review mid provider call. The drain window applies an update at the first idle gap
++# between turns, and a review starts right after every turn, so one is often in flight then
++# (David-MBP 2026-10-28 06:37:41, pid 91625). While the backend reports ``background_review:<n>``
++# the update keeps asking; the fence lets the review finish, asks it to stop between calls past
++# ``BACKGROUND_REVIEW_WAIT_S`` (300 s), and stops counting it past ``BACKGROUND_REVIEW_HARD_CAP_S``
++# (900 s), which is also this wait's own deadline. Every other answer (idle, another kind of busy,
++# an old backend with no fence, no token, no port) is stopped exactly as before.
++_REVIEW_RETIRE_POLL_S = 2.0
++_REVIEW_RETIRE_HTTP_TIMEOUT_S = 3.0
++
++
++def _review_retire_deadline_s() -> float:
++    from hermes_cli.backend_retirement import BACKGROUND_REVIEW_HARD_CAP_S
++    return float(BACKGROUND_REVIEW_HARD_CAP_S)
++
++
++def _retirement_endpoint(pid: int) -> tuple[str, int, str] | None:
++    """``(host, port, token)`` to reach *pid*'s retirement fence, or ``None`` when unknown.
++
++    Port: the spawn ledger (real port of a ``--port 0`` backend), the host rendezvous record that
++    names this pid, else a non-zero ``--port`` in its argv. Token: the session token in the
++    process's own environment (Desktop-local backends), else the rendezvous token of the record
++    that names this pid. Both are required; anything less falls back to the plain stop.
++    """
++    from hermes_cli import main_dashboard as _dash
++
++    host = port = token = None
++    if bind := _ledger_serve_binds().get(pid):
++        host, port = bind
++    with contextlib.suppress(Exception):
++        from gateway import host_rendezvous as _hr
++        for role in (_hr.ROLE_DESKTOP_SERVE, _hr.ROLE_SERVE):
++            record = _hr.read_record(role)
++            if record is not None and record.pid == pid and record.port:
++                if port is None:
++                    host, port = _hr.dial_host(record), int(record.port)
++                token = _hr.read_token(role) or None
++                break
++    if port is None:
++        argv = _dash._dashboard_cmdline_for_pid(pid) or []
++        raw = _flag_value(argv, "--port")
++        if raw and raw.isdigit() and int(raw) > 0:
++            host, port = _flag_value(argv, "--host") or "", int(raw)
++    env = _pid_environ(pid) or {}
++    token = env.get("HERMES_DASHBOARD_SESSION_TOKEN") or token
++    if not port or not token:
++        return None
++    if host in (None, "", "0.0.0.0", "::", "*", "localhost"):
++        host = "127.0.0.1"
++    return host, int(port), token
++
++
++def _retirement_request(endpoint: tuple[str, int, str], body: dict | None) -> dict | None:
++    """POST *body* to ``/api/health/retirement`` (``None`` body: GET ``/api/health/idle``)."""
++    import urllib.request
++
++    host, port, token = endpoint
++    netloc = f"[{host}]" if ":" in host else host
++    path = "/api/health/idle" if body is None else "/api/health/retirement"
++    request = urllib.request.Request(
++        f"http://{netloc}:{port}{path}", method="GET" if body is None else "POST",
++        data=None if body is None else json.dumps(body).encode(),
++        headers={"X-Hermes-Session-Token": token, "Content-Type": "application/json"})
++    try:
++        with urllib.request.urlopen(request, timeout=_REVIEW_RETIRE_HTTP_TIMEOUT_S) as response:
++            payload = json.loads(response.read(65536).decode("utf-8", "replace"))
++    except Exception:
++        return None
++    return payload if isinstance(payload, dict) else None
++
++
++def _await_background_reviews(pids: list[int]) -> None:
++    """Hold the stop of each backend in *pids* while it runs a background review (see above)."""
++    import time as _time
++
++    pending = {pid: ep for pid in pids if (ep := _retirement_endpoint(pid)) is not None}
++    if not pending:
++        return
++    started = _time.monotonic()
++    deadline = started + _review_retire_deadline_s()
++    waited: set[int] = set()
++    while pending:
++        for pid, endpoint in list(pending.items()):
++            permit = _retirement_request(endpoint, {"action": "prepare"}) or {}
++            if permit.get("ok") is True and isinstance(permit.get("token"), str):
++                committed = (_retirement_request(endpoint, {"action": "commit", "token": permit["token"]})
++                             or {}).get("ok") is True
++                del pending[pid]
++                if pid in waited:
++                    msg = (f"PID {pid} finished its background review after "
++                           f"{_time.monotonic() - started:.0f}s; retirement fence "
++                           f"{'committed' if committed else 'not committed'}, stopping it")
++                    print(f"    ✓ {msg}")
++                    logger.warning("dashboard stop: %s", msg)
++                continue
++            detail = str(((_retirement_request(endpoint, None) or {}).get("detail")) or "")
++            if not detail.startswith("background_review:"):
++                del pending[pid]  # nothing a wait protects (or an old backend): stop as before
++                continue
++            if pid not in waited:
++                waited.add(pid)
++                from hermes_cli.backend_retirement import BACKGROUND_REVIEW_WAIT_S
++                msg = (f"PID {pid} is running a background review ({detail}); waiting for it before "
++                       f"stopping (asked to wind down between API calls after "
++                       f"{BACKGROUND_REVIEW_WAIT_S:.0f}s, at most {_review_retire_deadline_s():.0f}s)")
++                print(f"    ⏳ {msg}")
++                logger.warning("dashboard stop: %s", msg)
++        if not pending:
++            return
++        if _time.monotonic() >= deadline:
++            for pid in pending:
++                msg = (f"PID {pid} background review still running after "
++                       f"{_time.monotonic() - started:.0f}s; stopping it anyway")
++                print(f"    ⚠ {msg}")
++                logger.warning("dashboard stop: %s", msg)
++            return
++        _time.sleep(_REVIEW_RETIRE_POLL_S)
++
++
+ def _kill_stale_dashboard_processes(
+     reason: str = "the running backend no longer matches the updated frontend", *,
+     restart_managed: bool = False, already_restarted_units: set[str] | None = None,
+@@ -686,6 +811,14 @@ def _kill_stale_dashboard_processes(
+                        or _launcher_launchd_job(pid)):
+                 pid_launchd[pid] = job
+     print(f"\n⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
++    if restart_managed:
++        # Update only: never cut a background review off mid-call (see _await_background_reviews).
++        # ``--stop`` is an explicit request and keeps its immediate stop.
++        try:
++            _await_background_reviews(list(pids))
++        except Exception:
++            logger.warning("dashboard stop: background-review wait failed; stopping as before",
++                           exc_info=True)
+     killed: list[int] = []
+     failed: list[tuple[int, str]] = []
+     (_kill_pids_windows if sys.platform == "win32" else _kill_pids_posix)(pids, killed, failed)
+diff --git a/tests/hermes_cli/test_update_stale_dashboard_review.py b/tests/hermes_cli/test_update_stale_dashboard_review.py
+new file mode 100644
+index 0000000000..12e1b4bbff
+--- /dev/null
++++ b/tests/hermes_cli/test_update_stale_dashboard_review.py
+@@ -0,0 +1,273 @@
++"""``hermes update`` must not SIGTERM a stale dashboard backend mid background review.
++
++The update's dashboard step (``_kill_stale_dashboard_processes(restart_managed=True)``) used to send a
++plain SIGTERM. On SIGTERM the serve finalizes its sessions and ``tui_gateway.session_lifecycle``
++calls ``cancel_background_review_for_live_turn``, which cuts a running review off mid provider call.
++The drain window applies an update at the first idle gap, and a review starts right after every
++turn, so a review is often in flight at that moment (David-MBP 2026-10-28 06:37:41, pid 91625).
++
++The stop now goes through the backend's own retirement fence (``POST /api/health/retirement``): a
++running review keeps it refused, past ``BACKGROUND_REVIEW_WAIT_S`` the fence asks the review to stop
++before its next provider call, and the update stops the backend only once the fence commits (or at
++the review hard cap, so the update never blocks past the existing 300/900 s bounds).
++
++The backend here is a real child process: a real ``RetirementFence`` behind a real HTTP listener
++authenticated by ``HERMES_DASHBOARD_SESSION_TOKEN`` (read from the child's environment, as the update
++does for a Desktop-local backend), a review thread that makes "provider calls" and honours
++``wind_down`` only between calls, and a SIGTERM handler that records what the real shutdown would do
++to a review still running (cancel it; mid-call when a call is in flight).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++
++from hermes_cli import dashboard_procs, main_dashboard
++
++pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals and /proc environ")
++
++_BACKEND = textwrap.dedent(
++    """
++    import json, os, pathlib, signal, sys, threading, time
++    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++    from hermes_cli import backend_retirement, web_server_idle_proof
++
++    out = pathlib.Path(sys.argv[1])
++    calls, call_s, wait_s = int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
++    backend_retirement.BACKGROUND_REVIEW_WAIT_S = wait_s
++    # No turns, no human input: only the review can hold this backend.
++    web_server_idle_proof.idle_proof = lambda: {"idle": True, "reason": None}
++    fence = backend_retirement.retirement
++    token = os.environ["HERMES_DASHBOARD_SESSION_TOKEN"]
++    state = {"in_call": False, "running": True, "events": []}
++
++    def log(event):
++        state["events"].append(event)
++        out.with_suffix(".events").write_text(json.dumps(state["events"]))
++
++    hold = fence.begin_background_review() if calls else None
++
++    def review():
++        try:
++            for n in range(calls):
++                if hold.wind_down.is_set():  # begin_iteration: the call boundary
++                    log("wound_down_at_call_boundary")
++                    return
++                state["in_call"] = True
++                log(f"call_{n}_start")
++                time.sleep(call_s)
++                state["in_call"] = False
++                log(f"call_{n}_end")
++            log("review_completed")
++        finally:
++            state["running"] = False
++            fence.end_background_review(hold)
++
++    if hold is not None:
++        threading.Thread(target=review, daemon=True).start()
++    else:
++        state["running"] = False
++
++    class H(BaseHTTPRequestHandler):
++        def log_message(self, *a):
++            pass
++
++        def _reply(self, payload, code=200):
++            body = json.dumps(payload).encode()
++            self.send_response(code)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(body)))
++            self.end_headers()
++            self.wfile.write(body)
++
++        def _authed(self):
++            if self.headers.get("X-Hermes-Session-Token") != token:
++                self._reply({"detail": "Unauthorized"}, 401)
++                return False
++            return True
++
++        def do_GET(self):  # /api/health/idle, shaped like busy_ledger's report
++            if not self._authed():
++                return
++            n = fence.background_review_count()
++            self._reply({"ok": True, "idle": not n, "reason": "turn_in_flight" if n else None,
++                         "detail": f"background_review:{n}" if n else None})
++
++        def do_POST(self):  # /api/health/retirement
++            if not self._authed():
++                return
++            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
++            action = body.get("action")
++            if action == "prepare":
++                reply = fence.prepare()
++            else:
++                reply = getattr(fence, action)(body.get("token"))
++            log(f"{action}:{'ok' if reply.get('ok') else 'refused'}")
++            self._reply(reply)
++
++    server = ThreadingHTTPServer(("127.0.0.1", 0), H)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++
++    def on_term(*_):
++        # tui_gateway.session_lifecycle: shutdown finalizes sessions and cancels any review that is
++        # still running (cancel_background_review_for_live_turn), mid-call if a call is in flight.
++        if state["running"]:
++            log("review_cancelled_mid_call" if state["in_call"] else "review_cancelled_between_calls")
++        else:
++            log("sigterm_no_review_running")
++        out.write_text("done")
++        os._exit(0)
++
++    signal.signal(signal.SIGTERM, on_term)
++    out.with_suffix(".port").write_text(str(server.server_address[1]))
++    time.sleep(600)
++    """
++)
++
++
++def _spawn_backend(tmp_path: Path, *, calls: int, call_s: float, wait_s: float = 300.0):
++    out = tmp_path / "backend.out"
++    env = dict(os.environ, HERMES_DASHBOARD_SESSION_TOKEN="tok-" + os.urandom(8).hex(),
++               PYTHONPATH=os.pathsep.join([str(Path(__file__).resolve().parents[2]),
++                                           os.environ.get("PYTHONPATH", "")]))
++    proc = subprocess.Popen([sys.executable, "-c", _BACKEND, str(out), str(calls), str(call_s), str(wait_s)],
++                            env=env, stdin=subprocess.DEVNULL)
++    port_file = out.with_suffix(".port")
++    deadline = time.monotonic() + 30
++    while not port_file.exists():
++        assert proc.poll() is None and time.monotonic() < deadline, "backend stand-in did not start"
++        time.sleep(0.02)
++    return proc, out, int(port_file.read_text())
++
++
++def _events(out: Path) -> list[str]:
++    path = out.with_suffix(".events")
++    return json.loads(path.read_text()) if path.exists() else []
++
++
++def _run_update_stop(pid: int, port: int):
++    """The update's dashboard step on one stale, manually started backend (nothing to respawn)."""
++    with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
++         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[pid]), \
++         patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
++         patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
++         patch.object(main_dashboard, "_dashboard_cmdline_for_pid", return_value=None), \
++         patch.object(main_dashboard, "_loaded_launchd_backend_jobs", return_value=[]), \
++         patch.object(main_dashboard, "_launchd_job_from_launch_env", return_value=None), \
++         patch.object(dashboard_procs, "_lock_owned_serve_pids", return_value=set()), \
++         patch.object(dashboard_procs, "_launcher_supervisor", return_value=None), \
++         patch.object(dashboard_procs, "_ledger_serve_binds", return_value={pid: ("127.0.0.1", port)}):
++        started = time.monotonic()
++        result = dashboard_procs._kill_stale_dashboard_processes(restart_managed=True)
++        return result, time.monotonic() - started
++
++
++@pytest.fixture
++def fast_poll(monkeypatch):
++    monkeypatch.setattr(dashboard_procs, "_REVIEW_RETIRE_POLL_S", 0.1, raising=False)
++
++
++def test_stale_backend_mid_review_is_stopped_only_after_the_review_finishes(tmp_path, fast_poll):
++    proc, out, port = _spawn_backend(tmp_path, calls=3, call_s=0.7)
++    try:
++        deadline = time.monotonic() + 10
++        while "call_0_start" not in _events(out):  # the review is mid provider call
++            assert time.monotonic() < deadline
++            time.sleep(0.02)
++        result, _elapsed = _run_update_stop(proc.pid, port)
++        proc.wait(timeout=20)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++    events = _events(out)
++    assert "review_cancelled_mid_call" not in events, events
++    assert "review_cancelled_between_calls" not in events, events
++    assert "review_completed" in events, events
++    # Stopped through the fence: committed after the review, then SIGTERMed with nothing running.
++    assert events.index("review_completed") < events.index("commit:ok") < events.index(
++        "sigterm_no_review_running"), events
++    assert result["killed"] == [proc.pid] and result["failed"] == []
++
++
++def test_review_past_the_wait_bound_winds_down_at_a_call_boundary(tmp_path, fast_poll):
++    # A long review (20 calls of 0.5 s) on a backend whose fence asks it to wind down after 0.3 s.
++    proc, out, port = _spawn_backend(tmp_path, calls=20, call_s=0.5, wait_s=0.3)
++    try:
++        deadline = time.monotonic() + 10
++        while "call_0_start" not in _events(out):
++            assert time.monotonic() < deadline
++            time.sleep(0.02)
++        result, elapsed = _run_update_stop(proc.pid, port)
++        proc.wait(timeout=20)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++    events = _events(out)
++    assert "review_cancelled_mid_call" not in events, events
++    assert "wound_down_at_call_boundary" in events, events
++    assert "review_completed" not in events, events  # it did not need to run all 20 calls
++    assert elapsed < 8, elapsed
++    assert events.index("wound_down_at_call_boundary") < events.index("commit:ok") < events.index(
++        "sigterm_no_review_running"), events
++    assert result["killed"] == [proc.pid]
++
++
++def test_update_does_not_wait_past_the_review_hard_cap(tmp_path, fast_poll, monkeypatch):
++    # A wedged review that never reaches a call boundary: the update gives up at its deadline and
++    # stops the backend as before, rather than blocking the update forever.
++    monkeypatch.setattr(dashboard_procs, "_review_retire_deadline_s", lambda: 1.0, raising=False)
++    proc, out, port = _spawn_backend(tmp_path, calls=1, call_s=60.0)
++    try:
++        deadline = time.monotonic() + 10
++        while "call_0_start" not in _events(out):
++            assert time.monotonic() < deadline
++            time.sleep(0.02)
++        result, elapsed = _run_update_stop(proc.pid, port)
++        proc.wait(timeout=20)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++    assert 1.0 <= elapsed < 15, elapsed
++    assert result["killed"] == [proc.pid]
++    assert "prepare:refused" in _events(out)  # it did ask the fence first
++
++
++def test_control_backend_with_no_review_is_stopped_as_today(tmp_path, fast_poll):
++    proc, out, port = _spawn_backend(tmp_path, calls=0, call_s=0.0)
++    try:
++        result, elapsed = _run_update_stop(proc.pid, port)
++        proc.wait(timeout=20)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++    assert _events(out)[-1] == "sigterm_no_review_running"
++    assert result["killed"] == [proc.pid] and result["failed"] == []
++    assert elapsed < 5, elapsed
++
++
++def test_control_backend_without_a_reachable_fence_is_stopped_as_today(tmp_path, fast_poll):
++    # Old backend / unknown port: no retirement endpoint, so the update falls back to the plain stop.
++    proc, out, port = _spawn_backend(tmp_path, calls=3, call_s=5.0)
++    try:
++        with patch.object(dashboard_procs, "_retirement_endpoint", return_value=None, create=True):
++            deadline = time.monotonic() + 10
++            while "call_0_start" not in _events(out):
++                assert time.monotonic() < deadline
++                time.sleep(0.02)
++            result, elapsed = _run_update_stop(proc.pid, port)
++        proc.wait(timeout=20)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++    assert result["killed"] == [proc.pid]
++    assert elapsed < 5, elapsed
+-- 
+2.55.0
+

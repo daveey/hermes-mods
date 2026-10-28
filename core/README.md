@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [held-session-refusal-backoff.md](held-session-refusal-backoff.md) | 0702 | A completion or other automatic turn refused because another backend holds the chat backs off (30 s doubling to 300 s) and shows one "open in another Hermes window or device" notice per streak instead of an "internal error" card every poll; the event waits and is delivered once the chat is free. |
 | [serve-update-wait.md](serve-update-wait.md) | 0697 | `hermes serve` waits out a live core update (600 s) or hermes-sync's admission hold (60 s) before loading the agent, so no backend boots on a tree about to be swapped. |
 | [background-review-retirement-hold.md](background-review-retirement-hold.md) | 0700 | A running post-turn background review holds the backend retirement fence: skew/idle retirement waits for it, asks it to stop between provider calls after 300 s, and stops counting it at 900 s; a retiring backend skips new reviews cleanly. |
 | [kanban-delegate-child-terminal-isolation.md](kanban-delegate-child-terminal-isolation.md) | 0692 | Delegate children keep their own terminal env; `--board` works from worker shells; `boards list` counts each board. |
