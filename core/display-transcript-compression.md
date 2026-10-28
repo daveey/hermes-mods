@@ -1,0 +1,27 @@
+# Display-only transcript compression
+
+Patch: 0656 (07fb47660c).
+
+## Behavior
+
+A transcript GET marked `X-Hermes-Display-Transcript: 1` omits redundant provider reasoning fields for display. The Desktop client sends the display header, accepts gzip, and decodes gzip or an older backend's plain response. Other API clients retain the unmodified transcript.
+
+## How it works
+
+The session message route builds a display-only response and optionally gzips it. The Desktop transport marks transcript requests and decodes compressed replies. Stored messages are not changed.
+
+## Code
+
+`hermes_cli/web_routers/sessions.py`; `apps/desktop/electron/display-transcript.ts`; `apps/desktop/electron/main.ts`.
+
+## Tests
+
+`scripts/run_tests.sh tests/hermes_cli/test_session_messages_display_transcript.py`: three passing backend tests in this mirror run. The commit also contains `apps/desktop/electron/display-transcript.test.ts`; its frontend suite was not rerun by the mirror worker. Live Desktop behavior was not independently reverified by the mirror worker.
+
+## Applying
+
+Apply after 0655. Included to keep the public append contiguous before the card-wait fallback.
+
+## Gotchas
+
+This is a display transport optimization, not permission to strip provider replay fields from stored messages or inference history. It changes core API and Electron transport, not a disk plugin.

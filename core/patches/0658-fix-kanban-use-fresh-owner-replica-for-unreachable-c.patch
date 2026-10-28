@@ -1,0 +1,387 @@
+From a9ed7fc9ff88c802c95d7bf552a37ebeb39314c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 07:22:13 +0000
+Subject: [PATCH 658/658] fix(kanban): use fresh owner replica for unreachable
+ card waits [daveey]
+
+---
+ hermes_cli/kanban_awaiting.py                |   5 +-
+ hermes_cli/kanban_origin_ledger.py           |   3 +
+ hermes_cli/kanban_wait_check.py              |  21 ++-
+ hermes_cli/kanban_wait_replica.py            |  89 ++++++++++
+ hermes_cli/kanban_wake_check.py              |   5 +-
+ tests/hermes_cli/test_kanban_wait_replica.py | 163 +++++++++++++++++++
+ 6 files changed, 281 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_wait_replica.py
+ create mode 100644 tests/hermes_cli/test_kanban_wait_replica.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 82decec937..2b03579cf9 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -331,8 +331,9 @@ def confirm_remote(awaiting: Optional[dict]) -> None:
+     if rc not in (0, 1):
+         raise AwaitingError(INVALID_AWAITING, f"cannot confirm producer card {ref} on {awaiting['gateway']}: "
+                                               f"{out[-200:]}")
+-    status = out.split()[-1] if out.split() else ""
+-    if status in ("archived", "triage"):
++    words = out.split()
++    status = words[1] if len(words) >= 2 and words[0] == ref else ""
++    if status in ("archived", "triage") or "orphan producer" in out or "agent-owned park:" in out:
+         raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {ref} on {awaiting['gateway']} "
+                                                f"is {status}, so nobody is producing it. {_REMEDY}")
+     _REMOTE_CONFIRMED[(awaiting["gateway"], ref)] = (time.monotonic(), out[-120:])
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 189690af16..12e91d0a1e 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -182,6 +182,9 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+                     and event and run and event[1] == run[0] and run[1] in ('done', 'completed') and run[2] == 'completed'
+                     and row[1] is not None and event[2] >= row[1] and run[3] is not None and run[3] >= row[1])
+     payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    if row[0] in ('scheduled', 'blocked'):
++        from hermes_cli.kanban_wait_replica import observe_wait
++        payload['wait_observation'] = observe_wait(conn, task['id'], now=now)
+     # No per-task timestamp: an unchanged task must publish an identical record, or every sync republishes
+     # every task. Owner liveness is the collector's per-scope heartbeat (``task_scopes[].observed_at``).
+     return {**payload, 'origin_observation': {
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index 6d259a27bc..35e0b0afb8 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -66,11 +66,12 @@ def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DE
+             status = rows[0][0]
+             if status in set(since or ()):
+                 return 1, f"{target} {status} (unchanged since park)"
++            suffix = _producer_suffix(board, target) if status in ("scheduled", "blocked") else ""
+             if status in set(until):
+-                return 0, f"{target} {status}"
++                return 0, f"{target} {status}{suffix}"
+             if PARKED_AGENT in set(until) and status in ("scheduled", "blocked") and _agent_owned_park(board, target):
+                 return 0, f"{target} {status} (agent-owned park: nothing else will produce what it waits for)"
+-            return 1, f"{target} {status}"
++            return 1, f"{target} {status}{suffix}"
+         if kind == "board-empty":
+             n = _query(_db(target), "select count(*) from tasks where status not in ('done','archived')")[0][0]
+             return (0 if n == 0 else 1), f"{target} open={n}"
+@@ -79,6 +80,16 @@ def check_local(kind: str, target: str, *, board: Optional[str] = None, until=DE
+     return 2, f"error: unknown check {kind!r}"
+ 
+ 
++def _producer_suffix(board, target):
++    from hermes_cli.kanban_session_activity import _open_ro
++    from hermes_cli.kanban_awaiting import card_orphan_reason
++    conn = _open_ro(_db(board))
++    try:
++        return " (orphan producer)" if card_orphan_reason(conn, target) else ""
++    finally:
++        conn.close()
++
++
+ def _agent_owned_park(board: Optional[str], target: str) -> bool:
+     """The target parked on something only an agent can end (certain, or a legacy park that has stalled)."""
+     from hermes_cli.kanban_session_activity import _local_wait_info, _open_ro
+@@ -104,7 +115,13 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=SSH_TIMEOUT + 15, check=False)
+     except (OSError, subprocess.TimeoutExpired) as exc:
++        if kind == "task":
++            from hermes_cli.kanban_wait_replica import check
++            return check(gateway, target, board=board, until=until, since=since)
+         return 2, f"error: ssh {host}: {exc}"
++    if p.returncode == 255 and kind == "task":
++        from hermes_cli.kanban_wait_replica import check
++        return check(gateway, target, board=board, until=until, since=since)
+     out = (p.stdout + p.stderr).strip()
+     if p.returncode == 0 and since and kind == "task":
+         words = (p.stdout or "").split()
+diff --git a/hermes_cli/kanban_wait_replica.py b/hermes_cli/kanban_wait_replica.py
+new file mode 100644
+index 0000000000..1fa6e3e04e
+--- /dev/null
++++ b/hermes_cli/kanban_wait_replica.py
+@@ -0,0 +1,89 @@
++"""Read owner task snapshots when SSH is unavailable. Never confuse unknown with pending."""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++from hermes_cli import kanban_capability_registry as registry
++
++# Gateway task_scopes are refreshed each sync; task updated_at only changes on edits.
++MAX_AGE_SECONDS = 600
++STATUSES = frozenset(("todo", "ready", "running", "scheduled", "review", "blocked", "triage", "done", "archived"))
++
++
++def read_task(gateway, target, board=None):
++    """Exact owner-qualified match, including completed/archived records, with fresh scope proof."""
++    board = board or "default"
++    db = registry._ro(registry.hub_db_path())
++    try:
++        db.execute("BEGIN")
++        rows = db.execute("SELECT data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
++                          (gateway, f"default/{board}/{target}")).fetchall()
++        if not rows:
++            raise ValueError(f"{target} not found in {gateway} replica")
++        tasks = [json.loads(r[0]) for r in rows]
++        if any(t != tasks[0] for t in tasks[1:]):
++            raise ValueError(f"ambiguous replica records for {target}")
++        task = tasks[0]
++        if (task.get("id") != target or task.get("board") != board or task.get("status") not in STATUSES
++                or task.get("gateway") != gateway or task.get("profile") != "default"
++                or task.get("owner_profile") != "default"):
++            raise ValueError(f"invalid replica task {target}")
++        scopes = []
++        for (raw,) in db.execute("SELECT data FROM replica WHERE gw=? AND coll='gateway'", (gateway,)):
++            scopes.extend(json.loads(raw).get("task_scopes", []))
++        matched = [s for s in scopes if s.get("profile") == "default" and s.get("board") == board]
++        if len(matched) != 1 or matched[0].get("state") != "ok":
++            raise ValueError(f"missing successful task-scope observation for {gateway}/{board}")
++        age = time.time() - float(matched[0].get("observed_at") or 0)
++        if not -60 <= age <= MAX_AGE_SECONDS:
++            raise ValueError(f"stale replica for {gateway}/{board} (age={age:.0f}s, limit={MAX_AGE_SECONDS}s)")
++        return task
++    finally:
++        db.close()
++
++
++def orphan_reason(task):
++    """Facts preserved by the replica that make a producer non-live."""
++    status = task["status"]
++    evidence = task.get("wait_observation")
++    if isinstance(evidence, dict) and evidence.get("orphan_reason"):
++        return evidence["orphan_reason"]
++    if status in ("archived", "triage"):
++        return status
++    if status == "blocked" and not task.get("human_request") and task.get("block_kind") not in ("assignment", "dependency"):
++        return "blocked with no human ask or routed owner"
++    return None
++
++
++def observe_wait(conn, target, *, now):
++    """Owner-only evidence collected in the same snapshot as the task row."""
++    from hermes_cli.kanban_awaiting import card_orphan_reason
++    from hermes_cli.kanban_session_activity import _local_wait_info
++    info = _local_wait_info(conn, [target], now=now).get(target) or {}
++    orphan = card_orphan_reason(conn, target)
++    return {"orphan_reason": orphan,
++            "parked_agent": bool(orphan or (info.get("agent_owned") and
++                                 (info.get("agent_owned_certain") or info.get("wait_state") == "stalled")))}
++
++
++def check(gateway, target, *, board=None, until=(), since=()):
++    try:
++        task = read_task(gateway, target, board)
++        status = task["status"]
++        orphan = orphan_reason(task)
++        suffix = " (replica; orphan producer)" if orphan else " (replica)"
++        if status in since:
++            return 1, f"{target} {status} (unchanged since park){suffix}"
++        if status in until:
++            return 0, f"{target} {status}{suffix}"
++        if status in ("scheduled", "blocked") and "parked-agent" in until:
++            evidence = task.get("wait_observation")
++            if not isinstance(evidence, dict) or type(evidence.get("parked_agent")) is not bool:
++                raise ValueError(f"{target} scheduled producer evidence unavailable; update owner core")
++            if evidence["parked_agent"]:
++                return 0, f"{target} {status} (replica; orphan producer)"
++        return 1, f"{target} {status}{suffix}"
++    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError) as exc:
++        return 2, f"error: replica {gateway}: {exc}"
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 6692676834..4b95d51033 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -72,6 +72,9 @@ def dry_run_error(cmd: Optional[str], *, cwd: Optional[str] = None, env: Optiona
+     """Run ``cmd`` once at park time; refusal text when it can never succeed (rc >= 2, could
+     not start, or exit 0/1 with error output), else None. A timeout is accepted: slow is not
+     broken. ``HERMES_KANBAN_WAKE_DRYRUN=0`` skips it (tests)."""
++    if cmd and re.search(r"\bhermes-hub\s+tasks\b", cmd) and re.search(r"\bt_[0-9a-f]{8,16}\b", cmd):
++        return ("refused: hand-rolled replica task probes hide missing or stale cards. Use "
++                "`hermes kanban wait-check task <id> --gateway <name> --until done,blocked` instead.")
+     if not cmd or os.environ.get("HERMES_KANBAN_WAKE_DRYRUN") == "0":
+         return None
+     rc, out = _run_probe(("dry-run", cmd), cmd, cwd or str(Path.home()), env if env is not None else dict(os.environ))
+@@ -101,7 +104,7 @@ GUARD_HELP = (
+     "default 900, min 120). Examples: "
+     "`sqlite3 ~/.bb/hub.db \"select build from devices where name='watch'\" | grep -q 559`, "
+     "`gh api repos/OWNER/REPO/tags --jq '.[].name' | grep -q '^desktop-client-v'`, "
+-    "`hermes kanban show t_xxxx --json | jq -e '.task.status==\"done\"'`. "
++    "`hermes kanban wait-check task <id> --gateway <name> --until done,blocked`. "
+     "A wait on another card on this board is a parent link (kanban_link), not a park. "
+     "Only a pure time wait (a soak window, a calendar date, a timed re-measure) may pass "
+     "clock_only=true; SCHEDULED_UNTIL stays the deadline either way."
+diff --git a/tests/hermes_cli/test_kanban_wait_replica.py b/tests/hermes_cli/test_kanban_wait_replica.py
+new file mode 100644
+index 0000000000..f94305b080
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_replica.py
+@@ -0,0 +1,163 @@
++"""Cross-gateway card waits survive an unavailable SSH route without hiding broken reads."""
++import json
++import sqlite3
++import subprocess
++import time
++
++import pytest
++
++from hermes_cli import kanban_awaiting as awaiting
++from hermes_cli import kanban_wait_check as wait
++from hermes_cli import kanban_wake_check as wake
++
++TID = "t_123456789abcdef0"
++
++
++@pytest.fixture
++def replica(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path))
++    db = sqlite3.connect(tmp_path / "hub.db")
++    db.execute("CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++    scope = {"task_scopes": [{"board": "default", "profile": "default", "state": "ok", "observed_at": time.time()}]}
++    db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", ("other", "gateway", "other", json.dumps(scope), int(time.time()*1000)))
++    db.commit()
++    monkeypatch.setattr(wait.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 255, "", "Could not resolve hostname"))
++    yield db
++    db.close()
++
++
++def put(db, status, **fields):
++    row = dict(id=TID, board="default", status=status, gateway="other", profile="default", owner_profile="default",
++               wait_observation={"parked_agent": False, "orphan_reason": None}, **fields)
++    db.execute("INSERT INTO replica VALUES(?,?,?,?,?)", ("other", "tasks", f"default/default/{TID}", json.dumps(row), 1))
++    db.commit()
++
++
++@pytest.mark.parametrize("status,rc", [("done", 0), ("archived", 0), ("blocked", 0), ("running", 1), ("scheduled", 1)])
++def test_fallback_status_including_terminal_records(replica, status, rc):
++    put(replica, status)
++    code, text = wait.check_remote("other", "task", TID)
++    assert code == rc, text
++    assert text.split()[:2] == [TID, status]
++
++
++def test_missing_and_stale_are_errors(replica):
++    assert wait.check_remote("other", "task", TID)[0] == 2
++    put(replica, "done")
++    replica.execute("UPDATE replica SET data=? WHERE coll='gateway'", (json.dumps({"task_scopes": [{"profile": "default", "board": "default", "state": "ok", "observed_at": 1}]}),))
++    replica.commit()
++    code, text = wait.check_remote("other", "task", TID)
++    assert code == 2 and "stale" in text
++
++
++def test_since_and_until_preserved(replica):
++    put(replica, "done")
++    assert wait.check_remote("other", "task", TID, since=("done",))[0] == 1
++    assert wait.check_remote("other", "task", TID, until=("blocked",))[0] == 1
++
++
++def test_confirmation_accepts_live_but_rejects_orphan(replica):
++    put(replica, "running")
++    awaiting.confirm_remote(dict(kind="card", ref=TID, gateway="other"))
++    replica.execute("DELETE FROM replica WHERE coll='tasks'")
++    put(replica, "blocked", human_request=None, block_kind="transient")
++    with pytest.raises(awaiting.AwaitingError):
++        awaiting.confirm_remote(dict(kind="card", ref=TID, gateway="other"))
++
++
++def test_handrolled_replica_probe_refused(monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    cmd = f"hermes-hub tasks --gw other --json | python3 -c 'print(\"{TID}\")'"
++    error = wake.dry_run_error(cmd)
++    assert error and "hermes kanban wait-check task" in error
++
++
++def test_qualified_wins_over_legacy_and_legacy_alone_is_unknown(replica):
++    put(replica, "done")
++    replica.execute("INSERT INTO replica VALUES(?,?,?,?,?)", ("other", "tasks", f"default/{TID}", json.dumps(dict(id=TID, board="default", status="running")), 1))
++    replica.commit()
++    assert wait.check_remote("other", "task", TID)[0] == 0
++    replica.execute("DELETE FROM replica WHERE key=?", (f"default/default/{TID}",))
++    replica.commit()
++    assert wait.check_remote("other", "task", TID)[0] == 2
++
++
++@pytest.mark.parametrize("failure", [OSError("no ssh"), subprocess.TimeoutExpired("ssh", 25)])
++def test_transport_exceptions_fall_back(replica, monkeypatch, failure):
++    put(replica, "done")
++    def fail(*a, **kw):
++        raise failure
++    monkeypatch.setattr(wait.subprocess, "run", fail)
++    assert wait.check_remote("other", "task", TID)[0] == 0
++
++
++@pytest.mark.parametrize("status", ["archived", "triage"])
++def test_non_live_confirmation(replica, status):
++    put(replica, status)
++    with pytest.raises(awaiting.AwaitingError):
++        awaiting.confirm_remote(dict(kind="card", ref=TID, gateway="other"))
++
++
++def test_scheduled_evidence_missing_is_error_and_orphan_wakes(replica):
++    put(replica, "scheduled")
++    row = json.loads(replica.execute("SELECT data FROM replica WHERE coll='tasks'").fetchone()[0])
++    row.pop("wait_observation")
++    replica.execute("UPDATE replica SET data=? WHERE coll='tasks'", (json.dumps(row),))
++    replica.commit()
++    assert wait.check_remote("other", "task", TID)[0] == 2
++    row["wait_observation"] = dict(parked_agent=True, orphan_reason="parked with no producer")
++    replica.execute("UPDATE replica SET data=? WHERE coll='tasks'", (json.dumps(row),))
++    replica.commit()
++    assert wait.check_remote("other", "task", TID)[0] == 0
++    with pytest.raises(awaiting.AwaitingError):
++        awaiting.confirm_remote(dict(kind="card", ref=TID, gateway="other"))
++
++
++def test_automatic_probe_since_status(replica, monkeypatch, capsys):
++    from argparse import Namespace
++    put(replica, "done")
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_PROBE", "1")
++    monkeypatch.setattr(wait, "handled_status", lambda *a: "done")
++    assert wait.run(Namespace(check="task", target=TID, gateway="other", board=None, until=None, since=None)) == 1
++    assert "unchanged since park" in capsys.readouterr().out
++
++
++def test_scope_and_identity_fail_closed(replica):
++    put(replica, "done")
++    assert wait.check_remote("other", "task", TID, board="elsewhere")[0] == 2
++    assert wait.check_remote("elsewhere", "task", TID)[0] == 2
++    replica.execute("DELETE FROM replica WHERE coll='gateway'")
++    replica.commit()
++    assert wait.check_remote("other", "task", TID)[0] == 2
++
++
++def test_supported_probe_allowed(monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    assert wake.dry_run_error(f"hermes kanban wait-check task {TID} --gateway other") is None
++
++
++def test_owner_collector_publishes_wait_evidence(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    kb.init_db()
++    from hermes_cli.kanban_db_connect import connect
++    conn = connect()
++    try:
++        tid = kb.create_task(conn, title="collector fixture", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, "scheduled", {"reason": "denied access; needs permission"})
++        conn.execute("BEGIN")
++        row = observe_owner_task(conn, dict(id=tid, status="scheduled", gateway="other", profile="default", board="default"), now=time.time())
++        assert row["wait_observation"]["orphan_reason"]
++        assert row["wait_observation"]["parked_agent"] is True
++        conn.rollback()
++        rc, out = wait.check_local("task", tid)
++        assert "orphan producer" in out or "agent-owned park:" in out
++        monkeypatch.setattr(wait.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, rc, out, ""))
++        with pytest.raises(awaiting.AwaitingError):
++            awaiting.confirm_remote(dict(kind="card", ref=tid, gateway="other"))
++    finally:
++        conn.close()
+-- 
+2.55.0
+

@@ -16,6 +16,9 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-wait-replica.md](kanban-wait-replica.md) | 0658 | Unreachable SSH card waits use fresh owner-qualified replica rows; missing/stale evidence errors, orphan producers are refused, and automatic probes share the route. |
+| [live-git-config-test-isolation.md](live-git-config-test-isolation.md) | 0657 | Tests scrub inherited Git location overrides and restore modified live core.bare values. |
+| [display-transcript-compression.md](display-transcript-compression.md) | 0656 | Display-only transcript responses omit redundant provider fields and support gzip over the Desktop transport. |
 | [borrowed-home-bootstrap.md](borrowed-home-bootstrap.md) | 0655 | Bootstrap checkout dependencies before isolated borrowed-home user code; avoid re-exec on the store interpreter. |
 | [kanban-pin-provider.md](kanban-pin-provider.md) | 0653 | Bind concrete model pins to a serving provider at create/set time; refuse missing or ambiguous providers; resolve legacy NULL-provider pins at dispatch. |
 | [kanban-board-recovery.md](kanban-board-recovery.md) | 0633–0637 0639–0640 0648–0649 0652 | Out-of-process table b-tree salvage and in-place SQLite backup install, tombstone-aware reconcile, shared recovery lock with holder identity, contention/deleted-sidecar refusal and forensic reports. |

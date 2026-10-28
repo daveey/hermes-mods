@@ -1,0 +1,231 @@
+From c431bbb32e8461b9ef31541cb1c161de50c293d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:24:24 -0700
+Subject: [PATCH 657/658] fix(tests): live git config guard restores core.bare;
+ tests never inherit the caller's GIT_DIR [daveey]
+
+2026-10-27 23:11 the live install's shared .git/config read core.bare=true (the [core] block a git
+reinit writes), and the next core update died with 'this operation must be run in a work tree'. The
+writer is not in any log; verified mechanisms are 'git init --bare' with no path while GIT_DIR (or
+--git-dir, or the cwd) names an existing repo. Tests in the tree use that form with cwd=tmp, so an
+inherited GIT_DIR turns them into a reinit of the real repo. The per-test environment now drops
+GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_COMMON_DIR/GIT_OBJECT_DIRECTORY/GIT_ALTERNATE_OBJECT_DIRECTORIES,
+and the live-config guard snapshots core.bare next to user.*, restores any changed value (not only
+added keys) and fails the test by name. Four new tests fail on the old conftest.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/conftest.py                             | 45 +++++++---
+ tests/test_live_git_config_guard.py           |  5 +-
+ tests/test_live_git_config_guard_core_bare.py | 83 +++++++++++++++++++
+ 3 files changed, 119 insertions(+), 14 deletions(-)
+ create mode 100644 tests/test_live_git_config_guard_core_bare.py
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 923bf6aabd..0a146c28a9 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -280,6 +280,12 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
+     for name in _HERMES_BEHAVIORAL_VARS:
+         monkeypatch.delenv(name, raising=False)
+ 
++    # 2b. Git repository location inherited from the caller (a git hook, a shell that exported it).
++    # With GIT_DIR set, a test's ``git init --bare <tmp>`` reinitializes THAT repo instead: on
++    # 2026-10-27 the live install's shared .git/config was flipped to core.bare=true this way.
++    for name in _GIT_LOCATION_VARS:
++        monkeypatch.delenv(name, raising=False)
++
+     # Honcho's fallback host/config resolution legitimately reads the user's
+     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
+     # on it), but pin the host so ordinary tests cannot inherit a developer's
+@@ -487,6 +493,11 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
+     monkeypatch.setattr(_kbd_mod, "_system_memory_sample", dict, raising=False)
+ 
+ 
++_GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
++                      "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
++# Entries a test must never change in a live checkout's shared config: identity (later commits get
++# authored as a fixture) and core.bare (every worktree and ``hermes update`` then refuse to run).
++_GUARDED_GIT_KEYS = r"^(user\..*|core\.bare)$"
+ _LIVE_GIT_CONFIGS: list | None = None
+ # Teardown may run before monkeypatch restores a test's deliberately empty PATH.
+ _GUARD_PATH = os.environ.get("PATH", os.defpath)
+@@ -532,17 +543,24 @@ def _plain_run(argv: list):
+ 
+ 
+ def _read_bytes_or_none(path: Path):
+-    """Identity (``user.*``) entries of a git config file, or None if it is absent.
++    """Guarded (``user.*``, ``core.bare``) entries of a git config file, or None if it is absent.
+ 
+     Read through ``git config --file`` so the in-process home-I/O guard is not
+-    involved. Only ``user.*`` is compared: branch/remote entries in the shared
++    involved. Only guarded keys are compared: branch/remote entries in the shared
+     config legitimately change whenever any worktree or branch is created.
+     """
+-    import subprocess
+-
+     if _plain_run(["test", "-f", str(path)])[0] != 0:
+         return None
+-    return _plain_run(["git", "config", "--file", str(path), "--get-regexp", r"^user\."])[1]
++    return _plain_run(["git", "config", "--file", str(path), "--get-regexp", _GUARDED_GIT_KEYS])[1]
++
++
++def _config_entries(raw) -> dict:
++    """``{key: [values]}`` from ``git config --get-regexp`` output."""
++    entries: dict = {}
++    for ln in (raw or b"").splitlines():
++        key, _, value = ln.partition(b" ")
++        entries.setdefault(key.decode(), []).append(value.decode())
++    return entries
+ 
+ 
+ def _assert_git_configs_unchanged(snapshots: dict) -> None:
+@@ -553,16 +571,19 @@ def _assert_git_configs_unchanged(snapshots: dict) -> None:
+         if after == before:
+             continue
+         changed.append(str(path))
+-        before_keys = {ln.split(b" ", 1)[0] for ln in (before or b"").splitlines()}
+-        for ln in (after or b"").splitlines():
+-            key = ln.split(b" ", 1)[0]
+-            if key not in before_keys:
+-                _plain_run(["git", "config", "--file", str(path), "--unset-all", key.decode()])
++        old, new = _config_entries(before), _config_entries(after)
++        for key in set(old) | set(new):
++            if old.get(key) == new.get(key):
++                continue
++            # Put every changed guarded key back exactly as it was: unset, then re-add the old values.
++            _plain_run(["git", "config", "--file", str(path), "--unset-all", key])
++            for value in old.get(key, []):
++                _plain_run(["git", "config", "--file", str(path), "--add", key, value])
+     if changed:
+         pytest.fail(
+-            "test wrote user.* into a live checkout's git config (removed): "
++            "test wrote user.* or core.bare into a live checkout's git config (restored): "
+             + ", ".join(changed)
+-            + " - run git config only inside a tmp_path repo",
++            + " - run git only inside a tmp_path repo, and never with an inherited GIT_DIR",
+             pytrace=False,
+         )
+ 
+diff --git a/tests/test_live_git_config_guard.py b/tests/test_live_git_config_guard.py
+index 8f22e57c30..43002ae134 100644
+--- a/tests/test_live_git_config_guard.py
++++ b/tests/test_live_git_config_guard.py
+@@ -22,6 +22,7 @@ def test_guard_teardown_with_mocked_popen(tmp_path, monkeypatch, fake_kind, muta
+     monkeypatch.setattr(guard, "_live_git_config_paths", lambda: [cfg])
+     request = SimpleNamespace(node=SimpleNamespace(get_closest_marker=lambda name: None, stash=pytest.Stash()))
+     guard._live_git_config_guard.__wrapped__(request)
++    pristine = guard._read_bytes_or_none(cfg)
+     if mutate:
+         subprocess.run([
+             "git", "config", "--file", str(cfg), "user.email", "fixture@example.invalid",
+@@ -42,7 +43,7 @@ def test_guard_teardown_with_mocked_popen(tmp_path, monkeypatch, fake_kind, muta
+         if mutate:
+             with pytest.raises(pytest.fail.Exception, match="test wrote user.* into a live checkout"):
+                 guard._check_live_git_configs(request.node)
+-            assert guard._read_bytes_or_none(cfg) == b""
++            assert guard._read_bytes_or_none(cfg) == pristine
+         else:
+             guard._check_live_git_configs(request.node)
+ 
+@@ -60,7 +61,7 @@ def test_guard_teardown_survives_empty_path(tmp_path, monkeypatch, mutate):
+         if mutate:
+             with pytest.raises(pytest.fail.Exception, match="test wrote user"):
+                 _assert_git_configs_unchanged(snapshots)
+-            assert _read_bytes_or_none(cfg) == b""
++            assert _read_bytes_or_none(cfg) == snapshots[cfg]
+         else:
+             _assert_git_configs_unchanged(snapshots)
+ 
+diff --git a/tests/test_live_git_config_guard_core_bare.py b/tests/test_live_git_config_guard_core_bare.py
+new file mode 100644
+index 0000000000..74a842cbc9
+--- /dev/null
++++ b/tests/test_live_git_config_guard_core_bare.py
+@@ -0,0 +1,83 @@
++"""The conftest guard also restores core.bare, and tests never inherit a caller's GIT_DIR.
++
++2026-10-27: something ran ``git init --bare`` with the live install's repository as its target
++(``git init --bare`` with no path and an inherited GIT_DIR does exactly that), the shared .git/config read core.bare=true, and every
++worktree and ``hermes update`` failed with "this operation must be run in a work tree".
++"""
++
++import os
++import subprocess
++import sys
++
++import pytest
++
++from tests.conftest import _assert_git_configs_unchanged, _read_bytes_or_none
++
++
++def _init(path):
++    subprocess.run(["git", "init", "-q", str(path)], check=True)
++    return path / ".git" / "config"
++
++
++def _bare(cfg):
++    return subprocess.run(["git", "config", "--file", str(cfg), "core.bare"],
++                          capture_output=True, text=True, check=False).stdout.strip()
++
++
++def test_guard_restores_core_bare_and_fails(tmp_path):
++    cfg = _init(tmp_path)
++    snapshots = {cfg: _read_bytes_or_none(cfg)}
++    subprocess.run(["git", "config", "--file", str(cfg), "core.bare", "true"], check=True)
++
++    with pytest.raises(pytest.fail.Exception, match="core.bare into a live checkout"):
++        _assert_git_configs_unchanged(snapshots)
++    assert _bare(cfg) == "false"
++
++
++def test_bare_init_through_an_inherited_git_dir_is_caught(tmp_path):
++    """The mechanism: ``git init --bare`` with no path and GIT_DIR set reinitializes GIT_DIR as bare
++    (``_run(["git", "init", "--bare"], cwd=bare)`` in a test that inherited the caller's GIT_DIR)."""
++    live = tmp_path / "live"
++    cfg = _init(live)
++    snapshots = {cfg: _read_bytes_or_none(cfg)}
++    env = {**os.environ, "GIT_DIR": str(live / ".git")}
++    store = tmp_path / "store"
++    store.mkdir()
++    subprocess.run(["git", "init", "-q", "--bare"], check=True, env=env, cwd=store)
++    assert _bare(cfg) == "true", "git reinitialized the GIT_DIR repo, not the path"
++
++    with pytest.raises(pytest.fail.Exception, match="core.bare"):
++        _assert_git_configs_unchanged(snapshots)
++    assert _bare(cfg) == "false"
++
++
++def test_guard_restores_a_changed_identity_value(tmp_path):
++    cfg = _init(tmp_path)
++    subprocess.run(["git", "config", "--file", str(cfg), "user.email", "real@example.invalid"], check=True)
++    snapshots = {cfg: _read_bytes_or_none(cfg)}
++    subprocess.run(["git", "config", "--file", str(cfg), "user.email", "fixture@example.invalid"], check=True)
++
++    with pytest.raises(pytest.fail.Exception, match="wrote user"):
++        _assert_git_configs_unchanged(snapshots)
++    assert subprocess.run(["git", "config", "--file", str(cfg), "user.email"],
++                          capture_output=True, text=True, check=False).stdout.strip() == "real@example.invalid"
++
++
++@pytest.mark.skipif(os.environ.get("HERMES_GIT_SCRUB_PROBE") != "1", reason="probe for the test below")
++def test_probe_sees_no_inherited_git_location():
++    assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"} & set(os.environ)
++
++
++def test_tests_do_not_inherit_the_callers_git_dir(tmp_path):
++    repo = tmp_path / "caller"
++    _init(repo)
++    env = {**os.environ, "HERMES_GIT_SCRUB_PROBE": "1", "GIT_DIR": str(repo / ".git"),
++           "GIT_WORK_TREE": str(repo), "GIT_INDEX_FILE": str(repo / ".git" / "index")}
++    env.pop("PYTEST_XDIST_WORKER", None)
++    result = subprocess.run(
++        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:randomly",
++         f"{__file__}::test_probe_sees_no_inherited_git_location"],
++        capture_output=True, text=True, env=env, cwd=os.path.dirname(os.path.dirname(__file__)), timeout=300,
++        check=False,
++    )
++    assert "1 passed" in result.stdout, result.stdout[-2000:] + result.stderr[-2000:]
+-- 
+2.55.0
+
