@@ -50,6 +50,25 @@ def test_allows_reads_and_helper():
         assert not blocked("terminal", command=cmd), cmd
 
 
+def test_fd_redirections_are_not_crontab_args():
+    # `2>/dev/null` used to be read as a file argument "2", so a plain read was blocked.
+    for cmd in [
+        "crontab -l 2>/dev/null",
+        "crontab -l 2>/dev/null | grep merge_queue | head -2",
+        "crontab -l 2>&1 | head",
+        "crontab -u daveey -l 2> /dev/null",
+        "ssh mini 'crontab -l 2>/dev/null | grep x'",
+    ]:
+        assert not blocked("terminal", command=cmd), cmd
+    for cmd in [
+        "crontab 2>/dev/null",  # no args: installs from stdin
+        "crontab -l 2>/dev/null | crontab -",
+        "crontab /tmp/new.cron 2>/dev/null",
+        "crontab -r 2>&1",
+    ]:
+        assert blocked("terminal", command=cmd), cmd
+
+
 def test_python_and_nested_calls():
     assert blocked("execute_code", code='subprocess.run(["crontab", "-"], input=t)')
     assert blocked("execute_code", code="os.system('crontab /tmp/x')")

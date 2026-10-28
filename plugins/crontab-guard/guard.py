@@ -17,7 +17,8 @@ HELPER = Path(__file__).resolve().parent / "crontab_line.py"
 HELPER_DISPLAY = str(HELPER).replace(str(Path.home()), "~")
 
 # A crontab command word, not part of crontab_line / crontab-guard / file names like x.crontab.
-SHELL_CRONTAB = re.compile(r"(?<![\w.\-/])(?:/usr/bin/)?crontab(?![\w.\-/])((?:[ \t]+[^\s;&|<>()`]+)*)")
+# Argument tokens stop at an fd redirection (`2>/dev/null`, `2>&1`): its digits are not a file argument.
+SHELL_CRONTAB = re.compile(r"(?<![\w.\-/])(?:/usr/bin/)?crontab(?![\w.\-/])((?:[ \t]+(?!\d+[<>])[^\s;&|<>()`]+)*)")
 READ_ONLY = re.compile(r"^\s*(?:-u\s+\S+\s+)?-l\s*$")
 # Python: "crontab" (or "/usr/bin/crontab") as a string literal, e.g. subprocess.run(["crontab", "-"]).
 PY_CRONTAB = re.compile(r"""["'](?:/usr/bin/)?crontab["']\s*(?:,\s*["']([^"']*)["'])?""")
