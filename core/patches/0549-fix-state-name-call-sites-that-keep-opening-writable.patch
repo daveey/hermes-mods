@@ -1,0 +1,126 @@
+From 068660dc1c2b7e9703cbd728bd699224d678514b Mon Sep 17 00:00:00 2001
+From: x <x@example.com>
+Date: Tue, 27 Oct 2026 18:27:50 -0700
+Subject: [PATCH] fix(state): name call sites that keep opening writable
+ SessionDB handles [daveey]
+
+A writable SessionDB() runs schema init plus the deleted-WAL holder scan
+(on macOS, every open file of every process): ~58 ms CPU vs ~1 ms read-only.
+A plugin that opened one per sidebar poll (23 per pass) held the Desktop
+backend near 100% CPU for hours on 2026-10-27, and nothing in the logs
+pointed at the caller.
+
+Count writable constructions per _creation_site; a site with 30+ in 60 s
+gets one WARNING (re-armed every 10 min) naming it and the read-only /
+registry alternatives. Read-only opens are not counted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state.py                               | 35 ++++++++++++++++
+ .../hermes_state/test_writable_open_guard.py  | 41 +++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+ create mode 100644 tests/hermes_state/test_writable_open_guard.py
+
+diff --git a/hermes_state.py b/hermes_state.py
+index e50b059a13..2dddc221bd 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -447,6 +447,40 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> Optional[Path]
+ 
+ # Process-wide shared SessionDB registry: long-lived in-process callers share ONE writer
+ # connection per resolved path via hermes_state_registry.acquire(); one-shots use SessionDB() + close().
++# Hot-path writable opens: each writable SessionDB() runs schema init plus, before connect, the deleted-WAL holder
++# scan (on macOS every open file of every process: ~60 ms CPU per open, vs ~1 ms read-only). A caller that opens one
++# per poll held the Desktop backend near 100% CPU for hours (chat-closeout lineage reads, 23 per sidebar poll).
++# Count writable opens per call site and name a site that keeps doing it.
++_WRITABLE_OPEN_WINDOW_S = 60.0
++_WRITABLE_OPEN_WARN_COUNT = 30
++_WRITABLE_OPEN_WARN_INTERVAL_S = 600.0
++_writable_opens: dict[str, deque] = {}
++_writable_open_warned: dict[str, float] = {}
++_writable_opens_lock = threading.Lock()
++
++
++def _note_writable_open(site: str, now: Optional[float] = None) -> bool:
++    """Record one writable open from *site*; warn (at most every 10 min per site) when it opened
++    ``_WRITABLE_OPEN_WARN_COUNT`` or more within ``_WRITABLE_OPEN_WINDOW_S``. True when it warned."""
++    now = time.monotonic() if now is None else now
++    with _writable_opens_lock:
++        times = _writable_opens.setdefault(site, deque())
++        times.append(now)
++        while now - times[0] > _WRITABLE_OPEN_WINDOW_S:
++            times.popleft()
++        count = len(times)
++        last = _writable_open_warned.get(site)
++        if count < _WRITABLE_OPEN_WARN_COUNT or (last is not None and now - last < _WRITABLE_OPEN_WARN_INTERVAL_S):
++            return False
++        _writable_open_warned[site] = now
++    logger.warning(
++        "%d writable SessionDB() opens in %.0fs from %s; each runs schema init and a system-wide holder scan. "
++        "Reads belong on SessionDB(read_only=True) (closed after use); a long-lived writer on "
++        "hermes_state_registry.acquire().", count, _WRITABLE_OPEN_WINDOW_S, site,
++    )
++    return True
++
++
+ def _foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
+     """Compatibility delegate to the state-holder authority."""
+     return _state_holders.foreign_state_db_holders(db_path)
+@@ -655,6 +689,7 @@ class SessionDB(
+                 # late cleanup must not import ctypes or look up it in a cleared module dictionary.
+                 if not _close_time_checkpoint_configurable():
+                     self._retire_connection = _prepare_connection_retirement()
++                _note_writable_open(self._creation_site)
+                 self._open_writer()
+             self._record_db_file_identity()
+             initialization_complete = True
+diff --git a/tests/hermes_state/test_writable_open_guard.py b/tests/hermes_state/test_writable_open_guard.py
+new file mode 100644
+index 0000000000..4b5d2cf5bd
+--- /dev/null
++++ b/tests/hermes_state/test_writable_open_guard.py
+@@ -0,0 +1,41 @@
++"""A call site that keeps opening writable SessionDB() handles is named in the log (hot-path writable-open guard)."""
++import logging
++
++import pytest
++
++import hermes_state
++
++
++@pytest.fixture(autouse=True)
++def _fresh_counters(monkeypatch):
++    monkeypatch.setattr(hermes_state, "_writable_opens", {})
++    monkeypatch.setattr(hermes_state, "_writable_open_warned", {})
++
++
++def test_warns_once_per_interval_when_a_site_reaches_the_threshold(caplog):
++    caplog.set_level(logging.WARNING, logger="hermes_state")
++    n = hermes_state._WRITABLE_OPEN_WARN_COUNT
++    warned = [hermes_state._note_writable_open("plugin.poll:12", now=100.0 + i * 0.1) for i in range(n + 5)]
++    assert warned.index(True) == n - 1 and warned.count(True) == 1
++    assert "plugin.poll:12" in caplog.text and "read_only=True" in caplog.text
++    # Still hot after the quiet interval: named again.
++    later = 100.0 + hermes_state._WRITABLE_OPEN_WARN_INTERVAL_S + 1
++    assert [hermes_state._note_writable_open("plugin.poll:12", now=later + i * 0.1) for i in range(n)][-1]
++
++
++def test_spread_out_or_distinct_sites_stay_quiet():
++    n = hermes_state._WRITABLE_OPEN_WARN_COUNT
++    window = hermes_state._WRITABLE_OPEN_WINDOW_S
++    assert not any(hermes_state._note_writable_open("cli.oneshot:1", now=i * (window / (n - 1) + 1)) for i in range(n * 2))
++    assert not any(hermes_state._note_writable_open(f"site:{i}", now=1.0) for i in range(n * 2))
++
++
++def test_writable_sessiondb_counts_its_caller_and_read_only_does_not(tmp_path):
++    db_path = tmp_path / "state.db"
++    hermes_state.SessionDB(db_path=db_path).close()
++    sites = list(hermes_state._writable_opens)
++    assert len(sites) == 1 and sites[0].endswith(
++        "test_writable_sessiondb_counts_its_caller_and_read_only_does_not:" + sites[0].rsplit(":", 1)[1]
++    )
++    hermes_state.SessionDB(db_path=db_path, read_only=True).close()
++    assert list(hermes_state._writable_opens) == sites and len(hermes_state._writable_opens[sites[0]]) == 1
+-- 
+2.55.0
+

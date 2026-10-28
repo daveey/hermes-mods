@@ -297,8 +297,7 @@ def _server():
 def _lineage(sid: str) -> list[str]:
     ids = [sid]
     try:
-        from hermes_state import SessionDB
-        tip = SessionDB().get_compression_tip(sid)
+        tip = _compression_tip(sid)
         if tip and tip not in ids:
             ids.append(tip)
     except Exception:
@@ -396,8 +395,15 @@ def wake_log() -> "owner_wake.WakeLog":
 
 
 def _compression_tip(sid: str) -> Optional[str]:
+    """Read-only and closed. The sidebar's waiting pass asks once per finished card, and a writable SessionDB()
+    runs schema init plus a system-wide open-file scan (~60 ms CPU) and was never closed: 23 of them per sidebar
+    poll held the Desktop backend near 100% CPU (core/backend-writable-open-guard.md)."""
     from hermes_state import SessionDB
-    return SessionDB().get_compression_tip(sid)
+    db = SessionDB(read_only=True)
+    try:
+        return db.get_compression_tip(sid)
+    finally:
+        db.close()
 
 
 def owner_wake_tick(*, now: Optional[float] = None, cards: Optional[list[dict]] = None,
