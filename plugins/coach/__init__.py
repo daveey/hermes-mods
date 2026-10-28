@@ -375,6 +375,21 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             m = s1.mode()
             screen = ((lambda cands: s1.reply_screen(cands, ask, log_lines, final_response, rc.profile_text()))
                       if m != "off" else None)
+            judged = {}
+
+            def draft_ref() -> dict:
+                """Store the judged draft once per turn (drafts.py: redacted, capped) and return the field that links a
+                reply_nudge / report_only_confirm event to it. Empty when the store is off or fails."""
+                if "id" not in judged:
+                    try:
+                        dr = _load("drafts")
+                        judged["id"] = dr.Drafts(store.root, clock=store.clock).put(
+                            dr.new_id(), session_id=session_id, ask=ask, draft=final_response, platform=platform)
+                    except Exception as exc:
+                        log.debug("coach drafts: %s", exc)
+                        judged["id"] = None
+                return {"draft_id": judged["id"]} if judged.get("id") else {}
+
             def confirm():
                 """report_only second opinion on the strong model (aux task coach_report_only) with the turn's real
                 tool arguments. None = not made (off, daily cap reached, error): the screen's own p decides."""
@@ -392,7 +407,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), final_response))
                 res = rc.parse_confirm(raw)
                 store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
-                           "p": res[0] if res else None, "evidence": res[1] if res else ""})
+                           "p": res[0] if res else None, "evidence": res[1] if res else "", **draft_ref()})
                 return res
 
             hit = rc.check(final_response, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
@@ -410,19 +425,20 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     v = hit["verdict"]
                     rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response)
                             and v.get(r, 0) >= rc.rule_threshold(r, v, cfg.get("thresholds") or {}, cfg["threshold"])
-                            and r != "unwatched" and not (r == "report_only" and rc.scope_limited(ask))]
+                            and r != "unwatched" and not (r == "report_only" and rc.report_only_guard(ask, final_response))]
                     hit = None
                     if rest:
                         r = max(rest, key=lambda x: v[x])
                         hit = {"rule": r, "p": v[r], "evidence": v["evidence"],
                                "nudge": rc.nudge_for(r, v["evidence"], kanban_down=kanban_down)}
             if not hit:
+                guard = rc.report_only_guard(ask, final_response)
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
-                           "candidates": rc.prefilter(final_response)})
+                           "candidates": rc.prefilter(final_response), **({"guard": guard} if guard else {})})
                 return None
             store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
                        "p": hit["p"], "evidence": hit["evidence"],
-                       **({"reason": hit["reason"]} if hit.get("reason") else {})})
+                       **({"reason": hit["reason"]} if hit.get("reason") else {}), **draft_ref()})
             return {"action": "continue", "message": hit["nudge"]}
         except Exception as exc:
             log.debug("coach pre_verify: %s", exc)

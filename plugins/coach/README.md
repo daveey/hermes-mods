@@ -128,6 +128,22 @@ session" without checking it; the judge scored that reply 0.60 and 0.75 against 
 explicit scope-limit guard and `COACH_REPLY_RULES` without `report_only` turn it off.
 Six explicit scope-limit fixtures (`tests/fixtures/report_only_scope_limits.json`) never fire; the deterministic
 `scope_limited()` guard drops them and the judge alone scores them <= 0.1.
+Scheduled-wait exemption (deterministic, no AI call): a pure status question ("is this session done? it was green but
+not anymore", "what's left?", "status?", with no action verb such as "fix/finish it", "can you", "please") answered
+by a reply whose last 1,500 chars name a timed or scheduled wait (scheduled, parked, wakes at/on, retention, soak
+window, cooldown, by design) and NO failure-shaped word (fail, error, broken, timing out, stuck, stale, blocked,
+not merged...) drops report_only and status_only before the judge; `reply_checked` logs `guard=scheduled_wait`. The
+judge and second-opinion prompts also score such a legitimate wait low. Built from live audit t_01a17f79ade9cbdd
+(a nudge on a scheduled retention card sent the agent into a needless investigation); fixtures in
+`tests/fixtures/report_only_scheduled_wait.json`, where the failed-soak "Desktop app is still timing out" and
+failing-tests-left-in-the-queue positives keep firing. Thresholds were not retuned.
+Judged drafts (`drafts.py`): every `reply_nudge` and `report_only_confirm` event carries a `draft_id`; the judged
+reply and the user's ask behind it are in `<HERMES_HOME>/coach/drafts.jsonl` (one record per judged turn, shared by
+both events), so a nudge stays auditable after later turns overwrite the session's last reply. Only the ask (1,500
+chars) and the reply (6,000 chars) are kept, never tool calls or outputs, both through core's
+`redact_sensitive_text(force=True)` plus a local pattern fallback. Capped at 2 MB and 30 days
+(`COACH_DRAFTS_MAX_BYTES`, `COACH_DRAFTS_MAX_AGE_DAYS`; oldest dropped first); `COACH_DRAFTS=off` disables it. Read
+one back: `drafts.Drafts(<coach dir>).for_event(<log record>)`, or `grep <draft_id> ~/.hermes/coach/drafts.jsonl`.
 Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` and `COACH_REPLY_THRESHOLDS`
 (`rule=th,...` per-rule overrides; defaults `report_only=0.5` for the second opinion, `report_only_screen=0.85`). Needs core
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
@@ -666,6 +682,8 @@ Both calls fail open when coach isn't loaded.
 - `signals.py`: the machine-signal sweeper, forwarder and monitor router (stdlib, Python 3.9+).
 - `agent_rules.py`: the agent-channel rules, plus the signals the user channel needs (subagents, long jobs, bug signatures).
 - `core.py`: the file store under `<HERMES_HOME>/coach/` (`sessions/<id>.json`, `bugs.jsonl`, `log.jsonl`), the gate, the user-rule evaluation, the briefs (spin-out's transcript reader + aux task `coach`) and stats.
+- `drafts.py`: the redacted, size/age-capped store of judged reply drafts (`drafts.jsonl`) that `reply_nudge` /
+  `report_only_confirm` events link to by `draft_id`.
 - `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the
   neutral reviewer prompt); `eval/second_opinion_replay.py` counts how often each would fire over `state.db`.
 - `stalled_goal.py`: the stalled-goal detector (a chat's delivery card idle while its graph spends runs; a human-wait ancestor frontier is `waiting_on_human`, not a takeover), hook helper

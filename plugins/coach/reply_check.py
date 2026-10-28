@@ -235,6 +235,58 @@ def scope_limited(user_ask: str) -> bool:
     return bool(SCOPE_LIMIT_RE.search(user_ask or ""))
 
 
+# report_only, legitimate scheduled wait (audit t_01a17f79ade9cbdd, session 20261025_182511_c46056): the user asked a
+# status question ("is this session done? it was green but not anymore") and the only open item in the reply was a
+# card parked on purpose (a scheduled retention card). The nudge pushed the agent into a needless investigation.
+# Deterministic, recall-safe: it applies only when the ask is a pure status question (no action verb), the reply names
+# a timed/scheduled wait, and the reply names NO failure-shaped problem at all; anything else goes to the judge.
+STATUS_QUESTION_RE = re.compile(
+    r"\b(?:is|are|was|were)\s+(?:this|it|that|these|those|they|everything|the\s+[\w-]+(?:\s+[\w-]+)?)\s+"
+    r"(?:\w+\s+){0,3}?(?:done|finished|complete|completed|over|green|idle|ready|still\s+(?:running|going|active|open))\b"
+    r"|\bwhy\s+(?:is|isn'?t|did|does)\s+(?:it|this|that|the\s+[\w-]+)\s+(?:\w+\s+){0,3}?"
+    r"(?:not\s+green|no longer green|red|yellow|unfinished|still\s+(?:open|running)|not\s+done)\b"
+    r"|\b(?:it|this|that)\s+was\s+(?:green|done|finished)\b|\bwhat(?:'s|’s| is)\s+(?:left|pending|still open|the status)\b"
+    r"|\bstatus\s*\?", re.I)
+ACTION_ASK_RE = re.compile(
+    r"\b(?:fix|repair|finish|complete|close|clean\s*up|archive|ship|land|deploy|merge|restart|rerun|retry|"
+    r"unblock|cancel|kill|stop|delete|remove|make|change|update|build|implement|add|do)\s+(?:it|this|that|them|the)\b"
+    r"|\bplease\b[^?]*$|\bcan you\b|\bcould you\b|\bgo ahead\b|\bjust (?:do|finish|fix)\b", re.I)
+SCHEDULED_WAIT_RE = re.compile(
+    r"\bscheduled\b|\bparked\b|\bSCHEDULED_UNTIL\b|\btimed wait\b|\bwakes?\s+(?:up\s+)?(?:at|on|in|by|after)\b"
+    r"|\bwake(?:-| )?(?:time|check)\b|\bretention\b|\bsoak(?:ing)? (?:window|period)\b|\bcool-?down\b"
+    r"|\brelease window\b|\bwaiting (?:until|for (?:its|the|a) (?:wake|timer|window|clock|date|scheduled))\b"
+    r"|\b(?:by|as) designed?\b|\bon purpose\b|\bintentional(?:ly)?\b", re.I)
+# Any of these names a real problem, so the reply is left to the judge (keeps "the Desktop app is still timing out"
+# and failing tests left in a queue firing).
+HARD_PROBLEM_RE = re.compile(
+    r"\bfail\w*|\berror\w*|\bbroken\b|\bbreak(?:s|ing)?\b|\bcrash\w*|\btim(?:ing|ed|es)\s+out\b|\btimeouts?\b"
+    r"|\bhang(?:s|ing)?\b|\bhung\b|\bstuck\b|\bstall\w*|\bstale\b|\bregress\w*|\bbugs?\b|\bexception\w*|\bred\b"
+    r"|\bnot (?:yet )?(?:merged|deployed|fixed|working|running|started|shipped|live)\b|\bblocked\b|\bcorrupt\w*"
+    r"|\bmissing\b|\bwrong\b|\bleak\w*|\bdown\b|\boutage\b|\bdegraded\b|\bflak\w*|\bmisbehav\w*|\boverdue\b"
+    r"|\bshould(?:n't| not) (?:be|have)\b|\bunexpected\w*|\bdidn'?t (?:run|wake|fire|start|finish)\b", re.I)
+
+
+def scheduled_wait_status(user_ask: str, reply: str) -> Optional[str]:
+    """Evidence when a pure status question got a reply whose only open item is a legitimately scheduled wait."""
+    ask = user_ask or ""
+    if not STATUS_QUESTION_RE.search(ask) or ACTION_ASK_RE.search(ask):
+        return None
+    tail = (reply or "")[-1500:]
+    m = SCHEDULED_WAIT_RE.search(tail)
+    if not m or HARD_PROBLEM_RE.search(tail):
+        return None
+    return f"status question; only open item is a scheduled wait (\"{m.group(0)}\")"
+
+
+def report_only_guard(user_ask: str, reply: str) -> Optional[str]:
+    """Why report_only can't apply to this turn ("scope_limited" / "scheduled_wait"), else None."""
+    if scope_limited(user_ask):
+        return "scope_limited"
+    if scheduled_wait_status(user_ask, reply):
+        return "scheduled_wait"
+    return None
+
+
 def prefilter(reply: str) -> list[str]:
     """Which rules this reply is a candidate for (cheap, recall-oriented)."""
     r = reply or ""
@@ -402,7 +454,10 @@ probabilities (0-1):
     AND the tool log shows the send. A bare "the owner/card has it" does not.
   Score it LOW when: the user explicitly limited scope ("analysis only", "just tell me", "plan first", "don't change
   anything"); the problem genuinely needs the user's hands, password, money, a physical device or a decision only
-  they can make, and the message says so; the message is a plan the user asked for; or no unresolved problem is left.
+  they can make, and the message says so; the message is a plan the user asked for; no unresolved problem is left;
+  or the user asked a status question ("is this done?", "why isn't it green?") and the only open item is a card,
+  job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and is
+  working as designed: a legitimate wait is not a problem.
 
 Calibrate: 0.8+ means you'd bet the user will push back ("do it yourself" / "just do it" / "you have access"; for
 report_only: "fix it" / "why aren't you fixing this?").
@@ -423,7 +478,7 @@ owner/card has it" does not.
 Return ONLY one JSON object:
 {"problem": true|false, "agent_fixable": true|false|null, "outcome": "<outcome>", "user_wanted_action": true|false, "quote": "<=20 words from the reply"}
 
-- problem: true if the reply mentions a defect, failure, bug, blocker, stale/wrong state, or something not working or not done that is STILL UNRESOLVED when the reply ends ("not fixed", "still broken", "remaining work", "X is outdated", "Y failed", "waiting on CI"). false if no unresolved problem is mentioned.
+- problem: true if the reply mentions a defect, failure, bug, blocker, stale/wrong state, or something not working or not done that is STILL UNRESOLVED when the reply ends ("not fixed", "still broken", "remaining work", "X is outdated", "Y failed", "waiting on CI"). false if no unresolved problem is mentioned. A card, job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and working as designed is not a problem by itself.
 - agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
@@ -641,7 +696,9 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     (no wake callable = can't tell, so `unwatched` is skipped).
     `screen(candidates) -> {rule: p} | None` (a System One model) drops screened candidates below `screen_below`
     before the LLM judge; when no candidate survives, the LLM is skipped. `shadow` = log only, drop nothing."""
-    scoped = scope_limited(user_ask)
+    # scope limit or a status question answered with a legitimately scheduled wait: report_only (and status_only, whose
+    # walls the scheduled wait is one of) can't apply, so neither the deterministic checks nor the judge see it.
+    scoped = bool(report_only_guard(user_ask, reply))
     if (not only or "report_only" in only) and not scoped:
         phrase = unverified_owner(reply, tool_log)
         if phrase:  # deterministic: no judge call, no AI score at the edge of its bar
