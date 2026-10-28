@@ -1,6 +1,6 @@
 # A down remote fails fast instead of redialing SSH per request
 
-Patch: 0593 (daveey/hermes `59a927377a`). Extends [desktop-remote-update-pause.md](desktop-remote-update-pause.md) (0592), whose gate cached only
+Patch: 0597 (daveey/hermes `59a927377a`). Extends [desktop-remote-update-pause.md](desktop-remote-update-pause.md) (0592), whose gate cached only
 a remote's own-update refusal, to every SSH dial failure a redial seconds later cannot change. Prewarm
 ([desktop-always-on-remote-dashboard.md](desktop-always-on-remote-dashboard.md), 0526/0535) shares the schedule.
 
