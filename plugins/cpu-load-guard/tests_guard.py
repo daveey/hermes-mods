@@ -514,3 +514,23 @@ def test_yaml_replaces_default_host_list(tmp_path, monkeypatch):
     (tmp_path / "cpu-load-guard.yaml").write_text("protected_hosts:\n  - hermes-hub\n")
     assert plugin.guard.enabled()
     assert run("terminal", {"command": INCIDENT_40})["action"] == "block"
+
+
+def test_flat_list_replaces_default_without_pyyaml(tmp_path, monkeypatch):
+    # The Hermes venv has no PyYAML. A missing module must not look like a missing file.
+    monkeypatch.delenv("CPU_LOAD_GUARD_HOSTS")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "cpu-load-guard.yaml").write_text(
+        "# comment\nprotected_hosts:\n  - only-this-host\n"
+    )
+    real_import = __import__("builtins").__import__
+
+    def _no_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ModuleNotFoundError("yaml")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", _no_yaml)
+    monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "hermes-hub")
+    assert plugin.guard.protected_hosts() == ["only-this-host"]
+    assert not plugin.guard.enabled()

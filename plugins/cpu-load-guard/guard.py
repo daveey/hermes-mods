@@ -121,19 +121,53 @@ def _home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
+def _flat_host_list(text: str) -> list[str] | None:
+    """A ``protected_hosts:`` file that is only a flat list, or None if it isn't that shape.
+
+    The Hermes venv has no PyYAML. A missing yaml module must not be treated as a missing
+    file: this parser is what makes a list replace the default on that interpreter.
+    """
+    hosts: list[str] = []
+    seen = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not seen:
+            if line.strip() != "protected_hosts:":
+                return None
+            seen = True
+            continue
+        item = line.strip()
+        if not item.startswith("- "):
+            return None
+        value = item[2:].strip().strip("'\"")
+        if not value:
+            return None
+        hosts.append(value)
+    return hosts if seen else None
+
+
 def protected_hosts() -> list[str]:
     env = os.environ.get("CPU_LOAD_GUARD_HOSTS")
     if env is not None:
         return [h.strip() for h in env.split(",") if h.strip()]
     cfg = _home() / "cpu-load-guard.yaml"
     try:
+        text = cfg.read_text()
+    except OSError:
+        return list(DEFAULT_PROTECTED)
+    flat = _flat_host_list(text)
+    if flat is not None:
+        return flat
+    try:
         import yaml  # type: ignore
 
-        data = yaml.safe_load(cfg.read_text()) or {}
+        data = yaml.safe_load(text) or {}
         hosts = data.get("protected_hosts")
         if isinstance(hosts, list):
             return [str(h) for h in hosts]
-    except Exception:  # missing file, no yaml, bad yaml: fall back to the default
+    except Exception:  # no yaml module, or a shape this parser does not understand
         pass
     return list(DEFAULT_PROTECTED)
 
