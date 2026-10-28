@@ -21,7 +21,7 @@ Run the checker once per wake; schedule the next look with `kanban_continue(resu
 |---|---|
 | merged | verify deployment, then the real end-to-end behavior |
 | conflicting (DIRTY) | repair: rebase/merge base, resolve, push, re-check head |
-| checks_failed | fix the named failing checks |
+| checks_failed | read the failing test names first. If main already fixed them (the PR's head predates the fix), `gh api -X PUT repos/O/R/pulls/N/update-branch -f expected_head_sha=<head>`, then diff base...new head: if the file list is unchanged, the existing review still applies, so hand the merge card the NEW head for `--match-head-commit`. Otherwise fix the PR. |
 | checks_pending | schedule a retry; not a user ask |
 | review_required / changes_requested | request or await a real review; address comments |
 | blocked_unknown | diagnose (rulesets, required checks, queue); do not guess or ask |
