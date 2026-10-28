@@ -4,7 +4,9 @@ under /usr/bin/python3).
 It turns raw machine signals into `self_heal.file_defect` calls with stable fingerprints:
 - errors      new tracebacks in <home>/logs/errors.log (any level), minus tool output and provider transients;
 - hook        plugin hook exceptions (`Hook '<name>' callback <cb> raised: ...` from hermes_cli/plugins_dispatch);
-- cron        a cron job whose sticky `last_failure.at` is newer than the cursor (cron/jobs.json);
+- cron        a cron job whose sticky `last_failure.at` is newer than the cursor (cron/jobs.json), filed only while
+              failure_streak >= cron.failure_nudge_threshold (default 3) or after that many recovered failures in
+              24 h (cursor `cron_fails`); a one-off failure the next run recovered from is only counted;
 - kanban      a card with >= 2 runs that crashed / timed out / failed to spawn (every board db);
 - gateway     gateway crash-restarts: `gateway.previous_unclean_exit`, `asyncio.run.exception`,
               `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log;
