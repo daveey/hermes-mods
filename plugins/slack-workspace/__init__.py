@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 if __package__:
-    from . import core, engage, follow, ownerops
+    from . import core, engage, follow, ownerops, awareness
 else:  # imported outside a package (e.g. pytest collecting this dir)
     import importlib.util as _ilu
     import sys as _sys
@@ -48,6 +48,7 @@ else:  # imported outside a package (e.g. pytest collecting this dir)
     engage = _sib("slack_workspace_engage", "engage.py")
     follow = _sib("slack_workspace_follow", "follow.py")
     ownerops = _sib("slack_workspace_ownerops", "ownerops.py")
+    awareness = _sib("slack_workspace_awareness", "awareness.py")
 
 logger = logging.getLogger(__name__)
 
@@ -1007,6 +1008,20 @@ def register(ctx):
     except Exception:
         root = Path.home() / ".hermes" / "slack-workspace"
     state = STATE.setdefault(str(root), State(root))
+
+    if state.store.policy().get("context_only") is True:
+        # Isolated shared bots need channel awareness, not host-side Slack/admin tools.
+        # Bind auth to THIS profile, never the multiplexed gateway's process environment.
+        def read_api(method, params):
+            if method not in {"conversations.history", "conversations.replies"}:
+                raise ValueError("context-only mode permits history/replies reads only")
+            token = follow.read_env_value(root.parent / ".env", "SLACK_BOT_TOKEN")
+            if not token:
+                raise RuntimeError("profile Slack token missing")
+            return core.call(token, method, params, timeout=5, _retries=0)
+        ctx.register_hook("pre_llm_call", awareness.make_hook(read_api, _session))
+        logger.info("slack-workspace context-only awareness registered for %s", root.parent)
+        return
 
     ctx.register_platform_handler("slack", _make_factory(state))
     ctx.register_hook("pre_llm_call", _make_context_hook(state))
