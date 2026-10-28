@@ -44,7 +44,8 @@ The private repo layout is `<host>/<profile>/<session_id>.json`. Each host write
 
 Digest = session stats (msgs counted from `messages`, since `sessions.message_count` goes stale), cost,
 subagent children folded into the root, user turns (first 10 + last 50, ≤500 chars; each with `prev`, the agent reply before it clipped to its
-first 150 + last 450 chars, v6, for the self-heal backstop judge), tool counts, tool-error
+first 150 + last 450 chars, v6, for the self-heal backstop judge; plus `prev_interrupt` `{reason, waited_s, prompt_tokens}`
+when that reply was a model wait core recorded as interrupted), tool counts, tool-error
 counts, pattern signals, `features` (content-free feature-use counts from tool-call args: kanban_create options,
 todo, cron/profile/board creation, worktrees; v4), and the last reply (≤800 chars). Removed: injected blocks (`<memory-context>`,
 system notes, pasted content), Hermes-written user-role messages (background-process notices, compression

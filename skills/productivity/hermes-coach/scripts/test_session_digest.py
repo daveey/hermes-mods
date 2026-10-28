@@ -162,6 +162,25 @@ class DigestSynthetic(unittest.TestCase):
         self.assertLessEqual(len(second["prev"]), sd.PREV_HEAD + sd.PREV_TAIL + 20)
         self.assertEqual(dg["digest_v"], 6)
 
+    def test_user_turn_after_an_interrupted_model_wait_carries_its_reason(self):
+        """Core stamps display_metadata.interrupt on the interrupted row; the next user turn names why the turn
+        stopped (self-heal agent-38bad5aced: Stop vs backend exit vs reaper were indistinguishable)."""
+        t = time.time() - 100
+        meta = json.dumps({"interrupt": {"reason": "user_stop", "waited_s": 106.6, "prompt_tokens": 320000}})
+        rows = [("user", "do it", t, 1, 0, None, None, "u1"),
+                ("assistant", "Operation interrupted: waiting for model response (106.6s elapsed).", t + 1, 1, 0,
+                 None, meta, "a1"),
+                ("user", "resume", t + 2, 1, 0, None, None, "u2"),
+                ("assistant", "Done.", t + 3, 1, 0, None, None, "a2"),
+                ("user", "thanks, next", t + 4, 1, 0, None, None, "u3")]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        _first, nudge, later = dg["user_turns"]
+        self.assertEqual(nudge["prev_interrupt"], {"reason": "user_stop", "waited_s": 106.6, "prompt_tokens": 320000})
+        self.assertNotIn("prev_interrupt", later)  # a real reply after it clears the reason
+
 
 class ExcludeProfileGlob(unittest.TestCase):
     def test_glob_drops_follower_profile(self):

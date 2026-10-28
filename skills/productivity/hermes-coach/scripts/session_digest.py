@@ -222,7 +222,9 @@ def transcript(con, sid, mcols):
         where += " and coalesce(display_kind, '') <> 'hidden'"
     uid = "message_uid" if "message_uid" in mcols else "NULL"
     active = "active" if "active" in mcols else "1"
-    rows = con.execute(f"""select role, content, tool_name, tool_calls, timestamp, {uid} as uid, {active} as live
+    meta = "display_metadata" if "display_metadata" in mcols else "NULL"
+    rows = con.execute(f"""select role, content, tool_name, tool_calls, timestamp, {uid} as uid, {active} as live,
+                                  {meta} as meta
                            from messages where {where} order by {order}""", (sid,)).fetchall()
     # Prefer the live copy of a uid, else its first compacted copy; keep the first position seen.
     best, order_keys = {}, []
@@ -234,6 +236,19 @@ def transcript(con, sid, mcols):
         elif r["live"] and not best[k]["live"]:
             best[k] = r
     return [best[k] for k in order_keys]
+
+
+def _interrupt_meta(raw):
+    """``{reason, waited_s, prompt_tokens}`` from a row's display_metadata JSON when core recorded why a model
+    wait was interrupted (user_stop, backend_exit, ws_orphan, ...); else None."""
+    try:
+        d = json.loads(raw) if isinstance(raw, str) and raw else None
+    except ValueError:
+        return None
+    i = d.get("interrupt") if isinstance(d, dict) else None
+    if not isinstance(i, dict) or not i.get("reason"):
+        return None
+    return {"reason": str(i["reason"])[:40], "waited_s": i.get("waited_s"), "prompt_tokens": i.get("prompt_tokens")}
 
 
 def digest_db(profile, db, host, since):
@@ -275,6 +290,7 @@ def digest_db(profile, db, host, since):
         sig = collections.Counter()
         feats = collections.Counter()
         last_reply, n_real = "", 0
+        last_interrupt = None
         for m in msgs:
             role, content = m["role"], m["content"] or ""
             if role == "user":
@@ -294,10 +310,15 @@ def digest_db(profile, db, host, since):
                 turn = {"t": round(m["timestamp"]), "text": trunc(text, TURN_CHARS)}
                 if last_reply.strip():
                     turn["prev"] = clip_ends(redact(_home_rel(last_reply) or ""))
+                if last_interrupt:
+                    turn["prev_interrupt"] = last_interrupt
                 users.append(turn)
             elif role == "assistant":
                 if content.strip():
                     last_reply = content
+                    # Why the model wait before this reply was cut short (core display_metadata.interrupt:
+                    # reason/waited_s/prompt_tokens), or None once a real reply follows it.
+                    last_interrupt = _interrupt_meta(m["meta"])
                 for tc, targs, inner in _tool_calls(m["tool_calls"], with_args=True):
                     if not inner:
                         tools[tc] += 1

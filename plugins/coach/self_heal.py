@@ -1737,6 +1737,39 @@ def backstop_context(dg: dict, turns: list, t: dict, n: int = 3, chars: int = 30
 
 _UNSET = object()
 
+# ── interrupted model waits (digest `prev_interrupt`, core display_metadata.interrupt) ──
+# A human Stop answered by a bare nudge is a slow first token, not an agent fault; a backend exit the user had to
+# nudge is a lost turn (auto-continue did not resume it). Other producers (ws_orphan, lease_takeover, ...) still go
+# to the judge. Rows without a reason (older cores) are judged exactly as before.
+HUMAN_STOPS = ("user_stop", "new_message", "user_interrupt")
+SLOW_MODEL_S = 60.0
+BARE_NUDGE_RE = re.compile(
+    r"^\s*(?:resume|continue|go on|keep going|carry on|status\??|still there\??|are you (?:still )?(?:there|stuck|"
+    r"working)\??|what'?s (?:going on|happening|up)\??|\?+|ping|hello\??|and\??|so\??|well\??)\W*$", re.I)
+
+
+def interrupt_triage(t: dict) -> Optional[dict]:
+    """Verdict for a user turn that follows an interrupted model wait, or None to judge it normally:
+    ``{"action": "slow_model"|"user_stop"}`` (skip: not a defect) or ``{"action": "lost_turn", "hit": {...}}``."""
+    info = t.get("prev_interrupt")
+    if not isinstance(info, dict):
+        return None
+    reason = str(info.get("reason") or "")
+    if reason in HUMAN_STOPS:
+        if not BARE_NUDGE_RE.match(clean_user(t.get("text") or "")[:200]):
+            return None  # a real complaint after a Stop is still judged
+        try:
+            waited = float(info.get("waited_s") or 0)
+        except (TypeError, ValueError):
+            waited = 0.0
+        return {"action": "slow_model" if waited >= SLOW_MODEL_S else "user_stop"}
+    if reason == "backend_exit":
+        v = {"p_defect": 0.95, "kind": "hermes_bug", "component": "gateway",
+             "symptom": "turn lost after backend exit, not auto-continued"}
+        return {"action": "lost_turn", "hit": {**v, "fingerprint": fingerprint(v["component"], v["symptom"]),
+                                               "source": "signal", "stages": []}}
+    return None
+
 
 def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Optional[float] = None,
              lookback: float = 3 * 3600, filer: Optional[Callable] = None, m: Optional[str] = None,
@@ -1788,9 +1821,19 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
             text = t.get("text") or ""
             if not prefilter(text):
                 continue
-            n += 1
-            hit = detect_complaint(t.get("prev") or "", text, llm=judge, threshold=threshold(),
-                                   context=backstop_context(dg, turns, t), confirm=confirm)
+            tri = interrupt_triage(t)
+            if tri and tri["action"] in ("slow_model", "user_stop"):
+                info = t.get("prev_interrupt") or {}
+                store.log({"event": "selfheal_slow_model" if tri["action"] == "slow_model" else "selfheal_user_stop",
+                           "session_id": dg.get("id") or f.stem, "at": t["t"], "waited_s": info.get("waited_s"),
+                           "prompt_tokens": info.get("prompt_tokens"), "reason": info.get("reason")})
+                continue
+            if tri:  # lost_turn: a machine signal, no judge
+                hit = tri["hit"]
+            else:
+                n += 1
+                hit = detect_complaint(t.get("prev") or "", text, llm=judge, threshold=threshold(),
+                                       context=backstop_context(dg, turns, t), confirm=confirm)
             if not hit:
                 continue
             sid = dg.get("id") or f.stem

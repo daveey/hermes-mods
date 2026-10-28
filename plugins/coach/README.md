@@ -361,6 +361,16 @@ Replay of the week-of-10-12 Hermes fix requests: 6/25 -> 12/25 caught; a 150-tur
 real complaints. With the resample, the strict-prompt changes and the confirm model (`claude-sonnet-5`) also on
 the backstop: 19/25 and 16/25 on two runs (13/13 without), control 28 and 30 (32 without).
 
+Interrupted model waits: core records why a turn was stopped while waiting for the model
+(`display_metadata.interrupt = {reason, waited_s, prompt_tokens}` on the interrupted row; reasons `user_stop`,
+`new_message`, `backend_exit`, `ws_orphan`, `lease_takeover`, `session_close`), and the digest carries it on the next
+user turn as `prev_interrupt`. The backstop (`interrupt_triage`) then skips the judge for a bare nudge ("resume",
+"status?") after a human Stop: it logs `selfheal_slow_model` (waited >= 60 s, with the prompt size) or
+`selfheal_user_stop` instead of filing an agent fault. A `backend_exit` the user had to nudge is a lost turn
+(auto-continue did not resume it) and is filed directly as a `gateway` defect, no judge. Other reasons, real complaints
+after a Stop, and rows from older cores (no reason) are judged as before. Count slow first tokens by prompt size with
+`grep selfheal_slow_model <coach>/log.jsonl`.
+
 Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
 workers. The complaint prefilter also rejects cross-session courier messages, generated blocked-card notices and
 standalone chat-closeout messages before any judge call. Those are coordination, not fresh user complaints;
