@@ -3,6 +3,7 @@
 Patches:
 
 - `patches/0549-fix-state-name-call-sites-that-keep-opening-writable.patch`
+- `patches/0579-perf-tui-kanban-notify-poller-skips-boards-whose-fil.patch`
 
 Plugin change (no patch, same commit): `plugins/chat-closeout/__init__.py` (`_lineage`, `_compression_tip`).
 
@@ -48,6 +49,15 @@ CPU-minutes in its first three hours. Its REST calls timed out ("Timed out conne
   `hermes_state_registry.acquire()` for a long-lived writer); it is named again at most every 10 min while it stays
   hot. Read-only opens are not counted. Spread-out or distinct call sites stay quiet.
 
+- Follow-up (py-spy of the relaunched backend, pid 14245, still ~2 cores at 20:30 with 21 open chats):
+  - The per-chat Kanban notification poller skips a board whose `kanban.db`/`-wal` file signature (mtime_ns,
+    size, inode) has not moved since that chat's last poll: no probe, no writable open, no claim. The signature
+    is taken before the poll, so a commit during it (a new event, a claim, a refused-turn rewind) is polled on the
+    next tick; consumer-health `polled` still fires on a skip.
+  - hermes-mods `hub-sync` keeps decoded `published`/`replica` rows per collection while `hub.db` and its WAL are
+    unchanged (file mtime_ns, size, inode), hands out shallow copies, and no longer mutates nested values in
+    `_overlay`. `tasks()` 161 -> 31 ms, `sessions()` 87 -> 42 ms per call against the live 16k-row replica.
+
 ## How it works
 
 `hermes_state._note_writable_open(site)` keeps a deque of monotonic timestamps per site, trims it to the 60 s window
@@ -82,6 +92,14 @@ is older than `_WRITABLE_OPEN_WARN_INTERVAL_S`. `SessionDB.__init__` calls it wi
 - hermes-mods `plugins/user-terminal/tests/test_state_reads_read_only.py` (fails on the old code)
   - `test_sender_title_is_read_only`, `test_caller_surfaces_session_source_is_read_only`.
 
+- `tests/tui_gateway/test_kanban_notify_poller.py` (core 0579)
+  - `TestUnchangedBoardSkip::test_unchanged_board_is_not_reopened_and_a_commit_is_delivered` (fails on the old
+    code): no `connect`/`count_notify_subs` on an unchanged board; a completion is delivered on the next tick.
+  - `TestUnchangedBoardSkip::test_skip_is_per_session`: one chat's signature never suppresses another's poll.
+- hermes-mods `plugins/hub-sync/tests/test_hubview.py` (fails on the old code)
+  - `test_unchanged_hub_db_is_decoded_once_and_a_write_is_seen`: no re-decode while unchanged, a replica write
+    is read on the next call, a caller's mutation of a returned row does not reach the cache.
+
 ## Measured (replaying `/api/profiles/sessions/sidebar` every 2 s for 60 s in-process against the live `~/.hermes`)
 
 | Plugin | Writable opens / min | CPU (one core = 100%) |
@@ -94,6 +112,13 @@ The replay has no GIL contention from other threads, so it understates the live 
 remains per poll is core `kanban_session_activity._legacy_remote_links` (~0.3 s CPU), outside this change.
 
 ## Gotchas
+
+- Not changed: `tui_gateway/change_watcher._session_db_content_sig` re-hashes every `sessions` row (7.7k, ~40 ms,
+  24 ms of it the fetch) on each state.db move, up to twice a second during a turn (~9% of busy samples). A time
+  cap breaks its tested contract (a session change broadcasts on the next pass) and a cheaper aggregate pre-check
+  would miss equal-length renames, so it was left as is.
+- `plugins/hub-sync/tests/test_human_request_path.py::test_real_producer_serializes_human_request` fails on main
+  before this change too (2 cases).
 
 - Core `883b05f36b` (another session, same evening) caches a clean macOS holder-scan result and single-flights
   the scan, which caps the scan's share of the cost; this guard and the plugin fix remove the opens that drove it.

@@ -134,11 +134,31 @@ def _float(v):
         return None
 
 
+# Decoded `published`/`replica` rows per collection, reused while hub.db and its WAL are unchanged. Desktop polls
+# sessions/tasks every few seconds and the replica holds ~16k rows (~40 MB of JSON): decoding all of it per request
+# kept the Desktop backend busy. Keyed by file identity (mtime_ns, size) of hub.db and hub.db-wal; every commit moves
+# one of them. Rows handed out are shallow copies, and nothing here mutates a cached row's nested values.
+_DECODED: Dict[tuple, tuple] = {}
+_DECODED_LOCK = threading.Lock()
+
+
+def _file_sig(path: Path) -> tuple:
+    out = []
+    for p in (path, Path(str(path) + "-wal")):
+        try:
+            st = p.stat()
+            out.append((st.st_mtime_ns, st.st_size, st.st_ino))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
 class View:
     """One read of hub.db: everything a request needs, then closed."""
 
-    def __init__(self, conn: sqlite3.Connection, now: Optional[float] = None):
+    def __init__(self, conn: sqlite3.Connection, now: Optional[float] = None, path: Optional[Path] = None):
         self.conn = conn
+        self.path = path  # set by open_view: enables the decoded-row cache (a bare conn reads fresh every time)
         self.now = _now() if now is None else now
         self.gateway = _meta(conn, "gateway")
         self.last_ok = _float(_meta(conn, "last_ok"))
@@ -204,11 +224,35 @@ class View:
                 continue
             if d.get(field) != o["value"]:
                 # set on the hub, not yet applied by the owner (asleep or behind): shown, and marked as such
-                d.setdefault("shared", {})[field] = {"by": o["by"], "owner_value": d.get(field)}
+                d["shared"] = {**(d.get("shared") or {}), field: {"by": o["by"], "owner_value": d.get(field)}}
             d[field] = o["value"]
         if coll == "inbox" and d.get("archived") is True and d.get("state") in ("open", "queuing"):
             d["state"] = "archived"
         return d
+
+    def _decoded(self, table: str, coll: str) -> list:
+        """``[(row, data dict)]`` for one table and collection; data dicts are shared with the cache (copy them)."""
+        if table == "published":
+            sql, args = "SELECT key, data, version FROM published WHERE coll = ?", (coll,)
+        else:
+            sql, args = ("SELECT gw, key, data, version, updated_at FROM replica WHERE coll = ? AND gw IS NOT ?",
+                         (coll, self.gateway))
+        key = (str(self.path), table, coll, self.gateway)
+        sig = _file_sig(self.path) if self.path is not None else None
+        if sig is not None:
+            with _DECODED_LOCK:
+                hit = _DECODED.get(key)
+            if hit is not None and hit[0] == sig:
+                return hit[1]
+        out = []
+        for r in self.conn.execute(sql, args):
+            d = _loads(r["data"])
+            if d is not None:
+                out.append((dict(r), d))
+        if sig is not None:
+            with _DECODED_LOCK:
+                _DECODED[key] = (sig, out)
+        return out
 
     def rows(self, coll: str) -> List[dict]:
         """Own records from `published`, other gateways' from `replica` (never own rows twice), with shared-field
@@ -216,22 +260,21 @@ class View:
         out = []
         pend = self.pending()
         if _has(self.conn, "published"):
-            for r in self.conn.execute("SELECT key, data, version FROM published WHERE coll = ?", (coll,)):
-                d = _loads(r["data"])
-                if d is None:
-                    continue
+            for r, data in self._decoded("published", coll):
+                d = dict(data)
                 d.update(gateway=self.gateway, key=r["key"], version=r["version"], local=True, stale=False,
                          synced_at=self.now, pending=pend.get((self.gateway, coll, r["key"]), []))
                 out.append(d)
         if _has(self.conn, "replica"):
             stale = self.hub_stale()
-            for r in self.conn.execute("SELECT gw, key, data, version, updated_at FROM replica WHERE coll = ? AND gw IS NOT ?",
-                                       (coll, self.gateway)):
-                d = _loads(r["data"])
-                if d is None:
-                    continue
-                d.update(gateway=r["gw"], key=r["key"], version=r["version"], local=False, stale=stale,
-                         synced_at=self.synced_at(r["gw"]), updated_at_hub=(r["updated_at"] or 0) / 1000.0,
+            synced = {}  # per gateway, not per row (~16k rows, a handful of gateways)
+            for r, data in self._decoded("replica", coll):
+                d = dict(data)
+                gw = r["gw"]
+                if gw not in synced:
+                    synced[gw] = self.synced_at(gw)
+                d.update(gateway=gw, key=r["key"], version=r["version"], local=False, stale=stale,
+                         synced_at=synced[gw], updated_at_hub=(r["updated_at"] or 0) / 1000.0,
                          pending=pend.get((r["gw"], coll, r["key"]), []))
                 out.append(d)
         return [self._overlay(coll, d) for d in out]
@@ -272,7 +315,7 @@ def open_view(now: Optional[float] = None) -> Optional[View]:
     conn = ro_connect(db_path())
     if conn is None:
         return None
-    return View(conn, now)
+    return View(conn, now, path=db_path())
 
 
 def _unavailable(**empty) -> dict:

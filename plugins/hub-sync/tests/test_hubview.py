@@ -279,3 +279,32 @@ def test_rest_post_request(api_client):
     assert r.status_code == 400 and "supports" in r.json()["detail"]
     r = c.post("/request", json={"gateway": "zzz", "coll": "sessions", "key": "default/s", "action": "pin"})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------- decoded-row cache
+
+def test_unchanged_hub_db_is_decoded_once_and_a_write_is_seen(hub, monkeypatch):
+    """Desktop polls sessions/tasks every few seconds over ~16k replica rows: an unchanged hub.db reuses the decoded
+    rows, a commit (new title) is read on the next call, and a caller mutating a returned row cannot touch the cache."""
+    hv, state = hub
+    calls = []
+    real = hv._loads
+    monkeypatch.setattr(hv, "_loads", lambda text: calls.append(1) or real(text))
+    first = hv.sessions(include_archived=True)["sessions"]
+    decoded = len(calls)
+    assert decoded > 0
+    first[0]["title"] = "mutated by a caller"
+    first[0].setdefault("tags", []).append("x")
+    second = hv.sessions(include_archived=True)["sessions"]
+    assert len(calls) == decoded  # nothing re-decoded
+    assert [r["key"] for r in second] == [r["key"] for r in first]
+    assert second[0]["title"] != "mutated by a caller" and "x" not in (second[0].get("tags") or [])
+    db = sqlite3.connect(str(state / "hub.db"))
+    row = db.execute("SELECT gw, key, data FROM replica WHERE coll='sessions' AND gw='mini' LIMIT 1").fetchone()
+    data = dict(json.loads(row[2]), title="renamed on mini")
+    with db:
+        db.execute("UPDATE replica SET data=? WHERE gw=? AND key=? AND coll='sessions'", (json.dumps(data), row[0], row[1]))
+    db.close()
+    third = hv.sessions(include_archived=True)["sessions"]
+    assert len(calls) > decoded
+    assert _by(third)[(row[0], row[1])]["title"] == "renamed on mini"
