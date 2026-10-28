@@ -522,7 +522,14 @@ def test_engine_budget_selfheal_lane_has_its_own_200_cap_outside_the_total(tmp_p
 
 
 # ── routing ──
-def test_bb_defects_route_to_the_bb_board_with_bb_self_fix(store):
+def plant_board(root, slug, archived=False):
+    d = Path(root) / "kanban" / "boards" / slug
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "board.json").write_text(json.dumps({"slug": slug, "archived": archived}))
+
+
+def test_bb_defects_route_to_the_bb_board_with_bb_self_fix(store, tmp_path):
+    plant_board(tmp_path, "bb")
     r = Runner()
     sh.file_defect(defect("bb", "camera enhance shows no sharpening"), store=store, m="live", runner=r, now=NOW,
                    cfg=HUB, budget_fn=OPEN)
@@ -530,6 +537,101 @@ def test_bb_defects_route_to_the_bb_board_with_bb_self_fix(store):
     assert argv[:4] == ["hermes", "kanban", "--board", "bb"]
     assert [argv[i + 1] for i, a in enumerate(argv) if a == "--skill"] == ["five-whys", "bb-self-fix"]
     assert sh.route({"component": "bb"}, {"bb_board": "babybear"})["board"] == "babybear"
+    assert opt(argv, "--assignee") == "default"
+
+
+def test_product_defect_creates_its_card_on_the_configured_bb_board(store, tmp_path):
+    plant_board(tmp_path, "bb-product")
+    r = Runner()
+    cfg = {"bb_board": "bb-product"}
+    d = defect("bb", "camera enhance shows no sharpening")
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=cfg, budget_fn=OPEN)
+    (argv,) = r.creates()
+    assert out["action"] == "filed" and argv[:4] == ["hermes", "kanban", "--board", "bb-product"]
+    assert opt(argv, "--assignee") == "default"
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--skill"] == ["five-whys", "bb-self-fix"]
+    assert sh.LaneState(store.root).get(d["fingerprint"])["board"] == "bb-product"
+    assert sh.USD_DAY == 200.0  # cap unchanged
+
+
+def _pending_fps(store):
+    import sqlite3
+    p = Path(store.root) / "selfheal_pending.sqlite"
+    if not p.exists():
+        return []
+    db = sqlite3.connect(p)
+    try:
+        return [json.loads(row[0])["fingerprint"] for row in db.execute("select payload from pending")]
+    finally:
+        db.close()
+
+
+def test_missing_bb_board_is_deferred_with_a_log_row_not_dropped(store, tmp_path):
+    r = Runner()
+    d = defect("bb", "camera enhance shows no sharpening")
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg={"bb_board": "bb"}, budget_fn=OPEN)
+    assert out["action"] == "deferred" and "does not exist" in out["why"] and out["board"] == "bb"
+    assert out["stop_pass"] is False and not r.creates()
+    (row,) = ev(store, "selfheal_deferred")
+    assert row["board"] == "bb" and "does not exist" in row["why"] and row["fingerprint"] == d["fingerprint"]
+    assert not sh.LaneState(store.root).get(d["fingerprint"]).get("card")
+    assert _pending_fps(store) == [d["fingerprint"]]
+    # still missing at retry time: kept, not dropped, and it does not block another admission
+    other = defect("desktop", "sidebar sessions reshuffle", p_defect=0.4)
+    sh.file_defect(other, store=store, m="live", runner=Runner(), now=NOW, cfg=HUB,
+                   budget_fn=lambda *a: {**OPEN(), "ok_running": False})
+
+    def retry(d, **kw):
+        return sh.file_defect(d, store=store, m="live", runner=r, now=NOW + 3600,
+                              cfg={"bb_board": "bb"}, budget_fn=OPEN)
+
+    sh.retry_deferred(store, now=NOW + 3600, filer=retry)
+    assert _pending_fps(store) == [d["fingerprint"]]
+    assert r.creates() and "--board" not in r.creates()[0][:4]
+    # board appears: the held payload files on it
+    plant_board(tmp_path, "bb")
+    sh.retry_deferred(store, now=NOW + 3600 + sh.MISSING_BOARD_RETRY_S, filer=retry)
+    assert r.creates()[-1][:4] == ["hermes", "kanban", "--board", "bb"]
+    assert d["fingerprint"] not in _pending_fps(store)
+    assert sh.LaneState(store.root).get(d["fingerprint"])["board"] == "bb"
+
+
+def test_create_that_reports_a_missing_board_defers_instead_of_dropping(store, tmp_path):
+    plant_board(tmp_path, "bb")  # preflight passes; the create still reports the board gone
+
+    class Gone(Runner):
+        def __call__(self, argv, capture_output=True, text=True, input=None, timeout=None):
+            self.calls.append((list(argv), input))
+            if "create" in argv:
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="kanban: board 'bb' does not exist. "
+                                              "Create it with `hermes kanban boards create bb`.")
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    r = Gone()
+    d = defect("bb", "wake word misses the second call")
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "deferred" and ev(store, "selfheal_deferred")
+    assert not ev(store, "selfheal_filed") and _pending_fps(store) == [d["fingerprint"]]
+    assert not sh.LaneState(store.root).get(d["fingerprint"]).get("status")
+
+
+def test_archived_bb_board_is_treated_as_missing(store, tmp_path):
+    plant_board(tmp_path, "bb", archived=True)
+    r = Runner()
+    out = sh.file_defect(defect("bb", "camera enhance shows no sharpening"), store=store, m="live", runner=r,
+                         now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "deferred" and not r.creates() and ev(store, "selfheal_deferred")
+
+
+def test_missing_bb_board_on_the_fix_path_errors_with_a_log_row(store):
+    d = defect("bb", "camera enhance shows no sharpening")
+    lane = sh.LaneState(store.root)
+    before = lane.update(d["fingerprint"], status="proposed", component="bb", symptom=d["symptom"])
+    r = Runner()
+    out = sh.file_fix(d["fingerprint"], store=store, runner=r, now=NOW, budget_fn=OPEN)
+    assert out["action"] == "error" and "does not exist" in out["why"] and not r.creates()
+    assert ev(store, "selfheal_file_error") and lane.get(d["fingerprint"])["status"] == before["status"]
 
 
 # ── entry paths, through the real hooks / sweeps ──

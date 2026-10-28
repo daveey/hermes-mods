@@ -486,7 +486,8 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   lane is not adopted, so a recurrence still files. Lanes record `family` when filed (`root_family()`). Tests:
   `test_self_heal_lane.py` replays the disk-I/O-then-corrupt pair (`test_replay_kanban_disk_io_then_corrupt_...`).
 - **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
-  hermes-mods-repo (Baby Bear: board `bb`, five-whys + bb-self-fix). Its brief makes it investigate live, with a
+  hermes-mods-repo (Baby Bear: hub board `bb`, assignee `default`, five-whys + bb-self-fix). A missing `bb_board`
+  is deferred (`selfheal_deferred`, payload kept for the cron retry), not dropped and not auto-created. The brief makes it investigate live, with a
   per-component checklist (Kanban events/runs, surface writer + backing state, processes/launchd/logs, git log), write
   the five-whys chain, and write `coach/selfheal/<fp>/proposal.md`: **What happened** (symptom, PT time, `@session`
   link, quote), **Why** (the chain with evidence), **Plan** (changes, regression test, detection guard, live check),

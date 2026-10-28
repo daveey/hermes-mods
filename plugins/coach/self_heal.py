@@ -726,12 +726,52 @@ def is_hub(cfg: Optional[dict] = None) -> bool:
 
 
 def route(d: dict, cfg: Optional[dict] = None) -> dict:
-    """Board + skills. Baby Bear product defects go to the bb board with bb-self-fix; everything else to the hub's
-    default board (Hermes / harness)."""
+    """Board + skills. Baby Bear product defects go to the hub bb board (cfg ``bb_board``, default ``bb``) with
+    bb-self-fix and assignee ``default``; everything else to the hub's default board (Hermes / harness). A missing
+    named board is not created here: live filing defers the payload instead of dropping it."""
     cfg = lane_config() if cfg is None else cfg
     if d.get("component") == "bb":
         return {"board": cfg.get("bb_board") or "bb", "skills": list(BB_SKILLS), "bb": True}
     return {"board": cfg.get("board") or None, "skills": list(SKILLS), "bb": False}
+
+
+_BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+_MISSING_BOARD_RE = re.compile(r"board\s+['\"]?[\w.-]+['\"]?\s+does not exist", re.I)
+MISSING_BOARD_RETRY_S = 900  # cron is every 5 min; don't hammer a board that is not there yet
+
+
+def _kanban_root() -> Path:
+    """Same root Hermes uses for boards: ``HERMES_KANBAN_HOME``, else the default Hermes root."""
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    try:
+        from hermes_constants import get_default_hermes_root  # type: ignore
+        return Path(get_default_hermes_root())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def board_present(board: Optional[str], home: Optional[Path] = None) -> bool:
+    """Whether ``hermes kanban --board <slug> create`` has a board to land on.
+
+    None and ``default`` always exist (DB at ``<root>/kanban.db``). A named board exists only when
+    ``<root>/kanban/boards/<slug>/board.json`` is present and not archived — Hermes's identity marker.
+    ``home`` overrides the root (tests)."""
+    if not board or board == "default":
+        return True
+    if not _BOARD_SLUG_RE.match(board):
+        return False
+    root = Path(home) if home is not None else _kanban_root()
+    try:
+        data = json.loads((root / "kanban" / "boards" / board / "board.json").read_text())
+    except Exception:
+        return False
+    return not data.get("archived")
+
+
+def _board_missing_output(err: str, out: str) -> bool:
+    return bool(_MISSING_BOARD_RE.search(f"{err or ''}\n{out or ''}"))
 
 
 def _pt(ts: float) -> str:
@@ -1086,6 +1126,15 @@ def _defer_investigation(d: dict, result: dict, store):
     return result
 
 
+def _defer_missing_board(d: dict, board: str, store, now: float) -> dict:
+    """Hold the defect for retry. A missing board must not be a silent drop: the payload stays in
+    ``selfheal_pending.sqlite`` and the cron refiles it. ``stop_pass`` is false so this does not halt
+    other pending admissions (it is not a cap denial)."""
+    result = {"action": "deferred", "why": f"kanban board {board!r} does not exist",
+              "retry_at": _iso(now + MISSING_BOARD_RETRY_S), "board": board, "stop_pass": False}
+    return _defer_investigation(d, result, store)
+
+
 PENDING_MAX_AGE_S = 7 * 86400  # detections waiting longer than this are dropped, not filed late
 _SOURCE_RANK = {"complaint": 0, "admission": 0, "signal": 1}  # in-chat judges, then machine signals (9/10 real in
 # the Oct 2026 shadow sample), then the digest backstop (3/6) and anything else
@@ -1152,8 +1201,8 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                 with db:
                     # Do not erase a newer detection written while this retry was executing.
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
-            elif result.get("action") == "deferred":
-                break  # the cap that denied this row denies the rest; they keep their retry time
+            elif result.get("action") == "deferred" and result.get("stop_pass", True):
+                break  # a cap denial denies the rest; a missing board (stop_pass false) does not
     finally:
         db.close()
     return out
@@ -1762,6 +1811,8 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                     return commented
             return owner
     args = card_args(d, dec["key"], dec.get("previous"), cfg)
+    if m == "live" and hub and args.get("board") and not board_present(args["board"]):
+        return _defer_missing_board(d, args["board"], store, now)
     b = (budget_fn or budget)(args.get("board"), now)
     sched = None
     if not b["ok_usd"]:
@@ -1785,6 +1836,8 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
         rc, out, err = _run(kanban_argv(args), runner)
+        if rc != 0 and _board_missing_output(err, out):
+            return _defer_missing_board(d, args.get("board") or "?", store, now)
         tid = _task_id(out) if rc == 0 else None
         if not tid or tid not in known:
             break
@@ -1841,6 +1894,10 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
             "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY}
+    if args.get("board") and not board_present(args["board"]):
+        why = f"kanban board {args['board']!r} does not exist"
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args["board"]})
+        return {"action": "error", "why": why, "board": args["board"]}
     b = (budget_fn or budget)(args.get("board"), now)
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
@@ -1852,6 +1909,10 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         return denied
     rc, out, err = _run(kanban_argv(args), runner)
     tid = _task_id(out) if rc == 0 else None
+    if not tid and _board_missing_output(err, out):
+        why = (err or out).strip()[-300:] or f"kanban board {args.get('board')!r} does not exist"
+        store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": why, "board": args.get("board")})
+        return {"action": "error", "why": why, "board": args.get("board")}
     if not tid:
         return {"action": "error", "why": (err or out).strip()[-300:]}
     if tid in known_cards(st):
