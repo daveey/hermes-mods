@@ -24,6 +24,12 @@ New-session defaults:
 - `background` carries the user's own words and any decision already made, so the worker does
   not re-ask.
 
+Standing approval (2026-10-28): the user does not want approval cards. Any session that follows
+from something they asked for starts at once with `initiation: "user_asked"`; never use
+"own_initiative" cards for it, and never propose then dismiss. Use a card only for work nobody
+asked for, rarely. Before starting, check `list_sessions {linked:true}` so you never duplicate a
+running session.
+
 Never wait on a worker inside a turn, never poll it, never predict its result.
 
 ## Ledger (source of truth across compaction)
