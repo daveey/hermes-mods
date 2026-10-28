@@ -63,6 +63,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             goal_gate.capture(session_id=session_id, user_message=user_message,
                               conversation_history=conversation_history,
                               canonical_user_content=_.get("canonical_user_content"))
+            # Seconds since this session's last recorded activity, read before user_turn bumps it: the length of
+            # a backend stop when this turn is core's resume note (self_heal.resume_signal).
+            last_seen = store.session(session_id).get("updated")
             rec = store.user_turn(session_id, user_message) or {}
             hint = coach.turn_start(session_id, user_message, platform=platform or "",
                                     parent_session_id=parent_session_id or "",
@@ -80,7 +83,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             threading.Thread(target=_lesson_bg, args=(session_id, user_message, prev), daemon=True).start()
             _selfheal_run(_selfheal_complaint, session_id, user_message,
                           prev or _last_assistant(conversation_history), platform, parent_session_id,
-                          list(coach.loop_state(session_id).get("last_log") or []))
+                          list(coach.loop_state(session_id).get("last_log") or []),
+                          (store.clock() - last_seen) if isinstance(last_seen, (int, float)) else None)
             loop_hint = _fix_loop(session_id, user_message, turn)
             stall_hint = _stalled_goal(session_id, platform)
             hint = " ".join(h for h in (f"[coach] {hint}" if hint else "", loop_hint or "", stall_hint or "") if h)
@@ -297,15 +301,19 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             return selfheal_confirm
         return None if selfheal_llm else sh.confirm_judge()
 
-    def _selfheal_complaint(session_id, user_message, prev, platform="", parent_session_id="", tool_log=None):
+    def _selfheal_complaint(session_id, user_message, prev, platform="", parent_session_id="", tool_log=None,
+                            gap_s=None):
         try:
             sh = _load("self_heal")
             if not sh.user_facing(platform, parent_session_id):
                 return
             hit = sh.detect_complaint(prev or "", user_message, llm=selfheal_llm, threshold=sh.threshold(),
                                       confirm=_confirm(sh),
-                                      tool_log=tool_log)
-            sh.handle(hit, session_id, store, evidence=sh.clean_user(user_message), platform=platform)
+                                      tool_log=tool_log, gap_s=gap_s)
+            evidence = sh.clean_user(user_message)
+            if hit and hit.get("gap_s") is not None:
+                evidence = f"backend stopped mid-turn; chat resumed {hit['gap_s'] // 60} min later. {evidence}"
+            sh.handle(hit, session_id, store, evidence=evidence, platform=platform)
         except Exception as exc:
             log.debug("coach self_heal complaint: %s", exc)
 

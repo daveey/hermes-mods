@@ -109,12 +109,57 @@ def test_admission_prefilter():
 def test_machine_signals_need_no_judge():
     api = sh.machine_signal("Sorry — this message was not processed (API call failed).")
     assert api["source"] == "signal" and api["kind"] == "api_error" and api["component"] == "provider"
-    assert sh.machine_signal("ok", ["-> terminal(x)", "Operation interrupted"])["kind"] == "interrupted"
+    # Real logger shape (agent_rules.observe): "-> tool(args)" lines and "   <- ERROR <result>" lines. A turn that was
+    # cut short with no reply ends on the cancelled tool's error line.
+    cut = ["-> terminal(sleep 900)", "   <- ERROR Tool execution cancelled. The user interrupted the turn."]
+    assert sh.machine_signal("", cut)["kind"] == "interrupted"
     rep = ["-> terminal(npm test)", "   <- ERROR exit 1: ENOENT"] * 3
     assert sh.machine_signal("done", rep)["kind"] == "repeat_failure"
     assert sh.machine_signal("done", rep[:4]) is None  # two identical errors are not a loop
     llm, calls = judge(0.0)
     assert sh.detect_admission("Sorry, not processed.", llm)["source"] == "signal" and not calls
+
+
+# gateway-a8b8d01aa4: finished turns were filed as "turn interrupted" because the tool log merely mentioned it.
+FINISHED = "Done. The hub's own background retry switches on once the hub Desktop backend restarts."
+
+
+def test_finished_reply_whose_command_args_mention_interrupt_is_not_interrupted():
+    log = ["-> terminal(grep -rn \"Turn stopped\" ~/.hermes/hermes-agent/tui_gateway)",
+           "-> search_files(Tool execution cancelled|Operation interrupted)",
+           "-> terminal(git commit -m 'detect turn lease lost')"]
+    assert sh.machine_signal(FINISHED, log) is None
+    assert sh.detect_admission(FINISHED, judge(0.0)[0], tool_log=log) is None
+
+
+def test_cancelled_tool_then_recovery_and_reply_is_not_interrupted():
+    log = ["-> terminal(sleep 900)", "   <- ERROR Tool execution cancelled. The user interrupted the turn.",
+           "-> terminal(ls)", "-> read_file(/tmp/x)"]
+    assert sh.machine_signal(FINISHED, log) is None
+    # even as the very last line: the agent replied afterwards, so the turn finished
+    assert sh.machine_signal(FINISHED, log[:2]) is None
+
+
+def test_core_interrupt_placeholder_reply_is_still_interrupted():
+    for reply in ("Operation interrupted: waiting for model response (42s).",
+                  "[Turn stopped by the user before it finished.]",
+                  "Session turn lease lost; stopping to protect the transcript.",
+                  "⚠️ No reply: the turn stopped while a tool result was still pending and the model produced no "
+                  "follow-up text. Send `continue` to let it summarize."):
+        hit = sh.machine_signal(reply, ["-> terminal(make)"])
+        assert hit and hit["kind"] == "interrupted" and hit["fingerprint"] == "gateway-a8b8d01aa4", reply
+
+
+def test_resume_note_user_turn_files_backend_stopped_signal():
+    note = ("[System note: Your previous turn was interrupted mid-run — the app or its backend process stopped "
+            "before the turn could finish. Some of the work may already be complete; check the current state "
+            "before redoing anything, then finish the task. The interrupted request was:]\n\nfix the panel")
+    llm, calls = judge(0.0)
+    hit = sh.detect_complaint("working on it", note, llm, gap_s=1200)
+    assert hit and hit["source"] == "signal" and hit["kind"] == "interrupted" and not calls
+    assert hit["symptom"] == "turn interrupted (backend stopped)" and hit["gap_s"] == 1200
+    assert hit["fingerprint"] != "gateway-a8b8d01aa4"
+    assert sh.resume_signal("please fix the panel") is None
 
 
 # ── detect_complaint / detect_admission ──
@@ -267,6 +312,22 @@ def test_pre_llm_call_complaint_path_logs_shadow_and_dedupes(tmp_path, on):
     assert ev[0]["fingerprint"] == ev[1]["fingerprint"]
     assert "Sorted by creation time." in calls[0][1]  # prev reply from conversation_history
     assert not (tmp_path / "coach" / "selfheal_queue.jsonl").exists()  # shadow never enqueues
+
+
+def test_pre_llm_call_resume_note_files_backend_stop_with_gap(tmp_path, on):
+    llm, calls = judge(0.0)
+    now = [1000.0]
+    store = core.Store(tmp_path / "coach", clock=lambda: now[0])
+    _, hooks = plugin.build(store=store, checkout=None, selfheal_sync=True, selfheal_llm=llm)
+    hooks["post_llm_call"](session_id="s1", assistant_response="Working on the panel fix now.")
+    now[0] += 1200  # backend down 20 min
+    note = ("[System note: Your previous turn was interrupted mid-run — the app or its backend process stopped "
+            "before the turn could finish. The interrupted request was:]\n\nfix the panel")
+    hooks["pre_llm_call"](session_id="s1", user_message=note)
+    ev = events(tmp_path)
+    assert len(ev) == 1 and ev[0]["source"] == "signal" and ev[0]["symptom"] == "turn interrupted (backend stopped)"
+    assert ev[0]["evidence"].startswith("backend stopped mid-turn; chat resumed 20 min later.")
+    assert not calls
 
 
 def test_post_llm_call_admission_path(tmp_path, on):

@@ -60,7 +60,16 @@ ACK_RE = re.compile(
 # replay's telemetry (api_err / interrupted / repeat): a provider error reply, an interrupted turn, or the same tool
 # error three times in one turn.
 API_ERR_RE = re.compile(r"not processed|API call failed|provider error|rate limit(?:ed)? .{0,40}(?:retry|exhaust)", re.I)
-INTERRUPT_RE = re.compile(r"Operation interrupted|turn lease lost|Turn stopped|Tool execution cancelled", re.I)
+# Core's interrupt placeholders, matched in the REPLY only. The tool log carries every command's arguments (a grep
+# for "Turn stopped" is not an interruption) and errors of cancelled tools the agent recovered from, so it is read
+# only for a turn that produced no reply and ended on a cancelled tool (gateway-a8b8d01aa4).
+INTERRUPT_RE = re.compile(r"Operation interrupted|turn lease lost|Turn stopped by|"
+                          r"turn stopped while a tool result was still pending", re.I)
+CANCEL_LINE_RE = re.compile(r"^\s*<-\s*ERROR\b.*(?:Tool execution cancelled|Operation interrupted|turn lease lost)",
+                            re.I)
+# Core's crash-recovery note (tui_gateway/session_history.py _AUTO_CONTINUE_NOTE_PREFIX): the next user turn after a
+# backend stopped mid-turn. The only trace such a stop leaves, since the cut turn never reaches post_llm_call.
+RESUME_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
 ERR_LINE_RE = re.compile(r"(?:<-|->)\s*ERROR\b\s*(.*)")
 
 COMPLAINT_SYS = """You watch a power user's chats with his AI agent system "Hermes" (the coding/ops agent, its Desktop
@@ -228,7 +237,7 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
     log = [str(x) for x in (tool_log or [])]
     if API_ERR_RE.search(r):
         v = {"p_defect": 0.9, "kind": "api_error", "component": "provider", "symptom": "turn failed with provider error"}
-    elif INTERRUPT_RE.search(r) or any(INTERRUPT_RE.search(x) for x in log[-10:]):
+    elif INTERRUPT_RE.search(r) or (not r.strip() and log and CANCEL_LINE_RE.search(log[-1])):
         v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
              "symptom": "turn interrupted before finishing"}
     else:
@@ -238,6 +247,18 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
             return None
         v = {"p_defect": 0.85, "kind": "repeat_failure", "component": "agent", "symptom": "same tool error repeated"}
     return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal"}
+
+
+def resume_signal(user_text, gap_s: Optional[float] = None) -> Optional[dict]:
+    """A user turn that is core's crash-recovery note: the backend stopped mid-turn and Hermes resumed the chat.
+    `gap_s` = seconds since the session's last recorded activity (None when unknown)."""
+    t = clean_user(user_text)
+    if not t.lstrip().startswith(RESUME_NOTE_PREFIX):
+        return None
+    v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
+         "symptom": "turn interrupted (backend stopped)"}
+    return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal",
+            "gap_s": None if gap_s is None else int(gap_s)}
 
 
 _STOP = set("a an the to of in on for and or is are was were be been it its this that with not no by at as from "
@@ -421,10 +442,15 @@ def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str]
 
 def detect_complaint(prev_reply: str, user_text, llm: Optional[Callable[[str, str], str]] = None,
                      threshold: float = THRESHOLD, tool_log=None,
-                     confirm: Optional[Callable[[str, str], str]] = None, context: str = "") -> Optional[dict]:
-    """pre_llm_call path: prefilter, then the cascade (complaint_verdict) on (previous reply + its turn's tool log,
-    user message). Returns {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open."""
+                     confirm: Optional[Callable[[str, str], str]] = None, context: str = "",
+                     gap_s: Optional[float] = None) -> Optional[dict]:
+    """pre_llm_call path: core's resume note (backend stopped mid-turn) is a machine signal; otherwise prefilter,
+    then the cascade (complaint_verdict) on (previous reply + its turn's tool log, user message). Returns
+    {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open."""
     try:
+        sig = resume_signal(user_text, gap_s)
+        if sig:
+            return sig
         if not prefilter(user_text):
             return None
         return _verdict(complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context),

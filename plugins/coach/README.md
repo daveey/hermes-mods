@@ -391,7 +391,12 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   counts a fix/root-cause request for a Hermes defect the agent's own message described, and a product problem the
   agent's own work caused; Hermes itself is never a `product_bug`. Outside-world problems (`kind: external`) never count.
 - **Turn end** (`post_llm_call`): machine signals first, no judge (a provider-error reply, an interrupted turn, one
-  tool error repeated 3×). Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
+  tool error repeated 3×). "Interrupted" is read from the reply only (core's placeholders: `Operation interrupted`,
+  `turn lease lost`, `Turn stopped by`, `the turn stopped while a tool result was still pending`); the tool log counts
+  only for an empty reply whose last line is a cancelled tool, since its `-> tool(args)` lines carry command text.
+  A backend that stops mid-turn never reaches this hook: the next user turn, core's `[System note: Your previous turn
+  was interrupted mid-run` resume note, files `turn interrupted (backend stopped)` with the gap since the last activity.
+  Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
   errors, a turn-end audit by the same judge; only self-admissions file (the other audit kinds cost more false alarms
   than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set).
 
