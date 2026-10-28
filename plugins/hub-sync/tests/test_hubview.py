@@ -303,7 +303,9 @@ def test_unchanged_hub_db_is_decoded_once_and_a_write_is_seen(hub, monkeypatch):
     row = db.execute("SELECT gw, key, data FROM replica WHERE coll='sessions' AND gw='mini' LIMIT 1").fetchone()
     data = dict(json.loads(row[2]), title="renamed on mini")
     with db:
-        db.execute("UPDATE replica SET data=? WHERE gw=? AND key=? AND coll='sessions'", (json.dumps(data), row[0], row[1]))
+        # as hermes_hub.py writes it: every upsert carries the hub's new change-feed seq with the new data
+        db.execute("UPDATE replica SET data=?, seq=seq+1000 WHERE gw=? AND key=? AND coll='sessions'",
+                   (json.dumps(data), row[0], row[1]))
     db.close()
     third = hv.sessions(include_archived=True)["sessions"]
     assert len(calls) > decoded

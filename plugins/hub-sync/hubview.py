@@ -140,6 +140,7 @@ def _float(v):
 # one of them. Rows handed out are shallow copies, and nothing here mutates a cached row's nested values.
 _DECODED: Dict[tuple, tuple] = {}
 _DECODED_LOCK = threading.Lock()
+_SEEN: Dict[str, tuple] = {}  # hub.db path -> (file signature, owner_seen map); see View.owner_seen
 
 
 def _file_sig(path: Path) -> tuple:
@@ -151,6 +152,13 @@ def _file_sig(path: Path) -> tuple:
         except OSError:
             out.append(None)
     return tuple(out)
+
+
+def _has_seq(conn) -> bool:
+    try:
+        return any(r[1] == "seq" for r in conn.execute("PRAGMA table_info(replica)"))
+    except sqlite3.Error:
+        return False
 
 
 class View:
@@ -169,10 +177,21 @@ class View:
 
     # when did each owner last publish anything we pulled (seconds)
     def owner_seen(self) -> Dict[str, float]:
+        """Memoized per hub.db file signature: the GROUP BY reads every replica row's overflow chain (``updated_at``
+        follows the large ``data`` column), ~20 ms a call, and each request opened a new View and paid it. [daveey]"""
         if self._seen is None:
-            self._seen = {r[0]: (r[1] or 0) / 1000.0 for r in
-                          self.conn.execute("SELECT gw, MAX(updated_at) FROM replica GROUP BY gw")} \
-                if _has(self.conn, "replica") else {}
+            sig = _file_sig(self.path) if self.path is not None else None
+            with _DECODED_LOCK:
+                hit = _SEEN.get(str(self.path)) if sig is not None else None
+            if hit is not None and hit[0] == sig:
+                self._seen = hit[1]
+            else:
+                self._seen = {r[0]: (r[1] or 0) / 1000.0 for r in
+                              self.conn.execute("SELECT gw, MAX(updated_at) FROM replica GROUP BY gw")} \
+                    if _has(self.conn, "replica") else {}
+                if sig is not None:
+                    with _DECODED_LOCK:
+                        _SEEN[str(self.path)] = (sig, self._seen)
         return self._seen
 
     def hub_stale(self) -> bool:
@@ -244,6 +263,8 @@ class View:
                 hit = _DECODED.get(key)
             if hit is not None and hit[0] == sig:
                 return hit[1]
+            if table == "replica" and _has_seq(self.conn):
+                return self._decoded_replica_incremental(key, sig, coll, hit)
         out = []
         for r in self.conn.execute(sql, args):
             d = _loads(r["data"])
@@ -252,6 +273,45 @@ class View:
         if sig is not None:
             with _DECODED_LOCK:
                 _DECODED[key] = (sig, out)
+        return out
+
+    def _decoded_replica_incremental(self, key: tuple, sig: tuple, coll: str, hit: Optional[tuple]) -> list:
+        """``_decoded("replica", coll)`` decoding only rows written since the cached copy. Any hub.db commit moves the
+        file signature, and hub-sync commits several times a minute (mostly other collections), so the plain cache
+        re-decoded ~10k session rows of JSON on nearly every Desktop poll. ``seq`` is the hub's change-feed position
+        and an update rewrites it, so rows past the cached high-water mark are exactly the new and changed ones;
+        COUNT and TOTAL(seq) against the cached rows catch deletions and resyncs, which reload in full. Contract: a
+        writer that changes a row's data also moves its seq, as every hermes_hub.py upsert does. [daveey]"""
+        where, args = "coll = ? AND gw IS NOT ?", (coll, self.gateway)
+        count, total = self.conn.execute(
+            "SELECT COUNT(*), TOTAL(seq) FROM replica WHERE " + where, args).fetchone()
+        state = hit[2] if hit is not None and len(hit) > 2 else None
+        if state is None:
+            by_key, high, seqs = {}, None, {}
+            new = self.conn.execute(
+                "SELECT gw, key, data, version, updated_at, seq FROM replica WHERE " + where, args)
+        else:
+            by_key, high, seqs = dict(state[0]), state[1], dict(state[2])
+            new = self.conn.execute(
+                "SELECT gw, key, data, version, updated_at, seq FROM replica WHERE " + where + " AND seq > ?",
+                args + (high if high is not None else -1,))
+        for r in new:
+            row = {k: r[k] for k in ("gw", "key", "data", "version", "updated_at")}
+            ident = (r["gw"], r["key"])
+            seqs[ident] = r["seq"] or 0
+            d = _loads(r["data"])
+            if d is None:
+                by_key.pop(ident, None)
+            else:
+                by_key[ident] = (row, d)
+            high = r["seq"] if high is None or (r["seq"] or 0) > high else high
+        if len(seqs) != count or abs(sum(seqs.values()) - (total or 0)) > 0.5:
+            if state is None:  # a full read that still disagrees: the table moved under us; serve it uncached
+                return list(by_key.values())
+            return self._decoded_replica_incremental(key, sig, coll, None)
+        out = list(by_key.values())
+        with _DECODED_LOCK:
+            _DECODED[key] = (sig, out, (by_key, high, seqs))
         return out
 
     def rows(self, coll: str) -> List[dict]:
