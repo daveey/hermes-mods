@@ -2,7 +2,7 @@
 
 Patch:
 
-- `patches/0722-feat-clarify-a-decision-recorded-in-the-For-you-queu.patch`: `tools/clarify_early.py`,
+- `patches/0723-feat-clarify-a-decision-recorded-in-the-For-you-queu.patch`: `tools/clarify_early.py`,
   `tools/clarify_tool.py`, `agent/inline_tool_executors.py`, `tui_gateway/agent_callbacks.py`,
   `tui_gateway/server_requests.py`.
 

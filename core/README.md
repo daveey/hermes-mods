@@ -396,7 +396,7 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Process and CI followups](process-ci-test-followups.md) | 0327 0332 0333 0337 0354 0374–0375 | Readiness, duplicate deadline identities, curl detection fallback and bounded fast-check lane. |
 | [Session start requests](session-start-requests.md) | 0376–0377 | Trusted metadata, authenticated SSH principal and persisted-owner preservation. |
 | [Session-start toolset allowlist](session-start-toolsets.md) | 0477 0486 0553 | A durable start can pin a closed toolset allowlist (validated, persisted, kept across resume, compression and branches; reloads cannot widen it). Runners repair chats use it to get only the runners tools. |
-| [Blocked clarify answered elsewhere](clarify-early-answer.md) | 0722 | A decision recorded in the user-steps For-you queue ends a session's blocked `clarify` within seconds (`answered_elsewhere`) instead of at its timeout |
+| [Blocked clarify answered elsewhere](clarify-early-answer.md) | 0723 | A decision recorded in the user-steps For-you queue ends a session's blocked `clarify` within seconds (`answered_elsewhere`) instead of at its timeout |
 
 Latest appended range (0458–0460): [456-patch verification](mirror-456-verification.md); before that (0396–0339): [453-patch verification](mirror-453-verification.md). Current full-series apply instructions and executed tests: [390-patch verification](mirror-390-verification.md). Historical adaptations, duplicate treatment and broader prior tests: [377-patch verification](mirror-377-verification.md).
 

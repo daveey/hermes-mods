@@ -390,7 +390,7 @@ this plugin documentation.
 
 A decision is delivered as a new turn, which the runtime refuses while the session's turn is active. When that turn is
 blocked in `clarify` on the same human, `clarify_early.py` (a provider for core's `tools/clarify_early.py`, core
-patch 0722) hands the session's recorded-but-undelivered decisions to the clarify as
+patch 0723) hands the session's recorded-but-undelivered decisions to the clarify as
 `{status: answered_elsewhere, decisions: [{requestId, title, choice, decidedAt, via}]}` before it asks and every 2 s
 while it waits. "The session" is the owner's stored id or a compression ancestor/descendant of it. The operations are
 then delivered with a receipt `run: {destination: clarify_early_answer, toolCallId}` (cards and inbox as usual, no
