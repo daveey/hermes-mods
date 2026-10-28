@@ -83,5 +83,5 @@ Orphans (old patches whose source commit was rebased away) kept in place because
 ## Checks
 
 - Privacy: new patches pass `core/` denylist scan (`.githooks/pre-commit`), `From:` identities rewritten, one live ssh target rewritten to `hub.example.com`, co-author trailers normalized.
-- Sequential `git am -3` replay from the merge-base `4957bbd0a0` cannot cover the whole series: it passes 0509 and stops at 0510 (and the pre-existing series stopped at its 0467, the same patch) because merge-commit conflict resolutions are not patches; real commit cherry-picks fail the same way. Per-commit equivalence above is the authoritative check.
+- Sequential `git am -3` replay from the merge-base `4957bbd0a0` used to stop at 0510 (and the pre-existing series stopped at its 0467, the same patch) because merge-commit conflict resolutions are not patches. The 2026-10-28 repair adapted that patch and the later fork-context conflicts to the linear series; the published series now applies from the merge-base through the tip. See [mirror-651-verification.md](mirror-651-verification.md). Per-commit equivalence above remains the inventory check.
 

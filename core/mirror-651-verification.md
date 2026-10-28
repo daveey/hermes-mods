@@ -12,14 +12,27 @@ New patch headers use `daveey <daveey@users.noreply.github.com>`. Standard path/
 
 Executed `git am -3` for 0631–0650 in a detached throwaway worktree at fork commit `7f117fa465`, then applied 0651. The private fork base needed its placement marker context normalized to the existing public 0565 substitutions before 0646 could apply. The corresponding old test's profile string was normalized too before rerunning placement tests. No regression assertion or acceptance criterion was weakened.
 
-The complete curated series was separately attempted using:
+The complete curated series was repaired and re-run on 2026-10-28:
 
 ```sh
 git worktree add --detach <scratch> 4957bbd0a0
 git -C <scratch> am -3 --empty=keep <mods>/core/patches/*.patch
 ```
 
-It applies through 0509, then conflicts at **0510** in `apps/desktop/src/store/session-dot-state.ts`. This reproduces the previously documented historical gap, before this appended range; it is not a verified end-to-end install from upstream. A dedicated repair follow-up was filed. Both throwaway worktrees were removed after verification.
+That command, against the then-published 664 patches (0001–0664), exited 0. Two patches 3-way-merged to "already applied" (a duplicate exact-owner admission commit, and the i18n `_keys.desktop.json` regenerate) and did not add a commit; 0610 was kept as an empty commit. Patches 0665 and 0666, published while that apply ran, then applied cleanly on the result. No manual conflict resolution.
+
+Problem: the same command previously applied 0001–0509 and stopped at 0510 with a content conflict in `apps/desktop/src/store/session-dot-state.ts` (log `out-1793171518-3540167-e3f0.log`; reproduced before the edit).
+Why 1: 0510's `withRowActivity` row type was cut against the fork's merge-resolved field order. The linear series still has patch 0364's order (`kanban_unseen | offline_cached | kanban_observed_at | kanban_remote_stale | kanban_unknown`). Evidence: the conflict hunk, and each order matching once in the patch set.
+Why 2: the published series is not a linear `format-patch` of `upstream/main..origin/main`. From 0343 it has a different order, and merge resolutions such as `165df7ddf9` are not patches, so fork context never appears in the series tree.
+Why 3: the next fork-context patches then conflicted the same way. 0543 assumed 0557's `_replica_decoded` cache, which the series applies later. 0545 re-added a stalled block 0555 had already introduced. 0604/0618 assumed a lockguard scan the series had already replaced with `replica_cards`. 0610 rewrote `198.51.100.7` to `192.0.2.10`, which 0592 already did. Evidence: each `git am --continue` stopped at the next of these.
+Root (happened): patches are exported from the fork's merge-resolved tree and appended in fork order, while the public series is a curated linearization. Context that exists only because of a merge, or because a later fork commit is numbered earlier, does not apply.
+Root (not caught): full-series apply was written down as a known gap (this file, README, mirror-reconciliation.md). `core/check_coverage.py` checks doc rows, not applyability, so a later append could publish on top of a series that does not apply.
+Recurrence: the same stop was already recorded (the pre-existing series stopped at its 0467, the same patch). Recording the gap did not adapt the patch, so the next full-series run hit it again.
+Countermeasures: the seven patches above were adapted to series context and their numbers kept. Proof is the exit-0 apply. A standing "re-run the full series before every append" gate is not in this change; the apply takes several minutes and would collide with an in-flight append.
+
+Equivalence limit: 0555's stripe-trace log still omits `kanban_stalled`. Folding that field into the indexed 0555 patch makes `git apply --check` fail, because the patch no longer matches its recorded blobs. The stripe itself counts stalled work (0545); the omission is the diagnostic log line only.
+
+Repair tests, on the applied tree, with `HERMES_PYTHON` pointing at the live checkout's `.venv` and desktop `node_modules` symlinked from an existing worktree: `tests/hermes_cli/test_kanban_session_activity.py`, `test_kanban_remote_inventory_cache.py` and `test_kanban_replica_decode_memo.py` 64 passed; `test_kanban_chat_links.py` and `test_kanban_chat_links_parity.py` 32 passed; `apps/desktop` vitest `src/store/session-dot-state.test.ts` 68 passed. Untested here: a full desktop `tsc`/`eslint` run, and every other test file in the applied tree.
 
 ## Executed regression tests
 

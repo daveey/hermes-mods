@@ -1,4 +1,4 @@
-From 070e9c30c8a5da2b9b4bc85057025799f598ede1 Mon Sep 17 00:00:00 2001
+From 5c29ae7c1ace231dcb63aa8a1369881e01cf3128 Mon Sep 17 00:00:00 2001
 From: daveey <daveey@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 04:44:35 +0000
 Subject: [PATCH] fix(kanban): OFD lock guard on every board connection;
@@ -52,7 +52,6 @@ shared handle table.
 ---
  hermes_cli/kanban_awaiting.py                 |   3 +-
  hermes_cli/kanban_capability_registry.py      |   3 +-
- hermes_cli/kanban_chat_links.py               |   3 +-
  hermes_cli/kanban_db_connect.py               |   6 +-
  hermes_cli/kanban_db_notify.py                |   3 +-
  hermes_cli/kanban_db_workspace.py             |   3 +-
@@ -66,7 +65,7 @@ shared handle table.
  tests/hermes_cli/test_kanban_db.py            |   3 +
  tests/hermes_cli/test_kanban_lockguard.py     | 246 ++++++++++++++++++
  .../test_wal_lock_guard_lifecycle.py          |  17 +-
- 16 files changed, 507 insertions(+), 26 deletions(-)
+ 15 files changed, 505 insertions(+), 25 deletions(-)
  create mode 100644 hermes_cli/kanban_lockguard.py
  create mode 100644 tests/hermes_cli/test_kanban_lockguard.py
 
@@ -92,7 +91,7 @@ index 70cec8a6b9..3b981092ee 100644
              rows = c.execute("SELECT topic, answer, card_id, ts FROM answered ORDER BY ts DESC LIMIT 500").fetchall()
          finally:
 diff --git a/hermes_cli/kanban_capability_registry.py b/hermes_cli/kanban_capability_registry.py
-index fc52a552e4..cdaf0eeb09 100644
+index cdbbdb7d0b..a549588971 100644
 --- a/hermes_cli/kanban_capability_registry.py
 +++ b/hermes_cli/kanban_capability_registry.py
 @@ -27,6 +27,7 @@ Config (``config.yaml``, default profile of the gateway)::
@@ -112,27 +111,6 @@ index fc52a552e4..cdaf0eeb09 100644
  
  
  # --- probes --------------------------------------------------------------------------------
-diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
-index a6097e9ba4..74b17f0ddb 100644
---- a/hermes_cli/kanban_chat_links.py
-+++ b/hermes_cli/kanban_chat_links.py
-@@ -15,6 +15,7 @@ with one local query.
- 
- from __future__ import annotations
- 
-+from hermes_cli import kanban_lockguard as _kanban_lockguard
- import logging
- import sqlite3
- import time
-@@ -172,7 +173,7 @@ def links_diff(gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES) -> dict[
-     replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
-     for _slug, path in replicas:
-         if path.exists():
--            with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2) as conn:
-+            with _kanban_lockguard.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2) as conn:
-                 sessions |= {r[0] for r in conn.execute(
-                     "SELECT DISTINCT chat_session FROM task_chat_links WHERE chat_gateway = ? AND released = 0", (gateway,))}
-     replica: dict[str, set[tuple[str, str, str]]] = {}
 diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
 index 7277453b1a..d7a36b3e45 100644
 --- a/hermes_cli/kanban_db_connect.py
@@ -476,7 +454,7 @@ index e67e358581..000aa26cfb 100644
      conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
      conn.row_factory = sqlite3.Row
 diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
-index b8cc592931..9df66a9512 100644
+index aad8fa32a9..2da07d9df0 100644
 --- a/hermes_cli/kanban_session_activity.py
 +++ b/hermes_cli/kanban_session_activity.py
 @@ -14,6 +14,7 @@ seconds because the sidebar polls.
@@ -487,7 +465,7 @@ index b8cc592931..9df66a9512 100644
  import contextlib
  import json
  import logging
-@@ -357,7 +358,7 @@ UNSEEN_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "stat
+@@ -360,7 +361,7 @@ UNSEEN_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "stat
  def _read_unseen(path: Path) -> dict[str, int]:
      """``tui`` subscriptions per chat whose cursor trails a terminal event: a result the session has not been
      handed yet (its backend is gone, so no poller claims it until the unloaded-session sweeper does). [daveey]"""
@@ -496,7 +474,7 @@ index b8cc592931..9df66a9512 100644
      try:
          ph = ",".join("?" for _ in UNSEEN_KINDS)
          rows = conn.execute(
-@@ -385,11 +386,11 @@ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+@@ -388,11 +389,11 @@ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
      """Read-only open that survives a WAL db whose -wal/-shm were just removed (plain ``mode=ro`` then fails);
      never creates the file."""
      try:
@@ -510,7 +488,7 @@ index b8cc592931..9df66a9512 100644
          conn.execute("PRAGMA query_only = ON")
          return conn
  
-@@ -398,15 +399,16 @@ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+@@ -401,15 +402,16 @@ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
  # parse + WAL-index setup + close each time (~2.5 ms a board, the whole latency budget). The dashboard is long-lived,
  # so keep one read-only connection per file, shared across the threadpool (one per thread would hold ~3 fds per
  # board per worker). An idle autocommit reader holds no snapshot, so it never blocks writers or checkpoints.
@@ -530,7 +508,7 @@ index b8cc592931..9df66a9512 100644
      key = str(path)
      try:
          st = os.stat(path)
-@@ -419,12 +421,20 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
+@@ -422,12 +424,20 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
          if entry is not None and entry[1] != ident:
              stale = _RO_CACHE.pop(key)[0]
              entry = None
@@ -555,7 +533,7 @@ index b8cc592931..9df66a9512 100644
      with lock:  # bodies read every result they start: an unfinished cursor would pin a WAL snapshot
          conn.row_factory = None
          try:
-@@ -816,7 +826,7 @@ def _remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str
+@@ -872,7 +882,7 @@ def _remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str
          conn = _open_ro(path)
      else:
          path.parent.mkdir(parents=True, exist_ok=True)
@@ -564,7 +542,7 @@ index b8cc592931..9df66a9512 100644
      try:
          scope = json.dumps(_origin_scope())
          if cards is not None:
-@@ -1490,7 +1500,7 @@ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool]) -> Call
+@@ -1557,7 +1567,7 @@ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool]) -> Call
  
  def _read_recent_done(path: Path, since: float) -> list[tuple[str, dict[str, Any]]]:
      """``(session_id, card)`` for done cards completed since ``since`` that a session created or shepherds."""
@@ -574,7 +552,7 @@ index b8cc592931..9df66a9512 100644
      try:
          has_runs = conn.execute(
 diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
-index e0fd80f392..b7e30556db 100644
+index 7cc3bd3651..4618812e5f 100644
 --- a/hermes_cli/kanban_sync_client.py
 +++ b/hermes_cli/kanban_sync_client.py
 @@ -22,6 +22,7 @@ gateway's hub enrollment (``~/.config/hermes-mail/{config.json,gateway.key}``),
@@ -585,7 +563,7 @@ index e0fd80f392..b7e30556db 100644
  import json
  import logging
  import re
-@@ -655,7 +656,7 @@ def outbox_pending(paths: Iterable[Path]) -> bool:
+@@ -661,7 +662,7 @@ def outbox_pending(paths: Iterable[Path]) -> bool:
      """True when any synced board has a local change waiting to be pushed (one cheap read-only query each)."""
      for path in paths:
          try:
@@ -595,7 +573,7 @@ index e0fd80f392..b7e30556db 100644
                  if conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1").fetchone():
                      return True
 diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
-index ea8029c3a8..6d259a27bc 100644
+index 4ee4d671f1..cf87f8426e 100644
 --- a/hermes_cli/kanban_wait_check.py
 +++ b/hermes_cli/kanban_wait_check.py
 @@ -11,6 +11,7 @@ never gets re-split by a remote shell.
