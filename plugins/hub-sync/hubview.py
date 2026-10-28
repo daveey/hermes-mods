@@ -42,7 +42,11 @@ ACTIONS: Dict[str, Dict[str, Dict[str, bool]]] = {
     "tasks": {"create": {"title": True, "body": False, "assignee": False}, "comment": {"text": True},
               "complete": {"summary": False}, "block": {"reason": False}, "unblock": {"reason": False},
               "archive": {}, "assign": {"profile": True}},
+    # Phase 6b: a project changes from another gateway only as a shared field (primary); "" clears icon/color.
+    "projects": {"rename": {"name": True}, "icon": {"icon": False}, "color": {"color": False}},
 }
+# Args kept verbatim (an empty string is a value, not a missing arg).
+RAW_ARGS = ("input", "icon", "color")
 
 
 def _now() -> float:
@@ -115,7 +119,8 @@ def _meta(conn, k, d=None):
 
 # Phase 6 shared fields (hermes-hub client >= 1.5.0, config "shared_fields"): fields any gateway sets directly on the
 # hub, merged per field by HLC. Mirrors hermes_hub.SHARED / overlay(); read here so an older client keeps working.
-SHARED = {"sessions": ("title", "pinned", "archived", "hidden"), "inbox": ("archived",)}
+SHARED = {"sessions": ("title", "pinned", "archived", "hidden"), "inbox": ("archived",),
+          "projects": ("name", "icon", "color")}
 
 
 def shared_mode(conn, coll) -> str:
@@ -456,6 +461,86 @@ def tasks(gateway: Optional[str] = None, exclude: Iterable[str] = (), board: Opt
     return _with_view(fn, tasks=[])
 
 
+def _project_path_key(node: dict) -> str:
+    """Folder identity for merging one gateway's profiles (as the REST route's ``_merge_profile_tree`` does)."""
+    p = str(node.get("path") or node.get("id") or "").replace("\\", "/").rstrip("/")
+    return p.lower() if len(p) > 1 and p[1] == ":" else p
+
+
+def _project_wire(n: dict, previews: List[dict], ids: List[str]) -> dict:
+    explicit = n.get("kind") == "explicit"
+    node = {"id": n.get("id"), "label": (n.get("name") if explicit else None) or n.get("label") or n.get("id"),
+            "path": n.get("path"), "color": n.get("color") or None, "icon": n.get("icon") or None,
+            "isAuto": bool(n.get("isAuto")), "isNoProject": bool(n.get("isNoProject")),
+            "sessionCount": n.get("sessionCount") or 0, "lastActive": n.get("lastActive") or 0,
+            "totalTokens": n.get("totalTokens") or 0, "totalCostUsd": n.get("totalCostUsd") or 0,
+            "repos": [dict(r, groups=[dict(g, sessions=[]) for g in r.get("groups") or []]) for r in n.get("repos") or []],
+            "previewSessions": previews, "sessionIds": ids,
+            "members": [{"gateway": n["gateway"], "profile": n.get("profile"), "id": n.get("id"), "key": n["key"],
+                         "kind": n.get("kind")}]}
+    if n.get("shared"):
+        node["shared"] = n["shared"]
+    return node
+
+
+def _merge_project(into: dict, other: dict, preview_limit: int) -> dict:
+    if into["isAuto"] and not other["isAuto"]:  # a declared project's label/color/icon win the identity
+        into, other = other, into
+    repos = {r["id"]: r for r in into["repos"]}
+    for r in other["repos"]:
+        if r["id"] in repos:
+            groups = {g["id"]: g for g in repos[r["id"]].get("groups") or []}
+            for g in r.get("groups") or []:
+                groups.setdefault(g["id"], g)
+            repos[r["id"]] = dict(repos[r["id"]], groups=list(groups.values()),
+                                  sessionCount=(repos[r["id"]].get("sessionCount") or 0) + (r.get("sessionCount") or 0))
+        else:
+            repos[r["id"]] = r
+    into["repos"] = list(repos.values())
+    for k in ("sessionCount", "totalTokens", "totalCostUsd"):
+        into[k] = (into.get(k) or 0) + (other.get(k) or 0)
+    into["lastActive"] = max(into.get("lastActive") or 0, other.get("lastActive") or 0)
+    into["previewSessions"] = _sort_activity(into["previewSessions"] + other["previewSessions"])[:preview_limit]
+    into["sessionIds"] = into["sessionIds"] + other["sessionIds"]
+    into["members"] = into["members"] + other["members"]
+    return into
+
+
+def projects(gateway: Optional[str] = None, exclude: Iterable[str] = (), preview_limit: int = 3) -> dict:
+    """Each gateway's project tree from the replica (hermes-hub >= 1.9.0): its published tree nodes with shared
+    name/icon/color on top, previews and sessionIds from its session records (stamped ``project``), profiles merged
+    by folder. ``{"gateways": {gw: {"projects": [...], "scoped_session_ids": [...], "synced_at"}}}``; a node's
+    ``members`` name every (gateway, profile, id) it stands for, so a rename can target each explicit one."""
+    def fn(v: View):
+        nodes = _gw_filter(v.rows("projects"), gateway, exclude)
+        gws = {n["gateway"] for n in nodes}
+        by_node: Dict[tuple, List[dict]] = {}
+        rows: Dict[tuple, dict] = {}
+        for s in v.rows("sessions"):
+            if s["gateway"] not in gws or s.get("archived") or s.get("hidden"):
+                continue
+            rows[(s["gateway"], s.get("profile"), s.get("id"))] = s
+            if s.get("project"):
+                by_node.setdefault((s["gateway"], s.get("profile"), s["project"]), []).append(s)
+        out: Dict[str, dict] = {}
+        for n in nodes:
+            gw, profile = n["gateway"], n.get("profile")
+            node_key = n["key"].split("/", 1)[1]
+            claimed = by_node.get((gw, profile, node_key), [])
+            previews = [rows[(gw, profile, i)] for i in n.get("previewIds") or [] if (gw, profile, i) in rows]
+            wire = _project_wire(n, previews[:preview_limit], [s["id"] for s in claimed])
+            merged = out.setdefault(gw, {"by_path": {}, "synced_at": v.synced_at(gw) if gw != v.gateway else v.now})
+            k = _project_path_key(wire)
+            merged["by_path"][k] = _merge_project(merged["by_path"][k], wire, preview_limit) if k in merged["by_path"] else wire
+        result = {}
+        for gw, m in out.items():
+            tree = sorted(m["by_path"].values(), key=lambda p: -(p.get("lastActive") or 0))
+            result[gw] = {"projects": tree, "scoped_session_ids": [i for p in tree for i in p["sessionIds"]],
+                          "synced_at": m["synced_at"]}
+        return {"gateways": result}
+    return _with_view(fn, gateways={})
+
+
 def where(session_id: str) -> dict:
     def fn(v: View):
         hits = []
@@ -566,11 +651,11 @@ def validate(body: Dict[str, Any], own_gateway: Optional[str], known: Iterable[s
     clean = {}
     for k, req in spec.items():
         v = args.get(k)
-        if v is None or (isinstance(v, str) and not v.strip() and k != "input"):
+        if v is None or (isinstance(v, str) and not v.strip() and k not in RAW_ARGS):
             if req:
                 raise RequestError(400, "%s %s needs %s" % (coll, action, k))
             continue
-        clean[k] = v if k == "input" else str(v)
+        clean[k] = v if k in RAW_ARGS else str(v)
     extra = set(args) - set(spec)
     if extra:
         raise RequestError(400, "unexpected args: %s" % ", ".join(sorted(extra)))
@@ -626,6 +711,8 @@ def request(body: Dict[str, Any], wait_s: float = SEND_WAIT_S) -> dict:
         if not own:
             raise RequestError(503, "this gateway has no hub name yet (run `hermes-hub sync`)")
         req = validate(body, own, known)  # inbox: callers pass the version they displayed as base_version
+        if req["coll"] == "projects" and shared_mode(v.conn, "projects") != "primary":
+            raise RequestError(409, "projects on other gateways change only with shared_fields.projects primary")
     finally:
         v.conn.close()
     db = client.open_db(path)

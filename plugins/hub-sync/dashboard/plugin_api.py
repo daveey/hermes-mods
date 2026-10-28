@@ -65,6 +65,11 @@ async def get_inbox(gateway: Optional[str] = None, exclude: Optional[str] = None
     return await asyncio.to_thread(_hv().inbox, gateway, _split(exclude), bool(all))
 
 
+@router.get("/projects")
+async def get_projects(gateway: Optional[str] = None, exclude: Optional[str] = None, preview_limit: int = 3) -> Dict[str, Any]:
+    return await asyncio.to_thread(_hv().projects, gateway, _split(exclude), max(0, min(preview_limit, 50)))
+
+
 @router.get("/tasks")
 async def get_tasks(gateway: Optional[str] = None, exclude: Optional[str] = None, board: Optional[str] = None,
                     all: int = 0) -> Dict[str, Any]:  # noqa: A002
