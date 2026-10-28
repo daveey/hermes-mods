@@ -37,7 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import coach_fixer as fx  # noqa: E402
 
-CAPS = {"scout": 3.0, "fixer": 7.0, "trial": 10.0, "selfheal": 25.0}
+CAPS = {"scout": 3.0, "fixer": 7.0, "trial": 10.0, "selfheal": 200.0}
 TOTAL_USD_DAY = 20.0
 LANES = ("scout", "fixer", "trial", "bot", "selfheal")
 # Lanes with their own approved daily cap that do not count toward (or stop at) the engine total: self-heal

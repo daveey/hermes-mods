@@ -620,7 +620,7 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #                     (selfheal_stale), so the next detection refiles it under a new generation.
 #   backstop (cron)   runs the complaint detector over new user turns in the coach digests (chats where the
 #                     in-process hook did not fire).
-#   budget            engine_budget lane `selfheal`: $25/UTC day (its own cap, outside the $20 engine total), <= 3
+#   budget            engine_budget lane `selfheal`: $200/UTC day (its own cap, outside the $20 engine total), <= 3
 #                     running cards, <= 1 filing per fingerprint per UTC day. Known cap denials never create a card;
 #                     investigations persist for admission retry, and fixes keep the Do-it outcome retryable.
 # Events (coach log.jsonl, read by coach_weekly's self-heal section): selfheal_would_file, selfheal_filed,
@@ -634,7 +634,7 @@ INVESTIGATION_RUNTIME = 3600
 FIX_RUNTIME = 7200
 INVESTIGATION_BUDGET = 8
 FIX_BUDGET = 15
-USD_DAY = 25.0
+USD_DAY = 200.0
 MAX_RUNNING = 3
 SNOOZE_DAYS = 14
 NOT_DEFECT_DAYS = 7
@@ -1024,7 +1024,7 @@ def _detected_at(d: dict) -> Optional[float]:
 def _pending_priority(d: dict) -> tuple:
     """Drain order: complaints/admissions, then machine signals, then the digest backstop; within a class the
     likelier defect, then the newest. Input (~75 new fingerprints a day in the Oct 2026 shadow log) far exceeds the
-    $25/day lane (~3 cards), so this order decides which defects get investigated at all."""
+    $200/day lane, so this order decides which defects get investigated at all."""
     try:
         p = float(d.get("p_defect") or 0)
     except (TypeError, ValueError):

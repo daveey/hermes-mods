@@ -375,14 +375,14 @@ def test_cron_retries_pending_only_when_live(store, monkeypatch, mode):
     assert calls == ([1] if mode == "live" else [])
 
 
-def test_engine_budget_selfheal_lane_has_its_own_25_cap_outside_the_total(tmp_path):
+def test_engine_budget_selfheal_lane_has_its_own_200_cap_outside_the_total(tmp_path):
     eb = load("engine_budget_lane_test", REPO / "skills/productivity/hermes-coach/scripts/engine_budget.py")
-    assert eb.CAPS["selfheal"] == 25.0 and "selfheal" in eb.SEPARATE
+    assert eb.CAPS["selfheal"] == 200.0 and "selfheal" in eb.SEPARATE
     snap = {"caps": dict(eb.CAPS), "total_cap": 20.0, "lanes": {"scout": 0, "fixer": 7, "trial": 13, "bot": 0,
                                                                  "selfheal": 10}, "total": 20.0}
     assert eb.check(snap, "selfheal")[0] is True  # engine total is spent, the selfheal lane is not
     assert eb.check(snap, "fixer")[0] is False
-    snap["lanes"]["selfheal"] = 25.0
+    snap["lanes"]["selfheal"] = 200.0
     ok, why = eb.check(snap, "selfheal")
     assert not ok and "selfheal lane" in why
     fx = load("coach_fixer_lane_test", REPO / "skills/productivity/hermes-coach/scripts/coach_fixer.py")

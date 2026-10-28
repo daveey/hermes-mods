@@ -378,7 +378,7 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   **Never** suppresses it. (Do it is not a Kanban `task` action because a worker is fenced from creating cards via the CLI.)
 - **Recurrence**: a fixed fingerprint that comes back files `selfheal:<fp>:r<n>`, whose brief says "previous fix <id>
   didn't hold" and requires a detection-level guard.
-- **Budget**: engine_budget lane `selfheal` ($25/UTC day, its own cap outside the $20 engine total; spend = these
+- **Budget**: engine_budget lane `selfheal` ($200/UTC day, its own cap outside the $20 engine total; spend = these
   cards' worker sessions), ≤ 3 running, ≤ 1 filing per fingerprint per UTC day. A known spend/concurrency denial
   creates **no card**: investigations persist in `coach/selfheal_pending.sqlite`, retried through admission by the
   live cron after midnight / one hour; failed retries retain their full evidence. Fixes remain proposed so Inbox
