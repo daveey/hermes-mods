@@ -1,0 +1,424 @@
+From 23b3a53bf3dc7fd095ab974a233571d55f02e2b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:22:14 -0700
+Subject: [PATCH] fix(kanban-sync): an older feed copy of a run never reopens
+ it; close dangling runs [daveey]
+
+A run that ended within one sync round of an earlier write of the same row came back 'running' on the gateway and
+on the Board (MacBook/hub/mini had 12/5/1 such rows). Child rows have no per-field clocks and push whole: the pull
+applied the feed copy of an older state of the run (our own earlier op, whose outbox row the push had already
+deleted, or the Board's lease-grant copy) over the newer local row, and the push then sent that clobbered row to
+the Board. The card had moved on (current_run_id cleared), so no path reached the run again.
+
+- apply: skip a feed copy of an existing child row while a local edit of it is pending in the outbox, and a
+  task_runs copy at or below task_runs.sync_version (new local-only column: the Board version last applied or
+  acknowledged; push records it from the op result)
+- dispatcher: close_dangling_runs (in the orphan pass) closes runs still 'running' that are not their card's current
+  run and are over 10 min old; on a synced board the close is pushed like any write
+
+Tests: test_kanban_sync_run_rows.py (red before on the stale-lock reclaim, orphan sweep, run-ends-before-first-push,
+newer-Board-write and sweep cases; a grant whose local CAS lost passes against a Board-faithful fake), the fake Board
+gains opt-in lease runs. test_kanban_sync_apply ms test: clear the claim's pending outbox and give the later copy a
+higher version (it relied on blind overwrite). Kanban t_01a17fd938a6621c.
+---
+ hermes_cli/kanban_db_dispatch.py              |  34 ++++
+ hermes_cli/kanban_db_sync.py                  |  30 ++-
+ hermes_cli/kanban_sync_client.py              |   5 +
+ tests/hermes_cli/kanban_sync_fake_board.py    |  22 ++-
+ tests/hermes_cli/test_kanban_sync_apply.py    |   5 +-
+ tests/hermes_cli/test_kanban_sync_run_rows.py | 176 ++++++++++++++++++
+ 6 files changed, 268 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_run_rows.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 1dd0939d23..81c01bb585 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1038,6 +1038,39 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+     return reconciled
+ 
+ 
++# A run younger than this may still be settling (a claim and its run row land in one txn, but a synced board's
++# feed can briefly carry a run ahead of its card's row), so the sweep leaves it alone.
++DANGLING_RUN_MIN_AGE_SECONDS = 600
++
++
++def close_dangling_runs(conn: sqlite3.Connection, *, min_age_seconds: int = DANGLING_RUN_MIN_AGE_SECONDS) -> list[int]:
++    """Close runs still ``running`` that are not their card's current run; returns their ids. [daveey]
++
++    Every claim path ends its run through ``current_run_id``. Once that pointer has moved on (cleared by a
++    terminal transition, or pointing at a newer run) nothing can reach the old row again, so a run that a path
++    abandoned, or that a sync race reopened after it ended, stays ``running`` forever and reads as live work.
++    The row is closed ``reclaimed``; on a synced board the capture trigger sends that to the Board."""
++    cutoff = int(time.time()) - min_age_seconds
++    closed: list[int] = []
++    with _kb.write_txn(conn):
++        rows = conn.execute(
++            "SELECT r.id, r.task_id FROM task_runs r JOIN tasks t ON t.id = r.task_id "
++            "WHERE r.status = 'running' AND r.ended_at IS NULL AND r.started_at < ? "
++            "  AND (t.current_run_id IS NULL OR t.current_run_id != r.id)", (cutoff,),
++        ).fetchall()
++        now = int(time.time())
++        for row in rows:
++            cur = conn.execute(
++                "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', ended_at = ?, "
++                "claim_expires = NULL, error = COALESCE(error, ?) WHERE id = ? AND ended_at IS NULL",
++                (now, "dangling run: no longer the card's current run", row["id"]),
++            )
++            if cur.rowcount == 1:
++                closed.append(int(row["id"]))
++                _kb._log.info("kanban reconcile: closed dangling run %s of task %s", row["id"], row["task_id"])
++    return closed
++
++
+ def _error_fingerprint(error_text: str) -> str:
+     """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
+     fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
+@@ -2350,6 +2383,7 @@ def _run_reclaim_phase(
+     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+     if reconcile_orphans:
+         result.reconciled_orphans = reconcile_orphaned_running(conn)
++        close_dangling_runs(conn)
+     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
+     result.crashed = detect_crashed_workers(conn, board=board)
+     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index b510b828bf..85c6c975df 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -80,7 +80,10 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+     "task_links": frozenset(),
+     "task_comments": frozenset(),
+     "task_events": frozenset(),
+-    "task_runs": frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at"}),
++    # ``sync_version``: the Board version of the row this gateway last applied or had acknowledged (the fence that
++    # keeps an older copy of a run from the feed off a newer local row).
++    "task_runs": frozenset({"claim_lock", "claim_expires", "worker_pid", "worker_started_at", "last_heartbeat_at",
++                            "sync_version"}),
+     "task_attachments": frozenset({"stored_path"}),
+     "task_chat_links": frozenset(),
+ }
+@@ -200,6 +203,7 @@ _SYNC_COLUMN_DDL = (
+     *((t, "uid", "uid TEXT") for t in _UID_TABLES),
+     ("task_attachments", "blob_key", "blob_key TEXT"),
+     ("tasks", "sync_version", "sync_version INTEGER"),
++    ("task_runs", "sync_version", "sync_version INTEGER"),
+     ("tasks", "field_hlc", "field_hlc TEXT"),
+     ("tasks", "lease_holder", "lease_holder TEXT"),
+     ("tasks", "lease_expires", "lease_expires INTEGER"),
+@@ -933,10 +937,16 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+                             (cols["parent_id"], cols["child_id"])).rowcount == 1
+     existing = conn.execute(f"SELECT id FROM {table} WHERE uid = ?", (ch.uid,)).fetchone()
+     if existing is not None:
++        if _local_row_is_newer(conn, table, ch, existing[0]):
++            return False
++        if table == "task_runs" and ch.version:
++            cols["sync_version"] = ch.version
+         assignments = ", ".join(f"{c} = ?" for c in cols)
+         if cols:
+             conn.execute(f"UPDATE {table} SET {assignments} WHERE id = ?", (*cols.values(), existing[0]))
+         return True
++    if table == "task_runs" and ch.version:
++        cols["sync_version"] = ch.version
+     if table == "task_attachments":
+         cols["stored_path"] = ""
+         result.blobs_to_fetch.append(ch.uid)
+@@ -946,6 +956,24 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+     return True
+ 
+ 
++def _local_row_is_newer(conn: sqlite3.Connection, table: str, ch: RemoteChange, row_id: int) -> bool:
++    """True when the feed's copy of an existing child row must not overwrite it.
++
++    Child rows have no per-field clocks, so the last write wins wherever it lands. Two copies are older than what
++    this gateway holds: one while a local edit of the row is still in the outbox (the push sends the row whole and
++    makes it the Board's newest version), and one at or below the Board version this gateway last applied or had
++    acknowledged (``task_runs.sync_version``). Without this, our own earlier push of a run (its outbox row already
++    gone) or the Board's lease-grant copy, pulled after the run ended here, reopened it as ``running`` and the next
++    push sent that back to the Board."""
++    if conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name = ? AND row_uid = ? AND state = 'pending' "
++                    "LIMIT 1", (table, ch.uid)).fetchone():
++        return True
++    if table != "task_runs" or not ch.version:
++        return False
++    seen = conn.execute("SELECT sync_version FROM task_runs WHERE id = ?", (row_id,)).fetchone()[0]
++    return seen is not None and ch.version <= seen
++
++
+ def _delete_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> bool:
+     from hermes_cli import kanban_db as _kb
+     _tombstone(conn, "tasks", ch.uid)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 418f0f43a4..e0fd80f392 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -340,6 +340,11 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     if row["table_name"] == "tasks" and res.get("version"):
+                         conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
+                                      (res["version"], row["row_uid"]))
++                    elif row["table_name"] == "task_runs" and res.get("version"):
++                        # The Board now holds this row at that version: its own feed copy of it (or anything
++                        # older) must not overwrite the local row later.
++                        conn.execute("UPDATE task_runs SET sync_version = MAX(COALESCE(sync_version, 0), ?) "
++                                     "WHERE uid = ?", (res["version"], row["row_uid"]))
+                     setattr(out, status, getattr(out, status) + 1)
+                     if status == "merged" and primary and res.get("row"):
+                         authoritative.append(_row_change(row["table_name"], res["row"]))
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 0719cc9308..ae8999014e 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -16,10 +16,13 @@ FENCED = {"status", "current_run_uid", "result", "started_at", "completed_at"}
+ 
+ 
+ class FakeService:
+-    def __init__(self) -> None:
++    def __init__(self, *, lease_runs: bool = False) -> None:
+         self.boards: dict[str, dict[str, Any]] = {}
+         self.calls: list[tuple[str, str, Any]] = []
+         self.offline = False
++        # Like transitions.ts grantLease/releaseTask: a grant writes the card running plus its run row, a release
++        # ends that run and returns the card to ready. Off by default (the older tests count rows).
++        self.lease_runs = lease_runs
+ 
+     def board(self, bid: str) -> dict[str, Any]:
+         return self.boards.setdefault(bid, {"seq": 0, "floor": 0, "changes": [], "rows": {}, "applied": {}, "leases": {}})
+@@ -134,14 +137,29 @@ class FakeHub:
+         b = self.svc.board(board)
+         task, run = body["task"], body["run_uid"]
+         cur = b["leases"].get(task)
++        op_id, hlc, gw = body.get("client_op_id"), f"{9_999_999_999_998:013d}-0000-board", self.gateway
++        version = None
+         if body["action"] == "grant":
+             if cur and cur["holder"] != self.gateway:
+                 return {"status": "rejected", "reason": "lease_held", "lease": cur}
+             b["leases"][task] = {"task_id": task, "holder": self.gateway, "run_uid": run, "expires": 9_999_999_999_999}
++            if self.svc.lease_runs and task in b["rows"].get("tasks", {}):
++                self.svc._put(b, "task_runs", run, {"task_id": task, "status": "running", "started_at": 1,
++                                                    "ended_at": None, "outcome": None}, gw, op_id, hlc)
++                version = self.svc._put(b, "tasks", task, {"status": "running", "current_run_uid": run,
++                                                           "lease_holder": gw, "lease_expires": 9_999_999_999_999},
++                                        gw, op_id, hlc)["version"]
+         elif body["action"] == "renew":
+             if not cur or cur["holder"] != self.gateway or cur["run_uid"] != run:
+                 return {"status": "rejected", "reason": "lease_lost", "lease": cur}
+         else:
+             b["leases"].pop(task, None)
++            runs = b["rows"].get("task_runs", {})
++            if (self.svc.lease_runs and cur and cur["run_uid"] == run and run in runs
++                    and runs[run].get("ended_at") is None):
++                self.svc._put(b, "task_runs", run, {"status": "released", "outcome": "released", "ended_at": 2},
++                              gw, op_id, hlc)
++                self.svc._put(b, "tasks", task, {"status": "ready", "current_run_uid": None, "lease_holder": None,
++                                                 "lease_expires": None}, gw, op_id, hlc)
+             return {"status": "applied", "lease": None}
+-        return {"status": "applied", "lease": b["leases"][task]}
++        return {"status": "applied", "lease": b["leases"][task], "version": version}
+diff --git a/tests/hermes_cli/test_kanban_sync_apply.py b/tests/hermes_cli/test_kanban_sync_apply.py
+index 1c8171423c..8eb5090113 100644
+--- a/tests/hermes_cli/test_kanban_sync_apply.py
++++ b/tests/hermes_cli/test_kanban_sync_apply.py
+@@ -187,6 +187,8 @@ def test_millisecond_timestamps_from_the_wire_are_stored_in_seconds(synced_conn)
+     run_uid = conn.execute("SELECT r.uid FROM tasks t JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
+                            (tid,)).fetchone()[0]
+     started_s = conn.execute("SELECT started_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0]
++    # The claim's own rows have been pushed (a still-pending local edit of a run keeps the local row).
++    conn.execute("DELETE FROM kanban_sync_outbox")
+     ms = started_s * 1000 + 955
+     page = [
+         _ch(1, "task_runs", run_uid, {"task_id": tid, "status": "running", "profile": "worker", "started_at": ms,
+@@ -203,7 +205,8 @@ def test_millisecond_timestamps_from_the_wire_are_stored_in_seconds(synced_conn)
+     assert tuple(conn.execute("SELECT created_at, started_at, completed_at FROM tasks WHERE id = 't_remote_ms000001'")
+                  .fetchone()) == (started_s, started_s, started_s)
+     # Seconds and nulls pass through untouched.
+-    sync.apply_remote_changes(conn, [_ch(5, "task_runs", run_uid, {"task_id": tid, "ended_at": started_s + 7})],
++    sync.apply_remote_changes(conn, [_ch(5, "task_runs", run_uid, {"task_id": tid, "ended_at": started_s + 7},
++                                                   version=2)],
+                               new_cursor=5)
+     assert conn.execute("SELECT ended_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0] == started_s + 7
+     assert sync.to_seconds(None) is None and sync.to_seconds(True) is True and sync.to_seconds("x") == "x"
+diff --git a/tests/hermes_cli/test_kanban_sync_run_rows.py b/tests/hermes_cli/test_kanban_sync_run_rows.py
+new file mode 100644
+index 0000000000..f241df11ff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_run_rows.py
+@@ -0,0 +1,176 @@
++"""Every path that ends or abandons a claim ends that claim's run row, on this gateway and on the Board.
++
++The live failure (2026-10-27, MacBook ``default``): a run that ended within one sync round of an earlier push of
++the same row came back ``running``. The pull applied the feed copy of an older state of the row (our own earlier
++op, whose outbox row the push had already deleted, or the Board's lease-grant row) over the newer local row, and
++the push then sent that clobbered row whole, so the Board went back to ``running`` too. Runs carry no
++``current_run_id`` after they end, so nothing ever closed them again.
++
++Service: the in-memory Board fake with Board-faithful lease runs (``kanban_sync_fake_board``).
++"""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = "macbook", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield conn
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
++
++
++def _round(kanban_home, svc):
++    res = ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    assert res.error is None and (res.push is None or res.push.rejected == 0)
++    return res
++
++
++def _run(conn, uid):
++    return conn.execute("SELECT status, outcome, ended_at FROM task_runs WHERE uid = ?", (uid,)).fetchone()
++
++
++def _board_run(svc, uid):
++    return svc.board(BOARD)["rows"]["task_runs"][uid]
++
++
++def _claimed(live, kanban_home, svc, title):
++    tid = kb.create_task(live, title=title, assignee="worker")
++    _round(kanban_home, svc)
++    assert kb.claim_task(live, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++    uid = live.execute("SELECT r.uid FROM tasks t JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
++                       (tid,)).fetchone()[0]
++    return tid, uid
++
++
++def _assert_ended(live, svc, uid, outcome):
++    local = _run(live, uid)
++    assert (local["status"], local["outcome"]) == (outcome, outcome) and local["ended_at"], dict(local)
++    board = _board_run(svc, uid)
++    assert (board["status"], board["outcome"]) == (outcome, outcome) and board["ended_at"], board
++    dangling = live.execute(
++        "SELECT r.id FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE r.ended_at IS NULL "
++        "AND r.status = 'running' AND (t.current_run_id IS NULL OR t.current_run_id != r.id)").fetchall()
++    assert not dangling
++
++
++def test_stale_lock_reclaim_survives_the_echo_of_the_runs_earlier_push(live, kanban_home, svc):
++    tid, uid = _claimed(live, kanban_home, svc, "stale lock")
++    _round(kanban_home, svc)  # the run's insert reaches the Board; its echo now waits in the feed
++    live.execute("UPDATE tasks SET claim_expires = ?, worker_pid = NULL WHERE id = ?", (int(time.time()) - 5, tid))
++    assert kb.release_stale_claims(live) == 1
++    _round(kanban_home, svc)  # pull (the stale echo) then push (the end)
++    _round(kanban_home, svc)
++    _assert_ended(live, svc, uid, "reclaimed")
++
++
++def test_orphan_sweep_survives_the_echo_of_the_runs_earlier_push(live, kanban_home, svc):
++    tid, uid = _claimed(live, kanban_home, svc, "orphan")
++    _round(kanban_home, svc)
++    live.execute("UPDATE tasks SET claim_lock = NULL, worker_pid = NULL WHERE id = ?", (tid,))
++    assert kd.reconcile_orphaned_running(live) == [tid]
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    _assert_ended(live, svc, uid, "reclaimed")
++
++
++def test_a_run_that_ends_before_its_first_push_survives_the_grants_own_run_row(live, kanban_home, svc):
++    """The Board's grant wrote the run row before the local claim did; that copy reaching the gateway after the
++    run already ended (a slow round) must not reopen it."""
++    tid, uid = _claimed(live, kanban_home, svc, "slow round")
++    live.execute("UPDATE tasks SET claim_expires = ?, worker_pid = NULL WHERE id = ?", (int(time.time()) - 5, tid))
++    assert kb.release_stale_claims(live) == 1
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    _assert_ended(live, svc, uid, "reclaimed")
++
++
++def test_a_grant_whose_local_claim_lost_ends_its_run_everywhere(live, kanban_home, svc, monkeypatch):
++    tid = kb.create_task(live, title="cas lost", assignee="worker")
++    _round(kanban_home, svc)
++    monkeypatch.setattr(kb, "claim_and_open_run", lambda *a, **k: None)  # another claimer won the local CAS
++    assert kb.claim_task(live, tid, ttl_seconds=900) is None
++    assert not svc.board(BOARD)["leases"]  # the unused lease was handed back
++    (uid,) = svc.board(BOARD)["rows"]["task_runs"]
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    _assert_ended(live, svc, uid, "released")
++    assert kb.get_task(live, tid).status == "ready"
++
++
++def test_a_newer_board_write_to_a_run_still_lands(live, kanban_home, svc):
++    """The fence only drops copies we already have: a later Board write (another writer's end) applies."""
++    _tid, uid = _claimed(live, kanban_home, svc, "board ends it")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    b = svc.board(BOARD)
++    svc._put(b, "task_runs", uid, {"status": "reclaimed", "outcome": "reclaimed", "ended_at": 7}, "server", None,
++             f"{9_999_999_999_999:013d}-0000-server")
++    _round(kanban_home, svc)
++    assert tuple(_run(live, uid)) == ("reclaimed", "reclaimed", 7)
++    assert live.execute("SELECT sync_version FROM task_runs WHERE uid = ?", (uid,)).fetchone()[0] == \
++        _board_run(svc, uid)["version"]
++
++
++def test_the_dispatcher_closes_a_dangling_run_and_the_board_follows(live, kanban_home, svc):
++    """Backstop for rows left behind before the fence (and any path not found yet): a run still ``running`` that
++    is no longer its card's current run is closed once it is old enough to have settled."""
++    tid, uid = _claimed(live, kanban_home, svc, "dangling")
++    _round(kanban_home, svc)
++    # What the race left on every host: the card moved on, the run row did not.
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
++                     "current_run_id = NULL WHERE id = ?", (tid,))
++    _live_tid, live_uid = _claimed(live, kanban_home, svc, "live run")  # a current run must never be touched
++    young = kb.create_task(live, title="young", assignee="worker")
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
++                     (young, int(time.time())))
++    old = int(time.time()) - kd.DANGLING_RUN_MIN_AGE_SECONDS - 1
++    live.execute("UPDATE task_runs SET started_at = ? WHERE uid IN (?, ?)", (old, uid, live_uid))
++    closed = kd.close_dangling_runs(live)
++    assert [live.execute("SELECT uid FROM task_runs WHERE id = ?", (i,)).fetchone()[0] for i in closed] == [uid]
++    assert kd.close_dangling_runs(live) == []  # idempotent
++    _round(kanban_home, svc)
++    assert _run(live, uid)["status"] == "reclaimed" and _run(live, uid)["ended_at"]
++    assert _board_run(svc, uid)["status"] == "reclaimed" and _board_run(svc, uid)["ended_at"]
++    assert _run(live, live_uid)["status"] == "running" and _board_run(svc, live_uid)["status"] == "running"
++    assert live.execute("SELECT count(*) FROM task_runs WHERE task_id = ? AND status = 'running'",
++                        (young,)).fetchone()[0] == 1
++
++
++def test_dispatch_pass_runs_the_dangling_run_sweep(live, monkeypatch):
++    called = []
++    monkeypatch.setattr(kd, "close_dangling_runs", lambda conn, **kw: called.append(conn) or [])
++    kd.dispatch_once(live, dry_run=True)
++    assert called
+-- 
+2.55.0
+
