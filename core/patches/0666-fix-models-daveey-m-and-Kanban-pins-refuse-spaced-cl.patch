@@ -1,0 +1,445 @@
+From 0bee5c66da5a986cd1544de39a396634495984df Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 07:51:06 +0000
+Subject: [PATCH] fix(models): [daveey] -m and Kanban pins refuse spaced cloud
+ model ids like /model does
+
+A route probe passed seven model ids as one `-m` value ("claude-opus-5-5
+openai-codex/gpt-6-astra ..."). /model has refused spaced ids on cloud
+providers for a long time, but the startup -m/--model flag (chat, TUI, -z)
+and Kanban --model pins never called that rule: Anthropic answered 404 x3,
+and on a host with a fallback chain the probe "passed" on another model.
+
+- models_validate.model_whitespace_error(): the /model whitespace rule as a
+  shared helper (same self-hosted / user base_url exemptions).
+- startup -m: refuse before any API call, exit 2, "Model names cannot
+  contain spaces. Pass one model per run."
+- kanban create_task / set_model_override: ValueError, also after a
+  provider-less pin is bound by resolve_pin_provider.
+- error_classifier: Anthropic 404 not_found_error "model: <id>" is
+  model_not_found, not a generic unknown 404.
+- tests/hermes_cli/test_model_whitespace_entry_parity.py runs the same bad
+  and good ids through /model, -m, -z and Kanban so they cannot drift.
+
+Self-heal agent-0a0a3008d1 (card t_01a1815770364ddb).
+---
+ agent/error_classifier.py                     |  14 ++
+ hermes_cli/kanban_db.py                       |  15 ++
+ hermes_cli/main.py                            |  24 +++
+ hermes_cli/models_validate.py                 |  31 ++-
+ tests/agent/test_error_classifier.py          |  24 +++
+ .../test_model_whitespace_entry_parity.py     | 201 ++++++++++++++++++
+ 6 files changed, 306 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_model_whitespace_entry_parity.py
+
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index 3938594c5c..47eb727bfb 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -1041,6 +1041,18 @@ def _status_403(c: _Ctx) -> Verdict:
+     return _V_AUTH_FALLBACK
+ 
+ 
++def _is_anthropic_model_not_found(body: Any) -> bool:
++    """Anthropic's unknown-model 404 names the field instead of saying "model not found":
++    ``{"type": "error", "error": {"type": "not_found_error", "message": "model: <id>"}}`` [daveey].
++    Only the ``model:`` field counts; a 404 on a file or batch id is not a missing model."""
++    if not isinstance(body, dict):
++        return False
++    err = _error_obj(body)
++    if not isinstance(err, dict) or str(err.get("type") or "").lower() != "not_found_error":
++        return False
++    return str(err.get("message") or "").strip().lower().startswith("model:")
++
++
+ def _status_404(c: _Ctx) -> Verdict:
+     # Structured billing code first, as in _status_429: this handler always returns,
+     # so _by_error_code never sees it; a bare "Not Found" message has nothing to match.
+@@ -1049,6 +1061,8 @@ def _status_404(c: _Ctx) -> Verdict:
+     verdict = _first_match(c.msg, _404_RULES)
+     if verdict is not None:
+         return verdict
++    if _is_anthropic_model_not_found(c.body):
++        return _V_MODEL_NOT_FOUND
+     # Bare id the catalogue only knows prefixed → malformed id (NVIDIA NIM "404
+     # page not found", #78796). A generic 404 (wrong path, proxy glitch) stays
+     # unknown so the real error surfaces instead of a silent misreported fallback.
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 53e6953547..764231e8e7 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1039,9 +1039,22 @@ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> t
+     provider = (provider or "").strip() or None
+     if provider and not model:
+         raise ValueError("provider_override requires a model_override")
++    _reject_spaced_pin(model, provider)
+     return model, provider
+ 
+ 
++def _reject_spaced_pin(model: Optional[str], provider: Optional[str]) -> None:
++    """The ``/model`` whitespace rule for Kanban pins [daveey]. A provider-less pin is checked again
++    once ``resolve_pin_provider`` binds its provider (a ``custom`` profile keeps spaced ids)."""
++    if not model or not provider:
++        return
++    from hermes_cli.models_validate import model_whitespace_error
++
++    message = model_whitespace_error(model, provider)
++    if message:
++        raise ValueError(f"{message} Pin one model per card (got {model!r} on provider {provider!r}).")
++
++
+ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
+     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
+     if assignee is None:
+@@ -1320,6 +1333,7 @@ def create_task(
+     # [daveey] Bind a provider-less concrete pin now (or refuse), never late-bind it to config at spawn.
+     from hermes_cli.kanban_pin_provider import resolve_pin_provider
+     model_override, provider_override = resolve_pin_provider(model_override, provider_override, assignee=assignee)
++    _reject_spaced_pin(model_override, provider_override)
+ 
+     # Retry once on the extremely unlikely id collision.
+     for attempt in range(2):
+@@ -1551,6 +1565,7 @@ def set_model_override(
+         from hermes_cli.kanban_pin_provider import resolve_pin_provider
+         row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         model, provider = resolve_pin_provider(model, None, assignee=row[0] if row else None)
++        _reject_spaced_pin(model, provider)
+     return _set_task_override(
+         conn, task_id,
+         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 5e32accabd..eeec79140a 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -1187,6 +1187,29 @@ def _has_any_provider_configured(*, strict_profile_scope: bool = False) -> bool:
+     return False
+ 
+ 
++def _reject_startup_spaced_model(explicit_model: str, explicit_provider: str, model_cfg: dict) -> None:
++    """``-m`` gets the ``/model`` whitespace rule before any API call [daveey].
++
++    A shell loop that fails to split a list passes every id as one ``-m`` value; a cloud provider
++    then 404s it (or a fallback chain answers on a different model and the probe "passes").
++    The configured base_url only counts when it belongs to the provider being used.
++    """
++    if not explicit_model or not any(ch.isspace() for ch in explicit_model):
++        return
++    cfg_provider = str(model_cfg.get("provider") or "").strip()
++    provider = explicit_provider or cfg_provider
++    base_url = str(model_cfg.get("base_url") or "").strip()
++    if explicit_provider and explicit_provider != cfg_provider:
++        base_url = ""
++    from hermes_cli.models_validate import model_whitespace_error
++
++    if model_whitespace_error(explicit_model, provider, base_url or None):
++        sys.stderr.write(
++            f"Model names cannot contain spaces. Pass one model per run.\n  got: -m {explicit_model!r}\n"
++        )
++        raise SystemExit(2)
++
++
+ def _confirm_startup_expensive_model_override(args) -> None:
+     """Guard startup -m/--provider overrides before the first API call."""
+     explicit_model = (getattr(args, "model", None) or "").strip()
+@@ -1213,6 +1236,7 @@ def _confirm_startup_expensive_model_override(args) -> None:
+     config = _dict(config)
+     model_cfg = _dict(config.get("model"))
+     security_cfg = _dict(config.get("security"))
++    _reject_startup_spaced_model(explicit_model, explicit_provider, model_cfg)
+ 
+     model = explicit_model or (model_cfg.get("default") or "").strip()
+     if not model:
+diff --git a/hermes_cli/models_validate.py b/hermes_cli/models_validate.py
+index deefb45603..b8017fb29c 100644
+--- a/hermes_cli/models_validate.py
++++ b/hermes_cli/models_validate.py
+@@ -229,6 +229,33 @@ def _whitespace_allowed(req: _Request) -> bool:
+     return provider_allows_model_whitespace(req.provider or req.normalized, req.base_url)
+ 
+ 
++def _normalized_provider(provider: Optional[str], base_url: Optional[str]) -> str:
++    """``validate_requested_model``'s provider normalization (OpenRouter on a foreign URL is custom)."""
++    from hermes_cli import models as _m
++
++    normalized = _m.normalize_provider(provider)
++    if normalized == "openrouter" and base_url and not base_url_host_matches(base_url, "openrouter.ai"):
++        normalized = "custom"
++    return normalized
++
++
++def model_whitespace_error(
++    model: Optional[str], provider: Optional[str], base_url: Optional[str] = None,
++) -> Optional[str]:
++    """The ``/model`` whitespace rule for any other entry point (startup ``-m``, Kanban pins) [daveey].
++
++    Returns the refusal message, or None when the id is fine for this provider/base_url. Same
++    exemptions as ``/model``: self-hosted providers and a user-configured base_url keep spaced ids.
++    """
++    requested = (model or "").strip()
++    if not requested or not any(ch.isspace() for ch in requested):
++        return None
++    req = _Request(requested, requested, provider, _normalized_provider(provider, base_url),
++                   None, base_url, None, None)
++    verdict = _reject_whitespace(req)
++    return verdict["message"] if verdict else None
++
++
+ def offered_model_ids(models, provider: Optional[str], base_url: Optional[str] = None) -> list:
+     """Ids a picker may show. Drops whitespace the validator will refuse; keeps the rest."""
+     ids = list(models or [])
+@@ -793,9 +820,7 @@ def validate_requested_model(
+     from hermes_cli import models as _m
+ 
+     requested = (model_name or "").strip()
+-    normalized = _m.normalize_provider(provider)
+-    if normalized == "openrouter" and base_url and not base_url_host_matches(base_url, "openrouter.ai"):
+-        normalized = "custom"
++    normalized = _normalized_provider(provider, base_url)
+     lookup = requested
+     if normalized == "copilot":
+         lookup = _m.normalize_copilot_model_id(requested, api_key=api_key) or requested
+diff --git a/tests/agent/test_error_classifier.py b/tests/agent/test_error_classifier.py
+index a771891262..7fdcd27e6e 100644
+--- a/tests/agent/test_error_classifier.py
++++ b/tests/agent/test_error_classifier.py
+@@ -230,6 +230,30 @@ class TestClassifyApiError:
+         assert result.retryable is False
+         assert result.should_fallback is True
+ 
++    def test_404_anthropic_not_found_error_on_model_is_model_not_found(self):
++        # Anthropic's 404 for an unknown id names the field, not "model not found":
++        # {"type":"error","error":{"type":"not_found_error","message":"model: <id>"}}.
++        # It must not read as a generic unknown 404 [daveey].
++        bad = "claude-opus-5-5 openai-codex/gpt-6-astra xai-oauth/grok-4.7"
++        e = MockAPIError(
++            f"Error code: 404 - {{'type': 'error', 'error': {{'type': 'not_found_error', 'message': 'model: {bad}'}}}}",
++            status_code=404,
++            body={"type": "error", "error": {"type": "not_found_error", "message": f"model: {bad}"}},
++        )
++        result = classify_api_error(e, provider="anthropic", model=bad)
++        assert result.reason == FailoverReason.model_not_found
++        assert result.retryable is False
++
++    def test_404_anthropic_not_found_error_on_other_resource_stays_unknown(self):
++        # Only the model field: a 404 on a file/batch id is not a missing model.
++        e = MockAPIError(
++            "Error code: 404",
++            status_code=404,
++            body={"type": "error", "error": {"type": "not_found_error", "message": "File not found: file_abc"}},
++        )
++        result = classify_api_error(e, provider="anthropic", model="claude-opus-5-5")
++        assert result.reason != FailoverReason.model_not_found
++
+     def test_404_retired_free_route_is_model_not_found(self):
+         # The provider retired the :free route — the slug is dead for every
+         # credential, so fall back instead of burning retries (#123180). Not
+diff --git a/tests/hermes_cli/test_model_whitespace_entry_parity.py b/tests/hermes_cli/test_model_whitespace_entry_parity.py
+new file mode 100644
+index 0000000000..8d38296ab8
+--- /dev/null
++++ b/tests/hermes_cli/test_model_whitespace_entry_parity.py
+@@ -0,0 +1,201 @@
++"""Every entry point that takes a model id refuses the same spaced ids [daveey].
++
++``/model`` (validate_requested_model) has refused "a b" on cloud providers for a long time. The
++startup ``-m``/``--model`` flag (chat, TUI, ``-z`` one-shot) and Kanban ``--model`` pins did not, so a
++shell loop that failed to split a list sent ``-m "claude-opus-5-5 openai-codex/gpt-6-astra ..."`` to
++Anthropic (404 x3) or, on a host with a fallback chain, "passed" on a different model. This file runs
++the same bad/good ids through each entry point so they cannot drift apart again.
++"""
++from argparse import Namespace
++from pathlib import Path
++import sys
++import types
++
++import pytest
++
++SPACES_MSG = "Model names cannot contain spaces"
++
++# (model, provider) a cloud provider can never serve.
++BAD = [
++    ("claude-opus-5-5 openai-codex/gpt-6-astra xai-oauth/grok-4.7", "anthropic"),
++    ("a b", "anthropic"),
++    ("claude\topus", "anthropic"),
++    ("gpt 5.4", "openai-codex"),
++]
++# Self-hosted / user endpoints really do serve spaced ids: every entry point must keep accepting them.
++GOOD_LOCAL = [
++    ("My Model", "custom", "http://localhost:8000/v1"),
++    ("Meta Llama 3.1 8B", "ollama", "http://127.0.0.1:11434/v1"),
++]
++
++
++# ── /model ──────────────────────────────────────────────────────────────
++
++@pytest.mark.parametrize("model,provider", BAD)
++def test_slash_model_rejects(model, provider):
++    from hermes_cli.models_validate import validate_requested_model
++
++    result = validate_requested_model(model, provider)
++    assert result["accepted"] is False
++    assert SPACES_MSG in result["message"]
++
++
++@pytest.mark.parametrize("model,provider,base_url", GOOD_LOCAL)
++def test_shared_helper_allows_local(model, provider, base_url):
++    from hermes_cli.models_validate import model_whitespace_error
++
++    assert model_whitespace_error(model, provider, base_url) is None
++
++
++@pytest.mark.parametrize("model,provider", BAD)
++def test_shared_helper_rejects(model, provider):
++    from hermes_cli.models_validate import model_whitespace_error
++
++    assert SPACES_MSG in (model_whitespace_error(model, provider) or "")
++
++
++# ── startup -m / --model (chat, TUI, -z) ────────────────────────────────
++
++def _chat_args(**overrides):
++    base = dict(
++        continue_last=None, model=None, provider=None, resume=None, no_restore_cwd=False,
++        toolsets=None, skills=None, tui=False, tui_dev=False, cli=True, verbose=None,
++        quiet=True, query="Reply with exactly ROUTE_OK", image=None, worktree=False,
++        checkpoints=False, pass_session_id=False, max_turns=None, ignore_rules=False,
++        ignore_user_config=False, safe_mode=False, compact=False, source=None, yolo=False,
++        accept_hooks=False,
++    )
++    base.update(overrides)
++    return Namespace(**base)
++
++
++@pytest.fixture
++def main_mod(monkeypatch):
++    import hermes_cli.main as mod
++
++    monkeypatch.setattr(mod, "_has_any_provider_configured", lambda: True)
++    monkeypatch.setattr(mod, "_sync_bundled_skills_for_startup", lambda: None)
++    monkeypatch.setattr(mod, "_pin_kanban_board_env", lambda: None)
++    monkeypatch.setattr(mod, "_resolve_session_by_name_or_id", lambda val: val)
++    monkeypatch.setattr(mod, "_oneshot_cleanup_done", False)
++
++    class _NoTTY:
++        def isatty(self):
++            return False
++
++    monkeypatch.setattr(sys, "stdin", _NoTTY())
++    return mod
++
++
++@pytest.fixture
++def fake_cli(monkeypatch):
++    """Stands in for cli.main: anything captured here means an agent (and its HTTP client) was built."""
++    captured = {}
++    monkeypatch.setitem(sys.modules, "cli", types.SimpleNamespace(main=lambda **kw: captured.update(kw)))
++    return captured
++
++
++def _config(monkeypatch, provider="anthropic", base_url=""):
++    model = {"provider": provider, "default": "claude-opus-5-5"}
++    if base_url:
++        model["base_url"] = base_url
++    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": model})
++
++
++@pytest.fixture
++def no_http(monkeypatch):
++    """Any Anthropic client construction fails the test: the refusal must come before the first call."""
++    def _boom(*a, **k):
++        raise AssertionError("an Anthropic client was built for a spaced model id")
++
++    import agent.anthropic_adapter as adapter
++    monkeypatch.setattr(adapter, "build_anthropic_client", _boom, raising=False)
++
++
++@pytest.mark.parametrize("model,provider", BAD)
++def test_cmd_chat_m_rejects_before_any_call(main_mod, fake_cli, no_http, monkeypatch, capsys, model, provider):
++    _config(monkeypatch)
++    with pytest.raises(SystemExit) as exc:
++        main_mod.cmd_chat(_chat_args(model=model, provider=provider))
++    assert exc.value.code == 2
++    assert not fake_cli
++    err = capsys.readouterr().err
++    assert "Model names cannot contain spaces. Pass one model per run." in err
++
++
++def test_cmd_chat_m_rejects_with_config_provider(main_mod, fake_cli, no_http, monkeypatch, capsys):
++    """No --provider: the configured cloud provider decides (the MacBook incident's shape)."""
++    _config(monkeypatch, provider="anthropic")
++    with pytest.raises(SystemExit) as exc:
++        main_mod.cmd_chat(_chat_args(model=BAD[0][0]))
++    assert exc.value.code == 2
++    assert not fake_cli
++
++
++def test_oneshot_z_rejects(main_mod, no_http, monkeypatch, capsys):
++    _config(monkeypatch)
++    called = []
++    monkeypatch.setattr(main_mod, "_run_and_exit_oneshot", lambda *a, **k: called.append(1))
++    args = _chat_args(model="a b", provider="anthropic")
++    args.oneshot = "hi"
++    with pytest.raises(SystemExit) as exc:
++        main_mod._run_oneshot_from_args(args)
++    assert exc.value.code == 2
++    assert not called
++
++
++@pytest.mark.parametrize("model,provider,base_url", GOOD_LOCAL)
++def test_cmd_chat_m_accepts_local_spaced_id(main_mod, fake_cli, monkeypatch, model, provider, base_url):
++    _config(monkeypatch, provider=provider, base_url=base_url)
++    main_mod.cmd_chat(_chat_args(model=model, provider=provider))
++    assert fake_cli["model"] == model
++
++
++# ── Kanban --model pins ─────────────────────────────────────────────────
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    (home / "config.yaml").write_text("kanban:\n  orchestrator_profile: supervisor\n")
++    for name in ("worker", "supervisor"):
++        profile = home / "profiles" / name
++        profile.mkdir(parents=True)
++        (profile / "config.yaml").write_text(
++            "model:\n  default: claude-opus-5-5\n  provider: anthropic\n"
++            "platform_toolsets:\n  cli: [terminal, file, kanban]\nterminal:\n  backend: local\n")
++    from hermes_cli import kanban_db as kb
++
++    kb.init_db()
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        yield conn
++
++
++@pytest.mark.parametrize("model,provider", BAD)
++def test_kanban_create_rejects(board, model, provider):
++    from hermes_cli import kanban_db as kb
++
++    with pytest.raises(ValueError, match=SPACES_MSG):
++        kb.create_task(board, title="probe", assignee="worker", model_override=model, provider_override=provider)
++    assert board.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("model,provider", BAD)
++def test_kanban_set_model_rejects(board, model, provider):
++    from hermes_cli import kanban_db as kb
++
++    tid = kb.create_task(board, title="probe", assignee="worker")
++    with pytest.raises(ValueError, match=SPACES_MSG):
++        kb.set_model_override(board, tid, model, provider)
++    assert kb.get_task(board, tid).model_override is None
++
++
++def test_kanban_create_accepts_custom_spaced_id(board):
++    from hermes_cli import kanban_db as kb
++
++    tid = kb.create_task(board, title="probe", assignee="worker", model_override="My Model",
++                         provider_override="custom")
++    assert kb.get_task(board, tid).model_override == "My Model"
+-- 
+2.55.0
+

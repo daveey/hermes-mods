@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [model-id-whitespace-entry-parity.md](model-id-whitespace-entry-parity.md) | 0666 | `-m`/`-z`/`--tui` and Kanban model pins refuse spaced cloud model ids like `/model` does (exit 2 before any API call); Anthropic 404 `model: <id>` classifies as model_not_found. |
 | [cron-script-sane-path.md](cron-script-sane-path.md) | 0665 | Cron scripts and the cron worker get the terminal's sane PATH (`~/.local/bin` and the standard dirs) whichever process won the tick lock; run docs name the runner process. |
 | [spotlight-noindex-scratch.md](spotlight-noindex-scratch.md) | 0664 | On macOS cache/scratch and cache/uv live in `*.noindex` dirs behind symlinks, so Hermes's temp churn stays out of Spotlight. |
 | [kanban-spawn-tests-host-independent.md](kanban-spawn-tests-host-independent.md) | 0663 | Kanban spawn env/PYTHONPATH tests pin the restart-safe scope wrapper so they pass with or without systemd. |
