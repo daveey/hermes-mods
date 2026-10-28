@@ -1,0 +1,172 @@
+From 4c32c4aad303ae83f7d2e54f9466d99b3a8835b8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:30:55 -0700
+Subject: [PATCH] perf(sessions): project the list preview onto the page, not
+ every admitted session [daveey]
+
+list_sessions_rich(order_by_last_active=True) put the correlated preview
+subquery in the paged SELECT. SQLite computes every result column for each
+candidate row before ORDER BY ... LIMIT keeps the page, so the sidebar read
+one message per session in the store (7.6k sessions / 600k messages here)
+for each slice, three slices per refresh.
+
+Pick the page in an inner SELECT (OFFSET keeps it unflattened) and project
+the preview onto those rows only. On the live 12 GB state.db the sidebar's
+three slices drop from 1.39s to 0.35s (cron 0.51s -> 0.04s, messaging
+0.69s -> 0.17s); rows, order and previews are identical on the same snapshot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_sessions.py                      | 29 ++++---
+ .../test_session_list_preview_page_only.py    | 82 +++++++++++++++++++
+ 2 files changed, 101 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_state/test_session_list_preview_page_only.py
+
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index d630d36cb5..19c4c44a9f 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -1380,11 +1380,12 @@ class SessionSessionsMixin:
+             where_clauses.append("s.hidden = 0")
+         where_sql = _where_sql(where_clauses)
+         # Shared projection head of the three list queries (whitespace is part of the SQL text).
+-        select_head = (
++        select_cols = (
+             f"SELECT {self._compact_session_cols() if compact_rows else 's.*'}"
+             + ("" if compact_rows else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved")
+-            + f",\n                    {_sql_preview_raw()},\n                    "
++            + ",\n                    "
+         )
++        select_head = f"{select_cols}{_sql_preview_raw()},\n                    "
+         prompt_join = (
+             "" if compact_rows else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
+         )
+@@ -1397,6 +1398,10 @@ class SessionSessionsMixin:
+             outer_where, id_params = self._chain_search_where(
+                 where_sql, (id_query or "").strip().lower(), (search_query or "").strip().lower(),
+             )
++            # The page is picked first and the preview projected onto it afterwards:
++            # SQLite computes every result column for each admitted row before
++            # ORDER BY ... LIMIT, so an inline preview read one message per session
++            # in the store, not per listed row. OFFSET keeps ``page`` unflattened.
+             query = f"""
+                 WITH RECURSIVE chain(root_id, cur_id) AS (
+                     SELECT s.id, s.id FROM sessions s {where_sql}
+@@ -1418,14 +1423,18 @@ class SessionSessionsMixin:
+                     FROM chain
+                     GROUP BY root_id
+                 )
+-                {select_head}{_sql_session_last_active("s")} AS last_active,
+-                    COALESCE(cm.effective_last_active, {_sql_in_window("s.started_at")}) AS _effective_last_active
+-                FROM sessions s
+-                LEFT JOIN chain_max cm ON cm.root_id = s.id
+-                {prompt_join}
+-                {outer_where}
+-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+-                LIMIT ? OFFSET ?
++                SELECT page.*, {_sql_preview_raw("page.id")}
++                FROM (
++                    {select_cols}{_sql_session_last_active("s")} AS last_active,
++                        COALESCE(cm.effective_last_active, {_sql_in_window("s.started_at")}) AS _effective_last_active
++                    FROM sessions s
++                    LEFT JOIN chain_max cm ON cm.root_id = s.id
++                    {prompt_join}
++                    {outer_where}
++                    ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
++                    LIMIT ? OFFSET ?
++                ) page
++                ORDER BY page._effective_last_active DESC, page.started_at DESC, page.id DESC
+             """
+             params = params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
+         else:
+diff --git a/tests/hermes_state/test_session_list_preview_page_only.py b/tests/hermes_state/test_session_list_preview_page_only.py
+new file mode 100644
+index 0000000000..04379f42ac
+--- /dev/null
++++ b/tests/hermes_state/test_session_list_preview_page_only.py
+@@ -0,0 +1,82 @@
++"""The session-list preview subquery runs for the returned page only, not every admitted session.
++
++SQLite evaluates every result column for each candidate row before ORDER BY ... LIMIT keeps the page,
++so a correlated preview column in the paged SELECT read one message per admitted session: ~0.55 s of a
++0.67 s sidebar slice on a 7.6k-session / 600k-message store, three slices per sidebar refresh.
++"""
++
++import sqlite3
++
++import pytest
++
++import hermes_state_sessions
++from hermes_state import SessionDB
++
++N_SESSIONS = 30
++LIMIT = 5
++
++
++@pytest.fixture()
++def db(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    for i in range(N_SESSIONS):
++        sid = f"s{i:02d}"
++        db.create_session(sid, "cli")
++        db.append_messages_batch(sid, [
++            {"role": "user", "content": f"hello from {sid}", "timestamp": 1_000 + i},
++            {"role": "assistant", "content": "hi", "timestamp": 1_000 + i + 0.5},
++        ])
++    db.set_session_pinned("s00", True)
++    yield db
++    db.close()
++
++
++def _count_preview_evaluations(db, monkeypatch, call):
++    calls = []
++    real_preview = hermes_state_sessions._sql_preview_raw
++
++    def counted_preview(session_id_expr="s.id"):
++        expr, alias = real_preview(session_id_expr).rsplit(" AS ", 1)
++        return f"count_preview({expr}) AS {alias}"
++
++    def count_preview(value):
++        calls.append(value)
++        return value
++
++    monkeypatch.setattr(hermes_state_sessions, "_sql_preview_raw", counted_preview)
++    real_connect = sqlite3.connect
++
++    def connect(*args, **kwargs):
++        conn = real_connect(*args, **kwargs)
++        conn.create_function("count_preview", 1, count_preview)
++        return conn
++
++    monkeypatch.setattr(sqlite3, "connect", connect)
++    # Pooled readers opened before the patch would not know the UDF: drop them.
++    db.close()
++    db = SessionDB(db_path=db.db_path)
++    try:
++        rows = call(db)
++    finally:
++        db.close()
++    return rows, calls
++
++
++@pytest.mark.parametrize("order_by_last_active", [True, False])
++def test_preview_is_computed_for_page_rows_only(db, monkeypatch, order_by_last_active):
++    rows, calls = _count_preview_evaluations(db, monkeypatch, lambda d: d.list_sessions_rich(
++        limit=LIMIT, order_by_last_active=order_by_last_active, include_pinned=True, compact_rows=True))
++
++    # The newest LIMIT sessions plus the back-filled pin (s00 is the oldest, so off the page).
++    assert [r["id"] for r in rows] == [f"s{i:02d}" for i in range(N_SESSIONS - 1, N_SESSIONS - 1 - LIMIT, -1)] + ["s00"]
++    assert all(r["preview"] == f"hello from {r['id']}" for r in rows)
++    # One evaluation per returned row (page + pin back-fill), never one per admitted session.
++    assert len(calls) == len(rows), f"preview evaluated {len(calls)}x for {len(rows)} rows"
++
++
++def test_full_rows_keep_preview_and_order(db):
++    rows = db.list_sessions_rich(limit=LIMIT, offset=2, order_by_last_active=True, compact_rows=False)
++
++    assert [r["id"] for r in rows] == [f"s{i:02d}" for i in range(N_SESSIONS - 3, N_SESSIONS - 3 - LIMIT, -1)]
++    assert all(r["preview"] == f"hello from {r['id']}" for r in rows)
++    assert all("_effective_last_active" not in r for r in rows)
+-- 
+2.55.0
+

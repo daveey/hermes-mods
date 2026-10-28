@@ -44,3 +44,7 @@ Source commit `4af6ea3a81` (`fix(session-start): no session store means no tools
 - The pin protects the Hermes session only; it does not constrain what the allowed tools themselves do. The runners tools go through the management broker, which enforces its own policy.
 - Sessions that already exist before this lands are unpinned; only starts created after it carry an allowlist.
 - `delegate_task` children are impossible because the tool is absent; if you add a toolset that can spawn agents to an allowlist, the children inherit the parent's `enabled_toolsets` rules, not a pin.
+
+## Follow-up patch (0553)
+
+**0553** (source `d439b11518`): `tests/tui_gateway/test_start_toolsets.py` uses `dict` instead of `lambda: {}` (ruff PIE807). Test-only.

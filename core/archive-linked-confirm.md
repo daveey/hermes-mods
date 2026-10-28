@@ -82,3 +82,7 @@ These are automated client tests, not proof that a running Desktop bundle has lo
 `archiveSession` is renderer core with no hook before the RPC. A plugin could only intercept clicks on the DOM,
 which misses the hotkey and tile menu and breaks on markup changes. The core part is a small generic guard API,
 and the data-specific check (machines) stays in a plugin.
+
+## Follow-up patch (0560)
+
+**0560** (source `5c653ed500`): the archive hotkey and tile menu archive without a selected row and resolved the owner from Recents only. While a remote gateway's pooled backend reconnects, the unified list has none of its rows, so an open hub chat had no owner and the preflight showed "Task status unavailable" for a chat with nothing linked. The owner is now resolved like resume and branch do (tagged project-tree/cron/messaging row, else the owner hint) in `archive-owner.ts`, and `refresh-archive-tasks.ts` logs why the task preflight returned unknown. Tests: `archive-linked-confirm.test.tsx` (new cases).

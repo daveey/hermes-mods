@@ -64,3 +64,7 @@ fork/upstream merge-base. The patches are not independent. Then set
 ## Plugin?
 
 No. This changes core dispatch and cron routing.
+
+## Follow-up patch (0562)
+
+**0562** documents `kanban.strong_model` / `strong_provider` in `website/docs/user-guide/configuration.md` (docs-drift ratchet). No code change.

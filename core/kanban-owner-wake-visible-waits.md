@@ -66,3 +66,7 @@ implicit `--from`, remote read failure), `apps/desktop/src/app/chat/sidebar/sess
 - The plugin needs this core (`kanban_session_activity.parked_waits`); on an older core the owner wake is a no-op.
 - `sidebar.row.kanbanStalled` is listed in `overlay-gaps.json` like its kanban neighbours (untranslated overlays).
 - ⌘] / ⌘[ still step only to green/red stripes; amber stalled is not a stop.
+
+## Follow-up patch (0564)
+
+**0564** regenerates `locales/_keys.desktop.json` for `sidebar.row.kanbanStalled` (the string was added without running `npm run i18n:keys`, which turned Main CI's JS check red) and adds a lefthook pre-commit job that runs `i18n:keys` and stages the result whenever `apps/desktop/src/i18n/en*.ts` is staged. Verified by restoring the stale file and running `lefthook run pre-commit --job "desktop i18n keys"`; `scripts/i18n-keys.test.mjs` passes.

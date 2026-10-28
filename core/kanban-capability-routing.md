@@ -55,3 +55,7 @@ Apply after 0300 (shared `requires` validation). Needs hermes-hub client >= 1.7.
 ## Plugin relationship
 
 Core: the block/schedule transitions, create preflight and the dispatcher tick are core transactions. The transport half lives in the hermes-hub client.
+
+## Follow-up patches (0561, 0567)
+
+**0561** is a lint fix (ruff FURB167/RUF100 and Windows-footgun rules) in `kanban_awaiting.py`, `kanban_capability_registry.py`, `kanban_capability_routing.py` and `tests/cron/test_cron_model_provider_pairing.py`; no behavior change. **0567** adds `hub_cli_path()` (configured value, then `PATH`, then `~/.local/bin`) and routing's `_hub_cli` uses it; see [kanban-default-placement.md](kanban-default-placement.md).

@@ -33,3 +33,7 @@ property, not covered by the tests.
 ## Plugin?
 
 No.
+
+## Follow-up patch (0570)
+
+**0570** (source `8b741ea26b`): the first run of a worker scope gets `MemoryMax` at 2x the base, bounded by admission (the same `MemAvailable` minus reserve check as recovery); typed OOM recovery doubles from that value. `hermes_cli/kanban_worker_scope.py`; test `test_first_run_base_uplift_is_admission_bounded` in `tests/hermes_cli/test_kanban_oom_recovery.py`.

@@ -1,0 +1,280 @@
+From 5b8e5443963eb24ec65ef52ef5f393d2d88a966e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:29:48 -0700
+Subject: [PATCH] fix(tests): per-host tests.host_slots cap; direct pytest runs
+ hold a host slot too [daveey]
+
+ffd03f1dec capped run_tests.sh per-file pytest processes host-wide, but at os.cpu_count() (16 on
+the MacBook) and only for runs through the runner. On 2026-10-27 the MacBook still had 6-16
+concurrent pytest runs (250-557% CPU), many started directly with a PM test-environment python.
+
+- host_slot_count(): HERMES_TEST_HOST_SLOTS env, else tests.host_slots in ~/.hermes/config.yaml
+  (HERMES_TEST_SLOT_CONFIG overrides the path; regex fallback without PyYAML), else cpu_count.
+  Per-host config applies to every new run without restarting anything.
+- tests/conftest.py: a direct pytest session of this tree waits for and holds one slot (xdist
+  workers and runner children, HERMES_TEST_SLOT_HELD=1, skip it) and marks its own children held.
+- acquire_host_slot()/release_host_slot() split out of host_test_slot().
+---
+ scripts/run_tests_host_slots.py            | 72 ++++++++++++++++++----
+ tests/conftest.py                          | 45 ++++++++++++++
+ tests/scripts/test_run_tests_host_slots.py | 65 +++++++++++++++++++
+ 3 files changed, 170 insertions(+), 12 deletions(-)
+
+diff --git a/scripts/run_tests_host_slots.py b/scripts/run_tests_host_slots.py
+index 874816689d..e3f8060170 100644
+--- a/scripts/run_tests_host_slots.py
++++ b/scripts/run_tests_host_slots.py
+@@ -11,12 +11,18 @@ crashed run frees its slots with its file descriptors.
+ A run started from inside a slot holder (a test that runs the runner) inherits
+ ``HERMES_TEST_SLOT_HELD=1`` and skips the cap, so nested runs cannot wait on slots their own parent
+ holds. ``HERMES_TEST_HOST_SLOTS=0`` disables the cap. Non-POSIX hosts are uncapped.
++
++The cap is ``HERMES_TEST_HOST_SLOTS``, else the host's ``tests.host_slots`` in ``~/.hermes/config.yaml``
++(per-host: a laptop the user works on sets a few, so agents' tests never take every core), else
++``os.cpu_count()``. A direct ``pytest`` run of this tree (a PM test-environment interpreter rather than
++scripts/run_tests.sh) holds one slot for its whole session (tests/conftest.py). [daveey]
+ """
+ from __future__ import annotations
+ 
+ import contextlib
+ import os
+ import random
++import re
+ import time
+ from collections.abc import Iterator
+ 
+@@ -24,13 +30,42 @@ HELD_ENV = "HERMES_TEST_SLOT_HELD"
+ POLL_S = 0.1
+ 
+ 
++def _config_slots() -> int | None:
++    """Per-host ``tests.host_slots`` from the Hermes config (``HERMES_TEST_SLOT_CONFIG`` overrides the path).
++
++    A laptop the user works on caps the tests every agent runs on it without restarting anything that
++    would have to inherit an env var. [daveey]
++    """
++    path = os.environ.get("HERMES_TEST_SLOT_CONFIG") or os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
++    try:
++        with open(path, encoding="utf-8") as fh:
++            text = fh.read()
++    except OSError:
++        return None
++    try:
++        import yaml
++
++        value = ((yaml.safe_load(text) or {}).get("tests") or {}).get("host_slots")
++    except Exception:  # no PyYAML in this interpreter, or a config it cannot parse: read the one key
++        m = re.search(r"^tests:[ \t]*\n(?:[ \t]+.*\n|[ \t]*\n)*?[ \t]+host_slots:[ \t]*(\d+)", text, re.M)
++        value = m.group(1) if m else None
++    try:
++        return max(0, int(value)) if value is not None and not isinstance(value, bool) else None
++    except (TypeError, ValueError):
++        return None
++
++
+ def host_slot_count() -> int:
++    """``HERMES_TEST_HOST_SLOTS`` env, else the host's ``tests.host_slots`` config, else ``os.cpu_count()``."""
+     raw = os.environ.get("HERMES_TEST_HOST_SLOTS", "").strip()
+     if raw:
+         try:
+             return max(0, int(raw))
+         except ValueError:
+             pass
++    configured = _config_slots()
++    if configured is not None:
++        return configured
+     return os.cpu_count() or 4
+ 
+ 
+@@ -54,12 +89,14 @@ def _try_slot(path: str) -> int | None:
+     return fd
+ 
+ 
+-@contextlib.contextmanager
+-def host_test_slot(on_wait=None) -> Iterator[None]:
+-    """Hold one host slot for the body. ``on_wait()`` is called once if every slot is taken."""
++def acquire_host_slot(on_wait=None) -> int | None:
++    """Block until one host slot is held; return its fd (None when the cap does not apply).
++
++    ``on_wait()`` is called once if every slot is taken. Close the fd (``release_host_slot``) to free it;
++    a crashed holder frees it with its file descriptors.
++    """
+     if not host_slots_enabled():
+-        yield
+-        return
++        return None
+     directory = host_slot_dir()
+     os.makedirs(directory, mode=0o700, exist_ok=True)
+     order = list(range(host_slot_count()))
+@@ -68,14 +105,25 @@ def host_test_slot(on_wait=None) -> Iterator[None]:
+     while True:
+         for n in order:
+             fd = _try_slot(os.path.join(directory, f"{n}.lock"))
+-            if fd is None:
+-                continue
+-            try:
+-                yield
+-            finally:
+-                os.close(fd)
+-            return
++            if fd is not None:
++                return fd
+         if not waited and on_wait is not None:
+             on_wait()
+         waited = True
+         time.sleep(POLL_S)
++
++
++def release_host_slot(fd: int | None) -> None:
++    if fd is not None:
++        with contextlib.suppress(OSError):
++            os.close(fd)
++
++
++@contextlib.contextmanager
++def host_test_slot(on_wait=None) -> Iterator[None]:
++    """Hold one host slot for the body. ``on_wait()`` is called once if every slot is taken."""
++    fd = acquire_host_slot(on_wait)
++    try:
++        yield
++    finally:
++        release_host_slot(fd)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 3ec04469ba..1e7614fa57 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1228,13 +1228,58 @@ def require_mcp_2_sdk():
+         pytest.skip(f"requires mcp=={pinned} (found {found}); install the [mcp] extra")
+ 
+ 
++def _host_slots_module():
++    import importlib.util
++
++    path = Path(__file__).resolve().parents[1] / "scripts" / "run_tests_host_slots.py"
++    spec = importlib.util.spec_from_file_location("_hermes_run_tests_host_slots", path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _take_host_test_slot(config) -> None:
++    """[daveey] A direct ``pytest`` run of this tree (a PM test-environment interpreter, not
++    scripts/run_tests.sh) holds one host-wide test slot for the whole session, like each per-file
++    process of the runner does. Runner children inherit HERMES_TEST_SLOT_HELD=1 and skip this; so
++    does anything this run spawns. xdist workers skip it (the controller holds the slot)."""
++    if hasattr(config, "workerinput"):
++        return
++    try:
++        slots = _host_slots_module()
++        if not slots.host_slots_enabled():
++            return
++
++        def note():
++            sys.stderr.write(f"(waiting for a host test slot: other runs hold all {slots.host_slot_count()} "
++                             f"in {slots.host_slot_dir()})\n")
++            sys.stderr.flush()
++
++        config._hermes_host_slot_fd = slots.acquire_host_slot(on_wait=note)
++        os.environ[slots.HELD_ENV] = "1"
++    except Exception as exc:  # the cap is advisory; never fail a run on it
++        sys.stderr.write(f"(host test slot unavailable: {exc})\n")
++
++
++def _release_host_test_slot(config) -> None:
++    fd = getattr(config, "_hermes_host_slot_fd", None)
++    if fd is not None:
++        try:
++            os.close(fd)
++        except OSError:
++            pass
++        config._hermes_host_slot_fd = None
++
++
+ def pytest_unconfigure(config):
++    _release_host_test_slot(config)
+     _remove_relocated_basetemp(config)
+ 
+ 
+ @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory
+ def pytest_configure(config):
+     """Register markers used by hermetic conftest."""
++    _take_host_test_slot(config)
+     _relocate_basetemp_outside_operator_home(config)
+     config.addinivalue_line(
+         "markers",
+diff --git a/tests/scripts/test_run_tests_host_slots.py b/tests/scripts/test_run_tests_host_slots.py
+index 8caa609b46..f2554cfb5c 100644
+--- a/tests/scripts/test_run_tests_host_slots.py
++++ b/tests/scripts/test_run_tests_host_slots.py
+@@ -118,3 +118,68 @@ def test_runner_attempt_waits_for_a_slot_and_marks_the_child(slot_env, monkeypat
+     assert time.monotonic() - started >= 0.9, "the attempt waited for the only slot"
+     assert code == 0, output
+     assert mod._SLOT_WAIT_NOTED.is_set(), "the run says once that it is waiting for slots"
++
++
++# --- per-host config fallback + direct pytest runs [daveey] -----------------------------------
++
++def test_host_config_sets_the_cap_when_the_env_does_not(tmp_path, monkeypatch):
++    cfg = tmp_path / "config.yaml"
++    cfg.write_text("model:\n  default: x\ntests:\n  # MacBook: agents' tests share 4 cores\n  host_slots: 4\n")
++    monkeypatch.setenv("HERMES_TEST_SLOT_CONFIG", str(cfg))
++    monkeypatch.delenv("HERMES_TEST_HOST_SLOTS", raising=False)
++    assert slots.host_slot_count() == 4
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "2")  # env still wins
++    assert slots.host_slot_count() == 2
++
++
++def test_host_config_parses_without_pyyaml(tmp_path, monkeypatch):
++    cfg = tmp_path / "config.yaml"
++    cfg.write_text("tests:\n  other: 1\n\n  host_slots: 3\nkanban:\n  host_slots: 9\n")
++    monkeypatch.setenv("HERMES_TEST_SLOT_CONFIG", str(cfg))
++    monkeypatch.delenv("HERMES_TEST_HOST_SLOTS", raising=False)
++    monkeypatch.setitem(sys.modules, "yaml", None)  # import yaml -> ImportError
++    assert slots.host_slot_count() == 3
++
++
++def test_missing_or_unset_host_config_keeps_cpu_count(tmp_path, monkeypatch):
++    monkeypatch.delenv("HERMES_TEST_HOST_SLOTS", raising=False)
++    monkeypatch.setenv("HERMES_TEST_SLOT_CONFIG", str(tmp_path / "absent.yaml"))
++    assert slots.host_slot_count() == (os.cpu_count() or 4)
++    cfg = tmp_path / "config.yaml"
++    cfg.write_text("tests:\n  other: 1\n")
++    monkeypatch.setenv("HERMES_TEST_SLOT_CONFIG", str(cfg))
++    assert slots.host_slot_count() == (os.cpu_count() or 4)
++
++
++def test_direct_pytest_run_holds_a_slot_for_its_session(slot_env, monkeypatch, tmp_path):
++    """A bare `python -m pytest` of this tree (no run_tests.sh) waits for, and holds, a host slot."""
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "1")
++    probe = tmp_path / "probe_slot.py"
++    probe.write_text(
++        "import os, sys, importlib.util\n"
++        f"sys.path.insert(0, {str(REPO_ROOT / 'tests')!r})\n"
++        "import conftest\n"
++        "class C: pass\n"
++        "c = C()\n"
++        "conftest._take_host_test_slot(c)\n"
++        "print('held', c._hermes_host_slot_fd is not None, os.environ.get('HERMES_TEST_SLOT_HELD'), flush=True)\n"
++        "sys.stdin.readline()\n"
++        "conftest._release_host_test_slot(c)\n"
++        "print('released', flush=True)\n")
++    env = {k: v for k, v in os.environ.items() if k != slots.HELD_ENV}
++    first = subprocess.Popen([sys.executable, str(probe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                             stderr=subprocess.PIPE, text=True, env=env, cwd=str(REPO_ROOT))
++    try:
++        assert first.stdout.readline().split() == ["held", "True", "1"]
++        second = subprocess.Popen([sys.executable, str(probe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                  stderr=subprocess.PIPE, text=True, env=env, cwd=str(REPO_ROOT))
++        time.sleep(1.0)
++        assert second.poll() is None  # waiting: the only slot is taken
++        first.stdin.write("\n"); first.stdin.flush()
++        assert first.stdout.readline().strip() == "released"
++        assert second.stdout.readline().split() == ["held", "True", "1"]
++        second.communicate("\n", timeout=30)
++    finally:
++        for p in (first,):
++            if p.poll() is None:
++                p.kill()
+-- 
+2.55.0
+

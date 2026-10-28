@@ -56,3 +56,18 @@ A run that has to wait says so once: `(waiting for host test slots: other runs h
   pool still adds to the load.
 - `uv sync` bytecode compilation for a fresh test environment (`pip_compileall`, one process per core) is
   outside the cap.
+
+## Follow-up patches (0559, 0563, 0566)
+
+Patch **0566** (source `5b8e544396`) makes the cap per host:
+
+- `host_slot_count()` reads `HERMES_TEST_HOST_SLOTS`, then `tests.host_slots` in the Hermes `config.yaml` under the home directory
+  (`HERMES_TEST_SLOT_CONFIG` overrides the path), then `os.cpu_count()`. A laptop the user works on sets a few slots in its own
+  config, so agents' tests never take every core and nothing has to inherit an env var. Without PyYAML the one key is read by regex. `0` disables the cap.
+- `acquire_host_slot()` / `release_host_slot()` are split out of `host_test_slot()`.
+- `tests/conftest.py` makes a direct `pytest` run of the tree (not via `run_tests.sh`) hold one slot for the whole session and
+  set `HERMES_TEST_SLOT_HELD=1` for what it spawns. xdist workers skip it (the controller holds the slot). A failure to take a slot is advisory and never fails the run.
+- Tests (the last four in `tests/scripts/test_run_tests_host_slots.py`): config sets the cap when the env does not (env still wins);
+  config parses without PyYAML; a missing or unset config keeps `cpu_count`; a direct pytest session waits for and holds the only slot (two probe processes).
+
+Patches **0559** and **0563** are lint fixes in `scripts/run_tests_host_slots.py` (Windows footguns; the `/tmp` slot-dir default marked deliberate for the `no-tmp` rule). **0559** also touches `hermes_cli/always_on_dashboard.py`. No behavior change.

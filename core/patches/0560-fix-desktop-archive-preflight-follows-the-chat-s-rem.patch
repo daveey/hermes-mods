@@ -1,0 +1,387 @@
+From 5c653ed50065ae1a07c61d16a62e2226c3cd556b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:33:09 +0000
+Subject: [PATCH] fix(desktop): archive preflight follows the chat's remote
+ owner, logs unknown verdicts [daveey]
+
+The session.archive hotkey and tile menu archive without a selected row and
+resolved the owner from Recents only. While a remote gateway's pooled backend
+reconnects, the unified list carries none of its rows, so an open hub chat had
+no owner: the linked-work preflight read the registry primary, got an
+(unlogged) 404, and showed 'Task status unavailable' + 'Session ancestry
+unavailable' for a chat with nothing linked. Resolve the owner like resume and
+branch do (tagged project-tree/cron/messaging row, else the owner hint), and
+log why the task preflight returned unknown so the dialog is traceable.
+---
+ .../archive-linked-confirm.test.tsx           | 159 +++++++++++++++++-
+ .../use-session-actions/archive-owner.ts      |  44 +++++
+ .../hooks/use-session-actions/index.ts        |  18 +-
+ .../refresh-archive-tasks.ts                  |  43 +++--
+ 4 files changed, 250 insertions(+), 14 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-session-actions/archive-owner.ts
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+index 7a510f52d9..1c3b7af7f1 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -9,8 +9,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { type SessionInfo, setSessionArchived } from '@/hermes'
+ import { registerArchiveGuard, resetArchiveGuardsForTests } from '@/store/archive-guards'
+ import { $confirmRequest, settleConfirm } from '@/store/confirm'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $offlineSessions, _resetOfflineSessionsForTests } from '@/store/offline-sessions'
+-import { $sessions, setSessions } from '@/store/session'
++import { $projectTree } from '@/store/project-tree'
++import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } from '@/store/session'
+ 
+ import type { ClientSessionState } from '../../../types'
+ 
+@@ -286,3 +288,158 @@ describe('offline archive owner isolation', () => {
+     expect($offlineSessions.get()).toEqual([selectedRow])
+   })
+ })
++
++// A remote (hub) chat archived from a door with no selected row — the
++// `session.archive` hotkey or a tile's tab menu — while the hub's pooled
++// backend reconnects: the unified Recents list carries none of the hub's rows.
++// The preflight used to read the registry primary ("local"), whose expected
++// 404 is never logged, and showed "Task status unavailable" + "Session
++// ancestry unavailable" for a chat with nothing linked.
++describe('archive preflight follows the remote owner when Recents lacks it', () => {
++  const remoteRow = (overrides: Partial<SessionInfo> = {}) =>
++    row({ connection_id: 'hermes-hub', id: 'hub-1', kanban_observed_at: undefined, profile: 'default', ...overrides })
++
++  const api = vi.fn()
++
++  // Mirrors main's hermes:api: the hub knows hub-1; the primary 404s.
++  const desktopApi = (hub: 'up' | 'down') => async ({ connectionId, path }: { connectionId?: string; path: string }) => {
++    if (connectionId !== 'hermes-hub') {
++      throw new Error('404: {"detail":"Session not found"}')
++    }
++
++    if (hub === 'down') {
++      throw new Error('Timed out connecting to Hermes backend after 2000ms')
++    }
++
++    if (path === '/api/sessions/hub-1') {
++      return { id: 'hub-1', parent_session_id: null }
++    }
++
++    if (path.startsWith('/api/session-kanban-tasks?ids=hub-1')) {
++      return { tasks: [] }
++    }
++
++    throw new Error(`unexpected ${path}`)
++  }
++
++  // The session-tasks plugin's guard contract: read ancestry on the owner it
++  // is handed (omitted = registry primary).
++  const ancestryGuard = vi.fn(async ({ connectionId, sessionId }: { connectionId?: string; sessionId: string }) => {
++    try {
++      await api({ connectionId: connectionId ?? 'local', path: `/api/sessions/${sessionId}` })
++
++      return []
++    } catch {
++      return [{ label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }]
++    }
++  })
++
++  beforeEach(() => {
++    _resetOfflineSessionsForTests()
++    _resetSessionOwnerHintsForTests()
++    setSessions([])
++    $projectTree.set([])
++    resetArchiveGuardsForTests()
++    registerArchiveGuard('plugin:session-tasks', ancestryGuard)
++    $connectionsRegistry.set({ connections: [], primary: 'local', secureTokenStorage: true, version: 1 })
++    $confirmRequest.set(null)
++    api.mockReset()
++    ancestryGuard.mockClear()
++    vi.stubGlobal('hermesDesktop', { api })
++    vi.mocked(setSessionArchived).mockReset()
++    vi.mocked(setSessionArchived).mockResolvedValue({ ok: true })
++    vi.spyOn(console, 'error').mockImplementation(() => {})
++  })
++
++  afterEach(() => {
++    settleConfirm(false)
++    cleanup()
++    setSessions([])
++    $projectTree.set([])
++    _resetSessionOwnerHintsForTests()
++    $connectionsRegistry.set(null)
++    resetArchiveGuardsForTests()
++    vi.unstubAllGlobals()
++    vi.mocked(console.error).mockRestore()
++  })
++
++  const hub = { connectionId: 'hermes-hub', profile: 'default' }
++
++  it.each([
++    ['only the project tree lists it', () => $projectTree.set([{ previewSessions: [remoteRow()], repos: [] } as never])],
++    ['Recents holds an ownerless copy', () => {
++      setSessions([remoteRow({ connection_id: undefined })])
++      $projectTree.set([{ previewSessions: [remoteRow()], repos: [] } as never])
++    }],
++    ['no list has a row but its owner is remembered', () => setSessionOwnerHint('hub-1', hub)]
++  ])('archives an idle hub chat without a warning when %s', async (_case, seed) => {
++    seed()
++    api.mockImplementation(desktopApi('up'))
++    const handle = await mountHarness()
++
++    await act(() => handle.archiveSession('hub-1'))
++
++    expect($confirmRequest.get()).toBeNull()
++    expect(api.mock.calls.map(([request]) => request.connectionId)).toEqual(['hermes-hub', 'hermes-hub', 'hermes-hub'])
++    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'hermes-hub', sessionId: 'hub-1' }))
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, hub)
++  })
++
++  it('still warns when the owning hub is genuinely unreachable', async () => {
++    $projectTree.set([{ previewSessions: [remoteRow()], repos: [] } as never])
++    api.mockImplementation(desktopApi('down'))
++    const handle = await mountHarness()
++    let done: Promise<void> | undefined
++
++    act(() => {
++      done = handle.archiveSession('hub-1')
++    })
++    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++
++    expect($confirmRequest.get()!.details).toEqual([
++      { label: 'Kanban tasks', value: 'Task status unavailable; work may still be unfinished.' },
++      { label: 'Unverified work', value: 'Session ancestry unavailable; linked work or rented machines may still be active.' }
++    ])
++    expect(api.mock.calls.every(([request]) => request.connectionId === 'hermes-hub')).toBe(true)
++    expect(console.error).toHaveBeenCalledWith(expect.stringMatching(/^\[archive-preflight\] task status unknown for hub-1 via hermes-hub\/default: GET \/api\/sessions\/hub-1 failed: Timed out/))
++    await act(async () => {
++      settleConfirm(false)
++      await done
++    })
++    expect(vi.mocked(setSessionArchived)).not.toHaveBeenCalled()
++  })
++
++  it('still reports the repair card itself as linked open work', async () => {
++    $projectTree.set([{ previewSessions: [remoteRow()], repos: [] } as never])
++    api.mockImplementation(async (request: { connectionId?: string; path: string }) =>
++      request.path.startsWith('/api/session-kanban-tasks')
++        ? { tasks: [{ id: 't_fix', status: 'running' }] }
++        : desktopApi('up')(request)
++    )
++    const handle = await mountHarness()
++    let done: Promise<void> | undefined
++
++    act(() => {
++      done = handle.archiveSession('hub-1')
++    })
++    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++    expect($confirmRequest.get()!.details).toEqual([{ label: 'Kanban tasks', value: '1 open' }])
++    await act(async () => {
++      settleConfirm(false)
++      await done
++    })
++  })
++
++  it('keeps an explicitly selected untagged row on the primary (control)', async () => {
++    const selectedRow = remoteRow({ connection_id: undefined, kanban_observed_at: Date.now() / 1000 })
++    setSessions([selectedRow])
++    $projectTree.set([{ previewSessions: [remoteRow()], repos: [] } as never])
++    api.mockImplementation(async () => ({ id: 'hub-1', parent_session_id: null }))
++    const handle = await mountHarness()
++
++    await act(() => handle.archiveSession('hub-1', { selectedRow }))
++
++    expect(ancestryGuard).toHaveBeenCalledWith(expect.objectContaining({ connectionId: undefined }))
++    expect(vi.mocked(setSessionArchived)).toHaveBeenCalledWith('hub-1', true, 'default')
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-owner.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-owner.ts
+new file mode 100644
+index 0000000000..aa166a4728
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-owner.ts
+@@ -0,0 +1,44 @@
++import type { SessionInfo } from '@/hermes'
++import { getSessionOwnerHint } from '@/store/session'
++
++import { cachedSessionRowCandidates } from './utils'
++
++/**
++ * The row whose owner an archive without a selected row (the `session.archive`
++ * hotkey, a tile's tab menu, plugins) checks and archives against.
++ *
++ * Those doors only had Recents ($sessions, plus offline copies) to go on. While
++ * a remote gateway's pooled backend reconnects, the unified list carries none
++ * of its rows, so an open remote chat had no row there: the linked-work
++ * preflight then read the registry primary, which 404s (silently) for a remote
++ * session, and the dialog showed both "Task status unavailable" and "Session
++ * ancestry unavailable" for a chat with nothing unknown about it.
++ *
++ * Resolve the owner the way resume/branch already do: a connection-tagged row
++ * from any cached list (project tree, cron, messaging) beats an ownerless
++ * Recents copy, and with no row at all the single remembered owner hint names
++ * the gateway. An untagged row with no tagged twin keeps meaning "primary".
++ */
++export function archiveOwnerRow(storedSessionId: string, row: SessionInfo | undefined): SessionInfo | undefined {
++  if (row?.connection_id?.trim() || row?.offline_cached) {
++    return row
++  }
++
++  const tagged = cachedSessionRowCandidates(storedSessionId).find(candidate => candidate.connection_id?.trim())
++
++  if (tagged) {
++    return row
++      ? { ...row, connection_id: tagged.connection_id, profile: tagged.profile?.trim() || row.profile }
++      : tagged
++  }
++
++  if (row) {
++    return row
++  }
++
++  const hint = getSessionOwnerHint(storedSessionId)
++
++  return hint?.connectionId
++    ? ({ connection_id: hint.connectionId, id: storedSessionId, profile: hint.profile } as SessionInfo)
++    : undefined
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index e2e9f1e10f..f2cc9700e2 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -174,6 +174,7 @@ import {
+ } from '../session-context-drift'
+ import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
+ 
++import { archiveOwnerRow } from './archive-owner'
+ import { branchCreateKey } from './branch-create-key'
+ import { confirmLinkedArchive } from './confirm-linked-archive'
+ import { sessionCreateOverrideParams, type SessionCreateOverrides, type SessionSeedMessage } from './create-overrides'
+@@ -3501,9 +3502,18 @@ export function useSessionActions({
+ 
+       const listed = findListedSession(storedSessionId)
+       let archived: SessionInfo | undefined
++      let listedRow: SessionInfo | undefined
+ 
+       try {
+-        archived = sessionActionRow(storedSessionId, options?.selectedRow) ?? listed?.session
++        archived = listedRow = sessionActionRow(storedSessionId, options?.selectedRow) ?? listed?.session
++
++        // A selected row is the user's explicit owner; every other door
++        // (hotkey, tile menu, plugins) resolves it like resume does, so a
++        // remote chat whose Recents row is momentarily absent or ownerless is
++        // neither checked nor archived on the registry primary.
++        if (!options?.selectedRow) {
++          archived = archiveOwnerRow(storedSessionId, archived)
++        }
+       } catch (err) {
+         notifyError(err, copy.archiveFailed)
+ 
+@@ -3582,8 +3592,10 @@ export function useSessionActions({
+ 
+         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
+       } catch (err) {
+-        if (archived) {
+-          restoreListedSession(archived, listed?.slice)
++        // Only a row the sidebar actually listed comes back; an owner resolved
++        // from the project tree or a hint was never in that slice.
++        if (listedRow) {
++          restoreListedSession(listedRow, listed?.slice)
+         }
+ 
+         untombstoneSessions(archivedIds)
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+index c194c45084..0097e121a3 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+@@ -17,54 +17,77 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+   }
+ 
+   const unknown = { ...session, kanban_unknown: true } as SessionInfo
++  let settled = false
+ 
+-  if (!owner.connectionId) {return unknown}
++  // An unknown verdict reaches the user as "Task status unavailable". Record
++  // why (owner, stage, error) in desktop.log: an expected 404 is never logged
++  // by hermes:api, so without this line the dialog leaves no trace at all.
++  const unknownBecause = (reason: string, error?: unknown): SessionInfo => {
++    if (!settled) {
++      settled = true
++      const detail = error === undefined ? '' : `: ${String((error as Error)?.message ?? error).slice(0, 200)}`
++      const route = `${owner.connectionId ?? '(none)'}/${owner.profile}${session?.connection_id ? '' : ' (no row owner)'}`
++      console.error(`[archive-preflight] task status unknown for ${id} via ${route}: ${reason}${detail}`)
++    }
++
++    return unknown
++  }
++
++  if (!owner.connectionId) {return unknownBecause('no owner connection')}
+   let timer: ReturnType<typeof setTimeout> | undefined
++  let stage = 'start'
+ 
+   const read = async (): Promise<SessionInfo> => {
+     const ids = new Set<string>()
+     let current: string | null = id
+ 
+     for (let hop = 0; current && hop < 12; hop++) {
+-      if (ids.has(current)) {return unknown}
++      if (ids.has(current)) {return unknownBecause(`ancestry cycle at ${current}`)}
+       ids.add(current)
++      stage = `GET /api/sessions/${current}`
+ 
+       const row: { id?: string; parent_session_id?: string | null } = await hermesApiAs(owner, {
+         path: `/api/sessions/${encodeURIComponent(current)}`, timeoutMs: 2_000
+       })
+ 
+-      if (row?.id !== current || (row.parent_session_id != null && typeof row.parent_session_id !== 'string')) {return unknown}
++      if (row?.id !== current || (row.parent_session_id != null && typeof row.parent_session_id !== 'string')) {
++        return unknownBecause(`malformed session row from ${stage}`)
++      }
++
+       current = row.parent_session_id || null
+     }
+ 
+-    if (current) {return unknown}
++    if (current) {return unknownBecause('ancestry deeper than 12 hops')}
++    stage = 'GET /api/session-kanban-tasks'
+ 
+     const result = await hermesApiAs<{ tasks?: Array<{ id?: string; status?: string; stale?: boolean; unfinished?: boolean }> }>(owner, {
+       path: `/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`, timeoutMs: 2_000
+     })
+ 
+-    if (!Array.isArray(result?.tasks)) {return unknown}
++    if (!Array.isArray(result?.tasks)) {return unknownBecause(`malformed response from ${stage}`)}
+     let active = 0
+     let blocked = 0
+ 
+     for (const task of result.tasks) {
+-      if (!task?.id || task.stale || !task.status) {return unknown}
++      if (!task?.id || task.stale || !task.status) {return unknownBecause(`stale or incomplete task ${task?.id ?? '?'}`)}
+ 
+       if (task.status === 'blocked') {blocked++}
+       else if (['todo', 'ready', 'running', 'scheduled', 'review', 'triage'].includes(task.status)) {active++}
+-      else {return unknown}
++      else {return unknownBecause(`task ${task.id} has status ${task.status}`)}
+     }
+ 
++    settled = true
++
+     return { ...session, kanban_active: active, kanban_blocked: blocked, kanban_unknown: false,
+       kanban_remote_stale: 0, kanban_observed_at: Date.now() / 1000 } as SessionInfo
+   }
+ 
+   try {
+     return await Promise.race([read(), new Promise<SessionInfo>(resolve => {
+-      timer = setTimeout(() => resolve(unknown), 2_500)
++      timer = setTimeout(() => resolve(unknownBecause(`no answer within 2500ms (${stage})`)), 2_500)
+     })])
+-  } catch {
+-    return unknown
++  } catch (error) {
++    return unknownBecause(`${stage} failed`, error)
+   } finally {
+     clearTimeout(timer)
+   }
+-- 
+2.55.0
+

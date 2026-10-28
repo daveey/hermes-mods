@@ -82,3 +82,7 @@ warning on cores without the patch's default). New sessions pick it up; open ses
   skill's `coach_eval.py compose_system` does).
 - No plugin alternative: plugin prompt sections are appended after the context tier and can't dedupe against the
   project chain.
+
+## Follow-up patch (0568)
+
+**0568** documents `agent.global_context_files` in `website/docs/user-guide/configuration.md` to clear the red docs-drift check on main. No code change.

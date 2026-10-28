@@ -1,0 +1,741 @@
+From 89b72a8684612907cb7139204082245d14167d11 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:29:48 -0700
+Subject: [PATCH] =?UTF-8?q?feat(kanban):=20default=20placement=20=E2=80=94?=
+ =?UTF-8?q?=20a=20card=20with=20no=20local-only=20need=20is=20created=20on?=
+ =?UTF-8?q?=20the=20routed=20gateway=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On 2026-10-27 the MacBook (16 cores) ran 11-14 default-board Kanban workers at once and its load
+average peaked at 430; David's rule is that automation runs on hermes-hub. Of 455 MacBook cards
+sampled over 7 days (classified by the tool calls their workers made), ~21% touched nothing local
+and ~25% needed hard MacBook-only access (AWS SSO profiles, Chrome, Keychain, Apple apps/TCC).
+
+- kanban.placement.route maps this gateway's hermes-hub name to a target ({"macbook": "hub"}).
+  kanban_create then creates a card with no local-only need on the target through the origin-bound
+  'hermes-hub create-task <gw> --origin-session <chat> --creator-session ...' path, so it still
+  shows in the chat that asked for it. Returns placed{gateway, request_id, task_id once applied}.
+- Stays local: placement='local'; parents, project, dir/worktree workspace, non-default board or
+  assignee, courier creation, options hermes-hub cannot carry (model/provider, goal_mode, triage,
+  initial_status, human_request, non-local completion contract); a requires capability the target
+  lacks; a local marker in title/body/skills (Chrome, Keychain, TCC, launchd, Desktop, MacBook, the
+  mini, Baby Bear, AWS SSO profiles...); the target not live (stale sync or capability record).
+- hermes-hub refusal falls back to a local card; an offline hub is durably queued (rc 3), never
+  duplicated. Request ids are stable per (gateway, idempotency key | title/body/origin).
+- Remote bodies carry skills and the runtime budget as text, plus how to route a MacBook-only wall
+  back with needs=[...] (capability routing).
+- Unset route = upstream behaviour.
+---
+ hermes_cli/config_defaults.py             |   7 +
+ hermes_cli/kanban_placement.py            | 301 ++++++++++++++++++++++
+ tests/hermes_cli/test_kanban_placement.py | 275 ++++++++++++++++++++
+ tools/kanban_tools.py                     |  55 ++++
+ tools/kanban_tools_schemas.py             |   9 +
+ 5 files changed, 647 insertions(+)
+ create mode 100644 hermes_cli/kanban_placement.py
+ create mode 100644 tests/hermes_cli/test_kanban_placement.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index e31e89264a..8dbff035fb 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1945,6 +1945,13 @@ DEFAULT_CONFIG = {
+         # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
+         # when fan-out would saturate one profile's model/API quota/browser pool. See #21582.
+         "max_in_progress_per_profile": None,
++        # [daveey] Default placement (hermes_cli/kanban_placement.py): ``route`` maps this gateway's
++        # hermes-hub name to a target gateway (e.g. {"macbook": "hub"}); kanban_create then creates a
++        # card with no local-only need on the target, bound to the creating chat. Other keys:
++        # creator_session ({target: session id}), local_markers / extra_local_markers /
++        # local_skill_markers (regex lists), assignees, hub_live_seconds, wait_seconds, hub_cli.
++        # Empty = upstream behaviour (every card is created here).
++        "placement": {},
+         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
+         # this home's dispatcher may claim (list or comma-separated string). None = any existing
+         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+new file mode 100644
+index 0000000000..3a537db09a
+--- /dev/null
++++ b/hermes_cli/kanban_placement.py
+@@ -0,0 +1,301 @@
++"""Default Kanban placement: a card with no local-only need runs on another gateway. [daveey]
++
++A gateway whose own machine must stay quiet (a laptop the user works on) maps itself to a target
++gateway in ``kanban.placement.route`` (shared config, e.g. ``{"macbook": "hub"}``). ``kanban_create``
++then asks :func:`decide` before writing a local card. Unless something pins the card here, it is
++created on the target through ``hermes-hub create-task <gw> ... --origin-session <chat>``: the same
++origin-bound path cross-gateway work already uses, so the card still shows in the chat that asked
++for it, and it runs (and burns CPU) on the target.
++
++A card stays local when any of these holds:
++
++* the caller pinned it: ``placement="local"``;
++* it cannot be expressed remotely: parents (dependencies are local links), a project, a ``dir`` or
++  ``worktree`` workspace, a non-default board or assignee, courier (origin) creation, or creation
++  options ``hermes-hub create-task`` cannot carry (model/provider pin, goal mode, triage, a non-local
++  completion contract, an initial status, a human request);
++* it declares a ``requires`` capability this gateway holds and the target does not;
++* its title, body or skills match a local marker (``kanban.placement.local_markers`` replaces the
++  built-in list, ``extra_local_markers`` extends it): Chrome, Keychain, TCC, Apple apps, launchd,
++  the Desktop app, this Mac, the mini, AWS SSO profiles...;
++* the target is not live: this gateway's hermes-hub sync has not succeeded recently, or the
++  target's capability record is stale.
++
++A worker on the target that still hits a local-only wall blocks with ``needs=[...]``; capability
++routing (:mod:`hermes_cli.kanban_capability_routing`) then opens an owner card back here.
++
++Unset ``route`` (upstream default) never places anything remotely.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import subprocess
++import time
++from typing import Callable, Optional
++
++from hermes_cli import kanban_capability_registry as reg
++
++HUB_TIMEOUT = 60
++DEFAULT_HUB_LIVE_SECONDS = 600
++DEFAULT_CREATOR_SESSION = "kanban-placement"
++
++# Phrases that mean the work needs this machine (a Mac the user works on). Case-insensitive.
++DEFAULT_LOCAL_MARKERS = (
++    r"\bchrome\b", r"\bcdp\b", r"\bkeychain\b", r"\bcodesign", r"\bnotari[sz]", r"\btcc\b",
++    r"\bosascript\b", r"\bapple ?script\b", r"\bapple (photos|notes|reminders|contacts|calendar|music)\b",
++    r"\bphotos\.app\b", r"\bimessage\b", r"\bfind ?my\b", r"\bremindctl\b", r"\bshortcuts? app\b",
++    r"\blaunchd\b", r"\blaunchctl\b", r"launchagents", r"~/library/", r"\bhermes\.app\b",
++    r"\bhermes desktop\b", r"\bdesktop (app|backend|backends|renderer|window|chat|chats|sidebar|ui)\b",
++    r"\bmacbook\b", r"\bmac ?os\b", r"\bmac ?mini\b", r"\bthe mini\b", r"\bdavids-mac-mini\b",
++    r"\bbaby ?bear\b", r"\bxcode\b", r"\bsimulator\b", r"\bwhatsapp\b", r"\bscreen ?shot",
++    r"\bexample-org\b", r"\bexample-sso\b", r"--profile example",
++)
++# Skills whose presence alone pins a card to a Mac.
++DEFAULT_LOCAL_SKILL_MARKERS = (
++    r"^apple", r"^imessage$", r"^findmy$", r"^macos-", r"^mac-", r"^invisible-chrome-agent$",
++    r"^local-chrome-remote-debugging$", r"^computer-use$", r"^myapp", r"^bb-", r"^ios-",
++)
++# kanban_create options hermes-hub create-task cannot carry: a card using them stays local.
++UNCARRIED_OPTIONS = ("model", "provider", "goal_mode", "triage", "initial_status", "human_request",
++                     "workspace_path", "project", "project_id", "tenant")
++
++
++class _Cfg:
++    def __init__(self, raw: dict):
++        self.raw = raw if isinstance(raw, dict) else {}
++
++    def target(self, self_gw: Optional[str]) -> Optional[str]:
++        route = self.raw.get("route")
++        if not self_gw or not isinstance(route, dict):
++            return None
++        tgt = route.get(self_gw)
++        return tgt if isinstance(tgt, str) and tgt and tgt != self_gw else None
++
++    def markers(self) -> list[re.Pattern]:
++        base = self.raw.get("local_markers")
++        pats = list(base) if isinstance(base, list) else list(DEFAULT_LOCAL_MARKERS)
++        extra = self.raw.get("extra_local_markers")
++        if isinstance(extra, list):
++            pats += extra
++        out = []
++        for p in pats:
++            try:
++                out.append(re.compile(str(p), re.I))
++            except re.error:
++                continue
++        return out
++
++    def skill_markers(self) -> list[re.Pattern]:
++        base = self.raw.get("local_skill_markers")
++        pats = list(base) if isinstance(base, list) else list(DEFAULT_LOCAL_SKILL_MARKERS)
++        return [re.compile(str(p), re.I) for p in pats]
++
++    def creator_session(self, target: str) -> str:
++        v = self.raw.get("creator_session")
++        if isinstance(v, dict):
++            v = v.get(target)
++        return v if isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", v) \
++            else DEFAULT_CREATOR_SESSION
++
++    def live_seconds(self) -> int:
++        try:
++            return max(60, int(self.raw.get("hub_live_seconds", DEFAULT_HUB_LIVE_SECONDS)))
++        except (TypeError, ValueError):
++            return DEFAULT_HUB_LIVE_SECONDS
++
++    def assignees(self) -> set[str]:
++        v = self.raw.get("assignees")
++        return {str(x) for x in v} if isinstance(v, list) and v else {"default"}
++
++
++def config() -> dict:
++    try:
++        from hermes_cli.config import load_config_readonly
++        cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("placement") or {}
++        return cfg if isinstance(cfg, dict) else {}
++    except Exception:
++        return {}
++
++
++def _local_marker(text: str, skills, cfg: _Cfg) -> Optional[str]:
++    for rx in cfg.markers():
++        m = rx.search(text or "")
++        if m:
++            return f"mentions {m.group(0)!r}"
++    for s in skills or []:
++        for rx in cfg.skill_markers():
++            if rx.search(str(s)):
++                return f"skill {s}"
++    return None
++
++
++def target_live(target: str, *, now: float, live_seconds: int,
++                meta: Optional[dict] = None, remote: Optional[dict] = None) -> Optional[str]:
++    """None when ``target`` looks reachable through hermes-hub, else the reason it does not."""
++    if meta is None:
++        meta = _hub_meta()
++    try:
++        last_ok = float(meta.get("last_ok") or 0)
++    except (TypeError, ValueError):
++        last_ok = 0.0
++    if now - last_ok > live_seconds:
++        return "this gateway's hermes-hub sync has not succeeded recently"
++    remote = reg.remote_records() if remote is None else remote
++    rec = remote.get(target)
++    try:
++        at = float((rec or {}).get("refreshed_at") or 0)
++    except (TypeError, ValueError):
++        at = 0.0
++    if now - at > reg.stale_after():
++        return f"{target}'s capability record is stale or missing"
++    return None
++
++
++def _hub_meta() -> dict:
++    try:
++        db = reg._ro(reg.hub_db_path())
++    except Exception:
++        return {}
++    try:
++        return {k: v for k, v in db.execute("SELECT k, v FROM meta")}
++    except Exception:
++        return {}
++    finally:
++        db.close()
++
++
++def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
++           self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
++           locate: Optional[Callable[[str], dict]] = None) -> dict:
++    """``{"where": "local"|<gateway>, "why": str}`` for a ``kanban_create`` call. Never raises."""
++    try:
++        c = _Cfg(config() if cfg is None else cfg)
++        if not isinstance(c.raw.get("route"), dict) or not c.raw["route"]:
++            return {"where": "local", "why": "no placement route for this gateway"}
++        self_gw = reg.self_gateway() if self_gw is None else self_gw
++        target = c.target(self_gw)
++        if not target:
++            return {"where": "local", "why": "no placement route for this gateway"}
++        pin = str(args.get("placement") or "auto").strip().lower()
++        if pin in ("local", "here", (self_gw or "").lower()):
++            return {"where": "local", "why": "placement pinned local by the caller"}
++        explicit = pin not in ("", "auto")
++        if explicit and pin != target.lower():
++            return {"where": "local", "why": f"placement {pin!r} is not a routed gateway (only {target!r})"}
++        if origin_intent is not None:
++            return {"where": "local", "why": "courier creation for another gateway"}
++        if args.get("parents"):
++            return {"where": "local", "why": "has parents (dependencies are local links)"}
++        if (args.get("workspace_kind") or "scratch") != "scratch":
++            return {"where": "local", "why": f"{args.get('workspace_kind')} workspace"}
++        board = args.get("board")
++        if board and board != "default":
++            return {"where": "local", "why": f"board {board!r}"}
++        assignee = args.get("assignee") or "default"
++        if assignee not in c.assignees():
++            return {"where": "local", "why": f"assignee {assignee!r} is not placed remotely"}
++        used = [k for k in UNCARRIED_OPTIONS if args.get(k) not in (None, "", False, [])]
++        if (args.get("completion_contract") or "local-only") != "local-only":
++            used.append("completion_contract")
++        if used:
++            return {"where": "local", "why": f"uses {', '.join(used)} (not carried by hermes-hub create-task)"}
++        needs = [r for r in (args.get("requires") or []) if reg.is_gateway_need(r)]
++        if [r for r in (args.get("requires") or []) if not reg.is_gateway_need(r)]:
++            return {"where": "local", "why": "requires profile tools validated on this gateway"}
++        now = time.time() if now is None else now
++        for need in needs:
++            found = (locate or (lambda n: reg.locate(n, now=now)))(need)
++            on_target = any(gw == target for gw, _ in found.get("holders") or [])
++            if not on_target:
++                return {"where": "local", "why": f"needs {need}, which {target} does not hold"}
++        if not explicit:
++            hit = _local_marker(f"{args.get('title') or ''}\n{args.get('body') or ''}",
++                                args.get("skills"), c)
++            if hit:
++                return {"where": "local", "why": f"local marker: {hit}"}
++        dead = (live or (lambda t: target_live(t, now=now, live_seconds=c.live_seconds())))(target)
++        if dead:
++            return {"where": "local", "why": f"{target} not live: {dead}"}
++        return {"where": target, "why": "no local-only need" if not explicit else "placement pinned by the caller"}
++    except Exception as exc:  # placement must never break card creation
++        return {"where": "local", "why": f"placement check failed: {exc}"}
++
++
++def _default_runner(argv: list[str]) -> tuple[int, str, str]:
++    try:
++        p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
++                           timeout=HUB_TIMEOUT, check=False, stdin=subprocess.DEVNULL)
++        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return 127, "", str(exc)
++
++
++# Tests replace this with a fake that records argv.
++hub_runner: Callable[[list[str]], tuple[int, str, str]] = _default_runner
++
++
++def request_id(self_gw: str, args: dict, origin_session: str) -> str:
++    """Stable per (gateway, idempotency key | title+body+origin): exact retries reuse it."""
++    key = args.get("idempotency_key") or json.dumps(
++        [args.get("title"), args.get("body"), args.get("assignee"), origin_session, args.get("skills")],
++        sort_keys=True)
++    return f"placement:{self_gw}:{hashlib.sha256(str(key).encode()).hexdigest()[:24]}"
++
++
++def remote_body(args: dict, *, self_gw: str, target: str) -> str:
++    body = (args.get("body") or "").rstrip()
++    extra = []
++    skills = args.get("skills") or []
++    if skills:
++        extra.append(f"Skills to load first: {', '.join(str(s) for s in skills)}.")
++    if args.get("max_runtime_seconds"):
++        extra.append(f"Runtime budget asked by the creator: {int(args['max_runtime_seconds'])} s.")
++    extra.append(
++        f"Placed on {target} by {self_gw}'s default placement rule (kanban.placement): nothing in the card "
++        f"named a {self_gw}-only need. If you hit something only {self_gw} has (its Chrome profile, Keychain, "
++        f"Apple apps, launchd or Desktop state, AWS SSO profiles, ssh to the mini, a checkout this host "
++        f"lacks), block with needs=[<capability>] so capability routing opens an owner card on {self_gw}; "
++        "don't park or ask David.")
++    return (body + "\n\n---\n" + "\n".join(extra)).strip()
++
++
++def create_remote(args: dict, *, target: str, origin_session: Optional[str], origin_profile: str,
++                  self_gw: str, cfg: Optional[dict] = None, hub_cli: str = "hermes-hub") -> dict:
++    """Queue the card on ``target``. Returns ``{ok, request_id, rc, ...}``; ok False means create locally."""
++    c = _Cfg(config() if cfg is None else cfg)
++    rid = request_id(self_gw, args, origin_session or "")
++    argv = [hub_cli, "create-task", target, str(args.get("title") or "untitled").strip()[:300],
++            "--body", remote_body(args, self_gw=self_gw, target=target),
++            "--assignee", str(args.get("assignee") or "default"), "--id", rid]
++    if origin_session:
++        argv += ["--origin-session", origin_session, "--origin-profile", origin_profile,
++                 "--creator-session", c.creator_session(target)]
++    else:
++        argv += ["--origin-session", ""]
++    rc, out, err = hub_runner(argv)
++    if rc == 0:
++        return {"ok": True, "request_id": rid, "queued_only": False}
++    if rc == 3:  # hub unreachable after the liveness check: queued, sent on the next sync (durable)
++        return {"ok": True, "request_id": rid, "queued_only": True}
++    return {"ok": False, "request_id": rid, "rc": rc, "error": (err or out)[-400:]}
++
++
++def remote_task_id(rid: str) -> Optional[str]:
++    """The target's task id once the request is done (None while pending/unknown)."""
++    try:
++        db = reg._ro(reg.hub_db_path())
++    except Exception:
++        return None
++    try:
++        row = db.execute("SELECT state, result FROM sent WHERE id = ?", (rid,)).fetchone()
++        if not row or row[0] != "done":
++            return None
++        res = json.loads(row[1] or "{}")
++        tid = res.get("task_id") or res.get("task") if isinstance(res, dict) else None
++        return tid if isinstance(tid, str) else None
++    except Exception:
++        return None
++    finally:
++        db.close()
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+new file mode 100644
+index 0000000000..8dce6b1543
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -0,0 +1,275 @@
++"""Default Kanban placement: a MacBook card with no local-only need runs on hermes-hub. [daveey]
++
++On 2026-10-27 the MacBook (16 cores) ran 11-14 default-board workers at once and its load average
++peaked at 430. Of 455 MacBook cards sampled over the week, ~45% touched nothing MacBook-only, yet
++every one ran there. ``kanban.placement.route`` sends such cards to the hub through the origin-bound
++``hermes-hub create-task`` path, so they still show in the chat that asked for them.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_capability_registry as reg
++from hermes_cli import kanban_placement as kp
++
++ROUTE = {"route": {"macbook": "hub"}, "creator_session": {"hub": "20261023_052109_5b3dee"}}
++ALIVE = lambda target: None  # noqa: E731
++NOWHERE = lambda need: {"need": need, "local": "absent", "holders": [], "stale": []}  # noqa: E731
++
++
++def decide(args, **kw):
++    kw.setdefault("cfg", ROUTE)
++    kw.setdefault("self_gw", "macbook")
++    kw.setdefault("live", ALIVE)
++    kw.setdefault("locate", NOWHERE)
++    return kp.decide(args, **kw)
++
++
++# --- the placement rule -------------------------------------------------------------------------
++
++def test_card_with_no_local_need_goes_to_the_target():
++    d = decide({"title": "daveey/hermes CI: ruff check fails with 11 errors on main",
++                "body": "Fix the lint errors on main and push.", "assignee": "default"})
++    assert d["where"] == "hub", d
++
++
++def test_no_route_is_upstream_behaviour():
++    assert decide({"title": "anything"}, cfg={})["where"] == "local"
++    # A route for another gateway does not apply here.
++    assert decide({"title": "anything"}, self_gw="mini")["where"] == "local"
++
++
++@pytest.mark.parametrize("extra,why", [
++    ({"parents": ["t_1"]}, "parents"),
++    ({"workspace_kind": "worktree", "workspace_path": "/Users/me/code/x"}, "worktree"),
++    ({"workspace_kind": "dir", "workspace_path": "/tmp/x"}, "dir"),
++    ({"board": "links"}, "board"),
++    ({"assignee": "links"}, "assignee"),
++    ({"model": "claude-opus-5-5", "provider": "anthropic"}, "model"),
++    ({"goal_mode": True}, "goal_mode"),
++    ({"triage": True}, "triage"),
++    ({"initial_status": "blocked"}, "initial_status"),
++    ({"project_id": "p_1"}, "project_id"),
++    ({"completion_contract": "daveey/hermes"}, "completion_contract"),
++    ({"requires": ["terminal"]}, "profile tools"),
++])
++def test_cards_hub_create_cannot_express_stay_local(extra, why):
++    d = decide({"title": "Fix the flaky test", **extra})
++    assert d["where"] == "local" and why in d["why"], d
++
++
++@pytest.mark.parametrize("text", [
++    "Sign in to X in the agent Chrome and buy credits",
++    "Read the token from the login Keychain",
++    "TCC prompt for Hermes Python.app keeps coming back",
++    "Reload the launchd job com.daveey.link-inbox",
++    "Hermes Desktop sidebar shows red on idle sessions",
++    "MacBook overloaded: find the drivers",
++    "Restart Baby Bear on the mini",
++    "aws s3 ls --profile example-org",
++    "Export the album from Apple Photos",
++])
++def test_local_markers_keep_mac_work_on_the_mac(text):
++    d = decide({"title": text})
++    assert d["where"] == "local" and d["why"].startswith("local marker"), d
++
++
++def test_local_skill_pins_the_card():
++    d = decide({"title": "Weekly digest", "skills": ["apple-notes"]})
++    assert d["where"] == "local" and "skill apple-notes" in d["why"], d
++
++
++def test_configured_markers_replace_and_extend_the_builtin_list():
++    cfg = {**ROUTE, "local_markers": [r"\bfoo\b"]}
++    assert decide({"title": "Fix Chrome"}, cfg=cfg)["where"] == "hub"
++    assert decide({"title": "Fix foo"}, cfg=cfg)["where"] == "local"
++    cfg = {**ROUTE, "extra_local_markers": [r"\bshoo\b"]}
++    assert decide({"title": "shoo app store build"}, cfg=cfg)["where"] == "local"
++
++
++def test_caller_pin_wins_both_ways():
++    assert decide({"title": "CI fix", "placement": "local"})["where"] == "local"
++    # An explicit pin to the target skips the marker heuristic (the caller knows).
++    assert decide({"title": "Chrome-free MacBook docs", "placement": "hub"})["where"] == "hub"
++    # ...but never the structural limits.
++    assert decide({"title": "x", "placement": "hub", "parents": ["t_1"]})["where"] == "local"
++    # A gateway with no route is not a destination.
++    assert decide({"title": "x", "placement": "mini"})["where"] == "local"
++
++
++def test_courier_creation_is_never_re_placed():
++    assert decide({"title": "x"}, origin_intent={"request_id": "r"})["where"] == "local"
++
++
++def test_declared_need_held_here_but_not_on_target_stays_local():
++    def only_here(need):
++        return {"need": need, "local": "fresh", "holders": [], "stale": []}
++    d = decide({"title": "Grant the scoped IAM change", "requires": ["aws:767406518141:admin"]}, locate=only_here)
++    assert d["where"] == "local" and "aws:767406518141:admin" in d["why"], d
++
++
++def test_declared_need_the_target_holds_goes_there():
++    def on_hub(need):
++        return {"need": need, "local": "absent", "holders": [("hub", time.time())], "stale": []}
++    assert decide({"title": "Run the runner drill", "requires": ["sudo:nopasswd"]}, locate=on_hub)["where"] == "hub"
++
++
++def test_target_not_live_falls_back_to_local():
++    d = decide({"title": "CI fix"}, live=lambda t: "hub's capability record is stale or missing")
++    assert d["where"] == "local" and "not live" in d["why"], d
++
++
++def test_decide_never_raises():
++    def boom(_):
++        raise RuntimeError("replica gone")
++    d = decide({"title": "x", "requires": ["ssh:hub"]}, locate=boom)
++    assert d["where"] == "local" and "failed" in d["why"]
++
++
++# --- liveness -----------------------------------------------------------------------------------
++
++def test_target_live_needs_a_recent_sync_and_a_fresh_target_record():
++    now = 1_000_000.0
++    fresh = {"hub": {"refreshed_at": now - 60}}
++    assert kp.target_live("hub", now=now, live_seconds=600, meta={"last_ok": now - 30}, remote=fresh) is None
++    assert "sync" in kp.target_live("hub", now=now, live_seconds=600, meta={"last_ok": now - 3600}, remote=fresh)
++    stale = {"hub": {"refreshed_at": now - 7200}}
++    assert "stale" in kp.target_live("hub", now=now, live_seconds=600, meta={"last_ok": now - 30}, remote=stale)
++    assert "missing" in kp.target_live("hub", now=now, live_seconds=600, meta={"last_ok": now - 30}, remote={})
++
++
++# --- kanban_create end to end -------------------------------------------------------------------
++
++HUB_SCHEMA = """
++CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
++CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT,
++  updated_at INTEGER, PRIMARY KEY (gw, coll, key));
++CREATE TABLE sent (id TEXT PRIMARY KEY, body TEXT, state TEXT, result TEXT, created_at REAL,
++  done_at REAL, posted INTEGER DEFAULT 0);
++"""
++
++
++@pytest.fixture
++def mac(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_state import SessionDB
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    mail = tmp_path / "mail.json"
++    mail.write_text(json.dumps({"gateway": "macbook"}))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(mail))
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    hub = sqlite3.connect(state / "hub.db")
++    hub.executescript(HUB_SCHEMA)
++    hub.execute("INSERT INTO meta VALUES ('gateway', 'macbook')")
++    hub.execute("INSERT INTO meta VALUES ('last_ok', ?)", (str(time.time()),))
++    rec = {"schema": 1, "gateway": "hub", "refreshed_at": time.time(),
++           "capabilities": [{"name": "sudo:nopasswd", "ok": True, "checked_at": time.time()}]}
++    hub.execute("INSERT INTO replica VALUES ('hub', 'capabilities', 'info', 1, 1, ?, ?)",
++                (json.dumps(rec), int(time.time())))
++    hub.commit()
++    sdb = SessionDB(db_path=home / "state.db")
++    sdb.create_session("20261027_183000_abc123", source="desktop")
++    sdb.close()
++    calls: list[list[str]] = []
++    result = {"rc": 0}
++
++    def fake_hub(argv):
++        calls.append(argv)
++        rid = argv[argv.index("--id") + 1]
++        if result["rc"] in (0, 3):
++            hub.execute("INSERT OR IGNORE INTO sent (id, body, state, created_at) VALUES (?, ?, 'sent', ?)",
++                        (rid, json.dumps({"id": rid, "to_gw": argv[2]}), time.time()))
++            if result.get("apply"):
++                hub.execute("UPDATE sent SET state='done', result=? WHERE id=?",
++                            (json.dumps({"ok": True, "task_id": "t_hub0001"}), rid))
++            hub.commit()
++        return result["rc"], rid, "" if result["rc"] == 0 else "boom"
++
++    monkeypatch.setattr(kp, "hub_runner", fake_hub)
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 0})
++    kb.init_db()
++    yield {"hub": hub, "calls": calls, "result": result}
++    hub.close()
++
++
++def _local_count() -> int:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        return len(kb.list_tasks(conn))
++
++
++def test_chat_card_is_created_on_the_hub_bound_to_its_chat(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({
++        "title": "daveey/hermes CI: ruff check fails on main", "body": "Fix it and push.",
++        "skills": ["github-pr-workflow"], "session_id": "20261027_183000_abc123"}))
++    assert out["ok"], out
++    assert out["placed"]["gateway"] == "hub" and out["placed"]["origin_session"] == "20261027_183000_abc123"
++    assert _local_count() == 0
++    argv = mac["calls"][0]
++    assert argv[1:3] == ["create-task", "hub"]
++    assert argv[argv.index("--origin-session") + 1] == "20261027_183000_abc123"
++    assert argv[argv.index("--creator-session") + 1] == "20261023_052109_5b3dee"
++    assert argv[argv.index("--assignee") + 1] == "default"
++    body = argv[argv.index("--body") + 1]
++    assert body.startswith("Fix it and push.")
++    assert "Skills to load first: github-pr-workflow." in body and "needs=[" in body
++
++
++def test_hub_task_id_is_returned_once_the_hub_applies_it(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 2})
++    mac["result"]["apply"] = True
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "session_id": "20261027_183000_abc123"}))
++    assert out["task_id"] == "t_hub0001" and out["placed"]["task_id"] == "t_hub0001", out
++
++
++def test_unpersisted_session_creates_an_unbound_hub_card(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "session_id": "nope"}))
++    argv = mac["calls"][0]
++    assert out["placed"]["origin_session"] is None
++    assert argv[argv.index("--origin-session") + 1] == "" and "--creator-session" not in argv
++
++
++def test_mac_card_stays_local_and_never_calls_the_hub(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Fix the Hermes Desktop sidebar stripe"}))
++    assert out["ok"] and out["task_id"] and "placed" not in out
++    assert mac["calls"] == [] and _local_count() == 1
++
++
++def test_hub_refusal_falls_back_to_a_local_card(mac):
++    from tools import kanban_tools as kt
++    mac["result"]["rc"] = 2
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index"}))
++    assert out["ok"] and out["task_id"] and "placed" not in out
++    assert len(mac["calls"]) == 1 and _local_count() == 1
++
++
++def test_offline_hub_is_durably_queued_not_duplicated_locally(mac):
++    from tools import kanban_tools as kt
++    mac["result"]["rc"] = 3
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index"}))
++    assert out["placed"]["queued_only"] is True and _local_count() == 0
++
++
++def test_retry_reuses_the_request_id():
++    a = kp.request_id("macbook", {"title": "t", "body": "b"}, "s1")
++    assert a == kp.request_id("macbook", {"title": "t", "body": "b"}, "s1")
++    assert a != kp.request_id("macbook", {"title": "t", "body": "b"}, "s2")
++    assert kp.request_id("macbook", {"title": "t", "idempotency_key": "k"}, "s1") == \
++        kp.request_id("macbook", {"title": "other", "idempotency_key": "k"}, "s1")
++    assert len(a) <= 128 and reg.is_gateway_need("x:y")  # ids fit hermes-hub's alphabet/length
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index a88f2e176c..5a9b7d3772 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1416,6 +1416,55 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+         state.close()
+ 
+ 
++def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id) -> Optional[str]:
++    """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
++
++    Returns the tool result when the card was queued there, None to create it locally (no route,
++    a local-only need, the target not live, or hermes-hub refused). Never raises.
++    """
++    try:
++        from hermes_cli import kanban_placement as kp
++        from hermes_cli import kanban_capability_registry as reg
++        from hermes_cli.profiles import current_profile_name
++
++        view = {**args, "assignee": assignee, "skills": skills, "parents": parents,
++                "project_id": project_id}
++        decision = kp.decide(view)
++        target = decision["where"]
++        if target == "local":
++            if decision.get("why", "").startswith(("local marker", "placement pinned", "needs ")):
++                logger.debug("kanban placement: local (%s)", decision["why"])
++            return None
++        self_gw = reg.self_gateway() or "local"
++        cfg = kp.config()
++        placed = kp.create_remote(view, target=target, origin_session=session_id,
++                                  origin_profile=current_profile_name("default") or "default",
++                                  self_gw=self_gw, cfg=cfg, hub_cli=cfg.get("hub_cli") or "hermes-hub")
++        if not placed.get("ok"):
++            logger.warning("kanban placement: %s refused the card (%s); creating it locally",
++                           target, placed.get("error"))
++            return None
++        tid = None
++        deadline = time.monotonic() + float(cfg.get("wait_seconds", 8) or 0)
++        while not placed.get("queued_only"):
++            tid = kp.remote_task_id(placed["request_id"])
++            if tid or time.monotonic() >= deadline:
++                break
++            time.sleep(1.0)
++        note = (f"Created on {target}, not here: {decision['why']} (kanban.placement). It runs there and "
++                + ("shows in this chat's tasks once the hub applies it. " if session_id else "")
++                + (f"Read it with cross_task @task:default@{target}/{tid} or `hermes-hub tasks --gw {target}`."
++                   if tid else f"The task id appears once {target} applies request {placed['request_id']} "
++                   "(`hermes-hub requests`)."))
++        return _ok(task_id=tid, placed={"gateway": target, "request_id": placed["request_id"],
++                                        "task_id": tid, "origin_session": session_id,
++                                        "queued_only": bool(placed.get("queued_only"))},
++                   note=note)
++    except Exception:
++        logger.warning("kanban placement failed; creating the card locally", exc_info=True)
++        return None
++
++
+ @_kanban_handler("kanban_create")
+ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+@@ -1486,6 +1535,12 @@ def _handle_create(args: dict, **kw) -> str:
+         if project_id is None and workspace_kind is None and workspace_path is None:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
++        if origin_intent is None and origin is None:
++            # Default placement: no local-only need -> the card runs on the routed gateway. [daveey]
++            remote = _place_remote(args, assignee=str(assignee), skills=skills, parents=parents,
++                                   project_id=project_id, session_id=session_id)
++            if remote is not None:
++                return remote
+         new_tid = kb.create_task(
+             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+             parents=tuple(parents), tenant=(args.get("tenant") if origin_intent is not None
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 8ec7a9f9b8..c312907989 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -662,6 +662,15 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "it unfinished; the result's origin_binding says how to "
+                 "read the binding back on the origin gateway."
+         )),
++        "placement": _prop("string", (
++                "Where the card runs. 'auto' (default): on a gateway with a "
++                "kanban.placement route (e.g. the MacBook -> hermes-hub), a "
++                "card with no local-only need is created on the target "
++                "gateway, still linked to this chat. 'local' pins it here "
++                "(use it when the work needs this machine: its Chrome, "
++                "Keychain, Apple apps, launchd/Desktop state, local "
++                "checkouts). A gateway name pins it there."
++        )),
+         "max_runtime_seconds": _prop("integer", (
+                 "Per-task runtime cap. When exceeded, the "
+                 "dispatcher SIGTERMs the worker and re-queues the "
+-- 
+2.55.0
+
