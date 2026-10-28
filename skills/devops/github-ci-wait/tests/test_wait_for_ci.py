@@ -142,3 +142,91 @@ class GhRepoTests(unittest.TestCase):
         self.assertIn(["-R", "me/fork"], [calls[0][i:i + 2] for i in range(len(calls[0]) - 1)])
         self.assertEqual(w.gh_cmd("me/fork", "workflow", "run", "ci.yaml", "--ref", "main"),
                          ["gh", "workflow", "run", "ci.yaml", "--ref", "main", "-R", "me/fork"])
+
+
+class ContainsCacheTests(unittest.TestCase):
+    """A run listed between a push and the next fetch must count once its commit is fetched."""
+
+    def setUp(self):
+        import subprocess
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.origin, self.local = root / "origin", root / "local"
+
+        def g(repo, *args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+                                   *args], check=True, capture_output=True, text=True).stdout.strip()
+        self.g = g
+        subprocess.run(["git", "init", "-q", str(self.origin)], check=True)
+        g(self.origin, "config", "user.email", "you@example.com")
+        g(self.origin, "config", "user.name", "you")
+        g(self.origin, "commit", "-q", "--allow-empty", "-m", "a")
+        self.a = g(self.origin, "rev-parse", "HEAD")
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.local)], check=True, capture_output=True)
+        g(self.origin, "commit", "-q", "--allow-empty", "-m", "b")
+        self.b = g(self.origin, "rev-parse", "HEAD")  # pushed, not fetched by `local` yet
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unfetched_run_head_counts_after_the_fetch(self):
+        contains = w.make_contains(self.local)
+        self.assertFalse(contains(self.b, self.a))  # b is unknown here yet
+        self.g(self.local, "fetch", "-q", "origin")
+        self.assertTrue(contains(self.b, self.a))
+
+    def test_definite_answers_are_cached(self):
+        from unittest import mock
+        self.g(self.local, "fetch", "-q", "origin")
+        contains = w.make_contains(self.local)
+        real, calls = w.subprocess.run, []
+
+        def counting(cmd, **kw):
+            calls.append(cmd)
+            return real(cmd, **kw)
+        with mock.patch.object(w.subprocess, "run", side_effect=counting):
+            for _ in range(2):
+                self.assertTrue(contains(self.b, self.a))
+                self.assertFalse(contains(self.a, self.b))
+        self.assertEqual(len(calls), 2)
+
+
+class BoundedCallTests(unittest.TestCase):
+    """A hung or failing gh/git call must neither hold a wait past its deadline nor crash it."""
+
+    def test_gh_and_git_calls_are_bounded(self):
+        from unittest import mock
+        seen = []
+
+        def fake(cmd, **kw):
+            seen.append(kw.get("timeout"))
+            raise w.subprocess.TimeoutExpired(cmd, kw.get("timeout") or 0)
+        with mock.patch.object(w.subprocess, "run", side_effect=fake):
+            with self.assertRaises(RuntimeError):
+                w.list_runs(Path("."), "main", ["ci.yml"], "o/r")
+            with self.assertRaises(RuntimeError):
+                w.git(Path("."), "fetch", "-q", "origin", "main")
+        self.assertTrue(seen and all(seen), seen)
+
+    def _main(self, listings, *extra):
+        from unittest import mock
+
+        def fake_git(repo, *args):
+            return "c" * 40 if args[0] == "rev-parse" else ""
+        with mock.patch.object(w, "resolve_repo", side_effect=lambda p: p), \
+                mock.patch.object(w, "git", side_effect=fake_git), \
+                mock.patch.object(w, "make_contains", return_value=lambda commit, sha: True), \
+                mock.patch.object(w, "list_runs", side_effect=listings), \
+                mock.patch.object(w.time, "sleep"):
+            return w.main(["c" * 40, "--workflow", "ci.yml", "--gh-repo", "o/r", "--interval", "0", *extra])
+
+    def test_gh_error_is_retried_and_the_wait_still_passes(self):
+        green = dict(run("c" * 40), _wf="ci.yml")
+        self.assertEqual(self._main([RuntimeError("gh run list: timed out"), [green]]), 0)
+
+    def test_gh_error_under_once_is_not_yet(self):
+        self.assertEqual(self._main([RuntimeError("gh run list: HTTP 502")], "--once"), 2)
+
+    def test_gh_that_keeps_failing_ends_the_wait(self):
+        self.assertEqual(self._main([RuntimeError("gh: auth")] * getattr(w, "MAX_CALL_ERRORS", 5)), 1)

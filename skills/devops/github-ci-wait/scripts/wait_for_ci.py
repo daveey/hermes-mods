@@ -17,8 +17,10 @@ Done when:
                     commit containing the sha concluded `success`
 
 Exit codes: 0 done; 1 stalled (nothing queued/running will finish it: the newest
-finished run containing the commit failed, or no run will ever pick it up);
-2 timed out, or not yet done with --once; 3 a sha is not on origin/<branch>.
+finished run containing the commit failed, or no run will ever pick it up), or
+`gh run list` failed MAX_CALL_ERRORS times in a row; 2 timed out, or not yet done
+with --once (a failed listing under --once is also 2); 3 a sha is not on origin/<branch>.
+Every gh/git call is bounded by CALL_TIMEOUT_S, so a hung call can't outlive the deadline.
 --dispatch: on a stall, `gh workflow run` each --workflow (at most twice) and
 keep waiting instead of exiting 1.
 
@@ -40,10 +42,15 @@ from pathlib import Path
 
 ACTIVE = {"queued", "in_progress", "waiting", "requested", "pending"}
 STARTUP_GRACE_S = 180  # runs can take a minute or two to appear after a push
+CALL_TIMEOUT_S = 120  # one gh/git call; an unbounded call that hangs holds the wait past its own deadline
+MAX_CALL_ERRORS = 5  # consecutive failed listings before giving up (exit 1), so auth/repo errors still surface
 
 
 def git(repo: Path, *args: str) -> str:
-    out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    try:
+        out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=CALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git {' '.join(args)}: timed out after {CALL_TIMEOUT_S}s") from None
     if out.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()}")
     return out.stdout.strip()
@@ -53,12 +60,22 @@ def make_contains(repo: Path):
     cache: dict[tuple[str, str], bool] = {}
 
     def contains(commit: str, sha: str) -> bool:
-        """True if `commit` has `sha` in its history (commit == sha counts)."""
+        """True if `commit` has `sha` in its history (commit == sha counts).
+
+        Only a definite answer is cached: exit 0 (yes) or 1 (no). Exit 128 means `commit` isn't fetched here yet,
+        as for a run listed between a push and the next fetch. Caching that as "no" hid the run for the rest of the
+        wait, so its success never counted and the wait ran to its timeout."""
         key = (commit, sha)
-        if key not in cache:
-            cache[key] = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, commit],
-                                        capture_output=True).returncode == 0
-        return cache[key]
+        if key in cache:
+            return cache[key]
+        try:
+            rc = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, commit],
+                                capture_output=True, timeout=CALL_TIMEOUT_S).returncode
+        except subprocess.TimeoutExpired:
+            return False
+        if rc in (0, 1):
+            cache[key] = rc == 0
+        return rc == 0
 
     return contains
 
@@ -127,7 +144,10 @@ def list_runs(repo: Path, branch: str, workflows: list[str], slug: str | None = 
         cmd = gh_cmd(slug, "run", "list", "--branch", branch, "-L", "40" if wf else "100", "--json", fields)
         if wf:
             cmd += ["--workflow", wf]
-        out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+        try:
+            out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=CALL_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"gh run list: timed out after {CALL_TIMEOUT_S}s") from None
         if out.returncode != 0:
             raise RuntimeError(f"gh run list: {out.stderr.strip()}")
         for run in json.loads(out.stdout or "[]"):
@@ -183,9 +203,26 @@ def main(argv: list[str] | None = None) -> int:
     label = ",".join(s[:9] for s in shas)
     start = time.monotonic()
     deadline = start + a.timeout_min * 60
-    dispatches, idle, last = 0, 0, ""
+    dispatches, idle, last, errors = 0, 0, "", 0
     while True:
-        runs = list_runs(repo, a.branch, a.workflow, slug)
+        try:
+            runs = list_runs(repo, a.branch, a.workflow, slug)
+        except RuntimeError as e:
+            # A failed or timed-out listing is "no data this round", not a verdict: retry until the deadline.
+            errors += 1
+            if a.once:
+                print(f"not yet: {e}")
+                return 2
+            if errors >= MAX_CALL_ERRORS:
+                print(f"gh kept failing ({errors} times in a row): {e}")
+                return 1
+            if time.monotonic() >= deadline:
+                print(f"timed out after {a.timeout_min:g} min; last gh error: {e}")
+                return 2
+            print(f"{e}; retrying", flush=True)
+            time.sleep(a.interval)
+            continue
+        errors = 0
         if a.tag_glob:
             tags = tags_done(repo, shas, a.tag_glob)
             if all(tags.values()):
@@ -230,7 +267,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"timed out after {a.timeout_min:g} min; still {note}")
             return 2
         time.sleep(a.interval)
-        fetch()
+        try:
+            fetch()
+        except RuntimeError as e:  # stale refs only delay a verdict: contains() doesn't cache an unknown commit
+            print(f"{e}; using the last fetch", flush=True)
 
 
 if __name__ == "__main__":

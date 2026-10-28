@@ -63,6 +63,9 @@ How to run it from an agent:
   check each job you started once with `process_manage poll`, and restart any that died. If a deploy or a
   promised report hangs on the result, put that step on a Kanban card with a `wake_check` instead; cards
   survive updates.
+- When a script chains steps after the wait, send the wait's output to a log file (`>> log 2>&1`), never
+  through `| tail -n`. tail prints nothing until the wait exits, so a killed or hung wait leaves no record of
+  what it was waiting on.
 - In a Kanban worker there is no async notify, and a poll loop burns `max_runtime_seconds` (most worker
   timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
