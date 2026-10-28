@@ -11,6 +11,7 @@ through the injected `signals` sink (core.SignalStore in production).
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -100,10 +101,87 @@ def _in_git_repo(p: str) -> bool:
     return False
 
 
+def _execute_file_change(code: str) -> bool:
+    """Inspect helper calls without running Python. Only statically known strings count;
+    comments, content strings and arbitrary dynamic expressions are not executable evidence."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return False
+    aliases = {name: name for name in ("write_file", "patch", "terminal")}
+    modules = {"hermes_tools"}
+    strings: dict[str, str] = {}
+
+    def text(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return strings.get(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = text(node.left), text(node.right)
+            return left + right if left is not None and right is not None else None
+        if isinstance(node, ast.JoinedStr):
+            parts = [text(p.value) if isinstance(p, ast.FormattedValue) and not p.format_spec else text(p)
+                     for p in node.values]
+            return "".join(parts) if all(p is not None for p in parts) else None
+        return None
+
+    class Calls(ast.NodeVisitor):
+        changed = False
+
+        def visit_ImportFrom(self, node):
+            if node.module == "hermes_tools":
+                for name in node.names:
+                    aliases[name.asname or name.name] = name.name
+
+        def visit_Import(self, node):
+            for name in node.names:
+                if name.name == "hermes_tools":
+                    modules.add(name.asname or name.name)
+
+        def visit_Assign(self, node):
+            self.visit(node.value)
+            value = text(node.value)
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    strings.pop(target.id, None)
+                    if value is not None:
+                        strings[target.id] = value
+
+        def visit_Call(self, node):
+            name = aliases.get(node.func.id) if isinstance(node.func, ast.Name) else None
+            if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in modules):
+                name = node.func.attr
+            if name in ("write_file", "patch", "terminal"):
+                key = "command" if name == "terminal" else "path"
+                values = {kw.arg: text(kw.value) for kw in node.keywords if kw.arg}
+                if key not in values and node.args:
+                    values[key] = text(node.args[0])
+                if values.get(key) is not None and is_file_change(name, values):
+                    self.changed = True
+            self.generic_visit(node)
+
+        # A declaration alone doesn't run its body. Dynamic helper/function dispatch is not inferred.
+        def visit_FunctionDef(self, node: ast.AST):
+            pass
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+        visit_Lambda = visit_FunctionDef
+
+    visitor = Calls()
+    visitor.visit(tree)
+    return visitor.changed
+
+
 def is_file_change(tool: str, args: Any) -> bool:
     """A call that changes project files: write_file/patch outside scratch, or a terminal git commit / worktree add /
-    in-place edit / output redirect into a git repo. Reads, tests and scratch probes don't count."""
+    in-place edit / output redirect into a git repo, including helper calls inside execute_code.
+    Reads, tests and scratch probes don't count."""
     a = args if isinstance(args, dict) else {}
+    if tool == "execute_code":
+        return _execute_file_change(str(a.get("code") or ""))
     if tool in ("write_file", "patch"):
         p = str(a.get("path") or "")
         return bool(p) and not _is_scratch(p)

@@ -464,6 +464,76 @@ def test_plan_first_fires_on_first_edit_of_an_unplanned_build_ask(tmp_path):
     assert [r for r in log if r.get("rule") == "plan_first"]
 
 
+@pytest.mark.parametrize("code_template", [
+    "from hermes_tools import write_file\nwrite_file(path={path!r}, content='x')",
+    "from hermes_tools import patch\npatch({path!r}, 'old', 'new')",
+    "from hermes_tools import write_file as save\ntarget = {path!r}\nsave(target, 'x')",
+    "import hermes_tools as tools\ntools.write_file({path!r}, 'x')",
+    "target = {path!r}\nwrite_file(f'{{target}}', 'x')",
+    "target = {path!r}\nwrite_file(target + '.bak', 'x')",
+    "from hermes_tools import terminal\nterminal(command='printf x > gen.py', workdir={repo!r})",
+    "from hermes_tools import terminal\nterminal(command={redirect!r})",
+    "from hermes_tools import terminal\nterminal({commit!r})",
+    "from hermes_tools import terminal\nterminal({inplace!r})",
+])
+def test_plan_first_execute_code_first_edit_and_session_cap(tmp_path, code_template):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    code = code_template.format(repo=str(repo), path=str(repo / "gen.py"), redirect=f"printf x > {repo}/gen.py",
+                                commit=f"git -C {repo} commit -am build",
+                                inplace=f"cd {repo} && sed -i 's/x/y/' gen.py")
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    out = _edit(hooks, "execute_code", {"code": code})
+    assert out and "Plan Before You Build" in json.loads(out)["coach_hint"]
+    assert _edit(hooks, "execute_code", {"code": code}) is None
+    log = [json.loads(line) for line in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert len([r for r in log if r.get("rule") == "plan_first"]) == 1
+
+
+@pytest.mark.parametrize("kind", ["custom", "tmpdir", "cache", "plans"])
+def test_plan_first_execute_code_scratch_exemptions(tmp_path, monkeypatch, kind):
+    if kind in ("cache", "plans"):
+        monkeypatch.delenv("COACH_SCRATCH_ROOTS")
+        root = Path.home() / ".hermes" / kind
+    elif kind == "tmpdir":
+        root = tmp_path / "temporary"
+        monkeypatch.setenv("TMPDIR", str(root))
+    else:
+        root = tmp_path / "scratch"
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    for code in (f"write_file({str(root / 'probe.py')!r}, 'x')",
+                 f"patch(path={str(root / 'probe.py')!r}, old_string='x', new_string='y')",
+                 f"terminal({f'cd {root} && git commit -am probe'!r})"):
+        assert _edit(hooks, "execute_code", {"code": code}) is None
+    log_path = tmp_path / "coach" / "log.jsonl"
+    log = [json.loads(line) for line in log_path.read_text().splitlines()] if log_path.exists() else []
+    assert not [r for r in log if r.get("rule") == "plan_first"]
+
+
+def test_plan_first_execute_code_mixed_scratch_and_project(tmp_path):
+    scratch = tmp_path / "scratch"
+    (scratch / ".git").mkdir(parents=True)
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    probe = f"terminal({f'printf x > {scratch}/probe.py'!r})"
+    assert _edit(hooks, "execute_code", {"code": probe}) is None
+    code = probe + f"\nwrite_file({str(tmp_path / 'app.py')!r}, 'x')"
+    out = _edit(hooks, "execute_code", {"code": code})
+    assert out and "Plan Before You Build" in json.loads(out)["coach_hint"]
+
+
+def test_plan_first_execute_code_ignores_readonly_and_mentioned_code(tmp_path):
+    for code in ("from hermes_tools import read_file\nread_file('/project/app.py')",
+                 "# write_file('/project/app.py', 'x')\nprint('read only')",
+                 "example = \"write_file('/project/app.py', 'x')\"\nprint(example)",
+                 "def example():\n    write_file('/project/app.py', 'x')",
+                 "write_file(get_unknown_path(), 'x')",
+                 "this is not valid Python!"):
+        assert not rules.is_file_change("execute_code", {"code": code})
+
+
 def test_plan_first_quiet_for_a_fix_request(tmp_path):
     _, hooks = _plan_hooks(tmp_path)
     fix = ("Fix the login page: it throws a TypeError when the email field is empty and the submit button stays "
