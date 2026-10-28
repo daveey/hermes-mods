@@ -1,7 +1,7 @@
 # A running background review holds backend retirement
 
 Patches: [`patches/0700-fix-retirement-a-running-background-review-holds-the.patch`](patches/0700-fix-retirement-a-running-background-review-holds-the.patch) (fork commit `4101ef7442`),
-[`patches/0702-fix-update-stop-a-stale-dashboard-backend-through-it.patch`](patches/0702-fix-update-stop-a-stale-dashboard-backend-through-it.patch) (fork commit `2d9f16aa2c`, the `hermes update` stop path)
+[`patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch`](patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch) (fork commit `2d9f16aa2c`, the `hermes update` stop path)
 
 ## Why
 
@@ -24,7 +24,7 @@ change, which was lost.
 - Once a review is older than `BACKGROUND_REVIEW_HARD_CAP_S` (900 s), it stops counting, so a wedged review cannot
   starve retirement.
 - `busy_ledger()` reports `background_review:<n>` for the idle-exit watchdog and `/api/health/idle`.
-- `hermes update`'s dashboard step (`_kill_stale_dashboard_processes(restart_managed=True)`, patch 0702) no longer
+- `hermes update`'s dashboard step (`_kill_stale_dashboard_processes(restart_managed=True)`, patch 0703) no longer
   sends a plain SIGTERM first. For each stale backend whose port (spawn ledger, host rendezvous record, or a
   non-zero `--port`) and session token (`HERMES_DASHBOARD_SESSION_TOKEN` in its environment, or the rendezvous
   token) it can find, it calls `POST /api/health/retirement` `prepare`. While `GET /api/health/idle` reports
@@ -51,7 +51,7 @@ change, which was lost.
 - `_spawn_background_review_now` holds the fence for the thread's whole run, and skips cleanly (run token released)
   on a retiring backend.
 
-`tests/hermes_cli/test_update_stale_dashboard_review.py` (patch 0702; 3 of 5 fail without it, and the 2 controls
+`tests/hermes_cli/test_update_stale_dashboard_review.py` (patch 0703; 3 of 5 fail without it, and the 2 controls
 pass both ways). The backend is a real child process: a real `RetirementFence` behind an HTTP listener that checks
 the session token from its environment, plus a SIGTERM handler that records what the shutdown would do to a review
 still running:
