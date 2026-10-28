@@ -124,7 +124,5 @@ Plugin: `plugins/chat-closeout/tests/test_proof_pass.py` (`test_a_pass_proves_th
   snapshot's annotations across threads.
 - Builds on fa44287eb6 (links fingerprint keyed on hub content, 15 s max age), which landed meanwhile: its
   fingerprint still covers every board's stat, which is why the in-scope pin above matters.
-- Not addressed: the `stale`/`status` flicker on origin rows when another process holds the origin ledger's write
-  lock (`project()` → `refresh_observations` → `BEGIN IMMEDIATE` on every read). That behavior is pinned by
-  `test_projection_keeps_sync_timestamp_but_not_freshness_during_write_contention[advance=False]`; changing it is an
-  owner decision.
+- The `stale`/`status` flicker on origin rows under ledger write-lock contention is fixed separately in 0652
+  ([kanban-local-owner-projection.md](kanban-local-owner-projection.md)).

@@ -8,13 +8,24 @@ Local terminal evidence can release an obligation only with an exact durable cre
 
 Projection refresh does not queue behind a ledger writer. Failed opportunistic refresh retains conservative unknown/unfinished state. This removes one demonstrated five-second writer wait, not every possible inventory delay.
 
+**0652:** a reader takes the ledger's write lock only when some observation would actually advance (a read-only scan
+decides first, re-checked inside the transaction). A refresh that finds the lock busy no longer marks the whole
+replica stale: a row stays current only when the replica holds exactly its stored version, so a row the busy refresh
+would have advanced still reads stale/unknown, and every other row keeps its real status. Before, every projection
+in every process took `BEGIN IMMEDIATE`, readers collided with each other, and the loser's projection flipped every
+hub row to stale/unknown for that poll (2 of 40 back-to-back projection pairs live; the sidebar's stale flicker).
+Five whys: the stale rows came from `fresh = False`; that came from `database is locked` in `refresh_observations`;
+the lock was held by another process's projection; readers took the write lock unconditionally; and a busy lock was
+treated like an unreadable replica. Not caught because the contention test used one held writer and pinned the
+conservative result even with nothing to advance; no test ran two readers at once.
+
 ## How it works
 
 The refresh writer uses timeout zero. Inventory reads use a read-only ledger connection rather than schema initialization. Local projection overlays a consistent read-only owner-board transaction, requiring the active profile and expected profile-home board path. It reuses owner-observation completion evidence and does not mutate receipts or observation versions. Open-row dedup checks both receipt aliases. Legacy aggregation excludes only the current exact owner, retaining same-gateway foreign-profile and unknown-owner rows.
 
 ## Code
 
-- `hermes_cli/kanban_origin_ledger.py`: nonblocking refresh, read-only projection and local overlay.
+- `hermes_cli/kanban_origin_ledger.py`: nonblocking refresh, read-only projection and local overlay; 0652: `_advanced_observation`, `refresh_observations` (read-only pre-scan), `_lock_busy`, `project()`.
 - `hermes_cli/kanban_origin_local.py`: strict local authority and creation-marker evidence.
 - `hermes_cli/kanban_session_activity.py`: exact open-association dedup and foreign-profile retention.
 
@@ -22,7 +33,7 @@ The refresh writer uses timeout zero. Inventory reads use a read-only ledger con
 
 Independent exact-head review at `b47371bdf826a63b7273235ddacb7a88c3cd6ac6` ran 206 tests across 15 Python files through the official runner, with retries disabled. Blocking `scripts/check` passed all 12 checks during implementation.
 
-- `tests/hermes_cli/test_kanban_origin_projection_contention.py`: real held SQLite writer, bounded projection, conservative uncertainty; red before the fix.
+- `tests/hermes_cli/test_kanban_origin_projection_contention.py`: real held SQLite writer, bounded projection, conservative uncertainty; red before the fix. Since 0652: with a held writer, a row with nothing to advance is current and an advanced row is stale/unknown (`[False]` / `[True]`); `test_a_projection_with_nothing_to_advance_takes_no_write_lock`; `test_concurrent_readers_never_see_each_other_as_stale` (two threads, 150 projections each). All three red on the pre-0652 code.
 - `tests/hermes_cli/test_kanban_local_receipt_authority.py`: running/scheduled/human-blocked local authority; unknown/different owners, aliases, terminal receipts and missing boards.
 - `tests/hermes_cli/test_kanban_remote_identity.py`: same-gateway foreign-profile and unknown-owner preservation; red before the fix.
 - `tests/hermes_cli/test_kanban_local_origin_projection.py`: verified completion/reopen/human-blocked; raw terminal states, missing/wrong markers, missing boards and pinned-board/profile mismatch.
