@@ -1,7 +1,7 @@
 # Desktop: keep remote gateways warm (always-on dashboard, prewarm, probe skip)
 
-Patches **0526** (`4dbfb50490`), **0535** (`7c62393349`, named-profile prewarm) and **0595** (`19c6caabe0`, retire on a
-replaced runtime). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
+Patches **0526** (`4dbfb50490`), **0535** (`7c62393349`, named-profile prewarm), **0595** (`19c6caabe0`, retire on a
+replaced runtime) and **0671** (`8e6534e7ad`, no marker drift or retire loop). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
 
 ## Behavior
 
@@ -73,6 +73,23 @@ Apply after 0448–0450. Then on each remote host: `hermes always-on-dashboard i
   revision-based skew watchdog never fired, so the dashboard sat stale until the next checkout change. 0595 makes the
   skew watchdog also retire on a lost runtime marker (between turns, never mid-update); the supervisor restarts it on
   the new runtime. Test: `test_a_replaced_runtime_retires_even_when_the_revision_did_not_move` and its two neighbours.
+- 0595 turned a PM side effect into a restart loop, fixed by **0671** (`8e6534e7ad`). On a host whose serve runs the
+  store Python (`-I`, Linux hub), the marker `.hermes-ssh-runtime-<nonce>` sits inside PM's published python tree.
+  `tree_digest` hashed it, so every `scripts/run_tests.sh` (`setup-hermes.sh --runtime-only` → `pm install
+  --trust-recorded` → `check_project_lock` → `_toolchain`'s `ensure("uv", explicit=True)`, which re-hashes the
+  python dependency) re-realized the python entry, deleted every marker and retired every SSH backend: the always-on
+  dashboard restarted every ~70 s. 0671: (1) `pm.store.tree_digest` skips files named exactly
+  `.hermes-ssh-runtime-<16 hex>` (`is_runtime_state_file`), like `__pycache__`; (2) the serve fingerprints its
+  purelib at boot (dist-info `RECORD`s, top-level files, `pyvenv.cfg`, interpreter) and, on a lost marker over
+  identical bytes, writes it back and stays up (`_ssh_runtime_reattach`); (3) a real runtime retirement is recorded
+  per owner nonce in `$HERMES_HOME/cache/ssh-runtime-retirements.json`, and another inside 15 min
+  (`RUNTIME_RETIRE_BACKOFF_S`) is held. Code-revision retirement is never held. Tests:
+  `test_a_deliberate_install_leaves_an_intact_entry_holding_ssh_runtime_markers_alone` (tests/pm/test_pm_core.py),
+  `test_ssh_runtime_reattaches_only_when_the_rerealized_tree_holds_the_same_bytes`,
+  `test_a_real_runtime_swap_retires_once_between_turns_and_is_recorded`,
+  `test_the_respawned_backend_does_not_retire_again_inside_the_backoff_window`.
+  Older copies of core (Kanban worker checkouts) still hash markers when they run tests against the shared store;
+  the reattach path is what keeps the serve up through those.
 - Rotate the token by uninstalling, deleting `~/.hermes/desktop-ssh/always-on`, and installing again.
 
 ## Plugin?
