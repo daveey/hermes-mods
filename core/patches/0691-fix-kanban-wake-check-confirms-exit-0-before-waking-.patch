@@ -1,0 +1,195 @@
+From ac4392155518c484c4fb383e9fe85657f9b3caf7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 02:49:15 -0700
+Subject: [PATCH] fix(kanban): wake check confirms exit 0 before waking; reaper
+ no longer waitpid(-1)s probe children
+
+---
+ hermes_cli/kanban_db_dispatch.py           | 40 ++++++-----------
+ hermes_cli/kanban_wake_check.py            | 23 ++++++++--
+ tests/hermes_cli/test_kanban_wake_check.py | 52 ++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 03a768fa19..8c31fae825 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -279,9 +279,9 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
+ _RECENT_WORKER_EXITS_MAX = 4096
+ _recent_worker_exits: dict[int, tuple[int, float]] = {}
+ 
+-# Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
+-# through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
+-# here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
++# A child's exit code is only recoverable through a live handle (Windows has no
++# ``waitpid(-1)``; on POSIX ``waitpid(-1)`` would steal other children's status), so
++# ``_default_spawn`` parks each worker's ``Popen`` here and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
+ _live_worker_procs: dict[int, subprocess.Popen] = {}
+ 
+ 
+@@ -368,27 +368,16 @@ def reap_worker_zombies() -> list[int]:
+     parked by ``_default_spawn`` (the only way to learn a child's exit code
+     there), so the rate-limit sentinel exit is classified on both hosts."""
+     reaped: list[int] = []
+-    if _kb._IS_WINDOWS:
+-        for pid, proc in list(_live_worker_procs.items()):
+-            returncode = proc.poll()
+-            if returncode is None:
+-                continue
+-            _record_worker_exit(pid, _wait_status_from_returncode(returncode))
+-            _live_worker_procs.pop(pid, None)
+-            reaped.append(pid)
+-        return reaped
+-    try:
+-        while True:
+-            try:
+-                pid, status = os.waitpid(-1, os.WNOHANG)
+-            except ChildProcessError:
+-                break
+-            if pid == 0:
+-                break
+-            _record_worker_exit(pid, status)
+-            reaped.append(pid)
+-    except Exception:
+-        pass
++    # Only our own workers: waitpid(-1) also stole wake-check probe children, and Python 3.14's
++    # Popen then reported their exit as 0 (a false condition_met).
++    for pid, proc in list(_live_worker_procs.items()):
++        returncode = proc.poll()
++        if returncode is None:
++            continue
++        _record_worker_exit(
++            pid, _wait_status_from_returncode(returncode) if returncode >= 0 else -returncode)
++        _live_worker_procs.pop(pid, None)
++        reaped.append(pid)
+     return reaped
+ 
+ 
+@@ -3239,8 +3228,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
+         )
+     # Intentionally NOT closing log_f: the child keeps writing after return;
+     # the OS-level FD stays open in the child until it exits.
+-    if _kb._IS_WINDOWS:
+-        _live_worker_procs[proc.pid] = proc
++    _live_worker_procs[proc.pid] = proc
+     return proc.pid
+ 
+ 
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 4b95d51033..8041303be1 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -359,14 +359,29 @@ def _run_probe(key: tuple[str, str], cmd: str, cwd: str, env: dict) -> tuple[Any
+             _PROCS.pop(key, None)
+ 
+ 
++def _probe_diagnostics(cwd: str, env: dict) -> dict:
++    """Where a probe ran, so a false wake can be diagnosed from its ``condition_met`` event alone."""
++    import socket
++
++    return {"pid": os.getpid(), "host": socket.gethostname(), "cwd": cwd, "home": env.get("HOME"),
++            "path_head": [p for p in (env.get("PATH") or "").split(os.pathsep)[:3]]}
++
++
+ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str) -> Any:
+     key = (db_path, task_id)
+     try:
+         rc, out = _run_probe(key, cmd, cwd, env)
++        diag = None
++        if rc == 0:
++            # One stray exit 0 must not wake a card (a stolen wait status once read as 0): confirm
++            # with a second run and wake only if it passes again. The second result is what counts.
++            first = {"first_rc": rc, "first_output": _tail(out)}
++            rc, out = _run_probe(key, cmd, cwd, env)
++            diag = {**first, "confirm_rc": rc, **_probe_diagnostics(cwd, env)}
+         from hermes_cli import kanban_db_connect as kbc
+         conn = kbc.connect(Path(db_path))
+         try:
+-            apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation)
++            apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag)
+         finally:
+             conn.close()
+         return rc
+@@ -376,7 +391,8 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+ 
+ 
+ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str,
+-                 *, generation: str, now: Optional[int] = None) -> Optional[str]:
++                 *, generation: str, now: Optional[int] = None,
++                 diagnostics: Optional[dict] = None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -392,7 +408,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             return None
+         rc_col = rc if isinstance(rc, int) else -1
+         if rc == 0:
+-            return _wake(conn, task_id, CONDITION_MET_EVENT, {"wake_check": cmd, "output": tail})
++            return _wake(conn, task_id, CONDITION_MET_EVENT, {
++                "wake_check": cmd, "output": tail, **({"diagnostics": diagnostics} if diagnostics else {})})
+         if rc == 1 and not output_error(out):
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+diff --git a/tests/hermes_cli/test_kanban_wake_check.py b/tests/hermes_cli/test_kanban_wake_check.py
+index a8e202f0c3..a690c13a26 100644
+--- a/tests/hermes_cli/test_kanban_wake_check.py
++++ b/tests/hermes_cli/test_kanban_wake_check.py
+@@ -451,3 +451,55 @@ def test_wait_check_remote_is_argv_safe(monkeypatch):
+     assert "'t_x; rm -rf /'" in seen["argv"][-1]
+     P.returncode, P.stdout = 255, ""
+     assert w.check_remote("hub", "task", "t_x")[0] == 2
++
++
++def _scheduled_probe(conn, monkeypatch, cmd):
++    from tools import kanban_tools as kt
++
++    tid = _running(conn)
++    _worker_env(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_schedule({
++        "reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting", "wake_check": cmd,
++        "check_every": 300, "awaiting": BUILD}))
++    assert out.get("status") == "scheduled", out
++    return tid
++
++
++def test_stray_exit0_does_not_wake_when_confirmation_run_fails(kanban_home, tmp_path, monkeypatch) -> None:
++    """A probe that exits 0 once then 1 (a stolen/garbled status) must not wake the card."""
++    counter = tmp_path / "runs"
++    cmd = f"echo x >> {counter}; test $(wc -l < {counter}) -le 1"  # run 1 -> 0, run 2+ -> 1
++    with kbc.connect_closing() as conn:
++        monkeypatch.setattr(kwc, "dry_run_error", lambda *a, **k: None)
++        tid = _scheduled_probe(conn, monkeypatch, cmd)
++        counter.unlink(missing_ok=True)
++        kwc.run_due_wake_checks(conn, now=int(time.time()), wait=True)
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert not _events(conn, tid, "condition_met")
++        assert len(counter.read_text().splitlines()) == 2  # probed, then confirmed
++
++
++def test_condition_met_payload_carries_diagnostics(kanban_home, tmp_path, monkeypatch) -> None:
++    flag = _flag(tmp_path)
++    flag.write_text("ok\n")
++    with kbc.connect_closing() as conn:
++        monkeypatch.setattr(kwc, "dry_run_error", lambda *a, **k: None)
++        tid = _scheduled_probe(conn, monkeypatch, _probe(flag))
++        kwc.run_due_wake_checks(conn, now=int(time.time()), wait=True)
++        ev = _events(conn, tid, "condition_met")
++        assert len(ev) == 1
++        d = ev[0].payload["diagnostics"]
++        assert d["pid"] and d["host"] and d["cwd"] and "home" in d
++        assert isinstance(d["path_head"], list) and d["first_rc"] == 0 and d["confirm_rc"] == 0
++
++
++def test_reaper_does_not_steal_wake_probe_status(kanban_home, monkeypatch) -> None:
++    """reap_worker_zombies used waitpid(-1): it reaped a probe child and Popen then read exit 1 as 0."""
++    import subprocess
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    monkeypatch.setattr(kbd, "_live_worker_procs", {})
++    proc = subprocess.Popen(["bash", "-c", "exit 1"], start_new_session=True)
++    time.sleep(0.5)
++    assert proc.pid not in kbd.reap_worker_zombies()
++    assert proc.wait() == 1
+-- 
+2.55.0
+

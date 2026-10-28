@@ -16,7 +16,11 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
-| [retirement-ledger-bom.md](retirement-ledger-bom.md) | 0688 | Retirement ledger reads BOM JSON; a nested `open(..., "rb")` is not a text-mode footgun. |
+| [kanban-delegate-child-terminal-isolation.md](kanban-delegate-child-terminal-isolation.md) | 0692 | Delegate children keep their own terminal env; `--board` works from worker shells; `boards list` counts each board. |
+| [kanban-blocked-create-needs-input.md](kanban-blocked-create-needs-input.md) | 0693 | A card created blocked with a human_request is classified `needs_input`. |
+| [pm-range-server-threaded.md](pm-range-server-threaded.md) | 0694 | Test range server is threaded so a paused download stops in 0.04 s, not 3.7 s. |
+| [kanban-wake-check-confirm.md](kanban-wake-check-confirm.md) | 0691 | A wake probe exiting 0 is confirmed by a second run; the reaper stops stealing probe statuses. |
+| [retirement-ledger-bom.md](retirement-ledger-bom.md) | 0688 0689 | Retirement ledger reads BOM JSON; a nested `open(..., "rb")` is not a text-mode footgun. |
 | [projects-tree-activity-mock.md](projects-tree-activity-mock.md) | 0687 | Projects tree activity test mocks `_all_counts(include_snapshot=...)`. Test harness only. |
 | [kanban-unlink.md](kanban-unlink.md) | 0685 | `kanban_unlink` removes an edge the worker owns (orchestrators any); a worker may complete the card it just parked; a parked card with a live run pid is not a leaked-worker env. |
 | [transcript-page-request-arg.md](transcript-page-request-arg.md) | 0684 | Direct history-page tests pass `Request` and an explicit `order`. Test harness only. |
@@ -58,7 +62,7 @@ The last public/private series reconciliation (what was already equivalent, what
 | [interrupt-reason.md](interrupt-reason.md) | 0625 0628 | Every interrupt producer records a fixed reason (user_stop, ws_orphan, backend_exit, lease_takeover, session_close) and phase on the interrupted row, the result and one INFO line. |
 | [model-routing-managed-adoption.md](model-routing-managed-adoption.md) | 0619 | Live agents adopt the managed subscription policy when enforcement is enabled; aux and main round-robin counters are split. |
 | [process-exit-log-noise.md](process-exit-log-noise.md) | 0620 | A process exit mid-turn logs one line, not a traceback, in the pre-final gate, tool executor and errors.log. |
-| [test-host-slot-cap.md](test-host-slot-cap.md) | 0611 | xdist workers are capped per host test slot; a full `max_in_progress` is reported as idle, not stuck. |
+| [test-host-slot-cap.md](test-host-slot-cap.md) | 0611 0690 | xdist workers are capped per host test slot (and by the host's `tests.xdist_workers`); a full `max_in_progress` is reported as idle, not stuck. |
 | [hub-project-groups.md](hub-project-groups.md) | 0602 0603 | Every gateway's project groups come from the hub replica when that gateway can't be reached (or before it answers), so an asleep gateway's groups stay; another gateway's declared project can be renamed or themed from here as a hub shared field, applied by its owner when it wakes (`hermes project tree` / `project update`). |
 | [websockets-keepalive-logging.md](websockets-keepalive-logging.md) | 0600 | A websockets peer that stops answering pings is a handled drop: every Hermes connection passes `logger=ws_logger()`, so the library's `ERROR keepalive ping failed` + traceback becomes one INFO line (errors.log and self-heal stay quiet; Kanban sync still reconnects). code_health HX015 flags a new `connect()`/`serve()` without `logger=`. |
 | [desktop-remote-update-pause.md](desktop-remote-update-pause.md) | 0592 0610 | While a remote gateway runs its own `hermes update`, its SSH dials pause per host: requests and prewarm fail fast from the cached refusal and one probe per backoff window (2–30 s) checks for the end, instead of a new SSH control master per request (53 in 108 s on 2026-10-27); the connection comes back once. |
@@ -394,3 +398,5 @@ Numbering addendum (0652–0653): final source refresh added `a934e39df2` and `9
 Numbering note (0631–0651): the full fork log was regenerated (657 non-merge commits through `90a63800fb`), compared against the curated public inventory, and this appended range follows `7f117fa465` in fork order. Historical numbering/adaptations above remain unchanged; these are not raw log ordinal numbers. The prematurely published sidebar-poll patch `2bc039b9bf` moved from 0631 to its proper place at 0647; doc references were updated. Every commit after `7f117fa465` through this snapshot is represented once. Application, tests, privacy substitutions and remaining historical limits: [mirror-651-verification.md](mirror-651-verification.md).
 
 Numbering note (0674–0688): appended after the already-published 0673 (worker nodes, `6d29976569`; do not renumber). 0671 is two files on purpose (do not renumber): `a3a632954c` (local lineage counts) and `8e6534e7ad` (SSH runtime markers). 0672 is `fc0f7c9910`. This range skips those three. 0687 and 0688 landed on the fork after 0672 and are included. 0673 and 0681 are adapted to series order (`runs_on` lands before `validate_skills`); From hashes are unchanged. Historical gaps called out above (actionable-evidence replay, contributor-map chores) stay unpatched.
+
+Numbering note (0689–0694): appended after 0688 in fork order (`7137506242`, `175f5c0e57`, `ac43921555`, `12fb47ed09`, `d4cb0dafe1`, `a081ba9470`). 0689 and 0690 extend the existing retirement-ledger and host-slot docs.
