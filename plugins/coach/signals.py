@@ -261,15 +261,44 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
     return out
 
 
+CRON_WINDOW_S = 86400
+
+
+def _cron_threshold(h: Path) -> int:
+    """cron.failure_nudge_threshold from <home>/config.yaml (core's own streak warning); default 3, 0/bad -> 3."""
+    try:
+        txt = (h / "config.yaml").read_text()
+    except OSError:
+        return 3
+    try:
+        import yaml  # optional: the sweep may run under a bare stdlib python
+        n = ((yaml.safe_load(txt) or {}).get("cron") or {}).get("failure_nudge_threshold", 3)
+    except ImportError:
+        m = re.search(r"^cron:[ \t]*\n(?:[ \t]+.*\n)*?[ \t]+failure_nudge_threshold:[ \t]*(\d+)", txt, re.M)
+        n = m.group(1) if m else 3
+    except Exception:
+        return 3
+    try:
+        return int(n) if int(n) > 0 else 3
+    except (TypeError, ValueError):
+        return 3
+
+
 def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
+    """File a cron job only while it is still failing (failure_streak >= threshold), or when it failed
+    `threshold` times within 24 h although each run recovered (count kept in cur["cron_fails"]).
+    A one-off failure the next run already recovered from is only counted: core keeps last_failure
+    after a success on purpose and leaves "how recent counts" to the reader (cron/jobs.py)."""
     out = []
     seen = cur.setdefault("cron", {})
+    fails = cur.setdefault("cron_fails", {})
     first = not seen
     for prof, h in homes(home):
         try:
             j = json.loads((h / "cron" / "jobs.json").read_text())
         except Exception:
             continue
+        threshold = _cron_threshold(h)
         for job in (j.get("jobs") if isinstance(j, dict) else j) or []:
             lf = job.get("last_failure") or {}
             at = _iso_ts(lf.get("at"))
@@ -281,14 +310,24 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
             seen[k] = at
             name = job.get("name") or job.get("id")
             detail = str(lf.get("detail") or job.get("last_error") or "run failed")
-            if detail.startswith("Gateway shutdown (") and int(job.get("failure_streak") or 0) < 2:
-                continue  # one-off run killed by a gateway restart (cursor already advanced); a streak still files
+            streak = int(job.get("failure_streak") or 0)
+            recent = [t for t in fails.get(k, []) if t > at - CRON_WINDOW_S]
+            if not detail.startswith("Gateway shutdown ("):
+                recent.append(at)  # a run killed by a gateway restart is not the job's fault: never counted
+            fails[k] = recent
+            if streak < threshold and len(recent) < threshold:
+                continue  # one-off / under core's own nudge threshold (cursor advanced): counted, not filed
+            why = (f"failure_streak={streak} >= {threshold}" if streak >= threshold
+                   else f"{len(recent)} failures in 24h (each recovered)")
+            fails.pop(k, None)  # one card per burst; the fp dedupes repeats anyway
             out.append({"kind": "cron", "component": "cron", "at": at, "profile": prof,
                         "symptom": f"cron job '{name}' failed on {host}: {detail.splitlines()[0][:120] if detail else ''}",
                         "details": home_tilde(f"job {job.get('id')} ({name}, profile {prof}) failure_streak="
-                                              f"{job.get('failure_streak')} last_status={job.get('last_status')}\n"
-                                              f"script={job.get('script')}\n{detail}")[:1500],
+                                              f"{job.get('failure_streak')} last_status={job.get('last_status')} "
+                                              f"filed: {why}\nscript={job.get('script')}\n{detail}")[:1500],
                         "fp": fp("cron", host, prof, name)})
+    for k in [k for k, v in fails.items() if not v or max(v) < now - CRON_WINDOW_S]:
+        fails.pop(k, None)  # keep the cursor small
     return out
 
 

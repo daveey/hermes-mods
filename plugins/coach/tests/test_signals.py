@@ -192,8 +192,9 @@ def test_plugin_hook_exception(home):
 def test_failed_cron_runs(home):
     crons = kinds(sg.collect(home, {}, "hubhost", NOW), "cron")
     names = sorted(s["symptom"].split("'")[1] for s in crons)
-    # a failed run is caught even after the job recovered (sticky last_failure); a month-old one is not
-    assert names == ["nightly export", "recovered job"]
+    # a job still failing at core's nudge threshold (streak 3) is filed; a one-off the next run recovered from
+    # ("recovered job", streak 0) is only counted; a month-old one is not seen at all
+    assert names == ["nightly export"]
     assert all(s["fp"].startswith("cron-") for s in crons)
 
 
@@ -204,10 +205,11 @@ def test_gateway_shutdown_cron_kill_is_one_off_unless_repeated(home):
         return {"id": i, "name": f"job {i}", "last_status": "error", "failure_streak": streak,
                 "last_failure": {"at": "2026-10-22T08:10:00+00:00", "detail": detail}}
     (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [
-        job("g1", 1, gw), job("g2", 2, gw), job("o1", 1, "Script exited with code 1")]}))
+        job("g1", 1, gw), job("g3", 3, gw), job("o3", 3, "Script exited with code 1")]}))
     cur = {}
     names = sorted(s["symptom"].split("'")[1] for s in sg.collect_cron(home, cur, NOW, "macbook"))
-    assert names == ["job g2", "job o1"]
+    assert names == ["job g3", "job o3"]
+    assert "default:g1" not in cur["cron_fails"]  # a gateway kill never counts toward the 24h burst
     # the suppressed run still advanced the seen cursor: no re-emit on the next pass
     assert cur["cron"]["default:g1"] > 0
     assert sg.collect_cron(home, cur, NOW + 60, "macbook") == []
@@ -434,3 +436,55 @@ def test_forward_parses_hub_result():
                                                                             "hub_host": "elsewhere"},
                        runner=runner, now=NOW)
     assert r["action"] == "forwarded" and r["hub_result"]["card"] == "t_9" and sg.lane_owns(r)
+
+
+def _cron_job(i, streak, status, at, detail="Script exited with code 1"):
+    return {"id": i, "name": f"job {i}", "last_status": status, "failure_streak": streak,
+            "last_failure": {"at": at, "detail": detail}}
+
+
+def _write_jobs(home, *jobs):
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": list(jobs)}))
+
+
+def _iso(ts):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def test_recovered_one_off_cron_failure_is_not_filed(home):
+    # bsky-notify 10/27: failed once, next run ok (streak 0) -> counted, never a self-heal card
+    _write_jobs(home, _cron_job("r1", 0, "ok", _iso(NOW - 1200)),
+                _cron_job("f1", 1, "error", _iso(NOW - 300)))
+    cur = {}
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == []
+    assert cur["cron"]["default:r1"] > 0  # cursor still advanced: no later re-emit
+    assert len(cur["cron_fails"]["default:r1"]) == 1
+
+
+def test_cron_failure_streak_at_threshold_is_filed(home):
+    _write_jobs(home, _cron_job("s3", 3, "error", _iso(NOW - 300)))
+    names = [s["symptom"].split("'")[1] for s in sg.collect_cron(home, {}, NOW, "hubhost")]
+    assert names == ["job s3"]
+
+
+def test_cron_threshold_follows_failure_nudge_threshold(home):
+    (home / "config.yaml").write_text("model: x\ncron:\n  failure_nudge_threshold: 2\n")
+    _write_jobs(home, _cron_job("s2", 2, "error", _iso(NOW - 300)))
+    assert len(sg.collect_cron(home, {}, NOW, "hubhost")) == 1
+
+
+def test_three_recovered_cron_failures_in_24h_are_filed(home):
+    cur = {}
+    for n, t in enumerate((NOW - 7200, NOW - 3600, NOW - 600)):
+        _write_jobs(home, _cron_job("flaky", 0, "ok", _iso(t)))
+        got = sg.collect_cron(home, cur, t + 300, "hubhost")
+        assert len(got) == (1 if n == 2 else 0), (n, got)
+    assert "3 failures in 24h" in got[0]["details"]
+
+
+def test_recovered_cron_failures_older_than_24h_do_not_accumulate(home):
+    cur = {}
+    for t in (NOW - 3 * 86400, NOW - 2 * 86400, NOW - 600):
+        _write_jobs(home, _cron_job("slow", 0, "ok", _iso(t)))
+        assert sg.collect_cron(home, cur, t + 300, "hubhost") == []
