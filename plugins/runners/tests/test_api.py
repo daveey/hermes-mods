@@ -372,3 +372,43 @@ def test_manifest_and_import_inert(monkeypatch):
     assert manifest['name'] == 'runners'
     assert manifest['api'] == 'plugin_api.py'
     assert manifest['tab']['hidden'] is True
+
+
+def test_fleet_route_reports_each_section_and_isolates_failures(disk_api, monkeypatch):
+    module, client, _, _, _, _ = disk_api
+    assert client.get(PREFIX + '/fleet').status_code == 401
+    module.FLEET_CACHE_S = 0
+    monkeypatch.setattr(module, '_gateway_section', lambda: dict(state='ready', machines=[dict(name='hub', slots=16, running=[])]))
+    body = client.get(PREFIX + '/fleet', headers=TOKEN).json()
+    assert body['contract_version'] == 1 and body['profile'] == 'example'
+    assert body['gateways']['machines'][0]['name'] == 'hub'
+    assert body['ci']['state'] in ('ready', 'stale') and body['ci']['machines'] == []
+    def down():
+        raise ImportError('no core')
+    monkeypatch.setattr(module, '_gateway_section', down)
+    body = client.get(PREFIX + '/fleet', headers=TOKEN).json()
+    assert body['gateways'] == {'state': 'unavailable', 'reason': 'ImportError', 'machines': []}
+    assert 'machines' in body['ci']
+
+
+def test_fleet_route_without_runner_config_still_serves_gateways(disk_api, monkeypatch):
+    module, client, path, _, _, _ = disk_api
+    path.unlink()
+    module.FLEET_CACHE_S = 0
+    monkeypatch.setattr(module, '_gateway_section', lambda: dict(state='ready', machines=[]))
+    body = client.get(PREFIX + '/fleet', headers=TOKEN).json()
+    assert body['ci'] == {'state': 'not_configured', 'machines': []}
+    assert body['gateways']['state'] == 'ready'
+
+
+def test_fleet_route_builds_once_per_cache_window(disk_api, monkeypatch):
+    module, client, _, _, _, _ = disk_api
+    calls = []
+    monkeypatch.setattr(module, '_gateway_section', lambda: calls.append(1) or dict(state='ready', machines=[]))
+    module._fleet_cache.update(at=None, value=None)
+    for _ in range(5):
+        assert client.get(PREFIX + '/fleet', headers=TOKEN).status_code == 200
+    assert len(calls) == 1
+    module._fleet_cache['at'] -= module.FLEET_CACHE_S + 1
+    client.get(PREFIX + '/fleet', headers=TOKEN)
+    assert len(calls) == 2

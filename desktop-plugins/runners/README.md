@@ -1,47 +1,47 @@
-# Runners Desktop — Observe
+# Runners Desktop — machines and slots
 
-Native SDK-only ESM status-bar contribution, order 6. Existing account-usage and core-update chrome is unchanged. Requires the Desktop SDK's `host.profileRoutes()`, connection-aware `ctx.rest`, React Query, Popover, ContextMenu and StatusDot. Missing routing fails visibly; there is no focused-gateway fallback.
+Status-bar chip (order 6) and panel. Two groups, one row per machine, one square per slot:
 
-## Behavior
+- **Gateway workers**: machines that run Kanban card runs, from the Board machine registry. Slots are the
+  registry's `max_card_runs` (this gateway falls back to its own `kanban.max_in_progress`; otherwise
+  "slots not set" and only the busy count). Busy slots are live Board leases from the gateway's sync-shadow
+  board replicas: hover shows card id, title, board and run time; click opens the card.
+- **CI workers**: GitHub Actions runners from the runners collector, grouped into machines by runner name
+  (`ec2-gwgen-2` → `ec2-gwgen`, `…-i-<instance>` → one ephemeral group). One runner = one slot. Deregistered
+  runners are history: only their count is shown. A failed readiness check is a ⚠ line, not a red slot.
 
-The enabled chip always renders. Counts are registrations, not machine counts or available slots. The narrow form retains full accessible counts and tooltip. The upward end-aligned panel is viewport-bounded (680px, 70vh). Physical nodes start collapsed, including hosts without registrations and newly discovered nodes. Expand a node for registrations, then select a registration for inline details; there is no reserved inspector. Unmapped registrations have a separate “Unassigned runners” disclosure. Nodes are identified within their owner, never merged by display name. Polling retains expansion and prunes removed identities.
+Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`),
+red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing
+running is grey with "not seen for N min". A section the gateway cannot read says Unknown/Stale with the reason.
 
-Node management reachability, health, provider activity and evidence freshness remain distinct. Reachable management is not verified node health; a failed management probe is not proof of outage. Missing activity or timestamps remain unknown. Capacity shows a limit only when explicitly enforced; unknown active-job counts remain unknown, and no free slots are inferred. Maintenance preserves reason/expiry and does not imply draining. Source diagnostics are collapsed below inventory; material owner failures remain visible.
+## Data and load
 
-All connected profiles are the default. Requests pin `connectionId` and explicit backend `?profile=`. Responses establish a stable gateway UUID/profile cache identity; changed owners and regressed epochs fail closed. A newer epoch for the same owner may refresh inventory, but captured actions retain their old fence. Removed or unavailable routes retain stale last observations. Different owners claiming the same provider registration create an explicit conflict and disable actions. Same-owner duplicates select reachable/newest evidence deterministically.
+`GET /api/plugins/runners/v1/fleet` (plugins/runners/dashboard/plugin_api.py, logic in plugins/runners/fleet.py).
+The server builds one result per 5 s per profile, single-flight, so any number of open panels cost one
+registry read (core caches it 60 s), indexed reads of each board replica (~30 ms on the hub) and one
+inventory projection. A registry older than 3 min marks gateway liveness unknown (Board not answering).
 
-Search covers names, host, scope, OS, architecture and labels. A native state selector offers All, Needs attention, Running (Busy), Idle, Held/maintenance, Failed, Unknown/stale and Checks passed + idle (Ready). Filtered counts and bars describe the shown cohort; the unfiltered registration total remains separate. The status chip's online/busy counts use the panel's current-evidence buckets: online is Running plus Idle, busy is Running, with current holds (including Running · draining) excluded from both. Stale, unknown and failed buckets are excluded; raw last-known provider activity is not current busy. Running · draining remains visible in the panel. Issue counts retain the owner API's canonical rule (stale, non-online or fail/warn-readiness registrations), while Needs attention follows display precedence, so an intentional hold with no independent failure or warning is not listed there. Readiness causes that contradict the owner's aggregate are ignored. Host warnings are counted once, not once per registration. Scope failures stay at source level. The basic v1 runner contract has no offline-confirmation count: the UI says “Offline observation”, never inventing a confirmed outage. Running without job evidence says “Running — job not identified”.
-
-The selected-B visual revision uses labeled registration bars: blue ▶ running, outlined ○ idle, amber hatched Ⅱ held/degraded, red × failed, gray patterned ? unknown. Every state has a count and text label. These bars are not CPU, host load, utilization, capacity or free-slot meters. Unassigned registrations receive their own full-width outlined cohort. Offline, stale, conflicting or unconfirmed-hold observations never count as idle; unknown checks do not become passing checks. Host maintenance without explicit per-registration evidence never claims a runner drain.
-
-Readiness causes come from the owner's optional `readiness_evidence` (required/passed/failed/warned/hold_explained_failures, its own observed/expiry times and freshness). The panel subtracts only failures the owner marks hold-explained **and** whose matching hold is current on the client clock (service only under a current systemd drain). A failure left over is an independent failure and stays red with the hold still shown; a failure fully explained by a current hold is amber Held, or Running · draining when the runner is busy. Missing, stale, expired, malformed or inconsistent cause evidence keeps the conservative aggregate failure ("individual check causes not reported"). Required keys that were neither passed, failed nor warned are listed as Not observed, and warnings stay visible independently of holds. Supervisor label withdrawals remain historical, not current holds.
-
-Inventory polling is 15s expanded / 60s collapsed, paused when the document is hidden. Opening requests one deduplicated asynchronous collection refresh. There are no per-row inventory requests; bounded details load only on expansion. Inventory fanout is limited to four requests concurrently. The collector remains gateway-owned and independent of the UI.
-
-Keyboard: the existing native palette offers “Show runners”, node/runner jumps and validated runner settings (aliases: configuration/preferences). Jumps clear filters, select the captured owner scope and focus the target; runner jumps lazily open detail. `/` or typing focuses search. Arrows traverse visible nodes and registrations; Right/Left expand/collapse a node; Enter toggles node expansion or inline detail. Shift+F10 opens the same native actions as right-click/overflow. Escape dismisses menu/help, then details, query, expanded node and popover, restoring focus. `?` opens the shortcut map. No second global palette or shortcut is added. Theme tokens, native focus rings and reduced-motion overrides are used.
-
-Refresh and validated GitHub settings links are supported. Diagnostic copy uses the SDK clipboard door and a bounded field allowlist (no raw logs/config). Repair menu placeholders are hidden behind the `repair_sessions` component feature flag (default false); even when exposed they are disabled. Maintenance controls are disabled and explicitly state that maintenance does not drain jobs. This UI does not create sessions, restart runners, dispatch jobs or modify maintenance.
-
-Node ages use host-resource provenance from actual probes, never inventory-envelope or collector-heartbeat timestamps. Missing evidence remains “Not observed”; expired or failed evidence is labeled stale/unavailable.
-
-Detail monitoring explicitly distinguishes not-configured, forbidden, unavailable, unknown and configured-but-unattributed activity. Provider `observed_jobs` appear separately from dispatched `jobs`, with observation ages and stale labels. Current-job links require a fresh busy registration, matching provider runner ID and repository/organization scope, valid observation times and numeric IDs, and an exact canonical GitHub URL; raw provider URLs are never opened blindly.
-
-Optional operational evidence displays intentional drain, maintenance, disk-pressure
-withholding and root-headroom waits separately from provider Offline observations.
-Current holds require fresh source and owner timestamps and never promote readiness.
-Details retain all source timestamps, unavailable/unknown “Not observed” states,
-last-known stale evidence and historical supervisor label withdrawals. Existing
-readiness failures and provider activity remain visible; no controls modify holds.
+The panel polls every 15 s while open, 60 s while closed, and not at all while the window is hidden. One poll
+runs at a time; each request times out after 5 s. The React Query cache keeps the last view during refetches,
+so an open panel updates in place. A failing gateway is retried after 15 s, 30 s, 60 s … capped at 5 min, and
+its last data stays on screen marked "Stale: last update … · <error>". Each section comes from the connected
+gateway with the best view of it (ready > stale > unknown).
 
 ## Tests
-
-From the repository root, Node >=22:
 
 ```sh
 npm ci --prefix desktop-plugins/runners/tests --ignore-scripts --no-audit --no-fund
 node --test desktop-plugins/runners/tests/*.test.mjs
+python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_api.py
 ```
 
-The harness uses real React, React Query and Radix Popover/ContextMenu with jsdom, isolated host atoms and fake REST. It never accesses live credentials or dispatches a job. Fixtures originate from `plugins/runners/contracts/fixtures.json`. Tests cover freshness/empty/error states, explicit routing and owner races, removed owners, duplicate registrations, host warnings, long names, 100 rows/no request amplification, menus, keyboard focus, hidden polling and palette registration. Tests cannot establish native screenshot fidelity or deployed backend availability; those require real Desktop integration evidence.
+- registry → slots, pinned only, slots not set, draining: `fleet.test.mjs` "registry", `test_fleet.py`
+  `test_registry_sets_slots_flags_and_drain`
+- live leases → busy slots with card titles, click opens card: "live leases", `test_live_leases_fill_slots_across_boards`
+- CI runners → machines, offline, warnings, hidden history: "CI runners", `test_ci_runners_grouped_into_machines_with_one_slot_each`
+- unreachable → backoff, stale last data, never red: "unreachable", `test_unreachable_registry_and_unseen_machines_are_unknown_not_failed`,
+  `test_stale_registry_keeps_slots_but_not_liveness`
+- REST route, section isolation, 5 s server cache: `test_api.py` `test_fleet_route_*`
+- open panel updates in place, one request per poll, no polling while hidden: "open panel updates in place"
 
-Normal installation: the repository installer or hermes-mods sync links this directory under the Desktop plugin discovery root. Disable/remove the Desktop contribution to roll back UI only; no runner services are affected.
+Not covered: native Desktop rendering (checked by hand after hermes-sync).

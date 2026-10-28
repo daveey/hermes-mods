@@ -156,6 +156,78 @@ def inventory():
     return invoke('inventory')
 
 
+def _fleet():
+    # Pure module with no package imports; load it by path like the backend.
+    with _lock:
+        name = 'hermes_runners_fleet'
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / 'fleet.py')
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            sys.modules[name] = module
+        return sys.modules[name]
+
+
+def _gateway_section():
+    import time
+    fleet = _fleet()
+    from hermes_cli import kanban_sync_client as ksc, kanban_worker_node as node
+    from hermes_cli.kanban_db_dispatch import configured_max_in_progress, resolve_max_in_progress
+    now_ms = int(time.time() * 1000)
+    leases = fleet.live_leases(ksc.shadow_path('x').parent, now_ms)
+    registry = node.registry()  # core caches it for REGISTRY_TTL_S; a failed read keeps the last value
+    read_at = node._REGISTRY.get('at')
+    age = time.monotonic() - read_at if registry is not None and read_at is not None else None
+    return fleet.gateway_workers(registry, leases, now_ms, registry_age_s=age,
+                                 local_cap=resolve_max_in_progress(configured_max_in_progress()))
+
+
+def _ci_section():
+    fleet = _fleet()
+    try:
+        backend = service()
+    except FileNotFoundError:
+        return dict(state='not_configured', machines=[])
+    if backend.config['owner_profile'] != active_profile():
+        return dict(state='unavailable', reason='owner_profile_mismatch', machines=[])
+    return fleet.ci_workers(backend.inventory())
+
+
+FLEET_CACHE_S = 5
+_fleet_cache = dict(at=None, profile=None, value=None)
+_fleet_lock = threading.Lock()
+
+
+@router.get('/fleet')
+def fleet_view():
+    """Machines and slots: gateway workers (Board registry + leases) and CI workers (collector).
+
+    One build per FLEET_CACHE_S per profile, single-flight: any number of open panels polling
+    costs one registry read, a few indexed SQLite reads and one inventory projection.
+    """
+    import time
+    profile = active_profile()
+    with _fleet_lock:
+        c = _fleet_cache
+        if c['value'] is not None and c['profile'] == profile and time.monotonic() - c['at'] < FLEET_CACHE_S:
+            return c['value']
+        value = _build_fleet(profile)
+        c.update(at=time.monotonic(), profile=profile, value=value)
+        return value
+
+
+def _build_fleet(profile):
+    sections = {}
+    for key, build in (('gateways', _gateway_section), ('ci', _ci_section)):
+        try:
+            sections[key] = build()
+        except (RuntimeError, OSError, sqlite3.Error, ImportError, ValueError, KeyError) as exc:
+            sections[key] = dict(state='unavailable', reason=type(exc).__name__, machines=[])
+    from datetime import datetime, timezone
+    return dict(contract_version=1, profile=profile,
+                generated_at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), **sections)
+
+
 @router.get('/runners/{runner_id}')
 def inspect(runner_id: str, request: Request, history_limit: int = 100):
     return invoke('inspect', runner_id, history_limit, principal=optional_principal(request))

@@ -73,7 +73,7 @@ def test_scope_error_persists_retry_eta_in_cached_api(tmp_path):
     ('offline', 'idle', 1001), ('unknown', 'unknown', 1001),
     ('online', 'idle', 1201),
 ])
-def test_api_ui_counts_match_actual_snapshot(tmp_path, registration, activity, now, source_failure):
+def test_api_counts_use_current_evidence_only(tmp_path, registration, activity, now, source_failure):
     import subprocess
     adapter = Adapter()
     row = dict(F['Runner'], registration=registration, activity=activity)
@@ -87,15 +87,12 @@ def test_api_ui_counts_match_actual_snapshot(tmp_path, registration, activity, n
             assert store.load_health(row['id']).source_error == 'forbidden'
             now = max(now, 1032)
     snapshot = Service(path, config(), clock=lambda: now).inventory()
-    root = Path(__file__).parents[3]
-    result = subprocess.run(['node', str(root / 'desktop-plugins/runners/tests/project-snapshot.mjs')],
-                            input=json.dumps(dict(snapshot=snapshot, now=now)),
-                            text=True, capture_output=True, check=True, timeout=15)
-    ui = json.loads(result.stdout)
+    # Stale inventory or a source failure keeps the row but never counts it as live.
     api = snapshot['data']['counts']
-    assert ui == dict(registrations=api['registrations'], online=api['online'],
-                     busy=api['busy'], ready=api['verified_ready'],
-                     unverified=api['readiness_unverified'], issues=api['issues'])
+    current = registration == 'online' and now == 1001 and not source_failure
+    assert api['registrations'] == 1
+    assert api['online'] == int(current)
+    assert api['busy'] == int(current and activity == 'busy')
 
 
 def test_hosts_once_concurrency_and_cache(tmp_path):

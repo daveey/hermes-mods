@@ -34,7 +34,7 @@ def test_required_checks_derive_readiness(tmp_path,disk,service,expected):
 
 
 @pytest.mark.parametrize('expires,ready', [(1100, 0), (1001, 1)])
-def test_maintenance_counts_match_desktop(tmp_path, expires, ready):
+def test_maintenance_counts(tmp_path, expires, ready):
     import json
     import subprocess
     from pathlib import Path
@@ -47,12 +47,8 @@ def test_maintenance_counts_match_desktop(tmp_path, expires, ready):
         Collector(store, cfg, adapter, clock=lambda: 1000, host_probe=probe).tick()
     snapshot = Service(path, cfg, clock=lambda: 1001).inventory()
     validate('InventoryResponse', snapshot)
-    result = subprocess.run(['node', str(Path(__file__).parents[3] / 'desktop-plugins/runners/tests/project-snapshot.mjs')],
-                            input=json.dumps(dict(snapshot=snapshot, now=1001)), text=True,
-                            capture_output=True, check=True, timeout=15)
-    ui = json.loads(result.stdout)
-    assert snapshot['data']['counts']['verified_ready'] == ui['ready'] == ready
-    assert snapshot['data']['counts']['readiness_unverified'] == ui['unverified'] == 1-ready
+    assert snapshot['data']['counts']['verified_ready'] == ready
+    assert snapshot['data']['counts']['readiness_unverified'] == 1-ready
 
 
 @pytest.mark.parametrize('copies', [1, 2])
@@ -74,12 +70,8 @@ def test_unreachable_host_counts_once_and_expires(tmp_path, copies, now):
         Collector(store, cfg, adapter, clock=lambda:1000, host_probe=probe).tick()
     snapshot = Service(path, cfg, clock=lambda:now).inventory()
     validate('InventoryResponse', snapshot)
-    result = subprocess.run(['node', str(Path(__file__).parents[3] / 'desktop-plugins/runners/tests/project-snapshot.mjs')],
-                            input=json.dumps(dict(snapshot=snapshot, now=now)), text=True,
-                            capture_output=True, check=True, timeout=15)
-    ui = json.loads(result.stdout)
     assert snapshot['data']['counts']['registrations'] == copies
-    assert snapshot['data']['counts']['issues'] == ui['issues'] == (1 if now == 1001 else copies)
+    assert snapshot['data']['counts']['issues'] == (1 if now == 1001 else copies)
 
 
 def test_host_failures_prevent_incident_recovery(tmp_path):

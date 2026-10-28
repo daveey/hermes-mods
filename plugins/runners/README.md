@@ -125,7 +125,8 @@ queued/completed runs cannot exhaust the budget before active work is inspected.
 Recent-only candidates use the bounded unfiltered history query; neither mode
 claims exhaustive job history or turns a missing attribution into runner failure.
 
-Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/enrollment`, GET
+Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/fleet` (machines and slots for the Desktop panel;
+see `desktop-plugins/runners/README.md`), GET `/enrollment`, GET
 `/inventory`, GET `/runners/{id}`, POST `/refresh`. Enrollment returns the explicit
 profile, enrollment flag and observe capabilities without opening the database or
 starting a collector. A profile with no runners configuration is not enrolled;
