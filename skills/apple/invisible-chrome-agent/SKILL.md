@@ -27,7 +27,7 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
 | `hermes-chrome-agent` | Stdlib-only Python supervisor + CLI (runs under `/usr/bin/python3`, ships its own minimal CDP websocket client). |
 | `window-evict.swift` | `hermes-window-evict X Y W H [--skip-pid N]...`: moves every layer-0 window of a non-Chrome app that sits on the virtual display (bounds X Y W H) to the main display's visible frame via Accessibility (match by frame, set position, shrink if larger), printing `evict <bundle> <title> from x,y to x,y`. `untrusted` (exit 0) when the calling process lacks Accessibility; `--check` prints `trusted`/`untrusted`. Skips `Hermes Touch ID.app`. |
 | `notifier.swift` | `Hermes Touch ID.app` (bundle `com.hermes.chrome-agent.notify`, LSUIElement, Developer-ID signed when the keychain has one), built by `install`: posts the passkey notification with UNUserNotificationCenter and reports clicks back to the supervisor over stdout. |
-| `test_hermes_chrome_agent.py` | Unit tests: click-through path, evict scheduling, focus guard, focus-filter rules and the proxy end to end against a fake Chrome (`/usr/bin/python3 -m unittest -v test_hermes_chrome_agent` in `scripts/`). |
+| `test_hermes_chrome_agent.py` | Unit tests: click-through path, evict scheduling, focus guard, focus-filter rules and the proxy end to end against a fake Chrome (`python -m pytest -q .` in `scripts/`; Mac-only cases skip themselves. CI runs that suite). |
 
 `hermes-chrome-agent run` (what launchd runs):
 - starts `hermes-vdisplay`, then Chrome with `--user-data-dir=$HERMES_HOME/chrome-agent --remote-debugging-port=9334

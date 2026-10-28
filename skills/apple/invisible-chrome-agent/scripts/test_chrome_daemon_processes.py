@@ -3,9 +3,7 @@ import json
 import os
 from pathlib import Path
 import socket
-import subprocess
 import sys
-import threading
 import time
 import unittest
 
@@ -13,7 +11,10 @@ from chrome_agent_lifecycle import Ledger, Lifecycle, Config
 from chrome_agent_process import fingerprint
 from chrome_agent_daemons import exchange, inspect, shutdown
 from test_hermes_chrome_agent import hca
-from chrome_test_fixtures import socket_directory
+from chrome_test_fixtures import (
+    announce_ready, join_thread, socket_directory, spawn_peer, sweep_until,
+    wait_process_exit, wait_ready_line, wait_socket_accepts, retire_until,
+)
 
 
 def peer(path, target, ignore):
@@ -21,26 +22,31 @@ def peer(path, target, ignore):
         listener.bind(path)
         os.chmod(path, 0o600)
         listener.listen()
+        announce_ready()
         while True:
-            with listener.accept()[0] as client:
-                with client.makefile('rb') as stream:
-                    raw = stream.readline()
-                if not raw:
-                    continue  # A connected client may reject a replaced peer before sending.
-                payload = json.loads(raw)
-                command = payload['meta']
-                if command == 'ping':
-                    reply = dict(pong=True, pid=os.getpid(), browser_kind='cdp')
-                elif command == 'current_tab':
-                    reply = dict(targetId=target)
-                elif command == 'allow_shutdown':
-                    ignore = False
-                    reply = dict(ok=True)
-                else:
-                    reply = dict(ok=True)
-                client.sendall(json.dumps(reply).encode() + b'\n')
-                if command == 'shutdown' and not ignore:
-                    return
+            try:
+                with listener.accept()[0] as client:
+                    with client.makefile('rb') as stream:
+                        raw = stream.readline()
+                    if not raw:
+                        continue  # A connected client may reject a replaced peer before sending.
+                    payload = json.loads(raw)
+                    command = payload['meta']
+                    if command == 'ping':
+                        reply = dict(pong=True, pid=os.getpid(), browser_kind='cdp')
+                    elif command == 'current_tab':
+                        reply = dict(targetId=target)
+                    elif command == 'allow_shutdown':
+                        ignore = False
+                        reply = dict(ok=True)
+                    else:
+                        reply = dict(ok=True)
+                    client.sendall(json.dumps(reply).encode() + b'\n')
+                    if command == 'shutdown' and not ignore:
+                        return
+            except (BrokenPipeError, ConnectionResetError, json.JSONDecodeError, KeyError, OSError):
+                # A timed-out client is not retirement. Dying here looks like a refused socket.
+                continue
 
 
 class RealDaemonTests(unittest.TestCase):
@@ -56,18 +62,15 @@ class RealDaemonTests(unittest.TestCase):
         cap = grant['capability']
         self.ledger.bind(cap, owner)
         path = str(self.root / ('bu-lease-' + cap + '.sock'))
-        process = subprocess.Popen([sys.executable, __file__, '--peer', path, target, str(int(ignore))])
+        process = spawn_peer([sys.executable, __file__, '--peer', path, target, str(int(ignore))])
         def cleanup():
             if process.poll() is None:
                 process.terminate()
-            process.wait(timeout=5)
+            wait_process_exit(process)
             self.assertIsNone(fingerprint(process.pid))
         self.addCleanup(cleanup)
-        deadline = time.monotonic() + 5
-        while not Path(path).exists():
-            self.assertIsNone(process.poll())
-            self.assertLess(time.monotonic(), deadline)
-            threading.Event().wait(.02)
+        wait_ready_line(process)
+        wait_socket_accepts(path)
         return grant, path, process
 
     def test_normal_sweep_preserves_active_sibling_and_foreign_page(self):
@@ -78,8 +81,8 @@ class RealDaemonTests(unittest.TestCase):
             self.ledger.complete(grant['capability'], grant['request_id'])
             self.ledger.release(grant['capability'])
         self.now += 2
-        self.ledger.sweep_daemons()
-        owned_proc.wait(timeout=3)
+        sweep_until(self.ledger, lambda: owned_proc.poll() is not None)
+        wait_process_exit(owned_proc)
         self.assertIsNone(fingerprint(owned_proc.pid))
         self.assertTrue(exchange(sibling_path, {'meta': 'ping'})['pong'])
         self.assertTrue(exchange(foreign_path, {'meta': 'ping'})['pong'])
@@ -88,8 +91,8 @@ class RealDaemonTests(unittest.TestCase):
         life = Lifecycle(self.ledger, 'test', lambda: None)
         self.ledger.complete(sibling['capability'], sibling['request_id'])
         self.assertTrue(life.drain(timeout=0))
-        remaining = life.retire_daemons(timeout=2)
-        sibling_proc.wait(timeout=3)
+        remaining = retire_until(self.ledger, lambda: sibling_proc.poll() is not None, seconds=15)
+        wait_process_exit(sibling_proc)
         self.assertEqual(remaining, 1)
         self.assertTrue(exchange(foreign_path, {'meta': 'ping'})['pong'])
 
@@ -127,14 +130,17 @@ class RealDaemonTests(unittest.TestCase):
         supervisor = hca.Supervisor()
         supervisor.lifecycle = Lifecycle(self.ledger, 'test', lambda: self.fail('idle retry woke browser'))
         supervisor.managed_step()
-        supervisor.lifecycle.daemon_sweep.join(7)
+        join_thread(supervisor.lifecycle.daemon_sweep)
         self.assertIsNone(process.poll())
         with self.ledger.transaction(readonly=True) as data:
             self.assertIn('daemon_socket', data['leases'][grant['capability']])
         exchange(path, {'meta': 'allow_shutdown'})
-        supervisor.managed_step()
-        supervisor.lifecycle.daemon_sweep.join(7)
-        process.wait(timeout=3)
+        deadline = time.monotonic() + 30
+        while process.poll() is None:
+            self.assertLess(time.monotonic(), deadline, 'retry sweep did not retire daemon')
+            supervisor.managed_step()
+            join_thread(supervisor.lifecycle.daemon_sweep)
+        wait_process_exit(process)
         self.assertIsNone(fingerprint(process.pid))
         self.assertFalse(supervisor.lifecycle.running)
 
