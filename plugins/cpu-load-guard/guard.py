@@ -91,7 +91,7 @@ _CMD_ENV_SPLIT = (
     r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*"
     r"|sudo(?:\s+-[ugCDhpRrt]\s+[^\s/.~-]\S*|\s+-[-\w=]+)*)\s+)*"
     r"env(?:\s+(?:-u|--unset)\s+[^\s/.~-]\S*|\s+-C(?:\s+)?\S+|\s+--chdir(?:=\S+|\s+\S+)|\s+-[-\w=]+)*"
-    r"\s+(?:-S|--split-string=)"
+    r"\s+(?:-[0iv]*S|--split-string=)"
 )
 CMD_POS_RE = re.compile(
     _CMD_ENV_SPLIT

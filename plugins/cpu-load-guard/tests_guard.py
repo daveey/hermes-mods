@@ -605,6 +605,9 @@ def test_write_file_of_py_reading_data_file_allows(tmp_path):
     "env -S {p}",
     "env --split-string {p}",
     "env -i -S{p}",
+    "env -iS{p}",
+    "env -vS{p}",
+    "env -0iS{p}",
     "env -u FOO -S{p}",
     "env -C /tmp -S{p}",
     "env --chdir /tmp -S{p}",
@@ -631,6 +634,8 @@ def test_sudo_env_wrapped_argv0_blocks(tmp_path, fmt):
     # name, not a split.
     "env - cat {t}",
     "env -S={t}",
+    "env -iS={t}",
+    "env -i cat {t}",
     "env FOO=1 -S{t}",
 ])
 def test_sudo_env_wrapped_reader_allows(tmp_path, fmt):
