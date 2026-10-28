@@ -1,0 +1,521 @@
+From 9c943cbd2f1c3cb1717f36d1ac9eb81fd0e8f880 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:13:20 -0700
+Subject: [PATCH] fix(kanban): bind a pinned model's provider at pin time,
+ refuse when ambiguous [daveey]
+
+A concrete model pinned with no provider late-bound its provider to the
+profile's config.yaml at every spawn. When that config briefly read
+class:deep / provider auto, the auto ladder sent claude-opus-5-5 to
+OpenRouter (HTTP 400, exit 78) on a card whose earlier runs had worked.
+
+hermes_cli/kanban_pin_provider.resolve_pin_provider is now the one
+resolver for create_task and set_model_override (so kanban_create, hermes
+kanban create --model, set-model and the dashboard): the profile's
+model.provider when it serves the id, else the single authenticated
+provider whose catalog lists it (vendor first-party as fallback). None or
+several -> pin_provider_unresolved naming the providers to pass. Class
+selectors are unchanged. The dispatcher binds legacy NULL-provider rows
+with the same resolver and records it on the model_tier event.
+---
+ hermes_cli/kanban.py                         |   3 +
+ hermes_cli/kanban_db.py                      |   8 +
+ hermes_cli/kanban_model_tier.py              |  11 ++
+ hermes_cli/kanban_pin_provider.py            | 171 +++++++++++++++++
+ tests/hermes_cli/test_kanban_model_tier.py   |   3 +
+ tests/hermes_cli/test_kanban_pin_provider.py | 184 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_strong_tier.py  |   3 +-
+ tools/kanban_tools.py                        |   4 +-
+ 8 files changed, 385 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_pin_provider.py
+ create mode 100644 tests/hermes_cli/test_kanban_pin_provider.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e34ae9734b..2f9e4dd15c 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -428,6 +428,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             (idem_key,)).fetchone() is not None
+         from hermes_cli.kanban_db_workspace import WorktreeWorkspaceConfigError
+         from hermes_cli.kanban_capabilities import CapabilityMismatchError
++        from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError
+         try:
+             task_id = kb.create_task(
+                 conn, title=args.title, body=body,
+@@ -456,6 +457,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             return _err(f"kanban: --workspace: {exc}", 2)
+         except CapabilityMismatchError as exc:
+             return _err(f"kanban: {exc.code}: {exc}", 2)
++        except PinProviderUnresolvedError as exc:
++            return _err(f"kanban: {exc}", 2)
+         if session_key and not idem_hit:
+             # Same completion subscription the kanban_create tool adds, so the chat
+             # that shelled out hears when the card lands (and its row stays busy).
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 2554368b18..53e6953547 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1317,6 +1317,9 @@ def create_task(
+                                    workspace_path=workspace_path)
+     from hermes_cli.kanban_model_assignment import validate_model_assignment
+     validate_model_assignment(assignee, model_override, provider_override)
++    # [daveey] Bind a provider-less concrete pin now (or refuse), never late-bind it to config at spawn.
++    from hermes_cli.kanban_pin_provider import resolve_pin_provider
++    model_override, provider_override = resolve_pin_provider(model_override, provider_override, assignee=assignee)
+ 
+     # Retry once on the extremely unlikely id collision.
+     for attempt in range(2):
+@@ -1543,6 +1546,11 @@ def set_model_override(
+     Allowed while ``running``: it applies on the NEXT dispatch, which is the
+     rate-limit-recovery flow (set, then reclaim/retry)."""
+     model, provider = _validate_model_override(model, provider)
++    if model and not provider:
++        # [daveey] Same pin-time binding as create_task: resolve against the card's assignee, or refuse.
++        from hermes_cli.kanban_pin_provider import resolve_pin_provider
++        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        model, provider = resolve_pin_provider(model, None, assignee=row[0] if row else None)
+     return _set_task_override(
+         conn, task_id,
+         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index e1b698dacf..342a38894d 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -200,6 +200,17 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+     except Exception as exc:
+         logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc)
+         return "error"
++    if reason == "pinned" and not _str(getattr(task, "provider_override", None)):
++        # A row pinned before pin-time binding (concrete model, NULL provider) used to take its provider from
++        # the profile's config.yaml at spawn; bind it with the same resolver the create paths use. [daveey]
++        from hermes_cli.kanban_pin_provider import resolve_legacy_pin
++        bound, unresolved = resolve_legacy_pin(task)
++        if bound:
++            task.provider_override = bound
++            reason = "pinned+provider_resolved"
++        elif unresolved:
++            logger.warning("kanban model tier: %s pin has no provider (%s)", getattr(task, "id", "?"), unresolved)
++            reason = "pinned+provider_unresolved"
+     if reason not in ("off", "profile_out_of_scope"):
+         try:
+             from hermes_cli import kanban_provider_walls as _walls
+diff --git a/hermes_cli/kanban_pin_provider.py b/hermes_cli/kanban_pin_provider.py
+new file mode 100644
+index 0000000000..5871ed4194
+--- /dev/null
++++ b/hermes_cli/kanban_pin_provider.py
+@@ -0,0 +1,171 @@
++"""Bind a pinned Kanban model to a provider at pin time [daveey].
++
++A card that pins a concrete model (``claude-opus-5-5``) with no provider used to late-bind the provider at
++spawn: the dispatcher passed only ``-m <model>`` and the worker paired it with whatever ``model.provider``
++the profile's config.yaml said at that moment. When that config flipped to ``provider: auto`` (with a
++``class:deep`` default) for ~50 minutes, the auto ladder ended at OpenRouter, which rejected the bare
++Anthropic id (HTTP 400), and the worker crashed with exit 78 — the same card had run fine on anthropic
++twice before.
++
++:func:`resolve_pin_provider` is the one resolver every pin path uses (``kanban_create``,
++``hermes kanban create --model``, ``set-model``, the dashboard — all via ``kanban_db``), and the dispatcher
++uses it for legacy rows. A concrete model without a provider gets, deterministically:
++
++1. the assignee profile's configured ``model.provider`` when that provider serves the id (its static or
++   cached live catalog lists it exactly, or it is the model vendor's own first-party provider) and holds
++   credentials; a ``custom``/``custom:*`` profile provider is taken only for ids no known catalog/vendor
++   claims (a private endpoint's own model name);
++2. otherwise the single authenticated provider whose static catalog lists that exact id;
++3. otherwise (no catalog lists it) the single authenticated first-party provider of the model's vendor.
++
++No candidate, or more than one, raises :class:`PinProviderUnresolvedError` naming the providers to pass.
++Class selectors (``class:deep``) are untouched: they keep provider auto by design.
++"""
++
++from __future__ import annotations
++
++import logging
++from contextlib import ExitStack
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++_NO_PREFERENCE = frozenset({"", "auto"})
++
++
++class PinProviderUnresolvedError(ValueError):
++    code = "pin_provider_unresolved"
++
++    def __init__(self, model: str, detail: str, providers: list[str]):
++        self.model, self.providers = model, list(providers)
++        hint = (f"pass provider= one of: {', '.join(self.providers)}" if self.providers
++                else "pass provider=<provider that serves it>")
++        super().__init__(
++            f"{self.code}: model {model!r} was pinned without a provider and {detail}; {hint} "
++            "(kanban_create provider=..., `hermes kanban create --provider ...`, `set-model ... --provider ...`)")
++
++
++def _canon(provider: Optional[str]) -> str:
++    pid = (provider or "").strip().lower()
++    if not pid or pid.startswith("custom:") or pid in _NO_PREFERENCE:
++        return pid
++    try:
++        from hermes_cli.models import normalize_provider
++        return normalize_provider(pid) or pid
++    except Exception:
++        return pid
++
++
++def _profile_scope(assignee: Optional[str], stack: ExitStack) -> Optional[Path]:
++    """Enter the assignee profile's HERMES_HOME + secret scope (the worker's view); None = current home."""
++    if not assignee:
++        return None
++    try:
++        from hermes_cli.profiles import resolve_profile_env
++        home = Path(resolve_profile_env(assignee))
++    except Exception:
++        return None  # non-profile lane: resolve against the current home
++    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
++    stack.callback(reset_secret_scope, set_secret_scope(build_profile_secret_scope(home)))
++    return home
++
++
++def _configured_provider(home: Optional[Path]) -> str:
++    try:
++        from hermes_cli.config_effective import load_user_config_effective
++        config = load_user_config_effective(home / "config.yaml") if home else load_user_config_effective()
++    except Exception as exc:
++        logger.debug("kanban pin provider: config unreadable (%s)", exc)
++        return ""
++    block = (config or {}).get("model")
++    return _canon(block.get("provider")) if isinstance(block, dict) else ""
++
++
++def _static_candidates(model: str) -> list[str]:
++    from hermes_cli.models import _static_catalog_matches
++    out: list[str] = []
++    for pid, name in _static_catalog_matches(model, ""):
++        pid = _canon(pid)
++        if name.lower() == model.lower() and pid not in out:
++            out.append(pid)
++    return out
++
++
++def _vendor_candidates(model: str) -> list[str]:
++    from hermes_cli.models import _PROVIDER_MODELS
++    from hermes_cli.models_detect import current_provider_owns_vendor
++    out: list[str] = []
++    for pid in _PROVIDER_MODELS:
++        canon = _canon(pid)
++        if canon not in out and current_provider_owns_vendor(model, pid):
++            out.append(canon)
++    return out
++
++
++def _serves(provider: str, model: str) -> bool:
++    from hermes_cli.models import _model_in_provider_catalog, _provider_keys
++    from hermes_cli.models_detect import current_provider_catalog_match, current_provider_owns_vendor
++    if _model_in_provider_catalog(model.lower(), _provider_keys(provider)):
++        return True
++    if current_provider_owns_vendor(model, provider):
++        return True
++    try:
++        return current_provider_catalog_match(model, provider) == model
++    except Exception:
++        return False
++
++
++def resolve_pin_provider(
++    model: Optional[str], provider: Optional[str], *, assignee: Optional[str] = None,
++    has_credentials: Optional[Callable[[str], bool]] = None,
++) -> tuple[Optional[str], Optional[str]]:
++    """``(model, provider)`` with the provider bound for a concrete provider-less pin; see module doc.
++    Raises :class:`PinProviderUnresolvedError` when no single authenticated provider qualifies."""
++    model = (model or "").strip() or None
++    provider = (provider or "").strip() or None
++    if not model or provider:
++        return model, provider
++    from agent.model_routing import is_class_selector
++    if is_class_selector(model):
++        return model, provider
++    if has_credentials is None:
++        from hermes_cli.models_detect import provider_has_credentials as has_credentials
++    with ExitStack() as stack:
++        home = _profile_scope(assignee, stack)
++        preferred = _configured_provider(home)
++        static = _static_candidates(model)
++        vendor = [] if static else _vendor_candidates(model)
++        known = static or vendor
++        if preferred.startswith("custom") and not known and has_credentials(preferred):
++            return model, preferred  # a private endpoint's own model name: the profile's endpoint serves it
++        if (preferred and preferred not in _NO_PREFERENCE and not preferred.startswith("custom")
++                and (preferred in known or (not known and _serves(preferred, model)))
++                and has_credentials(preferred)):
++            return model, preferred
++        authed = [p for p in known if has_credentials(p)]
++    if len(authed) == 1:
++        return model, authed[0]
++    if len(authed) > 1:
++        raise PinProviderUnresolvedError(model, f"several authenticated providers serve it ({', '.join(authed)})",
++                                         authed)
++    if known:
++        raise PinProviderUnresolvedError(
++            model, f"no provider that serves it has credentials here ({', '.join(known)} known)", known)
++    raise PinProviderUnresolvedError(model, "no known provider catalog lists that id", [])
++
++
++def resolve_legacy_pin(task: Any) -> tuple[Optional[str], Optional[str]]:
++    """Dispatcher path for rows pinned before the pin-time resolver: ``(provider, error)``. Never raises."""
++    model = (getattr(task, "model_override", None) or "").strip()
++    if not model or (getattr(task, "provider_override", None) or "").strip() or model.startswith("class:"):
++        return None, None
++    try:
++        return resolve_pin_provider(model, None, assignee=getattr(task, "assignee", None))[1], None
++    except PinProviderUnresolvedError as exc:
++        return None, str(exc)
++    except Exception as exc:  # never break dispatch over provider lookup
++        logger.debug("kanban pin provider: legacy resolve failed for %s (%s)", getattr(task, "id", "?"), exc)
++        return None, f"error: {exc}"
+diff --git a/tests/hermes_cli/test_kanban_model_tier.py b/tests/hermes_cli/test_kanban_model_tier.py
+index eaa52add27..7b7d80be10 100644
+--- a/tests/hermes_cli/test_kanban_model_tier.py
++++ b/tests/hermes_cli/test_kanban_model_tier.py
+@@ -81,6 +81,8 @@ def test_dispatcher_default_off_is_upstream_behaviour(board):
+ 
+ def test_kanban_create_tool_pin_survives_default_and_unpinned_gets_default(board, monkeypatch):
+     _write_cfg(board, default_model=SONNET)
++    from hermes_cli import models_detect
++    monkeypatch.setattr(models_detect, "provider_has_credentials", lambda pid: pid == "anthropic")
+     from tools import kanban_tools as kt
+     pinned = json.loads(kt._handle_create({"title": "adversarial review", "assignee": "default", "model": OPUS}))
+     plain = json.loads(kt._handle_create({"title": "routine docs", "assignee": "default"}))
+@@ -91,6 +93,7 @@ def test_kanban_create_tool_pin_survives_default_and_unpinned_gets_default(board
+     assert seen[pinned["task_id"]][0] == OPUS
+     assert seen[plain["task_id"]][0] == SONNET
+     assert pinned_events[0]["reason"] == "pinned" and pinned_events[0]["model"] == OPUS
++    assert pinned_events[0]["provider"] == "anthropic"  # bound at pin time, not late-bound to config
+ 
+ 
+ def test_review_lane_keeps_profile_model(board):
+diff --git a/tests/hermes_cli/test_kanban_pin_provider.py b/tests/hermes_cli/test_kanban_pin_provider.py
+new file mode 100644
+index 0000000000..98b469192e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pin_provider.py
+@@ -0,0 +1,184 @@
++"""A pinned concrete model is bound to a provider at pin time, never late-bound to config.yaml [daveey].
++
++Regression for run 5406 of t_01a1800921b1ff50: ``model_override=claude-opus-5-5`` with ``provider_override``
++NULL ran on anthropic twice, then crashed (exit 78, OpenRouter HTTP 400) while the profile config briefly said
++``model.default: class:deep`` / ``provider: auto``. Entry paths covered: ``kb.create_task``, the
++``kanban_create`` tool, ``hermes kanban create --model``, ``hermes kanban set-model``, and the dispatcher's
++legacy-row path (``apply_model_tier`` + worker argv).
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import models_detect
++from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError, resolve_pin_provider
++
++OPUS = "claude-opus-5-5"
++AUTO_DEEP = "model:\n  default: class:deep\n  provider: auto\n"
++AUTO_ONLY = "model:\n  default: claude-opus-5-5\n  provider: auto\n"
++
++
++def _home(tmp_path, monkeypatch, config: str, creds=("anthropic",)):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    (home / "config.yaml").write_text(config)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "HERMES_SESSION_KEY", "HERMES_INFERENCE_PROVIDER"):
++        monkeypatch.delenv(var, raising=False)
++    authed = set(creds)
++    monkeypatch.setattr(models_detect, "provider_has_credentials", lambda pid: pid in authed)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++@pytest.fixture(params=[AUTO_DEEP, AUTO_ONLY], ids=["class-deep-auto", "auto"])
++def auto_home(tmp_path, monkeypatch, request):
++    return _home(tmp_path, monkeypatch, request.param)
++
++
++def _argv(monkeypatch, tmp_path, task):
++    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
++    captured = {}
++
++    class FakeProc:
++        pid = 4245
++
++    monkeypatch.setattr(subprocess, "Popen", lambda cmd, *a, **k: captured.setdefault("cmd", list(cmd)) and FakeProc())
++    ws = tmp_path / "ws"
++    ws.mkdir(exist_ok=True)
++    kbd._default_spawn(task, str(ws))
++    cmd = captured["cmd"]
++    i = cmd.index("-m")
++    return cmd[i + 1], (cmd[cmd.index("--provider") + 1] if "--provider" in cmd else None)
++
++
++def _parser():
++    from hermes_cli import kanban as cli
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    return cli, parser
++
++
++# --- create paths -----------------------------------------------------------------------------------------
++
++def test_create_task_binds_anthropic_under_auto_config(auto_home, monkeypatch, tmp_path):
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title="t", assignee="default", model_override=OPUS))
++    assert (task.model_override, task.provider_override) == (OPUS, "anthropic")
++    assert _argv(monkeypatch, tmp_path, task) == (OPUS, "anthropic")
++
++
++def test_kanban_create_tool_binds_anthropic(auto_home):
++    from tools import kanban_tools as tools
++    out = json.loads(tools._handle_create({"title": "t", "assignee": "default", "model": OPUS}))
++    assert out.get("task_id"), out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, out["task_id"]).provider_override == "anthropic"
++
++
++def test_cli_create_and_set_model_bind_anthropic(auto_home, monkeypatch):
++    cli, parser = _parser()
++    monkeypatch.setattr(cli, "_check_dispatcher_presence", lambda: (True, ""))
++    assert cli._cmd_create(parser.parse_args(["kanban", "create", "via cli", "--assignee", "default",
++                                              "--model", OPUS])) == 0
++    with kbc.connect_closing() as conn:
++        tid = conn.execute("SELECT id FROM tasks WHERE title='via cli'").fetchone()[0]
++        assert kb.get_task(conn, tid).provider_override == "anthropic"
++        plain = kb.create_task(conn, title="plain", assignee="default")
++    assert cli._cmd_set_model(parser.parse_args(["kanban", "set-model", plain, OPUS])) == 0
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, plain)
++    assert (task.model_override, task.provider_override) == (OPUS, "anthropic")
++
++
++# --- refusals ---------------------------------------------------------------------------------------------
++
++def test_unknown_model_is_refused_everywhere(auto_home, monkeypatch, capsys):
++    with kbc.connect_closing() as conn:
++        with pytest.raises(PinProviderUnresolvedError, match="no known provider catalog") as exc:
++            kb.create_task(conn, title="t", assignee="default", model_override="no-such-model-zz9")
++        assert "provider=" in str(exc.value)
++        tid = kb.create_task(conn, title="keep", assignee="default")
++        with pytest.raises(PinProviderUnresolvedError):
++            kb.set_model_override(conn, tid, "no-such-model-zz9")
++        assert kb.get_task(conn, tid).model_override is None
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
++    from tools import kanban_tools as tools
++    out = json.loads(tools._handle_create({"title": "t", "assignee": "default", "model": "no-such-model-zz9"}))
++    assert out["code"] == "pin_provider_unresolved", out
++    cli, parser = _parser()
++    monkeypatch.setattr(cli, "_check_dispatcher_presence", lambda: (True, ""))
++    assert cli._cmd_create(parser.parse_args(["kanban", "create", "x", "--model", "no-such-model-zz9"])) == 2
++    assert "pin_provider_unresolved" in capsys.readouterr().err
++
++
++def test_ambiguous_model_is_refused_naming_the_providers(tmp_path, monkeypatch):
++    _home(tmp_path, monkeypatch, AUTO_DEEP, creds=("openai-api", "openai-codex"))
++    with pytest.raises(PinProviderUnresolvedError) as exc:
++        resolve_pin_provider("gpt-5.5", None, assignee="default")
++    assert set(exc.value.providers) == {"openai-api", "openai-codex"}
++    assert "openai-api" in str(exc.value) and "openai-codex" in str(exc.value)
++
++
++def test_configured_provider_breaks_the_tie(tmp_path, monkeypatch):
++    _home(tmp_path, monkeypatch, "model:\n  default: gpt-5.5\n  provider: openai-codex\n",
++          creds=("openai-api", "openai-codex"))
++    assert resolve_pin_provider("gpt-5.5", None, assignee="default") == ("gpt-5.5", "openai-codex")
++
++
++def test_custom_profile_provider_serves_its_private_model(tmp_path, monkeypatch):
++    _home(tmp_path, monkeypatch, "model:\n  default: my-local-llm\n  provider: custom:lab\n", creds=("custom:lab",))
++    assert resolve_pin_provider("my-local-llm", None, assignee="default") == ("my-local-llm", "custom:lab")
++
++
++def test_profile_provider_live_catalog_serves_an_uncatalogued_id(tmp_path, monkeypatch):
++    _home(tmp_path, monkeypatch, "model:\n  default: x\n  provider: nous\n", creds=("nous",))
++    monkeypatch.setattr(models_detect, "current_provider_catalog_match",
++                        lambda name, prov: name if prov == "nous" and name == "portal-only-zz1" else None)
++    assert resolve_pin_provider("portal-only-zz1", None, assignee="default") == ("portal-only-zz1", "nous")
++
++
++def test_no_credentials_refuses_and_names_the_serving_provider(tmp_path, monkeypatch):
++    _home(tmp_path, monkeypatch, AUTO_DEEP, creds=())
++    with pytest.raises(PinProviderUnresolvedError) as exc:
++        resolve_pin_provider(OPUS, None, assignee="default")
++    assert exc.value.providers == ["anthropic"]
++
++
++def test_explicit_provider_is_kept(auto_home):
++    assert resolve_pin_provider(OPUS, "openrouter") == (OPUS, "openrouter")
++
++
++# --- class selectors unchanged ----------------------------------------------------------------------------
++
++def test_class_selector_keeps_provider_auto(auto_home, monkeypatch, tmp_path):
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title="t", assignee="default", model_override="class:deep"))
++    assert (task.model_override, task.provider_override) == ("class:deep", None)
++    assert _argv(monkeypatch, tmp_path, task) == ("class:deep", "auto")
++
++
++# --- dispatcher: legacy rows ------------------------------------------------------------------------------
++
++def test_dispatcher_binds_legacy_null_provider_row(auto_home, monkeypatch, tmp_path):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="legacy", assignee="default")
++        conn.execute("UPDATE tasks SET model_override=?, provider_override=NULL WHERE id=?", (OPUS, tid))
++        conn.commit()
++        task = kb.claim_task(conn, tid)
++        assert tier.apply_model_tier(conn, task, lane="ready", cfg={}) == "pinned+provider_resolved"
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='model_tier'",
++                          (tid,)).fetchone()
++    assert json.loads(ev[0])["provider"] == "anthropic"
++    assert _argv(monkeypatch, tmp_path, task) == (OPUS, "anthropic")
+diff --git a/tests/hermes_cli/test_kanban_strong_tier.py b/tests/hermes_cli/test_kanban_strong_tier.py
+index 711233f371..a575196372 100644
+--- a/tests/hermes_cli/test_kanban_strong_tier.py
++++ b/tests/hermes_cli/test_kanban_strong_tier.py
+@@ -84,7 +84,8 @@ def test_strong_model_unset_keeps_old_behaviour(board):
+ def test_pins_and_out_of_scope_profiles_ignore_strong_model(board):
+     cfg = _cfg(strong_model=OPUS, default_model_profiles=["default"])
+     with kbc.connect() as conn:
+-        pinned = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default", model_override=SONNET))
++        pinned = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default", model_override=SONNET,
++                                                      provider_override="anthropic"))
+         other = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="bb-dev"))
+         assert tier.resolve_model_tier(conn, pinned, lane="review", cfg=cfg) == (None, None, "pinned")
+         assert tier.resolve_model_tier(conn, other, lane="review", cfg=cfg) == (None, None, "profile_out_of_scope")
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index f90dcb7df4..ec4e3b0022 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -225,7 +225,9 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                 from hermes_cli.kanban_assignment_routing import AssignmentRoutingError
+                 from hermes_cli.kanban_model_assignment import ModelProviderMismatchError
+                 from hermes_cli.kanban_awaiting import AwaitingError
+-                if isinstance(e, (AssignmentRoutingError, ModelProviderMismatchError, AwaitingError)):
++                from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError
++                if isinstance(e, (AssignmentRoutingError, ModelProviderMismatchError, AwaitingError,
++                                  PinProviderUnresolvedError)):
+                     return tool_error(str(e), code=e.code)
+                 if isinstance(e, CapabilityMismatchError):
+                     return tool_error(str(e), code=e.code, assignee=e.assignee, missing=e.missing)
+-- 
+2.55.0
+

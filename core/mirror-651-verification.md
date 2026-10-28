@@ -48,6 +48,10 @@ The four git-consumer failures are the unsupported-target/acquisition × checkpo
 
 Desktop: installed lockfile dependencies with `npm ci --ignore-scripts --no-audit --no-fund` in the disposable worktree, then ran `npx vitest run src/store/session-watchdog.test.ts`: **25 passed**. No live Electron multi-window probe, Windows recovery probe or full repository test run is claimed.
 
+## Late contiguous addendum: 0652–0653
+
+The final source refresh added `a934e39df2` (0652, safe recovery pid probe and wrapper test paths) and `9c943cbd2f` (0653, concrete pin-provider binding). Both public patches applied with `git am -3` in a new detached worktree at `90a63800fb`. Canonical runner results: recovery **28 passed** again, pin-provider **19 passed**, and targeted backup/doctor wrapper cases **2 passed**. That worktree was removed too. This extends the published inventory to **653 contiguous patches**, representing all **23** fork commits after `7f117fa465` through `9c943cbd2f`. The original 657-commit regeneration was followed by this two-commit append.
+
 ## Recovery reporting precision
 
 The recovery implementation writes a JSON report file and emits markdown-style summary/card content. It does not create a separate `.md` file alongside every JSON report. The feature doc reflects that distinction rather than implying an artifact the implementation does not write.

@@ -17,6 +17,7 @@ Patch series (mirrors of the curated commits; the numbers are apply order):
 | 0640 | `1bc374222c` | lint fixes |
 | 0648 | `86dba5f9a3` | holder record (`<db>.recover.pid` JSON) |
 | 0649 | `baed59f27c` | process-start identity in the holder record |
+| 0652 | `a934e39df2` | shared safe pid-existence probe and explicit proc-stat encoding |
 
 ## Behavior
 
@@ -147,7 +148,7 @@ Apply on the fork after its earlier Kanban dependencies, in order (not directly 
 git am -3 --empty=keep ~/code/hermes-mods/core/patches/0633-*.patch   # then 0634 0635 0636 0637 0639 0640 0648 0649
 ```
 
-- Apply all nine in order; later ones modify the module the first creates. 0638, 0641-0647 are unrelated.
+- Apply these in order; later ones modify the module the first creates. 0638, 0641-0647 and 0650-0651 are unrelated. 0652 replaces the holder liveness check with `gateway.status._pid_exists` and uses explicit UTF-8-sig for proc-stat reads; all 28 recovery tests passed again after it.
 - The live-guard `swap_db.py` must take the same `<db>.recovery.lock` for the manual-swap exclusion to hold.
 - Restart the gateway/dispatcher so `_start_auto_recovery` is loaded. No desktop rebuild.
 - Nothing to enable: automatic recovery is on by default.

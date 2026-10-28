@@ -20,6 +20,8 @@ Regression files: `tests/tui_gateway/test_profiles_list_canonical_session.py`, `
 
 Patch **0651** (`90a63800fb`) additionally scrubs inherited systemd unit markers per test: `INVOCATION_ID`, `NOTIFY_SOCKET`, `WATCHDOG_USEC`, `WATCHDOG_PID`, `JOURNAL_STREAM` and `MANAGERPID`. This keeps ordinary spawn tests in-process and prevents a test from notifying a real unit. Tests that exercise systemd opt in explicitly. `tests/test_hermetic_env_systemd_markers.py` verifies marker removal and in-process worker dispatch; both tests passed under the canonical runner.
 
+Patch **0652** (`a934e39df2`) binds the wrapper directory explicitly in backup/doctor tests. Canonical-runner targeted cases `test_import_skips_profile_dirs_without_config` and `test_profile_alias_status_follows_the_wrapper_the_profile_really_has` both passed. Its safe recovery PID probe is covered in the recovery doc.
+
 ## Applying
 
 Apply in series order, after the target-gap and existing test-isolation infrastructure.
