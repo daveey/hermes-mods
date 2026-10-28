@@ -218,6 +218,25 @@ def test_pre_llm_call_question_turn_gets_correction_and_the_open_item(home, monk
     assert first and CHILD in first["context"] and second is None
 
 
+def test_notice_starting_this_turn_is_not_called_missed(home, monkeypatch):
+    # The hook runs before the turn's user row is in state.db; that notice must not read as "never reached".
+    monkeypatch.setattr(plugin, "_home", lambda: home)
+    _child(home, summary="Shipped the naming fix; deployed.", body="Rename devices.", comments=())
+    assert plugin.pre_llm_call(session_id=CHAT, user_message=f"✔ [default] @default Kanban {CHILD} done — naming") is None
+    later = plugin.pre_llm_call(session_id=CHAT, user_message="ok")  # a turn that is not that notice still gets it
+    assert later and CHILD in later["context"] and "never reached this chat" in later["context"]
+
+
+def test_announced_undelivered_item_stays_without_the_missed_flag(home):
+    _child(home)
+    [item] = _followups(home)
+    assert item["missed_notice"] and item["undelivered"]
+    [kept] = core.drop_announced([item], f"✔ Kanban {CHILD} done — Mac person invite")
+    assert kept["undelivered"] and not kept["missed_notice"]
+    assert "never reached this chat" not in core.render_followups([kept])
+    assert core.drop_announced([item], "✔ Kanban t_1111bbbb done — another card") == [item]
+
+
 def test_pre_llm_call_is_silent_when_nothing_applies(home, monkeypatch):
     monkeypatch.setattr(plugin, "_home", lambda: home)
     assert plugin.pre_llm_call(session_id=CHAT, user_message="name her phone alex-iphone") is None

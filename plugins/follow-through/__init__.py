@@ -39,7 +39,8 @@ def pre_llm_call(session_id: str = "", user_message: Any = None, **_) -> dict | 
     try:
         parts = []
         home = _home()
-        items = core.open_followups(home, home / "state.db", session_id or "")
+        items = core.drop_announced(core.open_followups(home, home / "state.db", session_id or ""),
+                                    user_message if isinstance(user_message, str) else "")
         if items:
             asked = core.is_missed_action_question(user_message if isinstance(user_message, str) else "")
             due = {t for t in _throttle().due(session_id or "", [i["task_id"] for i in items])} if not asked else \

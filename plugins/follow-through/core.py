@@ -174,6 +174,22 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
     return found
 
 
+def drop_announced(items: list[dict], user_message: str) -> list[dict]:
+    """The completion notice that starts this turn may not be in state.db yet when pre_llm_call runs, so
+    open_followups reports it as missed. It is arriving right now: drop a missed-only item, and keep an
+    undelivered one without the missed flag."""
+    if not user_message:
+        return items
+    out = []
+    for it in items:
+        if it["missed_notice"] and f"Kanban {it['task_id']} done" in user_message:
+            if not it["undelivered"]:
+                continue
+            it = dict(it, missed_notice=False)
+        out.append(it)
+    return out
+
+
 def _excerpt(text: str, limit: int = 600) -> str:
     """The sentences around the kept-obligation match (the recorded instruction), trimmed."""
     m = _KEEP.search(text)
