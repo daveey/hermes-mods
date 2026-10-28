@@ -101,52 +101,163 @@ def _in_git_repo(p: str) -> bool:
     return False
 
 
+_PATH_JOIN = {"os.path.join", "posixpath.join"}
+_PATH_CTOR = {"Path", "PurePath", "PosixPath", "pathlib.Path", "pathlib.PurePath", "pathlib.PosixPath",
+              "pathlib.PurePosixPath"}
+_PATH_SAME = {"str", "os.fspath", "os.path.expanduser", "os.path.abspath", "os.path.normpath", "os.path.realpath"}
+_PATH_METHODS = {"expanduser", "resolve", "absolute", "as_posix"}
+
+
 def _execute_file_change(code: str) -> bool:
-    """Inspect helper calls without running Python. Only statically known strings count;
-    comments, content strings and arbitrary dynamic expressions are not executable evidence."""
+    """Inspect helper calls without running Python.
+
+    Each path/command argument is evaluated to its statically known value: fully known, or only a known leading
+    prefix (the left side of `+`, an f-string head, the first arguments of os.path.join / Path(...) / `/`,
+    expanduser of a literal, a loop over string literals). A write_file/patch whose known prefix is outside scratch
+    is a project edit even when the tail is dynamic (`write_file(R + k, v)` in a loop); a prefix inside scratch is
+    a probe. A path with no static prefix at all (a function's return value, an unknown variable) is not inferred:
+    no evidence either way, so it stays quiet rather than guess. Comments, content strings and uncalled
+    declarations never count."""
     try:
         tree = ast.parse(code)
     except (SyntaxError, ValueError):
         return False
     aliases = {name: name for name in ("write_file", "patch", "terminal")}
     modules = {"hermes_tools"}
-    strings: dict[str, str] = {}
+    imported: dict[str, str] = {}  # local name -> dotted origin (os.path, pathlib.Path, ...)
+    env: dict[str, tuple[str, bool]] = {}  # name -> (known text or prefix, complete?)
 
-    def text(node):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
+    def dotted(node) -> Optional[str]:
         if isinstance(node, ast.Name):
-            return strings.get(node.id)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left, right = text(node.left), text(node.right)
-            return left + right if left is not None and right is not None else None
+            return imported.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = dotted(node.value)
+            return f"{base}.{node.attr}" if base else None
+        return None
+
+    def cat(left, right, sep=""):
+        """Concatenate two evaluated parts; stop at the first unknown/partial piece."""
+        if left is None:
+            return None
+        if not left[1]:
+            return left
+        head = left[0].rstrip("/") + "/" if sep else left[0]
+        if right is None:
+            return (head, False) if head else None
+        if sep and right[0].startswith("/"):
+            return right
+        return head + right[0], right[1]
+
+    def joined(parts):
+        acc = None
+        for part in parts:
+            v = val(part)
+            acc = v if acc is None else cat(acc, v, "/")
+            if acc is None or not acc[1]:
+                return acc
+        return acc
+
+    def val(node) -> Optional[tuple[str, bool]]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value, True
+        if isinstance(node, ast.Name):
+            return env.get(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+            return cat(val(node.left), val(node.right), "/" if isinstance(node.op, ast.Div) else "")
         if isinstance(node, ast.JoinedStr):
-            parts = [text(p.value) if isinstance(p, ast.FormattedValue) and not p.format_spec else text(p)
-                     for p in node.values]
-            return "".join(parts) if all(p is not None for p in parts) else None
+            acc: Optional[tuple[str, bool]] = ("", True)
+            for p in node.values:
+                part = val(p.value) if isinstance(p, ast.FormattedValue) and not p.format_spec else (
+                    val(p) if not isinstance(p, ast.FormattedValue) else None)
+                acc = cat(acc, part)
+                if acc is None or not acc[1]:
+                    break
+            return acc if acc and acc[0] else None
+        if isinstance(node, ast.Call):
+            fn = dotted(node.func)
+            if fn in _PATH_JOIN or fn in _PATH_CTOR:
+                return joined(node.args) if node.args else None
+            if fn in _PATH_SAME and node.args:
+                v = val(node.args[0])
+                return (os.path.expanduser(v[0]), v[1]) if v else None
+            if fn in ("Path.home", "pathlib.Path.home"):
+                return str(Path.home()), True
+            if fn in ("tempfile.gettempdir",):
+                import tempfile
+                return tempfile.gettempdir(), True
+            if fn in ("os.getenv", "os.environ.get") and node.args:
+                key = val(node.args[0])
+                return (os.environ[key[0]], True) if key and key[1] and os.environ.get(key[0]) else None
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr in _PATH_METHODS:
+                    v = val(node.func.value)
+                    return (os.path.expanduser(v[0]), v[1]) if v else None
+                if node.func.attr == "joinpath":
+                    return joined([node.func.value, *node.args])
+        if (isinstance(node, ast.Subscript) and dotted(node.value) == "os.environ"):
+            key = val(node.slice)
+            return (os.environ[key[0]], True) if key and key[1] and os.environ.get(key[0]) else None
+        return None
+
+    def names(target) -> list[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [n for t in target.elts for n in names(t)]
+        return []
+
+    def bind(target, value):
+        for n in names(target):
+            env.pop(n, None)
+        if isinstance(target, ast.Name) and value is not None:
+            env[target.id] = value
+
+    def loop_value(it):
+        """A loop over string literals binds its variable to their common prefix."""
+        if isinstance(it, (ast.List, ast.Tuple, ast.Set)):
+            vals = [val(e) for e in it.elts]
+            if vals and all(v is not None and v[1] for v in vals):
+                texts = [v[0] for v in vals]
+                if len(set(texts)) == 1:
+                    return texts[0], True
+                pre = os.path.commonprefix(texts)
+                return (pre, False) if pre else None
         return None
 
     class Calls(ast.NodeVisitor):
         changed = False
 
         def visit_ImportFrom(self, node):
-            if node.module == "hermes_tools":
-                for name in node.names:
-                    aliases[name.asname or name.name] = name.name
+            for name in node.names:
+                local = name.asname or name.name
+                if node.module == "hermes_tools":
+                    aliases[local] = name.name
+                elif node.module:
+                    imported[local] = f"{node.module}.{name.name}"
 
         def visit_Import(self, node):
             for name in node.names:
                 if name.name == "hermes_tools":
                     modules.add(name.asname or name.name)
+                elif name.asname:
+                    imported[name.asname] = name.name
 
         def visit_Assign(self, node):
             self.visit(node.value)
-            value = text(node.value)
+            value = val(node.value)
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    strings.pop(target.id, None)
-                    if value is not None:
-                        strings[target.id] = value
+                bind(target, value)
+
+        def visit_AnnAssign(self, node):
+            if node.value is not None:
+                self.visit(node.value)
+                bind(node.target, val(node.value))
+
+        def visit_For(self, node):
+            self.visit(node.iter)
+            bind(node.target, loop_value(node.iter))
+            for stmt in node.body + node.orelse:
+                self.visit(stmt)
 
         def visit_Call(self, node):
             name = aliases.get(node.func.id) if isinstance(node.func, ast.Name) else None
@@ -155,11 +266,16 @@ def _execute_file_change(code: str) -> bool:
                 name = node.func.attr
             if name in ("write_file", "patch", "terminal"):
                 key = "command" if name == "terminal" else "path"
-                values = {kw.arg: text(kw.value) for kw in node.keywords if kw.arg}
+                values = {kw.arg: val(kw.value) for kw in node.keywords if kw.arg}
                 if key not in values and node.args:
-                    values[key] = text(node.args[0])
-                if values.get(key) is not None and is_file_change(name, values):
-                    self.changed = True
+                    values[key] = val(node.args[0])
+                got = values.get(key)
+                args = {k: v[0] for k, v in values.items() if v is not None and v[1]}
+                if got is not None and got[0]:
+                    # A partial path is classified by its known prefix; a partial command by its known head.
+                    args[key] = got[0]
+                    if is_file_change(name, args):
+                        self.changed = True
             self.generic_visit(node)
 
         # A declaration alone doesn't run its body. Dynamic helper/function dispatch is not inferred.
