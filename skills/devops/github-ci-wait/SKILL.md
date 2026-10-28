@@ -58,6 +58,11 @@ until one run or tag contains all of them.
 How to run it from an agent:
 - Start it with `terminal(background=true, notify=true)` and end the turn. Don't run a foreground sleep loop:
   it hits the tool timeout. Don't poll a background job either.
+- A Hermes update that pauses and restarts the chat kills its background jobs (`termination_source:
+  agent_close`), and no notice arrives. After a resume note saying the turn was paused for a Hermes update,
+  check each job you started once with `process_manage poll`, and restart any that died. If a deploy or a
+  promised report hangs on the result, put that step on a Kanban card with a `wake_check` instead; cards
+  survive updates.
 - In a Kanban worker there is no async notify, and a poll loop burns `max_runtime_seconds` (most worker
   timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
