@@ -44,6 +44,11 @@ Never wait on a worker inside a turn and never predict its result.
 - **Done:** card `done`, or a session whose last message reports the work finished (shipped,
   merged, verified) with nothing pending.
 
+**Never report stale state.** The user also talks to sessions and cards directly. Before listing
+anything as blocked on the user, re-read that card or session live in the same turn and confirm
+the ask is still open. If you can't confirm it, mark it "unverified". The ledger and status file
+say what's running, never what needs the user.
+
 ## Make things move
 
 - Stalled card: read its log (`hermes kanban log <id>`), then `kanban_comment` with the next step,
