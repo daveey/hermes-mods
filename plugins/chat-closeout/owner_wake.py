@@ -24,7 +24,9 @@ module's own SQLite file, so two backends never both wake for one premise.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -160,7 +162,21 @@ def card_line(card: dict[str, Any]) -> str:
     where = f" on {card['gateway']}" if card.get("gateway") else ""
     title = f" \"{card['title']}\"" if card.get("title") else ""
     state = "STALLED, " if w.get("wait_state") == "stalled" else ""
-    return f"- {card.get('key')}{where}{title}: {state}waiting on {w.get('waiting_on') or 'nothing named'} since {_since(w.get('waiting_since'))}"
+    deps = card.get("dependents") or []
+    known = [d for d in deps if not d.startswith("(")]
+    needed = (f"; still needed by {', '.join(known)}: do NOT close or archive it while they wait" if known else "")
+    needed += "".join(f"; {d}" for d in deps if d.startswith("("))
+    return (f"- {card.get('key')}{where}{title}: {state}waiting on {w.get('waiting_on') or 'nothing named'} since "
+            f"{_since(w.get('waiting_since'))}{needed}")
+
+
+# On 10-27 a supervisor wake called a card "safe to close" because its owning chat was archived, while a card on
+# another gateway was parked waiting on it; closing it would have left each naming the other as owner.
+REVERSE_DEPS_RULE = (
+    "Before you close, complete or archive any of these cards, check its reverse dependencies on every gateway: open "
+    "cards whose parents, awaiting or park/block reason name it, including its replica or tracker on the other "
+    "gateway (cross_task / `hermes kanban show` there). An archived or reaped owning chat never makes a card safe "
+    "to close; a card another card still waits on stays open (hand it to a live owner instead).")
 
 
 def wake_prompt(cards: list[dict[str, Any]]) -> str:
@@ -172,8 +188,8 @@ def wake_prompt(cards: list[dict[str, Any]]) -> str:
         "hosts, repos) when it is within the approved plan; otherwise create the owner card on the gateway that "
         "holds the capability and point the wait at it, or reassign. A tracker here may clear a capability gap its "
         "origin gateway holds. Do not re-park on the same premise, and do not turn this into a question for David "
-        "unless it truly needs his decision (then make it a visible blocked ask). Report in one short paragraph "
-        "what you changed.")
+        "unless it truly needs his decision (then make it a visible blocked ask). "
+        f"{REVERSE_DEPS_RULE} Report in one short paragraph what you changed.")
 
 
 def notice_text(cards: list[dict[str, Any]]) -> str:
@@ -191,8 +207,8 @@ def supervisor_body(cards: list[dict[str, Any]], session_id: str, why: str) -> s
         "Supervise each: read the card (cross-gateway: `hermes kanban wait-check task <id> --gateway <gw>`, "
         "cross_task), then clear the cause with this gateway's capabilities within the card's approved plan, create "
         "the owner card where the capability lives, or reassign it. Do not re-park on the same premise and do not ask "
-        "David unless a real human decision is needed (then a visible blocked ask). Complete this card with what you "
-        "changed.")
+        f"David unless a real human decision is needed (then a visible blocked ask). {REVERSE_DEPS_RULE} Complete "
+        "this card with what you changed.")
 
 
 # ---- the tick --------------------------------------------------------------------------------------------------
@@ -200,12 +216,28 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
          chat_info: Callable[[str], Optional[dict[str, Any]]],
          supervise: Callable[[list[dict[str, Any]], str, str], str],
          last_user: Callable[[str], float], now: Optional[float] = None,
-         canonical: Callable[[str], str] = lambda sid: sid) -> list[dict[str, Any]]:
+         canonical: Callable[[str], str] = lambda sid: sid,
+         dependents: Optional[Callable[[dict[str, Any]], list[str]]] = None) -> list[dict[str, Any]]:
     """One owner-wake pass. ``cards``: ``parked_waits()`` rows. ``chat_info(sid)``: ``{archived, end_reason, source}``
     or None when no store has the chat. ``supervise(cards, sid, why)`` creates one board-supervisor card for an
     orphaned chat's due cards and returns its id. ``canonical(sid)`` maps a session id to the chat it belongs to now
-    (its compression tip), so one chat is one group and one rate-limit counter. Returns what it did."""
+    (its compression tip), so one chat is one group and one rate-limit counter. ``dependents(card)`` names the open
+    cards still waiting on a card (``dependents_from``); the wake text says not to close those. Returns what it did."""
     now = time.time() if now is None else now
+
+    def annotate(claimed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if dependents is None:
+            return claimed
+        out = []
+        for c in claimed:
+            try:
+                deps = list(dependents(c))
+            except Exception:
+                logger.debug("owner-wake: dependents(%s) failed", c.get("key"), exc_info=True)
+                deps = ["(unreadable here: check before closing)"]
+            out.append({**c, "dependents": deps} if deps else c)
+        return out
+
     by_chat: dict[str, list[dict[str, Any]]] = {}
     for card in cards:
         if not (due(card) and card.get("session")) or log.fired(str(card["key"]), card["wait"]["premise"], now):
@@ -257,7 +289,7 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             assert wake is not None
             tried_this_tick += 1  # failed attempts count too: a refusing chat can't burn the tick
             try:
-                result = wake(sid, wake_prompt(claimed), display_kind="kanban_notice",
+                result = wake(sid, wake_prompt(annotate(claimed)), display_kind="kanban_notice",
                               display_metadata={"display_text": notice_text(claimed), "owner_wake": True,
                                                 "task_ids": [c["key"] for c in claimed]},
                               label="owner-wake")
@@ -291,7 +323,7 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             continue
         try:
             # One supervisor card per orphaned chat per pass, listing every card it newly holds.
-            task_id = supervise(claimed, sid, orphaned)
+            task_id = supervise(annotate(claimed), sid, orphaned)
         except Exception:
             logger.warning("owner-wake: supervisor route failed for %s", sid, exc_info=True)
             for c in claimed:
@@ -323,6 +355,138 @@ def _bookkeep(fn: Callable[[], Any], sid: str) -> None:
 
 
 # ---- real collaborators ----------------------------------------------------------------------------------------
+_CLOSED = ("done", "archived")
+# Fallback for older cores; the live list is core ``kanban_wait_info.PARK_EVENT_KINDS``.
+_PARK_EVENTS = ("scheduled", "blocked", "gave_up", "continuation_exhausted", "block_loop_detected", "triage_swept",
+                "supervisor_escalated", "continued", "status", "dependency_wait", "agent_block_escalated")
+UNREADABLE = "(some boards or replicas were unreadable here: check reverse dependencies before closing)"
+
+
+def _names(text: Any, tid: str) -> bool:
+    """``text`` names card ``tid`` as a whole id (t_159f0063 does not match t_159f00631)."""
+    return bool(tid) and re.search(rf"(?<![A-Za-z0-9_]){re.escape(tid)}(?![A-Za-z0-9_])", str(text or "")) is not None
+
+
+def _ro(path: Path) -> sqlite3.Connection:
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    c.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+    return c
+
+
+def _replica_wait_text(t: dict[str, Any]) -> str:
+    """The fields of a replicated card that say what it waits on (never its body: bodies cite cards as context)."""
+    run = t.get("run") if isinstance(t.get("run"), dict) else {}
+    return json.dumps([run.get("summary"), t.get("park"), t.get("awaiting"), t.get("wake_check"),
+                       t.get("block_reason")], default=str)
+
+
+def dependents_from(board_paths: Callable[[], list[Path]], replica_path: Callable[[], Optional[Path]], *,
+                    open_ro: Callable[[Path], sqlite3.Connection] = _ro,
+                    park_kinds: Iterable[str] = _PARK_EVENTS) -> Callable[[dict[str, Any]], list[str]]:
+    """``dependents(card)``: open cards still waiting on ``card``.
+
+    - Local boards: open children (``task_links``), open cards whose latest park event or wake check names it.
+    - Every gateway's cards in the hub replica (``hub.db`` ``replica`` coll ``tasks``, read once per finder: build
+      one per tick): open cards whose parents list it or whose last run summary names it (``park``/``awaiting``/
+      ``wake_check``/``block_reason`` too, if a replica ever carries them). A remote card that waits only through a
+      wake check is not visible here; the wake text's rule covers it. Stale duplicate replica rows can add a false
+      "still needed by", which errs toward keeping the card open.
+    - A board or replica that cannot be read adds ``UNREADABLE``: unknown is never "nothing depends on it"."""
+    park_kinds = tuple(park_kinds)
+    replica_cache: list[tuple[list[dict[str, Any]], bool]] = []
+
+    def local(tid: str) -> tuple[list[str], bool]:
+        found: list[str] = []
+        failed = False
+        like = f"%{tid}%"
+        for path in board_paths():
+            board = path.parent.name if path.parent.parent.name == "boards" else "default"
+            try:
+                c = open_ro(path)
+            except sqlite3.Error:
+                failed = True
+                continue
+            try:
+                tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                ids: set[str] = set()
+                closed = ",".join("?" for _ in _CLOSED)
+                if "task_links" in tables:
+                    ids.update(r[0] for r in c.execute(
+                        f"SELECT l.child_id FROM task_links l JOIN tasks t ON t.id = l.child_id WHERE l.parent_id = ? "
+                        f"AND t.status NOT IN ({closed})", (tid, *_CLOSED)))
+                if "task_events" in tables:
+                    kinds = ",".join("?" for _ in park_kinds)
+                    for task, payload in c.execute(
+                            f"SELECT e.task_id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+                            f"WHERE t.status NOT IN ({closed}) AND e.payload LIKE ? AND e.id = (SELECT MAX(x.id) FROM "
+                            f"task_events x WHERE x.task_id = e.task_id AND x.kind IN ({kinds}))",
+                            (*_CLOSED, like, *park_kinds)):
+                        if _names(payload, tid):
+                            ids.add(task)
+                if "task_wake_checks" in tables:
+                    for task, cmd in c.execute(
+                            f"SELECT w.task_id, w.cmd FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
+                            f"WHERE t.status NOT IN ({closed}) AND w.cmd LIKE ?", (*_CLOSED, like)):
+                        if _names(cmd, tid):
+                            ids.add(task)
+            except sqlite3.Error:
+                logger.debug("owner-wake: dependents read failed for %s", path, exc_info=True)
+                failed = True
+                continue
+            finally:
+                c.close()
+            found.extend(f"{board}/{i}" for i in sorted(ids - {tid}))
+        return found, failed
+
+    def replica() -> tuple[list[dict[str, Any]], bool]:
+        if not replica_cache:
+            rows: list[dict[str, Any]] = []
+            failed = False
+            try:
+                path = replica_path()
+                if path is not None:
+                    c = open_ro(path)
+                    try:
+                        raw = c.execute("SELECT data FROM replica WHERE coll = 'tasks'").fetchall()
+                    finally:
+                        c.close()
+                    for (data,) in raw:
+                        try:
+                            t = json.loads(data)
+                        except (TypeError, ValueError):
+                            continue
+                        if isinstance(t, dict) and t.get("id") and str(t.get("status") or "") not in _CLOSED:
+                            rows.append(t)
+            except Exception:
+                logger.debug("owner-wake: replica unreadable for dependents", exc_info=True)
+                failed = True
+            replica_cache.append((rows, failed))
+        return replica_cache[0]
+
+    def remote(tid: str, seen: set[str]) -> tuple[list[str], bool]:
+        rows, failed = replica()
+        out = []
+        for t in rows:
+            other = str(t.get("id"))
+            if other == tid or other in seen:
+                continue
+            parents = t.get("parents") if isinstance(t.get("parents"), list) else []
+            if tid in [str(p) for p in parents] or _names(_replica_wait_text(t), tid):
+                seen.add(other)
+                where = f" on {t['gateway']}" if t.get("gateway") else ""
+                out.append(f"{t.get('board') or 'default'}/{other}{where}")
+        return out, failed
+
+    def dependents(card: dict[str, Any]) -> list[str]:
+        tid = str(card.get("id") or str(card.get("key") or "").rsplit("/", 1)[-1])
+        here, failed_here = local(tid)
+        there, failed_there = remote(tid, {k.rsplit("/", 1)[-1] for k in here})
+        out = list(dict.fromkeys(here + there))
+        return out + [UNREADABLE] if (failed_here or failed_there) else out
+
+    return dependents
+
+
 def chat_info_from(state_dbs: Callable[[], list[Path]], tip: Callable[[str], Optional[str]]
                    ) -> Callable[[str], Optional[dict[str, Any]]]:
     """``chat_info`` over the state DBs. A compressed chat is judged by its compression tip (the live continuation)."""

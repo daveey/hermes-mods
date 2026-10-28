@@ -271,3 +271,149 @@ def test_bookkeeping_failure_after_a_started_wake_does_not_raise(tmp_path, monke
     out = h.tick([card('default/t_a')])
     assert out[0]['result'] == 'started' and len(h.wakes) == 1
     assert h.tick([card('default/t_a')], now=NOW + 60) == []  # finish() still recorded the premise
+
+
+# ---- reverse dependencies: never "safe to close" while another card waits on it --------------------------------
+def test_wake_and_supervisor_text_name_dependents_and_forbid_close(tmp_path):
+    chats = {'live': {'archived': False, 'end_reason': None, 'source': 'desktop'},
+             'arch': {'archived': True, 'end_reason': None, 'source': 'desktop'}}
+    h = Harness(tmp_path, chats=chats)
+    bodies = []
+    deps = {'t_159f0063': ['default/t_b11f0591 on hub'], 't_x': []}
+    ow.tick(cards=[card('default/t_159f0063', session='arch'), card('default/t_x', session='live', premise='q')],
+            wake=h.wake, log=h.log, chat_info=chats.get, last_user=lambda _s: 0.0, now=NOW,
+            supervise=lambda cs, sid, why: bodies.append(ow.supervisor_body(cs, sid, why)) or 't_sup',
+            dependents=lambda c: deps[c['id']])
+    assert len(bodies) == 1
+    assert 'still needed by default/t_b11f0591 on hub: do NOT close or archive it' in bodies[0]
+    assert 'reverse dependencies on every gateway' in bodies[0] and 'never makes a card safe' in bodies[0]
+    # The live chat's wake carries the rule too; a card nobody waits on gets no "still needed" note.
+    text = h.wakes[0][1]
+    assert 'reverse dependencies on every gateway' in text and 'still needed by' not in text
+
+
+def test_unreadable_dependents_say_check_before_closing(tmp_path):
+    h = Harness(tmp_path)
+
+    def boom(_c):
+        raise sqlite3.OperationalError('locked')
+    ow.tick(cards=[card('default/t_a')], wake=h.wake, log=h.log, chat_info=h.chats.get, supervise=h.supervise,
+            last_user=lambda _s: 0.0, now=NOW, dependents=boom)
+    assert 'unreadable here: check before closing' in h.wakes[0][1]
+
+
+def _board(path, tasks, links=(), events=(), checks=()):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(path)
+    c.executescript('CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT);'
+                    'CREATE TABLE task_links (parent_id TEXT, child_id TEXT);'
+                    'CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);'
+                    'CREATE TABLE task_wake_checks (task_id TEXT PRIMARY KEY, cmd TEXT);')
+    c.executemany('INSERT INTO tasks VALUES (?,?)', tasks)
+    c.executemany('INSERT INTO task_links VALUES (?,?)', links)
+    c.executemany('INSERT INTO task_events (task_id, kind, payload) VALUES (?,?,?)', events)
+    c.executemany('INSERT INTO task_wake_checks VALUES (?,?)', checks)
+    c.commit()
+    c.close()
+    return path
+
+
+def test_dependents_from_finds_children_park_reasons_wake_checks_and_remote_cards(tmp_path):
+    tid = 't_159f0063'
+    default = _board(tmp_path / 'kanban.db', [
+        (tid, 'triage'), ('t_child', 'todo'), ('t_donechild', 'done'), ('t_parked', 'scheduled'),
+        ('t_moved_on', 'scheduled'), ('t_lookalike', 'blocked'), ('t_closed_park', 'archived')],
+        links=[(tid, 't_child'), (tid, 't_donechild')],
+        events=[('t_parked', 'scheduled', json.dumps({'reason': f'waiting on MacBook acceptance in {tid}.'})),
+                ('t_moved_on', 'blocked', json.dumps({'reason': f'needs {tid}'})),
+                ('t_moved_on', 'scheduled', json.dumps({'reason': 'now waits on CI run 42'})),
+                ('t_lookalike', 'blocked', json.dumps({'reason': f'needs {tid}1'})),
+                ('t_closed_park', 'blocked', json.dumps({'reason': f'needs {tid}'}))])
+    other = _board(tmp_path / 'boards' / 'ops' / 'kanban.db', [('t_probe', 'scheduled')],
+                   checks=[('t_probe', f'hermes kanban wait-check task {tid} --gateway macbook')])
+    # The hub replica in its real shape: the incident's hub card was created by a hub chat (no origin binding to
+    # this gateway) and named the card only in its last run's park summary.
+    hub = _replica(tmp_path / 'hub.db', [
+        {'id': 't_b11f0591', 'board': 'default', 'gateway': 'hub', 'status': 'scheduled', 'origin_bindings': [],
+         'parents': ['t_8c0b6765'], 'body': 'context',
+         'run': {'outcome': 'scheduled', 'summary': f'SCHEDULED_UNTIL=... waiting on MacBook acceptance in {tid}.'}},
+        {'id': 't_kid', 'board': 'ops', 'gateway': 'mini', 'status': 'todo', 'parents': [tid]},
+        {'id': 't_bodyonly', 'board': 'default', 'gateway': 'hub', 'status': 'ready', 'body': f'see {tid} history'},
+        {'id': tid, 'board': 'default', 'gateway': 'macbook', 'status': 'triage', 'run': {'summary': tid}},
+        {'id': 't_old', 'board': 'default', 'gateway': 'hub', 'status': 'done', 'parents': [tid]},
+        {'id': 't_parked', 'board': 'default', 'gateway': 'macbook', 'status': 'scheduled',
+         'run': {'summary': f'waiting on {tid}'}}])  # this gateway's own card, already found locally
+    reads = []
+
+    def replica_path():
+        reads.append(1)
+        return hub
+    deps = ow.dependents_from(lambda: [default, other], replica_path)
+    assert deps({'id': tid, 'key': f'default/{tid}'}) == [
+        'default/t_child', 'default/t_parked', 'ops/t_probe', 'default/t_b11f0591 on hub', 'ops/t_kid on mini']
+    assert deps({'key': 'default/t_nothing'}) == []
+    assert reads == [1]  # the replica is read once per finder
+
+
+def _replica(path, tasks):
+    c = sqlite3.connect(path)
+    c.execute('CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT)')
+    c.executemany('INSERT INTO replica VALUES (?,?,?,?)',
+                  [(t['gateway'], 'tasks', f"{t['board']}/{t['id']}", json.dumps(t)) for t in tasks])
+    c.commit()
+    c.close()
+    return path
+
+
+def test_unreadable_board_or_replica_is_never_no_dependents(tmp_path):
+    garbage = tmp_path / 'boards' / 'x' / 'kanban.db'
+    garbage.parent.mkdir(parents=True)
+    garbage.write_bytes(b'not a database' * 100)
+    deps = ow.dependents_from(lambda: [garbage], lambda: None)
+    assert deps({'id': 't_a'}) == [ow.UNREADABLE]
+
+    def boom():
+        raise OSError('hub state unreadable')
+    assert ow.dependents_from(lambda: [], boom)({'id': 't_a'}) == [ow.UNREADABLE]
+    assert ow.dependents_from(lambda: [], lambda: None)({'id': 't_a'}) == []  # no replica on this host: nothing
+
+
+@pytest.mark.skipif(not core_src, reason='set HERMES_CORE_SOURCE to the fork checkout')
+def test_integration_supervisor_card_names_a_card_parked_on_the_orphan(tmp_path, monkeypatch):
+    import sys
+    sys.path.insert(0, core_src)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_HUB_STATE', str(tmp_path / 'hub-state'))
+    monkeypatch.setenv('CHAT_CLOSEOUT_OWNER_WAKE_DB', str(tmp_path / 'ow.db'))
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_session_activity as ksa
+    from hermes_cli.kanban_db_connect import connect_closing
+    ksa._reset_cache_for_tests()
+    with connect_closing() as conn:
+        orphan = kb.create_task(conn, title='scratch orphan', session_id='s_arch')
+        live = kb.create_task(conn, title='scratch live', session_id='s_live')
+        waiter = kb.create_task(conn, title='scratch waiter')
+        for tid in (orphan, live):
+            conn.execute("UPDATE tasks SET status='blocked', block_kind='capability' WHERE id=?", (tid,))
+            kb._append_event(conn, tid, 'blocked', {'kind': 'capability', 'reason': 'needs the MacBook DOM read'})
+        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (waiter,))
+        kb._append_event(conn, waiter, 'scheduled', {'reason': f'SCHEDULED_UNTIL=2026-11-01T00:00:00Z waiting on {orphan}'})
+        conn.commit()
+    (tmp_path / 'hub-state').mkdir()
+    _replica(tmp_path / 'hub-state' / 'hub.db', [
+        {'id': 't_hubwaiter', 'board': 'default', 'gateway': 'hub', 'status': 'scheduled',
+         'run': {'summary': f'waiting on acceptance in {live}'}}])
+    woke = []
+    out = plugin.owner_wake_tick(wake=lambda sid, text, **k: woke.append((sid, text)) or 'started',
+                                 last_user=lambda _s: 0.0,
+                                 chat_info={'s_arch': {'archived': True, 'end_reason': None, 'source': 'desktop'},
+                                            's_live': {'archived': False, 'end_reason': None, 'source': 'desktop'}}.get)
+    routed = [o for o in out if o['route'] == 'supervisor']
+    assert len(routed) == 1
+    with connect_closing() as conn:
+        sup = kb.get_task(conn, routed[0]['supervisor_task'])
+    assert f'still needed by default/{waiter}' in sup.body and 'do NOT close or archive' in sup.body
+    # The live chat's wake (real tick, real core reads) names the hub card from the replica.
+    assert [s for s, _ in woke] == ['s_live'] and 'still needed by default/t_hubwaiter on hub' in woke[0][1]
+    ksa._reset_cache_for_tests()

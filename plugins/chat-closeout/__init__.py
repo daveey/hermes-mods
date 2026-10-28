@@ -429,18 +429,34 @@ def owner_wake_tick(*, now: Optional[float] = None, cards: Optional[list[dict]] 
                     wake: Optional[Callable[..., str]] = None,
                     chat_info: Optional[Callable[[str], Optional[dict]]] = None,
                     supervise: Optional[Callable[[list[dict], str, str], str]] = None,
-                    last_user: Optional[Callable[[str], float]] = None) -> list[dict]:
+                    last_user: Optional[Callable[[str], float]] = None,
+                    dependents: Optional[Callable[[dict], list[str]]] = None) -> list[dict]:
     """Owner wake (owner_wake.py): a card parked for an agent-owned reason starts ONE supervise turn in the chat that
     owns it (archived/reaped/gone chat -> a board-supervisor card). Needs core ``parked_waits``; older cores: no-op."""
-    if cards is None:
+    try:
         from hermes_cli import kanban_session_activity as ksa
-        if not hasattr(ksa, "parked_waits"):
+    except ImportError:
+        ksa = None
+    if cards is None:
+        if ksa is None or not hasattr(ksa, "parked_waits"):
             return []
         cards = ksa.parked_waits(now=now)
     if wake is None:
         srv = _server()
         wake = srv._wake_session_turn if srv is not None else None
+    if dependents is None and ksa is not None and hasattr(ksa, "_board_db_paths"):
+        kw: dict = {}
+        if hasattr(ksa, "_open_ro"):
+            kw["open_ro"] = ksa._open_ro  # survives a WAL db whose -wal/-shm were just removed
+        try:
+            from hermes_cli import kanban_wait_info as kwi
+            kw["park_kinds"] = kwi.PARK_EVENT_KINDS
+        except (ImportError, AttributeError):
+            pass
+        dependents = owner_wake.dependents_from(
+            ksa._board_db_paths, getattr(ksa, "_hub_db_path", lambda: None), **kw)
     return owner_wake.tick(
+        dependents=dependents,
         cards=cards, wake=wake, log=wake_log(),
         chat_info=chat_info or owner_wake.chat_info_from(state_dbs, _compression_tip),
         supervise=supervise or owner_wake.supervise_on_board,
