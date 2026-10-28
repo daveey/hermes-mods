@@ -336,7 +336,38 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
         return None
     finally:
         conn.close()
-    return origin_refusal(task_id, missing) if missing else None
+    if not missing:
+        return None
+    return origin_refusal(task_id, missing) + remote_origin_hint(task_id, board, body, comments, missing[0])
+
+
+def _board_slug(board: Path) -> str:
+    """``<root>/kanban/boards/<slug>/kanban.db`` -> slug; the root ``kanban.db`` is ``default``."""
+    p = Path(board)
+    return p.parent.name if p.parent.parent.name == "boards" else "default"
+
+
+def remote_origin_hint(task_id: str, board: Path, body: str, comments: list[str], session: str) -> str:
+    """For an origin chat on ANOTHER gateway: a worker's cross_session send to a human chat is refused, and
+    ``kanban_origin_adopt`` only runs inside a courier-delivered adoption. The link is made from the origin gateway
+    with ``hermes-hub adopt-task``; a worker gets that run there with ``hermes-hub create-task``. '' otherwise."""
+    names = _gateway_names()
+    me = names[0] if names else ""
+    text = _DQUOTED.sub('""', "\n".join([body] + comments))
+    gw = next((m["gw"] for m in ORIGIN_REF_RE.finditer(text) if m["sid"] == session), "")
+    if not gw or not me or gw == me:
+        return ""
+    profile = (os.environ.get("HERMES_PROFILE") or "default").strip() or "default"
+    slug = _board_slug(board)
+    step = (f"hermes-hub adopt-task {me} {profile}/{slug}/{task_id} --origin-session {session} "
+            f"--id adopt:{task_id}:{session}")
+    delegate = (f"hermes-hub create-task {gw} {shlex.quote(f'Attach {me} card {task_id} to chat {session}')} "
+                f"--body {shlex.quote(f'Run on this gateway: {step}  Then confirm: hermes-hub links {session} --expect {me}/{slug}/{task_id}')} "
+                "--assignee default --origin-session ''")
+    return (f"\nThat chat is on gateway {gw}, not here ({me}): if cross_session refuses the send, link the card to the "
+            f"chat instead (this is what makes it hear the completion). The origin gateway must run: {step} . From "
+            f"this worker, get that run there with: {delegate} , then complete again once the link shows. Use that "
+            "CLI, not kanban_origin_adopt (it only runs inside a courier delivery), and do not ask a human for it.")
 
 
 def origin_refusal(task_id: str, sessions: list[str]) -> str:

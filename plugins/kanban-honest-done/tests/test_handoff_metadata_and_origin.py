@@ -291,3 +291,23 @@ def test_origin_gate_via_cli(tmp_path):
     paths = make_board(tmp_path)
     cmd = f"hermes kanban complete {OWN} --summary 'Shipped and verified.'"
     assert plugin.classify("terminal", {"command": cmd}, OWN, paths)
+
+
+def test_remote_origin_refusal_names_adopt_task_on_origin_gateway(tmp_path, monkeypatch):
+    """Live card t_a5cc12d9 (hub, origin chat on macbook): cross_session to a human chat is refused for workers and
+    kanban_origin_adopt has no courier context there, so the worker blocked on a human. The refusal must name the
+    hermes-hub path that links the card from the origin gateway, and a worker-runnable way to get it run there."""
+    monkeypatch.setattr(core, "_gateway_names", lambda: ("hub", {"hub", "macbook"}))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    why = plugin.classify("kanban_complete", {"summary": "Shipped."}, OWN, make_board(tmp_path, links=()))
+    step = f"hermes-hub adopt-task hub default/default/{OWN} --origin-session {ORIGIN} --id adopt:{OWN}:{ORIGIN}"
+    assert step in why
+    assert "hermes-hub create-task macbook " in why and "--origin-session ''" in why
+    assert "on gateway macbook" in why
+    assert "not kanban_origin_adopt" in why
+
+
+def test_same_gateway_origin_refusal_has_no_adopt_hint(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "_gateway_names", lambda: ("macbook", {"hub", "macbook"}))
+    why = plugin.classify("kanban_complete", {"summary": "Shipped."}, OWN, make_board(tmp_path, links=()))
+    assert why and "adopt-task" not in why
