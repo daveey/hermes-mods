@@ -410,6 +410,10 @@ def _default_add_sub(**kw: Any) -> None:
     from hermes_cli import kanban_db_notify as kbn
 
     with kbc.connect_closing() as conn:
+        # A forwarded request (enqueue) names a card owned by another gateway; never write an
+        # orphan row for a task this board does not have.
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (kw["task_id"],)).fetchone() is None:
+            raise LookupError(f"task {kw['task_id']} is not on this board")
         kbn.add_notify_sub(conn, **kw)
 
 

@@ -144,3 +144,20 @@ def test_real_kanban_db_gets_exactly_one_row(tmp_path, monkeypatch):
         ("hub", "macbook/default/20261023_204125_cb2658"),
         ("tui", "20261027_133954_1b6eae"),
     ]
+
+
+def test_default_add_sub_refuses_a_task_this_board_does_not_own(monkeypatch, tmp_path):
+    """enqueue() sees foreign worker cards; a refusal must not leave an orphan row in this DB."""
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with kbc.connect_closing() as conn:
+        mine = kb.create_task(conn, title="mine", assignee="default")
+    rf._default_add_sub(task_id=mine, platform="tui", chat_id="s1", notifier_profile="default")
+    with pytest.raises(LookupError):
+        rf._default_add_sub(task_id="t_foreign", platform="tui", chat_id="s1", notifier_profile="default")
+    with kbc.connect_closing() as conn:
+        rows = conn.execute("SELECT task_id FROM kanban_notify_subs").fetchall()
+    assert [r[0] for r in rows] == [mine]
+    monkeypatch.setattr(rf, "_this_gateway", lambda: "hub")
+    assert rf.subscribe_refused_chat(LOCAL, "t_foreign") is None
