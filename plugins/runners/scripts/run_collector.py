@@ -1,7 +1,7 @@
 """Observe-only supervisor with optional status-only repair reconciliation.
 
 No work is performed on import. repair_sessions permits diagnosis status reads,
-not session dispatch; management_operations, dispatch and workspace_jobs remain
+not session dispatch; dispatch and workspace_jobs remain
 refused. The owning profile's existing canonical state.db supplies receipts.
 
 Private JSON: {"credentials": {"opaque_ref": {"scope": "user/example",
@@ -118,9 +118,11 @@ def configure_core(root):
 
 
 def _readonly(config):
+    # management_operations gates the separate-identity broker (operations.py), which
+    # this process never imports or calls; the collector stays observe-only with it on.
     flags = config['features']
-    if flags['observe'] is not True or any(flags[k] is not False for k in
-            ('management_operations', 'dispatch', 'workspace_jobs')):
+    if flags['observe'] is not True or type(flags['management_operations']) is not bool or any(
+            flags[k] is not False for k in ('dispatch', 'workspace_jobs')):
         raise RuntimeError('observe_only_required')
 
 

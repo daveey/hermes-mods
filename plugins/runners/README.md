@@ -204,7 +204,9 @@ Enforced on every request:
   Unit names and argv come only from policy.
 - operation allowlist: `diagnose` (read-only) and `service_start`. Mutation is allowed only on
   policy targets marked `canary` and only when `management_operations` is true in broker policy.
-  The plugin flag of the same name gates the tool as well.
+  The plugin flag of the same name gates the tool as well. The observe-only collector keeps
+  running with that flag on (it never calls the broker); it still refuses `dispatch` and
+  `workspace_jobs`.
 - host and service identity: the request host must equal the broker host. The unit's `Id`,
   `FragmentPath` and description fingerprint must match the provisioned service.
 - the repair subject only: sibling services are refused, and there are no batch, reboot or

@@ -70,7 +70,12 @@ def test_diagnosis_flag_allowed_but_mutation_refused():
     cfg = config()
     cfg['features']['repair_sessions'] = True
     _readonly(cfg)
-    for flag in ('management_operations', 'dispatch', 'workspace_jobs'):
+    # management_operations gates the separate-identity broker, never the collector,
+    # so the collector keeps observing (and verifying repairs) while it is on.
+    cfg['features']['management_operations'] = True
+    _readonly(cfg)
+    cfg['features']['management_operations'] = False
+    for flag in ('dispatch', 'workspace_jobs'):
         cfg['features'][flag] = True
         with pytest.raises(RuntimeError, match='observe_only_required'):
             _readonly(cfg)

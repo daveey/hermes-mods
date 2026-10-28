@@ -69,7 +69,27 @@ def test_validate_every_tick_and_never_reset_fence(tmp_path, monkeypatch, field)
     assert len(instances) == 1
 
 
-@pytest.mark.parametrize('flag', ['management_operations', 'dispatch', 'workspace_jobs'])
+def test_management_flag_does_not_stop_observe_only_collector(tmp_path):
+    # The broker (separate OS identity) performs management; the collector never does.
+    cfg, config, private = files(tmp_path)
+    cfg['features']['management_operations'] = True
+    config.write_text(json.dumps(cfg))
+    runtime._readonly(runtime.ConfigFile(config).load())
+
+
+def test_collector_has_no_management_path():
+    import ast
+    import pathlib
+    root = pathlib.Path(runtime.__file__).resolve().parents[1]
+    for path in (root / 'collector.py', root / 'scripts' / 'run_collector.py', root / 'scripts' / 'runtime_collector.py'):
+        tree = ast.parse(path.read_text())
+        names = {a.name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+        modules = {n.module or '' for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        assert not any('operations' in m or 'broker' in m for m in names | modules), path
+        assert 'manage.sock' not in path.read_text(), path
+
+
+@pytest.mark.parametrize('flag', ['dispatch', 'workspace_jobs'])
 def test_readonly_startup(tmp_path, flag):
     cfg, config, private = files(tmp_path)
     cfg['features'][flag] = True
