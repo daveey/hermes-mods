@@ -123,6 +123,32 @@ def test_slack_bounds_always_have_six_decimals_for_history_and_replies():
     assert calls == ["conversations.history", "conversations.replies"]
 
 
+@pytest.mark.parametrize("latest_age", [100, 86400, 90000])
+def test_old_roots_only_fetch_recently_active_threads(latest_age):
+    root = {"ts": str(NOW - 3 * 86400), "text": "old root must not display",
+            "reply_count": 1, "latest_reply": str(NOW - latest_age)}
+    reply = {"ts": str(NOW - latest_age), "thread_ts": root["ts"],
+             "text": "thread update"}
+    calls = []
+    def api(method, params):
+        calls.append((method, params))
+        if method == "conversations.history":
+            # Model Slack's root timestamp filtering, not an unbounded fake.
+            return {"messages": [root] if float(params["oldest"]) <= float(root["ts"]) else []}
+        assert params["ts"] == root["ts"]
+        assert float(params["oldest"]) == NOW - 86400
+        return {"messages": [root, reply]}
+    text = a.context(api, "C1", now=NOW)
+    assert float(calls[0][1]["oldest"]) == NOW - 7 * 86400
+    assert "old root must not display" not in text
+    if latest_age <= 86400:
+        assert "thread update" in text
+        assert len(calls) == 2
+    else:
+        assert "thread update" not in text
+        assert len(calls) == 1
+
+
 def test_repeated_cursor_and_missing_cursor_report_incomplete():
     for response in ({"has_more": True}, {"response_metadata": {"next_cursor": "same"}}):
         _, warnings = a.collect(lambda *args: {"messages": [], **response}, "C1", now=NOW)
