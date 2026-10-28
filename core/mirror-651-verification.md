@@ -52,6 +52,10 @@ Desktop: installed lockfile dependencies with `npm ci --ignore-scripts --no-audi
 
 The final source refresh added `a934e39df2` (0652, safe recovery pid probe and wrapper test paths) and `9c943cbd2f` (0653, concrete pin-provider binding). Both public patches applied with `git am -3` in a new detached worktree at `90a63800fb`. Canonical runner results: recovery **28 passed** again, pin-provider **19 passed**, and targeted backup/doctor wrapper cases **2 passed**. That worktree was removed too. This extends the published inventory to **653 contiguous patches**, representing all **23** fork commits after `7f117fa465` through `9c943cbd2f`. The original 657-commit regeneration was followed by this two-commit append.
 
+## Concurrent mirror reconciliation: 0654
+
+Another publisher appended `599752f5c9` as 0652 while 0652–0653 were being verified here. Its patch and docs were retained, merged and renumbered to **0654**, following the actual fork order after `9c943cbd2f`; all its feature references were updated. Applied 0654 with `git am -3` at `9c943cbd2f` and ran `tests/hermes_cli/test_kanban_origin_projection_contention.py`: **5 passed**. The throwaway worktree was removed. The final series is contiguous through **0654** (`599752f5c9`), with no duplicate numbers or appended source commits.
+
 ## Recovery reporting precision
 
 The recovery implementation writes a JSON report file and emits markdown-style summary/card content. It does not create a separate `.md` file alongside every JSON report. The feature doc reflects that distinction rather than implying an artifact the implementation does not write.

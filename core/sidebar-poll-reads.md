@@ -124,5 +124,5 @@ Plugin: `plugins/chat-closeout/tests/test_proof_pass.py` (`test_a_pass_proves_th
   snapshot's annotations across threads.
 - Builds on fa44287eb6 (links fingerprint keyed on hub content, 15 s max age), which landed meanwhile: its
   fingerprint still covers every board's stat, which is why the in-scope pin above matters.
-- The `stale`/`status` flicker on origin rows under ledger write-lock contention is fixed separately in 0652
+- The `stale`/`status` flicker on origin rows under ledger write-lock contention is fixed separately in 0654
   ([kanban-local-owner-projection.md](kanban-local-owner-projection.md)).
