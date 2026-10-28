@@ -179,6 +179,50 @@ def duplicate_open(core, store, limit=2000):
     return out
 
 
+def cross_session_duplicates(core, store, limit=2000):
+    """Open requests in different sessions that same_open_ask treats as one decision.
+
+    One entry per pair (idempotent on the two request ids), within one namespace
+    (gateway + profile). Read-only. Returns [{namespace, ids, sessions}].
+    """
+    with store._tx() as c:
+        rows = c.execute(
+            'SELECT r.namespace, r.session, v.body FROM requests r JOIN revisions v '
+            'ON v.namespace=r.namespace AND v.id=r.id AND v.revision=r.revision '
+            "WHERE r.state IN ('open','needs_context') AND r.resolution IS NULL "
+            'ORDER BY r.rowid LIMIT ?', (limit,)).fetchall()
+    by_ns = {}
+    for row in rows:
+        try:
+            body = json.loads(row['body'])
+        except ValueError:
+            continue
+        by_ns.setdefault(row['namespace'], []).append((row['session'], body))
+    out = []
+    seen = set()
+    for ns, reqs in by_ns.items():
+        asks = [{'id': body['requestId'], 'kind': body['kind'], 'title': body.get('title', ''),
+                 'step': None, 'labels': [x.get('label') for x in body.get('choices', [])],
+                 'session': session}
+                for session, body in reqs]
+        for i, ask in enumerate(asks):
+            cand = {'text': ask['title'], 'kind': _BACK_KIND.get(ask['kind'], 'input'),
+                    'options': ask['labels'], 'verbatim_span': ''}
+            for prev in asks[:i]:
+                if prev['session'] == ask['session']:
+                    continue
+                if core.same_open_ask(cand, [prev]) is None:
+                    continue
+                pair = tuple(sorted((prev['id'], ask['id'])))
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                by_id = {prev['id']: prev['session'], ask['id']: ask['session']}
+                out.append({'namespace': ns, 'ids': list(pair),
+                            'sessions': [by_id[pair[0]], by_id[pair[1]]]})
+    return out
+
+
 def answered_open(core, store, db=None, limit=500):
     """Per-request detail for stale_counts' answeredOpen set (read-only).
 

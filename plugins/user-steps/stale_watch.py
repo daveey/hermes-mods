@@ -54,6 +54,20 @@ def dup_card(d):
             'idempotency_key': f"user-steps:dup:{d['namespace']}:{d['session']}", 'assignee': 'default'}
 
 
+def cross_dup_card(p):
+    a, b = p['ids']
+    sessions = ', '.join(p['sessions'])
+    body = (f"Two sessions on this gateway hold open user-steps requests for the same decision "
+            f"(core.same_open_ask matched them across chats). A status reply in one chat can restate the "
+            f"other's ask and mint a copy.\n\n- Namespace: {p['namespace']}\n"
+            f"- Sessions: {sessions}\n- Request ids: {a}, {b}\n\n"
+            f"Find which path minted the extra request and withdraw the newer duplicate with a reason. "
+            f"This watcher never withdraws anything.\n"
+            f"Source: plugins/user-steps/stale_watch.py.")
+    return {'title': 'user-steps: duplicate open requests across sessions', 'body': body,
+            'idempotency_key': f"user-steps:dup:{p['namespace']}:{a}:{b}", 'assignee': 'default'}
+
+
 def create_card(c):
     cmd = ['hermes', 'kanban', 'create', c['title'], '--body-file', '-', '--assignee', c['assignee'],
            '--idempotency-key', c['idempotency_key'], '--json']
@@ -74,6 +88,9 @@ def run(core, chat, store, db=None, now=None, min_age=MIN_AGE, create=create_car
     for d in chat.duplicate_open(core, store):
         create(dup_card(d))  # one card per session; idempotent on its key
         opened.append('dup:' + d['session'])
+    for p in chat.cross_session_duplicates(core, store):
+        create(cross_dup_card(p))  # one card per pair; idempotent on its key
+        opened.append('xdup:' + ':'.join(p['ids']))
     return opened
 
 

@@ -218,7 +218,7 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     open_asks = core.open_asks(store, owner, _ledger().read(session_id).get('steps', []))
     # continuity=True: the listed titles must not silently drop a re-ask before covered() judges it.
     res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks],
-                       '', aux_llm, continuity=True)
+                       '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner))
     approvals = [s for s in res.get('steps', []) if s['kind'] == 'approve']
     if not approvals:
         return None

@@ -333,7 +333,8 @@ or decide right now. Also say which previously-open steps are now resolved.
 Return ONLY JSON:
 {"steps":[{"text":"...","kind":"approve|do|choose|input","verbatim_span":"...","options":["..."]}],
  "resolved":["<open step id>", ...],
- "repeats":[{"id":"<open step id>","verbatim_span":"..."}]}
+ "repeats":[{"id":"<open step id>","verbatim_span":"..."}],
+ "elsewhere":[{"title":"<exact ELSEWHERE title>","verbatim_span":"..."}]}
 
 Kinds:
 - approve: the assistant proposes an action and waits for a go/no ("Want me to deploy it?", "OK to delete X?").
@@ -361,13 +362,29 @@ Rules:
   reply says are now done. Leave a step out when unsure.
 - Status reports are not asks: "X is in review", "not yet approved", "still open", "waiting on CI/a worker/a
   reviewer". A Kanban card in review is checked by an automated reviewer, not by the user.
+- A sentence that lists, counts or summarizes decisions waiting in other chats, queues or cards ('your For you
+  queue holds…', 'still waiting on you in the hub chat: …') is a status report, not a new ask, even when it
+  names each decision.
+- ELSEWHERE lists asks open in other chats. A sentence restating one of these points at an ask that lives
+  elsewhere: never a new step. Put {"title": "<exact ELSEWHERE title>", "verbatim_span": "<exact sentence>"} in
+  "elsewhere" instead. Those are neither minted nor framed.
 - If the reply says nothing is needed from the user, return no steps unless a sentence explicitly asks the user.
-- No asks: {"steps":[],"resolved":[...],"repeats":[...]}."""
+- No asks: {"steps":[],"resolved":[...],"repeats":[...],"elsewhere":[...]}."""
 
 
-def build_prompt(reply: str, open_steps: list[dict], user_msg: str) -> str:
+def build_prompt(reply: str, open_steps: list[dict], user_msg: str, elsewhere: Optional[list] = None) -> str:
     opened = "\n".join(f"- {s['id']} ({s.get('kind')}): {s.get('text')}" for s in open_steps) or "(none)"
-    return (f"OPEN STEPS:\n{opened}\n\nUSER'S LAST MESSAGE:\n{(user_msg or '(none)')[:1500]}\n\n"
+    titles: list[str] = []
+    for raw in elsewhere or []:
+        title = str(raw).strip()
+        if title and title not in titles:
+            titles.append(title)
+        if len(titles) >= 30:
+            break
+    listed = "\n".join(f"- {t}" for t in titles) or "(none)"
+    return (f"OPEN STEPS:\n{opened}\n\n"
+            f"ELSEWHERE (open asks in other chats; a sentence restating one is never a new step):\n{listed}\n\n"
+            f"USER'S LAST MESSAGE:\n{(user_msg or '(none)')[:1500]}\n\n"
             f"ASSISTANT REPLY:\n{(reply or '')[:12000]}")
 
 
@@ -577,6 +594,28 @@ def directly_asks(span: str) -> bool:
     return bool(_DIRECT_REQUEST.search(_QUOTED.sub('""', _plain(span))))
 
 
+# A paragraph that reports the user's pending decisions, queue or asks in other chats. A step whose evidence
+# sits in one is a status line, not a new ask in this chat. Gaps absorb quotes ("Your \"For you\" queue now holds").
+_DIGEST_MARK = re.compile(
+    r"(?:\bfor you|\byour).{0,40}?\b(?:queue|list|inbox)\b.{0,80}?\b(?:now\s+)?(?:holds|has|contains|shows)\b"
+    r"|waiting\s+(?:on|for)\s+you\s+in\b"
+    r"|\bin\s+(?:its|their)\s+own\s+chat\b"
+    r"|\b(?:decisions?|asks?)\b(?:\s+\w+){0,3}\s+(?:waiting|pending|open)\b(?:\s+\w+){0,3}\s+(?:in|on)\b",
+    re.I | re.S)
+
+
+def in_digest_report(span: str, paragraph: str) -> bool:
+    """The span sits in a digest of asks elsewhere, and does not itself ask the user to act in this chat.
+
+    Keep the step only when the span is a direct request and the digest marker is outside the span.
+    """
+    if not (_DIGEST_MARK.search(paragraph) or _DIGEST_MARK.search(_plain(paragraph))):
+        return False
+    if _DIGEST_MARK.search(span) or _DIGEST_MARK.search(_plain(span)):
+        return True
+    return not directly_asks(span)
+
+
 def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None,
              *, continuity: bool = False) -> list[dict]:
     out: list[dict] = []
@@ -608,6 +647,8 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
         block = locate(reply, span)
         if block is None or _norm(span) not in _norm(block["text"]):
             continue  # full evidence required; locate's framing prefix is not validation
+        if in_digest_report(span, block["text"]):
+            continue  # a digest of asks that live elsewhere is a status report, not a new tile
         if recommendation_without_request(span, block["text"]):
             continue  # a recommendation is not permission to manufacture a choice
         candidate = {"text": text, "kind": kind, "verbatim_span": span, "options": opts}
@@ -624,24 +665,76 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
     return out if continuity else out[:MAX_NEW_PER_REPLY]
 
 
+def _elsewhere_titles(raw: Optional[list], limit: int = 30) -> list[str]:
+    titles: list[str] = []
+    for item in raw or []:
+        title = str(item).strip()
+        if title and title not in titles:
+            titles.append(title)
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+def _span_restates(title: str, span: str) -> bool:
+    """The span restates this elsewhere title. An unrelated ask paired with a listed title is not a mapping."""
+    key = ask_key(title)
+    if len(key) >= _ASK_KEY_MIN and key in ask_key(span):
+        return True
+    words = _words(title)
+    return len(words) >= 3 and _overlap(words, _words(span)) >= _OVERLAP
+
+
+def elsewhere_mapped(raw: Any, reply: str, titles: list[str]) -> list[dict]:
+    """Model mappings whose title is an ELSEWHERE ask and whose span is in the reply.
+
+    A mapped span is not a new step: callers drop it from steps and must not frame it.
+    A title the prompt did not list cannot suppress a real ask, and a listed title cannot
+    suppress a span that does not restate it.
+    """
+    known = {ask_key(t) for t in titles if len(ask_key(t)) >= _ASK_KEY_MIN}
+    out: list[dict] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        span = str(item.get("verbatim_span") or "").strip()
+        if ask_key(title) not in known or locate(reply, span) is None or not _span_restates(title, span):
+            continue
+        out.append({"title": title, "verbatim_span": span})
+    return out
+
+
+def without_elsewhere(steps: list[dict], mapped: list[dict]) -> list[dict]:
+    drop = {ask_key(m["verbatim_span"]) for m in mapped}
+    return [s for s in steps if ask_key(s.get("verbatim_span")) not in drop]
+
+
 LLM = Callable[[str, str], str]
 
 
 def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM],
-            *, continuity: bool = False) -> dict:
-    """{steps, resolved, source: 'model'|'regex', error?}."""
+            *, continuity: bool = False, elsewhere: Optional[list] = None) -> dict:
+    """{steps, resolved, source: 'model'|'regex', error?}.
+
+    ``elsewhere`` is titles of open asks in other chats. Steps the model maps onto
+    one of them are omitted: neither minted nor framed.
+    """
     ids = {s["id"] for s in open_steps}
+    titles = _elsewhere_titles(elsewhere)
     dropped: list[str] = []
     if llm is not None:
         try:
-            d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg)))
+            d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg, titles)))
             resolved = [str(x) for x in (d.get("resolved") or []) if str(x) in ids]
             raw = d.get("repeats")
             repeats = [{"id": str(x["id"]), "verbatim_span": str(x["verbatim_span"])}
                        for x in (raw if isinstance(raw, list) else []) if isinstance(x, dict) and str(x.get("id")) in ids
                        and isinstance(x.get("verbatim_span"), str) and locate(reply, x["verbatim_span"]) is not None]
-            return {"steps": validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), "resolved": resolved,
-                    "repeats": repeats, "source": "model", "dropped": dropped}
+            mapped = elsewhere_mapped(d.get("elsewhere"), reply, titles)
+            steps = without_elsewhere(validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), mapped)
+            return {"steps": steps, "resolved": resolved, "repeats": repeats, "elsewhere": mapped,
+                    "source": "model", "dropped": dropped}
         except Exception as exc:  # fall back to the regex detector; resolution then only comes from buttons
             err = f"{type(exc).__name__}: {exc}"[:200]
             dropped.clear()
@@ -865,7 +958,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         mirrored = {s.get('requestId') for s in opened}
         listed += [{'id': a['id'], 'kind': a['kind'], 'text': a['title']}
                    for a in open_asks(action_store, action_owner) if a['id'] not in mirrored]
-    res = extract(reply, listed, user_msg, llm, continuity=True)
+    elsewhere = elsewhere_titles(action_store, action_owner) if action_store is not None else []
+    res = extract(reply, listed, user_msg, llm, continuity=True, elsewhere=elsewhere)
     published, resolved = [], []
     text = reply
     changed = False
@@ -944,10 +1038,12 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         # A sentence the model marked as a repeat of an open extracted tile is framed onto that tile too, so the
         # message points at the existing tile instead of reading as a new ask. Framing only: nothing is created.
         by_id = {s.get("id"): s for s in ledger.open_steps(session_id) if s.get("requestId")}
+        mapped_spans = {ask_key(m.get("verbatim_span")) for m in (res.get("elsewhere") or [])}
         for r in res["repeats"]:
             step = by_id.get(r["id"])
             if step is not None and all(p.get("id") != step["id"] for p in published) \
-                    and locate(text, r["verbatim_span"]) is not None:
+                    and locate(text, r["verbatim_span"]) is not None \
+                    and ask_key(r.get("verbatim_span")) not in mapped_spans:
                 published.append({**step, "verbatim_span": r["verbatim_span"]})
     if published and framed:
         text = frame(text, published, session_id)
@@ -1010,6 +1106,32 @@ def _words(text, drop=None) -> set:
 
 def _overlap(a: set, b: set) -> float:
     return len(a & b) / min(len(a), len(b)) if a and b else 0.0
+
+
+def elsewhere_titles(store, owner, limit=30) -> list[str]:
+    """Titles of open, undecided requests in other sessions of this gateway and profile.
+
+    Newest first, at most 30. Titles only: a restatement of one of these is not a new ask.
+    """
+    if store is None or not owner or not owner.get('storedSessionId'):
+        return []
+    cap = max(0, min(int(limit), 30))
+    with store._tx() as c:
+        rows = c.execute(
+            'SELECT v.body FROM requests r JOIN revisions v '
+            'ON v.namespace=r.namespace AND v.id=r.id AND v.revision=r.revision '
+            'WHERE r.namespace=? AND r.session!=? AND r.state IN (\'open\',\'needs_context\') '
+            'AND r.resolution IS NULL ORDER BY r.rowid DESC LIMIT ?',
+            (store._ns(owner), owner['storedSessionId'], cap)).fetchall()
+    out: list[str] = []
+    for row in rows:
+        try:
+            title = str(json.loads(row[0]).get('title') or '').strip()
+        except (ValueError, TypeError):
+            continue
+        if title and title not in out:
+            out.append(title)
+    return out
 
 
 def open_asks(store, owner, steps=()) -> list[dict]:

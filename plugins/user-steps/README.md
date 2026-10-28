@@ -441,6 +441,15 @@ skips are not live mutation or end-to-end verification.
 ## Stale-request detector
 
 `stale_watch.py` opens one Kanban card (idempotency key `user-steps-stale:<requestId>`) for each open clarification whose
-user reply is older than 1 h (the `/ping` `stale.answeredOpen` set). Run it periodically on every gateway, since action
+user reply is older than 1 h (the `/ping` `stale.answeredOpen` set), and one card per pair of open requests in
+different sessions that `same_open_ask` treats as the same decision (key `user-steps:dup:<namespace>:<id>:<id>`).
+Run it periodically on every gateway, since action
 stores are per host: `python3 ~/.hermes/plugins/user-steps/stale_watch.py` (`--dry-run`, `--min-age SECONDS`).
-Tests: `tests/test_stale_watch.py` (2 h reply -> one card; rerun -> no duplicate; retired -> none; CLI args).
+Tests: `tests/test_stale_watch.py` (2 h reply -> one card; rerun -> no duplicate; retired -> none; CLI args;
+cross-session pair -> one card; a single-session request -> none).
+
+A reply that only lists decisions waiting in other chats, queues or cards is a status report. A step whose
+evidence sits in that paragraph is not minted, unless the span itself is a direct request and does not contain
+the digest marker. The extractor prompt also receives up to 30 titles of open asks in other sessions
+(`ELSEWHERE`); a sentence that restates one of those titles is neither minted nor framed. A listed title
+cannot suppress an unrelated ask. Tests: `tests/test_elsewhere_digest.py`.

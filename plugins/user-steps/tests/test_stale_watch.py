@@ -126,3 +126,37 @@ def test_decided_or_withdrawn_twin_is_not_a_duplicate(tmp_path):
                           idempotencyKey='k1', revisionText=None))
     st.create(OWNER, _approval('Approve fix A for the build?'))
     assert chat.duplicate_open(core, st) == []
+
+
+def test_cross_session_pair_opens_one_card_and_a_single_session_request_opens_none(tmp_path):
+    alone = core.ActionStore(tmp_path / 'alone.sqlite3')
+    alone.create(OWNER, _approval('Approve fix A for the build?'))
+    board = Board()
+    go(alone, tmp_path / 'missing.db', board)
+    assert board.cards == {}
+
+    distinct = core.ActionStore(tmp_path / 'distinct.sqlite3')
+    other = dict(OWNER, storedSessionId='session-b')
+    distinct.create(OWNER, _approval('Approve fix A for the build?'))
+    other_body = _approval('Approve fix B for the deploy window?')
+    other_body['owner'] = other.copy()
+    distinct.create(other, other_body)
+    board = Board()
+    go(distinct, tmp_path / 'missing.db', board)
+    assert board.cards == {}
+
+    paired = core.ActionStore(tmp_path / 'paired.sqlite3')
+    a = paired.create(OWNER, _approval('Approve fix A for the build?'))
+    twin = _approval('Approve fix A for the build?')
+    twin['owner'] = other.copy()
+    b = paired.create(other, twin)
+    board = Board()
+    go(paired, tmp_path / 'missing.db', board)
+    go(paired, tmp_path / 'missing.db', board)
+    assert len(board.cards) == 1
+    key, card = next(iter(board.cards.items()))
+    assert key.startswith('user-steps:dup:')
+    assert a['requestId'] in key and b['requestId'] in key
+    assert a['requestId'] in card['body'] and b['requestId'] in card['body']
+    sessions_line = next(line for line in card['body'].splitlines() if line.startswith('- Sessions:'))
+    assert {part.strip() for part in sessions_line.split(':', 1)[1].split(',')} == {'session', 'session-b'}
