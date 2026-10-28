@@ -28,15 +28,27 @@ change.
 
 Clarifications preserve literal source choice labels and provide a free-text
 answer, without approval/plan controls. Answers never grant execution permission.
+The question's own "A, or B?" alternatives are buttons; a model option found
+verbatim is added when it is not already part of one. An "other" tail
+("something else", "neither") is never a button: the free-text answer covers it
+(a lone "something else" button once hid the real choice, desktop-1321064734).
 Existing revision-1 legacy clarifications receive a mechanical question-only
 revision, retaining their exact source and a server-owned migration receipt.
 
 Incomplete approvals are agent work: the producer rejects them with a completion
 instruction, and the buffered final gate nudges the agent to publish the exact
 inline plan with approve/change/decline choices. At budget exhaustion it withholds
-the approval ask. Existing incomplete cards say **Agent completion pending**; the
-user does not need to request a plan. Buttons retain 44px targets and owner/revision
-safety. A complete published request is not duplicated by prose extraction.
+the approval ask. Existing incomplete cards say **The agent asked you to approve
+this without a plan** and offer only **Ask agent for the plan** (drafts that ask
+in the composer) and **Dismiss** (hides that revision locally; a revised request
+shows again). No greyed-out Approve or "request changes" control. Buttons retain
+44px targets and owner/revision safety. A complete published request is not
+duplicated by prose extraction.
+
+`GET /ping` also returns `stale`: `answeredOpen` (open clarifications whose framed
+question already has a later user reply, i.e. chat retirement did not close them),
+`planPending` (plan-less asks waiting on the agent) and up to 20 `answeredOpenIds`.
+Read-only.
 
 Chat reconciliation retires source-bound clarification questions only, using the
 active same-session framed question and its first authentic user reply. Explicit

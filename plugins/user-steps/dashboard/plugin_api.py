@@ -175,7 +175,13 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
 
     @router.get('/ping')
     def ping():
-        return {'ok': True, 'api': API_VERSION}
+        out = {'ok': True, 'api': API_VERSION}
+        try:
+            # Requests still up after their question was answered (desktop-1321064734); >0 needs a look.
+            out['stale'] = _load('chat').stale_counts(_load('core'), store(), db=state_db)
+        except Exception:
+            out['stale'] = None
+        return out
 
     @router.get('/requests')
     def requests(session: str):

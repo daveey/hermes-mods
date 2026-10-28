@@ -1373,19 +1373,26 @@ def _question_alternatives(span: str, source: str) -> list[str]:
 
 
 def literal_options(step: dict) -> list[str]:
-    """Answer buttons for a legacy clarification: only text literally in the source."""
+    """Answer buttons for a legacy clarification: only text literally in the source.
+
+    The question's own 'A, or B?' alternatives come first, then any model option found
+    verbatim. An 'other' tail ('something else', 'neither') is never a button: the
+    free-text answer covers it, and a lone 'something else' button hid the real choice
+    (desktop-1321064734)."""
     source = _ws(step.get('paragraph') or step.get('text'))
     low = source.casefold()
-    out = []
+    found = []
     for o in step.get('options') or []:
         o = _ws(o)
-        if o and o.casefold() in low:
+        if o and o.casefold() in low and not _ALT_OTHER.match(o.strip(' .!?')):
             i = low.index(o.casefold())
-            out.append(source[i:i + len(o)])
-    if len(out) < 2:
-        derived = _question_alternatives(_ws(step.get('verbatim_span')), source)
-        if len(derived) > len(out):
-            out = derived
+            found.append(source[i:i + len(o)])
+    if len(found) >= 2:
+        out = found
+    else:
+        out = _question_alternatives(_ws(step.get('verbatim_span') or step.get('paragraph')), source)
+        # a model option that is part of a derived alternative is the same choice, not a second button
+        out += [x for x in found if not any(x.casefold() in y.casefold() for y in out)]
     return list(dict.fromkeys(out))[:4]
 
 

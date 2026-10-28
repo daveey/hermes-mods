@@ -72,6 +72,30 @@ def test_diplomacy_literal_options_untruncated():
         assert label[1:] in DIPLO['paragraph']
 
 
+# Live repro desktop-1321064734 (MacBook 2026-10-27): the model's options are a paraphrase ("Open a PR") plus a
+# literal "Something else"; the panel showed only "something else" and lost the real choice.
+PR_SPAN = 'Do you mean open a pull request implementing these strategy changes, or something else?'
+PR = dict(id='us_4e904be48c', session='s1', kind='choose', status='open', text='Choose: open a PR or something else',
+          verbatim_span=PR_SPAN, options=['Open a PR', 'Something else'],
+          paragraph='I can do that. ' + PR_SPAN)
+
+
+def test_reported_pr_question_keeps_its_real_option(env):
+    st, _ = env
+    assert core.literal_options(PR) == ['Open a pull request implementing these strategy changes']
+    r = st.migrate_step(OWNER, dict(PR))
+    assert r['kind'] == 'choice' and r['state'] == 'open' and r['scope']['complete'] is True
+    # one button per real option; "something else" is the free-text answer, not a dead button
+    assert labels(r) == ['Open a pull request implementing these strategy changes', 'Answer in your own words']
+    assert all(c['effect'] == 'answer' for c in r['choices'])
+
+
+def test_other_tail_alone_is_never_a_button():
+    step = dict(PR, options=['Something else', 'Neither'], verbatim_span='Should I add something else?',
+                paragraph='Should I add something else?')
+    assert core.literal_options(step) == []
+
+
 def test_validate_keeps_long_options():
     opt = "make a clearly labeled animation rebuilt from the replay's recorded moves"
     assert len(opt) > 60

@@ -10,7 +10,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 11
+const VERSION = 12
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -849,10 +849,11 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
   const legacyPlaceholder = c => c.id === 'request-context' && c.effect === 'revise' && c.label === 'Request complete action'
   const question = ['choice','input'].includes(r.kind)
   const approvalPending = !question && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !choices.some(c => c.effect === 'approve')))
-  const shown = choices.filter(c => !legacyPlaceholder(c) && (!approvalPending || c.effect !== 'revise'))
+  // A plan-less ask shows no greyed-out Approve and no "request changes": the user can only ask for the plan or hide it.
+  const shown = choices.filter(c => !legacyPlaceholder(c) && (!approvalPending || !['revise','approve'].includes(c.effect)))
   const approvalReason = approvalPending ? (r.kind === 'approval'
-    ? 'Agent completion pending — the agent must provide the full exact plan and approvable action. Work stays blocked; no action is needed from you.'
-    : 'Agent completion pending — the agent must provide the complete step. Work stays blocked; no action is needed from you.')
+    ? 'The agent asked you to approve this without a plan. Nothing can be approved until it posts one; no permission is granted.'
+    : 'The agent asked you to do this without a complete step. Nothing is needed until it posts one; no permission is granted.')
     : question && !shown.length ? 'Answer in chat — this question closes once your reply is recorded there. No permission is granted.' : ''
   const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: sessionBusy(state.operation) ? 'Decision recorded; waiting for the session to finish its current turn.' : 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
   return jsxs('article', { 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
@@ -869,8 +870,11 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : r.outcomes?.[selected.effect] || ''}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [
-      r.kind === 'approval' && !choices.some(c => c.effect === 'approve') && jsx('button', { type: 'button', style: choiceStyle('approve'), disabled: true, title: 'Agent completion pending.', children: 'Approve' }),
-      ...shown.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.effect), disabled: unavailable || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id))
+      ...shown.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.effect), disabled: unavailable || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id)),
+      ...(approvalPending ? [
+        jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),
+        jsx('button', { type: 'button', 'data-dismiss-request': '', style: actionStyle, title: 'Hide this until the agent posts a new revision', onClick: () => dismissRequest(r), children: 'Dismiss' }, 'dismiss')
+      ] : [])
     ] }),
     editing && jsxs('div', { onKeyDown: e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close() } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void send(editing) } }, children: [
       jsx('label', { children: jsxs('span', { children: ['Revision or answer', jsx('textarea', { ref: input, 'aria-label': 'Revision or answer', value: state.text || '', disabled: locked, onChange: e => update({ text: e.target.value }), rows: 3, style: { width: '100%', boxSizing: 'border-box', font: 'inherit', color: 'var(--foreground)', background: 'var(--card)', ...planStyle } })] }) }),
@@ -881,6 +885,24 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
 }
 
 const MINIMIZED_KEY = 'hermes.userSteps.minimized.v1'
+// A plan-less ask is agent work; the user may hide it. Keyed by revision, so a revised ask (the plan) shows again.
+const DISMISSED_REQ_KEY = 'hermes.userSteps.dismissedRequests.v1'
+function readDismissedRequests() {
+  try { const v = JSON.parse(window.localStorage.getItem(DISMISSED_REQ_KEY) || '[]'); return Array.isArray(v) ? v.filter(k => typeof k === 'string') : [] } catch { return [] }
+}
+const dismissedRequestKey = r => `${requestKey(r)}#${r.revision}`
+export const isRequestDismissed = r => readDismissedRequests().includes(dismissedRequestKey(r))
+export function dismissRequest(r) {
+  try { window.localStorage.setItem(DISMISSED_REQ_KEY, JSON.stringify([...new Set([...readDismissedRequests(), dismissedRequestKey(r)])].slice(-200))) } catch {}
+  canonical = { ...canonical }
+  canonicalSubs.forEach(fn => fn(canonical))
+}
+function askAgentForPlan(r, route) {
+  const session = route?.session || focusedId()
+  const what = r.kind === 'approval' ? 'the full plan' : 'the complete step'
+  void host.composer?.setDraft?.(session, `Please post ${what} for "${r.title}" (what exactly you will do, and its limits) so I can decide.\n`)
+  host.composer?.focus?.(session)
+}
 function readMinimized() {
   try { const v = JSON.parse(window.localStorage.getItem(MINIMIZED_KEY) || '[]'); return Array.isArray(v) ? v.filter(k => typeof k === 'string') : [] } catch { return [] }
 }
@@ -904,7 +926,7 @@ export function ActionQueue() {
     if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
     return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
   }
-  const requests = snap.requests.filter(r => (!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r))
+  const requests = snap.requests.filter(r => ((!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r)) && !(agentPending(r) && !needsReadback(r) && isRequestDismissed(r)))
   if (!requests.length && !snap.error) return null
   const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
   // Minimized holds only while every shown request was already shown when the user minimized; a new one (or a new

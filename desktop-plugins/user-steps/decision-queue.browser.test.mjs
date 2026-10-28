@@ -85,14 +85,16 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   await page.evaluate(value=>window.setRequests([value]),incomplete)
   const blocked=page.getByRole('article',{name:incomplete.title})
   await blocked.locator('[data-action-scope] [data-streamdown="strong"]').waitFor()
-  assert.equal(await blocked.getByRole('button',{name:'Approve',exact:true}).isDisabled(),true)
-  assert.match(await blocked.locator('[data-approval-blocked]').innerText(),/full exact plan/)
+  // desktop-1321064734: a plan-less ask offers exactly two things to do, never a greyed-out Approve
+  assert.equal(await blocked.getByRole('button',{name:'Approve',exact:true}).count(),0)
+  assert.deepEqual(await blocked.getByRole('button').allInnerTexts(),['Ask agent for the plan','Dismiss'])
+  assert.match(await blocked.locator('[data-approval-blocked]').innerText(),/without a plan/)
   for(const width of [640,360]){
    await page.setViewportSize({width,height:1000})
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
    if(screenshots)await page.locator('[data-action-queue]').screenshot({path:resolve(screenshots,`incomplete-${width}.png`)})
   }
-  assert.match(await blocked.locator('[data-agent-completion-pending]').innerText(),/Agent completion pending/)
+  assert.match(await blocked.locator('[data-agent-completion-pending]').innerText(),/asked you to approve this without a plan/)
   assert.equal(await blocked.getByRole('button',{name:/Request/}).count(),0)
   assert.equal(await page.evaluate(()=>window.posts.length),2,'agent completion does not require a user request')
   const question={...fixture,requestId:'00000000-0000-4000-8000-000000000092',kind:'choice',title:'Which output format?',scope:{complete:true,markdown:'Choose the output format.',sourceRefs:[]},outcomes:{answer:'Record the answer only; execution is not authorized.'},choices:[{id:'json',label:'JSON document',effect:'answer'},{id:'answer-text',label:'Something else',effect:'answer'}]}

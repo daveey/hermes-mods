@@ -44,9 +44,11 @@ def judged(system, user):
 def test_literal_options_and_non_authorizing_answer(env):
     st, r, _ = env
     assert r['state'] == 'open' and r['scope']['complete']
-    assert [c['label'] for c in r['choices']] == ['open a pull request', 'something else', 'Answer in your own words']
+    # desktop-1321064734: the question's real alternative is the button; 'something else' is the free-text answer
+    pr = 'Open a pull request implementing these strategy changes'
+    assert [c['label'] for c in r['choices']] == [pr, 'Answer in your own words']
     d = dict(requestId=r['requestId'], expectedRevision=1, choiceId='answer-0',
-             revisionText='open a pull request', idempotencyKey='test')
+             revisionText=pr, idempotencyKey='test')
     op = st.decide(OWNER, d)['operation']
     assert op['intent']['executionAuthorized'] is False
     assert op['intent']['permissionGrants'] == []
@@ -85,6 +87,19 @@ def test_unmatched_reply_remains_open(env):
     st, r, db = env
     assert chat.reconcile(core, st, OWNER, lambda *_: '{"outcome":"unmatched"}', db) == []
     assert st.get(OWNER, r['requestId'])['state'] == 'open'
+
+
+def test_stale_counts_flag_answered_but_open_until_retired(env):
+    """Detection (desktop-1321064734): a request still up after the user answered in chat is counted."""
+    st, r, db = env
+    ap = st.migrate_step(OWNER, dict(id='us_ap', text='Approve the deploy', paragraph='Want me to deploy?',
+                                     kind='approve', session='session', options=[]))
+    assert ap['state'] == 'needs_context'
+    got = chat.stale_counts(core, st, db)
+    assert got['answeredOpen'] == 1 and got['answeredOpenIds'] == [r['requestId']]
+    assert got['planPending'] == 1
+    chat.reconcile(core, st, OWNER, judged, db)
+    assert chat.stale_counts(core, st, db)['answeredOpen'] == 0
 
 
 def test_revision_and_owner_safety(env):
@@ -154,7 +169,8 @@ def test_existing_legacy_question_upgraded_and_chat_still_retires(env):
     upgraded = st.migrate_step(OWNER, dict(id='us_old', text=QUESTION, paragraph=QUESTION,
         kind='choose', session='session', options=['something else']))
     assert upgraded['revision'] == 2 and upgraded['state'] == 'open'
-    assert upgraded['choices'][0]['label'] == 'something else'
+    # desktop-1321064734: the real alternative, not a lone 'something else' button
+    assert upgraded['choices'][0]['label'] == 'Open a pull request implementing these strategy changes'
     with sqlite3.connect(db) as c:
         c.execute('UPDATE messages SET content=? WHERE id=1', (core.directive(['us_old'], 'session', QUESTION),))
     out = chat.reconcile(core, st, OWNER, judged, db, request_id=upgraded['requestId'], expected_revision=2)

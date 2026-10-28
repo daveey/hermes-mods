@@ -283,7 +283,10 @@ def test_rolling_card_create_update_archive_via_rest(home):
     app.include_router(api.create_router(home / "user-steps", home / "state.db", cards=board),
                        prefix="/api/plugins/user-steps")
     c = TestClient(app)
-    assert c.get("/api/plugins/user-steps/ping").json()["api"] >= 1
+    ping = c.get("/api/plugins/user-steps/ping").json()
+    assert ping["api"] >= 1
+    # detection field (desktop-1321064734): REST path reports stale counts, never errors
+    assert set(ping["stale"]) == {"answeredOpen", "planPending", "answeredOpenIds"}
     got = c.get("/api/plugins/user-steps/steps", params={"session": "S1"}).json()
     assert [s["id"] for s in got["steps"]] == ids and got["card"]["id"] == rows[0][0]  # oldest first
     one = c.get("/api/plugins/user-steps/step", params={"id": ids[0], "s": "S1"}).json()["step"]

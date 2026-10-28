@@ -99,6 +99,33 @@ def evidence(core, request, db, store):
             'hashes': [hashlib.sha256((r['content'] or '').encode()).hexdigest() for r in selected]}
 
 
+def stale_counts(core, store, db=None, limit=500):
+    """Detection for desktop-1321064734: unresolved panel requests that should not still be up.
+
+    answeredOpen = open clarifications whose framed question already has a later user reply
+    (chat reconcile runs every turn, so these are unmatched/failed retirements to look at);
+    planPending = plan-less asks waiting on the agent. Read-only; changes nothing."""
+    db = db or core._state_db()
+    with store._tx() as c:
+        rows = c.execute(
+            'SELECT r.state, v.body FROM requests r JOIN revisions v ON v.namespace=r.namespace AND v.id=r.id '
+            "AND v.revision=r.revision WHERE r.state IN ('open','needs_context') AND r.resolution IS NULL "
+            'ORDER BY r.rowid DESC LIMIT ?', (limit,)).fetchall()
+    answered, pending = [], []
+    for row in rows:
+        r = json.loads(row['body'])
+        r['state'] = row['state']
+        if r['kind'] in ('choice', 'input'):
+            try:
+                if evidence(core, r, db, store):
+                    answered.append(r['requestId'])
+            except (sqlite3.Error, OSError, KeyError, ValueError):
+                continue
+        elif not r['scope']['complete'] or r['state'] != 'open':
+            pending.append(r['requestId'])
+    return {'answeredOpen': len(answered), 'planPending': len(pending), 'answeredOpenIds': answered[:20]}
+
+
 def reconcile(core, store, owner, judge=llm, db=None, *, request_id=None, expected_revision=None):
     """Read authentic evidence, judge scope, then CAS and recheck evidence.
 
