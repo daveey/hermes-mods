@@ -54,20 +54,35 @@ SCRIPT_EXTS = {"", ".sh", ".bash", ".zsh", ".ksh", ".command", ".py"}
 MAX_SCRIPT_BYTES = 256 * 1024
 MAX_DEPTH = 2
 _TOKEN = r"([^\s;&|<>()'\"`]+)"
+# A shell word that may be single- or double-quoted (quoted paths can contain spaces). Three groups;
+# _word() returns the one that matched.
+_QTOKEN = r"(?:'([^']+)'|\"([^\"]+)\"|" + _TOKEN + ")"
 # `bash x.sh`, `sh -x x`, `source x`, `. x`, `python3 x.py` anywhere in the command (also inside
 # terminal('...') strings in execute_code).
 INTERP_RE = re.compile(
-    r"(?:^|(?<=[\s;&|(`'\"]))(?:bash|sh|zsh|dash|ksh|source|\.)(?:\s+-[-\w]+)*\s+" + _TOKEN, re.M
+    r"(?:^|(?<=[\s;&|(`'\"]))(?:bash|sh|zsh|dash|ksh|source|\.)(?:\s+-[-\w]+)*\s+" + _QTOKEN, re.M
 )
-PY_FILE_RE = re.compile(r"(?:^|(?<=[\s;&|(`'\"]))python[\d.]*(?:\s+-[-\w]+)*\s+" + r"([^\s;&|<>()'\"`]+\.py)\b", re.M)
+PY_FILE_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`'\"]))python[\d.]*(?:\s+-[-\w]+)*\s+"
+    r"(?:'([^']+\.py)'|\"([^\"]+\.py)\"|([^\s;&|<>()'\"`]+\.py)\b)",
+    re.M,
+)
 # A path in command position: `./x.sh`, `/abs/load-suite`, `nohup ~/x &`.
 CMD_POS_RE = re.compile(
     r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*)\s+)*"
-    r"((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+)"
+    r"(?:'((?:~|\.{1,2})?/[^']+)'|\"((?:~|\.{1,2})?/[^\"]+)\"|((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+))"
 )
 
 # `cd DIR` / `pushd DIR`: later relative script paths in the same command resolve against DIR.
-CD_RE = re.compile(r"(?:^|(?<=[\s;&|(`'\"]))(?:cd|pushd)(?:\s+-[LPe@]+)*\s+" + _TOKEN, re.M)
+CD_RE = re.compile(r"(?:^|(?<=[\s;&|(`'\"]))(?:cd|pushd)(?:\s+-[LPe@]+)*\s+" + _QTOKEN, re.M)
+
+
+def _word(m: re.Match) -> tuple[int, str]:
+    """(offset, text) of whichever quoted/unquoted alternative matched."""
+    for i in range(1, (m.re.groups or 0) + 1):
+        if m.group(i) is not None:
+            return m.start(i), m.group(i)
+    return m.start(), ""
 
 
 def _hostnames() -> set[str]:
@@ -256,13 +271,12 @@ def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
     if depth >= MAX_DEPTH:
         return None
     base = cwd or os.getcwd()
-    cds = [(m.start(), m.group(1)) for m in CD_RE.finditer(text)]
-    hits = sorted(
-        (m.start(1), m.group(1)) for r in (INTERP_RE, PY_FILE_RE, CMD_POS_RE) for m in r.finditer(text)
-    )
+    cds = [(m.start(), _word(m)[1]) for m in CD_RE.finditer(text)]
+    hits = sorted(_word(m) for r in (INTERP_RE, PY_FILE_RE, CMD_POS_RE) for m in r.finditer(text))
     seen = set()
     for pos, tok in hits:
-        p = _resolve(tok, _cwd_at(pos, cds, base))
+        here = _cwd_at(pos, cds, base)
+        p = _resolve(tok, here)
         if not p or p in seen:
             continue
         seen.add(p)
@@ -270,7 +284,11 @@ def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
             content = p.read_text(errors="replace")
         except OSError:
             continue
-        why = check_file(p, content, str(p.parent), depth + 1)
+        # bash resolves relative paths inside the script against the caller's cwd; the script's own
+        # directory is checked too, for scripts that cd to their own dir first.
+        why = check_file(p, content, here, depth + 1)
+        if not why and str(p.parent) != here:
+            why = check_file(p, content, str(p.parent), depth + 1)
         if why:
             return f"{why}, in script {p.name}"
     return None

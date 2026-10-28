@@ -315,3 +315,69 @@ def test_persisted_cwd_lookup_failure_is_harmless(tmp_path, monkeypatch):
     assert run("terminal", {"command": "bash load-suite.sh"}) is None
     _load_dir(tmp_path)
     assert run("terminal", {"command": "cd repo && bash load-suite.sh"})["action"] == "block"
+
+
+def _spaced_dir(tmp_path):
+    d = tmp_path / "with space"
+    d.mkdir()
+    p = d / "load-suite.sh"
+    p.write_text(LOAD_SUITE)
+    p.chmod(0o755)
+    return d
+
+
+@pytest.mark.parametrize("fmt", [
+    "cd '{d}' && ./load-suite.sh",
+    'cd "{d}"; bash load-suite.sh',
+    "pushd '{d}' >/dev/null && sh load-suite.sh",
+    'cd "{s}" && ./load-suite.sh',
+    "cd '{s}'; bash load-suite.sh",
+    'bash "{s}/load-suite.sh"',
+    "source '{s}/load-suite.sh'",
+    '"{s}/load-suite.sh" &',
+    "nohup '{s}/load-suite.sh' >/dev/null 2>&1 &",
+])
+def test_quoted_cd_and_script_paths_block(tmp_path, monkeypatch, fmt):
+    d = _load_dir(tmp_path)
+    s = _spaced_dir(tmp_path)
+    monkeypatch.chdir("/")
+    cmd = fmt.format(d=d, s=s)
+    for bg in (False, True):
+        r = run("terminal", {"command": cmd, "background": bg})
+        assert r and r["action"] == "block", cmd
+    code = "from hermes_tools import terminal\nterminal(" + repr(cmd) + ")"
+    r = run("execute_code", {"code": code})
+    assert r and r["action"] == "block", cmd
+
+
+def test_quoted_python_file_blocks(tmp_path, monkeypatch):
+    s = tmp_path / "with space"
+    s.mkdir()
+    (s / "burn.py").write_text(
+        "import os, subprocess\nfor _ in range(os.cpu_count()):\n    subprocess.Popen(['yes'], stdout=subprocess.DEVNULL)\n"
+    )
+    monkeypatch.chdir("/")
+    for cmd in (f'python3 "{s}/burn.py"', f"cd '{s}' && python3 burn.py"):
+        r = run("terminal", {"command": cmd})
+        assert r and r["action"] == "block", cmd
+
+
+def test_quoted_cd_elsewhere_allows(tmp_path, monkeypatch):
+    d = _load_dir(tmp_path)
+    monkeypatch.chdir(d)
+    other = tmp_path / "other dir"
+    other.mkdir()
+    (other / "load-suite.sh").write_text("#!/bin/bash\npytest -n 2\n")
+    assert run("terminal", {"command": f'cd "{other}" && bash load-suite.sh'}) is None
+    assert run("terminal", {"command": f"echo 'cd {d}' && bash --version"}) is None
+
+
+def test_nested_script_relative_path_uses_caller_cwd(tmp_path, monkeypatch):
+    # bash resolves a relative path inside outer.sh against the caller's cwd, not outer.sh's directory.
+    d = _load_dir(tmp_path)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "outer.sh").write_text("#!/bin/bash\nbash load-suite.sh\n")
+    monkeypatch.chdir("/")
+    r = run("terminal", {"command": f"cd {d} && bash {scripts}/outer.sh"})
+    assert r and r["action"] == "block"
