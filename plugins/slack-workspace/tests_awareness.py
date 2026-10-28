@@ -112,6 +112,17 @@ def test_display_keeps_late_update_after_large_old_thread(monkeypatch):
     assert "message truncated" in text
 
 
+def test_slack_bounds_always_have_six_decimals_for_history_and_replies():
+    calls = []
+    def api(method, params):
+        calls.append(method)
+        for key in ("oldest", "latest"):
+            assert len(params[key].split(".")[1]) == 6
+        return {"messages": [{"ts": str(NOW-100), "reply_count": 1}]} if method.endswith("history") else {"messages": []}
+    a.collect(api, "C1", now=NOW + .1234567)
+    assert calls == ["conversations.history", "conversations.replies"]
+
+
 def test_repeated_cursor_and_missing_cursor_report_incomplete():
     for response in ({"has_more": True}, {"response_metadata": {"next_cursor": "same"}}):
         _, warnings = a.collect(lambda *args: {"messages": [], **response}, "C1", now=NOW)

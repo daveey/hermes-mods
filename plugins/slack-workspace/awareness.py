@@ -73,16 +73,19 @@ def collect(api, channel: str, *, now: float, current_ts: str = "") -> tuple[lis
         if since <= stamp <= now and ts != current_ts and row.get("subtype") != "message_deleted":
             rows[ts] = row
 
+    # Slack silently returns empty pages for timestamps with >6 decimals.
+    # time.time()'s default str() often has seven; always use Slack precision.
+    oldest, latest = f"{since:.6f}", f"{now:.6f}"
     roots = []
-    for page in pages("conversations.history", {"channel": channel, "oldest": str(since),
-                                               "latest": str(now), "inclusive": True, "limit": 100}):
+    for page in pages("conversations.history", {"channel": channel, "oldest": oldest,
+                                               "latest": latest, "inclusive": True, "limit": 100}):
         for row in page:
             remember(row)
             if row.get("reply_count"):
                 roots.append(row)
     for root in roots:
         for page in pages("conversations.replies", {"channel": channel, "ts": root["ts"],
-                                                   "oldest": str(since), "latest": str(now),
+                                                   "oldest": oldest, "latest": latest,
                                                    "inclusive": True, "limit": 100}):
             for row in page:
                 remember(row)

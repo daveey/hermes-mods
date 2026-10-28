@@ -25,7 +25,8 @@ Tests (offline):
     uv run --with pytest --with pyyaml python -m pytest -q -p no:cacheprovider plugins/slack-workspace/tests_awareness.py
 
 Coverage: top-level cross-thread context including bot replies; history/replies pagination;
-current/future/old exclusions; CLI/DM isolation; failure redaction; request/display bounds; late
+current/future/old exclusions; six-decimal Slack timestamp bounds on history and replies;
+CLI/DM isolation; failure redaction; request/display bounds; late
 status updates after a large old thread; repeated/missing cursors; context-only registration with
 no tools/handlers and profile-bound credentials. Model compliance with the capability guidance
 is not guaranteed by these deterministic tests.
