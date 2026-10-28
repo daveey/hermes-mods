@@ -290,7 +290,9 @@ REPORTED_RE = re.compile(r"\bfollow-through:\s*SENT\b", re.I)
 FAILED_SEND_RE = re.compile(r"\"?ok\"?\s*:\s*false|\bno connected\b|\b(?:send|delivery) failed\b"
                             r"|\bfailed to (?:send|deliver)\b|\berror\b|\bnot (?:actually )?(?:sent|delivered|messaged)\b",
                             re.I)
-_DQUOTED = re.compile(r"\"[^\"\n]{0,400}\"|\u201c[^\u201d\n]{0,400}\u201d")
+# Quotes may span lines: self-heal cards quote the user's multi-line message ('Quote: "...\nOrigin @session:X ..."'),
+# and an origin named inside someone else's words is not this card's origin chat.
+_DQUOTED = re.compile(r"\"[^\"]{0,1200}\"|\u201c[^\u201d]{0,1200}\u201d")
 
 
 def origin_sessions(text: str) -> list[str]:
