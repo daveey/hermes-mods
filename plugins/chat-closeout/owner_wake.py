@@ -31,6 +31,20 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+
+def _ro_connect(path, timeout: float = 2.0) -> sqlite3.Connection:
+    """Read-only open. ``mode=ro`` fails on a WAL db whose -wal/-shm writers deleted on last close, so fall back to
+    ``mode=rw`` + ``query_only`` (reads the same data, never writes rows; ``mode=rw`` never creates a missing db)."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 logger = logging.getLogger("chat_closeout.owner_wake")
 
 MAX_WAKES_PER_CHAT_HOUR = 3
@@ -318,7 +332,7 @@ def chat_info_from(state_dbs: Callable[[], list[Path]], tip: Callable[[str], Opt
         failed = False
         for path in state_dbs():
             try:
-                c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+                c = _ro_connect(path, timeout=2)
             except sqlite3.Error:
                 failed = True
                 continue

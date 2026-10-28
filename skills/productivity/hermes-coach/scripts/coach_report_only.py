@@ -19,6 +19,20 @@ coach_weekly.py calls section() so the split shows up in the weekly output.
 import argparse, json, os, random, re, sqlite3, sys, time
 from pathlib import Path
 
+
+def _ro_connect(path, timeout: float = 2.0) -> sqlite3.Connection:
+    """Read-only open. ``mode=ro`` fails on a WAL db whose -wal/-shm writers deleted on last close, so fall back to
+    ``mode=rw`` + ``query_only`` (reads the same data, never writes rows; ``mode=rw`` never creates a missing db)."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
@@ -85,7 +99,7 @@ def _text(c):
 def extract_turns(db, since, until=None, sources=("desktop",)):
     """Final-reply turns of top-level sessions active since `since` (epoch). Read-only."""
     until = until or time.time()
-    con = sqlite3.connect(f"file:{os.path.expanduser(str(db))}?mode=ro", uri=True)
+    con = _ro_connect(os.path.expanduser(str(db)), timeout=10)
     con.row_factory = sqlite3.Row
     marks = ",".join("?" * len(sources))
     sess = con.execute(f"select id, model, source from sessions where parent_session_id is null and source in ({marks}) "
