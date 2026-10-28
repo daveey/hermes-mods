@@ -91,6 +91,121 @@ def test_execute_code_allows():
     assert run("execute_code", {"code": "x=[i*i for i in range(1000)]"}) is None
 
 
+def test_execute_code_quoted_yes_without_spawn_allows():
+    # A quoted 'yes' that is never launched is not a burner, even beside a wide range().
+    assert run("execute_code", {"code": "ans = 'yes'\nfor i in range(100): print(i)"}) is None
+    assert run("execute_code", {"code": "if reply in ('yes', 'y'):\n    for i in range(64): pass"}) is None
+    assert run("execute_code", {"code": "names = ['stress', 'yes']\nprint(len(range(32)))"}) is None
+
+
+# --- the incident vector: write a load script, then run it -------------------------------------
+
+# Reconstruction of the worker's load-suite.sh (run 2): a loader starting one `yes` per core,
+# pgrep checks, then ten suite runs.
+LOAD_SUITE = """#!/bin/bash
+set -u
+NCPU=$(sysctl -n hw.ncpu)
+start_load() {
+  for i in $(seq 1 "$NCPU"); do
+    yes > /dev/null &
+  done
+}
+start_load
+for run in $(seq 1 10); do
+  yes=$(pgrep -x yes | wc -l)
+  echo "RUN $run at $(date +%T) yes=$yes load=$(uptime)"
+  python -m pytest -q tests/test_browser_agent_retirement.py
+done
+"""
+LOADER_NOHUP = "#!/bin/sh\nnohup bash -c 'for i in $(seq $(sysctl -n hw.ncpu)); do yes >/dev/null & done; wait' &\n"
+PY_LOADER = "import os, subprocess\nfor _ in range(os.cpu_count()):\n    subprocess.Popen(['yes'], stdout=subprocess.DEVNULL)\n"
+
+
+@pytest.mark.parametrize("content", [LOAD_SUITE, LOADER_NOHUP])
+@pytest.mark.parametrize("name", ["load-suite.sh", "load-suite", "run.bash"])
+def test_write_file_of_load_script_blocks(tmp_path, content, name):
+    r = run("write_file", {"path": str(tmp_path / name), "content": content})
+    assert r and r["action"] == "block" and "hermes-hub" in r["message"]
+
+
+def test_write_file_of_python_loader_blocks(tmp_path):
+    r = run("write_file", {"path": str(tmp_path / "load.py"), "content": PY_LOADER})
+    assert r and r["action"] == "block"
+
+
+def test_patch_adding_load_blocks(tmp_path):
+    p = tmp_path / "load-suite.sh"
+    r = run("patch", {"path": str(p), "old_string": "start_load\n", "new_string": LOAD_SUITE})
+    assert r and r["action"] == "block"
+    r = run("patch", {"mode": "patch", "patch": f"*** Begin Patch\n*** Update File: {tmp_path}/x.sh\n+" + "\n+".join(LOAD_SUITE.splitlines())})
+    assert r and r["action"] == "block"
+    r = run("mcp__skill_manage", {"operations": []})
+    assert r is None
+
+
+def test_write_file_allows_normal_scripts_and_docs(tmp_path):
+    assert run("write_file", {"path": str(tmp_path / "ok.sh"), "content": "#!/bin/bash\npytest -n 2\n"}) is None
+    assert run("write_file", {"path": str(tmp_path / "ok.py"), "content": "ans = 'yes'\nfor i in range(100): print(i)\n"}) is None
+    # Documentation that quotes the pattern is not executable.
+    assert run("write_file", {"path": str(tmp_path / "NOTES.md"), "content": LOAD_SUITE}) is None
+
+
+@pytest.mark.parametrize("fmt", [
+    "bash {p}", "sh {p}", "zsh {p}", "source {p}", ". {p}", "bash -x {p} arg", "cd /tmp && bash {p}",
+    "nohup bash {p} > log 2>&1 &", "{p}", "./{n}",
+])
+def test_terminal_running_load_script_blocks(tmp_path, fmt):
+    p = tmp_path / "load-suite.sh"
+    p.write_text(LOAD_SUITE)
+    p.chmod(0o755)
+    cmd = fmt.format(p=p, n=p.name)
+    r = run("terminal", {"command": cmd, "workdir": str(tmp_path)})
+    assert r and r["action"] == "block", cmd
+    r = run("terminal", {"command": cmd, "workdir": str(tmp_path), "background": True})
+    assert r and r["action"] == "block", cmd
+
+
+def test_terminal_running_python_loader_blocks(tmp_path):
+    p = tmp_path / "load.py"
+    p.write_text(PY_LOADER)
+    for cmd in (f"python3 {p}", f"python {p}", "python3 load.py", "uv run python load.py"):
+        r = run("terminal", {"command": cmd, "workdir": str(tmp_path)})
+        assert r and r["action"] == "block", cmd
+
+
+def test_terminal_script_nested_one_level_blocks(tmp_path):
+    (tmp_path / "loader.sh").write_text(LOADER_NOHUP)
+    (tmp_path / "suite.sh").write_text(f"#!/bin/bash\nbash {tmp_path}/loader.sh\npytest -q\n")
+    r = run("terminal", {"command": f"bash {tmp_path}/suite.sh"})
+    assert r and r["action"] == "block"
+
+
+def test_execute_code_running_load_script_blocks(tmp_path):
+    p = tmp_path / "load-suite.sh"
+    p.write_text(LOAD_SUITE)
+    code = f"from hermes_tools import terminal\nterminal('bash {p}')"
+    r = run("execute_code", {"code": code})
+    assert r and r["action"] == "block"
+
+
+def test_terminal_running_benign_script_allows(tmp_path):
+    p = tmp_path / "ok.sh"
+    p.write_text("#!/bin/bash\npytest -n 2\nfor i in $(seq 1 $(nproc)); do echo $i; done\n")
+    assert run("terminal", {"command": f"bash {p}"}) is None
+    assert run("terminal", {"command": "bash /nonexistent/x.sh"}) is None
+    assert run("terminal", {"command": "source ~/.bashrc && echo hi"}) is None
+
+
+def test_terminal_inline_python_blocks():
+    cmd = "python3 -c 'import subprocess,os;[subprocess.Popen([\"yes\"],stdout=-3) for _ in range(os.cpu_count())]'"
+    r = run("terminal", {"command": cmd})
+    assert r and r["action"] == "block"
+    heredoc = "python3 - <<'EOF'\n" + PY_LOADER + "EOF"
+    r = run("terminal", {"command": heredoc})
+    assert r and r["action"] == "block"
+    assert run("terminal", {"command": "python3 -c 'print(\"yes\"); print(list(range(100)))'"}) is None
+
+
 def test_wrapped_tool_call_and_process_write():
     r = run("tool_call", {"calls": [{"name": "mcp__terminal", "arguments": {"command": "stress-ng --cpu 16"}}]})
     assert r and r["action"] == "block"

@@ -37,10 +37,33 @@ BG_BURNER_RE = re.compile(
     r"|while\s*(?::|true|\[\s*1\s*\])\s*;?\s*do\s*(?::|true)?\s*;?\s*done\s*&(?!&))",
     re.I,
 )
-PY_BURNER_RE = re.compile(
-    r"while\s+(?:True|1)\s*:\s*(?:pass|continue)\b|while\s+(?:True|1)\s*:\s*\n\s+(?:pass|continue)\b|"
-    r"[\"'](?:yes|stress|stress-ng|sha256sum|md5sum|lookbusy)[\"']",
-    re.I,
+PY_BUSY_RE = re.compile(
+    r"while\s+(?:True|1)\s*:\s*(?:pass|continue)\b|while\s+(?:True|1)\s*:\s*\n\s+(?:pass|continue)\b"
+)
+_PY_BURNERS = r"(?:yes|stress|stress-ng|sha256sum|md5sum|lookbusy|sysbench)"
+# A burner name counts only when it is launched: the first argument of a spawn call ...
+PY_SPAWN_CALL_RE = re.compile(
+    r"\b(?:Popen|run|call|check_call|check_output|system|popen|getoutput|getstatusoutput|"
+    r"spawn\w*|exec[lv]p?e?|create_subprocess_(?:exec|shell))\s*\(\s*\[?\s*[\"']" + _PY_BURNERS + r"\b"
+)
+# ... or the head of an argv list in code that spawns processes at all.
+PY_ARGV_RE = re.compile(r"\[\s*[\"']" + _PY_BURNERS + r"[\"']\s*[,\]]")
+PY_SPAWNS_RE = re.compile(r"\bsubprocess\b|\bos\.(?:system|popen|spawn|exec)|\bPopen\b|create_subprocess_")
+
+SCRIPT_EXTS = {"", ".sh", ".bash", ".zsh", ".ksh", ".command", ".py"}
+MAX_SCRIPT_BYTES = 256 * 1024
+MAX_DEPTH = 2
+_TOKEN = r"([^\s;&|<>()'\"`]+)"
+# `bash x.sh`, `sh -x x`, `source x`, `. x`, `python3 x.py` anywhere in the command (also inside
+# terminal('...') strings in execute_code).
+INTERP_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(`'\"]))(?:bash|sh|zsh|dash|ksh|source|\.)(?:\s+-[-\w]+)*\s+" + _TOKEN, re.M
+)
+PY_FILE_RE = re.compile(r"(?:^|(?<=[\s;&|(`'\"]))python[\d.]*(?:\s+-[-\w]+)*\s+" + r"([^\s;&|<>()'\"`]+\.py)\b", re.M)
+# A path in command position: `./x.sh`, `/abs/load-suite`, `nohup ~/x &`.
+CMD_POS_RE = re.compile(
+    r"(?:^|[;&|(\n`'\"])\s*(?:(?:nohup|exec|time|nice(?:\s+-n\s*-?\d+)?|setsid|caffeinate(?:\s+-\w+)*)\s+)*"
+    r"((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+)"
 )
 
 
@@ -148,9 +171,17 @@ def _wide_arg(arg: str) -> bool:
     return True  # $(nproc), $N, `...`: unknown count, treat as per-core
 
 
-def check_shell(text: str) -> str | None:
+def check_shell(text: str, cwd: str | None = None, depth: int = 0) -> str | None:
+    """Check shell text, inline Python in it, and local scripts it runs (size- and depth-capped)."""
     if not text or not text.strip():
         return None
+    why = _check_shell_text(text) or _check_py_text(text)  # python3 -c '...', python3 - <<EOF
+    if why:
+        return why
+    return _check_scripts_run(text, cwd, depth)
+
+
+def _check_shell_text(text: str) -> str | None:
     t = threshold()
     if STRESS_RE.search(text):
         for arg in _count_flag(text, r"--cpu|-c"):
@@ -168,15 +199,75 @@ def check_shell(text: str) -> str | None:
     return None
 
 
-def check_python(code: str) -> str | None:
-    if not code or not code.strip():
-        return None
-    why = check_shell(code)  # terminal("..."), subprocess.run("stress-ng ..."), os.system
-    if why:
-        return why
-    if PY_BURNER_RE.search(code) and _fan_out_wide(code):
+def _check_py_text(code: str) -> str | None:
+    spawns = bool(PY_SPAWN_CALL_RE.search(code)) or (bool(PY_ARGV_RE.search(code)) and bool(PY_SPAWNS_RE.search(code)))
+    if (spawns or PY_BUSY_RE.search(code)) and _fan_out_wide(code):
         return f"a Python/subprocess CPU burner fanned out to about one per core (>= {threshold()} of {ncpu()} cores)"
     return None
+
+
+def check_python(code: str, cwd: str | None = None, depth: int = 0) -> str | None:
+    if not code or not code.strip():
+        return None
+    # terminal("..."), subprocess.run("stress-ng ..."), os.system, terminal("bash load.sh")
+    return check_shell(code, cwd, depth)
+
+
+def _resolve(token: str, cwd: str | None) -> Path | None:
+    if not token or token.startswith("-") or "$" in token:
+        return None
+    p = Path(os.path.expanduser(token))
+    if not p.is_absolute():
+        p = Path(cwd or os.getcwd()) / p
+    try:
+        if p.is_file() and p.stat().st_size <= MAX_SCRIPT_BYTES:
+            return p
+    except OSError:
+        pass
+    return None
+
+
+def _is_python(path: Path, content: str) -> bool:
+    return path.suffix == ".py" or bool(re.match(r"#!\S*(?:\s+\S+)?\s*python", content))
+
+
+def check_file(path: Path, content: str, cwd: str | None = None, depth: int = 0) -> str | None:
+    if _is_python(path, content):
+        return check_python(content, cwd, depth)
+    return check_shell(content, cwd, depth)
+
+
+def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
+    if depth >= MAX_DEPTH:
+        return None
+    tokens = [m.group(1) for r in (INTERP_RE, PY_FILE_RE, CMD_POS_RE) for m in r.finditer(text)]
+    seen = set()
+    for tok in tokens:
+        p = _resolve(tok, cwd)
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        try:
+            content = p.read_text(errors="replace")
+        except OSError:
+            continue
+        why = check_file(p, content, str(p.parent), depth + 1)
+        if why:
+            return f"{why}, in script {p.name}"
+    return None
+
+
+def is_script_path(path: str, content: str = "") -> bool:
+    return Path(path).suffix.lower() in SCRIPT_EXTS  # docs (.md/.txt) quoting a burner are not run
+
+
+def check_write(path: str, content: str) -> str | None:
+    """Check text about to be written to a script file (write_file, patch)."""
+    if not content or not is_script_path(path, content):
+        return None
+    p = Path(os.path.expanduser(path or "x"))
+    why = check_file(p, content, str(p.parent))
+    return f"{why}, written to {p.name}" if why else None
 
 
 def message(why: str) -> str:
