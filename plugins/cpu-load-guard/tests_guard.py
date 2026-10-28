@@ -229,3 +229,89 @@ def test_default_protects_laptop(monkeypatch):
     assert plugin.guard.enabled()
     monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "hermes-hub")
     assert not plugin.guard.enabled()
+
+
+# --- relative script paths: `cd` in the command and the terminal's persisted cwd ----------------
+
+def _load_dir(tmp_path):
+    d = tmp_path / "repo"
+    d.mkdir()
+    p = d / "load-suite.sh"
+    p.write_text(LOAD_SUITE)
+    p.chmod(0o755)
+    return d
+
+
+@pytest.mark.parametrize("fmt", [
+    "cd {d} && ./load-suite.sh",
+    "cd {d}; bash load-suite.sh",
+    "cd {d} && nohup ./load-suite.sh > log 2>&1 &",
+    "pushd {d} >/dev/null && sh load-suite.sh",
+    "cd {parent} && cd repo && bash load-suite.sh",
+    "cd ~/{rel} && ./load-suite.sh",
+])
+def test_cd_then_relative_script_blocks(tmp_path, monkeypatch, fmt):
+    d = _load_dir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir("/")  # the agent process is elsewhere
+    cmd = fmt.format(d=d, parent=tmp_path, rel="repo")
+    for bg in (False, True):
+        r = run("terminal", {"command": cmd, "background": bg})
+        assert r and r["action"] == "block", cmd
+
+
+def test_cd_elsewhere_then_relative_script_allows(tmp_path, monkeypatch):
+    d = _load_dir(tmp_path)
+    monkeypatch.chdir(d)  # the script is in the process cwd, but the command cds away first
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "load-suite.sh").write_text("#!/bin/bash\npytest -n 2\n")
+    assert run("terminal", {"command": f"cd {other} && bash load-suite.sh"}) is None
+
+
+def test_execute_code_cd_then_relative_script_blocks(tmp_path, monkeypatch):
+    d = _load_dir(tmp_path)
+    monkeypatch.chdir("/")
+    code = f"from hermes_tools import terminal\nterminal('cd {d} && ./load-suite.sh')"
+    r = run("execute_code", {"code": code})
+    assert r and r["action"] == "block"
+
+
+def _fake_terminal_tool(monkeypatch, session_cwd=None, env_cwd=None):
+    import sys
+    import threading
+    import types
+
+    fake = types.ModuleType("tools.terminal_tool")
+    fake._env_lock = threading.Lock()
+    env = types.SimpleNamespace(cwd=env_cwd) if env_cwd else None
+    fake._active_environments = {"default": env} if env else {}
+    fake._resolve_container_task_id = lambda tid: "default"
+    fake._lookup_active_env = lambda eff, tid: fake._active_environments.get(eff)
+    fake.get_session_cwd = lambda key: session_cwd
+    pkg = types.ModuleType("tools")
+    pkg.terminal_tool = fake
+    monkeypatch.setitem(sys.modules, "tools", pkg)
+    monkeypatch.setitem(sys.modules, "tools.terminal_tool", fake)
+
+
+@pytest.mark.parametrize("cmd", ["bash load-suite.sh", "./load-suite.sh", "sh load-suite.sh &"])
+@pytest.mark.parametrize("where", ["env", "session"])
+def test_persisted_terminal_cwd_script_blocks(tmp_path, monkeypatch, cmd, where):
+    d = _load_dir(tmp_path)
+    monkeypatch.chdir("/")
+    _fake_terminal_tool(monkeypatch, **({"env_cwd": str(d)} if where == "env" else {"session_cwd": str(d)}))
+    r = plugin._pre_tool_call(tool_name="terminal", args={"command": cmd}, task_id="t1", session_id="s1")
+    assert r and r["action"] == "block", (cmd, where)
+    code = f"from hermes_tools import terminal\nterminal('{cmd}')"
+    r = plugin._pre_tool_call(tool_name="execute_code", args={"code": code}, task_id="t1")
+    assert r and r["action"] == "block", (cmd, where)
+
+
+def test_persisted_cwd_lookup_failure_is_harmless(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "tools.terminal_tool", None)  # import fails
+    monkeypatch.chdir(tmp_path)
+    assert run("terminal", {"command": "bash load-suite.sh"}) is None
+    _load_dir(tmp_path)
+    assert run("terminal", {"command": "cd repo && bash load-suite.sh"})["action"] == "block"

@@ -66,6 +66,9 @@ CMD_POS_RE = re.compile(
     r"((?:~|\.{1,2})?/[^\s;&|<>()'\"`]+)"
 )
 
+# `cd DIR` / `pushd DIR`: later relative script paths in the same command resolve against DIR.
+CD_RE = re.compile(r"(?:^|(?<=[\s;&|(`'\"]))(?:cd|pushd)(?:\s+-[LPe@]+)*\s+" + _TOKEN, re.M)
+
 
 def _hostnames() -> set[str]:
     names = set()
@@ -237,13 +240,29 @@ def check_file(path: Path, content: str, cwd: str | None = None, depth: int = 0)
     return check_shell(content, cwd, depth)
 
 
+def _cwd_at(pos: int, cds: list[tuple[int, str]], base: str) -> str:
+    """The shell's cwd at offset *pos*: *base* with every earlier `cd`/`pushd` applied."""
+    cwd = base
+    for start, target in cds:
+        if start >= pos:
+            break
+        if target == "-" or "$" in target:
+            continue  # unknown target; keep the last known directory
+        cwd = os.path.normpath(os.path.join(cwd, os.path.expanduser(target)))
+    return cwd
+
+
 def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
     if depth >= MAX_DEPTH:
         return None
-    tokens = [m.group(1) for r in (INTERP_RE, PY_FILE_RE, CMD_POS_RE) for m in r.finditer(text)]
+    base = cwd or os.getcwd()
+    cds = [(m.start(), m.group(1)) for m in CD_RE.finditer(text)]
+    hits = sorted(
+        (m.start(1), m.group(1)) for r in (INTERP_RE, PY_FILE_RE, CMD_POS_RE) for m in r.finditer(text)
+    )
     seen = set()
-    for tok in tokens:
-        p = _resolve(tok, cwd)
+    for pos, tok in hits:
+        p = _resolve(tok, _cwd_at(pos, cds, base))
         if not p or p in seen:
             continue
         seen.add(p)

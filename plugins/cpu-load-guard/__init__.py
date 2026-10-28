@@ -70,15 +70,47 @@ def _check_patch(args: dict) -> Optional[str]:
     return guard.check_write(path or "patch.sh", content)
 
 
-def classify(tool_name: str, args: Any) -> Optional[str]:
+def live_terminal_cwd(task_id: str = "", session_id: str = "") -> Optional[str]:
+    """Best-effort: the directory the agent's terminal shell is in now (it persists `cd`
+    across calls), so `bash load-suite.sh` after an earlier `cd` resolves where the shell will.
+    Order: the live env's cwd, then the session cwd record. None when unknown (no Hermes, no env)."""
+    try:
+        from tools import terminal_tool as tt
+    except Exception:
+        return None
+    try:
+        eff = tt._resolve_container_task_id(task_id or None)
+        lock = tt._env_lock
+        if lock.acquire(timeout=0.5):
+            try:
+                env = tt._lookup_active_env(eff, task_id or None)
+            finally:
+                lock.release()
+            cwd = getattr(env, "cwd", None)
+            if cwd and os.path.isdir(os.path.expanduser(str(cwd))):
+                return str(cwd)
+    except Exception:
+        pass
+    for key in (task_id, session_id):
+        try:
+            cwd = tt.get_session_cwd(key or None)
+            if cwd and os.path.isdir(os.path.expanduser(str(cwd))):
+                return str(cwd)
+        except Exception:
+            pass
+    return None
+
+
+def classify(tool_name: str, args: Any, task_id: str = "", session_id: str = "") -> Optional[str]:
     args = args if isinstance(args, dict) else {}
     name = tool_name[5:] if tool_name.startswith("mcp__") else tool_name
     if name in SHELL_TOOLS:
-        cwd = args.get("workdir") or args.get("cwd") or None
+        cwd = args.get("workdir") or args.get("cwd") or live_terminal_cwd(task_id, session_id)
         text = " ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
         return guard.check_shell(text, str(cwd) if cwd else None)
     if name in PY_TOOLS:
-        return guard.check_python(str(args.get("code") or ""))
+        # hermes_tools.terminal() inside execute_code runs in the same persisted shell
+        return guard.check_python(str(args.get("code") or ""), live_terminal_cwd(task_id, session_id))
     if name in WRITE_TOOLS:
         path = str(args.get("path") or "")
         return None if _own_file(path) else guard.check_write(path, str(args.get("content") or ""))
@@ -87,17 +119,18 @@ def classify(tool_name: str, args: Any) -> Optional[str]:
     if name == "tool_call":
         for call in args.get("calls") or []:
             if isinstance(call, dict):
-                why = classify(str(call.get("name") or ""), call.get("arguments"))
+                why = classify(str(call.get("name") or ""), call.get("arguments"), task_id, session_id)
                 if why:
                     return why
     return None
 
 
-def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[dict]:
+def _pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", session_id: str = "",
+                   **_: Any) -> Optional[dict]:
     try:
         if not guard.enabled():
             return None
-        why = classify(tool_name, args)
+        why = classify(tool_name, args, str(task_id or ""), str(session_id or ""))
     except Exception:  # never let this plugin break a tool call
         logger.debug("cpu-load-guard classify failed", exc_info=True)
         return None
