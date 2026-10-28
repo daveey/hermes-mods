@@ -106,6 +106,12 @@ _PATH_CTOR = {"Path", "PurePath", "PosixPath", "pathlib.Path", "pathlib.PurePath
               "pathlib.PurePosixPath"}
 _PATH_SAME = {"str", "os.fspath", "os.path.expanduser", "os.path.abspath", "os.path.normpath", "os.path.realpath"}
 _PATH_METHODS = {"expanduser", "resolve", "absolute", "as_posix"}
+# Native (non-hermes_tools) writes inside execute_code.
+_OPEN_FUNCS = {"open", "io.open", "builtins.open", "codecs.open"}
+_PATH_WRITE_METHODS = {"write_text", "write_bytes", "mkdir", "touch"}
+_DEST_FUNCS = {"shutil.copy": (1,), "shutil.copy2": (1,), "shutil.copyfile": (1,), "shutil.copytree": (1,),
+               "shutil.copymode": (1,), "shutil.copystat": (1,), "shutil.move": (0, 1),
+               "os.rename": (0, 1), "os.replace": (0, 1)}
 
 
 def _execute_file_change(code: str) -> bool:
@@ -276,7 +282,40 @@ def _execute_file_change(code: str) -> bool:
                     args[key] = got[0]
                     if is_file_change(name, args):
                         self.changed = True
+            if self.native_write(node):
+                self.changed = True
             self.generic_visit(node)
+
+        def native_write(self, node) -> bool:
+            """open(path, w/a/x/+), Path(...).write_text/write_bytes/mkdir/touch/open(mode), shutil.copy*/move and
+            os.rename/replace. Same known-prefix evaluation and scratch policy as write_file; reads stay quiet."""
+            def outside_scratch(expr) -> bool:
+                v = val(expr)
+                return bool(v and v[0]) and not _is_scratch(os.path.expanduser(v[0]))
+
+            def writes(mode_node) -> bool:
+                m = val(mode_node) if mode_node is not None else None
+                return bool(m and m[1] and set(m[0]) & set("wax+"))
+
+            def kwarg(name):
+                return next((kw.value for kw in node.keywords if kw.arg == name), None)
+
+            fn = dotted(node.func)
+            if fn in _OPEN_FUNCS and node.args:
+                mode = node.args[1] if len(node.args) > 1 else kwarg("mode")
+                return writes(mode) and outside_scratch(node.args[0])
+            if fn in _DEST_FUNCS:
+                idx = _DEST_FUNCS[fn]
+                args = [node.args[i] for i in idx if i < len(node.args)]
+                return any(outside_scratch(a) for a in args)
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr in _PATH_WRITE_METHODS:
+                    return outside_scratch(node.func.value)
+                if attr == "open":
+                    mode = node.args[0] if node.args else kwarg("mode")
+                    return writes(mode) and outside_scratch(node.func.value)
+            return False
 
         # A declaration alone doesn't run its body. Dynamic helper/function dispatch is not inferred.
         def visit_FunctionDef(self, node: ast.AST):

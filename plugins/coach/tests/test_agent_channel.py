@@ -587,6 +587,87 @@ def test_plan_first_execute_code_scratch_exemptions(tmp_path, monkeypatch, kind)
     assert not [r for r in log if r.get("rule") == "plan_first"]
 
 
+NATIVE_WRITE_SHAPES = [
+    "open({path!r}, 'w').write('x')",
+    "open({path!r}, 'a').write('x')",
+    "open({path!r}, 'x').write('x')",
+    "open({path!r}, 'r+').write('x')",
+    "open({path!r}, mode='wb').write(b'x')",
+    "with open({path!r}, 'w') as f:\n    f.write('x')",
+    "import io\nio.open({path!r}, 'w').write('x')",
+    "from pathlib import Path\nPath({path!r}).write_text('x')",
+    "from pathlib import Path\nPath({path!r}).write_bytes(b'x')",
+    "from pathlib import Path\nPath({path!r}).touch()",
+    "from pathlib import Path\nPath({path!r}).mkdir(parents=True)",
+    "from pathlib import Path\nPath({path!r}).open('w').write('x')",
+    "import pathlib\np = pathlib.Path({path!r})\np.write_text('x')",
+    "import shutil\nshutil.copy('/etc/hosts', {path!r})",
+    "import shutil\nshutil.copy2('/etc/hosts', {path!r})",
+    "import shutil\nshutil.copyfile('/etc/hosts', {path!r})",
+    "import shutil\nshutil.copytree('/etc/ssl', {path!r})",
+    "import shutil\nshutil.move({path!r} + '.old', {path!r})",
+    "import os\nos.rename({path!r} + '.old', {path!r})",
+    "import os\nos.replace({path!r} + '.old', {path!r})",
+]
+
+
+@pytest.mark.parametrize("code_template", NATIVE_WRITE_SHAPES)
+def test_plan_first_execute_code_native_python_writes_fire_once(tmp_path, code_template):
+    code = code_template.format(path=str(tmp_path / "repo" / "gen.py"))
+    assert rules.is_file_change("execute_code", {"code": code})
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    out = _edit(hooks, "execute_code", {"code": code})
+    assert out and "Plan Before You Build" in json.loads(out)["coach_hint"]
+    assert _edit(hooks, "execute_code", {"code": code}) is None
+    log = [json.loads(line) for line in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
+    assert len([r for r in log if r.get("rule") == "plan_first"]) == 1
+
+
+@pytest.mark.parametrize("code_template", NATIVE_WRITE_SHAPES)
+@pytest.mark.parametrize("kind", ["tmp", "tmpdir", "cache", "plans"])
+def test_plan_first_execute_code_native_python_writes_in_scratch_are_quiet(tmp_path, monkeypatch, kind, code_template):
+    if kind in ("cache", "plans"):
+        monkeypatch.delenv("COACH_SCRATCH_ROOTS")
+        root = Path.home() / ".hermes" / kind
+    elif kind == "tmpdir":
+        root = tmp_path / "temporary"
+        monkeypatch.setenv("TMPDIR", str(root))
+    else:
+        root = tmp_path / "scratch"
+    code = code_template.format(path=str(root / "probe.py"))
+    if kind == "tmp":
+        # the literal /tmp prefix is scratch under the default roots
+        monkeypatch.delenv("COACH_SCRATCH_ROOTS")
+        monkeypatch.delenv("TMPDIR", raising=False)
+        code = code_template.format(path="/tmp/probe.py")
+    assert not rules.is_file_change("execute_code", {"code": code})
+    _, hooks = _plan_hooks(tmp_path)
+    hooks["pre_llm_call"](session_id="s1", user_message=BUILD_ASK, platform="cli")
+    assert _edit(hooks, "execute_code", {"code": code}) is None
+    log_path = tmp_path / "coach" / "log.jsonl"
+    log = [json.loads(line) for line in log_path.read_text().splitlines()] if log_path.exists() else []
+    assert not [r for r in log if r.get("rule") == "plan_first"]
+
+
+@pytest.mark.parametrize("code", [
+    "open('/project/app.py').read()",
+    "open('/project/app.py', 'r').read()",
+    "open('/project/app.py', 'rb').read()",
+    "open('/project/app.py', mode='rt').read()",
+    "from pathlib import Path\nPath('/project/app.py').read_text()",
+    "from pathlib import Path\nPath('/project/app.py').open().read()",
+    "from pathlib import Path\nPath('/project/app.py').open('r').read()",
+    "import shutil\nshutil.copy('/project/app.py', '/tmp/app.py')",
+    "import os\nos.rename('/tmp/a.py', '/tmp/b.py')",
+    "open(unknown_path(), 'w').write('x')",
+    "open('/project/app.py', mode_var).read()",
+])
+def test_plan_first_execute_code_native_reads_and_unknowns_are_quiet(tmp_path, monkeypatch, code):
+    monkeypatch.delenv("COACH_SCRATCH_ROOTS")  # default roots: /tmp is scratch
+    assert not rules.is_file_change("execute_code", {"code": code})
+
+
 def test_plan_first_execute_code_mixed_scratch_and_project(tmp_path):
     scratch = tmp_path / "scratch"
     (scratch / ".git").mkdir(parents=True)
