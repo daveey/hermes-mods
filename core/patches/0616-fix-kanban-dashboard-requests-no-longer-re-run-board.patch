@@ -1,0 +1,101 @@
+From f2d0e2378587f8f593207ccbb641e613b6eae278 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:46:51 -0700
+Subject: [PATCH] fix(kanban): dashboard requests no longer re-run board init +
+ integrity_check per call [daveey]
+
+plugin_api._conn called init_db on every request; init_db drops the board's
+_INITIALIZED_PATHS entry, so each /api/plugins/kanban/* poll re-ran PRAGMA
+integrity_check over the whole board file (3-25 s on a 140 MB kanban.db),
+starving the Desktop backend REST API (275-445% CPU, 60 s timeouts).
+connect() already initialises once per process.
+---
+ plugins/kanban/dashboard/plugin_api.py      | 13 +++---
+ tests/plugins/test_kanban_conn_no_reinit.py | 51 +++++++++++++++++++++
+ 2 files changed, 58 insertions(+), 6 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_conn_no_reinit.py
+
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 0e7d4e181a..9dd1d8b849 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -89,12 +89,13 @@ def _existing_board_slug(slug: str) -> str:
+ 
+ 
+ def _conn(board: Optional[str] = None):
+-    """Connect to the already-normalised ``board`` (``None`` = active). ``init_db`` is
+-    idempotent; running it here lets a fresh install self-heal if POST /tasks arrives first."""
+-    try:
+-        kanban_db.init_db(board=board)
+-    except Exception as exc:
+-        log.warning("kanban init_db failed: %s", exc)
++    """Connect to the already-normalised ``board`` (``None`` = active).
++
++    ``kbc.connect`` initialises a board exactly once per process (schema, migrations, integrity
++    probe, cached in ``_INITIALIZED_PATHS``), so a fresh install still self-heals when POST /tasks
++    arrives first. Do NOT call ``init_db`` per request: it drops that cache entry and re-runs the
++    whole init, including ``PRAGMA integrity_check`` of the full board file (3-25 s on a 140 MB
++    ``kanban.db``) on every poll, which starved the Desktop backend's REST API."""
+     return kbc.connect(board=board)
+ 
+ 
+diff --git a/tests/plugins/test_kanban_conn_no_reinit.py b/tests/plugins/test_kanban_conn_no_reinit.py
+new file mode 100644
+index 0000000000..74eb95a388
+--- /dev/null
++++ b/tests/plugins/test_kanban_conn_no_reinit.py
+@@ -0,0 +1,51 @@
++"""Regression: dashboard requests must not re-run kanban board init (integrity_check) per call.
++
++``plugin_api._conn`` used to call ``init_db`` on every request. ``init_db`` drops the board's
++``_INITIALIZED_PATHS`` entry, so each GET /board re-ran ``PRAGMA integrity_check`` over the whole
++board file (3-25 s on a 140 MB kanban.db) and starved the Desktop backend's REST API.
++"""
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def plugin(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kbc._INITIALIZED_PATHS.clear()
++    path = Path(__file__).resolve().parents[2] / "plugins/kanban/dashboard/plugin_api.py"
++    spec = importlib.util.spec_from_file_location("kanban_conn_no_reinit_test", path)
++    mod = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, spec.name, mod)
++    spec.loader.exec_module(mod)
++    yield mod
++    kbc._INITIALIZED_PATHS.clear()
++
++
++def test_repeated_requests_probe_integrity_once(plugin, monkeypatch):
++    probes = []
++    real = kbc._run_integrity_check
++    monkeypatch.setattr(kbc, "_run_integrity_check", lambda conn: probes.append(1) or real(conn))
++    # Seed a non-empty board file so the integrity guard has something to probe.
++    kb.init_db()
++    probes.clear()
++    for _ in range(5):
++        with plugin._board_conn(None) as (_, conn):
++            conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchall()
++    assert probes == [], f"dashboard connect re-ran integrity_check {len(probes)}x"
++
++
++def test_fresh_install_still_self_initialises(plugin):
++    """connect() alone creates the schema, so POST /tasks first on a fresh home still works."""
++    with plugin._board_conn(None) as (_, conn):
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+-- 
+2.55.0
+

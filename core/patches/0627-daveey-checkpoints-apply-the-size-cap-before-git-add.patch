@@ -1,0 +1,551 @@
+From 4d28e047a7356fece231c5f49ae6ee5fee6b67f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 05:37:43 +0000
+Subject: [PATCH] [daveey] checkpoints: apply the size cap before git add;
+ clean up and back off after a staging timeout
+
+A project holding one multi-GB file (database, dataset, weights) made every
+checkpoint run `git add -A` past its timeout: the "skip files over
+max_file_size_mb" rule ran only after staging (_drop_oversize_from_index),
+when git had already hashed and compressed the file. The snapshot was lost,
+the killed git left a partial tmp_pack (hundreds of MB) and the project
+index lock in the store (so every later checkpoint of that folder failed on
+the lock), and the folder was retried, and waited on, every turn.
+
+- tools/checkpoint_staging.py (new sibling): one tree walk (replaces
+  _dir_file_count) counts entries and collects files over the cap plus the
+  3 biggest files; a per-project core.excludesFile of anchored literal
+  gitignore patterns; timeout debris cleanup (tmp_pack_*/tmp_obj_*/index
+  lock written since the call started; callers hold the store lock); a
+  per-process 1 h back-off registry.
+- CheckpointManager._stage_all: git add -A with the oversize excludes, after
+  unstaging those paths (excludes do not apply to tracked entries, e.g. a
+  file that grew past the cap). Used by _take, _diff and _safe_restore_plan
+  (which still lists oversize files as changed, as before).
+- _unstage uses update-index --force-remove: literal paths, and it does not
+  refuse an entry whose staged content differs from file and ref.
+- A staging timeout logs the working folder (git timeout message) and its 3
+  biggest files, and the folder is skipped for 60 min.
+- _drop_oversize_from_index stays as the backstop.
+
+Tests (tests/tools/test_checkpoint_manager.py), all red on the base:
+TestOversizeFilesNeverStaged (50 MB file under a 1 MB cap never reaches the
+store; a file that grew past the cap is unstaged first) and
+TestGitTimeoutRecovery (partial pack, loose temp and index lock removed,
+older foreign debris kept, next turn and other managers skip git add until
+the window ends; the log names the folder and biggest files).
+---
+ tests/tools/test_checkpoint_manager.py | 124 +++++++++++++++++++
+ tools/checkpoint_manager.py            | 117 +++++++++++-------
+ tools/checkpoint_staging.py            | 159 +++++++++++++++++++++++++
+ 3 files changed, 360 insertions(+), 40 deletions(-)
+ create mode 100644 tools/checkpoint_staging.py
+
+diff --git a/tests/tools/test_checkpoint_manager.py b/tests/tools/test_checkpoint_manager.py
+index a210f00d80..3097af9ad1 100644
+--- a/tests/tools/test_checkpoint_manager.py
++++ b/tests/tools/test_checkpoint_manager.py
+@@ -1443,3 +1443,127 @@ class TestWorkingDirVanishes:
+         assert mgr._take(str(work_dir), "snap") is True
+         assert pruned == []
+         assert not [r for r in caplog.records if r.levelno >= 40]
++
++
++def _store_bytes(store: Path) -> int:
++    return sum(p.stat().st_size for p in store.rglob("*") if p.is_file())
++
++
++class TestOversizeFilesNeverStaged:
++    """A file over ``max_file_size_mb`` must be excluded BEFORE ``git add`` reads it.
++
++    Dropping it from the index after staging (the old order) still hashed and
++    compressed the whole file into the store: a 3 GB file ran ``git add -A``
++    past its timeout and left the snapshot unsaved."""
++
++    def test_big_file_is_excluded_before_staging(self, work_dir, checkpoint_base, monkeypatch):
++        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
++        big = work_dir / "data" / "weights [v1].bin"
++        big.parent.mkdir()
++        with open(big, "wb") as fh:
++            fh.writelines(os.urandom(1024 * 1024) for _ in range(50))
++        mgr = CheckpointManager(enabled=True, max_file_size_mb=1)
++        assert mgr.ensure_checkpoint(str(work_dir), "snap") is True
++        store = _store_path(checkpoint_base)
++        files = subprocess.run(
++            ["git", "ls-tree", "-r", "--name-only", _ref_name(_project_hash(str(work_dir)))],
++            env={**os.environ, "GIT_DIR": str(store)}, capture_output=True, text=True, check=True,
++        ).stdout.split("\n")
++        assert "main.py" in files and "data/weights [v1].bin" not in files
++        # The blob was never read into the store (not even as a dangling object).
++        assert _store_bytes(store) < 5 * 1024 * 1024
++
++    def test_file_that_grew_past_the_cap_is_unstaged_before_add(self, work_dir, checkpoint_base, monkeypatch):
++        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
++        grower = work_dir / "grows.db"
++        grower.write_bytes(b"small")
++        mgr = CheckpointManager(enabled=True, max_file_size_mb=1)
++        assert mgr.ensure_checkpoint(str(work_dir), "small") is True
++        store = _store_path(checkpoint_base)
++        before = _store_bytes(store)
++        with open(grower, "wb") as fh:
++            fh.writelines(os.urandom(1024 * 1024) for _ in range(20))
++        (work_dir / "main.py").write_text("print('changed')\n")
++        mgr.new_turn()
++        assert mgr.ensure_checkpoint(str(work_dir), "grown") is True
++        assert _store_bytes(store) - before < 2 * 1024 * 1024
++
++
++class TestGitTimeoutRecovery:
++    """A timed-out ``git add`` leaves its partial pack and its index lock in the
++    store. Both must go, and the folder is not retried on every turn."""
++
++    @staticmethod
++    def _timeout_add(monkeypatch, store_holder, calls):
++        import tools.checkpoint_manager as cm
++        real_run = subprocess.run
++
++        def fake_run(cmd, *a, **kw):
++            if len(cmd) > 1 and cmd[-2:] == ["add", "-A"]:
++                calls.append(cmd)
++                store = Path(kw["env"]["GIT_DIR"])
++                pack_dir = store / "objects" / "pack"
++                pack_dir.mkdir(parents=True, exist_ok=True)
++                (pack_dir / "tmp_pack_abc123").write_bytes(b"x" * 4096)
++                (store / "objects" / "ab").mkdir(parents=True, exist_ok=True)
++                (store / "objects" / "ab" / "tmp_obj_q1w2e3").write_bytes(b"y")
++                Path(kw["env"]["GIT_INDEX_FILE"] + ".lock").write_bytes(b"")
++                store_holder.append(store)
++                raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
++            return real_run(cmd, *a, **kw)
++
++        monkeypatch.setattr(cm.subprocess, "run", fake_run)
++
++    def test_timeout_clears_debris_and_backs_off(self, work_dir, checkpoint_base, monkeypatch, caplog):
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        mgr = CheckpointManager(enabled=True)
++        # A foreign, older tmp pack (another run's debris) is not this run's to delete.
++        store = _store_path(checkpoint_base)
++        _init_store(store, str(work_dir))
++        foreign = store / "objects" / "pack" / "tmp_pack_foreign"
++        foreign.parent.mkdir(parents=True, exist_ok=True)
++        foreign.write_bytes(b"old")
++        old = time.time() - 3600
++        os.utime(foreign, (old, old))
++
++        stores, calls = [], []
++        self._timeout_add(monkeypatch, stores, calls)
++        caplog.set_level("DEBUG", logger="tools.checkpoint_manager")
++        assert mgr.ensure_checkpoint(str(work_dir), "snap") is False
++        assert len(calls) == 1
++        assert not list(store.rglob("tmp_pack_abc123")), "partial pack left in the store"
++        assert not list(store.rglob("tmp_obj_*")), "partial loose object left in the store"
++        assert not list((store / "indexes").glob("*.lock")), "index lock left behind"
++        assert foreign.exists()
++        # The timeout log names the folder so repeats group by project.
++        assert any(str(work_dir.resolve()) in r.getMessage() and "timed out" in r.getMessage()
++                   for r in caplog.records if r.levelno >= 30)
++
++        # Next turn: no git add for this folder during the back-off window.
++        mgr.new_turn()
++        assert mgr.ensure_checkpoint(str(work_dir), "snap-2") is False
++        assert len(calls) == 1
++
++        # A fresh manager (another agent in this process) honours it too.
++        assert CheckpointManager(enabled=True).ensure_checkpoint(str(work_dir), "snap-3") is False
++        assert len(calls) == 1
++
++        # After the window it retries.
++        import tools.checkpoint_staging as staging
++        later = staging._now() + staging._SLOW_DIR_BACKOFF_S + 1
++        monkeypatch.setattr(staging, "_now", lambda: later)
++        mgr.new_turn()
++        mgr.ensure_checkpoint(str(work_dir), "snap-4")
++        assert len(calls) == 2
++
++    def test_timeout_log_names_biggest_files(self, work_dir, checkpoint_base, monkeypatch, caplog):
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        (work_dir / "huge.sqlite").write_bytes(b"z" * 300_000)
++        stores, calls = [], []
++        self._timeout_add(monkeypatch, stores, calls)
++        caplog.set_level("DEBUG", logger="tools.checkpoint_manager")
++        assert CheckpointManager(enabled=True).ensure_checkpoint(str(work_dir), "snap") is False
++        msgs = [r.getMessage() for r in caplog.records if r.levelno >= 30]
++        assert any("huge.sqlite" in m and str(work_dir.resolve()) in m for m in msgs), msgs
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index afe343d0b8..5646a0cf78 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -61,6 +61,7 @@ from pathlib import Path, PurePosixPath
+ from hermes_constants import get_hermes_home
+ from hermes_cli._subprocess_compat import selected_git_env, windows_hide_flags
+ from hermes_cli.gitlock import clear_stale_tmp_packs
++from tools import checkpoint_staging as staging
+ from typing import Dict, List, Optional, Set, Tuple
+ 
+ from utils import env_int, rmtree_readonly
+@@ -416,7 +417,8 @@ def _run_git(
+             )
+         return ok, stdout, stderr
+     except subprocess.TimeoutExpired:
+-        msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
++        # Name the folder: it is what repeats group by (one slow project, not one git verb).
++        msg = f"git timed out after {timeout}s in {normalized_working_dir}: {' '.join(cmd)}"
+         logger.error(msg, exc_info=True)
+         return False, "", msg
+     except FileNotFoundError as exc:
+@@ -736,19 +738,6 @@ def _pre_v2_shadow_repos(base: Path) -> list[dict]:
+     return out
+ 
+ 
+-def _dir_file_count(path: str) -> int:
+-    """Quick file count estimate (stops early if over _MAX_FILES)."""
+-    count = 0
+-    try:
+-        for _ in Path(path).rglob("*"):
+-            count += 1
+-            if count > _MAX_FILES:
+-                return count
+-    except (PermissionError, OSError):
+-        pass
+-    return count
+-
+-
+ def _dir_size_bytes(path: Path) -> int:
+     """Best-effort recursive size in bytes.  Returns 0 on error."""
+     total = 0
+@@ -787,7 +776,8 @@ class CheckpointManager:
+         are dropped when the store exceeds this after a commit.
+     max_file_size_mb : int
+         Skip adding any single file larger than this to a checkpoint.
+-        (Implemented via ``.gitignore`` excludes + a post-stage size check.)
++        (A per-project ``core.excludesFile`` built before staging, so git
++        never reads them, plus a post-stage size check as a backstop.)
+     """
+ 
+     def __init__(
+@@ -879,8 +869,10 @@ class CheckpointManager:
+         index_file = _index_path(store, dir_hash)
+ 
+         # Stage the current tree so the name-only diff sees new files too.
+-        _run_git(["add", "-A"], store, abs_dir,
+-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
++        # Oversize files are excluded from staging (git never reads them) and
++        # no checkpoint holds them, so they count as changed by definition.
++        scan = staging.scan_tree(abs_dir, self.max_file_size_mb * 1024 * 1024, _MAX_FILES)
++        self._stage_all(store, abs_dir, index_file, scan)
+         ok, names_out, err = _run_git(
+             ["diff", "--name-only", "-z", commit_hash, "--cached"],
+             store, abs_dir, index_file=index_file,
+@@ -902,7 +894,7 @@ class CheckpointManager:
+                     "ledger_empty": True}
+         restore: list[str] = []
+         skipped: list[str] = []
+-        for rel in filter(None, names_out.split("\x00")):
++        for rel in dict.fromkeys([*filter(None, names_out.split("\x00")), *scan.oversize]):
+             abs_path = Path(abs_dir) / rel
+             entry = ledger.get(str(abs_path))
+             recorded = entry.get("sha256") if isinstance(entry, dict) else None
+@@ -943,6 +935,11 @@ class CheckpointManager:
+ 
+         self._checkpointed_dirs.add(abs_dir)
+ 
++        backoff = staging.slow_remaining_s(_resolve_checkpoint_base(), abs_dir)
++        if backoff:
++            logger.debug("Checkpoint skipped: %s timed out staging; retry in %d min", abs_dir, backoff // 60 + 1)
++            return False
++
+         try:
+             from tools.checkpoint_pruning import store_lock
+ 
+@@ -1060,8 +1057,7 @@ class CheckpointManager:
+         index_file = _index_path(store, dir_hash)
+ 
+         # Stage current state into the per-project index to compare.
+-        _run_git(["add", "-A"], store, abs_dir,
+-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
++        self._stage_all(store, abs_dir, index_file)
+ 
+         ok_stat, stat_out, _ = _run_git(
+             ["diff", "--stat", commit_hash, "--cached"],
+@@ -1432,7 +1428,8 @@ class CheckpointManager:
+         _touch_project(store, working_dir)
+ 
+         # Quick size guard — don't try to snapshot enormous directories
+-        if _dir_file_count(working_dir) > _MAX_FILES:
++        scan = staging.scan_tree(working_dir, self.max_file_size_mb * 1024 * 1024, _MAX_FILES)
++        if scan.count > _MAX_FILES:
+             logger.debug("Checkpoint skipped: >%d files in %s", _MAX_FILES, working_dir)
+             return False
+ 
+@@ -1466,18 +1463,22 @@ class CheckpointManager:
+             # First snapshot for this project.
+             index_file.parent.mkdir(parents=True, exist_ok=True)
+ 
+-        # Stage with per-project index.  Include a per-stage file-size filter
+-        # via ``core.bigFileThreshold`` is not what we want — instead, we
+-        # rely on the exclude file for broad patterns and post-stage prune
+-        # any path whose size exceeds max_file_size_mb.
+-        ok, _, err = _run_git(
+-            ["add", "-A"], store, working_dir,
+-            timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+-        )
++        # Stage with per-project index; files over max_file_size_mb are
++        # excluded before git reads them.
++        ok, _, err = self._stage_all(store, working_dir, index_file, scan)
+         if not ok:
+-            logger.debug("Checkpoint git-add failed: %s", err)
++            if err.startswith("git timed out"):
++                staging.mark_slow(_resolve_checkpoint_base(), working_dir)
++                logger.warning(
++                    "Checkpoint of %s timed out staging (biggest files: %s); not retried for %d min",
++                    working_dir, scan.biggest_text(), staging._SLOW_DIR_BACKOFF_S // 60,
++                )
++            else:
++                logger.debug("Checkpoint git-add failed: %s", err)
+             return False
+ 
++        # Backstop: anything over the cap that slipped past the excludes
++        # (a name gitignore cannot express, a file that grew mid-add).
+         if self.max_file_size_mb > 0:
+             self._drop_oversize_from_index(store, working_dir, index_file)
+ 
+@@ -1567,6 +1568,51 @@ class CheckpointManager:
+ 
+         return True
+ 
++    def _stage_all(
++        self, store: Path, working_dir: str, index_file: Path,
++        scan: Optional[staging.TreeScan] = None,
++    ) -> tuple[bool, str, str]:
++        """``git add -A`` into the project index without reading oversize files.
++
++        Files over ``max_file_size_mb`` go to git as a per-project
++        ``core.excludesFile`` and are unstaged first (excludes do not apply to
++        a path already in the index, e.g. one that grew past the cap since the
++        last snapshot). On a timeout, the killed git's partial pack and index
++        lock are removed. Callers hold the checkpoint store lock.
++        """
++        if scan is None:
++            scan = staging.scan_tree(working_dir, self.max_file_size_mb * 1024 * 1024, _MAX_FILES)
++        config: list[str] = []
++        if scan.oversize:
++            excludes = staging.write_oversize_excludes(store, _project_hash(working_dir), scan.oversize)
++            if excludes is not None:
++                config = ["-c", f"core.excludesFile={excludes}"]
++            self._unstage(store, working_dir, index_file, scan.oversize)
++        started = time.time()
++        ok, out, err = _run_git(
++            [*config, "add", "-A"], store, working_dir,
++            timeout=_GIT_TIMEOUT * 2, index_file=index_file,
++        )
++        if not ok and err.startswith("git timed out"):
++            removed = staging.clear_timeout_debris(store, started, index_file)
++            if removed:
++                logger.info("Checkpoint: removed %d partial file(s) left by the timed-out git add", len(removed))
++        return ok, out, err
++
++    @staticmethod
++    def _unstage(store: Path, working_dir: str, index_file: Path, paths: list[str]) -> None:
++        """Remove literal ``paths`` from the project index (absent ones are ignored).
++
++        ``update-index --force-remove`` takes paths literally (no pathspec
++        globbing) and, unlike ``rm --cached``, does not refuse an entry whose
++        staged content differs from both the file and the ref."""
++        batch = 200
++        for i in range(0, len(paths), batch):
++            _run_git(
++                ["update-index", "--force-remove", "--", *paths[i:i + batch]],
++                store, working_dir, index_file=index_file,
++            )
++
+     def _exceeds_size_cap(self, path: Path) -> bool:
+         """Whether *path* is larger than ``max_file_size_mb``.
+ 
+@@ -1615,16 +1661,7 @@ class CheckpointManager:
+             "Checkpoint: dropping %d oversize file(s) (>%d MB) from index",
+             len(oversize), self.max_file_size_mb,
+         )
+-        # Use --pathspec-from-file for safety with many paths.
+-        # Chunk into manageable batches.
+-        BATCH = 200
+-        for i in range(0, len(oversize), BATCH):
+-            chunk = oversize[i:i + BATCH]
+-            _run_git(
+-                ["rm", "--cached", "--quiet", "--"] + chunk,
+-                store, working_dir, index_file=index_file,
+-                allowed_returncodes={128},
+-            )
++        self._unstage(store, working_dir, index_file, oversize)
+ 
+     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
+         """Checkpoint-take path: snapshot-count budget plus one size round, gc deferred to the
+diff --git a/tools/checkpoint_staging.py b/tools/checkpoint_staging.py
+new file mode 100644
+index 0000000000..3305b1c66a
+--- /dev/null
++++ b/tools/checkpoint_staging.py
+@@ -0,0 +1,159 @@
++"""Checkpoint staging guards: what ``git add -A`` must never read, and what a timed-out add leaves behind.
++
++The size cap (``checkpoints.max_file_size_mb``) has to act BEFORE staging. ``git add`` hashes and
++compresses every file it stages, so a cap applied afterwards (``_drop_oversize_from_index``) still
++paid for a multi-GB file in full: the add ran past its timeout, the snapshot was lost, and the killed
++git left a partial pack and its index lock in the store.
++"""
++from __future__ import annotations
++
++import heapq
++import logging
++import os
++import re
++import stat
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Optional
++
++logger = logging.getLogger("tools.checkpoint_manager")
++
++# A folder whose staging timed out is not snapshotted again for this long (per process): every new
++# turn would otherwise wait out the full timeout again for a snapshot that cannot finish.
++_SLOW_DIR_BACKOFF_S = 3600
++_slow_dirs: dict[tuple[str, str], float] = {}
++_now = time.monotonic
++
++# Temp files a killed git writes into the store: pack-objects/index-pack output in objects/pack,
++# loose-object temps in objects/??/.
++_TMP_PACK_PREFIXES = ("tmp_pack_", "tmp_idx_", "tmp_rev_", "tmp_mtimes_", ".tmp-")
++_TMP_OBJ_PREFIX = "tmp_obj_"
++# Filesystems with 1-2 s mtime granularity (HFS+, FAT) can stamp a file created after the call
++# started slightly before it.
++_MTIME_SLACK_S = 2.0
++
++
++@dataclass
++class TreeScan:
++    """One walk of a working tree: entry count (capped), oversize files, biggest files."""
++
++    count: int = 0
++    oversize: list[str] = field(default_factory=list)
++    biggest: list[tuple[int, str]] = field(default_factory=list)
++
++    def biggest_text(self) -> str:
++        return ", ".join(f"{rel} ({size / 1048576:.1f} MB)" for size, rel in self.biggest) or "none"
++
++
++def scan_tree(path: str, cap_bytes: int, max_entries: int) -> TreeScan:
++    """Walk ``path`` once: count entries (stop past ``max_entries``), collect files over ``cap_bytes``
++    (0 = no cap) as POSIX paths relative to ``path``, and keep the 3 biggest files for the logs.
++
++    Symlinks are not followed (git stages the link, not its target)."""
++    scan = TreeScan()
++    root = Path(path)
++    heap: list[tuple[int, str]] = []
++    try:
++        for dirpath, dirnames, filenames in os.walk(root):
++            scan.count += len(dirnames) + len(filenames)
++            if scan.count > max_entries:
++                break
++            if ".git" in dirnames:
++                dirnames.remove(".git")
++            for name in filenames:
++                full = Path(dirpath) / name
++                try:
++                    st = full.lstat()
++                except OSError:
++                    continue
++                if not stat.S_ISREG(st.st_mode):
++                    continue
++                rel = full.relative_to(root).as_posix()
++                if cap_bytes > 0 and st.st_size > cap_bytes:
++                    scan.oversize.append(rel)
++                if len(heap) < 3:
++                    heapq.heappush(heap, (st.st_size, rel))
++                elif st.st_size > heap[0][0]:
++                    heapq.heapreplace(heap, (st.st_size, rel))
++    except OSError:
++        pass
++    scan.biggest = sorted(heap, reverse=True)
++    return scan
++
++
++_GITIGNORE_SPECIAL = re.compile(r"([\\*?\[\]!#])")
++
++
++def gitignore_literal(rel: str) -> Optional[str]:
++    """An anchored gitignore pattern matching exactly the path ``rel``; None when gitignore cannot
++    express it (a newline in the name)."""
++    if "\n" in rel or "\r" in rel:
++        return None
++    escaped = _GITIGNORE_SPECIAL.sub(r"\\\1", rel)
++    stripped = escaped.rstrip(" ")
++    escaped = stripped + "\\ " * (len(escaped) - len(stripped))
++    return "/" + escaped
++
++
++def write_oversize_excludes(store: Path, dir_hash: str, oversize: list[str]) -> Optional[Path]:
++    """Write the per-project excludes file passed to ``git add`` as ``core.excludesFile``."""
++    lines = [p for p in (gitignore_literal(rel) for rel in oversize) if p]
++    if not lines:
++        return None
++    path = store / "info" / f"oversize-{dir_hash}"
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        # fsencode: POSIX names need not be UTF-8 (surrogate-escaped here).
++        path.write_bytes(b"".join(os.fsencode(line) + b"\n" for line in lines))
++    except (OSError, UnicodeError) as exc:
++        logger.warning("Checkpoint: could not write oversize excludes %s: %s", path, exc)
++        return None
++    return path
++
++
++def clear_timeout_debris(store: Path, since: float, index_file: Optional[Path]) -> list[str]:
++    """Delete what a git killed at its timeout left in the store: partial packs, loose-object temps
++    and the index lock, written since ``since`` (wall clock).
++
++    The caller holds the checkpoint store lock, so every store write since ``since`` is this call's.
++    Older debris belongs to the periodic sweep (``gitlock.clear_stale_tmp_packs``)."""
++    objects = store / "objects"
++    candidates: list[Path] = []
++    try:
++        for entry in objects.iterdir():
++            if entry.name == "pack":
++                candidates += [p for p in entry.iterdir() if p.name.startswith(_TMP_PACK_PREFIXES)]
++            elif len(entry.name) == 2 and entry.is_dir():
++                candidates += [p for p in entry.iterdir() if p.name.startswith(_TMP_OBJ_PREFIX)]
++    except OSError:
++        pass
++    if index_file is not None:
++        candidates.append(Path(f"{index_file}.lock"))
++    removed: list[str] = []
++    cutoff = since - _MTIME_SLACK_S
++    for path in candidates:
++        try:
++            if path.is_file() and path.stat().st_mtime >= cutoff:
++                path.unlink()
++                removed.append(str(path))
++        except OSError as exc:
++            logger.debug("Checkpoint: could not remove timeout debris %s: %s", path, exc)
++    return removed
++
++
++def mark_slow(base: Path, working_dir: str) -> None:
++    _slow_dirs[(str(base), working_dir)] = _now() + _SLOW_DIR_BACKOFF_S
++
++
++def slow_remaining_s(base: Path, working_dir: str) -> float:
++    """Seconds left in ``working_dir``'s back-off window, 0 when it may be snapshotted."""
++    key = (str(base), working_dir)
++    until = _slow_dirs.get(key)
++    if until is None:
++        return 0.0
++    left = until - _now()
++    if left <= 0:
++        _slow_dirs.pop(key, None)
++        return 0.0
++    return left
+-- 
+2.55.0
+

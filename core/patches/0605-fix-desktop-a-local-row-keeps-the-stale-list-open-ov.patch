@@ -1,0 +1,214 @@
+From 08d0c266d2598df3ba3f729dad9017035fe47cf5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:39:07 -0700
+Subject: [PATCH] fix(desktop): a local row keeps the stale-list open over its
+ boot-snapshot copy [daveey]
+
+The cold-start boot snapshot feeds this Mac's own replica rows into
+mergeOfflineFallback (connection = registry primary), judged asleep at the
+moment it was read. When a later local session list failed (backend event
+loop stalled), a retained local row was replaced by that copy: offline_cached
+without offline_stale_list, so the open was refused ("<hub> is offline") or
+went read-only although the local gateway was running. With no connection_id
+on the live row, identities did not match and the copy was added as a
+refused duplicate instead.
+
+- A retained row of the primary backend never yields to a replica copy; it
+  takes the offline_stale_list stamp and resumes live with the notice.
+- Merge identities treat an empty connection_id as the registry primary, so
+  the boot copy is recognised as the same session (no duplicate).
+- Remote rows with a replica copy keep today's behaviour.
+
+Tests: integration (local row, with/without connection_id, opens live as one
+row; remote asleep replica stays refused) and a merge unit test. Both new
+local tests fail on the parent branch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../offline-fallback.integration.test.tsx     | 61 +++++++++++++++++++
+ .../src/store/offline-sessions.test.ts        | 18 ++++++
+ apps/desktop/src/store/offline-sessions.ts    | 20 ++++--
+ 3 files changed, 94 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx b/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx
+index 0f28ee605a..1778164d62 100644
+--- a/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx
+@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { SidebarProvider } from '@/components/ui/sidebar'
+ import { asleepOpenFor, clearAsleepOpen } from '@/store/asleep-session'
++import { _resetBootSnapshotForTests, applyBootSnapshot } from '@/store/boot-snapshot'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $pinnedSessionIds, $sidebarShowAutomated } from '@/store/layout'
+ import { $notifications } from '@/store/notifications'
+@@ -91,6 +92,7 @@ beforeEach(() => {
+ 
+ afterEach(() => {
+   cleanup()
++  _resetBootSnapshotForTests()
+   _resetOfflineSessionsForTests()
+   $sessions.set([])
+   $profiles.set([])
+@@ -215,6 +217,65 @@ describe('ChatSidebar offline fallback rows', () => {
+     clearTranscriptTails()
+   })
+ 
++  // [daveey] The boot snapshot carries this Mac's own replica rows. One asleep at boot must not turn a live local row
++  // into a refused/read-only cached row when a later local list fails (2026-10-27 incident through the boot path).
++  it.each([
++    ['no connection_id', undefined],
++    ["connection_id 'local'", 'local']
++  ])(
++    'a local row with an asleep boot-snapshot copy still opens live when the local list fails (%s)',
++    (_, connectionId) => {
++      $sessions.set([
++        makeSessionInfo({
++          connection_id: connectionId,
++          id: 'live-1',
++          last_active: 9_000,
++          source: 'desktop',
++          title: 'Live one'
++        })
++      ])
++      const asleepAtBoot = rec('live-1', { gateway: 'macbook', local: true, synced_at: 1, title: 'Live one' })
++      applyBootSnapshot(
++        () =>
++          ({
++            appStartMs: 1_000,
++            hub: { available: true, gateway: 'macbook', sessions: [asleepAtBoot], stale: false, synced_at: 1 },
++            readMs: 1,
++            tree: null
++          }) as never
++      )
++      act(() => recordSessionGatewayUnavailable('local'))
++      const resume = vi.fn()
++      mount(resume)
++
++      expect(screen.getAllByText('Live one')).toHaveLength(1)
++      expect(screen.getByTestId('session-row-offline').getAttribute('aria-label')).toBe(
++        'Not responding · This computer, showing its last list'
++      )
++
++      fireEvent.click(screen.getByText('Live one'))
++
++      expect(resume).toHaveBeenCalledWith('live-1', expect.objectContaining({ id: 'live-1', offline_stale_list: true }))
++      expect(asleepOpenFor('live-1')).toBeNull()
++      const notices = $notifications.get().map(n => n.message).join(' ')
++      expect(notices).toMatch(/This computer is not responding/)
++      expect(notices).not.toMatch(/is offline/)
++    }
++  )
++
++  it('a remote row whose replica says its owner is asleep stays refused when its list fails too', () => {
++    $sessions.set([makeSessionInfo({ connection_id: 'conn-mini', id: 'a', source: 'desktop', title: 'Chat a' })])
++    setCached([rec('a')])
++    act(() => recordSessionGatewayUnavailable('conn-mini'))
++    const resume = vi.fn()
++    mount(resume)
++
++    fireEvent.click(screen.getByText('Chat a'))
++
++    expect(resume).not.toHaveBeenCalled()
++    expect($notifications.get().map(n => n.message).join(' ')).toMatch(/mini is offline/)
++  })
++
+   it('opens a live row normally', () => {
+     const resume = vi.fn()
+     mount(resume)
+diff --git a/apps/desktop/src/store/offline-sessions.test.ts b/apps/desktop/src/store/offline-sessions.test.ts
+index 6fa413704f..be707d93ee 100644
+--- a/apps/desktop/src/store/offline-sessions.test.ts
++++ b/apps/desktop/src/store/offline-sessions.test.ts
+@@ -240,6 +240,24 @@ describe('mergeOfflineFallback', () => {
+     expect(merged.find(r => r.id === 'c1')?.offline_stale_list).toBeUndefined()
+   })
+ 
++  it("a failed local list keeps this Mac's own rows stale-list, one row each, over their asleep boot copies", () => {
++    recordSessionListResult([], [], undefined, 'all', [], true)
++
++    const boot = offlineSessionsFromReplica(
++      [rec('bare', { gateway: 'macbook', local: true }), rec('named', { gateway: 'macbook', local: true })],
++      gateway => (gateway === 'macbook' ? 'local' : undefined),
++      1_000_000,
++      { includeLocal: true }
++    )
++
++    const merged = mergeOfflineFallback([live('bare'), live('named', { connection_id: 'local' })], boot)
++
++    expect(merged.map(r => [r.id, r.offline_stale_list])).toEqual([
++      ['bare', true],
++      ['named', true]
++    ])
++  })
++
+   it('keeps reference identity when nothing is added', () => {
+     const rows = [live('l1')]
+ 
+diff --git a/apps/desktop/src/store/offline-sessions.ts b/apps/desktop/src/store/offline-sessions.ts
+index 7e6ab6c471..adf124c42f 100644
+--- a/apps/desktop/src/store/offline-sessions.ts
++++ b/apps/desktop/src/store/offline-sessions.ts
+@@ -19,6 +19,8 @@ import type { SessionInfo } from '@/hermes'
+ import { normalizeSessionSource, SIDEBAR_EXCLUDED_SOURCES } from '@/lib/session-source'
+ import { syncedAgoLabel } from '@/lib/synced-ago'
+ 
++import { $connectionsRegistry } from './connection-registry-state'
++
+ /** One hub replica session record, as the `hub-sync` plugin serves it. */
+ export interface OfflineReplicaRecord {
+   gateway: string
+@@ -273,13 +275,20 @@ function rowFromRecord(record: OfflineReplicaRecord, connectionId: string, linea
+ }
+ 
+ /** Fresh owner lists win; retained rows from a failed list are cached, not live. A retained row with no replica
+- * copy is stamped `offline_stale_list`: its owner failed one list, which does not prove it is unreachable. */
++ * copy is stamped `offline_stale_list`: its owner failed one list, which does not prove it is unreachable. Nor does
++ * a replica copy of this Mac's own backend (the boot snapshot's, judged asleep at boot): its row is stamped too. */
+ export function mergeOfflineFallback(
+   live: SessionInfo[],
+   offline: readonly SessionInfo[],
+   freshness = $sessionListFreshness.get()
+ ): SessionInfo[] {
+-  const cachedById = new Map(offline.map(row => [offlineIdentity(row), row]))
++  // [daveey] Primary-backend rows carry no connection_id while replica rows name the primary: one identity for both.
++  const primary = $connectionsRegistry.get()?.primary?.trim() || 'local'
++
++  const ownedIdentity = (row: Pick<SessionInfo, 'connection_id' | 'profile'>, id: string) =>
++    identity(row.connection_id?.trim() || primary, profileOf(row.profile), id)
++
++  const cachedById = new Map(offline.map(row => [ownedIdentity(row, row.id), row]))
+   const freshOwners = new Set<string>()
+   const seen = new Set<string>()
+   let changed = false
+@@ -289,7 +298,8 @@ export function mergeOfflineFallback(
+     let effective = row
+ 
+     if (!fresh) {
+-      const cached = cachedById.get(offlineIdentity(row))
++      const ownBackend = (row.connection_id?.trim() || primary) === primary
++      const cached = ownBackend ? undefined : cachedById.get(ownedIdentity(row, row.id))
+       effective = cached ?? { ...row, is_active: false, offline_cached: true, offline_stale_list: true }
+       changed = true
+     } else if (!row.offline_cached) {
+@@ -298,7 +308,7 @@ export function mergeOfflineFallback(
+ 
+     for (const id of [effective.id, effective._lineage_root_id, ...(effective._lineage_ids ?? [])]) {
+       if (id) {
+-        seen.add(identity(effective.connection_id?.trim() ?? '', profileOf(effective.profile), id))
++        seen.add(ownedIdentity(effective, id))
+       }
+     }
+ 
+@@ -309,7 +319,7 @@ export function mergeOfflineFallback(
+     row =>
+       !freshOwners.has(ownerKey(row.connection_id, row.profile)) &&
+       freshness[ownerKey(row.connection_id, row.profile)] !== true &&
+-      !seen.has(offlineIdentity(row))
++      !seen.has(ownedIdentity(row, row.id))
+   )
+ 
+   const merged = added.length ? [...rows, ...added] : changed ? rows : live
+-- 
+2.55.0
+

@@ -1,0 +1,227 @@
+From 48913b6339ecf1737f25b1831b5e364b8b1b30a3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:48:04 +0000
+Subject: [PATCH] fix(checkpoints): a workspace deleted mid-snapshot is one
+ WARNING, not an ERROR traceback; kanban logs who removed a scratch workspace
+ [daveey]
+
+Kanban removes scratch workspaces on card completion, so a checkpoint can find
+its working directory gone, even between _run_git's existence check and the
+git spawn. That path already returned (False, '', 'working directory not
+found') but logged ERROR with a full FileNotFoundError traceback (and the
+pre-check logged ERROR too). Now both log one WARNING line; a FileNotFoundError
+while the directory still exists keeps the ERROR traceback. _take skips the
+prune step when the folder vanished after the snapshot landed.
+
+Detection: scratch-workspace removal (completion and deferred parent cleanup)
+is logged at INFO with task id, last run id/status and the removing pid, so
+the next folder that disappears under a live agent names who deleted it.
+
+Tests: TestWorkingDirVanishes (race + already gone + _take skips prune), red on
+the base; test_kanban_scratch_removal_log.py.
+---
+ hermes_cli/kanban_db_workspace.py             | 15 ++++-
+ .../test_kanban_scratch_removal_log.py        | 44 ++++++++++++++
+ tests/tools/test_checkpoint_manager.py        | 57 +++++++++++++++++++
+ tools/checkpoint_manager.py                   | 14 +++--
+ 4 files changed, 124 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_removal_log.py
+
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index 4583942271..fae90d626d 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -393,6 +393,17 @@ def _scratch_tree_removable(path: Path) -> bool:
+     return True
+ 
+ 
++def _log_scratch_removal(conn: sqlite3.Connection, task_id: str, wp: Path, what: str) -> None:
++    """INFO line naming who removed a scratch workspace, so an agent that later
++    finds its cwd gone (checkpoint 'working directory not found') can be traced
++    to the run whose completion deleted it."""
++    row = conn.execute(
++        "SELECT id, status FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
++    ).fetchone()
++    run = f"run {row['id']} ({row['status']})" if row else "no run"
++    _kb._log.info("Removed %s for task %s, last %s, by pid %d: %s", what, task_id, run, os.getpid(), wp)
++
++
+ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+     """Remove a task's scratch workspace dir and kill its stale tmux session.
+     Called from :func:`complete_task` after the transaction commits; best-effort
+@@ -442,7 +453,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+                 elif not _defer_shared_workspace_cleanup(conn, task_id, path):
+                     release_lsp_clients(str(wp))
+                     shutil.rmtree(wp, ignore_errors=True)
+-                    _kb._log.debug("Removed scratch workspace: %s", wp)
++                    _log_scratch_removal(conn, task_id, wp, "scratch workspace")
+             else:
+                 _kb._log.warning(
+                     "Refusing to remove out-of-scratch workspace for task %s: %s "
+@@ -594,7 +605,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
+                     continue
+                 release_lsp_clients(str(wp))
+                 shutil.rmtree(wp, ignore_errors=True)
+-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
++                _log_scratch_removal(conn, parent_id, wp, f"deferred parent scratch workspace (child {task_id} done)")
+     except Exception:
+         pass  # best-effort
+ 
+diff --git a/tests/hermes_cli/test_kanban_scratch_removal_log.py b/tests/hermes_cli/test_kanban_scratch_removal_log.py
+new file mode 100644
+index 0000000000..e3dc0e90fe
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_removal_log.py
+@@ -0,0 +1,44 @@
++"""A scratch workspace removed by card completion is logged at INFO with the
++task, its last run and the removing pid, so an agent that later finds its cwd
++gone (checkpoint "working directory not found") can be traced to who removed it."""
++
++from __future__ import annotations
++
++import logging
++import os
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_workspace as kbw
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def test_completion_logs_scratch_removal_with_task_and_run(kanban_home, caplog):
++    caplog.set_level(logging.INFO, logger="hermes_cli.kanban_db")
++    with kbc.connect() as conn:
++        t = kb.create_task(conn, title="scratch removal")
++        ws = kbw.resolve_workspace(kb.get_task(conn, t))
++        kbw.set_workspace_path(conn, t, ws)
++        assert kb.complete_task(conn, t, result="ok")
++        run = kb.latest_run(conn, t)
++
++    assert not ws.exists()
++    lines = [r.getMessage() for r in caplog.records
++             if r.levelno == logging.INFO and r.getMessage().startswith("Removed scratch workspace")]
++    assert len(lines) == 1, lines
++    assert f"for task {t}," in lines[0]
++    assert f"last run {run.id} ({run.status})" in lines[0]
++    assert f"by pid {os.getpid()}" in lines[0]
++    assert lines[0].endswith(str(ws))
+diff --git a/tests/tools/test_checkpoint_manager.py b/tests/tools/test_checkpoint_manager.py
+index 580a0f9dfb..a210f00d80 100644
+--- a/tests/tools/test_checkpoint_manager.py
++++ b/tests/tools/test_checkpoint_manager.py
+@@ -1386,3 +1386,60 @@ class TestSessionDiff:
+         assert result["success"] is True
+         assert "feature.py" in result["diff"]
+         assert "+x = 1" in result["diff"]
++
++
++class TestWorkingDirVanishes:
++    """Kanban scratch workspaces are deleted by design (card completion), so a
++    checkpoint may find its working directory gone, even between the
++    existence check and the git spawn. That is an expected outcome: one WARNING
++    line, no traceback, the same (False, "", msg) result."""
++
++    @staticmethod
++    def _assert_one_quiet_warning(caplog, msg):
++        records = [r for r in caplog.records if r.name == "tools.checkpoint_manager"]
++        assert not [r for r in records if r.levelno >= 40], [r.getMessage() for r in records]
++        assert not [r for r in records if r.exc_info], "traceback logged"
++        warnings = [r for r in records if r.levelno == 30]
++        assert len(warnings) == 1 and msg in warnings[0].getMessage()
++
++    def test_deleted_between_check_and_spawn(self, work_dir, checkpoint_base, monkeypatch, caplog):
++        import tools.checkpoint_manager as cm
++        real_which = shutil.which
++
++        def which_then_delete(name, path=None):
++            shutil.rmtree(work_dir)
++            return real_which(name, path=path)
++
++        monkeypatch.setattr(cm.shutil, "which", which_then_delete)
++        caplog.set_level("DEBUG", logger="tools.checkpoint_manager")
++        result = _run_git(["rev-list", "--reverse", "refs/hermes/x"], checkpoint_base, str(work_dir))
++        msg = f"working directory not found: {work_dir.resolve()}"
++        assert result == (False, "", msg)
++        self._assert_one_quiet_warning(caplog, msg)
++
++    def test_already_gone(self, tmp_path, checkpoint_base, caplog):
++        gone = tmp_path / "gone"
++        caplog.set_level("DEBUG", logger="tools.checkpoint_manager")
++        result = _run_git(["status"], checkpoint_base, str(gone))
++        msg = f"working directory not found: {gone.resolve()}"
++        assert result == (False, "", msg)
++        self._assert_one_quiet_warning(caplog, msg)
++
++    def test_take_skips_prune_once_dir_is_gone(self, work_dir, fake_home, monkeypatch, caplog):
++        import tools.checkpoint_manager as cm
++        real_run_git = cm._run_git
++
++        def run_git_then_delete(args, *a, **kw):
++            out = real_run_git(args, *a, **kw)
++            if args[0] == "update-ref":
++                shutil.rmtree(work_dir)
++            return out
++
++        monkeypatch.setattr(cm, "_run_git", run_git_then_delete)
++        pruned = []
++        monkeypatch.setattr(CheckpointManager, "_prune", lambda self, *a: pruned.append(a))
++        caplog.set_level("DEBUG", logger="tools.checkpoint_manager")
++        mgr = CheckpointManager(enabled=True)
++        assert mgr._take(str(work_dir), "snap") is True
++        assert pruned == []
++        assert not [r for r in caplog.records if r.levelno >= 40]
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index 140cace15f..afe343d0b8 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -371,8 +371,9 @@ def _run_git(
+     """
+     normalized_working_dir = _normalize_path(working_dir)
+     if not normalized_working_dir.exists():
++        # Kanban scratch workspaces are deleted on card completion by design.
+         msg = f"working directory not found: {normalized_working_dir}"
+-        logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
++        logger.warning("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
+         return False, "", msg
+     if not normalized_working_dir.is_dir():
+         msg = f"working directory is not a directory: {normalized_working_dir}"
+@@ -424,7 +425,11 @@ def _run_git(
+             logger.error("Git executable not found: %s", " ".join(cmd), exc_info=True)
+             return False, "", "git not found"
+         msg = f"working directory not found: {normalized_working_dir}"
+-        logger.error("Git command failed before execution: %s (%s)", " ".join(cmd), msg, exc_info=True)
++        if not normalized_working_dir.is_dir():
++            # Deleted between the check above and the spawn (Kanban cleanup).
++            logger.warning("Git command skipped, working directory removed: %s (%s)", " ".join(cmd), msg)
++        else:
++            logger.error("Git command failed before execution: %s (%s)", " ".join(cmd), msg, exc_info=True)
+         return False, "", msg
+     except Exception as exc:
+         logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
+@@ -1555,8 +1560,9 @@ class CheckpointManager:
+ 
+         logger.debug("Checkpoint taken in %s: %s (%s)", working_dir, reason, new_sha[:8])
+ 
+-        # Count and size budgets share one failure boundary.
+-        if prune:
++        # Count and size budgets share one failure boundary. A workspace
++        # removed after the snapshot landed (Kanban cleanup) has nothing to prune.
++        if prune and os.path.isdir(working_dir):
+             self._prune(store, working_dir, ref)
+ 
+         return True
+-- 
+2.55.0
+

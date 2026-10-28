@@ -79,3 +79,7 @@ The three behaviour tests fail with `run()` made a passthrough (the pre-patch be
   tick (15 s).
 - Generic SSH failures (host down, auth) are not cached by this gate; the request path still redials for those.
   Only prewarm backs off on them.
+
+## Follow-up patches (0610)
+
+**0610** (`469b0731ea`): the pause test now uses a documentation address for the hub instead of a real one (`electron/remote-update-pause.test.ts`); no behaviour change.

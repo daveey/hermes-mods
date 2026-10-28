@@ -1,0 +1,314 @@
+From c5153adda1eb0e48cebdc7ddc0f165f251d68f1e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:50:20 +0000
+Subject: [PATCH] fix(logging): process exit mid-turn logs one line, not a
+ traceback (pre-final gate, tool executor, errors.log filter) [daveey]
+
+A turn finishing while the backend exits hit pre_final_gate._invoke after the main thread
+returned; its pool submit raised 'cannot schedule new futures after interpreter shutdown'
+(or, on a first pool use, 'can't register atexit after shutdown'), logged as a WARNING
+with a full traceback in errors.log and filed by self-heal as a defect (agent-9a2a3cc05d).
+
+- pre_final_gate._invoke / tool_executor sequential error path: shutdown errors log one
+  INFO line and fail open exactly as before.
+- tools.interpreter_shutdown also recognizes the atexit-refusal message.
+- Root guard: errors.log handler gets _ProcessExitNoiseFilter, collapsing any record whose
+  exception is a process-exit scheduling error to one line (agent.log keeps the traceback),
+  so future thread-starting sites need no opt-in.
+Tests: tests/agent/test_pre_final_gate_interpreter_shutdown.py (subprocess gate after main
+exit, both CPython messages; tool path; real-error controls), test_hermes_logging filter test.
+---
+ agent/pre_final_gate.py                       |  11 +-
+ agent/tool_executor.py                        |   6 +-
+ hermes_logging.py                             |  42 ++++++-
+ ...est_pre_final_gate_interpreter_shutdown.py | 109 ++++++++++++++++++
+ tests/test_hermes_logging.py                  |  28 +++++
+ tools/interpreter_shutdown.py                 |  10 +-
+ 6 files changed, 201 insertions(+), 5 deletions(-)
+ create mode 100644 tests/agent/test_pre_final_gate_interpreter_shutdown.py
+
+diff --git a/agent/pre_final_gate.py b/agent/pre_final_gate.py
+index cdb1031c88..f8f76abcf6 100644
+--- a/agent/pre_final_gate.py
++++ b/agent/pre_final_gate.py
+@@ -235,8 +235,15 @@ def _invoke(cb: Callable, kwargs: dict[str, Any], budget: int, limit: float) ->
+         return _call(cb, call_kwargs, limit)
+     except concurrent.futures.TimeoutError:
+         logger.warning("pre_final_gate hook %s timed out after %.1fs", name, limit)
+-    except Exception:
+-        logger.warning("pre_final_gate hook %s raised", name, exc_info=True)
++    except Exception as exc:
++        from tools.interpreter_shutdown import interpreter_shutting_down
++
++        if isinstance(exc, RuntimeError) and interpreter_shutting_down(exc):
++            # The process is exiting (Desktop quit, update, restart) while a turn finishes: not a
++            # gate failure. One quiet line, no traceback; fail open exactly as for any other error.
++            logger.info("pre_final_gate hook %s skipped: %s (process exiting)", name, exc)
++        else:
++            logger.warning("pre_final_gate hook %s raised", name, exc_info=True)
+     return _FAILED
+ 
+ 
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index da861983c7..4d35ee79ea 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -1785,7 +1785,11 @@ def _run_sequential_call(
+         if dispatch.error_result is None:
+             raise
+         function_result = dispatch.error_result(tool_error)
+-        logger.error(dispatch.error_log, ref.name, tool_error, exc_info=True)
++        if isinstance(tool_error, RuntimeError) and _is_interpreter_shutdown_submit_error(tool_error):
++            # Process exiting mid-tool: one line, no traceback (the result still records the error).
++            logger.info(dispatch.error_log + " (process exiting)", ref.name, tool_error)
++        else:
++            logger.error(dispatch.error_log, ref.name, tool_error, exc_info=True)
+         managed = _ManagedToolResult(result=function_result, args=ref.args, middleware_trace=ref.trace, blocked=False, dispatched=False)
+     finally:
+         if dispatch.is_delegate:
+diff --git a/hermes_logging.py b/hermes_logging.py
+index 6e9e6b20be..31561e6192 100644
+--- a/hermes_logging.py
++++ b/hermes_logging.py
+@@ -278,6 +278,45 @@ class _ComponentFilter(logging.Filter):
+         return record.name.startswith(self._prefixes)
+ 
+ 
++# CPython's process-exit scheduling refusals. Raised only while the interpreter is finalizing (or a
++# pool was shut down at exit), so any traceback carrying one is exit noise, not a defect.
++_PROCESS_EXIT_ERRORS = (
++    "cannot schedule new futures after",  # concurrent.futures (interpreter shutdown / pool shutdown)
++    "can't register atexit after shutdown",  # threading/atexit during finalization
++)
++
++
++def _process_exit_error(record: logging.LogRecord) -> Optional[BaseException]:
++    exc = record.exc_info[1] if record.exc_info else None
++    if isinstance(exc, RuntimeError) and any(s in str(exc).lower() for s in _PROCESS_EXIT_ERRORS):
++        return exc
++    return None
++
++
++class _ProcessExitNoiseFilter(logging.Filter):
++    """errors.log: a record whose exception is a process-exit scheduling error becomes one line.
++
++    Each thread-starting site would otherwise have to opt in to ``tools.interpreter_shutdown``
++    (the pre-final gate never did); this covers every present and future site. The full
++    traceback stays in agent.log. Other exceptions are untouched.
++    """
++
++    def filter(self, record: logging.LogRecord):
++        exc = _process_exit_error(record)
++        if exc is None:
++            return True
++        quiet = copy.copy(record)
++        quiet.msg = f"{record.getMessage()} [process exiting: {type(exc).__name__}: {exc}; traceback omitted]"
++        quiet.args = None
++        quiet.exc_info = None
++        quiet.exc_text = None  # an earlier handler's formatter may have cached the traceback text
++        quiet.stack_info = None
++        if sys.version_info >= (3, 12):
++            return quiet  # 3.12+: the handler emits this copy; other handlers keep the original
++        record.__dict__.update(quiet.__dict__)  # 3.11 cannot swap records; later handlers see one line too
++        return True
++
++
+ # Logger name prefixes per component; used by _ComponentFilter and ``hermes logs --component``.
+ COMPONENT_PREFIXES = {
+     # ``plugins.platforms``: messaging adapters that migrated out of
+@@ -380,7 +419,8 @@ def setup_logging(
+         _add_rotating_handler(
+             log_dir / filename, level=lvl, max_bytes=size, backup_count=count,
+             formatter=RedactingFormatter(_LOG_FORMAT),
+-            log_filter=_ComponentFilter(COMPONENT_PREFIXES[component]) if component else None,
++            log_filter=(_ComponentFilter(COMPONENT_PREFIXES[component]) if component
++                        else _ProcessExitNoiseFilter() if filename == "errors.log" else None),
+         )
+ 
+     if _WINDOWS_CLH_FALLBACK and not _fallback_warned:
+diff --git a/tests/agent/test_pre_final_gate_interpreter_shutdown.py b/tests/agent/test_pre_final_gate_interpreter_shutdown.py
+new file mode 100644
+index 0000000000..15a91c9115
+--- /dev/null
++++ b/tests/agent/test_pre_final_gate_interpreter_shutdown.py
+@@ -0,0 +1,109 @@
++"""Regression: the pre-final gate must fail open QUIETLY when the process is exiting.
++
++A turn that finishes while the backend exits (Desktop quit, ``hermes update``) reaches
++``pre_final_gate._invoke`` after interpreter finalization began; its worker-pool submit raises
++``RuntimeError: cannot schedule new futures after interpreter shutdown``. The gate already failed
++open, but logged a WARNING with a full traceback, which landed in errors.log and was filed as a
++defect by the self-heal sweeper (agent-9a2a3cc05d). Shutdown is not a gate failure: one INFO line,
++no traceback, same fail-open decision.
++"""
++from __future__ import annotations
++
++import logging
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from agent import pre_final_gate as gate
++
++REPO = Path(__file__).resolve().parents[2]
++
++_SCRIPT = textwrap.dedent(
++    """
++    import logging, sys, threading, time
++    sys.path.insert(0, {repo!r})
++    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
++    from agent import pre_final_gate as g
++    if {preimport!r}:
++        import concurrent.futures.thread  # pool module loaded -> "cannot schedule new futures ..."
++
++    def cb(**kw):
++        return {{}}
++
++    def turn():
++        time.sleep(0.5)  # the main thread has returned: interpreter finalization has begun
++        r = g._invoke(cb, {{}}, 1, 5.0)
++        print("FAILED_OPEN", r is g._FAILED, flush=True)
++
++    threading.Thread(target=turn).start()  # non-daemon, like a backend turn worker
++    """
++)
++
++
++@pytest.mark.parametrize("preimport", [True, False], ids=["futures-refused", "atexit-refused"])
++def test_gate_during_interpreter_shutdown_fails_open_without_traceback(preimport):
++    """Both CPython refusals: a loaded pool module refuses the submit; an unloaded one fails its
++    own import with "can't register atexit after shutdown"."""
++    proc = subprocess.run(
++        [sys.executable, "-c", _SCRIPT.format(repo=str(REPO), preimport=preimport)],
++        capture_output=True, text=True, timeout=60, check=False,
++    )
++    out = proc.stdout + proc.stderr
++    assert "FAILED_OPEN True" in proc.stdout, out
++    assert "Traceback" not in out, out
++    lines = [ln for ln in out.splitlines() if "pre_final_gate hook" in ln]
++    assert len(lines) == 1 and lines[0].startswith("INFO "), out
++    assert "process exiting" in lines[0], out
++
++
++def test_unrelated_hook_error_still_warns_with_traceback(caplog):
++    def boom(**_kw):
++        raise RuntimeError("real hook bug")
++
++    with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
++        assert gate._invoke(boom, {}, 1, 5.0) is gate._FAILED
++    recs = [r for r in caplog.records if "pre_final_gate hook" in r.getMessage()]
++    assert recs and recs[-1].levelno == logging.WARNING and recs[-1].exc_info, recs
++
++
++# ── same rule on the tool-executor path ("handle_function_call raised for ...") ──────────────────
++
++def _run_failing_tool(monkeypatch, exc):
++    from types import SimpleNamespace
++
++    from agent import tool_executor as te
++
++    def _raise(*_a, **_kw):
++        raise exc
++
++    monkeypatch.setattr(te, "_run_sequential_tool_execution_middleware", _raise)
++    dispatch = te._SequentialDispatch(
++        execute=lambda _args: None, error_result=lambda e: f"Error executing tool 'demo': {e}",
++        error_log="handle_function_call raised for %s: %s", finish_spinner=False,
++    )
++    ref = te._ToolCallRef("demo", {}, "task", "call-1", [])
++    managed, _ = te._run_sequential_call(
++        SimpleNamespace(), dispatch, ref, scope_block=None, messages=[], remaining_calls=[],
++        display_index=1, tool_start_time=0.0,
++    )
++    return managed
++
++
++def test_tool_call_during_interpreter_shutdown_logs_one_line(monkeypatch, caplog):
++    with caplog.at_level(logging.INFO):
++        managed = _run_failing_tool(
++            monkeypatch, RuntimeError("cannot schedule new futures after interpreter shutdown"))
++    assert "interpreter shutdown" in managed.result
++    recs = [r for r in caplog.records if "handle_function_call raised" in r.getMessage()]
++    assert len(recs) == 1 and recs[0].levelno == logging.INFO and not recs[0].exc_info, recs
++    assert "process exiting" in recs[0].getMessage()
++
++
++def test_tool_call_real_error_still_logs_traceback(monkeypatch, caplog):
++    with caplog.at_level(logging.INFO):
++        _run_failing_tool(monkeypatch, RuntimeError("real tool bug"))
++    recs = [r for r in caplog.records if "handle_function_call raised" in r.getMessage()]
++    assert len(recs) == 1 and recs[0].levelno == logging.ERROR and recs[0].exc_info, recs
+diff --git a/tests/test_hermes_logging.py b/tests/test_hermes_logging.py
+index 0ac03e7d93..f811c9489c 100644
+--- a/tests/test_hermes_logging.py
++++ b/tests/test_hermes_logging.py
+@@ -1033,3 +1033,31 @@ class TestRolloverPreservesLogOwnership:
+         monkeypatch.setattr(os, "chown", _refuse)
+         self._rolled_handler(log_path)
+         assert log_path.exists()
++
++
++def _log_with_exc(logger_name: str, msg: str, exc: BaseException) -> None:
++    try:
++        raise exc
++    except BaseException:
++        logging.getLogger(logger_name).warning(msg, exc_info=True)
++
++
++@pytest.mark.parametrize("text", [
++    "cannot schedule new futures after interpreter shutdown",
++    "can't register atexit after shutdown",
++])
++def test_errors_log_collapses_process_exit_tracebacks_to_one_line(hermes_home, text):
++    """A process-exit scheduling error is exit noise, not a defect: errors.log gets one line (no
++    traceback, so the self-heal sweeper files nothing); agent.log keeps the full record."""
++    hermes_logging.setup_logging(hermes_home=hermes_home)
++    _log_with_exc("agent.some_new_site", "exit-noise-witness raised", RuntimeError(text))
++    _log_with_exc("agent.some_new_site", "real-bug-witness raised", RuntimeError("real bug"))
++    hermes_logging.flush_log_queue()
++    errors = (hermes_home / "logs" / "errors.log").read_text(encoding="utf-8-sig")
++    agent = (hermes_home / "logs" / "agent.log").read_text(encoding="utf-8-sig")
++    noise = [ln for ln in errors.splitlines() if "exit-noise-witness" in ln]
++    assert len(noise) == 1 and "process exiting" in noise[0] and text in noise[0], errors
++    assert errors.count("Traceback (most recent call last)") == 1, errors  # only the real bug's
++    assert f"RuntimeError: {text}" not in errors.replace(noise[0], ""), errors
++    assert "RuntimeError: real bug" in errors, errors
++    assert agent.count("Traceback (most recent call last)") == 2, agent  # full detail kept
+diff --git a/tools/interpreter_shutdown.py b/tools/interpreter_shutdown.py
+index 770010fad1..5497730ad2 100644
+--- a/tools/interpreter_shutdown.py
++++ b/tools/interpreter_shutdown.py
+@@ -8,6 +8,9 @@ CPython raises ``cannot schedule new futures after interpreter shutdown``
+ (module-global flag) or ``... after shutdown`` (a pool whose ``shutdown()`` ran);
+ the short prefix catches both — safe here because every pool involved is a
+ module-global daemon or a ``with``-scoped local only finalization can shut down.
++A first ``ThreadPoolExecutor`` use after the main thread returned imports
++``concurrent.futures.thread``, whose ``threading._register_atexit`` raises
++``can't register atexit after shutdown`` instead: the same exit, another message.
+ """
+ 
+ from __future__ import annotations
+@@ -15,6 +18,8 @@ from __future__ import annotations
+ import sys
+ from typing import Optional
+ 
++_SHUTDOWN_MESSAGES = ("cannot schedule new futures", "can't register atexit after shutdown")
++
+ 
+ def interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
+     """True when the interpreter is finalizing. ``exc`` lets a caller treat an
+@@ -22,4 +27,7 @@ def interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
+     flag can be set a hair before ``sys.is_finalizing()`` flips."""
+     if sys.is_finalizing():
+         return True
+-    return exc is not None and "cannot schedule new futures" in str(exc).lower()
++    if exc is None:
++        return False
++    text = str(exc).lower()
++    return any(m in text for m in _SHUTDOWN_MESSAGES)
+-- 
+2.55.0
+

@@ -85,3 +85,7 @@ Apply 0532, 0533 and 0548 with `git am -3` after the preceding fork patches. 053
 - An owner that is unknown at the click (pasted id, route restore) gets no early paint and no cache write.
 - A row whose replica says offline but whose gateway is in fact up still opens read-only until the sidebar
   shows it live again; clicking the live row resumes normally.
+
+## Follow-up patches (0623)
+
+**0623** (`3285003cc2`): opens of another gateway's session spent 4.5-6.8 s in an "owner" stage. The owner probe (`probeStoredSession`) now answers at once from an awake hub-replica row that matches the named owner (`fallbackSessionRow`); a resume that names no owner takes it from the awake replica row so the cached transcript paints before any await (asleep rows keep the read-only path); the prefetcher puts sessions behind open Inbox cards first, ahead of the per-gateway 200-slot people-first ordering. Code: `electron/transcript-cache-host.ts`, `transcript-prefetch.ts`, `src/app/session/hooks/use-session-actions/{index,utils}.ts`. Tests: `transcript-cache-host.test.ts`, `transcript-prefetch.test.ts`, `use-session-actions.test.tsx`, `resolve-stored-session.test.ts`.

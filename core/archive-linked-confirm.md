@@ -86,3 +86,7 @@ and the data-specific check (machines) stays in a plugin.
 ## Follow-up patch (0560)
 
 **0560** (source `5c653ed500`): the archive hotkey and tile menu archive without a selected row and resolved the owner from Recents only. While a remote gateway's pooled backend reconnects, the unified list has none of its rows, so an open hub chat had no owner and the preflight showed "Task status unavailable" for a chat with nothing linked. The owner is now resolved like resume and branch do (tagged project-tree/cron/messaging row, else the owner hint) in `archive-owner.ts`, and `refresh-archive-tasks.ts` logs why the task preflight returned unknown. Tests: `archive-linked-confirm.test.tsx` (new cases).
+
+## Follow-up patches (0617)
+
+**0617** (`dd4f150218`): the archive preflight read Kanban task status with 2 s per read / 2.5 s overall and reported "task status unknown" whenever the backend was slower. Reads now allow 6 s, retry once on a timeout, within a 14 s budget. Code: `apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts`; test: `confirm-linked-archive.test.ts`.

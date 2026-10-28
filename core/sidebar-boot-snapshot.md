@@ -70,3 +70,7 @@ restart; a disk-plugin hot reload cannot activate it.
 ## Plugin?
 
 No. It needs the Electron main process and the pre-render store; the hub-sync half already is a bundled plugin.
+
+## Follow-up patches (0621)
+
+**0621** (`ff8ec1d78c`): replica recents showed "Subagent: ..." rows in Home, because hub replica rows (other gateways, and this gateway's own boot snapshot) only went through the source rule and a delegate child keeps its parent's source. The replica recents rule now drops rows the owner stamps `is_internal_child`. Exact-id opens are unaffected. Code: `apps/desktop/src/store/offline-sessions.ts`; test in `offline-sessions.test.ts`.

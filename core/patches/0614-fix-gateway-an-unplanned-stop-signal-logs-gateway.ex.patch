@@ -1,0 +1,241 @@
+From 7784b69330d62e00f76d27bd83c15a367e5558cb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:48:19 +0000
+Subject: [PATCH] fix(gateway): an unplanned stop signal logs
+ gateway.exit_signal (signal + parent), not a bare exit_nonzero [daveey]
+
+start_gateway() returns False for a SIGTERM with no planned-stop marker (launchctl bootout,
+kickstart -k, systemctl stop) so the supervisor revives the gateway. run_gateway() then wrote
+gateway.exit_nonzero with no signal or parent, so a supervisor bounce, a refused start and a
+restart loop looked identical and the self-heal detector filed every planned restart as a crash
+(mini, defect gateway-3cf2256311). The signal handler now records the signal + parent on the
+runner, the exit verdict exposes it via run_shutdown.last_signal_exit(), and run_gateway logs
+gateway.exit_signal (level info). Exit code stays 1; a failure verdict (refused start) still
+logs gateway.exit_nonzero.
+---
+ gateway/run.py                               |   6 +
+ gateway/run_shutdown.py                      |  14 +++
+ hermes_cli/gateway.py                        |   8 +-
+ hermes_cli/gateway_exit_diag.py              |   5 +-
+ tests/hermes_cli/test_gateway_exit_diag.py   |   1 +
+ tests/hermes_cli/test_gateway_exit_signal.py | 110 +++++++++++++++++++
+ 6 files changed, 141 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_gateway_exit_signal.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index d53cec82ca..36fcebc90e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5188,6 +5188,12 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
+             # Mirrored onto the runner so _stop_impl suppresses the gateway_state=stopped persist for
+             # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
+             _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
++            # Carried to the exit-diag record so a supervisor bounce isn't logged as a bare failure.
++            runner._unplanned_signal = {
++                "signal": sig_name or getattr(received_signal, "name", None) or "UNKNOWN",
++                "ppid": (_shutdown_ctx or {}).get("ppid", os.getppid()),
++                "parent": (_shutdown_ctx or {}).get("parent"),
++            }
+             logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
+ 
+         if _shutdown_ctx is not None:
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 064c4a48aa..c693635bd9 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -44,8 +44,21 @@ def _exit_with_failure_verdict(runner) -> bool:
+     return True
+ 
+ 
++# Set when the last verdict was "exit 1 because an unplanned stop signal arrived" (not a refused
++# start): ``hermes gateway run`` logs that as ``gateway.exit_signal`` with the signal and parent,
++# instead of a bare ``gateway.exit_nonzero`` that reads like a crash.
++_last_signal_exit: Optional[dict] = None
++
++
++def last_signal_exit() -> Optional[dict]:
++    """``{"signal", "ppid", "parent"}`` when the last verdict was an unplanned-signal exit, else None."""
++    return _last_signal_exit
++
++
+ def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bool:
+     """Resolve the process verdict after either startup abort or normal shutdown."""
++    global _last_signal_exit
++    _last_signal_exit = None
+     if _exit_with_failure_verdict(runner):
+         return False
+     if runner.exit_code is not None:
+@@ -55,6 +68,7 @@ def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bo
+             "Exiting with code 1 (signal-initiated shutdown without restart "
+             "request) so the service manager can revive the gateway."
+         )
++        _last_signal_exit = dict(getattr(runner, "_unplanned_signal", None) or {"signal": "UNKNOWN"})
+         return False
+     # Older restart paths may not set ``runner.exit_code``; retain the service-restart fallback.
+     if runner._restart_via_service:
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index c6353c8824..6c8acd8b45 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -4695,7 +4695,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
+         _exit_diag("asyncio.run.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
+         raise
+     if not success:
+-        _exit_diag("gateway.exit_nonzero")
++        # An unplanned stop signal (bootout, kickstart -k, systemctl stop) exits 1 on purpose so the
++        # service manager revives us: record which signal and parent, not a bare failure.
++        from gateway.run_shutdown import last_signal_exit
++        if (sig := last_signal_exit()) is not None:
++            _exit_diag("gateway.exit_signal", **sig)
++        else:
++            _exit_diag("gateway.exit_nonzero")
+         _hard_exit_after_gateway_teardown(1)
+     _exit_diag("gateway.exit_clean")
+     _hard_exit_after_gateway_teardown(0)
+diff --git a/hermes_cli/gateway_exit_diag.py b/hermes_cli/gateway_exit_diag.py
+index 203b14cb64..5641083683 100644
+--- a/hermes_cli/gateway_exit_diag.py
++++ b/hermes_cli/gateway_exit_diag.py
+@@ -13,8 +13,9 @@ import os
+ import sys
+ from datetime import UTC, datetime
+ 
+-# start_gateway() also returns False for a SIGTERM stop (launchctl bootout, systemctl stop), so a
+-# non-zero return is a warning; only an escaped exception or a failing SystemExit is an error.
++# An unplanned stop signal (launchctl bootout, kickstart -k, systemctl stop) is logged as
++# ``gateway.exit_signal`` (info, with signal + parent); a bare non-zero return is a warning; only an
++# escaped exception or a failing SystemExit is an error.
+ _TAG_LEVELS = {"asyncio.run.exception": "error", "gateway.exit_nonzero": "warning"}
+ 
+ 
+diff --git a/tests/hermes_cli/test_gateway_exit_diag.py b/tests/hermes_cli/test_gateway_exit_diag.py
+index 98da21b6a7..00d03b7da2 100644
+--- a/tests/hermes_cli/test_gateway_exit_diag.py
++++ b/tests/hermes_cli/test_gateway_exit_diag.py
+@@ -42,6 +42,7 @@ def test_failing_system_exit_is_error(code):
+         ("gateway.exit_clean", "info"),
+         ("atexit.hook", "info"),
+         ("gateway.exit_nonzero", "warning"),
++        ("gateway.exit_signal", "info"),
+         ("asyncio.run.exception", "error"),
+     ],
+ )
+diff --git a/tests/hermes_cli/test_gateway_exit_signal.py b/tests/hermes_cli/test_gateway_exit_signal.py
+new file mode 100644
+index 0000000000..c7be7924bb
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_exit_signal.py
+@@ -0,0 +1,110 @@
++"""An unplanned stop signal is logged as ``gateway.exit_signal``, not a bare ``gateway.exit_nonzero``.
++
++``start_gateway()`` returns False for a SIGTERM with no planned-stop marker (``launchctl bootout``,
++``kickstart -k``, ``systemctl stop``) so the service manager revives the gateway. ``run_gateway()``
++then wrote ``gateway.exit_nonzero`` with no signal or parent, so a supervisor bounce, a refused start
++and a restart loop looked identical and the self-heal detector filed every planned restart as a
++crash (mini, Oct 2026, defect gateway-3cf2256311). The exit code must stay 1 either way.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import signal
++import types
++from pathlib import Path
++
++import pytest
++
++
++class _HardExit(BaseException):
++    def __init__(self, code: int):
++        super().__init__(code)
++        self.code = code
++
++
++def _rows() -> list[dict]:
++    path = Path(os.environ["HERMES_HOME"]) / "logs" / "gateway-exit-diag.log"
++    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
++
++
++def _runner(*, fail: bool = False):
++    async def _stop():
++        return None
++
++    return types.SimpleNamespace(
++        _signal_initiated_shutdown=False, _restart_requested=False, _restart_via_service=False,
++        should_exit_with_failure=fail, exit_reason="no platform connected" if fail else None,
++        exit_code=None, stop=_stop,
++    )
++
++
++def _prepare(monkeypatch, runner, sig):
++    """Run the real CLI entry with a fake asyncio.run that drives the real signal handler + verdict."""
++    import gateway.run as gateway_run
++    import gateway.shutdown_forensics as forensics
++    import hermes_cli.gateway as gateway_cli
++    from gateway import status
++    from gateway.run_shutdown import _resolve_gateway_exit_verdict
++
++    monkeypatch.setattr(gateway_cli, "_guard_official_docker_root_gateway", lambda: None)
++    monkeypatch.setattr(gateway_cli, "_guard_named_profile_under_multiplexer", lambda force=False: None)
++    monkeypatch.setattr(gateway_cli, "_attach_to_host_gateway_or_guard", lambda **kwargs: None)
++    monkeypatch.setattr(gateway_cli, "_guard_supervised_gateway_conflict", lambda force=False: None)
++    monkeypatch.setattr(gateway_cli, "_guard_existing_gateway_process_conflict", lambda replace=False: None)
++    monkeypatch.setattr(gateway_cli, "_respawn_storm_backoff", lambda: None)
++    monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
++    monkeypatch.setattr(gateway_cli.sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
++    monkeypatch.setenv("HERMES_GATEWAY_EXIT_DIAG", "1")
++    monkeypatch.setattr(status, "consume_takeover_marker_for_self", lambda: False)
++    monkeypatch.setattr(status, "consume_planned_stop_marker_for_self", lambda: False)
++    monkeypatch.setattr(forensics, "spawn_async_diagnostic", lambda *a, **k: None)
++    monkeypatch.setattr(gateway_run.asyncio, "create_task", lambda coro: coro.close())
++
++    def _hard_exit(code: int) -> None:
++        raise _HardExit(code)
++
++    monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", _hard_exit)
++
++    def _fake_run(coro):
++        coro.close()
++        flag = [False]
++        if sig is not None:
++            gateway_run._start_gateway_make_shutdown_signal_handler(runner, flag)(sig)
++        return _resolve_gateway_exit_verdict(runner, flag[0])
++
++    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
++    return gateway_cli
++
++
++def test_unplanned_sigterm_writes_exit_signal_with_signal_and_parent(monkeypatch):
++    gateway_cli = _prepare(monkeypatch, _runner(), signal.SIGTERM)
++    with pytest.raises(_HardExit) as exc:
++        gateway_cli.run_gateway()
++    assert exc.value.code == 1  # launchd/systemd still revive it
++    last = _rows()[-1]
++    assert last["tag"] == "gateway.exit_signal"
++    assert last["signal"] == "SIGTERM"
++    assert last["level"] == "info"
++    assert last["ppid"] == os.getppid()
++    assert "gateway.exit_nonzero" not in [r["tag"] for r in _rows()]
++
++
++def test_refused_start_still_writes_exit_nonzero(monkeypatch):
++    """A failure verdict (no platform connected) is a real failure even when a signal also arrived."""
++    gateway_cli = _prepare(monkeypatch, _runner(fail=True), signal.SIGTERM)
++    with pytest.raises(_HardExit) as exc:
++        gateway_cli.run_gateway()
++    assert exc.value.code == 1
++    tags = [r["tag"] for r in _rows()]
++    assert tags[-1] == "gateway.exit_nonzero"
++    assert "gateway.exit_signal" not in tags
++
++
++def test_refused_start_without_signal_writes_exit_nonzero(monkeypatch):
++    gateway_cli = _prepare(monkeypatch, _runner(fail=True), None)
++    with pytest.raises(_HardExit) as exc:
++        gateway_cli.run_gateway()
++    assert exc.value.code == 1
++    assert _rows()[-1]["tag"] == "gateway.exit_nonzero"
+-- 
+2.55.0
+

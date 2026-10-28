@@ -1,0 +1,159 @@
+From 246370c63cb6a3f9f8fe87dee3d1aeeb752a8247 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 05:41:59 +0000
+Subject: [PATCH] fix(agent): retry/recovery interrupt exits record their
+ reason too; phase field [daveey]
+
+Follow-up to 7b9f2606cc. abort_turn_on_interrupt (error handling, retry backoff,
+empty-response retry, provider autorecover) wrote its own "Operation interrupted: ..."
+row with no reason, the same blind spot as the model-wait path (found by the live
+check: a Stop during a retry backoff saved a bare row). It now records
+display_metadata.interrupt and result["interrupt"] before clear_interrupt drops the
+reason. record_api_interrupt gains phase=model_wait|retry_wait so the slow-first-token
+count can tell the two apart.
+
+test_turn_api_call_interrupt: the partial row now carries the interrupt record next to
+interrupted=True; the exact-dict assertion pinned the old shape (stale after 7b9f2606cc).
+New: test_backend_exit_during_retry_backoff_records_backend_exit (red before).
+---
+ agent/interrupt_control.py                  | 15 +++----
+ agent/turn_recovery.py                      |  8 +++-
+ tests/agent/test_turn_api_call_interrupt.py |  4 +-
+ tests/tui_gateway/test_interrupt_reason.py  | 46 +++++++++++++++++++++
+ 4 files changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
+index fd0a1fd94e..9b6e8f81f9 100644
+--- a/agent/interrupt_control.py
++++ b/agent/interrupt_control.py
+@@ -66,17 +66,18 @@ def interrupt_reason(agent) -> str:
+     return _USER_REASON_SLUGS.get(reason) or interrupt_issuer(agent) or "unknown"
+ 
+ 
+-def record_api_interrupt(agent, waited_s: float, messages) -> dict:
+-    """[daveey] Note an interrupt that landed while waiting for the model: ``{reason, waited_s, prompt_tokens}``
+-    on ``agent._last_api_interrupt`` (the finalizer stamps it on the interrupted row and the turn result) and one
+-    INFO line in agent.log. Before this every producer saved the same bare text (self-heal agent-38bad5aced)."""
++def record_api_interrupt(agent, waited_s: float, messages, *, phase: str = "model_wait") -> dict:
++    """[daveey] Note an interrupt that landed while waiting for the model (``phase="model_wait"``) or in a retry /
++    recovery backoff (``"retry_wait"``): ``{reason, phase, waited_s, prompt_tokens}`` on ``agent._last_api_interrupt``
++    (stamped on the interrupted row and the turn result) and one INFO line in agent.log. Before this every producer
++    saved the same bare text (self-heal agent-38bad5aced)."""
+     from agent.model_metadata import estimate_messages_tokens_rough
+     prompt_tokens = int(estimate_messages_tokens_rough(list(messages or [])))
+-    info = {"reason": interrupt_reason(agent), "waited_s": round(max(0.0, float(waited_s)), 1),
++    info = {"reason": interrupt_reason(agent), "phase": phase, "waited_s": round(max(0.0, float(waited_s)), 1),
+             "prompt_tokens": prompt_tokens}
+     agent._last_api_interrupt = info
+-    logger.info("turn interrupted: reason=%s waited=%.1fs prompt_tokens=%d model=%s session=%s",
+-                info["reason"], info["waited_s"], prompt_tokens, getattr(agent, "model", None),
++    logger.info("turn interrupted: reason=%s phase=%s waited=%.1fs prompt_tokens=%d model=%s session=%s",
++                info["reason"], phase, info["waited_s"], prompt_tokens, getattr(agent, "model", None),
+                 getattr(agent, "session_id", None) or "none")
+     return info
+ 
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index 635fb55297..0a23f08d55 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1334,14 +1334,18 @@ def abort_turn_on_interrupt(
+     # already-executed tool result. Strip only that request-local scaffold before
+     # closing, so this exit owner can persist its specific interrupt reason.
+     agent._drop_trailing_empty_response_scaffolding(messages)
+-    close_interrupted_tool_sequence(messages, interrupt_text)
++    # [daveey] Record WHY (user_stop / backend_exit / ...) before clear_interrupt drops the reason.
++    from agent.interrupt_control import record_api_interrupt
++    interrupt_info = record_api_interrupt(agent, 0.0, messages, phase="retry_wait")
++    vars(agent).pop("_last_api_interrupt", None)
++    close_interrupted_tool_sequence(messages, interrupt_text, display_metadata={"interrupt": interrupt_info})
+     agent._persist_session(messages, conversation_history)
+     # The turn was stopped, not rebuilt: a pending steer was aimed at this turn's next
+     # tool iteration, which will no longer happen — drop it (hard-cancel semantics).
+     agent.clear_interrupt(hard_cancel=True)
+     return {
+         "final_response": interrupt_text, "messages": messages, "api_calls": api_call_count,
+-        "completed": False, "interrupted": True,
++        "completed": False, "interrupted": True, "interrupt": interrupt_info,
+     }
+ 
+ 
+diff --git a/tests/agent/test_turn_api_call_interrupt.py b/tests/agent/test_turn_api_call_interrupt.py
+index 764c961157..65d84b7ff3 100644
+--- a/tests/agent/test_turn_api_call_interrupt.py
++++ b/tests/agent/test_turn_api_call_interrupt.py
+@@ -72,5 +72,7 @@ def test_ordinary_partial_is_kept_as_the_interrupted_row():
+     messages, verdict = _interrupt("Visible draft.")
+ 
+     assert (messages[-1]["role"], messages[-1]["content"]) == ("assistant", "Visible draft.")
+-    assert messages[-1]["display_metadata"] == {"interrupted": True}
++    assert messages[-1]["display_metadata"]["interrupted"] is True
++    # [daveey] The row also records why the wait was cut short (agent-38bad5aced).
++    assert set(messages[-1]["display_metadata"]["interrupt"]) == {"reason", "phase", "waited_s", "prompt_tokens"}
+     assert verdict.final_response == "Visible draft."
+diff --git a/tests/tui_gateway/test_interrupt_reason.py b/tests/tui_gateway/test_interrupt_reason.py
+index 8ed654ef29..44b4a6da9f 100644
+--- a/tests/tui_gateway/test_interrupt_reason.py
++++ b/tests/tui_gateway/test_interrupt_reason.py
+@@ -160,6 +160,7 @@ def test_backend_exit_records_backend_exit(agent, sid, monkeypatch, caplog):
+     result = _run_with_slow_model(agent, monkeypatch, lambda: server._stop_turns_before_exit(budget_s=0))
+     _assert_recorded(result, caplog, "backend_exit")
+     assert result["interrupt_issuer"] == "backend_exit"
++    assert _interrupted_row(result)["phase"] == "model_wait"
+ 
+ 
+ def test_ws_orphan_reaper_records_ws_orphan(agent, sid, monkeypatch, caplog):
+@@ -183,6 +184,51 @@ def test_lease_takeover_records_lease_takeover(agent, sid, monkeypatch, caplog):
+     _assert_recorded(result, caplog, "lease_takeover")
+ 
+ 
++def test_backend_exit_during_retry_backoff_records_backend_exit(agent, sid, monkeypatch, caplog):
++    """The retry/recovery exits (``abort_turn_on_interrupt``: error handling, retry backoff, empty-response retry,
++    provider autorecover) save their own "Operation interrupted: ..." text; they record the reason too."""
++    import importlib
++
++    import httpx
++    import openai
++
++    turn_api_error = importlib.import_module("agent.turn_api_error")  # `agent` is the fixture here
++
++    caplog.set_level(logging.INFO)
++    monkeypatch.setattr(server, "_clear_pending", lambda *_a, **_k: None)
++    _session(sid, agent)
++    calls = []
++
++    def provider(*_a, **kw):
++        calls.append(kw)
++        if len(calls) == 1:
++            return _tool_call_response()
++        raise openai.APIConnectionError(request=httpx.Request("POST", "http://127.0.0.1/v1/chat/completions"))
++
++    def backoff(*_a, **_k):
++        server._stop_turns_before_exit(budget_s=0)  # the backend exits while the turn waits to retry
++        return 30.0
++
++    monkeypatch.setattr(turn_api_error, "compute_error_backoff", backoff)
++
++    rc = MagicMock()
++    rc.chat.completions.create.side_effect = provider
++    agent.client.chat.completions.create.side_effect = provider
++    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: rc)
++    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **kw: None)
++    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
++    with (
++        patch("model_tools.handle_function_call", return_value="search result"),
++        patch.object(agent, "_persist_session"),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        result = agent.run_conversation("look it up")
++    _assert_recorded(result, caplog, "backend_exit")
++    assert _interrupted_row(result)["phase"] == "retry_wait"
++    assert result["final_response"].startswith("Operation interrupted: retrying API call after error")
++
++
+ def test_compute_host_interrupt_frame_carries_the_reason(monkeypatch):
+     """An isolated (compute-host) turn is interrupted in the child: the reason rides on the frame."""
+     from tui_gateway.host_supervisor import HostSupervisor
+-- 
+2.55.0
+

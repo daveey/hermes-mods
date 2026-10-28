@@ -88,3 +88,7 @@ mirror's `runs-on` label is whatever your runners register.
 ## Plugin?
 
 No. CI config and tests.
+
+## Follow-up patches (0606, 0609, 0622)
+
+Red-main fixes, no behaviour change: **0606** (`7d752288be`) allowlists the bare `which` in `hub_cli_path` in `tests/fixtures/resolution_allowlist.json` and makes the stdio test opt out of host slots so it reads no real `~/.hermes`. **0609** (`fd394a4611`) fixes ruff PIE807 in `tests/hermes_cli/test_kanban_placement.py` (stub `config` with `dict`) and replaces `os.kill(pid, 0)` in `tools/browser_use_cli.py` `_owner_alive` with `gateway.status._pid_exists` (Windows-safe, treats zombies as dead); both had landed while main's concurrency group cancelled every newer run. **0622** (`838f8024f7`) refreshes the nine `tool_tokens` counts in `tests/fixtures/prompt_surface/surfaces.json` left stale by a `browser_exec` schema change; no prompt or schema text moves. Verified by the CI jobs named (ruff, footgun, `tests/ci/test_prompt_surface.py`); `_owner_alive` has no new dedicated test (untested).

@@ -1,0 +1,350 @@
+From 1ad73c13508fd832a983af8d53ac53ac6368fd4a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 05:36:44 +0000
+Subject: [PATCH] fix(kanban): a worker parking its own card on an opaque probe
+ must name the producer (opaque_probe_wait); same-probe re-parks count as one
+ premise [daveey]
+
+A wake check that names no card or CI run proves only that something polls. On 10-27 macbook
+t_3b031dd1 parked 9 h (and ~24 h on 10-26) on a python3 probe for 'agent Chrome and ports
+9333/9334 gone' while a launchd KeepAlive job kept that browser up; kanban_wait_info already
+called such parks agent-owned stalls, but the park gate (_infer) recorded them as inferred
+external waits and accepted them.
+
+- _infer refuses a card's own worker parking on an opaque probe with no declared awaiting
+  (code opaque_probe_wait; uses kanban_wait_info.producer_from_wake_check so writer and
+  checker agree). The error says how to declare awaiting={kind:'external', ref, why}, to do
+  the action or create an owner card, or to use a needs_input block. Short continues
+  (<= 2 h) and operator parks (dashboard, terminal: no HERMES_KANBAN_TASK for that card) are
+  unchanged; operator parks still record an inferred wait the checker flags.
+- Repeat counting also keys on the whitespace-normalised opaque probe, so a third park on
+  the same probe escalates to an owner card however the reason is worded.
+- kanban_tools_schemas: wake_check says a probe alone is not a producer.
+- Tests: refusal on schedule/block/long continue + a real hub probe shape; declared external
+  parks; CI/wait-check/short-continue/clock controls; re-worded re-park escalates; worker CLI
+  refused vs operator park accepted. Wake-check mechanism tests declare their producer.
+
+Self-heal kanban-92e96c16fd (t_01a180b0c3a4ca5e).
+---
+ hermes_cli/kanban_awaiting.py              |  78 +++++++++++++---
+ tests/hermes_cli/test_kanban_awaiting.py   | 103 ++++++++++++++++++++-
+ tests/hermes_cli/test_kanban_wake_check.py |  10 +-
+ tools/kanban_tools_schemas.py              |   4 +-
+ 4 files changed, 178 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 3b981092ee..775d29794c 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -21,10 +21,16 @@ Each park now carries ``awaiting = {kind, ref, why}`` on its parking event:
+ 
+ A park with no explicit ``awaiting`` is classified from its text: a pending step for a human is
+ refused (``human_wait``), and a wall only an agent action clears (grant, permission, access) is
+-refused (``agent_action_wait``) unless the producing card is declared. Anything else is recorded
++refused (``agent_action_wait``) unless the producing card is declared. A card's own worker parking it
++on a wake check that names no card or CI run (an opaque probe: "python3 -c ...", "test -f ...") is
++refused too
++(``opaque_probe_wait``): a probe proves only that something polls, which is what the read side
++(``kanban_wait_info``) already reports as a stall; on 10-27 a card waited 9 h on a KeepAlive browser
++nobody would stop. Short continues (<= 2 h, pacing a job) are exempt. Anything else is recorded
+ as an inferred ``clock`` / ``external`` wait so the checker can tell legacy guesses from declared
+ producers. The third park in a row on one premise is not parked again: it becomes one
+-agent-owned owner card for a supervisor and the card waits on it (``repark_escalated``).
++agent-owned owner card for a supervisor and the card waits on it (``repark_escalated``). A park
++on the same opaque probe counts as the same premise however its reason is worded.
+ """
+ from __future__ import annotations
+ 
+@@ -43,7 +49,8 @@ KINDS = ("card", "ci", "deploy", "external", "clock", "human")
+ AGENT_ACTION_WAIT = "agent_action_wait"
+ HUMAN_WAIT = "human_wait"
+ INVALID_AWAITING = "invalid_awaiting"
+-CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING)
++OPAQUE_PROBE_WAIT = "opaque_probe_wait"
++CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING, OPAQUE_PROBE_WAIT)
+ # Parks in a row on one premise before the next one escalates instead (the 3rd park = 2nd re-park).
+ REPARK_LIMIT = 2
+ ESCALATION_PREFIX = "repark-escalation:"
+@@ -371,10 +378,41 @@ def _live_card_ref(conn: sqlite3.Connection, task_id: str, text: str) -> Optiona
+     return None
+ 
+ 
++def _short_continue(op: str, wake_in: Optional[int]) -> bool:
++    return op == "continue" and (wake_in or 0) <= CONTINUE_TEXT_GUARD_SECONDS
++
++
++def opaque_probe(wake_check: Optional[str]) -> Optional[str]:
++    """The probe's name when a wake check names no card or CI run, else None. Same classifier as the
++    read side (``kanban_wait_info``), so the gate refuses exactly what the checker would call a stall."""
++    from hermes_cli.kanban_wait_info import producer_from_wake_check
++    found = producer_from_wake_check(wake_check)
++    return found[1] if found and found[0] == "probe" else None
++
++
++def parked_by_own_worker(task_id: str) -> bool:
++    """True when the card's own worker parks it (tool or CLI inside the worker process, which carries
++    ``HERMES_KANBAN_TASK``). An operator on the dashboard or a terminal is accountable for the probe it
++    sets; a worker parking itself on one is the 10-27 orphan shape."""
++    return bool(task_id) and os.environ.get("HERMES_KANBAN_TASK") == task_id
++
++
++def opaque_probe_error(probe: str) -> AwaitingError:
++    return AwaitingError(OPAQUE_PROBE_WAIT, (
++        f"this park waits on probe {probe!r} and names no producer. A probe proves only that something "
++        "polls, not that anything will ever make it pass. Say who changes that state: "
++        "awaiting={kind:'external', ref:'<who or what changes it>', why:'<evidence it will>'} (or "
++        "kind 'card'/'ci'/'deploy' when a card or run produces it). If only an action changes it (stop a "
++        "service, free a resource, retire tabs), that is work, not a wait: do it now, or create the owner "
++        "card and park with awaiting={kind:'card', ref:'<owner id>'}. If it needs David, "
++        "kanban_block(kind='needs_input', human_request={...}) instead."))
++
++
+ def _infer(conn, task_id, *, reason, wake_check, clock_only, op, wake_in) -> dict:
+     text = reason or ""
+     producer = _live_card_ref(conn, task_id, f"{text} {wake_check or ''}")
+-    if not (op == "continue" and (wake_in or 0) <= CONTINUE_TEXT_GUARD_SECONDS):
++    short = _short_continue(op, wake_in)
++    if not short:
+         wall = text_wall(text)
+         # A visible ask on the card waited on is not hidden; an agent wall needs a DECLARED owner card.
+         if wall and not (wall[0] == HUMAN_WAIT and producer):
+@@ -382,13 +420,26 @@ def _infer(conn, task_id, *, reason, wake_check, clock_only, op, wake_in) -> dic
+     if producer:
+         return {"kind": "card", "ref": producer, "inferred": True}
+     if wake_check and not clock_only:
++        probe = None if short or not parked_by_own_worker(task_id) else opaque_probe(wake_check)
++        if probe:
++            raise opaque_probe_error(probe)
+         return {"kind": "external", "ref": wake_check[:200], "inferred": True}
+     return {"kind": "clock", "inferred": True}
+ 
+ 
+-def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str) -> int:
+-    """Trailing parks of this card on ``premise``, newest first, stopping at the first other
+-    premise or at the last escalation (the supervisor acted since)."""
++def probe_premise(wake_check: Optional[str], *, op: str = "schedule", wake_in: Optional[int] = None) -> Optional[str]:
++    """Premise key of an opaque probe (whitespace-normalised command), so re-parks on one probe count
++    as one premise whatever the reason says. None for card/CI probes and short pacing continues."""
++    if _short_continue(op, wake_in) or not opaque_probe(wake_check):
++        return None
++    basis = "probe|" + " ".join(str(wake_check).split())
++    return hashlib.sha256(basis.encode()).hexdigest()[:16]
++
++
++def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
++                       probe: Optional[str] = None) -> int:
++    """Trailing parks of this card on ``premise`` (or on the same opaque ``probe``), newest first,
++    stopping at the first other premise or at the last escalation (the supervisor acted since)."""
+     count = 0
+     for kind, payload in conn.execute(
+             "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued',?) "
+@@ -396,12 +447,12 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str) ->
+         if kind == ESCALATED_EVENT:
+             break
+         try:
+-            got = (json.loads(payload or "{}").get("awaiting") or {}).get("premise")
++            got = json.loads(payload or "{}").get("awaiting") or {}
+         except (ValueError, AttributeError):
+-            got = None
+-        if got is None:
++            got = {}
++        if not isinstance(got, dict) or got.get("premise") is None:
+             continue  # a continuation with no wait, or a legacy park
+-        if got != premise:
++        if got["premise"] != premise and not (probe and got.get("probe") == probe):
+             break
+         count += 1
+     return count
+@@ -419,7 +470,10 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     if record["kind"] == "card" or (record["kind"] == "clock" and record.get("inferred")):
+         return record
+     record["premise"] = premise_hash(record, reason)
+-    if prior_same_premise(conn, task_id, record["premise"]) >= REPARK_LIMIT:
++    probe = probe_premise(wake_check, op=op, wake_in=wake_in)
++    if probe:
++        record["probe"] = probe
++    if prior_same_premise(conn, task_id, record["premise"], probe=probe) >= REPARK_LIMIT:
+         raise RepeatedPark(record)
+     return record
+ 
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+index b8ad105228..881578382b 100644
+--- a/tests/hermes_cli/test_kanban_awaiting.py
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -231,10 +231,11 @@ def test_replay_tracker_card_that_produces_nothing_is_refused(kanban_home, monke
+     "David's decision recorded 23:06 (design A); waiting for TestFlight processing build 412.",
+ ])
+ def test_ordinary_park_prose_is_not_a_wall(kanban_home, monkeypatch, reason) -> None:
++    # clock_only: an opaque "exit 1" probe with no producer is now refused on its own (opaque_probe_wait).
+     with kbc.connect_closing() as conn:
+         tid = _running(conn)
+         _as_worker(monkeypatch, conn, tid)
+-        out = _tool("schedule", {"reason": reason, "wake_check": "exit 1"})
++        out = _tool("schedule", {"reason": reason, "clock_only": True})
+         assert out.get("status") == "scheduled", out
+ 
+ 
+@@ -458,3 +459,103 @@ def test_unrelated_ledger_topics_do_not_match(kanban_home) -> None:
+     c.commit()
+     c.close()
+     assert kaw.answered_ask("t_x", "Waiting on David's approval for the hub restart; card status blocked") is None
++
++
++# -- opaque probes: a probe alone is not a producer (kanban-92e96c16fd) ------------------------------
++
++# macbook t_3b031dd1, run 5175 (10-27 17:33 UTC): parked 9 h on a probe nobody would ever make pass. The
++# agent Chrome is a launchd KeepAlive job in active use, and the plan forbids closing unknown tabs.
++CHROME_PROBE_REASON = ("SCHEDULED_UNTIL=2099-01-01T00:00:00Z \u2014 tab-ownership + idle-shutdown code is shipped; "
++                       "the legacy agent Chrome (KeepAlive supervisor 85897, browser 85920) still holds 26 pages. "
++                       "Wakes when the exact agent browser and both listeners (9333/9334) are absent.")
++CHROME_PROBE = ("python3 -c \"import socket,sys; sys.exit(0 if all(socket.socket().connect_ex(('127.0.0.1', p)) "
++                "for p in (9333, 9334)) else 1)\"")
++
++
++@pytest.mark.parametrize("op,args", [
++    ("schedule", {"reason": CHROME_PROBE_REASON, "wake_check": CHROME_PROBE}),
++    ("block", {"reason": CHROME_PROBE_REASON, "kind": "time", "wake_check": CHROME_PROBE}),
++    ("continue", {"checkpoint": CHROME_PROBE_REASON, "resume_after_seconds": 86400, "wake_check": CHROME_PROBE}),
++    ("schedule", {"reason": "Waiting for the queue file to change.",
++                  "wake_check": "test \"$(sha256sum QUEUE.md | cut -d ' ' -f 1)\" != ec94660442"}),
++])
++def test_opaque_probe_with_no_producer_is_refused(kanban_home, monkeypatch, op, args) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool(op, args)
++        assert "opaque_probe_wait" in (out.get("code"), out.get("rejection")), out
++        # The refusal says how to name the producer, and what to do when nobody else produces it.
++        assert "awaiting={kind:'external'" in out["error"] and "owner card" in out["error"], out
++        assert "needs_input" in out["error"], out
++        assert kb.get_task(conn, tid).status == "running" and kwc.get_state(conn, tid) is None
++
++
++def test_opaque_probe_with_a_declared_external_producer_parks(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": CHROME_PROBE_REASON, "wake_check": CHROME_PROBE, "awaiting": {
++            "kind": "external", "ref": "launchd com.example.agent-chrome",
++            "why": "the 02:00 maintenance job unloads it nightly (log line 'agent-chrome unloaded')"}})
++        assert out.get("status") == "scheduled", out
++        rec = _park_payload(conn, tid)["awaiting"]
++        assert rec["kind"] == "external" and not rec.get("inferred")
++        assert kwc.get_state(conn, tid)["cmd"] == CHROME_PROBE
++
++
++@pytest.mark.parametrize("op,args", [
++    ("schedule", {"reason": "Waiting for CI run 40443505012 to finish.",
++                  "wake_check": "gh run view 40443505012 --json status | grep -q completed"}),
++    ("schedule", {"reason": "Owner card builds the image.", "wake_check": "hermes kanban wait-check task {owner}"}),
++    ("continue", {"checkpoint": "Build still running; check again.", "resume_after_seconds": 600,
++                  "wake_check": "! ps -p 3966721 >/dev/null"}),
++    ("block", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z \u2014 24h soak window.", "kind": "time",
++               "clock_only": True}),
++])
++def test_named_producers_and_short_continues_still_park(kanban_home, monkeypatch, op, args) -> None:
++    with kbc.connect_closing() as conn:
++        owner, tid = _running(conn), _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        args = {k: (v.format(owner=owner) if k == "wake_check" else v) for k, v in args.items()}
++        out = _tool(op, args)
++        assert out.get("status") == "scheduled", out
++
++
++def test_same_probe_reparked_with_new_wording_escalates(kanban_home, monkeypatch) -> None:
++    """The premise was a hash of the reason text, so a re-worded re-park on the same probe never counted."""
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        outs = []
++        for n, why in enumerate(("listeners still up", "browser 85920 still alive, 26 tabs", "KeepAlive respawned")):
++            outs.append(_repark(conn, monkeypatch, tid, "schedule", {
++                "reason": f"park {n}: {why}", "wake_check": CHROME_PROBE,
++                "awaiting": {"kind": "external", "ref": "agent Chrome on the MacBook", "why": why}}))
++        assert [o.get("status") for o in outs[:2]] == ["scheduled", "scheduled"], outs
++        assert outs[2].get("code") == kaw.ESCALATED_EVENT and outs[2].get("status") == "todo", outs[2]
++        assert kb.get_task(conn, outs[2]["owner_task_id"]) is not None
++
++
++def test_worker_cli_park_on_its_own_card_is_refused_but_an_operator_park_is_not(kanban_home, monkeypatch,
++                                                                               capsys) -> None:
++    """Entry paths: the worker's own `hermes kanban schedule` (CLI) and an operator (dashboard/terminal,
++    no worker env). The operator's opaque park still records an inferred wait, so the checker flags it."""
++    from hermes_cli import kanban as kcli
++
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++
++    def run(*argv):
++        return kcli.kanban_command(parser.parse_args(["kanban", *argv]))
++
++    with kbc.connect_closing() as conn:
++        mine, other = _running(conn), _running(conn)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", mine)
++    assert run("schedule", mine, CHROME_PROBE_REASON, "--wake-check", CHROME_PROBE) != 0
++    assert kaw.OPAQUE_PROBE_WAIT in capsys.readouterr().err
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, mine).status == "running" and not kb.list_comments(conn, mine)
++        assert kb.schedule_task(conn, other, reason=CHROME_PROBE_REASON, wake_check=CHROME_PROBE)
++        rec = _park_payload(conn, other)["awaiting"]
++        assert rec["kind"] == "external" and rec["inferred"] is True
+diff --git a/tests/hermes_cli/test_kanban_wake_check.py b/tests/hermes_cli/test_kanban_wake_check.py
+index 323784cbc6..a8e202f0c3 100644
+--- a/tests/hermes_cli/test_kanban_wake_check.py
++++ b/tests/hermes_cli/test_kanban_wake_check.py
+@@ -54,6 +54,10 @@ def _probe(flag: Path) -> str:
+     return f"test -f {flag} && cat {flag} || exit 1"
+ 
+ 
++# A worker parking its own card on an opaque probe names who makes it pass (kanban_awaiting opaque_probe_wait).
++BUILD = {"kind": "external", "ref": "release build 559", "why": "the build job writes the flag when it lands"}
++
++
+ def _assert_condition_wake(conn, tid, flag: Path) -> None:
+     park = _events(conn, tid, "scheduled")[-1].payload
+     assert park["wake_check"] == _probe(flag) and park["check_every"] == 300
+@@ -86,7 +90,7 @@ def test_kanban_schedule_wake_check_wakes_when_probe_passes(kanban_home, tmp_pat
+         _worker_env(monkeypatch, conn, tid)
+         out = json.loads(kt._handle_schedule({
+             "reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for build 559",
+-            "wake_check": _probe(flag), "check_every": 300}))
++            "wake_check": _probe(flag), "check_every": 300, "awaiting": BUILD}))
+         assert out.get("status") == "scheduled", out
+         _assert_condition_wake(conn, tid, flag)
+ 
+@@ -102,7 +106,7 @@ def test_kanban_block_time_wake_check_wakes_when_probe_passes(kanban_home, tmp_p
+         _worker_env(monkeypatch, conn, tid)
+         out = json.loads(kt._handle_block({
+             "reason": "waiting for build 559", "kind": "time",
+-            "wake_check": _probe(flag), "check_every": 300}))
++            "wake_check": _probe(flag), "check_every": 300, "awaiting": BUILD}))
+         assert out.get("status") == "scheduled", out
+         _assert_condition_wake(conn, tid, flag)
+ 
+@@ -155,7 +159,7 @@ def test_kanban_continue_long_wait_needs_wake_check(kanban_home, tmp_path, monke
+         out = json.loads(kt._handle_continue({"checkpoint": "waiting on CI", "resume_after_seconds": 43200}))
+         assert "error" in out and kb.get_task(conn, tid).status == "running"
+         out = json.loads(kt._handle_continue({"checkpoint": "waiting on CI", "resume_after_seconds": 43200,
+-                                              "wake_check": _probe(flag), "check_every": 300}))
++                                              "wake_check": _probe(flag), "check_every": 300, "awaiting": BUILD}))
+         assert out.get("status") == "scheduled", out
+         assert _events(conn, tid, "continued")[-1].payload["wake_check"] == _probe(flag)
+         flag.write_text("ci green\n")
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index e3b7dc60a8..830ff50c73 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -195,7 +195,9 @@ _WAKE_CHECK_PROPS = {
+         "at once (its stdout reaches the next run), exit 1 = not yet. Any other exit 3 times in "
+         "a row wakes the card to fix the probe. REQUIRED for a wait on any readable fact (a DB "
+         "row, a git tag, a file, a log line, a service state) that wakes more than 2 h out, e.g. "
+-        "`gh api repos/O/R/tags --jq '.[].name' | grep -q '^v2'`. A wait on another card on "
++        "`gh api repos/O/R/tags --jq '.[].name' | grep -q '^v2'`. A probe alone is not a producer: "
++        "one that names no card or CI run is refused (opaque_probe_wait) unless `awaiting` says who "
++        "will make it pass. A wait on another card on "
+         "this board is a parent link (kanban_link), not a park."
+     )),
+     "check_every": {"type": "integer", "description": (
+-- 
+2.55.0
+

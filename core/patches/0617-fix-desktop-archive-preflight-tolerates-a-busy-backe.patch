@@ -1,0 +1,124 @@
+From dd4f150218cf07fd3d5e38fc317845df3cfc4f82 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:50:43 -0700
+Subject: [PATCH] fix(desktop): archive preflight tolerates a busy backend (6s
+ reads, one timeout retry, 14s budget) [daveey]
+
+2s per read / 2.5s overall reported 'task status unknown' whenever the backend
+took longer than that to answer.
+---
+ .../confirm-linked-archive.test.ts            | 24 ++++++++++++++-
+ .../refresh-archive-tasks.ts                  | 30 ++++++++++++++-----
+ 2 files changed, 46 insertions(+), 8 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
+index c072e6f32f..544394c60e 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/confirm-linked-archive.test.ts
+@@ -67,7 +67,7 @@ it('bounds a hung task read instead of hanging archive', async () => {
+   vi.useFakeTimers()
+   vi.stubGlobal('hermesDesktop', { api: () => new Promise(() => {}) })
+   const pending = confirmLinkedArchive('tip', { id: 'tip', connection_id: 'owner' } as SessionInfo, 'work', en.desktop)
+-  await vi.advanceTimersByTimeAsync(2500)
++  await vi.advanceTimersByTimeAsync(14_000)
+   expect($confirmRequest.get()?.details).toEqual([{ label: 'Kanban tasks', value: en.desktop.archiveLinkedTasksUnknown }])
+   expect($confirmRequest.get()?.description).not.toMatch(/still has work linked/)
+   settleConfirm(false)
+@@ -89,3 +89,25 @@ it.each([undefined, 'remote-owner'])('refreshes expired empty observations on th
+   expect($confirmRequest.get()).toBeNull()
+   expect(api.mock.calls.every(([args]) => args.connectionId === (connectionId || 'primary-owner') && args.profile === 'work')).toBe(true)
+ })
++
++it('retries a timed-out read once instead of reporting unknown', async () => {
++  const row = { id: 'tip', connection_id: 'owner', profile: 'work', kanban_unknown: true } as SessionInfo
++  let sessionCalls = 0
++
++  const api = vi.fn(async ({ path, timeoutMs }) => {
++    expect(timeoutMs).toBeGreaterThanOrEqual(5_000)
++
++    if (path.startsWith('/api/sessions/')) {
++      if (++sessionCalls === 1) {throw new Error('Timed out connecting to Hermes backend after 6000ms')}
++
++      return { id: 'tip', parent_session_id: null }
++    }
++
++    return { tasks: [] }
++  })
++
++  vi.stubGlobal('hermesDesktop', { api })
++  await expect(confirmLinkedArchive('tip', row, 'work', en.desktop)).resolves.toBe(true)
++  expect(sessionCalls).toBe(2)
++  expect($confirmRequest.get()).toBeNull()
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+index 0097e121a3..deeee97970 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+@@ -3,6 +3,14 @@ import type { SessionInfo } from '@/hermes'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { hasFreshKanbanObservation } from '@/store/kanban-observation'
+ 
++/** A busy backend can legitimately take several seconds to answer; "unknown" must mean the read
++ * failed, not that it was slow. Each read gets a generous timeout and one retry on a timeout, all
++ * inside an overall budget so the dialog never hangs. */
++const READ_TIMEOUT_MS = 6_000
++const OVERALL_BUDGET_MS = 14_000
++
++const isTimeout = (error: unknown) => /timed out/i.test(String((error as Error)?.message ?? error))
++
+ /** Expired sidebar evidence is a reason to read, not evidence of unfinished work.
+  * Capture the row owner before awaiting; never borrow the foreground gateway.
+  * Failed/malformed reads remain unknown, including incomplete ancestry. */
+@@ -37,6 +45,16 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+   let timer: ReturnType<typeof setTimeout> | undefined
+   let stage = 'start'
+ 
++  const request = async <T>(path: string): Promise<T> => {
++    try {
++      return await hermesApiAs<T>(owner, { path, timeoutMs: READ_TIMEOUT_MS })
++    } catch (error) {
++      if (!isTimeout(error)) {throw error}
++
++      return hermesApiAs<T>(owner, { path, timeoutMs: READ_TIMEOUT_MS })
++    }
++  }
++
+   const read = async (): Promise<SessionInfo> => {
+     const ids = new Set<string>()
+     let current: string | null = id
+@@ -46,9 +64,7 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+       ids.add(current)
+       stage = `GET /api/sessions/${current}`
+ 
+-      const row: { id?: string; parent_session_id?: string | null } = await hermesApiAs(owner, {
+-        path: `/api/sessions/${encodeURIComponent(current)}`, timeoutMs: 2_000
+-      })
++      const row: { id?: string; parent_session_id?: string | null } = await request(`/api/sessions/${encodeURIComponent(current)}`)
+ 
+       if (row?.id !== current || (row.parent_session_id != null && typeof row.parent_session_id !== 'string')) {
+         return unknownBecause(`malformed session row from ${stage}`)
+@@ -60,9 +76,9 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+     if (current) {return unknownBecause('ancestry deeper than 12 hops')}
+     stage = 'GET /api/session-kanban-tasks'
+ 
+-    const result = await hermesApiAs<{ tasks?: Array<{ id?: string; status?: string; stale?: boolean; unfinished?: boolean }> }>(owner, {
+-      path: `/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`, timeoutMs: 2_000
+-    })
++    const result = await request<{ tasks?: Array<{ id?: string; status?: string; stale?: boolean; unfinished?: boolean }> }>(
++      `/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`
++    )
+ 
+     if (!Array.isArray(result?.tasks)) {return unknownBecause(`malformed response from ${stage}`)}
+     let active = 0
+@@ -84,7 +100,7 @@ export async function refreshArchiveTasks(id: string, session: SessionInfo | und
+ 
+   try {
+     return await Promise.race([read(), new Promise<SessionInfo>(resolve => {
+-      timer = setTimeout(() => resolve(unknownBecause(`no answer within 2500ms (${stage})`)), 2_500)
++      timer = setTimeout(() => resolve(unknownBecause(`no answer within ${OVERALL_BUDGET_MS}ms (${stage})`)), OVERALL_BUDGET_MS)
+     })])
+   } catch (error) {
+     return unknownBecause(`${stage} failed`, error)
+-- 
+2.55.0
+

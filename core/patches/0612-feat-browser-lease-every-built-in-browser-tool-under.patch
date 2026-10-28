@@ -1,0 +1,838 @@
+From 4487e0fa3b1033bc865bdcecefd8da96760db0ec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:20:28 +0000
+Subject: [PATCH] feat(browser): lease every built-in browser tool under
+ browser.managed_agent [daveey]
+
+browser_exec was the only managed-Chrome client that acquired an owner lease; the
+built-in tools (navigate/snapshot/click/..., browser_cdp, browser_dialog, the vault
+page ops) resolved the raw cdp_url, which the managed supervisor answers with 403.
+
+- browser_agent_lifecycle: tool_lease (task-scoped "tools" owner, nested reuse,
+  no harness daemon), scoped_override (raises outside a lease, never the raw
+  root), renew_selected (vault keeps the last-selected exec/tools scope leased;
+  a rotated capability fails clearly).
+- _get_cdp_override resolves through the lease; agent-browser sessions pin their
+  lease and re-attach on rotation; managed close is a no-op so cleanup never
+  wakes Chrome; Lightpanda Chrome fallback gated off for managed sessions.
+- Unmanaged cdp_url behavior unchanged (tests run every path both ways).
+---
+ tests/tools/test_browser_managed_all_tools.py | 372 ++++++++++++++++++
+ tools/browser_agent_lifecycle.py              | 144 ++++++-
+ tools/browser_cdp_tool.py                     |  26 +-
+ tools/browser_dialog_tool.py                  |   8 +-
+ tools/browser_tool.py                         |  14 +-
+ tools/browser_tool_cdp.py                     |  15 +-
+ tools/browser_tool_lifecycle.py               |   3 +
+ tools/browser_tool_session.py                 |  44 ++-
+ tools/browser_vault_tool.py                   |   9 +-
+ 9 files changed, 614 insertions(+), 21 deletions(-)
+ create mode 100644 tests/tools/test_browser_managed_all_tools.py
+
+diff --git a/tests/tools/test_browser_managed_all_tools.py b/tests/tools/test_browser_managed_all_tools.py
+new file mode 100644
+index 0000000000..60c711df13
+--- /dev/null
++++ b/tests/tools/test_browser_managed_all_tools.py
+@@ -0,0 +1,372 @@
++"""Every built-in browser tool that attaches to a managed ``browser.cdp_url`` holds an owner lease.
++
++Each entry path runs twice: under ``browser.managed_agent`` (lease acquired before any CDP traffic,
++only the lease-scoped endpoint used, released by task cleanup) and with a plain ``cdp_url``
++(no lifecycle traffic, the raw override used exactly as before).
++"""
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++
++class _Lifecycle:
++    """Fake managed supervisor: /lifecycle/* control, /lease/<cap>/json/version discovery, and a
++    raw root that answers like plain Chrome when unmanaged and 403s when managed (as the real one does)."""
++
++    def __init__(self, managed: bool):
++        self.managed = managed
++        self.calls = []        # (path, payload) lifecycle POSTs
++        self.gets = []         # every GET path
++        self.rotate = False    # next acquire grants a fresh capability
++        self.caps = {}
++        outer = self
++
++        class Handler(BaseHTTPRequestHandler):
++            def _send(self, code, payload):
++                body = json.dumps(payload).encode()
++                self.send_response(code)
++                self.send_header("Content-Type", "application/json")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++
++            def do_POST(self):
++                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
++                outer.calls.append((self.path, payload))
++                if self.path == "/lifecycle/acquire":
++                    owner = tuple(payload["owner"])
++                    if outer.rotate or owner not in outer.caps:
++                        outer.rotate = False
++                        outer.caps[owner] = "cap" + str(len(outer.calls))
++                    cap = outer.caps[owner]
++                    return self._send(200, dict(capability=cap, request_id="req" + str(len(outer.calls)),
++                                                daemon_name="lease-" + cap,
++                                                endpoint=outer.endpoint + "/lease/" + cap))
++                return self._send(200, {"ok": True})
++
++            def do_GET(self):
++                outer.gets.append(self.path)
++                port = outer.server.server_port
++                if self.path.startswith("/lease/") and self.path.endswith("/json/version"):
++                    cap = self.path.split("/")[2]
++                    return self._send(200, {"webSocketDebuggerUrl":
++                                            f"ws://127.0.0.1:{port}/lease/{cap}/devtools/browser/scoped"})
++                if self.path == "/json/version" and not outer.managed:
++                    return self._send(200, {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/raw"})
++                return self._send(403, {"error": "managed Chrome requires an owner lease"})
++
++            def log_message(self, *args):
++                pass
++
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.endpoint = "http://127.0.0.1:" + str(self.server.server_port)
++        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++        self.thread.start()
++
++    def paths(self):
++        return [path for path, _ in self.calls]
++
++    def raw_ws(self):
++        return f"ws://127.0.0.1:{self.server.server_port}/devtools/browser/raw"
++
++    def scoped_ws(self, cap):
++        return f"ws://127.0.0.1:{self.server.server_port}/lease/{cap}/devtools/browser/scoped"
++
++    def close(self):
++        self.server.shutdown()
++        self.server.server_close()
++        self.thread.join(timeout=5)
++
++
++def _write_config(home, browser):
++    (home / "config.yaml").write_text(json.dumps({"browser": browser}))
++
++
++@pytest.fixture(params=["managed", "unmanaged"])
++def env(request, tmp_path, monkeypatch):
++    """Fake lifecycle + agent-browser + supervisor; ``env.managed`` selects the config."""
++    from tools import browser_agent_lifecycle as lifecycle
++    from tools import browser_tool as bt
++    from tools import browser_tool_session as bt_session
++    from tools.browser_supervisor import SUPERVISOR_REGISTRY
++
++    managed = request.param == "managed"
++    fake = _Lifecycle(managed)
++    browser = {"cdp_url": fake.endpoint}
++    if managed:
++        browser["managed_agent"] = {"endpoint": fake.endpoint, "installation_id": "test-installation"}
++    _write_config(tmp_path, browser)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
++    monkeypatch.delenv("CAMOFOX_URL", raising=False)
++
++    for name in ("_active_sessions", "_session_last_activity", "_last_active_session_key"):
++        monkeypatch.setattr(bt, name, {})
++    monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
++    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
++    monkeypatch.setattr(bt, "_url_policy_error", lambda *a, **k: None)
++    monkeypatch.setattr(bt, "_post_redirect_block", lambda *a, **k: None)
++    monkeypatch.setattr(bt, "_attach_auto_snapshot", lambda *a, **k: None)
++    monkeypatch.setattr(bt, "_maybe_start_recording", lambda *a, **k: None)
++    monkeypatch.setattr(bt, "_maybe_stop_recording", lambda *a, **k: None)
++    monkeypatch.setattr(bt, "_blocked_private_page_content", lambda *a, **k: None)
++    monkeypatch.setattr(bt_session, "_browser_command_preflight", lambda: {"browser_cmd": "/usr/bin/agent-browser"})
++
++    spawned = []
++    responses = {
++        "open": {"success": True, "data": {"title": "Example", "url": "https://example.com/"}},
++        "snapshot": {"success": True, "data": {"snapshot": '- button "Go" [ref=e1] and more text', "refs": {}}},
++        "click": {"success": True, "data": {}},
++        "close": {"success": True, "data": {}},
++    }
++
++    def fake_spawn(task_id, session_info, cmd_parts, command, *rest):
++        spawned.append((command, list(cmd_parts)))
++        return json.loads(json.dumps(responses.get(command, {"success": True, "data": {}})))
++
++    monkeypatch.setattr(bt_session, "_spawn_and_collect", fake_spawn)
++
++    attached, stopped = [], []
++    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get_or_start",
++                        lambda task_id, cdp_url, **kw: attached.append((task_id, cdp_url)))
++    monkeypatch.setattr(SUPERVISOR_REGISTRY, "get", lambda task_id: None)
++    monkeypatch.setattr(SUPERVISOR_REGISTRY, "stop", lambda task_id: stopped.append(task_id))
++
++    class Env:
++        pass
++
++    e = Env()
++    e.managed, e.fake, e.spawned, e.responses = managed, fake, spawned, responses
++    e.attached, e.stopped, e.home = attached, stopped, tmp_path
++    yield e
++    lifecycle.release_all()
++    fake.close()
++
++
++def _dispatch(name, args, task_id):
++    import tools.browser_cdp_tool  # noqa: F401 — registers browser_cdp
++    import tools.browser_dialog_tool  # noqa: F401
++    import tools.browser_tool  # noqa: F401
++    import tools.browser_vault_tool  # noqa: F401
++    from tools.registry import registry
++    out = registry.dispatch(name, args, task_id=task_id)
++    return json.loads(out) if isinstance(out, str) else out
++
++
++def _cdp_arg(cmd_parts):
++    return cmd_parts[cmd_parts.index("--cdp") + 1] if "--cdp" in cmd_parts else None
++
++
++def _acquires(fake):
++    return [payload for path, payload in fake.calls if path == "/lifecycle/acquire"]
++
++
++def test_navigate_snapshot_click_flow(env):
++    from tools.browser_tool_lifecycle import cleanup_browser
++    fake = env.fake
++    assert _dispatch("browser_navigate", {"url": "https://example.com/"}, "task-a")["success"]
++    assert _dispatch("browser_snapshot", {}, "task-a")["success"]
++    assert _dispatch("browser_click", {"ref": "@e1"}, "task-a")["success"]
++    commands = [command for command, _ in env.spawned if command != "eval"]  # click pre-checks via eval
++    assert commands == ["open", "snapshot", "click"]
++
++    if env.managed:
++        acquires = _acquires(fake)
++        assert len(acquires) == 3  # one owner request per tool call (nested calls reuse it)
++        assert {tuple(a["owner"][1:]) for a in acquires} == {("task-a", "tools")}
++        assert all("daemon_dir" not in a for a in acquires)  # no harness daemon for agent-browser
++        cap = fake.caps[tuple(acquires[0]["owner"])]
++        assert fake.paths().count("/lifecycle/complete") == 3
++        assert {_cdp_arg(parts) for _, parts in env.spawned} == {fake.scoped_ws(cap)}
++        assert "/json/version" not in fake.gets  # never the unscoped root, even to discover
++        assert env.attached and {url for _, url in env.attached} == {fake.scoped_ws(cap)}
++        cleanup_browser("task-a")
++        released = [p["capability"] for path, p in fake.calls if path == "/lifecycle/release"]
++        assert released == [cap]
++        assert [c for c, _ in env.spawned].count("close") == 0  # cleanup never wakes Chrome
++        assert len(_acquires(fake)) == 3
++        assert "task-a" in env.stopped
++    else:
++        assert fake.calls == []
++        assert {_cdp_arg(parts) for _, parts in env.spawned} == {fake.raw_ws()}
++        assert {url for _, url in env.attached} == {fake.raw_ws()}
++        cleanup_browser("task-a")
++        assert [c for c, _ in env.spawned][-1] == "close"
++        assert fake.calls == []
++
++
++def test_rotated_capability_reattaches_session(env):
++    if not env.managed:
++        pytest.skip("rotation is a managed-lease concept")
++    fake = env.fake
++    assert _dispatch("browser_navigate", {"url": "https://example.com/"}, "task-a")["success"]
++    first = _cdp_arg(env.spawned[-1][1])
++    fake.rotate = True
++    assert _dispatch("browser_snapshot", {}, "task-a")["success"]
++    second = _cdp_arg(env.spawned[-1][1])
++    assert first != second and "/lease/" in second
++    released = [p["capability"] for path, p in fake.calls if path == "/lifecycle/release"]
++    assert len(released) == 1 and released[0] in first  # the old capability is retired
++    assert env.attached[-1][1] == second
++    # Retiring the old capability never stops the live task supervisor: the only stop is the
++    # rotation teardown that runs before the re-attach.
++    assert env.stopped == ["task-a"]
++
++
++def test_outside_a_lease_fails_clearly_never_raw(env):
++    from tools import browser_tool_cdp
++    from tools.browser_agent_lifecycle import ManagedBrowserError
++    if env.managed:
++        with pytest.raises(ManagedBrowserError, match="owner lease"):
++            browser_tool_cdp._get_cdp_override()
++        assert env.fake.gets == []
++    else:
++        assert browser_tool_cdp._get_cdp_override() == env.fake.raw_ws()
++
++
++def test_lease_refusal_is_a_tool_error_naming_the_tool(env, monkeypatch):
++    from tools import browser_agent_lifecycle as lifecycle
++    if not env.managed:
++        pytest.skip("unmanaged never contacts the lifecycle")
++
++    def refused(*args, **kwargs):
++        raise lifecycle.ManagedBrowserError("Managed browser deliberately stopped/disabled")
++
++    monkeypatch.setattr(lifecycle, "_post", refused)
++    result = _dispatch("browser_navigate", {"url": "https://example.com/"}, "task-a")
++    assert not result["success"] and result["error"].startswith("browser_navigate:")
++    result = _dispatch("browser_cdp", {"method": "Target.getTargets"}, "task-a")
++    assert "browser_cdp:" in result["error"]
++    assert env.spawned == [] and env.fake.gets == []
++
++
++def test_browser_cdp(env, monkeypatch):
++    from tools import browser_cdp_tool
++    from tools.browser_tool_lifecycle import cleanup_browser
++    seen = []
++
++    async def fake_call(endpoint, method, params, target_id, timeout):
++        seen.append(endpoint)
++        return {"targetInfos": []}
++
++    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", fake_call)
++    assert browser_cdp_tool._browser_cdp_check()
++    result = _dispatch("browser_cdp", {"method": "Target.getTargets"}, "task-c")
++    assert result.get("success") is not False, result
++    fake = env.fake
++    if env.managed:
++        (acquire,) = _acquires(fake)
++        assert acquire["owner"][1:] == ["task-c", "tools"]
++        cap = fake.caps[tuple(acquire["owner"])]
++        assert seen == [fake.scoped_ws(cap)]
++        assert fake.paths() == ["/lifecycle/acquire", "/lifecycle/complete"]
++        assert "/json/version" not in fake.gets
++        cleanup_browser("task-c")
++        assert [p["capability"] for path, p in fake.calls if path == "/lifecycle/release"] == [cap]
++    else:
++        assert seen == [fake.raw_ws()]
++        assert fake.calls == []
++
++
++def test_vault_fill_holds_the_selected_scope(env, monkeypatch):
++    from tools import browser_agent_lifecycle as lifecycle
++    from tools import browser_vault_tool as vault
++    from tools.browser_tool_lifecycle import cleanup_browser
++    held = []
++
++    def fake_fill(handle, task_id=None):
++        held.append((lifecycle.current_tool_lease(), list(env.fake.paths())))
++        return json.dumps({"success": True, "filled": 1})
++
++    monkeypatch.setattr(vault, "browser_vault_fill", fake_fill)
++    assert _dispatch("browser_navigate", {"url": "https://example.com/"}, "task-v")["success"]
++    before = len(env.fake.calls)
++    assert _dispatch("browser_vault", {"action": "fill", "handle": "h"}, "task-v")["success"]
++    fake = env.fake
++    if env.managed:
++        cap = next(iter(fake.caps.values()))
++        lease, paths = held[0]
++        assert lease == fake.endpoint + "/lease/" + cap  # same scope as the page it fills
++        assert paths[before:] == ["/lifecycle/acquire"]  # leased while the fill runs
++        assert fake.paths()[-1] == "/lifecycle/complete"
++        assert lifecycle.supervisor_task("task-v") == "task-v"
++        # A rotated capability means the page is gone: refuse instead of filling elsewhere.
++        fake.rotate = True
++        result = _dispatch("browser_vault", {"action": "fill", "handle": "h"}, "task-v")
++        assert not result["success"] and result["error"].startswith("browser_vault:")
++        assert len(held) == 1
++        cleanup_browser("task-v")
++        assert len([p for path, p in fake.calls if path == "/lifecycle/release"]) == 2
++    else:
++        assert held == [("", [])]
++        assert fake.calls == []
++
++
++def test_vault_fill_renews_browser_exec_scope(env, monkeypatch):
++    if not env.managed:
++        pytest.skip("covered unmanaged by test_vault_fill_holds_the_selected_scope")
++    import subprocess
++    from tools import browser_agent_lifecycle as lifecycle
++    from tools import browser_use_cli as cli
++    from tools import browser_vault_tool as vault
++    monkeypatch.setattr(cli, "_base_subprocess_env", dict)
++    monkeypatch.setattr(cli, "_find_cli", lambda: ["unused-test-cli"])
++    monkeypatch.setattr(cli, "_attach_vault_supervisor", lambda *args: None)
++    monkeypatch.setattr(cli, "_workspace_dir", lambda task: None)
++    monkeypatch.setattr(cli, "_find_screenshot", lambda *args: None)
++    monkeypatch.setattr(cli, "_code_url_verdict", lambda code: cli._CodeUrlVerdict("", False))
++    monkeypatch.setattr(cli, "_run_cli_killing_process_group",
++                        lambda cmd, code, env, timeout: subprocess.CompletedProcess(cmd, 0, "ok", ""))
++    assert json.loads(cli.browser_exec("print(1)", task_id="task-x"))["success"]
++    before = len(_acquires(env.fake))
++    owners = []
++    monkeypatch.setattr(vault, "browser_vault_fill",
++                        lambda handle, task_id=None: owners.append(
++                            (len(_acquires(env.fake)), _acquires(env.fake)[-1]["owner"])) or
++                        json.dumps({"success": True}))
++    assert _dispatch("browser_vault", {"action": "fill", "handle": "h"}, "task-x")["success"]
++    assert owners[0][0] == before + 1  # leased while the fill runs
++    assert owners[0][1][1:] == ["task-x", "default"]  # the browser_exec scope, not a new tools scope
++    assert env.fake.paths()[-1] == "/lifecycle/complete"
++    assert lifecycle.supervisor_task("task-x").startswith("managed-")
++
++
++def test_requirements_and_doctor_treat_idle_endpoint_as_available(env, monkeypatch):
++    """Capability checks are config reads: no HTTP probe, idle or not."""
++    import urllib.request
++    import requests
++    from tools import browser_cdp_tool, browser_tool as bt
++    from tools import browser_tool_cloud, browser_tool_install, browser_tool_lightpanda_fallback as lp
++    from hermes_cli import doctor_tools
++
++    env.fake.close()  # idle: nothing listens on the managed endpoint at all
++    monkeypatch.setattr(requests, "get", lambda *a, **k: pytest.fail("network probe in a capability check"))
++    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: pytest.fail("network probe"))
++    monkeypatch.setattr(bt, "_is_browser_use_cli_mode", lambda: False)
++    assert browser_tool_install.check_browser_requirements()
++    assert browser_cdp_tool._browser_cdp_check()
++    assert not browser_tool_cloud._is_local_mode()
++    assert browser_tool_cloud.browser_backend_name() == "cdp"
++    monkeypatch.setattr(doctor_tools, "check_bool", lambda *a, **k: pytest.fail("chromium warned"))
++    doctor_tools._check_chromium()
++    monkeypatch.setattr(browser_tool_cloud, "_get_browser_engine", lambda: "lightpanda")
++    assert lp.lightpanda_engine_status() == (False, "a CDP override is active (/browser connect or browser.cdp_url)")
++    env.fake.calls.clear()
++
++
++def test_lightpanda_fallback_gating(env, monkeypatch):
++    from tools import browser_tool_cloud, browser_tool_lightpanda_fallback as lp
++    fallbacks = []
++    monkeypatch.setattr(browser_tool_cloud, "_get_browser_engine", lambda: "lightpanda")
++    monkeypatch.setattr(lp, "_run_chrome_fallback_command",
++                        lambda *a, **k: fallbacks.append(a) or {"success": True, "data": {"snapshot": "x" * 40}})
++    env.responses["snapshot"] = {"success": True, "data": {"snapshot": "", "refs": {}}}
++    assert _dispatch("browser_navigate", {"url": "https://example.com/"}, "task-l")["success"]
++    result = _dispatch("browser_snapshot", {}, "task-l")
++    if env.managed:
++        assert fallbacks == []  # never a temporary local Chrome outside the lease
++        assert "fallback_warning" not in result
++    else:
++        assert len(fallbacks) == 1  # unchanged: the existing Lightpanda→Chrome retry
+diff --git a/tools/browser_agent_lifecycle.py b/tools/browser_agent_lifecycle.py
+index 961835d26b..a8eb61bf6f 100644
+--- a/tools/browser_agent_lifecycle.py
++++ b/tools/browser_agent_lifecycle.py
+@@ -5,6 +5,7 @@ only keeps this process's capabilities for task-scoped release. A dead worker's
+ request protection expires at the supervisor; open daemon sockets are not activity.
+ """
+ import contextlib
++import contextvars
+ from dataclasses import dataclass, field
+ import hashlib
+ import json
+@@ -121,7 +122,125 @@ def _validate_grant(config: dict, result: dict) -> None:
+ def request_lease(config: dict, task_id: str | None, session: str, timeout: int, env: dict):
+     if not task_id:
+         raise ManagedBrowserError("Managed browser requires a tool task/session identity; refusing shared default ownership")
+-    owner = (str(get_hermes_home()), task_id, f"named:{session}" if session else "default")
++    with _owner_lease(config, task_id, f"named:{session}" if session else "default", timeout, env) as grant:
++        yield grant
++
++
++# Owner scope of the built-in browser tools (agent-browser, browser_cdp, browser_dialog). It can
++# never collide with a browser_exec scope ("default" / "named:<session>").
++TOOLS_SCOPE = "tools"
++_tool_scope: contextvars.ContextVar = contextvars.ContextVar("hermes_managed_browser_tool_scope", default=None)
++
++
++def _managed_config(tool: str) -> dict | None:
++    """The managed route for built-in tools: ``browser.managed_agent`` matching the raw override."""
++    from tools.browser_use_cli import _read_browser_cfg
++    try:
++        return configured_route(_read_browser_cfg(), {})
++    except ManagedBrowserError as exc:
++        raise ManagedBrowserError(f"{tool}: {exc}") from None
++
++
++@contextlib.contextmanager
++def tool_lease(tool: str, task_id: str | None, timeout: float):
++    """Hold an owner lease on the managed Chrome while a built-in browser tool runs.
++
++    Yields None (and does nothing else) when ``browser.managed_agent`` does not match the selected
++    CDP override. Otherwise yields the lease-scoped HTTP root; :func:`scoped_override` returns it to
++    every CDP resolution inside the block, so nothing reaches the unscoped endpoint. Nested calls
++    for the same task reuse the outer lease. Released by :func:`release_task` / :func:`release_all`.
++    """
++    config = _managed_config(tool)
++    if config is None:
++        yield None
++        return
++    if not task_id:
++        raise ManagedBrowserError(f"{tool}: managed browser requires a task identity; refusing shared default ownership")
++    current = _tool_scope.get()
++    if current and current[:3] == (str(get_hermes_home()), task_id, config["endpoint"]):
++        yield current[3]
++        return
++    timeout = max(1, min(86400, int(timeout or 0) or 1))
++    try:
++        with _owner_lease(config, task_id, TOOLS_SCOPE, timeout, None) as grant:
++            token = _tool_scope.set((str(get_hermes_home()), task_id, config["endpoint"], grant["endpoint"]))
++            try:
++                yield grant["endpoint"]
++            finally:
++                _tool_scope.reset(token)
++    except ManagedBrowserError as exc:
++        message = str(exc)
++        raise ManagedBrowserError(message if message.startswith(tool + ":") else f"{tool}: {message}") from None
++
++
++def scoped_override(raw: str, tool: str = "browser") -> str:
++    """Lease-scoped replacement for the raw CDP override, "" when unmanaged.
++
++    Raises ManagedBrowserError when the override is the managed endpoint but no tool lease is held:
++    a caller outside :func:`tool_lease` must fail, never fall back to the unscoped root.
++    """
++    current = _tool_scope.get()
++    if current and current[2] == raw and current[0] == str(get_hermes_home()):
++        return current[3]
++    if _managed_config(tool) is None:
++        return ""
++    raise ManagedBrowserError(f"{tool}: managed Chrome requires an owner lease; this path ran outside one")
++
++
++def current_tool_lease() -> str:
++    """Lease endpoint held by the enclosing :func:`tool_lease`, or ""."""
++    current = _tool_scope.get()
++    return current[3] if current and current[0] == str(get_hermes_home()) else ""
++
++
++@contextlib.contextmanager
++def renew_selected(tool: str, task_id: str | None, timeout: float):
++    """Keep the scope the vault addresses (the last browser_exec or built-in tool scope) leased.
++
++    Unmanaged: no-op. No scope selected yet: a fresh built-in tool lease. A rotated capability
++    means the selected scope's tabs and supervisor are gone, so fail instead of acting elsewhere.
++    """
++    config = _managed_config(tool)
++    if config is None:
++        yield None
++        return
++    if not task_id:
++        raise ManagedBrowserError(f"{tool}: managed browser requires a task identity; refusing shared default ownership")
++    home = str(get_hermes_home())
++    with _lock:
++        selected = _vault_owners.get((home, task_id))
++        found = next(((key, record) for key, record in _leases.items()
++                      if key[:2] == (home, task_id) and key[3] == config["endpoint"]
++                      and record.supervisor == selected and record.capability and not record.closing), None)
++    if found is None or found[0][2] == TOOLS_SCOPE:
++        previous = found[1].capability if found else ""
++        with tool_lease(tool, task_id, timeout) as endpoint:
++            if previous and not endpoint.endswith("/lease/" + previous):
++                raise ManagedBrowserError(f"{tool}: the managed browser lease for this task expired, so its tabs "
++                                          "are gone; open the page again (browser_navigate) and retry")
++            yield endpoint
++        return
++    key, record = found
++    previous = record.capability
++    timeout = max(1, min(86400, int(timeout or 0) or 1))
++    try:
++        with _owner_lease(config, task_id, key[2], timeout, dict(record.env) if record.env else None) as grant:
++            if grant["capability"] != previous:
++                raise ManagedBrowserError(f"{tool}: the managed browser lease for the selected browser_exec "
++                                          "session expired, so its tabs are gone; run browser_exec in that "
++                                          "session again and retry")
++            yield grant["endpoint"]
++    except ManagedBrowserError as exc:
++        message = str(exc)
++        raise ManagedBrowserError(message if message.startswith(tool + ":") else f"{tool}: {message}") from None
++
++
++@contextlib.contextmanager
++def _owner_lease(config: dict, task_id: str, owner_session: str, timeout: int, env: dict | None):
++    """Acquire/complete one request on the owner's lease; ``env`` (browser_exec only) is pointed at the
++    lease and remembered so the harness daemon can be shut down on release. Without ``env`` the
++    scope is a built-in tool scope whose supervisor is keyed by the task id."""
++    owner = (str(get_hermes_home()), task_id, owner_session)
+     key = (*owner, config["endpoint"])
+     with _lock:
+         pending = _leases.get(key)
+@@ -136,22 +255,27 @@ def request_lease(config: dict, task_id: str | None, session: str, timeout: int,
+     try:
+         # Serialize this owner's grant mutation, never unrelated owners or cleanup.
+         with record.lock:
++            extra = {"daemon_dir": _daemon_dir(env)} if env is not None else {}
+             result = _post(config, "acquire", owner=list(owner), timeout_s=timeout,
+-                           worker_pid=os.getpid(), daemon_dir=_daemon_dir(env))
++                           worker_pid=os.getpid(), **extra)
+             _validate_grant(config, result)
+             grant = result
+-            env.pop("BU_CDP_WS", None)
+-            env.update(BU_CDP_URL=grant["endpoint"], BU_NAME=grant["daemon_name"],
+-                       BH_RUNTIME_DIR_SHARED="1", BH_TMP_DIR_SHARED="1", BU_AUTOSPAWN="0")
++            if env is not None:
++                env.pop("BU_CDP_WS", None)
++                env.update(BU_CDP_URL=grant["endpoint"], BU_NAME=grant["daemon_name"],
++                           BH_RUNTIME_DIR_SHARED="1", BH_TMP_DIR_SHARED="1", BU_AUTOSPAWN="0")
++            supervisor = supervisor_identity(task_id, grant["capability"]) if env is not None else task_id
+             with _lock:
+                 if record.capability and record.capability != grant["capability"]:
+-                    record.retired.append(_Lease(record.config, capability=record.capability,
+-                                                 env=record.env, supervisor=record.supervisor))
++                    # A built-in tool scope keeps its supervisor key across rotations: never let
++                    # disposing the old capability stop the supervisor the new one re-attaches.
++                    record.retired.append(_Lease(record.config, capability=record.capability, env=record.env,
++                                                 supervisor="" if record.supervisor == supervisor else record.supervisor))
+                 record.capability = grant["capability"]
+-                record.env = dict(env)
+-                record.supervisor = supervisor_identity(task_id, record.capability)
++                record.env = dict(env) if env is not None else {}
++                record.supervisor = supervisor
+                 _vault_owners[owner[:2]] = record.supervisor
+-        yield
++        yield grant
+     finally:
+         if grant:
+             try:
+diff --git a/tools/browser_cdp_tool.py b/tools/browser_cdp_tool.py
+index 46a8b58a47..887d6c7ab9 100644
+--- a/tools/browser_cdp_tool.py
++++ b/tools/browser_cdp_tool.py
+@@ -104,9 +104,12 @@ def _run_async(coro):
+ 
+ def _resolve_cdp_endpoint() -> str:
+     """Normalized CDP WebSocket URL via ``browser_tool_cdp._get_cdp_override``, or ""."""
++    from tools.browser_agent_lifecycle import ManagedBrowserError
+     try:
+         from tools.browser_tool_cdp import _get_cdp_override  # type: ignore[import-not-found]
+         return (_get_cdp_override() or "").strip()
++    except ManagedBrowserError:
++        raise  # managed Chrome outside a lease: a clear error, never "no endpoint" or the raw root
+     except Exception as exc:  # pragma: no cover — defensive
+         logger.debug("browser_cdp: failed to resolve CDP endpoint: %s", exc)
+         return ""
+@@ -393,16 +396,31 @@ def _browser_cdp_check() -> bool:
+     return bool(check_browser_requirements() and _get_cdp_override_raw())
+ 
+ 
++def _managed_browser_cdp(args: dict, task_id: Optional[str]) -> str:
++    """browser_cdp inside an owner lease when ``browser.managed_agent`` applies (no-op otherwise)."""
++    from tools.browser_agent_lifecycle import ManagedBrowserError, tool_lease
++    timeout = args.get("timeout", 30.0)
++    try:
++        lease_timeout = float(timeout)
++    except (TypeError, ValueError):
++        lease_timeout = 30.0
++    try:
++        with tool_lease("browser_cdp", task_id or "default", min(max(lease_timeout, 1.0), 300.0)):
++            return browser_cdp(
++                method=args.get("method", ""), params=args.get("params"), target_id=args.get("target_id"),
++                frame_id=args.get("frame_id"), timeout=timeout, task_id=task_id,
++            )
++    except ManagedBrowserError as exc:
++        return tool_error(str(exc), method=args.get("method", ""))
++
++
+ registry.register(
+     name="browser_cdp",
+     toolset="browser-cdp",
+     schema=BROWSER_CDP_SCHEMA,
+     handler=lambda args, **kw: routed_browser_handler(
+         "browser_cdp", args,
+-        fallback=lambda: browser_cdp(
+-            method=args.get("method", ""), params=args.get("params"), target_id=args.get("target_id"),
+-            frame_id=args.get("frame_id"), timeout=args.get("timeout", 30.0), task_id=kw.get("task_id"),
+-        ),
++        fallback=lambda: _managed_browser_cdp(args, kw.get("task_id")),
+         task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+     ),
+     check_fn=_browser_cdp_check,
+diff --git a/tools/browser_dialog_tool.py b/tools/browser_dialog_tool.py
+index dc1f877eb4..7de3e9bb4d 100644
+--- a/tools/browser_dialog_tool.py
++++ b/tools/browser_dialog_tool.py
+@@ -85,7 +85,13 @@ def browser_dialog(
+                 "Call browser_navigate or /browser connect first."
+             ),
+         })
+-    result = supervisor.respond_to_dialog(action=action, prompt_text=prompt_text, dialog_id=dialog_id)
++    from tools.browser_agent_lifecycle import ManagedBrowserError, tool_lease
++    try:
++        # Managed Chrome: the supervisor's socket is lease-scoped; keep the owner lease live meanwhile.
++        with tool_lease("browser_dialog", task_id or "default", 30):
++            result = supervisor.respond_to_dialog(action=action, prompt_text=prompt_text, dialog_id=dialog_id)
++    except ManagedBrowserError as exc:
++        return json.dumps({"success": False, "error": str(exc)})
+     if result.get("ok"):
+         return json.dumps({"success": True, "action": action, "dialog": result.get("dialog", {})})
+     return json.dumps({"success": False, "error": result.get("error", "unknown error")})
+diff --git a/tools/browser_tool.py b/tools/browser_tool.py
+index 4a665e38c6..3c25a4b218 100644
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -1356,10 +1356,22 @@ def _routed_check_fn(name: str):
+     return check
+ 
+ 
++def _managed_tool_call(name: str, task_id, fn):
++    """Run a built-in browser tool inside an owner lease when ``browser.managed_agent`` applies (a
++    no-op otherwise); a lease failure is a clear tool error naming the tool, never a raw-endpoint retry."""
++    from tools.browser_agent_lifecycle import ManagedBrowserError, tool_lease
++    try:
++        with tool_lease(name, task_id or "default", _safe_command_timeout()):
++            return fn()
++    except ManagedBrowserError as exc:
++        return json.dumps({"success": False, "error": str(exc)})
++
++
+ def _routed_handler(name: str, fallback):
+     def handler(args, **kw):
+         return record_browser_call(lambda legacy: routed_browser_handler(
+-            name, args, fallback=lambda: legacy(lambda: fallback(args, kw)),
++            name, args, fallback=lambda: legacy(lambda: _managed_tool_call(
++                name, kw.get("task_id"), lambda: fallback(args, kw))),
+             task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+         ), _cloud.browser_backend_name)
+     return handler
+diff --git a/tools/browser_tool_cdp.py b/tools/browser_tool_cdp.py
+index 45b36c4c96..a249cd1cf1 100644
+--- a/tools/browser_tool_cdp.py
++++ b/tools/browser_tool_cdp.py
+@@ -64,10 +64,15 @@ def _get_cdp_override() -> str:
+     """Resolved CDP URL override, or "" (skips cloud AND local launch).
+ 
+     May perform HTTP ``/json/version`` discovery — only call on paths about to *connect*; pure gates must use
+-    :func:`_get_cdp_override_raw`.
++    :func:`_get_cdp_override_raw`. Under ``browser.managed_agent`` the override resolves through the enclosing
++    tool lease's scoped endpoint, and raises ``ManagedBrowserError`` outside one (never the unscoped root).
+     """
+     _bt = _origin()
+-    return _resolve_cdp_override(raw) if (raw := _get_cdp_override_raw()) else ""
++    raw = _get_cdp_override_raw()
++    if not raw:
++        return ""
++    from tools.browser_agent_lifecycle import scoped_override
++    return _resolve_cdp_override(scoped_override(raw) or raw)
+ 
+ 
+ def _get_dialog_policy_config() -> tuple[str, float]:
+@@ -108,7 +113,11 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
+     snapshots just lack ``pending_dialogs`` / ``frame_tree``.
+     """
+     _bt = _origin()
+-    cdp_url = _get_cdp_override()
++    from tools.browser_agent_lifecycle import ManagedBrowserError
++    try:
++        cdp_url = _get_cdp_override()
++    except ManagedBrowserError:
++        cdp_url = ""  # outside a lease: only the session's own lease-scoped URL below, never the raw root
+     if not cdp_url:
+         with _bt._cleanup_lock:
+             session_info = _bt._active_sessions.get(task_id, {})
+diff --git a/tools/browser_tool_lifecycle.py b/tools/browser_tool_lifecycle.py
+index 67d404dcd7..e261912214 100644
+--- a/tools/browser_tool_lifecycle.py
++++ b/tools/browser_tool_lifecycle.py
+@@ -743,6 +743,9 @@ def _cleanup_single_browser_session(task_id: str) -> None:
+             _bt.logger.warning("lightpanda stop failed for task %s: %s", task_id, e)
+     elif _session_has_expired(session_info):
+         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
++    elif (session_info.get("features") or {}).get("managed_agent"):
++        # The owner lease's release closes its tabs; a close here would wake an idle managed Chrome.
++        _bt.logger.debug("Skipping agent-browser close for managed browser session %s", task_id)
+     else:
+         try:
+             _session._run_browser_command(task_id, "close", [], timeout=10)
+diff --git a/tools/browser_tool_session.py b/tools/browser_tool_session.py
+index 8472668cf0..64f85237cd 100644
+--- a/tools/browser_tool_session.py
++++ b/tools/browser_tool_session.py
+@@ -348,12 +348,26 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> dict[str, Any]:
+         return session_info
+ 
+ 
++def _managed_lease_rotated(session_info: dict[str, Any]) -> bool:
++    """Inside a managed tool lease, a cached session attached through any other endpoint (an older
++    capability, or a pre-activation raw attach) must be re-created on the current lease."""
++    from tools.browser_agent_lifecycle import current_tool_lease
++    lease = current_tool_lease()
++    return bool(lease) and session_info.get("managed_lease") != lease
++
++
+ def _create_session_for_key(task_id: str, force_local: bool) -> dict[str, Any]:
+     """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
+     Precedence: CDP override > hybrid local sidecar (never real-profile) > cloud > local."""
+     cdp_override = _cdp._get_cdp_override()
+     if cdp_override and not force_local:
+-        return _create_cdp_session(task_id, cdp_override)
++        info = _create_cdp_session(task_id, cdp_override)
++        from tools.browser_agent_lifecycle import current_tool_lease
++        if lease := current_tool_lease():
++            # Pin the session to its lease: a rotated capability must recreate the daemon's attach.
++            info["features"] = {**(info.get("features") or {}), "managed_agent": True}
++            info["managed_lease"] = lease
++        return info
+     if force_local:
+         return _create_local_session(task_id, allow_real_profile=False)
+     provider = _cloud._get_cloud_provider()
+@@ -383,6 +397,14 @@ def _get_session_info(task_id: Optional[str] = None) -> dict[str, Any]:
+             replacement = _bt._active_sessions.get(task_id)
+         return replacement if replacement is not None and replacement is not existing_session else None
+ 
++    if existing_session is not None and _managed_lease_rotated(existing_session):
++        _bt.logger.info("Managed browser lease for task %s rotated; re-attaching its session", task_id)
++        _lifecycle._cleanup_single_browser_session(task_id)
++        replacement = _replacement_after_teardown()
++        if replacement is not None:
++            return replacement
++        existing_session = None
++
+     if existing_session is not None:
+         # Suspect recycle: a command timeout marked this session; the expensive recycle
+         # lives here at next use, not on the timeout path (mark must stay cheap).
+@@ -900,6 +922,22 @@ def _run_browser_command(
+         timeout = _bt._safe_command_timeout()
+     args = args or []
+ 
++    from tools.browser_agent_lifecycle import ManagedBrowserError, tool_lease
++    tool = f"browser ({command})"
++    try:
++        if command == "close":
++            from tools.browser_agent_lifecycle import _managed_config
++            if _managed_config(tool) is not None:
++                # Cleanup never wakes an idle managed Chrome: releasing the owner lease closes its tabs.
++                return {"success": True, "data": {"closed": False, "reason": "managed browser: lease release owns tab cleanup"}}
++        with tool_lease(tool, _bt._bare_task_id_for_session_key(task_id or "default"), timeout):
++            return _run_browser_command_unleased(task_id, command, args, timeout, _engine_override)
++    except ManagedBrowserError as exc:
++        return {"success": False, "error": str(exc)}
++
++
++def _run_browser_command_unleased(task_id: str, command: str, args: list[str], timeout: int,
++                                  _engine_override: Optional[str]) -> dict[str, Any]:
+     preflight = _browser_command_preflight()
+     if "browser_cmd" not in preflight:
+         return preflight
+@@ -931,6 +969,10 @@ def _run_browser_command(
+     # Lightpanda automatic Chrome fallback — runs for ALL exit paths (timeout,
+     # empty, non-JSON, nonzero rc, parsed).
+     fallback_reason = _lp._lightpanda_fallback_reason(engine, command, result)
++    if fallback_reason and (session_info.get("features") or {}).get("managed_agent"):
++        # A managed Chrome session never retries in a temporary local Chrome outside its lease.
++        _bt.logger.info("Lightpanda fallback skipped for managed browser session (task=%s)", task_id)
++        fallback_reason = None
+     if fallback_reason:
+         _bt.logger.info("Lightpanda fallback: retrying '%s' with Chrome (task=%s): %s", command, task_id, fallback_reason)
+         if command == "screenshot":  # separate Chrome session to the same URL
+diff --git a/tools/browser_vault_tool.py b/tools/browser_vault_tool.py
+index a2493ebbd1..7a75a8e6c9 100644
+--- a/tools/browser_vault_tool.py
++++ b/tools/browser_vault_tool.py
+@@ -638,7 +638,14 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
+     from tools.browser_tool_session import run_fenced
+ 
+     session = _active_sessions.get(_last_session_key(task_id or "default")) or {}
+-    res = run_fenced(session, lambda: {"raw": fn()})
++    from tools.browser_agent_lifecycle import ManagedBrowserError, renew_selected
++    try:
++        # Managed Chrome: keep the scope the vault addresses (last browser_exec / built-in tool scope)
++        # leased for the whole page operation; a no-op otherwise.
++        with renew_selected("browser_vault", task_id or "default", 120):
++            res = run_fenced(session, lambda: {"raw": fn()})
++    except ManagedBrowserError as exc:
++        return json.dumps({"success": False, "error": str(exc)})
+     return res["raw"] if "raw" in res else json.dumps(res)
+ 
+ 
+-- 
+2.55.0
+

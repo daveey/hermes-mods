@@ -1,0 +1,434 @@
+From 3285003cc2b4852199411c59b28f6f1ad076cce6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:25:47 -0700
+Subject: [PATCH] fix(desktop): [daveey] hub-session opens skip the owner
+ lookup and paint from cache; Inbox sessions prefetch first
+
+Opens of another gateway's session were slow (live [open-timing] 2026-10-27):
+Inbox cards for hub sessions painted from REST after a 4.5-6.8 s "owner"
+stage, and route resumes of an old hub chat (no owner given) never painted
+from the transcript cache even though it held them.
+
+- The owner probe (probeStoredSession) only knew $sessions / cron /
+  messaging / project-tree rows; hub sessions live in the hub-replica
+  fallback rows, so every open did getSession over SSH. A replica row that
+  matches the named owner now answers at once (fallbackSessionRow).
+- A resume that names no owner takes it from the session's awake replica
+  row, so the cached transcript paints before any await (asleep rows keep
+  the read-only path).
+- The prefetcher put people's chats before automations within 200 slots per
+  gateway; the sessions behind open Inbox cards (self-heal, Kanban) are
+  automations and never got a slot. Open Inbox items' sessions now go first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../electron/transcript-cache-host.test.ts    | 59 ++++++++++++++++++-
+ .../desktop/electron/transcript-cache-host.ts | 36 ++++++++++-
+ .../electron/transcript-prefetch.test.ts      | 13 ++++
+ apps/desktop/electron/transcript-prefetch.ts  | 24 ++++++--
+ .../hooks/use-session-actions.test.tsx        | 38 ++++++++++++
+ .../hooks/use-session-actions/index.ts        |  9 ++-
+ .../resolve-stored-session.test.ts            | 21 +++++++
+ .../hooks/use-session-actions/utils.ts        | 22 +++++++
+ 8 files changed, 215 insertions(+), 7 deletions(-)
+
+diff --git a/apps/desktop/electron/transcript-cache-host.test.ts b/apps/desktop/electron/transcript-cache-host.test.ts
+index 9fc2910441..23ef500895 100644
+--- a/apps/desktop/electron/transcript-cache-host.test.ts
++++ b/apps/desktop/electron/transcript-cache-host.test.ts
+@@ -4,7 +4,7 @@ import path from 'node:path'
+ 
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { installTranscriptCache } from './transcript-cache-host'
++import { installTranscriptCache, markInboxSessions } from './transcript-cache-host'
+ 
+ const dirs: string[] = []
+ 
+@@ -77,3 +77,60 @@ describe('transcript cache host', () => {
+     host.stop()
+   })
+ })
++
++describe('[daveey] open Inbox cards in prefetch', () => {
++  it('flags exactly the hub sessions an open card points at (gateway, profile, id)', () => {
++    const records = [
++      { gateway: 'hub', id: 's1', profile: 'default' },
++      { gateway: 'hub', id: 's2', profile: 'work' },
++      { gateway: 'mini', id: 's1', profile: 'default' }
++    ]
++
++    const marked = markInboxSessions(records, new Set(['hub\u0000default\u0000s1', 'hub\u0000default\u0000s2']))
++
++    expect(marked.map(record => Boolean(record.inbox))).toEqual([true, false, false])
++  })
++
++  it('reads the replica Inbox on the primary and fetches a card\'s session first', async () => {
++    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-cache-host-inbox-'))
++    dirs.push(dir)
++    const fetched: string[] = []
++
++    const getJson = vi.fn(async (descriptor: any, requestPath: string) => {
++      if (requestPath.startsWith('/api/plugins/hub-sync/sessions')) {
++        return {
++          sessions: [
++            { activity: 9, gateway: 'mini', id: 'chat', message_count: 3, profile: 'default' },
++            { activity: 1, automated: true, gateway: 'mini', id: 'card', message_count: 3, profile: 'default' }
++          ]
++        }
++      }
++
++      if (requestPath === '/api/plugins/hub-sync/inbox') {
++        return { items: [{ gateway: 'mini', profile: 'default', session_id: 'card', state: 'open' }] }
++      }
++
++      if (requestPath === '/api/plugins/hub-sync/status') {
++        return { gateway: descriptor.connectionId === 'local' ? 'macbook' : 'mini' }
++      }
++
++      fetched.push(requestPath.split('/')[3])
++
++      return { messages: [{ content: 'row', id: 1, role: 'user' }] }
++    })
++
++    const host = installTranscriptCache({
++      backendFor: vi.fn(async (connectionId: string) => ({ connectionId })),
++      getJson,
++      ipcMain: { handle: vi.fn(), on: vi.fn() } as never,
++      log: () => undefined,
++      registry: () => ({ connectionIds: ['local', 'mac-mini'], primary: 'local' }),
++      userDataDir: dir
++    })
++
++    await host.prefetcher.tick()
++
++    expect(getJson).toHaveBeenCalledWith(expect.anything(), '/api/plugins/hub-sync/inbox', expect.anything())
++    expect(fetched[0]).toBe('card')
++  })
++})
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index c3eca153a0..4c0558fc55 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -33,6 +33,20 @@ export interface TranscriptCacheHostDeps {
+ const GATEWAY_NAME_PREFIX = 'hub-gateway:'
+ const HUB_LIST_LIMIT = 2000
+ 
++const inboxKey = (gateway: unknown, profile: unknown, sessionId: unknown) =>
++  `${String(gateway ?? '')}\u0000${String(profile ?? '').trim() || 'default'}\u0000${String(sessionId ?? '')}`
++
++/** [daveey] Flag the hub session records an open Inbox card points at (the prefetcher fetches those first). */
++export function markInboxSessions(records: HubSessionRecord[], inbox: ReadonlySet<string>): HubSessionRecord[] {
++  if (!inbox.size) {
++    return records
++  }
++
++  return records.map(record =>
++    inbox.has(inboxKey(record.gateway, record.profile, record.id)) ? { ...record, inbox: true } : record
++  )
++}
++
+ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+   const store = new TranscriptCacheStore(path.join(deps.userDataDir, 'transcript-cache.sqlite'))
+ 
+@@ -158,6 +172,22 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     return undefined
+   }
+ 
++  // Open Inbox items of every gateway, from this Mac's replica; an unreadable Inbox only drops the priority.
++  const openInboxSessions = async (descriptor: unknown): Promise<Set<string>> => {
++    try {
++      const body = await deps.getJson(descriptor, '/api/plugins/hub-sync/inbox', { timeoutMs: 8_000 })
++      const items = Array.isArray(body?.items) ? body.items : []
++
++      return new Set(
++        items
++          .filter((item: any) => item?.session_id && item?.gateway)
++          .map((item: any) => inboxKey(item.gateway, item.profile, item.session_id))
++      )
++    } catch {
++      return new Set()
++    }
++  }
++
+   const prefetcher = new TranscriptPrefetcher({
+     connectionForGateway,
+     fetchLatest: async (key, limit) => {
+@@ -187,7 +217,11 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+           timeoutMs: 8_000
+         })
+ 
+-        return body?.available === false || !Array.isArray(body?.sessions) ? null : (body.sessions as HubSessionRecord[])
++        if (body?.available === false || !Array.isArray(body?.sessions)) {
++          return null
++        }
++
++        return markInboxSessions(body.sessions as HubSessionRecord[], await openInboxSessions(descriptor))
+       } catch {
+         return null
+       }
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index c60d26ba2f..669024cb41 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -45,6 +45,19 @@ describe('prefetch selection', () => {
+     ])
+   })
+ 
++  it('[daveey] puts the sessions of open Inbox cards first, even automations past a full chat window', () => {
++    const records = [
++      ...Array.from({ length: 5 }, (_, index) => record('hub', `chat${index}`, 100 + index)),
++      record('hub', 'selfheal', 1, { automated: true, inbox: true }),
++      record('hub', 'cron', 50, { automated: true })
++    ]
++
++    const targets = selectPrefetchTargets(records, gateway => CONNECTIONS[gateway], 3)
++
++    expect(targets.map(target => target.key.sessionId)).toEqual(['selfheal', 'chat4', 'chat3'])
++    expect(targets[0].inbox).toBe(true)
++  })
++
+   it('caps each gateway separately', () => {
+     const records = [
+       ...Array.from({ length: 250 }, (_, index) => record('mini', `m${index}`, index)),
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index e2dbc729a8..01063ad061 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -24,6 +24,8 @@ export interface HubSessionRecord {
+   gateway: string
+   hidden?: boolean
+   id: string
++  /** [daveey] An open Inbox card names this session: it is the one a click is about to open. */
++  inbox?: boolean
+   message_count?: null | number
+   parent_session_id?: null | string
+   profile?: null | string
+@@ -32,6 +34,7 @@ export interface HubSessionRecord {
+ 
+ export interface PrefetchTarget {
+   automated: boolean
++  inbox?: boolean
+   key: TranscriptCacheKey
+   meta: { activity: null | number; messageCount: null | number }
+ }
+@@ -55,8 +58,8 @@ export interface PrefetchDeps {
+ const profileOf = (value: unknown) => String(value ?? '').trim() || 'default'
+ 
+ /**
+- * Per gateway, the PER_GATEWAY most recently active session tips, people's chats
+- * before automations. A record that is another record's compression parent is
++ * Per gateway, the PER_GATEWAY most recently active session tips: open Inbox cards' sessions first, then people's
++ * chats before automations. A record that is another record's compression parent is
+  * history of that tip, not its own session. Fetch order: chats first, newest first.
+  */
+ export function selectPrefetchTargets(
+@@ -96,19 +99,32 @@ export function selectPrefetchTargets(
+ 
+     // People's chats claim the slots first: a gateway running many automations
+     // (Kanban, cron) would otherwise push the chats someone opens out of the window.
++    // [daveey] Sessions behind open Inbox cards come first: they are mostly automations (self-heal, Kanban), so a
++    // gateway with many chats otherwise never gave them a slot, and an Inbox click always waited on the network.
+     const byActivity = [...list].sort((a, b) => activityOf(b) - activityOf(a))
+-    const chosen = [...byActivity.filter(record => !record.automated), ...byActivity.filter(record => record.automated)]
++
++    const chosen = [
++      ...byActivity.filter(record => record.inbox),
++      ...byActivity.filter(record => !record.inbox && !record.automated),
++      ...byActivity.filter(record => !record.inbox && record.automated)
++    ]
+ 
+     for (const record of chosen.slice(0, perGateway)) {
+       targets.push({
+         automated: Boolean(record.automated),
++        ...(record.inbox ? { inbox: true } : {}),
+         key: { connectionId, profile: profileOf(record.profile), sessionId: record.id },
+         meta: { activity: record.activity ?? null, messageCount: record.message_count ?? null }
+       })
+     }
+   }
+ 
+-  return targets.sort((a, b) => Number(a.automated) - Number(b.automated) || (b.meta.activity ?? 0) - (a.meta.activity ?? 0))
++  return targets.sort(
++    (a, b) =>
++      Number(Boolean(b.inbox)) - Number(Boolean(a.inbox)) ||
++      Number(a.automated) - Number(b.automated) ||
++      (b.meta.activity ?? 0) - (a.meta.activity ?? 0)
++  )
+ }
+ 
+ /** Whether a cached entry is behind the hub's view of the session. */
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index 2e993a0b13..204de4ac75 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -37,6 +37,7 @@ import {
+ import { $goalsBySession, type SessionGoal } from '@/store/goals'
+ import { $pinnedSessionIds } from '@/store/layout'
+ import { $notifications, dismissNotification } from '@/store/notifications'
++import { $offlineSessions } from '@/store/offline-sessions'
+ import {
+   $activeGatewayProfile,
+   $newChatConnectionId,
+@@ -7452,6 +7453,43 @@ describe('[daveey] instant opens from the durable transcript cache', () => {
+     expect(getLatestSessionMessages).toHaveBeenCalledTimes(1)
+   })
+ 
++  it('a resume naming no owner of a hub-replica session paints from the cache and skips the owner lookup', async () => {
++    // An Inbox card / route resume of another gateway's session: no click route, no remembered owner, no $sessions
++    // row. The hub replica row carries the owner, so the cached rows paint at once and the owner needs no REST read.
++    saveTranscriptTail('stored-hub', [row(1, 'user', 'hub question'), row(2, 'assistant', 'hub answer')], owner)
++    $offlineSessions.set([
++      { connection_id: 'mac-mini', id: 'stored-hub', message_count: 2, profile: 'default', title: 'Hub chat' } as never
++    ])
++
++    const rest = deferred<unknown>()
++    vi.mocked(getLatestSessionMessages).mockReturnValue(rest.promise as never)
++    vi.mocked(requestGatewayForAgent).mockReturnValue(new Promise(() => {}) as never)
++
++    let resume!: Parameters<Parameters<typeof ResumeHarness>[0]['onReady']>[0]
++    render(<ResumeHarness onReady={ready => (resume = ready)} requestGateway={vi.fn(async () => ({}) as never)} />)
++    void resume('stored-hub', true)
++
++    expect(JSON.stringify($messages.get())).toContain('hub answer')
++    await waitFor(() => expect(lastTiming() ?? (globalThis as any).__hermesOpenTimings).toBeDefined())
++    expect(getSession).not.toHaveBeenCalled()
++    $offlineSessions.set([])
++  })
++
++  it('an asleep gateway\'s replica row does not become the owner of a resume', async () => {
++    saveTranscriptTail('stored-asleep', [row(1, 'user', 'asleep question')], owner)
++    $offlineSessions.set([
++      { connection_id: 'mac-mini', id: 'stored-asleep', offline_cached: true, profile: 'default', title: 'Asleep' } as never
++    ])
++    vi.mocked(getSession).mockReturnValue(new Promise(() => {}) as never)
++
++    let resume!: Parameters<Parameters<typeof ResumeHarness>[0]['onReady']>[0]
++    render(<ResumeHarness onReady={ready => (resume = ready)} requestGateway={vi.fn(async () => ({}) as never)} />)
++    void resume('stored-asleep', true)
++
++    expect(JSON.stringify($messages.get())).not.toContain('asleep question')
++    $offlineSessions.set([])
++  })
++
+   it('shows the fresh page while the owner lookup is still pending', async () => {
+     saveTranscriptTail('stored-slow', [row(1, 'user', 'old question')], owner)
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index f2cc9700e2..fe9b9766fa 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -210,6 +210,7 @@ import {
+   chatMessageArraysEquivalent,
+   dedupeInflightUserAgainstTranscript,
+   dropListedSession,
++  fallbackSessionRow,
+   findListedSession,
+   goneSessionVerdict,
+   isSessionGoneError,
+@@ -1367,9 +1368,15 @@ export function useSessionActions({
+       // (requestSessionResume with a row route, a plugin open) is authoritative as given.
+       const rememberedOwner = capturedOwner ? undefined : rememberedOwnerForResume(storedSessionId)
+ 
++      // [daveey] A resume that names no owner (a route change, a tab restore) of another gateway's session takes the
++      // owner from its hub-replica row, so it paints from the local transcript cache and skips the owner lookup.
++      // An asleep owner's row (offline_cached) is not used: that open is the read-only asleep path, never a dial.
++      const replicaRow = capturedOwner || rememberedOwner ? undefined : fallbackSessionRow(storedSessionId)
++      const replicaOwner = replicaRow && !replicaRow.offline_cached ? sessionOwnerRouteFromRow(replicaRow) : undefined
++
+       // An explicit capture outranks the remembered hint; the hint only
+       // fills in when the caller had no route to give.
+-      const ownerRoute = capturedOwner || rememberedOwner
++      const ownerRoute = capturedOwner || rememberedOwner || replicaOwner
+ 
+       // A connection switch clears/reloads the session rows before this path
+       // runs, so an untagged row belongs to the connection that supplied the
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
+index 250ab7a566..c1916289cf 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
+@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import type * as HermesModule from '@/hermes'
+ import { getSession } from '@/hermes'
++import { $offlineSessions } from '@/store/offline-sessions'
+ import { $activeGatewayProfile, $profiles } from '@/store/profile'
+ import { $projectTree } from '@/store/projects'
+ import { $cronSessions, $messagingSessions, $sessions, $unlistedSessionOwnerRows } from '@/store/session'
+@@ -45,6 +46,26 @@ describe('resolveStoredSession profile ownership', () => {
+     $unlistedSessionOwnerRows.set([])
+   })
+ 
++  it('[daveey] an owner the hub replica vouches for resolves without a REST lookup', async () => {
++    $offlineSessions.set([session({ connection_id: 'hermes-hub', id: 'h1', profile: 'default', title: 'Hub chat' })])
++
++    const resolved = await resolveStoredSession('h1', { connectionId: 'hermes-hub', profile: 'default' })
++
++    expect(resolved?.connection_id).toBe('hermes-hub')
++    expect(mockGetSession).not.toHaveBeenCalled()
++    $offlineSessions.set([])
++  })
++
++  it('[daveey] a replica row of a different owner still asks the named owner', async () => {
++    $offlineSessions.set([session({ connection_id: 'mac-mini', id: 'h2', profile: 'default', title: 'Other' })])
++    mockGetSession.mockResolvedValue(session({ id: 'h2' }))
++
++    await resolveStoredSession('h2', { connectionId: 'hermes-hub', profile: 'default' })
++
++    expect(mockGetSession).toHaveBeenCalledTimes(1)
++    $offlineSessions.set([])
++  })
++
+   it('returns a cached row that carries an owning profile', async () => {
+     $sessions.set([session({ id: 's1', profile: 'default' })])
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+index a8700ecffa..7ed691da56 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+@@ -16,6 +16,7 @@ import { parseErrorSurface } from '@/lib/error-surface'
+ import { isMessagingSource, normalizeSessionSource } from '@/lib/session-source'
+ import { isLiveTailReplyId } from '@/lib/spoken-reply'
+ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
++import { $sidebarFallbackSessions } from '@/store/boot-snapshot'
+ import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
+ import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
+ import { $projectTree } from '@/store/projects'
+@@ -2137,6 +2138,15 @@ export function cachedSessionRow(storedSessionId: string): SessionInfo | undefin
+   )
+ }
+ 
++/** [daveey] The sidebar's hub-replica row for a stored id (another gateway's session, or the cold-start boot
++ *  snapshot), with its owning connection. Opens of those sessions (Inbox cards, resumes, rows of an asleep
++ *  gateway) have no `$sessions` row, so without this the owner probe waited on a REST lookup over SSH (4-7 s). */
++export function fallbackSessionRow(storedSessionId: string): SessionInfo | undefined {
++  return $sidebarFallbackSessions
++    .get()
++    .find(session => session.connection_id?.trim() && sessionMatchesStoredId(session, storedSessionId))
++}
++
+ export type StoredSessionProbe = { status: 'found'; session: SessionInfo } | { status: 'gone' | 'inconclusive' }
+ 
+ export async function resolveStoredSession(
+@@ -2171,6 +2181,18 @@ export async function probeStoredSession(
+   const cached = cachedSessionRow(storedSessionId)
+ 
+   if (ownerRoute) {
++    const replicaRow = fallbackSessionRow(storedSessionId)
++
++    // [daveey] The hub replica already vouches for this owner: answer now instead of a REST lookup over SSH.
++    if (
++      !cached?.connection_id &&
++      replicaRow &&
++      replicaRow.connection_id === ownerRoute.connectionId &&
++      normalizeProfileKey(replicaRow.profile) === normalizeProfileKey(ownerRoute.profile)
++    ) {
++      return { status: 'found', session: replicaRow }
++    }
++
+     const scope = {
+       connectionId: ownerRoute.connectionId,
+       profile: ownerRoute.targetProfile || ownerRoute.profile
+-- 
+2.55.0
+
