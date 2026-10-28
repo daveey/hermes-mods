@@ -222,12 +222,14 @@ def test_off_switch(monkeypatch):
     assert run("terminal", {"command": "stress-ng --cpu $(nproc)"}) is None
 
 
-def test_default_protects_laptop(monkeypatch):
+def test_default_protects_laptop_and_hub(monkeypatch):
     monkeypatch.delenv("CPU_LOAD_GUARD_HOSTS")
     monkeypatch.setenv("HERMES_HOME", "/nonexistent")
     monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "David-MBP.local")
     assert plugin.guard.enabled()
     monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "hermes-hub")
+    assert plugin.guard.enabled()
+    monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "unrelated-host")
     assert not plugin.guard.enabled()
 
 
@@ -445,3 +447,70 @@ def test_reader_naming_load_file_allows(tmp_path, fmt):
     cmd = fmt.format(p=burn, readme=readme, py=py, dest=tmp_path / "copy.sh")
     r = run("terminal", {"command": cmd, "workdir": str(tmp_path)})
     assert r is None, (cmd, r)
+
+
+# --- hub incident: 40 background `python -c "while True: pass"` loops, then pytest ----------
+# The shell string is the command a worker submitted. These tests only pass it to the
+# pre_tool_call hook. They do not start a process.
+
+INCIDENT_40 = (
+    'cd ~/code/_wt/flaky-t01a183; PY=~/.hermes/hermes-agent/.venv/bin/python; '
+    'for i in $(seq 1 40); do (timeout 120 $PY -c "while True: pass" &) ; done; '
+    'sleep 1; for i in 1 2 3; do $PY -m pytest -q -p no:cacheprovider '
+    'tests/hermes_cli/test_config_rmw_lock.py '
+    'tests/hermes_cli/test_update_stale_dashboard_review.py '
+    'tests/tui_gateway/test_connector_accounts_rpc.py --durations=4 '
+    '2>&1 | grep -E "s call|passed|failed|^E  " ; done; '
+    'pkill -f "while True: pass"; true'
+)
+BOUNDED_PYTEST = (
+    "cd ~/code/_wt/flaky-t01a183; PY=~/.hermes/hermes-agent/.venv/bin/python; "
+    "$PY -m pytest -q -p no:cacheprovider "
+    "tests/hermes_cli/test_config_rmw_lock.py "
+    "tests/hermes_cli/test_update_stale_dashboard_review.py "
+    "tests/tui_gateway/test_connector_accounts_rpc.py --durations=4"
+)
+
+
+def test_terminal_rejects_exact_40_loop_payload():
+    r = run("terminal", {"command": INCIDENT_40, "timeout": 400})
+    assert r and r["action"] == "block"
+    assert "hermes-hub" in r["message"]
+    assert "generate load on hermes-hub" not in r["message"].lower()
+    r = run("terminal", {"command": INCIDENT_40, "background": True, "timeout": 120})
+    assert r and r["action"] == "block"
+
+
+def test_execute_code_rejects_exact_40_loop_payload():
+    # Independent of the terminal test: the same payload inside execute_code, which
+    # reaches the shell through hermes_tools.terminal() and is also scanned as code text.
+    wrapped = "from hermes_tools import terminal\nterminal(" + repr(INCIDENT_40) + ", timeout=400)"
+    r = run("execute_code", {"code": wrapped})
+    assert r and r["action"] == "block", r
+    r = run("execute_code", {"code": INCIDENT_40})
+    assert r and r["action"] == "block", r
+
+
+def test_bounded_pytest_allowed_on_both_paths():
+    assert run("terminal", {"command": BOUNDED_PYTEST, "timeout": 400}) is None
+    assert run("execute_code", {"code": "import subprocess\nsubprocess.run(['pytest', '-q', '-p', 'no:cacheprovider', 'tests/'])"}) is None
+    assert run("execute_code", {"code": "from hermes_tools import terminal\nterminal(" + repr(BOUNDED_PYTEST) + ")"}) is None
+
+
+def test_refusal_does_not_direct_saturation_at_hub():
+    r = run("terminal", {"command": "stress-ng --cpu 16"})
+    msg = r["message"]
+    assert "hermes-hub" in msg
+    assert "Generate load on hermes-hub" not in msg
+    assert "stress-ng --cpu $(nproc) there" not in msg
+
+
+def test_yaml_replaces_default_host_list(tmp_path, monkeypatch):
+    monkeypatch.delenv("CPU_LOAD_GUARD_HOSTS")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "cpu-load-guard.yaml").write_text("protected_hosts:\n  - only-this-host\n")
+    monkeypatch.setattr(plugin.guard.socket, "gethostname", lambda: "hermes-hub")
+    assert not plugin.guard.enabled()
+    (tmp_path / "cpu-load-guard.yaml").write_text("protected_hosts:\n  - hermes-hub\n")
+    assert plugin.guard.enabled()
+    assert run("terminal", {"command": INCIDENT_40})["action"] == "block"

@@ -7,7 +7,10 @@ import re
 import socket
 from pathlib import Path
 
-DEFAULT_PROTECTED = ["David-MBP", "MacBook-Pro-177"]
+# hermes-hub is the shared kanban host. It used to be the sanctioned place to
+# generate load, which put per-core burners on the fleet. Protect it by default.
+# A cpu-load-guard.yaml protected_hosts list still replaces this whole list.
+DEFAULT_PROTECTED = ["David-MBP", "MacBook-Pro-177", "hermes-hub"]
 
 # Expressions that evaluate to "number of cores".
 NCPU_RE = re.compile(
@@ -363,8 +366,9 @@ def check_write(path: str, content: str) -> str | None:
 
 def message(why: str) -> str:
     return (
-        f"cpu-load-guard: refused on this protected host: {why}. Hermes automation must not saturate David's "
-        "laptop. Generate load on hermes-hub instead (stress-ng --cpu $(nproc) there), or make the race "
-        "deterministic (inject the delay/ordering with an Event, mock or fake clock) instead of relying on host load. "
-        "A bounded test run such as `pytest -n 2` is fine."
+        f"cpu-load-guard: refused on this protected host: {why}. Hermes automation must not saturate "
+        "a shared host (this machine, the laptop, or hermes-hub). Do not fan out yes, stress, or "
+        "Python busy loops toward one per core. Make the race deterministic (inject the delay or "
+        "ordering with an Event, mock, or fake clock) instead of relying on host load. A bounded "
+        "test run such as `pytest -n 2`, or an ordinary pytest/CI command, is fine."
     )

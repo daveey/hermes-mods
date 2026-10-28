@@ -2,7 +2,7 @@
 
 A ``pre_tool_call`` hook inspects terminal (foreground and background), process writes,
 execute_code, write_file/patch of script files, and local scripts a command runs (size- and depth-capped) on hosts listed in ``protected_hosts`` of ``~/.hermes/cpu-load-guard.yaml``
-(default: the user's laptop; ``CPU_LOAD_GUARD_HOSTS=a,b`` overrides; ``CPU_LOAD_GUARD=off`` disables).
+(default: the user's laptop and hermes-hub; ``CPU_LOAD_GUARD_HOSTS=a,b`` overrides; ``CPU_LOAD_GUARD=off`` disables).
 A path passed as data to a reader or file tool (grep, cat, sed, git, cp, ...) is not inspected.
 
 Limits: regex heuristics. Obfuscated burners, scripts fetched or generated at run time, scripts over
