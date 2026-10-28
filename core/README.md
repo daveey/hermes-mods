@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [kanban-local-lineage-counts.md](kanban-local-lineage-counts.md) | 0671 | Local cards shared across compression aliases count once, matching the task strip; parked, held and stalled subsets deduplicate with the same snapshot. Distinct boards/cards remain distinct. |
 | [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md) | 0670 | A model pin the managed routing registry cannot serve is refused at create and set-model (code `model_pin_not_in_routing_registry`), not at worker startup. |
 | [standing-instructions.md](standing-instructions.md) | 0669 | Standing instructions survive compaction word for word, reach workers ahead of the comment cap, and hold a don't-wait block once. |
 | [bare-checkout-recover.md](bare-checkout-recover.md) | 0667–0668 | `hermes update` resets `core.bare` on a work tree that `git init --bare` flipped; a genuine bare repo is left alone. The `.git` marker is read as utf-8-sig. |
@@ -98,7 +99,7 @@ The last public/private series reconciliation (what was already equivalent, what
 | [kanban-worker-crash-oom-recovery.md](kanban-worker-crash-oom-recovery.md) | 0438 0454 0570 0594 | Scope-killed workers count as crashes; typed OOM recovery raises MemoryMax with admission and alerts on OOM rate. |
 | [kanban-triage-sweep-default-assignee.md](kanban-triage-sweep-default-assignee.md) | 0452 | CLI create defaults the assignee; stale triage cards are swept to the default profile once. |
 | [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) | 0448–0450 | Release instead of kill remote SSH backends on quit/resume, macOS launcher ownership proof, reuse-miss logging. |
-| [desktop-always-on-remote-dashboard.md](desktop-always-on-remote-dashboard.md) | 0526, 0535, 0595 | Always-on supervised remote dashboard (launchd/systemd, no idle exit, retires on a replaced runtime), startup prewarm (default + recently used named profiles) + keepalive reconnect, 30 s dispatch probe skip, `[remote-timing]` logs. |
+| [desktop-always-on-remote-dashboard.md](desktop-always-on-remote-dashboard.md) | 0526, 0535, 0595, 0671 | Always-on supervised remote dashboard (launchd/systemd, no idle exit, retires on a replaced runtime, never in a loop: PM ignores runtime markers, identical re-realizations reattach, 15 min retire backoff), startup prewarm (default + recently used named profiles) + keepalive reconnect, 30 s dispatch probe skip, `[remote-timing]` logs. |
 | [desktop-home-session-placement.md](desktop-home-session-placement.md) | 0403 | New cwd-only sessions keep a visible provisional or Home placement in every sidebar view. |
 | [kanban-sync-seams.md](kanban-sync-seams.md) | 0445 0458 | Phase 1 of the central Kanban sync service, off by default (`kanban.sync.enabled`): outbox capture triggers with a drift guard, `apply_remote_changes`, lease seams in claim/heartbeat/stale-claim, tombstoned deletes, wide ids, dispatcher wake; no network code yet |
 | [kanban-actionability-durable-evidence.md](kanban-actionability-durable-evidence.md) | 0393–0401 0396 0430 | Merge-adapted actionable escalation, scope heartbeat freshness, exact legacy attestation with a distinct wire action, contention timestamp retention, and test followups; locally verified candidate |

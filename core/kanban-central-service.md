@@ -143,8 +143,11 @@ rows for that board as stale; each (chat, card) is one row, keyed with the owner
 A card shared by two sessions of one compression lineage counts once. `links-diff` now compares `unknown` unfinished
 rows too, never uses that fallback, and is not clean while a needed replica is unreadable (it had reported 771/771
 clean while counts and list differed by 5). Tests: `test_kanban_chat_links_parity.py` (count == listed rows for each
-case), `test_kanban_sync_client.py::test_a_replica_pull_stamps_pulled_at_and_a_failed_one_does_not`. Local cards
-shared across a lineage still count twice (follow-up card).
+case), `test_kanban_sync_client.py::test_a_replica_pull_stamps_pulled_at_and_a_failed_one_does_not`.
+Local cards now also count once across compression aliases (patch `0671`): board-qualified identities travel with
+the count snapshot, including parked, held and stalled subsets. Distinct cards and equal ids on different boards
+remain distinct. Tests: `test_kanban_local_lineage_counts.py`; details in
+[kanban-local-lineage-counts.md](kanban-local-lineage-counts.md).
 
 Boards: every board on every host is attached and `primary` (6 on the laptop, 4 on the mini, 5 on the hub). Boards a
 host only knows through links (the laptop's `bb`, `runners` and `unconventional-collab`) keep just a replica. The sync loop now wakes on the service's WebSocket
