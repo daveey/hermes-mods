@@ -508,6 +508,24 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
   sweep in shadow, forwarder success/failure, ingest, monitor routing and `lane_owns`; also passes under Python 3.9,
   the Macs' `/usr/bin/python3`).
 
+### Desktop backend timeouts (`backend_timeouts.py`, no agent, no LLM)
+
+The Desktop app logs each failed backend call to `~/.hermes/logs/desktop.log` as
+`<local stamp> [hermes] [hermes:api GET /api/...] Error: Timed out connecting to Hermes backend after Nms`. On
+2026-10-27 the MacBook's `hermes serve` was CPU-starved and logged ~1,200 of those an hour for hours; nothing read
+them until an archive preflight failed in front of the user (self-heal `desktop-64ac180d9e`). A hermes cron job on
+each Mac (no-agent, every 10 min) runs `backend_timeouts.py`: it counts those lines over the last 30 min (live log
+plus the rotated `desktop.log.1..3`), grouped by request path with ids folded to `<id>`. At or above the threshold
+(default 30; config.yaml `coach.backend_timeouts.threshold` / `.window_minutes`, env
+`COACH_BACKEND_TIMEOUTS_THRESHOLD`, or `--threshold`) it runs `hermes kanban create --idempotency-key
+backend-timeouts:<host>:<date>` with the counts, top paths, load average and backend `ps` CPU; later firings that day
+comment on the same card at most once an hour (state in `<HERMES_HOME>/coach/backend_timeouts/state.json`). The
+card's acceptance is a fresh 30-min window with zero timeouts after the fix, not a restart. No Inbox items; stdout is
+empty while healthy. `--dry-run` prints the JSON report and files nothing; `--hours` prints a per-hour histogram of
+every timeout still in the logs. Tests: `tests/test_backend_timeouts.py` (40 lines file one card, 5 file none, a
+repeat the same day comments instead of duplicating, lost state, next day, rotated logs, histogram; also passes
+under Python 3.9).
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.
