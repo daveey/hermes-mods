@@ -1,0 +1,190 @@
+From 48e6269b089f1b6542610fbff7b9ca9c0f86069c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 09:46:53 -0700
+Subject: [PATCH 718/721] fix(kanban): comments no longer restart the
+ respawn-guard hold-cap clock (#170)
+
+* fix(kanban): comments no longer restart the respawn-guard hold-cap clock [daveey]
+
+* fix(kanban): report held ready cards (respawn_guarded / foreign runs_on) apart from stranded ones [daveey]
+---
+ hermes_cli/kanban_db_dispatch_guard_notice.py |  7 ++-
+ hermes_cli/kanban_diagnostics.py              | 56 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_diagnostics.py   | 28 ++++++++++
+ tests/hermes_cli/test_kanban_quota_guard.py   | 21 +++++++
+ 4 files changed, 109 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index 3f2fe8f92b..d1b492d067 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -25,12 +25,13 @@ GUARD_HOLD_NOTE_MARKER = "[respawn-guard]"
+ 
+ def guard_hold_started_at(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+     """When the current unbroken run of ``respawn_guarded`` events began: the first one
+-    after the newest event of any other kind (a claim, a block, an unblock, a comment...)."""
++    after the newest event of any other kind (a claim, a block, an unblock...). Comments of any
++    author do not restart it: a note or reply fixes nothing, and resetting on them held
++    a card in ``ready`` past its cap despite repeated comments. [daveey]"""
+     row = conn.execute(
+         "SELECT MIN(created_at) FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' "
+         "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+-        "AND kind != 'respawn_guarded' AND NOT (kind = 'commented' AND "
+-        "json_extract(payload, '$.author') = 'kanban-dispatcher')), 0)", (task_id, task_id),
++        "AND kind != 'respawn_guarded' AND kind != 'commented'), 0)", (task_id, task_id),
+     ).fetchone()
+     return int(row[0]) if row and row[0] is not None else None
+ 
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 127786b8cd..7795afa909 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -717,6 +717,30 @@ def _last_ready_entry_ts(events: Iterable[Any]) -> int:
+     return max([_latest_event_ts(events, _READY_WAIT_FLOOR_KINDS), *continued_ready])
+ 
+ 
++def _foreign_machines(task, cfg) -> list[str]:
++    """``machine:<m>`` runs_on labels naming a machine other than this hub (cfg ``own_machine``)."""
++    raw = _task_field(task, "runs_on")
++    if isinstance(raw, str):
++        try:
++            raw = json.loads(raw)
++        except ValueError:
++            raw = [raw]
++    own = str(cfg.get("own_machine", "hub"))
++    return [str(l).split(":", 1)[1] for l in (raw or [])
++            if str(l).startswith("machine:") and str(l).split(":", 1)[1] != own]
++
++
++def _ready_hold_reason(task, events, cfg) -> Optional[str]:
++    """Why a ready card is deliberately not claimed: its last event is ``respawn_guarded`` (the
++    dispatcher is holding it), or it is pinned to a foreign machine this hub never runs. [daveey]"""
++    evs = list(events or [])
++    if evs and _event_kind(max(evs, key=_event_ts)) == "respawn_guarded":
++        return "respawn_guarded"
++    if _foreign_machines(task, cfg):
++        return "foreign_runs_on"
++    return None
++
++
+ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
+     (default 30 min). Deliberately age-based and identity-agnostic so it
+@@ -732,6 +756,9 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     assignee = _task_field(task, "assignee") or ""
+     if not assignee.strip():
+         return []
++    # A deliberate hold is reported by _rule_held_in_ready, not as a stranded card.
++    if _ready_hold_reason(task, events, cfg):
++        return []
+ 
+     # Most recent event that put the task into ready; with none (old task /
+     # truncated events) fall back to created_at — over-flagging an ancient
+@@ -778,6 +805,34 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     )]
+ 
+ 
++
++def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """Unclaimed ``ready`` >= the stranded threshold, but held on purpose (respawn guard, or a
++    ``runs_on`` pin to another machine). Kept apart from ``stranded_in_ready`` so idle sweeps
++    do not nag about cards they cannot unstick. [daveey]"""
++    if _task_field(task, "status") != "ready" or _task_field(task, "claim_lock"):
++        return []
++    if not (_task_field(task, "assignee") or "").strip():
++        return []
++    reason = _ready_hold_reason(task, events, cfg)
++    if not reason:
++        return []
++    since = _last_ready_entry_ts(events) or int(_task_field(task, "created_at", 0) or 0)
++    age = now - since
++    if not since or age < float(cfg.get("stranded_threshold_seconds", 30 * 60)):
++        return []
++    return [Diagnostic(
++        kind="held_in_ready", severity="warning",
++        title=f"Ready {int(age / 60)}m, held ({reason})",
++        detail=f"Not stranded: {reason}. A respawn_guarded hold ends at its cap; a foreign "
++               f"machine:* pin waits for that machine (or a re-file).",
++        actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
++        first_seen_at=since, last_seen_at=since, count=1,
++        data={"ready_since": since, "age_seconds": int(age), "hold_reason": reason,
++              "foreign_machines": _foreign_machines(task, cfg)},
++    )]
++
++
+ def _rule_overdue_wake(task, events, runs, now, cfg) -> list[Diagnostic]:
+     """A ``scheduled`` card parked by a timed ``kanban_continue`` wait is still parked more than
+     cfg["overdue_wake_grace_seconds"] (default 10 min) after its ``wake_at``: the dispatcher's
+@@ -998,6 +1053,7 @@ _RULES: list[RuleFn] = [
+     _rule_stuck_in_blocked,
+     _rule_block_unblock_cycling,
+     _rule_stranded_in_ready,
++    _rule_held_in_ready,
+     _rule_overdue_wake,
+     _rule_scheduled_without_wake,
+     _rule_clock_only_park,
+diff --git a/tests/hermes_cli/test_kanban_diagnostics.py b/tests/hermes_cli/test_kanban_diagnostics.py
+index 2c6dacfa85..c593499dd5 100644
+--- a/tests/hermes_cli/test_kanban_diagnostics.py
++++ b/tests/hermes_cli/test_kanban_diagnostics.py
+@@ -283,3 +283,31 @@ def test_stranded_in_ready_counts_a_continue_that_resumed_straight_to_ready():
+               _event("continued", ts=now - 5 * 60, status="ready", resume_status="ready")]
+     assert [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
+             if d.kind == "stranded_in_ready"] == []
++
++
++def _kinds(diags):
++    return sorted(d.kind for d in diags if d.kind in ("stranded_in_ready", "held_in_ready"))
++
++
++def test_ready_hold_is_reported_apart_from_stranded():
++    """A respawn_guarded last event, or a foreign machine:* pin, is a held card, not a stranded one."""
++    now = 100_000
++    old = now - 90 * 60
++    guarded = [_event("created", ts=old), _event("respawn_guarded", ts=now - 60)]
++    d = kd.compute_task_diagnostics(_task(), guarded, [], now=now)
++    assert _kinds(d) == ["held_in_ready"]
++    assert next(x for x in d if x.kind == "held_in_ready").data["hold_reason"] == "respawn_guarded"
++
++    pinned = _task(runs_on='["machine:macbook"]')
++    d = kd.compute_task_diagnostics(pinned, [_event("created", ts=old)], [], now=now)
++    assert _kinds(d) == ["held_in_ready"]
++    assert next(x for x in d if x.kind == "held_in_ready").data["foreign_machines"] == ["macbook"]
++
++    # pinned to this hub, or a plain old ready card: still stranded
++    own = _task(runs_on=["machine:hub"])
++    assert _kinds(kd.compute_task_diagnostics(own, [_event("created", ts=old)], [], now=now)) == ["stranded_in_ready"]
++    # a guarded card that later got another event is no longer held
++    later = guarded + [_event("commented", ts=now - 10)]
++    assert _kinds(kd.compute_task_diagnostics(_task(), later, [], now=now)) == ["stranded_in_ready"]
++    # a young hold is not reported at all
++    assert _kinds(kd.compute_task_diagnostics(pinned, [_event("created", ts=now - 60)], [], now=now)) == []
+diff --git a/tests/hermes_cli/test_kanban_quota_guard.py b/tests/hermes_cli/test_kanban_quota_guard.py
+index bdb4bf2df3..cf8eba06c0 100644
+--- a/tests/hermes_cli/test_kanban_quota_guard.py
++++ b/tests/hermes_cli/test_kanban_quota_guard.py
+@@ -207,3 +207,24 @@ def test_auth_hold_block_is_not_released(kanban_home, monkeypatch):
+         assert task.status == "blocked" and task.block_kind == "capability"
+         ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()
+         assert json.loads(ev[0])["kind"] == "capability"
++
++
++def test_hold_clock_survives_non_dispatcher_comments(kanban_home, monkeypatch):
++    """A comment from an orchestrator/human must not restart the hold clock."""
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", "3600")
++    now = 5_000_000
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pr held", assignee="a")
++        monkeypatch.setattr(kb.time, "time", lambda: now)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
++        monkeypatch.setattr(kb.time, "time", lambda: now + 1800)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "commented", {"author": "default", "len": 10})
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
++        from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at
++        assert guard_hold_started_at(conn, tid) == now
++        monkeypatch.setattr(kb.time, "time", lambda: now + 3700)
++        assert kbd._block_if_guard_hold_capped(conn, tid, "active_pr") is True
++        assert kb.get_task(conn, tid).status != "ready"

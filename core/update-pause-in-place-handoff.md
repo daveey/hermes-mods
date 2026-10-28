@@ -108,3 +108,19 @@ Tests in `tests/tui_gateway/test_shutdown_job_receipts.py`:
 - `test_startup_sweep_resumes_a_job_receipt_older_than_the_turn_freshness_window`
 
 A live scheduler submitting a real background job, and a real backend exit, are untested in this patch. The tests drive the registry and the marker directly.
+
+## Follow-up patch (0719)
+
+**0719** (fork `64e81da1a0`): a synthesized notification turn that carries an inherited core-update-paused marker re-arms the in-place watcher exactly once whether it succeeds, raises, or is refused during input preparation. The original paused prompt remains available to continue when the session becomes idle.
+
+`_rearm_carried_pause_watcher` in `tui_gateway/prompt_turn.py` runs in the turn's innermost `finally`, after post-turn housekeeping. A turn that recorded its own marker does not use this carried-pause path. `_paused_marker_carried` remains set until a later turn records its own marker, so marker-retirement paths do not erase the paused request.
+
+Tests in `tests/tui_gateway/test_update_pause_superseded.py`:
+
+- `test_fresh_backend_notification_turn_success_rearms_the_watcher`
+- `test_fresh_backend_notification_turn_that_raises_still_rearms_the_watcher`
+- `test_fresh_backend_notification_turn_refused_at_prepare_still_rearms_the_watcher`
+
+These drive `_notif_run_submit` with a fresh session and a marker inherited from the previous backend. They assert the original prompt survives, the watcher is armed once, the session is idle, and the resume decision is `resume`. Watcher startup is captured by a fixture; these tests do not execute a live update or the resumed agent turn.
+
+Applying: append 0719 in series order. It depends on the earlier carried-marker support already in the fork; it is not a standalone replacement for 0704.

@@ -92,3 +92,16 @@ never-run repair card whose handoff names a queue-rejected PR lost its "repair a
 path now posts `comment_rejection` for every `REJECTED` PR in the handoff before releasing. Tests:
 `tests/hermes_cli/test_kanban_pr_rejection.py` (worker-opened cases now mark `worker_ran`; the never-run case
 still gets the note).
+
+## Hold-cap clock and ready diagnostics (0718)
+
+Patch **0718** (fork `48e6269b08`) makes `guard_hold_started_at` ignore comments from every author, not just the dispatcher. A human or orchestrator reply therefore cannot restart the hold-cap clock. A non-comment, non-`respawn_guarded` event still starts a new clock segment. This clock is separate from the event-deduplication behavior described above: a comment can cause another guard event without resetting the cap.
+
+`hermes_cli/kanban_diagnostics.py` also reports an old, unclaimed, assigned ready card as `held_in_ready`, rather than `stranded_in_ready`, when its latest event is `respawn_guarded` or its `machine:*` pin names another machine. The usual age threshold still applies. A pin to the configured own machine is not a foreign-machine hold. The diagnostic uses the latest event literally: a later comment removes the respawn-guard classification unless a foreign pin still applies.
+
+Tests:
+
+- `tests/hermes_cli/test_kanban_quota_guard.py::test_hold_clock_survives_non_dispatcher_comments`: a non-dispatcher comment leaves the original start timestamp intact, and the cap blocks the card after the original deadline.
+- `tests/hermes_cli/test_kanban_diagnostics.py::test_ready_hold_is_reported_apart_from_stranded`: guard and foreign-pin holds, own-machine control, later-comment control, and young-hold suppression.
+
+Applying: append 0718 in series order; it changes the existing guard-notice helper and diagnostics module. A real dispatcher waiting through the cap and rendered diagnostic UI are untested here.

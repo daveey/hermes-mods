@@ -1,0 +1,134 @@
+From 64e81da1a0f3fb7135de696e407e159f6fe943b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:57:20 +0000
+Subject: [PATCH 719/721] fix(tui_gateway): a synthesized turn over a paused
+ marker re-arms the watcher however it ends [daveey]
+
+d55299af3e re-armed the core-update in-place watcher only on the synthesized turn's success path. A
+notification turn that raised (_recover_turn_exception) or was refused at _prepare_turn_input kept the paused
+marker but armed no watcher, so on a backend that had already restarted nothing continued the paused turn
+until another restart or a typed message. The re-arm now runs in the turn's finally, once, for every exit.
+_paused_marker_carried stays set until the next turn records its own marker, so later retire paths (an idle
+Stop) also keep the paused request. Tests: a fresh backend (marker from the old process) whose notification
+turn succeeds, raises, or is refused.
+---
+ .../test_update_pause_superseded.py           | 52 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    | 29 +++++++++--
+ 2 files changed, 76 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_superseded.py b/tests/tui_gateway/test_update_pause_superseded.py
+index 795a05aae0..d0aaae389b 100644
+--- a/tests/tui_gateway/test_update_pause_superseded.py
++++ b/tests/tui_gateway/test_update_pause_superseded.py
+@@ -130,3 +130,55 @@ def test_notification_turn_without_a_pause_leaves_no_marker(env):
+ 
+     assert read_turn_marker(env.home, "session-key") is None
+     assert env.watchers == [("ui-sid", "session-key")]
++
++
++# --- After a backend restart: the paused marker was written by the old process, and the
++# new backend's first turn on the session is a synthesized one. Whatever way that turn ends, the in-place watcher
++# must be re-armed exactly once so the paused turn continues once the session is idle.
++
++def _fresh_session_with_inherited_pause(home, run_conversation):
++    from tui_gateway.turn_marker import mark_turn_paused, record_turn_start
++    record_turn_start(home, "session-key", "the long task")
++    assert mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    session = {"session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++               "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
++               "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++               "profile_home": str(home)}
++    session["agent"] = types.SimpleNamespace(session_id="session-key", run_conversation=run_conversation,
++                                             clear_interrupt=lambda: None)
++    return session
++
++
++def _assert_paused_turn_continues(env, session):
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None and marker["reason"] == up.PAUSE_REASON
++    assert marker["prompt"] == "the long task"
++    assert env.watchers == [("ui-sid", "session-key")], "the paused turn has no watcher to continue it"
++    assert not session.get("running")
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "resume"
++
++
++def test_fresh_backend_notification_turn_success_rearms_the_watcher(env):
++    session = _fresh_session_with_inherited_pause(
++        env.home, lambda message, **kw: {"final_response": "noted", "messages": []})
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    _assert_paused_turn_continues(env, session)
++
++
++def test_fresh_backend_notification_turn_that_raises_still_rearms_the_watcher(env):
++    def _boom(message, **kw):
++        raise RuntimeError("provider exploded")
++
++    session = _fresh_session_with_inherited_pause(env.home, _boom)
++    server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    _assert_paused_turn_continues(env, session)
++
++
++def test_fresh_backend_notification_turn_refused_at_prepare_still_rearms_the_watcher(env, monkeypatch):
++    def _never(message, **kw):
++        raise AssertionError("a refused turn must not reach the agent")
++
++    session = _fresh_session_with_inherited_pause(env.home, _never)
++    monkeypatch.setattr(server, "_prepare_turn_input", lambda *a, **k: None)
++    server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++    _assert_paused_turn_continues(env, session)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 843527dcde..efa9ae9e2e 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -222,6 +222,24 @@ def _carry_paused_marker(session: dict, home, marker_key: str) -> bool:
+     return True
+ 
+ 
++def _rearm_carried_pause_watcher(sid: str, session: dict, st) -> None:
++    """[daveey] A synthesized turn that ran over a core-update-paused marker re-arms the in-place watcher however
++    it ended (complete, raised, refused at prepare): otherwise, on a backend that already restarted, nothing
++    continues the paused turn. ``_paused_marker_carried`` stays set until the next turn records its own marker,
++    so later retire paths (the backstop above, an idle Stop) keep the paused request too."""
++    if st.marker_key:  # this turn wrote a marker of its own, so it did not carry the pause
++        return
++    with session["history_lock"]:
++        carried = str(session.get("_paused_marker_carried") or "")
++    if not carried:
++        return
++    try:
++        from tui_gateway import update_pause
++        update_pause.start_in_place_watcher(sid, session, carried)
++    except Exception:  # health: allow BLE001 -- a failed re-arm must not mask the turn's own outcome; logged
++        logger.exception("core-update pause: could not re-arm the watcher for %s", carried)
++
++
+ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+                         notification_category: str | None = None) -> str:
+     """Write the durable crash marker; returns the session key it was written under (compression
+@@ -1316,12 +1334,10 @@ def _run_admitted_prompt(
+                 from tui_gateway.free_tier_task_done import note_task_done
+                 note_task_done(session, st.result, st.agent, display_kind)
+             _emit("message.complete", sid, payload)
+-            # Kept until the next turn records its marker, so the backstop retire below also leaves it.
+-            carried = session.get("_paused_marker_carried")
+-            if paused_for_update or carried:
++            if paused_for_update:
+                 # The new backend continues it; if no update replaces this one, continue it here.
+                 from tui_gateway import update_pause
+-                update_pause.start_in_place_watcher(sid, session, str(st.marker_key or carried))
++                update_pause.start_in_place_watcher(sid, session, st.marker_key)
+             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+             if status == "complete":
+                 _after_complete_turn(sid, session, st, raw)
+@@ -1366,7 +1382,10 @@ def _run_admitted_prompt(
+                         session.pop("_auto_continue_scheduled", None)
+                 _emit_settled_session_info(sid, session, st.agent)
+             finally:
+-                _post_turn_housekeeping(sid, session, st)
++                try:
++                    _post_turn_housekeeping(sid, session, st)
++                finally:
++                    _rearm_carried_pause_watcher(sid, session, st)
+         return st.result, goal_followup
+     def run():
+         from agent.notification_presentation import notification_turn
