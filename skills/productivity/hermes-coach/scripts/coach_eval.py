@@ -525,6 +525,7 @@ Judge each item independently and strictly from the evidence shown.
 Return ONLY a JSON array, one object per item in order: {"id": "<item id>", "pass": 0|1, "why": "<one short sentence>"}"""
 
 
+EMPTY_TEXT = "[EMPTY: the model ended its turn normally and sent no message text]"
 REFUSAL_TEXT = "[REFUSED: the model declined to respond to this turn and sent no message]"
 
 
@@ -1117,8 +1118,13 @@ def replay_variant(name, eps, root, live, edits, runner, budget, model, jobs, re
             # The model's real behavior on this episode: graded like any reply (same for both variants).
             log(f"  {name} {ep['id']}: refused (graded as a refusal)")
             return ep["id"], k, REFUSAL_TEXT, 0.0
+        if not (text or "").strip() and stop == "end_turn" and (usage or {}).get("output_tokens"):
+            # A deterministic no-message turn (gpt-6-astra does this on some episodes, repeatably) is the model's real
+            # behavior, graded as such; leaving it ungraded would make the model-gate report INCOMPLETE forever.
+            log(f"  {name} {ep['id']}: empty reply (graded as an empty turn)")
+            return ep["id"], k, EMPTY_TEXT, 0.0
         if not (text or "").strip():
-            log(f"  {name} {ep['id']}: empty reply (stop_reason {stop})")
+            log(f"  {name} {ep['id']}: empty reply (stop_reason {stop}), left ungraded")
         return ep["id"], k, (text or "").strip() or None, 0.0
 
     with ThreadPoolExecutor(jobs) as ex:
@@ -1333,6 +1339,8 @@ def _run_behavior(cand, bench, eps, manifest, target, budget, budget_usd, runner
                                else os.environ.get("COACH_JUDGE_PROVIDER") or "anthropic"),
             "bench": str(bench), "episodes": len(eps), "repeats": repeats,
             "edits": cand.get("edits") or [], "complete": complete, "manifest": manifest,
+            "empty_turns": {"base": sum(v == EMPTY_TEXT for v in base.values()),
+                            "cand": sum(v == EMPTY_TEXT for v in candr.values())},
             "refusals": {"base": sum(v == REFUSAL_TEXT for v in base.values()),
                          "cand": sum(v == REFUSAL_TEXT for v in candr.values())},
             "benchmark_sha256": hashlib.sha256(Path(bench).read_bytes()).hexdigest()}

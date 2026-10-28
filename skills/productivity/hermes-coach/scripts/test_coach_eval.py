@@ -449,6 +449,9 @@ for line in sys.stdin:
                           "source": "fake", "prefix": "PFX"}), flush=True)
     elif "FAIL" in req["user"] or "FAIL" in req["system"]:
         print(json.dumps({"error": "HTTP 529 overloaded"}), flush=True)
+    elif "EMPTYTURN" in req["system"]:
+        print(json.dumps({"text": "", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 40,
+                          "cache_write_tokens": 0, "cache_read_tokens": 0}}), flush=True)
     elif "REFUSE" in req["system"]:
         print(json.dumps({"text": "", "stop_reason": "refusal", "usage": {"input_tokens": 10, "output_tokens": 0,
                           "cache_write_tokens": 0, "cache_read_tokens": 0}}), flush=True)
@@ -621,6 +624,21 @@ class Direct(unittest.TestCase):
         self.assertEqual(r["refusals"], {"base": 0, "cand": n})
         self.assertTrue(all(row["cand_reply"] == ce.REFUSAL_TEXT for row in r["rows"]))
         self.assertTrue(any("judge batch rejected: not JSON" in x for x in logs))  # judge failures are logged
+
+    def test_empty_end_turn_is_a_graded_reply_not_a_gap(self):
+        bench_f = bench(self.tmp / "bench.jsonl")
+        live = self.tmp / "live"
+        (live / "memories").mkdir(parents=True)
+        (live / "config.yaml").write_text("model:\n  default: x\n")
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"COACH_DATA": str(self.tmp / "data")}):
+            (self.tmp / "data/research/state").mkdir(parents=True)
+            r = ce.run_behavior({"name": "c", "target": "unverified_done",
+                                 "edits": [{"file": "AGENTS.md", "append": "EMPTYTURN"}]}, bench_f, None, 5.0,
+                                runner=self.runner, root=self.tmp / "ev" / "root", live=live, jobs=2, log=lambda *_: None)
+        n = len(ce.load_jsonl(bench_f))
+        self.assertEqual(r["empty_turns"], {"base": 0, "cand": n})
+        self.assertTrue(all(row["cand_reply"] == ce.EMPTY_TEXT for row in r["rows"]))
 
     def test_launcher_parsing(self):
         launcher = self.tmp / "hermes"
