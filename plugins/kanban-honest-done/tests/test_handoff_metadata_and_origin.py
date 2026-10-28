@@ -156,6 +156,17 @@ def test_origin_chat_linked_allowed(tmp_path):
     assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
 
 
+def test_origin_chat_is_creating_chat_allowed_before_link_sync(tmp_path):
+    """Live test t_01a180920ed19723: the creating chat's 'created' link row is written later by the sync loop, so
+    the first completion was refused although the card was the origin chat's own. tasks.session_id counts."""
+    paths = make_board(tmp_path, links=())
+    c = sqlite3.connect(paths()[0])
+    c.execute("UPDATE tasks SET session_id=? WHERE id=?", (ORIGIN, OWN))
+    c.commit()
+    c.close()
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
+
+
 def test_origin_chat_subscribed_allowed(tmp_path):
     paths = make_board(tmp_path, subs=[("tui", ORIGIN)])
     assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None

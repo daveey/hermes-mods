@@ -313,6 +313,12 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
         if not wanted:
             return None
         reached: set[str] = set()
+        try:  # the creating chat: its 'created' chat link is written later by the sync loop's reconcile
+            row = conn.execute("SELECT session_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row and row[0]:
+                reached.add(str(row[0]))
+        except sqlite3.Error:
+            pass
         if _has_table(conn, "task_chat_links"):
             reached |= {r[0] for r in conn.execute(
                 "SELECT chat_session FROM task_chat_links WHERE task_id=? AND released=0", (task_id,))}
