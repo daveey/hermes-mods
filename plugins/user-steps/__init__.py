@@ -256,6 +256,30 @@ def _require_publication_contract() -> None:
         raise RuntimeError("user-steps requires post-transform buffered publication; update core first")
 
 
+_ALIAS_SHAPE = ('objects {gatewayId, profile, type, id, board?} (type message, user_step or kanban; board only '
+                'for kanban); pass [] when there are none')
+
+
+def _shape_check(payload: dict) -> None:
+    """Reject wrongly shaped containers before anything indexes into them, with the exact fix.
+
+    The handler reads aliases/choices/scope before core.validate_action runs, so a string where an object
+    belongs used to crash with AttributeError instead of returning an error the agent could act on.
+    """
+    def objects(value, name, shape):
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise core.ActionError(f'{name} must be a list of {shape}')
+    if 'scope' in payload and not isinstance(payload['scope'], dict):
+        raise core.ActionError('scope must be an object {markdown, complete, sourceRefs}')
+    if isinstance(payload.get('scope'), dict) and 'sourceRefs' in payload['scope']:
+        objects(payload['scope']['sourceRefs'], 'scope.sourceRefs', _ALIAS_SHAPE)
+    if 'aliases' in payload:
+        objects(payload['aliases'], 'aliases', _ALIAS_SHAPE)
+    if 'choices' in payload:
+        objects(payload['choices'], 'choices', 'objects {id, label, effect} (effect approve, revise, decline or '
+                'answer)')
+
+
 def publish_action_request(args: dict, session_id: str = '', **_) -> str:
     """Agent producer: explicit scope only. Extraction NEVER calls this complete-plan path.
 
@@ -278,7 +302,10 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
             return json.dumps({'request': out})
         core._object(args, ('request',), ('requestId', 'expectedRevision', 'decisionCard'))
         owner = core.server_owner(session_id)
+        if not isinstance(args['request'], dict):
+            raise core.ActionError('request must be an object (the ActionRequest v2 fields)')
         payload = dict(args['request'])
+        _shape_check(payload)
         st = core.ActionStore()
         if core.declares_no_ask(payload):
             # "No decision needed: ..." is a status note, not an ask: it must leave For you, not become a tile.
@@ -374,13 +401,18 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         return json.dumps({'request': out})
     except (ValueError, TypeError, RuntimeError) as exc:
         return json.dumps({'error': str(exc), 'status': getattr(exc, 'status', 422)})
+    except (AttributeError, KeyError) as exc:
+        # Backstop: a shape _shape_check/validate_action missed must still reach the agent as a fixable error,
+        # never a raw dispatch failure it can only retry blindly.
+        return json.dumps({'error': f'Malformed request ({type(exc).__name__}: {exc}). Check the field shapes '
+                                    'in the action_request schema.', 'status': 422})
 
 
 PRODUCER_SCHEMA = {
     'name': 'action_request',
     'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one revises that one. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
     'parameters': {'type': 'object', 'additionalProperties': False,
-                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, choices [{id,label,effect}], qualified aliases, state (open or needs_context).'},
+                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, choices [{id, label, effect}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline), aliases: [] unless reusing a request\'s own refs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?}, never a bare card id string), state (open or needs_context).'},
                                   'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
                                   'decisionCard': {'type': 'object', 'additionalProperties': False,
                                                    'properties': {'board': {'type': 'string'}}, 'required': ['board'],
