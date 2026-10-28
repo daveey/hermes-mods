@@ -6,6 +6,7 @@ import json
 import shutil
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -101,6 +102,83 @@ def test_library_warning_traceback_is_not_a_defect_but_ours_is():
     assert sg.parse_errors(rec("WARNING", "mcp.os.posix.utilities", lib)) == []
     assert len(sg.parse_errors(rec("WARNING", "tools.mcp_tool", own))) == 1
     assert len(sg.parse_errors(rec("ERROR", "mcp.os.posix.utilities", lib))) == 1
+
+
+LIB = "/home/you/.hermes/installs/x/venv/lib/python3.14/site-packages"
+RECONNECT_TAILS = {
+    "close-1000": [f'  File "{LIB}/discord/client.py", line 731, in connect',
+                   "    await self.ws.poll_event()",
+                   f'  File "{LIB}/discord/gateway.py", line 668, in poll_event',
+                   "    raise ConnectionClosed(self.socket, shard_id=self.shard_id, code=code) from None",
+                   "discord.errors.ConnectionClosed: Shard ID None WebSocket closed with 1000"],
+    "reset": [f'  File "{LIB}/discord/gateway.py", line 677, in send',
+              "    await self.socket.send_str(data)",
+              f'  File "{LIB}/aiohttp/_websocket/writer.py", line 150, in _write_websocket_frame',
+              '    raise ClientConnectionResetError("Cannot write to closing transport")',
+              "aiohttp.client_exceptions.ClientConnectionResetError: Cannot write to closing transport"],
+    "dns": [f'  File "{LIB}/discord/client.py", line 728, in connect',
+            "    self.ws = await asyncio.wait_for(coro, timeout=60.0)",
+            '  File "/home/you/Applications/Hermes Python.app/Contents/lib/python3.14/asyncio/tasks.py", line 488, '
+            "in wait_for",
+            "    return await fut",
+            f'  File "{LIB}/aiohttp/connector.py", line 1577, in _create_direct_connection',
+            "    raise ClientConnectorDNSError(req.connection_key, exc) from exc",
+            "aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host gateway-us-east1-c.discord.gg:443 "
+            "ssl:default [nodename nor servname provided, or not known]"],
+    "handshake": [f'  File "{LIB}/aiohttp/client.py", line 1266, in _ws_connect',
+                  "    raise WSServerHandshakeError(",
+                  "aiohttp.client_exceptions.WSServerHandshakeError: 520, message='Invalid response status', "
+                  "url='wss://gateway.discord.gg/?v=10&encoding=json&compress=zstd-stream'"],
+}
+
+
+def reconnect_rec(tail, logger="discord.client", msg="Attempting a reconnect in 2.36s", at="2026-10-22 08:00:00"):
+    return [f"{at},000 ERROR {logger}: {msg}", "Traceback (most recent call last):"] + tail
+
+
+@pytest.mark.parametrize("variant", sorted(RECONNECT_TAILS))
+def test_library_auto_reconnect_is_not_a_defect(variant):
+    # discord.py logs every self-healing reconnect at ERROR with a traceback, then reconnects (client.py:769-781)
+    assert sg.parse_errors(reconnect_rec(RECONNECT_TAILS[variant])) == []
+
+
+def test_reconnect_message_with_a_hermes_frame_or_hermes_failed_to_connect_still_files():
+    own = ['  File "/home/you/.hermes/hermes-agent/gateway/platforms/discord.py", line 40, in start',
+           "    await self.client.start(token)"] + RECONNECT_TAILS["close-1000"]
+    assert len(sg.parse_errors(reconnect_rec(own))) == 1
+    ours = reconnect_rec(RECONNECT_TAILS["dns"], logger="hermes_plugins.platforms__discord.adapter",
+                         msg="[Discord] Failed to connect to Discord: Cannot connect to host discord.com:443")
+    assert len(sg.parse_errors(ours)) == 1
+    # a Hermes logger saying "Attempting a reconnect" is ours to look at, frames or not
+    assert len(sg.parse_errors(reconnect_rec(RECONNECT_TAILS["reset"], logger="gateway.run"))) == 1
+
+
+def _reconnect_log(home, n, start):
+    lines = []
+    for i in range(n):
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start + i * 60))
+        lines += reconnect_rec(RECONNECT_TAILS["close-1000"], at=t)
+    with (home / "logs" / "errors.log").open("a") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def test_reconnect_storm_files_one_defect_per_host_and_profile(tmp_path):
+    h = tmp_path / "home"
+    (h / "logs").mkdir(parents=True)
+    cur = {}
+    _reconnect_log(h, 20, NOW - 1500)  # 20 in the hour: the library is coping, nothing to file
+    assert kinds(sg.collect(h, cur, "macbook", NOW), "errors") == []
+    _reconnect_log(h, 1, NOW - 200)  # the 21st within an hour, on a later pass: one storm defect
+    storm = kinds(sg.collect(h, cur, "macbook", NOW), "errors")
+    assert len(storm) == 1
+    assert storm[0]["symptom"].startswith("discord.client keeps reconnecting on macbook (default): 21 reconnects")
+    assert storm[0]["component"] == "gateway" and storm[0]["count"] == 1
+    _reconnect_log(h, 3, NOW - 100)  # same storm, same hour: not filed again
+    assert kinds(sg.collect(h, cur, "macbook", NOW + 60), "errors") == []
+    other = tmp_path / "other"
+    (other / "logs").mkdir(parents=True)
+    _reconnect_log(other, 21, NOW - 1500)
+    assert kinds(sg.collect(other, {}, "mini", NOW), "errors")[0]["fp"] != storm[0]["fp"]  # per host
 
 
 def test_plugin_hook_exception(home):

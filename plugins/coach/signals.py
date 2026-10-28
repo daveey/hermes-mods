@@ -61,6 +61,13 @@ TRANSIENT_RE = re.compile(r"RateLimitError|rate_limit_error|\b429\b|overloaded_e
                           r"APITimeoutError|ReadTimeout|ConnectTimeout|RemoteProtocolError|CancelledError|"
                           r"KeyboardInterrupt|InternalServerError.*\b5\d\d\b", re.I)
 PLUGIN_PATH_RE = re.compile(r"/plugins/([\w.\-]+)/")
+# A network library that logs its own auto-reconnect at ERROR with the traceback, then reconnects by itself
+# (discord.py client.py:769-781: "sometimes, discord sends us 1000 for unknown reasons so we should reconnect").
+# Not a defect unless a Hermes logger or frame is involved; a storm of them on one host/profile still files one.
+RECONNECT_RE = re.compile(r"^Attempting a reconnect in \d")
+OWN_LOGGER_RE = re.compile(r"^(hermes|gateway|agent|tools|cron|tui_gateway|plugins|run_agent|kanban|coach|acp)")
+RECONNECT_STORM = 20               # more than this many library reconnects in RECONNECT_WINDOW_S files one defect
+RECONNECT_WINDOW_S = 3600
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -153,8 +160,9 @@ def component_of(paths: List[str]) -> Tuple[str, str]:
     return "agent", ""
 
 
-def parse_errors(lines: List[str]) -> List[dict]:
-    """Records (header + continuation lines) -> traceback and hook-exception signals."""
+def parse_errors(lines: List[str], reconnects: Optional[list] = None) -> List[dict]:
+    """Records (header + continuation lines) -> traceback and hook-exception signals. Library auto-reconnects are
+    not signals; each is appended to `reconnects` (when given) for the storm count."""
     recs, cur = [], None
     for ln in lines:
         m = REC_RE.match(ln)
@@ -187,6 +195,13 @@ def parse_errors(lines: List[str]) -> List[dict]:
         exc_line = next((l for l in reversed(block) if l and not l[0].isspace() and EXC_RE.match(l)), "")
         exc_type = (EXC_RE.match(exc_line).group(1) if exc_line else "") or "Exception"
         text = r["msg"] + "\n" + exc_line
+        if (RECONNECT_RE.match(r["msg"]) and not OWN_LOGGER_RE.match(r["logger"])
+                and not any(_own_frame(p) for p, _fn in frames)):
+            if reconnects is not None:  # the library reconnects by itself; only a storm of these is ours to file
+                reconnects.append({"at": r["at"], "logger": r["logger"],
+                                   "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
+                                                                   + block))[-1500:]})
+            continue
         if TRANSIENT_RE.search(text):
             continue
         comp, plug = component_of([f[0] for f in frames])
@@ -201,14 +216,48 @@ def parse_errors(lines: List[str]) -> List[dict]:
     return out
 
 
-def collect_errors(home: Path, cur: dict, now: float) -> List[dict]:
+def reconnect_storms(cur: dict, prof: str, recs: List[dict], now: float, host: str) -> List[dict]:
+    """Keep each (profile, library logger)'s reconnect times of the last hour in the cursor (a storm spans many
+    passes); more than RECONNECT_STORM of them files one defect per host/profile/logger per hour."""
+    store = cur.setdefault("reconnects", {})
+    by_logger: Dict[str, List[dict]] = {}
+    for r in recs:
+        by_logger.setdefault(r["logger"], []).append(r)
+    for k in list(store):  # loggers quiet this pass still age out
+        if k.startswith(f"{prof}:") and k.split(":", 1)[1] not in by_logger:
+            by_logger[k.split(":", 1)[1]] = []
+    out = []
+    for logger, rs in by_logger.items():
+        k = f"{prof}:{logger}"
+        st = store.get(k) or {}
+        ts = sorted(t for t in list(st.get("ts") or []) + [r["at"] for r in rs] if t >= now - RECONNECT_WINDOW_S)
+        st = {"ts": ts[-(RECONNECT_STORM * 5):], "filed": float(st.get("filed") or 0)}
+        if not ts and st["filed"] < now - RECONNECT_WINDOW_S:
+            store.pop(k, None)
+            continue
+        store[k] = st
+        if len(ts) > RECONNECT_STORM and st["filed"] < now - RECONNECT_WINDOW_S:
+            st["filed"] = now
+            last = rs[-1]["details"] if rs else ""
+            out.append({"kind": "errors", "component": "gateway", "at": ts[-1], "session_id": "", "profile": prof,
+                        "symptom": f"{logger} keeps reconnecting on {host or 'this host'} ({prof}): {len(ts)} "
+                                   f"reconnects in the last hour (more than {RECONNECT_STORM})",
+                        "details": (f"{len(ts)} library auto-reconnects logged by {logger} in the last hour; "
+                                    f"each one alone is not a defect. Latest:\n{last}")[:1500],
+                        "fp": fp("gateway", "reconnect-storm", host, prof, logger)})
+    return out
+
+
+def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     out = []
     for prof, h in homes(home):
         lines = read_new(h / "logs" / "errors.log", cur, f"errors:{prof}", now)
-        for s in parse_errors(lines):
+        recs: List[dict] = []
+        for s in parse_errors(lines, recs):
             if s["at"] >= now - BACKFILL_S:
                 s["profile"] = prof
                 out.append(s)
+        out += reconnect_storms(cur, prof, recs, now, host)
     return out
 
 
@@ -351,7 +400,7 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
 def collect(home: Path, cur: dict, host: str, now: Optional[float] = None) -> List[dict]:
     now = now or time.time()
     out = []
-    for kind, fn in (("errors", lambda: collect_errors(home, cur, now)),
+    for kind, fn in (("errors", lambda: collect_errors(home, cur, now, host)),
                      ("cron", lambda: collect_cron(home, cur, now, host)),
                      ("kanban", lambda: collect_kanban(home, cur, now, host)),
                      ("gateway", lambda: collect_gateway(home, cur, now, host)),
