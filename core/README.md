@@ -16,12 +16,14 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [git-consumer-fallback-tests.md](git-consumer-fallback-tests.md) | 0662 | Inject consumer failures at public PM boundary; cover missing-runtime preflight without losing callback assertions. |
+| [kanban-session-poll-coalescing.md](kanban-session-poll-coalescing.md) | 0661 | Overlapping session-list polls share one annotation refresh; failures remain unknown. |
 | [kanban-wait-replica.md](kanban-wait-replica.md) | 0658 | Unreachable SSH card waits use fresh owner-qualified replica rows; missing/stale evidence errors, orphan producers are refused, and automatic probes share the route. |
 | [live-git-config-test-isolation.md](live-git-config-test-isolation.md) | 0657 | Tests scrub inherited Git location overrides and restore modified live core.bare values. |
-| [display-transcript-compression.md](display-transcript-compression.md) | 0656 | Display-only transcript responses omit redundant provider fields and support gzip over the Desktop transport. |
+| [display-transcript-compression.md](display-transcript-compression.md) | 0656 0660 | Display-only transcript responses omit redundant provider fields and support gzip; sidebar click prepaints cached transcript. |
 | [borrowed-home-bootstrap.md](borrowed-home-bootstrap.md) | 0655 | Bootstrap checkout dependencies before isolated borrowed-home user code; avoid re-exec on the store interpreter. |
 | [kanban-pin-provider.md](kanban-pin-provider.md) | 0653 | Bind concrete model pins to a serving provider at create/set time; refuse missing or ambiguous providers; resolve legacy NULL-provider pins at dispatch. |
-| [kanban-board-recovery.md](kanban-board-recovery.md) | 0633–0637 0639–0640 0648–0649 0652 | Out-of-process table b-tree salvage and in-place SQLite backup install, tombstone-aware reconcile, shared recovery lock with holder identity, contention/deleted-sidecar refusal and forensic reports. |
+| [kanban-board-recovery.md](kanban-board-recovery.md) | 0633–0637 0639–0640 0648–0649 0652 0659 | Out-of-process table b-tree salvage and in-place SQLite backup install, tombstone-aware reconcile, shared recovery lock with holder identity, contention/deleted-sidecar refusal and forensic reports. |
 | [backend-activity-quiet-hint.md](backend-activity-quiet-hint.md) | 0632 | Backend last_active, not a window's event silence, decides a running turn's quiet hint. |
 | [recovery-era-test-isolation.md](recovery-era-test-isolation.md) | 0631 0638 0640 0651–0652 | Sandbox profile wrappers, reach the git fallback branch and synchronize downloader counters. |
 | [kanban-descendant-wait-refusal.md](kanban-descendant-wait-refusal.md) | 0641 | Refuse explicit or inferred waits on a card's own descendants and mutual return waits. |

@@ -18,6 +18,7 @@ Patch series (mirrors of the curated commits; the numbers are apply order):
 | 0648 | `86dba5f9a3` | holder record (`<db>.recover.pid` JSON) |
 | 0649 | `baed59f27c` | process-start identity in the holder record |
 | 0652 | `a934e39df2` | shared safe pid-existence probe and explicit proc-stat encoding |
+| 0659 | `adff0a11d6` | document automatic-recovery and recovery-assignee configuration keys in the user guide |
 
 ## Behavior
 

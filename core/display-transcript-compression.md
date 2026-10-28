@@ -1,6 +1,12 @@
 # Display-only transcript compression
 
-Patch: 0656 (07fb47660c).
+Patch: 0656 (07fb47660c), 0660 (3bb0324ccc).
+
+## Cached-click follow-up (0660)
+
+The sidebar click prepaints cached transcript rows synchronously before routing into the main chat. Already-selected/tiled sessions remain focus-only; asleep rows keep their read-only path. `prepaintClickedTranscript` lives in `apps/desktop/src/app/session/hooks/use-session-actions/provisional-transcript.ts` and is called by the sidebar's `use-offline-fallback.ts`.
+
+Source regression suites: `prepaint-clicked-transcript.test.ts` and `offline-fallback.integration.test.tsx` in the corresponding directories. These frontend tests were not rerun by this mirror worker; no live click-latency measurement is claimed. This is display-only caching, not a modification to persisted conversation history.
 
 ## Behavior
 

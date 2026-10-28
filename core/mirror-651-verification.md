@@ -44,7 +44,7 @@ The canonical runner `bash scripts/run_tests.sh <files> -j 3 --file-timeout 180`
 | test_hermetic_env_systemd_markers.py | 2 passed |
 | tools/test_git_consumer_environment.py | 1 passed, **4 failed**, still failed on runner retry |
 
-The four git-consumer failures are the unsupported-target/acquisition × checkpoint/diff cases: consumer calls succeed, but the injected failure callback was never called (`assert calls` is false). Patch 0638 is mirrored faithfully; this host result is not a claim that its fallback-injection coverage is green. A separate core repair follow-up was filed; the root cause remains undetermined pending tracing the PM lookup seam.
+The four git-consumer failures are the unsupported-target/acquisition × checkpoint/diff cases: consumer calls succeed, but the injected failure callback was never called (`assert calls` is false). Patch 0638 is mirrored faithfully; this host result is not a claim that its fallback-injection coverage is green. A separate core repair follow-up was filed; the root cause remains undetermined pending tracing the PM lookup seam. Follow-up: [0662 git-consumer boundary repair](git-consumer-fallback-tests.md) reproduces this four-failure mechanism with a missing packaged runtime and records the fix and green runs; the exact original host state remains unproven.
 
 Desktop: installed lockfile dependencies with `npm ci --ignore-scripts --no-audit --no-fund` in the disposable worktree, then ran `npx vitest run src/store/session-watchdog.test.ts`: **25 passed**. No live Electron multi-window probe, Windows recovery probe or full repository test run is claimed.
 
