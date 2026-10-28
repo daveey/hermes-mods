@@ -3,8 +3,10 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -276,6 +278,122 @@ class Lifecycle(unittest.TestCase):
         with patch.object(self.m, '_archive', side_effect=OSError('disk full')):
             self.call(self.result)
         self.assertEqual((self.tree / 'wip').read_text(), 'valuable')
+
+    # --- deferred teardown: trees the completion hook had to keep are reaped once the card settles ---
+
+    def _ended(self, ago_s):
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('update task_runs set ended_at=?', (int(time.time() - ago_s),))
+
+    def test_open_child_keep_is_logged_and_sweep_removes_after_child_finishes(self):
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("insert into tasks values ('child', 'todo', null, null)")
+            c.execute("insert into task_links values ('task', 'child')")
+        self._ended(3600)
+        self.call(self.result)
+        self.assertTrue(self.tree.exists())
+        self.assertIn(f'KEEP {self.tree} (registered to task): open child card(s) child', self.m.LOG.read_text())
+        self.m.sweep()
+        self.assertTrue(self.tree.exists())  # child still open
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update tasks set status='done' where id='child'")
+        self.assertEqual([r['action'] for r in self.m.sweep()], ['removed'])
+        self.assertFalse(self.tree.exists())
+
+    def test_sweep_reaps_card_closed_without_the_hook_after_grace_only(self):
+        self._ended(60)  # e.g. `hermes kanban complete` from a CLI: no tool hook ran
+        self.assertEqual(self.m.sweep(), [])  # inside the grace window the completing worker owns it
+        self.assertTrue(self.tree.exists())
+        for status in ('review', 'running', 'archived'):
+            with closing(sqlite3.connect(self.db)) as c, c:
+                c.execute('update tasks set status=?', (status,))
+            self.assertEqual(self.m.sweep(min_age_s=0), [])
+            self.assertTrue(self.tree.exists())
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update tasks set status='done'")
+            c.execute("insert into task_runs values ('run2', 'task', 'running', null, null)")
+        self.assertEqual(self.m.sweep(min_age_s=0), [])  # latest run not completed
+        self.assertTrue(self.tree.exists())
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("delete from task_runs where id='run2'")
+        self.assertEqual([r['action'] for r in self.m.sweep(min_age_s=0)], ['removed'])
+
+    def test_sweep_leaves_cards_older_than_the_gc_window_to_the_gc(self):
+        self._ended(9 * 86400)
+        self.assertEqual(self.m.sweep(), [])
+        self.assertTrue(self.tree.exists())
+
+    def test_sweep_retries_a_tree_a_process_held_at_completion(self):
+        self.m.live_cwds = lambda: [str(self.tree)]
+        self.call(self.result)
+        self.assertTrue(self.tree.exists())
+        self.assertIn('a live process works in it', self.m.LOG.read_text())
+        self.m.live_cwds = lambda: []
+        self._ended(3600)
+        self.assertEqual([r['action'] for r in self.m.sweep()], ['removed'])
+
+    def test_completion_starts_one_detached_sweep_an_hour(self):
+        self.call(self.result)
+        self.assertEqual(len(self.m.spawned_sweeps), 1)
+        with patch.object(self.m.subprocess, 'Popen') as popen, \
+                patch.dict(os.environ, {'HERMES_KANBAN_TASK': 'task', 'HERMES_KANBAN_DB': 'x'}):
+            self.m._real_spawn_sweep()
+            self.m._real_spawn_sweep()
+        self.assertEqual(popen.call_count, 1)
+        argv, kw = popen.call_args.args[0], popen.call_args.kwargs
+        self.assertEqual(argv[-1], 'sweep')
+        self.assertTrue(kw['start_new_session'])
+        self.assertFalse(any(k.startswith('HERMES_KANBAN_') for k in kw['env']))
+
+    def test_sweep_cli_entry_point(self):
+        # the exact child _spawn_sweep starts: `python __init__.py sweep`, with HOME as the scan root
+        (self.root / 'code').mkdir()
+        (self.root / 'code/repo').symlink_to(self.repo)
+        self._ended(3600)
+        try:
+            load().live_cwds()  # the real scan (setUp stubs self.m.live_cwds)
+        except RuntimeError as e:
+            self.skipTest(f'this host cannot scan process cwds: {e}')
+        env = {k: v for k, v in os.environ.items() if not k.startswith('HERMES_')}
+        env['HOME'] = str(self.root)
+        # host opt-ins (linux_sudo_readlink) live in the real HERMES_HOME; logs and repos come from HOME
+        env['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(Path.home() / '.hermes')
+        r = subprocess.run([sys.executable, '-B', self.m.__file__, 'sweep'], cwd='/', env=env,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout.splitlines()[0])['action'], 'removed')
+        self.assertFalse(self.tree.exists())
+        self.assertIn('REMOVED', (self.root / '.hermes/logs/worktree-owner.log').read_text())
+
+    # --- an untracked node_modules symlink (shared install) is not work at risk ---
+
+    def _link_node_modules(self, name='node_modules'):
+        target = self.root / 'shared-install'
+        target.mkdir(exist_ok=True)
+        (target / 'pkg.js').write_text('keep me')
+        (self.tree / 'tests').mkdir()
+        (self.tree / 'tests' / name).symlink_to(target)
+        return target
+
+    def test_untracked_cache_symlink_does_not_keep_tree_and_target_survives(self):
+        self._commit_ignore(['node_modules/'])  # a dir rule: git still lists the symlink as untracked
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update tasks set workspace_path=''")  # outside scratch: no archive fallback
+        target = self._link_node_modules()
+        self.assertIn('?? tests/', git(self.tree, 'status', '--porcelain'))
+        result = self.call(self.result)
+        self.assertEqual([r['action'] for r in result], ['removed'])
+        self.assertFalse(self.tree.exists())
+        self.assertEqual((target / 'pkg.js').read_text(), 'keep me')
+
+    def test_other_untracked_symlink_still_keeps_tree(self):
+        self._commit_ignore([])
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update tasks set workspace_path=''")
+        self._link_node_modules('data')
+        self.call(self.result)
+        self.assertTrue((self.tree / 'tests/data').is_symlink())
+        self.assertIn('nested git or symlink: tests/data', self.m.LOG.read_text())
 
 
 class LinuxCwd(unittest.TestCase):

@@ -2,7 +2,7 @@
 
 Run: python3 -B -m unittest discover -s plugins/worktree-owner/tests   (stdlib only; temp git repos)
 """
-import importlib.util, json, os, sqlite3, subprocess, tempfile, time, unittest
+import atexit, importlib.util, json, os, shutil, sqlite3, subprocess, tempfile, time, unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,6 +105,14 @@ def load():
     spec = importlib.util.spec_from_file_location("worktree_owner_t", SRC)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    # Never reach live state from a test: the host log, the sweep stamp, or a detached sweep of the real repos.
+    scratch = Path(tempfile.mkdtemp(prefix="wto-test-"))
+    atexit.register(shutil.rmtree, scratch, True)
+    m.LOG = scratch / "worktree-owner.log"
+    m.SWEEP_STAMP = scratch / "sweep.stamp"
+    m.spawned_sweeps = []
+    m._real_spawn_sweep = m._spawn_sweep
+    m._spawn_sweep = lambda: m.spawned_sweeps.append(time.time())
     return m
 
 

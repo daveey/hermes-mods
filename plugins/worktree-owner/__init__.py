@@ -198,12 +198,30 @@ def live_workspace_paths(exclude: str | None = None) -> set[str]:
         return {"*"}
 
 
+def _disposable_untracked(path: str, entry: str) -> bool:
+    """Untracked porcelain entry that is a cache-named symlink (`node_modules` linked to a shared install, which a
+    `node_modules/` ignore rule does not match): git unlinks it on removal and never touches the target."""
+    rel = entry.rstrip("/")
+    return os.path.islink(os.path.join(path, rel)) and _named_disposable(rel, _disposable_globs())
+
+
+def _untracked_links(path: str) -> list[str] | None:
+    """Disposable untracked symlinks when they are the only change in the tree; None if anything else changed."""
+    st = _git(path, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all", timeout=300)
+    if st.returncode != 0:
+        return None
+    entries = [e for e in st.stdout.split("\0") if e]
+    if all(e.startswith("?? ") and _disposable_untracked(path, e[3:]) for e in entries):
+        return [e[3:] for e in entries]
+    return None
+
+
 def _removable(path: str) -> str | None:
-    """None if clean and HEAD is on a remote; else the reason to keep."""
+    """None if clean (cache-named untracked links aside) and HEAD is on a remote; else the reason to keep."""
     st = _git(path, "--no-optional-locks", "status", "--porcelain", timeout=300)
     if st.returncode != 0:
         return "git status failed"
-    if st.stdout.strip():
+    if st.stdout.strip() and _untracked_links(path) is None:
         return "uncommitted/untracked changes"
     head = _git(path, 'rev-parse', 'HEAD')
     if head.returncode:
@@ -411,7 +429,9 @@ def _complex_reason(path: str) -> str | None:
         for name in dirs + files:
             p = os.path.join(root, name)
             rel = os.path.relpath(p, path)
-            if (os.path.islink(p) and rel not in tracked_links) or (name == '.git' and root != path):
+            # An untracked link named like a cache (node_modules -> a shared install) is unlinked, never followed.
+            if (os.path.islink(p) and rel not in tracked_links and not _named_disposable(rel, globs)) \
+                    or (name == '.git' and root != path):
                 return f'nested git or symlink: {rel}'
             if not os.path.islink(p) and not os.path.isdir(p) and not os.path.isfile(p):
                 return f'special file: {rel}'
@@ -453,7 +473,8 @@ def _remove(path: str, why_owned: str, ws: str = "") -> dict:
         return dict(path=path, action=f"kept: {keep}")
     common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
     main = os.path.dirname(common) if common else path
-    r = _git(main, "worktree", "remove", *(["--force", "--force"] if archived else []), path, timeout=600)
+    force = ["--force", "--force"] if archived else (["--force"] if _untracked_links(path) else [])
+    r = _git(main, "worktree", "remove", *force, path, timeout=600)
     if r.returncode != 0:
         _log(f"WARN remove {path} failed: {r.stderr.strip()[:200]}")
         return dict(path=path, action=f"kept: remove failed: {r.stderr.strip()[:120]}")
@@ -462,9 +483,17 @@ def _remove(path: str, why_owned: str, ws: str = "") -> dict:
 
 
 def teardown(task_id: str, env) -> list[dict]:
+    """Completion path: the worker that just completed *task_id* in run HERMES_KANBAN_RUN_ID tears its trees down."""
     db, run = env.get('HERMES_KANBAN_DB'), env.get('HERMES_KANBAN_RUN_ID')
     if not db or not run:
         return []
+    return _teardown(task_id, db, str(run))
+
+
+def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0) -> list[dict]:
+    """Verify under the board writer reservation that *task_id* is settled (done, no current run, latest run
+    done/completed and equal to *run*, or any id when *run* is None, no open child), then remove its trees.
+    Every decline that has trees at stake is logged as a KEEP line."""
     # mode=rw never creates a missing board. Hold the writer reservation through
     # filesystem removal so reopen/reassignment cannot race our authorization.
     with closing(sqlite3.connect(Path(db).resolve().as_uri() + '?mode=rw', uri=True, timeout=10)) as c:
@@ -474,19 +503,92 @@ def teardown(task_id: str, env) -> list[dict]:
             return []
         ended = c.execute('select id, status, outcome, ended_at from task_runs where task_id=? order by id desc limit 1',
                           (task_id,)).fetchone()
-        if not ended or str(ended[0]) != run or ended[1:3] != ('done', 'completed') or ended[3] is None:
+        if (not ended or (run is not None and str(ended[0]) != run) or ended[1:3] != ('done', 'completed')
+                or ended[3] is None):
             return []
+        if min_age_s and time.time() - float(ended[3]) < min_age_s:
+            return []  # sweep: let the completing worker finish its own teardown first
         # Children consume parent artifacts even before receiving a workspace.
-        if c.execute("select 1 from task_links l join tasks t on t.id=l.child_id "
-                     "where l.parent_id=? and t.status not in ('done','archived','failed','cancelled') limit 1",
-                     (task_id,)).fetchone():
+        kids = [r[0] for r in c.execute(
+            "select t.id from task_links l join tasks t on t.id=l.child_id "
+            "where l.parent_id=? and t.status not in ('done','archived','failed','cancelled')", (task_id,))]
+        if kids:
+            for path in _marked_paths(task_id, row[2] or ''):
+                _log(f"KEEP {path} (registered to {task_id}): open child card(s) {', '.join(kids[:5])}; "
+                     "torn down when they finish")
             return []
         live = {os.path.realpath(r[0]) for r in c.execute(
             "select workspace_path from tasks where status not in ('done','archived') and id != ? and coalesce(workspace_path,'') != ''", (task_id,))}
         # A tree made by ANY run of this card counts: review/retry loops finish in a later run than the one that
         # created the tree. The completing run was just verified to be the card's latest run.
         runs = {str(r[0]) for r in c.execute('select id from task_runs where task_id=?', (task_id,))}
+        env = {'HERMES_KANBAN_DB': db, 'HERMES_KANBAN_RUN_ID': str(ended[0])}
         return _teardown_locked(task_id, env, row[2] or '', live, runs)
+
+
+def _markers(extra: list[str] | None = None):
+    """Yield (gitdir, marker dict, tree path) for every owner marker in the scanned repos."""
+    for common in _common_dirs(extra or []):
+        for gd in glob.glob(os.path.join(common, "worktrees", "*")):
+            try:
+                rec = json.loads(Path(gd, MARKER).read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict):
+                yield gd, rec, rec.get("path") or _wt_path(gd)
+
+
+def _marked_paths(task_id: str, ws: str) -> list[str]:
+    return [p for _, rec, p in _markers([ws]) if rec.get('task_id') == task_id and p and os.path.isdir(p)]
+
+
+SWEEP_STAMP = H / ".hermes" / "cache" / "worktree-owner-sweep.stamp"
+SWEEP_EVERY_S = 3600.0
+SWEEP_MIN_AGE_S = 600.0
+SWEEP_MAX_AGE_S = 8 * 86400.0  # older trees are mac-worktree-gc's (it archives after 7 idle days)
+
+
+def sweep(min_age_s: float = SWEEP_MIN_AGE_S, max_age_s: float = SWEEP_MAX_AGE_S) -> list[dict]:
+    """Tear down the trees of every settled card on this host, whatever closed it.
+
+    The completion hook runs once, in the completing worker. It declines while a child card is open, a process
+    still works in a tree, or when the card was closed by the CLI/REST, and nothing retried those later: trees of
+    finished cards stayed until the 7-day GC. The sweep re-runs the same verified teardown for each marked card
+    on its own board (status done, latest run done/completed, no open child)."""
+    results = []
+    seen = set()
+    for _, rec, path in list(_markers()):
+        task, db = rec.get('task_id'), rec.get('board_db')
+        if not task or not db or (db, task) in seen or not path or not os.path.isdir(path) or not os.path.isfile(db):
+            continue
+        seen.add((db, task))
+        try:
+            with closing(_ro_connect(db)) as c:
+                ended = c.execute('select status, outcome, ended_at from task_runs where task_id=? order by id desc limit 1',
+                                  (task,)).fetchone()
+                st = c.execute('select status from tasks where id=?', (task,)).fetchone()
+            if not st or st[0] != 'done' or not ended or ended[2] is None or \
+                    time.time() - float(ended[2]) > max_age_s:
+                continue
+            results += _teardown(task, db, None, min_age_s)
+        except Exception as e:  # noqa: BLE001 - one bad board must not stop the others
+            _log(f"WARN sweep of {task} on {db} failed: {type(e).__name__}: {e}")
+    return results
+
+
+def _spawn_sweep() -> None:
+    """At most hourly, run sweep() in a detached child so the completing tool call never waits on it."""
+    try:
+        if SWEEP_STAMP.exists() and time.time() - SWEEP_STAMP.stat().st_mtime < SWEEP_EVERY_S:
+            return
+        SWEEP_STAMP.parent.mkdir(parents=True, exist_ok=True)
+        SWEEP_STAMP.touch()
+        env = {k: v for k, v in os.environ.items() if not k.startswith('HERMES_KANBAN_')}
+        subprocess.Popen([sys.executable, '-B', os.path.abspath(__file__), 'sweep'], cwd='/', env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception as e:  # noqa: BLE001
+        _log(f"WARN cannot start sweep: {type(e).__name__}: {e}")
 
 
 def _overlap(a: str, b: str) -> bool:
@@ -513,23 +615,17 @@ def _teardown_locked(task_id: str, env, ws: str, live: set[str], runs: set[str] 
             _log(f"KEEP {path} ({why}): shared with an open card")
             return dict(path=path, action='kept: shared with an open card')
         return _remove(path, why, scratch)
-    for common in _common_dirs([ws]):
-        for gd in glob.glob(os.path.join(common, "worktrees", "*")):
-            try:
-                rec = json.loads(Path(gd, MARKER).read_text())
-            except (OSError, ValueError):
-                continue
-            path = rec.get("path") or _wt_path(gd)
-            if rec.get('task_id') != task_id or not path or not os.path.isdir(path):
-                continue
-            if os.path.realpath(path) != os.path.realpath(_wt_path(gd) or '/'):
-                _log(f"KEEP {path} (registered to {task_id}): marker path is not git's path for this worktree")
-                continue
-            fence = _marker_fence(rec, task_id, env, runs)
-            if fence:
-                _log(f"KEEP {path} (registered to {task_id}): {fence}")
-                continue
-            results.append(remove(path, f"registered to {task_id}", ws))
+    for gd, rec, path in _markers([ws]):
+        if rec.get('task_id') != task_id or not path or not os.path.isdir(path):
+            continue
+        if os.path.realpath(path) != os.path.realpath(_wt_path(gd) or '/'):
+            _log(f"KEEP {path} (registered to {task_id}): marker path is not git's path for this worktree")
+            continue
+        fence = _marker_fence(rec, task_id, env, runs)
+        if fence:
+            _log(f"KEEP {path} (registered to {task_id}): {fence}")
+            continue
+        results.append(remove(path, f"registered to {task_id}", ws))
     # the card's own dir: workspace, when it is a linked worktree (a .git FILE) that no other open card uses
     if ws and os.path.isfile(os.path.join(ws, ".git")) and \
             not any(os.path.realpath(r["path"]) == os.path.realpath(ws) for r in results):
@@ -582,7 +678,9 @@ def on_tool_call(tool_name: str, args: Any, duration_ms: Any = 0, env=None, resu
             # An explicit board is safe only when the worker identifies that board.
             if a.get('board') is not None and a['board'] != env.get('HERMES_KANBAN_BOARD'):
                 return []
-            return teardown(task, env)
+            res = teardown(task, env)
+            _spawn_sweep()  # parents waiting on this card, CLI-closed cards, trees a process held at completion
+            return res
     except Exception as e:  # noqa: BLE001 - must never break a tool call
         _log(f"WARN hook failed for {tool_name}: {type(e).__name__}: {e}")
         logger.debug("worktree-owner hook failed", exc_info=True)
@@ -596,3 +694,12 @@ def _post_tool_call(tool_name: str = "", args: Any = None, duration_ms: Any = 0,
 
 def register(ctx) -> None:
     ctx.register_hook("post_tool_call", _post_tool_call)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["sweep"]:
+        for r in sweep():
+            print(json.dumps(r))
+    else:
+        print("usage: __init__.py sweep", file=sys.stderr)
+        sys.exit(2)
