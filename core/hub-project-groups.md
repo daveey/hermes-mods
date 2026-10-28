@@ -32,6 +32,21 @@ the hub-sync plugin's `GET /projects` (hermes-mods `plugins/hub-sync`).
 - hermes-hub: `client/tests/test_shared_projects.py`, `worker/test/shared-projects.test.ts`; hub-sync:
   `plugins/hub-sync/tests/test_projects_view.py`.
 
+## Live (2026-10-27, primary on all three gateways)
+
+- Rollout: Worker deploys 5eb77cd3 (#39), 6e15543a (#43), 9ebb69f4 (#44); client 1.9.2 on MacBook, mini and hub; core
+  0602-0603 on all three. Published nodes: MacBook 24, hub 14, mini 5. The Hub DO served the new features 272 s
+  after the first deploy.
+- Sleeping-owner test (mini's `hermes-mail` poller and `hermes-hub-watch` stopped): a rename plus color set from the
+  MacBook took 0.2-0.4 s per request and showed on the MacBook and the hub at once (about 1 s), marked as not yet
+  applied; mini's `projects.db` was unchanged. On wake mini applied both in 4-7 s.
+- Owner republish after the apply: 129 s on 1.9.0 (a forced rerun still waited out the 120 s gap, fixed in #43),
+  82 s on 1.9.1 (the watcher's light cycle re-collected only sessions/Inbox, fixed in #44), 8 s on 1.9.2.
+- An owner-local `hermes project update` reached the other two in about 2 min (tree cadence; the owner's own
+  Desktop shows it at once).
+- Not yet checked: the Desktop half (0603) in the Hermes Desktop UI, which needs the MacBook Desktop restarted on
+  the new build.
+
 ## Gotchas
 
 - `tui_gateway.server` points `sys.stdout` at stderr on import (its JSON-RPC channel), so `project tree` keeps the real

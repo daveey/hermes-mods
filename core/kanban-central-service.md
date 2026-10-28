@@ -1305,6 +1305,12 @@ to it.
 - **Not done (as of the first note):** the 7-day shadow soak, primary mode on all gateways, and deleting the request
   path for these fields.
 
+#### Phase 6b: projects (2026-10-27)
+
+Project groups and an explicit project's name/icon/color moved onto the hub the same way: details, tests and live
+numbers in [hub-project-groups.md](hub-project-groups.md). David chose no soak: cut straight to primary
+(hermes-hub #39, #43, #44; core 0602-0603).
+
 #### Primary is live (2026-10-28)
 
 - **Cut over early, at David's request**, after a clean shadow soak: 20/20 hourly `diff-shared` runs across the three
