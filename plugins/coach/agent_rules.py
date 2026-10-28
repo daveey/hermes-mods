@@ -316,7 +316,6 @@ def _inside(p: str, root: str) -> bool:
 
 HEREDOC_RE = re.compile(r"""<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1""")
 SHELL_RUNNER_RE = re.compile(r"""(?:^|[\s;&|(])(?:(?:ba|z|da)?sh|eval)(?:\s+-\w*c\w*)?\s*$""")
-QUOTED_RE = re.compile(r""""(?:[^"\\]|\\.)*"|'[^']*'""")
 HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME\b")
 
 
@@ -343,17 +342,103 @@ def _strip_heredocs(cmd: str) -> str:
 
 
 def _mask_quoted(cmd: str) -> str:
-    """Blank quoted strings that hold data (python -c code, echo text, commit messages).
+    """Mask shell data without shifting offsets, retaining nested command substitutions.
 
-    A quoted single token (a path like "$HOME/.hermes/hermes-agent") is kept; so is the script of
-    `bash -c '...'` / `eval "..."`, which the shell really runs.
+    Single-token paths and scripts passed to shell runners retain their existing treatment.
+    Quotes inside $(...) / backticks start fresh contexts, even in double-quoted strings.
+    Arithmetic operators are data; nested command substitutions still execute. Incomplete
+    quotes/substitutions and excessively deep nesting are masked through the end.
     """
-    def repl(m: re.Match) -> str:
-        body = m.group(0)[1:-1]
-        if not re.search(r"\s", body) or SHELL_RUNNER_RE.search(cmd[:m.start()]):
-            return m.group(0)
-        return m.group(0)[0] + "_" + m.group(0)[-1]
-    return QUOTED_RE.sub(repl, cmd)
+    out = list(cmd)
+    limit = len(cmd)
+
+    def mask(start: int, end: int) -> None:
+        out[start:end] = "_" * (end - start)
+
+    def substitution(start: int, level: int) -> int:
+        # Arithmetic operators are data, but nested command substitutions still execute.
+        arithmetic = cmd.startswith("$((", start)
+        body = start + (3 if arithmetic else 2)
+        if arithmetic:
+            mask(start, body)
+        end = code(body, ")", depth=1 if arithmetic else 0, data=arithmetic, level=level + 1)
+        if end == limit and (not cmd or cmd[end - 1] != ")"):
+            mask(start, end)  # Incomplete substitutions must not leak apparent code.
+        return end
+
+    def quoted(start: int, level: int, ansi: bool = False) -> int:
+        quote = cmd[start]
+        i = start + 1
+        while i < limit:
+            ch = cmd[i]
+            if ch == quote:
+                end = i + 1
+                body = cmd[start + 1:i]
+                # Preserve the existing single-token path and shell-script exceptions.
+                if SHELL_RUNNER_RE.search(cmd[:start]):
+                    # Scan the script independently: its outer quotes are transport syntax.
+                    out[start + 1:i] = _mask_quoted(body)
+                elif not re.search(r"[\s><;&|()`\\]", body):
+                    out[start + 1:i] = body
+                return end
+            if (quote == '"' or ansi) and ch == "\\":
+                mask(i, min(i + 2, limit))
+                i += 2
+            elif quote == '"' and cmd.startswith("$(", i):
+                i = substitution(i, level)
+            elif quote == '"' and ch == "`":
+                i = code(i + 1, "`", level=level + 1)
+            else:
+                mask(i, i + 1)
+                i += 1
+        mask(start, limit)
+        return limit
+
+    def code(start: int, stop: str = "", depth: int = 0, data: bool = False, level: int = 0) -> int:
+        if level >= 64:
+            mask(start, limit)
+            return limit
+        i = start
+        while i < limit:
+            ch = cmd[i]
+            if ch == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|()"):
+                end = cmd.find("\n", i)
+                end = end if end >= 0 else limit
+                mask(i, end)
+                i = end
+            elif ch == "\\":
+                if data:
+                    mask(i, min(i + 2, limit))
+                i += 2
+            elif cmd.startswith("$(", i):
+                i = substitution(i, level)
+            elif cmd.startswith("$'", i):
+                i = quoted(i + 1, level + 1, ansi=True)
+            elif ch in "\"'":
+                i = quoted(i, level + 1)
+            elif ch == stop and depth == 0:
+                if data:
+                    mask(i, i + 1)
+                return i + 1
+            elif ch == "`":
+                i = code(i + 1, "`", level=level + 1)
+            else:
+                if data:
+                    mask(i, i + 1)
+                if stop == ")":
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                i += 1
+        return limit
+
+    try:
+        code(0)
+    except RecursionError:
+        # Shell-runner strings recurse through _mask_quoted too; malformed input is data.
+        mask(0, limit)
+    return "".join(out)
 
 
 def shell_code(cmd: str) -> str:
