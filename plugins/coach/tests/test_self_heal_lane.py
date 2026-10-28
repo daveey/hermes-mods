@@ -957,3 +957,76 @@ def test_digest_card_mentioned_only_before_the_complaint_is_not_adopted(store, t
     r = Runner()
     out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
     assert out["action"] == "filed" and len(r.creates()) == 1
+
+
+# ── no origin session (background signal): adopt an open card that already owns the same error signature ──
+SIG_TB = ("WARNING hermes_cli.kanban_session_activity: kanban activity unavailable; rows marked kanban_unknown\n"
+          "Traceback (most recent call last):\n"
+          '  File "~/.hermes/hermes-agent/hermes_cli/kanban_session_activity.py", line 145, in _read_counts\n'
+          '    if "session_id" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:\n'
+          "sqlite3.OperationalError: disk I/O error\n")
+
+
+def _signal_defect(**kw):
+    return defect(component="kanban", source="signal", session_id="", quote="", details=SIG_TB,
+                  symptom="OperationalError in _read_counts (kanban_session_activity.py): kanban activity unavailable",
+                  **kw)
+
+
+def _board(tmp_path, rows):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / "home" / "kanban.db")
+    db.executescript("create table tasks(id text, title text, body text, status text, created_at int, session_id text);"
+                     "create table kanban_notify_subs(task_id text, chat_id text);")
+    db.executemany("insert into tasks values(?,?,?,?,?,NULL)", rows)
+    db.commit()
+    db.close()
+
+
+def test_sessionless_defect_adopts_open_card_with_matching_signature(store, tmp_path, monkeypatch):
+    _real_adoption_env(monkeypatch, tmp_path)
+    _board(tmp_path, [("t_0a0e00000001", "Kanban reads fail: 'disk I/O error' after WAL deleted",
+                       "every _read_counts call raises sqlite3.OperationalError: disk I/O error until restart",
+                       "scheduled", int(NOW - 86400))])
+    d = _signal_defect()
+    r = Runner()
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "skip" and out["adopted"] and out["card"] == "t_0a0e00000001"
+    assert not r.creates()
+    st = sh.LaneState(store.root).get(d["fingerprint"])
+    assert st["status"] == "approved" and st["fix_card"] == "t_0a0e00000001"
+    (e,) = ev(store, "selfheal_adopted_owner")
+    assert e["via"] == "signature" and e["card"] == "t_0a0e00000001"
+
+
+def test_open_card_with_same_exception_in_another_function_is_not_adopted(store, tmp_path, monkeypatch):
+    _real_adoption_env(monkeypatch, tmp_path)
+    _board(tmp_path, [("t_0a0e00000002", "Inbox store: disk I/O error",
+                       "sqlite3.OperationalError: disk I/O error in _write_outcome (inbox_store.py)",
+                       "running", int(NOW - 600))])
+    r = Runner()
+    out = sh.file_defect(_signal_defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and len(r.creates()) == 1
+    assert not ev(store, "selfheal_adopted_owner")
+
+
+def test_done_card_with_matching_signature_is_not_adopted(store, tmp_path, monkeypatch):
+    _real_adoption_env(monkeypatch, tmp_path)
+    _board(tmp_path, [("t_0a0e00000003", "Kanban reads fail: disk I/O error in _read_counts",
+                       "sqlite3.OperationalError: disk I/O error (kanban_session_activity.py)",
+                       "done", int(NOW - 600))])
+    r = Runner()
+    out = sh.file_defect(_signal_defect(), store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and len(r.creates()) == 1
+    assert not ev(store, "selfheal_adopted_owner")
+
+
+def test_signature_adoption_is_injectable_and_skips_known_cards(store):
+    d = _signal_defect()
+    seen = []
+    fn = lambda sig: seen.append(sig) or [{"id": "t_0a0e00000004", "status": "todo", "created_at": NOW, "board": "x"}]
+    r = Runner()
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN, sig_owner_fn=fn)
+    assert out["adopted"] and out["card"] == "t_0a0e00000004" and not r.creates()
+    assert seen[0]["exc_msg"] == "disk I/O error" and seen[0]["func"] == "_read_counts"
+    assert seen[0]["file"] == "kanban_session_activity.py"

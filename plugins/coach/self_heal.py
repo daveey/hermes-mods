@@ -1273,9 +1273,110 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
             "adopted": True}
 
 
+_EXC_LINE = re.compile(r"^\s*((?:[A-Za-z_][\w]*\.)*([A-Z]\w*(?:Error|Exception|Exit|Interrupt))):\s*(\S.*?)\s*$", re.M)
+_SYMPTOM_LOC = re.compile(r"\b([A-Z]\w*(?:Error|Exception))\s+in\s+([A-Za-z_]\w*)(?:\s*\(([\w./-]+\.\w+)\))?")
+SIGNATURE_MIN_MSG = 6  # a shorter exception message ("1", "None") is too generic to match card text on
+
+
+def error_signature(d: dict) -> Optional[dict]:
+    """The defect's error signature: {exc_class, exc_msg, func, file, symptom}. Exception from the last
+    `Class: message` line of `details` (a traceback tail), else from `symptom` ("OperationalError in _read_counts
+    (kanban_session_activity.py): ..."); function/file from the symptom. None when there is no exception at all."""
+    sym = str(d.get("symptom") or "")
+    det = str(d.get("details") or "")
+    exc_class = exc_msg = func = fname = None
+    hits = _EXC_LINE.findall(det)
+    if hits:
+        _, exc_class, exc_msg = hits[-1]
+    m = _SYMPTOM_LOC.search(sym)
+    if m:
+        exc_class = exc_class or m.group(1)
+        func, fname = m.group(2), m.group(3)
+    if not exc_class:
+        return None
+    return {"exc_class": exc_class, "exc_msg": exc_msg, "func": func, "file": fname, "symptom": sym.strip()}
+
+
+def signature_matches(sig: dict, text: str) -> bool:
+    """Specific enough to adopt: the identical symptom string, or the exception (class, plus its message when the
+    defect has one) AND the function or file it was raised in. Same exception elsewhere is not a match."""
+    t = (text or "").lower()
+    if len(sig.get("symptom") or "") >= 20 and sig["symptom"].lower() in t:
+        return True
+    msg = sig.get("exc_msg")
+    if msg and len(msg) >= SIGNATURE_MIN_MSG:
+        exc_ok = msg.lower() in t
+    else:
+        exc_ok = sig["exc_class"].lower() in t
+    loc_ok = any(x and x.lower() in t for x in (sig.get("func"), sig.get("file")))
+    return exc_ok and loc_ok
+
+
+def signature_owned_cards(sig: dict, home: Optional[Path] = None) -> list:
+    """Open (not done/archived) cards on this host's boards whose title+body match `sig` (signature_matches).
+    -> [{id, title, status, created_at, board}], newest first. Opened read-only like session_owned_cards."""
+    import sqlite3
+    home = Path(home) if home else Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    dbs = [(None, home / "kanban.db")] + [(p.parent.name, p) for p in sorted((home / "kanban" / "boards").glob("*/kanban.db"))]
+    rows: list = []
+    for board, path in dbs:
+        if not path.exists():
+            continue
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            db.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except sqlite3.Error:
+            try:
+                db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
+                db.execute("PRAGMA query_only=ON")
+            except sqlite3.Error:
+                continue
+        try:
+            for r in db.execute("SELECT id, title, body, status, created_at FROM tasks "
+                                "WHERE status NOT IN ('done', 'archived')"):
+                if signature_matches(sig, f"{r[1] or ''}\n{r[2] or ''}"):
+                    rows.append({"id": r[0], "title": r[1], "status": r[3], "created_at": r[4], "board": board})
+        except sqlite3.Error:
+            pass
+        finally:
+            db.close()
+    rows.sort(key=lambda r: r["created_at"] or 0, reverse=True)
+    return rows
+
+
+def _adopt_signature_card(d: dict, fp: str, store, now: float,
+                          sig_owner_fn: Optional[Callable] = None) -> Optional[dict]:
+    """No session owner (e.g. a background signal with no session): adopt an open card that already names the same
+    error signature (exception + function/file, or the identical symptom). Logs `selfheal_adopted_owner` via=signature."""
+    if sig_owner_fn is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":
+        return None
+    sig = error_signature(d)
+    if not sig:
+        return None
+    lane = LaneState(store.root)
+    st = lane.get(fp)
+    try:
+        cards = [c for c in (sig_owner_fn or signature_owned_cards)(sig) if c["id"] not in known_cards(st)]
+    except Exception as exc:
+        store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "via": "signature", "error": str(exc)[:200]})
+        return None
+    if not cards:
+        return None
+    c = cards[0]
+    lane.update(fp, status="approved", fix_card=c["id"], approved_at=now, component=d.get("component"),
+                symptom=d.get("symptom"), session_id=d.get("session_id"), board=c.get("board"),
+                filed_day=_utc_day(now), cards=sorted(known_cards(st) | {c["id"]}))
+    store.log({"event": "selfheal_adopted_owner", "via": "signature", "fingerprint": fp, "card": c["id"],
+               "status": c.get("status"), "board": c.get("board"), "session_id": d.get("session_id"),
+               "signature": {k: v for k, v in sig.items() if k != "symptom"},
+               "candidates": [x["id"] for x in cards]})
+    return {"action": "skip", "why": f"adopted owner card {c['id']} by error signature", "card": c["id"],
+            "adopted": True, "via": "signature"}
+
+
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
-                owner_fn: Optional[Callable] = None) -> dict:
+                owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
     """File one defect: {fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at,
     details}. Returns {"action": would_file|filed|skip|forwarded|error, ...}."""
     store = _store(store)
@@ -1306,7 +1407,8 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
         return {"action": "skip", "why": dec["why"]}
     if m == "live" and hub:  # the origin session already queued its own fix card: adopt it, file nothing
-        owner = _adopt_session_card(d, fp, store, now, owner_fn)
+        owner = _adopt_session_card(d, fp, store, now, owner_fn) or _adopt_signature_card(d, fp, store, now,
+                                                                                          sig_owner_fn)
         if owner:
             return owner
     args = card_args(d, dec["key"], dec.get("previous"), cfg)
