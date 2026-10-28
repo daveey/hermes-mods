@@ -99,6 +99,11 @@ the MacBook, hub and mini had 12, 5 and 1 such rows. Fixed on both sides:
   longer its card's current run and is over 10 min old (`close_dangling_runs`), and the sync pushes that close.
   Tests: `test_kanban_sync_run_rows.py` (stale-lock reclaim, orphan sweep, a run ending before its first push, a
   grant whose local CAS lost, a newer Board write still landing, the sweep).
+  Follow-up **0715** (fork `9d702b02e4`): if that sweep finds a terminal event (`completed`, `blocked`, or
+  `crashed`) for the run, it restores that end (status, outcome, `ended_at` from the event, and a string
+  `summary` from the payload when there is one) instead of rewriting the row to `reclaimed`. A run with no
+  terminal event is still reclaimed. `test_the_dangling_sweep_keeps_the_real_end_of_a_run_the_card_already_finished`
+  covers a completed run whose row was reopened to `running`. The `blocked` and `crashed` restore branches are untested.
 - Board (hermes-hub#32): `expireLease` ends the lease's run even when the card already moved on, and a holder's row
   op that moves its card out of `running` ends the lease's run before clearing the lease (the gateway's own end of
   the run, normally in the same batch, overwrites it). `wake_at` in `scheduled`/`continued` payloads and run

@@ -1,0 +1,89 @@
+From 9d702b02e4a8272f4d516ed71a3b1d0e7ecd8847 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:43:45 +0000
+Subject: [PATCH] fix(kanban): dangling-run sweep restores a run its card
+ already ended instead of rewriting it to reclaimed [daveey]
+
+---
+ hermes_cli/kanban_db_dispatch.py              | 26 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_sync_run_rows.py | 16 ++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index be279990ea..76beb3f8ce 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
+ from __future__ import annotations
+ 
+ import contextlib
++import json
+ import os
+ import re
+ import signal
+@@ -1080,6 +1081,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+ # A run younger than this may still be settling (a claim and its run row land in one txn, but a synced board's
+ # feed can briefly carry a run ahead of its card's row), so the sweep leaves it alone.
+ DANGLING_RUN_MIN_AGE_SECONDS = 600
++_DANGLING_RUN_TERMINAL_EVENTS = {
++    "completed": ("done", "completed"), "blocked": ("blocked", "blocked"), "crashed": ("crashed", "crashed"),
++}
+ 
+ 
+ def close_dangling_runs(conn: sqlite3.Connection, *, min_age_seconds: int = DANGLING_RUN_MIN_AGE_SECONDS) -> list[int]:
+@@ -1099,6 +1103,28 @@ def close_dangling_runs(conn: sqlite3.Connection, *, min_age_seconds: int = DANG
+         ).fetchall()
+         now = int(time.time())
+         for row in rows:
++            # A run the card already ended (a sync race or a recovery reopened its row) keeps that real end: the
++            # terminal event is the proof, and rewriting it to ``reclaimed`` hides the completion from the owner.
++            ended = conn.execute(
++                "SELECT kind, created_at, payload FROM task_events WHERE run_id = ? AND kind IN "
++                "('completed', 'blocked', 'crashed') ORDER BY id DESC LIMIT 1", (row["id"],),
++            ).fetchone()
++            if ended is not None:
++                status, outcome = _DANGLING_RUN_TERMINAL_EVENTS[ended["kind"]]
++                try:
++                    summary = (json.loads(ended["payload"] or "{}") or {}).get("summary")
++                except (ValueError, AttributeError):
++                    summary = None
++                cur = conn.execute(
++                    "UPDATE task_runs SET status = ?, outcome = ?, ended_at = ?, claim_expires = NULL, "
++                    "summary = COALESCE(summary, ?) WHERE id = ? AND ended_at IS NULL",
++                    (status, outcome, int(ended["created_at"]), summary if isinstance(summary, str) else None, row["id"]),
++                )
++                if cur.rowcount == 1:
++                    closed.append(int(row["id"]))
++                    _kb._log.info("kanban reconcile: restored run %s of task %s to %s from its %s event",
++                                  row["id"], row["task_id"], outcome, ended["kind"])
++                continue
+             cur = conn.execute(
+                 "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', ended_at = ?, "
+                 "claim_expires = NULL, error = COALESCE(error, ?) WHERE id = ? AND ended_at IS NULL",
+diff --git a/tests/hermes_cli/test_kanban_sync_run_rows.py b/tests/hermes_cli/test_kanban_sync_run_rows.py
+index 7dbeeac795..4104c3aa44 100644
+--- a/tests/hermes_cli/test_kanban_sync_run_rows.py
++++ b/tests/hermes_cli/test_kanban_sync_run_rows.py
+@@ -238,3 +238,19 @@ def test_dispatch_pass_runs_the_dangling_run_sweep(live, monkeypatch):
+     monkeypatch.setattr(kd, "close_dangling_runs", lambda conn, **kw: called.append(conn) or [])
+     kd.dispatch_once(live, dry_run=True)
+     assert called
++
++
++def test_the_dangling_sweep_keeps_the_real_end_of_a_run_the_card_already_finished(live, kanban_home, svc):
++    """A completed run whose row came back ``running`` (sync race / recovery) is restored to completed, not reclaimed."""
++    tid, uid = _claimed(live, kanban_home, svc, "done then reopened")
++    assert kb.complete_task(live, tid, summary="all done")
++    done = live.execute("SELECT id FROM task_runs WHERE uid = ?", (uid,)).fetchone()
++    old = int(time.time()) - kd.DANGLING_RUN_MIN_AGE_SECONDS - 1
++    with kbc.write_txn(live):  # the reopen: status back to running, end wiped
++        live.execute("UPDATE task_runs SET status = 'running', outcome = NULL, ended_at = NULL, started_at = ? "
++                     "WHERE id = ?", (old, done["id"]))
++    assert kd.close_dangling_runs(live) == [done["id"]]
++    row = live.execute("SELECT status, outcome, error, ended_at FROM task_runs WHERE id = ?", (done["id"],)).fetchone()
++    assert (row["status"], row["outcome"], row["error"]) == ("done", "completed", None)
++    assert row["ended_at"] == live.execute(
++        "SELECT created_at FROM task_events WHERE run_id = ? AND kind = 'completed'", (done["id"],)).fetchone()[0]
+-- 
+2.55.0
+

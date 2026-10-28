@@ -1,6 +1,8 @@
 # `hermes serve` waits out a core update before loading the agent
 
 Patch: [`patches/0697-fix-serve-wait-out-a-core-update-or-the-admission-ho.patch`](patches/0697-fix-serve-wait-out-a-core-update-or-the-admission-ho.patch)
+(fork commit `a4ba7217bd`), and [`patches/0714-fix-serve-re-exec-on-a-no-wait-gate-when-the-cached-.patch`](patches/0714-fix-serve-re-exec-on-a-no-wait-gate-when-the-cached-.patch)
+(fork commit `5f4e37b9db`, re-exec when a cached git identity is not HEAD)
 
 ## Why
 
@@ -40,3 +42,22 @@ and `HERMES_SERVE_UPDATE_POLL_S`.
 - With nothing pending, the serve starts at once and never sleeps.
 - Policy: the bound and its log lines, the shorter hold bound, a hold followed by an update (the update bound
   applies and the trailing hold is ignored), `0` turning the gate off, and the exemption for our own updater.
+
+## Follow-up patch (0714)
+
+**0714** (fork `5f4e37b9db`): a serve whose cached git identity is not HEAD re-execs even when the update gate returns `clear`.
+
+A serve can cache `get_version_info()` at import. An update can then move the checkout and finish before `cmd_dashboard` reaches the gate. The gate returns `clear` and previously never re-execed, so `/api/health` kept the old commit while the boot fingerprint was HEAD.
+
+`reexec_if_checkout_moved` runs the cached-identity check on `clear` as well as `cleared`. On `clear`, a launch-vs-now fingerprint change is not a reason: nothing was waited out. `update-timeout` and `hold-timeout` still do not re-exec. `MAX_REEXECS` still caps it. `_cached_commit()` returns a commit only when the cached identity's source is `git`. A `ci` or `build` stamp is not compared with HEAD, so those never cause a per-launch re-exec.
+
+Tests in `tests/hermes_cli/test_serve_update_wait_reexec.py`:
+
+- `test_serve_whose_identity_went_stale_before_the_gate_reexecs` (subprocess: the child script's `health_commit` matches HEAD after one re-exec)
+- `test_clear_reexecs_when_the_cached_identity_is_not_head`
+- `test_clear_does_not_reexec_when_the_cached_identity_is_head` (a fingerprint change alone does not re-exec on `clear`)
+- `test_clear_reexec_is_capped`
+- `test_only_a_git_identity_is_compared_with_head` (`git` is compared; `ci` and `build` are not)
+- `test_no_reexec_while_the_update_is_still_running` (`update-timeout`, `hold-timeout`)
+
+A live `/api/health` read after a real update is untested in this patch.

@@ -1,0 +1,174 @@
+From 5f4e37b9dbc0d07a79a9384115649ca254d1f8aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:38:04 +0000
+Subject: [PATCH] fix(serve): re-exec on a no-wait gate when the cached git
+ identity is not HEAD [daveey]
+
+A serve can cache get_version_info() at import, then an update moves the
+checkout and finishes before cmd_dashboard reaches the update gate. The gate
+returns "clear" and previously never re-execed, so /api/health kept the old
+commit while code_skew's boot fingerprint was HEAD. Run the cached-identity
+check on "clear" too (MAX_REEXECS cap kept; the launch-vs-now fingerprint
+check stays "cleared"-only). Only a source: git identity is compared with
+HEAD, so ci/build stamps never cause per-launch re-execs.
+---
+ hermes_cli/serve_update_wait.py               | 23 ++++++--
+ .../test_serve_update_wait_reexec.py          | 59 +++++++++++++++++--
+ 2 files changed, 72 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/serve_update_wait.py b/hermes_cli/serve_update_wait.py
+index 0fc7ca38a9..8abb4cf22f 100644
+--- a/hermes_cli/serve_update_wait.py
++++ b/hermes_cli/serve_update_wait.py
+@@ -173,12 +173,18 @@ def checkout_fingerprint() -> Optional[str]:
+ 
+ 
+ def _cached_commit() -> Optional[str]:
+-    """The commit ``get_version_info()`` already cached, without filling the cache."""
++    """The commit ``get_version_info()`` already cached, without filling the cache.
++
++    Only a ``source: git`` identity (a git stamp, or ``git rev-parse``) tracks the checkout's HEAD;
++    a ci/build/nix stamp names the commit it was built from, which need not be HEAD, so comparing
++    it would re-exec every launch (up to the cap) for nothing."""
+     try:
+         from hermes_cli import version_info as vi
+ 
+         cached = vi._cached_version_info
+-        return cached.commit if cached is not None else None
++        if cached is None or cached.source != "git":
++            return None
++        return cached.commit
+     except Exception:
+         return None
+ 
+@@ -204,16 +210,21 @@ def reexec_if_checkout_moved(result: str, launch_fingerprint: Optional[str], *,
+                              log: Optional[Callable[[str], None]] = None) -> bool:
+     """After :func:`wait_for_update_clear`: re-exec this serve if the code it loaded is stale.
+ 
+-    Only a wait that ended because the update finished (``"cleared"``) re-execs: with nothing to
+-    wait for nothing moved, and after a timeout the update is still running, so a new image would
+-    only wait again. Returns False when no re-exec happened (``execv`` replaces the process
++    A wait that ended because the update finished (``"cleared"``) re-execs when the checkout moved
++    during the wait or the cached identity is not HEAD. With nothing to wait for (``"clear"``) only
++    the cached-identity check applies: the identity can be cached at import (fireworks plugin,
++    startup update-debt check) just before an update moves the checkout and finishes, all before
++    this gate runs. After a timeout the update is still running, so a new image would only wait
++    again. Returns False when no re-exec happened (``execv`` replaces the process
+     otherwise; a stub ``execv`` in tests returns True)."""
+     try:
+         count = int(os.environ.pop(REEXEC_ENV, "0") or 0)  # never leaks into the agent's children
+     except ValueError:
+         count = 0
+-    if result != "cleared":
++    if result not in ("cleared", "clear"):
+         return False
++    if result == "clear":
++        launch_fingerprint = None  # nothing was waited out: only the cached-identity check applies
+     emit = log or _stderr
+     why = stale_after_wait(launch_fingerprint, (current_fingerprint or checkout_fingerprint)(),
+                            (cached_commit or _cached_commit)())
+diff --git a/tests/hermes_cli/test_serve_update_wait_reexec.py b/tests/hermes_cli/test_serve_update_wait_reexec.py
+index f250cbfe44..eb604cdf53 100644
+--- a/tests/hermes_cli/test_serve_update_wait_reexec.py
++++ b/tests/hermes_cli/test_serve_update_wait_reexec.py
+@@ -58,6 +58,8 @@ _CHILD = textwrap.dedent("""
+     vi._git_version_info = lambda _d: info(head.read_text().strip())
+     vi._reset_version_info_cache()  # importing main already cached the real tree's identity:
+     vi.get_version_info()  # cache it from the fake HEAD, as the fireworks plugin import does
++    if sys.argv[4:] == ["moved-before-gate"]:  # an update moved the checkout and finished already
++        head.write_text(sys.argv[3]); stamp.write_text(sys.argv[3])
+ 
+     import hermes_cli.serve_update_wait as suw
+     suw.update_live = marker.exists
+@@ -107,7 +109,7 @@ _CHILD = textwrap.dedent("""
+ """)
+ 
+ 
+-def _run_serve(tmp_path, *, update_running: bool, new: str = NEW):
++def _run_serve(tmp_path, *, update_running: bool, new: str = NEW, moved_before_gate: bool = False):
+     state = tmp_path / "state"
+     state.mkdir()
+     (state / "HEAD").write_text(OLD)
+@@ -120,7 +122,8 @@ def _run_serve(tmp_path, *, update_running: bool, new: str = NEW):
+     home.mkdir()
+     env = {k: v for k, v in os.environ.items() if k != "HERMES_SERVE_REEXEC_COUNT"}
+     env.update(HERMES_HOME=str(home), HERMES_SERVE_UPDATE_POLL_S="0.05")
+-    proc = subprocess.run([sys.executable, str(script), str(REPO), str(state), new],
++    proc = subprocess.run([sys.executable, str(script), str(REPO), str(state), new,
++                           *(["moved-before-gate"] if moved_before_gate else [])],
+                           env=env, capture_output=True, text=True, timeout=120, check=False)
+     assert proc.returncode == 0, proc.stderr[-4000:]
+     result = json.loads((state / "result.json").read_text())
+@@ -152,6 +155,20 @@ def test_serve_with_no_update_does_not_reexec(tmp_path):
+     assert "re-executing" not in stderr
+ 
+ 
++@pytest.mark.skipif(os.name == "nt", reason="re-exec in place is POSIX only")
++def test_serve_whose_identity_went_stale_before_the_gate_reexecs(tmp_path):
++    # Identity cached at OLD, then an update moved the checkout to NEW and finished before
++    # cmd_dashboard reached the gate: no wait ("clear"), yet the serve must not report OLD.
++    result, incarnations, token_reads, stderr = _run_serve(
++        tmp_path, update_running=False, moved_before_gate=True)
++    # The re-exec'd image runs the same child script, so it moves nothing: HEAD stays NEW.
++    assert result["health_commit"] == result["head"] == NEW
++    assert result["boot"].rsplit(":", 1)[-1] == NEW
++    assert len(incarnations) == 2 and len(set(incarnations)) == 1
++    assert token_reads == incarnations[:1]
++    assert "cached code identity" in stderr
++
++
+ # ── the decision itself ───────────────────────────────────────────────────────────────────────
+ 
+ FP_OLD, FP_NEW = f"git:refs/heads/main:{OLD}", f"git:refs/heads/main:{NEW}"
+@@ -180,12 +197,46 @@ def test_checkout_moved_or_identity_stale_reexecs(monkeypatch, launch, cached):
+     assert any("re-executing" in line for line in lines)
+ 
+ 
+-@pytest.mark.parametrize("result", ["clear", "update-timeout", "hold-timeout"])
+-def test_no_reexec_unless_the_wait_saw_the_update_finish(monkeypatch, result):
++@pytest.mark.parametrize("result", ["update-timeout", "hold-timeout"])
++def test_no_reexec_while_the_update_is_still_running(monkeypatch, result):
+     out, calls, _ = _decide(result, FP_OLD, FP_NEW, OLD, monkeypatch)
+     assert out is False and calls == []
+ 
+ 
++def test_clear_reexecs_when_the_cached_identity_is_not_head(monkeypatch):
++    # The identity was cached at import (OLD), then an update moved the checkout to NEW and
++    # finished before the gate ran: no wait ("clear"), but /api/health would report OLD.
++    monkeypatch.setattr(os, "name", "posix")
++    out, calls, lines = _decide("clear", FP_NEW, FP_NEW, OLD, monkeypatch)
++    assert out is True and len(calls) == 1 and calls[0][0] == sys.executable
++    assert os.environ[suw.REEXEC_ENV] == "1"
++    assert any("cached code identity" in line for line in lines)
++
++
++def test_clear_does_not_reexec_when_the_cached_identity_is_head(monkeypatch):
++    monkeypatch.setattr(os, "name", "posix")
++    assert _decide("clear", FP_NEW, FP_NEW, NEW, monkeypatch)[:2] == (False, [])
++    assert _decide("clear", FP_NEW, FP_NEW, None, monkeypatch)[:2] == (False, [])
++    # On "clear" the launch-vs-now fingerprint is not a reason: nothing was waited out.
++    assert _decide("clear", FP_OLD, FP_NEW, NEW, monkeypatch)[:2] == (False, [])
++
++
++def test_clear_reexec_is_capped(monkeypatch):
++    monkeypatch.setattr(os, "name", "posix")
++    out, calls, lines = _decide("clear", FP_NEW, FP_NEW, OLD, monkeypatch, count=suw.MAX_REEXECS)
++    assert out is False and calls == []
++    assert any("starting anyway" in line for line in lines)
++
++
++@pytest.mark.parametrize("source,expected", [("git", OLD), ("ci", None), ("build", None)])
++def test_only_a_git_identity_is_compared_with_head(monkeypatch, source, expected):
++    from hermes_cli import version_info as vi
++
++    monkeypatch.setattr(vi, "_cached_version_info",
++                        vi.VersionInfo("0.0.0", "0.0.0", 0, OLD, "main", source, False, None))
++    assert suw._cached_commit() == expected
++
++
+ def test_no_reexec_when_nothing_moved_or_no_checkout(monkeypatch):
+     assert _decide("cleared", FP_NEW, FP_NEW, NEW, monkeypatch)[:2] == (False, [])
+     assert _decide("cleared", FP_NEW, FP_NEW, None, monkeypatch)[:2] == (False, [])
+-- 
+2.55.0
+

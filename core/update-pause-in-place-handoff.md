@@ -1,8 +1,9 @@
 # A core-update-paused turn waits for a successor backend only while one is coming
 
 Patch: [`patches/0704-fix-core-update-a-paused-turn-continues-in-place-onc.patch`](patches/0704-fix-core-update-a-paused-turn-continues-in-place-onc.patch)
-(fork commit `e96d22b072`), and [`patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch`](patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch)
-(fork commit `549b7f1e71`, owned background jobs stopped for the pause)
+(fork commit `e96d22b072`), [`patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch`](patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch)
+(fork commit `549b7f1e71`, owned background jobs stopped for the pause), and [`patches/0717-daveey-Report-background-jobs-an-idle-chat-loses-whe.patch`](patches/0717-daveey-Report-background-jobs-an-idle-chat-loses-whe.patch)
+(fork commit `91f48a91a2`, idle-chat jobs reported when the backend exits)
 
 ## Why
 
@@ -79,3 +80,31 @@ Tests:
 - `tests/tui_gateway/test_update_pause_failures.py`: `test_write_failure_does_not_kill_or_release`, `test_kill_failure_refuses_pause_and_retains_intent`, `test_receipt_and_normal_notice_are_redacted_and_name_update`, `test_retry_marker_retains_interruption_receipts`, `test_write_after_signal_failure_leaves_uncertain_receipt`.
 
 A live scheduler submitting a real background job, and a real drain window, are untested in this patch. The tests drive the registry and the marker directly.
+
+## Follow-up patch (0717)
+
+**0717** (fork `91f48a91a2`): an idle chat's background jobs are reported when the backend exits. The step-boundary pause never sees them, because the turn already ended.
+
+Skew retirement, the updater restart, idle exit and a Desktop quit all end in `_shutdown_sessions` then `agent.close`, which killed owned jobs with `source=agent_close` and `consume_output=True`. The notify the chat waited on never arrived, and nothing recorded why.
+
+Before sessions are closed, `tui_gateway/exit_job_receipts.py` journals each session's owned non-persist running jobs into its turn marker, stops them with `source=backend_shutdown` and `consume_output=False`, and journals each outcome. `backend_shutdown` is a lifecycle kill source, so `persist_on_release` jobs are still skipped. The journal runs from `_shutdown_sessions` (after turns are stopped) and from the SIGTERM flush handler.
+
+- A turn already in flight keeps its crash marker and gains the job list.
+- An idle session gets a `background_jobs_stopped` marker only when one of the jobs had `notify=true`. Quiet-only jobs get no wake marker; the ordinary close still applies.
+- If the journal write fails, that session's jobs are not killed by this path and a warning is logged. A failed kill is logged as an unverified outcome. Unlike the update pause, backend exit does not abort the shutdown.
+- The kill reason is the update's reason when the checkout moved under this process or an update is live, otherwise `killed when the Hermes backend shut down`.
+- The next backend's startup sweep and `session.resume` submit a turn listing each job (id, UTC start, command head, restart advice) and, for a notify job, its completion notice. The status line is `Reporting stopped background jobs…`. The receipt outlives the turn freshness window (`JOBS_RECEIPT_MAX_AGE_S`, 24 h).
+- A real session end does not come through this path and still kills owned jobs without a receipt.
+
+Tests in `tests/tui_gateway/test_shutdown_job_receipts.py`:
+
+- `test_idle_shutdown_for_update_journals_notify_job_and_next_backend_reports_it`
+- `test_idle_shutdown_without_update_names_the_backend_shutdown`
+- `test_idle_session_with_only_quiet_jobs_gets_no_wake_marker`
+- `test_running_turn_at_shutdown_keeps_its_crash_marker_and_lists_the_jobs`
+- `test_persist_on_release_job_is_untouched_by_shutdown_journal`
+- `test_session_end_close_keeps_todays_silent_kill`
+- `test_sigterm_flush_handler_journals_before_chaining`
+- `test_startup_sweep_resumes_a_job_receipt_older_than_the_turn_freshness_window`
+
+A live scheduler submitting a real background job, and a real backend exit, are untested in this patch. The tests drive the registry and the marker directly.
