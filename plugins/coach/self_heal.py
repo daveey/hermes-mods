@@ -1749,6 +1749,45 @@ def file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, budg
     return {"action": "filed", "card": tid, "key": key, "scheduled": sched}
 
 
+_CRON_SYMPTOM = re.compile(r"^cron job '(?P<name>.+?)' failed on (?P<host>[^:\s]+):")
+
+
+def cron_job_state(fp: str, st: dict, home: Optional[Path] = None) -> Optional[dict]:
+    """Live failure_streak of the cron job behind a `cron-*` fingerprint, or None when it can't be judged here
+    (job on another host, jobs.json unreadable, no job matches the fingerprint)."""
+    m = _CRON_SYMPTOM.match(str(st.get("symptom") or ""))
+    if not fp.startswith("cron-") or not m or m.group("host") != host_name():
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_coach_signals_selfheal", Path(__file__).with_name("signals.py"))
+        sig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sig)
+    except Exception:
+        return None
+    home = Path(home) if home else Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    for prof, h in sig.homes(home):
+        try:
+            j = json.loads((h / "cron" / "jobs.json").read_text())
+        except Exception:
+            continue
+        for job in (j.get("jobs") if isinstance(j, dict) else j) or []:
+            name = job.get("name") or job.get("id")
+            if name == m.group("name") and sig.fp("cron", m.group("host"), prof, name) == fp:
+                return {"job": job.get("id"), "name": name, "profile": prof,
+                        "failure_streak": int(job.get("failure_streak") or 0), "threshold": sig._cron_threshold(h),
+                        "last_status": job.get("last_status")}
+    return None
+
+
+class FixPending(Exception):
+    """`event fixed` refused: the cron job behind the fingerprint is still failing."""
+
+    def __init__(self, state: dict, entry: dict):
+        super().__init__(f"{state['name']} failure_streak={state['failure_streak']} >= {state['threshold']}")
+        self.state, self.entry = state, entry
+
+
 EVENT_STATUS = {"proposed": "proposed", "fixed": "fixed", "not_defect": "not_defect", "reverted": "reverted",
                 "declined": "declined", "duplicate": "approved"}
 
@@ -1765,6 +1804,18 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     lane = LaneState(store.root)
     st = lane.get(fp)
     kw: dict = {"status": EVENT_STATUS[kind]}
+    cron_check = None
+    if kind == "fixed" and fp.startswith("cron-"):
+        # A cron fix is only fixed once the job runs green: refuse while it is still at core's nudge streak
+        # (cron-5aa82ca809 was marked fixed at streak 7 and climbing, and came back hours later).
+        cj = cron_job_state(fp, st)
+        cron_check = "unchecked" if cj is None else "ok"
+        if cj is not None and cj["failure_streak"] >= cj["threshold"]:
+            e = lane.update(fp, fix_pending_at=now, fix_pending_card=card or st.get("fix_card"))
+            store.log({"event": "selfheal_fix_pending", "fingerprint": fp, "card": card or st.get("fix_card"),
+                       "job": cj["job"], "failure_streak": cj["failure_streak"], "threshold": cj["threshold"],
+                       "note": note[:300]})
+            raise FixPending(cj, e)
     if kind == "duplicate":
         kw.update(fix_card=owner, approved_at=now, closed_at=None,
                   cards=sorted(known_cards(st) | {c for c in (card, owner) if c}))
@@ -1778,7 +1829,8 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
         kw["closed_at"] = now
     e = lane.update(fp, **kw)
     store.log({"event": f"selfheal_{kind}", "fingerprint": fp, "card": card or e.get("card"),
-               "component": e.get("component"), "note": note[:300], "recurrence": bool(e.get("recurrences"))})
+               "component": e.get("component"), "note": note[:300], "recurrence": bool(e.get("recurrences")),
+               **({"cron_check": cron_check} if cron_check else {})})
     return e
 
 
@@ -2064,7 +2116,15 @@ def main(argv=None) -> int:
     elif a.cmd == "fix":
         print(json.dumps(file_fix(a.fp)))
     elif a.cmd == "event":
-        e = record_event(a.kind, a.fp, a.card, a.note, owner=a.owner)
+        try:
+            e = record_event(a.kind, a.fp, a.card, a.note, owner=a.owner)
+        except FixPending as fx:
+            s = fx.state
+            print(json.dumps({"fingerprint": a.fp, "status": fx.entry.get("status"), "fix_pending": True,
+                              "job": s["name"], "failure_streak": s["failure_streak"], "threshold": s["threshold"],
+                              "why": "cron job still failing: not recorded fixed; keep the card open, verify a green "
+                                     "run (failure_streak below threshold), then record fixed again"}))
+            sys.exit(3)
         print(json.dumps({"fingerprint": a.fp, "status": e.get("status")}))
     elif a.cmd == "sync":
         for fp, what in sync():
