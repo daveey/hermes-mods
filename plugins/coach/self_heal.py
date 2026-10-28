@@ -625,8 +625,9 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #                     running cards, <= 1 filing per fingerprint per UTC day. Known cap denials never create a card;
 #                     investigations persist for admission retry, and fixes keep the Do-it outcome retryable.
 # Events (coach log.jsonl, read by coach_weekly's self-heal section): selfheal_would_file, selfheal_filed,
-# selfheal_recurrence, selfheal_skip, selfheal_proposed, selfheal_approved, selfheal_fixed, selfheal_reverted,
-# selfheal_not_defect, selfheal_declined.
+# selfheal_recurrence, selfheal_recurrence_held (an occurrence inside `deploy_grace_hours` after fixed: hosts may
+# still run old code; the 3rd held occurrence files anyway), selfheal_skip, selfheal_proposed, selfheal_approved,
+# selfheal_fixed, selfheal_reverted, selfheal_not_defect, selfheal_declined.
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 MODEL = "claude-opus-5-5"
@@ -663,8 +664,9 @@ def coach_root() -> Path:
 
 def lane_config() -> dict:
     """<coach>/selfheal-config.json (private, per host): {"hub_host": "<hostname of the hub>", "hub_ssh":
-    "<user@addr>", "board": "<hub board>", "bb_board": "bb"}. Env overrides: COACH_SELFHEAL_HUB (ssh target),
-    COACH_SELFHEAL_IS_HUB=1. With no hub configured every host files locally."""
+    "<user@addr>", "board": "<hub board>", "bb_board": "bb", "deploy_grace_hours": 6}. Env overrides:
+    COACH_SELFHEAL_HUB (ssh target), COACH_SELFHEAL_IS_HUB=1. With no hub configured every host files locally.
+    `deploy_grace_hours` (hub side): occurrences this soon after `fixed` are held, not filed as came-back."""
     try:
         cfg = json.loads((coach_root() / "selfheal-config.json").read_text())
     except Exception:
@@ -790,6 +792,11 @@ def investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[
                "hold. Say so in the proposal's first line, find why the earlier fix and its test didn't catch the "
                "return (five-whys step 5), and the Plan MUST add a detection-level guard (test, assertion, alert or "
                "gate) that fails if it comes back.\n")
+        held = [h for h in (previous.get("held") or []) if h.get("at")]
+        if held:
+            rec += ("\nHeld inside the rollout window (seen soon after the fix was pushed, so possibly a host still "
+                    "on old code; filed now because it kept happening or came after the window):\n" +
+                    "".join(f"- {_pt(h['at'])} on {h.get('host') or '?'} ({h.get('source') or '?'})\n" for h in held))
     proposal = f"~/.hermes/coach/selfheal/{fp}/proposal.md"
     return f"""Self-heal investigation for defect `{fp}`. Nothing here needs a human; David's standing approval of this
 lane covers the investigation AND the fix. You do NOT ship the fix yourself: you write the proposal, and the lane's
@@ -879,7 +886,9 @@ Investigation card: {st.get('card') or '?'}. Budget for this card <= ${FIX_BUDGE
 
 class LaneState:
     """<coach>/selfheal_lane.json: fingerprint -> {status, card, fix_card, component, symptom, filed_day, snooze_until,
-    suppressed, fixed_at, recurrences, refiles, gen, cards, history}. Statuses: filed, proposed, approved, fixed,
+    suppressed, fixed_at, recurrences, refiles, gen, cards, history, held}. `held` = occurrences seen inside the
+    rollout window after fixed_at ([{at, host, source, seen}]), cleared by the next filing or fix.
+    Statuses: filed, proposed, approved, fixed,
     not_defect, declined, suppressed, reverted, stale."""
 
     def __init__(self, root: Path):
@@ -1106,9 +1115,23 @@ def known_cards(st: dict) -> set:
     return {c for c in (st.get("cards") or []) + [st.get("card"), st.get("fix_card")] if c}
 
 
-def decide(d: dict, st: dict, now: float) -> dict:
+DEPLOY_GRACE_HOURS = 6.0  # "fixed" is stamped at push; hosts run old code until they update/restart (core updates
+# defer up to 3 h while cards run). An occurrence inside this window after fixed_at is held, not a recurrence.
+HELD_FILE_AFTER = 3  # ...unless the fingerprint is held this many times: a fix that really failed surfaces fast
+
+
+def deploy_grace_s(cfg: Optional[dict] = None) -> float:
+    """`deploy_grace_hours` in selfheal-config.json (0 = every occurrence after fixed is a recurrence)."""
+    cfg = lane_config() if cfg is None else cfg
+    try:
+        return max(0.0, float(cfg.get("deploy_grace_hours", DEPLOY_GRACE_HOURS))) * 3600
+    except (TypeError, ValueError):
+        return DEPLOY_GRACE_HOURS * 3600
+
+
+def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
     """Pure dedupe / suppression / recurrence decision for one defect against its lane state.
-    -> {"action": "file"|"skip", "why", "key", "previous"}"""
+    -> {"action": "file"|"skip"|"hold", "why", "key", "previous"}"""
     fp = d["fingerprint"]
     status = st.get("status")
     if st.get("suppressed"):
@@ -1123,7 +1146,18 @@ def decide(d: dict, st: dict, now: float) -> dict:
         return {"action": "skip", "why": f"closed as not a defect within {NOT_DEFECT_DAYS} days"}
     g = generation(st) + 1  # every filing gets a fresh generation, so its keys never name an earlier card
     if status == "fixed":
-        return {"action": "file", "why": "recurrence", "key": inv_key(fp, g), "gen": g, "previous": st}
+        # Judge by when it happened, not when it was processed: inside the rollout window it is most likely a
+        # host still running pre-fix code. Held occurrences are deduped by time so a replay never counts twice.
+        at = _detected_at(d)
+        at = now if at is None else at
+        grace = deploy_grace_s(cfg)
+        held = [h for h in (st.get("held") or []) if h.get("at") != at]
+        if grace and st.get("fixed_at") and at - float(st["fixed_at"]) < grace and len(held) + 1 < HELD_FILE_AFTER:
+            return {"action": "hold", "at": at, "held": held, "until": float(st["fixed_at"]) + grace,
+                    "why": f"inside the {grace / 3600:g} h rollout window after fixed ({_iso(st['fixed_at'])}); "
+                           f"held {len(held) + 1}/{HELD_FILE_AFTER - 1}"}
+        why = "recurrence" if not held else f"recurrence ({len(held)} held inside the rollout window)"
+        return {"action": "file", "why": why, "key": inv_key(fp, g), "gen": g, "previous": st}
     if st.get("card"):  # an earlier card closed without a fix (declined/reverted/not_defect/stale): new key
         return {"action": "file", "why": "refile", "key": inv_key(fp, g), "gen": g, "previous": None}
     return {"action": "file", "why": "new", "key": inv_key(fp, g), "gen": g, "previous": None}
@@ -1636,7 +1670,14 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         adopted = _adopt_recovery_holder(d, fp, st, store, now, runner)
         if adopted:
             return adopted
-    dec = decide(d, st, now)
+    dec = decide(d, st, now, cfg)
+    if dec["action"] == "hold":
+        held = dec["held"] + [{"at": dec["at"], "host": d.get("host"), "source": d.get("source"), "seen": now}]
+        lane.update(fp, held=held)
+        store.log({"event": "selfheal_recurrence_held", "mode": m, "fingerprint": fp, "at": dec["at"],
+                   "held": len(held), "until": dec["until"], "host": d.get("host"), "source": d.get("source"),
+                   "component": d.get("component"), "previous": st.get("fix_card"), "why": dec["why"]})
+        return {"action": "skip", "why": dec["why"], "held": len(held)}
     if dec["action"] == "skip":
         if (d.get("incident") and m == "live" and hub and not st.get("suppressed")
                 and (st.get("snooze_until") or 0) <= now and st.get("status") in ("filed", "approved", "proposed")):
@@ -1692,7 +1733,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     kw: dict = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
               filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
               fix_card=None if not prev else st.get("fix_card"), gen=gen,
-              cards=sorted(known | {tid}), proposed_at=None, family=root_family(d))
+              cards=sorted(known | {tid}), proposed_at=None, family=root_family(d), held=[])
     if prev:
         kw["recurrences"] = int(st.get("recurrences") or 0) + 1
     elif dec["why"] == "refile":
@@ -1824,7 +1865,7 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
     if kind == "proposed":
         kw["proposed_at"] = now
     if kind == "fixed":
-        kw.update(fixed_at=now, fix_card=card or st.get("fix_card"))
+        kw.update(fixed_at=now, fix_card=card or st.get("fix_card"), held=[])
     if kind in ("not_defect", "declined"):
         kw["closed_at"] = now
     e = lane.update(fp, **kw)
@@ -2138,8 +2179,11 @@ def main(argv=None) -> int:
     elif a.cmd == "status":
         st = LaneState(coach_root()).read()
         print(json.dumps({"mode": mode(), "hub": is_hub(), "budget": budget(),
-                          "fingerprints": {k: {kk: v.get(kk) for kk in ("status", "card", "fix_card", "filed_day")}
-                                           for k, v in st.items()}}, indent=1))
+                          "fingerprints": {k: {**{kk: v.get(kk) for kk in ("status", "card", "fix_card", "filed_day")},
+                                               "held": len(v.get("held") or [])}
+                                           for k, v in st.items()},
+                          "held_total": sum(len(v.get("held") or []) for v in st.values()),
+                          "deploy_grace_hours": deploy_grace_s() / 3600}, indent=1))
     return 0
 
 

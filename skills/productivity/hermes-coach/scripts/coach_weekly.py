@@ -382,6 +382,7 @@ def revertible(p):
 #             selfheal_approved     Do it pressed, fix card started selfheal_fixed     fix verified live ("Fixed: …")
 #             selfheal_reverted     fix undone                      selfheal_not_defect closed as not a defect
 #             selfheal_declined     Not now / Never                 selfheal_recurrence a fixed fingerprint came back
+#             selfheal_recurrence_held  seen inside the rollout window after a fix (counted, not filed)
 #   cards   Kanban tasks whose idempotency key starts with `selfheal` and ends in a hashed defect fingerprint
 #           (`selfheal:<fp>` investigation, `selfheal:<fp>:fix` or `selfheal-fix:<fp>` fix card) on every board of
 #           the home: cost = lifetime worker-session cost.
@@ -507,7 +508,7 @@ def selfheal_export(path, homes=None):
 def selfheal_stats(events, cards, lo, hi):
     """Per-stage distinct fingerprints in [lo, hi), recurrence, shadow would-files, $ and $ per fix."""
     stage = {s: set() for s, _ in SELFHEAL_STAGES}
-    shadow, recur = set(), set()
+    shadow, recur, held = set(), set(), 0
     fixed_before = {}  # fingerprint -> first time it was fixed (any time), for recurrence
     for r in events:
         if r.get("event") == "selfheal_fixed" and r.get("fingerprint"):
@@ -525,6 +526,8 @@ def selfheal_stats(events, cards, lo, hi):
         ev = r.get("event", "")[len("selfheal_"):]
         if ev in ("detect", "would_file"):
             shadow.add(fp)
+        elif ev == "recurrence_held":
+            held += 1  # seen inside the rollout window after a fix: not counted as came back
         elif ev == "recurrence":
             recur.add(fp)
             stage["filed"].add(fp)
@@ -551,7 +554,7 @@ def selfheal_stats(events, cards, lo, hi):
                 stage["fixed"].add(fp)
     n = {s: len(v) for s, v in stage.items()}
     filed = n["filed"]
-    return {**n, "shadow": len(shadow), "recurrence": len(recur),
+    return {**n, "shadow": len(shadow), "recurrence": len(recur), "held": held,
             "recurrence_rate": round(len(recur) / filed, 3) if filed else None,
             "usd": round(usd, 2), "usd_per_fix": round(usd / n["fixed"], 2) if n["fixed"] else None,
             "false_positive_rate": round(n["not_defect"] / filed, 3) if filed else None}
@@ -580,6 +583,8 @@ def section_selfheal(data, now, days, homes=None, events=None, cards=None):
     out += ["",
             f"Recurrence: {cur['recurrence']} of {cur['filed']} filed came back after a fix "
             f"({fmt(cur['recurrence_rate'])}; previous {fmt(prev['recurrence_rate'])}). Each needs a detection-level guard.",
+            f"Held in rollout window (seen soon after a fix shipped, not filed): {cur['held']} "
+            f"(previous {prev['held']}).",
             f"False-positive rate (not-a-defect / filed): {fmt(cur['false_positive_rate'])} "
             f"(previous {fmt(prev['false_positive_rate'])}).",
             f"Spend: ${cur['usd']:,.2f} (previous ${prev['usd']:,.2f}); $ per fix: "

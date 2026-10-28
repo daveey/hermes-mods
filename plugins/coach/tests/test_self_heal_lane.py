@@ -214,7 +214,8 @@ def test_recurrence_of_a_fixed_fingerprint_says_previous_fix_didnt_hold(store):
     sh.record_event("proposed", fp, "t_00000001", store=store, now=NOW + 100)
     sh.file_fix(fp, store=store, runner=r, now=NOW + 200, budget_fn=OPEN)
     sh.record_event("fixed", fp, "t_00000002", store=store, now=NOW + 300)
-    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW + 3 * 86400, cfg=HUB, budget_fn=OPEN)
+    out = sh.file_defect({**d, "at": NOW + 3 * 86400 - 60}, store=store, m="live", runner=r, now=NOW + 3 * 86400,
+                         cfg=HUB, budget_fn=OPEN)  # it happens again 3 days after the fix
     argv = r.creates()[-1]
     assert out["key"] == f"selfheal:{fp}:r2" and opt(argv, "--idempotency-key") == f"selfheal:{fp}:r2"
     body = opt(argv, "--body")
@@ -229,6 +230,97 @@ def test_recurrence_of_a_fixed_fingerprint_says_previous_fix_didnt_hold(store):
     weekly = load("coach_weekly_lane_test", REPO / "skills/productivity/hermes-coach/scripts/coach_weekly.py")
     for k in (out["key"], fx["key"], f"selfheal:{fp}:fix", f"selfheal:{fp}"):
         assert weekly.selfheal_fp(k) == fp and weekly.DEFECT_FP_RX.search(weekly.selfheal_fp(k))
+
+
+# ── rollout window: "pushed" is not "running on every host" ──
+FIXED_AT = 1793163024.0  # agent-664ecedaaf: fix 48913b6339 recorded 2026-10-28 04:50:24Z
+SEEN_AT = 1793166654.0   # the MacBook's errors.log line from a process still on old code, 05:50:54Z
+
+
+def _fixed(store, r, d, fixed_at=FIXED_AT):
+    fp = d["fingerprint"]
+    sh.file_defect(d, store=store, m="live", runner=r, now=fixed_at - 20000, cfg=HUB, budget_fn=OPEN)
+    sh.record_event("proposed", fp, "t_00000001", store=store, now=fixed_at - 19000)
+    sh.file_fix(fp, store=store, runner=r, now=fixed_at - 18000, budget_fn=OPEN)
+    sh.record_event("fixed", fp, "t_00000002", store=store, now=fixed_at)
+    return fp
+
+
+def test_occurrence_inside_the_rollout_window_is_held_not_filed(store):
+    # (a) replay of agent-664ecedaaf: seen 1 h after "fixed" (processed 11 min later), files nothing
+    r = Runner()
+    d = defect(component="agent", symptom="FileNotFoundError in _execute_child (subprocess.py)", source="signal",
+               at=SEEN_AT)
+    fp = _fixed(store, r, d)
+    n = len(r.creates())
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=1793167334.0, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "skip" and out.get("held") == 1, out
+    assert len(r.creates()) == n and not ev(store, "selfheal_recurrence")
+    (held,) = ev(store, "selfheal_recurrence_held")
+    assert held["fingerprint"] == fp and held["at"] == SEEN_AT and held["held"] == 1
+    st = sh.LaneState(store.root).get(fp)
+    assert st["status"] == "fixed" and [h["at"] for h in st["held"]] == [SEEN_AT]
+
+
+def test_occurrence_after_the_rollout_window_still_comes_back_and_lists_held(store):
+    # (b) same fingerprint 7 h after the fix files "came back"; the brief names the held occurrence
+    r = Runner()
+    d = defect(component="agent", symptom="FileNotFoundError in _execute_child (subprocess.py)", source="signal",
+               at=SEEN_AT)
+    fp = _fixed(store, r, d)
+    sh.file_defect(d, store=store, m="live", runner=r, now=SEEN_AT + 60, cfg=HUB, budget_fn=OPEN)
+    late = FIXED_AT + 7 * 3600
+    out = sh.file_defect({**d, "at": late}, store=store, m="live", runner=r, now=late + 60, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and out["key"] == f"selfheal:{fp}:r2"
+    argv = r.creates()[-1]
+    assert "(came back)" in argv[argv.index("create") + 1]
+    body = opt(argv, "--body")
+    assert "Held inside the rollout window" in body and sh._pt(SEEN_AT) in body
+    assert ev(store, "selfheal_recurrence")[0]["previous"] == "t_00000002"
+    assert not sh.LaneState(store.root).get(fp).get("held")  # the new generation starts clean
+
+
+def test_window_is_judged_by_occurrence_time_not_processing_time(store):
+    # (c) seen inside the window, processed 9 h later (queue drain / hub unreachable): still held
+    r = Runner()
+    d = defect(component="agent", symptom="FileNotFoundError in _execute_child (subprocess.py)", source="signal",
+               at=SEEN_AT)
+    _fixed(store, r, d)
+    n = len(r.creates())
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=FIXED_AT + 9 * 3600, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "skip" and out.get("held") == 1
+    assert len(r.creates()) == n
+
+
+def test_three_held_occurrences_file_inside_the_window(store):
+    # (d) detection guard: a fix that really failed surfaces fast; a replay of the same occurrence never counts twice
+    r = Runner()
+    d = defect(component="agent", symptom="FileNotFoundError in _execute_child (subprocess.py)", source="signal",
+               at=SEEN_AT)
+    fp = _fixed(store, r, d)
+    n = len(r.creates())
+    assert sh.file_defect(d, store=store, m="live", runner=r, now=SEEN_AT + 10, cfg=HUB, budget_fn=OPEN)["held"] == 1
+    again = sh.file_defect(d, store=store, m="live", runner=r, now=SEEN_AT + 20, cfg=HUB, budget_fn=OPEN)
+    assert again.get("held") == 1  # same occurrence replayed: not a second one
+    two = sh.file_defect({**d, "at": SEEN_AT + 600}, store=store, m="live", runner=r, now=SEEN_AT + 610, cfg=HUB,
+                         budget_fn=OPEN)
+    assert two["held"] == 2 and len(r.creates()) == n
+    out = sh.file_defect({**d, "at": SEEN_AT + 1200}, store=store, m="live", runner=r, now=SEEN_AT + 1210, cfg=HUB,
+                         budget_fn=OPEN)
+    assert out["action"] == "filed" and len(r.creates()) == n + 1
+    body = opt(r.creates()[-1], "--body")
+    assert "Held inside the rollout window" in body and sh._pt(SEEN_AT + 600) in body
+    assert ev(store, "selfheal_recurrence")[0]["fingerprint"] == fp
+
+
+def test_deploy_grace_zero_restores_immediate_recurrence(store):
+    r = Runner()
+    d = defect(component="agent", symptom="FileNotFoundError in _execute_child (subprocess.py)", source="signal",
+               at=SEEN_AT)
+    _fixed(store, r, d)
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=SEEN_AT + 60, cfg={"deploy_grace_hours": 0},
+                         budget_fn=OPEN)
+    assert out["action"] == "filed"
 
 
 # ── budget ──
@@ -807,7 +899,8 @@ def lifecycle(store, board, steps, d=None):
     for s in steps:
         t += 9 * 86400 if s == "file" else 600
         if s == "file":
-            r = sh.file_defect(d, store=store, m="live", runner=board, now=t, cfg=HUB, budget_fn=OPEN)
+            r = sh.file_defect({**d, "at": t - 60}, store=store, m="live", runner=board, now=t, cfg=HUB,
+                               budget_fn=OPEN)  # each filing is a fresh occurrence, seen just before it is processed
         elif s == "fix":
             r = sh.file_fix(fp, store=store, runner=board, now=t, budget_fn=OPEN)
         else:

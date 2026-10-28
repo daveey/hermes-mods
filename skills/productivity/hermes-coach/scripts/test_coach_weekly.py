@@ -342,6 +342,17 @@ class SelfHealLane(unittest.TestCase):
         self.assertIn("Recurrence: 1 of 1", out)
         self.assertIn("n/a (no fixes this window)", out)
 
+    def test_held_recurrences_are_counted_not_filed(self):
+        t = self.NOW - 2 * self.DAY
+        self.events([
+            {"ts": t, "event": "selfheal_fixed", "fingerprint": "agent-664ecedaaf"},
+            {"ts": t + 3600, "event": "selfheal_recurrence_held", "fingerprint": "agent-664ecedaaf"},
+            {"ts": t + 4000, "event": "selfheal_recurrence_held", "fingerprint": "agent-664ecedaaf"},
+        ])
+        out = self.section()
+        self.assertIn("Held in rollout window (seen soon after a fix shipped, not filed): 2 (previous 0).", out)
+        self.assertIn("| Filed (investigation card) | 0 | 0 |", out)
+
     def test_snapshot_roundtrip(self):
         t = self.NOW - self.DAY
         self.events([{"ts": t, "event": "selfheal_filed", "fingerprint": "fp-s", "quote": "private text"}])

@@ -439,6 +439,13 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   not a Kanban `task` action because a worker is fenced from creating cards via the CLI.)
 - **Recurrence**: a fixed fingerprint that comes back files `selfheal:<fp>:r<n>`, whose brief says "previous fix <id>
   didn't hold" and requires a detection-level guard.
+- **Rollout window**: "fixed" is stamped when the fix is pushed, not when every host runs it (core updates defer up
+  to 3 h while cards run; long-lived apps keep old code until restart). So recurrence is judged by when the
+  occurrence happened (`d["at"]`, else processing time): one inside `deploy_grace_hours` (selfheal-config.json,
+  default 6, `0` = off) after `fixed_at` logs `selfheal_recurrence_held`, is stored in the lane's `held` list
+  (deduped by `at`), and files nothing. The 3rd held occurrence files "came back" even inside the window, and the
+  first one after the window files as before; either brief lists the held occurrences. `status` prints held counts,
+  and the weekly report has a "Held in rollout window" line. Tests: `test_self_heal_lane.py` (rollout window block).
 - **Budget**: engine_budget lane `selfheal` ($200/UTC day, its own cap outside the $20 engine total; spend = these
   cards' worker sessions), ≤ 3 running, ≤ 1 filing per fingerprint per UTC day. A known spend/concurrency denial
   creates **no card**: investigations persist in `coach/selfheal_pending.sqlite`, retried through admission by the
@@ -452,7 +459,7 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   agent reply from digest v6 plus the session title and the 3 earlier user turns, since without them the strict stage
   scored context-free reports like "why didnt this work [screenshot]" as new issues), Inbox sync. In the cascade a
   stage whose answer is empty or unparseable is retried once and then left out of the mean, not counted as a 0.
-- Events (coach `log.jsonl`, read by `coach_weekly.py`): `selfheal_would_file`, `_filed`, `_recurrence`, `_skip`,
+- Events (coach `log.jsonl`, read by `coach_weekly.py`): `selfheal_would_file`, `_filed`, `_recurrence`, `_recurrence_held`, `_skip`,
   `_proposed`, `_approved`, `_fixed`, `_reverted`, `_not_defect`, `_declined`. Cards report theirs with
   `self_heal.py event <kind> <fp> --card <id>`. `self_heal.py status` prints the lane state and budget.
 - Tests: `tests/test_self_heal_lane.py` (each entry path, dedupe, recurrence, budget, bb routing, shadow vs live,
