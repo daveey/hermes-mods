@@ -80,6 +80,15 @@ If the user has given standing approval to quit/kill and relaunch an app or back
 memory), use it when updates are stuck waiting for in-flight turns to end. First check that no
 update/sync is mid-run and note any work the restart interrupts; tell the user after.
 
+## Never report stale state
+
+The user talks to sessions directly, so anything you remember can be out of date. Before you
+tell the user something is waiting on them, blocked, or not done, re-check it live in the same
+turn: read that session's latest events (and its PR/card state) and confirm the ask is still
+open and wasn't answered there. Do this for every "waiting on you" item, every time, including
+items you listed in an earlier reply. If you can't confirm, say "unverified" instead of listing
+it as waiting. The status cache is for "what's running", never for "what needs you".
+
 ## Speed
 
 - "What are we working on" / status questions: `cat ~/.claude/dispatcher/status.md` and answer
