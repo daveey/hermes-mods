@@ -1,6 +1,7 @@
 # A running background review holds backend retirement
 
-Patch: [`patches/0700-fix-retirement-a-running-background-review-holds-the.patch`](patches/0700-fix-retirement-a-running-background-review-holds-the.patch) (fork commit `4101ef7442`)
+Patches: [`patches/0700-fix-retirement-a-running-background-review-holds-the.patch`](patches/0700-fix-retirement-a-running-background-review-holds-the.patch) (fork commit `4101ef7442`),
+[`patches/0702-fix-update-stop-a-stale-dashboard-backend-through-it.patch`](patches/0702-fix-update-stop-a-stale-dashboard-backend-through-it.patch) (fork commit `2d9f16aa2c`, the `hermes update` stop path)
 
 ## Why
 
@@ -23,6 +24,17 @@ change, which was lost.
 - Once a review is older than `BACKGROUND_REVIEW_HARD_CAP_S` (900 s), it stops counting, so a wedged review cannot
   starve retirement.
 - `busy_ledger()` reports `background_review:<n>` for the idle-exit watchdog and `/api/health/idle`.
+- `hermes update`'s dashboard step (`_kill_stale_dashboard_processes(restart_managed=True)`, patch 0702) no longer
+  sends a plain SIGTERM first. For each stale backend whose port (spawn ledger, host rendezvous record, or a
+  non-zero `--port`) and session token (`HERMES_DASHBOARD_SESSION_TOKEN` in its environment, or the rendezvous
+  token) it can find, it calls `POST /api/health/retirement` `prepare`. While `GET /api/health/idle` reports
+  `background_review:<n>`, it asks again every 2 s, so the fence lets the review finish, winds it down between
+  calls past 300 s, and drops it past 900 s (also the update's own deadline). On a permit it commits (admission
+  closed, no new review starts) and then stops the backend as before. Any other answer (idle, a different busy
+  ledger, an old backend with no fence, no token or port) is stopped at once, as before. Update output:
+  `⏳ PID <n> is running a background review (background_review:1); waiting for it before stopping …`, then
+  `✓ PID <n> finished its background review after <s>s; retirement fence committed, stopping it` (or
+  `⚠ … stopping it anyway` at the deadline). `hermes dashboard --stop` keeps its immediate stop.
 - Unchanged: the hermes-sync drain-window probe. The tree move did not kill the reviews; the backend retirement
   2 minutes later did. Gating the drain on reviews would bring back update starvation.
 
@@ -38,3 +50,14 @@ change, which was lost.
 - `begin_iteration` breaks before the next provider call on `wind_down`.
 - `_spawn_background_review_now` holds the fence for the thread's whole run, and skips cleanly (run token released)
   on a retiring backend.
+
+`tests/hermes_cli/test_update_stale_dashboard_review.py` (patch 0702; 3 of 5 fail without it, and the 2 controls
+pass both ways). The backend is a real child process: a real `RetirementFence` behind an HTTP listener that checks
+the session token from its environment, plus a SIGTERM handler that records what the shutdown would do to a review
+still running:
+
+- A review in the middle of a provider call: the update stops the backend only after the review completes.
+  Without the patch, the stop records `review_cancelled_mid_call` 0.2 s after it starts.
+- A review past the wait bound winds down at a call boundary, and then the backend is stopped.
+- A wedged review: the update gives up at its deadline and stops the backend as before.
+- Controls: a backend with no review, and one with no reachable fence, are stopped at once as before.
