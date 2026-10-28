@@ -323,6 +323,36 @@ def test_deploy_grace_zero_restores_immediate_recurrence(store):
     assert out["action"] == "filed"
 
 
+def test_recurrence_on_the_day_it_was_filed_and_fixed_is_not_swallowed(store):
+    # agent-23a0c3b69f: filed, fixed at 05:40Z and back at 08:48Z the same UTC day; the hub logged
+    # selfheal_skip "already filed today" and the recurrence only surfaced through a watch card.
+    r = Runner()
+    d = defect(component="agent", symptom="TimeoutExpired in _run_git (checkpoint_manager.py)", source="signal")
+    fp = d["fingerprint"]
+    fixed_at = 1793166012.0  # 2026-10-28T05:40:12Z
+    sh.file_defect({**d, "at": fixed_at - 7200}, store=store, m="live", runner=r, now=fixed_at - 7000, cfg=HUB,
+                   budget_fn=OPEN)
+    sh.record_event("proposed", fp, "t_00000001", store=store, now=fixed_at - 6000)
+    sh.file_fix(fp, store=store, runner=r, now=fixed_at - 5000, budget_fn=OPEN)
+    sh.record_event("fixed", fp, "t_00000002", store=store, now=fixed_at)
+    assert sh.LaneState(store.root).get(fp)["filed_day"] == sh._utc_day(fixed_at)
+    n = len(r.creates())
+    # inside the rollout window: held (counts toward HELD_FILE_AFTER), not skipped as a same-day duplicate
+    seen = 1793177310.0  # 08:48:30Z
+    held = sh.file_defect({**d, "at": seen}, store=store, m="live", runner=r, now=seen + 60, cfg=HUB, budget_fn=OPEN)
+    assert held.get("held") == 1, held
+    # after the window, still the same UTC day: a recurrence card
+    late = fixed_at + sh.DEPLOY_GRACE_HOURS * 3600 + 600
+    assert sh._utc_day(late) == sh._utc_day(fixed_at)
+    out = sh.file_defect({**d, "at": late}, store=store, m="live", runner=r, now=late + 60, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "filed" and out["key"] == f"selfheal:{fp}:r2", out
+    assert len(r.creates()) == n + 1 and "(came back)" in r.creates()[-1][r.creates()[-1].index("create") + 1]
+    # and the day cap still holds for that new open card
+    again = sh.file_defect({**d, "at": late + 300}, store=store, m="live", runner=r, now=late + 360, cfg=HUB,
+                           budget_fn=OPEN)
+    assert again["action"] == "skip" and len(r.creates()) == n + 1
+
+
 # ── budget ──
 def test_over_the_dollar_cap_defers_evidence_without_creating_a_card(store):
     r = Runner()

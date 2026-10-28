@@ -1164,7 +1164,7 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
         return {"action": "skip", "why": "suppressed (Never)"}
     if (st.get("snooze_until") or 0) > now:
         return {"action": "skip", "why": f"snoozed until {_iso(st['snooze_until'])} (Not now)"}
-    if st.get("filed_day") == _utc_day(now):
+    if st.get("filed_day") == _utc_day(now) and status != "fixed":  # a post-fix recurrence is not a duplicate
         return {"action": "skip", "why": "already filed today (<= 1 per fingerprint per UTC day)"}
     if status in ("filed", "proposed", "approved"):
         return {"action": "skip", "why": f"open: {status} {st.get('fix_card') or st.get('card') or ''}".strip()}
