@@ -40,6 +40,9 @@ Kanban dispatcher (per run, decided at claim time):
 6. Title or body matches a `kanban.default_model_keep_patterns` regex (case-insensitive): profile model.
 7. Otherwise `kanban.default_model` (+ `kanban.default_provider` if set).
 
+When `kanban.strong_model` is set, steps 4–6 run on it instead of on the profile model
+([kanban-strong-tier.md](kanban-strong-tier.md), patches 0541 0542).
+
 The pin is set on the in-memory claimed task only, so the card row never changes and every run re-decides.
 
 ## How it works

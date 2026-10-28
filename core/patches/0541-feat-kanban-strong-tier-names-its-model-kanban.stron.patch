@@ -1,0 +1,183 @@
+From 69d5c4fca1b5f6037e2b33e0c4ebb8e7c883766e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 16:29:36 -0700
+Subject: [PATCH] feat(kanban): strong tier names its model
+ (kanban.strong_model / strong_provider) [daveey]
+
+Review-lane, retry-after-failure and keep-pattern cards ran on the profile's
+model, so a change of the profile default (Oct 24) silently moved every
+strong-tier run with it. With kanban.strong_model set they run on that model
+(provider from strong_provider, else inferred). Unset keeps the old behaviour;
+card pins and out-of-scope profiles are unchanged.
+---
+ hermes_cli/config_defaults.py               |   6 ++
+ hermes_cli/kanban_model_tier.py             |  14 ++-
+ tests/hermes_cli/test_kanban_strong_tier.py | 107 ++++++++++++++++++++
+ 3 files changed, 124 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_strong_tier.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 556f4c2606..71a5ab1bd0 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1978,6 +1978,12 @@ DEFAULT_CONFIG = {
+         "default_provider": "",
+         "default_model_profiles": [],
+         "default_model_keep_patterns": [],
++        # Strong tier [daveey]: the model (+ optional provider; "" = inferred from the model) that
++        # review-lane, retry-after-failure and keep-pattern cards run on while default_model is set.
++        # "" = the old behaviour (the profile's own model, or class:deep with a class default), which
++        # silently followed every change of the profile's default model.
++        "strong_model": "",
++        "strong_provider": "",
+         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 8efa6465a0..f2e5ca4a0d 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -12,6 +12,9 @@ and a later run re-decides. Cards keep the profile's model when:
+ * its title/body matches one of ``kanban.default_model_keep_patterns`` (case-insensitive regexes);
+ * its assignee is not in ``kanban.default_model_profiles`` (empty = every profile).
+ 
++``kanban.strong_model`` (+ optional ``kanban.strong_provider``, else inferred from the model) names the model
++those review/retry/keep-pattern cards run on instead of the profile's model; unset keeps the old behaviour.
++
+ Unset ``kanban.default_model`` (the default) = upstream behaviour: every card runs on its profile's model.
+ With a class default, review/retry/keep-pattern work explicitly requests ``class:deep`` rather than
+ inheriting a potentially weaker profile default. Explicit card pins and out-of-scope profiles are unchanged.
+@@ -93,9 +96,14 @@ def resolve_model_tier(
+     # Class defaults opt into class-preserving routing. Strong work must not
+     # fall back to a profile that may itself now default to standard/fast.
+     from agent.model_routing import is_class_selector
+-    strong: tuple[Optional[str], Optional[str]] = (
+-        ("class:deep", "auto") if is_class_selector(default_model) else (None, None)
+-    )
++    strong_model = _str(cfg.get("strong_model"))
++    strong: tuple[Optional[str], Optional[str]]
++    if strong_model:
++        # An explicit strong tier names its model, so review/retry work no longer follows whatever the
++        # profile's default happens to be (a profile switch once moved 558 strong runs to a GPT).
++        strong = (strong_model, _str(cfg.get("strong_provider")) or infer_provider(strong_model))
++    else:
++        strong = ("class:deep", "auto") if is_class_selector(default_model) else (None, None)
+     if lane == "review" or REVIEW_SKILL in (getattr(task, "skills", None) or []):
+         return *strong, "review"
+     try:
+diff --git a/tests/hermes_cli/test_kanban_strong_tier.py b/tests/hermes_cli/test_kanban_strong_tier.py
+new file mode 100644
+index 0000000000..711233f371
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_strong_tier.py
+@@ -0,0 +1,107 @@
++"""Kanban strong tier names its model (kanban.strong_model / strong_provider) [daveey].
++
++Review-lane, retry-after-failure and keep-pattern cards used to run on "the profile's model", so a change of
++the profile default silently moved every strong run with it. With ``strong_model`` set they run on that model;
++unset keeps the old behaviour. Entry paths: resolve_model_tier for each branch, and the dispatcher's
++``model_tier`` event plus the claimed task's pin for a review-lane card.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_model_tier as tier
++
++SONNET, OPUS = "claude-sonnet-5-5", "claude-opus-5-5"
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++def _cfg(**extra):
++    return {"default_model": SONNET, "default_provider": "anthropic", **extra}
++
++
++def _fail_once(conn, tid):
++    kb.claim_task(conn, tid)
++    conn.execute("UPDATE task_runs SET status='crashed', outcome='crashed', ended_at=1 WHERE task_id=?", (tid,))
++    conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL "
++                 "WHERE id=?", (tid,))
++    conn.commit()
++
++
++def test_strong_model_for_review_retry_and_keep_pattern(board):
++    cfg = _cfg(strong_model=OPUS, strong_provider="anthropic", default_model_keep_patterns=["hermes-core-wt"])
++    with kbc.connect() as conn:
++        review = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default"))
++        retry_id = kb.create_task(conn, title="flaky fix", assignee="default")
++        _fail_once(conn, retry_id)
++        retry = kb.get_task(conn, retry_id)
++        keep = kb.get_task(conn, kb.create_task(conn, title="x", body="build in hermes-core-wt", assignee="default"))
++        plain = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
++        got_review = tier.resolve_model_tier(conn, review, lane="review", cfg=cfg)
++        got_retry = tier.resolve_model_tier(conn, retry, lane="ready", cfg=cfg)
++        got_keep = tier.resolve_model_tier(conn, keep, lane="ready", cfg=cfg)
++        got_plain = tier.resolve_model_tier(conn, plain, lane="ready", cfg=cfg)
++    assert got_review == (OPUS, "anthropic", "review")
++    assert got_retry == (OPUS, "anthropic", "retry_after_run_crashed")
++    assert got_keep == (OPUS, "anthropic", "pattern:hermes-core-wt")
++    assert got_plain == (SONNET, "anthropic", "default")
++
++
++def test_strong_provider_unset_is_inferred_from_strong_model(board):
++    with kbc.connect() as conn:
++        t = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default"))
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg=_cfg(strong_model=OPUS)) == (
++            OPUS, "anthropic", "review")
++
++
++def test_strong_model_unset_keeps_old_behaviour(board):
++    with kbc.connect() as conn:
++        t = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default"))
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg=_cfg(strong_model="")) == (None, None, "review")
++        assert tier.resolve_model_tier(conn, t, lane="review", cfg={"default_model": "class:standard"})[:2] == (
++            "class:deep", "auto")
++
++
++def test_pins_and_out_of_scope_profiles_ignore_strong_model(board):
++    cfg = _cfg(strong_model=OPUS, default_model_profiles=["default"])
++    with kbc.connect() as conn:
++        pinned = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="default", model_override=SONNET))
++        other = kb.get_task(conn, kb.create_task(conn, title="impl", assignee="bb-dev"))
++        assert tier.resolve_model_tier(conn, pinned, lane="review", cfg=cfg) == (None, None, "pinned")
++        assert tier.resolve_model_tier(conn, other, lane="review", cfg=cfg) == (None, None, "profile_out_of_scope")
++
++
++def test_dispatcher_review_lane_runs_on_strong_model_and_records_it(board):
++    board.joinpath("config.yaml").write_text(
++        "kanban:\n" + "".join(f"  {k}: {json.dumps(v)}\n" for k, v in _cfg(strong_model=OPUS).items()),
++        encoding="utf-8")
++    seen = {}
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="impl", assignee="default")
++        kb.claim_task(conn, tid)
++        kb.request_review(conn, tid, summary="done, please review")
++        kbd.dispatch_once(conn, dry_run=False,
++                          spawn_fn=lambda task, ws: seen.__setitem__(task.id, (task.model_override,
++                                                                               task.provider_override)))
++        events = [e.payload for e in kb.list_events(conn, tid) if e.kind == "model_tier"]
++    assert seen[tid] == (OPUS, "anthropic")
++    assert events[-1]["reason"] == "review" and events[-1]["model"] == OPUS
+-- 
+2.54.0 (Apple Git-157)
+
