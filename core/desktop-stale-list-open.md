@@ -1,6 +1,6 @@
 # A stale-list row still opens and names its connection
 
-Patch: 0529. Fixes a gap in the offline fallback ([hub-sync-replica.md](hub-sync-replica.md),
+Patches: 0585 (feature), 0586–0588 (tests and CI fixes that landed with it in daveey/hermes#126). Fixes a gap in the offline fallback ([hub-sync-replica.md](hub-sync-replica.md),
 [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md)) found on 2026-10-27.
 
 ## Why

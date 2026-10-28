@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [desktop-stale-list-open.md](desktop-stale-list-open.md) | 0585–0588 | A sidebar row kept from a failed session list (busy local backend) still opens live, and the notice and tooltip name its connection as "not responding" instead of "its gateway is offline … never synced"; replica rows of unreachable gateways are unchanged. |
 | [kanban-default-placement.md](kanban-default-placement.md) | 0565 0567 0569 0572 | `kanban.placement.route` (e.g. `{macbook: hub}`): a `kanban_create` card with no local-only need is created on the target through `hermes-hub create-task`, bound to its origin chat; stays local for parents, projects, dir/worktree workspaces, uncarried options, local markers or a non-live target. `hub_cli_path()` finds `hermes-hub` without the login PATH. |
 | [sidebar-boot-snapshot.md](sidebar-boot-snapshot.md) | 0571 | Cold start paints the sidebar (every gateway's hub-replica rows and the last projects tree) from a snapshot Electron main reads before the backend is up; the CONNECTING overlay stays down; a failed replica read publishes nothing; `[sidebar-timing]` log line. |
 | [anthropic-pool-pin.md](anthropic-pool-pin.md) | 0573 | A session pinned to a credential-pool account keeps that account's token on every request (no swap back to an expired first entry); expired entries skipped by model-aware resolution; drift warning in 401 recovery. |
