@@ -12,6 +12,20 @@ if importlib.util.find_spec("ruamel") is not None:
 
 
 @pytest.fixture(autouse=True)
+def _isolated_worker_context(monkeypatch, tmp_path):
+    """Tests are not children of the worker running pytest, nor owners of its live board.
+
+    Clear inherited routing/identity pins before test fixtures apply their own values.
+    Keep HERMES_HOME alone: tests that need a full home already supply one.
+    """
+    for key in tuple(os.environ):
+        if key == "HERMES_DELEGATED_CHILD_CONTEXT" or key.startswith("HERMES_KANBAN_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+
+
+@pytest.fixture(autouse=True)
 def _no_dependency_sync_in_tmp_home(tmp_path):
     """Regression guard: a test basetemp must never hold a uv cache or a built environment."""
     yield

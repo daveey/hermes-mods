@@ -669,6 +669,15 @@ MODS="$HOME/code/hermes-mods"
 (cd "$CORE" && scripts/run_tests.sh -j 2 "$MODS/plugins/coach/tests")
 ```
 
+Tests clear inherited delegated-child and `HERMES_KANBAN_*` worker pins before
+fixtures run, and use a temporary fallback board (without changing `HERMES_HOME`).
+`test_worker_isolation.py` checks this in a subprocess with injected worker pins.
+Transport subprocesses retain managed `site-packages` paths, disable lazy installs,
+and still exclude worker identity and credentials; `test_transport_dependency_env.py`
+checks dependency import and identity isolation. The manager acceptance fixture
+checks four distinct callbacks (coach goal + compute envelope, ask-gate, and
+chat-closeout), including unload/reload and dispatch-order assertions.
+
 This uses the core's locked test dependencies and per-file isolation. Core-dependent
 tests and transport children use `hermes_yaml`, the runtime parser: PyYAML stopped
 being a core dependency in core commit `284dbaf537`. The Inbox action contract test

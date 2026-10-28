@@ -44,7 +44,12 @@ def isolated_env(home):
     import hermes_constants
     # Allowlist instead of inheriting hub credentials, card routes or proxy URLs.
     env = {k: os.environ[k] for k in ('PATH', 'PYTHONPATH', 'LANG', 'TZ') if k in os.environ}
-    env.update(PYTHONPATH=str(Path(hermes_constants.__file__).resolve().parent),
+    # Lazy core imports can add the managed dependency environment to sys.path
+    # without changing sys.executable. Children must see those same packages.
+    dependency_paths = [p for p in sys.path if p and 'site-packages' in Path(p).parts]
+    env.update(PYTHONPATH=os.pathsep.join([str(Path(hermes_constants.__file__).resolve().parent),
+                                         *dependency_paths]),
+               HERMES_DISABLE_LAZY_INSTALLS='1',
                HOME=str(home), HERMES_HOME=str(home), HERMES_RUNTIME_DIR=str(home / 'runtime'),
                OPENAI_API_KEY='local-test', COACH_LESSONS='0', COACH_REPLY_RULES='none',
                HERMES_VERIFY_ON_STOP='0', PYTHONUNBUFFERED='1', HERMES_TEST_ISOLATION='1')
@@ -112,6 +117,7 @@ def gateway_turn(frames, route, home):
 @pytest.mark.parametrize('route', ['cli', 'stdio', 'ws'])
 @pytest.mark.parametrize('case', ['abandoned', 'analysis', 'stop'])
 def test_guard_over_transport(tmp_path, route, case):
+    pytest.importorskip('dotenv', reason='transport subprocess needs optional core CLI dependency python-dotenv')
     home = tmp_path / 'home'
     env = isolated_env(home)
     stderr = home / 'stderr.log'
