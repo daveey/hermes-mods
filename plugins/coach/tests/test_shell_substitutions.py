@@ -1,5 +1,6 @@
 """Shell substitution boundaries must distinguish executable code from quoted data."""
 import importlib.util
+import time
 from pathlib import Path
 
 import pytest
@@ -74,3 +75,43 @@ def test_deep_unbalanced_substitutions_do_not_raise(prefix):
     masked = rules._mask_quoted(command)
     assert len(masked) == len(command)
     assert ">" not in masked
+
+
+def test_mask_quoted_many_nested_quotes_is_not_quadratic():
+    """SHELL_RUNNER_RE used to scan the whole prefix on every quote (~13s at 5000 reps)."""
+    command = 'echo "$(a "b" c)" ' * 5000
+    started = time.perf_counter()
+    masked = rules._mask_quoted(command)
+    elapsed = time.perf_counter() - started
+    assert len(masked) == len(command)
+    assert elapsed < 1.0, f"_mask_quoted took {elapsed:.2f}s on a {len(command)}-byte command"
+
+
+def test_long_prefix_still_scans_shell_runner_scripts_and_masks_quoted_data():
+    filler = 'echo "$(a "b" c)" ' * 200
+    quoted = filler + 'echo "select 1 where a >= 2"'
+    masked = rules._mask_quoted(quoted)
+    assert len(masked) == len(quoted)
+    assert ">=" not in masked[len(filler):]
+    script = filler + "bash -c 'date > out.txt'"
+    scanned = rules._mask_quoted(script)
+    assert "date > out.txt" in scanned
+
+
+def test_bounded_runner_tail_keeps_a_separator_at_the_window_edge():
+    """A 64-char window that starts on the separator before the runner still counts."""
+    token = "zsh" + " -" + ("c" * 58)
+    assert len(token) == 63
+    command = "echo " + token + " 'date > out.txt'"
+    assert "date > out.txt" in rules._mask_quoted(command)
+
+
+def test_bounded_runner_tail_does_not_split_a_longer_word():
+    """A tail that starts on 'bash' must not treat a longer token as a runner."""
+    token = "bash" + " -" + ("c" * 58)
+    assert len(token) == 64
+    command = "not" + token + " 'date > out.txt'"
+    masked = rules._mask_quoted(command)
+    assert ">" not in masked
+    real = "echo;" + token + " 'date > out.txt'"
+    assert "date > out.txt" in rules._mask_quoted(real)

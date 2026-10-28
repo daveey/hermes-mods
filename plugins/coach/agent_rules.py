@@ -432,7 +432,38 @@ def _inside(p: str, root: str) -> bool:
 
 HEREDOC_RE = re.compile(r"""<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1""")
 SHELL_RUNNER_RE = re.compile(r"""(?:^|[\s;&|(])(?:(?:ba|z|da)?sh|eval)(?:\s+-\w*c\w*)?\s*$""")
+# Runner word plus one -*c* flag. The pattern is end-anchored, so searching the
+# whole prefix on every quote is quadratic in command length.
+_SHELL_RUNNER_TAIL = 64
+_SHELL_WS = re.compile(r"\s")
+_SHELL_RUNNER_SEP = re.compile(r"[\s;&|(]")
 HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME\b")
+
+
+def _prefix_is_shell_runner(cmd: str, start: int) -> bool:
+    """True when SHELL_RUNNER_RE matches cmd[:start], inspecting only the suffix.
+
+    The pattern is end-anchored, so the whole prefix does not need to be scanned.
+    Trailing whitespace is skipped first (it is the pattern's trailing space), then
+    only a bounded tail is tested. A match that begins on a sliced boundary is
+    kept when that boundary is a separator, or when the character just before
+    the slice is a separator. Otherwise the slice cut a longer word.
+    """
+    i = start
+    while i > 0 and _SHELL_WS.match(cmd[i - 1]):
+        i -= 1
+    lo = max(0, i - _SHELL_RUNNER_TAIL)
+    match = SHELL_RUNNER_RE.search(cmd[lo:i])
+    if match is None:
+        return False
+    if lo == 0 or match.start() > 0:
+        return True
+    # The match starts on the sliced boundary. A separator there is real. A
+    # start-anchor match is real only when the character just before the slice
+    # is a separator; otherwise the slice cut a longer word (notbash -> bash).
+    if _SHELL_RUNNER_SEP.match(cmd[lo]):
+        return True
+    return _SHELL_RUNNER_SEP.match(cmd[lo - 1]) is not None
 
 
 def _strip_heredocs(cmd: str) -> str:
@@ -491,7 +522,7 @@ def _mask_quoted(cmd: str) -> str:
                 end = i + 1
                 body = cmd[start + 1:i]
                 # Preserve the existing single-token path and shell-script exceptions.
-                if SHELL_RUNNER_RE.search(cmd[:start]):
+                if _prefix_is_shell_runner(cmd, start):
                     # Scan the script independently: its outer quotes are transport syntax.
                     out[start + 1:i] = _mask_quoted(body)
                 elif not re.search(r"[\s><;&|()`\\]", body):
