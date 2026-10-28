@@ -77,7 +77,8 @@ def create_router(service_factory=None):
     @router.get('/inventory')
     def inventory(session_id: str='', profile: str='', gateway_id: str='', refresh: bool=False):
         svc = factory()
-        return svc.inventory(session_id=session_id,profile=profile,gateway_id=gateway_id,refresh=refresh)
+        svc.start_refresh(force=refresh)
+        return svc.inventory(session_id=session_id,profile=profile,gateway_id=gateway_id,refresh=False)
 
     def change(action, body):
         try:

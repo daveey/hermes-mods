@@ -92,6 +92,7 @@ def test_empty_gateway_resolves_persistent_identity_and_rejects_foreign_binding(
     app = FastAPI()
     app.include_router(api_module().create_router(lambda: service))
     client = TestClient(app)
+    service.inventory(refresh=True)
     data = client.get('/inventory?refresh=true').json()
     gateway = data['gateway_id']
     assert gateway

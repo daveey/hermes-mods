@@ -44,6 +44,38 @@ def _split(v: Optional[str]):
     return [x.strip() for x in (v or "").split(",") if x.strip()]
 
 
+# Desktop polls these every few seconds and times out at 4s. One slow sqlite+JSON
+# decode must not make every overlapping poll wait it out: return the last snapshot
+# for this key while a refresh is in flight.
+_snapshots: Dict[Any, Any] = {}
+_flights: Dict[Any, asyncio.Task] = {}
+_POLL_WAIT_S = 0.75
+
+
+async def _poll(key, fn):
+    flight = _flights.get(key)
+    last = _snapshots.get(key)
+    if flight is not None and not flight.done():
+        return last if last is not None else await flight
+
+    async def run():
+        try:
+            result = await asyncio.to_thread(fn)
+            _snapshots[key] = result
+            return result
+        finally:
+            _flights.pop(key, None)
+
+    task = asyncio.create_task(run())
+    _flights[key] = task
+    if last is None:
+        return await task
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=_POLL_WAIT_S)
+    except asyncio.TimeoutError:
+        return last
+
+
 @router.get("/ping")
 async def ping() -> Dict[str, Any]:
     return {"ok": True, "api": 1}
@@ -51,47 +83,57 @@ async def ping() -> Dict[str, Any]:
 
 @router.get("/status")
 async def get_status() -> Dict[str, Any]:
-    return await asyncio.to_thread(_hv().status)
+    return await _poll("status", lambda: _hv().status())
 
 
 @router.get("/sessions")
 async def get_sessions(gateway: Optional[str] = None, exclude: Optional[str] = None, archived: int = 0,
                        limit: int = 500) -> Dict[str, Any]:
-    return await asyncio.to_thread(_hv().sessions, gateway, _split(exclude), bool(archived), limit)
+    excluded = _split(exclude)
+    key = ("sessions", gateway, tuple(excluded), bool(archived), limit)
+    return await _poll(key, lambda: _hv().sessions(gateway, excluded, bool(archived), limit))
 
 
 @router.get("/inbox")
 async def get_inbox(gateway: Optional[str] = None, exclude: Optional[str] = None, all: int = 0) -> Dict[str, Any]:  # noqa: A002
-    return await asyncio.to_thread(_hv().inbox, gateway, _split(exclude), bool(all))
+    excluded = _split(exclude)
+    key = ("inbox", gateway, tuple(excluded), bool(all))
+    return await _poll(key, lambda: _hv().inbox(gateway, excluded, bool(all)))
 
 
 @router.get("/projects")
 async def get_projects(gateway: Optional[str] = None, exclude: Optional[str] = None, preview_limit: int = 3) -> Dict[str, Any]:
-    return await asyncio.to_thread(_hv().projects, gateway, _split(exclude), max(0, min(preview_limit, 50)))
+    excluded = _split(exclude)
+    preview = max(0, min(preview_limit, 50))
+    key = ("projects", gateway, tuple(excluded), preview)
+    return await _poll(key, lambda: _hv().projects(gateway, excluded, preview))
 
 
 @router.get("/tasks")
 async def get_tasks(gateway: Optional[str] = None, exclude: Optional[str] = None, board: Optional[str] = None,
                     all: int = 0) -> Dict[str, Any]:  # noqa: A002
-    return await asyncio.to_thread(_hv().tasks, gateway, _split(exclude), board, bool(all))
+    excluded = _split(exclude)
+    key = ("tasks", gateway, tuple(excluded), board, bool(all))
+    return await _poll(key, lambda: _hv().tasks(gateway, excluded, board, bool(all)))
 
 
 @router.get("/where/{session_id}")
 async def get_where(session_id: str) -> Dict[str, Any]:
-    return await asyncio.to_thread(_hv().where, session_id)
+    return await _poll(("where", session_id), lambda: _hv().where(session_id))
 
 
 @router.get("/session-links/{session_id}")
 async def get_session_links(session_id: str, ids: Optional[str] = None, all: int = 0,
                             origin_gateway: Optional[str] = None,
                             origin_profile: Optional[str] = None) -> Dict[str, Any]:  # noqa: A002
-    return await asyncio.to_thread(_hv().session_links, [session_id] + _split(ids), bool(all),
-                                   origin_gateway, origin_profile)
+    id_list = [session_id] + _split(ids)
+    key = ("session-links", tuple(id_list), bool(all), origin_gateway, origin_profile)
+    return await _poll(key, lambda: _hv().session_links(id_list, bool(all), origin_gateway, origin_profile))
 
 
 @router.get("/requests")
 async def get_requests(limit: int = 50) -> Dict[str, Any]:
-    return await asyncio.to_thread(_hv().requests, limit)
+    return await _poll(("requests", limit), lambda: _hv().requests(limit))
 
 
 @router.post("/request")

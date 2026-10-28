@@ -310,24 +310,63 @@ class InventoryService:
             self.adapters[provider] = collect
             self._last_refresh = None
 
-    def _refresh_if_due(self, force):
+    def _claim_refresh(self, force):
+        """Acquire the refresh lock and return the adapters to collect, or None if not due.
+
+        The caller owns the lock when this returns a list (including an empty one).
+        """
         if not self._refresh_lock.acquire(blocking=False):
-            return
-        try:
-            with self._lock:
-                if self._last_refresh is not None and self._clock() - self._last_refresh < (2 if force else 30):
-                    return
-                adapters = list(self.adapters.items())
-                self._refreshing = bool(adapters)
-            try:
-                for provider, collect in adapters:
-                    self._refresh(provider, collect)
-            finally:
-                with self._lock:
-                    self._refreshing = False
-                    self._last_refresh = self._clock()
-        finally:
+            return None
+        with self._lock:
+            if self._last_refresh is not None and self._clock() - self._last_refresh < (2 if force else 30):
+                self._refresh_lock.release()
+                return None
+            adapters = list(self.adapters.items())
+            if not adapters:
+                self._refreshing = False
+                self._last_refresh = self._clock()
+                empty = True
+            else:
+                self._refreshing = True
+                empty = False
+        if empty:
             self._refresh_lock.release()
+            return None
+        return adapters
+
+    def _finish_refresh(self, adapters):
+        try:
+            for provider, collect in adapters:
+                self._refresh(provider, collect)
+        finally:
+            with self._lock:
+                self._refreshing = False
+                self._last_refresh = self._clock()
+            self._refresh_lock.release()
+
+    def start_refresh(self, force=False):
+        """Start a due refresh on a daemon thread. The caller does not wait.
+
+        Desktop polls GET /inventory and times out at 15-30s when the request
+        thread runs the cloud collect. The poll gets the current snapshot;
+        ``refreshing`` stays true until the thread finishes.
+        """
+        adapters = self._claim_refresh(force)
+        if not adapters:
+            if adapters is not None:
+                self._refresh_lock.release()
+            return
+        self._refresh_thread = threading.Thread(
+            target=self._finish_refresh, args=(adapters,), daemon=True, name="inventory-refresh")
+        self._refresh_thread.start()
+
+    def _refresh_if_due(self, force):
+        adapters = self._claim_refresh(force)
+        if not adapters:
+            if adapters is not None:
+                self._refresh_lock.release()
+            return
+        self._finish_refresh(adapters)
 
     def inventory(self, session_id='', profile='', gateway_id='', refresh=False):
         self._refresh_if_due(refresh)

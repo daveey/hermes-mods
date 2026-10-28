@@ -23,6 +23,7 @@ def test_rest_inventory_and_registry_only_bindings(tmp_path):
     app.include_router(api.create_router(lambda:service), prefix='/api/plugins/compute-rentals')
     client = TestClient(app)
     base = '/api/plugins/compute-rentals'
+    service.inventory(refresh=True)
     data = client.get(base+'/inventory?refresh=true').json()
     body = dict(machine_key=data['machines'][0]['key'], gateway_id=service.gateway_id, profile='p', session_id='s')
     assert client.post(base+'/bindings', json=body).status_code == 200
@@ -68,3 +69,28 @@ def test_plugin_tools_use_trusted_session_and_explicit_other_identity(tmp_path, 
     assert attached['ownership'] == [dict(gateway_id=service.gateway_id,profile='p',session_id='trusted')]
     assert json.loads(ctx.tools['compute_rentals_detach']['handler'](args,session_id='trusted'))['ownership'] == []
     assert 'error' in json.loads(ctx.tools['compute_rentals_attach']['handler'](dict(args,profile='')))
+
+
+def test_inventory_get_does_not_wait_for_collect(tmp_path):
+    import threading
+    started = threading.Event()
+    release = threading.Event()
+
+    def collect():
+        started.set()
+        release.wait(10)
+        return result([machine()])
+
+    service = load('inventory').InventoryService(tmp_path, providers=('vast',))
+    service.register_adapter('vast', collect)
+    app = FastAPI()
+    app.include_router(api_module().create_router(lambda: service))
+    client = TestClient(app)
+    data = client.get('/inventory?refresh=true').json()
+    assert started.wait(2)
+    assert not release.is_set()
+    assert data['providers'][0]['status'] == 'loading'
+    assert data['machines'] == []
+    release.set()
+    service._refresh_thread.join(5)
+
