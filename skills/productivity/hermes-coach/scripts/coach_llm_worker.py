@@ -23,11 +23,61 @@ Codex wire: the ChatGPT Codex endpoint rejects max_output_tokens, so there the c
 is closed (stop_reason "max_tokens") once the streamed output exceeds 4 chars per allowed token. Routes that accept
 max_output_tokens (api.openai.com) get it on the wire. No tools, no retries (max_retries=0), no reasoning field sent.
 The price op returns the price table's rates; a subscription ("included-route") model prices at $0.
+
+Transcript calls (model-bench, coach_model_bench.py): a "call" may carry "messages" (neutral transcript: {"role":
+"user"|"assistant"|"tool", "content", "tool_calls": [{"id", "name", "arguments"}], "tool_call_id"}) instead of "user",
+and "tools" (OpenAI function schemas). They go on the wire as real tool_use/tool_result blocks (Anthropic) or
+function_call/function_call_output items (Codex), the tools are DECLARED, and the reply carries "tool_calls"
+[{"name", "arguments"}] next to "text": the model may keep acting instead of having to end the turn with text. Tool
+calls are never executed. Anthropic: cache breakpoints on the system block and the last message (a repeat is a cache
+read). Still exactly one request per call.
 """
 import json
 import os
 import re
 import sys
+
+
+_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _tool_input(args):
+    try:
+        v = json.loads(args) if isinstance(args, str) else args
+    except ValueError:
+        v = None
+    return v if isinstance(v, dict) else {"raw": str(args)}
+
+
+def codex_input(msgs):
+    """Neutral transcript -> Responses input items (function_call / function_call_output pairs kept matched)."""
+    out, open_ids = [], []
+    for m in msgs:
+        role = m.get("role")
+        if role == "tool":
+            cid = str(m.get("tool_call_id") or "")
+            if cid in open_ids:
+                open_ids.remove(cid)
+                out.append({"type": "function_call_output", "call_id": cid, "output": str(m.get("content") or "(empty)")})
+            continue
+        for cid in open_ids:
+            out.append({"type": "function_call_output", "call_id": cid, "output": "(no result recorded)"})
+        open_ids.clear()
+        if role == "user":
+            out.append({"role": "user", "content": [{"type": "input_text", "text": str(m.get("content") or "")}]})
+        elif role == "assistant":
+            if (m.get("content") or "").strip():
+                out.append({"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": m["content"]}]})
+            for i, tc in enumerate(m.get("tool_calls") or []):
+                cid = str(tc.get("id") or f"call_{len(out)}_{i}")
+                args = tc.get("arguments")
+                out.append({"type": "function_call", "call_id": cid, "name": tc["name"],
+                            "arguments": args if isinstance(args, str) else json.dumps(args or {})})
+                open_ids.append(cid)
+    for cid in open_ids:
+        out.append({"type": "function_call_output", "call_id": cid, "output": "(no result recorded)"})
+    return out
 
 
 def _reply(obj):
@@ -63,6 +113,9 @@ class AnthropicBackend:
         return _price_reply(self.get_price(model, self.provider, self.base_url), self.prefix) \
             or {"error": f"no price for {model}"}
 
+    def _call_transcript(self, req, system, extra):
+        return _anthropic_transcript(self, req, system, extra)
+
     def call(self, req):
         client, prefix, no_think_alias = self.client, self.prefix, self.no_think_alias
         system = []
@@ -70,6 +123,8 @@ class AnthropicBackend:
             system.append({"type": "text", "text": prefix})
         system.append({"type": "text", "text": req["system"], "cache_control": {"type": "ephemeral"}})
         extra = {"thinking": req["thinking"]} if req.get("thinking") else {}
+        if req.get("messages") is not None:
+            return self._call_transcript(req, system, extra)
         if extra and no_think_alias.get(req["model"]):
             extra = {"thinking": no_think_alias[req["model"]]}
         try:
@@ -90,6 +145,52 @@ class AnthropicBackend:
             "input_tokens": u.input_tokens or 0, "output_tokens": u.output_tokens or 0,
             "cache_write_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
             "cache_read_tokens": getattr(u, "cache_read_input_tokens", 0) or 0}}
+
+
+def openai_messages(system, msgs):
+    """Neutral transcript -> the OpenAI-chat message list Hermes keeps internally (system first)."""
+    out = [{"role": "system", "content": system}]
+    for m in msgs:
+        if m.get("role") == "assistant":
+            a = {"role": "assistant", "content": m.get("content") or ""}
+            if m.get("tool_calls"):
+                a["tool_calls"] = [{"id": tc.get("id"), "type": "function",
+                                    "function": {"name": tc["name"], "arguments": tc.get("arguments") if isinstance(
+                                        tc.get("arguments"), str) else json.dumps(tc.get("arguments") or {})}}
+                                   for tc in m["tool_calls"]]
+            out.append(a)
+        elif m.get("role") == "tool":
+            out.append({"role": "tool", "tool_call_id": m.get("tool_call_id"), "content": m.get("content") or ""})
+        else:
+            out.append({"role": "user", "content": m.get("content") or ""})
+    return out
+
+
+def _anthropic_transcript(self, req, system, extra):
+    """A transcript call built by Hermes's own Anthropic request builder (agent.anthropic_adapter), the same code a
+    live session uses: tool/message conversion, the OAuth Claude Code transforms (system prefix, tool-name wire
+    aliases; without them the subscription route answers 400 "third-party apps draw from extra usage") and Hermes's
+    prompt-cache layout. No reasoning_config: the model's default thinking, which counts against max_tokens."""
+    from agent.anthropic_adapter import build_anthropic_kwargs
+    from agent.prompt_caching import apply_anthropic_cache_control
+    msgs = openai_messages(req["system"], req["messages"])
+    msgs = apply_anthropic_cache_control(msgs, native_anthropic=True)
+    kw = build_anthropic_kwargs(req["model"], msgs, req.get("tools") or None, int(req["max_tokens"]), None,
+                                is_oauth=bool(self.prefix), base_url=self.base_url)
+    resp = self.client.messages.create(**kw)
+    text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text")
+    rev = {"chat_history_lookup": "session_search", "context_notes": "memory"}
+
+    def name(n):
+        n = n[len("mcp__"):] if n.startswith("mcp__") else n
+        return rev.get(n, n)
+    calls = [{"name": name(getattr(b, "name", "")), "arguments": json.dumps(getattr(b, "input", {}) or {})}
+             for b in resp.content if getattr(b, "type", "") == "tool_use"]
+    u = resp.usage
+    return {"text": text, "tool_calls": calls, "stop_reason": resp.stop_reason, "usage": {
+        "input_tokens": u.input_tokens or 0, "output_tokens": u.output_tokens or 0,
+        "cache_write_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_tokens": getattr(u, "cache_read_input_tokens", 0) or 0}}
 
 
 def _item_texts(item):
@@ -115,16 +216,28 @@ class CodexBackend:
         max_tokens = int(req["max_tokens"])
         kw = {"model": req["model"], "instructions": req["system"], "store": False, "stream": True,
               "input": [{"role": "user", "content": [{"type": "input_text", "text": req["user"]}]}]}
+        if req.get("messages") is not None:
+            kw["input"] = codex_input(req["messages"])
+            if req.get("tools"):
+                kw["tools"] = [{"type": "function", "name": t["function"]["name"],
+                                "description": (t["function"].get("description") or "")[:4000],
+                                "parameters": t["function"].get("parameters") or {"type": "object", "properties": {}}}
+                               for t in req["tools"]]
+                kw["tool_choice"] = "auto"
         if not self.chatgpt_backend:  # the ChatGPT Codex endpoint 400s on max_output_tokens
             kw["max_output_tokens"] = max_tokens
         stream = self.client.responses.create(**kw)
-        parts, done, chars, usage, stop, seen = [], [], 0, {}, "end_turn", {}
+        parts, done, chars, usage, stop, seen, calls = [], [], 0, {}, "end_turn", {}, []
         try:
             for ev in stream:
                 t = _get(ev, "type", "")
                 seen[t] = seen.get(t, 0) + 1
                 if t == "response.output_item.done":  # the final message, for streams that carry no text deltas
-                    done += _item_texts(_get(ev, "item", {}))
+                    item = _get(ev, "item", {})
+                    done += _item_texts(item)
+                    if _get(item, "type", "") == "function_call":
+                        calls.append({"name": _get(item, "name", ""), "arguments": _get(item, "arguments", "") or ""})
+                        chars += len(calls[-1]["arguments"])
                 if t == "response.output_text.delta":
                     d = _get(ev, "delta", "")
                     parts.append(d)
@@ -141,6 +254,9 @@ class CodexBackend:
                     if not done:
                         for it in _get(r, "output", None) or []:
                             done += _item_texts(it)
+                    if not calls:
+                        calls = [{"name": _get(it, "name", ""), "arguments": _get(it, "arguments", "") or ""}
+                                 for it in _get(r, "output", None) or [] if _get(it, "type", "") == "function_call"]
                     u = _get(r, "usage", {})
                     cached = int(_get(_get(u, "input_tokens_details", {}), "cached_tokens", 0) or 0)
                     usage = {"input_tokens": max(0, int(_get(u, "input_tokens", 0) or 0) - cached),
@@ -166,7 +282,10 @@ class CodexBackend:
         if not text.strip() and stop == "end_turn" and os.environ.get("COACH_WORKER_DEBUG_FILE"):
             with open(os.environ["COACH_WORKER_DEBUG_FILE"], "a") as fh:
                 fh.write(json.dumps({"empty_reply_events": seen, "usage": usage}) + "\n")
-        return {"text": "" if stop == "refusal" else text, "stop_reason": stop, "usage": usage}
+        out = {"text": "" if stop == "refusal" else text, "stop_reason": stop, "usage": usage}
+        if req.get("messages") is not None:
+            out["tool_calls"] = calls
+        return out
 
 
 def build_backend(provider):

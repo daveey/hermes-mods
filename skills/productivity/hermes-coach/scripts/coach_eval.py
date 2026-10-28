@@ -48,11 +48,11 @@ Two modes. Both print a markdown report (or JSON with --json) and exit 0 on PASS
              mandatory; smoke, partial and legacy reports cannot PASS or pool.
 
 bench-v2 (report-only): `coach_eval.py bench-build --v2 ~/.hermes/kanban/evidence/report-only/eval_set.jsonl` writes
-eval/bench-v2.jsonl (15 human-question report_only episodes + 15 controls; patterns report_only, control). The
-model gate for shared-config.json `model.default` / `model.provider` changes (hermes-sync) needs a fresh complete
-report for the new model:
-  coach_eval.py behavior --candidate eval/candidates/none.json --bench eval/bench-v2.jsonl --target report_only \
-      --model <new model> --out eval/reports/<date>-<model>-bench-v2.md      (COACH_EVAL_PROVIDER=<provider>)
+eval/bench-v2.jsonl (15 human-question report_only episodes + 15 controls; patterns report_only, control). bench-v2
+does NOT separate models (Opus and gpt-6-astra scored the same on it while live they differ 8% vs 63%): its replay
+has no tool results and no declared tools. The hermes-sync model gate uses bench-v3 instead: coach_model_bench.py
+(real turns rebuilt from state.db with tool results, declared tools, the report-only rubric; candidate compared with
+the incumbent model).
 
 Roots (env): COACH_DATA (~/code/hermes-coach-data; benchmark = eval/bench-v1.jsonl, reports = eval/reports/),
 COACH_SETS (~/.hermes/coach; replyset/, fixloop/), COACH_MODS (~/code/hermes-mods), HERMES_HOME (~/.hermes),

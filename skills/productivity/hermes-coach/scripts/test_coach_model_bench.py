@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""coach_model_bench.py + coach_llm_worker transcript wire, offline (no provider calls).
+Run: python3 -m unittest test_coach_model_bench.py   (from this directory)"""
+import json
+import os
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import coach_eval as ce  # noqa: E402
+import coach_llm_worker as w  # noqa: E402
+import coach_model_bench as mb  # noqa: E402
+
+MSGS = [{"role": "user", "content": "why is the badge wrong?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "name": "terminal", "arguments": "{\"command\": \"ls\"}"},
+                                                             {"id": "call_1", "name": "read_file", "arguments": "{}"}]},
+        {"role": "tool", "tool_call_id": "call_0", "content": "a b"}]
+
+
+class Wire(unittest.TestCase):
+    def test_codex_input_pairs_every_call_with_an_output(self):
+        items = w.codex_input(MSGS)
+        calls = [i["call_id"] for i in items if i.get("type") == "function_call"]
+        outs = [i["call_id"] for i in items if i.get("type") == "function_call_output"]
+        self.assertEqual(sorted(calls), sorted(outs))  # call_1 had no recorded result: a stub output is added
+        self.assertEqual(items[0]["role"], "user")
+
+    def test_openai_messages_keep_tool_calls_and_results(self):
+        m = w.openai_messages("SYS", MSGS)
+        self.assertEqual(m[0], {"role": "system", "content": "SYS"})
+        self.assertEqual([c["function"]["name"] for c in m[2]["tool_calls"]], ["terminal", "read_file"])
+        self.assertEqual(m[3]["role"], "tool")
+
+
+class FakeRunner:
+    """Offline runner: a transcript replay calls one tool on its first step, then ends with text; the rubric judge
+    labels every reply that mentions 'broken' report_only and the rest started; controls all pass."""
+    offline_only = True
+    max_cost_usd = 0.0
+
+    def __init__(self, stop_text):
+        self.stop_text, self.calls = stop_text, []
+
+    def __call__(self, prompt, **kw):
+        self.calls.append(prompt)
+        if isinstance(prompt, dict) and "messages" in prompt:
+            assert prompt["tools"], "tools must be declared"
+            if prompt["messages"][-1]["role"] != "tool":
+                return "", {"tool_calls": [{"name": "terminal", "arguments": "{}"}]}
+            assert mb.STUB_RESULT in prompt["messages"][-1]["content"]
+            return self.stop_text, {}
+        if isinstance(prompt, dict):  # rubric judge
+            ids = re.findall(r"### id: (\w+)", prompt["user"])
+            return json.dumps([{"id": i, "outcome": "report_only" if "broken" in prompt["user"].split(f"### id: {i}")[1].split("### id:")[0] else "started"}
+                               for i in ids]), {}
+        if prompt.startswith(ce.JUDGE_SYS):
+            ids = re.findall(r"=== ITEM id=(\w+)", prompt)
+            return json.dumps([{"id": i, "pass": 1, "why": "ok"} for i in ids]), {}
+        return "-> terminal(fix)\nDone.", {}
+
+
+class Run(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(os.path.realpath(tempfile.mkdtemp()))
+        os.environ["COACH_DATA"] = str(self.tmp / "data")
+        (self.tmp / "data").mkdir()
+        live = self.tmp / "live"
+        (live / "memories").mkdir(parents=True)
+        (live / "config.yaml").write_text("model: {}\n")
+        self.live = live
+        eps = [{"id": "_meta", "pattern": "_meta", "tools": [{"type": "function", "function": {"name": "terminal", "parameters": {}}}]}]
+        for i in range(3):
+            eps.append({"id": f"report_only:{i}", "pattern": "report_only", "kind": "transcript", "context_model": "astra",
+                        "user_ask": "why?", "orig_tools": {"terminal": 1}, "messages": MSGS[:1]})
+        eps.append({"id": "control:0", "pattern": "control", "kind": "reply", "user_ask": "do x", "tool_log": [],
+                    "label": "fine", "expected": "act", "original_reply": "ok"})
+        self.bench = self.tmp / "bench.jsonl"
+        self.bench.write_text("".join(json.dumps(e) + "\n" for e in eps))
+
+    def run_with(self, text):
+        return mb.run(self.bench, "m", repeats=2, runner=FakeRunner(text), root=self.tmp / "root", live=self.live,
+                      log=lambda *_: None, replies_path=self.tmp / "replies.jsonl")
+
+    def test_a_model_that_stops_at_the_diagnosis_scores_high(self):
+        r = self.run_with("It is still broken; the owner has it.")
+        ro = r["by_pattern"]["report_only"]
+        self.assertTrue(r["complete"])
+        self.assertEqual((ro["n"], ro["fail"], ro["acted"]), (6, 6, 6))
+        self.assertEqual(r["by_pattern"]["control"], dict(r["by_pattern"]["control"], n=2, **{"pass": 2}))
+        self.assertGreater(ro["ci95"][0], 0.5)
+
+    def test_a_model_that_acts_scores_low_and_the_reply_cache_is_reused(self):
+        r = self.run_with("Fixed it and started a card.")
+        self.assertEqual(r["by_pattern"]["report_only"]["fail"], 0)
+        again = FakeRunner("It is still broken")
+        r2 = mb.run(self.bench, "m", repeats=2, runner=again, root=self.tmp / "root", live=self.live,
+                    log=lambda *_: None, replies_path=self.tmp / "replies.jsonl")
+        self.assertFalse([p for p in again.calls if isinstance(p, dict) and "messages" in p])  # no new replays
+        self.assertEqual(r2["by_pattern"]["report_only"]["fail"], 0)
+
+    def test_wilson(self):
+        lo, hi = mb.wilson(36, 57)
+        self.assertTrue(lo < 36 / 57 < hi)
+        self.assertEqual(mb.wilson(0, 0), (0.0, 1.0))
+
+
+if __name__ == "__main__":
+    unittest.main()
