@@ -18,11 +18,16 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
    The marker lives inside git's own per-worktree dir, so it is never committed and it goes away with the worktree.
    Because the hook reads git's state rather than parsing the shell, `for b in ...; do git worktree add ...; done`
    fan-outs and trees nested inside a card's scratch workspace are covered. Attribution guard: a tree is claimed
-   only if its directory name appears in the command or code, or, for `terminal` only, a shell loop (`for`, `while`,
-   `xargs`, `parallel`) builds the paths from `$` variables. A tree that another agent creates in the same seconds is
-   not claimed.
+   only on evidence that this call made it. Either its directory name appears in the command or code as a whole path
+   component (`session-outcome` is not named by `session-outcome-desktop`), or, for `terminal` only, the command
+   builds paths from `$` variables and the tree lies under a literal prefix the command spells out: a partial name
+   (`~/code/wt-$b`, a `mktemp -d .../base.XXXX` template) or a bare directory (`~/code/_wt/$b`) only when that
+   directory is the card's own workspace. Overlapping in time is never enough: on 2026-10-29 a card's long
+   `D=$(mktemp ...); git worktree add $D ...; for i in 1 2; ...` test command claimed two trees a Claude Code session
+   created in `~/code/_wt` meanwhile (via `hermes-core-wt new`, whose command text has no `worktree add`), and the
+   card's teardown removed them. A tree with no such evidence stays unowned (`SKIP` line) and is left to the GC.
 2. **Teardown.** Only a successful `kanban_complete` result for the worker's own task and run can start cleanup. A writer reservation on the exact worker board protects verification and removal: the task must be `done`, its current run cleared, and its latest run must match the worker and have ended `done/completed`. Missing, failed, rejected, foreign-board/task, stale-run and review results do nothing. Markers carry the canonical board DB and run ID; ambiguous legacy markers are preserved.
-   Active child dependencies (even before workspace assignment), open-card workspace overlaps on that board and live process cwd paths preserve trees. Clean, pushed trees are removed without force, retaining their branches. Simple dirty/untracked/unpushed linked trees nested in the completed scratch workspace are archived before removal: a self-contained verified `unpushed.bundle`, binary `uncommitted.diff`, readable `untracked.tar.gz`, and `meta.json`. Archive failure preserves the source. Recover with `git clone <archive>/unpushed.bundle <restore>`, `git -C <restore> apply <archive>/uncommitted.diff` when present, then extract the untracked archive there.
+   Active child dependencies (even before workspace assignment), open-card workspace overlaps on that board and live process cwd paths preserve trees. Clean, pushed trees are removed without force, retaining their branches. A tree with uncommitted/untracked changes or a HEAD on no remote is never removed by a card's cleanup, whatever it is registered to and wherever it lives (nested scratch trees included; core preserves Git-bearing scratch): it logs `KEEP ... ; mac-worktree-gc archives it after 7 idle days`. A wrong marker can therefore never cost unsaved work.
    Staged changes, git-ignored files, nested Git entries, symlinks, special files and scan uncertainty are conservatively preserved, not force-removed. Rebuildable caches are the one exception: `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `node_modules`, `*.egg-info` and any directory holding a `CACHEDIR.TAG` do not keep a tree (and the symlink scan does not descend into them); any other ignored file (`.env`, notes) still does. A host adds repo-specific build/test artifacts as globs in `<HERMES_HOME>/worktree-owner.json` `"disposable_ignored"` (matched per path component and per leading relative path, e.g. `["test_durations.json", ".hermes/bin"]`); a collapsed ignored dir counts only if every file under it matches. Symlinks committed to the repo (mode 120000) don't keep a tree either. Trees outside scratch with unsaved work remain for explicit owner cleanup or an independently verified backstop.
    **Deferred teardown (sweep).** The completion hook runs once, in the completing worker, and must decline while a
    child card is still open or a process still works in a tree; cards closed from the CLI/REST never run it at all.
@@ -101,7 +106,7 @@ New sessions and Kanban workers load it. Sessions that are already open keep run
 python3 -B -m unittest discover -s plugins/worktree-owner/tests
 ```
 
-Stdlib unit suite: 64 tests using disposable Git repos and boards, including actual archive recovery and staged-version preservation. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
+Stdlib unit suite: 74 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
 
 Bootstrapped runtime integration (requires a core checkout with scratch preservation, and on Linux an existing noninteractive readlink grant for non-dumpable processes):
 
@@ -109,4 +114,4 @@ Bootstrapped runtime integration (requires a core checkout with scratch preserva
 hermes --run-module cProfile -o /dev/null "$PWD/plugins/worktree-owner/tests/runtime_fixture.py" /absolute/path/to/patched/core
 ```
 
-The fixture creates a disposable profile, discovers the actual plugin, selects its registered callback, uses real Kanban tool completion for clean/dirty/untracked/unpushed nested worktrees, verifies rejection preservation and post-success ordering, and performs a real Linux process scan without stubbing it. No production board transitions. This proves the candidate code; deployment must separately verify the default runtime contains the prerequisite core commit.
+The fixture creates a disposable profile, discovers the actual plugin, selects its registered callback, uses real Kanban tool completion for clean/dirty/untracked/unpushed nested worktrees (only the clean one is removed), verifies rejection preservation and post-success ordering, and performs a real Linux process scan without stubbing it. No production board transitions. This proves the candidate code; deployment must separately verify the default runtime contains the prerequisite core commit.

@@ -40,7 +40,6 @@ with tempfile.TemporaryDirectory(prefix='owner-runtime-') as tmp:
     assert len(hooks) == 1
     hook = hooks[0]
     m.LOG = root / 'owner.log'
-    m.ARCHIVE = root / 'archives'
     print('DISCOVERY', json.dumps({'module': m.__file__, 'hooks': plugin.hooks_registered}))
     paths = m.live_cwds()
     assert os.getcwd() in paths
@@ -96,7 +95,9 @@ with tempfile.TemporaryDirectory(prefix='owner-runtime-') as tmp:
             assert json.loads(result).get('ok') is True, result
             assert tree.exists(), 'core deleted tree before post-tool hook'
             hook(tool_name='kanban_complete', args=args, result=result)
-            assert not tree.exists(), m.LOG.read_text()
-            assert str(tree) not in git(repo, 'worktree', 'list')
-            print('ACTUAL_TOOL_AND_REGISTERED_HOOK', json.dumps({'state': state, 'rejection_kept': True, 'core_preserved': True, 'hook_removed': True, 'run_type': type(json.loads(result)['run_id']).__name__}))
+            # Only the clean, pushed tree may go; dirty/untracked/unpushed work is never removed by a card's cleanup.
+            removed = state == 'clean'
+            assert tree.exists() != removed, m.LOG.read_text()
+            assert (str(tree) in git(repo, 'worktree', 'list')) != removed
+            print('ACTUAL_TOOL_AND_REGISTERED_HOOK', json.dumps({'state': state, 'rejection_kept': True, 'core_preserved': True, 'hook_removed': removed, 'run_type': type(json.loads(result)['run_id']).__name__}))
     print('PASS: no real boards or worktrees modified')

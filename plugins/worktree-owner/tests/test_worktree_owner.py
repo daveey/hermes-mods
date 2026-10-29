@@ -241,17 +241,99 @@ class Owner(unittest.TestCase):
         res = self.m.on_tool_call("kanban_complete", {}, env=env)
         self.assertTrue(p.exists()); self.assertIn("live process", res[0]["action"])
 
-    def test_dirty_tree_nested_in_scratch_is_archived_before_the_scratch_is_deleted(self):
-        # the dispatcher rmtrees a scratch workspace on completion; a dirty nested tree must be saved first
+    def test_dirty_or_unpushed_trees_are_never_removed_by_a_card_cleanup(self):
+        # Acceptance: whatever a tree is registered to, and even nested in the card's scratch workspace, a card's
+        # cleanup never deletes uncommitted/untracked work or commits that are on no remote.
         ws = self.tmp / "kanban" / "workspaces" / "t_hhhh8888"; ws.mkdir(parents=True)
         env = {"HERMES_KANBAN_TASK": "t_hhhh8888", "HERMES_KANBAN_WORKSPACE": str(ws)}
-        p = self.make(ws / "repo", "bnest", env); (p / "wip.txt").write_text("unsaved\n")
-        self.m.ARCHIVE = self.tmp / "archive"
+        dirty = self.make(ws / "repo", "bnest", env); (dirty / "wip.txt").write_text("unsaved\n")
+        tracked = self.make(ws / "repo2", "bnest2", env); (tracked / "a.txt").write_text("edited\n")
+        unpushed = self.make(self.code / "proj-unp2", "bunp2", env)
+        (unpushed / "c.txt").write_text("c\n"); git(unpushed, "add", "c.txt"); git(unpushed, "commit", "-qm", "c")
+        head = git(unpushed, "rev-parse", "HEAD").strip()
+        # a tree some other session made, wrongly registered to this card (the 2026-10-29 12:47 failure mode)
+        foreign = self.code / "proj-foreign-wip"
+        git(self.repo, "worktree", "add", "-q", "-b", "bfw", str(foreign), "origin/main")
+        gd = Path(git(foreign, "rev-parse", "--absolute-git-dir").strip())
+        (gd / self.m.MARKER).write_text(json.dumps(dict(self.marker(dirty), path=str(foreign))))
+        (foreign / "notes.md").write_text("live work\n")
         res = self.m.on_tool_call("kanban_complete", {}, env=env)
-        self.assertEqual(res[0]["action"], "archived+removed")
-        arch = list(self.m.ARCHIVE.iterdir())[0]
-        self.assertTrue((arch / "untracked.tar.gz").exists())
-        self.assertNotIn(str(p), git(self.repo, "worktree", "list"))
+        acts = {Path(r["path"]).name: r["action"] for r in res}
+        for p, name in ((dirty, "repo"), (tracked, "repo2"), (unpushed, "proj-unp2"), (foreign, "proj-foreign-wip")):
+            self.assertTrue(p.exists(), p)
+            self.assertIn(str(p), git(self.repo, "worktree", "list"))
+            self.assertTrue(acts[name].startswith("kept: "), acts)
+        self.assertEqual((dirty / "wip.txt").read_text(), "unsaved\n")
+        self.assertEqual((tracked / "a.txt").read_text(), "edited\n")
+        self.assertEqual((foreign / "notes.md").read_text(), "live work\n")
+        self.assertEqual(git(unpushed, "rev-parse", "HEAD").strip(), head)
+        self.assertEqual(acts["proj-unp2"], "kept: HEAD not on any remote")
+        self.assertNotIn("REMOVED", self.m.LOG.read_text())
+
+    def test_card_command_running_while_another_process_creates_worktrees_claims_only_its_own(self):
+        # Regression for 2026-10-29 12:47: card t_01a189246eec9e00 ran a long terminal command
+        # (`D=$(mktemp -d .../base.XXXX); git worktree add $D ...; for i in 1 2; do ...; done`). Meanwhile a Claude Code
+        # session ran `hermes-core-wt new session-outcome-desktop` (no `worktree add` in ITS command text, so its own
+        # hook claimed nothing). The card's hook claimed both new ~/code/_wt trees, and the card's teardown removed them.
+        scratch = self.tmp / "scratch"; scratch.mkdir()
+        wt = self.code / "_wt"; wt.mkdir()
+        card_cmd = (f"cd {self.repo} && D=$(mktemp -d {scratch}/base.XXXX); git worktree add -q --detach $D HEAD && "
+                    f"for i in 1 2 3 4; do sleep 0.5; done; echo $D")
+        env = {"HERMES_KANBAN_TASK": "t_01a189246eec9e00", "HERMES_SESSION_ID": "20261029_124305_d82208"}
+        t0 = time.time()
+        card = subprocess.Popen(["bash", "-c", card_cmd], stdout=subprocess.PIPE, text=True, env=ENV)
+        time.sleep(0.7)  # the card's command is mid-run when the other process creates its trees
+        for name in ("session-outcome", "session-outcome-desktop"):
+            subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", f"wt/{name}", str(wt / name),
+                            "origin/main"], check=True, env=ENV, capture_output=True)
+        own = Path(card.communicate(timeout=60)[0].strip())
+        self.assertEqual(card.returncode, 0)
+        self.assertTrue(own.name.startswith("base."), own)
+        self.m.on_tool_call("terminal", {"command": card_cmd}, duration_ms=int((time.time() - t0) * 1000) + 50,
+                            env=env)
+        self.assertEqual(self.marker(own)["task_id"], "t_01a189246eec9e00")
+        for name in ("session-outcome", "session-outcome-desktop"):
+            self.assertIsNone(self.marker(wt / name), name)
+            self.assertIn(f"SKIP {wt / name}", self.m.LOG.read_text())
+        self.m.on_tool_call("kanban_complete", {}, env=env)
+        for name in ("session-outcome", "session-outcome-desktop"):
+            self.assertTrue((wt / name).exists(), name)
+        self.assertFalse(own.exists())  # the card's own clean tree is still torn down
+
+    def test_loop_over_a_shared_directory_does_not_claim_a_foreign_tree_in_it(self):
+        # `for b in $(cat list); do git worktree add ~/code/_wt/$b; done`: the names come from elsewhere, so only the
+        # directory is spelled out. A shared directory is not evidence; the card's own workspace is.
+        wt = self.code / "_wt"; wt.mkdir()
+        ws = self.tmp / "kanban" / "workspaces" / "t_jjjj0000"; ws.mkdir(parents=True)
+        env = {"HERMES_KANBAN_TASK": "t_jjjj0000", "HERMES_KANBAN_WORKSPACE": str(ws)}
+        t0 = time.time()
+        git(self.repo, "worktree", "add", "-q", "-b", "bshared", str(wt / "lane-x"), "origin/main")  # mine (unnamed)
+        git(self.repo, "worktree", "add", "-q", "-b", "bforeign2", str(wt / "other-agent"), "origin/main")
+        git(self.repo, "worktree", "add", "-q", "-b", "bws", str(ws / "lane-y"), "origin/main")
+        cmd = f"for b in $(cat lanes.txt); do git worktree add {wt}/$b origin/main; git worktree add {ws}/$b; done"
+        self.m.on_tool_call("terminal", {"command": cmd}, duration_ms=int((time.time() - t0) * 1000) + 50, env=env)
+        self.assertIsNone(self.marker(wt / "other-agent"))
+        self.assertIsNone(self.marker(wt / "lane-x"))  # left unowned rather than risk a foreign claim
+        self.assertEqual(self.marker(ws / "lane-y")["task_id"], "t_jjjj0000")
+
+    def test_partial_name_prefix_claims_fanout_but_not_a_lookalike_name(self):
+        t0 = time.time()
+        for b in ("p1", "p2"):
+            git(self.repo, "worktree", "add", "-q", "-b", f"wtp/{b}", str(self.code / f"wtp-{b}"), "origin/main")
+        git(self.repo, "worktree", "add", "-q", "-b", "bwtq", str(self.code / "wtq-other"), "origin/main")
+        cmd = f"for b in $(seq_names); do git worktree add {self.code}/wtp-$b; done"
+        self.m.on_tool_call("terminal", {"command": cmd}, duration_ms=int((time.time() - t0) * 1000) + 50,
+                            env={"HERMES_KANBAN_TASK": "t_kkkk1111"})
+        self.assertEqual(self.marker(self.code / "wtp-p1")["task_id"], "t_kkkk1111")
+        self.assertEqual(self.marker(self.code / "wtp-p2")["task_id"], "t_kkkk1111")
+        self.assertIsNone(self.marker(self.code / "wtq-other"))
+
+    def test_a_name_inside_a_longer_name_is_not_a_claim(self):
+        t0 = time.time()
+        git(self.repo, "worktree", "add", "-q", "-b", "bso", str(self.code / "session-outcome"), "origin/main")
+        self.m.on_tool_call("terminal", {"command": f"git worktree add {self.code}/session-outcome-desktop main"},
+                            duration_ms=int((time.time() - t0) * 1000) + 50, env={"HERMES_KANBAN_TASK": "t_llll2222"})
+        self.assertIsNone(self.marker(self.code / "session-outcome"))
 
     def test_execute_code_with_braces_does_not_claim_unnamed_trees(self):
         t0 = time.time()

@@ -21,7 +21,6 @@ class Lifecycle(unittest.TestCase):
         self.root = Path(tmp.name)
         self.m = load()
         self.m.LOG = self.root / 'log'
-        self.m.ARCHIVE = self.root / 'archive'
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         git(self.repo, 'init', '-q')
@@ -132,23 +131,22 @@ class Lifecycle(unittest.TestCase):
         self.m.on_tool_call('terminal', {'command': 'ssh example.com "git worktree add tree"'}, env=self.env)
         self.assertFalse((gd / self.m.MARKER).exists())
 
-    def test_recovery_self_contained(self):
+    def test_dirty_unpushed_scratch_tree_is_kept_intact(self):
+        # Formerly archived and force-removed; a card's cleanup now never deletes work that exists nowhere else.
         (self.tree / 'a').write_text('commit')
         git(self.tree, 'commit', '-qam', 'local')
         head = git(self.tree, 'rev-parse', 'HEAD').strip()
         (self.tree / 'a').write_text('dirty')
         (self.tree / 'untracked').write_text('unsaved')
         result = self.call(self.result)
-        self.assertEqual(result[0]['action'], 'archived+removed')
-        archive = Path(result[0]['archive'])
-        restored = self.root / 'restored'
-        git(self.root, 'clone', str(archive / 'unpushed.bundle'), str(restored))
-        self.assertEqual(git(restored, 'rev-parse', 'HEAD').strip(), head)
-        subprocess.run(['git', '-C', str(restored), 'apply', str(archive / 'uncommitted.diff')], check=True)
-        with tarfile.open(archive / 'untracked.tar.gz') as tar:
-            tar.extractall(restored, filter='data')
-        self.assertEqual((restored / 'a').read_text(), 'dirty')
-        self.assertEqual((restored / 'untracked').read_text(), 'unsaved')
+        self.assertEqual(result[0]['action'], 'kept: uncommitted/untracked changes')
+        self.assertEqual(git(self.tree, 'rev-parse', 'HEAD').strip(), head)
+        self.assertEqual((self.tree / 'a').read_text(), 'dirty')
+        self.assertEqual((self.tree / 'untracked').read_text(), 'unsaved')
+        (self.tree / 'untracked').unlink()
+        git(self.tree, 'checkout', '-q', 'a')
+        self.assertEqual(self.call(self.result)[0]['action'], 'kept: HEAD not on any remote')
+        self.assertTrue(self.tree.exists())
 
     def _commit_ignore(self, patterns):
         """Commit a .gitignore on the tree's branch and 'push' it, so the tree is clean and on a remote."""
@@ -272,12 +270,6 @@ class Lifecycle(unittest.TestCase):
         self.call(self.result)
         self.assertTrue(self.tree.exists())
         self.assertEqual(git(self.tree, 'show', ':a').strip(), 'staged version')
-
-    def test_archive_failure_keeps_data(self):
-        (self.tree / 'wip').write_text('valuable')
-        with patch.object(self.m, '_archive', side_effect=OSError('disk full')):
-            self.call(self.result)
-        self.assertEqual((self.tree / 'wip').read_text(), 'valuable')
 
     # --- deferred teardown: trees the completion hook had to keep are reaped once the card settles ---
 
