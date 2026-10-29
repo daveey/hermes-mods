@@ -202,6 +202,37 @@ class CgroupProcessPort:
                     found.add(int(name))
         return sorted(found)
 
+    def _cgroup_pids(self, control_group):
+        pids = set()
+        if control_group:
+            _require(control_group.startswith('/') and '..' not in control_group, 'invalid_cgroup')
+            base = os.path.join(self.cgroup_root, control_group.lstrip('/'))
+            if os.path.isdir(base):
+                for dirpath, _dirs, files in os.walk(base):
+                    if 'cgroup.procs' in files:
+                        with open(os.path.join(dirpath, 'cgroup.procs')) as f:
+                            pids.update(int(line) for line in f if line.strip())
+        return pids
+
+    def residual(self, control_group, runner_root=None):
+        """Every process still in the unit's cgroup, plus any process running from the runner root.
+
+        An inactive unit must have none: KillMode=process leaves run-helper.sh and Runner.Listener behind.
+        """
+        found = self._cgroup_pids(control_group)
+        if runner_root:
+            prefix = runner_root.rstrip('/').encode() + b'/'
+            for name in os.listdir(self.proc_root):
+                if not name.isdigit():
+                    continue
+                try:
+                    cmd = self._cmdline(name)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                if prefix in cmd:
+                    found.add(int(name))
+        return sorted(found)
+
 
 def _urllib_transport(url, headers, timeout):
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -368,6 +399,14 @@ class Engine:
             raise Refusal('activity_unknown', 'local worker-process state could not be determined') from None
         return 'present' if found else 'absent'
 
+    def _residual(self, target, props):
+        try:
+            found = self.processes.residual(props.get('ControlGroup') or None, **(
+                dict(runner_root=target['runner_root']) if target.get('runner_root') else {}))
+        except Exception:  # noqa: BLE001 - unknown local activity always refuses
+            raise Refusal('activity_unknown', 'residual unit process state could not be determined') from None
+        return 'present' if found else 'absent'
+
     @staticmethod
     def _service(props):
         return dict(unit=props.get('Id'), active_state=props.get('ActiveState'), sub_state=props.get('SubState'),
@@ -379,7 +418,12 @@ class Engine:
             workers = self._workers(target, props)
         except Refusal:
             workers = 'unknown'
+        try:
+            residual = self._residual(target, props)
+        except Refusal:
+            residual = 'unknown'
         data = dict(operation=op, target_id=target['id'], service=self._service(props), local_workers=workers,
+                    residual_processes=residual,
                     untrusted=dict(description=untrusted(props.get('Description', ''))), observed_at=self.clock(),
                     restart='disabled', restart_reason=QUIESCE_EXPLANATION)
         if evidence:
@@ -392,6 +436,10 @@ class Engine:
             raise Refusal('service_active_restart_disabled', QUIESCE_EXPLANATION)
         if self._workers(target, props) == 'present':
             raise Refusal('local_worker_present', 'a Runner.Worker process exists for this runner')
+        if self._residual(target, props) == 'present':
+            raise Refusal('residual_unit_processes',
+                          'the unit is inactive but processes remain in its cgroup or runner root (e.g. KillMode=process '
+                          'left Runner.Listener running); a start would run a second listener. Not starting.')
         try:
             gh = self.github.runner(target['github'])
         except Exception:  # noqa: BLE001
@@ -402,7 +450,10 @@ class Engine:
             raise Refusal('activity_stale', 'provider activity observation is not fresh')
         if gh['busy']:
             raise Refusal('runner_busy', 'provider reports this runner busy')
-        pre = dict(service=self._service(props), local_workers='absent',
+        if gh['status'] == 'online':
+            raise Refusal('provider_online_unit_inactive',
+                          'provider reports this runner online while its unit is inactive: another listener holds it')
+        pre = dict(service=self._service(props), local_workers='absent', residual_processes='absent',
                    github=dict(status=gh['status'], busy=False, fresh=True))
         self._last_mutation[target['id']] = self.clock()
         self.systemd.start(target['unit'])

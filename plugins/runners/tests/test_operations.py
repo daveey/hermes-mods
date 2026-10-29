@@ -70,13 +70,19 @@ class FakeGitHub:
 
 
 class FakeProcesses:
-    def __init__(self, workers=(), error=None):
+    def __init__(self, workers=(), error=None, residual=(), residual_error=None):
         self.workers_found, self.error = list(workers), error
+        self.residual_found, self.residual_error = list(residual), residual_error
 
-    def workers(self, control_group):
+    def workers(self, control_group, runner_root=None):
         if self.error:
             raise self.error
         return self.workers_found
+
+    def residual(self, control_group, runner_root=None):
+        if self.residual_error:
+            raise self.residual_error
+        return self.residual_found
 
 
 def engine(pol=None, systemd=None, github=None, processes=None, tmp_path=None, **kw):
@@ -155,6 +161,56 @@ def test_start_refused_on_local_worker_or_unknown_process_state(tmp_path, proces
     systemd = FakeSystemd()
     refused(engine(systemd=systemd, processes=processes, tmp_path=tmp_path).handle(request(), peer_uid=1000), code)
     assert systemd.started == []
+
+
+@pytest.mark.parametrize('processes, code', [
+    # KillMode=process leaves run-helper.sh + Runner.Listener in the cgroup of an inactive unit:
+    # a start would run a second listener beside the orphan (live canary, 2026-10-28).
+    (FakeProcesses(residual=[1479590, 1479596]), 'residual_unit_processes'),
+    (FakeProcesses(residual_error=PermissionError('cgroup')), 'activity_unknown'),
+])
+def test_start_refused_when_inactive_unit_left_processes(tmp_path, processes, code):
+    systemd = FakeSystemd(state='inactive')
+    result = refused(engine(systemd=systemd, processes=processes, tmp_path=tmp_path).handle(request(), peer_uid=1000), code)
+    assert systemd.started == []
+    if code == 'residual_unit_processes':
+        assert 'KillMode' in result['detail']
+
+
+def test_start_refused_when_provider_online_but_unit_inactive(tmp_path):
+    # A listener outside the unit (or not yet disconnected) still holds the registration.
+    systemd, github = FakeSystemd(state='inactive'), FakeGitHub(status='online', busy=False)
+    refused(engine(systemd=systemd, github=github, tmp_path=tmp_path).handle(request(), peer_uid=1000),
+            'provider_online_unit_inactive')
+    assert systemd.started == []
+
+
+@pytest.mark.parametrize('processes, expected', [
+    (FakeProcesses(), 'absent'),
+    (FakeProcesses(residual=[11]), 'present'),
+    (FakeProcesses(residual_error=OSError('x')), 'unknown'),
+])
+def test_diagnose_reports_residual_unit_processes(tmp_path, processes, expected):
+    systemd = FakeSystemd(state='inactive')
+    result = engine(systemd=systemd, processes=processes, tmp_path=tmp_path).handle(request('diagnose'), peer_uid=1000)
+    assert result['ok'] is True
+    assert result['data']['residual_processes'] == expected
+    assert systemd.started == []
+
+
+def test_cgroup_port_residual_lists_every_process_in_unit_cgroup_and_runner_root(tmp_path):
+    cg = tmp_path / 'cg' / 'system.slice' / 'u.service'
+    cg.mkdir(parents=True)
+    (cg / 'cgroup.procs').write_text('101\n102\n')
+    proc = tmp_path / 'proc'
+    for pid, cmd in ((101, b'/bin/bash\0/r/1/run-helper.sh\0'), (102, b'/r/1/bin/Runner.Listener\0run\0'),
+                     (103, b'/r/1/bin/Runner.Listener\0run\0'), (104, b'/usr/bin/sleep\0')):
+        (proc / str(pid)).mkdir(parents=True)
+        (proc / str(pid) / 'cmdline').write_bytes(cmd)
+    port = ops.CgroupProcessPort(cgroup_root=str(tmp_path / 'cg'), proc_root=str(proc))
+    assert port.residual('/system.slice/u.service', runner_root='/r/1') == [101, 102, 103]
+    assert port.residual('/system.slice/u.service') == [101, 102]
+    assert port.residual(None) == []
 
 
 def test_wrong_host_refused(tmp_path):
