@@ -140,6 +140,24 @@ def host_load(snapshot, now_s):
     return out
 
 
+CATEGORIES = ('Macs', 'EC2 Linux', 'Metta', 'Ephemeral', 'Other')
+
+
+def category(name, ephemeral, labels):
+    """Panel group for a CI machine: Macs, EC2 Linux, Metta, Ephemeral (per-instance runners) or Other."""
+    low = {l.lower() for l in labels}
+    name = (name or '').lower()
+    if ephemeral:
+        return 'Ephemeral'
+    if name.startswith('metta'):
+        return 'Metta'
+    if 'macos' in low or 'mac' in name.replace('-', ' ').split() or 'mac-' in name or name.endswith('-mac'):
+        return 'Macs'
+    if name.startswith(('ec2-', 'hermes-hub')) or 'linux' in low:
+        return 'EC2 Linux'
+    return 'Other'
+
+
 def ci_workers(inventory, loads=None):
     """Group the collector inventory into machines; one GitHub runner = one slot.
 
@@ -163,6 +181,7 @@ def ci_workers(inventory, loads=None):
             g['warnings'].append(f"{row.get('display_name')}: "
                                  + (', '.join(f'{c} failed' for c in failed) if failed else 'a check failed'))
     for g in groups.values():
+        g['category'] = category(g['name'], g['ephemeral'], [l for s in g['slots'] for l in s['labels']])
         g['slots'].sort(key=lambda s: s['runner'] or '')
         common = set.intersection(*(set(s['labels']) for s in g['slots']))
         g['labels'] = sorted(l for l in common if l.lower() not in _PLATFORM and not _SLOT_LABEL.match(l))

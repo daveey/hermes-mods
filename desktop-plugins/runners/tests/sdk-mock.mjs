@@ -29,6 +29,7 @@ for (const key of [
   'DOMRect'
 ])
   globalThis[key] = dom.window[key]
+globalThis.localStorage = dom.window.localStorage
 Object.defineProperty(globalThis, 'navigator', {
   value: dom.window.navigator,
   configurable: true

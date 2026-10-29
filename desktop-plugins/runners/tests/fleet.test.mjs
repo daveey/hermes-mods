@@ -5,6 +5,8 @@ import assert from 'node:assert/strict'
 import { React, loadPlugin, mount, host, route } from './sdk-mock.mjs'
 
 const P = await loadPlugin()
+// These tests look at individual CI machines: start with every CI group expanded.
+localStorage.setItem('hermes-runners-ci-open', JSON.stringify(P.CI_GROUPS))
 const NOW = Date.parse('2026-10-28T23:00:00Z')
 
 const fleet = (over = {}) => ({

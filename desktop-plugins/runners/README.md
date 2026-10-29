@@ -15,6 +15,13 @@ Status-bar chip (order 6) and panel. Two groups, one row per machine, one square
   keys, owner/epoch checks, status reconciliation, and no prompt resend. Deregistered
   runners are history: only their count is shown. A failed readiness check is a ⚠ line, not a red slot.
 
+CI groups: CI machines are grouped by category (`fleet.category` on the gateway; the panel falls back to the same
+rule for older gateways): **Macs** (macOS label or `mac` in the name), **EC2 Linux** (`ec2-*`, `hermes-hub*`,
+other Linux), **Metta** (`metta*`), **Ephemeral** (per-instance runners), **Other**. Each group is one collapsed
+row: `▸ ● EC2 Linux (9) · 2 offline · ⚠ 1 … 5/14` (slots busy/total; dot red = a readiness warning, amber = some
+offline, green = all fine). Click to expand its machines as before; which groups are open is remembered in
+localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list.
+
 Load: each gateway machine reports CPU load, RAM in use and disk space to the Board every 30 s (core
 `hermes_cli/machine_metrics.py` → `POST /v2/machines/me/metrics`, returned by `GET /v2/machines`). The row
 shows `CPU 50% · RAM 61% · Disk 57 GB free` with small bars (CPU = 1-min load ÷ cores; a bar at 90 % or more is
@@ -72,6 +79,8 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
   `tests/hermes_cli/test_machine_metrics.py`, hermes-hub `worker/test/machines.test.ts`)
 - open panel updates in place, one request per poll, no polling while hidden: "open panel updates in place"
 
+- CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
+  `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`
 - Investigate: start / already running / queued / needs you / done / error / old host:
   `investigate.test.mjs`; route create with placement, reuse of open/blocked, restart after done, refusals,
   fleet rows carry the latest: `test_api.py` `test_investigation_route_*`, `test_fleet_rows_carry_their_latest_investigation`;

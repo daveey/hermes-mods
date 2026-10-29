@@ -75,6 +75,8 @@ def test_ci_runners_grouped_into_machines_with_one_slot_each():
     # A failed check is a warning on an idle slot, never a red machine.
     assert m['mac-mini']['slots'][0]['state'] == 'idle'
     assert m['mac-mini']['warnings'] == ['mac-mini: tool:xcode failed']
+    assert {k: g['category'] for k, g in m.items()} == {
+        'ec2-gwgen': 'EC2 Linux', 'metta4': 'Metta', 'asg-ci': 'Ephemeral', 'mac-mini': 'Macs'}
     stale = fleet.ci_workers(dict(meta=dict(freshness='stale'), data=inventory['data']))
     assert stale['state'] == 'stale'
     assert {s['state'] for g in stale['machines'] for s in g['slots']} == {'unknown'}
@@ -126,3 +128,16 @@ def test_ci_machines_take_load_from_collector_host_probes():
     m = {g['name']: g for g in fleet.ci_workers(inv, loads)['machines']}
     assert m['mac-mini']['load']['cpu_load1'] == 30.35
     assert m['ec2-x']['load'] is None
+
+
+def test_ci_machine_categories_for_the_panel_groups():
+    c = fleet.category
+    assert c('davids-mac-mini', False, ['self-hosted']) == 'Macs'
+    assert c('bb-sign', False, ['macOS']) == 'Macs'
+    assert c('ec2-f18cf3d2-stable', False, ['Linux']) == 'EC2 Linux'
+    assert c('hermes-hub-canary', False, []) == 'EC2 Linux'
+    assert c('metta-fabric-b200-1-gpu', False, ['Linux']) == 'Metta'
+    assert c('metta1-cogamer', False, ['Linux']) == 'Metta'
+    assert c('tfgar-probe', True, ['Linux']) == 'Ephemeral'
+    assert c('machine', False, ['self-hosted']) == 'Other'
+    assert c('macaroni-box', False, ['Linux']) == 'EC2 Linux'

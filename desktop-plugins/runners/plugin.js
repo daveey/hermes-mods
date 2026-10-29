@@ -585,6 +585,80 @@ function SlotRepair({ slot, route, repairClient, sourceError }) {
   )
 }
 
+export const CI_GROUPS = ['Macs', 'EC2 Linux', 'Metta', 'Ephemeral', 'Other']
+
+// Same rule as fleet.category on the gateway; used when an older gateway sends no category.
+export function ciCategory(m) {
+  if (CI_GROUPS.includes(m.category)) return m.category
+  const name = (m.name || '').toLowerCase()
+  const labels = new Set((m.slots || []).flatMap((s) => s.labels || []).map((l) => l.toLowerCase()))
+  if (m.ephemeral) return 'Ephemeral'
+  if (name.startsWith('metta')) return 'Metta'
+  if (labels.has('macos') || /(^|-)mac(-|$)/.test(name)) return 'Macs'
+  if (name.startsWith('ec2-') || name.startsWith('hermes-hub') || labels.has('linux')) return 'EC2 Linux'
+  return 'Other'
+}
+
+// CI machines -> one group per category with its capacity and health, in CI_GROUPS order.
+export function groupCi(machines) {
+  const by = new Map()
+  for (const m of machines) {
+    const k = ciCategory(m)
+    if (!by.has(k)) by.set(k, [])
+    by.get(k).push(m)
+  }
+  return CI_GROUPS.filter((k) => by.has(k)).map((name) => {
+    const list = by.get(name), slots = list.flatMap((m) => m.slots)
+    const busy = slots.filter((s) => s.state === 'busy').length
+    const offline = slots.filter((s) => s.state === 'offline').length
+    const warnings = list.reduce((n, m) => n + m.warnings.length, 0)
+    const cpus = list.map((m) => m.load?.cpu_load1).filter((v) => typeof v === 'number')
+    return {
+      name, machines: list, busy, total: slots.length, offline, warnings,
+      health: warnings ? 'bad' : offline ? 'warn' : 'good',
+      load1Max: cpus.length ? Math.max(...cpus) : null
+    }
+  })
+}
+
+const OPEN_KEY = 'hermes-runners-ci-open'
+function readOpen() {
+  try { return new Set(JSON.parse(globalThis.localStorage?.getItem(OPEN_KEY) || '[]')) } catch { return new Set() }
+}
+function writeOpen(set) {
+  try { globalThis.localStorage?.setItem(OPEN_KEY, JSON.stringify([...set])) } catch {}
+}
+
+function CiGroup({ g, open, onToggle, rowProps }) {
+  const health = { good: 'all online', warn: `${g.offline} offline`, bad: `${g.warnings} readiness warning${g.warnings > 1 ? 's' : ''}` }[g.health]
+  return h('div', { className: 'hermes-fleet-group', 'data-ci-group': g.name },
+    h('button', {
+      type: 'button', className: 'hermes-fleet-group-head', 'aria-expanded': open ? 'true' : 'false',
+      title: `${g.machines.length} machines · ${health}`, onClick: onToggle
+    },
+      h('span', { className: 'hermes-fleet-chev' }, open ? '▾' : '▸'),
+      h(StatusDot, { tone: g.health }),
+      h('span', { className: 'hermes-fleet-group-name' }, `${g.name} (${g.machines.length})`),
+      h('span', { className: 'hermes-fleet-group-meta' },
+        [g.offline ? `${g.offline} offline` : null, g.warnings ? `⚠ ${g.warnings}` : null,
+          g.load1Max != null ? `load ≤ ${g.load1Max}` : null].filter(Boolean).join(' · ')),
+      h('span', { className: 'hermes-fleet-count' }, `${g.busy}/${g.total}`)),
+    open ? g.machines.map((m) => h(CiRow, { key: m.name, m, ...rowProps })) : null)
+}
+
+function CiGroups({ view, now, repairClient }) {
+  const [open, setOpen] = useState(readOpen)
+  const toggle = (name) => setOpen((prev) => {
+    const next = new Set(prev)
+    next.has(name) ? next.delete(name) : next.add(name)
+    writeOpen(next)
+    return next
+  })
+  const rowProps = { now, repairClient, route: view.ci.route, sourceError: view.ci.error }
+  return groupCi(view.ci.machines).map((g) =>
+    h(CiGroup, { key: g.name, g, open: open.has(g.name), onToggle: () => toggle(g.name), rowProps }))
+}
+
 function SectionNote({ section }) {
   if (section.state === 'ready') return null
   const msg = {
@@ -608,9 +682,7 @@ export function Panel({ view, now, repairClient, investigator }) {
       h('span', null, 'CI workers (GitHub Actions)'),
       h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
     h(SectionNote, { section: view.ci }),
-    ...view.ci.machines.map((m) => h(CiRow, {
-      key: m.name, m, now, repairClient, route: view.ci.route, sourceError: view.ci.error
-    })),
+    h(CiGroups, { view, now, repairClient }),
     view.ci.hidden_deregistered
       ? h('div', { className: 'hermes-fleet-note' }, `${view.ci.hidden_deregistered} deregistered runners (history) hidden`)
       : null,
@@ -696,6 +768,12 @@ const CSS = `
 .hermes-fleet-bar>span{display:block;height:100%;background:var(--ui-text-secondary)}
 .hermes-fleet-bar.is-high>span{background:#d9822b}
 .hermes-fleet-warning{color:var(--ui-text-secondary)}
+.hermes-fleet-group-head{display:grid;grid-template-columns:12px 10px minmax(0,1fr) auto 44px;column-gap:6px;align-items:center;width:100%;min-height:22px;padding:0;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.hermes-fleet-group-head:hover{background:var(--chrome-action-hover)}
+.hermes-fleet-group-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hermes-fleet-group-meta{font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap}
+.hermes-fleet-chev{color:var(--ui-text-tertiary);font-size:10px}
+.hermes-fleet-group>.hermes-fleet-row{padding-left:18px}
 .hermes-fleet-inv{grid-column:2/4;display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-inv>button:first-child{font-size:11px;padding:0 6px;border:1px solid var(--ui-stroke-secondary);border-radius:4px;background:transparent;color:var(--ui-text-secondary);cursor:pointer}
 .hermes-fleet-inv>button:disabled{opacity:.55;cursor:default}
