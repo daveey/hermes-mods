@@ -136,3 +136,14 @@ def test_clean_survives_a_hanging_tool_and_still_removes_the_cache(c, tmp_path, 
     done = c.clean(apply=True)
     uv = next(a for a in done["actions"] if a["name"] == "uv cache")
     assert uv["exit"] == "timeout after 180 s" and uv["removed"] and not (tmp_path / ".cache/uv").exists()
+
+
+def test_report_no_du_never_walks_caches(c, monkeypatch, tmp_path):
+    """--no-du must not run du at all (it hung >180 s at load 70 on multi-GB caches)."""
+    (tmp_path / ".cache/uv").mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(c, "du_kb", lambda *a, **k: calls.append(a) or 1)
+    d = c.disk(with_du=False)
+    assert calls == []
+    assert d["cleanable"] and d["cleanable"][0]["gb"] is None
+    assert "largest_in_home" not in d

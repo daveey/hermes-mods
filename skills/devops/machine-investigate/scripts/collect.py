@@ -217,7 +217,9 @@ def disk(with_du: bool = True) -> dict:
     if MAC:
         snaps = subprocess.run(["tmutil", "listlocalsnapshots", "/"], capture_output=True, text=True).stdout
         out["apfs_local_snapshots"] = [l for l in snaps.splitlines() if "com.apple" in l]
-    out["cleanable"] = [dict(c, gb=round((du_kb(c["path"]) or 0) / 2**20, 2), path=str(c["path"]))
+    # With --no-du (CPU-only question) never walk the caches: at load > 40 each `du` of a big cache ran its
+    # full 240 s timeout and the report printed nothing for minutes. Sizes are skipped (gb null), not guessed.
+    out["cleanable"] = [dict(c, gb=round((du_kb(c["path"], 15) or 0) / 2**20, 2) if with_du else None, path=str(c["path"]))
                         for c in cache_targets() if c["path"].exists()]
     if with_du:
         out["largest_in_home"] = du_children(HOME, 2)
