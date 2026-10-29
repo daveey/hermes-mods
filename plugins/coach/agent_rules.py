@@ -38,6 +38,11 @@ HINTS = {
     "live_checkout": ("You just changed the LIVE Hermes checkout ({path}) that running backends execute from. "
                       "Core work goes in a worktree: `~/.hermes/bin/hermes-core-wt new <slug>` -> edit/test/commit "
                       "there -> `hermes-core-wt ship <slug>`. Revert the change in the live tree if you can."),
+    "kanban_db_write": ("You just wrote the Kanban board database (kanban.db) by hand with SQL. That skips every "
+                        "lifecycle guard (acceptance receipts, run ownership, events). Use the kanban_* tools or "
+                        "`hermes kanban` instead. A card whose PR contract can't pass because the repo has no "
+                        "required checks completes with kanban_complete metadata.contract_waiver={{\"reason\": "
+                        "\"...\"}}; a damaged board is repaired with `hermes kanban recover`."),
     "plan_first": ("Plan Before You Build: this is a new build request and the user has not seen a plan yet. Stop "
                    "editing, post the plan (approach, files, how it gets tested) as your reply and end the turn for "
                    "the user's go. Someone else's approval (a reviewer, a cut PR) does not replace it."),
@@ -659,6 +664,24 @@ def redirect_writes_into(cmd: str, workdir: str, root: str) -> bool:
     return False
 
 
+KANBAN_DB_RE = re.compile(r"kanban[\w./-]*\.db\b|\bkanban\.db\b", re.I)
+KANBAN_SQL_WRITE_RE = re.compile(r"\b(UPDATE\s+(tasks|task_runs|task_events)\b|INSERT\s+(OR\s+\w+\s+)?INTO\s+"
+                                 r"(tasks|task_runs|task_events)\b|DELETE\s+FROM\s+(tasks|task_runs|task_events)\b)",
+                                 re.I)
+
+
+def writes_kanban_db(tool: str, args: dict) -> bool:
+    """True when a terminal command or execute_code script runs a write against kanban.db's task tables
+    (UPDATE/INSERT/DELETE on tasks, task_runs, task_events). Reads (SELECT) never count."""
+    if tool == "terminal":
+        text = str(args.get("command") or "")
+    elif tool == "execute_code":
+        text = str(args.get("code") or "")
+    else:
+        return False
+    return bool(KANBAN_DB_RE.search(text) and KANBAN_SQL_WRITE_RE.search(text))
+
+
 def touches_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Optional[str]:
     if not checkout:
         return None
@@ -1184,6 +1207,12 @@ class AgentCoach:
         if hit:
             self._fire(self._s(sid), sid, "live_checkout", "session", path=hit.replace(str(Path.home()), "~", 1))
 
+    def check_kanban_db_write(self, sid: str, tool: str, args: Any) -> None:
+        """kanban_db_write rule (once per session): a hand-written SQL write to the board's task tables.
+        Also run from transform_tool_result so the hint lands on this very call."""
+        if sid and writes_kanban_db(tool, args if isinstance(args, dict) else {}):
+            self._fire(self._s(sid), sid, "kanban_db_write", "session")
+
     def check_plan_first(self, sid: str, tool: str, args: Any) -> None:
         """plan_first rule for one call (also run from transform_tool_result, so the hint lands on this call)."""
         if not sid:
@@ -1235,6 +1264,7 @@ class AgentCoach:
 
         # live_checkout (once per session)
         self.check_live(sid, tool, args)
+        self.check_kanban_db_write(sid, tool, args)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":
             d = _as_dict(result) or {}

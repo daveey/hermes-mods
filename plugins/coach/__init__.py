@@ -105,6 +105,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     def transform_tool_result(tool_name="", result=None, session_id="", args=None, **_):
         try:
             coach.check_live(session_id, tool_name, args)
+            coach.check_kanban_db_write(session_id, tool_name, args)
             coach.check_plan_first(session_id, tool_name, args)
             hint = coach.take(session_id)
             return rules.attach_hint(result, hint) if hint and isinstance(result, str) else None

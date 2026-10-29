@@ -749,3 +749,29 @@ def test_plan_first_answered_clarify_counts_as_a_shown_plan(tmp_path):
                                 session_id="s1")
         out = _edit(hooks, "write_file", {"path": str(tmp_path / "gen.py"), "content": "x"})
         assert bool(out and "Plan Before You Build" in out) is fires, res
+
+
+def test_kanban_db_write_fires_on_sql_writes_only(tmp_path):
+    """agent-650ad5206a: a worker rewrote completion_contract in kanban.db by hand. Terminal and
+    execute_code SQL writes to the task tables get the hint (naming contract_waiver); reads don't."""
+    c = coach(tmp_path)
+    term(c, "sqlite3 ~/.hermes/kanban.db \"select id, completion_contract from tasks where id='t_1'\"")
+    c.observe("s1", "execute_code", {"code": "import sqlite3; sqlite3.connect('kanban.db').execute('SELECT * FROM tasks')"}, OK)
+    assert c.take("s1") is None
+    term(c, "sqlite3 ~/.hermes/kanban.db \"UPDATE tasks SET completion_contract='local-only' WHERE id='t_1'\"")
+    hint = c.take("s1")
+    assert hint and "contract_waiver" in hint and "kanban recover" in hint
+    term(c, "sqlite3 ~/.hermes/kanban.db \"UPDATE tasks SET status='done' WHERE id='t_2'\"")
+    assert c.take("s1") is None  # once per session
+    c2 = coach(tmp_path)
+    c2.observe("s2", "execute_code", {"code": (
+        "import sqlite3\ndb = sqlite3.connect('/home/u/.hermes/kanban/boards/x/kanban.db')\n"
+        "db.execute(\"update tasks set completion_contract='local-only' where id=?\", ('t_1',))")}, OK)
+    assert "contract_waiver" in (c2.take("s2") or "")
+    assert not rules.writes_kanban_db("terminal", {"command": "sqlite3 state.db 'UPDATE sessions SET x=1'"})
+
+
+def test_kanban_db_write_hint_lands_on_the_same_call_via_transform(tmp_path, monkeypatch):
+    c = coach(tmp_path)
+    c.check_kanban_db_write("s1", "terminal", {"command": "sqlite3 kanban.db 'DELETE FROM task_events WHERE id=3'"})
+    assert "contract_waiver" in (c.take("s1") or "")
