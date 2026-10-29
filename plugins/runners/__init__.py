@@ -41,11 +41,13 @@ def register(ctx):
                 if backend.config['owner_profile'] != api.active_profile():
                     raise PermissionError('owner_profile_mismatch')
                 from .models import validate
+                from . import tool_view
                 if _op == 'inventory':
                     validate('EmptyRequest', args)
-                    result = backend.inventory()
+                    result = tool_view.project_list(backend.inventory())
                 elif _op == 'inspect':
                     result = backend.inspect(**validate('InspectRequest', args))
+                    result = tool_view.project_inspect(result, backend.config, backend.inventory()['data']['runners'])
                 elif _op == 'refresh':
                     result = backend.refresh(args)
                 else:
@@ -53,6 +55,8 @@ def register(ctx):
                     domain = api.repair_domain(backend)
                     if _op == 'verify':
                         result = domain.verify(args, principal=principal)
+                        result = tool_view.project_ack(result, backend.config, backend.inventory()['data']['runners'],
+                                                       result.get('data', {}).get('target_ids') or [])
                     else:
                         from hashlib import sha256
                         from uuid import uuid4
@@ -61,7 +65,7 @@ def register(ctx):
                         repair = domain.reserve(args, requester, principal=principal)
                         repair = domain.start(repair['id'], principal=principal)
                         result = dict(meta=backend.inventory()['meta'], data=dict(repair=repair, owner_route=None, route_status='unresolved'))
-                return json.dumps(result)
+                return json.dumps(result, separators=(',', ':'))
             except (PermissionError, NotImplementedError) as exc:
                 reason = str(exc)
                 return json.dumps(dict(error=reason if reason in ('owning_gateway_runtime_required', 'owner_profile_mismatch', 'authenticated_principal_required') else 'repair_access_denied'))
