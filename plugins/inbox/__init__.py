@@ -65,6 +65,11 @@ SCHEMA = {
             "body": {"type": "string", "description": "Markdown: what you observed, evidence, cost/risk."},
             "accept_prompt": {"type": "string", "description": "Self-contained instruction run on 'Do it'."},
             "key": {"type": "string", "description": "Dedupe key; re-posting with it updates the open message."},
+            "poster": {"type": "string", "description": "Registered poster family; defaults to calling session source."},
+            "ask": {"type": "object", "description": "Required unless the type has resolve actions. Explain the owner-only decision, not agent work.",
+                    "properties": {"interaction": {"type": "string", "enum": ["approval", "credential", "publish_as_david", "physical", "preference"]},
+                                   "why_human": {"type": "string"}, "action": {"type": "string"}},
+                    "required": ["interaction", "why_human", "action"], "additionalProperties": False},
             "cwd": {"type": "string", "description": "Working directory for the work (defaults to yours)."},
             "prompt_label": {"type": "string", "description": "Optional one-line summary of what Do it will do, "
                              "shown on the card instead of the full accept_prompt (e.g. 'stop the idle Vast box')."},
@@ -155,13 +160,14 @@ def handle_post(args: dict, **context) -> str:
         poster, cwd = _poster_for(context.get("session_id"))
         result = store_module().Inbox().post(
             args.get("title", ""), args.get("body", ""), args.get("accept_prompt", ""),
-            key=args.get("key"), poster=poster, cwd=args.get("cwd"), inherited_cwd=cwd, prompt_label=args.get("prompt_label"),
-            type=args.get("type"), fields=args.get("fields"),
+            key=args.get("key"), poster=args.get("poster") or poster, cwd=args.get("cwd"), inherited_cwd=cwd, prompt_label=args.get("prompt_label"),
+            type=args.get("type"), fields=args.get("fields"), ask=args.get("ask"),
         )
         result["posted"] = True
         return json.dumps(result)
     except Exception as exc:
-        return json.dumps({"posted": False, "error": f"{type(exc).__name__}: {exc}"})
+        return json.dumps({"posted": False, "error": f"{type(exc).__name__}: {exc}",
+                           **({"reason": exc.reason, "task": exc.task} if hasattr(exc, "reason") else {})})
 
 
 def handle_outcome(args: dict, **_) -> str:
@@ -225,6 +231,7 @@ def _setup_cli(parser) -> None:
     condition.add_argument("--if-absent", action="store_true", help="create only if key has never existed")
     condition.add_argument("--expected", help="JSON outcome snapshot: refresh only if unchanged and open")
     p.add_argument("--poster")
+    p.add_argument("--ask", help="JSON {interaction, why_human, action}; required unless type resolves a decision")
     p.add_argument("--cwd")
     p.add_argument("--prompt-label", help="one line shown on the card instead of the full prompt")
     p.add_argument("--type", help="card type (see `hermes inbox types`)")
@@ -267,6 +274,7 @@ def _run_cli(args) -> int:
             result = inbox.post(args.title, body, args.prompt, key=args.key, poster=args.poster,
                                 cwd=args.cwd, prompt_label=getattr(args, "prompt_label", None),
                                 type=getattr(args, "type", None), fields=fields or None,
+                                ask=json.loads(args.ask) if getattr(args, "ask", None) else None,
                                 if_absent=getattr(args, "if_absent", False),
                                 **({"expected": expected} if raw_expected is not None else {}))
             print(json.dumps(result))

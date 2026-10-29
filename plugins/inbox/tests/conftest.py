@@ -10,3 +10,13 @@ HERMES_DISABLE_LAZY_INSTALLS=1 makes prepare_launch return None, so the import i
 import os
 
 os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_stores(tmp_path, monkeypatch):
+    """Every test, including parser/error paths, gets private stores before executing."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

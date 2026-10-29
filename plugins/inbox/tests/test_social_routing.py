@@ -39,7 +39,8 @@ def env(request, tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
     db._inbox_keep_open = True
     make_projects(tmp_path, request.param)
-    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: 1_000_000.0)
+    from ask_fixtures import decision_inbox
+    inbox = decision_inbox(store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: 1_000_000.0))
     yield inbox, db, request.param
     db.close()
 

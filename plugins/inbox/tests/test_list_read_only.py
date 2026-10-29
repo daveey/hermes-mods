@@ -35,7 +35,8 @@ def opens(tmp_path, monkeypatch):
                          ids=["own-home", "other-profile"])
 def test_list_is_read_only_and_closed(tmp_path, opens, make):
     inbox = make(tmp_path)
-    inbox.post("Approve deploy", "body", "Deploy it.", key="k1")
+    from ask_fixtures import ASK
+    inbox.post("Approve deploy", "body", "Deploy it.", key="k1", poster="cli", ask=ASK)
     assert inbox.exists()
     del opens[:]
     items = inbox.list()
