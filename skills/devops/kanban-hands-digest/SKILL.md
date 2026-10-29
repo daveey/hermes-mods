@@ -133,8 +133,11 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
 - **Your own reply text can become an ask.** On Desktop, the user-steps output transform publishes any reply
   sentence that tells the user to do or decide something as a "For you" prompt.
   - Sentences that did this: "Answering either with 'no action needed' clears it", a closing note that an
-    option was deliberately not taken, and a reminder that an already-open request "needs a Mac name, or
-    'Wait'" (published as a duplicate of that request, more than once).
+    option was deliberately not taken, a reminder that an already-open request "needs a Mac name, or
+    'Wait'" (published as a duplicate of that request, more than once), and a "Still to do: I queued a card
+    that will ..." note about agent work (he asked "is this waiting for me?").
+  - Never wrap agent progress or a queued card's plan in a `::user-step` directive; it renders as a For you ask
+    with an answer box. Say what the card is doing in plain prose and that nothing needs him.
   - State settled facts as statements. Put a genuine decision in one `action_request`; when one is already
     open, don't restate it at all: the For you panel already shows it. Even a neutral closing list ("You still
     have two decisions in For you: …") or a "Your choices: Yes / Change / No" block gets published as a duplicate.
