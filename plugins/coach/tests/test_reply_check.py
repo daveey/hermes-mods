@@ -642,3 +642,15 @@ def test_session_human_asks_reads_local_human_request_from_the_board(tmp_path, m
     monkeypatch.setattr(rc, "_lineage", lambda sid: [sid])
     got = rc.session_human_asks("chat")
     assert got == [{"id": "t_f68", "title": "askevepodcast GitHub", "action": _ASK["action"]}]
+
+
+def test_denied_ask_skips_a_reply_that_already_tells_the_ask():
+    """Live false positive: the reply presented the ask (card id and all), then said other jobs don't need the user."""
+    card = {"id": "t_f68", "title": "askevepodcast GitHub", "status": "blocked", "block_kind": "needs_input",
+            "human_request": json.dumps(_ASK)}
+    asks = lambda: rc.linked_human_asks([card])
+    for reply in ("One decision waits on you: unblock card t_f68 once you approve. The other two jobs don't need you.",
+                  "You need to: " + _ASK["action"] + ". The rest of the work doesn't need you."):
+        assert rc.check(reply, "status?", [], _zero_judge, human_asks=asks) is None, reply
+    hit = rc.check("The PR merges on its own; nothing needs you.", "status?", [], _zero_judge, human_asks=asks)
+    assert hit and hit["rule"] == "denied_ask"

@@ -307,6 +307,24 @@ def session_human_asks(session_id: str) -> list[dict]:
     return linked_human_asks(rows)
 
 
+_WORD = re.compile(r"[a-z0-9][a-z0-9./_-]{3,}")
+
+
+def ask_told(reply: str, ask: dict) -> bool:
+    """True when the reply already tells this ask: names its card id or title, or carries most of its action's words.
+    A reply that presents the ask and then says "the other jobs don't need you" is not a denial (live false positive
+    on the first day: draft d_4464e252269c4fc4)."""
+    text = (reply or "").lower()
+    cid = str(ask.get("id") or "").lower()
+    if cid and (cid in text or cid.rsplit("/", 1)[-1] in text):
+        return True
+    title = " ".join(str(ask.get("title") or "").lower().split())
+    if len(title) >= 8 and title in " ".join(text.split()):
+        return True
+    words = set(_WORD.findall(str(ask.get("action") or "").lower()))
+    return len(words) >= 3 and len(words & set(_WORD.findall(text))) / len(words) >= 0.6
+
+
 DENIED_ASK_NUDGE = (
     "[coach] Your reply says nothing needs the user (\"{evidence}\"), but {n} card(s) linked to this chat are blocked "
     "waiting on them: {asks}. Correct the reply before ending: in plain words say what is stuck (the work, not its "
@@ -830,7 +848,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         asks = []
         if phrase:
             try:
-                asks = list(human_asks() or [])
+                asks = [a for a in (human_asks() or []) if not ask_told(reply, a)]
             except Exception:
                 asks = []  # fail-open: an unreadable board never holds a reply
         if asks:
