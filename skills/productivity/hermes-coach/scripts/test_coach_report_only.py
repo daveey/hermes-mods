@@ -120,6 +120,56 @@ class Pipeline(unittest.TestCase):
         self.assertIn("unlabeled", meta["note"])
 
 
+class DisplayFrame(unittest.TestCase):
+    """Turns come from what the chat shows, not only the rows still sent to the model."""
+
+    def db(self):
+        path = Path(tempfile.mkdtemp()) / "state.db"
+        con = sqlite3.connect(path)
+        con.executescript("""create table sessions(id text, model text, source text, parent_session_id text,
+              last_activity_at real, started_at real);
+            create table messages(id integer primary key, session_id text, role text, content text, tool_calls text,
+              tool_name text, timestamp real, codex_message_items text, active int, compacted int,
+              _compressed_summary int, display_order int, display_metadata text);""")
+        now = time.time()
+        con.execute("insert into sessions values('sess-cccc3333','claude-opus-5-5','desktop',null,?,?)", (now, now))
+        ask, look = "why is the sidebar stale?", "Looking at the cache first, then the poller, then the store."
+        fixed = "Fixed it: the cache now refreshes on every write, and I checked it live."
+        later = "B and C both pass their checks now, so nothing else is open here."
+        tc = json.dumps([{"function": {"name": "terminal"}}])
+        rows = [  # id, role, content, tool_calls, t, active, compacted, summary, display_order, display_metadata
+            (1, "user", ask, None, 1, 0, 1, 0, 1, None),             # compacted original
+            (2, "assistant", look, tc, 2, 0, 1, 0, 2, None),
+            (101, "user", ask, None, 1, 1, 0, 0, 1, None),           # protected-tail copy: same display_order
+            (102, "assistant", look, tc, 2, 1, 0, 0, 2, None),
+            (103, "user", "[CONTEXT COMPACTION - REFERENCE ONLY] earlier turns...", None, 3, 1, 0, 1, 103, None),
+            (104, "user", "[Your active task list was preserved across context compression]\n- [ ] fix it", None, 4,
+             1, 0, 0, 104, None),
+            (105, "assistant", fixed, None, 5, 1, 0, 0, 105, None),
+            (106, "user", "thanks, also check B", None, 6, 1, 0, 0, 106, None),
+            (107, "user", "thanks, also check B\n\nand C", None, 7, 1, 0, 0, 107, json.dumps({"model_only": True})),
+            (108, "user", "and C", None, 7.5, 0, 0, 0, 108, None),     # rewound: never shown
+            (109, "assistant", later, None, 8, 1, 0, 0, 109, None),
+        ]
+        for i, role, c, tcs, t, a, cp, summ, order, meta in rows:
+            con.execute("insert into messages values(?,?,?,?,?,?,?,null,?,?,?,?,?)",
+                        (i, "sess-cccc3333", role, c, tcs, None, now - 100 + t, a, cp, summ, order, meta))
+        con.commit()
+        con.close()
+        return path
+
+    def test_compacted_turns_count_once_and_resume_prompts_join_their_turn(self):
+        ts = ro.extract_turns(self.db(), time.time() - 3600)
+        self.assertEqual([t["user"] for t in ts], ["why is the sidebar stale?", "thanks, also check B"])
+        self.assertTrue(ts[0]["final"].startswith("Fixed it"))
+        self.assertEqual(ts[0]["tools"], {"terminal": 1})        # the protected-tail copy is not counted twice
+        self.assertTrue(ts[1]["final"].startswith("B and C"))
+
+    def test_legacy_store_without_display_columns_reads_live_rows(self):
+        ts = Pipeline().db([("sess-aaaa1111", "why is it stale?", "x" * 60, None)])
+        self.assertEqual([t["user"] for t in ro.extract_turns(ts, time.time() - 3600)], ["why is it stale?"])
+
+
 class BenchV2(unittest.TestCase):
     def eval_set(self, n_ro=20, n_ctl=20):
         rows = []

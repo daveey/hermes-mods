@@ -77,6 +77,9 @@ EVENT_RX = re.compile(r"^\s*(\[chat-closeout\]|✔ \[|✖ \[|⚠|\[ASYNC DELEGAT
 SYNTHETIC_RX = re.compile(r"^\s*(\[(IMPORTANT|System|SYSTEM|Background|background|OUT-OF-BAND|Delegat|Subagent|Process|Cron|"
                           r"Goal|Context|Note|Kanban|Cross-session|CROSS)|<(system|task-notification|memory-context)|"
                           r"Background process|\[Message from|\[Delegation)", re.S)
+# Compaction writes these as user rows: a summary, then a prompt that resumes the turn it interrupted. Neither is a
+# human message, and the replies after the resume prompt belong to the interrupted turn.
+CONTINUATION_RX = re.compile(r"^\s*\[(Your active task list was preserved|CONTEXT COMPACTION)")
 OUTCOMES = ("fixed", "started", "proposed", "offered", "report_only", "na")
 
 
@@ -96,6 +99,45 @@ def _text(c):
     return c
 
 
+def _model_only(meta):
+    """display_metadata.model_only marks a merge the model reads but nobody typed; its source rows are shown instead."""
+    try:
+        d = json.loads(meta) if meta else None
+    except (TypeError, ValueError):
+        return False
+    return isinstance(d, dict) and bool(d.get("model_only"))
+
+
+def display_messages(con, sid):
+    """A chat's messages as the Desktop shows them (core ``hermes_state_timeline._display_rows_sql``).
+
+    Live rows alone (active=1) drop every turn before a session's last compaction, so long compacted chats are
+    undercounted and each compaction summary reads as a human message. Shown instead: live + compacted rows, one per
+    display_order (compaction re-inserts the live tail as copies sharing it; the live copy wins), minus compaction
+    summaries and model-only merges. Stores without those columns fall back to live rows.
+    """
+    mcols = {r[1] for r in con.execute("pragma table_info(messages)")}
+    base = "select id, role, content, tool_calls, timestamp, codex_message_items is not null as cx"
+    if not {"compacted", "_compressed_summary"} <= mcols:
+        return con.execute(f"{base} from messages where session_id=? and coalesce(active,1)=1 order by id",
+                           (sid,)).fetchall()
+    meta = "display_metadata" if "display_metadata" in mcols else "null"
+    if "display_order" in mcols:
+        key, order = "coalesce(display_order, id)", "coalesce(display_order, id), active desc, id desc"
+    else:
+        key, order = ("coalesce(message_uid, id)" if "message_uid" in mcols else "id"), "timestamp, id"
+    rows = con.execute(f"{base}, {meta} as meta, {key} as dkey from messages where session_id=? and "
+                       f"(coalesce(active,1)=1 or compacted=1) and coalesce(_compressed_summary,0)=0 order by {order}",
+                       (sid,)).fetchall()
+    out, seen = [], set()
+    for r in rows:
+        if r["dkey"] in seen or _model_only(r["meta"]):
+            continue
+        seen.add(r["dkey"])
+        out.append(r)
+    return out
+
+
 def extract_turns(db, since, until=None, sources=("desktop",)):
     """Final-reply turns of top-level sessions active since `since` (epoch). Read-only."""
     until = until or time.time()
@@ -106,13 +148,12 @@ def extract_turns(db, since, until=None, sources=("desktop",)):
                        f"and coalesce(last_activity_at, started_at) > ?", (*sources, since)).fetchall()
     out = []
     for s in sess:
-        msgs = con.execute("select role, content, tool_calls, timestamp, codex_message_items is not null as cx "
-                           "from messages where session_id=? and coalesce(active,1)=1 order by id", (s["id"],)).fetchall()
+        msgs = display_messages(con, s["id"])
         cur, turns = None, []
         for m in msgs:
             if m["role"] == "user":
                 t = re.sub(r"<memory-context>.*?</memory-context>", "", _text(m["content"]), flags=re.S).strip()
-                if not t or SYNTHETIC_RX.match(t):
+                if not t or SYNTHETIC_RX.match(t) or CONTINUATION_RX.match(t):
                     continue
                 cur = {"sid": s["id"], "model": s["model"] or "", "ts": m["timestamp"], "user": t[:1500], "tools": {},
                        "final": "", "codex": 0, "assistant_msgs": 0}
