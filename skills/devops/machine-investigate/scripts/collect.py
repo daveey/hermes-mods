@@ -15,6 +15,7 @@ Anything outside these allowlists is reported with a size or owner and left for 
 from __future__ import annotations
 
 import argparse
+import ctypes
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -138,7 +139,7 @@ def label(agent: dict) -> str:
     return ""
 
 
-def parse_runnable(out: str) -> dict:
+def parse_runnable(out: str, exclude=frozenset(), top=10) -> dict:
     """Parse Darwin ps -M -ax, including USER-less continuation thread rows.
 
     PRI has scheduler flags (4T, 31R, 4N); STAT may have modifiers (R+).
@@ -156,28 +157,124 @@ def parse_runnable(out: str) -> dict:
             pri = fields[offset + (3 if offset == 0 else 4)]
         except (ValueError, IndexError):
             continue
-        if not state.startswith("R") or not re.fullmatch(r"\d+[TRN]*", pri):
+        if pid in exclude or not state.startswith("R") or not re.fullmatch(r"\d+[TRN]*", pri):
             continue
         priority = str(int(pri.rstrip("TRN")))
         by_priority[priority] = by_priority.get(priority, 0) + 1
         if priority == "4":
             priority4[pid] = priority4.get(pid, 0) + 1
+    out = _finish(by_priority, priority4)
+    if top is None:
+        out["priority4"] = [{"pid": p, "threads": n} for p, n in priority4.items()]
+    return out
+
+
+class _ThreadInfo(ctypes.Structure):  # <sys/proc_info.h> struct proc_threadinfo
+    _fields_ = [("user_time", ctypes.c_uint64), ("system_time", ctypes.c_uint64), ("cpu_usage", ctypes.c_int32),
+                ("policy", ctypes.c_int32), ("run_state", ctypes.c_int32), ("flags", ctypes.c_int32),
+                ("sleep_time", ctypes.c_int32), ("curpri", ctypes.c_int32), ("priority", ctypes.c_int32),
+                ("maxpriority", ctypes.c_int32), ("name", ctypes.c_char * 64)]
+
+
+PROC_PIDLISTTHREADS, PROC_PIDTHREADINFO, TH_STATE_RUNNING = 6, 5, 1
+
+
+def _libproc():
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    lib.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    return lib
+
+
+def libproc_runnable(lib, exclude=frozenset()):
+    """Runnable threads by current priority for every pid libproc lets us read, in-process (~25 ms for 10k
+    threads, vs 0.1-0.9 s for setuid ps -M). Returns (by_priority, per-pid priority-4 counts, unreadable pids):
+    other users' processes (root daemons) are unreadable without root and go to ps."""
+    n = lib.proc_listallpids(None, 0)
+    pids = (ctypes.c_int * (n + 256))()
+    n = lib.proc_listallpids(pids, ctypes.sizeof(pids))
+    handles = (ctypes.c_uint64 * 4096)()
+    info = ctypes.sizeof(_ThreadInfo)
+    ti = _ThreadInfo()
+    by_priority, priority4, denied = {}, {}, []
+    for pid in pids[:max(n, 0)]:
+        if pid in exclude or pid <= 0:
+            continue
+        got = lib.proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, handles, ctypes.sizeof(handles))
+        while got >= ctypes.sizeof(handles):  # more threads than the buffer holds: grow and retry
+            handles = (ctypes.c_uint64 * (len(handles) * 2))()
+            got = lib.proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, handles, ctypes.sizeof(handles))
+        if got <= 0:
+            if ctypes.get_errno() != 3:  # ESRCH = exited since the listing; anything else = no access
+                denied.append(pid)
+            continue
+        for h in handles[:got // 8]:
+            if lib.proc_pidinfo(pid, PROC_PIDTHREADINFO, h, ctypes.byref(ti), info) != info:
+                continue  # thread exited
+            if ti.run_state == TH_STATE_RUNNING:
+                pri = str(ti.curpri)
+                by_priority[pri] = by_priority.get(pri, 0) + 1
+                if ti.curpri == 4:
+                    priority4[pid] = priority4.get(pid, 0) + 1
+    return by_priority, priority4, denied
+
+
+def _ps_threads(pids, timeout=2):
+    """ps -M for the given pids (all when None); returns (stdout, ps pid). -c skips argv (the process table
+    already has names/ancestry). The timeout is a safety net, not a performance claim."""
+    cmd = ["/bin/ps", "-M", "-axc"] if pids is None else ["/bin/ps", "-M", "-c", "-p", ",".join(map(str, pids))]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, _err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
+    # ps -p exits 1 when some listed pid is gone; output for the rest is still valid.
+    if proc.returncode and (pids is None or not out):
+        raise subprocess.CalledProcessError(proc.returncode, proc.args)
+    return out, proc.pid
+
+
+def _finish(by_priority: dict, priority4: dict) -> dict:
     return {"total": sum(by_priority.values()),
             "by_priority": dict(sorted(by_priority.items(), key=lambda kv: int(kv[0]))),
             "priority4": [{"pid": p, "threads": n} for p, n in
                           sorted(priority4.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]}
 
 
-def runnable_snapshot() -> dict:
-    # -c avoids fetching argv (the process table already has names/ancestry).
-    # A safety timeout is not a performance claim: scheduling can delay ps.
+def runnable_snapshot(lib_fn=None) -> dict:
+    """Runnable threads now: libproc for our own processes, setuid ps -M only for the ones it can't read.
+    The probe's own process and its ps are excluded. Run it outside Background QoS: a background-clamped probe
+    waits on the saturated E-cores it is counting (see install-agent in mac-load-recorder)."""
+    t0 = time.perf_counter()
+    me = {os.getpid()}
     try:
-        out = subprocess.run(["/bin/ps", "-M", "-axc"], capture_output=True,
-                             text=True, check=True, timeout=2).stdout
-        return parse_runnable(out)
+        try:
+            lib = (lib_fn or _libproc)()
+        except OSError:
+            lib = None
+        if lib is None:
+            out, ps_pid = _ps_threads(None)
+            snap = parse_runnable(out, exclude=me | {ps_pid})
+            snap["method"] = "ps"
+        else:
+            by_priority, priority4, denied = libproc_runnable(lib, exclude=me)
+            if denied:
+                out, ps_pid = _ps_threads(denied)
+                extra = parse_runnable(out, exclude=me | {ps_pid}, top=None)
+                for k, v in extra["by_priority"].items():
+                    by_priority[k] = by_priority.get(k, 0) + v
+                for row in extra["priority4"]:
+                    priority4[row["pid"]] = priority4.get(row["pid"], 0) + row["threads"]
+            snap = _finish(by_priority, priority4)
+            snap["method"] = "libproc+ps"
+            snap["ps_pids"] = len(denied)
     except (OSError, subprocess.SubprocessError) as exc:
         # Never report a failed measurement as a zero queue, or drop the spike.
-        return {"total": None, "by_priority": {}, "priority4": [], "error": type(exc).__name__}
+        snap = {"total": None, "by_priority": {}, "priority4": [], "error": type(exc).__name__}
+    snap["collect_s"] = round(time.perf_counter() - t0, 3)
+    return snap
 
 
 def attribute_runnable(snapshot: dict, table: dict, tags: dict) -> dict:

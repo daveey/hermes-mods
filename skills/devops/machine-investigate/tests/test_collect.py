@@ -204,21 +204,95 @@ def test_runnable_attribution_includes_low_cpu_and_vanished_pids(c):
     assert out["priority4"][-1]["owner"] == ""
 
 
-def test_runnable_command_and_failure_are_explicit(c, monkeypatch):
-    import subprocess
+class FakeLib:
+    """libproc stand-in: pid -> list of (run_state, curpri); pids in `denied` fail like other users' processes."""
+    def __init__(self, threads, denied=()):
+        self.threads, self.denied = threads, set(denied)
+
+    def proc_listallpids(self, buf, size):
+        pids = sorted(set(self.threads) | self.denied)
+        if buf:
+            for i, p in enumerate(pids):
+                buf[i] = p
+        return len(pids)
+
+    def proc_pidinfo(self, pid, flavor, arg, buf, size):
+        import ctypes
+        if pid in self.denied:
+            ctypes.set_errno(1)
+            return 0
+        rows = self.threads[pid]
+        if flavor == 6:
+            for i in range(len(rows)):
+                buf[i] = i + 1
+            return 8 * len(rows)
+        ti = buf._obj
+        ti.run_state, ti.curpri = rows[arg - 1]
+        return ctypes.sizeof(ti)
+
+
+class FakePopen:
     calls = []
-    def run(cmd, **kw):
-        calls.append((cmd, kw))
-        return subprocess.CompletedProcess(cmd, 0, THREAD_PS, "")
-    monkeypatch.setattr(c.subprocess, "run", run)
-    assert c.runnable_snapshot()["total"] == 5
-    assert calls[0][0] == ["/bin/ps", "-M", "-axc"]
-    assert calls[0][1]["timeout"] == 2
-    def fail(*a, **kw):
-        raise subprocess.TimeoutExpired(a[0], 2)
-    monkeypatch.setattr(c.subprocess, "run", fail)
-    assert c.runnable_snapshot()["total"] is None
-    assert c.runnable_snapshot()["error"] == "TimeoutExpired"
+    out = ""
+    pid = 4242
+    returncode = 0
+    hang = False
+
+    def __init__(self, cmd, **kw):
+        FakePopen.calls.append((cmd, kw))
+        self.args, self.pid, self.returncode = cmd, FakePopen.pid, FakePopen.returncode
+        self.killed = False
+
+    def communicate(self, timeout=None):
+        import subprocess
+        if FakePopen.hang and not self.killed:
+            FakePopen.calls.append(("timeout", timeout))
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return FakePopen.out, ""
+
+    def kill(self):
+        self.killed = True
+
+
+def no_lib():
+    raise OSError("no libproc")
+
+
+def test_runnable_ps_fallback_command_and_failure_are_explicit(c, monkeypatch):
+    FakePopen.calls, FakePopen.out, FakePopen.hang = [], THREAD_PS, False
+    monkeypatch.setattr(c.subprocess, "Popen", FakePopen)
+    snap = c.runnable_snapshot(lib_fn=no_lib)
+    assert snap["total"] == 5 and snap["method"] == "ps" and isinstance(snap["collect_s"], float)
+    assert FakePopen.calls[0][0] == ["/bin/ps", "-M", "-axc"]
+    FakePopen.calls, FakePopen.hang = [], True
+    snap = c.runnable_snapshot(lib_fn=no_lib)
+    assert ("timeout", 2) in FakePopen.calls
+    assert snap["total"] is None and snap["error"] == "TimeoutExpired" and "collect_s" in snap
+
+
+def test_runnable_excludes_the_probes_own_ps(c, monkeypatch):
+    own = "daveey 4242 s000 0.0 R 4T 0:00.00 0:00.00 ps\n"
+    FakePopen.calls, FakePopen.out, FakePopen.hang = [], THREAD_PS + own, False
+    monkeypatch.setattr(c.subprocess, "Popen", FakePopen)
+    snap = c.runnable_snapshot(lib_fn=no_lib)
+    assert snap["total"] == 5
+    assert 4242 not in [r["pid"] for r in snap["priority4"]]
+    assert c.parse_runnable(THREAD_PS + own)["total"] == 6
+
+
+def test_runnable_libproc_counts_own_and_sends_only_unreadable_pids_to_ps(c, monkeypatch):
+    import os
+    lib = FakeLib({500: [(1, 4), (1, 4), (2, 4), (1, 31)], 600: [(1, 20)], os.getpid(): [(1, 4)]}, denied=[211])
+    FakePopen.calls, FakePopen.out, FakePopen.hang = [], THREAD_PS, False
+    monkeypatch.setattr(c.subprocess, "Popen", FakePopen)
+    snap = c.runnable_snapshot(lib_fn=lambda: lib)
+    assert FakePopen.calls[0][0] == ["/bin/ps", "-M", "-c", "-p", "211"]
+    ps = c.parse_runnable(THREAD_PS)
+    assert snap["method"] == "libproc+ps" and snap["ps_pids"] == 1
+    assert snap["total"] == ps["total"] + 4  # probe's own pid excluded, run_state 2 not runnable
+    assert snap["by_priority"]["4"] == ps["by_priority"].get("4", 0) + 2
+    assert {"pid": 500, "threads": 2} in snap["priority4"]
+    assert os.getpid() not in [r["pid"] for r in snap["priority4"]]
 
 
 def test_report_wires_runnable_with_ancestry(c, monkeypatch):
