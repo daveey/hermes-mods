@@ -46,7 +46,7 @@ Historical acknowledgement requires trusted settled state even when a transcript
 Notices match the exact board/task or full remote owner key, never a bare-ID substring. Ambiguous legacy remote
 notices fail closed. Only active successful final replies (`stop`/`end_turn`, no tool calls, no commentary or failed
 turn display kind) count; missing completion metadata and interrupted replies remain unacknowledged.
-Registration logs `moved-ask-backoff-v3` and the selected module paths to distinguish activation from files on disk.
+Registration logs `relay-stamp-keep-v4` and the selected module paths to distinguish activation from files on disk.
 
 ## Moved asks and failed delivery
 
