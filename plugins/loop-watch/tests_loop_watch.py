@@ -138,3 +138,65 @@ def test_run_calls_on_tick():
         assert len(ticks) >= 3
     finally:
         lp.close()
+
+
+def _busy_frames():
+    """A real frame of a thread spinning in a function named hot_spin, plus an idle waiter."""
+    stop = threading.Event()
+    idle = threading.Event()
+
+    def hot_spin():
+        while not stop.is_set():
+            sum(range(1000))
+
+    t1 = threading.Thread(target=hot_spin, name="hot", daemon=True)
+    t2 = threading.Thread(target=idle.wait, name="idler", daemon=True)
+    t1.start(); t2.start()
+    return stop, idle
+
+
+def test_cpu_profile_names_busy_thread_and_skips_idle():
+    stop, idle = _busy_frames()
+    try:
+        rep = watch.cpu_profile(0.3, sample_s=0.01)
+    finally:
+        stop.set(); idle.set()
+    assert rep["kind"] == "cpu_profile" and rep["samples"] > 5
+    threads = {t["thread"]: t["busy_pct"] for t in rep["threads"]}
+    assert threads.get("hot", 0) > 50
+    assert "idler" not in threads
+    assert any("hot_spin" in " ".join(s["stack"]) for s in rep["stacks"])
+    assert rep["process_cpu_pct"] > 0
+
+
+def test_profile_trigger_runs_once_and_removes_request(tmp_path):
+    req = tmp_path / watch.PROFILE_REQUEST
+    got = []
+    ran = []
+    tick = watch.profile_trigger(req, got.append, spawn=lambda f: (ran.append(1), f()))
+    tick()  # no request: nothing
+    assert not ran
+    req.write_text("1")
+    tick()
+    assert ran == [1] and not req.exists()
+    assert got and got[0]["kind"] == "cpu_profile" and 0.9 <= got[0]["seconds"] <= 2
+    tick()
+    assert ran == [1]
+
+
+def test_profile_trigger_caps_and_defaults_seconds(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(watch, "cpu_profile", lambda s: seen.append(s) or {"kind": "cpu_profile"})
+    req = tmp_path / watch.PROFILE_REQUEST
+    tick = watch.profile_trigger(req, lambda r: None, spawn=lambda f: f())
+    for text in ("", "junk", "9999"):
+        req.write_text(text)
+        tick()
+    assert seen == [20.0, 20.0, watch.PROFILE_MAX_S]
+
+
+def test_default_sink_writes_profile_report(tmp_path):
+    path = tmp_path / "lw.jsonl"
+    sink = watch.default_sink(path)
+    sink({"kind": "cpu_profile", "seconds": 1.0, "process_cpu_pct": 50.0, "threads": [{"thread": "x", "busy_pct": 9.0}]})
+    assert json.loads(path.read_text())["kind"] == "cpu_profile"

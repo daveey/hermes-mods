@@ -15,6 +15,11 @@ its response start has its asyncio await chain sampled; if it answers after >= 2
 (``HERMES_LOOP_WATCH_SLOW_S``; 0 disables) it gets one ``loop-watch: slow request …`` line and a
 ``kind: slow_request`` report in the same jsonl. That covers the case a stall can't: the loop is
 responsive but the request is parked on an await (executor queue, lock, child task).
+
+On demand it profiles CPU: ``echo 20 > <HERMES_HOME>/logs/loop-watch.profile-request`` makes the next
+serve process that sees it sample every thread's Python stack for that many seconds (default 20, max
+120) and append a ``kind: cpu_profile`` report (process CPU %, busy share per thread, hottest stacks)
+to the same jsonl. No root needed, unlike py-spy on macOS.
 """
 
 from __future__ import annotations

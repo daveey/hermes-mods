@@ -140,6 +140,75 @@ class LoopWatch:
             self.stop.wait(self.period_s)
 
 
+PROFILE_REQUEST = "loop-watch.profile-request"
+PROFILE_MAX_S = 120.0
+
+
+def cpu_profile(seconds: float, *, sample_s: float = 0.02, frames: Callable[[], dict] = sys._current_frames,
+                names: Optional[Callable[[], dict]] = None, clock: Callable[[], float] = time.monotonic,
+                sleep: Callable[[float], None] = time.sleep, cpu: Callable[[], float] = time.process_time) -> dict:
+    """Sample every thread's Python stack for ``seconds``; report where non-idle samples landed.
+
+    For "why does this backend burn 100% CPU": the busy share per thread and the hottest stacks, plus
+    the process CPU used during the window (all threads) so the shares can be read as cores."""
+    names = names or (lambda: {t.ident: t.name for t in threading.enumerate()})
+    me = threading.get_ident()
+    per_thread: Counter = Counter()
+    stacks: Counter = Counter()
+    leaves: Counter = Counter()
+    samples = 0
+    c0, t0 = cpu(), clock()
+    while clock() - t0 < seconds:
+        nm = names()
+        for tid, fr in frames().items():
+            if tid == me:
+                continue
+            st = _fmt_stack(fr, 10)
+            if _idle(st):
+                continue
+            thread = nm.get(tid) or str(tid)
+            per_thread[thread] += 1
+            stacks[(thread, st)] += 1
+            leaves[st[-1] if st else "?"] += 1
+        samples += 1
+        sleep(sample_s)
+    wall = max(clock() - t0, 1e-9)
+    return {
+        "kind": "cpu_profile", "pid": os.getpid(), "seconds": round(wall, 1), "samples": samples,
+        "process_cpu_pct": round(100 * (cpu() - c0) / wall, 1),
+        "threads": [{"thread": t, "busy_pct": round(100 * n / max(samples, 1), 1)} for t, n in per_thread.most_common(15)],
+        "leaves": [{"n": n, "frame": f} for f, n in leaves.most_common(15)],
+        "stacks": [{"n": n, "thread": t, "stack": list(st)} for (t, st), n in stacks.most_common(20)],
+    }
+
+
+def profile_trigger(request: Path, sink: Callable[[dict], None], *, spawn=None) -> Callable[[], None]:
+    """on_tick hook: when ``request`` exists (its text = seconds, default 20), remove it and run
+    :func:`cpu_profile` in its own thread, then sink the report. ``touch`` the file to profile a live backend
+    without root (py-spy needs sudo on macOS)."""
+    def tick() -> None:
+        try:
+            text = request.read_text().strip()
+        except OSError:
+            return
+        try:
+            request.unlink()
+        except OSError:
+            return  # another backend took it
+        try:
+            seconds = min(PROFILE_MAX_S, max(1.0, float(text))) if text else 20.0
+        except ValueError:
+            seconds = 20.0
+
+        def body() -> None:
+            try:
+                sink(cpu_profile(seconds))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("loop-watch profile failed: %s", exc)
+        (spawn or (lambda f: threading.Thread(target=f, name="loop-watch-profile", daemon=True).start()))(body)
+    return tick
+
+
 def find_loop(target_thread: Optional[int] = None):
     """The running asyncio loop on ``target_thread`` (default: the main thread), or None."""
     target_thread = target_thread or threading.main_thread().ident
@@ -155,18 +224,27 @@ def find_loop(target_thread: Optional[int] = None):
 
 def default_sink(path: Path) -> Callable[[dict], None]:
     def sink(rep: dict) -> None:
+        if rep.get("kind") == "cpu_profile":
+            log.info("loop-watch: cpu profile %.0fs: process %.0f%% cpu, busiest %s", rep["seconds"],
+                     rep["process_cpu_pct"], ", ".join("%s %s%%" % (t["thread"], t["busy_pct"]) for t in rep["threads"][:3]))
+            _append(path, rep)
+            return
         top = rep["loop_stacks"][0]["stack"][-1] if rep["loop_stacks"] else "?"
         hog = rep["busy_threads"][0] if rep["busy_threads"] else None
         log.warning("loop-watch: event loop stalled %.2fs (posted %s, watch_lag %.2fs) loop top=%s busiest=%s",
                     rep["stall_s"], rep["posted"], rep["watch_lag_s"], top,
                     ("%s %s" % (hog["thread"], hog["stack"][-1])) if hog else "-")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rep) + "\n")
-        except OSError:
-            pass
+        _append(path, rep)
     return sink
+
+
+def _append(path: Path, rep: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rep) + "\n")
+    except OSError:
+        pass
 
 
 _STARTED_ATTR = "_hermes_loop_watch_started"
@@ -227,8 +305,13 @@ def start(home: Path, *, stall_s: float = STALL_S, wait_for_loop_s: float = 600.
         log.info("loop-watch: watching event loop of pid %d (stall >= %.1fs)", os.getpid(), stall_s)
         lw = LoopWatch(loop, getattr(loop, "_thread_id"), sink=sink, stall_s=stall_s)
         trace = _install_reqtrace(home, slow_s)
-        if trace is not None:
-            lw.on_tick = lambda: trace.tick(loop)
+        profile = profile_trigger(home / "logs" / PROFILE_REQUEST, sink)
+
+        def tick() -> None:
+            profile()
+            if trace is not None:
+                trace.tick(loop)
+        lw.on_tick = tick
         lw.run()
 
     th = threading.Thread(target=body, name="loop-watch", daemon=True)
