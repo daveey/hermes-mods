@@ -616,6 +616,18 @@ def in_digest_report(span: str, paragraph: str) -> bool:
     return not directly_asks(span)
 
 
+_ASSENT = re.compile(
+    r"^(?:(?:i'?d say|i would say|i think|i guess|so|well|then),?\s+)*"
+    r"(?:yes|yeah|yep|yup|sure|ok(?:ay)?|sounds good|go ahead|agreed|absolutely|definitely|of course|fine|"
+    r"correct|right|do it|please do|let'?s do it)(?:,?\s+(?:please|then|thanks))?$", re.I)
+
+
+def assent_echo(text: str) -> bool:
+    """A step under 6 words that only expresses assent ("I'd say yes.") is an echo, not an ask."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip(" \"'`*_.!")
+    return 0 < len(t.split()) < 6 and bool(_ASSENT.match(t))
+
+
 def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None,
              *, continuity: bool = False) -> list[dict]:
     out: list[dict] = []
@@ -642,6 +654,8 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             opts = []
         if _NOT_ASK.search(span):
             continue  # hypothetical / mention-only, whatever the model said
+        if assent_echo(span) or assent_echo(text):
+            continue  # "I'd say yes." echoes assent; it asks nothing
         if quiet and not directly_asks(span):
             continue  # the reply says nothing waits on the user; a status line is not an ask
         block = locate(reply, span)
@@ -898,6 +912,60 @@ def steps_payload(ledger: "Ledger", session: str) -> dict:
     opened = sorted((s for s in d.get("steps", []) if s.get("status") == "open"), key=lambda s: s.get("created", 0))
     own = [c for c in [(d.get("card") or {}).get("id"), *d.get("archived_cards", [])] if c]
     return {"root": root, "steps": [public_step(s) for s in opened], "card": d.get("card"), "own_cards": own[-50:]}
+
+
+def _canonical_open(step: dict) -> bool:
+    """False only when the step's canonical request is provably decided or retired; any doubt keeps it open."""
+    if not step.get("requestId") or not (home() / "user-steps" / "actions.sqlite3").is_file():
+        return True
+    try:
+        r = ActionStore().get(server_owner(step.get("session") or ""), step["requestId"])
+        return r["state"] in ("open", "needs_context") and not r.get("resolution")
+    except Exception:
+        return True
+
+
+def open_steps(session_id: str, ledger: Optional["Ledger"] = None) -> list[dict]:
+    """Public helper (session-outcome): this chat's open steps across its lineage, oldest first, public fields
+    plus ``choices``. A step whose canonical request was already decided or withdrawn is left out."""
+    if not session_id:
+        return []
+    lg = ledger or Ledger()
+    opened = sorted(lg.open_steps(session_id), key=lambda s: s.get("created", 0))
+    return [{**public_step(s), **({"choices": s["choices"]} if s.get("choices") else {})}
+            for s in opened if _canonical_open(s)]
+
+
+def add_step(session_id: str, question: str, options: list, *, ledger: Optional["Ledger"] = None,
+             now: Optional[float] = None) -> dict:
+    """Public helper (session-outcome): record one explicit ask, no extraction. ``options`` are labels or
+    {label, value}; two or more make a ``choose`` step whose labels become its buttons. An open step with the
+    same question in this chat is returned instead of a duplicate. Grants nothing."""
+    q = re.sub(r"\s+", " ", str(question or "")).strip()[:300]
+    if not session_id or not q:
+        raise ValueError("session_id and question are required")
+    choices = []
+    for o in options or []:
+        label = str((o.get("label") if isinstance(o, dict) else o) or "").strip()[:OPTION_MAX]
+        if label:
+            value = o.get("value", label) if isinstance(o, dict) else label
+            choices.append({"label": label, "value": str(value)[:OPTION_MAX]})
+    choices = choices[:4]
+    labels = [c["label"] for c in choices]
+    kind = "choose" if len(labels) >= 2 else "input"
+    lg = ledger or Ledger()
+    root = lg.root(session_id)
+    with lg.edit(root) as d:
+        for s in d["steps"]:
+            if s.get("status") == "open" and s.get("session") == session_id and _norm(s.get("text", "")) == _norm(q):
+                return dict(s)
+        step = {"id": new_step_id(), "text": q, "kind": kind, "verbatim_span": q,
+                "options": labels if kind == "choose" else [], "choices": choices, "status": "open",
+                "created": now or time.time(), "session": session_id, "source": "session_outcome",
+                # literal_options() only turns labels found in the source paragraph into buttons
+                "paragraph": q + ("\n\nOptions: " + " / ".join(labels) if labels else "")}
+        d["steps"].append(step)
+    return dict(step)
 
 
 # ---- resolve / pipeline --------------------------------------------------------------------------------
