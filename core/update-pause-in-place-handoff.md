@@ -167,3 +167,19 @@ Tests in `tests/tui_gateway/test_update_pause_superseded.py`:
 These drive `_notif_run_submit` with a fresh session and a marker inherited from the previous backend. They assert the original prompt survives, the watcher is armed once, the session is idle, and the resume decision is `resume`. Watcher startup is captured by a fixture; these tests do not execute a live update or the resumed agent turn.
 
 Applying: append 0719 in series order. It depends on the earlier carried-marker support already in the fork; it is not a standalone replacement for 0704.
+
+## Follow-up patch (0728)
+
+**0728** (fork `9b77743e86`, patch [`0728`](patches/0728-fix-update-pause-a-goal-continuation-waits-for-a-cor.patch)): a /goal continuation no longer runs ahead of a core-update-paused turn. `_run_post_turn_followups` claims the session directly for the goal tick (not through `_notif_claim_turn`, so the 0725 `continuation_due` gate never saw it), and the continuation is a real turn, not a synthesized one. After a notice turn carried the paused marker, the goal tick recorded its own marker over it and retired it, so the paused request was replaced instead of continued.
+
+`_goal_waits_for_paused_turn` in `tui_gateway/prompt_turn.py` drops the goal tick while `_paused_marker_carried` or `_update_pause_marker_key` is set, or `update_pause.continuation_due(session)` holds. The paused turn's continuation (or the user's next message) ends with its own goal evaluation, so the goal resumes after it. Marking the continuation synthesized instead was rejected: it would keep the marker but still run before the paused turn.
+
+Tests in `tests/tui_gateway/test_update_pause_superseded.py`:
+
+- `test_goal_continuation_after_a_carried_notice_turn_keeps_the_paused_turn` (RED before: the goal prompt ran and the marker was gone)
+- `test_goal_continuation_waits_while_a_paused_turn_continuation_is_due` (RED before)
+- `test_goal_continuation_still_runs_once_the_pause_is_retired` (control: a typed message retires the pause and the goal still continues)
+
+The goal judge is stubbed; no live update or real goal evaluation runs in these tests.
+
+Applying: append 0728 after 0725.
