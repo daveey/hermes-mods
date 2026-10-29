@@ -457,11 +457,13 @@ def test_fleet_route_builds_once_per_cache_window(disk_api, monkeypatch):
     module, client, _, _, _, _ = disk_api
     calls = []
     monkeypatch.setattr(module, '_gateway_section', lambda: calls.append(1) or dict(state='ready', machines=[]))
-    module._fleet_cache.clear()
+    module._fleet_invalidate()
     for _ in range(5):
         assert client.get(PREFIX + '/fleet', headers=TOKEN).status_code == 200
     assert len(calls) == 1
+    # The window passing ages every cache entry (the profile's and the shared gateway section's).
     module._fleet_cache[module.active_profile()]['at'] -= module.FLEET_CACHE_S + 1
+    module._gateway_cache['at'] -= module.FLEET_CACHE_S + 1
     client.get(PREFIX + '/fleet', headers=TOKEN)
     assert len(calls) == 2
 
@@ -522,6 +524,77 @@ def test_fleet_same_profile_polls_share_one_build(api, monkeypatch):
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert len(builds) == 1
+
+
+def test_fleet_profile_burst_builds_the_machine_wide_gateway_section_once(api, monkeypatch):
+    """The gateway section (board replicas, registry, kanban-home cap) has no profile input, but each
+    profile's entry rebuilt it: a 15 s poll never hits a 5 s cache, so every Desktop burst ran ten
+    identical builds at once (65 ms alone, 1.3-2.4 s wall together on the hub) and all ten answered
+    together, past the 5 s client timeout under contention (hub, 2026-10-29 13:26 PDT)."""
+    import threading, time
+    module, _, _ = api
+    module._fleet_invalidate()
+    current = threading.local()
+    monkeypatch.setattr(module, 'active_profile', lambda: current.name)
+    gateway_builds, ci_builds, guard = [], [], threading.Lock()
+    def gateway():
+        with guard:
+            gateway_builds.append(current.name)
+        time.sleep(0.2)
+        return dict(state='ready', machines=[dict(name='hub', slots=16, running=[])])
+    def ci():
+        with guard:
+            ci_builds.append(current.name)
+        return dict(state='ready', machines=[], owner=current.name)
+    monkeypatch.setattr(module, '_gateway_section', gateway)
+    monkeypatch.setattr(module, '_ci_section', ci)
+    results = {}
+    def poll(name):
+        current.name = name
+        results[name] = module.fleet_view()
+    def burst():
+        threads = [threading.Thread(target=poll, args=(n,)) for n in PROFILES]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+    burst()
+    assert len(gateway_builds) == 1, gateway_builds
+    # The CI section stays per profile: its owner_profile check must run as each profile.
+    assert sorted(ci_builds) == sorted(PROFILES)
+    assert {n: r['profile'] for n, r in results.items()} == {n: n for n in PROFILES}
+    assert {n: r['ci']['owner'] for n, r in results.items()} == {n: n for n in PROFILES}
+    assert all(r['gateways']['machines'][0]['name'] == 'hub' for r in results.values())
+    # Same expiry as before: past FLEET_CACHE_S the next burst rebuilds it, once.
+    for entry in list(module._fleet_cache.values()) + [module._gateway_cache]:
+        entry['at'] -= module.FLEET_CACHE_S + 1
+    burst()
+    assert len(gateway_builds) == 2 and len(ci_builds) == 2 * len(PROFILES)
+    # An investigation create invalidates it for every profile.
+    module._fleet_invalidate()
+    burst()
+    assert len(gateway_builds) == 3
+
+
+def test_fleet_gateway_section_failure_is_shared_for_the_window_not_retried_per_profile(api, monkeypatch):
+    import threading
+    module, _, _ = api
+    module._fleet_invalidate()
+    current = threading.local()
+    monkeypatch.setattr(module, 'active_profile', lambda: current.name)
+    calls = []
+    def down():
+        calls.append(1)
+        raise ImportError('no core')
+    monkeypatch.setattr(module, '_gateway_section', down)
+    monkeypatch.setattr(module, '_ci_section', lambda: dict(state='ready', machines=[]))
+    out = {}
+    def poll(name):
+        current.name = name
+        out[name] = module.fleet_view()['gateways']
+    threads = [threading.Thread(target=poll, args=(n,)) for n in PROFILES]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len(calls) == 1
+    assert all(v == {'state': 'unavailable', 'reason': 'ImportError', 'machines': []} for v in out.values())
 
 
 def test_local_cap_parses_config_once_until_it_changes(api, monkeypatch, tmp_path):

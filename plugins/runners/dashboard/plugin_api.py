@@ -321,18 +321,44 @@ def _fleet_entry(profile):
         return _fleet_cache.setdefault(profile, dict(at=None, value=None, lock=threading.Lock()))
 
 
+# The gateway section is machine-wide (board replicas, registry, kanban-home cap: no profile input),
+# so it has ONE entry and one single-flight lock shared by every profile route. Per-profile entries
+# rebuilt it ten times per Desktop poll burst (a 15 s poll never hits a 5 s cache), concurrently:
+# 65 ms alone became 1.3-2.4 s of GIL convoy for all ten polls at once.
+_gateway_cache = dict(at=None, value=None, lock=threading.Lock())
+
+
 def _fleet_invalidate():
     with _fleet_guard:
         for entry in _fleet_cache.values():
             entry.update(at=None, value=None)
+    _gateway_cache.update(at=None, value=None)
+
+
+def _section(build):
+    try:
+        return build()
+    except (RuntimeError, OSError, sqlite3.Error, ImportError, ValueError, KeyError) as exc:
+        return dict(state='unavailable', reason=type(exc).__name__, machines=[])
+
+
+def _shared_gateway_section():
+    import time
+    with _gateway_cache['lock']:
+        if _gateway_cache['value'] is not None and time.monotonic() - _gateway_cache['at'] < FLEET_CACHE_S:
+            return _gateway_cache['value']
+        value = _section(_gateway_section)
+        _gateway_cache.update(at=time.monotonic(), value=value)
+        return value
 
 
 @router.get('/fleet')
 def fleet_view():
     """Machines and slots: gateway workers (Board registry + leases) and CI workers (collector).
 
-    One build per FLEET_CACHE_S per profile, single-flight per profile: any number of open panels
-    polling a profile costs one registry read, a few indexed SQLite reads and one inventory projection.
+    One build per FLEET_CACHE_S per profile, single-flight per profile; the machine-wide gateway
+    section inside it is built once per FLEET_CACHE_S for all profiles (_shared_gateway_section), so
+    a poll burst over every profile costs one registry/replica read plus one CI projection each.
     """
     import time
     profile = active_profile()
@@ -346,12 +372,7 @@ def fleet_view():
 
 
 def _build_fleet(profile):
-    sections = {}
-    for key, build in (('gateways', _gateway_section), ('ci', _ci_section)):
-        try:
-            sections[key] = build()
-        except (RuntimeError, OSError, sqlite3.Error, ImportError, ValueError, KeyError) as exc:
-            sections[key] = dict(state='unavailable', reason=type(exc).__name__, machines=[])
+    sections = dict(gateways=_shared_gateway_section(), ci=_section(_ci_section))
     from datetime import datetime, timezone
     return dict(contract_version=1, profile=profile,
                 generated_at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), **sections)
