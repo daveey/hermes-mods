@@ -102,3 +102,19 @@ def test_llm_credit_ask_still_fires():
     assert rc.credit_ask("OpenAI returned insufficient_quota. Add $100 of credit and I'll rerun it.", [])
     # an LLM ask still fires when another paragraph mentions GitHub
     assert rc.credit_ask("CI on GitHub is green.\n\nAdd $250 of Anthropic credit so the eval can finish.", [])
+
+
+# Review round 1: a bare provider name is not billing context. A reply that mentions GitHub elsewhere still asks for
+# LLM credit; Claude Code named next to a GitHub Actions spending limit, or an AWS API key, is not an LLM credit ask.
+def test_bare_github_mention_does_not_silence_a_credit_ask():
+    for r in ("Pushed to GitHub. Please add $250 of credit to continue.",
+              "I opened PR #12 on GitHub.\n\nThe eval stopped: add $250 of credit and I'll rerun it.",
+              "Opened the PR on GitHub. Add $250 of Anthropic credit so the eval can finish."):
+        assert rc.credit_ask(r, []), r
+
+
+def test_bare_llm_name_does_not_turn_non_llm_billing_into_an_ask():
+    for r in ("The GitHub Actions run failed because Claude Code couldn't start; raise the spending limit for Actions.",
+              "I rotated the AWS API key. Add $20 of credit to AWS so the EC2 job keeps running.",
+              "Add $20 of credit to AWS; the AWS API key is in the vault."):
+        assert rc.credit_ask(r, []) is None, r

@@ -346,26 +346,47 @@ CREDIT_ASK_RE = re.compile(
     re.I)
 POOL_HELPER_RE = re.compile(r"hermes-pool-llm|pool_llm")
 # The ask must be about LLM API credit: the pool can't pay GitHub Actions, AWS, Vast or Cloudflare bills (live false
-# positive: "raise the spending limit" for the GitHub Actions billing watchdog).
+# positive: "raise the spending limit" for the GitHub Actions billing watchdog). Both signals are billing CONTEXT, never
+# a bare name: almost every coding reply says "GitHub" or "Claude", and that must not decide anything.
+_LLM = r"(?:anthropic|openai|open\s?router|gemini|claude|gpt|llm)"
+_BILL = (r"(?:credits?|credit balance|billing|quota|balance|funds|budget|spend(?:ing)?(?:\s+limit)?|top[- ]?up|bill"
+         r"|org|account)")
+_PREP = r"\s+(?:on|for|to|in|at|with|of)\s+(?:the\s+|our\s+|your\s+|my\s+)?"
 LLM_CREDIT_RE = re.compile(
-    r"\b(?:anthropic|openai|open\s?router|gemini|claude|gpt|llm)\b|insufficient_quota"
-    r"|credit balance is too low|no credits remaining|\bapi\s+(?:credits?|key|org)\b"
+    r"\b" + _LLM + r"(?:\s+api)?\s+" + _BILL + r"\b"
+    r"|\b" + _BILL + _PREP + _LLM + r"\b"
+    r"|insufficient_quota|credit balance is too low|no credits remaining|\bapi\s+credits?\b"
     r"|console\.anthropic\.com|platform\.openai\.com", re.I)
+_OTHER = (r"(?:github(?:\s+actions)?|actions|aws|ec2|vast(?:\.ai)?|cloudflare|runpod|lambda\s+labs|gcp|azure|heroku"
+          r"|vercel|netlify)")
 NON_LLM_BILLING_RE = re.compile(
-    r"\b(?:github(?:\s+actions)?|actions\s+(?:minutes|billing)|aws|ec2|vast(?:\.ai)?|cloudflare|runpod|lambda labs"
-    r"|gcp|azure|heroku|vercel|netlify)\b", re.I)
+    r"\bgithub\s+actions\b|\bactions\s+minutes\b"
+    r"|\b" + _OTHER + r"(?:\s+account)?\s+" + _BILL + r"\b"
+    r"|\b" + _BILL + _PREP + _OTHER + r"\b", re.I)
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n")
+
+
+def _nearest(rx: "re.Pattern", scope: str, a: int, b: int) -> Optional[int]:
+    """Distance from span [a, b) of scope to the nearest rx match (0 = overlapping), or None."""
+    d = [max(0, x.start() - b, a - x.end()) for x in rx.finditer(scope)]
+    return min(d) if d else None
 
 
 def _about_llm_credit(text: str, m: "re.Match") -> bool:
-    """The money wording at m may be about LLM provider credit. Its paragraph naming an LLM provider/error decides yes;
-    naming other billing (GitHub Actions, AWS, Vast, Cloudflare...) decides no; else the whole reply decides the same
-    way. A bare "add $250 of credit" with no provider named anywhere still counts (the rule's original case)."""
-    start, end = text.rfind("\n\n", 0, m.start()) + 1, text.find("\n\n", m.end())
-    for scope in (text[start:end if end >= 0 else len(text)], text):
-        if LLM_CREDIT_RE.search(scope):
-            return True
-        if NON_LLM_BILLING_RE.search(scope):
-            return False
+    """The money wording at m may be about LLM provider credit. Its sentence decides first, then its paragraph: the
+    billing target nearest the ask wins (LLM credit/quota wording = yes; GitHub Actions/AWS/Vast/Cloudflare billing =
+    no). A scope naming neither defers outward, never to other paragraphs; a bare "add $250 of credit" still counts."""
+    p0 = text.rfind("\n\n", 0, m.start()) + 1
+    p1 = text.find("\n\n", m.end())
+    p1 = len(text) if p1 < 0 else p1
+    cuts = [p0] + [x.end() + p0 for x in _SENTENCE_END.finditer(text[p0:p1])] + [p1]
+    s0 = max(c for c in cuts if c <= m.start())
+    s1 = min((c for c in cuts if c >= m.end()), default=p1)
+    for lo, hi in ((s0, s1), (p0, p1)):
+        scope, a, b = text[lo:hi], m.start() - lo, m.end() - lo
+        llm, other = _nearest(LLM_CREDIT_RE, scope, a, b), _nearest(NON_LLM_BILLING_RE, scope, a, b)
+        if llm is not None or other is not None:
+            return other is None or (llm is not None and llm <= other)
     return True
 
 
