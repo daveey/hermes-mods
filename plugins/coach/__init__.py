@@ -242,7 +242,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         t0 = time.time()
         since = getattr(coach, "turn_started", lambda _s: None)(session_id)
         try:
-            v = so.diff_review(ask, final_response, log_lines, changed_paths, since, repos=repos)
+            rc = _load("reply_check")
+            v = so.diff_review(ask, final_response, log_lines, changed_paths, since, repos=repos,
+                               llm=lambda s, p: so.aux_review(
+                                   s, p, timeout=rc.call_timeout(so.setting("diff_review_timeout_s"))))
         except Exception as exc:
             log.debug("coach diff_review: %s", exc)
             v = None
@@ -346,11 +349,76 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     def pre_verify(session_id="", platform="", attempt=0, final_response="", changed_paths=None, **_):
         """Check the agent's final answer before the turn ends; a hit keeps the turn going with a nudge.
-        At most one nudge per turn (attempt 0 only); fail-open on every error."""
+        At most one nudge per turn (attempt 0 only); fail-open on every error.
+
+        Runs inside one latency budget (reply_check.Budget) that fits the host's deadline for this callback. A nudge
+        counts only when it is returned before that deadline: `reply_nudge` is logged then, `reply_nudge_abandoned`
+        when the host already gave up (its result is discarded). The nudge is `reply_nudge_delivered` once the
+        continuation it asked for reaches pre_verify again in the same turn (attempt >= 1), and
+        `reply_nudge_undelivered` when the next check comes from a later turn instead."""
+        try:
+            rc = _load("reply_check")
+            budget = rc.start_budget()
+        except Exception as exc:
+            log.debug("coach pre_verify budget: %s", exc)
+            return None
+        token = rc.use_budget(budget)
+        try:
+            if session_id:
+                _nudge_delivery(session_id, attempt)
+            out: dict = {}
+            res = _reply_check(session_id, platform, attempt, final_response, changed_paths, out)
+            if not (isinstance(res, dict) and res.get("action") == "continue"):
+                return res
+            rec = out.get("rec") or {"event": "reply_nudge", "session_id": session_id, "rule": out.get("rule", "")}
+            timing = {"elapsed_s": round(budget.elapsed(), 2), "budget_s": budget.own_s,
+                      "host_timeout_s": budget.host_timeout_s}
+            turn = coach.turn_number(session_id)
+            if budget.abandoned():
+                st = coach.loop_state(session_id)
+                if (st.get("handoff_nudge") or {}).get("turn") == turn:
+                    st.pop("handoff_nudge", None)  # no continuation will come for it
+                store.log({**rec, "event": "reply_nudge_abandoned", **timing})
+                return None
+            if out.get("rec"):
+                store.log({**rec, **timing})
+            coach.loop_state(session_id)["pending_nudge"] = {
+                "turn": turn, "rule": rec.get("rule", ""), "at": time.time(),
+                **({"draft_id": rec["draft_id"]} if rec.get("draft_id") else {})}
+            return res
+        except Exception as exc:
+            log.debug("coach pre_verify: %s", exc)
+            return None
+        finally:
+            rc.reset_budget(token)
+
+    def _nudge_delivery(session_id, attempt):
+        """Close the pending nudge of this session: delivered when pre_verify runs again in its turn (the agent
+        continued), undelivered when the next check belongs to a later turn."""
+        try:
+            st = coach.loop_state(session_id)
+            n = st.get("pending_nudge")
+            if not n:
+                return
+            turn = coach.turn_number(session_id)
+            if n.get("turn") == turn and not attempt:
+                return  # a repeated attempt-0 check in the same turn: no continuation yet
+            st.pop("pending_nudge", None)
+            store.log({"event": "reply_nudge_delivered" if n.get("turn") == turn else "reply_nudge_undelivered",
+                       "session_id": session_id, "rule": n.get("rule", ""),
+                       "secs": round(time.time() - float(n.get("at") or time.time()), 1),
+                       **({"draft_id": n["draft_id"]} if n.get("draft_id") else {})})
+        except Exception as exc:
+            log.debug("coach nudge delivery: %s", exc)
+
+    def _reply_check(session_id, platform, attempt, final_response, changed_paths, out):
+        """pre_verify's check. The reply_nudge record of a judged hit goes to out["rec"] (logged by the caller only
+        if the nudge is returned in time); out["rule"] names the source of any other continue."""
         try:
             if session_id and final_response and platform not in ("cron",):
                 msg = _envelope(session_id, "reply", final_response, may_hold=not attempt)
                 if msg:
+                    out["rule"] = "compute_envelope"
                     return {"action": "continue", "message": msg}
             if attempt and session_id and final_response and platform not in ("cron",):
                 _handoff_outcome(session_id, final_response)
@@ -427,6 +495,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
                 if msg:
+                    out["rule"] = "diff_review"
                     return {"action": "continue", "message": msg}
                 if "unverified" not in cfg["rules"]:  # added only for the review: fall back to the next real rule
                     v = hit["verdict"]
@@ -443,9 +512,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response), **({"guard": guard} if guard else {})})
                 return None
-            store.log({"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
-                       "p": hit["p"], "evidence": hit["evidence"],
-                       **({"reason": hit["reason"]} if hit.get("reason") else {}), **draft_ref()})
+            out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
+                          "p": hit["p"], "evidence": hit["evidence"],
+                          **({"reason": hit["reason"]} if hit.get("reason") else {}), **draft_ref()}
             if hit["rule"] == "handoff":  # judged again on attempt 1: self-heal files the outcome, not the nudge
                 coach.loop_state(session_id)["handoff_nudge"] = {
                     "turn": coach.turn_number(session_id), "ask": ask, "log": list(log_lines)[-25:],
@@ -454,6 +523,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             log.debug("coach pre_verify: %s", exc)
             return None
+
+    # The host bounds this callback with its own budget (cores that honour per-callback budgets; others ignore it)
+    try:
+        pre_verify.hermes_hook_timeout = _load("reply_check").pre_verify_host_timeout_s()
+    except Exception as exc:
+        log.debug("coach pre_verify host timeout: %s", exc)
 
     def _handoff_outcome(session_id, final_response):
         """Attempt >= 1 after this turn's handoff nudge: judge the revised reply once (handoff only, same judge and

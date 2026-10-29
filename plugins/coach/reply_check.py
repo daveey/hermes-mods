@@ -21,9 +21,12 @@ never to the user.
 """
 from __future__ import annotations
 
+import contextvars
 import json
+import math
 import os
 import re
+import time
 from typing import Any, Callable, Optional
 
 HANDOFF_RE = re.compile(
@@ -803,12 +806,128 @@ def parse_confirm(raw: str) -> Optional[tuple]:
         return None
 
 
+# ---- pre_verify latency budget -------------------------------------------------------------------------------------
+# The host runs pre_verify on a worker it abandons at a deadline (core `plugins.hook_callback_timeout`, 30s default).
+# Work past that deadline is wasted, and a nudge returned after it is discarded, so the reply check runs inside one
+# explicit budget: every model call gets min(its own cap, time left - margin) and is skipped (fail-open) when less
+# than MIN_CALL is left. The coach declares host timeout = budget + slack on cores that honour per-callback budgets
+# (`hermes_hook_timeout`); older cores keep the global timeout, and the budget then shrinks to fit it.
+PRE_VERIFY_BUDGET_S = 75.0   # whole reply check: judge (cap 60s) + report_only confirm (cap 90s) + diff review share it
+PRE_VERIFY_SLACK_S = 10.0    # host timeout - budget: non-model work after the last call (log, drafts store, sqlite)
+PRE_VERIFY_MARGIN_S = 2.0    # kept free before the deadline on every call
+PRE_VERIFY_MIN_CALL_S = 5.0  # a model call with less time than this is not started
+_FALLBACK_HOST_TIMEOUT_S = 30.0
+
+
+def _env_s(name: str, default: float) -> float:
+    try:
+        v = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) and v >= 0 else default
+
+
+def pre_verify_budget_s() -> float:
+    return _env_s("COACH_PRE_VERIFY_BUDGET_S", PRE_VERIFY_BUDGET_S)
+
+
+def pre_verify_host_timeout_s() -> float:
+    """The per-callback host timeout the coach declares for pre_verify (seconds)."""
+    return pre_verify_budget_s() + _env_s("COACH_PRE_VERIFY_SLACK_S", PRE_VERIFY_SLACK_S)
+
+
+class BudgetExhausted(TimeoutError):
+    """Too little of the pre_verify budget is left to start another model call."""
+
+
+class Budget:
+    """One pre_verify call's deadline: the coach's own budget, capped by the host's deadline. `host` is core's
+    HookCallBudget (deadline + abandoned flag) when the core exposes it; otherwise `host_timeout_s` (the resolved
+    global hook timeout) is measured from this call's start, so the coach still fits an older core's bound."""
+
+    def __init__(self, own_s: float, host: Any = None, host_timeout_s: Optional[float] = None, clock=time.monotonic):
+        self.clock = clock
+        self.t0 = clock()
+        self.own_s = own_s
+        self.host = host
+        self.host_timeout_s = getattr(host, "timeout", None) if host is not None else host_timeout_s
+        self._host_deadline = (getattr(host, "deadline", None) if host is not None
+                               else (self.t0 + host_timeout_s if host_timeout_s else None))
+        self.margin = _env_s("COACH_PRE_VERIFY_MARGIN_S", PRE_VERIFY_MARGIN_S)
+        self.min_call = _env_s("COACH_PRE_VERIFY_MIN_CALL_S", PRE_VERIFY_MIN_CALL_S)
+
+    def elapsed(self) -> float:
+        return self.clock() - self.t0
+
+    def host_remaining(self) -> Optional[float]:
+        if self.host is not None and getattr(self.host, "abandoned", None) is not None and self.host.abandoned.is_set():
+            return 0.0
+        if self._host_deadline is None:
+            return None
+        return max(0.0, self._host_deadline - self.clock())
+
+    def remaining(self) -> float:
+        r = self.own_s - self.elapsed()
+        h = self.host_remaining()
+        return max(0.0, r if h is None else min(r, h))
+
+    def abandoned(self) -> bool:
+        """True once the host stopped (or must be assumed to have stopped) waiting for this call: anything this
+        call returns now is discarded, so it must not be recorded as a delivered nudge."""
+        h = self.host_remaining()
+        return h is not None and h <= min(0.25, self.margin)
+
+    def call_timeout(self, cap: float) -> float:
+        left = self.remaining() - self.margin
+        if left < self.min_call:
+            raise BudgetExhausted(f"{left:.1f}s left of the pre_verify budget")
+        return min(float(cap), left)
+
+
+_BUDGET: contextvars.ContextVar[Optional[Budget]] = contextvars.ContextVar("coach_pre_verify_budget", default=None)
+
+
+def start_budget(own_s: Optional[float] = None) -> Budget:
+    """The Budget for the pre_verify call running on this thread (reads the host deadline when core exposes it)."""
+    own_s = pre_verify_budget_s() if own_s is None else own_s
+    try:
+        from hermes_cli.plugins import current_hook_call  # type: ignore
+    except Exception:
+        current_hook_call = None
+    if current_hook_call is not None:
+        # None here = the host runs pre_verify synchronously (hook timeout disabled): only the own budget applies
+        return Budget(own_s, host=current_hook_call())
+    host_s = None
+    try:
+        from hermes_cli.plugins import _resolve_hook_callback_timeout  # type: ignore
+        host_s = float(_resolve_hook_callback_timeout())
+    except Exception:
+        host_s = _FALLBACK_HOST_TIMEOUT_S
+    return Budget(own_s, host_timeout_s=host_s if host_s and host_s > 0 else None)
+
+
+def use_budget(budget: Optional[Budget]):
+    """Install `budget` for this thread's model calls; returns the token for reset_budget()."""
+    return _BUDGET.set(budget)
+
+
+def reset_budget(token) -> None:
+    _BUDGET.reset(token)
+
+
+def call_timeout(cap: float) -> float:
+    """Timeout for one model call: `cap` outside pre_verify, else capped by what is left of its budget (raises
+    BudgetExhausted when too little is left, which the reply check treats as no verdict)."""
+    b = _BUDGET.get()
+    return float(cap) if b is None else b.call_timeout(cap)
+
+
 def aux_confirm(system: str, prompt: str) -> str:
     """Aux task `coach_report_only` (auxiliary.coach_report_only.{provider,model} in shared-config.json)."""
     from agent.auxiliary_client import call_llm  # type: ignore
     resp = call_llm(task="coach_report_only", messages=[{"role": "system", "content": system},
                                                        {"role": "user", "content": prompt}],
-                    max_tokens=1000, temperature=0, timeout=90)
+                    max_tokens=1000, temperature=0, timeout=call_timeout(90))
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 
@@ -949,7 +1068,7 @@ def aux_judge(system: str, prompt: str) -> str:
     from agent.auxiliary_client import call_llm  # type: ignore
     resp = call_llm(task="coach_reply", messages=[{"role": "system", "content": system},
                                                  {"role": "user", "content": prompt}],
-                    max_tokens=2000, temperature=0, timeout=60)
+                    max_tokens=2000, temperature=0, timeout=call_timeout(60))
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 

@@ -197,6 +197,19 @@ Settings: `COACH_REPLY_RULES` (comma list or `none`), `COACH_REPLY_THRESHOLD` an
 `agent.pre_verify_every_turn: true` (fork commit `4c93d9c632`), because `pre_verify` otherwise fires only after
 file edits. Nudges are logged as `reply_nudge` in `log.jsonl`; a turn the check ran on without a hit logs `reply_checked` (with the prefilter candidates).
 
+Latency budget (`reply_check.Budget`). The host runs `pre_verify` on a worker it abandons at a deadline, so the whole
+check runs inside one explicit budget: `COACH_PRE_VERIFY_BUDGET_S` (default 75s) and the coach declares host timeout
+= budget + `COACH_PRE_VERIFY_SLACK_S` (default 10s, so 85s) via `pre_verify.hermes_hook_timeout`. Every model call
+(judge, cap 60s; report_only confirm, cap 90s; diff review, `diff_review_timeout_s`) gets `min(cap, time left -
+COACH_PRE_VERIFY_MARGIN_S)` (2s) and is not started with less than `COACH_PRE_VERIFY_MIN_CALL_S` (5s) left (no
+verdict, fail-open). The deadline is the host's own (`hermes_cli.plugins.current_hook_call()`, fork commit
+`f5271c08c0`); on an older core that ignores per-callback budgets it is the global `plugins.hook_callback_timeout`
+(30s) from the call's start, so the check still fits. Delivery is recorded, not assumed: `reply_nudge` is logged only
+when the nudge is returned before the deadline (with `elapsed_s`, `budget_s`, `host_timeout_s`);
+`reply_nudge_abandoned` when the host already gave up (result discarded, no continuation); `reply_nudge_delivered`
+once the continuation reaches `pre_verify` again in the same turn (attempt >= 1); `reply_nudge_undelivered` when the
+next check comes from a later turn instead. Dispatch-level tests: `tests/test_pre_verify_deadline.py`.
+
 ### Goal disposition (`pre_final_gate`, experimental and default off)
 
 `goal_disposition.py` checks diagnosis-only endings that do not contain an ask, promise or
