@@ -268,7 +268,11 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
     relayed = set(row.get("relayed") or [])
     keep = {p for p in relayed if _premise_card(p) in batch
-            and (is_unknown(cards.get(_premise_card(p))) or is_settled(cards[_premise_card(p)]))}
+            and (is_unknown(cards.get(_premise_card(p))) or is_settled(cards[_premise_card(p)])
+                 or ask_premise(_premise_card(p), cards[_premise_card(p)]) == p)}
+    # ^ a card still parked on the very premise we told the chat about stays told, even when is_settled() is False
+    #   for it (a fresh shepherd row: blocked + complete human_request but block_kind None). Only a changed or
+    #   vanished ask (card back to work, re-blocked for another reason) makes the premise forgettable.
     reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
     gone = {i for i in covered & batch if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
     out: dict[str, Any] = {}

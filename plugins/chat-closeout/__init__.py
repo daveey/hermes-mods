@@ -838,7 +838,7 @@ def start_thread() -> Optional[threading.Event]:
 
 
 def register(ctx) -> None:
-    logger.info("chat-closeout: loaded relay-stamp-keep-v4 module=%s core=%s", __file__, core.__file__)
+    logger.info("chat-closeout: loaded relay-stamp-keep-v5 module=%s core=%s", __file__, core.__file__)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)

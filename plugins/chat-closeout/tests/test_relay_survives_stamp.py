@@ -25,12 +25,12 @@ def ask_card(remote, stale=False):
     return card
 
 
-def run(tmp_path, monkeypatch, remote, post_turn_cards):
+def run(tmp_path, monkeypatch, remote, post_turn_cards, key_card=None):
     led = core.Ledger(tmp_path / 'ledger.db')
     monkeypatch.setattr(plugin, 'ledger', lambda: led)
     monkeypatch.setattr(plugin, '_lineage', lambda sid: [sid])
     monkeypatch.setattr(plugin, '_moved_owner', lambda sid: None, raising=False)
-    fresh = {KEY: ask_card(remote), WORK: {'status': 'running'}}
+    fresh = {KEY: key_card or ask_card(remote), WORK: {'status': 'running'}}
     led.write('chat', batch=list(fresh), open=list(fresh))
     calls = []
 
@@ -72,3 +72,35 @@ def test_card_that_really_went_back_to_work_is_forgotten(tmp_path, monkeypatch):
     core.record_turn_end(led, 'chat', [KEY, WORK], lambda ids: cards, now=2000)
     row = led.get('chat')
     assert row['relayed'] == [] and row['covered'] == []
+
+
+def shepherd_ask_card():
+    """The live shape of the hub's macbook sandbox card: a FRESH shepherd-projected row, blocked with a complete
+    human_request but block_kind None, so is_settled() is False while ask_premise() still names the ask."""
+    return {'status': 'blocked', 'block_kind': None, 'human_request': dict(HR), 'remote': True, 'stale': False,
+            'via': 'shepherd', 'unfinished': True, 'binding_id': None}
+
+
+def test_fresh_shepherd_row_with_ask_but_no_block_kind_stays_relayed(tmp_path, monkeypatch):
+    post = {KEY: shepherd_ask_card(), WORK: {'status': 'running'}}
+    led, calls = run(tmp_path, monkeypatch, True, post, key_card=shepherd_ask_card())
+    assert len(calls) == 1
+    assert led.get('chat')['relayed']
+
+
+def test_wake_tick_reconcile_keeps_relay_for_unsettled_ask_card(tmp_path):
+    led = core.Ledger(tmp_path / 'ledger.db')
+    card = shepherd_ask_card()
+    prem = core.ask_premise(KEY, card)
+    assert prem and not core.is_settled(card)
+    assert core.reconcile({'batch': [KEY, WORK], 'covered': [KEY], 'relayed': [prem]},
+                          {KEY: card, WORK: {'status': 'running'}}).get('relayed', {prem}) == {prem}
+
+
+def test_changed_ask_on_unsettled_card_is_a_new_premise(tmp_path):
+    card = shepherd_ask_card()
+    prem = core.ask_premise(KEY, card)
+    card['human_request']['action'] = 'A different question'
+    out = core.reconcile({'batch': [KEY, WORK], 'covered': [KEY], 'relayed': [prem]},
+                         {KEY: card, WORK: {'status': 'running'}})
+    assert out['relayed'] == set()
