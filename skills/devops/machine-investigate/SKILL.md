@@ -41,7 +41,8 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only).
 
 ## What you may fix without asking
 
-- `collect.py clean --apply`: package/build caches only (uv, pip, npm/_npx, go build, cargo registry cache,
+- `collect.py clean --apply` (can take several minutes: run it in the background and wait for it, not in a
+  foreground call with a short timeout): package/build caches only (uv, pip, npm/_npx, go build, cargo registry cache,
   Homebrew, Xcode DerivedData, pnpm store prune, unavailable simulators). Report before/after free space.
 - `collect.py kill PID --apply`: refuses unless the process belongs to a Kanban card that is done, archived or
   blocked, and it never kills a GUI app or a Hermes gateway/serve. Use it for those leftovers only.

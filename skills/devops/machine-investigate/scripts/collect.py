@@ -315,9 +315,11 @@ def clean(apply: bool) -> dict:
         if apply:
             tool = c["cmd"] and shutil.which(c["cmd"][0])
             if tool:
-                res = subprocess.run(c["cmd"], capture_output=True, text=True, timeout=900)
                 act["ran"] = " ".join(c["cmd"])
-                act["exit"] = res.returncode
+                try:
+                    act["exit"] = subprocess.run(c["cmd"], capture_output=True, text=True, timeout=180).returncode
+                except subprocess.TimeoutExpired:
+                    act["exit"] = "timeout after 180 s"  # falls back to removing the directory below
             if not tool or (p.exists() and (du_kb(p) or 0) > before * 0.5):
                 if _safe_target(p):
                     shutil.rmtree(p, ignore_errors=True)

@@ -121,3 +121,18 @@ def test_report_runs_on_this_machine(c):
     out = c.report(1, with_du=False)
     assert out["cpus"] >= 1 and isinstance(out["processes"]["top"], list)
     assert out["disk"]["home_volume"]["total_gb"] > 0
+
+
+def test_clean_survives_a_hanging_tool_and_still_removes_the_cache(c, tmp_path, monkeypatch):
+    import subprocess as sp
+    _fill(tmp_path / ".cache/uv", 60)
+    monkeypatch.setattr(c.shutil, "which", lambda name: "/bin/" + name)
+    real = sp.run
+    def run(cmd, *a, **kw):
+        if cmd[0] == "uv":
+            raise sp.TimeoutExpired(cmd, kw.get("timeout"))
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(c.subprocess, "run", run)
+    done = c.clean(apply=True)
+    uv = next(a for a in done["actions"] if a["name"] == "uv cache")
+    assert uv["exit"] == "timeout after 180 s" and uv["removed"] and not (tmp_path / ".cache/uv").exists()
