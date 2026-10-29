@@ -18,8 +18,39 @@ HEAD = re.compile(r"\b(?:head|sha|commit)\s*[:=@]?\s*`?(" + HEX + r")(?![0-9A-Za
 SHORT = re.compile(r"\bPR\s*#(" + NUMBER + r")\b", re.I)
 LABELED = re.compile(r"\b(" + REPO + r")\s+PR\s*#(" + NUMBER + r")\b", re.I)
 REPO_LABEL = re.compile(r"\bRepo(?:sitory)?\s*:?\s+(" + REPO + r")\b", re.I)
-LIFECYCLE = re.compile(r"\s*[.]?\s+Unblock\s*=\s*(.+?)[;.]\s*archive\s*=\s*(.+)\s*$", re.I)
-EXTRA_AUTH = re.compile(r"\b(?:approve|authorize|purchase|spend|pay|delete|rotate|grant|unlock|destroy)\b|force[- ]push|\bdrop\s+(?:(?:the|prod|production)\s+)*(?:database|db|table)\b", re.I)
+LIFECYCLE = re.compile(r"\bUnblock\s*=(.*?)[;.]\s*archive\s*=(.*)\Z", re.I | re.S)
+# Full clauses, not verb prefixes: arbitrary objects/tails would reopen scope.
+PR_OBJECT = r"(?:the\s+)?(?:PR|change)|it"
+UNBLOCK_OUTCOME = re.compile(
+    r"(?:queue(?:\s+(?:merges?|(?:the\s+)?merge\s+train))?"
+    r"|merge\s+train"
+    r"|(?:agent\s+)?merges?(?:\s+(?:" + PR_OBJECT + r"))?(?:\s+via\s+normal\s+gates)?"
+    r"|(?:deploys?|release|ship)(?:\s+(?:" + PR_OBJECT + r"))?"
+    r"|(?:I\s+)?(?:verify|check)(?:\s+CI)?"
+    r"|(?:I\s+)?(?:re[- ]run|watch)\s+CI"
+    r"|(?:continue|resume)(?:\s+the\s+task)?)", re.I)
+ARCHIVE_OUTCOME = re.compile(
+    r"(?:close(?:\s+(?:the\s+)?PR)?"
+    r"|(?:drop|abandon)\s+the\s+change"
+    r"|(?:findings\s+stay|(?:the\s+)?card\s+stays?)\s+open"
+    r"|leave\s+(?:it|the\s+PR)\s+unmerged"
+    r"|PR\s+left\s+open)", re.I)
+OUTCOME_JOIN = re.compile(r",|\+|\b(?:and|then)\b", re.I)
+
+
+def _outcome_failure(lifecycle):
+    """Name the first unknown atom; never infer permission from an unknown verb."""
+    for name, text, allowed in zip(("Unblock", "archive"), lifecycle.groups(),
+                                    (UNBLOCK_OUTCOME, ARCHIVE_OUTCOME)):
+        text = text.strip()
+        # Only the final sentence terminator is punctuation, not arbitrary tails.
+        if name == "archive" and text.endswith("."):
+            text = text[:-1].rstrip()
+        for clause in OUTCOME_JOIN.split(text):
+            clause = clause.strip()
+            if not allowed.fullmatch(clause):
+                return f"Unrecognised {name} outcome clause: {clause!r}."
+    return ""
 REFERENCE = (r"(?:https://github\.com/" + REPO + r"/pull/" + NUMBER
              + r"|" + REPO + r"#" + NUMBER + r"|PR\s*#" + NUMBER + r")")
 SURFACE = r"(?:Discord|Slack|(?:the\s+)?(?:BB\s+)?Inbox)"
@@ -92,7 +123,7 @@ def request_target(row):
         return None
     lifecycle = LIFECYCLE.search(action)
     if lifecycle:
-        if (any(EXTRA_AUTH.search(part) for part in lifecycle.groups())
+        if (_outcome_failure(lifecycle)
                 or len(re.findall(r'\bUnblock\s*=', action, re.I)) != 1
                 or len(re.findall(r'\barchive\s*=', action, re.I)) != 1):
             return None
@@ -152,6 +183,15 @@ def parse_failure_reason(row) -> str:
     missing = [name for name, value in (("repository (OWNER/REPO)", repo),
                ("PR number (N)", number), ("head (SHA)", head)) if value is None]
     reason = "Not a supported PR-only approval request; use the canonical wording without additional authorization."
+    hr = _request(row) or {}
+    action = hr.get("action")
+    lifecycle = LIFECYCLE.search(action) if isinstance(action, str) else None
+    if lifecycle:
+        failure = _outcome_failure(lifecycle)
+        if failure:
+            reason += " " + failure
+    elif isinstance(action, str) and re.search(r"\b(?:Unblock|archive)\s*=", action, re.I):
+        reason += " Malformed Unblock/archive section; use Unblock = <clauses>; archive = <clauses>."
     if missing:
         reason += " Missing or ambiguous fields: " + ", ".join(missing) + "."
     return reason

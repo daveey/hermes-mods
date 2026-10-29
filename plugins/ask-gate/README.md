@@ -145,7 +145,14 @@ The strict action accepts optional `please`, optional `at head/sha/commit SHA`, 
   or `(head/sha/commit SHA)` (7–40 hexadecimal characters), optional `on GitHub`, and optional
   `, or OK the bb approval ask in …`. Allowed surfaces are only Discord, Slack, BB Inbox, the BB Inbox,
   Inbox, or the Inbox, joined by `/`, commas, or `or`. The existing `Unblock = …; archive = …` suffix
-  is recognized, but additional authorization in the action or unblock outcome is not accepted.
+  is recognized only when every full outcome clause is allowlisted (case-insensitive):
+  Unblock permits queue/merge/merge train, deploy/release/ship, verify/check/re-run/watch CI,
+  and continue/resume the task. Archive permits close the PR, drop/abandon the change,
+  findings/card stay open, and leave it unmerged. Clauses combine with `and`, `,`, `+`, or `then`.
+  Fixed compatibility phrases `agent merges via normal gates` and `PR left open` are also accepted.
+  Arbitrary objects or trailing instructions are rejected, not screened against a verb denylist.
+  Diagnostics quote the first unrecognised clause and its outcome side; malformed sections get
+  a syntax diagnostic. Replace the canonical template's ellipses with concrete supported clauses.
 
 For structured `kanban_block` and `kanban_create(initial_status='blocked')`, an approval-looking request
 that cannot strictly parse receives one deterministic wording hold per process-local session/tool/action+scope.
@@ -163,6 +170,18 @@ context ambiguity, JSON requests, owner independence and correction placeholders
 registers the actual `pre_tool_call` entry for both create and block, exercises the hold/retry, canonical and
 slash-separated regression requests, missing metadata, independent keys and evidence checks after retry.
 These use local synthetic data and stub judges/adapters, not live filing or approval services.
+`tests/test_pr_outcome_allowlist.py` covers complete positive lifecycle clauses, unknown verb classes
+(wipe, transfer, email/send, publish, revoke), arbitrary tails, malformed/multiline diagnostics,
+and bounded long-whitespace extraction. Filing tests exercise clause diagnostics on both tools.
+
+Five whys for the outcome-scope gap: unknown verbs were accepted because outcomes used a finite
+`EXTRA_AUTH` denylist instead of a complete positive grammar. Adding verbs only excluded known
+examples, leaving every unnamed instruction in accepted scope. The action's fullmatch did not protect
+these separately stripped outcomes. Earlier safety tests (`test_lifecycle_does_not_smuggle_authorization`)
+covered named destructive verbs and repeated keys, not unknown operations; thus that test contract
+could pass while the stated PR-only contract failed. The fix fullmatches each atom and tests unknown
+verb classes on both outcomes, with filing-boundary diagnostics. Authority, owner, head, receipt and
+CAS checks are unchanged; this parser still never grants permission.
 
 ### Cited evidence and vendor entitlements
 
