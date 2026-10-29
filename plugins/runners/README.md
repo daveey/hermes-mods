@@ -187,6 +187,17 @@ The separate repair ledger is additive and bounded to 100 active reservations an
 10,000 audit/idempotency requests. It fails closed when full rather than forgetting
 an ambiguous request. Generic Store retention does not prune this ledger.
 
+## Verifying a relayed approval (`runners_receipt`)
+
+A repair chat cannot treat "David approved it" in a message as evidence. `runners_receipt{repair_id, operation_id}`
+is a read-only lookup of the recorded decision in the user-steps store (read-only SQLite connection, same owner
+profile). It returns `verified=true` only when the operation is `effect=approve` with `executionAuthorized=true`,
+its frozen scope is complete and names this repair's subject (runner id, service ref or runner display name, exact
+token), and then lists `authorized_operations`: `diagnose` always, `service_start` only if the scope wording covers
+starting/recovering the subject. Declined/revised decisions, other subjects, unknown or malformed operation ids
+and a relay without a receipt are refused. It cannot create or consume a decision; `runners_operate` still
+enforces the broker policy.
+
 ## Guarded management operations (broker)
 
 `runners_operate` is the only management entry point a repair session gets. It forwards
