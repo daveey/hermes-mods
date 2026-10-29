@@ -80,6 +80,17 @@ If the user has given standing approval to quit/kill and relaunch an app or back
 memory), use it when updates are stuck waiting for in-flight turns to end. First check that no
 update/sync is mid-run and note any work the restart interrupts; tell the user after.
 
+## State in the title (every sweep)
+
+An idle session that is waiting looks stuck in the sidebar. Every sweep, keep each open session's
+title prefixed with its state, refreshed from a live check:
+- `▶` running (a turn or a known background agent is working) — say on what
+- `⏳` waiting — name the thing: PR/CI run, merge queue, deploy, another session, a schedule
+- `🔴` needs the user — name the decision in a few words
+- done → archive it (and tell the user); if archive is refused, title it `✅ done (archive me)`
+Verify each "waiting" against reality (PR state, CI, the watcher process); if nothing is actually
+pending, nudge the session or close it instead of letting it sit.
+
 ## Never report stale state
 
 The user talks to sessions directly, so anything you remember can be out of date. Before you
