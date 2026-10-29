@@ -264,3 +264,21 @@ def test_junk_audit_files_one_kanban_card_per_poster_family():
     by_key = {a[a.index("--idempotency-key") + 1]: kw["input"] for a, kw in calls}
     only_dm = [v for k, v in by_key.items() if ":x-dm:" in k][0]
     assert "x-dm" in only_dm and "gh-actions-billing" not in only_dm
+
+
+def test_audit_drains_refusals_whose_kanban_routing_was_fenced(tmp_path):
+    """A refusal logged with routing_error (worker fence, board down) is filed as a Kanban card by the cron."""
+    audit = _load("_inbox_junk_audit_drain", HERE / "junk_audit.py")
+    log = tmp_path / "inbox" / "refusals.jsonl"
+    log.parent.mkdir()
+    lines = [{"at": 1.0, "family": "cron", "poster": "cron", "key": "k1", "title": "Hub change was rejected", "body": "b",
+              "accept_prompt": "x", "reason": "content_status", "routing_error": "PermissionError: fenced"},
+             {"at": 2.0, "family": "x-dm", "key": "k2", "title": "ok", "reason": "ask_missing", "task": "t_done"}]
+    log.write_text("\n".join(json.dumps(r) for r in lines) + "\n")
+    made = []
+    creator = lambda **kw: made.append(kw) or "t_new"  # noqa: E731
+    assert audit.drain_refusals(tmp_path, creator) == 1
+    assert made[0]["idempotency_key"] == "inbox-refused:cron:k1" and "content_status" in made[0]["body"]
+    rows = [json.loads(x) for x in log.read_text().splitlines()]
+    assert rows[0]["task"] == "t_new" and "routing_error" not in rows[0] and rows[1]["task"] == "t_done"
+    assert audit.drain_refusals(tmp_path, creator) == 0 and len(made) == 1  # idempotent

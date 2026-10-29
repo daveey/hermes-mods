@@ -153,6 +153,46 @@ def file_cards(res: dict, now: float, runner=subprocess.run) -> dict:
     return made
 
 
+def drain_refusals(home, creator=None) -> int:
+    """File the Kanban card for refusals whose routing failed at post time (worker fence, board down).
+
+    ``<home>/inbox/refusals.jsonl`` keeps every refusal; one with ``routing_error`` and no ``task`` was never
+    filed. A cron/gateway process (not a fenced worker) retries it with the same idempotency key, then rewrites the
+    log atomically with the task id. Returns how many cards were filed.
+    """
+    import os
+    path = Path(home) / "inbox" / "refusals.jsonl"
+    if not path.exists():
+        return 0
+    creator = creator or _store().kanban_task_creator
+    rows, filed = [], 0
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            rows.append(line)
+            continue
+        if row.get("routing_error") and not row.get("task"):
+            try:
+                row["task"] = creator(
+                    title=f"Inbox refused: {row.get('title')}"[:120],
+                    body=f"Reason: {row.get('reason')}\n\n{row.get('title')}\n\n{row.get('body') or ''}\n\n"
+                         f"Requested instruction: {row.get('accept_prompt')}",
+                    assignee="default", idempotency_key=f"inbox-refused:{row.get('family')}:{row.get('key') or row.get('title')}")
+                row.pop("routing_error", None)
+                filed += 1
+            except Exception as exc:  # noqa: BLE001 - leave it for the next run
+                row["routing_error"] = f"{type(exc).__name__}: {exc}"
+        rows.append(row)
+    if filed:
+        tmp = path.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(r if isinstance(r, str) else json.dumps(r, ensure_ascii=True) for r in rows) + "\n")
+        os.replace(tmp, path)
+    return filed
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--json", help="read items from this file instead of `hermes-hub inbox --all --json`")
@@ -167,11 +207,12 @@ def main(argv=None) -> int:
             return 1
         items = json.loads(p.stdout)
     now = time.time()
+    drained = 0 if a.dry_run else drain_refusals(_store()._home())
     res = audit(items, now)
     cards = file_cards(res, now) if res["fresh"] and not a.dry_run else {}
     print(json.dumps({"items_7d": res["window_items"], "senders": len(res["senders"]),
                       "reposted_keys": len(res["reposted_keys"]), "test_cards": len(res["test_cards"]),
-                      "fresh": res["fresh"], "cards": cards}))
+                      "fresh": res["fresh"], "cards": cards, "refusals_drained": drained}))
     if a.dry_run:
         print(card_body(res))
     return 0
