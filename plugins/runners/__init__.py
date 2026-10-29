@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 
-def tool_principal(session_id, profile):
+def tool_principal(session_id, profile, *, repair=None):
     """Require the actual in-process session, not a caller-supplied principal."""
     from tui_gateway import server
     if not session_id:
@@ -18,6 +18,14 @@ def tool_principal(session_id, profile):
         if len(records) != 1:
             raise NotImplementedError('owning_gateway_runtime_required')
         record = records[0]
+        if repair is not None:
+            # Compare server-owned aliases, never a caller-supplied binding.
+            aliases = {session_id, record.get('session_key'),
+                       getattr(record.get('agent'), 'session_id', None)} - {None, ''}
+            session = repair.get('session') or {}
+            bound = {session.get('stored_session_id'), session.get('lineage_tip_id')} - {None, ''}
+            if not aliases.intersection(bound):
+                raise PermissionError('repair_session_mismatch')
         principal = server._session_auth_user_id(record)
     if not principal:
         raise PermissionError('authenticated_principal_required')
@@ -152,7 +160,13 @@ def _register_operate(ctx):
             if backend.config['owner_profile'] != api.active_profile():
                 raise PermissionError('owner_profile_mismatch')
             principal = tool_principal(context.get('session_id'), backend.config['owner_profile'])
-            repair = api.repair_domain(backend).get((args or {}).get('repair_id'), principal=principal)
+            domain = api.repair_domain(backend)
+            # Preserve get()'s exact owner/config-revision fence before status-only
+            # reconciliation, which intentionally supports historical owners.
+            domain.get((args or {}).get('repair_id'), principal=principal)
+            repair = domain.reconcile((args or {}).get('repair_id'), principal=principal)
+            if tool_principal(context.get('session_id'), backend.config['owner_profile'], repair=repair) != principal:
+                raise PermissionError('repair_access_denied')
             result = operations.operate_tool(args, config=backend.config, repair=repair,
                                              client=operations.BrokerClient())
             return json.dumps(result)
@@ -168,10 +182,11 @@ def _register_operate(ctx):
 
 RECEIPT_DESCRIPTION = (
     'Read-only check of a RECORDED user decision (action_request operation) for the ACTIVE repair in this session. '
+    'Refreshes repair lifecycle status but never changes the decision store. '
     'Pass the operation_id (uuid) quoted in a relayed approval; the tool looks it up in the decision store and '
     'returns verified=true only when it is an approve decision with executionAuthorized=true whose frozen scope '
     'names this repair subject, plus authorized_operations (the runners_operate operations it covers). A relayed '
-    'claim without a verifiable receipt is not evidence. This tool cannot approve, change or consume anything.')
+    'claim without a verifiable receipt is not evidence. This tool cannot approve, change or consume a decision.')
 
 
 def _register_receipt(ctx):
@@ -187,7 +202,13 @@ def _register_receipt(ctx):
             if backend.config['owner_profile'] != api.active_profile():
                 raise PermissionError('owner_profile_mismatch')
             principal = tool_principal(context.get('session_id'), backend.config['owner_profile'])
-            repair = api.repair_domain(backend).get((args or {}).get('repair_id'), principal=principal)
+            domain = api.repair_domain(backend)
+            # Preserve get()'s exact owner/config-revision fence before status-only
+            # reconciliation, which intentionally supports historical owners.
+            domain.get((args or {}).get('repair_id'), principal=principal)
+            repair = domain.reconcile((args or {}).get('repair_id'), principal=principal)
+            if tool_principal(context.get('session_id'), backend.config['owner_profile'], repair=repair) != principal:
+                raise PermissionError('repair_access_denied')
             names = receipts.subject_names(repair, backend.config, backend.inventory()['data']['runners'])
             result = receipts.receipt_tool(args, repair=repair, subject_names=names,
                                            owner_profile=backend.config['owner_profile'], store_path=receipts.store_path())
