@@ -15,6 +15,7 @@ Anything outside these allowlists is reported with a size or owner and left for 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import platform
@@ -137,9 +138,62 @@ def label(agent: dict) -> str:
     return ""
 
 
-def processes(table: dict, tags_fn=env_tags) -> dict:
+def parse_runnable(out: str) -> dict:
+    """Parse Darwin ps -M -ax, including USER-less continuation thread rows.
+
+    PRI has scheduler flags (4T, 31R, 4N); STAT may have modifiers (R+).
+    This is a point-in-time thread count, not the time-averaged load value.
+    """
+    by_priority, priority4 = {}, {}
+    for line in out.splitlines():
+        fields = line.split(None, 8)
+        if not fields:
+            continue
+        offset = 1 if len(fields) > 1 and fields[1].isdigit() else 0
+        try:
+            pid = int(fields[offset])
+            state = fields[offset + (2 if offset == 0 else 3)]
+            pri = fields[offset + (3 if offset == 0 else 4)]
+        except (ValueError, IndexError):
+            continue
+        if not state.startswith("R") or not re.fullmatch(r"\d+[TRN]*", pri):
+            continue
+        priority = str(int(pri.rstrip("TRN")))
+        by_priority[priority] = by_priority.get(priority, 0) + 1
+        if priority == "4":
+            priority4[pid] = priority4.get(pid, 0) + 1
+    return {"total": sum(by_priority.values()),
+            "by_priority": dict(sorted(by_priority.items(), key=lambda kv: int(kv[0]))),
+            "priority4": [{"pid": p, "threads": n} for p, n in
+                          sorted(priority4.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]}
+
+
+def runnable_snapshot() -> dict:
+    # -c avoids fetching argv (the process table already has names/ancestry).
+    # A safety timeout is not a performance claim: scheduling can delay ps.
+    try:
+        out = subprocess.run(["/bin/ps", "-M", "-axc"], capture_output=True,
+                             text=True, check=True, timeout=2).stdout
+        return parse_runnable(out)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Never report a failed measurement as a zero queue, or drop the spike.
+        return {"total": None, "by_priority": {}, "priority4": [], "error": type(exc).__name__}
+
+
+def attribute_runnable(snapshot: dict, table: dict, tags: dict) -> dict:
+    rows = []
+    for row in snapshot["priority4"]:
+        p = row["pid"]
+        c = chain(table, p)
+        rows.append(dict(row, name=table.get(p, {}).get("name", "?"),
+                         chain=[f"{table[q]['name']}[{q}]" for q in c[1:]],
+                         owner=label(owner(table, tags, p))))
+    return dict(snapshot, priority4=rows)
+
+
+def processes(table: dict, tags_fn=env_tags, extra_pids=()) -> dict:
     top = sorted((p for p in table if table[p]["cpu"] >= MIN_CPU), key=lambda p: -table[p]["cpu"])[:TOP_N]
-    tags = tags_fn(sorted({q for p in top for q in chain(table, p)}))
+    tags = tags_fn(sorted({q for p in [*top, *extra_pids] for q in chain(table, p)}))
     rows = []
     for p in top:
         c = chain(table, p)
@@ -270,9 +324,19 @@ def _ts(value) -> float:
 def report(hours: float, with_du: bool) -> dict:
     load = os.getloadavg()
     ncpu = os.cpu_count() or 1
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(runnable_snapshot) if MAC else None
+        table = ps_table()
+        runnable = pending.result() if pending else {"supported": False, "total": None, "by_priority": {}, "priority4": []}
+    tags = {}
+    def read_tags(pids):
+        tags.update(env_tags(pids))
+        return tags
+    proc = processes(table, tags_fn=read_tags, extra_pids=[row["pid"] for row in runnable["priority4"]])
     return {"host": platform.node(), "os": platform.platform(), "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "load": [round(x, 2) for x in load], "cpus": ncpu, "cpu_pct": round(100 * load[0] / ncpu),
-            "memory": memory(), "processes": processes(ps_table()), "disk": disk(with_du),
+            "memory": memory(), "processes": proc, "disk": disk(with_du),
+            "runnable": attribute_runnable(runnable, table, tags),
             "recorder": spikes(hours) if RECORDER_DIR.exists() else {"installed": False}}
 
 

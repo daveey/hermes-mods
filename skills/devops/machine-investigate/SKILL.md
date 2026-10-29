@@ -27,6 +27,7 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only).
      (`card:t_…`, `claude:…`, `hermes-session:…`, `codex:…`, `browser-use:…`); `by_app` CPU per top-level app;
      `young_by_name`: processes under 10 s old (a cron/sync/poll loop shows up here as many short-lived
      python/gh/git processes, not in the top list)
+   - `runnable` (macOS): R-state threads by priority and top priority-4 PIDs with owner/chain; load average includes the E-core background queue even when P-cores are idle.
    - `disk`: volume free, APFS local snapshots, `cleanable` caches with sizes, `largest_in_home`, other users' homes
    - `recorder`: load percentiles and per-agent CPU during recorded spikes (last 24 h)
 3. Sample twice more 30 s apart (`report --no-du`) before blaming a process: one ps snapshot is noise.

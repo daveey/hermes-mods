@@ -167,3 +167,77 @@ def test_card_status_does_not_walk_deep_trees(c, tmp_path):
     con.close()
     assert c.card_status("t_deep0001", [root]) is None
     assert c.card_status("t_board001", [root]) == "blocked"
+
+
+THREAD_PS = """\
+USER               PID   TT   %CPU STAT PRI     STIME     UTIME COMMAND
+worker             211   ??    0.0 R+    4T   0:00.00   0:00.00 /usr/bin/python3 job with spaces
+                   211         0.0 R     4N   0:00.00   0:00.00
+                   211         0.0 S     4T   0:00.00   0:00.00
+  worker           600   ??    0.0 R    31R   0:00.00   0:00.00 /bin/other
+                   600         0.0 R     4    0:00.00   0:00.00
+root               999   ??    0.0 R     4T   0:00.00   0:00.00 gone
+malformed
+                   xxx         0.0 R     4T
+                   211         0.0 R    bad
+"""
+
+
+def test_runnable_parser_counts_threads_and_priority_flags(c):
+    out = c.parse_runnable(THREAD_PS)
+    assert out == {"total": 5, "by_priority": {"4": 4, "31": 1},
+                   "priority4": [{"pid": 211, "threads": 2}, {"pid": 600, "threads": 1},
+                                 {"pid": 999, "threads": 1}]}
+    assert c.parse_runnable("")["total"] == 0
+    many = "\n".join(f"user {p} ?? 0.0 R 4T 0:00.00 0:00.00 x" for p in range(30, 10, -1))
+    assert [r["pid"] for r in c.parse_runnable(many)["priority4"]] == list(range(11, 21))
+
+
+def test_runnable_attribution_includes_low_cpu_and_vanished_pids(c):
+    t = c.parse_ps(PS)
+    t[211] = dict(t[211], cpu=0.0)
+    tags = {210: {"HERMES_KANBAN_TASK": "t_queue"}}
+    out = c.attribute_runnable(c.parse_runnable(THREAD_PS), t, tags)
+    assert out["priority4"][0]["owner"] == "card:t_queue"
+    assert out["priority4"][0]["chain"]
+    assert out["priority4"][-1]["name"] == "?"
+    assert out["priority4"][-1]["owner"] == ""
+
+
+def test_runnable_command_and_failure_are_explicit(c, monkeypatch):
+    import subprocess
+    calls = []
+    def run(cmd, **kw):
+        calls.append((cmd, kw))
+        return subprocess.CompletedProcess(cmd, 0, THREAD_PS, "")
+    monkeypatch.setattr(c.subprocess, "run", run)
+    assert c.runnable_snapshot()["total"] == 5
+    assert calls[0][0] == ["/bin/ps", "-M", "-axc"]
+    assert calls[0][1]["timeout"] == 2
+    def fail(*a, **kw):
+        raise subprocess.TimeoutExpired(a[0], 2)
+    monkeypatch.setattr(c.subprocess, "run", fail)
+    assert c.runnable_snapshot()["total"] is None
+    assert c.runnable_snapshot()["error"] == "TimeoutExpired"
+
+
+def test_report_wires_runnable_with_ancestry(c, monkeypatch):
+    monkeypatch.setattr(c, "MAC", True)
+    monkeypatch.setattr(c, "ps_table", lambda: c.parse_ps(PS))
+    monkeypatch.setattr(c, "runnable_snapshot", lambda: c.parse_runnable(THREAD_PS))
+    monkeypatch.setattr(c, "env_tags", lambda pids: TAGS)
+    out = c.report(1, with_du=False)
+    assert out["runnable"]["total"] == 5
+    assert out["runnable"]["priority4"][0]["owner"] == "card:t_aaaa1111"
+
+
+def test_report_linux_marks_thread_snapshot_unsupported(c, monkeypatch):
+    monkeypatch.setattr(c, "MAC", False)
+    monkeypatch.setattr(c, "runnable_snapshot", lambda: pytest.fail("Darwin ps must not run on Linux"))
+    assert c.report(1, with_du=False)["runnable"]["supported"] is False
+
+
+def test_runnable_numeric_username(c):
+    out = c.parse_runnable("123456 211 ?? 0.0 R 4T 0:00.00 0:00.00 x\n  211 0.0 R 4T 0:00.00 0:00.00\n")
+    assert out["total"] == 2
+    assert out["priority4"] == [{"pid": 211, "threads": 2}]
