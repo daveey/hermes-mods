@@ -319,7 +319,7 @@ _DO = re.compile(r"\b(can you|could you|please) (check|click|tap|open|plug|sign|
 def regex_steps(text: str) -> list[dict]:
     out: list[dict] = []
     for s in sentences(text or ""):
-        if _ASK.search(s) and not _NOT_ASK.search(s) and all(o["verbatim_span"] != s for o in out):
+        if _ASK.search(_blank_quotes(s)) and not _NOT_ASK.search(s) and all(o["verbatim_span"] != s for o in out):
             kind = "approve" if _APPROVE.search(s) else "do" if _DO.search(s) else "input"
             out.append({"text": s[:300], "kind": kind, "verbatim_span": s, "options": []})
     return out
@@ -445,13 +445,18 @@ def locate(reply: str, span: str) -> Optional[dict]:
     ns = _norm(span)
     if len(ns) < 4:
         return None
+    quoted_only = None
     for b in _blocks(reply):
         if b["code"] or b["quote"]:
             continue
         nb = _norm(re.sub(r"`[^`\n]*`", lambda m: m.group(0).strip("`"), b["text"]))
         if ns in nb:
-            return b
-    return None
+            # A block that only quotes the phrase ("titled \"Reply yes or no\"") must not hide a later block that
+            # really says it: prefer the first block whose unquoted text contains the span.
+            if ns in _norm(_blank_quotes(re.sub(r"`[^`\n]*`", lambda m: m.group(0).strip("`"), b["text"]))):
+                return b
+            quoted_only = quoted_only or b
+    return quoted_only
 
 
 _HANDOFF: dict[str, Any] = {}
@@ -628,6 +633,89 @@ def assent_echo(text: str) -> bool:
     return 0 < len(t.split()) < 6 and bool(_ASSENT.match(t))
 
 
+# ---- quoted text, one item per block, and the question as the title -----------------------------------
+_QUOTE_RANGE = re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d')
+# A bare reply prompt ("Reply yes or no here."): it points at a question made elsewhere in the reply.
+_REPLY_PROMPT = re.compile(r"\b(?:reply|answer|respond)\b[^.?!\n]{0,30}\b(?:yes|no|go)\b", re.I)
+
+
+def _blank_quotes(text: str) -> str:
+    """``text`` with every quoted range replaced by spaces (same length, so offsets still line up)."""
+    return _QUOTE_RANGE.sub(lambda m: " " * len(m.group(0)), text or "")
+
+
+def span_is_quoted(span: str, block_text: str) -> bool:
+    """The ask phrase is only someone's quoted words, never the assistant's own request.
+
+    True when the span lies inside a quoted range of its block, or when it contains quotes and, with the quoted
+    parts removed, no longer asks anything (a sentence that merely names a phrase: ``titled "Reply yes or no"``).
+    """
+    ns = _norm(span)
+    if not ns:
+        return False
+    for m in _QUOTE_RANGE.finditer(block_text or ""):
+        if ns in _norm(m.group(0)):
+            return True
+    if _QUOTE_RANGE.search(span or ""):
+        rest = _QUOTE_RANGE.sub(" ", span)
+        return not (_DIRECT_REQUEST.search(_plain(rest)) or _ASK.search(rest))
+    return False
+
+
+def _question_in(block_text: str) -> Optional[str]:
+    """Last sentence of a prose block that is a question outside quotes, without its bold label."""
+    blanked = _blank_quotes(block_text)
+    found = None
+    pos = 0
+    for part in re.split(r"(?<=[.!?])\s+|\n+", blanked):
+        i = blanked.find(part, pos)
+        if i < 0 or not part.strip():
+            continue
+        pos = i + len(part)
+        if part.rstrip().endswith("?"):
+            found = block_text[i:pos]
+    if not found:
+        return None
+    q = _LIST_MARK.sub("", _plain(found).strip())
+    q = re.sub(r"^(?:[^:\n]{1,40}:\s+)(?=\S)", "", q) if re.match(r"^[^:\n]{1,40}:\s", q) else q
+    q = re.sub(r"\s+", " ", q).strip()
+    return (q[:1].upper() + q[1:])[:300] if len(q) >= 12 else None
+
+
+def question_above(reply: str, block: dict) -> Optional[str]:
+    """Nearest question in the same reply section above ``block``: prose blocks only, back to a heading."""
+    prior = [b for b in _blocks(reply) if b["start"] < block["start"]]
+    for b in reversed(prior[-6:]):
+        if b["code"] or b["quote"]:
+            continue
+        if re.match(r"\s*#{1,6}\s", b["text"]):
+            break
+        q = _question_in(b["text"])
+        if q:
+            return q
+    return None
+
+
+def ask_slot(block: dict, span: str) -> tuple:
+    """Where an item lives: its block, plus the list line when the block is a list (each bullet is its own ask)."""
+    lines = block["text"].split("\n")
+    if len(lines) > 1 and all(_LIST_MARK.match(l.strip()) for l in lines[1:] if l.strip()):
+        ns = _norm(span)
+        for i, ln in enumerate(lines):
+            if ns and ns in _norm(ln):
+                return (block["start"], i)
+    return (block["start"], -1)
+
+
+def question_title(text: str, span: str, reply: str, block: dict) -> str:
+    """The title of an item is the question it answers. A span that is not a question, in a block that tells the
+    user to reply yes/no, takes the block's own question or else the nearest question above it; anything else
+    keeps the extractor's text."""
+    if "?" in _blank_quotes(_plain(span)) or not _REPLY_PROMPT.search(_blank_quotes(_plain(block["text"]))):
+        return text
+    return _question_in(block["text"]) or question_above(reply, block) or text
+
+
 def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None,
              *, continuity: bool = False) -> list[dict]:
     out: list[dict] = []
@@ -635,6 +723,7 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
     # model runs. Ordinary extractor callers retain their old deduplication.
     seen: set[Any] = set() if continuity else {_norm(s.get("text", "")) for s in open_steps}
     quiet = declares_no_user_action(reply)
+    used_blocks: set[tuple[int, int]] = set()
     for s in raw_steps if isinstance(raw_steps, list) else []:
         if not isinstance(s, dict):
             continue
@@ -661,10 +750,16 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
         block = locate(reply, span)
         if block is None or _norm(span) not in _norm(block["text"]):
             continue  # full evidence required; locate's framing prefix is not validation
+        if span_is_quoted(span, block["text"]):
+            continue  # a phrase inside quotation marks is cited, not asked
+        slot = ask_slot(block, span)
+        if slot in used_blocks:
+            continue  # one block (one list line, for bullet lists of distinct asks) yields at most one item
         if in_digest_report(span, block["text"]):
             continue  # a digest of asks that live elsewhere is a status report, not a new tile
         if recommendation_without_request(span, block["text"]):
             continue  # a recommendation is not permission to manufacture a choice
+        text = question_title(text, span, reply, block)
         candidate = {"text": text, "kind": kind, "verbatim_span": span, "options": opts}
         key = action_identity(candidate) if continuity else _norm(text)
         if key in seen:
@@ -674,6 +769,7 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
                 dropped.append(text)
             continue  # terminal-doable: the agent runs it via run_in_user_terminal, no For-you card
         seen.add(key)
+        used_blocks.add(slot)
         out.append(candidate)
     # Suppression/reuse must not be truncated by a *new* action budget.
     return out if continuity else out[:MAX_NEW_PER_REPLY]
