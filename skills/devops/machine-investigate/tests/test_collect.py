@@ -147,3 +147,23 @@ def test_report_no_du_never_walks_caches(c, monkeypatch, tmp_path):
     assert calls == []
     assert d["cleanable"] and d["cleanable"][0]["gb"] is None
     assert "largest_in_home" not in d
+
+
+def test_card_status_does_not_walk_deep_trees(c, tmp_path):
+    """workspaces/ and evidence/ hold huge trees (and build.db files); only board DBs at depth <= 2 are read."""
+    root = tmp_path / "kb"
+    deep = root / "workspaces/t_x/.build/out"
+    deep.mkdir(parents=True)
+    con = sqlite3.connect(deep / "build.db")
+    con.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+    con.execute("INSERT INTO tasks VALUES ('t_deep0001', 'done')")
+    con.commit()
+    con.close()
+    (root / "boards/b").mkdir(parents=True)
+    con = sqlite3.connect(root / "boards/b/kanban.db")
+    con.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+    con.execute("INSERT INTO tasks VALUES ('t_board001', 'blocked')")
+    con.commit()
+    con.close()
+    assert c.card_status("t_deep0001", [root]) is None
+    assert c.card_status("t_board001", [root]) == "blocked"

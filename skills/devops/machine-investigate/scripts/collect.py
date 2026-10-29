@@ -342,7 +342,9 @@ def card_status(task_id: str, homes: list[Path] | None = None) -> str | None:
         return None
     hermes_home = Path(os.environ.get("HERMES_HOME") or HOME / ".hermes")
     for root in homes or [hermes_home / "kanban"]:
-        for db in sorted(root.rglob("*.db")):
+        # Known board locations only (kanban.db, sync-shadow/*.db, boards/<slug>/kanban.db). rglob also walked workspaces/ and
+        # evidence/ (millions of files, ~2 min per call), which made `kill` hang once per candidate process.
+        for db in sorted({*root.glob("*.db"), *root.glob("*/*.db"), *root.glob("boards/*/*.db")}):
             try:
                 con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
                 row = con.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
