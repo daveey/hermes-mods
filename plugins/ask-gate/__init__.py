@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -37,6 +37,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     approval_reconciliation = _sib("approval_reconciliation")
     approval_adapter_loading = _sib("approval_adapter_loading")
     runtime_contract = _sib("runtime_contract")
+    pr_approval_request = _sib("pr_approval_request")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -509,6 +510,28 @@ def _retired_block(session_id: str, asks: list[str]) -> dict | None:
     return None
 
 
+# Process-local one-shot lint, not a new authorization or durable refusal policy.
+# Do not reset on a turn boundary: an unchanged retry must pass this lint.
+_PR_FILING_HELD: set[tuple[str, str, str]] = set()
+
+
+def _pr_filing_hold(session_id: str, tool_name: str, args: dict, request: dict) -> dict | None:
+    row = {"human_request": request, "title": args.get("title"), "body": args.get("body")}
+    if not pr_approval_request.looks_like_pr_approval(row) or pr_approval_request.request_target(row) is not None:
+        return None
+    ask = json.dumps({k: request[k] for k in ("action", "scope")}, sort_keys=True)
+    key = (session_id, tool_name, core.text_hash(ask))
+    if key in _PR_FILING_HELD:
+        return None
+    _PR_FILING_HELD.add(key)
+    return {"action": "block", "message":
+            "ask-gate: PR approval wording held once. " + pr_approval_request.parse_failure_reason(row)
+            + " Canonical wording: " + pr_approval_request.canonical_wording(row)
+            + " Fill missing placeholders and the actual unblock/archive outcomes; do not broaden authorization. "
+              "Retrying this same ask passes this wording check, but all existing checks still apply. "
+              "This notice grants no approval and changes no task state."}
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -518,6 +541,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             raise ValueError("human_request cannot accompany dependency/time/transient blocks")
         if tool_name == "kanban_create" and args.get("initial_status") != "blocked":
             raise ValueError("human_request requires initial_status=blocked on creation")
+        filing = _pr_filing_hold(session_id, tool_name, args, request)
+        if filing is not None:
+            return filing
         context = {"session_id": session_id, "tool_name": tool_name,
                    "human_request": request, "args": args}
         reconciled = lifecycle.preflight(context) or approval_reconciliation.preflight(context)

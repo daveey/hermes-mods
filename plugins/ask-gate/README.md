@@ -121,6 +121,49 @@ preservation; `tests/test_judge_unavailable.py` covers outages (class fallback, 
 deterministic checks still enforced, real refusals unchanged, no park advice on gate errors). Security prompt delivery and refusal handling are tested with a stub judge; real-model semantic
 accuracy and live UI/REST/CLI paths are not established by these plugin unit tests.
 
+### PR-only approval wording and one-shot filing hold
+
+`pr_approval_request.py` is a stdlib-only shared parser; it performs no I/O and has no owner allowlist:
+
+- `request_target(row) -> tuple[str, int, str | None] | None`: strict PR-only action recognition.
+  `row['human_request']` is a dict or JSON object string, with `interaction` of `approval`, `reply`, or
+  `external`. References are GitHub PR URLs, `OWNER/REPO#N`, or `PR #N`. Short references resolve only
+  through explicit matching PR references or `Repo:`/`Repository` labels in `title`, `body`, or request
+  `scope`; ambiguous repositories and conflicting repository labels are rejected. A head comes only
+  from the action, never from context. Private consumers must still enforce their owner policy and
+  verify authoritative current-head approval receipts; parsing never grants permission.
+- `looks_like_pr_approval(row) -> bool`: broader diagnostic for leading Approve/OK/Authorize PR asks,
+  not a strict parser or evidence of authorization.
+- `parse_failure_reason(row) -> str`: empty on strict success; otherwise describes the unsupported
+  wording and any missing/ambiguous correction metadata.
+- `canonical_wording(row) -> str`: correction text with unambiguous supplied repository, number and
+  head, or explicit `OWNER/REPO`, `N`, `SHA` placeholders. Correction hints may come from context even
+  for rejected actions; they must **not** be used as approval targets. Lifecycle outcomes remain
+  ellipses, not invented execution instructions.
+
+The strict action accepts optional `please`, optional `at head/sha/commit SHA`, bare `head/sha/commit SHA`,
+  or `(head/sha/commit SHA)` (7–40 hexadecimal characters), optional `on GitHub`, and optional
+  `, or OK the bb approval ask in …`. Allowed surfaces are only Discord, Slack, BB Inbox, the BB Inbox,
+  Inbox, or the Inbox, joined by `/`, commas, or `or`. The existing `Unblock = …; archive = …` suffix
+  is recognized, but additional authorization in the action or unblock outcome is not accepted.
+
+For structured `kanban_block` and `kanban_create(initial_status='blocked')`, an approval-looking request
+that cannot strictly parse receives one deterministic wording hold per process-local session/tool/action+scope.
+The message offers:
+
+> Approve https://github.com/OWNER/REPO/pull/N (head SHA) on GitHub, or OK the bb approval ask in Discord, Slack or the BB Inbox. Unblock = …; archive = ….
+
+An unchanged retry passes **this wording check**, including across turns; existing schema, stopped-workflow,
+reconciliation, retirement, evidence and judge checks still apply. Canonical wording proceeds without the
+new hold. This lint makes no model call, changes no task state, and neither approves nor unblocks anything.
+It does not rewrite tool arguments or reset on each turn; plugin/process reload resets the one-shot memory.
+
+Tests: `tests/test_pr_approval_request.py` covers syntax, surface variants, mixed-authorization rejection,
+context ambiguity, JSON requests, owner independence and correction placeholders. `tests/test_pr_approval_filing.py`
+registers the actual `pre_tool_call` entry for both create and block, exercises the hold/retry, canonical and
+slash-separated regression requests, missing metadata, independent keys and evidence checks after retry.
+These use local synthetic data and stub judges/adapters, not live filing or approval services.
+
 ### Cited evidence and vendor entitlements
 
 Why (five whys): an owner decision (grant a shared GitHub App Administration:read, or make a dedicated App) was
