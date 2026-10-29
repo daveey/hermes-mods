@@ -3,7 +3,8 @@
 
 settings.json:  {"matcher": "Bash", "hooks": [{"type": "command",
                  "command": "python3 <this file>", "timeout": 10}]}
-Exit 2 + stderr blocks the call and shows the agent the reason.
+Exit 2 + stderr blocks the call and shows the agent the reason. A multi-file Python test run in a Hermes core
+worktree is not blocked: stdout carries hookSpecificOutput.additionalContext pointing at `hermes-core-wt test`.
 """
 
 import importlib.util
@@ -24,8 +25,13 @@ try:
 except Exception:
     sys.exit(0)
 
-why = guard.check_shell(cmd, cwd=cwd if isinstance(cwd, str) and cwd else None) if guard.enabled() else None
-if why:
-    sys.stderr.write(guard.message(why) + "\n")
+cwd = cwd if isinstance(cwd, str) and cwd else None
+block, note = guard.evaluate(cmd, cwd=cwd) if guard.enabled() else (None, None)
+if block:
+    sys.stderr.write(block + "\n")
     sys.exit(2)
+if note:
+    # Non-blocking: no permissionDecision, so the normal permission flow applies; Claude Code adds
+    # additionalContext to the model's context next to the tool result.
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}}))
 sys.exit(0)

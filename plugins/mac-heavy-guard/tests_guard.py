@@ -148,15 +148,26 @@ def test_tool_call_batch_and_other_tools():
     assert not blocked("terminal", command="echo 'unbalanced")
 
 
-def _hook(cmd, env_extra=None):
+HOOK = HERE / "claude_hook.py"
+# Run claude_hook.py as Claude Code does (JSON on stdin, a fresh interpreter), with sys.platform set to darwin so
+# the macOS-only guard acts on any host (CI and the hub are Linux).
+AS_MAC = ("import runpy, sys; sys.platform = 'darwin'; sys.argv = [sys.argv[1]]; "
+          "runpy.run_path(sys.argv[0], run_name='__main__')")
+
+
+def _run_hook(payload, cwd=None, env_extra=None):
     import os
     env = dict(os.environ, **(env_extra or {}))
     env.pop("MAC_HEAVY_OK", None)
-    return subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input=json.dumps(
-        {"tool_name": "Bash", "tool_input": {"command": cmd}}), capture_output=True, text=True, env=env)
+    env.pop("MAC_HEAVY_GUARD", None)
+    return subprocess.run([sys.executable, "-c", AS_MAC, str(HOOK)], input=json.dumps(payload),
+                          capture_output=True, text=True, env=env, cwd=cwd)
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="guard only acts on macOS")
+def _hook(cmd, env_extra=None):
+    return _run_hook({"tool_name": "Bash", "tool_input": {"command": cmd}}, env_extra=env_extra)
+
+
 def test_claude_hook_blocks_and_allows():
     r = _hook("cargo build --release")
     assert r.returncode == 2 and "MAC_HEAVY_OK=1" in r.stderr
@@ -231,33 +242,20 @@ def test_allows_narrow_missing_optout_and_non_shell_scripts(tmp_path):
     assert not blocked("terminal", command="./big.sh", workdir=str(tmp_path))  # past the 64 KB read cap
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="guard only acts on macOS")
 def test_claude_hook_blocks_script(tmp_path):
-    import os
     _script(tmp_path, SCRIPT_BODIES[0])
-    env = dict(os.environ)
-    env.pop("MAC_HEAVY_OK", None)
-    r = subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input=json.dumps(
-        {"tool_name": "Bash", "tool_input": {"command": "./ci.sh > ci.log 2>&1"}}),
-        capture_output=True, text=True, env=env, cwd=tmp_path)
+    r = _run_hook({"tool_name": "Bash", "tool_input": {"command": "./ci.sh > ci.log 2>&1"}}, cwd=tmp_path)
     assert r.returncode == 2 and "ci.sh" in r.stderr and "whole pytest suite" in r.stderr
 
 
 def test_claude_hook_reads_the_script_from_the_session_cwd(tmp_path):
     """After a `cd` in an earlier Bash call, only the hook input's cwd names the shell's directory."""
-    import os
     _script(tmp_path, SCRIPT_BODIES[0])
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    env = dict(os.environ)
-    env.pop("MAC_HEAVY_OK", None)
-    r = subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input=json.dumps(
-        {"tool_name": "Bash", "tool_input": {"command": "./ci.sh"}, "cwd": str(tmp_path)}),
-        capture_output=True, text=True, env=env, cwd=elsewhere)
+    r = _run_hook({"tool_name": "Bash", "tool_input": {"command": "./ci.sh"}, "cwd": str(tmp_path)}, cwd=elsewhere)
     assert r.returncode == 2 and "ci.sh" in r.stderr and "whole pytest suite" in r.stderr
-    r = subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input=json.dumps(
-        {"tool_name": "Bash", "tool_input": {"command": "./ci.sh"}, "cwd": str(elsewhere)}),
-        capture_output=True, text=True, env=env, cwd=tmp_path)
+    r = _run_hook({"tool_name": "Bash", "tool_input": {"command": "./ci.sh"}, "cwd": str(elsewhere)}, cwd=tmp_path)
     assert r.returncode == 0, "a session cwd without the script must not borrow the hook's own cwd"
 
 
@@ -274,3 +272,149 @@ def test_script_resolved_against_the_task_shell_cwd(tmp_path, monkeypatch):
     assert plugin._pre_tool_call(tool_name="tool_call", task_id="t1", args={
         "calls": [{"name": "terminal", "arguments": {"command": "./ci.sh"}}]})
     assert plugin._pre_tool_call(tool_name="terminal", args={"command": "./ci.sh"}, task_id="other") is None
+
+
+# --- Hermes core worktrees: multi-file test runs get a note pointing at `hermes-core-wt test` --------------------
+
+def _repo(path, origin, run_tests=True):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
+    if run_tests:
+        (path / "scripts").mkdir()
+        _script(path / "scripts", "echo run\n", name="run_tests.sh")
+    (path / "tests" / "tools").mkdir(parents=True)
+    for name in ("test_a.py", "test_b.py", "tools/test_c.py"):
+        (path / "tests" / name).write_text("def test_x():\n    pass\n")
+    return path
+
+
+@pytest.fixture
+def core(tmp_path):
+    return _repo(tmp_path / "core-wt", "git@github.com:daveey/hermes.git")
+
+
+def _pre(command, workdir, tool_call_id="c1"):
+    return plugin._pre_tool_call(tool_name="terminal", args={"command": command, "workdir": str(workdir)},
+                                 task_id="t1", tool_call_id=tool_call_id)
+
+
+def _post(command, workdir, result='{"output": "2 passed", "exit_code": 0}', tool_call_id="c1"):
+    return plugin._transform_tool_result(tool_name="terminal", args={"command": command, "workdir": str(workdir)},
+                                         result=result, task_id="t1", tool_call_id=tool_call_id)
+
+
+NOTE_RUNS = [
+    ("pytest tests/test_a.py tests/test_b.py -q", "hermes-core-wt test tests/test_a.py tests/test_b.py -q"),
+    ("python -m pytest tests/tools", "hermes-core-wt test tests/tools"),
+    ("scripts/run_tests.sh tests/test_a.py tests/test_b.py", "hermes-core-wt test tests/test_a.py tests/test_b.py"),
+    ("./scripts/run_tests.sh -j 4 tests/tools/", "hermes-core-wt test -j 4 tests/tools/"),
+    ("python3 scripts/run_tests_parallel.py --files tests/test_a.py,tests/test_b.py",
+     "hermes-core-wt test --files tests/test_a.py,tests/test_b.py"),
+    ("cd tests/.. && nice -n 5 uv run pytest tests/test_a.py tests/tools/test_c.py::test_x",
+     "hermes-core-wt test tests/test_a.py tests/tools/test_c.py::test_x"),
+]
+
+
+@pytest.mark.parametrize("cmd,core_cmd", NOTE_RUNS)
+def test_note_for_multi_file_run_in_core_worktree(core, cmd, core_cmd):
+    msg = guard.note(cmd, cwd=str(core))
+    assert msg and core_cmd in msg and "hermes-hub" in msg and "MacBook" in msg, msg
+
+
+def test_note_for_two_file_pytest_run(core):
+    assert "hermes-core-wt test tests/test_a.py tests/test_b.py" in guard.note(
+        "pytest tests/test_a.py tests/test_b.py", cwd=str(core))
+
+
+def test_note_for_two_file_run_tests_run(core):
+    assert "hermes-core-wt test tests/test_a.py tests/test_b.py" in guard.note(
+        "scripts/run_tests.sh tests/test_a.py tests/test_b.py", cwd=str(core))
+
+
+@pytest.mark.parametrize("cmd", ["pytest tests/test_a.py -q", "scripts/run_tests.sh tests/test_a.py",
+                                 "pytest tests/test_a.py::test_x tests/test_a.py::test_y",
+                                 "pytest -k slow tests/test_a.py", "git status", "ls tests/tools"])
+def test_no_note_for_single_file_or_non_test(core, cmd):
+    assert guard.note(cmd, cwd=str(core)) is None
+    assert _pre(cmd, core) is None and _post(cmd, core) is None
+
+
+def test_no_note_outside_a_core_worktree(tmp_path):
+    other = _repo(tmp_path / "other", "git@github.com:someone/else.git")
+    mods = _repo(tmp_path / "mods", "git@github.com:daveey/hermes-mods.git")
+    no_runner = _repo(tmp_path / "norunner", "git@github.com:daveey/hermes.git", run_tests=False)
+    cmd = "pytest tests/test_a.py tests/test_b.py"
+    for repo in (other, mods, no_runner):
+        assert guard.note(cmd, cwd=str(repo)) is None, repo
+        assert _pre(cmd, repo) is None and _post(cmd, repo) is None
+
+
+def test_note_accepts_nousresearch_origin_and_subdir_cwd(tmp_path):
+    up = _repo(tmp_path / "up", "https://github.com/NousResearch/hermes-agent.git")
+    assert guard.note("pytest test_a.py test_b.py", cwd=str(up / "tests"))
+
+
+def test_no_note_when_opted_out(core, monkeypatch):
+    assert guard.note("MAC_HEAVY_OK=1 pytest tests/test_a.py tests/test_b.py", cwd=str(core)) is None
+    monkeypatch.setenv("MAC_HEAVY_OK", "1")
+    assert guard.note("pytest tests/test_a.py tests/test_b.py", cwd=str(core)) is None
+
+
+def test_block_message_names_core_wt_test_first_in_core_worktree(core, tmp_path):
+    res = _pre("scripts/run_tests.sh -j 8", core)
+    assert res and res["action"] == "block"
+    options = [ln for ln in res["message"].splitlines() if ln.startswith("- ")]
+    assert options[0].startswith("- This is a Hermes core worktree: hermes-core-wt test -j 8 "), options
+    assert "hermes-core-wt test" in _pre("python -m pytest -q", core)["message"]
+    other = _repo(tmp_path / "other", "git@github.com:someone/else.git")
+    assert "hermes-core-wt" not in _pre("scripts/run_tests.sh -j 8", other)["message"]
+    assert "hermes-core-wt" not in _pre("cargo build --release", core)["message"]
+
+
+def test_hermes_plugin_appends_note_to_the_tool_result(core):
+    """Hermes entry point: pre_tool_call lets the run through; transform_tool_result appends the note."""
+    cmd = "pytest tests/test_a.py tests/test_b.py"
+    assert _pre(cmd, core) is None
+    out = _post(cmd, core)
+    assert out.startswith('{"output": "2 passed"') and "hermes-core-wt test tests/test_a.py tests/test_b.py" in out
+    assert _post(cmd, core) is None, "a note is appended once"
+
+
+def test_hermes_plugin_note_uses_the_cwd_before_the_command_ran(core, monkeypatch):
+    """`cd <wt> && pytest ...` with no workdir: the note is computed from the task shell's cwd at call time."""
+    monkeypatch.setattr(plugin, "_terminal_cwd", lambda task_id: str(core.parent))
+    cmd = "cd core-wt && pytest tests/test_a.py tests/test_b.py"
+    assert plugin._pre_tool_call(tool_name="terminal", args={"command": cmd}, task_id="t1", tool_call_id="c9") is None
+    monkeypatch.setattr(plugin, "_terminal_cwd", lambda task_id: str(core))  # the shell has moved by now
+    out = plugin._transform_tool_result(tool_name="terminal", args={"command": cmd}, result="ok", task_id="t1",
+                                        tool_call_id="c9")
+    assert out and "hermes-core-wt test" in out
+
+
+def test_hermes_plugin_registers_both_hooks():
+    hooks = []
+
+    class Ctx:
+        def register_hook(self, name, fn):
+            hooks.append(name)
+
+    plugin.register(Ctx())
+    assert hooks == ["pre_tool_call", "transform_tool_result"]
+
+
+def test_claude_hook_emits_note_as_additional_context(core):
+    """Claude Code entry point: exit 0 (not blocked) with hookSpecificOutput.additionalContext."""
+    r = _run_hook({"tool_name": "Bash", "cwd": str(core),
+                   "tool_input": {"command": "pytest tests/test_a.py tests/test_b.py"}})
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse" and "permissionDecision" not in out
+    assert "hermes-core-wt test tests/test_a.py tests/test_b.py" in out["additionalContext"]
+    single = _run_hook({"tool_name": "Bash", "cwd": str(core), "tool_input": {"command": "pytest tests/test_a.py"}})
+    assert single.returncode == 0 and single.stdout == ""
+
+
+def test_claude_hook_block_names_core_wt_test_in_core_worktree(core):
+    r = _run_hook({"tool_name": "Bash", "cwd": str(core), "tool_input": {"command": "scripts/run_tests.sh"}})
+    assert r.returncode == 2 and "hermes-core-wt test runs it on hermes-hub" in r.stderr

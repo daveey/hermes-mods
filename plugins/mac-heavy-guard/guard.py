@@ -7,6 +7,10 @@ Shared by the Hermes pre_tool_call hook (__init__.py) and the Claude Code PreToo
 `pnpm install`, `uv sync`, `pip install -r`). Targeted work stays allowed (`pytest tests/test_x.py`,
 `cargo build`, `npm install left-pad`), as does anything sent over `ssh`.
 
+Hermes core worktrees: a multi-file Python test run there (pytest or scripts/run_tests.sh with 2+ test paths
+or a directory) is allowed but gets a note pointing at `hermes-core-wt test <same args>`, which runs it on
+hermes-hub; a blocked whole-suite run there lists that command first.
+
 Opt-out: prefix the command with `MAC_HEAVY_OK=1` (or export it). Off entirely: `MAC_HEAVY_GUARD=0`.
 The guard only acts on macOS.
 """
@@ -16,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import subprocess
 import sys
 from typing import Iterator, Optional
 
@@ -264,11 +269,13 @@ def _read_script(path: str, cwd: Optional[str]) -> Optional[str]:
     return text
 
 
-def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optional[str]:
+Hit = tuple[str, Optional[list[str]], Optional[str]]  # (why, Python-test args if a direct pytest/run_tests run, cwd)
+
+
+def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optional[Hit]:
     for argv, env in commands(text):
         if argv[0] == "cd" and len(argv) > 1 and not argv[1].startswith("-"):
-            target = os.path.expanduser(argv[1])
-            cwd = target if os.path.isabs(target) else os.path.join(cwd or os.getcwd(), target)
+            cwd = _cd(cwd, argv[1])
             continue
         if OPT_OUT in env:
             continue
@@ -276,28 +283,150 @@ def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optiona
         if not why and in_script:  # `step pytest python3 -m pytest -q`: a heavy command passed as arguments
             why = next((w for w in (check_argv(argv[k:]) for k in range(1, len(argv))) if w), None)
         if why:
-            return why
+            test = None if in_script else _py_test(argv)
+            return why, (test[1] if test else None), cwd
         ref = _script_arg(argv)
         if ref and depth < SCRIPT_MAX_DEPTH:
             body = _read_script(ref, cwd)
             if body:
                 inner = _scan(body, cwd, depth + 1, True)
                 if inner:
-                    return f"{ref} \u2192 {inner}"
+                    return f"{ref} \u2192 {inner[0]}", None, cwd
     return None
 
 
+def _cd(cwd: Optional[str], target: str) -> str:
+    target = os.path.expanduser(target)
+    return target if os.path.isabs(target) else os.path.join(cwd or os.getcwd(), target)
+
+
+def _opted_out() -> bool:
+    return os.environ.get(OPT_OUT, "0") not in ("", "0")
+
+
 def check_shell(text: str, cwd: Optional[str] = None) -> Optional[str]:
-    if os.environ.get(OPT_OUT, "0") not in ("", "0"):
+    if _opted_out():
         return None
-    return _scan(text, cwd, 0, False)
+    hit = _scan(text, cwd, 0, False)
+    return hit[0] if hit else None
 
 
-def message(why: str) -> str:
+# --- Hermes core worktrees: point multi-file test runs at `hermes-core-wt test` (runs on hermes-hub) -------------
+
+CORE_ORIGIN = re.compile(r"[:/](?:daveey/hermes|NousResearch/hermes-agent)(?:\.git)?/?$", re.I)
+
+
+def core_worktree(cwd: Optional[str]) -> Optional[str]:
+    """Root of the Hermes core checkout holding cwd (origin daveey/hermes or NousResearch/hermes-agent, and
+    scripts/run_tests.sh present), else None."""
+    d = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
+    while not os.path.exists(os.path.join(d, ".git")):
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    if not os.path.isfile(os.path.join(d, "scripts", "run_tests.sh")):
+        return None
+    try:
+        url = subprocess.run(["git", "-C", d, "config", "--get", "remote.origin.url"], capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return d if CORE_ORIGIN.search(url) else None
+
+
+def _py_test(argv: list[str]) -> Optional[tuple[str, list[str]]]:
+    """("pytest" | "run_tests", args) when argv runs pytest or Hermes's run_tests.sh / run_tests_parallel.py."""
+    first = os.path.basename(argv[0])
+    if (PY.match(first) or first in SHELLS) and len(argv) > 1 and _is_run_tests(argv[1]):
+        argv = argv[1:]
+    if argv and _is_run_tests(argv[0]):
+        return "run_tests", argv[1:]
+    argv = _strip_runner(argv)
+    if argv and os.path.basename(argv[0]) in ("pytest", "py.test"):
+        return "pytest", argv[1:]
+    return None
+
+
+def _multi_file(kind: str, args: list[str], cwd: Optional[str]) -> bool:
+    """2+ distinct test files, or any directory (run_tests.sh's --files-from list counts as many)."""
+    value_flags = PYTEST_VALUE_FLAGS | {"-k"} | (RUN_TESTS_VALUE_FLAGS if kind == "run_tests" else set())
+    paths: set[str] = set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--" and kind == "run_tests":
+            break  # the rest goes to pytest as options
+        if kind == "run_tests" and a.startswith(RUN_TESTS_SELECT_FLAGS):
+            flag, eq, val = a.partition("=")
+            if not eq:
+                val = args[i] if i < len(args) else ""
+                i += 1
+            if flag == "--files-from":
+                return True
+            paths.update(v for v in re.split(r"[,\s]+", val) if v)
+            continue
+        if a in value_flags:
+            i += 1
+            continue
+        if not a.startswith("-"):
+            paths.add(a)
+    files = set()
+    for p in paths:
+        f = p.split("::", 1)[0]
+        if f.endswith("/") or os.path.isdir(os.path.join(cwd or os.getcwd(), os.path.expanduser(f))):
+            return True
+        files.add(f)
+    return len(files) >= 2
+
+
+def core_test_command(args: list[str]) -> str:
+    return "hermes-core-wt test" + (" " + shlex.join(args) if args else "")
+
+
+def note(text: str, cwd: Optional[str] = None) -> Optional[str]:
+    """Non-blocking note for a multi-file Python test run inside a Hermes core worktree, else None."""
+    if _opted_out():
+        return None
+    for argv, env in commands(text):
+        if argv[0] == "cd" and len(argv) > 1 and not argv[1].startswith("-"):
+            cwd = _cd(cwd, argv[1])
+            continue
+        if OPT_OUT in env:
+            continue
+        test = _py_test(argv)
+        if test and _multi_file(test[0], test[1], cwd) and core_worktree(cwd):
+            return (
+                f"mac-heavy-guard note: `{shlex.join(argv)}` runs several test files on this MacBook, where "
+                "parallel pytest runs from many agents pile up and slow Hermes Desktop. "
+                f"`{core_test_command(test[1])}` runs the same tests on hermes-hub (under nice, on a snapshot of "
+                "this worktree including uncommitted files) with the output streamed back; use it for multi-file "
+                "runs. Not blocked: targeted runs are allowed here."
+            )
+    return None
+
+
+def evaluate(text: str, cwd: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """(block message, note) for a shell command; at most one is set."""
+    if _opted_out():
+        return None, None
+    hit = _scan(text, cwd, 0, False)
+    if hit:
+        why, test_args, hit_cwd = hit
+        core = core_test_command(test_args) if test_args is not None and core_worktree(hit_cwd) else None
+        return message(why, core), None
+    return None, note(text, cwd)
+
+
+def message(why: str, core_cmd: Optional[str] = None) -> str:
+    core = (f"- This is a Hermes core worktree: {core_cmd} runs it on hermes-hub (under nice) and streams the "
+            "output back.\n") if core_cmd else ""
     return (
         f"mac-heavy-guard: blocked {why} on this Mac. Heavy builds, whole test suites and whole-repo installs "
         "pile up across agents here (load 150-270) and make Hermes Desktop slow, so they run on the hub or "
         "worker-1 by default.\n"
+        f"{core}"
         "- Hermes: put the work on a card; cards that name tests/builds go to worker-1 automatically "
         "(kanban.placement.heavy_route), or set runs_on=[machine:worker-1].\n"
         "- Anywhere: run it on the hub, e.g. ssh ubuntu@hermes-hub 'cd <repo> && nice -n 10 <cmd>'.\n"
