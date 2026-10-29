@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import logging
 import sys
 from pathlib import Path
@@ -153,6 +154,9 @@ def handle_post(args: dict, **context) -> str:
     try:
         args = args or {}
         poster, cwd = _poster_for(context.get("session_id"))
+        if not poster:  # unknown session (cron/oneshot before its row exists): still a sender the breaker can count
+            prof = os.environ.get("HERMES_PROFILE") or "default"
+            poster = f"agent · {prof}"
         result = store_module().Inbox().post(
             args.get("title", ""), args.get("body", ""), args.get("accept_prompt", ""),
             key=args.get("key"), poster=poster, cwd=args.get("cwd"), inherited_cwd=cwd, prompt_label=args.get("prompt_label"),
@@ -235,6 +239,8 @@ def _setup_cli(parser) -> None:
     b.add_argument("--include-archived", action="store_true")
     u = sub.add_parser("unmute", help="let a poster muted as noise post again (after fixing it)")
     u.add_argument("poster")
+    uk = sub.add_parser("unarchive-key", help="let a key David archived be posted again (a genuinely new decision)")
+    uk.add_argument("key")
     a = sub.add_parser("archive", help="archive a message")
     a.add_argument("session_id")
     t = sub.add_parser("types", help="list card types, or show one")
@@ -323,7 +329,11 @@ def _run_cli(args) -> int:
         inbox.unmute(args.poster)
         print(f"unmuted {args.poster!r}")
         return 0
-    print("usage: hermes inbox {post,list,archive,act,outcome,types,unmute}")
+    if cmd == "unarchive-key":
+        inbox.unarchive_key(args.key)
+        print(f"released key {args.key!r}")
+        return 0
+    print("usage: hermes inbox {post,list,archive,act,outcome,types,unmute,unarchive-key}")
     return 2
 
 

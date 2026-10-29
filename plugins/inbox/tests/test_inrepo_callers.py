@@ -79,8 +79,8 @@ def _replay(store, caller):
         kw["poster"] = caller["poster"]
     if isinstance(caller["type"], str):
         kw["type"] = caller["type"]
-    store.Inbox().post("probe", "probe body", "probe instruction" if caller["has_prompt"] else "",
-                       key=f"probe:{caller['site']}", **kw)
+    store.Inbox().post("replay", "replay body", "replay instruction" if caller["has_prompt"] else "",
+                       key=f"replay:{caller['site']}", **kw)
 
 
 def test_scanner_finds_the_live_callers():

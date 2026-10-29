@@ -538,7 +538,7 @@ def test_task_rendered_body_is_capped(tenv):
     inbox, _, kb = tenv
     inbox.types.define("big", {"fields": {"id": {}, "text": {}},
                                "actions": [{"id": "go", "kind": "task", "prompt": "{{text}}{{text}}"}]})
-    sid = inbox.post("b", "", type="big", fields={"id": "1", "text": "x" * ct.MAX_FIELD_VALUE})["session_id"]
+    sid = inbox.post("b", "", type="big", poster="t", fields={"id": "1", "text": "x" * ct.MAX_FIELD_VALUE})["session_id"]
     with pytest.raises(ValueError, match="over"):
         inbox.act(sid, "go")
     assert kb.created == [] and [i["state"] for i in inbox.list()] == ["open"]
@@ -737,7 +737,7 @@ def test_rest_prompt_action_and_accept_alias(client):
     assert r.status_code == 409 and "own actions" in r.text
     r = c.post(f"/items/{sid}/act", json={"action": "rewrite", "input": "punchier"})
     assert r.json()["prompt"].startswith("Rewrite X draft Q2: punchier.")
-    legacy = c.post("/items", json={"title": "y", "body": "b", "accept_prompt": "go"}).json()["session_id"]
+    legacy = c.post("/items", json={"title": "y", "body": "b", "accept_prompt": "go", "poster": "t"}).json()["session_id"]
     assert c.post(f"/items/{legacy}/accept").json()["accept_prompt"] == "go"
 
 

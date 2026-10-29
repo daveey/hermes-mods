@@ -31,7 +31,7 @@ def test_root_lists_profile_items_and_accepts_them_by_profile(client):
     prof = root / "profiles" / "alpha-follow"
     prof.mkdir(parents=True)
     a = st.Inbox.for_home(prof).post("Reply in thread?", "who asked what", "post it", key="slack:C1:1.0:x")
-    b = st.Inbox().post("Root item", "b", "do")
+    b = st.Inbox().post("Root item", "b", "do", poster="t")
     items = {i["session_id"]: i for i in c.get("/items").json()["items"]}
     assert items[a["session_id"]]["profile"] == "alpha-follow"
     assert items[b["session_id"]]["profile"] == "default"
@@ -45,7 +45,7 @@ def test_root_lists_profile_items_and_accepts_them_by_profile(client):
 
 def test_rest_post_passes_prompt_label(client):
     c, api, root = client
-    r = c.post("/items", json={"title": "t", "body": "b", "accept_prompt": "the whole long prompt",
+    r = c.post("/items", json={"title": "t", "body": "b", "accept_prompt": "the whole long prompt", "poster": "t",
                                "prompt_label": "stop the idle box"})
     assert r.status_code == 200, r.text
     from hermes_state import SessionDB

@@ -73,14 +73,14 @@ def test_key_dedupes_and_marks_unread_again(env):
 
 def test_reading_clears_unread(env):
     inbox, db, _ = env
-    sid = inbox.post("t", "b", "p")["session_id"]
+    sid = inbox.post("t", "b", "p", poster="t")["session_id"]
     db.set_session_read(sid, True)  # what Desktop does when the chat opens
     assert inbox.list()[0]["unread"] is False
 
 
 def test_accept_unhides_and_leaves_inbox(env):
     inbox, db, _ = env
-    sid = inbox.post("t", "b", "do the thing")["session_id"]
+    sid = inbox.post("t", "b", "do the thing", poster="t")["session_id"]
     item = inbox.accept(sid)
     assert item["accept_prompt"] == "do the thing"
     assert not db.get_session(sid)["hidden"]
@@ -90,7 +90,7 @@ def test_accept_unhides_and_leaves_inbox(env):
 
 def test_user_turn_accepts_only_open_messages(env):
     inbox, db, _ = env
-    sid = inbox.post("t", "b", "p")["session_id"]
+    sid = inbox.post("t", "b", "p", poster="t")["session_id"]
     assert inbox.on_user_turn("not-an-inbox-id") is False
     assert inbox.on_user_turn(sid) is True
     assert not db.get_session(sid)["hidden"]
@@ -103,22 +103,25 @@ def test_archive(env):
     assert inbox.archive(sid)
     assert db.get_session(sid)["archived"]
     assert inbox.list() == []
-    # an archived message is not reused by its key
+    # an archived key sticks (bb-ce4c46ed94): a re-post is refused until released, then it is a new card
+    with pytest.raises(store.ArchivedKey):
+        inbox.post("t", "b", "p", key="k")
+    inbox.unarchive_key("k")
     assert inbox.post("t", "b", "p", key="k")["session_id"] != sid
     assert inbox.archive("nope") is False
 
 
 def test_archived_elsewhere_drops_out(env):
     inbox, db, _ = env
-    sid = inbox.post("t", "b", "p")["session_id"]
+    sid = inbox.post("t", "b", "p", poster="t")["session_id"]
     db.set_session_archived(sid, True)  # sidebar/session menu archive
     assert inbox.list() == []
 
 
 def test_duplicate_titles_get_suffix(env):
     inbox, db, _ = env
-    a = inbox.post("Same", "b", "p")["session_id"]
-    b = inbox.post("Same", "b", "p")["session_id"]
+    a = inbox.post("Same", "b", "p", poster="t")["session_id"]
+    b = inbox.post("Same", "b", "p", poster="t")["session_id"]
     assert db.get_session(a)["title"] == "Same" and db.get_session(b)["title"] == "Same (2)"
 
 
@@ -128,10 +131,10 @@ def test_cap_archives_oldest_read(env, monkeypatch):
     ids = []
     for i in range(3):
         clock["t"] += 1
-        ids.append(inbox.post(f"m{i}", "b", "p")["session_id"])
+        ids.append(inbox.post(f"m{i}", "b", "p", poster="t")["session_id"])
     db.set_session_read(ids[1], True)
     clock["t"] += 1
-    inbox.post("m3", "b", "p")
+    inbox.post("m3", "b", "p", poster="t")
     open_ids = {i["session_id"] for i in inbox.list()}
     assert ids[1] not in open_ids and len(open_ids) == 3
     assert db.get_session(ids[1])["archived"]
@@ -190,7 +193,7 @@ def test_same_key_after_a_reply_lands_in_that_conversation_not_a_new_card(env):
     assert not s["hidden"] and float(s.get("last_read_at") or 0) < clock["t"]
     assert "asked again" in db.get_messages(a["session_id"])[-1]["content"]
     assert inbox.list() == []  # still a chat in Recents, not back in the Inbox
-    inbox.archive(a["session_id"])
+    inbox.archive(a["session_id"])  # archived after a reply: David engaged, so the key is not held
     c = inbox.post("Board seat? (3rd)", "again", "p", key="slack:C1:1.0:board")
     assert c["session_id"] != a["session_id"] and not c["updated"]
 
@@ -212,7 +215,7 @@ def test_prompt_label_replaces_the_prompt_dump_on_the_card(env):
 
 def test_without_prompt_label_the_card_still_shows_the_prompt(env):
     inbox, db, _ = env
-    r = inbox.post("t", "b", "Destroy vast 123")
+    r = inbox.post("t", "b", "Destroy vast 123", poster="t")
     assert "**Proposed:** Destroy vast 123" in db.get_messages(r["session_id"])[0]["content"]
 
 
@@ -227,7 +230,7 @@ def test_tool_and_cli_pass_prompt_label(env, monkeypatch):
     import argparse
     ap = argparse.ArgumentParser()
     plugin._setup_cli(ap)
-    args = ap.parse_args(["post", "t2", "--body", "b", "--prompt", "p", "--prompt-label", "do the thing"])
+    args = ap.parse_args(["post", "t2", "--body", "b", "--prompt", "p", "--prompt-label", "do the thing", "--poster", "t"])
     assert plugin._run_cli(args) == 0
     sid = [i for i in inbox.list() if i["title"] == "t2"][0]["session_id"]
     assert "**Do it:** do the thing" in db.get_messages(sid)[0]["content"]
@@ -249,7 +252,7 @@ def _env_with_tasks(tmp_path, monkeypatch):
 def _post_and_archive(inbox, clock, poster, n):
     for i in range(n):
         clock["t"] += 60
-        r = inbox.post(f"Main CI red @ {i}", "red", "fix it", key=f"ci:{i}", poster=poster)
+        r = inbox.post(f"Main CI red @ {i}", "red", "fix it", key=f"ci:{int(clock['t'])}", poster=poster)
         inbox.archive(r["session_id"])
 
 

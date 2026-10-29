@@ -27,7 +27,22 @@ the window were all archived with no action (Archive, sidebar archive, or the op
 resolved card resets the streak), a new card from that poster is refused with `PosterMuted` (a `ValueError`: CLI
 exit 1, tool `posted: false`, REST 400) and one Kanban card `inbox-muted:<poster>` is filed to fix that poster.
 Updates to an already-open card with the same key still go through. After fixing the poster:
-`hermes inbox unmute '<poster>'`. Posts with no poster are not tracked.
+`hermes inbox unmute '<poster>'`.
+
+**Junk guards** (bb-ce4c46ed94; each earlier fix blocked one sender by name and the next one got through):
+- *Archive sticks:* when the newest card with a key was archived with no action, a re-post of that key is refused
+  for `ARCHIVE_STICK_S` (14 days) and filed as one Kanban card (`inbox-archived-key:<key>`).
+  `hermes inbox unarchive-key '<key>'` releases it for a genuinely new decision.
+- *Every post has a sender:* a keyed post with no poster is attributed to its key family (`key · gh-actions-billing`);
+  a post with neither poster nor key is refused (`NoPoster`). The agent tool falls back to `agent · <profile>`.
+- *Per job, not per card:* `kanban · <card>`, `desktop · <chat>` and `oneshot · <x>` count as one sender each for the
+  noise breaker (`poster_group`); `cron · <job>` is already per job. Key-family senders are never muted: those flows
+  are one key per item and are covered by the archive rule.
+- *No test/probe cards:* titles/keys that look like tests or probes (`TEST:`, `e2e routing probe`, `SCRATCH`,
+  `safe to ignore`, keys like `x-post:TEST3`, `bsky-routing-probe:`) are refused (`JunkPost`), and so is any post
+  from a pytest run (or `HERMES_INBOX_TEST=1`) into a real `~/.hermes` / `~/.bb-hermes` home.
+- *Detection:* `junk_audit.py` (daily hub cron `inbox-junk-audit`) reads every gateway's Inbox through
+  `hermes-hub inbox --all --json` and opens one Kanban card per day when junk still got through.
 Tests: `tests/test_store.py` (streak, reset, sidebar archive, window, re-key), `tests/test_mute_paths.py` (CLI, tool, REST).
 
 **Agent-fixable refusal** (`store.agent_fixable_reason`): before any card exists, a post from an agent-fixable

@@ -40,6 +40,12 @@ STALE_QUEUING_S = 300  # a task claim older than this had a crashed claimant; ac
 # with no action is refused, and one Kanban card is filed to fix that poster. David's Archive is the signal.
 MUTE_AFTER = 3
 MUTE_WINDOW_S = 7 * 86400
+# Archive sticks: a re-post of a key whose newest card David archived (no action) inside this window is refused
+# and filed as one Kanban card instead; `hermes inbox unarchive-key <key>` releases it early (bb-ce4c46ed94).
+ARCHIVE_STICK_S = 14 * 86400
+# Card-run posters are named "<source> · <card/chat title>": a new name per card, so the noise breaker never
+# reached 3. These count as their source. "cron · <job>" is already one name per job and stays as is.
+_GROUPED_SOURCES = ("kanban", "desktop", "oneshot")
 
 _lock = threading.RLock()
 _UNSET = object()  # explicit expected=None is invalid, never an unconditional fallback
@@ -51,6 +57,54 @@ class PosterMuted(ValueError):
 
 class AgentFixablePost(ValueError):
     """An automated poster tried to put agent-fixable state in the Inbox (owner-only decisions)."""
+
+
+class ArchivedKey(ValueError):
+    """David archived the newest card with this key; a re-post is refused (it goes to Kanban instead)."""
+
+
+class NoPoster(ValueError):
+    """A post with no sender: nothing could mute it, so it is refused."""
+
+
+class JunkPost(ValueError):
+    """A test/probe/scratch post aimed at the real Inbox."""
+
+
+def poster_group(poster: Optional[str]) -> Optional[str]:
+    """The name the noise breaker counts: "kanban · <card title>" -> "kanban"; anything else unchanged."""
+    if not poster:
+        return poster
+    head, sep, _ = poster.partition(" · ")
+    return head if sep and head.strip().lower() in _GROUPED_SOURCES else poster
+
+
+def key_poster(key: Optional[str]) -> Optional[str]:
+    """Sender for a keyed post that named none: its key family (gh-actions-billing:2026-10 -> key · gh-actions-billing)."""
+    fam = re.split(r"[:/]", key or "", maxsplit=1)[0].strip()[:60]
+    return f"key · {fam}" if fam else None
+
+
+# Test/probe/scratch cards (bb-ce4c46ed94: "TEST: approval binding", "e2e routing probe", "phase6 test A (safe to
+# ignore)"...). Uppercase TEST only, so "wave-speed test" in a real title passes; "latest"/"contest" never match.
+_JUNK_TITLE = re.compile(
+    r"\bTEST\b|(?i:^\s*\[?test\]?\s*[:\]-]|\[probe\]|\b(?:e2e|routing|test|smoke)\s+probe\b|\bscratch\b"
+    r"|\bsmoke\s*(?:test|check)|\bdo not post\b|\bnot for publication\b|\bsafe to ignore\b|\(ignore\)"
+    r"|\barchive me\b|\bdelete me\b|\blive test\b|\binbox test\b)")
+# Keys: an uppercase TEST/E2E/SCRATCH/PROBE/SMOKE segment (x-post:TEST3, bsky-reply:E2E-ROUTE-1), a family that
+# names a probe (bsky-routing-probe:, x-reply-adapter-smoke:, keytest:) or an id starting test- (cron:test-wrapper).
+# Lowercase "-tests-" inside a real key (organs-require-livingroom-tests-check) is left alone.
+_JUNK_KEY = re.compile(r"(?:^|[:_./-])(?:TEST|E2E|SCRATCH|PROBE|SMOKE)(?:[:_./-]|\d|$)"
+                       r"|(?i:^[^:]*(?:-probe|-smoke|keytest|selftest|tooltest|livetest)(?::|$)|:test[-_:])")
+
+
+def junk_reason(title: str, key: Optional[str]) -> Optional[str]:
+    """Why a post looks like a test/probe card, or None."""
+    if _JUNK_TITLE.search(title or ""):
+        return f"title {title[:60]!r} looks like a test/probe card"
+    if key and _JUNK_KEY.search(key):
+        return f"key {key[:60]!r} looks like a test/probe card"
+    return None
 
 
 # Posters that report board state an agent can fix: never the Inbox, always a Kanban comment/card.
@@ -138,6 +192,10 @@ CREATE INDEX IF NOT EXISTS items_key ON items(key);
 CREATE TABLE IF NOT EXISTS unmutes (
   poster     TEXT PRIMARY KEY,
   unmuted_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS key_releases (
+  key         TEXT PRIMARY KEY,
+  released_at REAL NOT NULL
 );
 """
 # Added with card types; ALTERed into older sidecars on open (idempotent).
@@ -357,6 +415,12 @@ class Inbox:
         poster = (" ".join(str(poster).split())[:80] or None) if poster else None
         if not title:
             raise ValueError("title is required")
+        junk = junk_reason(title, key) or self._test_env_reason()
+        if junk:
+            raise JunkPost(f"refused: {junk}. Tests and probes never post to the real Inbox: use a temp "
+                           f"HERMES_HOME (or check the card with the module's tests).")
+        named = poster  # what the caller called itself: project routing keys on this, never a derived name
+        poster = poster or key_poster(key)
         sh = selfheal_reason(poster, type, self.home)
         if sh:  # enforced here, not only in card text: old fix cards still carry a `hermes inbox post` step
             raise AgentFixablePost(f"refused: {sh}.")
@@ -369,6 +433,9 @@ class Inbox:
         fvals = ct.check_fields(tdef, fields)
         if not accept_prompt and ct.needs_accept_prompt(tdef):
             raise ValueError("accept_prompt is required (the instruction 'Do it' sends)")
+        if not poster:
+            raise NoPoster("refused: a post needs a sender (--poster / poster=) or a key, so David's archives can "
+                           "mute it if it turns out to be noise.")
         snap = ct.snapshot(tdef)
         tname, fjson, ajson = snap["name"], json.dumps(fvals), json.dumps(snap)
         legacy = ct.is_builtin_default(snap)  # by content: a look-alike type can't borrow the legacy text
@@ -384,7 +451,7 @@ class Inbox:
                     not expected.get("session_id")):
                 raise ValueError("expected must be an outcome snapshot with key, session_id and revision")
             return self._conditional_post(
-                title=title, body=body, accept_prompt=accept_prompt, key=key, poster=poster,
+                title=title, body=body, accept_prompt=accept_prompt, key=key, poster=poster, named=named,
                 cwd=cwd, inherited_cwd=inherited_cwd, model=model, prompt_label=prompt_label,
                 snap=snap, fvals=fvals, legacy=legacy, now=now,
                 if_absent=if_absent, expected=expected)
@@ -413,20 +480,40 @@ class Inbox:
                     side.commit()
                     db.set_session_read(talking, False)
                     return {"session_id": talking, "updated": True, "conversation": True}
-                ignored = self._ignored_streak(side, db, poster, now) if poster else 0
-                if poster and ignored >= MUTE_AFTER:
-                    self._file_mute_card(poster, title, body)
+                archived_at = self._archived_key(side, db, key, now) if key else None
+                if archived_at is not None:
+                    self._file_card(
+                        f"Inbox refused a re-post of an archived card: {key}",
+                        (f"David archived the Hermes Inbox card with key `{key}` (poster `{poster}`) "
+                         f"{(now - archived_at) / 3600:.0f} h ago with no action, and it was posted again. The "
+                         f"inbox now refuses that key for {ARCHIVE_STICK_S // 86400} days. Find the poster and "
+                         f"change it: what an agent can fix goes to a Kanban card, routine status goes nowhere, "
+                         f"only a decision David alone can make goes to the Inbox, once. If this really is a new "
+                         f"decision, run `hermes inbox unarchive-key '{key}'` on this gateway and re-post.\n\n"
+                         f"Refused post:\n\n**{title}**\n\n{body[:3000]}"),
+                        f"inbox-archived-key:{key}")
+                    raise ArchivedKey(
+                        f"refused: David archived the card with key {key!r} without acting on it; it stays "
+                        f"archived for {ARCHIVE_STICK_S // 86400} days. Route this to Kanban (a card was filed: "
+                        f"inbox-archived-key:{key}); if it is truly a new decision, `hermes inbox unarchive-key "
+                        f"{key!r}` first.")
+                group = poster_group(poster)
+                # Only a self-named sender is muted. A key-family name ("key · x-dm") is attribution: those flows
+                # (one key per DM/post) are covered per key by the archive rule above, where Archive = dismissed.
+                ignored = self._ignored_streak(side, db, poster, now) if named else 0
+                if ignored >= MUTE_AFTER:
+                    self._file_mute_card(group, title, body)
                     raise PosterMuted(
-                        f"poster {poster!r} is muted: its last {ignored} inbox cards were archived with no "
+                        f"poster {group!r} is muted: its last {ignored} inbox cards were archived with no "
                         f"action, so its posts are noise to David. Route what it reports to a Kanban card "
                         f"(an agent fixes it) and post to the Inbox only a decision David alone can make. "
-                        f"Unmute after fixing the poster: `hermes inbox unmute {poster!r}`.")
+                        f"Unmute after fixing the poster: `hermes inbox unmute {group!r}`.")
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 rt = routing_module()
                 cwd_explicit = int(cwd is not None)
                 cwd = rt.route_cwd(self.home, explicit=cwd, inherited=inherited_cwd, social=rt.is_social(
-                    key=key, type=type, title=title, body=body, poster=poster), poster=poster)
+                    key=key, type=type, title=title, body=body, poster=named), poster=named)
                 db.create_session(sid, "desktop", model=model, cwd=cwd or str(Path.home()))
                 db.set_session_hidden(sid, True)
                 text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy
@@ -509,7 +596,7 @@ class Inbox:
                 "message_count": len(messages),
                 "last_message_id": messages[-1]["id"] if messages else None}
 
-    def _conditional_post(self, *, title, body, accept_prompt, key, poster, cwd,
+    def _conditional_post(self, *, title, body, accept_prompt, key, poster, cwd, named=None,
                           inherited_cwd, model, prompt_label, snap, fvals, legacy, now,
                           if_absent, expected):
         with self._atomic() as (conn, db):
@@ -535,15 +622,15 @@ class Inbox:
 
             writer: Any = Writer()
             if current is None:
-                if poster and self._ignored_streak(conn, writer, poster, now) >= MUTE_AFTER:
+                if named and self._ignored_streak(conn, writer, poster, now) >= MUTE_AFTER:
                     raise PosterMuted(f"poster {poster!r} is muted; fix it before unmuting")
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 rt = routing_module()
                 routed = rt.route_cwd(self.home, explicit=cwd, inherited=inherited_cwd,
                                       social=rt.is_social(key=key, type=snap["name"], title=title,
-                                                          body=body, poster=poster),
-                                      poster=poster)
+                                                          body=body, poster=named),
+                                      poster=named)
                 type(db)._insert_session_row(writer, sid, "desktop", model=model,
                                              cwd=routed or str(Path.home()))
                 conn.execute("UPDATE sessions SET hidden=1 WHERE id=?", (sid,))
@@ -587,12 +674,15 @@ class Inbox:
     def _ignored_streak(self, side, db, poster: str, now: float) -> int:
         """How many of *poster*'s most recent closed cards (inside MUTE_WINDOW_S, after its last unmute)
         in a row were archived with no action. Accepted (Do it / a reply) or resolved breaks the streak;
-        cards still open don't count either way."""
-        row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=?", (poster,)).fetchone()
+        cards still open don't count either way. Counted per ``poster_group`` ("kanban · X" -> "kanban")."""
+        group = poster_group(poster) or poster
+        row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=?", (group,)).fetchone()
         since = max(now - MUTE_WINDOW_S, float(row["unmuted_at"]) if row else 0.0)
         streak = 0
-        for r in side.execute("SELECT session_id, state FROM items WHERE poster=? AND created_at>=? "
-                              "ORDER BY created_at DESC LIMIT 50", (poster, since)):
+        like = group.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + " · %"
+        for r in side.execute("SELECT session_id, state FROM items WHERE (poster=? OR (? AND poster LIKE ? "
+                              "ESCAPE '\\')) AND created_at>=? ORDER BY created_at DESC LIMIT 50",
+                              (group, int(group != poster), like, since)):
             if r["state"] in ("accepted", "resolved", "queuing"):
                 break
             s = db.get_session(r["session_id"])
@@ -604,22 +694,68 @@ class Inbox:
                     break
         return streak
 
-    def _file_mute_card(self, poster: str, title: str, body: str) -> None:
+    def _archived_key(self, side, db, key: str, now: float) -> Optional[float]:
+        """When the newest card with *key* was archived with no action inside ARCHIVE_STICK_S (and the key was
+        not released with unarchive-key since), the time it was archived; else None."""
+        row = side.execute("SELECT session_id, state, resolved_at, updated_at FROM items WHERE key=? "
+                           "ORDER BY created_at DESC, rowid DESC LIMIT 1", (key,)).fetchone()
+        if row is None or row["state"] not in ("open", "archived"):
+            return None  # accepted / resolved / queuing: David acted on it
+        s = db.get_session(row["session_id"])
+        if s and not s.get("hidden"):
+            return None  # un-hidden = accepted (Do it / a reply) before any archive: David engaged
+        if row["state"] == "open" and s and not s.get("archived"):
+            return None  # still open
+        at = float(row["resolved_at"] or row["updated_at"] or 0)
+        rel = side.execute("SELECT released_at FROM key_releases WHERE key=?", (key,)).fetchone()
+        if now - at > ARCHIVE_STICK_S or (rel and float(rel["released_at"]) >= at):
+            return None
+        return at
+
+    def unarchive_key(self, key: str) -> None:
+        """Let *key* be posted again before ARCHIVE_STICK_S runs out (a genuinely new decision)."""
+        with _lock:
+            side = self._side()
+            try:
+                side.execute("INSERT INTO key_releases(key, released_at) VALUES (?, ?) ON CONFLICT(key) "
+                             "DO UPDATE SET released_at=excluded.released_at", (key, self.clock()))
+                side.commit()
+            finally:
+                side.close()
+
+    def _test_env_reason(self) -> Optional[str]:
+        """Under pytest (or HERMES_INBOX_TEST) a real Hermes home (~/.hermes, ~/.bb-hermes or one of their
+        profiles) is refused; tests post to a temp HERMES_HOME."""
+        if not (os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("HERMES_INBOX_TEST")):
+            return None
+        home = Path(self.home).expanduser().resolve()
+        for root in (Path.home() / ".hermes", Path.home() / ".bb-hermes"):
+            root = root.resolve()
+            if home == root or home.parent == root / "profiles":
+                return f"a test run (pytest / HERMES_INBOX_TEST) is posting to the real Inbox at {self.home}"
+        return None
+
+    def _file_mute_card(self, poster: Optional[str], title: str, body: str) -> None:
         """One Kanban card per muted poster (idempotent): an agent fixes the poster's signal."""
+        self._file_card(
+            f"Inbox poster muted as noise: {poster}",
+            (f"David archived the last {MUTE_AFTER} Hermes Inbox cards from `{poster}` with no "
+             f"action, so the inbox now refuses its posts. Find the code that posts as this poster "
+             f"and change it: problems an agent can fix go to a Kanban card (assignee default), "
+             f"routine status goes nowhere, and only a decision David alone can make goes to the "
+             f"Inbox. Then run `hermes inbox unmute '{poster}'` on the gateway that refused it.\n\n"
+             f"Refused post:\n\n**{title}**\n\n{body[:3000]}"),
+            f"inbox-muted:{poster}")
+
+    def _file_card(self, title: str, body: str, idem: str) -> None:
+        """One Kanban card per refusal reason (idempotent). Best-effort, never silent."""
         try:
             (self._task_creator or kanban_task_creator)(
-                title=f"Inbox poster muted as noise: {poster}"[:120],
-                body=(f"David archived the last {MUTE_AFTER} Hermes Inbox cards from `{poster}` with no "
-                      f"action, so the inbox now refuses its posts. Find the code that posts as this poster "
-                      f"and change it: problems an agent can fix go to a Kanban card (assignee default), "
-                      f"routine status goes nowhere, and only a decision David alone can make goes to the "
-                      f"Inbox. Then run `hermes inbox unmute '{poster}'` on the gateway that refused it.\n\n"
-                      f"Refused post:\n\n**{title}**\n\n{body[:3000]}"),
-                assignee="default", idempotency_key=f"inbox-muted:{poster}")
+                title=title[:120], body=body, assignee="default", idempotency_key=idem)
         except Exception as exc:
             # The refusal itself is the guard; the card is best-effort but never silent: a Kanban worker's
             # terminal is fenced from board writes (HERMES_DELEGATED_CHILD_CONTEXT) and used to hide that here.
-            msg = (f"inbox: poster {poster!r} is muted but the Kanban fix card (inbox-muted:{poster}) could "
+            msg = (f"inbox: refused a post but the Kanban fix card ({idem}) could "
                    f"NOT be filed: {type(exc).__name__}: {str(exc)[:200]}. File it from outside a worker "
                    f"fence (hub cron / kanban_create).")
             try:
@@ -633,6 +769,7 @@ class Inbox:
                 pass
 
     def unmute(self, poster: str) -> None:
+        poster = poster_group(" ".join(str(poster).split())) or poster
         with _lock:
             side = self._side()
             try:

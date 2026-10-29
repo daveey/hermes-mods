@@ -1,0 +1,230 @@
+"""Junk guards (defect bb-ce4c46ed94): David's Archive sticks, every post has a sender, card-run posters are
+counted per job, and test/probe posts never reach the real Inbox.
+
+Before this, each fix blocked one sender by name, so any new sender got through: an archived alert came back
+as a new card (`gh-actions-billing:2026-10`, archived 5 times in 4 days), posts with no poster were never
+counted by the noise breaker, "kanban · <card title>" was a new poster per card, and TEST/probe cards landed
+in the real Inbox.
+"""
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parents[1]
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+store = _load("_inbox_store_junk", HERE / "store.py")
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db._inbox_keep_open = True
+    clock = {"t": 1_000_000.0}
+    tasks = []
+    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"],
+                        task_creator=lambda **kw: tasks.append(kw) or "t_junk")
+    return inbox, db, clock, tasks
+
+
+# ── 1. Archive sticks ───────────────────────────────────────────────────────────
+def test_archived_key_is_refused_on_repost_and_files_one_kanban_card(env):
+    inbox, _db, clock, tasks = env
+    r = inbox.post("GitHub Actions: billing lock", "b", "fix", key="gh-actions-billing:2026-10", poster="cron · gh")
+    inbox.archive(r["session_id"])
+    clock["t"] += 3600
+    with pytest.raises(store.ArchivedKey) as e:
+        inbox.post("GitHub Actions: billing lock", "b", "fix", key="gh-actions-billing:2026-10", poster="cron · gh")
+    assert "Kanban" in str(e.value) and "unarchive-key" in str(e.value)
+    assert [t["idempotency_key"] for t in tasks] == ["inbox-archived-key:gh-actions-billing:2026-10"]
+
+
+def test_sidebar_archive_also_sticks(env):
+    inbox, db, clock, _ = env
+    r = inbox.post("alert", "b", "fix", key="k:side", poster="p")
+    db.set_session_archived(r["session_id"], True)  # archived through the normal session door
+    clock["t"] += 60
+    with pytest.raises(store.ArchivedKey):
+        inbox.post("alert", "b", "fix", key="k:side", poster="p")
+
+
+def test_archived_key_allowed_again_after_window_or_unarchive_key(env):
+    inbox, _db, clock, _ = env
+    inbox.archive(inbox.post("a", "b", "p", key="k:1", poster="p")["session_id"])
+    clock["t"] += 60
+    inbox.unarchive_key("k:1")
+    clock["t"] += 60
+    assert inbox.post("a", "b", "p", key="k:1", poster="p")["updated"] is False
+    inbox.archive(inbox.post("c", "b", "p", key="k:2", poster="q")["session_id"])
+    clock["t"] += store.ARCHIVE_STICK_S + 60
+    assert inbox.post("c", "b", "p", key="k:2", poster="q")["updated"] is False
+
+
+def test_resolved_or_accepted_key_is_not_refused(env):
+    inbox, _db, clock, _ = env
+    sid = inbox.post("a", "b", "p", key="k:acc", poster="p")["session_id"]
+    inbox.accept(sid)
+    clock["t"] += 60
+    assert inbox.post("a2", "b", "p", key="k:acc", poster="p")["updated"] is True  # joins the conversation
+
+
+# ── 2. Every post has a sender ──────────────────────────────────────────────────
+def test_post_with_no_poster_and_no_key_is_refused(env):
+    inbox, *_ = env
+    with pytest.raises(store.NoPoster):
+        inbox.post("Approve spend", "b", "go")
+
+
+def test_keyed_post_without_poster_is_attributed_to_its_key_family(env):
+    inbox, *_ = env
+    sid = inbox.post("GitHub Actions: billing lock", "b", "fix", key="gh-actions-billing:2026-10")["session_id"]
+    assert inbox.get(sid)["poster"] == "key · gh-actions-billing"
+
+
+def test_card_run_posters_are_counted_per_source_not_per_card(env):
+    inbox, _db, clock, tasks = env
+    for name in ("A", "B", "C"):
+        clock["t"] += 60
+        inbox.archive(inbox.post(f"noise {name}", "b", "p", key=f"n:{name}", poster=f"kanban · {name}")["session_id"])
+    with pytest.raises(store.PosterMuted):
+        inbox.post("noise D", "b", "p", key="n:D", poster="kanban · D")
+    assert tasks[-1]["idempotency_key"] == "inbox-muted:kanban"
+    inbox.unmute("kanban · anything")  # unmute by any member names the group
+    assert inbox.post("useful", "b", "p", key="n:E", poster="kanban · E")["updated"] is False
+
+
+def test_cron_posters_stay_per_job(env):
+    inbox, _db, clock, _ = env
+    for name in ("A", "B", "C"):
+        clock["t"] += 60
+        inbox.archive(inbox.post(f"x {name}", "b", "p", key=f"c:{name}", poster=f"cron · job {name}")["session_id"])
+    assert inbox.post("x D", "b", "p", key="c:D", poster="cron · job D")["updated"] is False
+
+
+# ── 3. Test/probe posts never reach the real Inbox ──────────────────────────────
+@pytest.mark.parametrize("title,key", [
+    ("TEST: x", None),
+    ("TEST: approval binding, not for publication", "x-post:Q-TEST-APPROVAL-09593"),
+    ("Bluesky reply draft: e2e routing probe", "bsky-reply:E2E-ROUTE-2027862"),
+    ("X DM from SCRATCH TEST (not a real DM)", "x-dm:TEST-t01a17f04"),
+    ("phase6 test A (safe to ignore)", "phase6-test-a"),
+    ("Bluesky draft approval verification", "bsky-routing-probe:179304"),
+    ("Merge PR #99 after CI", "coding:E2E-2027862"),
+    ("LessWrong crosspost", "lw-crosspost:TEST-scratch"),
+    ("cron wrapper", "cron:test-wrapper"),
+    ("Inbox test from mini: archive me", None),
+])
+def test_test_and_probe_posts_are_refused(env, title, key):
+    inbox, *_ = env
+    with pytest.raises(store.JunkPost):
+        inbox.post(title, "b", "p", key=key, poster="someone")
+
+
+def test_key_family_posters_are_not_muted_by_dismissals(env):
+    """x-dm cards are dismissed with Archive one key each; that must never mute the DM flow."""
+    inbox, _db, clock, _ = env
+    for i in range(4):
+        clock["t"] += 60
+        inbox.archive(inbox.post(f"X DM from {i}", "b", "p", key=f"x-dm:{i}")["session_id"])
+    assert inbox.post("X DM from 5", "b", "p", key="x-dm:5")["updated"] is False
+
+
+@pytest.mark.parametrize("title,key", [
+    ("organs: make livingroom-tests a required check on main?", "organs-require-livingroom-tests-check"),
+    ("#quakes: Allie proposes moving past MeshRIR (D01 wave-speed test, then OpenFWI)", "quakes:next-benchmark"),
+    ("Approve the latest contest entry", "release:latest"),
+    ("GitHub Actions: billing lock or spend alert", "gh-actions-billing:2026-10"),
+])
+def test_real_cards_are_not_mistaken_for_tests(env, title, key):
+    inbox, *_ = env
+    assert inbox.post(title, "b", "p", key=key, poster="someone")["session_id"]
+
+
+def test_test_env_refused_only_against_a_real_home(env, monkeypatch, tmp_path):
+    inbox, *_ = env
+    monkeypatch.setenv("HERMES_INBOX_TEST", "1")
+    assert inbox.post("fine in a temp home", "b", "p", poster="x")["session_id"]  # tests use a temp home
+    real = store.Inbox(home=Path.home() / ".hermes", db_factory=lambda: pytest.fail("must refuse first"))
+    with pytest.raises(store.JunkPost):
+        real.post("ordinary title", "b", "p", poster="x")
+
+
+# ── entry paths: CLI and tool ───────────────────────────────────────────────────
+def _plugin(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mod = _load("_inbox_plugin_junk", HERE / "__init__.py")
+    monkeypatch.setattr(mod.store_module(), "kanban_task_creator", lambda **kw: "t_test")
+    return mod
+
+
+def _cli(mod, argv):
+    p = argparse.ArgumentParser()
+    mod._setup_cli(p)
+    return mod._run_cli(p.parse_args(argv))
+
+
+def test_cli_refuses_archived_key_and_unarchive_key_releases_it(monkeypatch, tmp_path, capsys):
+    mod = _plugin(monkeypatch, tmp_path)
+    assert _cli(mod, ["post", "alert", "--prompt", "p", "--key", "k:cli", "--poster", "cron · w"]) == 0
+    sid = json.loads(capsys.readouterr().out)["session_id"]
+    assert _cli(mod, ["archive", sid]) == 0
+    assert _cli(mod, ["post", "alert", "--prompt", "p", "--key", "k:cli", "--poster", "cron · w"]) == 1
+    assert "archived" in capsys.readouterr().err
+    assert _cli(mod, ["unarchive-key", "k:cli"]) == 0
+    assert _cli(mod, ["post", "alert", "--prompt", "p", "--key", "k:cli", "--poster", "cron · w"]) == 0
+
+
+def test_cli_refuses_post_with_no_poster_and_no_key(monkeypatch, tmp_path, capsys):
+    mod = _plugin(monkeypatch, tmp_path)
+    assert _cli(mod, ["post", "Approve spend", "--prompt", "p"]) == 1
+    assert "poster" in capsys.readouterr().err
+
+
+def test_tool_falls_back_to_a_poster_when_the_session_is_unknown(monkeypatch, tmp_path):
+    mod = _plugin(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod, "_poster_for", lambda sid: (None, None))
+    out = json.loads(mod.handle_post({"title": "Approve spend", "body": "b", "accept_prompt": "go"}))
+    assert out["posted"] is True
+    item = mod.store_module().Inbox().get(out["session_id"])
+    assert item["poster"].startswith("agent")
+
+
+# ── detection: the daily cross-gateway audit opens one Kanban card, never an Inbox card ──────────────────
+def test_junk_audit_finds_reposted_keys_untouched_senders_and_test_cards():
+    audit = _load("_inbox_junk_audit", HERE / "junk_audit.py")
+    now = 2_000_000.0
+    item = lambda **kw: dict({"gw": "macbook", "state": "archived", "outcome": "archived", "poster": None}, **kw)  # noqa: E731
+    items = [item(key="gh-actions-billing:2026-10", title="GitHub Actions: billing lock", created_at=now - 3 * 86400),
+             item(key="gh-actions-billing:2026-10", title="GitHub Actions: billing lock", created_at=now - 3600),
+             item(key="x-post:Q-TEST-1", title="TEST: approval binding", created_at=now - 7200, state="resolved"),
+             item(key="ok:1", title="Approve spend", created_at=now - 3600, state="accepted", outcome="do_it",
+                  poster="cron · audit"),
+             item(key="old:1", title="old", created_at=now - 30 * 86400)]
+    res = audit.audit(items, now)
+    assert res["senders"] == []  # key-family senders are judged per key, below
+    assert res["reposted_keys"][0]["key"] == "gh-actions-billing:2026-10" and res["reposted_keys"][0]["fresh"]
+    assert [f["key"] for f in res["test_cards"]] == ["x-post:Q-TEST-1"]
+    assert res["fresh"] is True
+    calls = []
+
+    class P:
+        returncode, stdout, stderr = 0, '{"id": "t_audit"}', ""
+
+    assert audit.file_card(res, now, runner=lambda argv, **kw: calls.append((argv, kw)) or P()) == "t_audit"
+    argv, kw = calls[0]
+    assert argv[:3] == ["hermes", "kanban", "create"] and "inbox" not in argv[1:3]
+    assert argv[argv.index("--idempotency-key") + 1].startswith("inbox-junk-audit:")
+    assert "gh-actions-billing" in kw["input"]
+    assert audit.audit([i for i in items if i["key"] == "ok:1"], now)["fresh"] is False
