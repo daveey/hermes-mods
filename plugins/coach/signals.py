@@ -3,6 +3,9 @@ under /usr/bin/python3).
 
 It turns raw machine signals into `self_heal.file_defect` calls with stable fingerprints:
 - errors      new tracebacks in <home>/logs/errors.log (any level), minus tool output and provider transients;
+              a provider 401/403 logged as "Streaming failed before delivery" (core's retry loop refreshes or
+              rotates) only as a storm: 3+ in 10 min per host, fingerprinted by status + reason class
+              (revoked/expired/invalid/other); the e0a5909348 credential-guard warnings (no traceback) always;
 - hook        plugin hook exceptions (`Hook '<name>' callback <cb> raised: ...` from hermes_cli/plugins_dispatch);
 - cron        a cron job whose sticky `last_failure.at` is newer than the cursor (cron/jobs.json), filed only while
               failure_streak >= cron.failure_nudge_threshold (default 3) or after that many recovered failures in
@@ -79,6 +82,25 @@ EXIT_NOISE_RE = re.compile(r"cannot schedule new futures after|can't register at
 # Not a defect unless a Hermes logger or frame is involved; a storm of them on one host/profile still files one.
 RECONNECT_RE = re.compile(r"^Attempting a reconnect in \d")
 OWN_LOGGER_RE = re.compile(r"^(hermes|gateway|agent|tools|cron|tui_gateway|plugins|run_agent|kanban|coach|acp)")
+# Provider 401/403 raised while opening a stream: core logs the traceback ("Streaming failed before delivery",
+# chat_completion_helpers) BEFORE its retry loop refreshes or rotates the credential, so one that recovered looks
+# like one that killed the turn (agent-101f72db15). Not filed per occurrence; AUTH_STORM_N within AUTH_STORM_S on
+# one host files one "auth-failure storm". 429 stays a TRANSIENT_RE skip.
+STREAM_FAIL_RE = re.compile(r"^Streaming failed before delivery\b")
+AUTH_EXC_RE = re.compile(r"(?:^|\.)(AuthenticationError|PermissionDeniedError)$")
+STATUS_RE = re.compile(r"Error code: (\d{3})\b")
+PROVIDER_MSG_RE = re.compile(r"""['"]message['"]:\s*['"]([^'"]*)['"]""")
+AUTH_STORM_N, AUTH_STORM_S = 3, 600
+# The guard warnings core commit e0a5909348 added around 401 recovery. They carry no traceback, so the traceback
+# path never saw them; "persists after N refreshes" and "moved off pool entry" are the detection-level signal that
+# the pinned-account 401 loop came back. Pool entry ids are left out of the fingerprint (one defect, any entry).
+GUARD_RES = (
+    ("refresh-persists", re.compile(r"^Credential auth failure persists after \d+ refreshes for pool entry \S+")),
+    ("moved-off-entry", re.compile(r"^(?:(\w+) )?pre-request credential check moved the session off pool entry \S+",
+                                   re.I)),
+    ("key-owner-mismatch", re.compile(r"^Credential auth failure: the failing key belongs to pool entry \S+, but the "
+                                      r"session is attributed to entry \S+")),
+)
 RECONNECT_STORM = 20               # more than this many library reconnects in RECONNECT_WINDOW_S files one defect
 RECONNECT_WINDOW_S = 3600
 
@@ -173,9 +195,28 @@ def component_of(paths: List[str]) -> Tuple[str, str]:
     return "agent", ""
 
 
-def parse_errors(lines: List[str], reconnects: Optional[list] = None) -> List[dict]:
-    """Records (header + continuation lines) -> traceback and hook-exception signals. Library auto-reconnects are
-    not signals; each is appended to `reconnects` (when given) for the storm count."""
+def auth_reason(text: str) -> str:
+    """The provider's 401/403 reason class: revoked / expired / invalid / other (from the error body's message)."""
+    m = PROVIDER_MSG_RE.search(text or "")
+    t = (m.group(1) if m else text or "").lower()
+    for word in ("revoked", "expired", "invalid"):
+        if word in t:
+            return word
+    return "other"
+
+
+def _provider_of(exc_type: str, msg: str = "") -> str:
+    if "." in exc_type:
+        return exc_type.split(".")[0].lower()
+    m = re.search(r"\b(anthropic|openai|xai|gemini|google|openrouter)\b", msg or "", re.I)
+    return m.group(1).lower() if m else "unknown"
+
+
+def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Optional[list] = None) -> List[dict]:
+    """Records (header + continuation lines) -> traceback, hook-exception and credential-guard signals. Library
+    auto-reconnects are not signals; each is appended to `reconnects` (when given) for the storm count. Provider
+    401/403s raised while opening a stream are handled by core's retry loop: not signals either, each is appended
+    to `auth` (when given) for the auth-failure storm count."""
     recs, cur = [], None
     for ln in lines:
         m = REC_RE.match(ln)
@@ -198,6 +239,17 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None) -> List[di
                         "symptom": f"plugin hook {hook} callback {cb} raised {err[:120]}",
                         "details": home_tilde(r["msg"])[:1500],
                         "fp": fp("plugin", "hook", hook, cb, re.sub(r"\d+", "N", exc))})
+            continue
+        guard = next(((k, m) for k, rx in GUARD_RES for m in [rx.search(r["msg"])] if m), None)
+        if guard:
+            gkind, gm = guard
+            prov = ((gm.group(1) or "").lower() if gkind == "moved-off-entry" and gm.group(1)
+                    else _provider_of("", r["msg"]))
+            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+                        "symptom": f"credential guard {gkind} ({prov}): {r['msg'][:160]}",
+                        "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
+                                                        + r["cont"]))[:1500],
+                        "fp": fp("agent", "credential-guard", prov, gkind)})
             continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue
@@ -222,8 +274,24 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None) -> List[di
             continue  # a library logging a handled exception (e.g. mcp's PermissionError); nothing of ours to fix
         inner = [(os.path.basename(p), fn) for p, fn in frames[-4:]]
         where = f"{inner[-1][1]} ({inner[-1][0]})" if inner else r["logger"]
-        sym = f"{exc_type.split('.')[-1]} in {where}" + (f" [{plug}]" if plug else "") + f": {r['msg'][:90]}"
         details = home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"] + block))
+        sm = STATUS_RE.search(exc_line) or STATUS_RE.search(r["msg"])
+        status = sm.group(1) if sm else ""
+        if AUTH_EXC_RE.search(exc_type) or status in ("401", "403"):
+            reason = auth_reason(exc_line or r["msg"])
+            if STREAM_FAIL_RE.match(r["msg"]):
+                if auth is not None:  # the retry loop refreshes/rotates; only a storm of these is ours to file
+                    auth.append({"at": r["at"], "sid": r["sid"], "status": status or "401", "reason": reason,
+                                 "provider": _provider_of(exc_type, exc_line), "details": details[-1500:]})
+                continue
+            tag = f"{status or 'auth'} {reason}"
+            sym = (f"{exc_type.split('.')[-1]} [{tag}] in {where}" + (f" [{plug}]" if plug else "")
+                   + f": {r['msg'][:90]}")
+            out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
+                        "details": details[-1500:],
+                        "fp": fp(comp, "tb", exc_type, tag, *[f"{a}:{b}" for a, b in inner])})
+            continue
+        sym = f"{exc_type.split('.')[-1]} in {where}" + (f" [{plug}]" if plug else "") + f": {r['msg'][:90]}"
         out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
                     "details": details[-1500:], "fp": fp(comp, "tb", exc_type, *[f"{a}:{b}" for a, b in inner])})
     return out
@@ -261,16 +329,55 @@ def reconnect_storms(cur: dict, prof: str, recs: List[dict], now: float, host: s
     return out
 
 
+def auth_storms(cur: dict, recs: List[dict], now: float, host: str) -> List[dict]:
+    """Keep this host's recent stream 401/403s in the cursor (a storm spans passes); AUTH_STORM_N of them within
+    AUTH_STORM_S files one auth-failure storm. The fingerprint carries provider, status and reason classes, so a
+    revoked-token storm and an expired-token storm are different defects."""
+    st = cur.get("auth") or {}
+    evs = [e for e in st.get("ev") or [] if e.get("at", 0) >= now - BACKFILL_S]
+    filed = float(st.get("filed") or 0)
+    out = []
+    for r in sorted((r for r in recs if r["at"] >= now - BACKFILL_S), key=lambda r: r["at"]):
+        evs = [e for e in evs if e["at"] > r["at"] - AUTH_STORM_S] + [
+            {k: r[k] for k in ("at", "sid", "status", "reason", "provider")}]
+        if len(evs) >= AUTH_STORM_N and filed <= r["at"] - AUTH_STORM_S:
+            filed = r["at"]
+            reasons = ",".join(sorted({e["reason"] for e in evs}))
+            statuses = ",".join(sorted({e["status"] for e in evs}))
+            provs = ",".join(sorted({e["provider"] for e in evs}))
+            sids = ", ".join(sorted({e["sid"] for e in evs if e["sid"]}))
+            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+                        "profile": r.get("profile") or "default",
+                        "symptom": f"auth-failure storm on {host or 'this host'}: {len(evs)} {provs} {statuses} "
+                                   f"({reasons}) stream errors in {AUTH_STORM_S // 60} min",
+                        "details": (f"{len(evs)} provider {statuses} errors ({reasons}) logged as 'Streaming failed "
+                                    f"before delivery' within {AUTH_STORM_S // 60} min; one alone is handled by the "
+                                    f"retry loop's refresh/rotation. Sessions: {sids}\nLatest:\n"
+                                    f"{r['details']}")[:1500],
+                        "fp": fp("agent", "auth-storm", provs, statuses, reasons)})
+            evs = []
+    evs = [e for e in evs if e["at"] > now - AUTH_STORM_S]
+    if evs or filed > now - AUTH_STORM_S:
+        cur["auth"] = {"ev": evs, "filed": filed}
+    else:
+        cur.pop("auth", None)
+    return out
+
+
 def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     out = []
+    auth: List[dict] = []
     for prof, h in homes(home):
         lines = read_new(h / "logs" / "errors.log", cur, f"errors:{prof}", now)
         recs: List[dict] = []
-        for s in parse_errors(lines, recs):
+        prof_auth: List[dict] = []
+        for s in parse_errors(lines, recs, prof_auth):
             if s["at"] >= now - BACKFILL_S:
                 s["profile"] = prof
                 out.append(s)
+        auth += [dict(a, profile=prof) for a in prof_auth]
         out += reconnect_storms(cur, prof, recs, now, host)
+    out += auth_storms(cur, auth, now, host)
     return out
 
 

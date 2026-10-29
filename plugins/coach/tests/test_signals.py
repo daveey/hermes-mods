@@ -610,3 +610,120 @@ def test_signals_and_refused_starts_share_one_restart_storm(home):
     _refused(home, 100)
     gw = kinds(sg.collect(home, {}, "macbook", NOW), "gateway")
     assert len(gw) == 1 and "restart storm" in gw[0]["symptom"]
+
+
+# ── provider 401/403 the retry loop handles (agent-101f72db15) ────────────────────────────────────────────────
+
+AUTH_OWN = "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py"
+AUTH_LIB = "/home/you/.hermes/installs/x/venv/lib/python3.14/site-packages/anthropic/_base_client.py"
+AUTH_MSG = {
+    "invalid": "Invalid authentication credentials",
+    "revoked": "OAuth access token has been revoked.",
+    "expired": "OAuth token has expired. Please obtain a new token or refresh your existing token.",
+}
+
+
+def auth_rec(ts="2026-10-28 13:19:38", reason="invalid", sid="20261028_130956_a12ab0",
+             msg="Streaming failed before delivery", status=401, exc="anthropic.AuthenticationError"):
+    """The real 13:19 PT macbook record (spool row agent-101f72db15, session 20261028_130956_a12ab0)."""
+    body = (f"Error code: {status} - {{'type': 'error', 'error': {{'type': 'authentication_error', "
+            f"'message': '{AUTH_MSG[reason]}'}}, 'request_id': 'req_011CgVFiqNZAjYwHe8qaTVMi'}}")
+    return [f"{ts},123 ERROR [{sid}] agent.chat_completion_helpers: {msg}: {body}",
+            "Traceback (most recent call last):",
+            f'  File "{AUTH_OWN}", line 3420, in _open_anthropic_stream',
+            "    return normalize_stream_usage(manager.__enter__())",
+            f'  File "{AUTH_LIB}", line 1364, in post',
+            "    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))",
+            f'  File "{AUTH_LIB}", line 1137, in request',
+            "    raise self._make_status_error_from_response(err.response) from None",
+            f"{exc}: {body}"]
+
+
+def _auth_home(tmp_path, lines):
+    h = tmp_path / "authhome"
+    (h / "logs").mkdir(parents=True)
+    (h / "logs" / "errors.log").write_text("\n".join(lines) + "\n")
+    return h
+
+
+def _ts(s):
+    return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+
+
+def test_recovered_stream_401_is_not_filed_per_occurrence(tmp_path):
+    """(a) the real 13:19 record: the retry loop refreshed/rotated and the turn finished; no per-occurrence signal."""
+    assert sg.parse_errors(auth_rec()) == []
+    h = _auth_home(tmp_path, auth_rec())
+    sigs = sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00"))
+    assert [s for s in sigs if s["kind"] == "errors"] == []
+
+
+def test_three_stream_401s_in_ten_minutes_file_one_storm(tmp_path):
+    """(b) 3 in 10 min on one host = one auth-failure storm signal, also when they span sweep passes."""
+    lines = auth_rec("2026-10-28 13:19:00") + auth_rec("2026-10-28 13:22:00") + auth_rec("2026-10-28 13:27:00")
+    h = _auth_home(tmp_path, lines)
+    sigs = [s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:30:00")) if s["kind"] == "errors"]
+    assert len(sigs) == 1
+    st = sigs[0]
+    assert "auth-failure storm" in st["symptom"] and "invalid" in st["symptom"] and "macbook" in st["symptom"]
+    assert st["session_id"] == "20261028_130956_a12ab0"
+    # two of them spread over two passes: the cursor carries the count
+    h2 = tmp_path / "h2"
+    (h2 / "logs").mkdir(parents=True)
+    log = h2 / "logs" / "errors.log"
+    cur = {}
+    log.write_text("\n".join(auth_rec("2026-10-28 13:19:00") + auth_rec("2026-10-28 13:20:00")) + "\n")
+    assert [s for s in sg.collect(h2, cur, "macbook", _ts("2026-10-28 13:21:00")) if s["kind"] == "errors"] == []
+    with log.open("a") as f:
+        f.write("\n".join(auth_rec("2026-10-28 13:24:00")) + "\n")
+    assert len([s for s in sg.collect(h2, cur, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]) == 1
+    # spread over more than 10 minutes: no storm
+    h3 = _auth_home(tmp_path / "x", auth_rec("2026-10-28 13:00:00") + auth_rec("2026-10-28 13:09:00")
+                    + auth_rec("2026-10-28 13:19:30"))
+    assert [s for s in sg.collect(h3, {}, "macbook", _ts("2026-10-28 13:30:00")) if s["kind"] == "errors"] == []
+
+
+def test_401_reason_class_splits_fingerprints(tmp_path):
+    """(c) "revoked" and "expired" are different defects, in storms and in plain (non-stream) tracebacks."""
+    def storm(reason):
+        lines = sum((auth_rec(f"2026-10-28 13:2{i}:00", reason) for i in range(3)), [])
+        sig = [s for s in sg.collect(_auth_home(tmp_path / reason, lines), {}, "macbook",
+                                     _ts("2026-10-28 13:30:00")) if s["kind"] == "errors"]
+        assert len(sig) == 1 and reason in sig[0]["symptom"]
+        return sig[0]["fp"]
+    assert len({storm("revoked"), storm("expired"), storm("invalid")}) == 3
+    plain = {r: sg.parse_errors(auth_rec(reason=r, msg="Anthropic client call failed")) for r in ("revoked", "expired")}
+    assert all(len(v) == 1 for v in plain.values())
+    assert plain["revoked"][0]["fp"] != plain["expired"][0]["fp"]
+    assert "revoked" in plain["revoked"][0]["symptom"] and "expired" in plain["expired"][0]["symptom"]
+
+
+GUARD_LINES = {
+    "refresh-persists": "2026-10-28 13:19:40,001 WARNING [20261028_130956_a12ab0] run_agent: Credential auth failure "
+                        "persists after 2 refreshes for pool entry acct-b — treating as unrecoverable and allowing "
+                        "fallback to activate.",
+    "moved-off-entry": "2026-10-28 13:19:41,001 WARNING [20261028_130956_a12ab0] run_agent: Anthropic pre-request "
+                       "credential check moved the session off pool entry acct-b (now acct-a)",
+    "key-owner-mismatch": "2026-10-28 13:19:42,001 WARNING [20261028_130956_a12ab0] agent.credential_pool_pin: "
+                          "Credential auth failure: the failing key belongs to pool entry acct-a, but the session is "
+                          "attributed to entry acct-b",
+}
+
+
+def test_each_e0a5909348_guard_warning_files_a_signal(tmp_path):
+    """(d) the guard warnings have no traceback; each one still files, fingerprinted by provider + warning kind."""
+    fps = set()
+    for kind, line in GUARD_LINES.items():
+        rows = sg.parse_errors([line])
+        assert len(rows) == 1, kind
+        r = rows[0]
+        assert r["kind"] == "errors" and r["session_id"] == "20261028_130956_a12ab0"
+        assert kind in r["symptom"] and "acct-" in r["details"]
+        fps.add(r["fp"])
+    assert len(fps) == 3
+    # the same warning for another pool entry is the same defect (entry ids are not in the fingerprint)
+    again = sg.parse_errors([GUARD_LINES["refresh-persists"].replace("acct-b", "acct-z")])
+    assert again[0]["fp"] in fps
+    # and through the real collector
+    h = _auth_home(tmp_path, list(GUARD_LINES.values()))
+    assert len([s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]) == 3
