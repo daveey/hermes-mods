@@ -1,6 +1,7 @@
 """Decision-receipt verification for repair chats: fictional fixtures, a temp user-steps store."""
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -15,14 +16,18 @@ SCOPE = ('Register runner `example-canary-1`. Card F then runs the demo: deliber
          'recover it from a repair chat.')
 
 
-def make_store(tmp_path, *, effect='approve', authorized=True, scope=SCOPE, ns=NS, op_id=OP):
+def make_store(tmp_path, *, effect='approve', authorized=True, scope=SCOPE, ns=NS, op_id=OP, state='resolved',
+               live_revision=4, age_days=0, approve_text='Run the demo.'):
     path = tmp_path / 'actions.sqlite3'
     c = sqlite3.connect(path)
     c.execute('CREATE TABLE operations (id TEXT PRIMARY KEY, namespace TEXT, session TEXT, request TEXT, '
               'revision INTEGER, idem TEXT, fingerprint TEXT, body TEXT)')
-    body = dict(operationId=op_id, requestId='req-1', revision=4, dispatchState='delivered',
+    c.execute('CREATE TABLE requests (namespace TEXT, id TEXT, session TEXT, revision INTEGER, state TEXT, resolution TEXT)')
+    c.execute('INSERT INTO requests VALUES (?,?,?,?,?,?)', (ns, 'req-1', 's', live_revision, state, None))
+    recorded = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
+    body = dict(operationId=op_id, requestId='req-1', revision=4, dispatchState='delivered', recordedAt=recorded,
                 intent=dict(effect=effect, executionAuthorized=authorized,
-                            request=dict(scope=dict(markdown=scope, complete=True))))
+                            request=dict(scope=dict(markdown=scope, complete=True), outcomes=dict(approve=approve_text))))
     c.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)', (op_id, ns, 's', 'req-1', 4, 'k', 'f', json.dumps(body)))
     c.commit(); c.close()
     return path
@@ -90,3 +95,43 @@ def test_tool_handler_requires_active_repair_and_refuses_relay_without_receipt(t
                                 repair=dict(id='repair_' + '1' * 32, state='active'),
                                 subject_names=(RUNNER, NAME), owner_profile='default', store_path=store)
     assert out['reason'] == 'unknown_field'
+
+
+REAL_SHAPE = (
+    '**Why:** card F.\n\n**Exact plan if approved (option a):**\n1. Register one runner `example-canary-1`.\n'
+    '5. Card F then runs the demo: deliberately stop the canary, recover it from a repair chat.\n\n'
+    '**Limits:** exactly one registration.\n\n**Exclusions:** no changes to the existing runners ec2-gwhub-1/ec2-gwhub-2; '
+    'no production labels (`hermes-hub`).\n\n**Consequences:** one extra idle runner.')
+
+
+def test_runner_named_only_in_exclusions_is_refused_but_the_granted_subject_passes(tmp_path):
+    path = make_store(tmp_path, scope=REAL_SHAPE)
+    assert verify(path)['authorized_operations'] == ['diagnose', 'service_start']
+    for excluded in ('ec2-gwhub-1', 'ec2-gwhub-2', 'hermes-hub'):
+        out = verify(path, names=(excluded,), runner='runner_' + '9' * 32)
+        assert out['verified'] is False and out['reason'] == 'subject_excluded_by_scope'
+
+
+def test_start_wording_only_in_restricting_sections_does_not_grant_service_start(tmp_path):
+    scope = 'Inspect `example-canary-1` read-only.\n\n**Exclusions:** do not recover or restart anything.'
+    assert verify(make_store(tmp_path, scope=scope))['authorized_operations'] == ['diagnose']
+
+
+@pytest.mark.parametrize('state', ['withdrawn', 'cancelled', 'superseded'])
+def test_withdrawn_or_superseded_request_is_refused(tmp_path, state):
+    assert verify(make_store(tmp_path, state=state))['reason'] == 'request_withdrawn_or_superseded'
+
+
+def test_newer_revision_and_old_receipts_are_refused(tmp_path):
+    assert verify(make_store(tmp_path, live_revision=5))['reason'] == 'request_withdrawn_or_superseded'
+
+
+def test_old_receipt_is_refused(tmp_path):
+    assert verify(make_store(tmp_path, age_days=15))['reason'] == 'receipt_expired'
+
+
+def test_subject_names_come_from_repair_binding_and_inventory():
+    config = dict(bindings=[dict(runner_id=RUNNER, service_ref=SERVICE), dict(runner_id='runner_' + '4' * 32, service_ref='service_' + 'b' * 32)])
+    runners = [dict(id=RUNNER, display_name=NAME), dict(id='runner_' + '4' * 32, display_name='other')]
+    assert receipts.subject_names(dict(entity_id=RUNNER), config, runners) == (RUNNER, SERVICE, NAME)
+    assert receipts.subject_names(dict(entity_id='runner_' + '8' * 32), config, runners) == ('runner_' + '8' * 32,)

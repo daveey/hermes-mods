@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 OPERATION_ID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
@@ -29,6 +30,26 @@ def store_path():
 
 def _refuse(reason):
     return dict(verified=False, reason=reason, authorized_operations=[])
+
+
+MAX_AGE_SECONDS = 14 * 86400
+# Sections that restrict rather than grant: a name there is an EXCLUSION, never an authorization.
+RESTRICTING = re.compile(r'^\W*(?:limits?|exclusions?|consequences?)\b', re.I | re.M)
+DEAD_STATES = ('withdrawn', 'cancelled', 'superseded')
+
+
+def split_scope(markdown):
+    """(granting text, restricting text): text before the first Limits/Exclusions/Consequences heading, and the rest."""
+    m = RESTRICTING.search(markdown)
+    return (markdown[:m.start()], markdown[m.start():]) if m else (markdown, '')
+
+
+def subject_names(repair, config, runners):
+    """Names that identify this repair's subject: runner id, bound service ref, inventory display name."""
+    entity = repair.get('entity_id')
+    binding = next((b for b in config.get('bindings', []) if b.get('runner_id') == entity), {})
+    runner = next((r for r in runners if r.get('id') == entity), {})
+    return tuple(n for n in (entity, binding.get('service_ref'), runner.get('display_name')) if isinstance(n, str) and n)
 
 
 def _names_subject(markdown, names):
@@ -57,15 +78,34 @@ def verify_receipt(operation_id, *, store_path, owner_profile, subject_names):
             return _refuse('unknown_operation')
         if intent.get('effect') != 'approve' or intent.get('executionAuthorized') is not True:
             return _refuse('not_an_authorizing_approval')
-        scope = intent['request']['scope']
+        request = intent['request']
+        scope = request['scope']
         markdown = scope['markdown']
         if scope.get('complete') is not True or not isinstance(markdown, str):
             return _refuse('scope_incomplete')
+        c = sqlite3.connect('file:%s?mode=ro' % Path(store_path), uri=True, timeout=5)
+        try:
+            live = c.execute('SELECT state, revision FROM requests WHERE namespace=? AND id=?',
+                             (row[0], body['requestId'])).fetchone()
+        finally:
+            c.close()
+        if live is None or live[0] in DEAD_STATES or live[1] != body['revision']:
+            return _refuse('request_withdrawn_or_superseded')
+        recorded = body.get('recordedAt')
+        from datetime import datetime
+        age = time.time() - datetime.fromisoformat(recorded).timestamp()
+        if age > MAX_AGE_SECONDS or age < -300:
+            return _refuse('receipt_expired')
+        approve = (request.get('outcomes') or {}).get('approve')
+        grants, restricts = split_scope(markdown)
+        grants = grants + '\n' + (approve if isinstance(approve, str) else '')
     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
         return _refuse('receipt_store_unavailable')
-    if not _names_subject(markdown, subject_names):
+    if _names_subject(restricts, subject_names):
+        return _refuse('subject_excluded_by_scope')
+    if not _names_subject(grants, subject_names):
         return _refuse('scope_does_not_name_subject')
-    ops = ['diagnose'] + (['service_start'] if START_WORDING.search(markdown) else [])
+    ops = ['diagnose'] + (['service_start'] if START_WORDING.search(grants) else [])
     return dict(verified=True, reason='verified', authorized_operations=ops, operation_id=operation_id,
                 request_id=body.get('requestId'), request_revision=body.get('revision'),
                 effect='approve', execution_authorized=True,

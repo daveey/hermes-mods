@@ -188,9 +188,7 @@ def _register_receipt(ctx):
                 raise PermissionError('owner_profile_mismatch')
             principal = tool_principal(context.get('session_id'), backend.config['owner_profile'])
             repair = api.repair_domain(backend).get((args or {}).get('repair_id'), principal=principal)
-            runner = next((r for r in backend.inventory()['data']['runners'] if r.get('id') == repair.get('entity_id')), {})
-            binding = next((b for b in backend.config.get('bindings', []) if b.get('runner_id') == repair.get('entity_id')), {})
-            names = (repair.get('entity_id'), binding.get('service_ref'), runner.get('display_name'))
+            names = receipts.subject_names(repair, backend.config, backend.inventory()['data']['runners'])
             result = receipts.receipt_tool(args, repair=repair, subject_names=names,
                                            owner_profile=backend.config['owner_profile'], store_path=receipts.store_path())
             return json.dumps(result)
