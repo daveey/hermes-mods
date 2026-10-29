@@ -216,3 +216,8 @@ def test_claude_hook_blocks_script(tmp_path):
         {"tool_name": "Bash", "tool_input": {"command": "./ci.sh > ci.log 2>&1"}}),
         capture_output=True, text=True, env=env, cwd=tmp_path)
     assert r.returncode == 2 and "ci.sh" in r.stderr and "whole pytest suite" in r.stderr
+
+
+def test_newline_separates_commands():
+    assert blocked("terminal", command="echo start\npython3 -m pytest -q\n")
+    assert blocked("terminal", command="echo start\nnpm ci\necho done\n")

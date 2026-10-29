@@ -38,7 +38,7 @@ def enabled() -> bool:
 
 
 def _tokens(text: str) -> Optional[list[str]]:
-    lex = shlex.shlex(text.replace("\\\n", " "), posix=True, punctuation_chars=";&|()")
+    lex = shlex.shlex(text.replace("\\\n", " "), posix=True, punctuation_chars=";&|()\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     lex.commenters = "#"
@@ -55,7 +55,7 @@ def commands(text: str) -> Iterator[tuple[list[str], set[str]]]:
         return
     cur: list[str] = []
     for t in toks + [";"]:
-        if t in SEPARATORS or (t and set(t) <= set(";&|()")):
+        if t in SEPARATORS or (t and set(t) <= set(";&|()\n")):
             if cur:
                 yield from _unwrap(cur)
             cur = []
