@@ -22,7 +22,7 @@ Never wait on a worker inside a turn and never predict its result.
 
 ## What to read on each sweep
 
-1. **Sessions:** `hermes sessions list --limit 60` (add `--workspace <repo>` to narrow). For
+1. **Sessions:** `hermes sessions outcome-audit --json` first (see Classify), then `hermes sessions list --limit 60` (add `--workspace <repo>` to narrow). For
    detail, query `~/.hermes/state.db` **read-only** (`sqlite3 -readonly`): `sessions` has `title`,
    `source`, `parent_session_id`, `last_activity_at`, `last_activity_description`, `ended_at`,
    `end_reason`, `archived`, `pinned`, `hidden`. Use `session_search` to read what a session last
@@ -33,6 +33,13 @@ Never wait on a worker inside a turn and never predict its result.
 3. **Inbox:** `hermes inbox list` (open proposals waiting on the user).
 
 ## Classify every live item
+
+**Outcome first.** Read each chat's stored outcome before anything else:
+`hermes sessions outcome-audit --json` (every sidebar row as `{id, title, kind, reason, age_h, on, items}`), or
+`hermes sessions outcome <id> --json` for one. Map it directly: `decision` → blocked on the user (its `items`
+are the asks), `waiting`/`running` → moving (its `on` names what), `done` → done (`summary`), `muted` → leave
+alone, `unresolved` → stalled, with `reason`. Don't re-derive a chat that has an outcome. The rules below are the
+fallback for cores without these commands, rows with no outcome, and cards and Inbox items.
 
 - **Blocked on the user:** a blocked card whose blocker is the user, an open Inbox item, or a
   session whose last assistant message asks the user something (a question, an approval, a click,
