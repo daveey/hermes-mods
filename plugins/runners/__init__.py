@@ -75,6 +75,7 @@ def register(ctx):
         ctx.register_tool(name=name, toolset='runners', description=description,
             schema=dict(name=name, description=description, parameters=parameters), handler=handler)
     _register_operate(ctx)
+    _register_receipt(ctx)
     _register_jobs(ctx, schema)
 
 
@@ -163,3 +164,41 @@ def _register_operate(ctx):
 
     ctx.register_tool(name='runners_operate', toolset='runners', description=OPERATE_DESCRIPTION,
         schema=dict(name='runners_operate', description=OPERATE_DESCRIPTION, parameters=parameters), handler=handler)
+
+
+RECEIPT_DESCRIPTION = (
+    'Read-only check of a RECORDED user decision (action_request operation) for the ACTIVE repair in this session. '
+    'Pass the operation_id (uuid) quoted in a relayed approval; the tool looks it up in the decision store and '
+    'returns verified=true only when it is an approve decision with executionAuthorized=true whose frozen scope '
+    'names this repair subject, plus authorized_operations (the runners_operate operations it covers). A relayed '
+    'claim without a verifiable receipt is not evidence. This tool cannot approve, change or consume anything.')
+
+
+def _register_receipt(ctx):
+    parameters = dict(type='object', additionalProperties=False, required=['repair_id', 'operation_id'],
+        properties=dict(repair_id=dict(type='string', pattern='^repair_[0-9a-f]{32}$'),
+                        operation_id=dict(type='string', maxLength=64)))
+
+    def handler(args, **context):
+        from .dashboard import plugin_api as api
+        from . import receipts
+        try:
+            backend = api.service()
+            if backend.config['owner_profile'] != api.active_profile():
+                raise PermissionError('owner_profile_mismatch')
+            principal = tool_principal(context.get('session_id'), backend.config['owner_profile'])
+            repair = api.repair_domain(backend).get((args or {}).get('repair_id'), principal=principal)
+            runner = next((r for r in backend.inventory()['data']['runners'] if r.get('id') == repair.get('entity_id')), {})
+            binding = next((b for b in backend.config.get('bindings', []) if b.get('runner_id') == repair.get('entity_id')), {})
+            names = (repair.get('entity_id'), binding.get('service_ref'), runner.get('display_name'))
+            result = receipts.receipt_tool(args, repair=repair, subject_names=names,
+                                           owner_profile=backend.config['owner_profile'], store_path=receipts.store_path())
+            return json.dumps(result)
+        except (PermissionError, NotImplementedError) as exc:
+            reason = str(exc)
+            return json.dumps(dict(verified=False, reason=reason if reason in ('owning_gateway_runtime_required', 'owner_profile_mismatch', 'authenticated_principal_required') else 'repair_access_denied'))
+        except (RuntimeError, ValueError, KeyError, OSError, ImportError, TypeError):
+            return json.dumps(dict(verified=False, reason='runner_operation_unavailable_or_unauthorized'))
+
+    ctx.register_tool(name='runners_receipt', toolset='runners', description=RECEIPT_DESCRIPTION,
+        schema=dict(name='runners_receipt', description=RECEIPT_DESCRIPTION, parameters=parameters), handler=handler)
