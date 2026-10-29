@@ -39,6 +39,8 @@ snapshot is temporary data, not an untracked live-checkout modification.
 - The live core's `git status --short tests/` is empty before and after the full
   run, and the temporary snapshot is removed.
 
-`--without-plugin` forwards the two routing/fallback test files without enabling
-the plugin. Its argument forwarding is unit-tested; its behavioral suite is not
-part of the enabled-plugin acceptance run above.
+`--without-plugin` is a negative control: it forwards the two routing/fallback
+test files without enabling the plugin. Against the tested core it reports
+27 passed and one expected failure, `test_long_reset_falls_back_when_rotation_cannot_recover`:
+core retries the primary once before fallback, while the plugin-enabled test
+requires immediate fallback. Both runs clean up their snapshots.
