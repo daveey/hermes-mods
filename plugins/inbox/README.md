@@ -22,12 +22,26 @@ The Inbox is for **decisions only David can make**: spend, an irreversible actio
 agent can fix (red CI, a broken job, a stuck card) goes to a **Kanban card** (assignee `default`), not here, and a
 card never duplicates a Kanban card that is already doing the work. Routine status goes nowhere.
 
-**Noise breaker** (`store.py`, `MUTE_AFTER` = 3, `MUTE_WINDOW_S` = 7 days): when a poster's last 3 closed cards in
-the window were all archived with no action (Archive, sidebar archive, or the open-cap auto-archive; an accepted or
-resolved card resets the streak), a new card from that poster is refused with `PosterMuted` (a `ValueError`: CLI
-exit 1, tool `posted: false`, REST 400) and one Kanban card `inbox-muted:<poster>` is filed to fix that poster.
-Updates to an already-open card with the same key still go through. After fixing the poster:
-`hermes inbox unmute '<poster>'`.
+**Ask contract (every door).** `post()` is the one gate for the tool, `hermes inbox post`, REST and any replica
+apply. A post must name a registered `poster` (`posters.yaml`; local extras in `<home>/inbox/posters.yaml`; the
+family is the text before `·`, so `kanban · <title>` is `kanban`) and carry `ask={interaction, why_human, action}`
+(`approval|credential|publish_as_david|physical|preference`), except cards whose type has `resolve` actions. Test
+or status wording (`TEST`, `scratch`, `CTESTLIVE`, `9999-..` dates, `failed`/`expired`/`X DM sent`), an
+unregistered or type-forbidden poster, a missing ask, and any write to the real inbox under pytest/`HERMES_TEST`
+are refused. A refusal is never silent: it becomes a Kanban card (`inbox-refused:<family>:<key>`; repeats are
+comments) and the poster gets `AgentOwnedPost`. `tests/test_poster_conformance.py` scans hermes-mods, daveey/hermes
+and hermes-hub call sites (`HERMES_POSTER_ROOTS` overrides) and fails on a literal poster that is not registered.
+
+**Noise breaker v2** (`store.py`, `MUTE_AFTER` = 2, `MUTE_WINDOW_S` = 7 days, keyed by poster *family*, poster-less
+posts counted): when a family's last 2 closed cards in the window were archived with no action, a new card is
+refused with `PosterMuted` and one Kanban card `inbox-muted:<family>` is filed. Updates to an already-open card
+with the same key still go through. After fixing the producer: `hermes inbox unmute '<family>' --fix-commit <sha>`
+(a commit SHA or GitHub commit URL is required and recorded).
+
+**Junk** (`hermes inbox junk <session_id>`, `POST /items/{id}/junk`, the trash button on a Desktop row): archives the
+card, mutes its family + key prefix, and files a five-whys Kanban card (`inbox-junk:<family>:<prefix>`) with the
+card's snapshot. The daily `inbox-junk-audit` cron (`junk_audit.py`) opens one Kanban card per poster family that
+still shows junk.
 
 **Junk guards** (bb-ce4c46ed94; each earlier fix blocked one sender by name and the next one got through):
 - *Archive sticks:* when the newest card with a key was archived with no action, a re-post of that key is refused
