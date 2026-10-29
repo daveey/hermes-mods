@@ -37,6 +37,9 @@ _spec.loader.exec_module(base)
 STATE = Path.home() / ".hermes" / "cache" / "worktree-owner" / "agent-hook"
 SLACK_S = 5.0
 FALLBACK_WINDOW_S = 600.0  # no PreToolUse stamp (hook added mid-session): look back this far
+# Helpers that run `git worktree add` inside a script, so the agent's command text never says it. Unregistered, their
+# trees were claimable by any concurrent card command (2026-10-29: `hermes-core-wt new session-outcome-desktop`).
+WT_HELPERS = re.compile(r"\bhermes-core-wt\s+new\b")
 STOP_EVERY_S = 300.0
 END_DELAY_S = 3.0  # let the agent process exit before checking live cwds
 
@@ -69,7 +72,7 @@ def _stamp_path(sid: str, tuid: str) -> Path:
 
 def register(payload: dict, agent: str, env) -> list[dict]:
     cmd = _command(payload)
-    if not base._mentions_worktree_add(cmd):
+    if not (base._mentions_worktree_add(cmd) or WT_HELPERS.search(cmd)):
         return []
     sid = str(payload.get("session_id") or "")
     stamp = _stamp_path(sid, str(payload.get("tool_use_id") or ""))

@@ -63,7 +63,7 @@ Log: `~/.hermes/logs/worktree-owner.log` (`REGISTER`, `REMOVED`, `KEEP`, `SKIP` 
 
 The same rule for worktrees made by Claude Code or Codex sessions (and their subagents), as command hooks:
 
-- `PreToolUse` / `PostToolUse` on Bash: a command that mentions `worktree add` gets the same `hermes-owner.json`
+- `PreToolUse` / `PostToolUse` on Bash: a command that mentions `worktree add` (or runs a helper that does, `hermes-core-wt new`) gets the same `hermes-owner.json`
   marker, with `agent` (`claude` / `codex`), `agent_session_id`, `cwd` and, inside a Kanban card,
   `task_id` (so the card's `kanban_complete` teardown also applies). The pre-hook stamps the call's start time, so
   only gitdirs born during the call are claimed, with the same attribution guard. A `HERMES_KANBAN_TASK` paired
@@ -106,7 +106,7 @@ New sessions and Kanban workers load it. Sessions that are already open keep run
 python3 -B -m unittest discover -s plugins/worktree-owner/tests
 ```
 
-Stdlib unit suite: 74 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
+Stdlib unit suite: 75 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
 
 Bootstrapped runtime integration (requires a core checkout with scratch preservation, and on Linux an existing noninteractive readlink grant for non-dumpable processes):
 

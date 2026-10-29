@@ -131,6 +131,15 @@ class AgentHook(unittest.TestCase):
         self.post(f"git worktree add -b other {self.code}/proj-zzz origin/main")
         self.assertIsNone(self.marker(p))
 
+    def test_hermes_core_wt_new_registers_the_tree_it_makes(self):
+        # its script runs `git worktree add`; the command the agent ran only says `hermes-core-wt new <slug>`
+        p = self.code / "session-outcome-desktop"
+        cmd = "~/.hermes/bin/hermes-core-wt new session-outcome-desktop"
+        self.post(cmd, tool_use_id="tu-cwt", event="PreToolUse")
+        git(self.repo, "worktree", "add", "-q", "-b", "wt/session-outcome-desktop", str(p), "origin/main")
+        self.post(cmd, tool_use_id="tu-cwt")
+        self.assertEqual(self.marker(p)["agent_session_id"], "sess-1")
+
     def test_pre_tool_use_stamp_bounds_the_birth_window(self):
         p = self.code / "proj-old"
         git(self.repo, "worktree", "add", "-q", "-b", "bold", str(p), "origin/main")
