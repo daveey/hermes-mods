@@ -1,0 +1,485 @@
+From 15ef9412b516a3dd814b812e64e307966a064f25 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:48:34 +0000
+Subject: [PATCH] fix(cron): a slow state.db write no longer crashes cron
+ finalization [daveey]
+
+The fallback-title lookup (get_next_title_in_lineage) ran through the bounded
+SessionDB proxy without its own try. After the first title write timed out
+(another process held the WAL write lock), the proxy failed fast and that
+RuntimeError escaped _finalize_cron_session: run_job crashed after the turn
+finished, the row stayed untitled and unended, and agent teardown was skipped
+(hermes-hub x-reply-discovery, 2026-10-28).
+
+- _finalize_cron_session never raises; title fallbacks are built guarded.
+- run_job's finally guards the call so teardown / hand-off always runs.
+- On a proxy timeout, log one WARNING naming job + session and retry title +
+  end_session once on a fresh SessionDB connection in a daemon thread
+  (cron.finalize_retry_delay_seconds, default 30s; same cleanup bound).
+- tests/cron/test_cron_finalize_slow_write.py (4 tests, red before).
+---
+ cron/scheduler.py                           | 221 +++++++++++++++-----
+ tests/cron/test_cron_finalize_slow_write.py | 189 +++++++++++++++++
+ 2 files changed, 363 insertions(+), 47 deletions(-)
+ create mode 100644 tests/cron/test_cron_finalize_slow_write.py
+
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 7c069f05b6..723998727e 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2140,9 +2140,149 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
+     return final_response
+ 
+ 
++def _cron_finalize_retry_delay_seconds() -> float:
++    """Seconds the background finalize retry waits for a state.db write-lock holder to let go."""
++    default = 30.0
++    try:
++        from hermes_cli.config import load_config
++
++        cfg = load_config() or {}
++        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
++        configured = cron_cfg.get("finalize_retry_delay_seconds")
++        if configured is not None and float(configured) >= 0:
++            return float(configured)
++    except Exception as exc:
++        logger.debug("Failed to load cron finalize retry delay from config: %s", exc)
++    return default
++
++
++def _open_fresh_cron_session_db(session_db):
++    """A NEW SessionDB connection on the same file as *session_db* (None for fakes without a path)."""
++    path = getattr(session_db, "db_path", None)
++    if not isinstance(path, (str, os.PathLike)):
++        return None
++    from hermes_state import SessionDB
++
++    return SessionDB(db_path=Path(path))
++
++
++def _next_lineage_title(session_db, job_id: str) -> str:
++    """Next free ``cron <id>`` lineage title; never raises (a disabled/broken DB yields the bare base)."""
++    base = f"cron {job_id}"
++    try:
++        next_fn = getattr(session_db, "get_next_title_in_lineage", None)
++        title = next_fn(base) if next_fn is not None else base
++        return title if isinstance(title, str) and title.strip() else base
++    except (Exception, KeyboardInterrupt) as e:
++        logger.debug("Job '%s': lineage title lookup failed: %s", job_id, e)
++        return base
++
++
++def _classify_cron_end_reason(session_db, session_id: str, job_id: str) -> str:
++    # Book cron_complete only when the last row is a real assistant reply ([SILENT] counts). Only a
++    # POSITIVELY recognized bad status downgrades (keep tuple in sync with
++    # session_lifecycle_statuses); unknown values / probe failures fail OPEN.
++    # Verified completion booking (#93820): the run may only be recorded as cron_complete when the session's
++    # LAST message row is a real assistant reply — a plain answer or the [SILENT] sentinel (both are
++    # assistant-text rows, so both classify as 'complete'). A turn that died after a tool call,
++    # mid-API-wait, or without any assistant text leaves the last row as a tool result / pending call / user
++    # prompt and must not surface as a healthy run. session_lifecycle_statuses is the existing cost-bounded
++    # classifier for exactly this shape. Only a POSITIVELY recognized pathological status (see the status
++    # vocabulary in hermes_state's session_lifecycle_statuses docstring — keep the tuple below in sync when
++    # it grows) downgrades the booking: an unknown value (newer classifier shape, test doubles) keeps the
++    # historical reason, and so does a failed probe — the booking itself is FAIL-OPEN on probe errors,
++    # because classification is best-effort metadata and must not mislabel a healthy run.
++    end_reason = "cron_complete"
++    try:
++        _statuses = session_db.session_lifecycle_statuses([session_id])
++        _lifecycle = _statuses.get(session_id)
++        if _lifecycle in ("interrupted", "error", "empty"):
++            end_reason = "cron_incomplete_no_output"
++            logger.warning(
++                "Job '%s': session ended without a final assistant "
++                "message (lifecycle=%s) — booking run as %s",
++                job_id, _lifecycle, end_reason)
++    except (Exception, KeyboardInterrupt) as e:
++        logger.debug("Job '%s': session lifecycle classification failed: %s", job_id, e)
++    return end_reason
++
++
++def _write_cron_title(session_db, session_id: str, job_id: str, titles: list) -> bool:
++    """Persist the first title in *titles* that sticks, then the lineage/id fallbacks; never raises."""
++    candidates = list(titles)
++    for idx, title in enumerate(candidates):
++        try:
++            if _set_cron_session_title(session_db, session_id, title):
++                return True
++        except (Exception, KeyboardInterrupt) as e:
++            logger.debug("Job '%s': failed to set cron session title %r: %s", job_id, title, e)
++            if idx == 0:
++                # Never leave the session untitled: the next free title in the lineage, then a bare
++                # id-stamped title (#50535). Built here, guarded, because on a disabled proxy the lineage
++                # lookup itself raises (a slow state.db write must not crash the job).
++                candidates[idx + 1:idx + 1] = [_next_lineage_title(session_db, job_id),
++                                               f"cron {job_id} {session_id[-6:]}"]
++    return False
++
++
++def _queue_cron_finalize_retry(session_db, job_id: str, session_id: str, titles: list,
++                               need_title: bool, need_end: bool, workdir: Optional[str]) -> None:
++    """Finish a timed-out finalization later on a fresh connection, off the dispatch path.
++
++    The first pass gave up because a state.db write outlived the cleanup bound (another process held the
++    WAL write lock). Leaving the row untitled and never ended hides the run, so one daemon thread waits
++    for the holder to let go, then retries title + end_session on its own SessionDB, under the same bound.
++    """
++    def _retry_body() -> None:
++        fresh = _open_fresh_cron_session_db(session_db)
++        if fresh is None:
++            logger.warning("Job '%s': session %s finalize retry skipped: no fresh state.db connection",
++                           job_id, session_id)
++            return
++        try:
++            titled = not need_title or _write_cron_title(fresh, session_id, job_id, titles)
++            ended = not need_end
++            if need_end:
++                if workdir:
++                    with contextlib.suppress(Exception):
++                        fresh.update_session_cwd(session_id, workdir)
++                fresh.end_session(session_id, _classify_cron_end_reason(fresh, session_id, job_id))
++                ended = True
++            if titled and ended:
++                logger.info("Job '%s': session %s finalized on retry", job_id, session_id)
++            else:
++                logger.warning("Job '%s': session %s finalize retry left it titled=%s ended=%s",
++                               job_id, session_id, titled, ended)
++        except (Exception, KeyboardInterrupt) as e:
++            logger.warning("Job '%s': session %s finalize retry failed: %s", job_id, session_id,
++                           " ".join(str(e).split()))
++        finally:
++            with contextlib.suppress(Exception):
++                fresh.close()
++
++    def _runner() -> None:
++        time.sleep(max(0.0, _cron_finalize_retry_delay_seconds()))
++        if not _run_cron_cleanup_with_timeout(
++                _retry_body, job_id=job_id, label=f"session finalization retry ({session_id})"):
++            logger.warning("Job '%s': session %s finalize retry did not complete; row may stay unended",
++                           job_id, session_id)
++
++    threading.Thread(target=ctx_bound(_runner), name=f"cron-finalize-retry-{job_id}", daemon=True).start()
++
++
+ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str,
+                            workdir: Optional[str] = None) -> None:
+-    """Title, classify, end and release the cron session after the agent turn has returned."""
++    """Title, classify, end and release the cron session after the agent turn has returned. Never raises:
++    the agent turn already finished, so a storage failure here must not turn the run into a crash."""
++    try:
++        _finalize_cron_session_steps(session_db, agent, job_id, job_name, cron_session_id, workdir)
++    except (Exception, KeyboardInterrupt) as e:
++        logger.warning("Job '%s': session %s finalization failed: %s", job_id, cron_session_id,
++                       " ".join(f"{type(e).__name__}: {e}".split()))
++
++
++def _finalize_cron_session_steps(session_db, agent, job_id: str, job_name: str, cron_session_id: str,
++                                 workdir: Optional[str]) -> None:
+     # Bound every DB op so storage failure cannot hold the dispatch guard.
+     _session_db = _BoundedCronSessionDB(session_db, job_id)
+     # Compression may have rotated the run onto a continuation: finalize that, not the stale cron
+@@ -2167,50 +2307,14 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
+         logger.debug("Job '%s': failed to resolve cron compression tip: %s", job_id, e)
+     # Title must persist BEFORE end_session()/close(). Run-time suffix keeps it unique against the
+     # sessions.title index; the fallbacks below guarantee a non-blank title.
+-    try:
+-        # Title the cron session from the job (name -> id) and PERSIST it BEFORE end_session()/close() tear
+-        # the connection down, so the close can never run over an in-flight title write (#50536).
+-        _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+-        _cron_title = f"{_title_base} · {safe_strftime(_hermes_now(), '%b %d %H:%M')}"
+-        if not _set_cron_session_title(_session_db, _final_cron_session_id, _cron_title):
+-            _set_cron_session_title(_session_db, _final_cron_session_id, f"cron {job_id}")
+-    except (Exception, KeyboardInterrupt) as e:
+-        logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
+-        # Never leave the session untitled.
+-        # Try the next free title in the lineage, then a bare id-stamped title. See #50535.
+-        for _fallback in (
+-            getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(f"cron {job_id}"),
+-            f"cron {job_id} {_final_cron_session_id[-6:]}"):
+-            try:
+-                if _set_cron_session_title(_session_db, _final_cron_session_id, _fallback):
+-                    break
+-            except (Exception, KeyboardInterrupt):
+-                continue
+-    # Book cron_complete only when the last row is a real assistant reply ([SILENT] counts). Only a
+-    # POSITIVELY recognized bad status downgrades (keep tuple in sync with
+-    # session_lifecycle_statuses); unknown values / probe failures fail OPEN.
+-    # Verified completion booking (#93820): the run may only be recorded as cron_complete when the session's
+-    # LAST message row is a real assistant reply — a plain answer or the [SILENT] sentinel (both are
+-    # assistant-text rows, so both classify as 'complete'). A turn that died after a tool call,
+-    # mid-API-wait, or without any assistant text leaves the last row as a tool result / pending call / user
+-    # prompt and must not surface as a healthy run. session_lifecycle_statuses is the existing cost-bounded
+-    # classifier for exactly this shape. Only a POSITIVELY recognized pathological status (see the status
+-    # vocabulary in hermes_state's session_lifecycle_statuses docstring — keep the tuple below in sync when
+-    # it grows) downgrades the booking: an unknown value (newer classifier shape, test doubles) keeps the
+-    # historical reason, and so does a failed probe — the booking itself is FAIL-OPEN on probe errors,
+-    # because classification is best-effort metadata and must not mislabel a healthy run.
+-    _end_reason = "cron_complete"
+-    try:
+-        _statuses = _session_db.session_lifecycle_statuses([_final_cron_session_id])
+-        _lifecycle = _statuses.get(_final_cron_session_id)
+-        if _lifecycle in ("interrupted", "error", "empty"):
+-            _end_reason = "cron_incomplete_no_output"
+-            logger.warning(
+-                "Job '%s': session ended without a final assistant "
+-                "message (lifecycle=%s) — booking run as %s",
+-                job_id, _lifecycle, _end_reason)
+-    except (Exception, KeyboardInterrupt) as e:
+-        logger.debug("Job '%s': session lifecycle classification failed: %s", job_id, e)
++    # Title the cron session from the job (name -> id) and PERSIST it BEFORE end_session()/close() tear
++    # the connection down, so the close can never run over an in-flight title write (#50536).
++    # _write_cron_title never raises and falls back to lineage / id-stamped titles (#50535).
++    _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
++    _cron_titles = [f"{_title_base} · {safe_strftime(_hermes_now(), '%b %d %H:%M')}", f"cron {job_id}"]
++    _titled = _write_cron_title(_session_db, _final_cron_session_id, job_id, _cron_titles)
++    _end_reason = _classify_cron_end_reason(_session_db, _final_cron_session_id, job_id)
++    _ended = False
+     # Stamp the job's workdir on the row BEFORE end_session (title-write ordering, #50536): the
+     # sidebar groups by cwd prefix and nothing else writes a cron row's cwd (#108205).
+     if workdir:
+@@ -2220,6 +2324,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
+             logger.debug("Job '%s': failed to stamp workdir on session row: %s", job_id, e, exc_info=True)
+     try:
+         _session_db.end_session(_final_cron_session_id, _end_reason)
++        _ended = True
+         # The scheduler owns cron-session finalization. AIAgent.close() also
+         # finalizes owned session rows by default; once the shared SessionDB is
+         # released below, that second end_session() would reopen the just-closed
+@@ -2230,6 +2335,22 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
+             agent._end_session_on_close = False
+     except (Exception, KeyboardInterrupt) as e:
+         logger.debug("Job '%s': failed to end session: %s", job_id, e)
++    if not (_titled and _ended):
++        if _session_db._disabled:
++            # A state.db write outlived the cleanup bound (another process holds the WAL write lock).
++            # One line, naming job + session, so the errors detector sees it; the retry owns the row now.
++            logger.warning(
++                "Job '%s': session %s finalization timed out (state.db busy; titled=%s ended=%s); "
++                "retrying on a fresh connection", job_id, _final_cron_session_id, _titled, _ended)
++            if agent is not None and not _ended:
++                # The retry books end_session; agent.close() must not re-end it on the busy/released DB.
++                with contextlib.suppress(Exception):
++                    agent._end_session_on_close = False
++            _queue_cron_finalize_retry(session_db, job_id, _final_cron_session_id, _cron_titles,
++                                       need_title=not _titled, need_end=not _ended, workdir=workdir)
++        else:
++            logger.warning("Job '%s': session %s finalization incomplete (titled=%s ended=%s)",
++                           job_id, _final_cron_session_id, _titled, _ended)
+     try:
+         from hermes_state_registry import release_or_close
+         release_or_close(_session_db)
+@@ -2672,8 +2793,14 @@ def run_job(
+             workdir=scope.workdir)
+         scope.exit()
+         if _session_db and not _worker_teardown_deferred:
+-            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
+-                                   workdir=scope.workdir)
++            # Never let finalization skip the teardown / hand-off below (it already never raises; this
++            # keeps that true against future edits).
++            try:
++                _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
++                                       workdir=scope.workdir)
++            except (Exception, KeyboardInterrupt) as e:
++                logger.warning("Job '%s': session %s finalization raised: %s", job_id, _cron_session_id,
++                               " ".join(f"{type(e).__name__}: {e}".split()))
+         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
+         # teardown, hand the live agent back: delivery needs a live async client.
+         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held
+diff --git a/tests/cron/test_cron_finalize_slow_write.py b/tests/cron/test_cron_finalize_slow_write.py
+new file mode 100644
+index 0000000000..2425f9a5f6
+--- /dev/null
++++ b/tests/cron/test_cron_finalize_slow_write.py
+@@ -0,0 +1,189 @@
++"""Cron session finalization survives a state.db write that outlives the cleanup timeout.
++
++Production failure (hermes-hub, x-reply-discovery): another process held the state.db WAL write lock for
++50+ s, the first title write timed out, the bounded proxy disabled itself, and the fallback-title
++expression (``get_next_title_in_lineage`` through the disabled proxy) raised out of
++``_finalize_cron_session``. run_job then crashed with "session finalization disabled after prior cleanup
++failure": no end_session, no agent teardown, an untitled session row left open.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++from unittest.mock import MagicMock, patch
++
++import cron.scheduler as sched
++from cron.scheduler import _finalize_cron_session, run_job
++
++
++_RUNTIME = {
++    "api_key": "test-key",
++    "base_url": "https://example.invalid/v1",
++    "provider": "openrouter",
++    "api_mode": "chat_completions",
++}
++
++
++class SlowTitleSessionDB:
++    """A real-shaped SessionDB whose title write blocks past the cleanup timeout (lock held elsewhere)."""
++
++    def __init__(self, release: threading.Event):
++        self.release = release
++        self.title_entered = threading.Event()
++        self.titles: list[tuple[str, str]] = []
++        self.ended: list[tuple[str, str]] = []
++
++    def get_compression_tip(self, _session_id):
++        return None
++
++    def set_session_title(self, session_id, title):
++        self.title_entered.set()
++        self.release.wait()
++        self.titles.append((session_id, title))
++        return True
++
++    def get_next_title_in_lineage(self, base):
++        return f"{base} #2"
++
++    def session_lifecycle_statuses(self, ids):
++        return {i: "complete" for i in ids}
++
++    def update_session_cwd(self, *_args):
++        return None
++
++    def end_session(self, session_id, reason):
++        self.ended.append((session_id, reason))
++
++    def close(self):
++        return None
++
++
++class RecordingSessionDB:
++    """The fresh connection the retry opens once the lock holder is gone."""
++
++    def __init__(self):
++        self.titles: list[tuple[str, str]] = []
++        self.ended: list[tuple[str, str]] = []
++        self.closed = threading.Event()
++
++    def get_compression_tip(self, _session_id):
++        return None
++
++    def set_session_title(self, session_id, title):
++        self.titles.append((session_id, title))
++        return True
++
++    def get_next_title_in_lineage(self, base):
++        return f"{base} #2"
++
++    def session_lifecycle_statuses(self, ids):
++        return {i: "complete" for i in ids}
++
++    def update_session_cwd(self, *_args):
++        return None
++
++    def end_session(self, session_id, reason):
++        self.ended.append((session_id, reason))
++
++    def close(self):
++        self.closed.set()
++
++
++def test_finalize_survives_title_write_timeout_and_retries_on_fresh_connection():
++    release = threading.Event()
++    slow_db = SlowTitleSessionDB(release)
++    fresh_db = RecordingSessionDB()
++    agent = MagicMock()
++    try:
++        with patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.2), \
++             patch("cron.scheduler._cron_finalize_retry_delay_seconds", return_value=0.0, create=True), \
++             patch("cron.scheduler._open_fresh_cron_session_db", return_value=fresh_db, create=True):
++            started = time.monotonic()
++            # Must return normally: the disabled proxy's fail-fast error may not escape.
++            _finalize_cron_session(slow_db, agent, "job-slow", "slow job", "cron_job-slow_1")
++            assert time.monotonic() - started < 5.0
++            assert slow_db.title_entered.is_set()
++            assert fresh_db.closed.wait(timeout=5.0), "retry on a fresh connection never ran"
++        assert fresh_db.titles and fresh_db.titles[0][0] == "cron_job-slow_1"
++        assert fresh_db.titles[0][1].strip()
++        assert fresh_db.ended == [("cron_job-slow_1", "cron_complete")]
++        # The retry owns row finalization now; agent.close() must not re-end it on the busy DB.
++        assert agent._end_session_on_close is False
++    finally:
++        release.set()
++
++
++def test_run_job_survives_title_write_timeout_and_tears_agent_down(tmp_path):
++    release = threading.Event()
++    slow_db = SlowTitleSessionDB(release)
++    fresh_db = RecordingSessionDB()
++    job = {"id": "slow-title", "name": "slow title", "prompt": "hello"}
++    try:
++        with patch("cron.scheduler._hermes_home", tmp_path), \
++             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
++             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
++             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
++             patch("hermes_state_registry.acquire", return_value=slow_db), \
++             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
++             patch("run_agent.AIAgent") as mock_agent_cls, \
++             patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.2), \
++             patch("cron.scheduler._cron_finalize_retry_delay_seconds", return_value=0.0, create=True), \
++             patch("cron.scheduler._open_fresh_cron_session_db", return_value=fresh_db, create=True), \
++             patch("cron.scheduler._teardown_cron_agent") as teardown:
++            mock_agent = MagicMock()
++            mock_agent.run_conversation.return_value = {"final_response": "ok"}
++            mock_agent_cls.return_value = mock_agent
++
++            success, _output, final_response, error = run_job(job)
++
++            assert success is True
++            assert final_response == "ok"
++            assert error is None
++            teardown.assert_called_once()
++            assert teardown.call_args.args[0] is mock_agent
++            assert fresh_db.closed.wait(timeout=5.0)
++        assert fresh_db.ended and fresh_db.ended[0][1] == "cron_complete"
++    finally:
++        release.set()
++
++
++def test_run_job_hands_agent_off_when_finalize_raises(tmp_path):
++    """Even if finalization itself blows up, the deferred-teardown hand-off still happens."""
++    job = {"id": "finalize-raises", "name": "finalize raises", "prompt": "hello"}
++    deferred: list = []
++    with patch("cron.scheduler._hermes_home", tmp_path), \
++         patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
++         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
++         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
++         patch("hermes_state_registry.acquire", return_value=RecordingSessionDB()), \
++         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
++         patch("run_agent.AIAgent") as mock_agent_cls, \
++         patch("cron.scheduler._finalize_cron_session", side_effect=RuntimeError("boom")):
++        mock_agent = MagicMock()
++        mock_agent.run_conversation.return_value = {"final_response": "ok"}
++        mock_agent_cls.return_value = mock_agent
++
++        success, _output, final_response, error = run_job(job, defer_agent_teardown=deferred)
++
++    assert success is True and error is None and final_response == "ok"
++    assert deferred == [mock_agent]
++
++
++def test_finalize_disabled_proxy_logs_one_warning_naming_job_and_session(caplog):
++    release = threading.Event()
++    slow_db = SlowTitleSessionDB(release)
++    try:
++        with patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.2), \
++             patch("cron.scheduler._cron_finalize_retry_delay_seconds", return_value=0.0, create=True), \
++             patch("cron.scheduler._open_fresh_cron_session_db", return_value=None, create=True), \
++             caplog.at_level("WARNING", logger="cron.scheduler"):
++            _finalize_cron_session(slow_db, None, "job-warn", "warn job", "cron_job-warn_1")
++            time.sleep(0.3)
++        warnings = [r for r in caplog.records
++                    if r.levelname == "WARNING" and "job-warn" in r.getMessage()
++                    and "cron_job-warn_1" in r.getMessage()]
++        assert warnings, [r.getMessage() for r in caplog.records]
++        assert "\n" not in warnings[0].getMessage()
++    finally:
++        release.set()
+-- 
+2.55.0
+

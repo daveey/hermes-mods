@@ -1,0 +1,232 @@
+From 11975e798c6f82d9af8295df6ad0b237174a90d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:14:44 +0000
+Subject: [PATCH] fix(kanban): note_oom_kill reuses the reclaim connection
+ [daveey]
+
+Opening a second connection inside the dead-worker write txn deadlocks
+when that connect runs the legacy-inflight backfill: its BEGIN IMMEDIATE
+waits on the lock the caller already holds, for the busy timeout. Pass
+the reclaim connection through so the OOM counter and alert card stay
+on the open transaction.
+---
+ hermes_cli/kanban_db_dispatch.py              | 10 +--
+ hermes_cli/kanban_worker_scope.py             | 62 ++++++++++------
+ .../test_kanban_crash_outcome_consumers.py    | 72 +++++++++++++++++++
+ 3 files changed, 117 insertions(+), 27 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 5df71a6534..1bd19a69b1 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1305,7 +1305,7 @@ class _DeadWorker:
+ 
+ def _classify_dead_worker(
+     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+-    run_id: Optional[int] = None,
++    run_id: Optional[int] = None, conn: Optional[sqlite3.Connection] = None,
+ ) -> _DeadWorker:
+     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
+ 
+@@ -1317,8 +1317,10 @@ def _classify_dead_worker(
+     failure = _worker_scope.read_failure(task_id, run_id, log or "") if task_id else None
+     if failure:
+         kind = "oom_killed" if failure["scope_result"] == "oom-kill" else "signaled"
+-        if kind == "oom_killed":
+-            _worker_scope.note_oom_kill(task_id, board)
++        if kind == "oom_killed" and task_id:
++            # On the reclaim connection. A second connect here re-runs the
++            # legacy-inflight backfill and deadlocks on this write txn.
++            _worker_scope.note_oom_kill(task_id, board, conn=conn)
+         dead = _DeadWorker(kind, None, _worker_scope.describe(failure), kind,
+                            {"pid": pid, "claimer": claimer, **failure})
+     else:
+@@ -1437,7 +1439,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+ 
+             pid = int(row["worker_pid"])
+             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board,
+-                                         run_id=row["current_run_id"])
++                                         run_id=row["current_run_id"], conn=conn)
+             retry_status = _kb._retry_status_for_run(conn, row["id"])
+             dead.event_payload["retry_status"] = retry_status
+             cur = conn.execute(
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+index 61f3e14dc2..1718835e33 100644
+--- a/hermes_cli/kanban_worker_scope.py
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import sqlite3
+ from pathlib import Path
+ import subprocess
+ import sys
+@@ -221,39 +222,54 @@ def apply_toolchain_env(env: dict) -> None:
+         env["NODE_OPTIONS"] = (node_options + " " + _NODE_HEAP_FLAG).strip()
+ 
+ 
+-def note_oom_kill(task_id: str, board: str | None = None, *, now: int | None = None) -> str | None:
++def note_oom_kill(
++    task_id: str, board: str | None = None, *, now: int | None = None,
++    conn: sqlite3.Connection | None = None,
++) -> str | None:
+     """Count OOM kills in 24h; above the threshold open one card per incident.
+ 
+     Later kills in the same incident (an open alert card exists) become comments.
+     Returns the alert task id, or None. Never raises.
++
++    Pass ``conn`` when the caller already holds a write transaction on this
++    board. A fresh ``connect()`` from inside that transaction deadlocks: init
++    re-runs the legacy-inflight backfill, and its ``BEGIN IMMEDIATE`` waits on
++    the lock the caller holds for the busy timeout. The alert card's
++    ``create_task`` / ``add_comment`` nest as a savepoint on ``conn``.
+     """
+     import time
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+     now = int(now if now is not None else time.time())
++
++    def _note(db: sqlite3.Connection) -> str | None:
++        kills = db.execute(
++            "SELECT COUNT(*) FROM task_runs WHERE outcome = 'oom_killed' AND ended_at >= ?",
++            (now - OOM_ALERT_WINDOW_SECONDS,)).fetchone()[0] + 1  # + this run, not yet booked
++        if kills <= OOM_ALERT_THRESHOLD:
++            return None
++        key = "worker-oom-rate-alert"
++        open_card = db.execute(
++            "SELECT id FROM tasks WHERE idempotency_key = ? AND status NOT IN ('done', 'archived') "
++            "ORDER BY created_at DESC LIMIT 1", (key,)).fetchone()
++        if open_card:
++            kb.add_comment(db, open_card[0], "oom-detector",
++                           f"Another worker OOM kill ({task_id}); {kills} in the last 24h.")
++            return open_card[0]
++        return kb.create_task(
++            db, title=f"Worker OOM kills: {kills} in 24h",
++            body=(f"{kills} kanban worker scopes were OOM-killed in the last 24h "
++                  f"(threshold {OOM_ALERT_THRESHOLD}); latest: {task_id}. Retries get a doubled "
++                  "MemoryMax up to 12 GiB; check `journalctl --user | grep oom-kill` and the "
++                  "victims' last output for the heavy step."),
++            assignee="default", created_by="oom-detector", priority=70,
++            idempotency_key=key, board=board)
++
+     try:
+-        with kbc.connect_closing(board=board) as conn:
+-            kills = conn.execute(
+-                "SELECT COUNT(*) FROM task_runs WHERE outcome = 'oom_killed' AND ended_at >= ?",
+-                (now - OOM_ALERT_WINDOW_SECONDS,)).fetchone()[0] + 1  # + this run, not yet booked
+-            if kills <= OOM_ALERT_THRESHOLD:
+-                return None
+-            key = "worker-oom-rate-alert"
+-            open_card = conn.execute(
+-                "SELECT id FROM tasks WHERE idempotency_key = ? AND status NOT IN ('done', 'archived') "
+-                "ORDER BY created_at DESC LIMIT 1", (key,)).fetchone()
+-            if open_card:
+-                kb.add_comment(conn, open_card[0], "oom-detector",
+-                               f"Another worker OOM kill ({task_id}); {kills} in the last 24h.")
+-                return open_card[0]
+-            return kb.create_task(
+-                conn, title=f"Worker OOM kills: {kills} in 24h",
+-                body=(f"{kills} kanban worker scopes were OOM-killed in the last 24h "
+-                      f"(threshold {OOM_ALERT_THRESHOLD}); latest: {task_id}. Retries get a doubled "
+-                      "MemoryMax up to 12 GiB; check `journalctl --user | grep oom-kill` and the "
+-                      "victims' last output for the heavy step."),
+-                assignee="default", created_by="oom-detector", priority=70,
+-                idempotency_key=key, board=board)
++        if conn is not None:
++            return _note(conn)
++        with kbc.connect_closing(board=board) as owned:
++            return _note(owned)
+     except Exception:
+         import logging
+         logging.getLogger(__name__).warning("oom detector failed", exc_info=True)
+diff --git a/tests/hermes_cli/test_kanban_crash_outcome_consumers.py b/tests/hermes_cli/test_kanban_crash_outcome_consumers.py
+index e58ec31818..55d801d051 100644
+--- a/tests/hermes_cli/test_kanban_crash_outcome_consumers.py
++++ b/tests/hermes_cli/test_kanban_crash_outcome_consumers.py
+@@ -1,6 +1,9 @@
+ """Classified scope deaths retain crash recovery policy, not log-text diagnoses."""
++import contextlib
+ import json
++import sqlite3
+ import time
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -75,3 +78,72 @@ def test_killed_workers_retain_crash_diagnostics(outcome):
+     task["consecutive_failures"] = 3
+     result = _rule_repeated_failures(task, [], runs, 100, {})
+     assert result[0].data["most_recent_outcome"] == outcome
++
++
++def test_oom_reclaim_does_not_take_a_second_write_txn(board, monkeypatch):
++    """A legacy inflight row makes the next connect's backfill take a write txn.
++
++    ``detect_crashed_workers`` already holds one. ``note_oom_kill`` used to open
++    a second connection for the OOM counter; that connect re-ran
++    ``_backfill_legacy_inflight_runs`` and blocked in ``BEGIN IMMEDIATE`` for
++    the busy timeout (the shard-0 hang). The counter must stay on the caller's
++    connection, and an over-threshold reclaim must still open the alert card.
++    """
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++    monkeypatch.setattr(scope, "read_failure", lambda *a: {
++        "scope_result": "oom-kill", "systemd_unit": "test.scope",
++        "memory_max_bytes": 67108864, "memory_peak_bytes": 67239936,
++    })
++    monkeypatch.setattr(scope, "release_failure", lambda *a: None)
++    holder: dict = {"conn": None}
++    crossed = []
++    real_write_txn = kbc.write_txn
++
++    @contextlib.contextmanager
++    def guarding_write_txn(conn, *, allow_nested=False):
++        # BEGIN IMMEDIATE on any other connection while reclaim holds its write
++        # txn is the deadlock (busy_timeout, then retries). Fail it immediately
++        # so the regression asserts instead of stalling the suite.
++        if holder["conn"] is not None and conn is not holder["conn"] and holder["conn"].in_transaction:
++            crossed.append(conn)
++            raise sqlite3.OperationalError("database is locked")
++        with real_write_txn(conn, allow_nested=allow_nested) as yielded:
++            yield yielded
++
++    monkeypatch.setattr(kbc, "write_txn", guarding_write_txn)
++
++    with kbc.connect() as conn:
++        legacy = kb.create_task(conn, title="legacy inflight", assignee="default")
++        conn.execute(
++            "UPDATE tasks SET status='running', current_run_id=NULL, worker_pid=NULL, "
++            "claim_lock=NULL, started_at=? WHERE id=?",
++            (int(time.time()) - 300, legacy),
++        )
++        for _ in range(scope.OOM_ALERT_THRESHOLD):
++            conn.execute(
++                "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
++                "VALUES (?, 'crashed', 'oom_killed', ?, ?)",
++                (legacy, int(time.time()) - 10, int(time.time()) - 10),
++            )
++        victim = kb.create_task(conn, title="oom victim", assignee="default")
++        _dead_worker_with_log(conn, victim, 72001, 1)
++        conn.commit()
++        # Force note_oom_kill's connect through the migration/backfill path.
++        db_file = kbc._main_db_file(conn)
++        assert db_file
++        kbc._INITIALIZED_PATHS.discard(str(Path(db_file).resolve()))
++        holder["conn"] = conn
++        dispatch.detect_crashed_workers(conn)
++        run = conn.execute(
++            "SELECT outcome FROM task_runs WHERE task_id=? AND outcome IS NOT NULL "
++            "ORDER BY id DESC LIMIT 1",
++            (victim,),
++        ).fetchone()
++        alert = conn.execute(
++            "SELECT id FROM tasks WHERE idempotency_key='worker-oom-rate-alert' "
++            "AND status NOT IN ('done', 'archived')"
++        ).fetchone()
++    assert not crossed, "note_oom_kill opened a second write txn inside reclaim"
++    assert run["outcome"] == "oom_killed"
++    assert alert is not None
+-- 
+2.55.0
+

@@ -1,0 +1,346 @@
+From 7fe2f48e51dd8fc1e8e92b534c83cf99676da867 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:45:55 +0000
+Subject: [PATCH] fix(kanban): stale replica of an offline gateway is 'unknown,
+ not yet', not a broken probe [daveey]
+
+wait-check exits 3 (not 2) when the card is in a stale hermes-hub replica of an
+offline gateway (a sleeping Mac), with stale_age=/gateway= in its output. The
+wake-check dispatcher re-probes rc 3 without counting toward wake_check_broken,
+until the replica is 24 h stale; then it wakes the card with a
+'Gateway X offline for N h' note (reason=gateway_offline). The park-time dry
+run and confirm_remote accept rc 3, so kanban_schedule with awaiting.kind=card
+parks on a card of an offline gateway, recording the last-seen status and
+staleness in observed. Missing cards and orphan producers are still refused.
+---
+ hermes_cli/kanban_awaiting.py                |   6 +-
+ hermes_cli/kanban_wait_check.py              |   8 +-
+ hermes_cli/kanban_wait_replica.py            |  30 ++++-
+ hermes_cli/kanban_wake_check.py              |  40 +++++++
+ tests/hermes_cli/test_kanban_wait_replica.py | 111 ++++++++++++++++++-
+ 5 files changed, 184 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 969509d283..0cb8375b39 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -330,7 +330,9 @@ def confirm_remote(awaiting: Optional[dict]) -> None:
+         return  # resolve reports the bad ref
+     from hermes_cli import kanban_wait_check as kwait
+     rc, out = kwait.check_remote(awaiting["gateway"], "task", ref, board=awaiting.get("board"))
+-    if rc not in (0, 1):
++    # rc 3: the gateway is offline, but the card is in its last replica. Accept it on that observation (``observed``
++    # keeps the last-seen status and the staleness), so a card can still park on a card of a sleeping Mac.
++    if rc not in (0, 1, 3):
+         raise AwaitingError(INVALID_AWAITING, f"cannot confirm producer card {ref} on {awaiting['gateway']}: "
+                                               f"{out[-200:]}")
+     words = out.split()
+@@ -338,7 +340,7 @@ def confirm_remote(awaiting: Optional[dict]) -> None:
+     if status in ("archived", "triage") or "orphan producer" in out or "agent-owned park:" in out:
+         raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {ref} on {awaiting['gateway']} "
+                                                f"is {status}, so nobody is producing it. {_REMEDY}")
+-    _REMOTE_CONFIRMED[(awaiting["gateway"], ref)] = (time.monotonic(), out[-120:])
++    _REMOTE_CONFIRMED[(awaiting["gateway"], ref)] = (time.monotonic(), out[-240:] if rc == 3 else out[-120:])
+ 
+ 
+ def _check_card(conn: sqlite3.Connection, task_id: str, awaiting: dict, text: str) -> None:
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index 35e0b0afb8..566eacde26 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -2,8 +2,10 @@
+ 
+ Exit 0 = condition met, 1 = not yet, 2 = cannot tell (unknown card, unreachable gateway,
+ unreadable DB). The wake-check scheduler treats 2 as broken (3 in a row wakes the card),
+-never as "not yet". Arguments travel as argv (``shlex.join`` for ssh), so SQL/quoting
+-never gets re-split by a remote shell.
++never as "not yet". 3 = unknown, not yet: the gateway is unreachable and its hermes-hub replica,
++which still holds the card, is stale (a sleeping Mac). The scheduler re-probes 3 without counting it
++as broken until the replica has been stale for ``kanban_wake_check.STALE_WAKE_AFTER``. Arguments
++travel as argv (``shlex.join`` for ssh), so SQL/quoting never gets re-split by a remote shell.
+ 
+     hermes kanban wait-check task t_x [--gateway hub] [--board SLUG] [--until done,review,blocked,triage,scheduled,archived]
+                                      [--from running]
+@@ -127,7 +129,7 @@ def check_remote(gateway: str, kind: str, target: str, *, board: Optional[str] =
+         words = (p.stdout or "").split()
+         if len(words) >= 2 and words[0] == target and words[1] in set(since):
+             return 1, f"{out} (unchanged since park)"
+-    if p.returncode in (0, 1):
++    if p.returncode in (0, 1, 3):  # 3: the remote read a stale replica of a third gateway
+         return p.returncode, out
+     return 2, f"error: remote wait-check on {host} exited {p.returncode}: {out[-300:]}"
+ 
+diff --git a/hermes_cli/kanban_wait_replica.py b/hermes_cli/kanban_wait_replica.py
+index 1fa6e3e04e..9a7690a198 100644
+--- a/hermes_cli/kanban_wait_replica.py
++++ b/hermes_cli/kanban_wait_replica.py
+@@ -9,9 +9,21 @@ from hermes_cli import kanban_capability_registry as registry
+ 
+ # Gateway task_scopes are refreshed each sync; task updated_at only changes on edits.
+ MAX_AGE_SECONDS = 600
++# Exit code for "cannot tell, not yet": the producer card is known from the last replica, but its gateway has not
++# synced for longer than MAX_AGE_SECONDS (a sleeping Mac). The wake-check dispatcher re-probes it without counting it
++# as broken, up to kanban_wake_check.STALE_WAKE_AFTER. [daveey]
++STALE_RC = 3
+ STATUSES = frozenset(("todo", "ready", "running", "scheduled", "review", "blocked", "triage", "done", "archived"))
+ 
+ 
++class StaleReplica(ValueError):
++    """The card was seen in the gateway's replica, but that replica is older than MAX_AGE_SECONDS."""
++
++    def __init__(self, gateway, board, age, task):
++        super().__init__(f"stale replica for {gateway}/{board} (age={age:.0f}s, limit={MAX_AGE_SECONDS}s)")
++        self.gateway, self.board, self.age, self.task = gateway, board, age, task
++
++
+ def read_task(gateway, target, board=None):
+     """Exact owner-qualified match, including completed/archived records, with fresh scope proof."""
+     board = board or "default"
+@@ -37,7 +49,9 @@ def read_task(gateway, target, board=None):
+         if len(matched) != 1 or matched[0].get("state") != "ok":
+             raise ValueError(f"missing successful task-scope observation for {gateway}/{board}")
+         age = time.time() - float(matched[0].get("observed_at") or 0)
+-        if not -60 <= age <= MAX_AGE_SECONDS:
++        if age > MAX_AGE_SECONDS:
++            raise StaleReplica(gateway, board, age, task)
++        if age < -60:
+             raise ValueError(f"stale replica for {gateway}/{board} (age={age:.0f}s, limit={MAX_AGE_SECONDS}s)")
+         return task
+     finally:
+@@ -68,9 +82,21 @@ def observe_wait(conn, target, *, now):
+                                  (info.get("agent_owned_certain") or info.get("wait_state") == "stalled")))}
+ 
+ 
++def stale_message(target, stale):
++    """``<id> <last seen status> (...)``: words 0-1 keep the shape every reader parses; ``stale_age=`` and
++    ``gateway=`` are what the wake-check dispatcher reads to cap the wait. Never starts with ``error:``."""
++    status = stale.task.get("status")
++    orphan = " orphan producer;" if orphan_reason(stale.task) else ""
++    return (f"{target} {status} (replica stale:{orphan} gateway={stale.gateway} not synced for {stale.age:.0f}s, "
++            f"stale_age={stale.age:.0f}s, limit={MAX_AGE_SECONDS}s; last seen {status}, unknown now: not yet)")
++
++
+ def check(gateway, target, *, board=None, until=(), since=()):
+     try:
+-        task = read_task(gateway, target, board)
++        try:
++            task = read_task(gateway, target, board)
++        except StaleReplica as stale:
++            return STALE_RC, stale_message(target, stale)
+         status = task["status"]
+         orphan = orphan_reason(task)
+         suffix = " (replica; orphan producer)" if orphan else " (replica)"
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index a14eed0cb0..bd261c5267 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -8,6 +8,11 @@ dispatcher probes it off-thread on each tick:
+   honoured, like ``wake_due_continuations``) with a ``condition_met`` event carrying the
+   stdout tail, which the next worker's context shows;
+ * exit 1 -> not yet: probe again ``check_every`` seconds later;
++* exit 3 (``UNKNOWN_RC``) with a ``stale_age=<N>s`` line -> unknown, not yet: ``hermes kanban
++  wait-check`` read the card from a stale replica of an offline gateway (a sleeping Mac). Probed
++  again without counting toward ``BROKEN_AFTER``, until the replica is ``STALE_WAKE_AFTER`` old;
++  then the card wakes (``wake_check_broken`` with ``reason=gateway_offline``) saying how long the
++  gateway has been offline;
+ * anything else, or a timeout, ``BROKEN_AFTER`` times in a row -> the card wakes with a
+   ``wake_check_broken`` event so a worker fixes the probe. A broken probe is never silent.
+ 
+@@ -48,6 +53,11 @@ MAX_CONCURRENT = 4
+ # ``run_due_wake_checks(wait=True)`` never waits longer than this; the dispatcher never waits.
+ TICK_BUDGET_SECONDS = 60
+ BROKEN_AFTER = 3
++# "Unknown, not yet" (kanban_wait_replica.STALE_RC): the producer's gateway is offline and its replica stale.
++UNKNOWN_RC = 3
++STALE_WAKE_AFTER = 24 * 3600
++STALE_AGE_RE = re.compile(r"\bstale_age=(\d+)s\b")
++STALE_GATEWAY_RE = re.compile(r"\bgateway=(\S+)")
+ GUARD_SECONDS = 2 * 3600
+ OUTPUT_TAIL_CHARS = 500
+ MAX_CMD_CHARS = 2000
+@@ -62,6 +72,14 @@ ERROR_OUTPUT_RE = re.compile(
+     r"|unable to open database file|^\s*error:", re.IGNORECASE | re.MULTILINE)
+ 
+ 
++def stale_age(rc: Any, out: str) -> Optional[int]:
++    """Seconds the producer's replica has been stale when this result is "unknown, not yet", else None."""
++    if rc != UNKNOWN_RC or output_error(out):
++        return None
++    m = STALE_AGE_RE.search(out or "")
++    return int(m.group(1)) if m else None
++
++
+ def output_error(out: str) -> Optional[str]:
+     """The matching error line when a probe's output shows it crashed, else None."""
+     m = ERROR_OUTPUT_RE.search(out or "")
+@@ -81,6 +99,8 @@ def dry_run_error(cmd: Optional[str], *, cwd: Optional[str] = None, env: Optiona
+     if rc == "timeout":
+         return None
+     bad = None
++    if stale_age(rc, out) is not None:
++        return None  # unknown, not yet: the producer's gateway is offline right now
+     if not isinstance(rc, int) or rc >= 2:
+         bad = f"exited {rc}"
+     elif output_error(out):
+@@ -423,6 +443,23 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+                 "next_at = ? WHERE task_id = ?", (now, tail, now + int(state["every"]), task_id))
+             return None
++        age = stale_age(rc, out)
++        if age is not None:
++            if age >= STALE_WAKE_AFTER:
++                m = STALE_GATEWAY_RE.search(out or "")
++                gw = m.group(1).rstrip(",;)") if m else "the producer's gateway"
++                hours = age / 3600
++                return _wake(conn, task_id, BROKEN_EVENT, {
++                    "wake_check": cmd, "rc": rc, "fails": 0, "output": tail, "reason": "gateway_offline",
++                    "gateway": gw, "offline_seconds": age,
++                    "note": (f"Gateway {gw} offline for {hours:.0f} h: its replica has not synced, so the producer "
++                             "card's status is unknown. Check whether that machine is up, then re-check and park "
++                             "again (or replan without it).")})
++            # Not broken: the gateway is just offline. Keep any real-failure streak from before as it was.
++            conn.execute(
++                "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, "
++                "next_at = ? WHERE task_id = ?", (now, rc, tail, now + int(state["every"]), task_id))
++            return None
+         fails = int(state["fails"] or 0) + 1
+         if rc == 1:  # exit 1 with error output: a crashed probe posing as "not yet"
+             rc, rc_col = f"exit 1 with error output: {output_error(out)}", 1
+@@ -555,6 +592,9 @@ def _render_wake_context(conn: sqlite3.Connection, task_id: str) -> str:
+             lines.append("## Woken by wake check (condition met)")
+             lines.append(f"The park's wake_check `{payload.get('wake_check')}` exited 0, so this card "
+                          "woke before its deadline. Its output:")
++        elif payload.get("reason") == "gateway_offline":
++            lines.append("## Woken because the producer's gateway is offline")
++            lines.append(f"{payload.get('note')} Probe: `{payload.get('wake_check')}`. Last output:")
+         else:
+             lines.append("## Woken because the wake check is broken")
+             lines.append(f"The park's wake_check `{payload.get('wake_check')}` failed "
+diff --git a/tests/hermes_cli/test_kanban_wait_replica.py b/tests/hermes_cli/test_kanban_wait_replica.py
+index f94305b080..a82a7afe55 100644
+--- a/tests/hermes_cli/test_kanban_wait_replica.py
++++ b/tests/hermes_cli/test_kanban_wait_replica.py
+@@ -41,13 +41,116 @@ def test_fallback_status_including_terminal_records(replica, status, rc):
+     assert text.split()[:2] == [TID, status]
+ 
+ 
+-def test_missing_and_stale_are_errors(replica):
++def make_stale(db, age):
++    scope = {"task_scopes": [{"profile": "default", "board": "default", "state": "ok", "observed_at": time.time() - age}]}
++    db.execute("UPDATE replica SET data=? WHERE coll='gateway'", (json.dumps(scope),))
++    db.commit()
++
++
++def test_missing_is_error_and_stale_known_card_is_unknown_not_yet(replica):
+     assert wait.check_remote("other", "task", TID)[0] == 2
+     put(replica, "done")
+-    replica.execute("UPDATE replica SET data=? WHERE coll='gateway'", (json.dumps({"task_scopes": [{"profile": "default", "board": "default", "state": "ok", "observed_at": 1}]}),))
+-    replica.commit()
++    make_stale(replica, 1237)
+     code, text = wait.check_remote("other", "task", TID)
+-    assert code == 2 and "stale" in text
++    # Seen in the last replica of an offline gateway: unknown, not yet (3), never "broken" (2) and never "met".
++    assert code == 3, text
++    assert text.split()[:2] == [TID, "done"] and "stale_age=1237s" in text and "gateway=other" in text
++    assert not wake.output_error(text)
++    # A missing card on a stale replica is still an error: there is nothing to have seen.
++    replica.execute("DELETE FROM replica WHERE coll='tasks'")
++    replica.commit()
++    assert wait.check_remote("other", "task", TID)[0] == 2
++    # A replica stamped far in the future is a broken clock, not an offline gateway.
++    put(replica, "running")
++    make_stale(replica, -3600)
++    assert wait.check_remote("other", "task", TID)[0] == 2
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="waiter", assignee="worker")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++        yield conn, tid
++    wake._shutdown_for_tests()
++
++
++def _probe_results(conn, tid, cmd, rc, out, n, *, start=1000):
++    for i in range(n):
++        gen = wake.get_state(conn, tid)["generation"]
++        wake.apply_result(conn, tid, cmd, rc, out, generation=gen, now=start + i * 900)
++
++
++def test_stale_macbook_replica_is_not_marked_broken_after_three_checks(replica, board):
++    from hermes_cli import kanban_db as kb
++    conn, tid = board
++    put(replica, "running")
++    make_stale(replica, 1237)
++    rc, out = wait.check_remote("other", "task", TID)
++    assert rc == 3
++    cmd = f"hermes kanban wait-check task {TID} --gateway other --until done,blocked"
++    assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", wake_check=cmd, check_every=900)
++    _probe_results(conn, tid, cmd, rc, out, wake.BROKEN_AFTER + 2)
++    assert kb.get_task(conn, tid).status == "scheduled"
++    state = wake.get_state(conn, tid)
++    assert state["fails"] == 0 and state["last_rc"] == 3
++    assert not [e for e in kb.list_events(conn, tid) if e.kind == wake.BROKEN_EVENT]
++    # Control: the old rc 2 "error: replica ..." still wakes as broken after BROKEN_AFTER checks.
++    _probe_results(conn, tid, cmd, 2, "error: replica other: stale replica", wake.BROKEN_AFTER, start=9000)
++    broken = [e for e in kb.list_events(conn, tid) if e.kind == wake.BROKEN_EVENT]
++    assert broken and broken[-1].payload.get("reason") is None and kb.get_task(conn, tid).status == "ready"
++
++
++def test_gateway_offline_past_cap_wakes_with_offline_note(replica, board):
++    from hermes_cli import kanban_db as kb
++    conn, tid = board
++    put(replica, "running")
++    make_stale(replica, wake.STALE_WAKE_AFTER + 2 * 3600)
++    rc, out = wait.check_remote("other", "task", TID)
++    cmd = f"hermes kanban wait-check task {TID} --gateway other"
++    assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", wake_check=cmd, check_every=900)
++    _probe_results(conn, tid, cmd, rc, out, 1)
++    assert kb.get_task(conn, tid).status == "ready"
++    ev = [e for e in kb.list_events(conn, tid) if e.kind == wake.BROKEN_EVENT][-1].payload
++    assert ev["reason"] == "gateway_offline" and ev["gateway"] == "other"
++    assert "Gateway other offline for 26 h" in ev["note"]
++    assert "producer's gateway is offline" in wake.render_wake_context(conn, tid)
++
++
++def test_schedule_awaiting_card_on_stale_replica_is_accepted(replica, board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++    conn, tid = board
++    put(replica, "running")
++    make_stale(replica, 1237)
++    rc, out = wait.check_remote("other", "task", TID)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
++    # The probe replays the stale reply (exit 3), so the park-time dry run sees exactly what wait-check prints.
++    probe = f"printf '%s\\n' {json.dumps(out)}; exit 3"
++    res = json.loads(kt._handle_schedule({
++        "reason": f"SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on {TID} on other",
++        "wake_check": probe, "check_every": 900,
++        "awaiting": {"kind": "card", "ref": TID, "gateway": "other"}}))
++    assert res.get("status") == "scheduled", res
++    park = [e for e in kb.list_events(conn, tid) if e.kind == "scheduled"][-1].payload
++    observed = json.dumps(park)
++    assert "stale_age=1237s" in observed and f"{TID} running" in observed
++    # An orphan seen in the stale replica is still refused.
++    replica.execute("DELETE FROM replica WHERE coll='tasks'")
++    put(replica, "archived")
++    make_stale(replica, 1237)
++    with pytest.raises(awaiting.AwaitingError):
++        awaiting.confirm_remote(dict(kind="card", ref=TID, gateway="other"))
+ 
+ 
+ def test_since_and_until_preserved(replica):
+-- 
+2.55.0
+
