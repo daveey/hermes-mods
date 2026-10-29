@@ -33,6 +33,10 @@ def signature(path):
         "turns": d.get("completedTurns"),
         "awaiting": bool(d.get("interruptedAwaitingPerson")),
         "prs": sorted(f"{p.get('repo')}#{p.get('prNumber')}:{p.get('state')}" for p in d.get("prs") or []),
+        # The app's own post-turn summary: what the session is doing and what it needs from the user.
+        "status": "{status_category}: {status_detail} | needs: {needs_action}".format(
+            **{k: (d.get("postTurnSummary") or {}).get(k) or "" for k in ("status_category", "status_detail", "needs_action")}
+        ),
     }
 
 
@@ -48,7 +52,9 @@ def describe(sid, old, new):
         out.append(f"PRs {old['prs']} -> {new['prs']}")
     if new["title"] != old["title"]:
         out.append(f"retitled {old['title']!r} -> {new['title']!r}")
-    return f"{sid} {new['title']!r}: " + "; ".join(out) if out else None
+    if new["status"] != old["status"]:
+        out.append(f"status now [{new['status']}]")
+    return f"{sid} {new['title']!r}: " + "; ".join(out) + f" [{new['status']}]" if out else None
 
 
 def main():
