@@ -39,7 +39,8 @@ DEFAULT_MODELS = {("anthropic", "deep"): "claude-opus-5-5", ("anthropic", "stand
                   ("anthropic", "fast"): "claude-haiku-5-5", ("openai-codex", "deep"): "gpt-6-astra",
                   ("openai-codex", "standard"): "gpt-6.1-sol", ("openai-codex", "fast"): "gpt-6-luna"}
 
-# An account that is out of quota / rate limited: rotate. Anything else (bad request, auth) is raised as is.
+# Quota failures rotate immediately; auth failures get one store resync/refresh before rotation.
+AUTH_TEXT = re.compile(r"token has been revoked|invalid_grant", re.I)
 QUOTA_TEXT = re.compile(r"credit balance is too low|no credits remaining|insufficient_quota|rate.?limit|usage limit"
                         r"|quota|too many requests|overloaded|extra usage", re.I)
 ROTATE_STATUS = {402, 429, 529}
@@ -48,7 +49,7 @@ MCP_PREFIX = "mcp__"
 
 
 class PoolExhausted(RuntimeError):
-    """Every account in the pool refused the call for quota/rate reasons."""
+    """Every account refused the call for quota/rate or unrecovered auth reasons."""
 
 
 def canonical_provider(provider: str) -> str:
@@ -58,8 +59,16 @@ def canonical_provider(provider: str) -> str:
     return PROVIDERS[p]
 
 
+def error_status(exc: BaseException) -> Optional[int]:
+    return getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    return error_status(exc) == 401 or bool(AUTH_TEXT.search(str(exc)))
+
+
 def is_quota_error(exc: BaseException) -> bool:
-    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    status = error_status(exc)
     if isinstance(status, int) and status in ROTATE_STATUS:
         return True
     return bool(QUOTA_TEXT.search(str(exc)))
@@ -67,8 +76,11 @@ def is_quota_error(exc: BaseException) -> bool:
 
 def with_rotation(call: Callable[[Any], Any], pool: Any, *, model: Optional[str] = None,
                   max_tries: Optional[int] = None, on_attempt: Optional[Callable[[Any], None]] = None) -> Any:
-    """Run ``call(entry)`` on the pool's selected account; on a quota/rate error mark that account exhausted and
-    retry on the next one, at most once per account. Raises PoolExhausted when no account is left."""
+    """Rotate on quota or unrecovered auth failure, visiting each account at most once.
+
+    Auth failures first resync/refresh the issuing credential via the pool's locked
+    recovery API and retry once with a newly built client. No daemon restart needed.
+    """
     tries = max_tries or max(1, len(list(pool.entries())))
     last: Optional[BaseException] = None
     tried: list[str] = []
@@ -77,18 +89,32 @@ def with_rotation(call: Callable[[Any], Any], pool: Any, *, model: Optional[str]
         if entry is None or getattr(entry, "id", None) in tried:
             break
         tried.append(getattr(entry, "id", "?"))
-        if on_attempt:
-            on_attempt(entry)
-        try:
-            return call(entry)
-        except Exception as exc:  # noqa: BLE001 - classified below
-            if not is_quota_error(exc):
-                raise
-            last = exc
-            status = getattr(exc, "status_code", None)
-            pool.mark_exhausted_and_rotate(status_code=status if isinstance(status, int) else 429,
-                                           credential_id=getattr(entry, "id", None), model=model,
-                                           error_context={"reason": "quota", "message": str(exc)[:300]})
+        for attempt in range(2):
+            if on_attempt:
+                on_attempt(entry)
+            try:
+                return call(entry)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                auth = is_auth_error(exc)
+                if not auth and not is_quota_error(exc):
+                    raise
+                last = exc
+                if auth and attempt == 0:
+                    try:
+                        refreshed = pool.try_refresh_matching(credential_id=entry.id)
+                    except Exception:  # failed refresh must not strand other accounts
+                        refreshed = None
+                    if refreshed is not None and refreshed.id == entry.id:
+                        entry = refreshed
+                        continue
+                # Auth is account-wide, even if the upstream used status 400 for
+                # invalid_grant. Use the pool's 401 cooldown, not a quota cooldown.
+                status = error_status(exc)
+                pool.mark_exhausted_and_rotate(status_code=401 if auth else status if isinstance(status, int) else 429,
+                                               credential_id=getattr(entry, "id", None), model=model,
+                                               error_context={"reason": "auth" if auth else "quota",
+                                                              "message": str(exc)[:300]})
+                break
     labels = ", ".join(tried) or "none available"
     raise PoolExhausted(f"every pooled account refused (tried: {labels}); last error: {last}") from last
 

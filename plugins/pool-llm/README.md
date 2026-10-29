@@ -29,6 +29,11 @@ errors keep their status; the key is never logged). Non-streaming only. Each rep
 
 On a 429/quota/credit error the account is marked exhausted in the pool and the call retries on the next account;
 when all refuse it raises `PoolExhausted` (HTTP 429 from `serve`) naming the accounts tried.
+For both Claude and Codex, a 401, `token has been revoked`, or `invalid_grant` first invokes the pool's
+locked credential-store resync/OAuth refresh for the issuing account and retries once with a new client.
+Persistent auth failure (or failed refresh) marks that account unhealthy with the pool's 401 cooldown and
+rotates to the next account. The running daemon keeps the recovered credentials; no restart is needed.
+Other errors (for example malformed requests) still propagate without rotation.
 
 Not covered: embeddings (no pool path) and models the pool doesn't carry; those still need a paid key.
 
