@@ -345,6 +345,30 @@ CREDIT_ASK_RE = re.compile(
     r"|\bmoney ask\b",
     re.I)
 POOL_HELPER_RE = re.compile(r"hermes-pool-llm|pool_llm")
+# The ask must be about LLM API credit: the pool can't pay GitHub Actions, AWS, Vast or Cloudflare bills (live false
+# positive: "raise the spending limit" for the GitHub Actions billing watchdog).
+LLM_CREDIT_RE = re.compile(
+    r"\b(?:anthropic|openai|open\s?router|gemini|claude|gpt|llm)\b|insufficient_quota"
+    r"|credit balance is too low|no credits remaining|\bapi\s+(?:credits?|key|org)\b"
+    r"|console\.anthropic\.com|platform\.openai\.com", re.I)
+NON_LLM_BILLING_RE = re.compile(
+    r"\b(?:github(?:\s+actions)?|actions\s+(?:minutes|billing)|aws|ec2|vast(?:\.ai)?|cloudflare|runpod|lambda labs"
+    r"|gcp|azure|heroku|vercel|netlify)\b", re.I)
+
+
+def _about_llm_credit(text: str, m: "re.Match") -> bool:
+    """The money wording at m may be about LLM provider credit. Its paragraph naming an LLM provider/error decides yes;
+    naming other billing (GitHub Actions, AWS, Vast, Cloudflare...) decides no; else the whole reply decides the same
+    way. A bare "add $250 of credit" with no provider named anywhere still counts (the rule's original case)."""
+    start, end = text.rfind("\n\n", 0, m.start()) + 1, text.find("\n\n", m.end())
+    for scope in (text[start:end if end >= 0 else len(text)], text):
+        if LLM_CREDIT_RE.search(scope):
+            return True
+        if NON_LLM_BILLING_RE.search(scope):
+            return False
+    return True
+
+
 # A sentence saying credit is NOT needed is not an ask (live false positive 2026-10-29: "So no credit top-up is
 # needed."). Only explicit not-needed forms are blanked before the search, so "No credits left, so a top-up is
 # needed", "No need to wait; add $250 of credit" and "... but add $250" still hold.
@@ -373,7 +397,7 @@ def credit_ask(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     # pool-llm's own hint (echoed tool output) and quoted/code text are not an ask
     text = "\n".join(l for l in _CODE_QUOTE.sub(" ", reply or "").splitlines() if "pool-llm:" not in l)
     text = CREDIT_NEGATED_RE.sub(lambda n: " " * len(n.group(0)), text)
-    m = CREDIT_ASK_RE.search(text)
+    m = next((m for m in CREDIT_ASK_RE.finditer(text) if _about_llm_credit(text, m)), None)
     if not m or any(POOL_HELPER_RE.search(l or "") for l in (tool_log or [])):
         return None
     return m.group(0).strip()

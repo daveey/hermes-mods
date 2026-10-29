@@ -77,3 +77,28 @@ def test_negation_guard_keeps_real_asks():
                  "You don't need to do anything but add $250 of credit.",
                  "No API credit is needed for Claude, but add $250 of OpenAI credit."):
         assert rc.credit_ask(text, []), text
+
+
+# Live false positive (Inbox zero-junk plan step 7): the GitHub Actions billing watchdog reply said the spending-limit
+# raise stays a typed approval card. The account pool can't pay non-LLM bills, so only LLM provider credit counts.
+GH_ACTIONS_REPLY = ("Step 7: the GitHub Actions billing watchdog now posts when the monthly Actions minutes run low; "
+                    "only 'raise the spending limit / pay' stays a typed approval card.")
+
+
+def test_github_actions_billing_is_not_an_llm_credit_ask():
+    assert rc.credit_ask(GH_ACTIONS_REPLY, []) is None
+    assert rc.credit_ask("GitHub Actions is out of minutes: raise the spending limit on the billing page.", []) is None
+
+
+def test_other_non_llm_billing_is_not_an_llm_credit_ask():
+    for r in ("Please add $50 of credit to the Vast.ai account so the GPU rental can continue.",
+              "Raise the AWS budget to $500 so the EC2 job keeps running.",
+              "Top up the Cloudflare balance before Friday."):
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_llm_credit_ask_still_fires():
+    assert rc.credit_ask("Please add Anthropic API credit so the eval can continue.", [])
+    assert rc.credit_ask("OpenAI returned insufficient_quota. Add $100 of credit and I'll rerun it.", [])
+    # an LLM ask still fires when another paragraph mentions GitHub
+    assert rc.credit_ask("CI on GitHub is green.\n\nAdd $250 of Anthropic credit so the eval can finish.", [])
