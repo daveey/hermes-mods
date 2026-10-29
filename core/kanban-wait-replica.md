@@ -40,7 +40,7 @@ Apply after 0657 with `git am -3`. The three-patch append 0656–0658 is checked
 - Archived rows already removed by the collector's retention policy are unknown.
 - This is core lifecycle/probe behavior, not a plugin hook.
 
-## Follow-up patches (0733–0734)
+## Follow-up patches (0733–0734, 0737)
 
 **0733** (fork `7fe2f48e51`), **0734** (fork `68654ac016`, test-only: the schedule test asserts the stale-replica rc so ruff RUF059 stays quiet).
 
@@ -52,4 +52,6 @@ A card that is in a stale hermes-hub replica of an offline gateway (a sleeping M
 
 Code: `hermes_cli/kanban_wait_replica.py` (`StaleReplica`, `STALE_RC`, `stale_message`), `kanban_wait_check.py` (pass rc 3 through), `kanban_wake_check.py` (`UNKNOWN_RC`, `stale_age`, `STALE_WAKE_AFTER`), `kanban_awaiting.py` (`confirm_remote`).
 
-Tests in `tests/hermes_cli/test_kanban_wait_replica.py`: `test_missing_is_error_and_stale_known_card_is_unknown_not_yet`, `test_stale_macbook_replica_is_not_marked_broken_after_three_checks`, `test_gateway_offline_past_cap_wakes_with_offline_note`, `test_schedule_awaiting_card_on_stale_replica_is_accepted`. Ran the file on fork `origin/main` `a65917ae05` for this mirror: 25 passed (that tip also contains `c3c618c3f0`). The `kanban_block` entry path (no `wake_check`, auto-filled probe) is that later commit and is not in this series: untested as a published patch.
+Tests in `tests/hermes_cli/test_kanban_wait_replica.py`: `test_missing_is_error_and_stale_known_card_is_unknown_not_yet`, `test_stale_macbook_replica_is_not_marked_broken_after_three_checks`, `test_gateway_offline_past_cap_wakes_with_offline_note`, `test_schedule_awaiting_card_on_stale_replica_is_accepted`. Ran the file on fork `origin/main` `a65917ae05` for this mirror: 25 passed (that tip also contains `c3c618c3f0`). The `kanban_block` entry path is covered by **0737** (fork `c3c618c3f0`, test-only).
+
+**0737** pins `kanban_block(kind='time', awaiting=card@gateway)` against a stale replica (no `wake_check`, auto-filled probe): the hub refused this with `invalid_awaiting: ... stale replica` while a Mac slept, and 0733 fixed the behavior. A card the stale replica shows as missing is still refused (`invalid_awaiting`); an archived one is refused (`agent_action_wait`). Tests in the same file: `test_block_awaiting_card_on_stale_replica_is_accepted`, `test_block_awaiting_card_on_stale_replica_refuses_missing_or_archived`. Re-run on `a65917ae05`: 25 passed.
