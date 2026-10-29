@@ -1,0 +1,40 @@
+"""credit_ask (self-heal agent-fe419d4901): a reply asking the user to buy API credit while the turn never tried the
+Hermes account pool is held deterministically, before the judge."""
+import importlib.util
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("t_reply_check_credit", HERE / "reply_check.py")
+rc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rc)
+
+# Verbatim tail of the 01:47 PT reply in @session:default/20261027_152719_2b256c (msg 661112, coach digest).
+REAL_REPLY = ("**Still needs you:** v11 is still waiting on API credit. At 01:34 PT, Anthropic still said \"credit "
+              "balance is too low\" and OpenAI \"no credits remaining\". Add about $250 to each, or reply "
+              "\"OpenRouter\". The eval restarts on its own within 15 minutes of both keys working.\n"
+              "- https://console.anthropic.com/settings/billing\n"
+              "- https://platform.openai.com/settings/organization/billing")
+
+
+def _no_judge(system, prompt):
+    raise AssertionError("credit_ask must not need the LLM judge")
+
+
+def test_real_reply_is_flagged_before_the_judge():
+    hit = rc.check(REAL_REPLY, "hows it looking", ["-> terminal(command='bash check_credits.sh')"], _no_judge)
+    assert hit and hit["rule"] == "credit_ask" and hit["p"] == 1.0
+    assert "hermes-pool-llm" in hit["nudge"]
+
+
+def test_reply_passes_when_the_turn_tried_the_pool():
+    log = ["-> terminal(command='~/.hermes/plugins/pool-llm/bin/hermes-pool-llm check')"]
+    assert rc.credit_ask(REAL_REPLY, log) is None
+
+
+def test_plain_status_mentioning_credit_is_not_flagged():
+    assert rc.credit_ask("The eval now runs on the account pool; no credit was added.", []) is None
+    assert rc.credit_ask("Moved the judges to hermes-pool-llm serve; GitHub billing is unrelated.", []) is None
+
+
+def test_rule_is_on_by_default():
+    assert "credit_ask" in rc.DEFAULT_RULES and "credit_ask" in rc.settings()["rules"]

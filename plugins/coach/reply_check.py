@@ -332,8 +332,37 @@ DENIED_ASK_NUDGE = (
     "do that step itself, do it instead of asking.")
 
 
-RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask")
-DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask")
+# ---- credit_ask: the reply asks the user to buy API credit while the account pool was never tried -------------
+# (self-heal agent-fe419d4901: the Ask Eve eval chat asked David for ~$250 each of Anthropic and OpenAI API credit and
+# parked 8 h; the Hermes subscription pool, Claude Max + ChatGPT accounts, could have run it.) Deterministic, before the
+# judge. Same pattern as plugins/pool-llm/hooks.py CREDIT_ASK_RE (that plugin holds the matching kanban_block once).
+_MONEY = r"(?:api\s+)?(?:credits?|credit balance|billing|funds|balance|budget|spend(?:ing)? limit|top[- ]?up)"
+CREDIT_ASK_RE = re.compile(
+    r"console\.anthropic\.com/settings/(?:billing|plans)|platform\.openai\.com/(?:settings/organization/|account/)?billing"
+    r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund|increase|raise)\b[^.\n]{0,60}?\$?\d*[^.\n]{0,20}?\b" + _MONEY +
+    r"|\b(?:credits?|balance)\b[^.\n]{0,40}\b(?:add|top[- ]?up|refill|buy|purchase)\b"
+    r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund)\s+(?:about |around |roughly |another |~)?\$\d"
+    r"|\bmoney ask\b",
+    re.I)
+POOL_HELPER_RE = re.compile(r"hermes-pool-llm|pool_llm")
+CREDIT_ASK_NUDGE = (
+    "[coach] credit_ask: your reply asks the user to add or buy API credit (\"{evidence}\"), but this turn never tried "
+    "the Hermes subscription account pool (Claude Max + ChatGPT accounts). Run the work there first: "
+    "`~/.hermes/plugins/pool-llm/bin/hermes-pool-llm ask --provider anthropic|openai --model <m> \"...\"`, or "
+    "`hermes-pool-llm serve --port 8765` and point the harness at it (ANTHROPIC_BASE_URL=http://127.0.0.1:8765, "
+    "OPENAI_BASE_URL=http://127.0.0.1:8765/v1). Ask for money only if the pool fails too, quoting its error.")
+
+
+def credit_ask(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The phrase asking the user to buy API credit, when the turn never ran the pool helper; else None."""
+    m = CREDIT_ASK_RE.search(reply or "")
+    if not m or any(POOL_HELPER_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return m.group(0).strip()
+
+
+RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask")
+DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85}
@@ -857,6 +886,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "denied_ask", "p": 1.0, "evidence": phrase, "reason": "denied_ask",
                     "verdict": {"denied_ask": 1.0, "evidence": phrase},
                     "nudge": DENIED_ASK_NUDGE.format(evidence=phrase[:120], n=len(asks), asks=listed[:900])}
+    if not only or "credit_ask" in only:
+        phrase = credit_ask(reply, tool_log)
+        if phrase:  # deterministic: asking the user for money while the account pool sat unused
+            return {"rule": "credit_ask", "p": 1.0, "evidence": phrase, "reason": "credit_ask",
+                    "verdict": {"credit_ask": 1.0, "evidence": phrase},
+                    "nudge": CREDIT_ASK_NUDGE.format(evidence=phrase[:160])}
     if (not only or "report_only" in only) and not scoped:
         phrase = unverified_owner(reply, tool_log)
         if phrase:  # deterministic: no judge call, no AI score at the edge of its bar

@@ -111,7 +111,8 @@ def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_THRESHOLD", raising=False)
     monkeypatch.delenv("COACH_REPLY_THRESHOLDS", raising=False)
     cfg = rc.settings()
-    assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask"] and cfg["threshold"] == 0.7
+    assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask",
+                            "credit_ask"] and cfg["threshold"] == 0.7
     assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85}
 
 

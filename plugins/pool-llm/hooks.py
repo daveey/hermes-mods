@@ -1,0 +1,119 @@
+"""pool-llm hooks: point a credit/quota failure at the account pool, and hold an ask that David buy API credit.
+
+- transform_terminal_output / transform_tool_result: output carrying a paid-key credit error ("credit balance is too
+  low", "no credits remaining", "insufficient_quota") gets one line naming ``hermes-pool-llm``.
+- pre_tool_call: a kanban_block / kanban_create / inbox_post / action_request whose text asks the user to add or buy
+  API credit (or links an Anthropic/OpenAI billing page) is refused ONCE per session when the session never ran the
+  pool helper. The refusal says to try the pool first; a second attempt goes through (the pool may really be down).
+"""
+from __future__ import annotations
+
+import json
+import re
+import threading
+from typing import Any, Optional
+
+MARK = "pool-llm:"
+HELPER = "~/.hermes/plugins/pool-llm/bin/hermes-pool-llm"
+CREDIT_ERROR_RE = re.compile(r"credit balance is too low|no credits remaining|insufficient_quota", re.I)
+HINT = (f"{MARK} this is a paid API key out of credit. Don't ask the user to buy credit: run the call on the Hermes "
+        f"subscription account pool instead (Claude Max + ChatGPT accounts, rotates on limits). One call: `{HELPER} ask "
+        f"--provider anthropic|openai --model <m> \"...\"`; an unmodified SDK harness: `{HELPER} serve --port 8765` then "
+        "ANTHROPIC_BASE_URL=http://127.0.0.1:8765 OPENAI_BASE_URL=http://127.0.0.1:8765/v1 (any API key). "
+        f"`{HELPER} models` lists the pool's models.")
+
+_MONEY = r"(?:api\s+)?(?:credits?|credit balance|billing|funds|balance|budget|spend(?:ing)? limit|top[- ]?up)"
+CREDIT_ASK_RE = re.compile(
+    r"console\.anthropic\.com/settings/(?:billing|plans)|platform\.openai\.com/(?:settings/organization/|account/)?billing"
+    r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund|increase|raise)\b[^.\n]{0,60}?\$?\d*[^.\n]{0,20}?\b" + _MONEY +
+    r"|\b(?:credits?|balance)\b[^.\n]{0,40}\b(?:add|top[- ]?up|refill|buy|purchase)\b"
+    r"|\b(?:add|buy|purchase|top[- ]?up|load|refill|fund)\s+(?:about |around |roughly |another |~)?\$\d"
+    r"|\bmoney ask\b",
+    re.I)
+ASK_TOOLS = {"kanban_block", "kanban_create", "inbox_post", "action_request"}
+HELPER_USE_RE = re.compile(r"hermes-pool-llm|pool_llm")
+REFUSAL = (f"{MARK} held once: this asks the user to add or buy API credit, but this session never tried the Hermes "
+           f"account pool. Run the work on the pool first (`{HELPER} ask ...`, or `{HELPER} serve` for an SDK "
+           "harness; see ~/AGENTS.md 'LLM Calls in Scripts and Evals'). Ask the user for money only after the pool failed too, "
+           "and quote that failure in the ask. Retrying this exact call will go through.")
+
+_lock = threading.Lock()
+_used: set[str] = set()      # sessions that ran the pool helper
+_held: set[str] = set()      # sessions already refused once
+
+
+def _bare(name: str) -> str:
+    return (name or "").rsplit("__", 1)[-1]
+
+
+def hint_for(text: Any) -> Optional[str]:
+    if isinstance(text, str) and MARK not in text and CREDIT_ERROR_RE.search(text):
+        return text.rstrip("\n") + "\n\n" + HINT
+    return None
+
+
+def note_helper_use(session_id: str, text: Any) -> None:
+    if session_id and isinstance(text, str) and HELPER_USE_RE.search(text):
+        with _lock:
+            _used.add(session_id)
+
+
+def transform_terminal_output(command: str = "", output: Any = None, task_id: str = "", **kw) -> Optional[str]:
+    note_helper_use(kw.get("session_id") or task_id, command)
+    if HELPER_USE_RE.search(command or ""):
+        return None  # the helper's own output (e.g. PoolExhausted quoting the error) needs no pointer to itself
+    return hint_for(output)
+
+
+def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "",
+                          **_) -> Optional[str]:
+    name = _bare(tool_name)
+    if name not in ("execute_code", "process_manage", "process", "terminal"):
+        return None
+    blob = json.dumps(args, default=str) if args else ""
+    note_helper_use(session_id, blob)
+    if HELPER_USE_RE.search(blob):
+        return None
+    return hint_for(result)
+
+
+def _ask_calls(tool_name: str, args: Any):
+    name = _bare(tool_name)
+    if name in ASK_TOOLS and isinstance(args, dict):
+        yield name, args
+    elif name == "tool_call" and isinstance(args, dict) and isinstance(args.get("calls"), list):
+        for call in args["calls"]:
+            if isinstance(call, dict):
+                yield from _ask_calls(str(call.get("name") or ""), call.get("arguments"))
+
+
+def credit_ask(tool_name: str, args: Any) -> Optional[str]:
+    """The matched phrase when this tool call asks the user for API credit, else None."""
+    for name, a in _ask_calls(tool_name, args):
+        if name == "kanban_create" and a.get("initial_status") != "blocked" and not a.get("human_request"):
+            continue
+        m = CREDIT_ASK_RE.search(json.dumps(a, default=str, ensure_ascii=False))
+        if m:
+            return m.group(0)
+    return None
+
+
+def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_) -> Optional[dict]:
+    name = _bare(tool_name)
+    if name in ("terminal", "execute_code"):
+        note_helper_use(session_id, json.dumps(args, default=str) if args else "")
+        return None
+    if not credit_ask(tool_name, args):
+        return None
+    key = session_id or "?"
+    with _lock:
+        if key in _used or key in _held:
+            return None
+        _held.add(key)
+    return {"action": "block", "message": REFUSAL}
+
+
+def register(ctx) -> None:
+    ctx.register_hook("transform_terminal_output", transform_terminal_output)
+    ctx.register_hook("transform_tool_result", transform_tool_result)
+    ctx.register_hook("pre_tool_call", pre_tool_call)
