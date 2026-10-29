@@ -25,23 +25,46 @@ def scheduled(owner):
 
 @pytest.fixture
 def dispatcher(scheduled, monkeypatch):
-    from gateway.kanban_dispatcher_health import DispatcherHealth
+    """Receipt for this board only. Do not tick the live dispatcher.
+
+    ``available()`` fails closed when ``/proc/locks`` omits this flock or a
+    host pause sentinel exists. Both are shared with the gateway dispatcher
+    and with sibling ``-j`` workers, so a miss becomes
+    ``owner_dispatcher_unverified`` before the consumer check. Scope, ttl and
+    invalidation stay on the real receipt; lock ownership and pause paths are
+    bound to this fixture.
+    """
+    import os
+    from gateway import kanban_dispatcher_health as health
     from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock
-    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher, _resolve_dispatcher_settings
-    from hermes_cli import kanban_db as kb, kanban_db_dispatch as kbd
+    from hermes_cli import kanban_db as kb
     root = scheduled[0].parent / 'kanban'
-    monkeypatch.setattr(Path, 'home', lambda: scheduled[0].parent)
-    monkeypatch.setenv('HERMES_KANBAN_HOME', str(scheduled[0].parent))
-    monkeypatch.setattr(kbd, '_memory_pressure_level', lambda: 'unknown')
-    loop = _KanbanDispatcher(kb, _resolve_dispatcher_settings({},kb))
-    monkeypatch.setattr(loop, '_board_slugs', lambda: ['default'])
-    monkeypatch.setattr(loop, '_receipt_scope', lambda: ({'default'}, {'ready'}))
+    root.mkdir(parents=True, exist_ok=True)
+    sentinel = root / 'estop-absent'
+    monkeypatch.setattr('agent.estop._candidate_sentinel_paths', lambda: [sentinel])
     lock, state = _acquire_singleton_lock(root / '.dispatcher.lock')
-    assert state == 'held'
-    producer = DispatcherHealth(lock, interval=1)
+    assert lock is not None and state == 'held'
+    held = lock
+
+    def owns_fixture_lock(path, pid, _lock=held):
+        try:
+            name = getattr(_lock, 'name', None)
+            if pid != os.getpid() or getattr(_lock, 'closed', True) or not name:
+                return False
+            return Path(path).resolve() == Path(name).resolve()
+        except OSError:
+            return False
+
+    monkeypatch.setattr(health, '_owns_lock', owns_fixture_lock)
+    producer = health.DispatcherHealth(lock, interval=60)
     try:
-        loop.tick_once()
-        producer.publish(loop.successful_scopes)
+        producer.publish([(str(scheduled[0].resolve()), ['default'], ['ready'], health.time.monotonic())])
+        assert producer.path is not None
+        record = json.loads(producer.path.read_text())
+        assert record.get('boards'), 'fixture must publish a scope without a live tick'
+        assert record.get('pause_paths') and all(
+            Path(p).resolve().is_relative_to(root.resolve()) for p in record['pause_paths'])
+        assert health.available(kb.kanban_home() / 'kanban', scheduled[0], 'default', 'ready')
         yield producer
     finally:
         producer.close()
@@ -55,7 +78,15 @@ def test_scheduled_requires_both_native_receipts(scheduled, consumer, dispatcher
         ownership.authoritative_owner(scheduled[1], scheduled[2], SID)
 
 
-def test_scheduling_does_not_replace_return_receipt(scheduled, dispatcher):
+def test_scheduling_does_not_replace_return_receipt(scheduled, dispatcher, monkeypatch):
+    # Parallel workers rewrite /proc/locks. A missing line must not become
+    # owner_dispatcher_unverified; scheduling still needs the return consumer.
+    real = Path.read_text
+    def poisoned(self, *args, **kwargs):
+        if self == Path('/proc/locks'):
+            return ''
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', poisoned)
     with pytest.raises(ValueError, match='owner_result_consumer_unverified'):
         ownership.authoritative_owner(scheduled[1], scheduled[2], SID)
 
