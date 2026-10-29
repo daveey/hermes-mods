@@ -63,7 +63,7 @@ SCOPE_REFERENCE = (r"(?:https://github\.com/" + REPO + r"/pull/" + NUMBER
                    + r"|" + REPO + r" +PR *#" + NUMBER
                    + r"|PR *#" + NUMBER + r"|(?:Repo(?:sitory)? *:? +)?" + REPO + r")")
 SCOPE = re.compile(
-    r" *" + SCOPE_REFERENCE + r"(?: +\([A-Za-z0-9][A-Za-z0-9._-]{0,63}\))?"
+    r" *" + SCOPE_REFERENCE + r"(?: +\((?P<label>[A-Za-z0-9][A-Za-z0-9._-]{0,63})\))?"
     + r"(?:,? +(?:head|sha|commit) +" + HEX + r")?(?: +only)? *", re.I | re.ASCII)
 
 
@@ -159,6 +159,28 @@ def request_target(row):
     if target is None or len(heads) > 1:
         return None
     return *target, next(iter(heads), None)
+
+
+def scope_label(row):
+    """Return a syntactically valid label verbatim, not authority or instructions."""
+    scope = (_request(row) or {}).get("scope")
+    match = SCOPE.fullmatch(scope) if isinstance(scope, str) else None
+    return match.group("label") if match else None
+
+
+def scope_label_failure(row, head_ref_name):
+    """Bind optional label to the authoritative PR headRefName (case-sensitive).
+
+    Call after fetching the PR, before trusting a receipt. Syntax-only filing
+    cannot establish this invariant; a slug grammar alone is not sufficient.
+    """
+    failure = _scope_failure(_request(row) or {})
+    if failure:
+        return failure
+    label = scope_label(row)
+    if label is not None and label != head_ref_name:
+        return f"Scope label {label!r} does not equal PR headRefName {head_ref_name!r}."
+    return ""
 
 
 def looks_like_pr_approval(row) -> bool:

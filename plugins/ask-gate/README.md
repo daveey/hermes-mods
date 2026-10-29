@@ -132,6 +132,11 @@ accuracy and live UI/REST/CLI paths are not established by these plugin unit tes
   `scope`; ambiguous repositories and conflicting repository labels are rejected. A head comes only
   from the action, never from context. Private consumers must still enforce their owner policy and
   verify authoritative current-head approval receipts; parsing never grants permission.
+- `scope_label(row) -> str | None`: extracts a syntactically valid optional scope label verbatim.
+- `scope_label_failure(row, head_ref_name) -> str`: returns a diagnostic naming a label that does
+  not exactly equal the authoritative PR `headRefName`, including absent branch metadata. Consumers
+  must call it after fetching the PR and before reading approval receipts. Matching is case-sensitive;
+  no label requires no branch metadata. Filing is syntax-only and does not perform this network check.
 - `looks_like_pr_approval(row) -> bool`: broader diagnostic for leading Approve/OK/Authorize PR asks,
   not a strict parser or evidence of authorization.
 - `parse_failure_reason(row) -> str`: empty on strict success; otherwise describes the unsupported
@@ -199,6 +204,12 @@ its lifecycle suffix. Scope tests exercised resolution and ambiguity but not ext
 `tests/test_pr_scope_allowlist.py` now covers the full positive grammar, unknown instructions,
 label/length bounds, extra heads, URL tails, JSON, and scope-head non-authority;
 `tests/test_pr_approval_filing.py` checks the scope diagnostic through both create and block hooks.
+`tests/test_pr_scope_branch.py` covers verbatim dict/JSON label extraction, exact case-sensitive
+branch matching, absent metadata, absent labels, and malformed-scope diagnostics. Slug syntax alone
+cannot exclude imperative-looking labels; an earlier grammar discarded that label before consumers
+could validate it. Consumers must bind it to the real PR branch rather than add a verb denylist.
+Existing syntax tests did not exercise authoritative branch identity; the new helpers make that
+separate semantic validation testable without adding I/O to this module.
 
 ### Cited evidence and vendor entitlements
 
