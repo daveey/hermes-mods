@@ -9,6 +9,7 @@ import sqlite3
 from pathlib import Path
 
 KEY_PREFIX = 'investigate-machine:'
+TITLE = 'Investigate machine load: '
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
 OPEN = ('triage', 'todo', 'ready', 'scheduled', 'running', 'review')
 # A remote create that has not come back with a card yet is shown as queued for this long.
@@ -42,7 +43,7 @@ def card_args(machine, load, now_s):
         'numbers.',
     ])
     return {
-        'title': f'Investigate machine load: {machine}',
+        'title': f'{TITLE}{machine}',
         'body': body,
         'assignee': 'default',
         'placement': machine,
@@ -65,15 +66,17 @@ def latest(shadow_dirs, names=None):
             except sqlite3.Error:
                 continue
             try:
+                # A cross-gateway create does not carry the idempotency key, so the title names the machine too.
                 rows = db.execute(
-                    'SELECT id, status, result, idempotency_key, created_at, completed_at, human_request FROM tasks '
-                    'WHERE idempotency_key LIKE ? ORDER BY created_at DESC', (KEY_PREFIX + '%',)).fetchall()
+                    'SELECT id, status, result, title, created_at, completed_at, human_request FROM tasks '
+                    'WHERE idempotency_key LIKE ? OR title LIKE ? ORDER BY created_at DESC',
+                    (KEY_PREFIX + '%', TITLE + '%')).fetchall()
             except sqlite3.Error:
                 rows = []
             finally:
                 db.close()
-            for tid, status, result, key, created, completed, ask in rows:
-                machine = key[len(KEY_PREFIX):].rsplit(':', 1)[0]
+            for tid, status, result, title, created, completed, ask in rows:
+                machine = (title or '')[len(TITLE):].strip()
                 if names is not None and machine not in names:
                     continue
                 cur = best.get(machine)

@@ -489,10 +489,12 @@ def _investigate_env(module, monkeypatch, tmp_path, machines=('mini', 'hub')):
 def _shadow_card(tmp_path, tid, machine, status, created_at, result=None):
     import sqlite3
     db = sqlite3.connect(tmp_path / 'default.db')
-    db.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT, status TEXT, result TEXT, idempotency_key TEXT, '
+    db.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT, status TEXT, result TEXT, idempotency_key TEXT, title TEXT, '
                'created_at INTEGER, completed_at INTEGER, human_request TEXT)')
-    db.execute('INSERT INTO tasks VALUES (?,?,?,?,?,?,?)',
-               (tid, status, result, f'investigate-machine:{machine}:{created_at}', created_at, None, None))
+    # Cross-gateway creates arrive without the idempotency key: the title alone identifies the machine.
+    key = f'investigate-machine:{machine}:{created_at}' if created_at % 2 == 0 else None
+    db.execute('INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?)',
+               (tid, status, result, key, f'Investigate machine load: {machine}', created_at, None, None))
     db.commit()
     db.close()
 
@@ -522,7 +524,7 @@ def test_investigation_route_reuses_an_open_or_blocked_card_and_restarts_after_d
     _shadow_card(tmp_path, 't_aaaa00000001', 'hub', 'running', 100)
     res = client.post(PREFIX + '/investigations', json={'machine': 'hub'}, headers=TOKEN).json()
     assert res['created'] is False and res['investigation']['task'] == 't_aaaa00000001' and not created
-    _shadow_card(tmp_path, 't_aaaa00000002', 'mini', 'blocked', 100)
+    _shadow_card(tmp_path, 't_aaaa00000002', 'mini', 'blocked', 101)
     res = client.post(PREFIX + '/investigations', json={'machine': 'mini'}, headers=TOKEN).json()
     assert res['created'] is False and res['investigation']['status'] == 'blocked' and not created
     _shadow_card(tmp_path, 't_aaaa00000003', 'mini', 'done', 200, 'mini: fine now')

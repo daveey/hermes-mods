@@ -28,7 +28,7 @@ with `placement=<machine>` (so the card runs ON that machine; a cross-gateway cr
 pickup) and the `machine-investigate` skill, or returns the one already open or blocked (never a duplicate).
 The row then shows `Investigating · t_…` (click opens the card), `Needs you · <ask>` while the card is blocked,
 or `Investigated 12m ago · <verdict>` (click opens the result; the button starts a new one). Status comes from
-the fleet response: each gateway row carries `investigation` (newest card with key `investigate-machine:<name>:…`
+the fleet response: each gateway row carries `investigation` (newest card titled `Investigate machine load: <name>`
 in the board replicas; a create not yet replicated shows as queued for 15 min).
 
 Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`),
