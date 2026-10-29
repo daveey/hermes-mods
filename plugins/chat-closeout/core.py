@@ -144,6 +144,12 @@ def is_settled(card: Optional[dict[str, Any]]) -> bool:
     return False
 
 
+def is_unknown(card: Optional[dict[str, Any]]) -> bool:
+    """No usable read of the card: absent from the read, or a remote row that is stale/unconfirmed. Unknown is not
+    evidence the card went back to work, so coverage upkeep must not forget what it already told the chat."""
+    return card is None or (bool(card.get("remote")) and card.get("stale") is not False)
+
+
 def needs_human(card: Optional[dict[str, Any]]) -> bool:
     return bool(card) and is_settled(card) and card.get("status") not in DONE_STATUSES
 
@@ -262,7 +268,7 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
     batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
     relayed = set(row.get("relayed") or [])
     keep = {p for p in relayed if _premise_card(p) in batch
-            and (cards.get(_premise_card(p)) is None or is_settled(cards[_premise_card(p)]))}
+            and (is_unknown(cards.get(_premise_card(p))) or is_settled(cards[_premise_card(p)]))}
     reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
     gone = {i for i in covered & batch if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
     out: dict[str, Any] = {}
