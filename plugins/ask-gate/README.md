@@ -121,6 +121,33 @@ preservation; `tests/test_judge_unavailable.py` covers outages (class fallback, 
 deterministic checks still enforced, real refusals unchanged, no park advice on gate errors). Security prompt delivery and refusal handling are tested with a stub judge; real-model semantic
 accuracy and live UI/REST/CLI paths are not established by these plugin unit tests.
 
+### Cited evidence and vendor entitlements
+
+Why (five whys): an owner decision (grant a shared GitHub App Administration:read, or make a dedicated App) was
+refused four times. (1) The judge returned non-ok each time, suggesting a narrower token or the user's classic token.
+(2) It never saw the proof: tool results were stored head-only at 400 chars and rendered at 220, and the HTTP 422
+"permissions requested are not granted to this installation" and the 403 on the endpoint came after the echoed
+permission JSON. (3) The prompt said a missing API permission plus a broader credential on the sheet is
+agent_can_do "always", with no case for an App's own maximum permissions, which no token can exceed and GitHub has
+no API to change. (4) The structured path refused on any non-ok verdict, so an invented scope ("github-minter")
+refused just as a real one did; ordinary asks already discard ungrounded agent_can_do. (5) Nothing tested a long
+result whose failure is at the end, or entitlement versus credential requests.
+
+Fix: tool args/results are stored at 1600 chars and rendered at 220/360, keeping head and tail (`core.clip`). An
+explicit request also gets the calls its evidence names (same matching as the evidence check, up to 6) at full
+stored length. The structured prompt separates a missing credential (agent_can_do when a minter or broader scope
+could issue it and nothing failed) from a missing vendor entitlement (ok when the cited results show the vendor
+refusing the agent's own mint for that permission). It also rejects as `how` a retry of the failed mint, a
+permission the evidence shows failing, or a credential the request's scope excludes. A structured agent_can_do whose
+`how` names nothing on the sheet and no route used this turn is treated as ok, the same as for ordinary asks. A
+grounded agent_can_do and every unverified verdict still refuse.
+
+Tests: `tests/test_entitlement_evidence.py` (stub judge) covers tail survival in storage and rendering, the
+cited-evidence section and its limit to cited calls, invented-scope handling, and refusal kept for a real minter,
+for a route used this turn, and for unverified. Real-model accuracy is not covered by unit tests:
+`scripts/replay_entitlement.py` replays one entitlement and two credential requests through the live judge (run
+on hub 2026-10-29: 3/3 correct for each case).
+
 ## Approval-store reconciliation adapters
 
 Before judging an explicit `human_request` on create/block, `approval_reconciliation.preflight` consults

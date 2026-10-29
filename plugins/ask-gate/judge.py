@@ -95,11 +95,30 @@ This item is an explicit human_request, not a draft's incidental prose. Judge th
  Metadata is not authorization, never bypasses a security denial, and never unblocks or
  executes a task. Only return ok if the actual request is supported and safe; otherwise
  return unverified with a concrete safe check/correction in how.
+Missing CREDENTIAL versus missing ENTITLEMENT. A credential the agent holds or can mint lacking a
+ permission (a token without a scope, while a minter or broader scope on the sheet could issue one
+ with it, and no attempt failed) is agent_can_do. A vendor-side entitlement is different: the
+ maximum permission set of a GitHub App / OAuth app / integration installation, an org policy, a
+ plan. No token minted from that App and no other credential can exceed it, and GitHub has no API
+ to change a GitHub App's permissions: only the App owner can, in its settings page, and the
+ installation owner accepts. When the cited tool results show the agent's own mint for exactly the
+ needed permission refused by the vendor (e.g. HTTP 422 "The permissions requested are not granted
+ to this installation") and the narrower permissions it does have failing on the endpoint, a
+ request asking the owner to change the entitlement or choose an alternative is ok. Suggesting a
+ retry of that mint, a permission the evidence shows failing, or a credential the request's scope
+ explicitly excludes (e.g. "no classic token fallback") is not a valid how. Name in how only a
+ scope that literally appears on the capability sheet; never invent one.
 """
 
 
-def structured_llm(llm: Callable[[str, str], str]) -> Callable[[str, str], str]:
-    """Require an actual verdict for the single explicit request; ordinary chats stay fail-open."""
+def structured_llm(llm: Callable[[str, str], str], caps: str | None = None) -> Callable[[str, str], str]:
+    """Require an actual verdict for the single explicit request; ordinary chats stay fail-open.
+
+    One exception, the same rule ordinary asks get from ``parse_verdicts``: an agent_can_do whose `how` names
+    nothing in ``caps`` (the capability sheet plus this turn's tool-call arguments; an invented "github-minter"
+    scope) is speculation, not a refusal. Every other non-ok verdict, and agent_can_do naming a real scope or a
+    route used this turn, still refuses.
+    """
     def call(system: str, user: str) -> str:
         try:
             raw = llm(system + "\n" + STRUCTURED_SYSTEM, user)
@@ -114,9 +133,14 @@ def structured_llm(llm: Callable[[str, str], str]) -> Callable[[str, str], str]:
                 or items[0].get("i") != 0 or items[0].get("verdict") not in VERDICTS):
             raise ValueError("missing or malformed human_request judge verdict")
         # Do not let the ordinary parser's confidence/how fallbacks turn a refusal into ok.
-        if items[0]["verdict"] != "ok":
-            raise ValueError("human_request not verified: " + str(items[0].get("reason", ""))
-                             + "; " + str(items[0].get("how", "")))
+        verdict, how = items[0]["verdict"], str(items[0].get("how", ""))
+        if verdict == "agent_can_do" and caps is not None and not _grounded(how, caps):
+            return json.dumps({"asks": [{"i": 0, "verdict": "ok", "confidence": 1.0, "how": "",
+                                         "reason": "ungrounded agent_can_do (names no capability on the sheet): "
+                                                   + str(items[0].get("reason", ""))[:160]}]})
+        if verdict != "ok":
+            raise ValueError(f"human_request not verified ({verdict}): " + str(items[0].get("reason", ""))
+                             + "; " + how)
         return raw
     return call
 

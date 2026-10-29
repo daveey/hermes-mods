@@ -225,9 +225,17 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
     ledger_text = "\n".join(f"- {a['topic']} -> {a['answer']} ({core.fmt_ts(a['ts'])})" for a in led)
     pending = [asks[i] for i in remaining]
     base = llm or _llm()
-    verdicts = judge_mod.judge(pending, tools_text=core.render_tools(tools), user_msgs=_user_msgs(session_id),
-                              card_status=statuses, ledger_text=ledger_text, caps=core.capability_sheet(force=True),
-                              reply=reply, llm=judge_mod.structured_llm(base) if structured else base,
+    caps = core.capability_sheet(force=True)
+    tools_text = core.render_tools(tools)
+    # A route counts as real when the sheet lists it or this turn already used it (a scope in a tool call).
+    grounding = caps + "\n" + "\n".join(t["args"] for t in tools)
+    if structured:
+        # An explicit request is judged on the result its evidence cites, not on the 360-char excerpt of it.
+        cited = core.render_evidence(" ".join(pending), tools)
+        tools_text += ("\n\n" + cited) if cited else ""
+    verdicts = judge_mod.judge(pending, tools_text=tools_text, user_msgs=_user_msgs(session_id),
+                              card_status=statuses, ledger_text=ledger_text, caps=caps,
+                              reply=reply, llm=judge_mod.structured_llm(base, grounding) if structured else base,
                               ledger=[a for a in led if not a.get('retired')],
                               soft=[core.is_soft_ask(a) for a in pending])
     for v in verdicts:

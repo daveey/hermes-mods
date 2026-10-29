@@ -646,7 +646,8 @@ class TurnLog:
     def add(self, session: str, tool: str, args: Any, result: Any) -> None:
         with self._lock:
             lst = self._d.setdefault(session, [])
-            lst.append({"tool": tool, "args": _short(args, 400), "result": _short(result, 400), "t": time.time()})
+            lst.append({"tool": tool, "args": _short(args, STORE_CHARS), "result": _short(result, STORE_CHARS),
+                        "t": time.time()})
             del lst[:-60]
 
     def get(self, session: str) -> list[dict]:
@@ -670,8 +671,21 @@ def _short(v: Any, n: int) -> str:
             s = json.dumps(v, default=str)
         except (TypeError, ValueError):
             s = str(v)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s if len(s) <= n else s[: n - 1] + "…"
+    return clip(re.sub(r"\s+", " ", s).strip(), n)
+
+
+# Tool results put the verdict last (an HTTP 422 after the request echo, an exit code after the output), so a
+# head-only cut hid exactly the failure a human_request cites. Keep both ends.
+STORE_CHARS = 1600
+
+
+def clip(s: str, n: int) -> str:
+    """``s`` cut to at most ``n`` chars, keeping its head and its tail (where errors and exit codes are)."""
+    if len(s) <= n:
+        return s
+    head = max(1, n * 2 // 5)
+    tail = max(1, n - head - 3)
+    return s[:head] + " … " + s[-tail:]
 
 
 def tools_from_messages(turn_messages: list[Any]) -> list[dict]:
@@ -686,13 +700,13 @@ def tools_from_messages(turn_messages: list[Any]) -> list[dict]:
             for tc in g(m, "tool_calls") or []:
                 fn = g(tc, "function") or {}
                 ent = {"tool": g(fn, "name") or g(tc, "name") or "?",
-                       "args": _short(g(fn, "arguments") or g(tc, "arguments") or "", 400), "result": ""}
+                       "args": _short(g(fn, "arguments") or g(tc, "arguments") or "", STORE_CHARS), "result": ""}
                 calls[str(g(tc, "id"))] = ent
                 order.append(ent)
         elif role == "tool":
             ent = calls.get(str(g(m, "tool_call_id")))
             if ent is not None:
-                ent["result"] = _short(g(m, "content") or "", 400)
+                ent["result"] = _short(g(m, "content") or "", STORE_CHARS)
     return order
 
 
@@ -712,7 +726,21 @@ def merge_tool_logs(*logs: list[dict]) -> list[dict]:
 def render_tools(tools: list[dict], limit: int = 40) -> str:
     if not tools:
         return "(no tool calls this turn)"
-    return "\n".join(f"- {t['tool']}({t['args'][:220]}) -> {t['result'][:220]}" for t in tools[-limit:])
+    return "\n".join(f"- {t['tool']}({clip(t['args'], 220)}) -> {clip(t['result'], 360)}" for t in tools[-limit:])
+
+
+def evidence_calls(claim: str, tools: list[dict], max_calls: int = 6) -> list[dict]:
+    """The evidence-producing calls of this turn that ``claim`` names (same rule as ``checked_matches``), newest
+    last. The judge gets these at full stored length so it can read the result the evidence cites."""
+    return [t for t in tools if _names_call(claim, t)][-max_calls:]
+
+
+def render_evidence(claim: str, tools: list[dict]) -> str:
+    calls = evidence_calls(claim, tools)
+    if not calls:
+        return ""
+    return ("TOOL CALLS THE REQUEST'S EVIDENCE CITES (longer excerpts, head and tail kept):\n"
+            + "\n".join(f"- {t['tool']}({clip(t['args'], 500)}) -> {t['result']}" for t in calls))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -734,17 +762,18 @@ def checked_matches(claim: str, tools: list[dict]) -> bool:
     A claim matches a call if the call's tool name appears in it, or at least two distinctive claim tokens
     appear in the call's arguments or result. ``kanban_create``/``kanban_block`` and other writes never count.
     """
+    return any(_names_call(claim, t) for t in tools)
+
+
+def _names_call(claim: str, t: dict) -> bool:
+    if t["tool"] in _NON_EVIDENCE:
+        return False
     low = claim.lower()
-    toks = {t for t in re.findall(r"[a-z0-9_@./:-]{4,}", low) if t not in _STOP}
-    for t in tools:
-        if t["tool"] in _NON_EVIDENCE:
-            continue
-        if t["tool"].lower() in low:
-            return True
-        hay = (t["args"] + " " + t["result"]).lower()
-        if sum(1 for tok in toks if tok in hay) >= 2:
-            return True
-    return False
+    if t["tool"].lower() in low:
+        return True
+    toks = {w for w in re.findall(r"[a-z0-9_@./:-]{4,}", low) if w not in _STOP}
+    hay = (t["args"] + " " + t["result"]).lower()
+    return sum(1 for tok in toks if tok in hay) >= 2
 
 
 def validate_human_request(value: Any) -> dict[str, str]:
