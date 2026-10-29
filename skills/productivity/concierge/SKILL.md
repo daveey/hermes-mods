@@ -64,8 +64,12 @@ the user instead. After archiving, post one line per batch: count + titles.
 
 ## Sweep (sessions you didn't start never wake you)
 
-Keep a `ScheduleWakeup` heartbeat (~1200-1800s) while the ledger has open rows or the user is
-active. On each wakeup:
+Keep `watch.py` (next to this file) running in the background with `run_in_background`:
+`python3 <skill dir>/watch.py --interval 60 --ignore <this session id> --ignore-title-only`.
+It stats the app's session files every minute at no model cost and exits, printing what changed
+(a turn finished, a session waits on the user, a PR changed state, an archive). Its exit wakes
+you: update that session's title and tell the user, then start it again. Keep a long
+`ScheduleWakeup` (~1800s) as the fallback for a full sweep. On each wakeup:
 1. `list_sessions` (limit 60). Compare against the ledger and the previous sweep.
 2. Report rows that finished; archive per the rule.
 3. Note sessions idle and stuck (not running, last turn ended in an error or a question) and
