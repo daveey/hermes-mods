@@ -129,6 +129,35 @@ function Slot({ state, title, onClick }) {
   })
 }
 
+// CPU as load per core when the core count is known; RAM used; disk free. Grey when absent, "N min old" when stale.
+export function loadParts(load, now = Date.now()) {
+  if (!load) return null
+  const parts = []
+  if (typeof load.cpu_load1 === 'number')
+    parts.push(load.cpus
+      ? { key: 'cpu', label: 'CPU', pct: Math.min(100, Math.round((100 * load.cpu_load1) / load.cpus)), text: `${Math.round((100 * load.cpu_load1) / load.cpus)}%` }
+      : { key: 'cpu', label: 'load', pct: null, text: String(load.cpu_load1) })
+  if (typeof load.mem_used_pct === 'number')
+    parts.push({ key: 'ram', label: 'RAM', pct: Math.round(load.mem_used_pct), text: `${Math.round(load.mem_used_pct)}%` })
+  if (typeof load.disk_free_gb === 'number') {
+    const used = load.disk_total_gb ? Math.round(100 * (1 - load.disk_free_gb / load.disk_total_gb)) : null
+    parts.push({ key: 'disk', label: 'Disk', pct: used, text: `${Math.round(load.disk_free_gb)} GB free` })
+  }
+  return { parts, stale: load.stale ? `${ago(now - load.at).replace(' ago', '')} old` : null }
+}
+
+function Meters({ load, now }) {
+  const v = loadParts(load, now)
+  if (!v) return h('span', { className: 'hermes-fleet-load is-none' }, 'load not reported')
+  return h('span', { className: `hermes-fleet-load${v.stale ? ' is-stale' : ''}` },
+    ...v.parts.map((p) => h('span', { key: p.key, className: 'hermes-fleet-meter', 'data-meter': p.key, title: `${p.label} ${p.text}` },
+      `${p.label} `,
+      p.pct == null ? null : h('span', { className: `hermes-fleet-bar${p.pct >= 90 ? ' is-high' : ''}` },
+        h('span', { style: { width: `${p.pct}%` } })),
+      ` ${p.text}`)),
+    v.stale ? h('span', { className: 'hermes-fleet-meter' }, `(${v.stale})`) : null)
+}
+
 function openCard(run) {
   const hook = globalThis.__hermesKanbanOpenTask
   if (typeof hook === 'function' && hook(run.task, run.board, null) !== false) return
@@ -153,11 +182,12 @@ function GatewayRow({ m, now }) {
       })),
       ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] }))),
     h('span', { className: 'hermes-fleet-count' }, m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
-    h('span', { className: 'hermes-fleet-meta' }, [meta, m.reason].filter(Boolean).join(' · '))
+    h('span', { className: 'hermes-fleet-meta' }, [meta, m.reason].filter(Boolean).join(' · ')),
+    h(Meters, { load: m.load, now })
   )
 }
 
-function CiRow({ m }) {
+function CiRow({ m, now }) {
   const busy = m.slots.filter((s) => s.state === 'busy').length
   const offline = m.slots.filter((s) => s.state === 'offline').length
   return h('div', { className: 'hermes-fleet-row', 'data-machine': m.name },
@@ -166,6 +196,7 @@ function CiRow({ m }) {
       ...m.slots.map((s, i) => h(Slot, { key: s.runner || i, state: s.state, title: `${text(s.runner)} · ${SLOT_TITLE[s.state]}\n${s.labels.join(', ')}` }))),
     h('span', { className: 'hermes-fleet-count' }, `${busy}/${m.slots.length}`),
     h('span', { className: 'hermes-fleet-meta' }, [m.labels.join(', '), offline ? `${offline} offline` : null].filter(Boolean).join(' · ')),
+    m.load ? h(Meters, { load: m.load, now }) : null,
     ...m.warnings.map((w) => h('div', { key: w, className: 'hermes-fleet-warning' }, `⚠ ${text(w)}`))
   )
 }
@@ -193,7 +224,7 @@ export function Panel({ view, now }) {
       h('span', null, 'CI workers (GitHub Actions)'),
       h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
     h(SectionNote, { section: view.ci }),
-    ...view.ci.machines.map((m) => h(CiRow, { key: m.name, m })),
+    ...view.ci.machines.map((m) => h(CiRow, { key: m.name, m, now })),
     view.ci.hidden_deregistered
       ? h('div', { className: 'hermes-fleet-note' }, `${view.ci.hidden_deregistered} deregistered runners (history) hidden`)
       : null,
@@ -270,6 +301,12 @@ const CSS = `
 .hermes-fleet-count{text-align:right;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary)}
 .hermes-fleet-meta,.hermes-fleet-warning{grid-column:2/4;font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-meta:empty{display:none}
+.hermes-fleet-load{grid-column:2/4;display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--ui-text-secondary);font-variant-numeric:tabular-nums}
+.hermes-fleet-load.is-none,.hermes-fleet-load.is-stale{color:var(--ui-text-tertiary)}
+.hermes-fleet-meter{display:inline-flex;align-items:center;gap:3px;white-space:nowrap}
+.hermes-fleet-bar{display:inline-block;width:36px;height:5px;border-radius:3px;background:var(--ui-stroke-secondary);overflow:hidden}
+.hermes-fleet-bar>span{display:block;height:100%;background:var(--ui-text-secondary)}
+.hermes-fleet-bar.is-high>span{background:#d9822b}
 .hermes-fleet-warning{color:var(--ui-text-secondary)}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}

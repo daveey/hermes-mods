@@ -208,7 +208,8 @@ def _ci_section():
         return dict(state='not_configured', machines=[])
     if backend.config['owner_profile'] != active_profile():
         return dict(state='unavailable', reason='owner_profile_mismatch', machines=[])
-    return fleet.ci_workers(backend.inventory())
+    import time
+    return fleet.ci_workers(backend.inventory(), fleet.host_load(backend._snapshot(), time.time()))
 
 
 FLEET_CACHE_S = 5

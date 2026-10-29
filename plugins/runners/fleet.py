@@ -11,6 +11,17 @@ from pathlib import Path
 UNSEEN_MS = 10 * 60 * 1000
 # The core refreshes the registry every 60 s; three missed refreshes means the Board is not answering.
 REGISTRY_STALE_S = 180
+# Gateways report load every 30 s; older than this, the meters say how old.
+METRICS_STALE_MS = 2 * 60 * 1000
+_METRIC_KEYS = ('cpu_load1', 'cpus', 'mem_used_pct', 'disk_free_gb', 'disk_total_gb')
+
+
+def _load(raw, now_ms):
+    """Registry ``metrics`` -> ``{values..., at, stale}``, or None when never reported."""
+    if not isinstance(raw, dict) or not isinstance(raw.get('at'), (int, float)):
+        return None
+    out = {k: raw[k] for k in _METRIC_KEYS if isinstance(raw.get(k), (int, float))}
+    return dict(out, at=raw['at'], stale=now_ms - raw['at'] > METRICS_STALE_MS)
 # Labels every runner on a platform carries; they say nothing about the machine.
 _PLATFORM = {'self-hosted', 'linux', 'x64', 'macos', 'arm64', 'windows'}
 _SLOT_LABEL = re.compile(r'^ci-capacity-slot-\d+$')
@@ -88,6 +99,7 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
             labels=list(entry.get('labels') or []) if entry else [],
             pinned_only=bool(entry and entry.get('pinned_only')),
             slots=slots, slots_source=slots_source,
+            load=_load(entry.get('metrics'), now_ms) if entry else None,
             running=[dict(board=l['board'], task=l['task'], title=l['title'], started_at=l['started_at'])
                      for l in running]))
     return dict(state='unknown' if registry is None else ('stale' if stale else 'ready'), machines=rows)
@@ -111,7 +123,24 @@ def _slot(row, fresh):
     return 'offline' if row.get('registration') == 'offline' else 'unknown'
 
 
-def ci_workers(inventory):
+def host_load(snapshot, now_s):
+    """Collector host probes -> ``{host_id: load}`` (CPU load and free disk; the probe has no RAM)."""
+    out = {}
+    for host_id, result in ((snapshot or {}).get('host_results') or {}).items():
+        facts, at = result.get('facts') or {}, result.get('at')
+        if not isinstance(at, (int, float)):
+            continue
+        load = {}
+        if isinstance(facts.get('load'), list) and facts['load']:
+            load['cpu_load1'] = round(float(facts['load'][0]), 2)
+        if isinstance(facts.get('disk_free_bytes'), (int, float)):
+            load['disk_free_gb'] = round(facts['disk_free_bytes'] / 1024 ** 3, 1)
+        if load:
+            out[host_id] = dict(load, at=int(at * 1000), stale=(now_s - at) * 1000 > METRICS_STALE_MS)
+    return out
+
+
+def ci_workers(inventory, loads=None):
     """Group the collector inventory into machines; one GitHub runner = one slot.
 
     Deregistered (``missing``) runners are history, not slots: only their count is kept.
@@ -124,7 +153,9 @@ def ci_workers(inventory):
             hidden += 1
             continue
         key, ephemeral = machine_of(row.get('display_name'))
-        g = groups.setdefault(key, dict(name=key, ephemeral=ephemeral, slots=[], warnings=[]))
+        g = groups.setdefault(key, dict(name=key, ephemeral=ephemeral, slots=[], warnings=[], load=None))
+        if g['load'] is None and row.get('host_id') in (loads or {}):
+            g['load'] = loads[row['host_id']]
         g['slots'].append(dict(runner=row.get('display_name'), state=_slot(row, fresh),
                                labels=list(row.get('labels') or [])))
         if row.get('readiness') == 'fail' and row.get('registration') == 'online':

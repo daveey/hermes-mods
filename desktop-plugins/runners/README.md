@@ -10,6 +10,13 @@ Status-bar chip (order 6) and panel. Two groups, one row per machine, one square
   (`ec2-gwgen-2` → `ec2-gwgen`, `…-i-<instance>` → one ephemeral group). One runner = one slot. Deregistered
   runners are history: only their count is shown. A failed readiness check is a ⚠ line, not a red slot.
 
+Load: each gateway machine reports CPU load, RAM in use and disk space to the Board every 30 s (core
+`hermes_cli/machine_metrics.py` → `POST /v2/machines/me/metrics`, returned by `GET /v2/machines`). The row
+shows `CPU 50% · RAM 61% · Disk 57 GB free` with small bars (CPU = 1-min load ÷ cores; a bar at 90 % or more is
+orange), "load not reported" until the machine's core has the reporter, and "(N min old)" in grey after 2 min.
+CI machines show load and free disk only when the runners collector probes their host (no RAM there); the
+others have no meter line.
+
 Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`),
 red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing
 running is grey with "not seen for N min". A section the gateway cannot read says Unknown/Stale with the reason.
@@ -43,6 +50,9 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 - unreachable → backoff, stale last data, never red: "unreachable", `test_unreachable_registry_and_unseen_machines_are_unknown_not_failed`,
   `test_stale_registry_keeps_slots_but_not_liveness`
 - REST route, section isolation, 5 s server cache: `test_api.py` `test_fleet_route_*`
+- load meters reported / absent / stale, CI host probes: "load meters", `test_gateway_load_reported_absent_and_stale`,
+  `test_ci_machines_take_load_from_collector_host_probes` (reporter and Board route: core
+  `tests/hermes_cli/test_machine_metrics.py`, hermes-hub `worker/test/machines.test.ts`)
 - open panel updates in place, one request per poll, no polling while hidden: "open panel updates in place"
 
 Not covered: native Desktop rendering (checked by hand after hermes-sync).

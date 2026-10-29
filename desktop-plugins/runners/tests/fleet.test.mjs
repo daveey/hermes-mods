@@ -75,6 +75,26 @@ test('registry: each machine keeps its own cap whichever gateway answered last',
   assert.equal(hub.slots_source, 'local')
 })
 
+test('load meters: reported, absent and stale', async () => {
+  const body = fleet()
+  body.gateways.machines[0].load = { cpu_load1: 8, cpus: 16, mem_used_pct: 95.4, disk_free_gb: 57.2, disk_total_gb: 387, at: NOW - 30000, stale: false }
+  body.gateways.machines[1].load = { cpu_load1: 1, cpus: 8, at: NOW - 10 * 60000, stale: true }
+  body.ci.machines[1].load = { cpu_load1: 30.35, disk_free_gb: 24, at: NOW, stale: false }
+  const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
+  const hub = ui.container.querySelector('[data-machine="hub"] .hermes-fleet-load')
+  assert.equal(hub.textContent, 'CPU  50%RAM  95%Disk  57 GB free')
+  assert.equal(hub.querySelectorAll('.hermes-fleet-bar').length, 3)
+  assert.equal(hub.querySelectorAll('.is-high').length, 1, 'RAM ≥ 90% is highlighted')
+  const w1 = ui.container.querySelector('[data-machine="worker-1"] .hermes-fleet-load')
+  assert.ok(w1.classList.contains('is-stale'))
+  assert.match(w1.textContent, /CPU  13%\(10m old\)/)
+  assert.equal(ui.container.querySelector('[data-machine="mini"] .hermes-fleet-load').textContent, 'load not reported')
+  // CI: the collector's probe has load (no core count) and disk; machines without a probe show no meter line.
+  assert.match(ui.container.querySelector('[data-machine="mac-mini"] .hermes-fleet-load').textContent, /load\s+30.35.*24 GB free/)
+  assert.equal(ui.container.querySelector('[data-machine="ec2-gwgen"] .hermes-fleet-load'), null)
+  await ui.close()
+})
+
 test('live leases: busy slots name the card and open it on click', async () => {
   const opened = []
   globalThis.__hermesKanbanOpenTask = (id, board) => (opened.push([id, board]), true)

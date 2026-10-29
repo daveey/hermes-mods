@@ -96,3 +96,30 @@ def test_stale_registry_keeps_slots_but_not_liveness():
     (m,) = out['machines']
     assert m['slots'] == 16
     assert (m['state'], m['reason']) == ('unknown', 'Board not answering; registry read 10 min ago')
+
+
+def test_gateway_load_reported_absent_and_stale():
+    reg = _registry(hub=dict(metrics=dict(cpu_load1=8.0, cpus=16, mem_used_pct=61.2, disk_free_gb=57, disk_total_gb=387, at=NOW - 30_000)),
+                    mini=dict(metrics=dict(cpu_load1=1.0, cpus=8, at=NOW - 10 * MIN)),
+                    macbook={}, junk=dict(metrics=dict(cpus=4)))  # no server time: ignored
+    m = {r['name']: r for r in fleet.gateway_workers(reg, [], NOW)['machines']}
+    assert m['hub']['load'] == dict(cpu_load1=8.0, cpus=16, mem_used_pct=61.2, disk_free_gb=57, disk_total_gb=387,
+                                    at=NOW - 30_000, stale=False)
+    assert m['mini']['load']['stale'] is True
+    assert m['macbook']['load'] is None and m['junk']['load'] is None
+
+
+def test_ci_machines_take_load_from_collector_host_probes():
+    snapshot = dict(host_results={
+        'h-mini': dict(at=1000.0, facts=dict(load=[30.35, 21.0, 17.5], disk_free_bytes=24 * 1024 ** 3)),
+        'h-old': dict(at=100.0, facts=dict(load=[1.0])),
+        'h-none': dict(at=1000.0, facts={})})
+    loads = fleet.host_load(snapshot, 1010.0)
+    assert loads['h-mini'] == dict(cpu_load1=30.35, disk_free_gb=24.0, at=1_000_000, stale=False)
+    assert loads['h-old']['stale'] is True and 'h-none' not in loads
+    inv = dict(meta=dict(freshness='fresh'), data=dict(runners=[
+        dict(display_name='mac-mini', host_id='h-mini', registration='online', activity='idle', freshness='fresh', labels=[]),
+        dict(display_name='ec2-x-1', host_id=None, registration='online', activity='idle', freshness='fresh', labels=[])]))
+    m = {g['name']: g for g in fleet.ci_workers(inv, loads)['machines']}
+    assert m['mac-mini']['load']['cpu_load1'] == 30.35
+    assert m['ec2-x']['load'] is None
