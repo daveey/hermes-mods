@@ -135,7 +135,8 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
     option was deliberately not taken, and a reminder that an already-open request "needs a Mac name, or
     'Wait'" (published as a duplicate of that request, more than once).
   - State settled facts as statements. Put a genuine decision in one `action_request`; when one is already
-    open, refer to it by its subject ("the build-Mac request is still open") without telling him what to answer.
+    open, don't restate it at all: the For you panel already shows it. Even a neutral closing list ("You still
+    have two decisions in For you: …") or a "Your choices: Yes / Change / No" block gets published as a duplicate.
   - After each reply, check the hook's open-request list for an auto-filed duplicate or stale prompt and
     remove it with `action_request {"withdraw": {"requestId", "reason"}}` (alone, no `request`); readback
     shows `state: withdrawn`. To correct one that is still needed, re-send it with its `requestId` and
