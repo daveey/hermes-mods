@@ -61,6 +61,11 @@ def probe_anthropic_dispatch():
         _anthropic_log_context=lambda: 'fixture',
     )
     agent._try_refresh_anthropic_client_credentials = lambda: ClientLifecycleMixin._try_refresh_anthropic_client_credentials(agent)
+    # Core split the refresh into these helpers; bind the real ones too, or the refresh dies on
+    # AttributeError (swallowed) and the probe reports a fixture artifact, not core behavior.
+    for name in ('_resolve_anthropic_refresh_token', '_adopt_anthropic_token'):
+        if hasattr(ClientLifecycleMixin, name):
+            setattr(agent, name, getattr(ClientLifecycleMixin, name).__get__(agent))
     # Capture which key the actual request-client constructor receives, without HTTP.
     agent._request_anthropic_client_key = lambda: ('anthropic', agent._anthropic_api_key)
     agent._build_anthropic_client_for_key = lambda key: SimpleNamespace(selected_key=key[1])

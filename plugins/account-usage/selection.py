@@ -89,8 +89,38 @@ def failure_identity(original):
     return identity
 
 
+MANAGED_ROUTING_REFUSAL = ('Account selection is unavailable while managed model routing is on: '
+                           'core pins each chat to its routed subscription account')
+
+
+def managed_routing_refusal(agent=None):
+    """Refusal text when core model routing owns credential choice, else None.
+
+    Core's subscription fence (model_routing_managed.verify_main_sdk and
+    model_routing_runtime.verify_class_runtime) requires the request client to
+    carry the pool's CURRENT OAuth entry, and a class-routed pool may restrict
+    auth types. A request-local snapshot of another account can satisfy neither,
+    so a manual choice is refused here, visibly, instead of failing inside core
+    (or, with a class route but no enforcement, bypassing the auth-type fence).
+    """
+    if agent is not None and getattr(agent, 'model_routing', None):
+        return MANAGED_ROUTING_REFUSAL
+    try:
+        from agent.model_routing_managed import managed_config
+    except ImportError:  # core predates managed routing
+        return None
+    try:
+        enforced = managed_config() is not None
+    except Exception:
+        return MANAGED_ROUTING_REFUSAL  # an invalid policy never widens access
+    return MANAGED_ROUTING_REFUSAL if enforced else None
+
+
 def dispatch_snapshot(agent, snapshot, next_call, request):
     clear_attempt(agent)
+    refusal = managed_routing_refusal(agent)
+    if refusal:
+        raise SelectionRejected(refusal)
     reject_identity_headers(request.get('extra_headers'))
     if request.get('model', snapshot.model) != snapshot.model:
         raise SelectionRejected('Request model changed before dispatch')
@@ -298,6 +328,14 @@ class CredentialSnapshot:
     token: str = field(repr=False)
 
 
+def _codex_entitled(token, model):
+    try:
+        from agent.codex_entitlements import codex_entry_entitled_for_model
+    except ImportError:  # core predates the Codex plan gate
+        return True
+    return codex_entry_entitled_for_model(token, model)
+
+
 def choose_snapshot(entries, *, provider, model, account_id, base_url):
     """Validate an authoritative, already-hydrated read-only row snapshot.
 
@@ -329,6 +367,9 @@ def choose_snapshot(entries, *, provider, model, account_id, base_url):
         until = _exhausted_until(e, sole_credential=sole)
         if until is not None and until > now or model_cooldown_until(e, model) is not None:
             raise SelectionRejected('Account is cooling down for this model')
+        if provider == 'openai-codex' and not _codex_entitled(e.runtime_api_key, model):
+            # Same plan gate core's pool selection applies (codex_entitlements).
+            raise SelectionRejected('Account is not entitled to this model')
         if e.expires_at_ms is not None and e.expires_at_ms / 1000 <= now + 30:
             continue
         if e.expires_at:
@@ -811,7 +852,9 @@ class ExecutionIntegration:
             pass
 
     def disable(self):
-        self.error = 'Account selection compatibility check failed; reload after re-auditing the plugin'
+        # Reloading never helps: the pinned core seams changed. Name the fix.
+        self.error = ('Account selection is off: Hermes core changed under its audited seams; '
+                      're-audit and refresh plugins/account-usage/execution-compatibility.json')
         _install_failures[self.home] = self.error
 
     def abandon(self):
@@ -1094,6 +1137,9 @@ class SelectionService:
     def put(self, runtime_id, *, provider, account_id, expected_revision):
         if self.home in _install_failures:
             raise SelectionRejected(_install_failures[self.home])
+        refusal = managed_routing_refusal()
+        if refusal:
+            raise SelectionRejected(refusal)
         with owner_scope(runtime_id, profile_home=self.home, server=self.server) as owner:
             if provider != owner.provider:
                 raise SelectionRejected('Selected provider does not match this chat')

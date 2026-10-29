@@ -22,6 +22,14 @@ def selection():
     return module
 
 
+def unmanaged(test):
+    """Hermetic default: core managed model routing OFF, whatever the host config says.
+    Tests that need it on patch managed_config themselves (ManagedRouting below)."""
+    p = patch('agent.model_routing_managed.managed_config', return_value=None)
+    p.start()
+    test.addCleanup(p.stop)
+
+
 def entry(id='B', **kw):
     args = dict(provider='anthropic', id=id, label='same label', auth_type='oauth',
                 priority=0, source='fixture', access_token=f'sk-ant-oat01-fixture-{id}',
@@ -65,7 +73,88 @@ class ReadOnlySelection(unittest.TestCase):
             s.choose_snapshot([], provider='anthropic', model='claude-fixture',
                               account_id='removed', base_url='https://api.anthropic.com')
 
+def codex_token(plan):
+    import base64
+    import json
+    claims = {'exp': time.time() + 3600, 'https://api.openai.com/auth': {'chatgpt_plan_type': plan}}
+    body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')
+    return f'eyJhbGciOiJub25lIn0.{body}.sig'
+
+
+class ManagedRouting(unittest.TestCase):
+    """Core's subscription fence owns credential choice under model routing; selection refuses it."""
+    managed = {'model_routing': {'enabled': True, 'enforce_subscription_only': True}}
+
+    def snapshot(self, s):
+        return s.CredentialSnapshot('anthropic', 'claude-fixture', 'account-B', 'B',
+                                    'https://api.anthropic.com', 'fixture-B')
+
+    def agent(self, **kw):
+        from types import SimpleNamespace
+        return SimpleNamespace(provider='anthropic', model='claude-fixture',
+                               base_url='https://api.anthropic.com', **kw)
+
+    def test_enforced_policy_refuses_dispatch_before_downstream_or_failure_attribution(self):
+        s = selection()
+        a = self.agent()
+        with patch('agent.model_routing_managed.managed_config', return_value=self.managed):
+            with self.assertRaisesRegex(s.SelectionRejected, 'managed model routing'):
+                s.dispatch_snapshot(a, self.snapshot(s), lambda r: self.fail('downstream reached'), {})
+        self.assertNotIn('_account_usage_failed_attempt', vars(a))
+        self.assertIsNone(s.current_snapshot(a))
+
+    def test_class_routed_agent_refused_even_without_enforcement(self):
+        s = selection()
+        a = self.agent(model_routing={'billing_group': 'subscription', 'requested_class': 'fast'})
+        with patch('agent.model_routing_managed.managed_config', return_value=None):
+            with self.assertRaisesRegex(s.SelectionRejected, 'managed model routing'):
+                s.dispatch_snapshot(a, self.snapshot(s), lambda r: self.fail('downstream reached'), {})
+
+    def test_unreadable_policy_fails_closed(self):
+        s = selection()
+        with patch('agent.model_routing_managed.managed_config', side_effect=ValueError('bad policy')):
+            self.assertEqual(s.managed_routing_refusal(), s.MANAGED_ROUTING_REFUSAL)
+
+    def test_unmanaged_unrouted_dispatch_still_reaches_downstream(self):
+        s = selection()
+        a = self.agent()
+        with patch('agent.model_routing_managed.managed_config', return_value=None):
+            seen = s.dispatch_snapshot(a, self.snapshot(s), lambda r: s.current_snapshot(a), {})
+        self.assertEqual(seen.entry_id, 'B')
+
+    def test_put_refuses_before_queuing_anything(self):
+        import tempfile
+        s = selection()
+        with tempfile.TemporaryDirectory() as home:
+            service = s.SelectionService(home)
+            with patch('agent.model_routing_managed.managed_config', return_value=self.managed), \
+                 patch.object(s, 'owner_scope', side_effect=AssertionError('owner resolved')):
+                with self.assertRaisesRegex(s.SelectionRejected, 'managed model routing'):
+                    service.put('runtime-A', provider='anthropic', account_id='x', expected_revision=0)
+            self.assertFalse((Path(home) / 'account_usage_selection.sqlite3').exists())
+
+    def test_codex_choice_applies_core_plan_gate(self):
+        s = selection()
+        base = 'https://chatgpt.com/backend-api/codex'
+        for plan, allowed in (('free', False), ('plus', True)):
+            with self.subTest(plan=plan):
+                row = entry('C', provider='openai-codex', access_token=codex_token(plan), base_url=base)
+                choose = lambda: s.choose_snapshot([row], provider='openai-codex', model='gpt-6-astra',
+                    account_id=_identity_id_for('openai-codex', row), base_url=base)
+                if allowed:
+                    self.assertEqual(choose().entry_id, 'C')
+                else:
+                    with self.assertRaisesRegex(s.SelectionRejected, 'not entitled'):
+                        choose()
+                # A non-gated model never consults the plan.
+                self.assertEqual(s.choose_snapshot([row], provider='openai-codex', model='gpt-fixture',
+                    account_id=_identity_id_for('openai-codex', row), base_url=base).entry_id, 'C')
+
+
 class RequestLocalDispatch(unittest.TestCase):
+    def setUp(self):
+        unmanaged(self)
+
     def test_anthropic_sdk_sends_selected_key_without_mutating_agent(self):
         import httpx
         import anthropic

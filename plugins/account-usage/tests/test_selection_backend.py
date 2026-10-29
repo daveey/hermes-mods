@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, '/Users/daveey/.hermes/hermes-agent')
 import hermes_bootstrap
 sys.path.insert(0, str(Path(__file__).parent))
-from test_request_selection import selection, entry
+from test_request_selection import selection, entry, unmanaged
 from hermes_cli.active_sessions import try_acquire_active_session
 from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
@@ -31,6 +31,7 @@ def remote_lease(home, ready, release):
 
 class Backend(unittest.TestCase):
     def setUp(self):
+        unmanaged(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)

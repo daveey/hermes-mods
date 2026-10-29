@@ -14,7 +14,9 @@ class Combined(unittest.TestCase):
     def setUp(self):
         gc.collect()
         import tempfile
-        temp = patch.object(tempfile, 'tempdir', '/Users/daveey/.hermes/cache/scratch')
+        scratch = Path.home() / '.hermes' / 'cache' / 'scratch'  # any host, not one user's Mac path
+        scratch.mkdir(parents=True, exist_ok=True)
+        temp = patch.object(tempfile, 'tempdir', str(scratch))
         temp.start()
         self.addCleanup(temp.stop)
         Backend.setUp(self)
