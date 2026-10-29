@@ -355,12 +355,12 @@ class Detector:
         now = self.clock()
         st = self._load()
         last_ts = st.get("last_ts")
-        if last_ts is not None and 0 <= now - last_ts < self.cfg["min_interval_s"] - 3:
+        if last_ts is not None and 0 <= now - last_ts < max(30, self.cfg["min_interval_s"]):
             return {"action": "skipped_too_soon"}
         out = self.ps_fn()
         rows = (parse_ps(out) if out else None) or None  # unparseable/empty table = no sample
         if rows is None:
-            # no sample: keep the old baseline; the next interval will be long (gap) and so incomplete
+            # Keep the baseline for CPU accounting, but invalidate evidence across the failed sample.
             st["last_failure"] = now
             self._save(st)
             return {"action": "ps_failed"}
@@ -371,10 +371,13 @@ class Detector:
             # first run, lost state, or the wall clock stepped back: re-baseline, drop the window and streak
             evaluate_idle(self.probes, rows, now, now, self.registry, None, seen)
             st.update(last_ts=now, snap=_jsonable_snap(cur), window=None, streak=[], probe_prev=seen)
+            st.pop("last_failure", None)  # failures before this fresh baseline cannot spoil its window
             self._save(st)
             return {"action": "baseline" if last_ts is None or "snap" not in st else "clock_back"}
         prev = _load_snap(st["snap"])
         acc = account_interval(prev, cur, self.services, last_ts, now, self.cfg["max_gap_s"])
+        if st.pop("last_failure", None) is not None:
+            acc["reasons"].append("ps_failed")
         idle, evidence = evaluate_idle(self.probes, rows, now, last_ts, self.registry, st.get("probe_prev", {}), seen)
         win = st.get("window") or {"start": last_ts, "cpu": {}, "wall_s": 0.0, "intervals": 0,
                                     "bad": [], "evidence": []}

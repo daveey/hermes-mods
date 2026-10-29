@@ -291,6 +291,43 @@ def test_incomplete_sample_gap_ps_failure_and_too_soon(tmp_path):
     assert sim.det._load()["window"]["wall_s"] == before
 
 
+@pytest.mark.parametrize("dt", [27, 28, 29.99])
+def test_thirty_seconds_is_a_hard_minimum(tmp_path, dt):
+    sim = Sim(tmp_path)
+    start(sim)
+    assert sim.step(dt, 120)["action"] == "skipped_too_soon"
+
+
+def test_short_ps_failure_invalidates_window_even_without_long_gap(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(270, 120)
+    sim.ps_ok = False
+    assert sim.step(30, 120)["action"] == "ps_failed"
+    sim.ps_ok = True
+    sim.run(300, 120)  # next success is only 60 seconds after previous success
+    assert sim.windows()[-1]["window"] == "incomplete"
+    assert sim.runner.calls == []
+    sim.run(600, 120)
+    assert sim.windows()[-1]["window"] == "idle_over"
+    assert sim.runner.calls == []  # failure must also break consecutive-over streaks
+
+
+@pytest.mark.parametrize("clock_back", [False, True])
+def test_failure_before_fresh_baseline_does_not_taint_new_window(tmp_path, clock_back):
+    sim = Sim(tmp_path)
+    if clock_back:
+        start(sim)
+    sim.ps_ok = False
+    sim.step(30, 120)
+    sim.ps_ok = True
+    if clock_back:
+        sim.now -= 300
+    assert sim.step(30, 120)["action"] in ("baseline", "clock_back")
+    sim.run(600, 120)
+    assert sim.windows()[-1]["window"] == "idle_over"
+
+
 def test_corrupt_state_restarts_from_baseline(tmp_path):
     sim = Sim(tmp_path)
     start(sim)
