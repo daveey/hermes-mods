@@ -17,14 +17,21 @@ the outcome and feeds core the two things only plugins know: open user decisions
     "eta"?}]}` declares `{"kind": "waiting", "on": [...]}`.
 - **Provider** `user-steps`: user-steps `open_steps(sid)` → `{"decision_items": [...], "waiting_on": []}`, or None
   when the chat has no open steps.
-- **Judge**: is the last assistant message a closing summary? One call on the subscription pool
+- **Judge**: is the last assistant message a closing summary? Desktop, tui and cli chats only: any other
+  `source=` (core passes it), or a session row whose source is known and not interactive, gets None with no model
+  call. One call on the subscription pool
   (`pool-llm`'s `complete`, `anthropic`, `fast` tier) with a 3 s budget. YES → True, NO → False, anything else,
   any error or a timeout → None (core falls back to its heuristic). Verdicts are cached per (session, text).
-- **`pre_final_gate`** (buffered): when the turn made no `session_outcome` call, core does not already say
-  `decision`, `waiting` or `muted`, the chat has no open user-steps step, and the judge says the reply is NOT a
-  summary, the reply is held once with a request for the call. The nudge carries `[session-outcome]`. When it is
-  already in the turn (or this gate held earlier in the turn), the reply passes. It never asks twice in a turn.
-  An undecided judge never holds.
+- **`pre_final_gate`** (buffered): when the turn made no `session_outcome` call, it asks core
+  `derive_outcome(sid, ignore_live_turn=True, pending_reply=<the candidate reply>)`. Only
+  `unresolved{no_summary}` holds the reply, once, with a request for the call. Core's own precedence decides, so
+  decisions, waits and mutes pass, and an undecided judge falls back to core's heuristic. The nudge carries
+  `[session-outcome]`. When it is already in the turn (or this gate held earlier in the turn), the reply passes. It
+  never asks twice in a turn. A core whose `derive_outcome` lacks those keywords, or any error, passes.
+- **Per-turn call record**: a call is recorded as (session, tool call id) and counts only for a gate whose turn
+  holds that call id, so it never carries into the next turn.
+- **`decide` is all or nothing**: every item is validated before any write; a failed write or a rejected
+  declaration removes the steps this call added (pre-existing steps it matched are kept).
 - **No core**: without `hermes_state_outcome` the plugin loads, the tool is not offered, the gate passes and
   nothing registers.
 - Off switch: `HERMES_SESSION_OUTCOME_OFF=1`. Kanban workers and subagents are skipped.
@@ -35,6 +42,10 @@ the outcome and feeds core the two things only plugins know: open user decisions
 
 - each tool kind: done, wait, decide, and the malformed cases (no summary, unknown wait kind, fewer than 2 choices,
   core rejection);
+- decide is all or nothing: a bad later item writes nothing; a failed write or a rejected declaration keeps nothing
+  this call added;
+- the call record is per turn (same turn passes, the next turn and another chat are asked);
+- the judge skips non-interactive sources (by `source=` and by session row) without a model call;
 - decide writes ledger steps with options and choices, then declares;
 - the provider returns open steps as decision items;
 - the judge: YES/NO, timeout → None, failure or unclear answer → None, the default path calls pool `fast` tier;
@@ -46,9 +57,15 @@ the outcome and feeds core the two things only plugins know: open user decisions
 User-steps' `open_steps`, `add_step` and the assent-echo filter are tested in
 `plugins/user-steps/tests/test_outcome_helpers.py`.
 
+`tests/test_real_core.py` runs the gate against the REAL `hermes_state_outcome` from the session-outcome core
+worktree (`HERMES_OUTCOME_CORE_DIR`, default `~/code/_wt/session-outcome`) on a temp HERMES_HOME state.db: a live
+turn marker doesn't hide the reply, a non-summary is held once, a summary passes, an undecided judge falls back to
+core's heuristic, and an open user-steps step makes core say `decision`. It skips without that checkout or core's
+deps, so run it with the Hermes venv:
+
 ```sh
 uv run --with pytest python -m pytest -q -p no:cacheprovider plugins/session-outcome/tests
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q -p no:cacheprovider plugins/session-outcome/tests
 ```
 
-Untested: the real core wiring (core calls the provider and judge at refresh time), since `hermes_state_outcome` is
-not on main yet.
+Untested: core calling the provider and judge from its own refresh triggers (turn end, notice, card change).

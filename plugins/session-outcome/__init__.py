@@ -171,7 +171,30 @@ SCHEMA = {
     },
 }
 
-_CALLED: dict[str, float] = {}  # session -> time of its last session_outcome call (gate backup signal)
+# (session, tool_call_id) -> time of a session_outcome call. The gate counts it only when that call id is in the
+# turn it is checking, so a call never carries into the next turn's gate.
+_CALLED: dict[tuple[str, str], float] = {}
+_CALLED_TTL_S = 3600.0
+
+
+def _current_tool_call_id(explicit: str = "") -> str:
+    if explicit:
+        return str(explicit)
+    try:
+        from tools.approval_context import _approval_tool_call_id  # type: ignore
+
+        return str(_approval_tool_call_id.get() or "")
+    except Exception:
+        return ""
+
+
+def _note_call(session_id: str, tool_call_id: str) -> None:
+    now = time.time()
+    for key, at in list(_CALLED.items()):
+        if now - at > _CALLED_TTL_S:
+            _CALLED.pop(key, None)
+    if tool_call_id:
+        _CALLED[(session_id, tool_call_id)] = now
 
 
 def _err(msg: str) -> str:
@@ -228,7 +251,19 @@ def _validate(args: dict) -> dict:
     raise ValueError('kind must be "done", "decide" or "wait"')
 
 
-def handle(args: dict, session_id: str = "", **_: Any) -> str:
+def _rollback_steps(us, session_id: str, ids: list[str]) -> None:
+    """Remove steps this call added, so a failed decide leaves no tiles behind."""
+    if not ids:
+        return
+    try:
+        lg = us.Ledger()
+        with lg.edit(lg.root(session_id)) as d:
+            d["steps"] = [s for s in d["steps"] if s.get("id") not in ids]
+    except Exception:
+        log.exception("session-outcome: rolling back decide steps failed")
+
+
+def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -> str:
     try:
         if not session_id:
             return _err("no session")
@@ -240,17 +275,27 @@ def handle(args: dict, session_id: str = "", **_: Any) -> str:
             return _err(str(exc))
         api = _outcome_api()
         result: dict[str, Any] = {"ok": True}
+        added: list[str] = []
         if spec["kind"] == "done":
             outcome = {"kind": "done", "summary": spec["summary"]}
         elif spec["kind"] == "wait":
             outcome = {"kind": "waiting", "on": spec["on"]}
         else:
+            # Every item was validated above, before any write. Writes are all or nothing: a failed write or a
+            # rejected declaration removes the steps this call added.
             us = _user_steps()
             items = []
+            before = {s["id"] for s in us.open_steps(session_id)} if us is not None else set()
             for it in spec["items"]:
                 if us is not None:
-                    step = us.add_step(session_id, it["question"], it["choices"])
+                    try:
+                        step = us.add_step(session_id, it["question"], it["choices"])
+                    except Exception as exc:
+                        _rollback_steps(us, session_id, added)
+                        return _err(f"decide not recorded (nothing written): {exc}")
                     sid = step["id"]
+                    if sid not in before:
+                        added.append(sid)
                 else:
                     sid = "us_" + uuid.uuid4().hex[:10]
                 item = {"id": sid, "question": it["question"], "choices": it["choices"], "state": "open"}
@@ -261,7 +306,6 @@ def handle(args: dict, session_id: str = "", **_: Any) -> str:
             result["steps"] = [i["id"] for i in items]
             if us is None:
                 result["note"] = "user-steps is not installed: no decision tiles were created"
-        _CALLED[session_id] = time.time()
         if api is None:
             result.update(declared=False, outcome=outcome,
                           note=(result.get("note", "") + " " if result.get("note") else "")
@@ -269,8 +313,12 @@ def handle(args: dict, session_id: str = "", **_: Any) -> str:
             return json.dumps(result)
         try:
             api.declare_outcome(session_id, outcome)
-        except (ValueError, TypeError) as exc:
-            return _err(f"outcome rejected: {exc}")
+        except Exception as exc:
+            us = _user_steps() if added else None
+            if us is not None:
+                _rollback_steps(us, session_id, added)
+            return _err(f"outcome rejected (nothing kept): {exc}")
+        _note_call(session_id, _current_tool_call_id(tool_call_id))
         result.update(declared=True, outcome=outcome)
         return json.dumps(result)
     except Exception as exc:  # never crash the agent loop
@@ -339,10 +387,16 @@ def _with_budget(fn: Callable[[], Any], budget: float) -> Any:
     return box.get("v")
 
 
-def judge(session_id: str, last_assistant_text: str) -> Optional[bool]:
-    """True = a closing summary, False = not, None = can't tell (core uses its heuristic)."""
+def judge(session_id: str, last_assistant_text: str, *, source: Optional[str] = None) -> Optional[bool]:
+    """True = a closing summary, False = not, None = can't tell (core uses its heuristic).
+
+    Only desktop/tui/cli chats are judged: any other ``source`` (or, when core passes none, a session row whose
+    source is known and not interactive) gets None without a model call."""
     text = last_assistant_text if isinstance(last_assistant_text, str) else ""
     if not text.strip():
+        return None
+    src = str(source or "").strip().lower() or _row_source(session_id)
+    if src and src not in INTERACTIVE:
         return None
     key = (session_id, hashlib.sha1(text.encode("utf-8", "replace")).hexdigest())
     if key in _JUDGED:
@@ -377,10 +431,22 @@ def _tool_names(msg: dict) -> list[str]:
     return names
 
 
+def _call_ids(msg: dict) -> list[str]:
+    ids = []
+    for call in msg.get("tool_calls") or []:
+        cid = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+        if cid:
+            ids.append(str(cid))
+    if msg.get("role") == "tool" and msg.get("tool_call_id"):
+        ids.append(str(msg["tool_call_id"]))
+    return ids
+
+
 def _called_this_turn(session_id: str, msgs: list) -> bool:
-    if any(TOOL in _tool_names(m) for m in msgs if isinstance(m, dict)):
+    msgs = [m for m in msgs if isinstance(m, dict)]
+    if any(TOOL in _tool_names(m) for m in msgs):
         return True
-    return bool(_CALLED.pop(session_id, None))
+    return any((session_id, cid) in _CALLED for m in msgs for cid in _call_ids(m))
 
 
 def _asked_this_turn(session_id: str, msgs: list, attempt: int) -> bool:
@@ -390,17 +456,15 @@ def _asked_this_turn(session_id: str, msgs: list, attempt: int) -> bool:
 
 
 def _would_be_no_summary(api, session_id: str, reply: str) -> bool:
-    """Would this reply leave the chat unresolved{no_summary}? Decisions, waits and mutes outrank the summary
-    check (derive precedence 1, 3, 4), so any of those means no. Otherwise it hinges on the reply being judged a
-    summary; an undecided judge (None) never holds."""
+    """Would this reply leave the chat unresolved{no_summary}? Core's own derivation answers, skipping the live
+    turn this gate runs inside and treating the unsaved candidate as the last assistant message (it calls the
+    judge, cached, and falls back to its heuristic). A core that can't do that, or any error, never holds."""
     try:
-        if (api.derive_outcome(session_id) or {}).get("kind") in ("decision", "waiting", "muted"):
-            return False
+        out = api.derive_outcome(session_id, ignore_live_turn=True, pending_reply=reply) or {}
     except Exception:
         log.debug("session-outcome derive failed", exc_info=True)
-    if provider(session_id):
         return False
-    return judge(session_id, reply) is False
+    return out.get("kind") == "unresolved" and out.get("reason") == "no_summary"
 
 
 def pre_final_gate(session_id: str = "", platform: str = "", final_response: str = "",

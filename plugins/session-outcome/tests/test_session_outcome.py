@@ -24,15 +24,29 @@ class FakeCore(types.ModuleType):
 
     def __init__(self):
         super().__init__("hermes_state_outcome")
-        self.declared, self.providers, self.judges, self.derived = [], {}, [], {}
+        self.declared, self.providers, self.judges, self.derived, self.derive_calls = [], {}, [], {}, []
 
     def declare_outcome(self, sid, outcome):
         if outcome.get("kind") not in ("done", "decision", "waiting", "running", "muted", "unresolved"):
             raise ValueError("bad kind")
         self.declared.append((sid, outcome))
 
-    def derive_outcome(self, sid):
-        return self.derived.get(sid, {"kind": "running", "source": "derived"})
+    def derive_outcome(self, sid, *, db=None, ignore_live_turn=False, pending_reply=None):
+        """Mimics core precedence: live turn, providers, then the judge (heuristic fallback) on the reply."""
+        self.derive_calls.append({"sid": sid, "ignore_live_turn": ignore_live_turn, "pending_reply": pending_reply})
+        if not ignore_live_turn:
+            return {"kind": "running", "source": "derived"}
+        if sid in self.derived:
+            return self.derived[sid]
+        for fn in self.providers.values():
+            got = fn(sid)
+            if got and got.get("decision_items"):
+                return {"kind": "decision", "items": got["decision_items"]}
+        text = pending_reply or ""
+        verdict = self.judges[-1](sid, text) if self.judges else None
+        if verdict is None:
+            verdict = len(text) >= 40 and not text.rstrip().endswith("?")
+        return {"kind": "done", "summary": text} if verdict else {"kind": "unresolved", "reason": "no_summary"}
 
     def refresh_outcome(self, sid, trigger):
         return self.derive_outcome(sid)
@@ -85,6 +99,11 @@ def fake(monkeypatch):
 def plugin(home, fake):
     mod = _load()
     mod._llm = lambda system, user: "NO"
+    mod.register(Ctx())
+    fake.providers.clear()
+    fake.judges.clear()
+    fake.register_outcome_provider("user-steps", mod.provider)
+    fake.register_outcome_judge(mod.judge)
     return mod
 
 
@@ -141,6 +160,40 @@ def test_decide_needs_two_choices_and_writes_nothing(plugin, fake, home):
     assert fake.declared == [] and not (home / "user-steps" / "S1.json").exists()
 
 
+def test_decide_validates_every_item_before_writing(plugin, fake, home):
+    good = {"question": "A or B?", "choices": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}]}
+    bad = {"question": "Only one?", "choices": [{"label": "Yes", "value": "y"}]}
+    out = call(plugin, {"kind": "decide", "items": [good, bad]})
+    assert not out["ok"] and "items[1]" in out["error"]
+    assert fake.declared == [] and not (home / "user-steps" / "S1.json").exists()
+
+
+def test_decide_failed_write_or_rejection_keeps_nothing(plugin, fake, home, monkeypatch):
+    us = plugin._user_steps()
+    keep = us.add_step("S1", "Pre-existing ask?", ["x", "y"])
+    items = [{"question": f"Q{i}?", "choices": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}]}
+             for i in range(3)]
+    real_add, n = us.add_step, {"i": 0}
+
+    def flaky(*a, **kw):
+        n["i"] += 1
+        if n["i"] == 2:
+            raise OSError("disk full")
+        return real_add(*a, **kw)
+    monkeypatch.setattr(us, "add_step", flaky)
+    out = call(plugin, {"kind": "decide", "items": items})
+    assert not out["ok"] and "nothing written" in out["error"]
+    assert [s["id"] for s in us.open_steps("S1")] == [keep["id"]] and fake.declared == []
+
+    monkeypatch.setattr(us, "add_step", real_add)
+    monkeypatch.setattr(fake, "declare_outcome", lambda sid, o: (_ for _ in ()).throw(ValueError("bad item")))
+    out = call(plugin, {"kind": "decide", "items": items + [{"question": "Pre-existing ask?",
+                                                              "choices": [{"label": "x", "value": "x"},
+                                                                          {"label": "y", "value": "y"}]}]})
+    assert not out["ok"] and "nothing kept" in out["error"]
+    assert [s["id"] for s in us.open_steps("S1")] == [keep["id"]]  # the pre-existing step survives
+
+
 def test_bad_kind_is_refused(plugin, fake):
     assert not call(plugin, {"kind": "maybe"})["ok"] and fake.declared == []
 
@@ -156,8 +209,6 @@ def test_core_rejection_is_reported(plugin, fake, monkeypatch):
 # ---- provider -----------------------------------------------------------------------------------------
 
 def test_provider_returns_open_steps(plugin, fake):
-    ctx = Ctx()
-    plugin.register(ctx)
     prov = fake.providers["user-steps"]
     assert prov("S1") is None
     call(plugin, {"kind": "decide", "items": [{"question": "Which region?", "choices": [
@@ -176,6 +227,18 @@ def test_judge_yes_no(plugin):
     assert plugin.judge("S1", "Deployed v2 and verified the health check.") is True
     plugin._llm = lambda s, u: "no."
     assert plugin.judge("S1", "Working on it, will report back.") is False
+
+
+def test_judge_only_interactive_sources(plugin):
+    calls = []
+    plugin._llm = lambda s, u: calls.append(u) or "YES"
+    for src in ("slack", "cron", "kanban"):
+        assert plugin.judge("S1", f"Finished the {src} job.", source=src) is None
+    assert plugin.judge("K1", "Finished the slack job, row source.") is None  # no source kwarg: row says slack
+    assert calls == []
+    assert plugin.judge("S1", "Deployed and verified.", source="tui") is True
+    assert plugin.judge("C1", "Deployed and verified, cli row.") is True
+    assert len(calls) == 2
 
 
 def test_judge_timeout_returns_none(plugin, monkeypatch):
@@ -235,21 +298,39 @@ def test_gate_asks_once_then_passes_second_miss(plugin):
 def test_gate_passes_when_tool_was_called(plugin):
     msgs = [{"role": "assistant", "tool_calls": [{"function": {"name": "session_outcome", "arguments": "{}"}}]}]
     assert gate(plugin, msgs=msgs) is None
-    call(plugin, {"kind": "done", "summary": "ok"})
-    assert gate(plugin) is None  # handler flag
 
 
-def test_gate_passes_summary_and_undecided_judge(plugin):
+def test_call_flag_is_per_turn(plugin, fake):
+    out = json.loads(plugin.handle({"kind": "done", "summary": "ok"}, session_id="S1", tool_call_id="call_A"))
+    assert out["declared"]
+    # same turn: the call's id is in the turn (here only as the tool result row, no tool name)
+    assert gate(plugin, msgs=[{"role": "tool", "tool_call_id": "call_A", "content": "{}"}]) is None
+    # next turn: that call does not carry over; the gate asks again
+    nxt = gate(plugin, msgs=[{"role": "user", "content": "and now?"}])
+    assert nxt and nxt["hold"]
+    # same call id in another chat does not count either
+    assert gate(plugin, sid="T1", platform="tui", msgs=[{"role": "tool", "tool_call_id": "call_A"}])["hold"]
+
+
+def test_gate_passes_summary_and_undecided_judge_uses_heuristic(plugin, fake):
     plugin._llm = lambda s, u: "YES"
     assert gate(plugin, reply="Merged #12 and deployed; health check green.") is None
+    assert fake.derive_calls[-1] == {"sid": "S1", "ignore_live_turn": True,
+                                     "pending_reply": "Merged #12 and deployed; health check green."}
     plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
-    assert gate(plugin, reply="Something else entirely.") is None
+    assert gate(plugin, reply="Rebased, fixed both failing tests and pushed; CI is green.") is None
+    assert gate(plugin, reply="Hmm?")["hold"]
+
+
+def test_gate_fails_open_on_old_core_signature(plugin, fake, monkeypatch):
+    monkeypatch.setattr(fake, "derive_outcome", lambda sid: {"kind": "unresolved", "reason": "no_summary"})
+    assert gate(plugin) is None
 
 
 def test_gate_passes_when_decision_or_wait_outranks(plugin, fake):
     fake.derived["S1"] = {"kind": "waiting", "on": [{"kind": "card", "id": "t_1"}]}
     assert gate(plugin) is None
-    fake.derived["S1"] = {"kind": "running"}
+    del fake.derived["S1"]
     call(plugin, {"kind": "decide", "items": [{"question": "A or B?", "choices": [
         {"label": "A", "value": "a"}, {"label": "B", "value": "b"}]}]})
     plugin._CALLED.clear()
@@ -282,6 +363,8 @@ def test_non_interactive_session_refused_and_not_gated(plugin, fake):
 
 
 def test_register_wires_tool_gate_provider_and_judge(plugin, fake):
+    fake.providers.clear()
+    fake.judges.clear()
     ctx = Ctx()
     plugin.register(ctx)
     assert ctx.tools["session_outcome"]["schema"]["name"] == "session_outcome"
