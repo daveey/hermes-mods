@@ -16,7 +16,7 @@ Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call`
 | Gate | Refuses | Paths |
 |---|---|---|
 | A | editing your **own** card's title/body (`--priority`, other cards, comments stay allowed) | `hermes kanban edit <own id or $HERMES_KANBAN_TASK> --title/--body` via `terminal`, `process`, `execute_code`, `tool_call` |
-| B | completing your own card when the handoff, meaning the summary **and every text value in its `metadata`** (`not_done`, `remaining`, nested lists), admits dropped, deferred, unrun or unverified work (incl. plain "not verified / not performed / not checked / not confirmed / not tested"), unless the handoff names a follow-up card `t_xxxxxxxx` that exists (any board), is open or done (not archived), and was created by this card (`creator_task_id`) or is linked to it | `kanban_complete` tool (direct or via `tool_call`), `hermes kanban complete <own> --summary/--result/--metadata` via shell or `execute_code` |
+| B | completing your own card when the handoff, meaning the summary **and every text value in its `metadata`** (`not_done`, `remaining`, nested lists), admits dropped, deferred, unrun or unverified work (incl. plain "not verified / not performed / not checked / not confirmed / not tested"), unless the handoff names a follow-up card `t_xxxxxxxx` that exists (any board), is open or done (not archived), and was created by this card (`creator_task_id`) or is linked to it | `kanban_complete` tool (direct or via `tool_call`), `hermes kanban complete <own> --summary/--result/--metadata` via shell or `execute_code`. `execute_code` is not run: shell text is the decoded Python string value (`ast`, so a `repr`-escaped command is the command the shell would see). A command that exists only as a runtime value is not recovered |
 | D | completing your own card when its body or comments name an origin chat (`origin … @session:X`, e.g. "Origin chat: @session:default@macbook/X") that is not linked to the card: no unreleased `task_chat_links` row, no notify subscription (`tui` X, or `hub` `<gw>/<profile>/X`), and no `follow-through: SENT … X` comment. The refusal tells the worker to send the chat the result with `cross_session` and record that comment (workers are fenced from `hermes kanban notify-subscribe` on their own board), or `kanban_block` if the send fails. Double-quoted text is skipped | same paths as B |
 | E | (any session, not only workers) `kanban_create` whose title/body names an origin chat on **another** gateway (`origin … @session:<profile>@<gw>/<id>`, `<gw>` a known hermes-hub gateway) without `origin_session` (or `HERMES_ORIGIN_SESSION`) binding that chat. The refusal gives the exact `origin_session='…'` to pass, which subscribes the chat so it sees the card and its completion. Fails open when this gateway has no hermes-hub name | `kanban_create` tool (direct or via `tool_call`) |
 
@@ -51,6 +51,11 @@ unverified", scoping notes like "the other test files were not run").
 `tests/test_title_context.py` covers the exact deferred-cleanup defect title: completed handoffs pass,
 while real summary/nested-metadata admissions are refused through the tool, tool wrapper, terminal, and
 triple-quoted execute_code paths. It also checks explicit title overrides and sidebar attention.
+
+`tests/test_escaped_execute_code.py` covers the same summary and nested-metadata admissions, and a clean
+handoff, through `terminal({command!r})` and triple-quoted strings (including a multi-line literal and
+implicit concatenation). Parsing does not execute the snippet. A syntax error still decodes quote-delimited
+literals. Own-card edits stay refused, including when the edit command is `repr`-escaped.
 
 Replay with metadata, "not verified" and Gate D (hub, Oct 28 2026, 14 days, 399 completed cards): B would refuse 15
 (was 2; the new ones are real admissions such as "CI not yet checked", about 2 false); D would refuse 16, every one a

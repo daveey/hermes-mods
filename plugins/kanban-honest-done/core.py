@@ -5,6 +5,7 @@ Pure functions plus small read-only board queries, so tests can drive them with 
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shlex
@@ -518,22 +519,78 @@ def check_shell(command: str, own: str, paths_fn) -> Optional[str]:
     return None
 
 
-_PY_EDIT_RE = re.compile(r"kanban\s+edit\s+[\"']?(t_[0-9a-f]{8}(?:[0-9a-f]{8})?|\$\{?HERMES_KANBAN_TASK\}?)[\"']?[^\n]*?--(?:title|body)\b")
+_PY_EDIT_RE = re.compile(r"kanban\s+edit\s+[\"']?(t_[0-9a-f]{8}(?:[0-9a-f]{8})?|\$\{?HERMES_KANBAN_TASK\}?)[\"']?[^\\n]*?--(?:title|body)\b")
+# Quote-delimited literals on one line, optional raw/format/bytes prefix. Fallback only: ``ast.parse`` is preferred.
+_PY_STR_RE = re.compile(
+    r"(?:[rRuUbBfF]{1,2})?(?:\"\"\"|''').*?(?:\"\"\"|''')"
+    r"|(?:[rRuUbBfF]{0,2})\"(?:[^\"\\]|\\.)*\""
+    r"|(?:[rRuUbBfF]{0,2})'(?:[^'\\]|\\.)*'"
+)
+
+
+def _literal_string(src: str) -> Optional[str]:
+    """Decode one quote-delimited literal. ``ast.literal_eval`` does not execute it."""
+    i = 0
+    while i < len(src) and i < 3 and src[i] in "rRuUbBfF":
+        i += 1
+    if i and i < len(src) and src[i] in "\"'":
+        if "b" in src[:i].lower():
+            return None
+        src = "".join(c for c in src[:i] if c in "rR") + src[i:]
+    try:
+        val = ast.literal_eval(src)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return None
+    return val if isinstance(val, str) else None
+
+
+def _regex_string_literals(code: str) -> list[str]:
+    """Decoded quote-delimited literals. Used when ``code`` is not valid Python."""
+    out: list[str] = []
+    for line in code.splitlines():
+        for m in _PY_STR_RE.finditer(line):
+            val = _literal_string(m.group(0))
+            if val is not None:
+                out.append(val)
+    return out
+
+
+def _python_string_values(code: str) -> list[str]:
+    """String values in ``code``, with Python escapes decoded, without executing it.
+
+    ``ast.parse`` recovers escapes, raw strings, implicit concatenation and multi-line
+    literals. An f-string interpolation is not evaluated: only its constant parts are
+    visible. Invalid syntax falls back to quote-delimited literals via ``ast.literal_eval``.
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return _regex_string_literals(code)
+    out: list[str] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value not in seen:
+            seen.add(node.value)
+            out.append(node.value)
+    return out
 
 
 def check_python(code: str, own: str, paths_fn) -> Optional[str]:
-    """execute_code: the same shell checks on every string literal-ish line, plus a direct edit regex."""
+    """execute_code: shell checks on decoded string literals, plus a direct edit regex.
+
+    The value checked is what ``terminal()`` would receive. ``terminal({command!r})`` is
+    therefore the shell command, not source text that still contains ``\\\\'``. The snippet
+    is not executed, so a command that exists only as a runtime value is not recovered.
+    """
     for m in _PY_EDIT_RE.finditer(code or ""):
         if _is_own(m.group(1), own):
             return EDIT_REFUSAL
-    for line in (code or "").splitlines():
-        if "kanban" in line and ("complete" in line or "edit" in line):
-            for lit in re.findall(r"(?:\"\"\"|''')(.*?)(?:\"\"\"|''')|\"((?:[^\"\\]|\\.)*)\"|'((?:[^'\\]|\\.)*)'", line):
-                cmd = next((x for x in lit if x), "")
-                if "kanban" in cmd:
-                    why = check_shell(cmd, own, paths_fn)
-                    if why:
-                        return why
+    for cmd in _python_string_values(code or ""):
+        if "kanban" not in cmd or ("complete" not in cmd and "edit" not in cmd):
+            continue
+        why = check_shell(cmd, own, paths_fn)
+        if why:
+            return why
     return None
 
 
