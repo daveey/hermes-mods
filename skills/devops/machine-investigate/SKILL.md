@@ -8,6 +8,7 @@ metadata:
   hermes:
     tags: [devops, load, disk, macos, linux, runners]
     related_skills: [five-whys, mac-disk-cleanup]
+    requires_toolsets: [terminal, file, kanban]
 ---
 
 # Machine investigate

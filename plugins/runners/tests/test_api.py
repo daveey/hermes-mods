@@ -507,6 +507,7 @@ def test_investigation_route_creates_a_card_placed_on_the_machine(api, monkeypat
     assert res.json()['created'] is True and res.json()['investigation']['task'] == 't_000000000001'
     (args,) = created
     assert args['placement'] == 'mini' and args['skills'] == ['machine-investigate', 'five-whys']
+    assert args['requires'] == ['terminal', 'file', 'kanban']
     assert args['idempotency_key'].startswith('investigate-machine:mini:')
     assert 'CPU load1 13.8 on 8 cores (172%)' in args['body'] and 'disk 20 GB free' in args['body']
     # A second click before the card reaches the replicas returns the queued one, not a duplicate.

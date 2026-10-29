@@ -47,6 +47,8 @@ def card_args(machine, load, now_s):
         'assignee': 'default',
         'placement': machine,
         'skills': ['machine-investigate', 'five-whys'],
+        # Shell for ps/du/launchctl, files for the report, kanban to block with the asks.
+        'requires': ['terminal', 'file', 'kanban'],
         'idempotency_key': f'{KEY_PREFIX}{machine}:{int(now_s)}',
         'max_runtime_seconds': 2700,
     }
