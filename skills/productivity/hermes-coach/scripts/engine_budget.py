@@ -342,7 +342,10 @@ def inbox_post(hermes, snap, stops, data, run=subprocess.run):
               "today's stopped cards listed in research/state/budget-stops.jsonl (`hermes kanban --board hermes unblock "
               "<id>`). Report the new caps.")
     base = [hermes, "inbox", "post", title, "--body", body, "--prompt", prompt, "--key", f"engine-budget:{snap['day']}",
-            "--poster", "coach · engine budget", "--cwd", str(data)]
+            "--poster", "coach · engine budget", "--cwd", str(data),
+            "--ask", json.dumps({"interaction": "approval",
+                                 "why_human": "Raising the improvement engine's daily spend cap is David's spend decision",
+                                 "action": "Approve or decline a higher cap for today"})]
     label = ["--prompt-label", "Raise today's engine cap"]
     try:
         r = None

@@ -106,12 +106,45 @@ _JUNK_KEY = re.compile(r"(?:^|[:_./-])(?:TEST|E2E|SCRATCH|PROBE|SMOKE)(?:[:_./-]
                        r"|(?i:^[^:]*(?:-probe|-smoke|keytest|selftest|tooltest|livetest)(?::|$)|:test[-_:])")
 
 
+# Shared with ask_contract._TEST_HANDLE (kept identical; test_policy_layer_also_rejects_handle_markers covers both).
+_TEST_HANDLE = re.compile(r"@(?:[\w.\-]*scratch|(?:[\w.\-]*[_.\-])?test\d*(?![A-Za-z]))", re.I)
+
+
+def card_human_request(task_id: str):
+    """The structured human_request of a Kanban card (dict), or None. Read-only; never raises."""
+    import sqlite3
+    try:
+        from hermes_cli import kanban_db as kb
+        path = os.environ.get("HERMES_KANBAN_DB") or str(kb.kanban_db_path())
+    except Exception:
+        path = os.environ.get("HERMES_KANBAN_DB") or str(Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "kanban.db")
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute("SELECT human_request FROM tasks WHERE id=?", (task_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        value = json.loads(row[0])
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def junk_reason(title: str, key: Optional[str]) -> Optional[str]:
     """Why a post looks like a test/probe card, or None."""
     if _JUNK_TITLE.search(title or ""):
         return f"title {title[:60]!r} looks like a test/probe card"
     if key and _JUNK_KEY.search(key):
         return f"key {key[:60]!r} looks like a test/probe card"
+    if _TEST_HANDLE.search(title or ""):
+        return f"title {title[:60]!r} names a test/probe (scratch) account"
     return None
 
 
@@ -473,6 +506,9 @@ class Inbox:
         if not accept_prompt and ct.needs_accept_prompt(tdef):
             raise ValueError("accept_prompt is required (the instruction 'Do it' sends)")
         snap = ct.snapshot(tdef)
+        if not ask and policy.family(poster) == "kanban" and os.environ.get("HERMES_KANBAN_TASK"):
+            # A blocked card's human_request IS the owner ask: no second hand-written copy to forget.
+            ask = policy.ask_from_human_request(card_human_request(os.environ["HERMES_KANBAN_TASK"]))
         refusal = policy.reason(home=self.home, poster=poster, ask=ask, actions=snap["actions"],
                                 type_name=snap["name"], title=title, body=body, key=key)
         if refusal:
@@ -576,9 +612,12 @@ class Inbox:
                 self._close(db)
 
     def _refuse(self, reason, title, body, prompt, poster, key, error_class=AgentOwnedPost):
-        family = policy_module().family(poster)
+        pol = policy_module()
+        family = pol.family(poster)
         event = {"at": self.clock(), "family": family, "poster": poster, "key": key,
                  "title": title, "body": body, "accept_prompt": prompt, "reason": reason}
+        if reason in ("ask_missing", "ask_invalid"):
+            reason = f"{reason}: {pol.RETRY_SHAPE}"
         task = None
         try:
             task = (self._task_creator or kanban_task_creator)(

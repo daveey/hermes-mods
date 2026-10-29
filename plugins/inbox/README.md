@@ -29,7 +29,7 @@ family is the text before `·`, so `kanban · <title>` is `kanban`) and carry `a
 or status wording (`TEST`, `scratch`, `CTESTLIVE`, `9999-..` dates, `failed`/`expired`/`X DM sent`), an
 unregistered or type-forbidden poster, a missing ask, and any write to the real inbox under pytest/`HERMES_TEST`
 are refused. A refusal is never silent: it becomes a Kanban card (`inbox-refused:<family>:<key>`; repeats are
-comments) and the poster gets `AgentOwnedPost`. `tests/test_poster_conformance.py` scans hermes-mods, daveey/hermes
+comments) and the poster gets `AgentOwnedPost`. An `ask_missing`/`ask_invalid` refusal names the retry shape (`ask={interaction, why_human, action}`) in the error and the Kanban copy, so the calling agent reposts with `ask` instead of leaving a real owner ask on the board. A `kanban` poster inside a worker whose card has a valid `human_request` gets `ask` filled from it (`user_terminal`/`physical` -> `physical`, `reply` -> `preference`, `external` -> `approval`). `@handle` markers are test junk too: `scratch` anywhere in a handle, or a standalone `test` segment (`@test`, `@acme_test2`); `@latest`, `@contest`, `@testarossa` pass. `tests/test_poster_conformance.py` scans hermes-mods, daveey/hermes
 and hermes-hub call sites (`HERMES_POSTER_ROOTS` overrides) and fails on a literal poster that is not registered.
 
 **Noise breaker v2** (`store.py`, `MUTE_AFTER` = 2, `MUTE_WINDOW_S` = 7 days, keyed by poster *family*, poster-less

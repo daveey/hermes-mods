@@ -35,8 +35,42 @@ _TEST_CS = re.compile(r"\bTEST\b")
 _TEST_CI = re.compile(r"\b(?:scratch|drill|ignore)\b|\b(?:live|e2e|smoke) test\b|\btest (?:card|post|ask)\b|CTESTLIVE|9999-\d\d-\d\d", re.I)
 
 
+# Test markers inside @handles: scratch anywhere (@scratchtest, @myscratch) and a standalone "test" segment
+# (@test, @test_account, @acme-test, @acme_test2). "test" inside an ordinary word (@latest, @contest, @testarossa)
+# is a real account and passes.
+_TEST_HANDLE = re.compile(r"@(?:[\w.\-]*scratch|(?:[\w.\-]*[_.\-])?test\d*(?![A-Za-z]))", re.I)
+
+
 def _is_test(text):
-    return bool(_TEST_CS.search(text) or _TEST_CI.search(text))
+    return bool(_TEST_CS.search(text) or _TEST_CI.search(text) or _TEST_HANDLE.search(text))
+
+
+def is_test(text):
+    return _is_test(text or "")
+
+
+RETRY_SHAPE = ('retry the same post with ask={"interaction": "approval|credential|publish_as_david|physical|preference", '
+               '"why_human": "<why only David can do this>", "action": "<the exact thing David does>"} '
+               '(Inbox tool: pass `ask`; CLI: --ask JSON). Post it only if David must act; otherwise use a Kanban card')
+
+_HR_INTERACTION = {"approval": "approval", "credential": "credential", "physical": "physical",
+                   "user_terminal": "physical", "reply": "preference", "external": "approval"}
+
+
+def ask_from_human_request(hr):
+    """The Inbox ask for a Kanban card's human_request (dict or JSON text), or None when it has none."""
+    if isinstance(hr, str):
+        try:
+            hr = json.loads(hr)
+        except ValueError:
+            return None
+    if not isinstance(hr, dict):
+        return None
+    interaction = _HR_INTERACTION.get(str(hr.get("interaction") or "").strip())
+    why, action = hr.get("why_human"), hr.get("action")
+    if not interaction or not all(isinstance(v, str) and v.strip() for v in (why, action)):
+        return None
+    return {"interaction": interaction, "why_human": why.strip(), "action": action.strip()}
 _STATUS = re.compile(r"\b(?:was rejected|failed|expired|came back|missing guards|still on disk|sent to)\b|\bposted:|^Fixed:", re.I)
 
 

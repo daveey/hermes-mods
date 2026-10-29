@@ -225,6 +225,16 @@ class Engine(unittest.TestCase):
         self.assertIn(f"engine-budget:{fx.utc_day(self.now)}", posts[0])
         self.assertIn("budget-overrides.jsonl", posts[0][posts[0].index("--prompt") + 1])
 
+    def test_post_carries_the_owner_ask(self):
+        os.environ["COACH_INBOX"] = "1"
+        self.over_total()
+        eb.watchdog(self.home, "hermes", self.data, "hermes", self.now, out=lambda m: None,
+                    kill=lambda p, s: None, pids=lambda tid, hint=None: [], run=self.run_)
+        post = next(c for c in self.calls if c[1:3] == ["inbox", "post"])
+        ask = json.loads(post[post.index("--ask") + 1])
+        self.assertEqual(ask["interaction"], "approval")
+        self.assertTrue(ask["why_human"].strip() and ask["action"].strip())
+
     def test_card_is_typed_engine_budget(self):
         os.environ["COACH_INBOX"] = "1"
         self.over_total()
