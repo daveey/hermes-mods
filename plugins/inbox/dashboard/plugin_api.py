@@ -85,7 +85,9 @@ async def _run(fn):
     try:
         return await asyncio.to_thread(fn)
     except ValueError as exc:  # bad type / field / input
-        raise HTTPException(status_code=400, detail=str(exc))
+        detail = ({"reason": exc.reason, "task": exc.task, "error": str(exc)}
+                  if hasattr(exc, "reason") else str(exc))
+        raise HTTPException(status_code=400, detail=detail)
     except Exception as exc:
         # A task action could not queue its Kanban card (the card stays open). Matched by name: a
         # store.py reload (mtime change) between building the Inbox and here changes the class.
@@ -110,7 +112,7 @@ async def post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     return await _run(lambda: _store().Inbox().post(
         payload.get("title", ""), payload.get("body", ""), payload.get("accept_prompt", ""),
         key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd"),
-        prompt_label=payload.get("prompt_label"), type=payload.get("type"), fields=payload.get("fields")))
+        prompt_label=payload.get("prompt_label"), type=payload.get("type"), fields=payload.get("fields"), ask=payload.get("ask")))
 
 
 @router.get("/items/{session_id}")
