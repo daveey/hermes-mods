@@ -2,6 +2,7 @@
 Inbox outcomes (Do it -> fix card, Not now, Never), digest backstop, queue drain."""
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -1473,3 +1474,53 @@ def test_file_fix_reserves_fix_budget_by_default(store, monkeypatch):
     sh.LaneState(store.root).update(d["fingerprint"], status="proposed", component="desktop")
     r = sh.file_fix(d["fingerprint"], store=store, runner=Runner(), now=NOW)
     assert seen == [sh.FIX_BUDGET] and r["action"] == "deferred"
+
+
+# ── the origin session fixed it with a bare commit (no card): record fixed, file nothing ──
+def _fork_repo_with_commit(tmp_path, subject, ts):
+    import subprocess
+    repo = tmp_path / "fork"
+    repo.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "GIT_AUTHOR_DATE": f"{int(ts)} +0000", "GIT_COMMITTER_DATE": f"{int(ts)} +0000"}
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True, env=env)
+    g("init", "-q", "-b", "main")
+    (repo / "f").write_text("x")
+    g("add", "f")
+    g("commit", "-q", "-m", subject)
+    g("update-ref", "refs/remotes/origin/main", "HEAD")
+    return repo, g("rev-parse", "HEAD").stdout.strip()
+
+
+def _commit_case(store, tmp_path, monkeypatch, subject, commit_at, last_reply="Fixed. The icon now maps to cloud."):
+    _real_adoption_env(monkeypatch, tmp_path)
+    d = defect(at=NOW - 60, host="macbook", component="desktop", complaint_at=NOW - 3600)
+    repo, sha = _fork_repo_with_commit(tmp_path, subject, commit_at)
+    monkeypatch.setenv("COACH_FORK_REPO", str(repo))
+    p = tmp_path / "data" / "macbook" / "default" / f"{d['session_id']}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"id": d["session_id"], "host": "macbook", "user_turns": [], "last_reply": last_reply,
+                             "last_activity_at": NOW - 3000}))
+    r = Runner()
+    return d, sha, r, sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+
+
+def test_defect_fixed_by_bare_session_commit_files_nothing_and_records_fixed(store, tmp_path, monkeypatch):
+    d, sha, r, out = _commit_case(store, tmp_path, monkeypatch,
+                                  "fix(desktop): show SSH cloud gateways with the cloud glyph", NOW - 3200)
+    assert out["action"] == "skip" and out["adopted"] and out["commit"] == sha
+    assert not r.creates()
+    assert sh.LaneState(store.root).get(d["fingerprint"] if d.get("fingerprint") else sh.fingerprint("desktop", d["symptom"]))["status"] == "fixed"
+    (e,) = ev(store, "selfheal_adopted_owner")
+    assert e["via"] == "session_commit" and e["commit"] == sha
+    assert sha[:12] in ev(store, "selfheal_fixed")[0]["note"]
+
+
+def test_commit_before_the_complaint_or_other_component_is_not_a_fix(store, tmp_path, monkeypatch):
+    _, _, r, out = _commit_case(store, tmp_path, monkeypatch, "fix(desktop): old", NOW - 7200)
+    assert out["action"] == "filed" and len(r.creates()) == 1
+
+
+def test_commit_for_another_component_is_not_a_fix(store, tmp_path, monkeypatch):
+    _, _, r, out = _commit_case(store, tmp_path, monkeypatch, "fix(kanban): unrelated", NOW - 3200)
+    assert out["action"] == "filed" and len(r.creates()) == 1

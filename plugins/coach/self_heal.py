@@ -1402,6 +1402,60 @@ def digest_owner_cards(d: dict, since: float, data: Optional[Path] = None) -> li
     return []
 
 
+_SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
+SESSION_COMMIT_SLACK_S = 1800  # a fix may land a little after the session's last recorded activity
+
+
+def _fork_repo() -> Path:
+    return Path(os.environ.get("COACH_FORK_REPO") or Path.home() / ".hermes" / "hermes-agent")
+
+
+def _git_lines(repo: Path, *args: str) -> list:
+    import subprocess
+    try:
+        p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return p.stdout.splitlines() if p.returncode == 0 else []
+
+
+def session_commit_fix(d: dict, since: float, data: Optional[Path] = None, repo: Optional[Path] = None) -> Optional[dict]:
+    """A fix the origin session shipped as a bare commit (no kanban card): a commit on the fork's origin/main made
+    after `since` that (a) the session's digest names by sha, or (b) landed inside the session's active window
+    (since .. last_activity_at + slack) as a `fix` whose subject names the defect's component, e.g.
+    `fix(desktop): ...` for component=desktop. Window+component is what catches a digest whose truncated last_reply
+    never names the sha. -> {sha, at, subject} or None."""
+    sid, host, comp = d.get("session_id"), d.get("host"), (d.get("component") or "").lower()
+    if not sid:
+        return None
+    root = Path(data) if data else Path(os.environ.get("COACH_DATA") or Path.home() / "code" / "hermes-coach-data")
+    paths = sorted(root.glob(f"{host}/*/{sid}.json")) if host else sorted(root.glob(f"*/*/{sid}.json"))
+    repo = Path(repo) if repo else _fork_repo()
+    for path in paths:
+        try:
+            dg = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        until = (dg.get("last_activity_at") or since) + SESSION_COMMIT_SLACK_S
+        commits = []  # (sha, committer ts, subject) on origin/main since the complaint
+        for ln in _git_lines(repo, "log", "origin/main", f"--since={int(since)}", "--format=%H\t%ct\t%s"):
+            sha, _, rest = ln.partition("\t")
+            ts, _, subj = rest.partition("\t")
+            if ts.isdigit() and int(ts) > since:
+                commits.append((sha, int(ts), subj))
+        text = " ".join([str(dg.get("last_reply") or "")] + [str(t.get(k) or "") for t in dg.get("user_turns") or []
+                                                            if (t.get("t") or 0) > since for k in ("prev", "text")])
+        named = set(_SHA.findall(text))
+        for sha, ts, subj in commits:
+            if any(sha.startswith(n) for n in named):
+                return {"sha": sha, "at": ts, "subject": subj, "via": "named"}
+        for sha, ts, subj in sorted(commits, key=lambda c: c[1]):
+            head = subj.lower()
+            if ts <= until and head.startswith("fix") and comp and re.search(r"\b%s\b" % re.escape(comp), head):
+                return {"sha": sha, "at": ts, "subject": subj, "via": "window"}
+    return None
+
+
 def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[Callable] = None) -> Optional[dict]:
     """If the defect's origin session created/subscribed an active card after the complaint, record the newest as the
     lane's fix_card (approved) and log `selfheal_adopted_owner`. -> result dict, or None to go on and file."""
@@ -1416,6 +1470,19 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     except Exception as exc:
         store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
         return None
+    if not cards and owner_fn is None:  # no card: the session may have fixed it with a bare commit
+        try:
+            fix = session_commit_fix(d, d.get("complaint_at") or d.get("at") or since)
+        except Exception as exc:
+            store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "error": str(exc)[:200]})
+            fix = None
+        if fix:
+            record_event("fixed", fp, note=f"fixed by origin session in commit {fix['sha'][:12]}: {fix['subject']}"[:300],
+                         store=store, now=now)
+            store.log({"event": "selfheal_adopted_owner", "via": "session_commit", "fingerprint": fp,
+                       "commit": fix["sha"], "match": fix["via"], "session_id": sid})
+            return {"action": "skip", "why": f"origin session {sid} already fixed it in commit {fix['sha'][:12]}",
+                    "commit": fix["sha"], "adopted": True}
     if not cards:
         return None
     c = cards[0]
