@@ -89,6 +89,7 @@ test('load meters: reported, absent and stale', async () => {
   assert.ok(w1.classList.contains('is-stale'))
   assert.match(w1.textContent, /CPU  13%\(10m old\)/)
   assert.equal(ui.container.querySelector('[data-machine="mini"] .hermes-fleet-load').textContent, 'load not reported')
+  assert.equal(P.loadParts({ cpus: 16, at: NOW }), null, 'a report with no readable values is "not reported"')
   // CI: the collector's probe has load (no core count) and disk; machines without a probe show no meter line.
   assert.match(ui.container.querySelector('[data-machine="mac-mini"] .hermes-fleet-load').textContent, /load\s+30.35.*24 GB free/)
   assert.equal(ui.container.querySelector('[data-machine="ec2-gwgen"] .hermes-fleet-load'), null)

@@ -143,6 +143,7 @@ export function loadParts(load, now = Date.now()) {
     const used = load.disk_total_gb ? Math.round(100 * (1 - load.disk_free_gb / load.disk_total_gb)) : null
     parts.push({ key: 'disk', label: 'Disk', pct: used, text: `${Math.round(load.disk_free_gb)} GB free` })
   }
+  if (!parts.length) return null
   return { parts, stale: load.stale ? `${ago(now - load.at).replace(' ago', '')} old` : null }
 }
 
