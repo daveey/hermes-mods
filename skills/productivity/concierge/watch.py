@@ -45,7 +45,8 @@ def describe(sid, old, new):
     if new["archived"] and not old["archived"]:
         return f"{sid} archived: {new['title']}"
     out = []
-    if new["turns"] != old["turns"]:
+    # A turn with no summary yet will be reported when its summary lands.
+    if new["turns"] != old["turns"] and new["status"] != EMPTY_STATUS:
         out.append(f"finished a turn ({old['turns']}->{new['turns']})")
     if new["awaiting"] != old["awaiting"]:
         out.append("now waiting on the user" if new["awaiting"] else "no longer waiting on the user")
