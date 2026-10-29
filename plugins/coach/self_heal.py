@@ -1490,7 +1490,7 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     st = lane.get(fp)
     lane.update(fp, status="approved", fix_card=c["id"], approved_at=now, component=d.get("component"),
                 symptom=d.get("symptom"), session_id=sid, board=c.get("board"), filed_day=_utc_day(now),
-                cards=sorted(known_cards(st) | {c["id"]}))
+                cards=sorted(known_cards(st) | {c["id"]}), **_complaint_identity(d))
     store.log({"event": "selfheal_adopted_owner", "fingerprint": fp, "card": c["id"], "status": c.get("status"),
                "board": c.get("board"), "session_id": sid, "candidates": [x["id"] for x in cards]})
     return {"action": "skip", "why": f"adopted owner card {c['id']} from session {sid}", "card": c["id"],
@@ -1699,7 +1699,7 @@ def _adopt_signature_card(d: dict, fp: str, store, now: float,
     c = cards[0]
     lane.update(fp, status="approved", fix_card=c["id"], approved_at=now, component=d.get("component"),
                 symptom=d.get("symptom"), session_id=d.get("session_id"), board=c.get("board"),
-                filed_day=_utc_day(now), cards=sorted(known_cards(st) | {c["id"]}))
+                filed_day=_utc_day(now), cards=sorted(known_cards(st) | {c["id"]}), **_complaint_identity(d))
     store.log({"event": "selfheal_adopted_owner", "via": "signature", "fingerprint": fp, "card": c["id"],
                "status": c.get("status"), "board": c.get("board"), "session_id": d.get("session_id"),
                "signature": {k: v for k, v in sig.items() if k != "symptom"},
@@ -1730,6 +1730,77 @@ def _lane_family(e: dict) -> Optional[str]:
     return e.get("family") or root_family({"symptom": e.get("symptom")})
 
 
+def _complaint_identity(d: dict) -> dict:
+    """Stable evidence shared by hook and digest detectors; never hash generated symptom text.
+
+    Hook `at` is detection time; backstop `at` is the user-turn time. The quote bridges
+    delayed detection. Use 300 normalized characters (the queue's evidence limit).
+    Missing fields remain unknown: do not backfill legacy lanes from their filing time.
+    """
+    quote = re.sub(r"\s+", " ", clean_user(str(d.get("quote") or ""))).strip().casefold()[:300]
+    at = d.get("complaint_at", d.get("at"))
+    try:
+        at = float(at) if at is not None else None
+    except (TypeError, ValueError):
+        at = None
+    return {"complaint_at": at,
+            "complaint_quote_hash": hashlib.sha256(quote.encode()).hexdigest()[:20] if quote else None}
+
+
+def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]:
+    """Different fingerprints for the same session/user turn share the original owner.
+
+    A resolved complaint is not a new recurrence merely because a second detector saw
+    it late. Declined owners and expired not-defect decisions may be investigated anew.
+    """
+    sid = d.get("session_id")
+    identity = _complaint_identity(d)
+    if not sid or not any(identity.values()):
+        return None
+    lane = LaneState(store.root)
+    owners = []
+    entries = lane.read()
+    for ofp, e in entries.items():
+        # An alias retains the old turn even if its canonical fingerprint later recurs.
+        # Consult the canonical lifecycle rather than trusting a stale copied verdict.
+        canonical = entries.get(e["complaint_owner"], {}) if e.get("complaint_owner") else e
+        if ((ofp == fp and not e.get("complaint_owner")) or e.get("session_id") != sid
+                or not canonical or canonical.get("status") == "declined"):
+            continue
+        if (canonical.get("status") == "not_defect" and
+                now - (canonical.get("closed_at") or 0) >= NOT_DEFECT_DAYS * 86400):
+            continue
+        card = e.get("fix_card") or e.get("card")
+        same_quote = (identity["complaint_quote_hash"] and
+                      identity["complaint_quote_hash"] == e.get("complaint_quote_hash"))
+        try:
+            same_time = (identity["complaint_at"] is not None and e.get("complaint_at") is not None and
+                         abs(identity["complaint_at"] - float(e["complaint_at"])) <= 120)
+        except (TypeError, ValueError):
+            same_time = False
+        if card and (same_quote or same_time):
+            owners.append((e.get("filed_at") or now, ofp, card, e))
+    if not owners:
+        return None
+    _, ofp, card, e = sorted(owners, key=lambda o: (o[0], o[1]))[0]
+    st = lane.get(fp)
+    # Keep only an alias, not a copied lifecycle: copying `proposed` would launch a
+    # second fix from sync(), and copying `not_defect` would suppress this fingerprint
+    # globally. Keep its own earlier lifecycle for a genuinely new recurrence.
+    previous = st.get("complaint_previous") if st.get("status") == "adopted" else (st or None)
+    lane.update(fp, status="adopted", card=None, fix_card=card,
+                complaint_previous=previous,
+                fixed_at=None, closed_at=None, filed_day=None,
+                component=d.get("component"), symptom=d.get("symptom"), session_id=sid,
+                board=e.get("board"), complaint_owner=e.get("complaint_owner") or ofp,
+                complaint_at=e.get("complaint_at"), complaint_quote_hash=e.get("complaint_quote_hash"),
+                cards=sorted(known_cards(st) | {card}))
+    store.log({"event": "selfheal_adopted_owner", "via": "complaint_turn", "fingerprint": fp,
+               "owner_fingerprint": ofp, "card": card, "session_id": sid, "board": e.get("board")})
+    return {"action": "skip", "why": f"same complaint turn as {ofp}", "card": card,
+            "adopted": True, "via": "complaint_turn", "fingerprint": fp}
+
+
 def _adopt_family_lane(d: dict, fp: str, store, now: float) -> Optional[dict]:
     """Another open lane (filed/proposed/approved) already owns this defect's root family: join its card instead of
     filing a second investigation of the same root. The oldest open lane wins. Logs selfheal_adopted_owner via=family."""
@@ -1751,7 +1822,7 @@ def _adopt_family_lane(d: dict, fp: str, store, now: float) -> Optional[dict]:
     st = lane.get(fp)
     lane.update(fp, status="approved", fix_card=card, approved_at=now, component=d.get("component"),
                 symptom=d.get("symptom"), session_id=d.get("session_id"), board=board, family=fam,
-                family_owner=ofp, filed_day=_utc_day(now), cards=sorted(known_cards(st) | {card}))
+                family_owner=ofp, filed_day=_utc_day(now), cards=sorted(known_cards(st) | {card}), **_complaint_identity(d))
     store.log({"event": "selfheal_adopted_owner", "via": "family", "family": fam, "fingerprint": fp, "card": card,
                "owner_fingerprint": ofp, "board": board, "session_id": d.get("session_id"),
                "candidates": [o[2] for o in sorted(owners)]})
@@ -1847,6 +1918,17 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         return res
     lane = LaneState(store.root)
     st = lane.get(fp)
+    if st.get("status") == "adopted" and m == "live" and hub:
+        owner = _adopt_complaint_lane(d, fp, store, now)
+        if owner:
+            if d.get("incident"):
+                commented = _corruption_comment(d, lane.get(fp), store, runner)
+                if commented["action"] == "error":
+                    return commented
+            return owner
+        if st.get("complaint_previous"):
+            st = lane.update(fp, **{**st["complaint_previous"], "complaint_previous": None,
+                                   "complaint_owner": None})
     if (d.get("incident") and m == "live" and hub and not st.get("suppressed")
             and (st.get("snooze_until") or 0) <= now):
         adopted = _adopt_recovery_holder(d, fp, st, store, now, runner)
@@ -1866,6 +1948,14 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
             return _corruption_comment(d, st, store, runner)
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
         return {"action": "skip", "why": dec["why"]}
+    if m == "live" and hub:
+        owner = _adopt_complaint_lane(d, fp, store, now)
+        if owner:
+            if d.get("incident"):
+                commented = _corruption_comment(d, lane.get(fp), store, runner)
+                if commented["action"] == "error":
+                    return commented
+            return owner
     if m == "live" and hub:  # the origin session already queued its own fix card: adopt it, file nothing
         owner = ((_adopt_family_lane(d, fp, store, now) or _adopt_signature_card(d, fp, store, now, sig_owner_fn))
                  if d.get("incident") else
@@ -1919,7 +2009,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     kw: dict = dict(status="filed", card=tid, component=d.get("component"), symptom=d.get("symptom"),
               filed_day=_utc_day(now), filed_at=now, board=args.get("board"), session_id=d.get("session_id"),
               fix_card=None if not prev else st.get("fix_card"), gen=gen,
-              cards=sorted(known | {tid}), proposed_at=None, family=root_family(d), held=[])
+              cards=sorted(known | {tid}), proposed_at=None, family=root_family(d), held=[],
+              complaint_owner=None, complaint_previous=None,
+              **_complaint_identity(d))
     if prev:
         kw["recurrences"] = int(st.get("recurrences") or 0) + 1
     elif dec["why"] == "refile":

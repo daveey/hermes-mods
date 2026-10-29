@@ -578,7 +578,7 @@ def test_missing_bb_board_is_deferred_with_a_log_row_not_dropped(store, tmp_path
     assert not sh.LaneState(store.root).get(d["fingerprint"]).get("card")
     assert _pending_fps(store) == [d["fingerprint"]]
     # still missing at retry time: kept, not dropped, and it does not block another admission
-    other = defect("desktop", "sidebar sessions reshuffle", p_defect=0.4)
+    other = defect("desktop", "sidebar sessions reshuffle", p_defect=0.4, session_id="other-complaint")
     sh.file_defect(other, store=store, m="live", runner=Runner(), now=NOW, cfg=HUB,
                    budget_fn=lambda *a: {**OPEN(), "ok_running": False})
 
@@ -799,6 +799,7 @@ def test_queue_drain_files_each_queued_detection_once(store):
 # ── Inbox: Do it -> fix card, Not now, Never ──
 def proposed(store, r, d=None):
     d = d or defect()
+    d = {**d, "session_id": d["fingerprint"]}  # independent proposal fixtures, not one user turn
     sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
     prop = Path(store.root) / "selfheal" / d["fingerprint"] / "proposal.md"
     prop.parent.mkdir(parents=True, exist_ok=True)
@@ -1167,7 +1168,7 @@ def test_card_from_before_the_complaint_or_unrelated_still_files(store):
                          owner_fn=_owner(old))
     assert out["action"] == "filed" and len(r.creates()) == 1
     r2 = Runner()
-    out = sh.file_defect(defect(symptom="other thing"), store=store, m="live", runner=r2, now=NOW, cfg=HUB,
+    out = sh.file_defect(defect(symptom="other thing", quote="a separate issue", at=NOW + 3600), store=store, m="live", runner=r2, now=NOW, cfg=HUB,
                          budget_fn=OPEN, owner_fn=lambda sid, since: [])
     assert out["action"] == "filed"
 
@@ -1455,7 +1456,7 @@ def test_concurrent_admissions_cannot_both_take_the_last_headroom(store, monkeyp
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     outs = []
-    ds = [defect(component=c, symptom=f"distinct symptom {c}") for c in ("desktop", "kanban")]
+    ds = [defect(component=c, symptom=f"distinct symptom {c}", session_id=c) for c in ("desktop", "kanban")]
     ts = [threading.Thread(target=lambda d=d: outs.append(
         sh.file_defect(d, store=store, m="live", runner=runner, now=NOW, cfg=HUB, budget_fn=budget_fn)))
         for d in ds]

@@ -482,6 +482,17 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   on the hub over ssh, so dedupe, recurrence, suppression and budget live in one place (`coach/selfheal_lane.json`).
 - **Shadow** (`COACH_SELFHEAL=shadow`, else `mode` in `coach/selfheal-config.json`, default shadow) logs `selfheal_would_file` with the full card args and creates
   nothing. **Live** creates the investigation card.
+- **Complaint turns:** filing stores `complaint_at` (explicit turn timestamp, else detector `at`) and a short
+  SHA-256 hash of the first 300 normalized quote characters. Before filing another fingerprint, the hub adopts
+  an existing lane card for the same session if timestamps are within 120 seconds OR quote hashes match.
+  This bridges backstop/hook wording differences and delayed queue delivery. Aliases keep original turn identity,
+  not copied lifecycle verdicts: only the canonical owner can launch a fix, and an alias does not suppress other
+  sessions' complaints. Even a fixed owner counts for the same old complaint. Declined owners and `not_defect` decisions
+  older than the existing seven-day window do not count. Legacy lanes without either field remain distinct.
+  Different session IDs and different turns with different quotes stay separate. Equal repeated quotes in one
+  session intentionally count as the same complaint. Tests: `tests/test_self_heal_complaint_turn.py` exercises the
+  backstop/hook pair (red before the guard), distinct turns, legacy state, timestamp boundaries, quote normalization,
+  cross-session isolation and closed-owner policies. Shadow mode remains non-mutating (no simulated lane state).
 - **SQLite incidents:** `database disk image is malformed`, `KanbanDbCorruptError`, and `file is not a database`
   share a fingerprint by source host, normalized DB path and UTC event-hour. Explicit `db_path` wins, then a path
   in evidence; pathless Kanban tracebacks default to `~/.hermes/kanban.db`. Other pathless SQLite errors are not
