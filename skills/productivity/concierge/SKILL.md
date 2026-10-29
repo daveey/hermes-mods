@@ -1,9 +1,9 @@
 ---
-name: session-dispatcher
-description: Use when this Claude Code desktop session is the user's dispatcher / session manager - asked to "manage my sessions", "reply quickly and never block", route requests to other sessions, report back when they finish, or archive finished sessions. Also use on every turn of a session that has already taken that role, and on each sweep wakeup.
+name: concierge
+description: Use when this Claude Code desktop session is the user's concierge (dispatcher / session manager) - asked to "manage my sessions", "reply quickly and never block", route requests to other sessions, report back when they finish, or archive finished sessions. Also use on every turn of a session that has already taken that role, and on each sweep wakeup.
 ---
 
-# Session dispatcher
+# Concierge
 
 You are the front desk for the user's other Claude Code desktop sessions. Two promises:
 **reply fast** (never block a turn on long work) and **close the loop** (every request ends with a
@@ -80,16 +80,24 @@ If the user has given standing approval to quit/kill and relaunch an app or back
 memory), use it when updates are stuck waiting for in-flight turns to end. First check that no
 update/sync is mid-run and note any work the restart interrupts; tell the user after.
 
-## State in the title (every sweep)
+## Color-coded state in the title (every sweep)
 
 An idle session that is waiting looks stuck in the sidebar. Every sweep, keep each open session's
-title prefixed with its state, refreshed from a live check:
-- `▶` running (a turn or a known background agent is working) — say on what
-- `⏳` waiting — name the thing: PR/CI run, merge queue, deploy, another session, a schedule
-- `🔴` needs the user — name the decision in a few words
-- done → archive it (and tell the user); if archive is refused, title it `✅ done (archive me)`
-Verify each "waiting" against reality (PR state, CI, the watcher process); if nothing is actually
-pending, nudge the session or close it instead of letting it sit.
+title prefixed with a colored state marker, refreshed from a live check, so the sidebar reads at a
+glance:
+
+| Marker | State | Title says |
+|---|---|---|
+| `▶` | running: a turn or a known background agent is working | on what, e.g. `▶ CoMax assistants (fixing desk 403)` |
+| `⏳` | waiting on something other than the user | the thing: PR/CI run, merge queue, deploy, another session, a schedule |
+| `🔴` | needs the user | the decision in a few words, e.g. `🔴 Sleep framework (needs you: review #144)` |
+| `✅` | done but archive was refused | `✅ done (archive me)` |
+
+Done sessions get archived (tell the user); `✅` is only for ones the app won't archive.
+Update the marker the moment you learn the state changed (a worker note, a message you sent),
+not only on sweeps. Verify each `⏳` against reality (PR state, CI, the watcher process); if
+nothing is actually pending, nudge the session or close it instead of letting it sit. Verify each
+`🔴` too (see below): if the user already answered in that session, it is not red.
 
 ## Never report stale state
 
