@@ -19,7 +19,7 @@ SHORT = re.compile(r"\bPR\s*#(" + NUMBER + r")\b", re.I)
 LABELED = re.compile(r"\b(" + REPO + r")\s+PR\s*#(" + NUMBER + r")\b", re.I)
 REPO_LABEL = re.compile(r"\bRepo(?:sitory)?\s*:?\s+(" + REPO + r")\b", re.I)
 LIFECYCLE = re.compile(r"\s*[.]?\s+Unblock\s*=\s*(.+?)[;.]\s*archive\s*=\s*(.+)\s*$", re.I)
-EXTRA_AUTH = re.compile(r"\b(?:approve|authorize|purchase|spend|pay|delete|rotate|grant|unlock)\b|force[- ]push", re.I)
+EXTRA_AUTH = re.compile(r"\b(?:approve|authorize|purchase|spend|pay|delete|rotate|grant|unlock|destroy)\b|force[- ]push|\bdrop\s+(?:(?:the|prod|production)\s+)*(?:database|db|table)\b", re.I)
 REFERENCE = (r"(?:https://github\.com/" + REPO + r"/pull/" + NUMBER
              + r"|" + REPO + r"#" + NUMBER + r"|PR\s*#" + NUMBER + r")")
 SURFACE = r"(?:Discord|Slack|(?:the\s+)?(?:BB\s+)?Inbox)"
@@ -92,7 +92,9 @@ def request_target(row):
         return None
     lifecycle = LIFECYCLE.search(action)
     if lifecycle:
-        if EXTRA_AUTH.search(lifecycle[1]):
+        if (any(EXTRA_AUTH.search(part) for part in lifecycle.groups())
+                or len(re.findall(r'\bUnblock\s*=', action, re.I)) != 1
+                or len(re.findall(r'\barchive\s*=', action, re.I)) != 1):
             return None
         action = action[:lifecycle.start()].rstrip(" .")
     if not ACTION.fullmatch(action):
@@ -112,7 +114,7 @@ def looks_like_pr_approval(row) -> bool:
     hr = _request(row)
     action = hr.get("action") if hr else None
     return bool(isinstance(action, str)
-                and re.match(r"\s*(?:please\s+)?(?:approve|ok|authorize)\b", action, re.I)
+                and re.search(r"\b(?:approve|ok|authorize)\b", action, re.I)
                 and (SHORT.search(action) or REF.search(action)
                      or re.search(r"\b(?:pull request|bb approval ask)\b", action, re.I)))
 

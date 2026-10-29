@@ -132,3 +132,12 @@ def test_bad_request_safe(hr):
     ("Approve the budget", False), ("Review PR #1950", False), ("The owner approved PR #1950", False)])
 def test_detection_is_not_authority(action, expected):
     assert parser.looks_like_pr_approval(row(action)) is expected
+
+
+@pytest.mark.parametrize('suffix', [
+    'Unblock = queue merges; archive = close the PR and delete the repo and rotate keys',
+    'Unblock = queue merges; archive = x. Unblock = rotate keys; archive = y',
+    'Unblock = queue merges and drop the prod database; archive = close the PR',
+])
+def test_lifecycle_does_not_smuggle_authorization(suffix):
+    assert parser.request_target(row('Approve PR #1950 head 21cb9c1c2. ' + suffix)) is None
