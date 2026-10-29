@@ -48,7 +48,13 @@ CREATE_TOOLS = {"terminal", "execute_code"}
 SLACK_S = 5.0  # clock slack around the tool call window
 
 
+_DRY = False  # sweep --dry-run: decide and report, remove/archive/log nothing
+
+
 def _log(msg: str) -> None:
+    if _DRY:
+        print(f"DRY {msg}", file=sys.stderr)
+        return
     try:
         LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG, "a") as fh:
@@ -460,6 +466,10 @@ def _remove(path: str, why_owned: str, ws: str = "") -> dict:
         return dict(path=path, action=f'kept: {complex_reason}')
     keep = _removable(path)
     archived = None
+    if _DRY and not keep:
+        return dict(path=path, action="would remove")
+    if _DRY and _in_scratch(path, ws) and keep != "git status failed":
+        return dict(path=path, action="would archive+remove")
     if keep and _in_scratch(path, ws) and keep != "git status failed":
         # the dispatcher will rmtree this scratch dir right after completion: save the work, then remove properly
         try:
@@ -548,13 +558,21 @@ SWEEP_MIN_AGE_S = 600.0
 SWEEP_MAX_AGE_S = 8 * 86400.0  # older trees are mac-worktree-gc's (it archives after 7 idle days)
 
 
-def sweep(min_age_s: float = SWEEP_MIN_AGE_S, max_age_s: float = SWEEP_MAX_AGE_S) -> list[dict]:
+def sweep(min_age_s: float = SWEEP_MIN_AGE_S, max_age_s: float = SWEEP_MAX_AGE_S, dry_run: bool = False) -> list[dict]:
     """Tear down the trees of every settled card on this host, whatever closed it.
 
     The completion hook runs once, in the completing worker. It declines while a child card is open, a process
     still works in a tree, or when the card was closed by the CLI/REST, and nothing retried those later: trees of
     finished cards stayed until the 7-day GC. The sweep re-runs the same verified teardown for each marked card
-    on its own board (status done, latest run done/completed, no open child)."""
+    on its own board (status done, latest run done/completed, no open child). mac-worktree-gc --all-repos runs it
+    hourly too, so hosts with few completions re-check. *dry_run* reports what it would do and changes nothing."""
+    global _DRY
+    if dry_run:
+        _DRY = True
+        try:
+            return sweep(min_age_s, max_age_s)
+        finally:
+            _DRY = False
     results = []
     seen = set()
     for _, rec, path in list(_markers()):
@@ -697,9 +715,9 @@ def register(ctx) -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["sweep"]:
-        for r in sweep():
+    if sys.argv[1:] in (["sweep"], ["sweep", "--dry-run"]):
+        for r in sweep(dry_run=sys.argv[2:] == ["--dry-run"]):
             print(json.dumps(r))
     else:
-        print("usage: __init__.py sweep", file=sys.stderr)
+        print("usage: __init__.py sweep [--dry-run]", file=sys.stderr)
         sys.exit(2)

@@ -35,6 +35,8 @@ class T(unittest.TestCase):
         self.assertEqual(bf.pick_tab(TABS)["id"], "b")
         self.assertEqual(bf.pick_tab(TABS, "example")["id"], "a")
         self.assertIsNone(bf.pick_tab([TABS[2]]))
+        # a match that hits nothing never falls back to another tab (agent-07dbafdef0)
+        self.assertIsNone(bf.pick_tab(TABS, "github.com/signup"))
 
     def test_tool_result_on_login_page_focuses_and_notes_once(self):
         out = '{"output": "https://accounts.google.com/v3/signin/identifier?q | Sign in"}'
@@ -53,12 +55,13 @@ class T(unittest.TestCase):
 
     def test_reply_asking_user_in_chrome_focuses_only_after_browser_use(self):
         text = "Please sign in to Google in the Chrome window, then say done."
-        with mock.patch.object(bf, "focus", return_value={"focused": True, "tab": None}) as f:
+        tab = {"title": "Sign in - Google Accounts", "url": "https://accounts.google.com/v3/signin/identifier"}
+        with mock.patch.object(bf, "focus", return_value={"focused": True, "tab": tab}) as f:
             self.assertIsNone(bf.transform_llm_output(text, session_id="s"))  # session never used the browser
             bf.transform_tool_result("browser_exec", {}, "ok", session_id="s")
             r = bf.transform_llm_output(text, session_id="s")
             self.assertIn("front", r)
-            f.assert_called_once()
+            f.assert_called_once_with(None, kinds=("signin",))
             self.assertIsNone(bf.transform_llm_output("The AC is set to 75.", session_id="s"))
 
     def test_focus_unhides_virtual_display_chrome_before_raising(self):
@@ -107,6 +110,86 @@ class T(unittest.TestCase):
         with mock.patch.object(bf, "focus", return_value={"focused": False}) as f:
             self.assertIsNone(bf.transform_tool_result("browser_exec", {}, out, session_id="s2"))
             f.assert_called_once_with("x.com", require_login=True)
+
+    # agent-07dbafdef0 (2026-10-28): a reply asked David to finish a GitHub signup; browser-focus raised a
+    # logged-in github.com tab and still said "I've brought the Chrome window to the front".
+    def _focus_env(self, tabs, calls):
+        return [mock.patch.object(bf, "_quiet", return_value=False),
+                mock.patch.object(bf, "agent_chromes", return_value=[(101, 9333)]),
+                mock.patch.object(bf, "_chrome_agent", side_effect=lambda c: calls.append(c) or True),
+                mock.patch.object(bf, "_get", side_effect=lambda u: tabs if u.endswith("/json/list") else "ok"),
+                mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True),
+                mock.patch.object(bf, "_watch_login", side_effect=lambda port, tid: calls.append(("watch", tid)))]
+
+    def _run(self, patches, fn):
+        import contextlib
+        with contextlib.ExitStack() as st:
+            for p in patches:
+                st.enter_context(p)
+            return fn()
+
+    SETTINGS = [{"id": "s", "type": "page", "title": "Your profile", "url": "https://github.com/settings/profile"}]
+    SIGNUP = [{"id": "u", "type": "page", "title": "Join GitHub", "url": "https://github.com/signup?source=login"}]
+    INCIDENT_REPLY = ("Please finish the GitHub signup in the incognito window: solve the captcha and click "
+                      "Create account, then tell me when it's done.")
+
+    def test_focus_with_unmatched_match_raises_nothing(self):
+        calls = []
+        r = self._run(self._focus_env(self.SETTINGS, calls), lambda: bf.focus("github.com/signup"))
+        self.assertFalse(r["focused"])
+        self.assertIn("no tab matches github.com/signup", r["error"])
+        self.assertIn("https://github.com/settings/profile", r["open_tabs"])
+        self.assertEqual(calls, [])   # no show, no activate
+
+    def test_tool_result_says_no_match(self):
+        calls = []
+        out = self._run(self._focus_env(self.SETTINGS, calls), lambda: bf.handle({"match": "github.com/signup"}))
+        self.assertIn('"focused": false', out)
+        self.assertIn("no tab matches", out)
+
+    def test_reply_about_missing_signup_page_gets_no_front_line(self):
+        calls = []
+        bf.transform_tool_result("browser_exec", {}, "ok", session_id="g")
+        r = self._run(self._focus_env(self.SETTINGS, calls), lambda: bf.transform_llm_output(self.INCIDENT_REPLY, session_id="g"))
+        self.assertIsNone(r)
+        self.assertNotIn("activate", calls)
+
+    def test_reply_about_open_signup_page_raises_it(self):
+        calls = []
+        bf.transform_tool_result("browser_exec", {}, "ok", session_id="h")
+        r = self._run(self._focus_env(self.SETTINGS + self.SIGNUP, calls),
+                      lambda: bf.transform_llm_output(self.INCIDENT_REPLY, session_id="h"))
+        self.assertIn("front", r)
+        self.assertIn("Join GitHub", r)
+        self.assertIn("activate", calls)
+
+    def test_reply_naming_no_page_does_not_claim_front(self):
+        calls = []
+        bf.transform_tool_result("browser_exec", {}, "ok", session_id="k")
+        r = self._run(self._focus_env(self.SETTINGS, calls),
+                      lambda: bf.transform_llm_output("Click Allow on the tab I opened.", session_id="k"))
+        self.assertIsNone(r)
+
+    def test_signup_url_counts_as_sign_in(self):
+        for u in ("https://github.com/signup?source=login", "https://example.com/sign-up", "https://x.com/i/flow/join",
+                  "https://example.org/register"):
+            self.assertTrue(bf._LOGIN_URL.search(u), u)
+        self.assertFalse(bf._LOGIN_URL.search("https://github.com/settings/profile"))
+
+    def test_cant_see_window_injects_check_note_once(self):
+        hist = [{"role": "assistant", "tool_calls": [{"function": {"name": "browser_exec"}}]}]
+        with bf._lock:
+            bf._last_raised["c"] = "https://github.com/settings/profile"
+        r = bf.pre_llm_call(session_id="c", user_message="i dont see the captcha window, let's try afain",
+                            conversation_history=hist)
+        self.assertIn("check the browser", r["context"])
+        self.assertIn("https://github.com/settings/profile", r["context"])
+        self.assertIsNone(bf.pre_llm_call(session_id="c", user_message="ok thanks, that worked", conversation_history=hist))
+        r2 = bf.pre_llm_call(session_id="c", user_message="the window is logged in, i dont see a captcha or anything",
+                             conversation_history=hist)
+        self.assertIn("check the browser", r2["context"])
+        # no browser use in the session: nothing
+        self.assertIsNone(bf.pre_llm_call(session_id="n", user_message="i dont see the window", conversation_history=[]))
 
     def test_login_watcher_done_when_tab_leaves_sign_in(self):
         _s = importlib.util.spec_from_file_location("wl", pathlib.Path(__file__).with_name("watch_login.py"))

@@ -65,12 +65,254 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
   return { poll, routes }
 }
 
+const ID_PATTERN = /^[a-z]{2,12}_[0-9a-f]{16,64}$/
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const repairSafeError = (message) => Object.assign(new Error(message), { safe: true })
+const repairRouteKey = (r) => JSON.stringify([r.connectionId, r.mode, r.profile, r.targetProfile])
+const ownerQueryKey = (o) => ['runners', 'owner', o.gateway_id, o.profile]
+const ownerKey = (o) => JSON.stringify(ownerQueryKey(o))
+
+function repairValidRoute(r) {
+  return (
+    r &&
+    ['connectionId', 'profile', 'targetProfile'].every((k) => typeof r[k] === 'string' && r[k].trim()) &&
+    ['local', 'remote'].includes(r.mode)
+  )
+}
+
+function verifyEnvelope(value, route, expected, discovery = false) {
+  const o = value?.meta?.owner
+  if (
+    value?.meta?.contract_version !== 1 ||
+    !UUID.test(o?.gateway_id || '') ||
+    o.profile !== route.targetProfile ||
+    (expected &&
+      (ownerKey(o) !== ownerKey(expected) ||
+        (discovery ? o.owner_epoch < expected.owner_epoch : o.owner_epoch !== expected.owner_epoch)))
+  )
+    throw repairSafeError('Owner identity mismatch')
+  if (value.error)
+    throw repairSafeError(
+      {
+        not_found: 'Plugin unavailable',
+        forbidden: 'Partial permissions',
+        configuration_error: 'Configuration error',
+        dependency_unavailable: 'Provider outage'
+      }[value.error.code] || 'Source unavailable'
+    )
+  if (!value.data) throw repairSafeError('Invalid inventory response')
+  return value
+}
+
+// Port of the pre-fleet repair()/openRepair(): idempotency keys, owner/epoch
+// checks, status reconciliation, and no prompt resend. The row's route and
+// owner are copied before the first await.
+export function createRepairClient(ctx, hostRef = host) {
+  const starts = new Set(), repairPending = new Map(), repairKeys = new Map()
+  async function routes() {
+    const list = await hostRef.profileRoutes()
+    if (!Array.isArray(list) || list.some((r) => !repairValidRoute(r)))
+      throw repairSafeError('Invalid owner route registry')
+    return [...new Map(list.map((r) => [repairRouteKey(r), { ...r }])).values()]
+  }
+  async function request(input, path, options = {}, expected) {
+    if (!repairValidRoute(input)) throw repairSafeError('Invalid owner route')
+    const route = { ...input }, key = repairRouteKey(route)
+    if (!(await routes()).some((r) => repairRouteKey(r) === key))
+      throw repairSafeError('Owner gateway disconnected: route removed')
+    const response = await ctx.rest(
+      `/v1${path}${path.includes('?') ? '&' : '?'}profile=${encodeURIComponent(route.targetProfile)}`,
+      { ...options, connectionId: route.connectionId, timeoutMs: 10000 }
+    )
+    if (!(await routes()).some((r) => repairRouteKey(r) === key))
+      throw repairSafeError('Owner gateway disconnected: route changed')
+    if (path === '/enrollment') {
+      if (
+        response?.contract_version !== 1 || response.profile !== route.targetProfile ||
+        typeof response.enrolled !== 'boolean' || !Array.isArray(response.capabilities) ||
+        (response.enrolled && !response.capabilities.includes('inventory'))
+      )
+        throw repairSafeError('Invalid enrollment response')
+      return response
+    }
+    return verifyEnvelope(response, route, expected, path === '/inventory' && !options.method)
+  }
+  async function assertRoute(route) {
+    if (!(await routes()).some((r) => repairRouteKey(r) === repairRouteKey(route)))
+      throw repairSafeError('Owner gateway disconnected: route removed')
+  }
+  async function openRepair(route, owner, repair) {
+    if (
+      !repair?.owner || ownerKey(repair.owner) !== ownerKey(owner) ||
+      repair.owner.owner_epoch !== owner.owner_epoch ||
+      !ID_PATTERN.test(repair.session?.start_request_id || '')
+    )
+      throw repairSafeError('Invalid repair owner or start request')
+    if (typeof hostRef.requestProfile !== 'function' || typeof hostRef.openSession !== 'function')
+      throw repairSafeError('Repair sessions unsupported: update Hermes Desktop')
+    const params = {
+      profile: route.targetProfile, namespace: 'runners', start_request_id: repair.session.start_request_id
+    }
+    async function status() {
+      const response = await request(route, `/repairs/${encodeURIComponent(repair.id)}`, {}, owner)
+      const current = response.data.repair
+      if (current?.owner?.gateway_id !== owner.gateway_id || current.owner.profile !== owner.profile)
+        throw repairSafeError('Repair session owner identity mismatch')
+      return {
+        gateway_id: current.owner.gateway_id, profile: current.owner.profile,
+        stored_session_id: current.session.stored_session_id,
+        resolved_session_id: current.session.lineage_tip_id,
+        exists: !!current.session.stored_session_id,
+        reconciliation: current.session.state, reconciled: true
+      }
+    }
+    const key = JSON.stringify([ownerKey(owner), owner.owner_epoch, params.start_request_id])
+    await assertRoute(route)
+    let result
+    if (starts.has(key)) {
+      try {
+        result = await status()
+      } catch {
+        throw repairSafeError('Repair outcome unknown; status reconciliation unavailable. No prompt resent.')
+      }
+    } else {
+      starts.add(key)
+      try {
+        result = await hostRef.requestProfile(route, 'session.start_request', params, 10000, { spawnPriority: 'foreground' })
+      } catch {
+        await assertRoute(route)
+        try {
+          result = await status()
+        } catch {
+          throw repairSafeError('Repair outcome unknown; status reconciliation unavailable. No prompt resent.')
+        }
+      }
+    }
+    // Only an authoritative owner status of reserved/queued permits recovery of
+    // a pre-create/pre-claim crash. Reuse the durable core ID, never send text.
+    if (['reserved', 'queued'].includes(result?.reconciliation)) {
+      await assertRoute(route)
+      result = await hostRef.requestProfile(route, 'session.start_request', params, 10000, { spawnPriority: 'foreground' })
+    }
+    await assertRoute(route)
+    // Core keys its start ledger by its own install authority, not the runners
+    // owner UUID. Bind an RPC result to the verified runners owner through the
+    // owner's reconciled status for the same repair before opening anything.
+    if (result && !result.reconciled) {
+      let server
+      try {
+        server = await status()
+      } catch {
+        throw repairSafeError('Repair session started; owner status unavailable. Open again to reconcile. No prompt resent.')
+      }
+      if (
+        result.profile !== owner.profile || !server.exists ||
+        server.stored_session_id !== result.stored_session_id
+      )
+        throw repairSafeError('Repair session owner identity mismatch')
+      result = server
+    }
+    if (result?.gateway_id !== owner.gateway_id || result.profile !== owner.profile)
+      throw repairSafeError('Repair session owner identity mismatch')
+    const id = result.resolved_session_id || result.stored_session_id
+    if (!result.exists || !/^[A-Za-z0-9_-]{1,128}$/.test(id || ''))
+      throw repairSafeError('Repair session outcome unknown; no session available to open')
+    await hostRef.openSession(id, { route: { ...route } })
+    return repair
+  }
+  async function repair(row) {
+    if (!row?.actionable || !row.source?.snapshot || row.source.error)
+      throw repairSafeError('Owner gateway disconnected or ownership conflict')
+    if (!ID_PATTERN.test(row.id)) throw repairSafeError('Invalid runner ID')
+    const route = { ...row.source.route }, owner = { ...row.source.snapshot.meta.owner }, entity = row.id
+    const key = JSON.stringify([ownerKey(owner), owner.owner_epoch, entity])
+    const related = new Set([entity, ...row.source.snapshot.data.runners
+      .filter((r) => row.host_id && r.host_id === row.host_id).map((r) => r.id)])
+    const mappedHost = row.source.snapshot.data.hosts.find((item) => item.id === row.host_id)
+    if (ID_PATTERN.test(mappedHost?.resource_id || '')) related.add(mappedHost.resource_id)
+    if (repairPending.has(key)) return repairPending.get(key)
+    const run = async () => {
+      const detail = await request(route, `/runners/${encodeURIComponent(entity)}?history_limit=50`, {}, owner)
+      const existing = (detail.data.repairs || []).find((r) =>
+        related.has(r.entity_id) && !['closed', 'failed'].includes(r.state))
+      if (existing) {
+        starts.add(JSON.stringify([ownerKey(owner), owner.owner_epoch, existing.session?.start_request_id]))
+        return openRepair(route, owner, existing)
+      }
+      const incident = (detail.data.incidents || []).find((i) =>
+        i.entity_id === entity && !i.resolved_at && ID_PATTERN.test(i.id))
+      if (!incident) throw repairSafeError('No current incident identity; refresh runner evidence before investigating')
+      const previous = (detail.data.repairs || []).find((r) => related.has(r.entity_id))
+      const attempt = `${key}:${incident.id}:${previous?.id || 'first'}`
+      if (!repairKeys.has(attempt)) repairKeys.set(attempt, `repair_${crypto.randomUUID().replaceAll('-', '')}`)
+      const response = await request(route, '/repairs', {
+        method: 'POST',
+        body: {
+          entity_id: entity, incident_id: incident.id,
+          idempotency_key: repairKeys.get(attempt), mode: row.issue ? 'repair' : 'diagnose', expected_owner: owner
+        }
+      }, owner)
+      if (!related.has(response.data.repair?.entity_id))
+        throw repairSafeError('Invalid repair entity')
+      return openRepair(route, owner, response.data.repair)
+    }
+    const promise = run()
+    repairPending.set(key, promise)
+    try { return await promise } finally { repairPending.delete(key) }
+  }
+  // Popover enablement. Creating a session needs an open incident. Reopening an
+  // active repair does not: the reservation outlives the incident row.
+  async function prepare(route, slot, sourceError) {
+    const label = 'Repair in new session'
+    if (sourceError) return { enabled: false, label, reason: 'Owner gateway disconnected', row: null }
+    if (!repairValidRoute(route) || !ID_PATTERN.test(slot?.id || ''))
+      return { enabled: false, label, reason: 'No runner id on this slot', row: null }
+    let enrollment
+    try {
+      enrollment = await request(route, '/enrollment')
+    } catch (e) {
+      if ((e?.status ?? e?.statusCode) === 404)
+        return { enabled: false, label, reason: 'Repair sessions are not enabled for this gateway', row: null }
+      throw e?.safe ? e : repairSafeError('Could not read enrollment')
+    }
+    const features = enrollment?.features?.repair_sessions === true
+    if (!features)
+      return { enabled: false, label, reason: 'Repair sessions are not enabled for this gateway', row: null }
+    const detail = await request(route, `/runners/${encodeURIComponent(slot.id)}?history_limit=50`)
+    const runner = detail.data.runner || { id: slot.id, host_id: null }
+    const incident = (detail.data.incidents || []).find((i) =>
+      i.entity_id === slot.id && !i.resolved_at && ID_PATTERN.test(i.id || ''))
+    const active = (detail.data.repairs || []).find((r) =>
+      r.entity_id === slot.id && !['closed', 'failed'].includes(r.state))
+    const row = {
+      actionable: true,
+      id: slot.id,
+      host_id: runner.host_id || null,
+      issue: true,
+      source: {
+        route: { ...route },
+        snapshot: {
+          meta: { owner: { ...detail.meta.owner } },
+          data: { runners: [runner], hosts: detail.data.hosts || [] }
+        }
+      }
+    }
+    return {
+      enabled: !!(incident || active),
+      label: active ? 'Open repair session' : label,
+      reason: incident || active ? '' : 'No open incident',
+      row
+    }
+  }
+  return { prepare, repair, openRepair, request }
+}
+
 // Each section comes from the route that has the best view of it (ready > stale > ...).
 export function merge(sources, now = Date.now()) {
   const pick = (name) => {
     const options = sources
       .filter((s) => s.body?.[name])
-      .map((s) => ({ ...s.body[name], connectionId: s.route.connectionId, at: s.at, error: s.error }))
+      .map((s) => ({ ...s.body[name], connectionId: s.route.connectionId, route: { ...s.route }, at: s.at, error: s.error }))
       .sort((a, b) => (RANK[a.state] ?? 9) - (RANK[b.state] ?? 9) || b.at - a.at)
     const best = options[0]
     if (!best) {
@@ -121,11 +363,12 @@ export function summarize(view) {
 
 const SLOT_TITLE = { busy: 'busy', idle: 'free', offline: 'offline', unknown: 'state unknown' }
 
-function Slot({ state, title, onClick }) {
+function Slot({ state, title, onClick, onMouseEnter, slotId }) {
   return h(onClick ? 'button' : 'span', {
     type: onClick ? 'button' : undefined,
     className: `hermes-fleet-slot is-${state}`,
-    title, 'aria-label': title, onClick
+    title, 'aria-label': title, onClick, onMouseEnter,
+    'data-runner-slot': slotId || undefined
   })
 }
 
@@ -188,17 +431,65 @@ function GatewayRow({ m, now }) {
   )
 }
 
-function CiRow({ m, now }) {
+function CiRow({ m, now, repairClient, route, sourceError }) {
+  const [openKey, setOpenKey] = useState(null)
+  const interactive = !!(repairClient && route)
   const busy = m.slots.filter((s) => s.state === 'busy').length
   const offline = m.slots.filter((s) => s.state === 'offline').length
+  const open = m.slots.find((s, i) => (s.id || s.runner || String(i)) === openKey)
   return h('div', { className: 'hermes-fleet-row', 'data-machine': m.name },
     h('span', { className: 'hermes-fleet-name' }, text(m.name) + (m.ephemeral ? ' (ephemeral)' : '')),
     h('span', { className: 'hermes-fleet-slots' },
-      ...m.slots.map((s, i) => h(Slot, { key: s.runner || i, state: s.state, title: `${text(s.runner)} · ${SLOT_TITLE[s.state]}\n${s.labels.join(', ')}` }))),
+      ...m.slots.map((s, i) => {
+        const key = s.id || s.runner || String(i)
+        return h(Slot, {
+          key, state: s.state, slotId: s.id,
+          title: `${text(s.runner)} · ${SLOT_TITLE[s.state]}\n${(s.labels || []).join(', ')}`,
+          onClick: interactive ? () => setOpenKey(openKey === key ? null : key) : undefined,
+          onMouseEnter: interactive ? () => setOpenKey(key) : undefined
+        })
+      })),
     h('span', { className: 'hermes-fleet-count' }, `${busy}/${m.slots.length}`),
     h('span', { className: 'hermes-fleet-meta' }, [m.labels.join(', '), offline ? `${offline} offline` : null].filter(Boolean).join(' · ')),
     m.load ? h(Meters, { load: m.load, now }) : null,
-    ...m.warnings.map((w) => h('div', { key: w, className: 'hermes-fleet-warning' }, `⚠ ${text(w)}`))
+    ...m.warnings.map((w) => h('div', { key: w, className: 'hermes-fleet-warning' }, `⚠ ${text(w)}`)),
+    open ? h(SlotRepair, { key: openKey, slot: open, route, repairClient, sourceError }) : null
+  )
+}
+
+function SlotRepair({ slot, route, repairClient, sourceError }) {
+  const [prep, setPrep] = useState(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    let cancel = false
+    repairClient.prepare(route, slot, sourceError).then(
+      (p) => { if (!cancel) setPrep(p) },
+      (e) => { if (!cancel) setError(e?.safe ? e.message : 'Could not check repair status') }
+    )
+    return () => { cancel = true }
+  }, [slot.id])
+  return h('div', {
+    className: 'hermes-fleet-pop', role: 'dialog', 'aria-label': `Actions for ${text(slot.runner)}`
+  },
+    h('div', { className: 'hermes-fleet-pop-title' }, text(slot.runner)),
+    h('button', {
+      type: 'button',
+      'data-repair-action': slot.id || '',
+      'data-repair-ready': prep ? '1' : '0',
+      disabled: !prep?.enabled || busy,
+      title: prep?.reason || prep?.label || 'Checking repair status',
+      onClick: async () => {
+        if (!prep?.enabled || busy || !prep.row) return
+        setBusy(true)
+        setError('')
+        try { await repairClient.repair(prep.row) }
+        catch (e) { setError(e?.safe ? e.message : 'Could not open repair session') }
+        finally { setBusy(false) }
+      }
+    }, busy ? 'Opening repair session…' : (prep?.label || 'Repair in new session')),
+    error ? h('div', { role: 'alert' }, error) : null,
+    prep && !prep.enabled ? h('div', { className: 'hermes-fleet-note' }, prep.reason) : null
   )
 }
 
@@ -213,7 +504,7 @@ function SectionNote({ section }) {
   return h('div', { className: 'hermes-fleet-note', role: 'status' }, msg)
 }
 
-export function Panel({ view, now }) {
+export function Panel({ view, now, repairClient }) {
   const s = summarize(view)
   return h('div', { className: 'hermes-fleet' },
     h('div', { className: 'hermes-fleet-head' },
@@ -225,7 +516,9 @@ export function Panel({ view, now }) {
       h('span', null, 'CI workers (GitHub Actions)'),
       h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
     h(SectionNote, { section: view.ci }),
-    ...view.ci.machines.map((m) => h(CiRow, { key: m.name, m, now })),
+    ...view.ci.machines.map((m) => h(CiRow, {
+      key: m.name, m, now, repairClient, route: view.ci.route, sourceError: view.ci.error
+    })),
     view.ci.hidden_deregistered
       ? h('div', { className: 'hermes-fleet-note' }, `${view.ci.hidden_deregistered} deregistered runners (history) hidden`)
       : null,
@@ -259,6 +552,7 @@ export function Runners({ ctx }) {
   const [open, setOpen] = useState(false)
   const visible = useVisible()
   const transport = useMemo(() => createTransport(ctx), [ctx])
+  const repairClient = useMemo(() => createRepairClient(ctx), [ctx])
   const query = useQuery({
     queryKey: ['runners', 'fleet'],
     queryFn: () => transport.poll(),
@@ -288,7 +582,7 @@ export function Runners({ ctx }) {
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
       style: { width: 'min(640px, calc(100vw - 24px))', maxHeight: '70vh', overflowY: 'auto' }
-    }, view ? h(Panel, { view, now }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
+    }, view ? h(Panel, { view, now, repairClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
   )
 }
 
@@ -311,6 +605,10 @@ const CSS = `
 .hermes-fleet-warning{color:var(--ui-text-secondary)}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
+.hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}
+.hermes-fleet-pop-title{font-weight:600}
+.hermes-fleet-pop button{font-size:11px}
+.hermes-fleet-pop button:disabled{opacity:.55}
 .hermes-fleet-slot{display:inline-block;width:10px;height:10px;border-radius:2px;border:1px solid var(--ui-text-tertiary);padding:0;background:transparent}
 button.hermes-fleet-slot{cursor:pointer}
 .hermes-fleet-slot.is-busy{background:var(--ui-accent);border-color:var(--ui-accent)}

@@ -156,8 +156,8 @@ def ci_workers(inventory, loads=None):
         g = groups.setdefault(key, dict(name=key, ephemeral=ephemeral, slots=[], warnings=[], load=None))
         if g['load'] is None and row.get('host_id') in (loads or {}):
             g['load'] = loads[row['host_id']]
-        g['slots'].append(dict(runner=row.get('display_name'), state=_slot(row, fresh),
-                               labels=list(row.get('labels') or [])))
+        g['slots'].append(dict(id=row.get('id'), runner=row.get('display_name'),
+                               state=_slot(row, fresh), labels=list(row.get('labels') or [])))
         if row.get('readiness') == 'fail' and row.get('registration') == 'online':
             failed = (row.get('readiness_evidence') or {}).get('failed') or []
             g['warnings'].append(f"{row.get('display_name')}: "

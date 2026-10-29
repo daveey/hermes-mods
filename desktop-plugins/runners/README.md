@@ -7,7 +7,12 @@ Status-bar chip (order 6) and panel. Two groups, one row per machine, one square
   "slots not set" and only the busy count). Busy slots are live Board leases from the gateway's sync-shadow
   board replicas: hover shows card id, title, board and run time; click opens the card.
 - **CI workers**: GitHub Actions runners from the runners collector, grouped into machines by runner name
-  (`ec2-gwgen-2` → `ec2-gwgen`, `…-i-<instance>` → one ephemeral group). One runner = one slot. Deregistered
+  (`ec2-gwgen-2` → `ec2-gwgen`, `…-i-<instance>` → one ephemeral group). One runner = one slot. Each slot
+  carries the runner entity id (`runner_…`) from the fleet projection. Click or hover a slot to open its
+  popover: **Repair in new session** (or **Open repair session** when that runner already has an active
+  repair). The action is enabled only when that gateway's enrollment has `features.repair_sessions` and the
+  runner has an open incident, or an active repair to reopen. It uses the captured owner route: idempotency
+  keys, owner/epoch checks, status reconciliation, and no prompt resend. Deregistered
   runners are history: only their count is shown. A failed readiness check is a ⚠ line, not a red slot.
 
 Load: each gateway machine reports CPU load, RAM in use and disk space to the Board every 30 s (core
@@ -46,7 +51,10 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 - registry → slots, pinned only, slots not set, draining: `fleet.test.mjs` "registry", `test_fleet.py`
   `test_registry_sets_slots_flags_and_drain`
 - live leases → busy slots with card titles, click opens card: "live leases", `test_live_leases_fill_slots_across_boards`
-- CI runners → machines, offline, warnings, hidden history: "CI runners", `test_ci_runners_grouped_into_machines_with_one_slot_each`
+- CI runners → machines, offline, warnings, hidden history, and the runner entity id on each slot: "CI runners",
+  `test_ci_runners_grouped_into_machines_with_one_slot_each`
+- repair popover → create a session, reopen the same session id twice, disabled without an incident:
+  `repair.test.mjs`
 - unreachable → backoff, stale last data, never red: "unreachable", `test_unreachable_registry_and_unseen_machines_are_unknown_not_failed`,
   `test_stale_registry_keeps_slots_but_not_liveness`
 - REST route, section isolation, 5 s server cache: `test_api.py` `test_fleet_route_*`

@@ -51,11 +51,12 @@ def test_live_leases_fill_slots_across_boards(tmp_path):
 
 
 def test_ci_runners_grouped_into_machines_with_one_slot_each():
+    entity = 'runner_' + 'ab' * 16
     def row(name, registration='online', activity='idle', labels=('self-hosted', 'Linux', 'X64'), **kw):
         return dict(dict(display_name=name, registration=registration, activity=activity, freshness='fresh',
                          labels=list(labels), readiness='pass'), **kw)
     inventory = dict(meta=dict(freshness='fresh', observed_at='2026-10-28T00:00:00Z'), data=dict(runners=[
-        row('ec2-gwgen-1', activity='busy', labels=('self-hosted', 'Linux', 'ci-capacity-slot-1', 'ci-fast')),
+        row('ec2-gwgen-1', id=entity, activity='busy', labels=('self-hosted', 'Linux', 'ci-capacity-slot-1', 'ci-fast')),
         row('ec2-gwgen-2', labels=('self-hosted', 'Linux', 'ci-capacity-slot-2', 'ci-fast')),
         row('metta4', registration='offline'), row('metta4-12', registration='offline'),
         row('asg-ci-i-0a6c6cfc48937944e-e38f2300'),
@@ -66,6 +67,8 @@ def test_ci_runners_grouped_into_machines_with_one_slot_each():
     m = {g['name']: g for g in out['machines']}
     assert out['state'] == 'ready' and out['hidden_deregistered'] == 1
     assert [s['state'] for s in m['ec2-gwgen']['slots']] == ['busy', 'idle']
+    # The Desktop repair action addresses the collector entity, not the display name.
+    assert [s['id'] for s in m['ec2-gwgen']['slots']] == [entity, None]
     assert m['ec2-gwgen']['labels'] == ['ci-fast']
     assert [s['state'] for s in m['metta4']['slots']] == ['offline', 'offline']
     assert m['asg-ci']['ephemeral'] is True and out['machines'][-1]['name'] == 'asg-ci'
