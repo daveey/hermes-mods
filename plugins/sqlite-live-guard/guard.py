@@ -8,9 +8,12 @@ home (``~/.hermes``, ``$HERMES_HOME``), outside scratch, cache, archive and back
   ``-shm`` of a database that another process has open, or swapping the main file under it, splits the
   writers onto different WAL views, and the next checkpoint corrupts the b-trees.
 - ``sqlite3`` maintenance against a live file (``REINDEX``, ``VACUUM``, checkpoint / journal-mode pragmas,
-  ``.restore``), and ``sqlite3`` writes (DML/DDL) into a live file that was quarantined as corrupt in the
-  last few hours (a ``<db>.corrupt.*.bak`` sibling). Reads, ``-readonly`` and ``mode=ro``/``immutable=1``
-  URIs pass; plain DML into a healthy board passes (SQLite locks it correctly).
+  ``.restore``); ``sqlite3`` writes (DML/DDL) into a live Kanban board (``kanban.db``) at any time, with the
+  refusal naming the ``hermes kanban`` verb that makes the change; and ``sqlite3`` writes into any other live
+  file that was quarantined as corrupt in the last few hours (a ``<db>.corrupt.*.bak`` sibling). Reads,
+  ``-readonly`` and ``mode=ro``/``immutable=1`` URIs pass.
+- ``rm`` / ``mv`` / ``truncate`` of a live database's ``<db>.corrupt.*.bak`` quarantine: deleting it once
+  switched the raw-write block off and destroyed the evidence a recovery reads (self-heal agent-6eb3a51e94).
 
 A damaged Kanban board is rebuilt with ``hermes kanban [--board <slug>] recover``: it holds the board's
 recovery lock, installs in place through the SQLite backup API (no rename under open WAL connections) and
@@ -187,6 +190,65 @@ def _check_redirects(seg: list[str], in_home: bool) -> Optional[str]:
     return None
 
 
+# Writes into a live Kanban board (any SQL statement on these tables) map to the verb that makes the change.
+_KANBAN_VERBS = (
+    (re.compile(r"\binto\s+task_comments\b", re.I), "comment <id> \"<text>\""),
+    (re.compile(r"\bstatus\s*=\s*'ready'", re.I), "unblock <id>"),
+    (re.compile(r"\bstatus\s*=\s*'blocked'", re.I), "block <id> \"<reason>\""),
+    (re.compile(r"\bstatus\s*=\s*'done'", re.I), "complete <id> --summary \"...\""),
+    (re.compile(r"\bstatus\s*=\s*'scheduled'", re.I), "schedule <id> ..."),
+    (re.compile(r"\bstatus\s*=\s*'archived'", re.I), "archive <id>"),
+    (re.compile(r"\binto\s+task_links\b", re.I), "link <parent> <child>"),
+    (re.compile(r"\bfrom\s+task_links\b", re.I), "unlink <parent> <child>"),
+    (re.compile(r"\b(?:into|from)\s+task_attachments\b", re.I), "attach <id> <file> / attach-rm <id> <att>"),
+    (re.compile(r"\bassignee\s*=", re.I), "reassign <id> <profile>"),
+    (re.compile(r"\b(?:priority|title|body)\s*=", re.I), "edit <id> --priority/--title/--body ..."),
+)
+
+
+def _board_of(db: str, in_home: bool) -> Optional[str]:
+    """``hermes kanban`` prefix for the live Kanban board ``db`` names (``hermes kanban``, ``hermes kanban
+    --board <slug>``, ``HERMES_HOME=<dir> hermes kanban`` for a profile's board), or None for other databases."""
+    path = db[5:].split("?", 1)[0] if db.startswith("file:") else db
+    if path.rsplit("/", 1)[-1] != "kanban.db":
+        return None
+    if in_home and not path.startswith(("/", "~", "$")):
+        path = os.path.join(_home(), path)
+    full = Path(_expand(path))
+    home = Path(_home())
+    if full == home / "kanban.db":
+        return "hermes kanban"
+    if full.parent.parent == home / "kanban" / "boards":
+        return f"hermes kanban --board {full.parent.name}"
+    return "HERMES_HOME=" + str(full.parent).replace(str(Path.home()), "~") + " hermes kanban"
+
+
+def _kanban_verb(sql: str, prefix: str) -> str:
+    for pat, verb in _KANBAN_VERBS:
+        if pat.search(sql or ""):
+            return f"`{prefix} {verb}` (or the matching kanban_* tool)"
+    if re.search(r"\btask_events\b", sql or "", re.I):
+        return (f"the `{prefix} <verb>` that makes the change: it writes its own task_events row (an event "
+                "row alone moves nothing)")
+    return f"the kanban_* tools or the matching `{prefix} <verb>` (`{prefix} --help` lists them)"
+
+
+# ``<db>.corrupt.<hash>.bak``: the copy Kanban/SQLite recovery kept of a board judged corrupt. It is the evidence
+# ``hermes kanban recover`` and a human need; Kanban rotates these itself (kanban_db_connect cap).
+_QUARANTINE_NAME = re.compile(r"\.db\.corrupt\.[^/]*\.bak$")
+
+
+def is_quarantine(path: str, in_home: bool = False) -> bool:
+    """True when ``path`` (globs included) names a live database's ``.corrupt.*.bak`` quarantine."""
+    if not path or path.startswith("-"):
+        return False
+    base = path.rsplit("/", 1)[-1]
+    if not _QUARANTINE_NAME.search(base):
+        return False
+    live = path[: -len(base)] + base.split(".corrupt.", 1)[0]
+    return is_live(live, in_home)
+
+
 def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[str]:
     readonly = any(a in ("-readonly", "--readonly", "-safe") for a in args)
     sql: list[str] = []
@@ -229,6 +291,10 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[s
     if kind == "maintenance":
         return f"`sqlite3` would run maintenance (REINDEX/VACUUM/checkpoint/journal pragma) on live database {db}"
     if kind == "write":
+        board = _board_of(db, in_home)
+        if board is not None:
+            return (f"`sqlite3` would write to live Kanban board {db}; a raw write skips the board's own "
+                    f"transitions, events and locks (hub incident 2026-10-28). Use {_kanban_verb(text, board)}")
         bak = recently_quarantined(os.path.join(_home(), db) if in_home and not db.startswith(("/", "~", "$", "file:"))
                                    else db)
         if bak:
@@ -296,6 +362,12 @@ def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
             if hit:
                 verb = "move" if word == "mv" else "delete or truncate"
                 return f"`{word}` would {verb} live database file {hit}"
+            bak = next((o for o in ops if is_quarantine(o, in_home)), None)
+            if bak:
+                verb = "move" if word == "mv" else "delete or truncate"
+                return (f"`{word}` would {verb} the corruption quarantine {bak} of live database "
+                        f"{bak.split('.corrupt.', 1)[0]}; it is the evidence a recovery needs, and Kanban rotates "
+                        "these copies itself (deleting one also proves nothing about the board's health)")
         elif word in ("cp", "install", "rsync", "ln", "sqlite3_rsync"):
             if ops and is_live(ops[-1], in_home):
                 return f"`{word}` would overwrite live database file {ops[-1]}"
@@ -436,7 +508,7 @@ def check_python(code: str) -> Optional[str]:
                 cands = [s.group("s") for s in _PY_STR.finditer(groups["dst"])][-1:]
             else:
                 cands = [s.group("s") for s in _PY_STR.finditer(groups.get("a") or "")]
-            hit = next((c for c in cands if is_live(_expand(c))), None)
+            hit = next((c for c in cands if is_live(_expand(c)) or is_quarantine(_expand(c))), None)
             if hit:
                 return f"Python file operations on live database file {hit}"
     why = _check_python_ast(code)
