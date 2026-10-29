@@ -1721,11 +1721,14 @@ class ActionStore:
         finally:
             c.close()
 
-    def withdraw(self, owner, rid, *, by, reason, evidence=None, expected_revision=None, now=None):
+    def withdraw(self, owner, rid, *, by, reason, evidence=None, expected_revision=None, now=None,
+                 closes_cards=False):
         """open/needs_context -> withdrawn. Grants nothing, admits no turn, delivers nothing.
 
         Refused once a decision is recorded for the current revision (the decision wins), for a closed
         request, or for a stale expected revision. Repeating it returns the first withdrawal unchanged.
+        A request bound to a decision card is refused unless the caller closes that card afterwards
+        (``closes_cards``, withdraw_request with a card closer), so no card is left asking David.
         """
         if by not in WITHDRAW_BY: raise ActionError('Invalid withdrawal actor')
         if not isinstance(reason, str) or not reason.strip(): raise ActionError('Withdrawal reason required')
@@ -1737,7 +1740,7 @@ class ActionStore:
             r = self._get(c, owner, rid); ns = self._ns(owner)
             if r['state'] == 'withdrawn': return self._view(c, owner, rid)
             if r['state'] not in ('open', 'needs_context'): raise ActionError('Request is already closed', 409)
-            if any(a.get('type') == 'kanban' for a in r.get('aliases', [])):
+            if not closes_cards and any(a.get('type') == 'kanban' for a in r.get('aliases', [])):
                 raise ActionError('This request is decided on its decision card', 409)
             if expected_revision is not None and r['revision'] != expected_revision:
                 raise ActionError('Stale revision', 409)
@@ -1992,10 +1995,21 @@ def _retire_steps(ledger: "Ledger", session: str, ids: list[str], resolution: st
 
 def withdraw_request(store: "ActionStore", ledger: Optional["Ledger"], owner: dict, rid: str, *, by: str,
                      reason: str, evidence: Optional[str] = None, expected_revision: Optional[int] = None,
-                     now: Optional[float] = None) -> dict:
-    """Withdraw one canonical request (ActionStore.withdraw), then retire its ledger step(s)."""
+                     now: Optional[float] = None, cards=None) -> dict:
+    """Withdraw one canonical request (ActionStore.withdraw), then retire its ledger step(s).
+
+    ``cards`` (QualifiedCardDelivery) also lets a request bound to a decision card be withdrawn: the card
+    is closed (archived) right after. Repeating the withdrawal retries a card close that failed."""
     view = store.withdraw(owner, rid, by=by, reason=reason, evidence=evidence,
-                          expected_revision=expected_revision, now=now)
+                          expected_revision=expected_revision, now=now, closes_cards=cards is not None)
+    if cards is not None and view.get("state") == "withdrawn" and any(
+            a.get("type") == "kanban" for a in view.get("aliases", [])):
+        w = view.get("withdrawal") or {}
+        try:
+            cards.close_withdrawn(view, w.get("reason") or reason)
+        except Exception as exc:
+            raise ActionError(f"Request withdrawn, but closing its decision card failed ({exc}); "
+                              "repeat the withdrawal to retry", 503) from exc
     ids = [a["id"] for a in view.get("aliases", []) if a.get("type") == "user_step"
            and a.get("gatewayId") == owner["gatewayId"] and a.get("profile") == owner["profile"]]
     if ids and ledger is not None:

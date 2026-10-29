@@ -120,6 +120,11 @@ transaction becomes visible. Replacement requests retain those exact card aliase
 and rebind with revision CAS. Other Kanban references belong in `scope.sourceRefs`,
 not in mutation-authorizing aliases. Failed publication can leave an inert blocked
 card; it cannot expose an unbound decision or schedule execution.
+The card carries a `human_request` (core refuses a blocked card without one,
+`agent_owned_block`) and is typed `needs_input`, so the board shows it as waiting
+on David: `action` = request title, `interaction` = `approval` (approval),
+`reply` (choice/input) or `external` (external_step), `scope` = the scope's first
+paragraph, `evidence` = `ActionRequest <id> revision <n> in the For you queue`.
 
 ## Persistence and API
 
@@ -195,8 +200,11 @@ isolated tests, not live deployment or full final-gate ordering proof.
 An ask that is no longer needed leaves the queue through `withdrawn`, a terminal
 state that is **not a decision**: it grants nothing, admits no turn and delivers
 nothing. It is refused (409) once a decision is recorded for the current revision,
-so a decision always wins a race, and it is never available for a request bound to
-a decision card (that card decides it). The legacy ledger step behind it is marked
+so a decision always wins a race. A request bound to a decision card can be
+withdrawn only by its agent (`action_request {"withdraw": ...}`): the undecided
+card gets a "Withdrawn without a decision" comment and is archived, and repeating
+the withdrawal retries a failed archive. The reconciler and the Desktop "Not
+needed" button still never withdraw card-bound requests. The legacy ledger step behind it is marked
 resolved (`No longer needed: <reason>`, `withdrawn: true`), which keeps the passive
 strip and ask-gate consistent. A withdrawal is not a decline: asking the same thing
 again later is a fresh ask, never held as a repeat. Lifecycle data (ask time and
@@ -403,9 +411,15 @@ turn-end hook). Tests: `tests/test_clarify_early.py`.
 From the repository root:
 
 ```sh
-uv run --with pytest --with pyyaml --with fastapi --with httpx python -m pytest -q -p no:cacheprovider plugins/user-steps/tests
+uv run --with pytest --with pyyaml --with fastapi --with httpx --with ruamel.yaml python -m pytest -q -p no:cacheprovider plugins/user-steps/tests -rs
 HERMES_DESKTOP_DIR=/path/to/test-dependencies node --test --test-reporter=tap desktop-plugins/user-steps/decision-queue.test.mjs desktop-plugins/user-steps/decision-queue.browser.test.mjs desktop-plugins/user-steps/test/*.test.mjs desktop-plugins/session-tasks/test/*.test.mjs desktop-plugins/blocked-panel/test/*.test.mjs
 ```
+
+`tests/conftest.py` puts the core checkout (`HERMES_CORE_DIR`, else `~/.hermes/hermes-agent`) on
+`sys.path`, so the real-core Kanban tests (`test_decision_card_real_core.py`, `test_card_delivery_core.py`)
+run instead of skipping. Inside a Kanban worker the delegated-write fence covers `~/.hermes`, so pass
+`--basetemp` outside it (e.g. `--basetemp ~/.cache/us-pytest`) or those tests skip. The three
+`tui_gateway` tests still need `run-core-integration.sh <core worktree>`.
 
 `HERMES_DESKTOP_DIR` points to a package directory containing React, react-dom,
 jsdom, esbuild and Playwright with installed Chromium. If omitted, the tests use

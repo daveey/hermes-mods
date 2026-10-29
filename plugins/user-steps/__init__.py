@@ -298,7 +298,8 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
             core._string(w['requestId'])
             owner = core.server_owner(session_id)
             out = core.withdraw_request(core.ActionStore(), _ledger(), owner, w['requestId'], by='agent',
-                                        reason=w['reason'], expected_revision=w.get('expectedRevision'))
+                                        reason=w['reason'], expected_revision=w.get('expectedRevision'),
+                                        cards=cards_mod.QualifiedCardDelivery())
             return json.dumps({'request': out})
         core._object(args, ('request',), ('requestId', 'expectedRevision', 'decisionCard'))
         owner = core.server_owner(session_id)
@@ -316,7 +317,8 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
             if 'expectedRevision' not in args: raise core.ActionError('expectedRevision required')
             out = core.withdraw_request(st, _ledger(), owner, args['requestId'], by='agent',
                                         reason=payload.get('title') or 'No decision needed',
-                                        expected_revision=args.get('expectedRevision'))
+                                        expected_revision=args.get('expectedRevision'),
+                                        cards=cards_mod.QualifiedCardDelivery())
             return json.dumps({'request': out, 'note': 'Not published: it says no decision is needed, so the '
                                'request was withdrawn instead (no decision, nothing granted).'})
         if payload.get('kind') == 'approval' and not (payload.get('scope') or {}).get('complete'):

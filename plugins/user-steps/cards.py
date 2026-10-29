@@ -256,7 +256,8 @@ class QualifiedCardDelivery:
         from types import SimpleNamespace
         return SimpleNamespace(connect=connect, write_txn=kanban_db.write_txn,
                                get_task=kanban_db.get_task, add_comment=kanban_db.add_comment,
-                               create_task=kanban_db.create_task)
+                               create_task=kanban_db.create_task, block_task=kanban_db.block_task,
+                               archive_task=kanban_db.archive_task)
 
     def prepare(self, request, board):
         """Create a dedicated blocked metadata card via the fenced core producer.
@@ -269,19 +270,74 @@ class QualifiedCardDelivery:
                    type='kanban', board=board, id='new')
         api = self._api()
         c = api.connect(self._path(ref, owner))
+        ask = self.human_request(request)
         try:
             ref['id'] = api.create_task(c, title=request['title'],
                 body='Canonical decision metadata only; never execute this card.\n' + DecisionInbox._encode(request),
                 initial_status='blocked', session_id=owner['storedSessionId'], board=board,
                 idempotency_key=self.creation_key(request), assignee=owner['profile'],
-                workspace_kind='scratch', project_id='', parents=())
+                workspace_kind='scratch', project_id='', parents=(), human_request=ask)
+            # Type the block needs_input (David's ask). A repeat (idempotent hit, already typed) is a no-op.
+            block = getattr(api, 'block_task', None)
+            if block is not None:
+                block(c, ref['id'], kind='needs_input', human_request=ask,
+                      reason='Waiting on David: ' + request['title'])
         finally: c.close()
         return ref
+
+    _INTERACTION = {'approval': 'approval', 'choice': 'reply', 'input': 'reply', 'external_step': 'external'}
+
+    @classmethod
+    def human_request(cls, request):
+        """The card's ask for David (core refuses a blocked card without one: agent_owned_block)."""
+        import re
+        markdown = (request.get('scope') or {}).get('markdown') or ''
+        first = next((p.strip() for p in re.split(r'\n\s*\n', markdown) if p.strip()), '')
+        scope = re.sub(r'\s+', ' ', first)[:500] or request['title']
+        return {'action': request['title'],
+                'why_human': 'This request asks David for a decision only he can make; '
+                             'he records it in the For you queue.',
+                'interaction': cls._INTERACTION[request['kind']],
+                'scope': scope,
+                'evidence': f"ActionRequest {request['requestId']} revision {request['revision']} in the For you queue"}
 
     def bind_request(self, request, expected_revision):
         for ref in request['aliases']:
             if ref['type'] == 'kanban':
                 self.bind(request, ref, expected_revision=expected_revision)
+
+    def close_withdrawn(self, request, reason):
+        """Archive the decision card(s) of a request the store already moved to ``withdrawn``.
+
+        Only an undecided binding ('bound') closes; a delivered decision keeps its card. Idempotent: a
+        retry after a failed archive finds the binding 'withdrawn' and archives again.
+        """
+        if request.get('state') != 'withdrawn':
+            raise RuntimeError('Only a withdrawn request closes its decision card')
+        api = self._api()
+        owner = DecisionInbox._encode(request['owner'])
+        for ref in request['aliases']:
+            if ref['type'] != 'kanban': continue
+            c = api.connect(self._path(ref, request['owner']))
+            try:
+                with api.write_txn(c):
+                    self._schema(c)
+                    row = c.execute('SELECT owner,request_id,state FROM user_steps_card_bindings WHERE task=?',
+                                    (ref['id'],)).fetchone()
+                    if not row or tuple(row[:2]) != (owner, request['requestId']):
+                        raise RuntimeError('Exact card binding required')
+                    if row[2] not in ('bound', 'withdrawn'):
+                        raise RuntimeError('A decision was delivered to this card; it is not withdrawn')
+                    status = self._task(c, ref['id'])['status']
+                    if row[2] == 'bound':
+                        c.execute("UPDATE user_steps_card_bindings SET state='withdrawn' WHERE task=? AND state='bound'",
+                                  (ref['id'],))
+                        api.add_comment(c, ref['id'], 'user-steps',
+                                        'Withdrawn without a decision: ' + reason +
+                                        '\nNothing was granted; this decision card is closed.')
+                if status not in ('archived', 'done'):
+                    api.archive_task(c, ref['id'])
+            finally: c.close()
 
     @staticmethod
     def creation_key(request):
