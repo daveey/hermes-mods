@@ -223,8 +223,99 @@ STATUS_ONLY_NUDGE = (
     "Do not reopen, re-review or add another watcher card.")
 
 
-RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only")
-DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only")
+# ---- denied_ask: the reply says nothing needs the user while a card linked to the chat is blocked on them --------
+# (self-heal agent-8cecfe01cb: "no new approval request" while t_f68e984c waited on a GitHub passkey for 18 h)
+_ASK_NOUN = r"(?:approvals?|asks?|actions?|inputs?|decisions?|sign-?offs?|confirmations?)"
+DENY_ASK_RE = re.compile(
+    r"\bno (?:new |pending |open |further |other )?" + _ASK_NOUN +
+    r"(?:\s+requests?\b|\s+(?:is |are )?(?:needed|required|pending|waiting)\b"
+    r"|\s+(?:needed |required )?(?:from|for|on) you\b|\s+on your (?:side|end|part)\b)"
+    r"|\bnothing (?:(?:is |'s )?(?:needed|required|waiting|blocked|pending) (?:from|on|for) you\b"
+    r"|(?:needs|requires|is waiting on) you\b|for you to do\b)"
+    r"|\b(?:doesn'?t|does not|don'?t|do not) need (?:anything (?:from|of) )?you\b"
+    r"|\bnot (?:blocked|waiting) on you\b"
+    r"|\byou don'?t need to (?:do|approve|click|sign|confirm) anything\b",
+    re.IGNORECASE)
+_CODE_QUOTE = re.compile(r"```.*?```|`[^`]*`|^>.*$", re.DOTALL | re.MULTILINE)
+
+
+def denies_ask(reply: str) -> Optional[str]:
+    """The phrase in the reply saying no ask/approval is pending for the user (code and quotes ignored), else None."""
+    m = DENY_ASK_RE.search(_CODE_QUOTE.sub(" ", reply or ""))
+    return m.group(0) if m else None
+
+
+def _ask_valid(value: Any, kind: Any) -> Optional[dict]:
+    """Core's human_request contract (hermes_cli.kanban_human_request), with a local copy for older cores."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    try:
+        from hermes_cli.kanban_human_request import validate_human_request  # type: ignore
+        try:
+            return validate_human_request(value, kind=kind)
+        except ValueError:
+            return None
+    except ImportError:
+        pass
+    fields = ("action", "why_human", "interaction", "scope", "evidence")
+    if not isinstance(value, dict) or any(not isinstance(value.get(f), str) or not value[f].strip() for f in fields):
+        return None
+    if kind in ("dependency", "transient", "time"):
+        return None
+    return {f: value[f].strip() for f in fields}
+
+
+def linked_human_asks(cards: list) -> list[dict]:
+    """``[{id, title, action}]`` for parked cards with a validated ask for the user."""
+    out = []
+    for c in cards or []:
+        if not isinstance(c, dict) or c.get("status") not in ("blocked", "triage"):
+            continue
+        ask = _ask_valid(c.get("human_request"), c.get("block_kind"))
+        if ask:
+            out.append({"id": str(c.get("key") or c.get("id")), "title": str(c.get("title") or ""),
+                        "action": " ".join(ask["action"].split())})
+    return out
+
+
+def session_human_asks(session_id: str) -> list[dict]:
+    """Asks waiting on the user from cards linked to this chat (created, shepherded, subscribed, or remote origin
+    cards), via core's session_tasks. Local rows don't carry human_request, so it is read from their board."""
+    from hermes_cli import kanban_session_activity as ksa  # type: ignore
+    rows = ksa.session_tasks(_lineage(session_id), tuple(getattr(ksa, "BLOCKED_STATUSES", ("blocked", "triage"))))
+    need = [r for r in rows if "human_request" not in r and r.get("id")]
+    if need:
+        by_board: dict[str, list] = {}
+        for r in need:
+            by_board.setdefault(str(r.get("board") or "default"), []).append(r)
+        for path in ksa._board_db_paths():
+            slug = path.parent.name if path.parent.parent.name == "boards" else "default"
+            if slug not in by_board:
+                continue
+            conn = _ro_connect(path, timeout=2)
+            try:
+                for r in by_board[slug]:
+                    got = conn.execute("select status, block_kind, human_request from tasks where id=?",
+                                       (r["id"],)).fetchone()
+                    if got:
+                        r.update(status=got[0], block_kind=got[1], human_request=got[2])
+            finally:
+                conn.close()
+    return linked_human_asks(rows)
+
+
+DENIED_ASK_NUDGE = (
+    "[coach] Your reply says nothing needs the user (\"{evidence}\"), but {n} card(s) linked to this chat are blocked "
+    "waiting on them: {asks}. Correct the reply before ending: in plain words say what is stuck (the work, not its "
+    "card id), the one thing the user must do and where (page, app or link), and what happens after. If an agent can "
+    "do that step itself, do it instead of asking.")
+
+
+RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask")
+DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85}
@@ -716,8 +807,11 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           shadow: bool = False, log: Optional[Callable[[dict], None]] = None,
           thresholds: Optional[dict] = None,
           confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = 0.5,
-          kanban_down: Optional[bool] = None) -> Optional[dict]:
+          kanban_down: Optional[bool] = None,
+          human_asks: Optional[Callable[[], list]] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
+    `human_asks()` lists asks waiting on the user from cards linked to the chat ([{id, title, action}]); it is called
+    only when the reply says nothing needs the user, and a hit is the deterministic `denied_ask` rule.
     `thresholds` ({rule: th}) overrides `threshold` per rule; with it, the top rule among those over their own
     threshold wins.
     `confirm() -> (p, evidence) | None` is the report_only second opinion (aux task `coach_report_only`, real tool
@@ -731,6 +825,20 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     # scope limit or a status question answered with a legitimately scheduled wait: report_only (and status_only, whose
     # walls the scheduled wait is one of) can't apply, so neither the deterministic checks nor the judge see it.
     scoped = bool(report_only_guard(user_ask, reply))
+    if human_asks is not None and (not only or "denied_ask" in only):
+        phrase = denies_ask(reply)
+        asks = []
+        if phrase:
+            try:
+                asks = list(human_asks() or [])
+            except Exception:
+                asks = []  # fail-open: an unreadable board never holds a reply
+        if asks:
+            listed = "; ".join(f"{a.get('title') or a.get('id')} ({a.get('id')}) needs: {a.get('action')}"
+                               for a in asks[:3])
+            return {"rule": "denied_ask", "p": 1.0, "evidence": phrase, "reason": "denied_ask",
+                    "verdict": {"denied_ask": 1.0, "evidence": phrase},
+                    "nudge": DENIED_ASK_NUDGE.format(evidence=phrase[:120], n=len(asks), asks=listed[:900])}
     if (not only or "report_only" in only) and not scoped:
         phrase = unverified_owner(reply, tool_log)
         if phrase:  # deterministic: no judge call, no AI score at the edge of its bar

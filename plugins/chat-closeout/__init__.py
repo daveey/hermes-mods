@@ -267,8 +267,15 @@ def post_llm_call(session_id: str = "", platform: str = "", **_: Any) -> None:
         return
     try:
         observed = _state.setdefault("observed", {}).pop(session_id, None)
+        asked = _state.setdefault("observed_ask", {}).pop(session_id, None)
         out = core.record_turn_end(ledger(), session_id, open_card_ids(session_id), read_cards,
                                    observed_sig=observed)
+        if asked:
+            row = ledger().get(session_id) or {}
+            batch = set(row.get("batch") or [])
+            ids = {t for t, _ in asked if t in batch}
+            ledger().write(session_id, covered=set(row.get("covered") or []) | ids,
+                           relayed=set(row.get("relayed") or []) | {p for t, p in asked if t in ids})
         if out.get("open") or out.get("closeout"):
             logger.info("chat-closeout: %s waiting_on=%s%s", session_id, out.get("open"),
                         " (close-out turn: covered %s)" % sorted(out.get("covered") or [])
@@ -284,6 +291,7 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         return None
     try:
         _state.setdefault("observed", {}).pop(session_id, None)
+        _state.setdefault("observed_ask", {}).pop(session_id, None)
         row = ledger().get(session_id)
         if not row or not row.get("batch"):
             return None
@@ -295,6 +303,11 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
             if not row["batch"]:
                 return None
         key = core.pending_key(row, cards)
+        if not key and row.get("closing") is None:
+            cands = core.ask_candidates(row, cards) if core.ask_relay_key(row, cards) else []
+            if cands:  # the user is here anyway: tell this turn what waits on them (covered at its end)
+                _state.setdefault("observed_ask", {})[session_id] = cands
+                return {"context": core.ask_relay_prompt(row, cards, [t for t, _ in cands])}
         if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
@@ -454,9 +467,14 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
                 _state["capped"][sid] = key
                 logger.warning("chat-closeout: %s hit the %d wakes/hour cap; close-out deferred", sid,
                                core.MAX_WAKES_PER_HOUR)
-        due = core.closeout_due(row, cards, unseen=sum(unseen.get(i, 0) for i in ids),
-                                last_user_at=last_user(ids), now=now)
-        if not due or not led.claim(sid, due, now):
+        n_unseen, user_at = sum(unseen.get(i, 0) for i in ids), last_user(ids)
+        due = core.closeout_due(row, cards, unseen=n_unseen, last_user_at=user_at, now=now)
+        if not due:
+            relay = core.ask_relay_due(row, cards, unseen=n_unseen, last_user_at=user_at, now=now)
+            if relay and led.claim(sid, relay, now):
+                done.append(_relay(led, sid, row, cards, relay, now, wake))
+            continue
+        if not led.claim(sid, due, now):
             continue
         new_ids = core.uncovered(row, cards)
         # Mark the batch covered and the turn as a close-out BEFORE it starts: the turn's own end (or a card it
@@ -484,6 +502,38 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
             logger.info("chat-closeout: close-out wake of %s deferred (%s)", sid, result)
         done.append({"session_id": sid, "result": result, "sig": due})
     return done
+
+
+def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Callable[..., str]) -> dict:
+    """Ask relay: ONE turn telling the chat a batch card waits on the user while other batch cards still work. The
+    asked cards are covered and their premises recorded BEFORE the turn (it is not a close-out: no ``closing``, the
+    working cards keep their own close-out); a failed wake undoes both."""
+    cands = core.ask_candidates(row, cards)
+    ids = [t for t, _ in cands]
+    batch = set(row.get("batch") or [])
+    before = {k: row.get(k) for k in ("covered", "relayed", "wakes", "wake_count")}
+    wakes = [t for t in row.get("wakes") or [] if 0 <= now - float(t) < 3600] + [now]
+    relayed = {p for p in row.get("relayed") or [] if p.rsplit("@", 1)[0] in batch} | {p for _, p in cands}
+    led.write(sid, covered=set(row.get("covered") or []) | set(ids), relayed=relayed, wakes=wakes,
+              wake_count=int(row.get("wake_count") or 0) + 1)
+    try:
+        result = wake(sid, core.ask_relay_prompt(row, cards, ids), display_kind="kanban_notice",
+                      display_metadata={"display_text": core.ask_notice_text(cards, ids), "ask_relay": True,
+                                        "task_ids": ids},
+                      label="chat-closeout")
+    except Exception:
+        logger.warning("chat-closeout: ask relay wake failed for %s", sid, exc_info=True)
+        result = "error"
+    if result == "started":
+        led.write(sid, wake_result="started")
+        logger.info("chat-closeout: relayed %d ask(s) to %s while %d card(s) still work (%s)", len(ids), sid,
+                    sum(1 for t in batch if not core.is_settled(cards.get(t))), ", ".join(ids))
+    else:
+        led.write(sid, covered=set(before["covered"] or []), relayed=set(before["relayed"] or []),
+                  wakes=before["wakes"] or [], wake_count=int(before["wake_count"] or 0))
+        led.release(sid, key, result)
+        logger.info("chat-closeout: ask relay to %s deferred (%s)", sid, result)
+    return {"session_id": sid, "result": result, "sig": key, "ask_relay": ids}
 
 
 def wake_log() -> "owner_wake.WakeLog":

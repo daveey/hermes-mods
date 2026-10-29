@@ -419,6 +419,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            screen=screen, screen_below=s1.below(), shadow=m == "shadow", log=s1.log,
                            confirm=confirm, confirm_floor=rc.CONFIRM_FLOOR,
                            kanban_down=kanban_down,
+                           human_asks=lambda: rc.session_human_asks(session_id),
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)

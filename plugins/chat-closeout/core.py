@@ -102,12 +102,13 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dic
             bk = "t.block_kind" if "block_kind" in cols else "NULL"
             comp = "t.completed_at" if "completed_at" in cols else "NULL"
             res = "t.result" if "result" in cols else "NULL"
+            hr = "t.human_request" if "human_request" in cols else "NULL"
             has_runs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
             summary = (f"COALESCE((SELECT r.summary FROM task_runs r WHERE r.task_id = t.id AND r.summary IS NOT NULL "
                        f"AND r.summary != '' ORDER BY r.id DESC LIMIT 1), {res})") if has_runs else res
             ph = ",".join("?" for _ in left)
             for r in conn.execute(f"SELECT t.id, t.status, t.title, {bk} AS block_kind, {comp} AS completed_at, "
-                                  f"{summary} AS summary FROM tasks t WHERE t.id IN ({ph})", left):
+                                  f"{summary} AS summary, {hr} AS human_request FROM tasks t WHERE t.id IN ({ph})", left):
                 card = {**dict(r), 'board': board}
                 for key in (r['id'], card_key(card)):
                     if key in want:
@@ -147,6 +148,86 @@ def needs_human(card: Optional[dict[str, Any]]) -> bool:
     return bool(card) and is_settled(card) and card.get("status") not in DONE_STATUSES
 
 
+# ---- ask relay: a card that needs the user, told to the chat while other batch cards still work -----------------
+ASK_FIELDS = ("action", "why_human", "interaction", "scope", "evidence")
+ASK_INTERACTIONS = ("approval", "reply", "user_terminal", "physical", "external")
+NONHUMAN_BLOCK_KINDS = ("dependency", "transient", "time")
+
+
+def ask_of(card: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
+    """The card's validated human ask (core ``kanban_human_request`` contract: all five fields, a known interaction,
+    not a dependency/transient/time wait) while it is parked, else None. ``human_request`` may be the stored JSON
+    text (local boards) or the decoded dict (remote projection). A stale remote row is never an ask."""
+    if not card or card.get("status") not in ("blocked", "triage"):
+        return None
+    if card.get("remote") and card.get("stale") is not False:
+        return None
+    if card.get("block_kind") in NONHUMAN_BLOCK_KINDS:
+        return None
+    value = card.get("human_request")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, dict) or any(not isinstance(value.get(f), str) or not value[f].strip()
+                                          for f in ASK_FIELDS):
+        return None
+    if value["interaction"] not in ASK_INTERACTIONS:
+        return None
+    return {f: " ".join(value[f].split()) for f in ASK_FIELDS}
+
+
+def _norm(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "").lower()).strip()
+
+
+def ask_premise(tid: str, card: Optional[dict[str, Any]]) -> Optional[str]:
+    """``<card key>@<hash>`` naming WHY the card waits on the user: its status, block kind and ask. Re-blocked for
+    another reason = another premise; the same block seen again = the same one."""
+    ask = ask_of(card)
+    if ask is None:
+        return None
+    basis = json.dumps([card.get("status"), card.get("block_kind") or "", _norm(ask["action"]),
+                        _norm(ask["why_human"]), _norm(ask["scope"])])
+    return f"{tid}@{hashlib.sha1(basis.encode()).hexdigest()[:12]}"
+
+
+def _premise_card(premise: str) -> str:
+    return premise.rsplit("@", 1)[0]
+
+
+def ask_candidates(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> list[tuple[str, str]]:
+    """``[(card key, premise)]`` for batch cards that wait on the user with an ask this chat was never told about.
+    A card covered by a close-out that recorded no premise (rows from before the relay) is left alone, so a deploy
+    never relays old asks; a covered card whose recorded premise changed (re-blocked for a new reason) is new."""
+    relayed = set(row.get("relayed") or [])
+    told = {_premise_card(p) for p in relayed}
+    covered = set(row.get("covered") or [])
+    out = []
+    for tid in sorted(set(row.get("batch") or [])):
+        premise = ask_premise(tid, cards.get(tid))
+        if premise and premise not in relayed and (tid not in covered or tid in told):
+            out.append((tid, premise))
+    return out
+
+
+def ask_relay_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optional[str]:
+    """Key of the asks to relay now, or None. A pending close-out takes precedence: it reports every settled card,
+    asks included, so the relay only covers the case it can't: the batch is not settled because other cards work
+    (usually a card that waits on the blocked one)."""
+    if pending_key(row, cards):
+        return None
+    cands = ask_candidates(row, cards)
+    if not cands:
+        return None
+    return "ask:" + hashlib.sha1(";".join(p for _, p in cands).encode()).hexdigest()[:16]
+
+
+def ask_premises(ids: Iterable[str], cards: dict[str, dict[str, Any]]) -> set[str]:
+    return {p for p in (ask_premise(i, cards.get(i)) for i in ids) if p}
+
+
 def settled_sig(batch: Iterable[str], cards: dict[str, dict[str, Any]]) -> Optional[str]:
     """Signature of the batch's settled state, or None while any card is still working."""
     ids = sorted(set(batch))
@@ -175,8 +256,13 @@ def closeout_key(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> Optio
 
 def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Coverage upkeep: a covered card that went back to work (unblocked -> running) is uncovered, so its real
-    result gets a close-out; a covered card that is done/archived leaves the batch. Returns changed fields."""
+    result gets a close-out; a covered card that is done/archived leaves the batch. A relayed ask whose card went
+    back to work or left the batch is forgotten, so a later block (even for the same reason) is a new ask.
+    Returns changed fields."""
     batch, covered = set(row.get("batch") or []), set(row.get("covered") or [])
+    relayed = set(row.get("relayed") or [])
+    keep = {p for p in relayed if _premise_card(p) in batch
+            and (cards.get(_premise_card(p)) is None or is_settled(cards[_premise_card(p)]))}
     reopened = {i for i in covered if cards.get(i) is not None and not is_settled(cards[i])}
     gone = {i for i in covered & batch if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
     out: dict[str, Any] = {}
@@ -186,6 +272,9 @@ def reconcile(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> dict[str
         out.update(done_sig=None, claim_sig=None)
     if gone:
         out["batch"] = batch - gone
+        keep = {p for p in keep if _premise_card(p) not in gone}
+    if keep != relayed:
+        out["relayed"] = keep
     return out
 
 
@@ -311,7 +400,8 @@ CREATE TABLE IF NOT EXISTS waiting (
   covered TEXT NOT NULL DEFAULT '[]',    -- batch cards a close-out already reported (never wake for them again)
   closing TEXT,                          -- JSON batch ids while a close-out turn runs (NULL otherwise)
   wakes TEXT NOT NULL DEFAULT '[]',      -- wall times of recent wakes (per-chat hourly cap)
-  wake_count INTEGER NOT NULL DEFAULT 0
+  wake_count INTEGER NOT NULL DEFAULT 0,
+  relayed TEXT NOT NULL DEFAULT '[]'     -- ask premises (card@hash) the chat was told about (ask relay)
 );
 CREATE TABLE IF NOT EXISTS unseen_seen (session_id TEXT PRIMARY KEY, since REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, at REAL NOT NULL);
@@ -320,8 +410,9 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 
 
 _MIGRATE = (("covered", "TEXT NOT NULL DEFAULT '[]'"), ("closing", "TEXT"),
-            ("wakes", "TEXT NOT NULL DEFAULT '[]'"), ("wake_count", "INTEGER NOT NULL DEFAULT 0"))
-_JSON_SETS = ("batch", "open", "covered")
+            ("wakes", "TEXT NOT NULL DEFAULT '[]'"), ("wake_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("relayed", "TEXT NOT NULL DEFAULT '[]'"))
+_JSON_SETS = ("batch", "open", "covered", "relayed")
 
 
 class Ledger:
@@ -467,7 +558,7 @@ def _row(r) -> Optional[dict[str, Any]]:
     if r is None:
         return None
     d = dict(r)
-    for k in ("batch", "open", "covered", "wakes"):
+    for k in ("batch", "open", "covered", "wakes", "relayed"):
         try:
             d[k] = list(json.loads(d.get(k) or "[]"))
         except ValueError:
@@ -502,7 +593,7 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
     batch, covered = set(view["batch"]), set(view.get("covered") or [])
     key = closeout_key(view, cards)
     fields: dict[str, Any] = {"open": open_now, "stamped_at": now}
-    fields.update({k: fix[k] for k in ("done_sig", "claim_sig") if k in fix})
+    fields.update({k: fix[k] for k in ("done_sig", "claim_sig", "relayed") if k in fix})
     if key and key != row.get("settled_sig"):
         fields.update(settled_sig=key, settled_at=now)  # the watchdog's "settled since" clock
     closing = bool(observed_sig) or row.get("closing") is not None
@@ -514,9 +605,12 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
         if done:
             fields.update(done_sig=done, done_at=now)
         covered |= {i for i in batch if is_settled(cards.get(i))}
+        # the close-out reported these asks: the relay must not tell them again while later cards work
+        fields["relayed"] = set(view.get("relayed") or []) | ask_premises(covered, cards)
         gone = {i for i in covered if is_settled(cards.get(i)) and (cards.get(i) or {}).get("status") in DONE_STATUSES}
         batch -= gone   # reported and finished; human-blocked cards stay (covered) until they move
         covered -= gone
+        fields["relayed"] = {p for p in fields["relayed"] if _premise_card(p) in batch}
         fields["closing"] = None
     fields["batch"], fields["covered"] = batch, covered
     if not batch and not row:
@@ -546,6 +640,58 @@ def closeout_due(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, unsee
     return key
 
 
+def ask_relay_due(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, unseen: int, last_user_at: float,
+                  now: float) -> Optional[str]:
+    """The ask-relay key when this chat should get its one ask turn now, else None. Same gates as a close-out: not
+    claimed already, notices handed over, the user quiet for 5 min, under the per-chat hourly wake cap."""
+    key = ask_relay_key(row, cards)
+    if not key or key == row.get("claim_sig"):
+        return None
+    if unseen > 0 or now - (last_user_at or 0) < USER_QUIET_S:
+        return None
+    if wakes_last_hour(row, now) >= MAX_WAKES_PER_HOUR:
+        return None
+    return key
+
+
+PLAIN_ASK_RULE = (
+    "For a card waiting on the user, say in plain words: what is stuck (the work, by what it does), the one thing "
+    "the user must do and where (the page, app or link; read the card with kanban_show if the ask is vague), and "
+    "what happens after they do it. Card ids are not the explanation: name the work. If an agent can do the step "
+    "itself, do it instead of asking.")
+
+
+def _ask_line(c: dict[str, Any]) -> str:
+    ask = ask_of(c)
+    if not ask:
+        return ""
+    return (f"\n  needs the user to: {ask['action'][:400]}\n  why only the user: {ask['why_human'][:200]}"
+            f" ({ask['interaction']}; scope: {ask['scope'][:160]})")
+
+
+def ask_relay_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> str:
+    ids = sorted(set(ids))
+    lines = [f"{TAG} Work this chat started is now waiting on the user, while other work in this chat waits behind "
+             "it. This turn tells the user. Waiting on the user:"]
+    for tid in ids:
+        c = cards.get(tid) or {}
+        lines.append(f"- {c.get('title') or tid} (card {tid}, {c.get('status')}/{c.get('block_kind') or '-'})"
+                     f"{_ask_line(c)}")
+    behind = [cards.get(t) or {} for t in sorted(set(row.get("batch") or [])) if t not in ids
+              and not is_settled(cards.get(t))]
+    if behind:
+        lines.append("Still in progress or queued behind it: " + "; ".join(
+            f"{c.get('title') or '(untitled)'} [{c.get('status') or '?'}]" for c in behind[:8]))
+    lines.append("Write a short message for the user now. " + PLAIN_ASK_RULE + " Don't say that nothing needs them. "
+                 "Keep the turn to this ask; the other cards report when they finish.")
+    return "\n".join(lines)
+
+
+def ask_notice_text(cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> str:
+    titles = [str((cards.get(t) or {}).get("title") or t) for t in sorted(set(ids))]
+    return ("Needs you: " + "; ".join(titles))[:160]
+
+
 def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:
     lines = [f"{TAG} Every kanban card this chat handed work to has settled. This turn is the close-out:"]
     for tid in sorted(row.get("batch") or []):
@@ -557,13 +703,13 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> st
         if state == "blocked":
             state = f"blocked ({c.get('block_kind') or 'needs a human'})"
         handoff = " ".join(str(c.get("summary") or "").split())[:700] or "(no handoff)"
-        lines.append(f"- {tid} [{state}] {c.get('title') or ''}\n  handoff: {handoff}")
+        lines.append(f"- {tid} [{state}] {c.get('title') or ''}{_ask_line(c)}\n  handoff: {handoff}")
     lines.append(
         "Write the closing answer for the user now: what each card delivered (from its handoff; check any claim you "
         "can cheaply verify), and for a card blocked on the user the exact one-line ask. For each problem the "
         "handoffs leave open that an agent can fix, fix it now if it's small and reversible; otherwise create a "
         "linked card with acceptance criteria and name it. List as still open only items that are the user's own "
-        "call, or that a card you checked this turn is actively running.")
+        "call, or that a card you checked this turn is actively running. " + PLAIN_ASK_RULE)
     return "\n".join(lines)
 
 

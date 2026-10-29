@@ -111,7 +111,7 @@ def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_THRESHOLD", raising=False)
     monkeypatch.delenv("COACH_REPLY_THRESHOLDS", raising=False)
     cfg = rc.settings()
-    assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only"] and cfg["threshold"] == 0.7
+    assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask"] and cfg["threshold"] == 0.7
     assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85}
 
 
@@ -562,3 +562,83 @@ def test_pre_verify_attempt_one_without_a_handoff_nudge_makes_no_judge_call(tmp_
     n = len(calls)
     assert hooks["pre_verify"](session_id="s3", attempt=1, final_response=HANDOFF_DRAFT) is None
     assert len(calls) == n
+
+
+# ---- denied_ask (self-heal agent-8cecfe01cb): a reply says no ask is pending while a linked card waits on the user
+_ASK = {"action": "Confirm GitHub access for askevepodcast (passkey or emailed code)", "why_human": "2FA",
+        "interaction": "external", "scope": "github login", "evidence": "sudo-mode prompt"}
+
+
+def _zero_judge(*_):
+    return json.dumps({r: 0.0 for r in rc.RULES} | {"evidence": ""})
+
+
+def test_reply_check_denies_ask_while_card_human_blocked():
+    cards = [{"id": "t_f68", "title": "askevepodcast GitHub", "status": "blocked", "block_kind": "needs_input",
+              "human_request": json.dumps(_ASK)}]
+    reply = "The worker is still running the Ask Eve setup; there's no new approval request for you."
+    called = []
+    hit = rc.check(reply, "is it stuck?", [], lambda s, p: called.append(1) or _zero_judge(),
+                   human_asks=lambda: rc.linked_human_asks(cards))
+    assert hit and hit["rule"] == "denied_ask" and hit["p"] == 1.0
+    assert _ASK["action"] in hit["nudge"] and "askevepodcast GitHub" in hit["nudge"]
+    assert not called  # deterministic: no judge call
+
+
+def test_reply_check_denied_ask_negative_when_card_running():
+    cards = [{"id": "t_f68", "title": "askevepodcast GitHub", "status": "running", "block_kind": None,
+              "human_request": json.dumps(_ASK)}]
+    reply = "The worker is still running the Ask Eve setup; there's no new approval request for you."
+    assert rc.check(reply, "is it stuck?", [], _zero_judge, human_asks=lambda: rc.linked_human_asks(cards)) is None
+
+
+def test_denied_ask_phrases():
+    for text in ("No approval needed from you.", "Nothing needs you right now.", "There's no new approval request.",
+                 "Nothing is blocked on you.", "No action required on your side.", "nothing for you to do"):
+        assert rc.denies_ask(text), text
+    for text in ("Card t_1 needs your approval: click Allow.", "No tests failed.", "The approval request is below."):
+        assert not rc.denies_ask(text), text
+
+
+def test_pre_verify_holds_denied_ask_once(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("coach_init_rc_da", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcl = mod._load("reply_check")
+    monkeypatch.setattr(rcl, "aux_judge", _zero_judge)
+    monkeypatch.setattr(rcl, "session_human_asks", lambda sid: [
+        {"id": "t_f68", "title": "askevepodcast GitHub", "action": _ASK["action"]}] if sid == "s1" else [])
+    store = core.Store(root=tmp_path / "coach")
+    coach, hooks = mod.build(store=store, checkout=None)
+    hooks["pre_llm_call"](session_id="s1", user_message="what is this blocked on")
+    reply = "It's running; no approval needed from you."
+    out = hooks["pre_verify"](session_id="s1", attempt=0, final_response=reply)
+    assert out and out["action"] == "continue" and _ASK["action"] in out["message"]
+    assert hooks["pre_verify"](session_id="s1", attempt=1, final_response=reply) is None
+
+
+def test_session_human_asks_reads_local_human_request_from_the_board(tmp_path, monkeypatch):
+    """Local session_tasks rows carry no human_request: it is read from the card's board; a running card is not an ask."""
+    import sqlite3
+    import types
+    db = tmp_path / "kanban.db"
+    c = sqlite3.connect(db)
+    c.execute("create table tasks (id text, status text, block_kind text, human_request text)")
+    c.execute("insert into tasks values ('t_f68', 'blocked', 'needs_input', ?)", (json.dumps(_ASK),))
+    c.execute("insert into tasks values ('t_run', 'running', NULL, ?)", (json.dumps(_ASK),))
+    c.commit()
+    c.close()
+    fake = types.SimpleNamespace(
+        BLOCKED_STATUSES=("blocked", "triage"), _board_db_paths=lambda: [db],
+        session_tasks=lambda ids, statuses: [{"id": "t_f68", "title": "askevepodcast GitHub", "status": "blocked",
+                                              "board": "default"},
+                                             {"id": "t_run", "title": "other", "status": "blocked", "board": "default"}])
+    import sys
+    pkg = sys.modules.get("hermes_cli") or types.ModuleType("hermes_cli")
+    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    monkeypatch.setattr(pkg, "kanban_session_activity", fake, raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_session_activity", fake)
+    monkeypatch.setattr(rc, "_lineage", lambda sid: [sid])
+    got = rc.session_human_asks("chat")
+    assert got == [{"id": "t_f68", "title": "askevepodcast GitHub", "action": _ASK["action"]}]
