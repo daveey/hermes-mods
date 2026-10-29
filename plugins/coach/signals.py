@@ -524,15 +524,52 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
         except Exception:
             continue
         seen[board] = top
-        for tid, n, _mx, ended, outcomes, errs, title, ikey, status in rows:
+        groups: Dict[tuple, list] = {}
+        for row in rows:
+            tid, n, _mx, ended, outcomes, errs, title, ikey, status = row
             if (ended or 0) < now - BACKFILL_S or ikey.startswith("selfheal:"):
                 continue  # self-heal's own cards: the lane reconciles them (no card about a card about a card)
+            stem = _TITLE_NUM_RE.sub("", title or "").strip()
+            ek = _err_key(errs)
+            # siblings of one batch ("load #14", "load #20") failing the same way are one defect, not one per card
+            key = (stem, ek) if stem and ek else (tid,)
+            groups.setdefault(key, []).append(row)
+        for key, grp in groups.items():
+            if len(grp) == 1 and (len(key) == 1 or key[0] == (grp[0][6] or "").strip()):
+                tid, n, _mx, ended, outcomes, errs, title, ikey, status = grp[0]
+                out.append({"kind": "kanban", "component": "kanban", "at": float(ended or now),
+                            "symptom": f"kanban card {tid} on {host}/{board} failed {n}x ({outcomes}): {title[:80]}",
+                            "details": home_tilde(f"board {board} card {tid} status={status} title={title}\n"
+                                                  f"outcomes: {outcomes}\nerrors: {errs}")[:1500],
+                            "kanban": {"board": board, "cards": [tid]},
+                            "fp": fp("kanban", host, board, tid)})
+                continue
+            grp.sort(key=lambda r: r[0])
+            tids = [r[0] for r in grp]
+            stem, ek = key
+            n = sum(r[1] for r in grp)
+            ended = max(r[3] or 0 for r in grp)
+            outcomes = ",".join(r[4] for r in grp)
+            statuses = ",".join(sorted({str(r[8]) for r in grp}))
             out.append({"kind": "kanban", "component": "kanban", "at": float(ended or now),
-                        "symptom": f"kanban card {tid} on {host}/{board} failed {n}x ({outcomes}): {title[:80]}",
-                        "details": home_tilde(f"board {board} card {tid} status={status} title={title}\n"
-                                              f"outcomes: {outcomes}\nerrors: {errs}")[:1500],
-                        "fp": fp("kanban", host, board, tid)})
+                        "symptom": f"kanban cards {tids[0]}+{len(tids) - 1} on {host}/{board} failed {n}x "
+                                   f"({len(tids)} siblings '{stem[:60]} #N'): same error",
+                        "details": home_tilde(f"board {board} cards {', '.join(tids)} status={statuses} "
+                                              f"title={stem} #N\noutcomes: {outcomes}\n"
+                                              f"errors: {grp[0][5]}")[:1500],
+                        "kanban": {"board": board, "cards": tids},
+                        # one fingerprint per batch+error, so siblings failing in a later pass dedupe onto it
+                        "fp": fp("kanban", host, board, "batch", stem, ek)})
     return out
+
+
+_TITLE_NUM_RE = re.compile(r"\s*#\d+\s*$")
+
+
+def _err_key(errs: Optional[str]) -> str:
+    """The distinct run errors of a card with ids, numbers and pids masked, so sibling cards compare equal."""
+    parts = {re.sub(r"\bt_[0-9a-zA-Z]+|\d+", "#", p.strip()) for p in (errs or "").split(" | ")}
+    return " | ".join(sorted(p for p in parts if p))
 
 
 def _signal_storm(cur: dict, prof: str, r: dict, at: float, host: str) -> Optional[dict]:
@@ -646,7 +683,7 @@ def to_defect(s: dict) -> dict:
          "quote": s.get("quote") or ""}
     if (s.get("count") or 1) > 1:
         d["details"] = f"(seen {s['count']}x this pass)\n" + d["details"]
-    for k in ("profile", "monitor"):
+    for k in ("profile", "monitor", "kanban"):
         if s.get(k):
             d[k] = s[k]
     return d

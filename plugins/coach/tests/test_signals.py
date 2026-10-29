@@ -795,3 +795,28 @@ def test_each_e0a5909348_guard_warning_files_a_signal(tmp_path):
     # and through the real collector
     h = _auth_home(tmp_path, list(GUARD_LINES.values()))
     assert len([s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]) == 3
+
+
+def test_kanban_sibling_cards_with_same_stem_and_error_are_one_signal(tmp_path):
+    h = tmp_path / "h"
+    err = "worker exited cleanly (rc=0) without kanban_complete — protocol violation"
+    runs = []
+    for n in (14, 20, 23):
+        runs += [(f"t_load{n}", f"load with-worker #{n}", None, "crashed", err)] * 2
+    runs += [("t_other", "load with-worker #30", None, "crashed", "worker died: SIGKILL"),
+             ("t_other", "load with-worker #30", None, "crashed", "worker died: SIGKILL"),
+             ("t_build", "build the thing", None, "crashed", err),
+             ("t_build", "build the thing", None, "crashed", err)]
+    make_board(h / "kanban" / "boards" / "worker-load" / "kanban.db", runs)
+    ks = sg.collect_kanban(h, {}, NOW, "hubhost")
+    assert len(ks) == 3, [s["symptom"] for s in ks]
+    batch = [s for s in ks if "t_load14" in s["details"]]
+    assert len(batch) == 1
+    assert all(t in batch[0]["details"] for t in ("t_load14", "t_load20", "t_load23"))
+    assert batch[0]["kanban"] == {"board": "worker-load", "cards": ["t_load14", "t_load20", "t_load23"]}
+    # the batch keeps one fingerprint across passes; unrelated cards stay separate
+    again = sg.collect_kanban(h, {}, NOW, "hubhost")
+    assert {s["fp"] for s in again} == {s["fp"] for s in ks}
+    assert len({s["fp"] for s in ks}) == 3
+    d = sg.to_defect(batch[0])
+    assert d["kanban"]["cards"] == ["t_load14", "t_load20", "t_load23"]

@@ -1577,3 +1577,70 @@ def test_sync_leaves_current_briefs_and_ended_cards_alone(store):
     b.finish(ids[1], "done")
     sh.sync(store, runner=b, now=NOW + 900)
     assert not [a for a, _ in b.calls if "comment" in a]
+
+
+# ── deferred kanban signals recheck the trigger card (self-heal kanban-40fa92de39) ──
+def _kanban_home(tmp_path, monkeypatch, status, board="worker-load", card="t_01a181f353b47ebf"):
+    import sqlite3
+    home = tmp_path / "hh"
+    db = home / "kanban" / "boards" / board / "kanban.db"
+    db.parent.mkdir(parents=True)
+    c = sqlite3.connect(db)
+    c.execute("create table tasks (id text primary key, title text, status text)")
+    c.execute("insert into tasks values (?,?,?)", (card, "load with-worker #23", status))
+    c.commit()
+    c.close()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(sh, "host_name", lambda: "hubhost")
+    return db
+
+
+def kanban_defect(card="t_01a181f353b47ebf", board="worker-load", **kw):
+    """The payload signals.to_defect produced for the 10-28 worker-load card (no structured kanban key)."""
+    base = dict(symptom=f"kanban card {card} on hubhost/{board} failed 3x (crashed): load with-worker #23",
+                source="signal", kind="kanban", p_defect=None, host="hubhost", session_id=None, quote="",
+                details=f"board {board} card {card} status=triage title=load with-worker #23\noutcomes: crashed")
+    return defect(component="kanban", **{**base, **kw})
+
+
+def test_pending_kanban_signal_whose_card_was_archived_is_skipped_not_filed(store, tmp_path, monkeypatch):
+    db = _kanban_home(tmp_path, monkeypatch, "triage")
+    d = kanban_defect()
+    _queue(store, d)
+    import sqlite3
+    c = sqlite3.connect(db)
+    c.execute("update tasks set status='archived'")  # the owner closed it while the row waited
+    c.commit()
+    c.close()
+    out = sh.retry_deferred(store, now=NOW + 3601, filer=lambda *a, **k: pytest.fail("filed a closed card"))
+    assert out and out[0]["action"] == "skip"
+    skips = [e for e in ev(store, "selfheal_skip") if e["fingerprint"] == d["fingerprint"]]
+    assert skips and "trigger card t_01a181f353b47ebf now archived" in skips[-1]["why"]
+    assert sh.retry_deferred(store, now=NOW + 7200, filer=lambda *a, **k: pytest.fail("resurrected")) == []
+
+
+def test_pending_kanban_signal_whose_card_is_still_in_triage_is_filed(store, tmp_path, monkeypatch):
+    _kanban_home(tmp_path, monkeypatch, "triage")
+    d = kanban_defect()
+    _queue(store, d)
+    got = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d) or {"action": "filed"})
+    assert got == [d]
+
+
+def test_pending_kanban_signal_with_missing_board_or_remote_host_keeps_filing(store, tmp_path, monkeypatch):
+    _kanban_home(tmp_path, monkeypatch, "archived")
+    gone = kanban_defect(board="nope", card="t_aaaa")
+    remote = kanban_defect(host="macbook", symptom="remote kanban card")  # another host's board: unreadable here
+    _queue(store, gone, remote)
+    got = []
+    sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["symptom"]) or {"action": "filed"})
+    assert sorted(got) == sorted([gone["symptom"], remote["symptom"]])
+
+
+def test_live_file_defect_skips_a_kanban_signal_whose_cards_are_all_closed(store, tmp_path, monkeypatch):
+    _kanban_home(tmp_path, monkeypatch, "done")
+    r = Runner()
+    d = {**kanban_defect(), "kanban": {"board": "worker-load", "cards": ["t_01a181f353b47ebf"]}}
+    out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "skip" and "now done" in out["why"] and not r.creates()

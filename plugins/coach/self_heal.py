@@ -1168,6 +1168,67 @@ def _pending_priority(d: dict) -> tuple:
     return (_SOURCE_RANK.get(d.get("source") or "", 2), -p, -(_detected_at(d) or 0))
 
 
+CLOSED_CARD_STATUSES = ("archived", "done")
+_KANBAN_DETAILS_RE = re.compile(r"\bboard (\S+) cards? ((?:t_[0-9a-zA-Z]+(?:,\s*)?)+)")
+_BOARD_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def kanban_trigger(d: dict) -> Optional[tuple]:
+    """(board, [card ids]) a kanban signal is about: the structured ``kanban`` key (signals.to_defect), else the
+    ``board <b> card <id>`` details line that older pending payloads carry. None for other defects."""
+    if d.get("kind") != "kanban" and d.get("component") != "kanban":
+        return None
+    k = d.get("kanban") or {}
+    if k.get("board") and k.get("cards"):
+        return str(k["board"]), [str(c) for c in k["cards"]]
+    m = _KANBAN_DETAILS_RE.search(d.get("details") or "")
+    if not m:
+        return None
+    return m.group(1), [c.strip() for c in m.group(2).split(",") if c.strip()]
+
+
+def _kanban_board_path(board: str, home: Path) -> Optional[Path]:
+    """signals.board_dbs labels: ``<board>`` on the default home, ``<profile>/<board>`` on a profile."""
+    prof, _, name = board.rpartition("/")
+    if not _BOARD_PART_RE.match(name) or (prof and not _BOARD_PART_RE.match(prof)):
+        return None
+    h = home / "profiles" / prof if prof else home
+    return h / "kanban.db" if name == "default" else h / "kanban" / "boards" / name / "kanban.db"
+
+
+def kanban_trigger_closed(d: dict, home: Optional[Path] = None) -> Optional[str]:
+    """Why to drop a kanban signal: every card it names is now archived/done on its (local) board, e.g. the owner
+    closed it while the detection waited in the pending queue. None (= file as before) when the signal is not a
+    kanban one, came from another host's board, or the board/card cannot be read."""
+    trig = kanban_trigger(d)
+    if not trig or (d.get("host") and d["host"] != host_name()):
+        return None
+    board, cards = trig
+    path = _kanban_board_path(board, Path(home) if home else _kanban_home())
+    if not path or not path.is_file():
+        return None
+    import sqlite3
+    try:
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            db.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except sqlite3.Error:
+            db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5)
+            db.execute("PRAGMA query_only=ON")
+        try:
+            got = []
+            for c in cards:
+                row = db.execute("SELECT status FROM tasks WHERE id=?", (c,)).fetchone()
+                if not row or row[0] not in CLOSED_CARD_STATUSES:
+                    return None
+                got.append(f"{c} now {row[0]}")
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return None
+    return "trigger card " + ", ".join(got)
+
+
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     """Recheck due investigations through normal admission, never automatically release a card.
 
@@ -1192,6 +1253,13 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                 store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp,
                            "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
                 out.append({"action": "skip", "why": "stale pending"})
+                continue
+            closed = kanban_trigger_closed(d)
+            if closed:  # the owner closed the card while this waited: nothing is broken any more
+                with db:
+                    db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
+                store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp, "why": closed})
+                out.append({"action": "skip", "why": closed})
                 continue
             due.append((_pending_priority(d), fp, d, version))
         due.sort(key=lambda r: r[0])
@@ -1920,6 +1988,11 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
             pass
         store.log({"event": "selfheal_forward", "fingerprint": fp, "ok": rc == 0, "detail": res["out"]})
         return res
+    if m == "live" and hub:
+        closed = kanban_trigger_closed(d)
+        if closed:
+            store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": closed})
+            return {"action": "skip", "why": closed}
     lane = LaneState(store.root)
     st = lane.get(fp)
     if st.get("status") == "adopted" and m == "live" and hub:
