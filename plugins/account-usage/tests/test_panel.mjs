@@ -231,3 +231,25 @@ test('clean table: only rows with something to say get a chevron; status-only ce
  const x={statusOnly:true}
  assert.deepEqual(['ready','limited','unavailable','unknown'].map(state=>plugin.statusLabel(x,{state})),['ok','blocked','sign-in needed','not checked'])
 })
+test('rows are non-clickable with the backend reason only when selection.unavailable is set', async () => {
+  const prelude = 'const host=globalThis.__auTestHost, atom=globalThis.__auTestAtom;\nconst jsx=(type,props)=>({type,props}), jsxs=jsx;\n'
+  globalThis.__auTestHost = {state: {}}; globalThis.__auTestAtom = atom
+  const mod = await import('data:text/javascript;base64,' + Buffer.from(prelude + source.replace(/^import .*$/gm, '') + '\n//' + Math.random()).toString('base64'))
+  const reason = 'Account selection is unavailable while managed model routing is on: core pins each chat to its routed subscription account'
+  const g = {slug: 'anthropic', accounts: [], markId: null}, a = {id: 'B', label: 'Account B', state: 'ready', windows: []}
+  const row = selection => {
+    const calls = []
+    const el = mod.AccountRow({g, a, open: false, onToggle() {}, selectionStore: {select: (...x) => calls.push(x)},
+      selectionState: {busy: false, loading: false, selection}, reconnectStore: {key: () => 'k'}, reconnectState: {}})
+    const button = el.props.children[0].props.children[0]
+    return {button: button.props, calls}
+  }
+  const base = {session_id: 'runtime-a', provider: 'anthropic', model: 'm', revision: 0, account_id: null, state: 'none'}
+  const off = row({...base, unavailable: reason})
+  assert.equal(off.button.disabled, true); assert.equal(off.button.onClick, undefined)
+  assert.ok(off.button.title.includes(reason)); assert.match(off.button['aria-label'], /managed model routing/)
+  const on = row(base)
+  assert.equal(on.button.disabled, false); assert.equal(typeof on.button.onClick, 'function')
+  on.button.onClick(); assert.deepEqual(on.calls, [['anthropic', a]])
+  assert.ok(!on.button.title.includes('managed'))
+})

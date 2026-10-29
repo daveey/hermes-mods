@@ -33,6 +33,7 @@ const CSS = `
 .hermes-au-row:hover { background: var(--chrome-action-hover) }
 .hermes-au-row:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px }
 .hermes-au-row:disabled { cursor: wait }
+.hermes-au-row[data-unavailable]:disabled { cursor: not-allowed }
 .hermes-au-fix { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 0 3px 5px 21px; font-size: 10.5px }
 .hermes-au-fix button { color: var(--ui-accent, var(--accent)); border: 1px solid currentColor; border-radius: 3px; padding: 1px 7px; background: transparent; cursor: pointer; font-size: 10.5px }
 .hermes-au-fix button:disabled { cursor: wait; opacity: .6 }
@@ -398,10 +399,12 @@ function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
 
 // The table shows only visual cues (dot colour, bars, dimmed rows, a tinted chevron). Why an
 // account is limited, status hints and the Reconnect action sit behind the row's chevron.
-function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reconnectStore, reconnectState }) {
+export function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reconnectStore, reconnectState }) {
   const t = tone(a)
   const name = a.label || a.id
   const why = describe(a)
+  // Backend says manual choice is refused (managed model routing); keep the row as a read-only status line.
+  const refused = typeof selectionState.selection?.unavailable === 'string' ? selectionState.selection.unavailable : ''
   const fix = reconnectState[reconnectStore.key(g.slug, a.id)] || {}
   const details = hasDetails(g, a)
   // A Reconnect outcome stays visible after the click even if the row is collapsed again.
@@ -410,9 +413,11 @@ function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reco
   return jsxs('div', { children: [
     jsxs('div', { className: 'hermes-au-line', children: [
       jsxs('button', { type: 'button', className: 'hermes-au-row',
-        'aria-label': `Try ${name} next`, disabled: selectionState.busy || selectionState.loading,
-        onClick: () => selectionStore.select(g.slug, a),
-        style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.6 }, title: `${name} · ${why || a.state} · Next request in the focused chat only`, children: [
+        'aria-label': refused ? `${name}: ${refused}` : `Try ${name} next`, disabled: selectionState.busy || selectionState.loading || !!refused,
+        'aria-disabled': refused ? 'true' : undefined, 'data-unavailable': refused ? 'true' : undefined,
+        onClick: refused ? undefined : () => selectionStore.select(g.slug, a),
+        style: { ...GRID, opacity: a.state === 'ready' || a.id === g.markId ? 1 : 0.6, ...(refused ? { cursor: 'not-allowed' } : {}) },
+        title: refused ? `${name} · ${why || a.state} · ${refused}` : `${name} · ${why || a.state} · Next request in the focused chat only`, children: [
         jsx(Dot, { t, mark: a.id === g.markId ? g.mark : null }),
         jsxs('span', { style: { display: 'flex', alignItems: 'center', minWidth: 0, fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
           jsx('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: name }), a.id === g.markId ? jsx(MarkBadge, { g }) : null,

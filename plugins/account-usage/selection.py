@@ -1112,6 +1112,9 @@ class SelectionService:
             result = self.metadata(owner, store.read(owner.key))
             if invalidated or result['state'] == 'rejected':
                 result['error'] = abandoned or 'Account selection was rejected; choose an available account for the current route'
+            unavailable = managed_routing_refusal()  # same gate put() applies
+            if unavailable:
+                result['unavailable'] = unavailable
             return result
 
     def consume_for_agent(self, agent):

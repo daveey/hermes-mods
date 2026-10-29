@@ -219,6 +219,16 @@ class Backend(unittest.TestCase):
         with self.assertRaises(self.s.SelectionRejected):
             self.s.resolve_owner('runtime-A', profile_home=self.home, server=self.server)
 
+    def test_get_exposes_managed_routing_refusal_only_when_enforced(self):
+        service = self.s.SelectionService(self.home, server=self.server)
+        self.assertNotIn('unavailable', service.get('runtime-A'))  # unmanaged() from setUp
+        managed = {'model_routing': {'enabled': True, 'enforce_subscription_only': True}}
+        with patch('agent.model_routing_managed.managed_config', return_value=managed):
+            got = service.get('runtime-A')
+        self.assertEqual(got['unavailable'], self.s.MANAGED_ROUTING_REFUSAL)
+        self.assertEqual(got['state'], 'empty')
+        self.assertNotIn('unavailable', service.get('runtime-A'))
+
     def test_service_consumes_once_and_never_revives_invalid_selection(self):
         self.assertTrue(hasattr(self.s.SelectionService, 'consume_for_agent'), 'dispatch API missing')
         self.lease()
