@@ -221,3 +221,13 @@ def test_claude_hook_blocks_script(tmp_path):
 def test_newline_separates_commands():
     assert blocked("terminal", command="echo start\npython3 -m pytest -q\n")
     assert blocked("terminal", command="echo start\nnpm ci\necho done\n")
+
+
+def test_script_resolved_against_the_task_shell_cwd(tmp_path, monkeypatch):
+    """A worker that `cd`s in one terminal call and runs ./ci.sh in the next sends no workdir."""
+    _script(tmp_path, SCRIPT_BODIES[0])
+    monkeypatch.setattr(plugin, "_terminal_cwd", lambda task_id: str(tmp_path) if task_id == "t1" else None)
+    assert plugin._pre_tool_call(tool_name="terminal", args={"command": "./ci.sh"}, task_id="t1")
+    assert plugin._pre_tool_call(tool_name="tool_call", task_id="t1", args={
+        "calls": [{"name": "terminal", "arguments": {"command": "./ci.sh"}}]})
+    assert plugin._pre_tool_call(tool_name="terminal", args={"command": "./ci.sh"}, task_id="other") is None

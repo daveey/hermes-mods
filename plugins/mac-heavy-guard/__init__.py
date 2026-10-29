@@ -26,24 +26,36 @@ logger = logging.getLogger(__name__)
 SHELL_TOOLS = {"terminal", "process_manage", "process"}
 
 
-def classify(tool_name: str, args: Any) -> Optional[str]:
+def _terminal_cwd(task_id: str) -> Optional[str]:
+    """The persistent shell's current directory for this task (a previous `cd` call), if Hermes tracks one."""
+    try:
+        from tools import terminal_tool as tt
+        env = tt._active_environments.get(tt._resolve_container_task_id(task_id)) or tt._active_environments.get(task_id)
+        cwd = getattr(env, "cwd", None)
+        return cwd if isinstance(cwd, str) and cwd else None
+    except Exception:
+        return None
+
+
+def classify(tool_name: str, args: Any, task_id: str = "") -> Optional[str]:
     args = args if isinstance(args, dict) else {}
     if tool_name in SHELL_TOOLS:
-        return guard.check_shell(str(args.get("command") or ""), cwd=args.get("workdir") or None)
+        cwd = args.get("workdir") or (_terminal_cwd(task_id) if task_id else None)
+        return guard.check_shell(str(args.get("command") or ""), cwd=cwd)
     if tool_name in {"tool_call", "mcp__tool_call"}:
         for call in args.get("calls") or []:
             if isinstance(call, dict):
-                why = classify(str(call.get("name") or ""), call.get("arguments"))
+                why = classify(str(call.get("name") or ""), call.get("arguments"), task_id)
                 if why:
                     return why
     return None
 
 
-def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[dict]:
+def _pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", **_: Any) -> Optional[dict]:
     try:
         if not guard.enabled():
             return None
-        why = classify(tool_name, args)
+        why = classify(tool_name, args, task_id or "")
     except Exception:  # never let this plugin break a tool call
         logger.debug("mac-heavy-guard classify failed", exc_info=True)
         return None
