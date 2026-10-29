@@ -64,6 +64,11 @@ HEAVY = [
     "FOO=1 cargo build --release",
     "bash -lc 'cd repo && npm ci'",
     "git pull && pnpm install && pnpm test",
+    "scripts/run_tests.sh",
+    "./scripts/run_tests.sh -j 8",
+    "bash scripts/run_tests.sh --slice 1/2",
+    "python3 scripts/run_tests_parallel.py --include-integration",
+    "MAC_HEAVY_NOPE=1 scripts/run_tests.sh --file-timeout 600",
 ]
 
 LIGHT = [
@@ -88,6 +93,10 @@ LIGHT = [
     "git commit -m 'run pytest and npm install'",
     "rg 'docker build' docs/",
     "ls -la",
+    "scripts/run_tests.sh tests/test_x.py",
+    "scripts/run_tests.sh -j 4 tests/tools/",
+    "scripts/run_tests.sh --files tests/a.py,tests/b.py",
+    "python3 scripts/run_tests_parallel.py --files-from sel.txt",
 ]
 
 
@@ -144,6 +153,13 @@ def test_claude_hook_blocks_and_allows():
     assert r.returncode == 2 and "MAC_HEAVY_OK=1" in r.stderr
     assert _hook("pytest tests/test_x.py").returncode == 0
     assert _hook("MAC_HEAVY_OK=1 npm ci").returncode == 0
+
+
+def test_claude_hook_blocks_whole_hermes_suite():
+    r = _hook("scripts/run_tests.sh -j 8")
+    assert r.returncode == 2 and "run_tests.sh" in r.stderr
+    assert _hook("scripts/run_tests.sh tests/test_x.py").returncode == 0
+    assert _hook("MAC_HEAVY_OK=1 scripts/run_tests.sh").returncode == 0
 
 
 # --- scripts: a local shell script is scanned like inline text ---------------------------------

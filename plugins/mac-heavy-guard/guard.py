@@ -3,7 +3,7 @@
 Shared by the Hermes pre_tool_call hook (__init__.py) and the Claude Code PreToolUse hook
 (claude_hook.py). Heavy = release builds (`cargo build --release`), container builds
 (`docker build`), whole test suites (`pytest` with no test path or with `-n`, bare `npm test`,
-`vitest run` with no filter, `make test`) and whole-repo dependency installs (`npm install`,
+`vitest run` with no filter, `make test`, Hermes `scripts/run_tests.sh` with no test path) and whole-repo dependency installs (`npm install`,
 `pnpm install`, `uv sync`, `pip install -r`). Targeted work stays allowed (`pytest tests/test_x.py`,
 `cargo build`, `npm install left-pad`), as does anything sent over `ssh`.
 
@@ -136,7 +136,36 @@ def _pytest_full(args: list[str]) -> Optional[str]:
     return "the whole pytest suite (no test path)"
 
 
+# Hermes core's per-file suite runner (scripts/run_tests.sh -> run_tests_parallel.py): positional args and
+# --files/--files-from/--paths narrow it; with none it runs all ~6000 test files.
+RUN_TESTS = ("run_tests.sh", "run_tests_parallel.py")
+RUN_TESTS_VALUE_FLAGS = {"-j", "--jobs", "--file-timeout", "--file-retries", "--slice", "--generate-slices",
+                         "--flaky-report"}
+RUN_TESTS_SELECT_FLAGS = ("--files", "--files-from", "--paths")
+
+
+def _run_tests_full(args: list[str]) -> Optional[str]:
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a.startswith(RUN_TESTS_SELECT_FLAGS):
+            return None
+        if a in RUN_TESTS_VALUE_FLAGS:
+            skip = True
+            continue
+        if not a.startswith("-"):
+            return None
+    return "the whole Hermes test suite (run_tests.sh with no test paths)"
+
+
 def check_argv(argv: list[str]) -> Optional[str]:
+    first = os.path.basename(argv[0])
+    if (PY.match(first) or first in SHELLS) and len(argv) > 1 and os.path.basename(argv[1]) in RUN_TESTS:
+        argv = argv[1:]
+    if argv and os.path.basename(argv[0]) in RUN_TESTS:
+        return _run_tests_full(argv[1:])
     argv = _strip_runner(argv)
     if not argv:
         return None
