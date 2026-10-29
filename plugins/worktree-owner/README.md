@@ -61,7 +61,9 @@ The same rule for worktrees made by Claude Code or Codex sessions (and their sub
 - `PreToolUse` / `PostToolUse` on Bash: a command that mentions `worktree add` gets the same `hermes-owner.json`
   marker, with `agent` (`claude` / `codex`), `agent_session_id`, `cwd` and, inside a Kanban card,
   `task_id` (so the card's `kanban_complete` teardown also applies). The pre-hook stamps the call's start time, so
-  only gitdirs born during the call are claimed, with the same attribution guard. Repos searched: `~/code` depth
+  only gitdirs born during the call are claimed, with the same attribution guard. A `HERMES_KANBAN_TASK` paired
+  with `HERMES_KANBAN_RUN_ID` is stamped only when that run still holds a live claim; a finished run is not a
+  card. An unreadable board is left as-is. Repos searched: `~/code` depth
   1-2, `~/.hermes/hermes-agent`, the session cwd and any `cd <dir>` / `git -C <dir>` in the command.
 - `Stop` (at most every 5 min per session) and `SessionEnd`: a detached child removes this session's marked trees
   that are clean, have no live process cwd inside, and are merged: HEAD is an ancestor of `origin/<default>` after a

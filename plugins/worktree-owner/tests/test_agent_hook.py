@@ -88,6 +88,42 @@ class AgentHook(unittest.TestCase):
                        "tool_input": {"command": f"git worktree add -b bk {p}"}}, "claude", env={"HERMES_KANBAN_TASK": "t_k"})
         self.assertEqual(self.marker(p)["task_id"], "t_k")
 
+    def _identity_db(self, live, task="t_dead", run_id=5):
+        import sqlite3
+        db = self.tmp / f"{task}.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, claim_lock TEXT, current_run_id INTEGER)")
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, status TEXT, claim_lock TEXT, ended_at INTEGER)"
+        )
+        if live:
+            conn.execute("INSERT INTO tasks VALUES (?, 'running', 'lock', ?)", (task, run_id))
+            conn.execute("INSERT INTO task_runs VALUES (?, ?, 'running', 'lock', NULL)", (run_id, task))
+        else:
+            conn.execute("INSERT INTO tasks VALUES (?, 'done', NULL, NULL)", (task,))
+            conn.execute("INSERT INTO task_runs VALUES (?, ?, 'done', 'lock', 1)", (run_id, task))
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_finished_run_identity_is_not_stamped(self):
+        p = self.code / "proj-stale"
+        git(self.repo, "worktree", "add", "-q", "-b", "bstale", str(p), "origin/main")
+        db = self._identity_db(False)
+        self.h.handle({"hook_event_name": "PostToolUse", "session_id": "s", "cwd": str(self.repo), "tool_name": "Bash",
+                       "tool_input": {"command": f"git worktree add -b bstale {p}"}}, "claude",
+                      env={"HERMES_KANBAN_TASK": "t_dead", "HERMES_KANBAN_RUN_ID": "5", "HERMES_KANBAN_DB": str(db)})
+        self.assertIsNone((self.marker(p) or {}).get("task_id"))
+
+    def test_live_run_identity_is_stamped(self):
+        p = self.code / "proj-live"
+        git(self.repo, "worktree", "add", "-q", "-b", "blive", str(p), "origin/main")
+        db = self._identity_db(True, "t_live", 9)
+        self.h.handle({"hook_event_name": "PostToolUse", "session_id": "s", "cwd": str(self.repo), "tool_name": "Bash",
+                       "tool_input": {"command": f"git worktree add -b blive {p}"}}, "claude",
+                      env={"HERMES_KANBAN_TASK": "t_live", "HERMES_KANBAN_RUN_ID": "9", "HERMES_KANBAN_DB": str(db)})
+        self.assertEqual(self.marker(p)["task_id"], "t_live")
+
     def test_ignores_other_commands_and_unnamed_concurrent_trees(self):
         p = self.code / "proj-n"
         git(self.repo, "worktree", "add", "-q", "-b", "bn", str(p), "origin/main")

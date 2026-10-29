@@ -208,8 +208,75 @@ def end(payload: dict, agent: str, detach: bool = True) -> list[dict]:
     return teardown(sid, agent, cwd)
 
 
+def _board_db(env) -> str:
+    pinned = (env.get("HERMES_KANBAN_DB") or "").strip()
+    if pinned:
+        return os.path.expanduser(pinned)
+    home = (env.get("HERMES_KANBAN_HOME") or "").strip()
+    root = os.path.expanduser(home) if home else os.path.join(os.path.expanduser("~"), ".hermes")
+    board = (env.get("HERMES_KANBAN_BOARD") or "").strip()
+    if board and board != "default":
+        return os.path.join(root, "kanban", "boards", board, "kanban.db")
+    return os.path.join(root, "kanban.db")
+
+
+_LIVE_SQL = """
+SELECT 1
+FROM task_runs r
+JOIN tasks t ON t.id = r.task_id AND t.current_run_id = r.id
+WHERE r.id = ? AND r.task_id = ?
+  AND r.ended_at IS NULL AND r.status = 'running' AND r.claim_lock IS NOT NULL
+  AND t.status = 'running' AND t.claim_lock IS NOT NULL
+LIMIT 1
+"""
+
+
+def _run_live(env, task: str, run_id: int):
+    """True live, False not, None when the board cannot be read. Same rule as Hermes startup."""
+    import sqlite3
+    db = _board_db(env)
+    try:
+        if not os.path.isfile(db):
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            conn.execute("select 1 from sqlite_master limit 1")
+        except sqlite3.OperationalError:
+            conn = sqlite3.connect(f"file:{db}?mode=rw", uri=True, timeout=2)
+            conn.execute("PRAGMA query_only=ON")
+        try:
+            row = conn.execute(_LIVE_SQL, (run_id, task)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return row is not None
+
+
+def without_finished_identity(env):
+    """Drop HERMES_KANBAN_TASK/RUN_ID when that run is finished. Unreadable board: keep them.
+
+    A bare task with no run id is left alone (this hook cannot prove it stale).
+    """
+    task = (env.get("HERMES_KANBAN_TASK") or "").strip()
+    raw = (env.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not task or not raw.isdigit():
+        return env
+    live = _run_live(env, task, int(raw))
+    if live is None or live:
+        return env
+    base._log(
+        f"dropped finished kanban identity HERMES_KANBAN_TASK={task} HERMES_KANBAN_RUN_ID={raw} (run is not live)"
+    )
+    if env is os.environ:
+        env.pop("HERMES_KANBAN_TASK", None)
+        env.pop("HERMES_KANBAN_RUN_ID", None)
+        return env
+    return {k: v for k, v in env.items() if k not in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID")}
+
+
 def handle(payload, agent: str, env=None, detach: bool = True) -> list[dict]:
-    env = os.environ if env is None else env
+    env = without_finished_identity(os.environ if env is None else env)
     try:
         if not isinstance(payload, dict):
             return []
