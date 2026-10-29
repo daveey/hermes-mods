@@ -640,7 +640,11 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 #   investigation     card `selfheal:<fp>` for generation 1, `selfheal:<fp>:r<gen>` after (one monotonic counter per
 #                     fingerprint over refiles AND recurrences; kanban idempotency returns done cards too), model
 #                     claude-opus-5-5, 1 h. Investigates LIVE (kanban.db, logs, processes, git log), writes the
-#                     five-whys chain, posts Inbox type `selfheal` (Do it / Not now / Never) under key selfheal:<fp>.
+#                     five-whys chain and proposal.md, records `event proposed` (posts nothing to the Inbox; the
+#                     inbox plugin's post() refuses self-heal posts while auto_approve is on).
+#   auto-approve      sync files the fix card for every `proposed` fingerprint (manual mode: the Inbox outcome on key
+#                     selfheal:<fp> decides). Old cards still telling the worker to `hermes inbox post` get a one-time
+#                     "ignore that step" comment (sweep_inbox_steps).
 #   Do it             -> file_fix (hub cron sync, or `self_heal.py fix <fp>`): fix card `selfheal:<fp>[:r<gen>]:fix` (red-then-green regression test, ship,
 #                     verify live, `event fixed --result result.md` stores the proof; nothing is posted to the Inbox).
 #   sync (cron)       reads Inbox outcomes every 5 min: Do it (a resolve) files the fix card, Not now snoozes the
@@ -2235,6 +2239,47 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
     return done
 
 
+# The retired step in cards filed before 921830b (proposals) / 4f1c2a6 (results): both templates wrote
+# `env HERMES_HOME="$HOME/.hermes" hermes inbox post --...`. Current briefs only mention "`hermes inbox post`" in a
+# "do NOT run" sentence, and proposals may quote a bare `hermes inbox post --poster ...` live check: neither matches.
+OLD_INBOX_STEP = re.compile(r'env HERMES_HOME="\$HOME/\.hermes" hermes inbox post\s+--')
+INBOX_STEP_NOTE = ("self-heal: IGNORE the `hermes inbox post` step in this card's body. Self-heal now auto-approves "
+                   "every proposal and stores results quietly: record a proposal with `self_heal.py event proposed`, "
+                   "a finished fix with `self_heal.py event fixed --result result.md` (saved to "
+                   "selfheal-results/<fp>.md). The Inbox refuses self-heal posts (AgentFixablePost).")
+
+
+def sweep_inbox_steps(store=None, runner=None) -> list:
+    """Cards keep the instructions they were filed with: comment once on each open self-heal card whose body still
+    carries the retired `hermes inbox post --...` step. Returns [(fp, card)]. Lane field `inbox_step_noted` = card."""
+    store = _store(store)
+    lane = LaneState(store.root)
+    done = []
+    for fp, st in lane.read().items():
+        status = st.get("status")
+        card = st.get("card") if status == "filed" else st.get("fix_card") if status == "approved" else None
+        if not card or st.get("inbox_step_noted") == card:
+            continue
+        argv = ["hermes", "kanban"] + (["--board", st["board"]] if st.get("board") else [])
+        try:
+            rc, out, _ = _run(argv + ["show", card, "--json"], runner)
+            task = json.loads(out)["task"] if rc == 0 else None
+        except Exception:
+            task = None
+        if not task or task.get("status") in ENDED or not OLD_INBOX_STEP.search(task.get("body") or ""):
+            continue
+        try:
+            rc, out, err = _run(argv + ["comment", card, INBOX_STEP_NOTE], runner)
+        except Exception as exc:
+            rc, out, err = 1, "", str(exc)
+        if rc == 0:
+            lane.update(fp, inbox_step_noted=card)
+            done.append((fp, card))
+        store.log({"event": "selfheal_inbox_step_noted", "fingerprint": fp, "card": card, "ok": rc == 0,
+                   "error": (err or out)[-200:] if rc else None})
+    return done
+
+
 def auto_approve(cfg: Optional[dict] = None) -> bool:
     """Every proposal is approved without a human (David's standing approval): `auto_approve` in
     selfheal-config.json, env COACH_SELFHEAL_AUTO_APPROVE=0/1 overrides; default on."""
@@ -2256,6 +2301,10 @@ def sync(store=None, runner=None, now: Optional[float] = None, fixer: Optional[C
     auto = auto_approve() if auto is None else auto
     lane = LaneState(store.root)
     done = reconcile(store, runner, now)
+    try:
+        done += [(fp, f"inbox step noted on {card}") for fp, card in sweep_inbox_steps(store, runner)]
+    except Exception as exc:
+        store.log({"event": "selfheal_inbox_step_error", "error": str(exc)[:200]})
     for fp, st in lane.read().items():
         if st.get("status") != "proposed":
             continue

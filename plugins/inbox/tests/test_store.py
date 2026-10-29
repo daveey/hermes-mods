@@ -327,3 +327,46 @@ def test_mute_card_failure_is_visible_not_silent(tmp_path, monkeypatch, capsys, 
     assert "inbox-muted:p-fenced" in err and "NOT be filed" in err and "fenced" in err
     assert "NOT be filed" in caplog.text
     db.close()
+
+
+# ── self-heal posts are enforced at the post path, not only in card text (defect plugin-0001f0af0f) ──
+# Fix cards filed before an instruction-template change kept their old `hermes inbox post` step and reached
+# David's Inbox anyway. While auto-approve is on (the default), nothing from self-heal may be posted.
+
+def test_selfheal_result_post_is_always_refused(env, monkeypatch):
+    inbox, _, _ = env
+    monkeypatch.setenv("COACH_SELFHEAL_AUTO_APPROVE", "0")  # even in manual mode: results are never Inbox cards
+    with pytest.raises(store.AgentFixablePost, match="selfheal-results/"):
+        inbox.post("Fixed: x", "proof", "", poster="cron · audit", type="selfheal-result")
+    assert inbox.list() == []
+
+
+def test_selfheal_posts_refused_while_auto_approve_is_on(env, monkeypatch):
+    inbox, _, _ = env
+    monkeypatch.delenv("COACH_SELFHEAL_AUTO_APPROVE", raising=False)  # default: auto-approve on
+    with pytest.raises(store.AgentFixablePost, match="self_heal.py event fixed --result"):
+        inbox.post("Proposal: x", "why", "Do it", poster="self-heal", type="selfheal", key="selfheal:fp1")
+    with pytest.raises(store.AgentFixablePost):  # the poster alone, any type
+        inbox.post("Fixed: x", "proof", "Do it", poster="Self-Heal")
+    with pytest.raises(store.AgentFixablePost):  # the type alone, any poster
+        inbox.post("Proposal: y", "why", "Do it", poster="agent", type="selfheal")
+    (env[0].home / "coach").mkdir(parents=True, exist_ok=True)
+    (env[0].home / "coach" / "selfheal-config.json").write_text(json.dumps({"auto_approve": True}))
+    with pytest.raises(store.AgentFixablePost):
+        inbox.post("Fixed: z", "proof", "Do it", poster="self-heal")
+    assert inbox.list() == []
+
+
+def test_selfheal_post_allowed_in_manual_mode(env, monkeypatch):
+    inbox, _, _ = env
+    monkeypatch.setenv("COACH_SELFHEAL_AUTO_APPROVE", "0")
+    r = inbox.post("Proposal: x", "why", "Do it", poster="self-heal", key="selfheal:fp1")
+    assert r["session_id"] and [i["poster"] for i in inbox.list()] == ["self-heal"]
+
+
+def test_selfheal_manual_mode_from_config_file(env, monkeypatch):
+    inbox, _, _ = env
+    monkeypatch.delenv("COACH_SELFHEAL_AUTO_APPROVE", raising=False)
+    (inbox.home / "coach").mkdir(parents=True, exist_ok=True)
+    (inbox.home / "coach" / "selfheal-config.json").write_text(json.dumps({"auto_approve": False}))
+    assert inbox.post("Proposal: x", "why", "Do it", poster="self-heal")["session_id"]

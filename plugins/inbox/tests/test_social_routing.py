@@ -258,6 +258,13 @@ def _add_project(home: Path, slug: str, path: str, pid: str):
     conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _selfheal_manual_mode(monkeypatch):
+    """Self-heal posts reach the Inbox only in self-heal's manual mode (auto-approve on refuses them in post(),
+    see test_store.py::test_selfheal_posts_refused_while_auto_approve_is_on); the routing below is that mode's."""
+    monkeypatch.setenv("COACH_SELFHEAL_AUTO_APPROVE", "0")
+
+
 def test_poster_named_project_routes_new_card(env):
     inbox, db, pr = env
     sh = str(Path(pr).parent / "self-heal")

@@ -68,6 +68,43 @@ def agent_fixable_reason(poster: Optional[str], accept_prompt: str) -> Optional[
     return None
 
 
+# Self-heal (coach plugin) proposals and results: the rule "never in the Inbox while auto-approve is on" is
+# enforced here, because fix cards keep the instructions they were filed with and older ones still say
+# `hermes inbox post` (defect plugin-0001f0af0f). Only self-heal's manual mode re-opens the proposal gate.
+SELFHEAL_POSTER = "self-heal"
+SELFHEAL_TYPE = "selfheal"
+SELFHEAL_RESULT_TYPE = "selfheal-result"  # legacy: results are stored in <coach>/selfheal-results/, never posted
+_SELFHEAL_WHERE = ("self-heal results go to selfheal-results/<fp>.md via `self_heal.py event fixed --result`; "
+                   "nothing goes to the Inbox")
+
+
+def selfheal_auto_approve(home: Optional[Path] = None) -> bool:
+    """Mirror of coach self_heal.auto_approve() (no cross-plugin import): env COACH_SELFHEAL_AUTO_APPROVE=0/1 wins,
+    else `auto_approve` in <home>/coach/selfheal-config.json (then the root HERMES_HOME's), default on."""
+    env = os.environ.get("COACH_SELFHEAL_AUTO_APPROVE", "").strip().lower()
+    if env:
+        return env not in ("0", "false", "off", "no")
+    for root in dict.fromkeys(p for p in (home, _home()) if p):
+        try:
+            cfg = json.loads((Path(root) / "coach" / "selfheal-config.json").read_text())
+        except Exception:
+            continue
+        if isinstance(cfg, dict) and "auto_approve" in cfg:
+            return bool(cfg["auto_approve"])
+    return True
+
+
+def selfheal_reason(poster: Optional[str], type: Optional[str], home: Optional[Path] = None) -> Optional[str]:
+    """Why a self-heal post is refused, or None. Results: always. Proposals/any self-heal post: unless manual mode."""
+    t = (type or "").strip().lower()
+    p = "-".join((poster or "").strip().lower().replace("_", " ").split())
+    if t == SELFHEAL_RESULT_TYPE:
+        return f"type {SELFHEAL_RESULT_TYPE!r} is retired: {_SELFHEAL_WHERE}"
+    if (t == SELFHEAL_TYPE or p == SELFHEAL_POSTER) and selfheal_auto_approve(home):
+        return f"self-heal auto-approves every proposal (auto_approve on), so {_SELFHEAL_WHERE}"
+    return None
+
+
 class TaskError(RuntimeError):
     """A ``task`` action could not queue its Kanban card (the inbox card stays open)."""
 
@@ -320,6 +357,9 @@ class Inbox:
         poster = (" ".join(str(poster).split())[:80] or None) if poster else None
         if not title:
             raise ValueError("title is required")
+        sh = selfheal_reason(poster, type, self.home)
+        if sh:  # enforced here, not only in card text: old fix cards still carry a `hermes inbox post` step
+            raise AgentFixablePost(f"refused: {sh}.")
         why = agent_fixable_reason(poster, accept_prompt)
         if why:  # detection-level guard: refuse before David ever sees it (the noise breaker needs 3)
             raise AgentFixablePost(

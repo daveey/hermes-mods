@@ -1525,3 +1525,55 @@ def test_commit_before_the_complaint_or_other_component_is_not_a_fix(store, tmp_
 def test_commit_for_another_component_is_not_a_fix(store, tmp_path, monkeypatch):
     _, _, r, out = _commit_case(store, tmp_path, monkeypatch, "fix(kanban): unrelated", NOW - 3200)
     assert out["action"] == "filed" and len(r.creates()) == 1
+
+
+# ── cards filed before the no-Inbox rule keep their old `hermes inbox post` step (defect plugin-0001f0af0f) ──
+class BodyBoard(Board):
+    """Board whose `show --json` also returns each card's body."""
+
+    def __init__(self, bodies, **kw):
+        super().__init__(**kw)
+        self.bodies = bodies
+
+    def __call__(self, argv, capture_output=True, text=True, input=None, timeout=None):
+        argv = list(argv)
+        if "show" in argv:
+            self.calls.append((argv, input))
+            tid = argv[argv.index("show") + 1]
+            if tid not in self.status:
+                return SimpleNamespace(returncode=1, stdout="", stderr=f"no such task: {tid}")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"task": {
+                "id": tid, "status": self.status[tid], "body": self.bodies.get(tid, "")}}), stderr="")
+        return super().__call__(argv, capture_output, text, input, timeout)
+
+
+OLD_STEP = ('6. Post the result: `env HERMES_HOME="$HOME/.hermes" hermes inbox post --type selfheal-result '
+            '--field fp=x --key selfheal:x --poster "self-heal" --body - "Fixed: <what>" < <result.md>`')
+
+
+def test_sync_comments_once_on_an_open_card_that_still_says_inbox_post(store):
+    b = BodyBoard({})
+    fp, ids = lifecycle(store, b, ["file", "proposed", "fix"])
+    b.bodies[ids[1]] = "Self-heal FIX\n" + OLD_STEP
+    done = dict(sh.sync(store, runner=b, now=NOW + 600))
+    assert done[fp] == f"inbox step noted on {ids[1]}"
+    comments = [a for a, _ in b.calls if "comment" in a]
+    assert len(comments) == 1 and comments[0][-2] == ids[1] and "IGNORE the `hermes inbox post`" in comments[0][-1]
+    sh.sync(store, runner=b, now=NOW + 900)  # once per card
+    assert len([a for a, _ in b.calls if "comment" in a]) == 1
+    assert ev(store, "selfheal_inbox_step_noted")[0]["ok"] is True
+
+
+def test_sync_leaves_current_briefs_and_ended_cards_alone(store):
+    b = BodyBoard({})
+    fp, ids = lifecycle(store, b, ["file", "proposed", "fix"])
+    current = sh.fix_brief(fp, sh.LaneState(store.root).get(fp)) + sh.investigation_brief(defect())
+    assert "hermes inbox post" in current  # the current briefs name the command only to forbid it
+    # ...and an approved proposal may quote the command as its live check (t_01a1850ff844f91d got a false note)
+    current += "\n- Live check: run `hermes inbox post --poster self-heal --type selfheal-result ...`, confirm refused."
+    b.bodies[ids[1]] = current
+    sh.sync(store, runner=b, now=NOW + 600)
+    b.bodies[ids[1]] = OLD_STEP
+    b.finish(ids[1], "done")
+    sh.sync(store, runner=b, now=NOW + 900)
+    assert not [a for a, _ in b.calls if "comment" in a]
