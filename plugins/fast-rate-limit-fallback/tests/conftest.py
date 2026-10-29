@@ -18,7 +18,9 @@ def loaded_local_plugin(monkeypatch, tmp_path):
     import run_agent  # noqa: F401
     import agent.turn_recovery  # noqa: F401
     import agent.turn_api_error  # noqa: F401
-    source = Path(os.environ['FAST_RATE_LIMIT_PLUGIN_SOURCE'])
+    # Source is owned by this staged suite, not by a process-global env var
+    # that core/env-isolation fixtures or another harness can restore/replace.
+    source = Path(__file__).resolve().parent / 'source'
     target = get_hermes_home() / 'plugins' / 'fast-rate-limit-fallback'
     shutil.copytree(source, target, ignore=shutil.ignore_patterns('tests', '__pycache__'))
     # Isolated test-home fixture, never the user's config.
