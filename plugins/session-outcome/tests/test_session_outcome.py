@@ -75,7 +75,9 @@ class Ctx:
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    for k in ("HERMES_KANBAN_TASK", "HERMES_SESSION_OUTCOME_OFF", "HERMES_PLATFORM", "HERMES_SESSION_PLATFORM"):
+    # The run's own session env (a kanban worker or one-shot run) must not leak into the surface tests.
+    for k in ("HERMES_KANBAN_TASK", "HERMES_SESSION_OUTCOME_OFF", "HERMES_PLATFORM", "HERMES_SESSION_PLATFORM",
+              "HERMES_SINGLE_QUERY_SESSION", "HERMES_SESSION_SOURCE_EXPLICIT"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
     db = sqlite3.connect(tmp_path / "state.db")
@@ -227,6 +229,24 @@ def test_judge_yes_no(plugin):
     assert plugin.judge("S1", "Deployed v2 and verified the health check.") is True
     plugin._llm = lambda s, u: "no."
     assert plugin.judge("S1", "Working on it, will report back.") is False
+
+
+def test_judge_sees_head_and_tail_of_a_long_reply(plugin):
+    # A long report leads with its answer and ends with sources; a tail-only cut hid the answer and the judge
+    # called a finished research report "not a summary".
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    head = "Yes, I found supporting results: six wins out of six reported comparisons. "
+    tail = " Sources: [8] archived brief, [9] composite results."
+    reply = head + ("x" * 30000) + tail
+    assert plugin.judge("S1", reply) is True
+    sent = seen[-1]
+    assert sent.startswith(head) and sent.endswith(tail)
+    assert "middle of the message omitted" in sent
+    assert len(sent) <= plugin.JUDGE_INPUT_CHARS + 60
+    short = "Deployed v3 and verified the health check passes."
+    plugin.judge("S2", short)
+    assert seen[-1] == short
 
 
 def test_judge_only_interactive_sources(plugin):

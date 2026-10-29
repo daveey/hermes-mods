@@ -36,6 +36,10 @@ TOOLSET = "session_outcome"
 INTERACTIVE = frozenset({"desktop", "tui", "cli"})
 WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent")
 JUDGE_BUDGET_S = 3.0
+# The judge sees at most this many characters of the reply: whole up to here, else head + tail, never only the
+# tail. A long report leads with its answer; a tail-only cut leaves sources and a closing aside, which the judge
+# reads as "not a summary".
+JUDGE_INPUT_CHARS = 12000
 TAG = "[session-outcome]"
 SUMMARY_MAX = 1000
 PLUGINS = Path(__file__).resolve().parent.parent
@@ -364,6 +368,15 @@ def _pool_llm(system: str, user: str) -> str:
 
 
 _llm: Callable[[str, str], str] = _pool_llm
+
+
+def _judge_input(text: str) -> str:
+    """The reply as the judge sees it: whole when short, else its head and tail around an omission marker."""
+    if len(text) <= JUDGE_INPUT_CHARS:
+        return text
+    half = JUDGE_INPUT_CHARS // 2
+    return f"{text[:half]}\n\n[... middle of the message omitted ...]\n\n{text[-half:]}"
+
 _JUDGED: dict[tuple, Optional[bool]] = {}
 
 
@@ -402,7 +415,7 @@ def judge(session_id: str, last_assistant_text: str, *, source: Optional[str] = 
     if key in _JUDGED:
         return _JUDGED[key]
     try:
-        raw = _with_budget(lambda: _llm(JUDGE_SYSTEM, text[-4000:]), JUDGE_BUDGET_S)
+        raw = _with_budget(lambda: _llm(JUDGE_SYSTEM, _judge_input(text)), JUDGE_BUDGET_S)
         word = str(raw or "").strip().strip(".!\"'`*").upper()
         verdict = True if word.startswith("YES") else False if word.startswith("NO") else None
     except Exception:

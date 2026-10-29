@@ -22,6 +22,8 @@ the outcome and feeds core the two things only plugins know: open user decisions
   call. One call on the subscription pool
   (`pool-llm`'s `complete`, `anthropic`, `fast` tier) with a 3 s budget. YES → True, NO → False, anything else,
   any error or a timeout → None (core falls back to its heuristic). Verdicts are cached per (session, text).
+  The judge reads the whole reply up to 12,000 characters, else its head and tail around an omission marker:
+  never only the tail, which hides a long report's answer and gets a finished report judged NO.
 - **`pre_final_gate`** (buffered): when the turn made no `session_outcome` call, it asks core
   `derive_outcome(sid, ignore_live_turn=True, pending_reply=<the candidate reply>)`. Only
   `unresolved{no_summary}` holds the reply, once, with a request for the call. Core's own precedence decides, so
@@ -49,6 +51,7 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - decide writes ledger steps with options and choices, then declares;
 - the provider returns open steps as decision items;
 - the judge: YES/NO, timeout → None, failure or unclear answer → None, the default path calls pool `fast` tier;
+- the judge gets a long reply's head and tail (whole when short);
 - the gate asks once and passes the second miss (by nudge tag and by the in-memory backup), passes after a tool
   call, on a summary, on an undecided judge, and when a wait or an open step outranks;
 - non-interactive sources (cron, slack, Kanban worker) get no tool and no gate; tui and cli do;
