@@ -16,6 +16,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 | Doc | Patches | What you get |
 |---|---|---|
+| [update-pause-terminal-frame-contract.md](update-pause-terminal-frame-contract.md) | 0738 | A core-update-paused turn's `message.complete` frame passes `MessageCompletePayload`: the deliberate `paused_for_update` flag is declared as an optional bool (generated TS/OpenRPC regenerated); ordinary Stops never carry it. |
 | [cron-finalize-slow-write.md](cron-finalize-slow-write.md) | 0735 | A state.db write that outlives cron finalization's cleanup bound no longer crashes the job: finalization returns, the agent is torn down or handed off, and one WARNING names the job and session while a daemon thread retries title + end_session on a fresh connection. |
 | [kanban-isolated-home-module-restore.md](kanban-isolated-home-module-restore.md) | 0732 | Test fixtures that drop hermes modules to see a temp HERMES_HOME put the process's module objects back, so a later file in the same pytest process patches the object it imported. Test harness only. |
 | [turn-lease-busy-release.md](turn-lease-busy-release.md) | 0736 | A turn-lease release that loses the state.db write lock marks the holder abandoned (reclaimable by the next turn in-process) and retries the DELETE on a daemon thread; live leases are still refused. |
