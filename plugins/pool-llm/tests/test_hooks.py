@@ -113,3 +113,8 @@ def test_quoted_or_reported_credit_ask_is_not_held():
     assert h.credit_ask("kanban_block", {"reason": meta}) is None
     assert h.credit_ask("kanban_block", {"reason": "Card said \"add $250 of Anthropic credit\"; that was wrong."}) is None
     assert h.credit_ask("kanban_block", {"reason": "Please add Anthropic API credit, the credit balance is too low."})
+    # review round 1: meta wording elsewhere in the sentence must not swallow a direct ask
+    for r in ("The pool still does nothing; please add $50 of Anthropic credit.",
+              "The API still fires 429s, so please top up OpenAI credit.",
+              "Please add Anthropic credit so the detector job can run."):
+        assert h.credit_ask("kanban_block", {"reason": r}), r

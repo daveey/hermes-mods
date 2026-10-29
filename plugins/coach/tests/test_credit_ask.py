@@ -145,17 +145,34 @@ def test_real_asks_still_fire_next_to_quotes_and_meta_wording():
     assert rc.credit_ask("Raise the GitHub Actions spending limit to $50 so CI can run.", []) is None
 
 
+# Review round 1 (a6a17e4): the meta guard was loose enough to swallow real asks.
+MUST_FIRE = ("The pool still does nothing; please add $50 of Anthropic credit.",
+             "The API still fires 429s, so please top up OpenAI credit.",
+             "Please add Anthropic credit so the detector job can run.",
+             "The pool still does nothing; add $50 of Anthropic credit.",
+             "The eval still fires errors, add $100 of OpenAI API credit.")
+
+
+def test_meta_guard_keeps_direct_asks():
+    for r in MUST_FIRE:
+        assert rc.credit_ask(r, []), r
+    # the reported forms stay silent
+    assert rc.credit_ask("The rule matched: add $250 of Anthropic credit was a false positive.", []) is None
+    assert rc.credit_ask("An ask to add $250 of Anthropic credit still fires, as intended.", []) is None
+
+
 def test_pool_llm_mirror_matches_coach():
     """pool-llm/hooks.py carries a copy of this logic; the two must not drift."""
     spec2 = importlib.util.spec_from_file_location("t_pool_llm_hooks_mirror", HERE.parent / "pool-llm" / "hooks.py")
     h = importlib.util.module_from_spec(spec2)
     spec2.loader.exec_module(h)
-    for name in ("CREDIT_ASK_RE", "LLM_CREDIT_RE", "NON_LLM_BILLING_RE", "_SENTENCE_END", "_QUOTED_RE", "_META_RE"):
+    for name in ("CREDIT_ASK_RE", "LLM_CREDIT_RE", "NON_LLM_BILLING_RE", "_SENTENCE_END", "_QUOTED_RE", "_META_RE",
+                 "_CLAUSE_CUT", "_DIRECT_RE"):
         a, b = getattr(rc, name), getattr(h, name)
         assert (a.pattern, a.flags) == (b.pattern, b.flags), name
     import inspect
     for fn in ("_nearest", "_about_llm_credit", "_mentioned_not_asked", "_is_llm_credit_ask"):
         assert inspect.getsource(getattr(rc, fn)) == inspect.getsource(getattr(h, fn)), fn
     for r in (META_REPLY, "Please add Anthropic API credit, the credit balance is too low.",
-              "Raise the GitHub Actions spending limit to $50 so CI can run."):
+              "Raise the GitHub Actions spending limit to $50 so CI can run.") + MUST_FIRE:
         assert bool(rc.credit_ask(r, [])) == bool(h.credit_ask("kanban_block", {"reason": r})), r

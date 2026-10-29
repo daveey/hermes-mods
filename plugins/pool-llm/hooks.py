@@ -84,10 +84,19 @@ def _about_llm_credit(text: str, m: "re.Match") -> bool:
 _QUOTED_RE = re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d')
 _META_RE = re.compile(
     r"\bsets?\s+(?:it|this|that|them|the\s+\w+)\s+off\b|\bsetting\s+(?:it|this|that)\s+off\b"
+    # "...credit still does." / "...no longer fires once...": the verb must END its clause (punctuation, end of text,
+    # or a trailing condition), so "still does nothing" and "still fires 429s" are not reports on the detector.
     r"|\b(?:still|no\s+longer|never)\s+(?:does|do|did|fires?|fired|triggers?|trips?|flags?|matches?|catches?)\b"
-    r"(?!\s+(?:the|a|an|this|that|your|our|its|it|so|to|not|n[\u2019']t)\b)"
-    r"|\bfalse\s+(?:alarm|positive|negative)s?\b|\bcredit_ask\b|\b(?:detector|regex)\b"
+    r"(?=\s*(?:[.,;:!?)\u2013\u2014]|$|(?:once|when|whenever|if|unless|after|because|since|now|anymore|either|too)\b))"
+    r"|\bfalse\s+(?:alarm|positive|negative)s?\b|\bcredit_ask\b"
+    r"|\b(?:the|this|that|its|my|our)\s+(?:detector|regex|rule|check)(?:[\u2019']s)?(?:\s+regex)?\s+(?:still\s+)?"
+    r"(?:matched|matches|caught|catches|fires|fired|flags|flagged|triggers|triggered)\b"
     r"|\b(?:an?|the)\s+(?:real|genuine|actual|plain|bare)\s+(?:ask|request)\b", re.I)
+# A clause that directly requests the ask ("...; please add $50", "so can you top up") is an ask whatever the rest of
+# its sentence says. Only explicit request words count: a bare clause-initial verb also opens "false alarm: add ...".
+_CLAUSE_CUT = re.compile(r"[;:,()\u2013\u2014]|\s-\s")
+_DIRECT_RE = re.compile(r"\b(?:please|pls|can\s+you|could\s+you|would\s+you|need\s+you\s+to)\b(?:\s+\w+){0,3}\s*$",
+                        re.I)
 
 
 def _mentioned_not_asked(text: str, m: "re.Match") -> bool:
@@ -100,6 +109,9 @@ def _mentioned_not_asked(text: str, m: "re.Match") -> bool:
     cuts = [0] + [x.end() for x in _SENTENCE_END.finditer(text)] + [len(text)]
     s0 = max(c for c in cuts if c <= m.start())
     s1 = min((c for c in cuts if c >= m.end()), default=len(text))
+    head = text[s0:m.start()]
+    if _DIRECT_RE.search(head[max((c.end() for c in _CLAUSE_CUT.finditer(head)), default=0):]):
+        return False
     return bool(_META_RE.search(text[s0:s1]))
 
 
