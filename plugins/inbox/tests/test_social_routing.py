@@ -113,7 +113,8 @@ def test_no_pr_project_keeps_fallback(tmp_path, monkeypatch):
     from hermes_state import SessionDB
     db = SessionDB(db_path=tmp_path / "state.db")
     db._inbox_keep_open = True
-    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db)
+    from ask_fixtures import decision_inbox
+    inbox = decision_inbox(store.Inbox(home=tmp_path, db_factory=lambda: db))
     r = inbox.post("X post pending", "b", "p", key="x-post:A", inherited_cwd="/Users/me")
     assert db.get_session(r["session_id"])["cwd"] == "/Users/me"
     db.close()
@@ -143,7 +144,7 @@ def test_backfill_moves_only_fallback_cwd_and_is_idempotent(env, monkeypatch):
     home = str(Path.home())
     # A known non-explicit fallback can occur before a pr project is configured.
     with monkeypatch.context() as m:
-        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        m.setattr(store.routing_module(), "project_path", lambda home, *a: None)
         a = inbox.post("X post pending", "b", "p", key="x-post:A")
     b = inbox.post("X post pending", "b", "p", key="x-post:B", cwd="/Users/me/code/writing")  # chosen -> stays
     c = inbox.post("Merge PR #4", "b", "p", key="coding:1", cwd=home)         # not social -> stays
@@ -190,7 +191,7 @@ def test_legacy_schema_migration_leaves_provenance_unknown(env):
 def test_backfill_unended_sessions_fail_closed(env, monkeypatch, message_count, age):
     inbox, db, pr = env
     with monkeypatch.context() as m:
-        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        m.setattr(store.routing_module(), "project_path", lambda home, *a: None)
         r = inbox.post("X post pending", "b", "p", key="x-post:A")
     db._execute_write(lambda c: c.execute(
         "UPDATE sessions SET started_at=?, last_activity_at=?, message_count=? WHERE id=?",
@@ -203,7 +204,7 @@ def test_backfill_unended_sessions_fail_closed(env, monkeypatch, message_count, 
 def test_backfill_rechecks_session_at_write(env, monkeypatch, change):
     inbox, db, pr = env
     with monkeypatch.context() as m:
-        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        m.setattr(store.routing_module(), "project_path", lambda home, *a: None)
         r = inbox.post("X post pending", "b", "p", key="x-post:A")
     db.end_session(r["session_id"], "completed")
     write = db._execute_write
@@ -222,7 +223,7 @@ def test_backfill_rechecks_session_at_write(env, monkeypatch, change):
 def test_backfill_missing_lifecycle_evidence_fails_closed(env, monkeypatch, missing):
     inbox, db, pr = env
     with monkeypatch.context() as m:
-        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        m.setattr(store.routing_module(), "project_path", lambda home, *a: None)
         r = inbox.post("X post pending", "b", "p", key="x-post:A")
     get_session = db.get_session
     snapshot = get_session(r["session_id"])
@@ -236,7 +237,7 @@ def test_backfill_missing_lifecycle_evidence_fails_closed(env, monkeypatch, miss
 def test_backfill_archived_opt_in_still_requires_ended_session(env, monkeypatch):
     inbox, db, pr = env
     with monkeypatch.context() as m:
-        m.setattr(store.routing_module(), "project_path", lambda home: None)
+        m.setattr(store.routing_module(), "project_path", lambda home, *a: None)
         r = inbox.post("X post pending", "b", "p", key="x-post:A")
     db.set_session_archived(r["session_id"], True)
     assert inbox.backfill_social(apply=True)[0]["action"] == "skip:archived"
@@ -285,6 +286,8 @@ def test_poster_named_project_routes_conditional_post(env):
 
 def test_poster_project_explicit_cwd_and_unknown_poster(env):
     inbox, db, pr = env
+    from ask_fixtures import register_test_posters
+    register_test_posters(inbox.home)
     sh = str(Path(pr).parent / "self-heal")
     _add_project(Path(inbox.home), "self-heal", sh, "p_sh")
     r = inbox.post("A", "b", "p", key="selfheal:k3", poster="self-heal", cwd="/tmp/x", inherited_cwd="/Users/me")

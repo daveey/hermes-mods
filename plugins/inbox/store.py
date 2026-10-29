@@ -472,9 +472,6 @@ class Inbox:
         fvals = ct.check_fields(tdef, fields)
         if not accept_prompt and ct.needs_accept_prompt(tdef):
             raise ValueError("accept_prompt is required (the instruction 'Do it' sends)")
-        if not poster:
-            raise NoPoster("refused: a post needs a sender (--poster / poster=) or a key, so David's archives can "
-                           "mute it if it turns out to be noise.")
         snap = ct.snapshot(tdef)
         refusal = policy.reason(home=self.home, poster=poster, ask=ask, actions=snap["actions"],
                                 type_name=snap["name"], title=title, body=body, key=key)
