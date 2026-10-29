@@ -244,7 +244,7 @@ class KanbanSink:
     @staticmethod
     def _run(argv: List[str], stdin: Optional[str] = None) -> Tuple[int, str]:
         res = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=60)
-        return res.returncode, res.stdout
+        return res.returncode, res.stdout + ("\n" + res.stderr if res.stderr else "")
 
     def _base(self) -> List[str]:
         return list(self.hermes) + ["kanban", "--board", self.board]
@@ -253,21 +253,48 @@ class KanbanSink:
         code, out = self.run(self._base() + ["show", "--json", task_id], None)
         if code != 0:
             return None
+        data = self._json(out)
         try:
-            status = json.loads(out)["task"]["status"]
-        except (ValueError, KeyError, TypeError):
+            status = data["task"]["status"]  # type: ignore[index]
+        except (KeyError, TypeError):
             return None
         return status not in ("done", "archived")
 
+    @staticmethod
+    def _json(out: str) -> Optional[dict]:
+        dec = json.JSONDecoder()
+        for i, ch in enumerate(out):
+            if ch == "{":
+                try:
+                    val, _ = dec.raw_decode(out[i:])
+                except ValueError:
+                    continue
+                if isinstance(val, dict):
+                    return val
+        return None
+
     def create(self, key: str, title: str, body: str) -> Optional[str]:
-        code, out = self.run(self._base() + ["create", title, "--body-file", "-", "--assignee", self.assignee,
-                                             "--idempotency-key", key, "--no-requires", "--json"], body)
-        if code != 0:
+        argv = self._base() + ["create", title, "--body-file", "-", "--assignee", self.assignee,
+                               "--idempotency-key", key, "--no-requires", "--json"]
+        code, out = self.run(argv, body)
+        data = self._json(out)
+        if data and data.get("code") == "create_overlap":
+            # Another open card looks similar (e.g. an earlier incident or an owner card): the detector's card
+            # is separate work (a fresh measured episode), so say so instead of being refused.
+            ids = [str(m["id"]) for m in data.get("matches", []) if m.get("id")]
+            if not ids:
+                return None
+            extra: List[str] = []
+            for i in ids:
+                extra += ["--distinct-from", i]
+            extra += ["--distinct-reason", "cpu-budget detector: new measured idle-CPU episode, key " + key]
+            code, out = self.run(argv + extra, body)
+            data = self._json(out)
+        if code != 0 or not data:
             return None
         try:
-            data = json.loads(out)
             return str(data.get("id") or data.get("task_id") or data["task"]["id"])
-        except (ValueError, KeyError, TypeError):
+        except (KeyError, TypeError):
             return None
 
     def comment(self, task_id: str, body: str) -> bool:

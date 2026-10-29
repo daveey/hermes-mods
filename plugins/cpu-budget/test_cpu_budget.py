@@ -472,3 +472,23 @@ def test_ps_is_called_wide_so_launchd_does_not_truncate_args(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake)
     cb.run_ps()
     assert "-Aww" in seen["argv"]
+
+
+def test_create_overlap_refusal_is_retried_with_distinct_from(tmp_path):
+    calls = []
+
+    def runner(argv, stdin=None):
+        calls.append(argv)
+        if "--distinct-from" not in argv:
+            return 1, "warn\n" + json.dumps({"ok": False, "created": False, "code": "create_overlap",
+                                              "matches": [{"id": "t_a"}, {"id": "t_b"}]})
+        return 0, json.dumps({"id": "t_new"})
+
+    sink = cb.KanbanSink(["hermes"], "bb", "bb-queue", runner=runner)
+    assert sink.create("k", "title", "body") == "t_new"
+    retry = calls[1]
+    assert retry.count("--distinct-from") == 2 and "t_a" in retry and "--distinct-reason" in retry
+    # an overlap without ids, or any other refusal, creates nothing
+    assert cb.KanbanSink(["h"], "bb", "a", runner=lambda a, s=None: (1, json.dumps({"code": "create_overlap"}))
+                         ).create("k", "t", "b") is None
+    assert cb.KanbanSink(["h"], "bb", "a", runner=lambda a, s=None: (1, "boom")).create("k", "t", "b") is None
