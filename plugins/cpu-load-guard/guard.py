@@ -114,8 +114,13 @@ EXEC_OPERAND_RE = re.compile(
 _DATA_PREFIX_RE = re.compile(
     r"(?:(?<![=!<>])=|\b(?:open|read_text|read_bytes|load|loads|Path|PurePath|exists|isfile|isdir|"
     r"getsize|getmtime|stat|abspath|realpath|basename|dirname|splitext|readlines|read_file|"
-    r"fromfile|loadtxt|read_csv|read_json|expanduser|glob|iglob)\s*\()\s*$"
+    r"fromfile|loadtxt|read_csv|read_json|expanduser|glob|iglob|"
+    # hermes_tools file tools and their kin: the path is the file to edit/read, not a command.
+    r"patch|write_file|search_files|replace|rename|copy|copyfile|move|unlink|remove)\s*\()\s*$"
 )
+# Documents and data: a path with one of these suffixes in command position is not run unless it has
+# the exec bit. `bash notes.md` (an interpreter hit) is still scanned.
+DATA_EXTS = frozenset({".md", ".markdown", ".rst", ".txt", ".json", ".yaml", ".yml", ".toml", ".csv", ".log", ".html"})
 
 # Readers and file tools. A path they are given is data, never a script this command runs, even
 # when an interpreter name happens to sit in their arguments (`grep python burn.py`).
@@ -410,6 +415,16 @@ def _is_data_path(text: str, m: re.Match) -> bool:
     return bool(_DATA_PREFIX_RE.search(text[: b + 1] if text[b] == "(" else text[:b]))
 
 
+def _is_doc_in_cmd_pos(tok: str, base: str, cds: list[tuple[int, str]], m: re.Match) -> bool:
+    """A command-position path naming a non-executable document (README.md, notes.txt)."""
+    if Path(tok).suffix.lower() not in DATA_EXTS:
+        return False
+    p = Path(os.path.expanduser(tok))
+    if not p.is_absolute():
+        p = Path(_cwd_at(m.start(), cds, base)) / p
+    return not os.access(p, os.X_OK)
+
+
 def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
     if depth >= MAX_DEPTH:
         return None
@@ -417,7 +432,8 @@ def _check_scripts_run(text: str, cwd: str | None, depth: int) -> str | None:
     cds = [(m.start(), _word(m)[1]) for m in CD_RE.finditer(text)]
     hits = sorted(
         [_word(m) + (False,) for r in (INTERP_RE, PY_FILE_RE) for m in r.finditer(text)]
-        + [_word(m) + (False,) for m in CMD_POS_RE.finditer(text) if not _is_data_path(text, m)]
+        + [_word(m) + (False,) for m in CMD_POS_RE.finditer(text)
+           if not _is_data_path(text, m) and not _is_doc_in_cmd_pos(_word(m)[1], base, cds, m)]
         + [_word(m) + (True,) for m in EXEC_OPERAND_RE.finditer(text)]
     )
     seen = set()

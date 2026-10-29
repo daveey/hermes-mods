@@ -671,3 +671,61 @@ def test_spawn_argv_list_with_small_cpu_count_allows():
     s = "stress" + "-ng"
     code = f"import subprocess\nsubprocess.run(['{s}', '--cpu', '2', '--timeout', '1s'])\n"
     assert run("execute_code", {"code": code}) is None
+
+
+# --- incident: execute_code that git-shows a README and patches it was refused as 8-worker stress ---
+# hermes_tools.patch("/abs/README.md", ...) put an absolute doc path in command position; the guard
+# read the README (it documents stress-ng) as a script. Doc/data files are not run; fan-outs still block.
+
+
+def _readme(tmp_path):
+    r = tmp_path / "README.md"
+    r.write_text("| cpu-load-guard | refuses ~one `" + "stress" + "-ng --cpu`/`openssl speed -multi` per core |\n")
+    return r
+
+
+def _readme_edit_payload(d):
+    return (
+        "from hermes_tools import terminal, patch\n"
+        f"a = terminal('git show origin/main:README.md', workdir='{d}')['output']\n"
+        f"b = terminal('git show a9f60e2:README.md', workdir='{d}')['output']\n"
+        "row = next(l for l in a.splitlines() if l.startswith('| [pool-llm]'))\n"
+        f"patch('{d}/README.md', row, row.replace('x', 'y'))\n"
+        f"patch(path='{d}/README.md', old_string=row, new_string=row + ' ')\n"
+    )
+
+
+def test_execute_code_git_show_and_patch_readme_allows(tmp_path):
+    _readme(tmp_path)
+    assert run("execute_code", {"code": _readme_edit_payload(tmp_path)}) is None
+
+
+@pytest.mark.parametrize("fmt", [
+    "{p}",  # a bare doc path as a command (no exec bit)
+    "nohup {p} &",
+    "patch('{p}', a, b)",
+    "write_file('{p}', c)",
+    "terminal('git diff {p}')",
+])
+def test_doc_path_in_command_position_is_not_scanned(tmp_path, fmt):
+    p = _readme(tmp_path)
+    assert run("execute_code", {"code": fmt.format(p=p)}) is None
+    assert run("terminal", {"command": fmt.format(p=p), "workdir": str(tmp_path)}) is None
+
+
+def test_doc_edit_payload_with_real_fanout_still_blocks(tmp_path):
+    _readme(tmp_path)
+    s = "stress" + "-ng"
+    for extra in (f"terminal('{s} --cpu 16 --timeout 30')\n",
+                  "terminal('for i in $(seq 1 16); do yes >/dev/null & done')\n"):
+        assert run("execute_code", {"code": _readme_edit_payload(tmp_path) + extra})["action"] == "block"
+
+
+def test_interpreter_or_exec_bit_on_doc_still_scanned(tmp_path):
+    p = tmp_path / "burn.md"
+    p.write_text(BURN_SH)
+    assert run("terminal", {"command": f"bash {p}", "workdir": str(tmp_path)})["action"] == "block"
+    q = tmp_path / "burn.txt"
+    q.write_text(BURN_SH)
+    q.chmod(0o755)
+    assert run("terminal", {"command": f"{q}", "workdir": str(tmp_path)})["action"] == "block"
