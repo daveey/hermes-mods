@@ -218,6 +218,24 @@ def test_claude_hook_blocks_script(tmp_path):
     assert r.returncode == 2 and "ci.sh" in r.stderr and "whole pytest suite" in r.stderr
 
 
+def test_claude_hook_reads_the_script_from_the_session_cwd(tmp_path):
+    """After a `cd` in an earlier Bash call, only the hook input's cwd names the shell's directory."""
+    import os
+    _script(tmp_path, SCRIPT_BODIES[0])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    env = dict(os.environ)
+    env.pop("MAC_HEAVY_OK", None)
+    r = subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input=json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "./ci.sh"}, "cwd": str(tmp_path)}),
+        capture_output=True, text=True, env=env, cwd=elsewhere)
+    assert r.returncode == 2 and "ci.sh" in r.stderr and "whole pytest suite" in r.stderr
+    r = subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input=json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "./ci.sh"}, "cwd": str(elsewhere)}),
+        capture_output=True, text=True, env=env, cwd=tmp_path)
+    assert r.returncode == 0, "a session cwd without the script must not borrow the hook's own cwd"
+
+
 def test_newline_separates_commands():
     assert blocked("terminal", command="echo start\npython3 -m pytest -q\n")
     assert blocked("terminal", command="echo start\nnpm ci\necho done\n")

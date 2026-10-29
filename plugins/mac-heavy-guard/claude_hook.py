@@ -16,11 +16,15 @@ guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
 
 try:
-    cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "") or ""
+    payload = json.load(sys.stdin)
+    cmd = payload.get("tool_input", {}).get("command", "") or ""
+    # The session's shell directory (after any `cd` in an earlier Bash call). The hook's own process cwd
+    # need not be it, and `./ci.sh` must be read from where the shell will run it.
+    cwd = payload.get("cwd")
 except Exception:
     sys.exit(0)
 
-why = guard.check_shell(cmd) if guard.enabled() else None
+why = guard.check_shell(cmd, cwd=cwd if isinstance(cwd, str) and cwd else None) if guard.enabled() else None
 if why:
     sys.stderr.write(guard.message(why) + "\n")
     sys.exit(2)
