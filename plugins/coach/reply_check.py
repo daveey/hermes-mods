@@ -239,7 +239,8 @@ def scope_limited(user_ask: str) -> bool:
 # status question ("is this session done? it was green but not anymore") and the only open item in the reply was a
 # card parked on purpose (a scheduled retention card). The nudge pushed the agent into a needless investigation.
 # Deterministic, recall-safe: it applies only when the ask is a pure status question (no action verb), the reply names
-# a timed/scheduled wait, and the reply names NO failure-shaped problem at all; anything else goes to the judge.
+# a timed/scheduled wait, and the reply names NO failure-shaped problem and admits NO unfinished work of its own;
+# anything else goes to the judge.
 STATUS_QUESTION_RE = re.compile(
     r"\b(?:is|are|was|were)\s+(?:this|it|that|these|those|they|everything|the\s+[\w-]+(?:\s+[\w-]+)?)\s+"
     r"(?:\w+\s+){0,3}?(?:done|finished|complete|completed|over|green|idle|ready|still\s+(?:running|going|active|open))\b"
@@ -264,6 +265,19 @@ HARD_PROBLEM_RE = re.compile(
     r"|\bnot (?:yet )?(?:merged|deployed|fixed|working|running|started|shipped|live)\b|\bblocked\b|\bcorrupt\w*"
     r"|\bmissing\b|\bwrong\b|\bleak\w*|\bdown\b|\boutage\b|\bdegraded\b|\bflak\w*|\bmisbehav\w*|\boverdue\b"
     r"|\bshould(?:n't| not) (?:be|have)\b|\bunexpected\w*|\bdidn'?t (?:run|wake|fire|start|finish)\b", re.I)
+# Unfinished, agent-fixable work admitted next to the wait ("I haven't pushed the fix yet, and the deploy card is
+# parked"; "the migration is half finished; I still need to run step 3"): the wait is then not the only open item, so
+# the reply goes to the judge (review round 1 of t_01a184ac93d31979). Phrases that only describe the wait itself
+# ("the session remains open until that card completes") stay out of this list.
+UNFINISHED_WORK_RE = re.compile(
+    r"\b(?:haven'?t|hasn'?t|didn'?t|have not|has not|did not)\s+(?:yet\s+)?(?:actually\s+)?[a-z]\w+"
+    r"|\bstill\s+(?:need(?:s|ed)?|ha(?:ve|s)|got)\s+to\b|\bneed(?:s)? to still\b|\b(?:am|is|are|have|has)\s+yet to\b"
+    r"|\bnot\s+(?:yet\s+)?(?:been\s+)?(?:done|finished|complete[d]?|pushed|run|committed|tested|verified|applied|"
+    r"landed|written|built|released|published|migrated|implemented|closed|resolved|addressed)\b"
+    r"|\bhalf[- ](?:way|done|finished|complete[d]?|through|migrated|implemented)\b|\bpartial(?:ly)?\b|\bincomplete\b"
+    r"|\bremaining\s+(?:work|steps?|items?|tasks?|tests?|fix(?:es)?|changes?)\b|\b(?:work|steps?|items?|tasks?)\s+"
+    r"remain\b|\bleft to (?:do|fix|finish|run|push|write)\b|\bTODO\b|\bnext step (?:is|will be)\b"
+    r"|\bI(?:'ll| will) still\b|\bnot quite\b|\bwork in progress\b|\bWIP\b", re.I)
 
 
 def scheduled_wait_status(user_ask: str, reply: str) -> Optional[str]:
@@ -273,7 +287,7 @@ def scheduled_wait_status(user_ask: str, reply: str) -> Optional[str]:
         return None
     tail = (reply or "")[-1500:]
     m = SCHEDULED_WAIT_RE.search(tail)
-    if not m or HARD_PROBLEM_RE.search(tail):
+    if not m or HARD_PROBLEM_RE.search(tail) or UNFINISHED_WORK_RE.search(tail):
         return None
     return f"status question; only open item is a scheduled wait (\"{m.group(0)}\")"
 

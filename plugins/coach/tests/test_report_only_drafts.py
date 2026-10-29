@@ -46,7 +46,8 @@ def _judge(p):
 def test_scheduled_wait_fixtures_fire_only_where_expected():
     ths = rc.settings()["thresholds"]
     for f in FIXTURES:
-        assert "report_only" in rc.prefilter(f["reply"]), f["id"]  # every row reaches the report_only path
+        if f["expect"]:
+            assert "report_only" in rc.prefilter(f["reply"]), f["id"]  # every positive reaches the report_only path
         llm, calls = _judge(0.95)
         hit = rc.check(f["reply"], f["user"], f["log"], llm, threshold=0.8, thresholds=ths,
                        confirm=lambda: (0.9, "report_only + agent_fixable"), confirm_floor=rc.CONFIRM_FLOOR)
@@ -80,6 +81,25 @@ def test_scheduled_wait_needs_a_status_question_and_a_named_wait():
     assert rc.scheduled_wait_status(ask, "The panel is still stale; I haven't fixed it.") is None  # no wait named
     assert rc.scheduled_wait_status(ask, "It is scheduled for Monday, but the build is broken.") is None
     assert rc.scheduled_wait_status(ask, "The soak window is open and the app is still timing out.") is None
+
+
+def test_scheduled_wait_is_exempt_only_when_it_is_the_sole_open_item():
+    ask = "is it done?"
+    for reply in ("No. The migration is half finished; I still need to run step 3. The cleanup card is scheduled.",
+                  "Not quite: I haven't pushed the fix yet, and the deploy card is parked until tomorrow.",
+                  "The deploy card is parked. The fix is not yet committed.",
+                  "The release card wakes at 9:00; the docs change is still left to do.",
+                  "It is scheduled for Monday; the next step is to run the backfill myself.",
+                  "The rollout card is parked; I have yet to update the README.",
+                  "The retention card is scheduled. TODO: rerun the eval."):
+        assert rc.scheduled_wait_status(ask, reply) is None, reply
+    for reply in ("Tests pass. The release card is scheduled and wakes at 9:00 by design.",
+                  "Everything is pushed and green. The retention card is parked on purpose until Nov 1, so the "
+                  "session remains open until that card completes.",
+                  _fx("status-scheduled-retention-20261025")["reply"]):
+        assert rc.scheduled_wait_status(ask, reply), reply
+    # probe 4 of the review: a failure next to the wait is never exempt (guard level; the prefilter has its own recall)
+    assert rc.report_only_guard("is this session done?", "2 tests are failing. The retention card is scheduled.") is None
 
 
 def test_judge_and_second_opinion_prompts_carry_the_exemption():
