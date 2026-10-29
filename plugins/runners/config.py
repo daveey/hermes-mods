@@ -27,7 +27,14 @@ class ConfigError(ValueError):
     code = 'configuration_error'
 
 
-class _StrictLoader(yaml.SafeLoader):
+# libyaml's C parser when present: the hub's 288 KB runners.yaml took 0.35-0.5 s with the pure-Python
+# parser (several seconds under startup GIL contention), stalling the first fleet poll burst after a
+# backend restart. Construction and resolution stay the Python SafeConstructor/Resolver subclassed
+# below, so the strict rules (string keys, no duplicates, timestamps as text) are identical.
+_BaseLoader = getattr(yaml, 'CSafeLoader', None) or yaml.SafeLoader
+
+
+class _StrictLoader(_BaseLoader):
     pass
 
 

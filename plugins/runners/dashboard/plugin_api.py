@@ -53,11 +53,21 @@ def _signature(path):
             stat.st_ctime_ns, stat.st_mode, stat.st_uid, stat.st_gid)
 
 
+_home_locks = {}
+
+
+def _home_lock(home):
+    # Single-flight per profile home. The module-wide _lock is held only to look the lock up, so a
+    # profile without runners.yaml (or with a warm cache) never queues behind another profile's parse.
+    with _lock:
+        return _home_locks.setdefault(home, threading.Lock())
+
+
 def service():
     from hermes_constants import get_hermes_home
     ConfigFile, Service = _backend()
-    with _lock:
-        home = Path(get_hermes_home()).resolve()
+    home = Path(get_hermes_home()).resolve()
+    with _home_lock(home):
         try:
             path = home / 'runners.yaml'
             key = (home, active_profile(), _signature(path))

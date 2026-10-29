@@ -252,6 +252,47 @@ def test_other_profile_config_failure_does_not_evict_the_owner_config(disk_api, 
     assert len(calls) == 1
 
 
+def test_profiles_without_config_never_wait_for_the_owner_parse(disk_api, tmp_path, monkeypatch):
+    """Desktop polls fleet for every profile at once. Right after a backend restart the owner's
+    runners.yaml parse is slow; the other profiles (no runners.yaml) must answer at once instead of
+    queueing behind it on a module-wide lock and hitting Desktop's 5 s request timeout together."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from plugins.runners.config import ConfigFile
+    module, client, path, calls, cfg, constants = disk_api
+    owner_home = constants.get_hermes_home()
+    local = threading.local()
+    constants.get_hermes_home = lambda: getattr(local, 'home', owner_home)
+    parsing = threading.Event()
+    load = ConfigFile.load
+    def slow(self):
+        parsing.set()
+        time.sleep(2.0)
+        return load(self)
+    monkeypatch.setattr(ConfigFile, 'load', slow)
+    others = []
+    for i in range(9):
+        (tmp_path / f'profile-{i}').mkdir()
+        others.append(tmp_path / f'profile-{i}')
+    def poll(home):
+        local.home = home
+        started = time.monotonic()
+        try:
+            module.service()
+            outcome = 'ok'
+        except FileNotFoundError:
+            outcome = 'missing'
+        return outcome, time.monotonic() - started
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        owner = pool.submit(poll, owner_home)
+        assert parsing.wait(5)
+        results = list(pool.map(poll, others))
+        assert owner.result()[0] == 'ok'
+    assert all(outcome == 'missing' for outcome, _ in results)
+    assert max(elapsed for _, elapsed in results) < 0.5, results
+
+
 def test_atomic_replace_same_size_mtime_invalidates(disk_api):
     import os
     module, client, path, calls, cfg, _ = disk_api

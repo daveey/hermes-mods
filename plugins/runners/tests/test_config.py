@@ -154,3 +154,44 @@ def test_bad_disk_config_is_not_empty_inventory(tmp_path):
     path = tmp_path / 'runners.yaml'; path.write_text('hosts: SECRET')
     with pytest.raises(ConfigError):
         ConfigFile(path).load()
+
+
+def _pure_strict_loader():
+    """The same strict constructor/resolver tables on the pure-Python parser."""
+    from plugins.runners.config import _StrictLoader
+    class Pure(yaml.SafeLoader):
+        pass
+    Pure.yaml_constructors = dict(_StrictLoader.yaml_constructors)
+    Pure.yaml_implicit_resolvers = dict(_StrictLoader.yaml_implicit_resolvers)
+    return Pure
+
+
+def test_strict_loader_uses_libyaml_when_available():
+    from plugins.runners.config import _StrictLoader
+    if not yaml.__with_libyaml__:
+        pytest.skip('libyaml not built into this PyYAML')
+    assert issubclass(_StrictLoader, yaml.CSafeLoader)
+
+
+_EQUIVALENCE = ['a: SECRET\na: other', 'features: {observe: true, observe: false}', '[]', '!!python/object:SECRET {}',
+                'a: &x [*x]', 'schema_version: true', '1: x', 'when: 2026-10-29T22:57:22Z\nday: 2026-10-29',
+                'base: &b {x: 1}\nother: {<<: *b, y: 2}', 'n: [1, 2.5, null, ~, yes, "s"]', '[: invalid']
+
+
+@pytest.mark.parametrize('text', _EQUIVALENCE)
+def test_libyaml_and_pure_strict_loaders_agree(text):
+    from plugins.runners.config import _StrictLoader
+    def outcome(loader):
+        try:
+            return 'ok', repr(yaml.load(text, Loader=loader))  # repr: 'a: &x [*x]' is self-referential
+        except Exception as exc:  # the exception class is the contract, not the message
+            return 'error', 'yaml' if isinstance(exc, yaml.YAMLError) else type(exc).__name__
+    assert outcome(_StrictLoader) == outcome(_pure_strict_loader())
+
+
+def test_libyaml_and_pure_agree_on_a_full_graph():
+    from plugins.runners.config import _StrictLoader, normalize
+    cfg = normalize(dict(BASE, scopes=[dict(FIXTURES['Scope'], id=f'scope_{i + 1:016x}', name=f'fictional/p-{i}')
+                                       for i in range(50)]))
+    text = yaml.safe_dump(cfg)
+    assert yaml.load(text, Loader=_StrictLoader) == yaml.load(text, Loader=_pure_strict_loader()) == cfg
