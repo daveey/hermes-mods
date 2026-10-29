@@ -38,7 +38,7 @@ MAX_PROMPT = 4_000
 STALE_QUEUING_S = 300  # a task claim older than this had a crashed claimant; act() may retry it
 # Noise breaker: a poster whose last MUTE_AFTER closed cards (within MUTE_WINDOW_S) were all archived
 # with no action is refused, and one Kanban card is filed to fix that poster. David's Archive is the signal.
-MUTE_AFTER = 3
+MUTE_AFTER = 2
 MUTE_WINDOW_S = 7 * 86400
 # Archive sticks: a re-post of a key whose newest card David archived (no action) inside this window is refused
 # and filed as one Kanban card instead; `hermes inbox unarchive-key <key>` releases it early (bb-ce4c46ed94).
@@ -55,7 +55,15 @@ class PosterMuted(ValueError):
     """The poster's recent cards were all dismissed; its posts are refused until it is fixed + unmuted."""
 
 
-class AgentFixablePost(ValueError):
+class AgentOwnedPost(ValueError):
+    """A refused Inbox post preserved for agents, never a human approval."""
+
+    def __init__(self, reason, task=None):
+        self.reason, self.task = reason, task
+        super().__init__(f"refused: {reason}" + (f"; kanban={task}" if task else ""))
+
+
+class AgentFixablePost(AgentOwnedPost):
     """An automated poster tried to put agent-fixable state in the Inbox (owner-only decisions)."""
 
 
@@ -173,6 +181,12 @@ def kanban_task_creator(*, title: str, body: str, assignee: str, board=None, ski
     if board and not kb.board_exists(board):
         raise TaskError(f"kanban board {board!r} does not exist")
     with kbc.connect_closing(board=board) as conn:
+        existing = (conn.execute("SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived' "
+                                 "ORDER BY created_at DESC LIMIT 1", (idempotency_key,)).fetchone()
+                    if idempotency_key and idempotency_key.startswith(("inbox-refused:", "inbox-junk:")) else None)
+        if existing:
+            kb.add_comment(conn, existing["id"], "inbox", body)
+            return existing["id"]
         return kb.create_task(conn, title=title, body=body, assignee=assignee, board=board,
                               skills=list(skills or []) or None, idempotency_key=idempotency_key,
                               created_by="inbox")
@@ -191,7 +205,15 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS items_key ON items(key);
 CREATE TABLE IF NOT EXISTS unmutes (
   poster     TEXT PRIMARY KEY,
-  unmuted_at REAL NOT NULL
+  unmuted_at REAL NOT NULL,
+  fix_commit TEXT
+);
+CREATE TABLE IF NOT EXISTS junk_mutes (
+  family TEXT NOT NULL,
+  key_prefix TEXT NOT NULL,
+  muted_at REAL NOT NULL,
+  session_id TEXT NOT NULL,
+  PRIMARY KEY(family, key_prefix)
 );
 CREATE TABLE IF NOT EXISTS key_releases (
   key         TEXT PRIMARY KEY,
@@ -201,7 +223,7 @@ CREATE TABLE IF NOT EXISTS key_releases (
 # Added with card types; ALTERed into older sidecars on open (idempotent).
 _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
             ("outcome_value", "TEXT"), ("resolved_at", "REAL"), ("outcome_task", "TEXT"),
-            ("cwd_explicit", "INTEGER"))  # NULL = legacy/unknown; never infer intent from a path
+            ("cwd_explicit", "INTEGER"), ("ask_json", "TEXT"))  # NULL = legacy/unknown
 # Not "types.py": a sibling named like the stdlib module shadows it whenever this dir is on sys.path.
 _TYPES = Path(__file__).resolve().parent / "card_types.py"
 
@@ -265,6 +287,18 @@ def profile_home(root: Path, profile: Optional[str]) -> Path:
     return Path(root) / "profiles" / profile
 
 
+def policy_module():
+    path = Path(__file__).with_name("ask_contract.py")
+    key = f"_hermes_inbox_policy_{path.stat().st_mtime_ns}"
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod = sys.modules.setdefault(key, mod)
+    return mod
+
+
 class Inbox:
     """``db_factory`` returns a SessionDB (injectable for tests); ``home`` holds the sidecar."""
 
@@ -316,6 +350,12 @@ class Inbox:
                 except sqlite3.OperationalError as exc:  # a concurrent opener added it first
                     if "duplicate column" not in str(exc):
                         raise
+        if "fix_commit" not in {r[1] for r in conn.execute("PRAGMA table_info(unmutes)")}:
+            try:
+                conn.execute("ALTER TABLE unmutes ADD COLUMN fix_commit TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
         return conn
 
     def _sessions(self):
@@ -402,10 +442,13 @@ class Inbox:
              model: Optional[str] = None, prompt_label: Optional[str] = None,
              type: Optional[str] = None, fields: Optional[dict] = None,
              inherited_cwd: Optional[str] = None, if_absent: bool = False,
-             expected: Any = _UNSET) -> dict[str, Any]:
+             expected: Any = _UNSET, ask: Optional[dict] = None) -> dict[str, Any]:
         """``cwd`` is an explicit caller choice and always wins; ``inherited_cwd`` is the posting
         session's own cwd, which social cards replace with this host's `pr` project folder.
         New cards persist cwd_explicit (including explicit home); reposts retain original provenance."""
+        policy = policy_module()
+        if policy.test_isolation(self.home):
+            raise AgentOwnedPost("test_isolation")
         ct = types_module()
         title = " ".join(str(title or "").split())[:MAX_TITLE]
         prompt_label = " ".join(str(prompt_label or "").split())[:200] or None
@@ -422,13 +465,9 @@ class Inbox:
         named = poster  # what the caller called itself: project routing keys on this, never a derived name
         poster = poster or key_poster(key)
         sh = selfheal_reason(poster, type, self.home)
-        if sh:  # enforced here, not only in card text: old fix cards still carry a `hermes inbox post` step
-            raise AgentFixablePost(f"refused: {sh}.")
-        why = agent_fixable_reason(poster, accept_prompt)
-        if why:  # detection-level guard: refuse before David ever sees it (the noise breaker needs 3)
-            raise AgentFixablePost(
-                f"refused: {why}. The Inbox is for decisions only David can make; put this on the "
-                f"Kanban board instead (kanban_comment on the card, or kanban_create a fix card).")
+        why = sh or agent_fixable_reason(poster, accept_prompt)
+        if why:
+            self._refuse(why, title, body, accept_prompt, poster, key, AgentFixablePost)
         tdef = self.types.get(type or "default")
         fvals = ct.check_fields(tdef, fields)
         if not accept_prompt and ct.needs_accept_prompt(tdef):
@@ -437,6 +476,10 @@ class Inbox:
             raise NoPoster("refused: a post needs a sender (--poster / poster=) or a key, so David's archives can "
                            "mute it if it turns out to be noise.")
         snap = ct.snapshot(tdef)
+        refusal = policy.reason(home=self.home, poster=poster, ask=ask, actions=snap["actions"],
+                                type_name=snap["name"], title=title, body=body, key=key)
+        if refusal:
+            self._refuse(refusal, title, body, accept_prompt, poster, key)
         tname, fjson, ajson = snap["name"], json.dumps(fvals), json.dumps(snap)
         legacy = ct.is_builtin_default(snap)  # by content: a look-alike type can't borrow the legacy text
         # A type with resolve actions is a decision card: after the user acted on it, a re-post is a
@@ -454,11 +497,13 @@ class Inbox:
                 title=title, body=body, accept_prompt=accept_prompt, key=key, poster=poster, named=named,
                 cwd=cwd, inherited_cwd=inherited_cwd, model=model, prompt_label=prompt_label,
                 snap=snap, fvals=fvals, legacy=legacy, now=now,
-                if_absent=if_absent, expected=expected)
+                if_absent=if_absent, expected=expected, ask=ask)
         with _lock:
             side = self._side()
             db = self._sessions()
             try:
+                if self._junk_muted(side, poster, key):
+                    raise PosterMuted(f"poster family {policy.family(poster)!r} key prefix is muted as Junk")
                 existing = self._open_by_key(side, db, key) if key else None
                 if existing:
                     sid = existing
@@ -466,8 +511,9 @@ class Inbox:
                             else _typed_update_text(body, snap, fvals, now))
                     db.append_message(sid, "assistant", text)
                     side.execute("UPDATE items SET title=?, poster=COALESCE(?, poster), accept_prompt=?, "
-                                 "updated_at=?, type=?, fields_json=?, actions_json=? WHERE session_id=?",
-                                 (title, poster, accept_prompt, now, tname, fjson, ajson, sid))
+                                 "updated_at=?, type=?, fields_json=?, actions_json=?, ask_json=? WHERE session_id=?",
+                                 (title, poster, accept_prompt, now, tname, fjson, ajson,
+                                  json.dumps(ask) if ask else None, sid))
                     side.commit()
                     _set_title(db, sid, title)
                     db.set_session_read(sid, False)
@@ -522,14 +568,41 @@ class Inbox:
                 _set_title(db, sid, title)
                 db.set_session_read(sid, False)
                 side.execute("INSERT INTO items(session_id,key,title,poster,accept_prompt,created_at,updated_at,state,"
-                             "type,fields_json,actions_json,cwd_explicit) VALUES (?,?,?,?,?,?,?, 'open',?,?,?,?)",
-                             (sid, key, title, poster, accept_prompt, now, now, tname, fjson, ajson, cwd_explicit))
+                             "type,fields_json,actions_json,cwd_explicit,ask_json) VALUES (?,?,?,?,?,?,?, 'open',?,?,?,?,?)",
+                             (sid, key, title, poster, accept_prompt, now, now, tname, fjson, ajson, cwd_explicit,
+                              json.dumps(ask) if ask else None))
                 side.commit()
                 self._enforce_cap(side, db)
                 return {"session_id": sid, "updated": False}
             finally:
                 side.close()
                 self._close(db)
+
+    def _refuse(self, reason, title, body, prompt, poster, key, error_class=AgentOwnedPost):
+        family = policy_module().family(poster)
+        event = {"at": self.clock(), "family": family, "poster": poster, "key": key,
+                 "title": title, "body": body, "accept_prompt": prompt, "reason": reason}
+        task = None
+        try:
+            task = (self._task_creator or kanban_task_creator)(
+                title=f"Inbox refused: {title}"[:120],
+                body=f"Reason: {reason}\n\n{title}\n\n{body}\n\nRequested instruction: {prompt}",
+                assignee="default", idempotency_key=f"inbox-refused:{family}:{key or title}")
+            event["task"] = task
+        except Exception as exc:
+            event["routing_error"] = f"{type(exc).__name__}: {exc}"
+        path = self.home / "inbox" / "refusals.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = (json.dumps(event, ensure_ascii=True) + "\n").encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if "routing_error" in event:
+            reason += f"; kanban routing failed: {event['routing_error']} (saved to {path})"
+        raise error_class(reason, task)
 
     @contextmanager
     def _atomic(self):
@@ -592,14 +665,17 @@ class Inbox:
                                                      item.get("resolved_at") or item["updated_at"]),
                 "type": item.get("type") or "default", "title": item["title"],
                 "task": None if item["state"] == "queuing" else item.get("outcome_task"), "revision": revision,
+            "ask": item.get("ask_json"),
                 "item_state": item["state"], "updated_at": item["updated_at"],
                 "message_count": len(messages),
                 "last_message_id": messages[-1]["id"] if messages else None}
 
     def _conditional_post(self, *, title, body, accept_prompt, key, poster, cwd, named=None,
                           inherited_cwd, model, prompt_label, snap, fvals, legacy, now,
-                          if_absent, expected):
+                          if_absent, expected, ask):
         with self._atomic() as (conn, db):
+            if self._junk_muted(conn, poster, key):
+                raise PosterMuted(f"poster family {policy_module().family(poster)!r} key prefix is muted as Junk")
             current = self._snapshot(conn, key)
             conflict = (current is not None) if if_absent else (
                 current is None or current["state"] != "open" or current["item_state"] != "open" or
@@ -635,18 +711,19 @@ class Inbox:
                                              cwd=routed or str(Path.home()))
                 conn.execute("UPDATE sessions SET hidden=1 WHERE id=?", (sid,))
                 conn.execute("INSERT INTO inbox.items(session_id,key,title,poster,accept_prompt,"
-                             "created_at,updated_at,state,type,fields_json,actions_json,cwd_explicit) "
-                             "VALUES (?,?,?,?,?,?,?,'open',?,?,?,?)",
+                             "created_at,updated_at,state,type,fields_json,actions_json,cwd_explicit,ask_json) "
+                             "VALUES (?,?,?,?,?,?,?,'open',?,?,?,?,?)",
                              (sid, key, title, poster, accept_prompt, now, now, snap["name"],
-                              json.dumps(fvals), json.dumps(snap), int(cwd is not None)))
+                              json.dumps(fvals), json.dumps(snap), int(cwd is not None),
+                              json.dumps(ask) if ask else None))
                 text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy else
                         _typed_post_text(title, body, poster, snap, fvals))
             else:
                 sid = current["session_id"]
                 conn.execute("UPDATE inbox.items SET title=?,poster=COALESCE(?,poster),accept_prompt=?,"
-                             "updated_at=?,type=?,fields_json=?,actions_json=? WHERE session_id=?",
+                             "updated_at=?,type=?,fields_json=?,actions_json=?,ask_json=? WHERE session_id=?",
                              (title, poster, accept_prompt, now, snap["name"], json.dumps(fvals),
-                              json.dumps(snap), sid))
+                              json.dumps(snap), json.dumps(ask) if ask else None, sid))
                 text = (_update_text(body, accept_prompt, now, prompt_label) if legacy else
                         _typed_update_text(body, snap, fvals, now))
             db._check_transcript_write_guards(conn, sid, None, reject_active_turn_lease=True)
@@ -671,23 +748,27 @@ class Inbox:
             return {"applied": True, "session_id": sid, "updated": current is not None,
                     "snapshot": self._snapshot(conn, key)}
 
-    def _ignored_streak(self, side, db, poster: str, now: float) -> int:
-        """How many of *poster*'s most recent closed cards (inside MUTE_WINDOW_S, after its last unmute)
-        in a row were archived with no action. Accepted (Do it / a reply) or resolved breaks the streak;
-        cards still open don't count either way. Counted per ``poster_group`` ("kanban · X" -> "kanban")."""
-        group = poster_group(poster) or poster
-        row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=?", (group,)).fetchone()
+    def _ignored_streak(self, side, db, poster: Optional[str], now: float) -> int:
+        """Count archived-untouched by stable family, including unlabelled legacy rows.
+
+        A generic 'Do it' on a repair is not a human decision: only an actual
+        resolved decision resets the streak. An unmute has an explicit fix receipt.
+        """
+        family = policy_module().family(poster)
+        row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=? AND fix_commit IS NOT NULL", (family,)).fetchone()
         since = max(now - MUTE_WINDOW_S, float(row["unmuted_at"]) if row else 0.0)
         streak = 0
-        like = group.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + " · %"
-        for r in side.execute("SELECT session_id, state FROM items WHERE (poster=? OR (? AND poster LIKE ? "
-                              "ESCAPE '\\')) AND created_at>=? ORDER BY created_at DESC LIMIT 50",
-                              (group, int(group != poster), like, since)):
-            if r["state"] in ("accepted", "resolved", "queuing"):
+        for r in side.execute("SELECT session_id, state, poster FROM items WHERE created_at>=? "
+                              "ORDER BY created_at DESC, rowid DESC", (since,)):
+            if policy_module().family(r["poster"]) != family:
+                continue
+            if r["state"] == "resolved":
                 break
+            if r["state"] in ("accepted", "queuing"):
+                continue
             s = db.get_session(r["session_id"])
             if s and not s.get("archived") and not s.get("hidden"):
-                break  # un-hidden through another door = David engaged with it
+                continue
             if r["state"] == "archived" or not s or s.get("archived"):
                 streak += 1
                 if streak >= MUTE_AFTER:
@@ -768,16 +849,50 @@ class Inbox:
             except Exception:
                 pass
 
-    def unmute(self, poster: str) -> None:
-        poster = poster_group(" ".join(str(poster).split())) or poster
+    def unmute(self, poster: str, *, fix_commit: Optional[str] = None) -> None:
+        if not isinstance(fix_commit, str) or not re.fullmatch(
+                r"(?:[a-fA-F0-9]{7,40}|https://github\.com/[^/]+/[^/]+/commit/[a-fA-F0-9]{7,40})", fix_commit):
+            raise ValueError("unmute requires a linked fix commit (SHA or GitHub commit URL)")
+        family = policy_module().family(poster)
         with _lock:
             side = self._side()
             try:
-                side.execute("INSERT INTO unmutes(poster, unmuted_at) VALUES (?, ?) ON CONFLICT(poster) "
-                             "DO UPDATE SET unmuted_at=excluded.unmuted_at", (poster, self.clock()))
+                side.execute("INSERT INTO unmutes(poster, unmuted_at, fix_commit) VALUES (?, ?, ?) ON CONFLICT(poster) "
+                             "DO UPDATE SET unmuted_at=excluded.unmuted_at,fix_commit=excluded.fix_commit",
+                             (family, self.clock(), fix_commit))
+                side.execute("DELETE FROM junk_mutes WHERE family=?", (family,))
                 side.commit()
             finally:
                 side.close()
+
+    def junk(self, session_id: str) -> Optional[dict]:
+        item = self.get(session_id)
+        if not item:
+            return None
+        family = policy_module().family(item.get("poster"))
+        prefix = (item.get("key") or "").split(":", 1)[0]
+        with _lock:
+            side = self._side()
+            try:
+                side.execute("INSERT OR REPLACE INTO junk_mutes VALUES (?,?,?,?)",
+                             (family, prefix, self.clock(), session_id))
+                side.commit()
+            finally:
+                side.close()
+        self.archive(session_id)
+        task = (self._task_creator or kanban_task_creator)(
+            title=f"Inbox Junk: fix poster family {family}"[:120],
+            body=(f"Load five-whys and trace producer → post contract → user-visible card. "
+                  f"The owner marked this card as Junk; family {family!r}, key prefix {prefix!r} is muted. "
+                  f"Fix the producer and add a failing regression before changing code; unmute only with the fix commit.\n\n"
+                  f"Original card attachment (metadata/action snapshot):\n{json.dumps(item, default=str)}"),
+            assignee="default", idempotency_key=f"inbox-junk:{family}:{prefix}")
+        return {"ok": True, "task": task, "family": family, "key_prefix": prefix}
+
+    def _junk_muted(self, side, poster, key):
+        family = policy_module().family(poster)
+        prefix = (key or "").split(":", 1)[0]
+        return side.execute("SELECT 1 FROM junk_mutes WHERE family=? AND key_prefix=?", (family, prefix)).fetchone() is not None
 
     def _open_by_key(self, side, db, key) -> Optional[str]:
         for row in side.execute("SELECT session_id FROM items WHERE key=? AND state='open' "

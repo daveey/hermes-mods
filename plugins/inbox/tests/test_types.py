@@ -58,7 +58,8 @@ def env(tmp_path, monkeypatch, skills):
     db._inbox_keep_open = True
     clock = {"t": 1_000_000.0}
     reg = ct.Registry(tmp_path, skill_dirs=[skills])
-    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"], types=reg)
+    from ask_fixtures import decision_inbox
+    inbox = decision_inbox(store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"], types=reg))
     yield inbox, db, clock
     db.close()
 
