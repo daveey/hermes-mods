@@ -456,3 +456,63 @@ def test_git_https_and_keychain_get_hint(out):
 ])
 def test_no_hint_for_mentions_or_key_only_servers(out):
     assert ut.transform_terminal_output(command="x", output=out) is None
+
+
+# ---- launchers must not pass a Kanban worker's identity to the terminal app
+
+WORKER_ENV = {"HERMES_KANBAN_TASK": "t_dead", "HERMES_KANBAN_RUN_ID": "5045", "HERMES_KANBAN_WORKER_TASK": "t_dead"}
+
+
+@pytest.fixture
+def worker(monkeypatch, tmp_path):
+    for k, v in WORKER_ENV.items():
+        monkeypatch.setenv(k, v)
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append((list(argv), kw))
+        return subprocess.CompletedProcess(argv, 0, stdout="workspace:7", stderr="")
+
+    monkeypatch.setattr(ut.subprocess, "run", fake_run)
+    monkeypatch.setattr(ut.time, "sleep", lambda s: None)
+    job = tmp_path / "job"
+    job.mkdir()
+    return calls, job
+
+
+@pytest.mark.parametrize("which", ["cmux", "terminal", "iterm"])
+def test_launchers_pass_scrubbed_env(worker, monkeypatch, which):
+    calls, job = worker
+    monkeypatch.setattr(ut, "terminal_order", lambda: [which])
+    ut.open_window(job)
+    assert calls
+    for argv, kw in calls:
+        env = kw.get("env")
+        assert env is not None, argv
+        assert "HERMES_KANBAN_TASK" not in env and "HERMES_KANBAN_RUN_ID" not in env
+        assert "HERMES_KANBAN_WORKER_TASK" not in env
+
+
+def test_cmux_command_unsets_identity_first(worker, monkeypatch):
+    calls, job = worker
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["cmux"])
+    ut.open_window(job)
+    cmd = next(a for a, _ in calls if "new-workspace" in a)[-1]
+    assert cmd.startswith("unset ") and "HERMES_KANBAN_TASK" in cmd.split(";")[0] and "HERMES_KANBAN_RUN_ID" in cmd.split(";")[0]
+
+
+def test_terminal_app_command_unsets_identity_first(worker, monkeypatch):
+    calls, job = worker
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["terminal"])
+    ut.open_window(job)
+    script = calls[0][0][2]
+    assert "do script \"unset " in script and "HERMES_KANBAN_RUN_ID" in script.split("runner.sh")[0]
+
+
+def test_iterm_command_env_unsets_identity(worker, monkeypatch):
+    calls, job = worker
+    monkeypatch.setattr(ut, "terminal_order", lambda: ["iterm"])
+    ut.open_window(job)
+    script = calls[0][0][2]
+    pre = script.split("runner.sh")[0]
+    assert "env -u HERMES_KANBAN_TASK" in pre and "-u HERMES_KANBAN_RUN_ID" in pre

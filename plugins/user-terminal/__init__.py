@@ -161,14 +161,49 @@ def terminal_order() -> list[str]:
     return order
 
 
+# A terminal app launched from a Kanban worker keeps the worker's identity for ever (cmux ran for days as a
+# dead card), and every tab it opens inherits it. Plugin subprocesses skip the tool-env scrub, so scrub here.
+_FALLBACK_KANBAN_KEYS = (
+    "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+)
+_EXTRA_IDENTITY_KEYS = ("HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKER_TASK")
+
+
+def worker_identity_keys() -> tuple[str, ...]:
+    try:
+        from agent.delegation_context import KANBAN_ENV_KEYS  # type: ignore
+
+        base = tuple(KANBAN_ENV_KEYS)
+    except Exception:
+        base = _FALLBACK_KANBAN_KEYS
+    return tuple(dict.fromkeys(base + _FALLBACK_KANBAN_KEYS + _EXTRA_IDENTITY_KEYS))
+
+
+def launch_env() -> dict[str, str]:
+    """os.environ without the Kanban worker identity: the environment for every app this plugin launches."""
+    drop = set(worker_identity_keys())
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+def _unset_prefix() -> str:
+    """Shell prefix for a command typed into a terminal that may itself carry a stale worker identity."""
+    return "unset " + " ".join(worker_identity_keys()) + "; "
+
+
+def _env_unset_prefix() -> str:
+    """Same, for a command exec'd without a shell (iTerm): env -u KEY ..."""
+    return "/usr/bin/env " + " ".join(f"-u {k}" for k in worker_identity_keys()) + " "
+
+
 def _cmux(*args: str, timeout: float = 5) -> subprocess.CompletedProcess:
-    return subprocess.run([str(CMUX_BIN), *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run([str(CMUX_BIN), *args], capture_output=True, text=True, timeout=timeout, env=launch_env())
 
 
 def _open_cmux(shell_cmd: str, title: str) -> str:
     ok = _cmux("ping").returncode == 0
     if not ok:
-        subprocess.run(["open", "-a", str(CMUX_APP)], check=False)
+        subprocess.run(["open", "-a", str(CMUX_APP)], check=False, env=launch_env())
         for _ in range(40):
             time.sleep(0.5)
             if _cmux("ping").returncode == 0:
@@ -183,7 +218,7 @@ def _open_cmux(shell_cmd: str, title: str) -> str:
     if m:
         _cmux("rename-workspace", "--workspace", m.group(0), title)
         _cmux("select-workspace", "--workspace", m.group(0))
-    subprocess.run(["open", "-a", str(CMUX_APP)], check=False)
+    subprocess.run(["open", "-a", str(CMUX_APP)], check=False, env=launch_env())
     return "cmux"
 
 
@@ -213,7 +248,7 @@ def _open_terminal_app(shell_cmd: str) -> str:
     script = (f'tell application "Terminal"\nset t to do script {_osa_quote(shell_cmd)}\nset w to front window\n'
               f'set number of columns of w to {COLS}\nset number of rows of w to {ROWS}\nactivate\nend tell\n'
               + _center("Terminal"))
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20)
+    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20, env=launch_env())
     return "Terminal"
 
 
@@ -221,20 +256,20 @@ def _open_iterm(shell_cmd: str) -> str:
     script = ('tell application "iTerm"\nactivate\nset w to (create window with default profile command '
               + _osa_quote(shell_cmd) + f')\ntell current session of w\nset columns to {COLS}\nset rows to {ROWS}\n'
               'end tell\nend tell\n' + _center("iTerm"))
-    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20)
+    subprocess.run(["osascript", "-e", script], check=True, capture_output=True, timeout=20, env=launch_env())
     return "iTerm"
 
 
 def open_window(job: Path) -> str:
     run_cmd = f"/bin/bash {shlex.quote(str(job / 'runner.sh'))} {shlex.quote(str(job))}"
-    shell_cmd = run_cmd + "; exit"  # typed into an interactive shell (Terminal.app, cmux)
+    shell_cmd = _unset_prefix() + run_cmd + "; exit"  # typed into an interactive shell (Terminal.app, cmux)
     errors = []
     for k in terminal_order():
         try:
             if k == "cmux":
                 return _open_cmux(shell_cmd, "Hermes: confirm command")
             if k == "iterm":
-                return _open_iterm(run_cmd)  # iTerm execs it directly, no shell
+                return _open_iterm(_env_unset_prefix() + run_cmd)  # iTerm execs it directly, no shell
             if k == "terminal":
                 return _open_terminal_app(shell_cmd)
         except Exception as e:  # fall through to the next terminal
