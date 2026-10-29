@@ -3,6 +3,7 @@ import ast
 import hmac
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import types
@@ -19,10 +20,45 @@ F = json.loads((ROOT / 'contracts/fixtures.json').read_text())
 PREFIX = '/api/plugins/runners/v1'
 
 
+def resolve_core_auth_source() -> Path:
+    """Exact core auth source, never a mock.
+
+    CI sets RUNNERS_CORE_WEB_SERVER to a pinned NousResearch/hermes-agent
+    web_server.py. A developer machine falls back to the installed checkout.
+    A missing file fails closed so the suite cannot pass by skipping auth.
+    """
+    override = os.environ.get('RUNNERS_CORE_WEB_SERVER')
+    if override:
+        path = Path(override)
+    else:
+        root = os.environ.get('RUNNERS_CORE_ROOT')
+        path = (Path(root) / 'hermes_cli/web_server.py') if root else (
+            Path.home() / '.hermes/hermes-agent/hermes_cli/web_server.py')
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'core auth source missing at {path}; set RUNNERS_CORE_WEB_SERVER '
+            'to hermes_cli/web_server.py (CI pins NousResearch/hermes-agent)')
+    return path
+
+
+def test_missing_core_auth_source_names_the_provision_contract(tmp_path, monkeypatch):
+    missing = tmp_path / 'absent.py'
+    monkeypatch.setenv('RUNNERS_CORE_WEB_SERVER', str(missing))
+    with pytest.raises(FileNotFoundError, match='RUNNERS_CORE_WEB_SERVER'):
+        resolve_core_auth_source()
+
+
+def test_core_auth_source_prefers_the_explicit_override(tmp_path, monkeypatch):
+    source = tmp_path / 'web_server.py'
+    source.write_text('def _require_token(request):\n    return None\n')
+    monkeypatch.setenv('RUNNERS_CORE_WEB_SERVER', str(source))
+    assert resolve_core_auth_source() == source
+
+
 @pytest.fixture
 def api(monkeypatch, tmp_path):
     # Execute the exact core auth implementation, not a permissive mock.
-    core = Path.home() / '.hermes/hermes-agent/hermes_cli/web_server.py'
+    core = resolve_core_auth_source()
     tree = ast.parse(core.read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
              ('_require_token', '_has_valid_session_token')]
