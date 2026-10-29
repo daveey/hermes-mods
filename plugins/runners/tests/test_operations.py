@@ -26,13 +26,13 @@ def policy(**overrides):
                  fragment_path='/etc/systemd/system/gh-runner-canary@.service',
                  operations=['diagnose', 'service_start'],
                  github=dict(api='https://api.github.com', repo='example/app', runner_id=7,
-                             credential_ref='cred_' + 'd' * 32)),
+                             credential_ref='cred_' + 'd' * 32, app_id=1)),
             dict(id=SIBLING, host_id=HOST, unit='gh-runner-canary@2.service', canary=True,
                  description_contains='example-canary-2',
                  fragment_path='/etc/systemd/system/gh-runner-canary@.service',
                  operations=['diagnose', 'service_start'],
                  github=dict(api='https://api.github.com', repo='example/app', runner_id=8,
-                             credential_ref='cred_' + 'd' * 32)),
+                             credential_ref='cred_' + 'd' * 32, app_id=1)),
         ])
     base.update(overrides)
     return ops.load_policy(base)
@@ -66,7 +66,8 @@ class FakeGitHub:
         self.calls.append(github['runner_id'])
         if self.error:
             raise self.error
-        return dict(status=self.status, busy=self.busy, observed_at=self.clock() - self.age)
+        return dict(status=self.status, busy=self.busy, observed_at=self.clock() - self.age,
+                    token_source='app_installation')
 
 
 class FakeProcesses:
@@ -134,7 +135,7 @@ def test_start_stopped_idle_canary_with_fresh_checks(tmp_path):
     data = result['data']
     assert data['outcome'] == 'control_plane_started'
     assert data['verification'] == 'restored_unverified_build'
-    assert data['pre']['github'] == dict(status='offline', busy=False, fresh=True)
+    assert data['pre']['github'] == dict(status='offline', busy=False, fresh=True, token_source='app_installation')
     assert data['pre']['local_workers'] == 'absent'
     assert data['post']['active_state'] == 'active'
 
@@ -388,4 +389,4 @@ def test_mutating_target_requires_canary_flag():
                              description_contains='x', fragment_path='/etc/systemd/system/gh-runner@.service',
                              operations=['diagnose', 'service_start'],
                              github=dict(api='https://api.github.com', repo='example/app', runner_id=1,
-                                         credential_ref='cred_' + 'd' * 32))])
+                                         credential_ref='cred_' + 'd' * 32, app_id=1))])

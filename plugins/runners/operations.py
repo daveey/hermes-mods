@@ -123,11 +123,12 @@ def load_policy(raw):
             _require('github' in t, 'mutation_requires_provider_check')
         if 'github' in t:
             g = t['github']
-            _require(isinstance(g, dict) and set(g) == {'api', 'repo', 'runner_id', 'credential_ref'})
+            _require(isinstance(g, dict) and set(g) == {'api', 'repo', 'runner_id', 'credential_ref', 'app_id'})
             _require(g['api'] == GITHUB_API, 'endpoint_not_allowlisted')
             _require(isinstance(g['repo'], str) and REPO.fullmatch(g['repo']) and '..' not in g['repo'])
             _require(type(g['runner_id']) is int and 0 < g['runner_id'] < 2**53)
             _require(isinstance(g['credential_ref'], str) and credentials.REF.fullmatch(g['credential_ref']))
+            _require(type(g['app_id']) is int and 0 < g['app_id'] < 2**53, 'app_id_required')
         if 'runner_root' in t:
             _require(isinstance(t['runner_root'], str) and ABS_PATH.fullmatch(t['runner_root']) and '..' not in t['runner_root'])
         _require(t['id'] not in seen_ids and t['unit'] not in seen_units, 'duplicate_target')
@@ -247,13 +248,20 @@ def _urllib_transport(url, headers, timeout):
 
 
 class GitHubPort:
-    def __init__(self, credential_dir, *, expected_uid, transport=None, clock=time.time):
+    """Reads runner state with a short-lived GitHub App installation token (no static token path)."""
+
+    def __init__(self, credential_dir, *, expected_uid, transport=None, mint_transport=None, clock=time.time,
+                 signer=None):
         self.credential_dir, self.expected_uid = credential_dir, expected_uid
         self.transport, self.clock = transport or _urllib_transport, clock
+        self.minter = credentials.AppTokenMinter(credential_dir, expected_uid=expected_uid, transport=mint_transport,
+                                                 clock=clock, signer=signer)
 
     def runner(self, github):
+        if type(github.get('app_id')) is not int:
+            raise ActivityUnknown('app_id_missing')
         try:
-            token = credentials.load_secret(self.credential_dir, github['credential_ref'], expected_uid=self.expected_uid)
+            token = self.minter.token(app_id=github['app_id'], key_ref=github['credential_ref'], repo=github['repo'])
         except credentials.CredentialError as exc:
             raise ActivityUnknown(str(exc)) from None
         url = '%s/repos/%s/actions/runners/%d' % (GITHUB_API, github['repo'], github['runner_id'])
@@ -271,7 +279,8 @@ class GitHubPort:
             raise ActivityUnknown('provider_malformed') from None
         if not isinstance(data, dict) or data.get('id') not in (None, github['runner_id']):
             raise ActivityUnknown('provider_identity_mismatch')
-        return dict(status=data.get('status'), busy=data.get('busy'), observed_at=self.clock())
+        return dict(status=data.get('status'), busy=data.get('busy'), observed_at=self.clock(),
+                    token_source=credentials.TOKEN_SOURCE)
 
 
 class FlockLocks:
@@ -323,6 +332,20 @@ def _parse(obj):
     return obj
 
 
+def _provider_error(exc, bare=False):
+    # ActivityUnknown messages are fixed codes; anything else may echo headers, so it is dropped.
+    code = str(exc) if isinstance(exc, ActivityUnknown) else 'provider_error'
+    return code if bare else ': ' + code
+
+
+def _token_source(result):
+    data = result.get('data') if isinstance(result, dict) else None
+    gh = data.get('github') if isinstance(data, dict) else None
+    if gh is None and isinstance(data, dict) and isinstance(data.get('pre'), dict):
+        gh = data['pre'].get('github')
+    return gh.get('token_source') if isinstance(gh, dict) else None
+
+
 class Engine:
     def __init__(self, policy, *, systemd, github, processes, locks, clock=time.time, settle_seconds=20.0, audit=None):
         self.policy, self.systemd, self.github, self.processes, self.locks = policy, systemd, github, processes, locks
@@ -340,7 +363,8 @@ class Engine:
                 self.audit(dict(at=self.clock(), peer_uid=peer_uid, request_id=request_id if isinstance(request_id, str) else None,
                                 operation=obj.get('operation') if isinstance(obj, dict) and isinstance(obj.get('operation'), str) else None,
                                 target_id=obj.get('target_id') if isinstance(obj, dict) and isinstance(obj.get('target_id'), str) else None,
-                                ok=result['ok'], refusal=result.get('refusal')))
+                                ok=result['ok'], refusal=result.get('refusal'),
+                                token_source=_token_source(result)))
         return result
 
     def _handle(self, obj, peer_uid):
@@ -426,9 +450,20 @@ class Engine:
                     residual_processes=residual,
                     untrusted=dict(description=untrusted(props.get('Description', ''))), observed_at=self.clock(),
                     restart='disabled', restart_reason=QUIESCE_EXPLANATION)
+        if 'github' in target:
+            data['github'] = self._github_activity(target)
         if evidence:
             data['evidence'] = evidence
         return data
+
+    def _github_activity(self, target):
+        try:
+            gh = self.github.runner(target['github'])
+        except Exception as exc:  # noqa: BLE001 - diagnose never fails because the provider is unreachable
+            return dict(error=_provider_error(exc, bare=True))
+        fresh = self.clock() - gh.get('observed_at', 0) <= ACTIVITY_MAX_AGE
+        return dict(status=gh.get('status'), busy=gh.get('busy'), observed_at=gh.get('observed_at'), fresh=fresh,
+                    token_source=gh.get('token_source'))
 
     def _start(self, target, op, evidence):
         props = self._identity(target)
@@ -442,8 +477,9 @@ class Engine:
                           'left Runner.Listener running); a start would run a second listener. Not starting.')
         try:
             gh = self.github.runner(target['github'])
-        except Exception:  # noqa: BLE001
-            raise Refusal('activity_unknown', 'fresh provider activity could not be determined') from None
+        except Exception as exc:  # noqa: BLE001
+            raise Refusal('activity_unknown', 'fresh provider activity could not be determined'
+                          + _provider_error(exc)) from None
         if gh.get('status') not in ('online', 'offline') or type(gh.get('busy')) is not bool:
             raise Refusal('activity_unknown', 'provider returned unrecognized activity')
         if self.clock() - gh.get('observed_at', 0) > ACTIVITY_MAX_AGE:
@@ -454,7 +490,8 @@ class Engine:
             raise Refusal('provider_online_unit_inactive',
                           'provider reports this runner online while its unit is inactive: another listener holds it')
         pre = dict(service=self._service(props), local_workers='absent', residual_processes='absent',
-                   github=dict(status=gh['status'], busy=False, fresh=True))
+                   github=dict(status=gh['status'], busy=False, fresh=True,
+                             token_source=gh.get('token_source')))
         self._last_mutation[target['id']] = self.clock()
         self.systemd.start(target['unit'])
         deadline = time.monotonic() + self.settle_seconds

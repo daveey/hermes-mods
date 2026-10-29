@@ -72,17 +72,30 @@ def test_redaction_removes_secrets_from_any_text():
     assert '[REDACTED]' in credentials.redact(text, [SECRET])
 
 
-def test_github_port_never_returns_or_logs_the_token(tmp_path):
+def _app_port(tmp_path, runner_transport):
     os.chmod(tmp_path, 0o700)
-    _write(tmp_path / REF, 0o600)
+    (tmp_path / REF).write_text('-----BEGIN RSA PRIVATE KEY-----\nZmFrZQ==\n-----END RSA PRIVATE KEY-----\n')
+    os.chmod(tmp_path / REF, 0o600)
+
+    def mint(method, url, headers, body, timeout):
+        if url.endswith('/installation'):
+            return 200, b'{"id": 5}'
+        return 201, json.dumps(dict(token=SECRET, expires_at='2099-01-01T00:00:00Z',
+                                    permissions={'administration': 'read', 'metadata': 'read'},
+                                    repositories=[{'name': 'app'}])).encode()
+    return ops.GitHubPort(tmp_path, expected_uid=os.getuid(), transport=runner_transport, mint_transport=mint,
+                          signer=lambda k, d: b'sig')
+
+
+def test_github_port_never_returns_or_logs_the_token(tmp_path):
     seen = {}
 
     def transport(url, headers, timeout):
         seen['url'], seen['auth'] = url, headers['Authorization']
         raise OSError('boom ' + headers['Authorization'])
 
-    port = ops.GitHubPort(tmp_path, expected_uid=os.getuid(), transport=transport)
-    github = dict(api='https://api.github.com', repo='example/app', runner_id=7, credential_ref=REF)
+    port = _app_port(tmp_path, transport)
+    github = dict(api='https://api.github.com', repo='example/app', runner_id=7, credential_ref=REF, app_id=1)
     with pytest.raises(ops.ActivityUnknown) as exc:
         port.runner(github)
     assert seen['url'] == 'https://api.github.com/repos/example/app/actions/runners/7'
@@ -91,15 +104,13 @@ def test_github_port_never_returns_or_logs_the_token(tmp_path):
 
 
 def test_github_port_parses_runner_status(tmp_path):
-    os.chmod(tmp_path, 0o700)
-    _write(tmp_path / REF, 0o600)
-    port = ops.GitHubPort(tmp_path, expected_uid=os.getuid(),
-                          transport=lambda url, headers, timeout: (200, json.dumps(dict(id=7, status='offline', busy=False)).encode()))
-    got = port.runner(dict(api='https://api.github.com', repo='example/app', runner_id=7, credential_ref=REF))
+    github = dict(api='https://api.github.com', repo='example/app', runner_id=7, credential_ref=REF, app_id=1)
+    port = _app_port(tmp_path, lambda url, headers, timeout: (200, json.dumps(dict(id=7, status='offline', busy=False)).encode()))
+    got = port.runner(github)
     assert got['status'] == 'offline' and got['busy'] is False
-    port = ops.GitHubPort(tmp_path, expected_uid=os.getuid(), transport=lambda url, headers, timeout: (403, b'{}'))
+    port = _app_port(tmp_path, lambda url, headers, timeout: (403, b'{}'))
     with pytest.raises(ops.ActivityUnknown):
-        port.runner(dict(api='https://api.github.com', repo='example/app', runner_id=7, credential_ref=REF))
+        port.runner(github)
 
 
 def test_github_endpoint_is_allowlisted():
@@ -108,7 +119,7 @@ def test_github_endpoint_is_allowlisted():
             clients=[dict(uid=1000)], targets=[dict(id='service_' + 'a' * 32, host_id='00000000-0000-4000-8000-0000000000aa',
             unit='gh-runner-canary@1.service', canary=True, description_contains='x',
             fragment_path='/etc/systemd/system/gh-runner-canary@.service', operations=['diagnose', 'service_start'],
-            github=dict(api='http://169.254.169.254', repo='example/app', runner_id=7, credential_ref=REF))]))
+            github=dict(api='http://169.254.169.254', repo='example/app', runner_id=7, credential_ref=REF, app_id=1))]))
 
 
 def test_probe_key_forced_command_refuses_arbitrary_commands(tmp_path):
@@ -141,7 +152,7 @@ def test_polkit_rule_grants_only_start_of_listed_canary_units():
             dict(id='service_' + 'a' * 32, host_id='00000000-0000-4000-8000-0000000000aa', unit='gh-runner-canary@1.service',
                  canary=True, description_contains='x', fragment_path='/etc/systemd/system/gh-runner-canary@.service',
                  operations=['diagnose', 'service_start'],
-                 github=dict(api='https://api.github.com', repo='example/app', runner_id=7, credential_ref=REF)),
+                 github=dict(api='https://api.github.com', repo='example/app', runner_id=7, credential_ref=REF, app_id=1)),
             dict(id='service_' + 'b' * 32, host_id='00000000-0000-4000-8000-0000000000aa', unit='gh-runner@1.service',
                  canary=False, description_contains='y', fragment_path='/etc/systemd/system/gh-runner@.service',
                  operations=['diagnose'])]))

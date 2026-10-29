@@ -214,6 +214,16 @@ copy of the code (`templates/broker.service`). Policy lives at
 in `/etc/hermes-runners-broker/credentials` (broker-owned 0700/0600). Peers are
 authenticated by kernel `SO_PEERCRED` uid against the policy's client list.
 
+GitHub access uses a dedicated, broker-only GitHub App (Administration:read + Metadata:read,
+installed on the one repo). The only credential file is that App's private key
+(`credentials/cred_<hex>`, broker-owned 0600, PEM; a group/world-readable or wrongly owned file is
+refused). Each policy `github` block carries `app_id`. The broker signs a short-lived JWT, looks up the
+repo installation, and mints an installation token with `repositories=[<repo>]`,
+`permissions={administration: read}`; it refuses a token that comes back broader. Tokens are cached
+in memory until 5 minutes before expiry. There is no static-token path: a mint failure surfaces as an
+explicit `app_*` error (diagnose `github.error`, refusal detail) and nothing else is tried. `diagnose`
+reports fresh runner activity and every audit record carries `token_source` (`app_installation`).
+
 Enforced on every request:
 
 - strict schema: unknown fields (`command`, `argv`, `unit`, ...) and non-opaque IDs are refused.
