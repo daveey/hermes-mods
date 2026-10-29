@@ -35,7 +35,8 @@ def _refuse(reason):
 MAX_AGE_SECONDS = 14 * 86400
 # Sections that restrict rather than grant: a name there is an EXCLUSION, never an authorization.
 RESTRICTING = re.compile(r'^\W*(?:limits?|exclusions?|consequences?)\b', re.I | re.M)
-DEAD_STATES = ('withdrawn', 'cancelled', 'superseded')
+LIVE_STATE = 'resolved'
+NEGATION = re.compile(r"(?:\bnot|\bno|\bnever|\bwithout|n't|\bdon't|\bdo not)\W+(?:\w+\W+){0,3}$", re.I)
 
 
 def split_scope(markdown):
@@ -50,6 +51,11 @@ def subject_names(repair, config, runners):
     binding = next((b for b in config.get('bindings', []) if b.get('runner_id') == entity), {})
     runner = next((r for r in runners if r.get('id') == entity), {})
     return tuple(n for n in (entity, binding.get('service_ref'), runner.get('display_name')) if isinstance(n, str) and n)
+
+
+def _grants_start(text):
+    """True when a non-negated start/recover phrase appears in the granting text."""
+    return any(not NEGATION.search(text[max(0, m.start() - 40):m.start()]) for m in START_WORDING.finditer(text))
 
 
 def _names_subject(markdown, names):
@@ -89,7 +95,7 @@ def verify_receipt(operation_id, *, store_path, owner_profile, subject_names):
                              (row[0], body['requestId'])).fetchone()
         finally:
             c.close()
-        if live is None or live[0] in DEAD_STATES or live[1] != body['revision']:
+        if live is None or live[0] != LIVE_STATE or live[1] != body['revision']:
             return _refuse('request_withdrawn_or_superseded')
         recorded = body.get('recordedAt')
         from datetime import datetime
@@ -98,6 +104,8 @@ def verify_receipt(operation_id, *, store_path, owner_profile, subject_names):
             return _refuse('receipt_expired')
         approve = (request.get('outcomes') or {}).get('approve')
         grants, restricts = split_scope(markdown)
+        restricts += '\n' + '\n'.join(str(x) for x in (request.get('exclusions') or []))
+        restricts += '\n' + json.dumps(request.get('limits') or [])
         grants = grants + '\n' + (approve if isinstance(approve, str) else '')
     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
         return _refuse('receipt_store_unavailable')
@@ -105,7 +113,7 @@ def verify_receipt(operation_id, *, store_path, owner_profile, subject_names):
         return _refuse('subject_excluded_by_scope')
     if not _names_subject(grants, subject_names):
         return _refuse('scope_does_not_name_subject')
-    ops = ['diagnose'] + (['service_start'] if START_WORDING.search(grants) else [])
+    ops = ['diagnose'] + (['service_start'] if _grants_start(grants) else [])
     return dict(verified=True, reason='verified', authorized_operations=ops, operation_id=operation_id,
                 request_id=body.get('requestId'), request_revision=body.get('revision'),
                 effect='approve', execution_authorized=True,

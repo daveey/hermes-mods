@@ -117,7 +117,7 @@ def test_start_wording_only_in_restricting_sections_does_not_grant_service_start
     assert verify(make_store(tmp_path, scope=scope))['authorized_operations'] == ['diagnose']
 
 
-@pytest.mark.parametrize('state', ['withdrawn', 'cancelled', 'superseded'])
+@pytest.mark.parametrize('state', ['withdrawn', 'cancelled', 'superseded', 'open', 'needs_context'])
 def test_withdrawn_or_superseded_request_is_refused(tmp_path, state):
     assert verify(make_store(tmp_path, state=state))['reason'] == 'request_withdrawn_or_superseded'
 
@@ -135,3 +135,9 @@ def test_subject_names_come_from_repair_binding_and_inventory():
     runners = [dict(id=RUNNER, display_name=NAME), dict(id='runner_' + '4' * 32, display_name='other')]
     assert receipts.subject_names(dict(entity_id=RUNNER), config, runners) == (RUNNER, SERVICE, NAME)
     assert receipts.subject_names(dict(entity_id='runner_' + '8' * 32), config, runners) == ('runner_' + '8' * 32,)
+
+
+@pytest.mark.parametrize('scope', ['Inspect `example-canary-1`. Do not recover or start the canary.',
+                                   'Inspect `example-canary-1`. Never restart; no recovery: do not recover it.'])
+def test_negated_start_wording_does_not_grant_service_start(tmp_path, scope):
+    assert verify(make_store(tmp_path, scope=scope))['authorized_operations'] == ['diagnose']

@@ -195,8 +195,9 @@ profile). It returns `verified=true` only when the operation is `effect=approve`
 its frozen scope is complete and names this repair's subject (runner id, service ref or runner display name, whole
 token) in the granting part of the scope (the text before its Limits/Exclusions/Consequences headings, plus the
 approve outcome); a subject named only under Exclusions is refused. The request must not be withdrawn, cancelled or
-superseded, still be at the recorded revision, and the receipt at most 14 days old. It then lists `authorized_operations`: `diagnose` always, `service_start` only if the scope wording covers
-starting/recovering the subject. Declined/revised decisions, other subjects, unknown or malformed operation ids
+superseded, still be at the recorded revision, and the receipt at most 14 days old. It then lists `authorized_operations`: `diagnose` always, `service_start` only if the granting text contains a
+non-negated start/recover phrase (it is not tied to a particular sentence; the request's structured exclusions/limits
+and the Limits/Exclusions/Consequences sections can only restrict). Declined/revised decisions, other subjects, unknown or malformed operation ids
 and a relay without a receipt are refused. It cannot create or consume a decision. It is advisory: the repair brief
 tells the chat to act only on `verified=true`, but `runners_operate` does not itself demand a receipt. The hard limits
 are unchanged and enforced by the broker (policy-listed canary unit, stopped-only `service_start`, no sibling targets).
