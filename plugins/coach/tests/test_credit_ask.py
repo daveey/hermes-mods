@@ -118,3 +118,44 @@ def test_bare_llm_name_does_not_turn_non_llm_billing_into_an_ask():
               "I rotated the AWS API key. Add $20 of credit to AWS so the EC2 job keeps running.",
               "Add $20 of credit to AWS; the AWS API key is in the vault."):
         assert rc.credit_ask(r, []) is None, r
+
+
+# Live false positive after ccd7722: a reply DESCRIBING the rule (quoted example + "still does") was held as an ask.
+META_REPLY = ("Fixed: \"Raise the GitHub Actions spending limit\" no longer sets it off, while a real ask to add "
+              "Anthropic or OpenAI credit still does.")
+
+
+def test_quoted_or_reported_mention_is_not_an_ask():
+    assert rc.credit_ask(META_REPLY, []) is None
+    for r in ("Added a test: \"Please add $250 of Anthropic credit\" is held before the judge.",
+              "The old card said \u201cadd $100 of OpenAI API credit\u201d.",
+              "The credit_ask rule caught \"add Anthropic credit\" in my last reply.",
+              "That was a false alarm: add Anthropic API credit only matched the detector's regex.",
+              "Asking David to add $250 of OpenAI credit no longer fires once the pool was tried."):
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_real_asks_still_fire_next_to_quotes_and_meta_wording():
+    assert rc.credit_ask("Please add Anthropic API credit, the credit balance is too low.", [])
+    assert rc.credit_ask(REAL_REPLY, [])  # quotes elsewhere on the line do not cover the ask
+    assert rc.credit_ask("The eval still does nothing. Add $250 of Anthropic credit so it can finish.", [])
+    assert rc.credit_ask("Anthropic says \"credit balance is too low\", so please add $100 of credit.", [])
+    assert rc.credit_ask("It still fails: add $100 of OpenAI API credit and I'll rerun it.", [])
+    # GitHub Actions billing stays out
+    assert rc.credit_ask("Raise the GitHub Actions spending limit to $50 so CI can run.", []) is None
+
+
+def test_pool_llm_mirror_matches_coach():
+    """pool-llm/hooks.py carries a copy of this logic; the two must not drift."""
+    spec2 = importlib.util.spec_from_file_location("t_pool_llm_hooks_mirror", HERE.parent / "pool-llm" / "hooks.py")
+    h = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(h)
+    for name in ("CREDIT_ASK_RE", "LLM_CREDIT_RE", "NON_LLM_BILLING_RE", "_SENTENCE_END", "_QUOTED_RE", "_META_RE"):
+        a, b = getattr(rc, name), getattr(h, name)
+        assert (a.pattern, a.flags) == (b.pattern, b.flags), name
+    import inspect
+    for fn in ("_nearest", "_about_llm_credit", "_mentioned_not_asked", "_is_llm_credit_ask"):
+        assert inspect.getsource(getattr(rc, fn)) == inspect.getsource(getattr(h, fn)), fn
+    for r in (META_REPLY, "Please add Anthropic API credit, the credit balance is too low.",
+              "Raise the GitHub Actions spending limit to $50 so CI can run."):
+        assert bool(rc.credit_ask(r, [])) == bool(h.credit_ask("kanban_block", {"reason": r})), r

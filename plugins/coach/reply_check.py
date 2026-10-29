@@ -390,6 +390,37 @@ def _about_llm_credit(text: str, m: "re.Match") -> bool:
     return True
 
 
+# Only an ask counts, not a mention of one (live false positive 2026-10-29: a reply describing this rule, '"Raise the
+# GitHub Actions spending limit" no longer sets it off, while a real ask to add Anthropic or OpenAI credit still
+# does.'). Skipped: wording inside double quotes on its line, and a sentence that reports on the detector itself.
+# Same code in plugins/pool-llm/hooks.py; keep the two in step.
+_QUOTED_RE = re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d')
+_META_RE = re.compile(
+    r"\bsets?\s+(?:it|this|that|them|the\s+\w+)\s+off\b|\bsetting\s+(?:it|this|that)\s+off\b"
+    r"|\b(?:still|no\s+longer|never)\s+(?:does|do|did|fires?|fired|triggers?|trips?|flags?|matches?|catches?)\b"
+    r"(?!\s+(?:the|a|an|this|that|your|our|its|it|so|to|not|n[\u2019']t)\b)"
+    r"|\bfalse\s+(?:alarm|positive|negative)s?\b|\bcredit_ask\b|\b(?:detector|regex)\b"
+    r"|\b(?:an?|the)\s+(?:real|genuine|actual|plain|bare)\s+(?:ask|request)\b", re.I)
+
+
+def _mentioned_not_asked(text: str, m: "re.Match") -> bool:
+    """The money wording at m sits inside double quotes, or in a sentence reporting on the credit-ask detector."""
+    ls = text.rfind("\n", 0, m.start()) + 1
+    le = text.find("\n", m.end())
+    line = text[ls:len(text) if le < 0 else le]
+    if any(q.start() + ls <= m.start() and m.end() <= q.end() + ls for q in _QUOTED_RE.finditer(line)):
+        return True
+    cuts = [0] + [x.end() for x in _SENTENCE_END.finditer(text)] + [len(text)]
+    s0 = max(c for c in cuts if c <= m.start())
+    s1 = min((c for c in cuts if c >= m.end()), default=len(text))
+    return bool(_META_RE.search(text[s0:s1]))
+
+
+def _is_llm_credit_ask(text: str, m: "re.Match") -> bool:
+    """m is an ask (not a quoted or reported mention) about LLM provider credit."""
+    return not _mentioned_not_asked(text, m) and _about_llm_credit(text, m)
+
+
 # A sentence saying credit is NOT needed is not an ask (live false positive 2026-10-29: "So no credit top-up is
 # needed."). Only explicit not-needed forms are blanked before the search, so "No credits left, so a top-up is
 # needed", "No need to wait; add $250 of credit" and "... but add $250" still hold.
@@ -418,7 +449,7 @@ def credit_ask(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     # pool-llm's own hint (echoed tool output) and quoted/code text are not an ask
     text = "\n".join(l for l in _CODE_QUOTE.sub(" ", reply or "").splitlines() if "pool-llm:" not in l)
     text = CREDIT_NEGATED_RE.sub(lambda n: " " * len(n.group(0)), text)
-    m = next((m for m in CREDIT_ASK_RE.finditer(text) if _about_llm_credit(text, m)), None)
+    m = next((m for m in CREDIT_ASK_RE.finditer(text) if _is_llm_credit_ask(text, m)), None)
     if not m or any(POOL_HELPER_RE.search(l or "") for l in (tool_log or [])):
         return None
     return m.group(0).strip()

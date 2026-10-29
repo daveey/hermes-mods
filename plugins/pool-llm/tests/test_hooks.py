@@ -104,3 +104,12 @@ def test_anthropic_credit_block_is_held():
     # LLM credit in its own paragraph holds even when another paragraph mentions GitHub Actions
     mixed = "CI on GitHub Actions is green.\n\nAdd $100 of OpenAI API credits; the eval hits insufficient_quota."
     assert h.credit_ask("kanban_block", {"reason": mixed})
+
+
+def test_quoted_or_reported_credit_ask_is_not_held():
+    h = fresh()
+    meta = ("Fixed: \"Raise the GitHub Actions spending limit\" no longer sets it off, while a real ask to add "
+            "Anthropic or OpenAI credit still does.")
+    assert h.credit_ask("kanban_block", {"reason": meta}) is None
+    assert h.credit_ask("kanban_block", {"reason": "Card said \"add $250 of Anthropic credit\"; that was wrong."}) is None
+    assert h.credit_ask("kanban_block", {"reason": "Please add Anthropic API credit, the credit balance is too low."})
