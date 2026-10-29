@@ -345,6 +345,21 @@ CREDIT_ASK_RE = re.compile(
     r"|\bmoney ask\b",
     re.I)
 POOL_HELPER_RE = re.compile(r"hermes-pool-llm|pool_llm")
+# A sentence saying credit is NOT needed is not an ask (live false positive 2026-10-29: "So no credit top-up is
+# needed."). Only explicit not-needed forms are blanked before the search, so "No credits left, so a top-up is
+# needed", "No need to wait; add $250 of credit" and "... but add $250" still hold.
+_NEG_MONEY = r"(?:api\s+)?(?:credits?|credit balance|billing|funds|budget|money|top[- ]?up)"
+_NOT_NEEDED = r"(?:needed|required|necessary)"
+_NEG_GAP = r"(?:(?!\b(?:but|except|only|just|unless|until)\b)[^.\n;:,\u2013\u2014]){0,40}?"
+CREDIT_NEGATED_RE = re.compile(
+    r"\bno\s+(?:more\s+|extra\s+|additional\s+|new\s+)?" + _NEG_MONEY +
+    r"\b(?:\s+[\w-]+){0,2}?(?:\s+(?:is|are|was|were|gets|will\s+be))?\s+" + _NOT_NEEDED + r"\b"
+    r"|\bno\s+need\s+(?:to|for)\b" + _NEG_GAP + r"\b" + _NEG_MONEY + r"\b"
+    r"|\b(?:don[\u2019']t|doesn[\u2019']t|do\s+not|does\s+not|won[\u2019']t|will\s+not|never|no\s+longer)\s+"
+    r"need(?:s|ed)?\b" + _NEG_GAP + r"\b" + _NEG_MONEY + r"\b"
+    r"|\b" + _NEG_MONEY + r"\b(?:\s+[\w-]+){0,2}?\s+(?:is|are|was|were)(?:n[\u2019']t|\s+not|\s+no\s+longer)\s+" +
+    _NOT_NEEDED + r"\b",
+    re.I)
 CREDIT_ASK_NUDGE = (
     "[coach] credit_ask: your reply asks the user to add or buy API credit (\"{evidence}\"), but this turn never tried "
     "the Hermes subscription account pool (Claude Max + ChatGPT accounts). Run the work there first: "
@@ -357,6 +372,7 @@ def credit_ask(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     """The phrase asking the user to buy API credit, when the turn never ran the pool helper; else None."""
     # pool-llm's own hint (echoed tool output) and quoted/code text are not an ask
     text = "\n".join(l for l in _CODE_QUOTE.sub(" ", reply or "").splitlines() if "pool-llm:" not in l)
+    text = CREDIT_NEGATED_RE.sub(lambda n: " " * len(n.group(0)), text)
     m = CREDIT_ASK_RE.search(text)
     if not m or any(POOL_HELPER_RE.search(l or "") for l in (tool_log or [])):
         return None

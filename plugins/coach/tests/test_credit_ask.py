@@ -54,3 +54,26 @@ def test_echoed_pool_llm_hint_is_not_an_ask():
 def test_ask_in_code_or_quote_is_not_an_ask_but_plain_ask_still_is():
     assert rc.credit_ask("The old skill said `add credits to the API org`.", []) is None
     assert rc.credit_ask("Please add credits to the OpenAI API org so the eval can continue.", [])
+
+
+# Live false positive (2026-10-29): a status reply saying credit is NOT needed was held as a credit ask.
+NEGATED_REPLY = ("- So no credit top-up is needed. Claude and GPT run on our Hermes accounts, and embeddings go "
+                 "through the same pool to OpenRouter for cents.")
+
+
+def test_reply_saying_credit_is_not_needed_is_not_an_ask():
+    assert rc.credit_ask(NEGATED_REPLY, ["-> terminal(command='pytest -q tests')"]) is None
+    for text in ("No credit top-up needed: the eval runs on the account pool.",
+                 "We don't need to add credits; the pool covers it.",
+                 "No need to buy API credits for this run.",
+                 "A credit top-up isn't needed.",
+                 "API credit: no top-up is needed."):
+        assert rc.credit_ask(text, []) is None, text
+
+
+def test_negation_guard_keeps_real_asks():
+    for text in ("No credits left, so a top-up is needed.",
+                 "No need to wait; add $250 of credit to each.",
+                 "You don't need to do anything but add $250 of credit.",
+                 "No API credit is needed for Claude, but add $250 of OpenAI credit."):
+        assert rc.credit_ask(text, []), text
