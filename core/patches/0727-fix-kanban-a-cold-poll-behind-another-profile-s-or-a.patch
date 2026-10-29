@@ -1,0 +1,257 @@
+From c826ad105b85c230ccf234c2d2115dfb52be46f7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:37:16 +0000
+Subject: [PATCH] fix(kanban): a cold poll behind another profile's or a failed
+ annotation read reads its own scope [daveey]
+
+One server process serves several profiles; _annotation_snapshot keeps one global
+flight lock but per-scope results. A cold poll that waited behind another scope's
+read, or behind a read that raised, returned None and annotate_kanban_activity
+marked every row kanban_unknown with a synthetic 'kanban annotation unavailable'
+traceback (44x on hermes-hub, 5 profiles, self-heal kanban-d0ba67426d).
+
+The waiter now reads its own scope while holding the lock when no usable result
+exists; same-scope overlapping polls still share one read. A failed read raises
+its real error (traceback kept); a None snapshot logs one WARNING line.
+---
+ hermes_cli/kanban_session_activity.py         |  71 ++++++++----
+ .../test_kanban_session_activity.py           | 108 ++++++++++++++++++
+ 2 files changed, 156 insertions(+), 23 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8419f7a04e..a8c115533a 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1916,15 +1916,31 @@ def _read_annotation_parts() -> tuple:
+         active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra, attention))
+ 
+ 
+-def _annotation_snapshot() -> tuple | None:
++def _refresh_annotation_locked(scope: tuple[str, ...]) -> tuple:
++    """Read this scope's parts and publish them. Caller holds ``_annotate_refresh_lock``."""
++    global _annotate_flight_scope, _annotate_flight_result
++    _annotate_flight_scope = scope
++    _annotate_flight_result = None
++    parts = _read_annotation_parts()
++    _last_annotation[scope] = parts
++    _annotate_flight_result = parts
++    return parts
++
++
++def _annotation_snapshot() -> tuple:
+     """One in-flight annotation read, shared by overlapping polls.
+ 
+     Returns the last good parts when a refresh is already running, so those polls
+     do not occupy an AnyIO worker for the whole waiting-source and attention pass.
+-    A cold start (nothing served yet) waits for that pass. None means the read
+-    failed and the caller stamps ``kanban_unknown``.
++    A cold start (nothing served yet) waits for that pass. Raises the read's own
++    error when it fails; the caller stamps ``kanban_unknown``.
++
++    [daveey] One server process serves several profiles and the result is per scope.
++    A cold poll that waited behind another scope's read, or behind a read that failed,
++    used to get None and mark every row unknown (kanban-d0ba67426d). It now reads its
++    own scope while it holds the lock; same-scope overlapping polls still share one read.
+     """
+-    global _annotate_flight_scope, _annotate_flight_result, _annotate_waiters
++    global _annotate_waiters
+     scope = _origin_scope()
+     if not _annotate_refresh_lock.acquire(blocking=False):
+         _annotate_waiters += 1
+@@ -1932,19 +1948,21 @@ def _annotation_snapshot() -> tuple | None:
+             stale = _last_annotation.get(scope)
+             if stale is not None:
+                 return stale
+-            with _annotate_refresh_lock:
+-                if _annotate_flight_scope == scope and _annotate_flight_result is not None:
+-                    return _annotate_flight_result
+-                return _last_annotation.get(scope)
++            _annotate_refresh_lock.acquire()
+         finally:
+             _annotate_waiters -= 1
++        try:
++            if _annotate_flight_scope == scope and _annotate_flight_result is not None:
++                return _annotate_flight_result
++            cached = _last_annotation.get(scope)
++            if cached is not None:
++                return cached
++            # No usable result for this scope: another profile's flight, or a failed one.
++            return _refresh_annotation_locked(scope)
++        finally:
++            _annotate_refresh_lock.release()
+     try:
+-        _annotate_flight_scope = scope
+-        _annotate_flight_result = None
+-        parts = _read_annotation_parts()
+-        _last_annotation[scope] = parts
+-        _annotate_flight_result = parts
+-        return parts
++        return _refresh_annotation_locked(scope)
+     finally:
+         _annotate_refresh_lock.release()
+ 
+@@ -1969,6 +1987,17 @@ def one_annotation_snapshot() -> Iterator[None]:
+         _annotation_scope.reads = _annotation_scope.attention = _annotation_scope.links = None
+ 
+ 
++def _mark_kanban_unknown(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    for row in rows:
++        for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale",
++                    "kanban_parked", "kanban_held", "kanban_stalled"):
++            row.pop(key, None)
++        row.pop("kanban_observed_at", None)
++        row.pop("kanban_waiting_on", None)
++        row["kanban_unknown"] = True
++    return rows
++
++
+ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     """Stamp ``kanban_active``, ``kanban_blocked``, ``kanban_waiting_on`` (local open card ids), ``kanban_unseen`` (finished cards whose result the
+     session has not been handed yet) and ``kanban_attention`` (done cards a registered check flags) on each session row
+@@ -1987,7 +2016,10 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         else:
+             parts = _annotation_snapshot()
+             if parts is None:
+-                raise RuntimeError("kanban annotation unavailable")
++                # [daveey] Not a read error (those raise with their own traceback): one line, no synthetic
++                # traceback for self-heal to chase.
++                _log.warning("kanban annotation unavailable (no snapshot); rows marked kanban_unknown")
++                return _mark_kanban_unknown(rows)
+             (active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra,
+              attention) = parts
+             if shared is not None:
+@@ -1998,14 +2030,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         # [daveey] A failed read is "unknown", never "no work": stamp ``kanban_unknown`` (the sidebar keeps the
+         # row off done) and drop the counts rather than present them as fresh.
+         _log.warning("kanban activity unavailable; rows marked kanban_unknown", exc_info=True)
+-        for row in rows:
+-            for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale",
+-                        "kanban_parked", "kanban_held", "kanban_stalled"):
+-                row.pop(key, None)
+-            row.pop("kanban_observed_at", None)
+-            row.pop("kanban_waiting_on", None)
+-            row["kanban_unknown"] = True
+-        return rows
++        return _mark_kanban_unknown(rows)
+     if attention is None:
+         attention = getattr(_annotation_scope, "attention", None)
+     if attention is None:
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 2be5a2d8fb..e5f915c8c9 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -980,3 +980,111 @@ def test_poll_during_annotation_refresh_returns_previous_counts(kanban_root, mon
+     assert other[0].get("kanban_active") == 2
+     assert "kanban_unknown" not in other[0]
+ 
++
++
++def _scoped_reader(monkeypatch, *, slow_scope=None, fail_scopes=()):
++    """Per-thread origin scope (one server, several profiles) and a recording ``_read_annotation_parts``.
++
++    The ``slow_scope`` read waits until another poll is queued on the flight lock, so the
++    overlap is deterministic. A scope in ``fail_scopes`` raises on its first ``fail_scopes[scope]`` reads.
++    """
++    import threading
++    import time
++
++    local = threading.local()
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: (getattr(local, "scope", "A"),))
++    reads: list[str] = []
++    fails = dict(fail_scopes)
++    entered = threading.Event()
++
++    def read():
++        scope = ksa._origin_scope()[0]
++        reads.append(scope)
++        if scope == slow_scope and not entered.is_set():
++            entered.set()
++            deadline = time.monotonic() + 3
++            while time.monotonic() < deadline and ksa._annotate_waiters < 1:
++                time.sleep(0.005)
++            assert ksa._annotate_waiters >= 1
++        if fails.get(scope, 0) > 0:
++            fails[scope] -= 1
++            raise sqlite3.OperationalError(f"board read failed for {scope}")
++        return ({f"s_{scope}": 3}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
++
++    monkeypatch.setattr(ksa, "_read_annotation_parts", read)
++    return local, reads, entered
++
++
++def _run_overlap(local, entered, leader_scope, waiter_scope, waiter_rows):
++    import threading
++
++    errors: list[BaseException] = []
++
++    def leader():
++        local.scope = leader_scope
++        try:
++            ksa.annotate_kanban_activity([{"id": f"s_{leader_scope}"}])
++        except BaseException as exc:  # surfaced below
++            errors.append(exc)
++
++    holder = threading.Thread(target=leader)
++    holder.start()
++    assert entered.wait(2)
++    local.scope = waiter_scope
++    ksa.annotate_kanban_activity(waiter_rows)
++    holder.join(3)
++    assert not holder.is_alive()
++    assert not errors
++
++
++def test_cold_profile_poll_behind_another_profiles_read_gets_its_own_counts(kanban_root, monkeypatch):
++    """[daveey] One server serves several profiles. A cold profile-B poll that queued behind profile A's
++    in-flight read used to find no B result and stamp every row kanban_unknown (kanban-d0ba67426d)."""
++    local, reads, entered = _scoped_reader(monkeypatch, slow_scope="A")
++    rows = [{"id": "s_B"}]
++    _run_overlap(local, entered, "A", "B", rows)
++    assert "kanban_unknown" not in rows[0]
++    assert rows[0].get("kanban_active") == 3
++    assert sorted(reads) == ["A", "B"]  # one read per scope
++    assert ksa._last_annotation[("B",)][0] == {"s_B": 3}
++
++
++def test_cold_poll_behind_a_failed_read_retries_once(kanban_root, monkeypatch):
++    """[daveey] Same profile: the leader's read raised; the queued cold poll reads again instead of unknown."""
++    local, reads, entered = _scoped_reader(monkeypatch, slow_scope="A", fail_scopes={"A": 1})
++    rows = [{"id": "s_A"}]
++    _run_overlap(local, entered, "A", "A", rows)
++    assert "kanban_unknown" not in rows[0]
++    assert rows[0].get("kanban_active") == 3
++    assert reads == ["A", "A"]
++
++
++def test_cold_poll_whose_retry_also_fails_is_unknown_with_the_real_error(kanban_root, monkeypatch, caplog):
++    """[daveey] If the waiter's own read fails too, rows are kanban_unknown and the log carries that read's
++    traceback (the real error self-heal needs), not a synthetic 'annotation unavailable'."""
++    import logging
++
++    local, reads, entered = _scoped_reader(monkeypatch, slow_scope="A", fail_scopes={"A": 2})
++    rows = [{"id": "s_A"}]
++    with caplog.at_level(logging.WARNING, logger=ksa._log.name):
++        _run_overlap(local, entered, "A", "A", rows)
++    assert rows[0]["kanban_unknown"] is True
++    assert reads == ["A", "A"]
++    failures = [r for r in caplog.records if "kanban activity unavailable" in r.getMessage()]
++    assert len(failures) == 2  # leader and waiter each logged their own read failure
++    assert all(r.exc_info and isinstance(r.exc_info[1], sqlite3.OperationalError) for r in failures)
++    assert "kanban annotation unavailable" not in caplog.text
++
++
++def test_snapshot_none_logs_one_line_without_a_synthetic_traceback(kanban_root, monkeypatch, caplog):
++    """[daveey] Detection guard: a None snapshot (no read error) is one WARNING line, never a traceback."""
++    import logging
++
++    monkeypatch.setattr(ksa, "_annotation_snapshot", lambda: None)
++    rows = [{"id": "s1", "kanban_active": 4}]
++    with caplog.at_level(logging.WARNING, logger=ksa._log.name):
++        ksa.annotate_kanban_activity(rows)
++    assert rows[0]["kanban_unknown"] is True and "kanban_active" not in rows[0]
++    records = [r for r in caplog.records if r.levelno >= logging.WARNING]
++    assert len(records) == 1 and not records[0].exc_info
++    assert "Traceback" not in caplog.text
+-- 
+2.55.0
+
