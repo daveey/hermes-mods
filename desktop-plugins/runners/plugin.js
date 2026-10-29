@@ -452,19 +452,35 @@ export function investigationView(inv, now = Date.now()) {
 
 // POST /v1/investigations on the gateway that served the gateway section. The gateway creates the card
 // ON the machine (placement=<machine>) or returns the one already open, so a second click never duplicates.
-export function createInvestigator(ctx) {
+// A gateway still on an older runners plugin answers 404; the next connected gateway is tried.
+export function createInvestigator(ctx, hostRef = host) {
   const pending = new Map()
+  async function post(route, body) {
+    return ctx.rest(`/v1/investigations?profile=${encodeURIComponent(route.targetProfile)}`, {
+      method: 'POST', body, connectionId: route.connectionId, timeoutMs: 30000
+    })
+  }
   async function start(route, m) {
-    if (!validRoute(route)) throw Object.assign(new Error('No gateway route for this machine'), { safe: true })
     if (pending.has(m.name)) return pending.get(m.name)
     const load = m.load ? Object.fromEntries(
       ['cpu_load1', 'cpus', 'mem_used_pct', 'disk_free_gb', 'disk_total_gb'].filter((k) => typeof m.load[k] === 'number').map((k) => [k, m.load[k]])) : null
-    const p = ctx.rest(`/v1/investigations?profile=${encodeURIComponent(route.targetProfile)}`, {
-      method: 'POST', body: { machine: m.name, load }, connectionId: route.connectionId, timeoutMs: 30000
-    }).then((res) => {
-      if (!res?.investigation) throw Object.assign(new Error('Invalid investigation response'), { safe: true })
-      return res
-    })
+    const p = (async () => {
+      const others = ((await hostRef.profileRoutes?.()) || []).filter(validRoute)
+      const routes = [...new Map([route, ...others].filter(validRoute).map((r) => [routeKey(r), r])).values()]
+      if (!routes.length) throw Object.assign(new Error('No gateway route for this machine'), { safe: true })
+      let last
+      for (const r of routes) {
+        try {
+          const res = await post(r, { machine: m.name, load })
+          if (!res?.investigation) throw Object.assign(new Error('Invalid investigation response'), { safe: true })
+          return res
+        } catch (e) {
+          last = e
+          if ((e?.status ?? e?.statusCode) !== 404 || e?.message === 'unknown_machine') throw e
+        }
+      }
+      throw last
+    })()
     pending.set(m.name, p)
     try { return await p } finally { pending.delete(m.name) }
   }

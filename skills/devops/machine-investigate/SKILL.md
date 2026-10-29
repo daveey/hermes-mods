@@ -7,7 +7,7 @@ license: MIT
 metadata:
   hermes:
     tags: [devops, load, disk, macos, linux, runners]
-    related_skills: [five-whys]
+    related_skills: [five-whys, mac-disk-cleanup]
 ---
 
 # Machine investigate
@@ -33,7 +33,9 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only).
    job (`launchctl list | grep`, `launchctl print gui/$UID/<label>` for its interval), a systemd unit, a cron
    (`crontab -l`, `~/.hermes/cron/jobs.json`). A loop that spawns `gh`/`git`/`python` every few seconds is a
    polling interval problem: find the job and its interval.
-5. Write the diagnosis with the `five-whys` skill: every why cites evidence from the report; stop at a
+5. Disk: for a macOS disk question also follow `mac-disk-cleanup` (its repo-deletion rules and known big
+   hitters); its deletions still go through the ask below.
+6. Write the diagnosis with the `five-whys` skill: every why cites evidence from the report; stop at a
    process/guard/design gap.
 
 ## What you may fix without asking

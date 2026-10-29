@@ -21,7 +21,10 @@ const view = (investigation) => P.merge([{
   }
 }], NOW)
 
-function setup(responses) {
+const other = { connectionId: 'hub', mode: 'remote', profile: 'default', targetProfile: 'default' }
+let routes = [route]
+function setup(responses, list = [route]) {
+  routes = list
   const calls = [], opened = []
   globalThis.__hermesKanbanOpenTask = (task, board) => { opened.push([task, board]); return true }
   const ctx = {
@@ -32,7 +35,8 @@ function setup(responses) {
       return structuredClone(next)
     }
   }
-  return { calls, opened, investigator: P.createInvestigator(ctx) }
+  const hostRef = { profileRoutes: async () => routes }
+  return { calls, opened, investigator: P.createInvestigator(ctx, hostRef) }
 }
 
 const render = (v, investigator) => mount(React.createElement(P.Panel, { view: v, now: NOW, investigator }))
@@ -100,6 +104,16 @@ test('error: a failed start says why and leaves the button usable', async () => 
   await ui.click(button(ui))
   assert.match(ui.container.querySelector('[role="alert"]').textContent, /Could not start: unknown_machine/)
   assert.equal(button(ui).disabled, false)
+})
+
+test('old gateway: a 404 from the section gateway retries on the next connected one', async () => {
+  const { calls, opened, investigator } = setup([Object.assign(new Error('Not Found'), { status: 404 }),
+    { created: true, machine: 'mini', investigation: { task: 't_0123abce', status: 'created' } }], [route, other])
+  const ui = await render(view(null), investigator)
+  await ui.click(button(ui))
+  assert.deepEqual(calls.map(([, o]) => o.connectionId), ['example', 'hub'])
+  assert.equal(calls[1][0], '/v1/investigations?profile=default')
+  assert.deepEqual(opened, [['t_0123abce', 'default']])
 })
 
 test('no investigator (old host): no button', async () => {
