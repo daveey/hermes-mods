@@ -632,6 +632,15 @@ every timeout still in the logs. Tests: `tests/test_backend_timeouts.py` (40 lin
 repeat the same day comments instead of duplicating, lost state, next day, rotated logs, histogram; also passes
 under Python 3.9).
 
+On macOS, the watcher also reads `pmset -g log` (30-second bound) to identify positively observed Sleep/DarkWake
+intervals, ending at either a plain full Wake or DarkWake-to-FullWake. Timeouts in those intervals, including
+expired timers delivered in the full-wake second, remain in raw `count`/`by_path` but are split into
+`sleep_count` versus `awake_count`/`awake_by_path`. Only `awake_count` triggers an incident. There is no
+post-wake grace period: failures from the following second alert normally. The `power` field reports the
+intervals and probe status. Unsupported platforms, unavailable power history and failed probes suppress nothing.
+The acceptance check still requires raw `count: 0`, not merely `awake_count: 0`. Additional regressions cover
+sleep-only and mixed bursts, darkwake-to-fullwake, the wake-second boundary, pmset failures and unsupported hosts.
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.

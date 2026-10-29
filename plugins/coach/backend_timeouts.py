@@ -5,6 +5,9 @@ The Desktop app logs every failed backend call as `<local stamp> [hermes] [herme
 connecting to Hermes backend after Nms`. A CPU-starved `hermes serve` produced ~1,200 of those an hour on 2026-10-27
 and nothing read them until an archive preflight failed in front of David (self-heal desktop-64ac180d9e). This counts
 them over the last --window minutes (live desktop.log plus rotated desktop.log.1..3), grouped by request path.
+Raw count stays unchanged; only awake_count triggers incidents. On macOS, positively observed pmset sleep/darkwake
+intervals classify sleep_count (including timers delivered in the full-wake second), with no post-wake grace.
+Failed/unsupported power probes suppress nothing.
 
     backend_timeouts.py [--dry-run] [--json] [--hours] [--threshold N] [--window MIN] [--home PATH] [--host NAME]
 
@@ -96,19 +99,73 @@ def iter_timeouts(files: list):
                 yield last_ts, route_of(line)
 
 
-def scan(home: Path, now: datetime, window_min: int) -> dict:
+POWER_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ([+-]\d{4})\s+"
+    r"(Sleep|DarkWake|Wake)\s+(Entering (?:Sleep|DarkWake) state|DarkWake (?:from|to FullWake)|Wake from)"
+)
+
+
+def power_intervals(text: str, now: datetime) -> list:
+    """Only positive power evidence suppresses alerts; DarkWake is NOT a full wake.
+
+    Both logs have second-resolution event attribution. Timers delivered in the
+    full-wake second belong to the suspended interval; no later grace is used.
+    """
+    intervals = []
+    asleep = None
+    for line in text.splitlines():
+        m = POWER_RE.match(line)
+        if not m:
+            continue
+        ts = datetime.strptime(m[1] + ' ' + m[2], '%Y-%m-%d %H:%M:%S %z')
+        ts = ts.astimezone().replace(tzinfo=None)
+        if ts > now:
+            continue
+        if m[3] in ('Sleep', 'DarkWake'):
+            if asleep is None:
+                asleep = ts
+        elif asleep is not None:
+            intervals.append((asleep, ts))
+            asleep = None
+    if asleep is not None:
+        intervals.append((asleep, now))
+    return intervals
+
+
+def probe_power(now: datetime) -> dict:
+    if sys.platform != 'darwin':
+        return {'status': 'unsupported', 'intervals': []}
+    try:
+        r = subprocess.run(['/usr/bin/pmset', '-g', 'log'], capture_output=True, text=True, timeout=30)
+        if r.returncode:
+            return {'status': 'failed', 'intervals': [], 'error': f'pmset exit {r.returncode}'}
+        intervals = power_intervals(r.stdout, now)
+        return {'status': 'ok', 'intervals': intervals}
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {'status': 'failed', 'intervals': [], 'error': type(exc).__name__}
+
+
+def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     start = now - timedelta(minutes=window_min)
     by_path: Counter = Counter()
+    awake_by_path: Counter = Counter()
+    sleep_count = 0
     first = last = None
     files = log_files(home)
     for ts, route in iter_timeouts(files):
         if start <= ts <= now:
             by_path[route] += 1
+            if any(lo <= ts <= hi for lo, hi in intervals):
+                sleep_count += 1
+            else:
+                awake_by_path[route] += 1
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     return {"window_start": start.isoformat(sep=" "), "window_end": now.isoformat(sep=" "),
             "files": [str(p) for p in files], "count": sum(by_path.values()),
             "by_path": dict(by_path.most_common()),
+            "sleep_count": sleep_count, "awake_count": sum(awake_by_path.values()),
+            "awake_by_path": dict(awake_by_path.most_common()),
             "first": first.isoformat(sep=" ") if first else None, "last": last.isoformat(sep=" ") if last else None}
 
 
@@ -177,6 +234,9 @@ def card_body(host: str, rep: dict, probe: dict, threshold: int, window_min: int
 The Desktop app on {host} logged {rep['count']} "{NEEDLE}" lines in the last {window_min} min
 ({rep['first']} .. {rep['last']}, local time; threshold {threshold}). Users see this as chats that won't load,
 archive asking "task status unavailable", stale boards.
+Of these, {rep.get("awake_count", rep["count"])} occurred while awake and
+{rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals.
+The threshold applies only to awake timeouts; raw count remains unchanged.
 
 ## Top request paths
 {_paths_md(rep)}
@@ -279,7 +339,7 @@ def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, thre
 
 
 def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] = None,
-         probe: Optional[Callable] = None) -> int:
+         probe: Optional[Callable] = None, power_probe: Optional[Callable] = None) -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("--dry-run", action="store_true", help="print the report, file nothing")
     ap.add_argument("--json", action="store_true", help="JSON output")
@@ -303,10 +363,16 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
     threshold = a.threshold if a.threshold is not None else (
         int(env_t) if env_t and env_t.isdigit() else config_value("threshold", DEFAULT_THRESHOLD))
     window = a.window if a.window is not None else config_value("window_minutes", DEFAULT_WINDOW_MIN)
-    rep = scan(home, now, window)
+    power = (power_probe or probe_power)(now)
+    intervals = power.get("intervals", [])
+    rep = scan(home, now, window, intervals)
+    power_report = {k: v for k, v in power.items() if k != "intervals"}
+    power_report["intervals"] = [[lo.isoformat(sep=" "), hi.isoformat(sep=" ")]
+                                 for lo, hi in intervals if hi >= now - timedelta(minutes=window)]
     res = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "host": host, "home": str(home),
            "dry_run": a.dry_run, "threshold": threshold, "window_min": window, **rep,
-           "over_threshold": rep["count"] >= threshold, "cards": []}
+           "power": power_report,
+           "over_threshold": rep["awake_count"] >= threshold, "cards": []}
     if res["over_threshold"]:
         res["host_probe"] = (probe or probe_host)()
         if not a.dry_run:
