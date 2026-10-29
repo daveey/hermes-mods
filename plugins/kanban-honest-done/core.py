@@ -15,7 +15,7 @@ from typing import Any, Iterable, Optional
 TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")  # legacy 8-hex and current 16-hex board ids
 
 # Each pattern names a way a handoff admits part of the card's work was not done. Matched per sentence against the
-# completion summary (and the card title, see TITLE_KINDS). Keep these narrow: every false hit refuses a real
+# completion summary and metadata, never the request title. Keep these narrow: every false hit refuses a real
 # completion. `replay.py` measures them against a real board.
 DROP_PATTERNS: tuple[tuple[str, str], ...] = (
     ("split to follow-up", r"\bsplit (?:off |out )?(?:in)?to (?:a |an |its own )?(?:separate )?follow[- ]?ups?\b"),
@@ -40,9 +40,6 @@ DROP_PATTERNS: tuple[tuple[str, str], ...] = (
                   r"|\bfollow[- ]?up (?:card|task|item|work)s?\b"
                   r"|\bfollow[- ]?up is to\b"),
 )
-# Title text is the card's own name, and many cards are follow-ups by design ("Zoom rooms 6: follow-ups"). Only
-# a title that says the card itself shed work counts.
-TITLE_KINDS = {"split to follow-up", "dropped from scope", "deferred"}
 
 # A sentence that says nothing was dropped, or that a deferral was the requester's call, is not an admission.
 NEGATION_RE = re.compile(
@@ -84,7 +81,12 @@ def dropped_work(text: str, kinds: Optional[set[str]] = None) -> list[tuple[str,
 
 
 def dropped_work_in_handoff(summary: str, title: str = "") -> list[tuple[str, str]]:
-    return dropped_work(title, TITLE_KINDS) + dropped_work(summary)
+    """Classify current completion evidence, not the task's pre-existing request context.
+
+    ``title`` is retained for caller compatibility (including sidebar/replay callers). A title may
+    describe the defect being fixed; its wording cannot establish that work is still unfinished.
+    """
+    return dropped_work(summary)
 
 
 def metadata_text(metadata: Any) -> str:

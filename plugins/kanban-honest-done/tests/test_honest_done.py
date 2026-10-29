@@ -68,9 +68,9 @@ def board(tmp_path):
 
 # --- classifier ---------------------------------------------------------------------------------------------------
 
-def test_incident_summary_and_title_are_dropped_work():
+def test_incident_summary_admits_dropped_work():
     kinds = {k for k, _ in core.dropped_work_in_handoff(INCIDENT_SUMMARY, INCIDENT_TITLE)}
-    assert {"split to follow-up", "dropped from scope"} <= kinds
+    assert kinds == {"dropped from scope"}  # One hit per sentence; both admissions share a sentence.
 
 
 @pytest.mark.parametrize("text", [
@@ -102,9 +102,9 @@ def test_benign_text_does_not_hit(text):
     assert not core.dropped_work(text), text
 
 
-def test_title_only_counts_strong_kinds():
+def test_title_is_context_not_completion_evidence():
     assert not core.dropped_work_in_handoff("All done and verified.", "Zoom rooms 6: follow-ups")
-    assert core.dropped_work_in_handoff("All done and verified.", INCIDENT_TITLE)
+    assert not core.dropped_work_in_handoff("All done and verified.", INCIDENT_TITLE)
 
 
 # --- B: kanban_complete -------------------------------------------------------------------------------------------
@@ -115,9 +115,9 @@ def test_complete_refused_without_followup_card(board):
     assert why and "Refused" in why and "kanban_create" in why and "kanban_block" in why
 
 
-def test_complete_refused_when_title_alone_admits_split(board):
+def test_complete_allowed_when_only_request_title_mentions_split(board):
     paths = board(tasks=[(OWN, INCIDENT_TITLE, "running")])
-    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths)
+    assert plugin.classify("kanban_complete", {"summary": "Shipped and verified."}, OWN, paths) is None
 
 
 def test_complete_allowed_with_open_followup_created_by_this_task(board):
