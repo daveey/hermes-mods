@@ -685,6 +685,19 @@ Both calls fail open when coach isn't loaded.
 - Their shows use up coach's 15-turn budget. They aren't blocked by that budget, because they respond to a message you just sent.
 - spin-out: only its automatic panel goes through the gate. ⇧⌘F always shows.
 
+### Duplicate-owner overrides (`create_overlap_watch.py`, no agent, no LLM)
+
+Core `kanban_create` refuses a card that open cards on any board or gateway already cover (core patch 0726,
+`core/kanban-create-overlap.md`); an agent overrides with `distinct_from` + `distinct_reason`, recorded as a
+`create_overlap` event with `outcome: override` on the new card. A hermes cron job on hermes-hub (no-agent, daily)
+runs `create_overlap_watch.py`: it reads every board on the host (`kanban.db` + `kanban/boards/*/kanban.db`,
+read-only) and counts overrides in the last 7 days whose new card is now archived (a coordinator closed it as a
+duplicate). More than 2 files ONE card per host and ISO week (`--idempotency-key
+create-overlap-overrides:<host>:<year>-W<week>`) with the evidence, asking an agent to fix the refusal note,
+matcher or skill guidance that let them through. `--dry-run` prints the JSON and files nothing. Tests:
+`tests/test_create_overlap_watch.py` (only recent archived overrides count across boards; exactly 2 files nothing,
+3 files one card with a stable week key; dry-run files nothing).
+
 ## Files
 
 - `__init__.py`: the hooks (`pre_llm_call`, `post_tool_call`, `transform_tool_result`).

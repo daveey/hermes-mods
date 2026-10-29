@@ -1,0 +1,705 @@
+From d0cc66e9f4db4644492881e129f185584f8c0d44 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:08:58 +0000
+Subject: [PATCH] feat(kanban): kanban_create refuses a second owner for work
+ an open card already does [daveey]
+
+A chat counted Stage B owners by its own chat links (only finished Stage A cards), found none, and created
+"Stage B" on the default board while Stage B ran on board research-x from another chat. Nothing in
+kanban_create looked beyond an identical retry or an idempotency key.
+
+hermes_cli/kanban_overlap.py scans open cards on every board of this gateway (live board DBs) and on every
+other gateway (the hermes-hub replica, hub.db) BEFORE placement routes the card away. A card matches when the
+new card names its board (title slug, or /<slug> / "board <slug>" in the body, e.g. a example-org/<slug> repo)
+and the titles share a word, or when the titles share >= half of the longer title's significant words (3+).
+Parents, the creator's own card, and cards the same chat/worker created are never matches; closed cards never
+match; a missing replica is skipped and logged, never a block. On a match nothing is created and the result is
+code=create_overlap with the cards (id, gateway, board, status, linked chats). distinct_from + distinct_reason
+overrides; every refusal/override writes a create_overlap event (the coach's create_overlap_watch counts
+overrides later archived as duplicates). kanban.create_overlap_check: false turns it off.
+
+Offsets: _runs_where and the marker-placement result fields move to tools/kanban_tools_placement.py.
+tests/conftest.py points HERMES_HUB_STATE at a per-test dir so the host's live hub replica never leaks in.
+Self-heal agent-e1f3f31a01.
+---
+ hermes_cli/config_defaults.py                 |   4 +-
+ hermes_cli/kanban_overlap.py                  | 235 ++++++++++++++++++
+ tests/conftest.py                             |   3 +
+ .../test_kanban_create_entry_parity.py        |  33 +++
+ tests/tools/test_kanban_create_overlap.py     | 188 ++++++++++++++
+ tools/kanban_tools.py                         |  43 +---
+ tools/kanban_tools_placement.py               |  38 +++
+ tools/kanban_tools_schemas.py                 |  10 +-
+ 8 files changed, 518 insertions(+), 36 deletions(-)
+ create mode 100644 hermes_cli/kanban_overlap.py
+ create mode 100644 tests/tools/test_kanban_create_overlap.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index bbdaa60665..d2c0fc08d1 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1899,13 +1899,13 @@ DEFAULT_CONFIG = {
+     "kanban": {
+         # Central sync (core patch 0193): true = boards opened afterwards get sync tables + outbox triggers. [daveey]
+         "sync": {"enabled": False},
++        "create_overlap_check": True,  # kanban_create refuses work open cards already own (kanban_overlap) [daveey]
+         # A board whose TABLE b-trees fail integrity_check (REINDEX can't fix it) pauses dispatch; true = the
+         # gateway dispatcher also starts `hermes kanban recover` for it (salvage in a child process, fill from
+         # the newest healthy backup, write back in place, loss report + follow-up card + sync reconcile). On
+         # here: fail-closed alone left a board down until an agent noticed by chance. [daveey]
+         "auto_recover_corruption": True,
+-        # Assignee of the follow-up card an automatic recovery files on the recovered board. [daveey]
+-        "recovery_card_assignee": "default",
++        "recovery_card_assignee": "default",  # assignee of the card an automatic recovery files [daveey]
+         # Opt-in per-profile broker argv before gh (empty = ordinary login); never include tokens.
+         "pr_acceptance": {"gh_command_prefix": []},
+         # Calendar retention for terminal worktrees; archive commits to recovery
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+new file mode 100644
+index 0000000000..b57279c90e
+--- /dev/null
++++ b/hermes_cli/kanban_overlap.py
+@@ -0,0 +1,235 @@
++"""Refuse a second owner for work an open card already does (kanban_create). [daveey]
++
++A chat counted owners by its OWN chat links, found none, and created "Stage B" on the default board while
++Stage B was already running on board ``research-x`` from another chat. Before creating, this scans
++open cards on every board of this gateway (live board DBs) and every other gateway (the hermes-hub replica,
++``hub.db``), so the answer no longer depends on which chat asks or which board the card lands on.
++
++An open card matches when:
++- the new card names its board (the slug in the title, or ``/<slug>`` / ``board <slug>`` in the body, e.g. a
++  ``example-org/<slug>`` repo), is not being created on that board, and the titles share a word, or
++- both titles share at least half of the longer title's significant words (3 or more).
++
++Never matched: closed cards, the creator's own card, the new card's parents, cards the same chat or the same
++worker created (fan-out). A missing or unreadable replica is skipped and logged, never a block.
++``kanban.create_overlap_check: false`` turns the check off.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import re
++import sqlite3
++from typing import Callable, Iterable, Optional
++
++_log = logging.getLogger(__name__)
++
++EVENT = "create_overlap"
++OPEN = ("todo", "ready", "running", "scheduled", "blocked", "review", "triage")
++MAX_SHOWN = 8
++MIN_SHARED = 3
++_STOP = frozenset("""
++a an and are as at be by for from in into is it its of on or the then this that to via with without after before
++when not no all new card task fix add run make use using update ensure follow up followup self heal
++""".split())
++
++
++def enabled() -> bool:
++    from hermes_cli.config import cfg_get, load_config
++    return bool(cfg_get(load_config(), "kanban", "create_overlap_check", default=True))
++
++
++def words(text: str) -> set[str]:
++    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) >= 2 and w not in _STOP}
++
++
++def _names_board(slug: str, title: str, body: str) -> bool:
++    if not slug or slug == "default":
++        return False
++    s = re.escape(slug.lower())
++    if re.search(rf"(?<![a-z0-9_-]){s}(?![a-z0-9_-])", (title or "").lower()):
++        return True
++    return bool(re.search(rf"(?:/|\bboard[\s:=`'\"]+){s}(?![a-z0-9_-])", (body or "").lower()))
++
++
++def _reasons(card: dict, new_words: set[str], title: str, body: str, target_board: str) -> tuple[list[str], float]:
++    reasons, score = [], 0.0
++    theirs = words(card.get("title") or "")
++    shared = new_words & theirs
++    # A board named in passing (a path, a log line) is not enough: the titles must share a word too.
++    if (card["board"] != target_board and shared - words(card["board"])
++            and _names_board(card["board"], title, body)):
++        reasons.append(f"the new card names board {card['board']!r}")
++    if new_words and theirs:
++        score = len(shared) / max(len(new_words), len(theirs))
++        if len(shared) >= MIN_SHARED and score >= 0.5:
++            reasons.append(f"titles share {len(shared)} words ({', '.join(sorted(shared))})")
++    return reasons, score
++
++
++def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_boards import list_boards
++    from hermes_cli.kanban_session_activity import cached_ro
++    marks = ",".join("?" * len(OPEN))
++    for meta in list_boards(include_archived=False):
++        slug = meta.get("slug") or kb.DEFAULT_BOARD
++        path = kb.kanban_db_path(board=slug)
++        if not path.exists():
++            continue
++        try:
++            with cached_ro(path) as c:
++                rows = c.execute(
++                    "SELECT t.id, t.title, t.status, t.session_id, (SELECT json_extract(e.payload, "
++                    "'$.creator_task_id') FROM task_events e WHERE e.task_id = t.id AND e.kind = 'created' "
++                    f"LIMIT 1) FROM tasks t WHERE t.status IN ({marks})", OPEN).fetchall()
++                try:
++                    links = c.execute("SELECT task_id, chat_session FROM task_chat_links WHERE released = 0"
++                                      ).fetchall()
++                except sqlite3.OperationalError:
++                    links = []
++        except sqlite3.Error as exc:
++            _log.warning("kanban create overlap: board %s unreadable, skipped (%s)", slug, exc)
++            continue
++        chats: dict[str, set[str]] = {}
++        for tid, sess in links:
++            chats.setdefault(tid, set()).add(sess)
++        for tid, title, status, sess, creator in rows:
++            yield {"id": tid, "board": slug, "gateway": self_gw or "local", "status": status, "title": title,
++                   "session_id": sess, "creator_task_id": creator, "local": True,
++                   "chats": sorted(chats.get(tid, set()) | ({sess} if sess else set()))}
++
++
++def _replica_cards(self_gw: Optional[str]) -> Iterable[dict]:
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli.kanban_session_activity import cached_ro
++    path = reg.hub_db_path()
++    if not path.exists():
++        _log.info("kanban create overlap: no hermes-hub replica at %s; other gateways not checked", path)
++        return
++    marks = ",".join("?" * len(OPEN))
++    try:
++        with cached_ro(path) as c:
++            rows = c.execute(f"SELECT gw, data FROM replica WHERE coll = 'tasks' AND gw != ? "
++                             f"AND json_extract(data, '$.status') IN ({marks})", (self_gw or "", *OPEN)).fetchall()
++    except sqlite3.Error as exc:
++        _log.warning("kanban create overlap: replica %s unreadable, other gateways skipped (%s)", path, exc)
++        return
++    seen = set()
++    for gw, raw in rows:
++        try:
++            t = json.loads(raw)
++        except ValueError:
++            continue
++        key = (gw, t.get("board"), t.get("id"))
++        if not t.get("id") or key in seen:
++            continue
++        seen.add(key)
++        sessions = [s for s in (t.get("sessions") or []) if isinstance(s, dict)]
++        yield {"id": t["id"], "board": t.get("board") or "default", "gateway": t.get("gateway") or gw,
++               "status": t.get("status"), "title": t.get("title") or "", "local": False,
++               "session_id": next((s.get("session") for s in sessions if s.get("rel") == "created"), None),
++               "creator_task_id": None,
++               "chats": sorted({str(s["session"]) for s in sessions if s.get("session")})}
++
++
++def find(*, title: str, body: str, target_board: str, session_id: Optional[str], self_tid: Optional[str],
++         parents: Iterable[str]) -> list[dict]:
++    """Open cards elsewhere that already cover this work, best match first. Never raises."""
++    try:
++        from hermes_cli import kanban_capability_registry as reg
++        self_gw = reg.self_gateway()
++        skip = set(parents) | ({self_tid} if self_tid else set())
++        new_words = words(title)
++        out = []
++        for source in (_local_cards(self_gw), _replica_cards(self_gw)):
++            for card in source:
++                if (card["id"] in skip or (session_id and card["session_id"] == session_id)
++                        or (self_tid and card["creator_task_id"] == self_tid)):
++                    continue
++                reasons, score = _reasons(card, new_words, title, body, target_board)
++                if reasons:
++                    out.append({**{k: card[k] for k in ("id", "board", "gateway", "status", "title", "chats")},
++                                "why": "; ".join(reasons), "_score": score, "_local": card["local"]})
++        out.sort(key=lambda m: (-m["_score"], m["status"] not in ("running", "ready", "scheduled"), m["id"]))
++        return out
++    except Exception:  # health: allow BLE001 -- a broken check must never block creating a card
++        _log.warning("kanban create overlap check failed; creating without it", exc_info=True)
++        return []
++
++
++def public(matches: list[dict]) -> list[dict]:
++    return [{k: v for k, v in m.items() if not k.startswith("_")} for m in matches[:MAX_SHOWN]]
++
++
++def refusal(matches: list[dict], distinct_from: list[str], reason: str) -> dict:
++    shown = public(matches)
++    uncovered = [m["id"] for m in shown if m["id"] not in distinct_from]
++    ask = ("pass distinct_reason (why this is separate work) with distinct_from" if distinct_from and not reason
++           else f"call kanban_create again with distinct_from={uncovered} and distinct_reason='<why it is separate>'")
++    named = ", ".join(f"{m['id']} on {m['gateway']}/{m['board']} ({m['status']})" for m in shown[:3])
++    note = (f"No card was created: {len(matches)} open card(s) already look like this work ({named}). "
++            "Count owners by board/project, not by your chat's links: continue the existing card "
++            f"(read it, comment on it, or message its chat), or if this really is separate work {ask}.")
++    return {"ok": False, "created": False, "code": EVENT, "matches": shown, "total_matches": len(matches),
++            "note": note}
++
++
++def covered(matches: list[dict], distinct_from: list[str], reason: str) -> bool:
++    return bool(reason.strip()) and all(m["id"] in distinct_from for m in matches[:MAX_SHOWN])
++
++
++def record(conn: Optional[sqlite3.Connection], task_id: Optional[str], *, outcome: str, title: str,
++           matches: list[dict], reason: str = "", session_id: Optional[str] = None) -> None:
++    """``create_overlap`` event (the detection signal): on the new card for an override; for a refusal on the
++    creator's own card, else on the best LOCAL match's board. Never raises."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    payload = {"outcome": outcome, "title": title, "reason": reason or None, "session_id": session_id,
++               "matches": [{"id": m["id"], "board": m["board"], "gateway": m["gateway"], "status": m["status"]}
++                           for m in public(matches)]}
++    _log.info("kanban create overlap: %s %r (%d matches)", outcome, title, len(matches))
++    try:
++        if conn is not None and task_id:
++            with kb.write_txn(conn):
++                kb._append_event(conn, task_id, EVENT, payload)
++            return
++        local = next((m for m in matches if m["_local"]), None)
++        if local is None:
++            return
++        with kbc.connect_closing(board=local["board"]) as other, kb.write_txn(other):
++            kb._append_event(other, local["id"], EVENT, payload)
++    except Exception:  # health: allow BLE001 -- the event is telemetry; the refusal itself already happened
++        _log.warning("kanban create overlap: could not record the %s event", outcome, exc_info=True)
++
++
++def _no_override(conn: sqlite3.Connection, task_id: str) -> None:
++    return None
++
++
++def check(conn: sqlite3.Connection, args: dict, *, courier: bool, title: str, session_id: Optional[str],
++          self_tid: Optional[str], parents: list[str]) -> tuple[Optional[str], Callable[[sqlite3.Connection, str], None]]:
++    """``(refusal_json, _)`` stops the create; otherwise ``(None, after_create)``, where ``after_create(conn,
++    new_task_id)`` records an accepted ``distinct_from`` override on the new card (a no-op when nothing
++    overlapped). A courier-applied card (``courier``) was already checked on the gateway that asked for it."""
++    from hermes_cli import kanban_db as kb
++    if courier or not enabled():
++        return None, _no_override
++    key = args.get("idempotency_key")
++    if key and conn.execute("SELECT 1 FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
++                            (key,)).fetchone():
++        return None, _no_override  # a retry returns the existing card; nothing new is created
++    distinct = [str(x) for x in (args.get("distinct_from") or [])]
++    reason = str(args.get("distinct_reason") or "")
++    matches = find(title=title, body=str(args.get("body") or ""), target_board=args.get("board") or kb.DEFAULT_BOARD,
++                   session_id=session_id, self_tid=self_tid, parents=parents)
++    if not matches:
++        return None, _no_override
++    if covered(matches, distinct, reason):
++        return None, lambda c, tid: record(c, tid, outcome="override", title=title, matches=matches,
++                                           reason=reason, session_id=session_id)
++    own = bool(self_tid) and not args.get("board")  # the creator's card is on the board this call opened
++    record(conn if own else None, self_tid, outcome="refused", title=title, matches=matches,
++           session_id=session_id)
++    return json.dumps(refusal(matches, distinct, reason)), _no_override
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5100772879..72f1ac2fb7 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -294,6 +294,9 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
+     # defaultHost and silently select the wrong nested config block. Tests of
+     # custom host resolution override/delete this explicitly.
+     monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
++    # The hermes-hub replica (hub.db) lives under HOME, which stays real: point readers (kanban_create's overlap
++    # check, wait replicas) at an empty per-test dir so the host's live cards never leak into a test. [daveey]
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hermes-hub-state"))
+ 
+     # 3. Isolate both inputs to profile/root resolution. HERMES_HOME alone
+     #    is insufficient: get_default_hermes_root() resolves the native root
+diff --git a/tests/hermes_cli/test_kanban_create_entry_parity.py b/tests/hermes_cli/test_kanban_create_entry_parity.py
+index 9137e1b2fe..bf123f655b 100644
+--- a/tests/hermes_cli/test_kanban_create_entry_parity.py
++++ b/tests/hermes_cli/test_kanban_create_entry_parity.py
+@@ -281,3 +281,36 @@ def test_every_create_path_refuses_a_pin_the_managed_registry_rejects(chat, monk
+             assert bad.status_code == 400 and "model_pin_not_in_routing_registry" in bad.text, bad.text
+     with kbc.connect_closing() as conn:
+         assert kb.list_tasks(conn) == []
++
++
++def test_placed_tool_create_is_overlap_checked_before_it_leaves(chat, tmp_path, monkeypatch):
++    """[daveey] A card the placement route sends to another gateway is checked against that gateway's open cards
++    (hermes-hub replica) first: a duplicate never reaches the courier; distinct work still does."""
++    import sqlite3
++
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_placement as kp
++    from tools.registry import registry
++    hub_db = tmp_path / "hub-state" / "hub.db"
++    hub_db.parent.mkdir(parents=True)
++    db = sqlite3.connect(hub_db)
++    db.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT)")
++    db.execute("INSERT INTO replica VALUES ('hub', 'tasks', 'default/research-x/t_live', ?)", (json.dumps(
++        {"id": "t_live", "board": "research-x", "gateway": "hub", "status": "running",
++         "title": "Stage B1: tuning matrix on rented GPUs", "sessions": []}),))
++    db.commit()
++    db.close()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(hub_db.parent))
++    monkeypatch.setattr(reg, "self_gateway", lambda: "macbook")
++    monkeypatch.setattr(kp, "decide", lambda view, **kw: {"where": "hub", "why": "routed"})
++    sent = []
++    monkeypatch.setattr(kp, "create_remote", lambda view, **kw: sent.append(view["title"]) or
++                        {"ok": True, "request_id": "r1", "queued_only": True})
++    dup = json.loads(registry.dispatch("kanban_create", {
++        "title": "Stage B: run it", "body": "Execute Stage B for example-org/research-x.", "assignee": "default",
++        "requires": []}))
++    assert dup["code"] == "create_overlap" and [m["id"] for m in dup["matches"]] == ["t_live"], dup
++    ok = json.loads(registry.dispatch("kanban_create", {"title": "Rotate the Telnyx key", "assignee": "default",
++                                                        "requires": []}))
++    assert ok["status"] == "queued" and ok["placed"]["gateway"] == "hub", ok
++    assert sent == ["Rotate the Telnyx key"]
+diff --git a/tests/tools/test_kanban_create_overlap.py b/tests/tools/test_kanban_create_overlap.py
+new file mode 100644
+index 0000000000..ac8a935d93
+--- /dev/null
++++ b/tests/tools/test_kanban_create_overlap.py
+@@ -0,0 +1,188 @@
++"""kanban_create refuses a second owner for work an open card already does. [daveey]
++
++Incident (2026-10-28): a chat said "approve stage b" and created "Stage B: ..." on the default board, while
++Stage B was already running on board ``research-x`` from another chat. The chat counted owners by
++its OWN chat links, which held only the finished Stage A cards, and kanban_create created the duplicate with
++no hint. The create now scans open cards on every board of this gateway (and the hermes-hub replica for other
++gateways) and refuses on a match, naming the existing card; ``distinct_from`` + ``distinct_reason`` overrides
++and is recorded as a ``create_overlap`` event.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++B1_TITLE = ("Stage B1: run the frozen X/T tuning + confirmation matrix and external-anchor rescoring "
++            "on rented GPUs")
++DUP_TITLE = "Stage B: GPU calibration, bounded comparison campaign and verified report"
++DUP_BODY = ("David explicitly approved: 'approve stage b'. Execute frozen Stage B for "
++            "example-org/research-x. Checked this turn: current PLAN.md read via gh.")
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++def _board_with_b1(status_after_create=None):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_boards as kbb
++    from hermes_cli import kanban_db_connect as kbc
++    kbb.create_board("research-x")
++    conn = kbc.connect(board="research-x")
++    try:
++        tid = kb.create_task(conn, title=B1_TITLE, body="Stage B / B1 of 3 on rented GPUs.",
++                             assignee="default", session_id="20261026_154948_ea6cfd")
++        if status_after_create:
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status_after_create, tid))
++            conn.commit()
++    finally:
++        conn.close()
++    return tid
++
++
++def _default_titles():
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        return [t.title for t in kb.list_tasks(conn)]
++    finally:
++        conn.close()
++
++
++def _create(**args):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_create({"title": DUP_TITLE, "body": DUP_BODY, "assignee": "default",
++                                         "requires": [], **args}))
++
++
++def test_stage_b_duplicate_on_another_board_is_refused_naming_the_owner(home):
++    b1 = _board_with_b1()
++    out = _create()
++    assert out.get("ok") is False, out
++    assert out.get("code") == "create_overlap"
++    assert out.get("created") is False
++    hit = {m["id"]: m for m in out["matches"]}
++    assert b1 in hit
++    assert hit[b1]["board"] == "research-x"
++    assert "20261026_154948_ea6cfd" in hit[b1]["chats"]
++    assert DUP_TITLE not in _default_titles()
++
++
++def test_distinct_from_creates_and_records_the_override(home):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    b1 = _board_with_b1()
++    no_reason = _create(distinct_from=[b1])
++    assert no_reason.get("ok") is False and DUP_TITLE not in _default_titles()
++    out = _create(distinct_from=[b1], distinct_reason="Stage B2 is a separate campaign from B1")
++    assert out.get("ok") is True, out
++    conn = kbc.connect()
++    try:
++        events = [e for e in kb.list_events(conn, out["task_id"]) if e.kind == "create_overlap"]
++    finally:
++        conn.close()
++    assert len(events) == 1
++    assert events[0].payload["outcome"] == "override"
++    assert events[0].payload["reason"] == "Stage B2 is a separate campaign from B1"
++    assert b1 in [m["id"] for m in events[0].payload["matches"]]
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_closed_cards_never_match(home, status):
++    _board_with_b1(status_after_create=status)
++    out = _create()
++    assert out.get("ok") is True, out
++
++
++def test_similar_title_on_the_same_board_matches(home):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="Retire the ci-gw runner boxes after the ASG cutover",
++                             assignee="default", session_id="other-chat")
++    finally:
++        conn.close()
++    out = _create(title="ASG cutover: retire ci-gw runner boxes", body="")
++    assert out.get("code") == "create_overlap", out
++    assert [m["id"] for m in out["matches"]] == [tid]
++    unrelated = _create(title="Rotate the Telnyx API key", body="")
++    assert unrelated.get("ok") is True, unrelated
++
++
++def test_same_chat_fan_out_and_parents_are_not_matches(home):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        parent = kb.create_task(conn, title="Retire the ci-gw runner boxes after the ASG cutover",
++                                assignee="default", session_id="other-chat")
++    finally:
++        conn.close()
++    out = _create(title="Retire ci-gw runner boxes: ASG cutover follow-up", body="", parents=[parent])
++    assert out.get("ok") is True, out
++
++
++def test_overlap_check_off_by_config(home):
++    (home / "config.yaml").write_text("kanban:\n  create_overlap_check: false\n")
++    _board_with_b1()
++    assert _create().get("ok") is True
++
++
++def _fake_replica(path, rows):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    db = sqlite3.connect(path)
++    db.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT)")
++    for gw, task in rows:
++        db.execute("INSERT INTO replica VALUES (?,?,?,?)",
++                   (gw, "tasks", f"default/{task['board']}/{task['id']}", json.dumps(task)))
++    db.commit()
++    db.close()
++
++
++def test_placed_create_checks_the_target_gateways_replica_first(home, tmp_path, monkeypatch):
++    """A MacBook chat whose card routes to the hub: the hub's open Stage B card is in the hub replica."""
++    from hermes_cli import kanban_capability_registry as reg
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(reg, "self_gateway", lambda: "macbook")
++    _fake_replica(tmp_path / "hub-state" / "hub.db", [
++        ("hub", {"id": "t_b1", "board": "research-x", "title": B1_TITLE, "status": "scheduled",
++                 "gateway": "hub", "sessions": [{"session": "20261026_154948_ea6cfd"}]}),
++        ("hub", {"id": "t_old", "board": "research-x", "title": "Stage A3", "status": "done",
++                 "gateway": "hub"}),
++    ])
++    placed = []
++    monkeypatch.setattr(kt, "_place_remote", lambda *a, **k: placed.append(a) or (None, None))
++    out = _create()
++    assert out.get("code") == "create_overlap", out
++    assert [(m["gateway"], m["id"]) for m in out["matches"]] == [("hub", "t_b1")]
++    assert placed == [] and DUP_TITLE not in _default_titles()
++
++
++def test_missing_replica_never_blocks(home, monkeypatch):
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: "macbook")
++    assert _create().get("ok") is True
++
++
++def test_a_board_named_in_passing_with_an_unrelated_title_is_not_a_match(home):
++    _board_with_b1()
++    out = _create(title="Rotate the Telnyx API key",
++                  body="Logs are under ~/.hermes/kanban/boards/research-x/ for reference.")
++    assert out.get("ok") is True, out
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 736ec152b6..5497208ade 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -20,7 +20,8 @@ from hermes_cli.goals import handoff_judge_goal, judge_goal
+ from tools.registry import no_cache_check_fn, registry, tool_error
+ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+-from tools.kanban_tools_placement import _placement_refused
++from hermes_cli import kanban_overlap
++from tools.kanban_tools_placement import _marker_placement_fields, _placement_refused, _runs_where
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+@@ -1692,22 +1693,6 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         return None, None
+ 
+ 
+-def _runs_where(runs_on, pinned_machine, marker_placement) -> str:
+-    """Where a card created on this board runs, for the kanban_create result. Never raises."""
+-    if runs_on is not None:
+-        if pinned_machine:
+-            return f"{pinned_machine} via the board lease (runs_on={runs_on})"
+-        return f"a machine matching runs_on={runs_on} via the board lease"
+-    if marker_placement and marker_placement.get("defer"):
+-        return f"{marker_placement['defer']} once its parents finish"
+-    try:
+-        from hermes_cli import kanban_capability_registry as _reg
+-        gw = _reg.self_gateway()
+-    except Exception:
+-        gw = None
+-    return f"here ({gw})" if gw else "here"
+-
+-
+ @_kanban_handler("kanban_create")
+ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+@@ -1793,6 +1778,12 @@ def _handle_create(args: dict, **kw) -> str:
+             if runs_on is not None:
+                 pinned_machine = str(args.get("placement")).strip()
+                 args = {**args, "placement": "local"}
++        # [daveey] Refuse a second owner: open cards on every board/gateway, not this chat's links.
++        refused, after_create = kanban_overlap.check(conn, args, courier=origin_intent is not None,
++                                                     title=str(title).strip(), session_id=session_id,
++                                                     self_tid=self_tid, parents=parents)
++        if refused:
++            return refused
+         if origin_intent is None and origin is None:
+             check_tool_create(args.get("requires"), workspace_kind=workspace_kind, project_id=project_id,
+                               skills=skills, assignee=str(assignee))  # before placement routes it away [daveey]
+@@ -1852,22 +1843,8 @@ def _handle_create(args: dict, **kw) -> str:
+             }}
+         if origin is not None:
+             extra["origin_binding"] = kanban_origin.bind(conn, new_tid, origin, board=args.get("board"))
+-        if marker_placement and marker_placement.get("defer"):
+-            # [daveey] Run on the routed gateway once the parents finish (kanban_placement_forward).
+-            from hermes_cli import kanban_placement_forward as _kpf
+-            from hermes_cli.profiles import current_profile_name as _cpn
+-            _kpf.record_deferral(conn, new_tid, target=marker_placement["defer"], origin_session=session_id,
+-                                 origin_profile=_cpn("default") or "default")
+-            extra["placement"] = {"where": "local", "defer": marker_placement["defer"],
+-                                  "why": marker_placement["why"]}
+-            extra["note"] = (f"Created here as {new_tid} so it can wait on its parents; it runs on "
+-                             f"{marker_placement['defer']}, not here: when the parents finish the dispatcher "
+-                             f"forwards it there and this card completes when that one does.")
+-        elif marker_placement and marker_placement.get("runs_on"):
+-            extra["placement"] = dict(marker_placement)
+-        elif marker_placement:
+-            extra["placement"] = {"where": marker_placement["where"], "why": marker_placement["why"]}
+-            extra["remedy"] = marker_placement["remedy"]
++        extra.update(_marker_placement_fields(conn, new_tid, marker_placement, session_id))
++        after_create(conn, new_tid)
+         if origin_intent is None and args.get("requires"):
+             # Placement preflight: declared gateway needs this gateway lacks are owned first. [daveey]
+             from hermes_cli.kanban_capability_routing import preflight
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 2af43e2077..bfb3809f2f 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -1,6 +1,8 @@
+ """Placement refusals for ``kanban_create`` (split out of :mod:`tools.kanban_tools`). [daveey]"""
+ from __future__ import annotations
+ 
++from typing import Optional
++
+ from tools.registry import tool_error
+ 
+ 
+@@ -11,3 +13,39 @@ def _placement_refused(pin: str, why: str) -> str:
+         "silently replaced by a local card. Use placement='local' (or omit it) to create the card on this "
+         "gateway, or create it on the target with `hermes-hub create-task <gateway> ...`.",
+         code="placement_unavailable", placement=pin, created=False)
++
++
++def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict], session_id: Optional[str]) -> dict:
++    """Result fields for a card a placement marker kept here; a deferred card records its forward. [daveey]"""
++    if not marker_placement:
++        return {}
++    if marker_placement.get("defer"):
++        # Run on the routed gateway once the parents finish (kanban_placement_forward).
++        from hermes_cli import kanban_placement_forward as _kpf
++        from hermes_cli.profiles import current_profile_name as _cpn
++        _kpf.record_deferral(conn, new_tid, target=marker_placement["defer"], origin_session=session_id,
++                             origin_profile=_cpn("default") or "default")
++        return {"placement": {"where": "local", "defer": marker_placement["defer"], "why": marker_placement["why"]},
++                "note": (f"Created here as {new_tid} so it can wait on its parents; it runs on "
++                         f"{marker_placement['defer']}, not here: when the parents finish the dispatcher "
++                         f"forwards it there and this card completes when that one does.")}
++    if marker_placement.get("runs_on"):
++        return {"placement": dict(marker_placement)}
++    return {"placement": {"where": marker_placement["where"], "why": marker_placement["why"]},
++            "remedy": marker_placement["remedy"]}
++
++
++def _runs_where(runs_on, pinned_machine, marker_placement) -> str:
++    """Where a card created on this board runs, for the kanban_create result. Never raises."""
++    if runs_on is not None:
++        if pinned_machine:
++            return f"{pinned_machine} via the board lease (runs_on={runs_on})"
++        return f"a machine matching runs_on={runs_on} via the board lease"
++    if marker_placement and marker_placement.get("defer"):
++        return f"{marker_placement['defer']} once its parents finish"
++    try:
++        from hermes_cli import kanban_capability_registry as _reg
++        gw = _reg.self_gateway()
++    except Exception:
++        gw = None
++    return f"here ({gw})" if gw else "here"
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 7183642eab..b9db74f5b8 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -635,7 +635,11 @@ KANBAN_CREATE_SCHEMA = _schema(
+         "orchestrator workers to fan out — decompose work into child "
+         "tasks with specific assignees, link them into a pipeline, "
+         "then complete your own task. The dispatcher picks up the new "
+-        "tasks on its next tick and spawns the assigned profiles."
++        "tasks on its next tick and spawns the assigned profiles. "
++        "Count owners by board/project, not by your chat's links: a card "
++        "that open cards on any board or gateway already cover is refused "
++        "(code create_overlap, with their ids); continue that card, or pass "
++        "distinct_from + distinct_reason when the work really is separate."
+     ),
+     {
+         "title": _prop("string", "Short task title (required)."),
+@@ -708,6 +712,10 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "— a specifier profile is expected to flesh out "
+                 "the body before work starts."
+         )),
++        "distinct_from": {"type": "array", "items": {"type": "string"}, "description": (
++                "Ids of open cards a create_overlap refusal named that this card is NOT a duplicate of. "
++                "Needs distinct_reason; recorded as a create_overlap event on the new card.")},
++        "distinct_reason": _prop("string", "Why this card is separate work from the distinct_from cards."),
+         "idempotency_key": _prop("string", (
+                 "If a non-archived task with this key already "
+                 "exists, return that task's id instead of creating "
+-- 
+2.55.0
+
