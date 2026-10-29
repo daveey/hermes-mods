@@ -19,6 +19,7 @@ import sys
 import time
 
 ROOT = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
+EMPTY_STATUS = ":  | needs: "
 
 
 def signature(path):
@@ -52,8 +53,9 @@ def describe(sid, old, new):
         out.append(f"PRs {old['prs']} -> {new['prs']}")
     if new["title"] != old["title"]:
         out.append(f"retitled {old['title']!r} -> {new['title']!r}")
-    if new["status"] != old["status"]:
-        out.append(f"status now [{new['status']}]")
+    # A summary cleared to empty only means a new turn started; the turn's end reports it.
+    if new["status"] != old["status"] and new["status"] != EMPTY_STATUS and not out:
+        out.append("status changed")
     return f"{sid} {new['title']!r}: " + "; ".join(out) + f" [{new['status']}]" if out else None
 
 
