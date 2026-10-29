@@ -500,21 +500,31 @@ def teardown(task_id: str, env) -> list[dict]:
     return _teardown(task_id, db, str(run))
 
 
-def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0) -> list[dict]:
+RUN_SETTLED = (('done', 'completed'), ('completed', 'completed'))  # worker kanban_complete; operator/CLI close
+
+
+def _teardown(task_id: str, db: str, run: str | None, min_age_s: float = 0.0,
+              declined: list[str] | None = None) -> list[dict]:
     """Verify under the board writer reservation that *task_id* is settled (done, no current run, latest run
     done/completed and equal to *run*, or any id when *run* is None, no open child), then remove its trees.
-    Every decline that has trees at stake is logged as a KEEP line."""
+    Every decline that has trees at stake is logged as a KEEP line; the sweep passes *declined* to get the
+    reason for the checks below, which return before any tree is looked at."""
     # mode=rw never creates a missing board. Hold the writer reservation through
     # filesystem removal so reopen/reassignment cannot race our authorization.
     with closing(sqlite3.connect(Path(db).resolve().as_uri() + '?mode=rw', uri=True, timeout=10)) as c:
         c.execute('BEGIN IMMEDIATE')
         row = c.execute('select status, current_run_id, workspace_path from tasks where id=?', (task_id,)).fetchone()
         if not row or row[0] != 'done' or row[1] is not None:
+            if declined is not None and row and row[0] == 'done':
+                declined.append(f'card has a current run {row[1]}')
             return []
         ended = c.execute('select id, status, outcome, ended_at from task_runs where task_id=? order by id desc limit 1',
                           (task_id,)).fetchone()
-        if (not ended or (run is not None and str(ended[0]) != run) or ended[1:3] != ('done', 'completed')
+        if (not ended or (run is not None and str(ended[0]) != run) or tuple(ended[1:3]) not in RUN_SETTLED
                 or ended[3] is None):
+            if declined is not None and ended and run is None:
+                declined.append(f'latest run {ended[0]} is {ended[1]}/{ended[2]}'
+                                + ('' if ended[3] is not None else ', not ended'))
             return []
         if min_age_s and time.time() - float(ended[3]) < min_age_s:
             return []  # sweep: let the completing worker finish its own teardown first
@@ -556,6 +566,8 @@ SWEEP_STAMP = H / ".hermes" / "cache" / "worktree-owner-sweep.stamp"
 SWEEP_EVERY_S = 3600.0
 SWEEP_MIN_AGE_S = 600.0
 SWEEP_MAX_AGE_S = 8 * 86400.0  # older trees are mac-worktree-gc's (it archives after 7 idle days)
+DEFAULT_BOARD = H / ".hermes" / "kanban.db"  # board of legacy markers (no board_db), as mac-worktree-gc assumes
+ARCHIVE_KEEP_SUFFIX = "mac-worktree-gc archives it after 7 idle days"  # GC: kept on purpose, not stale
 
 
 def sweep(min_age_s: float = SWEEP_MIN_AGE_S, max_age_s: float = SWEEP_MAX_AGE_S, dry_run: bool = False) -> list[dict]:
@@ -577,7 +589,10 @@ def sweep(min_age_s: float = SWEEP_MIN_AGE_S, max_age_s: float = SWEEP_MAX_AGE_S
     seen = set()
     for _, rec, path in list(_markers()):
         task, db = rec.get('task_id'), rec.get('board_db')
-        if not task or not db or (db, task) in seen or not path or not os.path.isdir(path) or not os.path.isfile(db):
+        legacy = not db or rec.get('run_id') is None
+        db = db or str(DEFAULT_BOARD)
+        if not task or (not legacy and (db, task) in seen) or not path or not os.path.isdir(path) \
+                or not os.path.isfile(db):
             continue
         seen.add((db, task))
         try:
@@ -586,9 +601,21 @@ def sweep(min_age_s: float = SWEEP_MIN_AGE_S, max_age_s: float = SWEEP_MAX_AGE_S
                                   (task,)).fetchone()
                 st = c.execute('select status from tasks where id=?', (task,)).fetchone()
             if not st or st[0] != 'done' or not ended or ended[2] is None or \
-                    time.time() - float(ended[2]) > max_age_s:
+                    time.time() - float(ended[2]) > max_age_s or time.time() - float(ended[2]) < min_age_s:
                 continue
-            results += _teardown(task, db, None, min_age_s)
+            if legacy:
+                # Written before markers carried board_db/run_id (4e8d1f2): the fence can't prove this card made
+                # the tree, so it is the GC's. Say so, or the report keeps quoting the completion-time reason.
+                _log(f"KEEP {path} (registered to {task}): legacy marker without a board/run id; "
+                     f"{ARCHIVE_KEEP_SUFFIX}")
+                results.append(dict(path=path, action='kept: legacy marker'))
+                continue
+            declined: list[str] = []
+            results += _teardown(task, db, None, min_age_s, declined)
+            for why in declined:
+                for p in _marked_paths(task, ''):
+                    _log(f"KEEP {p} (registered to {task}): {why}")
+                    results.append(dict(path=p, action=f'kept: {why}'))
         except Exception as e:  # noqa: BLE001 - one bad board must not stop the others
             _log(f"WARN sweep of {task} on {db} failed: {type(e).__name__}: {e}")
     return results

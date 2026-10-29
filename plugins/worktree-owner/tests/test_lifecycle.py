@@ -318,6 +318,40 @@ class Lifecycle(unittest.TestCase):
             c.execute("delete from task_runs where id='run2'")
         self.assertEqual([r['action'] for r in self.m.sweep(min_age_s=0)], ['removed'])
 
+    def test_sweep_reaps_card_closed_by_an_operator_run_completed_completed(self):
+        # supervisor/CLI closes end the run as status 'completed' (not 'done'); the sweep declined them silently
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update task_runs set status='completed'")
+        self._ended(3600)
+        self.assertEqual([r['action'] for r in self.m.sweep()], ['removed'])
+        self.assertFalse(self.tree.exists())
+
+    def test_sweep_logs_why_it_keeps_a_finished_cards_tree(self):
+        # every decline with a tree at stake writes a KEEP line, so the GC report shows today's reason, not the
+        # completion-time one (MBP: 'a live process works in it' 6 days on, sweep printed nothing)
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("insert into task_runs values ('run2', 'task', 'crashed', 'crashed', ?)", (int(time.time() - 3600),))
+        self._ended(3600)
+        rows = self.m.sweep()
+        self.assertEqual([r['path'] for r in rows], [str(self.tree)])
+        self.assertTrue(rows[0]['action'].startswith('kept: latest run'))
+        self.assertTrue(self.tree.exists())
+        self.assertIn(f'KEEP {self.tree} (registered to task): latest run run2 is crashed/crashed', self.m.LOG.read_text())
+
+    def test_sweep_logs_legacy_marker_as_kept_for_the_gc_archive(self):
+        # markers written before 4e8d1f2 have no board_db/run_id: the sweep skipped them with no log line, so the
+        # report kept quoting the completion-time reason and counted them stale
+        gd = Path(git(self.tree, 'rev-parse', '--absolute-git-dir').strip())
+        (gd / self.m.MARKER).write_text(json.dumps(dict(task_id='task', path=str(self.tree))))
+        self.m.DEFAULT_BOARD = self.db
+        self._ended(3600)
+        rows = self.m.sweep()
+        self.assertEqual([r['action'] for r in rows], ['kept: legacy marker'])
+        self.assertTrue(self.tree.exists())
+        line = [x for x in self.m.LOG.read_text().splitlines() if 'KEEP' in x][-1]
+        self.assertIn('legacy marker without a board/run id', line)
+        self.assertTrue(line.endswith('mac-worktree-gc archives it after 7 idle days'))
+
     def test_sweep_leaves_cards_older_than_the_gc_window_to_the_gc(self):
         self._ended(9 * 86400)
         self.assertEqual(self.m.sweep(), [])

@@ -27,9 +27,15 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
    **Deferred teardown (sweep).** The completion hook runs once, in the completing worker, and must decline while a
    child card is still open or a process still works in a tree; cards closed from the CLI/REST never run it at all.
    So after each completion the hook also starts, at most hourly, a detached `python3 __init__.py sweep`: for every
-   marked tree on the host whose card is settled on its own board (done, latest run done/completed at least 10 min
-   and at most 8 days ago, no open child), it re-runs the same verified teardown under the board reservation. A tree
-   kept for an open child logs `KEEP ... open child card(s) <ids>; torn down when they finish`. The hourly
+   marked tree on the host whose card is settled on its own board (done, latest run done/completed, or
+   completed/completed for an operator or CLI close, at least 10 min and at most 8 days ago, no open child), it
+   re-runs the same verified teardown under the board reservation. A tree
+   kept for an open child logs `KEEP ... open child card(s) <ids>; torn down when they finish`. Every other sweep
+   decline on a done card logs a KEEP line too and prints a `kept: <reason>` row (e.g. `latest run N is
+   crashed/crashed`), so the GC report quotes today's reason, not the one from completion time. A marker written
+   before markers carried `board_db`/`run_id` (legacy, looked up on `~/.hermes/kanban.db`) is never torn down by
+   the plugin: it logs `KEEP ... legacy marker without a board/run id; mac-worktree-gc archives it after 7 idle days`
+   and is left to the GC. The hourly
    `mac-worktree-gc.py --all-repos` also runs the sweep before its own pass (and `sweep --dry-run` under its
    `--dry-run`), so a host with few completions re-checks too; `sweep --dry-run` prints `would remove` rows and
    removes and logs nothing. Older trees belong to mac-worktree-gc. An untracked symlink named like a cache (`tests/node_modules` linked to a shared install,
