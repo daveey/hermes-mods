@@ -493,3 +493,72 @@ def test_unverified_owner_skips_quoted_phrases_and_counts_cli_owner_checks():
     assert rc.unverified_owner(reply, ["-> terminal(hermes kanban --board runners comment t_26e528fa 'repro: ...')"]) is None
     # a plain terminal call that only mentions a tool name is not an owner check
     assert rc.unverified_owner(reply, ["-> terminal(grep -rn kanban_show plugins/)"]) is not None
+
+
+def _hooks_with_judge(tmp_path, monkeypatch, verdicts):
+    """build() with a scripted judge: each call pops the next verdict. Returns (hooks, calls, log_rows)."""
+    spec = importlib.util.spec_from_file_location("coach_init_rc_outcome", HERE / "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    core = mod._load("core")
+    rcl = mod._load("reply_check")
+    calls = []
+
+    def judge(s, p):
+        calls.append(p)
+        return json.dumps(verdicts[min(len(calls), len(verdicts)) - 1])
+    monkeypatch.setattr(rcl, "aux_judge", judge)
+    monkeypatch.setenv("COACH_REPLY_RULES", "handoff")
+    monkeypatch.setenv("COACH_SYSTEM_ONE", "off")
+    store = core.Store(root=tmp_path / "coach")
+    _coach, hooks = mod.build(store=store, checkout=None)
+    rows = lambda: [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]  # noqa
+    return hooks, calls, rows
+
+
+HANDOFF_DRAFT = "To finish, sign in to the Telnyx portal and paste the API key here, then let me know."
+HANDOFF_FINAL = ("I checked directly: Telnyx redirects to login and the vault has no Telnyx credential, so that one "
+                 "sign-in needs your hands: sign in to the Telnyx portal, then tell me when it's done.")
+
+
+def test_pre_verify_logs_one_handoff_outcome_after_a_nudge_and_never_nudges_again(tmp_path, monkeypatch):
+    hooks, calls, rows = _hooks_with_judge(tmp_path, monkeypatch, [
+        {"handoff": 0.9, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0, "evidence": "asks sign-in"},
+        {"handoff": 0.2, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0, "evidence": "legit"}])
+    hooks["pre_llm_call"](session_id="s1", user_message="get me a telnyx number")
+    out = hooks["pre_verify"](session_id="s1", attempt=0, final_response=HANDOFF_DRAFT)
+    assert out["action"] == "continue" and len(calls) == 1
+    assert hooks["pre_verify"](session_id="s1", attempt=1, final_response=HANDOFF_FINAL) is None
+    assert len(calls) == 2  # exactly one outcome judgement
+    outs = [r for r in rows() if r["event"] == "reply_nudge_outcome"]
+    nudge = [r for r in rows() if r["event"] == "reply_nudge"][0]
+    assert len(outs) == 1 and outs[0]["rule"] == "handoff" and outs[0]["session_id"] == "s1"
+    assert outs[0]["resolved"] is True and outs[0]["p"] == 0.2
+    assert outs[0].get("draft_id") == nudge.get("draft_id")
+    # a further attempt in the same turn neither re-judges nor logs a second outcome
+    assert hooks["pre_verify"](session_id="s1", attempt=2, final_response=HANDOFF_FINAL) is None
+    assert len(calls) == 2 and len([r for r in rows() if r["event"] == "reply_nudge_outcome"]) == 1
+
+
+def test_pre_verify_outcome_unresolved_when_the_revision_still_hands_off(tmp_path, monkeypatch):
+    v = {"handoff": 0.95, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0, "evidence": "still asks"}
+    hooks, calls, rows = _hooks_with_judge(tmp_path, monkeypatch, [v, v])
+    hooks["pre_llm_call"](session_id="s2", user_message="get me a telnyx number")
+    assert hooks["pre_verify"](session_id="s2", attempt=0, final_response=HANDOFF_DRAFT)["action"] == "continue"
+    assert hooks["pre_verify"](session_id="s2", attempt=1, final_response=HANDOFF_DRAFT) is None
+    outs = [r for r in rows() if r["event"] == "reply_nudge_outcome"]
+    assert len(outs) == 1 and outs[0]["resolved"] is False and outs[0]["p"] == 0.95
+
+
+def test_pre_verify_attempt_one_without_a_handoff_nudge_makes_no_judge_call(tmp_path, monkeypatch):
+    hooks, calls, rows = _hooks_with_judge(tmp_path, monkeypatch, [
+        {"handoff": 0.9, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0, "evidence": "x"}])
+    hooks["pre_llm_call"](session_id="s3", user_message="get me a telnyx number")
+    assert hooks["pre_verify"](session_id="s3", attempt=1, final_response=HANDOFF_DRAFT) is None
+    assert calls == []
+    # and a nudge from an earlier turn does not leak into the next turn's attempt 1
+    hooks["pre_verify"](session_id="s3", attempt=0, final_response=HANDOFF_DRAFT)
+    hooks["pre_llm_call"](session_id="s3", user_message="next question")
+    n = len(calls)
+    assert hooks["pre_verify"](session_id="s3", attempt=1, final_response=HANDOFF_DRAFT) is None
+    assert len(calls) == n

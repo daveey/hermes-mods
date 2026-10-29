@@ -595,3 +595,25 @@ def test_backstop_passes_the_confirm_model(tmp_path, monkeypatch):
     sh.backstop(data, store=store, judge=first, now=now, m="shadow", confirm=yes,
                 filer=lambda d, store=None, m=None: filed.append(d) or d)
     assert len(cyes) == 1 and len(filed) == 1 and filed[0]["stages"] == [0.8, 0.8, 0.9]
+
+
+def test_handoff_nudge_counts_show_resolved_versus_filed(tmp_path):
+    """Detection for agent-e278947864: `self_heal.py status` reports how many handoff nudges the revised reply
+    resolved versus how many still file, so a judge that never resolves (or always does) stays visible."""
+    log = tmp_path / "log.jsonl"
+    now = 1792660000.0
+    rows = [
+        {"ts": now - 3000, "event": "reply_nudge", "rule": "handoff", "session_id": "a", "draft_id": "d1"},
+        {"ts": now - 2990, "event": "reply_nudge_outcome", "rule": "handoff", "session_id": "a", "draft_id": "d1",
+         "resolved": True},
+        {"ts": now - 2500, "event": "reply_nudge", "rule": "handoff", "session_id": "b"},
+        {"ts": now - 2490, "event": "reply_nudge_outcome", "rule": "handoff", "session_id": "b", "resolved": False},
+        {"ts": now - 2000, "event": "reply_nudge", "rule": "handoff", "session_id": "c"},   # no outcome, past grace
+        {"ts": now - 60, "event": "reply_nudge", "rule": "handoff", "session_id": "d"},     # no outcome yet
+        {"ts": now - 50, "event": "reply_nudge", "rule": "confirm", "session_id": "e"},     # other rule: ignored
+        {"ts": now - 9 * 86400, "event": "reply_nudge", "rule": "handoff", "session_id": "old"},  # outside window
+    ]
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    c = sh.handoff_nudge_counts(tmp_path, now=now)
+    assert c == {"days": 7, "nudges": 4, "resolved": 1, "still_handed_off": 1, "no_outcome": 1, "waiting": 1,
+                 "filed": 2}

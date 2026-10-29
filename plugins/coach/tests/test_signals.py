@@ -820,3 +820,64 @@ def test_kanban_sibling_cards_with_same_stem_and_error_are_one_signal(tmp_path):
     assert len({s["fp"] for s in ks}) == 3
     d = sg.to_defect(batch[0])
     assert d["kanban"]["cards"] == ["t_load14", "t_load20", "t_load23"]
+
+
+# ── handoff nudge outcome (self-heal agent-e278947864): file the outcome, not the nudge ──────────────────────
+
+def _coach_home(tmp_path, rows):
+    h = tmp_path / "home"
+    (h / "coach").mkdir(parents=True)
+    (h / "coach" / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return h
+
+
+NUDGE = {"ts": NOW - 120, "event": "reply_nudge", "session_id": "20261027_234200_abcdef", "rule": "handoff",
+         "p": 0.82, "evidence": "Asks user to sign into Telnyx", "draft_id": "d1"}
+
+
+def _outcome(resolved, ts=NOW - 86, **kw):
+    return {"ts": ts, "event": "reply_nudge_outcome", "rule": "handoff", "session_id": NUDGE["session_id"],
+            "draft_id": "d1", "p": 0.1 if resolved else 0.9, "resolved": resolved, **kw}
+
+
+def _handoffs(sigs):
+    return [s for s in sigs if s["kind"] == "coach" and "handed the user a step" in s["symptom"]]
+
+
+def test_handoff_nudge_resolved_by_the_revised_reply_files_nothing(tmp_path):
+    h = _coach_home(tmp_path, [NUDGE, _outcome(True)])
+    cur = {}
+    assert _handoffs(sg.collect_coach(h, cur, NOW)) == []
+    assert _handoffs(sg.collect_coach(h, cur, NOW + 3600)) == []  # and never later either
+
+
+def test_handoff_nudge_still_handing_off_after_revision_files_one_defect(tmp_path):
+    h = _coach_home(tmp_path, [NUDGE, _outcome(False)])
+    got = _handoffs(sg.collect_coach(h, {}, NOW))
+    assert len(got) == 1 and got[0]["session_id"] == NUDGE["session_id"]
+    assert "Telnyx" in got[0]["symptom"] and "still handed off" in got[0]["details"]
+
+
+def test_handoff_nudge_without_outcome_files_only_after_the_grace_window(tmp_path):
+    h = _coach_home(tmp_path, [NUDGE])
+    cur = {}
+    assert _handoffs(sg.collect_coach(h, cur, NOW)) == []  # 2 min old: the revision may still be running
+    assert _handoffs(sg.collect_coach(h, cur, NUDGE["ts"] + 14 * 60)) == []
+    late = _handoffs(sg.collect_coach(h, cur, NUDGE["ts"] + sg.HANDOFF_GRACE_S + 1))
+    assert len(late) == 1 and "no outcome" in late[0]["details"]
+    assert _handoffs(sg.collect_coach(h, cur, NUDGE["ts"] + 3600)) == []  # filed once, then forgotten
+
+
+def test_handoff_outcome_in_a_later_pass_resolves_the_pending_nudge(tmp_path):
+    h = _coach_home(tmp_path, [NUDGE])
+    cur = {}
+    assert _handoffs(sg.collect_coach(h, cur, NOW)) == []
+    with (h / "coach" / "log.jsonl").open("a") as f:
+        f.write(json.dumps(_outcome(True, ts=NOW + 30)) + "\n")
+    assert _handoffs(sg.collect_coach(h, cur, NOW + 3600)) == []
+
+
+def test_handoff_outcome_of_another_session_does_not_resolve_it(tmp_path):
+    other = {**_outcome(True), "session_id": "someone_else", "draft_id": "d9"}
+    h = _coach_home(tmp_path, [NUDGE, other])
+    assert len(_handoffs(sg.collect_coach(h, {}, NUDGE["ts"] + sg.HANDOFF_GRACE_S + 1))) == 1

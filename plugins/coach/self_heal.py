@@ -687,6 +687,48 @@ def host_name() -> str:
     return os.uname().nodename.split(".")[0]
 
 
+HANDOFF_GRACE_S = 15 * 60  # same as signals.HANDOFF_GRACE_S
+
+
+def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
+    """Handoff reply_nudges in <coach>/log.jsonl over `days`, by what their reply_nudge_outcome said: resolved (the
+    revised reply no longer hands off: not filed), still_handed_off and no_outcome (past the grace window: both
+    filed by the signals collector), waiting (inside the grace window). For `status`: a judge that never resolves
+    anything, or resolves everything, shows here."""
+    root = Path(root) if root is not None else coach_root()
+    now = time.time() if now is None else now
+    since = now - days * 86400
+    nudges, outcomes = [], []
+    try:
+        with (root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if '"reply_nudge' not in ln or '"handoff"' not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("rule") != "handoff" or float(r.get("ts") or 0) < since:
+                    continue
+                (nudges if r.get("event") == "reply_nudge" else
+                 outcomes if r.get("event") == "reply_nudge_outcome" else []).append(r)
+    except OSError:
+        pass
+    c = {"days": days, "nudges": len(nudges), "resolved": 0, "still_handed_off": 0, "no_outcome": 0, "waiting": 0}
+    for n in nudges:
+        t = float(n.get("ts") or 0)
+        o = next((o for o in outcomes if o.get("session_id") == n.get("session_id")
+                  and not (n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"])
+                  and -5 <= float(o.get("ts") or 0) - t <= HANDOFF_GRACE_S), None)
+        if o is not None:
+            outcomes.remove(o)
+            c["resolved" if o.get("resolved") is True else "still_handed_off"] += 1
+        else:
+            c["waiting" if now - t <= HANDOFF_GRACE_S else "no_outcome"] += 1
+    c["filed"] = c["still_handed_off"] + c["no_outcome"]
+    return c
+
+
 def coach_root() -> Path:
     try:
         from hermes_constants import get_hermes_home  # type: ignore
@@ -2615,6 +2657,7 @@ def main(argv=None) -> int:
                                                "held": len(v.get("held") or [])}
                                            for k, v in st.items()},
                           "held_total": sum(len(v.get("held") or []) for v in st.values()),
+                          "handoff_nudges": handoff_nudge_counts(),
                           "deploy_grace_hours": deploy_grace_s() / 3600}, indent=1))
     return 0
 

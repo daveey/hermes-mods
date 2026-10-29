@@ -666,6 +666,24 @@ def aux_judge(system: str, prompt: str) -> str:
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 
+def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
+                    threshold: float = 0.8, thresholds: Optional[dict] = None) -> dict:
+    """After a handoff nudge: does the REVISED final reply still hand the user a step? Same judge and threshold as
+    the nudge. Returns {"p", "resolved", "evidence", "judged"}; resolved=None when the judge gave no usable verdict
+    (the self-heal collector then files, as it would without an outcome). A reply the prefilter no longer flags is
+    resolved without a judge call, the same way check() never judges a reply with no candidate."""
+    if "handoff" not in prefilter(reply):
+        return {"p": 0.0, "resolved": True, "evidence": "no handoff language left", "judged": False}
+    try:
+        v = parse_verdict(llm(judge_system(), judge_prompt(user_ask, tool_log, reply)))
+    except Exception:
+        v = None
+    if not v:
+        return {"p": None, "resolved": None, "evidence": "judge gave no verdict", "judged": True}
+    th = rule_threshold("handoff", v, thresholds or {}, threshold)
+    return {"p": v["handoff"], "resolved": v["handoff"] < th, "evidence": v.get("evidence") or "", "judged": True}
+
+
 def rule_threshold(rule: str, verdict: dict, thresholds: dict, default: float) -> float:
     """The threshold a verdict is held to: report_only uses its second-opinion threshold only when the strong model
     scored it, otherwise report_only_screen."""
