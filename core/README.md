@@ -20,6 +20,81 @@ Base: `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`. Empty duplicate entries are re
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
 
+## Merge-aware mirror verification
+
+Documentation coverage (`python3 -B core/check_coverage.py`) remains unchanged.
+It is not a source-equivalence check. Before publishing a new series, separately run:
+
+```sh
+python3 -B core/verify_mirror.py \
+  --source-repo /path/to/source-repo \
+  --source-tip FROZEN_FORK_COMMIT \
+  --base FROZEN_UPSTREAM_COMMIT \
+  --patch-dir core/patches
+```
+
+Use frozen commit IDs, not moving refs, in publication evidence. `--base` is the
+upstream exclusion tip for `base..source-tip`; the replay starts at its merge-base
+with the source tip, not at an upstream tip that may have advanced. The verifier
+resolves inputs once, checks exact non-merge SHA headers and unique contiguous
+ordinals, applies all mail patches with `git am -3 --empty=keep`, then checks the
+complete committed tree (paths, modes, object kinds and blob content). Successful
+application alone cannot hide a merge-only runtime resolution or a removed test.
+It verifies final source equivalence, not each intermediate commit's contents or
+commit metadata: curated merge-linearization overlays remain supported.
+
+The source checkout HEAD is never changed. A uniquely owned detached worktree is
+removed in `finally` on replay/comparison success or failure; other worktrees are
+not pruned. Removal retries once. If Git persistently refuses removal, the command
+fails and preserves the worktree and its registry entry together for recovery via
+`git -C /path/to/source-repo worktree list`. Git diagnostics and source contents
+are never printed by the CLI; success prints JSON with frozen IDs and patch count.
+The source repository and public patch directory must be trusted local inputs;
+this is not a sandbox for repository-configured filters or hostile patches.
+
+Default comparison is byte-exact. The historical 0960 series includes public
+substitutions and reviewed ordering/formatting differences, so it is not expected
+to pass byte-exact comparison without an explicitly reviewed policy. This tooling
+change does not certify that snapshot with a new policy or weaken the default.
+For approved substitutions, supply `--policy /path/to/public-policy.json`:
+
+```json
+{
+  "source_tip": "FULL_FROZEN_SOURCE_COMMIT_ID",
+  "base": "FULL_FROZEN_UPSTREAM_COMMIT_ID",
+  "substitutions": [["original-example", "public-example"]],
+  "fingerprints": {}
+}
+```
+
+Substitutions are literal UTF-8 source-to-public byte replacements, applied in
+listed order to differing blobs, never regexes, paths, modes or missing files.
+Keep patterns narrow and review their scope. Never generate rules by reading a
+private denylist or put private denylist values into public output. All policy
+keys are required, with exact resolved snapshot IDs. A historical ordering-only
+difference may instead use `"path/to/file": ["SOURCE_BLOB_ID", "APPLIED_BLOB_ID"]`
+inside `fingerprints`. Both complete Git blob IDs must match, file modes must
+match, and every fingerprint must be used; an altered blob or stale snapshot
+fails. Fingerprints require independent review for semantic equivalence: they
+are exact reviewed pairs, not a semantic-equivalence algorithm or path exemptions.
+
+Run the stdlib-only fixture suite (also used by the core-mirror CI workflow):
+
+```sh
+python3 -B -m unittest discover -s core -p test_verify_mirror.py -v
+```
+
+The fixtures exercise faithful replay, missing/duplicated/reordered headers,
+missing/duplicate/gapped ordinals, omitted merge-only runtime resolution, deleted
+regression tests despite successful replay, explicit directional privacy rules,
+snapshot-bound fingerprints and altered content, malformed policies, file modes,
+advanced upstream bases, CLI privacy, and cleanup after replay/comparison failure.
+Cleanup fixtures preserve source HEAD and a sibling worktree, inject transient
+and persistent removal errors, and explicitly clean up their own recovery fixture.
+No private repository, network, runtime change or third-party Python package is
+needed. Real source snapshot verification is an additional publisher-run gate,
+not something the public fixture CI can perform without the source repository.
+
 ## Features
 
 | Doc | Patches | What you get |
