@@ -163,8 +163,9 @@ def test_cpu_profile_names_busy_thread_and_skips_idle():
         stop.set(); idle.set()
     assert rep["kind"] == "cpu_profile" and rep["samples"] > 5
     threads = {t["thread"]: t["busy_pct"] for t in rep["threads"]}
-    assert threads.get("hot", 0) > 50
-    assert "idler" not in threads
+    parked = {t["thread"]: t["pct"] for t in rep["parked_threads"]}
+    assert threads.get("hot", 0) + parked.get("hot", 0) > 50 and threads.get("hot", 0) > 0
+    assert "idler" not in threads and "idler" not in parked
     assert any("hot_spin" in " ".join(s["stack"]) for s in rep["stacks"])
     assert rep["process_cpu_pct"] > 0
 

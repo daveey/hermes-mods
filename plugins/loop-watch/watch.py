@@ -156,17 +156,26 @@ def cpu_profile(seconds: float, *, sample_s: float = 0.02, frames: Callable[[], 
     per_thread: Counter = Counter()
     stacks: Counter = Counter()
     leaves: Counter = Counter()
+    parked_threads: Counter = Counter()
+    parked_stacks: Counter = Counter()
     samples = 0
+    last: dict = {}  # tid -> (leaf frame id, f_lasti): unchanged between samples = parked in a blocking C call
     c0, t0 = cpu(), clock()
     while clock() - t0 < seconds:
         nm = names()
         for tid, fr in frames().items():
             if tid == me:
                 continue
+            pos = (id(fr), fr.f_lasti)
+            parked, last[tid] = last.get(tid) == pos, pos
             st = _fmt_stack(fr, 10)
             if _idle(st):
                 continue
             thread = nm.get(tid) or str(tid)
+            if parked:  # blocked in C (waitpid, pipe read) or one long C call (sqlite execute): listed apart
+                parked_threads[thread] += 1
+                parked_stacks[(thread, st)] += 1
+                continue
             per_thread[thread] += 1
             stacks[(thread, st)] += 1
             leaves[st[-1] if st else "?"] += 1
@@ -179,6 +188,10 @@ def cpu_profile(seconds: float, *, sample_s: float = 0.02, frames: Callable[[], 
         "threads": [{"thread": t, "busy_pct": round(100 * n / max(samples, 1), 1)} for t, n in per_thread.most_common(15)],
         "leaves": [{"n": n, "frame": f} for f, n in leaves.most_common(15)],
         "stacks": [{"n": n, "thread": t, "stack": list(st)} for (t, st), n in stacks.most_common(20)],
+        # Same leaf frame as the previous sample: a blocking C call or one long C call. Read with process_cpu_pct.
+        "parked_threads": [{"thread": t, "pct": round(100 * n / max(samples, 1), 1)}
+                           for t, n in parked_threads.most_common(15)],
+        "parked_stacks": [{"n": n, "thread": t, "stack": list(st)} for (t, st), n in parked_stacks.most_common(10)],
     }
 
 
