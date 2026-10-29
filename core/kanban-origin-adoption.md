@@ -1,6 +1,6 @@
 # Durable origin adoption of an existing task
 
-Patches **0380–0382** (`b9b85d1009`, `16633d1e41`, `5a1eeb73db`).
+Patches **0385, 0386, 0388** (`b9b85d1009`, `16633d1e41`, `5a1eeb73db`).
 
 ## Behavior
 
@@ -24,7 +24,7 @@ Executed on the applied public series: `tests/hermes_cli/test_kanban_origin_adop
 
 ## Applying
 
-Apply the full ordered series from the documented merge base. These three patches precede archive-refresh **0383** and local-authority **0384–0387**; they are not standalone against arbitrary upstream revisions.
+Apply the full ordered series from the documented merge base. These three patches precede archive-refresh **0389** and local-authority **0390, 0391, 0393, 0394**; they are not standalone against arbitrary upstream revisions.
 
 ## Gotchas
 
@@ -34,9 +34,9 @@ This adds a supported adoption primitive, not a migration of historical ownerles
 
 Core owns the transactional intent and authority boundary. Plugins may call the registered action but cannot replace its lifecycle checks with a task-ID-only match.
 
-## Follow-up patch (0708)
+## Follow-up patch (0774)
 
-**0708** (fork `a8ebd66ee6`): the trusted origin courier selects the Kanban toolset around the real registry check and dispatch.
+**0774** (fork `a8ebd66ee6`): the trusted origin courier selects the Kanban toolset around the real registry check and dispatch.
 
 `receive` used `registry.get_definitions` against whatever toolsets the chat profile had enabled. A worker-only profile with no chat toolsets therefore returned `kanban_tool_unavailable` forever. `_dispatch_owner_tool` wraps `kanban_origin_adopt` and `kanban_create` in `scoped_kanban_toolset_selection(['kanban'])`. It does not write profile config or process env. A missing registration still returns `pending` / `kanban_tool_unavailable`. Child fences stay on the real dispatch path.
 

@@ -1,0 +1,129 @@
+From 54a602e0682209255abb6b673306f8dc9a796432 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:07:46 -0700
+Subject: [PATCH] fix(kanban remote notices): stop re-writing delivered notices
+ every sweep [daveey]
+
+sweep_remote_notices ran append_kanban_notice for every done/blocked remote card on
+every 30 s pass, even when the notice was already in the transcript: one state.db
+writer txn plus a lineage json scan each. On the MacBook (2893 replica cards, 441
+notices, 13 GB state.db) that held the Desktop backend near one core and contended
+with live turns. Remember persisted notice ids in-process; a restart re-checks once,
+a new event has a new id, an unwritable notice is retried.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tui_gateway/test_kanban_remote_notices.py | 49 +++++++++++++++++--
+ tui_gateway/kanban_remote_notices.py          | 19 +++++++
+ 2 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+index 83f56647fb..1a7e09f076 100644
+--- a/tests/tui_gateway/test_kanban_remote_notices.py
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -51,9 +51,9 @@ def test_remote_completion_reaches_only_addressed_chat_and_is_idempotent(tmp_pat
+             assert profile == "default"
+             yield db, db.get_compression_tip(sid) or sid
+ 
+-        for _ in range(2):
+-            out = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)
+-            assert len(out) == 2
++        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 2
++        # Already persisted: later passes skip it without opening the store (no writer txn per pass).
++        assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener) == []
+         messages = db.get_messages(CHAT)
+         assert len(messages) == 1
+         assert messages[0]["display_kind"] == "kanban_notice"
+@@ -347,3 +347,46 @@ def test_legacy_fresh_rows_reoffered_once_and_stale_rows_left(tmp_path, caplog):
+     assert "left 1 delivered notice" in caplog.text
+     assert krn.collect(PENDING_SESSION, "default", hub_db=replica, ledger=ledger, now=now,
+                        transcript_has=lambda key, tid: False) == []
++
++
++def test_sweep_skips_persisted_notices_without_opening_store_until_restart(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    krn._reset_for_tests()
++    _tid, replica = _replicate(tmp_path, f"FINAL SEND for @session:default@macbook/{CHAT}: memo proof")
++    opens = []
++    with SessionDB(tmp_path / "state.db") as db:
++        for sid in (CHAT, OTHER):
++            db.create_session(sid, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            opens.append(sid)
++            yield db, db.get_compression_tip(sid) or sid
++
++        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 2
++        assert len(opens) == 2
++        for _ in range(3):
++            assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener) == []
++        assert len(opens) == 2
++        krn._reset_for_tests()  # a restarted backend re-checks once and finds the rows: still one notice per chat
++        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 2
++        assert len(opens) == 4 and len(db.get_messages(CHAT)) == 1
++
++
++def test_sweep_does_not_remember_a_notice_it_could_not_write(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    krn._reset_for_tests()
++    _tid, replica = _replicate(tmp_path, "retry proof")
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        missing = True
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield (None, None) if missing or sid != CHAT else (db, sid)
++
++        assert not sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)
++        missing = False
++        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 1
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 9d71d05b81..0efbe8030a 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -407,9 +407,24 @@ def release(claim: dict, *, ledger: Optional[Path] = None) -> bool:
+         return False
+ 
+ 
++# [daveey] Notices this process already persisted (or found persisted), keyed (replica, profile, session, notice_id).
++# Without it every 30 s pass re-ran append_kanban_notice for every done/blocked remote card: one state.db writer txn
++# plus a lineage json scan each (441 per pass on the MacBook 2026-10-28, ~1 core of the Desktop backend, and write
++# contention for live turns). A restart re-checks each once; a new event has a new notice_id.
++_DELIVERED_MAX = 50_000
++_delivered: dict[tuple, None] = {}
++
++
++def _remember_delivered(key: tuple) -> None:
++    _delivered[key] = None
++    while len(_delivered) > _DELIVERED_MAX:
++        _delivered.pop(next(iter(_delivered)))
++
++
+ def _reset_for_tests() -> None:
+     global _index_memo
+     _index_memo = None
++    _delivered.clear()
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -481,9 +496,13 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+                     metadata = {"notice_id": event_key, "board": task.get("board", "default"),
+                                 "task_id": task["id"], "gateway": owner, "kanban_event_keys": [event_key]}
+                     text = format_notice(owner, key, task)
++                memo_key = (str(path), profile, sid, metadata["notice_id"])
++                if memo_key in _delivered:
++                    continue
+                 with session_db(profile, sid) as (db, tip):
+                     if db is not None and text:
+                         row_id = db.append_kanban_notice(tip, text, metadata)
++                        _remember_delivered(memo_key)
+                         delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
+                         at = _terminal_at(task)
+                         ack({"session": sid, "ref": f"{owner}/{key}",
+-- 
+2.55.0
+

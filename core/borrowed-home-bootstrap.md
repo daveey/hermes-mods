@@ -1,6 +1,6 @@
 # Activate dependencies before borrowed-home user code
 
-Patch 0655 (`bcf47021db`).
+Patch 0665 (`bcf47021db`).
 
 ## Behavior
 

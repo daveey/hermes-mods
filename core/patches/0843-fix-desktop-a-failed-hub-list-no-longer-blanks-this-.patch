@@ -1,0 +1,229 @@
+From 7adaa5306ee98531eafe21d4f15bddbf86969b1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:12:00 -0700
+Subject: [PATCH] fix(desktop): a failed hub list no longer blanks this Mac's
+ sidebar stripes [daveey]
+
+Rows of this Mac's own chats lost their stripe (periodic, waiting, stuck, done) for
+seconds to 16 minutes whenever the hub backend dropped. The sidebar list request
+follows the window's connection; when it failed on the hub, recordSessionListResult
+marked EVERY owner in $sessions stale, local included. mergeOfflineFallback then
+re-added the cold-start boot-snapshot copies of local chats (frozen at launch, no
+cron_active / kanban_* / goal stamps) and those painted over the live projects-tree
+rows. desktop.log shows each periodic->none flip at the exact second of a hub
+sidebar-list failure (15:46:35, 16:05:28, 16:22:42 PDT 2026-10-28).
+
+- recordSessionListResult: a failed list (or an error naming no connection) on a
+  REMOTE gateway marks only that gateway's owners stale; the primary's list still
+  covers everyone (it can carry other gateways' rows).
+- mergeOfflineFallback: once the own backend has a live row in the list, its boot
+  copies are never re-added (older chats paint from the stamped live tree).
+- stripe-transition trace: logs cron_active and names fallback rows source=fallback
+  (they were mislabelled project-tree, which hid this cause).
+
+Tests: offline-sessions (4 new: hub failure keeps local live, error scoping, no boot
+copies after own backend answered, cold start still paints boot copies; 3 fail on
+the old code), session-dot-state trace source. Store/sidebar/session-hooks suites
+green except voice-prefs (fails on origin/main too).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/store/offline-sessions.test.ts        | 55 +++++++++++++++++++
+ apps/desktop/src/store/offline-sessions.ts    | 29 +++++++++-
+ .../src/store/session-dot-state.test.ts       |  8 +++
+ apps/desktop/src/store/session-dot-state.ts   | 12 +++-
+ 4 files changed, 98 insertions(+), 6 deletions(-)
+
+diff --git a/apps/desktop/src/store/offline-sessions.test.ts b/apps/desktop/src/store/offline-sessions.test.ts
+index ea2e87d987..b6271ca5bb 100644
+--- a/apps/desktop/src/store/offline-sessions.test.ts
++++ b/apps/desktop/src/store/offline-sessions.test.ts
+@@ -278,6 +278,61 @@ describe('mergeOfflineFallback', () => {
+     ])
+   })
+ 
++  // [daveey] Boot-snapshot copies of this Mac's own chats: no activity stamps (cron_active, kanban_*).
++  const ownBoot = () =>
++    offlineSessionsFromReplica(
++      [rec('older', { gateway: 'macbook', local: true }), rec('recent', { gateway: 'macbook', local: true })],
++      gateway => (gateway === 'macbook' ? 'local' : undefined),
++      9_000,
++      { includeLocal: true }
++    )
++
++  it("a failed list on another gateway leaves this Mac's own rows live and adds no boot copies", () => {
++    const previous = [
++      live('recent', { connection_id: 'local', profile: 'default' }),
++      live('h1', { connection_id: 'hermes-hub', profile: 'default' })
++    ]
++
++    recordSessionListResult(previous, [], 'hermes-hub', 'default', [], true)
++    const merged = mergeOfflineFallback(previous, ownBoot())
++
++    expect(merged.find(r => r.id === 'recent')?.offline_cached).toBeUndefined()
++    expect(merged.find(r => r.id === 'h1')).toMatchObject({ offline_cached: true, offline_stale_list: true })
++    expect(ids(merged)).toEqual(['recent', 'h1'])
++  })
++
++  it('a backend error without connection_id belongs to the gateway the list was sent to', () => {
++    const previous = [
++      live('recent', { connection_id: 'local', profile: 'default' }),
++      live('h1', { connection_id: 'hermes-hub', profile: 'default' })
++    ]
++
++    recordSessionListResult(previous, [], 'hermes-hub', 'default', [{ profile: 'default' }])
++    const merged = mergeOfflineFallback(previous, [])
++
++    expect(merged.find(r => r.id === 'recent')?.offline_cached).toBeUndefined()
++    expect(merged.find(r => r.id === 'h1')?.offline_cached).toBe(true)
++  })
++
++  it("once this Mac's backend answered, a failed local list never re-adds its stamp-less boot copies", () => {
++    recordSessionListResult([], [], undefined, 'default', [], true)
++    const merged = mergeOfflineFallback([live('recent', { connection_id: 'local' })], ownBoot())
++
++    expect(ids(merged)).toEqual(['recent'])
++    expect(merged[0]).toMatchObject({ offline_stale_list: true })
++  })
++
++  it("on a cold start (no live row of this Mac yet) the boot copies of its chats still paint", () => {
++    recordSessionListResult([], [], undefined, 'default', [], true)
++
++    expect(ids(mergeOfflineFallback([], ownBoot())).sort()).toEqual(['older', 'recent'])
++    expect(ids(mergeOfflineFallback([live('h1', { connection_id: 'hermes-hub' })], ownBoot())).sort()).toEqual([
++      'h1',
++      'older',
++      'recent'
++    ])
++  })
++
+   it('keeps reference identity when nothing is added', () => {
+     const rows = [live('l1')]
+ 
+diff --git a/apps/desktop/src/store/offline-sessions.ts b/apps/desktop/src/store/offline-sessions.ts
+index 2a7088365b..b6bff9de51 100644
+--- a/apps/desktop/src/store/offline-sessions.ts
++++ b/apps/desktop/src/store/offline-sessions.ts
+@@ -127,13 +127,27 @@ export function recordSessionListResult(
+   }
+ 
+   const returnedOwners = new Set(incoming.map(row => ownerKey(row.connection_id, row.profile)))
++  // [daveey] The primary backend's list can carry other gateways' rows, so its failure is everyone's. A REMOTE
++  // backend's list answers only for that gateway: a failed list on the hub (the window's request scope follows the
++  // focused chat) used to mark this Mac's own rows stale too, so the sidebar swapped them for stamp-less fallback
++  // copies and every local stripe (periodic, waiting, stuck, done) blanked until the next local list. Primary rows
++  // carry no connection_id: one identity for both spellings.
++  const primary = $connectionsRegistry.get()?.primary?.trim() || 'local'
++  const gatewayOf = (id: null | string | undefined) => id?.trim() || primary
++  const requestGateway = gatewayOf(connection)
++  const covers = (ownerConnection: null | string | undefined, errorConnection?: null | string) =>
++    errorConnection?.trim()
++      ? gatewayOf(errorConnection) === gatewayOf(ownerConnection)
++      : requestGateway === primary || gatewayOf(ownerConnection) === requestGateway
+ 
+   for (const [key, owner] of owners) {
++    const onRequestGateway = gatewayOf(owner.connection_id) === requestGateway
++
+     const ownerFailed =
+-      failed ||
++      (failed && covers(owner.connection_id)) ||
+       errors.some(
+         error =>
+-          (!error.connection_id || error.connection_id === owner.connection_id) &&
++          covers(owner.connection_id, error.connection_id) &&
+           (error.profile === 'all' || profileOf(error.profile) === profileOf(owner.profile))
+       )
+ 
+@@ -141,7 +155,7 @@ export function recordSessionListResult(
+       next[key] = true
+     } else if (ownerFailed) {
+       next[key] = false
+-    } else if ((owner.connection_id || 'local') === (connection || 'local')) {
++    } else if (onRequestGateway && !failed) {
+       next[key] = true
+     }
+   }
+@@ -318,8 +332,17 @@ export function mergeOfflineFallback(
+     return effective
+   })
+ 
++  // [daveey] This Mac's own fallback rows are the cold-start boot snapshot: frozen at launch and without activity
++  // stamps (cron_active, kanban_*, goal_active, ...). Once the own backend has put any live row in the list it has
++  // answered this launch, and its older chats paint from the live (stamped) projects tree instead; re-adding the boot
++  // copies after a failed list blanked their stripes.
++  const ownBackendAnswered = live.some(
++    row => !row.offline_cached && (row.connection_id?.trim() || primary) === primary
++  )
++
+   const added = offline.filter(
+     row =>
++      !(ownBackendAnswered && (row.connection_id?.trim() || primary) === primary) &&
+       !freshOwners.has(ownerKey(row.connection_id, row.profile)) &&
+       freshness[ownerKey(row.connection_id, row.profile)] !== true &&
+       !seen.has(ownedIdentity(row, row.id))
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 6ef635c623..d14a7c8de2 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -815,6 +815,14 @@ describe('recordStripeTransition', () => {
+     expect(String(logLine.mock.calls[1][0])).toContain('cached done->none')
+     expect(String(logLine.mock.calls[1][0])).toContain('source=cache')
+ 
++    // [daveey] A replica/boot fallback row is named as such: it carries no activity stamps (cron_active, kanban_*).
++    const fallback = { ...row, id: 'fallback', offline_synced_at: 9_000 }
++    recordStripeTransition(fallback, 'periodic', 'background', 1_000)
++    recordStripeTransition(fallback, null, 'background', 2_000)
++    expect(String(logLine.mock.calls[2][0])).toContain('fallback periodic->none')
++    expect(String(logLine.mock.calls[2][0])).toContain('source=fallback')
++    expect(String(logLine.mock.calls[2][0])).toContain('cron_active=-')
++
+     expect(takeSessionListRefreshReason()).toBe('list-refetch')
+   })
+ 
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 6b6d736975..a72f0446a8 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -560,6 +560,7 @@ export type StripeTraceRow = Pick<SessionInfo, 'id'> &
+       SessionInfo,
+       | 'background_active'
+       | 'connection_id'
++      | 'cron_active'
+       | 'goal_active'
+       | 'kanban_active'
+       | 'kanban_blocked'
+@@ -569,6 +570,7 @@ export type StripeTraceRow = Pick<SessionInfo, 'id'> &
+       | 'kanban_stalled'
+       | 'kanban_waiting_on'
+       | 'offline_cached'
++      | 'offline_synced_at'
+       | 'profile'
+     >
+   >
+@@ -583,9 +585,12 @@ function rowListSource(row: StripeTraceRow): string {
+ 
+   const conn = row.connection_id ?? ''
+ 
+-  return $sessions.get().some(s => s.id === row.id && (s.connection_id ?? '') === conn)
+-    ? sessionListSource
+-    : 'project-tree'
++  if ($sessions.get().some(s => s.id === row.id && (s.connection_id ?? '') === conn)) {
++    return sessionListSource
++  }
++
++  // [daveey] A hub-replica / boot-snapshot fallback row (carries no activity stamps), not a projects-tree row.
++  return row.offline_synced_at !== undefined ? 'fallback' : 'project-tree'
+ }
+ 
+ /** Build the desktop.log line for one transition. Exported for tests. */
+@@ -608,6 +613,7 @@ export function formatStripeTransition(
+     ['kanban_waiting_on', row.kanban_waiting_on],
+     ['kanban_observed_at', row.kanban_observed_at],
+     ['goal_active', row.goal_active],
++    ['cron_active', row.cron_active],
+     ['background_active', row.background_active],
+     ['delegating', $delegatingSessionIds.get().includes(row.id)],
+     ['bg_running', $backgroundRunningSessionIds.get().includes(row.id)],
+-- 
+2.55.0
+

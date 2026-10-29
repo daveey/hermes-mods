@@ -1,0 +1,744 @@
+From 582e43bdd014ffdc9187b3cf4f6303e84892ccc0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:59:22 -0700
+Subject: [PATCH] kanban: FINAL SEND lines reach chats subscribed by a refused
+ worker send (#144)
+
+* feat(kanban): FINAL SEND lines in a completion summary reach the chat a refused worker send subscribed [daveey]
+
+* fix(kanban): carry remote completion notices through owner replicas [daveey]
+
+* fix(checkpoints): accept BOM in slow-folder JSON (inherited lint blocker) [daveey]
+
+* fix(kanban): dedupe notices across compression and opt in new completions [daveey]
+
+* fix(kanban): goal receipts compare the exact judged evidence, not the public preview
+
+* fix(kanban): reap drops a non-Popen so a missing poll() cannot fail the tick
+
+Spawn tests leave FakeProc doubles in _live_worker_procs. The dispatcher
+reaps those handles at the start of each tick, and proc.poll() then
+tracebacks into test_gateway_dispatcher_disables_corrupt_board_without_traceback.
+Drop entries that are not pollable. Also set check=False on the serve
+reexec helper so ruff PLW1510 on main does not fail this PR's CI.
+
+* kanban_db_notify: annotate os.kill liveness probe for footgun check
+
+* kanban_origin_ledger: match judged evidence against FINAL SEND-stripped event preview
+---
+ gateway/kanban_watchers_notifier.py           |   3 +-
+ hermes_cli/kanban_db.py                       |  31 +----
+ hermes_cli/kanban_db_completion_payload.py    |  27 ++++
+ hermes_cli/kanban_db_dispatch.py              |  14 +--
+ hermes_cli/kanban_final_send.py               |  64 ++++++++++
+ hermes_cli/kanban_origin_ledger.py            |   9 +-
+ hermes_state_messages.py                      |   6 +-
+ .../test_kanban_core_functionality.py         |  18 +++
+ tests/hermes_cli/test_kanban_goal_receipt.py  |  18 +++
+ tests/tools/test_checkpoint_slow_bom.py       |  13 ++
+ tests/tui_gateway/test_kanban_final_send.py   | 116 ++++++++++++++++++
+ .../tui_gateway/test_kanban_remote_notices.py |  97 +++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |  73 +++++++++++
+ tui_gateway/kanban_unloaded.py                |   2 +
+ tui_gateway/session_notifications.py          |  11 +-
+ 15 files changed, 461 insertions(+), 41 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_completion_payload.py
+ create mode 100644 hermes_cli/kanban_final_send.py
+ create mode 100644 tests/tools/test_checkpoint_slow_bom.py
+ create mode 100644 tests/tui_gateway/test_kanban_final_send.py
+ create mode 100644 tests/tui_gateway/test_kanban_remote_notices.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index f62e7e8800..c93f188a7a 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -396,7 +396,8 @@ def _fmt_completed(ev, n) -> tuple:
+     if payload_summary:
+         wake_handoff = _first_line(str(payload_summary), 200)
+     elif n.task and n.task.result:
+-        wake_handoff = _first_line(n.task.result, 160)
++        from hermes_cli.kanban_final_send import public_summary
++        wake_handoff = _first_line(public_summary(n.task.result), 160)
+     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
+     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 4e44b3ae82..7acde87f71 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2883,11 +2883,15 @@ def complete_task(
+         event_summary = handoff_summary
+         if prior_status == "review" and not event_summary:
+             event_summary = _REVIEW_APPROVED_NOTE
+-        completion_payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
++        from hermes_cli.kanban_db_completion_payload import completed_event_payload
++        completion_payload = completed_event_payload(result, event_summary, verified_cards, metadata)
+         if goal_event_id is not None:
+             conn.execute('UPDATE task_events SET run_id=? WHERE id=? AND task_id=?',
+                          (run_id, goal_event_id, task_id))
+             completion_payload['goal_verified_event_id'] = goal_event_id
++            # The preview above hides FINAL SEND blocks and is clipped; the origin ledger must
++            # compare the exact evidence the judge saw.
++            completion_payload['goal_evidence'] = (summary or result or '').strip()
+         if acceptance_event_id is not None:
+             conn.execute("UPDATE task_events SET run_id=? WHERE id=? AND task_id=?",
+                          (run_id, acceptance_event_id, task_id))
+@@ -2998,31 +3002,6 @@ def _cleaned_artifact_paths(metadata: Any) -> list[str]:
+     return [str(p).strip() for p in raw if isinstance(p, str) and str(p).strip()]
+ 
+ 
+-def _completed_event_payload(
+-    result: Optional[str], event_summary: Optional[str], verified_cards: list[str], metadata: Any,
+-) -> dict:
+-    """``completed`` event payload: first summary line (400 chars) so gateway
+-    notifiers / dashboard WS render without a second round-trip; verified
+-    cards; and ``metadata["artifacts"]`` promoted so the notifier can upload
+-    them as native attachments without fetching the run row."""
+-    # Mirror CLI's _show_voice_status: include STT/TTS provider availability so the user can tell at a
+-    # glance *why* voice mode isn't working ("STT provider: MISSING ..." is the common case). ``record_key``
+-    # mirrors the configured ``voice.record_key`` so the TUI can both bind it (frontend
+-    # ``isVoiceToggleKey``) and display it in /voice status — previously the TUI hardcoded Ctrl+B and
+-    # ignored the config (#18994).
+-    payload: dict = {
+-        "result_len": len(result) if result else 0,
+-        "summary": _first_line(event_summary, 400) or None,
+-    }
+-    if verified_cards:
+-        payload["verified_cards"] = verified_cards
+-    if isinstance(metadata, dict):
+-        cleaned = _cleaned_artifact_paths(metadata)
+-        if cleaned:
+-            payload["artifacts"] = cleaned
+-    return payload
+-
+-
+ def _flag_phantom_prose_refs(
+     conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+     summary: Optional[str], result: Optional[str], verified_cards: list[str],
+diff --git a/hermes_cli/kanban_db_completion_payload.py b/hermes_cli/kanban_db_completion_payload.py
+new file mode 100644
+index 0000000000..a925fde106
+--- /dev/null
++++ b/hermes_cli/kanban_db_completion_payload.py
+@@ -0,0 +1,27 @@
++"""Completion event data shared by Kanban notification consumers."""
++
++from typing import Any, Optional
++
++from hermes_cli.kanban_final_send import parse_final_sends, public_summary
++
++
++def completed_event_payload(
++    result: Optional[str], event_summary: Optional[str], verified_cards: list[str], metadata: Any,
++) -> dict:
++    """Keep the summary preview, addressed messages and artifacts on the durable event."""
++    from hermes_cli.kanban_db import _cleaned_artifact_paths, _first_line
++
++    payload: dict = {
++        "notice_version": 1,
++        "result_len": len(result) if result else 0,
++        "summary": _first_line(public_summary(event_summary), 400) or None,
++    }
++    if verified_cards:
++        payload["verified_cards"] = verified_cards
++    if final_sends := parse_final_sends(event_summary):
++        payload["final_sends"] = final_sends
++    if isinstance(metadata, dict):
++        cleaned = _cleaned_artifact_paths(metadata)
++        if cleaned:
++            payload["artifacts"] = cleaned
++    return payload
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 76beb3f8ce..328b138b5d 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -367,16 +367,14 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
+ 
+ 
+ def reap_worker_zombies() -> list[int]:
+-    """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
+-    every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
+-    parked by ``_default_spawn`` (the only way to learn a child's exit code
+-    there), so the rate-limit sentinel exit is classified on both hosts."""
++    """Reap registered worker handles. Drop a non-Popen so a missing poll() cannot traceback a tick."""
+     reaped: list[int] = []
+-    # Only our own workers: waitpid(-1) also stole wake-check probe children, and Python 3.14's
+-    # Popen then reported their exit as 0 (a false condition_met).
+     for pid, proc in list(_live_worker_procs.items()):
+-        returncode = proc.poll()
+-        if returncode is None:
++        poll = getattr(proc, "poll", None)
++        returncode = poll() if callable(poll) else None
++        if not isinstance(returncode, int):
++            if not callable(poll):
++                _live_worker_procs.pop(pid, None)
+             continue
+         _record_worker_exit(
+             pid, _wait_status_from_returncode(returncode) if returncode >= 0 else -returncode)
+diff --git a/hermes_cli/kanban_final_send.py b/hermes_cli/kanban_final_send.py
+new file mode 100644
+index 0000000000..a842caf1cc
+--- /dev/null
++++ b/hermes_cli/kanban_final_send.py
+@@ -0,0 +1,64 @@
++"""``FINAL SEND for @session:<ref>: <text>`` lines in a Kanban completion summary.
++
++A worker is refused a ``cross_session`` send into a human chat. The refusal subscribes that chat to the
++worker's own card; the worker then writes the message it wanted to send as a ``FINAL SEND`` line in its
++``kanban_complete`` summary. ``kanban_db.complete_task`` records the parsed blocks on the ``completed``
++event (``payload["final_sends"]``, keyed by session id) and the notifier shows a subscribed chat the block
++addressed to it in place of the generic "✔ Kanban <id> done — <summary>" line.
++
++Grammar: a line starting ``FINAL SEND for @session:<profile>[@<gateway>]/<session_id>:`` (optional ``**``/
++backtick/``-`` decoration). The text is the rest of that line plus every following line up to the next
++``FINAL SEND`` line. A chat only sees a block addressed to its own session id.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import Optional
++
++MAX_CHARS = 4000
++
++_HEAD = re.compile(
++    r"^[\s>*`_-]*FINAL[ _]SEND\s+for\s+`?@session:(?:[A-Za-z0-9_.-]+(?:@[A-Za-z0-9_.-]+)?/)?"
++    r"(?P<sid>[A-Za-z0-9_.-]+)`?\s*\**\s*:\s*\**(?P<rest>.*)$",
++    re.IGNORECASE,
++)
++
++
++def public_summary(summary: Optional[str]) -> str:
++    """Only prose before the first addressed block is a broadcast summary."""
++    lines = []
++    for line in (summary or "").splitlines():
++        if _HEAD.match(line):
++            break
++        lines.append(line)
++    return "\n".join(lines).strip()
++
++
++def parse_final_sends(summary: Optional[str]) -> dict[str, str]:
++    """``{session_id: text}`` for every ``FINAL SEND`` block in *summary* (first block per session wins)."""
++    if not summary:
++        return {}
++    blocks: list[tuple[str, list[str]]] = []
++    for line in str(summary).splitlines():
++        m = _HEAD.match(line)
++        if m:
++            blocks.append((m.group("sid"), [m.group("rest").strip()]))
++        elif blocks:
++            blocks[-1][1].append(line.rstrip())
++    out: dict[str, str] = {}
++    for sid, lines in blocks:
++        text = "\n".join(lines).strip()
++        if text and sid not in out:
++            out[sid] = text[:MAX_CHARS]
++    return out
++
++
++def final_send_for_chat(payload: Optional[dict], chat_id: str) -> Optional[str]:
++    """The ``FINAL SEND`` text a ``completed`` event addresses to subscription *chat_id*, or None.
++    ``tui`` rows hold the bare session id, ``hub`` rows ``<gw>/<profile>/<sid>``."""
++    sends = (payload or {}).get("final_sends")
++    if not isinstance(sends, dict) or not chat_id:
++        return None
++    text = sends.get(str(chat_id).rsplit("/", 1)[-1])
++    return text if isinstance(text, str) and text else None
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 6ceaeef15e..ae9c98d9c6 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -180,8 +180,11 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+             # [daveey] The completed event keeps only the handoff's first line (400 chars). A longer or multi-line
+             # handoff is bound through the closing run, which stores it whole, so it can still match the judged
+             # evidence; comparing against the event alone never released such a card.
++            # The event preview hides FINAL SEND blocks (public_summary), so accept that form of the first line too.
++            from hermes_cli.kanban_final_send import public_summary
+             evidence_ok = isinstance(judged, str) and (judged == recorded or (
+-                _first_line(judged, 400) == recorded and run is not None and run[0] == event[1]
++                recorded in (_first_line(judged, 400), _first_line(public_summary(judged), 400) or '')
++                and run is not None and run[0] == event[1]
+                 and judged == (run[4] or '').strip()))
+             goal_verified = bool(isinstance(subject, dict) and proof.get('snapshot') == digest(subject)
+                                  and subject.get('task_id') == task['id']
+@@ -210,6 +213,10 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+             legacy = bool(legacy and contract_ok)
+             verified = legacy
+     payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    # Only post-rollout events opt in: do not replay the replica's historical done-card inventory.
++    if terminal and event and json.loads(event[3] or '{}').get('notice_version') == 1:
++        payload['completion_notice'] = {'event_id': event[0], 'created_at': event[2],
++                                        'payload': json.loads(event[3] or '{}')}
+     if row[0] in ('scheduled', 'blocked'):
+         from hermes_cli.kanban_wait_replica import observe_wait
+         payload['wait_observation'] = observe_wait(conn, task['id'], now=now)
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index 8ebdff0599..f57070b391 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -500,9 +500,9 @@ class SessionMessagesMixin:
+         from hermes_state_sessions import _LINEAGE_CTE_SQL  # watermark is lineage-stamped
+ 
+         def _do(conn):
+-            existing = conn.execute(
+-                "SELECT m.id FROM messages m WHERE m.session_id = ? AND m.display_kind = 'kanban_notice' "
+-                "AND json_extract(m.display_metadata, '$.notice_id') = ? LIMIT 1", (session_id, notice_id)).fetchone()
++            existing = conn.execute(_LINEAGE_CTE_SQL +
++                "SELECT m.id FROM messages m JOIN lineage l ON m.session_id=l.id WHERE m.display_kind='kanban_notice' "
++                "AND json_extract(m.display_metadata, '$.notice_id') = ? LIMIT 1", (session_id, session_id, notice_id)).fetchone()
+             if existing is None and keys:
+                 existing = conn.execute(
+                     _LINEAGE_CTE_SQL + " SELECT m.id FROM messages m, "
+diff --git a/tests/hermes_cli/test_kanban_core_functionality.py b/tests/hermes_cli/test_kanban_core_functionality.py
+index 55dd676f62..ec0d4731d7 100644
+--- a/tests/hermes_cli/test_kanban_core_functionality.py
++++ b/tests/hermes_cli/test_kanban_core_functionality.py
+@@ -692,6 +692,12 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
+         def __init__(self):
+             self.pid = 99999
+ 
++        def poll(self):
++            # reap_worker_zombies polls registered Popen handles. Without
++            # this, the double stays in _live_worker_procs and a later
++            # dispatcher tick in this process logs an AttributeError.
++            return None
++
+     def fake_popen(cmd, **kwargs):
+         captured["cmd"] = cmd
+         captured["env"] = kwargs.get("env", {})
+@@ -708,6 +714,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
+         pid = kbd._default_spawn(task, str(workspace))
+         assert pid == 99999
+     finally:
++        kbd._live_worker_procs.pop(99999, None)
+         conn.close()
+ 
+     cmd = captured["cmd"]
+@@ -725,6 +732,17 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
+     assert env.get("HERMES_PROFILE") == "some-profile"
+ 
+ 
++def test_reap_drops_non_popen_without_traceback(monkeypatch):
++    """A spawn-test double with no poll() must not traceback a later tick."""
++
++    class BareProc:
++        pid = 99991
++
++    monkeypatch.setattr(kbd, "_live_worker_procs", {99991: BareProc()})
++    assert kbd.reap_worker_zombies() == []
++    assert 99991 not in kbd._live_worker_procs
++
++
+ # ---------------------------------------------------------------------------
+ # Per-task force-loaded skills
+ # ---------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_goal_receipt.py b/tests/hermes_cli/test_kanban_goal_receipt.py
+index 694918a277..065ae5b048 100644
+--- a/tests/hermes_cli/test_kanban_goal_receipt.py
++++ b/tests/hermes_cli/test_kanban_goal_receipt.py
+@@ -88,3 +88,21 @@ def test_completion_entry_records_real_goal_success(board, monkeypatch, entry):
+     with kbc.connect_closing() as conn:
+         conn.execute('BEGIN')
+         assert ledger.observe_owner_task(conn, {'id': tid, 'status': 'done'}, now=1000)['origin_observation']['verified']
++
++
++@pytest.mark.parametrize('evidence', [
++    'FINAL SEND for @session:default/20261026_abc: hello',
++    'Tested\nsecond line\nFINAL SEND for @session:default/20261026_abc: hello',
++])
++def test_goal_release_survives_final_send_in_evidence(board, monkeypatch, evidence):
++    """The public preview hides FINAL SEND blocks; the receipt must still match the judged text."""
++    monkeypatch.setattr(kanban_tools, '_goal_judge_available', lambda: True)
++    monkeypatch.setattr(kanban_tools, 'judge_goal', lambda **kw: ('done', 'verified', None, None, False))
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Build', assignee='default', goal_mode=True,
++                             completion_contract='local-only')
++        proof = kanban_tools._goal_gate('kanban_complete', kb.get_task(conn, tid), tid, evidence)
++        assert kb.complete_task(conn, tid, summary=evidence, goal_verification=proof)
++        conn.execute('BEGIN')
++        observed = ledger.observe_owner_task(conn, {'id': tid, 'status': 'done'}, now=1000)
++        assert observed['origin_observation']['verified'] is True
+diff --git a/tests/tools/test_checkpoint_slow_bom.py b/tests/tools/test_checkpoint_slow_bom.py
+new file mode 100644
+index 0000000000..4753fb0ec0
+--- /dev/null
++++ b/tests/tools/test_checkpoint_slow_bom.py
+@@ -0,0 +1,13 @@
++"""The checkpoint back-off JSON accepts files written with or without a BOM."""
++
++import pytest
++
++from tools.checkpoint_staging import _read_slow, _slow_file
++
++
++@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
++def test_slow_folder_backoff_survives_bom(tmp_path, encoding):
++    path = _slow_file(tmp_path)
++    path.parent.mkdir(parents=True)
++    path.write_text('{"folder": 12345.0}', encoding=encoding)
++    assert _read_slow(tmp_path) == {"folder": 12345.0}
+diff --git a/tests/tui_gateway/test_kanban_final_send.py b/tests/tui_gateway/test_kanban_final_send.py
+new file mode 100644
+index 0000000000..af3413daa6
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_final_send.py
+@@ -0,0 +1,116 @@
++"""A chat a worker was refused into is subscribed to the worker's card and gets its message on completion.
++
++The cross_session refusal (session-mentions plugin) subscribes the chat (``tui`` row for a local chat,
++``hub`` row ``<gw>/<profile>/<sid>`` for a chat on another gateway). On completion that chat gets the
++standard "✔ Kanban <id> done" notice; a ``FINAL SEND for @session:...:`` line addressed to it replaces
++the generic summary.
++"""
++
++from types import SimpleNamespace
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli.kanban_final_send import final_send_for_chat, parse_final_sends
++from tui_gateway.server import _collect_kanban_notifications, _format_kanban_event_text
++
++CHAT = "20261023_204125_cb2658"
++OTHER = "20261022_204322_4d8ce1"
++MSG = "Result: the deploy is live.\nSecond line of the message."
++
++
++def _task(chat_id: str = CHAT, platform: str = "tui") -> str:
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="worker card", assignee="default")
++        kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
++        return tid
++    finally:
++        conn.close()
++
++
++def _complete(tid: str, summary: str) -> None:
++    conn = kbc.connect()
++    try:
++        kb.complete_task(conn, tid, summary=summary)
++    finally:
++        conn.close()
++
++
++def test_subscribed_chat_gets_the_standard_done_notice():
++    tid = _task()
++    _complete(tid, "shipped the fix")
++    texts = _collect_kanban_notifications({"session_key": CHAT})
++    assert len(texts) == 1
++    assert texts[0].startswith("✔ ") and f"Kanban {tid} done" in texts[0]
++    assert "shipped the fix" in texts[0]
++
++
++def test_final_send_line_addressed_to_the_chat_replaces_the_summary():
++    tid = _task()
++    _complete(tid, f"Did the work.\nFINAL SEND for @session:default@macbook/{CHAT}: {MSG}")
++    (text,) = _collect_kanban_notifications({"session_key": CHAT})
++    assert f"Kanban {tid} done" in text
++    assert MSG in text
++    assert "Did the work." not in text
++
++
++def test_final_send_for_another_chat_is_not_shown_here():
++    tid = _task()
++    _complete(tid, f"generic summary\nFINAL SEND for @session:default@macbook/{OTHER}: private to the other chat")
++    (text,) = _collect_kanban_notifications({"session_key": CHAT})
++    assert "generic summary" in text
++    assert "private to the other chat" not in text
++
++
++def test_two_final_sends_each_reach_only_their_own_chat():
++    summary = (
++        f"FINAL SEND for @session:default@macbook/{CHAT}: for the first\n"
++        f"FINAL SEND for @session:default/{OTHER}: for the second"
++    )
++    sends = parse_final_sends(summary)
++    assert sends == {CHAT: "for the first", OTHER: "for the second"}
++
++
++def test_hub_subscription_row_matches_by_session_id():
++    ev = SimpleNamespace(kind="completed", payload={"summary": "x", "final_sends": {CHAT: MSG}})
++    task = SimpleNamespace(title="worker card", assignee="default", result=None)
++    sub = {"task_id": "t_abc", "chat_id": f"macbook/default/{CHAT}"}
++    text = _format_kanban_event_text(sub, task, ev, "")
++    assert MSG in text and "Kanban t_abc done" in text
++    other = {"task_id": "t_abc", "chat_id": f"macbook/default/{OTHER}"}
++    assert MSG not in _format_kanban_event_text(other, task, ev, "")
++
++
++def test_final_send_first_line_is_not_broadcast_to_other_subscribers():
++    tid = _task()
++    _complete(tid, f"FINAL SEND for @session:default@macbook/{OTHER}: private message")
++    (text,) = _collect_kanban_notifications({"session_key": CHAT})
++    assert "private message" not in text
++
++
++def test_result_fallback_does_not_broadcast_addressed_text():
++    from gateway.kanban_watchers_notifier import _fmt_completed
++    task = SimpleNamespace(title="worker", result=f"FINAL SEND for @session:default/{OTHER}: private result")
++    ev = SimpleNamespace(kind="completed", payload={"summary": None})
++    text = _format_kanban_event_text({"task_id": "t_example", "chat_id": CHAT}, task, ev, "")
++    assert "private result" not in text
++    text, _, _ = _fmt_completed(ev, SimpleNamespace(task=task, head="card", title="worker"))
++    assert "private result" not in text
++
++
++def test_final_send_only_replaces_completed_events():
++    ev = SimpleNamespace(kind="blocked", payload={"reason": "need input", "final_sends": {CHAT: MSG}})
++    task = SimpleNamespace(title="t", assignee="default", result=None)
++    text = _format_kanban_event_text({"task_id": "t_abc", "chat_id": CHAT}, task, ev, "")
++    assert "blocked" in text and MSG not in text
++
++
++def test_parser_accepts_decorated_and_bare_refs_and_ignores_junk():
++    assert parse_final_sends("**FINAL SEND for @session:default/abc**: hi") == {"abc": "hi"}
++    assert parse_final_sends("- `FINAL SEND for @session:p@gw/abc`: hi\nmore") == {"abc": "hi\nmore"}
++    assert parse_final_sends("FINAL SEND for nobody: hi") == {}
++    assert parse_final_sends("FINAL SEND for @session:default/abc:   ") == {}
++    assert parse_final_sends(None) == {}
++    assert final_send_for_chat({"final_sends": {"abc": "hi"}}, "gw/default/abc") == "hi"
++    assert final_send_for_chat({}, "abc") is None
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+new file mode 100644
+index 0000000000..7abc5add43
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -0,0 +1,97 @@
++"""A remote owner publishes completion evidence; the destination persists one passive notice."""
++
++import contextlib
++import json
++import sqlite3
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli.kanban_origin_ledger import observe_owner_task
++from hermes_state import SessionDB
++from tui_gateway.kanban_remote_notices import sweep_remote_notices
++
++CHAT = "20261026_235722_bef6c6"
++OTHER = "20261022_204322_4d8ce1"
++
++
++def _replicate(tmp_path, summary, *, legacy=False):
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="remote worker", assignee="default")
++        for sid in (CHAT, OTHER):
++            kbn.add_notify_sub(conn, task_id=tid, platform="hub", chat_id=f"macbook/default/{sid}")
++        kb.complete_task(conn, tid, summary=summary)
++        if legacy:
++            conn.execute("UPDATE task_events SET payload=json_remove(payload,'$.notice_version') WHERE task_id=?", (tid,))
++            conn.commit()
++        task = {"id": tid, "status": "done", "title": "remote worker", "board": "default",
++                "gateway": "hub", "profile": "default", "assignee": "default", "origin_bindings": [],
++                "sessions": [{"gw": "macbook", "profile": "default", "session": sid, "rel": "shepherd"}
++                             for sid in (CHAT, OTHER)]}
++        conn.execute("BEGIN")
++        published = observe_owner_task(conn, task, now=0)
++        conn.rollback()
++    replica = tmp_path / "hub.db"
++    with sqlite3.connect(replica) as conn:
++        conn.execute("CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT)")
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?)", ("hub", "tasks", f"default/default/{tid}", json.dumps(published)))
++    return tid, replica
++
++
++def test_remote_completion_reaches_only_addressed_chat_and_is_idempotent(tmp_path):
++    tid, replica = _replicate(tmp_path, f"FINAL SEND for @session:default@macbook/{CHAT}: remote proof")
++    with SessionDB(tmp_path / "state.db") as db:
++        for sid in (CHAT, OTHER):
++            db.create_session(sid, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            assert profile == "default"
++            yield db, db.get_compression_tip(sid) or sid
++
++        for _ in range(2):
++            out = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)
++            assert len(out) == 2
++        messages = db.get_messages(CHAT)
++        assert len(messages) == 1
++        assert messages[0]["display_kind"] == "kanban_notice"
++        assert "remote proof" in messages[0]["content"] and tid in messages[0]["content"]
++        assert "remote proof" not in db.get_messages(OTHER)[0]["content"]
++        db.end_session(CHAT, "compression")
++        db.create_session("continuation", "desktop", parent_session_id=CHAT)
++        sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)
++        assert not db.get_messages("continuation")
++        assert len(db.get_messages(CHAT)) == 1
++        assert not sweep_remote_notices(replica_path=replica, gateway="stranger", session_db=opener)
++
++
++def test_remote_generic_notice_and_busy_retry(tmp_path):
++    _tid, replica = _replicate(tmp_path, "generic completion proof")
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        busy = True
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            if busy:
++                raise RuntimeError("busy")
++            yield (db, sid) if sid == CHAT else (None, None)
++
++        assert not sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)
++        busy = False
++        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 1
++        assert "generic completion proof" in db.get_messages(CHAT)[0]["content"]
++
++
++def test_legacy_done_cards_are_not_replayed_on_rollout(tmp_path):
++    _tid, replica = _replicate(tmp_path, "historical completion", legacy=True)
++    assert not sweep_remote_notices(replica_path=replica, gateway="macbook")
++    with sqlite3.connect(replica) as conn:
++        task = json.loads(conn.execute("SELECT data FROM replica").fetchone()[0])
++        assert "completion_notice" not in task
++
++
++def test_absent_replica_is_read_only_and_not_created(tmp_path):
++    path = tmp_path / "absent.db"
++    assert sweep_remote_notices(replica_path=path, gateway="macbook") == []
++    assert not path.exists()
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index b4b3b9b22b..563f3d3cfd 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -20,11 +20,13 @@ from __future__ import annotations
+ 
+ import contextlib
+ import json
++import logging
+ import os
+ import sqlite3
+ import threading
+ import time
+ from pathlib import Path
++from types import SimpleNamespace
+ from typing import Any, Callable, Optional
+ 
+ FRESH_S = 6 * 3600.0
+@@ -198,3 +200,74 @@ def release(claim: dict, *, ledger: Optional[Path] = None) -> bool:
+ def _reset_for_tests() -> None:
+     global _index_memo
+     _index_memo = None
++
++
++logger = logging.getLogger(__name__)
++
++
++@contextlib.contextmanager
++def _session_db(profile, sid):
++    from hermes_cli.profiles import get_profile_dir
++    from hermes_state import SessionDB
++
++    path = get_profile_dir(profile) / "state.db"
++    if not path.is_file():
++        yield None, None
++        return
++    db = SessionDB(path)
++    try:
++        yield (db, db.get_compression_tip(sid) or sid) if db.get_session(sid) else (None, None)
++    finally:
++        db.close()
++
++
++def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session_db) -> list[dict]:
++    """Read owner completion evidence and persist addressed notices exactly once.
++
++    SessionDB deduplicates by owner+board+card+event+destination in its writer
++    transaction. Busy chats refuse the write; an unchanged replica is retried
++    on the next sweep. Kept beside collect() so a background sweep still
++    delivers FINAL SEND lines when no chat is polling.
++    """
++    from hermes_cli.kanban_origin import _hub_db, gateway_names
++    from tui_gateway.session_notifications import _format_kanban_event_text
++
++    path = replica_path if replica_path is not None else _hub_db()
++    if path is None:
++        return []
++    me = gateway if gateway is not None else gateway_names()[0]
++    if not me:
++        return []
++    try:
++        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
++            rows = conn.execute("SELECT gw,key,data FROM replica WHERE coll='tasks' AND gw!=?", (me,)).fetchall()
++    except sqlite3.Error:
++        logger.debug("remote Kanban replica unavailable", exc_info=True)
++        return []
++    delivered = []
++    for owner, key, raw in rows:
++        try:
++            task = json.loads(raw)
++            notice = task.get("completion_notice")
++            if task.get("status") != "done" or not isinstance(notice, dict):
++                continue
++            for link in task.get("sessions", []):
++                if link.get("rel") != "shepherd" or link.get("gw") != me:
++                    continue
++                profile, sid = link.get("profile"), link.get("session")
++                if not profile or not sid:
++                    continue
++                event_id = notice["event_id"]
++                metadata = {"notice_id": f"remote:{owner}:{key}:{event_id}:{profile}:{sid}",
++                            "board": task.get("board", "default"), "task_id": task["id"],
++                            "gateway": owner, "event_ids": [event_id]}
++                sub = {"task_id": task["id"], "chat_id": f"{me}/{profile}/{sid}"}
++                ev = SimpleNamespace(kind="completed", payload=notice["payload"])
++                text = _format_kanban_event_text(sub, SimpleNamespace(**task), ev, metadata["board"])
++                with session_db(profile, sid) as (db, tip):
++                    if db is not None:
++                        row_id = db.append_kanban_notice(tip, text, metadata)
++                        delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
++        except Exception:
++            logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
++    return delivered
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 0626bce4f6..a805d0e095 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -454,6 +454,8 @@ def _loop(stop: threading.Event) -> None:
+     stop.wait(_env_float("HERMES_KANBAN_UNLOADED_FIRST_S", FIRST_RUN_DELAY_S))
+     while not stop.is_set():
+         try:
++            from tui_gateway.kanban_remote_notices import sweep_remote_notices
++            sweep_remote_notices()
+             sweep_once(live_session_ids(), grace_s=grace)
+         except Exception:
+             logger.warning("kanban unloaded sweep failed", exc_info=True)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 5dece42f76..8ee6772024 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -425,8 +425,9 @@ def _kb_first_line(value: Any, limit: int) -> str:
+ 
+ 
+ def _kb_completed(task, payload: dict, title: str) -> str:
++    from hermes_cli.kanban_final_send import public_summary
+     handoff = (_kb_first_line(payload["summary"], 200) if payload.get("summary")
+-               else _kb_first_line(task.result, 160) if getattr(task, "result", None) else "")
++               else _kb_first_line(public_summary(getattr(task, "result", None)), 160))
+     return f" done — {title}{handoff}"
+ 
+ 
+@@ -466,7 +467,13 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
+     title = (getattr(task, "title", None) or task_id)[:120]
+     who = getattr(task, "assignee", None) or ""
+     prefix = f"{glyph} " + (f"[{board_slug}] " if board_slug else "") + (f"@{who} " if who else "")
+-    return f"{prefix}Kanban {task_id}{fmt(task, getattr(ev, 'payload', None) or {}, title)}"
++    payload = getattr(ev, "payload", None) or {}
++    if getattr(ev, "kind", "") == "completed":
++        # A worker refused a send into this chat put its message in the summary as a FINAL SEND line. [daveey]
++        from hermes_cli.kanban_final_send import final_send_for_chat
++        if final := final_send_for_chat(payload, str(sub.get("chat_id") or "")):
++            return f"{prefix}Kanban {task_id} done — {title}\n{final}"
++    return f"{prefix}Kanban {task_id}{fmt(task, payload, title)}"
+ 
+ 
+ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # Fresh Kanban claims: heartbeat reset and lease echo fencing
 
-Patch: `0523`. Fork commit: `36df211821def79e500d656bba07c299b84ba156`.
+Patch: `0530`. Fork commit: `36df211821def79e500d656bba07c299b84ba156`.
 
 ## Behavior
 
@@ -30,6 +30,6 @@ Apply the fork commit, or this patch on a compatible fork with the existing cent
 
 Core-only: claim transaction and sync apply are database boundaries, not plugin hooks. This changes no timeout policy. The lease response must include its authoritative task version to establish the grant fence; older clients without it retain legacy behavior. Live deployment is separate from passing tests; do not restart active chats to force it.
 
-## Follow-up patch (0558)
+## Follow-up patch (0543)
 
-**0558** is a test-only change: `tests/hermes_cli/test_kanban_core_functionality.py` now accepts that a claim seeds the run heartbeat, and the stale-run test asserts it is unchanged.
+**0543** is a test-only change: `tests/hermes_cli/test_kanban_core_functionality.py` now accepts that a claim seeds the run heartbeat, and the stale-run test asserts it is unchanged.

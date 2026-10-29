@@ -422,7 +422,7 @@ git am -3 --empty=keep ~/code/hermes-mods/core/patches/{0001,0002,0003,0005,0006
 After that:
 
 - The Python fixes (0005, 0006, 0009) take effect when the gateway or backend restarts.
-- The desktop fixes (0001–0003, 0053) need a rebuilt app: `hermes desktop --build-only --force-build`. On macOS, set
+- The desktop fixes (0001, 0002, 0003, 0053) need a rebuilt app: `hermes desktop --build-only --force-build`. On macOS, set
   `APPLE_SIGNING_IDENTITY`, otherwise the build is ad-hoc signed.
 - None of the seven changes the RPC contract, i18n locale files, or the keybind registry, so there's nothing to
   regenerate.

@@ -1,6 +1,6 @@
 # Remote card references are not phantom references
 
-Patch 0650 (`63ab7b706a`).
+Patch 0659 (`63ab7b706a`).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ Completion checks local references plus replica task ids. Diagnostic projection 
 
 ## Applying
 
-Apply 0650 after the Kanban diagnostics and hub replica patches with `git am -3`.
+Apply 0659 after the Kanban diagnostics and hub replica patches with `git am -3`.
 
 ## Gotchas
 

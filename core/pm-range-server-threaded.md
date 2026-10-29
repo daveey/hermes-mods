@@ -1,6 +1,6 @@
 # Test range server is threaded so paused downloads stop in 0.04 s
 
-Patch: 0694 (daveey/hermes `a081ba9470`).
+Patch: 0706 (daveey/hermes `a081ba9470`).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ No new test: the change is to a test helper. Per the commit message, the 22 file
 
 ## Applying
 
-`git am -3` 0694 in series order.
+`git am -3` 0706 in series order.
 
 ## Gotchas
 

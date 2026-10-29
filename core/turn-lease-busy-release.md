@@ -1,6 +1,6 @@
 # Turn lease: a release that hit a busy state.db does not block the next turn
 
-Patch: 0736 (fork `1611048a7c`).
+Patch: 0876 (fork `1611048a7c`).
 
 ## Behavior
 
@@ -34,7 +34,7 @@ Re-run for this mirror on fork `origin/main` `a65917ae05`: the file passes (27 t
 
 ## Applying
 
-Apply after 0735 with `git am -3`. Numbering follows fork order after the already-published 0729/0730.
+Apply after 0875 with `git am -3`. Numbering follows fork order after the already-published 0877/0879.
 
 ## Gotchas
 

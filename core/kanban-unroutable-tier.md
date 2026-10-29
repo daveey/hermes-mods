@@ -1,6 +1,6 @@
 # Keep the profile model when a chosen class is unroutable
 
-Patch 0645 (`c92c6a0099`).
+Patch 0654 (`c92c6a0099`).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ An automatically tier-chosen class without an eligible route on this host leaves
 
 ## Applying
 
-Apply 0645 after the model-tier and model-class-routing patches with `git am -3`.
+Apply 0654 after the model-tier and model-class-routing patches with `git am -3`.
 
 ## Gotchas
 

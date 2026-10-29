@@ -23,7 +23,7 @@ was off screen.
 
 ## Behavior
 
-### Durable CLI writers (0360)
+### Durable CLI writers (0362)
 
 Desktop admission now checks the SQLite conversation writer even with a warm active-session registry. It refuses promptly instead of waiting for the long writer timeout. `session.take_over` requests a holder-qualified cooperative handoff and acknowledges only actual release; replacement holders and profile mismatches are rejected. A CLI takeover latch prevents automatic reacquisition, including after compression. Accepted late-race row identity is retained for the existing Take over/reload exactly-once recovery.
 
@@ -103,7 +103,7 @@ The terminal origin guard rejects detached `hermes chat --continue TITLE --creat
 
 ## How it works
 
-0360 adds durable-writer preflight and holder-qualified cooperative release before the older registry takeover flow below. The CLI latch is preserved across compression; the SQLite lease is not deleted and no process is killed.
+0362 adds durable-writer preflight and holder-qualified cooperative release before the older registry takeover flow below. The CLI latch is preserved across compression; the SQLite lease is not deleted and no process is killed.
 
 ### Background: active-session leases (stock)
 
@@ -225,7 +225,7 @@ from a client-less sibling runtime in the **same process**. Nothing in stock ups
 
 ## Code
 
-0360 changes `agent/turn_facade_lease.py`, `hermes_cli/active_sessions.py`, `hermes_cli/cli_chat_turn_mixin.py`, `hermes_state_compression.py`, `tui_gateway/session_lifecycle.py`, `tui_gateway/methods_session_takeover.py`, `tui_gateway/prompt_turn.py`, `tools/terminal_tool.py`, and `tools/terminal_tool_guards.py`. The excerpts below describe the earlier registry protocol, not the newer durable preflight.
+0362 changes `agent/turn_facade_lease.py`, `hermes_cli/active_sessions.py`, `hermes_cli/cli_chat_turn_mixin.py`, `hermes_state_compression.py`, `tui_gateway/session_lifecycle.py`, `tui_gateway/methods_session_takeover.py`, `tui_gateway/prompt_turn.py`, `tools/terminal_tool.py`, and `tools/terminal_tool_guards.py`. The excerpts below describe the earlier registry protocol, not the newer durable preflight.
 
 The excerpts below are the core of each patch. See the patch files for the complete diff.
 
@@ -485,7 +485,7 @@ i18n (0014) adds the keys `assistant.thread.errorTakeOver`, `errorTakeOverUnconf
 
 ## Tests
 
-0360 adds `tests/tui_gateway/test_cli_durable_takeover.py`, `test_cli_takeover_adversarial.py`, `test_cli_takeover_full_turn.py`, `test_durable_takeover_recovery.py`, and `tests/tools/test_terminal_background_user_chat.py`. The implementation handoff reports 703 delta-file/adversarial passes; narrower overlapping runs are not additive. The full-turn fixture uses real cross-process AIAgent and SQLite through Desktop `message.complete`, with a stub at the provider boundary. No live Electron/provider/deployment proof is claimed.
+0362 adds `tests/tui_gateway/test_cli_durable_takeover.py`, `test_cli_takeover_adversarial.py`, `test_cli_takeover_full_turn.py`, `test_durable_takeover_recovery.py`, and `tests/tools/test_terminal_background_user_chat.py`. The implementation handoff reports 703 delta-file/adversarial passes; narrower overlapping runs are not additive. The full-turn fixture uses real cross-process AIAgent and SQLite through Desktop `message.complete`, with a stub at the provider boundary. No live Electron/provider/deployment proof is claimed.
 
 Python. Use the repo runner (AGENTS.md: never bare `pytest`):
 
@@ -531,7 +531,7 @@ npx vitest run --project electron electron/remote-lifecycle.test.ts   # 0060
 - `remote-lifecycle.test.ts`: `buildSpawnCommand` puts `HERMES_DESKTOP_CLIENT_HOST=<host>` after
   `HERMES_DESKTOP=1`, strips shell metacharacters from a hostile name, and omits the variable for an empty one.
 
-Verified on upstream/main (`e06df9c2ea`) with 0001–0015 applied and 0013 resolved as described below:
+Verified on upstream/main (`e06df9c2ea`) with 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015 applied and 0013 resolved as described below:
 
 - Python: 28 tests passed.
 - vitest: 5 files, 123 tests passed.
@@ -539,10 +539,10 @@ Verified on upstream/main (`e06df9c2ea`) with 0001–0015 applied and 0013 resol
 
 ## Applying
 
-For 0360 apply the complete ordered series at the merge-base. Update both gateway and CLI participants separately; publishing a patch does not activate either.
+For 0362 apply the complete ordered series at the merge-base. Update both gateway and CLI participants separately; publishing a patch does not activate either.
 
 ```bash
-cd ~/.hermes/hermes-agent        # on upstream/main, after 0001–0012
+cd ~/.hermes/hermes-agent        # on upstream/main, after 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012
 git am -3 --empty=keep ~/code/hermes-mods/core/patches/0013-feat-sessions-take-over-a-chat-open-in-another-Herme.patch
 # -> CONFLICT in tui_gateway/server.py (see below); resolve, git add, git am --continue
 git am -3 --empty=keep ~/code/hermes-mods/core/patches/0014-feat-desktop-Take-over-here-on-a-chat-open-in-anothe.patch
@@ -577,7 +577,7 @@ Every other file in 0013 merges cleanly. All the helpers it calls already exist 
 | `spawn_context_thread`                                                                                      | `agent/memory_provider.py`              |
 | `env_float`                                                                                                 | `tui_gateway/_env.py`                   |
 
-With that resolution, 0014–0030 still apply in order. 0020 later appends `"session.title.suggest"` to the same
+With that resolution, 0014, 0015, 0016, 0017, 0018, 0019, 0020, 0021, 0022, 0023, 0024, 0025, 0026, 0027, 0028, 0029, 0030 still apply in order. 0020 later appends `"session.title.suggest"` to the same
 frozenset; `-3` merges it fine.
 
 Dependencies:
@@ -587,14 +587,14 @@ Dependencies:
 - 0015 is independent: desktop only, applies with `-3` on bare upstream.
 - 0060 needs 0013 (it edits `_revoke_taken_over_lease` in `methods_session_takeover.py` and its tests) and 0014
   (`gatewayErrorSurface` in `status.ts`). `session_owner_details` and the `notOwned` branch in `submit.ts` are stock.
-- None of 0013–0015 depends on 0001–0012. They were only tested in sequence after them.
+- None of 0013, 0014, 0015 depends on 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012. They were only tested in sequence after them.
 
 After applying, rebuild the desktop app (0014/0015) and restart the backend (0013). Every backend that might be
 displaced needs 0013 too, because the old owner's watcher is what stops its turn and acks. See Gotchas.
 
 ## Gotchas
 
-- With 0360, an older CLI that cannot cooperate gets a bounded refusal: stop the chat explicitly in its owning terminal, then retry. Do not delete its durable lease or kill its process as a takeover shortcut. The legacy registry-only behavior below does not override this durable-writer check.
+- With 0362, an older CLI that cannot cooperate gets a bounded refusal: stop the chat explicitly in its owning terminal, then retry. Do not delete its durable lease or kill its process as a takeover shortcut. The legacy registry-only behavior below does not override this durable-writer check.
 
 - **Generated RPC contract.** `apps/shared/src/gateway-contract.generated.ts` and
   `apps/shared/src/gateway-contract.openrpc.json` are rendered from the Pydantic models in `tui_gateway/contracts/`

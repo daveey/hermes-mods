@@ -1,6 +1,6 @@
 # A peer dropped mid-send ends the WS read loop as a disconnect
 
-Patch: 0607 (daveey/hermes `ead8bb5d23`).
+Patch: 0602 (daveey/hermes `ead8bb5d23`).
 
 ## Behavior
 

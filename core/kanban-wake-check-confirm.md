@@ -1,6 +1,6 @@
 # Wake check confirms exit 0 before waking; the reaper no longer steals probe statuses
 
-Patch: 0691 (daveey/hermes `ac43921555`). Extends [kanban-condition-wakes.md](kanban-condition-wakes.md).
+Patch: 0703 (daveey/hermes `ac43921555`). Extends [kanban-condition-wakes.md](kanban-condition-wakes.md).
 
 ## Behavior
 
@@ -23,7 +23,7 @@ Patch: 0691 (daveey/hermes `ac43921555`). Extends [kanban-condition-wakes.md](ka
 
 ## Applying
 
-`git am -3` 0691 in series order; it edits the wake-check and dispatch modules from [kanban-condition-wakes.md](kanban-condition-wakes.md).
+`git am -3` 0703 in series order; it edits the wake-check and dispatch modules from [kanban-condition-wakes.md](kanban-condition-wakes.md).
 
 ## Gotchas
 

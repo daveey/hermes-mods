@@ -1,0 +1,355 @@
+From 0864c0ca49baa980e38d927d84b4aa18432567c6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:32:38 +0000
+Subject: [PATCH] fix(desktop): retry paused update continuations across warm
+ resumes [daveey]
+
+---
+ .../tui_gateway/test_update_pause_recovery.py | 182 ++++++++++++++++++
+ tui_gateway/methods_session.py                |  18 --
+ tui_gateway/session_auto_continue.py          |  33 +++-
+ tui_gateway/startup_resume.py                 |  31 ++-
+ 4 files changed, 240 insertions(+), 24 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_recovery.py
+
+diff --git a/tests/tui_gateway/test_update_pause_recovery.py b/tests/tui_gateway/test_update_pause_recovery.py
+new file mode 100644
+index 0000000000..1e1dfd6780
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_recovery.py
+@@ -0,0 +1,182 @@
++"""Paused updates recover without a user send, including a warm Desktop reattach."""
++import json
++import threading
++import time
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from hermes_state import SessionDB
++from tui_gateway import server, startup_resume as sr, update_pause as up
++from tui_gateway.turn_marker import mark_turn_paused, record_turn_start
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True,
++       "freshness_minutes": 240, "resume_on_startup_delay_seconds": 0}}}
++
++
++@pytest.fixture
++def recovery(tmp_path, monkeypatch):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("paused", source="desktop")
++    db.append_message("paused", "user", "finish the request")
++    db.append_message("paused", "assistant", "completed step one")
++    record_turn_start(tmp_path, "paused", "finish the request")
++    mark_turn_paused(tmp_path, "paused", up.PAUSE_REASON)
++    path = tmp_path / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries["paused"]["writer_pid"] = 2 ** 22 - 3
++    entries["paused"].pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_profile_home", lambda p: tmp_path)
++    monkeypatch.setattr(server, "_profile_session_db", lambda home: (db, False))
++    monkeypatch.setattr(server, "_default_session_cwd", lambda: str(tmp_path))
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda *a, **kw: None)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
++    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
++    calls, done = [], threading.Event()
++    def submit(rid, sid, session, text, **kw):
++        calls.append((text, kw))
++        record_turn_start(tmp_path, "paused", "finish the request", pauses=1)
++        done.set()
++    monkeypatch.setattr(server, "_run_prompt_submit", submit)
++    before = set(server._sessions)
++    yield types.SimpleNamespace(home=tmp_path, calls=calls, done=done)
++    for sid in set(server._sessions) - before:
++        server._sessions.pop(sid, None)
++    db.close()
++
++
++def mount():
++    response = server.handle_request({"id": "resume", "method": "session.resume", "params": {
++        "session_id": "paused", "source": "desktop", "omit_messages": True}})
++    assert "error" not in response, response
++    return response["result"]
++
++
++def assert_continued(r):
++    assert r.done.wait(5), "no automatic continuation dispatched"
++    assert len(r.calls) == 1
++    assert r.calls[0][0] == up.pause_note("finish the request")
++    assert r.calls[0][1]["display_kind"] == "auto_continue"
++
++
++def test_connected_desktop_reattach_retries_after_admission_hold(recovery):
++    af.set_hold(recovery.home)
++    first = mount()
++    assert not first.get("auto_continue")
++    af.clear_hold(recovery.home)
++    second = mount()  # same live record, no prompt.submit / notification
++    assert second["session_id"] == first["session_id"]
++    assert second.get("auto_continue")
++    assert_continued(recovery)
++
++
++def test_old_connected_backend_waits_for_new_head(recovery, monkeypatch):
++    # The old runtime wrote this marker itself and is still connected after the swap.
++    record_turn_start(recovery.home, "paused", "finish the request")
++    mark_turn_paused(recovery.home, "paused", up.PAUSE_REASON)
++    af.set_hold(recovery.home)
++    first = mount()
++    af.clear_hold(recovery.home)
++    monkeypatch.setattr(up, "_detect_skew", lambda: ("old-head", "new-head"))
++    second = mount()
++    assert second["session_id"] == first["session_id"]
++    assert not second.get("auto_continue")
++    assert recovery.calls == []
++    # Replacement runtime, once the checkout and loaded revision match.
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    assert mount().get("auto_continue")
++    assert_continued(recovery)
++
++
++@pytest.mark.parametrize("flag", ["running", "resume_hydrating", "_closing", "_finalized"])
++def test_live_record_not_ready_for_recovery_is_left_alone(recovery, flag):
++    af.set_hold(recovery.home)
++    first = mount()
++    af.clear_hold(recovery.home)
++    session = server._sessions[first["session_id"]]
++    session[flag] = True
++    if flag == "_finalized":
++        assert server._maybe_schedule_auto_continue(first["session_id"], session, "paused") is None
++    else:
++        assert not mount().get("auto_continue")
++    assert recovery.calls == []
++    session[flag] = False
++    assert mount().get("auto_continue")
++    assert_continued(recovery)
++
++
++def test_startup_sweep_retries_warm_record_after_hold(recovery):
++    af.set_hold(recovery.home)
++    first = sr.resume_interrupted_sessions(server._methods["session.resume"], recovery.home, CFG)
++    assert first[0]["scheduled"] is False
++    af.clear_hold(recovery.home)
++    second = sr.resume_interrupted_sessions(server._methods["session.resume"], recovery.home, CFG)
++    assert second[0]["scheduled"] is True
++    assert_continued(recovery)
++
++
++@pytest.mark.parametrize("obstacle", ["hold", "live_writer"])
++def test_boot_worker_retries_without_another_client_message(recovery, monkeypatch, obstacle):
++    from hermes_cli import config
++    import hermes_constants
++    from agent import memory_provider
++
++    af.set_hold(recovery.home)
++    live = [obstacle == "live_writer"]
++    if live[0]:
++        af.clear_hold(recovery.home)
++        monkeypatch.setattr(sr, "marker_writer_state", lambda marker: "alive" if live[0] else "dead")
++    monkeypatch.setattr(config, "load_config", lambda: CFG)
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: recovery.home)
++    ticks = []
++    def sleep(seconds):
++        ticks.append(seconds)
++        if len(ticks) == 2:
++            af.clear_hold(recovery.home)
++            live[0] = False
++    monkeypatch.setattr(sr, "time", types.SimpleNamespace(sleep=sleep, monotonic=time.monotonic,
++                                                       time=time.time))
++    # Keep the worker synchronous; continuation dispatch still uses a real admitted thread.
++    class Inline:
++        def start(self):
++            self.target()
++    def spawn(target, **kwargs):
++        thread = Inline()
++        thread.target = target
++        return thread
++    monkeypatch.setattr(memory_provider, "spawn_context_thread", spawn)
++    # Older implementation uses Thread directly; capture only the sweep, not dispatch threads.
++    real_thread = threading.Thread
++    def thread_factory(*args, **kwargs):
++        return spawn(kwargs["target"]) if kwargs.get("name") == "startup-resume-sweep" else real_thread(*args, **kwargs)
++    monkeypatch.setattr(sr.threading, "Thread", thread_factory)
++    sr.start_startup_resume_sweep()
++    assert_continued(recovery)
++
++
++def test_in_place_watcher_retries_until_hold_lifts(recovery, monkeypatch):
++    af.set_hold(recovery.home)
++    result = mount()
++    session = server._sessions[result["session_id"]]
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    # Run the actual watch loop without real poll delays.
++    ticks = []
++    def sleep(seconds):
++        ticks.append(seconds)
++        if len(ticks) == 2:
++            af.clear_hold(recovery.home)
++    monkeypatch.setattr(up, "time", types.SimpleNamespace(sleep=sleep, monotonic=time.monotonic))
++    watcher = up.start_in_place_watcher(result["session_id"], session, "paused")
++    watcher.join(5)
++    assert not watcher.is_alive()
++    assert len(ticks) >= 2
++    assert_continued(recovery)
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 16a33259b5..3be4f33532 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -900,24 +900,6 @@ def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
+         return _resume_reuse_live_locked(ctx, sid, session)
+ 
+ 
+-def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
+-    """Reuse with _session_resume_lock already held (including the eager double-check)."""
+-    if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
+-        return refusal
+-    _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
+-    payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
+-                                    transport=current_transport() or _stdio_transport,
+-                                    inline_images=ctx.inline_images)
+-    payload["resumed"] = ctx.target
+-    if ctx.defer_history:
+-        payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
+-                       message_count=int(session.get("resume_message_count") or payload["message_count"]))
+-    # A lazy watch session never owns a run loop — overlay the child-run registry.
+-    if session.get("agent") is None and _child_run_active(ctx.target, ctx.profile_home):
+-        payload.update(running=True, status="streaming")
+-    return _ok(ctx.rid, payload)
+-
+-
+ def _resume_response(
+     ctx: _Resume, sid: str, record: dict, *, info: dict, display: list = (), count_source: list | None = None,
+     messages: list | None = None, message_count: int | None = None, running: bool = False,
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index f241dceb10..4290410454 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -19,6 +19,31 @@ from .method_ctx import bind_module
+ _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
+ 
+ 
++def _resume_reuse_live_locked(ctx, sid: str, session: dict) -> dict:
++    """Warm resume recovery, with the caller holding _session_resume_lock."""
++    if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
++        return refusal
++    _cancel_ws_orphan_reap(sid)
++    payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
++                                    transport=current_transport() or _stdio_transport,
++                                    inline_images=ctx.inline_images)
++    payload["resumed"] = ctx.target
++    # A boot sweep can race Desktop's mount or update hold. Retry on warm reuse too,
++    # but don't make stale code busy again before its replacement can take over.
++    if not ctx.lazy and not session.get("running") and not session.get("resume_hydrating"):
++        from tui_gateway.update_pause import _detect_skew
++        if _detect_skew() is None:
++            if (continuation := _maybe_schedule_auto_continue(sid, session, ctx.target)) is not None:
++                payload["auto_continue"] = continuation
++    if ctx.defer_history:
++        payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
++                       message_count=int(session.get("resume_message_count") or payload["message_count"]))
++    # A lazy watch session never owns a run loop — overlay the child-run registry.
++    if session.get("agent") is None and _child_run_active(ctx.target, ctx.profile_home):
++        payload.update(running=True, status="streaming")
++    return _ok(ctx.rid, payload)
++
++
+ def _auto_continue_config() -> tuple[bool, float, int]:
+     """(enabled, freshness window in seconds, max attempts) from ``desktop.auto_continue`` in config.yaml."""
+     desktop = _load_cfg().get("desktop")
+@@ -92,9 +117,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
+         clear_turn_marker(home, session_key)  # stale/disabled/crash-looping: a manual message continues
+         return None
+-    if session.get("_auto_continue_scheduled"):
+-        return None
+-    session["_auto_continue_scheduled"] = True
++    with session["history_lock"]:
++        if (session.get("_auto_continue_scheduled")
++                or session.get("_closing") or session.get("_finalized") or session.get("resume_hydrating")):
++            return None
++        session["_auto_continue_scheduled"] = True
+     # [daveey] A core-update pause is not a crash: no attempt is used and the note says the step finished.
+     paused = marker.get("reason") == "core_update_pause"
+     if paused:
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index a1d99ac0b9..868ebf7862 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -80,10 +80,13 @@ def pending_resumes(home: Path, cfg: dict | None, *, now: float | None = None) -
+     return out
+ 
+ 
+-def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path, cfg: dict | None) -> list[dict]:
++def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path, cfg: dict | None,
++                                *, paused_only: bool = False) -> list[dict]:
+     """Call ``resume(rid, params)`` (the ``session.resume`` handler) for each pending marker; returns outcomes."""
+     results = []
+     for row in pending_resumes(home, cfg):
++        if paused_only and (read_turn_marker(row["home"], row["session_key"]) or {}).get("reason") != "core_update_pause":
++            continue
+         params: dict[str, Any] = {"session_id": row["session_key"], "omit_messages": True}
+         if row["profile"]:
+             params["profile"] = row["profile"]
+@@ -102,6 +105,17 @@ def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path,
+     return results
+ 
+ 
++def _paused_markers_remain(home: Path, cfg: dict | None) -> bool:
++    # Include live writers: they can still be retiring during the first boot sweep.
++    _, fresh, max_attempts, _ = _settings(cfg)
++    now = time.time()
++    return any(entry.get("reason") == "core_update_pause" and entry.get("auto_continue", True)
++               and now - float(entry.get("started_at") or 0) <= fresh
++               and int(entry.get("attempts") or 0) < max_attempts
++               for _, h in _homes(home) for key in _load(_marker_path(h))
++               if (entry := read_turn_marker(h, key)) is not None)
++
++
+ def start_startup_resume_sweep() -> threading.Thread | None:
+     """Backend boot hook: run the sweep on a daemon thread after a short settle delay (no-op unless enabled)."""
+     try:
+@@ -115,6 +129,8 @@ def start_startup_resume_sweep() -> threading.Thread | None:
+     if not enabled:
+         return None
+ 
++    home = Path(get_hermes_home())
++
+     def _run() -> None:
+         time.sleep(delay)
+         try:
+@@ -123,12 +139,21 @@ def start_startup_resume_sweep() -> threading.Thread | None:
+             if handler is None:
+                 logger.warning("startup resume: session.resume handler not installed")
+                 return
+-            done = resume_interrupted_sessions(handler, Path(get_hermes_home()), cfg)
++            done = resume_interrupted_sessions(handler, home, cfg)
+             if done:
+                 logger.info("startup resume: %d interrupted session(s) processed", len(done))
++            # Backend boot can precede hold release or the last old SSH writer's exit.
++            # Retry PAUSES only: ordinary crash recovery keeps its one-shot semantics.
++            deadline = time.monotonic() + 600.0
++            while time.monotonic() < deadline and _paused_markers_remain(home, cfg):
++                time.sleep(5.0)
++                resume_interrupted_sessions(handler, home, cfg, paused_only=True)
++            if _paused_markers_remain(home, cfg):
++                logger.warning("startup resume: paused turns still pending after the update recovery window")
+         except Exception:
+             logger.exception("startup resume sweep failed")
+ 
+-    t = threading.Thread(target=_run, daemon=True, name="startup-resume-sweep")
++    from agent.memory_provider import spawn_context_thread
++    t = spawn_context_thread(_run, name="startup-resume-sweep")
+     t.start()
+     return t
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # Isolated kanban-home fixtures restore the process module graph
 
-Patch: 0732 (fork `b3c050ed13`). Test harness only.
+Patch: 0872 (fork `b3c050ed13`). Test harness only.
 
 ## Behavior
 
@@ -23,7 +23,7 @@ No production entry path. The per-profile fixture is the same restore, not a sec
 
 ## Applying
 
-Append after 0731. Test-only; nothing to configure.
+Append after 0871. Test-only; nothing to configure.
 
 ## Gotchas
 

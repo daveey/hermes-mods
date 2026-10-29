@@ -1,0 +1,349 @@
+From b3ae470c6d4775c81f6066308a3f502f00df2a62 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:56:02 +0000
+Subject: [PATCH] feat(kanban): hermes kanban create and REST POST /tasks
+ refuse a second owner too [daveey]
+
+The create_overlap check (d0cc66e9f4) ran only in the kanban_create tool, so
+the CLI and the dashboard/REST create endpoint could still create a duplicate
+owner. Both now call kanban_overlap.check: CLI --distinct-from (repeatable) +
+--distinct-reason, exit 2 with the refusal (JSON on stdout under --json); REST
+distinct_from + distinct_reason, 409 with the refusal as detail. Idempotency
+retries skip the check, and a keyed creator (coach/self-heal crons) is never
+blocked by open cards of its own key family (text before the first ':').
+Parity tests cover a refused duplicate and an accepted override per path.
+---
+ hermes_cli/kanban.py                          |  24 ++++
+ hermes_cli/kanban_overlap.py                  |  47 +++++---
+ hermes_cli/kanban_parser.py                   |   5 +
+ plugins/kanban/dashboard/plugin_api.py        |  19 ++-
+ .../test_kanban_create_entry_parity.py        | 109 ++++++++++++++++++
+ 5 files changed, 189 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 8297dc2f6d..545ee56678 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -430,6 +430,28 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         idem_hit = bool(idem_key) and conn.execute(
+             "SELECT 1 FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1",
+             (idem_key,)).fetchone() is not None
++        # [daveey] Refuse a second owner, exactly as the kanban_create tool does (hermes_cli/kanban_overlap.py):
++        # open cards on every board/gateway, skipping parents, the creator's own fan-out and its key family.
++        from hermes_cli import kanban_overlap
++        board = getattr(args, "board", None) or kb.get_current_board()
++        refused, after_create = kanban_overlap.check(
++            conn, {"body": body, "idempotency_key": idem_key,
++                   "board": None if board == kb.DEFAULT_BOARD else board,
++                   "distinct_from": getattr(args, "distinct_from", None) or [],
++                   "distinct_reason": getattr(args, "distinct_reason", None)},
++            courier=False, title=str(args.title).strip(), session_id=session_id,
++            self_tid=os.environ.get("HERMES_KANBAN_TASK") if in_worker else None,
++            parents=list(args.parent or ()), entry="cli")
++        if refused:
++            if getattr(args, "json", False):
++                print(refused)
++            else:
++                ref = json.loads(refused)
++                print(f"kanban: {ref['code']}: {ref['note']}", file=sys.stderr)
++                for m in ref["matches"]:
++                    print(f"  {m['id']}  {m['gateway']}/{m['board']}  ({m['status']})  {m['title']}  — {m['why']}",
++                          file=sys.stderr)
++            return 2
+         from hermes_cli.kanban_db_workspace import WorktreeWorkspaceConfigError
+         from hermes_cli.kanban_capabilities import CapabilityMismatchError
+         from hermes_cli.kanban_pin_provider import PinProviderUnresolvedError
+@@ -468,6 +490,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             return _err(f"kanban: {exc.code}: {exc}", 2)
+         except (PinProviderUnresolvedError, ModelProviderMismatchError) as exc:
+             return _err(f"kanban: {exc}", 2)
++        if not idem_hit:
++            after_create(conn, task_id)  # records an accepted --distinct-from override on the new card
+         if session_key and not idem_hit:
+             # Same completion subscription the kanban_create tool adds, so the chat
+             # that shelled out hears when the card lands (and its row stays busy).
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index b57279c90e..306c33749d 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -83,7 +83,7 @@ def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
+                 rows = c.execute(
+                     "SELECT t.id, t.title, t.status, t.session_id, (SELECT json_extract(e.payload, "
+                     "'$.creator_task_id') FROM task_events e WHERE e.task_id = t.id AND e.kind = 'created' "
+-                    f"LIMIT 1) FROM tasks t WHERE t.status IN ({marks})", OPEN).fetchall()
++                    f"LIMIT 1), t.idempotency_key FROM tasks t WHERE t.status IN ({marks})", OPEN).fetchall()
+                 try:
+                     links = c.execute("SELECT task_id, chat_session FROM task_chat_links WHERE released = 0"
+                                       ).fetchall()
+@@ -95,9 +95,9 @@ def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
+         chats: dict[str, set[str]] = {}
+         for tid, sess in links:
+             chats.setdefault(tid, set()).add(sess)
+-        for tid, title, status, sess, creator in rows:
++        for tid, title, status, sess, creator, key in rows:
+             yield {"id": tid, "board": slug, "gateway": self_gw or "local", "status": status, "title": title,
+-                   "session_id": sess, "creator_task_id": creator, "local": True,
++                   "session_id": sess, "creator_task_id": creator, "local": True, "key_family": key_family(key),
+                    "chats": sorted(chats.get(tid, set()) | ({sess} if sess else set()))}
+ 
+ 
+@@ -130,13 +130,21 @@ def _replica_cards(self_gw: Optional[str]) -> Iterable[dict]:
+         yield {"id": t["id"], "board": t.get("board") or "default", "gateway": t.get("gateway") or gw,
+                "status": t.get("status"), "title": t.get("title") or "", "local": False,
+                "session_id": next((s.get("session") for s in sessions if s.get("rel") == "created"), None),
+-               "creator_task_id": None,
++               "creator_task_id": None, "key_family": None,
+                "chats": sorted({str(s["session"]) for s in sessions if s.get("session")})}
+ 
+ 
++def key_family(key: Optional[str]) -> Optional[str]:
++    """An idempotency key's family: the text before the first ':' (``coach-fix:<slug>`` -> ``coach-fix``), else
++    the whole key. One automated creator (coach / self-heal cron) keys all its cards in one family."""
++    key = (key or "").strip()
++    return key.split(":", 1)[0] if key else None
++
++
+ def find(*, title: str, body: str, target_board: str, session_id: Optional[str], self_tid: Optional[str],
+-         parents: Iterable[str]) -> list[dict]:
+-    """Open cards elsewhere that already cover this work, best match first. Never raises."""
++         parents: Iterable[str], family: Optional[str] = None) -> list[dict]:
++    """Open cards elsewhere that already cover this work, best match first. Never raises. ``family`` (the new
++    card's idempotency-key family) skips cards from the same keyed creator: its keys already dedupe them."""
+     try:
+         from hermes_cli import kanban_capability_registry as reg
+         self_gw = reg.self_gateway()
+@@ -146,7 +154,8 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+         for source in (_local_cards(self_gw), _replica_cards(self_gw)):
+             for card in source:
+                 if (card["id"] in skip or (session_id and card["session_id"] == session_id)
+-                        or (self_tid and card["creator_task_id"] == self_tid)):
++                        or (self_tid and card["creator_task_id"] == self_tid)
++                        or (family and card.get("key_family") == family)):
+                     continue
+                 reasons, score = _reasons(card, new_words, title, body, target_board)
+                 if reasons:
+@@ -163,11 +172,21 @@ def public(matches: list[dict]) -> list[dict]:
+     return [{k: v for k, v in m.items() if not k.startswith("_")} for m in matches[:MAX_SHOWN]]
+ 
+ 
+-def refusal(matches: list[dict], distinct_from: list[str], reason: str) -> dict:
++def _retry_ask(entry: str, uncovered: list[str]) -> str:
++    if entry == "cli":
++        flags = " ".join(f"--distinct-from {i}" for i in uncovered)
++        return f"run `hermes kanban create` again with {flags} --distinct-reason '<why it is separate>'"
++    if entry == "rest":
++        return (f"POST again with \"distinct_from\": {json.dumps(uncovered)} and "
++                "\"distinct_reason\": \"<why it is separate>\"")
++    return f"call kanban_create again with distinct_from={uncovered} and distinct_reason='<why it is separate>'"
++
++
++def refusal(matches: list[dict], distinct_from: list[str], reason: str, entry: str = "tool") -> dict:
+     shown = public(matches)
+     uncovered = [m["id"] for m in shown if m["id"] not in distinct_from]
+     ask = ("pass distinct_reason (why this is separate work) with distinct_from" if distinct_from and not reason
+-           else f"call kanban_create again with distinct_from={uncovered} and distinct_reason='<why it is separate>'")
++           else _retry_ask(entry, uncovered))
+     named = ", ".join(f"{m['id']} on {m['gateway']}/{m['board']} ({m['status']})" for m in shown[:3])
+     note = (f"No card was created: {len(matches)} open card(s) already look like this work ({named}). "
+             "Count owners by board/project, not by your chat's links: continue the existing card "
+@@ -209,10 +228,12 @@ def _no_override(conn: sqlite3.Connection, task_id: str) -> None:
+ 
+ 
+ def check(conn: sqlite3.Connection, args: dict, *, courier: bool, title: str, session_id: Optional[str],
+-          self_tid: Optional[str], parents: list[str]) -> tuple[Optional[str], Callable[[sqlite3.Connection, str], None]]:
++          self_tid: Optional[str], parents: list[str], entry: str = "tool",
++          ) -> tuple[Optional[str], Callable[[sqlite3.Connection, str], None]]:
+     """``(refusal_json, _)`` stops the create; otherwise ``(None, after_create)``, where ``after_create(conn,
+     new_task_id)`` records an accepted ``distinct_from`` override on the new card (a no-op when nothing
+-    overlapped). A courier-applied card (``courier``) was already checked on the gateway that asked for it."""
++    overlapped). A courier-applied card (``courier``) was already checked on the gateway that asked for it.
++    ``entry`` (tool | cli | rest) only words the refusal's retry hint for the caller's entry path."""
+     from hermes_cli import kanban_db as kb
+     if courier or not enabled():
+         return None, _no_override
+@@ -223,7 +244,7 @@ def check(conn: sqlite3.Connection, args: dict, *, courier: bool, title: str, se
+     distinct = [str(x) for x in (args.get("distinct_from") or [])]
+     reason = str(args.get("distinct_reason") or "")
+     matches = find(title=title, body=str(args.get("body") or ""), target_board=args.get("board") or kb.DEFAULT_BOARD,
+-                   session_id=session_id, self_tid=self_tid, parents=parents)
++                   session_id=session_id, self_tid=self_tid, parents=parents, family=key_family(key))
+     if not matches:
+         return None, _no_override
+     if covered(matches, distinct, reason):
+@@ -232,4 +253,4 @@ def check(conn: sqlite3.Connection, args: dict, *, courier: bool, title: str, se
+     own = bool(self_tid) and not args.get("board")  # the creator's card is on the board this call opened
+     record(conn if own else None, self_tid, outcome="refused", title=title, matches=matches,
+            session_id=session_id)
+-    return json.dumps(refusal(matches, distinct, reason)), _no_override
++    return json.dumps(refusal(matches, distinct, reason, entry)), _no_override
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 9380163881..a9bd0f71a9 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -253,6 +253,11 @@ _SPECS = [
+         _arg("--idempotency-key",
+              help="Dedup key. If a non-archived task with this key exists, "
+                   "its id is returned instead of creating a duplicate."),
++        _arg("--distinct-from", action="append", default=[], metavar="TASK_ID",
++             help="Open card this is NOT a duplicate of (repeatable). A create that open cards already "
++                  "cover is refused (create_overlap) unless every match is listed here with --distinct-reason."),
++        _arg("--distinct-reason", default=None,
++             help="Why this card is separate work from the --distinct-from cards (recorded on the new card)"),
+         _arg("--origin-session", default=None,
+              help="Chat on ANOTHER gateway this card is work for (@session:<profile>@<gateway>/<id>; "
+                   "default $HERMES_ORIGIN_SESSION). It then shows in that chat's task list."),
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 04e7822d17..d225f55bea 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -566,13 +566,28 @@ class CreateTaskBody(BaseModel):
+     provider_override: Optional[str] = None
+     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
+     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
++    # [daveey] create_overlap override (same as the kanban_create tool): open cards this is not a duplicate of.
++    distinct_from: list[str] = Field(default_factory=list)
++    distinct_reason: Optional[str] = None
+ 
+ 
+ @router.post("/tasks")
+ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+     with _board_conn(board) as (board, conn), _value_error_400():
+-        # CreateTaskBody field names match create_task's keyword parameters.
+-        task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
++        fields = payload.model_dump()
++        overlap_args = {"body": fields.get("body"), "idempotency_key": fields.get("idempotency_key"),
++                        "board": None if (board or kanban_db.DEFAULT_BOARD) == kanban_db.DEFAULT_BOARD else board,
++                        "distinct_from": fields.pop("distinct_from"), "distinct_reason": fields.pop("distinct_reason")}
++        # [daveey] Refuse a second owner, exactly as the kanban_create tool does (hermes_cli/kanban_overlap.py).
++        from hermes_cli import kanban_overlap
++        refused, after_create = kanban_overlap.check(
++            conn, overlap_args, courier=False, title=payload.title.strip(), session_id=None, self_tid=None,
++            parents=list(payload.parents), entry="rest")
++        if refused:
++            raise HTTPException(status_code=409, detail=json.loads(refused))
++        # CreateTaskBody field names (less the overlap override) match create_task's keyword parameters.
++        task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **fields)
++        after_create(conn, task_id)
+         task = kanban_db.get_task(conn, task_id)
+         body: dict[str, Any] = {"task": _task_dict(
+             task, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
+diff --git a/tests/hermes_cli/test_kanban_create_entry_parity.py b/tests/hermes_cli/test_kanban_create_entry_parity.py
+index bf123f655b..607c2a5186 100644
+--- a/tests/hermes_cli/test_kanban_create_entry_parity.py
++++ b/tests/hermes_cli/test_kanban_create_entry_parity.py
+@@ -314,3 +314,112 @@ def test_placed_tool_create_is_overlap_checked_before_it_leaves(chat, tmp_path,
+                                                         "requires": []}))
+     assert ok["status"] == "queued" and ok["placed"]["gateway"] == "hub", ok
+     assert sent == ["Rotate the Telnyx key"]
++
++
++_LIVE_TITLE = "Rotate the Telnyx webhook signing key"
++_DUP_TITLE = "Rotate Telnyx webhook signing key now"
++
++
++def _open_owner(key: str | None = None) -> str:
++    """An open card another chat created on this gateway (the existing owner)."""
++    with kbc.connect_closing() as conn:
++        return kb.create_task(conn, title=_LIVE_TITLE, assignee="default", session_id="20261027_000000_other0",
++                              idempotency_key=key)
++
++
++def _cli(argv: list[str], monkeypatch) -> int:
++    monkeypatch.setattr(kc, "_check_dispatcher_presence", lambda **kw: (True, ""))
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    return kc._cmd_create(root.parse_args(["kanban", "create", *argv]))
++
++
++def _rest(payload: dict):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from plugins.kanban.dashboard.plugin_api import router
++    app = FastAPI()
++    app.include_router(router)
++    with TestClient(app) as client:
++        return client.post("/tasks", json=payload)
++
++
++def _titles() -> list[str]:
++    with kbc.connect_closing() as conn:
++        return sorted(t.title for t in kb.list_tasks(conn))
++
++
++def _override_events(task_id: str) -> list[dict]:
++    with kbc.connect_closing() as conn:
++        rows = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'create_overlap'",
++                            (task_id,)).fetchall()
++    return [json.loads(r[0]) for r in rows]
++
++
++def test_cli_create_refuses_a_duplicate_owner(chat, monkeypatch, capsys):
++    """[daveey] `hermes kanban create` runs the same create_overlap check as the kanban_create tool."""
++    live = _open_owner()
++    assert _cli([_DUP_TITLE, "--assignee", "default", "--json"], monkeypatch) == 2
++    out = json.loads(capsys.readouterr().out)
++    assert out["code"] == "create_overlap" and [m["id"] for m in out["matches"]] == [live], out
++    assert _titles() == [_LIVE_TITLE]
++    assert _cli([_DUP_TITLE, "--assignee", "default"], monkeypatch) == 2
++    err = capsys.readouterr().err
++    assert "create_overlap" in err and live in err and f"--distinct-from {live}" in err, err
++    assert _titles() == [_LIVE_TITLE]
++
++
++def test_cli_create_override_is_accepted_and_recorded(chat, monkeypatch, capsys):
++    live = _open_owner()
++    # distinct_from without a reason is still refused
++    assert _cli([_DUP_TITLE, "--assignee", "default", "--distinct-from", live], monkeypatch) == 2
++    capsys.readouterr()
++    assert _cli([_DUP_TITLE, "--assignee", "default", "--json", "--distinct-from", live,
++                 "--distinct-reason", "different key: the staging one"], monkeypatch) == 0
++    new = json.loads(capsys.readouterr().out)["id"]
++    assert _titles() == sorted([_LIVE_TITLE, _DUP_TITLE])
++    [ev] = _override_events(new)
++    assert ev["outcome"] == "override" and ev["reason"] == "different key: the staging one", ev
++
++
++def test_cli_create_with_idempotency_key_skips_its_own_family(chat, monkeypatch, capsys):
++    """Automated creators (coach / self-heal crons) dedupe by --idempotency-key: a retry returns the existing
++    card, and an earlier open card from the same key family (text before the first ':') never blocks a new one."""
++    live = _open_owner("coach-fix:telnyx-a")
++    assert _cli([_LIVE_TITLE, "--assignee", "default", "--json", "--idempotency-key", "coach-fix:telnyx-a"],
++                monkeypatch) == 0
++    assert json.loads(capsys.readouterr().out)["id"] == live
++    assert _cli([_DUP_TITLE, "--assignee", "default", "--json", "--idempotency-key", "coach-fix:telnyx-b"],
++                monkeypatch) == 0
++    capsys.readouterr()
++    assert _cli(["Rotate Telnyx webhook signing key today", "--assignee", "default", "--json",
++                 "--idempotency-key", "other-watch:1"], monkeypatch) == 2
++    assert json.loads(capsys.readouterr().out)["code"] == "create_overlap"
++
++
++def test_cli_create_never_matches_its_parent(chat, monkeypatch, capsys):
++    live = _open_owner()
++    assert _cli([_DUP_TITLE, "--assignee", "default", "--parent", live], monkeypatch) == 0
++
++
++def test_rest_create_refuses_a_duplicate_owner(chat):
++    """[daveey] The dashboard/REST POST /tasks runs the same create_overlap check as the kanban_create tool."""
++    live = _open_owner()
++    r = _rest({"title": _DUP_TITLE, "assignee": "default"})
++    assert r.status_code == 409, r.text
++    detail = r.json()["detail"]
++    assert detail["code"] == "create_overlap" and [m["id"] for m in detail["matches"]] == [live], detail
++    assert _titles() == [_LIVE_TITLE]
++
++
++def test_rest_create_override_is_accepted_and_recorded(chat):
++    live = _open_owner()
++    r = _rest({"title": _DUP_TITLE, "assignee": "default", "distinct_from": [live]})
++    assert r.status_code == 409, r.text
++    r = _rest({"title": _DUP_TITLE, "assignee": "default", "distinct_from": [live],
++               "distinct_reason": "the staging key, not prod"})
++    assert r.status_code == 200, r.text
++    new = r.json()["task"]["id"]
++    assert _titles() == sorted([_LIVE_TITLE, _DUP_TITLE])
++    [ev] = _override_events(new)
++    assert ev["outcome"] == "override" and ev["reason"] == "the staging key, not prod", ev
+-- 
+2.55.0
+

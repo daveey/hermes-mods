@@ -1,0 +1,117 @@
+From fb1ec372828bbad941922e70efc3e9649003fa95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:46:05 -0700
+Subject: [PATCH] fix(ci): scripts/check hook borrows the installed Hermes env
+ in a clone that is not an install
+
+~/code/hermes (the sync mirror, branch state) is a sanctioned place for origin/main worktrees but
+has no pm install and its .venv has no dependencies, so prompt-surface refused every main push from
+it. When the main checkout has no pm/environments.py, compose from ${HERMES_HOME:-~/.hermes}/hermes-agent;
+skip a composition that carries no dependency path.
+
+Test: tests/scripts/test_code_health_cli.py::test_hooks_take_the_pm_composed_environment_minus_its_checkout[main_checkout|installed_hermes].
+---
+ scripts/check                         | 23 ++++++++++++++---------
+ tests/scripts/test_code_health_cli.py | 25 ++++++++++++++++---------
+ 2 files changed, 30 insertions(+), 18 deletions(-)
+
+diff --git a/scripts/check b/scripts/check
+index 5a47ffef40..289ccd9364 100755
+--- a/scripts/check
++++ b/scripts/check
+@@ -62,20 +62,25 @@ done
+   echo "scripts/check hook: no python3 or python on PATH" >&2; exit 1; }
+ # A pm-managed install keeps the dependencies on its composed PYTHONPATH, not in a venv (the
+ # Macs' venv/ predates them, and prompt-surface imports them all): take PATH and PYTHONPATH from
+-# the main checkout's composed environment (read-only, never syncs), minus the main checkout
+-# itself so the judged tree's own modules win.
+-if [ -f "$common/pm/environments.py" ] && pm_env="$(cd "$common" && PYTHONHOME= PYTHONPATH="$common" \
+-    "$py" -m pm.environments --format json 2>/dev/null | "$py" -c '
++# the composed environment (read-only, never syncs) of the main checkout, or, for a clone that
++# is not an install (a mirror's worktree), of the installed Hermes checkout; minus that checkout
++# itself, so the judged tree's own modules win.
++for pm_root in "$common" "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"; do
++  [ -f "$pm_root/pm/environments.py" ] || continue
++  pm_env="$(cd "$pm_root" && PYTHONHOME= PYTHONPATH="$pm_root" "$py" -m pm.environments --format json \
++      2>/dev/null | "$py" -c '
+ import json, os, shlex, sys
+-env, common = json.load(sys.stdin), os.path.realpath(sys.argv[1])
+-pp = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and os.path.realpath(p) != common]
+-if env.get("PATH"):
++env, root = json.load(sys.stdin), os.path.realpath(sys.argv[1])
++pp = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and os.path.realpath(p) != root]
++if env.get("PATH") and pp:
+     print("export PATH=" + shlex.quote(env["PATH"]))
+     print("export PYTHONPATH=" + shlex.quote(os.pathsep.join(pp)))
+-' "$common")" && [ -n "$pm_env" ]; then
++' "$pm_root")" || continue
++  [ -n "$pm_env" ] || continue
+   eval "$pm_env"
+   py="$(command -v python3 || command -v python || echo "$py")"
+-fi
++  break
++done
+ judge() {  # judge TREE-ISH ARGS...: check out TREE-ISH alone and run its own scripts/check ARGS
+   local tree=$1 tmp dir rc
+   shift
+diff --git a/tests/scripts/test_code_health_cli.py b/tests/scripts/test_code_health_cli.py
+index 7c7709aabc..bc8ff37be4 100644
+--- a/tests/scripts/test_code_health_cli.py
++++ b/tests/scripts/test_code_health_cli.py
+@@ -287,13 +287,18 @@ def test_hooks_prefer_the_repo_virtualenv_over_path_python(tmp_path):
+     assert proc.returncode != 0 and "wrong interpreter" in proc.stderr
+ 
+ 
+-def test_hooks_take_the_pm_composed_environment_minus_the_main_checkout(tmp_path):
++@pytest.mark.parametrize("where", ["main_checkout", "installed_hermes"])
++def test_hooks_take_the_pm_composed_environment_minus_its_checkout(tmp_path, where):
+     """A pm-managed install (the Macs) keeps the dependencies on its composed PYTHONPATH: the
+     stale venv/ python cannot import them, so the hook runs the composed PATH's python with the
+-    composed PYTHONPATH, minus the main checkout (the judged tree's own modules must win)."""
++    composed PYTHONPATH, minus the composing checkout (the judged tree's own modules must win).
++    A clone that is not an install (the sync mirror's worktrees) borrows the installed Hermes
++    checkout's environment, ``$HERMES_HOME/hermes-agent``."""
+     repo = _engine_repo(tmp_path)
+     assert _check(repo, "--install-hook", "pre-commit").returncode == 0
+     (repo / ".venv").symlink_to(Path(sys.prefix), target_is_directory=True)
++    hermes_home = tmp_path / "hermes-home"
++    pm_root = repo if where == "main_checkout" else hermes_home / "hermes-agent"
+     record = tmp_path / "seen"
+     composed = tmp_path / "composed-bin"
+     composed.mkdir()
+@@ -301,23 +306,25 @@ def test_hooks_take_the_pm_composed_environment_minus_the_main_checkout(tmp_path
+         f"#!/bin/sh\nprintf '%s\\n' \"$PYTHONPATH\" >> '{record}'\nexec '{sys.executable}' \"$@\"\n",
+         encoding="utf-8")
+     (composed / "python3").chmod(0o755)
+-    path = os.pathsep.join([str(composed), _env()["PATH"]])
+-    # untracked: the hook reads it from the main checkout, not from the judged tree
+-    _write(repo, {"pm/environments.py": (
++    env = _env()
++    env["HERMES_HOME"] = str(hermes_home)
++    path = os.pathsep.join([str(composed), env["PATH"]])
++    # untracked in the repo: the hook reads it from the composing checkout, not the judged tree
++    _write(pm_root, {"pm/environments.py": (
+         "import json, os\n"
+         f"print(json.dumps({{'PATH': {path!r}, 'PYTHONPATH': os.pathsep.join([os.getcwd(), '/deps'])}}))\n"
+     )})
+     _write(repo, {"pkg/b.py": "def b():\n    return 2\n"})
+     _git(repo, "add", "--", "pkg/b.py")
+-    proc = _sh(repo, "git", "commit", "-q", "-m", "pm")
++    proc = _sh(repo, "git", "commit", "-q", "-m", "pm", env=env)
+     assert proc.returncode == 0, proc.stdout + proc.stderr
+     assert record.read_text(encoding="utf-8").splitlines() == ["/deps"]
+-    # control: without pm/environments.py the hook keeps the venv python and never runs ours
+-    (repo / "pm/environments.py").unlink()
++    # control: with no composing checkout the hook keeps the venv python and never runs ours
++    (pm_root / "pm/environments.py").unlink()
+     record.unlink()
+     _write(repo, {"pkg/b.py": "def b():\n    return 3\n"})
+     _git(repo, "add", "--", "pkg/b.py")
+-    proc = _sh(repo, "git", "commit", "-q", "-m", "venv")
++    proc = _sh(repo, "git", "commit", "-q", "-m", "venv", env=env)
+     assert proc.returncode == 0, proc.stdout + proc.stderr
+     assert not record.exists()
+ 
+-- 
+2.55.0
+

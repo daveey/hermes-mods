@@ -2,11 +2,11 @@
 
 ## Behavior
 
-Patches **0378–0379** let an owning worker resume once after independent review requests changes to its existing PR. A dependency park must capture the authenticated owner run, parent IDs and PR URLs. Completed, actually claimed parent runs must supply structured `changes_required`, PR and full reviewed-SHA evidence after the park. This is permission to repair, not merge approval or current-head CI evidence.
+Patches **0383, 0384** let an owning worker resume once after independent review requests changes to its existing PR. A dependency park must capture the authenticated owner run, parent IDs and PR URLs. Completed, actually claimed parent runs must supply structured `changes_required`, PR and full reviewed-SHA evidence after the park. This is permission to repair, not merge approval or current-head CI evidence.
 
 ## How it works
 
-`checkpoint` captures scope inside the block transaction. `resumes_review` validates the latest run, unchanged dependencies, completed review provenance and the guarded PR set. The next claim consumes the permission. Legacy unauthenticated parks, comment-only evidence and changed PR/parent scope fail closed. Patch 0379 moves transactional claim release into `apply_block_update` without changing this contract.
+`checkpoint` captures scope inside the block transaction. `resumes_review` validates the latest run, unchanged dependencies, completed review provenance and the guarded PR set. The next claim consumes the permission. Legacy unauthenticated parks, comment-only evidence and changed PR/parent scope fail closed. Patch 0384 moves transactional claim release into `apply_block_update` without changing this contract.
 
 ## Code
 
@@ -25,7 +25,7 @@ Result: **13 passed**. These are database/dispatch regression tests; no live dis
 
 ## Applying
 
-Apply 0378 then 0379 after the preceding fork series. They mirror commits `cd68a2ce18` and `cb8fd02e9f`. Activate through the normal safe core update, not by changing an active checkout.
+Apply 0383 then 0384 after the preceding fork series. They mirror commits `cd68a2ce18` and `cb8fd02e9f`. Activate through the normal safe core update, not by changing an active checkout.
 
 ## Gotchas
 

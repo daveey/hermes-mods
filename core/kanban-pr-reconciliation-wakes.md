@@ -1,18 +1,18 @@
 # PR waits wake for reconciliation, not automatic acceptance
 
-Patches: **0339 0343 0344 0346**.
+Patches: **0339 0344 0345 0347**.
 
 ## Behavior
 
 An explicit immediate PR checkpoint can resume without a guard notice re-arming its own hold (0339). A later real PR update still protects against duplicate work; non-immediate or superseded continuations do not gain blanket permission.
 
-The PR condition probe wakes a parked card when the PR becomes terminal, including closed-unmerged, so the worker can reconcile it (0343). An open PR can also wake on explicitly supplied, verified supersession evidence (0344). Neither wake completes the card nor substitutes for required exact-head CI or acceptance.
+The PR condition probe wakes a parked card when the PR becomes terminal, including closed-unmerged, so the worker can reconcile it (0344). An open PR can also wake on explicitly supplied, verified supersession evidence (0345). Neither wake completes the card nor substitutes for required exact-head CI or acceptance.
 
 ## How it works
 
 `kanban_db_dispatch_pr_state.py` distinguishes real checkpoint/handoff events from guard-generated notices. `kanban_pr_wake.py` uses the existing profile-scoped PR acceptance transport. Its exit contract is **0 inspect now, 1 pending, 2 error**. Invalid exact PR URLs and unreadable/mismatched evidence are errors; transport failures do not print sensitive stderr.
 
-Optional `--superseding-commit` and `--verification-job` must be supplied together as an exact lowercase 40-hex SHA and a positive decimal job ID. The successful completed job must match that SHA, and the repository's default branch must contain it. The message explicitly requires replacement ownership and all required exact-head CI before delivery. 0346 rejects malformed completed-job conclusions rather than treating malformed evidence as an ordinary pending job.
+Optional `--superseding-commit` and `--verification-job` must be supplied together as an exact lowercase 40-hex SHA and a positive decimal job ID. The successful completed job must match that SHA, and the repository's default branch must contain it. The message explicitly requires replacement ownership and all required exact-head CI before delivery. 0347 rejects malformed completed-job conclusions rather than treating malformed evidence as an ordinary pending job.
 
 ## Code
 
@@ -30,7 +30,7 @@ Run with `bash scripts/run_tests.sh <files>` in the isolated applied checkout. M
 
 ## Applying
 
-Apply the ordered series with prior condition wakes and PR acceptance transport. [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) documents the later 0349 orderly-park handoff and broker-aware state-read changes. [kanban-origin-work-ledger.md](kanban-origin-work-ledger.md) documents deferred origin completion notices, a separate boundary.
+Apply the ordered series with prior condition wakes and PR acceptance transport. [kanban-pr-park-handoff.md](kanban-pr-park-handoff.md) documents the later 0350 orderly-park handoff and broker-aware state-read changes. [kanban-origin-work-ledger.md](kanban-origin-work-ledger.md) documents deferred origin completion notices, a separate boundary.
 
 ## Gotchas
 

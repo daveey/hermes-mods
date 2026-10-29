@@ -1,0 +1,37 @@
+# test(kanban): goal-mode CLI gate tests use a task-id-shaped id (1184aefb32 rejects 't1') [daveey]
+
+Patch 0953, source `4d3b7207146e3c164280c26d0d8eab3c222279b0`.
+
+## Behavior
+
+test(kanban): goal-mode CLI gate tests use a task-id-shaped id (1184aefb32 rejects 't1') [daveey]. This is the source commit's bounded change; later patches may refine it.
+
+## How it works
+
+The patch changes the following implementation seams (diff hunk headings, not a claim that every seam has independent test coverage):
+
+- `class TestCLIJudgeGate:`
+
+## Code
+
+- `tests/hermes_cli/test_kanban_goal_mode.py`
+
+## Tests
+
+Source test files changed by this commit:
+
+- `tests/hermes_cli/test_kanban_goal_mode.py`
+
+These are source coverage references, not a claim that this mirror executed the suite. Only results explicitly recorded in [mirror-958-verification.md](mirror-958-verification.md) were run for this publication. Other entry paths are untested by this mirror.
+
+## Applying
+
+Apply the complete ordered series from the documented merge-base with `git am -3 --empty=keep`. Patches share state and are not independent cherry-picks. See the linked patch for the full diff; use its implementation seams above when porting to a different upstream revision.
+
+## Gotchas
+
+Patch numbers now follow fork-log ordinals, not the older curated numbering. Privacy substitutions use example users, accounts and hosts. Merge-only resolutions and duplicate handling are listed in the verification document. Do not infer a live deployment or full test-suite pass from successful patch application.
+
+## Plugin?
+
+This entry mirrors an in-tree fork change. It is not a separately installable hermes-mods plugin.

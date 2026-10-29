@@ -1,6 +1,6 @@
 # Unresolved goal fallback
 
-Patch **0392** (`2228cfe8da`, core PR #48; squash of the draft commits listed under Code).
+Patch **0399** (`2228cfe8da`, core PR #48; squash of the draft commits listed under Code).
 
 ## Behavior
 
@@ -37,7 +37,7 @@ Combined coach discovery and scripted agent-loop tests cover CLI/Desktop platfor
 
 ## Applying
 
-Part of the ordered series (0392). Apply the full series from the documented merge base with `git am -3 --empty=keep`; verified in [mirror-392-verification.md](mirror-392-verification.md). Merging core adds only the hook infrastructure: enforcement stays off until the opt-in coach `goal_disposition` plugin (hermes-mods PR #3) is enabled. A running backend needs a restart to load it.
+Part of the ordered series (0399). Apply the full series from the documented merge base with `git am -3 --empty=keep`; verified in [mirror-392-verification.md](mirror-392-verification.md). Merging core adds only the hook infrastructure: enforcement stays off until the opt-in coach `goal_disposition` plugin (hermes-mods PR #3) is enabled. A running backend needs a restart to load it.
 
 ## Gotchas
 

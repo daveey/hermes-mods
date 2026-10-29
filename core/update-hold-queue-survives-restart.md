@@ -1,6 +1,6 @@
 # Update hold: a queued message survives the backend restart and is delivered once
 
-Patches: 0739 (fork `2f26519116`), 0740 (`0d1e39ba3e`), 0741 (`4edd4010e0`).
+Patches: 0900 (fork `2f26519116`), 0901 (`0d1e39ba3e`), 0929 (`4edd4010e0`).
 
 ## Behavior
 
@@ -21,10 +21,10 @@ Now:
   - **Accepted just before the restart:** once the hold lifts and the turn starts, the turn's own marker replaces the
     `update_hold_queue` entry. A turn the SIGTERM killed is continued as an interrupted turn, not sent again. A turn
     that already answered is not replayed.
-  - **Renderer reload to the same backend (0741):** Desktop reconnects to the same backend, and `session.resume`
+  - **Renderer reload to the same backend (0929):** Desktop reconnects to the same backend, and `session.resume`
     reuses the live record. While the live queue holds the prompt, the marker is not replayed, and it stays for a
     later restart. During the hold itself the replay was already blocked: `_start_session_work` reserves fresh
-    admission, and the hold refuses it. Before 0741 the duplicate was reachable only while admission was open and the
+    admission, and the hold refuses it. Before 0929 the duplicate was reachable only while admission was open and the
     queue still held the prompt. That is the ≤250 ms before the retry timer drains after the hold lifts, or a queue
     retrying on transient contention. In that window the warm resume replayed the text and the queue drained it too.
   - **Reload that outlasted the orphan grace:** the reaper drops the in-memory queue and keeps the marker, so the next
@@ -48,16 +48,16 @@ Now:
    `violates its wire contract`). The test asserted the dict, not the contract.
 5. **Why it wasn't caught:** the hold-queue tests (t_01a181e61e88e5d4) ran the queue and drain in one process. None
    killed the backend and resumed in a new one, and none reconnected to the same one. That gap is closed by the
-   restart, accepted-before-restart, reload and Stop tests below. 0741 came out of the reload test: it failed on 0740.
+   restart, accepted-before-restart, reload and Stop tests below. 0929 came out of the reload test: it failed on 0901.
    The follow-up 17:44:32 `session_busy` on the retry (a busy state.db read as another writer) was fixed by
-   `7e8e8f4a59` (turn-lease busy-DB floor). The replay test in 0740 drives that admission.
+   `7e8e8f4a59` (turn-lease busy-DB floor). The replay test in 0901 drives that admission.
 
 ## How it works
 
 - `tui_gateway/session_auto_continue.py::_queue_submit_behind_update_hold`: after the accept row,
   `record_turn_start(..., reason=UPDATE_HOLD_QUEUE_REASON)` with the merged queue text.
 - `_maybe_schedule_auto_continue`: a `held` marker replays `marker["prompt"]` with `display_kind=None`, and uses its
-  own age bound. A held marker is skipped while `session["queued_prompt"]` is set (0741).
+  own age bound. A held marker is skipped while `session["queued_prompt"]` is set (0929).
 - `tui_gateway/startup_resume.py`: `UPDATE_HOLD_QUEUE_REASON` joins `_RETRY_REASONS` with the 1 h bound.
 - `tui_gateway/turn_marker.py`: `reason` on `record_turn_start`; `UPDATE_HOLD_QUEUE_REASON`,
   `UPDATE_HOLD_QUEUE_MAX_AGE_S`.
@@ -78,9 +78,9 @@ Now:
 - Accepted just before the restart (real claim/dispatch path): `test_prompt_accepted_just_before_the_restart_is_continued_not_replayed`,
   `test_prompt_answered_just_before_the_restart_is_not_sent_again`.
 - Renderer reload: `test_renderer_reload_under_the_hold_leaves_the_prompt_to_the_live_queue` (through
-  `_resume_reuse_live_locked`; failed before 0741), `test_renderer_gone_long_enough_to_reap_the_session_replays_once_in_the_same_backend`.
+  `_resume_reuse_live_locked`; failed before 0929), `test_renderer_gone_long_enough_to_reap_the_session_replays_once_in_the_same_backend`.
   The first test stubs `_start_session_work`, so it shows the guard holds with admission open; it does not show the
-  race happening live. 0741's commit message says "under the update hold". The reachable window is the narrower one
+  race happening live. 0929's commit message says "under the update hold". The reachable window is the narrower one
   under Behavior.
 - Cross-process probe (real `python -m tui_gateway.entry` processes, isolated HERMES_HOME, live code `4edd4010e0`,
   2026-10-29 00:37 PDT). It sets the hold and submits (`queued`, marker journaled), warm-resumes on the same backend
@@ -95,7 +95,7 @@ sessions; the full SIGTERM → respawn → resume run is proved live (see Gotcha
 
 ## Applying
 
-Apply 0739, 0740, 0741 in order after 0738 with `git am -3`. 0740 needs `7e8e8f4a59` (turn-lease busy-DB floor) for
+Apply 0900, 0901, 0929 in order after 0906 with `git am -3`. 0901 needs `7e8e8f4a59` (turn-lease busy-DB floor) for
 its lease test.
 
 ## Gotchas

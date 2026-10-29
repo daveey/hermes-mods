@@ -1,0 +1,157 @@
+From 3bc8874799c754caec763b41ca23f7434f2ff078 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 22:14:52 +0000
+Subject: [PATCH 425/453] test(routing): exercise failure and tool-loop native
+ HTTP boundaries
+
+(cherry picked from commit 3bc8874799c754caec763b41ca23f7434f2ff078)
+---
+ tests/agent/test_class_failure_wire.py | 136 +++++++++++++++++++++++++
+ 1 file changed, 136 insertions(+)
+ create mode 100644 tests/agent/test_class_failure_wire.py
+
+diff --git a/tests/agent/test_class_failure_wire.py b/tests/agent/test_class_failure_wire.py
+new file mode 100644
+index 0000000000..2f103d96bd
+--- /dev/null
++++ b/tests/agent/test_class_failure_wire.py
+@@ -0,0 +1,136 @@
++"""Exercise the real turn recovery ladder through a native SDK HTTP transport."""
++import json
++from copy import deepcopy
++from unittest.mock import patch
++
++import anthropic
++import httpx
++import pytest
++
++from hermes_cli.config import atomic_config_write
++from tests.agent.test_model_routing_agent import build_agent
++from tests.agent import test_model_routing_agent
++
++routing_home = test_model_routing_agent.routing_home
++streaming_route = test_model_routing_agent.streaming_route
++
++
++def completion(model, tool_round=None):
++    message = {"id": "test-message", "type": "message", "role": "assistant",
++               "model": model, "content": [], "stop_reason": None,
++               "usage": {"input_tokens": 10, "output_tokens": 0}}
++    events = [
++        {"type": "message_start", "message": message},
++        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
++        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}},
++        {"type": "content_block_stop", "index": 0},
++        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
++        {"type": "message_stop"},
++    ]
++    if tool_round is not None:
++        events[1]["content_block"] = {"type": "tool_use", "id": f"tool-{tool_round}",
++                                     "name": "read_file", "input": {}}
++        events[2]["delta"] = {"type": "input_json_delta", "partial_json": json.dumps({
++            "path": f"fixture-{tool_round}.txt"})}
++        events[4]["delta"]["stop_reason"] = "tool_use"
++    body = "".join("event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n" for event in events)
++    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
++
++
++@pytest.mark.parametrize("failure", ["timeout", 401, 429])
++@pytest.mark.parametrize("exhausted", [False, True])
++def test_class_failure_never_reaches_paid_wire(routing_home, streaming_route, tmp_path, failure, exhausted):
++    second = deepcopy(routing_home["model_routing"]["routes"]["deep"][0])
++    second["model"] = "z-anthropic-deep"
++    routing_home["model_routing"]["routes"]["deep"].append(second)
++    routing_home["agent"] = {"max_iterations": 4}
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    sent = []
++
++    def respond(request):
++        body = json.loads(request.content)
++        sent.append((str(request.url), dict(request.headers), body))
++        if exhausted or body["model"] == "anthropic-deep":
++            if failure == "timeout":
++                raise httpx.ReadTimeout("simulated transport timeout", request=request)
++            return httpx.Response(failure, json={"type": "error", "error": {
++                "type": "authentication_error" if failure == 401 else "rate_limit_error",
++                "message": "invalid credential" if failure == 401 else "quota exhausted"}})
++        return completion(body["model"])
++
++    sdk_class = anthropic.Anthropic
++
++    def sdk(**kwargs):
++        kwargs["http_client"] = httpx.Client(transport=httpx.MockTransport(respond))
++        kwargs["max_retries"] = 0
++        return sdk_class(**kwargs)
++
++    with patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("agent.turn_recovery.interruptible_backoff_sleep", return_value=None), \
++         patch("anthropic.Anthropic", side_effect=sdk):
++        agent = build_agent(session_id="wire-recovery", max_iterations=4,
++                            fallback_model=[{"provider": "openrouter", "model": "paid-wrong-class"}])
++        try:
++            result = agent.run_conversation("Say ok")
++            if failure != 401 and not exhausted:
++                assert result["final_response"] == "ok", result
++                assert agent.model == "z-anthropic-deep"
++                resumed = build_agent(session_id="wire-recovery")
++                try:
++                    assert resumed.model == agent.model
++                finally:
++                    resumed.release_clients()
++            else:
++                assert result.get("failed") or result.get("error"), result
++        finally:
++            agent.release_clients()
++    assert sent
++    assert all(url.startswith("https://api.anthropic.com/") for url, _, _ in sent)
++    assert all(headers.get("authorization", "").startswith("Bearer sk-ant-oat") for _, headers, _ in sent)
++    assert all("x-api-key" not in headers for _, headers, _ in sent)
++    assert all(body["model"] in {"anthropic-deep", "z-anthropic-deep"} for _, _, body in sent)
++    if failure != 401 and not exhausted:
++        assert {body["model"] for _, _, body in sent} == {"anthropic-deep", "z-anthropic-deep"}
++        assert sent[0][2]["system"] == sent[-1][2]["system"]
++
++
++def test_repeated_tool_rounds_do_not_reallocate_or_rewrite_prefix(routing_home, streaming_route, tmp_path):
++    import sqlite3
++
++    sent = []
++    schema = {"type": "function", "function": {"name": "read_file", "description": "Read fixture",
++              "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
++                             "required": ["path"]}}}
++
++    def respond(request):
++        body = json.loads(request.content)
++        sent.append(body)
++        return completion(body["model"], len(sent) if len(sent) <= 2 else None)
++
++    sdk_class = anthropic.Anthropic
++
++    def sdk(**kwargs):
++        kwargs["http_client"] = httpx.Client(transport=httpx.MockTransport(respond))
++        return sdk_class(**kwargs)
++
++    with patch("model_tools.get_tool_definitions", return_value=[schema]), \
++         patch("model_tools.handle_function_call", return_value="fixture contents") as tool, \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("anthropic.Anthropic", side_effect=sdk):
++        agent = build_agent(session_id="tool-lineage", max_iterations=4)
++        try:
++            with sqlite3.connect(tmp_path / "model-routing.sqlite3") as db:
++                counters = db.execute("SELECT * FROM counters").fetchall()
++            result = agent.run_conversation("Read both fixtures then say ok")
++            assert result["final_response"] == "ok", result
++            assert tool.call_count == 2
++            assert len(sent) == 3
++            assert all(body["model"] == agent.model for body in sent)
++            assert all(body["system"] == sent[0]["system"] for body in sent)
++            assert all(body["tools"] == sent[0]["tools"] for body in sent)
++            assert sent[2]["messages"][:len(sent[1]["messages"])] == sent[1]["messages"]
++            with sqlite3.connect(tmp_path / "model-routing.sqlite3") as db:
++                assert db.execute("SELECT * FROM counters").fetchall() == counters
++        finally:
++            agent.release_clients()
+-- 
+2.54.0 (Apple Git-157)
+

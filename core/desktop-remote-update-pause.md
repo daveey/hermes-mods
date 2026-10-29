@@ -1,6 +1,6 @@
 # A remote's own update pauses SSH dials instead of redialing per request
 
-Patch: 0592 (daveey/hermes `79f405b20b` + test follow-up `469b0731ea`, exported as one patch). Follows up on [desktop-always-on-remote-dashboard.md](desktop-always-on-remote-dashboard.md) (0526, 0535),
+Patch: 0605 (daveey/hermes `79f405b20b` + test follow-up `469b0731ea`, exported as one patch). Follows up on [desktop-always-on-remote-dashboard.md](desktop-always-on-remote-dashboard.md) (0538, 0548),
 whose prewarm already backed off but whose request path did not.
 
 ## Why
@@ -27,7 +27,7 @@ Why 3: nothing remembered the refusal. The preflight's 'update-in-progress' erro
 Why 4: backoff lived only in remote-prewarm.ts (its own per-target state), not at the dial chokepoint, so only one of
   the paths that dial had it ("[remote-prewarm] ... retry 1 in 2000 ms" next to per-request redials).
 Root (happened): retry policy was owned by one caller instead of by the dial; a known-long refusal had no negative cache.
-Root (not caught): the 0526 tests (remote-warm-dispatch.test.ts) drive RemotePrewarmer with a mocked `ensure` and
+Root (not caught): the 0538 tests (remote-warm-dispatch.test.ts) drive RemotePrewarmer with a mocked `ensure` and
   pin only prewarm's own backoff; nothing ran repeated requests through the pool's delete-on-failure path, and the
   remote-lifecycle tests assert one refused dial, not what the next request does.
 Recurrence: same class as #103288 (boot re-driving a failing ssh probe every ~2 s, fixed by tagging that error
@@ -80,6 +80,6 @@ The three behaviour tests fail with `run()` made a passthrough (the pre-patch be
 - Generic SSH failures (host down, auth) are not cached by this gate; the request path still redials for those.
   Only prewarm backs off on them.
 
-## Follow-up patches (0610)
+## Follow-up patches (0606)
 
-**0610** (`469b0731ea`): the pause test now uses a documentation address for the hub instead of a real one (`electron/remote-update-pause.test.ts`); no behaviour change.
+**0606** (`469b0731ea`): the pause test now uses a documentation address for the hub instead of a real one (`electron/remote-update-pause.test.ts`); no behaviour change.

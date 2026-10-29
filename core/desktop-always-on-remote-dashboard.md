@@ -1,7 +1,7 @@
 # Desktop: keep remote gateways warm (always-on dashboard, prewarm, probe skip)
 
-Patches **0526** (`4dbfb50490`), **0535** (`7c62393349`, named-profile prewarm), **0595** (`19c6caabe0`, retire on a
-replaced runtime) and **0671** (`8e6534e7ad`, no marker drift or retire loop) and **0696** (`e4222cf97b`, the serve unlinks its own `.hermes-ssh-runtime-<nonce>` marker at lifespan shutdown/atexit only while it still records its pid, and prunes markers of provably dead pids at boot; live or unreadable markers are kept). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0448–0450).
+Patches **0538** (`4dbfb50490`), **0548** (`7c62393349`, named-profile prewarm), **0612** (`19c6caabe0`, retire on a
+replaced runtime) and **0682, 0695** (`8e6534e7ad`, no marker drift or retire loop) and **0718** (`e4222cf97b`, the serve unlinks its own `.hermes-ssh-runtime-<nonce>` marker at lifespan shutdown/atexit only while it still records its pid, and prunes markers of provably dead pids at boot; live or unreadable markers are kept). Builds on [desktop-remote-backend-reuse.md](desktop-remote-backend-reuse.md) (0454, 0455, 0456).
 
 ## Behavior
 
@@ -10,7 +10,7 @@ Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a
 - **Always-on remote dashboard.** `hermes always-on-dashboard install` writes a launchd agent (macOS,
   `com.hermes.always-on-dashboard`, `KeepAlive`) or a systemd user unit (Linux, `hermes-always-on-dashboard.service`,
   `Restart=always`) running `hermes always-on-dashboard run`. `run` waits for the update marker to clear, stages the
-  persisted token from `~/.hermes/desktop-ssh/always-on/` (0700 dir, 0600 `token`/`nonce`, minted once, never
+  persisted token from `~/.hermes/desktop-ssh/always-on/` (0735 dir, 0622 `token`/`nonce`, minted once, never
   rotated by a restart), writes `record.json` (pid, port, nonce, home) and execs the SAME
   `HERMES_DESKTOP=1 serve --isolated --ssh-session-token-file … --ssh-owner-nonce …` Desktop spawns, on fixed
   loopback port 9147 (a second copy exits `PORT_IN_USE`). `HERMES_ALWAYS_ON_DASHBOARD=1` disables the idle-exit
@@ -23,7 +23,7 @@ Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a
   path. It never kills it, writes a lockfile for it or rotates its token. Named profiles keep owned backends.
 - **Prewarm + hold.** `remote-prewarm.ts` dials every SSH connection in `connections.json` (its default profile,
   plus each named profile a user dispatch reached in the last 24 h, at most 4 per connection, recorded by
-  `RecentRemoteProfiles` in `userData/remote-prewarm-profiles.json`; 0535) at app ready, then every
+  `RecentRemoteProfiles` in `userData/remote-prewarm-profiles.json`; 0548) at app ready, then every
   15 s forces a health probe through `ensureRegistryBackend(…, { forceProbe })`; a failure retires the dead tunnel
   and reconnects, with 2/5/15/30/60 s backoff. `ControlPersist` 300 → 3600 s. `HERMES_DESKTOP_REMOTE_PREWARM=0`
   turns it off.
@@ -52,7 +52,7 @@ Opening or sending in a remote (SSH) session no longer waits on an SSH dial or a
 - `apps/desktop/electron/remote-warm-dispatch.test.ts`: probe skipped within 30 s and run after 30 s; forced probe
   on a dropped tunnel retires + reconnects; prewarmer backoff reconnect; startup prewarm dials all connections in
   parallel and schedules the keepalive; removed connections drop; recently used named profiles join the targets,
-  expire after 24 h, cap at 4, survive a restart, and are held like default ones (0535); `main.ts` call sites (start on ready, stop on
+  expire after 24 h, cap at 4, survive a restart, and are held like default ones (0548); `main.ts` call sites (start on ready, stop on
   quit, forced keepalive through `ensureRegistryBackend`, ledger wiring) pinned by source.
 
 The `main.ts` wiring is checked by source assertions, not by booting Electron; the live behavior is proved from
@@ -60,7 +60,7 @@ The `main.ts` wiring is checked by source assertions, not by booting Electron; t
 
 ## Applying
 
-Apply after 0448–0450. Then on each remote host: `hermes always-on-dashboard install` (once).
+Apply after 0454, 0455, 0456. Then on each remote host: `hermes always-on-dashboard install` (once).
 
 ## Gotchas
 
@@ -70,15 +70,15 @@ Apply after 0448–0450. Then on each remote host: `hermes always-on-dashboard i
   `always-on dashboard serves X, not Y` and spawns as before.
 - An update can rebuild the runtime (site-packages) without moving the checkout revision. The serve then reports
   `runtimeIntact: false`, Desktop refuses to reuse it (waits 20 s, logs "runs a replaced runtime", spawns), and the
-  revision-based skew watchdog never fired, so the dashboard sat stale until the next checkout change. 0595 makes the
+  revision-based skew watchdog never fired, so the dashboard sat stale until the next checkout change. 0612 makes the
   skew watchdog also retire on a lost runtime marker (between turns, never mid-update); the supervisor restarts it on
   the new runtime. Test: `test_a_replaced_runtime_retires_even_when_the_revision_did_not_move` and its two neighbours.
-- 0595 turned a PM side effect into a restart loop, fixed by **0671** (`8e6534e7ad`). On a host whose serve runs the
+- 0612 turned a PM side effect into a restart loop, fixed by **0682, 0695** (`8e6534e7ad`). On a host whose serve runs the
   store Python (`-I`, Linux hub), the marker `.hermes-ssh-runtime-<nonce>` sits inside PM's published python tree.
   `tree_digest` hashed it, so every `scripts/run_tests.sh` (`setup-hermes.sh --runtime-only` → `pm install
   --trust-recorded` → `check_project_lock` → `_toolchain`'s `ensure("uv", explicit=True)`, which re-hashes the
   python dependency) re-realized the python entry, deleted every marker and retired every SSH backend: the always-on
-  dashboard restarted every ~70 s. 0671: (1) `pm.store.tree_digest` skips files named exactly
+  dashboard restarted every ~70 s. 0682, 0695: (1) `pm.store.tree_digest` skips files named exactly
   `.hermes-ssh-runtime-<16 hex>` (`is_runtime_state_file`), like `__pycache__`; (2) the serve fingerprints its
   purelib at boot (dist-info `RECORD`s, top-level files, `pyvenv.cfg`, interpreter) and, on a lost marker over
   identical bytes, writes it back and stays up (`_ssh_runtime_reattach`); (3) a real runtime retirement is recorded

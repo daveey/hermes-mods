@@ -1,0 +1,799 @@
+From 5bab4bb450aa9322183f1653ed6ebe6c77d5bfd6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:36:02 +0000
+Subject: [PATCH] fix(kanban): keep remote notices in flight until the
+ transcript has them [daveey]
+
+A remote claim stays delivered=0 with holder pid + start until the notice is in
+the chat transcript. A dead holder is re-offered unless that shared key is
+already in the lineage. Poller and sweep record one key, so both yield one row.
+Legacy delivered=1 rows inside FRESH_S with no transcript hit are re-offered
+once; older ones are counted and left. Messaging and unloaded sweeps use the
+same durable claim.
+---
+ gateway/kanban_watchers.py                    |   5 +
+ gateway/kanban_watchers_notifier.py           |   7 +-
+ .../tui_gateway/test_kanban_remote_notices.py | 219 ++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 279 +++++++++++++++---
+ tui_gateway/kanban_unloaded.py                |  15 +-
+ tui_gateway/session_notifications.py          |  26 +-
+ 6 files changed, 508 insertions(+), 43 deletions(-)
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index fce74e6503..a2c634b434 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -10,6 +10,7 @@ in ``kanban_watchers_common``.
+ from __future__ import annotations
+ 
+ import asyncio
++import contextlib
+ import functools
+ import os
+ import time
+@@ -164,6 +165,10 @@ class GatewayKanbanWatchersMixin:
+ 
+     def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
+         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
++        # Claim was durable: the send finished, so clear the in-flight holder. A crash before this
++        # rewinds the claim (recover_orphaned_notify_claims) and the next tick sends again. [daveey]
++        with contextlib.suppress(Exception):
++            self._kanban_sub_op(board, "ack_notify_claim", sub, upto=cursor)
+ 
+     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
+         self._kanban_sub_op(board, "remove_notify_sub", sub)
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index c93f188a7a..7c4281e93e 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -313,7 +313,7 @@ class _Collector:
+             return None
+         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
+             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+-            thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
++            thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS, durable=True,
+         )
+         if not events:
+             return None
+@@ -334,6 +334,11 @@ class _Collector:
+         try:
+             if self.gc_due:
+                 self._gc_stale_subs(conn, slug)
++            # A claim whose holder died between claim and send is rewound before this tick claims again.
++            # Messaging has no transcript row to dedupe against, so a crash after a successful send and before
++            # the ack can deliver twice; that is the at-least-once trade the tui path already makes. [daveey]
++            with contextlib.suppress(Exception):
++                _kbn().recover_orphaned_notify_claims(conn)
+             # No explicit init_db(): connect() already runs the migration once per
+             # process, and init_db() would re-run it on a second connection racing
+             # the first.
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+index ed3f40e7d1..83f56647fb 100644
+--- a/tests/tui_gateway/test_kanban_remote_notices.py
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -2,7 +2,9 @@
+ 
+ import contextlib
+ import json
++import os
+ import sqlite3
++import time
+ 
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+@@ -124,7 +126,224 @@ def test_poller_collect_delivers_final_send_and_sweeper_dedupes(tmp_path):
+         assert len(db.get_messages(CHAT)) == 1
+ 
+ 
++def test_poller_acks_the_ledger_only_after_the_transcript_write(tmp_path, monkeypatch):
++    """The open-chat poller does not ack the in-flight row until the notice text is in the transcript."""
++    from tui_gateway import kanban_remote_notices as krn
++    from tui_gateway.session_notifications import _kb_ack_durable
++
++    now = time.time()
++    card = _card("t_poll_ack", CHAT, status="done", at=now - 4, final="after-write")
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    monkeypatch.setattr(krn, "ledger_path", lambda: ledger)
++    got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    text = object()
++    session = {"_kanban_claims": [{"remote": got[0], "texts": [text]}]}
++    _kb_ack_durable(session, set())
++    assert _ledger_row(ledger, CHAT, got[0]["ref"])["delivered"] == 0
++    _kb_ack_durable(session, {id(text)})
++    assert _ledger_row(ledger, CHAT, got[0]["ref"])["delivered"] == 1
++    assert session["_kanban_claims"][0]["acked"] is True
++
++
+ def test_absent_replica_is_read_only_and_not_created(tmp_path):
+     path = tmp_path / "absent.db"
+     assert sweep_remote_notices(replica_path=path, gateway="macbook") == []
+     assert not path.exists()
++
++
++# Live ledger rows the 2026-10-28 scan found claimed delivered=1 and missing from the transcript.
++# 33 of 37 landed; these four did not. The two 5ab65c rows were still in memory (chat mid-turn).
++PENDING_SESSION = "20261027_134353_5ab65c"
++PENDING_TASKS = ("t_01a183148bf778c8", "t_01a1834ff6b03914")
++LOST_SESSION = "20261026_235722_bef6c6"
++LOST_TASKS = ("t_01a18481058a3df0", "t_01a1836a150478cb")
++CLAIMED_PDT = 1793227349.0  # 2026-10-28 15:42:29 PDT, the 5ab65c claim time
++
++
++def _dead_pid() -> int:
++    import subprocess
++    import sys
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _hub(tmp_path, cards, me="macbook"):
++    path = tmp_path / "hub.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE meta(k TEXT, v TEXT)")
++        conn.execute("INSERT INTO meta VALUES ('gateway', ?)", (me,))
++        conn.execute("CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, seq INTEGER)")
++        for i, card in enumerate(cards, 1):
++            conn.execute("INSERT INTO replica VALUES (?,?,?,?,?)",
++                         ("hub", "tasks", card["key"], json.dumps(card["task"]), i))
++    return path
++
++
++def _card(tid, session, *, status, at, summary="handoff", final=None):
++    task = {"id": tid, "status": status, "title": tid, "board": "default", "assignee": "default",
++            "sessions": [{"gw": "macbook", "profile": "default", "session": session, "rel": "shepherd"}]}
++    if status == "done":
++        task["completed_at"] = at
++        task["completion_notice"] = {"event_id": 9000 + (hash(tid) % 1000), "payload": {"summary": summary}}
++        if final:
++            task["completion_notice"]["payload"]["final_sends"] = {session: final}
++            task["completion_notice"]["payload"]["summary"] = f"prose\nFINAL SEND for @session:default@macbook/{session}: {final}"
++    else:
++        task["run"] = {"ended_at": at, "summary": summary}
++        task["block_kind"] = "needs_input"
++    return {"key": f"default/default/{tid}", "task": task}
++
++
++def _ledger_row(ledger, session, ref):
++    with sqlite3.connect(ledger) as conn:
++        conn.row_factory = sqlite3.Row
++        row = conn.execute("SELECT * FROM notices WHERE session=? AND ref=?", (session, ref)).fetchone()
++        return dict(row) if row else None
++
++
++def _orphan_holder(ledger, session, ref):
++    with sqlite3.connect(ledger) as conn:
++        conn.execute("UPDATE notices SET holder_pid=?, holder_start=NULL WHERE session=? AND ref=?",
++                     (_dead_pid(), session, ref))
++
++
++def test_done_claim_survives_the_consumer_dying_before_the_turn(tmp_path):
++    """A. Claimed while the chat is busy; the consumer dies before the turn; the next one delivers once and acks."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    card = _card("t_done", CHAT, status="done", at=now - 10, final="once")
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    first = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    assert len(first) == 1 and first[0]["event_key"]
++    row = _ledger_row(ledger, CHAT, first[0]["ref"])
++    assert row["delivered"] == 0 and row["holder_pid"] == os.getpid()
++    _orphan_holder(ledger, CHAT, first[0]["ref"])
++
++    again = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now,
++                        transcript_has=lambda key, tid: False)
++    assert [item["ref"] for item in again] == [first[0]["ref"]]
++    assert krn.ack(again[0], ledger=ledger)
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    assert _ledger_row(ledger, CHAT, first[0]["ref"])["delivered"] == 1
++
++
++def test_transcript_write_then_death_before_ack_is_not_delivered_twice(tmp_path):
++    """B. Written, then the consumer dies before the ack: no second notice, and the row is acked."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    card = _card("t_written", CHAT, status="done", at=now - 5, final="kept")
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        db.record_kanban_notice(CHAT, got[0]["text"],
++                                {"notice_id": "live:b", "kanban_event_keys": [got[0]["event_key"]]})
++        _orphan_holder(ledger, CHAT, got[0]["ref"])
++
++        def has(key, tid):
++            return krn.notice_in_transcript(db, CHAT, key, tid)
++
++        assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now, transcript_has=has) == []
++        assert len(db.get_messages(CHAT)) == 1
++    assert _ledger_row(ledger, CHAT, got[0]["ref"])["delivered"] == 1
++
++
++def test_poller_and_sweep_share_one_key(tmp_path):
++    """C (dedup half). The formatter is PR 177's. Poller + sweep still land one row."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    card = _card("t_shared", CHAT, status="done", at=now - 3, final="shared-key")
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        db.record_kanban_notice(CHAT, got[0]["text"],
++                                {"notice_id": got[0]["event_key"], "kanban_event_keys": [got[0]["event_key"]]})
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield (db, sid) if sid == CHAT else (None, None)
++
++        sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger)
++        assert len(db.get_messages(CHAT)) == 1
++        assert "shared-key" in db.get_messages(CHAT)[0]["content"]
++
++
++def test_blocked_claim_survives_the_consumer_dying(tmp_path):
++    """D. A blocked remote notice has the same in-flight guarantee, and the sweep uses the same key."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    card = _card("t_blocked", CHAT, status="blocked", at=now - 8, summary="need a decision")
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    first = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    assert len(first) == 1 and first[0]["event_key"] and "blocked" in first[0]["text"]
++    assert _ledger_row(ledger, CHAT, first[0]["ref"])["delivered"] == 0
++    _orphan_holder(ledger, CHAT, first[0]["ref"])
++    again = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    assert len(again) == 1 and again[0]["event_key"] == first[0]["event_key"]
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        db.record_kanban_notice(CHAT, again[0]["text"],
++                                {"notice_id": again[0]["event_key"], "kanban_event_keys": [again[0]["event_key"]]})
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield (db, sid) if sid == CHAT else (None, None)
++
++        sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger)
++        assert len(db.get_messages(CHAT)) == 1
++    assert krn.ack(again[0], ledger=ledger)
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++
++
++def test_legacy_fresh_rows_reoffered_once_and_stale_rows_left(tmp_path, caplog):
++    """E. The four missing 10-28 rows (inside FRESH_S, no transcript) are re-offered once. An older row is not."""
++    import logging
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = CLAIMED_PDT + 120
++    pending = [_card(tid, PENDING_SESSION, status="done", at=CLAIMED_PDT - 30) for tid in PENDING_TASKS]
++    lost = [_card(tid, LOST_SESSION, status="done", at=CLAIMED_PDT - 2500) for tid in LOST_TASKS]
++    stale_card = _card("t_old", CHAT, status="done", at=now - krn.FRESH_S - 100)
++    replica = _hub(tmp_path, pending + lost + [stale_card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    with sqlite3.connect(ledger) as conn:
++        conn.execute("CREATE TABLE notices (session TEXT, ref TEXT, state TEXT, at REAL, delivered INTEGER, "
++                     "PRIMARY KEY (session, ref, state))")
++        for card, session, at in (
++            *[(c, PENDING_SESSION, CLAIMED_PDT) for c in pending],
++            *[(c, LOST_SESSION, CLAIMED_PDT - 2400) for c in lost],
++            (stale_card, CHAT, now - krn.FRESH_S - 50),
++        ):
++            task = card["task"]
++            term = int(task.get("completed_at") or 0)
++            conn.execute("INSERT INTO notices VALUES (?,?,?,?,1)",
++                         (session, f"hub/{card['key']}", f"done@{term}", at))
++    caplog.set_level(logging.INFO, logger="tui_gateway.kanban_remote_notices")
++    got = krn.collect(PENDING_SESSION, "default", hub_db=replica, ledger=ledger, now=now,
++                      transcript_has=lambda key, tid: False)
++    assert {item["ref"].rsplit("/", 1)[-1] for item in got} == set(PENDING_TASKS)
++    lost_got = krn.collect(LOST_SESSION, "default", hub_db=replica, ledger=ledger, now=now,
++                           transcript_has=lambda key, tid: False)
++    assert {item["ref"].rsplit("/", 1)[-1] for item in lost_got} == set(LOST_TASKS)
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now,
++                       transcript_has=lambda key, tid: False) == []
++    assert "left 1 delivered notice" in caplog.text
++    assert krn.collect(PENDING_SESSION, "default", hub_db=replica, ledger=ledger, now=now,
++                       transcript_has=lambda key, tid: False) == []
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 1a1d8b0841..9d71d05b81 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -10,9 +10,13 @@ never verified the work (hub kanban.db evidence 2026-10-28, card t_01a182faed899
+ 
+ This module reads the replica for cards linked to (this gateway, the session's profile, the session) and returns
+ one notice per terminal state (done, blocked), claimed in a small SQLite ledger so a notice is delivered once
+-across every backend on this host. A refused turn releases its claim (``release``) so the owner of the chat
+-re-claims it. Only states that became terminal within ``FRESH_S`` are announced; older ones are recorded
+-silently, so a first run never floods a chat with history.
++across every backend on this host. A claim is in flight (holder pid + process start, the same probe the local
++tui path uses) until the notice is in the chat transcript; only then is the row ``delivered``. A holder that
++died first is re-offered, unless that key is already in the transcript. A refused turn releases its claim
++(``release``) so the owner of the chat re-claims it. Only states that became terminal within ``FRESH_S`` are
++announced; older ones are recorded silently, so a first run never floods a chat with history. A legacy
++``delivered=1`` row from before this (claimed before the write) inside ``FRESH_S`` whose notice is in no
++transcript of the chat is re-offered once.
+ 
+ Without hermes-hub (no hub.db) everything here is a no-op.
+ """
+@@ -106,9 +110,15 @@ def _ledger(path: Optional[Path] = None) -> sqlite3.Connection:
+     path = path or ledger_path()
+     path.parent.mkdir(parents=True, exist_ok=True)
+     conn = sqlite3.connect(str(path), timeout=5.0)
++    conn.row_factory = sqlite3.Row
+     conn.execute("PRAGMA journal_mode=WAL")
+     conn.execute("CREATE TABLE IF NOT EXISTS notices (session TEXT NOT NULL, ref TEXT NOT NULL, state TEXT NOT NULL, "
+                  "at REAL NOT NULL, delivered INTEGER NOT NULL, PRIMARY KEY (session, ref, state))")
++    cols = {row[1] for row in conn.execute("PRAGMA table_info(notices)")}
++    for name, decl in (("holder_pid", "INTEGER"), ("holder_start", "INTEGER"), ("notice_key", "TEXT"),
++                       ("legacy_seen", "INTEGER NOT NULL DEFAULT 0")):
++        if name not in cols:
++            conn.execute(f"ALTER TABLE notices ADD COLUMN {name} {decl}")
+     return conn
+ 
+ 
+@@ -139,6 +149,50 @@ def _event_key(owner: str, key: str, notice: dict) -> str:
+     return f"remote:{owner}:{key}:{notice['event_id']}"
+ 
+ 
++def _shared_key(owner: str, key: str, task: dict, profile: str, sid: str) -> str:
++    """The ``kanban_event_keys`` value both paths record. Done uses :func:`_event_key`; blocked has no
++    completion event, so the terminal state plus the destination is the identity."""
++    notice = task.get("completion_notice")
++    if task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice:
++        return _event_key(owner, key, notice)
++    at = _terminal_at(task)
++    return f"remote:{owner}:{key}:{task.get('status')}@{int(at) if at else 0}:{profile}:{sid}"
++
++
++def _my_holder() -> tuple:
++    from hermes_cli.kanban_db_notify import _my_holder as holder
++    return holder()
++
++
++def _holder_is_me(pid) -> bool:
++    from hermes_cli.kanban_db_notify import _holder_is_me
++    return pid is not None and _holder_is_me({"inflight_pid": pid})
++
++
++def _holder_alive(pid, start) -> bool:
++    from hermes_cli.kanban_db_notify import _holder_alive
++    return pid is not None and _holder_alive({"inflight_pid": pid, "inflight_start": start})
++
++
++def notice_in_transcript(db, session_id: str, notice_key: str, task_id: str) -> bool:
++    """True when this chat's compression lineage already has the notice (keyed row, or a legacy
++    ``Kanban <id>`` line). Reuses ``kanban_notice_keys_delivered`` — the local at-least-once dedup."""
++    if db is None:
++        return False
++    if notice_key and hasattr(db, "kanban_notice_keys_delivered"):
++        if notice_key in db.kanban_notice_keys_delivered(session_id, [notice_key]):
++            return True
++    if not task_id or not hasattr(db, "_read_ctx"):
++        return False
++    from hermes_state_sessions import _LINEAGE_CTE_SQL
++    with db._read_ctx() as conn:
++        row = conn.execute(
++            _LINEAGE_CTE_SQL + " SELECT 1 FROM messages m WHERE m.session_id IN (SELECT id FROM lineage) "
++            "AND instr(m.content, ?) > 0 LIMIT 1",
++            (session_id, session_id, f"Kanban {task_id} ")).fetchone()
++    return row is not None
++
++
+ def _completion_text(gw: str, key: str, task: dict, me: str, profile: str, sid: str) -> Optional[str]:
+     """Standard done notice from the owner's published ``completion_notice`` (FINAL SEND aware), else None."""
+     notice = task.get("completion_notice")
+@@ -150,58 +204,194 @@ def _completion_text(gw: str, key: str, task: dict, me: str, profile: str, sid:
+     return _format_kanban_event_text(sub, SimpleNamespace(**task), ev, task.get("board", "default"))
+ 
+ 
++def _notice_item(card: dict, session_key: str, me: str, profile: str) -> dict:
++    task = card["task"]
++    at = _terminal_at(task)
++    sid = card.get("sid") or session_key
++    text = _completion_text(card["gw"], card["key"], task, me, profile, sid)
++    item = {"text": text or format_notice(card["gw"], card["key"], task), "session": session_key,
++            "ref": f"{card['gw']}/{card['key']}", "state": f"{task['status']}@{int(at) if at else 0}"}
++    if text:
++        item["event_key"] = _event_key(card["gw"], card["key"], task["completion_notice"])
++    elif task.get("status") == "blocked":
++        item["event_key"] = _shared_key(card["gw"], card["key"], task, profile, sid)
++    return item
++
++
++def _reconcile_legacy(conn, session_key: str, cards: list, now: float, transcript_has, me: str,
++                      profile: str) -> list:
++    """Re-offer a pre-fix ``delivered=1`` row once, if it is still inside ``FRESH_S`` and in no transcript."""
++    if transcript_has is None:
++        return []
++    rows = conn.execute(
++        "SELECT ref, state, at FROM notices WHERE session=? AND delivered=1 AND IFNULL(legacy_seen,0)=0 "
++        "AND notice_key IS NULL", (session_key,)).fetchall()
++    if not rows:
++        return []
++    by_state = {}
++    for card in cards:
++        task = card["task"]
++        at = _terminal_at(task)
++        by_state[(f"{card['gw']}/{card['key']}", f"{task['status']}@{int(at) if at else 0}")] = card
++    pid, start = _my_holder()
++    stale = 0
++    out = []
++    for row in rows:
++        card = by_state.get((row["ref"], row["state"]))
++        if card is None or now - float(row["at"] or 0) > FRESH_S:
++            stale += 1
++            conn.execute("UPDATE notices SET legacy_seen=1 WHERE session=? AND ref=? AND state=?",
++                         (session_key, row["ref"], row["state"]))
++            continue
++        task = card["task"]
++        key = _shared_key(card["gw"], card["key"], task, profile, card.get("sid") or session_key)
++        if transcript_has(key, str(task["id"])):
++            conn.execute("UPDATE notices SET legacy_seen=1, notice_key=? WHERE session=? AND ref=? AND state=?",
++                         (key, session_key, row["ref"], row["state"]))
++            continue
++        cur = conn.execute(
++            "UPDATE notices SET delivered=0, holder_pid=?, holder_start=?, notice_key=?, legacy_seen=1 "
++            "WHERE session=? AND ref=? AND state=? AND delivered=1 AND IFNULL(legacy_seen,0)=0",
++            (pid, start, key, session_key, row["ref"], row["state"]))
++        if cur.rowcount == 1:
++            out.append(_notice_item(card, session_key, me, profile))
++    if stale:
++        logger.info("remote kanban: left %d delivered notice(s) unreoffered "
++                    "(older than %.0fh, or not in the replica)", stale, FRESH_S / 3600)
++    if out:
++        logger.info("remote kanban: re-offered %d legacy notice(s) claimed delivered but absent "
++                    "from the transcript", len(out))
++    return out
++
++
++def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id, transcript_has) -> str:
++    """``offer`` a new or orphaned claim, ``acked`` when the transcript already has it, else ``skip``.
++
++    A fresh claim is in flight (delivered=0, this process's pid + start). It becomes delivered only in
++    :func:`ack`, after the transcript write. A holder that is gone is re-offered unless the key is already
++    in the transcript.
++    """
++    row = conn.execute(
++        "SELECT delivered, holder_pid, holder_start, notice_key FROM notices WHERE session=? AND ref=? AND state=?",
++        (session, ref, state)).fetchone()
++    pid, start = _my_holder()
++    if row is None:
++        with conn:
++            conn.execute(
++                "INSERT INTO notices (session, ref, state, at, delivered, holder_pid, holder_start, notice_key, "
++                "legacy_seen) VALUES (?,?,?,?,?,?,?,?,?)",
++                (session, ref, state, now, 0 if fresh else 1, pid if fresh else None, start if fresh else None,
++                 notice_key, 0 if fresh else 1))
++        return "offer" if fresh else "skip"
++    if row["delivered"]:
++        return "skip"
++    holder = row["holder_pid"]
++    if _holder_is_me(holder) or _holder_alive(holder, row["holder_start"]):
++        return "skip"
++    if holder is None:
++        return "skip"  # old silent delivered=0 record: never announced, do not flood
++    key = notice_key or row["notice_key"] or ""
++    if transcript_has is not None and transcript_has(key, task_id):
++        with conn:
++            conn.execute(
++                "UPDATE notices SET delivered=1, holder_pid=NULL, holder_start=NULL, notice_key=? "
++                "WHERE session=? AND ref=? AND state=? AND delivered=0",
++                (key, session, ref, state))
++        return "acked"
++    with conn:
++        cur = conn.execute(
++            "UPDATE notices SET holder_pid=?, holder_start=?, notice_key=? "
++            "WHERE session=? AND ref=? AND state=? AND delivered=0 AND holder_pid IS ?",
++            (pid, start, key, session, ref, state, holder))
++    return "offer" if cur.rowcount == 1 else "skip"
++
++
+ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, ledger: Optional[Path] = None,
+             now: Optional[float] = None, lineage: tuple[str, ...] = (),
+-            skip: Optional[Callable[[str], bool]] = None) -> list[dict]:
+-    """Claim and return ``[{text, session, ref, state}]`` for this session's newly terminal remote cards.
+-
+-    ``lineage`` adds earlier ids of the same chat (a compaction fork keeps the link on the old id). ``skip(task_id)``
+-    is true for remote cards a local placeholder already reports (a deferred placement forward): its own tui
+-    subscription announces the result, so a second notice would be a duplicate. Never raises."""
++            skip: Optional[Callable[[str], bool]] = None,
++            transcript_has: Optional[Callable[[str, str], bool]] = None) -> list[dict]:
++    """Claim and return ``[{text, session, ref, state, event_key}]`` for this session's newly terminal remote cards.
++
++    The ledger row stays in flight (holder pid + start) until :func:`ack`. ``lineage`` adds earlier ids of the
++    same chat (a compaction fork keeps the link on the old id). ``skip(task_id)`` is true for remote cards a
++    local placeholder already reports. ``transcript_has(notice_key, task_id)`` lets a dead holder's claim be
++    acked instead of re-offered, and re-offers a legacy ``delivered=1`` row once. Never raises.
++    """
+     path = hub_db or hub_db_path()
+     if not session_key or not path.is_file():
+         return []
+     now = time.time() if now is None else now
++    profile = profile or "default"
+     try:
+         with _lock:
+             me, index = _index(path)
+         cards = []
+         for sid in (session_key, *lineage):
+-            cards.extend(dict(c, sid=sid) for c in index.get((profile or "default", sid), ()))
++            cards.extend(dict(c, sid=sid) for c in index.get((profile, sid), ()))
+         if not cards:
+             return []
+         out: list[dict] = []
+         conn = _ledger(ledger)
+         try:
++            with conn:
++                out.extend(_reconcile_legacy(conn, session_key, cards, now, transcript_has, me, profile))
++            offered = {(item["ref"], item["state"]) for item in out}
+             for card in cards:
++                if len(out) >= MAX_PER_POLL:
++                    break
+                 task = card["task"]
+                 ref = f"{card['gw']}/{card['key']}"
+                 at = _terminal_at(task)
+                 state = f"{task['status']}@{int(at) if at else 0}"
++                if (ref, state) in offered:
++                    continue
+                 fresh = at is not None and now - at <= FRESH_S
+                 if fresh and skip is not None and conn.execute(
+                         "SELECT 1 FROM notices WHERE session=? AND ref=? AND state=?",
+                         (session_key, ref, state)).fetchone() is None and skip(str(task["id"])):
+                     fresh = False  # recorded silently: the placeholder's own notice covers it
+-                with conn:
+-                    cur = conn.execute("INSERT OR IGNORE INTO notices VALUES (?,?,?,?,?)",
+-                                       (session_key, ref, state, now, 1 if fresh else 0))
+-                if cur.rowcount == 1 and fresh:
+-                    text = _completion_text(card["gw"], card["key"], task, me, profile or "default", card["sid"])
+-                    item = {"text": text or format_notice(card["gw"], card["key"], task), "session": session_key,
+-                            "ref": ref, "state": state}
+-                    if text:
+-                        item["event_key"] = _event_key(card["gw"], card["key"], task["completion_notice"])
+-                    out.append(item)
+-                    if len(out) >= MAX_PER_POLL:
+-                        break
++                key = _shared_key(card["gw"], card["key"], task, profile, card.get("sid") or session_key)
++                verdict = _claim_notice(conn, session=session_key, ref=ref, state=state, now=now, fresh=fresh,
++                                        notice_key=key, task_id=str(task["id"]), transcript_has=transcript_has)
++                if verdict == "offer":
++                    out.append(_notice_item(card, session_key, me, profile))
+         finally:
+             conn.close()
+         return out
+     except Exception:
++        logger.debug("remote kanban collect failed", exc_info=True)
+         return []
+ 
+ 
++def ack(claim: dict, *, ledger: Optional[Path] = None) -> bool:
++    """The notice is in the transcript: the in-flight row is delivered. Idempotent."""
++    try:
++        conn = _ledger(ledger)
++        try:
++            with conn:
++                cur = conn.execute(
++                    "UPDATE notices SET delivered=1, holder_pid=NULL, holder_start=NULL "
++                    "WHERE session=? AND ref=? AND state=? AND delivered=0",
++                    (claim["session"], claim["ref"], claim["state"]))
++                if cur.rowcount == 0 and claim.get("notice_key") and conn.execute(
++                        "SELECT 1 FROM notices WHERE session=? AND ref=? AND state=?",
++                        (claim["session"], claim["ref"], claim["state"])).fetchone() is None:
++                    pid_at = time.time()
++                    conn.execute(
++                        "INSERT INTO notices (session, ref, state, at, delivered, notice_key, legacy_seen) "
++                        "VALUES (?,?,?,?,1,?,1)",
++                        (claim["session"], claim["ref"], claim["state"], pid_at, claim["notice_key"]))
++            row = conn.execute(
++                "SELECT delivered FROM notices WHERE session=? AND ref=? AND state=?",
++                (claim["session"], claim["ref"], claim["state"])).fetchone()
++            return row is not None and int(row["delivered"]) == 1
++        finally:
++            conn.close()
++    except Exception:
++        logger.debug("remote kanban ack failed", exc_info=True)
++        return False
++
++
+ def release(claim: dict, *, ledger: Optional[Path] = None) -> bool:
+     """Hand a refused notice back so the chat's owning backend claims it on its next poll."""
+     try:
+@@ -241,13 +431,12 @@ def _session_db(profile, sid):
+         db.close()
+ 
+ 
+-def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session_db) -> list[dict]:
+-    """Read owner completion evidence and persist addressed notices exactly once.
+-
+-    SessionDB deduplicates by owner+board+card+event+destination in its writer
+-    transaction. Busy chats refuse the write; an unchanged replica is retried
+-    on the next sweep. Kept beside collect() so a background sweep still
+-    delivers FINAL SEND lines when no chat is polling.
++def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session_db, live_ids=None,
++                         ledger=None) -> list[dict]:
++    """Persist addressed notices, then ack the ledger. Write-first: a failed append leaves no delivered row
++    and the next sweep retries (no claim-before-durable). ``live_ids`` are open chats; their poller writes the
++    row and starts the turn, so this sweep skips them. Done and blocked share one ``kanban_event_keys`` value
++    with ``collect``, so running both yields one transcript row.
+     """
+     from hermes_cli.kanban_origin import _hub_db, gateway_names
+ 
+@@ -257,6 +446,7 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+     me = gateway if gateway is not None else gateway_names()[0]
+     if not me:
+         return []
++    live = set(live_ids or ())
+     try:
+         with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+             rows = conn.execute("SELECT gw,key,data FROM replica WHERE coll='tasks' AND gw!=?", (me,)).fetchall()
+@@ -268,24 +458,37 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+         try:
+             task = json.loads(raw)
+             notice = task.get("completion_notice")
+-            if task.get("status") != "done" or not isinstance(notice, dict):
++            done = task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice
++            blocked = task.get("status") == "blocked"
++            if not done and not blocked:
+                 continue
+             for link in task.get("sessions", []):
+                 if link.get("rel") != "shepherd" or link.get("gw") != me:
+                     continue
+                 profile, sid = link.get("profile"), link.get("session")
+-                if not profile or not sid:
++                if not profile or not sid or sid in live:
+                     continue
+-                event_id = notice["event_id"]
+-                metadata = {"notice_id": f"remote:{owner}:{key}:{event_id}:{profile}:{sid}",
+-                            "board": task.get("board", "default"), "task_id": task["id"],
+-                            "gateway": owner, "event_ids": [event_id],
+-                            "kanban_event_keys": [_event_key(owner, key, notice)]}
+-                text = _completion_text(owner, key, task, me, profile, sid)
++                if done:
++                    event_id = notice["event_id"]
++                    event_key = _event_key(owner, key, notice)
++                    metadata = {"notice_id": f"remote:{owner}:{key}:{event_id}:{profile}:{sid}",
++                                "board": task.get("board", "default"), "task_id": task["id"],
++                                "gateway": owner, "event_ids": [event_id],
++                                "kanban_event_keys": [event_key]}
++                    text = _completion_text(owner, key, task, me, profile, sid)
++                else:
++                    event_key = _shared_key(owner, key, task, profile, sid)
++                    metadata = {"notice_id": event_key, "board": task.get("board", "default"),
++                                "task_id": task["id"], "gateway": owner, "kanban_event_keys": [event_key]}
++                    text = format_notice(owner, key, task)
+                 with session_db(profile, sid) as (db, tip):
+-                    if db is not None:
++                    if db is not None and text:
+                         row_id = db.append_kanban_notice(tip, text, metadata)
+                         delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
++                        at = _terminal_at(task)
++                        ack({"session": sid, "ref": f"{owner}/{key}",
++                             "state": f"{task['status']}@{int(at) if at else 0}",
++                             "notice_key": event_key}, ledger=ledger)
+         except Exception:
+             logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
+     return delivered
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index a805d0e095..4a7a60d805 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -21,7 +21,9 @@ when the notice is diagnostic-only, when the chat's wake budget is spent (``HERM
+ default 4: a woken turn can create a card whose notice wakes it again) or when ``HERMES_KANBAN_UNLOADED_WAKE=0``.
+ A chat another live backend holds reaching the sweeper means that backend's poller missed: it is logged with the
+ holder ("poller miss"). Claimed events always end as a turn or a row: any error after the claim falls back to the row,
+-and a failed row rewinds the claim. Once woken, the chat is live in that process, so later notices go through its live
++and a failed row rewinds the claim. The claim is durable (holder pid + start) until that row or the started
++turn is acked; a sweeper that dies in between is rewound by ``recover_orphaned_notify_claims`` on the next
++pass, the same guarantee as the live poller. Once woken, the chat is live in that process, so later notices go through its live
+ poller like any open chat's. Residual: if submit raises after the turn thread already started, the row is written too.
+ A chat mid-turn refuses the row (``SessionTurnLeaseLostError``): that is "busy, try later", so the claim is rewound
+ with one INFO line and the next pass retries; a notice still stalled after ``OVERDUE_S`` logs one WARNING per card
+@@ -254,12 +256,17 @@ def _wake_job(wake, session_db, slug, ident, tip, text, metadata, old, new, now)
+             verdict = "error"
+         if verdict == "started":
+             _charge_wake(tip, now)
++            from hermes_cli import kanban_db_connect as _kbc
++            from hermes_cli import kanban_db_notify as _kbn
++            with contextlib.closing(_kbc.connect(board=slug)) as conn:
++                _kbn.ack_notify_claim(conn, upto=new, from_cursor=old, **ident)
+         else:
+             from hermes_cli import kanban_db_connect as _kbc
+             from hermes_cli import kanban_db_notify as _kbn
+             with contextlib.closing(_kbc.connect(board=slug)) as conn:
+                 if not _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new):
+                     return "deferred"
++                _kbn.ack_notify_claim(conn, upto=new, from_cursor=old, **ident)
+         logger.info("kanban sweep wake of %s for %s/%s: %s", tip, slug, ident["task_id"],
+                     "turn started" if verdict == "started" else f"{verdict}, notice row written")
+         return verdict
+@@ -347,7 +354,7 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+     with session_db(sub["chat_id"]) as (db, tip):
+         if db is None or tip is None:
+             return None  # no store holds this chat (deleted): leave the cursor alone
+-        old, new, claimed = _kbn.claim_unseen_events_for_sub(conn, kinds=kinds, **ident)
++        old, new, claimed = _kbn.claim_unseen_events_for_sub(conn, kinds=kinds, durable=True, **ident)
+         if not claimed:
+             return None  # a live poller or another sweeper got there first
+     texts = [t for t in (fmt(sub, task, ev, slug) for ev in claimed) if t]
+@@ -375,6 +382,8 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+         persisted = _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new)
+     if not persisted:
+         return None  # chat busy: the claim is rewound and the next pass retries
++    with contextlib.suppress(Exception):
++        _kbn.ack_notify_claim(conn, upto=new, from_cursor=old, **ident)
+     logger.info("kanban notice for unloaded session %s (board=%s task=%s events=%d wake=%s)",
+                 tip, slug, ident["task_id"], len(texts), verdict)
+     return {"board": slug, "task_id": ident["task_id"], "chat_id": ident["chat_id"], "session_id": tip,
+@@ -455,7 +464,7 @@ def _loop(stop: threading.Event) -> None:
+     while not stop.is_set():
+         try:
+             from tui_gateway.kanban_remote_notices import sweep_remote_notices
+-            sweep_remote_notices()
++            sweep_remote_notices(live_ids=live_session_ids())
+             sweep_once(live_session_ids(), grace_s=grace)
+         except Exception:
+             logger.warning("kanban unloaded sweep failed", exc_info=True)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 5906bdc147..dce517ab6a 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -658,6 +658,19 @@ def _forwarded_locally(remote_task_id: str) -> bool:
+         return False
+ 
+ 
++def _remote_transcript_has(session_key: str):
++    """``(notice_key, task_id) -> bool`` over this chat's lineage, for orphan and legacy reconciliation."""
++    def check(notice_key: str, task_id: str) -> bool:
++        try:
++            with _session_db({"session_key": session_key}) as db:
++                from tui_gateway.kanban_remote_notices import notice_in_transcript
++                return notice_in_transcript(db, session_key, notice_key, task_id)
++        except Exception:
++            logger.debug("remote kanban transcript check failed", exc_info=True)
++            return False
++    return check
++
++
+ def _collect_remote_kanban_notifications(session_key: str, claims: list | None) -> list:
+     """Done/blocked notices for cards on other gateways linked to this chat (``kanban_remote_notices``). [daveey]"""
+     try:
+@@ -666,7 +679,8 @@ def _collect_remote_kanban_notifications(session_key: str, claims: list | None)
+         if not _krn.hub_db_path().is_file():
+             return []
+         found = _krn.collect(session_key, get_active_profile_name() or "default",
+-                             lineage=_session_lineage(session_key), skip=_forwarded_locally)
++                             lineage=_session_lineage(session_key), skip=_forwarded_locally,
++                             transcript_has=_remote_transcript_has(session_key))
+     except Exception as exc:
+         _notif_log_failure("remote kanban notification poll failed", exc)
+         return []
+@@ -773,6 +787,16 @@ def _kb_ack_durable(session: dict, durable_ids: set) -> None:
+     by_sub: dict = {}
+     for claim in session.get("_kanban_claims") or []:
+         if claim.get("remote"):
++            texts = claim.get("texts") or []
++            if texts and all(id(t) in durable_ids for t in texts) and not claim.get("acked"):
++                try:
++                    from tui_gateway import kanban_remote_notices as _krn
++                    if _krn.ack(claim["remote"]):
++                        claim["durable"] = True
++                        claim["acked"] = True
++                except Exception:
++                    logger.warning(
++                        "remote kanban notice ack failed (a restart redelivers; the row dedups)", exc_info=True)
+             continue
+         texts = claim.get("texts") or []
+         if texts and all(id(t) in durable_ids for t in texts):
+-- 
+2.55.0
+

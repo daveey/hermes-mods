@@ -1,6 +1,6 @@
 # Orphan-race resume tests use a real session.resume ctx
 
-Patch: [`patches/0716-test-tui_gateway-build-orphan-race-resume-ctx-from-a.patch`](patches/0716-test-tui_gateway-build-orphan-race-resume-ctx-from-a.patch)
+Patch: [`patches/0788-test-tui_gateway-build-orphan-race-resume-ctx-from-a.patch`](patches/0788-test-tui_gateway-build-orphan-race-resume-ctx-from-a.patch)
 (fork commit `264ba95bc9`). Test harness only. Product code is unchanged.
 
 ## Behavior
@@ -26,7 +26,7 @@ Not re-run in this mirror. No product entry path changed, so none is claimed.
 
 ## Applying
 
-`git am -3` 0716. Test file only.
+`git am -3` 0788. Test file only.
 
 ## Gotchas
 

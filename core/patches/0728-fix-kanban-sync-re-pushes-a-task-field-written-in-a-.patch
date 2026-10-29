@@ -1,0 +1,178 @@
+From c36b1ef5f03bfe1a2f7a678b68780cc119415429 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 11:46:12 +0000
+Subject: [PATCH] fix(kanban): sync re-pushes a task field written in a capture
+ gap instead of diverging silently [daveey]
+
+Hub incident 2026-10-28 (t_01a180daf776c25e): kanban_wake_check._wake moved a
+card scheduled -> ready while another process was re-installing the capture
+triggers. The next install's gap heal queued the uid-less task_events row (so
+the wake_check_broken event reached the service), but a tasks row has no
+"never captured" marker, so its status change was never queued. The service
+kept 'scheduled' and refused every lease as not_claimable for ~3 h, until a
+later local write overwrote the status.
+
+Each sync round now runs repair_divergence after the pulls: for this
+gateway's cards whose live sync_version equals the replica's and that have
+no pending or rejected tasks op, any synced field that still differs can only
+be an uncaptured local write. Exactly those fields are queued (base_version =
+the shared version) and a warning is logged; RoundResult.repaired lists them.
+Cards with unequal versions (a remote edit not yet applied) are left alone.
+
+Tests: the gap reproduction (event synced, status not) in shadow and primary
+mode, RED before / GREEN after, plus a control that an unpulled remote edit
+is not clobbered.
+---
+ hermes_cli/kanban_sync_client.py            | 45 +++++++++++++++-
+ tests/hermes_cli/test_kanban_sync_client.py | 58 +++++++++++++++++++++
+ 2 files changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 8e558477b1..014e96eed6 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -31,7 +31,7 @@ import threading
+ import time
+ import urllib.error
+ import urllib.request
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+@@ -515,6 +515,7 @@ class RoundResult:
+     pulled: int = 0
+     push: Optional[PushResult] = None
+     error: Optional[str] = None
++    repaired: dict[str, list[str]] = field(default_factory=dict)  # cards re-pushed by repair_divergence
+ 
+ 
+ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+@@ -563,6 +564,11 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             except Resync:
+                 _log.warning("kanban sync: %s live cursor below the retention floor; rebuilding from a snapshot", slug)
+                 resync(live, hub, slug, observers=True, partition=gateway)
++        replica = open_shadow(slug, gateway)
++        try:
++            result.repaired = repair_divergence(live, replica, gateway)
++        finally:
++            replica.close()
+         result.push = push(live, hub, slug, gateway, primary=mode == "primary")
+         return result
+     finally:
+@@ -955,6 +961,43 @@ def diff(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) ->
+             "child_mismatch": children, "rejected_ops": rejected, "foreign_cards": foreign}
+ 
+ 
++def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, list[str]]:
++    """Queue the local values of this gateway's cards that the service never received.
++
++    A card whose live ``sync_version`` equals the replica's, with no outbox op in flight, has seen every service
++    write. Any synced field that still differs was then written locally with no capture trigger, e.g. in the
++    window while another process re-installed the triggers. The gap heal in ``install_or_remove`` only finds
++    child rows (they have no uid yet). A task row has no such marker, so this is the only place that finds it.
++    Hub incident 2026-10-28: a ``scheduled -> ready`` wake reached the service as its event but not as its
++    status, and the service refused every lease as ``not_claimable`` for 3 h. Returns {task id: fields queued}."""
++    from hermes_cli.kanban_db_connect import write_txn
++    held = {r[0] for r in live.execute(
++        "SELECT DISTINCT row_uid FROM kanban_sync_outbox WHERE table_name = 'tasks' AND state IN ('pending', 'rejected')")}
++    seen = {r[0]: r[1] for r in shadow.execute(
++        "SELECT id, sync_version FROM tasks WHERE (created_on = ? OR created_on IS NULL) AND sync_version IS NOT NULL",
++        (gateway,))}
++    repaired: dict[str, list[str]] = {}
++    rows = live.execute("SELECT * FROM tasks WHERE sync_version IS NOT NULL").fetchall()
++    for row in rows:
++        tid = row["id"]
++        if tid in held or seen.get(tid) != row["sync_version"]:
++            continue
++        theirs = shadow.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        mine, remote = _row_fields(live, "tasks", row), _row_fields(shadow, "tasks", theirs)
++        fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v}
++        if not fields:
++            continue
++        with write_txn(live):
++            live.execute(
++                "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++                "VALUES (?, 'tasks', ?, 'upsert', ?, ?, '', ?)",
++                (sync.uuid7(), tid, json.dumps(fields), row["sync_version"], int(time.time() * 1000)))
++        repaired[tid] = sorted(fields)
++        _log.warning("kanban sync: %s %s differed from the service with nothing in flight (an uncaptured write); "
++                     "re-queued", tid, ", ".join(sorted(fields)))
++    return repaired
++
++
+ # --- leases (primary boards) ----------------------------------------------------------------------
+ 
+ class HubLeaseClient:
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index e14494207f..1e2cef5278 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -613,6 +613,64 @@ def test_rows_written_in_a_capture_gap_are_queued_on_the_next_install(live, kanb
+         other.close()
+ 
+ 
++def _gap_wake(live, tid):
++    """kanban_wake_check._wake landing in a capture gap: a raw status UPDATE plus an event, no trigger."""
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'", (tid,))
++        live.execute("INSERT INTO task_events (task_id, kind, payload, created_at) "
++                     "VALUES (?, 'wake_check_broken', '{}', 1)", (tid,))
++
++
++def _service_task(svc, tid):
++    return svc.board(BOARD)["rows"]["tasks"][tid]
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_a_status_change_in_a_capture_gap_reaches_the_service_with_its_event(live, svc, kanban_home, mode):
++    # Hub incident 2026-10-28 (t_01a180daf776c25e): the gap heal queued the uid-less event but never the tasks row,
++    # so the service kept 'scheduled' and refused every lease as not_claimable while the board said 'ready'.
++    sync.set_mode(live, mode)
++    tid = kb.create_task(live, title="parked", assignee="worker")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,))
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)  # feed settled: board and replica agree on the version, as on the hub
++    assert _service_task(svc, tid)["status"] == "scheduled"
++    _gap_wake(live, tid)
++    _reinstall(kanban_home).close()  # the next process heals the gap
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    kinds = {c["fields"]["kind"] for c in svc.board(BOARD)["changes"]
++             if c["table"] == "task_events" and c["fields"] and c["fields"].get("task_id") == tid}
++    assert "wake_check_broken" in kinds
++    assert _service_task(svc, tid)["status"] == "ready"
++    shadow = _shadow()
++    try:
++        assert ksc.diff(live, shadow, ME)["field_mismatch"] == {}
++    finally:
++        shadow.close()
++
++
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_divergence_repair_leaves_an_unpulled_remote_edit_alone(live, svc, kanban_home, mode):
++    sync.set_mode(live, mode)
++    tid = kb.create_task(live, title="mine", assignee="worker")
++    _round(kanban_home, svc)
++    other = svc.hub(OTHER)
++    other.ops(BOARD, [{"client_op_id": "o-1", "op": "upsert", "table": "tasks", "uid": tid,
++                       "hlc": f"{int(time.time() * 1000) + 60_000:013d}-0000-{OTHER}", "fields": {"title": "renamed"}}])
++    _round(kanban_home, svc)  # the replica pulls the remote edit; this board never wrote it
++    shadow = _shadow()
++    try:
++        assert ksc.repair_divergence(live, shadow, ME) == {}  # versions differ: an edit not applied here, not a gap
++    finally:
++        shadow.close()
++    _round(kanban_home, svc)
++    assert _service_task(svc, tid)["title"] == "renamed"
++    assert not _pending(live)
++
++
+ def test_rows_from_before_the_first_attach_are_left_to_import(kanban_home):
+     support.write_sync_config(kanban_home, True)
+     conn = kbc.connect(kanban_home / "kanban.db")  # never attached: board_id is local:…
+-- 
+2.55.0
+

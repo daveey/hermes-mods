@@ -1,0 +1,342 @@
+From 5033f308f0aba5cd28fafb04e9cb363466984a41 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:05:10 +0000
+Subject: [PATCH] fix(desktop-e2e): fail fast on a small /dev/shm and keep core
+ failures inside the job limit [daveey]
+
+CI 40785530488 (a0ebd73b) lost the Desktop core lane with no explanation:
+9 specs each hit the 180 s test timeout, the 30 min job limit cancelled the
+run before the list reporter printed any failure, and the artifact upload
+hit the account-wide storage quota.
+
+Root cause (host, fixed outside this repo): the rebuilt gen-2 CI box created
+runner containers without --shm-size, so they had Docker's 64 MiB /dev/shm
+(every other box has 2g). Electron's renderer never painted there: the
+sibling update-concurrency job on the same box logged "app never became
+interactive" with an empty body while the backend was ready.
+
+This change makes that class self-diagnosing in the job log:
+- e2e/shm-preflight.ts: globalSetup for the core and update lanes refuses a
+  Linux /dev/shm under 512 MiB in ~2 s, naming --shm-size
+  (HERMES_E2E_ALLOW_SMALL_SHM=1 overrides).
+- core playwright config: maxFailures 3, so a lane-wide failure ends after
+  ~9 min and the end-of-run failure details reach the log.
+- waitForInteractive default 90 s (was 180 s, equal to the test timeout,
+  so its route/DOM/main-process diagnosis could never be printed).
+
+Tests: e2e/shm-preflight.unit.test.ts, e2e/core/lane-budget.unit.test.ts;
+both lanes' globalSetup run for real in a --shm-size 64m container (refused
+in 2 s) and core at 2g (passes).
+---
+ apps/desktop/e2e/core/global-setup.ts         |  6 ++
+ apps/desktop/e2e/core/harness.ts              | 11 ++-
+ .../desktop/e2e/core/lane-budget.unit.test.ts | 42 +++++++++
+ apps/desktop/e2e/core/playwright.config.ts    |  8 ++
+ apps/desktop/e2e/shm-preflight.ts             | 62 +++++++++++++
+ apps/desktop/e2e/shm-preflight.unit.test.ts   | 93 +++++++++++++++++++
+ apps/desktop/e2e/update/global-setup.ts       |  3 +
+ 7 files changed, 223 insertions(+), 2 deletions(-)
+ create mode 100644 apps/desktop/e2e/core/global-setup.ts
+ create mode 100644 apps/desktop/e2e/core/lane-budget.unit.test.ts
+ create mode 100644 apps/desktop/e2e/shm-preflight.ts
+ create mode 100644 apps/desktop/e2e/shm-preflight.unit.test.ts
+
+diff --git a/apps/desktop/e2e/core/global-setup.ts b/apps/desktop/e2e/core/global-setup.ts
+new file mode 100644
+index 0000000000..580e9ef18c
+--- /dev/null
++++ b/apps/desktop/e2e/core/global-setup.ts
+@@ -0,0 +1,6 @@
++import { assertShmLargeEnough } from '../shm-preflight'
++
++/** Fail the whole core lane in seconds on a host that cannot paint Electron. */
++export default function globalSetup(): void {
++  assertShmLargeEnough()
++}
+diff --git a/apps/desktop/e2e/core/harness.ts b/apps/desktop/e2e/core/harness.ts
+index 9bb7d2e9b9..4c53051701 100644
+--- a/apps/desktop/e2e/core/harness.ts
++++ b/apps/desktop/e2e/core/harness.ts
+@@ -471,8 +471,15 @@ export function composer(page: Page) {
+   return page.locator('[data-slot="composer-root"] [contenteditable="true"]').filter({ visible: true }).first()
+ }
+ 
+-/** Composer mounted, no full-viewport overlay above it, window visible. */
+-export async function waitForInteractive(app: ElectronApplication, page: Page, timeout = 180_000): Promise<void> {
++/**
++ * Composer mounted, no full-viewport overlay above it, window visible.
++ *
++ * The default stays well under the core lane's 180 s test timeout (a green
++ * core test, boot included, finishes in 10-34 s): when it equals the test timeout, the test
++ * timeout fires first and the "never became interactive" diagnosis below
++ * (route, center element chain, main-process log) is never produced.
++ */
++export async function waitForInteractive(app: ElectronApplication, page: Page, timeout = 90_000): Promise<void> {
+   try {
+     await expect(composer(page)).toBeVisible({ timeout })
+     await page.waitForFunction(
+diff --git a/apps/desktop/e2e/core/lane-budget.unit.test.ts b/apps/desktop/e2e/core/lane-budget.unit.test.ts
+new file mode 100644
+index 0000000000..94634aa9ec
+--- /dev/null
++++ b/apps/desktop/e2e/core/lane-budget.unit.test.ts
+@@ -0,0 +1,42 @@
++import * as fs from 'node:fs'
++import * as path from 'node:path'
++
++import { describe, expect, it } from 'vitest'
++
++/**
++ * The core lane must finish (and print its failures) inside the job's 30 min
++ * limit even when every spec fails. CI 40785530488: 9 specs x 180 s blank-window
++ * timeouts, then the job limit cancelled the run before Playwright printed a
++ * single error, and the artifact upload hit the account quota, so nothing
++ * explained the failure.
++ */
++const core = import.meta.dirname
++const config = fs.readFileSync(path.join(core, 'playwright.config.ts'), 'utf8')
++const harness = fs.readFileSync(path.join(core, 'harness.ts'), 'utf8')
++
++const workflow = fs.readFileSync(
++  path.join(core, '..', '..', '..', '..', '.github', 'workflows', 'e2e-desktop-core.yml'),
++  'utf8'
++)
++
++const num = (s: string) => Number(s.replace(/_/g, ''))
++
++describe('core lane time budget', () => {
++  const testTimeout = num(/\n {2}timeout: ([\d_]+),/.exec(config)![1])
++  const maxFailures = num(/\n {2}maxFailures: (\d+),/.exec(config)?.[1] ?? 'NaN')
++  const jobMinutes = num(/Desktop core E2E \(Linux\)[\s\S]*?timeout-minutes: (\d+)/.exec(workflow)![1])
++
++  it('stops a lane-wide failure well before the job limit', () => {
++    expect(Number.isFinite(maxFailures)).toBe(true)
++    // Failing specs alone must leave at least half the job for build + report.
++    expect(maxFailures * testTimeout).toBeLessThanOrEqual((jobMinutes * 60_000) / 2)
++  })
++
++  it('waitForInteractive gives up before the test timeout, so its diagnosis is printed', () => {
++    const fallback = num(/export async function waitForInteractive\([^)]*timeout = ([\d_]+)\)/.exec(harness)![1])
++
++    expect(fallback).toBeLessThan(testTimeout)
++    // and leaves room for the evaluate + log tail that builds the message
++    expect(testTimeout - fallback).toBeGreaterThanOrEqual(30_000)
++  })
++})
+diff --git a/apps/desktop/e2e/core/playwright.config.ts b/apps/desktop/e2e/core/playwright.config.ts
+index 5d773e7680..fc4fb56834 100644
+--- a/apps/desktop/e2e/core/playwright.config.ts
++++ b/apps/desktop/e2e/core/playwright.config.ts
+@@ -15,13 +15,21 @@ import { defineConfig } from '@playwright/test'
+  *  - 180 s per test (green runs take 6-36 s): a stalled stream fails the one
+  *    test fast instead of the 30-min job timeout cancelling the whole lane
+  *    before it reports.
++ *  - globalSetup refuses a host whose /dev/shm cannot paint Electron, and
++ *    maxFailures stops a lane-wide failure after 3 specs (~9 min). Both keep
++ *    the run inside the job limit so the list reporter's end-of-run failure
++ *    details reach the job log; with the artifact quota hit, that log is the
++ *    only evidence there is (CI 40785530488: 9 blank-window timeouts, then a
++ *    cancel, no error text and no artifact).
+  */
+ export default defineConfig({
+   testDir: '.',
+   testMatch: '*.spec.ts',
++  globalSetup: './global-setup.ts',
+   timeout: 180_000,
+   expect: { timeout: 60_000 },
+   retries: 0,
++  maxFailures: 3,
+   /* A required lane must also refuse a stray `.only`, not just stop
+    * retrying it: `forbidOnly: true` unconditionally — locally and in CI —
+    * because a focused test here would silently shrink a required job. */
+diff --git a/apps/desktop/e2e/shm-preflight.ts b/apps/desktop/e2e/shm-preflight.ts
+new file mode 100644
+index 0000000000..648d2e2523
+--- /dev/null
++++ b/apps/desktop/e2e/shm-preflight.ts
+@@ -0,0 +1,62 @@
++import * as fs from 'node:fs'
++
++/**
++ * Refuse to start an Electron E2E suite on a Linux host whose /dev/shm is too
++ * small for Chromium.
++ *
++ * Docker gives a container 64 MiB of /dev/shm unless it is started with
++ * --shm-size. Under that, the Electron renderer never paints: the backend comes
++ * up, but the window stays blank (`body text:` empty), so every spec times out
++ * at its own limit. On CI 40785530488 that was 9 x 180 s of identical timeouts
++ * before the 30 min job limit cancelled the lane, and no failure text was ever
++ * printed. This check fails the run in about a second instead, naming the cause.
++ */
++export const MIN_SHM_BYTES = 512 * 1024 * 1024
++
++export interface ShmProbe {
++  platform: NodeJS.Platform
++  /** Free bytes on /dev/shm, or null when it cannot be measured. */
++  shmBytes: () => null | number
++}
++
++export function shmProblem(probe: ShmProbe, min = MIN_SHM_BYTES): null | string {
++  if (probe.platform !== 'linux') {
++    return null
++  }
++
++  const bytes = probe.shmBytes()
++
++  if (bytes === null || bytes >= min) {
++    return null
++  }
++
++  const mib = (n: number) => `${Math.round(n / (1024 * 1024))} MiB`
++
++  return (
++    `/dev/shm has ${mib(bytes)} total; Electron needs at least ${mib(min)}. With less, the renderer stays ` +
++    `blank and every spec times out. Start the runner container with --shm-size (2g on the hermes CI ` +
++    `boxes), or set HERMES_E2E_ALLOW_SMALL_SHM=1 to run anyway.`
++  )
++}
++
++export function realShmBytes(): null | number {
++  try {
++    const s = fs.statfsSync('/dev/shm')
++
++    return s.blocks * s.bsize
++  } catch {
++    return null
++  }
++}
++
++export function assertShmLargeEnough(probe: ShmProbe = { platform: process.platform, shmBytes: realShmBytes }): void {
++  if (process.env.HERMES_E2E_ALLOW_SMALL_SHM === '1') {
++    return
++  }
++
++  const problem = shmProblem(probe)
++
++  if (problem) {
++    throw new Error(problem)
++  }
++}
+diff --git a/apps/desktop/e2e/shm-preflight.unit.test.ts b/apps/desktop/e2e/shm-preflight.unit.test.ts
+new file mode 100644
+index 0000000000..6522e1cc76
+--- /dev/null
++++ b/apps/desktop/e2e/shm-preflight.unit.test.ts
+@@ -0,0 +1,93 @@
++import * as fs from 'node:fs'
++import * as path from 'node:path'
++
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { assertShmLargeEnough, MIN_SHM_BYTES, realShmBytes, shmProblem } from './shm-preflight'
++
++const MiB = 1024 * 1024
++
++describe('shmProblem', () => {
++  it("names Docker's 64 MiB default as too small on Linux", () => {
++    // The gen-2 CI box (CI 40785530488) ran runner containers without
++    // --shm-size; Electron's window stayed blank and every spec timed out.
++    const problem = shmProblem({ platform: 'linux', shmBytes: () => 64 * MiB })
++
++    expect(problem).toContain('64 MiB')
++    expect(problem).toContain('--shm-size')
++  })
++
++  it('accepts the 2g the CI boxes give their containers', () => {
++    expect(shmProblem({ platform: 'linux', shmBytes: () => 2048 * MiB })).toBeNull()
++  })
++
++  it('accepts exactly the minimum', () => {
++    expect(shmProblem({ platform: 'linux', shmBytes: () => MIN_SHM_BYTES })).toBeNull()
++  })
++
++  it('does not block a host where /dev/shm cannot be measured', () => {
++    expect(shmProblem({ platform: 'linux', shmBytes: () => null })).toBeNull()
++  })
++
++  it('is Linux-only: macOS and Windows have no /dev/shm limit to check', () => {
++    const probe = () => {
++      throw new Error('must not probe off Linux')
++    }
++
++    expect(shmProblem({ platform: 'darwin', shmBytes: probe })).toBeNull()
++    expect(shmProblem({ platform: 'win32', shmBytes: probe })).toBeNull()
++  })
++})
++
++describe('assertShmLargeEnough', () => {
++  const saved = process.env.HERMES_E2E_ALLOW_SMALL_SHM
++
++  afterEach(() => {
++    if (saved === undefined) {
++      delete process.env.HERMES_E2E_ALLOW_SMALL_SHM
++    } else {
++      process.env.HERMES_E2E_ALLOW_SMALL_SHM = saved
++    }
++  })
++
++  it('throws on a small /dev/shm', () => {
++    delete process.env.HERMES_E2E_ALLOW_SMALL_SHM
++    expect(() => assertShmLargeEnough({ platform: 'linux', shmBytes: () => 64 * MiB })).toThrow(/\/dev\/shm has 64 MiB/)
++  })
++
++  it('can be overridden explicitly', () => {
++    process.env.HERMES_E2E_ALLOW_SMALL_SHM = '1'
++    expect(() => assertShmLargeEnough({ platform: 'linux', shmBytes: () => 64 * MiB })).not.toThrow()
++  })
++})
++
++describe('realShmBytes', () => {
++  it.runIf(process.platform === 'linux' && fs.existsSync('/dev/shm'))('measures the real /dev/shm size', () => {
++    const bytes = realShmBytes()
++
++    expect(typeof bytes).toBe('number')
++    expect(bytes).toBeGreaterThan(0)
++  })
++})
++
++describe('the Electron lanes run the preflight', () => {
++  // Both entry paths: the required core lane and the update lane each have
++  // their own Playwright config and global setup.
++  const e2e = import.meta.dirname
++
++  it('core: playwright config wires global-setup.ts, which asserts /dev/shm', () => {
++    const config = fs.readFileSync(path.join(e2e, 'core', 'playwright.config.ts'), 'utf8')
++    const setup = fs.readFileSync(path.join(e2e, 'core', 'global-setup.ts'), 'utf8')
++
++    expect(config).toMatch(/globalSetup: '\.\/global-setup\.ts'/)
++    expect(setup).toMatch(/assertShmLargeEnough\(\)/)
++  })
++
++  it('update: global setup asserts /dev/shm before building the install', () => {
++    const setup = fs.readFileSync(path.join(e2e, 'update', 'global-setup.ts'), 'utf8')
++    const body = setup.slice(setup.indexOf('export default function globalSetup'))
++
++    expect(body.indexOf('assertShmLargeEnough()')).toBeGreaterThan(-1)
++    expect(body.indexOf('assertShmLargeEnough()')).toBeLessThan(body.indexOf('seedInstall'))
++  })
++})
+diff --git a/apps/desktop/e2e/update/global-setup.ts b/apps/desktop/e2e/update/global-setup.ts
+index 2549b68372..62aa074912 100644
+--- a/apps/desktop/e2e/update/global-setup.ts
++++ b/apps/desktop/e2e/update/global-setup.ts
+@@ -1,6 +1,8 @@
+ import * as fs from 'node:fs'
+ import * as path from 'node:path'
+ 
++import { assertShmLargeEnough } from '../shm-preflight'
++
+ import { seedInstall, UPDATE_ROOT } from './harness'
+ 
+ /**
+@@ -38,6 +40,7 @@ function assertIsolated(): void {
+  */
+ export default function globalSetup(): void {
+   assertIsolated()
++  assertShmLargeEnough()
+ 
+   if (process.env.HERMES_E2E_UPDATE_REUSE === '1' && fs.existsSync(path.join(UPDATE_ROOT, 'install.json'))) {
+     return
+-- 
+2.55.0
+

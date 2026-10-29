@@ -1,0 +1,510 @@
+From 3eaf0d9d4a05020805fbcaa63fc388046f5ff140 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:08:18 +0000
+Subject: [PATCH] fix(kanban): self-heal fix card may requeue the card it
+ repaired [daveey]
+
+A worker that fixed a deterministic crash could not return that card to
+ready: unblock is orchestrator-only, the shell is fenced, and assignment
+routing has no supervisor and is told not to unblock. A self-heal fix card
+(created_by=self-heal, key selfheal:<fp>[:rN]:fix) may now unblock the
+single card named in its defect. A card that finished fix card created may
+do the same, so a completed repair is not stranded. Logged as
+self_heal_requeue. The shell fence is unchanged.
+---
+ hermes_cli/kanban.py                         |  53 ++++
+ tests/tools/test_kanban_self_heal_requeue.py | 259 +++++++++++++++++++
+ tools/kanban_tools.py                        |  34 +--
+ tools/kanban_tools_schemas.py                |   8 +-
+ tools/kanban_tools_self_heal.py              |  65 +++++
+ 5 files changed, 396 insertions(+), 23 deletions(-)
+ create mode 100644 tests/tools/test_kanban_self_heal_requeue.py
+ create mode 100644 tools/kanban_tools_self_heal.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 149537b21e..080183ae82 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1136,6 +1136,59 @@ def _is_stranded_runs_on_copy(conn, task) -> bool:
+     return False
+ 
+ 
++_SELF_HEAL_FIX_KEY = re.compile(r"^selfheal:[a-z0-9]+(?:-[a-z0-9]+)*(?::r[1-9]\d*)?:fix$")
++_NAMED_DEFECT_CARD = re.compile(
++    r"\bkanban card (t_[0-9a-f]{16}|t_[0-9a-f]{8})\b", re.IGNORECASE,
++)
++_PLURAL_DEFECT = re.compile(r"\bkanban cards\b", re.IGNORECASE)
++
++
++def _is_self_heal_fix_card(task) -> bool:
++    """A self-heal FIX card, not an investigation (``created_by`` alone is both)."""
++    if task is None or (task.created_by or "") != "self-heal":
++        return False
++    return bool(_SELF_HEAL_FIX_KEY.fullmatch(task.idempotency_key or ""))
++
++
++def named_defect_card(task) -> Optional[str]:
++    """The one ``kanban card t_...`` id in title/body, else None.
++
++    A sibling batch (``kanban cards``) or two different ids is not a single
++    defect, so it is not a grant.
++    """
++    if task is None:
++        return None
++    text = f"{task.title or ''}\n{task.body or ''}"
++    if _PLURAL_DEFECT.search(text):
++        return None
++    found = list(dict.fromkeys(_NAMED_DEFECT_CARD.findall(text)))
++    return found[0] if len(found) == 1 else None
++
++
++def self_heal_requeue_grant(conn, worker_task_id: str) -> tuple[Optional[str], Optional[str]]:
++    """``(target_id, fix_card_id)`` this worker may unblock, else ``(None, None)``.
++
++    A self-heal fix card may unblock the single card named in its defect. A
++    card that fix card created may do the same once the fix card is done, so a
++    finished repair is not stranded when the fix card can no longer call tools.
++    Any other worker, and any other target, stays refused. [daveey]
++    """
++    worker = kb.get_task(conn, worker_task_id)
++    if worker is None:
++        return None, None
++    if _is_self_heal_fix_card(worker):
++        target = named_defect_card(worker)
++        return (target, worker.id) if target else (None, None)
++    creator = _creator_task_id(conn, worker_task_id)
++    if not creator:
++        return None, None
++    fix = kb.get_task(conn, creator)
++    if fix is None or not _is_self_heal_fix_card(fix) or fix.status != "done":
++        return None, None
++    target = named_defect_card(fix)
++    return (target, fix.id) if target else (None, None)
++
++
+ def worker_archive_scope(conn, task_id: str) -> tuple[Optional[str], Optional[str]]:
+     """``(refusal, via)`` for archiving ``task_id`` from this process.
+ 
+diff --git a/tests/tools/test_kanban_self_heal_requeue.py b/tests/tools/test_kanban_self_heal_requeue.py
+new file mode 100644
+index 0000000000..dadf01f795
+--- /dev/null
++++ b/tests/tools/test_kanban_self_heal_requeue.py
+@@ -0,0 +1,259 @@
++"""A self-heal fix card may requeue the one card named in its defect.
++
++Ordinary workers stay refused (kanban_unblock is orchestrator-only, and the
++worker shell stays fenced). The grant is the fix card itself, or a card that
++finished fix card created, and only the single ``kanban card t_...`` id.
++"""
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++
++import pytest
++
++ROOT = __import__("pathlib").Path(__file__).resolve().parents[2]
++
++
++@pytest.fixture
++def board(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    for key in (
++        "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
++        "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME",
++        "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_WORKER_TASK",
++    ):
++        monkeypatch.delenv(key, raising=False)
++    from pathlib import Path as _Path
++    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
++    from hermes_cli import kanban_db as kb
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++def _triage(conn, kb, title="crashed card"):
++    tid = kb.create_task(conn, title=title, assignee="default")
++    conn.execute(
++        "UPDATE tasks SET status='triage', consecutive_failures=3, "
++        "last_failure_error='crash' WHERE id=?",
++        (tid,),
++    )
++    conn.commit()
++    return tid
++
++
++def _fix(conn, kb, target, *, key="selfheal:kanban-50a03854e8:fix", created_by="self-heal",
++         title=None, status=None):
++    title = title or (
++        f"self-heal fix: kanban card {target} on hermes-hub/default failed 3x (crashed):"
++    )
++    tid = kb.create_task(
++        conn, title=title, created_by=created_by, idempotency_key=key, assignee="default",
++    )
++    if status:
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++        conn.commit()
++    return tid
++
++
++def _as_worker(monkeypatch, conn, kb, tid):
++    kb.claim_task(conn, tid)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, tid)))
++
++
++def _unblock(target):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_unblock({"task_id": target}))
++
++
++def test_self_heal_fix_worker_requeues_named_triage_card(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    target = _triage(conn, kb)
++    fix = _fix(conn, kb, target)
++    _as_worker(monkeypatch, conn, kb, fix)
++    conn.close()
++
++    out = _unblock(target)
++    assert out.get("ok") is True, out
++    assert out.get("status") == "ready"
++    assert out.get("via") == "self-heal-requeue"
++
++    conn = kbc.connect()
++    try:
++        task = kb.get_task(conn, target)
++        assert task is not None
++        assert task.status == "ready"
++        assert task.consecutive_failures == 0
++        assert task.last_failure_error is None
++        events = [e for e in kb.list_events(conn, target) if e.kind == "self_heal_requeue"]
++        assert len(events) == 1
++        assert events[0].payload == {"by": fix, "fix_card": fix, "target": target}
++        assert any(e.kind == "unblocked" for e in kb.list_events(conn, target))
++    finally:
++        conn.close()
++
++
++def test_self_heal_fix_worker_cannot_requeue_a_different_card(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    named = _triage(conn, kb, "named")
++    other = _triage(conn, kb, "other")
++    fix = _fix(conn, kb, named)
++    _as_worker(monkeypatch, conn, kb, fix)
++    conn.close()
++
++    out = _unblock(other)
++    assert out.get("ok") is not True
++    assert "orchestrator-only" in out.get("error", "")
++
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, other).status == "triage"
++        assert kb.get_task(conn, named).status == "triage"
++    finally:
++        conn.close()
++
++
++def test_ordinary_worker_still_cannot_unblock(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    target = _triage(conn, kb)
++    worker = kb.create_task(conn, title="plain worker", assignee="default")
++    _as_worker(monkeypatch, conn, kb, worker)
++    conn.close()
++
++    out = _unblock(target)
++    assert out.get("ok") is not True
++    assert "orchestrator-only" in out.get("error", "")
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, target).status == "triage"
++    finally:
++        conn.close()
++
++
++def test_investigation_card_and_plural_defect_are_not_a_grant(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    conn = kbc.connect()
++    target = _triage(conn, kb)
++    investigation = _fix(
++        conn, kb, target, key="selfheal:kanban-50a03854e8",
++        title=f"self-heal: kanban card {target} on hub/default failed 3x",
++    )
++    _as_worker(monkeypatch, conn, kb, investigation)
++    assert kt._check_kanban_unblock() is False
++    assert _unblock(target).get("ok") is not True
++
++    plural = _fix(
++        conn, kb, target,
++        key="selfheal:kanban-aabbccddee:fix",
++        title=f"self-heal fix: kanban cards {target}+2 on hub/default failed",
++    )
++    _as_worker(monkeypatch, conn, kb, plural)
++    assert kt._check_kanban_unblock() is False
++    assert _unblock(target).get("ok") is not True
++    assert kb.get_task(conn, target).status == "triage"
++    conn.close()
++
++
++def test_child_of_done_fix_card_can_requeue_the_same_card(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    conn = kbc.connect()
++    target = _triage(conn, kb)
++    fix = _fix(conn, kb, target, status="done")
++    child = kb.create_task(
++        conn, title=f"requeue {target}", assignee="default", created_by="default",
++        creator_task_id=fix,
++    )
++    _as_worker(monkeypatch, conn, kb, child)
++    conn.close()
++
++    assert kt._check_kanban_unblock() is True
++    out = _unblock(target)
++    assert out.get("ok") is True, out
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, target).status == "ready"
++        payload = next(
++            e.payload for e in kb.list_events(conn, target) if e.kind == "self_heal_requeue"
++        )
++        assert payload == {"by": child, "fix_card": fix, "target": target}
++    finally:
++        conn.close()
++
++
++def test_child_of_unfinished_fix_card_cannot_requeue(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    target = _triage(conn, kb)
++    fix = _fix(conn, kb, target, status="running")
++    child = kb.create_task(
++        conn, title="too early", assignee="default", creator_task_id=fix,
++    )
++    _as_worker(monkeypatch, conn, kb, child)
++    conn.close()
++
++    assert _unblock(target).get("ok") is not True
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, target).status == "triage"
++    finally:
++        conn.close()
++
++
++def test_later_generation_fix_key_is_a_grant(board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    target = _triage(conn, kb)
++    fix = _fix(conn, kb, target, key="selfheal:kanban-50a03854e8:r2:fix")
++    _as_worker(monkeypatch, conn, kb, fix)
++    conn.close()
++
++    assert _unblock(target).get("ok") is True
++
++
++def test_self_heal_worker_cli_unblock_stays_fenced(board, monkeypatch):
++    """The shell fence is unchanged: only the in-process tool has the grant."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    conn = kbc.connect()
++    target = _triage(conn, kb)
++    fix = _fix(conn, kb, target)
++    _as_worker(monkeypatch, conn, kb, fix)
++    conn.close()
++
++    proc = subprocess.run(
++        [sys.executable, "-m", "hermes_cli.main", "kanban", "unblock", target],
++        cwd=ROOT, env=dict(__import__("os").environ), stdin=subprocess.DEVNULL,
++        capture_output=True, text=True, timeout=45, check=False,
++    )
++    assert proc.returncode != 0, (proc.stdout, proc.stderr)
++    assert "orchestrator-only" in proc.stderr
++    conn = kbc.connect()
++    try:
++        assert kb.get_task(conn, target).status == "triage"
++    finally:
++        conn.close()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index c45f3fa07a..e69026704c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -109,7 +109,7 @@ def _check_kanban_mode() -> bool:
+ 
+ @no_cache_check_fn
+ def _check_kanban_orchestrator_mode() -> bool:
+-    """Board-routing tools (kanban_list, kanban_unblock): hidden from task workers."""
++    """Board-routing tools (kanban_list): hidden from task workers."""
+     return _visible(to_env_worker=False)
+ 
+ 
+@@ -2019,22 +2019,6 @@ def _maybe_subscribe_on_touch(conn: Any, task_id: str) -> bool:
+                                  reason="touch")
+ 
+ 
+-@_kanban_handler("kanban_unblock")
+-def _handle_unblock(args: dict, **kw) -> str:
+-    """Transition a blocked (or triage/scheduled) task to ready, or todo while parents remain open."""
+-    _reject_delegated_child_mutation("kanban_unblock")
+-    _require_orchestrator_tool("kanban_unblock")
+-    tid = args.get("task_id")
+-    _check(tid, "task_id is required")
+-    tid = str(tid)
+-    _enforce_worker_task_ownership(tid)
+-    with _board(args.get("board")) as (kb, conn):
+-        _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
+-        subscribed = _maybe_subscribe_on_touch(conn, tid)
+-        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)),
+-                   **({"subscribed": True} if subscribed else {}))
+-
+-
+ @_kanban_handler("kanban_archive")
+ def _handle_archive(args: dict, **kw) -> str:
+     """Archive an unclaimed card this worker's task created, or any card for an orchestrator."""
+@@ -2125,8 +2109,13 @@ def _handle_origin_adopt(args: dict, **kw) -> str:
+ 
+ # --- Registration (order preserved: it is the order tools appear in the schema) ---
+ 
+-# kanban_list / kanban_unblock route the board and are hidden from task workers.
+-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
++# kanban_list routes the board and is hidden from task workers. kanban_unblock's
++# gate lives in kanban_tools_self_heal (orchestrators, plus a self-heal requeue grant).
++_ORCHESTRATOR_TOOLS = frozenset({"kanban_list"})
++from tools.kanban_tools_self_heal import check_unblock as _check_kanban_unblock_fn
++from tools.kanban_tools_self_heal import handle_unblock as _handle_unblock_fn
++_check_kanban_unblock = no_cache_check_fn(_check_kanban_unblock_fn)
++_handle_unblock = _kanban_handler("kanban_unblock")(_handle_unblock_fn)
+ _TOOLS = (
+     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
+     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
+@@ -2150,6 +2139,11 @@ _TOOLS = (
+     ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"))
+ 
+ for _name, _sch, _handler, _emoji in _TOOLS:
+-    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
++    if _name == "kanban_unblock":
++        _gate = _check_kanban_unblock
++    elif _name in _ORCHESTRATOR_TOOLS:
++        _gate = _check_kanban_orchestrator_mode
++    else:
++        _gate = _check_kanban_mode
+     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
+                       check_fn=_gate)
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index de7eab5044..60ee132d54 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -836,9 +836,11 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
+     (
+         "Unblock a Kanban task (blocked, scheduled, or a triage card a block "
+         "loop escalated). It moves to ready when all parents are done, "
+-        "or todo while any parent remains open. Orchestrator-only — only "
+-        "profiles with the kanban toolset can unblock routed work; "
+-        "dispatcher-spawned task workers never see this tool."
++        "or todo while any parent remains open. Orchestrator-only, except "
++        "one case: a self-heal fix card may unblock the single card named in "
++        "its defect (`kanban card t_...`). A card that finished fix card "
++        "created may do the same. Any other worker call is refused, and the "
++        "worker shell stays fenced."
+     ),
+     {
+         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+new file mode 100644
+index 0000000000..b212a1d61b
+--- /dev/null
++++ b/tools/kanban_tools_self_heal.py
+@@ -0,0 +1,65 @@
++"""Self-heal requeue: the one unblock a worker may perform on another card.
++
++Lives outside ``kanban_tools`` so that file, already over its line cap, does not
++grow. The shell fence is unchanged; only the in-process tool has this grant.
++"""
++from __future__ import annotations
++
++import os
++from typing import Optional
++
++
++def check_unblock() -> bool:
++    """Orchestrators always. A worker only when it holds a self-heal requeue grant."""
++    from tools.kanban_tools import _board, _is_dispatcher_owned_worker, _visible, logger
++
++    if _visible(to_env_worker=False):
++        return True
++    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    if not env_tid or not _is_dispatcher_owned_worker():
++        return False
++    try:
++        with _board(None) as (_, conn):
++            from hermes_cli.kanban import self_heal_requeue_grant
++            target, _fix = self_heal_requeue_grant(conn, env_tid)
++            return target is not None
++    except Exception:  # health: allow BLE001 -- tool-list gate fails closed; traceback is logged
++        logger.exception("kanban_unblock grant check failed")
++        return False
++
++
++def _log_requeue(conn, kb, tid: str, env_tid: str, fix_id: Optional[str]) -> None:
++    """Audit row in its own txn. ``unblock_task`` already committed the transition."""
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        kb._append_event(conn, tid, "self_heal_requeue", {
++            "by": env_tid, "fix_card": fix_id, "target": tid,
++        })
++
++
++def handle_unblock(args: dict, **kw) -> str:
++    """Transition a blocked/triage/scheduled task, or the one self-heal defect card."""
++    from tools import kanban_tools as kt
++
++    kt._reject_delegated_child_mutation("kanban_unblock")
++    tid = args.get("task_id")
++    kt._check(tid, "task_id is required")
++    tid = str(tid)
++    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    if env_tid and tid != env_tid:
++        with kt._board(args.get("board")) as (kb, conn):
++            from hermes_cli.kanban import self_heal_requeue_grant
++            grant, fix_id = self_heal_requeue_grant(conn, env_tid)
++            if grant == tid:
++                ok = kb.unblock_task(conn, tid)
++                kt._check(ok, f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
++                _log_requeue(conn, kb, tid, env_tid, fix_id)
++                return kt._ok(task_id=tid, via="self-heal-requeue",
++                              **kt._fields(kb.get_task(conn, tid), ("status",)))
++    kt._require_orchestrator_tool("kanban_unblock")
++    kt._enforce_worker_task_ownership(tid)
++    with kt._board(args.get("board")) as (kb, conn):
++        kt._check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
++        subscribed = kt._maybe_subscribe_on_touch(conn, tid)
++        return kt._ok(task_id=tid, **kt._fields(kb.get_task(conn, tid), ("status",)),
++                      **({"subscribed": True} if subscribed else {}))
+-- 
+2.55.0
+

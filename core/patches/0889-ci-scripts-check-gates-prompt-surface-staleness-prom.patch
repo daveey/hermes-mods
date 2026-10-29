@@ -1,0 +1,182 @@
+From 1cd314df0b296497e7ec8610f332eae310fd1ab7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 02:58:04 +0000
+Subject: [PATCH] ci: scripts/check gates prompt-surface staleness;
+ prompt_surface render is hermetic under any TMPDIR
+
+---
+ scripts/check                            |  6 ++-
+ scripts/ci/prompt_surface.py             | 54 ++++++++++++++++++++++++
+ tests/ci/test_prompt_surface_hermetic.py | 43 +++++++++++++++++++
+ 3 files changed, 102 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ci/test_prompt_surface_hermetic.py
+
+diff --git a/scripts/check b/scripts/check
+index 783553041f..70635d8a1b 100755
+--- a/scripts/check
++++ b/scripts/check
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """Run every blocking lint check CI runs, locally, with the same pinned tools: the lint
+ the workflow's guards, ruff and the code-health ratchet, plus the case-collision, lazy-deps,
+-profile-archive and blob-size guards that CI runs in workflows of their own.
++profile-archive, prompt-surface and blob-size guards that CI runs in workflows of their own.
+ 
+     python scripts/check                # everything, against the merge-base with origin/main
+     python scripts/check --only health  # just the code-health ratchet
+@@ -111,6 +111,10 @@ _GUARDS = {
+     "case-collisions": ["scripts/check-case-collisions.py"],
+     "lazy-deps": ["scripts/ci/check_lazy_deps_imports.py"],
+     "profile-archives": ["scripts/ci/check_profile_archive_boundary.py"],
++    # The committed system-prompt / tool-schema snapshot is what the code renders (the same
++    # comparison tests/ci/test_prompt_surface.py makes, ~6s). Needs the repo's own dependencies,
++    # which the hooks' python has; a push that edits a tool description without re-rendering stops here.
++    "prompt-surface": ["scripts/ci/prompt_surface.py", "check"],
+ }
+ # Guards that judge a diff, not a tree: they get the same base/head as the ratchet
+ # (blob-size-check.yml).
+diff --git a/scripts/ci/prompt_surface.py b/scripts/ci/prompt_surface.py
+index 92e9b43247..397cac0490 100644
+--- a/scripts/ci/prompt_surface.py
++++ b/scripts/ci/prompt_surface.py
+@@ -13,6 +13,7 @@ both through the production code into ``tests/fixtures/prompt_surface/``, which
+ * a repository ruleset requires a hermes-agent-core approval for that directory.
+ 
+     python scripts/ci/prompt_surface.py render            # regenerate the committed snapshot
++    python scripts/ci/prompt_surface.py check             # exit 1 when the committed snapshot is stale
+     python scripts/ci/prompt_surface.py diff BASE HEAD --output FILE   # Markdown summary
+ 
+ ``render`` runs in a throwaway ``HERMES_HOME`` (stock config, bundled skills synced) with the clock,
+@@ -92,6 +93,23 @@ def _pin_environment() -> None:
+     # The toolchain probe line reports the host's python/node/pip; it is environment, not code.
+     from tools import env_probe
+     env_probe.get_environment_probe_line = lambda **_k: ""  # type: ignore[assignment]
++    _bound_workspace_discovery()
++
++
++def _bound_workspace_discovery() -> None:
++    """Workspace discovery must stop at the throwaway home. It walks up from the cwd looking for a
++    ``.git`` or a project marker (AGENTS.md, Makefile...), and a caller whose TMPDIR sits under a
++    real directory with one (hub: ``~/.hermes/cache/scratch`` under ``~/AGENTS.md``) would otherwise
++    render its own checkout's workspace into the snapshot."""
++    from agent import coding_context
++    home = Path(os.environ["HOME"]).resolve()
++    git_root, marker_root = coding_context._git_root, coding_context._marker_root
++
++    def inside(path: Path | None) -> Path | None:
++        return path if path is not None and (path == home or home in path.parents) else None
++
++    coding_context._git_root = lambda cwd: inside(git_root(cwd))  # type: ignore[assignment]
++    coding_context._marker_root = lambda cwd: inside(marker_root(cwd))  # type: ignore[assignment]
+ 
+ 
+ class _ImportFailures(logging.Handler):
+@@ -223,6 +241,39 @@ def render(out: Path) -> int:
+     return 0
+ 
+ 
++def tree_differences(committed: Path, rendered: Path) -> list[str]:
++    """Paths that differ between two snapshot trees, byte for byte."""
++    out: list[str] = []
++    names = {p.relative_to(d).as_posix() for d in (committed, rendered) for p in d.rglob("*") if p.is_file()}
++    for name in sorted(names):
++        left, right = committed / name, rendered / name
++        if not left.exists():
++            out.append(f"not committed: {name}")
++        elif not right.exists():
++            out.append(f"only in committed: {name}")
++        elif left.read_bytes() != right.read_bytes():
++            out.append(f"stale: {name}")
++    return out
++
++
++REGENERATE = "scripts/run-in-hermes-env python scripts/ci/prompt_surface.py render"
++
++
++def check(snapshot: Path = SNAPSHOT) -> int:
++    """Exit 1 (naming the stale files) when *snapshot* is not what this checkout renders."""
++    with tempfile.TemporaryDirectory(prefix="prompt-surface-check-") as tmp:
++        rendered = Path(tmp) / "prompt_surface"
++        if (code := render(rendered)) != 0:
++            return code
++        differences = tree_differences(snapshot, rendered)
++    if differences:
++        print("prompt surface is stale: the system prompt or tool schemas changed without the snapshot.\n"
++              f"Regenerate and commit it:\n    {REGENERATE}\n" + "\n".join(differences[:20]))
++        return 1
++    print("prompt surface: snapshot is current")
++    return 0
++
++
+ # ── diff (stdlib only) ───────────────────────────────────────────────────────
+ 
+ def _signed(n: int) -> str:
+@@ -331,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
+     sub = parser.add_subparsers(dest="cmd", required=True)
+     r = sub.add_parser("render", help="regenerate the committed snapshot (default) or --out DIR")
+     r.add_argument("--out", type=Path, default=SNAPSHOT)
++    sub.add_parser("check", help="fail when the committed snapshot is stale")
+     d = sub.add_parser("diff", help="Markdown summary of two snapshot directories")
+     d.add_argument("base", type=Path)
+     d.add_argument("head", type=Path)
+@@ -340,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
+     args = parser.parse_args(argv)
+     if args.cmd == "render":
+         return render(args.out.resolve())
++    if args.cmd == "check":
++        return check()
+     if args.cmd == "_child":
+         return _render_child(args.out)
+     text = summarize(args.base, args.head)
+diff --git a/tests/ci/test_prompt_surface_hermetic.py b/tests/ci/test_prompt_surface_hermetic.py
+new file mode 100644
+index 0000000000..1c4a0ef15c
+--- /dev/null
++++ b/tests/ci/test_prompt_surface_hermetic.py
+@@ -0,0 +1,43 @@
++"""``prompt_surface.render`` gives the same bytes wherever the caller's TMPDIR lives.
++
++Workspace discovery walks up from the render's cwd looking for a ``.git`` or a project marker. When
++TMPDIR sat under a real directory with an AGENTS.md (the hub: ``~/.hermes/cache/scratch`` under
++``~/AGENTS.md``) the render picked that directory up and rewrote five prompts.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import tempfile
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[2]
++_spec = importlib.util.spec_from_file_location("prompt_surface", REPO / "scripts" / "ci" / "prompt_surface.py")
++assert _spec is not None and _spec.loader is not None
++prompt_surface = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(prompt_surface)
++
++
++def test_render_ignores_project_markers_above_tmpdir(tmp_path, monkeypatch):
++    outer = tmp_path / "outer"
++    scratch = outer / "cache" / "scratch"
++    scratch.mkdir(parents=True)
++    (outer / "AGENTS.md").write_text("# Outer rules\nUse the outer conventions.\n", encoding="utf-8")
++    (outer / "Makefile").write_text("test:\n\ttrue\n", encoding="utf-8")
++    (outer / ".git").mkdir()
++
++    clean = tmp_path / "clean"
++    assert prompt_surface.render(clean) == 0
++
++    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
++    polluted = tmp_path / "polluted"
++    assert prompt_surface.render(polluted) == 0
++
++    assert prompt_surface.tree_differences(clean, polluted) == []
++
++
++def test_check_reports_stale_files(tmp_path):
++    stale = tmp_path / "stale"
++    stale.mkdir()
++    (stale / "surfaces.json").write_text("{}\n", encoding="utf-8")
++    assert prompt_surface.check(stale) == 1
+-- 
+2.55.0
+

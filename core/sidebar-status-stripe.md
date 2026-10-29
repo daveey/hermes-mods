@@ -49,7 +49,7 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - A finished turn does not go green while the session's work still runs elsewhere. Its dot reads
   `background` (no stripe) when:
   - kanban tasks it created are still `todo`, `ready`, `running` or `scheduled` (`0044`). A turn that calls
-    `kanban_create` ends at once while workers run for hours. Since `0358`, blocked-only work also
+    `kanban_create` ends at once while workers run for hours. Since `0359`, blocked-only work also
     keeps both dot paths unfinished; the stripe retains its blocked priority. `done` and `archived`
     tasks don't count. See [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md).
   - its standing `/goal` is still `active` (`0051`): between goal turns, or parked on a judge `wait` timer.
@@ -131,7 +131,7 @@ row stripe from `0024` ([multi-gateway-projects.md](multi-gateway-projects.md)).
 - Blocked counts (`0063`): `_read_counts(path, statuses)` now takes the status set; `_all_counts()` reads
   `ACTIVE_STATUSES` and `BLOCKED_STATUSES = ("blocked",)` into two maps under one cache entry.
   `active_task_counts()` and the new `blocked_task_counts()` return each. `annotate_kanban_activity` stamps
-  `kanban_blocked` the same way as `kanban_active`. Since `0358`, blocked counts also prevent a finished dot
+  `kanban_blocked` the same way as `kanban_active`. Since `0359`, blocked counts also prevent a finished dot
   in both Desktop paths. Database/WAL fingerprints invalidate the three-second cache on external writes;
   see [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md) for verification and limits.
 - `app/chat/sidebar/gateway-device-icon.tsx`: `gatewayDevice(connection, localHostname)` picks the kind.
@@ -210,7 +210,7 @@ The three 0099/0104 regression files below passed in the full-series verificatio
   test uses two 12 s windows below the store’s 30 s sweep, preserving the assertion that hidden
   panes skip their own 5 s timer while visible panes poll.
 
-- `0124` (passed on the full 0001–0127 series, Oct 17, 2026 PT):
+- `0124` (passed on the full 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017, 0018, 0019, 0020, 0021, 0022, 0023, 0024, 0025, 0026, 0027, 0028, 0029, 0030, 0031, 0032, 0033, 0034, 0035, 0036, 0037, 0038, 0039, 0040, 0041, 0042, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057, 0058, 0059, 0060, 0061, 0062, 0063, 0064, 0065, 0066, 0067, 0068, 0069, 0070, 0071, 0072, 0073, 0074, 0075, 0076, 0077, 0078, 0079, 0080, 0081, 0082, 0083, 0084, 0085, 0086, 0087, 0088, 0089, 0090, 0091, 0092, 0093, 0094, 0095, 0096, 0097, 0098, 0099, 0100, 0101, 0102, 0103, 0104, 0105, 0106, 0107, 0108, 0109, 0110, 0111, 0112, 0113, 0114, 0115, 0116, 0117, 0118, 0119, 0120, 0121, 0122, 0123, 0124, 0125, 0126, 0127 series, Oct 17, 2026 PT):
   - `tests/tui_gateway/test_projects_rpc.py::test_tree_rows_carry_session_activity_stamps`: `projects.tree`
     previews and `projects.project_sessions` lanes carry `goal_active` and `kanban_active`/`kanban_blocked`; an idle
     session carries none of the four (control). `cron_active` and `background_active` are only checked as absent.
@@ -270,7 +270,7 @@ Hermes processes from erasing each other's entries there; it does not need `0069
 `0094` changes the backend reaper. Apply `0095` after `0092`
 (it extends `sessionStatusStripe`'s `kanbanBlocked` signature) and after `0051`/`0070` (adjacent router lines).
 `0124` needs the four annotators from `0044`/`0051`/`0070`/`0095` and the project tree from
-[multi-gateway-projects.md](multi-gateway-projects.md). Verified: 0001–0127 apply with `git am -3 --empty=keep` at merge-base
+[multi-gateway-projects.md](multi-gateway-projects.md). Verified: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017, 0018, 0019, 0020, 0021, 0022, 0023, 0024, 0025, 0026, 0027, 0028, 0029, 0030, 0031, 0032, 0033, 0034, 0035, 0036, 0037, 0038, 0039, 0040, 0041, 0042, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057, 0058, 0059, 0060, 0061, 0062, 0063, 0064, 0065, 0066, 0067, 0068, 0069, 0070, 0071, 0072, 0073, 0074, 0075, 0076, 0077, 0078, 0079, 0080, 0081, 0082, 0083, 0084, 0085, 0086, 0087, 0088, 0089, 0090, 0091, 0092, 0093, 0094, 0095, 0096, 0097, 0098, 0099, 0100, 0101, 0102, 0103, 0104, 0105, 0106, 0107, 0108, 0109, 0110, 0111, 0112, 0113, 0114, 0115, 0116, 0117, 0118, 0119, 0120, 0121, 0122, 0123, 0124, 0125, 0126, 0127 apply with `git am -3 --empty=keep` at merge-base
 `4957bbd0a0` (Oct 17, 2026 PT).
 
 ## Gotchas

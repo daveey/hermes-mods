@@ -1,6 +1,6 @@
 # Provider overlay never overwrites a configured default model
 
-Patches **0513, 0515** (sources `7dcc9a1d61`, `4cfc27bc24`).
+Patches **0520, 0522** (sources `7dcc9a1d61`, `4cfc27bc24`).
 
 ## Behavior
 
@@ -53,13 +53,13 @@ The card shows "Begin sets <model> as the default model for new chats." when the
 
 - `onboarding-local-confirm.test.ts`: unavailable/missing/partial config defers until Begin (one write of the shown
   model), dismiss does not write, explicit empty first run persists, and dismissal during empty/configured/failed
-  options reads has no effects. Six regressions failed before 0515; all eight pass after it.
+  options reads has no effects. Six regressions failed before 0522; all eight pass after it.
 - Follow-up verification: 75 onboarding tests pass; TypeScript and ESLint pass. The six existing first-run local
   tests now explicitly return empty config rather than simulating a failed configuration read.
 
 ## Applying
 
-`git am -3` 0513 and 0515. Touches only the onboarding store, the confirm panel and the onboarding locale blocks.
+`git am -3` 0520 and 0522. Touches only the onboarding store, the confirm panel and the onboarding locale blocks.
 
 ## Gotchas
 

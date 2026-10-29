@@ -9,7 +9,7 @@
 
 The full non-merge source range was enumerated and exported. All 384 previously reviewed public patch bodies remain byte-identical, including privacy substitutions, explicit empty duplicate envelopes and merge adaptations documented in [the earlier verification](mirror-377-verification.md). The historical 0251 adaptation retains its replacement envelope identity rather than being overwritten by its raw source commit. This is a public adapted series, not a claim of tree identity with private source.
 
-Six new patches were added: adoption **0380–0382** and annotation/alias-read latency fixes **0388–0390**. Previous archive-refresh 0380 is now **0383**; local-authority 0381–0384 is now **0384–0387**. Documentation references moved with the patches. No hotkey changed.
+Six new patches were added: adoption **0385, 0386, 0388** and annotation/alias-read latency fixes **0395, 0396, 0397**. Previous archive-refresh 0385 is now **0389**; local-authority 0386, 0388, 0389, 0390 is now **0390, 0391, 0393, 0394**. Documentation references moved with the patches. No hotkey changed.
 
 ## Full apply validation
 

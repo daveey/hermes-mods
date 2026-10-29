@@ -1,0 +1,214 @@
+From d6dc1fe8d7e539cca428be86f9cdf0d817a9a7c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 22:29:29 -0700
+Subject: [PATCH 455/456] feat(kanban): dispatcher honors hermes-sync
+ core-update drain hold (no new claims while running work drains) [t_368038b3]
+
+(cherry picked from commit d6dc1fe8d7e539cca428be86f9cdf0d817a9a7c1)
+---
+ agent/core_update_drain.py            | 97 +++++++++++++++++++++++++++
+ gateway/kanban_watchers_common.py     |  9 ++-
+ tests/agent/test_core_update_drain.py | 67 ++++++++++++++++++
+ 3 files changed, 172 insertions(+), 1 deletion(-)
+ create mode 100644 agent/core_update_drain.py
+ create mode 100644 tests/agent/test_core_update_drain.py
+
+diff --git a/agent/core_update_drain.py b/agent/core_update_drain.py
+new file mode 100644
+index 0000000000..e4979ffa5e
+--- /dev/null
++++ b/agent/core_update_drain.py
+@@ -0,0 +1,97 @@
++"""Core-update drain hold: hermes-sync asks for no NEW kanban claims while it drains.
++
++hermes-sync's ``core-drain`` writes ``<home>/core-update/drain-hold`` (JSON ``{"pid", "started_at",
++"reason"}``) for every installation root it is about to update, then waits until running workers
++finish and no Desktop turn is live, applies ``hermes update --yes`` and removes the file. While the
++hold is active the kanban dispatcher spawns nothing (running workers are never touched), so a
++saturated board drains instead of refilling between update checks.
++
++A hold only counts while its writer pid is alive: a crashed updater must not freeze dispatch.
++A file that cannot be parsed counts for ``_UNPARSEABLE_GRACE_S`` (a writer mid-write), then not.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import threading
++import time
++from pathlib import Path
++from typing import Optional
++
++from agent.file_safety import _hermes_home_path as _hermes_home, _hermes_root_path as _canonical_root
++
++HOLD_RELPATH = Path("core-update") / "drain-hold"
++_UNPARSEABLE_GRACE_S = 600
++
++_log_lock = threading.Lock()
++_logged: set[str] = set()
++
++
++def _pid_alive(pid: int) -> bool:
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    except OSError:
++        return False
++    return True
++
++
++def hold_paths() -> list[Path]:
++    """Process home first, then the fleet root when it is a different directory."""
++    paths = [_hermes_home() / HOLD_RELPATH]
++    try:
++        root = _canonical_root() / HOLD_RELPATH
++        if root.resolve() != paths[0].resolve():
++            paths.append(root)
++    except Exception:
++        pass
++    return paths
++
++
++def read_hold(path: Path, now: Optional[float] = None) -> Optional[dict]:
++    """The hold record when ``path`` is an active hold, else None."""
++    try:
++        raw = path.read_text(encoding="utf-8")
++        st = path.stat()
++    except (FileNotFoundError, NotADirectoryError):
++        return None
++    except OSError:
++        return None
++    try:
++        data = json.loads(raw)
++        pid = int(data["pid"])
++    except (ValueError, KeyError, TypeError):
++        age = (now if now is not None else time.time()) - st.st_mtime
++        return {"pid": None, "reason": "unparseable drain hold"} if 0 <= age < _UNPARSEABLE_GRACE_S else None
++    if pid <= 0 or not _pid_alive(pid):
++        return None
++    return data if isinstance(data, dict) else None
++
++
++def active_hold() -> Optional[dict]:
++    for path in hold_paths():
++        record = read_hold(path)
++        if record is not None:
++            return {**record, "path": str(path)}
++    return None
++
++
++def check_drain_hold(component: str, logger: logging.Logger) -> bool:
++    """True while a live drain hold exists; logs once per engagement per component."""
++    record = active_hold()
++    if record is None:
++        with _log_lock:
++            _logged.discard(component)
++        return False
++    with _log_lock:
++        first = component not in _logged
++        _logged.add(component)
++    if first:
++        logger.info("%s dispatch held for a core update drain (pid %s, %s); running workers continue",
++                    component, record.get("pid"), record.get("path"))
++    return True
+diff --git a/gateway/kanban_watchers_common.py b/gateway/kanban_watchers_common.py
+index 4be46ea4c4..e78afcd74f 100644
+--- a/gateway/kanban_watchers_common.py
++++ b/gateway/kanban_watchers_common.py
+@@ -107,7 +107,14 @@ def _kanban_dispatch_allowed() -> bool:
+         from agent.estop import check_paused
+     except ImportError:
+         return True
+-    return not check_paused("kanban", logger)
++    if check_paused("kanban", logger):
++        return False
++    # hermes-sync core-update drain: no new claims while running work drains (never touches it).
++    try:
++        from agent.core_update_drain import check_drain_hold
++    except ImportError:
++        return True
++    return not check_drain_hold("kanban", logger)
+ 
+ 
+ def _acquire_singleton_lock(lock_path) -> tuple[Optional[object], str]:
+diff --git a/tests/agent/test_core_update_drain.py b/tests/agent/test_core_update_drain.py
+new file mode 100644
+index 0000000000..2846694fba
+--- /dev/null
++++ b/tests/agent/test_core_update_drain.py
+@@ -0,0 +1,67 @@
++"""The kanban dispatcher spawns nothing while a live hermes-sync core-update drain hold exists."""
++
++import json
++import os
++import subprocess
++import time
++
++import pytest
++
++from agent import core_update_drain as drain
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setattr(drain, "_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    return tmp_path
++
++
++def _write(home, payload):
++    path = home / drain.HOLD_RELPATH
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
++    return path
++
++
++def _dead_pid():
++    p = subprocess.Popen(["true"])
++    p.wait()
++    return p.pid
++
++
++def test_no_hold_allows_dispatch(home):
++    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
++    assert drain.active_hold() is None
++    assert _kanban_dispatch_allowed() is True
++
++
++def test_live_hold_blocks_dispatch(home):
++    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
++    _write(home, {"pid": os.getpid(), "started_at": time.time(), "reason": "core update"})
++    assert drain.active_hold()["pid"] == os.getpid()
++    assert _kanban_dispatch_allowed() is False
++
++
++def test_dead_writer_hold_is_ignored(home):
++    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
++    _write(home, {"pid": _dead_pid(), "started_at": time.time()})
++    assert drain.active_hold() is None
++    assert _kanban_dispatch_allowed() is True
++
++
++def test_unparseable_hold_counts_only_briefly(home):
++    path = _write(home, "{partial")
++    assert drain.active_hold() is not None
++    old = time.time() - drain._UNPARSEABLE_GRACE_S - 5
++    os.utime(path, (old, old))
++    assert drain.active_hold() is None
++
++
++def test_profile_home_honors_fleet_root_hold(tmp_path, monkeypatch):
++    profile = tmp_path / "profiles" / "worker"
++    profile.mkdir(parents=True)
++    monkeypatch.setattr(drain, "_hermes_home", lambda: profile)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    _write(tmp_path, {"pid": os.getpid()})
++    assert drain.active_hold()["path"] == str(tmp_path / drain.HOLD_RELPATH)
+-- 
+2.54.0 (Apple Git-157)
+

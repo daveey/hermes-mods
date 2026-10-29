@@ -1,0 +1,120 @@
+From 1230e3d4af7134e981c63bd62de62fc61ac77775 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:38:31 +0000
+Subject: [PATCH] fix(gateway): persist watchdog degraded stamp before
+ hard-exit [daveey]
+
+The loop-liveness watchdog waited 0.25s for the background status writer
+and then os._exit, which kills that writer. On a CPU-throttled runner the
+wait expired first, so gateway_state.json stayed "running" after exit 75
+(test_loop_liveness_watchdog_marks_runtime_degraded_before_restart).
+
+Wait on the writer's completion with a 10s bound that returns as soon as
+the snapshot is durable. A wedged filesystem still cannot postpone the
+restart indefinitely. The new test holds persist past the old 0.25s
+deadline so the race is no longer load-dependent.
+---
+ gateway/shutdown_watchdog.py                 |  9 +++-
+ tests/gateway/test_loop_liveness_watchdog.py | 51 +++++++++++++++++++-
+ 2 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/gateway/shutdown_watchdog.py b/gateway/shutdown_watchdog.py
+index 60a6888d20..522d0a7d49 100644
+--- a/gateway/shutdown_watchdog.py
++++ b/gateway/shutdown_watchdog.py
+@@ -41,6 +41,12 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
+ # the loop it monitors) is fixed at the root by the off-loop heartbeat write + two-witness probe (#90502),
+ # so the default stays tight for genuine wedges.
+ DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
++# os._exit kills the background status writer, so a timed-out wait drops the
++# degraded stamp and readers keep seeing "running" (#113372). 0.25s expired
++# under CPU throttle before the snapshot was durable. Wait on the writer's
++# completion: this returns as soon as the write lands, and a wedged filesystem
++# can postpone the restart by at most this long.
++_STATUS_STAMP_WAIT_S = 10.0
+ _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
+ _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+ 
+@@ -172,7 +178,8 @@ def _mark_exited_quietly(exit_code: int, reason: str) -> None:
+         # operator intent (a restart-drain that wedged is still a requested restart) untouched.
+         restart = {"restart_requested": True} if exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE else {}
+         write_runtime_status(
+-            gateway_state="degraded", exit_reason=reason, wait_timeout=0.25, **restart)
++            gateway_state="degraded", exit_reason=reason,
++            wait_timeout=_STATUS_STAMP_WAIT_S, **restart)
+ 
+ 
+ def _process_hermes_home() -> Path:
+diff --git a/tests/gateway/test_loop_liveness_watchdog.py b/tests/gateway/test_loop_liveness_watchdog.py
+index 90c91a57a3..c3f06b4bd8 100644
+--- a/tests/gateway/test_loop_liveness_watchdog.py
++++ b/tests/gateway/test_loop_liveness_watchdog.py
+@@ -278,9 +278,11 @@ def test_loop_liveness_watchdog_marks_runtime_degraded_before_restart():
+             loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=2
+         )
+         assert handle is not None
+-        assert fired.wait(timeout=2.0), "watchdog did not reach its restart exit"
++        # Returns as soon as the exit is reached. Must outlast the pre-exit
++        # status persist, which itself waits out a throttled writer.
++        assert fired.wait(timeout=30.0), "watchdog did not reach its restart exit"
+         handle.stop()
+-        handle.join(timeout=1.0)
++        handle.join(timeout=5.0)
+ 
+     record = read_runtime_status()
+     assert exit_codes == [75]
+@@ -288,6 +290,51 @@ def test_loop_liveness_watchdog_marks_runtime_degraded_before_restart():
+     assert record["exit_reason"] == "loop_liveness_watchdog"
+     assert record["restart_requested"] is True
+ 
++def test_loop_liveness_watchdog_status_stamp_survives_a_slow_persist(monkeypatch):
++    """The degraded stamp must be on disk before ``os._exit`` when persist is slow.
++
++    ``os._exit`` kills the background status writer, so a wait that returns
++    first drops the stamp. A 0.25s bound did that on a throttled runner: exit
++    code 75 was recorded and ``gateway_state.json`` was still ``running``.
++    Hold the write past that old deadline; the wait must return only once the
++    snapshot is durable, not on a fixed short clock.
++    """
++    from gateway import status
++
++    original = status._write_json_file
++
++    def slow_write(path, payload):
++        time.sleep(0.40)  # longer than the old 0.25s pre-exit wait
++        return original(path, payload)
++
++    monkeypatch.setattr(status, "_write_json_file", slow_write)
++    status.write_runtime_status(gateway_state="running", exit_reason=None)
++    loop = MagicMock(spec=asyncio.AbstractEventLoop)
++    fired = threading.Event()
++    exit_codes = []
++
++    def fake_exit(code: int) -> None:
++        exit_codes.append(code)
++        fired.set()
++
++    with (
++        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback"),
++        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
++    ):
++        handle = start_loop_liveness_watchdog(
++            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=2
++        )
++        assert handle is not None
++        assert fired.wait(timeout=30.0), "watchdog did not reach its restart exit"
++        handle.stop()
++        handle.join(timeout=5.0)
++
++    record = status.read_runtime_status()
++    assert exit_codes == [75]
++    assert record["gateway_state"] == "degraded"
++    assert record["exit_reason"] == "loop_liveness_watchdog"
++    assert record["restart_requested"] is True
++
+ def test_heartbeat_write_does_not_block_the_loop_it_monitors():
+     """The heartbeat write must not freeze the loop the watchdog is watching.
+ 
+-- 
+2.55.0
+

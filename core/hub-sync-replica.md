@@ -32,14 +32,14 @@ syncing there. Without either, every read answers `null`/`[]` and the Desktop be
   - Compression chains collapse to the tip. Recency is the session's real `last_active`, never the sync time.
   - Rows are marked offline (cloud mark + "synced Xm ago", `data-testid=session-row-offline`) and never
     `is_active`: a stale running turn is not shown as live.
-  - Live wins within the owning connection **and profile** (0364); another profile's live rows do not erase
+  - Live wins within the owning connection **and profile** (0369); another profile's live rows do not erase
     this profile's cached rows. Identity is (connection, profile, id), and proven lineage ids dedupe too.
   - Clicking a cached row does not call resume; it shows an honest "gateway offline, cannot open" notice.
     Archive and Rename on a cached row queue an owner request on the hub (pending marker); pin is local only.
 
 ## How it works
 
-### Cached-owner and freshness follow-up (0364)
+### Cached-owner and freshness follow-up (0369)
 
 Offline rows carry the full owner through both row menus and virtualized/non-virtualized archive gestures.
 Rename/archive resolve the effective owner again: a reconnected live row wins even before the replica poll
@@ -53,16 +53,16 @@ ordinary visibility, grouping and pin resolution. Code additions include `store/
 and `app/session/hooks/use-session-actions/confirm-linked-archive.ts`, alongside the existing offline stores,
 row/menu components and hub-sync poller.
 
-0364 source regression suites (not run in this documentation pass):
+0369 source regression suites (not run in this documentation pass):
 `store/offline-session-owner.test.ts`, `store/offline-session-actions.test.ts`, `store/offline-sessions.test.ts`,
 `plugins/hub-sync/model.test.ts`, `app/chat/sidebar/session-actions-menu.test.ts` and `.test.tsx`,
 `session-row.test.tsx`, `virtual-session-list.test.tsx`, `sessions-section-created-sort.test.tsx`,
 `app/session/hooks/use-session-list-actions.test.tsx` and
 `use-session-actions/archive-linked-confirm.test.tsx` (paths relative to `apps/desktop/src`).
 They cover owner collisions, stale menu snapshots, live reconnect precedence, linked archive confirmation,
-real poller/list refresh and both row rendering paths. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); historical results below are not a 0364 or current-series run. No live deployment is claimed.
+real poller/list refresh and both row rendering paths. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); historical results below are not a 0369 or current-series run. No live deployment is claimed.
 
-Apply 0364 after 0329 in the ordered series; it needs the owner-routing and unknown-work archive changes.
+Apply 0369 after 0329 in the ordered series; it needs the owner-routing and unknown-work archive changes.
 Do not fall back to the ambient selected gateway/profile when an offline action cannot prove its owner.
 The poller is a plugin, but row ownership, action dispatch and live/cache reconciliation need core changes.
 
@@ -75,8 +75,8 @@ The poller is a plugin, but row ownership, action dispatch and live/cache reconc
 
 ## Tests
 
-For 0364, the source suite inventory and verification limits are listed in the cached-owner follow-up
-above; none were executed in this documentation pass. The totals below are historical pre-0364 evidence.
+For 0369, the source suite inventory and verification limits are listed in the cached-owner follow-up
+above; none were executed in this documentation pass. The totals below are historical pre-0369 evidence.
 
 Run in `apps/desktop`: `npx vitest run src/store/offline-sessions.test.ts src/store/offline-session-actions.test.ts
 src/app/chat/sidebar src/plugins/hub-sync src/store/hub-sync.test.ts src/plugins/kanban`; full suite 262 files /

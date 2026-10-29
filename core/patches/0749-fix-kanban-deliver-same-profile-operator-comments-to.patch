@@ -1,0 +1,445 @@
+From 906cc79472704e3b899b325f5fb8c377b62886ba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:34:28 +0000
+Subject: [PATCH] fix(kanban): deliver same-profile operator comments to a live
+ worker run [daveey]
+
+The mid-run comment bridge skipped every comment whose author equalled the
+worker's profile. Workers and the chats steering them all run as `default`,
+so every operator note from a same-profile chat was dropped (a MacBook
+worker restarted 16 CPU burners past two "stop" comments).
+
+- add_comment records the writer run on its `commented` event
+  (comment_id + writer_run_id) when HERMES_KANBAN_TASK/RUN_ID name the
+  task, so the tool, `hermes kanban comment` from the worker's shell and
+  delegate children all mark their notes as the run's own, cross-process,
+  with no task_comments schema change.
+- The bridge skips only those ids (author filter kept as the run-less
+  fallback), stamps each note "<author> (another session) at HH:MM TZ",
+  and writes a `comment_delivered {comment_ids, run_id}` event.
+- kanban_comment returns live_run (+ a delivery note: next model call);
+  the CLI prints the same; kanban_show lists undelivered_comments posted
+  during the live run.
+---
+ hermes_cli/kanban.py                         |   4 +
+ hermes_cli/kanban_db.py                      |  80 ++++++++-
+ tests/tools/test_kanban_comment_injection.py | 178 +++++++++++++++++++
+ tools/kanban_tools.py                        |  53 +++++-
+ 4 files changed, 305 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 61e31e8cc1..1f5382e00e 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -936,7 +936,11 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+     author = args.author or _profile_author()
+     with kbc.connect_closing() as conn:
+         kb.add_comment(conn, args.task_id, author, body)
++        live = kb.live_run_id(conn, args.task_id)
+     print(f"Comment added to {args.task_id}")
++    own_run = os.environ.get("HERMES_KANBAN_TASK") == args.task_id
++    if live is not None and not own_run:
++        print("The card has a live worker run: it gets this note at its next model call.")
+     return 0
+ 
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 6ab9e3f447..190b1f2be9 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1762,12 +1762,29 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
+ 
+ # --- Comments & events ---
+ 
++def _writer_run_id(task_id: str) -> Optional[int]:
++    """The dispatcher run id of THIS process when it is the worker of ``task_id``
++    (``HERMES_KANBAN_TASK`` matches and ``HERMES_KANBAN_RUN_ID`` is an int), else None.
++    Every writer inside a worker run (the kanban_comment tool, ``hermes kanban comment``
++    from its terminal, delegate children) inherits both, so the run is known in any process."""
++    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
++        return None
++    try:
++        return int((os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip())
++    except ValueError:
++        return None
++
++
+ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+     if not body or not body.strip():
+         raise ValueError("comment body is required")
+     if not author or not author.strip():
+         raise ValueError("comment author is required")
+     now = int(time.time())
++    # [daveey] A comment written from inside a worker run records that run on its
++    # ``commented`` event, so the live comment bridge can skip exactly the run's own notes
++    # by id. Authorship cannot: workers and the chats steering them share a profile.
++    writer_run = _writer_run_id(task_id)
+     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
+     # compose comment writes under one outer commit.
+     with write_txn(conn, allow_nested=True):
+@@ -1776,8 +1793,67 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str)
+             "INSERT INTO task_comments (task_id, author, body, created_at) "
+             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
+         )
+-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+-        return int(cur.lastrowid or 0)
++        cid = int(cur.lastrowid or 0)
++        payload: dict = {"author": author, "len": len(body), "comment_id": cid}
++        if writer_run is not None:
++            payload["writer_run_id"] = writer_run
++        _append_event(conn, task_id, "commented", payload)
++        return cid
++
++
++def own_comment_ids(conn: sqlite3.Connection, task_id: str, run_id: int) -> set[int]:
++    """Ids of the comments on ``task_id`` written from inside run ``run_id`` (any process)."""
++    rows = conn.execute(
++        "SELECT json_extract(payload, '$.comment_id') FROM task_events "
++        "WHERE task_id = ? AND kind = 'commented' "
++        "AND json_extract(payload, '$.writer_run_id') = ?", (task_id, int(run_id)),
++    ).fetchall()
++    return {int(r[0]) for r in rows if r[0] is not None}
++
++
++def delivered_comment_ids(conn: sqlite3.Connection, task_id: str, run_id: int) -> set[int]:
++    """Ids the live bridge already steered into run ``run_id`` (``comment_delivered`` events)."""
++    out: set[int] = set()
++    for (raw,) in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'comment_delivered' "
++            "AND run_id = ?", (task_id, int(run_id))).fetchall():
++        try:
++            out.update(int(i) for i in (json.loads(raw or "{}").get("comment_ids") or []))
++        except (ValueError, TypeError, AttributeError):
++            continue
++    return out
++
++
++def record_comment_delivery(conn: sqlite3.Connection, task_id: str, run_id: int,
++                            comment_ids: list[int]) -> None:
++    """Receipt that the live bridge steered ``comment_ids`` into the running worker of ``run_id``."""
++    with write_txn(conn, allow_nested=True):
++        _append_event(conn, task_id, "comment_delivered",
++                      {"comment_ids": [int(i) for i in comment_ids], "run_id": int(run_id)},
++                      run_id=int(run_id))
++
++
++def live_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    """The active run id when the task is ``running``, else None."""
++    row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if not row or row[0] != "running" or row[1] is None:
++        return None
++    return int(row[1])
++
++
++def undelivered_live_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
++    """Comments posted since the live run started that the run neither wrote nor received."""
++    run_id = live_run_id(conn, task_id)
++    if run_id is None:
++        return []
++    started = conn.execute("SELECT started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++    since = int(started[0]) if started and started[0] is not None else 0
++    skip = own_comment_ids(conn, task_id, run_id) | delivered_comment_ids(conn, task_id, run_id)
++    rows = conn.execute(
++        "SELECT id, task_id, author, body, created_at FROM task_comments "
++        "WHERE task_id = ? AND created_at >= ? ORDER BY id ASC", (task_id, since),
++    ).fetchall()
++    return [Comment.from_row(r) for r in rows if int(r[0]) not in skip]
+ 
+ 
+ def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
+diff --git a/tests/tools/test_kanban_comment_injection.py b/tests/tools/test_kanban_comment_injection.py
+index cee3970611..87d2facde0 100644
+--- a/tests/tools/test_kanban_comment_injection.py
++++ b/tests/tools/test_kanban_comment_injection.py
+@@ -191,3 +191,181 @@ def test_skips_own_authored_comments_without_env_profile(worker_home, monkeypatc
+     _unthrottle()
+     assert kt.inject_new_comments_from_env(agent) is False
+     assert agent.steers == []
++
++
++# --- Same-profile operator notes vs this run's own notes (echo filter keyed on comment ids) ---
++#
++# Every actor on a board usually runs as the same profile (``default``): Desktop chats,
++# the chats overseeing workers, and the workers themselves. Filtering by author therefore
++# dropped every operator note from a same-profile chat. Own notes are now the comments
++# this RUN wrote (tool or CLI), recorded by id; everything else is delivered.
++
++import json
++import os
++import subprocess
++
++
++def _running_worker(monkeypatch, title="live task", profile="default"):
++    """A claimed (running) task with this process set up as its dispatcher worker."""
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title=title)
++        task = kb.claim_task(conn, tid)
++        assert task is not None and task.current_run_id is not None
++        run_id = task.current_run_id
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    monkeypatch.setenv("HERMES_PROFILE", profile)
++    return tid, run_id
++
++
++def _as_other_session(fn):
++    """Run ``fn`` as a different session on the SAME profile (an operator chat): no worker env."""
++    saved = {k: os.environ.pop(k) for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID") if k in os.environ}
++    try:
++        return fn()
++    finally:
++        os.environ.update(saved)
++
++
++def test_same_profile_operator_comment_is_injected(worker_home, monkeypatch):
++    tid, _run = _running_worker(monkeypatch)
++    agent = FakeAgent()
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False  # seed
++
++    def post():
++        conn = kbc.connect()
++        try:
++            return kb.add_comment(conn, tid, author="default", body="STOP the CPU burners now")
++        finally:
++            conn.close()
++    _as_other_session(post)
++
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    assert "STOP the CPU burners" in agent.steers[0]
++    # The steer names the author as another session and carries a time.
++    assert "default (another session) at " in agent.steers[0]
++
++
++def test_own_kanban_comment_tool_note_is_not_injected(worker_home, monkeypatch):
++    tid, _run = _running_worker(monkeypatch)
++    agent = FakeAgent()
++    _unthrottle()
++    kt.inject_new_comments_from_env(agent)  # seed
++    out = json.loads(kt._handle_comment({"task_id": tid, "body": "progress: step 2 done"}))
++    assert out["ok"]
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False
++    assert agent.steers == []
++
++
++def test_own_cli_comment_from_separate_process_is_not_injected(worker_home, monkeypatch):
++    tid, _run = _running_worker(monkeypatch)
++    agent = FakeAgent()
++    _unthrottle()
++    kt.inject_new_comments_from_env(agent)  # seed
++    # ``hermes kanban comment`` run by the worker's terminal: a separate process with the worker env.
++    slash = f"comment {tid} note from my own shell"
++    code = (f"import sys; sys.path.insert(0, {str(_WORKTREE)!r}); from hermes_cli import kanban; "
++            f"print(kanban.run_slash({slash!r}))")
++    proc = subprocess.run([sys.executable, "-c", code], env=dict(os.environ), capture_output=True,
++                          text=True, timeout=120, check=False)
++    assert "Comment added" in proc.stdout, proc.stdout + proc.stderr
++    conn = kbc.connect()
++    try:
++        assert any("own shell" in c.body for c in kb.list_comments(conn, tid))
++    finally:
++        conn.close()
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False
++    assert agent.steers == []
++
++
++def test_mixed_batch_injects_only_the_operator_note(worker_home, monkeypatch):
++    tid, _run = _running_worker(monkeypatch)
++    agent = FakeAgent()
++    _unthrottle()
++    kt.inject_new_comments_from_env(agent)  # seed
++    kt._handle_comment({"task_id": tid, "body": "my own progress note"})
++
++    def post():
++        conn = kbc.connect()
++        try:
++            kb.add_comment(conn, tid, author="default", body="operator: pause and re-read the card")
++        finally:
++            conn.close()
++    _as_other_session(post)
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    assert "re-read the card" in agent.steers[0]
++    assert "my own progress note" not in agent.steers[0]
++
++
++def test_comment_delivered_event_records_ids_and_run(worker_home, monkeypatch):
++    tid, run_id = _running_worker(monkeypatch)
++    agent = FakeAgent()
++    _unthrottle()
++    kt.inject_new_comments_from_env(agent)  # seed
++
++    def post():
++        conn = kbc.connect()
++        try:
++            return kb.add_comment(conn, tid, author="default", body="operator note")
++        finally:
++            conn.close()
++    cid = _as_other_session(post)
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    conn = kbc.connect()
++    try:
++        delivered = [e for e in kb.list_events(conn, tid) if e.kind == "comment_delivered"]
++    finally:
++        conn.close()
++    assert len(delivered) == 1
++    assert delivered[0].payload == {"comment_ids": [cid], "run_id": run_id}
++    assert delivered[0].run_id == run_id
++
++
++def test_kanban_comment_reports_live_run_for_running_and_ready(worker_home, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    conn = kbc.connect()
++    try:
++        running = kb.create_task(conn, title="running card")
++        assert kb.claim_task(conn, running) is not None
++        ready = kb.create_task(conn, title="ready card")
++    finally:
++        conn.close()
++    out_running = json.loads(kt._handle_comment({"task_id": running, "body": "hello worker"}))
++    out_ready = json.loads(kt._handle_comment({"task_id": ready, "body": "hello later"}))
++    assert out_running["live_run"] is True
++    assert "next model call" in out_running["delivery"]
++    assert out_ready["live_run"] is False
++    assert "delivery" not in out_ready
++
++
++def test_kanban_show_lists_undelivered_live_run_comments(worker_home, monkeypatch):
++    tid, _run = _running_worker(monkeypatch)
++    kt._handle_comment({"task_id": tid, "body": "own note, never pending"})
++
++    def post():
++        conn = kbc.connect()
++        try:
++            return kb.add_comment(conn, tid, author="default", body="pending operator note")
++        finally:
++            conn.close()
++    cid = _as_other_session(post)
++    shown = json.loads(kt._handle_show({"task_id": tid}))
++    assert shown["undelivered_comments"] == [cid]
++
++    agent = FakeAgent()
++    kt._comment_watermark[tid] = cid - 1  # watermark just below the operator note
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    shown = json.loads(kt._handle_show({"task_id": tid}))
++    assert shown["undelivered_comments"] == []
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 231324f613..d306aeb08a 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -704,9 +704,23 @@ _comment_poll_last_attempt: float = 0.0
+ _comment_watermark: dict[str, int] = {}
+ 
+ 
++def _comment_stamp(c: Any, own_identity: str) -> str:
++    """``default (another session) at 04:50 PDT``: who wrote the note and when, so a worker
++    can tell an operator note from its own even when both run as the same profile."""
++    author = (c.author or "").strip() or "operator"
++    who = f"{author} (another session)" if author == own_identity else author
++    try:
++        when = time.strftime("%H:%M %Z", time.localtime(int(c.created_at)))
++    except (TypeError, ValueError, OverflowError):
++        return who
++    return f"{who} at {when}"
++
++
+ def inject_new_comments_from_env(agent: Any) -> bool:
+     """Steer new operator comments on the worker's task into ``agent``; True iff a
+-    steer was injected; never raises. Own comments (``_persisted_identity``) are skipped."""
++    steer was injected; never raises. Skipped as own: the comments THIS run wrote, by id
++    (``commented`` events carrying ``writer_run_id``; tool and CLI alike). A same-profile
++    chat's note is an operator note. Without a run id, falls back to the author filter."""
+     global _comment_poll_last_attempt
+     # Operator notes address the dispatcher-owned worker; a delegate_task child sharing
+     # this process must neither receive them nor advance the shared watermark (#112817).
+@@ -717,9 +731,13 @@ def inject_new_comments_from_env(agent: Any) -> bool:
+         return False
+     _comment_poll_last_attempt = now
+     seen = _comment_watermark.get(tid)
++    run_id = _worker_run_id(tid)
++    own_ids: set[int] = set()
+     try:
+         with _board(None, quiet_close=True) as (kb, conn):
+             rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
++            if seen is not None and rows and run_id is not None:
++                own_ids = kb.own_comment_ids(conn, tid, run_id)
+     except Exception:
+         logger.debug("comment-inject: bridge failed", exc_info=True)
+         return False
+@@ -729,22 +747,32 @@ def inject_new_comments_from_env(agent: Any) -> bool:
+         return False
+     # Advance past everything read (including our own notes) so nothing is re-injected.
+     _comment_watermark[tid] = max(c.id for c in rows)
+-    # Same resolution the write side used, so a worker skips its OWN comments even
+-    # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
+-    # re-enter the live turn as fake operator steering).
++    # Same resolution the write side used, for the stamp and the run-less fallback.
+     own = _persisted_identity()
+-    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
++    if run_id is not None:
++        # [daveey] Own = written by this run (by id). Every actor usually shares one
++        # profile, so an author filter dropped every operator note from a same-profile chat.
++        fresh = [c for c in rows if c.id not in own_ids and (c.body or "").strip()]
++    else:
++        fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+     if not fresh:
+         return False
+-    lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
++    lines = [f"- {_comment_stamp(c, own)}: {c.body.strip()}" for c in fresh]
+     note = ("New note" + ("s" if len(fresh) > 1 else "")
+             + " on your kanban task from the operator (delivered mid-run). "
+             + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
+     try:
+-        return bool(agent.steer(note))
++        delivered = bool(agent.steer(note))
+     except Exception:
+         logger.debug("comment-inject: steer failed", exc_info=True)
+         return False
++    if delivered and run_id is not None:
++        try:
++            with _board(None, quiet_close=True) as (kb, conn):
++                kb.record_comment_delivery(conn, tid, run_id, [c.id for c in fresh])
++        except Exception:
++            logger.debug("comment-inject: delivery receipt failed", exc_info=True)
++    return delivered
+ 
+ 
+ # Soft deadline: near ``max_runtime_seconds`` steer the running turn to checkpoint with
+@@ -828,6 +856,8 @@ def _handle_show(args: dict, **kw) -> str:
+                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
+             "children": kb.child_ids(conn, tid),
+             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
++            # Posted during the live run, not written by it, not yet steered into it.
++            "undelivered_comments": [c.id for c in kb.undelivered_live_comments(conn, tid)],
+             # Capped; full log via CLI.
+             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
+             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+@@ -1356,7 +1386,14 @@ def _handle_comment(args: dict, **kw) -> str:
+     with _board(args.get("board")) as (kb, conn):
+         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+         subscribed = _maybe_subscribe_on_touch(conn, str(tid))
+-        return _ok(task_id=tid, comment_id=cid, **({"subscribed": True} if subscribed else {}))
++        live = kb.live_run_id(conn, str(tid))
++        extra: dict = {"live_run": live is not None}
++        if live is not None and _worker_run_id(str(tid)) != live:
++            extra["delivery"] = (
++                "the card has a live worker run: it gets this note at its next model call "
++                "(often a few minutes); a comment_delivered event on the card confirms it")
++        return _ok(task_id=tid, comment_id=cid, **extra,
++                   **({"subscribed": True} if subscribed else {}))
+ 
+ 
+ def _store_attachment(board, tid, filename, data, content_type) -> str:
+-- 
+2.55.0
+

@@ -1,0 +1,617 @@
+From 08c725d741724496579ff212ec70a04634ae61d8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:11:20 -0700
+Subject: [PATCH] fix(desktop): fail fast while a pooled remote backend is
+ known down [daveey]
+
+Every `hermes update` on the hub or mini retires its SSH-isolated serve backends, and the
+Desktop kept routing renderer polls (hub-sync/status, kanban/board, runners) at the dead tunnel
+or queued them behind the redial, so each restart surfaced as a run of 4-10 s "Timed out
+connecting to Hermes backend" errors. On 2026-10-28 all 11 mac-mini "dial failed" clusters and
+both hermes-hub ECONNRESET bursts lined up with a core update on that host (hermes-sync.log
+"update exit"), not with sleep, Tailscale (both peers direct) or sshd keepalive.
+
+remote-down-gate.ts tracks each remote pool key (conn:<id>::<profile>): a reset/refused/hung-up
+request, a failed connect or a failed dispatch probe marks it down; while down its requests
+reject at once with RemoteBackendDownError. After a 2 s backoff (doubling to 30 s) one trial
+request redials; its answer (HTTP errors included) reopens the gate. A plain request timeout
+does not take the remote down (slow endpoint) but drops the answer mark so the next dispatch
+re-probes /api/health. Fast-fails log as one line with no stack.
+---
+ .../electron/api-request-failure.test.ts      |   9 +
+ apps/desktop/electron/api-request-failure.ts  |   7 +-
+ apps/desktop/electron/main.ts                 |  68 ++++-
+ .../desktop/electron/remote-down-gate.test.ts | 183 ++++++++++++++
+ apps/desktop/electron/remote-down-gate.ts     | 238 ++++++++++++++++++
+ 5 files changed, 492 insertions(+), 13 deletions(-)
+ create mode 100644 apps/desktop/electron/remote-down-gate.test.ts
+ create mode 100644 apps/desktop/electron/remote-down-gate.ts
+
+diff --git a/apps/desktop/electron/api-request-failure.test.ts b/apps/desktop/electron/api-request-failure.test.ts
+index fb48c51c53..7bffbcc509 100644
+--- a/apps/desktop/electron/api-request-failure.test.ts
++++ b/apps/desktop/electron/api-request-failure.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from 'vitest'
+ 
+ import { formatApiRequestFailure } from './api-request-failure'
++import { RemoteBackendDownError } from './remote-down-gate'
+ 
+ const timeout = new Error('Timed out connecting to Hermes backend after 4000ms')
+ 
+@@ -39,4 +40,12 @@ describe('formatApiRequestFailure', () => {
+     expect(line.length).toBeLessThanOrEqual(6000)
+     expect(line).toContain(`conn=${'c'.repeat(120)} `)
+   })
++  it('logs a remote-down fast-fail as one line without a stack', () => {
++    const fastFail = new RemoteBackendDownError('conn:hermes-hub::default', 'read ECONNRESET', 3000, 1000)
++    const line = formatApiRequestFailure({ connectionId: 'hermes-hub', path: '/api/plugins/hub-sync/status' } as any, fastFail)
++
++    expect(line).toContain('conn=hermes-hub Remote backend "conn:hermes-hub::default" is down')
++    expect(line).not.toContain('\n')
++    expect(line).not.toContain('Timed out connecting')
++  })
+ })
+diff --git a/apps/desktop/electron/api-request-failure.ts b/apps/desktop/electron/api-request-failure.ts
+index 49ead90ec3..f8a751fda0 100644
+--- a/apps/desktop/electron/api-request-failure.ts
++++ b/apps/desktop/electron/api-request-failure.ts
+@@ -25,7 +25,12 @@ export function formatApiRequestFailure(
+   const path = String(request?.path ?? '(no path)').slice(0, 500)
+   const conn = clampToken(request?.connectionId) || 'primary'
+   const profile = clampToken(request?.profile)
+-  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
++  // A fast-fail from the remote down gate is expected while a remote restarts: one line, no stack.
++  const expectedFastFail = (error as { code?: unknown } | null)?.code === 'REMOTE_BACKEND_DOWN'
++
++  const detail =
++    error instanceof Error ? (expectedFastFail ? error.message : (error.stack ?? error.message)) : String(error)
++
+   const route = `conn=${conn}${profile ? ` profile=${profile}` : ''}`
+ 
+   return `[hermes:api ${method} ${path}] ${route} ${detail}`.slice(0, 6000)
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index c7d12aa6cc..bd7f009f10 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -535,6 +535,7 @@ import {
+   type QuitTeardownTask
+ } from './quit-teardown'
+ import { createSshReuseProbe, wireRegistryReconnect } from './registry-reconnect-wiring'
++import { dispatchThroughRemoteDownGate, RemoteDownGate } from './remote-down-gate'
+ import * as remoteLifecycle from './remote-lifecycle'
+ import {
+   attachPowerResumeRemoteRevalidation,
+@@ -2002,6 +2003,9 @@ const pooledRemoteLiveness = new RemoteLivenessTracker(undefined, REMOTE_POOLED_
+ 
+ const remoteRevalidation = new RemoteRevalidationCoordinator()
+ const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
++// [daveey] Per pool key: a remote backend that just reset/refused/failed its dispatch probe fails its requests fast
++// until a backoff trial answers again (remote-down-gate.ts).
++const remoteDownGate = new RemoteDownGate()
+ // Single-owner reconnect/dial claim (#90812): reconnectGateway()'s in-flight
+ // lock is per-renderer, so two windows racing one wake can both invoke the
+ // backend ensure IPC and double-dial a pooled SSH backend. Main owns backend
+@@ -11355,6 +11359,7 @@ async function ensureRegistryBackend(
+           rememberLog(
+             `Pooled remote backend "${key}" failed its dispatch probe (${error?.message || error}); reconnecting on demand.`
+           )
++          remoteDownGate.markDown(key, `dispatch probe failed: ${error?.message || error}`)
+           await stopPoolBackend(key, 'revalidate')
+ 
+           if (source.kind === 'ssh') {
+@@ -17637,20 +17642,42 @@ async function dispatchRegistryApiRequest(
+   // passive read would otherwise inherit its "no warm backend" rejection.
+   const spawnPriority = spawnPriorityFrom(request?.priority)
+ 
+-  const connection: any = request?.passive
+-    ? await ensureRegistryBackend(registryConnectionId, routeProfile, '', { passive: true })
+-    : await backendDialClaims.run(backendDialClaimKey(registryConnectionId, routeProfile), () =>
+-        ensureRegistryBackend(registryConnectionId, routeProfile, '', { spawnPriority })
+-      )
++  const connect = (): Promise<any> =>
++    request?.passive
++      ? ensureRegistryBackend(registryConnectionId, routeProfile, '', { passive: true })
++      : backendDialClaims.run(backendDialClaimKey(registryConnectionId, routeProfile), () =>
++          ensureRegistryBackend(registryConnectionId, routeProfile, '', { spawnPriority })
++        )
+ 
+-  const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
++  let requestPath = ''
++  let connection: any = null
+ 
+-  const response = await fetchJsonForBackend(connection, requestPath, {
+-    method: request?.method,
+-    body: request?.body,
+-    upload: request?.upload,
+-    timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+-  })
++  const send = (descriptor: any) => {
++    connection = descriptor
++    requestPath = pathForRegistryBackendRequest(request.path, requestProfile, descriptor)
++
++    return fetchJsonForBackend(descriptor, requestPath, {
++      method: request?.method,
++      body: request?.body,
++      upload: request?.upload,
++      timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
++    })
++  }
++
++  // [daveey] Remote (non-local) connections go through the down gate: while the pooled backend is known down
++  // (reset, refused, failed dispatch probe) its requests reject at once instead of each burning a 4-10 s timeout.
++  const gateKey = remoteDownGateKey(registryConnectionId, routeProfile)
++
++  const response = gateKey
++    ? await dispatchThroughRemoteDownGate({
++        gate: remoteDownGate,
++        key: gateKey,
++        connect,
++        request: send,
++        forgetAnswer: baseUrl => remoteAnswerLedger.forget(baseUrl),
++        log: rememberLog
++      })
++    : await send(await connect())
+ 
+   desktopProfilePreferences.afterProfileRequest(registryConnectionId, request, response, connection.mode)
+ 
+@@ -17659,6 +17686,23 @@ async function dispatchRegistryApiRequest(
+     : response
+ }
+ 
++// Pool key the down gate tracks for a registry request, or null when the request stays on this machine.
++function remoteDownGateKey(connectionId, profile): null | string {
++  try {
++    const registry = readDesktopConnectionsRegistry()
++    const id = registryDialConnectionId(connectionId, registry.primary)
++    const source = registry.connections.find(c => c.id === id)
++
++    if (!source || source.kind === 'local') {
++      return null
++    }
++
++    return backendScopeKey(id, profile)
++  } catch {
++    return null
++  }
++}
++
+ function registryConnectionKind(connectionId) {
+   const registry = readDesktopConnectionsRegistry()
+   const source = registry.connections.find(connection => connection.id === connectionId)
+diff --git a/apps/desktop/electron/remote-down-gate.test.ts b/apps/desktop/electron/remote-down-gate.test.ts
+new file mode 100644
+index 0000000000..6dc1385ab4
+--- /dev/null
++++ b/apps/desktop/electron/remote-down-gate.test.ts
+@@ -0,0 +1,183 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it, vi } from 'vitest'
++
++import {
++  dispatchThroughRemoteDownGate,
++  isRemoteBackendDownError,
++  isRemoteTransportFailure,
++  REMOTE_DOWN_INITIAL_BACKOFF_MS,
++  REMOTE_DOWN_MAX_BACKOFF_MS,
++  RemoteDownGate
++} from './remote-down-gate'
++
++// 2026-10-28: a hub/mini `hermes update` restarts the remote serve backend; the Desktop kept dialing the dead tunnel
++// and every renderer poll burned a 4-10 s "Timed out connecting to Hermes backend". While a pooled remote is known
++// down its requests must fail fast, with one backoff trial at a time reopening the gate.
++
++const KEY = 'conn:hermes-hub::default'
++const BASE_URL = 'http://127.0.0.1:62511'
++
++function reset(): Error {
++  return Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
++}
++
++function clock(start = 1_000_000) {
++  let now = start
++
++  return {
++    now: () => now,
++    advance: (ms: number) => {
++      now += ms
++    }
++  }
++}
++
++function harness() {
++  const time = clock()
++  const gate = new RemoteDownGate(time.now)
++  const connection = { baseUrl: BASE_URL }
++  const connect = vi.fn(async () => connection)
++  const forgetAnswer = vi.fn()
++  const log = vi.fn()
++
++  const run = (request: () => Promise<unknown>) =>
++    dispatchThroughRemoteDownGate({ gate, key: KEY, connect, request, forgetAnswer, log })
++
++  return { connect, forgetAnswer, gate, log, run, time }
++}
++
++describe('remote down gate', () => {
++  it('fails requests fast after the remote resets, without dialing or waiting for a timeout', async () => {
++    const h = harness()
++
++    await expect(h.run(async () => Promise.reject(reset()))).rejects.toThrow('ECONNRESET')
++    expect(h.forgetAnswer).toHaveBeenCalledWith(BASE_URL)
++    expect(h.gate.isDown(KEY)).toBe(true)
++    expect(h.log).toHaveBeenCalledWith(expect.stringContaining(`[remote-down] ${KEY} marked down`))
++
++    const request = vi.fn(async () => ({ ok: true }))
++    h.connect.mockClear()
++
++    const startedAt = performance.now()
++    const error = await h.run(request).catch(e => e)
++
++    expect(isRemoteBackendDownError(error)).toBe(true)
++    expect(String(error.message)).toContain(KEY)
++    expect(performance.now() - startedAt).toBeLessThan(50)
++    expect(h.connect).not.toHaveBeenCalled()
++    expect(request).not.toHaveBeenCalled()
++  })
++
++  it('lets one trial through after the backoff; its answer reopens the gate', async () => {
++    const h = harness()
++
++    await h.run(async () => Promise.reject(reset())).catch(() => {})
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++
++    let finishTrial: (value: unknown) => void = () => {}
++    const trial = h.run(() => new Promise(resolve => (finishTrial = resolve)))
++
++    // While the trial (which may be a full SSH redial) is in flight, everything else still fails fast.
++    await vi.waitFor(() => expect(h.connect).toHaveBeenCalledTimes(2))
++    await expect(h.run(async () => 'other')).rejects.toSatisfy(isRemoteBackendDownError)
++
++    finishTrial({ ok: true })
++    await expect(trial).resolves.toEqual({ ok: true })
++    expect(h.gate.isDown(KEY)).toBe(false)
++    await expect(h.run(async () => 'after')).resolves.toBe('after')
++  })
++
++  it('a failed trial doubles the backoff, capped', async () => {
++    const h = harness()
++
++    await h.run(async () => Promise.reject(reset())).catch(() => {})
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    h.connect.mockRejectedValueOnce(new Error('ssh: connect to host 192.0.2.10 port 22: Operation timed out'))
++    await expect(h.run(async () => 'x')).rejects.toThrow('ssh: connect')
++
++    // Second failure: 2x backoff. Halfway through it the gate is still shut.
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(h.run(async () => 'x')).rejects.toSatisfy(isRemoteBackendDownError)
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(h.run(async () => 'back')).resolves.toBe('back')
++
++    const capped = new RemoteDownGate(h.time.now)
++
++    for (let i = 0; i < 20; i++) {
++      capped.markDown(KEY, 'reset')
++    }
++
++    h.time.advance(REMOTE_DOWN_MAX_BACKOFF_MS - 1)
++    expect(() => capped.admit(KEY)).toThrow()
++    h.time.advance(1)
++    expect(capped.admit(KEY)).toEqual({ trial: true })
++  })
++
++  it('an HTTP error is an answer: it does not mark the remote down, and it reopens a down gate', async () => {
++    const h = harness()
++
++    await expect(h.run(async () => Promise.reject(new Error('500: boom')))).rejects.toThrow('500')
++    expect(h.gate.isDown(KEY)).toBe(false)
++
++    h.gate.markDown(KEY, 'reset')
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(h.run(async () => Promise.reject(new Error('401: unauthorized')))).rejects.toThrow('401')
++    expect(h.gate.isDown(KEY)).toBe(false)
++  })
++
++  it('a slow endpoint timing out does not take the whole remote down, but forces the next dispatch to re-probe', async () => {
++    const h = harness()
++    const timeout = new Error('Timed out connecting to Hermes backend after 4000ms')
++
++    await expect(h.run(async () => Promise.reject(timeout))).rejects.toThrow('Timed out')
++    expect(h.gate.isDown(KEY)).toBe(false)
++    expect(h.forgetAnswer).toHaveBeenCalledWith(BASE_URL)
++
++    // ...but a trial that times out keeps it down.
++    h.gate.markDown(KEY, 'reset')
++    h.time.advance(REMOTE_DOWN_INITIAL_BACKOFF_MS)
++    await expect(h.run(async () => Promise.reject(timeout))).rejects.toThrow('Timed out')
++    expect(h.gate.isDown(KEY)).toBe(true)
++  })
++
++  it('config refusals say nothing about remote health', async () => {
++    const h = harness()
++
++    h.connect.mockRejectedValueOnce(new Error('Passive read: no warm backend for "conn:hermes-hub::default"'))
++    await expect(h.run(async () => 'x')).rejects.toThrow('Passive read')
++    h.connect.mockRejectedValueOnce(new Error("Profile 'x@hub' does not exist."))
++    await expect(h.run(async () => 'x')).rejects.toThrow('does not exist')
++    expect(h.gate.isDown(KEY)).toBe(false)
++  })
++
++  it('keys are independent: a down hub does not gate mac-mini', async () => {
++    const h = harness()
++
++    h.gate.markDown(KEY, 'reset')
++    expect(() => h.gate.admit('conn:mac-mini::default')).not.toThrow()
++  })
++
++  it('classifies transport failures', () => {
++    expect(isRemoteTransportFailure(reset())).toBe(true)
++    expect(isRemoteTransportFailure(new Error('socket hang up'))).toBe(true)
++    expect(isRemoteTransportFailure(new Error('connect ECONNREFUSED 127.0.0.1:62511'))).toBe(true)
++    expect(isRemoteTransportFailure(new Error('Timed out connecting to Hermes backend after 4000ms'))).toBe(false)
++    expect(isRemoteTransportFailure(new Error('500: boom'))).toBe(false)
++  })
++})
++
++describe('main.ts wiring', () => {
++  const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
++
++  it('routes registry requests to remote connections through the gate', () => {
++    const body = main.slice(main.indexOf('async function dispatchRegistryApiRequest('))
++
++    expect(body.slice(0, 4000)).toMatch(/dispatchThroughRemoteDownGate\(\{\s*gate: remoteDownGate,\s*key: gateKey/)
++  })
++
++  it('a failed dispatch probe marks the pool key down', () => {
++    expect(main).toMatch(/failed its dispatch probe[\s\S]{0,200}remoteDownGate\.markDown\(key,/)
++  })
++})
+diff --git a/apps/desktop/electron/remote-down-gate.ts b/apps/desktop/electron/remote-down-gate.ts
+new file mode 100644
+index 0000000000..56c6d64c67
+--- /dev/null
++++ b/apps/desktop/electron/remote-down-gate.ts
+@@ -0,0 +1,238 @@
++// [daveey] Fail fast while a pooled remote backend is known to be down.
++//
++// A remote Hermes backend (hub, mini) restarts several times a day: every `hermes update` on that host retires its
++// SSH-isolated serve/dashboard processes (web_server_skew_exit), and the tunnel then answers ECONNRESET / socket hang
++// up until the Desktop redials. On 2026-10-28 every mac-mini "dial failed" cluster (11 of 11) and both hermes-hub
++// ECONNRESET bursts lined up with a core update on that host, not with sleep, Tailscale or sshd keepalive.
++//
++// During that window each renderer poll (hub-sync/status, kanban/board, runners enrollment, ...) still dialed the dead
++// descriptor or queued behind the redial, so the outage surfaced as a stream of 4-10 s "Timed out connecting to Hermes
++// backend" errors and blocked UI work behind them. This gate records the outage per pool key
++// (`conn:<id>::<profile>`) and, while it lasts, rejects requests at once with RemoteBackendDownError. After a short
++// backoff ONE request is let through as the trial: it reprobes/redials; its success reopens the gate, its failure
++// doubles the backoff. Requests that arrive while the trial is in flight fail fast too.
++
++export const REMOTE_DOWN_INITIAL_BACKOFF_MS = 2_000
++export const REMOTE_DOWN_MAX_BACKOFF_MS = 30_000
++
++export const REMOTE_BACKEND_DOWN_CODE = 'REMOTE_BACKEND_DOWN'
++
++export class RemoteBackendDownError extends Error {
++  readonly code = REMOTE_BACKEND_DOWN_CODE
++  readonly key: string
++  readonly retryInMs: number
++
++  constructor(key: string, reason: string, downForMs: number, retryInMs: number) {
++    const retry = retryInMs > 0 ? `next try in ${Math.ceil(retryInMs / 1000)}s` : 'reconnect in progress'
++
++    super(
++      `Remote backend "${key}" is down (${reason}, ${Math.round(downForMs / 1000)}s ago); ${retry}. Failing fast instead of waiting for a timeout.`
++    )
++    this.name = 'RemoteBackendDownError'
++    this.key = key
++    this.retryInMs = retryInMs
++  }
++}
++
++export function isRemoteBackendDownError(error: unknown): error is RemoteBackendDownError {
++  return (error as { code?: unknown } | null)?.code === REMOTE_BACKEND_DOWN_CODE
++}
++
++const TRANSPORT_CODES = new Set([
++  'ECONNABORTED',
++  'ECONNREFUSED',
++  'ECONNRESET',
++  'EHOSTDOWN',
++  'EHOSTUNREACH',
++  'ENETUNREACH',
++  'EPIPE'
++])
++
++const TRANSPORT_MESSAGE_RE = /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|EHOSTDOWN)\b|socket hang up/i
++const TIMEOUT_MESSAGE_RE = /Timed out connecting to Hermes backend/i
++
++/** The connection itself broke (reset, refused, hung up): the backend behind the tunnel is gone. */
++export function isRemoteTransportFailure(error: unknown): boolean {
++  const code = (error as { code?: unknown } | null)?.code
++
++  if (typeof code === 'string' && TRANSPORT_CODES.has(code)) {
++    return true
++  }
++
++  return TRANSPORT_MESSAGE_RE.test(String((error as { message?: unknown } | null)?.message ?? error ?? ''))
++}
++
++export function isRemoteTimeout(error: unknown): boolean {
++  return TIMEOUT_MESSAGE_RE.test(String((error as { message?: unknown } | null)?.message ?? error ?? ''))
++}
++
++interface DownState {
++  failures: number
++  reason: string
++  since: number
++  retryAt: number
++  trialInFlight: boolean
++}
++
++export interface RemoteDownAdmission {
++  trial: boolean
++}
++
++export class RemoteDownGate {
++  readonly #down = new Map<string, DownState>()
++  readonly #now: () => number
++  readonly #initialBackoffMs: number
++  readonly #maxBackoffMs: number
++
++  constructor(
++    now: () => number = Date.now,
++    initialBackoffMs = REMOTE_DOWN_INITIAL_BACKOFF_MS,
++    maxBackoffMs = REMOTE_DOWN_MAX_BACKOFF_MS
++  ) {
++    this.#now = now
++    this.#initialBackoffMs = initialBackoffMs
++    this.#maxBackoffMs = maxBackoffMs
++  }
++
++  isDown(key: string): boolean {
++    return this.#down.has(key)
++  }
++
++  /** Throws RemoteBackendDownError while `key` is down; otherwise admits the request (as the trial when down). */
++  admit(key: string): RemoteDownAdmission {
++    const state = this.#down.get(key)
++
++    if (!state) {
++      return { trial: false }
++    }
++
++    const now = this.#now()
++
++    if (state.trialInFlight || now < state.retryAt) {
++      throw new RemoteBackendDownError(key, state.reason, now - state.since, Math.max(0, state.retryAt - now))
++    }
++
++    state.trialInFlight = true
++
++    return { trial: true }
++  }
++
++  markDown(key: string, reason: string): void {
++    const now = this.#now()
++    const previous = this.#down.get(key)
++    const failures = (previous?.failures ?? 0) + 1
++    const backoff = Math.min(this.#initialBackoffMs * 2 ** (failures - 1), this.#maxBackoffMs)
++
++    this.#down.set(key, {
++      failures,
++      reason: String(reason || 'unreachable').slice(0, 160),
++      since: previous?.since ?? now,
++      retryAt: now + backoff,
++      trialInFlight: false
++    })
++  }
++
++  markUp(key: string): boolean {
++    return this.#down.delete(key)
++  }
++
++  /** A trial that ended without a verdict (e.g. a slow endpoint) hands the trial slot back. */
++  releaseTrial(key: string): void {
++    const state = this.#down.get(key)
++
++    if (state) {
++      state.trialInFlight = false
++    }
++  }
++}
++
++export interface GatedRemoteDispatchOptions<TConnection extends { baseUrl?: null | string }, TResult> {
++  gate: RemoteDownGate
++  key: string
++  connect: () => Promise<TConnection>
++  request: (connection: TConnection) => Promise<TResult>
++  // Drop the "answered recently" mark so the next dispatch re-probes /api/health instead of trusting a dead tunnel.
++  forgetAnswer?: (baseUrl: null | string | undefined) => void
++  log?: (message: string) => void
++}
++
++/**
++ * Run one registry request through the down gate.
++ *
++ * - known down → RemoteBackendDownError immediately (no dial, no timeout wait);
++ * - the connection breaks (connect fails, or the request resets/refuses/hangs up) → mark down;
++ * - any answer from the backend, HTTP errors included → mark up;
++ * - a request timeout → forget the answer mark (next dispatch re-probes) and, if it was the trial, stay down.
++ */
++export async function dispatchThroughRemoteDownGate<TConnection extends { baseUrl?: null | string }, TResult>({
++  gate,
++  key,
++  connect,
++  request,
++  forgetAnswer,
++  log
++}: GatedRemoteDispatchOptions<TConnection, TResult>): Promise<TResult> {
++  const { trial } = gate.admit(key)
++  let connection: TConnection
++
++  try {
++    connection = await connect()
++  } catch (error) {
++    if (isRemoteBackendDownError(error)) {
++      throw error
++    }
++
++    // Config refusals ("No connection with id", bad profile, passive read with no warm backend) say nothing
++    // about the remote's health.
++    const message = String((error as { message?: unknown } | null)?.message ?? error)
++
++    if (/^No connection with id|does not exist|^Passive read: no warm backend/.test(message)) {
++      if (trial) {
++        gate.releaseTrial(key)
++      }
++
++      throw error
++    }
++
++    const wasUp = !gate.isDown(key)
++    gate.markDown(key, `connect failed: ${message}`)
++
++    if (wasUp) {
++      log?.(`[remote-down] ${key} marked down (connect failed: ${message.slice(0, 160)}); failing fast until it answers`)
++    }
++
++    throw error
++  }
++
++  try {
++    const result = await request(connection)
++
++    if (gate.markUp(key)) {
++      log?.(`[remote-down] ${key} answered again; gate open`)
++    }
++
++    return result
++  } catch (error) {
++    if (isRemoteTransportFailure(error)) {
++      forgetAnswer?.(connection?.baseUrl)
++      const wasUp = !gate.isDown(key)
++      const message = String((error as { message?: unknown } | null)?.message ?? error)
++      gate.markDown(key, message)
++
++      if (wasUp) {
++        log?.(`[remote-down] ${key} marked down (${message.slice(0, 160)}); failing fast until it answers`)
++      }
++    } else if (isRemoteTimeout(error)) {
++      forgetAnswer?.(connection?.baseUrl)
++
++      if (trial) {
++        gate.markDown(key, 'trial request timed out')
++      }
++    } else if (gate.markUp(key)) {
++      // An HTTP status error (4xx/5xx) or a bad payload is still an answer: the backend is reachable.
++      log?.(`[remote-down] ${key} answered again; gate open`)
++    }
++
++    throw error
++  }
++}
+-- 
+2.55.0
+

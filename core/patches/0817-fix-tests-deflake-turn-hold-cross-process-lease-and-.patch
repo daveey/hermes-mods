@@ -1,0 +1,727 @@
+From 9a6270f82577ea558f6fc9679ac77b2312e9aa2a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:19:04 +0000
+Subject: [PATCH] fix(tests): deflake turn-hold, cross-process lease and
+ hosted-room tests; poll long CI runs for flakes [daveey]
+
+Three files flaked in PR run 40764402730 shard 1 (each reproduced with a
+deterministic injected delay, no host-wide CPU stress):
+
+- active_sessions: every refused claim rewrote the unchanged registry, an
+  fsync'd write under the exclusive lock, so N contenders queued behind N
+  disk flushes; with a 2 s injected fsync the test hit the CI signature
+  (TimeoutExpired after 10 s). Refusals now write only when they pruned
+  (invariant test, red on base). The test uses one cohort hang guard and
+  an event-ordered late contender instead of per-phase 10 s bounds and a
+  2.5 s sleep.
+- turn-hold adoption: asserted elapsed < 5.0 s on the whole handler; a
+  slow but legitimate agent turn (injected 5.5 s) fails it. The hold is
+  now proven by event order (turn returned while the worker still
+  streamed); a hold that waits for the worker still fails.
+- hosted-room runtime: the helper defaulted to a 0.4 s lease TTL on a real
+  clock, so any >0.4 s stall fenced the attempt (injected 0.6 s stall ->
+  indeterminate, the CI timeout). Default is now the production 30 s;
+  positive waits use a 30 s hang guard. Two tests that had already been
+  patched one by one with lease_ttl_seconds=30 use the default.
+
+flaky_kanban --from-github read only the newest 40 completed runs. A
+37-minute test run completed behind 53 newer runs, so its FLAKY
+annotations never became cards. It now pages through a 6 h creation
+window (regression test red on base).
+---
+ hermes_cli/active_sessions.py                 |   6 +-
+ scripts/ci/flaky_kanban.py                    |  34 ++++-
+ tests/ci/test_flaky_kanban.py                 |  38 ++++++
+ .../test_session_hygiene_turnhold_adoption.py |  27 +++-
+ tests/hermes_cli/test_active_sessions.py      | 129 ++++++++++++------
+ .../test_hosted_room_driver_runtime.py        |  88 ++++++------
+ 6 files changed, 228 insertions(+), 94 deletions(-)
+
+diff --git a/hermes_cli/active_sessions.py b/hermes_cli/active_sessions.py
+index 9ebbf8cb08..1413e53908 100644
+--- a/hermes_cli/active_sessions.py
++++ b/hermes_cli/active_sessions.py
+@@ -563,7 +563,11 @@ def try_acquire_active_session(
+             logger.info("Pruned %d stale active session lease(s)", pruned)
+ 
+         def refuse(message: str, reason: str, log: str, *args) -> tuple[None, ActiveSessionRefusal]:
+-            _write_entries(state_path, entries)  # persist the prune even when refusing
++            # Persist a prune even when refusing, but never rewrite an unchanged
++            # registry: each write fsyncs under the exclusive lock, so a no-op write
++            # per refusal serializes every contender behind the disk.
++            if pruned:
++                _write_entries(state_path, entries)
+             logger.info(log, *args)
+             return None, ActiveSessionRefusal(message, reason)
+ 
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index dc9be78722..bf83d4bbea 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -184,13 +184,39 @@ def _gh(url: str, token: str) -> Any:
+         return json.loads(resp.read())
+ 
+ 
+-def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *, runs: int = 40) -> list[str]:
+-    """File cards for FLAKY annotations on recently completed runs not seen before."""
++def _completed_runs(api: str, token: str, *, since: float, per_page: int = 100) -> list[dict[str, Any]]:
++    """Every run created since ``since`` that has completed, across all result pages.
++
++    The list is ordered by creation, but a run is only readable once it completes: a
++    40-minute test run finishes after dozens of newer short runs, so a fixed first page
++    (it used to be the newest 40) silently skipped exactly the long test runs that carry
++    FLAKY annotations. A creation-time window, paged out, keeps them in view until they
++    complete; ``state["runs"]`` dedupes across polls.
++    """
++    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
++    runs: list[dict[str, Any]] = []
++    page = 1
++    while True:
++        batch = _gh(f"{api}/actions/runs?status=completed&created=%3E%3D{created}"
++                    f"&per_page={per_page}&page={page}", token).get("workflow_runs", [])
++        runs += batch
++        if len(batch) < per_page:
++            return runs
++        page += 1
++
++
++def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
++                lookback_hours: float = 6.0) -> list[str]:
++    """File cards for FLAKY annotations on recently completed runs not seen before.
++
++    ``lookback_hours`` must outlast the slowest workflow plus any cron outage, and stay
++    well under ``save_state``'s 1000-run dedupe memory (the repo sees ~50 runs/hour).
++    """
+     api = f"https://api.github.com/repos/{repo}"
+     log: list[str] = []
+     done = set(state["runs"])
+-    page = _gh(f"{api}/actions/runs?status=completed&per_page={runs}", token)
+-    for run in sorted(page.get("workflow_runs", []), key=lambda r: r["id"]):
++    since = time.time() - lookback_hours * 3600
++    for run in sorted(_completed_runs(api, token, since=since), key=lambda r: r["id"]):
+         key = f"{run['id']}/{run.get('run_attempt', 1)}"
+         if key in done:
+             continue
+diff --git a/tests/ci/test_flaky_kanban.py b/tests/ci/test_flaky_kanban.py
+index 5c201e3f74..5be5171ba2 100644
+--- a/tests/ci/test_flaky_kanban.py
++++ b/tests/ci/test_flaky_kanban.py
+@@ -120,6 +120,44 @@ def test_annotations_round_trip_through_the_github_poll(monkeypatch):
+     assert len(board.cards) == 2
+ 
+ 
++def test_poll_pages_past_newer_runs_to_reach_a_long_test_run(monkeypatch):
++    """A long test run completes after more newer runs than one page holds.
++
++    Regression: PR run 40764402730 (37 min of tests) finished behind 53 newer
++    completed runs; the poll read only the newest 40, so its three FLAKY
++    annotations never became cards.
++    """
++    api = "https://api.github.com/repos/o/r"
++    # Newest first, as GitHub orders them; the slow test run is the oldest.
++    runs = [{"id": 1000 - i, "run_attempt": 1, "head_branch": "b", "html_url": f"https://r/{1000 - i}"}
++            for i in range(150)]
++    slow = runs[-1]["id"]
++    seen_urls = []
++
++    def fake_gh(url, token):
++        seen_urls.append(url)
++        if url.startswith(f"{api}/actions/runs?"):
++            query = dict(part.split("=", 1) for part in url.split("?", 1)[1].split("&"))
++            per_page, page = int(query["per_page"]), int(query.get("page", 1))
++            return {"workflow_runs": runs[(page - 1) * per_page: page * per_page]}
++        if url.startswith(f"{api}/actions/runs/{slow}/attempts/1/jobs"):
++            return {"jobs": [{"id": 7, "name": "Python tests / Run tests (1/2)", "html_url": "https://job/7"}]}
++        if "/attempts/" in url:
++            return {"jobs": []}
++        if url.startswith(f"{api}/check-runs/7/annotations"):
++            return [{"title": fk.ANNOTATION_TITLE, "message": "tests/slow.py::test_flaky\nE  boom"}]
++        raise AssertionError(url)
++
++    monkeypatch.setattr(fk, "_gh", fake_gh)
++    board, state = FakeBoard(), fk.load_state(Path("/nonexistent/state.json"))
++    log = fk.poll_github("o/r", "tok", board, state)
++
++    assert log == [f"opened {state['cards']['tests/slow.py::test_flaky']['card']} tests/slow.py::test_flaky"]
++    assert f"{slow}/1" in state["runs"] and len(state["runs"]) == len(runs)
++    # Bounded by a creation window, not by a page count.
++    assert all("created=%3E%3D" in u for u in seen_urls if u.startswith(f"{api}/actions/runs?"))
++
++
+ def test_annotate_mode_tolerates_a_missing_report(tmp_path, capsys):
+     assert fk.main(["--annotate", str(tmp_path / "absent.json")]) == 0
+     assert "no flaky report" in capsys.readouterr().out
+diff --git a/tests/gateway/test_session_hygiene_turnhold_adoption.py b/tests/gateway/test_session_hygiene_turnhold_adoption.py
+index 752ecfd7bf..a490659bb3 100644
+--- a/tests/gateway/test_session_hygiene_turnhold_adoption.py
++++ b/tests/gateway/test_session_hygiene_turnhold_adoption.py
+@@ -159,6 +159,12 @@ async def _drain_deferred(runner, timeout=10.0):
+         )
+ 
+ 
++# The fake summary worker streams until the test releases it; it gives up after
++# this long only so a broken hold cannot hang the run. Generous on purpose: the
++# hold is proven by event order, so this bound never races a healthy turn.
++_WORKER_GIVE_UP_SECONDS = 45.0
++
++
+ @pytest.mark.asyncio
+ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
+     monkeypatch, tmp_path
+@@ -168,6 +174,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
+     the turn itself is still released at the budget (#90845 invariant).
+     """
+     worker_started = threading.Event()
++    worker_gave_up = threading.Event()
+     release_worker = threading.Event()
+     committed = threading.Event()
+     cleanup_done = threading.Event()
+@@ -205,7 +212,8 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
+             # would hang at interpreter exit joining executor threads).
+             _spin_started = time.monotonic()
+             while not release_worker.is_set():
+-                if time.monotonic() - _spin_started > 20:
++                if time.monotonic() - _spin_started > _WORKER_GIVE_UP_SECONDS:
++                    worker_gave_up.set()
+                     return (messages, None)
+                 if commit_fence is not None:
+                     commit_fence.touch_progress()
+@@ -232,14 +240,21 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
+     adapter = _CaptureAdapter()
+     runner = _build_runner(gateway_run, adapter, fake_db)
+ 
+-    started = time.monotonic()
+-    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
+-    elapsed = time.monotonic() - started
++    result = await asyncio.wait_for(
++        runner._handle_message(_make_event()), timeout=_WORKER_GIVE_UP_SECONDS * 2
++    )
+ 
+-    # #90845/#92318 invariant intact: the turn is released at the budget.
++    # #90845/#92318 invariant intact: the turn-hold budget released the turn
++    # while the summary worker was still streaming (never committed, never
++    # gave up). Ordered by events, not elapsed wall time: the handler's own
++    # latency on a loaded runner is not the hold (CI saw 5.7s against a
++    # 5.0s bound with a 0.3s budget). A turn that waited for the worker
++    # instead returns only after the worker gives up, which fails below.
+     assert result == "ok"
+-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
+     assert worker_started.is_set()
++    assert not committed.is_set() and not worker_gave_up.is_set(), (
++        "the turn waited for the summary worker instead of the turn-hold budget"
++    )
+     assert runner._run_agent.await_count == 1
+ 
+     # (b) NO retry-after was armed while the attempt is still running —
+diff --git a/tests/hermes_cli/test_active_sessions.py b/tests/hermes_cli/test_active_sessions.py
+index 2351353d1d..da579525b7 100644
+--- a/tests/hermes_cli/test_active_sessions.py
++++ b/tests/hermes_cli/test_active_sessions.py
+@@ -8,6 +8,7 @@ from pathlib import Path
+ import pytest
+ 
+ from hermes_cli import active_sessions
++from tests.waiting import wait_until
+ 
+ 
+ 
+@@ -53,6 +54,53 @@ def test_resolve_max_concurrent_sessions_values():
+ 
+ 
+ 
++# Hang guard for the whole cross-process cohort, not a latency bound: every wait
++# below is on an observable event (a ready/result file, process exit). Each
++# contender's attempt holds the registry's exclusive lock across an fsync'd write,
++# so on a busy CI disk the attempts serialize for seconds; per-phase 10s bounds
++# turned that into TimeoutExpired flakes.
++_COHORT_TIMEOUT = 120.0
++
++_CONTENDER_SCRIPT = (
++    "import os, time\n"
++    "from pathlib import Path\n"
++    "from hermes_cli.active_sessions import try_acquire_active_session\n"
++    "idx = os.environ['WORKER_INDEX']\n"
++    "worker_count = int(os.environ['WORKER_COUNT'])\n"
++    "late_worker = os.environ.get('LATE_WORKER_INDEX')\n"
++    "ready_dir = Path(os.environ['READY_DIR'])\n"
++    "results_dir = Path(os.environ['RESULTS_DIR'])\n"
++    "go_file = Path(os.environ['GO_FILE'])\n"
++    "deadline = float(os.environ['COHORT_DEADLINE'])\n"
++    "def wait_for(cond, what):\n"
++    "    while not cond():\n"
++    "        if time.time() > deadline:\n"
++    "            raise RuntimeError('timed out waiting for ' + what)\n"
++    "        time.sleep(0.01)\n"
++    "(ready_dir / idx).write_text('ready', encoding='utf-8')\n"
++    "wait_for(go_file.exists, 'go file')\n"
++    "if idx == late_worker:\n"
++    "    # Attempt only once another process provably holds the last slot.\n"
++    "    wait_for(lambda: any(p.read_text(encoding='utf-8') == 'OK'\n"
++    "                         for p in results_dir.iterdir()), 'a holder')\n"
++    "lease, message = try_acquire_active_session(\n"
++    "    session_id=f'process-{idx}',\n"
++    "    surface='cli',\n"
++    "    config={'max_concurrent_sessions': 1},\n"
++    ")\n"
++    "outcome = 'BLOCK' if lease is None else 'OK'\n"
++    "tmp = results_dir / f'.{idx}.tmp'\n"
++    "tmp.write_text(outcome, encoding='utf-8')\n"
++    "tmp.replace(results_dir / idx)\n"
++    "print(outcome, flush=True)\n"
++    "if lease is not None:\n"
++    "    wait_for(lambda: len([p for p in results_dir.iterdir()\n"
++    "                          if not p.name.startswith('.')]) >= worker_count,\n"
++    "             'all workers to attempt acquire')\n"
++    "    lease.release()\n"
++)
++
++
+ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
+     home = tmp_path / ".hermes"
+     monkeypatch.setenv("HERMES_HOME", str(home))
+@@ -62,58 +110,24 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
+     results_dir = tmp_path / "results"
+     results_dir.mkdir()
+     go_file = tmp_path / "go"
++    deadline = time.monotonic() + _COHORT_TIMEOUT
+     env = os.environ.copy()
+     env["HERMES_HOME"] = str(home)
+     env["PYTHONPATH"] = str(repo_root)
+-    script = (
+-        "import os, time\n"
+-        "from pathlib import Path\n"
+-        "from hermes_cli.active_sessions import try_acquire_active_session\n"
+-        "idx = os.environ['WORKER_INDEX']\n"
+-        "worker_count = int(os.environ['WORKER_COUNT'])\n"
+-        "delayed_worker = os.environ.get('DELAYED_WORKER_INDEX')\n"
+-        "ready_dir = Path(os.environ['READY_DIR'])\n"
+-        "results_dir = Path(os.environ['RESULTS_DIR'])\n"
+-        "go_file = Path(os.environ['GO_FILE'])\n"
+-        "(ready_dir / idx).write_text('ready', encoding='utf-8')\n"
+-        "deadline = time.time() + 10\n"
+-        "while not go_file.exists():\n"
+-        "    if time.time() > deadline:\n"
+-        "        raise RuntimeError('timed out waiting for go file')\n"
+-        "    time.sleep(0.01)\n"
+-        "if idx == delayed_worker:\n"
+-        "    time.sleep(2.5)\n"
+-        "lease, message = try_acquire_active_session(\n"
+-        "    session_id=f'process-{idx}',\n"
+-        "    surface='cli',\n"
+-        "    config={'max_concurrent_sessions': 1},\n"
+-        ")\n"
+-        "if lease is None:\n"
+-        "    (results_dir / idx).write_text('BLOCK', encoding='utf-8')\n"
+-        "    print('BLOCK', flush=True)\n"
+-        "else:\n"
+-        "    (results_dir / idx).write_text('OK', encoding='utf-8')\n"
+-        "    print('OK', flush=True)\n"
+-        "    deadline = time.time() + 10\n"
+-        "    while len(list(results_dir.iterdir())) < worker_count:\n"
+-        "        if time.time() > deadline:\n"
+-        "            raise RuntimeError('timed out waiting for all workers to attempt acquire')\n"
+-        "        time.sleep(0.01)\n"
+-        "    lease.release()\n"
+-    )
++    env["COHORT_DEADLINE"] = str(time.time() + _COHORT_TIMEOUT)
+     workers: list[subprocess.Popen[str]] = []
+     try:
+         for index in range(6):
+             worker_env = env.copy()
+             worker_env["WORKER_INDEX"] = str(index)
+             worker_env["WORKER_COUNT"] = "6"
+-            worker_env["DELAYED_WORKER_INDEX"] = "5"
++            worker_env["LATE_WORKER_INDEX"] = "5"
+             worker_env["READY_DIR"] = str(ready_dir)
+             worker_env["RESULTS_DIR"] = str(results_dir)
+             worker_env["GO_FILE"] = str(go_file)
+             workers.append(
+                 subprocess.Popen(
+-                    [sys.executable, "-c", script],
++                    [sys.executable, "-c", _CONTENDER_SCRIPT],
+                     env=worker_env,
+                     text=True,
+                     stdout=subprocess.PIPE,
+@@ -121,16 +135,18 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
+                 )
+             )
+ 
+-        deadline = time.time() + 10
+-        while len(list(ready_dir.iterdir())) < len(workers):
+-            if time.time() > deadline:
+-                raise AssertionError("workers did not become ready")
+-            time.sleep(0.01)
++        wait_until(
++            lambda: len(list(ready_dir.iterdir())) >= len(workers),
++            timeout=max(0.0, deadline - time.monotonic()),
++            what="every contender to become ready",
++        )
+         go_file.write_text("go", encoding="utf-8")
+ 
+         outputs = []
+         for worker in workers:
+-            stdout, stderr = worker.communicate(timeout=10)
++            stdout, stderr = worker.communicate(
++                timeout=max(0.0, deadline - time.monotonic())
++            )
+             assert worker.returncode == 0, stderr
+             outputs.append(stdout.strip())
+     finally:
+@@ -144,6 +160,31 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
+     assert active_sessions.active_session_registry_snapshot() == []
+ 
+ 
++def test_refusal_without_prune_leaves_registry_file_untouched(tmp_path, monkeypatch):
++    """A refused claim that pruned nothing must not rewrite the registry.
++
++    Every registry write fsyncs while holding the exclusive lock, so a no-op
++    rewrite per refusal made N contenders queue behind N disk flushes.
++    """
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    cfg = {"max_concurrent_sessions": 1}
++    holder, _ = active_sessions.try_acquire_active_session(
++        session_id="holder", surface="cli", config=cfg
++    )
++    assert holder is not None
++    state_path = active_sessions._state_path()
++    before = state_path.stat()
++
++    # Both refusal kinds: over the cap, and a second writer for a held session.
++    for session_id in ("over-cap", "holder"):
++        lease, refusal = active_sessions.try_acquire_active_session(
++            session_id=session_id, surface="desktop", config=cfg
++        )
++        assert lease is None and refusal is not None
++
++    after = state_path.stat()
++    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
++    holder.release()
+ 
+ 
+ def test_release_orphaned_leases_reclaims_only_unowned_own_pid_entries(tmp_path, monkeypatch):
+diff --git a/tests/tui_gateway/test_hosted_room_driver_runtime.py b/tests/tui_gateway/test_hosted_room_driver_runtime.py
+index 3273b60f95..6e1bc7a296 100644
+--- a/tests/tui_gateway/test_hosted_room_driver_runtime.py
++++ b/tests/tui_gateway/test_hosted_room_driver_runtime.py
+@@ -405,6 +405,14 @@ def _admit(
+     )
+ 
+ 
++# The production lease TTL. A test exercising lease expiry passes its own short
++# TTL (or an injected clock); every other test must not be fenced by a scheduler
++# stall: with a real clock and a 0.4 s TTL, any >0.4 s pause between lease renewal
++# and settle on a loaded runner legitimately expires the lease, turning the task
++# indeterminate instead of settled.
++_UNTESTED_LEASE_TTL_SECONDS = 30.0
++
++
+ def _runtime(
+     db: Path,
+     rpc: FakeSessionRPC,
+@@ -416,13 +424,19 @@ def _runtime(
+         rooms=[BINDING],
+         rpc=rpc,
+         turn_lock=locks or RecordingTurnLocks(),
+-        lease_ttl_seconds=kwargs.pop("lease_ttl_seconds", 0.4),
++        lease_ttl_seconds=kwargs.pop("lease_ttl_seconds", _UNTESTED_LEASE_TTL_SECONDS),
+         poll_interval_seconds=kwargs.pop("poll_interval_seconds", 0.01),
+         **kwargs,
+     )
+ 
+ 
+-def _wait_for(predicate, *, timeout: float = 5.0) -> None:
++# Deadline for a positive wait, not a delay: a fast run returns in milliseconds and
++# only a real hang waits this long. CI first attempts of this file ran ~4x slower than
++# a quiet host, which tipped the old 1 s / 5 s bounds.
++_HANG_GUARD_SECONDS = 30.0
++
++
++def _wait_for(predicate, *, timeout: float = _HANG_GUARD_SECONDS) -> None:
+     deadline = time.monotonic() + timeout
+     while time.monotonic() < deadline:
+         if predicate():
+@@ -456,7 +470,7 @@ def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     create = next(params for method, params in rpc.calls if method == "create")
+     submit = next(params for method, params in rpc.calls if method == "submit")
+@@ -488,7 +502,7 @@ def test_worker_settles_without_any_client_transport(db: Path):
+ 
+     assert runtime.status()["running"] is True
+     assert runtime.status()["cycles"] >= 1
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+ 
+ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
+@@ -509,7 +523,7 @@ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert prepared
+     assert published == [(ROOM_ID, identity.task_id, "settled")]
+@@ -538,7 +552,7 @@ def test_transport_resolver_selects_member_transport_without_forking_state(
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert resolutions
+     assert all(binding == BINDING for binding, _, _ in resolutions)
+@@ -671,10 +685,10 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
+     )
+ 
+     runtime.start()
+-    assert waiting.submitted.wait(1.0)
++    assert waiting.submitted.wait(_HANG_GUARD_SECONDS)
+     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
+     assert state.get_task(db, identities[0])["status"] == "running"
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+ 
+ def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
+@@ -720,7 +734,7 @@ def test_bounded_scheduler_eventually_runs_later_room(tmp_path: Path):
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+ 
+ def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
+@@ -856,7 +870,7 @@ def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Pa
+         content="é" * (MAX_TERMINAL_TEXT_BYTES + 100),
+     )
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     result = state.get_task(db, identity)["result"]
+     assert result["truncated"] is True
+@@ -940,7 +954,7 @@ def test_turn_deadline_stops_exact_attempt_and_publishes_durable_failure(db: Pat
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "failed")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     failed = state.get_task(db, identity)
+     assert failed["result"]["reason_code"] == "turn_deadline_exceeded"
+@@ -1003,7 +1017,7 @@ def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identities[0])["status"] == "failed")
+     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert state.get_task(db, identities[0])["result"]["reason_code"] == (
+         "turn_deadline_exceeded"
+@@ -1072,9 +1086,9 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
+     runtime = _runtime(db, rpc, clock=clock)
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(1.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+     time.sleep(0.04)
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     task = state.get_task(db, identity)
+     assert task["status"] == "running"
+@@ -1106,7 +1120,7 @@ def test_active_recovered_turn_is_never_resubmitted(db: Path):
+ 
+     runtime.start()
+     time.sleep(0.08)
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert state.get_task(db, identity)["status"] == "running"
+     assert not [call for call in rpc.calls if call[0] == "submit"]
+@@ -1319,7 +1333,7 @@ def test_ambiguous_recovery_remains_indeterminate(db: Path):
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "indeterminate")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert not [call for call in rpc.calls if call[0] == "submit"]
+ 
+@@ -1443,7 +1457,7 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path)
+     runtime = _runtime(db, rpc)
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(1.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+     _wait_for(
+         lambda: (
+             "observation failed after submit"
+@@ -1454,7 +1468,7 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path)
+     rpc.complete(identity.task_id, content="Recovered after a transient read.")
+     runtime.wakeup()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     task = state.get_task(db, identity)
+     assert task["result"]["text"] == "Recovered after a transient read."
+@@ -1474,12 +1488,12 @@ def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
+     )
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(1.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+     cancelled = runtime.cancel(identity, cancel_id="cancel-user")
+     rpc.complete(identity.task_id, content="Too late.")
+     runtime.wakeup()
+     time.sleep(0.05)
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert cancelled["status"] == "cancelled"
+     assert observed_status == ["stopping"]
+@@ -1489,7 +1503,7 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
+     identity = _identity()
+     _admit(db, identity)
+     rpc = FakeSessionRPC(auto_complete=False)
+-    runtime = _runtime(db, rpc, lease_ttl_seconds=30.0)  # not under test; 0.4 s lapsed on loaded CI (t_94f2c8ba)
++    runtime = _runtime(db, rpc)
+     original_interrupt = rpc.interrupt
+     attempts = 0
+     retry_allowed = threading.Event()
+@@ -1512,7 +1526,7 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
+     runtime.wakeup()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled", timeout=30)
+     assert attempts >= 2
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+     assert state.get_task(db, identity)["status"] == "cancelled"
+ 
+ 
+@@ -1650,7 +1664,7 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
+     runtime = _runtime(db, rpc)
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(1.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+ 
+     def finish_only_after_stop_intent():
+         if state.get_task(db, identity)["status"] == "stopping":
+@@ -1661,7 +1675,7 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
+ 
+     assert result["status"] == "settled"
+     assert result["result"]["text"] == "Already done."
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+ 
+ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
+@@ -1720,7 +1734,7 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     settled = state.get_task(db, identity)
+     assert stopping["status"] == "stopping"
+@@ -1843,7 +1857,7 @@ def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
+     )
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(1.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+     session_id = next(iter(rpc.states))
+     with rpc._lock:
+         rpc.states[session_id]["pending_approval"] = {
+@@ -1858,7 +1872,7 @@ def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
+     assert member == PROFILE
+     assert action["request_id"] == "approval-1"
+     assert action["approval"]["choices"] == ["once", "deny"]
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+ 
+ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
+@@ -1868,7 +1882,7 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
+     runtime = _runtime(db, rpc)
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(1.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+     session_id = next(iter(rpc.states))
+ 
+     def switch_to_newer_task() -> None:
+@@ -1885,7 +1899,7 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
+     assert all(params["expected_task_id"] == identity.task_id for params in skipped)
+     assert rpc.states[session_id]["active"] is True
+     assert rpc.states[session_id]["task_id"] == "task-2"
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+ 
+ def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path):
+@@ -1915,7 +1929,7 @@ def test_status_reports_room_blocked_on_unresolved_indeterminate_task(db: Path):
+ 
+     runtime.start()
+     _wait_for(lambda: ROOM_ID in runtime.status()["blocked_rooms"])
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert state.get_task(db, identity)["status"] == "indeterminate"
+ 
+@@ -1924,14 +1938,10 @@ def test_authority_loss_stops_terminal_commit(db: Path):
+     identity = _identity()
+     _admit(db, identity)
+     rpc = FakeSessionRPC(auto_complete=False)
+-    # Generous lease TTL: this test is about AUTHORITY loss. A short TTL let
+-    # a loaded CI runner expire the lease before the authority change was
+-    # observed, so last_error flipped to "driver lease is stale or expired"
+-    # (flaky main run 33455779041).
+-    runtime = _runtime(db, rpc, lease_ttl_seconds=30.0)
++    runtime = _runtime(db, rpc)
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(1.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+     hosted_rooms.claim_authority(
+         db,
+         room_id=ROOM_ID,
+@@ -1944,7 +1954,7 @@ def test_authority_loss_stops_terminal_commit(db: Path):
+     rpc.complete(identity.task_id)
+     runtime.wakeup()
+     _wait_for(lambda: runtime.status()["last_error"] is not None)
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     assert state.get_task(db, identity)["status"] == "running"
+     assert "authority changed" in runtime.status()["last_error"]
+@@ -1959,7 +1969,7 @@ def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Pa
+ 
+     runtime.start()
+     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+-    assert runtime.stop(timeout=5.0)
++    assert runtime.stop(timeout=_HANG_GUARD_SECONDS)
+ 
+     # Balanced enter/exit pairs on the task's profile only (a loaded runner may run extra cycles).
+     assert locks.events and all(profile == PROFILE for _event, profile in locks.events)
+@@ -1977,7 +1987,7 @@ def test_stop_is_bounded_and_does_not_interrupt_active_turn(db: Path):
+     runtime = _runtime(db, rpc, poll_interval_seconds=0.01)
+ 
+     runtime.start()
+-    assert rpc.submitted.wait(5.0)
++    assert rpc.submitted.wait(_HANG_GUARD_SECONDS)
+     started = time.monotonic()
+     stopped = runtime.stop(timeout=5.0)
+ 
+-- 
+2.55.0
+

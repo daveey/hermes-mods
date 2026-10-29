@@ -1,0 +1,143 @@
+From 8f03cbcee3b337ced4321f944adce42b31e81457 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 10:40:36 +0000
+Subject: [PATCH] fix(oneshot): [daveey] hermes -z keeps writing agent.log;
+ silence console log handlers instead of logging.disable
+
+logging.disable(CRITICAL) short-circuits isEnabledFor for every logger, so the
+setup_logging() file handlers saw nothing and one-shot turns left no
+conversation turn / API call #N / Turn ended lines in agent.log. Mute only
+console StreamHandlers (not FileHandlers, not the queued file handlers) and
+make logging.lastResort a no-op; stdout stays the reply, stderr stays clean.
+---
+ hermes_cli/oneshot.py                         | 28 +++++++-
+ tests/hermes_cli/test_oneshot_file_logging.py | 71 +++++++++++++++++++
+ 2 files changed, 96 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_oneshot_file_logging.py
+
+diff --git a/hermes_cli/oneshot.py b/hermes_cli/oneshot.py
+index cfddfc975c..957a4d2553 100644
+--- a/hermes_cli/oneshot.py
++++ b/hermes_cli/oneshot.py
+@@ -235,6 +235,27 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str]
+         pass
+ 
+ 
++def _silence_console_log_handlers() -> None:
++    """Mute every console log handler already attached, leaving file/queue handlers alone.
++
++    A ``StreamHandler`` binds its stream at creation, so ``redirect_stderr`` below does not
++    reach handlers attached earlier (``--verbose``, a library's ``basicConfig``). Raise their
++    level past CRITICAL instead. ``FileHandler`` subclasses ``StreamHandler`` and is kept, as are
++    the queued agent.log/errors.log handlers (``QueueHandler`` is not a ``StreamHandler``).
++    Handlers created later bind to the redirected (devnull) stream. ``logging.lastResort`` (used
++    only when no handler at all exists, e.g. setup_logging() failed) is replaced by a no-op so a
++    WARNING outside the redirect window cannot reach the real stderr.
++    """
++    logging.lastResort = logging.NullHandler()
++    loggers = [logging.getLogger()] + [
++        lg for lg in list(logging.root.manager.loggerDict.values()) if isinstance(lg, logging.Logger)
++    ]
++    for lg in loggers:
++        for handler in list(lg.handlers):
++            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
++                handler.setLevel(logging.CRITICAL + 1)
++
++
+ def run_oneshot(
+     prompt: str,
+     model: Optional[str] = None,
+@@ -252,9 +273,10 @@ def run_oneshot(
+     the CLI layer: latest/title/--continue resolution) whose transcript is loaded and continued
+     by this turn. Returns the exit code; the caller owns process termination.
+     """
+-    # Silence every stdlib logger: AIAgent, tools and provider adapters log to stderr through the
+-    # root logger. File handlers from setup_logging() keep working (level-independent).
+-    logging.disable(logging.CRITICAL)
++    # Keep the console clean (stdout = the reply, stderr = no log text) WITHOUT disabling logging:
++    # ``logging.disable`` short-circuits ``isEnabledFor`` for every logger, so the setup_logging()
++    # file handlers would see nothing and one-shot turns would leave no agent.log lines.
++    _silence_console_log_handlers()
+ 
+     # --provider without --model is ambiguous (the provider may not host the configured model, and
+     # picking its catalog default hides the mismatch). Validate BEFORE the stderr redirect.
+diff --git a/tests/hermes_cli/test_oneshot_file_logging.py b/tests/hermes_cli/test_oneshot_file_logging.py
+new file mode 100644
+index 0000000000..f7de95bc86
+--- /dev/null
++++ b/tests/hermes_cli/test_oneshot_file_logging.py
+@@ -0,0 +1,71 @@
++"""``hermes -z`` keeps writing agent.log while keeping the console clean.
++
++``run_oneshot`` used to call ``logging.disable(logging.CRITICAL)``. That short-circuits
++``Logger.isEnabledFor`` for every logger, so the file handlers from ``setup_logging()`` never saw
++a record either: one-shot turns left no ``conversation turn`` / ``API call #N`` / ``Turn ended``
++line in agent.log, and provider audits that read it could not see them. Only console handlers
++may be silenced; stdout stays exactly the reply and stderr carries no log text.
++"""
++
++import logging
++from unittest import mock
++
++import pytest
++
++import hermes_logging
++from hermes_cli import oneshot
++
++_MARK = "oneshot-file-logging-probe API call #1: model=fake provider=fake"
++
++
++@pytest.fixture
++def file_logged_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    root = logging.getLogger()
++    saved_level, saved_handlers = root.level, list(root.handlers)
++    saved_disable = logging.root.manager.disable
++    saved_last_resort = logging.lastResort
++    hermes_logging._reset_queued_handlers()
++    hermes_logging._logging_initialized = False
++    logging.disable(logging.NOTSET)
++    hermes_logging.setup_logging(hermes_home=home, force=True)
++    try:
++        yield home
++    finally:
++        hermes_logging._reset_queued_handlers()
++        hermes_logging._logging_initialized = False
++        for h in list(root.handlers):
++            if h not in saved_handlers:
++                root.removeHandler(h)
++        root.setLevel(saved_level)
++        logging.disable(saved_disable)
++        logging.lastResort = saved_last_resort
++
++
++def test_oneshot_logs_reach_agent_log_but_not_console(file_logged_home, capfd):
++    # A console handler like the one ``--verbose`` / a library basicConfig would attach, bound to
++    # the real stderr before run_oneshot's redirect takes effect.
++    console = logging.StreamHandler()
++    console.setLevel(logging.DEBUG)
++    logging.getLogger().addHandler(console)
++    module_logger = logging.getLogger("run_agent.oneshot_probe")
++
++    def fake_agent(*_a, **_kw):
++        module_logger.info(_MARK)
++        return "the reply", {"final_response": "the reply", "completed": True, "failed": False}
++
++    try:
++        with mock.patch.object(oneshot, "_run_agent", side_effect=fake_agent):
++            code = oneshot.run_oneshot("q")
++        hermes_logging.flush_log_queue()
++    finally:
++        logging.getLogger().removeHandler(console)
++
++    out, err = capfd.readouterr()
++    assert code == 0
++    assert out == "the reply\n"
++    assert _MARK not in err and err == ""
++    agent_log = (file_logged_home / "logs" / "agent.log").read_text(encoding="utf-8")
++    assert _MARK in agent_log
+-- 
+2.55.0
+

@@ -1,0 +1,218 @@
+From 4897e78880e91de5027c9a2128c5fbb78598ed43 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:08:53 -0700
+Subject: [PATCH] fix(resume): bound a replaced backend's durable pause hold to
+ HOLD_MAX_S; paused continuation takes over idle detached holders [daveey]
+
+Review of 0514681bb4: the durable core_update_pause hold had no time bound, so a
+continuation refused forever (live foreign owner, startup sweep gave up after 600s)
+refused every automatic notice for the whole freshness window (240 min). The hold
+now starts when this backend first sees the pause, keyed by the pause identity
+(started_at, paused_at, pauses), and releases after HOLD_MAX_S (305s) like the
+in-place hold; re-reading the same marker never re-arms it, a new pause does.
+
+Paused continuations used allow_takeover=False, so an idle detached sibling holding
+the lease blocked them until the WS orphan reap (20s grace, longer while a
+detached turn runs). They now take over only an idle detached holder; a mid-turn
+holder (notice, another reader's continuation) is never interrupted and the 30s
+refusal backoff retries.
+---
+ .../tui_gateway/test_update_pause_recovery.py | 71 ++++++++++++++++++-
+ tui_gateway/session_auto_continue.py          |  4 +-
+ tui_gateway/session_lifecycle.py              | 13 ++--
+ tui_gateway/update_pause.py                   | 18 ++++-
+ 4 files changed, 98 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_recovery.py b/tests/tui_gateway/test_update_pause_recovery.py
+index d91ec37ce5..19f5c0cd44 100644
+--- a/tests/tui_gateway/test_update_pause_recovery.py
++++ b/tests/tui_gateway/test_update_pause_recovery.py
+@@ -129,7 +129,7 @@ def test_replaced_backend_slot_refusal_backs_off(recovery, monkeypatch):
+     monkeypatch.setattr(server, "time", types.SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+     monkeypatch.setattr(server, "_start_session_work", lambda fn, **kw: fn() or True)
+     def slot(*args, **kwargs):
+-        assert kwargs == {"allow_takeover": False}
++        assert kwargs == {"takeover_idle_only": True}
+         attempts.append(clock[0])
+         return "another live owner" if len(attempts) == 1 else None
+     monkeypatch.setattr(server, "_ensure_active_session_slot", slot)
+@@ -190,6 +190,75 @@ def test_pause_readers_use_exclusive_slot_without_detached_takeover(recovery, mo
+         server._release_active_session_slot(second)
+ 
+ 
++@pytest.mark.parametrize("holder_running", [False, True])
++def test_pause_reader_takes_over_only_an_idle_detached_holder(recovery, monkeypatch, holder_running):
++    _detached_ws_transport = server._detached_ws_transport
++    af.set_hold(recovery.home)
++    sid = mount()["session_id"]
++    af.clear_hold(recovery.home)
++    first = server._sessions[sid]
++    # A same-process sibling runtime of this chat lost its client but still holds the lease.
++    holder = {**first, "history_lock": threading.Lock(), "transport": _detached_ws_transport,
++              "running": holder_running}
++    holder.pop("active_session_lease", None)
++    server._sessions["holder"] = holder
++    assert recovery.real_slot("holder", holder) is None
++    monkeypatch.setattr(server, "_ensure_active_session_slot", recovery.real_slot)
++    monkeypatch.setattr(server, "_start_session_work", lambda fn, **kw: fn() or True)
++    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **kw: None)
++    try:
++        assert server._maybe_schedule_auto_continue(sid, first, "paused") is not None
++        if holder_running:
++            # Mid-turn holder (a notice, another reader's continuation): never interrupted; retry backs off.
++            assert recovery.calls == [] and not first["running"]
++            assert holder.get("active_session_lease") is not None
++            assert first["_auto_continue_retry_after"] > time.monotonic()
++        else:
++            # Idle holder: no wait for its reap, the paused turn continues now.
++            assert_continued(recovery)
++            assert holder.get("active_session_lease") is None
++    finally:
++        server._release_active_session_slot(first)
++        server._release_active_session_slot(holder)
++
++
++def test_replaced_backend_durable_hold_is_bounded(recovery, monkeypatch):
++    # Fresh backend whose continuation is refused forever (a live foreign owner): notices wait for the
++    # paused turn at most HOLD_MAX_S, like the in-place hold, then flow; re-reading never re-arms it.
++    af.set_hold(recovery.home)
++    sid = mount()["session_id"]
++    af.clear_hold(recovery.home)
++    session = server._sessions[sid]
++    mono = [1000.0]
++    monkeypatch.setattr(up, "_mono", lambda: mono[0])
++    monkeypatch.setattr(server, "_start_session_work", lambda fn, **kw: fn() or True)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **kw: "another live owner")
++    assert server._maybe_schedule_auto_continue(sid, session, "paused") is not None
++    assert recovery.calls == []
++    def claim():
++        claimed = server._notif_claim_turn(session)
++        session["running"] = False
++        return claimed
++    for dt in (0.0, 60.0, up.HOLD_MAX_S - 1):
++        mono[0] = 1000.0 + dt
++        assert up.continuation_due(session) and not claim(), dt
++    for dt in (up.HOLD_MAX_S, 900.0, 3600.0, 3 * 3600.0):
++        mono[0] = 1000.0 + dt
++        monkeypatch.setattr(up, "_now", lambda dt=dt: time.time() + min(dt, 3600.0))
++        assert not up.continuation_due(session) and claim(), dt
++    # A new pause (fresh paused_at) by a dead writer is a new hold, bounded the same way.
++    mark_turn_paused(recovery.home, "paused", up.PAUSE_REASON)
++    path = recovery.home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries["paused"]["writer_pid"] = 2 ** 22 - 3
++    entries["paused"].pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++    monkeypatch.setattr(up, "_now", time.time)
++    assert up.continuation_due(session) and not claim()
++    mono[0] += up.HOLD_MAX_S
++    assert not up.continuation_due(session) and claim()
++
++
+ def test_typed_message_during_build_retires_scheduled_pause(recovery, monkeypatch):
+     from tui_gateway.turn_marker import clear_turn_marker
+     af.set_hold(recovery.home)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 8d3b087780..3cf49f4b27 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -231,7 +231,9 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+         # marker and still be mid-turn. Leave the marker so a later resume retries.
+         # Running the continuation anyway would be the double-writer this fence exists to prevent. See
+         # #94778.
+-        slot_error = (_ensure_active_session_slot(sid, session, allow_takeover=False) if paused
++        # A paused continuation takes over only an idle detached sibling: one mid-turn (a notice, another
++        # reader's continuation) keeps the slot and this retries after the 30 s backoff below.
++        slot_error = (_ensure_active_session_slot(sid, session, takeover_idle_only=True) if paused
+                       else _ensure_active_session_slot(sid, session))
+         if slot_error is not None:
+             logger.info("auto-continue for %s refused: session has another live owner", session_key)
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 617e6ea5e5..44e9e8baf9 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -142,13 +142,16 @@ def _session_moved_refusal(session: dict):
+         return None
+ 
+ 
+-def _ensure_active_session_slot(sid: str, session: dict, *, allow_takeover: bool = True) -> str | None:
++def _ensure_active_session_slot(sid: str, session: dict, *, allow_takeover: bool = True,
++                                takeover_idle_only: bool = False) -> str | None:
+     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
+     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
+     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
+     inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream.
+     Exact admission passes allow_takeover=False: it must not move a detached owner's lease,
+-    and already holds the non-reentrant resume lock used by takeover."""
++    and already holds the non-reentrant resume lock used by takeover. ``takeover_idle_only`` takes over
++    only a detached sibling that is not mid-turn (a paused-turn continuation must never interrupt a
++    notice or another reader's continuation, but must not wait out an idle holder's reap either)."""
+     # A registry slot is not the SQLite writer lease. Check even on a warm Desktop session.
+     # Its own running agent is excluded by exact holder, preserving ordinary steer/stop.
+     if (refusal := _durable_owner_refusal(session)) is not None:
+@@ -163,7 +166,7 @@ def _ensure_active_session_slot(sid: str, session: dict, *, allow_takeover: bool
+         return None
+     from hermes_cli.active_sessions import SESSION_NOT_OWNED
+     if (allow_takeover and getattr(limit_message, "reason", None) == SESSION_NOT_OWNED
+-            and _take_over_detached_runtime_lease(sid, session, key)):
++            and _take_over_detached_runtime_lease(sid, session, key, idle_only=takeover_idle_only)):
+         return None
+     return limit_message
+ 
+@@ -186,7 +189,7 @@ def _detached_lease_holder(session: dict, key: str) -> tuple[str, dict] | None:
+     return None
+ 
+ 
+-def _take_over_detached_runtime_lease(sid: str, session: dict, key: str) -> bool:
++def _take_over_detached_runtime_lease(sid: str, session: dict, key: str, *, idle_only: bool = False) -> bool:
+     """Hand a detached sibling runtime's lease for ``key`` to ``session``; True when it now owns the slot.
+ 
+     Lease identity is (pid, live_session_id), so a client that reconnects under a NEW runtime — Desktop
+@@ -203,6 +206,8 @@ def _take_over_detached_runtime_lease(sid: str, session: dict, key: str) -> bool
+         if (found := _detached_lease_holder(session, key)) is None:
+             return False
+         other_sid, other = found
++        if idle_only and other.get("running"):
++            return False
+         lease = other["active_session_lease"]
+         if not transfer_active_session(lease, session_id=key, metadata=_lease_metadata(sid)):
+             return False
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 150cb60061..4646a3fab4 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -70,6 +70,10 @@ def _now() -> float:
+     return time.time()
+ 
+ 
++def _mono() -> float:
++    return time.monotonic()
++
++
+ def _home(session: dict) -> Path:
+     from tui_gateway import server
+     return Path(session.get("profile_home") or server._hermes_home)
+@@ -361,8 +365,18 @@ def _durable_continuation_due(session: dict) -> bool:
+     # indefinitely starve automatic delivery when the startup reader skips them.
+     with server._session_profile_runtime_scope(session):
+         enabled, freshness, attempts = server._auto_continue_config()
+-    return bool(enabled and _now() - marker["started_at"] <= freshness
+-                and marker["attempts"] < attempts)
++    if not (enabled and _now() - marker["started_at"] <= freshness and marker["attempts"] < attempts):
++        return False
++    # Same cap as the in-place hold (HOLD_MAX_S): a continuation this backend keeps failing to admit
++    # (a live foreign owner, a startup sweep that gave up) must not refuse the chat's notices for the
++    # whole freshness window. The clock starts when this backend first sees this pause and is keyed by
++    # the pause's identity, so re-reading the same marker never re-arms it; only a new pause does.
++    identity = (marker.get("started_at"), marker.get("paused_at"), marker.get("pauses"))
++    with session["history_lock"]:
++        seen = session.get("_update_pause_durable_seen")
++        if not seen or seen[0] != identity:
++            seen = session["_update_pause_durable_seen"] = (identity, _mono())
++    return _mono() - seen[1] < HOLD_MAX_S
+ 
+ 
+ def _note_watching(session: dict) -> None:
+-- 
+2.55.0
+

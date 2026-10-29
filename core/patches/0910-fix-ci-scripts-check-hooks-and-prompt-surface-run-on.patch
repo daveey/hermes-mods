@@ -1,0 +1,213 @@
+From 5205b04e751f262c6a48f6c35a8bd11bbd282df2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:36:55 -0700
+Subject: [PATCH] fix(ci): scripts/check hooks and prompt-surface run on macOS
+ pm installs
+
+The pre-push hook refused every push from the MacBook: prompt-surface could not render there.
+- _pin_environment set sys.platform='linux' before sysconfig/psutil loaded, so macOS looked up
+  _sysconfigdata__linux_darwin and psutil's Linux extension: load both under the real platform first.
+- render() replaced PYTHONPATH with the tree, dropping a pm install's dependency site-packages:
+  keep the caller's entries after the tree.
+- /var/folders -> /private/var/folders: the child scrubbed the resolved HOME from text carrying the
+  unresolved one; render under a resolved temp dir.
+- hook template: the Macs' venv/ predates the pm-managed deps; take PATH/PYTHONPATH from the main
+  checkout's composed pm environment (read-only), minus the main checkout itself.
+
+Tests: tests/ci/test_prompt_surface_hermetic.py (symlinked TMPDIR, PYTHONPATH, platform modules),
+tests/scripts/test_code_health_cli.py (pm-composed hook env); red before, green after on macOS.
+---
+ scripts/check                            | 16 +++++++
+ scripts/ci/prompt_surface.py             | 15 +++++-
+ tests/ci/test_prompt_surface_hermetic.py | 59 ++++++++++++++++++++++++
+ tests/scripts/test_code_health_cli.py    | 35 ++++++++++++++
+ 4 files changed, 124 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/check b/scripts/check
+index 70635d8a1b..5a47ffef40 100755
+--- a/scripts/check
++++ b/scripts/check
+@@ -60,6 +60,22 @@ for root in "$repo" "$common"; do
+ done
+ [ -n "$py" ] || py="$(command -v python3 || command -v python)" || {
+   echo "scripts/check hook: no python3 or python on PATH" >&2; exit 1; }
++# A pm-managed install keeps the dependencies on its composed PYTHONPATH, not in a venv (the
++# Macs' venv/ predates them, and prompt-surface imports them all): take PATH and PYTHONPATH from
++# the main checkout's composed environment (read-only, never syncs), minus the main checkout
++# itself so the judged tree's own modules win.
++if [ -f "$common/pm/environments.py" ] && pm_env="$(cd "$common" && PYTHONHOME= PYTHONPATH="$common" \
++    "$py" -m pm.environments --format json 2>/dev/null | "$py" -c '
++import json, os, shlex, sys
++env, common = json.load(sys.stdin), os.path.realpath(sys.argv[1])
++pp = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and os.path.realpath(p) != common]
++if env.get("PATH"):
++    print("export PATH=" + shlex.quote(env["PATH"]))
++    print("export PYTHONPATH=" + shlex.quote(os.pathsep.join(pp)))
++' "$common")" && [ -n "$pm_env" ]; then
++  eval "$pm_env"
++  py="$(command -v python3 || command -v python || echo "$py")"
++fi
+ judge() {  # judge TREE-ISH ARGS...: check out TREE-ISH alone and run its own scripts/check ARGS
+   local tree=$1 tmp dir rc
+   shift
+diff --git a/scripts/ci/prompt_surface.py b/scripts/ci/prompt_surface.py
+index 397cac0490..dd99cc2c33 100644
+--- a/scripts/ci/prompt_surface.py
++++ b/scripts/ci/prompt_surface.py
+@@ -80,6 +80,13 @@ def _pin_environment() -> None:
+     socket.socket.connect = refuse  # type: ignore[method-assign]
+     socket.create_connection = refuse  # type: ignore[assignment]
+     socket.getaddrinfo = refuse  # type: ignore[assignment]
++    # Modules that pick their implementation from sys.platform at import load here, under the
++    # host's real platform, before the override: on macOS sysconfig (zoneinfo's first call) would
++    # look up `_sysconfigdata__linux_darwin` and psutil would load its Linux extension.
++    import sysconfig
++    import zoneinfo
++    sysconfig.get_config_vars()
++    import psutil
+     sys.platform = "linux"  # skills index ``platforms:`` gate
+ 
+     import hermes_time
+@@ -216,12 +223,18 @@ def render(out: Path) -> int:
+     """Render into *out* from a fresh child process and home, so nothing from the caller's
+     environment, config or imported modules reaches the bytes."""
+     with tempfile.TemporaryDirectory(prefix="prompt-surface-") as tmp:
++        # Resolved: macOS's /var/folders is a symlink to /private/var/folders, and the child
++        # scrubs the resolved HOME out of text that would otherwise carry the unresolved one.
++        tmp = str(Path(tmp).resolve())
+         home = Path(tmp) / "home"
+         home.mkdir()
+         staging = Path(tmp) / "out"
+         env = {
+             "PATH": os.environ.get("PATH", ""), "HOME": str(home), "HERMES_HOME": str(home / ".hermes"),
+-            "TZ": "UTC", "LANG": "C.UTF-8", "PYTHONHASHSEED": "0", "PYTHONPATH": str(ROOT),
++            "TZ": "UTC", "LANG": "C.UTF-8", "PYTHONHASHSEED": "0",
++            # ROOT first; the caller's entries after it, because pm-managed installs (the Macs)
++            # carry the dependencies' site-packages on PYTHONPATH rather than in a venv.
++            "PYTHONPATH": os.pathsep.join([str(ROOT), *filter(None, [os.environ.get("PYTHONPATH")])]),
+             "TMPDIR": tmp, "PYTHONDONTWRITEBYTECODE": "1",
+         }
+         for key in ("HERMES_RUNTIME_DIR", "SYSTEMROOT"):
+diff --git a/tests/ci/test_prompt_surface_hermetic.py b/tests/ci/test_prompt_surface_hermetic.py
+index 1c4a0ef15c..76c938a60c 100644
+--- a/tests/ci/test_prompt_surface_hermetic.py
++++ b/tests/ci/test_prompt_surface_hermetic.py
+@@ -8,6 +8,9 @@ TMPDIR sat under a real directory with an AGENTS.md (the hub: ``~/.hermes/cache/
+ from __future__ import annotations
+ 
+ import importlib.util
++import os
++import subprocess
++import sys
+ import tempfile
+ from pathlib import Path
+ 
+@@ -41,3 +44,59 @@ def test_check_reports_stale_files(tmp_path):
+     stale.mkdir()
+     (stale / "surfaces.json").write_text("{}\n", encoding="utf-8")
+     assert prompt_surface.check(stale) == 1
++
++
++def test_render_is_the_same_when_tmpdir_is_reached_through_a_symlink(tmp_path, monkeypatch):
++    """macOS's /var/folders is a symlink to /private/var/folders: the child scrubs the resolved
++    HOME, so a home spelled through the link leaked raw temp paths into every prompt."""
++    clean = tmp_path / "clean"
++    assert prompt_surface.render(clean) == 0
++
++    real = tmp_path / "private" / "tmp"
++    real.mkdir(parents=True)
++    link = tmp_path / "linked"
++    link.symlink_to(real, target_is_directory=True)
++    monkeypatch.setattr(tempfile, "tempdir", str(link))
++    via_link = tmp_path / "via_link"
++    assert prompt_surface.render(via_link) == 0
++
++    assert prompt_surface.tree_differences(clean, via_link) == []
++
++
++def test_render_child_keeps_the_callers_pythonpath_after_the_tree(tmp_path, monkeypatch):
++    """pm-managed installs (the Macs) put the dependencies' site-packages on PYTHONPATH."""
++    seen = {}
++
++    def fake_run(argv, *, env, **_kw):
++        seen.update(env)
++        return subprocess.CompletedProcess(argv, 1, "", "stop")
++
++    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["/deps/site-packages", "/more"]))
++    monkeypatch.setattr(prompt_surface.subprocess, "run", fake_run)
++    assert prompt_surface.render(tmp_path / "out") == 1
++    assert seen["PYTHONPATH"].split(os.pathsep) == [str(prompt_surface.ROOT), "/deps/site-packages", "/more"]
++
++
++def test_pinned_render_keeps_the_hosts_platform_modules():
++    """The render pins sys.platform to "linux"; modules that choose an implementation from it at
++    import (sysconfig's data module, psutil's extension) must already be loaded for the real
++    host, or on macOS zoneinfo dies on `_sysconfigdata__linux_darwin` and psutil on its Linux
++    extension."""
++    host = sys.platform
++    code = (
++        "import importlib.util, sys\n"
++        f"spec = importlib.util.spec_from_file_location('ps', {str(REPO / 'scripts/ci/prompt_surface.py')!r})\n"
++        "ps = importlib.util.module_from_spec(spec); spec.loader.exec_module(ps)\n"
++        f"sys.path.insert(0, {str(REPO)!r})\n"
++        "ps._pin_environment()\n"
++        "import sysconfig, zoneinfo, psutil\n"
++        "assert sys.platform == 'linux'\n"
++        "sysconfig.get_config_var('TZPATH')\n"
++        "print(psutil._psplatform.__name__)\n"
++    )
++    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
++                          check=False)
++    assert proc.returncode == 0, proc.stderr[-3000:]
++    expected = {"darwin": "psutil._psosx", "linux": "psutil._pslinux", "win32": "psutil._pswindows"}
++    if host in expected:
++        assert proc.stdout.strip().splitlines()[-1] == expected[host]
+diff --git a/tests/scripts/test_code_health_cli.py b/tests/scripts/test_code_health_cli.py
+index b5a7011b13..7c7709aabc 100644
+--- a/tests/scripts/test_code_health_cli.py
++++ b/tests/scripts/test_code_health_cli.py
+@@ -287,6 +287,41 @@ def test_hooks_prefer_the_repo_virtualenv_over_path_python(tmp_path):
+     assert proc.returncode != 0 and "wrong interpreter" in proc.stderr
+ 
+ 
++def test_hooks_take_the_pm_composed_environment_minus_the_main_checkout(tmp_path):
++    """A pm-managed install (the Macs) keeps the dependencies on its composed PYTHONPATH: the
++    stale venv/ python cannot import them, so the hook runs the composed PATH's python with the
++    composed PYTHONPATH, minus the main checkout (the judged tree's own modules must win)."""
++    repo = _engine_repo(tmp_path)
++    assert _check(repo, "--install-hook", "pre-commit").returncode == 0
++    (repo / ".venv").symlink_to(Path(sys.prefix), target_is_directory=True)
++    record = tmp_path / "seen"
++    composed = tmp_path / "composed-bin"
++    composed.mkdir()
++    (composed / "python3").write_text(
++        f"#!/bin/sh\nprintf '%s\\n' \"$PYTHONPATH\" >> '{record}'\nexec '{sys.executable}' \"$@\"\n",
++        encoding="utf-8")
++    (composed / "python3").chmod(0o755)
++    path = os.pathsep.join([str(composed), _env()["PATH"]])
++    # untracked: the hook reads it from the main checkout, not from the judged tree
++    _write(repo, {"pm/environments.py": (
++        "import json, os\n"
++        f"print(json.dumps({{'PATH': {path!r}, 'PYTHONPATH': os.pathsep.join([os.getcwd(), '/deps'])}}))\n"
++    )})
++    _write(repo, {"pkg/b.py": "def b():\n    return 2\n"})
++    _git(repo, "add", "--", "pkg/b.py")
++    proc = _sh(repo, "git", "commit", "-q", "-m", "pm")
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert record.read_text(encoding="utf-8").splitlines() == ["/deps"]
++    # control: without pm/environments.py the hook keeps the venv python and never runs ours
++    (repo / "pm/environments.py").unlink()
++    record.unlink()
++    _write(repo, {"pkg/b.py": "def b():\n    return 3\n"})
++    _git(repo, "add", "--", "pkg/b.py")
++    proc = _sh(repo, "git", "commit", "-q", "-m", "venv")
++    assert proc.returncode == 0, proc.stdout + proc.stderr
++    assert not record.exists()
++
++
+ def test_check_refuses_old_python_before_importing_anything():
+     # The guard reads sys.version_info; a 3.10 interpreter is emulated by overriding it before
+     # scripts/check runs (tomllib, imported via ruff_runner, would otherwise crash it).
+-- 
+2.55.0
+

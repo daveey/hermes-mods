@@ -1,13 +1,13 @@
 # New sessions on a saved gateway (device switcher "New sessions on ▸")
 
-Patches **0722** (`066b48864d`), **0724** (`0c7f598467`).
+Patches **0813** (`066b48864d`), **0816** (`0c7f598467`).
 
 ## Behavior
 - The status-bar device switcher keeps its menu (gateways, Manage gateways…) and gains one row above Manage:
   **New sessions on: <gateway> ▸**, a submenu listing the gateways as radio choices. Picking one saves it (profile
   `default`) as the app-wide new-session route. It does not switch what is on screen. The saved gateway's row in the
-  main list shows a small home mark ("New sessions start here"). 0722 first shipped this as a per-row right-click;
-  0724 moved it into the menu because the right-click replaced the row's existing context menu.
+  main list shows a small home mark ("New sessions start here"). 0813 first shipped this as a per-row right-click;
+  0816 moved it into the menu because the right-click replaced the row's existing context menu.
 - The choice is sticky: Electron persists it (`active-profile.json` → `defaultRoute`), so it survives a relaunch.
   Opening or clicking a session on another gateway (sidebar, Inbox, search, deep link) never changes it.
 - Generic new sessions use it: the sidebar **New session** row (upstream), `/new` (upstream), the tab-strip "+" /
@@ -52,7 +52,7 @@ generic "Failed to open profile" toast for a routed target with `notifyNewSessio
 - Untested: the Inbox/search/deep-link open paths individually (they share the resume path the sidebar test drives).
 
 ## Applying
-After 0042. `git am -3 --empty=keep core/patches/0722-*.patch core/patches/0724-*.patch`.
+After 0042. `git am -3 --empty=keep core/patches/0813-*.patch core/patches/0816-*.patch`.
 
 ## Gotchas
 - The route's profile is `default` when picked from the switcher; use the profile row's "Set as default" for another.

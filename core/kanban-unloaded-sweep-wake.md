@@ -1,6 +1,6 @@
 # Unclaimed kanban notices start a turn (sweeper wake) + poller-miss log
 
-Patch **0518** (source `7c5b978a33`). Builds on [kanban-unloaded-session-delivery.md](kanban-unloaded-session-delivery.md) (0185/0186).
+Patch **0525** (source `7c5b978a33`). Builds on [kanban-unloaded-session-delivery.md](kanban-unloaded-session-delivery.md) (0185/0186).
 
 ## Behavior
 
@@ -63,7 +63,7 @@ All in `tui_gateway/kanban_unloaded.py`:
 
 ## Applying
 
-`git am -3` 0518 after 0185. It needs `server._wake_session_turn`, from the chat-closeout wake primitive, and
+`git am -3` 0525 after 0185. It needs `server._wake_session_turn`, from the chat-closeout wake primitive, and
 `agent.memory_provider.spawn_context_thread`.
 
 ## Gotchas

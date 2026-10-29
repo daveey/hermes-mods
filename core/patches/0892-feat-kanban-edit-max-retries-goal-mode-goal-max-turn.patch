@@ -1,0 +1,559 @@
+From c350e23068d28528a49e33dd30402aa160913f25 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 03:03:52 +0000
+Subject: [PATCH] feat(kanban): edit
+ --max-retries/--goal-mode/--goal-max-turns/--max-runtime-seconds/--session-id
+ and reopen <done> [daveey]
+
+Operator board writes that skills did with raw sqlite3 (now refused by
+sqlite-live-guard) get supported verbs:
+
+- hermes kanban edit <id> gains --max-retries N, --goal-mode on|off,
+  --goal-max-turns N, --max-runtime-seconds N and --session-id SID (refuses
+  to overwrite a non-empty session_id without --force). Writes go through
+  kanban_db_operator.edit_operator_fields (new sibling module, keeps kanban_db.py under its health cap), which appends one 'edited' event listing
+  old -> new per field; a refusal applies nothing.
+- hermes kanban reopen <id> --reason TEXT: done -> ready (todo while a
+  parent is open), completed_at cleared, breaker reset, 'reopened' event
+  with reason + actor, REOPENED comment; descendants are invalidated via
+  invalidate_descendants_for_parent_reopen like the dashboard reopen.
+  Refuses any other status.
+- show --json now includes goal_mode and goal_max_turns.
+
+Kanban card t_01a185886ffb611e.
+---
+ hermes_cli/commands.py                        |   2 +-
+ hermes_cli/kanban.py                          |  67 ++++-
+ hermes_cli/kanban_db_operator.py              | 109 ++++++++
+ hermes_cli/kanban_output.py                   |   3 +-
+ hermes_cli/kanban_parser.py                   |  18 +-
+ .../test_kanban_edit_operator_fields.py       | 233 ++++++++++++++++++
+ 6 files changed, 416 insertions(+), 16 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_operator.py
+ create mode 100644 tests/hermes_cli/test_kanban_edit_operator_fields.py
+
+diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
+index ba6d73fcd2..66240538fb 100644
+--- a/hermes_cli/commands.py
++++ b/hermes_cli/commands.py
+@@ -290,7 +290,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
+                "Tools & Skills", args_hint="[subcommand]",
+                subcommands=("init", "boards", "create", "list", "ls", "show", "assign",
+                             "reclaim", "reassign", "diagnostics", "diag", "link", "unlink",
+-                            "claim", "comment", "complete", "edit", "block", "unblock",
++                            "claim", "comment", "complete", "edit", "reopen", "block", "unblock",
+                             "archive", "tail", "dispatch", "stats", "notify-subscribe",
+                             "notify-list", "notify-unsubscribe", "log", "runs",
+                             "heartbeat", "assignees", "context", "specify", "gc"),
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 545ee56678..25aeb361b6 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -22,6 +22,7 @@ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_workspace as kbw
+ from hermes_cli import kanban_db_notify as kbn
++from hermes_cli import kanban_db_operator as kbo
+ from hermes_cli import kanban_swarm as ks
+ from hermes_cli import kanban_workflow
+ from hermes_cli.kanban_output import (
+@@ -251,7 +252,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+-    "request-review", "request-changes", "reopen-review",
++    "request-review", "request-changes", "reopen-review", "reopen",
+     "gc", "origin-bind", "origin-create", "origin-adopt", "sync",
+ })
+ 
+@@ -1297,6 +1298,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+ 
+ 
++_OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runtime_seconds", "session_id")
++
++
+ def _cmd_edit(args: argparse.Namespace) -> int:
+     result = getattr(args, "result", None)
+     raw_metadata = getattr(args, "metadata", None)
+@@ -1304,23 +1308,60 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     title = getattr(args, "title", None)
+     body = getattr(args, "body", None)
+     priority = getattr(args, "priority", None)
++    operator = {name: getattr(args, name, None) for name in _OPERATOR_EDIT_FLAGS}
++    if operator["goal_mode"] is not None:
++        operator["goal_mode"] = operator["goal_mode"] == "on"
++    has_operator = any(value is not None for value in operator.values())
+     if result is None and (summary is not None or raw_metadata is not None):
+         return _err("kanban edit: --summary and --metadata require --result", 2)
+-    if all(value is None for value in (title, body, priority, result)):
+-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
++    if all(value is None for value in (title, body, priority, result)) and not has_operator:
++        return _err(
++            "kanban edit: provide --title, --body, --priority, --result, --max-retries, --goal-mode, "
++            "--goal-max-turns, --max-runtime-seconds, or --session-id", 2,
++        )
++    if getattr(args, "force", False) and operator["session_id"] is None:
++        return _err("kanban edit: --force only applies to --session-id", 2)
+     metadata, rc = _parse_metadata_flag(raw_metadata)
+     if rc:
+         return rc
+     with kbc.connect_closing() as conn:
+-        ok = kb.edit_task(
+-            conn, args.task_id, title=title, body=body, priority=priority,
+-            result=result, summary=summary, metadata=metadata,
+-        )
+-    return _ok_or_err(
+-        ok,
+-        f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
+-        f"Edited {args.task_id}",
+-    )
++        changed: dict = {}
++        if has_operator:
++            # Operator columns first: a refusal (e.g. a session_id overwrite) must leave the
++            # whole edit unapplied rather than half of it. [daveey]
++            try:
++                changed = kbo.edit_operator_fields(
++                    conn, args.task_id, force=bool(getattr(args, "force", False)), **operator,
++                )
++            except kbo.KanbanEditRefused as exc:
++                return _err(f"kanban edit: {exc}")
++            if changed is None:
++                return _err(f"cannot edit {args.task_id} (unknown id)")
++        if any(value is not None for value in (title, body, priority, result)):
++            ok = kb.edit_task(
++                conn, args.task_id, title=title, body=body, priority=priority,
++                result=result, summary=summary, metadata=metadata,
++            )
++            if not ok:
++                return _err(f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)")
++    detail = "; ".join(f"{f}: {c['old']!r} -> {c['new']!r}" for f, c in (changed or {}).items())
++    print(f"Edited {args.task_id}" + (f" ({detail})" if detail else ""))
++    return 0
++
++
++def _cmd_reopen(args: argparse.Namespace) -> int:
++    """``done`` -> ``ready`` (``todo`` while a parent is open) with an audited reason. [daveey]"""
++    with kbc.connect_closing() as conn:
++        try:
++            status = kbo.reopen_done_task(conn, args.task_id, reason=args.reason, actor=_profile_author())
++        except kbo.KanbanEditRefused as exc:
++            return _err(f"kanban reopen: {exc}", 2)
++        if status is None:
++            current = kb.get_task(conn, args.task_id)
++            what = "unknown id" if current is None else f"status is {current.status!r}, not 'done'"
++            return _err(f"cannot reopen {args.task_id} ({what}); use unblock/reopen-review for other states")
++    print(f"Reopened {args.task_id} -> {status}")
++    return 0
+ 
+ 
+ def _commented(conn, reason: Optional[str], author, prefix: str, op):
+@@ -1826,7 +1867,7 @@ _HANDLERS = {
+     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+     "comment": _cmd_comment, "attach": _cmd_attach,
+     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
+-    "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
++    "complete": _cmd_complete, "edit": _cmd_edit, "reopen": _cmd_reopen, "block": _cmd_block,
+     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+new file mode 100644
+index 0000000000..055b3899cd
+--- /dev/null
++++ b/hermes_cli/kanban_db_operator.py
+@@ -0,0 +1,109 @@
++"""Operator edits of a Kanban card: the retry/goal/runtime/session columns
++``hermes kanban edit`` exposes, and reopening a done card (``hermes kanban
++reopen``). The supported route for writes skills used to do with raw sqlite3,
++which sqlite-live-guard refuses. [daveey]"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++from typing import Any, Optional
++
++from hermes_cli import kanban_db as _kb
++
++
++class KanbanEditRefused(ValueError):
++    """An operator edit refused by a guard (bad value, protected overwrite)."""
++
++
++def edit_operator_fields(
++    conn: sqlite3.Connection, task_id: str, *, max_retries: Optional[int] = None,
++    goal_mode: Optional[bool] = None, goal_max_turns: Optional[int] = None,
++    max_runtime_seconds: Optional[int] = None, session_id: Optional[str] = None,
++    force: bool = False, board: Optional[str] = None,
++) -> Optional[dict[str, dict[str, Any]]]:
++    """Set the operator-only columns ``hermes kanban edit`` exposes (retry
++    breaker, goal loop, runtime cap, session backfill) in one txn. ``None``
++    leaves a field alone. Returns ``{field: {"old", "new"}}`` for the fields
++    that actually changed (``{}`` = nothing to do), ``None`` for an unknown id.
++    Raises :class:`KanbanEditRefused` for a non-positive count or for
++    overwriting a non-empty ``session_id`` without ``force``. Appends one
++    ``edited`` event listing old -> new. [daveey]"""
++    wanted: dict[str, Any] = {}
++    for field, value in (("max_retries", max_retries), ("goal_max_turns", goal_max_turns),
++                         ("max_runtime_seconds", max_runtime_seconds)):
++        if value is None:
++            continue
++        if isinstance(value, bool) or int(value) < 1:
++            raise KanbanEditRefused(f"{field} must be a positive integer (got {value!r})")
++        wanted[field] = int(value)
++    if goal_mode is not None:
++        wanted["goal_mode"] = 1 if goal_mode else 0
++    if session_id is not None:
++        sid = str(session_id).strip()
++        if not sid:
++            raise KanbanEditRefused("session_id must be non-empty")
++        wanted["session_id"] = sid
++    with _kb.write_txn(conn):
++        row = conn.execute(
++            "SELECT max_retries, goal_mode, goal_max_turns, max_runtime_seconds, session_id "
++            "FROM tasks WHERE id = ?", (task_id,),
++        ).fetchone()
++        if row is None:
++            return None
++        old_sid = (row["session_id"] or "").strip()
++        if "session_id" in wanted and old_sid and old_sid != wanted["session_id"] and not force:
++            raise KanbanEditRefused(
++                f"{task_id} already has session_id {old_sid}; pass --force to overwrite it"
++            )
++        changes = {
++            field: {"old": row[field], "new": new}
++            for field, new in wanted.items() if row[field] != new
++        }
++        if not changes:
++            return {}
++        conn.execute(
++            f"UPDATE tasks SET {', '.join(f'{f} = ?' for f in changes)} WHERE id = ?",
++            (*(c["new"] for c in changes.values()), task_id),
++        )
++        _kb._append_event(conn, task_id, "edited", {"fields": list(changes), "changes": changes})
++    _kb.notify_task_updated(conn, task_id, list(changes), board=board)
++    return changes
++
++
++def reopen_done_task(
++    conn: sqlite3.Connection, task_id: str, *, reason: str, actor: str,
++) -> Optional[str]:
++    """Operator reopen: ``done`` -> ``ready`` (``todo`` while a parent is open,
++    the same re-gate unblock uses), ``completed_at`` cleared, the breaker reset.
++    Refuses (returns ``None``) any other status or an unknown id. Appends a
++    ``reopened`` event with ``reason`` and ``actor`` plus a ``REOPENED:`` comment,
++    and invalidates done/ready/running descendants through
++    :func:`invalidate_descendants_for_parent_reopen` (every done-reopen surface
++    routes there). Returns the landing status. [daveey]"""
++    reason = (reason or "").strip()
++    actor = (actor or "").strip() or "operator"
++    if not reason:
++        raise KanbanEditRefused("reopen requires a reason")
++    now = int(time.time())
++    with _kb.write_txn(conn):
++        if _kb._task_status(conn, task_id) != "done":
++            return None
++        new_status = _kb._landing_status_after_parents(conn, task_id)
++        cur = conn.execute(
++            "UPDATE tasks SET status = ?, completed_at = NULL, current_run_id = NULL, "
++            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
++            "consecutive_failures = 0, human_request = NULL WHERE id = ? AND status = 'done'",
++            (new_status, task_id),
++        )
++        if cur.rowcount != 1:
++            return None
++        _kb._append_event(conn, task_id, "reopened", {
++            "reason": reason[:2000], "actor": actor, "previous_status": "done", "status": new_status,
++        })
++        _kb._insert_comment(conn, task_id, actor, f"REOPENED: {reason}", now)
++        result = _kb.invalidate_descendants_for_parent_reopen(conn, task_id, author=actor)
++    for pid, claim_lock, started_at in result["terminations"]:
++        _kb._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
++    _kb.recompute_ready(conn)
++    return new_status
+diff --git a/hermes_cli/kanban_output.py b/hermes_cli/kanban_output.py
+index dec5f58137..17634985c5 100644
+--- a/hermes_cli/kanban_output.py
++++ b/hermes_cli/kanban_output.py
+@@ -18,7 +18,8 @@ _TASK_DICT_FIELDS = (
+     "human_request",
+     "workspace_kind", "workspace_path", "branch_name", "project_id",
+     "created_by", "created_at", "started_at", "completed_at", "result",
+-    "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
++    "skills", "max_runtime_seconds", "max_retries", "goal_mode", "goal_max_turns",
++    "model_override", "provider_override",
+     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+ )
+ _SHOW_RUN_FIELDS = (
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index a9bd0f71a9..9de2303cc8 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -420,7 +420,23 @@ _SPECS = [
+         _arg("--priority", type=int, help="Replace the task priority"),
+         _arg("--result", help="Backfilled task result text for a done task"),
+         *_STEP_HANDOFF,
+-    ], help="Edit task fields or recovery fields on an already-completed task"),
++        _arg("--max-retries", type=int, metavar="N", dest="max_retries",
++             help="Per-task failure circuit breaker: block on the Nth consecutive failure"),
++        _arg("--goal-mode", choices=["on", "off"], dest="goal_mode",
++             help="Run the worker in a goal loop (on) or single-shot (off)"),
++        _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
++             help="Turn budget for goal-mode workers"),
++        _arg("--max-runtime-seconds", type=int, metavar="N", dest="max_runtime_seconds",
++             help="Per-task runtime cap in seconds"),
++        _arg("--session-id", metavar="SID", dest="session_id",
++             help="Backfill the originating chat session id (refuses to overwrite one without --force)"),
++        _arg("--force", action="store_true", help="With --session-id: overwrite a non-empty session_id"),
++    ], help="Edit task fields, operator fields (retries, goal mode, runtime cap, session), "
++            "or recovery fields on an already-completed task"),
++    _cmd("reopen", [
++        _TASK_ID,
++        _arg("--reason", required=True, help="Why the done task is reopened (event + comment)"),
++    ], help="Reopen a done task: done -> ready (todo while a parent is open); refuses other states"),
+     _cmd("block", [
+         _HUMAN_REQUEST,
+         _arg("--metadata-only", action="store_true",
+diff --git a/tests/hermes_cli/test_kanban_edit_operator_fields.py b/tests/hermes_cli/test_kanban_edit_operator_fields.py
+new file mode 100644
+index 0000000000..b4b206e4ec
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_edit_operator_fields.py
+@@ -0,0 +1,233 @@
++"""``hermes kanban edit`` operator flags and ``hermes kanban reopen``: the supported
++route for the board writes orchestrator skills used to do with raw sqlite3. [daveey]"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_operator as kbo
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _new(**kw) -> str:
++    with kbc.connect_closing() as conn:
++        return kb.create_task(conn, title=kw.pop("title", "card"), **kw)
++
++
++def _show(task_id: str) -> dict:
++    return json.loads(kc.run_slash(f"show {task_id} --json"))
++
++
++def _edited_events(task_id: str) -> list[dict]:
++    with kbc.connect_closing() as conn:
++        return [e.payload for e in kb.list_events(conn, task_id) if e.kind == "edited"]
++
++
++def _main(argv: list[str]) -> int:
++    """Run the real argparse + dispatch path (rc and refusals included)."""
++    import argparse
++
++    from hermes_cli.kanban_parser import build_parser
++
++    root = argparse.ArgumentParser(prog="hermes")
++    sub = root.add_subparsers(dest="command")
++    build_parser(sub)
++    args = root.parse_args(["kanban", *argv])
++    return kc.kanban_command(args)
++
++
++# --- one test per edit flag ------------------------------------------------
++
++
++def test_edit_max_retries_reads_back_in_show_json(kanban_home):
++    tid = _new()
++    out = kc.run_slash(f"edit {tid} --max-retries 5")
++    assert "max_retries: None -> 5" in out
++    assert _show(tid)["task"]["max_retries"] == 5
++    assert _edited_events(tid)[-1] == {
++        "fields": ["max_retries"], "changes": {"max_retries": {"old": None, "new": 5}},
++    }
++
++
++def test_edit_goal_mode_on_and_off(kanban_home):
++    tid = _new()
++    kc.run_slash(f"edit {tid} --goal-mode on")
++    assert _show(tid)["task"]["goal_mode"] is True
++    kc.run_slash(f"edit {tid} --goal-mode off")
++    assert _show(tid)["task"]["goal_mode"] is False
++    assert [e["changes"]["goal_mode"] for e in _edited_events(tid)] == [
++        {"old": 0, "new": 1}, {"old": 1, "new": 0},
++    ]
++
++
++def test_edit_goal_max_turns(kanban_home):
++    tid = _new(goal_mode=True, goal_max_turns=20)
++    kc.run_slash(f"edit {tid} --goal-max-turns 40")
++    assert _show(tid)["task"]["goal_max_turns"] == 40
++    assert _edited_events(tid)[-1]["changes"] == {"goal_max_turns": {"old": 20, "new": 40}}
++
++
++def test_edit_max_runtime_seconds(kanban_home):
++    tid = _new(max_runtime_seconds=600)
++    kc.run_slash(f"edit {tid} --max-runtime-seconds 7200")
++    assert _show(tid)["task"]["max_runtime_seconds"] == 7200
++    assert _edited_events(tid)[-1]["changes"] == {"max_runtime_seconds": {"old": 600, "new": 7200}}
++
++
++def test_edit_session_id_backfills_empty(kanban_home):
++    tid = _new()
++    kc.run_slash(f"edit {tid} --session-id 20261029_000000_abc123")
++    assert _show(tid)["task"]["session_id"] == "20261029_000000_abc123"
++    assert _edited_events(tid)[-1]["changes"] == {
++        "session_id": {"old": None, "new": "20261029_000000_abc123"},
++    }
++
++
++def test_edit_session_id_force_overwrites(kanban_home):
++    tid = _new(session_id="old-sid")
++    assert _main(["edit", tid, "--session-id", "new-sid", "--force"]) == 0
++    assert _show(tid)["task"]["session_id"] == "new-sid"
++    assert _edited_events(tid)[-1]["changes"] == {"session_id": {"old": "old-sid", "new": "new-sid"}}
++
++
++def test_edit_operator_and_classic_fields_together(kanban_home):
++    tid = _new(title="old")
++    assert _main(["edit", tid, "--title", "new", "--max-retries", "2"]) == 0
++    task = _show(tid)["task"]
++    assert (task["title"], task["max_retries"]) == ("new", 2)
++
++
++def test_edit_same_value_appends_no_event(kanban_home):
++    tid = _new(max_retries=3)
++    assert _main(["edit", tid, "--max-retries", "3"]) == 0
++    assert _edited_events(tid) == []
++
++
++# --- one test per edit refusal ---------------------------------------------
++
++
++def test_edit_session_id_refuses_overwrite_without_force(kanban_home, capsys):
++    tid = _new(session_id="old-sid")
++    assert _main(["edit", tid, "--session-id", "new-sid", "--max-retries", "4"]) == 1
++    assert "pass --force" in capsys.readouterr().err
++    task = _show(tid)["task"]
++    assert (task["session_id"], task["max_retries"]) == ("old-sid", None)  # nothing half-applied
++    assert _edited_events(tid) == []
++
++
++@pytest.mark.parametrize("flag", ["--max-retries", "--goal-max-turns", "--max-runtime-seconds"])
++def test_edit_refuses_non_positive_counts(kanban_home, capsys, flag):
++    tid = _new()
++    assert _main(["edit", tid, flag, "0"]) == 1
++    assert "positive integer" in capsys.readouterr().err
++    assert _edited_events(tid) == []
++
++
++def test_edit_refuses_unknown_task(kanban_home, capsys):
++    assert _main(["edit", "t_nope", "--max-retries", "5"]) == 1
++    assert "unknown id" in capsys.readouterr().err
++
++
++def test_edit_refuses_force_without_session_id(kanban_home, capsys):
++    tid = _new()
++    assert _main(["edit", tid, "--max-retries", "5", "--force"]) == 2
++    assert "--force only applies to --session-id" in capsys.readouterr().err
++    assert _show(tid)["task"]["max_retries"] is None
++
++
++def test_edit_goal_mode_rejects_other_values(kanban_home):
++    tid = _new()
++    with pytest.raises(SystemExit):
++        _main(["edit", tid, "--goal-mode", "maybe"])
++
++
++def test_edit_db_function_refuses_blank_session_id(kanban_home):
++    tid = _new()
++    with kbc.connect_closing() as conn, pytest.raises(kbo.KanbanEditRefused):
++        kbo.edit_operator_fields(conn, tid, session_id="  ")
++
++
++# --- reopen -----------------------------------------------------------------
++
++
++def _done(**kw) -> str:
++    tid = _new(**kw)
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, tid, result="ok", force=True)
++    return tid
++
++
++def test_reopen_done_task_goes_ready_with_event(kanban_home, monkeypatch):
++    monkeypatch.setenv("HERMES_PROFILE", "operator-x")
++    tid = _done()
++    assert _show(tid)["task"]["completed_at"]
++    assert _main(["reopen", tid, "--reason", "acceptance was wrong"]) == 0
++    payload = _show(tid)
++    assert payload["task"]["status"] == "ready"
++    assert payload["task"]["completed_at"] is None
++    with kbc.connect_closing() as conn:
++        events = [e for e in kb.list_events(conn, tid) if e.kind == "reopened"]
++        comments = kb.list_comments(conn, tid)
++    assert len(events) == 1
++    assert events[0].payload["reason"] == "acceptance was wrong"
++    assert events[0].payload["actor"]
++    assert events[0].payload["previous_status"] == "done"
++    assert any(c.body == "REOPENED: acceptance was wrong" for c in comments)
++
++
++def test_reopen_invalidates_done_descendants(kanban_home):
++    parent = _done(title="parent")
++    child = _new(title="child")
++    with kbc.connect_closing() as conn:
++        kb.link_tasks(conn, parent_id=parent, child_id=child)
++        kb.recompute_ready(conn)
++        assert kb.complete_task(conn, child, result="ok", force=True)
++    assert _main(["reopen", parent, "--reason", "redo"]) == 0
++    assert _show(parent)["task"]["status"] == "ready"
++    assert _show(child)["task"]["status"] == "todo"
++
++
++@pytest.mark.parametrize("status", ["ready", "blocked", "review", "archived"])
++def test_reopen_refuses_non_done(kanban_home, capsys, status):
++    tid = _new()
++    with kbc.connect_closing() as conn:
++        if status == "blocked":
++            assert kb.block_task(conn, tid, reason="x")
++        elif status == "review":
++            assert kb.request_review(conn, tid, summary="s", force=True)
++        elif status == "archived":
++            assert kb.archive_task(conn, tid)
++    before = _show(tid)["task"]["status"]
++    assert _main(["reopen", tid, "--reason", "nope"]) == 1
++    assert "not 'done'" in capsys.readouterr().err
++    assert _show(tid)["task"]["status"] == before
++    with kbc.connect_closing() as conn:
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == "reopened"]
++
++
++def test_reopen_refuses_unknown_task(kanban_home, capsys):
++    assert _main(["reopen", "t_nope", "--reason", "x"]) == 1
++    assert "unknown id" in capsys.readouterr().err
++
++
++def test_reopen_requires_reason(kanban_home, capsys):
++    tid = _done()
++    with pytest.raises(SystemExit):
++        _main(["reopen", tid])
++    assert _main(["reopen", tid, "--reason", "   "]) == 2
++    assert _show(tid)["task"]["status"] == "done"
+-- 
+2.55.0
+

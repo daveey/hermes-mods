@@ -1,0 +1,189 @@
+From cded83cddc8c86978aa9f9bd9e6bec63ba089029 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:14:24 -0700
+Subject: [PATCH] fix(desktop): the cold-start restore stands down once the
+ user typed in the fresh chat; e2e update harness picks the relaunched main,
+ not its crashpad handler [daveey]
+
+Second first-run repro: launch 2 typed into the fresh chat before the session
+list arrived; Enter was not yet accepted, and the resume-last-session restore
+then swapped the remembered chat in and the typed text out. The restore now
+also stands down when the fresh draft differs from what this launch found
+(flushed first; a draft left from an earlier launch still restores).
+
+app-update: desktopMainProcesses matched any binary in the packaged dir with no
+--type=, so the pre-update app's chrome_crashpad_handler (re-parented to init)
+was taken for the relaunched app and SIGTERMed; the real app never quit. Match
+the packaged exe's own basename.
+---
+ apps/desktop/e2e/update/harness.ts            | 19 +++++++---
+ .../hooks/use-desktop-integrations.test.tsx   | 38 +++++++++++++++++++
+ .../contrib/hooks/use-desktop-integrations.ts | 32 +++++++++++++---
+ apps/desktop/src/store/composer.ts            | 13 +++++++
+ 4 files changed, 91 insertions(+), 11 deletions(-)
+
+diff --git a/apps/desktop/e2e/update/harness.ts b/apps/desktop/e2e/update/harness.ts
+index 816f1dafaa..f04884b715 100644
+--- a/apps/desktop/e2e/update/harness.ts
++++ b/apps/desktop/e2e/update/harness.ts
+@@ -265,13 +265,22 @@ function exeOf(pid: number): string {
+   }
+ }
+ 
+-/** Live Desktop main processes of this install (the packaged exe, not its zygote/renderer/gpu children). */
++/**
++ * Live Desktop main processes of this install: the packaged exe itself, not its zygote/renderer/gpu children
++ * (`--type=`) and not the other binaries shipped beside it. `chrome_crashpad_handler` runs from the same
++ * directory with no `--type=`; an app's handler outlives its main by a moment (re-parented to init), so a
++ * directory-only match took the pre-update app's handler for the relaunched app and SIGTERMed the wrong pid.
++ */
+ export function desktopMainProcesses(facts: InstallFacts): ProcInfo[] {
+-  const exe = fs.realpathSync(path.dirname(packagedExe(facts)))
++  const exe = fs.realpathSync(packagedExe(facts))
++  const dir = path.dirname(exe)
+ 
+-  return installProcesses(facts).filter(
+-    proc => exeOf(proc.pid).startsWith(exe + path.sep) && !/--type=/.test(proc.cmdline)
+-  )
++  return installProcesses(facts).filter(proc => {
++    // A main still running from a binary the update replaced reads as "<path> (deleted)".
++    const own = exeOf(proc.pid).replace(/ \(deleted\)$/, '')
++
++    return own.startsWith(dir + path.sep) && path.basename(own) === path.basename(exe) && !/--type=/.test(proc.cmdline)
++  })
+ }
+ 
+ /** The `hermes serve` backend(s) of this install (children of the backend excluded). */
+diff --git a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
+index 351caba543..fc73295f45 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
++++ b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
+@@ -255,6 +255,44 @@ describe('useDesktopIntegrations', () => {
+       expect(navigate).not.toHaveBeenCalled()
+     })
+ 
++    it('does not restore over a draft typed into the fresh chat this launch', () => {
++      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
++      const result = render({ profileReady: true, sessions: [] })
++
++      // Typed while the session list was still loading (Enter not yet accepted).
++      stashSessionDraft(null, 'typed before the list arrived', [])
++
++      try {
++        result.rerender({
++          activeProfile: 'default',
++          locationPathname: '/',
++          profileReady: true,
++          resumeExhaustedSessionId: null,
++          resumeLastSession: true,
++          routedSessionId: null,
++          sessions: [session({ id: 'remembered-session', profile: 'default' })]
++        })
++
++        expect(navigate).not.toHaveBeenCalled()
++        expect(takeSessionDraft(null).text).toBe('typed before the list arrived')
++      } finally {
++        stashSessionDraft(null, '', [])
++      }
++    })
++
++    it('still restores over a fresh draft left from an earlier launch (control)', () => {
++      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
++      stashSessionDraft(null, 'left over from last week', [])
++
++      try {
++        render({ profileReady: true, sessions: [session({ id: 'remembered-session', profile: 'default' })] })
++
++        expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true })
++      } finally {
++        stashSessionDraft(null, '', [])
++      }
++    })
++
+     it('still restores once a fresh-chat send has settled (control)', () => {
+       window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
+       beginFreshChatSend()()
+diff --git a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+index 88f4180e4c..44a2e48b57 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+@@ -14,7 +14,12 @@ import { pathFromHermesDeepLink, resolveHermesOpenPath } from '@/lib/hermes-open
+ import { canonicalizeCombo } from '@/lib/keybinds/combo'
+ import { runBuiltinAction } from '@/lib/keybinds/plugin-actions'
+ import { storedSessionIdForNotification } from '@/lib/session-ids'
+-import { announceNewSessionDraftKey, freshChatSendInFlight } from '@/store/composer'
++import {
++  announceNewSessionDraftKey,
++  freshChatSendInFlight,
++  freshDraftSignature,
++  requestComposerDraftSync
++} from '@/store/composer'
+ import { recordAction } from '@/store/desktop-metrics'
+ import { $comboIndex } from '@/store/keybinds'
+ import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
+@@ -121,6 +126,20 @@ export function useDesktopIntegrations({
+   }, [])
+ 
+   const restoredRef = useRef(false)
++  // The fresh-chat draft as this launch found it; a different one later means the user typed.
++  const freshDraftBaselineRef = useRef<string | null>(null)
++
++  if (freshDraftBaselineRef.current === null) {
++    freshDraftBaselineRef.current = freshDraftSignature()
++  }
++
++  const freshChatTouched = () => {
++    // The stash lags the editor by the persist debounce; flush so the last keystrokes count.
++    requestComposerDraftSync('flush')
++
++    return freshDraftSignature() !== freshDraftBaselineRef.current
++  }
++
+   const diskPluginsScanPending = useStore($diskPluginsScanPending)
+ 
+   // Wait until boot has adopted the primary profile, then restore that profile's
+@@ -156,11 +175,12 @@ export function useDesktopIntegrations({
+           return
+         }
+ 
+-        // The user already sent from the fresh chat (Enter as soon as the
+-        // composer enabled, before the session list arrived): that send owns
+-        // the window. Navigating now would abort it as a session switch and
+-        // drop the message; the new chat it creates is where they are.
+-        if (freshChatSendInFlight()) {
++        // The user already started on the fresh chat (typed into it, or hit
++        // Send as soon as the composer enabled) before the session list
++        // arrived: they are where they chose to be. Navigating now would
++        // abort an in-flight send as a session switch, or swap a just-typed
++        // draft out of the editor, and either way drop what they wrote.
++        if (freshChatSendInFlight() || freshChatTouched()) {
+           restoredRef.current = true
+ 
+           return
+diff --git a/apps/desktop/src/store/composer.ts b/apps/desktop/src/store/composer.ts
+index b63045aa64..f0c7ee973a 100644
+--- a/apps/desktop/src/store/composer.ts
++++ b/apps/desktop/src/store/composer.ts
+@@ -616,6 +616,19 @@ export function beginFreshChatSend(): () => void {
+ 
+ export const freshChatSendInFlight = (): boolean => freshChatSendsInFlight > 0
+ 
++/**
++ * The current fresh-chat draft as a comparable value (text + attachment ids).
++ * Fresh drafts persist across launches, so "has content" alone can't tell a
++ * draft typed this launch from one left over; compare against a baseline.
++ * Reads the stash: flush the editor first (`requestComposerDraftSync('flush')`)
++ * when the last keystrokes must count.
++ */
++export const freshDraftSignature = (): string => {
++  const draft = draftsBySession.get(freshDraftScope())
++
++  return draft ? JSON.stringify([draft.text, draft.attachments.map(attachment => attachment.id)]) : ''
++}
++
+ export function announceNewSessionDraftKey(toKey: string | null | undefined): void {
+   announcedNewSessionDraftKey = toKey?.trim() || null
+ }
+-- 
+2.55.0
+

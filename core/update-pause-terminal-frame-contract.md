@@ -1,6 +1,6 @@
 # Update pause: the paused turn's terminal frame passes its wire contract
 
-Patch: 0738 (fork `5a367adffa`).
+Patch: 0906 (fork `5a367adffa`).
 
 ## Behavior
 
@@ -41,7 +41,7 @@ and `tests/tui_gateway/contracts/`.
 
 ## Applying
 
-Apply after 0737 with `git am -3`. If the generated contract files conflict, take either side and rerun
+Apply after 0878 with `git am -3`. If the generated contract files conflict, take either side and rerun
 `scripts/gen_gateway_contracts.py`.
 
 ## Gotchas

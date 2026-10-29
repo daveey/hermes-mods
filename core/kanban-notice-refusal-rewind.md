@@ -11,7 +11,7 @@ heard that a child card finished, so a "send it when it's ready" follow-up never
 
 ## Behavior
 
-The following describes 0132's refusal path. Patches 0720–0721 below supersede it for local notices already recorded durably: those rows are not rewound on a turn refusal.
+The following describes 0132's refusal path. Patches 0792, 0793 below supersede it for local notices already recorded durably: those rows are not rewound on a turn refusal.
 
 - A chat's Kanban notices are polled by every backend that has the chat open. The poll claims the board's
   notify cursor, then starts an agent turn. When the admission gate refuses that turn (`SESSION_NOT_OWNED`: another
@@ -51,12 +51,12 @@ Core-only; no config. Takes effect when the backend restarts on the new core.
 
 ## Gotchas
 
-- Patches 0720–0721 add durable claims and transcript deduplication for local tui subscriptions; see below. Remote-only/unkeyed notices retain the previous submit path and are not covered by the new backend-replacement tests.
+- Patches 0792, 0793 add durable claims and transcript deduplication for local tui subscriptions; see below. Remote-only/unkeyed notices retain the previous submit path and are not covered by the new backend-replacement tests.
 - A durable transcript row proves delivery to the chat, not successful completion of the agent's follow-up work. The `follow-through` plugin remains a separate check on that work.
 
-## Durable local notices across backend replacement (0720–0721)
+## Durable local notices across backend replacement (0792, 0793)
 
-Patch **0720** (fork `bf9ca96750`) keeps a busy chat's local tui notice claim in flight until the notice is recorded in the transcript. A replacement backend can recover a dead holder's claim rather than trusting the already-advanced cursor. Patch **0721** (fork `9cf6985e99`) adds the compaction regression test; it changes no production code.
+Patch **0792** (fork `bf9ca96750`) keeps a busy chat's local tui notice claim in flight until the notice is recorded in the transcript. A replacement backend can recover a dead holder's claim rather than trusting the already-advanced cursor. Patch **0793** (fork `9cf6985e99`) adds the compaction regression test; it changes no production code.
 
 ### Behavior
 
@@ -86,14 +86,14 @@ Patch **0720** (fork `bf9ca96750`) keeps a busy chat's local tui notice claim in
 - `test_busy_transcript_keeps_the_claim_in_flight_and_buffered`
 - `test_live_holder_blocks_other_claimers_and_is_not_recovered`
 - `test_ack_keeps_an_earlier_outstanding_claim_in_flight`
-- `test_compacting_session_keeps_the_notice_and_lands_it_in_the_new_tip` (0721)
+- `test_compacting_session_keeps_the_notice_and_lands_it_in_the_new_tip` (0793)
 - `test_unloaded_sweep_recovers_an_orphaned_claim`
 
 These use real SQLite stores, a dead subprocess for orphan identity, and a stubbed notification submit. A live backend replacement, full compaction run, end-to-end row adoption by an agent turn, poller-stop release, and remote-gateway delivery are untested by this suite.
 
 ### Applying
 
-Append 0720 then 0721 in series order. The existing database migration adds nullable in-flight fields. Restart the backend to load the code; no plugin or new configuration is required.
+Append 0792 then 0793 in series order. The existing database migration adds nullable in-flight fields. Restart the backend to load the code; no plugin or new configuration is required.
 
 ### Gotchas
 

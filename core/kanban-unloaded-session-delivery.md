@@ -1,6 +1,6 @@
 # Kanban results reach chats no backend holds (+ green row for waiting results)
 
-Patches: 0185 (delivery + reap warning), 0186 (`kanban_unseen` stripe input), 0596 (a chat mid-turn defers the
+Patches: 0185 (delivery + reap warning), 0186 (`kanban_unseen` stripe input), 0610 (a chat mid-turn defers the
 notice instead of crashing the sweep; overdue warning; HX014 code-health rule).
 
 ## Behavior
@@ -16,7 +16,7 @@ notice instead of crashing the sweep; overdue warning; HX014 code-health rule).
   rewinds the claim, logs one INFO line (`... deferred: chat busy (active turn); retrying next pass`, DEBUG on later
   passes, no traceback) and delivers on the first pass after the turn ends. A notice whose claim was rewound and that
   still waits 15 min after its event logs ONE WARNING per board/card/chat: `kanban notice for <board>/<task> to chat
-  <id> overdue <N>m: <reason>`. Before 0596 the store opener swallowed the refusal at its `yield` and Python raised
+  <id> overdue <N>m: <reason>`. Before 0610 the store opener swallowed the refusal at its `yield` and Python raised
   "generator didn't stop after throw()", logged with a traceback every 30 s (277 times in 2h20m on 10-27).
 
 ## How it works
@@ -31,7 +31,7 @@ notice instead of crashing the sweep; overdue warning; HX014 code-health rule).
   delivered; the record clears once the sub has no unseen events.
 - `scripts/code_health` rule HX014 (`py_rules_contextmanager.py`) blocks new `@contextmanager`s whose broad `except`
   around a `yield` does not re-raise and can yield again (a second `yield`, or the `try` in a loop). One-shot
-  suppress-and-log helpers are not flagged; the tree has 0 hits after 0596.
+  suppress-and-log helpers are not flagged; the tree has 0 hits after 0610.
 - `SessionDB.append_kanban_notice` dedupes by `notice_id` (board:task:cursor range) inside the writer txn, refuses
   while another backend holds a live turn lease, and stamps a NULL `last_read_at` just before the notice.
 - `kanban_session_activity._read_unseen` counts tui subs whose cursor trails a terminal event.
@@ -47,13 +47,13 @@ notice instead of crashing the sweep; overdue warning; HX014 code-health rule).
   live poller vs sweeper never double deliver (both orders); loaded session skipped; grace respected; failed append
   rewinds and retries; unknown chat keeps cursor; dedupe; reap warning.
 - `tests/hermes_cli/test_kanban_session_activity.py`: `kanban_unseen` counting.
-- `tests/tui_gateway/test_kanban_unloaded_busy.py` (0596; REAL `find_session_db` and a real turn lease): an error in
+- `tests/tui_gateway/test_kanban_unloaded_busy.py` (0610; REAL `find_session_db` and a real turn lease): an error in
   the caller's block comes out as itself, not RuntimeError; store-open errors are still skipped; a busy chat
   rewinds with no WARNING/traceback and lands after the turn (passive-row path); same via the wake-worker path
   (refused wake -> busy row -> `deferred`); a stall past 15 min warns exactly once over 3 passes. Red 3/4 on the base.
 - `tests/scripts/test_code_health_contextmanager_rule.py`: HX014 shapes (flagged and not), the flagged shape really
   turns the caller's error into RuntimeError while the fixed shape does not, rule scope excludes tests.
-- Live-path repro (0596, isolated HERMES_HOME, real sweeper thread, a second process holding the turn lease for ~6
+- Live-path repro (0610, isolated HERMES_HOME, real sweeper thread, a second process holding the turn lease for ~6
   passes): base 6 WARNINGs / 6 "didn't stop after throw()"; fixed 0 WARNINGs / 0 tracebacks / 1 INFO deferral; both
   deliver once after the turn ends.
 - `session-dot-state.test.ts`: results waiting -> green; cards running -> background; orphan-reaped idle -> green.
@@ -62,12 +62,12 @@ notice instead of crashing the sweep; overdue warning; HX014 code-health rule).
 
 ## Applying
 `git am -3 --empty=keep` patches 0185 then 0186 (0186 only touches the row stamp and renderer; 0185 stands alone).
-0596 also needs 0518 (the wake worker it touches).
+0610 also needs 0525 (the wake worker it touches).
 
 ## Gotchas
 - The sweeper only handles chats found in a local state.db (launch store, then named profiles); a chat on another
   gateway is swept by that gateway.
-- Since 0518 the sweeper first tries a turn with the notice and writes this row only as the fallback ([kanban-unloaded-sweep-wake.md](kanban-unloaded-sweep-wake.md)). Before it, the notice was a transcript row, not an agent turn: the agent read it only when the chat was next opened.
+- Since 0525 the sweeper first tries a turn with the notice and writes this row only as the fallback ([kanban-unloaded-sweep-wake.md](kanban-unloaded-sweep-wake.md)). Before it, the notice was a transcript row, not an agent turn: the agent read it only when the chat was next opened.
 
 ## Plugin?
 No plugin surface exists for gateway-side delivery or sidebar stripe inputs.

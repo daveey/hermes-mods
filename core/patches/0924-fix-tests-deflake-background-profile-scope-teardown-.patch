@@ -1,0 +1,154 @@
+From af02121e95c9fc3680005378c15978dddc05724c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:16:38 -0700
+Subject: [PATCH] fix(tests): deflake background profile-scope teardown (#181)
+
+* fix(tests): tolerate throttled profile teardown and join reap timer [daveey]
+
+* fix(tests): keep plugin discovery and state.db open out of the timed ws-reap wait [daveey]
+
+Under SIGSTOP/SIGCONT starvation the reap wait failed even at 60s: the timed path
+ran ~3.8s CPU of environment-dependent work unrelated to the profile-scope contract
+(plugin discovery parsing every installed manifest twice; state.db writer opens that
+scan every host process's /proc fds). Stub the plugin dispatch leaf (recording the
+hook's scope), stub the reap keep-alive gates, and hold B's registry db generation
+so the teardown acquire is a cache hit. Timed work drops to ~70ms CPU; starved wait
+1.5s (was 26s+/fail).
+
+* fix(tests): tolerate throttled profile teardown and join reap timer [daveey]
+
+* fix(tests): keep plugin discovery and state.db open out of the timed ws-reap wait [daveey]
+
+Under SIGSTOP/SIGCONT starvation the reap wait failed even at 60s: the timed path
+ran ~3.8s CPU of environment-dependent work unrelated to the profile-scope contract
+(plugin discovery parsing every installed manifest twice; state.db writer opens that
+scan every host process's /proc fds). Stub the plugin dispatch leaf (recording the
+hook's scope), stub the reap keep-alive gates, and hold B's registry db generation
+so the teardown acquire is a cache hit. Timed work drops to ~70ms CPU; starved wait
+1.5s (was 26s+/fail).
+
+* fix(ci): synchronize overlap docs and LSP spawn mock contracts [daveey]
+---
+ ...test_windows_subprocess_no_window_flags.py |  8 ++++
+ .../test_background_thread_profile_scope.py   | 42 +++++++++++++++++--
+ website/docs/user-guide/features/kanban.md    | 10 +++++
+ 3 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/tests/test_windows_subprocess_no_window_flags.py b/tests/test_windows_subprocess_no_window_flags.py
+index 9da1ed7aaa..b8e1e70c49 100644
+--- a/tests/test_windows_subprocess_no_window_flags.py
++++ b/tests/test_windows_subprocess_no_window_flags.py
+@@ -282,6 +282,13 @@ def test_lsp_client_spawn_hides_console_window(monkeypatch):
+         stdout = None
+         stderr = None
+ 
++    # No real child exists: model its birth identity without querying a host PID.
++    def fake_create_time(pid):
++        assert pid == _FakeProc.pid
++        return 123.0
++
++    monkeypatch.setattr("agent.deadline.process_create_time", fake_create_time)
++
+     async def fake_exec(*cmd, **kwargs):
+         captured.append((list(cmd), kwargs))
+         return _FakeProc()
+@@ -297,6 +304,7 @@ def test_lsp_client_spawn_hides_console_window(monkeypatch):
+         command=["fake-langserver", "--stdio"],
+     )
+     asyncio.run(client._spawn())
++    assert client._proc_born == 123.0
+ 
+     assert len(captured) == 1, captured
+     cmd, kwargs = captured[0]
+diff --git a/tests/tui_gateway/test_background_thread_profile_scope.py b/tests/tui_gateway/test_background_thread_profile_scope.py
+index 3168db2e34..4c7fb1f642 100644
+--- a/tests/tui_gateway/test_background_thread_profile_scope.py
++++ b/tests/tui_gateway/test_background_thread_profile_scope.py
+@@ -61,7 +61,7 @@ def test_auto_title_thread_runs_in_the_turns_profile_scope(served_home, monkeypa
+     finally:
+         reset_secret_scope(secret_token)
+         reset_hermes_home_override(home_token)
+-    assert done.wait(timeout=10), "auto-title thread never ran"
++    assert done.wait(timeout=60), "auto-title thread never ran"
+     assert seen == {"home": str(b), "key": "b-key"}
+ 
+ 
+@@ -84,16 +84,52 @@ def test_ws_orphan_reap_tears_down_under_the_sessions_profile(served_home, monke
+         "session_key": "sess-b", "profile_home": str(b), "transport": server._detached_ws_transport,
+         "last_active": 0.0,
+     }
++    # Real plugin discovery (scan + YAML-parse every installed plugin manifest, twice) is ~2.5s of CPU
++    # inside the timed teardown and unrelated to the profile-scope contract; under CPU throttling it,
++    # not the scope binding, blew the wait. Stub only the plugin dispatch leaf: the real Timer ->
++    # _teardown_popped_session -> lifecycle.invoke_hook -> commit/close path still runs.
++    from hermes_cli import lifecycle
++
++    seen_hooks = []
++    monkeypatch.setattr(
++        lifecycle, "_plugin_hooks",
++        lambda hook_name, **kwargs: seen_hooks.append((hook_name, str(get_hermes_home()))) or [])
++    # Same for the reap's keep-alive gates (live delegations / wakeup schedules / background processes):
++    # each opens state.db, whose writer preflight scans every host process's /proc fds (~0.9s CPU, scales
++    # with host load). Reap eligibility has its own tests; here the session is simply idle.
++    for gate in ("_session_has_active_delegations", "_session_owns_live_wakeup_schedule",
++                 "_session_owns_running_process"):
++        monkeypatch.setattr(server, gate, lambda *args, **kwargs: False)
++    # Warm the one-time costs outside the wait so it times only the Timer -> teardown -> scope binding:
++    # first import of tools.approval, and B's state.db generation in the refcounted registry (its writer
++    # open also runs the /proc fd scan). Holding a ref makes the teardown's acquire a cache hit.
++    import tools.approval
++    from hermes_state_registry import acquire, release_or_close
++
++    warm_db = acquire(Path(b) / "state.db")
+     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+     monkeypatch.setattr(server, "_ws_session_is_orphaned", lambda s: s is session)
+     with server._sessions_lock:
+         server._sessions[sid] = session
+     try:
+-        server._schedule_ws_orphan_reap(sid)
+-        assert done.wait(timeout=10), "reap timer never tore the session down"
++        # Keep the registry lock until we capture the real Timer: even an immediate
++        # callback cannot finish and remove its registration before we own its cleanup.
++        with server._sessions_lock:
++            server._schedule_ws_orphan_reap(sid)
++            timer = server._pending_ws_reaps[sid]
++        try:
++            # Real lifecycle work on CPU-throttled runners can exceed 10s. This
++            # event returns immediately on completion; it is not a timing assertion.
++            assert done.wait(timeout=60), "reap timer never tore the session down"
++        finally:
++            server._cancel_ws_orphan_reap(sid)
++            timer.join(timeout=60)
++            assert not timer.is_alive(), "reap timer outlived its profile fixtures"
+     finally:
+         with server._sessions_lock:
+             server._sessions.pop(sid, None)
++        release_or_close(warm_db)
+     assert seen_commit == {"home": str(b), "key": "b-key"}
+     assert seen_close == {"home": str(b), "key": "b-key"}
++    assert ("on_session_end", str(b)) in seen_hooks  # lifecycle hooks dispatched under B too
+     assert Path(get_hermes_home()) == a  # the test thread's own context is untouched
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index d76fb9aa5d..a9ece150bb 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -45,6 +45,16 @@ This is the shape that covers the workloads `delegate_task` can't:
+ 
+ The eight canonical collaboration patterns are catalogued in [Collaboration patterns](#collaboration-patterns) below.
+ 
++## Duplicate-owner checks
++
++`kanban.create_overlap_check` defaults to `true`. Creation checks open cards across
++local boards and available gateway replicas for overlapping work, rather than only
++cards linked to the current chat. A refusal returns `create_overlap` with the existing
++card IDs; continue the existing owner, or pass `distinct_from` and `distinct_reason`
++when the proposed work is genuinely separate. Set `kanban.create_overlap_check` to
++`false` to disable this check. Missing or unreadable replicas are skipped and logged;
++the check cannot guarantee uniqueness against unavailable boards.
++
+ ## PR completion contracts
+ 
+ Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
+-- 
+2.55.0
+

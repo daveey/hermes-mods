@@ -1,0 +1,473 @@
+From 9056be951d1a698a4af29418fc525d6a2ab379a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:26:38 +0000
+Subject: [PATCH] fix(kanban): honest requires and hub profiles no longer pin
+ MacBook cards local [daveey]
+
+Since #166 every agent create declares requires, and placement kept any card with a
+profile-tool entry (terminal/file/git/kanban) local, so almost nothing reached the hub.
+
+- requires: terminal/file/git/kanban travel (kanban.placement.carried_requires) when the
+  hub client carries options; host_repo and unknown names stay local. When the target
+  publishes profile-tools:<profile>:<tool> in its capability record (new: every gateway's
+  registry refresh publishes its profiles' configured tools), a tool the assignee's profile
+  lacks keeps the card local.
+- assignees: a profile the target advertises in its hermes-hub gateway record is placed
+  there; only a name the target has no profile of stays local.
+- markers: myapp/baby bear only pins when the title names the product, not a skill,
+  repo or path name in the body (metta disk checks loading myapp-ship-and-ops);
+  macOS no longer matches CI runner labels or file names (macos-latest, *-macos.yml).
+
+Card t_01a184ccf2b568d1.
+---
+ hermes_cli/config_defaults.py             |   5 +-
+ hermes_cli/kanban_capability_registry.py  |  58 +++++++++++
+ hermes_cli/kanban_placement.py            | 100 +++++++++++++++---
+ tests/hermes_cli/test_kanban_placement.py | 119 +++++++++++++++++++++-
+ 4 files changed, 268 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 1885eafad1..bbdaa60665 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1959,7 +1959,10 @@ DEFAULT_CONFIG = {
+         # hermes-hub name to a target gateway (e.g. {"macbook": "hub"}); kanban_create then creates a
+         # card with no local-only need on the target, bound to the creating chat. Other keys:
+         # creator_session ({target: session id}), local_markers / extra_local_markers /
+-        # local_skill_markers (regex lists), assignees, hub_live_seconds, wait_seconds, hub_cli.
++        # local_skill_markers (regex lists), assignees (always placed; any profile the target
++        # advertises is placed too), carried_requires (profile tools the target is trusted to
++        # satisfy when it publishes no profile-tools; default terminal/file/git/kanban),
++        # hub_live_seconds, wait_seconds, hub_cli.
+         # Empty = upstream behaviour (every card is created here).
+         "placement": {},
+         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
+diff --git a/hermes_cli/kanban_capability_registry.py b/hermes_cli/kanban_capability_registry.py
+index cdaf0eeb09..24e516b367 100644
+--- a/hermes_cli/kanban_capability_registry.py
++++ b/hermes_cli/kanban_capability_registry.py
+@@ -223,6 +223,38 @@ def probe_specs(cfg: dict) -> list[tuple[str, object]]:
+     return specs
+ 
+ 
++# Per-profile configured tools (``profile-tools:<profile>:<terminal|file|git|kanban>``), published so
++# another gateway's placement can tell whether a card's ``requires`` would pass on this gateway's
++# profile before sending it here (:mod:`hermes_cli.kanban_placement`). host_repo is never published:
++# a checkout on this host says nothing about the creator's checkout. [daveey]
++PROFILE_TOOLS_NS = "profile-tools"
++PROFILE_TOOLS = ("terminal", "file", "git", "kanban")
++
++
++def profile_tool_entries() -> list[tuple[str, bool]]:
++    """(name, True) for each tool of :data:`PROFILE_TOOLS` each live profile's policy grants.
++
++    A profile whose policy cannot be read publishes nothing (reads as lacking every tool). Never raises.
++    """
++    out: list[tuple[str, bool]] = []
++    try:
++        from hermes_cli.kanban_capabilities import _profile_capabilities
++        from hermes_cli.profiles import list_profile_names
++        names = list_profile_names()
++    except Exception:
++        return out
++    for name in names:
++        try:
++            held = _profile_capabilities(name)
++        except Exception:
++            continue
++        for tool in PROFILE_TOOLS:
++            cap = f"{PROFILE_TOOLS_NS}:{name}:{tool}"
++            if tool in held and is_gateway_need(cap):
++                out.append((cap, True))
++    return out
++
++
+ def refresh(cfg: Optional[dict] = None, *, now: Optional[float] = None) -> dict:
+     """Run every probe now and atomically rewrite the registry file. Returns the record."""
+     cfg = _config() if cfg is None else cfg
+@@ -241,6 +273,7 @@ def refresh(cfg: Optional[dict] = None, *, now: Optional[float] = None) -> dict:
+             gh = pool.submit(_builtin_github)
+         else:
+             gh = None
++        tools = pool.submit(profile_tool_entries) if cfg.get("profile_tools", True) else None
+         for fut in futures:
+             name, ok, at = fut.result()
+             results[name] = {"name": name, "ok": ok, "checked_at": round(at, 3)}
+@@ -248,6 +281,10 @@ def refresh(cfg: Optional[dict] = None, *, now: Optional[float] = None) -> dict:
+             at = round(time.time(), 3)
+             for name, ok in gh.result():
+                 results.setdefault(name, {"name": name, "ok": ok, "checked_at": at})
++        if tools is not None:
++            at = round(time.time(), 3)
++            for name, ok in tools.result():
++                results.setdefault(name, {"name": name, "ok": ok, "checked_at": at})
+     record = {
+         "schema": SCHEMA,
+         "gateway": self_gateway(),
+@@ -355,6 +392,27 @@ def remote_records(*, exclude: Optional[str] = None) -> dict[str, dict]:
+     return out
+ 
+ 
++def remote_gateway_profiles(gateway: str) -> Optional[list[str]]:
++    """The profile names ``gateway`` advertises in its hermes-hub ``gateway`` record (the client
++    publishes every profile home it serves), None when unknown/unreadable. [daveey]"""
++    try:
++        db = _ro(hub_db_path())
++    except Exception:
++        return None
++    try:
++        row = db.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'gateway' AND key = 'info'",
++                         (gateway,)).fetchone()
++    except Exception:
++        row = None
++    finally:
++        db.close()
++    try:
++        profiles = json.loads(row[0]).get("profiles") if row else None
++    except (ValueError, AttributeError):
++        return None
++    return [str(p) for p in profiles] if isinstance(profiles, list) else None
++
++
+ def locate(need: str, *, now: Optional[float] = None, cfg: Optional[dict] = None,
+            local: Optional[dict] = None, remote: Optional[dict] = None,
+            self_gw: Optional[str] = None) -> dict:
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 863f4a53bf..b4f7f530c2 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -17,13 +17,20 @@ A card stays local when any of these holds:
+   creates the card on the target (parent handoffs in the body, same origin chat) and parks the local
+   card until the target's card is done, so local grandchildren still wait for the real work;
+ * it cannot be expressed remotely: a project, a ``dir`` or
+-  ``worktree`` workspace, a non-default board or assignee, courier (origin) creation, or creation
++  ``worktree`` workspace, a non-default board, an assignee the target has no profile of (its
++  hermes-hub ``gateway`` record lists them; ``assignees`` names extra always-placed ones), courier
++  (origin) creation, or creation
+   options ``hermes-hub create-task`` cannot carry (an initial status, a human request, a tenant). A
+   hermes-hub client with ``create-task --option`` (1.8.0+) carries skills, the runtime budget, priority,
+   model/provider pins, goal mode, triage, the completion contract and the rest of
+   :data:`CARRIED_OPTIONS`; with an older client a model/provider pin, goal mode, triage or a non-local
+   completion contract keeps the card local, and skills and the runtime budget ride in the body text;
+ * it declares a ``requires`` capability this gateway holds and the target does not;
++* it ``requires`` a profile tool the target cannot satisfy: anything outside
++  ``carried_requires`` (default terminal, file, git, kanban; so host_repo and unknown names), a
++  tool the target's profile lacks when the target publishes ``profile-tools:<profile>:<tool>``
++  in its capability record, or any profile tool with a hermes-hub client that cannot carry
++  ``requires`` as a field;
+ * its title, body or skills match a local marker (``kanban.placement.local_markers`` replaces the
+   built-in list, ``extra_local_markers`` extends it): Chrome, Keychain, TCC, Apple apps, launchd,
+   the Desktop app, a Desktop DOM/CDP readback, this Mac's Keychain... A bare host name (MacBook,
+@@ -68,6 +75,14 @@ HUB_TIMEOUT = 60
+ DEFAULT_HUB_LIVE_SECONDS = 600
+ DEFAULT_CREATOR_SESSION = "kanban-placement"
+ 
++# "macOS" as a word, not a CI runner label or file/skill name (macos-latest, macos-release,
++# hermes-state-macos.yml): a GitHub-hosted macOS job runs on GitHub, not on this Mac.
++MACOS_MARKER = r"(?<![\w/.-])mac ?os(?![\w/-]|\.\w)"
++# Baby Bear the product, named in the TITLE (see TITLE_ONLY_LOCAL_MARKERS) and not as part of a skill,
++# repo or path name (myapp-ship-and-ops, me/myapp, ~/code/myapp-h4): the BB repo is
++# checked out on the hub and its devices are reached over ssh:mini, so a body that loads a BB skill
++# (e.g. a metta disk check) is not Mac work. Mac-only BB work still hits xcode/simulator/codesign.
++BABYBEAR_MARKER = r"(?<![\w/.~-])baby ?bear(?![\w/-]|\.\w)"
+ # Phrases that mean the work needs this machine (a Mac the user works on). Case-insensitive.
+ DEFAULT_LOCAL_MARKERS = (
+     r"\bchrome\b", r"\bcdp\b", r"\bkeychain\b", r"\bcodesign", r"\bnotari[sz]", r"\btcc\b",
+@@ -76,8 +91,8 @@ DEFAULT_LOCAL_MARKERS = (
+     r"\blaunchd\b", r"\blaunchctl\b", r"launchagents", r"~/library/", r"\bhermes\.app\b",
+     r"\bhermes desktop\b", r"\bdesktop (app|backend|backends|renderer|window|chat|chats|sidebar|ui)\b",
+     r"\bdesktop\s+dom\b",
+-    r"\bmacbook\b", r"\bmac ?os\b", r"\bmac ?mini\b", r"\bthe mini\b", r"\bdavids-mac-mini\b",
+-    r"\bbaby ?bear\b", r"\bxcode\b", r"\bsimulator\b", r"\bwhatsapp\b", r"\bscreen ?shot",
++    r"\bmacbook\b", MACOS_MARKER, r"\bmac ?mini\b", r"\bthe mini\b", r"\bdavids-mac-mini\b",
++    BABYBEAR_MARKER, r"\bxcode\b", r"\bsimulator\b", r"\bwhatsapp\b", r"\bscreen ?shot",
+     r"\bexample-org\b", r"\bexample-sso\b", r"--profile example",
+ )
+ # Host names that mean "the work is on that machine" only when they are the subject of the
+@@ -85,7 +100,7 @@ DEFAULT_LOCAL_MARKERS = (
+ # MacBook"), which is not a reason to keep a core-code card on the laptop. A caller who replaces
+ # ``local_markers`` owns the list and every pattern scans the whole text.
+ TITLE_ONLY_LOCAL_MARKERS = frozenset({
+-    r"\bmacbook\b", r"\bmac ?mini\b", r"\bthe mini\b", r"\bdavids-mac-mini\b",
++    r"\bmacbook\b", r"\bmac ?mini\b", r"\bthe mini\b", r"\bdavids-mac-mini\b", BABYBEAR_MARKER,
+ })
+ LOCAL_MARKER_REMEDY = (
+     "if the work doesn't need this machine, archive and re-create with placement='hub'")
+@@ -112,6 +127,9 @@ CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provid
+ # Of those, the ones an older client (no --option) cannot express at all: the card stays local.
+ LEGACY_UNCARRIED = ("model", "provider", "goal_mode", "triage")
+ HELP_CACHE_SECONDS = 600
++# Profile tools (``requires`` entries) a target can satisfy when it does not publish its profiles'
++# tools: what the hub's default profile has. host_repo never travels: it means a checkout on THIS host.
++DEFAULT_CARRIED_REQUIRES = ("terminal", "file", "git", "kanban")
+ _help_cache: dict = {}
+ 
+ 
+@@ -180,6 +198,32 @@ class _Cfg:
+         v = self.raw.get("assignees")
+         return {str(x) for x in v} if isinstance(v, list) and v else {"default"}
+ 
++    def carried_requires(self) -> set[str]:
++        v = self.raw.get("carried_requires")
++        return {str(x) for x in v} if isinstance(v, list) else set(DEFAULT_CARRIED_REQUIRES)
++
++
++def target_info(target: str, *, now: float, remote: Optional[dict] = None) -> dict:
++    """What ``target`` advertises through hermes-hub: ``{"profiles": [names] | None, "tools":
++    {profile: {tool}} | None}``. ``tools`` is None when its capability record publishes no
++    ``profile-tools:`` entry (an older core); only entries checked within the stale window count."""
++    profiles = reg.remote_gateway_profiles(target)
++    remote = reg.remote_records() if remote is None else remote
++    tools: Optional[dict] = None
++    limit = reg.stale_after()
++    prefix = reg.PROFILE_TOOLS_NS + ":"
++    for c in reg._entries(remote.get(target) or {}):
++        name = c["name"]
++        if not name.startswith(prefix):
++            continue
++        tools = {} if tools is None else tools
++        raw = c.get("checked_at")
++        if not c.get("ok") or isinstance(raw, bool) or not isinstance(raw, (int, float)) or now - raw > limit:
++            continue
++        _, prof, tool = name.split(":", 2)
++        tools.setdefault(prof, set()).add(tool)
++    return {"profiles": profiles, "tools": tools}
++
+ 
+ def config() -> dict:
+     try:
+@@ -400,7 +444,8 @@ def _raw_explicit_pin(args: dict) -> str:
+ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+            self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
+            locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None,
+-           machine_ok: Optional[Callable[[str], bool]] = None) -> dict:
++           machine_ok: Optional[Callable[[str], bool]] = None,
++           info: Optional[Callable[[str], dict]] = None) -> dict:
+     """``_decide`` plus one rule: a caller who pinned another gateway never gets a silent local card.
+ 
+     Any local outcome for such a pin (no route to that gateway, a structural limit, target not live)
+@@ -414,7 +459,7 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         sg = reg.self_gateway() if self_gw is None else self_gw
+         known = sg.strip().lower() if isinstance(sg, str) else ""
+         out = _decide(args, origin_intent=origin_intent, now=now, cfg=cfg, self_gw=sg, live=live,
+-                      locate=locate, carries=carries, machine_ok=machine_ok)
++                      locate=locate, carries=carries, machine_ok=machine_ok, info=info)
+         pin = explicit_foreign_pin(args, sg, cfg)
+         if pin and origin_intent is None and out.get("where") == "local" and not out.get("defer"):
+             return {"where": "refuse", "why": out.get("why", ""), "pin": pin}
+@@ -433,7 +478,8 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg: Optional[dict] = None,
+             self_gw: Optional[str] = None, live: Optional[Callable[[str], Optional[str]]] = None,
+             locate: Optional[Callable[[str], dict]] = None, carries: Optional[bool] = None,
+-            machine_ok: Optional[Callable[[str], bool]] = None) -> dict:
++            machine_ok: Optional[Callable[[str], bool]] = None,
++            info: Optional[Callable[[str], dict]] = None) -> dict:
+     """``{"where": "local"|<gateway>, "why": str}`` for a ``kanban_create`` call; heavy work bound for a
+     worker is ``{"where": "local", "runs_on": [machine:<worker>], "why": ...}``. Never raises."""
+     try:
+@@ -463,16 +509,46 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         board = args.get("board")
+         if board and board != "default":
+             return {"where": "local", "why": f"board {board!r}"}
++        now = time.time() if now is None else now
++        seen: dict = {}
++
++        def tgt() -> dict:  # read the target's advertisement once, only when a rule needs it
++            if "v" not in seen:
++                try:
++                    seen["v"] = (info or (lambda t: target_info(t, now=now)))(target) or {}
++                except Exception:
++                    seen["v"] = {}
++            return seen["v"]
++
+         assignee = args.get("assignee") or "default"
+         if assignee not in c.assignees():
+-            return {"where": "local", "why": f"assignee {assignee!r} is not placed remotely"}
++            profiles = tgt().get("profiles")
++            if profiles is None:
++                return {"where": "local", "why": f"assignee {assignee!r} is not placed remotely "
++                                                 f"({target} advertises no profile list)"}
++            if assignee not in profiles:
++                return {"where": "local", "why": f"assignee {assignee!r} has no profile on {target}"}
+         used = _uncarried(args, c, carries)
+         if used:
+             return {"where": "local", "why": f"uses {', '.join(used)} (not carried by hermes-hub create-task)"}
+-        needs = [r for r in (args.get("requires") or []) if reg.is_gateway_need(r)]
+-        if [r for r in (args.get("requires") or []) if not reg.is_gateway_need(r)]:
+-            return {"where": "local", "why": "requires profile tools validated on this gateway"}
+-        now = time.time() if now is None else now
++        reqs = args.get("requires") or []
++        reqs = [reqs] if isinstance(reqs, str) else list(reqs)
++        needs = [r for r in reqs if reg.is_gateway_need(r)]
++        tools = [str(r) for r in reqs if not reg.is_gateway_need(r)]
++        if tools:
++            pinned = [r for r in tools if r not in c.carried_requires()]
++            if pinned:
++                return {"where": "local", "why": f"requires {', '.join(pinned)}, which {target} cannot "
++                                                 "satisfy for this gateway (not in carried_requires)"}
++            if not (carries if carries is not None else hub_carries_options(_hub_cli(c))):
++                return {"where": "local", "why": f"requires {', '.join(tools)} (not carried by this "
++                                                 "hermes-hub client's create-task)"}
++            held = tgt().get("tools")
++            if held is not None:
++                lacking = [r for r in tools if r not in (held.get(assignee) or set())]
++                if lacking:
++                    return {"where": "local", "why": f"requires {', '.join(lacking)}, which {target}'s "
++                                                     f"profile {assignee!r} lacks"}
+         for need in needs:
+             found = (locate or (lambda n: reg.locate(n, now=now)))(need)
+             on_target = any(gw == target for gw, _ in found.get("holders") or [])
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 8a4db15444..d0e9763285 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -21,6 +21,8 @@ from hermes_cli import kanban_placement as kp
+ ROUTE = {"route": {"macbook": "hub"}, "creator_session": {"hub": "20261023_052109_5b3dee"}}
+ ALIVE = lambda target: None
+ NOWHERE = lambda need: {"need": need, "local": "absent", "holders": [], "stale": []}
++# The target advertises nothing (an older hub client/core): profiles unknown, profile tools unpublished.
++SILENT = lambda target: {"profiles": None, "tools": None}
+ 
+ 
+ def decide(args, **kw):
+@@ -28,6 +30,7 @@ def decide(args, **kw):
+     kw.setdefault("self_gw", "macbook")
+     kw.setdefault("live", ALIVE)
+     kw.setdefault("locate", NOWHERE)
++    kw.setdefault("info", SILENT)
+     kw.setdefault("carries", False)  # a hermes-hub client without create-task --option (< 1.8.0)
+     return kp.decide(args, **kw)
+ 
+@@ -58,7 +61,7 @@ def test_no_route_is_upstream_behaviour():
+     ({"initial_status": "blocked"}, "initial_status"),
+     ({"project_id": "p_1"}, "project_id"),
+     ({"completion_contract": "daveey/hermes"}, "completion_contract"),
+-    ({"requires": ["terminal"]}, "profile tools"),
++    ({"requires": ["terminal"]}, "not carried by this hermes-hub client"),
+ ])
+ def test_cards_hub_create_cannot_express_stay_local(extra, why):
+     d = decide({"title": "Fix the flaky test", **extra})
+@@ -201,6 +204,120 @@ def test_decide_never_raises():
+     assert d["where"] == "local" and "failed" in d["why"]
+ 
+ 
++# --- requires and assignees (an honest `requires` list no longer pins a card here) ---------------
++
++HONEST = ["terminal", "file", "git", "kanban"]
++HUB_PROFILES = ["default", "alpha", "bb-tuner", "coach", "ci-sweeper"]
++HUB_TOOLS = {"default": {"terminal", "file", "git", "kanban"}, "coach": {"terminal", "file", "git"},
++             "alpha": {"terminal", "file", "git"}}
++ADVERTISED = lambda target: {"profiles": HUB_PROFILES, "tools": HUB_TOOLS}
++
++
++def test_honest_requires_with_the_default_assignee_goes_to_the_target():
++    d = decide({"title": "Fix the flaky test", "requires": HONEST}, carries=True)
++    assert d["where"] == "hub", d
++    # The same when the target publishes its profile tools and its default profile has them all.
++    assert decide({"title": "Fix the flaky test", "requires": HONEST}, carries=True,
++                  info=ADVERTISED)["where"] == "hub"
++
++
++def test_host_repo_and_unknown_requires_stay_local():
++    for req in (["terminal", "host_repo"], ["teleport"]):
++        d = decide({"title": "Fix the flaky test", "requires": req}, carries=True, info=ADVERTISED)
++        assert d["where"] == "local" and "carried_requires" in d["why"], d
++
++
++def test_carried_requires_is_configurable():
++    cfg = {**ROUTE, "carried_requires": ["terminal"]}
++    assert decide({"title": "x", "requires": ["terminal"]}, carries=True, cfg=cfg)["where"] == "hub"
++    d = decide({"title": "x", "requires": ["terminal", "file"]}, carries=True, cfg=cfg)
++    assert d["where"] == "local" and "file" in d["why"], d
++
++
++def test_requires_a_target_profile_lacks_stays_local():
++    d = decide({"title": "x", "assignee": "coach", "requires": ["terminal", "kanban"]}, carries=True,
++               info=ADVERTISED)
++    assert d["where"] == "local" and "kanban" in d["why"] and "coach" in d["why"], d
++    # ci-sweeper publishes no tools at all: lacks every one.
++    d = decide({"title": "x", "assignee": "ci-sweeper", "requires": ["terminal"]}, carries=True,
++               info=ADVERTISED)
++    assert d["where"] == "local" and "lacks" in d["why"], d
++
++
++def test_assignee_the_target_has_a_profile_for_goes_there():
++    d = decide({"title": "Coach plugin build", "assignee": "coach", "requires": ["terminal", "file", "git"]},
++               carries=True, info=ADVERTISED)
++    assert d["where"] == "hub", d
++
++
++def test_unknown_assignee_stays_local():
++    d = decide({"title": "x", "assignee": "links"}, info=ADVERTISED)
++    assert d["where"] == "local" and "no profile on hub" in d["why"], d
++    # A target that advertises no profile list keeps the old rule: only `assignees` travel.
++    d = decide({"title": "x", "assignee": "coach"})
++    assert d["where"] == "local" and "not placed remotely" in d["why"], d
++
++
++def test_target_info_reads_the_gateway_record_and_fresh_profile_tools(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path))
++    now = time.time()
++    db = sqlite3.connect(tmp_path / "hub.db")
++    db.executescript(HUB_SCHEMA)
++    db.execute("INSERT INTO replica VALUES ('hub','gateway','info',1,1,?,0)",
++               (json.dumps({"gateway": "hub", "profiles": ["default", "coach"]}),))
++    db.commit()
++    db.close()
++    caps = [{"name": "profile-tools:default:terminal", "ok": True, "checked_at": now - 10},
++            {"name": "profile-tools:coach:file", "ok": True, "checked_at": now - 99999},  # stale
++            {"name": "ssh:mini", "ok": True, "checked_at": now}]
++    got = kp.target_info("hub", now=now, remote={"hub": {"schema": 1, "capabilities": caps}})
++    assert got == {"profiles": ["default", "coach"], "tools": {"default": {"terminal"}}}
++    # No profile-tools entry at all: tools unknown (None), not "lacks everything".
++    got = kp.target_info("mini", now=now, remote={"mini": {"schema": 1, "capabilities": caps[2:]}})
++    assert got == {"profiles": None, "tools": None}
++
++
++def test_registry_publishes_each_profiles_tools(monkeypatch):
++    from hermes_cli import kanban_capabilities as kc
++    from hermes_cli import profiles as pr
++    monkeypatch.setattr(pr, "list_profile_names", lambda: ["default", "coach", "broken"])
++
++    def caps(name):
++        if name == "broken":
++            raise ValueError("bad config")
++        return {"default": {"terminal", "file", "git", "kanban", "host_repo"},
++                "coach": {"terminal", "git"}}[name]
++    monkeypatch.setattr(kc, "_profile_capabilities", caps)
++    names = [n for n, ok in reg.profile_tool_entries() if ok]
++    assert names == ["profile-tools:default:terminal", "profile-tools:default:file",
++                     "profile-tools:default:git", "profile-tools:default:kanban",
++                     "profile-tools:coach:terminal", "profile-tools:coach:git"]
++    assert all(reg.is_gateway_need(n) for n in names)
++
++
++# --- marker narrowing ------------------------------------------------------------------------------
++
++def test_myapp_skill_or_repo_in_the_body_does_not_pin_the_card():
++    # t_01a18329fe89fefb / t_01a18491e6b20fc9: metta disk checks kept on the MacBook by a BB skill name.
++    d = decide({"title": "Disk H4: metta4 silent 81 h (unreachable, 12 runners offline)",
++                "body": "Skills: myapp-ship-and-ops, five-whys.\nRemove the worktree ~/code/myapp-h4 "
++                        "once me/myapp PR 1823 has merged."})
++    assert d["where"] == "hub", d
++    # Baby Bear named as the subject of the title still pins it.
++    d = decide({"title": "Baby Bear voice listening regressed", "body": "x"})
++    assert d["where"] == "local" and "baby bear" in d["why"], d
++
++
++def test_macos_ci_runner_labels_do_not_pin_the_card():
++    d = decide({"title": "Move hermes-state CI to GitHub-hosted runners",
++                "body": "runs-on: macos-latest; see .github/workflows/hermes-state-macos.yml"})
++    assert d["where"] == "hub", d
++    d = decide({"title": "test_gateway_start_refused.py: teardown ERRORs on macOS.", "body": ""})
++    assert d["where"] == "local" and "macos" in d["why"], d
++    d = decide({"title": "Teardown fails", "body": "Only on macOS, never on Linux."})
++    assert d["where"] == "local" and "macos" in d["why"], d
++
++
+ # --- liveness -----------------------------------------------------------------------------------
+ 
+ def test_target_live_needs_a_recent_sync_and_a_fresh_target_record():
+-- 
+2.55.0
+

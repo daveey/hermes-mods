@@ -1,0 +1,569 @@
+From 4b29ad8e4de5d216571212869d09e88d2d72bfdb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:29:25 -0700
+Subject: [PATCH] fix(code-skew): [daveey] pin first-time in-tree imports to
+ the boot commit after an in-place core update
+
+A Desktop hermes serve booted at 2aa3397018 kept its old agent.model_routing_managed while
+hermes update moved the tree to abe20b1815; the first-time lazy import of the new
+kanban_model_assignment then failed with "cannot import name ManagedPinRejectedError" for
+three hours, because the skew watchdog only retires a backend once every Desktop session is
+idle (t_01a1824adc287c5a).
+
+gateway.boot_pinned_imports puts a meta-path finder in front of sys.meta_path at serve and
+gateway boot. Once the checkout leaves the boot commit (latched), every first-time import of a
+git-tracked module under the project root loads the boot commit's blob via git cat-file, so
+the process keeps one consistent revision until the existing watchdog restarts it. Untracked
+paths (venv, plugins), modules new since boot, and any git failure fall back to the normal
+import. HERMES_BOOT_PINNED_IMPORTS=0 disables it.
+---
+ gateway/boot_pinned_imports.py            | 274 ++++++++++++++++++++++
+ gateway/code_skew.py                      |  16 ++
+ gateway/run.py                            |   3 +-
+ hermes_cli/web_server.py                  |   3 +-
+ tests/gateway/test_boot_pinned_imports.py | 194 +++++++++++++++
+ 5 files changed, 488 insertions(+), 2 deletions(-)
+ create mode 100644 gateway/boot_pinned_imports.py
+ create mode 100644 tests/gateway/test_boot_pinned_imports.py
+
+diff --git a/gateway/boot_pinned_imports.py b/gateway/boot_pinned_imports.py
+new file mode 100644
+index 0000000000..29b5317cfd
+--- /dev/null
++++ b/gateway/boot_pinned_imports.py
+@@ -0,0 +1,274 @@
++"""Keep a long-running process on ONE code revision after an in-place core update.
++
++A gateway or ``hermes serve`` imports most of the tree at boot and the rest lazily. When
++``hermes update`` moves the checkout under it, the next first-time import loads the NEW file
++against the OLD modules already in ``sys.modules``: ``from agent.model_routing_managed import
++ManagedPinRejectedError`` then fails with ImportError because the loaded ``model_routing_managed``
++predates the class (t_01a1824adc287c5a). Retirement (``web_server_skew_exit``) only fires once the
++backend is idle, which a busy Desktop can postpone for hours.
++
++This finder closes that window. It snapshots the boot commit; once the checkout has moved past it,
++every first-time import of a git-tracked module under the project root is served from the boot
++commit's blob (``git cat-file``) instead of the working tree, so the process keeps running one
++consistent revision until it restarts on the new code. Running turns are untouched.
++
++Every uncertain case falls back to the normal import (exactly the pre-fix behaviour): no boot
++commit, git missing or failing, a path outside the root or untracked (venv, plugins), a module that
++did not exist at boot. The finder never raises.
++"""
++
++from __future__ import annotations
++
++import importlib.abc
++import importlib.machinery
++import importlib.util
++import linecache
++import logging
++import os
++import shutil
++import subprocess
++import sys
++import threading
++from typing import Callable, Optional
++
++_log = logging.getLogger(__name__)
++
++_GIT_TIMEOUT_S = 15
++_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
++                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES")
++
++
++def _sha_of(fingerprint: Optional[str]) -> Optional[str]:
++    """Full commit sha from a ``git:<ref>:<sha>`` fingerprint, else None."""
++    if not fingerprint:
++        return None
++    sha = fingerprint.rsplit(":", 1)[-1].strip()
++    if len(sha) in (40, 64) and all(c in "0123456789abcdef" for c in sha):
++        return sha
++    return None
++
++
++class _BootBlobLoader(importlib.abc.Loader):
++    """Executes a module from the boot commit's source while keeping its on-disk location
++    (``__file__``, package ``__path__``, data files) so relative file access still works."""
++
++    def __init__(self, fullname: str, source: bytes, origin: str, is_package: bool):
++        self.name = fullname
++        self.path = origin
++        self._source = source
++        self._is_package = is_package
++
++    def create_module(self, spec):
++        return None
++
++    def exec_module(self, module) -> None:
++        text = self._source.decode("utf-8")
++        # Tracebacks and inspect show the code that actually runs, not the newer file on disk.
++        linecache.cache[self.path] = (len(text), None, text.splitlines(True), self.path)
++        code = compile(self._source, self.path, "exec", dont_inherit=True)
++        exec(code, module.__dict__)
++
++    def is_package(self, fullname: str) -> bool:
++        return self._is_package
++
++    def get_source(self, fullname: str) -> str:
++        return self._source.decode("utf-8")
++
++    def get_filename(self, fullname: str) -> str:
++        return self.path
++
++    def get_data(self, path: str) -> bytes:
++        with open(path, "rb") as fh:
++            return fh.read()
++
++    def get_resource_reader(self, fullname: str):
++        if not self._is_package:
++            return None
++        from importlib.readers import FileReader
++
++        return FileReader(self)  # type: ignore[arg-type]  # FileReader only reads .path
++
++
++class BootPinnedFinder(importlib.abc.MetaPathFinder):
++    """``sys.meta_path`` entry that pins first-time in-tree imports to ``boot_sha`` once the
++    checkout has moved. ``current_sha`` reads the checkout's HEAD sha (None when unknown)."""
++
++    def __init__(self, root: str, boot_sha: str, current_sha: Callable[[], Optional[str]],
++                 git: Optional[str] = None):
++        self.root = os.path.realpath(root)
++        self.boot_sha = boot_sha
++        self._current_sha = current_sha
++        self._git = git or shutil.which("git")
++        self._top_level = self._list_top_level()
++        self._lock = threading.RLock()
++        self._local = threading.local()
++        self._skewed = False
++        self._boot_files: Optional[frozenset[str]] = None
++        self._boot_dirs: Optional[frozenset[str]] = None
++        self._git_failed = False
++        self._announced = False
++        self.pinned: list[str] = []  # module names served from the boot commit (observability/tests)
++
++    # -- helpers -------------------------------------------------------------------------------
++    def _list_top_level(self) -> frozenset[str]:
++        try:
++            names = os.listdir(self.root)
++        except OSError:
++            return frozenset()
++        return frozenset(n.removesuffix(".py") for n in names)
++
++    def _rel(self, path: str) -> Optional[str]:
++        try:
++            real = os.path.realpath(path or os.getcwd())
++        except (OSError, ValueError):
++            return None
++        if real == self.root:
++            return ""
++        if real.startswith(self.root + os.sep):
++            return os.path.relpath(real, self.root).replace(os.sep, "/")
++        return None
++
++    def _run_git(self, *args: str) -> Optional[bytes]:
++        if not self._git or self._git_failed:
++            return None
++        env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
++        try:
++            done = subprocess.run([self._git, "--no-replace-objects", "-C", self.root, *args],
++                                  capture_output=True, timeout=_GIT_TIMEOUT_S, env=env,
++                                  stdin=subprocess.DEVNULL, check=False)
++        except (OSError, subprocess.SubprocessError) as exc:
++            self._git_failed = True
++            _log.warning("boot-pinned imports disabled: git failed (%s); lazy imports load from disk", exc)
++            return None
++        if done.returncode != 0:
++            return None
++        return done.stdout
++
++    def _boot_tree(self) -> Optional[frozenset[str]]:
++        if self._boot_files is None:
++            out = self._run_git("ls-tree", "-r", "-z", "--name-only", self.boot_sha)
++            if out is None:
++                self._git_failed = True
++                _log.warning("boot-pinned imports disabled: boot commit %s is unreadable; "
++                             "lazy imports load from disk", self.boot_sha[:10])
++                return None
++            self._boot_files = frozenset(p.decode("utf-8", "surrogateescape") for p in out.split(b"\0") if p)
++        return self._boot_files
++
++    def is_skewed(self) -> bool:
++        """Latched: once the checkout left the boot commit, this process stays pinned to it."""
++        if self._skewed:
++            return True
++        try:
++            current = self._current_sha()
++        except Exception:
++            current = None
++        if current and current != self.boot_sha:
++            self._skewed = True
++        return self._skewed
++
++    def _tracked_dir(self, rel: Optional[str]) -> bool:
++        """True when ``rel`` lies under a top-level directory the boot commit tracks (so not the
++        untracked venv, caches or plugin checkouts that happen to live under the root)."""
++        files = self._boot_tree()
++        if files is None or rel is None:
++            return False
++        if self._boot_dirs is None:
++            self._boot_dirs = frozenset(f.split("/", 1)[0] for f in files if "/" in f)
++        return rel == "" or rel.split("/", 1)[0] in self._boot_dirs
++
++    def _boot_location(self, fullname: str, path) -> Optional[tuple[str, bool]]:
++        """(repo-relative file, is_package) for ``fullname`` in the boot tree, searching the same
++        directories the path finder would (the parent package's ``__path__`` or ``sys.path``)."""
++        files = self._boot_tree()
++        if files is None:
++            return None
++        tail = fullname.rpartition(".")[2]
++        for entry in (path if path is not None else sys.path):
++            rel_dir = self._rel(entry) if isinstance(entry, str) else None
++            if rel_dir is None:
++                continue
++            base = f"{rel_dir}/{tail}" if rel_dir else tail
++            if f"{base}/__init__.py" in files:
++                return f"{base}/__init__.py", True
++            if f"{base}.py" in files:
++                return f"{base}.py", False
++        return None
++
++    # -- MetaPathFinder ------------------------------------------------------------------------
++    def find_spec(self, fullname, path=None, target=None):
++        if getattr(self._local, "busy", False):
++            return None
++        if path is None and fullname.partition(".")[0] not in self._top_level:
++            return None  # not a top-level name the project root provides
++        self._local.busy = True
++        try:
++            return self._find_spec(fullname, path)
++        except Exception:
++            _log.debug("boot-pinned finder fell back for %s", fullname, exc_info=True)
++            return None
++        finally:
++            self._local.busy = False
++
++    def _find_spec(self, fullname, path):
++        if self._git_failed or not self.is_skewed():
++            return None
++        with self._lock:
++            if path is not None and not any(isinstance(e, str) and self._tracked_dir(self._rel(e))
++                                            for e in path):
++                return None  # a submodule of a package outside the tracked tree (venv, stdlib)
++            disk = importlib.machinery.PathFinder.find_spec(fullname, path)
++            disk_rel = self._rel(disk.origin) if disk is not None and disk.origin and disk.has_location else None
++            if disk is not None and disk.has_location and disk_rel is None:
++                return None  # resolves outside the project root: not ours
++            located = self._boot_location(fullname, path)
++            if located is None:
++                if disk_rel is not None and disk_rel != "" and self._tracked_dir(disk_rel):
++                    _log.warning("boot-pinned imports: %s did not exist at boot commit %s; loading "
++                                 "it from disk", fullname, self.boot_sha[:10])
++                return None
++            rel, is_package = located
++            source = self._run_git("cat-file", "blob", f"{self.boot_sha}:{rel}")
++            if source is None:
++                return None
++            if not self._announced:
++                self._announced = True
++                _log.warning("checkout moved past boot commit %s; first-time imports of in-tree "
++                             "modules now load from the boot commit until this process restarts",
++                             self.boot_sha[:10])
++            self.pinned.append(fullname)
++        origin = os.path.join(self.root, *rel.split("/"))
++        loader = _BootBlobLoader(fullname, source, origin, is_package)
++        spec = importlib.util.spec_from_loader(fullname, loader, origin=origin, is_package=is_package)
++        if spec is None:
++            return None
++        spec.has_location = True
++        if is_package:
++            spec.submodule_search_locations = [os.path.dirname(origin)]
++        return spec
++
++
++_installed: Optional[BootPinnedFinder] = None
++
++
++def install(root, boot_fingerprint: Optional[str],
++            current_fingerprint: Callable[[], Optional[str]]) -> Optional[BootPinnedFinder]:
++    """Put a ``BootPinnedFinder`` at the front of ``sys.meta_path`` (idempotent per process).
++
++    No-op when ``HERMES_BOOT_PINNED_IMPORTS=0``, under pytest unless it is ``1``, or when the boot
++    revision is not a resolved commit."""
++    global _installed
++    setting = os.environ.get("HERMES_BOOT_PINNED_IMPORTS", "").strip().lower()
++    if setting in {"0", "false", "no", "off"}:
++        return None
++    if os.environ.get("PYTEST_CURRENT_TEST") and setting not in {"1", "true", "yes", "on"}:
++        return None  # a test process imports a dirty worktree; serve lifespans under test must not pin it
++    boot_sha = _sha_of(boot_fingerprint)
++    if boot_sha is None:
++        return None
++    if _installed is not None and _installed in sys.meta_path:
++        return _installed
++    finder = BootPinnedFinder(str(root), boot_sha, lambda: _sha_of(current_fingerprint()))
++    sys.meta_path.insert(0, finder)
++    _installed = finder
++    return finder
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+index 943829663b..a73693d819 100644
+--- a/gateway/code_skew.py
++++ b/gateway/code_skew.py
+@@ -34,6 +34,22 @@ def record_boot_fingerprint() -> None:
+         _boot_fingerprint = _fingerprint()
+ 
+ 
++def install_boot_pinned_imports() -> None:
++    """After ``record_boot_fingerprint``: pin later first-time in-tree imports to the boot commit
++    once the checkout moves, so a lazy import never mixes revisions (``gateway.boot_pinned_imports``)."""
++    try:
++        from gateway.boot_pinned_imports import install
++        from hermes_cli.main import _read_git_revision_fingerprint
++
++        # Bind the reader and root now: later monkeypatches/reassignments must not flip the latch.
++        root = _PROJECT_ROOT
++        install(root, _boot_fingerprint, lambda: _read_git_revision_fingerprint(root))
++    except Exception:
++        import logging
++
++        logging.getLogger(__name__).warning("boot-pinned imports did not install", exc_info=True)
++
++
+ def _short(fingerprint: str) -> str:
+     """Render a ``git:<ref>:<sha>`` fingerprint as a compact label."""
+     sha = fingerprint.rsplit(":", 1)[-1]
+diff --git a/gateway/run.py b/gateway/run.py
+index 8ee8a13cfa..3b3bcaa70c 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5718,8 +5718,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+     apply_nofile_soft_limit()
+ 
+     # Snapshot the revision while sys.modules matches disk so a later `git pull` is detected safely.
+-    from gateway.code_skew import record_boot_fingerprint
++    from gateway.code_skew import install_boot_pinned_imports, record_boot_fingerprint
+     record_boot_fingerprint()
++    install_boot_pinned_imports()
+ 
+     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
+     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 2f4cbf6606..08c8b52b59 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -211,9 +211,10 @@ async def _lifespan(app: FastAPI):
+     # Snapshot the checkout revision so lazy-import paths (model picker) can
+     # refuse with "restart required" after `hermes update` replaced the code
+     # (#86207); the update flow does not reliably restart the dashboard.
+-    from gateway.code_skew import record_boot_fingerprint
++    from gateway.code_skew import install_boot_pinned_imports, record_boot_fingerprint
+ 
+     record_boot_fingerprint()
++    install_boot_pinned_imports()
+ 
+     # Hosted Bot rooms belong to the backend process. Recovery may need a
+     # contended state.db migration, so keep it off the pre-yield path: Group
+diff --git a/tests/gateway/test_boot_pinned_imports.py b/tests/gateway/test_boot_pinned_imports.py
+new file mode 100644
+index 0000000000..d9b726e6a2
+--- /dev/null
++++ b/tests/gateway/test_boot_pinned_imports.py
+@@ -0,0 +1,194 @@
++"""A long-running process must not mix module revisions after an in-place core update.
++
++Regression for t_01a1824adc287c5a: a Desktop ``hermes serve`` booted at 2aa3397018 had the old
++``agent.model_routing_managed`` loaded; ``hermes update`` moved the tree to a commit that added
++``ManagedPinRejectedError``; the first-time lazy import of the NEW ``kanban_model_assignment``
++then failed with ``cannot import name 'ManagedPinRejectedError'``.
++"""
++
++from __future__ import annotations
++
++import importlib
++import inspect
++import subprocess
++import sys
++import uuid
++from pathlib import Path
++
++import pytest
++
++from gateway import boot_pinned_imports
++from gateway.boot_pinned_imports import BootPinnedFinder
++from hermes_cli.main import _read_git_revision_fingerprint
++
++_GIT = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
++
++
++def _git(repo: Path, *args: str) -> str:
++    return subprocess.run(["git", "-C", str(repo), *_GIT, *args], check=True,
++                          capture_output=True, text=True).stdout.strip()
++
++
++def _commit(repo: Path, files: dict[str, str | None], msg: str) -> str:
++    for rel, text in files.items():
++        path = repo / rel
++        if text is None:
++            path.unlink()
++            continue
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(text, encoding="utf-8")
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-q", "-m", msg)
++    return _git(repo, "rev-parse", "HEAD")
++
++
++OLD_ROUTING = "class ModelRoutingError(Exception):\n    pass\n"
++NEW_ROUTING = OLD_ROUTING + "\n\nclass ManagedPinRejectedError(ModelRoutingError):\n    pass\n"
++OLD_ASSIGN = ("def validate():\n"
++              "    from {pkg}.routing import ModelRoutingError\n"
++              "    return 'old:' + ModelRoutingError.__name__\n")
++NEW_ASSIGN = ("def validate():\n"
++              "    from {pkg}.routing import ManagedPinRejectedError\n"
++              "    return 'new:' + ManagedPinRejectedError.__name__\n")
++
++
++@pytest.fixture
++def tree(tmp_path, monkeypatch):
++    """A git checkout on sys.path holding a uniquely named package at a boot commit."""
++    pkg = f"bootpin_{uuid.uuid4().hex[:10]}"
++    repo = tmp_path / "checkout"
++    repo.mkdir()
++    _git(repo, "init", "-q")
++    boot = _commit(repo, {f"{pkg}/__init__.py": "",
++                          f"{pkg}/routing.py": OLD_ROUTING,
++                          f"{pkg}/assign.py": OLD_ASSIGN.format(pkg=pkg),
++                          f"{pkg}/gone.py": "VALUE = 'boot'\n"}, "boot")
++    monkeypatch.syspath_prepend(str(repo))
++    importlib.invalidate_caches()
++    finders: list = []
++    yield pkg, repo, boot, finders
++    for finder in finders:
++        if finder in sys.meta_path:
++            sys.meta_path.remove(finder)
++    for name in [n for n in sys.modules if n == pkg or n.startswith(pkg + ".")]:
++        del sys.modules[name]
++
++
++def _finder(repo: Path, boot: str, finders: list) -> BootPinnedFinder:
++    finder = BootPinnedFinder(str(repo), boot, lambda: boot_pinned_imports._sha_of(
++        _read_git_revision_fingerprint(repo)))
++    sys.meta_path.insert(0, finder)
++    finders.append(finder)
++    return finder
++
++
++def _core_update(repo: Path, pkg: str) -> None:
++    """What ``hermes update`` does to the running tree: the routing module gains a class and the
++    not-yet-imported module starts importing it."""
++    _commit(repo, {f"{pkg}/routing.py": NEW_ROUTING,
++                   f"{pkg}/assign.py": NEW_ASSIGN.format(pkg=pkg),
++                   f"{pkg}/gone.py": None,
++                   f"{pkg}/added.py": "VALUE = 'added'\n"}, "advance")
++    importlib.invalidate_caches()
++
++
++def test_unguarded_process_mixes_revisions_and_raises_the_reported_import_error(tree):
++    """Control: without the finder the scenario reproduces the incident."""
++    pkg, repo, _boot, _ = tree
++    importlib.import_module(f"{pkg}.routing")  # loaded at boot
++    _core_update(repo, pkg)
++    assign = importlib.import_module(f"{pkg}.assign")  # first-time lazy import: NEW file
++    with pytest.raises(ImportError, match="cannot import name 'ManagedPinRejectedError'"):
++        assign.validate()
++
++
++def test_lazy_import_after_update_loads_the_boot_revision_instead_of_raising(tree):
++    pkg, repo, boot, finders = tree
++    importlib.import_module(f"{pkg}.routing")  # loaded at boot
++    finder = _finder(repo, boot, finders)
++    _core_update(repo, pkg)
++
++    assign = importlib.import_module(f"{pkg}.assign")
++
++    assert assign.validate() == "old:ModelRoutingError"  # one consistent revision, no ImportError
++    assert finder.pinned == [f"{pkg}.assign"]
++    assert assign.__file__ == str(repo / pkg / "assign.py")
++    assert "ModelRoutingError" in inspect.getsource(assign.validate)  # source shown = code run
++
++
++def test_a_module_deleted_by_the_update_still_imports_from_the_boot_commit(tree):
++    pkg, repo, boot, finders = tree
++    importlib.import_module(pkg)
++    _finder(repo, boot, finders)
++    _core_update(repo, pkg)
++    assert not (repo / pkg / "gone.py").exists()
++    assert importlib.import_module(f"{pkg}.gone").VALUE == "boot"
++
++
++def test_a_module_new_since_boot_falls_back_to_disk(tree):
++    pkg, repo, boot, finders = tree
++    importlib.import_module(pkg)
++    finder = _finder(repo, boot, finders)
++    _core_update(repo, pkg)
++    assert importlib.import_module(f"{pkg}.added").VALUE == "added"
++    assert f"{pkg}.added" not in finder.pinned
++
++
++def test_no_update_means_normal_disk_imports(tree):
++    """Before the checkout moves the finder stays out of the way (uncommitted edits load)."""
++    pkg, repo, boot, finders = tree
++    finder = _finder(repo, boot, finders)
++    (repo / pkg / "assign.py").write_text("def validate():\n    return 'dirty'\n", encoding="utf-8")
++    assert importlib.import_module(f"{pkg}.assign").validate() == "dirty"
++    assert finder.pinned == [] and finder.is_skewed() is False
++
++
++def test_an_unreadable_boot_commit_falls_back_to_the_old_behaviour(tree):
++    pkg, repo, _boot, finders = tree
++    importlib.import_module(pkg)
++    finder = _finder(repo, "f" * 40, finders)  # not an object in this repo
++    _core_update(repo, pkg)
++    assert importlib.import_module(f"{pkg}.added").VALUE == "added"
++    assert finder.pinned == []
++
++
++def test_skew_is_latched_even_if_the_tree_returns(tree):
++    pkg, repo, boot, finders = tree
++    finder = _finder(repo, boot, finders)
++    _core_update(repo, pkg)
++    assert finder.is_skewed() is True
++    _git(repo, "reset", "-q", "--hard", boot)
++    assert finder.is_skewed() is True
++
++
++def test_install_is_a_noop_under_pytest_and_when_disabled(tree, monkeypatch):
++    _pkg, repo, boot, _ = tree
++    monkeypatch.setattr(boot_pinned_imports, "_installed", None)
++    monkeypatch.delenv("HERMES_BOOT_PINNED_IMPORTS", raising=False)
++    assert boot_pinned_imports.install(repo, f"git:HEAD:{boot}", lambda: None) is None
++    monkeypatch.setenv("HERMES_BOOT_PINNED_IMPORTS", "0")
++    assert boot_pinned_imports.install(repo, f"git:HEAD:{boot}", lambda: None) is None
++    monkeypatch.setenv("HERMES_BOOT_PINNED_IMPORTS", "1")
++    assert boot_pinned_imports.install(repo, "git:refs/heads/main:unresolved", lambda: None) is None
++
++
++def test_code_skew_wiring_installs_a_finder_bound_to_the_boot_commit(tree, monkeypatch):
++    """The serve lifespan / gateway entry point: ``record_boot_fingerprint`` then
++    ``install_boot_pinned_imports`` pins lazy imports once the checkout moves."""
++    from gateway import code_skew
++
++    pkg, repo, boot, finders = tree
++    importlib.import_module(f"{pkg}.routing")
++    monkeypatch.setenv("HERMES_BOOT_PINNED_IMPORTS", "1")
++    monkeypatch.setattr(boot_pinned_imports, "_installed", None)
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", repo)
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
++    code_skew.record_boot_fingerprint()
++    code_skew.install_boot_pinned_imports()
++    finder = boot_pinned_imports._installed
++    assert finder is not None and sys.meta_path[0] is finder
++    finders.append(finder)
++    assert finder.boot_sha == boot
++
++    _core_update(repo, pkg)
++    assert importlib.import_module(f"{pkg}.assign").validate() == "old:ModelRoutingError"
+-- 
+2.55.0
+

@@ -1,0 +1,293 @@
+From 4c2a3c5e25244c2b173256d735841291a86fbbcd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:38:23 +0000
+Subject: [PATCH] fix(kanban): retry guarded terminal scratch cleanup during GC
+ [daveey]
+
+---
+ hermes_cli/kanban_db_workspace.py          |   3 +-
+ hermes_cli/kanban_ops.py                   |  29 +----
+ hermes_cli/kanban_worktree_gc.py           |  42 ++++++
+ tests/hermes_cli/test_kanban_scratch_gc.py | 145 +++++++++++++++++++++
+ 4 files changed, 192 insertions(+), 27 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_gc.py
+
+diff --git a/hermes_cli/kanban_db_workspace.py b/hermes_cli/kanban_db_workspace.py
+index 1fba89cebac..55b076f6855 100644
+--- a/hermes_cli/kanban_db_workspace.py
++++ b/hermes_cli/kanban_db_workspace.py
+@@ -117,7 +117,8 @@ def _conn_uses_path(
+             other_key = _path_key(Path(other).expanduser().resolve(strict=False))
+         except OSError:
+             continue
+-        if other_key == key:
++        if (Path(other_key).is_relative_to(Path(key))
++                or Path(key).is_relative_to(Path(other_key))):
+             return True
+     return False
+ 
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index aba24ea6c47..d9e45a513fa 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -15,7 +15,6 @@ from pathlib import Path
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
+-from hermes_cli import kanban_db_workspace as kbw
+ from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
+ 
+ 
+@@ -322,14 +321,12 @@ def _cmd_watch(args: argparse.Namespace) -> int:
+ 
+ 
+ def _cmd_gc(args: argparse.Namespace) -> int:
+-    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+-    import shutil
++    """Retry terminal workspace cleanup and remove old events and worker logs."""
+     event_days = getattr(args, "event_retention_days", 30)
+     log_days = getattr(args, "log_retention_days", 30)
+     if event_days < 0 or log_days < 0:
+         return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
+-    scratch_root = kb.workspaces_root()
+-    from hermes_cli.kanban_worktree_gc import gc_task_worktrees, retention_days
++    from hermes_cli.kanban_worktree_gc import gc_task_scratch, gc_task_worktrees, retention_days
+     wt_days = getattr(args, "worktree_retention_days", None)
+     wt_days = retention_days() if wt_days is None else wt_days
+     if wt_days < 0:
+@@ -337,27 +334,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
+     with kbc.connect_closing() as conn:
+         removed_ws = gc_task_worktrees(conn, older_than_days=wt_days)
+     with kbc.connect_closing() as conn:
+-        rows = conn.execute(
+-            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+-            "WHERE status = 'archived'"
+-        ).fetchall()
+-        for row in rows:
+-            if row["workspace_kind"] == "worktree":
+-                continue  # handled by the retention-aware sweep above
+-            if row["workspace_kind"] != "scratch":
+-                continue
+-            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+-            # Same containment predicate as completion cleanup (#28818): strictly below a
+-            # managed root, never the root itself (which holds every task's scratch dir).
+-            # Cheap existence/symlink check first: most rows were already cleaned at
+-            # completion, and rmtree refuses a symlink (so it must not be counted).
+-            if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
+-                continue
+-            if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
+-                continue
+-            shutil.rmtree(path, ignore_errors=True)
+-            if not path.exists():
+-                removed_ws += 1
++        removed_ws += gc_task_scratch(conn)
+ 
+     removed_events = 0
+     if event_days:
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 94e2ec5eaa7..4d5a9802438 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -33,6 +33,48 @@ def retention_days() -> int:
+         return 0
+ 
+ 
++def gc_task_scratch(conn: sqlite3.Connection) -> int:
++    """Retry terminal scratch cleanup, failing closed on any unreadable board.
++
++    Only task records establish ownership; never infer it from directory names.
++    Read every board before the first removal, even if an earlier board reports
++    a live sharer. Keep the selected owner locked against concurrent resumption.
++    """
++    import shutil
++
++    from hermes_cli import kanban_db as kb
++
++    removed = 0
++    with kb.write_txn(conn):
++        try:
++            rows = conn.execute(
++                "SELECT id, workspace_path FROM tasks WHERE workspace_kind='scratch' "
++                f"AND status IN {ws._TERMINAL_STATUSES_SQL}"
++            ).fetchall()
++            for board in ws._sibling_board_db_files(conn):
++                with _read_board(board) as other:
++                    other.execute("SELECT workspace_path FROM tasks").fetchall()
++        except (OSError, sqlite3.Error):
++            log.warning("Scratch GC aborted: cannot read all boards; preserving workspaces", exc_info=True)
++            return 0
++        for row in rows:
++            path = Path(row["workspace_path"] or (kb.workspaces_root() / row["id"])).expanduser()
++            if not path.is_dir() or path.is_symlink() or not ws._is_managed_scratch_path(path):
++                continue
++            if ws._has_active_children(conn, row["id"]):
++                continue
++            if not ws._scratch_tree_removable(path):
++                continue
++            if ws._defer_shared_workspace_cleanup(conn, row["id"], path):
++                continue
++            ws.release_lsp_clients(str(path))
++            shutil.rmtree(path, ignore_errors=True)
++            if not path.exists():
++                ws._log_scratch_removal(conn, row["id"], path, "scratch workspace (GC retry)")
++                removed += 1
++    return removed
++
++
+ def gc_task_worktrees(conn: sqlite3.Connection, *, older_than_days: int = 7,
+                      repo_root: str | None = None) -> int:
+     """Reap terminal rows only, retaining active children and cross-board sharers.
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc.py b/tests/hermes_cli/test_kanban_scratch_gc.py
+new file mode 100644
+index 00000000000..70df2e9f85d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_gc.py
+@@ -0,0 +1,145 @@
++"""GC retries deferred terminal scratch cleanup without guessing ownership."""
++import argparse
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_ops
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    return tmp_path
++
++
++def _workspace(status="done"):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="deferred scratch")
++        path = kb.workspaces_root() / tid
++        path.mkdir(parents=True)
++        (path / "artifact.txt").write_text("scratch")
++        with kb.write_txn(conn):
++            conn.execute(
++                "UPDATE tasks SET status=?, workspace_kind='scratch', workspace_path=? WHERE id=?",
++                (status, str(path), tid),
++            )
++    return tid, path
++
++
++def _gc():
++    return kanban_ops._cmd_gc(argparse.Namespace(
++        event_retention_days=0, log_retention_days=0, worktree_retention_days=0,
++    ))
++
++
++@pytest.mark.parametrize("status", ["done", "archived", "failed", "cancelled"])
++def test_gc_retries_terminal_scratch(board, status):
++    _, path = _workspace(status)
++    assert _gc() == 0
++    assert not path.exists()
++
++
++@pytest.mark.parametrize("status", ["ready", "running", "blocked", "review", "scheduled"])
++def test_gc_keeps_nonterminal_and_unknown_scratch(board, status):
++    _, path = _workspace(status)
++    unknown = kb.workspaces_root() / "t_unknown"
++    unknown.mkdir()
++    assert _gc() == 0
++    assert path.exists()
++    assert unknown.exists()
++
++
++@pytest.mark.parametrize("metadata", ["dotgit", "bare", "symlink"])
++def test_gc_preserves_uncertain_scratch(board, metadata):
++    _, path = _workspace("archived")
++    nested = path / "nested"
++    nested.mkdir()
++    if metadata == "dotgit":
++        (nested / ".git").write_text("gitdir: elsewhere")
++    elif metadata == "bare":
++        for name in ("HEAD", "objects", "refs"):
++            (nested / name).mkdir()
++    else:
++        (nested / "link").symlink_to(path / "artifact.txt")
++    assert _gc() == 0
++    assert (path / "artifact.txt").exists()
++
++
++def test_gc_retries_after_cross_board_sharer_finishes(board):
++    _, path = _workspace()
++    kb.create_board("other")
++    with kbc.connect_closing(board="other") as conn:
++        sharer = kb.create_task(conn, title="live sharer")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(path), sharer))
++    assert _gc() == 0
++    assert path.exists()
++    with kbc.connect_closing(board="other") as conn, kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (sharer,))
++    assert _gc() == 0
++    assert not path.exists()
++
++
++def test_gc_preserves_parent_with_active_child(board):
++    tid, path = _workspace()
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="needs artifacts", parents=[tid])
++    assert _gc() == 0
++    assert path.exists()
++
++
++def test_gc_reads_all_boards_before_removing_any_scratch(board, monkeypatch):
++    from hermes_cli import kanban_db_workspace as ws
++
++    scanned = []
++    monkeypatch.setattr(ws, "_scratch_tree_removable", lambda path: scanned.append(path) or True)
++    _, first = _workspace()
++    _, second = _workspace("archived")
++    kb.create_board("broken")
++    broken = kb.kanban_home() / "kanban" / "boards" / "broken" / "kanban.db"
++    broken.write_bytes(b"not sqlite")
++    assert _gc() == 0
++    assert first.exists()
++    assert second.exists()
++    assert scanned == []
++
++
++def test_gc_keeps_scratch_when_board_discovery_fails(board, monkeypatch):
++    from hermes_cli import kanban_db_workspace as ws
++
++    _, path = _workspace()
++
++    def unreadable(_conn):
++        raise PermissionError("cannot enumerate boards")
++
++    monkeypatch.setattr(ws, "_sibling_board_db_files", unreadable)
++    assert _gc() == 0
++    assert path.exists()
++
++
++@pytest.mark.parametrize("entry", ["gc", "completion"])
++@pytest.mark.parametrize("relation", ["descendant", "ancestor", "sibling"])
++def test_cleanup_protects_overlapping_live_workspaces(board, entry, relation):
++    from hermes_cli import kanban_db_workspace as ws
++
++    tid, path = _workspace()
++    live_path = {"descendant": path / "nested", "ancestor": path.parent,
++                 "sibling": path.with_name(path.name + "-other")}[relation]
++    live_path.mkdir(parents=True, exist_ok=True)
++    with kbc.connect_closing() as conn:
++        live = kb.create_task(conn, title="live overlapping directory")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
++                         (str(live_path), live))
++        if entry == "completion":
++            ws._cleanup_workspace(conn, tid)
++    if entry == "gc":
++        assert _gc() == 0
++    assert path.exists() is (relation != "sibling")
++    assert live_path.exists()
+-- 
+2.55.0
+

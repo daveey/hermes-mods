@@ -1,0 +1,202 @@
+From b54002e7047105f739031fa20e75d1e8c4ebb16e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:17:43 -0700
+Subject: [PATCH] fix(tui): an idle prompt.submit refused only by the
+ core-update hold is queued, not bounced with 5035 [daveey]
+
+The hermes-sync drainer now holds update admission for a bounded drain window
+while in-flight turns finish (t_01a181e61e88e5d4). Desktop has no 5035 handling,
+so a send to an idle chat during that window surfaced as an error. The message
+now joins the durable queue (persisted at accept, like a mid-turn send) and the
+existing admission retry runs it when the hold lifts. A retiring backend and a
+rewind keep their 5035.
+---
+ .../test_update_hold_submit_queue.py          | 114 ++++++++++++++++++
+ tui_gateway/methods_prompt.py                 |   5 +
+ tui_gateway/session_auto_continue.py          |  33 +++++
+ 3 files changed, 152 insertions(+)
+ create mode 100644 tests/tui_gateway/test_update_hold_submit_queue.py
+
+diff --git a/tests/tui_gateway/test_update_hold_submit_queue.py b/tests/tui_gateway/test_update_hold_submit_queue.py
+new file mode 100644
+index 0000000000..e1ce53494e
+--- /dev/null
++++ b/tests/tui_gateway/test_update_hold_submit_queue.py
+@@ -0,0 +1,114 @@
++"""An idle prompt.submit refused only by the core-update admission hold is queued, never bounced.
++
++The update drainer holds admission for a bounded drain window while in-flight turns finish (hermes-sync
++``drain_window``, t_01a181e61e88e5d4). Desktop has no handling for 5035, so a refusal there showed the
++user an error for the message they had just sent. The message now joins the durable queue (persisted at
++accept) and the admission retry runs it once the hold lifts. A retiring backend keeps its 5035.
++"""
++import threading
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af, backend_retirement
++from tui_gateway import admission_retry, server
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture
++def held(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    timers = []
++
++    class Timer:
++        def __init__(self, delay, target):
++            self.target = target
++            self.daemon = True
++
++        def start(self):
++            timers.append(self)
++
++    monkeypatch.setattr(admission_retry.threading, "Timer", Timer)
++    persisted = []
++    monkeypatch.setattr(server, "_persist_queued_user_row",
++                        lambda session, envelope, kind: persisted.append((envelope["text"], kind)))
++    dispatched = []
++
++    def dispatch(rid, sid, record, envelope, generation):
++        dispatched.append(envelope["text"])
++        record["running"] = False
++        server._clear_inflight_turn(record)
++        return True
++
++    monkeypatch.setattr(server, "_dispatch_claimed_queue", dispatch)
++    session = {
++        "agent": types.SimpleNamespace(valid_tool_names=set()),
++        "session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++        "history_version": 0, "running": False, "transport": None, "attached_images": [],
++        "profile_home": str(tmp_path),
++    }
++    server._sessions["sid"] = session
++    af.set_hold(tmp_path)
++    yield types.SimpleNamespace(home=tmp_path, fence=fence, timers=timers, persisted=persisted,
++                                dispatched=dispatched, session=session)
++    server._sessions.pop("sid", None)
++    af.clear_hold(tmp_path)
++
++
++def _submit(**params):
++    return server._methods["prompt.submit"]("r1", {"session_id": "sid", "text": "hello there", **params})
++
++
++def test_idle_submit_under_the_update_hold_is_queued_and_runs_after_it(held):
++    resp = _submit()
++    assert "error" not in resp, resp
++    assert resp["result"]["status"] == "queued"
++    assert held.session["queued_prompt"]["text"] == "hello there"
++    assert held.session["running"] is False
++    assert held.persisted == [("hello there", None)], "durable at accept: an update restart cannot lose it"
++    assert len(held.timers) == 1
++    assert af.state(held.home)["reservations"] == 0, "queued, not admitted"
++    # Still held: the retry re-arms without dispatching.
++    held.timers.pop().target()
++    assert not held.dispatched and len(held.timers) == 1
++    af.clear_hold(held.home)
++    held.timers.pop().target()
++    assert held.dispatched == ["hello there"]
++    assert not held.session.get("queued_prompt")
++
++
++def test_second_send_under_the_hold_merges_into_the_same_queue(held):
++    _submit()
++    resp = _submit(text="and another")
++    assert resp["result"]["status"] == "queued"
++    assert held.session["queued_prompt"]["text"] == "hello there\n\nand another"
++    assert len(held.timers) == 1, "one retry timer per session"
++
++
++def test_retiring_backend_keeps_its_5035(held):
++    token = held.fence.prepare()["token"]
++    try:
++        resp = _submit()
++    finally:
++        held.fence.cancel(token)
++    assert resp["error"]["code"] == 5035
++    assert not held.session.get("queued_prompt")
++    assert not held.timers
++
++
++def test_a_rewind_under_the_hold_is_refused_not_queued(held):
++    resp = _submit(truncate_before_user_ordinal=0, confirm_truncate=True)
++    assert resp["error"]["code"] == 5035
++    assert not held.session.get("queued_prompt")
++
++
++def test_without_a_hold_the_submit_is_admitted_normally(held, monkeypatch):
++    af.clear_hold(held.home)
++    ran = []
++    monkeypatch.setattr(server, "_dispatch_admitted_prompt", lambda rid, *a: ran.append(a) or server._ok(rid, {"status": "streaming"}))
++    resp = _submit()
++    assert resp["result"]["status"] == "streaming"
++    assert ran and not held.session.get("queued_prompt")
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 991410c1ec..3c12787d46 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -852,6 +852,11 @@ def _(rid, params: dict) -> dict:
+                 break
+             if (err.get("error", {}).get("data") or {}).get("reason") == "turn_claim_busy":
+                 continue
++            if (err.get("error", {}).get("code") == 5035 and not has_truncation and not internal_hosted_submit
++                    and (held := _queue_submit_behind_update_hold(
++                        rid, sid, session, text, busy_transport, turn_author=turn_author,
++                        display_kind=display_kind)) is not None):
++                return held
+             return err
+         if internal_hosted_submit:
+             return _err(rid, 4091, "hosted room member session is busy")
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 311938cecc..d8dd035649 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -461,6 +461,39 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
+     return _ok(rid, {"status": "queued"})
+ 
+ 
++def _queue_submit_behind_update_hold(rid, sid: str, session: dict, text: Any, transport: Any,
++                                     turn_author: dict | None = None, display_kind: str | None = None) -> dict | None:
++    """An idle ``prompt.submit`` refused ONLY by the core-update admission hold is queued, not bounced.
++
++    The update drainer holds admission for a bounded drain window while the turns in flight finish
++    (hermes-sync ``drain_window``, t_01a181e61e88e5d4). Desktop has no 5035 handling, so a refusal there
++    showed the user an error for a message they had just sent. Instead the message joins the durable
++    queue exactly like a mid-turn send (persisted at accept, so a backend restart for the update cannot
++    lose it), and ``retry_queued_prompt`` re-enters admission until the hold lifts. Returns the
++    ``{"status": "queued"}`` reply, or None when the refusal was not the hold (a retiring backend keeps its
++    5035: the client is replacing this process) or the session is no longer idle (caller retries)."""
++    from hermes_cli.backend_retirement import retirement
++    if not retirement.acquire():
++        return None
++    retirement.release()
++    from tui_gateway.admission_retry import retry_queued_prompt
++    with session["history_lock"]:
++        if session.get("running") or session.get("_closing") or session.get("_finalized"):
++            return None
++        image_paths = list(session.get("attached_images", []))
++        if image_paths:
++            session["attached_images"] = []
++        envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
++        if envelope is not None:
++            _persist_queued_user_row(session, envelope, display_kind)
++        session["last_active"] = time.time()
++        if not retry_queued_prompt(rid, sid, session) and session.get("queued_prompt"):
++            # Retirement raced in between: the queue is the client's to replay; keep the 5035.
++            logger.info("update-hold queue for session %s: retry unavailable, kept queued", sid)
++    logger.info("prompt.submit for session %s queued behind the core-update admission hold", sid)
++    return _ok(rid, {"status": "queued", "reason": "update_hold"})
++
++
+ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+     """Fire a queued next-turn prompt if one is waiting and the session is idle. True when dispatched: the caller
+     skips lower-priority follow-ups this cycle (the user's message wins)."""
+-- 
+2.55.0
+

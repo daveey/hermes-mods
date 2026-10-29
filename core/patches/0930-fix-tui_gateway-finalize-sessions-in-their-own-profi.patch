@@ -1,0 +1,244 @@
+From b9459ef5d01620b981d8b48b3edd0a0b08be8a9d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:30:35 -0700
+Subject: [PATCH] fix(tui_gateway): finalize sessions in their own profile
+ scope [daveey] (#182)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* fix(tui_gateway): finalize a session in its own profile scope [daveey]
+
+A multiplexed reaper has an empty context. on_session_end already ran
+inside the session scope, but on_session_finalize ran after it closed,
+so the first teardown of a secondary profile discovered and fired the
+launch profile's plugins — a second full manifest scan. The per-home
+manager cache then makes the next finalize of that profile free.
+
+* fix(hermes_state): reuse a clean Linux deleted-WAL fd scan [daveey]
+
+Every state.db writer open walked every process fd. Darwin already
+caches a clean verdict for 30s, invalidated by directory mtime or
+sidecar identity. Linux now does the same. Positive verdicts are not
+cached, and a sidecar retired during the walk is not published as clean.
+
+* fix(tui resume): read unanswered-turn tail before handing the profile db to the hydration worker; deflakes deferred-resume db ownership test
+---
+ hermes_state_dbfile.py                        | 27 +++++++++
+ .../test_deleted_wal_generation_guard.py      | 52 ++++++++++++++++
+ .../test_finalize_plugin_discovery.py         | 59 +++++++++++++++++++
+ tui_gateway/session_lifecycle.py              | 14 +++--
+ 4 files changed, 147 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tui_gateway/test_finalize_plugin_discovery.py
+
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index d2a5ad6ca5..ea26337c44 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -520,6 +520,18 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
+     return scan.verdicts[base]
+ 
+ 
++# Same contract as the Darwin clean-verdict cache, for the Linux /proc walk.
++# Positive verdicts are never stored. ``_darwin_clean_key`` is the invalidation
++# (directory mtime + sidecar identity): a WAL write touches neither.
++_LINUX_FD_CLEAN_TTL_SECONDS = 30.0
++_linux_clean_until: dict[str, tuple[float, tuple]] = {}
++
++
++def _linux_clean_cached(base: str, key: tuple) -> bool:
++    cached = _linux_clean_until.get(base)
++    return cached is not None and cached[0] > time.monotonic() and cached[1] == key
++
++
+ def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
+     """Return processes holding an unlinked ``state.db-wal`` / ``-shm`` sidecar for *db_path*.
+ 
+@@ -530,6 +542,12 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
+     that path holds.  Windows returns ``[]`` -- it cannot unlink a held sidecar, so no retired
+     generation can exist; any other platform returns ``[]`` as before.
+ 
++    A clean verdict is reused for ``_LINUX_FD_CLEAN_TTL_SECONDS`` (same contract as the Darwin
++    cache): every writer open used to walk every fd of every process, which scales with the
++    host's process count. Positive verdicts are never cached. The cache key is taken before
++    the walk; a directory mtime or sidecar-identity change (unlink, replace — not a WAL write)
++    misses it.
++
+     Includes this process: on the open/write refuse path the in-process writer holding the orphan
+     inode must not mint a replacement WAL (``_foreign_state_db_holders`` skips this PID)."""
+     if sys.platform == "win32":
+@@ -539,12 +557,21 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
+         if sys.platform == "darwin":
+             holders = _iter_darwin_sidecar_holders(db_path)
+         elif sys.platform.startswith("linux"):
++            base = os.path.realpath(os.path.abspath(os.fspath(db_path)))
++            key = _darwin_clean_key(base)
++            if _linux_clean_cached(base, key):
++                return []
+             watched = _watched_sqlite_sidecar_paths(db_path)
+             for pid, target, fd_path in _iter_proc_fd_targets():
+                 canonical = canonical_sqlite_path(target)
+                 if (" (deleted)" in target and canonical in watched
+                         and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                     holders.append((pid, target))
++            # Key taken before the walk: a sidecar retired during it must not be published
++            # as clean under the new key. A positive verdict is never cached.
++            if not holders and _darwin_clean_key(base) == key:
++                _linux_clean_until[base] = (
++                    time.monotonic() + _LINUX_FD_CLEAN_TTL_SECONDS, key)
+     except Exception as exc:
+         logger.debug("deleted-WAL holder scan failed for %s: %s", db_path, exc)
+     return holders
+diff --git a/tests/hermes_state/test_deleted_wal_generation_guard.py b/tests/hermes_state/test_deleted_wal_generation_guard.py
+index 1bf68c79f8..a96782f407 100644
+--- a/tests/hermes_state/test_deleted_wal_generation_guard.py
++++ b/tests/hermes_state/test_deleted_wal_generation_guard.py
+@@ -688,3 +688,55 @@ def test_darwin_clean_verdict_is_dropped_once_a_sidecar_is_unlinked(tmp_path, fa
+     wal.unlink()
+     assert hermes_state_dbfile._iter_darwin_sidecar_holders(path) == []
+     assert fake_darwin_scan["calls"] == 2, "an unlinked sidecar must force a fresh pass"
++
++
++def test_linux_clean_holder_scan_is_reused_until_a_sidecar_changes(tmp_path, monkeypatch):
++    """A clean Linux /proc walk is not repeated on the next writer open.
++
++    Darwin already caches a clean verdict, invalidated by directory mtime or
++    sidecar identity. Linux used to walk every process fd on every open
++    (~0.4s on a busy host, scaling with process count). A WAL write keeps the
++    cache; unlinking a sidecar drops it.
++    """
++    monkeypatch.setattr(hermes_state_dbfile.sys, "platform", "linux")
++    monkeypatch.setattr(hermes_state_dbfile, "_linux_clean_until", {}, raising=False)
++    path = tmp_path / "state.db"
++    path.write_bytes(b"")
++    wal = Path(str(path) + "-wal")
++    wal.write_bytes(b"generation 1")
++    calls = {"n": 0}
++
++    def scan():
++        calls["n"] += 1
++        yield from ()
++
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_proc_fd_targets", scan)
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 1, "an unchanged directory reuses the clean verdict"
++    with wal.open("ab") as handle:
++        handle.write(b" more frames")  # a WAL write keeps the cache
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 1, "a WAL write must not drop the clean verdict"
++    wal.unlink()
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 2, "an unlinked sidecar must force a fresh pass"
++
++
++def test_linux_positive_holder_scan_is_not_cached(tmp_path, monkeypatch):
++    """A process holding a deleted sidecar is re-checked on the next open."""
++    monkeypatch.setattr(hermes_state_dbfile.sys, "platform", "linux")
++    monkeypatch.setattr(hermes_state_dbfile, "_linux_clean_until", {}, raising=False)
++    path = tmp_path / "state.db"
++    path.write_bytes(b"")
++    calls = {"n": 0}
++
++    def scan():
++        calls["n"] += 1
++        yield (os.getpid(), str(path) + "-wal (deleted)", "/dev/null")
++
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_proc_fd_targets", scan)
++    monkeypatch.setattr(hermes_state_dbfile, "_fd_is_truly_unlinked", lambda *_a, **_k: True)
++    assert iter_deleted_sqlite_sidecar_holders(path)
++    assert iter_deleted_sqlite_sidecar_holders(path)
++    assert calls["n"] == 2, "a positive verdict must not be reused"
+diff --git a/tests/tui_gateway/test_finalize_plugin_discovery.py b/tests/tui_gateway/test_finalize_plugin_discovery.py
+new file mode 100644
+index 0000000000..b23ba7d513
+--- /dev/null
++++ b/tests/tui_gateway/test_finalize_plugin_discovery.py
+@@ -0,0 +1,59 @@
++"""Session teardown must not rediscover plugins for a profile it already loaded.
++
++``PluginManager`` is already cached per resolved home, and ``discover_and_load``
++is a no-op once that manager has run. A multiplexed reaper still paid for two
++full scans on the first teardown of a secondary profile: ``on_session_end``
++ran inside the session scope, then ``on_session_finalize`` ran after the scope
++closed and discovered the launch profile. Two consecutive finalizations of one
++profile must therefore enter ``discover_and_load`` at most once, and only for
++that profile.
++"""
++
++import threading
++from unittest.mock import MagicMock
++
++from hermes_constants import hermes_home_key
++from hermes_cli.plugins import PluginManager, _reset_plugin_managers_for_tests
++
++
++def _session(profile_home: str, session_id: str) -> dict:
++    agent = MagicMock()
++    agent.session_id = session_id
++    agent.model = "test-model"
++    agent.platform = "tui"
++    agent._session_messages = None
++    return {
++        "agent": agent,
++        "history": [{"role": "user", "content": "x"}],
++        "history_lock": threading.Lock(),
++        "session_key": session_id,
++        "profile_home": profile_home,
++        "source": "tui",
++    }
++
++
++def test_two_finalizations_discover_each_profile_at_most_once(tmp_path, monkeypatch):
++    """The inner scan runs at most once for the session profile, never for the launch home."""
++    from tui_gateway import server
++
++    profile = tmp_path / "profile-b"
++    profile.mkdir()
++    (profile / ".env").write_text("", encoding="utf-8")
++    calls: list[str] = []
++    real_discover = PluginManager.discover_and_load
++
++    def _record_discover(self, force=False):
++        calls.append(hermes_home_key(self.home_path))
++        return real_discover(self, force=force)
++
++    _reset_plugin_managers_for_tests()
++    monkeypatch.setattr(PluginManager, "discover_and_load", _record_discover)
++    # The guard under test is the per-manager ``_discovered`` flag, not YAML parsing.
++    monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self: None)
++    try:
++        server._finalize_session(_session(str(profile), "sess-1"))
++        server._finalize_session(_session(str(profile), "sess-2"))
++    finally:
++        _reset_plugin_managers_for_tests()
++
++    assert calls == [hermes_home_key(profile)], calls
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 44e9e8baf9..1864cd5952 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -430,11 +430,15 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
+         if agent is not None and history and hasattr(agent, "commit_memory_session"):
+             with contextlib.suppress(Exception):
+                 agent.commit_memory_session(history)
+-
+-    session_key = session.get("session_key")
+-    session_id = getattr(agent, "session_id", None) or session_key
+-    # Returned to the client by ``session.close`` (the TUI shows them after its /new reset); reaper paths have no client.
+-    session["_end_msgs"] = _notify_session_boundary("on_session_finalize", session_id, _session_source(session)) or []
++        # ``on_session_finalize`` resolves profile state at call time — plugin hooks and Relay's
++        # ``current_profile_key`` — so it has to run in this same scope. The gateway binds the
++        # owning profile for that reason (``_finalize_session_off_loop``). Outside it, a reaper
++        # with an empty context discovers and fires the LAUNCH profile's plugins for a secondary
++        # session: a second full manifest scan on the first teardown of that profile.
++        session_key = session.get("session_key")
++        session_id = getattr(agent, "session_id", None) or session_key
++        # Returned to the client by ``session.close`` (the TUI shows them after its /new reset); reaper paths have no client.
++        session["_end_msgs"] = _notify_session_boundary("on_session_finalize", session_id, _session_source(session)) or []
+     # End the state.db row so it doesn't linger as a ghost in /resume. Use session_id (agent.session_id), not
+     # session_key: after compression the key may be the stale ended parent while session_id is the live continuation.
+     # Fix for #20001.
+-- 
+2.55.0
+

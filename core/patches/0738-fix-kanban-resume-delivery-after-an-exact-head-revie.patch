@@ -1,0 +1,282 @@
+From e6324b7636a8c93b5ac60f5fd9ebccc72fc2bdde Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:10:51 +0000
+Subject: [PATCH] fix(kanban): resume delivery after an exact-head review
+ approval [daveey]
+
+active_pr held a parked owner after the review parent completed APPROVE
+with a full head SHA, because resumes_review only accepted
+changes_required plus reviewed_sha plus pr. A later comment repeating
+the checkpointed PR is not a new publication. One continuation; the
+next claim still consumes it. An unrelated PR, a new PR, a short head,
+an incomplete review and a crash/reclaim stay held. This is not a
+delivery completion and not a CI bypass.
+
+Problem: t_01a1820bcf616efe stayed ready with no unsatisfied parents and
+respawn_guarded active_pr after review run 3561 (verdict APPROVE, head
+0d0f9d77a5e5bbb455499b0f4b69bf20201c24c7, no pr).
+Why 1: no accepted handoff event after the PR comment; resumes_review false.
+Why 2: _reviewed_pr requires changes_required + reviewed_sha + pr.
+Why 3: the continuation was repair-only; the production handoff stores head.
+Why 4: tests asserted any approved verdict stays held.
+Root: exact-head approval was not a recognized delivery handoff.
+Not caught: no sequence test for APPROVE+head plus a later same-PR comment.
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  5 +-
+ hermes_cli/kanban_dependency_review.py        | 75 +++++++++++++++++--
+ .../test_kanban_dependency_review.py          | 55 +++++++++++++-
+ website/docs/user-guide/features/kanban.md    | 19 +++--
+ 4 files changed, 135 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index f91e73cc05..8170c4796e 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -171,7 +171,10 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     an ``unblocked`` event: a worker that opened its PR and blocked itself waiting for the
+     merge is resumed by that unblock to ship/verify THAT PR. So does an orderly park AFTER the
+     PR comment (``continued`` checkpoint or ``scheduled`` timed wait): the owner parked knowing
+-    its PR, and the wake resumes it from that checkpoint, not a context-free respawn. A
++    its PR, and the wake resumes it from that checkpoint, not a context-free respawn. So does
++    a completed exact-head review of the checkpointed PRs (repair metadata, or an approval
++    whose full head is ``head``/``reviewed_sha``): a later comment that repeats those PRs
++    does not invalidate it. A
+     crash/reclaim is not a handoff, so the worker that opened the PR is still not re-spawned
+     against it. A latest immediate checkpoint also permits a same-second PR report;
+     scheduled checkpoints do not get that same-second exception. Dispatcher guard
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 31335e7b2c..ae4da2e318 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -1,8 +1,12 @@
+ """Run-owned dependency review checkpoints for resuming an existing PR.
+ 
+ Neither a promotion nor comment prose is permission to retry an implementation.
+-Only an authenticated park can capture the PRs and dependency edges being awaited;
+-a completed independent review must subsequently request repair of those same PRs.
++Only an authenticated park can capture the PRs and dependency edges being awaited.
++A completed review then authorizes one continuation of those same PRs: a repair
++when it records ``changes_required`` with ``reviewed_sha``, or a landing
++continuation when it records an exact-head approval. The next claim consumes it.
++A later comment that repeats a captured PR does not re-arm the hold; a new PR,
++a review naming a different PR, or a crash/reclaim does.
+ """
+ from __future__ import annotations
+ 
+@@ -10,6 +14,7 @@ import re
+ 
+ 
+ _SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
++_APPROVALS = frozenset({"approve", "approved"})
+ 
+ 
+ def checkpoint(conn, task_id, expected_run_id):
+@@ -56,8 +61,8 @@ def apply_block_update(conn, task_id, expected_run_id, kind, new_status, set_sql
+     return conn.execute(sql, params).rowcount == 1
+ 
+ 
+-def _reviewed_pr(conn, parent_id, parked_at, owner_run_id):
+-    """Structured evidence from the latest completed run, never a board comment."""
++def _completed_review_run(conn, parent_id, parked_at, owner_run_id):
++    """Latest claimed completion of this parent, or None. Never a board comment."""
+     from hermes_cli import kanban_db as kb
+ 
+     row = conn.execute(
+@@ -71,13 +76,58 @@ def _reviewed_pr(conn, parent_id, parked_at, owner_run_id):
+             or row["id"] == owner_run_id
+             or (kb._to_epoch(row["ended_at"]) or 0) < parked_at):
+         return None
++    return row
++
++
++def _named_pr(data) -> str | None:
++    pr = data.get("pr")
++    if isinstance(pr, str) and pr.strip():
++        return pr.strip().rstrip("/").lower()
++    return None
++
++
++def _exact_head(data) -> bool:
++    return any(
++        isinstance(data.get(key), str) and _SHA.fullmatch(data.get(key))
++        for key in ("reviewed_sha", "head")
++    )
++
++
++def _reviewed_pr(conn, parent_id, parked_at, owner_run_id):
++    """Repair evidence: changes_required plus reviewed_sha and the PR URL."""
++    from hermes_cli import kanban_db as kb
++
++    row = _completed_review_run(conn, parent_id, parked_at, owner_run_id)
++    if row is None:
++        return None
+     data = kb._json_dict(row["metadata"])
+     sha = data.get("reviewed_sha")
+-    pr = data.get("pr")
++    pr = _named_pr(data)
+     if (data.get("verdict") != "changes_required" or not isinstance(sha, str)
+-            or not _SHA.fullmatch(sha) or not isinstance(pr, str)):
++            or not _SHA.fullmatch(sha) or pr is None):
+         return None
+-    return pr.rstrip("/").lower()
++    return pr
++
++
++def _approval_prs(conn, parent_id, parked_at, owner_run_id, captured: set[str]) -> set[str]:
++    """PRs an exact-head approval authorizes, or empty.
++
++    A named ``pr`` is the only PR that approval covers. With no ``pr``, the
++    authenticated checkpoint is the binding: the review did not name a
++    different head. A short ``head`` is not exact.
++    """
++    from hermes_cli import kanban_db as kb
++
++    row = _completed_review_run(conn, parent_id, parked_at, owner_run_id)
++    if row is None:
++        return set()
++    data = kb._json_dict(row["metadata"])
++    verdict = data.get("verdict")
++    verdict_norm = verdict.strip().lower() if isinstance(verdict, str) else ""
++    if verdict_norm not in _APPROVALS or not _exact_head(data):
++        return set()
++    named = _named_pr(data)
++    return {named} if named is not None else set(captured)
+ 
+ 
+ def resumes_review(conn, task_id, pr_urls):
+@@ -112,4 +162,13 @@ def resumes_review(conn, task_id, pr_urls):
+     if parked_at is None:
+         return False
+     reviewed = {_reviewed_pr(conn, p, parked_at, row["id"]) for p in parents}
+-    return urls.issubset(reviewed)
++    if urls.issubset(reviewed):
++        return True
++    captured_set = {u.rstrip("/").lower() for u in captured}
++    # Every parent must authorize. One exact-head approval does not cover a
++    # sibling that never reviewed, and a named unrelated PR does not cover
++    # the checkpoint set.
++    return all(
++        urls.issubset(_approval_prs(conn, p, parked_at, row["id"], captured_set))
++        for p in parents
++    )
+diff --git a/tests/hermes_cli/test_kanban_dependency_review.py b/tests/hermes_cli/test_kanban_dependency_review.py
+index 310a32bcd9..8a5798952a 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review.py
++++ b/tests/hermes_cli/test_kanban_dependency_review.py
+@@ -31,12 +31,16 @@ def parked(conn, *, authenticated=True):
+     return task, reviews
+ 
+ 
+-def finish_reviews(conn, reviews, *, verdict="changes_required", pr=PR):
++HEAD = "0d0f9d77a5e5bbb455499b0f4b69bf20201c24c7"
++
++
++def finish_reviews(conn, reviews, *, verdict="changes_required", pr=PR, metadata=None):
+     for review in reviews:
+         kb.claim_task(conn, review)
+         run = kb.get_task(conn, review).current_run_id
++        body = {"verdict": verdict, "pr": pr, "reviewed_sha": "a" * 40} if metadata is None else metadata
+         assert kb.complete_task(conn, review, summary="Review complete", expected_run_id=run,
+-                                metadata={"verdict": verdict, "pr": pr, "reviewed_sha": "a" * 40})
++                                metadata=body)
+     kb.recompute_ready(conn)
+ 
+ 
+@@ -61,9 +65,12 @@ def test_completed_reviews_resume_same_pr_despite_later_comments(board):
+ @pytest.mark.parametrize("mode", ["unowned", "unrelated", "approved", "new_pr", "noop_assign", "pending"])
+ def test_dependency_and_comments_do_not_grant_generic_retry(board, mode):
+     task, reviews = parked(board, authenticated=mode != "unowned")
+-    if mode != "pending":
++    if mode in {"approved", "noop_assign"}:
++        # Approval without a full head is not an exact-head handoff.
++        finish_reviews(board, reviews, metadata={"verdict": "approved", "pr": PR, "head": "0d0f9d77"})
++    elif mode != "pending":
+         finish_reviews(board, reviews,
+-                       verdict="approved" if mode in {"approved", "noop_assign"} else "changes_required",
++                       verdict="changes_required",
+                        pr=PR + "1" if mode == "unrelated" else PR)
+     if mode == "new_pr":
+         kb.add_comment(board, task, "dev", PR + "1")
+@@ -71,3 +78,43 @@ def test_dependency_and_comments_do_not_grant_generic_retry(board, mode):
+         kb.assign_task(board, task, "dev")
+     kb.add_comment(board, task, "reviewer", "changes_required " + PR)
+     assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("metadata", [
++    {"verdict": "APPROVE", "head": HEAD},
++    {"verdict": "approved", "reviewed_sha": HEAD, "pr": PR},
++])
++def test_exact_head_approval_releases_once_despite_later_same_pr_comment(board, metadata):
++    """Production sequence: checkpoint records the PR, review completes at an
++    exact head, then a reviewer comment repeats that PR. Held before, released
++    after, and a crash/reclaim does not get a second continuation."""
++    task, reviews = parked(board)
++    kb.add_comment(board, task, "reviewer", "Reviewing " + PR)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    task_row = kb.get_task(board, task)
++    assert task_row is not None and task_row.status != "done"
++    finish_reviews(board, reviews, metadata=metadata)
++    kb.add_comment(board, task, "reviewer", "APPROVE at exact head " + HEAD + " " + PR)
++    task_row = kb.get_task(board, task)
++    assert task_row is not None and task_row.status == "ready"
++    assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    assert kb.reclaim_task(board, task, reason="Worker died", signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_exact_head_approval_of_unrelated_pr_stays_held(board):
++    task, reviews = parked(board)
++    finish_reviews(board, reviews, metadata={
++        "verdict": "APPROVE", "head": HEAD, "pr": PR + "1",
++    })
++    kb.add_comment(board, task, "reviewer", "Approved a different head " + PR)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_new_pr_after_exact_head_approval_stays_held(board):
++    task, reviews = parked(board)
++    finish_reviews(board, reviews, metadata={"verdict": "APPROVE", "head": HEAD})
++    kb.add_comment(board, task, "reviewer", "Opened a new head " + PR + "9")
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 00635d12c2..d76fb9aa5d 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1230,18 +1230,25 @@ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run`
+ An owning worker can link independent review cards as parents with `kanban_link`,
+ then call `kanban_block(kind="dependency")`. If its comments already identify the
+ PR, the authenticated park captures the current run, parent IDs, and PR URLs.
+-After all parents finish, the `active_pr` guard permits one continuation to repair
+-those same PRs when each guarded PR has a completed review with structured metadata:
++After all parents finish, the `active_pr` guard permits one continuation of
++those same PRs. A repair requires each review's latest claimed completed run
++to carry:
+ 
+ ```json
+ {"verdict": "changes_required", "pr": "https://github.com/owner/repo/pull/123", "reviewed_sha": "0123456789abcdef0123456789abcdef01234567"}
+ ```
+ 
++An exact-head approval is the landing continuation, not a second implementation
++and not merge or CI approval. The run metadata must use `approve` / `approved`
++/ `APPROVE` and a full 40-character `head` or `reviewed_sha`. If it names `pr`,
++that URL is the only one authorized; if it does not, the checkpoint's captured
++URLs are the binding. A short head is not exact.
++
+ The evidence must come from the review card's latest, actually claimed completed
+-run, finishing at or after the park. This is routing evidence, not merge approval
+-or proof of current-head CI. Reviewer comments or guard notices repeating the same
+-PR after the park do not invalidate it. A new PR, changed parent set, unclaimed
+-completion, unrelated dependency, or malformed evidence does not authorize retry.
++run, finishing at or after the park. Reviewer comments or guard notices repeating the same
++PR after the park do not invalidate it. A new PR, a review that names a different
++PR, a changed parent set, an unclaimed completion, an unrelated dependency, a
++non-exact approval, or malformed evidence does not authorize retry.
+ The next implementation claim consumes the checkpoint: a subsequent crash/reclaim
+ stays guarded. Same-owner assignment remains a no-op for this guard.
+ 
+-- 
+2.55.0
+

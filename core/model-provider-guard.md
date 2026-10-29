@@ -1,6 +1,6 @@
 # Bare vendor model ids are refused on OpenRouter and Nous
 
-Patch **0682** (`f359ad12a3`).
+Patch **0691** (`f359ad12a3`).
 
 ## Behavior
 
@@ -11,7 +11,7 @@ After the client is built, a bare vendor model id (`claude-*`, `gpt-*`, and the 
 - `agent.model_provider_guard: false` turns the guard off.
 - API worker threads copy the caller's session id, so `Streaming failed before delivery` in `errors.log` is tagged `[<sid>]`. A thread with no session id stays untagged.
 
-The pin-without-provider route itself is 0653 ([kanban-pin-provider.md](kanban-pin-provider.md)). This guard covers every other route that can still land a bare vendor id on OpenRouter or Nous (auto config, fallback, cron, CLI).
+The pin-without-provider route itself is 0663 ([kanban-pin-provider.md](kanban-pin-provider.md)). This guard covers every other route that can still land a bare vendor id on OpenRouter or Nous (auto config, fallback, cron, CLI).
 
 ## How it works
 
@@ -43,7 +43,7 @@ Untested: a live OpenRouter or Nous HTTP call. The unit tests assert the guard r
 
 ## Applying
 
-`git am -3` 0682.
+`git am -3` 0691.
 
 ## Gotchas
 

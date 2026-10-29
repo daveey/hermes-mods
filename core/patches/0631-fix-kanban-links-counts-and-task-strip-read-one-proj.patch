@@ -1,0 +1,892 @@
+From abc3b16214e9b974b36ad5584012be5502716dde Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:49:48 +0000
+Subject: [PATCH] fix(kanban-links): counts and task strip read one projection
+ under links_reader=replica [daveey]
+
+Under kanban.sync.links_reader=replica the sidebar counts read the origin-ledger
+projection while session_tasks read the replica chat links, which dropped
+done-but-unverified cards (Upkeep: "Waiting on 14 cards" over 9 chips).
+
+- _remote_cards(None, ...) now feeds the counts too, so count and list come from
+  one reader in each mode; the replica files are in the counts fingerprint.
+- replica_cards: an unreleased link to a done/archived card, or to a card row the
+  replica lacks, is an unknown, unfinished obligation; only a released link drops
+  it. Only this origin profile's links (chat_profile) count. stale/synced_at come
+  from the replica's real last pull (new kanban_sync_state.pulled_at, stamped by
+  _pull_replica after a successful pull). An unreadable replica keeps its last
+  rows (per path, gateway and profile) as stale; on a cold start it falls back to
+  the ledger's rows for that board, stale. One row per (chat, card); the key
+  carries the owner profile this chat's ledger row names, else default.
+- annotate_kanban_activity counts a remote card shared by two sessions of one
+  lineage once (it summed per-session rows; the list shows one row per card).
+- links_diff compares unknown+unfinished obligations, never uses the ledger
+  fallback, and is not clean while a replica it needs is unreadable, so it can no
+  longer report clean while counts and list disagree.
+
+Tests: test_kanban_chat_links_parity.py asserts count == listed rows for 1 active
++ 12 todo, review/blocked, done-unverified, missing card row (remote and own
+gateway), old/never-pulled/fresh replica, unreadable replica warm, cold and per
+profile, same id on two gateways, one owner profile per card, two origin profiles,
+compression lineage (distinct and shared cards), verified release, another chat
+turning done, and links_diff on unknown rows and unreadable replicas; the
+pulled_at stamp test is in test_kanban_sync_client.py. The old replica test that
+asserted a done unreleased card is NOT listed encoded the bug; it now asserts the
+card is listed as unknown.
+---
+ hermes_cli/kanban_chat_links.py               | 231 +++++++++++---
+ hermes_cli/kanban_db_sync.py                  |  10 +
+ hermes_cli/kanban_session_activity.py         |  65 +++-
+ hermes_cli/kanban_sync_client.py              |   9 +-
+ tests/hermes_cli/test_kanban_chat_links.py    |   9 +-
+ .../test_kanban_chat_links_parity.py          | 292 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_sync_client.py   |  19 ++
+ 7 files changed, 574 insertions(+), 61 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_chat_links_parity.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index a6097e9ba4..ecc3c5b363 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -8,9 +8,11 @@ with one local query.
+   links into a board file: chats that created a card here (``tasks.session_id``), chats that shepherd a card here
+   (``tui`` subscriptions), and this gateway's chats' links to other gateways' cards from the origin-ledger
+   projection, with its released state. Links it no longer finds are marked released, never deleted.
+-- :func:`replica_cards` answers a chat lineage's cards on other gateways from the replicas; ``session_tasks`` uses
+-  it instead of the origin ledger when ``kanban.sync.links_reader`` is ``replica``.
+-- :func:`links_diff` compares the two answers per chat; readers switch only once it is clean.
++- :func:`replica_cards` answers a chat lineage's cards on other gateways from the replicas; ``session_tasks`` AND the
++  sidebar counts use it instead of the origin ledger when ``kanban.sync.links_reader`` is ``replica``, so the
++  count and the task strip are one projection in each mode.
++- :func:`links_diff` compares the two answers per chat, ``unknown`` unfinished obligations included; readers
++  switch only once it is clean.
+ """
+ 
+ from __future__ import annotations
+@@ -107,81 +109,216 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     return {"added": added, "changed": changed, "released": released}
+ 
+ 
+-def replica_cards(session_ids: Iterable[str], gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES,
+-                  replicas: Optional[list[tuple[str, Path]]] = None) -> list[dict[str, Any]]:
+-    """This gateway's chats' (``session_ids``, one lineage) unreleased links to cards created on OTHER gateways,
+-    from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends."""
+-    ids = [s for s in dict.fromkeys(str(s) for s in session_ids if s)]
+-    if not ids:
++TERMINAL_STATUSES = ("done", "archived")
++UNKNOWN = "unknown"
++# Rows last read from each replica, so an unreadable replica keeps its rows (stale) instead of dropping them.
++_last_good: dict[tuple[str, str, str], tuple[list[dict[str, Any]], Optional[float]]] = {}
++
++
++def _reset_for_tests() -> None:
++    _last_good.clear()
++
++
++def _stale_after_s() -> float:
++    """A replica not pulled for this long is stale: the hub-sync window, or three sync periods if that is longer."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_session_activity import HUB_STALE_AFTER_S
++    try:
++        period = float(sync.sync_config().get("interval_seconds") or 0)
++    except (TypeError, ValueError):
++        period = 0.0
++    return max(HUB_STALE_AFTER_S, 3 * period)
++
++
++def _read_replica(path: Path, gateway: str, profile: str) -> tuple[list[dict[str, Any]], Optional[float]]:
++    """Every unreleased link of this gateway+profile's chats in one replica, with its card row (or none when the
++    card row is missing), and the replica's last successful pull. Raises ``sqlite3.Error`` when unreadable."""
++    from hermes_cli.kanban_session_activity import cached_ro  # lazy: that module imports this one
++    with cached_ro(path) as conn:
++        conn.row_factory = sqlite3.Row
++        rows = [dict(r) for r in conn.execute(
++            "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
++            "t.priority, t.block_kind, t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind "
++            "FROM task_chat_links l LEFT JOIN tasks t ON t.id = l.task_id "
++            "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
++            "AND (t.id IS NULL OR (t.created_on IS NOT NULL AND t.created_on != ?))",
++            (gateway, profile, gateway)).fetchall()]
++        try:
++            row = conn.execute("SELECT pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
++            pulled = float(row[0]) if row and row[0] is not None else None
++        except sqlite3.OperationalError:  # replica written before pulls were stamped
++            pulled = None
++    return rows, pulled
++
++
++def _ledger_owners() -> dict[tuple[str, str], list[tuple[str, str, str, bool]]]:
++    """``(board, id) -> [(owner gateway, owner profile, session, released)]`` from the origin-ledger projection. A
++    synced board is one file per gateway with one row per id, shared by that gateway's profiles, so the replica
++    row carries no owner profile: the ledger only labels it (``_owner_of``)."""
++    from hermes_cli.kanban_session_activity import _remote_links
++    try:
++        cards = _remote_links()
++    except Exception as exc:  # health: allow BLE001 -- the profile is a label; a failed ledger read must not hide cards
++        _log.info("kanban chat links: owner profiles unavailable (%s: %s)", type(exc).__name__, exc)
++        return {}
++    out: dict[tuple[str, str], list[tuple[str, str, str, bool]]] = {}
++    for c in cards:
++        if c.get("gateway") and c.get("board") and c.get("id") and c.get("profile"):
++            out.setdefault((str(c["board"]), str(c["id"])), []).append(
++                (str(c["gateway"]), str(c["profile"]), str(c.get("session") or ""), bool(c.get("released"))))
++    return out
++
++
++def _owner_of(known: list[tuple[str, str, str, bool]], owner: Optional[str],
++              session: str) -> tuple[Optional[str], str]:
++    """The ONE (owner gateway, owner profile) for a replica card: the profile this chat's own unreleased ledger row
++    names, else the only one any unreleased row names, else ``default`` (never several rows for one card)."""
++    if owner is not None:
++        known = [k for k in known if k[0] == owner]
++    for pick in ([k for k in known if k[2] == session and not k[3]], [k for k in known if not k[3]]):
++        pairs = sorted({(k[0], k[1]) for k in pick})
++        if len(pairs) == 1:
++            return pairs[0]
++    gateways = sorted({k[0] for k in known})
++    return (owner if owner is not None else gateways[0] if len(gateways) == 1 else None), "default"
++
++
++def _ledger_fallback(board: str, gateway: str, profile: str, statuses: tuple[str, ...]) -> list[dict[str, Any]]:
++    """Cold start with an unreadable replica: the ledger's rows for that board, all stale (never "no cards")."""
++    from hermes_cli.kanban_session_activity import _remote_links
++    try:
++        cards = _remote_links()
++    except Exception as exc:  # health: allow BLE001 -- both sources unreadable: nothing to show, logged
++        _log.warning("kanban chat links: replica and ledger both unreadable for %s (%s)", board, exc)
++        return []
++    out = []
++    for c in cards:
++        if (c.get("board") != board or c.get("origin_gateway") not in (None, gateway)
++                or c.get("origin_profile") not in (None, profile) or not c.get("session") or c.get("released")):
++            continue
++        if c.get("status") in statuses or (c.get("status") == UNKNOWN and c.get("unfinished")):
++            out.append({**c, "session_id": c["session"], "remote": True, "stale": True, "source": "ledger-fallback"})
++    return out
++
++
++def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES,
++                  replicas: Optional[list[tuple[str, Path]]] = None, *, now: Optional[float] = None,
++                  ledger_fallback: bool = True, unreadable_out: Optional[list[str]] = None) -> list[dict[str, Any]]:
++    """This gateway's chats' (``session_ids``, one lineage; ``None`` = every chat) unreleased links to cards created
++    on OTHER gateways, from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends.
++
++    The sidebar counts read this too when ``links_reader`` is ``replica``, so both answers are one projection:
++    - an unreleased link to a ``done``/``archived`` card, or to a card row the replica lacks, is an ``unknown``,
++      unfinished obligation (the ledger's done-without-verified-release); only a released link drops it;
++    - only this origin profile's links (``chat_profile``) count;
++    - ``stale``/``synced_at`` come from the replica's last successful pull;
++    - an unreadable replica keeps its last rows, stale; on a cold start the ledger's rows for that board, stale.
++      ``ledger_fallback=False`` (links_diff) skips both, so a diff never compares the ledger with itself;
++      ``unreadable_out`` collects the boards whose replica could not be read;
++    - one row per (chat, card); the key carries the owner profile the ledger names for it, else ``default``."""
++    from hermes_cli.profiles import get_active_profile_name
++    ids = None if session_ids is None else set(str(s) for s in session_ids if s)
++    if ids is not None and not ids:
+         return []
+     if replicas is None:
+         from hermes_cli import kanban_sync_client as ksc
+         replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
+-    from hermes_cli.kanban_session_activity import cached_ro  # lazy: that module imports this one
+-    ph = ",".join("?" for _ in ids)
+-    st = ",".join("?" for _ in statuses)
+-    now = time.time()
++    profile = get_active_profile_name()
++    now = time.time() if now is None else now
++    stale_after = _stale_after_s()
++    owners: Optional[dict[tuple[str, str], list[tuple[str, str, str, bool]]]] = None
+     out: dict[tuple[str, str], dict[str, Any]] = {}
+     for board, path in replicas:
+-        if not path.exists():
+-            continue
++        memo_key = (str(path), gateway, profile)
+         try:
+-            with cached_ro(path) as conn:
+-                conn.row_factory = sqlite3.Row
+-                rows = conn.execute(
+-                    "SELECT t.id, t.title, t.status, t.assignee, t.created_at, t.started_at, t.priority, t.block_kind, "
+-                    "t.human_request, t.created_on, l.chat_session, l.chat_profile, l.kind FROM task_chat_links l "
+-                    f"JOIN tasks t ON t.id = l.task_id WHERE l.chat_gateway = ? AND l.released = 0 AND l.chat_session IN ({ph}) "
+-                    f"AND t.status IN ({st}) AND t.created_on IS NOT NULL AND t.created_on != ?",
+-                    (gateway, *ids, *statuses, gateway)).fetchall()
++            rows, pulled = _read_replica(path, gateway, profile)
++            _last_good[memo_key] = (rows, pulled)
++            stale = pulled is None or now - pulled > stale_after
+         except sqlite3.Error as exc:
+-            _log.info("kanban chat links: replica %s unreadable (%s)", path, exc)
+-            continue
++            if unreadable_out is not None:
++                unreadable_out.append(board)
++            if not ledger_fallback:
++                continue
++            hit = _last_good.get(memo_key)
++            _log.info("kanban chat links: replica %s unreadable (%s); %s", path, exc,
++                      "keeping its last rows as stale" if hit else "falling back to the ledger, stale")
++            if hit is None:
++                for c in _ledger_fallback(board, gateway, profile, statuses):
++                    if ids is None or c["session"] in ids:
++                        out.setdefault((c["session"], c["key"]), c)
++                continue
++            rows, pulled = hit
++            stale = True
++        if owners is None and rows:
++            owners = _ledger_owners()
+         for r in rows:
+-            owner = r["created_on"]
+-            key = f"{owner}/default/{board}/{r['id']}"
++            if ids is not None and r["chat_session"] not in ids:
++                continue
++            status = r["status"]
++            missing = r["task_row"] is None
++            unknown = missing or status in TERMINAL_STATUSES or status is None
++            if not unknown and status not in statuses:
++                continue
++            tid = str(r["id"])
++            owner, owner_profile = _owner_of((owners or {}).get((board, tid), []), r["created_on"], r["chat_session"])
++            if missing and owner == gateway:  # the ledger places the missing row on this gateway: a local card
++                continue
++            key = f"{owner or '?'}/{owner_profile}/{board}/{tid}"
+             pair = (r["chat_session"], key)  # one row per chat and card: a card often has several chats
+             if pair in out:
+                 continue
+             out[pair] = {
+-                "title": r["title"], "status": r["status"], "assignee": r["assignee"], "created_at": r["created_at"],
+-                "started_at": r["started_at"], "priority": r["priority"], "block_kind": r["block_kind"],
+-                "human_request": r["human_request"], "id": r["id"], "board": board, "gateway": owner, "key": key,
+-                "session": r["chat_session"], "session_id": r["chat_session"], "via": "origin" if r["kind"] == "created" else "shepherd",
+-                "remote": True, "profile": "default", "owner_profile": "default", "origin_gateway": gateway,
+-                "origin_profile": r["chat_profile"], "ownership_state": "qualified", "unfinished": True,
+-                "released": False, "reported_status": r["status"], "synced_at": now, "stale": False,
++                "title": r["title"], "status": UNKNOWN if unknown else status, "assignee": r["assignee"],
++                "created_at": r["created_at"], "started_at": r["started_at"], "priority": r["priority"],
++                "block_kind": r["block_kind"], "human_request": r["human_request"], "id": tid, "board": board,
++                "gateway": owner, "key": key, "session": r["chat_session"], "session_id": r["chat_session"],
++                "via": "origin" if r["kind"] == "created" else "shepherd", "remote": True,
++                "profile": owner_profile, "owner_profile": owner_profile, "origin_gateway": gateway,
++                "origin_profile": r["chat_profile"],
++                "ownership_state": "qualified" if owner is not None else "unknown", "unfinished": True,
++                "released": False, "reported_status": status, "synced_at": pulled, "stale": stale,
+                 "source": "replica",
+             }
+     return list(out.values())
+ 
+ 
++def _ledger_obligation(card: dict[str, Any], statuses: tuple[str, ...]) -> bool:
++    """An unreleased ledger row the sidebar counts: open, or ``unknown`` and unfinished (done, release unverified)."""
++    if card.get("released"):
++        return False
++    return card.get("status") in statuses or (card.get("status") == UNKNOWN and bool(card.get("unfinished")))
++
++
+ def links_diff(gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES) -> dict[str, Any]:
+-    """Per chat, the open remote cards the origin ledger lists against the ones the replicas list. Clean when the
+-    two answers match for every chat either side knows."""
++    """Per chat, the remote obligations the origin ledger lists against the ones the replicas list, including
++    ``unknown`` unfinished rows (done cards without a verified release). Clean when the two answers match for
++    every chat either side knows."""
+     from hermes_cli.kanban_session_activity import _remote_links
+     ledger: dict[str, set[tuple[str, str, str]]] = {}
+     for card in _remote_links():
+         if card.get("origin_gateway") not in (None, gateway) or not card.get("session"):
+             continue
+-        if card.get("status") not in statuses or card.get("released"):
++        if not _ledger_obligation(card, statuses):
+             continue
+         ledger.setdefault(card["session"], set()).add((card["gateway"], card["board"], card["id"]))
+-    sessions = set(ledger)
++    replica: dict[str, set[tuple[str, str, str]]] = {}
++    unreadable: list[str] = []
+     from hermes_cli import kanban_sync_client as ksc
+     replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
+-    for _slug, path in replicas:
+-        if path.exists():
+-            with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2) as conn:
+-                sessions |= {r[0] for r in conn.execute(
+-                    "SELECT DISTINCT chat_session FROM task_chat_links WHERE chat_gateway = ? AND released = 0", (gateway,))}
+-    replica: dict[str, set[tuple[str, str, str]]] = {}
+-    for card in replica_cards(sessions, gateway, statuses, replicas):
++    for card in replica_cards(None, gateway, statuses, replicas, ledger_fallback=False, unreadable_out=unreadable):
+         replica.setdefault(card["session"], set()).add((card["gateway"], card["board"], card["id"]))
++    # A replica that exists but cannot be read, or that is missing while the ledger has cards on its board, answers
++    # nothing: the diff is never clean while one does (readers must not switch on it). A missing replica of a board
++    # with no ledger cards has nothing to compare.
++    exists = {slug for slug, path in replicas if path.exists()}
++    ledger_boards = {b for cards in ledger.values() for _gw, b, _tid in cards}
++    unreadable = sorted({b for b in unreadable if b in exists or b in ledger_boards})
++    sessions = set(ledger) | set(replica)
+     only_ledger = {s: sorted(ledger.get(s, set()) - replica.get(s, set())) for s in sessions}
+     only_replica = {s: sorted(replica.get(s, set()) - ledger.get(s, set())) for s in sessions}
+     only_ledger = {s: v for s, v in only_ledger.items() if v}
+     only_replica = {s: v for s, v in only_replica.items() if v}
+-    return {"clean": not only_ledger and not only_replica, "chats": len(sessions),
++    # An unreadable replica answers nothing (see above).
++    return {"clean": not only_ledger and not only_replica and not unreadable, "chats": len(sessions),
+             "ledger_links": sum(len(v) for v in ledger.values()), "replica_links": sum(len(v) for v in replica.values()),
+-            "only_in_ledger": only_ledger, "only_in_replica": only_replica}
++            "only_in_ledger": only_ledger, "only_in_replica": only_replica, "unreadable": unreadable}
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 85c6c975df..3439b47a2e 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -212,6 +212,8 @@ _SYNC_COLUMN_DDL = (
+     ("kanban_sync_outbox", "retry_after", "retry_after INTEGER"),
+     # 1 once repair_ms_timestamps ran on this file (the one-time repair of rows applied before the guard).
+     ("kanban_sync_state", "seconds_repaired", "seconds_repaired INTEGER NOT NULL DEFAULT 0"),
++    # Wall time of the last successful feed pull into this file (replicas): readers derive staleness from it. [daveey]
++    ("kanban_sync_state", "pulled_at", "pulled_at REAL"),
+ )
+ 
+ # Resolved db paths whose triggers this process installed. Empty = no synced
+@@ -543,6 +545,14 @@ def sync_state(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+     return dict(row) if row else None
+ 
+ 
++def mark_pulled(conn: sqlite3.Connection, at: Optional[float] = None) -> None:
++    """Stamp a successful feed pull (``pulled_at``), so readers of a replica can tell a fresh copy from an old one
++    without asking the network. [daveey]"""
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET pulled_at = ?", (time.time() if at is None else at,))
++
++
+ def new_task_id(conn: sqlite3.Connection) -> str:
+     """Synced boards: ``t_`` + 16 hex (48-bit ms timestamp + 16 random bits), safe
+     across gateways and offline creation; otherwise the classic 8-hex id."""
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 320f4393e0..aad8fa32a9 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -45,6 +45,9 @@ _parked_sink = threading.local()  # .maps: (parked, held) or None; per thread, s
+ # [daveey] Per session, parked cards whose agent-owned wait is older than kanban_wait_info.STALL_AFTER_S (amber
+ # "stalled" in the sidebar), from the same snapshot as ``_cache``.
+ _stalled_cache: list[dict[str, int]] = [{}]
++# [daveey] Per session, the remote cards counted (key, bucket, parked) from the same snapshot as ``_cache``: a
++# lineage whose sessions share a card (created in one, shepherded from another) counts it once, as the list shows it.
++_remote_keys_cache: list[dict[str, frozenset[tuple[str, str, bool]]]] = [{}]
+ _pairs_lock = threading.Lock()
+ # _all_counts single flight: held for a whole recompute; the generation bumps when one publishes.
+ _counts_flight = threading.Lock()
+@@ -472,8 +475,10 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+ 
+ # [daveey] The ONE origin-work association for cards on other gateways. The sidebar counts
+ # (``kanban_active``/``kanban_blocked``, which also drive the archive guard) and the session task list
+-# (``session_tasks``) both come from ``_remote_links``, so they can never disagree about which remote
+-# cards a session observes or owns. Each link selects only its exact card. Created
++# (``session_tasks``) both come from ``_remote_cards``: the origin-ledger projection (``_remote_links``), or the
++# synced chat links (``kanban_chat_links.replica_cards``) when ``kanban.sync.links_reader`` is ``replica``. Never
++# read one source for the count and the other for the list: that split showed "Waiting on 14" over a 9-chip strip
++# (the replica list dropped done-but-unverified cards the ledger still counted). Each link selects only its exact card. Created
+ # children count via their own inherited links. Gateway/profile/board/id identifies
+ # a card; distinct qualified profiles stay separate. Historical unqualified aliases
+ # do not add another count when a qualified record for the same card is available.
+@@ -822,12 +827,26 @@ def _hub_content_signature(hub: Path) -> tuple:
+     return signature
+ 
+ 
++def _replica_paths() -> list[Path]:
++    """The board replicas the counts read when ``kanban.sync.links_reader`` is ``replica`` (else none), so a pull
++    that changes a chat's cards invalidates the cached counts like a local board write does. [daveey]"""
++    try:
++        from hermes_cli import kanban_db_sync as _sync
++        if _sync.sync_config().get("links_reader") != "replica":
++            return []
++        from hermes_cli import kanban_sync_client as _ksc
++        return [_ksc.shadow_path(slug) for slug, _path in _ksc.board_paths()]
++    except Exception:  # health: allow BLE001 -- a fingerprint input; the TTL still bounds a missed change
++        return []
++
++
+ def _activity_fingerprint() -> tuple:
+     """Invalidate on cross-process commits, including WAL writes and board replacement. The hub replica counts by
+     content (``_hub_content_signature``), the boards by stat."""
+     paths = _board_db_paths()
+     hub = _hub_db_path()
+     signature = [_hub_content_signature(hub)] if hub is not None else []
++    paths.extend(_replica_paths())
+     for db in paths:
+         for path in (db, Path(str(db) + "-wal")):
+             try:
+@@ -1168,7 +1187,8 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+     waiting: dict[str, set[str]] = {}
+     for sid, tid in pairs:
+         waiting.setdefault(sid, set()).add(tid)
+-    for card in _remote_links():
++    remote_keys: dict[str, set[tuple[str, str, bool]]] = {}
++    for card in _remote_cards(None, LISTED_STATUSES, False):
+         bucket = _replica_bucket(card)
+         into = active if bucket == "active" else blocked if bucket == "blocked" else None
+         if into is None:
+@@ -1177,8 +1197,10 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         into[sid] = into.get(sid, 0) + 1
+         # A replica row has no parent links; its owner promotes a todo whose parents finished on the next tick, so a
+         # replicated todo waits on a parent (parked). Held needs those links, so remote cards are never held.
+-        if bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo"):
++        is_parked = bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo")
++        if is_parked:
+             parked[sid] = parked.get(sid, 0) + 1
++        remote_keys.setdefault(sid, set()).add((str(card.get("key")), str(bucket), is_parked))
+         # Same status test as parked/blocked above: a legacy row whose live status is unknown (reported_status is
+         # only its last report) is never counted stalled, so stalled can't exceed what the row shows parked.
+         if card.get("status") != "unknown" and (_remote_wait(card) or {}).get("wait_state") == "stalled":
+@@ -1193,6 +1215,7 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         _waiting_cache[0] = {sid: frozenset(ids) for sid, ids in waiting.items()}
+         _parked_cache[0] = (parked, held)
+         _stalled_cache[0] = stalled
++        _remote_keys_cache[0] = {sid: frozenset(keys) for sid, keys in remote_keys.items()}
+     counts = (active, blocked, unseen, stale)
+     return (*counts, {sid: frozenset(ids) for sid, ids in waiting.items()}) if include_waiting else counts
+ 
+@@ -1454,9 +1477,10 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+         found[task_id]["pr_url"] = url
+ 
+ 
+-def _remote_cards(ids: list[str], statuses: tuple[str, ...], stale_ok: bool) -> list[dict[str, Any]]:
+-    """Cards on other gateways linked to these chats: from the synced chat links in the replicas when
+-    ``kanban.sync.links_reader`` is ``replica`` (RFC phase 5), else from the origin-ledger projection."""
++def _remote_cards(ids: list[str] | None, statuses: tuple[str, ...], stale_ok: bool) -> list[dict[str, Any]]:
++    """Cards on other gateways linked to these chats (``ids`` None = every chat): from the synced chat links in the
++    replicas when ``kanban.sync.links_reader`` is ``replica`` (RFC phase 5), else from the origin-ledger projection.
++    The sidebar counts and ``session_tasks`` both read this, so they are one projection in either mode. [daveey]"""
+     from hermes_cli import kanban_db_sync as _sync
+     if _sync.sync_config().get("links_reader") == "replica":
+         from hermes_cli import kanban_chat_links as _links
+@@ -1467,7 +1491,7 @@ def _remote_cards(ids: list[str], statuses: tuple[str, ...], stale_ok: bool) ->
+             gateway = None
+         if gateway:
+             return _links.replica_cards(ids, gateway, statuses)
+-    return _remote_links(stale_ok=stale_ok)
++    return _remote_links(stale_ok=True) if stale_ok else _remote_links()
+ 
+ 
+ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED_STATUSES, *,
+@@ -1615,6 +1639,25 @@ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
+             yield sid
+ 
+ 
++def _lineage_remote_duplicates(remote_keys: dict[str, frozenset[tuple[str, str, bool]]],
++                               ids: list[str]) -> dict[str, int]:
++    """How many remote cards the per-session counts add more than once across one lineage (a card created in one
++    session and shepherded from another), per row field, so the row counts each card once like ``session_tasks``
++    lists it. [daveey]"""
++    seen = [remote_keys.get(sid, frozenset()) for sid in ids]
++    if sum(1 for s in seen if s) < 2:
++        return {}
++    union = frozenset().union(*seen)
++    out: dict[str, int] = {}
++    for field, test in (("kanban_active", lambda k: k[1] == "active"), ("kanban_blocked", lambda k: k[1] == "blocked"),
++                        ("kanban_parked", lambda k: k[2])):
++        rows = sum(1 for s in seen for k in s if test(k))
++        cards = len({k[0] for k in union if test(k)})
++        if rows > cards:
++            out[field] = rows - cards
++    return out
++
++
+ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     """Stamp ``kanban_active``, ``kanban_blocked``, ``kanban_waiting_on`` (local open card ids), ``kanban_unseen`` (finished cards whose result the
+     session has not been handed yet) and ``kanban_attention`` (done cards a registered check flags) on each session row
+@@ -1630,6 +1673,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         with _cache_lock:  # the snapshot that call just read or wrote: never a second projection
+             parked, held = _parked_cache[0]
+             stalled = _stalled_cache[0]
++            remote_keys = _remote_keys_cache[0]
+         extra = _extra_waiting()
+     except Exception:
+         # [daveey] A failed read is "unknown", never "no work": stamp ``kanban_unknown`` (the sidebar keeps the
+@@ -1652,9 +1696,10 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+         row["kanban_observed_at"] = observed_at
+         row.pop("kanban_unknown", None)
+         ids = list(_row_ids(row))
++        dup = _lineage_remote_duplicates(remote_keys, ids)
+         for key, counts in (("kanban_active", active), ("kanban_blocked", blocked), ("kanban_unseen", unseen),
+                             ("kanban_attention", attention), ("kanban_remote_stale", remote_stale)):
+-            n = sum(counts.get(sid, 0) for sid in ids)
++            n = sum(counts.get(sid, 0) for sid in ids) - dup.get(key, 0)
+             if n:
+                 row[key] = n
+             else:
+@@ -1667,7 +1712,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+             row["kanban_active"] = int(row.get("kanban_active") or 0) + len(pending)
+         # [daveey] Parked/held are subsets of kanban_active. kanban_parked is stamped (even 0) whenever there is open
+         # work, so the desktop can tell "none parked" from a backend that predates the field.
+-        n_parked = sum(parked.get(sid, 0) for sid in ids)
++        n_parked = sum(parked.get(sid, 0) for sid in ids) - dup.get("kanban_parked", 0)
+         n_held = sum(held.get(sid, 0) for sid in ids)
+         if row.get("kanban_active"):
+             row["kanban_parked"] = n_parked
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 6a2d784530..7cc3bd3651 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -525,13 +525,18 @@ def _pull_replica(slug: str, hub: Hub, gateway: str) -> int:
+     replica = open_shadow(slug, gateway)
+     try:
+         try:
+-            return pull(replica, hub, slug, observers=False)
++            pulled = pull(replica, hub, slug, observers=False)
+         except Resync:
+             _log.warning("kanban sync: %s replica cursor below the retention floor; rebuilding from a snapshot", slug)
+             replica.close()
+             shadow_path(slug).unlink(missing_ok=True)
+             replica = open_shadow(slug, gateway)
+-            return resync(replica, hub, slug, observers=False)
++            pulled = resync(replica, hub, slug, observers=False)
++        try:  # readers derive the replica's staleness from this (kanban_chat_links); a failed stamp only ages it
++            sync.mark_pulled(replica)
++        except sqlite3.Error as exc:
++            _log.warning("kanban sync: %s replica pull not stamped (%s)", slug, exc)
++        return pulled
+     finally:
+         replica.close()
+ 
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 4d105fd4ec..3b3a783297 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -99,8 +99,13 @@ def test_replica_answers_a_chats_open_cards_on_other_gateways(tmp_path):
+              [("t_open", ME, "s1", "shepherd", 0), ("t_done", ME, "s1", "shepherd", 0), ("t_mine", ME, "s1", "created", 0),
+               ("t_released", ME, "s1", "shepherd", 1), ("t_theirs", "mini", "s1", "shepherd", 0)])
+     got = links.replica_cards(["s1", "s0"], ME, replicas=[("default", rep)])
+-    assert [(c["id"], c["gateway"], c["board"], c["via"], c["session_id"]) for c in got] == [("t_open", OTHER, "default", "shepherd", "s1")]
+-    assert got[0]["title"] == "open card" and got[0]["source"] == "replica"
++    # A done card whose link is not released is still the chat's (unknown, unfinished): the sidebar counts it, so the
++    # list must too. Only a released link drops a card (t_released).
++    assert sorted((c["id"], c["gateway"], c["board"], c["via"], c["session_id"], c["status"]) for c in got) == [
++        ("t_done", OTHER, "default", "shepherd", "s1", "unknown"), ("t_open", OTHER, "default", "shepherd", "s1", "running")]
++    got = {c["id"]: c for c in got}
++    assert got["t_open"]["title"] == "open card" and got["t_open"]["source"] == "replica"
++    assert got["t_done"]["reported_status"] == "done" and got["t_done"]["unfinished"] is True
+ 
+ 
+ def test_links_diff_is_clean_when_both_answers_match_and_lists_the_difference(kanban_home, monkeypatch, tmp_path):
+diff --git a/tests/hermes_cli/test_kanban_chat_links_parity.py b/tests/hermes_cli/test_kanban_chat_links_parity.py
+new file mode 100644
+index 0000000000..8703923005
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_chat_links_parity.py
+@@ -0,0 +1,292 @@
++"""Sidebar counts and the session task list agree under ``kanban.sync.links_reader: replica``. [daveey]
++
++The MacBook's Upkeep chat showed "Waiting on 14 cards" (counts read the origin-ledger projection) while the task
++strip listed 9 (``session_tasks`` read the replica, which dropped the 5 done-but-unverified cards). Each case here
++asserts the counted number equals the listed number for one chat lineage, with both read the way the Desktop
++reads them (``annotate_kanban_activity`` and ``session_tasks``).
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, HUB, MINI = "macbook", "hub", "mini"
++
++
++@pytest.fixture
++def env(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    (home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n    links_reader: replica\n")
++    conn = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(conn, "default", ME)
++    conn.close()
++    replicas: dict[str, object] = {}
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", ME))
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", home / "kanban.db"),
++                                                     *((s, home / f"{s}.links.db") for s in replicas if s != "default")])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: tmp_path / "shadow" / f"{slug}.db")
++    ledger: list[dict] = []
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: list(ledger))
++    ksa._reset_cache_for_tests()
++    getattr(links, "_reset_for_tests", lambda: None)()
++    yield {"tmp": tmp_path, "home": home, "ledger": ledger, "replicas": replicas}
++    ksa._reset_cache_for_tests()
++    getattr(links, "_reset_for_tests", lambda: None)()
++
++
++def replica(env, tasks, chat_links, *, board="default", pulled_at: object = "now"):
++    """``tasks``: (id, status, created_on[, block_kind]); ``chat_links``: (task_id, session, kind, released)."""
++    env["replicas"][board] = True
++    path = env["tmp"] / "shadow" / f"{board}.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.unlink(missing_ok=True)
++    conn = sqlite3.connect(path)
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, chat_session TEXT, "
++        "kind TEXT, released INTEGER, created_at INTEGER);"
++        "CREATE TABLE kanban_sync_state (board_id TEXT PRIMARY KEY, cursor INTEGER, gateway_id TEXT, hlc_last TEXT, "
++        "mode TEXT, applying INTEGER, pending_run_uid TEXT, pulled_at REAL);")
++    for t in tasks:
++        tid, status, owner, block_kind = (*t, None)[:4]
++        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, 'worker', 1, NULL, 0, ?, NULL, ?)",
++                     (tid, f"title {tid}", status, block_kind, owner))
++    for tid, session, kind, released in chat_links:
++        conn.execute("INSERT INTO task_chat_links VALUES (?, ?, ?, 'default', ?, ?, ?, 1)",
++                     (links.link_uid(tid, ME, "default", session, kind), tid, ME, session, kind, released))
++    stamp = time.time() if pulled_at == "now" else pulled_at
++    conn.execute("INSERT INTO kanban_sync_state VALUES (?, 0, ?, '', 'shadow', 0, NULL, ?)", (board, ME, stamp))
++    conn.commit()
++    conn.close()
++    ksa._reset_cache_for_tests()
++    return path
++
++
++def counted(*lineage):
++    row = {"id": lineage[-1], "_lineage_ids": list(lineage)}
++    ksa.annotate_kanban_activity([row])
++    return int(row.get("kanban_active") or 0) + int(row.get("kanban_blocked") or 0), row
++
++
++def listed(*lineage):
++    return [t for t in ksa.session_tasks(list(lineage)) if t.get("remote")]
++
++
++def assert_parity(*lineage, expect):
++    n, row = counted(*lineage)
++    rows = listed(*lineage)
++    assert (n, len(rows)) == (expect, expect), (row, [(r["key"], r["status"]) for r in rows])
++    return row, rows
++
++
++def test_one_active_and_twelve_todo_count_and_list_the_same(env):
++    tasks = [("t_run", "running", HUB)] + [(f"t_todo{i:02d}", "todo", HUB) for i in range(12)]
++    replica(env, tasks, [(t[0], "s1", "shepherd", 0) for t in tasks])
++    assert_parity("s1", expect=13)
++
++
++def test_blocked_for_review_counts_and_lists(env):
++    replica(env, [("t_rev", "review", HUB), ("t_blk", "blocked", HUB, "needs_input")],
++            [("t_rev", "s1", "shepherd", 0), ("t_blk", "s1", "created", 0)])
++    assert_parity("s1", expect=2)
++
++
++def test_done_without_verified_release_stays_an_unknown_chip_and_counts(env):
++    """The Upkeep 14 vs 9: a done card whose link is not released is still an obligation in both places."""
++    replica(env, [("t_open", "running", HUB), ("t_done", "done", HUB), ("t_arch", "archived", HUB)],
++            [("t_open", "s1", "created", 0), ("t_done", "s1", "created", 0), ("t_arch", "s1", "shepherd", 0)])
++    _, rows = assert_parity("s1", expect=3)
++    done = {r["id"]: r for r in rows}
++    assert (done["t_done"]["status"], done["t_done"]["reported_status"], done["t_done"]["unfinished"]) == ("unknown", "done", True)
++    assert done["t_arch"]["status"] == "unknown"
++
++
++def test_a_link_whose_card_row_is_missing_is_unknown_not_dropped(env):
++    replica(env, [("t_open", "running", HUB)], [("t_open", "s1", "created", 0), ("t_gone", "s1", "created", 0)])
++    _, rows = assert_parity("s1", expect=2)
++    assert {r["id"]: r["status"] for r in rows}["t_gone"] == "unknown"
++
++
++def test_verified_release_disappears_from_both(env):
++    replica(env, [("t_done", "done", HUB), ("t_open", "ready", HUB)],
++            [("t_done", "s1", "created", 1), ("t_open", "s1", "created", 0)])
++    _, rows = assert_parity("s1", expect=1)
++    assert [r["id"] for r in rows] == ["t_open"]
++
++
++def test_another_chat_still_turns_done(env):
++    replica(env, [("t_done", "done", HUB), ("t_open", "running", HUB)],
++            [("t_done", "s2", "created", 1), ("t_open", "s1", "created", 0)])
++    row, _ = assert_parity("s2", expect=0)
++    assert "kanban_active" not in row and "kanban_remote_stale" not in row
++    assert_parity("s1", expect=1)
++
++
++def test_old_replica_rows_are_stale_from_its_real_sync_age(env):
++    pulled = time.time() - 3600
++    replica(env, [("t_open", "running", HUB)], [("t_open", "s1", "created", 0)], pulled_at=pulled)
++    row, rows = assert_parity("s1", expect=1)
++    assert rows[0]["stale"] is True and rows[0]["synced_at"] == pytest.approx(pulled)
++    assert row.get("kanban_remote_stale") == 1
++
++
++def test_fresh_replica_rows_are_not_stale(env):
++    replica(env, [("t_open", "running", HUB)], [("t_open", "s1", "created", 0)])
++    row, rows = assert_parity("s1", expect=1)
++    assert rows[0]["stale"] is False and "kanban_remote_stale" not in row
++
++
++def test_a_replica_that_never_recorded_a_pull_is_stale(env):
++    replica(env, [("t_open", "running", HUB)], [("t_open", "s1", "created", 0)], pulled_at=None)
++    _, rows = assert_parity("s1", expect=1)
++    assert rows[0]["stale"] is True
++
++
++def test_unreadable_replica_keeps_its_last_rows_as_stale(env):
++    path = replica(env, [("t_open", "running", HUB), ("t_done", "done", HUB)],
++                   [("t_open", "s1", "created", 0), ("t_done", "s1", "created", 0)])
++    assert_parity("s1", expect=2)
++    path.unlink()
++    path.write_bytes(b"this is not a sqlite database" * 100)
++    ksa._reset_cache_for_tests()
++    _, rows = assert_parity("s1", expect=2)
++    assert all(r["stale"] for r in rows)
++
++
++def test_unreadable_replica_on_cold_start_falls_back_to_the_ledger_as_stale(env):
++    path = env["tmp"] / "shadow" / "default.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_bytes(b"garbage" * 200)
++    env["ledger"].append({"id": "t_led", "board": "default", "gateway": HUB, "key": f"{HUB}/default/default/t_led",
++                          "profile": "default", "session": "s1", "via": "origin", "origin_gateway": ME,
++                          "origin_profile": "default", "released": False, "status": "unknown",
++                          "reported_status": "done", "unfinished": True, "title": "t_led"})
++    _, rows = assert_parity("s1", expect=1)
++    assert rows[0]["stale"] is True and rows[0]["id"] == "t_led"
++
++
++def test_same_task_id_on_two_gateways_is_two_rows(env):
++    # Two boards (one per owner gateway's partition) carrying the same id.
++    replica(env, [("t_same", "running", HUB)], [("t_same", "s1", "created", 0)])
++    replica(env, [("t_same", "ready", MINI)], [("t_same", "s1", "shepherd", 0)], board="runners")
++    _, rows = assert_parity("s1", expect=2)
++    assert sorted(r["key"] for r in rows) == [f"{HUB}/default/default/t_same", f"{MINI}/default/runners/t_same"]
++
++
++def test_one_owner_profile_per_card_even_when_the_ledger_names_several(env):
++    """A synced board is one file per gateway with one row per id, so the replica holds ONE card: the ledger's other
++    profile names (released rows, other chats) label it, they never fan it out into extra rows."""
++    replica(env, [("t_same", "running", HUB)], [("t_same", "s1", "created", 0)])
++    base = {"id": "t_same", "board": "default", "gateway": HUB, "via": "origin", "origin_gateway": ME,
++            "origin_profile": "default", "status": "running", "unfinished": True}
++    env["ledger"].extend([
++        {**base, "profile": "alpha", "key": f"{HUB}/alpha/default/t_same", "session": "s_other", "released": False},
++        {**base, "profile": "beta", "key": f"{HUB}/beta/default/t_same", "session": "s1", "released": True},
++        {**base, "profile": "default", "key": f"{HUB}/default/default/t_same", "session": "s1", "released": False}])
++    _, rows = assert_parity("s1", expect=1)
++    assert (rows[0]["key"], rows[0]["owner_profile"]) == (f"{HUB}/default/default/t_same", "default")
++
++
++def test_same_task_id_linked_from_two_origin_profiles_stays_with_each_profile(env, monkeypatch):
++    path = replica(env, [("t_same", "running", HUB)], [("t_same", "s1", "created", 0)])
++    conn = sqlite3.connect(path)
++    conn.execute("INSERT INTO task_chat_links VALUES ('u2', 't_same', ?, 'alpha', 's9', 'created', 0, 1)", (ME,))
++    conn.commit()
++    conn.close()
++    assert_parity("s1", expect=1)
++    assert_parity("s9", expect=0)  # another origin profile's chat: not this profile's card
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "alpha")
++    ksa._reset_cache_for_tests()
++    assert_parity("s9", expect=1)
++    assert_parity("s1", expect=0)
++
++
++def test_unreadable_replica_rows_are_kept_per_origin_profile(env, monkeypatch):
++    path = replica(env, [("t_a", "running", HUB)], [("t_a", "s1", "created", 0)])
++    assert_parity("s1", expect=1)
++    path.unlink()
++    path.write_bytes(b"garbage" * 200)
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "alpha")
++    ksa._reset_cache_for_tests()
++    assert_parity("s1", expect=0)  # default's remembered rows are not alpha's
++
++
++def test_owner_profile_comes_from_the_ledger_not_a_hard_coded_default(env):
++    replica(env, [("t_a", "running", HUB)], [("t_a", "s1", "created", 0)])
++    env["ledger"].append({"id": "t_a", "board": "default", "gateway": HUB, "profile": "alpha",
++                          "key": f"{HUB}/alpha/default/t_a", "session": "s1", "via": "origin", "origin_gateway": ME,
++                          "origin_profile": "default", "released": False, "status": "running", "unfinished": True})
++    _, rows = assert_parity("s1", expect=1)
++    assert rows[0]["key"] == f"{HUB}/alpha/default/t_a" and rows[0]["profile"] == "alpha"
++
++
++def test_another_origin_profiles_links_are_not_this_profiles_cards(env):
++    path = replica(env, [("t_a", "running", HUB)], [("t_a", "s1", "created", 0)])
++    conn = sqlite3.connect(path)
++    conn.execute("UPDATE task_chat_links SET chat_profile = 'alpha'")
++    conn.commit()
++    conn.close()
++    assert_parity("s1", expect=0)
++
++
++def test_compression_lineage_counts_and_lists_every_alias(env):
++    replica(env, [("t_root", "running", HUB), ("t_tip", "blocked", HUB, "needs_input"), ("t_both", "ready", HUB)],
++            [("t_root", "s_root", "created", 0), ("t_tip", "s_tip", "created", 0),
++             ("t_both", "s_root", "shepherd", 0)])
++    assert_parity("s_root", "s_tip", expect=3)
++
++
++def test_one_card_linked_from_two_sessions_of_a_lineage_counts_once(env):
++    replica(env, [("t_both", "running", HUB), ("t_blk", "blocked", HUB, "needs_input")],
++            [("t_both", "s_root", "created", 0), ("t_both", "s_tip", "shepherd", 0),
++             ("t_blk", "s_root", "created", 0), ("t_blk", "s_tip", "shepherd", 0)])
++    row, _ = assert_parity("s_root", "s_tip", expect=2)
++    assert row.get("kanban_active") == 2  # not 4: each shared card once (blocked without a human ask is active)
++    assert_parity("s_tip", expect=2)  # each session alone still counts both
++
++
++def test_a_missing_card_row_the_ledger_places_on_this_gateway_is_not_remote(env):
++    replica(env, [], [("t_mine", "s1", "created", 0)])
++    env["ledger"].append({"id": "t_mine", "board": "default", "gateway": ME, "profile": "alpha",
++                          "key": f"{ME}/alpha/default/t_mine", "session": "s1", "via": "origin", "origin_gateway": ME,
++                          "origin_profile": "default", "released": False, "status": "running", "unfinished": True})
++    assert_parity("s1", expect=0)
++
++
++def test_links_diff_is_not_clean_while_a_replica_is_unreadable(env):
++    path = env["tmp"] / "shadow" / "default.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_bytes(b"garbage" * 200)
++    env["ledger"].append({"id": "t_led", "board": "default", "gateway": HUB, "profile": "default",
++                          "key": f"{HUB}/default/default/t_led", "session": "s1", "via": "origin",
++                          "origin_gateway": ME, "origin_profile": "default", "released": False,
++                          "status": "running", "unfinished": True})
++    report = links.links_diff(ME)
++    assert not report["clean"] and report["unreadable"] == ["default"]
++    assert report["only_in_ledger"] == {"s1": [(HUB, "default", "t_led")]}  # never compared with itself
++
++
++def test_links_diff_compares_unknown_unfinished_rows(env):
++    replica(env, [("t_done", "done", HUB)], [("t_done", "s1", "created", 0)])
++    row = {"id": "t_done", "board": "default", "gateway": HUB, "profile": "default", "key": f"{HUB}/default/default/t_done",
++           "session": "s1", "via": "origin", "origin_gateway": ME, "origin_profile": "default", "released": False,
++           "status": "unknown", "reported_status": "done", "unfinished": True}
++    env["ledger"].append(row)
++    assert links.links_diff(ME)["clean"]
++    # The replica released it while the ledger still holds it unfinished: counts and list would split.
++    replica(env, [("t_done", "done", HUB)], [("t_done", "s1", "created", 1)])
++    report = links.links_diff(ME)
++    assert not report["clean"]
++    assert report["only_in_ledger"] == {"s1": [(HUB, "default", "t_done")]}
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index ee25a16610..e14494207f 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -178,6 +178,25 @@ def test_shadow_pull_fills_the_shadow_copy_and_never_touches_the_live_board(live
+     assert _tables_digest(live) == live_before  # pushes only clear outbox rows; no remote row lands live
+ 
+ 
++def test_a_replica_pull_stamps_pulled_at_and_a_failed_one_does_not(live, svc, kanban_home):
++    """Readers derive a replica's staleness from its last successful pull (kanban_chat_links.replica_cards)."""
++    before = time.time()
++    assert _round(kanban_home, svc).error is None
++    shadow = _shadow()
++    try:
++        stamped = sync.sync_state(shadow)["pulled_at"]
++    finally:
++        shadow.close()
++    assert stamped is not None and stamped >= before
++    svc.offline = True
++    assert ksc.sync_all_once(svc.hub(ME))[0].error  # the round failed
++    shadow = _shadow()
++    try:
++        assert sync.sync_state(shadow)["pulled_at"] == stamped  # an offline round never refreshes it
++    finally:
++        shadow.close()
++
++
+ def test_pull_advances_the_cursor_with_the_page_and_keeps_it_when_apply_fails(live, svc, monkeypatch):
+     sync.set_mode(live, "primary")
+     _other_creates(svc, "t_a")
+-- 
+2.55.0
+

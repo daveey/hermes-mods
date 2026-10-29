@@ -1,0 +1,673 @@
+From f46e5f476c1bb56b4f9a69031327bb6d8bc96704 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:32:39 +0000
+Subject: [PATCH] fix(kanban): check requires where runs_on lands the card;
+ never refuse a review verdict [daveey]
+
+t_01a184ac93d31979 (requires [terminal,file,git,kanban], runs_on machine:worker-1) passed create on the
+MacBook's profile, ran twice on worker-1 unchecked, then the reviewer's kanban_request_changes failed
+assignee_capability_mismatch against worker-1's `default` and became a human ask.
+
+- kanban_runs_on_capabilities: create and `kanban move` refuse when every machine runs_on can land on is
+  KNOWN (local policy or published profile-tools) to lack a needed tool, naming machine and tool; unknown
+  machines never refuse.
+- worker-node pickup: a machine never claims a card its own profile cannot satisfy (left on the Board).
+- request_changes records the verdict for the implementer that ran the card; a mismatch is a warning in
+  the changes_requested event.
+- _profile_capabilities: `kanban` is held unless agent.disabled_toolsets removes it, because every
+  dispatched worker gets the kanban toolset (model_tools) whatever platform_toolsets.cli says.
+---
+ hermes_cli/kanban_capabilities.py             |  10 +
+ hermes_cli/kanban_db.py                       |  10 +-
+ hermes_cli/kanban_move.py                     |  16 +-
+ hermes_cli/kanban_runs_on_capabilities.py     | 196 ++++++++++++
+ hermes_cli/kanban_worker_node.py              |   5 +
+ .../test_kanban_assignment_routing.py         |   5 +-
+ .../test_kanban_requires_placement.py         | 286 ++++++++++++++++++
+ .../test_kanban_review_capabilities.py        |   4 +-
+ 8 files changed, 524 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_runs_on_capabilities.py
+ create mode 100644 tests/hermes_cli/test_kanban_requires_placement.py
+
+diff --git a/hermes_cli/kanban_capabilities.py b/hermes_cli/kanban_capabilities.py
+index 7be68fa989..b5be4d97ea 100644
+--- a/hermes_cli/kanban_capabilities.py
++++ b/hermes_cli/kanban_capabilities.py
+@@ -246,6 +246,16 @@ def _profile_capabilities(assignee: str) -> set[str]:
+         stack.callback(reset_terminal_scope, set_terminal_scope(terminal))
+         toolsets = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+         available = set(toolsets) & {"terminal", "file", "kanban"}
++        # [daveey] Every assignee runs as a dispatcher-spawned worker, and model_tools._select_tool_names adds
++        # the kanban toolset to every such worker whatever platform_toolsets.cli says; only
++        # agent.disabled_toolsets (subtracted last) can take it away. Reading `kanban` from the chat toolsets
++        # refused a reviewer's verdict on worker-1 while that reviewer was calling kanban tools
++        # (t_01a184ac93d31979).
++        disabled = (config.get("agent") or {}).get("disabled_toolsets") or []
++        if isinstance(disabled, str):
++            disabled = [disabled]
++        if "kanban" not in disabled:
++            available.add("kanban")
+         if "terminal" in available:
+             available.add("git")
+         if terminal.get("TERMINAL_ENV", "").strip().lower() == "local":
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index def7ff700e..67d2e84331 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1351,6 +1351,8 @@ def create_task(
+     from hermes_cli.kanban_capabilities import validate_assignment
+     required = validate_assignment(assignee, requires=requires, workspace_kind=workspace_kind,
+                                    workspace_path=workspace_path, skills=skills_list, require_declaration=require_declaration)
++    from hermes_cli.kanban_runs_on_capabilities import check_create  # [daveey] where runs_on lands it
++    check_create(conn, runs_on, assignee=assignee, requires=required, workspace_kind=workspace_kind)
+     from hermes_cli.kanban_model_assignment import validate_model_assignment
+     validate_model_assignment(assignee, model_override, provider_override)
+     # [daveey] Bind a provider-less concrete pin now (or refuse), never late-bind it to config at spawn.
+@@ -3711,11 +3713,8 @@ def request_changes(
+         if implementer is None:
+             return False, "review handoff has no valid implementer provenance"
+         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+-        from hermes_cli.kanban_capabilities import validate_assignment
+-
+-        task = get_task(conn, task_id)
+-        validate_assignment(implementer, requires=task.requires,
+-                            workspace_kind=task.workspace_kind, workspace_path=task.workspace_path, skills=task.skills)
++        from hermes_cli.kanban_runs_on_capabilities import verdict_warning  # [daveey] never refuse a verdict
++        capability_warning = verdict_warning(implementer, get_task(conn, task_id))
+ 
+         new_status = _landing_status_after_parents(conn, task_id)
+         # consecutive_failures deliberately PRESERVED: a review transition is
+@@ -3746,6 +3745,7 @@ def request_changes(
+                 "implementer": implementer,
+                 "reviewer": reviewer,
+                 "status": new_status,
++                **capability_warning,
+             },
+             run_id=run_id,
+         )
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index e466e9b374..68f9a18954 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -14,6 +14,9 @@ Guards:
+ * ``kanban.move.max_moves`` (default 3) moves per card;
+ * moving back to a machine the card already left is ping-pong: refused unless ``force``, and it still counts;
+ * ``dir`` / ``worktree`` workspaces exist only on their creator, so those cards never move;
++* the card's ``requires`` must fit the assignee's profile on at least one matching machine whose profile
++  tools are known or unknown; every match known to lack one refuses ``capability_mismatch``, naming the
++  machine and the missing tool (:mod:`hermes_cli.kanban_runs_on_capabilities`);
+ * the board must sync to the Board service (``runs_on`` is a Board placement field).
+ 
+ Every move is a ``moved`` event ``{from_machine, runs_on, previous_runs_on, reason, move_no, forced}``: the audit log.
+@@ -83,7 +86,8 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+         raise MoveRefused("invalid_runs_on", str(exc)) from exc
+     if not labels:
+         raise MoveRefused("invalid_runs_on", "runs_on must name at least one label, e.g. ['machine:worker-1']")
+-    row = conn.execute("SELECT status, workspace_kind, runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    row = conn.execute("SELECT status, workspace_kind, runs_on, assignee, requires FROM tasks WHERE id = ?",
++                       (task_id,)).fetchone()
+     if row is None:
+         raise MoveRefused("not_found", f"task {task_id} not found")
+     if row["workspace_kind"] in ("dir", "worktree"):
+@@ -99,6 +103,16 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+     matches = matching_machines(labels, machines, me=me)
+     if not matches:
+         raise MoveRefused("no_machine", f"no active, unheld machine other than {me} has every label in {labels}")
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    try:
++        requires = json.loads(row["requires"]) if row["requires"] else []
++    except ValueError:
++        requires = []
++    try:
++        roc.check(labels, assignee=row["assignee"], requires=requires, workspace_kind=row["workspace_kind"] or "scratch",
++                  me=me, machines={m: machines[m] for m in matches}, exclude_me=True)
++    except roc.PlacementCapabilityMismatch as exc:
++        raise MoveRefused("capability_mismatch", str(exc)) from exc
+     past = history(conn, task_id)
+     limit = max_moves(cfg)
+     if len(past) >= limit:
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+new file mode 100644
+index 0000000000..de764a51b7
+--- /dev/null
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -0,0 +1,196 @@
++"""``requires`` checked against the machines a card's ``runs_on`` can land on. [daveey]
++
++:func:`hermes_cli.kanban_capabilities.validate_assignment` reads the assignee's profile on THIS machine. A
++card with ``runs_on`` runs on another machine, with that machine's profile of the same name, so the local
++check proves nothing about where it will run. Two halves close that gap:
++
++* :func:`check` (create, ``kanban move``): every Board-registry machine whose labels satisfy ``runs_on`` (and,
++  for a move, is not this one) is a candidate. A candidate's profile tools are known for this machine (local
++  policy) and for a gateway that publishes ``profile-tools:<profile>:<tool>`` in its hermes-hub capability
++  record (:func:`hermes_cli.kanban_placement.target_info`). When every candidate is KNOWN to lack a profile
++  tool the card needs, the write is refused with :class:`PlacementCapabilityMismatch`, which names each
++  machine and what it lacks. A candidate whose tools are unknown (it publishes none, or the registry is
++  unreachable) never refuses: the claim gate below is the backstop.
++* :func:`claim_refusal` (worker-node pickup): the machine about to copy a foreign card checks its own
++  profile. A card it cannot satisfy is left on the Board for a machine that can, so it never runs a card it
++  could not hand back.
++
++Only the profile tools a remote record can describe count (terminal, file, git, kanban); ``host_repo`` means a
++checkout on the creator and dir/worktree cards never leave it.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import time
++from typing import Any, Callable, Mapping, Optional
++
++from hermes_cli.kanban_capabilities import CapabilityMismatchError
++
++_log = logging.getLogger(__name__)
++
++PROFILE_TOOLS = ("terminal", "file", "git", "kanban")
++_logged_refusals: set[tuple[str, str]] = set()
++
++
++class PlacementCapabilityMismatch(CapabilityMismatchError):
++    """No machine ``runs_on`` can land on gives the assignee's profile the tools ``requires`` names."""
++
++    code = "runs_on_capability_mismatch"
++
++    def __init__(self, assignee: str, runs_on: list[str], lacking: Mapping[str, list[str]]):
++        self.runs_on = list(runs_on)
++        self.lacking = {name: list(missing) for name, missing in sorted(lacking.items())}
++        missing = sorted({c for v in self.lacking.values() for c in v}, key=PROFILE_TOOLS.index)
++        per_machine = "; ".join(f"machine {name} lacks {', '.join(v)}" for name, v in self.lacking.items())
++        super().__init__(assignee, missing, reason=(
++            f"runs_on={self.runs_on}: {per_machine} for profile {assignee!r}. Drop a requirement the work does "
++            "not need, or choose runs_on for a machine whose profile has it"))
++
++
++def _remote_tools(name: str) -> Optional[dict[str, set[str]]]:
++    """``{profile: {tool}}`` gateway ``name`` publishes through hermes-hub, or None when unknown."""
++    try:
++        from hermes_cli import kanban_placement as kp
++        return kp.target_info(name, now=time.time()).get("tools")
++    except Exception:  # health: allow BLE001 -- unreadable replica: unknown, never a refusal
++        return None
++
++
++def _local_tools(assignee: str) -> Optional[set[str]]:
++    try:
++        from hermes_cli.kanban_capabilities import _profile_capabilities
++        return set(_profile_capabilities(assignee))
++    except Exception:  # health: allow BLE001 -- unreadable policy: unknown (create's own check refuses it)
++        return None
++
++
++def candidates(runs_on: list[str], machines: Mapping[str, Mapping[str, Any]], *,
++               me: str, exclude_me: bool) -> list[str]:
++    """Active, unheld registry machines carrying every ``runs_on`` label."""
++    from hermes_cli import kanban_worker_node as wn
++    out = []
++    for name, entry in machines.items():
++        if (exclude_me and name == me) or not entry or entry.get("state", "active") != "active" or entry.get("hold"):
++            continue
++        if set(runs_on) <= wn.effective_labels(entry, name):
++            out.append(name)
++    return sorted(out)
++
++
++def missing_on(name: str, assignee: str, required: list[str], *, me: str,
++               remote_tools: Callable[[str], Optional[dict]]) -> Optional[list[str]]:
++    """Tools ``assignee`` lacks on machine ``name``: ``[]`` capable, None unknown."""
++    held: Optional[set[str]]
++    if name == me:
++        held = _local_tools(assignee)
++    else:
++        tools = remote_tools(name)
++        if tools is None:
++            return None
++        held = {str(t) for t in (tools.get(assignee) or ())}
++        if "terminal" in held:
++            held.add("git")  # the capability model: git means terminal access
++    if held is None:
++        return None
++    return [c for c in required if c not in held]
++
++
++def check(runs_on: Optional[list[str]], *, assignee: Optional[str], requires, workspace_kind: str = "scratch",
++          me: str, machines: Optional[Mapping[str, Mapping[str, Any]]] = None, exclude_me: bool = False,
++          remote_tools: Optional[Callable[[str], Optional[dict]]] = None) -> dict[str, Optional[list[str]]]:
++    """``{machine: missing | None}`` for the candidates, or raise :class:`PlacementCapabilityMismatch` when every
++    candidate is known to lack something. Empty when there is nothing to check (no ``runs_on``, no assignee, no
++    profile tool required, registry unreachable, no candidate machine: other guards own those cases)."""
++    if runs_on is None or not assignee:
++        return {}
++    from hermes_cli.kanban_capabilities import _required_capabilities
++    try:
++        required = [c for c in _required_capabilities(requires, workspace_kind) if c in PROFILE_TOOLS]
++    except ValueError:
++        return {}  # malformed requires: create's own validation reports it
++    if not required:
++        return {}
++    if machines is None:
++        from hermes_cli import kanban_worker_node as wn
++        try:
++            reg = wn.registry()
++        except Exception:  # health: allow BLE001 -- registry unreachable: the claim gate decides
++            reg = None
++        if not reg:
++            return {}
++        machines = reg.get("machines") or {}
++    names = candidates(list(runs_on), machines or {}, me=me, exclude_me=exclude_me)
++    if not names:
++        return {}
++    fetch = remote_tools or _remote_tools
++    verdicts = {n: missing_on(n, assignee, required, me=me, remote_tools=fetch) for n in names}
++    if any(v is None or not v for v in verdicts.values()):
++        return verdicts
++    raise PlacementCapabilityMismatch(assignee, list(runs_on), {n: v for n, v in verdicts.items() if v})
++
++
++def check_create(conn, runs_on, *, assignee: Optional[str], requires, workspace_kind: str = "scratch") -> None:
++    """:func:`check` for ``create_task`` on a Board primary: the local check read THIS machine's profile."""
++    if runs_on is None:
++        return
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    if sync.board_mode(conn) != "primary":
++        return
++    labels = wn.normalize_runs_on(runs_on if isinstance(runs_on, str) else list(runs_on))
++    check(labels, assignee=assignee, requires=requires, workspace_kind=workspace_kind, me=wn._own(conn))
++
++
++def verdict_warning(implementer: str, task) -> dict:
++    """``{"capability_warning": ...}`` for a ``changes_requested`` event, or ``{}``.
++
++    The implementer already ran the card, so a capability it lacks on the machine recording the verdict
++    (another machine's profile of that name, or policy drift since) is a warning on the verdict, never a
++    refusal: refusing turned a reviewer's verdict on a worker-node card into a human ask
++    (t_01a184ac93d31979)."""
++    from hermes_cli.kanban_capabilities import validate_assignment
++    try:
++        validate_assignment(implementer, requires=task.requires, workspace_kind=task.workspace_kind,
++                            workspace_path=task.workspace_path, skills=task.skills)
++    except CapabilityMismatchError as exc:
++        return {"capability_warning": {"profile": implementer, "missing": list(exc.missing), "error": str(exc)[:400]}}
++    return {}
++
++
++def _loads(value: Any, default):
++    if value is None or value == "":
++        return default
++    if isinstance(value, str):
++        try:
++            return json.loads(value)
++        except ValueError:
++            return default
++    return value
++
++
++def claim_refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
++    """None when this machine's profile can run ``card`` (a replica row), else why not.
++
++    The same check create runs locally, applied by the machine that would run the card. Logged once per
++    card and reason so a card no machine can take is visible in the worker's log."""
++    assignee = card.get("assignee")
++    if not assignee:
++        return None
++    from hermes_cli.kanban_capabilities import validate_assignment
++    try:
++        validate_assignment(assignee, requires=_loads(card.get("requires"), []) or [],
++                            workspace_kind=card.get("workspace_kind") or "scratch",
++                            skills=_loads(card.get("skills"), None) or None)
++    except CapabilityMismatchError as exc:
++        reason = str(exc)
++    except ValueError as exc:  # a requirement this core does not know: it cannot prove it either
++        reason = f"cannot check requires: {exc}"
++    else:
++        return None
++    key = (str(card.get("id")), reason)
++    if key not in _logged_refusals:
++        _logged_refusals.add(key)
++        _log.info("kanban worker node: not claiming %s on %s, left for a capable machine: %s",
++                  card.get("id"), me or "this machine", reason)
++    return reason
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 7d2fb1fbcd..a22e3f45ae 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -324,6 +324,11 @@ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+                 continue
+             if profile_exists is not None and card["assignee"] and not profile_exists(card["assignee"]):
+                 continue
++            # [daveey] Never claim a card this machine's profile cannot satisfy: it would run, then fail its own
++            # handoffs here (t_01a184ac93d31979). Left on the Board for a machine that can.
++            from hermes_cli.kanban_runs_on_capabilities import claim_refusal
++            if claim_refusal(dict(card), me=own) is not None:
++                continue
+             picked.append(card["id"])
+         imported = import_cards(conn, replica, picked)
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_assignment_routing.py b/tests/hermes_cli/test_kanban_assignment_routing.py
+index 3906c300b5..fbe7697d75 100644
+--- a/tests/hermes_cli/test_kanban_assignment_routing.py
++++ b/tests/hermes_cli/test_kanban_assignment_routing.py
+@@ -168,8 +168,11 @@ def test_explicit_human_evidence_preserves_access_boundary(board, blocker_id, pa
+ def test_supervisor_must_have_board_tools(board):
+     conn, home = board
+     tid = task_with_drift(board)
++    # Dispatched workers get the kanban toolset whatever platform_toolsets.cli says; only
++    # agent.disabled_toolsets removes it (kanban_capabilities._profile_capabilities). [daveey]
+     (home / 'profiles/supervisor/config.yaml').write_text(
+-        'platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n')
++        'platform_toolsets:\n  cli: [terminal, file]\nterminal:\n  backend: local\n'
++        'agent:\n  disabled_toolsets: [kanban]\n')
+     assert kb.block_task(conn, tid, kind='assignment', reason='Wrong worker')
+     assert kb.get_task(conn, tid).assignee == 'creator'
+     repair = kb.get_task(conn, payload(conn, tid)['supervisor_task_id'])
+diff --git a/tests/hermes_cli/test_kanban_requires_placement.py b/tests/hermes_cli/test_kanban_requires_placement.py
+new file mode 100644
+index 0000000000..bb2623d110
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_requires_placement.py
+@@ -0,0 +1,286 @@
++"""``requires`` is checked where a card runs, not only where it was created. [daveey]
++
++t_01a184ac93d31979 was created on the MacBook with ``requires: [terminal, file, git, kanban]`` and
++``runs_on: [machine:worker-1]``. The create check read the MacBook's ``default`` profile (has ``kanban``),
++worker-1 claimed and ran it twice without a check, and the reviewer's ``kanban_request_changes`` then failed
++``assignee_capability_mismatch`` against worker-1's ``default`` (no ``kanban``), which became a human ask.
++
++(a) create / move refuse when every machine ``runs_on`` can land on is known to lack a needed tool, naming it;
++(b) a worker node never picks up a card its own profile cannot satisfy;
++(c) ``request_changes`` always records the verdict for the implementer that ran the card (a warning at most).
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_capabilities import CapabilityMismatchError
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway
++
++WITH_KANBAN = "platform_toolsets:\n  cli: [terminal, file, kanban]\n"
++NEEDS = ["terminal", "file", "git", "kanban"]
++NO_SHELL = "platform_toolsets:\n  cli: [file]\n"
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    # The hub's `default` has board tools (like the MacBook's); worker-1's does not (kanban is default-off).
++    with open(hub.home / "config.yaml", "a") as fh:
++        fh.write(WITH_KANBAN)
++    hub.enter()
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _publish(monkeypatch, tools_by_gateway):
++    """What each gateway publishes as ``profile-tools:`` through hermes-hub (None = publishes nothing)."""
++    monkeypatch.setattr(kp, "target_info", lambda name, now, remote=None: {
++        "profiles": None, "tools": tools_by_gateway.get(name)})
++
++
++# --- (a) create ------------------------------------------------------------------------------------------------
++
++def test_create_for_a_machine_known_to_lack_a_tool_is_refused_naming_it(gws, monkeypatch):
++    hub, _ = gws
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
++    before = hub.conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++    with pytest.raises(CapabilityMismatchError) as caught:
++        kb.create_task(hub.conn, title="heavy", assignee="default", requires=NEEDS,
++                       runs_on=["machine:worker-1"])
++    msg = str(caught.value)
++    assert "worker-1" in msg and "kanban" in msg, msg
++    assert caught.value.missing == ["kanban"]
++    assert hub.conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
++
++
++def test_create_passes_when_one_matching_machine_is_capable_or_unknown(gws, monkeypatch):
++    hub, _ = gws
++    # runs_on=[linux] matches the hub too, whose own default has kanban.
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
++    assert kb.create_task(hub.conn, title="a", assignee="default", requires=NEEDS, runs_on=["linux"])
++    # worker-1 publishes nothing: unknown never refuses (the claim gate decides).
++    _publish(monkeypatch, {})
++    assert kb.create_task(hub.conn, title="b", assignee="default", requires=NEEDS, runs_on=["machine:worker-1"])
++    # worker-1 publishes kanban for default.
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "kanban"}}})
++    assert kb.create_task(hub.conn, title="c", assignee="default", requires=NEEDS, runs_on=["machine:worker-1"])
++    # a card that needs no board tools is fine on the kanban-less worker.
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
++    assert kb.create_task(hub.conn, title="d", assignee="default", requires=["terminal", "file", "git"],
++                          runs_on=["machine:worker-1"])
++
++
++def test_tool_create_refusal_names_the_machine(gws, monkeypatch):
++    _hub, _ = gws
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
++    from tools import kanban_tools as kt
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    out = json.loads(kt._handle_create({"title": "heavy", "assignee": "default", "requires": NEEDS,
++                                        "runs_on": ["machine:worker-1"], "placement": "local"}))
++    assert out.get("error") and "worker-1" in out["error"] and "kanban" in out["error"], out
++
++
++# --- (a) move --------------------------------------------------------------------------------------------------
++
++def _running_hub_card(hub, **kw):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="work", assignee="default", runs_on=["machine:hub"], **kw)
++    hub.round()
++    hub.tick()
++    assert kb.get_task(hub.conn, tid).status == "running"
++    hub.round()
++    return tid, hub.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++
++
++def test_move_to_a_machine_known_to_lack_a_tool_is_refused_naming_it(gws, monkeypatch):
++    hub, _ = gws
++    _publish(monkeypatch, {})
++    tid, run_id = _running_hub_card(hub, requires=NEEDS)
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="heavy", checkpoint="x",
++                       expected_run_id=run_id)
++    assert not res["ok"] and res["reason_code"] == "capability_mismatch", res
++    assert "worker-1" in res["error"] and "kanban" in res["error"]
++    t = kb.get_task(hub.conn, tid)
++    assert t.status == "running" and json.loads(
++        hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == ["machine:hub"]
++    # Control: the same move succeeds once the worker publishes the tool.
++    _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "kanban"}}})
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="heavy", checkpoint="x",
++                       expected_run_id=run_id)
++    assert res["ok"], res
++
++
++def test_queued_move_is_refused_too(gws, monkeypatch):
++    hub, _ = gws
++    _publish(monkeypatch, {})
++    tid = kb.create_task(hub.conn, title="q", assignee="default", requires=NEEDS, runs_on=["machine:hub"],
++                         triage=True)
++    _publish(monkeypatch, {WORKER: {"default": {"terminal"}}})
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="heavy")
++    assert not res["ok"] and res["reason_code"] == "capability_mismatch" and "worker-1" in res["error"], res
++
++
++# --- (b) claim -------------------------------------------------------------------------------------------------
++
++def test_worker_does_not_claim_a_card_its_profile_cannot_satisfy(gws, svc, monkeypatch):
++    hub, worker = gws
++    _publish(monkeypatch, {})  # worker-1 publishes no profile tools (live today): create cannot know
++    # worker-1's `default` has no shell.
++    with open(worker.home / "config.yaml", "a") as fh:
++        fh.write(NO_SHELL)
++    tid = kb.create_task(hub.conn, title="heavy", assignee="default", requires=["terminal", "file"],
++                         runs_on=["machine:worker-1"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None, "worker-1 copied a card its default profile cannot satisfy"
++    assert tid not in svc.board(BOARD)["leases"]
++    hub.round()
++    assert kb.get_task(hub.conn, tid).status == "ready"
++    # Control: once worker-1's default has a shell, it takes the card.
++    (worker.home / "config.yaml").write_text(
++        (worker.home / "config.yaml").read_text().replace(NO_SHELL, WITH_KANBAN))
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is not None
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++
++
++def test_worker_claims_a_requires_kanban_card_without_kanban_in_its_chat_toolsets(gws, svc, monkeypatch):
++    """The 10-28 card: worker-1's `default` has no `kanban` in platform_toolsets.cli, but every dispatched
++    worker gets the kanban toolset (model_tools), so it can run AND hand back a requires-kanban card."""
++    hub, worker = gws
++    _publish(monkeypatch, {})
++    tid = kb.create_task(hub.conn, title="heavy", assignee="default", requires=NEEDS, runs_on=["machine:worker-1"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++
++
++def test_worker_defers_a_requires_kanban_card_when_kanban_is_disabled(gws, svc, monkeypatch):
++    hub, worker = gws
++    _publish(monkeypatch, {})
++    with open(worker.home / "config.yaml", "a") as fh:
++        fh.write("agent:\n  disabled_toolsets: [kanban]\n")
++    tid = kb.create_task(hub.conn, title="heavy", assignee="default", requires=NEEDS, runs_on=["machine:worker-1"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid) is None and tid not in svc.board(BOARD)["leases"]
++
++
++def test_claim_refusal_reads_replica_row_fields():
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    assert roc.claim_refusal({"id": "t", "assignee": None, "requires": json.dumps(NEEDS)}) is None
++    assert roc.claim_refusal({"id": "t", "assignee": "default", "requires": json.dumps(["bogus"])})
++
++
++# --- (c) request_changes ---------------------------------------------------------------------------------------
++
++LOCAL = "platform_toolsets: {cli: [terminal, file, kanban]}\nterminal: {backend: local}\n"
++
++
++@pytest.fixture
++def profiles(tmp_path, monkeypatch):
++    from pathlib import Path
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++
++    def configure(name, policy=LOCAL):
++        target = home / "profiles" / name
++        target.mkdir(parents=True, exist_ok=True)
++        (target / "config.yaml").write_text(policy)
++
++    configure("implementer")
++    configure("reviewer")
++    kb.init_db()
++    return configure
++
++
++def _in_review_run(conn):
++    tid = kb.create_task(conn, title="ran on a worker node", assignee="implementer", requires=NEEDS)
++    assert kb.claim_task(conn, tid) is not None
++    assert kb.request_review(conn, tid, reviewer="reviewer", expected_run_id=kb.get_task(conn, tid).current_run_id)
++    assert kb.claim_review_task(conn, tid) is not None
++    return tid, kb.get_task(conn, tid).current_run_id
++
++
++def test_request_changes_records_the_verdict_when_the_profile_here_lacks_a_requirement(profiles):
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        tid, run_id = _in_review_run(conn)
++        # This machine's `implementer` lost its shell after it ran the card (policy drift, or another
++        # machine's profile of the same name).
++        profiles("implementer", "platform_toolsets: {cli: [file]}\n")
++        ok, detail = kb.request_changes(conn, tid, reason="Fix the flaky assertion", expected_run_id=run_id)
++        assert ok and detail == "implementer", detail
++        task = kb.get_task(conn, tid)
++        assert task.assignee == "implementer" and task.status == "ready" and task.current_run_id is None
++        (payload,) = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (tid,)).fetchone()
++        ev = json.loads(payload)
++        assert ev["reason"] == "Fix the flaky assertion" and ev["implementer"] == "implementer"
++        assert ev["capability_warning"]["missing"] == ["terminal", "git"]
++        outcome = conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0]
++        assert outcome == "changes_requested"
++
++
++def test_request_changes_tool_records_the_verdict(profiles, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    with kbc.connect() as conn:
++        tid, run_id = _in_review_run(conn)
++    profiles("implementer", "platform_toolsets: {cli: [file]}\n")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    out = json.loads(kt._handle_request_changes({"reason": "Revise the test"}))
++    assert not out.get("error"), out
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.assignee == "implementer" and task.status == "ready"
++
++
++def test_request_changes_without_a_mismatch_records_no_warning(profiles):
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        tid, run_id = _in_review_run(conn)
++        assert kb.request_changes(conn, tid, reason="Revise", expected_run_id=run_id)[0]
++        (payload,) = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (tid,)).fetchone()
++        assert "capability_warning" not in json.loads(payload)
++
++
++def test_request_changes_for_the_10_28_card_needs_no_warning(profiles):
++    """requires=[..., kanban], implementer without `kanban` in its chat toolsets: no mismatch at all."""
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        tid, run_id = _in_review_run(conn)
++        profiles("implementer", "platform_toolsets: {cli: [terminal, file]}\nterminal: {backend: local}\n")
++        assert kb.request_changes(conn, tid, reason="Revise", expected_run_id=run_id)[0]
++        (payload,) = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (tid,)).fetchone()
++        assert "capability_warning" not in json.loads(payload)
+diff --git a/tests/hermes_cli/test_kanban_review_capabilities.py b/tests/hermes_cli/test_kanban_review_capabilities.py
+index 4866345b57..6263f75695 100644
+--- a/tests/hermes_cli/test_kanban_review_capabilities.py
++++ b/tests/hermes_cli/test_kanban_review_capabilities.py
+@@ -62,7 +62,9 @@ def _handoff(conn, tid, operation):
+     return kb.reopen_review_task(conn, tid)
+ 
+ 
+-@pytest.mark.parametrize("operation", ["request", "rerequest", "changes", "reopen"])
++# ``changes`` is not here: request_changes records the verdict for the implementer that already ran the card
++# and only warns (tests/hermes_cli/test_kanban_requires_placement.py, t_01a184ac93d31979). [daveey]
++@pytest.mark.parametrize("operation", ["request", "rerequest", "reopen"])
+ @pytest.mark.parametrize("workspace_kind", ["scratch", "dir", "worktree"])
+ def test_review_rejects_incapable_target_atomically(profiles, operation, workspace_kind):
+     with kbc.connect() as conn:
+-- 
+2.55.0
+

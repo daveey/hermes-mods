@@ -1,0 +1,552 @@
+From c44335f7746592fa03560621d9904024626898d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:53:48 +0000
+Subject: [PATCH] fix(kanban): never dispatch a card this machine cannot lease;
+ pick up pinned reviews [daveey]
+
+The MacBook dispatcher stalled 2026-10-28 16:35-17:08 PDT: one spawn in 33 min while the ready queue grew to 15
+with 5/6 slots used. Every tick deferred t_01a184c7144d5773 (status review, runs_on ["machine:hub"]) with
+claim_deferred: labels_mismatch.
+
+Why chain (confirmed in code):
+- Why 1: each tick spent its spawn on t_01a184c7144d5773 and the Board refused the lease (labels_mismatch):
+  kanban_db_sync.claim_gate via claim_review_task.
+- Why 2: local candidate selection (lane_rows for ready and review, has_spawnable_*) never applied runs_on
+  eligibility; it existed only in kanban_worker_node.eligible (pickup) and in the Board's grantLease.
+- Why 3 (corrected): not "a deferred claim ends the tick" (the lane loops already continue), but the review
+  reservation: _any_spawnable_review saw that card as spawnable review work, so with one free slot
+  ready_budget = 0, the ready lane started nothing, and the review claim was deferred. The reserved slot was
+  never given back to ready work.
+- Why 4: the card sat in review forever because worker-node pickup copied only 'ready' cards, so the hub never
+  took the review of a card pinned to it, and after its implementation run the copy was evicted.
+- Root (happened): runs_on eligibility was enforced only by the remote lease, after local selection, and
+  pickup had no review lane.
+- Root (not caught): no test put a runs_on-ineligible card ahead of eligible work; the stuck detector had no
+  "deferred claims" reason and blamed profile health.
+
+Fix:
+- kanban_worker_node.local_refusals: the Board's refusal (eligible()) for unclaimed cards of a lane, on primary
+  boards; registry unreachable = no local filtering (the lease still fails closed). Used by the ready and
+  review lanes, the review reservation and has_spawnable_ready/review. Refused cards are counted in
+  DispatchResult.skipped_ineligible and never listed by --dry-run.
+- A deferred claim is recorded (DispatchResult.claim_deferred, reason from claim_gate) and the tick moves on;
+  a review-reserved slot no review took goes back to the remaining ready rows in the same tick.
+- Worker-node pickup also takes foreign review cards whose runs_on names this machine (explicit runs_on only,
+  only when review dispatch is on), so the pinned machine reviews them.
+- stuck_warning(): the CLI daemon and the gateway's "dispatcher stuck" line name claim_deferred(<reason>) /
+  skipped_ineligible(<reason>) and point at runs_on and Board leases instead of profile health.
+
+Tests: tests/hermes_cli/test_kanban_runs_on_dispatch.py (acceptance: one free slot, review card pinned to
+another machine ahead of an eligible ready card, the ready card spawns that tick; fails on 131f0a3467 with
+spawned == []). Kanban dispatch/sync/worker-node suites: 27 files, 326 tests passed.
+---
+ gateway/kanban_watchers.py                    |  10 +-
+ hermes_cli/kanban_db_dispatch.py              | 118 ++++++++++---
+ hermes_cli/kanban_db_sync.py                  |  12 ++
+ hermes_cli/kanban_ops.py                      |   9 +-
+ hermes_cli/kanban_worker_node.py              |  39 ++++-
+ .../test_kanban_runs_on_dispatch.py           | 157 ++++++++++++++++++
+ 6 files changed, 306 insertions(+), 39 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_runs_on_dispatch.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index a2c634b434..fe269f469c 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -355,14 +355,8 @@ class GatewayKanbanWatchersMixin:
+                         bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned and not capped else 0
+                     now = int(time.time())
+                     if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+-                        held = _kbd.describe_suppression(res for _slug, res in (results or []))
+-                        logger.warning(
+-                            "kanban dispatcher stuck: ready queue non-empty for "
+-                            "%d consecutive ticks but 0 workers spawned.%s Check "
+-                            "profile health (venv, PATH, credentials) and "
+-                            "`hermes kanban list --status ready`.",
+-                            bad_ticks, f" Last tick held back: {held}." if held else "",
+-                        )
++                        # Names deferred Board claims / unleasable cards when those explain the zero.
++                        logger.warning("%s", _kbd.stuck_warning(bad_ticks, (res for _slug, res in (results or []))))
+                         last_warn_at = now
+                 except asyncio.CancelledError:
+                     logger.debug("kanban dispatcher: cancelled")
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 7888ffc115..5df71a6534 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -183,6 +183,13 @@ class DispatchResult:
+     """``(task_id, assignee, current_running_count)`` deferred because the
+     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
+     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
++    skipped_ineligible: list[tuple[str, str]] = field(default_factory=list)
++    """``(task_id, reason)`` ready/review cards this machine cannot lease (``runs_on`` / creator labels exclude
++    it, ``pinned_only``): the Board would refuse the claim (``labels_mismatch``), so they are never candidates
++    and never hold a slot or the review reservation. [daveey]"""
++    claim_deferred: list[tuple[str, str]] = field(default_factory=list)
++    """``(task_id, reason)`` whose claim the Board lease deferred this tick (``lease_held``, ``labels_mismatch``,
++    ``offline``). The tick moves on to the next candidate; the stuck warning names these. [daveey]"""
+     crashed: list[str] = field(default_factory=list)
+     """Task ids reclaimed because their worker PID disappeared."""
+     remote_archived: list[str] = field(default_factory=list)
+@@ -252,6 +259,12 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
+             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+         if res.skipped_owned:
+             counts["skipped_owned"] = counts.get("skipped_owned", 0) + 1
++        for _task_id, reason in res.claim_deferred:
++            key = f"claim_deferred({reason})"
++            counts[key] = counts.get(key, 0) + 1
++        for _task_id, reason in res.skipped_ineligible:
++            key = f"skipped_ineligible({reason})"
++            counts[key] = counts.get(key, 0) + 1
+         if res.memory_pressure:
+             pressure = res.memory_pressure
+         if res.at_capacity:
+@@ -264,6 +277,22 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
+     return ", ".join(parts)
+ 
+ 
++def stuck_warning(bad_ticks: int, results: Iterable[Optional[DispatchResult]]) -> str:
++    """The "dispatcher stuck" line for the CLI daemon and the embedded gateway dispatcher.
++
++    When the Board deferred claims or the queue held cards this machine cannot lease, the line says so and points
++    at the Board leases and ``runs_on``; it only blames profile health when nothing else explains the zero."""
++    results = list(results)
++    held = describe_suppression(results)
++    msg = (f"kanban dispatcher stuck: ready queue non-empty for {bad_ticks} consecutive ticks but 0 workers "
++           f"spawned.{f' Last tick held back: {held}.' if held else ''}")
++    lease_bound = any(res is not None and (res.claim_deferred or res.skipped_ineligible) for res in results)
++    if lease_bound:
++        return (msg + " The Board lease refused or deferred claims: check the cards' runs_on / placement "
++                "(`hermes kanban show <id>`) and which machine holds or may take their Board lease.")
++    return msg + " Check profile health (venv, PATH, credentials) and `hermes kanban list --status ready`."
++
++
+ def all_at_capacity(results: Iterable[Optional[DispatchResult]]) -> bool:
+     """True when every board's tick that ran was held only by a full concurrency cap (nothing could spawn).
+ 
+@@ -2015,12 +2044,23 @@ def dispatch_profile_allowlist_summary() -> str:
+             "profile, or the config could not be read — omit the key to allow any)")
+ 
+ 
++def _local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
++    """Cards in ``status`` this machine cannot lease (``kanban_worker_node.local_refusals``); never raises."""
++    try:
++        from hermes_cli.kanban_worker_node import local_refusals
++        return local_refusals(conn, status)
++    except Exception:  # health: allow BLE001 -- eligibility is advisory; the Board lease still decides
++        _kb._log.debug("kanban dispatch: local eligibility check failed", exc_info=True)
++        return {}
++
++
+ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+-    rows = conn.execute(
+-        "SELECT DISTINCT assignee FROM tasks "
++    refused = _local_refusals(conn, status)
++    rows = [row for row in conn.execute(
++        "SELECT id, assignee FROM tasks "
+         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
+         (status,),
+-    ).fetchall()
++    ).fetchall() if row["id"] not in refused]
+     if not rows:
+         return False
+     profile_exists = _profile_exists_fn()
+@@ -2338,8 +2378,12 @@ def _dispatch_lane_task(
+         _count_spawn(assignee)
+         return True
+     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
++    _kb._sync.pop_claim_deferral(task_id)
+     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+     if claimed is None:
++        deferral = _kb._sync.pop_claim_deferral(task_id)
++        if deferral is not None:  # the Board said no this tick: the caller moves on to the next candidate
++            result.claim_deferred.append((task_id, deferral))
+         return False
+     try:
+         resolved_branch_name = None
+@@ -2687,10 +2731,14 @@ def _dispatch_once_locked(
+         except Exception:
+             _kb._log.debug("kanban dispatch: triage sweep failed", exc_info=True)
+     _kb._sync.worker_pickup(conn, spawn_budget, dry_run, _profile_exists_fn)  # worker node (RFC "Placement")
+-    ready_rows = lane_rows(conn, "ready")
++    # Cards this machine cannot lease (runs_on for another machine, ...) are never candidates: before 10-28 a
++    # review card pinned to the hub sat first in the MacBook's review lane, took the review reservation every
++    # tick, and the Board refused its lease every tick, so the eligible ready queue never started.
++    ready_rows = _eligible_rows(conn, lane_rows(conn, "ready"), "ready", result)
+     # Review rows are enumerated up front so the budget split can see whether
+     # review work exists at all.
+-    review_rows = lane_rows(conn, "review") if review_dispatch_enabled() else []
++    review_rows = (_eligible_rows(conn, lane_rows(conn, "review"), "review", result)
++                   if review_dispatch_enabled() else [])
+     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
+     # skipped_unassigned — "busy, retry later" differs from "needs routing".
+     # Resolved BEFORE the review reservation so the reservation can see which
+@@ -2727,22 +2775,32 @@ def _dispatch_once_locked(
+     )
+     default_assignee = _resolve_default_assignee(default_assignee)
+     spawned = 0
+-    for row in ready_rows:
+-        if ready_budget is not None and spawned >= ready_budget:
+-            break
+-        row_assignee = row["assignee"]
+-        if not row_assignee:
+-            # Honour kanban.default_assignee so an unassigned task doesn't
+-            # park in 'ready' forever.
+-            if not default_assignee or not _apply_default_assignee(
+-                conn, row["id"], default_assignee, dry_run=dry_run,
+-            ):
+-                result.skipped_unassigned.append(row["id"])
+-                continue
+-            row_assignee = default_assignee
+-            result.auto_assigned_default.append(row["id"])
+-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+-            spawned += 1
++    next_ready = 0
++
++    def _run_ready(limit: Optional[int]) -> None:
++        # Resumable: a deferred or refused claim never ends the tick, the loop moves on to the next row, and
++        # a second call after the review lane continues where this one stopped.
++        nonlocal spawned, next_ready
++        while next_ready < len(ready_rows):
++            if limit is not None and spawned >= limit:
++                return
++            row = ready_rows[next_ready]
++            next_ready += 1
++            row_assignee = row["assignee"]
++            if not row_assignee:
++                # Honour kanban.default_assignee so an unassigned task doesn't
++                # park in 'ready' forever.
++                if not default_assignee or not _apply_default_assignee(
++                    conn, row["id"], default_assignee, dry_run=dry_run,
++                ):
++                    result.skipped_unassigned.append(row["id"])
++                    continue
++                row_assignee = default_assignee
++                result.auto_assigned_default.append(row["id"])
++            if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
++                spawned += 1
++
++    _run_ready(ready_budget)
+ 
+     # A review agent (sdlc-review) approves (→ done) or requests changes
+     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
+@@ -2756,9 +2814,27 @@ def _dispatch_once_locked(
+             continue
+         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+             spawned += 1
++    # The review reservation is only a hold: a slot no review took (its claim deferred, guarded, capped) goes
++    # back to the ready rows still waiting this tick.
++    _run_ready(spawn_budget)
+     return result
+ 
+ 
++def _eligible_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row], status: str,
++                   result: DispatchResult) -> list[sqlite3.Row]:
++    refused = _local_refusals(conn, status) if rows else {}
++    if not refused:
++        return rows
++    kept = []
++    for row in rows:
++        reason = refused.get(row["id"])
++        if reason is None:
++            kept.append(row)
++        else:
++            result.skipped_ineligible.append((row["id"], reason))
++    return kept
++
++
+ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
+     try:
+         parsed = int(value)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 06d56d70e9..6dd1cd22fe 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -689,6 +689,16 @@ class ClaimGate:
+             _log.info("kanban sync: release of unused lease for %s failed: %s", task_id, err)
+ 
+ 
++# task_id -> why the Board did not grant its lease, set by :func:`claim_gate` and read once by the dispatcher
++# (:func:`pop_claim_deferral`), so a tick can tell a deferred claim from a lost CAS and the "dispatcher stuck"
++# warning can name it.
++_CLAIM_DEFERRALS: dict[str, str] = {}
++
++
++def pop_claim_deferral(task_id: str) -> Optional[str]:
++    return _CLAIM_DEFERRALS.pop(task_id, None)
++
++
+ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str = "ready") -> ClaimGate:
+     """Lease seam before a claim CAS. Only ``primary`` boards ask the service;
+     without a grant the card stays ``ready`` (no offline claims: every card is
+@@ -703,9 +713,11 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+                                   ttl_s=max(expires - int(time.time()), 1), lane=lane)
+     except _CLIENT_ERRORS as exc:  # fail closed: an unreachable service defers the claim
+         _log.info("claim_deferred: offline task=%s (%s: %s)", task_id, type(exc).__name__, exc)
++        _CLAIM_DEFERRALS[task_id] = "offline"
+         return ClaimGate(expires, deferred=True)
+     if not lease.granted:
+         _log.info("claim_deferred: %s task=%s holder=%s", lease.reason or "denied", task_id, lease.holder)
++        _CLAIM_DEFERRALS[task_id] = lease.reason or "denied"
+         return ClaimGate(expires, deferred=True)
+     deadline = lease.expires_ms // 1000 - LEASE_SAFETY_MARGIN_SECONDS
+     return ClaimGate(min(expires, deadline), lease=lease, ids=ids)
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index dd2e75b12b..46b8af0502 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -240,14 +240,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
+         if health_state["bad_ticks"] >= HEALTH_WINDOW:
+             now = int(time.time())
+             if now - health_state["last_warn_at"] >= 300:
+-                held = kbd.describe_suppression([res])
+-                held = f" Last tick held back: {held}." if held else ""
+                 print(
+-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
+-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
+-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
+-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
+-                    f"recent spawn_failed tasks.",
++                    f"[{_fmt_ts(now)}] WARN {kbd.stuck_warning(health_state['bad_ticks'], [res])}"
++                    " See `hermes kanban list --status blocked` for recent spawn_failed tasks.",
+                     file=sys.stderr, flush=True,
+                 )
+                 health_state["last_warn_at"] = now
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 6076d76c11..7d2fb1fbcd 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -209,16 +209,45 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     return gone
+ 
+ 
++def local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
++    """``{task_id: reason}`` for unclaimed ``status`` cards this gateway cannot lease: the Board's refusal
++    (:func:`eligible`) computed before the claim, so local dispatch never spends a slot on them. Only cards with
++    ``runs_on`` or another creator can be refused (a held machine is left to the lease). Empty when the board is
++    not primary or the registry is unreachable: the lease stays the authority and fails closed."""
++    if sync.board_mode(conn) != "primary":
++        return {}
++    own = _own(conn)
++    rows = conn.execute(
++        "SELECT id, runs_on, created_on, workspace_kind FROM tasks WHERE status = ? AND claim_lock IS NULL "
++        "AND (runs_on IS NOT NULL OR (created_on IS NOT NULL AND created_on != ?))", (status, own)).fetchall()
++    if not rows:
++        return {}
++    reg = registry()
++    if not reg:
++        return {}
++    machines = reg["machines"]
++    out: dict[str, str] = {}
++    for row in rows:
++        reason = eligible(dict(row), own, machines)
++        if reason is not None and reason != "held":
++            out[row["id"]] = reason
++    return out
++
++
+ def candidates(replica: sqlite3.Connection, own: str, *, now_ms: Optional[int] = None) -> list[sqlite3.Row]:
++    """Foreign ``ready`` and ``review`` cards without a live lease, reviews first (they finish work in flight).
++    A review runs where its ``runs_on`` says, like its implementation run did: before 10-28 only ``ready`` was
++    picked up, so a ``runs_on=[machine:hub]`` card that asked for review sat in the MacBook's review column,
++    which the MacBook could never lease (``labels_mismatch``)."""
+     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+     return replica.execute(
+-        "SELECT * FROM tasks WHERE status = 'ready' AND created_on IS NOT NULL AND created_on != ? "
++        "SELECT * FROM tasks WHERE status IN ('ready', 'review') AND created_on IS NOT NULL AND created_on != ? "
+         "AND (lease_holder IS NULL OR COALESCE(lease_expires, 0) < ?) "
+         # The replica holds the whole board: a card with an open (or missing) parent would only be refused
+         # parents_not_done by the Board, and that refusal demotes it on every machine. [daveey]
+         "AND NOT EXISTS (SELECT 1 FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
+         "WHERE l.child_id = tasks.id AND COALESCE(p.status, '') NOT IN ('done', 'archived')) "
+-        "ORDER BY priority DESC, created_at, id",
++        "ORDER BY status = 'review' DESC, priority DESC, created_at, id",
+         (own, now_ms)).fetchall()
+ 
+ 
+@@ -278,6 +307,8 @@ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+     from hermes_cli import kanban_lockguard
+     replica = kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+     replica.row_factory = sqlite3.Row
++    from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
++    review_enabled = review_dispatch_enabled()
+     try:
+         picked: list[str] = []
+         for card in candidates(replica, own):
+@@ -285,7 +316,9 @@ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+                 break
+             if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (card["id"],)).fetchone():
+                 continue
+-            if mode == "explicit" and card["runs_on"] is None:
++            if (mode == "explicit" or card["status"] == "review") and card["runs_on"] is None:
++                continue  # a default-placement review stays with its creator
++            if card["status"] == "review" and not review_enabled:
+                 continue
+             if eligible(dict(card), own, machines) is not None:
+                 continue
+diff --git a/tests/hermes_cli/test_kanban_runs_on_dispatch.py b/tests/hermes_cli/test_kanban_runs_on_dispatch.py
+new file mode 100644
+index 0000000000..87dbd8c013
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_runs_on_dispatch.py
+@@ -0,0 +1,157 @@
++"""Local dispatch applies the Board's runs_on / label eligibility before it claims (MacBook stall, 2026-10-28).
++
++The Mac's review lane held a card with ``runs_on=["machine:hub"]``: every tick the review reservation kept a slot
++for it, the Board refused the lease (``labels_mismatch``) and the eligible ready queue never started. Cards this
++machine cannot lease are never candidates (counted in ``skipped_ineligible``), a deferred claim never ends the
++tick, and the machine named by ``runs_on`` picks the review card up and reviews it.
++"""
++
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)  # the Board refuses runs_on it can't satisfy
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "normal")
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="explicit")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _spawned(res):
++    return [tid for tid, _a, _w in res.spawned]
++
++
++def _review_card_pinned_to_worker(hub, worker):
++    """The production path: the hub creates a card for worker-1, worker-1 runs it and asks for review, and the
++    card lands back in the hub's review column with runs_on=[machine:worker-1]."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="pinned to worker-1", assignee="default", runs_on=["machine:worker-1"])
++    hub.round()
++    worker.round()
++    assert tid in _spawned(worker.tick())
++    worker.enter()
++    run_id = worker.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert kb.request_review(worker.conn, tid, summary="implemented", expected_run_id=run_id)
++    worker.round()
++    hub.round()
++    assert kb.get_task(hub.conn, tid).status == "review"
++    return tid
++
++
++def test_an_ineligible_review_card_does_not_hold_the_last_slot(gws, svc):
++    """Acceptance: one free slot, a review card pinned to another machine ahead of an eligible ready card. The
++    ready card spawns in that same tick."""
++    hub, worker = gws
++    review = _review_card_pinned_to_worker(hub, worker)
++    hub.enter()
++    ready = kb.create_task(hub.conn, title="eligible here", assignee="default")
++    res = hub.tick(max_in_progress=1)
++    assert _spawned(res) == [ready]
++    assert (review, "labels_mismatch") in res.skipped_ineligible
++    assert kb.get_task(hub.conn, review).status == "review"
++    assert svc.board(BOARD)["leases"].get(review, {}).get("holder") != HUB
++
++
++def test_dry_run_never_lists_a_card_this_machine_cannot_lease(gws):
++    hub, worker = gws
++    review = _review_card_pinned_to_worker(hub, worker)
++    hub.enter()
++    other = kb.create_task(hub.conn, title="worker only", assignee="default", runs_on=["machine:worker-1"])
++    res = hub.tick(dry_run=True)
++    assert review not in _spawned(res) and other not in _spawned(res)
++    assert {t for t, _r in res.skipped_ineligible} >= {review, other}
++
++
++def test_health_probe_does_not_count_ineligible_cards(gws):
++    hub, worker = gws
++    _review_card_pinned_to_worker(hub, worker)
++    hub.enter()
++    kb.create_task(hub.conn, title="worker only", assignee="default", runs_on=["machine:worker-1"])
++    assert not kbd.has_spawnable_ready(hub.conn)
++    assert not kbd.has_spawnable_review(hub.conn)
++    kb.create_task(hub.conn, title="mine", assignee="default")
++    assert kbd.has_spawnable_ready(hub.conn)
++
++
++def test_the_pinned_machine_picks_up_and_reviews_the_card(gws, svc):
++    """The other half of the stall: worker-1 must take the review it is pinned to, or the card sits forever."""
++    hub, worker = gws
++    tid = _review_card_pinned_to_worker(hub, worker)
++    worker.round()
++    res = worker.tick()
++    assert tid in _spawned(res)
++    lease = svc.board(BOARD)["leases"][tid]
++    assert lease["holder"] == WORKER and lease.get("lane", "review") == "review"
++    assert worker.conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    worker.enter()
++    run_id = worker.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert kb.complete_task(worker.conn, tid, summary="approved", expected_run_id=run_id)
++    worker.round()
++    hub.round()
++    assert kb.get_task(hub.conn, tid).status == "done"
++
++
++def test_a_deferred_review_claim_hands_its_slot_to_ready_work(gws, svc):
++    """A review card this machine may lease, but the Board refuses this tick (another gateway holds it): the
++    reserved slot goes to the next ready card instead of ending the tick."""
++    hub, _ = gws
++    hub.enter()
++    review = kb.create_task(hub.conn, title="needs review", assignee="default")
++    assert kb.request_review(hub.conn, review, summary="x")
++    hub.round()
++    svc.board(BOARD)["leases"][review] = {"task_id": review, "holder": "mini", "run_uid": "r-mini", "lane": "review",
++                                          "expires": 9e12}
++    ready = kb.create_task(hub.conn, title="ready work", assignee="default")
++    res = hub.tick(max_in_progress=1)
++    assert _spawned(res) == [ready]
++    assert [t for t, _r in res.claim_deferred] == [review]
++    assert "claim_deferred" in kbd.describe_suppression([res])
++
++
++def test_stuck_warning_names_deferred_claims_not_profile_health():
++    res = kbd.DispatchResult()
++    res.claim_deferred.append(("t_x", "labels_mismatch"))
++    res.skipped_ineligible.append(("t_y", "labels_mismatch"))
++    msg = kbd.stuck_warning(45, [res])
++    assert "claim_deferred(labels_mismatch)=1" in msg and "skipped_ineligible(labels_mismatch)=1" in msg
++    assert "profile health" not in msg and "Board" in msg
++    assert "profile health" in kbd.stuck_warning(45, [kbd.DispatchResult()])
++
++
++def test_unsynced_boards_are_unaffected(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++    from tests.hermes_cli import kanban_sync_support as support
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "normal")
++    home = support.kanban_home(tmp_path, monkeypatch)
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        tid = kb.create_task(conn, title="plain", assignee="default")
++        assert kbd.has_spawnable_ready(conn)
++        res = kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: os.getpid())
++        assert _spawned(res) == [tid] and res.skipped_ineligible == []
++    finally:
++        conn.close()
+-- 
+2.55.0
+

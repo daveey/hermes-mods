@@ -1,0 +1,119 @@
+From 742aed2a386b3dea5c8e6c77e4962b4b0c581d79 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 22:20:54 +0000
+Subject: [PATCH 426/453] fix(routing): preserve standing class across
+ temporary gateway pins
+
+(cherry picked from commit 742aed2a386b3dea5c8e6c77e4962b4b0c581d79)
+---
+ gateway/slash_commands_model.py               |  6 ++-
+ .../test_class_model_switch_persistence.py    | 49 +++++++++++++++++++
+ tests/gateway/test_messaging_class_routing.py | 11 +++++
+ 3 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/slash_commands_model.py b/gateway/slash_commands_model.py
+index 5259bbe717..bcdc3afc97 100644
+--- a/gateway/slash_commands_model.py
++++ b/gateway/slash_commands_model.py
+@@ -193,6 +193,10 @@ class GatewayModelCommandsMixin:
+         cached_agent = self._cached_agent_for(ctx.session_key)
+         if cached_agent is None:
+             return None
++        if ctx.one_turn and not picker and getattr(cached_agent, "model_routing", None):
++            # The temporary turn is rebuilt from its override below. Switching the
++            # standing class agent here would durably clear its routing provenance.
++            return None
+         try:
+             cached_agent.switch_model(
+                 new_model=result.new_model, new_provider=result.target_provider,
+@@ -221,7 +225,7 @@ class GatewayModelCommandsMixin:
+ 
+         # Persist the new model to the session DB so the dashboard shows the updated model (#34850).
+         _sess_db = getattr(self, "_session_db", None)
+-        if _sess_db is not None:  # so the dashboard shows the updated model
++        if _sess_db is not None and not one_turn:  # temporary pins must not survive restart
+             try:
+                 _sess_entry = await self.async_session_store.get_or_create_session(source)
+                 # Typed path: consume the auto-reset flag so the next message's cleanup does not
+diff --git a/tests/gateway/test_class_model_switch_persistence.py b/tests/gateway/test_class_model_switch_persistence.py
+index 60dbe22997..1126b222df 100644
+--- a/tests/gateway/test_class_model_switch_persistence.py
++++ b/tests/gateway/test_class_model_switch_persistence.py
+@@ -53,3 +53,52 @@ async def test_same_model_global_pin_clears_class_without_cached_agent(tmp_path,
+         assert config["provider"] == "anthropic"
+     finally:
+         reopened.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("cached", [False, True])
++async def test_once_pin_preserves_durable_class_before_and_after_restore(tmp_path, monkeypatch, cached):
++    db = SessionDB(db_path=tmp_path / "sessions.db")
++    metadata = {"requested_class": "deep", "selected_model": "selected-model"}
++    db.create_session("s", source="local", model="selected-model", model_config={"model_routing": metadata})
++    runner = GatewayRunner.__new__(GatewayRunner)
++    runner._session_db = AsyncSessionDB(db)
++    runner.session_store = SimpleNamespace(_entries={"key": SimpleNamespace(session_id="s")})
++    runner._async_session_store = SimpleNamespace(
++        _store=runner.session_store,
++        get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="s")),
++        set_model_override=AsyncMock(),
++    )
++    runner._session_model_overrides = {}
++    runner._evict_cached_agent = Mock()
++    agent = SimpleNamespace(model_routing=metadata)
++
++    def switch(**kwargs):
++        # The common agent switch deliberately clears provenance for permanent pins.
++        db.patch_session_model_config("s", {"model_routing": None})
++        agent.model_routing = None
++
++    agent.switch_model = Mock(side_effect=switch)
++    runner._cached_agent_for = Mock(return_value=agent if cached else None)
++    ctx = _ModelSwitchContext(session_key="key", source=None, config_path=None,
++                              persist_global=False, one_turn=True, current_model="selected-model",
++                              restore_snapshot=runner._snapshot_session_model_override("key"))
++    result = SimpleNamespace(new_model="temporary-model", target_provider="anthropic", api_key="",
++                             base_url="", api_mode="anthropic_messages", provider_label="Anthropic",
++                             request_overrides={}, runtime_capabilities={})
++    try:
++        assert runner._switch_cached_agent_model(result, ctx, False) is None
++        assert await runner._record_model_switch(result, ctx, source=None, one_turn=True, picker=False) is None
++        assert runner._session_model_overrides["key"]["model"] == "temporary-model"
++        runner._async_session_store.set_model_override.assert_not_awaited()
++        # Crash/restart before a temporary turn must retain the standing allocation.
++        assert stored_class(runner, "key") == "class:deep"
++        assert db.get_session("s")["model"] == "selected-model"
++        assert json.loads(db.get_session("s")["model_config"])["model_routing"] == metadata
++        runner._restore_pending_one_turn_model_override("key")
++        assert not runner._session_model_overrides
++        assert stored_class(runner, "key") == "class:deep"
++        if cached:
++            agent.switch_model.assert_not_called()
++    finally:
++        db.close()
+diff --git a/tests/gateway/test_messaging_class_routing.py b/tests/gateway/test_messaging_class_routing.py
+index a9359abcf2..1e05ebda62 100644
+--- a/tests/gateway/test_messaging_class_routing.py
++++ b/tests/gateway/test_messaging_class_routing.py
+@@ -81,6 +81,17 @@ def test_resume_ignores_changed_defaults_but_explicit_pin_wins(routing_home, str
+             "model": "exact-user-pin", "provider": "anthropic", "api_key": "fake", "credential_pool": object()}))
+         model, runtime = runner._resolve_session_agent_runtime(user_config=routing_home)
+         assert model == "exact-user-pin"
++    # A temporary concrete turn shares the transcript, not the durable class route.
++    with patch("model_tools.get_tool_definitions", return_value=[]):
++        temporary = AIAgent(model="temporary-model", provider="anthropic", api_mode="anthropic_messages",
++                            api_key="sk-ant-oat01-test-only", session_id="stored-class", session_db=db,
++                            skip_context_files=True, skip_memory=True, quiet_mode=True)
++        try:
++            assert temporary.run_conversation("Temporary turn")["final_response"] == "ok"
++            assert temporary.model_routing is None
++            assert stored_class(runner, "test-session-key") == "class:deep"
++        finally:
++            temporary.release_clients()
+     agent.release_clients()
+     db.close()
+ 
+-- 
+2.54.0 (Apple Git-157)
+

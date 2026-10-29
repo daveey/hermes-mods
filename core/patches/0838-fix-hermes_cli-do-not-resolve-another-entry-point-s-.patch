@@ -1,0 +1,395 @@
+From 1ccc80512eb199d012c34f1619f16ed219201aa4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:36:14 +0000
+Subject: [PATCH] fix(hermes_cli): do not resolve another entry point's -p at
+ import [daveey]
+
+Importing hermes_cli.main scanned sys.argv for -p/--profile and treated
+pytest's separate `-p usage_guard_probe` as a Hermes profile, then
+SystemExit'd the importer. Only a Hermes CLI process (console script or
+python -m hermes_cli.main) now owns that scan. Real -p/--profile selection
+is unchanged.
+
+Problem: importing hermes_cli.main under pytest with a separate
+`-p usage_guard_probe` raised FileNotFoundError then SystemExit(1)
+(26 setup errors; hermes_cli/main.py resolve_profile_env).
+Why 1: the scanner returned any token matching the profile-id regex.
+Why 2: the foreign-flag skip ran only when the value did not match that
+regex; `no:xdist` is skipped for the colon, `usage_guard_probe` is not.
+Why 3: the invocation check was consulted only on the invalid-name exit,
+and only asked whether argv[0] contained "pytest".
+Root (happened): import-time argv scan claimed profile-shaped -p without
+requiring the process to be the Hermes CLI.
+Root (not caught): the regression covered option-looking values only.
+Concatenated `-pusage_guard_probe` does not match the token-exact -p check.
+Recurrence: first hit of a profile-shaped plugin id.
+---
+ hermes_cli/main.py                           | 100 +++--------------
+ hermes_cli/main_profile_argv.py              | 110 +++++++++++++++++++
+ tests/hermes_cli/test_ux_messages_startup.py | 102 +++++++++++++++++
+ 3 files changed, 229 insertions(+), 83 deletions(-)
+ create mode 100644 hermes_cli/main_profile_argv.py
+
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index a64b435cb2..239ed1dea5 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -430,91 +430,16 @@ _startup_fast.ensure_project_root_on_path()
+ # cache HERMES_HOME at import time. --profile/-p is pre-parsed from sys.argv,
+ # HERMES_HOME set, and the flag stripped so argparse never sees it. Falls back
+ # to ~/.hermes/active_profile for the sticky default.
+-_PROFILE_NAME_RE = r"^[a-z0-9][a-z0-9_-]{0,63}$"  # mirrors hermes_cli.profiles._PROFILE_ID_RE
+ # Set only when -p/--profile was on argv. Sticky active_profile must not count:
+ # `hermes desktop` with no flag must not overwrite Desktop's stored profile.
+ _explicit_cli_profile: str | None = None
+ 
+-
+-def _inside_mcp_add_args(argv: list, index: int) -> bool:
+-    """True once argv reaches `hermes mcp add ... --args <command argv>`.
+-
+-    ``mcp add --args`` is command-argv passthrough. Flags after that point
+-    belong to the child MCP command (for example Docker MCP Toolkit's
+-    ``--profile``), not to Hermes' own profile selector.
+-    """
+-    try:
+-        mcp_index = argv.index("mcp", 0, index)
+-        argv.index("add", mcp_index + 1, index)
+-    except ValueError:
+-        return False
+-    return True
+-
+-
+-def _looks_like_hermes_invocation() -> bool:
+-    """False when ``sys.argv`` belongs to a test runner rather than a ``hermes`` run.
+-
+-    pytest's own ``-p no:xdist`` reaches ``_scan_profile_flag`` through ``sys.argv`` at import
+-    time; it must stay a silent skip, while a real ``hermes -p 'Work Bot'`` must fail loudly.
+-    """
+-    return "pytest" not in (sys.argv[0] or "")
+-
+-
+-def _exit_invalid_profile_name(value: str) -> None:
+-    from hermes_cli.profiles import _invalid_profile_name_error
+-
+-    print(f"Error: {_invalid_profile_name_error(value)}", file=sys.stderr)
+-    print("Run `hermes profile list` to see your profiles.", file=sys.stderr)
+-    sys.exit(2)
+-
+-
+-def _looks_like_option_value(value: str) -> bool:
+-    """A ``-p`` value that clearly belongs to some other tool (pytest's ``-p no:xdist``, a
+-    third-party ``-p --flag``), never a mistyped profile name."""
+-    return value.startswith("-") or ":" in value
+-
+-
+-def _scan_profile_flag(argv: list) -> tuple:
+-    """Find -p/--profile/--profile= in argv -> (name, tokens_consumed, index).
+-
+-    Historically the flag worked even after the subcommand (`hermes chat -p
+-    coder`), so scan broadly; stop at ``--`` and at the `mcp add --args`
+-    passthrough region. The value is normalised (strip + casefold, matching
+-    ``profiles.normalize_profile_name``) before validation so ``-p Work`` selects
+-    ``work``. A value that cannot be a profile name is rejected so
+-    resolve_profile_env never sys.exits on it; the rejection is explained (exit 2)
+-    only when the flag comes BEFORE the first subcommand token under a real
+-    ``hermes`` run — after a subcommand, ``-p`` may belong to that subcommand or a
+-    plugin (`hermes kanban ... -p 8080`), and option-looking values (``no:xdist``,
+-    ``--flag``) are always a silent skip.
+-    """
+-    from hermes_cli._parser import top_level_value_flag_sets
+-
+-    value_flags, optional_value_flags = top_level_value_flag_sets()
+-    i = 0
+-    saw_subcommand = False
+-    while i < len(argv):
+-        arg = argv[i]
+-        if arg == "--" or (arg == "--args" and _inside_mcp_add_args(argv, i)):
+-            break
+-        if arg in {"--profile", "-p"} and i + 1 < len(argv):
+-            raw = argv[i + 1]
+-            value = raw.strip().casefold()
+-            if re.match(_PROFILE_NAME_RE, value):
+-                return value, 2, i
+-            if not saw_subcommand and not _looks_like_option_value(raw) and _looks_like_hermes_invocation():
+-                _exit_invalid_profile_name(raw)
+-            break
+-        if arg.startswith("--profile="):
+-            return arg.split("=", 1)[1].strip().casefold(), 1, i
+-        takes_value = "=" not in arg and i + 1 < len(argv) and (
+-            arg in value_flags
+-            or (arg in optional_value_flags and not argv[i + 1].startswith("-"))
+-        )
+-        if not takes_value and not arg.startswith("-"):
+-            saw_subcommand = True
+-        i += 2 if takes_value else 1
+-    return None, 0, None
++# Import-time-safe sibling: it does not read HERMES_HOME. The scanner lives
++# here so this file does not grow; re-exported for existing callers.
++from hermes_cli.main_profile_argv import (
++    _looks_like_hermes_invocation,
++    _scan_profile_flag,
++)
+ 
+ 
+ def _resolve_sudo_user_profile_env(name: str) -> str | None:
+@@ -593,11 +518,20 @@ def explicit_cli_profile() -> str | None:
+ 
+ 
+ def _apply_profile_override() -> None:
+-    """Pre-parse --profile/-p and set HERMES_HOME before imports."""
++    """Pre-parse --profile/-p and set HERMES_HOME before imports.
++
++    Only a Hermes CLI process owns ``-p``/``--profile``. Importing this module
++    from pytest (or any other entry point) must ignore that argv: a separate
++    ``-p usage_guard_probe`` is a plugin flag, not a profile, and resolving it
++    ``sys.exit``s the importer. Sticky ``active_profile`` is unchanged.
++    """
+     global _explicit_cli_profile
+     _explicit_cli_profile = None
+     argv = sys.argv[1:]
+-    profile_name, consume, profile_index = _scan_profile_flag(argv)
++    if _looks_like_hermes_invocation():
++        profile_name, consume, profile_index = _scan_profile_flag(argv)
++    else:
++        profile_name, consume, profile_index = None, 0, None
+     from_sticky_profile = False
+ 
+     # HERMES_HOME already set with no explicit flag: trust it only when it
+diff --git a/hermes_cli/main_profile_argv.py b/hermes_cli/main_profile_argv.py
+new file mode 100644
+index 0000000000..9ae0e456e0
+--- /dev/null
++++ b/hermes_cli/main_profile_argv.py
+@@ -0,0 +1,110 @@
++"""Import-time ``-p``/``--profile`` scan for the Hermes CLI.
++
++``hermes_cli.main`` imports this before profile resolution. Keep the module
++free of import-time Hermes imports: other modules cache ``HERMES_HOME`` at
++import, and this file is loaded before that home is chosen.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++import sys
++
++_PROFILE_NAME_RE = r"^[a-z0-9][a-z0-9_-]{0,63}$"  # mirrors hermes_cli.profiles._PROFILE_ID_RE
++
++
++def _inside_mcp_add_args(argv: list, index: int) -> bool:
++    """True once argv reaches `hermes mcp add ... --args <command argv>`.
++
++    ``mcp add --args`` is command-argv passthrough. Flags after that point
++    belong to the child MCP command (for example Docker MCP Toolkit's
++    ``--profile``), not to Hermes' own profile selector.
++    """
++    try:
++        mcp_index = argv.index("mcp", 0, index)
++        argv.index("add", mcp_index + 1, index)
++    except ValueError:
++        return False
++    return True
++
++
++def _looks_like_hermes_invocation() -> bool:
++    """True only when this process was started as the Hermes CLI.
++
++    pytest's separate ``-p <plugin>`` and any other entry point's argv must
++    not select a profile. ``python -m hermes_cli.main`` sets ``argv[0]`` to
++    this package's ``main.py``; the console script's basename is ``hermes``.
++    """
++    argv0 = sys.argv[0] if sys.argv else ""
++    base = os.path.basename(argv0).lower()
++    for suffix in (".exe", "-script.pyw", "-script.py"):
++        if base.endswith(suffix):
++            base = base[: -len(suffix)]
++            break
++    if base in {"hermes", "hermes-agent", "hermes-acp"}:
++        return True
++    normalized = argv0.replace("\\", "/")
++    return (
++        normalized.endswith("/hermes_cli/main.py")
++        or normalized.endswith("/hermes_cli/main.pyc")
++    )
++
++
++def _exit_invalid_profile_name(value: str) -> None:
++    from hermes_cli.profiles import _invalid_profile_name_error
++
++    print(f"Error: {_invalid_profile_name_error(value)}", file=sys.stderr)
++    print("Run `hermes profile list` to see your profiles.", file=sys.stderr)
++    sys.exit(2)
++
++
++def _looks_like_option_value(value: str) -> bool:
++    """A ``-p`` value that clearly belongs to some other tool (pytest's ``-p no:xdist``, a
++    third-party ``-p --flag``), never a mistyped profile name."""
++    return value.startswith("-") or ":" in value
++
++
++def _scan_profile_flag(argv: list) -> tuple:
++    """Find -p/--profile/--profile= in argv -> (name, tokens_consumed, index).
++
++    Historically the flag worked even after the subcommand (`hermes chat -p
++    coder`), so scan broadly; stop at ``--`` and at the `mcp add --args`
++    passthrough region. The value is normalised (strip + casefold, matching
++    ``profiles.normalize_profile_name``) before validation so ``-p Work`` selects
++    ``work``. ``_apply_profile_override`` calls this only for a Hermes CLI
++    process, so another entry point's ``-p <plugin>`` is not resolved at import.
++    A value that cannot be a profile name is rejected so resolve_profile_env
++    never sys.exits on it; the rejection is explained (exit 2) only when the
++    flag comes BEFORE the first subcommand token under a real ``hermes`` run —
++    after a subcommand, ``-p`` may belong to that subcommand or a plugin
++    (`hermes kanban ... -p 8080`), and option-looking values (``no:xdist``,
++    ``--flag``) are always a silent skip.
++    """
++    from hermes_cli._parser import top_level_value_flag_sets
++
++    value_flags, optional_value_flags = top_level_value_flag_sets()
++    i = 0
++    saw_subcommand = False
++    while i < len(argv):
++        arg = argv[i]
++        if arg == "--" or (arg == "--args" and _inside_mcp_add_args(argv, i)):
++            break
++        if arg in {"--profile", "-p"} and i + 1 < len(argv):
++            raw = argv[i + 1]
++            value = raw.strip().casefold()
++            if re.match(_PROFILE_NAME_RE, value):
++                return value, 2, i
++            if not saw_subcommand and not _looks_like_option_value(raw) and _looks_like_hermes_invocation():
++                _exit_invalid_profile_name(raw)
++            break
++        if arg.startswith("--profile="):
++            return arg.split("=", 1)[1].strip().casefold(), 1, i
++        takes_value = "=" not in arg and i + 1 < len(argv) and (
++            arg in value_flags
++            or (arg in optional_value_flags and not argv[i + 1].startswith("-"))
++        )
++        if not takes_value and not arg.startswith("-"):
++            saw_subcommand = True
++        i += 2 if takes_value else 1
++    return None, 0, None
+diff --git a/tests/hermes_cli/test_ux_messages_startup.py b/tests/hermes_cli/test_ux_messages_startup.py
+index b8243c8b13..89823492d1 100644
+--- a/tests/hermes_cli/test_ux_messages_startup.py
++++ b/tests/hermes_cli/test_ux_messages_startup.py
+@@ -6,8 +6,11 @@ profile name explains the rule; missing optional dependencies point at ``hermes
+ """
+ 
+ import io
++import os
++import subprocess
+ import sys
+ from contextlib import redirect_stderr
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -75,3 +78,102 @@ def test_invalid_dash_p_after_a_subcommand_is_left_to_that_subcommand(monkeypatc
+     # A plugin/subcommand flag such as `hermes kanban serve -p "Work Bot"` is not our profile selector.
+     monkeypatch.setattr(sys, "argv", ["hermes", "kanban", "serve", "-p", "Work Bot"])
+     assert _main._scan_profile_flag(sys.argv[1:]) == (None, 0, None)
++
++
++_REPO = Path(__file__).resolve().parents[2]
++_FOREIGN_IMPORT = """\
++import os
++import sys
++
++home, argv0 = sys.argv[1], sys.argv[2]
++os.environ["HERMES_HOME"] = home
++# pytest's separate ``-p <plugin>`` (and another entry point's same shape).
++sys.argv = [
++    argv0,
++    "tests/hermes_cli/test_codex_credential_host_binding.py",
++    "-p",
++    "usage_guard_probe",
++    "--tb=short",
++]
++import hermes_cli.main
++
++assert os.environ["HERMES_HOME"] == home, os.environ["HERMES_HOME"]
++assert hermes_cli.main.explicit_cli_profile() is None
++print("OK")
++"""
++
++
++@pytest.mark.parametrize("argv0", [
++    "/usr/lib/python3.14/site-packages/pytest/__main__.py",
++    "/opt/ci/run_tests_parallel.py",
++])
++def test_importing_main_with_foreign_separate_dash_p_does_not_resolve_a_profile(tmp_path, argv0):
++    """Importing hermes_cli.main must not treat another program's ``-p <plugin>`` as ``--profile``.
++
++    ``usage_guard_probe`` is a legal profile id, so the colon/dash skip for
++    ``-p no:xdist`` does not cover it. The import must not look the name up
++    or SystemExit.
++    """
++    home = tmp_path / "profiles" / "default"
++    home.mkdir(parents=True)
++    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
++    probe = tmp_path / "probe_import.py"
++    probe.write_text(_FOREIGN_IMPORT, encoding="utf-8")
++    env = os.environ.copy()
++    env["PYTHONPATH"] = os.pathsep.join(
++        [str(_REPO), env["PYTHONPATH"]] if env.get("PYTHONPATH") else [str(_REPO)]
++    )
++    env["HERMES_HOME"] = str(home)
++    result = subprocess.run(
++        [sys.executable, str(probe), str(home), argv0],
++        cwd=_REPO,
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=90,
++        check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert "usage_guard_probe" not in result.stderr
++    assert result.stdout.strip().splitlines()[-1] == "OK"
++
++
++def test_apply_ignores_foreign_separate_dash_p_without_a_profile_lookup(tmp_path, monkeypatch):
++    from hermes_cli import main as _main
++
++    home = tmp_path / "profiles" / "default"
++    home.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(sys, "argv", [
++        "/opt/ci/run_tests_parallel.py",
++        "tests/hermes_cli/test_codex_credential_host_binding.py",
++        "-p",
++        "usage_guard_probe",
++        "--tb=short",
++    ])
++    looked_up: list[str] = []
++
++    def _boom(name: str) -> str:
++        looked_up.append(name)
++        raise AssertionError(f"profile lookup of {name}")
++
++    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", _boom)
++    _main._apply_profile_override()
++    assert looked_up == []
++    assert os.environ["HERMES_HOME"] == str(home)
++    assert _main.explicit_cli_profile() is None
++
++
++@pytest.mark.parametrize("argv0", ["hermes", "/opt/hermes/hermes_cli/main.py"])
++def test_real_hermes_invocation_still_selects_dash_p(tmp_path, monkeypatch, argv0):
++    from hermes_cli import main as _main
++
++    root = tmp_path / ".hermes"
++    profile = root / "profiles" / "work"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setattr(sys, "argv", [argv0, "-p", "work", "status"])
++    _main._apply_profile_override()
++    assert os.environ["HERMES_HOME"] == str(profile)
++    assert _main.explicit_cli_profile() == "work"
+-- 
+2.55.0
+

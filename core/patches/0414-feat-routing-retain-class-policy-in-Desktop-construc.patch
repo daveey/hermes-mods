@@ -1,0 +1,270 @@
+From 3af33c50e8e489e5e9e318d2ce53ae596c42be54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 06:37:48 +0000
+Subject: [PATCH 408/453] feat(routing): retain class policy in Desktop
+ construction and resume [daveey]
+
+(cherry picked from commit 3af33c50e8e489e5e9e318d2ce53ae596c42be54)
+---
+ docs/model-routing.md                   | 13 +++-
+ tests/tui_gateway/test_class_routing.py | 94 +++++++++++++++++++++++++
+ tui_gateway/class_routing.py            | 52 ++++++++++++++
+ tui_gateway/model_switch.py             |  3 +
+ tui_gateway/server.py                   | 33 ++-------
+ 5 files changed, 166 insertions(+), 29 deletions(-)
+ create mode 100644 tests/tui_gateway/test_class_routing.py
+ create mode 100644 tui_gateway/class_routing.py
+
+diff --git a/docs/model-routing.md b/docs/model-routing.md
+index 9eb41bed57..e50923922b 100644
+--- a/docs/model-routing.md
++++ b/docs/model-routing.md
+@@ -89,6 +89,13 @@ CLI integration tests exercise the native Anthropic SDK streaming request throug
+ an isolated mock HTTP transport, inspect endpoint/model/OAuth headers, and restore
+ from a real temporary session DB. This is not a live entitlement probe.
+ 
+-Desktop, messaging, API, delegation, cron, Kanban and auxiliary adapters and their
+-per-entry request/recovery tests remain required before activation. This document
+-is not rollout proof.
++Desktop/TUI construction defers class credential resolution until AIAgent has its
++durable session key. Runtime persistence/restoration retains the class while showing
++the concrete model; explicit switches clear the metadata. Config sync does not
++rebalance existing conversations when a class default changes. Desktop tests cover
++construction, restoration, explicit pinning, empty-pool zero sends, and the native
++Anthropic streaming SDK request via mock HTTP transport (not live entitlement).
++
++Messaging, API, delegation, cron, Kanban and auxiliary adapters and their per-entry
++request/recovery tests remain required before activation. Desktop background/preview
++agents and startup readiness also require audit. This document is not rollout proof.
+diff --git a/tests/tui_gateway/test_class_routing.py b/tests/tui_gateway/test_class_routing.py
+new file mode 100644
+index 0000000000..c3b16cd040
+--- /dev/null
++++ b/tests/tui_gateway/test_class_routing.py
+@@ -0,0 +1,94 @@
++"""Desktop construction and resume preserve the class credential fence."""
++from unittest.mock import patch
++
++import pytest
++import run_agent  # bootstrap before real-home guard
++from tui_gateway import server
++from tests.agent import test_model_routing_agent
++
++routing_home = test_model_routing_agent.routing_home
++streaming_route = test_model_routing_agent.streaming_route
++
++
++@pytest.fixture
++def native_transport(monkeypatch):
++    import json
++    import anthropic
++    import httpx
++    sent = []
++
++    def respond(request):
++        sent.append((str(request.url), dict(request.headers), json.loads(request.content)))
++        events = [
++            {"type": "message_start", "message": {
++                "id": "test", "type": "message", "role": "assistant", "model": "anthropic-deep",
++                "content": [], "stop_reason": None, "usage": {"input_tokens": 10, "output_tokens": 0}}},
++            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
++            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}},
++            {"type": "content_block_stop", "index": 0},
++            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
++            {"type": "message_stop"}]
++        body = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
++        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
++
++    original = anthropic.Anthropic
++
++    def client(**kwargs):
++        return original(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(respond)))
++
++    monkeypatch.setattr(anthropic, "Anthropic", client)
++    monkeypatch.setattr("agent.title_generator._auto_title_enabled", lambda: False)
++    return sent
++
++
++def test_desktop_construct_resume_and_pin(routing_home, streaming_route, native_transport, monkeypatch):
++    from hermes_cli.config import load_config
++    monkeypatch.setattr(server, "_load_cfg", load_config)
++    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("class:deep", "auto"))
++    monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
++    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda platform: [])
++    monkeypatch.setattr(server, "_startup_system_prompt", lambda *a: "")
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    with patch("model_tools.get_tool_definitions", return_value=[]):
++        agent = server._make_agent("ui-id", "durable-id")
++        assert isinstance(agent, run_agent.AIAgent)
++        assert agent.model == "anthropic-deep"
++        assert agent.model_routing["requested_class"] == "deep"
++        assert agent.run_conversation("Say ok")["final_response"] == "ok"
++        assert native_transport
++        assert all(body["model"] == "anthropic-deep" for _, _, body in native_transport)
++        assert all(url.startswith("https://api.anthropic.com/") for url, _, _ in native_transport)
++        assert all(headers.get("authorization", "").startswith("Bearer sk-ant-oat")
++                   and "x-api-key" not in headers for _, headers, _ in native_transport)
++        config = server._runtime_model_config(agent)
++        overrides = server._stored_session_runtime_overrides({"model": agent.model, "model_config": config})
++        assert overrides["model_override"]["model"] == "class:deep"
++        assert overrides["provider_override"] == "auto"
++        resumed = server._make_agent("new-ui-id", "durable-id", **overrides)
++        assert resumed.model_routing == agent.model_routing
++        monkeypatch.setattr(server, "_config_model_target", lambda: ("class:standard", ""))
++        session = {"agent": agent, "model_override": {"model": "class:deep"},
++                   "composer_override_profile": {"model": "old", "provider": "auto"}}
++        with patch.object(server, "_apply_model_switch") as switch:
++            server._sync_agent_model_with_config("ui-id", session)
++        switch.assert_not_called()
++        assert session["model_override"] == {"model": "class:deep"}
++        agent.switch_model(agent.model, agent.provider, api_key=agent.api_key,
++                           base_url=agent.base_url, api_mode=agent.api_mode)
++        assert "model_routing" not in server._runtime_model_config(agent, config)
++        agent.release_clients()
++        resumed.release_clients()
++
++
++def test_desktop_exhaustion_cannot_enter_paid_fallback(routing_home, streaming_route, monkeypatch):
++    from agent.model_routing import ModelRoutingError
++    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("class:deep", "auto"))
++    monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
++    monkeypatch.setattr(server, "_startup_system_prompt", lambda *a: "")
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    monkeypatch.setattr("agent.credential_pool.CredentialPool.has_available", lambda *a, **k: False)
++    with patch("anthropic.Anthropic") as sdk, patch.object(server, "_resolve_runtime_with_fallback") as legacy:
++        with pytest.raises(ModelRoutingError):
++            server._make_agent("ui-empty", "durable-empty")
++    sdk.assert_not_called()
++    legacy.assert_not_called()
+diff --git a/tui_gateway/class_routing.py b/tui_gateway/class_routing.py
+new file mode 100644
+index 0000000000..2463326332
+--- /dev/null
++++ b/tui_gateway/class_routing.py
+@@ -0,0 +1,52 @@
++"""Class selectors stay intact until AIAgent owns a durable session identity."""
++from agent.model_routing import is_class_selector
++
++
++def deferred_runtime(model, provider, config):
++    if not is_class_selector(model):
++        return None
++    model_config = config.get("model") or {}
++    configured = model_config.get("provider") if isinstance(model_config, dict) else None
++    # AIAgent validates the selector and provider and fences credentials atomically.
++    requested = provider or configured or "auto"
++    return {"provider": requested, "requested_provider": requested}
++
++
++def restore_class_overrides(model, config, overrides):
++    route = config.get("model_routing")
++    if not isinstance(route, dict) or route.get("selected_model") != model:
++        return overrides
++    level = route.get("requested_class")
++    if level not in ("deep", "standard", "fast"):
++        return overrides
++    overrides["model_override"] = {"model": f"class:{level}", "provider": "auto"}
++    overrides["provider_override"] = "auto"
++    return overrides
++
++
++def runtime_model_config(agent, existing, runtime_view, logger):
++    """Persist concrete display identity and class policy, clearing stale explicit-switch metadata."""
++    config = dict(existing or {})
++    route = getattr(agent, "model_routing", None)
++    agent = runtime_view(agent)
++    attr = lambda k: str(getattr(agent, k, "") or "").strip()
++    model, provider, base_url = attr("model"), attr("provider"), attr("base_url")
++    if provider.lower() == "custom":
++        try:
++            from hermes_cli.runtime_provider import canonical_custom_identity
++            provider = canonical_custom_identity(base_url=base_url, model=model or None) or provider
++        except Exception:
++            logger.debug("custom provider identity lookup failed", exc_info=True)
++    reasoning_config = getattr(agent, "reasoning_config", None)
++    live = {
++        "model": model, "provider": provider, "base_url": base_url, "api_mode": attr("api_mode"),
++        "reasoning_config": reasoning_config if isinstance(reasoning_config, dict) else None,
++        "service_tier": getattr(agent, "service_tier", None),
++        "model_routing": route,
++    }
++    for key, value in live.items():
++        if value or isinstance(value, dict):
++            config[key] = value
++        else:
++            config.pop(key, None)
++    return config
+diff --git a/tui_gateway/model_switch.py b/tui_gateway/model_switch.py
+index bf76f39e05..e1124e9a88 100644
+--- a/tui_gateway/model_switch.py
++++ b/tui_gateway/model_switch.py
+@@ -456,6 +456,9 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
+     target = _config_model_target()
+     if not target[0]:
+         return
++    from agent.model_routing import is_class_selector
++    if is_class_selector(target[0]):
++        return  # Class defaults apply to new sessions, never rebalance existing conversations.
+     seen = session.get("config_model_seen")
+     if target == seen:
+         return
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 8caf0158b6..91064b3394 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1714,38 +1714,16 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
+         overrides["reasoning_config_override"] = reasoning_config
+     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
+         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+-    return overrides
++    from tui_gateway.class_routing import restore_class_overrides
++    return restore_class_overrides(model, model_config, overrides)
+ 
+ 
+ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+     """Merge the agent's CURRENT runtime identity onto the row's persisted ``model_config``. Falsy agent
+     attributes DELETE the key rather than skip the write: resume reads provider/endpoint from this JSON
+     (model column written separately), so a stale provider would route the resumed chat to the wrong endpoint."""
+-    config = dict(existing or {})
+-    agent = session_runtime_view(agent)
+-    attr = lambda k: str(getattr(agent, k, "") or "").strip()
+-    model, provider, base_url = attr("model"), attr("provider"), attr("base_url")
+-    if provider.lower() == "custom":
+-        # ``agent.provider`` resolves every named custom entry to the literal "custom", losing the entry
+-        # identity (api_key is never persisted): recover ``custom:<name>`` from the endpoint URL.
+-        try:
+-            from hermes_cli.runtime_provider import canonical_custom_identity
+-            provider = canonical_custom_identity(base_url=base_url, model=model or None) or provider
+-        except Exception:
+-            logger.debug("custom provider identity lookup failed", exc_info=True)
+-    reasoning_config = getattr(agent, "reasoning_config", None)
+-    live = {
+-        "model": model, "provider": provider, "base_url": base_url, "api_mode": attr("api_mode"),
+-        # An empty dict is still a real (present) reasoning config.
+-        "reasoning_config": reasoning_config if isinstance(reasoning_config, dict) else None,
+-        "service_tier": getattr(agent, "service_tier", None),
+-    }
+-    for key, value in live.items():
+-        if value or isinstance(value, dict):
+-            config[key] = value
+-        else:
+-            config.pop(key, None)
+-    return config
++    from tui_gateway.class_routing import runtime_model_config
++    return runtime_model_config(agent, existing, session_runtime_view, logger)
+ 
+ 
+ def _persist_live_session_runtime(session: dict | None) -> None:
+@@ -2578,6 +2556,9 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
+             requested_provider = provider_override
+         resolve_kwargs = {"requested": requested_provider, "target_model": model or None}
+         overrides = {}
++    from tui_gateway.class_routing import deferred_runtime
++    if (deferred := deferred_runtime(model, requested_provider, _load_cfg())) is not None:
++        return model, deferred
+     resolution = _resolve_runtime_with_fallback(resolve_kwargs)
+     if resolution.used_fallback:
+         if not resolution.selected_model:
+-- 
+2.54.0 (Apple Git-157)
+

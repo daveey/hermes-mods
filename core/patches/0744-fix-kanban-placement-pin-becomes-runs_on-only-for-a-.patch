@@ -1,0 +1,217 @@
+From af0521714fc8e8129cf89b3b76955cee437d8823 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:25:37 +0000
+Subject: [PATCH] fix(kanban): placement pin becomes runs_on only for a machine
+ that advertises pickup [daveey]
+
+kanban_create(placement='hub') on the MacBook (route {macbook: hub}) turned the
+pin into runs_on=[machine:hub] because hub is an active registry machine, but
+hub runs with kanban.sync.pickup off, so the card sat ready on the MacBook board
+forever (4 stranded on 10-28). placement_runs_on now requires the registry entry
+to advertise pickup (missing field = no pickup); otherwise the pin falls
+through to today's placement, so a routed gateway pin goes through
+_place_remote again. Every kanban_create result now carries runs_where (plus
+placed / runs_on as before) so the caller can see where the card runs.
+
+The Board's /v2/machines projection is fixed (labels, pinned_only,
+max_card_runs, hold) and gateways cannot write it, so no machine advertises
+pickup until hermes-hub carries the field.
+---
+ hermes_cli/kanban_worker_node.py            | 20 +++++--
+ tests/hermes_cli/test_kanban_worker_node.py | 60 ++++++++++++++++++++-
+ tools/kanban_tools.py                       | 29 ++++++++--
+ 3 files changed, 101 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 94083a79ca..3ac94b1a06 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -16,6 +16,10 @@ Placement rules mirrored from the Board (``runs_on`` a JSON list of labels):
+   creator has gone silent. The Board decides the time part; locally only the label and workspace parts are checked.
+ * a ``pinned_only`` machine takes another gateway's card only when its ``runs_on`` names the machine's
+   ``machine:`` label; its own cards are always its own.
++
++``kanban_create(placement=<name>)`` turns the pin into ``runs_on=[machine:<name>]`` only when the machine's registry
++entry advertises ``pickup`` (:func:`advertises_pickup`; a missing field means no pickup). Otherwise the pin keeps its
++gateway meaning (``kanban.placement`` route), so a card is never parked for a machine that never copies it.
+ """
+ from __future__ import annotations
+ 
+@@ -68,15 +72,25 @@ def set_runs_on(conn: sqlite3.Connection, task_id: str, runs_on: Optional[list[s
+                  (None if runs_on is None else json.dumps(runs_on), task_id))
+ 
+ 
++def advertises_pickup(entry: Optional[Mapping[str, Any]]) -> bool:
++    """True when a registry entry says the machine copies other gateways' cards (``kanban.sync.pickup`` on).
++    A missing field means no pickup: a ``runs_on=[machine:<name>]`` card for such a machine is never claimed."""
++    value = (entry or {}).get("pickup")
++    if isinstance(value, str):
++        return value.strip().lower() in ("explicit", "all", "true", "on", "1", "yes")
++    return value is True
++
++
+ def placement_runs_on(conn: sqlite3.Connection, placement: Any) -> Optional[list[str]]:
+-    """``placement=<gateway>`` on a primary board, naming another active machine in the registry ->
+-    ``[machine:<gateway>]``. None for ``auto``/``local``/this gateway/unknown names (today's placement applies)."""
++    """``placement=<gateway>`` on a primary board, naming another active machine in the registry that picks up other
++    gateways' cards -> ``[machine:<gateway>]``. None for ``auto``/``local``/this gateway/unknown names/machines
++    without pickup (today's placement applies, e.g. the ``kanban.placement`` route)."""
+     name = str(placement or "").strip()
+     if not name or name in ("auto", "local") or sync.board_mode(conn) != "primary" or name == _own(conn):
+         return None
+     reg = registry()
+     entry = (reg or {}).get("machines", {}).get(name)
+-    if not entry or entry.get("state", "active") != "active":
++    if not entry or entry.get("state", "active") != "active" or not advertises_pickup(entry):
+         return None
+     return [f"machine:{name}"]
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_node.py b/tests/hermes_cli/test_kanban_worker_node.py
+index 1c0088598f..ec2f8c29b0 100644
+--- a/tests/hermes_cli/test_kanban_worker_node.py
++++ b/tests/hermes_cli/test_kanban_worker_node.py
+@@ -24,8 +24,9 @@ HUB, WORKER, BOARD = "hub", "worker-1", "default"
+ MACHINES = {
+     HUB: {"name": HUB, "state": "active", "labels": ["linux"], "pinned_only": False, "max_card_runs": None,
+           "hold": False},
++    # worker-1 runs with kanban.sync.pickup on and advertises it; hub and macbook say nothing (= no pickup).
+     WORKER: {"name": WORKER, "state": "active", "labels": ["linux"], "pinned_only": False, "max_card_runs": 12,
+-             "hold": False},
++             "hold": False, "pickup": "all"},
+     "macbook": {"name": "macbook", "state": "active", "labels": ["macos"], "pinned_only": True,
+                 "max_card_runs": None, "hold": False},
+ }
+@@ -179,6 +180,63 @@ def test_tool_create_runs_on_and_placement_to_an_enrolled_machine(gws, monkeypat
+                                        (out["task_id"],)).fetchone()[0]) == ["linux"]
+ 
+ 
++def _route_self_to_hub(monkeypatch, worker, *, hub_pickup=None):
++    """worker-1 routes kanban_create to gateway `hub` (kanban.placement.route), and `hub` is also an active
++    machine in the registry: the MacBook's setup on 10-28."""
++    worker.enter()
++    from hermes_cli import kanban_placement as kp
++    entry = {**MACHINES[HUB], **({"pickup": hub_pickup} if hub_pickup is not None else {})}
++    wn.set_registry_fetch(lambda: {"me": WORKER, "machines": [entry, MACHINES[WORKER], MACHINES["macbook"]]})
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: WORKER)
++    monkeypatch.setattr(kp, "config", lambda: {"route": {WORKER: HUB}})
++    monkeypatch.setattr(kp, "target_live", lambda *a, **k: None)
++    sent = []
++    monkeypatch.setattr(kp, "create_remote", lambda view, **kw: sent.append(kw["target"]) or {
++        "ok": True, "request_id": "req-1", "queued_only": True})
++    return sent
++
++
++@pytest.mark.parametrize("hub_pickup", [None, False, "off"])
++def test_a_routed_gateway_pin_to_a_machine_without_pickup_takes_the_gateway_route(gws, monkeypatch, hub_pickup):
++    """MacBook 10-28: placement='hub' became runs_on=[machine:hub] on the MacBook board, and the hub (pickup off)
++    never took it. A machine that does not advertise pickup gets no runs_on card; the routed pin goes through
++    _place_remote as before 6d29976569."""
++    _, worker = gws
++    sent = _route_self_to_hub(monkeypatch, worker, hub_pickup=hub_pickup)
++    before = worker.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
++    out = _tool_create({"title": "for the hub", "assignee": "default", "placement": HUB})
++    assert sent == [HUB], out
++    assert out["placed"]["gateway"] == HUB and "runs_on" not in out, out
++    assert out["runs_where"] == HUB
++    assert worker.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before  # nothing stranded here
++
++
++def test_a_routed_gateway_pin_to_a_machine_with_pickup_still_gets_runs_on(gws, monkeypatch):
++    _, worker = gws
++    sent = _route_self_to_hub(monkeypatch, worker, hub_pickup="explicit")
++    out = _tool_create({"title": "for the hub", "assignee": "default", "placement": HUB})
++    assert sent == [] and out["runs_on"] == ["machine:hub"], out
++    assert json.loads(worker.conn.execute("SELECT runs_on FROM tasks WHERE id = ?",
++                                          (out["task_id"],)).fetchone()[0]) == ["machine:hub"]
++    assert "machine:hub" in out["runs_where"]
++
++
++def test_placement_runs_on_needs_advertised_pickup(gws):
++    hub, _ = gws
++    hub.enter()
++    assert wn.placement_runs_on(hub.conn, WORKER) == ["machine:worker-1"]
++    assert wn.placement_runs_on(hub.conn, "macbook") is None  # active, but no pickup field
++
++
++def test_a_plain_local_create_says_it_runs_here(gws, monkeypatch):
++    hub, _ = gws
++    hub.enter()
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    out = _tool_create({"title": "here", "assignee": "default"})
++    assert out["ok"] and "placed" not in out and "runs_on" not in out, out
++    assert out["runs_where"] == f"here ({HUB})"
++
++
+ def test_tool_placement_to_an_unknown_gateway_still_refuses(gws, monkeypatch):
+     hub, _ = gws
+     hub.enter()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 1baa792519..231324f613 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1543,14 +1543,15 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+             note = (f"{retry}Created on {target} as {tid}, not here: {decision['why']} (kanban.placement). It runs "
+                     f"there{shows}. Read it with cross_task @task:default@{target}/{tid} or "
+                     f"`hermes-hub tasks --gw {target}`.")
+-            return _ok(task_id=tid, status=remote_status or "created", **fields, note=note), None
++            return _ok(task_id=tid, status=remote_status or "created", **fields, runs_where=target,
++                       note=note), None
+         note = (f"{retry}The card IS created: it is queued on {target} as request {rid} and {target} makes the "
+                 f"card from it (it runs there, not here: {decision['why']}). Do NOT call kanban_create again "
+                 "for this card: an identical call returns this same request, and any changed call creates a "
+                 f"second, duplicate card. Its task id appears once {target} applies the request "
+                 + ("(this chat's tasks, " if session_id else "(")
+                 + "`hermes-hub requests`).")
+-        return _ok(task_id=None, status="queued", **fields, note=note), None
++        return _ok(task_id=None, status="queued", **fields, runs_where=target, note=note), None
+     except Exception as exc:
+         logger.warning("kanban placement failed", exc_info=True)
+         try:
+@@ -1565,6 +1566,22 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         return None, None
+ 
+ 
++def _runs_where(runs_on, pinned_machine, marker_placement) -> str:
++    """Where a card created on this board runs, for the kanban_create result. Never raises."""
++    if runs_on is not None:
++        if pinned_machine:
++            return f"{pinned_machine} via the board lease (runs_on={runs_on})"
++        return f"a machine matching runs_on={runs_on} via the board lease"
++    if marker_placement and marker_placement.get("defer"):
++        return f"{marker_placement['defer']} once its parents finish"
++    try:
++        from hermes_cli import kanban_capability_registry as _reg
++        gw = _reg.self_gateway()
++    except Exception:
++        gw = None
++    return f"here ({gw})" if gw else "here"
++
++
+ @_kanban_handler("kanban_create")
+ def _handle_create(args: dict, **kw) -> str:
+     """Create a (child) task; orchestrator workers use this to fan out."""
+@@ -1636,8 +1653,9 @@ def _handle_create(args: dict, **kw) -> str:
+             if self_task is not None and self_task.project_id:
+                 project_id, project_source_task_id = self_task.project_id, self_task.id
+         marker_placement = None
+-        # Placement on a synced board: ``runs_on`` labels, and a pin to an enrolled machine becomes
+-        # ``runs_on=[machine:<name>]`` (created here, run there through the Board lease). [daveey]
++        # Placement on a synced board: ``runs_on`` labels, and a pin to an enrolled machine that advertises
++        # pickup becomes ``runs_on=[machine:<name>]`` (created here, run there through the Board lease). Any
++        # other pin, a routed gateway included, falls through to the gateway route below. [daveey]
+         from hermes_cli import kanban_worker_node as _wn
+         try:
+             runs_on = _wn.normalize_runs_on(args.get("runs_on"))
+@@ -1732,6 +1750,9 @@ def _handle_create(args: dict, **kw) -> str:
+                 extra["placement"] = {"where": "local", "runs_on": runs_on, "machine": pinned_machine}
+                 extra["note"] = (f"Created here as {new_tid}; it runs on {pinned_machine} via the board lease "
+                                  f"(runs_on={runs_on}). The pin was honoured: do not re-create it.")
++        # Every result says where the card runs (`placed` for a routed card, `runs_on` for a board-lease card):
++        # a caller that can't tell re-creates it, or never learns it is stranded. [daveey]
++        extra["runs_where"] = _runs_where(runs_on, pinned_machine, marker_placement)
+         if origin_intent is not None:
+             return json.dumps({"ok": False, "created": True, "code": "origin_bind_pending",
+                                "task_id": new_tid, **landed, **gate,
+-- 
+2.55.0
+

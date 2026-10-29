@@ -1,6 +1,6 @@
 # Reject certain delegated model/provider conflicts
 
-Patch: **0355**, source `78c05251a087b61b3f95b863c76f37b285a2bfd7`. Extends [model tiers and per-task routing](model-tiers.md).
+Patch: **0356**, source `78c05251a087b61b3f95b863c76f37b285a2bfd7`. Extends [model tiers and per-task routing](model-tiers.md).
 
 ## Behavior
 

@@ -105,7 +105,7 @@ the MacBook, hub and mini had 12, 5 and 1 such rows. Fixed on both sides:
   longer its card's current run and is over 10 min old (`close_dangling_runs`), and the sync pushes that close.
   Tests: `test_kanban_sync_run_rows.py` (stale-lock reclaim, orphan sweep, a run ending before its first push, a
   grant whose local CAS lost, a newer Board write still landing, the sweep).
-  Follow-up **0715** (fork `9d702b02e4`): if that sweep finds a terminal event (`completed`, `blocked`, or
+  Follow-up **0787** (fork `9d702b02e4`): if that sweep finds a terminal event (`completed`, `blocked`, or
   `crashed`) for the run, it restores that end (status, outcome, `ended_at` from the event, and a string
   `summary` from the payload when there is one) instead of rewriting the row to `reclaimed`. A run with no
   terminal event is still reclaimed. `test_the_dangling_sweep_keeps_the_real_end_of_a_run_the_card_already_finished`
@@ -155,7 +155,7 @@ A card shared by two sessions of one compression lineage counts once. `links-dif
 rows too, never uses that fallback, and is not clean while a needed replica is unreadable (it had reported 771/771
 clean while counts and list differed by 5). Tests: `test_kanban_chat_links_parity.py` (count == listed rows for each
 case), `test_kanban_sync_client.py::test_a_replica_pull_stamps_pulled_at_and_a_failed_one_does_not`.
-Local cards now also count once across compression aliases (patch `0671`): board-qualified identities travel with
+Local cards now also count once across compression aliases (patch `0682, 0695`): board-qualified identities travel with
 the count snapshot, including parked, held and stalled subsets. Distinct cards and equal ids on different boards
 remain distinct. Tests: `test_kanban_local_lineage_counts.py`; details in
 [kanban-local-lineage-counts.md](kanban-local-lineage-counts.md).
@@ -187,7 +187,7 @@ is what is built and what tests prove:
   machine, on a primary board, creates the card here with `runs_on=[machine:<gateway>]`; an unknown name is still
   refused `placement_unavailable` (card t_01a18094c9791eea). The `kanban_create` result then carries `runs_on`,
   `placement: {where: local, runs_on, machine}` and a note "created here, runs on <machine> via the board lease", so a
-  caller doesn't read the pin as ignored and re-create the card (0699, test
+  caller doesn't read the pin as ignored and re-create the card (0732, test
   `test_tool_create_runs_on_and_placement_to_an_enrolled_machine`). A gateway with `kanban.sync.pickup` set copies eligible
   `ready` cards that other gateways created from its replica into its live board each dispatcher tick (no capture, so
   nothing is pushed), and the normal claim path takes the Board lease. `pickup: explicit` (what worker nodes run)
@@ -1373,7 +1373,7 @@ to it.
 
 Project groups and an explicit project's name/icon/color moved onto the hub the same way: details, tests and live
 numbers in [hub-project-groups.md](hub-project-groups.md). David chose no soak: cut straight to primary
-(hermes-hub #39, #43, #44; core 0602-0603).
+(hermes-hub #39, #43, #44; core 0626, 0627).
 
 #### Primary is live (2026-10-28)
 

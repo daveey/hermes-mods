@@ -1,0 +1,185 @@
+From e54472005d1eb086f3cc0e9929512bacc967572b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:00:35 +0000
+Subject: [PATCH] refactor(kanban): replica record identity helpers move to
+ kanban_session_activity_records (file cap)
+
+---
+ hermes_cli/kanban_session_activity.py         | 67 +----------------
+ hermes_cli/kanban_session_activity_records.py | 72 +++++++++++++++++++
+ 2 files changed, 74 insertions(+), 65 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity_records.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index cc906a6c5e..1be2e48dff 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -16,6 +16,7 @@ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_activity_identity as _identity
++from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases, _moved_evidence, _retire_moved
+ import contextlib
+ import json
+ import logging
+@@ -654,70 +655,6 @@ def _owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str |
+     return beat is not None and 0 <= now - beat <= SCOPE_HEARTBEAT_FRESH_S
+ 
+ 
+-def _moved_evidence(tasks: dict[tuple, dict[str, Any]], heartbeats: dict[tuple[str, str, str], float],
+-                    now: float) -> dict[str, Any]:
+-    """What a fresh replica proves about where each card lives (``_retire_moved``): the gateways publishing a
+-    profile-qualified record per ``(board, id, created_at)``, and the owner scopes whose collector read cleanly within
+-    ``SCOPE_HEARTBEAT_FRESH_S``. [daveey]"""
+-    published: dict[tuple[str, str, Any], set[str]] = {}
+-    for (gw, owner_profile, board, tid), t in tasks.items():
+-        if owner_profile is not None and t.get('created_at') is not None:
+-            published.setdefault((board, tid, t.get('created_at')), set()).add(gw)
+-    live = {scope for scope, beat in heartbeats.items() if 0 <= now - beat <= SCOPE_HEARTBEAT_FRESH_S}
+-    return {'published': {k: frozenset(v) for k, v in published.items()}, 'live_scopes': frozenset(live)}
+-
+-
+-def _retire_moved(card: dict[str, Any], moved: dict[str, Any]) -> bool:
+-    """A remembered row whose card a fresh replica proves lives on ANOTHER gateway: retire it, never release it.
+-
+-    A worker node runs another gateway's card from a copy in its own board file, and its collector used to publish
+-    that copy as its own (``hub/default/default/t_1f359ff1`` for a MacBook card, 10-29). Once the copy was evicted
+-    the record vanished, and absence is never closure, so the origin kept the row stale and open forever, naming an
+-    owner that has no such card. It is retired only on proof: the named owner is publishing that exact
+-    profile/board scope right now without the card, and another gateway publishes a qualified record with the
+-    same board, id and ``created_at`` (a copy keeps its ``created_at``). The real owner's record then speaks for
+-    the card: its own links, or this gateway's local board when the card is local. [daveey]"""
+-    if card.get('ownership_state') != 'qualified' or card.get('created_at') is None:
+-        return False
+-    scope = (card.get('gateway'), card.get('owner_profile'), card.get('board'))
+-    if scope not in moved.get('live_scopes', ()):
+-        return False
+-    gateways = moved.get('published', {}).get((card.get('board'), card.get('id'), card.get('created_at')), ())
+-    return any(gw != card.get('gateway') for gw in gateways)
+-
+-
+-def _fold_legacy_aliases(tasks: dict[tuple, dict[str, Any]], raw: dict[tuple, dict[str, Any]]) -> None:
+-    """Merge each unqualified ``board/id`` record into its proven profile-qualified twin, in place.
+-
+-    Hub-sync used to key records ``board/id``; it now publishes ``profile/board/id`` and the old rows linger,
+-    so every pre-qualification card was both counted twice and stuck ``unknown`` forever. A legacy record is
+-    folded only when exactly one profile on the same owner gateway publishes that board/id AND both records
+-    carry the same non-null ``created_at`` and ``created_by`` (identity, not an ID match). Its shepherd links
+-    move onto the twin, so no session loses the association; anything ambiguous stays a separate ``unknown``
+-    obligation. [daveey]
+-    """
+-    qualified: dict[tuple[str, str, str], list[tuple]] = {}
+-    for key in tasks:
+-        gw, owner_profile, board, tid = key
+-        if owner_profile is not None:
+-            qualified.setdefault((gw, board, tid), []).append(key)
+-    for key in [k for k in tasks if k[1] is None]:
+-        gw, _, board, tid = key
+-        twins = qualified.get((gw, board, tid), [])
+-        if len(twins) != 1:
+-            continue
+-        old, new = raw[key], raw[twins[0]]
+-        if (old.get('created_at') is None or old.get('created_at') != new.get('created_at')
+-                or old.get('created_by') != new.get('created_by')):
+-            continue
+-        twin = tasks[twins[0]]
+-        links = [*(twin.get('sessions') if isinstance(twin.get('sessions'), list) else []),
+-                 *(link for link in (old.get('sessions') if isinstance(old.get('sessions'), list) else [])
+-                   if isinstance(link, dict) and link.get('rel') == 'shepherd')]
+-        tasks[twins[0]] = {**twin, 'sessions': links, '_legacy_key': f'{gw}/{board}/{tid}'}
+-        del tasks[key]
+-
+-
+ # (replica path, gw, record key) -> (row text, decoded row) from the last replica read: the projection rebuilds on
+ # every kanban.db / hub.db change, and re-parsing and re-hashing thousands of unchanged rows cost ~0.3 s per
+ # sidebar refresh. Keyed on the exact stored text, so an edited row always decodes afresh. [daveey]
+@@ -893,7 +830,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         # (session, card) pair absent from it is a dropped link, not an unreadable replica.
+         owners_out.update((gw, board, tid) for gw, _, board, tid in tasks)
+     if moved_out is not None and not stale:
+-        moved_out.update(_moved_evidence(tasks, heartbeats, now))
++        moved_out.update(_moved_evidence(tasks, heartbeats, now, SCOPE_HEARTBEAT_FRESH_S))
+     blank_before = {key for key in tasks if key[1] is None}
+     _fold_legacy_aliases(tasks, raw)
+     # Only a proven-identity alias is the same card as its qualified twin (folded above, links carried
+diff --git a/hermes_cli/kanban_session_activity_records.py b/hermes_cli/kanban_session_activity_records.py
+new file mode 100644
+index 0000000000..7efab4b7e0
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_records.py
+@@ -0,0 +1,72 @@
++"""Which replica record speaks for a card: legacy-alias folding and retiring rows a fresh replica proves moved.
++
++Split from ``kanban_session_activity`` (its file cap); ``_project_replica`` and ``_legacy_remote_links`` call these.
++[daveey]
++"""
++from __future__ import annotations
++
++from typing import Any
++
++
++def _moved_evidence(tasks: dict[tuple, dict[str, Any]], heartbeats: dict[tuple[str, str, str], float],
++                    now: float, fresh_s: float) -> dict[str, Any]:
++    """What a fresh replica proves about where each card lives (``_retire_moved``): the gateways publishing a
++    profile-qualified record per ``(board, id, created_at)``, and the owner scopes whose collector read cleanly within
++    ``fresh_s`` (``SCOPE_HEARTBEAT_FRESH_S``). [daveey]"""
++    published: dict[tuple[str, str, Any], set[str]] = {}
++    for (gw, owner_profile, board, tid), t in tasks.items():
++        if owner_profile is not None and t.get('created_at') is not None:
++            published.setdefault((board, tid, t.get('created_at')), set()).add(gw)
++    live = {scope for scope, beat in heartbeats.items() if 0 <= now - beat <= fresh_s}
++    return {'published': {k: frozenset(v) for k, v in published.items()}, 'live_scopes': frozenset(live)}
++
++
++def _retire_moved(card: dict[str, Any], moved: dict[str, Any]) -> bool:
++    """A remembered row whose card a fresh replica proves lives on ANOTHER gateway: retire it, never release it.
++
++    A worker node runs another gateway's card from a copy in its own board file, and its collector used to publish
++    that copy as its own (``hub/default/default/t_1f359ff1`` for a MacBook card, 10-29). Once the copy was evicted
++    the record vanished, and absence is never closure, so the origin kept the row stale and open forever, naming an
++    owner that has no such card. It is retired only on proof: the named owner is publishing that exact
++    profile/board scope right now without the card, and another gateway publishes a qualified record with the
++    same board, id and ``created_at`` (a copy keeps its ``created_at``). The real owner's record then speaks for
++    the card: its own links, or this gateway's local board when the card is local. [daveey]"""
++    if card.get('ownership_state') != 'qualified' or card.get('created_at') is None:
++        return False
++    scope = (card.get('gateway'), card.get('owner_profile'), card.get('board'))
++    if scope not in moved.get('live_scopes', ()):
++        return False
++    gateways = moved.get('published', {}).get((card.get('board'), card.get('id'), card.get('created_at')), ())
++    return any(gw != card.get('gateway') for gw in gateways)
++
++
++def _fold_legacy_aliases(tasks: dict[tuple, dict[str, Any]], raw: dict[tuple, dict[str, Any]]) -> None:
++    """Merge each unqualified ``board/id`` record into its proven profile-qualified twin, in place.
++
++    Hub-sync used to key records ``board/id``; it now publishes ``profile/board/id`` and the old rows linger,
++    so every pre-qualification card was both counted twice and stuck ``unknown`` forever. A legacy record is
++    folded only when exactly one profile on the same owner gateway publishes that board/id AND both records
++    carry the same non-null ``created_at`` and ``created_by`` (identity, not an ID match). Its shepherd links
++    move onto the twin, so no session loses the association; anything ambiguous stays a separate ``unknown``
++    obligation. [daveey]
++    """
++    qualified: dict[tuple[str, str, str], list[tuple]] = {}
++    for key in tasks:
++        gw, owner_profile, board, tid = key
++        if owner_profile is not None:
++            qualified.setdefault((gw, board, tid), []).append(key)
++    for key in [k for k in tasks if k[1] is None]:
++        gw, _, board, tid = key
++        twins = qualified.get((gw, board, tid), [])
++        if len(twins) != 1:
++            continue
++        old, new = raw[key], raw[twins[0]]
++        if (old.get('created_at') is None or old.get('created_at') != new.get('created_at')
++                or old.get('created_by') != new.get('created_by')):
++            continue
++        twin = tasks[twins[0]]
++        links = [*(twin.get('sessions') if isinstance(twin.get('sessions'), list) else []),
++                 *(link for link in (old.get('sessions') if isinstance(old.get('sessions'), list) else [])
++                   if isinstance(link, dict) and link.get('rel') == 'shepherd')]
++        tasks[twins[0]] = {**twin, 'sessions': links, '_legacy_key': f'{gw}/{board}/{tid}'}
++        del tasks[key]
+-- 
+2.55.0
+

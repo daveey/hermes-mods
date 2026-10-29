@@ -1,0 +1,197 @@
+From dff3b8a924588484b9195774d0c075130478da1f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:03:06 -0700
+Subject: [PATCH] [daveey] Stop the board poll from stalling the Desktop
+ backend
+
+GET /board returned every done card with its full body. The local default
+board was 7.3MB (1859 done cards). json.dumps of that payload ran on the
+event loop and held other requests past hub-sync's 4s timeout. The hub's
+copy was 3.5MB and took 5-11s over SSH, past kanban's 6s timeout.
+
+The poll now keeps the newest 80 done cards and a 200-char body preview.
+The drawer still loads the full card from /tasks/:id. done_limit=0 returns
+the whole column. Encoding runs off the loop.
+
+The snapshot cache already kept a slow read off the poll, but still served
+and encoded the full history on every request.
+---
+ plugins/kanban/dashboard/plugin_api.py        | 47 +++++++++++++++----
+ tests/plugins/test_kanban_board_done_order.py | 46 ++++++++++++++++++
+ 2 files changed, 85 insertions(+), 8 deletions(-)
+
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 1782bcc585..5ecd4e36e0 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -177,6 +177,11 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
+ BOARD_COLUMNS: list[str] = list(kanban_workflow.DEFAULT_WORKFLOW.keys())
+ 
+ _CARD_SUMMARY_PREVIEW_CHARS = 200
++# Newest done cards on the board poll. A busy board's done column is history
++# (thousands of cards, multi-MB bodies). Shipping all of it encodes megabytes
++# on the request and cannot cross an SSH tunnel inside the Desktop's 6s
++# timeout. 0 returns the whole column. [daveey]
++_BOARD_DONE_LIMIT = 80
+ 
+ 
+ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
+@@ -309,7 +314,9 @@ def get_board(
+     include_archived: bool = Query(False),
+     board: Optional[str] = _BOARD_Q,
+     workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
+-    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key")):
++    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
++    done_limit: int = Query(_BOARD_DONE_LIMIT, ge=0, le=10000, description="Newest done cards to include. 0 returns the whole column."),
++):
+     """Full board grouped by status column; omitting ``board`` uses the active board
+     (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``).
+ 
+@@ -322,18 +329,27 @@ def get_board(
+     sig = key = None
+     try:
+         path = str(kanban_db.kanban_db_path(board=resolved))
+-        key = (path, tenant, include_archived, workflow_template_id, current_step_key)
++        key = (path, tenant, include_archived, workflow_template_id, current_step_key, int(done_limit))
+         sig = file_sig(path)  # before the read: a commit during it is read again next time
+     except Exception:
+         pass
+ 
+     def read():
+-        return _get_board_uncached(tenant, include_archived, resolved, workflow_template_id, current_step_key)
++        return _get_board_uncached(
++            tenant, include_archived, resolved, workflow_template_id, current_step_key, int(done_limit))
+ 
+     return serve(key, sig, read, now=time.monotonic())
+ 
+ 
+-def _get_board_uncached(tenant, include_archived, board, workflow_template_id, current_step_key):
++def _preview_list_body(task: dict) -> None:
++    """List cards carry a short body. The drawer loads the full text from /tasks/:id."""
++    body = task.get("body")
++    if isinstance(body, str) and len(body) > _CARD_SUMMARY_PREVIEW_CHARS:
++        task["body"] = body[:_CARD_SUMMARY_PREVIEW_CHARS]
++        task["body_truncated"] = True
++
++
++def _get_board_uncached(tenant, include_archived, board, workflow_template_id, current_step_key, done_limit=_BOARD_DONE_LIMIT):
+     with _board_conn(board) as (board, conn):
+         tasks = kanban_db.list_tasks(
+             conn, tenant=tenant, include_archived=include_archived,
+@@ -374,6 +390,7 @@ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, c
+             # subscriber, else the session that created it.
+             d["managing_session_id"] = managers.get(t.id) or (t.session_id or None)
+             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
++            _preview_list_body(d)
+             columns[t.status if t.status in columns else "todo"].append(d)
+ 
+         # Queue lanes keep the list_tasks dispatch order; the done column is
+@@ -381,6 +398,10 @@ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, c
+         # into the "completed_at DESC NULLS LAST, id DESC" SQL key.
+         columns["done"].sort(key=lambda d: d["id"], reverse=True)
+         columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
++        done_total = len(columns["done"])
++        limit = int(done_limit or 0)
++        if limit > 0 and done_total > limit:
++            columns["done"] = columns["done"][:limit]
+ 
+         # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
+         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
+@@ -391,8 +412,15 @@ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, c
+         # lane immediately, matching the assignee picker at /assignees
+         # which already uses this helper.
+         assignees = [entry["name"] for entry in kanban_db.known_assignees(conn)]
++        columns_out = []
++        for name, tasks in columns.items():
++            col = {"name": name, "tasks": tasks}
++            if name == "done":
++                col["total"] = done_total
++                col["omitted"] = done_total - len(tasks)
++            columns_out.append(col)
+         return {
+-            "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
++            "columns": columns_out, "tenants": tenants,
+             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+ 
+ 
+@@ -441,6 +469,7 @@ async def get_board_endpoint(
+     board: Optional[str] = _BOARD_Q,
+     workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
+     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
++    done_limit: int = Query(_BOARD_DONE_LIMIT, ge=0, le=10000, description="Newest done cards to include. 0 returns the whole column."),
+ ):
+     # Resolve selection before keying so a board switch cannot join an older read.
+     result = await _read_board(
+@@ -449,10 +478,12 @@ async def get_board_endpoint(
+         board=board or kanban_db.get_current_board(),
+         workflow_template_id=workflow_template_id,
+         current_step_key=current_step_key,
++        done_limit=done_limit,
+     )
+-    # The board is plain JSON data (multi-MB on a busy board): json.dumps it directly. FastAPI's jsonable_encoder
+-    # walked ~190k objects per poll (~275 ms) for byte-identical output.
+-    return Response(content=json.dumps(result), media_type="application/json")
++    # Encode off the loop. A busy board used to json.dumps several MB here and
++    # stall every other request (hub-sync's 4s timeout included). [daveey]
++    payload = await asyncio.to_thread(json.dumps, result)
++    return Response(content=payload, media_type="application/json")
+ 
+ 
+ # --- GET /tasks/:id ---------------------------------------------------------
+diff --git a/tests/plugins/test_kanban_board_done_order.py b/tests/plugins/test_kanban_board_done_order.py
+index 34130187b8..680eadb15c 100644
+--- a/tests/plugins/test_kanban_board_done_order.py
++++ b/tests/plugins/test_kanban_board_done_order.py
+@@ -113,3 +113,49 @@ def test_queue_lane_keeps_fifo_default(client):
+ 
+     ready = _column(client, "ready")  # no parents -> both land ready (dispatch order)
+     assert [t["id"] for t in ready] == [b["id"], a["id"]]
++
++
++def _finish_at(client, task_id, completed_at, body=None):
++    _finish(client, task_id)
++    with kbc.connect() as conn:
++        conn.execute("UPDATE tasks SET completed_at = ? WHERE id = ?", (completed_at, task_id))
++        if body is not None:
++            conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
++        conn.commit()
++
++
++def test_board_poll_caps_done_column_and_previews_body(client):
++    """The Desktop poll must not ship every done card's full body. The list
++    keeps the newest ``done_limit`` cards and a short preview; the drawer
++    still loads the full text from /tasks/:id."""
++    long_body = "x" * 500
++    older = client.post("/api/plugins/kanban/tasks", json={"title": "older"}).json()["task"]
++    newer = client.post("/api/plugins/kanban/tasks", json={"title": "newer"}).json()["task"]
++    _finish_at(client, older["id"], 1000, long_body)
++    _finish_at(client, newer["id"], 2000, long_body)
++
++    r = client.get("/api/plugins/kanban/board?done_limit=1")
++    assert r.status_code == 200, r.text
++    col = next(c for c in r.json()["columns"] if c["name"] == "done")
++    assert col["total"] == 2
++    assert col["omitted"] == 1
++    assert [t["id"] for t in col["tasks"]] == [newer["id"]]
++    assert len(col["tasks"][0]["body"]) <= 200
++    assert col["tasks"][0]["body_truncated"] is True
++
++    full = client.get(f"/api/plugins/kanban/tasks/{newer['id']}")
++    assert full.status_code == 200, full.text
++    assert full.json()["task"]["body"] == long_body
++
++
++def test_done_limit_zero_returns_every_done_card(client):
++    first = client.post("/api/plugins/kanban/tasks", json={"title": "first"}).json()["task"]
++    second = client.post("/api/plugins/kanban/tasks", json={"title": "second"}).json()["task"]
++    _finish_at(client, first["id"], 1000)
++    _finish_at(client, second["id"], 2000)
++
++    r = client.get("/api/plugins/kanban/board?done_limit=0")
++    assert r.status_code == 200, r.text
++    col = next(c for c in r.json()["columns"] if c["name"] == "done")
++    assert col["omitted"] == 0
++    assert [t["id"] for t in col["tasks"]] == [second["id"], first["id"]]
+-- 
+2.55.0
+

@@ -1,0 +1,289 @@
+From 11fd6953d877dae7c4411edeb88f372bca4ddef8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:47:28 -0700
+Subject: [PATCH] fix(kanban): serve the last board snapshot while a refresh
+ runs [daveey]
+
+Desktop polls GET /board continuously. A kanban commit moves the db/-wal
+signature, so the 15s cache misses and the poll waited out the uncached
+read (about 1.3s, tens of seconds under load) and hit the client timeout.
+Return the last snapshot and refresh off the request.
+
+Problem: since 2026-10-28 00:56 PDT, after b549dbc49c, desktop.log still
+showed "Timed out connecting to Hermes backend" on GET kanban/board.
+Why 1: the poll waited for the uncached read. coalesced_read makes every
+waiter await the same flight.
+Why 2: every commit changes the wal signature, so a busy board almost
+never hits the cache.
+Why 3: the annotation-flight fix removed one lock but left the refresh
+on the request path.
+Root: a poll treats a refresh as part of the request.
+Not caught: tests proved cache hits and pool admission, not that a poll
+returns while the refresh is blocked.
+---
+ plugins/kanban/dashboard/board_snapshot.py    | 84 +++++++++++++++++++
+ plugins/kanban/dashboard/plugin_api.py        | 48 +++--------
+ tests/plugins/test_kanban_board_read_cache.py | 45 ++++++++--
+ 3 files changed, 137 insertions(+), 40 deletions(-)
+ create mode 100644 plugins/kanban/dashboard/board_snapshot.py
+
+diff --git a/plugins/kanban/dashboard/board_snapshot.py b/plugins/kanban/dashboard/board_snapshot.py
+new file mode 100644
+index 0000000000..2a8bffaae6
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_snapshot.py
+@@ -0,0 +1,84 @@
++"""Last-snapshot reads for GET /board.
++
++Desktop polls the board continuously. One uncached read of a busy board is about
++1.3s of CPU, and every kanban commit moves the db/-wal signature, so the
++signature cache misses on almost every poll. Waiting for that read on the
++request timed the poll out (6-30s) and held an AnyIO worker. Serve the last
++snapshot and refresh off the caller.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++from pathlib import Path
++from typing import Callable, Optional
++
++CACHE_TTL_S = 15.0
++_cache: dict[tuple, tuple] = {}
++_cache_lock = threading.Lock()
++_refresh_lock = threading.Lock()
++_refresh_thread: Optional[threading.Thread] = None
++
++
++def file_sig(path: str) -> Optional[tuple]:
++    out = []
++    for candidate in (path, f"{path}-wal"):
++        try:
++            st = Path(candidate).stat()
++        except OSError:
++            out.append(None)
++            continue
++        out.append((st.st_mtime_ns, st.st_size, st.st_ino))
++    return tuple(out) if out[0] is not None else None
++
++
++def _publish(key, sig, now, result) -> None:
++    with _cache_lock:
++        _cache[key] = (sig, now, result)
++
++
++def join_refresh(timeout: float = 5) -> None:
++    thread = _refresh_thread
++    if thread is not None:
++        thread.join(timeout)
++
++
++def _schedule(read: Callable[[], dict], key, sig, now) -> None:
++    global _refresh_thread
++
++    def run() -> None:
++        try:
++            result = read()
++            _publish(key, sig, now, result)
++        finally:
++            _refresh_lock.release()
++
++    if not _refresh_lock.acquire(blocking=False):
++        return
++    thread = threading.Thread(target=run, daemon=True, name="kanban-board-refresh")
++    _refresh_thread = thread
++    thread.start()
++
++
++def serve(key, sig, read: Callable[[], dict], now: Optional[float] = None) -> dict:
++    """Return a board payload.
++
++    A fresh signature hit is reused. A miss that already has a snapshot returns
++    that snapshot and refreshes off the caller. The first read (no snapshot)
++    runs on the caller.
++    """
++    if now is None:
++        now = time.monotonic()
++    if key is None or sig is None:
++        return read()
++    with _cache_lock:
++        hit = _cache.get(key)
++    if hit is not None and hit[0] == sig and now - hit[1] < CACHE_TTL_S:
++        return dict(hit[2], now=int(time.time()))
++    if hit is not None:
++        _schedule(read, key, sig, now)
++        return dict(hit[2], now=int(time.time()))
++    result = read()
++    _publish(key, sig, now, result)
++    return result
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 647177866c..1782bcc585 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -15,7 +15,6 @@ import json
+ import logging
+ import re
+ import sqlite3
+-import threading
+ import time
+ from concurrent.futures import ThreadPoolExecutor
+ from contextlib import closing, contextmanager
+@@ -305,27 +304,6 @@ def _managing_sessions(conn: sqlite3.Connection) -> dict[str, str]:
+     return {str(r[0]): str(r[1]) for r in rows}
+ 
+ 
+-# Desktop polls GET /board continuously; on a busy board one read is ~1.3 s CPU (diagnostics over every task's
+-# events and runs, init_db's health guard, a 6.5 MB payload) and kept the Desktop backend near a core on 2026-10-27.
+-# Reuse the last result while the board's kanban.db and -wal are unchanged (every commit moves their mtime_ns, size
+-# or inode), at most _BOARD_CACHE_TTL_S old: diagnostics also depend on the clock and config.
+-_BOARD_CACHE_TTL_S = 15.0
+-_board_cache: dict[tuple, tuple] = {}
+-_board_cache_lock = threading.Lock()
+-
+-
+-def _board_file_sig(path: str) -> Optional[tuple]:
+-    out = []
+-    for candidate in (path, f"{path}-wal"):
+-        try:
+-            st = Path(candidate).stat()
+-        except OSError:
+-            out.append(None)
+-            continue
+-        out.append((st.st_mtime_ns, st.st_size, st.st_ino))
+-    return tuple(out) if out[0] is not None else None
+-
+-
+ def get_board(
+     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
+     include_archived: bool = Query(False),
+@@ -333,26 +311,26 @@ def get_board(
+     workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
+     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key")):
+     """Full board grouped by status column; omitting ``board`` uses the active board
+-    (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``)."""
++    (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``).
++
++    A signature hit is reused. A miss that already has a snapshot returns it and
++    refreshes off this request so a slow read cannot time out the Desktop poll.
++    """
++    from plugins.kanban.dashboard.board_snapshot import file_sig, serve
++
+     resolved = _resolve_board(board)
+     sig = key = None
+     try:
+         path = str(kanban_db.kanban_db_path(board=resolved))
+         key = (path, tenant, include_archived, workflow_template_id, current_step_key)
+-        sig = _board_file_sig(path)  # before the read: a commit during it is read again next time
++        sig = file_sig(path)  # before the read: a commit during it is read again next time
+     except Exception:
+         pass
+-    now = time.monotonic()
+-    if sig is not None:
+-        with _board_cache_lock:
+-            hit = _board_cache.get(key)
+-        if hit is not None and hit[0] == sig and now - hit[1] < _BOARD_CACHE_TTL_S:
+-            return dict(hit[2], now=int(time.time()))
+-    result = _get_board_uncached(tenant, include_archived, resolved, workflow_template_id, current_step_key)
+-    if sig is not None:
+-        with _board_cache_lock:
+-            _board_cache[key] = (sig, now, result)
+-    return result
++
++    def read():
++        return _get_board_uncached(tenant, include_archived, resolved, workflow_template_id, current_step_key)
++
++    return serve(key, sig, read, now=time.monotonic())
+ 
+ 
+ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, current_step_key):
+diff --git a/tests/plugins/test_kanban_board_read_cache.py b/tests/plugins/test_kanban_board_read_cache.py
+index 0c114635d5..61a64b3b37 100644
+--- a/tests/plugins/test_kanban_board_read_cache.py
++++ b/tests/plugins/test_kanban_board_read_cache.py
+@@ -1,13 +1,15 @@
+-"""Kanban dashboard plugin: GET /board reuses its last result while the board's files are unchanged.
++"""Kanban dashboard plugin: GET /board reuses its last snapshot.
+ 
+-Desktop polls the board continuously and one read of a busy board cost ~1.3 s CPU, so the read is cached per
+-board + query, keyed by the kanban.db/-wal file signature and at most ``_BOARD_CACHE_TTL_S`` old.
++Desktop polls the board continuously. An unchanged board is read once. A write
++is visible once the off-request refresh finishes; a poll that arrives while that
++refresh is still running gets the previous snapshot instead of waiting it out.
+ """
+ 
+ from __future__ import annotations
+ 
+ import importlib.util
+ import sys
++import threading
+ from pathlib import Path
+ 
+ import pytest
+@@ -57,6 +59,8 @@ def _create(title: str) -> None:
+ 
+ 
+ def test_unchanged_board_is_read_once_and_a_write_is_seen(board):
++    from plugins.kanban.dashboard.board_snapshot import join_refresh
++
+     _mod, client, reads = board
+     _create("first")
+     one = client.get("/api/plugins/kanban/board").json()
+@@ -65,7 +69,10 @@ def test_unchanged_board_is_read_once_and_a_write_is_seen(board):
+     assert two["now"] >= one["now"]
+     _create("second")
+     three = client.get("/api/plugins/kanban/board").json()
+-    assert len(reads) == 2 and _titles(three) == {"first", "second"}
++    assert _titles(three) == {"first"}
++    join_refresh()
++    four = client.get("/api/plugins/kanban/board").json()
++    assert len(reads) == 2 and _titles(four) == {"first", "second"}
+ 
+ 
+ def test_query_params_are_cached_separately(board):
+@@ -76,13 +83,41 @@ def test_query_params_are_cached_separately(board):
+ 
+ 
+ def test_cache_expires_after_ttl(board, monkeypatch):
++    from plugins.kanban.dashboard.board_snapshot import CACHE_TTL_S, join_refresh
++
+     mod, client, reads = board
+     clock = {"t": 1000.0}
+     monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+     client.get("/api/plugins/kanban/board")
+-    clock["t"] += mod._BOARD_CACHE_TTL_S - 1
++    clock["t"] += CACHE_TTL_S - 1
+     client.get("/api/plugins/kanban/board")
+     assert len(reads) == 1
+     clock["t"] += 2
+     client.get("/api/plugins/kanban/board")
++    join_refresh()
+     assert len(reads) == 2
++
++
++def test_poll_returns_last_snapshot_while_refresh_is_blocked(board, monkeypatch):
++    from plugins.kanban.dashboard.board_snapshot import join_refresh
++
++    mod, client, _reads = board
++    _create("first")
++    client.get("/api/plugins/kanban/board")
++    started = threading.Event()
++    release = threading.Event()
++    real = mod._get_board_uncached
++
++    def blocked(*args):
++        started.set()
++        release.wait(10)
++        return real(*args)
++
++    monkeypatch.setattr(mod, "_get_board_uncached", blocked)
++    _create("second")
++    body = client.get("/api/plugins/kanban/board").json()
++    assert _titles(body) == {"first"}
++    assert started.wait(2)
++    release.set()
++    join_refresh()
++    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"first", "second"}
+-- 
+2.55.0
+

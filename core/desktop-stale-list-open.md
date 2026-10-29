@@ -1,6 +1,6 @@
 # A stale-list row still opens and names its connection
 
-Patches: 0585 (feature), 0586–0588 (tests and CI fixes that landed with it in daveey/hermes#126). Fixes a gap in the offline fallback ([hub-sync-replica.md](hub-sync-replica.md),
+Patches: 0584 (feature), 0585, 0586, 0587 (tests and CI fixes that landed with it in daveey/hermes#126). Fixes a gap in the offline fallback ([hub-sync-replica.md](hub-sync-replica.md),
 [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md)) found on 2026-10-27.
 
 ## Why
@@ -54,6 +54,6 @@ One sidebar session list failed, so `$sessionListFreshness` marked the local con
 - The watchdog alert for a stalled app backend lives in the private repo (`home/scripts/hermes_watchdog.py`,
   `desktop-app-backend`). It is not part of this patch.
 
-## Follow-up patches (0605)
+## Follow-up patches (0598)
 
-**0605** (`08d0c266d2`): the cold-start boot snapshot feeds this Mac's own replica rows into `mergeOfflineFallback`, judged asleep when read. When a later local list failed, a retained local row was replaced by that copy (`offline_cached` without `offline_stale_list`), so the open was refused ("<hub> is offline") or went read-only although the local gateway was running; with no `connection_id` the copy was added as a refused duplicate. Now a retained row of the primary backend never yields to a replica copy (it takes the `offline_stale_list` stamp and resumes live), and merge identities treat an empty `connection_id` as the registry primary. Remote rows with a replica copy keep the old behaviour. Code: `apps/desktop/src/store/offline-sessions.ts`. Tests: `offline-sessions.test.ts` (merge unit) and `offline-fallback.integration.test.tsx` (local row with and without connection_id opens live as one row; remote asleep replica stays refused); both new local tests fail on the parent.
+**0598** (`08d0c266d2`): the cold-start boot snapshot feeds this Mac's own replica rows into `mergeOfflineFallback`, judged asleep when read. When a later local list failed, a retained local row was replaced by that copy (`offline_cached` without `offline_stale_list`), so the open was refused ("<hub> is offline") or went read-only although the local gateway was running; with no `connection_id` the copy was added as a refused duplicate. Now a retained row of the primary backend never yields to a replica copy (it takes the `offline_stale_list` stamp and resumes live), and merge identities treat an empty `connection_id` as the registry primary. Remote rows with a replica copy keep the old behaviour. Code: `apps/desktop/src/store/offline-sessions.ts`. Tests: `offline-sessions.test.ts` (merge unit) and `offline-fallback.integration.test.tsx` (local row with and without connection_id opens live as one row; remote asleep replica stays refused); both new local tests fail on the parent.

@@ -1,0 +1,180 @@
+From 2b9ed17df6bd5386e715b39b23a294e915613ca1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:47:31 -0700
+Subject: [PATCH] fix(update): never book Desktop's own backend on the Desktop
+ app's launchd job [daveey]
+
+The 04:36 PDT fenced update on David-MBP (2026-10-28) still owed a false gateway_restart after
+fc7b1ac399: the dashboard refresh stopped Desktop's local `serve --port 0` (pid 38035), and
+_launchd_job_from_launch_env attributed it to gui/501/application.com.nousresearch.hermes.* --
+the Desktop app's LaunchServices job, whose live pid (the app) is the backend's parent. The update
+kickstarted the app job, waited for launchd to report a fresh APP pid, booked the backend
+unrecovered and recorded the follow-up, while Desktop respawned its backend a second later.
+
+- `application.*` labels (LaunchServices app instances: Desktop, terminal apps) never claim a
+  backend; real KeepAlive backend jobs keep the kickstart path.
+- _is_ephemeral_port_zero_backend reads through the `Hermes Python.app -I -c <bootstrap>` form
+  Desktop spawns its backend with; without it the now-unattributed Desktop backend would have been
+  replayed as a detached `--port 0` orphan (verified on the live pid: raw False, resolved True).
+
+Tests: app-label attribution, the 38035 replay end to end, the bootstrap port-0 check and respawn
+filter fail without the fix; controls keep a never-returning real job unrecovered and a fixed-port
+backend replayed.
+---
+ hermes_cli/dashboard_procs.py                 |  7 ++
+ hermes_cli/main_dashboard.py                  |  7 ++
+ .../test_update_dashboard_launchd_wrapper.py  | 98 +++++++++++++++++++
+ 3 files changed, 112 insertions(+)
+
+diff --git a/hermes_cli/dashboard_procs.py b/hermes_cli/dashboard_procs.py
+index 27a600b453..f534895034 100644
+--- a/hermes_cli/dashboard_procs.py
++++ b/hermes_cli/dashboard_procs.py
+@@ -223,6 +223,13 @@ def _is_ephemeral_port_zero_backend(argv: list[str]) -> bool:
+ 
+     See #78821.
+     """
++    # [daveey] Desktop launches its backend through the ``Hermes Python.app -I -c <bootstrap>`` form,
++    # whose ``serve --port 0`` lives inside the inline source: read the argv the bootstrap runs, or
++    # a killed Desktop backend is replayed as a detached ``--port 0`` orphan next to Desktop's own.
++    from gateway.status_inline_source import command_line_runs_inline_source, inline_bootstrap_argv
++    tokens = [str(tok) for tok in argv]
++    if command_line_runs_inline_source(tokens):
++        argv = inline_bootstrap_argv(tokens) or argv
+     if _dashboard_subcommand_index(argv) is None:
+         return False
+     return any((tok == "--port" and i + 1 < len(argv) and str(argv[i + 1]) == "0")
+diff --git a/hermes_cli/main_dashboard.py b/hermes_cli/main_dashboard.py
+index c8260662e4..33fe187350 100644
+--- a/hermes_cli/main_dashboard.py
++++ b/hermes_cli/main_dashboard.py
+@@ -356,6 +356,13 @@ def _launchd_job_from_launch_env(
+     label = str((_pid_environ(pid) or {}).get("XPC_SERVICE_NAME") or "").strip()
+     if not label or label == "0":
+         return None
++    if label.startswith("application."):
++        # A LaunchServices app instance (Hermes Desktop, a terminal app), not a backend supervisor:
++        # every child inherits its name and has the app as an ancestor, so the ancestor match below
++        # claimed the Desktop's own ``serve --port 0`` for the app job. The update then waited for
++        # launchd to report a fresh pid for the APP, booked the backend unrecovered and owed a false
++        # ``gateway_restart`` (David-MBP 2026-10-28 04:37 PDT) while Desktop had already respawned it.
++        return None
+     uid = os.getuid()  # windows-footgun: ok — darwin-only branch
+     for domain in (f"gui/{uid}", f"user/{uid}"):
+         try:
+diff --git a/tests/hermes_cli/test_update_dashboard_launchd_wrapper.py b/tests/hermes_cli/test_update_dashboard_launchd_wrapper.py
+index 558b9b6d2c..db4e34cfb2 100644
+--- a/tests/hermes_cli/test_update_dashboard_launchd_wrapper.py
++++ b/tests/hermes_cli/test_update_dashboard_launchd_wrapper.py
+@@ -48,6 +48,9 @@ def test_cmdline_capture_keeps_exact_argv_of_spaced_runpy_backend(monkeypatch):
+         ({"XPC_SERVICE_NAME": LABEL}, (True, 999), (), False),  # job's live process is someone else
+         ({"XPC_SERVICE_NAME": LABEL}, (False, None), (), False),  # job not loaded
+         ({"XPC_SERVICE_NAME": "0"}, (True, 4242), (), False),
++        # A LaunchServices app job (Desktop / terminal) is an ancestor of every child it spawns,
++        # but it is no backend supervisor: never attribute the child to it.
++        ({"XPC_SERVICE_NAME": "application.com.nousresearch.hermes.1.2"}, (True, 77), (77, 1), False),
+         ({}, (True, 4242), (), False),
+     ],
+ )
+@@ -118,3 +121,98 @@ def test_terminal_launched_dashboard_still_respawns_from_argv(monkeypatch):
+     respawn.assert_called_once_with([ARGV])
+ 
+ 
++
++_DESKTOP_SERVE = [_PY, "-I", "-c", _SRC.replace("'dashboard', '--port', '9119', '--no-open'",
++                                                "'serve', '--host', '127.0.0.1', '--port', '0'")]
++_APP_LABEL = "application.com.nousresearch.hermes.834263643.834268344"
++_APP_PID = 23501
++
++
++@pytest.mark.platforms("macos")
++def test_desktop_local_serve_is_not_booked_on_the_desktop_app_job(monkeypatch):
++    """David-MBP 2026-10-28 04:37 PDT: the update stopped Desktop's own ``serve --port 0`` (it inherits
++    the app's ``XPC_SERVICE_NAME`` and the app is its parent), attributed it to the Desktop app's
++    LaunchServices job, waited for launchd to report a fresh APP pid, booked the backend unrecovered
++    and owed ``gateway_restart`` -- while Desktop respawned its backend a second later. The backend
++    is Desktop's to bring back: no kickstart of the app job, no argv respawn, nothing unrecovered."""
++    monkeypatch.setitem(
++        sys.modules, "psutil", _fake_psutil(argv=_DESKTOP_SERVE, env={"XPC_SERVICE_NAME": _APP_LABEL})
++    )
++
++    def _fake_kill(pid, sig):
++        if sig == 0:
++            raise ProcessLookupError
++
++    with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
++         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[38035]), \
++         patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
++         patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
++         patch.object(main_dashboard, "_loaded_launchd_backend_jobs", return_value=[]), \
++         patch("hermes_cli.gateway._launchd_print_service_pid", return_value=(True, _APP_PID)), \
++         patch.object(main_dashboard, "_restart_launchd_job", return_value=False) as restart, \
++         patch.object(main_dashboard, "_respawn_dashboard_processes", return_value=[]) as respawn, \
++         patch("hermes_cli.dashboard_procs._process_ancestors", return_value=[_APP_PID, 1]), \
++         patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
++         patch("os.kill", side_effect=_fake_kill), \
++         patch("time.sleep"):
++        result = dashboard_procs._kill_stale_dashboard_processes(restart_managed=True)
++
++    restart.assert_not_called()
++    respawn.assert_not_called()  # a Desktop --port 0 backend is never resurrected from argv
++    assert result["killed"] == [38035] and result["unrecovered"] == []
++
++
++@pytest.mark.platforms("macos")
++def test_real_launchd_backend_job_that_never_returns_stays_unrecovered(monkeypatch):
++    """Control: a genuine backend job (non-``application.`` label) whose kickstart never yields a
++    fresh pid is still booked unrecovered, so the update keeps warning."""
++    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(argv=ARGV, env={"XPC_SERVICE_NAME": LABEL}))
++
++    def _fake_kill(pid, sig):
++        if sig == 0:
++            raise ProcessLookupError
++
++    with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
++         patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[4242]), \
++         patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
++         patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
++         patch.object(main_dashboard, "_loaded_launchd_backend_jobs", return_value=[]), \
++         patch("hermes_cli.gateway._launchd_print_service_pid", return_value=(True, 77)), \
++         patch.object(main_dashboard, "_restart_launchd_job", return_value=False), \
++         patch.object(main_dashboard, "_respawn_dashboard_processes", return_value=[]), \
++         patch("hermes_cli.dashboard_procs._process_ancestors", return_value=[77, 1]), \
++         patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
++         patch("os.kill", side_effect=_fake_kill), \
++         patch("time.sleep"):
++        result = dashboard_procs._kill_stale_dashboard_processes(restart_managed=True)
++
++    assert result["unrecovered"] == [4242]
++
++
++def _desktop_bootstrap(port: str) -> list[str]:
++    """The ``Hermes Python.app -I -I -c`` shape Hermes Desktop spawns its local backend with (live
++    pid 87773 on David-MBP): argv assigned inside the source, then the published launcher exec'd."""
++    launcher = (
++        "import os, re, sys\\nsys.path.insert(0, '/Users/me/.hermes/hermes-agent')\\n"
++        "from hermes_cli.main import main\\nsys.argv[0] = re.sub(r'(-script\\\\.pyw|\\\\.exe)?$', '', sys.argv[0])\\n"
++        "sys.exit(main())\\n"
++    )
++    src = (
++        "import sys, runpy; sys.path.insert(0, '/Users/me/.hermes/hermes-agent'); "
++        f"sys.argv = ['-c', 'serve', '--host', '127.0.0.1', '--port', '{port}']; "
++        f'exec("{launcher}")'
++    )
++    return [_PY, "-I", "-I", "-c", src]
++
++
++@pytest.mark.parametrize(("port", "expected"), [("0", True), ("9119", False)])
++def test_port_zero_check_reads_through_the_desktop_inline_bootstrap(port, expected):
++    assert dashboard_procs._is_ephemeral_port_zero_backend(_desktop_bootstrap(port)) is expected
++
++
++def test_killed_desktop_bootstrap_backend_is_never_respawned():
++    assert dashboard_procs._filter_dashboard_respawn_candidates(
++        [(87773, _desktop_bootstrap("0"), None)], own_home="/Users/me/.hermes") == []
++    # control: a fixed-port backend in the same shape is still replayed
++    assert dashboard_procs._filter_dashboard_respawn_candidates(
++        [(87774, _desktop_bootstrap("9119"), None)], own_home="/Users/me/.hermes") == [_desktop_bootstrap("9119")]
+-- 
+2.55.0
+

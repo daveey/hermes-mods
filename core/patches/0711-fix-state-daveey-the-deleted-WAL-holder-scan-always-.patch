@@ -1,0 +1,122 @@
+From e5dd8a90ecec2678fd7f4b3223b6527d52a53dfb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 02:43:40 -0700
+Subject: [PATCH] fix(state): [daveey] the deleted-WAL holder scan always runs
+ on a real thread of its own
+
+Since ca3e667b61 (one deleted-WAL holder scan in flight per process), every SessionDB open on macOS
+starts the scan pass from _join_darwin_fd_scan through threading.Thread, while holding _DARWIN_SCAN_LOCK.
+93 test call sites replace threading.Thread with stubs whose start() runs the target inline or never.
+
+- Inline stub: the pass took _DARWIN_SCAN_LOCK again in its finally, on the thread already holding it,
+  and deadlocked. All of tests/tui_gateway/test_tui_gateway_server.py (671 cases) hung on every Mac from
+  10-27. faulthandler showed the main thread parked in hermes_state_dbfile.run under a stub's start().
+  run_tests.sh reported the file as CRASHED, with no results.
+- Never-start stub: the open waited out the 5 s scan timeout, and the stub recorded the pass as the
+  thread of the code under test. test_interrupt_before_agent_ready_prevents_late_turn_start counted 2
+  threads and called the scan as if it were the turn.
+
+CI runs on Linux, which never takes the darwin path, so nothing caught it.
+
+The pass now starts on threading.Thread as the threading module defined it, found through the main
+thread's class MRO. Binding threading.Thread at import is not enough: this module is often first imported
+while such a stub is installed, and the binding then captured the stub. The lock is unchanged.
+
+Tests: test_thread_stubs_never_capture_the_scan_pass[inline|never] fails before ("a threading.Thread stub
+captured the scan pass": ['_DarwinFdScan.run'] == []) and passes now. On macOS the server file runs again:
+test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks (hung) and
+test_interrupt_before_agent_ready_prevents_late_turn_start (failed) pass, and the whole file passes in one
+process (671 passed in 373 s).
+---
+ hermes_state_dbfile.py                        | 19 ++++++++-
+ .../test_state_db_darwin_fd_scan_hang.py      | 40 +++++++++++++++++++
+ 2 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index 6fee91c728..814abf3018 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -246,6 +246,23 @@ _DARWIN_FD_SCAN_THREAD_NAME = "hermes-wal-holder-scan"
+ _DARWIN_SCAN_LOCK = threading.Lock()
+ _DARWIN_SCAN_IN_FLIGHT = None
+ 
++
++def _interpreter_thread_class():
++    """threading.Thread as the threading module defined it, even while the attribute is replaced: the
++    main thread is an instance of a subclass that module built at its own import."""
++    for cls in type(threading.main_thread()).__mro__:
++        if cls.__module__ == "threading" and cls.__name__ == "Thread":
++            return cls
++    return threading.Thread
++
++
++# The pass always runs on a real thread of its own. Tests replace threading.Thread with stubs whose
++# start() runs the target inline or never (93 call sites), and this module is imported lazily, often
++# while such a stub is installed, so the class can't just be bound at import. Run inline, the pass re-took
++# _DARWIN_SCAN_LOCK on the thread already holding it and deadlocked; never started, the SessionDB open
++# waited out the scan timeout and the stub mistook the pass for the thread under test.
++_SCAN_THREAD = _interpreter_thread_class()
++
+ # A clean (no holder) verdict is reused for this long. Every SessionDB open used to walk every fd
+ # of every process (~5 s of CPU, up to 5 s of abandoned thread each on timeout); a busy Mac opening
+ # state.db from dozens of CLI/worker/wake_check processes spent its cores on that. Positive
+@@ -424,7 +441,7 @@ def _join_darwin_fd_scan(base: str | None = None, key: tuple | None = None,
+             scan = _DarwinFdScan(time.monotonic() + timeout)
+             _DARWIN_SCAN_IN_FLIGHT = scan
+             try:
+-                threading.Thread(target=scan.run, name=_DARWIN_FD_SCAN_THREAD_NAME, daemon=True).start()
++                _SCAN_THREAD(target=scan.run, name=_DARWIN_FD_SCAN_THREAD_NAME, daemon=True).start()
+             except BaseException:
+                 _DARWIN_SCAN_IN_FLIGHT = None
+                 raise
+diff --git a/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py b/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py
+index c16a9a626e..05dd0a1549 100644
+--- a/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py
++++ b/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py
+@@ -192,3 +192,43 @@ def test_timed_out_scan_is_not_cached(monkeypatch, tmp_path):
+     monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", 0.3)
+     assert _iter_darwin_sidecar_holders(tmp_path / "state.db") == []
+     assert not dbfile._darwin_clean_until
++
++
++@pytest.mark.parametrize("stub_start", ["inline", "never"])
++def test_thread_stubs_never_capture_the_scan_pass(monkeypatch, tmp_path, stub_start):
++    """Tests replace threading.Thread with stubs whose start() runs the target inline or never (93 call
++    sites). The pass must stay on its own real thread under both. Run inline, it re-took _DARWIN_SCAN_LOCK
++    on the thread already holding it and deadlocked: all of test_tui_gateway_server.py hung on macOS from
++    10-27. Never started, the SessionDB open waited out the scan timeout and the stub recorded the pass as
++    the code under test's thread (test_interrupt_before_agent_ready_prevents_late_turn_start saw 2)."""
++    watched = os.path.realpath(os.path.join(os.fspath(tmp_path), "state.db-wal"))
++    lib = _HealthyLibproc(watched, (0xDEAD, 0xBEEF))
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++    monkeypatch.setattr(dbfile, "_darwin_all_pids", lambda _lib: [4242])
++    # Private copies, restored at teardown: a regression then wedges only this test's lock and slot.
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_LOCK", type(dbfile._DARWIN_SCAN_LOCK)())
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_IN_FLIGHT", None)
++    real_thread = threading.Thread
++    captured = []
++
++    class _StubThread:
++        def __init__(self, target=None, **_kwargs):
++            self._target = target
++            captured.append(getattr(target, "__qualname__", repr(target)))
++
++        def start(self):
++            if stub_start == "inline":
++                self._target()
++
++    monkeypatch.setattr(threading, "Thread", _StubThread)
++    # This module is often first imported while such a stub is installed: what it would bind then.
++    assert dbfile._interpreter_thread_class() is real_thread
++    outcome = []
++    worker = real_thread(
++        target=lambda: outcome.append(_iter_darwin_sidecar_holders(tmp_path / "state.db")), daemon=True)
++    worker.start()
++    worker.join(10.0)
++    assert not worker.is_alive(), "the pass deadlocked on _DARWIN_SCAN_LOCK"
++    assert captured == [], "a threading.Thread stub captured the scan pass"
++    assert outcome == [[(4242, watched)]]
++    assert dbfile._DARWIN_SCAN_IN_FLIGHT is None
+-- 
+2.55.0
+

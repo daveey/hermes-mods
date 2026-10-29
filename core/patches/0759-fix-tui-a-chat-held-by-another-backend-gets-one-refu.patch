@@ -1,0 +1,505 @@
+From 1e339d9ec3ec2d669a14d41c430aeaa1b8d443ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:15:11 +0000
+Subject: [PATCH] fix(tui): a chat held by another backend gets one refusal
+ notice, not a retry loop [daveey]
+
+A synthesized turn (process completion, subagent result, /loop tick, kanban notice) refused SESSION_NOT_OWNED
+because another backend holds the chat's durable turn lease went straight back on the queue, and the
+notification poller re-ran it on its next pass. Each refused attempt painted "Hermes hit an internal error
+... Your message was not answered" (139 cards in 110 s, David-MBP 2026-10-28, chat 20261023_204423_b85a94,
+until hermes-sync's drain closed admission).
+
+- _admit_prompt_turn records the refusal code on the session; _notif_run_submit reads it and starts a
+  doubling backoff (30 s up to 300 s). _notif_claim_turn claims nothing while it holds.
+- Inside a refusal streak, a retry probes ownership first and stays silent while the chat is still held,
+  so the user sees exactly one notice per streak. A successful admission clears the streak.
+- A refused completion event is released and held for this chat instead of being marked delivered with no
+  turn run; it is delivered once the other backend lets go.
+- SESSION_NOT_OWNED / SESSION_COORDINATION_UNAVAILABLE get their own turn-error copy ("This chat is open in
+  another Hermes window or device") instead of the gateway layer's "internal error".
+
+Tests: tests/tui_gateway/test_notification_owner_refusal_backoff.py (real poller thread + admission against a
+foreign lease: bounded attempts and one notice; delivered after release; user prompts still refuse every
+time) and tests/e2e/core/terminal/test_held_session_notification_refusal.py (real `hermes serve`, background
+job completing while a second process holds the durable turn lease: 111 attempts/111 cards in 40 s before,
+1/1 after).
+---
+ .../test_held_session_notification_refusal.py | 120 ++++++++++++
+ ...test_notification_owner_refusal_backoff.py | 176 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |   6 +
+ tui_gateway/session_notifications.py          |  70 ++++++-
+ tui_gateway/user_messages.py                  |   6 +
+ 5 files changed, 375 insertions(+), 3 deletions(-)
+ create mode 100644 tests/e2e/core/terminal/test_held_session_notification_refusal.py
+ create mode 100644 tests/tui_gateway/test_notification_owner_refusal_backoff.py
+
+diff --git a/tests/e2e/core/terminal/test_held_session_notification_refusal.py b/tests/e2e/core/terminal/test_held_session_notification_refusal.py
+new file mode 100644
+index 0000000000..b6d0aa95f9
+--- /dev/null
++++ b/tests/e2e/core/terminal/test_held_session_notification_refusal.py
+@@ -0,0 +1,120 @@
++"""A chat held by another process must not get a refused notification turn re-run in a loop.
++
++Live repro of 2026-10-28 (David-MBP desktop.log, chat 20261023_204423_b85a94): a background-process
++completion was waiting in the Desktop backend while another device's backend held the chat. The poller
++re-ran the completion turn every ~0.8 s; each one was refused SESSION_NOT_OWNED and painted an
++"internal error ... Your message was not answered" card (139 in 110 s).
++
++Harness: the REAL ``hermes serve`` backend (Desktop's argv) with a fake LLM, one Desktop-shaped
++WebSocket client. The client's turn starts ``terminal(background=true, notify_on_complete=true)`` and
++keeps the chat open. A SECOND OS process then takes the chat's active-session lease over and keeps it
++(another device's backend holding it). When the background job finishes, its completion turn is refused. Asserts at
++most 3 attempts (message.start) and exactly one error notice over the window, with owner copy, not
++"internal error".
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import time
++
++import pytest
++
++from tests.e2e.core.terminal._gateway_client import REPO_ROOT, Backend, etype, poll_until
++from tests.fakes.fake_llm_provider import Text, ToolCall
++
++pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group lifecycle")
++
++WINDOW_S = float(os.environ.get("HELD_REFUSAL_WINDOW_S", "45"))
++JOB_S = 12
++
++_HOLDER = r"""
++import os, sys, time
++from hermes_state import SessionDB
++from hermes_state_pidns import holder_namespace_token
++# Another device's backend on the same host shares state.db and holds the chat's durable turn lease
++# (2026-10-28: the mini's Desktop backend, SSH-spawned on David-MBP). The Desktop backend's admission reads
++# that lease (_durable_owner_refusal) and refuses SESSION_NOT_OWNED, the incident's refusal.
++holder = f"pid={os.getpid()}{holder_namespace_token()}:turn=other-device:platform=desktop"
++db = SessionDB()
++ok = db.try_acquire_session_turn_lease(sys.argv[1], holder, ttl_seconds=600)
++print("HELD" if ok else "REFUSED", flush=True)
++time.sleep(float(sys.argv[2]))
++"""
++
++
++def _responder(record: dict):
++    messages = record["body"].get("messages") or []
++    tool_results = [m for m in messages if m.get("role") == "tool"]
++    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
++    text = str(last_user.get("content") or "")
++    if "start the job" in text and not tool_results:
++        return ToolCall("terminal", {"command": f"sleep {JOB_S} && echo bgdone", "background": True,
++                                     "notify_on_complete": True})
++    return Text("ok, noted")
++
++
++@pytest.fixture
++def backend(tmp_path):
++    be = Backend(tmp_path, _responder)
++    be.start()
++    try:
++        yield be
++    finally:
++        be.stop()
++
++
++def test_refused_completion_turn_is_bounded_and_noticed_once(backend):
++    client = backend.connect("desktop")
++    sid = client.call("session.create", cols=80)["session_id"]
++    start = len(client.snapshot())
++    client.call("prompt.submit", session_id=sid, text="please start the job")
++    client.wait_for(lambda f: etype(f) == "message.complete" and f["params"].get("session_id") == sid,
++                    timeout=90, start=start, what="first turn complete")
++    job_started = time.monotonic()
++    key = poll_until(lambda: (backend.db_rows("select id from sessions order by started_at desc limit 1")
++                              or [[None]])[0][0], timeout=30, what="session row")
++
++    env = {**os.environ, "HOME": str(backend.home), "HERMES_HOME": str(backend.hermes_home),
++           "PYTHONPATH": str(REPO_ROOT), "HERMES_STATE_DB_GUARD_BYPASS": "1"}
++    holder = subprocess.Popen([sys.executable, "-c", _HOLDER, key, str(WINDOW_S + JOB_S + 30)], env=env,
++                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    try:
++        assert holder.stdout is not None and holder.stderr is not None
++        line = poll_until(lambda: holder.stdout.readline().strip(), timeout=60, what="holder lease")
++        assert line.startswith("HELD"), f"holder could not take the lease: {line} {holder.stderr.read()}"
++        rsid = sid
++        assert time.monotonic() - job_started < JOB_S, "set up too slowly: the job finished before the hold"
++        mark = len(client.snapshot())
++        held_at = time.monotonic()
++        time.sleep(WINDOW_S)
++        frames = [f for f in client.snapshot()[mark:] if f.get("method") == "event"
++                  and f["params"].get("session_id") == rsid]
++    finally:
++        holder.kill()
++        holder.wait(timeout=10)
++
++    starts = [f for f in frames if etype(f) == "message.start"]
++    errors = [f["params"]["payload"] for f in frames if etype(f) == "message.complete"
++              and (f["params"].get("payload") or {}).get("status") == "error"]
++    report = {
++        "session_key": key, "window_s": WINDOW_S,
++        "attempts_message_start": len(starts),
++        "error_notices": len(errors),
++        "first_start_after_hold_s": round(starts[0]["_t"] - held_at, 2) if starts else None,
++        "notice_codes": [(e.get("error_surface") or {}).get("code") for e in errors],
++        "notice_first_line": [str(e.get("text") or "").splitlines()[0] for e in errors[:3]],
++    }
++    print("REPRO " + json.dumps(report))
++    seen = [(etype(f), (f.get("params") or {}).get("session_id")) for f in client.snapshot()
++            if f.get("method") == "event"]
++    assert errors, (f"the completion turn never ran against the held chat (sid={sid} rsid={rsid}):\n"
++                    f"events={seen}\nllm={[str(b.get('messages', [])[-1:])[:300] for b in backend.llm.main_requests()]}\n"
++                    f"{backend.logs()}")
++    assert len(starts) <= 3, report
++    assert len(errors) == 1, report
++    assert report["notice_codes"] == ["SESSION_NOT_OWNED"], report
++    assert "internal error" not in errors[0]["text"], report
+diff --git a/tests/tui_gateway/test_notification_owner_refusal_backoff.py b/tests/tui_gateway/test_notification_owner_refusal_backoff.py
+new file mode 100644
+index 0000000000..81e77cf558
+--- /dev/null
++++ b/tests/tui_gateway/test_notification_owner_refusal_backoff.py
+@@ -0,0 +1,176 @@
++"""A synthesized turn refused because another device holds the chat is not retried in a loop.
++
++2026-10-28, David-MBP: a background-process completion addressed to chat 20261023_204423_b85a94 sat in
++the MacBook Desktop backend while the mini's Desktop (an SSH backend on the same Mac) held the chat's
++active-session lease. The session's notification poller claimed the idle session, ran the completion
++turn, ``_admit_prompt_turn`` refused it SESSION_NOT_OWNED (message.start + an error message.complete),
++``_notif_retry_completions`` put the event straight back on the queue after 0.25 s, and the poller
++dequeued it again: 139 "Hermes hit an internal error ... Your message was not answered" cards in 110 s,
++one every ~0.78 s, until hermes-sync's drain closed admission.
++
++These tests drive the REAL poller thread, dispatch, ``_run_prompt_submit`` and ``_admit_prompt_turn``
++against a real active-session registry entry held by another writer, and assert bounded attempts and a
++single notice whose copy says where the chat is open, not "internal error".
++"""
++
++from __future__ import annotations
++
++import queue
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from tui_gateway import server
++
++KEY = "20261023_204423_b85a94"
++
++
++def _completion() -> dict:
++    return {"type": "completion", "session_id": "proc_refused", "session_key": KEY, "command": "sleep 1",
++            "exit_code": 0, "output": "done"}
++
++
++@pytest.fixture
++def held_elsewhere(monkeypatch):
++    """A real registry lease on KEY held by another writer (another device's backend)."""
++    from hermes_cli.active_sessions import try_acquire_active_session
++
++    lease, refusal = try_acquire_active_session(
++        session_id=KEY, surface="desktop", config={},
++        metadata={"live_session_id": "mini-ssh-backend"})
++    assert refusal is None and lease is not None
++    yield lease
++    lease.release()
++
++
++@pytest.fixture
++def poller_env(monkeypatch):
++    from tools.process_registry import process_registry
++
++    q: queue.Queue = queue.Queue()
++    monkeypatch.setattr(process_registry, "completion_queue", q)
++    monkeypatch.setattr(process_registry, "restore_completions", lambda: 0)
++    process_registry._completion_consumed.discard("proc_refused")
++    frames: list = []
++    lock = threading.Lock()
++
++    def _emit(event, sid, payload=None):
++        with lock:
++            frames.append((event, payload))
++
++    monkeypatch.setattr(server, "_emit", _emit)
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    # No state.db writer lease in this sandbox: the registry lease below is the only owner signal.
++    monkeypatch.setattr(server, "_foreign_turn_owner", lambda session: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: True)
++    for name in ("_poll_bot_live_delivery_guarded", "_maybe_fire_tui_loop_tick",
++                 "_maybe_fire_tui_heartbeat_tick", "_notif_poll_kanban", "_notif_take_parked"):
++        monkeypatch.setattr(server, name, lambda *a, **k: None)
++    monkeypatch.setattr("tools.async_delegation.maybe_sweep_orphaned_completions", lambda q: None)
++    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda evt, consumer: "claim")
++    monkeypatch.setattr("tools.async_delegation.release_event_delivery", lambda evt, claim: None)
++    completed: list = []
++    monkeypatch.setattr("tools.async_delegation.complete_event_delivery",
++                        lambda evt, claim: completed.append(evt))
++    turns: list = []
++    monkeypatch.setattr(server, "_notif_resolve_event_key", lambda evt_key, session=None: evt_key)
++    session = {"session_key": KEY, "history": [], "history_version": 0, "history_lock": threading.RLock(),
++               "running": False, "agent": SimpleNamespace(run_conversation=lambda *a, **k: turns.append(a)),
++               "attached_images": [], "cols": 80, "source": "desktop", "inflight_turn": None}
++    sid = "56b01ba7"
++    with server._sessions_lock:
++        saved = dict(server._sessions)
++        server._sessions.clear()
++        server._sessions[sid] = session
++    try:
++        yield SimpleNamespace(queue=q, frames=frames, lock=lock, session=session, sid=sid, turns=turns,
++                              completed=completed)
++    finally:
++        with server._sessions_lock:
++            server._sessions.clear()
++            server._sessions.update(saved)
++        process_registry._completion_consumed.discard("proc_refused")
++
++
++def _run_poller(env, seconds: float) -> None:
++    stop = threading.Event()
++    worker = threading.Thread(target=server._notification_poller_scoped_loop,
++                              args=(stop, env.sid, env.session), daemon=True)
++    worker.start()
++    time.sleep(seconds)
++    stop.set()
++    env.session["_finalized"] = True
++    worker.join(timeout=10)
++    assert not worker.is_alive()
++
++
++def _counts(env):
++    with env.lock:
++        starts = [p for e, p in env.frames if e == "message.start"]
++        errors = [p for e, p in env.frames if e == "message.complete" and (p or {}).get("status") == "error"]
++    return starts, errors
++
++
++def test_owner_refusal_is_not_retried_in_a_loop_and_shows_one_notice(poller_env, held_elsewhere):
++    poller_env.queue.put(_completion())
++
++    _run_poller(poller_env, 4.0)
++
++    starts, errors = _counts(poller_env)
++    # Before the fix: a message.start + error message.complete pair every ~0.3-0.8 s for as long as the
++    # other device held the chat.
++    assert len(errors) == 1, f"one notice, not a loop: {len(errors)} refusals in 4 s"
++    assert len(starts) <= 1
++    notice = errors[0]
++    assert notice["error_surface"]["code"] == "SESSION_NOT_OWNED"
++    assert "internal error" not in notice["text"]
++    assert "open in another Hermes window or device" in notice["text"]
++    assert poller_env.turns == [], "the refused turn must never reach the model"
++    # The completion is neither lost nor marked delivered: it waits for the chat to come free.
++    assert poller_env.completed == []
++    assert poller_env.session["running"] is False
++
++
++def test_refused_completion_is_delivered_once_the_other_device_lets_go(poller_env, held_elsewhere, monkeypatch):
++    """Backoff, not a drop: after the holder releases, the next attempt runs the turn."""
++    monkeypatch.setattr(server, "_OWNER_REFUSAL_BACKOFF_S", 0.5, raising=False)
++    delivered: list = []
++    real_submit = server._run_prompt_submit
++
++    def _submit(rid, sid, session, text, **kwargs):
++        if held_elsewhere.released:
++            delivered.append(text)
++            with session["history_lock"]:
++                session["running"] = False
++            return True
++        return real_submit(rid, sid, session, text, **kwargs)
++
++    monkeypatch.setattr(server, "_run_prompt_submit", _submit)
++    poller_env.queue.put(_completion())
++    stop = threading.Event()
++    worker = threading.Thread(target=server._notification_poller_scoped_loop,
++                              args=(stop, poller_env.sid, poller_env.session), daemon=True)
++    worker.start()
++    deadline = time.monotonic() + 1.5
++    while time.monotonic() < deadline and not _counts(poller_env)[1]:
++        time.sleep(0.05)
++    held_elsewhere.release()
++    deadline = time.monotonic() + 5.0
++    while time.monotonic() < deadline and not delivered:
++        time.sleep(0.05)
++    stop.set()
++    poller_env.session["_finalized"] = True
++    worker.join(timeout=10)
++
++    assert len(_counts(poller_env)[1]) == 1
++    assert len(delivered) == 1, "the held completion must be delivered after the release"
++
++
++def test_a_user_prompt_refusal_still_reports_every_time(poller_env, held_elsewhere):
++    """Control: the backoff covers synthesized turns only. A prompt the user typed gets its card."""
++    for _ in range(2):
++        assert server._run_prompt_submit("rid", poller_env.sid, poller_env.session, "hello") is False
++    assert len(_counts(poller_env)[1]) == 2
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index e0a8912043..723ef05301 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -153,6 +153,9 @@ def _admit_prompt_turn(
+             if _retain_unadmitted_submit_row(session["history"], staged):
+                 session["history_version"] = int(session.get("history_version", 0)) + 1
+         reason = getattr(ownership_refusal, "reason", None) or "SESSION_COORDINATION_UNAVAILABLE"
++        # [daveey] Read by the notification poller (_notif_after_submit): a synthesized turn refused for
++        # ownership backs off instead of re-running every poll (139 refusal cards in 110 s, 2026-10-28).
++        session["_turn_owner_refusal"] = reason
+         _emit_terminal_turn_error(
+             sid, session, str(ownership_refusal),
+             error_surface={"layer": "gateway", "code": reason, "retryable": False})
+@@ -160,6 +163,9 @@ def _admit_prompt_turn(
+     with session["history_lock"]:
+         if not owns(session):
+             return None
++        # This process owns the chat again: any notification refusal backoff is over. [daveey]
++        for key in ("_turn_owner_refusal", "_notif_owner_refused_until", "_notif_owner_refusal_delay"):
++            session.pop(key, None)
+         if session.get("_closing") or (
+             queued_prompt_generation is not None
+             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 122bbc0be6..3a4ab23df4 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -171,7 +171,10 @@ def _notif_release_turn(session: dict) -> None:
+ def _notif_claim_turn(session: dict) -> bool:
+     """Claim the idle session (running=True) under history_lock; False if a turn is live.
+     After the user's Stop no automatic turn starts: the cancel latch holds notifications
+-    (requeued by the callers) until the next user prompt clears it."""
++    (requeued by the callers) until the next user prompt clears it. While another backend owns
++    the chat (owner-refusal backoff) no automatic turn starts either."""
++    if _notif_owner_refused(session):
++        return False
+     with _session_turn_admission(session) as admitted:
+         if not admitted or session.get("running") or session.get("_turn_cancel_requested"):
+             return False
+@@ -183,19 +186,66 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
+     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
+ 
+ 
++# [daveey] A synthesized turn (process completion, subagent result, /loop, /heartbeat, bot DM, kanban notice)
++# that the admission gate refuses because another live process holds the chat: SESSION_NOT_OWNED is
++# deterministic until that owner lets go, so the poller waits (doubling backoff) instead of re-running the turn
++# on its next pass. Before, a refused completion went straight back on the queue and the poller re-ran it every
++# ~0.8 s, painting a "Your message was not answered" card each time (139 in 110 s on 2026-10-28). The first
++# refusal of a streak shows its card; later probes in the streak are silent.
++_OWNER_REFUSAL_BACKOFF_S = 30.0
++_OWNER_REFUSAL_BACKOFF_MAX_S = 300.0
++_OWNER_REFUSAL_CODES = ("SESSION_NOT_OWNED", "SESSION_COORDINATION_UNAVAILABLE")
++
++
++def _notif_owner_refused(session: dict) -> bool:
++    """True while an owner-refusal backoff holds this session's automatic turns."""
++    return time.monotonic() < float(session.get("_notif_owner_refused_until") or 0)
++
++
++def _notif_note_owner_refusal(session: dict, reason: str) -> None:
++    delay = float(session.get("_notif_owner_refusal_delay") or _OWNER_REFUSAL_BACKOFF_S)
++    session["_notif_owner_refusal_delay"] = min(delay * 2, _OWNER_REFUSAL_BACKOFF_MAX_S)
++    session["_notif_owner_refused_until"] = time.monotonic() + delay
++    logger.info("automatic turn for session %s refused (%s): another owner holds the chat; next try in %.0fs",
++                session.get("session_key") or "", reason, delay)
++
++
++def _notif_owner_preflight(sid: str, session: dict) -> bool:
++    """False = refused silently. Only inside a refusal streak (its card already shown): probe ownership
++    before anything is emitted, so a later retry while the chat is still held elsewhere stays invisible."""
++    if not session.get("_notif_owner_refusal_delay"):
++        return True
++    refusal = _ensure_active_session_slot(sid, session)
++    if refusal is None:
++        return True
++    _notif_note_owner_refusal(session, str(getattr(refusal, "reason", None) or "refused"))
++    return False
++
++
+ def _notif_run_submit(rid, sid, session, text, **kwargs):
+     """Run a turn this caller just claimed via _notif_claim_turn.
+ 
+     A plain stage() adopts the freshly claimed generation instead of inheriting a stale
+     one from an enclosing worker context (which would refuse the new turn and leak it)."""
+     from tui_gateway.turn_admission import stage
++    if not _notif_owner_preflight(sid, session):
++        _notif_release_turn(session)
++        return False
++    session.pop("_turn_owner_refusal", None)
+     with stage(session):
+-        return _run_prompt_submit(rid, sid, session, text, **kwargs)
++        accepted = _run_prompt_submit(rid, sid, session, text, **kwargs)
++    reason = session.pop("_turn_owner_refusal", None)
++    if not accepted and reason in _OWNER_REFUSAL_CODES:
++        _notif_note_owner_refusal(session, reason)
++    return accepted
+ 
+ 
+ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> Any:
+     """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure.
+     Returns the gate's verdict (False = refused, no turn runs)."""
++    if not _notif_owner_preflight(sid, session):
++        _notif_release_turn(session)
++        return False
+     try:
+         from gateway.warning_notifications import render_notification
+         with _session_profile_runtime_scope(session):
+@@ -351,6 +401,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
+         if wakeup.lstrip().startswith("/"):
+             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
+         else:
++            if not _notif_owner_preflight(sid, session):  # still held elsewhere: no dangling message.start
++                _notif_release_turn(session)
++                with contextlib.suppress(Exception):
++                    mgr.abandon_tick()
++                return
+             _emit("message.start", sid)
+             _notif_run_submit(rid, sid, session, wakeup)
+     except Exception as exc:
+@@ -687,10 +742,19 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
+     if diagnostic_process_event(evt):
+         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
+     try:
+-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
++        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
++                                 "notification poller dispatch failed", **kwargs)
+     except Exception:
+         release_event_delivery(evt, claim)
+         return
++    if accepted is False and _notif_owner_refused(session):
++        # Another backend owns the chat: the event waits here for the backoff instead of being marked
++        # delivered while no turn ran (a subagent result used to be dropped this way). [daveey]
++        release_event_delivery(evt, claim)
++        from tools.process_registry import process_registry
++        if not _notif_hold_for(session, evt, process_registry.completion_queue):
++            process_registry.completion_queue.put(evt)
++        return
+     complete_event_delivery(evt, claim)
+ 
+ 
+diff --git a/tui_gateway/user_messages.py b/tui_gateway/user_messages.py
+index 09a7fb3482..9ccd7160ff 100644
+--- a/tui_gateway/user_messages.py
++++ b/tui_gateway/user_messages.py
+@@ -36,6 +36,12 @@ _TURN_ERROR_CODE_COPY: dict[str, tuple[str, str]] = {
+     # [daveey] Not a provider verdict: the turn's session lease was lost (another owner claimed it).
+     "session_turn_lease_lost": ("Hermes stopped this turn because it lost ownership of the session",
+                                 "Send /retry to run it again."),
++    # [daveey] Admission refusals: another live process (often another device's Desktop) holds the chat.
++    # They fell through to the gateway layer's "internal error" copy, which reads like a crash.
++    "SESSION_NOT_OWNED": ("This chat is open in another Hermes window or device",
++                          "Use it there, or start a new chat with /new."),
++    "SESSION_COORDINATION_UNAVAILABLE": ("Hermes could not check whether this chat is open somewhere else",
++                                         "Send /retry; type /logs for the trace."),
+ }
+ 
+ _TURN_ERROR_LAYER_COPY: dict[str, tuple[str, str]] = {
+-- 
+2.55.0
+

@@ -1,0 +1,87 @@
+From 2e952ee5103f9687e0af38bd8a00f6ae08cf5e3f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 04:11:08 +0000
+Subject: [PATCH] fix(tests): synchronize notification held handoff under load
+ [daveey]
+
+---
+ .../test_notification_held_handoff.py         | 37 +++++++++++++------
+ 1 file changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/tests/tui_gateway/test_notification_held_handoff.py b/tests/tui_gateway/test_notification_held_handoff.py
+index 23bd8b0bf4..fd378b9bcb 100644
+--- a/tests/tui_gateway/test_notification_held_handoff.py
++++ b/tests/tui_gateway/test_notification_held_handoff.py
+@@ -15,6 +15,7 @@ from types import SimpleNamespace
+ 
+ import pytest
+ 
++from tests.waiting import wait_until
+ from tui_gateway import server
+ 
+ 
+@@ -160,36 +161,50 @@ def test_shutdown_drain_returns_held_events_to_the_shared_queue(env):
+     assert server._notif_hold_for(owner, _completion("key-a"), env.queue) is False
+ 
+ 
+-def test_busy_owner_among_many_pollers_does_not_bounce_its_event(env):
++def test_busy_owner_among_many_pollers_does_not_bounce_its_event(env, monkeypatch):
+     """The live failure: one busy owner, many idle pollers. Each foreign dequeue used to resolve lineage and
+     re-queue, so lookups grew with pollers x time; now the event is handed over once and waits."""
+     owner = _sess("key-owner", running=True)
+     others = {f"sid_{i}": _sess(f"key-{i}") for i in range(6)}
+-    _add(sid_owner=owner, **others)
++    sessions = {"sid_owner": owner, **others}
++    _add(**sessions)
++    ready = {sid: threading.Event() for sid in sessions}
++    queue_get = env.queue.get
++
++    def get_when_ready(*args, **kwargs):
++        # First dequeue happens after held-list initialization, unlike merely starting a thread.
++        ready[threading.current_thread().name].set()
++        return queue_get(*args, **kwargs)
++
++    monkeypatch.setattr(env.queue, "get", get_when_ready)
+     stops, threads = [], []
+-    for sid, s in [("sid_owner", owner), *others.items()]:
++    for sid, s in sessions.items():
+         stop = threading.Event()
+-        t = threading.Thread(target=server._notification_poller_loop, args=(stop, sid, s), daemon=True)
++        t = threading.Thread(target=server._notification_poller_loop, args=(stop, sid, s), daemon=True, name=sid)
+         stops.append(stop)
+         threads.append(t)
+         t.start()
+     try:
+-        time.sleep(0.3)  # every poller has created its held list
++        for sid, event in ready.items():
++            assert event.wait(timeout=30), f"poller {sid} never reached its first dequeue"
+         env.queue.put(_completion("key-owner", "proc_load"))
+-        time.sleep(1.5)
+ 
++        def held_by_owner():
++            with server._notif_held_lock:
++                return [e["session_id"] for e in owner["_notif_held"]] == ["proc_load"]
++
++        # Elapsed wall time doesn't imply a poller ran on a throttled CI worker.
++        wait_until(held_by_owner, timeout=30, what="busy owner holding proc_load")
+         assert len(env.resolves) <= 3, f"event bounced: {len(env.resolves)} lineage lookups"
+         assert env.queue.empty()
+-        assert [e["session_id"] for e in owner["_notif_held"]] == ["proc_load"]
+         assert env.delivered == []
+ 
+         owner["running"] = False  # the turn ends: the owner's own poller delivers it
+-        deadline = time.monotonic() + 3
+-        while not env.delivered and time.monotonic() < deadline:
+-            time.sleep(0.05)
++        wait_until(lambda: env.delivered, timeout=30, what="owner delivering its held completion")
+         assert [sid for sid, _ in env.delivered] == ["sid_owner"]
+     finally:
+         for stop in stops:
+             stop.set()
+         for t in threads:
+-            t.join(timeout=5)
++            t.join(timeout=30)
++        assert not any(t.is_alive() for t in threads), "notification poller leaked into the next test"
+-- 
+2.55.0
+

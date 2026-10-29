@@ -1,0 +1,185 @@
+From 5c1a2bd67e9e2741fb193d3ca6d1a8b80bde976c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 17:00:44 -0700
+Subject: [PATCH 534/534] fix(kanban-sync): store core's seconds columns in seconds
+ whatever the feed sends [daveey]
+
+The Board's lease grants wrote task_runs.started_at and the claimed event's
+created_at from its ms clock (fixed in daveey/hermes-hub#30). The apply path
+copied them verbatim into every gateway's board, and since child rows push
+whole, the damaged local row went back to the Board too. Readers computing
+now - started_at in seconds broke (coach_fixer.utc_day: 'year 58792').
+
+- _local_fields normalizes SECONDS_COLUMNS (ms -> s) on every applied change
+- install_or_remove repairs rows already in ms once per file
+  (kanban_sync_state.seconds_repaired), uncaptured: the Board repairs its own
+---
+ hermes_cli/kanban_db_sync.py               | 54 ++++++++++++++++++-
+ tests/hermes_cli/test_kanban_sync_apply.py | 61 ++++++++++++++++++++++
+ 2 files changed, 114 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 10a234dee0..b510b828bf 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -97,6 +97,49 @@ REF_COLUMNS: dict[tuple[str, str], str] = {
+     ("task_events", "run_id"): "run_uid",
+ }
+ SYNCED_TABLES = tuple(SYNCED_COLUMNS)
++# Synced columns core keeps in Unix SECONDS (``int(time.time())``). The service's own clocks (leases, HLCs, the feed,
++# tombstones) are milliseconds; a millisecond value in one of these columns makes every ``now - started_at`` reader
++# wrong by 1000x (2026-10-27: the Board's lease grants wrote ``task_runs.started_at`` in ms and
++# ``coach_fixer.utc_day`` crashed on "year 58792"). The apply path normalizes them, whatever a peer sends.
++SECONDS_COLUMNS: dict[str, frozenset[str]] = {
++    "tasks": frozenset({"created_at", "started_at", "completed_at"}),
++    "task_runs": frozenset({"started_at", "ended_at"}),
++    "task_comments": frozenset({"created_at"}),
++    "task_events": frozenset({"created_at"}),
++    "task_attachments": frozenset({"created_at"}),
++    "task_chat_links": frozenset({"created_at"}),
++}
++# Above this a timestamp is milliseconds: 1e11 s is the year 5138, 1e11 ms is 1973.
++MS_THRESHOLD = 100_000_000_000
++
++
++def to_seconds(value: Any) -> Any:
++    """A seconds-column value from the wire: a millisecond number becomes seconds, anything else is unchanged."""
++    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > MS_THRESHOLD:
++        return int(value // 1000)
++    return value
++
++
++def repair_ms_timestamps(conn: sqlite3.Connection) -> int:
++    """Rewrite millisecond values in ``SECONDS_COLUMNS`` to seconds; returns the number of cells fixed.
++
++    Runs with ``applying`` set, so nothing is captured: the service repairs its own copy, and any later write of a
++    row sends the repaired value. The caller holds the write transaction."""
++    fixed = 0
++    present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
++    conn.execute("UPDATE kanban_sync_state SET applying = 1")
++    try:
++        for table, columns in SECONDS_COLUMNS.items():
++            if table not in present:
++                continue
++            have = set(table_columns(conn, table))
++            for column in sorted(columns & have):
++                fixed += conn.execute(
++                    f"UPDATE {table} SET {column} = CAST({column} / 1000 AS INTEGER) WHERE {column} > ?",
++                    (MS_THRESHOLD,)).rowcount
++    finally:
++        conn.execute("UPDATE kanban_sync_state SET applying = 0")
++    return fixed
+ _UID_TABLES = ("task_comments", "task_events", "task_runs", "task_attachments", "task_chat_links")
+ # Append-only rows leave only with their task; a delete trigger there would echo
+ # every cascade row of a task delete the service already cascades itself.
+@@ -163,6 +206,8 @@ _SYNC_COLUMN_DDL = (
+     ("tasks", "lease_version", "lease_version INTEGER"),
+     ("tasks", "created_on", "created_on TEXT"),
+     ("kanban_sync_outbox", "retry_after", "retry_after INTEGER"),
++    # 1 once repair_ms_timestamps ran on this file (the one-time repair of rows applied before the guard).
++    ("kanban_sync_state", "seconds_repaired", "seconds_repaired INTEGER NOT NULL DEFAULT 0"),
+ )
+ 
+ # Resolved db paths whose triggers this process installed. Empty = no synced
+@@ -282,6 +327,11 @@ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+                 _queue_rows(conn, table, missed)
+                 _log.warning("kanban sync: %d %s row(s) were written without capture; queued for upload", len(missed), table)
+         install_triggers(conn)
++        if not conn.execute("SELECT seconds_repaired FROM kanban_sync_state").fetchone()[0]:
++            fixed = repair_ms_timestamps(conn)
++            conn.execute("UPDATE kanban_sync_state SET seconds_repaired = 1")
++            if fixed:
++                _log.warning("kanban sync: %d millisecond timestamp(s) rewritten to seconds", fixed)
+     _SYNCED_PATHS.add(db_path)
+ 
+ 
+@@ -801,7 +851,7 @@ def _local_run_id(conn: sqlite3.Connection, uid: Optional[str], task_id: Any) ->
+ 
+ 
+ def _local_fields(conn: sqlite3.Connection, table: str, fields: Mapping[str, Any], task_id: Any) -> dict[str, Any]:
+-    """Wire fields -> local columns: drop local-only/key/unknown columns, uids -> local ids."""
++    """Wire fields -> local columns: drop local-only/key/unknown columns, uids -> local ids, ms -> seconds."""
+     present = set(table_columns(conn, table))
+     allowed = set(captured_columns(conn, table)) | (SERVER_COLUMNS.get(table, frozenset()) & present)
+     out: dict[str, Any] = {}
+@@ -810,6 +860,8 @@ def _local_fields(conn: sqlite3.Connection, table: str, fields: Mapping[str, Any
+         if wire not in fields:
+             continue
+         value = _from_wire(fields[wire])
++        if column in SECONDS_COLUMNS.get(table, ()):
++            value = to_seconds(value)
+         out[column] = _local_run_id(conn, value, task_id) if (table, column) in REF_COLUMNS else value
+     return out
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_apply.py b/tests/hermes_cli/test_kanban_sync_apply.py
+index c727f3eec8..1c8171423c 100644
+--- a/tests/hermes_cli/test_kanban_sync_apply.py
++++ b/tests/hermes_cli/test_kanban_sync_apply.py
+@@ -174,3 +174,64 @@ def test_apply_refuses_an_unsynced_board(kanban_home):
+     with kbc.connect_closing(kanban_home / "plain.db") as conn:
+         with pytest.raises(RuntimeError):
+             sync.apply_remote_changes(conn, [], new_cursor=1)
++
++
++# --- seconds columns (2026-10-27: the Board wrote task_runs.started_at in ms; readers crashed on "year 58792") ---
++
++def test_millisecond_timestamps_from_the_wire_are_stored_in_seconds(synced_conn):
++    """A run claimed through a Board lease: the server's copy of the run row carries ms. A whole-row push of the
++    damaged local row would then send ms back, so the apply path must normalize every seconds column."""
++    conn = synced_conn
++    tid = kb.create_task(conn, title="claimed via lease", assignee="worker")
++    kb.claim_task(conn, tid)
++    run_uid = conn.execute("SELECT r.uid FROM tasks t JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
++                           (tid,)).fetchone()[0]
++    started_s = conn.execute("SELECT started_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0]
++    ms = started_s * 1000 + 955
++    page = [
++        _ch(1, "task_runs", run_uid, {"task_id": tid, "status": "running", "profile": "worker", "started_at": ms,
++                                      "ended_at": None}),
++        _ch(2, "task_events", "ev-ms", {"task_id": tid, "run_uid": run_uid, "kind": "claimed",
++                                        "payload": '{"holder": "macbook"}', "created_at": ms}),
++        _ch(3, "task_comments", "c-ms", {"task_id": tid, "author": "a", "body": "b", "created_at": ms}),
++        _ch(4, "tasks", "t_remote_ms000001", _task_fields(created_at=ms, started_at=ms, completed_at=ms)),
++    ]
++    sync.apply_remote_changes(conn, page, new_cursor=4)
++    assert conn.execute("SELECT started_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0] == started_s
++    assert conn.execute("SELECT created_at FROM task_events WHERE uid = 'ev-ms'").fetchone()[0] == started_s
++    assert conn.execute("SELECT created_at FROM task_comments WHERE uid = 'c-ms'").fetchone()[0] == started_s
++    assert tuple(conn.execute("SELECT created_at, started_at, completed_at FROM tasks WHERE id = 't_remote_ms000001'")
++                 .fetchone()) == (started_s, started_s, started_s)
++    # Seconds and nulls pass through untouched.
++    sync.apply_remote_changes(conn, [_ch(5, "task_runs", run_uid, {"task_id": tid, "ended_at": started_s + 7})],
++                              new_cursor=5)
++    assert conn.execute("SELECT ended_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0] == started_s + 7
++    assert sync.to_seconds(None) is None and sync.to_seconds(True) is True and sync.to_seconds("x") == "x"
++
++
++def test_rows_already_in_milliseconds_are_repaired_once_on_open(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    path = kanban_home / "kanban.db"
++    conn = kbc.connect(path)
++    try:
++        tid = kb.create_task(conn, title="damaged", assignee="worker")
++        kb.claim_task(conn, tid)
++        run_id, started_s = conn.execute("SELECT id, started_at FROM task_runs WHERE task_id = ?", (tid,)).fetchone()
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (started_s * 1000 + 1, run_id))
++        conn.execute("UPDATE task_events SET created_at = created_at * 1000 WHERE task_id = ?", (tid,))
++        conn.execute("UPDATE kanban_sync_state SET applying = 0, seconds_repaired = 0")
++        conn.commit()
++        outbox_before = _outbox_count(conn)
++    finally:
++        conn.close()
++    sync._SYNCED_PATHS.clear()
++    kbc._INITIALIZED_PATHS.clear()
++    conn = kbc.connect(path)
++    try:
++        assert conn.execute("SELECT started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0] == started_s
++        assert conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] < sync.MS_THRESHOLD
++        assert conn.execute("SELECT seconds_repaired FROM kanban_sync_state").fetchone()[0] == 1
++        assert _outbox_count(conn) == outbox_before  # the repair is not captured: the service repairs its own copy
++    finally:
++        conn.close()
+-- 
+2.55.0
+

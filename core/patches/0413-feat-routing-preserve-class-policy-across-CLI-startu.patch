@@ -1,0 +1,489 @@
+From e123da695e92904e05f84309a37ddbe550ee2943 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 06:28:16 +0000
+Subject: [PATCH 407/453] feat(routing): preserve class policy across CLI
+ startup and resume [daveey]
+
+(cherry picked from commit e123da695e92904e05f84309a37ddbe550ee2943)
+---
+ agent/agent_init.py                        |   4 +-
+ agent/agent_runtime_helpers.py             |   3 +-
+ agent/model_routing_agent.py               |  25 ++++
+ docs/model-routing.md                      |  16 ++-
+ hermes_cli/cli_agent_setup_mixin.py        |  41 ++++--
+ hermes_cli/cli_init_mixin.py               |   3 +-
+ hermes_cli/cli_model_routing.py            |  89 +++++++++++++
+ hermes_cli/cli_model_switch_mixin.py       |   5 +-
+ tests/hermes_cli/test_cli_class_routing.py | 142 +++++++++++++++++++++
+ 9 files changed, 305 insertions(+), 23 deletions(-)
+ create mode 100644 hermes_cli/cli_model_routing.py
+ create mode 100644 tests/hermes_cli/test_cli_class_routing.py
+
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index db260f92f9..d8b89e4efc 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1182,8 +1182,8 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
+ 
+     agent._session_db = session_db  # optional SQLite store (CLI/gateway-provided)
+     agent._parent_session_id = parent_session_id
+-    agent._session_init_model_config = {
+-        "max_iterations": agent.max_iterations,
++    from agent.model_routing_agent import routing_model_config
++    agent._session_init_model_config = {**routing_model_config(agent), "max_iterations": agent.max_iterations,
+         "reasoning_config": reasoning_config,
+         "max_tokens": max_tokens,
+     }
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 72a774c75a..45cddaad94 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2450,7 +2450,8 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
+     agent._provider_fallback_route = None
+     agent._fallback_index = 0
+     agent._credential_pool_revert_id = None
+-    agent.model_routing = None  # Explicit user switches leave the automatic class lane.
++    from agent.model_routing_agent import clear_class_route
++    clear_class_route(agent)
+     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
+     if old_norm and new_norm and old_norm != new_norm:
+         fallback_chain = [
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 303c5f54fa..335d1f9648 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -90,9 +90,34 @@ def try_class_fallback(agent):
+     _reset_stale_streak(agent)
+     agent._fallback_activated = False
+     _snapshot_primary_runtime(agent)
++    persist_class_metadata(agent)
+     return True
+ 
+ 
++def persist_class_metadata(agent):
++    """Keep the ordinary session row in sync with the durable allocation store."""
++    metadata = getattr(agent, "model_routing", None)
++    config = getattr(agent, "_session_init_model_config", None)
++    if isinstance(config, dict):
++        config["model_routing"] = metadata
++    db = getattr(agent, "_session_db", None)
++    if db and getattr(agent, "_session_db_created", False):
++        db.update_session_model(agent.session_id, agent.model)
++        db.patch_session_model_config(agent.session_id, {"model_routing": metadata})
++
++
++def clear_class_route(agent):
++    if not getattr(agent, "model_routing", None):
++        return
++    agent.model_routing = None
++    persist_class_metadata(agent)
++
++
++def routing_model_config(agent):
++    metadata = getattr(agent, "model_routing", None)
++    return {"model_routing": metadata} if metadata else {}
++
++
+ def publish_session_id(session_id):
+     """Publish context-local identity without leaking delegated IDs process-wide."""
+     import os
+diff --git a/docs/model-routing.md b/docs/model-routing.md
+index cfddefc674..9eb41bed57 100644
+--- a/docs/model-routing.md
++++ b/docs/model-routing.md
+@@ -79,6 +79,16 @@ credentials are stored. Per-provider account selection remains inside native poo
+ 
+ ## Implementation status
+ 
+-Core allocator, config structure validation and runtime credential boundary are
+-implemented. Entry-path adapters, per-entry tests and outgoing-request failure
+-recovery remain required before activation. This document is not rollout proof.
++Core allocator, config validation, runtime credential boundary, and common agent
++construction/recovery are implemented. CLI startup, readiness/lazy credentials,
++agent creation and session restore now preserve selectors and subscription fences.
++The CLI shell retains the selector while the agent sends only the concrete model;
++session `model_config.model_routing` records the selection for restoration. Explicit
++switches clear that metadata, including when selecting the same concrete model.
++CLI integration tests exercise the native Anthropic SDK streaming request through
++an isolated mock HTTP transport, inspect endpoint/model/OAuth headers, and restore
++from a real temporary session DB. This is not a live entitlement probe.
++
++Desktop, messaging, API, delegation, cron, Kanban and auxiliary adapters and their
++per-entry request/recovery tests remain required before activation. This document
++is not rollout proof.
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index 6ab10e581a..ad0fb8ece9 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -226,12 +226,30 @@ def _retire_agent(cli) -> None:
+     cli.agent = None
+ 
+ 
++def _set_missing_model(cli, provider):
++    if cli.model or not provider:
++        return
++    from cli import logger
++    try:
++        from hermes_cli.models import get_default_model_for_provider
++        model = get_default_model_for_provider(provider)
++        if model:
++            cli.model = model
++            logger.info("No model configured — defaulting to %s for provider %s", model, provider)
++    except Exception:
++        import logging
++        logging.exception("Provider default lookup failed")
++
++
+ class CLIAgentSetupMixin:
+     """Agent construction + session-resume display methods for ``HermesCLI``."""
+ 
+     def _ensure_runtime_credentials(self) -> bool:
+         """Re-resolve provider credentials before agent use so key rotation / token
+         refresh are picked up without restarting the CLI. False on auth failure."""
++        from hermes_cli.cli_model_routing import ensure_class_credentials, is_class_selector
++        if is_class_selector(self.model):
++            return ensure_class_credentials(self)
+         from cli import ChatConsole, logger
+         from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+         _primary_exc = None
+@@ -315,17 +333,7 @@ class CLIAgentSetupMixin:
+ 
+         # Still empty (e.g. `hermes auth add` without `hermes model`): fall back to the
+         # provider's first catalog model so the API doesn't reject an empty model.
+-        if not self.model and resolved_provider:
+-            try:
+-                from hermes_cli.models import get_default_model_for_provider
+-                _default = get_default_model_for_provider(resolved_provider)
+-                if _default:
+-                    self.model = _default
+-                    logger.info(
+-                        "No model configured — defaulting to %s for provider %s",
+-                        _default, resolved_provider)
+-            except Exception:
+-                pass
++        _set_missing_model(self, resolved_provider)
+ 
+         # [daveey] `--provider gemini` without `-m` must not send the config's claude-* model to Gemini
+         # (404 on every call): a model that clearly belongs to another vendor falls back to the
+@@ -360,7 +368,7 @@ class CLIAgentSetupMixin:
+             logger.info("Model moved to %s: reasoning_config resolved: %s", self.model, self.reasoning_config)
+ 
+         # AIAgent/OpenAI client holds auth at init, so rebuild on key/routing/model change.
+-        if (credentials_changed or routing_changed or model_changed) and self.agent is not None:
++        if any((credentials_changed, routing_changed, model_changed)) and self.agent is not None:
+             _retire_agent(self)
+             self._active_agent_route_signature = None
+         return True
+@@ -435,6 +443,9 @@ class CLIAgentSetupMixin:
+         """``(ready, error)``: *error* is the exception that stopped resolution — raised, or
+         swallowed by the "auto" ladder and stamped on a keyless fallback — ``None`` when a provider
+         resolved (usable or merely keyless). Never prints or mutates CLI state."""
++        from hermes_cli.cli_model_routing import is_class_selector, probe_class_credentials
++        if is_class_selector(getattr(self, "model", None)):
++            return probe_class_credentials(self)
+         from hermes_cli.runtime_provider import resolve_runtime_provider
+         try:
+             runtime = resolve_runtime_provider(
+@@ -670,7 +681,9 @@ class CLIAgentSetupMixin:
+             return False
+         try:
+             runtime = runtime_override or _current_runtime(self)
+-            effective_model = model_override or self.model
++            route_signature = _route_signature(model_override or self.model, runtime)
++            from hermes_cli.cli_model_routing import agent_route
++            effective_model, runtime = agent_route(model_override or self.model, runtime)
+             # -q never builds the prompt_toolkit app, so the clarify modal can't be
+             # answered — answer headless instead of polling until clarify_timeout.
+             single_query_mode = getattr(self, "_single_query_mode", False)
+@@ -741,7 +754,7 @@ class CLIAgentSetupMixin:
+                 seed_credits_at_session_start(self.agent)
+             except Exception:
+                 pass
+-            self._active_agent_route_signature = _route_signature(effective_model, runtime)
++            self._active_agent_route_signature = route_signature
+ 
+             # Force-create DB row on /title intent, then apply title.
+             if self._pending_title and self._session_db:
+diff --git a/hermes_cli/cli_init_mixin.py b/hermes_cli/cli_init_mixin.py
+index 86e03844a9..7545621aad 100644
+--- a/hermes_cli/cli_init_mixin.py
++++ b/hermes_cli/cli_init_mixin.py
+@@ -119,7 +119,8 @@ class CLIInitMixin:
+         self.model = model or _config_model or ""
+         _cfg_provider = _model_config.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER")
+         _startup_provider_override = _startup_base_url_override = _startup_api_key_override = ""
+-        if self.model:
++        from agent.model_routing import is_class_selector
++        if self.model and not is_class_selector(self.model):
+             from hermes_cli.model_switch import resolve_startup_model_route
+ 
+             _startup_route = resolve_startup_model_route(
+diff --git a/hermes_cli/cli_model_routing.py b/hermes_cli/cli_model_routing.py
+new file mode 100644
+index 0000000000..05a15122f6
+--- /dev/null
++++ b/hermes_cli/cli_model_routing.py
+@@ -0,0 +1,89 @@
++"""Class policy adapter for CLI startup, lazy credentials, and session restore.
++
++Keep the selector on the shell, concrete route on the agent. Reconstructing an
++agent from a bare concrete model would lose the subscription-only failure fence.
++"""
++import json
++import logging
++import sys
++
++from agent.model_routing import is_class_selector
++
++
++def resolve_cli_class(cli):
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    from hermes_cli.config_effective import load_user_config_effective
++
++    config = load_user_config_effective()
++    requirements = {"tools": True, "streaming": True}
++    context = (config.get("model") or {}).get("context_length")
++    if context:
++        requirements["min_context_tokens"] = context
++    return resolve_runtime_provider(
++        requested=cli.requested_provider, target_model=cli.model,
++        explicit_api_key=cli._explicit_api_key, explicit_base_url=cli._explicit_base_url,
++        routing_session_id=cli.session_id, routing_requirements=requirements,
++        routing_config=config)
++
++
++def probe_class_credentials(cli):
++    try:
++        resolve_cli_class(cli)
++        return True, None
++    except Exception as exc:
++        logging.getLogger(__name__).debug("Class readiness probe failed", exc_info=True)
++        return False, exc
++
++
++def ensure_class_credentials(cli):
++    from hermes_cli.runtime_provider import format_runtime_provider_error
++    cli._credentials_rate_limited = False
++    cli._credentials_terminal = False
++    try:
++        runtime = resolve_cli_class(cli)
++    except Exception as exc:
++        # No legacy fallback, even for unexpected auth/transport failures.
++        logging.getLogger(__name__).debug("Class credential resolution failed", exc_info=True)
++        print(format_runtime_provider_error(exc), file=sys.stderr)
++        return False
++    cli.api_key, cli.base_url = runtime["api_key"], runtime["base_url"]
++    cli.provider, cli.api_mode = runtime["provider"], runtime["api_mode"]
++    cli._credential_pool = runtime["credential_pool"]
++    cli._provider_source = runtime.get("source")
++    cli.acp_command, cli.acp_args = None, []
++    cli.model_routing = runtime["model_routing"]
++    return True
++
++
++def agent_route(model, runtime):
++    if not is_class_selector(model):
++        return model, runtime
++    # Credentials resolved above are for display/readiness only. The common
++    # constructor reuses the same durable allocation and creates a fenced pool.
++    return model, {"provider": "auto", "requested_provider": "auto"}
++
++
++def skip_or_restore_class(cli, session_meta):
++    return (not (session_meta or {}).get("model")
++            or getattr(cli, "_explicit_model_override", False)
++            or restore_class_route(cli, session_meta))
++
++
++def restore_class_route(cli, session_meta):
++    if getattr(cli, "_explicit_model_override", False):
++        return False
++    config = session_meta.get("model_config") or {}
++    if isinstance(config, str):
++        try:
++            config = json.loads(config)
++        except (ValueError, TypeError):
++            return False
++    metadata = config.get("model_routing") if isinstance(config, dict) else None
++    if not isinstance(metadata, dict) or metadata.get("selected_model") != session_meta.get("model"):
++        return False
++    selector = "class:" + str(metadata.get("requested_class", ""))
++    if not is_class_selector(selector):
++        return False
++    cli.model, cli.requested_provider = selector, "auto"
++    cli._explicit_api_key = cli._explicit_base_url = None
++    return True
+diff --git a/hermes_cli/cli_model_switch_mixin.py b/hermes_cli/cli_model_switch_mixin.py
+index cc74086f10..98c2eff2b9 100644
+--- a/hermes_cli/cli_model_switch_mixin.py
++++ b/hermes_cli/cli_model_switch_mixin.py
+@@ -441,7 +441,7 @@ class CLIModelSwitchMixin:
+             "api_mode": result.api_mode or None}
+         try:
+             db.update_session_model(sid, result.new_model)
+-            db.patch_session_model_config(sid, {"gateway_runtime": route, **route})
++            db.patch_session_model_config(sid, {"gateway_runtime": route, **route, "model_routing": None})
+         except Exception:
+             logger.debug("Failed to persist model switch to session DB", exc_info=True)
+ 
+@@ -454,7 +454,8 @@ class CLIModelSwitchMixin:
+         so the session still opens (the first turn surfaces the auth error).
+         """
+         from cli import logger
+-        if not (session_meta or {}).get("model") or getattr(self, "_explicit_model_override", False):
++        from hermes_cli.cli_model_routing import skip_or_restore_class
++        if skip_or_restore_class(self, session_meta):
+             return
+         route = stored_session_route(session_meta, current_model=self.model, current_provider=self.provider)
+         if route is None:
+diff --git a/tests/hermes_cli/test_cli_class_routing.py b/tests/hermes_cli/test_cli_class_routing.py
+new file mode 100644
+index 0000000000..d6b6eafae1
+--- /dev/null
++++ b/tests/hermes_cli/test_cli_class_routing.py
+@@ -0,0 +1,142 @@
++"""CLI lazy credentials must preserve class policy through agent construction."""
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import cli  # load bootstrap before the real-home guard
++from run_agent import AIAgent
++from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
++from tests.agent import test_model_routing_agent
++
++routing_home = test_model_routing_agent.routing_home
++streaming_route = test_model_routing_agent.streaming_route
++
++
++def shell():
++    return SimpleNamespace(
++        model="class:deep", requested_provider="auto", session_id="cli-session",
++        _explicit_api_key=None, _explicit_base_url=None, agent=None,
++        api_key=None, base_url=None, provider="auto", api_mode="chat_completions",
++        acp_command=None, acp_args=[], tool_progress_mode="off",
++        _resolve_fallback_runtime=MagicMock(), _session_db=MagicMock())
++
++
++def test_cli_class_credentials_and_agent_resume(routing_home, streaming_route):
++    from hermes_cli.cli_model_routing import agent_route
++    s = shell()
++    assert CLIAgentSetupMixin._ensure_runtime_credentials(s)
++    assert s.model == "class:deep"
++    assert s.provider == "anthropic"
++    assert s._credential_pool.current().auth_type == "oauth"
++    model, runtime = agent_route(s.model, {"provider": s.provider, "api_key": s.api_key,
++                                           "base_url": s.base_url})
++    with patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
++        first = AIAgent(model=model, session_id=s.session_id, quiet_mode=True,
++                        skip_context_files=True, skip_memory=True, **runtime)
++        s.agent = first
++        assert CLIAgentSetupMixin._ensure_runtime_credentials(s)
++        assert s.agent is first
++        resumed = AIAgent(model=model, session_id=s.session_id, quiet_mode=True,
++                          skip_context_files=True, skip_memory=True, **runtime)
++    assert first.model == resumed.model == "anthropic-deep"
++    assert first.model_routing == resumed.model_routing
++    s._resolve_fallback_runtime.assert_not_called()
++
++
++def test_cli_empty_class_never_uses_legacy_fallback(routing_home, streaming_route, monkeypatch):
++    monkeypatch.setattr("agent.credential_pool.CredentialPool.has_available", lambda *a, **k: False)
++    s = shell()
++    assert CLIAgentSetupMixin._probe_runtime_credentials(s)[0] is False
++    assert CLIAgentSetupMixin._ensure_runtime_credentials(s) is False
++    s._resolve_fallback_runtime.assert_not_called()
++
++
++def test_cli_real_construction_request_and_database_resume(routing_home, streaming_route, tmp_path):
++    import json
++    import anthropic
++    import httpx
++    from hermes_state import SessionDB
++
++    sent = []
++
++    def respond(request):
++        sent.append((str(request.url), dict(request.headers), json.loads(request.content)))
++        message = {
++            "id": "test-message", "type": "message", "role": "assistant",
++            "model": "anthropic-deep", "content": [],
++            "stop_reason": None, "usage": {"input_tokens": 10, "output_tokens": 0}}
++        events = [
++            {"type": "message_start", "message": message},
++            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
++            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}},
++            {"type": "content_block_stop", "index": 0},
++            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
++            {"type": "message_stop"}]
++        body = "".join("event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n" for event in events)
++        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
++
++    sdk_class = anthropic.Anthropic
++
++    def sdk(**kwargs):
++        kwargs["http_client"] = httpx.Client(transport=httpx.MockTransport(respond))
++        return sdk_class(**kwargs)
++
++    db = SessionDB(tmp_path / "cli-test.db")
++    with patch("cli._prepare_deferred_agent_startup"), \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"), \
++         patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("anthropic.Anthropic", side_effect=sdk):
++        s = cli.HermesCLI(model="class:deep", provider="auto", compact=True)
++        s.session_id = "cli-real"
++        s._session_db = db
++        s._install_tool_callbacks = lambda: None
++        s.streaming_enabled = False
++        s.ignore_rules = True
++        assert s._init_agent()
++        assert s.agent.model_routing["requested_class"] == "deep"
++        signature = s._resolve_turn_agent_config("next")["signature"]
++        assert signature == s._active_agent_route_signature
++        result = s.agent.run_conversation("Say ok")
++        assert result["final_response"] == "ok"
++        stored = db.get_session(s.session_id)
++        restored = shell()
++        restored._explicit_model_override = False
++        from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
++        CLIModelSwitchMixin._restore_session_model(restored, stored, quiet=True)
++        assert restored.model == "class:deep"
++        assert restored.requested_provider == "auto"
++        s.agent.switch_model(s.agent.model, s.agent.provider, api_key=s.agent.api_key,
++                             base_url=s.agent.base_url, api_mode=s.agent.api_mode)
++        config = db.get_session(s.session_id)["model_config"]
++        config = json.loads(config) if isinstance(config, str) else config
++        assert not config.get("model_routing")
++        assert not s.agent._session_init_model_config.get("model_routing")
++        s.agent.release_clients()
++    db.close()
++    assert sent
++    assert all(body["model"] == "anthropic-deep" for _, _, body in sent)
++    assert all(url.startswith("https://api.anthropic.com/") for url, _, _ in sent)
++    assert all(headers.get("authorization", "").startswith("Bearer sk-ant-oat") for _, headers, _ in sent)
++    assert all("x-api-key" not in headers for _, headers, _ in sent)
++
++
++def test_cli_pin_is_not_rewritten():
++    from hermes_cli.cli_model_routing import agent_route
++    runtime = {"provider": "custom", "api_key": "test", "base_url": "http://localhost:8000"}
++    assert agent_route("unknown-exact-pin", runtime) == ("unknown-exact-pin", runtime)
++
++
++def test_cli_restore_class_metadata_and_explicit_override():
++    from hermes_cli.cli_model_routing import restore_class_route
++    s = shell()
++    s.model = "ambient-pin"
++    metadata = {"model": "anthropic-deep", "model_config": {
++        "model_routing": {"requested_class": "deep", "selected_model": "anthropic-deep"}}}
++    assert restore_class_route(s, metadata)
++    assert s.model == "class:deep"
++    assert s.requested_provider == "auto"
++    s._explicit_model_override = True
++    s.model = "explicit-pin"
++    assert not restore_class_route(s, metadata)
++    assert s.model == "explicit-pin"
+-- 
+2.54.0 (Apple Git-157)
+

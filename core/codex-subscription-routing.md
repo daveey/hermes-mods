@@ -44,7 +44,7 @@ re-route and guard the final token.
 
 ## Applying
 
-`git am -3 --empty=keep` in order 0236-0240. 0240 assumes the helpers 0236 first put inside `credential_pool.py`/`codex_models.py`.
+`git am -3 --empty=keep` in order 0236, 0237, 0238, 0239, 0240. 0240 assumes the helpers 0236 first put inside `credential_pool.py`/`codex_models.py`.
 
 ## Gotchas
 

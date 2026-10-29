@@ -1,12 +1,12 @@
 # Kanban board connections: OFD lock guard and no per-request init
 
-Patches: 0616, 0618 (daveey/hermes `f2d0e23785`, `070e9c30c8`).
+Patches: 0614, 0616 (daveey/hermes `f2d0e23785`, `070e9c30c8`).
 
 ## Behavior
 
-0616: the Kanban dashboard called `init_db` on every request, which dropped the board's `_INITIALIZED_PATHS` entry, so each `/api/plugins/kanban/*` poll re-ran `PRAGMA integrity_check` over the whole file (3-25 s on a 140 MB board), starving the Desktop backend REST API. Requests now rely on `connect()`, which initialises once per process.
+0614: the Kanban dashboard called `init_db` on every request, which dropped the board's `_INITIALIZED_PATHS` entry, so each `/api/plugins/kanban/*` poll re-ran `PRAGMA integrity_check` over the whole file (3-25 s on a 140 MB board), starving the Desktop backend REST API. Requests now rely on `connect()`, which initialises once per process.
 
-0618: Kanban processes were stranded on a deleted `kanban.db-wal`/`-shm` generation (every read failed with "disk I/O error" or reported false corruption until restart; self-heal kanban-759104eb56). POSIX advisory locks belong to the process, so any stray `open()/close()` of the db inside a process cancels SQLite's locks and a sibling then unlinks the WAL. Every board connection now takes the OFD-lock guard `state.db` has had since September, and a stranded cached reader reopens.
+0616: Kanban processes were stranded on a deleted `kanban.db-wal`/`-shm` generation (every read failed with "disk I/O error" or reported false corruption until restart; self-heal kanban-759104eb56). POSIX advisory locks belong to the process, so any stray `open()/close()` of the db inside a process cancels SQLite's locks and a sibling then unlinks the WAL. Every board connection now takes the OFD-lock guard `state.db` has had since September, and a stranded cached reader reopens.
 
 ## How it works
 
@@ -18,7 +18,7 @@ Patches: 0616, 0618 (daveey/hermes `f2d0e23785`, `070e9c30c8`).
 
 ## Tests
 
-- `tests/hermes_cli/test_kanban_lockguard.py` (9 of 10 fail on the old code, including open_ro, cached_ro and `kbc.connect`; a lint-style test keeps raw `sqlite3.connect` out of `kanban*.py`), `tests/hermes_state/test_wal_lock_guard_lifecycle.py`, `tests/hermes_cli/test_kanban_db.py` (adapted), `tests/plugins/test_kanban_conn_no_reinit.py` (0616).
+- `tests/hermes_cli/test_kanban_lockguard.py` (9 of 10 fail on the old code, including open_ro, cached_ro and `kbc.connect`; a lint-style test keeps raw `sqlite3.connect` out of `kanban*.py`), `tests/hermes_state/test_wal_lock_guard_lifecycle.py`, `tests/hermes_cli/test_kanban_db.py` (adapted), `tests/plugins/test_kanban_conn_no_reinit.py` (0614).
 
 ## Applying
 

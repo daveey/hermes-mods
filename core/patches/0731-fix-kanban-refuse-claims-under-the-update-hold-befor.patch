@@ -1,0 +1,132 @@
+From 452d8e128de9d6829fd096a70cae5adc37bcec77 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 04:44:41 -0700
+Subject: [PATCH] fix(kanban): refuse claims under the update hold before
+ taking a Board-service lease [daveey]
+
+During a core-update drain window the admission hold stands for minutes. claim_task/claim_review_task
+acquired the Board-service lease first, then claim_transaction refused and the lease was released, so the
+service recorded a claimed+released run per ready card per dispatcher tick (1129 junk runs across 17 cards
+in one 11-minute window on the MacBook, 2026-10-28). A lock-free early read of the hold now returns before
+the lease; claim_transaction still re-checks under admission.lock.
+---
+ hermes_cli/kanban_admission.py           | 17 ++++++++++++
+ hermes_cli/kanban_db.py                  |  7 ++++-
+ tests/hermes_cli/test_admission_fence.py | 34 ++++++++++++++++++++++++
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index d60aa5846f..6c4742fca8 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -1,6 +1,7 @@
+ """Kanban claim publication boundary for the POSIX updater fence."""
+ import contextlib
+ import logging
++from pathlib import Path
+ 
+ 
+ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, event_extra=None, gate=None):
+@@ -43,6 +44,22 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+     return run_id
+ 
+ 
++def admission_hold_set():
++    """[daveey] Lock-free early read of the updater hold, for callers to check BEFORE side effects that
++    precede ``claim_transaction`` (the Board-service lease). Advisory only: ``claim_transaction`` still
++    re-checks under admission.lock, so a hold set after this read is still honoured. An unreadable
++    fence reads as "not set" here and is decided by that authoritative check."""
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli.admission_fence import is_held, SUPPORTED
++
++    if not SUPPORTED:
++        return False
++    try:
++        return is_held(Path(get_default_hermes_root()) / "core-update")
++    except OSError:
++        return False
++
++
+ @contextlib.contextmanager
+ def claim_transaction(conn):
+     """Fence check and real SQL commit share admission.lock (never a savepoint).
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e91d1a32ab..1b1dd6b240 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -31,7 +31,7 @@ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+-from hermes_cli.kanban_admission import claim_transaction, claim_and_open_run
++from hermes_cli.kanban_admission import admission_hold_set, claim_transaction, claim_and_open_run
+ from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+ from toolsets import get_toolset_names
+ 
+@@ -2207,6 +2207,9 @@ def claim_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
++    # [daveey] Refuse a held fence before the Board-service lease, not after it.
++    if admission_hold_set():
++        return None
+     gate = _sync.claim_gate(conn, task_id, expires)
+     if gate.deferred:
+         return None
+@@ -2245,6 +2248,8 @@ def claim_review_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
++    if admission_hold_set():  # [daveey] before the Board-service lease (see claim_task)
++        return None
+     gate = _sync.claim_gate(conn, task_id, expires, lane="review")
+     if gate.deferred:
+         return None
+diff --git a/tests/hermes_cli/test_admission_fence.py b/tests/hermes_cli/test_admission_fence.py
+index b89e338b43..d7180d0269 100644
+--- a/tests/hermes_cli/test_admission_fence.py
++++ b/tests/hermes_cli/test_admission_fence.py
+@@ -150,6 +150,40 @@ def test_hold_blocks_kanban_claims_without_mutation(tmp_path, monkeypatch, revie
+         conn.close()
+ 
+ 
++@pytest.mark.parametrize("review", [False, True])
++def test_hold_skips_board_service_lease_before_claiming(tmp_path, monkeypatch, review):
++    """[daveey] A held fence must refuse BEFORE the Board-service lease: acquiring one and releasing it on
++    refusal records a claimed+released run on the service per ready card per tick (1129 junk runs over one
++    11-minute drain window on 2026-10-28)."""
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    conn = kbc.connect(tmp_path / "kanban.db")
++    gates = []
++    real_gate = kb._sync.claim_gate
++
++    def counting_gate(*args, **kwargs):
++        gates.append(args[1] if len(args) > 1 else kwargs.get("task_id"))
++        return real_gate(*args, **kwargs)
++
++    monkeypatch.setattr(kb._sync, "claim_gate", counting_gate)
++    try:
++        task = kb.create_task(conn, title="held", assignee="default")
++        status = "review" if review else "ready"
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task))
++        claim = kb.claim_review_task if review else kb.claim_task
++        af.set_hold(tmp_path)
++        for _ in range(3):
++            assert claim(conn, task) is None
++        assert gates == []
++        af.clear_hold(tmp_path)
++        assert claim(conn, task).status == "running"
++        assert gates == [task]
++    finally:
++        conn.close()
++
++
+ def test_claim_rejects_nested_transaction_before_waiting(tmp_path, monkeypatch):
+     from hermes_cli import kanban_db as kb
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+-- 
+2.55.0
+

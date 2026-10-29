@@ -17,14 +17,14 @@ named (or after 24h), and a comment or heartbeat landing after the park no longe
 See also [kanban-park-invariants.md](kanban-park-invariants.md) (0169): every `kanban_schedule` park now gets a wake
 (default 24h) and human asks cannot be scheduled.
 
-## Follow-ups: 0231 and 0373
+## Follow-ups: 0231 and 0378
 
 0231 fixes classify-in-place for an already-blocked, untyped card: a subsequent `kind=time`
 request takes the normal timed-park route, becomes `scheduled` with a wake and clears the human-block
 kind instead of remaining `blocked + time`. Genuine `needs_input`/`capability` classification remains
 human-visible. The shared `hermes_cli/kanban_db.py` / `kanban_timed_park.py` implementation is covered
 by source `tests/hermes_cli/test_kanban_timed_park.py`; this documentation pass did not run that suite.
-0373 only condenses the explanatory comment in `kanban_db.py`; it makes no runtime change and adds no test.
+0378 only condenses the explanatory comment in `kanban_db.py`; it makes no runtime change and adds no test.
 Apply both in series order. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); neither
 patch implies a live dispatcher deployment. This remains core routing, not a plugin notification fix.
 
@@ -83,7 +83,7 @@ patch implies a live dispatcher deployment. This remains core routing, not a plu
 ## Tests
 
 - 0231: source `tests/hermes_cli/test_kanban_timed_park.py` covers the already-blocked/untyped
-  classification route. Not run in this documentation pass. 0373 is comment-only and adds no test.
+  classification route. Not run in this documentation pass. 0378 is comment-only and adds no test.
 
 - `tests/agent/test_system_prompt.py`: `test_kanban_guidance_routes_timed_waits_to_schedule_not_block` (guidance
   names `kanban_schedule(` and `SCHEDULED_UNTIL=`; updated by 0155).

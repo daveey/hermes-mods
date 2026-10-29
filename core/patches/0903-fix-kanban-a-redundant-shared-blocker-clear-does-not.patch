@@ -1,0 +1,193 @@
+From fe4027a3bde1ef1a5ccc43527d86ba13919d5c37 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:42:02 -0700
+Subject: [PATCH] fix(kanban): a redundant shared-blocker clear does not
+ re-wake a card an earlier clear released [daveey]
+
+release_cleared_blockers measured "this card already saw the clear" against the NEWEST clear
+(cleared_at). A second card ending a run with clear_blocker=true, with no re-assertion in
+between, moved cleared_at forward and woke every card the first clear had already released.
+Now BlockerState.first_cleared_at records the earliest clear after the newest assertion, and
+_already_saw_clear compares against it. A later clear wakes a card again only after X was
+re-asserted. cleared_at/cleared_by/cleared_via (reporting) and is_open are unchanged.
+
+Observed 2026-10-28 (MacBook board): t_e7dc822c behind github-askevepodcast-suspended was woken
+at 15:41:14 PDT (cleared by t_01a1800921b1ff50 run 9464, correct) and again at 15:53:38 PDT
+(cleared by t_01a180e8c9732286 run 9472, spurious; it had re-parked at 15:47:28 without the id).
+
+Five whys:
+- Why 1: _already_saw_clear(t_e7dc822c) returned False: it compared against st.cleared_at, the
+  newest clear (15:53:28); the card's shared_blocker_cleared event (15:41:14) and latest run
+  start (15:41:37) were both older.
+- Why 2: cleared_at moved forward because a second card behind X ended a run with
+  clear_blocker=true; blocker_states calls _mark_cleared for every behind card's clearing run,
+  even when X is already cleared with no assertion since.
+- Why 3: t_e7dc822c stays in `behind` after its release: re-parks without the id are "pass"
+  runs (448e876df2 semantics), so it remains behind X indefinitely.
+- Root (happened): "already saw the clear" was measured against the newest clear, not the first
+  clear since the newest assertion, so a redundant clear counted as a new event.
+- Root (not caught): the 334d58b4c3 tests covered a single clearing card and per-tick re-wakes;
+  none had two cards clear the same blocker in sequence while a third sat behind it.
+- Recurrence: third defect in this module in a day (448e876df2, 334d58b4c3); agents cannot know
+  whether another card already cleared X, so a clear must be idempotent.
+
+Tests: test_redundant_clear_by_another_card_does_not_rewake (A, B, C behind X; A clears, C woken
+once; C re-parks; B clears; release returns [], no new event/comment) and
+test_clear_after_a_reassertion_still_wakes_after_a_redundant_clear (D re-asserts X, then clears;
+C woken again). Both fail on 2f26519116 and pass with the fix.
+---
+ hermes_cli/kanban_shared_blockers.py          | 23 +++--
+ .../test_kanban_blocker_park_wake.py          | 86 +++++++++++++++++++
+ 2 files changed, 102 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 906ab652bf..ea000d5d06 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -115,6 +115,9 @@ class BlockerState:
+     cleared_at: int = 0
+     cleared_by: Optional[tuple[str, Optional[int]]] = None   # (task_id, run_id or None) that cleared it
+     cleared_via: str = ""                           # "run" or "condition_met"
++    # Earliest clear after the newest assertion. A card woken for it has seen every later clear
++    # until X is re-asserted; ``cleared_at`` (the newest) is only for reporting. [daveey]
++    first_cleared_at: int = 0
+     reason: str = ""                                # summary of the newest asserting run
+     # task_id -> ended_at of the asserting run the card is still behind
+     behind: dict[str, int] = field(default_factory=dict)
+@@ -225,16 +228,20 @@ def _probe_parked_behind(conn: sqlite3.Connection, kb, task_id: str, met, blocke
+ 
+ 
+ def _already_saw_clear(conn: sqlite3.Connection, kb, task_id: str, st: BlockerState) -> bool:
+-    """True when ``task_id`` already acted after ``st``'s newest clear: it was woken for it (a
+-    :data:`CLEARED_EVENT` for this blocker at or after ``cleared_at``) or a run of it started
+-    after it. Such a card re-parked without the id on purpose (it checked and the wall still
+-    stood for it); waking it again every tick looped forever (2026-10-28, t_01a180e8c9732286:
+-    one wasted run per park). A LATER clear still wakes it. [daveey]"""
+-    if st.probe_starts.get(task_id, 0) > st.cleared_at:
++    """True when ``task_id`` already acted after ``st``'s FIRST clear since its newest assertion:
++    it was woken for it (a :data:`CLEARED_EVENT` for this blocker at or after ``first_cleared_at``)
++    or a run of it started after it. Such a card re-parked without the id on purpose (it checked
++    and the wall still stood for it); waking it again every tick looped forever (2026-10-28,
++    t_01a180e8c9732286: one wasted run per park). Measuring against the first clear, not the
++    newest, makes a clear idempotent: a second card clearing X again with no re-assertion in
++    between is no new information (2026-10-28 15:53, t_e7dc822c woken twice). A later clear wakes
++    the card again only after X was re-asserted. [daveey]"""
++    since = st.first_cleared_at or st.cleared_at
++    if st.probe_starts.get(task_id, 0) > since:
+         return True
+     for row in conn.execute(
+         "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND created_at >= ? "
+-        "ORDER BY id DESC LIMIT 20", (task_id, CLEARED_EVENT, st.cleared_at),
++        "ORDER BY id DESC LIMIT 20", (task_id, CLEARED_EVENT, since),
+     ):
+         if normalize_blocker_id(kb._json_dict(row["payload"]).get("blocker_id")) == st.blocker_id:
+             return True
+@@ -243,6 +250,8 @@ def _already_saw_clear(conn: sqlite3.Connection, kb, task_id: str, st: BlockerSt
+ 
+ def _mark_cleared(st: BlockerState, task_id: str, run_id: Optional[int], ended: int, *,
+                   via: str = "run") -> None:
++    if ended > st.asserted_at and (not st.first_cleared_at or ended < st.first_cleared_at):
++        st.first_cleared_at = ended
+     if ended >= st.cleared_at:
+         st.cleared_at = ended
+         st.cleared_by = (task_id, int(run_id) if run_id is not None else None)
+diff --git a/tests/hermes_cli/test_kanban_blocker_park_wake.py b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+index 6f2390b017..2ecfaddbbc 100644
+--- a/tests/hermes_cli/test_kanban_blocker_park_wake.py
++++ b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+@@ -363,6 +363,92 @@ def _age_all(conn, seconds: int) -> None:
+         conn.execute("UPDATE task_runs SET started_at = started_at - ?, "
+                      "ended_at = CASE WHEN ended_at IS NULL THEN NULL ELSE ended_at - ? END", (seconds, seconds))
+         conn.execute("UPDATE task_events SET created_at = created_at - ?", (seconds,))
++        conn.execute("UPDATE task_comments SET created_at = created_at - ?", (seconds,))
++
++
++# --- A redundant clear does not re-wake a card an earlier clear already released ----------
++# Repro of 2026-10-28 15:41-15:53 PDT: t_e7dc822c sat behind github-askevepodcast-suspended.
++# t_01a1800921b1ff50 cleared it (15:41, correct wake); t_e7dc822c re-parked without the id;
++# t_01a180e8c9732286 then also ended a run with clear_blocker=true (15:53, no re-assertion in
++# between), and t_e7dc822c was woken a second time for no new information.
++
++def _run_and_clear(monkeypatch, tid: str) -> None:
++    """``tid`` runs, sees the wall gone, and parks for another reason with clear_blocker=true."""
++    with kbc.connect_closing() as conn:
++        if kb.get_task(conn, tid).status != "ready":
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++            conn.commit()
++        _as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_schedule({"reason": "account is back; waiting on a deploy now",
++                                          "clock_only": True, "clear_blocker": True}))
++    assert "error" not in out, out
++    _as_parent(monkeypatch)
++
++
++def _repark_without_id(monkeypatch, tid: str) -> None:
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "ready"
++        _as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_continue({"checkpoint": "API still 404 for me; re-check later",
++                                          "resume_after_seconds": 3600, "wake_check": WAKE, "awaiting": AWAIT}))
++    assert "error" not in out, out
++    _as_parent(monkeypatch)
++
++
++def _dispatcher_comments(conn, tid: str) -> int:
++    return conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ? AND author = 'dispatcher'",
++                        (tid,)).fetchone()[0]
++
++
++def _two_clears_in_sequence(monkeypatch) -> tuple[str, str, str]:
++    """A, B, C behind X; A clears (C woken once); C re-parks without the id; B clears again."""
++    with kbc.connect_closing() as conn:
++        a = _worker_block_behind(monkeypatch, conn, "a")
++        b = _worker_block_behind(monkeypatch, conn, "b")
++        c = _worker_block_behind(monkeypatch, conn, "c")
++        _age_all(conn, 600)
++    _run_and_clear(monkeypatch, a)
++    with kbc.connect_closing() as conn:
++        st = ksb.blocker_states(conn)[BID]
++        assert not st.is_open and st.cleared_by[0] == a
++        released = ksb.release_cleared_blockers(conn)
++        assert c in released and b in released
++        assert len(_cleared_events(conn, c)) == 1 and _dispatcher_comments(conn, c) == 1
++    _repark_without_id(monkeypatch, c)
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, c).status == "scheduled"
++        _age_all(conn, 120)
++    _run_and_clear(monkeypatch, b)
++    with kbc.connect_closing() as conn:
++        assert ksb.blocker_states(conn)[BID].cleared_by[0] == b   # newest clear, kept for reporting
++    return a, b, c
++
++
++def test_redundant_clear_by_another_card_does_not_rewake(kanban_home, monkeypatch):
++    _a, _b, c = _two_clears_in_sequence(monkeypatch)
++    with kbc.connect_closing() as conn:
++        assert ksb.release_cleared_blockers(conn) == []
++        assert kb.get_task(conn, c).status == "scheduled"
++        assert len(_cleared_events(conn, c)) == 1
++        assert _dispatcher_comments(conn, c) == 1
++        res = kbd.dispatch_once(conn, spawn_fn=_spawn_noop)
++        assert c not in (res.shared_blocker_released or [])
++        assert len(_cleared_events(conn, c)) == 1
++
++
++def test_clear_after_a_reassertion_still_wakes_after_a_redundant_clear(kanban_home, monkeypatch):
++    _a, _b, c = _two_clears_in_sequence(monkeypatch)
++    with kbc.connect_closing() as conn:
++        assert ksb.release_cleared_blockers(conn) == []
++        _age_all(conn, 120)
++        d = _worker_block_behind(monkeypatch, conn, "d")      # X re-asserted ...
++        assert ksb.blocker_states(conn)[BID].is_open
++        _age_all(conn, 60)
++        _clear_via_wake_check(conn, d)                      # ... then cleared by a run's probe
++        st = ksb.blocker_states(conn)[BID]
++        assert not st.is_open and st.cleared_by[0] == d
++        assert c in ksb.release_cleared_blockers(conn)
++        assert len(_cleared_events(conn, c)) == 2
+ 
+ 
+ # --- A wake_check clears X only when the park that set it carried X -----------------------
+-- 
+2.55.0
+

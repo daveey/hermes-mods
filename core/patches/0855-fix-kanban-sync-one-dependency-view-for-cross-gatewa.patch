@@ -1,0 +1,582 @@
+From 4a16a716f79f8d0a2d234100aacf5f8c8a66d809 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:01:57 +0000
+Subject: [PATCH] fix(kanban sync): one dependency view for cross-gateway
+ parents [daveey]
+
+A primary board's live file dropped every link whose parent another gateway
+owns (own_partition required both ends to be ours), and kanban_db read a
+link to an absent parent as satisfied (JOIN tasks). So the owner's promoter
+kept marking a child ready that the Board refused to lease
+(parents_not_done): 60 promoted/claim_rejected events in 7 min on
+2026-10-28 (t_01a184ac93d31979 waiting on worker-1's t_01a184d5273673a3).
+
+- own_partition keeps a link whose child is ours.
+- The sync round mirrors each foreign parent's Board status from the
+  replica into the local-only kanban_sync_remote_parents table and wakes
+  the dispatcher when one moves.
+- kanban_db.parent_states is the one view recompute_ready, claim_task,
+  unsatisfied_parents and promote_task read; a parent on neither the board
+  nor the mirror is missing and gates. A todo child with a missing parent
+  gets a parent_missing event and is blocked after 10 min with
+  'parent <id> missing from this board' (parent_found closes the streak).
+- Push sends unacked parent/child task rows ahead of a link, and retries a
+  link the Board refuses 'not_found: unknown task(s)' instead of dropping it.
+- Worker nodes no longer copy a ready replica card with an open or missing
+  parent.
+- The fake Board refuses links to unknown cards, like rows.ts upsertLink.
+---
+ hermes_cli/kanban_db.py                       | 101 ++++++--
+ hermes_cli/kanban_db_sync.py                  |  44 ++++
+ hermes_cli/kanban_sync_client.py              |  32 ++-
+ hermes_cli/kanban_worker_node.py              |   7 +-
+ tests/hermes_cli/kanban_sync_fake_board.py    |   7 +
+ .../test_kanban_cross_gateway_parents.py      | 225 ++++++++++++++++++
+ 6 files changed, 380 insertions(+), 36 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_cross_gateway_parents.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e049b7820b..8f46e75e1b 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2172,6 +2172,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+         failure_limit = DEFAULT_FAILURE_LIMIT
+     from hermes_cli.kanban_block_routing import has_sticky_block
+     promoted = 0
++    remote = _sync.has_remote_parents(conn)
+     with write_txn(conn):
+         todo_rows = conn.execute(
+             "SELECT id, status, consecutive_failures, max_retries "
+@@ -2187,12 +2188,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+             if cur_status in ("blocked", "triage") and has_sticky_block(conn, task_id):
+                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
+                 continue
+-            parents = conn.execute(
+-                "SELECT t.status FROM tasks t "
+-                "JOIN task_links l ON l.parent_id = t.id "
+-                "WHERE l.child_id = ?", (task_id,),
+-            ).fetchall()
+-            if all(p["status"] in ("done", "archived") for p in parents):
++            states = parent_states(conn, task_id, remote=remote)
++            if cur_status == "todo" and _note_missing_parents(conn, task_id, states):
++                continue
++            if all(st in ("done", "archived") for _pid, st in states):
+                 resume_status = _resume_status_from_events(conn, task_id)
+                 if cur_status in ("blocked", "triage"):
+                     # At the breaker limit, no auto-recovery (else block ->
+@@ -2225,14 +2224,74 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+ 
+ # --- Claim / complete / block ---
+ 
++# A child whose parent row this board does not have (neither a local card nor, on a synced board, a card another
++# gateway owns) waits; after this long it is blocked "parent <id> missing from this board". [daveey]
++PARENT_MISSING_BLOCK_SECONDS = 600
++
++
++def parent_states(
++    conn: sqlite3.Connection, task_id: str, *, remote: Optional[bool] = None,
++) -> list[tuple[str, Optional[str]]]:
++    """``(parent_id, status)`` for every direct parent, in id order: the ONE dependency view that the promoter
++    (:func:`recompute_ready`), the claim (:func:`claim_task`) and the board views read.
++
++    The status is the local card's. On a synced board a parent another gateway owns is not a local card (a primary
++    board's live file holds only this gateway's cards), so its status comes from the mirror the sync round keeps
++    from the replica (``kanban_db_sync.REMOTE_PARENTS_TABLE``), the same rows the Board's own claim check reads.
++    ``None`` = the parent is on neither: missing, and it gates (never read as satisfied). [daveey]"""
++    if remote is None:
++        remote = _sync.has_remote_parents(conn)
++    if remote:
++        sql = ("SELECT l.parent_id AS id, COALESCE(p.status, r.status) AS status FROM task_links l "
++               "LEFT JOIN tasks p ON p.id = l.parent_id "
++               f"LEFT JOIN {_sync.REMOTE_PARENTS_TABLE} r ON r.parent_id = l.parent_id "
++               "WHERE l.child_id = ? ORDER BY l.parent_id")
++    else:
++        sql = ("SELECT l.parent_id AS id, p.status AS status FROM task_links l "
++               "LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ? ORDER BY l.parent_id")
++    return [(row["id"], row["status"]) for row in conn.execute(sql, (task_id,)).fetchall()]
++
++
++def _note_missing_parents(
++    conn: sqlite3.Connection, task_id: str, states: list[tuple[str, Optional[str]]],
++) -> bool:
++    """Inside :func:`recompute_ready`'s txn, for a ``todo`` child: record when a parent goes missing
++    (``parent_missing`` event, once per streak), clear the streak when it comes back (``parent_found``), and block
++    the child after :data:`PARENT_MISSING_BLOCK_SECONDS`. True when the child was blocked here."""
++    if not states:
++        return False
++    missing = [pid for pid, st in states if st is None]
++    last = conn.execute(
++        "SELECT kind, created_at FROM task_events WHERE task_id = ? AND kind IN ('parent_missing', 'parent_found') "
++        "ORDER BY id DESC LIMIT 1", (task_id,),
++    ).fetchone()
++    if not missing:
++        if last is not None and last["kind"] == "parent_missing":
++            _append_event(conn, task_id, "parent_found", None)
++        return False
++    if last is None or last["kind"] != "parent_missing":
++        _append_event(conn, task_id, "parent_missing", {"parents": missing})
++        return False
++    if int(time.time()) - int(last["created_at"] or 0) < PARENT_MISSING_BLOCK_SECONDS:
++        return False
++    reason = "; ".join(f"parent {pid} missing from this board" for pid in missing)
++    cur = conn.execute(
++        "UPDATE tasks SET status = 'blocked', block_kind = 'transient' WHERE id = ? AND status = 'todo'",
++        (task_id,),
++    )
++    if cur.rowcount != 1:
++        return False
++    _append_event(conn, task_id, "blocked", {
++        "reason": reason + f" (unlink it with `hermes kanban unlink <parent> {task_id}`, then unblock)",
++        "kind": "transient", "source": "parent_missing", "parents": missing,
++    })
++    return True
++
++
+ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+-    """Return whether every direct parent is terminal for dependency gating."""
+-    return conn.execute(
+-        "SELECT 1 FROM task_links l "
+-        "JOIN tasks p ON p.id = l.parent_id "
+-        "WHERE l.child_id = ? "
+-        "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
+-    ).fetchone() is None
++    """Return whether every direct parent is terminal for dependency gating (:func:`parent_states`: a parent
++    another gateway owns counts by its Board status, a missing parent gates)."""
++    return all(st in ("done", "archived") for _pid, st in parent_states(conn, task_id))
+ 
+ 
+ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+@@ -2240,13 +2299,8 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
+     still counts as open (``done`` / ``archived`` release the child), in id
+     order, so a refusal or a board view can name the blockers instead of the
+     caller guessing. Read-only."""
+-    rows = conn.execute(
+-        "SELECT p.id, p.status FROM task_links l "
+-        "JOIN tasks p ON p.id = l.parent_id "
+-        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
+-        "ORDER BY p.id", (task_id,),
+-    ).fetchall()
+-    return [(row["id"], row["status"]) for row in rows]
++    return [(pid, st if st is not None else "missing") for pid, st in parent_states(conn, task_id)
++            if st not in ("done", "archived")]
+ 
+ 
+ def claim_task(
+@@ -3716,12 +3770,7 @@ def promote_task(
+     # No override: claim_task demotes ready -> todo on an undone parent whichever
+     # writer set 'ready', so a forced promotion would only report a success the
+     # first claim silently reverts (#106195). The dependency itself is the knob.
+-    parents = conn.execute(
+-        "SELECT t.id, t.status FROM tasks t "
+-        "JOIN task_links l ON l.parent_id = t.id "
+-        "WHERE l.child_id = ?", (task_id,),
+-    ).fetchall()
+-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
++    unsatisfied = [pid for pid, st in parent_states(conn, task_id) if st not in ("done", "archived")]
+     if unsatisfied:
+         return False, (
+             f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index cfe7df0130..06d56d70e9 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -172,6 +172,11 @@ CREATE TABLE IF NOT EXISTS kanban_sync_outbox (
+     state        TEXT NOT NULL DEFAULT 'pending'
+ );
+ CREATE INDEX IF NOT EXISTS idx_outbox_pending ON kanban_sync_outbox(state, created_at);
++CREATE TABLE IF NOT EXISTS kanban_sync_remote_parents (
++    parent_id    TEXT PRIMARY KEY,
++    status       TEXT NOT NULL,
++    refreshed_at INTEGER NOT NULL
++);
+ CREATE TABLE IF NOT EXISTS kanban_sync_tombstones (
+     table_name TEXT NOT NULL,
+     row_uid    TEXT NOT NULL,
+@@ -298,6 +303,45 @@ def _db_key(conn: sqlite3.Connection) -> Optional[str]:
+     return _main_db_file(conn)
+ 
+ 
++# Local-only mirror (never captured, never pushed): the Board status of every parent a local link names that is not
++# a local card, i.e. a card another gateway owns. ``kanban_db.parent_states`` reads it, so the promoter and the claim
++# gate on the same parents the Board's own claim check does. Refreshed from the replica each sync round
++# (``kanban_sync_client.refresh_remote_parents``). A parent the replica lacks has no row: it reads as missing. [daveey]
++REMOTE_PARENTS_TABLE = "kanban_sync_remote_parents"
++
++
++def has_remote_parents(conn: sqlite3.Connection) -> bool:
++    """Whether this board file has the remote-parent mirror (synced boards only)."""
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
++                        (REMOTE_PARENTS_TABLE,)).fetchone() is not None
++
++
++def refresh_remote_parents(live: sqlite3.Connection, replica: sqlite3.Connection) -> list[str]:
++    """Copy the replica's status of every foreign parent the live file's links name into the mirror; drop rows no
++    link needs and rows the replica no longer has. Returns the parents whose status changed (the caller wakes the
++    dispatcher so a released child is promoted on the next tick, not the next sweep)."""
++    if not has_remote_parents(live):
++        return []
++    wanted = [r[0] for r in live.execute(
++        "SELECT DISTINCT l.parent_id FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id WHERE p.id IS NULL")]
++    found: dict[str, str] = {}
++    for i in range(0, len(wanted), 500):
++        chunk = wanted[i:i + 500]
++        found.update({r[0]: r[1] for r in replica.execute(
++            f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk)})
++    current = {r[0]: r[1] for r in live.execute(f"SELECT parent_id, status FROM {REMOTE_PARENTS_TABLE}")}
++    if current == found:
++        return []
++    changed = sorted(k for k in set(current) | set(found) if current.get(k) != found.get(k))
++    now = int(time.time())
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(live):
++        live.execute(f"DELETE FROM {REMOTE_PARENTS_TABLE}")
++        live.executemany(f"INSERT INTO {REMOTE_PARENTS_TABLE} (parent_id, status, refreshed_at) VALUES (?, ?, ?)",
++                         [(pid, st, now) for pid, st in found.items()])
++    return changed
++
++
+ def install_or_remove(conn: sqlite3.Connection, db_path: str) -> None:
+     """Init-time seam: with the flag on, create the sync tables and (unless the
+     board was detached to ``off``) install the capture triggers; with it off,
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 6994403ab9..a4b0495bb6 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -286,7 +286,7 @@ def transient_rejection(res: dict) -> bool:
+     reason = str(res.get("reason") or "")
+     detail = str(res.get("detail") or "")
+     return (reason in TRANSIENT_REASONS or (reason == "invalid" and "unknown table" in detail)
+-            or (reason == "not_found" and detail.startswith("no task")))  # its card is sent first next round
++            or (reason == "not_found" and detail.startswith(("no task", "unknown task"))))  # card goes first next round
+ 
+ 
+ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -> list[tuple[dict, str]]:
+@@ -298,12 +298,19 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+     in_batch = {r["row_uid"] for r in rows if r["table_name"] == "tasks"}
+     wanted: list[str] = []
+     for r in rows:
+-        if r["table_name"] in ("tasks", "task_links"):
++        if r["table_name"] == "tasks":
+             continue
+-        fields = r["fields"] if isinstance(r["fields"], dict) else json.loads(r["fields"] or "{}")
+-        tid = fields.get("task_id")
+-        if tid and tid not in in_batch and tid not in wanted:
+-            wanted.append(tid)
++        if r["table_name"] == "task_links":
++            if r["op"] != "upsert":
++                continue
++            # Both ends of a new link: a link must never reach the Board ahead of a card it names. [daveey]
++            tids = list(str(r["row_uid"]).split(">", 1))
++        else:
++            fields = r["fields"] if isinstance(r["fields"], dict) else json.loads(r["fields"] or "{}")
++            tids = [fields.get("task_id")]
++        for tid in tids:
++            if tid and tid not in in_batch and tid not in wanted:
++                wanted.append(tid)
+     out: list[tuple[dict, str]] = []
+     for tid in wanted:
+         task = conn.execute("SELECT * FROM tasks WHERE id = ? AND sync_version IS NULL", (tid,)).fetchone()
+@@ -460,7 +467,12 @@ def own_partition(conn: sqlite3.Connection, changes: list[sync.RemoteChange], ga
+     """The changes for cards this gateway created (``created_on`` = it, or unset) and their child rows.
+ 
+     A primary board's live file holds only its own cards, so the dispatcher's sweeps (stale claims, orphans,
+-    concurrency counts) never see another gateway's work; the replica copy holds the whole board."""
++    concurrency counts) never see another gateway's work; the replica copy holds the whole board.
++
++    A link is kept when its CHILD is ours, even if the parent is another gateway's card: the edge gates our card,
++    and the Board's claim check counts it. Dropping it made the local promoter re-promote a child the Board refused
++    to lease (60 promoted/claim_rejected events in 7 min, 2026-10-28). The parent's status comes from the replica
++    (``kanban_db_sync.refresh_remote_parents``). [daveey]"""
+     kept: list[sync.RemoteChange] = []
+     mine: set[str] = set()
+ 
+@@ -478,8 +490,8 @@ def own_partition(conn: sqlite3.Connection, changes: list[sync.RemoteChange], ga
+             if not is_mine(ch.uid):
+                 continue
+         elif ch.table == "task_links":
+-            parent, _, child = ch.uid.partition(">")
+-            if not (is_mine(parent) and is_mine(child)):
++            _parent, _, child = ch.uid.partition(">")
++            if not is_mine(child):
+                 continue
+         elif not is_mine(ch.fields.get("task_id") if ch.op == "upsert" else
+                          _child_task(conn, ch.table, ch.uid)):
+@@ -600,6 +612,8 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+                 resync(live, hub, slug, observers=True, partition=gateway)
+         replica = open_shadow(slug, gateway)
+         try:
++            if mode == "primary" and sync.refresh_remote_parents(live, replica):
++                sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+             result.repaired = repair_divergence(live, replica, gateway)
+         finally:
+             replica.close()
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 3ac94b1a06..6076d76c11 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -213,7 +213,12 @@ def candidates(replica: sqlite3.Connection, own: str, *, now_ms: Optional[int] =
+     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+     return replica.execute(
+         "SELECT * FROM tasks WHERE status = 'ready' AND created_on IS NOT NULL AND created_on != ? "
+-        "AND (lease_holder IS NULL OR COALESCE(lease_expires, 0) < ?) ORDER BY priority DESC, created_at, id",
++        "AND (lease_holder IS NULL OR COALESCE(lease_expires, 0) < ?) "
++        # The replica holds the whole board: a card with an open (or missing) parent would only be refused
++        # parents_not_done by the Board, and that refusal demotes it on every machine. [daveey]
++        "AND NOT EXISTS (SELECT 1 FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
++        "WHERE l.child_id = tasks.id AND COALESCE(p.status, '') NOT IN ('done', 'archived')) "
++        "ORDER BY priority DESC, created_at, id",
+         (own, now_ms)).fetchall()
+ 
+ 
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index ef2313f748..fe7914bfdc 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -92,6 +92,13 @@ class FakeService:
+                 row = self._put(b, table, uid, {"lease_holder": None, "lease_expires": None}, gw, op["client_op_id"],
+                                 op["hlc"])
+             return {"status": "applied" if len(won) == len(f) else "merged", "row": row}
++        if table == "task_links":
++            # rows.ts upsertLink: a link needs both of its cards on the Board.
++            tasks = b["rows"].get("tasks", {})
++            missing = [x for x in (f.get("parent_id"), f.get("child_id"))
++                       if x not in tasks or tasks[x].get("deleted_at")]
++            if missing:
++                return {"status": "rejected", "reason": "not_found", "detail": f"unknown task(s): {', '.join(map(str, missing))}"}
+         return {"status": "applied", "row": self._put(b, table, uid, f, gw, op["client_op_id"], op["hlc"])}
+ 
+     def compact(self, bid: str) -> None:
+diff --git a/tests/hermes_cli/test_kanban_cross_gateway_parents.py b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+new file mode 100644
+index 0000000000..0ceb3b5779
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_cross_gateway_parents.py
+@@ -0,0 +1,225 @@
++"""One dependency view for the promoter, the claim and the Board (2026-10-28 incident).
++
++worker-1 linked a parent card it owned to a card the MacBook owned. The link reached the Board, but the MacBook's
++live board file dropped it (``own_partition`` kept a link only when BOTH ends were its own cards), so its promoter
++kept marking the child ready while the Board refused every lease ``parents_not_done``: 60 promoted/claim_rejected
++events in 7 minutes. These tests pin the fix: the owner keeps a link whose child is its own, gates on the foreign
++parent's Board status (mirrored from the replica), never treats a parent it cannot find as satisfied, blocks such a
++child after ``PARENT_MISSING_BLOCK_SECONDS``, and never pushes a link ahead of a card it names. [daveey]"""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "macbook", "worker-1", "default"
++
++
++# --- local board: missing parent ------------------------------------------------------------------------------
++
++@pytest.fixture
++def local(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, False)
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _link_raw(conn, parent, child):
++    with kbc.write_txn(conn):
++        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, child))
++        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
++
++
++def _events(conn, tid, kind):
++    return conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
++                        (tid, kind)).fetchall()
++
++
++def test_a_child_whose_parent_is_missing_is_not_promoted_then_blocked_after_the_timeout(local):
++    child = kb.create_task(local, title="child", assignee="worker")
++    _link_raw(local, "t_ghost", child)
++    assert kb.parent_states(local, child) == [("t_ghost", None)]
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "todo"  # before the fix: promoted (the JOIN dropped the parent)
++    assert not kb._parents_satisfied(local, child)
++    assert kb.unsatisfied_parents(local, child) == [("t_ghost", "missing")]
++    assert len(_events(local, child, "parent_missing")) == 1
++    kb.recompute_ready(local)  # still inside the window: no second event, no block
++    assert kb.get_task(local, child).status == "todo"
++    assert len(_events(local, child, "parent_missing")) == 1
++    with kbc.write_txn(local):
++        local.execute("UPDATE task_events SET created_at = created_at - ? WHERE task_id = ? AND kind = 'parent_missing'",
++                      (kb.PARENT_MISSING_BLOCK_SECONDS + 1, child))
++    kb.recompute_ready(local)
++    t = kb.get_task(local, child)
++    assert (t.status, t.block_kind) == ("blocked", "transient")
++    [(payload, _at)] = _events(local, child, "blocked")
++    assert "parent t_ghost missing from this board" in payload
++    kb.recompute_ready(local)  # a sticky block: the promoter leaves it for an unlink + unblock
++    assert kb.get_task(local, child).status == "blocked"
++
++
++def test_a_forced_ready_child_with_a_missing_parent_is_not_claimed(local):
++    child = kb.create_task(local, title="child", assignee="worker")
++    _link_raw(local, "t_ghost", child)
++    with kbc.write_txn(local):
++        local.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
++    assert kb.claim_task(local, child) is None
++    assert kb.get_task(local, child).status == "todo"
++
++
++def test_a_parent_that_comes_back_closes_the_missing_streak(local):
++    child = kb.create_task(local, title="child", assignee="worker")
++    _link_raw(local, "t_late", child)
++    kb.recompute_ready(local)
++    assert len(_events(local, child, "parent_missing")) == 1
++    with kbc.write_txn(local):
++        local.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t_late', 'late', 'running', ?)",
++                      (int(time.time()),))
++    kb.recompute_ready(local)
++    assert len(_events(local, child, "parent_found")) == 1
++    assert kb.get_task(local, child).status == "todo"  # the parent is open: still gated, never blocked
++
++
++def test_the_normal_parent_child_flow_is_unchanged(local):
++    parent = kb.create_task(local, title="parent", assignee="worker")
++    child = kb.create_task(local, title="child", assignee="worker", parents=[parent])
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "todo"
++    assert kb.unsatisfied_parents(local, child) == [(parent, "ready")]
++    assert not _events(local, child, "parent_missing")
++    assert kb.claim_task(local, parent) is not None
++    assert kb.complete_task(local, parent, result="ok")
++    kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == "ready"
++    assert kb.claim_task(local, child) is not None
++    assert not _events(local, child, "parent_missing") and not _events(local, child, "claim_rejected")
++
++
++# --- synced board: a parent another gateway owns --------------------------------------------------------------
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield conn
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
++
++
++def _round(kanban_home, svc):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++def _other(svc, op_id, table, uid, fields):
++    hub = svc.hub(OTHER)
++    res = hub.ops(BOARD, [{"client_op_id": f"other-{op_id}", "op": "upsert", "table": table, "uid": uid,
++                           "hlc": f"{time.time_ns() // 1_000_000 + 1000:013d}-0000-{OTHER}", "fields": fields}])
++    assert res["results"][0]["status"] == "applied", res
++    return res
++
++
++def test_a_foreign_parent_gates_its_child_on_the_owner_until_it_is_done(live, svc, kanban_home):
++    local_parent = kb.create_task(live, title="local parent", assignee="worker")
++    child = kb.create_task(live, title="child", assignee="worker", parents=[local_parent])
++    _round(kanban_home, svc)
++    # Another gateway creates a parent card it owns and links it to our child (the worker-1 run of 2026-10-28).
++    _other(svc, "p", "tasks", "t_foreign", {"title": "foreign parent", "status": "ready", "created_at": 1})
++    _other(svc, "l", "task_links", f"t_foreign>{child}", {"parent_id": "t_foreign", "child_id": child})
++    _round(kanban_home, svc)
++    assert kb.get_task(live, "t_foreign") is None  # still not a local card: the dispatcher never sees it
++    assert live.execute("SELECT 1 FROM task_links WHERE parent_id = 't_foreign' AND child_id = ?",
++                        (child,)).fetchone()  # before the fix: dropped by own_partition
++    assert kb.parent_states(live, child) == sorted([(local_parent, "ready"), ("t_foreign", "ready")])
++    # Our own parent finishes. Before the fix the promoter now promoted the child the Board would refuse.
++    assert kb.claim_task(live, local_parent) is not None
++    assert kb.complete_task(live, local_parent, result="ok")
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "todo"
++    assert kb.unsatisfied_parents(live, child) == [("t_foreign", "ready")]
++    assert not _events(live, child, "parent_missing")
++    # The foreign parent finishes on its gateway: the next round mirrors it and the child is released.
++    _other(svc, "done", "tasks", "t_foreign", {"status": "done"})
++    sync.consume_dispatcher_wake()
++    _round(kanban_home, svc)
++    assert sync.consume_dispatcher_wake()  # the round woke the dispatcher for the released child
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "ready"
++    assert kb.claim_task(live, child) is not None
++
++
++def test_a_link_from_our_card_to_a_foreign_child_stays_out_of_the_live_board(live):
++    mine = kb.create_task(live, title="own", assignee="worker")
++    ch = [
++        sync.RemoteChange(1, "task_links", f"{mine}>t_foreign", "upsert", {}, 1, "", OTHER),
++        sync.RemoteChange(2, "task_links", f"t_foreign>{mine}", "upsert", {}, 1, "", OTHER),
++    ]
++    assert [c.seq for c in ksc.own_partition(live, ch, ME)] == [2]
++
++
++def test_a_link_never_reaches_the_board_ahead_of_its_parent_card(live, svc):
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)
++    parent = kb.create_task(live, title="parent made in a capture gap", assignee="worker")  # never queued
++    sync.install_triggers(live)
++    child = kb.create_task(live, title="child", assignee="worker", parents=[parent])
++    res = ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    rows = svc.board(BOARD)["rows"]
++    # Before the fix the link went out alone and the Board refused it for good (not_found: unknown task).
++    assert res.rejected == 0, live.execute("SELECT last_error FROM kanban_sync_outbox").fetchall()
++    assert parent in rows["tasks"] and f"{parent}>{child}" in rows["task_links"]
++
++
++def test_a_link_the_board_refuses_for_an_unknown_card_is_retried_not_dropped():
++    assert ksc.transient_rejection({"reason": "not_found", "detail": "unknown task(s): t_x"})
++    assert ksc.transient_rejection({"reason": "not_found", "detail": "no task t_x"})
++    assert not ksc.transient_rejection({"reason": "cycle", "detail": "x"})
++
++
++def test_a_worker_node_does_not_copy_a_ready_card_whose_parent_is_open(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    replica = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        now = int(time.time())
++        with kbc.write_txn(replica):
++            for tid, status in (("t_p", "ready"), ("t_c", "ready"), ("t_free", "ready")):
++                replica.execute("INSERT INTO tasks (id, title, status, created_at, created_on) VALUES (?, ?, ?, ?, ?)",
++                                (tid, tid, status, now, ME))
++            replica.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('t_p', 't_c')")
++            replica.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('t_gone', 't_free')")
++        from hermes_cli import kanban_worker_node as wn
++        ids = {r["id"] for r in wn.candidates(replica, OTHER)}
++        assert ids == {"t_p"}  # t_c waits on t_p; t_free names a parent the Board does not have
++        with kbc.write_txn(replica):
++            replica.execute("UPDATE tasks SET status = 'done' WHERE id = 't_p'")
++            replica.execute("DELETE FROM task_links WHERE parent_id = 't_gone'")
++        assert {r["id"] for r in wn.candidates(replica, OTHER)} == {"t_c", "t_free"}
++    finally:
++        replica.close()
+-- 
+2.55.0
+

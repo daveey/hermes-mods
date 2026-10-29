@@ -1,0 +1,197 @@
+From 3b678aeda717c758bd4ace63fddb1e6997df6675 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:52:20 +0000
+Subject: [PATCH] fix(kanban): tag PR-acceptance completion refusals
+ rejection=pr_acceptance, not stale_run [daveey]
+
+kanban_complete raised every bare-False refusal with no unsatisfied parents as
+stale_run, including PR-acceptance refusals (no_required_checks, failing, pending
+checks), so coach digests counted PR-CI refusals as stale runs. Add the
+pr_acceptance class and stamp it when this call appended a pr_acceptance event
+with ok=false (event-id high-water mark, not prose matching). Genuinely stale,
+terminal or unknown ids stay stale_run.
+---
+ .../test_kanban_complete_rejection_class.py   | 50 +++++++++++++++++++
+ tools/kanban_tools.py                         | 24 +++------
+ tools/kanban_tools_completion.py              | 42 ++++++++++++++++
+ 3 files changed, 100 insertions(+), 16 deletions(-)
+ create mode 100644 tools/kanban_tools_completion.py
+
+diff --git a/tests/tools/test_kanban_complete_rejection_class.py b/tests/tools/test_kanban_complete_rejection_class.py
+index 2e171ac79e..a3195e1287 100644
+--- a/tests/tools/test_kanban_complete_rejection_class.py
++++ b/tests/tools/test_kanban_complete_rejection_class.py
+@@ -75,6 +75,56 @@ def test_stale_run(board, monkeypatch):
+     assert _complete({"summary": "done"}) == "stale_run"
+ 
+ 
++_PR = "https://github.com/acme/repo/pull/7"
++
++
++def _no_required_checks(monkeypatch):
++    """PR acceptance read: the contract repo has no required checks (refused unless waived)."""
++    from hermes_cli import kanban_pr_acceptance as kpa
++
++    def collect(contract, published_pr, assignee=None):
++        return {"ok": False, "classification": "no_required_checks", "head_sha": "a" * 40,
++                "pr_url": published_pr, "detail": "no required checks; pass metadata.contract_waiver",
++                "recovery": "Add required checks or pass a contract_waiver."}
++    monkeypatch.setattr(kpa, "collect_acceptance", collect)
++
++
++def test_pr_acceptance_refusal_is_not_stale_run(board, monkeypatch):
++    # Regression: a no_required_checks PR-acceptance refusal was tagged stale_run, so digests
++    # counted every PR-CI refusal as a stale run. [daveey]
++    _no_required_checks(monkeypatch)
++    _claim(board, monkeypatch, completion_contract="acme/repo")
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_complete({"summary": "done", "metadata": {"published_pr": _PR}}))
++    assert out["rejection"] == "pr_acceptance"
++    assert "PR acceptance no_required_checks" in out["error"]
++    # Retrying hits the same refusal: still pr_acceptance, not stale_run.
++    assert _complete({"summary": "done", "metadata": {"published_pr": _PR}}) == "pr_acceptance"
++
++
++def test_terminal_card_after_pr_refusal_is_stale_run(board, monkeypatch):
++    # A card whose last_failure_error still names an old PR refusal, but is now terminal:
++    # this call recorded no acceptance, so it stays stale_run.
++    _no_required_checks(monkeypatch)
++    tid, _ = _claim(board, monkeypatch, completion_contract="acme/repo")
++    assert _complete({"summary": "done", "metadata": {"published_pr": _PR}}) == "pr_acceptance"
++    from tools import kanban_tools as kt
++    waived = json.loads(kt._handle_complete({"summary": "done", "metadata": {
++        "published_pr": _PR, "contract_waiver": {"reason": "repo has no CI"}}}))
++    assert waived.get("ok") is True, waived
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        assert board.get_task(conn, tid).status == "done"
++    assert _complete({"summary": "done again", "metadata": {"published_pr": _PR}}) == "stale_run"
++
++
++def test_already_terminal_card_is_stale_run(board, monkeypatch):
++    _claim(board, monkeypatch)
++    from tools import kanban_tools as kt
++    assert json.loads(kt._handle_complete({"summary": "done"})).get("ok") is True
++    assert _complete({"summary": "done again"}) == "stale_run"
++
++
+ def test_parents(board, monkeypatch):
+     from hermes_cli import kanban_db_connect as kbc
+     with kbc.connect() as conn:
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8c4b5a3935..c45f3fa07a 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -23,6 +23,7 @@ from hermes_cli.kanban_capabilities import check_tool_create, declaration_requir
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import _marker_placement_fields, _placement_refused, _runs_where
+ from tools.kanban_tools_db_hint import generic_tool_error
++from tools import kanban_tools_completion as _kc
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+@@ -151,6 +152,7 @@ COMPLETE_REJECTION_CLASSES = frozenset({
+     "empty",          # no summary/result, or an evidence-free completion
+     "live_claim",     # another live dispatcher worker owns the card
+     "stale_run",      # run superseded, card already terminal, or unknown id
++    "pr_acceptance",  # completion contract's PR CI acceptance refused (pr_acceptance event ok=false)
+     "parents",        # unsatisfied parent dependencies
+     "not_owner",      # delegate child / other task / unbound run id
+     "invalid_args",   # unknown parameter or malformed argument
+@@ -943,18 +945,6 @@ def _handle_list(args: dict, **kw) -> str:
+             "promoted": promoted})
+ 
+ 
+-def _parked_by_own_run(conn, tid: str, run_id: int) -> bool:
+-    """True when ``run_id`` is the card's latest run, ended by ``kanban_block``, and nothing has
+-    claimed the card since (no current run, no claim lock, status ready/blocked)."""
+-    row = conn.execute("SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
+-    if row is None or row["current_run_id"] is not None or row["claim_lock"] \
+-            or row["status"] not in ("ready", "blocked"):
+-        return False
+-    last = conn.execute("SELECT id, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+-                        (tid,)).fetchone()
+-    return bool(last and last["id"] == run_id and last["outcome"] == "blocked")
+-
+-
+ @_kanban_handler("kanban_complete", classify_rejections=True)
+ def _handle_complete(args: dict, **kw) -> str:
+     """Mark the current task done with a structured handoff. Every refusal
+@@ -985,10 +975,11 @@ def _handle_complete(args: dict, **kw) -> str:
+         goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+         try:
+             run_id = _worker_run_id(tid)
+-            if run_id is not None and _parked_by_own_run(conn, tid, run_id):
++            if run_id is not None and _kc.parked_by_own_run(conn, tid, run_id):
+                 # This worker parked its card with kanban_block, then edited its own edges (kanban_unlink):
+                 # its run is over but nothing has claimed the card since, so it may still close its own card.
+                 run_id = None
++            event_mark = _kc.event_mark(conn, tid)  # a refusal's own pr_acceptance event lands above it
+             ok = kb.complete_task(
+                 conn, tid, result=result, summary=summary, metadata=metadata,
+                 created_cards=created_cards, expected_run_id=run_id, goal_verification=goal_verification)
+@@ -1039,9 +1030,10 @@ def _handle_complete(args: dict, **kw) -> str:
+                 raise _Reject(
+                     f"could not complete {tid}: unsatisfied parent dependencies: "
+                     f"{detail}; complete the parents first (done or archived)", "parents")
+-            _check(False, (task.last_failure_error if task else None) or
+-                   f"could not complete {tid} (unknown id, stale run, or already terminal)",
+-                   "stale_run")
++            reason = (task.last_failure_error if task else None) or \
++                f"could not complete {tid} (unknown id, stale run, or already terminal)"
++            _check(False, reason, "pr_acceptance" if _kc.pr_acceptance_refused(conn, tid, event_mark)
++                   else "stale_run")
+         run = kb.latest_run(conn, tid)
+         # Artifact staging is atomic with the completion write, so a worker that
+         # read `kanban_attachments` before completing saw an empty list and has
+diff --git a/tools/kanban_tools_completion.py b/tools/kanban_tools_completion.py
+new file mode 100644
+index 0000000000..2e8c188b5d
+--- /dev/null
++++ b/tools/kanban_tools_completion.py
+@@ -0,0 +1,42 @@
++"""kanban_complete DB reads: own-park detection and the refusal's PR-acceptance cause. [daveey]
++
++A PR-acceptance refusal (no_required_checks, failing, pending or missing checks) used to reach the worker
++tagged ``rejection=stale_run``, so digests counted every PR-CI refusal as a stale run. The structured signal is
++the ``pr_acceptance`` event (ok=false) that ``record_acceptance`` appends during the refused call: an event id
++above the high-water mark taken just before ``complete_task``.
++"""
++
++from __future__ import annotations
++
++import json
++
++
++def parked_by_own_run(conn, tid: str, run_id: int) -> bool:
++    """True when ``run_id`` is the card's latest run, ended by ``kanban_block``, and nothing has
++    claimed the card since (no current run, no claim lock, status ready/blocked)."""
++    row = conn.execute("SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    if row is None or row["current_run_id"] is not None or row["claim_lock"] \
++            or row["status"] not in ("ready", "blocked"):
++        return False
++    last = conn.execute("SELECT id, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++                        (tid,)).fetchone()
++    return bool(last and last["id"] == run_id and last["outcome"] == "blocked")
++
++
++def event_mark(conn, tid: str) -> int:
++    """The card's highest event id now; events a later call appends have larger ids."""
++    return conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
++
++
++def pr_acceptance_refused(conn, tid: str, mark: int) -> bool:
++    """True when the completion attempt since ``mark`` recorded a failed, unwaived pr_acceptance event."""
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'pr_acceptance' AND id > ? "
++        "ORDER BY id DESC LIMIT 1", (tid, mark)).fetchone()
++    if not row:
++        return False
++    try:
++        payload = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
++    except (TypeError, ValueError):
++        return False
++    return isinstance(payload, dict) and payload.get("ok") is False and not payload.get("waived")
+-- 
+2.55.0
+

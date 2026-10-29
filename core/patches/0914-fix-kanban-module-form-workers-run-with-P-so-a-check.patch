@@ -1,0 +1,499 @@
+From 648e72d2ecbc20d12328e5945da008da488c87bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:49:31 -0700
+Subject: [PATCH] fix(kanban): module-form workers run with -P so a checkout
+ workspace can't shadow the install [daveey] (#153)
+
+* fix(kanban): module-form workers run with -P so a checkout workspace can't shadow the install [daveey]
+
+A hermes-agent worktree card spawns its worker as `python -m hermes_cli.main`
+with cwd = the worktree. -m puts the cwd first on sys.path, ahead of the
+install-root PYTHONPATH pin, so the worker imported the worktree's hermes_cli,
+took it as project root and refused: "no dependency environment is committed
+for this install". Every worktree card on the repo died at spawn.
+
+Module-form argv now carries -P (Python >= 3.11, the project floor) via
+cron.scheduler_worker_env.hermes_module_argv, on every entry path that pins
+the install tree on PYTHONPATH: kanban worker (_module_hermes_argv), the
+placement forwarder, the cron external worker and the cron bot-chat turn.
+is_hermes_module_argv recognises both shapes for the pin checks. The flag is
+not inherited, so workers' own python children keep cwd-first semantics.
+gateway.run._resolve_hermes_bin is left alone: its children get no pin and
+run from HERMES_HOME / the project root, where the cwd entry is what imports.
+
+Tests: tests/hermes_cli/test_worker_argv_ignores_cwd_checkout.py spawns each
+path's real argv+env from a decoy checkout (4 RED on the old argv: DECOY
+imported from the cwd) plus a grandchild-inheritance check.
+
+* chore(kanban): keep the -P argv change line-neutral for the code-health ratchet [daveey]
+
+* fix(ci): document kanban.create_overlap_check; give LSP spawn test's fake proc a pid [daveey]
+
+Both fail on origin/main 6db9b6d0bb (docs drift ratchet from d0cc66e9f4;
+_FakeProc lacked .pid after 47ae53b158 started reading proc.pid in _spawn).
+
+* chore: drop CI-drift fixes now duplicated on main [daveey]
+---
+ cron/scheduler.py                             |   6 +-
+ cron/scheduler_delivery.py                    |   7 +-
+ cron/scheduler_worker_env.py                  |  23 ++
+ hermes_cli/kanban_db_dispatch.py              |  14 +-
+ hermes_cli/kanban_placement_forward.py        |   4 +-
+ tests/cron/test_bot_chat_cli_home.py          |   3 +-
+ tests/cron/test_cron_bot_chat_delivery.py     |   4 +-
+ tests/hermes_cli/test_kanban_db.py            |   8 +-
+ tests/hermes_cli/test_kanban_placement.py     |   2 +-
+ .../test_worker_argv_ignores_cwd_checkout.py  | 237 ++++++++++++++++++
+ 10 files changed, 285 insertions(+), 23 deletions(-)
+ create mode 100644 tests/hermes_cli/test_worker_argv_ignores_cwd_checkout.py
+
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 58ef464352..8498152924 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -3810,10 +3810,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
+     ack_path = handoff_dir / f"{execution_id}.ready"
+     # Captured so a worker that dies before its acknowledgement can name the cause (#112729).
+     stderr_path = handoff_dir / f"{execution_id}.stderr"
++    from cron.scheduler_worker_env import hermes_module_argv
++
+     command = [
+-        sys.executable,
+-        "-m",
+-        "cron.scheduler",
++        *hermes_module_argv(sys.executable, "cron.scheduler"),
+         "--external-worker-file",
+         str(payload_path),
+         "--ack-file",
+diff --git a/cron/scheduler_delivery.py b/cron/scheduler_delivery.py
+index 9667ebadbf..5d2da2e404 100644
+--- a/cron/scheduler_delivery.py
++++ b/cron/scheduler_delivery.py
+@@ -894,8 +894,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
+         found = _ilu.find_spec("hermes_cli") is not None
+     except Exception:
+         found = False
++    from cron.scheduler_worker_env import hermes_module_argv, is_hermes_module_argv, pin_hermes_tree_on_pythonpath
+     if found:
+-        argv = [sys.executable, "-m", "hermes_cli.main"]
++        argv = hermes_module_argv(sys.executable)
+     else:
+         hermes_bin = shutil.which("hermes")
+         if not hermes_bin:
+@@ -924,12 +925,10 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
+                      f"profile's environment ({type(exc).__name__}: {exc}); do not resend")
+     if home.parent.name != "profiles":
+         argv += ["-p", "default"]
+-    if argv[1:3] == ["-m", "hermes_cli.main"]:
++    if is_hermes_module_argv(argv):
+         # served_profile_child_env strips Hermes-owned PYTHONPATH entries; under a store-python
+         # shim the bare interpreter then cannot import the package find_spec just proved (#122487).
+         from pathlib import Path
+-
+-        from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+         pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
+ 
+     query_file = None
+diff --git a/cron/scheduler_worker_env.py b/cron/scheduler_worker_env.py
+index 79bfc6031d..7584d17109 100644
+--- a/cron/scheduler_worker_env.py
++++ b/cron/scheduler_worker_env.py
+@@ -61,6 +61,29 @@ def _committed_dependency_site_packages(project_root: Path) -> Path | None:
+     return selected if selected.is_dir() else None
+ 
+ 
++#: ``-P`` (Python >= 3.11, the floor in ``pyproject.toml``): don't put the cwd in front of
++#: ``sys.path`` for ``-m``/``-c``. A Hermes child spawned with ``cwd`` = a task workspace
++#: that is itself a Hermes checkout (a hermes-agent worktree card) otherwise imports THAT
++#: tree's ``hermes_cli`` ahead of the PYTHONPATH pin below, takes the worktree as its
++#: project root and refuses to start ("no dependency environment is committed for this
++#: install"). The flag is not inherited, so the worker's own shell children keep normal
++#: ``python -m`` semantics.
++SAFE_PATH_FLAG = "-P"
++
++
++def hermes_module_argv(executable: str, module: str = "hermes_cli.main") -> list[str]:
++    """``[executable, -P, -m, module]``: run ``module`` from the install's import path only."""
++    return [executable, SAFE_PATH_FLAG, "-m", module]
++
++
++def is_hermes_module_argv(argv: list, module: str = "hermes_cli.main") -> bool:
++    """True for ``python [-P] -m <module> ...`` (both the safe-path and the legacy shape)."""
++    rest = list(argv[1:])
++    if rest[:1] == [SAFE_PATH_FLAG]:
++        rest = rest[1:]
++    return rest[:2] == ["-m", module]
++
++
+ def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
+     """Prepend ``repo_root`` -- and, when this runner has one, the committed dependency
+     generation's ``site-packages`` -- to the worker env's own PYTHONPATH (never
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 1bd19a69b1..325dd37136 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2899,8 +2899,10 @@ def _rotate_worker_log(
+ 
+ def _module_hermes_argv() -> list[str]:
+     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
+-    console-script target — there is no top-level ``hermes`` package)."""
+-    return [sys.executable, "-m", "hermes_cli.main"]
++    console-script target — there is no top-level ``hermes`` package). ``-P``: the cwd is
++    the task workspace, which must never shadow the install (see ``hermes_module_argv``)."""
++    from cron.scheduler_worker_env import hermes_module_argv
++    return hermes_module_argv(sys.executable)
+ 
+ 
+ def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
+@@ -2914,12 +2916,10 @@ def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
+     auto-blocks (#122299, #122487, #122500). Same-interpreter child, so the
+     root is version-safe to propagate; ``hermes_cli.main``'s own bootstrap
+     then owns dependency activation as usual. A resolved shim path owns its
+-    imports and is left alone. Same pin cron's external worker uses (#112729).
+-    """
+-    if cmd[1:3] != ["-m", "hermes_cli.main"]:
++    imports and is left alone. Same pin cron's external worker uses (#112729)."""
++    from cron.scheduler_worker_env import is_hermes_module_argv, pin_hermes_tree_on_pythonpath
++    if not is_hermes_module_argv(cmd):
+         return
+-    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+-
+     pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
+ 
+ 
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 38ad15e98e..0ba05f0d9e 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -93,7 +93,9 @@ def forward_argv(task, board: Optional[str], worker_cmd: list) -> Optional[list]
+             conn.close()
+         if not st:
+             return None
+-        return [sys.executable, "-m", MODULE, "--", *[str(x) for x in worker_cmd]]
++        # ``-P``: the forwarder runs with cwd = the task workspace; see ``hermes_module_argv``.
++        from cron.scheduler_worker_env import hermes_module_argv
++        return [*hermes_module_argv(sys.executable, MODULE), "--", *[str(x) for x in worker_cmd]]
+     except Exception:
+         return None
+ 
+diff --git a/tests/cron/test_bot_chat_cli_home.py b/tests/cron/test_bot_chat_cli_home.py
+index 9899f8a0bf..59ed2968d6 100644
+--- a/tests/cron/test_bot_chat_cli_home.py
++++ b/tests/cron/test_bot_chat_cli_home.py
+@@ -34,7 +34,8 @@ def test_cli_keeps_discovered_home_when_launch_selection_changes(tmp_path, monke
+                 'import hermes_cli.main; from hermes_constants import get_hermes_home; '
+                 'print(json.dumps(str(get_hermes_home())))')
+         # Everything after the launcher (binary or ``python -m hermes_cli.main``) is the CLI argv.
+-        cli_argv = argv[3:] if argv[1:3] == ["-m", "hermes_cli.main"] else argv[1:]
++        from cron.scheduler_worker_env import is_hermes_module_argv
++        cli_argv = argv[argv.index("hermes_cli.main") + 1:] if is_hermes_module_argv(argv) else argv[1:]
+         result = real_run([sys.executable, "-c", code, json.dumps(cli_argv)],
+                           env=env, capture_output=True, text=True, timeout=30)
+         assert result.returncode == 0, result.stderr
+diff --git a/tests/cron/test_cron_bot_chat_delivery.py b/tests/cron/test_cron_bot_chat_delivery.py
+index 8585b9fdaa..d110c944aa 100644
+--- a/tests/cron/test_cron_bot_chat_delivery.py
++++ b/tests/cron/test_cron_bot_chat_delivery.py
+@@ -129,8 +129,8 @@ def test_deliver_runs_canonical_bot_chat_lane():
+     assert err is None
+     argv = calls["argv"]
+     # The running install's interpreter, not whatever `hermes` PATH names (same order as /update).
+-    assert argv[:3] == [sys.executable, "-m", "hermes_cli.main"]
+-    assert argv[3:5] == ["-p", "default"]  # do not follow active_profile
++    assert argv[:4] == [sys.executable, "-P", "-m", "hermes_cli.main"]
++    assert argv[4:6] == ["-p", "default"]  # do not follow active_profile
+     assert "chat" in argv
+     assert "Bot Chat" in argv
+     assert "--create-if-missing" in argv
+diff --git a/tests/hermes_cli/test_kanban_db.py b/tests/hermes_cli/test_kanban_db.py
+index 6ec24eaff8..1a00275f66 100644
+--- a/tests/hermes_cli/test_kanban_db.py
++++ b/tests/hermes_cli/test_kanban_db.py
+@@ -1592,7 +1592,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
+     monkeypatch.delenv("HERMES_BIN", raising=False)
+     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
+     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
+-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
++    assert kbd._resolve_hermes_argv() == [sys.executable, "-P", "-m", "hermes_cli.main"]
+ 
+     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
+     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+@@ -1609,8 +1609,6 @@ def test_resolve_hermes_argv_module_actually_runs():
+     would fail and so would every dispatcher spawn that hits the fallback.
+     Run it as a real subprocess to catch that regression.
+     """
+-    import subprocess
+-    from hermes_cli import kanban_db_dispatch as kbd
+     import shutil
+     from unittest import mock
+ 
+@@ -1618,7 +1616,9 @@ def test_resolve_hermes_argv_module_actually_runs():
+         os.environ.pop("HERMES_BIN", None)
+         with mock.patch.object(shutil, "which", return_value=None):
+             argv = kbd._resolve_hermes_argv()
+-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, check=False)
++    env = dict(os.environ)  # ``-P`` drops the cwd entry
++    kbd._propagate_module_import_root(argv, env)
++    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, check=False, env=env)
+     assert r.returncode == 0, (
+         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
+         f"stderr={r.stderr[:200]!r}"
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index d0e9763285..18f843bafa 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -908,7 +908,7 @@ def test_kanban_create_with_parents_creates_a_local_deferred_card(mac):
+         assert st["target"] == "hub" and st["origin_session"] == "20261027_183000_abc123"
+         assert kb.get_task(conn, out["task_id"]).status == "todo"
+         task = kb.get_task(conn, out["task_id"])
+-        assert kpf.forward_argv(task, None, ["hermes", "chat"])[1:4] == ["-m", kpf.MODULE, "--"]
++        assert kpf.forward_argv(task, None, ["hermes", "chat"])[1:5] == ["-P", "-m", kpf.MODULE, "--"]
+         task.skills = ["sdlc-review"]  # the review lane always runs a real reviewer
+         assert kpf.forward_argv(task, None, ["hermes", "chat"]) is None
+     marked = json.loads(kt._handle_create({"title": "Read the Chrome tab", "parents": [parent]}))
+diff --git a/tests/hermes_cli/test_worker_argv_ignores_cwd_checkout.py b/tests/hermes_cli/test_worker_argv_ignores_cwd_checkout.py
+new file mode 100644
+index 0000000000..a5263f6d09
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_argv_ignores_cwd_checkout.py
+@@ -0,0 +1,237 @@
++"""Module-form Hermes children import the install's tree, never one in their cwd.
++
++A hermes-agent worktree card runs its worker with ``cwd`` = the worktree. With
++``python -m hermes_cli.main`` Python put that cwd first on ``sys.path``, ahead of the
++install-root ``PYTHONPATH`` pin, so the worker imported the WORKTREE's ``hermes_cli``,
++took it as its project root and refused to start ("no dependency environment is
++committed for this install"). Every such card died at spawn.
++
++Each test captures the argv + env one entry path really spawns with, then runs that
++argv's interpreter prefix (everything before ``-m``) with cwd = a decoy checkout whose
++``hermes_cli`` / ``cron`` packages refuse to import, and asserts the child imported the
++install's packages instead. ``-c`` and ``-m`` share the cwd-first ``sys.path`` rule, so the
++probe sees exactly what the module launch would.
++"""
++
++from __future__ import annotations
++
++import os
++import subprocess
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++PROBE = "import hermes_cli, cron; print(hermes_cli.__file__); print(cron.__file__)"
++# The spawn paths under test get ``subprocess.Popen`` monkeypatched; the probe needs the real one.
++_REAL_POPEN = subprocess.Popen
++
++
++def _run(argv: list[str], *, cwd: Path, env: dict) -> tuple[int, str, str]:
++    with _REAL_POPEN(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
++                     stderr=subprocess.PIPE, text=True) as proc:
++        out, err = proc.communicate(timeout=60)
++    return proc.returncode, out, err
++
++
++@pytest.fixture
++def decoy_checkout(tmp_path):
++    """A directory that looks like another Hermes checkout to ``-m``'s cwd entry."""
++    decoy = tmp_path / "other-checkout"
++    for package in ("hermes_cli", "cron"):
++        (decoy / package).mkdir(parents=True)
++        (decoy / package / "__init__.py").write_text(
++            f"raise SystemExit('DECOY {package} imported from the cwd')\n", encoding="utf-8"
++        )
++    return decoy
++
++
++def _imports_from(argv: list[str], env: dict, cwd: Path) -> list[Path]:
++    """Run ``argv``'s interpreter + flags with the probe; return the imported package files."""
++    prefix = argv[: argv.index("-m")]
++    child_env = {k: v for k, v in env.items() if k != "PYTHONSAFEPATH"}
++    returncode, out, err = _run([*prefix, "-c", PROBE], cwd=cwd, env=child_env)
++    assert returncode == 0, (out, err)
++    return [Path(line).resolve() for line in out.split()]
++
++
++def _assert_install_tree(paths: list[Path]) -> None:
++    assert paths, "probe printed nothing"
++    for path in paths:
++        assert path.is_relative_to(REPO_ROOT), f"{path} is not from the install tree {REPO_ROOT}"
++
++
++# --- kanban worker spawn ----------------------------------------------------------------
++
++
++def _kanban_task(kb):
++    return kb.Task(
++        id="t_argv", title="argv", body=None, assignee="w", status="running", priority=0,
++        created_by="test", created_at=1, started_at=None, completed_at=None,
++        workspace_kind="worktree", workspace_path=None, claim_lock="lock", claim_expires=None,
++        tenant=None, current_run_id=1,
++    )
++
++
++def _capture_kanban_spawn(monkeypatch, tmp_path, workspace: Path) -> dict:
++    root = tmp_path / ".hermes"
++    (root / "profiles" / "w").mkdir(parents=True)
++    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
++    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.delenv("HERMES_BIN", raising=False)
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    # The systemd scope wrapper is a prefix around the same argv; keep the test host-neutral.
++    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, cmd, board=None: cmd)
++    captured: dict = {}
++
++    class FakeProc:
++        pid = 4242
++
++    def fake_popen(cmd, *args, **kwargs):
++        captured.update(cmd=list(cmd), env=dict(kwargs.get("env") or {}), cwd=kwargs.get("cwd"))
++        return FakeProc()
++
++    monkeypatch.setattr(subprocess, "Popen", fake_popen)
++    kbd._default_spawn(_kanban_task(kb), str(workspace))
++    return captured
++
++
++def test_kanban_worker_in_a_checkout_workspace_imports_the_install(
++    monkeypatch, tmp_path, decoy_checkout
++):
++    captured = _capture_kanban_spawn(monkeypatch, tmp_path, decoy_checkout)
++
++    assert captured["cwd"] == str(decoy_checkout)
++    assert "hermes_cli.main" in captured["cmd"]
++    _assert_install_tree(_imports_from(captured["cmd"], captured["env"], decoy_checkout))
++    # And the real entry point starts from there (it refused with the PM error before).
++    module_at = captured["cmd"].index("hermes_cli.main")
++    child_env = {k: v for k, v in captured["env"].items() if k != "PYTHONSAFEPATH"}
++    returncode, out, err = _run([*captured["cmd"][: module_at + 1], "--version"],
++                                cwd=decoy_checkout, env=child_env)
++    assert returncode == 0 and "DECOY" not in err, (out, err)
++
++
++def test_placement_forwarder_and_its_worker_import_the_install(
++    monkeypatch, tmp_path, decoy_checkout
++):
++    """Deferred placement swaps in ``-m hermes_cli.kanban_placement_forward -- <worker argv>``;
++    both the forwarder and the worker argv it execs run from the task workspace."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_placement_forward as fwd
++
++    monkeypatch.setattr(fwd, "state", lambda conn, task_id: {"deferred": True})
++    real_db_path = kb.kanban_db_path
++
++    def db_path(board=None):
++        path = Path(real_db_path(board=board))
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.touch()
++        return path
++
++    monkeypatch.setattr(kb, "kanban_db_path", db_path)
++    captured = _capture_kanban_spawn(monkeypatch, tmp_path, decoy_checkout)
++
++    cmd = captured["cmd"]
++    assert fwd.MODULE in cmd, cmd
++    _assert_install_tree(_imports_from(cmd, captured["env"], decoy_checkout))
++    worker = cmd[cmd.index("--") + 1:]
++    assert "hermes_cli.main" in worker
++    _assert_install_tree(_imports_from(worker, captured["env"], decoy_checkout))
++
++
++# --- cron external worker ---------------------------------------------------------------
++
++
++def test_cron_external_worker_argv_imports_the_install(monkeypatch, tmp_path, decoy_checkout):
++    """The worker is spawned from the install root today; its argv must not depend on that."""
++    import json
++    from unittest.mock import Mock
++
++    from cron import scheduler
++    from tools.process_registry import GatewayChildDispatch
++
++    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(
++        "tools.process_registry.restart_safe_gateway_child_argv",
++        lambda command, **_: GatewayChildDispatch("degraded", command),
++    )
++    spawned: list = []
++
++    class FakeProcess:
++        returncode = 0
++
++        def poll(self):
++            return self.returncode
++
++        def wait(self, timeout=None):
++            return self.returncode
++
++    def popen(command, **kwargs):
++        if "--ack-file" not in command:  # an unrelated helper spawn
++            return _REAL_POPEN(command, **kwargs)
++        spawned.append((list(command), kwargs))
++        ack = Path(command[command.index("--ack-file") + 1])
++        ack.write_text(json.dumps({"pid": 4321, "execution_id": "exec-1"}), encoding="utf-8")
++        return FakeProcess()
++
++    monkeypatch.setattr(scheduler, "mark_execution_handoff_pending",
++                        Mock(return_value={"id": "exec-1", "handoff_pending": 1}))
++    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
++    statuses = iter([{"id": "exec-1", "status": "running"}, {"id": "exec-1", "status": "completed"}])
++    monkeypatch.setattr(scheduler, "get_execution", Mock(side_effect=lambda _id: next(statuses)))
++
++    assert scheduler._launch_external_cron_worker(
++        {"id": "job-1", "execution_id": "exec-1", "prompt": "work"}) is True
++    command, kwargs = spawned[0]
++    assert "cron.scheduler" in command
++    _assert_install_tree(_imports_from(command, kwargs["env"], decoy_checkout))
++
++
++# --- cron bot-chat delivery -------------------------------------------------------------
++
++
++def test_cron_bot_chat_turn_argv_imports_the_install(monkeypatch, tmp_path, decoy_checkout):
++    import cron.scheduler_delivery as delivery
++
++    root = tmp_path / "hermes"
++    (root / "profiles" / "beta").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    captured: dict = {}
++
++    def fake_turn(argv, env, report_path, timeout):
++        captured.update(argv=list(argv), env=dict(env))
++        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
++
++    monkeypatch.setattr(delivery, "_run_bot_chat_turn", fake_turn)
++    assert delivery._deliver_to_bot_chat({"id": "j", "name": "nightly"}, "brief", "beta") is None
++
++    assert "hermes_cli.main" in captured["argv"]
++    _assert_install_tree(_imports_from(captured["argv"], captured["env"], decoy_checkout))
++
++
++def test_safe_path_flag_is_not_inherited_by_grandchildren(tmp_path):
++    """``-P`` is an interpreter flag, not ``PYTHONSAFEPATH``: the worker's own terminal
++    children keep the normal cwd-first ``python -m`` semantics."""
++    from cron.scheduler_worker_env import hermes_module_argv
++
++    import sys
++
++    argv = hermes_module_argv(sys.executable)
++    prefix = argv[: argv.index("-m")]
++    grandchild = "import sys; print(sys.flags.safe_path)"
++    script = (
++        "import subprocess, sys; print(sys.flags.safe_path); "
++        f"print(subprocess.run([sys.executable, '-c', {grandchild!r}], "
++        "capture_output=True, text=True).stdout.strip())"
++    )
++    result = subprocess.run(
++        [*prefix, "-c", script],
++        cwd=str(tmp_path), env={k: v for k, v in os.environ.items() if k != "PYTHONSAFEPATH"},
++        capture_output=True, text=True, timeout=60, check=False,
++    )
++    assert result.stdout.split() == ["True", "False"], result
+-- 
+2.55.0
+

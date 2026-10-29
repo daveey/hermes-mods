@@ -47,7 +47,7 @@ Merged and deployed are different. Mirror verification did not restart or deploy
 The prior creation key cache was process-local, and ordinary drafts deliberately had no durable row. Only core can atomically associate a visible session and first user turn before scheduling and adopt that row into its existing turn lifecycle. Plugins still own their domain policy, repair records and frontend actions.
 
 
-## Trusted metadata and authenticated SSH ownership (0376–0377)
+## Trusted metadata and authenticated SSH ownership (0381, 0382)
 
 Source commits `5c31e92ca8` and `b598614d83` are merged. The following implementation test results are the source handoff, not a live rollout claim.
 

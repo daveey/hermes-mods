@@ -1,0 +1,290 @@
+From f456a8d0811af06e79fe1614f409cc8f0c958350 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:47:28 +0000
+Subject: [PATCH] fix(dashboard): keep model-switch catalog lookups out of
+ config lock waits [daveey]
+
+---
+ agent/models_dev.py                           | 19 ++++-
+ hermes_cli/model_switch.py                    | 20 +++--
+ hermes_cli/web_server_config.py               |  2 +-
+ tests/agent/test_models_dev_network_scope.py  | 30 +++++++
+ .../test_config_model_catalog_lock.py         | 84 +++++++++++++++++++
+ .../test_model_switch_catalog_network.py      | 38 +++++++++
+ 6 files changed, 184 insertions(+), 9 deletions(-)
+ create mode 100644 tests/agent/test_models_dev_network_scope.py
+ create mode 100644 tests/hermes_cli/test_config_model_catalog_lock.py
+ create mode 100644 tests/hermes_cli/test_model_switch_catalog_network.py
+
+diff --git a/agent/models_dev.py b/agent/models_dev.py
+index 721d27d14d..0bb37e7fd3 100644
+--- a/agent/models_dev.py
++++ b/agent/models_dev.py
+@@ -13,6 +13,7 @@ import logging
+ import re
+ import threading
+ import time
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
+@@ -34,6 +35,22 @@ _models_dev_retry_after: float = 0
+ _models_dev_fetch_lock = threading.Lock()
+ _models_dev_refresh_lock = threading.Lock()
+ _models_dev_refresh_in_flight = False
++_models_dev_cache_only: ContextVar[bool] = ContextVar("models_dev_cache_only", default=False)
++
++
++@contextlib.contextmanager
++def models_dev_network_scope(*, allow_network: bool):
++    """Bound an operation's indirect catalog lookups without changing other requests.
++
++    Nested callers cannot re-enable network inside a cache-only operation. In
++    particular, dashboard config writers must not wait for the singleflight fetch
++    lock while holding their config lock, even through provider/alias helpers.
++    """
++    token = _models_dev_cache_only.set(_models_dev_cache_only.get() or not allow_network)
++    try:
++        yield
++    finally:
++        _models_dev_cache_only.reset(token)
+ 
+ 
+ @dataclass
+@@ -443,7 +460,7 @@ def fetch_models_dev(force_refresh: bool = False, *, allow_network: bool = True)
+     ``force_refresh=True`` bypasses the cache fast paths and the backoff, falling back to cached data
+     only if the call fails. ``allow_network=False`` returns any memory/disk cache and never makes a request."""
+     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
+-    if not allow_network:
++    if not allow_network or _models_dev_cache_only.get():
+         if not _models_dev_cache and (disk_data := _load_disk_cache()):
+             _models_dev_cache = disk_data
+             disk_age = _disk_cache_age_seconds()
+diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
+index 845735954e..3e8e3610e5 100644
+--- a/hermes_cli/model_switch.py
++++ b/hermes_cli/model_switch.py
+@@ -1740,24 +1740,30 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
+ def switch_model(
+     raw_input: str, current_provider: str, current_model: str, current_base_url: str = "",
+     current_api_key: str = "", is_global: bool = False, explicit_provider: str = "",
+-    user_providers: dict | None = None, custom_providers: list | None = None) -> ModelSwitchResult:
++    user_providers: dict | None = None, custom_providers: list | None = None,
++    *, allow_network: bool = True) -> ModelSwitchResult:
+     """Core model-switching pipeline shared between CLI and gateway.
+ 
+     Route (PATH A with ``--provider``, else PATH B) -> credentials -> validation -> result; each
+     step returns a failure :class:`ModelSwitchResult` to stop the chain, or ``None`` to continue.
+     ``user_providers`` / ``custom_providers`` are the config.yaml ``providers:`` dict and
+-    ``custom_providers:`` list."""
++    ``custom_providers:`` list. ``allow_network=False`` makes all models.dev lookups
++    cache-only, including indirect provider and alias resolution. Provider endpoint
++    validation is unchanged; this flag only controls the metadata registry."""
++    from agent.models_dev import models_dev_network_scope
++
+     st = _Switch(
+         raw_input=raw_input, current_provider=current_provider, current_model=current_model,
+         current_base_url=current_base_url, current_api_key=current_api_key, is_global=is_global,
+         explicit_provider=explicit_provider, user_providers=user_providers, custom_providers=custom_providers,
+         new_model=raw_input.strip(), target_provider=current_provider)
+     route = _route_explicit_provider if explicit_provider else _route_from_model_input
+-    for step in (route, _resolve_switch_credentials, _validate_switch):
+-        fail = step(st)
+-        if fail is not None:
+-            return fail
+-    return _build_switch_result(st)
++    with models_dev_network_scope(allow_network=allow_network):
++        for step in (route, _resolve_switch_credentials, _validate_switch):
++            fail = step(st)
++            if fail is not None:
++                return fail
++        return _build_switch_result(st)
+ 
+ 
+ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg: Any) -> dict[str, Any]:
+diff --git a/hermes_cli/web_server_config.py b/hermes_cli/web_server_config.py
+index 410ca1781b..ee563111d7 100644
+--- a/hermes_cli/web_server_config.py
++++ b/hermes_cli/web_server_config.py
+@@ -493,7 +493,7 @@ def _validated_main_model_selection(
+         current_base_url=base_url if is_bare_custom else str(model_cfg.get("base_url") or ""),
+         current_api_key=api_key if is_bare_custom else "",
+         user_providers=cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {},
+-        custom_providers=get_compatible_custom_providers(cfg))
++        custom_providers=get_compatible_custom_providers(cfg), allow_network=False)
+     if not result.success:
+         raise HTTPException(status_code=400, detail=result.error_message or "model switch rejected")
+     if is_bare_custom and base_url.strip():
+diff --git a/tests/agent/test_models_dev_network_scope.py b/tests/agent/test_models_dev_network_scope.py
+new file mode 100644
+index 0000000000..e5c3ceb40c
+--- /dev/null
++++ b/tests/agent/test_models_dev_network_scope.py
+@@ -0,0 +1,30 @@
++"""A scoped catalog policy must be cache-only, nested and exception safe."""
++
++import pytest
++
++from agent import models_dev
++
++
++@pytest.mark.parametrize("source", ["memory", "disk", "cold"])
++def test_cache_only_scope_serves_available_data_and_restores_on_error(monkeypatch, source):
++    registry = {"example": {"name": "Example", "models": {}}}
++    monkeypatch.setattr(models_dev, "_models_dev_cache", registry if source == "memory" else {})
++    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
++    monkeypatch.setattr(models_dev, "_models_dev_retry_after", 0)
++    monkeypatch.setattr(models_dev, "_load_disk_cache", lambda: registry if source == "disk" else {})
++    monkeypatch.setattr(models_dev, "_disk_cache_age_seconds", lambda: None)
++    calls = []
++
++    def fetch(**_kwargs):
++        calls.append(True)
++        raise OSError("offline")
++
++    monkeypatch.setattr(models_dev, "_fetch_models_dev_from_network", fetch)
++    with pytest.raises(ValueError, match="test unwind"):
++        with models_dev.models_dev_network_scope(allow_network=False):
++            with models_dev.models_dev_network_scope(allow_network=True):
++                assert models_dev.fetch_models_dev(force_refresh=True) == ({} if source == "cold" else registry)
++                assert not calls
++                raise ValueError("test unwind")
++    models_dev.fetch_models_dev(force_refresh=True)
++    assert calls
+diff --git a/tests/hermes_cli/test_config_model_catalog_lock.py b/tests/hermes_cli/test_config_model_catalog_lock.py
+new file mode 100644
+index 0000000000..20d0ed6fb9
+--- /dev/null
++++ b/tests/hermes_cli/test_config_model_catalog_lock.py
+@@ -0,0 +1,84 @@
++"""A cold models.dev fetch must not monopolize dashboard config writes."""
++
++import threading
++
++import pytest
++
++from tests.hermes_cli.test_config_rmw_lock import client as rmw_client, _on_disk
++
++
++@pytest.mark.parametrize("operation", ["activate", "make_default"])
++def test_blocked_catalog_fetch_does_not_block_config_autosave(request, monkeypatch, operation):
++    client = request.getfixturevalue("rmw_client")
++    from agent import models_dev
++    from hermes_cli.config import load_config, save_config
++
++    cfg = load_config()
++    cfg["providers"] = {"racebox": {"base_url": "http://racebox:8000/v1", "model": "race-model", "api_key": "k"}}
++    save_config(cfg)
++    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
++    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
++    monkeypatch.setattr(models_dev, "_models_dev_retry_after", 0)
++    monkeypatch.setattr(models_dev, "_load_disk_cache", dict)
++    monkeypatch.setattr(models_dev, "_disk_cache_age_seconds", lambda: None)
++    fetching, release, saved = threading.Event(), threading.Event(), threading.Event()
++    results, errors = {}, []
++
++    def blocked_fetch(**_kwargs):
++        fetching.set()
++        release.wait()
++        raise OSError("catalog unavailable")
++
++    monkeypatch.setattr(models_dev, "_fetch_models_dev_from_network", blocked_fetch)
++
++    def send_request(name, callback):
++        try:
++            results[name] = callback()
++        except BaseException as exc:
++            errors.append(exc)
++        finally:
++            if name == "autosave":
++                saved.set()
++
++    # Hold a real foreground catalog fetch open. The dashboard's model writer
++    # must not join it while holding the config RMW lock.
++    catalog = threading.Thread(target=lambda: models_dev.fetch_models_dev())
++    def select_model():
++        if operation == "activate":
++            return client.post("/api/providers/custom-endpoints/racebox/activate")
++        return client.post("/api/providers/custom-endpoints", json={
++            "id": "racebox", "name": "racebox", "base_url": "http://racebox:8000/v1",
++            "model": "race-model", "make_default": True, "discover_models": False})
++
++    activate = threading.Thread(target=send_request, args=("activate", select_model))
++    autosave = threading.Thread(target=send_request, args=("autosave", lambda: client.put(
++        "/api/config", json={"config": {"display": {"personality": "canary"}}})))
++    reached_switch = threading.Event()
++    from hermes_cli import model_switch
++    real_label = model_switch._switch_provider_label
++
++    def label(st):
++        # This point is reached under the config lock, before the old blocking lookup.
++        reached_switch.set()
++        return real_label(st)
++
++    monkeypatch.setattr(model_switch, "_switch_provider_label", label)
++    catalog.start()
++    try:
++        assert fetching.wait(10), "catalog fetch did not start"
++        activate.start()
++        assert reached_switch.wait(10), "activation did not reach model switch"
++        autosave.start()
++        assert saved.wait(10), "autosave waited for the blocked catalog fetch"
++        assert not release.is_set()
++    finally:
++        release.set()
++        for thread in (catalog, activate, autosave):
++            if thread.ident is not None:
++                thread.join(30)
++                assert not thread.is_alive()
++    assert not errors
++    assert results["activate"].status_code == 200, results["activate"].text
++    assert results["autosave"].status_code == 200, results["autosave"].text
++    assert _on_disk()["model"]["provider"] == "racebox"
++    assert _on_disk()["display"]["personality"] == "canary"
+diff --git a/tests/hermes_cli/test_model_switch_catalog_network.py b/tests/hermes_cli/test_model_switch_catalog_network.py
+new file mode 100644
+index 0000000000..12c26a68ae
+--- /dev/null
++++ b/tests/hermes_cli/test_model_switch_catalog_network.py
+@@ -0,0 +1,38 @@
++"""Dashboard cache-only switching keeps CLI catalog fetches available."""
++
++import pytest
++
++from agent import models_dev
++from hermes_cli.model_switch import switch_model
++
++
++@pytest.mark.parametrize("allow_network", [False, True])
++@pytest.mark.parametrize("provider", ["openrouter", "racebox"])
++def test_switch_catalog_network_policy(monkeypatch, allow_network, provider):
++    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
++    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
++    monkeypatch.setattr(models_dev, "_models_dev_retry_after", 0)
++    monkeypatch.setattr(models_dev, "_load_disk_cache", dict)
++    monkeypatch.setattr(models_dev, "_disk_cache_age_seconds", lambda: None)
++    calls = []
++
++    def fetch(**_kwargs):
++        calls.append(True)
++        raise OSError("offline")
++
++    monkeypatch.setattr(models_dev, "_fetch_models_dev_from_network", fetch)
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kw: {
++        "api_key": "test-key", "base_url": "http://endpoint/v1", "api_mode": "chat_completions"})
++    monkeypatch.setattr("hermes_cli.models_validate.validate_requested_model", lambda *_a, **_kw: {
++        "accepted": True, "persist": True, "recognized": True})
++    kwargs: dict = {} if allow_network else {"allow_network": False}
++    result = switch_model(
++        "race-model", current_provider=provider, current_model="old-model", explicit_provider=provider,
++        user_providers={"racebox": {"base_url": "http://endpoint/v1", "model": "race-model", "api_key": "k"}},
++        **kwargs)
++    assert result.success, result.error_message
++    assert bool(calls) is allow_network
++    # The per-operation policy must not leak into the next CLI request.
++    if not allow_network:
++        models_dev.fetch_models_dev()
++        assert calls
+-- 
+2.55.0
+

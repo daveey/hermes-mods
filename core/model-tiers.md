@@ -41,7 +41,7 @@ Kanban dispatcher (per run, decided at claim time):
 7. Otherwise `kanban.default_model` (+ `kanban.default_provider` if set).
 
 When `kanban.strong_model` is set, steps 4–6 run on it instead of on the profile model
-([kanban-strong-tier.md](kanban-strong-tier.md), patches 0541 0542).
+([kanban-strong-tier.md](kanban-strong-tier.md), patches 0554 0555).
 
 The pin is set on the in-memory claimed task only, so the card row never changes and every run re-decides.
 

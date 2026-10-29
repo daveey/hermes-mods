@@ -1,0 +1,423 @@
+From aec7fe78a906f051680e56d2d7e03fe798858b62 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 07:57:23 +0000
+Subject: [PATCH 416/453] Fence auxiliary class calls before legacy provider
+ discovery and recovery
+
+(cherry picked from commit aec7fe78a906f051680e56d2d7e03fe798858b62)
+---
+ agent/auxiliary_class_routing.py            | 198 ++++++++++++++++++++
+ agent/auxiliary_client.py                   |  21 +--
+ agent/auxiliary_stream_watchdog.py          |  13 ++
+ tests/agent/test_auxiliary_class_routing.py | 117 ++++++++++++
+ 4 files changed, 335 insertions(+), 14 deletions(-)
+ create mode 100644 agent/auxiliary_class_routing.py
+ create mode 100644 tests/agent/test_auxiliary_class_routing.py
+
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+new file mode 100644
+index 0000000000..15caecae60
+--- /dev/null
++++ b/agent/auxiliary_class_routing.py
+@@ -0,0 +1,198 @@
++"""Class auxiliary jobs: shared allocation, fenced credentials, no legacy ladder.
++
++Keep this boundary outside the legacy resolver: its discovery and auth recovery
++may intentionally use paid credentials, even when an explicit model was supplied.
++"""
++from functools import wraps
++from types import SimpleNamespace
++from uuid import uuid4
++
++from agent.model_routing import ModelRoutingError, is_class_selector
++from agent.model_routing_runtime import resolve_class_runtime
++
++
++def _class_request(task, options):
++    from agent import auxiliary_client as aux
++    task_config = aux._get_auxiliary_task_config(task) if task else {}
++    requested = options.get("model")
++    if not requested or requested == "auto":
++        requested = task_config.get("model")
++    if not is_class_selector(requested):
++        return None
++    provider, model, base, key, mode = aux._resolve_task_provider_model(
++        task, options.get("provider"), options.get("model"),
++        options.get("base_url"), options.get("api_key"))
++    if not is_class_selector(model):
++        return None
++    overrides = (base, key, mode, options.get("api_mode"), options.get("api_key"),
++                 task_config.get("base_url"), task_config.get("api_key"),
++                 task_config.get("key_env"), task_config.get("api_key_env"))
++    if provider not in (None, "", "auto") or any(overrides):
++        raise ModelRoutingError("Auxiliary class requests require provider auto and no transport overrides")
++    extra = aux._get_task_extra_body(task)
++    extra.update(options.get("extra_body") or {})
++    if set(extra) & {"model", "messages", "tools", "stream", "max_tokens", "max_completion_tokens"}:
++        raise ModelRoutingError("Auxiliary class extra_body cannot override request identity or capabilities")
++    headers = options.get("extra_headers") or {}
++    if {k.lower() for k in headers} & {"authorization", "x-api-key", "api-key", "host"}:
++        raise ModelRoutingError("Auxiliary class headers cannot override authentication or destination")
++    runtime = aux._normalize_main_runtime(options.get("main_runtime"))
++    owner = runtime.get("session_id") or str(uuid4())
++    # Separate side jobs from the main allocation; retries/restarts of a named
++    # session's same task reuse its durable route without pinning unrelated jobs.
++    identity = f"aux:{owner}:{task or 'call'}:{model}"
++    requirements = _requirements(task, options, extra)
++    return model, identity, requirements
++
++
++def _requirements(task, options, extra):
++    from agent import auxiliary_client as aux
++    messages = options.get("messages") or []
++    vision = task == "vision" or any(
++        isinstance(block, dict) and block.get("type") in {"image", "image_url", "input_image"}
++        for msg in messages for block in (msg.get("content") if isinstance(msg.get("content"), list) else []))
++    # Conservative byte bound avoids selecting a route too small before a
++    # provider-specific tokenizer is known. Include output reservation and tools.
++    import json
++    context = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
++    context += len(json.dumps(options.get("tools") or []).encode("utf-8"))
++    context += options.get("max_tokens") or 4096
++    return {"tools": bool(options.get("tools")), "vision": vision,
++            "streaming": True, "json": bool(extra.get("response_format")),
++            "min_context_tokens": max(context, aux._task_minimum_context_length(task) or 0)}
++
++
++def _client(runtime):
++    """Construct from the already fenced credential, never select a second pool."""
++    from agent import auxiliary_client as aux
++    provider, model = runtime["provider"], runtime["model"]
++    key, base = runtime["api_key"], runtime["base_url"]
++    if runtime["api_mode"] == "anthropic_messages":
++        from agent.anthropic_adapter import build_anthropic_client
++        return aux.AnthropicAuxiliaryClient(build_anthropic_client(key, base), model, key, base,
++                                           is_oauth=key.startswith("sk-ant-oat"))
++    if provider in {"openai-codex", "xai-oauth"}:
++        if provider == "openai-codex":
++            headers = aux._codex_cloudflare_headers(key, base_url=base)
++        else:
++            from tools.xai_http import hermes_xai_default_headers
++            headers = hermes_xai_default_headers()
++        real = aux._create_openai_client(api_key=key, base_url=base, default_headers=headers)
++        return aux.CodexAuxiliaryClient(real, model)
++    client, resolved = aux.resolve_provider_client(
++        provider, model, explicit_api_key=key, explicit_base_url=base, api_mode=runtime["api_mode"])
++    if client is None or resolved != model:
++        raise ModelRoutingError("Auxiliary class client did not preserve the selected route")
++    return client
++
++
++def _prepare(task, options, request, failed):
++    from agent import auxiliary_client as aux
++    model, identity, requirements = request
++    runtime = resolve_class_runtime(model, "auto", session_id=identity,
++                                    requirements=requirements, excluded=failed)
++    client = _client(runtime)
++    extra = aux._get_task_extra_body(task)
++    extra.update(options.get("extra_body") or {})
++    kwargs = aux._build_call_kwargs(
++        runtime["provider"], runtime["model"], options["messages"],
++        temperature=options.get("temperature"), max_tokens=options.get("max_tokens"),
++        tools=options.get("tools"), timeout=aux._effective_aux_timeout(task, options.get("timeout")),
++        extra_body=extra, reasoning_config=options.get("reasoning_config"),
++        base_url=runtime["base_url"], task=task,
++        no_progress_timeout=aux._get_task_no_progress_timeout(task)
++        if isinstance(client, aux.CodexAuxiliaryClient) else None)
++    if options.get("extra_headers"):
++        kwargs["extra_headers"] = dict(options["extra_headers"])
++    aux._set_relay_auxiliary_route(runtime["provider"], runtime["model"], runtime["api_mode"])
++    info = options.get("route_info")
++    if info is not None:
++        info.update(runtime["model_routing"], provider=runtime["provider"], model=runtime["model"])
++    return runtime, client, kwargs
++
++
++def _retryable(exc):
++    from agent import auxiliary_client as aux
++    return any(predicate(exc) for predicate, _ in aux._FALLBACK_REASONS)
++
++
++def _complete(task, runtime, client, kwargs):
++    from agent import auxiliary_client as aux
++    return aux._validate_llm_response(aux._relay_sync_completion(
++        client, kwargs, provider=runtime["provider"], api_mode=runtime["api_mode"],
++        create=lambda request: aux._create_with_progress(
++            client, request, task, force_stream=aux._provider_requires_stream(
++                runtime["provider"], runtime["base_url"]))), task)
++
++
++def _stream(task, runtime, client, kwargs, options):
++    from agent import auxiliary_client as aux
++    try:
++        if aux._client_streams_internally(client):
++            # Native adapters aggregate their SDK stream; expose one normalized
++            # chunk, preserving tool calls, rather than iterating a response object.
++            response = _complete(task, runtime, client, kwargs)
++            choice = response.choices[0]
++            yield SimpleNamespace(choices=[SimpleNamespace(index=0, delta=choice.message,
++                                                           finish_reason=choice.finish_reason)],
++                                  model=runtime["model"], usage=getattr(response, "usage", None))
++        else:
++            kwargs["stream"] = True
++            if options.get("stream_options"):
++                kwargs["stream_options"] = options["stream_options"]
++            yield from aux._relay_sync_stream(client, kwargs, provider=runtime["provider"],
++                                              api_mode=runtime["api_mode"])
++        # Never replay a stream after yielding any output.
++    finally:
++        aux._close_cached_client(client, close_async=True)
++
++
++def class_routed_sync(callback):
++    @wraps(callback)
++    def wrapped(task=None, **options):
++        from agent import auxiliary_client as aux
++        request = _class_request(task, options)
++        if request is None:
++            return callback(task, **options)
++        failed = []
++        while True:
++            runtime, client, kwargs = _prepare(task, options, request, failed)
++            if options.get("stream"):
++                return _stream(task, runtime, client, kwargs, options)
++            try:
++                return _complete(task, runtime, client, kwargs)
++            except Exception as exc:
++                if not _retryable(exc):
++                    raise
++                failed.append((runtime["provider"], runtime["model"]))
++            finally:
++                aux._close_cached_client(client, close_async=True)
++    return wrapped
++
++
++def class_routed_async(callback):
++    @wraps(callback)
++    async def wrapped(task=None, **options):
++        from agent import auxiliary_client as aux
++        request = _class_request(task, options)
++        if request is None:
++            return await callback(task, **options)
++        failed = []
++        while True:
++            runtime, sync_client, kwargs = _prepare(task, options, request, failed)
++            client, _ = aux._to_async_client(sync_client, runtime["model"])
++            try:
++                async def create(request_kwargs):
++                    return await aux._acreate_with_progress(
++                        client, request_kwargs, task, force_stream=aux._provider_requires_stream(
++                            runtime["provider"], runtime["base_url"]))
++                return aux._validate_llm_response(await aux._relay_async_completion(
++                    client, kwargs, provider=runtime["provider"], api_mode=runtime["api_mode"], create=create), task)
++            except Exception as exc:
++                if not _retryable(exc):
++                    raise
++                failed.append((runtime["provider"], runtime["model"]))
++            finally:
++                aux._close_cached_client(client, close_async=True)
++                aux._close_cached_client(sync_client, close_async=True)
++    return wrapped
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index a249b9a235..9f0bb9683f 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -8129,7 +8129,8 @@ def call_llm(
+         if stream and semaphore is not None:
+             stream_semaphore = semaphore
+             semaphore = None
+-            return _release_sync_semaphore_after_stream(response, stream_semaphore)
++            from agent.auxiliary_stream_watchdog import release_sync_semaphore_after_stream
++            return release_sync_semaphore_after_stream(response, stream_semaphore)
+         return response
+     finally:
+         if latency_info is not None:
+@@ -8138,19 +8139,6 @@ def call_llm(
+             semaphore.release()
+ 
+ 
+-def _release_sync_semaphore_after_stream(stream: Any, semaphore: threading.BoundedSemaphore):
+-    """Release a permit only after a streaming response is consumed or closed."""
+-    try:
+-        yield from stream
+-    finally:
+-        try:
+-            close = getattr(stream, "close", None)
+-            if callable(close):
+-                close()
+-        finally:
+-            semaphore.release()
+-
+-
+ def _plan_aux_call(
+     task: Optional[str], *, async_mode: bool, provider: Optional[str], model: Optional[str],
+     base_url: Optional[str], api_key: Optional[str], main_runtime: Optional[dict[str, Any]],
+@@ -8223,6 +8211,10 @@ def _start_recovery_ladder(
+         main_runtime=retry_kwargs["main_runtime"], route_info=route_info)
+ 
+ 
++from agent.auxiliary_class_routing import class_routed_sync, class_routed_async
++
++
++@class_routed_sync
+ def _call_llm_impl(
+     task: str | None = None, *, provider: str | None = None, model: str | None = None, base_url: str | None = None,
+     api_key: str | None = None, main_runtime: Optional[dict[str, Any]] = None, messages: list,
+@@ -8409,6 +8401,7 @@ async def async_call_llm(
+             semaphore.release()
+ 
+ 
++@class_routed_async
+ async def _async_call_llm_impl(
+     task: str | None = None, *, provider: str | None = None, model: str | None = None, base_url: str | None = None,
+     api_key: str | None = None, main_runtime: Optional[dict[str, Any]] = None, messages: list,
+diff --git a/agent/auxiliary_stream_watchdog.py b/agent/auxiliary_stream_watchdog.py
+index f3a6c5abfd..e682f60802 100644
+--- a/agent/auxiliary_stream_watchdog.py
++++ b/agent/auxiliary_stream_watchdog.py
+@@ -17,6 +17,19 @@ from types import SimpleNamespace
+ from typing import Any, Optional
+ 
+ 
++def release_sync_semaphore_after_stream(stream: Any, semaphore: threading.BoundedSemaphore):
++    """Release a permit only after a streaming response is consumed or closed."""
++    try:
++        yield from stream
++    finally:
++        try:
++            close = getattr(stream, "close", None)
++            if callable(close):
++                close()
++        finally:
++            semaphore.release()
++
++
+ def _stream_socket(stream: Any) -> Any:
+     """The raw socket under an SDK chunk stream (``stream.response`` is the ``httpx.Response``)."""
+     from agent.agent_runtime_helpers import _socket_from_response
+diff --git a/tests/agent/test_auxiliary_class_routing.py b/tests/agent/test_auxiliary_class_routing.py
+new file mode 100644
+index 0000000000..e3592f3622
+--- /dev/null
++++ b/tests/agent/test_auxiliary_class_routing.py
+@@ -0,0 +1,117 @@
++"""Auxiliary classes never enter legacy discovery or paid recovery."""
++import asyncio
++from unittest.mock import patch
++
++import pytest
++from agent import auxiliary_client as aux
++from agent.model_routing import ModelRoutingError
++from tests.tui_gateway import test_class_routing as fixtures
++
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++native_transport = fixtures.native_transport
++
++
++@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
++def test_auxiliary_native_wire(mode, routing_home, streaming_route, native_transport):
++    info = {}
++    kwargs = dict(model="class:deep", provider="auto", messages=[{"role": "user", "content": "ok"}],
++                  main_runtime={"session_id": "aux-owner"}, route_info=info, max_tokens=32)
++    with patch.object(aux, "_try_discovery_chain", side_effect=AssertionError("legacy discovery")):
++        if mode == "async":
++            response = asyncio.run(aux.async_call_llm("title", **kwargs))
++        elif mode == "stream":
++            chunks = list(aux.call_llm("title", stream=True, **kwargs))
++            assert "".join(c.choices[0].delta.content or "" for c in chunks) == "ok"
++            response = None
++        else:
++            response = aux.call_llm("title", **kwargs)
++        if response is not None:
++            assert response.choices[0].message.content == "ok"
++    assert info["requested_class"] == "deep"
++    assert info["model"] == "anthropic-deep"
++    assert len(native_transport) == 1
++    url, headers, body = native_transport[0]
++    assert url.startswith("https://api.anthropic.com/")
++    assert headers["authorization"].startswith("Bearer sk-ant-oat")
++    assert "x-api-key" not in headers
++    assert body["model"] == "anthropic-deep"
++
++
++@pytest.mark.parametrize("async_mode", [False, True])
++def test_auxiliary_empty_pool_no_paid_fallback(async_mode, routing_home, streaming_route, monkeypatch):
++    monkeypatch.setattr("agent.credential_pool.CredentialPool.has_available", lambda *a, **k: False)
++    with patch.object(aux, "_try_discovery_chain") as discover, patch.object(aux, "_try_payment_fallback") as paid:
++        with pytest.raises(ModelRoutingError):
++            kwargs = dict(model="class:deep", messages=[{"role": "user", "content": "ok"}])
++            if async_mode:
++                asyncio.run(aux.async_call_llm("title", **kwargs))
++            else:
++                aux.call_llm("title", **kwargs)
++    discover.assert_not_called()
++    paid.assert_not_called()
++
++
++@pytest.mark.parametrize("override", [{"provider": "anthropic"}, {"base_url": "https://other.invalid"},
++                                      {"api_key": "paid"}, {"extra_body": {"model": "paid-model"}},
++                                      {"extra_headers": {"Authorization": "Bearer paid"}}])
++def test_auxiliary_refuses_transport_bypass(override, routing_home, streaming_route, native_transport):
++    with pytest.raises(ModelRoutingError):
++        aux.call_llm("title", model="class:deep", messages=[], **override)
++    assert native_transport == []
++
++
++@pytest.mark.parametrize("failure", [401, 429, "timeout"])
++def test_auxiliary_same_class_recovery_on_wire(failure, routing_home, streaming_route,
++                                               native_transport, monkeypatch, tmp_path):
++    import json
++    import httpx
++    from copy import deepcopy
++    from hermes_cli.config import atomic_config_write
++    second = deepcopy(routing_home["model_routing"]["routes"]["deep"][0])
++    second["model"] = "z-anthropic-deep"
++    routing_home["model_routing"]["routes"]["deep"].append(second)
++    routing_home["auxiliary"] = {"title": {"model": "class:deep", "provider": "auto"}}
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    attempts = []
++    original = httpx.MockTransport.handle_request
++
++    def respond(transport, request):
++        body = json.loads(request.content)
++        attempts.append(body["model"])
++        if body["model"] == "anthropic-deep":
++            if failure == "timeout":
++                raise httpx.ReadTimeout("timed out", request=request)
++            return httpx.Response(failure, json={"type": "error", "error": {
++                "type": "authentication_error" if failure == 401 else "rate_limit_error",
++                "message": "synthetic failure"}}, request=request)
++        return original(transport, request)
++
++    monkeypatch.setattr(httpx.MockTransport, "handle_request", respond)
++    info = {}
++    kwargs = dict(messages=[{"role": "user", "content": "ok"}],
++                  main_runtime={"session_id": "owner"}, route_info=info)
++    with patch.object(aux, "_try_payment_fallback", side_effect=AssertionError("paid bypass")):
++        assert aux.call_llm("title", **kwargs).choices[0].message.content == "ok"
++        assert info["reason"] == "same-class-failover"
++        assert aux.call_llm("title", **kwargs).choices[0].message.content == "ok"
++    assert attempts[0] == "anthropic-deep"
++    assert attempts[-2:] == ["z-anthropic-deep", "z-anthropic-deep"]
++    assert set(attempts) == {"anthropic-deep", "z-anthropic-deep"}
++    assert info["requested_class"] == "deep"
++    assert all(h["authorization"].startswith("Bearer sk-ant-oat") for _, h, _ in native_transport)
++
++
++@pytest.mark.parametrize("capability", ["vision", "json", "context_tokens"])
++def test_auxiliary_capabilities_fail_before_wire(capability, routing_home, streaming_route,
++                                                native_transport, tmp_path):
++    from hermes_cli.config import atomic_config_write
++    caps = routing_home["model_routing"]["routes"]["deep"][0]["capabilities"]
++    caps.update(vision=True, json=True)
++    caps[capability] = 1 if capability == "context_tokens" else False
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}]
++    with pytest.raises(ModelRoutingError):
++        aux.call_llm("title", model="class:deep", messages=messages,
++                     extra_body={"response_format": {"type": "json_object"}})
++    assert native_transport == []
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,8 +1,8 @@
 # Display-only transcript compression
 
-Patch: 0656 (07fb47660c), 0660 (3bb0324ccc).
+Patch: 0666 (07fb47660c), 0670 (3bb0324ccc).
 
-## Cached-click follow-up (0660)
+## Cached-click follow-up (0670)
 
 The sidebar click prepaints cached transcript rows synchronously before routing into the main chat. Already-selected/tiled sessions remain focus-only; asleep rows keep their read-only path. `prepaintClickedTranscript` lives in `apps/desktop/src/app/session/hooks/use-session-actions/provisional-transcript.ts` and is called by the sidebar's `use-offline-fallback.ts`.
 
@@ -26,7 +26,7 @@ The session message route builds a display-only response and optionally gzips it
 
 ## Applying
 
-Apply after 0655. Included to keep the public append contiguous before the card-wait fallback.
+Apply after 0665. Included to keep the public append contiguous before the card-wait fallback.
 
 ## Gotchas
 

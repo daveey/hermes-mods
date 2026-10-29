@@ -1,6 +1,6 @@
 # Replica human asks paint the chat red
 
-Patches **0678** (`3fb26ab729`) and **0679** (`996fd25340`).
+Patches **0687** (`3fb26ab729`) and **0688** (`996fd25340`).
 
 ## Behavior
 
@@ -22,13 +22,13 @@ Sidebar counts read `kanban_chat_links.replica_cards`. That path used to pass `h
 
 ## Tests
 
-0678, `tests/hermes_cli/test_kanban_chat_links.py` and `tests/hermes_cli/test_kanban_session_activity.py`:
+0687, `tests/hermes_cli/test_kanban_chat_links.py` and `tests/hermes_cli/test_kanban_session_activity.py`:
 
 - `test_replica_human_ask_paints_the_chat_blocked`
 - `test_unknown_replica_card_waits_like_a_parked_one`
 - `test_unverified_completion_*` expectation moves from parked 0 to 13
 
-0679, `tests/hermes_cli/test_kanban_chat_links_parity.py`:
+0688, `tests/hermes_cli/test_kanban_chat_links_parity.py`:
 
 - `test_remote_human_ask_with_null_block_kind_counts_blocked_not_open`
 - `test_local_card_and_remote_replica_cards_in_one_lineage`
@@ -37,7 +37,7 @@ This mirror did not re-run those files. The Desktop paint (the red stripe itself
 
 ## Applying
 
-`git am -3` 0678 then 0679. Both touch the replica count path; 0679 is tests only.
+`git am -3` 0687 then 0688. Both touch the replica count path; 0688 is tests only.
 
 ## Gotchas
 

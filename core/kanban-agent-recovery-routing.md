@@ -1,6 +1,6 @@
 # Continuation exhaustion and automatic stops belong to agent recovery
 
-Patches: **0269 0301 0307 0308 0334 0365**.
+Patches: **0269 0301 0307 0308 0334 0370**.
 
 ## Behavior
 
@@ -19,7 +19,7 @@ Automatic give-up, respawn-guard holds, repeated agent-only blocks and impossibl
 | 0307 | Make the exhaustion test's clock-wait control explicitly a pure clock wait; test-only. |
 | 0308 | Preserve approval requests embedded in exhaustion context. |
 | 0334 | Route automatic stop/give-up/guard/dependency-loop paths to agent triage. |
-| 0365 | Preserve budget recovery after agent triage; align lifecycle, scope-failure and park regressions. |
+| 0370 | Preserve budget recovery after agent triage; align lifecycle, scope-failure and park regressions. |
 
 ## Code
 
@@ -33,7 +33,7 @@ Source tests, **not executed in this documentation pass**:
 - `tests/hermes_cli/test_kanban_agent_stop_routing.py`: give-up and guard holds; agent-versus-approval repeated blocks; impossible dependency loops; budget recovery follow-up.
 - `tests/hermes_cli/test_kanban_assignment_routing.py`: human-block preservation after helper moves.
 - `tests/hermes_cli/test_kanban_block_classify.py`, `test_kanban_core_functionality.py`, `test_kanban_db.py`, `test_kanban_quota_guard.py`: automatic-stop integration.
-- `tests/hermes_cli/test_kanban_park_invariants.py`, `test_kanban_review_lifecycle_complete.py`, `test_kanban_worker_exit_trailer.py`, `test_kanban_worker_scope_failure.py`, `test_kanban_worktree_create_validation.py`: 0365 lifecycle expectations.
+- `tests/hermes_cli/test_kanban_park_invariants.py`, `test_kanban_review_lifecycle_complete.py`, `test_kanban_worker_exit_trailer.py`, `test_kanban_worker_scope_failure.py`, `test_kanban_worktree_create_validation.py`: 0370 lifecycle expectations.
 
 Use `bash scripts/run_tests.sh <files>` in the applied isolated checkout. Executed full-series and selected test results are recorded in [mirror verification](mirror-377-verification.md); no live dispatcher exercise or UI verification is claimed here.
 

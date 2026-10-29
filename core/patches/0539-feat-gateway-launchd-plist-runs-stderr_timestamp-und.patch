@@ -1,0 +1,228 @@
+From 4148caceab0a2d300bb116544519941ce829a81b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 16:02:55 -0700
+Subject: [PATCH] feat(gateway): launchd plist runs stderr_timestamp under the
+ installed core-update launcher [daveey]
+
+hermes-sync's core-update gate only proceeds when every gateway LaunchAgent runs under its launcher
+(~/.hermes/bin/hermes-gateway-launcher), but the template knew nothing of it: a hand-repointed plist was
+reverted by refresh_launchd_plist_if_needed at the next update or gateway restart. When the launcher is
+installed under the installation root, generate_launchd_plist now prefixes the stderr_timestamp command
+with [launcher, --home, <home>, --] inside the job's sh -c exec string. Not around the signed-bundle or
+osascript wrapper: those forward no SIGUSR1 and drop the launcher's exec.lock fd. gateway.status skips
+the launcher's own process line like the osascript wrapper's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/status.py                             |  4 +-
+ hermes_cli/gateway_launchd.py                 | 28 ++++++
+ tests/gateway/test_status.py                  |  1 +
+ .../test_status_core_update_launcher.py       | 23 +++++
+ ...st_gateway_launchd_core_update_launcher.py | 95 +++++++++++++++++++
+ 5 files changed, 149 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_status_core_update_launcher.py
+ create mode 100644 tests/hermes_cli/test_gateway_launchd_core_update_launcher.py
+
+diff --git a/gateway/status.py b/gateway/status.py
+index 67c03fe116..1c979d9f8a 100644
+--- a/gateway/status.py
++++ b/gateway/status.py
+@@ -591,8 +591,8 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
+         tokens = [t.lower() for t in cased_tokens]
+         basenames = [t.rsplit("/", 1)[-1] for t in tokens]
+     # The launchd job's osascript wrapper (gateway_launchd.launchd_program_arguments) carries the gateway argv
+-    # inside one JXA script string; the gateway itself is its child and is matched on its own command line.
+-    if basenames[0] == "osascript":
++    # inside one JXA script string ([daveey] the core-update launcher after ``--``); the gateway is matched on its own line.
++    if basenames[0] == "osascript" or "hermes-gateway-launcher" in basenames[:2]:
+         return None
+     # Gateway-dedicated entrypoints carry no subcommand to inspect.
+     if any(t == "gateway/run.py" or t.endswith("/gateway/run.py") for t in tokens):
+diff --git a/hermes_cli/gateway_launchd.py b/hermes_cli/gateway_launchd.py
+index 9f9973503d..71e09cd3c1 100644
+--- a/hermes_cli/gateway_launchd.py
++++ b/hermes_cli/gateway_launchd.py
+@@ -227,6 +227,33 @@ _SIGNED_WRAPPER_SOURCE = (
+ )
+ 
+ 
++# [daveey] Stable core-update launcher that hermes-sync installs outside the mutable checkout (state repo
++# ``hermes-gateway-launcher``, docs/core-update-safety.md). Same name gateway.status skips.
++GATEWAY_LAUNCHER_NAME = "hermes-gateway-launcher"
++
++
++def gateway_launcher_path(hermes_home: str) -> Path:
++    """``<installation root>/bin/hermes-gateway-launcher``: a profile home maps to its root."""
++    home = Path(hermes_home)
++    root = home.parent.parent if home.parent.name == "profiles" else home
++    return root / "bin" / GATEWAY_LAUNCHER_NAME
++
++
++def gateway_launcher_prefix(hermes_home: str) -> list[str]:
++    """[daveey] ``[launcher, --home, <home>, --]`` when the core-update launcher is installed, else ``[]``.
++
++    It goes around ``stderr_timestamp``, inside the job's ``/bin/sh -c exec …`` string, never around the
++    signed-bundle or osascript wrapper: those forward no SIGUSR1 (the launcher's drain request) and spawn
++    ``sh`` without the launcher's ``exec.lock`` fd, so wrapping them would let the updater take LOCK_EX while
++    the gateway still runs. ``stderr_timestamp`` forwards SIGUSR1 to the gateway and exits with its status.
++    Emitting it here keeps ``refresh_launchd_plist_if_needed`` from reverting the bootstrap.
++    """
++    launcher = gateway_launcher_path(hermes_home)
++    if not (launcher.is_file() and os.access(launcher, os.X_OK)):
++        return []
++    return [str(launcher), "--home", hermes_home, "--"]
++
++
+ def launchd_responsible_python() -> Path | None:
+     """[daveey] The Developer-ID-signed Hermes Python.app executable to own the launchd job, if installed."""
+     from hermes_cli._launchers import signed_python_app
+@@ -399,6 +426,7 @@ def generate_launchd_plist() -> str:
+     # [daveey] With Hermes Python.app installed, the signed bundle owns the job instead (TCC attribution).
+     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
+     command = _timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
++    command = [*gateway_launcher_prefix(hermes_home), *command]
+     prog_args = launchd_program_arguments(command, stdout_log, stderr_log, responsible=launchd_responsible_python())
+     prog_args_xml = "\n        ".join(f"<string>{escape(part)}</string>" for part in prog_args)
+ 
+diff --git a/tests/gateway/test_status.py b/tests/gateway/test_status.py
+index d6ea3f0359..93df942f94 100644
+--- a/tests/gateway/test_status.py
++++ b/tests/gateway/test_status.py
+@@ -1852,3 +1852,4 @@ def test_retained_gateway_state_keeps_watchdog_degraded_like_startup_failed():
+     assert status.retained_gateway_state({**watchdog, "desired_state": "stopped"}) == "stopped"
+     assert status.retained_gateway_state({"gateway_state": "degraded", "exit_reason": None}) == "stopped"
+     assert status.retained_gateway_state({"gateway_state": "startup_failed", "exit_reason": "x"}) == "startup_failed"
++
+diff --git a/tests/gateway/test_status_core_update_launcher.py b/tests/gateway/test_status_core_update_launcher.py
+new file mode 100644
+index 0000000000..2a671abe3b
+--- /dev/null
++++ b/tests/gateway/test_status_core_update_launcher.py
+@@ -0,0 +1,23 @@
++"""[daveey] gateway.status never takes the core-update launcher's process line for the gateway."""
++from gateway import status
++
++
++class TestCoreUpdateLauncherIsNotTheGateway:
++    """[daveey] The core-update launcher carries the gateway argv after ``--`` and spawns it; only the
++    gateway's own line may match, or stop/status/update would signal or count the launcher."""
++
++    LAUNCHER = "/Users/u/.hermes/bin/hermes-gateway-launcher"
++    TAIL = ["--home", "/Users/u/.hermes", "--", "/Users/u/.hermes/hermes-agent/.hermes/bin/hermes",
++            "--run-module", "hermes_cli.stderr_timestamp", "--error-log", "/tmp/e.log", "--",
++            "/Users/u/.hermes/hermes-agent/.hermes/bin/hermes", "gateway", "run", "--external-supervisor"]
++
++    def test_launcher_exec_line_is_not_a_gateway(self):
++        assert status.looks_like_gateway_command_line(" ".join([self.LAUNCHER, *self.TAIL])) is False
++
++    def test_launcher_under_interpreter_is_not_a_gateway(self):
++        line = " ".join(["/usr/local/bin/python3", self.LAUNCHER, *self.TAIL])
++        assert status.looks_like_gateway_command_line(line) is False
++
++    def test_gateway_child_line_still_matches(self):
++        line = "/Users/u/.hermes/hermes-agent/.hermes/bin/hermes gateway run --external-supervisor"
++        assert status.looks_like_gateway_command_line(line) is True
+diff --git a/tests/hermes_cli/test_gateway_launchd_core_update_launcher.py b/tests/hermes_cli/test_gateway_launchd_core_update_launcher.py
+new file mode 100644
+index 0000000000..fb79bf91b4
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_launchd_core_update_launcher.py
+@@ -0,0 +1,95 @@
++"""[daveey] The launchd gateway plist runs stderr_timestamp under the installed core-update launcher.
++
++See hermes_cli.gateway_launchd.gateway_launcher_prefix and the state repo's docs/core-update-safety.md.
++"""
++import plistlib
++import shlex
++from pathlib import Path
++
++import hermes_cli.gateway as gateway_cli
++from gateway import status
++from tests.hermes_cli.test_gateway_service import _osascript_exec_argv
++
++
++class TestCoreUpdateLauncherPlist:
++    def _install_launcher(self, tmp_path, mode=0o755):
++        launcher = tmp_path / ".hermes" / "bin" / "hermes-gateway-launcher"
++        launcher.parent.mkdir(parents=True, exist_ok=True)
++        launcher.write_text("#!/usr/bin/env python3\n")
++        launcher.chmod(mode)
++        return launcher
++
++    def _signed_plist_exec_argv(self, tmp_path, monkeypatch):
++        profile_dir = tmp_path / ".hermes"
++        profile_dir.mkdir(parents=True, exist_ok=True)
++        monkeypatch.setattr(Path, "home", lambda: tmp_path)
++        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
++        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
++        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
++        signed = tmp_path / "Applications" / "Hermes Python.app" / "Contents" / "MacOS" / "python3.14"
++        from hermes_cli import gateway_launchd
++        monkeypatch.setattr(gateway_launchd, "launchd_responsible_python", lambda: signed)
++        program_args = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))["ProgramArguments"]
++        assert program_args[:3] == [str(signed), "-I", "-c"]
++        exec_, *argv = shlex.split(program_args[4])
++        assert exec_ == "exec"
++        return profile_dir, argv[:-4]
++
++    def test_launchd_plist_runs_stderr_wrapper_under_installed_core_update_launcher(self, tmp_path, monkeypatch):
++        """[daveey] With the core-update launcher installed, it wraps stderr_timestamp INSIDE the shim's
++        ``sh -c exec`` string (the shim forwards no SIGUSR1 and drops the lock fd), so the template keeps
++        the bootstrap instead of reverting it on the next refresh."""
++        launcher = self._install_launcher(tmp_path)
++        profile_dir, argv = self._signed_plist_exec_argv(tmp_path, monkeypatch)
++
++        assert argv[:4] == [str(launcher.resolve()), "--home", str(profile_dir.resolve()), "--"]
++        assert argv[4] == "/usr/bin/python3"
++        assert any("hermes_cli.stderr_timestamp" in part for part in argv)
++        assert argv[-3:] == ["gateway", "run", "--external-supervisor"]
++        # The launcher's own ps line carries the gateway argv as data: never the gateway itself.
++        assert status.looks_like_gateway_command_line(shlex.join(argv)) is False
++        assert status.looks_like_gateway_command_line(shlex.join(["/usr/bin/python3", *argv])) is False
++
++    def test_launchd_osascript_plist_also_runs_under_installed_launcher(self, tmp_path, monkeypatch):
++        """[daveey] The upstream osascript form gets the same prefix inside its shell command."""
++        launcher = self._install_launcher(tmp_path)
++        profile_dir = tmp_path / ".hermes"
++        monkeypatch.setattr(Path, "home", lambda: tmp_path)
++        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
++        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
++        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
++
++        program_args = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))["ProgramArguments"]
++        argv = _osascript_exec_argv(program_args)
++
++        assert argv[:4] == [str(launcher.resolve()), "--home", str(profile_dir.resolve()), "--"]
++        assert argv[4] == "/usr/bin/python3"
++
++    def test_launchd_profile_plist_uses_installation_root_launcher(self, tmp_path, monkeypatch):
++        """[daveey] A profile's gateway runs under the root's launcher, with its own home for the lock."""
++        launcher = self._install_launcher(tmp_path)
++        profile_dir = tmp_path / ".hermes" / "profiles" / "mybot"
++        profile_dir.mkdir(parents=True)
++        monkeypatch.setattr(Path, "home", lambda: tmp_path)
++        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
++        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
++        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
++
++        program_args = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))["ProgramArguments"]
++        argv = _osascript_exec_argv(program_args)
++
++        assert argv[:4] == [str(launcher.resolve()), "--home", str(profile_dir.resolve()), "--"]
++
++    def test_launchd_plist_without_launcher_keeps_stderr_wrapper_first(self, tmp_path, monkeypatch):
++        """[daveey] No launcher installed (every non-bootstrapped host): the command is unchanged."""
++        _profile_dir, argv = self._signed_plist_exec_argv(tmp_path, monkeypatch)
++
++        assert argv[0] == "/usr/bin/python3"
++        assert "hermes-gateway-launcher" not in " ".join(argv)
++
++    def test_launchd_plist_ignores_non_executable_launcher(self, tmp_path, monkeypatch):
++        """[daveey] A half-installed (non-executable) launcher would fail every launchd spawn: skip it."""
++        self._install_launcher(tmp_path, mode=0o644)
++        _profile_dir, argv = self._signed_plist_exec_argv(tmp_path, monkeypatch)
++
++        assert argv[0] == "/usr/bin/python3"
+-- 
+2.55.0
+

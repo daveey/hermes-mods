@@ -1,0 +1,200 @@
+From 6a72fdf91111de9234cf72ecce54ba904ae32601 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 02:51:03 -0700
+Subject: [PATCH] fix(kanban): heal missing capture-gap child links [daveey]
+ (#154)
+
+---
+ hermes_cli/kanban_sync_client.py            |  39 ++++++-
+ tests/hermes_cli/test_kanban_sync_client.py | 113 ++++++++++++++++++++
+ 2 files changed, 150 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 2a58849c39..6cd13fec2e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -612,6 +612,7 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             if mode == "primary" and sync.refresh_remote_parents(live, replica):
+                 sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+             result.repaired = repair_divergence(live, replica, gateway)
++            repair_missing_children(live, replica, gateway)
+             if mode == "primary":
+                 heal_clobbered_completions(live)
+         finally:
+@@ -1011,13 +1012,47 @@ def diff(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) ->
+             "child_mismatch": children, "rejected_ops": rejected, "foreign_cards": foreign}
+ 
+ 
++def repair_missing_children(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> None:
++    """Heal capture-gap links, including app-assigned uids the NULL-uid install heal cannot find.
++
++    Only absence is evidence here: never overwrite an existing replica child. Equal acknowledged
++    task versions and no outstanding ops distinguish settled local inserts from unpulled work.
++    Serialize the live scan and queue so concurrent rounds cannot enqueue the same row twice.
++    """
++    from hermes_cli.kanban_db_connect import write_txn
++    seen = {r[0]: r[1] for r in shadow.execute(
++        "SELECT id, sync_version FROM tasks WHERE (created_on = ? OR created_on IS NULL) AND sync_version IS NOT NULL",
++        (gateway,))}
++    with write_txn(live):
++        held = {(t, u) for t, u in live.execute(
++            "SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state IN ('pending', 'rejected')")}
++        held |= {(t, u) for t, u in live.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones")}
++        held |= {(t, u) for t, u in shadow.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones")}
++        settled = {r[0] for r in live.execute("SELECT id, sync_version FROM tasks WHERE sync_version IS NOT NULL")
++                   if seen.get(r[0]) == r[1] and ("tasks", r[0]) not in held}
++        for table in ("task_links", "task_chat_links"):
++            remote = _live_uids(shadow, table)
++            for row in live.execute(f"SELECT * FROM {table}").fetchall():
++                uid = _row_uid(table, row)
++                parents = {row["parent_id"], row["child_id"]} if table == "task_links" else {row["task_id"]}
++                if not uid or uid in remote or (table, uid) in held or not parents <= settled:
++                    continue
++                live.execute(
++                    "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++                    "VALUES (?, ?, ?, 'upsert', ?, NULL, '', ?)",
++                    (sync.uuid7(), table, uid, json.dumps(_row_fields(live, table, row)), time.time_ns() // 1_000_000))
++                _log.warning("kanban sync: %s %s absent from the service with nothing in flight "
++                             "(an uncaptured write); re-queued", table, uid)
++
++
+ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, list[str]]:
+     """Queue the local values of this gateway's cards that the service never received.
+ 
+     A card whose live ``sync_version`` equals the replica's, with no outbox op in flight, has seen every service
+     write. Any synced field that still differs was then written locally with no capture trigger, e.g. in the
+-    window while another process re-installed the triggers. The gap heal in ``install_or_remove`` only finds
+-    child rows (they have no uid yet). A task row has no such marker, so this is the only place that finds it.
++    window while another process re-installed the triggers. The install heal only finds NULL-uid children;
++    ``repair_missing_children`` handles settled missing links. A task row has no missing-row marker, so this
++    field comparison is the only place that finds its uncaptured edits.
+     Hub incident 2026-10-28: a ``scheduled -> ready`` wake reached the service as its event but not as its
+     status, and the service refused every lease as ``not_claimable`` for 3 h. Returns {task id: fields queued}."""
+     from hermes_cli.kanban_db_connect import write_txn
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 1e2cef5278..495d28bedf 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -613,6 +613,119 @@ def test_rows_written_in_a_capture_gap_are_queued_on_the_next_install(live, kanb
+         other.close()
+ 
+ 
++def _gap_link(live, table, parent, child):
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        if table == "task_links":
++            uid = f"{parent}>{child}"
++            live.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, child))
++        else:
++            uid = f"{child}:chat-created"
++            live.execute("INSERT INTO task_chat_links "
++                         "(uid, task_id, chat_gateway, chat_session, kind, created_at) "
++                         "VALUES (?, ?, ?, 'session-gap', 'created', 1)", (uid, child, ME))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    return uid
++
++
++@pytest.mark.parametrize("table", ["task_links", "task_chat_links"])
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_missing_child_capture_gap_is_healed_by_a_sync_round(live, svc, kanban_home, caplog, table, mode):
++    sync.set_mode(live, mode)
++    parent = kb.create_task(live, title="parent", assignee="worker")
++    child = kb.create_task(live, title="child", assignee="worker")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    uid = _gap_link(live, table, parent, child)
++    assert not _pending(live)
++    _round(kanban_home, svc)
++    assert uid in svc.board(BOARD)["rows"].get(table, {})
++    assert table in caplog.text and uid in caplog.text and "re-queued" in caplog.text
++    settled = _round(kanban_home, svc)
++    assert settled.push.sent == 0
++    assert sum(table in r.message and uid in r.message and "re-queued" in r.message
++               for r in caplog.records) == 1
++    shadow = _shadow()
++    try:
++        assert ksc.diff(live, shadow, ME)["child_mismatch"] == {}
++    finally:
++        shadow.close()
++
++
++@pytest.mark.parametrize("table", ["task_links", "task_chat_links"])
++@pytest.mark.parametrize("mode", ["shadow", "primary"])
++def test_missing_child_repair_does_not_duplicate_an_inflight_op(live, svc, kanban_home, monkeypatch, table, mode):
++    sync.set_mode(live, mode)
++    parent = kb.create_task(live, title="parent", assignee="worker")
++    child = kb.create_task(live, title="child", assignee="worker")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    uid = _gap_link(live, table, parent, child)
++    hub = svc.hub(ME)
++
++    def no_ack(board, ops):
++        return {"results": []}
++
++    monkeypatch.setattr(hub, "ops", no_ack)
++    for _ in range(2):
++        ksc.sync_board(BOARD, kanban_home / "kanban.db", hub, ME)
++    rows = [r for r in _pending(live) if r["table_name"] == table and r["row_uid"] == uid]
++    assert len(rows) == 1
++    assert json.loads(rows[0]["fields"])["child_id" if table == "task_links" else "task_id"] == child
++
++
++@pytest.mark.parametrize("table", ["task_links", "task_chat_links"])
++@pytest.mark.parametrize("guard", ["pending", "rejected", "local_tombstone", "remote_tombstone",
++                                  "version_ahead", "replica_ahead", "unacknowledged", "foreign", "task_pending",
++                                  "parent_version", "parent_unacknowledged", "parent_pending", "present", "none"])
++def test_missing_child_repair_honors_existing_state(live, svc, kanban_home, table, guard):
++    parent = kb.create_task(live, title="parent", assignee="worker")
++    child = kb.create_task(live, title="child", assignee="worker")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    uid = _gap_link(live, table, parent, child)
++    shadow = _shadow()
++    try:
++        subject = parent if table == "task_links" and guard.startswith("parent_") else child
++        with kbc.write_txn(live), kbc.write_txn(shadow):
++            live.execute("UPDATE kanban_sync_state SET applying = 1")
++            if guard in ("pending", "rejected", "task_pending", "parent_pending"):
++                live.execute("INSERT INTO kanban_sync_outbox "
++                             "(op_id, table_name, row_uid, op, fields, hlc, created_at, state) "
++                             "VALUES ('held-op', ?, ?, 'upsert', '{}', '', 1, ?)",
++                             ("tasks" if guard in ("task_pending", "parent_pending") else table,
++                              subject if guard in ("task_pending", "parent_pending") else uid,
++                              "rejected" if guard == "rejected" else "pending"))
++            elif guard.endswith("tombstone"):
++                target = live if guard == "local_tombstone" else shadow
++                target.execute("INSERT INTO kanban_sync_tombstones VALUES (?, ?, 1)", (table, uid))
++            elif guard in ("version_ahead", "parent_version"):
++                live.execute("UPDATE tasks SET sync_version = sync_version + 1 WHERE id = ?", (subject,))
++            elif guard == "replica_ahead":
++                shadow.execute("UPDATE tasks SET sync_version = sync_version + 1 WHERE id = ?", (child,))
++            elif guard in ("unacknowledged", "parent_unacknowledged"):
++                live.execute("UPDATE tasks SET sync_version = NULL WHERE id = ?", (subject,))
++            elif guard == "foreign":
++                shadow.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (OTHER, child))
++            live.execute("UPDATE kanban_sync_state SET applying = 0")
++        if guard == "present":
++            row = live.execute(f"SELECT * FROM {table}").fetchone()
++            fields = ksc._row_fields(live, table, row)
++            if table == "task_chat_links":
++                fields["released"] = 1  # existing replica differs: never clobber it
++            sync.apply_remote_changes(shadow, [sync.RemoteChange(
++                1, table, uid, "upsert", fields, 1, "", ME)], new_cursor=1, board=BOARD)
++        before = [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox")]
++        ksc.repair_missing_children(live, shadow, ME)
++        after = [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox")]
++        if guard == "none":
++            assert len(after) == 1 and after[0]["row_uid"] == uid
++        else:
++            assert after == before
++    finally:
++        shadow.close()
++
++
+ def _gap_wake(live, tid):
+     """kanban_wake_check._wake landing in a capture gap: a raw status UPDATE plus an event, no trigger."""
+     with kbc.write_txn(live):
+-- 
+2.55.0
+

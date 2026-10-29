@@ -1,0 +1,269 @@
+From 65651a3328565a1dbd2751583eee83556c87dace Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:19:40 +0000
+Subject: [PATCH] fix(kanban): backfill origin/shepherd provenance on legacy
+ hub subs so old observer copies stop spreading [daveey]
+
+Old inheritance wrote each copied sub with the CHILD's creation time, so a copied hermes-hub
+observer on a descendant passed the 120 s origin-binding window and kept spreading. Board open
+now stamps every unstamped 'hub' sub once (stamp_legacy_hub_sub_provenance): a row whose chat
+also sits on a parent or the creator task takes that ancestor's resolved reason, any other row
+is origin when written within the window of its card's creation, else shepherd. A fenced
+(delegated-child) opener skips it; the inherit-time window stays as the fallback.
+
+Dry run on copies of the hub boards: runners 309 rows (92 origin / 217 shepherd; t_82f80db4,
+t_54aa263b, t_f15d182d all shepherd), default 2207 rows (1362 / 845), each under 0.1 s.
+---
+ hermes_cli/kanban_db.py                       | 14 +--
+ hermes_cli/kanban_db_connect.py               |  8 ++
+ hermes_cli/kanban_db_notify.py                | 91 +++++++++++++++++++
+ .../test_kanban_notify_inheritance.py         | 86 ++++++++++++++++++
+ 4 files changed, 190 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 39a0fd7765..6d0dadeab6 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1453,19 +1453,15 @@ def _inherit_notify_subs(
+     )
+ 
+ 
+-# A legacy (unstamped) 'hub' sub written within this many seconds of its card's creation is the origin
+-# binding (``kanban_origin.bind`` runs in the creating tool call); later ones are hermes-hub shepherds. [daveey]
+-LEGACY_ORIGIN_BIND_WINDOW_S = 120
+-
+-
+ def _owning_sub_clause() -> str:
+     """SQL predicate (aliases ``s`` = sub, ``p`` = its task) for a subscription a child inherits.
+ 
+     Stamped provenance (``delivery_metadata.reason``) decides: ``shepherd``/``touch`` are observers and never
+-    inherit; ``create``/``origin`` (and any other value) do. Unstamped rows predate stamping: a 'hub' row is the
+-    origin binding only when written at creation (``LEGACY_ORIGIN_BIND_WINDOW_S``), every other platform keeps
+-    the old inherit-everything behaviour (gateway DM subs carry no reason)."""
+-    from hermes_cli.kanban_db_notify import OBSERVER_SUB_REASONS
++    inherit; ``create``/``origin`` (and any other value) do. Legacy 'hub' rows are stamped once at board open
++    (``kanban_db_notify.stamp_legacy_hub_sub_provenance``); a 'hub' row still unstamped (written by an older
++    process since) counts as the origin binding only when written at creation (``LEGACY_ORIGIN_BIND_WINDOW_S``).
++    Every other unstamped row keeps the old inherit-everything behaviour (gateway DM subs carry no reason)."""
++    from hermes_cli.kanban_db_notify import LEGACY_ORIGIN_BIND_WINDOW_S, OBSERVER_SUB_REASONS
+ 
+     observers = ", ".join(f"'{r}'" for r in OBSERVER_SUB_REASONS)
+     reason = ("CASE WHEN json_valid(s.delivery_metadata) "
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index d7a36b3e45..d99970af67 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1013,6 +1013,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+     ):
+         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
+ 
++    if _table_exists(conn, "kanban_notify_subs") and "delivery_metadata" in _column_names(conn, "kanban_notify_subs"):
++        # Unstamped legacy 'hub' subs get origin/shepherd provenance so inheritance can tell them apart. [daveey]
++        from hermes_cli.kanban_db_notify import stamp_legacy_hub_sub_provenance
++        try:
++            stamp_legacy_hub_sub_provenance(conn)
++        except PermissionError:
++            pass  # a read-only (delegated-child) opener: the next writer stamps; inheritance has a fallback
++
+     _rebuild_drifted_tables(conn)
+ 
+ 
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index 676bb5da7a..62a6eaeaae 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -291,6 +291,97 @@ def remove_notify_sub(
+     return cur.rowcount > 0
+ 
+ 
++# Origin bindings run in the creating call; a legacy (unstamped) 'hub' sub written later than this after its
++# card's creation is a hermes-hub shepherd. Also the fallback for rows still unstamped at inherit time. [daveey]
++LEGACY_ORIGIN_BIND_WINDOW_S = 120
++
++_UNSTAMPED_SQL = ("(CASE WHEN delivery_metadata IS NULL THEN 1 WHEN NOT json_valid(delivery_metadata) THEN 1 "
++                  "WHEN json_type(delivery_metadata) != 'object' THEN 1 "
++                  "WHEN json_extract(delivery_metadata, '$.reason') IS NULL THEN 1 ELSE 0 END) = 1")
++
++
++def stamp_legacy_hub_sub_provenance(conn: sqlite3.Connection) -> int:
++    """One-shot backfill: give every unstamped 'hub' sub a ``reason`` (``origin`` or ``shepherd``). [daveey]
++
++    Before provenance stamping, the origin binding and hermes-hub shepherd subs were both bare 'hub' rows, and
++    inheritance copied them to children with the CHILD's creation time, so a copied observer looked exactly
++    like a fresh origin binding and kept spreading down the program. Resolve each row through the card graph:
++    a row whose chat also sits on one of the card's parents or its creator task is an inherited copy and takes
++    that ancestor's resolved reason; any other row is the card's own, ``origin`` when written within
++    ``LEGACY_ORIGIN_BIND_WINDOW_S`` of the card's creation, else ``shepherd``. Idempotent and cheap once done
++    (no unstamped rows left). Returns the number of rows stamped."""
++    rows = conn.execute(
++        "SELECT s.task_id, s.chat_id, s.thread_id, s.created_at AS sub_at, t.created_at AS task_at "
++        "FROM kanban_notify_subs s LEFT JOIN tasks t ON t.id = s.task_id "
++        f"WHERE s.platform = 'hub' AND {_UNSTAMPED_SQL.replace('delivery_metadata', 's.delivery_metadata')}"
++    ).fetchall()
++    if not rows:
++        return 0
++    pending = {(r["task_id"], r["chat_id"]): r for r in rows}
++    task_ids = sorted({r["task_id"] for r in rows})
++    ancestors: dict[str, set[str]] = {}
++
++    def _ancestors(task_id: str) -> set[str]:
++        if task_id not in ancestors:
++            found = {r[0] for r in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,))}
++            for (payload,) in conn.execute(
++                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' ORDER BY id LIMIT 1",
++                    (task_id,)):
++                try:
++                    creator = (json.loads(payload or "{}") or {}).get("creator_task_id")
++                except (TypeError, ValueError, AttributeError):
++                    creator = None
++                if creator:
++                    found.add(str(creator))
++            found.discard(task_id)
++            ancestors[task_id] = found
++        return ancestors[task_id]
++
++    resolved: dict[tuple[str, str], str] = {}
++
++    def _stamped(task_id: str, chat_id: str) -> Optional[str]:
++        row = conn.execute(
++            "SELECT delivery_metadata FROM kanban_notify_subs WHERE task_id = ? AND platform = 'hub' AND chat_id = ? "
++            "ORDER BY thread_id LIMIT 1", (task_id, chat_id)).fetchone()
++        if row is None:
++            return None
++        return _decode_notify_delivery_metadata(row["delivery_metadata"]).get("reason") or "origin"
++
++    def _resolve(task_id: str, chat_id: str, seen: frozenset) -> Optional[str]:
++        key = (task_id, chat_id)
++        if key in resolved:
++            return resolved[key]
++        if key not in pending:
++            return _stamped(task_id, chat_id)
++        inherited = [reason for anc in sorted(_ancestors(task_id)) if anc not in seen
++                     for reason in [_resolve(anc, chat_id, seen | {task_id})] if reason is not None]
++        if inherited:
++            reason = "origin" if any(r in OWNING_SUB_REASONS for r in inherited) else "shepherd"
++        else:
++            row = pending[key]
++            bound_at_creation = (row["task_at"] is not None and row["sub_at"] is not None
++                                 and int(row["sub_at"]) <= int(row["task_at"]) + LEGACY_ORIGIN_BIND_WINDOW_S)
++            reason = "origin" if bound_at_creation else "shepherd"
++        resolved[key] = reason
++        return reason
++
++    with _kb.write_txn(conn, allow_nested=True):
++        for task_id in task_ids:
++            for (tid, chat_id) in [k for k in pending if k[0] == task_id]:
++                _resolve(tid, chat_id, frozenset())
++        for (task_id, chat_id), reason in resolved.items():
++            conn.execute(
++                "UPDATE kanban_notify_subs SET delivery_metadata = CASE "
++                "WHEN delivery_metadata IS NULL THEN json_object('reason', ?) "
++                "WHEN NOT json_valid(delivery_metadata) THEN json_object('reason', ?) "
++                "WHEN json_type(delivery_metadata) = 'object' THEN json_set(delivery_metadata, '$.reason', ?) "
++                "ELSE json_object('reason', ?) END "
++                f"WHERE task_id = ? AND platform = 'hub' AND chat_id = ? AND {_UNSTAMPED_SQL}",
++                (reason, reason, reason, reason, task_id, chat_id),
++            )
++    return len(rows)
++
++
+ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int = 30) -> int:
+     """Delete notify subs whose task sat in ``done``/``blocked`` untouched for
+     longer than ``max_age_days`` (``<= 0`` disables); returns rows deleted.
+diff --git a/tests/hermes_cli/test_kanban_notify_inheritance.py b/tests/hermes_cli/test_kanban_notify_inheritance.py
+index 0197c31173..5fb0d30d07 100644
+--- a/tests/hermes_cli/test_kanban_notify_inheritance.py
++++ b/tests/hermes_cli/test_kanban_notify_inheritance.py
+@@ -156,3 +156,89 @@ def test_resubscribe_never_downgrades_an_owning_sub(kanban_home):
+         assert _reasons(conn, parent) == {"creator": "create", "macbook/default/origin": "origin", "t": "shepherd"}
+     finally:
+         conn.close()
++
++
++def _legacy_hub(conn, task_id, chat, at):
++    conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, created_at) "
++                 "VALUES (?, 'hub', ?, '', ?)", (task_id, chat, at))
++
++
++@pytest.mark.parametrize("edge", ["creator", "link"])
++def test_backfill_stops_legacy_observer_copies_spreading(kanban_home, edge):
++    """Old inheritance copied a grandparent's hub observer onto the parent with the PARENT's creation time, so
++    the copy looked like a fresh origin binding. The board-open backfill resolves copies through the graph."""
++    conn = kbc.connect()
++    try:
++        grand = kb.create_task(conn, title="program", assignee="default")
++        g_at = kb.get_task(conn, grand).created_at
++        _legacy_hub(conn, grand, "macbook/default/origin", g_at)
++        _legacy_hub(conn, grand, "macbook/default/observer", g_at + 3600)
++        if edge == "creator":
++            parent = kb.create_task(conn, title="worker fan-out", assignee="w", creator_task_id=grand)
++        else:
++            parent = kb.create_task(conn, title="linked", assignee="w")
++            kb.link_tasks(conn, grand, parent)
++        p_at = kb.get_task(conn, parent).created_at
++        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (parent,))
++        for chat in ("macbook/default/origin", "macbook/default/observer"):  # what the old code wrote
++            _legacy_hub(conn, parent, chat, p_at)
++        _legacy_hub(conn, parent, "macbook/default/late", p_at + 600)  # a shepherd of the parent itself
++        conn.commit()
++    finally:
++        conn.close()
++    kb.init_db()  # board open re-runs the migration pass
++    conn = kbc.connect()
++    try:
++        assert _reasons(conn, grand) == {"macbook/default/origin": "origin", "macbook/default/observer": "shepherd"}
++        assert _reasons(conn, parent) == {"macbook/default/origin": "origin", "macbook/default/observer": "shepherd",
++                                          "macbook/default/late": "shepherd"}
++        child = kb.create_task(conn, title="next", assignee="w", creator_task_id=parent)
++        assert _sub_keys(conn, child) == [("hub", "macbook/default/origin")]
++        assert kbn.stamp_legacy_hub_sub_provenance(conn) == 0  # idempotent: nothing left unstamped
++    finally:
++        conn.close()
++
++
++def test_backfill_keeps_existing_metadata_and_skips_stamped_rows(kanban_home):
++    conn = kbc.connect()
++    try:
++        task = kb.create_task(conn, title="t", assignee="default")
++        at = kb.get_task(conn, task).created_at
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, created_at, "
++                     "delivery_metadata) VALUES (?, 'hub', 'gw/p/a', '', ?, '{\"guild_id\": \"g\"}')", (task, at))
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, created_at, "
++                     "delivery_metadata) VALUES (?, 'hub', 'gw/p/b', '', ?, 'not json')", (task, at + 999))
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, created_at, "
++                     "delivery_metadata) VALUES (?, 'hub', 'gw/p/c', '', ?, '{\"reason\": \"shepherd\"}')", (task, at))
++        conn.commit()
++        assert kbn.stamp_legacy_hub_sub_provenance(conn) == 2
++        subs = {s["chat_id"]: s["delivery_metadata"] for s in kbn.list_notify_subs(conn, task)}
++        assert subs == {"gw/p/a": {"guild_id": "g", "reason": "origin"}, "gw/p/b": {"reason": "shepherd"},
++                        "gw/p/c": {"reason": "shepherd"}}
++    finally:
++        conn.close()
++
++
++def test_board_open_survives_a_fenced_backfill(kanban_home, monkeypatch):
++    """A delegated-child opener may not write: the backfill's PermissionError must not fail board open, and
++    inheritance still drops a late unstamped hub row through its creation-window fallback."""
++    conn = kbc.connect()
++    try:
++        parent = kb.create_task(conn, title="p", assignee="default")
++        _legacy_hub(conn, parent, "gw/p/late", kb.get_task(conn, parent).created_at + 3600)
++        conn.commit()
++    finally:
++        conn.close()
++
++    def fenced(_conn):
++        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
++
++    monkeypatch.setattr("hermes_cli.kanban_db_notify.stamp_legacy_hub_sub_provenance", fenced)
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        assert _reasons(conn, parent) == {"gw/p/late": None}
++        child = kb.create_task(conn, title="c", assignee="w", creator_task_id=parent)
++        assert _sub_keys(conn, child) == []
++    finally:
++        conn.close()
+-- 
+2.55.0
+

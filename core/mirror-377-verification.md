@@ -12,7 +12,7 @@ The full ordered non-merge range was regenerated, existing privacy substitutions
 git am -3 --empty=keep /path/to/hermes-mods/core/patches/*.patch
 ```
 
-Nine explicit empty duplicate envelopes preserve source identities: 0314, 0318–0321, 0332–0333, 0353–0354. They must not be silently dropped. Reconnect duplicates match earlier0309/0310/0315/0317; deadline duplicates match0257/0263/0348; Nix0353 matches0347. Stable patch IDs verified the repeated diffs;0314 repeats the already-present AutomatedRow type field.
+Nine explicit empty duplicate envelopes preserve source identities: 0314, 0318, 0319, 0320, 0321, 0332, 0333, 0354, 0355. They must not be silently dropped. Reconnect duplicates match earlier0309/0310/0315/0317; deadline duplicates match0257/0263/0349; Nix0353 matches0347. Stable patch IDs verified the repeated diffs;0314 repeats the already-present AutomatedRow type field.
 
 ## Merge adaptations
 

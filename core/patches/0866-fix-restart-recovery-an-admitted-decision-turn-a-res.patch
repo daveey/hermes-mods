@@ -1,0 +1,452 @@
+From 0ee4afb4bf1d90bec5434c684eebabb66208ae40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:21:11 +0000
+Subject: [PATCH] fix(restart recovery): an admitted decision turn a restart
+ stops before its first tool is continued at boot; sweep logs every skipped
+ marker; restart failed-turn copy [daveey]
+
+Self-heal desktop-3a6213ce74: prompt admission dispatched with auto_continue=False, so a hub update that
+restarted the backend 15 s into an approved For-you decision left a marker the boot sweep skipped silently,
+and the chat said 'Send it again' with no button left. The admitted turn's marker now stays
+auto-continuable until its first tool starts (mark_turn_tool_started flips it off before the tool runs,
+keeping at-most-once execution); startup_resume logs each skipped marker with its reason; a failed turn
+stopped by backend_exit before any tool says it continues automatically.
+---
+ agent/conversation_loop.py                    |  9 ++-
+ agent/turn_failure_copy.py                    | 16 +++-
+ tests/agent/test_failed_decision_turn_copy.py | 47 +++++++++++
+ .../test_admission_restart_resume.py          | 80 +++++++++++++++++++
+ tests/tui_gateway/test_prompt_admission.py    |  7 +-
+ tui_gateway/methods_prompt_admission.py       |  7 +-
+ tui_gateway/prompt_turn.py                    |  7 +-
+ tui_gateway/session_auto_continue.py          |  2 +
+ tui_gateway/startup_resume.py                 | 29 +++++--
+ tui_gateway/tool_progress.py                  |  5 ++
+ tui_gateway/turn_marker.py                    | 22 ++++-
+ 11 files changed, 213 insertions(+), 18 deletions(-)
+ create mode 100644 tests/agent/test_failed_decision_turn_copy.py
+ create mode 100644 tests/tui_gateway/test_admission_restart_resume.py
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index d5b961dfa1..6279a12dc1 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1815,6 +1815,12 @@ def _redact_display_metadata(metadata: dict) -> dict:
+     return {k: _redact(v) for k, v in metadata.items()}
+ 
+ 
++def _stopped_by_backend_exit(agent, result: dict) -> bool:
++    """[daveey] The turn was interrupted by the backend shutting down (``_stop_turns_before_exit``)."""
++    return (getattr(agent, "_tool_interrupt_reason", None) == "backend_exit"
++            or "(backend_exit)" in str(result.get("turn_exit_reason") or ""))
++
++
+ def _close_durable_failed_turn(agent, result: Any) -> None:
+     """Append a Hermes-authored assistant boundary when a failed turn left ``user`` as the
+     durable conversation tail (in place, on ``result["messages"]`` and in SessionDB).
+@@ -1851,7 +1857,8 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
+         start = result.get("current_turn_user_idx")
+         turn_messages = messages[start:] if isinstance(start, int) and 0 <= start < len(messages) else messages
+         boundary = {
+-            "role": "assistant", "content": failed_turn_notice(turn_messages), "display_kind": FAILED_TURN_DISPLAY_KIND,
++            "role": "assistant", "display_kind": FAILED_TURN_DISPLAY_KIND,
++            "content": failed_turn_notice(turn_messages, restarted=_stopped_by_backend_exit(agent, result)),
+         }
+         if failure := _failed_turn_display_metadata(agent, result):
+             boundary["display_metadata"] = failure
+diff --git a/agent/turn_failure_copy.py b/agent/turn_failure_copy.py
+index 73b36815a6..d37d05252e 100644
+--- a/agent/turn_failure_copy.py
++++ b/agent/turn_failure_copy.py
+@@ -43,6 +43,13 @@ PARTIAL_FAILED_TURN_NOTICE = (
+     "This turn did not complete. Some actions may already have run; verify their effects "
+     "before resending."
+ )
++# [daveey] A backend restart (``backend_exit``) stopped the turn before any tool ran: restart recovery
++# continues it (auto-continue / the boot sweep), and a For-you decision has no button left to press, so
++# "Send it again" would be wrong advice (self-heal desktop-3a6213ce74).
++RESTART_FAILED_TURN_NOTICE = (
++    "Hermes restarted before this turn finished. It continues automatically once the backend is back; "
++    "send it again only if nothing happens within a few minutes."
++)
+ # ``messages.display_kind`` of that row: display-only (stripped before every provider request),
+ # so renderers show a Hermes notice and room pollers never read it as the model's reply.
+ FAILED_TURN_DISPLAY_KIND = "failed_turn"
+@@ -52,20 +59,21 @@ def untyped_failed_turn_display_kind(role: Any, content: Any) -> Optional[str]:
+     """``FAILED_TURN_DISPLAY_KIND`` for a boundary row persisted before the closers typed it
+     (exact notice text, so a real reply quoting it stays a reply); read-side only."""
+     if role == "assistant" and isinstance(content, str) and content.strip() in (
+-        FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE,
++        FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, RESTART_FAILED_TURN_NOTICE,
+     ):
+         return FAILED_TURN_DISPLAY_KIND
+     return None
+ 
+ 
+-def failed_turn_notice(turn_messages: Any) -> str:
+-    """Boundary copy for a failed turn: never claim "not processed" when a tool may have run."""
++def failed_turn_notice(turn_messages: Any, *, restarted: bool = False) -> str:
++    """Boundary copy for a failed turn: never claim "not processed" when a tool may have run. ``restarted``:
++    the turn was stopped by a backend restart, whose recovery continues a turn that ran no tool."""
+     for row in turn_messages or ():
+         if isinstance(row, dict) and (
+             row.get("role") == "tool" or (row.get("role") == "assistant" and row.get("tool_calls"))
+         ):
+             return PARTIAL_FAILED_TURN_NOTICE
+-    return FAILED_TURN_NOTICE
++    return RESTART_FAILED_TURN_NOTICE if restarted else FAILED_TURN_NOTICE
+ 
+ 
+ def provider_label_for(provider: Any) -> str:
+diff --git a/tests/agent/test_failed_decision_turn_copy.py b/tests/agent/test_failed_decision_turn_copy.py
+new file mode 100644
+index 0000000000..be900a1fc8
+--- /dev/null
++++ b/tests/agent/test_failed_decision_turn_copy.py
+@@ -0,0 +1,47 @@
++"""A turn a backend restart stopped before any tool ran must not tell the user to "Send it again".
++
++Regression for self-heal desktop-3a6213ce74: an approved For-you decision was cut off by a hub update
++restart (``backend_exit``) during the model wait. The boundary row said "Your request was not processed.
++Send it again", but the decision tile was already closed and the restart recovery continues the turn.
++"""
++from types import SimpleNamespace
++
++from agent.turn_failure_copy import (
++    FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, RESTART_FAILED_TURN_NOTICE,
++    failed_turn_notice, untyped_failed_turn_display_kind,
++)
++
++DECISION = [{"role": "user", "content": "Canonical user decision. Act only on the frozen revision below."}]
++
++
++def test_failed_decision_turn_copy():
++    notice = failed_turn_notice(DECISION, restarted=True)
++    assert notice == RESTART_FAILED_TURN_NOTICE
++    assert "Send it again" not in notice and "automatically" in notice
++    # A restored transcript still types the row as a Hermes boundary, not a model reply.
++    assert untyped_failed_turn_display_kind("assistant", notice) == FAILED_TURN_DISPLAY_KIND
++
++
++def test_restart_after_a_tool_ran_keeps_the_partial_copy():
++    ran = DECISION + [{"role": "assistant", "tool_calls": [{"id": "c1"}]}, {"role": "tool", "content": "ok"}]
++    assert failed_turn_notice(ran, restarted=True) == PARTIAL_FAILED_TURN_NOTICE
++
++
++def test_other_failures_keep_send_it_again():
++    assert failed_turn_notice(DECISION) == FAILED_TURN_NOTICE
++
++
++def test_close_durable_failed_turn_detects_backend_exit(monkeypatch):
++    from agent import conversation_loop as cl
++    rows = []
++
++    class DB:
++        def latest_conversation_role(self, _sid):
++            return "user"
++
++    agent = SimpleNamespace(_session_db=DB(), session_id="s", _persist_disabled=False, provider="", model="",
++                            _tool_interrupt_reason="backend_exit",
++                            _flush_messages_to_session_db=lambda msgs: rows.extend(msgs))
++    monkeypatch.setattr(cl, "_failed_turn_display_metadata", lambda *a: {})
++    cl._close_durable_failed_turn(agent, {"completed": False, "interrupted": True, "messages": list(DECISION)})
++    assert rows[-1]["content"] == RESTART_FAILED_TURN_NOTICE
+diff --git a/tests/tui_gateway/test_admission_restart_resume.py b/tests/tui_gateway/test_admission_restart_resume.py
+new file mode 100644
+index 0000000000..93a82589ab
+--- /dev/null
++++ b/tests/tui_gateway/test_admission_restart_resume.py
+@@ -0,0 +1,80 @@
++"""An admitted decision whose turn a backend restart stops before any tool ran is continued at the next boot.
++
++Regression for self-heal desktop-3a6213ce74: a hub update restarted the backend 15 s into an approved For-you
++decision (model wait, no tool call). The admission turn recorded its crash marker with ``auto_continue: false``,
++so the boot sweep skipped it without a log line and the approval was lost. A decision turn now stays
++continuable until its first tool starts; after that, at-most-once execution keeps it out of auto-continue.
++"""
++import json
++import logging
++
++import pytest
++
++from tests.tui_gateway.test_prompt_admission import call, owner
++from tui_gateway import server
++from tui_gateway import startup_resume as sr
++from tui_gateway.turn_marker import _marker_path
++
++DEAD_PID = 2 ** 22 - 3
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++
++
++def _start_admitted_turn(session, params, monkeypatch):
++    """prompt.admit, then run its dispatch the way ``_run_after_agent_ready`` -> ``_run_prompt_submit`` records
++    the turn marker (prompt_turn.py: ``_record_turn_marker(session, text, auto_continue=...)``)."""
++    def run(rid, sid, sess, text, *args, **kw):
++        server._record_turn_marker(sess, text, auto_continue=kw.get("auto_continue", True))
++    monkeypatch.setattr(server, "_run_after_agent_ready", run)
++    assert "result" in call("prompt.admit", params)
++
++
++def _backend_exit(session):
++    """What ``_stop_turns_before_exit`` + the interrupted turn's terminal frame do, then the process dies."""
++    session["_exit_keeps_turn_marker"] = True
++    server._retire_turn_marker(session)
++    path = _marker_path(server._session_home(session))
++    entries = json.loads(path.read_text())
++    for entry in entries.values():
++        entry["writer_pid"] = DEAD_PID
++        entry.pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++    return path.parent.parent
++
++
++def test_backend_exit_marker_survives_and_boot_sweep_continues(owner, monkeypatch):
++    _db, session, params, started = owner
++    _start_admitted_turn(session, params, monkeypatch)
++    started[0]()
++    home = _backend_exit(session)
++    pending = sr.pending_resumes(home, CFG)
++    assert [r["session_key"] for r in pending] == [params["stored_session_id"]]
++
++
++def test_admitted_turn_is_not_continued_once_a_tool_started(owner, monkeypatch, caplog):
++    _db, session, params, started = owner
++    _start_admitted_turn(session, params, monkeypatch)
++    started[0]()
++    sid = next(s for s, v in server._sessions.items() if v is session)
++    server._on_tool_start(sid, "call-1", "terminal", {"command": "true"})
++    home = _backend_exit(session)
++    with caplog.at_level(logging.INFO, logger="tui_gateway.startup_resume"):
++        assert sr.pending_resumes(home, CFG) == []
++    assert any("skipped" in r.getMessage() and params["stored_session_id"] in r.getMessage()
++               and "auto_continue off" in r.getMessage() for r in caplog.records), caplog.text
++
++
++@pytest.mark.parametrize("why,entry,needle", [
++    ("stale", {"age": 9 * 3600}, "older than"),
++    ("capped", {"attempts": 2}, "attempt cap"),
++])
++def test_boot_sweep_logs_every_skipped_marker(tmp_path, caplog, why, entry, needle):
++    import time
++    m = {"prompt": "p", "started_at": time.time() - entry.get("age", 60), "attempts": entry.get("attempts", 0),
++         "auto_continue": True, "writer_pid": DEAD_PID}
++    p = _marker_path(tmp_path)
++    p.parent.mkdir(parents=True)
++    p.write_text(json.dumps({why: m}))
++    with caplog.at_level(logging.INFO, logger="tui_gateway.startup_resume"):
++        assert sr.pending_resumes(tmp_path, CFG) == []
++    assert any(why in r.getMessage() and needle in r.getMessage() for r in caplog.records), caplog.text
+diff --git a/tests/tui_gateway/test_prompt_admission.py b/tests/tui_gateway/test_prompt_admission.py
+index 1a6a7d1f4b..8930df72e1 100644
+--- a/tests/tui_gateway/test_prompt_admission.py
++++ b/tests/tui_gateway/test_prompt_admission.py
+@@ -104,7 +104,7 @@ def test_crash_after_commit_does_not_reexecute(owner, monkeypatch):
+     assert db.get_messages(params["stored_session_id"]) == []
+ 
+ 
+-def test_turn_adopts_admission_row_without_duplicate_and_disables_recovery(owner, monkeypatch):
++def test_turn_adopts_admission_row_without_duplicate_and_limits_recovery_to_no_tool_turns(owner, monkeypatch):
+     from tests.tui_gateway.test_submit_time_user_row import _flush_agent
+     from agent.turn_context import _stage_turn_user_message
+     db, session, params, started = owner
+@@ -113,7 +113,10 @@ def test_turn_adopts_admission_row_without_duplicate_and_disables_recovery(owner
+     recorded = []
+     monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **kw: recorded.append(kw))
+     started[0]()
+-    assert recorded == [{"auto_continue": False}]
++    # Dispatch never replays; the turn stays continuable only until its first tool starts
++    # (test_admission_restart_resume.py proves both halves).
++    assert recorded == [{"auto_continue": True}]
++    assert session.get("_marker_until_tool") is True
+     agent = _flush_agent(db, params["stored_session_id"])
+     server._adopt_submit_user_row(session, agent, params["text"], params["text"])
+     msg, _ = _stage_turn_user_message(agent, params["text"], params["text"], None, None, None, None)
+diff --git a/tui_gateway/methods_prompt_admission.py b/tui_gateway/methods_prompt_admission.py
+index 88fae83b58..a82790439f 100644
+--- a/tui_gateway/methods_prompt_admission.py
++++ b/tui_gateway/methods_prompt_admission.py
+@@ -123,7 +123,12 @@ def _dispatch(server, rid, sid, session, text, profile):
+         # Only the committed transaction winner projects this row, before any
+         # model output. An unstarted cancellation must never paint permission.
+         server._emit("message.admitted", sid, user_event)
+-        server._run_after_agent_ready(rid, sid, session, text, None, None, None, auto_continue=False)
++        # Dispatch is never replayed, but a turn a restart stops BEFORE its first tool ran has done nothing
++        # irreversible: its marker stays auto-continuable until then (turn_marker.mark_turn_tool_started), so the
++        # next boot continues the decision instead of dropping it (self-heal desktop-3a6213ce74).
++        with session["history_lock"]:
++            session["_marker_until_tool"] = True
++        server._run_after_agent_ready(rid, sid, session, text, None, None, None, auto_continue=True)
+ 
+     worker = server._start_session_work(run, name="prompt-admission", session=session)
+     if worker is None:
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 0c5f39d864..7272f65fe6 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -256,6 +256,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     marker_text = session.pop("_auto_continue_prompt", None) or text
+     session.pop("_paused_marker_carried", None)
+     synthesized = session.pop("_synthesized_turn", False)
++    until_tool = bool(session.pop("_marker_until_tool", False))
+     # [daveey] A core-update pause kept the previous turn's marker; this turn owns (and retires) its own.
+     session.pop("_update_pause_marker_key", None)
+     if not synthesized:  # the continuation (or a typed message) started: automatic turns may run again
+@@ -265,8 +266,12 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     if isinstance(marker_text, str) and marker_text.strip():
+         with session["history_lock"]:
+             session["_active_turn_marker_key"] = marker_key
++            # [daveey] _on_tool_start switches an at-most-once turn's marker off before its first tool runs.
++            session["_until_tool_marker_key"] = marker_key if until_tool and auto_continue else ""
+         record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
+-                          auto_continue=auto_continue, **({"killed_jobs": killed_jobs} if killed_jobs else {}),
++                          auto_continue=auto_continue,
++                          **({"until_tool": True} if until_tool and auto_continue else {}),
++                          **({"killed_jobs": killed_jobs} if killed_jobs else {}),
+                           **({"pauses": marker_pauses} if marker_pauses else {}),
+                           **({"notification_category": "diagnostic"}
+                              if notification_category == "diagnostic" else {}))
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 4d420736df..c6eee151a0 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -230,6 +230,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+             session["_auto_continue_attempt"], session["_auto_continue_prompt"] = attempt, marker["prompt"]
+             session["_auto_continue_pauses"] = pauses
+             session["_auto_continue_killed_jobs"] = marker.get("killed_jobs", [])
++            # [daveey] A continued at-most-once turn keeps the contract: off again at its first tool.
++            session["_marker_until_tool"] = bool(marker.get("until_tool"))
+         try:
+             from gateway.warning_notifications import render_notification
+             diagnostic = marker.get("notification_category") == "diagnostic"
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index 9c5894e598..c6fb30fa73 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -69,7 +69,23 @@ def _homes(home: Path) -> list[tuple[str | None, Path]]:
+     return out
+ 
+ 
+-def pending_resumes(home: Path, cfg: dict | None, *, now: float | None = None) -> list[dict[str, Any]]:
++def _skip_reason(m: dict | None, now: float, fresh: float, max_attempts: int) -> str | None:
++    """Why the sweep leaves this marker alone, or None when it resumes it."""
++    if m is None:
++        return "unreadable or empty prompt"
++    if not m.get("auto_continue", True):
++        return "auto_continue off (a tool already ran in an at-most-once turn, or its owner recovers it)"
++    if now - m["started_at"] > _max_age(m, fresh):
++        return f"older than the {_max_age(m, fresh) / 60:.0f} min freshness window"
++    if m["attempts"] >= max_attempts:
++        return f"attempt cap reached ({m['attempts']}/{max_attempts})"
++    if marker_writer_state(m) == "alive":
++        return f"writer pid {m.get('writer_pid')} is still alive"
++    return None
++
++
++def pending_resumes(home: Path, cfg: dict | None, *, now: float | None = None,
++                    log_skips: bool = True) -> list[dict[str, Any]]:
+     """Markers the sweep would resume: fresh, auto-continuable, under the attempt cap, writer process gone."""
+     _, fresh, max_attempts, _ = _settings(cfg)
+     now = time.time() if now is None else now
+@@ -77,12 +93,11 @@ def pending_resumes(home: Path, cfg: dict | None, *, now: float | None = None) -
+     for profile, h in _homes(home):
+         for key in list(_load(_marker_path(h))):
+             m = read_turn_marker(h, key)
+-            if m is None or not m.get("auto_continue", True):
++            # [daveey] Every skip is logged with its reason: a silent skip hid a lost decision (desktop-3a6213ce74).
++            if (why := _skip_reason(m, now, fresh, max_attempts)) is not None:
++                if log_skips:
++                    logger.info("startup resume: marker %s (profile=%s) skipped: %s", key, profile or "default", why)
+                 continue
+-            if now - m["started_at"] > _max_age(m, fresh) or m["attempts"] >= max_attempts:
+-                continue
+-            if marker_writer_state(m) == "alive":
+-                continue  # a live sibling backend owns this turn
+             out.append({"profile": profile, "home": str(h), "session_key": key, "started_at": m["started_at"]})
+     out.sort(key=lambda r: r["started_at"], reverse=True)
+     return out
+@@ -92,7 +107,7 @@ def resume_interrupted_sessions(resume: Callable[[str, dict], Any], home: Path,
+                                 *, paused_only: bool = False) -> list[dict]:
+     """Call ``resume(rid, params)`` (the ``session.resume`` handler) for each pending marker; returns outcomes."""
+     results = []
+-    for row in pending_resumes(home, cfg):
++    for row in pending_resumes(home, cfg, log_skips=not paused_only):
+         if paused_only and (read_turn_marker(row["home"], row["session_key"]) or {}).get("reason") not in _RETRY_REASONS:
+             continue
+         # [daveey] No client is attached: run as the session's stored source, not this process's env default.
+diff --git a/tui_gateway/tool_progress.py b/tui_gateway/tool_progress.py
+index b2b0339901..485035b1d9 100644
+--- a/tui_gateway/tool_progress.py
++++ b/tui_gateway/tool_progress.py
+@@ -285,6 +285,11 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
+             if snapshot is not None:
+                 session.setdefault("edit_snapshots", {})[tool_call_id] = snapshot
+         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
++        if until_key := session.pop("_until_tool_marker_key", ""):
++            # [daveey] Before the tool runs: a restart from here on may leave a side effect, so no auto-continue.
++            with contextlib.suppress(Exception):
++                from tui_gateway.turn_marker import mark_turn_tool_started
++                mark_turn_tool_started(_session_home(session), until_key)
+         # A preview prepared for an earlier call whose completion never fired (failed
+         # flush) must not attach to a provider that reuses the same call id.
+         session.setdefault("tool_result_metadata", {}).pop(tool_call_id, None)
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 13946684c5..509d390065 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -116,11 +116,12 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> bool:
+ 
+ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
+                       auto_continue: bool = True, notification_category: str | None = None,
+-                      pauses: int = 0, killed_jobs: list | None = None) -> None:
++                      pauses: int = 0, killed_jobs: list | None = None, until_tool: bool = False) -> None:
+     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
+     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume.
+     ``pauses`` = core-update pauses this logical turn already took (``mark_turn_paused``), counted apart
+-    from crash attempts so a pause never uses one up."""
++    from crash attempts so a pause never uses one up. ``until_tool`` [daveey]: the turn is continuable only
++    until its first tool starts (``mark_turn_tool_started``); used by at-most-once admitted decisions."""
+     if not session_key or not prompt:
+         return
+     now = time.time()
+@@ -130,6 +131,8 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
+         entry["killed_jobs"] = list(killed_jobs)
+     if pauses:
+         entry["pauses"] = max(0, int(pauses))
++    if until_tool:
++        entry["until_tool"] = True
+     if notification_category == "diagnostic":
+         entry["notification_category"] = notification_category
+     # Identity only — never the prompt: this log is read on crash triage and must not carry turn content.
+@@ -143,6 +146,20 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
+         _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
+ 
+ 
++def mark_turn_tool_started(home: Path | str, session_key: str) -> bool:
++    """[daveey] An ``until_tool`` turn just started its first tool: from here a restart may have left a side
++    effect behind, so auto-continue is switched off (the turn's at-most-once contract). Written BEFORE the tool
++    runs. True when an ``until_tool`` marker was switched off."""
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not isinstance(entry, dict) or not entry.get("until_tool") or not entry.get("auto_continue", True):
++            return None
++        entry.update(auto_continue=False, tool_started_at=time.time())
++        return entries
++
++    return bool(session_key) and _update(home, session_key, mutate, "mark tool start")
++
++
+ def mark_turn_paused(home: Path | str, session_key: str, reason: str,
+                      *, killed_jobs: list | None = None, increment: bool = True) -> bool:
+     """[daveey] Stamp a live turn's marker as paused at a step boundary for a core update: ``reason``,
+@@ -226,6 +243,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+                 # Writer identity when present: extra keys only, so a marker written by an older build still reads.
+                 **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                 **({"reason": str(entry["reason"])} if entry.get("reason") else {}),
++                **({"until_tool": True} if entry.get("until_tool") else {}),
+                 **({"notification_category": "diagnostic"}
+                    if entry.get("notification_category") == "diagnostic" else {}),
+                 **({"killed_jobs": killed} if killed else {})}
+-- 
+2.55.0
+

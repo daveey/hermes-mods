@@ -1,15 +1,15 @@
 # A down remote fails fast instead of redialing SSH per request
 
-Patch: 0597 (daveey/hermes `59a927377a`). Extends [desktop-remote-update-pause.md](desktop-remote-update-pause.md) (0592), whose gate cached only
+Patch: 0618 (daveey/hermes `59a927377a`). Extends [desktop-remote-update-pause.md](desktop-remote-update-pause.md) (0605), whose gate cached only
 a remote's own-update refusal, to every SSH dial failure a redial seconds later cannot change. Prewarm
-([desktop-always-on-remote-dashboard.md](desktop-always-on-remote-dashboard.md), 0526/0535) shares the schedule.
+([desktop-always-on-remote-dashboard.md](desktop-always-on-remote-dashboard.md), 0538/0548) shares the schedule.
 
 ## Why
 
 On 2026-10-27 16:53:11–16:55:28 PDT the Mac mini stopped answering on its tailnet address. Desktop opened 11 SSH
 control masters to it in 2 min 17 s, each failing `kind=timeout ... ssh timed out after 15000ms`, and 36 renderer
 requests (`/api/plugins/inbox/items`, `/api/plugins/hub-sync/status`, `/api/session-kanban-tasks`, ...) each waited
-up to 15 s before failing with "SSH operation to ... timed out". 0592's Gotchas named the gap: generic failures
+up to 15 s before failing with "SSH operation to ... timed out". 0605's Gotchas named the gap: generic failures
 still redial per request.
 
 Five whys (evidence in `~/.hermes/logs/desktop.log.1` and `desktop.log`, that window):
@@ -22,15 +22,15 @@ Why 1: each request dialed. The next control master opens ~20 ms after the previ
 Why 2: no pool entry existed to share. ensureRegistryBackend() (main.ts) deletes the entry in its .catch() when the
   dial fails, so the next request starts a new dial. Concurrent requests did share one dial (several errors with the
   same millisecond).
-Why 3: nothing remembered the failure. 0592's gate (remote-update-pause.ts) cached only kind 'update-in-progress';
+Why 3: nothing remembered the failure. 0605's gate (remote-update-pause.ts) cached only kind 'update-in-progress';
   the 'timeout' error that ssh-connection.ts _fail() tags was thrown and forgotten.
-Why 4: there was no written rule for which dial failures are worth remembering. 0592 fixed the failure kind its
+Why 4: there was no written rule for which dial failures are worth remembering. 0605 fixed the failure kind its
   incident showed and listed the rest as a gotcha, so each further kind would need its own incident; only
   remote-prewarm.ts backed off on them (its own state, its own caller).
 Root (happened): the dial chokepoint had no classification of failures; retry policy for a down host lived in one
   caller (prewarm) instead of at the dial.
-Root (not caught): no test sends repeated requests at a host that times out or refuses. 0592's tests drive only the
-  update refusal; 0526's drive prewarm with a mocked ensure; ssh-connection tests assert how one failed dial is
+Root (not caught): no test sends repeated requests at a host that times out or refuses. 0605's tests drive only the
+  update refusal; 0538's drive prewarm with a mocked ensure; ssh-connection tests assert how one failed dial is
   classified, not what the next request does.
 ```
 
@@ -40,7 +40,7 @@ Root (not caught): no test sends repeated requests at a host that times out or r
 
 | Class | Error `kind` | Why |
 |---|---|---|
-| `update` (0592) | `update-in-progress` | The remote refuses until its own `hermes update` ends. Backoff 2, 5, 10, 20, 30 s. |
+| `update` (0605) | `update-in-progress` | The remote refuses until its own `hermes update` ends. Backoff 2, 5, 10, 20, 30 s. |
 | `unreachable` | `unreachable`, `timeout`, `transient-transport-error` | Network: host down, refused, no route, SSH timeout, transport dropped mid-preflight. Decided outside Desktop; the host can come back by itself. |
 | `unreachable` | `auth-failed`, `interactive-auth`, `host-key-changed` | SSH refused us. Every redial gets the same answer until the user fixes it outside Desktop (ssh-add, known_hosts, a Tailscale check); the probe notices that fix within one window. Boot still latches these as terminal on the primary path. |
 | not remembered | `ssh-client-failed` (#103288) | Local client broken. Raised by `ssh -G` before the gate and latched by boot; handling unchanged. |
@@ -73,7 +73,7 @@ schedule does not change.
 
 ## Tests
 
-`electron/remote-dial-backoff.test.ts`, next to 0592's `remote-update-pause.test.ts`, with a fake clock and the
+`electron/remote-dial-backoff.test.ts`, next to 0605's `remote-update-pause.test.ts`, with a fake clock and the
 same harness shape (`ensureRegistryBackend()`'s pool, shared in-flight entry, deleted on failure, around the gate):
 
 - **Renderer requests**: 540 requests over 3 minutes against a timing-out host (3 a second, two profiles) make fewer
@@ -97,8 +97,8 @@ same harness shape (`ensureRegistryBackend()`'s pool, shared in-flight entry, de
   with an unremembered kind ends the backoff.
 - **main.ts wiring**: each explicit-retry IPC handler calls `remoteUpdatePause.clear(...)`.
 
-With the `unreachable` class disabled (the 0592 behaviour) six of the nine tests fail; with `clear()` a no-op the
-explicit-reconnect test fails. 0592's tests pass unchanged.
+With the `unreachable` class disabled (the 0605 behaviour) six of the nine tests fail; with `clear()` a no-op the
+explicit-reconnect test fails. 0605's tests pass unchanged.
 
 ## Gotchas
 

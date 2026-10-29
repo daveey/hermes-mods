@@ -1,0 +1,210 @@
+From 30c707ff2edda7122405d67461f2cf2e8509a80a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:29:40 -0700
+Subject: [PATCH] fix(desktop): replica fallback keeps a gateway's last kanban
+ counts [daveey]
+
+A non-active gateway's project tree falls back to the hub replica on cold
+start (before its first live answer) and after any failed background
+refresh. Replica records carry no kanban_* annotations, so every row of
+that gateway painted an empty task badge and no waiting/stuck stripe
+until a live tree landed. Seen live: after a Desktop restart with the hub
+active, 17 This-device rows showed 0 open / 0 blocked for 16 min (session
+status audit, two runs), recovering only when a local chat was opened.
+
+Remember the task evidence each gateway's rows last carried (including the
+boot snapshot tree replaced by the first apply) and carry it onto replica
+rows of the same connection/profile/session. The original
+kanban_observed_at is kept, so freshness checks still treat it as expired
+until live data arrives; evidence never crosses gateways.
+---
+ .../src/store/projects-hub-replica.test.ts    | 72 +++++++++++++++++++
+ apps/desktop/src/store/projects.ts            | 71 +++++++++++++++++-
+ 2 files changed, 142 insertions(+), 1 deletion(-)
+
+diff --git a/apps/desktop/src/store/projects-hub-replica.test.ts b/apps/desktop/src/store/projects-hub-replica.test.ts
+index 2fec521ce0..52b5f04369 100644
+--- a/apps/desktop/src/store/projects-hub-replica.test.ts
++++ b/apps/desktop/src/store/projects-hub-replica.test.ts
+@@ -168,6 +168,78 @@ describe('remote project groups from the hub replica', () => {
+     expect(remoteNode()?.label).toBe('Garden (live)')
+   })
+ 
++  // [daveey] Replica records carry no task annotations. Swapping a gateway's rows for them must not wipe the
++  // kanban badge it last reported (audit: 17 rows of This device showed no open/blocked counts for 16 min after a
++  // restart while the hub was the active gateway).
++  const liveRow = (over: Record<string, unknown> = {}) => ({
++    id: 's_1', profile: 'default', title: 'mini chat', message_count: 3, started_at: 1, last_active: 5,
++    kanban_active: 2, kanban_blocked: 1, kanban_parked: 2, kanban_observed_at: 1000, ...over
++  })
++
++  const remoteRow = () => remoteNode()?.previewSessions?.find(row => row.id === 's_1')
++
++  it('keeps the last live kanban counts when a failed refresh falls back to the replica', async () => {
++    vi.mocked(hubGatewayProjects).mockResolvedValue([replicaNode()])
++    vi.mocked(hermesApi).mockResolvedValue({
++      active_id: null,
++      projects: [{ ...replicaNode(), members: undefined, previewSessions: [liveRow()] }],
++      scoped_session_ids: []
++    })
++    await refreshProjectTree()
++    await flush()
++    expect(remoteRow()).toMatchObject({ kanban_active: 2, kanban_blocked: 1 })
++
++    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_000)
++
++    try {
++      vi.mocked(hermesApi).mockRejectedValue(new Error('ssh: connect timed out'))
++      vi.mocked(requestGatewayForAgent).mockRejectedValue(new Error('ssh: connect timed out'))
++      await refreshProjectTree()
++      await flush()
++    } finally {
++      clock.mockRestore()
++    }
++
++    expect(vi.mocked(hubGatewayProjects).mock.calls.length).toBeGreaterThanOrEqual(2)
++    expect(remoteRow()).toMatchObject({ kanban_active: 2, kanban_blocked: 1, kanban_observed_at: 1000 })
++  })
++
++  it('keeps the boot snapshot kanban counts while the first live answer is pending', async () => {
++    $projectTree.set([
++      {
++        ...(replicaNode() as never as SidebarProjectTree),
++        id: `gw:${conn}:p_garden`,
++        previewSessions: [liveRow({ connection_id: conn, kanban_active: 3 })] as never
++      }
++    ])
++    vi.mocked(hermesApi).mockReturnValue(new Promise(() => {}) as never)
++    vi.mocked(hubGatewayProjects).mockResolvedValue([replicaNode()])
++
++    await refreshProjectTree()
++    await flush()
++
++    expect(remoteRow()).toMatchObject({ connection_id: conn, kanban_active: 3, kanban_blocked: 1 })
++  })
++
++  it('never borrows task evidence from another gateway or invents it for an unseen row', async () => {
++    $projectTree.set([
++      {
++        ...(replicaNode() as never as SidebarProjectTree),
++        id: 'gw:other:p_garden',
++        previewSessions: [liveRow({ connection_id: 'other', kanban_active: 9 })] as never
++      }
++    ])
++    vi.mocked(hermesApi).mockReturnValue(new Promise(() => {}) as never)
++    vi.mocked(hubGatewayProjects).mockResolvedValue([replicaNode()])
++
++    await refreshProjectTree()
++    await flush()
++
++    expect(remoteRow()).toBeDefined()
++    expect(remoteRow()).not.toHaveProperty('kanban_active')
++    expect(remoteRow()).not.toHaveProperty('kanban_observed_at')
++  })
++
+   it('renames a remote declared project as one shared set per declared member, and keeps the new name', async () => {
+     vi.mocked(hermesApi).mockRejectedValue(new Error('asleep'))
+     vi.mocked(requestGatewayForAgent).mockRejectedValue(new Error('asleep'))
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index f3af2709dd..9e5d3ab507 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -9,6 +9,7 @@ import {
+   projectOwnerBySessionId,
+   type SidebarProjectTree
+ } from '@/app/chat/sidebar/projects/workspace-groups'
++import { withKanbanEvidence } from '@/app/session/hooks/refresh-retained-kanban'
+ import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
+ import { getHermesConfig, hermesApi, type HermesGateway, type SessionInfo } from '@/hermes'
+ import { translateNow } from '@/i18n'
+@@ -570,11 +571,75 @@ async function fillFromReplica(connectionId: string, entry: RemoteTreeEntry): Pr
+   const replica = await replicaProjectTree(connectionId).catch(() => null)
+ 
+   if (replica) {
+-    entry.projects = replica
++    rememberKanbanEvidence(entry.projects, () => connectionId)
++    entry.projects = replica.map(node => carryKanbanEvidence(node, connectionId))
+     reapplyLastProjectTree()
+   }
+ }
+ 
++// [daveey] The last task evidence (kanban_* annotations) each gateway's rows carried, by (connection, profile,
++// session). Hub replica records have no task annotations, so a gateway whose rows fall back to the replica (cold
++// start before its first live tree, or a failed background refresh) would paint every row with an empty kanban
++// badge and no waiting/stuck stripe. Its rows keep the last counts it reported instead; their original
++// `kanban_observed_at` stays, so freshness checks still treat the evidence as expired until a live answer lands.
++const knownKanbanEvidence = new Map<string, SessionInfo>()
++
++const kanbanEvidenceKey = (connectionId: string, row: SessionInfo) =>
++  `${connectionId}\u0000${normalizeProfileKey(row.profile || 'default')}\u0000${row.id}`
++
++const hasKanbanEvidence = (row: SessionInfo) =>
++  typeof row.kanban_observed_at === 'number' && Number.isFinite(row.kanban_observed_at)
++
++function treeRows(node: SidebarProjectTree): SessionInfo[] {
++  return [
++    ...(node.previewSessions ?? []),
++    ...(node.repos ?? []).flatMap(repo => (repo.groups ?? []).flatMap(group => group.sessions ?? []))
++  ]
++}
++
++function rememberKanbanEvidence(
++  nodes: readonly SidebarProjectTree[],
++  connectionOf: (row: SessionInfo) => string | undefined
++): void {
++  for (const row of nodes.flatMap(treeRows)) {
++    const connectionId = row?.id && hasKanbanEvidence(row) ? connectionOf(row) : undefined
++
++    if (!connectionId) {
++      continue
++    }
++
++    const key = kanbanEvidenceKey(connectionId, row)
++    const known = knownKanbanEvidence.get(key)
++
++    if (!known || (known.kanban_observed_at ?? 0) <= (row.kanban_observed_at ?? 0)) {
++      knownKanbanEvidence.set(key, row)
++    }
++  }
++}
++
++function withKnownKanban(rows: SessionInfo[], connectionId: string): SessionInfo[] {
++  return rows.map(row => {
++    const known = hasKanbanEvidence(row) ? undefined : knownKanbanEvidence.get(kanbanEvidenceKey(connectionId, row))
++
++    return known ? withKanbanEvidence(row, known) : row
++  })
++}
++
++function carryKanbanEvidence(node: SidebarProjectTree, connectionId: string): SidebarProjectTree {
++  return {
++    ...node,
++    ...(node.previewSessions ? { previewSessions: withKnownKanban(node.previewSessions, connectionId) } : {}),
++    ...(node.repos
++      ? {
++          repos: node.repos.map(repo => ({
++            ...repo,
++            groups: (repo.groups ?? []).map(group => ({ ...group, sessions: withKnownKanban(group.sessions ?? [], connectionId) }))
++          }))
++        }
++      : {})
++  }
++}
++
+ async function refreshRemoteProjectTree(connectionId: string, profile: string): Promise<void> {
+   const now = Date.now()
+   const entry = remoteTrees.get(connectionId) ?? { projects: [], fetchedAt: 0, failedAt: 0, inFlight: false }
+@@ -632,6 +697,10 @@ $hiddenGatewayIds.listen(() => {
+ })
+ 
+ function applyProjectTreePayload(res: ProjectTreePayload, owner: ProjectRowOwner): void {
++  // [daveey] Rows about to be replaced (the boot snapshot's on the first apply) are the last task evidence their
++  // gateway reported; a replica fallback for that gateway reuses it (see knownKanbanEvidence).
++  const previousOwner = lastLocalTree ? ownerGatewayId(lastLocalTree.owner) : undefined
++  rememberKanbanEvidence($projectTree.get(), row => row.connection_id?.trim() || previousOwner)
+   lastLocalTree = { res, owner }
+   const remotes = visibleRemoteTrees(owner)
+   const scoped = new Set([...(res.scoped_session_ids ?? []), ...remoteScopedSessionIds(remotes)])
+-- 
+2.55.0
+

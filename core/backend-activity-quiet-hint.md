@@ -1,6 +1,6 @@
 # Backend activity controls the running-turn quiet hint
 
-Patch 0632 (`371e91ded4`).
+Patch 0639 (`371e91ded4`).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ Added cases in `apps/desktop/src/store/session-watchdog.test.ts` cover backend a
 
 ## Applying
 
-Apply 0632 after the session-state/watchdog patches with `git am -3`.
+Apply 0639 after the session-state/watchdog patches with `git am -3`.
 
 ## Gotchas
 

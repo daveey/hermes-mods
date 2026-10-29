@@ -1,0 +1,255 @@
+From cf5ac4444c007547b313845766e5466f006a161f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 21:58:43 +0000
+Subject: [PATCH 423/453] fix(routing): publish failover only after runtime
+ preparation
+
+(cherry picked from commit cf5ac4444c007547b313845766e5466f006a161f)
+---
+ agent/model_routing.py                  |  4 +--
+ agent/model_routing_agent.py            | 20 +++++++----
+ agent/model_routing_runtime.py          | 46 ++++++++++++++++---------
+ agent/model_routing_state.py            |  6 +++-
+ tests/agent/test_model_routing_agent.py | 16 +++++++++
+ tests/agent/test_model_routing_state.py | 36 +++++++++++++++++++
+ 6 files changed, 101 insertions(+), 27 deletions(-)
+
+diff --git a/agent/model_routing.py b/agent/model_routing.py
+index 65f7870fcc..cdf28f0e6b 100644
+--- a/agent/model_routing.py
++++ b/agent/model_routing.py
+@@ -92,7 +92,7 @@ def _capable(route, requirements):
+ 
+ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+                         parent_session_id=None, requirements=None, excluded=(), state_path=None,
+-                        eligible=None):
++                        eligible=None, prepare=None):
+     """Return concrete model/provider and durable metadata, or unchanged exact pin.
+ 
+     ``excluded`` is a sequence of failed (provider, model) pairs for a new attempt,
+@@ -128,5 +128,5 @@ def resolve_model_route(model, provider="auto", *, config=None, session_id=None,
+         from hermes_constants import get_hermes_home
+         state_path = get_hermes_home() / "model-routing.sqlite3"
+     metadata = RoutingState(state_path).allocate(session_id, parent_session_id, level,
+-                                                routes, policy.get("policy_version", 1), excluded)
++                                                routes, policy.get("policy_version", 1), excluded, prepare)
+     return {"model": metadata["selected_model"], "provider": metadata["selected_provider"], "metadata": metadata}
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index 0e438adfc7..e728457d70 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -58,24 +58,30 @@ def try_class_fallback(agent):
+     context = getattr(getattr(agent, "context_compressor", None), "context_length", 0)
+     if isinstance(context, int) and context > 0:
+         requirements["min_context_tokens"] = max(requirements.get("min_context_tokens", 0), context)
+-    try:
+-        runtime = resolve_class_runtime(
+-            "class:" + agent.model_routing["requested_class"], "auto",
+-            session_id=agent.session_id, requirements=requirements, excluded=failed)
+-    except ModelRoutingError:
+-        return False
+     old_model, old_provider, old_url = agent.model, agent.provider, agent.base_url
+     old_client = agent.client
+     previous = vars(agent).copy()
+-    try:
++    building_client = False
++
++    def prepare(runtime):
++        nonlocal building_client
++        building_client = True
+         agent.model, agent.provider = runtime["model"], runtime["provider"]
+         agent.base_url, agent.api_mode = runtime["base_url"], runtime["api_mode"]
+         agent.requested_provider = "auto"
+         agent._credential_pool = runtime["credential_pool"]
+         _build_client(agent, runtime["api_key"], runtime["base_url"], [])
++
++    try:
++        runtime = resolve_class_runtime(
++            "class:" + agent.model_routing["requested_class"], "auto",
++            session_id=agent.session_id, requirements=requirements, excluded=failed,
++            prepare_runtime=prepare)
+     except Exception as exc:
+         vars(agent).clear()
+         vars(agent).update(previous)
++        if isinstance(exc, ModelRoutingError) and not building_client:
++            return False
+         raise ModelRoutingError("Class failover client construction failed; no legacy fallback permitted") from exc
+     agent.model_routing = runtime["model_routing"]
+     if old_client is not None and old_client is not agent.client:
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 3117ceb1b4..687f189e5d 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -5,7 +5,8 @@ from agent.model_routing import ModelRoutingError, resolve_model_route
+ 
+ 
+ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+-                          parent_session_id=None, requirements=None, excluded=(), state_path=None):
++                          parent_session_id=None, requirements=None, excluded=(), state_path=None,
++                          prepare_runtime=None):
+     from agent.credential_pool import load_pool
+     from hermes_cli import runtime_provider as runtime
+ 
+@@ -26,27 +27,38 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         return pools[key].has_available(model=route["model"])
+ 
+     failed = list(excluded)
+-    while True:
+-        chosen = resolve_model_route(model, provider, config=config, session_id=session_id,
+-                                     parent_session_id=parent_session_id, requirements=requirements,
+-                                     excluded=failed, eligible=eligible, state_path=state_path)
+-        metadata = chosen["metadata"]
+-        selected = chosen["provider"]
++    resolved = {}
++
++    class UnavailableCredential(Exception):
++        pass
++
++    def prepare(metadata):
++        selected, selected_model = metadata["selected_provider"], metadata["selected_model"]
+         runtime._raise_if_provider_disabled(selected)
+         pool = pools[selected, metadata["billing_group"]]
+-        entry = pool.select(model=chosen["model"])
++        entry = pool.select(model=selected_model)
+         if entry is None:
+-            # Refresh/quota can change after the availability probe. Never enter
+-            # the legacy ladder (it can consume an environment API key).
+-            failed.append((selected, chosen["model"]))
+-            continue
+-        cfg = {"provider": selected, "default": chosen["model"]}
+-        resolved = runtime._resolve_runtime_from_pool_entry(
++            # Roll back the unready selection before trying another same-class
++            # candidate. Never enter the legacy environment-key ladder.
++            failed.append((selected, selected_model))
++            raise UnavailableCredential
++        cfg = {"provider": selected, "default": selected_model}
++        resolved.update(runtime._resolve_runtime_from_pool_entry(
+             provider=selected, entry=entry, model_cfg=cfg, pool=pool,
+-            requested_provider=selected, target_model=chosen["model"])
++            requested_provider=selected, target_model=selected_model))
+         verify_class_runtime(resolved, metadata)
+-        resolved.update(model=chosen["model"], model_routing=metadata)
+-        return resolved
++        resolved.update(model=selected_model, model_routing=metadata)
++        if prepare_runtime is not None:
++            prepare_runtime(resolved)
++
++    while True:
++        try:
++            resolve_model_route(model, provider, config=config, session_id=session_id,
++                                parent_session_id=parent_session_id, requirements=requirements,
++                                excluded=failed, eligible=eligible, state_path=state_path, prepare=prepare)
++            return resolved
++        except UnavailableCredential:
++            continue
+ 
+ 
+ def verify_class_runtime(runtime, metadata):
+diff --git a/agent/model_routing_state.py b/agent/model_routing_state.py
+index 116587562c..6825e68ac6 100644
+--- a/agent/model_routing_state.py
++++ b/agent/model_routing_state.py
+@@ -12,7 +12,7 @@ class RoutingState:
+         self.path = Path(path)
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+ 
+-    def allocate(self, session_id, parent_session_id, level, candidates, version, excluded):
++    def allocate(self, session_id, parent_session_id, level, candidates, version, excluded, prepare=None):
+         """Allocate and persist atomically; aliases share one failover decision."""
+         with closing(sqlite3.connect(self.path, timeout=30, isolation_level=None)) as db:
+             db.execute("PRAGMA busy_timeout=30000")
+@@ -23,6 +23,10 @@ class RoutingState:
+             db.execute("BEGIN IMMEDIATE")
+             try:
+                 result = self._allocate(db, session_id, parent_session_id, level, candidates, version, excluded)
++                # Credentials/client must be usable before another process can
++                # observe the replacement. Failure rolls back counters as well.
++                if prepare is not None:
++                    prepare(result)
+                 db.execute("COMMIT")
+                 return result
+             except BaseException:
+diff --git a/tests/agent/test_model_routing_agent.py b/tests/agent/test_model_routing_agent.py
+index 215b73316e..615158b733 100644
+--- a/tests/agent/test_model_routing_agent.py
++++ b/tests/agent/test_model_routing_agent.py
+@@ -72,6 +72,9 @@ def test_agent_class_failure_stays_same_class_and_preserves_prompt(routing_home,
+                     agent._try_activate_fallback()
+             assert agent.model == "anthropic-deep"
+             assert agent.model_routing["selected_model"] == agent.model
++            resumed = build_agent(session_id="failover")
++            assert resumed.model_routing == agent.model_routing
++            assert resumed.model == agent.model
+             return
+         assert agent._try_activate_fallback() is True
+         assert agent.model == "z-anthropic-deep"
+@@ -103,6 +106,19 @@ def test_explicit_switch_clears_class_policy(routing_home):
+     assert agent.model_routing is None
+ 
+ 
++def test_rejected_runtime_does_not_publish_initial_allocation(routing_home, tmp_path):
++    import sqlite3
++    from agent.model_routing_runtime import resolve_class_runtime
++
++    with patch("agent.model_routing_runtime.verify_class_runtime", side_effect=ModelRoutingError("rejected")):
++        with pytest.raises(ModelRoutingError, match="rejected"):
++            resolve_class_runtime("class:deep", "auto", session_id="unready")
++    with sqlite3.connect(tmp_path / "model-routing.sqlite3") as db:
++        assert db.execute("SELECT count(*) FROM routes").fetchone()[0] == 0
++        assert db.execute("SELECT count(*) FROM counters").fetchone()[0] == 0
++        assert db.execute("SELECT count(*) FROM aliases").fetchone()[0] == 0
++
++
+ def test_agent_empty_class_fails_before_legacy_paid_fallback(routing_home, monkeypatch):
+     monkeypatch.setattr("agent.credential_pool.CredentialPool.has_available", lambda *a, **k: False)
+     with patch("agent.auxiliary_client.resolve_provider_client") as legacy:
+diff --git a/tests/agent/test_model_routing_state.py b/tests/agent/test_model_routing_state.py
+index 97ae027546..07d32ecc17 100644
+--- a/tests/agent/test_model_routing_state.py
++++ b/tests/agent/test_model_routing_state.py
+@@ -53,6 +53,42 @@ def test_lineage_arriving_before_parent_shares_identity(tmp_path):
+     assert resolve_model_route("class:fast", session_id="parent", **args) == first
+ 
+ 
++@pytest.mark.parametrize("reject", [False, True])
++def test_prepared_failover_is_invisible_until_commit_and_rolls_back(tmp_path, reject):
++    import json
++
++    path = tmp_path / "routes.db"
++    args = dict(config=policy(), session_id="parent", state_path=path)
++    first = resolve_model_route("class:deep", **args)
++    from agent.model_routing_state import RoutingState
++    RoutingState(path).link_continuation("child", "parent")
++    with sqlite3.connect(path) as db:
++        counters = db.execute("SELECT * FROM counters ORDER BY pool").fetchall()
++
++    def prepare(metadata):
++        assert metadata["selected_provider"] != first["provider"]
++        # Another connection (including a restarted reader) cannot see a
++        # replacement whose credential/client preparation hasn't succeeded.
++        with sqlite3.connect(path) as reader:
++            stored = json.loads(reader.execute("SELECT metadata FROM routes").fetchone()[0])
++            assert stored == first["metadata"]
++        if reject:
++            raise RuntimeError("client failed")
++
++    failure = [(first["provider"], first["model"])]
++    if reject:
++        with pytest.raises(RuntimeError, match="client failed"):
++            resolve_model_route("class:deep", excluded=failure, prepare=prepare, **args)
++        expected = first
++        with sqlite3.connect(path) as db:
++            assert db.execute("SELECT * FROM counters ORDER BY pool").fetchall() == counters
++    else:
++        expected = resolve_model_route("class:deep", excluded=failure, prepare=prepare, **args)
++    assert resolve_model_route("class:deep", **args) == expected
++    args["session_id"] = "child"
++    assert resolve_model_route("class:deep", **args) == expected
++
++
+ def test_config_validation_reports_bad_manifest():
+     from hermes_cli.config import validate_config_structure
+     cfg = policy()
+-- 
+2.54.0 (Apple Git-157)
+

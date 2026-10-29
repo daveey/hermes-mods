@@ -1,0 +1,107 @@
+From ed53a153fdd60d3b0ca8005a4d295aa696b59426 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:24:23 -0700
+Subject: [PATCH] fix(kanban placement): heavy_route works with the real Board
+ registry (no pickup field) [daveey]
+
+GET /v2/machines publishes labels/state/hold but never pickup, so advertises_pickup() was False for every
+machine (hub and worker-1 included, though both claim runs_on cards) and 1ba4ced7e2's heavy route never
+fired on the MacBook. The heavy-route check now needs an active, unheld machine and treats a missing
+pickup field as on (heavy_route naming the worker is the operator saying so); an explicit pickup off
+still refuses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_placement.py              |  9 +++++++--
+ tests/hermes_cli/test_kanban_placement.py   | 16 ++++++++++++++++
+ tests/hermes_cli/test_kanban_worker_node.py | 15 +++++++++++++++
+ tools/kanban_tools.py                       |  4 +++-
+ 4 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 46efcfece3..863f4a53bf 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -220,10 +220,15 @@ def _heavy_marker(title: str, body: str, cfg: _Cfg) -> Optional[str]:
+ 
+ 
+ def _machine_picks_up(name: str) -> bool:
+-    """``name`` is an active machine in the Board registry that picks up other gateways' cards."""
++    """``name`` is an active machine in the Board registry that is not held (draining) and has not turned
++    pickup off. The Board registry does not publish ``pickup`` today (10-28: every entry lacked it, the hub
++    and worker-1 included, though both claim ``runs_on`` cards), so a missing field counts as on:
++    ``heavy_route`` naming the worker is the operator saying it picks up."""
+     from hermes_cli import kanban_worker_node as wn
+     entry = ((wn.registry() or {}).get("machines") or {}).get(name)
+-    return bool(entry) and entry.get("state", "active") == "active" and wn.advertises_pickup(entry)
++    if not entry or entry.get("state", "active") != "active" or entry.get("hold"):
++        return False
++    return "pickup" not in entry or wn.advertises_pickup(entry)
+ 
+ 
+ def target_live(target: str, *, now: float, live_seconds: int,
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index d68aef6361..8a4db15444 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1081,3 +1081,19 @@ def test_configured_heavy_markers_replace_the_builtin_list():
+     cfg = {**HEAVY, "heavy_markers": [r"\bcrunch\b"]}
+     assert decide({"title": "Run the benchmark"}, cfg=cfg, machine_ok=PICKS_UP)["where"] == "hub"
+     assert decide({"title": "crunch the logs"}, cfg=cfg, machine_ok=PICKS_UP)["runs_on"] == ["machine:worker-1"]
++
++
++@pytest.mark.parametrize("entry,ok", [
++    ({"state": "active", "labels": ["linux"]}, True),           # the Board publishes no pickup field (10-28)
++    ({"state": "active", "pickup": "explicit"}, True),
++    ({"state": "active", "pickup": "off"}, False),
++    ({"state": "active", "pickup": False}, False),
++    ({"state": "active", "hold": True}, False),
++    ({"state": "revoked"}, False),
++    (None, False),
++])
++def test_heavy_route_machine_check_reads_the_board_registry(monkeypatch, entry, ok):
++    from hermes_cli import kanban_worker_node as wn
++    machines = {"worker-1": entry} if entry else {}
++    monkeypatch.setattr(wn, "registry", lambda: {"me": "macbook", "machines": machines})
++    assert kp._machine_picks_up("worker-1") is ok
+diff --git a/tests/hermes_cli/test_kanban_worker_node.py b/tests/hermes_cli/test_kanban_worker_node.py
+index 270e109ba6..0a426d1d9a 100644
+--- a/tests/hermes_cli/test_kanban_worker_node.py
++++ b/tests/hermes_cli/test_kanban_worker_node.py
+@@ -401,3 +401,18 @@ def test_tool_create_sends_heavy_work_to_the_worker_by_runs_on(gws, monkeypatch)
+     assert "machine:worker-1" in out["runs_where"]
+     out = _tool_create({"title": "Summarise the failing CI jobs", "assignee": "default"})
+     assert sent == ["elsewhere"] and out["placed"]["gateway"] == "elsewhere", out
++
++
++def test_tool_create_heavy_route_works_when_the_registry_has_no_pickup_field(gws, monkeypatch):
++    """Production 10-28: GET /v2/machines entries carry labels/state but no ``pickup``."""
++    hub, _ = gws
++    hub.enter()
++    from hermes_cli import kanban_placement as kp
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": [
++        {k: v for k, v in MACHINES[m].items() if k != "pickup"} for m in (HUB, WORKER, "macbook")]})
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    monkeypatch.setattr(kp, "config", lambda: {"route": {HUB: "elsewhere"}, "heavy_route": {HUB: WORKER}})
++    monkeypatch.setattr(kp, "target_live", lambda *a, **k: None)
++    monkeypatch.setattr(kp, "create_remote", lambda view, **kw: {"ok": True, "request_id": "r", "queued_only": True})
++    out = _tool_create({"title": "Run the bench-v2 benchmark", "assignee": "default"})
++    assert out["runs_on"] == ["machine:worker-1"], out
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 066c251d58..8598b47597 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1564,7 +1564,9 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         view = {**args, "assignee": assignee, "skills": skills, "parents": parents,
+                 "project_id": project_id}
+         from hermes_cli import kanban_worker_node as _wn
+-        machine_ok = (lambda m: _wn.placement_runs_on(conn, m) is not None) if conn is not None else None
++        # runs_on only works on a board that syncs as primary; the machine check is kp._machine_picks_up.
++        machine_ok = ((lambda m: _wn.sync.board_mode(conn) == "primary" and kp._machine_picks_up(m))
++                      if conn is not None else None)
+         decision = kp.decide(view, machine_ok=machine_ok)
+         target = decision["where"]
+         if target == "refuse":
+-- 
+2.55.0
+

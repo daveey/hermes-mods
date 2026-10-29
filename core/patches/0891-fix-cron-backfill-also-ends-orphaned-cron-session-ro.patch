@@ -1,0 +1,142 @@
+From ac1eb73e0e49fa9c419109293ad552363645d6bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 03:07:16 +0000
+Subject: [PATCH] fix(cron): backfill also ends orphaned cron session rows
+ whose attempt was pruned or settled unfinalized [daveey]
+
+Follow-up to fec6ced730. Of hermes-hub's 6 stuck cron_* rows only 3 had an 'unknown'
+ledger attempt; 1 was a 'failed' attempt whose finalization was disabled and 2+ had their
+attempt pruned, so the ledger-driven backfill could not reach them.
+end_orphaned_cron_sessions() ends unended cron_* rows older than 1 h whose job has no
+claimed/running attempt claimed at or before the row started; backfill_interrupted_cron_sessions()
+runs it after the ledger pass. Tests: 2 new (old orphan ended, young/live-owned spared).
+---
+ cron/interrupted_sessions.py                  | 70 ++++++++++++++++++-
+ .../cron/test_interrupted_cron_session_end.py | 36 ++++++++++
+ 2 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/cron/interrupted_sessions.py b/cron/interrupted_sessions.py
+index 7b9cb2a79e..ff0d71d323 100644
+--- a/cron/interrupted_sessions.py
++++ b/cron/interrupted_sessions.py
+@@ -217,4 +217,72 @@ def backfill_interrupted_cron_sessions(
+         logger.warning("cron interrupted-session backfill: ledger read failed: %s", exc)
+         return 0
+     rows = [r for r in rows if (_ts(r.get("claimed_at")) or 0) >= cutoff]
+-    return end_interrupted_cron_sessions(rows, db_path=db_path, timeout_seconds=timeout_seconds)
++    ended = end_interrupted_cron_sessions(rows, db_path=db_path, timeout_seconds=timeout_seconds)
++    return ended + end_orphaned_cron_sessions(days=days, db_path=db_path)
++
++
++def _job_id_of(session_id: str) -> str:
++    # cron_<job_id>_<YYYYmmdd>_<HHMMSS>
++    return session_id[len("cron_"):].rsplit("_", 2)[0]
++
++
++def end_orphaned_cron_sessions(
++    *, days: float = 7.0, min_age_seconds: float = 3600.0, db_path: Optional[Path] = None,
++) -> int:
++    """End unended ``cron_*`` session rows that no live attempt can still own.
++
++    Covers rows whose ledger attempt was already pruned, or settled without the owner finalizing
++    the session. A row is left alone when it is younger than *min_age_seconds* or when its job has
++    a ``claimed``/``running`` attempt claimed at or before the row started (that attempt may still
++    be writing it). Manual/one-shot repair; never raises.
++    """
++    from cron import executions
++    from hermes_state import SessionDB
++
++    try:
++        now = executions._hermes_now().timestamp()
++        with executions._transaction() as conn:
++            live = [dict(r) for r in conn.execute(
++                "SELECT job_id, claimed_at FROM executions WHERE status IN ('claimed','running')")]
++    except _STORAGE_ERRORS as exc:
++        logger.warning("cron orphan-session sweep: ledger read failed: %s", exc)
++        return 0
++    live_claims: dict[str, list[float]] = {}
++    for r in live:
++        ts = _ts(r.get("claimed_at"))
++        if ts is not None:
++            live_claims.setdefault(str(r["job_id"]), []).append(ts)
++    ended = 0
++    try:
++        db = SessionDB(db_path=db_path)
++    except _STORAGE_ERRORS as exc:
++        logger.warning("cron orphan-session sweep: state.db open failed: %s", exc)
++        return 0
++    try:
++        rows = [dict(r) for r in db._read_all(
++            "SELECT id, started_at, title FROM sessions WHERE id LIKE 'cron\\_%' ESCAPE '\\' "
++            "AND ended_at IS NULL AND started_at >= ? AND started_at < ?",
++            (now - days * 86400, now - min_age_seconds))]
++        for row in rows:
++            sid, started = row["id"], float(row["started_at"])
++            job_id = _job_id_of(sid)
++            if any(c - _CLAIM_SKEW_SECONDS <= started for c in live_claims.get(job_id, [])):
++                continue
++            try:
++                if not row.get("title"):
++                    _title_interrupted(db, sid, job_id, started)
++                n = _end_one(db, sid)
++            except _STORAGE_ERRORS as exc:
++                logger.warning("cron orphan-session sweep: %s: %s", sid, exc)
++                continue
++            if n:
++                ended += n
++                logger.info("Job '%s': ended orphaned cron session %s", job_id, sid)
++    except _STORAGE_ERRORS as exc:
++        logger.warning("cron orphan-session sweep failed: %s", exc)
++    finally:
++        try:
++            db.close()
++        except (sqlite3.Error, OSError) as exc:
++            logger.debug("cron orphan-session sweep: state.db close failed: %s", exc)
++    return ended
+diff --git a/tests/cron/test_interrupted_cron_session_end.py b/tests/cron/test_interrupted_cron_session_end.py
+index 71006eac7e..7502507e39 100644
+--- a/tests/cron/test_interrupted_cron_session_end.py
++++ b/tests/cron/test_interrupted_cron_session_end.py
+@@ -161,3 +161,39 @@ def test_cleanup_thread_keeps_profile_scoped_hermes_home(monkeypatch, tmp_path):
+         db.close()
+     finally:
+         reset_hermes_home_override(token)
++
++
++def _bare_session(db, sid, started):
++    db.create_session(sid, source="cron")
++    db._execute_write(lambda c: c.execute("UPDATE sessions SET started_at=? WHERE id=?", (started, sid)))
++
++
++def test_orphan_sweep_ends_old_rows_without_a_live_attempt(monkeypatch, env):
++    """Rows whose ledger attempt was pruned (or settled without finalizing) are ended by the sweep."""
++    import time
++
++    import cron.interrupted_sessions as mod
++
++    _executions, db, _ = env
++    old = "cron_gone1_20261028_010708"
++    young = "cron_gone2_20261029_020000"
++    _bare_session(db, old, time.time() - 3 * 3600)
++    _bare_session(db, young, time.time() - 60)
++
++    assert mod.end_orphaned_cron_sessions(days=1) == 1
++    row = db.get_session(old)
++    assert row["end_reason"] == "cron_interrupted" and row["title"].endswith("(interrupted)")
++    assert db.get_session(young)["ended_at"] is None
++    assert mod.end_orphaned_cron_sessions(days=1) == 0
++
++
++def test_orphan_sweep_spares_a_row_a_live_attempt_may_own(monkeypatch, env):
++    import cron.interrupted_sessions as mod
++
++    executions, db, _ = env
++    rec = executions.create_execution("busy", source="builtin")
++    executions.mark_execution_running(rec["id"])  # same process: still live
++    sid = _session_for(db, rec, "busy")
++
++    assert mod.end_orphaned_cron_sessions(days=1, min_age_seconds=0) == 0
++    assert db.get_session(sid)["ended_at"] is None
+-- 
+2.55.0
+

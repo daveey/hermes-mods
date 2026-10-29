@@ -1,0 +1,130 @@
+From ea91fc2b15fad0aa490004495c3498f65ce61e48 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:35:18 -0700
+Subject: [PATCH] fix(sessions move): refuse while open cards on other gateways
+ notify the chat (--force overrides) [daveey]
+
+repoint_links re-points only this gateway's cards; a card another gateway owns would keep notifying the archived
+copy. The move now lists such open cards (kanban_chat_links.replica_cards) and refuses with remote_cards unless
+--force.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/session_handover.py            | 29 +++++++++++++++++++----
+ hermes_cli/subcommands/sessions.py        |  2 ++
+ tests/hermes_cli/test_session_handover.py | 13 ++++++++++
+ 3 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/session_handover.py b/hermes_cli/session_handover.py
+index 2509633434..359fdd499f 100644
+--- a/hermes_cli/session_handover.py
++++ b/hermes_cli/session_handover.py
+@@ -10,6 +10,10 @@ A chat session moves to another gateway while this one (its current owner) is al
+ 6. archive the copy here (``end_reason='moved_to_gateway:<gw>'``);
+ 7. re-point this gateway's open cards that notify the chat to the new gateway's copy (:func:`repoint_links`).
+ 
++Open cards owned by OTHER gateways that notify the chat (``kanban_chat_links.replica_cards``) cannot be re-pointed
++from here: their notices would reach the archived copy. Such a move is refused (``remote_cards``, naming them)
++unless ``--force``; wait for those cards to finish, or force and read their results on their own gateway.
++
+ If the CAS fails after the push, the hidden target copy is deleted through the transport and the move reports it.
+ 
+ Transport (config ``sessions.move``)::
+@@ -315,7 +319,7 @@ def _segments_and_counts(db, session_id: str, home: str) -> tuple[dict, dict[str
+     return payload, {s["id"]: len(s.get("messages") or []) for s in segments}
+ 
+ 
+-def move_session(session_id: str, to: str, reason: str, *, after_turn: bool = False, db=None,
++def move_session(session_id: str, to: str, reason: str, *, after_turn: bool = False, force: bool = False, db=None,
+                  cfg: Optional[dict] = None, wait_s: float = AFTER_TURN_WAIT_S, poll_s: float = POLL_S,
+                  sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+     """Run the move; returns the report (``moved`` True/False, plus ``code`` and ``error`` when refused)."""
+@@ -336,7 +340,7 @@ def move_session(session_id: str, to: str, reason: str, *, after_turn: bool = Fa
+         db = db or _open_db()
+         try:
+             return _move(db, session_id, to, reason, me=me, target=hosts[to], after_turn=after_turn, cfg=cfg,
+-                         wait_s=wait_s, poll_s=poll_s, sleep=sleep)
++                         wait_s=wait_s, poll_s=poll_s, sleep=sleep, force=force)
+         finally:
+             if own:
+                 db.close()
+@@ -344,8 +348,19 @@ def move_session(session_id: str, to: str, reason: str, *, after_turn: bool = Fa
+         return {"session_id": session_id, "to": to, "moved": False, "code": exc.code, "error": str(exc), **exc.extra}
+ 
+ 
++def remote_open_cards(lineage: list[str], me: str) -> list[dict[str, Any]]:
++    """Open cards created on other gateways that this lineage's chats are linked to (from the board replicas)."""
++    from hermes_cli import kanban_chat_links as kcl
++    try:
++        rows = kcl.replica_cards(lineage, me, statuses=OPEN_STATUSES)
++    except Exception:  # health: allow BLE001 -- no replica (sync off): nothing known on other gateways
++        return []
++    return [{"id": r.get("id"), "gateway": r.get("gateway") or r.get("owner_gateway") or "?", "status": r.get("status")}
++            for r in rows if r.get("status") in OPEN_STATUSES]
++
++
+ def _move(db, session_id: str, to: str, reason: str, *, me: str, target: str, after_turn: bool, cfg,
+-          wait_s: float, poll_s: float, sleep) -> dict[str, Any]:
++          wait_s: float, poll_s: float, sleep, force: bool = False) -> dict[str, Any]:
+     from hermes_cli import session_owner as so
+     resolved = db.resolve_session_id(session_id) if hasattr(db, "resolve_session_id") else session_id
+     if not resolved or not db.get_session(resolved):
+@@ -358,6 +373,11 @@ def _move(db, session_id: str, to: str, reason: str, *, me: str, target: str, af
+     rec = so.owner(root)
+     if rec and rec.get("gateway") != me:
+         raise MoveError("not_owner", f"this chat is owned by {rec.get('gateway')}, not {me}", owner=rec)
++    remote = remote_open_cards(lineage, me)
++    if remote and not force:
++        raise MoveError("remote_cards", f"{len(remote)} open card(s) on other gateways notify this chat and cannot be "
++                        "re-pointed from here: " + ", ".join(f"{c['gateway']}/{c['id']}" for c in remote[:10])
++                        + "; wait for them to finish or pass --force", cards=remote)
+     if turn_running(db, root):
+         if not after_turn:
+             raise MoveError("turn_running", "a turn is running in this chat; retry when it ends (or --after-turn)")
+@@ -438,7 +458,8 @@ def cmd_discard_hidden(args) -> int:
+ 
+ 
+ def cmd_move(args) -> int:
+-    res = move_session(args.session_id, args.to, args.reason or "", after_turn=bool(args.after_turn))
++    res = move_session(args.session_id, args.to, args.reason or "", after_turn=bool(args.after_turn),
++                       force=bool(getattr(args, "force", False)))
+     _print(res)
+     return 0 if res.get("moved") and res.get("revealed", True) else 1
+ 
+diff --git a/hermes_cli/subcommands/sessions.py b/hermes_cli/subcommands/sessions.py
+index f6012b3466..119d619208 100644
+--- a/hermes_cli/subcommands/sessions.py
++++ b/hermes_cli/subcommands/sessions.py
+@@ -331,6 +331,8 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
+     sessions_move.add_argument("--to", required=True, help="Target gateway (a key of sessions.move.hosts)")
+     sessions_move.add_argument("--reason", required=True, help="Why the chat must move (recorded on the Board)")
+     _flag(sessions_move, "--after-turn", help="Wait (up to 10 min) for a running turn to end instead of refusing")
++    _flag(sessions_move, "--force", help="Move even though open cards on other gateways notify this chat "
++                                         "(their notices reach the archived copy here)")
+     sessions_import_lineage = sessions_subparsers.add_parser(
+         "import-lineage", help="Import an exported session lineage (JSON; the target side of `sessions move`)")
+     sessions_import_lineage.add_argument("file", help="Payload file, or - for stdin")
+diff --git a/tests/hermes_cli/test_session_handover.py b/tests/hermes_cli/test_session_handover.py
+index 7478ce619d..cb938d46d4 100644
+--- a/tests/hermes_cli/test_session_handover.py
++++ b/tests/hermes_cli/test_session_handover.py
+@@ -406,3 +406,16 @@ def test_transport_argv_templates():
+     cfg = {"sessions": {"move": {"transport": ["env", "X=1", "{args}"], "remote_hermes": "py -m hermes_cli.main"}}}
+     assert sh.transport_argv("u@h", ["sessions", "reveal", "s 1"], cfg) == [
+         "env", "X=1", "py", "-m", "hermes_cli.main", "sessions", "reveal", "s 1"]
++
++
++def test_open_cards_on_other_gateways_refuse_the_move_unless_forced(gw, monkeypatch):
++    """Cards another gateway owns cannot be re-pointed from here: their notices would reach the archived copy."""
++    from hermes_cli import kanban_chat_links as kcl
++    rows = [{"id": "t_remote", "gateway": OTHER, "status": "running"}, {"id": "t_old", "gateway": OTHER, "status": "done"}]
++    monkeypatch.setattr(kcl, "replica_cards", lambda ids, me, statuses=None, **kw: rows)
++    res = sh.move_session(SID, DST, "needs the hub", db=gw.db)
++    assert not res["moved"] and res["code"] == "remote_cards" and f"{OTHER}/t_remote" in res["error"], res
++    assert res["cards"] == [{"id": "t_remote", "gateway": OTHER, "status": "running"}]  # a done card is no obligation
++    assert not gw.db.get_session(SID)["archived"]
++    res = sh.move_session(SID, DST, "needs the hub", db=gw.db, force=True)
++    assert res["moved"], res
+-- 
+2.55.0
+

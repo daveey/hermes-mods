@@ -2,8 +2,8 @@
 
 Patches:
 
-- `patches/0530-fix-tui-owner-addressed-notifications-wait-with-thei.patch`
-- `patches/0576-perf-tui-kanban-poll-reads-only-this-chat-s-notify-s.patch`: each chat's kanban poll reads only its own subscriptions.
+- `patches/0541-fix-tui-owner-addressed-notifications-wait-with-thei.patch`
+- `patches/0582-perf-tui-kanban-poll-reads-only-this-chat-s-notify-s.patch`: each chat's kanban poll reads only its own subscriptions.
 
 A Desktop backend runs one notification poller thread per open chat, and every poller drains one process-wide
 completion queue. Before this patch, an event addressed to a chat whose turn was still running went back on that
@@ -29,7 +29,7 @@ recomputed kanban activity in turn behind one lock, with about 24 threadpool wor
 
 - Each chat's poller reads only its own `platform="tui"` subscriptions on each board (filtered in SQL), not every
   subscription row on the board. `list_notify_subs` accepts `platform` (case-insensitive) and `chat_id` (exact),
-  like `count_notify_subs`. Before 0576, ~20 pollers each fetched all 2,465 rows every 5 s. sqlite's `fetchall`
+  like `count_notify_subs`. Before 0582, ~20 pollers each fetched all 2,465 rows every 5 s. sqlite's `fetchall`
   re-takes the GIL per row, so ~10 threads were always queued in `take_gil` and the backend ran at ~240% CPU,
   ~210% of it system time.
 
@@ -70,7 +70,7 @@ the old body, which bumps the generation when it publishes.
 - `tests/tui_gateway/test_kanban_notify_poller.py::TestPollerReadsOnlyItsOwnSubscriptions`
   - `test_list_notify_subs_filters_platform_and_chat_in_sql`: SQL filters, case-insensitive platform.
   - `test_poller_fetches_only_this_sessions_rows_and_still_delivers`: 41 subscriptions on the board, the poll
-    fetches 1 row and still delivers its notice (41 rows before 0576).
+    fetches 1 row and still delivers its notice (41 rows before 0582).
 - `tests/hermes_cli/test_kanban_session_activity.py::test_concurrent_sidebar_reads_share_one_recompute_while_the_board_keeps_changing`:
   8 concurrent readers with a fingerprint that changes on every read, at most 2 recomputes (8 before).
 - The existing routing tests (`test_tui_gateway_server.py`, `test_launch_db_home_override_race.py`,
@@ -81,7 +81,7 @@ Untested: the HTTP route `/api/profiles/sessions` end to end under concurrent lo
 
 ## Apply
 
-`git am core/patches/0530-*.patch core/patches/0576-*.patch`. Takes effect when the Desktop backend restarts.
+`git am core/patches/0541-*.patch core/patches/0582-*.patch`. Takes effect when the Desktop backend restarts.
 
 ## Gotchas
 

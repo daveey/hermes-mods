@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/0702-fix-tui-a-chat-held-by-another-backend-gets-one-refu.patch`
+- `patches/0759-fix-tui-a-chat-held-by-another-backend-gets-one-refu.patch`
 
 On 2026-10-28 a background-process completion was waiting in David-MBP's Desktop backend for chat
 `20261023_204423_b85a94`. Meanwhile the mini's Desktop backend (SSH-spawned on the same Mac, so it shares
@@ -66,7 +66,7 @@ Untested: the Desktop renderer's display of the new copy. The e2e asserts the `m
 
 ## Apply
 
-`git am core/patches/0702-*.patch`. Takes effect when the Desktop backend restarts.
+`git am core/patches/0759-*.patch`. Takes effect when the Desktop backend restarts.
 
 ## Gotchas
 

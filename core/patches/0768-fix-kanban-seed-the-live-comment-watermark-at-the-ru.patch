@@ -1,0 +1,167 @@
+From 91359bea619716f9a5dd98cff949741d13bc487e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:51:18 +0000
+Subject: [PATCH] fix(kanban): seed the live comment watermark at the run's
+ start, not the first poll [daveey]
+
+A comment posted after the worker's prompt was built but before its first
+activity tick was swallowed by the first-poll seed and never steered in.
+The first poll now seeds at the max comment id created before
+task_runs.started_at for this run, then delivers newer comments through the
+normal filter (own ids, empty bodies, ids already in comment_delivered).
+Falls back to the old seed-at-now when the run can't be resolved.
+---
+ hermes_cli/kanban_db.py                      | 13 ++++
+ tests/tools/test_kanban_comment_injection.py | 78 ++++++++++++++++++++
+ tools/kanban_tools.py                        | 13 +++-
+ 3 files changed, 101 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8566c04913..88c9b39fd7 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1824,6 +1824,19 @@ def delivered_comment_ids(conn: sqlite3.Connection, task_id: str, run_id: int) -
+     return out
+ 
+ 
++def comment_id_before_run_start(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[int]:
++    """Highest comment id on ``task_id`` created before run ``run_id`` started (0 when none);
++    None when the run or its ``started_at`` can't be resolved. Those earlier comments are in
++    the worker's prompt, so the live comment bridge seeds its watermark here."""
++    row = conn.execute("SELECT started_at FROM task_runs WHERE id = ? AND task_id = ?",
++                       (int(run_id), task_id)).fetchone()
++    if not row or row[0] is None:
++        return None
++    got = conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id = ? AND created_at < ?",
++                       (task_id, int(row[0]))).fetchone()
++    return int(got[0]) if got and got[0] is not None else 0
++
++
+ def record_comment_delivery(conn: sqlite3.Connection, task_id: str, run_id: int,
+                             comment_ids: list[int]) -> None:
+     """Receipt that the live bridge steered ``comment_ids`` into the running worker of ``run_id``."""
+diff --git a/tests/tools/test_kanban_comment_injection.py b/tests/tools/test_kanban_comment_injection.py
+index 87d2facde0..a186aa48d7 100644
+--- a/tests/tools/test_kanban_comment_injection.py
++++ b/tests/tools/test_kanban_comment_injection.py
+@@ -369,3 +369,81 @@ def test_kanban_show_lists_undelivered_live_run_comments(worker_home, monkeypatc
+     assert kt.inject_new_comments_from_env(agent) is True
+     shown = json.loads(kt._handle_show({"task_id": tid}))
+     assert shown["undelivered_comments"] == []
++
++
++# --- First poll: the watermark is seeded at the run's start, not at "now" ---
++#
++# Comments from before the run started are in the worker's prompt; ones posted between
++# spawn and the first activity tick are not, so the first poll must deliver them.
++
++
++def _backdate_comment(cid, seconds):
++    conn = kbc.connect()
++    try:
++        conn.execute("UPDATE task_comments SET created_at = created_at - ? WHERE id = ?", (seconds, cid))
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def _post_as_operator(tid, body):
++    def post():
++        conn = kbc.connect()
++        try:
++            return kb.add_comment(conn, tid, author="default", body=body)
++        finally:
++            conn.close()
++    return _as_other_session(post)
++
++
++def test_comment_after_run_start_before_first_poll_is_injected(worker_home, monkeypatch):
++    tid, run_id = _running_worker(monkeypatch)
++    cid = _post_as_operator(tid, "reply EARLY-ACK in a kanban_comment")
++    agent = FakeAgent()
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is True
++    assert "EARLY-ACK" in agent.steers[0]
++    conn = kbc.connect()
++    try:
++        delivered = [e for e in kb.list_events(conn, tid) if e.kind == "comment_delivered"]
++    finally:
++        conn.close()
++    assert [e.payload for e in delivered] == [{"comment_ids": [cid], "run_id": run_id}]
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False
++    assert len(agent.steers) == 1
++
++
++def test_comment_before_run_start_is_not_injected_on_first_poll(worker_home, monkeypatch):
++    tid, _run = _running_worker(monkeypatch)
++    cid = _post_as_operator(tid, "old note already in the prompt")
++    _backdate_comment(cid, 60)
++    agent = FakeAgent()
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False
++    assert agent.steers == []
++    assert kt._comment_watermark[tid] == cid
++
++
++def test_own_comment_before_first_poll_is_not_injected(worker_home, monkeypatch):
++    tid, _run = _running_worker(monkeypatch)
++    out = json.loads(kt._handle_comment({"task_id": tid, "body": "my own early progress note"}))
++    assert out["ok"]
++    agent = FakeAgent()
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False
++    assert agent.steers == []
++
++
++def test_first_poll_skips_comments_already_delivered_to_this_run(worker_home, monkeypatch):
++    tid, run_id = _running_worker(monkeypatch)
++    cid = _post_as_operator(tid, "delivered by an earlier process of this run")
++    conn = kbc.connect()
++    try:
++        kb.record_comment_delivery(conn, tid, run_id, [cid])
++    finally:
++        conn.close()
++    agent = FakeAgent()
++    _unthrottle()
++    assert kt.inject_new_comments_from_env(agent) is False
++    assert agent.steers == []
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index b7361f4663..c3a628aa9e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -698,7 +698,7 @@ def heartbeat_current_worker_from_env() -> bool:
+ 
+ # Live operator-note injection: poll the task for new comments and steer them in
+ # OUT-OF-BAND, so a user can talk to a running task without block → comment → unblock.
+-# Watermarked per task (seeded on first poll: that history is already in the context).
++# Watermarked per task, seeded on first poll at the run's start (earlier history is in the prompt).
+ _COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
+ _comment_poll_last_attempt: float = 0.0
+ _comment_watermark: dict[str, int] = {}
+@@ -735,13 +735,20 @@ def inject_new_comments_from_env(agent: Any) -> bool:
+     own_ids: set[int] = set()
+     try:
+         with _board(None, quiet_close=True) as (kb, conn):
++            if seen is None and run_id is not None:
++                # [daveey] Seed at the run's start, not "now": comments from before the run
++                # are in the prompt, but ones posted between spawn and this first poll are not.
++                seen = kb.comment_id_before_run_start(conn, tid, run_id)
++                if seen is not None:
++                    _comment_watermark[tid] = seen
+             rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
+             if seen is not None and rows and run_id is not None:
+-                own_ids = kb.own_comment_ids(conn, tid, run_id)
++                own_ids = (kb.own_comment_ids(conn, tid, run_id)
++                           | kb.delivered_comment_ids(conn, tid, run_id))
+     except Exception:
+         logger.debug("comment-inject: bridge failed", exc_info=True)
+         return False
+-    if seen is None:
++    if seen is None:  # no run to anchor on: everything so far counts as already seen
+         _comment_watermark[tid] = max((c.id for c in rows), default=0)
+     if seen is None or not rows:
+         return False
+-- 
+2.55.0
+

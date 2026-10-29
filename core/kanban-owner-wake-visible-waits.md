@@ -1,6 +1,6 @@
 # Owner wake and visible waits: what each parked card waits on, amber "stalled"
 
-Patches **0544–0547** (core), plus the `chat-closeout` plugin's owner wake (`plugins/chat-closeout/owner_wake.py`)
+Patches **0557, 0558, 0559, 0560** (core), plus the `chat-closeout` plugin's owner wake (`plugins/chat-closeout/owner_wake.py`)
 and the `session-tasks` desktop plugin's wait lines.
 
 ## Behavior
@@ -34,7 +34,7 @@ Agent-owned: a `transient`/`capability`/`assignment` block, triage after `gave_u
 `supervisor_escalated`/`triage_swept`, `continuation_exhausted`, a park declaring `awaiting.kind=human` (a hidden
 ask), or a declared awaiting with no producer. Uncertain (counts only once stalled): an untyped block, a park on an
 opaque probe. Not agent-owned: a dependency block, a needs-input block, block-loop triage, a park on a card / CI run
-/ deploy / external ref / clock window. On the "no producer, no park" core (0529) every park records an `awaiting`;
+/ deploy / external ref / clock window. On the "no producer, no park" core (0540) every park records an `awaiting`;
 an **inferred** clock/external guess is judged by its wake mechanism (wake_check / wake_at), not as "no producer".
 
 ## How it works
@@ -67,6 +67,6 @@ implicit `--from`, remote read failure), `apps/desktop/src/app/chat/sidebar/sess
 - `sidebar.row.kanbanStalled` is listed in `overlay-gaps.json` like its kanban neighbours (untranslated overlays).
 - ⌘] / ⌘[ still step only to green/red stripes; amber stalled is not a stop.
 
-## Follow-up patch (0564)
+## Follow-up patch (0570)
 
-**0564** regenerates `locales/_keys.desktop.json` for `sidebar.row.kanbanStalled` (the string was added without running `npm run i18n:keys`, which turned Main CI's JS check red) and adds a lefthook pre-commit job that runs `i18n:keys` and stages the result whenever `apps/desktop/src/i18n/en*.ts` is staged. Verified by restoring the stale file and running `lefthook run pre-commit --job "desktop i18n keys"`; `scripts/i18n-keys.test.mjs` passes.
+**0570** regenerates `locales/_keys.desktop.json` for `sidebar.row.kanbanStalled` (the string was added without running `npm run i18n:keys`, which turned Main CI's JS check red) and adds a lefthook pre-commit job that runs `i18n:keys` and stages the result whenever `apps/desktop/src/i18n/en*.ts` is staged. Verified by restoring the stale file and running `lefthook run pre-commit --job "desktop i18n keys"`; `scripts/i18n-keys.test.mjs` passes.

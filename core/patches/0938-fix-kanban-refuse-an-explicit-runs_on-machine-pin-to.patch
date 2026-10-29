@@ -1,0 +1,391 @@
+From cc3d681cb9ddf0993ec0f31a13b99702cb7a08cb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 08:34:59 +0000
+Subject: [PATCH] fix(kanban): refuse an explicit runs_on machine pin to a
+ machine that does not pick up the board [daveey]
+
+Three hub cards created with runs_on=[machine:macbook] sat ready until
+archived: only the MacBook may lease them and it never copies hub cards
+(GET /v2/machines pickup: null). Create (kanban_create tool, hermes kanban
+create) and move (kanban_move, hermes kanban move) now refuse
+machine:<x> unless x is an active registry machine advertising pickup
+(null/missing = none; registry unreachable fails closed), with
+placement_unavailable naming placement="<x>" as the working route.
+Placement-derived runs_on (placement=<machine>, heavy_route) is unchanged.
+kanban edit and the dashboard cannot write runs_on.
+---
+ hermes_cli/kanban.py                          |   4 +-
+ hermes_cli/kanban_move.py                     |   6 +
+ hermes_cli/kanban_worker_node.py              |  64 ++++++
+ tests/hermes_cli/test_kanban_move.py          |   4 +-
+ .../test_kanban_runs_on_pickup_guard.py       | 183 ++++++++++++++++++
+ tools/kanban_tools.py                         |   2 +-
+ tools/kanban_tools_schemas.py                 |   5 +-
+ 7 files changed, 263 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_runs_on_pickup_guard.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 080183ae82..0f23cfda00 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -467,7 +467,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_model_assignment import ModelProviderMismatchError
+         from hermes_cli.kanban_skill_check import UnknownSkillError
+         from hermes_cli.kanban_capabilities import RequiresDeclarationMissing, declaration_required
++        from hermes_cli.kanban_worker_node import MachinePinRefused, check_machine_pins
+         try:
++            check_machine_pins(conn, getattr(args, "runs_on", None))  # explicit pins need pickup [daveey]
+             task_id = kb.create_task(
+                 conn, title=args.title, body=body,
+                 assignee=args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+@@ -495,7 +497,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             )
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
+-        except (CapabilityMismatchError, UnknownSkillError, RequiresDeclarationMissing) as exc:
++        except (CapabilityMismatchError, UnknownSkillError, RequiresDeclarationMissing, MachinePinRefused) as exc:
+             return _err(f"kanban: {exc.code}: {exc}", 2)
+         except (PinProviderUnresolvedError, ModelProviderMismatchError) as exc:
+             return _err(f"kanban: {exc}", 2)
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 68f9a18954..1a46c981ae 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -11,6 +11,8 @@ Guards:
+ 
+ * the target labels must be satisfiable now by a registry machine other than this one that is active and not
+   on hold (``machine:<x>`` for an unregistered x never is);
++* ``machine:<x>`` needs x to advertise pickup (``placement_unavailable`` otherwise: x would never copy the card,
++  :func:`hermes_cli.kanban_worker_node.check_machine_pins`);
+ * ``kanban.move.max_moves`` (default 3) moves per card;
+ * moving back to a machine the card already left is ping-pong: refused unless ``force``, and it still counts;
+ * ``dir`` / ``worktree`` workspaces exist only on their creator, so those cards never move;
+@@ -103,6 +105,10 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+     matches = matching_machines(labels, machines, me=me)
+     if not matches:
+         raise MoveRefused("no_machine", f"no active, unheld machine other than {me} has every label in {labels}")
++    try:
++        wn.check_machine_pins(conn, labels, machines=machines, me=me)
++    except wn.MachinePinRefused as exc:
++        raise MoveRefused(exc.code, str(exc)) from exc
+     from hermes_cli import kanban_runs_on_capabilities as roc
+     try:
+         requires = json.loads(row["requires"]) if row["requires"] else []
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index a22e3f45ae..3983cb0531 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -81,6 +81,70 @@ def advertises_pickup(entry: Optional[Mapping[str, Any]]) -> bool:
+     return value is True
+ 
+ 
++class MachinePinRefused(Exception):  # not ValueError: label-syntax handlers must not swallow its code
++    """An explicit ``runs_on`` names ``machine:<name>`` for a machine that never copies this board's cards.
++
++    Such a card sits ``ready`` forever: only that machine may lease it, and it never looks (10-28: three hub cards
++    with ``runs_on=[machine:macbook]`` were never claimed). Nothing was written; the working route is a
++    cross-gateway create on the machine's own gateway (``placement="<name>"``)."""
++
++    code = "placement_unavailable"
++
++    def __init__(self, machine: str, why: str):
++        self.machine = machine
++        super().__init__(
++            f"runs_on names machine:{machine}, but {why}, so no worker would ever claim the card on this board. "
++            f"Nothing was written. Create it on that machine's own gateway instead: kanban_create("
++            f"placement=\"{machine}\") (a cross-gateway create, origin-bound to this chat), or "
++            f"`hermes-hub create-task {machine} ...`.")
++
++    @property
++    def tool_error_fields(self) -> dict:
++        return {"machine": self.machine, "placement": self.machine, "created": False}
++
++
++def check_machine_pins(conn: sqlite3.Connection, runs_on: Any, *,
++                       machines: Optional[Mapping[str, Mapping[str, Any]]] = None,
++                       me: Optional[str] = None) -> None:
++    """Refuse (:class:`MachinePinRefused`) a ``runs_on`` naming ``machine:<x>`` (x not this machine) unless x is an
++    active registry machine that advertises pickup (:func:`advertises_pickup`; null or missing = no pickup).
++    Labels other than ``machine:*`` are not checked. A no-op off a Board primary (``set_runs_on`` refuses there).
++    The registry unreachable fails closed: pickup cannot be confirmed."""
++    if runs_on is None:
++        return
++    labels = normalize_runs_on(runs_on if isinstance(runs_on, str) else list(runs_on))
++    names = [lab.split(":", 1)[1] for lab in labels or [] if lab.startswith("machine:")]
++    if not names or sync.board_mode(conn) != "primary":
++        return
++    me = me or _own(conn)
++    names = [n for n in names if n != me]
++    if not names:
++        return
++    pool = machines
++    if pool is None:
++        reg = registry()
++        if reg is None:
++            raise MachinePinRefused(names[0], "the Board machine registry is unreachable, so its pickup is unknown")
++        pool = reg.get("machines") or {}
++    for name in names:
++        entry = pool.get(name)
++        if not entry:
++            raise MachinePinRefused(name, "no machine of that name is enrolled in the Board registry")
++        if entry.get("state", "active") != "active":
++            raise MachinePinRefused(name, f"that machine is {entry.get('state')!r}, not active")
++        if not advertises_pickup(entry):
++            raise MachinePinRefused(name, "that machine does not pick up other gateways' cards (its /v2/machines "
++                                          f"entry has pickup={entry.get('pickup')!r})")
++
++
++def explicit_runs_on(conn: sqlite3.Connection, value: Any) -> Optional[list[str]]:
++    """A caller-supplied ``runs_on`` (create tool / CLI): :func:`normalize_runs_on`, then :func:`check_machine_pins`.
++    Placement-derived ``runs_on`` (``placement_runs_on``, ``heavy_route``) keeps its own pickup rule."""
++    labels = normalize_runs_on(value)
++    check_machine_pins(conn, labels)
++    return labels
++
++
+ def placement_runs_on(conn: sqlite3.Connection, placement: Any) -> Optional[list[str]]:
+     """``placement=<gateway>`` on a primary board, naming another active machine in the registry that picks up other
+     gateways' cards -> ``[machine:<gateway>]``. None for ``auto``/``local``/this gateway/unknown names/machines
+diff --git a/tests/hermes_cli/test_kanban_move.py b/tests/hermes_cli/test_kanban_move.py
+index bbec12fdfc..a79c1d3043 100644
+--- a/tests/hermes_cli/test_kanban_move.py
++++ b/tests/hermes_cli/test_kanban_move.py
+@@ -125,7 +125,9 @@ def test_max_moves_and_ping_pong(gws):
+     hub, _ = gws
+     hub.enter()
+     tid = kb.create_task(hub.conn, title="q", assignee="default")
+-    machines = {**MACHINES, "w2": {"name": "w2", "state": "active", "labels": ["linux"], "hold": False}}
++    # Every target advertises pickup: a machine:<x> move to a machine without it is refused (placement_unavailable).
++    machines = {**MACHINES, HUB: {**MACHINES[HUB], "pickup": "explicit"},
++                "w2": {"name": "w2", "state": "active", "labels": ["linux"], "hold": False, "pickup": "all"}}
+     # hub -> worker-1 -> w2: each move leaves a machine.
+     assert km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="1", machines=machines, me=HUB)["ok"]
+     assert km.move_queued(hub.conn, tid, runs_on=["machine:w2"], reason="2", machines=machines, me=WORKER)["ok"]
+diff --git a/tests/hermes_cli/test_kanban_runs_on_pickup_guard.py b/tests/hermes_cli/test_kanban_runs_on_pickup_guard.py
+new file mode 100644
+index 0000000000..f8cadff3ff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_runs_on_pickup_guard.py
+@@ -0,0 +1,183 @@
++"""An explicit ``runs_on=[machine:<x>]`` is refused unless x advertises pickup in the Board registry. [daveey]
++
++10-28: three hub cards created with ``runs_on=["machine:macbook"]`` sat ``ready`` until archived: only the MacBook
++may lease them, and it never copies hub cards (``/v2/machines`` ``pickup: null``). Every write of ``runs_on`` is
++covered: create (agent tool and ``hermes kanban create``; placement-derived
++``runs_on`` keeps its own rule) and ``kanban move`` (queued card and the agent
++tool from a running card). ``kanban edit`` / the dashboard cannot write ``runs_on``. Auto-placement is unchanged.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    hub.enter()
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _registry(macbook_pickup):
++    """The live 10-29 registry shape: every entry carries ``pickup`` (null unless the machine published one)."""
++    mac = {**MACHINES["macbook"], "pickup": macbook_pickup}
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": [MACHINES[HUB], MACHINES[WORKER], mac]})
++
++
++def _count(conn):
++    return conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
++
++
++def _tool(handler, args):
++    from tools import kanban_tools
++    return json.loads(getattr(kanban_tools, handler)(args))
++
++
++# --- create ---------------------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("macbook_pickup", [None, False, "off"])
++def test_tool_create_pinned_to_a_machine_without_pickup_is_refused(gws, macbook_pickup):
++    hub, _ = gws
++    _registry(macbook_pickup)
++    before = _count(hub.conn)
++    out = _tool("_handle_create", {"title": "mac readback", "assignee": "default", "runs_on": ["machine:macbook"]})
++    assert out.get("code") == "placement_unavailable", out
++    assert 'placement="macbook"' in out["error"] and out.get("created") is False, out
++    assert _count(hub.conn) == before
++
++
++def test_tool_create_pinned_to_an_unknown_machine_is_refused(gws):
++    _hub, _ = gws
++    _registry(None)
++    out = _tool("_handle_create", {"title": "x", "assignee": "default", "runs_on": ["machine:nosuchbox"]})
++    assert out.get("code") == "placement_unavailable" and 'placement="nosuchbox"' in out["error"], out
++
++
++def test_a_missing_pickup_field_counts_as_no_pickup(gws):
++    _hub, _ = gws
++    mac = {k: v for k, v in MACHINES["macbook"].items() if k != "pickup"}
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": [MACHINES[HUB], MACHINES[WORKER], mac]})
++    out = _tool("_handle_create", {"title": "x", "assignee": "default", "runs_on": ["machine:macbook"]})
++    assert out.get("code") == "placement_unavailable" and "pickup=None" in out["error"], out
++
++
++def test_an_unreachable_registry_refuses_a_machine_pin(gws):
++    _hub, _ = gws
++
++    def down():
++        raise OSError("board down")
++    wn.set_registry_fetch(down)
++    out = _tool("_handle_create", {"title": "x", "assignee": "default", "runs_on": ["machine:macbook"]})
++    assert out.get("code") == "placement_unavailable" and "unreachable" in out["error"], out
++
++
++@pytest.mark.parametrize("macbook_pickup", ["explicit", "all"])
++def test_tool_create_pinned_to_a_machine_that_advertises_pickup_is_accepted(gws, macbook_pickup):
++    hub, _ = gws
++    _registry(macbook_pickup)
++    out = _tool("_handle_create", {"title": "mac readback", "assignee": "default", "runs_on": ["machine:macbook"]})
++    assert "error" not in out, out
++    row = hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (out["task_id"],)).fetchone()
++    assert json.loads(row[0]) == ["machine:macbook"]
++
++
++def test_own_machine_and_plain_labels_are_not_checked(gws):
++    _hub, _ = gws
++    _registry(None)
++    for runs_on in (["machine:hub"], ["linux"]):
++        out = _tool("_handle_create", {"title": f"on {runs_on}", "assignee": "default", "runs_on": runs_on})
++        assert out.get("runs_on") == runs_on, out
++
++
++def test_cli_create_gets_the_same_two_results(gws):
++    hub, _ = gws
++    from hermes_cli import kanban as kcli
++    _registry(None)
++    before = _count(hub.conn)
++    out = kcli.run_slash('create "mac" --assignee default --runs-on machine:macbook --json')
++    assert "placement_unavailable" in out and 'placement="macbook"' in out, out
++    assert _count(hub.conn) == before
++    _registry("explicit")
++    tid = json.loads(kcli.run_slash('create "mac" --assignee default --runs-on machine:macbook --json'))["id"]
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
++        "machine:macbook"]
++
++
++# --- move -----------------------------------------------------------------------------------------------------
++
++def test_move_queued_to_a_machine_without_pickup_is_refused_and_accepted_with_it(gws):
++    hub, _ = gws
++    _registry(None)
++    tid = kb.create_task(hub.conn, title="queued", assignee="default", runs_on=["machine:hub"])
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:macbook"], reason="needs the mac")
++    assert res["ok"] is False and res["reason_code"] == "placement_unavailable", res
++    assert 'placement="macbook"' in res["error"]
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
++        "machine:hub"]
++    _registry("all")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:macbook"], reason="needs the mac")
++    assert res["ok"] and res["matches"] == ["macbook"], res
++
++
++def test_cli_move_gets_the_same_two_results(gws, capsys):
++    hub, _ = gws
++    from hermes_cli import kanban as kcli
++    _registry(None)
++    tid = kb.create_task(hub.conn, title="queued", assignee="default", runs_on=["machine:hub"])
++    out = kcli.run_slash(f'move {tid} --runs-on machine:macbook --reason "needs the mac" --json')
++    res = json.loads(out)
++    assert res["ok"] is False and res["reason_code"] == "placement_unavailable", res
++    _registry("explicit")
++    res = json.loads(kcli.run_slash(f'move {tid} --runs-on machine:macbook --reason "needs the mac" --json'))
++    assert res["ok"] and res["runs_on"] == ["machine:macbook"], res
++
++
++def test_tool_move_of_a_running_card_to_a_machine_without_pickup_is_refused(gws, monkeypatch):
++    hub, _ = gws
++    _registry(None)
++    tid = kb.create_task(hub.conn, title="work", assignee="default", runs_on=["machine:hub"])
++    hub.round()
++    hub.tick()
++    run_id = hub.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    out = _tool("_handle_move", {"task_id": tid, "runs_on": ["machine:macbook"], "reason": "needs the mac",
++                                 "checkpoint": "step 1 done"})
++    assert "does not pick up" in out["error"] and 'placement="macbook"' in out["error"], out
++    task = kb.get_task(hub.conn, tid)
++    assert task is not None and task.status == "running"
++
++
++# --- auto-placement unchanged -----------------------------------------------------------------------------------
++
++def test_placement_pin_still_becomes_runs_on_only_with_pickup(gws, monkeypatch):
++    """``placement=<machine>`` keeps its own rule (placement_runs_on): pickup -> runs_on, none -> gateway route."""
++    hub, _ = gws
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    _registry(None)
++    assert wn.placement_runs_on(hub.conn, WORKER) == ["machine:worker-1"]
++    assert wn.placement_runs_on(hub.conn, "macbook") is None
++    out = _tool("_handle_create", {"title": "on the worker", "assignee": "default", "placement": WORKER})
++    assert out["runs_on"] == ["machine:worker-1"], out
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index e69026704c..c87eae7377 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1760,7 +1760,7 @@ def _handle_create(args: dict, **kw) -> str:
+         # other pin, a routed gateway included, falls through to the gateway route below. [daveey]
+         from hermes_cli import kanban_worker_node as _wn
+         try:
+-            runs_on = _wn.normalize_runs_on(args.get("runs_on"))
++            runs_on = _wn.explicit_runs_on(conn, args.get("runs_on"))  # machine pins need pickup
+         except ValueError as exc:
+             return tool_error(str(exc))
+         pinned_machine = None
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 60ee132d54..98dd8033ba 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -399,7 +399,7 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "runs_on": {"type": "array", "items": {"type": "string"}, "description": (
+             "Labels the next machine must have, e.g. [\"machine:worker-1\"], [\"macos\"], [\"linux\"]. "
+-            "machine:<name> pins one registered machine."
++            "machine:<name> pins one registered machine that picks up this board (else refused)."
+         )},
+         "reason": _prop("string", "Why the card must move (what this machine lacks). Logged on the card."),
+         "checkpoint": _prop("string", (
+@@ -733,7 +733,8 @@ KANBAN_CREATE_SCHEMA = _schema(
+                     "description": "Machine labels the card needs (all of them), on a board that syncs to the "
+                     "Board service: e.g. ['linux'], ['macos', 'xcode'], ['machine:<name>'] for one machine, "
+                     "[] for any machine. Omit for the default: it runs here, or on a machine like this one "
+-                    "if it waits too long."},
++                    "if it waits too long. 'machine:<name>' is refused (placement_unavailable) unless that "
++                    "machine picks up this board; then use placement='<name>'."},
+         "placement": _prop("string", (
+                 "Where the card runs. 'auto' (default): on a gateway with a "
+                 "kanban.placement route (e.g. the MacBook -> 'hub', the gateway "
+-- 
+2.55.0
+

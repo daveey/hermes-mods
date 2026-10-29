@@ -1,6 +1,6 @@
 # Creating a card blocked with a human_request classifies it needs_input
 
-Patch: 0693 (daveey/hermes `d4cb0dafe1`). Related: [kanban-ownerless-blocks.md](kanban-ownerless-blocks.md).
+Patch: 0705 (daveey/hermes `d4cb0dafe1`). Related: [kanban-ownerless-blocks.md](kanban-ownerless-blocks.md).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ Patch: 0693 (daveey/hermes `d4cb0dafe1`). Related: [kanban-ownerless-blocks.md](
 
 ## Applying
 
-`git am -3` 0693 in series order.
+`git am -3` 0705 in series order.
 
 ## Gotchas
 

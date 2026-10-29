@@ -1,0 +1,688 @@
+From 4206276bd9f7cffcdcca3262e0e8592ce449d854 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:57:33 +0000
+Subject: [PATCH] fix(kanban): archive under another machine's live lease sends
+ a stop request, not a rejected write [daveey]
+
+kanban_archive (tool, CLI, dashboard) on a card another gateway runs under its live Board
+lease used to write 'archived' locally and report success; the Board rejected the status
+write (live_claim), the card read back running and the remote worker kept going.
+
+Now the requester appends an archive_requested event (events are not lease-fenced) and
+returns {status: archive_pending, holder}; no local 'archived' event. The holder pulls the
+event, which wakes its dispatcher; that tick archives the card there (host-local worker
+terminated, holder's status write accepted). A board whose capture would not carry the
+request refuses with code remote_live_lease naming the holder.
+
+Other lifecycle tools (complete/block/unblock/schedule/continue/request_review/
+request_changes) on such a card are refused up front (rejection live_claim, holder), and
+any task write the Board still rejects live_claim leaves a sync_rejected event on the card.
+---
+ hermes_cli/kanban.py                          |  26 +-
+ hermes_cli/kanban_db_dispatch.py              |   9 +
+ hermes_cli/kanban_db_sync.py                  |   2 +
+ hermes_cli/kanban_remote_stop.py              | 143 +++++++++++
+ hermes_cli/kanban_sync_client.py              |  14 ++
+ plugins/kanban/dashboard/plugin_api.py        |  39 ++-
+ .../hermes_cli/test_kanban_remote_archive.py  | 232 ++++++++++++++++++
+ tools/kanban_tools.py                         |  47 +++-
+ 8 files changed, 499 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_remote_stop.py
+ create mode 100644 tests/hermes_cli/test_kanban_remote_archive.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 9ff92ccd80..9154077258 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1570,8 +1570,30 @@ def _cmd_archive(args: argparse.Namespace) -> int:
+             refusal, vias[tid] = worker_archive_scope(conn, tid)
+             if refusal:
+                 return _err(refusal)
+-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid, via=vias.get(tid)),
+-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
++        # A card another machine runs under its live Board lease gets a stop request, not a local status write
++        # the Board would reject (kanban_remote_stop). [daveey]
++        from hermes_cli.kanban_remote_stop import RemoteArchiveRefused, archive as _archive
++        outcomes: dict[str, dict] = {}
++        refusals: dict[str, str] = {}
++
++        def _one(tid: str) -> bool:
++            try:
++                out = _archive(conn, tid, via=vias.get(tid))
++            except RemoteArchiveRefused as exc:
++                refusals[tid] = str(exc)
++                return False
++            if out:
++                outcomes[tid] = out
++            return bool(out)
++
++        def _ok_line(tid: str) -> str:
++            out = outcomes[tid]
++            if out.get("status") == "archive_pending":
++                return (f"Archive pending {tid}: running on {out['holder']} under its live lease; a stop request "
++                        f"was sent and {out['holder']} archives it at its next dispatcher tick")
++            return f"Archived {tid}"
++
++        return _bulk_apply(ids, _one, _ok_line, lambda tid: refusals.get(tid) or f"cannot archive {tid}")
+ 
+ 
+ def _cmd_stats(args: argparse.Namespace) -> int:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 328b138b5d..7888ffc115 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -185,6 +185,8 @@ class DispatchResult:
+     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+     crashed: list[str] = field(default_factory=list)
+     """Task ids reclaimed because their worker PID disappeared."""
++    remote_archived: list[str] = field(default_factory=list)
++    """Task ids archived on a stop request from another gateway (``kanban_remote_stop``)."""
+     auto_blocked: list[str] = field(default_factory=list)
+     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+     agent_block_escalated: list[str] = field(default_factory=list)
+@@ -2443,6 +2445,13 @@ def _run_reclaim_phase(
+     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+     reap_worker_zombies()
+     result.reaped_terminal_workers = reap_terminal_workers(conn)
++    # Stop requests another gateway sent for cards this gateway runs under its own Board lease (kanban_archive of a
++    # card running on this machine). Before the reclaim sweeps, so they see the archived card. [daveey]
++    from hermes_cli.kanban_remote_stop import apply_stop_requests
++    try:
++        result.remote_archived = apply_stop_requests(conn)
++    except Exception:
++        _kb._log.warning("kanban: applying remote stop requests failed", exc_info=True)
+     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+     if reconcile_orphans:
+         result.reconciled_orphans = reconcile_orphaned_running(conn)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9cfb94d2e2..cfe7df0130 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1017,6 +1017,8 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+     names = ["uid", *cols]
+     conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                  (ch.uid, *cols.values()))
++    if table == "task_events" and ch.fields.get("kind") == "archive_requested":
++        result.wake_dispatcher = True  # a stop request for a card this gateway may hold (kanban_remote_stop)
+     return True
+ 
+ 
+diff --git a/hermes_cli/kanban_remote_stop.py b/hermes_cli/kanban_remote_stop.py
+new file mode 100644
+index 0000000000..fc3bc7b2a1
+--- /dev/null
++++ b/hermes_cli/kanban_remote_stop.py
+@@ -0,0 +1,143 @@
++"""Archive a card another machine is running: a stop request through the Board, acted on by the lease holder. [daveey]
++
++On a primary board a card this gateway created can run on another machine under that machine's Board lease
++(worker nodes, ``kanban_worker_node``). The Board fences every status write on such a card to the lease holder
++(``live_claim``), so archiving it here used to write ``archived`` locally, report success, and then have the push
++rejected: the card read back ``running`` and the remote worker kept going.
++
++Now the requester does not write the status at all. It appends an ``archive_requested`` event (events are not
++fenced, so the Board accepts it from any gateway) and reports ``archive_pending``. The holder pulls the event into its
++copy of the card, which wakes its dispatcher; that tick (:func:`apply_stop_requests`) archives the card there,
++terminating its host-local worker, and the holder's status write (it owns the lease) reaches every gateway.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++from typing import Any, Callable, Optional
++
++from hermes_cli import kanban_db_sync as sync
++
++_log = logging.getLogger(__name__)
++
++STOP_KIND = "archive_requested"
++VIA = "remote_archive_request"
++
++
++class RemoteArchiveRefused(ValueError):
++    """The card runs under another machine's live lease and this board cannot carry a stop request to it."""
++
++    code = "remote_live_lease"
++
++    def __init__(self, task_id: str, holder: str, why: str) -> None:
++        super().__init__(f"cannot archive {task_id}: it is running under {holder}'s live lease and {why}. "
++                         f"Nothing changed. Archive it on {holder}, or wait for the run to end.")
++        self.task_id, self.holder = task_id, holder
++        self.tool_error_fields = {"holder": holder, "rejection": "live_claim"}
++
++
++def remote_holder(conn: sqlite3.Connection, task_id: str, now_ms: Optional[int] = None) -> Optional[str]:
++    """The other gateway whose live Board lease covers ``task_id`` (no local claim), else None.
++
++    Only primary boards mirror leases; an expired lease is not a holder (the Board accepts writes again)."""
++    if sync.board_mode(conn) != "primary":
++        return None
++    row = conn.execute("SELECT status, claim_lock, lease_holder, lease_expires FROM tasks WHERE id = ?",
++                       (task_id,)).fetchone()
++    if row is None or not row["lease_holder"] or row["lease_expires"] is None or row["claim_lock"] is not None:
++        return None
++    own = str(sync._state(conn)["gateway_id"])
++    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
++    if row["lease_holder"] == own or int(row["lease_expires"]) <= now_ms:
++        return None
++    return str(row["lease_holder"])
++
++
++def _run_uid(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    row = conn.execute("SELECT r.uid FROM tasks t JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
++                       (task_id,)).fetchone()
++    return row[0] if row and row[0] else None
++
++
++def request_archive(conn: sqlite3.Connection, task_id: str, holder: str, *, via: Optional[str] = None) -> dict:
++    """Queue a stop request for ``holder`` (an ``archive_requested`` event pushed to the Board) and return
++    ``{"status": "archive_pending", "holder": ...}``. Raises :class:`RemoteArchiveRefused` when the event would
++    not reach the Board (nothing captured it into the outbox); nothing is left written in that case."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import write_txn
++    own = str(sync._state(conn)["gateway_id"])
++    payload: dict[str, Any] = {"holder": holder, "requested_by": own, "run_uid": _run_uid(conn, task_id)}
++    if via:
++        payload["via"] = via
++    with write_txn(conn):
++        before = conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name = 'task_events'").fetchone()[0]
++        kb._append_event(conn, task_id, STOP_KIND, payload, run_id=kb._current_run_id(conn, task_id))
++        after = conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name = 'task_events'").fetchone()[0]
++        if after <= before:
++            # The capture trigger did not record it: the Board would never hear of it. Undo and refuse.
++            conn.execute("DELETE FROM task_events WHERE id = (SELECT MAX(id) FROM task_events WHERE task_id = ? "
++                         "AND kind = ?)", (task_id, STOP_KIND))
++            raise RemoteArchiveRefused(task_id, holder, "this board cannot send it a stop request")
++    # The sync loop sees the pending outbox row within a tick (``wait_for_work``) and pushes it.
++    _log.info("kanban: archive of %s requested from %s (lease holder %s)", task_id, own, holder)
++    return {"status": "archive_pending", "holder": holder}
++
++
++def archive(conn: sqlite3.Connection, task_id: str, *, via: Optional[str] = None, signal_fn=None) -> Optional[dict]:
++    """Archive ``task_id``, or send a stop request when another machine holds its live lease.
++
++    Returns ``{"status": "archived"}``, ``{"status": "archive_pending", "holder": h}``, or None when the card
++    cannot be archived (unknown, already archived). Raises :class:`RemoteArchiveRefused`."""
++    from hermes_cli import kanban_db as kb
++    holder = remote_holder(conn, task_id)
++    if holder is not None:
++        return request_archive(conn, task_id, holder, via=via)
++    return {"status": "archived"} if kb.archive_task(conn, task_id, via=via, signal_fn=signal_fn) else None
++
++
++def _wants_stop(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str], run_started: int) -> Optional[dict]:
++    """The newest stop request for the card's current run, else None."""
++    for kind_payload, created_at in conn.execute(
++            "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC",
++            (task_id, STOP_KIND)).fetchall():
++        try:
++            payload = json.loads(kind_payload or "{}")
++        except ValueError:
++            payload = {}
++        asked_run = payload.get("run_uid")
++        if asked_run:
++            if asked_run == run_uid:
++                return payload
++            continue  # aimed at an earlier run of the card
++        if int(created_at or 0) >= int(run_started or 0):
++            return payload
++    return None
++
++
++def apply_stop_requests(conn: sqlite3.Connection, *, signal_fn: Optional[Callable] = None) -> list[str]:
++    """Holder side (each dispatcher tick): archive every card this gateway runs under its own lease that has a
++    stop request for the current run. ``archive_task`` terminates the host-local worker; the status write is
++    the lease holder's, so the Board accepts it. Returns the ids archived."""
++    if sync.board_mode(conn) != "primary":
++        return []
++    from hermes_cli import kanban_db as kb
++    own = str(sync._state(conn)["gateway_id"])
++    rows = conn.execute(
++        "SELECT t.id, r.uid AS run_uid, COALESCE(r.started_at, t.started_at, 0) AS run_started "
++        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
++        "WHERE t.status = 'running' AND t.claim_lock IS NOT NULL AND t.lease_holder = ? "
++        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ?)", (own, STOP_KIND)).fetchall()
++    done: list[str] = []
++    for row in rows:
++        request = _wants_stop(conn, row["id"], row["run_uid"], row["run_started"])
++        if request is None:
++            continue
++        try:
++            if kb.archive_task(conn, row["id"], via=VIA, signal_fn=signal_fn):
++                done.append(row["id"])
++                _log.info("kanban: archived %s on a stop request from %s", row["id"], request.get("requested_by"))
++        except Exception:  # health: allow BLE001 -- one card's archive must not stop the dispatcher tick
++            _log.warning("kanban: stop request for %s failed", row["id"], exc_info=True)
++    return done
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 014e96eed6..13d0737171 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -295,6 +295,18 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+     return out
+ 
+ 
++def _record_live_claim_rejection(conn: sqlite3.Connection, row: dict, reason: str) -> None:
++    """A card write the Board refused because another gateway holds the card's live lease leaves a
++    ``sync_rejected`` event on the card (inside the push txn), so ``kanban show`` says the write never happened
++    instead of the card silently reverting to the service's row. [daveey]"""
++    from hermes_cli import kanban_db as kb
++    fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"] or "{}")
++    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (row["row_uid"],)).fetchone() is None:
++        return
++    kb._append_event(conn, row["row_uid"], "sync_rejected",
++                     {"reason": reason[:300], "fields": sorted(fields), "op_id": row["op_id"]})
++
++
+ @dataclass
+ class PushResult:
+     sent: int = 0
+@@ -369,6 +381,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                                  "WHERE op_id = ?", (reason[:500], op_id))
+                     out.rejected += 1
+                     _log.warning("kanban sync: %s %s %s rejected (%s)", board, row["table_name"], row["row_uid"], reason)
++                    if row["table_name"] == "tasks" and res.get("reason") == "live_claim":
++                        _record_live_claim_rejection(conn, row, reason)
+                     if primary and res.get("row"):
+                         authoritative.append(_row_change(row["table_name"], res["row"]))
+         if authoritative:
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 5ecd4e36e0..04e7822d17 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -813,19 +813,32 @@ _OVERRIDE_OPS = (
+ )
+ 
+ 
+-def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_deferred: bool) -> None:
++def _archive(conn, task_id: str) -> tuple[bool, Optional[str]]:
++    """Archive, or send a stop request when another machine runs the card under its live Board lease
++    (``kanban_remote_stop``): ``(ok, holder)``, holder set when the archive is pending there. [daveey]"""
++    from hermes_cli.kanban_remote_stop import RemoteArchiveRefused, archive
++    try:
++        out = archive(conn, task_id)
++    except RemoteArchiveRefused as exc:
++        raise _conflict(str(exc)) from exc
++    return bool(out), (out or {}).get("holder") if (out or {}).get("status") == "archive_pending" else None
++
++
++def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_deferred: bool) -> Optional[str]:
+     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
+-    (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
++    (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast).
++    Returns the lease holder when an archive is pending on another machine."""
+     s = payload.status
++    pending: Optional[str] = None
+     if s == "archived":
+-        ok = kanban_db.archive_task(conn, task_id)
++        ok, pending = _archive(conn, task_id)
+     else:
+         with _map_errors(400, _StatusRejected, ValueError):
+             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
+         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
+             ok = kanban_db.assign_task(conn, task_id, None)
+     if ok:
+-        return
++        return pending
+     blockers = _parents_blocking_ready(conn, task_id) if s == "ready" else []
+     if blockers:
+         names = ", ".join(f"{p['title']!r} ({p['id']}, status={p['status']})" for p in blockers)
+@@ -885,8 +898,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+         if payload.assignee is not None and not review_assignee_deferred:
+             with _map_errors(409, RuntimeError), _value_error_400():
+                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
++        pending = None
+         if payload.status is not None:
+-            _patch_status(conn, task_id, payload, review_assignee_deferred)
++            pending = _patch_status(conn, task_id, payload, review_assignee_deferred)
+         for wanted, apply, _refused in _OVERRIDE_OPS:
+             if wanted(payload):
+                 with _map_errors(400, ValueError, RuntimeError):
+@@ -899,7 +913,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
+         updated = kanban_db.get_task(conn, task_id)
+         return {"task": _task_dict(
+             updated, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
+-        ) if updated else None}
++        ) if updated else None, **({"archive_pending": pending} if pending else {})}
+ 
+ 
+ @router.delete("/tasks/{task_id}")
+@@ -1020,8 +1034,17 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
+         if not _classify_request(conn, tid, payload, actor):
+             entry.update(ok=False, error="classification requires parked card without a current run")
+         return
+-    if payload.archive and not kanban_db.archive_task(conn, tid):
+-        entry.update(ok=False, error="archive refused")
++    if payload.archive:
++        try:
++            ok, pending = _archive(conn, tid)
++        except HTTPException as exc:
++            ok, pending = False, None
++            entry.update(ok=False, error=str(exc.detail))
++        else:
++            if not ok:
++                entry.update(ok=False, error="archive refused")
++            elif pending:
++                entry.update(archive_pending=pending)
+     if payload.status is not None and not payload.archive:
+         s = payload.status
+         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+diff --git a/tests/hermes_cli/test_kanban_remote_archive.py b/tests/hermes_cli/test_kanban_remote_archive.py
+new file mode 100644
+index 0000000000..b4a3a2e9cd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_archive.py
+@@ -0,0 +1,232 @@
++"""Archiving a card another machine runs under its live Board lease (kanban_remote_stop). [daveey]
++
++Before: kanban_archive on the creator wrote ``archived`` locally and answered ``{"status": "archived"}``; the Board
++rejected the status write (``live_claim``), the card read back ``running`` and the remote worker kept going. Now the
++creator sends a stop request (an ``archive_requested`` event) and answers ``archive_pending``; the holder archives
++the card at its next dispatcher tick, terminating its worker. Two gateways share the in-memory Board fake.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER, Gateway
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_DB"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++@pytest.fixture
++def kills(monkeypatch):
++    """Record worker terminations instead of signalling: the fake spawns report the test's own pid."""
++    sent: list[tuple[int, int]] = []
++    monkeypatch.setattr(kbd, "_kill_fn", lambda signal_fn: (lambda pid, sig: sent.append((pid, sig))))
++    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda pid, started_at=None: True)
++    return sent
++
++
++def _events(conn, tid):
++    return [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
++
++
++def _running_on_worker(hub, worker, svc):
++    """A hub card the worker claims and runs; both sides synced, hub reads it running under worker-1's lease."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="remote work", assignee="default", runs_on=["linux"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++    worker.round()
++    hub.round()
++    row = hub.conn.execute("SELECT status, lease_holder, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (row["status"], row["lease_holder"], row["claim_lock"]) == ("running", WORKER, None)
++    return tid
++
++
++def _tool(name, args):
++    from tools import kanban_tools
++    return json.loads(getattr(kanban_tools, name)(args))
++
++
++def test_tool_archive_under_a_remote_lease_is_pending_and_writes_no_archived_event(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    out = _tool("_handle_archive", {"task_id": tid})
++    assert out == {"ok": True, "task_id": tid, "status": "archive_pending", "holder": WORKER}
++    assert kb.get_task(hub.conn, tid).status == "running"
++    events = _events(hub.conn, tid)
++    assert "archived" not in events and "archive_requested" in events
++    # Nothing queued for the Board would move the card's status; the request is an event.
++    ops = [(r["table_name"], json.loads(r["fields"])) for r in hub.conn.execute(
++        "SELECT table_name, fields FROM kanban_sync_outbox WHERE state = 'pending'")]
++    assert not [f for t, f in ops if t == "tasks" and "status" in f]
++    assert any(t == "task_events" and f.get("kind") == "archive_requested" for t, f in ops)
++    hub.round()
++    assert not hub.conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state = 'rejected'").fetchone()
++    assert kills == []  # the creator never signals a worker it does not run
++
++
++def test_cli_archive_under_a_remote_lease_is_pending(gws, svc, kills, capsys):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    from hermes_cli import kanban as kcli
++    out = kcli.run_slash(f"archive {tid}")
++    assert "Archive pending" in out and WORKER in out, out
++    assert kb.get_task(hub.conn, tid).status == "running"
++    assert "archived" not in _events(hub.conn, tid)
++
++
++def test_the_holder_stops_its_worker_at_the_next_tick_and_the_card_reads_archived(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    assert _tool("_handle_archive", {"task_id": tid})["status"] == "archive_pending"
++    hub.round()  # the stop request reaches the Board
++    sync.consume_dispatcher_wake()
++    worker.round()  # ... and the holder's copy of the card
++    assert sync.consume_dispatcher_wake()  # which wakes its dispatcher now, not at the next poll
++    pid = worker.conn.execute("SELECT worker_pid FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    res = worker.tick()
++    assert res.remote_archived == [tid]
++    assert kills and kills[0][0] == pid  # its worker was terminated
++    assert kb.get_task(worker.conn, tid).status == "archived"
++    term = json.loads(worker.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archive_worker_termination'",
++        (tid,)).fetchone()[0])
++    assert term["host_local"] is True and term["terminated"] is True
++    worker.round()
++    assert tid not in svc.board(BOARD)["leases"]
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == "archived"
++    hub.round()
++    assert kb.get_task(hub.conn, tid).status == "archived"
++    archived = json.loads(hub.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'", (tid,)).fetchone()[0])
++    assert archived["via"] == "remote_archive_request"
++    # A second tick does nothing more.
++    assert worker.tick().remote_archived == []
++
++
++def test_a_stop_request_for_an_earlier_run_does_not_stop_the_current_one(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    worker.enter()
++    with kb.write_txn(worker.conn):
++        kb._append_event(worker.conn, tid, "archive_requested", {"holder": WORKER, "run_uid": "old-run"})
++    assert worker.tick().remote_archived == []
++    assert kb.get_task(worker.conn, tid).status == "running"
++
++
++def test_archive_of_a_host_local_running_card_behaves_as_before(gws, svc, kills):
++    hub, _worker = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="hub's own", assignee="default", runs_on=["machine:hub"])
++    hub.tick()
++    assert kb.get_task(hub.conn, tid).status == "running"
++    out = _tool("_handle_archive", {"task_id": tid})
++    assert out == {"ok": True, "task_id": tid, "status": "archived"}
++    assert kb.get_task(hub.conn, tid).status == "archived"
++    term = json.loads(hub.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archive_worker_termination'",
++        (tid,)).fetchone()[0])
++    assert term["host_local"] is True and term["terminated"] is True and kills
++    hub.round()
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == "archived"
++
++
++def test_archive_is_refused_with_the_holder_named_when_the_board_cannot_carry_a_stop_request(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    for (name,) in hub.conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' "
++                                    "AND tbl_name = 'task_events'").fetchall():
++        hub.conn.execute(f"DROP TRIGGER {name}")
++    out = _tool("_handle_archive", {"task_id": tid})
++    assert out.get("code") == "remote_live_lease" and out.get("holder") == WORKER, out
++    assert WORKER in out["error"]
++    assert kb.get_task(hub.conn, tid).status == "running"
++    assert "archive_requested" not in _events(hub.conn, tid) and "archived" not in _events(hub.conn, tid)
++
++
++def test_other_lifecycle_tools_on_a_remote_lease_are_refused_with_the_holder(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    out = _tool("_handle_block", {"task_id": tid, "reason": "stop"})
++    assert out.get("rejection") == "live_claim" and out.get("holder") == WORKER, out
++    assert kb.get_task(hub.conn, tid).status == "running"
++    out = _tool("_handle_complete", {"task_id": tid, "summary": "done elsewhere"})
++    assert out.get("rejection") == "live_claim" and out.get("holder") == WORKER, out
++    assert kb.get_task(hub.conn, tid).status == "running"
++    # The holder's own worker is not refused: on worker-1 the lease is its own.
++    worker.enter()
++    from hermes_cli.kanban_remote_stop import remote_holder
++    assert remote_holder(worker.conn, tid) is None
++
++
++def test_a_status_write_the_board_rejects_live_claim_is_recorded_on_the_card(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    # A path that bypasses the tools (an operator script) writes the status anyway.
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    hub.round()
++    rejected = hub.conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'sync_rejected'",
++                                (tid,)).fetchone()
++    assert rejected is not None
++    payload = json.loads(rejected[0])
++    assert payload["reason"].startswith("live_claim") and "status" in payload["fields"]
++    assert kb.get_task(hub.conn, tid).status == "running"  # the Board's row came back
++    assert os.getpid()  # (no worker was signalled on either side)
++    assert kills == []
++
++
++@pytest.mark.parametrize("bulk", [False, True])
++def test_dashboard_archive_under_a_remote_lease_is_pending(gws, svc, kills, bulk):
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from tests.plugins.test_kanban_dashboard_plugin import _load_plugin_router
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    app = FastAPI()
++    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
++    client = TestClient(app)
++    if bulk:
++        r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [tid], "archive": True})
++        assert r.status_code == 200, r.text
++        assert r.json()["results"] == [{"id": tid, "ok": True, "archive_pending": WORKER}]
++    else:
++        r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "archived"})
++        assert r.status_code == 200, r.text
++        assert r.json()["archive_pending"] == WORKER and r.json()["task"]["status"] == "running"
++    assert "archived" not in _events(hub.conn, tid) and "archive_requested" in _events(hub.conn, tid)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 2ddb68241c..736ec152b6 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -210,6 +210,9 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+                        f"{tool_name}: unknown parameter(s): {', '.join(unknown)}. "
+                        f"Valid parameters: {', '.join(sorted(properties))}. Nothing changed.",
+                        "invalid_args")
++                refused = _remote_lease_refusal(tool_name, args)
++                if refused is not None:
++                    return refused
+                 out = fn(args, **kw)
+                 if classify_rejections and isinstance(out, str) and out.startswith('{"error"'):
+                     out = _tag_rejection(out, "invalid_args")
+@@ -250,6 +253,40 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+     return deco
+ 
+ 
++# Tools whose write moves a card's lifecycle columns, which the Board fences to the lease holder (``live_claim``).
++# kanban_archive is not here: it sends the holder a stop request instead (kanban_remote_stop). [daveey]
++_LEASE_FENCED_TOOLS = frozenset({
++    "kanban_complete", "kanban_block", "kanban_unblock", "kanban_schedule", "kanban_continue",
++    "kanban_request_review", "kanban_request_changes",
++})
++
++
++def _remote_lease_refusal(tool_name: str, args: dict) -> Optional[str]:
++    """A typed refusal when the target card runs under another machine's live Board lease, else None.
++
++    Such a write would be committed here and then rejected by the Board (``live_claim``) after the tool had
++    reported success: the card reads back as before and the caller never learns. Refusing up front says so."""
++    if tool_name not in _LEASE_FENCED_TOOLS:
++        return None
++    tid = _default_task_id(args.get("task_id"))
++    if not tid:
++        return None
++    try:
++        from hermes_cli.kanban_remote_stop import remote_holder
++        with _board(args.get("board"), quiet_close=True) as (_kb, conn):
++            holder = remote_holder(conn, str(tid))
++    except Exception:
++        logger.debug("%s: remote lease check for %s failed", tool_name, tid, exc_info=True)
++        return None  # the handler reports its own board errors
++    if holder is None:
++        return None
++    return tool_error(
++        f"{tool_name} refused: {tid} is running under {holder}'s live lease on the Board, which accepts "
++        f"lifecycle writes only from the lease holder. Nothing changed. Act on {holder}, use kanban_archive "
++        f"(it sends {holder} a stop request), or wait for the run to end.",
++        rejection="live_claim", code="remote_live_lease", holder=holder)
++
++
+ def _reject_delegated_child_mutation(tool_name: str) -> None:
+     """A delegate_task child shares the parent's process, so inherited HERMES_KANBAN_*
+     env is not proof of ownership: it may report findings but must not mutate."""
+@@ -2037,13 +2074,17 @@ def _handle_archive(args: dict, **kw) -> str:
+     tid = args.get("task_id")
+     _check(tid, "task_id is required")
+     tid = str(tid)
+-    with _board(args.get("board")) as (kb, conn):
++    with _board(args.get("board")) as (_kb, conn):
+         from hermes_cli.kanban import worker_archive_scope
+         refusal, via = worker_archive_scope(conn, tid)
+         if refusal:
+             raise _Reject(refusal)
+-        _check(kb.archive_task(conn, tid, via=via), f"cannot archive {tid}")
+-        return _ok(task_id=tid, status="archived")
++        # A card another machine runs under its live Board lease is not archived here: the Board would reject the
++        # status write (live_claim) and the remote worker would keep running. Send it a stop request instead. [daveey]
++        from hermes_cli.kanban_remote_stop import archive as _archive
++        out = _archive(conn, tid, via=via)
++        _check(out, f"cannot archive {tid}")
++        return _ok(task_id=tid, **out)
+ 
+ 
+ @_kanban_handler("kanban_link")
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # Named browser-harness daemons stop when their owner dies or goes idle
 
-Patches **0581** (source `4c6a424f63`) and **0582** (source `c51212b4d0`).
+Patches **0594** (source `4c6a424f63`) and **0595** (source `c51212b4d0`).
 
 ## Behavior
 
@@ -8,14 +8,14 @@ Patches **0581** (source `4c6a424f63`) and **0582** (source `c51212b4d0`).
   detached (`start_new_session`), has no idle exit, and holds a browser-level CDP connection to the agent Chrome.
   Nothing stopped it when the agent that started it went away. On 2026-10-27, 18 of them were found re-parented to
   launchd (ppid 1), the oldest about 5 days old.
-- Now (0581) each `browser_exec` on a named daemon stamps `<harness runtime>/hermes-owners/<BU_NAME>/<pid>-<start>`
+- Now (0594) each `browser_exec` on a named daemon stamps `<harness runtime>/hermes-owners/<BU_NAME>/<pid>-<start>`
   (pid plus process start time, so a recycled pid does not count as the same owner). The reaper stops a stamped
   daemon through the harness's own identity-checked `--reload` when no stamp names a live process, or when no owner
   has driven it for `browser.harness_daemon_idle_s` seconds (default 7200; `0` turns the idle rule off). It runs from
   `browser_exec` at most once a minute, and at every Hermes process exit, after that process drops its own stamps. A
   daemon that a live sibling process still drives is kept.
 - The shared `default` daemon is never stamped or reaped. It is the one daemon that normal work is meant to reuse.
-- Now (0582) the `session` parameter's description tells the model to omit it for normal work, and to set a name only
+- Now (0595) the `session` parameter's description tells the model to omit it for normal work, and to set a name only
   for a browser task that runs at the same time as another one. Before, it invited a name "so concurrent tasks don't
   share tabs".
 
@@ -44,13 +44,13 @@ Why 4 (survived): nothing stops a named daemon when its owner goes away —
 Root (happened): daemon lifetime was tied to an explicit stop call on one exit path, not to the owner's liveness.
 Root (not caught): no test asserted that a daemon dies with its owner; the agent-browser orphan reaper
   (`_reap_orphaned_browser_sessions`, owner_pid files) covers agent-browser daemons only, never harness daemons.
-Recurrence: partial. 0371 (managed-chrome-leases) retires harness daemons for managed leases only (opt-in,
+Recurrence: partial. 0376 (managed-chrome-leases) retires harness daemons for managed leases only (opt-in,
   experimental); the plain CDP/local route kept leaking.
 Countermeasures:
 - symptom: 3 leftover named daemons stopped with `BU_NAME=<name> browser_harness.run --reload`.
-- root: owner stamps plus reaper (0581) — proof: tests below; real-harness repro (an owner SIGKILLed, its daemon
+- root: owner stamps plus reaper (0594) — proof: tests below; real-harness repro (an owner SIGKILLed, its daemon
   re-parented to ppid 1, the next reap stops it).
-- instructions: `session` description says omit it (0582) — proof: prompt-surface snapshot updated with it.
+- instructions: `session` description says omit it (0595) — proof: prompt-surface snapshot updated with it.
 - detection: test_sigkilled_owner_leaves_daemon_the_next_reap_stops reproduces the leak with real processes.
 ```
 
@@ -69,9 +69,9 @@ the reaper with `drop_own=True` unconditionally.
 
 - `tools/browser_use_cli.py`: `_harness_runtime_dir`, `record_daemon_owner`, `_owner_alive`,
   `reap_orphaned_harness_daemons`, `_maybe_reap_harness_daemons`, the stamp+reap call in `browser_exec`'s dispatch,
-  and the `session` description (0582).
+  and the `session` description (0595).
 - `tools/browser_tool_lifecycle.py`: `_reap_harness_daemons_on_exit` in `_emergency_cleanup_all_sessions`.
-- `tests/fixtures/prompt_surface/tools/browser_exec.json` (0582).
+- `tests/fixtures/prompt_surface/tools/browser_exec.json` (0595).
 
 ## Tests
 
@@ -90,7 +90,7 @@ the reaper with `drop_own=True` unconditionally.
 The atexit hook wiring (`_emergency_cleanup_all_sessions` → reaper) has no dedicated test; the exit behavior is
 tested by calling the reaper with `drop_own=True`. The existing browser suites (`test_browser_use_cli.py`,
 `test_browser_cleanup.py`, `test_browser_orphan_reaper.py`, `test_browser_agent_*`, 500+ tests) pass.
-`test_prompt_surface.py` cannot render on macOS (`_sysconfigdata__linux_darwin`); CI on Linux checks 0582's snapshot.
+`test_prompt_surface.py` cannot render on macOS (`_sysconfigdata__linux_darwin`); CI on Linux checks 0595's snapshot.
 
 A manual reproduction with the real harness against the agent Chrome (127.0.0.1:9333) gave: owner pid 76791 drove
 `session="reaprepro"`, daemon 76851; `kill -9` the owner → the daemon showed ppid 1; `reap_orphaned_harness_daemons()`
@@ -98,12 +98,12 @@ from a new process returned `['reaprepro']` and daemon 76851 was gone.
 
 ## Applying
 
-`git am -3` 0581 then 0582. 0581 needs `stop_harness_daemons`/`_driven_daemons` (upstream browser-use CLI backend)
+`git am -3` 0594 then 0595. 0594 needs `stop_harness_daemons`/`_driven_daemons` (upstream browser-use CLI backend)
 and `gateway.status.get_process_start_time`.
 
 ## Gotchas
 
-- Daemons started before 0581 have no stamps and are not reaped. Stop them once by hand.
+- Daemons started before 0594 have no stamps and are not reaped. Stop them once by hand.
 - A daemon driven from a terminal `browser-use` with `BU_NAME=...` (not `browser_exec`) is not stamped, so it is never reaped.
 - A gateway that hosts many sessions is one owner pid. Its named daemons are stopped by the idle window, not by owner death.
 - A name reused after a reap just respawns its daemon. The tab pin preamble is keyed by daemon pid, so the new

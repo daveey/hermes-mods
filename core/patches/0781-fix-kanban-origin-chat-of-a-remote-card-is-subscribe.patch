@@ -1,0 +1,757 @@
+From a7dd1e117cba4f5a9dd11b74cb76e5fb36274c99 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 15:58:50 +0000
+Subject: [PATCH] fix(kanban): origin chat of a remote card is subscribed and
+ hears it finish [daveey]
+
+Hub evidence 2026-10-28 (card t_01a182faed899158): hub cards placed from macbook
+chat 5ab65c had no subscription for it, and 5ab65c never got a done notice.
+
+Why 1: create_with_origin/adopt_with_origin (the courier path every placement-created
+  card takes) stored the origin binding but no platform='hub' subscription; only the
+  legacy kanban_origin.bind path subscribed.
+Why 2: even a hub subscription only feeds replica links (sidebar, task list): nothing on
+  the origin gateway turned a linked remote card's done/blocked into a chat notice.
+  Only deferred forwards notified, through their local placeholder's tui sub.
+Root: default placement moved cards to the hub, replacing a notifying local card with a
+  remote one that had no notice path. Not caught: placement tests asserted card+binding,
+  never that the origin chat is subscribed or notified.
+
+- kanban_origin_creation: _subscribe_origin adds the hub sub from the binding in the
+  creating txn (never the courier's ambient session; the courier path no longer
+  auto-subscribes its process session).
+- tui_gateway/kanban_remote_notices: per-chat poll of the hub replica for terminal cards
+  on other gateways linked (rel=shepherd) to this gateway/profile/session (+ compaction
+  lineage), one notice per state via a host-wide claim ledger, released on a refused
+  turn; states older than 6 h recorded silently; cards a local forward placeholder
+  reports are skipped (no duplicate).
+- kanban_tools._tui_session_key: a process HERMES_SESSION_KEY naming a different chat
+  than this context's bound session id is not subscribed (multi-session serve leak).
+
+Tests: tests/hermes_cli/test_kanban_origin_notify.py (10; 5 fail on the base).
+---
+ hermes_cli/kanban_origin_creation.py          |  18 +
+ tests/hermes_cli/test_kanban_origin_notify.py | 308 ++++++++++++++++++
+ tools/kanban_tools.py                         |  38 ++-
+ tui_gateway/kanban_remote_notices.py          | 200 ++++++++++++
+ tui_gateway/session_notifications.py          |  69 +++-
+ 5 files changed, 630 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_notify.py
+ create mode 100644 tui_gateway/kanban_remote_notices.py
+
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 9d02cc6116..3e0dc313f9 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -17,6 +17,22 @@ def _json(value):
+     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+ 
+ 
++def _subscribe_origin(conn, task_id: str, origin: dict) -> None:
++    """Subscribe the bound origin chat to its card (platform 'hub', ``<gw>/<profile>/<session>``) in the
++    caller's transaction. [daveey] The courier path stored the binding but no subscription, so the origin
++    chat on another gateway was never linked to the card and never got its done notice. Only the legacy
++    ``kanban_origin.bind`` path subscribed. The chat comes from the binding, never from a process env var.
++    Same row shape as ``kanban_db_notify.add_notify_sub``, which opens its own non-nested txn."""
++    import time
++
++    chat_id = f"{origin['gateway']}/{origin['profile']}/{origin['session']}"
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, chat_type, "
++        "notifier_profile, delivery_mode, created_at, last_event_id) VALUES (?, 'hub', ?, '', 'dm', ?, 'notify', ?, "
++        "COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))",
++        (task_id, chat_id, origin["profile"], int(time.time()), task_id))
++
++
+ def create_with_origin(conn, intent: dict, options: dict) -> str:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_origin_ledger import validate_binding
+@@ -66,6 +82,7 @@ def create_with_origin(conn, intent: dict, options: dict) -> str:
+                   "task_record_key": f"{intent['owner']['profile']}/{intent['owner']['board']}/{task_id}"}
+         conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)",
+                      (intent["request_id"], immutable, task_id, _json(marker), "origin-bind-" + secrets.token_hex(16)))
++        _subscribe_origin(conn, task_id, intent["origin"])
+         return task_id
+ 
+ 
+@@ -125,4 +142,5 @@ def adopt_with_origin(conn, intent: dict, *, board: str) -> str:
+         marker["binding_id"] = "binding-" + secrets.token_hex(16)
+         conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)",
+                      (intent["request_id"], immutable, task_id, _json(marker), "origin-bind-" + secrets.token_hex(16)))
++        _subscribe_origin(conn, task_id, intent["origin"])
+         return task_id
+diff --git a/tests/hermes_cli/test_kanban_origin_notify.py b/tests/hermes_cli/test_kanban_origin_notify.py
+new file mode 100644
+index 0000000000..22f4ebf9f3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_notify.py
+@@ -0,0 +1,308 @@
++"""The chat that filed a card on another gateway is the one subscribed to it, and it hears the card finish.
++
++Hub evidence 2026-10-28 (card t_01a182faed899158): placement-created hub cards bound to chat 5ab65c had no
++subscription for it (``create_with_origin`` stored only the binding), and no code turned a hub-side link into a
++done notice on the origin gateway. One test per entry path: the kanban_create tool with auto placement (origin
++side, then owner side), the deferred-placement forward, the CLI ``--origin-session``, plus the origin-side
++notice delivery.
++"""
++import argparse
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kn
++from hermes_state import SessionDB
++from tools import kanban_tools  # noqa: F401  (registers kanban_create)
++from tools.registry import registry
++
++CHAT = "20261027_134353_5ab65c"
++STALE = "20261026_170127_f07c32"
++
++
++def _subs(task_id, platform=None):
++    with kbc.connect_closing() as conn:
++        return sorted((s["platform"], s["chat_id"]) for s in kn.list_notify_subs(conn, task_id)
++                      if platform is None or s["platform"] == platform)
++
++
++# --- owner side: the courier (origin intent) path the hub runs for every placed card --------------------------
++
++@pytest.fixture
++def owner(tmp_path, monkeypatch):
++    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_TASK", "HERMES_ORIGIN_SESSION"):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    # A process-global session left over from some other chat: must never be subscribed.
++    monkeypatch.setenv("HERMES_SESSION_KEY", STALE)
++    monkeypatch.setenv("HERMES_SESSION_ID", STALE)
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session("kanban-placement-macbook", "cli")
++    db.close()
++    kb.init_db()
++    return {"request_id": "placement:macbook:0123456789abcdef",
++            "owner": {"gateway": "hub", "profile": "default", "board": "default"},
++            "origin": {"gateway": "macbook", "profile": "default", "session": CHAT}}
++
++
++def test_courier_create_subscribes_the_bound_origin_not_the_ambient_session(owner):
++    args = {"title": "Build", "assignee": "default", "session_id": "kanban-placement-macbook"}
++    res = json.loads(registry.dispatch("kanban_create", args, origin_intent=owner))
++    assert res.get("created") is True, res
++    tid = res["task_id"]
++    assert _subs(tid) == [("hub", f"macbook/default/{CHAT}")]
++    again = json.loads(registry.dispatch("kanban_create", args, origin_intent=owner))
++    assert again["task_id"] == tid and _subs(tid) == [("hub", f"macbook/default/{CHAT}")]
++
++
++def test_courier_adoption_subscribes_the_bound_origin(owner):
++    from hermes_cli.kanban_origin_creation import adopt_with_origin
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Existing", assignee="default")
++        intent = {"request_id": "adopt:0123456789", "origin": owner["origin"],
++                  "owner": {**owner["owner"], "task_id": tid}}
++        assert adopt_with_origin(conn, intent, board="default") == tid
++    assert ("hub", f"macbook/default/{CHAT}") in _subs(tid)
++
++
++# --- origin side: kanban_create auto placement and the deferred forward ----------------------------------------
++
++@pytest.fixture
++def mac(tmp_path, monkeypatch):
++    from tests.hermes_cli.test_kanban_placement import HUB_SCHEMA, ROUTE
++    from hermes_cli import kanban_placement as kp
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    for name in ("HERMES_KANBAN_TASK", "HERMES_ORIGIN_SESSION", "HERMES_KANBAN_DB"):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv("HERMES_SESSION_ID", STALE)
++    monkeypatch.setenv("HERMES_SESSION_KEY", STALE)
++    mail = tmp_path / "mail.json"
++    mail.write_text(json.dumps({"gateway": "macbook"}))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(mail))
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    hub = sqlite3.connect(state / "hub.db")
++    hub.executescript(HUB_SCHEMA)
++    hub.execute("INSERT INTO meta VALUES ('gateway', 'macbook')")
++    hub.execute("INSERT INTO meta VALUES ('last_ok', ?)", (str(time.time()),))
++    rec = {"schema": 1, "gateway": "hub", "refreshed_at": time.time(), "capabilities": []}
++    hub.execute("INSERT INTO replica VALUES ('hub', 'capabilities', 'info', 1, 1, ?, ?)",
++                (json.dumps(rec), int(time.time())))
++    hub.commit()
++    sdb = SessionDB(db_path=home / "state.db")
++    for sid in (CHAT, STALE):
++        sdb.create_session(sid, source="desktop")
++    sdb.close()
++    calls = []
++
++    def fake_hub(argv):
++        if "--help" in argv:
++            return 0, "usage: hermes-hub create-task [--id ID]", ""
++        calls.append(argv)
++        rid = argv[argv.index("--id") + 1]
++        hub.execute("INSERT OR IGNORE INTO sent (id, body, state, created_at) VALUES (?, ?, 'sent', ?)",
++                    (rid, json.dumps({"id": rid}), time.time()))
++        hub.commit()
++        return 0, rid, ""
++
++    monkeypatch.setattr(kp, "hub_runner", fake_hub)
++    monkeypatch.setattr(kp, "hub_spawn", lambda argv: None, raising=False)
++    monkeypatch.setattr(kp, "_help_cache", {})
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 0})
++    kb.init_db()
++    yield {"calls": calls}
++    hub.close()
++
++
++def _as_chat(fn):
++    """Run ``fn`` as chat CHAT's turn: the request-scoped ContextVars name it, os.environ names another chat.
++    Runs in a copied context so the binding never leaks into later tests."""
++    import contextvars
++    from gateway.session_context import set_session_vars
++
++    def run():
++        set_session_vars(session_key=CHAT, session_id=CHAT)
++        return fn()
++
++    return contextvars.copy_context().run(run)
++
++
++def test_auto_placement_sends_the_filing_chat_as_origin(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(_as_chat(lambda: kt._handle_create({"title": "Fix the flaky lint", "body": "Push it."})))
++    assert out["ok"] and out["placed"]["gateway"] == "hub", out
++    argv = mac["calls"][0]
++    assert argv[argv.index("--origin-session") + 1] == CHAT
++
++
++def test_deferred_forward_sends_the_filing_chat_as_origin(mac, monkeypatch):
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="Orchestrate", assignee="default")
++    out = json.loads(_as_chat(lambda: kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]})))
++    assert out["ok"] and out["placement"]["defer"] == "hub", out
++    tid = out["task_id"]
++    # The local placeholder notifies its chat (the bound ContextVar key), never the process-global one.
++    assert _subs(tid, "tui") == [("tui", CHAT)]
++    with kbc.connect_closing() as conn:
++        kb.complete_task(conn, parent, summary="done", force=True)
++        assert kpf.state(conn, tid)["origin_session"] == CHAT
++        claimed = kb.claim_task(conn, tid)
++        f = kpf.Forwarder(conn, tid, claimed.current_run_id)
++        f.live = lambda t: None
++        f.await_id = lambda rid, **kw: (None, None)
++        f.run()  # forwarder runs in a worker process: the env names no chat of its own
++    argv = mac["calls"][-1]
++    assert argv[argv.index("--origin-session") + 1] == CHAT
++
++
++def test_local_create_never_subscribes_a_stale_process_session(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    out = json.loads(_as_chat(lambda: kt._handle_create({"title": "Read the Chrome tab", "body": "local"})))
++    assert out["ok"] and "placed" not in out, out
++    assert _subs(out["task_id"]) == [("tui", CHAT)]
++
++
++def test_tui_key_ignores_a_process_key_naming_another_chat(monkeypatch):
++    import contextvars
++    from gateway.session_context import scoped_current_session_id
++    from tools import kanban_tools as kt
++    monkeypatch.setenv("HERMES_SESSION_KEY", STALE)
++
++    def key_as(sid):
++        with scoped_current_session_id(sid):
++            return kt._tui_session_key()
++
++    assert contextvars.Context().run(key_as, CHAT) == ""
++    assert contextvars.Context().run(key_as, STALE) == STALE  # same chat: an inherited key is fine
++    assert contextvars.Context().run(kt._tui_session_key) == STALE  # nothing bound: CLI subprocess
++
++
++# --- CLI --origin-session ---------------------------------------------------------------------------------------
++
++def test_cli_origin_session_flag_subscribes_that_chat(tmp_path, monkeypatch, capsys):
++    from hermes_cli import kanban as kc
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    for name in ("HERMES_KANBAN_TASK", "HERMES_ORIGIN_SESSION", "HERMES_KANBAN_DB"):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv("HERMES_SESSION_ID", STALE)
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    conn = sqlite3.connect(state / "hub.db")
++    conn.executescript("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);"
++                       "CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT,"
++                       " updated_at INTEGER, PRIMARY KEY (gw, coll, key));")
++    conn.execute("INSERT INTO meta VALUES ('gateway', 'hub')")
++    conn.execute("INSERT INTO replica VALUES ('macbook', 'gateway', 'info', 1, 1, '{}', 0)")
++    conn.commit()
++    conn.close()
++    kb.init_db()
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    args = root.parse_args(["kanban", "create", "via cli", "--json", "--origin-session", f"macbook:{CHAT}"])
++    assert kc._cmd_create(args) == 0
++    out = json.loads(capsys.readouterr().out)
++    assert _subs(out["id"], "hub") == [("hub", f"macbook/default/{CHAT}")]
++
++
++# --- origin side delivery: a linked hub card's done reaches the chat --------------------------------------------
++
++def _replica(tmp_path, cards):
++    path = tmp_path / "hub.db"
++    conn = sqlite3.connect(path)
++    conn.executescript("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);"
++                       "CREATE TABLE IF NOT EXISTS replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, "
++                       "seq INTEGER, data TEXT, updated_at INTEGER, PRIMARY KEY (gw, coll, key));")
++    conn.execute("INSERT OR REPLACE INTO meta VALUES ('gateway', 'macbook')")
++    seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM replica").fetchone()[0]
++    for gw, key, task in cards:
++        seq += 1
++        conn.execute("INSERT OR REPLACE INTO replica VALUES (?, 'tasks', ?, 1, ?, ?, 0)",
++                     (gw, key, seq, json.dumps(task)))
++    conn.commit()
++    conn.close()
++    return path
++
++
++def _card(tid, status, session=CHAT, *, at=None, rel="shepherd", gw="macbook"):
++    at = time.time() - 30 if at is None else at
++    return {"id": tid, "title": f"card {tid}", "status": status, "assignee": "default", "completed_at": int(at),
++            "run": {"summary": f"{tid} handoff", "ended_at": int(at)},
++            "sessions": [{"gw": gw, "profile": "default", "rel": rel, "session": session}]}
++
++
++def test_remote_done_notice_is_delivered_once_and_released_on_refusal(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++    krn._reset_for_tests()
++    hub = _replica(tmp_path, [
++        ("hub", "default/default/t_done", _card("t_done", "done")),
++        ("hub", "default/default/t_run", _card("t_run", "running")),
++        ("hub", "default/default/t_other", _card("t_other", "done", session=STALE)),
++        ("hub", "default/default/t_old", _card("t_old", "done", at=time.time() - 3 * krn.FRESH_S)),
++        ("macbook", "default/default/t_mine", _card("t_mine", "done")),  # local: tui subs cover it
++    ])
++    ledger = tmp_path / "ledger.db"
++    got = krn.collect(CHAT, "default", hub_db=hub, ledger=ledger)
++    assert [g["ref"] for g in got] == ["hub/default/default/t_done"]
++    assert got[0]["text"].startswith("✔ [hub:default] @default Kanban t_done done — card t_done\nt_done handoff")
++    assert krn.collect(CHAT, "default", hub_db=hub, ledger=ledger) == []  # claimed once
++    assert krn.release(got[0], ledger=ledger)
++    assert [g["ref"] for g in krn.collect(CHAT, "default", hub_db=hub, ledger=ledger)] == ["hub/default/default/t_done"]
++    # a blocked state is its own notice; a link kept on a compaction parent still reaches the tip
++    _replica(tmp_path, [("hub", "default/default/t_run", _card("t_run", "blocked", session="parent_sid"))])
++    got = krn.collect(CHAT, "default", hub_db=hub, ledger=ledger, lineage=("parent_sid",))
++    assert [g["ref"] for g in got] == ["hub/default/default/t_run"] and "blocked" in got[0]["text"]
++    assert krn.collect("someone_else", "default", hub_db=hub, ledger=ledger) == []
++
++
++def test_remote_notice_skips_a_card_a_local_forward_placeholder_reports(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++    krn._reset_for_tests()
++    hub = _replica(tmp_path, [("hub", "default/default/t_fwd", _card("t_fwd", "done")),
++                              ("hub", "default/default/t_own", _card("t_own", "done"))])
++    ledger = tmp_path / "ledger.db"
++    asked = []
++    got = krn.collect(CHAT, "default", hub_db=hub, ledger=ledger, skip=lambda t: asked.append(t) or t == "t_fwd")
++    assert [g["ref"] for g in got] == ["hub/default/default/t_own"]
++    assert krn.collect(CHAT, "default", hub_db=hub, ledger=ledger, skip=lambda t: asked.append(t) or True) == []
++    assert sorted(asked) == ["t_fwd", "t_own"]  # asked once per new state, never on later polls
++
++
++def test_session_poller_delivers_remote_notice_through_collect(tmp_path, monkeypatch):
++    import threading
++    from tui_gateway import kanban_remote_notices as krn
++    from tui_gateway import server as srv
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path))
++    krn._reset_for_tests()
++    kb.init_db()
++    _replica(tmp_path, [("hub", "default/default/t_done", _card("t_done", "done")),
++                        ("hub", "default/default/t_fwd", _card("t_fwd", "done"))])
++    from hermes_cli.kanban_placement_forward import FORWARDED
++    with kbc.connect_closing() as conn:
++        local = kb.create_task(conn, title="placeholder", assignee="default")
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                     (local, FORWARDED, json.dumps({"request_id": "r", "remote_task_id": "t_fwd"}), int(time.time())))
++        conn.commit()
++    claims: list = []
++    texts = srv._collect_kanban_notifications({"session_key": CHAT}, claims)
++    assert [str(t) for t in texts if "t_done" in t], texts
++    assert not [t for t in texts if "t_fwd" in t]  # the placeholder's own tui sub reports it
++    assert any(c.get("remote") for c in claims)
++    session = {"_kanban_claims": claims, "history_lock": threading.Lock()}
++    srv._kb_rewind_refused(session, texts)  # a refused turn hands the notice back
++    again = srv._collect_kanban_notifications({"session_key": CHAT}, [])
++    assert [str(t) for t in again if "t_done" in t]
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index d8f30d44ee..fe74a2c927 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1819,9 +1819,11 @@ def _handle_create(args: dict, **kw) -> str:
+         # a caller that can't tell re-creates it, or never learns it is stranded. [daveey]
+         extra["runs_where"] = _runs_where(runs_on, pinned_machine, marker_placement)
+         if origin_intent is not None:
++            # The courier is not a chat: the bound origin is subscribed from the binding in the same txn
++            # (kanban_origin_creation._subscribe_origin), never the receiving process's ambient session. [daveey]
+             return json.dumps({"ok": False, "created": True, "code": "origin_bind_pending",
+                                "task_id": new_tid, **landed, **gate,
+-                               "subscribed": _maybe_auto_subscribe(conn, new_tid), **extra})
++                               "subscribed": False, **extra})
+         return _ok(task_id=new_tid, **landed, **gate,
+                    subscribed=_maybe_auto_subscribe(conn, new_tid), **extra)
+ 
+@@ -1852,6 +1854,38 @@ def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
+         return session_key
+ 
+ 
++def _bound_session_var(name: str) -> Optional[str]:
++    """The request-scoped ContextVar value of a ``HERMES_SESSION_*`` var, or None when it was never bound in this
++    context. Unlike ``get_session_env`` it never falls back to ``os.environ``. [daveey]"""
++    try:
++        from gateway import session_context as _sc
++        var = _sc._VAR_MAP.get(name)
++        if var is None:
++            return None
++        value = var.get()
++        return None if value is _sc._UNSET else str(value or "")
++    except Exception:
++        return None
++
++
++def _tui_session_key() -> str:
++    """The chat a TUI/Desktop subscription belongs to: the bound ContextVar key. Otherwise the process-global
++    ``os.environ`` key (a CLI subprocess that inherited its chat's env), but never when it names a different
++    chat than the session id bound in this context. In a multi-session serve process ``os.environ`` holds
++    whichever chat was set up last, so trusting it subscribed another chat to this one's card.
++    ``HERMES_SESSION_ID`` alone never subscribes (it is set for every CLI run). [daveey]"""
++    key = _bound_session_var("HERMES_SESSION_KEY")
++    if key:
++        return key
++    env_key = os.environ.get("HERMES_SESSION_KEY", "")
++    sid = _bound_session_var("HERMES_SESSION_ID")
++    if env_key and sid and env_key != sid:
++        logger.info("kanban auto-subscribe: ignoring process HERMES_SESSION_KEY %s; this context runs %s",
++                    env_key, sid)
++        return ""
++    return env_key
++
++
+ def _resolve_notify_target() -> Optional[dict[str, Any]]:
+     """``kanban_db.add_notify_sub`` kwargs for the calling session, or None (CLI/cron/tests).
+     Gateway sessions: ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` ContextVars. TUI/desktop:
+@@ -1861,7 +1895,7 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
+     from gateway.session_context import get_session_env as env
+     platform, chat_id = env("HERMES_SESSION_PLATFORM", ""), env("HERMES_SESSION_CHAT_ID", "")
+     if not platform or not chat_id:
+-        session_key = env("HERMES_SESSION_KEY", "") or os.environ.get("HERMES_SESSION_KEY", "")
++        session_key = _tui_session_key()
+         if not session_key:
+             return None
+         platform, chat_id = "tui", session_key
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+new file mode 100644
+index 0000000000..b4b3b9b22b
+--- /dev/null
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -0,0 +1,200 @@
++"""Done/blocked notices for cards on OTHER gateways that a chat here is linked to. [daveey]
++
++A chat's local cards notify it through ``platform='tui'`` subscriptions (``session_notifications._kb_poll_board``).
++A card placed on another gateway (default ``kanban.placement`` route, deferred forward, ``hermes-hub create-task``,
++a cross_task shepherd) is linked to the chat by a ``platform='hub'`` subscription on the OWNER's board instead. The
++owner's hermes-hub client publishes that link as ``sessions: [{gw, profile, session, rel: 'shepherd'}]`` on the
++card's task record, and this gateway's replica (``~/.local/state/hermes-hub/hub.db``) carries it with the card's
++status. Nothing turned that link into a notice: a chat whose card ran on the hub never heard it finished, so it
++never verified the work (hub kanban.db evidence 2026-10-28, card t_01a182faed899158).
++
++This module reads the replica for cards linked to (this gateway, the session's profile, the session) and returns
++one notice per terminal state (done, blocked), claimed in a small SQLite ledger so a notice is delivered once
++across every backend on this host. A refused turn releases its claim (``release``) so the owner of the chat
++re-claims it. Only states that became terminal within ``FRESH_S`` are announced; older ones are recorded
++silently, so a first run never floods a chat with history.
++
++Without hermes-hub (no hub.db) everything here is a no-op.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import os
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++FRESH_S = 6 * 3600.0
++MAX_PER_POLL = 10
++LINK_RELS = ("shepherd",)
++_TERMINAL = ("done", "blocked")
++
++_lock = threading.Lock()
++_index_memo: Optional[tuple] = None  # (path, signature, me, index)
++
++
++def hub_db_path() -> Path:
++    return Path(os.environ.get("HERMES_HUB_STATE") or Path.home() / ".local" / "state" / "hermes-hub") / "hub.db"
++
++
++def ledger_path() -> Path:
++    from hermes_constants import get_hermes_home
++    return Path(get_hermes_home()) / "kanban" / "remote-notices.db"
++
++
++def _ro(path: Path) -> sqlite3.Connection:
++    try:
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
++        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
++        return conn
++    except sqlite3.OperationalError:
++        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=1.0)
++        conn.execute("PRAGMA query_only = ON")
++        return conn
++
++
++def _terminal_at(task: dict) -> Optional[float]:
++    run = task.get("run") if isinstance(task.get("run"), dict) else {}
++    for value in (task.get("completed_at") if task.get("status") == "done" else None, run.get("ended_at")):
++        with contextlib.suppress(TypeError, ValueError):
++            if value:
++                return float(value)
++    return None
++
++
++def _index(path: Path) -> tuple[str, dict]:
++    """``(this gateway, {(profile, session): [card, ...]})`` for terminal cards owned by other gateways, cached on
++    the replica's task-row signature (one decode per change, shared by every chat's poll)."""
++    global _index_memo
++    conn = _ro(path)
++    try:
++        row = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
++        me = str(row[0]) if row and row[0] else ""
++        sig = conn.execute("SELECT COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll = 'tasks'").fetchone()
++        memo = _index_memo
++        if memo is not None and memo[0] == str(path) and memo[1] == sig and memo[2] == me:
++            return me, memo[3]
++        rows = conn.execute("SELECT gw, key, data FROM replica WHERE coll = 'tasks'").fetchall()
++    finally:
++        conn.close()
++    index: dict[tuple[str, str], list[dict]] = {}
++    for gw, key, data in rows:
++        if not me or gw == me:
++            continue  # this gateway's own cards notify through local tui subscriptions
++        try:
++            task = json.loads(data)
++        except (TypeError, ValueError):
++            continue
++        if not isinstance(task, dict) or task.get("status") not in _TERMINAL or not task.get("id"):
++            continue
++        links = task.get("sessions") if isinstance(task.get("sessions"), list) else []
++        for link in links:
++            if (isinstance(link, dict) and link.get("gw") == me and link.get("rel") in LINK_RELS
++                    and link.get("session")):
++                index.setdefault((str(link.get("profile") or "default"), str(link["session"])), []).append(
++                    {"gw": str(gw), "key": str(key), "task": task})
++    _index_memo = (str(path), sig, me, index)
++    return me, index
++
++
++def _ledger(path: Optional[Path] = None) -> sqlite3.Connection:
++    path = path or ledger_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(str(path), timeout=5.0)
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("CREATE TABLE IF NOT EXISTS notices (session TEXT NOT NULL, ref TEXT NOT NULL, state TEXT NOT NULL, "
++                 "at REAL NOT NULL, delivered INTEGER NOT NULL, PRIMARY KEY (session, ref, state))")
++    return conn
++
++
++def _first_line(value: Any, limit: int) -> str:
++    lines = str(value or "").strip().splitlines()
++    return f"\n{lines[0][:limit]}" if lines else ""
++
++
++def format_notice(gw: str, key: str, task: dict) -> str:
++    """Same shape as a local notice (``session_notifications._format_kanban_event_text``), plus where it ran."""
++    parts = key.split("/")
++    board = parts[-2] if len(parts) >= 2 else "default"
++    tid = str(task.get("id"))
++    title = str(task.get("title") or tid)[:120]
++    who = task.get("assignee") or ""
++    run = task.get("run") if isinstance(task.get("run"), dict) else {}
++    prefix = f"[{gw}:{board}] " + (f"@{who} " if who else "")
++    if task.get("status") == "done":
++        handoff = _first_line(run.get("summary") or task.get("result"), 200)
++        return f"✔ {prefix}Kanban {tid} done — {title}{handoff}\n(ran on {gw}; read it with cross_task @task:{board}@{gw}/{tid})"
++    reason = run.get("summary") or task.get("block_kind") or ""
++    return (f"⏸ {prefix}Kanban {tid} blocked" + (f": {str(reason)[:160]}" if reason else "")
++            + f" — {title}\n(on {gw}; read it with cross_task @task:{board}@{gw}/{tid})")
++
++
++def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, ledger: Optional[Path] = None,
++            now: Optional[float] = None, lineage: tuple[str, ...] = (),
++            skip: Optional[Callable[[str], bool]] = None) -> list[dict]:
++    """Claim and return ``[{text, session, ref, state}]`` for this session's newly terminal remote cards.
++
++    ``lineage`` adds earlier ids of the same chat (a compaction fork keeps the link on the old id). ``skip(task_id)``
++    is true for remote cards a local placeholder already reports (a deferred placement forward): its own tui
++    subscription announces the result, so a second notice would be a duplicate. Never raises."""
++    path = hub_db or hub_db_path()
++    if not session_key or not path.is_file():
++        return []
++    now = time.time() if now is None else now
++    try:
++        with _lock:
++            _, index = _index(path)
++        cards = []
++        for sid in (session_key, *lineage):
++            cards.extend(index.get((profile or "default", sid), ()))
++        if not cards:
++            return []
++        out: list[dict] = []
++        conn = _ledger(ledger)
++        try:
++            for card in cards:
++                task = card["task"]
++                ref = f"{card['gw']}/{card['key']}"
++                at = _terminal_at(task)
++                state = f"{task['status']}@{int(at) if at else 0}"
++                fresh = at is not None and now - at <= FRESH_S
++                if fresh and skip is not None and conn.execute(
++                        "SELECT 1 FROM notices WHERE session=? AND ref=? AND state=?",
++                        (session_key, ref, state)).fetchone() is None and skip(str(task["id"])):
++                    fresh = False  # recorded silently: the placeholder's own notice covers it
++                with conn:
++                    cur = conn.execute("INSERT OR IGNORE INTO notices VALUES (?,?,?,?,?)",
++                                       (session_key, ref, state, now, 1 if fresh else 0))
++                if cur.rowcount == 1 and fresh:
++                    out.append({"text": format_notice(card["gw"], card["key"], task), "session": session_key,
++                                "ref": ref, "state": state})
++                    if len(out) >= MAX_PER_POLL:
++                        break
++        finally:
++            conn.close()
++        return out
++    except Exception:
++        return []
++
++
++def release(claim: dict, *, ledger: Optional[Path] = None) -> bool:
++    """Hand a refused notice back so the chat's owning backend claims it on its next poll."""
++    try:
++        conn = _ledger(ledger)
++        try:
++            with conn:
++                cur = conn.execute("DELETE FROM notices WHERE session=? AND ref=? AND state=?",
++                                   (claim["session"], claim["ref"], claim["state"]))
++            return cur.rowcount == 1
++        finally:
++            conn.close()
++    except Exception:
++        return False
++
++
++def _reset_for_tests() -> None:
++    global _index_memo
++    _index_memo = None
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 3a4ab23df4..8a3e3f69c7 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -591,7 +591,67 @@ def _collect_kanban_notifications(session: dict, claims: list | None = None) ->
+     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
+         unique.setdefault(resolved, slug)
+     seen = session.setdefault("_kb_board_seen", {})
+-    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, claims, seen)]
++    texts = [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, claims, seen)]
++    return texts + _collect_remote_kanban_notifications(session_key, claims)
++
++
++def _session_lineage(session_key: str, limit: int = 8) -> tuple:
++    """Earlier ids of this chat (compaction parents): a remote card stays linked to the id that created it."""
++    out: list = []
++    with contextlib.suppress(Exception):
++        import sqlite3
++        from pathlib import Path
++        from hermes_constants import get_hermes_home
++        path = Path(get_hermes_home()) / "state.db"
++        if not path.is_file():
++            return ()
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++        try:
++            sid = session_key
++            for _ in range(limit):
++                row = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (sid,)).fetchone()
++                if not row or not row[0] or row[0] in out:
++                    break
++                sid = str(row[0])
++                out.append(sid)
++        finally:
++            conn.close()
++    return tuple(out)
++
++
++def _forwarded_locally(remote_task_id: str) -> bool:
++    """True when a deferred-placement placeholder on this board forwarded to ``remote_task_id``: it reports the
++    result through its own tui subscription, so a remote notice would repeat it. Called only for a fresh,
++    not-yet-claimed remote state (rare), so the unindexed event scan stays off the hot poll path."""
++    try:
++        from hermes_cli import kanban_db_connect as _kbc
++        from hermes_cli.kanban_placement_forward import FORWARDED
++        with _kbc.connect_closing() as conn:
++            return conn.execute("SELECT 1 FROM task_events WHERE kind = ? AND payload LIKE ? LIMIT 1",
++                                (FORWARDED, f'%"{remote_task_id}"%')).fetchone() is not None
++    except Exception:
++        return False
++
++
++def _collect_remote_kanban_notifications(session_key: str, claims: list | None) -> list:
++    """Done/blocked notices for cards on other gateways linked to this chat (``kanban_remote_notices``). [daveey]"""
++    try:
++        from hermes_cli.profiles import get_active_profile_name
++        from tui_gateway import kanban_remote_notices as _krn
++        if not _krn.hub_db_path().is_file():
++            return []
++        found = _krn.collect(session_key, get_active_profile_name() or "default",
++                             lineage=_session_lineage(session_key), skip=_forwarded_locally)
++    except Exception as exc:
++        _notif_log_failure("remote kanban notification poll failed", exc)
++        return []
++    texts = []
++    for item in found:
++        text = _KanbanText(item["text"])
++        texts.append(text)
++        if claims is not None:
++            claims.append({"remote": item, "texts": [text]})
++    return texts
+ 
+ 
+ def _notif_poll_kanban(sid: str, session: dict) -> None:
+@@ -625,6 +685,13 @@ def _kb_rewind_refused(session: dict, batch: list) -> None:
+     for claim in reversed(claims):
+         texts = claim.get("texts") or []
+         if texts and all(id(t) in refused for t in texts):
++            if claim.get("remote"):
++                from tui_gateway import kanban_remote_notices as _krn
++                if _krn.release(claim["remote"]):
++                    continue
++                keep_back.update(id(t) for t in texts if id(t) in refused)
++                remaining.append(claim)
++                continue
+             try:
+                 conn = _kbc.connect(board=claim["board"])
+                 with contextlib.closing(conn):
+-- 
+2.55.0
+

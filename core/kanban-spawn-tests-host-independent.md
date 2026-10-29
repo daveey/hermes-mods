@@ -1,6 +1,6 @@
 # Host-independent Kanban spawn tests
 
-Patch 0663 (`40aa7ba60d`), following a2c2b3eba8. Test-only; production behavior is unchanged.
+Patch 0675 (`40aa7ba60d`), following a2c2b3eba8. Test-only; production behavior is unchanged.
 
 ## Behavior
 
@@ -16,7 +16,7 @@ On a systemd host the real wrapper refuses a claimed task with no current run id
 
 ## Applying
 
-Append after 0662.
+Append after 0672.
 
 ## plugin?
 

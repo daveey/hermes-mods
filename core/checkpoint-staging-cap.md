@@ -1,12 +1,12 @@
 # Checkpoints: vanished workspaces warn once; oversize files never reach git add
 
-Patches: 0615, 0627 (daveey/hermes `48913b6339`, `4d28e047a7`).
+Patches: 0613, 0633 (daveey/hermes `48913b6339`, `4d28e047a7`).
 
 ## Behavior
 
-0615: Kanban removes scratch workspaces on card completion, so a checkpoint can find its folder gone, even between the existence check and the git spawn. That now logs one WARNING instead of an ERROR traceback (a FileNotFoundError while the directory still exists keeps the ERROR), and `_take` skips pruning when the folder vanished after the snapshot landed. Scratch-workspace removal (completion and deferred parent cleanup) is logged at INFO with task id, last run id/status and the removing pid.
+0613: Kanban removes scratch workspaces on card completion, so a checkpoint can find its folder gone, even between the existence check and the git spawn. That now logs one WARNING instead of an ERROR traceback (a FileNotFoundError while the directory still exists keeps the ERROR), and `_take` skips pruning when the folder vanished after the snapshot landed. Scratch-workspace removal (completion and deferred parent cleanup) is logged at INFO with task id, last run id/status and the removing pid.
 
-0627: the "skip files over `max_file_size_mb`" rule used to run only after `git add -A` had hashed the file, so one multi-GB file made every checkpoint time out, leave a partial `tmp_pack` and the index lock in the store, and be retried every turn. Now the cap is applied before staging, a staging timeout cleans its debris, and the folder is skipped for 60 minutes.
+0633: the "skip files over `max_file_size_mb`" rule used to run only after `git add -A` had hashed the file, so one multi-GB file made every checkpoint time out, leave a partial `tmp_pack` and the index lock in the store, and be retried every turn. Now the cap is applied before staging, a staging timeout cleans its debris, and the folder is skipped for 60 minutes.
 
 ## How it works
 

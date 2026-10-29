@@ -1,0 +1,295 @@
+From a408ba1b05d2d1add193dcb7b0f878522bcc94b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:11:09 -0700
+Subject: [PATCH] fix(state): macOS holder scan reads libproc identities, not
+ every foreign file [daveey]
+
+On macOS, 65 tests in 19 tests/hermes_state files failed on every run, while
+Linux CI stayed green. In most of them, repair or VACUUM refused with "a live
+writer still holds state.db".
+
+Five whys:
+- Why did repair refuse? foreign_state_db_holders returned (-1, "open-file
+  scan failed: TEST BUG: file I/O against the REAL hermes home:
+  ~/.hermes/logs/hermes-tunnel.log"), and live_writer_holds_db fails closed
+  on that sentinel.
+- Why did the scan touch that file? On darwin it used
+  psutil.Process.open_files(). That calls isfile_strict(), which does an
+  os.stat on every file every process has open. The leg then realpath'd
+  each path. Any other Hermes process's log file is in that set.
+- Why did that fail? The test home-I/O guard refuses stat/lstat under the
+  real home. It exempts only /proc metadata, which is how the Linux leg
+  inspects descriptors (by readlink plus inode identity, with no foreign
+  file I/O).
+- Why did the two legs differ? The darwin leg matched textual paths
+  (realpath on both sides, 9b419a2d3c) instead of identities, so it needed
+  file I/O on every foreign path.
+- Not caught: CI runs tests/hermes_state only on Linux. The macOS lane
+  runs only `-m platforms` tests, and nothing exercised the darwin leg on
+  Linux.
+
+Production on a Mac was not blocked. With the real runtime and no guard, a
+quiet copy of state.db scanned clean, and repair took its backup and ran its
+strategies. The verdict still depended on stat-ing every foreign file.
+
+Fix: on darwin, enumerate descriptors through libproc
+(hermes_state_dbfile._iter_darwin_fd_targets, already used by the
+deleted-WAL guard). It gives the kernel path and the vnode (st_dev, st_ino)
+with no file I/O. A process counts as a holder when its identity is the
+db/-wal/-shm identity, or when its case-folded path names a watched file:
+that covers a retired generation, which psutil silently dropped. Live on
+the MacBook, this found the same 9 holder pids as psutil, in 0.04 s
+instead of 0.14 s.
+
+Detection: test_state_db_holders.py fakes the libproc layer and forces the
+darwin leg, so it runs on Linux CI. It refuses any stat, lstat or realpath of
+a foreign path, and checks identity aliasing, self-exclusion, retired
+generations, case folding and fail-closed.
+
+The remaining 5 macOS-only failures were test assumptions:
+- test_cross_vm_fs_wal_refusal: the mountinfo parser test now presents as
+  Linux. _detect_cross_vm_fs returns False off Linux before it parses.
+- test_guest_durability_barriers: macOS always enforces synchronous=FULL.
+- test_write_lock_patience: the holder now holds until released. A 1 s
+  busy_timeout lasts about 3 s with macOS SQLite, so the 2 s hold ended
+  inside the first wait.
+---
+ hermes_state_holders.py                       | 29 +++++++
+ .../test_cross_vm_fs_wal_refusal.py           |  6 +-
+ .../test_guest_durability_barriers.py         |  5 +-
+ tests/hermes_state/test_state_db_holders.py   | 87 +++++++++++++++++++
+ .../hermes_state/test_write_lock_patience.py  | 17 ++--
+ 5 files changed, 137 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_state_holders.py b/hermes_state_holders.py
+index aae7ad132a..aca31e1d90 100644
+--- a/hermes_state_holders.py
++++ b/hermes_state_holders.py
+@@ -542,6 +542,35 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
+             holders.append((-1, f"open-file scan failed: {exc}"))
+         return holders
+ 
++    if sys.platform == "darwin":
++        # libproc, not psutil: psutil.Process.open_files() stats every file every process has
++        # open (isfile_strict), and the old leg then realpath'd each one. Touching other
++        # processes' files makes the verdict depend on whether each of them can be stat'ed,
++        # and in tests it tripped the real-home I/O guard on another Hermes process's
++        # ~/.hermes/logs/*.log, so every macOS run saw a phantom live writer and refused repair.
++        # libproc hands back the kernel path and the vnode's (st_dev, st_ino) with no file I/O,
++        # so this leg judges by identity exactly like the /proc leg above. A watched path whose
++        # identity moved on (a retired, unlinked generation) still counts, as on Linux.
++        try:
++            from hermes_state_dbfile import _iter_darwin_fd_targets
++
++            own_pid = os.getpid()
++            # APFS/HFS+ are case-insensitive by default and libproc reports the opener's spelling.
++            watched_folded = {path.casefold() for path in watched}
++            for pid, _fd, target, identity in _iter_darwin_fd_targets():
++                if pid == own_pid:
++                    continue
++                if identity in watched_ids or target.casefold() in watched_folded:
++                    holders.append((pid, target))
++        except Exception as exc:
++            logger.warning(
++                "Could not prove state.db has no foreign holders; "
++                "deferring structural maintenance: %s",
++                exc,
++            )
++            holders.append((-1, f"open-file scan failed: {exc}"))
++        return holders
++
+     if psutil is None:
+         return [(-1, "open-file scan unavailable")]
+     try:
+diff --git a/tests/hermes_state/test_cross_vm_fs_wal_refusal.py b/tests/hermes_state/test_cross_vm_fs_wal_refusal.py
+index 1307385ea7..5e5dfb612b 100644
+--- a/tests/hermes_state/test_cross_vm_fs_wal_refusal.py
++++ b/tests/hermes_state/test_cross_vm_fs_wal_refusal.py
+@@ -7,6 +7,7 @@ while never live-downgrading an on-disk WAL database and never flagging an ordin
+ 
+ import logging
+ import sqlite3
++from types import SimpleNamespace
+ 
+ import pytest
+ 
+@@ -37,7 +38,10 @@ class TestDetectCrossVmFs:
+         ("/data/native/db", False),     # ext4 mounted over the virtiofs tree — longest prefix wins
+         ("/datastore", False),          # sibling path sharing a prefix string, not a mount prefix
+     ])
+-    def test_only_virtiofs_and_9p_mounts_are_flagged(self, tmp_path, path, expected):
++    def test_only_virtiofs_and_9p_mounts_are_flagged(self, tmp_path, monkeypatch, path, expected):
++        # The mountinfo parser is what is pinned here; _detect_cross_vm_fs answers False off Linux
++        # before reading the file, so present as Linux or every True case fails on a Mac.
++        monkeypatch.setattr(hermes_state_wal, "sys", SimpleNamespace(platform="linux"))
+         mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS, BIND_9P, NESTED_EXT4, SPACE_VIRTIOFS])
+         assert _detect_cross_vm_fs(path, mountinfo_path=mi) is expected
+ 
+diff --git a/tests/hermes_state/test_guest_durability_barriers.py b/tests/hermes_state/test_guest_durability_barriers.py
+index bfa29bca47..6480dc8f86 100644
+--- a/tests/hermes_state/test_guest_durability_barriers.py
++++ b/tests/hermes_state/test_guest_durability_barriers.py
+@@ -8,6 +8,7 @@ the guest entry point applies it directly.
+ """
+ 
+ import sqlite3
++import sys
+ 
+ import pytest
+ 
+@@ -47,7 +48,9 @@ def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path
+         conn.execute("PRAGMA journal_mode=DELETE")
+         conn.execute("PRAGMA synchronous=1")
+         apply_durability_barriers(conn)
+-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
++        # No configured level leaves the connection's own setting, except that macOS always takes
++        # its FULL write barrier (_enforce_macos_synchronous_full), unset config or not.
++        assert conn.execute("PRAGMA synchronous").fetchone()[0] == (2 if sys.platform == "darwin" else 1)
+     finally:
+         conn.close()
+ 
+diff --git a/tests/hermes_state/test_state_db_holders.py b/tests/hermes_state/test_state_db_holders.py
+index eaece06ae1..e1d4273163 100644
+--- a/tests/hermes_state/test_state_db_holders.py
++++ b/tests/hermes_state/test_state_db_holders.py
+@@ -111,3 +111,90 @@ def test_windows_restart_manager_scan_sizes_then_excludes_self(monkeypatch, tmp_
+     _Api.RmStartSession = _Fn(lambda *_args: 5)
+     with pytest.raises(OSError):
+         hermes_state_holders._windows_restart_manager_holders(db_path)
++
++
++# ── macOS leg, faked so it runs (and regresses) on Linux CI too ────────────────────────────────
++#
++# The darwin leg used psutil.Process.open_files(), which stats every file of every process, and
++# then realpath'd each path. Under the test real-home I/O guard the first foreign Hermes log file
++# raised, the scan failed closed, and 65 tests/hermes_state cases saw "a live writer still holds
++# state.db" on every Mac while Linux CI (the /proc leg) stayed green.
++
++FOREIGN_HOME = "/foreign-hermes-home"
++
++
++@pytest.fixture
++def darwin_scan(tmp_path, monkeypatch):
++    """Route foreign_state_db_holders to its darwin leg with a fake libproc enumeration, and
++    refuse any stat/lstat/realpath of a foreign process's file (what the home-I/O guard does)."""
++    import hermes_state_dbfile
++
++    db_path = tmp_path / "state.db"
++    db_path.touch()
++    (tmp_path / "state.db-wal").touch()
++    db_stat = os.stat(db_path)
++    wal_stat = os.stat(tmp_path / "state.db-wal")
++    state = {"targets": [], "raise": None}
++
++    def fake_targets():
++        if state["raise"] is not None:
++            raise state["raise"]
++        yield from state["targets"]
++
++    platform_view = SimpleNamespace(**{k: getattr(hermes_state_holders.sys, k) for k in ("argv", "executable")})
++    platform_view.platform = "darwin"
++    monkeypatch.setattr(hermes_state_holders, "sys", platform_view)
++    monkeypatch.setattr(hermes_state_holders, "_IS_WINDOWS", False)
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_darwin_fd_targets", fake_targets)
++    projected_os = SimpleNamespace(**vars(os))
++    projected_os.getpid = lambda: 111
++    projected_os.path = SimpleNamespace(**vars(os.path))
++
++    def refuse_foreign(fn):
++        def guarded(path, *args, **kwargs):
++            assert not os.fspath(path).startswith(FOREIGN_HOME), f"scan touched a foreign file: {path}"
++            return fn(path, *args, **kwargs)
++        return guarded
++
++    projected_os.stat = refuse_foreign(os.stat)
++    projected_os.lstat = refuse_foreign(os.lstat)
++    projected_os.path.realpath = refuse_foreign(os.path.realpath)
++    monkeypatch.setattr(hermes_state_holders, "os", projected_os)
++    state.update(db=db_path, db_id=(db_stat.st_dev, db_stat.st_ino),
++                 wal_id=(wal_stat.st_dev, wal_stat.st_ino))
++    return state
++
++
++def test_darwin_scan_never_touches_foreign_files_and_finds_holder_by_identity(darwin_scan):
++    db = darwin_scan["db"]
++    darwin_scan["targets"] = [
++        (222, 4, f"{FOREIGN_HOME}/logs/hermes-tunnel.log", (1, 1)),
++        # Same vnode under another spelling (symlinked home, bind alias): identity decides.
++        (222, 5, "/alias-home/state.db", darwin_scan["db_id"]),
++        (111, 3, str(db), darwin_scan["db_id"]),  # this process: never a foreign holder
++    ]
++    assert hermes_state_holders.foreign_state_db_holders(db) == [(222, "/alias-home/state.db")]
++
++
++def test_darwin_scan_quiet_store_is_clean_despite_foreign_files(darwin_scan):
++    darwin_scan["targets"] = [
++        (222, 4, f"{FOREIGN_HOME}/logs/hermes-tunnel.log", (1, 1)),
++        (333, 7, f"{FOREIGN_HOME}/state.db", (1, 2)),
++    ]
++    assert hermes_state_holders.foreign_state_db_holders(darwin_scan["db"]) == []
++
++
++def test_darwin_scan_counts_a_retired_generation_and_case_folded_path(darwin_scan):
++    db = darwin_scan["db"]
++    darwin_scan["targets"] = [
++        # The WAL path now names a new inode; pid 222 still holds the unlinked one.
++        (222, 6, os.path.realpath(str(db)) + "-wal", (darwin_scan["wal_id"][0], darwin_scan["wal_id"][1] + 1000)),
++        (333, 6, os.path.realpath(str(db)).upper() + "-SHM", (9, 9)),
++    ]
++    assert [pid for pid, _ in hermes_state_holders.foreign_state_db_holders(db)] == [222, 333]
++
++
++def test_darwin_scan_failure_fails_closed(darwin_scan):
++    darwin_scan["raise"] = OSError("proc_listpids failed")
++    holders = hermes_state_holders.foreign_state_db_holders(darwin_scan["db"])
++    assert holders and holders[0][0] == -1
+diff --git a/tests/hermes_state/test_write_lock_patience.py b/tests/hermes_state/test_write_lock_patience.py
+index 994f89d44e..338c8e2c98 100644
+--- a/tests/hermes_state/test_write_lock_patience.py
++++ b/tests/hermes_state/test_write_lock_patience.py
+@@ -27,13 +27,16 @@ import pytest
+ from hermes_state import SessionDB
+ 
+ 
+-def _hold_write_lock(db_path, hold_s, started_evt):
+-    """Hold the SQLite write lock on *db_path* for *hold_s* seconds."""
++def _hold_write_lock(db_path, hold_s, started_evt, release_evt=None):
++    """Hold the SQLite write lock on *db_path* for *hold_s* seconds (or until *release_evt*)."""
+     conn = sqlite3.connect(str(db_path), timeout=1.0, isolation_level=None)
+     try:
+         conn.execute("BEGIN IMMEDIATE")
+         started_evt.set()
+-        time.sleep(hold_s)
++        if release_evt is None:
++            time.sleep(hold_s)
++        else:
++            release_evt.wait(hold_s)
+         conn.execute("COMMIT")
+     finally:
+         conn.close()
+@@ -86,9 +89,12 @@ class TestTranscriptWritePatience:
+         held by another process — not read like disk/permission damage."""
+         monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
+ 
+-        started = threading.Event()
++        # Hold until the assertion is done, not for a fixed 2 s: one 1 s busy_timeout wait lasts
++        # ~3 s with the SQLite builds on macOS, so a 2 s hold ended inside the FIRST wait there
++        # and the write succeeded (this test failed on every Mac, never on Linux CI).
++        started, release = threading.Event(), threading.Event()
+         holder = threading.Thread(
+-            target=_hold_write_lock, args=(db.db_path, 2.0, started)
++            target=_hold_write_lock, args=(db.db_path, 30.0, started, release)
+         )
+         holder.start()
+         try:
+@@ -96,6 +102,7 @@ class TestTranscriptWritePatience:
+             with pytest.raises(sqlite3.OperationalError) as excinfo:
+                 db.set_meta("k", "v")  # routine write, short patience
+         finally:
++            release.set()
+             holder.join(timeout=10.0)
+         assert not holder.is_alive()
+         text = str(excinfo.value)
+-- 
+2.55.0
+

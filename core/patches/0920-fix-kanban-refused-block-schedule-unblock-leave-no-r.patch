@@ -1,0 +1,857 @@
+From 1184aefb321a5c01177eb3e8212f2f140f24562e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:42:29 +0000
+Subject: [PATCH] fix(kanban): refused block/schedule/unblock leave no reason
+ comment; explain the human-answer refusal; reject free text as task ids
+ [daveey]
+
+- The PREFIX: reason comment is written by the op itself, inside its write txn and
+  before its transition event, and rolled back to a savepoint unless the op lands
+  (hermes_cli/kanban_reason_comment.py). A refused op leaves no comment; a crash
+  rolls back both together.
+- schedule refused because the card waits on a human answer now says so (block_kind,
+  blocked time) and gives the way out (unblock --reason, then schedule), on the CLI
+  and the kanban_schedule tool.
+- unblock/block/schedule (and every task_ids command) reject tokens that are not
+  task ids, and unknown ids, with exit 2 before mutating anything.
+
+Card t_01a18653b77a4f83.
+---
+ hermes_cli/kanban.py                          | 116 +++--------
+ hermes_cli/kanban_cli_park.py                 | 111 ++++++++++
+ hermes_cli/kanban_db.py                       |  61 +++---
+ hermes_cli/kanban_db_schedule.py              |  16 +-
+ hermes_cli/kanban_reason_comment.py           |  97 +++++++++
+ .../test_kanban_refused_op_comments.py        | 194 ++++++++++++++++++
+ tools/kanban_tools.py                         |   6 +-
+ 7 files changed, 471 insertions(+), 130 deletions(-)
+ create mode 100644 hermes_cli/kanban_cli_park.py
+ create mode 100644 hermes_cli/kanban_reason_comment.py
+ create mode 100644 tests/hermes_cli/test_kanban_refused_op_comments.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 8a8ed04b01..149537b21e 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -32,6 +32,10 @@ from hermes_cli.kanban_output import (
+     _task_to_dict,
+ )
+ from hermes_cli.kanban_boards import _dispatch_boards
++from hermes_cli.kanban_cli_park import (
++    _REASON_FLAG_HINT, _REASON_WORDS_HINT, _cli_awaiting, _cli_wake_check, _commented, _guarded_park, _ids_error,
++    _parked_msg,
++)
+ from hermes_cli.kanban_ops import (
+     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_recover, _cmd_repair, _cmd_tail, _cmd_watch,
+ )
+@@ -301,12 +305,15 @@ def _bulk_ids(args: argparse.Namespace) -> list[str]:
+     return [args.task_id] + list(getattr(args, "ids", None) or [])
+ 
+ 
+-def _require_ids(args: argparse.Namespace) -> tuple[list[str], int]:
+-    """``args.task_ids`` -> ``(ids, 0)`` or ``([], 1)`` after printing the standard error."""
++def _require_ids(args: argparse.Namespace, hint: str = 'Free text goes in its flag, e.g. --reason "..."',
++                 ) -> tuple[list[str], int]:
++    """``args.task_ids`` -> ``(ids, 0)``, ``([], 1)`` when empty, or ``([], 2)`` when a token is not
++    task-id shaped (``_ids_error``), after printing the error."""
+     ids = list(args.task_ids or [])
+     if not ids:
+         return ids, _err("at least one task_id is required")
+-    return ids, 0
++    rc = _ids_error(ids, hint)
++    return ([], rc) if rc else (ids, 0)
+ 
+ 
+ def _parse_duration(val) -> Optional[int]:
+@@ -1373,83 +1380,6 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
+-def _commented(conn, reason: Optional[str], author, prefix: str, op):
+-    """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
+-    def run(tid):
+-        if reason:
+-            kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
+-        return op(tid)
+-    return run
+-
+-
+-def _cli_wake_check(args: argparse.Namespace):
+-    """``(wake_check, check_every, clock_only)`` from ``--wake-check/--check-every/--clock-only``."""
+-    from hermes_cli import kanban_wake_check as kwc
+-
+-    cmd = kwc.normalize_cmd(getattr(args, "wake_check", None))
+-    every = kwc.normalize_every(getattr(args, "check_every", None)) if cmd else None
+-    err = kwc.dry_run_error(cmd)
+-    if err:
+-        raise ValueError(err)
+-    return cmd, every, bool(getattr(args, "clock_only", False))
+-
+-
+-def _cli_awaiting(args: argparse.Namespace, wake):
+-    """``(awaiting, wake)`` from ``--awaiting KIND:REF|JSON`` (+ ``--awaiting-why``); a card wait
+-    with no ``--wake-check`` gets ``hermes kanban wait-check task`` as its probe. [daveey]"""
+-    from hermes_cli import kanban_awaiting as kaw
+-
+-    raw = getattr(args, "awaiting", None)
+-    if not raw:
+-        return None, wake
+-    awaiting = kaw.normalize(raw)
+-    why = getattr(args, "awaiting_why", None)
+-    if why and awaiting is not None:
+-        awaiting["why"] = why.strip()[:600]
+-    probe = None if wake[0] else kaw.card_probe(awaiting)
+-    if probe:
+-        from hermes_cli import kanban_wake_check as kwc
+-        wake = (probe, kwc.normalize_every(None), wake[2])
+-    kaw.confirm_remote(awaiting)  # ssh, so before the park's write txn
+-    return awaiting, wake
+-
+-
+-def _guarded_park(conn, op: str, wake, refused: dict, park, awaiting=None, **plan):
+-    """Per-task op: refuse a park > 2 h out with no probe (``kanban_wake_check.guard_error``)
+-    or one nothing would produce (``kanban_awaiting``), before its comment is written. [daveey]"""
+-    from hermes_cli import kanban_awaiting as kaw
+-    from hermes_cli import kanban_wake_check as kwc
+-
+-    def run(tid):
+-        wake_at = kwc.planned_wake(conn, tid, op=op, **plan)
+-        err = kwc.guard_error(wake_at=wake_at, wake_check=wake[0], clock_only=wake[2])
+-        if err:
+-            refused[tid] = f"cannot {op} {tid}: {err}"
+-            return False
+-        try:
+-            if wake_at is not None:
+-                kaw.resolve(conn, tid, awaiting=awaiting, reason=plan.get("reason"), wake_check=wake[0],
+-                            clock_only=wake[2], op=op)
+-            return park(tid)
+-        except kaw.AwaitingError as exc:
+-            refused[tid] = f"cannot {op} {tid}: {exc}"
+-            return False
+-        except ValueError as exc:   # e.g. a wake_check on a block that is not a timed park
+-            refused[tid] = f"cannot {op} {tid}: {exc}"
+-            return False
+-    return run
+-
+-
+-def _parked_msg(conn, verb: str, suffix: str):
+-    """``ok_msg`` for a park that may have escalated to an owner card instead."""
+-    from hermes_cli import kanban_awaiting as kaw
+-
+-    def msg(tid):
+-        owner = kaw.escalated_owner(conn, tid)
+-        return kaw.escalation_message(tid, owner) if owner else f"{verb} {tid}{suffix}"
+-    return msg
+-
+-
+ def _cmd_block(args: argparse.Namespace) -> int:
+     reason = _joined_words(args.reason)
+     kind = getattr(args, "kind", None)
+@@ -1465,6 +1395,10 @@ def _cmd_block(args: argparse.Namespace) -> int:
+     ids = _bulk_ids(args)
+     suffix = f": {reason}" if reason else ""
+     with kbc.connect_closing() as conn:
++        rc = _ids_error(ids, _REASON_WORDS_HINT, conn)
++        if rc:
++            return rc
++
+         def ok_msg(tid):
+             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
+             landed = kb.get_task(conn, tid)
+@@ -1494,9 +1428,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
+             return _err(f"kanban block: {policy}", 2)
+         refused: dict = {}
+         op = _guarded_park(conn, "block", wake, refused, _commented(
+-            conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
++            reason, author, "BLOCKED", lambda tid, comment: kb.block_task(
+                 conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+-                human_request=request, awaiting=awaiting,
++                human_request=request, awaiting=awaiting, comment=comment,
+                 wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
+             awaiting=awaiting, reason=reason, kind=kind)
+         return _bulk_apply(ids, op, ok_msg, lambda tid: refused.get(tid) or f"cannot block {tid}")
+@@ -1511,6 +1445,9 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+     ids = _bulk_ids(args)
+     suffix = f": {reason}" if reason else ""
+     with kbc.connect_closing() as conn:
++        rc = _ids_error(ids, _REASON_WORDS_HINT, conn)
++        if rc:
++            return rc
+         try:
+             wake = _cli_wake_check(args)
+             awaiting, wake = _cli_awaiting(args, wake)
+@@ -1518,25 +1455,30 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
+             return _err(f"kanban schedule: {exc}", 2)
+         refused: dict = {}
+         op = _guarded_park(conn, "schedule", wake, refused, _commented(
+-            conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
++            reason, author, "SCHEDULED", lambda tid, comment: kb.schedule_task(
+                 conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid), awaiting=awaiting,
+-                wake_check=wake[0], check_every=wake[1], clock_only=wake[2])),
++                wake_check=wake[0], check_every=wake[1], clock_only=wake[2], comment=comment)),
+             awaiting=awaiting, reason=reason)
++        from hermes_cli.kanban_reason_comment import human_answer_refusal
+         return _bulk_apply(ids, op, _parked_msg(conn, "Scheduled", suffix),
+-                           lambda tid: refused.get(tid) or f"cannot schedule {tid}")
++                           lambda tid: (refused.get(tid) or human_answer_refusal(conn, tid, "schedule")
++                                        or f"cannot schedule {tid}"))
+ 
+ 
+ def _cmd_unblock(args: argparse.Namespace) -> int:
+     if os.environ.get("HERMES_KANBAN_TASK"):
+         return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
+-    ids, rc = _require_ids(args)
++    ids, rc = _require_ids(args, _REASON_FLAG_HINT)
+     if rc:
+         return rc
+     reason = _stripped_or_none(getattr(args, "reason", None))
+     author = _profile_author() if reason else None
+     suffix = f": {reason}" if reason else ""
+     with kbc.connect_closing() as conn:
+-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
++        rc = _ids_error(ids, _REASON_FLAG_HINT, conn)
++        if rc:
++            return rc
++        op = _commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(conn, tid, comment=comment))
+         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
+                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+ 
+diff --git a/hermes_cli/kanban_cli_park.py b/hermes_cli/kanban_cli_park.py
+new file mode 100644
+index 0000000000..d469e89224
+--- /dev/null
++++ b/hermes_cli/kanban_cli_park.py
+@@ -0,0 +1,111 @@
++"""CLI helpers for per-task park/unblock ops, split out of ``hermes_cli/kanban.py``. [daveey]
++
++Reason comments (``_commented``), id validation before any mutation (``_ids_error``), and the
++wake-check / awaiting guards a park runs before it lands (``_guarded_park``).
++"""
++from __future__ import annotations
++
++import argparse
++import re
++from typing import Optional
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_output import _err
++
++
++def _commented(reason: Optional[str], author, prefix: str, op):
++    """Wrap a per-task ``op(tid, comment)`` so a ``reason`` is recorded as a ``PREFIX: reason``
++    comment by the op itself, in its write txn and only when it lands (``kanban_reason_comment``):
++    a refused op leaves no comment claiming a change that never happened. [daveey]"""
++    comment = (author, f"{prefix}: {reason}") if reason else None
++    return lambda tid: op(tid, comment)
++
++
++# A task id as the boards mint them (``t_`` + hex; see ``kanban_db._new_task_id``/``kanban_db_sync.new_task_id``).
++_TASK_ID_SHAPE = re.compile(r"t_[0-9a-zA-Z]{4,64}")
++
++
++def _ids_error(ids, hint: str, conn=None) -> int:
++    """rc 2 (stderr names the token) when any id is not task-id shaped or, given ``conn``, not on the
++    board; 0 when all are. Run before any mutation so free text passed where ids go changes nothing."""
++    for tid in ids:
++        if not isinstance(tid, str) or not _TASK_ID_SHAPE.fullmatch(tid):
++            return _err(f"not a task id: {str(tid)[:40]!r}. {hint}", 2)
++    if conn is not None:
++        for tid in ids:
++            if kb.get_task(conn, tid) is None:
++                return _err(f"unknown task id: {tid!r}; nothing was changed", 2)
++    return 0
++
++
++_REASON_FLAG_HINT = 'Pass a reason with --reason "..."'
++_REASON_WORDS_HINT = "The reason goes after the task id; --ids takes only task ids"
++
++
++def _cli_wake_check(args: argparse.Namespace):
++    """``(wake_check, check_every, clock_only)`` from ``--wake-check/--check-every/--clock-only``."""
++    from hermes_cli import kanban_wake_check as kwc
++
++    cmd = kwc.normalize_cmd(getattr(args, "wake_check", None))
++    every = kwc.normalize_every(getattr(args, "check_every", None)) if cmd else None
++    err = kwc.dry_run_error(cmd)
++    if err:
++        raise ValueError(err)
++    return cmd, every, bool(getattr(args, "clock_only", False))
++
++
++def _cli_awaiting(args: argparse.Namespace, wake):
++    """``(awaiting, wake)`` from ``--awaiting KIND:REF|JSON`` (+ ``--awaiting-why``); a card wait
++    with no ``--wake-check`` gets ``hermes kanban wait-check task`` as its probe. [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
++
++    raw = getattr(args, "awaiting", None)
++    if not raw:
++        return None, wake
++    awaiting = kaw.normalize(raw)
++    why = getattr(args, "awaiting_why", None)
++    if why and awaiting is not None:
++        awaiting["why"] = why.strip()[:600]
++    probe = None if wake[0] else kaw.card_probe(awaiting)
++    if probe:
++        from hermes_cli import kanban_wake_check as kwc
++        wake = (probe, kwc.normalize_every(None), wake[2])
++    kaw.confirm_remote(awaiting)  # ssh, so before the park's write txn
++    return awaiting, wake
++
++
++def _guarded_park(conn, op: str, wake, refused: dict, park, awaiting=None, **plan):
++    """Per-task op: refuse a park > 2 h out with no probe (``kanban_wake_check.guard_error``)
++    or one nothing would produce (``kanban_awaiting``) before ``park`` runs; ``park`` itself writes
++    its reason comment only when it lands (``_commented``). [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_wake_check as kwc
++
++    def run(tid):
++        wake_at = kwc.planned_wake(conn, tid, op=op, **plan)
++        err = kwc.guard_error(wake_at=wake_at, wake_check=wake[0], clock_only=wake[2])
++        if err:
++            refused[tid] = f"cannot {op} {tid}: {err}"
++            return False
++        try:
++            if wake_at is not None:
++                kaw.resolve(conn, tid, awaiting=awaiting, reason=plan.get("reason"), wake_check=wake[0],
++                            clock_only=wake[2], op=op)
++            return park(tid)
++        except kaw.AwaitingError as exc:
++            refused[tid] = f"cannot {op} {tid}: {exc}"
++            return False
++        except ValueError as exc:   # e.g. a wake_check on a block that is not a timed park
++            refused[tid] = f"cannot {op} {tid}: {exc}"
++            return False
++    return run
++
++
++def _parked_msg(conn, verb: str, suffix: str):
++    """``ok_msg`` for a park that may have escalated to an owner card instead."""
++    from hermes_cli import kanban_awaiting as kaw
++
++    def msg(tid):
++        owner = kaw.escalated_owner(conn, tid)
++        return kaw.escalation_message(tid, owner) if owner else f"{verb} {tid}{suffix}"
++    return msg
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8f46e75e1b..def7ff700e 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3319,6 +3319,7 @@ def block_task(
+     blocker_id: Optional[str] = None, wake_check: Optional[str] = None,
+     check_every: Optional[int] = None, clock_only: bool = False,
+     human_request: Optional[dict] = None, awaiting: Any = None, clear_blocker: bool = False,
++    comment: Optional[tuple[str, str]] = None,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+     :func:`kanban_block_routing.route_block`). A wait on time -- ``kind='time'``, a ``dependency``
+@@ -3341,12 +3342,16 @@ def block_task(
+     ``assignment`` is agent-owned: a capable configured supervisor receives a
+     durable repair card and the original waits in ``todo`` on that dependency
+     (including explicit classification of a breaker-parked card).
++
++    ``comment`` (``(author, body)``) is written in the same txn, before the transition event,
++    and only when the block lands (``kanban_reason_comment``).
+     """
+     from hermes_cli.kanban_human_request import reject_timed_request, validate_human_request
++    from hermes_cli.kanban_reason_comment import reason_comment
+     human_request = validate_human_request(human_request, kind=kind)
+     if kind is not None and kind not in VALID_BLOCK_KINDS:
+         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+-    with write_txn(conn):
++    with write_txn(conn), reason_comment(conn, task_id, comment) as noted:
+         cur_row = conn.execute(
+             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+         ).fetchone()
+@@ -3376,11 +3381,12 @@ def block_task(
+                 mode = "timed"
+             if mode is not None:
+                 reject_timed_request(human_request)
+-                return ktp.park(conn, task_id, reason=reason, requested_kind=kind, source_status="ready",
+-                                from_untyped_block=True, wake_check=wake_check,
+-                                check_every=check_every, clock_only=clock_only, awaiting=awaiting,
+-                                blocker_id=blocker_id, blocker_wake=mode == "blocker",
+-                                run_metadata=_clear_meta(clear_blocker))
++                return noted.keep(ktp.park(
++                    conn, task_id, reason=reason, requested_kind=kind, source_status="ready",
++                    from_untyped_block=True, wake_check=wake_check,
++                    check_every=check_every, clock_only=clock_only, awaiting=awaiting,
++                    blocker_id=blocker_id, blocker_wake=mode == "blocker",
++                    run_metadata=_clear_meta(clear_blocker)))
+             _refuse_untimed_probe(kind, wake_check, clock_only)
+             requested_kind, rekind_reason = kind, None
+             if kind == "assignment":
+@@ -3401,7 +3407,7 @@ def block_task(
+             if kind == "assignment":
+                 assignment_routing.route(conn, get_task(conn, task_id), payload)
+             _append_event(conn, task_id, "blocked", payload)
+-            return True
++            return noted.keep(True)
+         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else cur_row["status"]
+         requested_kind, rekind_reason = kind, None
+         from hermes_cli.kanban_block_routing import classify_stop
+@@ -3421,11 +3427,12 @@ def block_task(
+             mode = "timed"
+         if mode is not None:
+             reject_timed_request(human_request)
+-            return ktp.park(conn, task_id, reason=reason, requested_kind=kind,
+-                            source_status=source_status, expected_run_id=expected_run_id,
+-                            wake_check=wake_check, check_every=check_every, clock_only=clock_only, awaiting=awaiting,
+-                            blocker_id=blocker_id, blocker_wake=mode == "blocker",
+-                            run_metadata=_clear_meta(clear_blocker))
++            return noted.keep(ktp.park(
++                conn, task_id, reason=reason, requested_kind=kind,
++                source_status=source_status, expected_run_id=expected_run_id,
++                wake_check=wake_check, check_every=check_every, clock_only=clock_only, awaiting=awaiting,
++                blocker_id=blocker_id, blocker_wake=mode == "blocker",
++                run_metadata=_clear_meta(clear_blocker)))
+         _refuse_untimed_probe(kind, wake_check, clock_only)
+         # Parent-less ``dependency`` behind a shared blocker with a human ask: sticky ``needs_input``.
+         if kind == "dependency" and no_open_parent:
+@@ -3483,6 +3490,7 @@ def block_task(
+             payload["rekind_reason"] = rekind_reason
+             assignment_routing.route(conn, get_task(conn, task_id), payload)
+         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
++        noted.keep()
+         blocked_task = get_task(conn, task_id)
+         if kind == "dependency":
+             # Historical ordering: the dependency lane fires inside the txn.
+@@ -3827,13 +3835,15 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
+     return "ready" if _parents_satisfied(conn, task_id) else "todo"
+ 
+ 
+-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
++def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: Optional[tuple[str, str]] = None) -> bool:
+     """``blocked``/``scheduled``/``triage`` -> its resumable phase (parent
+     re-gated; ``review`` when that is where it left off), closing any leaked run
+     first. ``triage`` is accepted so a card a block loop escalated can go back
+-    to work without the specifier/decomposer rewriting it. [daveey]"""
++    to work without the specifier/decomposer rewriting it. ``comment`` is written in the same
++    txn and only when the unblock lands (``kanban_reason_comment``). [daveey]"""
++    from hermes_cli.kanban_reason_comment import reason_comment
+     now = int(time.time())
+-    with write_txn(conn):
++    with write_txn(conn), reason_comment(conn, task_id, comment) as noted:
+         resume_status = (
+             _resume_status_from_events(conn, task_id)
+             if _task_status(conn, task_id) in ("blocked", "triage")
+@@ -3870,7 +3880,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+                 else None
+             ),
+         )
+-        return True
++        return noted.keep(True)
+ 
+ 
+ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+@@ -4210,24 +4220,6 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+     return True
+ 
+ 
+-def _awaiting_human_answer(conn: sqlite3.Connection, task_id: str) -> bool:
+-    """True when the card's outstanding ask is for a human: a human-kind ``block_kind``
+-    (``needs_input``/``capability``) whose latest ``blocked``/``block_loop_detected`` event
+-    has had no ``unblocked`` and no new run (``claimed``) since. [daveey]"""
+-    row = conn.execute("SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-    if row is None or _row_get(row, "block_kind") not in ("needs_input", "capability"):
+-        return False
+-    ask = conn.execute(
+-        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected')",
+-        (task_id,)).fetchone()[0]
+-    if ask is None:
+-        return row["status"] == "blocked"
+-    answered = conn.execute(
+-        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN ('unblocked', 'claimed') LIMIT 1",
+-        (task_id, ask)).fetchone()
+-    return answered is None
+-
+-
+ # --- Worker context builder (what a spawned worker sees) ---
+ 
+ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -4705,6 +4697,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
+ 
+ # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
+ from hermes_cli.kanban_db_schedule import schedule_task
++from hermes_cli.kanban_reason_comment import _awaiting_human_answer
+ from hermes_cli.kanban_db_notify import _inherit_notify_subs, _owning_sub_clause
+ from hermes_cli.kanban_db_boards import (
+     _default_board_display_name,
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 7d1a644557..ae8fd691a5 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -13,7 +13,7 @@ def schedule_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     expected_run_id: Optional[int] = None, wake_check: Optional[str] = None,
+     check_every: Optional[int] = None, clock_only: bool = False, awaiting: Any = None,
+-    clear_blocker: bool = False,
++    clear_blocker: bool = False, comment: Optional[tuple[str, str]] = None,
+ ) -> bool:
+     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
+     (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
+@@ -21,8 +21,12 @@ def schedule_task(
+     not on any needs-me surface, so such a park hid the ask (t_6feb6afd). [daveey]
+ 
+     ``awaiting`` names the producer (``kanban_awaiting``); a park nothing would satisfy raises
+-    ``AwaitingError``, and a third park on one premise escalates to an owner card instead."""
+-    with _kb.write_txn(conn):
++    ``AwaitingError``, and a third park on one premise escalates to an owner card instead.
++
++    ``comment`` (``(author, body)``) is written in the same txn and only when the park lands
++    (``kanban_reason_comment``); ``human_answer_refusal`` explains the human-answer refusal."""
++    from hermes_cli.kanban_reason_comment import reason_comment
++    with _kb.write_txn(conn), reason_comment(conn, task_id, comment) as noted:
+         if _kb._awaiting_human_answer(conn, task_id):
+             return False
+         from hermes_cli.kanban_timed_park import scheduled_payload
+@@ -32,8 +36,8 @@ def schedule_task(
+             record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+                               clock_only=clock_only, op="schedule")
+         except kaw.RepeatedPark as rp:
+-            return kaw.escalate(conn, task_id, record=rp.record, reason=reason,
+-                                expected_run_id=expected_run_id) is not None
++            return noted.keep(kaw.escalate(conn, task_id, record=rp.record, reason=reason,
++                                           expected_run_id=expected_run_id) is not None)
+         wake_check = wake_check or kaw.card_probe(record)
+         why = kaw.park_cycle_error(conn, task_id, record, wake_check)
+         if why:
+@@ -69,7 +73,7 @@ def schedule_task(
+             **payload, **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record, **meta,
+         }, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check, check_every)
+-        return True
++        return noted.keep(True)
+ 
+ 
+ # Late-bound origin namespace (see module docstring); imported LAST so this
+diff --git a/hermes_cli/kanban_reason_comment.py b/hermes_cli/kanban_reason_comment.py
+new file mode 100644
+index 0000000000..4c1e11897f
+--- /dev/null
++++ b/hermes_cli/kanban_reason_comment.py
+@@ -0,0 +1,97 @@
++"""Reason comments that only exist when their state change does, and why a park was refused. [daveey]
++
++``hermes kanban block|schedule|unblock <id> <reason>`` record the reason as a ``PREFIX: reason``
++comment. The CLI used to write it in its own transaction before the op ran, so a refused op left
++a comment claiming a change that never happened (t_01a18653b77a4f83). :func:`reason_comment`
++writes it inside the op's own write txn instead, first (so ``commented`` still precedes the
++transition event, which ``escalated_owner`` and the block-loop human-input checks rely on), and
++rolls it back to a savepoint unless the op marks success. A crash rolls both back together.
++"""
++from __future__ import annotations
++
++import contextlib
++import secrets
++import sqlite3
++import time
++from typing import Iterator, Optional
++
++Comment = Optional[tuple[str, str]]  # (author, body)
++
++
++class _ReasonComment:
++    __slots__ = ("comment_id", "kept")
++
++    def __init__(self) -> None:
++        self.comment_id: Optional[int] = None
++        self.kept = False
++
++    def keep(self, ok=True):
++        """Mark the op successful when ``ok`` is truthy; returns ``ok`` so it wraps a return value."""
++        if ok:
++            self.kept = True
++        return ok
++
++
++@contextlib.contextmanager
++def reason_comment(conn: sqlite3.Connection, task_id: str, comment: Comment) -> Iterator[_ReasonComment]:
++    """Use INSIDE the op's ``write_txn``. Writes ``comment`` now and drops it at exit unless
++    ``.keep()`` was called; an exception rolls it back with the rest of the txn."""
++    from hermes_cli import kanban_db as kb
++
++    state = _ReasonComment()
++    if not (comment and comment[1] and conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()):
++        yield state
++        return
++    # A savepoint, not a DELETE: on a synced board the insert triggers queue outbox rows for the
++    # comment and its event, and append-only tables capture no deletes. The refusal paths of
++    # block/schedule/unblock write nothing before refusing, so this undoes only the comment.
++    savepoint = f"reason_comment_{secrets.token_hex(6)}"
++    conn.execute(f"SAVEPOINT {savepoint}")
++    state.comment_id = kb.add_comment(conn, task_id, comment[0], comment[1])
++    try:
++        yield state
++    except BaseException:
++        with contextlib.suppress(sqlite3.OperationalError):
++            conn.execute(f"ROLLBACK TO {savepoint}")
++            conn.execute(f"RELEASE {savepoint}")
++        raise
++    if not state.kept:
++        conn.execute(f"ROLLBACK TO {savepoint}")
++        state.comment_id = None
++    conn.execute(f"RELEASE {savepoint}")
++
++
++def _awaiting_human_answer(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when the card's outstanding ask is for a human: a human-kind ``block_kind``
++    (``needs_input``/``capability``) whose latest ``blocked``/``block_loop_detected`` event
++    has had no ``unblocked`` and no new run (``claimed``) since. [daveey]"""
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute("SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or kb._row_get(row, "block_kind") not in ("needs_input", "capability"):
++        return False
++    ask = conn.execute(
++        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected')",
++        (task_id,)).fetchone()[0]
++    if ask is None:
++        return row["status"] == "blocked"
++    answered = conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN ('unblocked', 'claimed') LIMIT 1",
++        (task_id, ask)).fetchone()
++    return answered is None
++
++
++def human_answer_refusal(conn: sqlite3.Connection, task_id: str, op: str = "schedule") -> Optional[str]:
++    """Why ``op`` was refused because the card waits on a human answer (``_awaiting_human_answer``),
++    with the way out; None when that guard does not apply."""
++    if not _awaiting_human_answer(conn, task_id):
++        return None
++    row = conn.execute("SELECT block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    ts = conn.execute(
++        "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected')",
++        (task_id,)).fetchone()[0]
++    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(int(ts))) if ts else "at an unrecorded time"
++    gerund = "scheduling" if op == "schedule" else f"{op}ing"
++    return (f"cannot {op} {task_id}: it is blocked on a human answer (block_kind {row[0]}, blocked {when}); "
++            f"{gerund} would hide that ask. Move the ask to a card the human sees, then: "
++            f'hermes kanban unblock {task_id} --reason "..." && hermes kanban {op} {task_id} ...')
+diff --git a/tests/hermes_cli/test_kanban_refused_op_comments.py b/tests/hermes_cli/test_kanban_refused_op_comments.py
+new file mode 100644
+index 0000000000..57d817a78b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_refused_op_comments.py
+@@ -0,0 +1,194 @@
++"""A refused kanban op leaves no reason comment, says why, and free text is never parsed as ids. [daveey]
++
++Regression for t_01a18653b77a4f83: two refused ``hermes kanban schedule`` calls each left a
++``SCHEDULED: ...`` comment on a card that stayed ``blocked``; the refusal printed only
++``cannot schedule <id>``; and ``unblock <id> "free text"`` unblocked the card before failing on
++the free text as a second "id".
++"""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT"):
++        monkeypatch.delenv(key, raising=False)
++    kb.init_db()
++    return home
++
++
++def _cli(*argv: str) -> int:
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kc.build_parser(parser.add_subparsers(dest="command"))
++    return kc.kanban_command(parser.parse_args(["kanban", *argv]))
++
++
++_ASK = json.dumps({"action": "Unlock the iPhone", "why_human": "needs Face ID", "interaction": "physical",
++                   "scope": "one unlock", "evidence": "device locked"})
++
++
++def _human_blocked(conn, title="needs david") -> str:
++    tid = kb.create_task(conn, title=title, assignee="a")
++    kb.claim_task(conn, tid)
++    assert kb.block_task(conn, tid, reason="David: unlock the iPhone", kind="needs_input")
++    return tid
++
++
++def _comments(conn, tid) -> list[str]:
++    return [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (tid,))]
++
++
++def _events(conn, tid, kind) -> int:
++    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?", (tid, kind)).fetchone()[0]
++
++
++def test_refused_schedule_leaves_no_comment_and_says_why(kanban_home, capsys):
++    with kbc.connect() as conn:
++        tid = _human_blocked(conn)
++    rc = _cli("schedule", tid, "Parked on the wall", "--clock-only")
++    err = capsys.readouterr().err
++    assert rc == 1
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert _comments(conn, tid) == []
++        assert _events(conn, tid, "commented") == 0
++    assert "blocked on a human answer (block_kind needs_input, blocked " in err
++    assert "scheduling would hide that ask" in err
++    assert f'hermes kanban unblock {tid} --reason "..." && hermes kanban schedule {tid}' in err
++
++
++def test_refused_unblock_leaves_no_comment(kanban_home, capsys):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="ready card", assignee="a")
++    rc = _cli("unblock", tid, "--reason", "not actually blocked")
++    assert rc == 1
++    assert "cannot unblock" in capsys.readouterr().err
++    with kbc.connect() as conn:
++        assert _comments(conn, tid) == []
++        assert _events(conn, tid, "unblocked") == 0
++
++
++def test_successful_schedule_and_unblock_write_exactly_one_comment_each(kanban_home):
++    with kbc.connect() as conn:
++        tid = _human_blocked(conn)
++    assert _cli("unblock", tid, "--reason", "ask moved to t_feedface") == 0
++    with kbc.connect() as conn:
++        assert _comments(conn, tid) == ["UNBLOCK: ask moved to t_feedface"]
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready"
++        kb.claim_task(conn, tid)
++    assert _cli("schedule", tid, "waiting", "on", "the", "soak", "--clock-only") == 0
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert _comments(conn, tid) == ["UNBLOCK: ask moved to t_feedface", "SCHEDULED: waiting on the soak"]
++        kinds = [r[0] for r in conn.execute(
++            "SELECT kind FROM task_events WHERE task_id = ? AND kind IN ('commented', 'scheduled', 'unblocked') "
++            "ORDER BY id", (tid,))]
++    # The comment still precedes its transition event (escalated_owner / block-loop checks read order).
++    assert kinds == ["commented", "unblocked", "commented", "scheduled"]
++
++
++def test_successful_block_writes_one_comment_before_its_event(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="to block", assignee="a")
++        kb.claim_task(conn, tid)
++    assert _cli("block", tid, "need", "the", "key", "--kind", "needs_input", "--human-request", _ASK) == 0
++    with kbc.connect() as conn:
++        assert _comments(conn, tid) == ["BLOCKED: need the key"]
++        last_two = [r[0] for r in conn.execute(
++            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 2", (tid,))]
++    assert last_two == ["blocked", "commented"]
++
++
++def test_refused_block_leaves_no_comment(kanban_home):
++    with kbc.connect() as conn:
++        tid = _human_blocked(conn)
++        before = _comments(conn, tid)
++    assert _cli("block", tid, "again", "--kind", "needs_input", "--human-request", _ASK) == 1
++    with kbc.connect() as conn:
++        assert _comments(conn, tid) == before
++
++
++def test_unblock_free_text_is_rejected_before_any_change(kanban_home, capsys):
++    with kbc.connect() as conn:
++        tid = _human_blocked(conn)
++    text = "Moving the API-credit ask to a card David sees"
++    rc = _cli("unblock", tid, text)
++    err = capsys.readouterr().err
++    assert rc == 2
++    assert f"not a task id: {text[:40]!r}" in err
++    assert '--reason "..."' in err
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert _events(conn, tid, "unblocked") == 0
++        assert _comments(conn, tid) == []
++
++
++def test_unknown_id_is_rejected_before_any_change(kanban_home, capsys):
++    with kbc.connect() as conn:
++        tid = _human_blocked(conn)
++    assert _cli("unblock", tid, "t_00000000deadbeef") == 2
++    assert "unknown task id" in capsys.readouterr().err
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_schedule_ids_free_text_is_rejected_before_any_change(kanban_home, capsys):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="ready card", assignee="a")
++    assert _cli("schedule", tid, "--clock-only", "--ids", "wait for the soak") == 2
++    assert "not a task id: 'wait for the soak'" in capsys.readouterr().err
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).status == "ready"
++        assert _comments(conn, tid) == []
++
++
++def test_db_comment_rolls_back_with_a_raising_op(kanban_home):
++    """The comment and the change share one txn: an op that raises keeps neither."""
++    from hermes_cli import kanban_awaiting as kaw
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="a")
++        with pytest.raises(kaw.AwaitingError):
++            kb.schedule_task(conn, tid, reason="x", awaiting={"kind": "human"}, comment=("me", "SCHEDULED: x"))
++        assert _comments(conn, tid) == []
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++# --- kanban_schedule tool: a separate entry path -----------------------------------------------
++
++@pytest.fixture
++def worker_env(kanban_home, monkeypatch):
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++        assert kb.block_task(conn, tid, reason="David: approve the spend", kind="needs_input")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return tid
++
++
++def test_tool_refused_schedule_leaves_no_comment_and_says_why(worker_env):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_schedule({"reason": "Parked on the wall", "clock_only": True}))
++    assert "blocked on a human answer (block_kind needs_input" in out.get("error", ""), out
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, worker_env).status == "blocked"
++        assert _comments(conn, worker_env) == []
++        assert _events(conn, worker_env, "commented") == 0
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 43043ecb0d..8c4b5a3935 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -20,7 +20,7 @@ from hermes_cli.goals import handoff_judge_goal, judge_goal
+ from tools.registry import no_cache_check_fn, registry, tool_error
+ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+-from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap
++from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import _marker_placement_fields, _placement_refused, _runs_where
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_schemas import (
+@@ -1303,8 +1303,8 @@ def _handle_schedule(args: dict, **kw) -> str:
+             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
+             wake_check=wake[0], check_every=wake[1], clock_only=wake[2], awaiting=awaiting,
+             clear_blocker=clear_blocker)
+-        _check(ok, f"could not schedule {tid} (unknown id, not in todo/ready/running/blocked, or it "
+-                   "waits on a human answer: needs_input/capability asks stay blocked, never scheduled)")
++        _check(ok, "" if ok else krc.human_answer_refusal(conn, tid, "schedule")
++               or f"could not schedule {tid} (unknown id, or not in todo/ready/running/blocked)")
+         escalated = _escalated(kb, conn, tid)
+         if escalated:
+             return escalated
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # A pinned skill the assignee cannot load is refused at create
 
-Patch **0681** (`45a6fbe63e`). Sits next to [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md) (0670): that one refuses a model pin the registry cannot serve; this one refuses a skill pin the assignee cannot load.
+Patch **0690** (`45a6fbe63e`). Sits next to [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md) (0685): that one refuses a model pin the registry cannot serve; this one refuses a skill pin the assignee cannot load.
 
 ## Behavior
 
@@ -39,7 +39,7 @@ Untested: gateway and API-server create paths call `create_task` without `valida
 
 ## Applying
 
-`git am -3` 0681. New module plus the create, CLI, worker-start and dispatch call sites.
+`git am -3` 0690. New module plus the create, CLI, worker-start and dispatch call sites.
 
 ## Gotchas
 

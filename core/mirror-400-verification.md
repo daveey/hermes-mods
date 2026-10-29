@@ -14,7 +14,7 @@ fork main branch with exact remote-SHA readback. A second reviewer replayed all
 preserved patches, privacy scan, coverage and 22 production-path comparisons.
 Mirror publication and runtime activation remain separate from that source receipt.
 
-## Merge-history reasoning (0393)
+## Merge-history reasoning (0343, 0361, 0364, 0365, 0366, 0387, 0392)
 
 The previous 392 public patches terminate at source `2228cfe8dada6912c5f8966f967d12870d029c2d`.
 They remain byte-identical, at their existing paths and numbers, including adapted 0251.
@@ -26,9 +26,9 @@ paired fixture changes (`53a6693092` and `d7235c1661`), and later integration fi
 (`dd13c9b77c`, `c13f6de33e`, `3d0d4ea6a4`). Its merge commits also carry resolutions
 (`341c1ca588`, `5e7b3f828c`, `323c8d17be`, `6d2be1e857`). Replaying only the
 non-merge changes both conflicts with mainline and omits those recorded resolutions.
-The attempted 405-patch export failed at raw branch patch 0343; it is superseded.
+The attempted 405-patch export failed at raw branch patch 0344; it is superseded.
 
-0393 integrates the first-parent delta of the recorded final merge
+0343, 0361, 0364, 0365, 0366, 0387, 0392 integrates the first-parent delta of the recorded final merge
 `2b6644387f36bd0cc9e4c88f6aeb36572f8b4b1d`, whose first parent is the 392-source tip.
 It replaces individual replay of all seven branch non-merge commits, not seven independent
 features. This preserves the actual merged result rather than choosing one duplicate implementation.
@@ -38,17 +38,17 @@ cache declaration placement and test ordering. They take the recorded merge vers
 old public patch bodies nor unrelated scrubbed source files are replaced. The patch envelope
 is synthetic and names its source merge rather than impersonating a raw source commit.
 
-0394–0401 are then the source first-parent followups in order:
+0400, 0401, 0402, 0403, 0404, 0405, 0406, 0407 are then the source first-parent followups in order:
 
 | Patch | Source | Purpose |
 | --- | --- | --- |
-| 0394 | d69ad5291ce94014ab67a99a136ad43a2577a850 | Deterministic auto-continue marker timestamp test |
-| 0395 | 1330267ab4d0273b04045618ba97a289f1c27d9a | LSP cleanup/reaping test robustness |
-| 0397 | a286616b5a0e2eadfdaa97a9030a2247045d42f6 | Atomic activity snapshot projects fixture |
-| 0398 | dc50ba33a29bd0237f33bd2bf22a3e4070f5053a | Scope-heartbeat owner liveness |
-| 0399 | a253016acf39404f7e0b7aefd4151d09584a176e | Exact owner-attested legacy alias reconciliation |
-| 0400 | 76b9c78f24f2d89d22ec45e20b71a2e738d06c70 | Distinct legacy-reconciliation wire action |
-| 0401 | 0146a882edf55e22fc9197e2a2e190a0fbacf068 | Preserve sync timestamp during ledger contention |
+| 0400 | d69ad5291ce94014ab67a99a136ad43a2577a850 | Deterministic auto-continue marker timestamp test |
+| 0401 | 1330267ab4d0273b04045618ba97a289f1c27d9a | LSP cleanup/reaping test robustness |
+| 0403 | a286616b5a0e2eadfdaa97a9030a2247045d42f6 | Atomic activity snapshot projects fixture |
+| 0404 | dc50ba33a29bd0237f33bd2bf22a3e4070f5053a | Scope-heartbeat owner liveness |
+| 0405 | a253016acf39404f7e0b7aefd4151d09584a176e | Exact owner-attested legacy alias reconciliation |
+| 0406 | 76b9c78f24f2d89d22ec45e20b71a2e738d06c70 | Distinct legacy-reconciliation wire action |
+| 0407 | 0146a882edf55e22fc9197e2a2e190a0fbacf068 | Preserve sync timestamp during ledger contention |
 
 ## Full apply and preservation
 

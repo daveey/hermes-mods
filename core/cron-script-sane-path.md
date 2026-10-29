@@ -1,6 +1,6 @@
 # Cron scripts get the terminal's sane PATH, whichever process runs the tick
 
-Patch: 0665.
+Patch: 0676.
 
 ## Behavior
 
@@ -57,7 +57,7 @@ function, not by its own test.
 
 ## Applying
 
-`git am core/patches/0665-*.patch`, then `scripts/run_tests.sh tests/cron/test_cron_script_minimal_path.py`.
+`git am core/patches/0676-*.patch`, then `scripts/run_tests.sh tests/cron/test_cron_script_minimal_path.py`.
 
 ## Gotchas
 

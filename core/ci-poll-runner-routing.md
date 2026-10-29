@@ -37,7 +37,7 @@ The full **280-patch** series applied successfully using `git am -3 --empty=keep
 
 ## Applying
 
-Apply the full ordered series from its merge-base. This merged branch inserts commits before previously published entries: broker transport is now 0335 and PR park handoff is now 0349. The existing patches were moved without changing their bytes, and their documentation references were updated.
+Apply the full ordered series from its merge-base. This merged branch inserts commits before previously published entries: broker transport is now 0335 and PR park handoff is now 0350. The existing patches were moved without changing their bytes, and their documentation references were updated.
 
 ## Gotchas
 

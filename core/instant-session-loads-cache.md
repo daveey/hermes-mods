@@ -1,6 +1,6 @@
 # Instant session loads: local transcript cache
 
-Patches 0532 (source `307ab56d4b`), 0533 (source `8914c58a90`) and 0548 (source `0c02a4eb07`). Part C1 of the "instant session loads"
+Patches 0545 (source `307ab56d4b`), 0546 (source `8914c58a90`) and 0564 (source `0c02a4eb07`). Part C1 of the "instant session loads"
 plan; part A (sidebar rows from the hub replica) is [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md).
 
 ## Behavior
@@ -14,7 +14,7 @@ plan; part A (sidebar rows from the hub replica) is [desktop-sidebar-replica-liv
   automations). A session is refetched when its `activity` or `message_count` moved, at most every 30 s while
   it keeps moving. Gateway names map to registry connections through each connection's own
   `/api/plugins/hub-sync/status`, remembered in the cache file. A gateway whose route fails is skipped for 60 s.
-  Remote gateways are dialed passively (0548): prefetch rides the pool entry the remote prewarmer holds and never
+  Remote gateways are dialed passively (0564): prefetch rides the pool entry the remote prewarmer holds and never
   starts a cold SSH dial or spawn, bumps `lastActiveAt`, or records a profile as opened. The local backend may start.
 - **Open and reconcile.** When the clicked row names its owner, the REST read starts at the click (not after
   the owner lookup and gateway switch) and the cold resume reuses that same request. The fresh page replaces
@@ -37,7 +37,7 @@ plan; part A (sidebar rows from the hub replica) is [desktop-sidebar-replica-liv
 - `electron/transcript-cache.ts`: `TranscriptCacheStore` on `node:sqlite` (Electron 40 = Node 24; no native
   module). `putLatest` keeps the loaded prefix only when the new latest page overlaps it (by server row id), so a
   session that outgrew the window never stitches a gap. LRU 1000 sessions / 256 MiB, 8 MiB per entry (oldest
-  rows drop first). File mode 0600.
+  rows drop first). File mode 0622.
 - `electron/transcript-prefetch.ts`: pure selection/refresh logic with injected I/O.
 - `electron/transcript-cache-host.ts`: IPC (`hermes:transcript-cache:*`; `read` is `sendSync`), name learning,
   prefetch wiring. `main.ts` injects `ensureRegistryBackend` (behind `backendDialClaims`) and
@@ -75,8 +75,8 @@ showed the asleep notice with the draft kept.
 
 ## Applying
 
-Apply 0532, 0533 and 0548 with `git am -3` after the preceding fork patches. 0533 touches `use-session-actions`,
-`submit.ts`, `main.ts` and `preload.ts`, so it depends on the fork's Desktop series (offline rows from 0528).
+Apply 0545, 0546 and 0564 with `git am -3` after the preceding fork patches. 0546 touches `use-session-actions`,
+`submit.ts`, `main.ts` and `preload.ts`, so it depends on the fork's Desktop series (offline rows from 0537).
 
 ## Gotchas
 
@@ -86,13 +86,13 @@ Apply 0532, 0533 and 0548 with `git am -3` after the preceding fork patches. 053
 - A row whose replica says offline but whose gateway is in fact up still opens read-only until the sidebar
   shows it live again; clicking the live row resumes normally.
 
-## Follow-up patches (0623)
+## Follow-up patches (0628)
 
-**0623** (`3285003cc2`): opens of another gateway's session spent 4.5-6.8 s in an "owner" stage. The owner probe (`probeStoredSession`) now answers at once from an awake hub-replica row that matches the named owner (`fallbackSessionRow`); a resume that names no owner takes it from the awake replica row so the cached transcript paints before any await (asleep rows keep the read-only path); the prefetcher puts sessions behind open Inbox cards first, ahead of the per-gateway 200-slot people-first ordering. Code: `electron/transcript-cache-host.ts`, `transcript-prefetch.ts`, `src/app/session/hooks/use-session-actions/{index,utils}.ts`. Tests: `transcript-cache-host.test.ts`, `transcript-prefetch.test.ts`, `use-session-actions.test.tsx`, `resolve-stored-session.test.ts`.
+**0628** (`3285003cc2`): opens of another gateway's session spent 4.5-6.8 s in an "owner" stage. The owner probe (`probeStoredSession`) now answers at once from an awake hub-replica row that matches the named owner (`fallbackSessionRow`); a resume that names no owner takes it from the awake replica row so the cached transcript paints before any await (asleep rows keep the read-only path); the prefetcher puts sessions behind open Inbox cards first, ahead of the per-gateway 200-slot people-first ordering. Code: `electron/transcript-cache-host.ts`, `transcript-prefetch.ts`, `src/app/session/hooks/use-session-actions/{index,utils}.ts`. Tests: `transcript-cache-host.test.ts`, `transcript-prefetch.test.ts`, `use-session-actions.test.tsx`, `resolve-stored-session.test.ts`.
 
-## Follow-up patch (0674)
+## Follow-up patch (0680)
 
-**0674** (`29e02765f4`): after 0623, Inbox opens of new hub sessions still painted from REST. Every one was a hidden session, and some were archived. The prefetcher dropped hidden and archived records before the Inbox-first rule, and the replica's `/sessions` list leaves archived rows out entirely.
+**0680** (`29e02765f4`): after 0628, Inbox opens of new hub sessions still painted from REST. Every one was a hidden session, and some were archived. The prefetcher dropped hidden and archived records before the Inbox-first rule, and the replica's `/sessions` list leaves archived rows out entirely.
 
 - A hidden or archived record is kept when an open Inbox card points at it, and only then.
 - A card whose session the list left out gets a minimal record built from the card (gateway, profile, session id, activity), so it is prefetched too.

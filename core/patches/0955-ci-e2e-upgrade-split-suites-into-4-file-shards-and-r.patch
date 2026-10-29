@@ -1,0 +1,123 @@
+From e8d99e7a39712e546a211f635407a3b829ed33fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 04:18:48 -0700
+Subject: [PATCH] ci(e2e-upgrade): split suites into <=4-file shards and run
+ one worker per slot CPU [daveey]
+
+The git suite (9 files) ran as one shard at HERMES_TEST_WORKERS=6 on a 4-CPU bwrap slot; under load its
+own deadlines fired (git fetch 300 s watchdog, 30 s paused-gateway restart, the lock driver's update
+timeout) and three files went FLAKY, failing release run 40821597683. The plan now splits any suite
+over 4 files into <suite>-<i>of<n> shards (every n-th file), and the run step sizes workers to nproc
+(cap 6) instead of a fixed 6.
+
+Tests: test_e2e_upgrade_shards_cover_every_file_once_and_fit_one_slot replays the plan and every
+shard: each <=4 files, every upgrade test file exactly once (red before: core ran 7 files).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .github/workflows/tests.yml        | 36 +++++++++++++++++++++---------
+ tests/ci/test_update_ci_routing.py | 27 ++++++++++++++++++++++
+ 2 files changed, 53 insertions(+), 10 deletions(-)
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 2eb10d0bd2..306cfddd97 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -289,10 +289,18 @@ jobs:
+           set -euo pipefail
+           shards=$(python3 - <<'PY'
+           import json, pathlib
++          # A directory with more files than one slot runs at once is split into <dir>-<i>of<n>
++          # chunks (the run step takes every n-th file from i): a bwrap slot has 4 CPUs, and 9 git
++          # files at 6 workers starved their own deadlines (fetch watchdog, 30 s gateway restart).
++          CHUNK = 4
+           root = pathlib.Path("tests/e2e/core/upgrade")
+-          shards = ["core"] if any(root.glob("test_*.py")) else []
+-          shards += sorted(d.name for d in root.iterdir()
+-                           if d.is_dir() and not d.name.startswith(("_", ".")) and any(d.rglob("test_*.py")))
++          groups = {"core": sorted(root.glob("test_*.py"))}
++          groups.update((d.name, sorted(d.rglob("test_*.py"))) for d in sorted(root.iterdir())
++                        if d.is_dir() and not d.name.startswith(("_", ".")))
++          shards = []
++          for name, files in groups.items():
++              n = -(-len(files) // CHUNK)
++              shards += [name] if n == 1 else [f"{name}-{i}of{n}" for i in range(1, n + 1)]
+           print(json.dumps(shards))
+           PY
+           )
+@@ -432,22 +440,30 @@ jobs:
+         run: |
+           set -euo pipefail
+           source .venv/bin/activate
+-          if [ "$SHARD" = core ]; then
+-            mapfile -t files < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | sort)
++          suite=$SHARD part=1 parts=1
++          if [[ "$SHARD" =~ ^(.+)-([0-9]+)of([0-9]+)$ ]]; then
++            suite=${BASH_REMATCH[1]} part=${BASH_REMATCH[2]} parts=${BASH_REMATCH[3]}
++          fi
++          if [ "$suite" = core ]; then
++            mapfile -t all < <(find tests/e2e/core/upgrade -maxdepth 1 -name 'test_*.py' | LC_ALL=C sort)
+           else
+-            mapfile -t files < <(find "tests/e2e/core/upgrade/$SHARD" -name 'test_*.py' | sort)
++            mapfile -t all < <(find "tests/e2e/core/upgrade/$suite" -name 'test_*.py' | LC_ALL=C sort)
+           fi
++          files=()
++          for i in "${!all[@]}"; do
++            [ $(( i % parts )) -eq $(( part - 1 )) ] && files+=("${all[$i]}")
++          done
+           # A shard that collects nothing is a wiring bug, not a pass.
+           [ "${#files[@]}" -gt 0 ] || { echo "no test files for shard $SHARD" >&2; exit 1; }
+           printf 'shard %s: %s\n' "$SHARD" "${files[*]}"
++          # One worker per CPU this slot really has (cpuset), at most 6: each file drives real
++          # installs/updaters, and more workers than CPUs starves their deadlines.
++          cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
++          export HERMES_TEST_WORKERS=$(( cpus < 6 ? cpus : 6 ))
+           scripts/run_tests.sh --include-integration "${files[@]}"
+         env:
+           SHARD: ${{ matrix.shard }}
+           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
+-          # Each file drives real installs/updaters (process trees plus uv and
+-          # git I/O); cpu_count of them at once starves their deadlines. A
+-          # shard holds at most ~7 files, so this runs each shard in one wave.
+-          HERMES_TEST_WORKERS: "6"
+           HERMES_TEST_FILE_TIMEOUT: "3000"
+           OPENROUTER_API_KEY: ""
+           OPENAI_API_KEY: ""
+diff --git a/tests/ci/test_update_ci_routing.py b/tests/ci/test_update_ci_routing.py
+index 4f98d2f496..97d6e21144 100644
+--- a/tests/ci/test_update_ci_routing.py
++++ b/tests/ci/test_update_ci_routing.py
+@@ -844,3 +844,30 @@ def test_run_tests_forwards_the_strict_switch():
+     text = (_REPO / "scripts/run_tests.sh").read_text(encoding="utf-8-sig")
+     allow = re.search(r"for _test_var in (.*?); do", text, re.DOTALL)
+     assert allow and "HERMES_E2E_STRICT_ACCEPTANCE" in allow.group(1).split()
++
++
++def test_e2e_upgrade_shards_cover_every_file_once_and_fit_one_slot():
++    """Each e2e-upgrade shard runs at most 4 files (one per CPU of a bwrap slot), and together the shards
++    select every upgrade test file exactly once. The 9-file git directory used to be one shard at 6
++    workers on a 4-CPU slot, and its fetch watchdog / 30 s gateway restart deadlines flaked under load
++    (release run 40821597683)."""
++    lanes = {k: False for k in cc.classify(["README.md"])}
++    lanes["e2e_upgrade"] = True
++    node = _reached(_ci_run(lanes), "tests", "e2e-upgrade")
++    assert node is not None
++    body, ctx = node["body"], node["ctx"]
++    step = next(s for s in body["steps"] if s.get("name", "").startswith("Run upgrade e2e tests"))
++    shards = gha.render(body["strategy"]["matrix"]["shard"], ctx)
++    seen: dict[str, str] = {}
++    for shard in shards:
++        cell = {**ctx, "matrix": {"shard": shard}, "runner": {"os": "Linux", "arch": "X64"}}
++        files = workflow_steps.selected_files(step, cell, _REPO)
++        assert 0 < len(files) <= 4, f"shard {shard} runs {len(files)} files: {sorted(files)}"
++        for f in files:
++            assert f not in seen, f"{f} runs in both {seen[f]} and {shard}"
++            seen[f] = shard
++    upgrade = _REPO / "tests" / "e2e" / "core" / "upgrade"
++    expected = {p.relative_to(_REPO).as_posix() for p in upgrade.rglob("test_*.py")
++                if not any(part.startswith(("_", ".")) for part in p.relative_to(upgrade).parts[:-1])}
++    assert set(seen) == expected, f"missing {sorted(expected - set(seen))}, extra {sorted(set(seen) - expected)}"
++    assert any(s.startswith("git-") for s in shards), shards  # the 9-file git suite is split
+-- 
+2.55.0
+

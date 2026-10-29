@@ -1,6 +1,6 @@
 # Cron pins pass the managed routing registry; gated ticks keep the last verdict
 
-Patch: 0730 (core `a65917ae05`). Cron sibling of [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md).
+Patch: 0879 (core `a65917ae05`). Cron sibling of [kanban-managed-pin-policy.md](kanban-managed-pin-policy.md).
 
 ## Behavior
 

@@ -1,0 +1,497 @@
+From cee338f7fcd744611b234823b046fcc91af9ccd5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 09:33:24 +0000
+Subject: [PATCH] [daveey] Extend orphan install-state GC with idle-safe hourly
+ host sweeps
+
+---
+ pm/install_states.py                         | 240 +++++++++++++------
+ tests/pm/test_install_states_gc.py           |  14 ++
+ tests/pm/test_install_states_hourly_gc.py    | 126 ++++++++++
+ website/docs/reference/package-management.md |  10 +
+ 4 files changed, 319 insertions(+), 71 deletions(-)
+ create mode 100644 tests/pm/test_install_states_hourly_gc.py
+
+diff --git a/pm/install_states.py b/pm/install_states.py
+index ffa363ae76..d65be014b4 100644
+--- a/pm/install_states.py
++++ b/pm/install_states.py
+@@ -1,27 +1,19 @@
+-"""Reclaim per-checkout dependency state whose checkout is gone.
+-
+-Dependency state lives under ``<home>/installs/<install_key>`` where the key hashes the
+-checkout path (:func:`pm.environments.install_key`). Every ``hermes -w`` worktree, review tree
+-or scratch clone that boots the agent therefore commits a full environment (venv, test venv,
+-PM runtime, ~200 MB each), and nothing removed it when the tree was deleted: one developer
+-host carried 402 such orphans (80 GB) after a fortnight of worktree campaigns.
+-
+-The state dir records the checkout it belongs to in ``inputs/.project-root`` (written by
+-:func:`pm.environments.record_activation_inputs`). A missing path alone does not prove the
+-checkout is gone: a data root shared with a container (``-v ~/.hermes:/opt/data``) or an
+-unmounted volume records paths this process cannot see. So a dir is an orphan only when its
+-checkout sat where this process can see that it was deleted -- under the data root that owns
+-``installs/`` (scratch clones, the runtime checkout) or directly in a ``.worktrees/`` dir that
+-still exists. Removal still fails closed on anything a live process could hold: the install
+-lock, or a dependency / PM runtime generation lease.
+-"""
++"""Reclaim idle per-checkout dependency state using one collector.
+ 
++Startup/``pm gc`` retain conservative discovery: a container sharing a data root may
++not see the host's checkouts. The hourly host worktree GC explicitly selects
++``--all-missing-roots`` to include deleted ~/code/_wt and temporary checkouts.
++Both policies retain recent state, held install locks and generation leases.
++"""
+ from __future__ import annotations
+ 
++import argparse
+ import contextlib
+ import logging
+ import os
+ import shutil
++import sys
++import time
+ from pathlib import Path
+ 
+ logger = logging.getLogger(__name__)
+@@ -33,72 +25,178 @@ def _provably_deleted(root: Path, data_root: Path) -> bool:
+     return root.is_relative_to(data_root) or (root.parent.name == ".worktrees" and root.parent.is_dir())
+ 
+ 
+-def orphan_install_states(installs: Path) -> list[Path]:
+-    """State dirs whose recorded checkout is provably deleted. Dirs without a record are left alone."""
++def _orphan(state: Path, data_root: Path, all_missing_roots: bool) -> bool:
++    try:
++        text = (state / "inputs" / ".project-root").read_text(encoding="utf-8-sig").strip()
++    except (OSError, UnicodeError):
++        text = ""
++    if not text or not Path(text).is_absolute():
++        logger.info("keep %s: no recorded root (or unreadable/invalid record)", state)
++        return False
++    root = Path(text)
++    try:
++        root.stat()
++    except FileNotFoundError:
++        return all_missing_roots or _provably_deleted(root, data_root)
++    except OSError:
++        return False  # Permission/mount errors are not proof of absence.
++    return False
++
++
++def orphan_install_states(installs: Path, *, all_missing_roots: bool = False) -> list[Path]:
++    """Discover missing recorded roots; broader host-local discovery is opt-in."""
+     if not installs.is_dir():
+         return []
+-    data_root = installs.resolve().parent
+-    orphans: list[Path] = []
+-    for state in sorted(installs.iterdir()):
+-        record = state / "inputs" / ".project-root"
+-        if not state.is_dir() or not record.is_file():
+-            continue
+-        try:
+-            root = record.read_text(encoding="utf-8-sig").strip()
+-        except OSError:
++    return [state for state in sorted(installs.iterdir())
++            if state.is_dir() and not state.is_symlink()
++            and _orphan(state, installs.resolve().parent, all_missing_roots)]
++
++
++def _leases_held(state: Path) -> bool:
++    from pm.filesystem import lock_fd
++
++    # leases_held() also prunes unlocked files, touching directories during a
++    # dry run and resetting the idle window. Probe without mutating the tree.
++    for generations in (state / "environments", state / "pm-runtime" / "generations"):
++        if not generations.is_dir():
+             continue
+-        if root and _provably_deleted(Path(root), data_root):
+-            orphans.append(state)
+-    return orphans
++        for generation in generations.iterdir():
++            leases = generation / ".leases"
++            if not leases.is_dir():
++                continue
++            for lease in leases.iterdir():
++                try:
++                    fd = os.open(lease, os.O_RDWR)
++                except OSError:
++                    return True
++                try:
++                    if not lock_fd(fd, wait=False):
++                        return True
++                finally:
++                    os.close(fd)
++    return False
+ 
+ 
+-def _held(state: Path) -> bool:
+-    """True while a process may still be using this state dir: the install lock is taken or a
+-    generation lease is held. Any lock we cannot even open counts as held."""
+-    from hermes_cli.runtime_state import leases_held
++@contextlib.contextmanager
++def _install_lock(state: Path, *, dry_run: bool):
++    """Hold the nonblocking lock until removal finishes, rather than probe then release."""
+     from pm.filesystem import lock_fd
+ 
+-    lock = state / ".install.lock"
+-    if lock.exists():
++    fd = None
++    try:
++        flags = os.O_RDWR | (0 if dry_run else os.O_CREAT)
+         try:
+-            fd = os.open(lock, os.O_RDWR)
++            fd = os.open(state / ".install.lock", flags, 0o600)
++        except FileNotFoundError:
++            yield dry_run  # Dry runs must not create locks or change idle timestamps.
++            return
+         except OSError:
+-            return True
+-        try:
+-            if not lock_fd(fd, wait=False):
+-                return True
+-        finally:
++            yield False
++            return
++        yield lock_fd(fd, wait=False)
++    finally:
++        if fd is not None:
+             os.close(fd)
+-    for generations in (state / "environments", state / "pm-runtime" / "generations"):
+-        if generations.is_dir():
+-            for generation in generations.iterdir():
+-                if generation.is_dir() and (generation / ".leases").is_dir() and leases_held(generation):
+-                    return True
+-    return False
+ 
+ 
+-def collect_orphan_install_states(installs: Path) -> list[Path]:
+-    """Remove every unheld orphan state dir under *installs*; returns what was removed."""
+-    removed: list[Path] = []
+-    for state in orphan_install_states(installs):
+-        if _held(state):
+-            logger.debug("orphan install state %s is still held; skipped", state.name)
++def _idle_size(state: Path, cutoff: float) -> int | None:
++    """Return reclaimable allocated bytes, or None if recently touched/unreadable.
++
++    Do not follow symlinks. Count a hardlinked inode only if all its links are in
++    this tree; bytes shared outside it are not freed by unlinking this tree.
++    """
++    inodes = {}
++
++    def failed(error):
++        raise error
++
++    try:
++        for root, dirs, files in os.walk(state, onerror=failed, followlinks=False):
++            for path in [Path(root), *(Path(root) / name for name in files),
++                         *(Path(root) / name for name in dirs if (Path(root) / name).is_symlink())]:
++                info = path.lstat()
++                if info.st_mtime > cutoff:
++                    return None
++                key = (info.st_dev, info.st_ino)
++                count, _, _ = inodes.get(key, (0, info, path.is_dir()))
++                inodes[key] = (count + 1, info, path.is_dir() and not path.is_symlink())
++    except OSError:
++        return None
++    return sum(getattr(info, "st_blocks", 0) * 512 for count, info, directory in inodes.values()
++               if directory or count >= info.st_nlink)
++
++
++def _remove_state(state: Path) -> bool:
++    # Keep the record and locked inode until all payloads are gone. Partial
++    # removal remains discoverable on the next pass (including Windows holds).
++    for child in state.iterdir():
++        if child.name in ("inputs", ".install.lock"):
+             continue
+-        # The record goes last, and only once everything else is gone: the startup prune runs on
+-        # a daemon thread and a removal can fail part-way (an open file on Windows, a read-only
+-        # dir), and a dir that lost its record first would never be recognised again.
+-        for child in state.iterdir():
+-            if child.name == "inputs":
+-                continue
+-            if child.is_dir() and not child.is_symlink():
+-                shutil.rmtree(child, ignore_errors=True)
+-            else:
+-                with contextlib.suppress(OSError):
+-                    child.unlink()
+-        if any(child.name != "inputs" for child in state.iterdir()):
+-            logger.debug("orphan install state %s only partly removed; retried next pass", state.name)
++        if child.is_dir() and not child.is_symlink():
++            shutil.rmtree(child, ignore_errors=True)
++        else:
++            with contextlib.suppress(OSError):
++                child.unlink()
++    if any(child.name not in ("inputs", ".install.lock") for child in state.iterdir()):
++        logger.warning("keep %s: partly removed; retry next pass", state)
++        return False
++    shutil.rmtree(state, ignore_errors=True)
++    return not state.exists()
++
++
++def collect_orphan_install_states(installs: Path, *, all_missing_roots: bool = False,
++                                  dry_run: bool = False, min_idle_seconds: float = 3600) -> list[Path]:
++    """Remove idle, unheld orphans. Return actual removals (never dry-run plans)."""
++    removed = []
++    freed = 0
++    planned = 0
++    cutoff = time.time() - min_idle_seconds
++    for state in orphan_install_states(installs, all_missing_roots=all_missing_roots):
++        size = _idle_size(state, cutoff)
++        if size is None:
++            logger.info("keep %s: touched within %.0fs or unreadable", state, min_idle_seconds)
+             continue
+-        shutil.rmtree(state, ignore_errors=True)
+-        if not state.exists():
+-            removed.append(state)
++        if _leases_held(state):
++            logger.info("keep %s: generation lease held", state)
++            continue
++        had_lock = (state / ".install.lock").exists()
++        with _install_lock(state, dry_run=dry_run) as acquired:
++            if not acquired or _leases_held(state):
++                logger.info("keep %s: install lock or generation lease held", state)
++                continue
++            # Revalidate after acquiring the lock: an installer could have run
++            # between discovery and acquisition. Creating a missing lock itself
++            # touches the state root, so that legacy case uses the pre-lock scan.
++            if not _orphan(state, installs.resolve().parent, all_missing_roots):
++                continue
++            if had_lock and _idle_size(state, cutoff) is None:
++                continue
++            if dry_run:
++                planned += 1
++                logger.info("would remove %s (%.3f GiB)", state, size / 2**30)
++            elif _remove_state(state):
++                removed.append(state)
++                freed += size
++                logger.info("removed %s (%.3f GiB)", state, size / 2**30)
++    logger.info("install-state gc: removed %d; freed ~%.3f GiB allocated (shared/cloned bytes may differ); "
++                "would remove %d", len(removed), freed / 2**30, planned)
+     return removed
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--installs", type=Path, help="override the owning home's installs directory")
++    parser.add_argument("--all-missing-roots", action="store_true",
++                        help="host-local only: this process sees every recorded checkout's filesystem")
++    parser.add_argument("--dry-run", action="store_true")
++    args = parser.parse_args(argv)
++    from pm.environments import installs_root
++
++    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
++    collect_orphan_install_states(args.installs if args.installs is not None else installs_root(),
++                                  all_missing_roots=args.all_missing_roots, dry_run=args.dry_run)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/pm/test_install_states_gc.py b/tests/pm/test_install_states_gc.py
+index ea9f3a3b3a..a0eccda022 100644
+--- a/tests/pm/test_install_states_gc.py
++++ b/tests/pm/test_install_states_gc.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ import os
+ import subprocess
++import time
+ 
+ import pm.environments
+ import pytest
+@@ -18,9 +19,18 @@ def _state(installs, key, project_root):
+     (state / "inputs").mkdir(parents=True)
+     (state / "inputs" / ".project-root").write_text(str(project_root), encoding="utf-8")
+     (state / "environments" / "gen" / "venv").mkdir(parents=True)
++    _age(state)
+     return state
+ 
+ 
++def _age(state):
++    old = time.time() - 7200
++    for parent, dirs, files in os.walk(state):
++        for name in dirs + files:
++            os.utime(os.path.join(parent, name), (old, old))
++    os.utime(state, (old, old))
++
++
+ def test_startup_prune_reclaims_only_provably_deleted_checkouts(tmp_path, monkeypatch):
+     installs = tmp_path / "home" / "installs"
+     repo = tmp_path / "repo"
+@@ -58,6 +68,8 @@ def test_held_orphan_is_kept(tmp_path):
+                       runtime / "pm-runtime" / "generations" / "gen" / ".leases"):
+         lease_dir.mkdir(parents=True)
+         fds.append(os.open(lease_dir / "reader", os.O_CREAT | os.O_RDWR, 0o600))
++    for state in (locked, leased, runtime):
++        _age(state)
+     assert all(lock_fd(fd, wait=False) for fd in fds)
+     try:
+         assert collect_orphan_install_states(installs) == []
+@@ -76,10 +88,12 @@ def test_partly_removed_orphan_keeps_its_record_until_retried(tmp_path):
+     state = _state(installs, "aaaa", tmp_path / "gone")
+     stuck = state / "environments" / "gen" / "venv"
+     (stuck / "pyvenv.cfg").write_text("", encoding="utf-8")
++    _age(state)
+     stuck.chmod(0o500)  # its entries cannot be unlinked: the removal stops part-way
+     try:
+         assert collect_orphan_install_states(installs) == []
+         assert orphan_install_states(installs) == [state]
+     finally:
+         stuck.chmod(0o700)
++    _age(state)  # Partial removal touched dirs; retry after another idle window.
+     assert collect_orphan_install_states(installs) == [state] and not state.exists()
+diff --git a/tests/pm/test_install_states_hourly_gc.py b/tests/pm/test_install_states_hourly_gc.py
+new file mode 100644
+index 0000000000..1771e7ed4a
+--- /dev/null
++++ b/tests/pm/test_install_states_hourly_gc.py
+@@ -0,0 +1,126 @@
++"""Host-local GC extends the existing collector, retaining age and lock guards."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++import time
++
++import pytest
++from pm.filesystem import lock_fd
++from pm.install_states import collect_orphan_install_states
++
++
++def _age(state):
++    old = time.time() - 7200
++    for root, dirs, files in os.walk(state):
++        for name in dirs + files:
++            os.utime(Path(root) / name, (old, old), follow_symlinks=False)
++    os.utime(state, (old, old))
++
++
++def _state(tmp_path, recorded=True):
++    state = tmp_path / "data" / "installs" / "abc123"
++    (state / "inputs").mkdir(parents=True)
++    root = tmp_path / "code" / "_wt" / "gone"
++    if recorded:
++        (state / "inputs" / ".project-root").write_text(str(root))
++    (state / ".install.lock").touch()
++    (state / "environments" / "gen").mkdir(parents=True)
++    (state / "environments" / "gen" / "payload").write_bytes(b"x" * 8192)
++    _age(state)
++    return state, root
++
++
++@pytest.mark.parametrize("case", ["gone", "live", "locked", "recent", "unknown", "dry-run"])
++def test_hourly_collection_contract(tmp_path, caplog, case):
++    state, root = _state(tmp_path, recorded=case != "unknown")
++    fd = None
++    if case == "live":
++        root.mkdir(parents=True)
++    elif case == "recent":
++        state.touch()
++    elif case == "locked":
++        fd = os.open(state / ".install.lock", os.O_RDWR)
++        assert lock_fd(fd, wait=False)
++    try:
++        with caplog.at_level("INFO"):
++            removed = collect_orphan_install_states(
++                state.parent, all_missing_roots=True, dry_run=case == "dry-run")
++        assert removed == ([state] if case == "gone" else [])
++        assert state.exists() == (case != "gone")
++        if case == "unknown":
++            assert "no recorded root" in caplog.text
++        if case == "dry-run":
++            assert "would remove" in caplog.text
++    finally:
++        if fd is not None:
++            os.close(fd)
++
++
++def test_nested_recent_touch_is_kept(tmp_path):
++    state, _ = _state(tmp_path)
++    (state / "environments" / "gen" / "payload").touch()
++    assert collect_orphan_install_states(state.parent, all_missing_roots=True) == []
++    assert state.is_dir()
++
++
++def test_generation_lease_keeps_idle_orphan(tmp_path):
++    state, _ = _state(tmp_path)
++    leases = state / "environments" / "gen" / ".leases"
++    leases.mkdir()
++    fd = os.open(leases / "reader", os.O_CREAT | os.O_RDWR, 0o600)
++    _age(state)
++    assert lock_fd(fd, wait=False)
++    try:
++        assert collect_orphan_install_states(state.parent, all_missing_roots=True) == []
++    finally:
++        os.close(fd)
++    assert collect_orphan_install_states(state.parent, all_missing_roots=True) == [state]
++
++
++def test_cli_dry_run_then_sweep_then_empty(tmp_path):
++    state, _ = _state(tmp_path)
++    command = [sys.executable, "-m", "pm.install_states", "--installs", str(state.parent),
++               "--all-missing-roots"]
++    dry = subprocess.run([*command, "--dry-run"], capture_output=True, text=True, check=True)
++    assert "would remove" in dry.stdout and "removed 0" in dry.stdout
++    assert state.exists()
++    swept = subprocess.run(command, capture_output=True, text=True, check=True)
++    assert "removed 1" in swept.stdout and "GiB" in swept.stdout
++    assert not state.exists()
++    again = subprocess.run(command, capture_output=True, text=True, check=True)
++    assert "removed 0" in again.stdout
++
++
++def test_install_lock_remains_held_during_deletion(tmp_path, monkeypatch):
++    from pm import install_states
++    state, _ = _state(tmp_path)
++    remove = install_states.shutil.rmtree
++    probed = []
++
++    def observed(path, *args, **kwargs):
++        if Path(path) == state / "environments":
++            fd = os.open(state / ".install.lock", os.O_RDWR)
++            try:
++                probed.append(not lock_fd(fd, wait=False))
++            finally:
++                os.close(fd)
++        return remove(path, *args, **kwargs)
++
++    monkeypatch.setattr(install_states.shutil, "rmtree", observed)
++    assert collect_orphan_install_states(state.parent, all_missing_roots=True) == [state]
++    assert probed == [True]
++
++
++def test_dry_run_preserves_unlocked_lease_and_absent_lock(tmp_path):
++    state, _ = _state(tmp_path)
++    (state / ".install.lock").unlink()
++    leases = state / "environments" / "gen" / ".leases"
++    leases.mkdir()
++    (leases / "abandoned").touch()
++    _age(state)
++    before = {str(p.relative_to(state)): p.lstat().st_mtime_ns for p in state.rglob("*")}
++    assert collect_orphan_install_states(state.parent, all_missing_roots=True, dry_run=True) == []
++    after = {str(p.relative_to(state)): p.lstat().st_mtime_ns for p in state.rglob("*")}
++    assert after == before
++    assert not (state / ".install.lock").exists()
+diff --git a/website/docs/reference/package-management.md b/website/docs/reference/package-management.md
+index 1a2e7d3336..36645cdabb 100644
+--- a/website/docs/reference/package-management.md
++++ b/website/docs/reference/package-management.md
+@@ -537,6 +537,16 @@ hermes pm install chromium
+ | `pm status` | Print the latest sync/update receipt as JSON, or report that no receipt exists. |
+ | `pm gc` | Remove unreferenced tool-store entries, eligible download partials, unused lease-managed Python generations, and the `installs/INSTALL_KEY/` state of deleted checkouts (a worktree removed from a `.worktrees/` dir that still exists, or a clone under the data root; checkouts this process cannot see, such as a host install viewed from a container sharing the data root, are kept, as is any state whose install lock or generation lease is still held). The worktree pruner that runs at startup reclaims those orphaned state dirs too. |
+ 
++`python -m pm.install_states --dry-run` previews just the orphan install-state
++sweep. The same collector requires at least one hour without any entry's mtime
++changing and holds a nonblocking install lock through removal; held dependency
++and PM runtime generation leases keep the state. Missing/unreadable root records
++are retained and reported. On a host that sees every recorded checkout filesystem,
++`--all-missing-roots` explicitly includes deleted temporary and `_wt` checkouts
++outside the data root. Never select that policy from a container sharing host
++state or while checkout volumes are unmounted. Output lists removals and estimated
++allocated GiB reclaimed; shared/cloned storage can differ from apparent size.
++
+ `pm env` excludes inherited process variables, including credentials. Its
+ output can still reveal local installation paths; review it before sharing.
+ 
+-- 
+2.55.0
+

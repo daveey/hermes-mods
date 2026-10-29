@@ -1,0 +1,791 @@
+From dc19ad6ccc9a16da6125fa796673b5140e94d37e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:58:12 -0700
+Subject: [PATCH] feat(kanban): kanban_move / hermes kanban move: a running
+ card relocates itself via runs_on [daveey]
+
+One move = checkpoint + end this run as continued + new runs_on + a moved event, in one write txn
+(continue_task gains an in_txn hook). The Board ends the old lease when the card leaves running and its
+grant checks runs_on for every claimer, the creator included, so only a matching machine runs it next.
+Guards: target labels must match an active, unheld registry machine other than this one; kanban.move.max_moves
+(default 3); moving back to a machine the card left needs force; dir/worktree cards never move; synced boards
+only. Entry paths: agent tool kanban_move (worker run, terminal tool), CLI hermes kanban move (own run with
+--checkpoint, queued card, or --reclaim for a card running here). Fake Board: opt-in runs_on grant check and
+lease end on leaving running, as worker/src rows.ts + checkPlacement.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/kanban_stop.py                        |   1 +
+ agent/transports/hermes_tools_mcp_server.py |   2 +-
+ hermes_cli/kanban.py                        |  35 ++-
+ hermes_cli/kanban_continuation.py           |   9 +-
+ hermes_cli/kanban_move.py                   | 209 +++++++++++++++++
+ hermes_cli/kanban_parser.py                 |  14 ++
+ tests/hermes_cli/kanban_sync_fake_board.py  |  16 +-
+ tests/hermes_cli/test_kanban_move.py        | 240 ++++++++++++++++++++
+ tools/kanban_tools.py                       |  26 ++-
+ tools/kanban_tools_schemas.py               |  29 +++
+ 10 files changed, 573 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_move.py
+ create mode 100644 tests/hermes_cli/test_kanban_move.py
+
+diff --git a/agent/kanban_stop.py b/agent/kanban_stop.py
+index 7691222844..70846ba668 100644
+--- a/agent/kanban_stop.py
++++ b/agent/kanban_stop.py
+@@ -24,6 +24,7 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
+     "kanban_block",
+     "kanban_schedule",
+     "kanban_continue",
++    "kanban_move",
+     "kanban_request_review",
+     "kanban_request_changes",
+ })
+diff --git a/agent/transports/hermes_tools_mcp_server.py b/agent/transports/hermes_tools_mcp_server.py
+index d2459ed675..ab847cad62 100644
+--- a/agent/transports/hermes_tools_mcp_server.py
++++ b/agent/transports/hermes_tools_mcp_server.py
+@@ -60,7 +60,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
+     "vision_analyze", "image_generate", "skill_view", "skills_list", "text_to_speech",
+     # Kanban handoff tools: stateless (read HERMES_KANBAN_TASK, write kanban.db).
+     # Without them a codex-runtime worker can't report completion and hangs.
+-    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_continue", "kanban_request_review",
++    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_continue", "kanban_move", "kanban_request_review",
+     "kanban_request_changes", "kanban_comment",
+     "kanban_heartbeat", "kanban_show", "kanban_list",
+     # Orchestrator-only (the kanban tool gates them on HERMES_KANBAN_TASK unset).
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index c442c3fb80..9ff92ccd80 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -247,7 +247,7 @@ def _profile_author() -> str:
+ 
+ 
+ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+-    "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
++    "init", "create", "swarm", "assign", "reclaim", "move", "reassign", "link", "unlink",
+     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+@@ -786,6 +786,37 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
+                       f"Reclaimed {args.task_id}")
+ 
+ 
++def _cmd_move(args: argparse.Namespace) -> int:
++    """[daveey] ``hermes kanban move``: the card's own worker (HERMES_KANBAN_TASK + run id) moves its running card;
++    otherwise a queued card is relabelled, or with --reclaim a card running here is stopped first."""
++    from hermes_cli import kanban_move as km
++    labels = [x.strip() for x in str(args.runs_on).split(",") if x.strip()]
++    own_run = os.environ.get("HERMES_KANBAN_TASK") == args.task_id and os.environ.get("HERMES_KANBAN_RUN_ID")
++    with kbc.connect_closing() as conn:
++        status = (conn.execute("SELECT status FROM tasks WHERE id = ?", (args.task_id,)).fetchone() or {"status": None})
++        if own_run and not (args.checkpoint or "").strip():
++            res = {"ok": False, "reason_code": "checkpoint_required",
++                   "error": "--checkpoint is required when a worker moves its own running card"}
++        elif own_run:
++            res = km.move_task(conn, args.task_id, runs_on=labels, reason=args.reason, checkpoint=args.checkpoint,
++                               expected_run_id=int(os.environ["HERMES_KANBAN_RUN_ID"]), force=args.force)
++        elif status["status"] == "running":
++            if not args.reclaim:
++                res = {"ok": False, "reason_code": "running",
++                       "error": f"{args.task_id} is running: its worker moves it (kanban_move), or pass --reclaim"}
++            else:
++                res = km.move_reclaim(conn, args.task_id, runs_on=labels, reason=args.reason, force=args.force)
++        else:
++            res = km.move_queued(conn, args.task_id, runs_on=labels, reason=args.reason, force=args.force)
++    if getattr(args, "json", False):
++        print(json.dumps(res))
++    elif res.get("ok"):
++        print(f"Moved {args.task_id} to {res['runs_on']} (eligible: {', '.join(res['matches'])}; "
++              f"move {res['move_no']}; now {res['status']})")
++    else:
++        print(f"kanban move: {res.get('error')} [{res.get('reason_code')}]", file=sys.stderr)
++    return 0 if res.get("ok") else 1
++
+ def _cmd_reassign(args: argparse.Namespace) -> int:
+     profile = _none_profile(args.profile)
+     reclaim = bool(getattr(args, "reclaim", False))
+@@ -1742,7 +1773,7 @@ _HANDLERS = {
+     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "wait-check": _cmd_wait_check,
+     "capabilities": _cmd_capabilities,
+     "assign": _cmd_assign, "set-model": _cmd_set_model,
+-    "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
++    "reclaim": _cmd_reclaim, "move": _cmd_move, "reassign": _cmd_reassign,
+     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+     "comment": _cmd_comment, "attach": _cmd_attach,
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 2ad90bedf3..1406e19167 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -20,7 +20,7 @@ from __future__ import annotations
+ 
+ import sqlite3
+ import time
+-from typing import Any, Optional
++from typing import Callable, Any, Optional
+ 
+ CONTINUED_OUTCOME = "continued"
+ CONTINUATION_WOKEN_EVENT = "continuation_woken"
+@@ -86,7 +86,7 @@ def continue_task(
+     resume_after_seconds: int = 0, expected_run_id: Optional[int] = None,
+     max_continuations: Optional[int] = None, metadata: Optional[dict] = None,
+     wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
+-    awaiting: Any = None,
++    awaiting: Any = None, in_txn: Optional[Callable[[sqlite3.Connection, int], None]] = None,
+ ) -> dict[str, Any]:
+     """End the running run as ``continued`` and re-queue the card.
+ 
+@@ -94,6 +94,9 @@ def continue_task(
+     reviewer run) at once; > 0 -> ``scheduled`` until ``wake_due_continuations`` promotes it.
+     Returns ``{"ok": True, "status", "run_id", "continuation", "wake_at"}`` or
+     ``{"ok": False, "error"}``. Never touches ``consecutive_failures`` / ``block_recurrences``.
++    ``in_txn(conn, run_id)`` runs inside the same write transaction once the run has ended
++    (:mod:`hermes_cli.kanban_move` rewrites ``runs_on`` there), so the re-queued card is never
++    visible with its old placement. [daveey]
+     """
+     from hermes_cli import kanban_db as kb
+ 
+@@ -201,6 +204,8 @@ def continue_task(
+             payload["awaiting"] = record
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now)
++        if in_txn is not None:
++            in_txn(conn, run_id)
+     return {"ok": True, "status": new_status, "run_id": run_id,
+             "continuation": streak + 1, "wake_at": wake_at}
+ 
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+new file mode 100644
+index 0000000000..e466e9b374
+--- /dev/null
++++ b/hermes_cli/kanban_move.py
+@@ -0,0 +1,209 @@
++"""A running card moves itself to another machine: ``kanban_move`` / ``hermes kanban move``. [daveey]
++
++A move is a ``kanban_continue`` whose re-queue also rewrites the card's ``runs_on``. In one write transaction it
++saves the checkpoint, ends this run as ``continued``, writes the new labels and appends a ``moved`` event. The
++card goes back to ``ready``; when the holder pushes it out of ``running`` the Board ends its lease (worker
++``rows.ts``), and the Board's grant checks ``runs_on`` labels for every claimer, the creator included
++(``checkPlacement``), so only a matching machine runs it next. Nothing runs twice: the run ends before the lease
++does, and the lease CAS admits one claimer.
++
++Guards:
++
++* the target labels must be satisfiable now by a registry machine other than this one that is active and not
++  on hold (``machine:<x>`` for an unregistered x never is);
++* ``kanban.move.max_moves`` (default 3) moves per card;
++* moving back to a machine the card already left is ping-pong: refused unless ``force``, and it still counts;
++* ``dir`` / ``worktree`` workspaces exist only on their creator, so those cards never move;
++* the board must sync to the Board service (``runs_on`` is a Board placement field).
++
++Every move is a ``moved`` event ``{from_machine, runs_on, previous_runs_on, reason, move_no, forced}``: the audit log.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Mapping, Optional
++
++DEFAULT_MAX_MOVES = 3
++MOVED_EVENT = "moved"
++
++
++class MoveRefused(ValueError):
++    def __init__(self, code: str, message: str):
++        super().__init__(message)
++        self.code = code
++
++
++def max_moves(cfg: Optional[dict] = None) -> int:
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++            cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("move") or {}
++        except Exception:
++            cfg = {}
++    try:
++        return max(1, int((cfg or {}).get("max_moves", DEFAULT_MAX_MOVES)))
++    except (TypeError, ValueError):
++        return DEFAULT_MAX_MOVES
++
++
++def history(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
++    rows = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
++                        (task_id, MOVED_EVENT)).fetchall()
++    out = []
++    for (payload,) in rows:
++        try:
++            out.append(json.loads(payload) if payload else {})
++        except ValueError:
++            out.append({})
++    return out
++
++
++def matching_machines(runs_on: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: str) -> list[str]:
++    """Registry machines other than ``me`` that are active, not held and carry every label."""
++    from hermes_cli import kanban_worker_node as wn
++    out = []
++    for name, entry in machines.items():
++        if name == me or not entry or entry.get("state", "active") != "active" or entry.get("hold"):
++            continue
++        if set(runs_on) <= wn.effective_labels(entry, name):
++            out.append(name)
++    return sorted(out)
++
++
++def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool = False,
++          machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
++          cfg: Optional[dict] = None) -> dict[str, Any]:
++    """Validate a move; returns ``{runs_on, previous, matches, move_no, forced, me}`` or raises :class:`MoveRefused`."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    try:
++        labels = wn.normalize_runs_on(runs_on)
++    except ValueError as exc:
++        raise MoveRefused("invalid_runs_on", str(exc)) from exc
++    if not labels:
++        raise MoveRefused("invalid_runs_on", "runs_on must name at least one label, e.g. ['machine:worker-1']")
++    row = conn.execute("SELECT status, workspace_kind, runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        raise MoveRefused("not_found", f"task {task_id} not found")
++    if row["workspace_kind"] in ("dir", "worktree"):
++        raise MoveRefused("workspace_bound", f"a {row['workspace_kind']} card runs only where its workspace is")
++    if sync.board_mode(conn) != "primary":
++        raise MoveRefused("not_synced", "runs_on needs a board that syncs to the Board service (kanban.sync)")
++    me = me or str(sync._state(conn)["gateway_id"])
++    if machines is None:
++        reg = wn.registry()
++        if reg is None:
++            raise MoveRefused("registry_unavailable", "the Board machine registry is unreachable; try again")
++        machines = reg.get("machines") or {}
++    matches = matching_machines(labels, machines, me=me)
++    if not matches:
++        raise MoveRefused("no_machine", f"no active, unheld machine other than {me} has every label in {labels}")
++    past = history(conn, task_id)
++    limit = max_moves(cfg)
++    if len(past) >= limit:
++        raise MoveRefused("move_limit", f"card already moved {len(past)} time(s) (kanban.move.max_moves {limit}); "
++                                        "finish it here or block it")
++    left = {p.get("from_machine") for p in past}
++    back = [m for m in matches if m in left]
++    if back and len(back) == len(matches) and not force:
++        raise MoveRefused("ping_pong", f"the card already left {', '.join(back)}; pass force to move it back")
++    return {"runs_on": labels, "previous": wn._parse(row["runs_on"]), "matches": matches, "move_no": len(past) + 1,
++            "forced": bool(back and force), "me": me}
++
++
++def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, checkpoint: str,
++              expected_run_id: Optional[int] = None, force: bool = False,
++              machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
++              cfg: Optional[dict] = None) -> dict[str, Any]:
++    """Move a RUNNING card: ``{"ok": True, "runs_on", "matches", "move_no", "run_id", "status"}`` or
++    ``{"ok": False, "error", "reason_code"}``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_worker_node as wn
++    from hermes_cli.kanban_continuation import continue_task
++    reason = (reason or "").strip()
++    if not reason:
++        return {"ok": False, "reason_code": "reason_required", "error": "reason is required (why this card must move)"}
++    try:
++        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg)
++    except MoveRefused as exc:
++        return {"ok": False, "reason_code": exc.code, "error": str(exc)}
++
++    def _in_txn(c: sqlite3.Connection, run_id: int) -> None:
++        wn.set_runs_on(c, task_id, plan["runs_on"])
++        kb._append_event(c, task_id, MOVED_EVENT, {
++            "from_machine": plan["me"], "runs_on": plan["runs_on"], "previous_runs_on": plan["previous"],
++            "reason": reason[:500], "move_no": plan["move_no"], "forced": plan["forced"],
++            "matches": plan["matches"]}, run_id=run_id)
++
++    note = f"Moving to {plan['runs_on']} ({', '.join(plan['matches'])}): {reason}"
++    res = continue_task(conn, task_id, checkpoint=f"{checkpoint.strip()}\n\n[{note}]",
++                        expected_run_id=expected_run_id, in_txn=_in_txn)
++    if not res.get("ok"):
++        return {"ok": False, "reason_code": res.get("reason_code") or "not_running", "error": res.get("error")}
++    return {"ok": True, "runs_on": plan["runs_on"], "matches": plan["matches"], "move_no": plan["move_no"],
++            "run_id": res.get("run_id"), "status": res.get("status")}
++
++
++def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, force: bool = False,
++                machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
++                cfg: Optional[dict] = None) -> dict[str, Any]:
++    """Move a card that is NOT running (ready/todo/scheduled/blocked/triage): same guards, no run to end."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_worker_node as wn
++    reason = (reason or "").strip()
++    if not reason:
++        return {"ok": False, "reason_code": "reason_required", "error": "reason is required (why this card must move)"}
++    try:
++        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg)
++    except MoveRefused as exc:
++        return {"ok": False, "reason_code": exc.code, "error": str(exc)}
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row["status"] in ("running", "done", "archived"):
++            return {"ok": False, "reason_code": "bad_status",
++                    "error": f"task {task_id} is {row['status']}" + (" (use --reclaim, or kanban_move from its run)"
++                                                                   if row["status"] == "running" else "")}
++        wn.set_runs_on(conn, task_id, plan["runs_on"])
++        kb._append_event(conn, task_id, MOVED_EVENT, {
++            "from_machine": plan["me"], "runs_on": plan["runs_on"], "previous_runs_on": plan["previous"],
++            "reason": reason[:500], "move_no": plan["move_no"], "forced": plan["forced"],
++            "matches": plan["matches"], "queued": True})
++    return {"ok": True, "runs_on": plan["runs_on"], "matches": plan["matches"], "move_no": plan["move_no"],
++            "status": row["status"]}
++
++
++def move_reclaim(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: str, force: bool = False,
++                 machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
++                 cfg: Optional[dict] = None) -> dict[str, Any]:
++    """Operator move of a card running on THIS gateway (``hermes kanban move --reclaim``): write the new labels
++    first (``runs_on`` is not lease-fenced), then reclaim the run (stops its worker) and release the Board lease.
++    Labels first means a re-claim between the two steps already sees the new placement."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    reason = (reason or "").strip()
++    if not reason:
++        return {"ok": False, "reason_code": "reason_required", "error": "reason is required (why this card must move)"}
++    try:
++        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg)
++    except MoveRefused as exc:
++        return {"ok": False, "reason_code": exc.code, "error": str(exc)}
++    row = conn.execute("SELECT t.status, t.claim_lock, r.uid AS run_uid FROM tasks t LEFT JOIN task_runs r "
++                       "ON r.id = t.current_run_id WHERE t.id = ?", (task_id,)).fetchone()
++    if row["status"] != "running" or row["claim_lock"] is None:
++        return {"ok": False, "reason_code": "not_running_here",
++                "error": f"task {task_id} is not running under a claim on this gateway"}
++    with kb.write_txn(conn):
++        wn.set_runs_on(conn, task_id, plan["runs_on"])
++        kb._append_event(conn, task_id, MOVED_EVENT, {
++            "from_machine": plan["me"], "runs_on": plan["runs_on"], "previous_runs_on": plan["previous"],
++            "reason": reason[:500], "move_no": plan["move_no"], "forced": plan["forced"],
++            "matches": plan["matches"], "reclaimed": True})
++    if not kb.reclaim_task(conn, task_id, reason=f"moved to {plan['runs_on']}: {reason}"[:400]):
++        return {"ok": False, "reason_code": "reclaim_failed",
++                "error": f"labels set to {plan['runs_on']} but the run could not be reclaimed; it ends on its own"}
++    sync.release_lease(conn, task_id, row["run_uid"])
++    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
++    return {"ok": True, "runs_on": plan["runs_on"], "matches": plan["matches"], "move_no": plan["move_no"],
++            "status": status}
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 5f6c5bba96..9380163881 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -348,6 +348,20 @@ _SPECS = [
+                   "--provider <name>). Cleared together with the model."),
+     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
++    _cmd("move", [
++        _TASK_ID,
++        _arg("--runs-on", dest="runs_on", required=True,
++             help="Comma-separated labels the next machine must have, e.g. machine:worker-1 or macos"),
++        _arg("--reason", required=True, help="Why the card must move (logged as a `moved` event)"),
++        _arg("--checkpoint", default=None,
++             help="Resume notes (required when a card's own worker moves its running card)"),
++        _arg("--force", action="store_true", help="Allow moving back to a machine the card already left"),
++        _arg("--reclaim", action="store_true",
++             help="The card is running here under another run: stop that run, then move it"),
++        _json_flag(),
++    ], help="Move a card to machines with other labels (runs_on): a worker moves its own running card, an operator "
++            "moves a queued one or (--reclaim) one running here. Guards: kanban.move.max_moves, no unknown or held "
++            "target, no ping-pong without --force"),
+     _cmd("reassign", [
+         _TASK_ID,
+         _arg("profile", help="New profile name (or 'none' to unassign)"),
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 06d0e277cb..71977b6893 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -18,13 +18,16 @@ FENCED = {"status", "current_run_uid", "result", "started_at", "completed_at"}
+ 
+ 
+ class FakeService:
+-    def __init__(self, *, lease_runs: bool = False) -> None:
++    def __init__(self, *, lease_runs: bool = False, machines: Optional[dict] = None) -> None:
+         self.boards: dict[str, dict[str, Any]] = {}
+         self.calls: list[tuple[str, str, Any]] = []
+         self.offline = False
+         # Like transitions.ts grantLease/releaseTask: a grant writes the card running plus its run row, a release
+         # ends that run and returns the card to ready. Off by default (the older tests count rows).
+         self.lease_runs = lease_runs
++        # Opt-in placement, like transitions.ts checkPlacement's runs_on rule: a grant needs every runs_on label
++        # on the claiming machine ({name: {"labels": [...]}}; machine:<name> is implicit). None = no check.
++        self.machines = machines
+ 
+     def board(self, bid: str) -> dict[str, Any]:
+         return self.boards.setdefault(bid, {"seq": 0, "floor": 0, "changes": [], "rows": {}, "applied": {}, "leases": {}})
+@@ -80,6 +83,11 @@ class FakeService:
+             for k in won:
+                 clocks[k] = op["hlc"]
+             row = self._put(b, table, uid, won, gw, op["client_op_id"], op["hlc"])
++            # As rows.ts: the holder moving its card out of `running` ends the lease (opt-in with lease_runs).
++            if self.lease_runs and lease and lease["holder"] == gw and "status" in won and won["status"] != "running":
++                b["leases"].pop(uid, None)  # clearLease: the lease row and the task's lease mirror
++                row = self._put(b, table, uid, {"lease_holder": None, "lease_expires": None}, gw, op["client_op_id"],
++                                op["hlc"])
+             return {"status": "applied" if len(won) == len(f) else "merged", "row": row}
+         return {"status": "applied", "row": self._put(b, table, uid, f, gw, op["client_op_id"], op["hlc"])}
+ 
+@@ -144,6 +152,12 @@ class FakeHub:
+         if body["action"] == "grant":
+             if cur and cur["holder"] != self.gateway:
+                 return {"status": "rejected", "reason": "lease_held", "lease": cur}
++            card = b["rows"].get("tasks", {}).get(task) or {}
++            if self.svc.machines is not None and card.get("runs_on"):
++                want = json.loads(card["runs_on"]) if isinstance(card["runs_on"], str) else card["runs_on"]
++                mine = set((self.svc.machines.get(self.gateway) or {}).get("labels") or []) | {f"machine:{self.gateway}"}
++                if set(want or []) - mine:
++                    return {"status": "rejected", "reason": "labels_mismatch", "lease": cur}
+             b["leases"][task] = {"task_id": task, "holder": self.gateway, "run_uid": run, "expires": 9_999_999_999_999}
+             if self.svc.lease_runs and task in b["rows"].get("tasks", {}):
+                 self.svc._put(b, "task_runs", run, {"task_id": task, "status": "running", "started_at": 1,
+diff --git a/tests/hermes_cli/test_kanban_move.py b/tests/hermes_cli/test_kanban_move.py
+new file mode 100644
+index 0000000000..bbec12fdfc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move.py
+@@ -0,0 +1,240 @@
++"""kanban_move: a running card moves itself to machines with other runs_on labels (hermes_cli.kanban_move). [daveey]
++
++One move = checkpoint + end this run as ``continued`` + new ``runs_on`` + a ``moved`` event, in one transaction; the
++Board ends the old lease when the card leaves ``running`` and admits only a machine with the new labels. Entry paths:
++the core API, the agent tool (``kanban_move``) and the CLI (``hermes kanban move``), each tested here, plus a
++two-gateway run on the fake Board (placement and lease-end on) proving the card completes once, on the target.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway, _runs
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _running_hub_card(hub, **kw):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title=kw.pop("title", "work"), assignee="default",
++                         runs_on=kw.pop("runs_on", ["machine:hub"]), **kw)
++    hub.round()
++    hub.tick()
++    assert kb.get_task(hub.conn, tid).status == "running"
++    hub.round()
++    return tid, hub.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++
++
++def _events(conn, tid, kind=km.MOVED_EVENT):
++    return [json.loads(p or "{}") for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id", (tid, kind))]
++
++
++# --- end to end: hub -> worker-1, one completion -----------------------------------------------------------------
++
++def test_a_hub_card_moves_itself_to_the_worker_and_completes_there_once(gws, svc):
++    hub, worker = gws
++    tid, run_id = _running_hub_card(hub)
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="needs the worker's GPU",
++                       checkpoint="step 1 done (commit abc); next: run the bench", expected_run_id=run_id)
++    assert res["ok"] and res["matches"] == [WORKER] and res["move_no"] == 1 and res["status"] == "ready", res
++    t = hub.conn.execute("SELECT status, runs_on, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (t["status"], json.loads(t["runs_on"]), t["claim_lock"]) == ("ready", ["machine:worker-1"], None)
++    [ev] = _events(hub.conn, tid)
++    assert ev["from_machine"] == HUB and ev["previous_runs_on"] == ["machine:hub"] and ev["reason"]
++    hub.round()
++    assert tid not in svc.board(BOARD)["leases"]  # the Board ended the hub's lease when the card left running
++    # The hub's own dispatcher cannot take it back: the Board's grant checks runs_on for the creator too.
++    hub.tick()
++    assert kb.get_task(hub.conn, tid).status != "running" or \
++        hub.conn.execute("SELECT lease_holder FROM tasks WHERE id = ?", (tid,)).fetchone()[0] != HUB
++    hub.round()
++    assert tid not in svc.board(BOARD)["leases"] or svc.board(BOARD)["leases"][tid]["holder"] != HUB
++    # worker-1 claims it, runs it with the checkpoint, completes it.
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++    worker.enter()
++    wrun = worker.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert kb.complete_task(worker.conn, tid, result="bench done on worker-1", expected_run_id=wrun)
++    worker.round()
++    hub.round()
++    t = kb.get_task(hub.conn, tid)
++    assert t.status == "done" and t.result == "bench done on worker-1"
++    outcomes = sorted(r["outcome"] for r in svc.board(BOARD)["rows"]["task_runs"].values())
++    assert outcomes.count("completed") == 1 and "continued" in outcomes, outcomes  # one completion, no double run
++
++
++# --- guards ---------------------------------------------------------------------------------------------------------
++
++def test_move_refuses_unknown_held_and_self_only_targets(gws):
++    hub, _ = gws
++    tid, run_id = _running_hub_card(hub)
++    for runs_on in (["machine:nowhere"], ["machine:hub"], ["gpu"]):
++        res = km.move_task(hub.conn, tid, runs_on=runs_on, reason="r", checkpoint="c", expected_run_id=run_id)
++        assert not res["ok"] and res["reason_code"] == "no_machine", (runs_on, res)
++    held = {**MACHINES, WORKER: {**MACHINES[WORKER], "hold": True}}
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="r", checkpoint="c",
++                       expected_run_id=run_id, machines=held)
++    assert res["reason_code"] == "no_machine"
++    assert kb.get_task(hub.conn, tid).status == "running"  # a refused move leaves the run alone
++
++
++def test_move_needs_a_reason_and_a_running_card(gws):
++    hub, _ = gws
++    tid, run_id = _running_hub_card(hub)
++    assert km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason=" ", checkpoint="c",
++                        expected_run_id=run_id)["reason_code"] == "reason_required"
++    assert km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="r", checkpoint="c",
++                        expected_run_id=run_id + 99)["ok"] is False  # not this run's card
++
++
++def test_workspace_bound_cards_never_move(gws):
++    hub, _ = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="wt", assignee="default", workspace_kind="dir", workspace_path="/tmp/x")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="r")
++    assert res["reason_code"] == "workspace_bound"
++
++
++def test_max_moves_and_ping_pong(gws):
++    hub, _ = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="q", assignee="default")
++    machines = {**MACHINES, "w2": {"name": "w2", "state": "active", "labels": ["linux"], "hold": False}}
++    # hub -> worker-1 -> w2: each move leaves a machine.
++    assert km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="1", machines=machines, me=HUB)["ok"]
++    assert km.move_queued(hub.conn, tid, runs_on=["machine:w2"], reason="2", machines=machines, me=WORKER)["ok"]
++    # w2 -> hub: the card already left the hub -> ping-pong, unless forced (and a forced move still counts).
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="3", machines=machines, me="w2")
++    assert res["reason_code"] == "ping_pong"
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="3", machines=machines, me="w2", force=True)
++    assert res["ok"] and res["move_no"] == 3 and _events(hub.conn, tid)[-1]["forced"] is True
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="4", machines=machines, me=HUB,
++                         force=True)
++    assert res["reason_code"] == "move_limit"  # default kanban.move.max_moves = 3
++    assert [e["reason"] for e in _events(hub.conn, tid)] == ["1", "2", "3"]  # the audit log
++    assert km.max_moves({"max_moves": 5}) == 5 and km.max_moves({"max_moves": "x"}) == km.DEFAULT_MAX_MOVES
++
++
++def test_labels_matching_a_machine_it_never_left_are_not_ping_pong(gws):
++    hub, _ = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="q", assignee="default")
++    machines = {**MACHINES, "w2": {"name": "w2", "state": "active", "labels": ["linux"], "hold": False}}
++    assert km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="1", machines=machines, me=HUB)["ok"]
++    # From worker-1, ["linux"] matches the hub (left) and w2 (never visited): allowed.
++    assert km.move_queued(hub.conn, tid, runs_on=["linux"], reason="2", machines=machines, me=WORKER)["ok"]
++
++
++# --- entry path: agent tool -------------------------------------------------------------------------------------------
++
++def test_tool_kanban_move_moves_the_workers_own_card(gws, monkeypatch):
++    hub, _ = gws
++    tid, run_id = _running_hub_card(hub)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "reason": "needs linux box",
++                                      "checkpoint": "done: A; next: B"}))
++    assert out.get("ok", True) and out["runs_on"] == ["machine:worker-1"] and out["matches"] == [WORKER], out
++    assert "End your turn" in out["next"]
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
++        "machine:worker-1"]
++    assert _events(hub.conn, tid)[0]["reason"] == "needs linux box"
++    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "reason": "again", "checkpoint": "x"}))
++    assert out.get("ok") is False or "error" in out  # the run is over: no second move from it
++
++
++def test_tool_kanban_move_requires_its_arguments(gws, monkeypatch):
++    hub, _ = gws
++    tid, run_id = _running_hub_card(hub)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    from tools import kanban_tools as kt
++    for args in ({"reason": "r", "checkpoint": "c"}, {"runs_on": ["machine:worker-1"], "checkpoint": "c"},
++                 {"runs_on": ["machine:worker-1"], "reason": "r"}, {"runs_on": [], "reason": "r", "checkpoint": "c"}):
++        out = json.loads(kt._handle_move(args))
++        assert "error" in out, (args, out)
++    assert kb.get_task(hub.conn, tid).status == "running"
++
++
++def test_kanban_move_is_a_registered_terminal_tool():
++    from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS
++    from tools import kanban_tools as kt
++    from tools.registry import registry
++    assert "kanban_move" in _TERMINAL_KANBAN_TOOLS and "kanban_move" in kt._RUN_LIFECYCLE_TOOLS
++    assert registry.get_entry("kanban_move") is not None if hasattr(registry, "get_entry") else True
++
++
++# --- entry path: CLI ----------------------------------------------------------------------------------------------------
++
++def _cli(line):
++    from hermes_cli import kanban as kcli
++    return kcli.run_slash(line)
++
++
++def test_cli_move_relabels_a_queued_card(gws):
++    hub, _ = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="queued", assignee="default")
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "needs the worker" --json'))
++    assert out["ok"] and out["runs_on"] == ["machine:worker-1"], out
++    assert _events(hub.conn, tid)[0]["queued"] is True
++    out = json.loads(_cli(f'move {tid} --runs-on machine:nowhere --reason x --json'))
++    assert out["reason_code"] == "no_machine"
++
++
++def test_cli_move_of_a_running_card_needs_reclaim(gws, monkeypatch):
++    hub, _ = gws
++    tid, _ = _running_hub_card(hub)
++    # The fixture's spawner records this test process as the worker pid; reclaim must not SIGTERM it.
++    stopped = []
++    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, **kw: stopped.append(pid) or {
++        "prev_pid": pid, "host_local": True, "termination_attempted": True, "terminated": True, "sigkill": False})
++    out = json.loads(_cli(f"move {tid} --runs-on machine:worker-1 --reason x --json"))
++    assert out["reason_code"] == "running" and kb.get_task(hub.conn, tid).status == "running"
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "stuck here" --reclaim --json'))
++    assert out["ok"], out
++    t = hub.conn.execute("SELECT status, runs_on, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert t["status"] != "running" and t["claim_lock"] is None and json.loads(t["runs_on"]) == ["machine:worker-1"]
++    assert _events(hub.conn, tid)[0]["reclaimed"] is True and stopped  # the old run's worker was stopped
++
++
++def test_cli_move_by_the_cards_own_worker_ends_its_run(gws, monkeypatch):
++    hub, _ = gws
++    tid, run_id = _running_hub_card(hub)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "needs linux" --json'))
++    assert out["reason_code"] == "checkpoint_required"  # refused before touching the card
++    assert kb.get_task(hub.conn, tid).status == "running"
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "needs linux" '
++                          f'--checkpoint "did A; next B" --json'))
++    assert out["ok"] and out["status"] == "ready", out
++    run = hub.conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++    assert run["outcome"] == "continued"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8598b47597..2ddb68241c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -24,7 +24,7 @@ from tools.kanban_tools_placement import _placement_refused
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+-    KANBAN_COMPLETE_SCHEMA, KANBAN_CONTINUE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
++    KANBAN_COMPLETE_SCHEMA, KANBAN_CONTINUE_SCHEMA, KANBAN_MOVE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+     KANBAN_LIST_SCHEMA, KANBAN_ORIGIN_ADOPT_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_ARCHIVE_SCHEMA,
+     KANBAN_UNLINK_SCHEMA)
+@@ -117,7 +117,7 @@ def _check_kanban_orchestrator_mode() -> bool:
+ # would silently skip the run-ownership CAS in kanban_db. Non-lifecycle tools
+ # (heartbeat / attach / attach_url) do not terminate a run and are not gated.
+ _RUN_LIFECYCLE_TOOLS = frozenset({
+-    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_continue",
++    "kanban_complete", "kanban_block", "kanban_schedule", "kanban_continue", "kanban_move",
+     "kanban_request_review", "kanban_request_changes",
+ })
+ 
+@@ -1317,6 +1317,27 @@ def _handle_continue(args: dict, **kw) -> str:
+                           wake_at=res.get("wake_at"), next=note)
+ 
+ 
++@_kanban_handler("kanban_move")
++def _handle_move(args: dict, **kw) -> str:
++    """[daveey] Checkpoint, end this run and re-queue the card with new runs_on labels (hermes_cli.kanban_move)."""
++    tid = _worker_guard("kanban_move", args)
++    checkpoint = _redact(_require_text(
++        args, "checkpoint", "checkpoint is required — write what is done, what is not portable and the next "
++        "steps so the run on the other machine can resume"))
++    reason = _require_text(args, "reason", "reason is required — say what this machine lacks")
++    runs_on = args.get("runs_on")
++    _check(isinstance(runs_on, list) and runs_on, "runs_on must be a non-empty list of labels, e.g. ['machine:worker-1']")
++    from hermes_cli.kanban_move import move_task
++    with _board(args.get("board")) as (kb, conn):
++        res = move_task(conn, tid, runs_on=runs_on, reason=reason, checkpoint=checkpoint,
++                        expected_run_id=_worker_run_id(tid), force=bool(args.get("force")))
++        _check(res.get("ok"), f"could not move {tid}: {res.get('error')}")
++        note = (f"Moved: the card is re-queued for {res['runs_on']} (eligible now: {', '.join(res['matches'])}); "
++                "this run is over. End your turn with a one-line reply; do not call more tools.")
++        return _ok_landed(kb, conn, tid, res["status"], runs_on=res["runs_on"], matches=res["matches"],
++                          move_no=res["move_no"], next=note)
++
++
+ @_kanban_handler("kanban_request_review")
+ def _handle_request_review(args: dict, **kw) -> str:
+     """Move implementation into the first-class review phase."""
+@@ -2104,6 +2125,7 @@ _TOOLS = (
+     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
+     ("kanban_schedule", KANBAN_SCHEDULE_SCHEMA, _handle_schedule, "⏰"),
+     ("kanban_continue", KANBAN_CONTINUE_SCHEMA, _handle_continue, "⏭"),
++    ("kanban_move", KANBAN_MOVE_SCHEMA, _handle_move, "🚚"),
+     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
+     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
+     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index c612b84e66..7183642eab 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -384,6 +384,35 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+ )
+ 
+ 
++KANBAN_MOVE_SCHEMA = _schema(
++    "kanban_move",
++    (
++        "Move your current task to another machine and end this run there: use when the work needs something "
++        "this machine lacks (a Mac for Xcode/iOS/simulators, a GPU, a specific host's files or logs) or "
++        "belongs on a less loaded machine. It saves your checkpoint, ends this run as 'continued', sets the "
++        "card's runs_on to the labels you give and re-queues it, so ONLY a machine carrying every label claims "
++        "the next run (the Board enforces it). Refused when no other active machine matches, after "
++        "kanban.move.max_moves moves, when moving back to a machine the card already left (pass force), and "
++        "for dir/worktree cards. After it returns, end your turn with a one-line reply; do not call more tools."
++    ),
++    {
++        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
++        "runs_on": {"type": "array", "items": {"type": "string"}, "description": (
++            "Labels the next machine must have, e.g. [\"machine:worker-1\"], [\"macos\"], [\"linux\"]. "
++            "machine:<name> pins one registered machine."
++        )},
++        "reason": _prop("string", "Why the card must move (what this machine lacks). Logged on the card."),
++        "checkpoint": _prop("string", (
++            "Everything the next run needs to resume on the other machine: what is done (commits, branches, "
++            "pushed work, with ids), what is NOT portable (local files, processes) and the exact next steps. "
++            "Markdown. No secrets."
++        )),
++        "force": {"type": "boolean", "description": "Allow moving back to a machine this card already left."},
++    },
++    ["runs_on", "reason", "checkpoint"],
++)
++
++
+ KANBAN_CONTINUE_SCHEMA = _schema(
+     "kanban_continue",
+     (
+-- 
+2.55.0
+

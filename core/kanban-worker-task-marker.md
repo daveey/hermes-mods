@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/0705-fix-kanban-worker-tool-children-carry-HERMES_KANBAN_.patch`: informational card marker exported
+- `patches/0775-fix-kanban-worker-tool-children-carry-HERMES_KANBAN_.patch`: informational card marker exported
   to every tool child of a Kanban worker; docs row in `environment-variables.md`.
 
 ## Behavior
@@ -47,7 +47,7 @@ Patches:
 
 ## Apply
 
-`git am core/patches/0705-*.patch`. On a newer upstream, re-implement in `scrub_kanban_env` (or wherever
+`git am core/patches/0775-*.patch`. On a newer upstream, re-implement in `scrub_kanban_env` (or wherever
 `HERMES_KANBAN_TASK` is removed from tool-child envs) and keep every reader of the new name out of identity code.
 
 ## Gotchas

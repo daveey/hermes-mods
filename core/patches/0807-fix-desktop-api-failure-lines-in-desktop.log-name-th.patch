@@ -1,0 +1,144 @@
+From 02a197fab24c4fdc280fadad43fd670e26c665b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:06:50 -0700
+Subject: [PATCH] fix(desktop): api failure lines in desktop.log name the
+ connection the request went to [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+'[hermes:api GET /path] Error: Timed out connecting…' didn't say which backend timed out.
+hub-sync asks every registry connection for /status, so mac-mini/hub tunnel timeouts read
+as a stalled local backend (2026-10-28, a day of chasing the wrong process). The line now
+carries conn=<registry id>|primary and profile=<p>; the path still closes the bracket so
+coach backend_timeouts keeps parsing it.
+---
+ .../electron/api-request-failure.test.ts      | 42 +++++++++++++++++++
+ apps/desktop/electron/api-request-failure.ts  | 32 ++++++++++++++
+ apps/desktop/electron/main.ts                 | 15 +------
+ 3 files changed, 75 insertions(+), 14 deletions(-)
+ create mode 100644 apps/desktop/electron/api-request-failure.test.ts
+ create mode 100644 apps/desktop/electron/api-request-failure.ts
+
+diff --git a/apps/desktop/electron/api-request-failure.test.ts b/apps/desktop/electron/api-request-failure.test.ts
+new file mode 100644
+index 0000000000..fb48c51c53
+--- /dev/null
++++ b/apps/desktop/electron/api-request-failure.test.ts
+@@ -0,0 +1,42 @@
++import { describe, expect, it } from 'vitest'
++
++import { formatApiRequestFailure } from './api-request-failure'
++
++const timeout = new Error('Timed out connecting to Hermes backend after 4000ms')
++
++describe('formatApiRequestFailure', () => {
++  it('names the registry connection a failed request was pinned to', () => {
++    // hub-sync asks EVERY connection for /status; a remote tunnel timing out must not read as the local backend.
++    const line = formatApiRequestFailure(
++      { connectionId: 'conn:mac-mini', method: 'get', path: '/api/plugins/hub-sync/status' } as any,
++      timeout
++    )
++
++    expect(line.startsWith('[hermes:api GET /api/plugins/hub-sync/status] conn=conn:mac-mini ')).toBe(true)
++    expect(line).toContain('Timed out connecting to Hermes backend after 4000ms')
++  })
++
++  it('marks an unpinned request as the primary route, with its profile when given', () => {
++    expect(formatApiRequestFailure({ path: '/api/plugins/kanban/boards' }, timeout)).toMatch(
++      /^\[hermes:api GET \/api\/plugins\/kanban\/boards\] conn=primary Error: Timed out/
++    )
++    expect(formatApiRequestFailure({ path: '/api/sessions', profile: 'coach' } as any, timeout)).toMatch(
++      /^\[hermes:api GET \/api\/sessions\] conn=primary profile=coach Error:/
++    )
++  })
++
++  it('keeps the coach backend-timeouts parser working (path still closes the bracket)', () => {
++    const line = formatApiRequestFailure({ connectionId: 'conn:hermes-hub', path: '/api/x?y=1' } as any, timeout)
++    expect(/\[hermes:api (?:[A-Z]+ )?(\S+?)\]/.exec(line)?.[1]).toBe('/api/x?y=1')
++  })
++
++  it('clamps long paths, ids and details', () => {
++    const line = formatApiRequestFailure(
++      { connectionId: 'c'.repeat(500), path: '/p'.repeat(400), profile: 'q'.repeat(500) } as any,
++      new Error('e'.repeat(9000))
++    )
++
++    expect(line.length).toBeLessThanOrEqual(6000)
++    expect(line).toContain(`conn=${'c'.repeat(120)} `)
++  })
++})
+diff --git a/apps/desktop/electron/api-request-failure.ts b/apps/desktop/electron/api-request-failure.ts
+new file mode 100644
+index 0000000000..49ead90ec3
+--- /dev/null
++++ b/apps/desktop/electron/api-request-failure.ts
+@@ -0,0 +1,32 @@
++// Format an api-request failure for desktop.log. The renderer only ever sees
++// the invoke rejection; the real stack lives here in main, so persist it
++// before rethrowing. Clamp: paths and error detail must not bloat the log.
++//
++// [daveey] The line names the backend the request went to: `conn=<registry id>` for a request pinned to
++// a registered gateway connection, else `conn=primary` (the legacy/primary route), plus `profile=` when
++// the request names one. hub-sync asks every connection for /status, so a remote tunnel timing out
++// (mac-mini down, a hub tunnel after sleep) used to read as "the local backend stalled" and sent a
++// whole investigation after the wrong process (2026-10-28). The path still closes the bracket, so
++// parsers keyed on `[hermes:api METHOD PATH]` (coach backend_timeouts) keep working.
++const ID_MAX = 120
++
++function clampToken(value: unknown): string {
++  return String(value ?? '')
++    .trim()
++    .replace(/\s+/g, '_')
++    .slice(0, ID_MAX)
++}
++
++export function formatApiRequestFailure(
++  request: { connectionId?: unknown; method?: string; path?: string; profile?: unknown } | null | undefined,
++  error: unknown
++): string {
++  const method = String(request?.method ?? 'GET').toUpperCase()
++  const path = String(request?.path ?? '(no path)').slice(0, 500)
++  const conn = clampToken(request?.connectionId) || 'primary'
++  const profile = clampToken(request?.profile)
++  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
++  const route = `conn=${conn}${profile ? ` profile=${profile}` : ''}`
++
++  return `[hermes:api ${method} ${path}] ${route} ${detail}`.slice(0, 6000)
++}
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index dd567bb98c..c7d12aa6cc 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -37,6 +37,7 @@ import type { Session } from 'electron'
+ import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime-state'
+ import { hideAgentTestInstance, isHiddenAgentTestInstance } from './agent-test-instance'
+ import { HERMES_API_EXPECTED_404 } from './api-expected-404'
++import { formatApiRequestFailure } from './api-request-failure'
+ import {
+   destroyKeepaliveAgents,
+   htmlResponseError,
+@@ -17782,20 +17783,6 @@ async function handleHermesApiRequest(request) {
+   return response
+ }
+ 
+-// Format an api-request failure for desktop.log. The renderer only ever sees
+-// the invoke rejection; the real stack lives here in main, so persist it
+-// before rethrowing. Clamp: paths and error detail must not bloat the log.
+-function formatApiRequestFailure(
+-  request: { method?: string; path?: string } | null | undefined,
+-  error: unknown
+-): string {
+-  const method = String(request?.method ?? 'GET').toUpperCase()
+-  const path = String(request?.path ?? '(no path)').slice(0, 500)
+-  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
+-
+-  return `[hermes:api ${method} ${path}] ${detail}`.slice(0, 6000)
+-}
+-
+ ipcMain.handle('hermes:api', async (_event, request) => {
+   // Hold the deletion gate for BOTH profile deletes and renames: a concurrent
+   // renderer reconnect entering ensureBackend() mid-mutation would otherwise
+-- 
+2.55.0
+

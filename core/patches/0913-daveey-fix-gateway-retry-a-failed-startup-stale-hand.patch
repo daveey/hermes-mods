@@ -1,0 +1,427 @@
+From 589ad047e4f1f7fe0f9a865998ebf2405e4a8518 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:32:46 +0000
+Subject: [PATCH] [daveey] fix(gateway): retry a failed startup stale-handoff
+ reclaim instead of giving up
+
+reclaim_stale_running_handoffs returned [] both when nothing was stranded and when
+the state.db write lock was unavailable, and the handoff watcher ran it exactly once
+per store at startup. A gateway started inside a lock storm (MacBook 2026-10-28 21:15 PT)
+therefore left 'running' rows in place until the next restart, blocking /handoff for
+those sessions (self-heal defect agent-9cbeb4e676).
+
+- reclaim_stale_running_handoffs returns None on failure (same WARNING), a list on success.
+- _reclaim_stale returns True on success (even []), False on None/raise.
+- The watcher keeps failed scopes and retries them at the top of later ticks with
+  backoff (30s doubling, 5 min cap), never while a dispatch of its own is in flight;
+  after 3 failures it logs ONE ERROR naming the profile store (detector signal).
+  Successful startups still reclaim exactly once per store.
+- New gateway/run_handoff_reclaim.py holds the retry state (StaleHandoffReclaimer);
+  _reclaim_stale moves there from gateway/run.py (file-size cap).
+
+Tests: watcher retry/backoff/one-ERROR/in-flight guard; real SessionDB with the write
+lock held returns None, not [].
+---
+ gateway/run.py                                |  19 ---
+ gateway/run_adapters.py                       |  16 +-
+ gateway/run_handoff_reclaim.py                |  89 +++++++++++
+ hermes_state_gateway.py                       |   8 +-
+ .../test_handoff_watcher_resilience.py        | 146 ++++++++++++++++++
+ .../test_reclaim_stale_handoffs.py            |  41 +++++
+ 6 files changed, 293 insertions(+), 26 deletions(-)
+ create mode 100644 gateway/run_handoff_reclaim.py
+ create mode 100644 tests/hermes_state/test_reclaim_stale_handoffs.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 3b3bcaa70c..c8b6c0f58a 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1741,25 +1741,6 @@ async def _resolve_handoff_watch_scopes(runner: object) -> list:
+     return _handoff_watch_scopes(runner)
+ 
+ 
+-async def _reclaim_stale(runner: object) -> None:
+-    """Fail handoffs left in ``running`` by a gateway that died mid-dispatch (once per store at startup).
+-    ``running`` is only set for one in-process dispatch, so a leftover row belongs to a dead process and
+-    blocks ``request_handoff`` for that session forever. Defensive: a raising reclaim aborts startup."""
+-    reclaim = getattr(getattr(runner, "_session_db", None), "reclaim_stale_running_handoffs", None)
+-    if not callable(reclaim):
+-        return
+-    try:
+-        ids = await reclaim(
+-            "gateway stopped mid-handoff; state reclaimed at startup. Re-run /handoff to try again.")
+-    except Exception:
+-        logger.debug("Stale-handoff reclaim raised", exc_info=True)
+-        return
+-    if ids:
+-        logger.warning(
+-            "Reclaimed %d handoff(s) stranded in 'running' by a previous "
+-            "gateway: %s", len(ids), ", ".join(str(i) for i in ids))
+-
+-
+ def _terminal_scope_cwd(default: str = "") -> str:
+     """Scope-aware TERMINAL_CWD read for footer/context surfaces. Only an import failure falls back:
+     an active refusal scope must raise, not use the launch cwd."""
+diff --git a/gateway/run_adapters.py b/gateway/run_adapters.py
+index 4e19825717..bc429d3a09 100644
+--- a/gateway/run_adapters.py
++++ b/gateway/run_adapters.py
+@@ -531,7 +531,8 @@ class GatewayAdapterLifecycleMixin:
+         """Process pending CLI→gateway session handoffs from ``state.db``: claim atomically (pending
+         → running), re-bind the home channel to the CLI session_id, dispatch a synthetic event, mark
+         ``completed``/``failed``."""
+-        from gateway.run import _async_profile_runtime_scope, _reclaim_stale, _resolve_handoff_watch_scopes
++        from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
++        from gateway.run_handoff_reclaim import StaleHandoffReclaimer, _reclaim_stale
+         from gateway.run_idle_gates import off_loop_gate, profile_has_pending_handoff
+         await asyncio.sleep(5)  # let platforms connect before dispatching through them
+         # Does _process_handoff accept the profile argument? Test stand-ins bind a one-arg callable.
+@@ -594,13 +595,20 @@ class GatewayAdapterLifecycleMixin:
+ 
+         # Multiplex scope resolution walks the filesystem (profiles_to_serve) off the loop, so a
+         # stalled walk cannot trip the liveness probe — startup reclaim and every tick alike.
+-        for _pname, _phome in await _resolve_handoff_watch_scopes(self):
++        # A failed reclaim (busy state.db) is retried with backoff on later ticks (run_handoff_reclaim).
++        async def _reclaim_scope(pname, phome) -> bool:
++            ok = False
+             with _log_suppressed(logging.DEBUG, "Stale-handoff reclaim failed", exc_info=True):
+-                async with _scope(_phome):
+-                    await _reclaim_stale(self)
++                async with _scope(phome):
++                    ok = bool(await _reclaim_stale(self))
++            return ok
++
++        reclaimer = StaleHandoffReclaimer(_reclaim_scope)
++        await reclaimer.startup(await _resolve_handoff_watch_scopes(self))
+         try:
+             while self._running:
+                 try:
++                    await reclaimer.retry_due(busy=bool(inflight))
+                     for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
+                         # Idle gate (run_idle_gates): skip the scope entry when the profile's store
+                         # holds no pending handoff. The root poll (None) is unscoped and stays cheap.
+diff --git a/gateway/run_handoff_reclaim.py b/gateway/run_handoff_reclaim.py
+new file mode 100644
+index 0000000000..17eeacaf25
+--- /dev/null
++++ b/gateway/run_handoff_reclaim.py
+@@ -0,0 +1,89 @@
++"""Handoff watcher: reclaim of handoffs stranded in ``running`` by a dead gateway, with retry.
++
++``running`` is only set by the gateway watcher for one in-process dispatch, so a leftover row at
++watcher startup belongs to a previous gateway that died mid-dispatch, and it blocks
++``request_handoff`` for that session forever. The watcher reclaims each served profile store once
++at startup. A reclaim that FAILS (busy state.db: the store returns ``None``) is not "nothing to do":
++the store is kept and retried with backoff on later ticks (agent-9cbeb4e676).
++"""
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any, Awaitable, Callable, Optional
++
++logger = logging.getLogger("gateway.run")  # log-record parity with the watcher's origin module
++
++RECLAIM_RETRY_MIN_S, RECLAIM_RETRY_MAX_S, RECLAIM_ERROR_AFTER = 30.0, 300.0, 3
++reclaim_clock = time.monotonic  # module seam: tests drive the backoff with a fake clock
++
++
++async def _reclaim_stale(runner: object) -> bool:
++    """Fail handoffs left in ``running`` by a gateway that died mid-dispatch, in the currently scoped
++    store. Defensive: a raising reclaim must not abort startup.
++
++    Returns True when the store was reclaimed (even with nothing stranded) and False when the reclaim
++    failed (``None`` from the store, or a raise), so the watcher retries it. A store without the method
++    has nothing to reclaim: True."""
++    reclaim = getattr(getattr(runner, "_session_db", None), "reclaim_stale_running_handoffs", None)
++    if not callable(reclaim):
++        return True
++    try:
++        ids = await reclaim(
++            "gateway stopped mid-handoff; state reclaimed at startup. Re-run /handoff to try again.")
++    except Exception:
++        logger.debug("Stale-handoff reclaim raised", exc_info=True)
++        return False
++    if ids is None:
++        return False
++    if ids:
++        logger.warning(
++            "Reclaimed %d handoff(s) stranded in 'running' by a previous "
++            "gateway: %s", len(ids), ", ".join(str(i) for i in ids))
++    return True
++
++
++class StaleHandoffReclaimer:
++    """Per-watcher state: profile stores whose reclaim has not succeeded yet.
++
++    ``reclaim_scope(profile_name, profile_home) -> bool`` runs one reclaim inside that store's scope.
++    Successful startups keep "exactly once per store"; a failed store is retried at most every
++    ``RECLAIM_RETRY_MIN_S`` doubling to ``RECLAIM_RETRY_MAX_S``, and after ``RECLAIM_ERROR_AFTER``
++    failures ONE ERROR names the store (the signal detector files a card from it)."""
++
++    def __init__(self, reclaim_scope: Callable[[Optional[str], Any], Awaitable[bool]]) -> None:
++        self._reclaim_scope = reclaim_scope
++        # profile name -> [profile_home, failures, next_attempt_at, error_logged]
++        self.pending: dict[Optional[str], list] = {}
++
++    async def startup(self, scopes) -> None:
++        for name, home in scopes:
++            if not await self._reclaim_scope(name, home):
++                self._failed(name, self.pending.setdefault(name, [home, 0, 0.0, False]))
++
++    async def retry_due(self, busy: bool) -> None:
++        """Retry due stores. ``busy`` (this gateway has a dispatch in flight) skips the round: the
++        reclaim fails EVERY 'running' row in the store, including our own live dispatch's."""
++        if not self.pending or busy:
++            return
++        now = reclaim_clock()
++        for name, entry in list(self.pending.items()):
++            if now < entry[2]:
++                continue
++            if not await self._reclaim_scope(name, entry[0]):
++                self._failed(name, entry)
++                continue
++            self.pending.pop(name, None)
++            if entry[3]:
++                logger.warning("Stale-handoff reclaim for profile store %s succeeded after %d failed "
++                               "attempt(s)", name or "root", entry[1])
++
++    def _failed(self, name: Optional[str], entry: list) -> None:
++        entry[1] += 1
++        entry[2] = reclaim_clock() + min(RECLAIM_RETRY_MIN_S * (2 ** (entry[1] - 1)), RECLAIM_RETRY_MAX_S)
++        if entry[1] >= RECLAIM_ERROR_AFTER and not entry[3]:
++            entry[3] = True
++            logger.error(
++                "Stale-handoff reclaim failed %d times for profile store %s; handoffs stranded in "
++                "'running' there block /handoff for their sessions until a reclaim succeeds "
++                "(still retrying every %.0fs)", entry[1], name or "root", RECLAIM_RETRY_MAX_S)
+diff --git a/hermes_state_gateway.py b/hermes_state_gateway.py
+index 9fe3bde4c1..3f8c93737d 100644
+--- a/hermes_state_gateway.py
++++ b/hermes_state_gateway.py
+@@ -971,8 +971,10 @@ class SessionGatewayMixin:
+             f" AND handoff_state IN ({', '.join('?' for _ in states)})" if states else "")
+         return self._write_rowcount(sql, (error[:500], session_id, *states)) > 0
+ 
+-    def reclaim_stale_running_handoffs(self, error: str) -> list[str]:
+-        """Fail every handoff stuck in ``running``; returns the ids reclaimed. Only the gateway watcher sets
++    def reclaim_stale_running_handoffs(self, error: str) -> Optional[list[str]]:
++        """Fail every handoff stuck in ``running``; returns the ids reclaimed (``[]`` = nothing stranded),
++        or ``None`` when the write failed (e.g. the write lock stayed busy) so the caller retries instead of
++        mistaking a failure for "nothing to reclaim" (agent-9cbeb4e676). Only the gateway watcher sets
+         ``running``, for one in-process dispatch — so a ``running`` row at watcher startup belongs to a
+         PREVIOUS gateway that died mid-dispatch. It is poisonous: ``request_handoff`` only accepts
+         NULL/``completed``/``failed``, so the session could never hand off again, with no error surfaced.
+@@ -993,4 +995,4 @@ class SessionGatewayMixin:
+             logger.warning(
+                 "reclaim_stale_running_handoffs failed; stranded 'running' "
+                 "handoff rows (if any) were left in place", exc_info=True)
+-            return []
++            return None
+diff --git a/tests/gateway/test_handoff_watcher_resilience.py b/tests/gateway/test_handoff_watcher_resilience.py
+index 6de8a84d88..b58f0a7455 100644
+--- a/tests/gateway/test_handoff_watcher_resilience.py
++++ b/tests/gateway/test_handoff_watcher_resilience.py
+@@ -250,6 +250,152 @@ async def test_reclaim_runs_per_profile_store(monkeypatch):
+     )
+ 
+ 
++class _FlakyReclaimDB(_ReclaimDB):
++    """Reclaim fails (None) for the first ``fail_times`` calls, then reclaims ``stale_ids``."""
++
++    def __init__(self, fail_times=1, stale_ids=("s1",)):
++        super().__init__(stale_ids=stale_ids)
++        self.fail_times = fail_times
++        self.results = []
++
++    async def reclaim_stale_running_handoffs(self, error):
++        self.reclaim_calls.append(error)
++        result = None if len(self.reclaim_calls) <= self.fail_times else list(self.stale_ids)
++        self.results.append(result)
++        return result
++
++
++def _fake_clock(monkeypatch, step):
++    """Each read advances a fake monotonic clock by ``step`` seconds (the watcher's backoff clock)."""
++    from gateway import run_handoff_reclaim
++    now = [1000.0]
++
++    def _clock():
++        now[0] += step
++        return now[0]
++
++    monkeypatch.setattr(run_handoff_reclaim, "reclaim_clock", _clock)
++    return now
++
++
++def _no_sleep_patch(monkeypatch):
++    async def _no_sleep(_seconds):
++        return None
++
++    monkeypatch.setattr(run.asyncio, "sleep", _no_sleep)
++
++
++def _watch_fake(db, ticks):
++    fake = types.SimpleNamespace()
++    fake._session_db = db
++    fake._running = _running_flag(ticks)
++
++    async def _process_handoff(row, profile_name=None):
++        return None
++
++    fake._process_handoff = _process_handoff
++    return fake
++
++
++@pytest.mark.asyncio
++async def test_failed_startup_reclaim_is_retried_until_it_succeeds(monkeypatch):
++    """A reclaim that fails at startup (busy state.db: None, not []) is retried on a later tick.
++
++    Before the fix the startup reclaim ran exactly once and a failure looked like "nothing to do",
++    so a store locked at startup kept its poisonous 'running' rows until the next gateway restart
++    (agent-9cbeb4e676).
++    """
++    monkeypatch.setattr(run, "_handoff_watch_scopes", lambda _r: [(None, None)])
++    _no_sleep_patch(monkeypatch)
++    _fake_clock(monkeypatch, step=40.0)  # every tick is past the 30s minimum backoff
++
++    db = _FlakyReclaimDB(fail_times=1, stale_ids=["s1"])
++    coro = run.GatewayRunner._handoff_watcher(_watch_fake(db, ticks=5), interval=0.0, drain_timeout=0.01)
++    await asyncio.wait_for(coro, timeout=5)
++
++    assert len(db.reclaim_calls) == 2, f"expected startup + one retry, got {len(db.reclaim_calls)}"
++    assert db.results == [None, ["s1"]], "the retry must actually reclaim the stranded row"
++
++
++@pytest.mark.asyncio
++async def test_reclaim_retry_respects_backoff(monkeypatch):
++    """No retry storm: ticks inside the 30s minimum backoff do not call reclaim again."""
++    monkeypatch.setattr(run, "_handoff_watch_scopes", lambda _r: [(None, None)])
++    _no_sleep_patch(monkeypatch)
++    _fake_clock(monkeypatch, step=1.0)  # ~10 ticks ≈ 20s of clock reads, all inside the backoff
++
++    db = _FlakyReclaimDB(fail_times=99)
++    coro = run.GatewayRunner._handoff_watcher(_watch_fake(db, ticks=10), interval=0.0, drain_timeout=0.01)
++    await asyncio.wait_for(coro, timeout=5)
++
++    assert len(db.reclaim_calls) == 1, f"retried inside the backoff window: {len(db.reclaim_calls)} calls"
++
++
++@pytest.mark.asyncio
++async def test_reclaim_that_keeps_failing_logs_one_error(monkeypatch, caplog):
++    """After 3 failed attempts the watcher logs ONE ERROR naming the store (detector signal)."""
++    import logging
++
++    monkeypatch.setattr(run, "_handoff_watch_scopes", lambda _r: [(None, None)])
++    _no_sleep_patch(monkeypatch)
++    _fake_clock(monkeypatch, step=400.0)  # past the 5 min cap: every tick retries
++
++    db = _FlakyReclaimDB(fail_times=99)
++    caplog.set_level(logging.DEBUG)
++    coro = run.GatewayRunner._handoff_watcher(_watch_fake(db, ticks=6), interval=0.0, drain_timeout=0.01)
++    await asyncio.wait_for(coro, timeout=5)
++
++    assert len(db.reclaim_calls) >= 4, f"expected retries to continue, got {len(db.reclaim_calls)}"
++    errors = [r for r in caplog.records
++              if r.levelno == logging.ERROR and "reclaim" in r.getMessage().lower()]
++    assert len(errors) == 1, [r.getMessage() for r in errors]
++    assert "root" in errors[0].getMessage(), errors[0].getMessage()
++
++
++@pytest.mark.asyncio
++async def test_reclaim_retry_skipped_while_a_handoff_is_inflight(monkeypatch):
++    """A retry must never fail this gateway's OWN live dispatch: it waits until nothing is in flight."""
++    monkeypatch.setattr(run, "_handoff_watch_scopes", lambda _r: [(None, None)])
++    _no_sleep_patch(monkeypatch)
++    _fake_clock(monkeypatch, step=400.0)
++
++    class _DB(_FlakyReclaimDB):
++        def __init__(self):
++            super().__init__(fail_times=99)
++            self.claimed = []
++
++        async def list_pending_handoffs(self):
++            return [{"id": "slow-row"}]
++
++        async def claim_handoff(self, sid):
++            if sid in self.claimed:
++                return False
++            self.claimed.append(sid)
++            return True
++
++        async def complete_handoff(self, sid):
++            return None
++
++        async def fail_handoff(self, sid, err):
++            return None
++
++    db = _DB()
++    fake = _watch_fake(db, ticks=6)
++
++    async def _process_handoff(row, profile_name=None):
++        await asyncio.Event().wait()  # in flight for the whole run
++
++    fake._process_handoff = _process_handoff
++    coro = run.GatewayRunner._handoff_watcher(fake, interval=0.0, drain_timeout=0.01)
++    await asyncio.wait_for(coro, timeout=5)
++
++    assert db.claimed == ["slow-row"]
++    # Startup + tick 1's retry (it runs BEFORE tick 1 claims the row); once the row is in flight,
++    # later ticks (each past the backoff on this clock) must not retry.
++    assert len(db.reclaim_calls) == 2, (
++        f"retried reclaim while this gateway had a handoff in flight: {len(db.reclaim_calls)} calls")
++
++
+ 
+ 
+ def test_reclaim_stale_running_handoffs_flips_only_running_rows(tmp_path):
+diff --git a/tests/hermes_state/test_reclaim_stale_handoffs.py b/tests/hermes_state/test_reclaim_stale_handoffs.py
+new file mode 100644
+index 0000000000..39f30faa05
+--- /dev/null
++++ b/tests/hermes_state/test_reclaim_stale_handoffs.py
+@@ -0,0 +1,41 @@
++"""reclaim_stale_running_handoffs must tell failure apart from "nothing to reclaim".
++
++The gateway's startup reclaim used to get ``[]`` both when no row was stranded and when the write lock was
++unavailable, so a reclaim that hit a busy state.db was never retried (agent-9cbeb4e676).
++"""
++
++import sqlite3
++
++from hermes_state import SessionDB
++
++
++def _strand(db, sid):
++    db.create_session(sid, "cli")
++    db._execute_write(lambda conn: conn.execute(
++        "UPDATE sessions SET handoff_state = 'running' WHERE id = ?", (sid,)))
++
++
++def test_reclaim_returns_none_when_write_lock_is_held(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    _strand(db, "dead")
++    db._WRITE_PATIENCE_S = 0.3  # instance override keeps the lock wait short
++
++    holder = sqlite3.connect(str(tmp_path / "state.db"), timeout=0, isolation_level=None)
++    holder.execute("BEGIN IMMEDIATE")
++    try:
++        result = db.reclaim_stale_running_handoffs("gateway died")
++    finally:
++        holder.execute("ROLLBACK")
++        holder.close()
++
++    assert result is None, f"a failed reclaim must return None, not {result!r}"
++    assert db.get_handoff_state("dead")["state"] == "running"
++
++    assert db.reclaim_stale_running_handoffs("gateway died") == ["dead"]
++    assert db.get_handoff_state("dead")["state"] == "failed"
++
++
++def test_reclaim_with_nothing_stranded_returns_empty_list(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session("ok", "cli")
++    assert db.reclaim_stale_running_handoffs("gateway died") == []
+-- 
+2.55.0
+

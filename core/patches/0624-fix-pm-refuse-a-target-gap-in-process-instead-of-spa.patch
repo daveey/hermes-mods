@@ -1,0 +1,123 @@
+From 992410c31768411d5ebb09fd3c57c7b4e65be744 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:12:03 -0700
+Subject: [PATCH] fix(pm): refuse a target gap in-process instead of spawning a
+ worker per ensure() [daveey]
+
+selected_git_env() asks pm.ensure('git') on every internal git call. On POSIX, git is a deliberate gap
+(Git.gaps: 'POSIX uses system git by choice'), but the client's lazy pre-check counted it as missing and
+spawned a PM worker per call. The worker could only answer 'unavailable on <target>'. On David-MBP one
+busy kanban agent started ~53 PM worker interpreters a minute, each 0.7-2.3 s, and the caller fell back
+to system git every time. ensure() now raises the same InstallError from the package's static
+missing_reason(current_target()) before any worker; packages without a gap are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pm/client.py                       | 16 ++++++++
+ tests/pm/test_client_target_gap.py | 60 ++++++++++++++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+ create mode 100644 tests/pm/test_client_target_gap.py
+
+diff --git a/pm/client.py b/pm/client.py
+index bce938e867..5a29fb07cb 100644
+--- a/pm/client.py
++++ b/pm/client.py
+@@ -16,6 +16,21 @@ from pm.runtime import is_runtime, runtime_command, runtime_environment
+ from pm.worker_operations import OPERATIONS
+ 
+ 
++def _raise_target_gap(package) -> None:
++    """Raise the worker's ``unavailable on <target>`` refusal here, without spawning it.
++
++    A gap (``Git.gaps``: POSIX uses system git by choice) is a static fact of the package and the host
++    target, so the worker can only refuse. ``selected_git_env`` asks for git on every internal git call:
++    a worker per call cost ~0.7-2 s and a fresh interpreter each time (~1/s from one busy agent).
++    """
++    from pm.store import current_target
++
++    target = current_target()
++    reason = package.missing_reason(target)
++    if reason is not None:
++        raise InstallError(package.name, f"unavailable on {target}: {reason}", "none")
++
++
+ def _missing_or_refuse(name):
+     from pm.install import _refuse_lazy, is_installed, lazy_installs_allowed
+     from pm.registry import walk
+@@ -187,6 +202,7 @@ def ensure(name, *, base_env=None, explicit=False, verify=True, progress=None, p
+         from pm.install import ensure as direct
+         return direct(name, base_env=base_env, explicit=explicit, verify=verify, progress=progress,
+                       pause_event=pause_event, download_progress=download_progress)
++    _raise_target_gap(get_package(name))
+     if not explicit and not isinstance(get_package(name), StatePackage):
+         if not _missing_or_refuse(name):
+             return Runner(name, env_for(name, base_env=base_env))
+diff --git a/tests/pm/test_client_target_gap.py b/tests/pm/test_client_target_gap.py
+new file mode 100644
+index 0000000000..1361a9bddb
+--- /dev/null
++++ b/tests/pm/test_client_target_gap.py
+@@ -0,0 +1,60 @@
++"""A package with a gap on this host's target is refused in-process: no PM worker per call.
++
++``selected_git_env`` asks ``pm.ensure("git")`` on every internal git call. On POSIX, git is a deliberate
++gap (``Git.gaps``), so the worker could only answer "unavailable on <target>". It used to be spawned
++anyway, a fresh interpreter and ~0.7-2 s per git call.
++"""
++
++import subprocess
++
++import pytest
++
++from pm import client
++from pm.package import InstallError
++
++
++@pytest.fixture
++def no_worker(monkeypatch):
++    def refuse(*args, **kwargs):
++        raise AssertionError("a PM worker was requested")
++
++    monkeypatch.setattr(client, "is_runtime", lambda: False)
++    monkeypatch.setattr(client, "_request", refuse)
++    monkeypatch.setattr(client, "_missing_or_refuse", lambda name: [name])  # git counts as missing
++
++
++@pytest.mark.parametrize("target", ["darwin-arm64", "linux-x64"])
++@pytest.mark.parametrize("explicit", [False, True])
++def test_git_gap_is_refused_without_a_worker(monkeypatch, no_worker, target, explicit):
++    monkeypatch.setattr("pm.store.current_target", lambda: target)
++
++    with pytest.raises(InstallError, match=f"unavailable on {target}: POSIX uses system git by choice"):
++        client.ensure("git", explicit=explicit)
++
++
++def test_package_without_a_gap_still_goes_to_the_worker(monkeypatch):
++    calls = []
++    monkeypatch.setattr(client, "is_runtime", lambda: False)
++    monkeypatch.setattr(client, "_missing_or_refuse", lambda name: [name])
++    monkeypatch.setattr(client, "_request", lambda operation, arguments, **kw: calls.append((operation, arguments)))
++    monkeypatch.setattr("pm.store.current_target", lambda: "win32-x64")  # Git for Windows: no gap
++    monkeypatch.setattr("pm.install.env_for", lambda name, base_env=None: {"PATH": "/pm/git"})
++
++    runner = client.ensure("git")
++
++    assert calls == [("ensure", {"name": "git", "explicit": False})]
++    assert runner.env == {"PATH": "/pm/git"}
++
++
++def test_selected_git_env_falls_back_to_system_git_without_spawning(monkeypatch, no_worker):
++    from hermes_cli._subprocess_compat import selected_git_env
++
++    monkeypatch.setattr("pm.store.current_target", lambda: "darwin-arm64")
++
++    def no_spawn(*args, **kwargs):
++        raise AssertionError(f"spawned {args[:1]}")
++
++    monkeypatch.setattr(subprocess, "Popen", no_spawn)
++    base = {"PATH": "/usr/bin", "HOME": "/h"}
++
++    assert selected_git_env(base) == base
+-- 
+2.55.0
+

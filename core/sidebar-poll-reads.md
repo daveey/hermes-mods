@@ -1,9 +1,9 @@
 # One sidebar poll reads each store once
 
-Patch **0647** (source `2bc039b9bf`). Follows [kanban-replica-read-memo.md](kanban-replica-read-memo.md) (0580) and
-[sessions-list-preview-page-only.md](sessions-list-preview-page-only.md) (0554).
+Patch **0656** (source `2bc039b9bf`). Follows [kanban-replica-read-memo.md](kanban-replica-read-memo.md) (0592) and
+[sessions-list-preview-page-only.md](sessions-list-preview-page-only.md) (0533).
 
-After 0580, replaying `GET /api/profiles/sessions/sidebar` every 2 s against the live `~/.hermes` still cost
+After 0592, replaying `GET /api/profiles/sessions/sidebar` every 2 s against the live `~/.hermes` still cost
 ~170 ms of backend CPU per poll (Desktop's own query: ~85–115 ms). The response cache (5 s) lets about one poll in
 three through; each of those spent ~600 ms.
 
@@ -22,7 +22,7 @@ three through; each of those spent ~600 ms.
 4. **Why ~150 ms of state.db per response?** Three `list_sessions_rich` calls; each evaluated the session filter
    (three `json_extract`s on `model_config` per row, ~8 ms) twice and every session's `MAX(messages.timestamp)`
    (~10 ms) twice: once in the `chain_max` CTE and again for each admitted row before `ORDER BY … LIMIT`.
-5. **Why did the replica read memo (0580) almost never hit?** Its key held `last_ok`, which every hub pull (~2 s)
+5. **Why did the replica read memo (0592) almost never hit?** Its key held `last_ok`, which every hub pull (~2 s)
    moves; 24 of 28 live reads missed on `last_ok` alone with the task rows unchanged.
 6. **Why ~50 ms per remote projection beyond the replica read?** It resolved each receipt alias's compression tip
    on a fresh connection to the 12 GB state.db (~24 opens per projection), and a board WAL moving between the
@@ -48,7 +48,7 @@ three through; each of those spent ~600 ms.
   rows the filter admitted, so the filter runs once) by `(effective_last_active, started_at, id)`; columns,
   `last_active` and the preview are projected onto the picked page only. Same rows, same order, same columns.
 - Pinned back-fill: driven from `SELECT id FROM sessions WHERE pinned = 1`, then the same filter and columns.
-- Replica read memo (0580): the key drops `last_ok`; a hit also requires the same stale verdict and the same
+- Replica read memo (0592): the key drops `last_ok`; a hit also requires the same stale verdict and the same
   per-owner `synced_at` (`_replica_synced`, the projection's own expression over the memoized rows' update times),
   which are the only ways `last_ok` reaches the answer. Reuse still ends at the next scope-heartbeat cut-off.
 - `_project_remote_links` resolves tips on one state.db connection per projection
@@ -63,7 +63,7 @@ three through; each of those spent ~600 ms.
 
 ## Measured
 
-Live `~/.hermes`, 30 polls 2 s apart, process CPU per poll, interleaved runs of `main` (529b6c9f66, with 0580) and
+Live `~/.hermes`, 30 polls 2 s apart, process CPU per poll, interleaved runs of `main` (529b6c9f66, with 0592) and
 this change on an otherwise idle machine:
 
 | request | main | this change |
@@ -114,7 +114,7 @@ Plugin: `plugins/chat-closeout/tests/test_proof_pass.py` (`test_a_pass_proves_th
 
 ## Applying
 
-`git am -3`; needs 0580 (replica read memo) and 0554 (page-only preview).
+`git am -3`; needs 0592 (replica read memo) and 0533 (page-only preview).
 
 ## Gotchas
 
@@ -124,5 +124,5 @@ Plugin: `plugins/chat-closeout/tests/test_proof_pass.py` (`test_a_pass_proves_th
   snapshot's annotations across threads.
 - Builds on fa44287eb6 (links fingerprint keyed on hub content, 15 s max age), which landed meanwhile: its
   fingerprint still covers every board's stat, which is why the in-scope pin above matters.
-- The `stale`/`status` flicker on origin rows under ledger write-lock contention is fixed separately in 0654
+- The `stale`/`status` flicker on origin rows under ledger write-lock contention is fixed separately in 0664
   ([kanban-local-owner-projection.md](kanban-local-owner-projection.md)).

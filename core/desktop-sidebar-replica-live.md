@@ -1,6 +1,6 @@
 # Sidebar rows of every gateway from the hub replica, at once
 
-Patch: 0528. Part A of "instant session loads" (2026-10-27, approved by David). Builds on the hub-sync replica
+Patch: 0537. Part A of "instant session loads" (2026-10-27, approved by David). Builds on the hub-sync replica
 fallback in [hub-sync-replica.md](hub-sync-replica.md) and needs hermes-hub client 1.7.1 or later on every gateway
 (`hermes-hub watch` keeps the replica within about 2 s of each owner).
 

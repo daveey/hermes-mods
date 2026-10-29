@@ -1,6 +1,6 @@
 # Direct transcript-page tests pass Request
 
-Patch **0684** (`cb8da3bf9a`). Test harness only.
+Patch **0693** (`cb8da3bf9a`). Test harness only.
 
 ## Behavior
 
@@ -21,11 +21,11 @@ Existing tests, callers fixed rather than new cases:
 - `test_rest_pages_bind_the_history_owner_for_messages_and_around`
 - `test_unscoped_rest_history_uses_custom_home_of_its_database`
 
-This mirror did not re-run the file. The sibling messages-endpoint caller (`test_messages_endpoint_reports_corruption`) is a different commit, covered as the route-argument bind in [spotlight-noindex-scratch.md](spotlight-noindex-scratch.md) (0683). The REST path through FastAPI, where Query defaults apply, is untested by this patch.
+This mirror did not re-run the file. The sibling messages-endpoint caller (`test_messages_endpoint_reports_corruption`) is a different commit, covered as the route-argument bind in [spotlight-noindex-scratch.md](spotlight-noindex-scratch.md) (0692). The REST path through FastAPI, where Query defaults apply, is untested by this patch.
 
 ## Applying
 
-`git am -3` 0684. Test file only.
+`git am -3` 0693. Test file only.
 
 ## Gotchas
 

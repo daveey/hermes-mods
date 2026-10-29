@@ -1,0 +1,517 @@
+From f441e3ff10840c59ed05a1d5fc682c861f47c0a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:02:27 +0000
+Subject: [PATCH] fix(kanban): a PR contract on a repo with no required checks
+ completes via metadata.contract_waiver, not a hand-edited kanban.db [daveey]
+
+Acceptance classified 'no required checks' as missing; the only way out was an
+orchestrator re-point (2f4774720d), so a worker finishing such a card still had to
+block, and one rewrote completion_contract in kanban.db instead (agent-650ad5206a).
+
+- new classification no_required_checks; its detail names metadata.contract_waiver
+  and the orchestrator re-point (test_kanban_pr_transport expectation updated to
+  the new classification).
+- complete_task honours contract_waiver={reason} only when the fresh read is
+  no_required_checks; logs contract_waived (+ the pr_acceptance receipt), and the
+  origin ledger accepts that receipt. Every other classification stays refused.
+- kanban_create tool and CLI warn (never refuse) when the contract repo's default
+  branch has no required checks.
+- CLI complete names the PR acceptance reason instead of 'unknown id or terminal state'.
+- contract CLI helpers (incl. the moved _cmd_edit_contract) live in
+  hermes_cli/kanban_contract_cli.py (file caps).
+---
+ hermes_cli/kanban.py                          |  41 +-----
+ hermes_cli/kanban_contract_cli.py             | 106 +++++++++++++++
+ hermes_cli/kanban_origin_ledger.py            |   8 +-
+ hermes_cli/kanban_pr_acceptance.py            |  23 +++-
+ hermes_cli/kanban_pr_acceptance_store.py      |  14 +-
+ tests/hermes_cli/test_kanban_pr_acceptance.py | 122 +++++++++++++++++-
+ tests/hermes_cli/test_kanban_pr_transport.py  |   4 +-
+ tools/kanban_tools.py                         |   8 +-
+ tools/kanban_tools_schemas.py                 |   4 +-
+ 9 files changed, 282 insertions(+), 48 deletions(-)
+ create mode 100644 hermes_cli/kanban_contract_cli.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 97ab9b5fb3..8a8ed04b01 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -25,6 +25,7 @@ from hermes_cli import kanban_db_notify as kbn
+ from hermes_cli import kanban_db_operator as kbo
+ from hermes_cli import kanban_swarm as ks
+ from hermes_cli import kanban_workflow
++from hermes_cli import kanban_contract_cli as _contract_cli
+ from hermes_cli.kanban_output import (
+     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
+     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
+@@ -506,6 +507,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             from hermes_cli.kanban_capability_routing import preflight
+             placement = preflight(conn, task_id, board=getattr(args, "board", None))
+         task = kb.get_task(conn, task_id)
++    contract_extra = _contract_cli.create_warning_fields(task, skip=idem_hit, stderr=True)
+     unlinked_warning = None
+     if not in_worker and not session_id and not idem_hit and _agent_invoked():
+         # An agent shelled out but no chat could be stamped (unknown/missing session env:
+@@ -521,6 +523,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         out = _task_to_dict(task)
+         if unlinked_warning:  # also in the payload: run_slash returns only stdout for --json
+             out["warning"] = unlinked_warning
++        out.update(contract_extra)
+         if origin_binding:
+             out["origin_binding"] = origin_binding
+         if placement:
+@@ -1293,6 +1296,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
+                     fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
+                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
++                else:  # a PR-acceptance refusal names its reason, not "unknown id" [daveey]
++                    fail_msg[tid] = _contract_cli.complete_refusal(conn, tid) or fail_msg[tid]
+             return done
+ 
+         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+@@ -1301,43 +1306,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+ _OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runtime_seconds", "session_id")
+ 
+ 
+-def _cmd_edit_contract(args: argparse.Namespace) -> int:
+-    """``hermes kanban edit <id> --completion-contract X --reason Y``: the audited way out
+-    of a completion gate that can never pass. Orchestrator-only, like unblock: a worker
+-    that could re-point its own card's gate would make the gate meaningless. [daveey]"""
+-    if os.environ.get("HERMES_KANBAN_TASK"):
+-        return _err(
+-            "kanban edit: --completion-contract is orchestrator-only; a worker can't change its own "
+-            "card's gate. Block without a human_request so the owning chat re-points it", 2,
+-        )
+-    others = [f"--{name.replace('_', '-')}" for name in (
+-        "title", "body", "priority", "result", "summary", "metadata", *_OPERATOR_EDIT_FLAGS,
+-    ) if getattr(args, name, None) is not None]
+-    if others or getattr(args, "force", False):
+-        return _err(
+-            "kanban edit: --completion-contract can't be combined with other edit flags "
+-            f"({', '.join(others) or '--force'}); run them as separate edits", 2,
+-        )
+-    with kbc.connect_closing() as conn:
+-        try:
+-            change = kbo.set_completion_contract(
+-                conn, args.task_id, args.completion_contract,
+-                reason=getattr(args, "reason", None) or "", actor=_profile_author(),
+-            )
+-        except kbo.KanbanEditRefused as exc:
+-            return _err(f"kanban edit: {exc}", 2)
+-    if change is None:
+-        return _err(f"cannot edit {args.task_id} (unknown id)")
+-    if not change:
+-        print(f"Edited {args.task_id} (completion_contract unchanged)")
+-        return 0
+-    print(f"Edited {args.task_id} (completion_contract: {change['old']!r} -> {change['new']!r})")
+-    return 0
+-
+-
+ def _cmd_edit(args: argparse.Namespace) -> int:
+     if getattr(args, "completion_contract", None) is not None:
+-        return _cmd_edit_contract(args)
++        return _contract_cli.cmd_edit_contract(args)
+     if getattr(args, "reason", None) is not None:
+         return _err("kanban edit: --reason only applies to --completion-contract", 2)
+     result = getattr(args, "result", None)
+diff --git a/hermes_cli/kanban_contract_cli.py b/hermes_cli/kanban_contract_cli.py
+new file mode 100644
+index 0000000000..bd859f5273
+--- /dev/null
++++ b/hermes_cli/kanban_contract_cli.py
+@@ -0,0 +1,106 @@
++"""Completion-contract CLI/tool helpers: the audited orchestrator re-point
++(``hermes kanban edit --completion-contract``), the creation-time warning for a PR
++contract that can never pass CI acceptance, and naming a PR-acceptance refusal on
++``hermes kanban complete``. The worker's own way out is ``metadata.contract_waiver``
++(kanban_pr_acceptance_store). [daveey]
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++from typing import Optional
++from urllib.parse import quote
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_operator as kbo
++from hermes_cli import kanban_pr_acceptance as _kpa
++
++
++def contract_warning(contract: Optional[str], assignee: Optional[str] = None) -> Optional[str]:
++    """Creation-time advisory: an OWNER/REPO (or PR URL) contract whose repository has no required
++    checks on its default branch can only complete through a contract_waiver. Any read error, an
++    unreadable repo or configured checks return None: this never refuses or delays a create beyond
++    the gh read itself. [daveey]"""
++    if not contract or contract == "local-only":
++        return None
++    match = _kpa._REPO.fullmatch(contract) or _kpa._PR.fullmatch(contract)
++    if not match:
++        return None
++    repo = contract if _kpa._REPO.fullmatch(contract) else match[1]
++    owner, name = repo.split("/")
++    query = (f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)})'
++             '{defaultBranchRef{name branchProtectionRule{requiredStatusChecks{context}}}}}')
++    try:
++        profile_home = _kpa._assignee_profile_home(assignee)
++        repository = _kpa._api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
++        ref = (repository or {}).get("defaultBranchRef")
++        if not ref or not ref.get("name"):
++            return None
++        if ((ref.get("branchProtectionRule") or {}).get("requiredStatusChecks") or []):
++            return None
++        branch = ref["name"]
++        rules = _kpa._api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
++                     paginate=True, profile_home=profile_home)
++        if any(rule.get("type") == "required_status_checks" for page in rules for rule in page):
++            return None
++    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError,
++            IndexError, AttributeError):
++        return None  # advisory only: gate setup/auth errors are RuntimeError subclasses
++    return ("completion_contract " + contract + ": " + _kpa.NO_REQUIRED_CHECKS_DETAIL.format(where=f"{repo}@{branch}", repoint=_kpa._REPOINT_HINT)
++            + " Prefer completion_contract='local-only' for this card if no CI applies.")
++
++
++def create_warning_fields(task, *, skip: bool = False, stderr: bool = False) -> dict:
++    """``{"contract_warning": text}`` for a new card whose PR contract's repo has no required
++    checks (printed to stderr too when asked), else ``{}``. Never refuses the create."""
++    contract = getattr(task, "completion_contract", None) if task is not None and not skip else None
++    warning = contract_warning(contract, getattr(task, "assignee", None))
++    if warning and stderr:
++        print(f"⚠  {warning}", file=sys.stderr)
++    return {"contract_warning": warning} if warning else {}
++
++
++def complete_refusal(conn, task_id: str) -> Optional[str]:
++    """The recorded PR-acceptance refusal (with its way out) for a card complete just refused."""
++    task = kb.get_task(conn, task_id)
++    reason = (getattr(task, "last_failure_error", None) or "") if task and task.status != "done" else ""
++    return f"cannot complete {task_id}: {reason}" if reason.startswith("PR acceptance") else None
++
++
++def cmd_edit_contract(args: argparse.Namespace) -> int:
++    """``hermes kanban edit <id> --completion-contract X --reason Y``: the audited way out
++    of a completion gate that can never pass. Orchestrator-only, like unblock: a worker
++    that could re-point its own card's gate would make the gate meaningless. [daveey]"""
++    from hermes_cli.kanban import _OPERATOR_EDIT_FLAGS, _err, _profile_author
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return _err(
++            "kanban edit: --completion-contract is orchestrator-only; a worker can't change its own "
++            "card's gate. Block without a human_request so the owning chat re-points it", 2,
++        )
++    others = [f"--{name.replace('_', '-')}" for name in (
++        "title", "body", "priority", "result", "summary", "metadata", *_OPERATOR_EDIT_FLAGS,
++    ) if getattr(args, name, None) is not None]
++    if others or getattr(args, "force", False):
++        return _err(
++            "kanban edit: --completion-contract can't be combined with other edit flags "
++            f"({', '.join(others) or '--force'}); run them as separate edits", 2,
++        )
++    with kbc.connect_closing() as conn:
++        try:
++            change = kbo.set_completion_contract(
++                conn, args.task_id, args.completion_contract,
++                reason=getattr(args, "reason", None) or "", actor=_profile_author(),
++            )
++        except kbo.KanbanEditRefused as exc:
++            return _err(f"kanban edit: {exc}", 2)
++    if change is None:
++        return _err(f"cannot edit {args.task_id} (unknown id)")
++    if not change:
++        print(f"Edited {args.task_id} (completion_contract unchanged)")
++        return 0
++    print(f"Edited {args.task_id} (completion_contract: {change['old']!r} -> {change['new']!r})")
++    return 0
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index ae9c98d9c6..4d31980910 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -157,8 +157,12 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+             (acceptance_id, task['id'], event[0])).fetchone() if type(acceptance_id) is int else None
+         if acceptance and acceptance[1] is not None and acceptance[1] == event[1]:
+             receipt = json.loads(acceptance[0] or '{}')
+-            contract_verified = bool(isinstance(receipt, dict) and receipt.get('ok') is True
+-                                     and receipt.get('classification') == 'success'
++            # [daveey] A contract_waiver is accepted only on a no_required_checks receipt (kanban_pr_acceptance_store).
++            waived = (receipt.get('classification') == 'no_required_checks'
++                      and isinstance(receipt.get('waived'), dict)) if isinstance(receipt, dict) else False
++            contract_verified = bool(isinstance(receipt, dict)
++                                     and ((receipt.get('ok') is True and receipt.get('classification') == 'success')
++                                          or waived)
+                                      and receipt.get('pr_url') == row[4]
+                                      and isinstance(receipt.get('head_sha'), str)
+                                      and re.fullmatch(r'[0-9a-f]{40}', receipt['head_sha']))
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 7e55103f2e..2417c3e029 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -34,6 +34,22 @@ def validate_contract(value: str | None) -> str:
+     return value
+ 
+ 
++NO_REQUIRED_CHECKS_DETAIL = (
++    "No repository-required checks are configured on {where}, so this PR contract can never pass CI "
++    "acceptance. If the work is verified another way, retry completion with "
++    "metadata.contract_waiver={{\"reason\": \"<how it was verified>\"}} (honoured only while the repo has "
++    "no required checks; logged as a contract_waived event). Otherwise {repoint} Never edit "
++    "completion_contract in kanban.db.")
++
++
++def waiver_reason(metadata) -> str | None:
++    """The stripped reason of ``metadata.contract_waiver`` (``{"reason": str}`` or a bare string), else None."""
++    raw = metadata.get("contract_waiver") if isinstance(metadata, dict) else None
++    if isinstance(raw, dict):
++        raw = raw.get("reason")
++    return raw.strip()[:500] if isinstance(raw, str) and raw.strip() else None
++
++
+ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+          profile_home: str | None = None):
+     from hermes_platform.resolver.github import resolve_gh
+@@ -210,8 +226,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                                     for r in rule["parameters"]["required_status_checks"])
+         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+         if not required:
+-            receipt["detail"] = ("No repository-required checks are configured on the PR's base branch, so "
+-                                 f"{_REPOINT_HINT} (Create non-CI tasks with a local-only contract.)")
++            # A contract that can never pass. Name the one supported way out: nothing can edit
++            # completion_contract after creation, so "use local-only" sent workers to hand-edit
++            # kanban.db (agent-650ad5206a). [daveey]
++            receipt.update(classification="no_required_checks", detail=NO_REQUIRED_CHECKS_DETAIL.format(
++                where=f"{repo}@{branch}", repoint=_REPOINT_HINT))
+             return receipt
+         phase = "reading check runs"
+         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
+diff --git a/hermes_cli/kanban_pr_acceptance_store.py b/hermes_cli/kanban_pr_acceptance_store.py
+index 162a5a3189..e7433c34cf 100644
+--- a/hermes_cli/kanban_pr_acceptance_store.py
++++ b/hermes_cli/kanban_pr_acceptance_store.py
+@@ -49,7 +49,13 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+     # The assignee profile's gh login owns the repo: acceptance must not run as
+     # the ambient login of whichever process completes the card (#122689).
+     assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
+-    return snapshot, _kpa.collect_acceptance(contract, published_pr, assignee=assignee)
++    receipt = _kpa.collect_acceptance(contract, published_pr, assignee=assignee)
++    reason = _kpa.waiver_reason(metadata)
++    if reason and receipt.get("classification") == "no_required_checks":
++        # The only waivable classification, judged on THIS fresh read: a repo that gained
++        # required checks (or a failing/missing/pending check) is never waived. [daveey]
++        receipt["waived"] = {"reason": reason}
++    return snapshot, receipt
+ 
+ 
+ def record_acceptance(conn, task_id, acceptance):
+@@ -59,6 +65,12 @@ def record_acceptance(conn, task_id, acceptance):
+     if _snapshot(conn, task_id) != snapshot:
+         return False
+     _append_event(conn, task_id, "pr_acceptance", receipt, run_id=snapshot[0])
++    if receipt.get("waived") and receipt.get("classification") == "no_required_checks":
++        acceptance_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
++        _append_event(conn, task_id, "contract_waived",
++                      {"reason": receipt["waived"]["reason"], "pr_acceptance_event_id": acceptance_id,
++                       "receipt": receipt}, run_id=snapshot[0])
++        return acceptance_id
+     if not receipt["ok"]:
+         detail = f"PR acceptance {receipt['classification']}: {receipt.get('detail', '')} {receipt['recovery']}"
+         conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", (detail, task_id))
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance.py b/tests/hermes_cli/test_kanban_pr_acceptance.py
+index 6509b6bfda..f96e037523 100644
+--- a/tests/hermes_cli/test_kanban_pr_acceptance.py
++++ b/tests/hermes_cli/test_kanban_pr_acceptance.py
+@@ -20,10 +20,12 @@ def github(tmp_path, monkeypatch):
+             state["requests"].append(self.path)
+             sha = state["head"]
+             if self.path == "/graphql":
++                rule = None if state.get("no_required") else {"requiredStatusChecks": [
++                    {"context": "required", "app": {"databaseId": 1}}]}
+                 value = {"data": {"repository": {"pullRequest": {
+                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
++                    "baseRef": {"branchProtectionRule": rule}},
++                    "defaultBranchRef": {"name": "main", "branchProtectionRule": rule}}}}
+             elif "/rules/branches/" in self.path:
+                 value = [[]]
+             elif "/check-runs" in self.path:
+@@ -268,3 +270,119 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
+             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+     assert receipt["classification"] == "auth"
+     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
++
++
++# --- contract waiver: an OWNER/REPO contract on a repo with NO required checks (agent-650ad5206a) ---
++# Such a contract could never pass acceptance and nothing could change it after creation, so workers
++# stalled and then rewrote completion_contract in kanban.db by hand. The supported way out is
++# metadata.contract_waiver, honoured only when a fresh read shows zero required checks.
++
++_PR7 = "https://github.com/acme/repo/pull/7"
++_WAIVER = {"reason": "repo has no CI; tests ran locally"}
++
++
++def _events(conn, tid, kind):
++    return [json.loads(r[0]) for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, kind))]
++
++
++@pytest.mark.platforms("linux")
++def test_no_required_checks_names_the_waiver_and_waiver_completes(github):
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++
++    github["no_required"] = True
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
++        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": _PR7})
++        receipt = _events(conn, tid, "pr_acceptance")[-1]
++        assert receipt["classification"] == "no_required_checks"
++        assert "contract_waiver" in receipt["detail"]
++        assert "contract_waiver" in kb.get_task(conn, tid).last_failure_error
++        assert not _events(conn, tid, "contract_waived")
++        # An empty reason is not a waiver.
++        assert not kb.complete_task(conn, tid, result="done",
++                                    metadata={"published_pr": _PR7, "contract_waiver": {"reason": " "}})
++        assert kb.complete_task(conn, tid, result="done",
++                                metadata={"published_pr": _PR7, "contract_waiver": _WAIVER})
++        assert kb.get_task(conn, tid).status == "done"
++        waived = _events(conn, tid, "contract_waived")
++        assert len(waived) == 1 and waived[0]["reason"] == _WAIVER["reason"]
++        assert waived[0]["receipt"]["classification"] == "no_required_checks"
++        assert waived[0]["receipt"]["pr_url"] == _PR7
++        conn.execute("SAVEPOINT observation")
++        try:
++            obs = observe_owner_task(conn, {"id": tid, "status": "done"}, now=123)["origin_observation"]
++        finally:
++            conn.execute("RELEASE observation")
++        assert obs["verified"]
++
++
++@pytest.mark.platforms("linux")
++def test_waiver_never_bypasses_configured_required_checks(github):
++    with connect() as conn:
++        for fault in ("failure", "missing", "pending"):
++            github.update(conclusion="failure" if fault == "failure" else
++                          "pending" if fault == "pending" else "success", head="a" * 40)
++            if fault == "missing":
++                github["missing"] = True
++            tid = kb.create_task(conn, title=fault, completion_contract="acme/repo")
++            assert not kb.complete_task(conn, tid, result="done",
++                                        metadata={"published_pr": _PR7, "contract_waiver": _WAIVER})
++            assert kb.get_task(conn, tid).status != "done"
++            assert not _events(conn, tid, "contract_waived")
++            github.pop("missing", None)
++
++
++@pytest.mark.platforms("linux")
++def test_waiver_via_kanban_complete_tool(github, monkeypatch):
++    from tools import kanban_tools as kt
++
++    github["no_required"] = True
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
++        run_id = kb.claim_task(conn, tid).current_run_id
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    refused = json.loads(kt._handle_complete({"summary": "shipped", "metadata": {"published_pr": _PR7}}))
++    assert refused.get("ok") is not True and "contract_waiver" in json.dumps(refused)
++    out = json.loads(kt._handle_complete({"summary": "shipped",
++                                          "metadata": {"published_pr": _PR7, "contract_waiver": _WAIVER}}))
++    assert out["ok"] is True
++    with connect() as conn:
++        assert kb.get_task(conn, tid).status == "done"
++        assert _events(conn, tid, "contract_waived")
++
++
++@pytest.mark.platforms("linux")
++def test_waiver_via_cli_complete(github):
++    from hermes_cli import kanban as kc
++
++    github["no_required"] = True
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
++    meta = json.dumps({"published_pr": _PR7})
++    refused = kc.run_slash(f"complete {tid} --summary shipped --metadata '{meta}'")
++    assert "contract_waiver" in refused, refused
++    meta = json.dumps({"published_pr": _PR7, "contract_waiver": _WAIVER})
++    kc.run_slash(f"complete {tid} --summary shipped --metadata '{meta}'")
++    with connect() as conn:
++        assert kb.get_task(conn, tid).status == "done"
++        assert _events(conn, tid, "contract_waived")
++
++
++@pytest.mark.platforms("linux")
++def test_create_warns_when_contract_repo_has_no_required_checks(github, monkeypatch):
++    from hermes_cli import kanban as kc
++    from tools import kanban_tools as kt
++
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    github["no_required"] = True
++    out = json.loads(kt._handle_create({"title": "pr work", "assignee": "default", "requires": [],
++                                        "completion_contract": "acme/repo"}))
++    assert out["ok"] is True and "contract_waiver" in out.get("contract_warning", "")
++    cli = kc.run_slash("create 'pr work 2' --completion-contract acme/repo")
++    assert "contract_waiver" in cli, cli
++    github["no_required"] = False
++    out = json.loads(kt._handle_create({"title": "pr work 3", "assignee": "default", "requires": [],
++                                        "completion_contract": "acme/repo"}))
++    assert out["ok"] is True and "contract_warning" not in out
+diff --git a/tests/hermes_cli/test_kanban_pr_transport.py b/tests/hermes_cli/test_kanban_pr_transport.py
+index 55a9b53ad1..7268b0a7c6 100644
+--- a/tests/hermes_cli/test_kanban_pr_transport.py
++++ b/tests/hermes_cli/test_kanban_pr_transport.py
+@@ -126,6 +126,8 @@ def test_no_required_checks_names_the_repoint_path(monkeypatch):
+         "baseRef": {"branchProtectionRule": None}}}}}
+     monkeypatch.setattr(gate, "_api", lambda endpoint, **kw: pr if endpoint == "graphql" else [[]])
+     receipt = gate.collect_acceptance("https://github.com/acme/repo/pull/7", None)
+-    assert receipt["ok"] is False and receipt["classification"] == "missing"
++    # Its own classification (the only waivable one), naming the worker's waiver AND the re-point.
++    assert receipt["ok"] is False and receipt["classification"] == "no_required_checks"
+     assert "No repository-required checks" in receipt["detail"]
+     assert "--completion-contract" in receipt["detail"]
++    assert "contract_waiver" in receipt["detail"]
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 8037c100cc..43043ecb0d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -20,7 +20,7 @@ from hermes_cli.goals import handoff_judge_goal, judge_goal
+ from tools.registry import no_cache_check_fn, registry, tool_error
+ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+-from hermes_cli import kanban_overlap
++from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap
+ from tools.kanban_tools_placement import _marker_placement_fields, _placement_refused, _runs_where
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_schemas import (
+@@ -1859,9 +1859,9 @@ def _handle_create(args: dict, **kw) -> str:
+                 extra["placement"] = {"where": "local", "runs_on": runs_on, "machine": pinned_machine}
+                 extra["note"] = (f"Created here as {new_tid}; it runs on {pinned_machine} via the board lease "
+                                  f"(runs_on={runs_on}). The pin was honoured: do not re-create it.")
+-        # Every result says where the card runs (`placed` for a routed card, `runs_on` for a board-lease card):
+-        # a caller that can't tell re-creates it, or never learns it is stranded. [daveey]
+-        extra["runs_where"] = _runs_where(runs_on, pinned_machine, marker_placement)
++        # Every result says where the card runs (a caller that can't tell re-creates it or never learns it is stranded)
++        extra.update(runs_where=_runs_where(runs_on, pinned_machine, marker_placement),  # + contract advisory [daveey]
++                     **_contract_cli.create_warning_fields(kb.get_task(conn, new_tid)))
+         if origin_intent is not None:
+             # The courier is not a chat: the bound origin is subscribed from the binding in the same txn
+             # (kanban_origin_creation._subscribe_origin), never the receiving process's ambient session. [daveey]
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index b9db74f5b8..de7eab5044 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -802,7 +802,9 @@ KANBAN_CREATE_SCHEMA = _schema(
+         )),
+         "completion_contract": _prop("string", (
+             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+-            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
++            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr. "
++            "A repo with no required checks can only complete with metadata.contract_waiver={\"reason\": ...} "
++            "(prefer local-only there)."
+         )),
+         "goal_max_turns": _prop("integer", (
+                 "Turn budget for goal_mode workers. Caps how many "
+-- 
+2.55.0
+

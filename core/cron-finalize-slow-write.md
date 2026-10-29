@@ -1,6 +1,6 @@
 # Cron finalization survives a slow state.db write
 
-Patch: 0735 (fork `15ef9412b5`).
+Patch: 0875 (fork `15ef9412b5`).
 
 ## Behavior
 
@@ -43,7 +43,7 @@ Ran for this mirror on fork `origin/main` `a65917ae05` with the hub test-environ
 
 ## Applying
 
-Append after 0734. Do not renumber 0729 or 0730: those were published ahead of this range. See the numbering note in [README.md](README.md).
+Append after 0874. Do not renumber 0877 or 0879: those were published ahead of this range. See the numbering note in [README.md](README.md).
 
 ## Gotchas
 

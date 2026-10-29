@@ -1,6 +1,6 @@
 # Exhausted-provider recovery (not first-run setup)
 
-Patch **0521** (source `42b8d9b755`; public series position 0521 after the 2026-10-27 reconciliation).
+Patch **0528** (source `42b8d9b755`; public series position 0528 after the 2026-10-27 reconciliation).
 
 ## Behavior
 
@@ -50,7 +50,7 @@ gateway contracts (`contracts/events.py`, `common.py`, `config_free_tier_control
 
 ## Applying
 
-`git am -3 core/patches/0521-*.patch` after `0520`. Run `bash scripts/run-in-hermes-env python3 scripts/gen_gateway_contracts.py` if contracts drift, and `npm run i18n:keys`.
+`git am -3 core/patches/0528-*.patch` after `0527`. Run `bash scripts/run-in-hermes-env python3 scripts/gen_gateway_contracts.py` if contracts drift, and `npm run i18n:keys`.
 
 ## Gotchas
 

@@ -1,0 +1,345 @@
+From 0af1a2acd89feaff179e477dc35312bb1af24d53 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:12:35 +0000
+Subject: [PATCH] fix(kanban): let a sweep worker archive a provably stranded
+ runs_on copy [daveey]
+
+A ready card pinned runs_on=[machine:<m>] to a machine without advertised
+pickup is never claimed. Once a sweep re-filed it on that machine, no worker
+could archive the dead copy: archive scope allowed only the creator's task.
+Allow a foreign archive when the card is ready, never claimed, every machine:
+label is refused by placement_runs_on against a reachable registry, and a
+comment says it was re-filed naming the copy. The archived event records
+via: stranded-runs_on sweep by <task id>.
+---
+ hermes_cli/kanban.py                        |  84 +++++++++--
+ hermes_cli/kanban_db.py                     |   7 +-
+ tests/tools/test_kanban_stranded_archive.py | 150 ++++++++++++++++++++
+ tools/kanban_tools.py                       |   6 +-
+ 4 files changed, 230 insertions(+), 17 deletions(-)
+ create mode 100644 tests/tools/test_kanban_stranded_archive.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 1f5382e00e..e4e2fa06fa 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -10,6 +10,7 @@ import argparse
+ import contextlib
+ import json
+ import os
++import re
+ import shlex
+ import sys
+ import time
+@@ -1022,25 +1023,83 @@ def _creator_task_id(conn, task_id: str) -> Optional[str]:
+         return None
+ 
+ 
+-def worker_may_archive(conn, task_id: str) -> Optional[str]:
+-    """None if this process may archive ``task_id``, else the refusal.
++_TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{16}\b")
++_REFILED_RE = re.compile(r"\bre-?filed\b", re.IGNORECASE)
+ 
+-    A dispatcher worker may archive an unclaimed card its own task created
+-    (``creator_task_id`` is ``HERMES_KANBAN_TASK``). Every other foreign card is
+-    refused — that is the "scoped worker can't archive it" wall. No env task
+-    (a human or an orchestrator) may archive any card, as before.
++
++def _is_stranded_runs_on_copy(conn, task) -> bool:
++    """A foreign card no machine will ever run, already re-filed elsewhere. [daveey]
++
++    All must hold: ``ready``; no ``claimed`` event ever; ``runs_on`` has at least one
++    ``machine:<m>`` label and every such ``<m>`` is another gateway that
++    ``placement_runs_on`` refuses today (no advertised pickup), read from a reachable
++    machine registry; and a comment says it was re-filed, naming another task id.
++    """
++    from hermes_cli import kanban_db_sync as ksync
++    from hermes_cli import kanban_worker_node as wn
++
++    if task.status != "ready":
++        return False
++    if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' LIMIT 1",
++                    (task.id,)).fetchone():
++        return False
++    try:
++        if "runs_on" not in ksync.table_columns(conn, "tasks"):
++            return False
++        row = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (task.id,)).fetchone()
++        machines = [label.split(":", 1)[1] for label in (wn._parse(row[0] if row else None) or [])
++                    if label.startswith("machine:")]
++        if not machines or wn.registry() is None:
++            return False
++        own = wn._own(conn)
++        if any(not m or m == own or wn.placement_runs_on(conn, m) for m in machines):
++            return False
++    except Exception:  # health: allow BLE001 -- unreadable sync state: not provably stranded, refuse
++        return False
++    for (body,) in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (task.id,)):
++        body = body or ""
++        if _REFILED_RE.search(body) and any(t != task.id for t in _TASK_ID_RE.findall(body)):
++            return True
++    return False
++
++
++def worker_archive_scope(conn, task_id: str) -> tuple[Optional[str], Optional[str]]:
++    """``(refusal, via)`` for archiving ``task_id`` from this process.
++
++    ``refusal`` is None when allowed. ``via`` is set when the archive is allowed only
++    as a stranded-``runs_on`` sweep of a foreign card; record it on the archived event.
+     """
+     env_tid = os.environ.get("HERMES_KANBAN_TASK")
+     if not env_tid:
+-        return None
++        return None, None
+     if env_tid == task_id:
+-        return ("refusing to archive the assigned task; finish it with kanban_complete")
++        return ("refusing to archive the assigned task; finish it with kanban_complete"), None
+     task = kb.get_task(conn, task_id)
+     if task is None:
+-        return f"no such task: {task_id}"
++        return f"no such task: {task_id}", None
+     if _creator_task_id(conn, task_id) != env_tid:
++        if not (task.claim_lock or task.worker_pid) and _is_stranded_runs_on_copy(conn, task):
++            return None, f"stranded-runs_on sweep by {env_tid}"
+         return (f"worker is scoped to task {env_tid}; refusing to archive {task_id}. "
+-                "A worker may archive only an unclaimed card its own task created.")
++                "A worker may archive only an unclaimed card its own task created."), None
++    return _worker_may_archive_own(task), None
++
++
++def worker_may_archive(conn, task_id: str) -> Optional[str]:
++    """None if this process may archive ``task_id``, else the refusal.
++
++    A dispatcher worker may archive an unclaimed card its own task created
++    (``creator_task_id`` is ``HERMES_KANBAN_TASK``), or a foreign card that is a
++    provably stranded ``runs_on`` copy (see ``_is_stranded_runs_on_copy``). Every
++    other foreign card is refused — that is the "scoped worker can't archive it"
++    wall. No env task (a human or an orchestrator) may archive any card, as before.
++    """
++    return worker_archive_scope(conn, task_id)[0]
++
++
++def _worker_may_archive_own(task) -> Optional[str]:
++    """The refusal for a card this worker's task created, else None."""
++    task_id = task.id
+     if task.status == "running" or task.claim_lock or task.worker_pid:
+         return (f"cannot archive {task_id}: it is claimed (status={task.status}). "
+                 "A worker may archive only an unclaimed card its own task created.")
+@@ -1468,11 +1527,12 @@ def _cmd_archive(args: argparse.Namespace) -> int:
+         if purge_ids:
+             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
+                                lambda tid: f"cannot delete {tid} (must already be archived)")
++        vias: dict[str, Optional[str]] = {}
+         for tid in ids:
+-            refusal = worker_may_archive(conn, tid)
++            refusal, vias[tid] = worker_archive_scope(conn, tid)
+             if refusal:
+                 return _err(refusal)
+-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
++        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid, via=vias.get(tid)),
+                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+ 
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 88c9b39fd7..4c88960f72 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -4136,7 +4136,7 @@ def specify_triage_task(
+     return True
+ 
+ 
+-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
++def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None) -> bool:
+     """Archive a task; a *running* task's host-local worker is terminated.
+ 
+     Clearing ``worker_pid`` in the DB alone left the OS process running past its
+@@ -4171,7 +4171,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
+             conn, task_id, outcome="reclaimed", status="reclaimed",
+             summary="task archived with run still active",
+         )
+-        _append_event(conn, task_id, "archived", {"source_status": row["status"]}, run_id=run_id)
++        payload = {"source_status": row["status"]}
++        if via:
++            payload["via"] = via  # archived outside the creator scope (stranded-runs_on sweep) [daveey]
++        _append_event(conn, task_id, "archived", payload, run_id=run_id)
+     if was_running:
+         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+         with write_txn(conn):
+diff --git a/tests/tools/test_kanban_stranded_archive.py b/tests/tools/test_kanban_stranded_archive.py
+new file mode 100644
+index 0000000000..120fc721e0
+--- /dev/null
++++ b/tests/tools/test_kanban_stranded_archive.py
+@@ -0,0 +1,150 @@
++"""A sweep worker may archive a foreign card that is provably stranded. [daveey]
++
++A card pinned ``runs_on=[machine:<m>]`` to a machine that does not advertise pickup is never
++claimed. Once a sweep has re-filed it on that machine (and said so in a comment), no worker could
++archive the dead copy: the archive scope only lets the creator's task do it, and the creator may
++be done. The stranded case: ``ready``, never claimed, every ``machine:`` label names a machine
++``placement_runs_on`` refuses today, and a comment names the re-filed copy. Everything else is
++refused as before.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_db_connect import connect
++
++MACHINES = [
++    {"name": "hub", "state": "active", "labels": ["linux"]},
++    {"name": "macbook", "state": "active", "labels": ["macos"], "pinned_only": True},  # no pickup
++    {"name": "worker-1", "state": "active", "labels": ["linux"], "pickup": "all"},
++]
++REFILED = "t_0123456789abcdef"
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    (home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    db = home / "kanban.db"
++    conn = connect(db)
++    ksc.ensure_identity(conn, "default", "hub")
++    sync.set_mode(conn, "primary")
++    wn.set_registry_fetch(lambda: {"me": "hub", "machines": MACHINES})
++    sweeper = kb.create_task(conn, title="sweeper")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", sweeper)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    yield conn, sweeper
++    wn.set_registry_fetch(None)
++    conn.close()
++
++
++def _stranded(conn, runs_on=("machine:macbook",), comment=True):
++    other_creator = kb.create_task(conn, title="creator")
++    tid = kb.create_task(conn, title="stranded", creator_task_id=other_creator)
++    if runs_on is not None:
++        wn.set_runs_on(conn, tid, list(runs_on))
++    if comment:
++        kb.add_comment(conn, tid, "default", f"Stranded. Re-filed on macbook as {REFILED}. -- sweep")
++    assert kb.get_task(conn, tid).status == "ready"
++    return tid
++
++
++def _archive(tid):
++    from tools import kanban_tools as kt
++
++    return json.loads(kt._handle_archive({"task_id": tid}))
++
++
++def _archived_payload(conn, tid):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived' "
++                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++    return json.loads(row[0]) if row and row[0] else None
++
++
++def test_sweep_worker_archives_a_provably_stranded_foreign_card(board):
++    conn, sweeper = board
++    tid = _stranded(conn)
++    out = _archive(tid)
++    assert out.get("ok") and out["task_id"] == tid, out
++    assert kb.get_task(conn, tid).status == "archived"
++    assert _archived_payload(conn, tid)["via"] == f"stranded-runs_on sweep by {sweeper}"
++
++
++def test_cli_archive_of_a_stranded_card_records_the_sweep(board, capsys):
++    from hermes_cli.kanban import _cmd_archive
++
++    conn, sweeper = board
++    tid = _stranded(conn)
++    assert _cmd_archive(SimpleNamespace(task_ids=[tid], purge_ids=[])) == 0, capsys.readouterr().err
++    assert kb.get_task(conn, tid).status == "archived"
++    assert _archived_payload(conn, tid)["via"] == f"stranded-runs_on sweep by {sweeper}"
++
++
++def test_stranded_card_with_a_claimed_event_is_refused(board):
++    conn, sweeper = board
++    tid = _stranded(conn)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "claimed", {"lock": "x"})
++    out = _archive(tid)
++    assert out.get("ok") is not True and sweeper in out["error"], out
++    assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_running_stranded_card_is_refused(board):
++    conn, _ = board
++    tid = _stranded(conn)
++    conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++    conn.commit()
++    out = _archive(tid)
++    assert out.get("ok") is not True, out
++    assert kb.get_task(conn, tid).status == "running"
++
++
++def test_card_for_a_machine_that_advertises_pickup_is_refused(board):
++    conn, _ = board
++    tid = _stranded(conn, runs_on=("machine:worker-1",))
++    out = _archive(tid)
++    assert out.get("ok") is not True, out
++    assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_card_without_runs_on_is_refused(board):
++    conn, _ = board
++    tid = _stranded(conn, runs_on=None)
++    out = _archive(tid)
++    assert out.get("ok") is not True, out
++    assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_stranded_card_without_a_refiled_comment_is_refused(board):
++    conn, _ = board
++    tid = _stranded(conn, comment=False)
++    out = _archive(tid)
++    assert out.get("ok") is not True, out
++    assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_card_is_refused_when_the_machine_registry_is_unreachable(board):
++    conn, _ = board
++    tid = _stranded(conn)
++
++    def _down():
++        raise OSError("registry down")
++
++    wn.set_registry_fetch(_down)
++    out = _archive(tid)
++    assert out.get("ok") is not True, out
++    assert kb.get_task(conn, tid).status == "ready"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index c3a628aa9e..d8f30d44ee 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1973,11 +1973,11 @@ def _handle_archive(args: dict, **kw) -> str:
+     _check(tid, "task_id is required")
+     tid = str(tid)
+     with _board(args.get("board")) as (kb, conn):
+-        from hermes_cli.kanban import worker_may_archive
+-        refusal = worker_may_archive(conn, tid)
++        from hermes_cli.kanban import worker_archive_scope
++        refusal, via = worker_archive_scope(conn, tid)
+         if refusal:
+             raise _Reject(refusal)
+-        _check(kb.archive_task(conn, tid), f"cannot archive {tid}")
++        _check(kb.archive_task(conn, tid, via=via), f"cannot archive {tid}")
+         return _ok(task_id=tid, status="archived")
+ 
+ 
+-- 
+2.55.0
+

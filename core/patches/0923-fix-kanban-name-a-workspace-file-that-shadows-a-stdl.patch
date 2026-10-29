@@ -1,0 +1,396 @@
+From b3f78f0a909f5085958fda93afcea0364f259990 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 03:53:22 +0000
+Subject: [PATCH] fix(kanban): name a workspace file that shadows a stdlib
+ module in a start-up crash; block it at once [daveey]
+
+What: when a worker exits non-zero before its first heartbeat, the dispatcher lists top-level
+<stdlib-name>.py files in the task workspace and appends "workspace file inspect.py shadows stdlib
+module inspect. Rename it ..." to the crash error (event payload: workspace_stdlib_shadows). When
+the worker log also carries a traceback frame from that file, the card is blocked at once as
+`assignment` instead of being retried. The regression test also runs the real worker argv with
+--version from a workspace holding a failing inspect.py (green with the -P argv from PR #153).
+
+Why: hub cards t_01a185a36329ca4e and t_01a18555704bff20 wrote a helper inspect.py; `python -m
+hermes_cli.main` put the cwd first on sys.path, dataclasses imported the helper, and each card
+crash-looped ("exited with code 1") until the breaker gave up, with supervisors blaming
+unrelated log lines. Self-heal defects kanban-3ba0fd6351 / kanban-50a03854e8.
+
+Red: on 6db9b6d0bb the 3 contract tests fail (no hint, retried instead of blocked, argv imports
+the workspace inspect.py). Green: 5 passed with this commit on top of #153.
+---
+ hermes_cli/kanban_db_dispatch.py              |  26 ++--
+ hermes_cli/kanban_db_dispatch_exit_code.py    |  19 +++
+ hermes_cli/kanban_workspace_shadow.py         | 112 ++++++++++++++
+ .../test_kanban_workspace_stdlib_shadow.py    | 142 ++++++++++++++++++
+ 4 files changed, 283 insertions(+), 16 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_exit_code.py
+ create mode 100644 hermes_cli/kanban_workspace_shadow.py
+ create mode 100644 tests/hermes_cli/test_kanban_workspace_stdlib_shadow.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 325dd37136..00f5ead657 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -31,6 +31,7 @@ from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+ from hermes_cli import kanban_db_dispatch_guard_notice as _guard_notice
+ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as _guard_hold_started_at
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
++from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code_kind
+ from hermes_cli import kanban_worker_scope as _worker_scope
+ from hermes_cli.kanban_db_dispatch_queries import lane_rows
+ 
+@@ -365,17 +366,6 @@ def _classify_worker_exit(pid: int) -> tuple[str, Optional[int]]:
+     return ("unknown", None)
+ 
+ 
+-def _exit_code_kind(code: int) -> tuple[str, int]:
+-    """``(kind, code)`` for a worker's exit code, however it was observed."""
+-    if code == 0:
+-        return ("clean_exit", 0)
+-    if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
+-        return ("rate_limited", code)
+-    if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
+-        return ("terminal_provider", code)
+-    return ("nonzero_exit", code)
+-
+-
+ _EXIT_TRAILER_RE = re.compile(
+     r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+ )
+@@ -1293,6 +1283,7 @@ class _DeadWorker:
+     terminal_provider: bool = False
+     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's credential/model — trips at once."""
+     unknown_skill: bool = False  # died of ``Unknown skill(s)``: blocked as ``assignment`` at once [daveey]
++    stdlib_shadow: bool = False  # traceback from a workspace ``<stdlib>.py``: blocked at once [daveey]
+ 
+     @property
+     def run_outcome(self) -> str:
+@@ -1331,6 +1322,9 @@ def _classify_dead_worker(
+             dead.error_text += f" Worker's last output: {worker_output!r}"
+             dead.event_payload["worker_output"] = worker_output
+             dead.unknown_skill = dead.kind == "nonzero_exit" and "Unknown skill(s):" in worker_output
++    if task_id and dead.kind == "nonzero_exit":  # name a workspace <stdlib>.py [daveey]
++        from hermes_cli.kanban_workspace_shadow import note_dead_worker
++        note_dead_worker(dead, conn, task_id, run_id, board)
+     return dead
+ 
+ 
+@@ -1538,8 +1532,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                     "protocol_violation_limit": violation_limit,
+                 },
+             )
+-        elif dead.terminal_provider or dead.unknown_skill:
+-            # No retry heals a revoked credential, a gone model or a missing pinned skill: block now, sticky.
++        elif dead.terminal_provider or dead.unknown_skill or dead.stdlib_shadow:
++            # No retry heals a revoked credential, a gone model, a missing skill or a stdlib shadow: block now.
++            flag = "unknown_skill" if dead.unknown_skill else "stdlib_shadow" if dead.stdlib_shadow else "terminal_provider"
+             tripped = _record_task_failure(
+                 conn, tid,
+                 error=error_text,
+@@ -1547,9 +1542,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                 force_trip=True,
+                 release_claim=False,
+                 end_run=False,
+-                event_payload_extra={"pid": pid, "claimer": claimer,
+-                                     "unknown_skill" if dead.unknown_skill else "terminal_provider": True},
+-                block_kind="assignment" if dead.unknown_skill else "transient",
++                event_payload_extra={"pid": pid, "claimer": claimer, flag: True},
++                block_kind="transient" if dead.terminal_provider else "assignment",
+             )
+         else:
+             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+diff --git a/hermes_cli/kanban_db_dispatch_exit_code.py b/hermes_cli/kanban_db_dispatch_exit_code.py
+new file mode 100644
+index 0000000000..11d2ca1f89
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_exit_code.py
+@@ -0,0 +1,19 @@
++"""Classify a dead Kanban worker's exit code. [daveey]
++
++Split out of ``kanban_db_dispatch`` (code-health file cap).
++"""
++
++from __future__ import annotations
++
++
++def exit_code_kind(code: int) -> tuple[str, int]:
++    """``(kind, code)`` for a worker's exit code, however it was observed."""
++    from hermes_cli import kanban_db as kb
++
++    if code == 0:
++        return ("clean_exit", 0)
++    if code == kb.KANBAN_RATE_LIMIT_EXIT_CODE:
++        return ("rate_limited", code)
++    if code == kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
++        return ("terminal_provider", code)
++    return ("nonzero_exit", code)
+diff --git a/hermes_cli/kanban_workspace_shadow.py b/hermes_cli/kanban_workspace_shadow.py
+new file mode 100644
+index 0000000000..a744b8c4bc
+--- /dev/null
++++ b/hermes_cli/kanban_workspace_shadow.py
+@@ -0,0 +1,112 @@
++"""Name the workspace file that shadowed a Python stdlib module in a dead worker. [daveey]
++
++A Kanban worker starts inside its task workspace, where agents write scratch scripts. A
++helper named like a stdlib module (``inspect.py``) used to win over the real module when
++the worker started (``python -m`` puts the cwd first on ``sys.path``), so every respawn
++ran the helper and exited before the agent did anything. The crash was booked as a plain
++``exited with code 1`` and retried until the breaker gave up; supervisors chased unrelated
++log lines. The module-form worker now runs with ``-P``; this is the detection layer for any
++launch path that still trusts the cwd:
++
++* ``startup_shadows`` lists top-level ``<stdlib-name>.py`` files in a workspace when the run
++  died before its first heartbeat, so the crash error says which file to rename;
++* ``traceback_hits`` reports the ones the worker's log tail shows a traceback frame from,
++  which proves the shadow caused the death: the dispatcher blocks that card at once instead
++  of retrying a deterministic failure.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import sys
++from pathlib import Path
++from typing import Optional
++
++# Names a top-level script commonly carries without being imported by anything at start-up.
++_IGNORED = frozenset({"__main__", "this", "antigravity"})
++
++
++def stdlib_shadows(workspace: Optional[Path]) -> list[str]:
++    """Top-level ``*.py`` files in ``workspace`` whose stem is a stdlib module name, sorted."""
++    if workspace is None:
++        return []
++    try:
++        entries = list(workspace.iterdir())
++    except OSError:
++        return []
++    names = sys.stdlib_module_names
++    return sorted(
++        p.name for p in entries
++        if p.suffix == ".py" and p.stem in names and p.stem not in _IGNORED and p.is_file()
++    )
++
++
++def _workspace_for(conn: sqlite3.Connection, task_id: str, board: Optional[str]) -> Optional[Path]:
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    raw = row[0] if row is not None else None
++    path = Path(raw).expanduser() if raw else kb.workspaces_root(board=board) / task_id
++    return path if path.is_absolute() and path.is_dir() else None
++
++
++def _run_had_heartbeat(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> bool:
++    if run_id is None:
++        return False
++    row = conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'heartbeat' LIMIT 1",
++        (task_id, run_id),
++    ).fetchone()
++    return row is not None
++
++
++def startup_shadows(
++    conn: Optional[sqlite3.Connection], task_id: str, run_id: Optional[int], board: Optional[str],
++) -> tuple[Optional[Path], list[str]]:
++    """``(workspace, shadow file names)`` for a run that died before its first heartbeat.
++
++    Returns ``(None, [])`` when the run heartbeat (it got past start-up) or nothing shadows.
++    Never raises: this only adds a hint to a crash that is already being booked.
++    """
++    if conn is None:
++        return None, []
++    try:
++        if _run_had_heartbeat(conn, task_id, run_id):
++            return None, []
++        workspace = _workspace_for(conn, task_id, board)
++        return workspace, stdlib_shadows(workspace)
++    except (sqlite3.Error, OSError, ValueError):
++        return None, []
++
++
++def traceback_hits(workspace: Path, shadows: list[str], log_tail: str) -> list[str]:
++    """Shadow files that appear as a traceback frame (``File "<workspace>/<name>"``) in the log."""
++    hits = []
++    for name in shadows:
++        frame = f'File "{workspace / name}"'
++        if frame in log_tail:
++            hits.append(name)
++    return hits
++
++
++def hint(shadows: list[str], proven: list[str]) -> str:
++    """One sentence for the crash error naming each shadow file and the fix."""
++    parts = [f"{name} shadows stdlib module {name[:-3]}" for name in shadows]
++    lead = "Worker died at start-up because workspace file " if proven else (
++        "Worker died before its first heartbeat; workspace file ")
++    return (f" {lead}{'; '.join(parts)}. Rename it (e.g. {shadows[0][:-3]}_helper.py) "
++            "and send the card back to ready.")
++
++
++def note_dead_worker(dead, conn, task_id: str, run_id: Optional[int], board: Optional[str]) -> None:
++    """Append the shadow hint to a dead worker's crash error; flag it to block at once when proven."""
++    from hermes_cli import kanban_db as kb
++
++    workspace, shadows = startup_shadows(conn, task_id, run_id, board)
++    if not shadows or workspace is None:
++        return
++    log_tail = kb.read_worker_log(task_id, tail_bytes=16000, board=board) or ""
++    proven = traceback_hits(workspace, shadows, log_tail)
++    dead.error_text += hint(shadows, proven)
++    dead.event_payload["workspace_stdlib_shadows"] = shadows
++    dead.stdlib_shadow = bool(proven)
+diff --git a/tests/hermes_cli/test_kanban_workspace_stdlib_shadow.py b/tests/hermes_cli/test_kanban_workspace_stdlib_shadow.py
+new file mode 100644
+index 0000000000..c183110f3a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_workspace_stdlib_shadow.py
+@@ -0,0 +1,142 @@
++"""A task workspace file named like a stdlib module must not crash-loop its card. [daveey]
++
++Hub cards t_01a185a36329ca4e and t_01a18555704bff20 wrote a helper ``inspect.py`` into their
++workspace. The worker starts in the workspace as ``python -m hermes_cli.main``, ``-m`` put the
++cwd first on ``sys.path``, ``dataclasses`` imported the helper instead of the stdlib
++``inspect``, and every respawn died in ~15 s with ``exited with code 1`` until the breaker gave
++up. Contracts:
++
++* the worker argv the dispatcher really builds starts from such a workspace (``--version``
++  rc 0), i.e. the cwd is not on the worker's import path;
++* a pre-heartbeat crash with a stdlib-named file in the workspace names that file in the
++  crash error; with a traceback frame from it the card is blocked at once (``assignment``),
++  never retried; a run that heartbeat, or a workspace with no such file, is booked as before.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_workspace_shadow as shadow
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++_FAKE_INSPECT = "import sys\nprint('FAKE inspect from the workspace')\nsys.exit(1)\n"
++
++
++def test_worker_argv_starts_from_workspace_holding_inspect_py(tmp_path, monkeypatch):
++    workspace = tmp_path / "ws"
++    workspace.mkdir()
++    (workspace / "inspect.py").write_text(_FAKE_INSPECT, encoding="utf-8")
++    monkeypatch.delenv("HERMES_BIN", raising=False)
++    argv = kbd._resolve_hermes_argv()
++    env = {k: v for k, v in os.environ.items() if k != "PYTHONSAFEPATH"}
++    env["PYTHONPATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
++    r = subprocess.run([*argv, "--version"], cwd=workspace, env=env, capture_output=True, text=True,
++                       timeout=60, check=False)
++    assert "FAKE inspect" not in r.stdout + r.stderr, (argv, r.stdout[-400:], r.stderr[-400:])
++    assert r.returncode == 0, (argv, r.returncode, r.stdout[-400:], r.stderr[-400:])
++
++
++def test_stdlib_shadows_lists_only_top_level_stdlib_names(tmp_path):
++    (tmp_path / "inspect.py").write_text("", encoding="utf-8")
++    (tmp_path / "json.py").write_text("", encoding="utf-8")
++    (tmp_path / "probe.py").write_text("", encoding="utf-8")
++    (tmp_path / "sub").mkdir()
++    (tmp_path / "sub" / "os.py").write_text("", encoding="utf-8")
++    assert shadow.stdlib_shadows(tmp_path) == ["inspect.py", "json.py"]
++    assert shadow.stdlib_shadows(tmp_path / "missing") == []
++
++
++# dispatcher booking ------------------------------------------------------------------------
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in ("HERMES_SESSION_KEY", "HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    kb.init_db()
++    return home
++
++
++def _dead_worker(conn, *, log: str, files: dict[str, str], heartbeat: bool = False, pid: int = 73000):
++    host = kb._claimer_id().split(":", 1)[0]
++    tid = kb.create_task(conn, title="helper script", assignee="default", max_retries=5)
++    kb.claim_task(conn, tid, claimer=f"{host}:w0")
++    workspace = kb.workspaces_root() / tid
++    workspace.mkdir(parents=True, exist_ok=True)
++    for name, text in files.items():
++        (workspace / name).write_text(text, encoding="utf-8")
++    conn.execute("UPDATE tasks SET worker_pid=?, workspace_path=? WHERE id=?", (pid, str(workspace), tid))
++    conn.commit()
++    if heartbeat:
++        kbd.heartbeat_worker(conn, tid)
++    path = kb.worker_log_path(tid)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(log.replace("{ws}", str(workspace)), encoding="utf-8")
++    kbd._record_worker_exit(pid, 1 << 8)
++    return tid, workspace
++
++
++_TRACEBACK = (
++    "Traceback (most recent call last):\n"
++    '  File "/usr/lib/python3.14/dataclasses.py", line 5, in <module>\n'
++    "    import inspect\n"
++    '  File "{ws}/inspect.py", line 3, in <module>\n'
++    "    raise SystemExit(1)\n"
++)
++
++
++def test_traceback_from_workspace_inspect_py_blocks_at_once_and_names_it(board):
++    with kbc.connect() as conn:
++        tid, _ = _dead_worker(conn, log=_TRACEBACK, files={"inspect.py": _FAKE_INSPECT})
++        assert tid in kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "triage", task.status
++        assert task.block_kind == "assignment", task.block_kind
++        assert task.consecutive_failures == 1
++        assert "inspect.py shadows stdlib module inspect" in task.last_failure_error
++        gave_up = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)).fetchone()
++        assert json.loads(gave_up["payload"])["stdlib_shadow"] is True
++        crashed = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='crashed'", (tid,)).fetchone()
++        assert json.loads(crashed["payload"])["workspace_stdlib_shadows"] == ["inspect.py"]
++
++
++def test_silent_shadow_exit_names_file_but_keeps_retry(board):
++    """The helper ran and exited 1 with its own output (no traceback): hint, normal retry budget."""
++    with kbc.connect() as conn:
++        tid, _ = _dead_worker(conn, log="PR 1929 open RUNS [...]\n", files={"inspect.py": _FAKE_INSPECT})
++        assert tid in kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready", task.status
++        assert "before its first heartbeat; workspace file inspect.py shadows stdlib module inspect" in (
++            task.last_failure_error)
++
++
++def test_crash_after_heartbeat_or_without_shadow_is_unchanged(board):
++    with kbc.connect() as conn:
++        tid, _ = _dead_worker(conn, log=_TRACEBACK, files={"inspect.py": _FAKE_INSPECT}, heartbeat=True)
++        tid2, _ = _dead_worker(conn, log="boom\n", files={"probe.py": ""}, pid=73001)
++        crashed = kbd.detect_crashed_workers(conn)
++        for t in (tid, tid2):
++            assert t in crashed
++            task = kb.get_task(conn, t)
++            assert task.status == "ready", task.status
++            assert "shadows stdlib" not in (task.last_failure_error or "")
+-- 
+2.55.0
+

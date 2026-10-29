@@ -1,7 +1,7 @@
 # `hermes serve` waits out a core update before loading the agent
 
-Patch: [`patches/0697-fix-serve-wait-out-a-core-update-or-the-admission-ho.patch`](patches/0697-fix-serve-wait-out-a-core-update-or-the-admission-ho.patch)
-(fork commit `a4ba7217bd`), and [`patches/0714-fix-serve-re-exec-on-a-no-wait-gate-when-the-cached-.patch`](patches/0714-fix-serve-re-exec-on-a-no-wait-gate-when-the-cached-.patch)
+Patch: [`patches/0720-fix-serve-wait-out-a-core-update-or-the-admission-ho.patch`](patches/0720-fix-serve-wait-out-a-core-update-or-the-admission-ho.patch)
+(fork commit `a4ba7217bd`), and [`patches/0786-fix-serve-re-exec-on-a-no-wait-gate-when-the-cached-.patch`](patches/0786-fix-serve-re-exec-on-a-no-wait-gate-when-the-cached-.patch)
 (fork commit `5f4e37b9db`, re-exec when a cached git identity is not HEAD)
 
 ## Why
@@ -43,9 +43,9 @@ and `HERMES_SERVE_UPDATE_POLL_S`.
 - Policy: the bound and its log lines, the shorter hold bound, a hold followed by an update (the update bound
   applies and the trailing hold is ignored), `0` turning the gate off, and the exemption for our own updater.
 
-## Follow-up patch (0714)
+## Follow-up patch (0786)
 
-**0714** (fork `5f4e37b9db`): a serve whose cached git identity is not HEAD re-execs even when the update gate returns `clear`.
+**0786** (fork `5f4e37b9db`): a serve whose cached git identity is not HEAD re-execs even when the update gate returns `clear`.
 
 A serve can cache `get_version_info()` at import. An update can then move the checkout and finish before `cmd_dashboard` reaches the gate. The gate returns `clear` and previously never re-execed, so `/api/health` kept the old commit while the boot fingerprint was HEAD.
 

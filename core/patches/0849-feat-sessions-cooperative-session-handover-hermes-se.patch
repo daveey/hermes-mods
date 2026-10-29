@@ -1,0 +1,1551 @@
+From 59009a4979358773526eb8871f60304a6888887e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:22:53 -0700
+Subject: [PATCH] feat(sessions): cooperative session handover: hermes sessions
+ move + Board owner fencing [daveey]
+
+A chat moves to another gateway while this one (its owner) is alive and signs the move:
+- hermes_cli/session_owner.py: owner(s)/move against the Board's new POST /v2/boards/<id>/sessions
+  (hermes-hub branch session-owners) through the kanban sync client and gateway key; board = the default
+  board's primary sync binding (sync off / not primary = no record, no fencing); 30 s per-session cache;
+  unreachable Board = last answer, else fail-open with a warning. refusal(sid) -> SESSION_MOVED.
+- Fencing: tui_gateway _admit_prompt_turn checks it before the slot claim (_session_moved_refusal), and
+  hermes --resume / -z --resume exit 1 with the same refusal.
+- hermes sessions move <id> --to <gw> --reason .. [--after-turn]: refuse mid-turn (durable turn lease) or
+  wait up to 10 min; export lineage + source_home; push hidden via sessions.move.transport (default ssh to
+  sessions.move.hosts[gw]); verify counts; Board CAS (epoch from the record, 0 if none); reveal there;
+  archive here (moved_to_gateway:<gw>); re-point open cards created/shepherded by the chat to a
+  platform='hub' sub <gw>/<profile>/<sid> and drop the tui sub. A CAS failure deletes the hidden copy.
+- Target verbs: sessions import-lineage <file|-> [--hidden] (cwd remap, replaces a copy it once handed
+  away), sessions reveal <id>, sessions discard-hidden <id>... (never deletes a visible session).
+- Agent tool session_move(to, reason) (toolset session_move, in the core chat list; check_fn refuses
+  Kanban workers and unconfigured hosts) spawns the --after-turn move detached.
+- Fake Board gains the sessions route, mirroring the Worker.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_client.py           |  18 +-
+ hermes_cli/main.py                         |  12 +
+ hermes_cli/session_handover.py             | 462 +++++++++++++++++++++
+ hermes_cli/session_owner.py                | 209 ++++++++++
+ hermes_cli/sessions_cmd.py                 |   9 +
+ hermes_cli/subcommands/sessions.py         |  17 +
+ hermes_cli/tools_config.py                 |   1 +
+ tests/hermes_cli/kanban_sync_fake_board.py |  39 ++
+ tests/hermes_cli/test_session_handover.py  | 408 ++++++++++++++++++
+ tests/tools/test_session_move_tool.py      |  65 +++
+ tools/session_move_tool.py                 |  83 ++++
+ toolsets.py                                |   3 +
+ tui_gateway/prompt_turn.py                 |   4 +-
+ tui_gateway/session_lifecycle.py           |  16 +
+ 14 files changed, 1344 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/session_handover.py
+ create mode 100644 hermes_cli/session_owner.py
+ create mode 100644 tests/hermes_cli/test_session_handover.py
+ create mode 100644 tests/tools/test_session_move_tool.py
+ create mode 100644 tools/session_move_tool.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 13d0737171..7616ec2ffc 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -58,7 +58,7 @@ class SyncUnavailable(RuntimeError):
+ class HubError(RuntimeError):
+     def __init__(self, status: int, detail: str) -> None:
+         super().__init__(f"hub {status}: {detail}")
+-        self.status = status
++        self.status, self.detail = status, detail
+ 
+ 
+ class Resync(Exception):
+@@ -128,6 +128,22 @@ class Hub:
+     def leases(self, board: str, body: dict) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/leases", body)
+ 
++    def sessions(self, board: str, body: dict) -> dict:
++        """Session owners (session handover, :mod:`hermes_cli.session_owner`): ``get`` / ``move``. A 409 refusal
++        returns its body (``{reason, owner}``) instead of raising."""
++        try:
++            return self._call("POST", f"/v2/boards/{board}/sessions", body)
++        except HubError as exc:
++            if exc.status != 409:
++                raise
++            try:
++                res = json.loads(exc.detail)
++            except ValueError:
++                raise exc from None
++            if not isinstance(res, dict) or not res.get("reason"):
++                raise
++            return res
++
+     def machines(self) -> dict:
+         """The machine registry (RFC "One machine registry"): ``{me, machines: [{name, labels, pinned_only, ...}]}``."""
+         return self._call("GET", "/v2/machines")
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 47101215ff..c590421265 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -1523,6 +1523,17 @@ def _import_foreign_resume(args) -> None:
+     args.resume = _imported_id
+ 
+ 
++def _refuse_moved_session(session_id: str) -> None:
++    """``hermes --resume <id>`` (chat, TUI and ``-z``) of a chat handed over to another gateway exits 1 with the
++    ``SESSION_MOVED`` refusal (hermes_cli.session_owner, the same check the TUI admission gate runs). [daveey]"""
++    from hermes_cli.session_owner import refusal
++    from hermes_cli.active_sessions import format_refusal_stderr
++    message = refusal(session_id)
++    if message is not None:
++        print(format_refusal_stderr(message), file=sys.stderr)
++        sys.exit(1)
++
++
+ def _resolve_chat_session_args(args, use_tui: bool) -> None:
+     """Normalize --in / --resume / --continue on ``args`` before agent init.
+ 
+@@ -1556,6 +1567,7 @@ def _resolve_chat_session_args(args, use_tui: bool) -> None:
+     if resume_val:
+         # On miss keep the original so _init_agent reports "Session not found" with it.
+         args.resume = _resolve_session_by_name_or_id(resume_val) or resume_val
++        _refuse_moved_session(args.resume)
+ 
+     # cd back into a resumed session's recorded cwd (opt out: --no-restore-cwd;
+     # --worktree owns its own dir). A missing dir warns and stays put.
+diff --git a/hermes_cli/session_handover.py b/hermes_cli/session_handover.py
+new file mode 100644
+index 0000000000..2509633434
+--- /dev/null
++++ b/hermes_cli/session_handover.py
+@@ -0,0 +1,462 @@
++"""Cooperative session handover: ``hermes sessions move`` and its target-side verbs. [daveey]
++
++A chat session moves to another gateway while this one (its current owner) is alive and signs the move:
++
++1. refuse while a turn runs (``--after-turn`` waits for it to end, polling up to 10 min);
++2. export the whole compression lineage (every message row, ``include_inactive``) plus ``source_home``;
++3. push it HIDDEN to the target through the transport and verify the per-segment message counts;
++4. CAS the owner record on the Board (:mod:`hermes_cli.session_owner`; epoch from the current record, 0 if none);
++5. reveal the copy on the target;
++6. archive the copy here (``end_reason='moved_to_gateway:<gw>'``);
++7. re-point this gateway's open cards that notify the chat to the new gateway's copy (:func:`repoint_links`).
++
++If the CAS fails after the push, the hidden target copy is deleted through the transport and the move reports it.
++
++Transport (config ``sessions.move``)::
++
++    sessions:
++      move:
++        hosts: {hub: ubuntu@hub-host}        # gateway -> ssh target; a move needs its target listed here
++        transport: "ssh -o BatchMode=yes {target} {command}"   # default; {args} expands to separate argv words
++        remote_hermes: hermes                # the hermes executable on the target
++        profile: default                     # the chat's profile on the target (default: this profile)
++
++The target side is ``hermes sessions import-lineage <file|-> [--hidden]`` (prints a JSON count per segment),
++``hermes sessions reveal <id>`` (unhide) and ``hermes sessions discard-hidden <id>`` (delete a copy that is still
++hidden: the undo of a push whose CAS failed; a visible session is never deleted).
++
++Turn running = the session's durable turn lease (state.db ``session_turn_leases``, held from admission to flush of
++every turn, by any surface). The active-session registry slot is NOT used for this: Desktop holds it for the life
++of an open chat, so it would read "a turn runs" between turns and ``--after-turn`` could never proceed.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import shlex
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import Any, Callable, Iterable, Optional
++
++_log = logging.getLogger(__name__)
++
++END_REASON_PREFIX = "moved_to_gateway:"
++AFTER_TURN_WAIT_S = 600.0
++POLL_S = 2.0
++DEFAULT_TRANSPORT = "ssh -o BatchMode=yes {target} {command}"
++OPEN_STATUSES = ("todo", "ready", "running", "scheduled", "blocked", "review", "triage")
++TRANSPORT_TIMEOUT_S = 600.0
++
++
++class MoveError(RuntimeError):
++    def __init__(self, code: str, message: str, **extra: Any):
++        super().__init__(message)
++        self.code, self.extra = code, extra
++
++
++# --- pure helpers ------------------------------------------------------------------------------------------------
++
++def remap_cwd(cwd: Optional[str], src_home: str, dst_home: str) -> tuple[Optional[str], Optional[str]]:
++    """``(new cwd, None)`` or ``(None, reason)``. No cwd stays no cwd (hermes-session-move's rule)."""
++    if not cwd:
++        return cwd, None
++    src = str(src_home).rstrip("/")
++    if cwd == src:
++        return dst_home, None
++    if cwd.startswith(src + "/"):
++        return str(dst_home).rstrip("/") + cwd[len(src):], None
++    return None, f"cwd {cwd} is outside {src}"
++
++
++def move_config(cfg: Optional[dict] = None) -> dict[str, Any]:
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++            cfg = load_config_readonly() or {}
++        except Exception:  # health: allow BLE001 -- unreadable config: no hosts, every move is refused
++            cfg = {}
++    sessions = cfg.get("sessions") if isinstance(cfg, dict) else None
++    move = (sessions or {}).get("move") if isinstance(sessions, dict) else None
++    return dict(move) if isinstance(move, dict) else {}
++
++
++def move_hosts(cfg: Optional[dict] = None) -> dict[str, str]:
++    hosts = move_config(cfg).get("hosts")
++    return {str(k): str(v) for k, v in hosts.items() if k and v} if isinstance(hosts, dict) else {}
++
++
++def transport_argv(target: str, hermes_args: list[str], cfg: Optional[dict] = None) -> list[str]:
++    """The argv that runs ``<remote_hermes> <hermes_args>`` on ``target``: the ``sessions.move.transport`` template
++    (a string, shlex-split, or a list) with ``{target}``, ``{command}`` (the whole remote command as one word, for
++    ssh) and ``{args}`` (the remote command as separate words, for a local transport)."""
++    mc = move_config(cfg)
++    remote = mc.get("remote_hermes") or "hermes"
++    remote_words = shlex.split(remote) if isinstance(remote, str) else [str(w) for w in remote]
++    words = [*remote_words, *hermes_args]
++    template = mc.get("transport") or DEFAULT_TRANSPORT
++    tokens = shlex.split(template) if isinstance(template, str) else [str(t) for t in template]
++    out: list[str] = []
++    for tok in tokens:
++        if tok == "{args}":
++            out.extend(words)
++        else:
++            out.append(tok.replace("{target}", target).replace("{command}", shlex.join(words)))
++    return out
++
++
++def _last_json(text: str) -> Optional[dict]:
++    for line in reversed((text or "").splitlines()):
++        line = line.strip()
++        if line.startswith("{"):
++            try:
++                value = json.loads(line)
++            except ValueError:
++                continue
++            if isinstance(value, dict):
++                return value
++    return None
++
++
++def run_transport(target: str, hermes_args: list[str], *, payload: Optional[str] = None,
++                  cfg: Optional[dict] = None) -> dict[str, Any]:
++    """Run a target-side verb; its last JSON line, plus ``rc`` (``ok`` False with ``error`` when none came back)."""
++    argv = transport_argv(target, hermes_args, cfg)
++    try:
++        p = subprocess.run(argv, input=payload, capture_output=True, text=True, encoding="utf-8",
++                           errors="replace", timeout=TRANSPORT_TIMEOUT_S,
++                           check=False)
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return {"ok": False, "rc": None, "error": f"{type(exc).__name__}: {exc}"}
++    res = _last_json(p.stdout)
++    if res is None:
++        return {"ok": False, "rc": p.returncode, "error": ((p.stderr or "") + (p.stdout or ""))[-600:]}
++    res.setdefault("ok", p.returncode == 0)
++    res["rc"] = p.returncode
++    return res
++
++
++# --- target side ---------------------------------------------------------------------------------------------------
++
++def _open_db():
++    from hermes_state import SessionDB
++    return SessionDB()
++
++
++def _count(db, sid: str) -> int:
++    return len(db.get_messages(sid, include_inactive=True))
++
++
++def _handed_away(db, sid: str) -> bool:
++    """A copy this gateway once handed to another one (archived ``moved_to_gateway:``): a move back replaces it."""
++    row = db.get_session(sid)
++    return bool(row and row.get("archived") and str(row.get("end_reason") or "").startswith(END_REASON_PREFIX))
++
++
++def import_lineage(payload: dict, *, hidden: bool = False, db=None, home: Optional[str] = None) -> dict[str, Any]:
++    """Import an ``export_session_lineage(include_inactive=True)`` payload (``source_home`` remapped to this home)."""
++    own = db is None
++    db = db or _open_db()
++    try:
++        segments = [dict(s) for s in (payload.get("segments") or [payload])]
++        src = payload.get("source_home")
++        dst = home or str(Path.home())
++        for seg in segments:
++            seg.pop("segments", None)
++            if src:
++                new, why = remap_cwd(seg.get("cwd"), src, dst)
++                seg["cwd"] = None if why else new
++        replaced = [s["id"] for s in segments if s.get("id") and _handed_away(db, s["id"])]
++        for sid in reversed(replaced):  # the tip first: a compression child never outlives its parent here
++            db.delete_session(sid)
++        res = db.import_sessions(segments)
++        ids = [s["id"] for s in segments if s.get("id")]
++        if res.get("ok") and hidden:
++            for sid in ids:
++                db.set_session_hidden(sid, True)
++        counts = {sid: _count(db, sid) for sid in ids if db.get_session(sid)}
++        return {"ok": bool(res.get("ok")), "imported": res.get("imported"), "skipped": res.get("skipped"),
++                "replaced": replaced, "errors": res.get("errors"), "hidden": bool(hidden), "counts": counts}
++    finally:
++        if own:
++            db.close()
++
++
++def reveal(session_id: str, *, db=None) -> dict[str, Any]:
++    own = db is None
++    db = db or _open_db()
++    try:
++        lineage = db.get_compression_lineage(session_id) or ([session_id] if db.get_session(session_id) else [])
++        if not lineage:
++            return {"ok": False, "error": f"no session {session_id}"}
++        for sid in lineage:
++            db.set_session_hidden(sid, False)
++        return {"ok": True, "revealed": lineage}
++    finally:
++        if own:
++            db.close()
++
++
++def discard_hidden(session_ids: Iterable[str], *, db=None) -> dict[str, Any]:
++    """Delete sessions that are still hidden (an unrevealed push). A visible one is left and reported."""
++    own = db is None
++    db = db or _open_db()
++    try:
++        deleted, kept = [], []
++        for sid in reversed(list(session_ids)):
++            row = db.get_session(sid)
++            if row is None:
++                continue
++            if not row.get("hidden"):
++                kept.append(sid)
++                continue
++            if db.delete_session(sid):
++                deleted.append(sid)
++        return {"ok": not kept, "deleted": deleted, "kept_visible": kept}
++    finally:
++        if own:
++            db.close()
++
++
++# --- source side ---------------------------------------------------------------------------------------------------
++
++def turn_running(db, session_id: str) -> bool:
++    """A live durable turn lease on the session's lineage (any surface, any process)."""
++    try:
++        owner = db.session_turn_lease_owner(session_id)
++    except Exception:  # health: allow BLE001 -- no lease table yet: nothing ever ran a turn
++        return False
++    return bool(owner) and float(owner.get("expires_at") or 0) > time.time()
++
++
++def wait_for_turn_end(db, session_id: str, *, wait_s: float = AFTER_TURN_WAIT_S, poll_s: float = POLL_S,
++                      sleep: Callable[[float], None] = time.sleep) -> bool:
++    deadline = time.monotonic() + wait_s
++    while turn_running(db, session_id):
++        if time.monotonic() >= deadline:
++            return False
++        sleep(poll_s)
++    return True
++
++
++def _profile(cfg: Optional[dict]) -> str:
++    configured = move_config(cfg).get("profile")
++    if configured:
++        return str(configured)
++    try:
++        from hermes_cli.profiles import current_profile_name
++        name = current_profile_name("default") or "default"
++    except Exception:  # health: allow BLE001 -- unknown profile: the default one
++        name = "default"
++    return "default" if name == "custom" else name
++
++
++def _board_conns():
++    """``(slug, path)`` for every kanban board file on this host (the default board and named boards)."""
++    from hermes_cli import kanban_db
++    root = kanban_db.kanban_home()
++    found = [("default", root / "kanban.db")] if (root / "kanban.db").exists() else []
++    boards = kanban_db.boards_root()
++    if boards.is_dir():
++        found += [(p.parent.name, p) for p in sorted(boards.glob("*/kanban.db")) if p.is_file()]
++    return found
++
++
++def repoint_links(lineage: list[str], to: str, *, profile: str) -> list[dict[str, Any]]:
++    """Open cards on this gateway's boards created by the lineage (``tasks.session_id``) or shepherded by it
++    (``tui`` subscriptions) notify ``(to, profile, same session id)`` from now on: a ``platform='hub'`` subscription
++    (kanban_origin.bind, the cross-gateway notice path hermes-hub publishes as a ``shepherd`` session link and the
++    target's ``kanban_remote_notices`` delivers), and the local ``tui`` subscription is removed so the archived copy
++    here is never notified."""
++    from hermes_cli import kanban_db_notify as kbn
++    from hermes_cli import kanban_origin as ko
++    from hermes_cli.kanban_db_connect import connect_closing
++    ids = [str(i) for i in lineage if i]
++    if not ids:
++        return []
++    q = ",".join("?" * len(ids))
++    st = ",".join("?" * len(OPEN_STATUSES))
++    out: list[dict[str, Any]] = []
++    for slug, path in _board_conns():
++        with connect_closing(path) as conn:
++            cards: dict[str, set[str]] = {}
++            for tid, sid in conn.execute(
++                    f"SELECT id, session_id FROM tasks WHERE status IN ({st}) AND session_id IN ({q})",
++                    (*OPEN_STATUSES, *ids)):
++                cards.setdefault(tid, set()).add(sid)
++            subs: dict[str, set[str]] = {}
++            try:
++                for tid, chat in conn.execute(
++                        f"SELECT s.task_id, s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++                        f"WHERE s.platform = 'tui' AND s.chat_id IN ({q}) AND t.status IN ({st})",
++                        (*ids, *OPEN_STATUSES)):
++                    subs.setdefault(tid, set()).add(chat)
++                    cards.setdefault(tid, set())
++            except Exception:  # health: allow BLE001 -- a board without notify subscriptions
++                pass
++            for tid in sorted(cards):
++                chats = sorted(subs.get(tid) or cards[tid])
++                for chat in chats:
++                    ko.bind(conn, tid, ko.Origin(to, profile, chat), board=slug)
++                for chat in sorted(subs.get(tid) or ()):
++                    kbn.remove_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat)
++                out.append({"board": slug, "task": tid, "chats": chats, "to": f"{to}/{profile}"})
++    return out
++
++
++def _segments_and_counts(db, session_id: str, home: str) -> tuple[dict, dict[str, int]]:
++    payload = db.export_session_lineage(session_id, include_inactive=True)
++    if not payload:
++        raise MoveError("not_found", f"no session {session_id} here")
++    payload = {**payload, "source_home": home}
++    segments = payload.get("segments") or [payload]
++    return payload, {s["id"]: len(s.get("messages") or []) for s in segments}
++
++
++def move_session(session_id: str, to: str, reason: str, *, after_turn: bool = False, db=None,
++                 cfg: Optional[dict] = None, wait_s: float = AFTER_TURN_WAIT_S, poll_s: float = POLL_S,
++                 sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
++    """Run the move; returns the report (``moved`` True/False, plus ``code`` and ``error`` when refused)."""
++    from hermes_cli import session_owner as so
++    reason = (reason or "").strip()
++    try:
++        if not reason:
++            raise MoveError("reason_required", "--reason is required (why this chat must move)")
++        hosts = move_hosts(cfg)
++        if to not in hosts:
++            raise MoveError("unknown_host", f"{to!r} is not in sessions.move.hosts ({', '.join(sorted(hosts)) or 'none'})")
++        me = so.self_gateway()
++        if not me:
++            raise MoveError("no_gateway", "this machine has no hermes-hub gateway name")
++        if to == me:
++            raise MoveError("same_gateway", f"this chat is already on {me}")
++        own = db is None
++        db = db or _open_db()
++        try:
++            return _move(db, session_id, to, reason, me=me, target=hosts[to], after_turn=after_turn, cfg=cfg,
++                         wait_s=wait_s, poll_s=poll_s, sleep=sleep)
++        finally:
++            if own:
++                db.close()
++    except MoveError as exc:
++        return {"session_id": session_id, "to": to, "moved": False, "code": exc.code, "error": str(exc), **exc.extra}
++
++
++def _move(db, session_id: str, to: str, reason: str, *, me: str, target: str, after_turn: bool, cfg,
++          wait_s: float, poll_s: float, sleep) -> dict[str, Any]:
++    from hermes_cli import session_owner as so
++    resolved = db.resolve_session_id(session_id) if hasattr(db, "resolve_session_id") else session_id
++    if not resolved or not db.get_session(resolved):
++        raise MoveError("not_found", f"no session {session_id} here")
++    lineage = db.get_compression_lineage(resolved) or [resolved]
++    root = lineage[0]
++    if so._context() is None:
++        raise MoveError("not_synced", "session moves need the default board syncing to the Board service "
++                                      "(kanban.sync enabled, mode primary)")
++    rec = so.owner(root)
++    if rec and rec.get("gateway") != me:
++        raise MoveError("not_owner", f"this chat is owned by {rec.get('gateway')}, not {me}", owner=rec)
++    if turn_running(db, root):
++        if not after_turn:
++            raise MoveError("turn_running", "a turn is running in this chat; retry when it ends (or --after-turn)")
++        if not wait_for_turn_end(db, root, wait_s=wait_s, poll_s=poll_s, sleep=sleep):
++            raise MoveError("turn_timeout", f"the turn did not end within {int(wait_s)} s; nothing moved")
++    home = str(Path.home())
++    payload, counts = _segments_and_counts(db, root, home)
++    ids = list(counts)
++    pushed = run_transport(target, ["sessions", "import-lineage", "-", "--hidden"], payload=json.dumps(payload),
++                           cfg=cfg)
++    got = pushed.get("counts") if isinstance(pushed.get("counts"), dict) else {}
++    if not pushed.get("ok") or any(int(got.get(k, -1)) < v for k, v in counts.items()):
++        undo = run_transport(target, ["sessions", "discard-hidden", *ids], cfg=cfg) if pushed.get("ok") else None
++        raise MoveError("push_incomplete", f"the copy on {to} is incomplete", push=pushed, segments=counts,
++                        discarded=undo)
++    grown = [k for k, v in counts.items() if _count(db, k) > v]
++    if grown:
++        undo = run_transport(target, ["sessions", "discard-hidden", *ids], cfg=cfg)
++        raise MoveError("grew_during_move", f"a turn landed here during the move ({grown}); nothing moved, "
++                                            "the hidden copy was removed", discarded=undo)
++    epoch = int((rec or {}).get("epoch") or 0)
++    try:
++        cas = so.move(root, to, epoch, reason)
++    except so.OwnerUnavailable as exc:
++        cas = {"ok": False, "reason": "board_unavailable", "error": str(exc)}
++    if not cas.get("ok"):
++        undo = run_transport(target, ["sessions", "discard-hidden", *ids], cfg=cfg)
++        raise MoveError("cas_failed", f"the Board refused the move ({cas.get('reason')}); the hidden copy on {to} "
++                        + ("was removed" if undo.get("ok") else "could NOT be removed: " + str(undo.get("error")
++                                                                                              or undo)),
++                        cas=cas, discarded=undo)
++    revealed = run_transport(target, ["sessions", "reveal", root], cfg=cfg)
++    end_reason = END_REASON_PREFIX + to
++    for sid in ids:
++        db.reopen_session(sid)
++        db.end_session(sid, end_reason)
++        db.set_session_archived(sid, True)
++    links = repoint_links(ids, to, profile=_profile(cfg))
++    report = {"session_id": root, "to": to, "moved": True, "owner": cas.get("owner"), "segments": counts,
++              "revealed": bool(revealed.get("ok")), "links": links}
++    if not revealed.get("ok"):
++        report["reveal_error"] = revealed.get("error") or revealed
++    return report
++
++
++# --- CLI ----------------------------------------------------------------------------------------------------------
++
++def _print(obj: Any) -> None:
++    print(json.dumps(obj, default=str))
++
++
++def cmd_import_lineage(args) -> int:
++    src = args.file
++    text = sys.stdin.read() if src == "-" else Path(src).read_text(encoding="utf-8-sig")
++    try:
++        payload = json.loads(text)
++    except ValueError as exc:
++        _print({"ok": False, "error": f"not JSON: {exc}"})
++        return 1
++    if not isinstance(payload, dict):
++        _print({"ok": False, "error": "payload must be an export_session_lineage object"})
++        return 1
++    res = import_lineage(payload, hidden=bool(args.hidden))
++    _print(res)
++    return 0 if res.get("ok") else 1
++
++
++def cmd_reveal(args) -> int:
++    res = reveal(args.session_id)
++    _print(res)
++    return 0 if res.get("ok") else 1
++
++
++def cmd_discard_hidden(args) -> int:
++    res = discard_hidden(args.session_ids)
++    _print(res)
++    return 0 if res.get("ok") else 1
++
++
++def cmd_move(args) -> int:
++    res = move_session(args.session_id, args.to, args.reason or "", after_turn=bool(args.after_turn))
++    _print(res)
++    return 0 if res.get("moved") and res.get("revealed", True) else 1
++
++
++def spawn_after_turn_move(session_id: str, to: str, reason: str) -> int:
++    """Start ``hermes sessions move <id> --to <to> --reason ... --after-turn`` detached (the agent tool's path);
++    returns its pid. Output goes to ``<hermes home>/logs/session-move-<id>.log``."""
++    from hermes_constants import get_hermes_home
++    log_dir = Path(get_hermes_home()) / "logs"
++    log_dir.mkdir(parents=True, exist_ok=True)
++    log = open(log_dir / f"session-move-{session_id}.log", "ab")  # handed to the child
++    try:
++        repo = str(Path(__file__).resolve().parent.parent)
++        p = subprocess.Popen(
++            [sys.executable, "-m", "hermes_cli.main", "sessions", "move", session_id, "--to", to,
++             "--reason", reason, "--after-turn"],
++            cwd=repo, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
++            env={**os.environ})
++    finally:
++        log.close()
++    return p.pid
+diff --git a/hermes_cli/session_owner.py b/hermes_cli/session_owner.py
+new file mode 100644
+index 0000000000..bc62649140
+--- /dev/null
++++ b/hermes_cli/session_owner.py
+@@ -0,0 +1,209 @@
++"""Which gateway owns a chat session, on the Board service (session handover). [daveey]
++
++A chat session can move to another gateway (``hermes sessions move``). The Board records the move in
++``session_owners`` (hermes-hub ``POST /v2/boards/<id>/sessions``): ``{gateway, epoch, moved_at, moved_by}`` keyed by
++the session's compression-lineage ROOT id. No row means no record: the session belongs to whichever gateway holds
++it locally (the upstream behaviour). A move is a CAS on ``epoch`` signed by the current owner's gateway key, so two
++gateways can never both believe they were handed the chat.
++
++Fencing: every turn source on a gateway asks :func:`refusal` before it runs a turn (the TUI/Desktop admission gate
++``tui_gateway/prompt_turn._admit_prompt_turn`` and the CLI resume path, ``hermes --resume`` / ``-z``). A session
++whose owner record names another gateway is refused ``SESSION_MOVED``.
++
++The Board is reached through the kanban sync client (same HTTP client and gateway key as ``/leases``); the board
++is the ``default`` board's sync binding. With ``kanban.sync`` off, or that board not ``primary``, there is no
++record and no fencing. Answers are cached per session for :data:`CACHE_TTL_S`. Board unreachable: the last cached
++answer, stale or not; with none, the turn is allowed (fail-open) and logged.
++"""
++from __future__ import annotations
++
++import logging
++import threading
++import time
++from typing import Any, Callable, Iterable, Optional
++
++_log = logging.getLogger(__name__)
++
++CACHE_TTL_S = 30.0
++MAX_IDS = 200  # the Board's per-request limit
++SESSION_MOVED = "SESSION_MOVED"
++
++_lock = threading.Lock()
++_cache: dict[str, tuple[float, Optional[dict]]] = {}  # session id -> (fetched at, owner or None)
++_context_cache: Optional[tuple[float, Optional[tuple[Any, str]]]] = None
++_hub_factory: Optional[Callable[[], Any]] = None
++
++
++class OwnerUnavailable(RuntimeError):
++    """The Board cannot be asked (sync off, board not primary, or unreachable): a move cannot be recorded."""
++
++
++def set_hub_factory(factory: Optional[Callable[[], Any]]) -> Optional[Callable[[], Any]]:
++    """Install the Board client factory (tests: a fake Board's hub); returns the previous one. Clears the caches."""
++    global _hub_factory
++    previous, _hub_factory = _hub_factory, factory
++    reset_cache()
++    return previous
++
++
++def reset_cache() -> None:
++    global _context_cache
++    with _lock:
++        _cache.clear()
++        _context_cache = None
++
++
++def _board_id() -> Optional[str]:
++    """The ``default`` board's service id when it syncs as ``primary``, else None (no record, no fencing)."""
++    from hermes_cli import kanban_db
++    from hermes_cli import kanban_db_sync as sync
++    if not sync.sync_enabled():
++        return None
++    path = kanban_db.kanban_home() / "kanban.db"
++    if not path.exists() or not sync.board_selected(str(path)):
++        return None
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing(path) as conn:
++        if sync.board_mode(conn) != "primary":
++            return None
++        board = str(sync._state(conn)["board_id"] or "")
++    return board or None
++
++
++def _context() -> Optional[tuple[Any, str]]:
++    """``(hub, board id)`` or None when ownership is not recorded here. Cached like owner answers."""
++    global _context_cache
++    now = time.monotonic()
++    with _lock:
++        if _context_cache is not None and now - _context_cache[0] < CACHE_TTL_S:
++            return _context_cache[1]
++    try:
++        board = _board_id()
++        ctx = None
++        if board:
++            if _hub_factory is not None:
++                hub = _hub_factory()
++            else:
++                from hermes_cli import kanban_sync_client as ksc
++                hub = ksc.Hub(ksc.load_identity())
++            ctx = (hub, board)
++    except Exception as exc:  # health: allow BLE001 -- no enrollment / unreadable board: no record, no fencing
++        _log.info("session owner: no Board context (%s: %s)", type(exc).__name__, exc)
++        ctx = None
++    with _lock:
++        _context_cache = (now, ctx)
++    return ctx
++
++
++def _put(sid: str, owner: Optional[dict]) -> None:
++    with _lock:
++        _cache[sid] = (time.monotonic(), dict(owner) if owner else None)
++
++
++def owners(ids: Iterable[str]) -> dict[str, Optional[dict]]:
++    """``{session id: {gateway, epoch, moved_at, moved_by} | None}`` (None = no record, or unknown and fail-open)."""
++    wanted = [str(i) for i in dict.fromkeys(ids) if i]
++    out: dict[str, Optional[dict]] = {}
++    ctx = _context()
++    if ctx is None:
++        return {sid: None for sid in wanted}
++    hub, board = ctx
++    now = time.monotonic()
++    missing = []
++    with _lock:
++        for sid in wanted:
++            hit = _cache.get(sid)
++            if hit is not None and now - hit[0] < CACHE_TTL_S:
++                out[sid] = dict(hit[1]) if hit[1] else None
++            else:
++                missing.append(sid)
++    for start in range(0, len(missing), MAX_IDS):
++        chunk = missing[start:start + MAX_IDS]
++        try:
++            res = hub.sessions(board, {"action": "get", "session_ids": chunk})
++            found = res.get("owners") or {}
++        except Exception as exc:  # health: allow BLE001 -- unreachable Board: last answer, else fail-open
++            for sid in chunk:
++                with _lock:
++                    hit = _cache.get(sid)
++                if hit is not None:
++                    out[sid] = dict(hit[1]) if hit[1] else None
++                else:
++                    out[sid] = None
++                    _log.warning("session owner: Board unreachable for %s (%s: %s); no cached answer, allowing the "
++                                 "turn (fail-open)", sid, type(exc).__name__, exc)
++            continue
++        for sid in chunk:
++            owner = found.get(sid) if isinstance(found, dict) else None
++            owner = dict(owner) if isinstance(owner, dict) and owner.get("gateway") else None
++            _put(sid, owner)
++            out[sid] = owner
++    return out
++
++
++def owner(session_id: str) -> Optional[dict]:
++    return owners([session_id]).get(str(session_id))
++
++
++def move(session_id: str, to: str, expect_epoch: int, reason: str) -> dict[str, Any]:
++    """Board CAS move: ``{"ok": True, "owner"}`` or ``{"ok": False, "reason", "owner"}`` (a 409 refusal).
++    Raises :class:`OwnerUnavailable` when the Board is not in use here or cannot be reached."""
++    ctx = _context()
++    if ctx is None:
++        raise OwnerUnavailable("session moves need the default board syncing to the Board service (kanban.sync, "
++                               "mode primary)")
++    hub, board = ctx
++    try:
++        res = hub.sessions(board, {"action": "move", "session_id": session_id, "to": to,
++                                   "expect_epoch": int(expect_epoch), "reason": reason})
++    except Exception as exc:  # health: allow BLE001 -- surfaced to the mover, nothing was recorded
++        raise OwnerUnavailable(f"the Board could not record the move ({type(exc).__name__}: {exc})") from exc
++    cur = res.get("owner") if isinstance(res.get("owner"), dict) else None
++    _put(session_id, cur)
++    if res.get("status") == "moved":
++        return {"ok": True, "owner": cur}
++    return {"ok": False, "reason": str(res.get("reason") or "refused"), "owner": cur}
++
++
++def self_gateway() -> Optional[str]:
++    from hermes_cli import kanban_capability_registry as reg
++    return reg.self_gateway()
++
++
++def lineage_root(session_id: str, db: Any = None) -> str:
++    """The compression-lineage root of ``session_id`` (the id the Board records), or the id itself."""
++    try:
++        if db is None:
++            from hermes_state import SessionDB
++            db = SessionDB(read_only=True)
++            try:
++                lineage = db.get_compression_lineage(session_id)
++            finally:
++                db.close()
++        else:
++            lineage = db.get_compression_lineage(session_id)
++    except Exception:  # health: allow BLE001 -- no store or no row: the id is its own root
++        lineage = None
++    return str(lineage[0]) if lineage else str(session_id)
++
++
++def refusal(session_id: Optional[str], *, db: Any = None):
++    """An ``ActiveSessionRefusal`` (reason ``SESSION_MOVED``) when the session's owner record names another
++    gateway, else None. Used by every turn source (TUI admission, CLI resume)."""
++    if not session_id:
++        return None
++    try:
++        if _context() is None:
++            return None
++        me = self_gateway()
++        if not me:
++            return None
++        rec = owner(lineage_root(str(session_id), db))
++    except Exception as exc:  # health: allow BLE001 -- fail-open, as for an unreachable Board
++        _log.warning("session owner: check failed for %s (%s: %s); allowing the turn", session_id,
++                     type(exc).__name__, exc)
++        return None
++    if not rec or rec.get("gateway") in (None, "", me):
++        return None
++    from hermes_cli.active_sessions import ActiveSessionRefusal
++    return ActiveSessionRefusal(f"This chat moved to {rec['gateway']}; open it there.", SESSION_MOVED)
+diff --git a/hermes_cli/sessions_cmd.py b/hermes_cli/sessions_cmd.py
+index cb68cd4529..9a88e309dd 100644
+--- a/hermes_cli/sessions_cmd.py
++++ b/hermes_cli/sessions_cmd.py
+@@ -1185,7 +1185,16 @@ def _cmd_set_journal_mode(args):
+     return cmd_set_journal_mode(args)
+ 
+ 
++def _cmd_handover(args):
++    """``sessions move`` / ``import-lineage`` / ``reveal`` / ``discard-hidden`` (hermes_cli.session_handover). [daveey]"""
++    from hermes_cli import session_handover as sh
++    return {"move": sh.cmd_move, "import-lineage": sh.cmd_import_lineage, "reveal": sh.cmd_reveal,
++            "discard-hidden": sh.cmd_discard_hidden}[args.sessions_action](args)
++
++
+ _PRE_DB_HANDLERS = {
++    "move": _cmd_handover, "import-lineage": _cmd_handover, "reveal": _cmd_handover,
++    "discard-hidden": _cmd_handover,
+     "repair": _cmd_repair, "recover": _cmd_recover, "import": _cmd_import,
+     "repair-profiles": _cmd_repair_profiles,  # opens every profile's store itself
+     "set-journal-mode": _cmd_set_journal_mode,  # offline: must not open the store it converts
+diff --git a/hermes_cli/subcommands/sessions.py b/hermes_cli/subcommands/sessions.py
+index 26269a84f0..f6012b3466 100644
+--- a/hermes_cli/subcommands/sessions.py
++++ b/hermes_cli/subcommands/sessions.py
+@@ -324,6 +324,23 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
+ 
+     # cmd_sessions lives in hermes_cli/sessions_cmd.py; the parser is threaded
+     # in because the fallthrough branch calls sessions_parser.print_help().
++    # Session handover (hermes_cli.session_handover). [daveey]
++    sessions_move = sessions_subparsers.add_parser(
++        "move", help="Hand this chat over to another gateway (sessions.move.hosts); this gateway archives its copy")
++    sessions_move.add_argument("session_id", help="Session ID to move")
++    sessions_move.add_argument("--to", required=True, help="Target gateway (a key of sessions.move.hosts)")
++    sessions_move.add_argument("--reason", required=True, help="Why the chat must move (recorded on the Board)")
++    _flag(sessions_move, "--after-turn", help="Wait (up to 10 min) for a running turn to end instead of refusing")
++    sessions_import_lineage = sessions_subparsers.add_parser(
++        "import-lineage", help="Import an exported session lineage (JSON; the target side of `sessions move`)")
++    sessions_import_lineage.add_argument("file", help="Payload file, or - for stdin")
++    _flag(sessions_import_lineage, "--hidden", help="Import it hidden (revealed later with `sessions reveal`)")
++    sessions_reveal = sessions_subparsers.add_parser("reveal", help="Unhide a session and its compression lineage")
++    sessions_reveal.add_argument("session_id", help="Session ID to reveal")
++    sessions_discard = sessions_subparsers.add_parser(
++        "discard-hidden", help="Delete sessions that are still hidden (undo an unrevealed `import-lineage`)")
++    sessions_discard.add_argument("session_ids", nargs="+", help="Session IDs (visible ones are never deleted)")
++
+     # main() injects a lazy indirection so sessions_cmd is only imported when
+     # the subcommand runs.
+     def _dispatch_sessions(_args, *, sessions_parser=sessions_parser):
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index 50f4a25543..b84a8e3435 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -83,6 +83,7 @@ CONFIGURABLE_TOOLSETS = [
+     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
+     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
+     ("session_search",  "🔎 Session Search",            "search past conversations"),
++    ("session_move",    "🚚 Session Move",              "hand a chat to another gateway (sessions.move.hosts)"),
+     ("connections",     "🔌 Connections",               "remote connector tools and account authorization"),
+     ("clarify",         "❓ Clarifying Questions",      "clarify"),
+     ("delegation",      "👥 Task Delegation",           "delegate_task"),
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index 71977b6893..ef2313f748 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -28,6 +28,9 @@ class FakeService:
+         # Opt-in placement, like transitions.ts checkPlacement's runs_on rule: a grant needs every runs_on label
+         # on the claiming machine ({name: {"labels": [...]}}; machine:<name> is implicit). None = no check.
+         self.machines = machines
++        # Session owners (worker/src/board.ts ``sessions``): {board: {session_id: owner}} plus the move audit.
++        self.session_owners: dict[str, dict[str, dict]] = {}
++        self.session_audit: list[dict] = []
+ 
+     def board(self, bid: str) -> dict[str, Any]:
+         return self.boards.setdefault(bid, {"seq": 0, "floor": 0, "changes": [], "rows": {}, "applied": {}, "leases": {}})
+@@ -186,3 +189,39 @@ class FakeHub:
+                                                  "lease_expires": None}, gw, op_id, hlc)
+             return {"status": "applied", "lease": None}
+         return {"status": "applied", "lease": b["leases"][task], "version": version}
++
++    def sessions(self, board: str, body: dict) -> dict:
++        """As board.ts ``sessions``: ``get`` -> {owners}; ``move`` is a CAS signed by the current owner. The target
++        must be an active, unheld registry machine (with ``machines`` None, any name) other than the caller.
++        A refusal is the 409 body ``{reason, owner}`` (what :meth:`ksc.Hub.sessions` returns for a 409)."""
++        self._check()
++        self.svc.calls.append(("sessions", board, body))
++        owners = self.svc.session_owners.setdefault(board, {})
++        if body["action"] == "get":
++            ids = body["session_ids"]
++            assert isinstance(ids, list) and len(ids) <= 200
++            return {"owners": {sid: copy.deepcopy(owners[sid]) for sid in ids if sid in owners}}
++        sid, to, expect = body["session_id"], body["to"], body["expect_epoch"]
++        cur = copy.deepcopy(owners.get(sid))
++
++        def refuse(reason: str) -> dict:
++            return {"reason": reason, "owner": cur}
++
++        if cur and cur["gateway"] != self.gateway:
++            return refuse("not_owner")
++        if (cur["epoch"] if cur else 0) != expect:
++            return refuse("epoch_mismatch")
++        if to == self.gateway:
++            return refuse("same_gateway")
++        if self.svc.machines is not None:
++            m = self.svc.machines.get(to)
++            if not m or m.get("state", "active") != "active" or m.get("hold"):
++                return refuse("unknown_target")
++        elif not to:
++            return refuse("unknown_target")
++        owners[sid] = {"gateway": to, "epoch": expect + 1, "moved_at": int(time.time() * 1000),
++                       "moved_by": self.gateway}
++        self.svc.session_audit.append({"session_id": sid, "actor": self.gateway,
++                                       "from_gateway": cur["gateway"] if cur else None, "to_gateway": to,
++                                       "epoch": expect + 1, "reason": body.get("reason")})
++        return {"status": "moved", "owner": copy.deepcopy(owners[sid])}
+diff --git a/tests/hermes_cli/test_session_handover.py b/tests/hermes_cli/test_session_handover.py
+new file mode 100644
+index 0000000000..7478ce619d
+--- /dev/null
++++ b/tests/hermes_cli/test_session_handover.py
+@@ -0,0 +1,408 @@
++"""Session handover: the Board owner record, fencing, and ``hermes sessions move`` end to end. [daveey]
++
++Entry paths, one test each: the owner client against the fake Board (cache, fail-open, CAS outcomes), the fence in
++``tui_gateway.prompt_turn._admit_prompt_turn``, ``hermes --resume`` and ``hermes -z --resume``, ``hermes sessions
++move`` through the CLI with a local transport into a second HERMES_HOME (copied, revealed, archived here, fenced
++here), a refusal mid-turn and the ``--after-turn`` wait, a CAS failure removing the hidden copy, and a card created
++by the moved chat whose done notice reaches the new gateway's copy, not the archived one here.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import sqlite3
++import sys
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import session_handover as sh
++from hermes_cli import session_owner as so
++from hermes_state import SessionDB
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++SRC, DST, OTHER, BOARD = "macbook", "hub", "linux-2", "default"
++MACHINES = {name: {"name": name, "state": "active", "labels": [], "hold": False} for name in (SRC, DST, OTHER)}
++REPO = Path(__file__).resolve().parents[2]
++SID = "20261028_120000_aaaaaa"
++
++
++def _write_config(home: Path, dst_home: Path, dst_root: Path) -> None:
++    cfg = {
++        "kanban": {"sync": {"enabled": True}},
++        "sessions": {"move": {
++            "hosts": {DST: "ubuntu@hub-host"},
++            # the target is a second HERMES_HOME on this machine (a pytest child: the live-DB guard needs the bypass)
++            "transport": ["env", f"HERMES_HOME={dst_home}", f"HOME={dst_root}", f"PYTHONPATH={REPO}",
++                          "HERMES_STATE_DB_GUARD_BYPASS=1", "{args}"],
++            "remote_hermes": [sys.executable, "-m", "hermes_cli.main"],
++            "profile": "default",
++        }},
++    }
++    (home / "config.yaml").write_text(json.dumps(cfg))  # JSON is YAML
++
++
++@pytest.fixture
++def gw(tmp_path, monkeypatch):
++    """This gateway (``macbook``, primary ``default`` board on a fake Board) and an empty target home (``hub``)."""
++    src_root, dst_root = tmp_path / "src", tmp_path / "dst"
++    home, dst_home = src_root / ".hermes", dst_root / ".hermes"
++    home.mkdir(parents=True)
++    dst_home.mkdir(parents=True)
++    (src_root / "code" / "proj").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: src_root)
++    import hermes_state
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")  # what a bare SessionDB() opens
++    mail = tmp_path / "mail.json"
++    mail.write_text(json.dumps({"gateway": SRC}))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(mail))
++    _write_config(home, dst_home, dst_root)
++    sync.consume_dispatcher_wake()
++    conn = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, SRC)
++    sync.set_mode(conn, "primary")
++    svc = FakeService(machines=MACHINES)
++    so.set_hub_factory(lambda: svc.hub(SRC))
++    db = SessionDB(home / "state.db")
++    db.create_session(SID, "desktop", cwd=str(src_root / "code" / "proj"))
++    db.append_message(SID, "user", "please build it")
++    db.append_message(SID, "assistant", "on it")
++    try:
++        yield SimpleNamespace(home=home, dst_home=dst_home, dst_root=dst_root, src_root=src_root, conn=conn, svc=svc,
++                              db=db)
++    finally:
++        so.set_hub_factory(None)
++        db.close()
++        conn.close()
++
++
++def _dst_db(gw) -> SessionDB:
++    return SessionDB(gw.dst_home / "state.db")
++
++
++def _owner_on_board(gw, sid=SID):
++    return gw.svc.session_owners.get(BOARD, {}).get(sid)
++
++
++# --- the owner client against the fake Board --------------------------------------------------------------------
++
++def test_owner_client_cas_outcomes_and_30s_cache(gw, monkeypatch):
++    assert so.owner(SID) is None  # no record
++    calls = len(gw.svc.calls)
++    assert so.owner(SID) is None and len(gw.svc.calls) == calls  # cached
++
++    assert so.move(SID, DST, 1, "x") == {"ok": False, "reason": "epoch_mismatch", "owner": None}
++    first = so.move(SID, DST, 0, "needs the hub")
++    assert first["ok"] and first["owner"]["gateway"] == DST and first["owner"]["epoch"] == 1
++    assert so.move(SID, OTHER, 1, "again")["reason"] == "not_owner"  # macbook no longer owns it
++    assert so.move("other-sid", "ghost", 0, "x")["reason"] == "unknown_target"
++    assert so.move("other-sid", SRC, 0, "x")["reason"] == "same_gateway"
++    assert gw.svc.session_audit == [{"session_id": SID, "actor": SRC, "from_gateway": None, "to_gateway": DST,
++                                     "epoch": 1, "reason": "needs the hub"}]
++
++    # a stale cache entry is refetched after CACHE_TTL_S
++    clock = [1000.0]
++    monkeypatch.setattr(so.time, "monotonic", lambda: clock[0])
++    so.reset_cache()
++    assert so.owner(SID)["gateway"] == DST
++    gw.svc.session_owners[BOARD][SID]["gateway"] = OTHER  # changed on the Board behind our back
++    clock[0] += so.CACHE_TTL_S - 1
++    assert so.owner(SID)["gateway"] == DST
++    clock[0] += 2
++    assert so.owner(SID)["gateway"] == OTHER
++
++
++def test_owner_client_unreachable_board_uses_last_answer_else_fails_open(gw, monkeypatch, caplog):
++    gw.svc.session_owners[BOARD] = {SID: {"gateway": DST, "epoch": 1, "moved_at": 1, "moved_by": SRC}}
++    clock = [1000.0]
++    monkeypatch.setattr(so.time, "monotonic", lambda: clock[0])
++    assert so.owner(SID)["gateway"] == DST
++    gw.svc.offline = True
++    clock[0] += 3600  # far past the TTL: still the last answer, never "no record"
++    assert so.owner(SID)["gateway"] == DST
++    assert so.refusal(SID) is not None
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.session_owner"):
++        assert so.owner("never-asked") is None
++    assert "fail-open" in caplog.text
++    with pytest.raises(so.OwnerUnavailable):
++        so.move(SID, OTHER, 1, "x")
++
++
++def test_no_record_and_no_fencing_when_sync_is_off(gw):
++    gw.svc.session_owners[BOARD] = {SID: {"gateway": DST, "epoch": 1, "moved_at": 1, "moved_by": SRC}}
++    (gw.home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: false\n")
++    so.reset_cache()
++    assert so.owner(SID) is None and so.refusal(SID) is None
++    with pytest.raises(so.OwnerUnavailable):
++        so.move(SID, DST, 0, "x")
++
++
++def test_ksc_hub_sessions_returns_a_409_refusal_body(monkeypatch):
++    hub = ksc.Hub(ksc.Identity(url="https://hub.test", key="k", gateway=SRC))
++
++    def refuse(method, path, body=None):
++        assert path == "/v2/boards/default/sessions" and body["action"] == "move"
++        raise ksc.HubError(409, json.dumps({"reason": "not_owner", "owner": {"gateway": DST, "epoch": 2}}))
++
++    monkeypatch.setattr(hub, "_call", refuse)
++    assert hub.sessions("default", {"action": "move"}) == {"reason": "not_owner", "owner": {"gateway": DST, "epoch": 2}}
++
++    def boom(method, path, body=None):
++        raise ksc.HubError(500, "internal error")
++
++    monkeypatch.setattr(hub, "_call", boom)
++    with pytest.raises(ksc.HubError):
++        hub.sessions("default", {"action": "get", "session_ids": []})
++
++
++# --- fencing ------------------------------------------------------------------------------------------------------
++
++def _moved_away(gw):
++    gw.svc.session_owners[BOARD] = {SID: {"gateway": DST, "epoch": 1, "moved_at": 1, "moved_by": SRC}}
++    so.reset_cache()
++
++
++def test_admit_prompt_turn_refuses_a_moved_session(gw, monkeypatch):
++    from tui_gateway import server
++    frames = []
++    monkeypatch.setattr(server, "_emit_terminal_turn_error",
++                        lambda sid, session, error, error_surface=None, **k: frames.append((str(error), error_surface)))
++    monkeypatch.setattr(server, "_session_db", lambda session: contextlib.nullcontext(gw.db))
++    claimed = []
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, session, **k: claimed.append(sid) or None)
++    session = {"agent": None, "session_key": SID, "history": [], "history_lock": threading.Lock(),
++               "history_version": 0, "running": True, "attached_images": []}
++    monkeypatch.setattr("tui_gateway.turn_admission.owns", lambda session: True)
++
++    _moved_away(gw)
++    assert server._admit_prompt_turn("live-sid", session, "hello", None, None, None, None) is None
++    assert frames == [(f"This chat moved to {DST}; open it there.",
++                       {"layer": "gateway", "code": "SESSION_MOVED", "retryable": False})]
++    assert session["_turn_owner_refusal"] == "SESSION_MOVED" and session["running"] is False
++    assert claimed == []  # refused before the slot claim
++
++    # owned here again (no record): the gate passes on to the slot claim
++    gw.svc.session_owners[BOARD] = {}
++    so.reset_cache()
++    session["running"] = True
++    server._admit_prompt_turn("live-sid", session, "hello", None, None, None, None)
++    assert claimed == ["live-sid"]
++
++
++def _resume_args(**kw):
++    return SimpleNamespace(resume=SID, continue_last=None, no_restore_cwd=True, worktree=False, in_dir=None, **kw)
++
++
++def test_cli_resume_of_a_moved_session_exits_with_session_moved(gw, monkeypatch, capsys):
++    from hermes_cli import main as hm
++    monkeypatch.setattr(hm, "_apply_in_dir", lambda args: None)
++    monkeypatch.setattr(hm, "_import_foreign_resume", lambda args: None)
++    monkeypatch.setattr(hm, "_resolve_session_by_name_or_id", lambda value: value)
++    hm._resolve_chat_session_args(_resume_args(), use_tui=False)  # not moved: resumes
++    _moved_away(gw)
++    with pytest.raises(SystemExit) as exc:
++        hm._resolve_chat_session_args(_resume_args(), use_tui=False)
++    assert exc.value.code == 1
++    err = capsys.readouterr().err
++    assert "hermes-refusal-reason: SESSION_MOVED" in err and f"moved to {DST}" in err
++
++
++def test_oneshot_resume_of_a_moved_session_exits_before_the_turn(gw, monkeypatch, capsys):
++    from hermes_cli import main as hm
++    monkeypatch.setattr(hm, "_apply_in_dir", lambda args: None)
++    monkeypatch.setattr(hm, "_import_foreign_resume", lambda args: None)
++    monkeypatch.setattr(hm, "_resolve_session_by_name_or_id", lambda value: value)
++    monkeypatch.setattr(hm, "_confirm_startup_expensive_model_override", lambda args: None)
++    ran = []
++    monkeypatch.setattr(hm, "_run_and_exit_oneshot", lambda *a, **k: ran.append(k))
++    _moved_away(gw)
++    with pytest.raises(SystemExit) as exc:
++        hm._run_oneshot_from_args(_resume_args(oneshot="hi"))
++    assert exc.value.code == 1 and ran == []
++    assert "SESSION_MOVED" in capsys.readouterr().err
++
++
++# --- hermes sessions move, end to end ----------------------------------------------------------------------------
++
++def _cli(*argv) -> tuple[int, dict]:
++    """``hermes sessions <argv>`` through the real sessions parser and dispatcher."""
++    import argparse
++    import io
++    from hermes_cli.sessions_cmd import cmd_sessions
++    from hermes_cli.subcommands.sessions import build_sessions_parser
++    parser = argparse.ArgumentParser(prog="hermes")
++    build_sessions_parser(parser.add_subparsers(dest="command"), cmd_sessions=cmd_sessions)
++    args = parser.parse_args(["sessions", *argv])
++    out = io.StringIO()
++    with contextlib.redirect_stdout(out):
++        rc = cmd_sessions(args)
++    return rc, json.loads(out.getvalue().strip().splitlines()[-1])
++
++
++def _card(gw, title="build it"):
++    tid = kb.create_task(gw.conn, title=title, assignee="default", session_id=SID)
++    kbn.add_notify_sub(gw.conn, task_id=tid, platform="tui", chat_id=SID)
++    return tid
++
++
++def test_sessions_move_end_to_end_copies_reveals_archives_fences_and_repoints(gw):
++    tid = _card(gw)
++    rc, res = _cli("move", SID, "--to", DST, "--reason", "needs the hub's GPU")
++    assert rc == 0 and res["moved"] and res["revealed"], res
++    assert res["segments"] == {SID: 2}
++    assert res["owner"]["gateway"] == DST and res["owner"]["epoch"] == 1
++    assert _owner_on_board(gw)["gateway"] == DST
++
++    with contextlib.closing(_dst_db(gw)) as dst:  # copied and revealed there, cwd remapped
++        row = dst.get_session(SID)
++        assert row and not row["hidden"] and not row["archived"]
++        assert row["cwd"] == str(gw.dst_root / "code" / "proj")
++        assert [m["content"] for m in dst.get_messages(SID)] == ["please build it", "on it"]
++    row = gw.db.get_session(SID)  # archived here
++    assert row["archived"] and row["end_reason"] == f"moved_to_gateway:{DST}"
++    assert str(so.refusal(SID)) == f"This chat moved to {DST}; open it there."  # fenced here
++    so.reset_cache()
++    assert so.refusal(SID).reason == "SESSION_MOVED"
++
++    assert res["links"] == [{"board": BOARD, "task": tid, "chats": [SID], "to": f"{DST}/default"}]
++    subs = {(s["platform"], s["chat_id"]) for s in kbn.list_notify_subs(gw.conn, tid)}
++    assert subs == {("hub", f"{DST}/default/{SID}")}  # no tui sub: the archived copy here is never notified
++
++
++def _published(conn, tid: str, owner_gw: str) -> dict:
++    """The card as this gateway's hermes-hub client publishes it (client/hermes_hub.py: a ``platform='hub'``
++    subscription ``<gw>/<profile>/<session>`` becomes a ``rel: shepherd`` session link, tui subs ``subscribed``)."""
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++    t = kb.get_task(conn, tid)
++    sessions = [{"session": t.session_id, "profile": "default", "rel": "created"}] if t.session_id else []
++    for platform, chat in conn.execute("SELECT platform, chat_id FROM kanban_notify_subs WHERE task_id = ?", (tid,)):
++        if platform == "tui":
++            sessions.append({"session": chat, "profile": None, "rel": "subscribed"})
++        elif platform == "hub":
++            g, p, s = chat.split("/")
++            sessions.append({"session": s, "profile": p, "gw": g, "rel": "shepherd"})
++    task = {"id": tid, "status": t.status, "title": t.title, "board": BOARD, "gateway": owner_gw,
++            "profile": "default", "assignee": t.assignee, "origin_bindings": [], "sessions": sessions}
++    conn.execute("BEGIN")
++    try:
++        return observe_owner_task(conn, task, now=0)
++    finally:
++        conn.rollback()
++
++
++def test_a_card_done_after_the_move_notifies_the_copy_on_the_new_gateway(gw, tmp_path):
++    from tui_gateway.kanban_remote_notices import sweep_remote_notices
++    tid = _card(gw, "run the bench")
++    rc, res = _cli("move", SID, "--to", DST, "--reason", "bench box")
++    assert rc == 0 and res["moved"], res
++    kb.complete_task(gw.conn, tid, summary="bench: 42 it/s")
++
++    # the local tui notifier has nothing to deliver to the archived copy here
++    assert kbn.list_notify_subs(gw.conn, tid, platform="tui") == []
++    replica = tmp_path / "hub-replica.db"
++    with contextlib.closing(sqlite3.connect(replica)) as rc_conn:
++        rc_conn.execute("CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT)")
++        rc_conn.execute("INSERT INTO replica VALUES (?,?,?,?)",
++                        (SRC, "tasks", f"default/default/{tid}", json.dumps(_published(gw.conn, tid, SRC))))
++        rc_conn.commit()
++    with contextlib.closing(_dst_db(gw)) as dst:
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            assert profile == "default"
++            yield dst, dst.get_compression_tip(sid) or sid
++
++        out = sweep_remote_notices(replica_path=replica, gateway=DST, session_db=opener,
++                                   ledger=tmp_path / "dst-ledger.db")
++        assert len(out) == 1
++        notices = [m for m in dst.get_messages(SID) if m.get("display_kind") == "kanban_notice"]
++        assert len(notices) == 1 and tid in notices[0]["content"] and "42 it/s" in notices[0]["content"]
++    # this gateway never announces its own card to a remote chat of its own, nor to the archived copy
++    assert sweep_remote_notices(replica_path=replica, gateway=SRC, session_db=None) == []
++    assert not [m for m in gw.db.get_messages(SID) if m.get("display_kind") == "kanban_notice"]
++
++
++def test_move_refused_mid_turn_and_after_turn_waits_for_the_turn_to_end(gw):
++    holder = f"pid={__import__('os').getpid()}:test-turn"
++    assert gw.db.try_acquire_session_turn_lease(SID, holder)
++    res = sh.move_session(SID, DST, "x", db=gw.db)
++    assert res["moved"] is False and res["code"] == "turn_running"
++    assert _owner_on_board(gw) is None
++
++    res = sh.move_session(SID, DST, "x", after_turn=True, db=gw.db, wait_s=0.0, poll_s=0.0)
++    assert res["code"] == "turn_timeout" and _owner_on_board(gw) is None
++
++    slept = []
++
++    def sleep(s):
++        slept.append(s)
++        gw.db.release_session_turn_lease(SID, holder)  # the turn ends
++
++    res = sh.move_session(SID, DST, "after this turn", after_turn=True, db=gw.db, poll_s=0.01, sleep=sleep)
++    assert res["moved"] and slept == [0.01], res
++    assert _owner_on_board(gw)["gateway"] == DST
++
++
++def test_a_cas_failure_removes_the_hidden_copy(gw, monkeypatch):
++    gw.svc.session_owners[BOARD] = {SID: {"gateway": SRC, "epoch": 3, "moved_at": 1, "moved_by": OTHER}}
++    so.reset_cache()
++    real_move = so.move
++
++    def racing_move(sid, to, expect, reason):  # another move won between our read and the CAS
++        gw.svc.session_owners[BOARD][SID]["epoch"] = 4
++        return real_move(sid, to, expect, reason)
++
++    monkeypatch.setattr(so, "move", racing_move)
++    res = sh.move_session(SID, DST, "x", db=gw.db)
++    assert res["moved"] is False and res["code"] == "cas_failed" and res["cas"]["reason"] == "epoch_mismatch", res
++    assert res["discarded"]["ok"] and res["discarded"]["deleted"] == [SID]
++    with contextlib.closing(_dst_db(gw)) as dst:
++        assert dst.get_session(SID) is None
++    row = gw.db.get_session(SID)
++    assert not row["archived"] and row["end_reason"] is None  # still live here
++
++
++def test_move_needs_a_configured_host_and_a_reason(gw):
++    assert sh.move_session(SID, OTHER, "x", db=gw.db)["code"] == "unknown_host"
++    assert sh.move_session(SID, DST, " ", db=gw.db)["code"] == "reason_required"
++    assert sh.move_session(SID, SRC, "x", db=gw.db, cfg={"sessions": {"move": {"hosts": {SRC: "me"}}}})["code"] \
++        == "same_gateway"
++    gw.svc.session_owners[BOARD] = {SID: {"gateway": OTHER, "epoch": 1, "moved_at": 1, "moved_by": SRC}}
++    so.reset_cache()
++    assert sh.move_session(SID, DST, "x", db=gw.db)["code"] == "not_owner"
++
++
++def test_import_lineage_replaces_a_copy_this_gateway_handed_away(tmp_path):
++    """A chat moved away and back: the archived ``moved_to_gateway:`` copy here is replaced by the newer one."""
++    with contextlib.closing(SessionDB(tmp_path / "a.db")) as a, contextlib.closing(SessionDB(tmp_path / "b.db")) as b:
++        a.create_session(SID, "desktop", cwd="/home/u/code/x")
++        a.append_message(SID, "user", "one")
++        b.import_sessions([a.export_session_lineage(SID, include_inactive=True)["segments"][0]])
++        b.end_session(SID, "moved_to_gateway:hub")
++        b.set_session_archived(SID, True)
++        a.append_message(SID, "assistant", "two")
++        payload = {**a.export_session_lineage(SID, include_inactive=True), "source_home": "/home/u"}
++        res = sh.import_lineage(payload, hidden=True, db=b, home="/Users/u")
++        assert res["ok"] and res["replaced"] == [SID] and res["counts"] == {SID: 2}, res
++        row = b.get_session(SID)
++        assert row["hidden"] and not row["archived"] and row["cwd"] == "/Users/u/code/x"
++        assert sh.discard_hidden([SID], db=b)["deleted"] == [SID]
++        b.import_sessions([dict(payload["segments"][0])])
++        assert sh.discard_hidden([SID], db=b) == {"ok": False, "deleted": [], "kept_visible": [SID]}
++
++
++def test_transport_argv_templates():
++    cfg = {"sessions": {"move": {}}}
++    assert sh.transport_argv("u@h", ["sessions", "reveal", "s1"], cfg) == [
++        "ssh", "-o", "BatchMode=yes", "u@h", "hermes sessions reveal s1"]
++    cfg = {"sessions": {"move": {"transport": ["env", "X=1", "{args}"], "remote_hermes": "py -m hermes_cli.main"}}}
++    assert sh.transport_argv("u@h", ["sessions", "reveal", "s 1"], cfg) == [
++        "env", "X=1", "py", "-m", "hermes_cli.main", "sessions", "reveal", "s 1"]
+diff --git a/tests/tools/test_session_move_tool.py b/tests/tools/test_session_move_tool.py
+new file mode 100644
+index 0000000000..8f03a04131
+--- /dev/null
++++ b/tests/tools/test_session_move_tool.py
+@@ -0,0 +1,65 @@
++"""``session_move``: the agent tool starts ``hermes sessions move ... --after-turn`` detached. [daveey]"""
++from __future__ import annotations
++
++import json
++import subprocess
++
++import pytest
++
++from hermes_cli import session_handover as sh
++from tools import session_move_tool as smt
++
++
++@pytest.fixture
++def hosts(monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(sh, "move_hosts", lambda cfg=None: {"hub": "ubuntu@hub-host"})
++    monkeypatch.setattr(smt, "_current_session_id", lambda: "20261028_120000_aaaaaa")
++
++
++def test_the_tool_spawns_the_after_turn_move_detached(hosts, monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    started = []
++
++    class _Proc:
++        pid = 4242
++
++    def popen(argv, **kw):
++        started.append((argv, kw))
++        return _Proc()
++
++    monkeypatch.setattr(subprocess, "Popen", popen)
++    out = json.loads(smt.session_move("hub", "needs the hub's GPU"))
++    assert out == {"ok": True, "session_id": "20261028_120000_aaaaaa", "to": "hub", "pid": 4242,
++                   "message": "moving after this turn; reopen the chat on hub"}
++    [(argv, kw)] = started
++    assert argv[1:] == ["-m", "hermes_cli.main", "sessions", "move", "20261028_120000_aaaaaa", "--to", "hub",
++                        "--reason", "needs the hub's GPU", "--after-turn"]
++    assert kw["start_new_session"] is True and kw["stdin"] is subprocess.DEVNULL
++    assert (tmp_path / "logs" / "session-move-20261028_120000_aaaaaa.log").exists()
++
++
++def test_the_tool_refuses_a_target_not_in_sessions_move_hosts(hosts, monkeypatch):
++    monkeypatch.setattr(sh, "spawn_after_turn_move", lambda *a: pytest.fail("must not spawn"))
++    out = json.loads(smt.session_move("linux-2", "x"))
++    assert out["code"] == "unknown_host" and "linux-2" in out["error"]
++    assert json.loads(smt.session_move("hub", " "))["code"] == "reason_required"
++
++
++def test_the_tool_is_offered_to_chats_with_hosts_only_never_to_kanban_workers(hosts, monkeypatch):
++    assert smt.check_session_move_requirements() is True
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_123")
++    assert smt.check_session_move_requirements() is False
++    assert "error" in json.loads(smt.session_move("hub", "x"))
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    monkeypatch.setattr(sh, "move_hosts", lambda cfg=None: {})
++    assert smt.check_session_move_requirements() is False
++
++
++def test_the_tool_is_registered_in_the_session_move_toolset():
++    from tools.registry import registry
++    import toolsets
++    entry = registry.get_entry("session_move") if hasattr(registry, "get_entry") else registry._tools["session_move"]
++    assert entry.toolset == "session_move"
++    assert "session_move" in toolsets.TOOLSETS["session_move"]["tools"]
++    assert "session_move" not in toolsets.TOOLSETS["kanban"]["tools"]
+diff --git a/tools/session_move_tool.py b/tools/session_move_tool.py
+new file mode 100644
+index 0000000000..e16229ac4a
+--- /dev/null
++++ b/tools/session_move_tool.py
+@@ -0,0 +1,83 @@
++"""``session_move``: a chat hands itself over to another gateway after this turn. [daveey]
++
++It starts ``hermes sessions move <this session> --to <to> --reason ... --after-turn`` detached
++(:func:`hermes_cli.session_handover.spawn_after_turn_move`): the move waits for this turn to end, copies the chat to
++``to``, records the new owner on the Board and archives the copy here (hermes_cli.session_handover). Chats only:
++never available to a Kanban worker (``HERMES_KANBAN_TASK``), and only when ``sessions.move.hosts`` lists a target.
++"""
++from __future__ import annotations
++
++import os
++from typing import Any, Optional
++
++from tools.registry import no_cache_check_fn, registry, tool_error, tool_result
++
++SESSION_MOVE_SCHEMA = {
++    "name": "session_move",
++    "description": (
++        "Move THIS chat to another gateway (machine) after the current turn ends, e.g. when the work needs files, "
++        "devices or tools that only exist there. The chat's whole history is copied, the other gateway becomes "
++        "its owner and the copy here is archived; the user reopens the chat on the target. Only targets listed in "
++        "sessions.move.hosts are allowed. Say what will happen and why before calling it; the move starts once "
++        "this turn is over."),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "to": {"type": "string", "description": "Target gateway name (a key of sessions.move.hosts)"},
++            "reason": {"type": "string", "description": "Why this chat must move (recorded with the move)"},
++        },
++        "required": ["to", "reason"],
++    },
++}
++
++
++def _hosts() -> dict[str, str]:
++    from hermes_cli.session_handover import move_hosts
++    return move_hosts()
++
++
++@no_cache_check_fn
++def check_session_move_requirements() -> bool:
++    """Chats only (never a Kanban worker), and only with a configured target."""
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return False
++    try:
++        return bool(_hosts())
++    except Exception:  # health: allow BLE001 -- unreadable config: the tool is not offered
++        return False
++
++
++def _current_session_id() -> Optional[str]:
++    from gateway.session_context import get_session_env
++    for name in ("HERMES_SESSION_KEY", "HERMES_SESSION_ID"):
++        value = (get_session_env(name, "") or "").strip()
++        if value:
++            return value
++    return None
++
++
++def session_move(to: Any, reason: Any) -> str:
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return tool_error("session_move is for chats; a Kanban worker moves its card with kanban_move")
++    to = str(to or "").strip()
++    reason = str(reason or "").strip()
++    hosts = _hosts()
++    if to not in hosts:
++        return tool_error(f"{to!r} is not a configured move target (sessions.move.hosts: "
++                          f"{', '.join(sorted(hosts)) or 'none'})", code="unknown_host")
++    if not reason:
++        return tool_error("reason is required (why this chat must move)", code="reason_required")
++    sid = _current_session_id()
++    if not sid:
++        return tool_error("no current chat session to move", code="no_session")
++    from hermes_cli import session_handover as sh
++    pid = sh.spawn_after_turn_move(sid, to, reason)
++    return tool_result({"ok": True, "session_id": sid, "to": to, "pid": pid,
++                        "message": f"moving after this turn; reopen the chat on {to}"})
++
++
++registry.register(
++    name="session_move", toolset="session_move", schema=SESSION_MOVE_SCHEMA,
++    check_fn=check_session_move_requirements,
++    handler=lambda args, **kw: session_move(args.get("to"), args.get("reason")),
++    emoji="🚚")
+diff --git a/toolsets.py b/toolsets.py
+index 153c528ed4..60e8e4a0b4 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -23,6 +23,7 @@ _HERMES_CORE_TOOLS = [
+     "text_to_speech",
+     "todo_list", "memory",
+     "session_search",
++    "session_move",  # chats only: its check_fn refuses Kanban workers and unconfigured hosts [daveey]
+     "clarify",
+     "execute_code", "delegate_task",
+     "cronjob_manage",
+@@ -129,6 +130,8 @@ TOOLSETS = {
+     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+     "context_engine": _ts("Runtime tools exposed by the active context engine"),
+     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
++    "session_move": _ts("Hand this chat over to another gateway after the turn (sessions.move.hosts)",
++                        ["session_move"]),
+     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
+     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
+     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index efa9ae9e2e..902e43a10d 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -140,7 +140,9 @@ def _admit_prompt_turn(
+             return None
+     held_lease = session.get("active_session_lease")
+     # When the session already holds its lease this is a cheap dict check. See #94778.
+-    if not session.get("_closing") and (ownership_refusal := _ensure_active_session_slot(sid, session)) is not None:
++    # [daveey] A chat handed over to another gateway (hermes sessions move) is fenced here, before the slot claim.
++    if not session.get("_closing") and (ownership_refusal := (
++            _session_moved_refusal(session) or _ensure_active_session_slot(sid, session))) is not None:
+         logger.info(
+             "Refusing turn for session %s at _run_prompt_submit: %s",
+             session.get("session_key") or sid,
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index b1622300d1..617e6ea5e5 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -126,6 +126,22 @@ def _durable_owner_refusal(session: dict):
+         f"Writer: {holder}", SESSION_NOT_OWNED)
+ 
+ 
++def _session_moved_refusal(session: dict):
++    """``SESSION_MOVED`` when the Board's owner record for this chat's lineage names another gateway (it was handed
++    over with ``hermes sessions move``), else None. No record, sync off or an unreachable Board without a cached
++    answer admit the turn (hermes_cli.session_owner). [daveey]"""
++    key = str(session.get("session_key") or "")
++    if not key:
++        return None
++    from hermes_cli import session_owner
++    try:
++        with _session_db(session) as db:
++            return session_owner.refusal(key, db=db)
++    except Exception:
++        logger.warning("Could not check the session owner record for %s", key, exc_info=True)
++        return None
++
++
+ def _ensure_active_session_slot(sid: str, session: dict, *, allow_takeover: bool = True) -> str | None:
+     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
+     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
+-- 
+2.55.0
+

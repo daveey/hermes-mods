@@ -1,0 +1,142 @@
+From 0c02a4eb07acafd76c3b2e25551e9d478b1d8b28 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:18:13 -0700
+Subject: [PATCH] fix(desktop): transcript prefetch rides warm remote pool
+ entries passively [daveey]
+
+The remote prewarmer already dials and holds every SSH gateway (same pool key,
+conn:<id>::default). Prefetch now passes passive for remote connections, so it
+never starts a cold SSH dial or spawn, never bumps lastActiveAt, and never
+records a profile as opened. The local backend may still be started.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../electron/transcript-cache-host.test.ts    | 79 +++++++++++++++++++
+ .../desktop/electron/transcript-cache-host.ts | 11 ++-
+ 2 files changed, 88 insertions(+), 2 deletions(-)
+ create mode 100644 apps/desktop/electron/transcript-cache-host.test.ts
+
+diff --git a/apps/desktop/electron/transcript-cache-host.test.ts b/apps/desktop/electron/transcript-cache-host.test.ts
+new file mode 100644
+index 0000000000..9fc2910441
+--- /dev/null
++++ b/apps/desktop/electron/transcript-cache-host.test.ts
+@@ -0,0 +1,79 @@
++import fs from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { installTranscriptCache } from './transcript-cache-host'
++
++const dirs: string[] = []
++
++afterEach(() => {
++  for (const dir of dirs.splice(0)) {
++    fs.rmSync(dir, { force: true, recursive: true })
++  }
++})
++
++function install() {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-cache-host-'))
++  dirs.push(dir)
++
++  const on = new Map<string, (event: any, payload?: any) => void>()
++  const ipcMain = { handle: vi.fn(), on: (channel: string, fn: any) => on.set(channel, fn) }
++  const backendFor = vi.fn(async (connectionId: string, _opts: { passive: boolean }) => ({ connectionId }))
++
++  const getJson = vi.fn(async (descriptor: any, requestPath: string) => {
++    if (requestPath.startsWith('/api/plugins/hub-sync/sessions')) {
++      return {
++        sessions: [
++          { activity: 2, gateway: 'mini', id: 'm1', message_count: 3, profile: 'default' },
++          { activity: 1, gateway: 'macbook', id: 'l1', message_count: 3, profile: 'default' }
++        ]
++      }
++    }
++
++    if (requestPath === '/api/plugins/hub-sync/status') {
++      return { gateway: descriptor.connectionId === 'local' ? 'macbook' : 'mini' }
++    }
++
++    return { messages: [{ content: `row of ${descriptor.connectionId}`, id: 1, role: 'user' }] }
++  })
++
++  const host = installTranscriptCache({
++    backendFor,
++    getJson,
++    ipcMain: ipcMain as never,
++    log: () => undefined,
++    registry: () => ({ connectionIds: ['local', 'mac-mini'], primary: 'local' }),
++    userDataDir: dir
++  })
++
++  return { backendFor, host, on }
++}
++
++describe('transcript cache host', () => {
++  it('prefetch rides warm remote pool entries (passive) and may start the local backend', async () => {
++    const { backendFor, host } = install()
++
++    expect(await host.prefetcher.tick()).toMatchObject({ fetched: 2 })
++
++    const remote = backendFor.mock.calls.filter(([id]) => id === 'mac-mini')
++    const local = backendFor.mock.calls.filter(([id]) => id === 'local')
++    expect(remote.length).toBeGreaterThan(0)
++    expect(remote.every(([, opts]) => opts.passive === true)).toBe(true)
++    // The hub list read is passive; the local name probe and transcript fetch may spawn.
++    expect(local.some(([, opts]) => opts.passive === false)).toBe(true)
++    host.stop()
++  })
++
++  it('answers the renderer read over sync IPC, normalizing an empty connection to the primary', async () => {
++    const { host, on } = install()
++
++    await host.prefetcher.tick()
++
++    const event: { returnValue?: any } = {}
++    on.get('hermes:transcript-cache:read')!(event, { connectionId: '', profile: '', sessionId: 'l1' })
++    expect(event.returnValue?.messages).toEqual([{ content: 'row of local', id: 1, role: 'user' }])
++    host.stop()
++  })
++})
+diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
+index d820ba2d8b..c3eca153a0 100644
+--- a/apps/desktop/electron/transcript-cache-host.ts
++++ b/apps/desktop/electron/transcript-cache-host.ts
+@@ -50,6 +50,13 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+     }
+   }
+ 
++  // Remote gateways are held warm by the B prewarmer (remote-prewarm); prefetch only
++  // rides a pool entry that already exists and never starts a cold SSH dial or spawn
++  // (and, being passive, never counts as an open). The local backend may be started.
++  const dialOptions = (connectionId: string) => ({
++    passive: connectionId !== (deps.registry().primary || 'local')
++  })
++
+   const guarded = <T>(label: string, fn: () => T, fallback: T): T => {
+     try {
+       return fn()
+@@ -131,7 +138,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+       learnedThisRun.add(connectionId)
+ 
+       try {
+-        const descriptor = await deps.backendFor(connectionId, { passive: false })
++        const descriptor = await deps.backendFor(connectionId, dialOptions(connectionId))
+         const status = await deps.getJson(descriptor, '/api/plugins/hub-sync/status', { timeoutMs: 8_000 })
+         const name = typeof status?.gateway === 'string' ? status.gateway.trim() : ''
+ 
+@@ -154,7 +161,7 @@ export function installTranscriptCache(deps: TranscriptCacheHostDeps) {
+   const prefetcher = new TranscriptPrefetcher({
+     connectionForGateway,
+     fetchLatest: async (key, limit) => {
+-      const descriptor = await deps.backendFor(key.connectionId, { passive: false })
++      const descriptor = await deps.backendFor(key.connectionId, dialOptions(key.connectionId))
+ 
+       const query = new URLSearchParams({
+         include_compacted: 'true',
+-- 
+2.55.0
+

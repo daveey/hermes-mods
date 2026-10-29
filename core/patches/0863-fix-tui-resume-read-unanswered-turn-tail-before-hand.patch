@@ -1,0 +1,72 @@
+From ae5cb9a99c0af3f7f6dfa17e78f4bea476caf516 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:18:24 +0000
+Subject: [PATCH] fix(tui resume): read unanswered-turn tail before handing the
+ profile db to the hydration worker; deflakes deferred-resume db ownership
+ test
+
+---
+ .../tui_gateway/test_deferred_model_history.py | 18 ++++++++++++++++++
+ tui_gateway/methods_session.py                 |  6 ++++--
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/tests/tui_gateway/test_deferred_model_history.py b/tests/tui_gateway/test_deferred_model_history.py
+index 85698130c7..f6132ba4ef 100644
+--- a/tests/tui_gateway/test_deferred_model_history.py
++++ b/tests/tui_gateway/test_deferred_model_history.py
+@@ -70,6 +70,23 @@ def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monk
+     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *args: None)
+     monkeypatch.setattr(server, "_start_agent_build", lambda *args: built.set())
+     monkeypatch.setattr(server, "_emit", lambda kind, sid, payload: events.append((kind, payload)))
++    reopened = []
++    original_tail = db.latest_conversation_tail
++    original_schedule = server._schedule_resume_hydration
++
++    def tail(key):
++        if closed.is_set():  # a read after close() silently reopens the handle (#94736)
++            reopened.append(key)
++        return original_tail(key)
++
++    def schedule_and_finish(*args, **kwargs):
++        # Starve the response thread: the worker finishes (and closes) before the handler continues.
++        original_schedule(*args, **kwargs)
++        if kwargs.get("close_db"):
++            assert closed.wait(5)
++
++    monkeypatch.setattr(db, "latest_conversation_tail", tail)
++    monkeypatch.setattr(server, "_schedule_resume_hydration", schedule_and_finish)
+     sid = None
+     try:
+         response = server.handle_request({"id": "resume", "method": "session.resume", "params": {
+@@ -91,6 +108,7 @@ def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monk
+         if profile:
+             assert closed.wait(5)
+             assert db._conn is None
++            assert not reopened, "resume read the profile db after the hydration worker closed it"
+         else:
+             assert not closed.is_set()
+             assert db.get_session("tip") is not None
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 354babe3a5..96f248d6ed 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -970,12 +970,14 @@ def _resume_deferred(ctx: _Resume) -> dict:
+                   resume_message_count=int(ctx.found.get("message_count") or 0))
+     if (reused := ctx.claim(sid, record)) is not None:
+         return reused
++    # Before the handle moves to the hydration worker: one indexed read of the newest durable row.
++    # It must precede the schedule: a fast worker finishes and close()s the profile-scoped handle,
++    # and a read after that reopens it (teardown/worker race, #94736).
++    unanswered = _unanswered_turn_inflight(record, None, ctx.db)
+     # Desktop owns the visible transcript through bounded REST pages, not this model-history restore.
+     _schedule_resume_hydration(
+         sid, ctx.target, ctx.db, close_db=ctx.owns_db,
+         model_history_only=source == "desktop" and ctx.omit_messages)
+-    # Before the handle moves to the hydration worker: one indexed read of the newest durable row.
+-    unanswered = _unanswered_turn_inflight(record, None, ctx.db)
+     ctx.owns_db = False  # the hydration worker now owns (and closes) the profile-scoped handle
+     _schedule_session_cap_enforcement()
+     return _resume_response(ctx, sid, record, info=ctx.info(cwd, overrides), messages=[],
+-- 
+2.55.0
+

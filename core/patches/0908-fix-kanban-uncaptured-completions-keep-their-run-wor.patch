@@ -1,0 +1,461 @@
+From 49745758d7efc93f671c72993a4c52ab345c3773 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 05:42:52 +0000
+Subject: [PATCH] fix(kanban): uncaptured completions keep their run;
+ worker-node ghosts retire [daveey]
+
+Two idle-check violations from 10-29, each a class:
+
+1. hub t_01a185075c59bd52 closed on owner, never released. Its completion landed in a capture-trigger gap.
+   repair_divergence re-queued only the tasks row, so the Board took `done` while the lease's run was still
+   open and ended that run with its placeholder (rows.ts endLeaseRun: released, "card left running (done)").
+   With no later holder write, the placeholder came back over the local done/completed run. The owner
+   observation then published verified=False, and a ledger-bound card is never released without verification.
+   - repair_divergence also queues the card's diverged run rows (same Board version on both sides, nothing in
+     flight), BEFORE the tasks row.
+   - heal_clobbered_completions (primary rounds, after the pull) restores a run that has exactly the
+     placeholder shape: the card is done, the run is its latest, and its latest completed event names the run.
+     The fix goes through capture, so the Board is corrected as well.
+
+2. MacBook chat 20261022_205332_a60287 kept hub/default/default/t_1f359ff1 open. The hub's worker node had
+   published its copy of a MacBook card as hub-owned (hermes-hub fix: daveey/hermes-hub#59). After eviction the
+   origin's remembered row stayed stale forever, because absence is not closure. A remembered qualified row is
+   retired (never released) only when a fresh replica shows the named owner publishing that exact scope right
+   now without the card, AND another gateway publishing a qualified record with the same board, id and
+   created_at.
+
+Tests (each red on base): test_kanban_sync_run_rows (gap completion, clobber heal, plus a heal guard),
+test_kanban_remote_moved_owner (retire in the same process and at a cold start from the snapshot, plus 3
+unproven-move guards). The fake Board now mirrors rows.ts endLeaseRun.
+---
+ hermes_cli/kanban_session_activity.py         | 58 +++++++++++--
+ hermes_cli/kanban_sync_client.py              | 83 +++++++++++++++++-
+ tests/hermes_cli/kanban_sync_fake_board.py    |  8 ++
+ .../test_kanban_remote_moved_owner.py         | 87 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_sync_run_rows.py | 61 +++++++++++++
+ 5 files changed, 288 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_remote_moved_owner.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index a8c115533a..cc906a6c5e 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -654,6 +654,38 @@ def _owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str |
+     return beat is not None and 0 <= now - beat <= SCOPE_HEARTBEAT_FRESH_S
+ 
+ 
++def _moved_evidence(tasks: dict[tuple, dict[str, Any]], heartbeats: dict[tuple[str, str, str], float],
++                    now: float) -> dict[str, Any]:
++    """What a fresh replica proves about where each card lives (``_retire_moved``): the gateways publishing a
++    profile-qualified record per ``(board, id, created_at)``, and the owner scopes whose collector read cleanly within
++    ``SCOPE_HEARTBEAT_FRESH_S``. [daveey]"""
++    published: dict[tuple[str, str, Any], set[str]] = {}
++    for (gw, owner_profile, board, tid), t in tasks.items():
++        if owner_profile is not None and t.get('created_at') is not None:
++            published.setdefault((board, tid, t.get('created_at')), set()).add(gw)
++    live = {scope for scope, beat in heartbeats.items() if 0 <= now - beat <= SCOPE_HEARTBEAT_FRESH_S}
++    return {'published': {k: frozenset(v) for k, v in published.items()}, 'live_scopes': frozenset(live)}
++
++
++def _retire_moved(card: dict[str, Any], moved: dict[str, Any]) -> bool:
++    """A remembered row whose card a fresh replica proves lives on ANOTHER gateway: retire it, never release it.
++
++    A worker node runs another gateway's card from a copy in its own board file, and its collector used to publish
++    that copy as its own (``hub/default/default/t_1f359ff1`` for a MacBook card, 10-29). Once the copy was evicted
++    the record vanished, and absence is never closure, so the origin kept the row stale and open forever, naming an
++    owner that has no such card. It is retired only on proof: the named owner is publishing that exact
++    profile/board scope right now without the card, and another gateway publishes a qualified record with the
++    same board, id and ``created_at`` (a copy keeps its ``created_at``). The real owner's record then speaks for
++    the card: its own links, or this gateway's local board when the card is local. [daveey]"""
++    if card.get('ownership_state') != 'qualified' or card.get('created_at') is None:
++        return False
++    scope = (card.get('gateway'), card.get('owner_profile'), card.get('board'))
++    if scope not in moved.get('live_scopes', ()):
++        return False
++    gateways = moved.get('published', {}).get((card.get('board'), card.get('id'), card.get('created_at')), ())
++    return any(gw != card.get('gateway') for gw in gateways)
++
++
+ def _fold_legacy_aliases(tasks: dict[tuple, dict[str, Any]], raw: dict[tuple, dict[str, Any]]) -> None:
+     """Merge each unqualified ``board/id`` record into its proven profile-qualified twin, in place.
+ 
+@@ -724,7 +756,8 @@ _REPLICA_PROBE = ("SELECT count(*), count(seq), max(seq), total(seq), total(vers
+ 
+ def _read_remote_links(path: Path, now: float | None = None, *,
+                        qualified_out: set | None = None,
+-                       owners_out: set | None = None) -> list[dict[str, Any]]:
++                       owners_out: set | None = None,
++                       moved_out: dict | None = None) -> list[dict[str, Any]]:
+     """Replica cards linked to a session on this gateway, one row per (session, card).
+ 
+     Open and unproven cards come back ``unfinished``; cards their owner attests closed
+@@ -763,27 +796,32 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                     qualified_out.update(memo[4])
+                 if owners_out is not None:
+                     owners_out.update(memo[5])
++                if moved_out is not None:
++                    moved_out.update(memo[9])
+                 return list(memo[3])  # cards are read-only, as in ``_links_cache``
+         rows = conn.execute(f"SELECT gw, key, data, updated_at, {version_column} FROM replica WHERE coll = 'tasks'").fetchall()
+     finally:
+         conn.close()
+     if key is None:
+         return _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+-                                qualified_out=qualified_out, owners_out=owners_out)
++                                qualified_out=qualified_out, owners_out=owners_out, moved_out=moved_out)
+     qualified: set = set()
+     owners: set = set()
++    moved: dict = {}
+     seen_at: dict[str, float] = {}
+     cards = _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+-                             qualified_out=qualified, owners_out=owners, seen_out=seen_at)
++                             qualified_out=qualified, owners_out=owners, seen_out=seen_at, moved_out=moved)
+     # Reuse ends at the next scope-heartbeat cut-off; the hub-staleness cut-off is the ``stale`` comparison above.
+     beats = [beat + d for beat in _scope_heartbeats(info_rows).values() for d in (0.0, SCOPE_HEARTBEAT_FRESH_S)]
+     _remote_read_memo = (key, now, min((t for t in beats if t > now), default=float('inf')), list(cards),
+                          frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
+-                         dict(seen_at))
++                         dict(seen_at), dict(moved))
+     if qualified_out is not None:
+         qualified_out.update(qualified)
+     if owners_out is not None:
+         owners_out.update(owners)
++    if moved_out is not None:
++        moved_out.update(moved)
+     return cards
+ 
+ 
+@@ -799,7 +837,8 @@ def _replica_synced(seen_at: dict[str, float], last_ok: float | None) -> tuple:
+ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: list, last_ok: float | None,
+                      offline: float | None, *, qualified_out: set | None = None, owners_out: set | None = None,
+                      horizon_out: list[float] | None = None,
+-                     seen_out: dict[str, float] | None = None) -> list[dict[str, Any]]:
++                     seen_out: dict[str, float] | None = None,
++                     moved_out: dict | None = None) -> list[dict[str, Any]]:
+     """``_read_remote_links`` of rows already read. ``horizon_out`` collects every wall time after ``now`` at which
+     the same rows could project differently (hub-sync staleness, scope-heartbeat freshness)."""
+     stale = offline is not None or last_ok is None or now - last_ok > HUB_STALE_AFTER_S
+@@ -853,6 +892,8 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         # A fresh replica that still carries the owner row is authoritative about its links: a remembered
+         # (session, card) pair absent from it is a dropped link, not an unreadable replica.
+         owners_out.update((gw, board, tid) for gw, _, board, tid in tasks)
++    if moved_out is not None and not stale:
++        moved_out.update(_moved_evidence(tasks, heartbeats, now))
+     blank_before = {key for key in tasks if key[1] is None}
+     _fold_legacy_aliases(tasks, raw)
+     # Only a proven-identity alias is the same card as its qualified twin (folded above, links carried
+@@ -1279,7 +1320,8 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+             raise FileNotFoundError("no hub.db")
+         qualified: set[tuple[str, str, str]] = set()
+         owners: set[tuple[str, str, str]] = set()
+-        cards = _read_remote_links(path, qualified_out=qualified, owners_out=owners)
++        moved: dict[str, Any] = {}
++        cards = _read_remote_links(path, qualified_out=qualified, owners_out=owners, moved_out=moved)
+     except Exception as exc:  # a broken replica must never break the sidebar
+         if previous is None:
+             if path is not None:
+@@ -1306,7 +1348,9 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+                  # Fresh replica + owner row present but this session's link gone: expire the ghost.
+                  and (c.get("gateway"), c.get("board"), c.get("id")) not in owners
+                  and not (c.get("ownership_state") == "unknown"
+-                          and (c["session"], c.get("gateway"), c.get("board"), c.get("id")) in qualified_now))
++                          and (c["session"], c.get("gateway"), c.get("board"), c.get("id")) in qualified_now)
++                 # Fresh replica: the named owner publishes the scope without it, another gateway owns the card.
++                 and not _retire_moved(c, moved))
+     if _snapshot_saved != (scope, cards):
+         # The durable snapshot only speeds a cold start. Losing a write race (database is locked) must not
+         # fail this read: the sidebar would mark every row kanban_unknown. The next changed read retries.
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index a4b0495bb6..c114f3891e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -615,6 +615,8 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+             if mode == "primary" and sync.refresh_remote_parents(live, replica):
+                 sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+             result.repaired = repair_divergence(live, replica, gateway)
++            if mode == "primary":
++                heal_clobbered_completions(live)
+         finally:
+             replica.close()
+         result.push = push(live, hub, slug, gateway, primary=mode == "primary")
+@@ -1038,17 +1040,94 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+         fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v}
+         if not fields:
+             continue
++        runs = _diverged_runs(live, shadow, tid)
+         with write_txn(live):
++            # [daveey] The same uncaptured transaction usually ended the card's run too (``complete_task`` writes
++            # both). Queue those run rows FIRST: a card arriving ``done`` before its run makes the Board end the
++            # lease's run generically (rows.ts ``endLeaseRun``: ``released``, "card left running (done)"), and
++            # with no later holder write that row came back over the real ``done/completed`` run. The owner then
++            # published the card unverified, and no origin ever released it (hub t_01a185075c59bd52, 10-29).
++            for run_uid, run_fields, run_version in runs:
++                live.execute(
++                    "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, "
++                    "created_at) VALUES (?, 'task_runs', ?, 'upsert', ?, ?, '', ?)",
++                    (sync.uuid7(), run_uid, json.dumps(run_fields), None, int(time.time() * 1000)))
+             live.execute(
+                 "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+                 "VALUES (?, 'tasks', ?, 'upsert', ?, ?, '', ?)",
+                 (sync.uuid7(), tid, json.dumps(fields), row["sync_version"], int(time.time() * 1000)))
+-        repaired[tid] = sorted(fields)
++        repaired[tid] = sorted(fields) + [f"task_runs:{uid}" for uid, _f, _v in runs]
+         _log.warning("kanban sync: %s %s differed from the service with nothing in flight (an uncaptured write); "
+-                     "re-queued", tid, ", ".join(sorted(fields)))
++                     "re-queued", tid, ", ".join(repaired[tid]))
+     return repaired
+ 
+ 
++def _diverged_runs(live: sqlite3.Connection, shadow: sqlite3.Connection, tid: str) -> list[tuple[str, dict, Any]]:
++    """``(uid, full row fields, Board version)`` of ``tid``'s run rows the service never received: same Board version on
++    both sides (this gateway has applied every service write of the row), nothing in flight, and a synced field that
++    differs. A run the service never saw at all is the install-time gap heal's (it has no uid there)."""
++    held = {r[0] for r in live.execute(
++        "SELECT DISTINCT row_uid FROM kanban_sync_outbox WHERE table_name = 'task_runs' "
++        "AND state IN ('pending', 'rejected')")}
++    out = []
++    for row in live.execute("SELECT * FROM task_runs WHERE task_id = ? AND uid IS NOT NULL ORDER BY id", (tid,)):
++        uid = row["uid"]
++        if uid in held:
++            continue
++        theirs = shadow.execute("SELECT * FROM task_runs WHERE uid = ?", (uid,)).fetchone()
++        if theirs is None or theirs["sync_version"] is None or theirs["sync_version"] != row["sync_version"]:
++            continue
++        mine, remote = _row_fields(live, "task_runs", row), _row_fields(shadow, "task_runs", theirs)
++        if any(k in remote and remote[k] != v for k, v in mine.items()):
++            out.append((uid, mine, row["sync_version"]))
++    return out
++
++
++# rows.ts ``upsertTask``: the holder moved its card out of ``running`` before its own end of the run arrived, so the
++# Board ended the lease's run with this placeholder. Its comment: "the holder's own end of the run normally follows".
++_LEASE_END_PLACEHOLDER = "card left running (done)"
++
++
++def heal_clobbered_completions(live: sqlite3.Connection) -> list[str]:
++    """Restore completed runs the Board's placeholder lease end overwrote; returns the task ids healed.
++
++    Guarded to the one shape that write leaves: the card is ``done``; the run is its latest; the run reads exactly
++    ``released``/``released`` with the Board's placeholder error; and the card's latest ``completed`` event names
++    that run (``complete_task`` writes the event and the ``done/completed`` run end in one transaction, so the
++    event proves how this holder ended the run). The run is set back to ``done``/``completed`` with the event's
++    summary, through the capture triggers, so the Board's copy is corrected by the next push too. Anything else is
++    left alone: a run released for any other reason is not a completion. [daveey]"""
++    from hermes_cli.kanban_db_connect import write_txn
++    rows = live.execute(
++        "SELECT r.id AS run_id, r.task_id, r.ended_at, t.completed_at FROM task_runs r JOIN tasks t ON t.id = r.task_id "
++        "WHERE r.status = 'released' AND r.outcome = 'released' AND r.error = ? AND t.status = 'done' "
++        "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = r.task_id)", (_LEASE_END_PLACEHOLDER,)).fetchall()
++    healed = []
++    for row in rows:
++        event = live.execute(
++            "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1",
++            (row["task_id"],)).fetchone()
++        if event is None or event["run_id"] != row["run_id"]:
++            continue
++        try:
++            payload = json.loads(event["payload"] or "{}")
++        except ValueError:
++            payload = {}
++        summary = (payload.get("summary") or payload.get("result")) if isinstance(payload, dict) else None
++        ended = max(int(row["ended_at"] or 0), int(row["completed_at"] or 0)) or None
++        with write_txn(live):
++            changed = live.execute(
++                "UPDATE task_runs SET status = 'done', outcome = 'completed', error = NULL, "
++                "summary = COALESCE(summary, ?), ended_at = ? "
++                "WHERE id = ? AND status = 'released' AND outcome = 'released' AND error = ?",
++                (summary, ended, row["run_id"], _LEASE_END_PLACEHOLDER)).rowcount
++        if changed:
++            healed.append(row["task_id"])
++            _log.warning("kanban sync: %s run %s was ended by the Board's lease placeholder over its completion; "
++                         "restored done/completed", row["task_id"], row["run_id"])
++    return healed
++
++
+ # --- leases (primary boards) ----------------------------------------------------------------------
+ 
+ class HubLeaseClient:
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index fe7914bfdc..7d59c0e59a 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -89,6 +89,14 @@ class FakeService:
+             # As rows.ts: the holder moving its card out of `running` ends the lease (opt-in with lease_runs).
+             if self.lease_runs and lease and lease["holder"] == gw and "status" in won and won["status"] != "running":
+                 b["leases"].pop(uid, None)  # clearLease: the lease row and the task's lease mirror
++                # endLeaseRun: a run the holder has not ended yet ends with a placeholder (the holder's own end
++                # "normally follows in the same batch and overwrites this generic one").
++                run = b["rows"].get("task_runs", {}).get(lease["run_uid"])
++                if run is not None and run.get("ended_at") is None:
++                    self._put(b, "task_runs", lease["run_uid"],
++                              {"status": "released", "outcome": "released",
++                               "error": f"card left running ({won['status']})", "ended_at": int(time.time())},
++                              gw, op["client_op_id"], op["hlc"])
+                 row = self._put(b, table, uid, {"lease_holder": None, "lease_expires": None}, gw, op["client_op_id"],
+                                 op["hlc"])
+             return {"status": "applied" if len(won) == len(f) else "merged", "row": row}
+diff --git a/tests/hermes_cli/test_kanban_remote_moved_owner.py b/tests/hermes_cli/test_kanban_remote_moved_owner.py
+new file mode 100644
+index 0000000000..bf0c2dec29
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_remote_moved_owner.py
+@@ -0,0 +1,87 @@
++"""A remembered remote row whose card a fresh replica proves lives on another gateway is retired. [daveey]
++
++Live incident (10-29): the hub's worker node ran MacBook card t_1f359ff1 from a copy in the hub's board file, and the
++hub collector published that copy as ``hub/default/default/t_1f359ff1`` with the MacBook chat's shepherd link. After
++the copy was evicted the record vanished; absence is never closure, so the MacBook kept the row open (stale) forever
++and its chat counted a card the named owner never had.
++"""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++
++LINK = {'gw': 'origin', 'profile': 'default', 'session': 's1', 'rel': 'shepherd'}
++
++
++def _card(gw, *, status='running', created_at=1, sessions=(LINK,)):
++    return {'id': 't_1', 'board': 'default', 'gateway': gw, 'profile': 'default', 'status': status,
++            'created_at': created_at, 'created_by': 'default', 'sessions': list(sessions)}
++
++
++def _write(path, records, *, beats):
++    now = time.time()
++    with sqlite3.connect(path) as db:
++        db.executescript('DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS replica;'
++                         'CREATE TABLE meta(k TEXT PRIMARY KEY,v TEXT);'
++                         'CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,version INTEGER,data TEXT,updated_at INTEGER,'
++                         'PRIMARY KEY (gw,coll,key));')
++        db.executemany('INSERT INTO meta VALUES (?,?)', [('gateway', 'origin'), ('last_ok', str(now))])
++        for gw, beat in beats.items():
++            info = {'gateway': gw, 'task_scopes': [
++                {'profile': 'default', 'board': 'default', 'state': 'ok', 'observed_at': now - beat}]}
++            db.execute("INSERT INTO replica VALUES (?,'gateway','info',1,?,0)", (gw, json.dumps(info)))
++        for gw, data in records:
++            db.execute("INSERT INTO replica VALUES (?,'tasks','default/default/t_1',1,?,?)",
++                       (gw, json.dumps(data), int(now * 1000)))
++
++
++@pytest.fixture
++def origin(tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    hub = tmp_path / 'hub.db'
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: hub)
++    saved = {'cards': None}
++
++    def snapshot(cards=None):
++        if cards is None:
++            return saved['cards']
++        saved['cards'] = cards
++        return cards
++
++    monkeypatch.setattr(activity, '_remote_snapshot', snapshot)
++    activity._reset_cache_for_tests()
++    # The worker node's copy is published under the hub; the real owner (this gateway) publishes its own card.
++    _write(hub, [('hub', _card('hub')), ('origin', _card('origin', sessions=()))], beats={'hub': 5, 'origin': 5})
++    assert [(c['key'], c['unfinished']) for c in activity._legacy_remote_links()] == [
++        ('hub/default/default/t_1', True)]
++    yield hub
++    activity._reset_cache_for_tests()
++
++
++def _open(rows):
++    return [(c['key'], c.get('stale')) for c in rows if c.get('unfinished')]
++
++
++@pytest.mark.parametrize('restart', [False, True], ids=['same-process', 'cold-start-from-snapshot'])
++def test_a_worker_node_copy_gone_from_a_fresh_replica_is_retired(origin, restart):
++    _write(origin, [('origin', _card('origin', status='done', sessions=()))], beats={'hub': 5, 'origin': 5})
++    if restart:
++        activity._reset_cache_for_tests()  # the remembered row now comes only from the durable snapshot
++    assert _open(activity._legacy_remote_links()) == []
++
++
++@pytest.mark.parametrize('why, records, beats', [
++    ('named owner offline: its silence proves nothing', [('origin', _card('origin', sessions=()))],
++     {'hub': 3600, 'origin': 5}),
++    ('no other gateway publishes the card', [], {'hub': 5, 'origin': 5}),
++    ('another gateway publishes a different card under the same id', [('origin', _card('origin', created_at=2,
++                                                                                         sessions=()))],
++     {'hub': 5, 'origin': 5}),
++])
++def test_an_unproven_move_keeps_the_row_open(origin, why, records, beats):
++    _write(origin, records, beats=beats)
++    assert _open(activity._legacy_remote_links()) == [('hub/default/default/t_1', True)], why
+diff --git a/tests/hermes_cli/test_kanban_sync_run_rows.py b/tests/hermes_cli/test_kanban_sync_run_rows.py
+index 4104c3aa44..de1e0e3441 100644
+--- a/tests/hermes_cli/test_kanban_sync_run_rows.py
++++ b/tests/hermes_cli/test_kanban_sync_run_rows.py
+@@ -254,3 +254,64 @@ def test_the_dangling_sweep_keeps_the_real_end_of_a_run_the_card_already_finishe
+     assert (row["status"], row["outcome"], row["error"]) == ("done", "completed", None)
+     assert row["ended_at"] == live.execute(
+         "SELECT created_at FROM task_events WHERE run_id = ? AND kind = 'completed'", (done["id"],)).fetchone()[0]
++
++
++def _complete_in_capture_gap(live, kanban_home, tid, summary):
++    """``complete_task`` landing while another process had the capture triggers down (hub, 10-29 00:33)."""
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)
++    assert kb.complete_task(live, tid, summary=summary, force=True)
++    other = kbc.connect(kanban_home / "kanban.db")  # the next process re-installs the triggers (uid-less gap heal)
++    other.close()
++
++
++def test_a_completion_in_a_capture_gap_reaches_the_board_as_completed_not_released(live, kanban_home, svc):
++    """Hub t_01a185075c59bd52 (10-29): the uncaptured completion was healed for the tasks row only. The Board took
++    ``done`` while the lease's run was still open and ended it ``released`` ("card left running (done)"); that
++    row came back over the local ``done/completed`` run, the owner published the card unverified, and the origin
++    chat never released it. The run row must reach the Board with the card."""
++    tid, uid = _claimed(live, kanban_home, svc, "gap completion")
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)  # settled: board, replica and Board agree on the task and run versions
++    _complete_in_capture_gap(live, kanban_home, tid, "shipped it")
++    for _ in range(3):
++        _round(kanban_home, svc)
++    _assert_completed(live, svc, uid)
++
++
++def test_a_run_the_boards_placeholder_clobbered_is_restored_from_its_completion(live, kanban_home, svc):
++    """Repair of rows already hit: the card is done, its latest ``completed`` event names the run, and the run reads
++    the Board's placeholder end. The heal restores ``done/completed`` locally and on the Board."""
++    tid, uid = _claimed(live, kanban_home, svc, "clobbered")
++    _round(kanban_home, svc)
++    assert kb.complete_task(live, tid, summary="real end", force=True)
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    # The state the race left on the hub: placeholder end on the Board and, through the pull, locally.
++    b = svc.board(BOARD)
++    svc._put(b, "task_runs", uid, {"status": "released", "outcome": "released", "summary": None,
++                                   "error": "card left running (done)"}, "server", None,
++             f"{9_999_999_999_999:013d}-0000-server")
++    _round(kanban_home, svc)  # the pull lands the placeholder; the heal right after it restores the run
++    _round(kanban_home, svc)
++    _assert_completed(live, svc, uid)
++    assert live.execute("SELECT summary FROM task_runs WHERE uid = ?", (uid,)).fetchone()[0] == "real end"
++
++
++def test_the_completion_heal_leaves_a_run_released_for_another_reason(live, kanban_home, svc):
++    """Guard: a placeholder-ended run that is not the one the card's completion names is not a completion."""
++    tid, uid = _claimed(live, kanban_home, svc, "not this run")
++    _round(kanban_home, svc)
++    with kbc.write_txn(live):
++        live.execute("UPDATE task_runs SET status = 'released', outcome = 'released', "
++                     "error = 'card left running (done)', ended_at = 5 WHERE uid = ?", (uid,))
++        live.execute("UPDATE tasks SET status = 'done', completed_at = 5, current_run_id = NULL WHERE id = ?", (tid,))
++    assert ksc.heal_clobbered_completions(live) == []  # no completed event names this run
++    assert tuple(_run(live, uid))[:2] == ("released", "released")
++
++
++def _assert_completed(live, svc, uid):
++    local = _run(live, uid)
++    assert (local["status"], local["outcome"]) == ("done", "completed"), dict(local)
++    board = _board_run(svc, uid)
++    assert (board["status"], board["outcome"]) == ("done", "completed"), board
+-- 
+2.55.0
+

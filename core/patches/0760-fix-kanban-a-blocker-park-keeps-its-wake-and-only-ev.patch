@@ -1,0 +1,1226 @@
+From 448e876df2e16ce4f26ac5b6a27b1ae93b07defd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 12:47:01 +0000
+Subject: [PATCH] fix(kanban): a blocker park keeps its wake, and only evidence
+ clears a shared blocker [daveey]
+
+2026-10-28: two cards called kanban_block with SCHEDULED_UNTIL, a wake_check and
+blocker_id=github-askevepodcast-suspended. block_task skipped the timed park
+whenever blocker_id was set, so both landed 'blocked' with no wake_at and no
+task_wake_checks row. A parent chat then re-parked one with kanban_schedule and
+no id; blocker_states counted that run as a clear, and release_cleared_blockers
+unblocked the other card while the account was still suspended.
+
+- kanban_timed_park.park_mode decides how block_task parks. A blocker never
+  cancels a timed park (SCHEDULED_UNTIL / kind=time / wake_check / clock_only):
+  the card parks 'scheduled' with its wake and probe, and blocker_id rides on
+  the closed run and the event, so the card stays behind the blocker.
+- A blocker park with no wake, no human ask and no open parent is given one on
+  the shared probe cadence (blocker_wake_seconds), so a blocker whose cards are
+  all parked still gets probed. A human ask behind a blocker stays a block.
+- run_effect: a run asserts X (carries the id), clears it (completed /
+  review handoff, or clear_blocker=true), or passes (neutral outcomes and any
+  re-park without the id). A condition_met (wake_check exit 0) on a card behind
+  X and a run naming a different blocker also clear it.
+- release_cleared_blockers wakes 'scheduled' cards behind a cleared blocker as
+  well as 'blocked' ones.
+- kanban_block / kanban_schedule / kanban_continue take clear_blocker; the
+  schemas and the probe context describe the blocker_id semantics.
+
+Tests: tests/hermes_cli/test_kanban_blocker_park_wake.py reproduces the 04:15
+block and the 04:28 re-park for schedule/block/continue by worker and parent,
+and checks every block park keeps a way back; it fails on 76ff5aa9fa.
+---
+ hermes_cli/kanban_block_routing.py            |  12 +-
+ hermes_cli/kanban_db.py                       |  55 +++-
+ hermes_cli/kanban_db_schedule.py              |   9 +-
+ hermes_cli/kanban_shared_blockers.py          | 118 +++++--
+ hermes_cli/kanban_timed_park.py               |  94 +++++-
+ hermes_cli/kanban_wake_check.py               |  16 +-
+ .../test_kanban_agent_stop_routing.py         |  13 +-
+ .../test_kanban_blocker_park_wake.py          | 287 ++++++++++++++++++
+ .../hermes_cli/test_kanban_shared_blockers.py |  41 ++-
+ tests/hermes_cli/test_kanban_timed_park.py    |   9 +-
+ tools/kanban_tools.py                         |  35 ++-
+ tools/kanban_tools_schemas.py                 |  52 +++-
+ 12 files changed, 637 insertions(+), 104 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_blocker_park_wake.py
+
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+index cf6a6dbec7..95cc8d713d 100644
+--- a/hermes_cli/kanban_block_routing.py
++++ b/hermes_cli/kanban_block_routing.py
+@@ -5,17 +5,17 @@ import sqlite3
+ 
+ 
+ def latest_run_blocker(conn: sqlite3.Connection, task_id: str) -> str | None:
+-    """Shared blocker of the latest non-neutral closed run."""
+-    from hermes_cli.kanban_db import _json_dict
+-    from hermes_cli.kanban_shared_blockers import NEUTRAL_OUTCOMES, normalize_blocker_id
++    """Shared blocker the card is still behind: the newest closed run that said anything about
++    it (``kanban_shared_blockers.run_effect``; neutral outcomes and re-parks without the id pass)."""
++    from hermes_cli.kanban_shared_blockers import run_effect
+     for row in conn.execute(
+         "SELECT outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+         "ORDER BY id DESC LIMIT 20", (task_id,),
+     ):
+-        bid = normalize_blocker_id(_json_dict(row["metadata"]).get("blocker_id"))
+-        if bid is not None:
++        effect, bid = run_effect(row["outcome"], row["metadata"])
++        if effect == "assert":
+             return bid
+-        if (row["outcome"] or "") not in NEUTRAL_OUTCOMES:
++        if effect == "clear":
+             return None
+     return None
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 190b1f2be9..8566c04913 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3296,12 +3296,18 @@ def _refuse_untimed_probe(kind: Optional[str], wake_check: Optional[str], clock_
+         "would run it. Use kind='time' to wait on it, or drop it for a human ask.")
+ 
+ 
++def _clear_meta(clear_blocker: bool) -> dict:
++    """Run metadata for an explicit "the shared blocker is gone" park (``kanban_shared_blockers``)."""
++    from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
++    return {CLEAR_FLAG: True} if clear_blocker else {}
++
++
+ def block_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+     blocker_id: Optional[str] = None, wake_check: Optional[str] = None,
+     check_every: Optional[int] = None, clock_only: bool = False,
+-    human_request: Optional[dict] = None, awaiting: Any = None,
++    human_request: Optional[dict] = None, awaiting: Any = None, clear_blocker: bool = False,
+ ) -> bool:
+     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
+     :func:`kanban_block_routing.route_block`). A wait on time -- ``kind='time'``, a ``dependency``
+@@ -3309,7 +3315,11 @@ def block_task(
+     with a wake time instead (``kanban_timed_park``). ``transient`` still counts
+     toward the loop breaker. True on any transition. ``blocker_id`` names a
+     shared external blocker (``kanban_shared_blockers``), stored on the closed
+-    run's metadata and the event payload. [daveey]
++    run's metadata and the event payload. A blocker never cancels the timed park,
++    and a blocker park with no human ask and no open parent is given a wake
++    (``kanban_timed_park.needs_blocker_wake``): every parked card keeps a way back.
++    ``clear_blocker`` records on the run that the caller saw the card's shared
++    blocker gone (the only way a park without the id clears it). [daveey]
+ 
+     An already-``blocked`` card that the failure breaker parked UNTYPED
+     (``block_kind IS NULL``, no live run) is classified in place when *kind*
+@@ -3347,14 +3357,19 @@ def block_task(
+             # otherwise Desktop lists them under "For you" with an unblock button.
+             from hermes_cli import kanban_timed_park as ktp
+             from hermes_cli.kanban_shared_blockers import normalize_blocker_id
+-            if (ktp.is_timed_park(kind, reason, parents_satisfied=_parents_satisfied(conn, task_id),
+-                                  blocker_id=blocker_id)
+-                    or _probe_parks(kind, wake_check, clock_only, human_request)):
++            blocker_id = normalize_blocker_id(blocker_id)
++            satisfied = _parents_satisfied(conn, task_id)
++            mode = ktp.park_mode(kind, reason, parents_satisfied=satisfied, blocker_id=blocker_id,
++                                 human_request=human_request, wake_check=wake_check, clock_only=clock_only)
++            if mode is None and _probe_parks(kind, wake_check, clock_only, human_request):
++                mode = "timed"
++            if mode is not None:
+                 reject_timed_request(human_request)
+                 return ktp.park(conn, task_id, reason=reason, requested_kind=kind, source_status="ready",
+                                 from_untyped_block=True, wake_check=wake_check,
+                                 check_every=check_every, clock_only=clock_only, awaiting=awaiting,
+-                                blocker_id=normalize_blocker_id(blocker_id))
++                                blocker_id=blocker_id, blocker_wake=mode == "blocker",
++                                run_metadata=_clear_meta(clear_blocker))
+             _refuse_untimed_probe(kind, wake_check, clock_only)
+             requested_kind, rekind_reason = kind, None
+             if kind == "assignment":
+@@ -3383,17 +3398,25 @@ def block_task(
+         no_open_parent = _parents_satisfied(conn, task_id)
+         from hermes_cli import kanban_timed_park as ktp
+         from hermes_cli.kanban_shared_blockers import normalize_blocker_id
+-        # A timed park keeps its wake time and wake check behind a shared blocker too; the
+-        # blocker id rides on the closed run, so the card still counts as behind it. [daveey]
+-        if (ktp.is_timed_park(kind, reason, parents_satisfied=no_open_parent, blocker_id=blocker_id)
+-                or _probe_parks(requested_kind, wake_check, clock_only, human_request)):
++        blocker_id = normalize_blocker_id(blocker_id)
++        # A blocker never cancels the timed park, and a blocker park with no wake of its own
++        # wakes on the probe cadence (``kanban_timed_park.park_mode``). An agent-owned block
++        # that brings a wake_check / clock_only parks on that probe. [daveey]
++        mode = None if exhausted_budget else ktp.park_mode(
++            kind, reason, parents_satisfied=no_open_parent, blocker_id=blocker_id,
++            human_request=human_request, wake_check=wake_check, clock_only=clock_only)
++        if (mode is None and not exhausted_budget
++                and _probe_parks(requested_kind, wake_check, clock_only, human_request)):
++            mode = "timed"
++        if mode is not None:
+             reject_timed_request(human_request)
+             return ktp.park(conn, task_id, reason=reason, requested_kind=kind,
+                             source_status=source_status, expected_run_id=expected_run_id,
+                             wake_check=wake_check, check_every=check_every, clock_only=clock_only, awaiting=awaiting,
+-                            blocker_id=normalize_blocker_id(blocker_id))
++                            blocker_id=blocker_id, blocker_wake=mode == "blocker",
++                            run_metadata=_clear_meta(clear_blocker))
+         _refuse_untimed_probe(kind, wake_check, clock_only)
+-        # Parent-less ``dependency`` behind a shared blocker: sticky ``needs_input`` (todo would respawn it).
++        # Parent-less ``dependency`` behind a shared blocker with a human ask: sticky ``needs_input``.
+         if kind == "dependency" and no_open_parent:
+             kind = "needs_input"
+             rekind_reason = "no_open_parent"
+@@ -3435,10 +3458,14 @@ def block_task(
+         conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
+                      (json.dumps(human_request) if human_request else None, task_id))
+         payload["human_request"] = human_request
++        from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
++        run_meta = {**({"blocker_id": blocker_id} if blocker_id else {}), **_clear_meta(clear_blocker)}
++        if clear_blocker:
++            payload[CLEAR_FLAG] = True
+         run_id = _end_or_synthesize_run(
+             conn, task_id, outcome="blocked", status="blocked", summary=reason,
+-            metadata={"blocker_id": blocker_id} if blocker_id else None,
+-            synthesize=bool(reason or blocker_id),
++            metadata=run_meta or None,
++            synthesize=bool(reason or run_meta),
+         )
+         if kind == "assignment":
+             payload["requested_kind"] = requested_kind
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index f886ba833e..9d149e4661 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -15,6 +15,7 @@ def schedule_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     expected_run_id: Optional[int] = None, wake_check: Optional[str] = None,
+     check_every: Optional[int] = None, clock_only: bool = False, awaiting: Any = None,
++    clear_blocker: bool = False,
+ ) -> bool:
+     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
+     (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
+@@ -59,11 +60,15 @@ def schedule_task(
+             params.append(int(expected_run_id))
+         if conn.execute(sql, params).rowcount != 1:
+             return False
++        # A card behind a shared blocker stays behind it: a park without the id says nothing about
++        # the wall (kanban_shared_blockers.run_effect) unless ``clear_blocker`` says it is gone.
++        meta = _kb._clear_meta(clear_blocker)
+         run_id = _kb._end_or_synthesize_run(
+-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
++            conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
++            metadata=meta or None, synthesize=bool(reason or meta),
+         )
+         _kb._append_event(conn, task_id, "scheduled", {
+-            **payload, **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record,
++            **payload, **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record, **meta,
+         }, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check, check_every)
+         return True
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 206b54b800..b1902b9eca 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -5,21 +5,34 @@ pipeline down) ends its run with ``kanban_block(..., blocker_id="<slug>")`` or
+ ``kanban_continue(..., blocker_id="<slug>")``. The id lands in that run's metadata
+ (``blocker_id``); nothing else is stored, so the blocker's state is derived from run history:
+ 
+-* a card is **behind** blocker X while its latest non-neutral closed run carries X;
++* a card is **behind** blocker X while its latest run that said anything about X carries X;
+ * X was **asserted** at the newest ``ended_at`` of any run carrying X;
+-* X was **cleared** at the newest ``ended_at`` of a run that followed an X-run on the same card
+-  and did NOT carry X (it completed, handed off, or stopped on something else);
++* X was **cleared** only on evidence that the wall is gone, at the newest of:
++  - the ``ended_at`` of a run that followed an X-run on the same card and completed or handed
++    off (``CLEAR_OUTCOMES``);
++  - the ``ended_at`` of such a run that ended with ``clear_blocker: true`` in its metadata
++    (an explicit "the wall is gone", passed to kanban_block/kanban_schedule/kanban_continue);
++  - the ``ended_at`` of such a run that named a different blocker (the probe got past X and
++    hit another wall);
++  - a ``condition_met`` event (the card's wake_check exited 0) on a card behind X;
+ * X is **open** while asserted > cleared.
+ 
++A re-park WITHOUT the id (``blocked``/``scheduled``/``continued`` with no ``clear_blocker``) says
++nothing about X: the card stays behind X and X stays open. It used to count as a clear, so a
++parent chat re-parking one card released every other card while the wall still stood
++(2026-10-28, t_e7dc822c run 5878 released t_01a1800921b1ff50).
++
+ While X is open the dispatcher spawns at most one card behind it (the *probe*) per
+ ``kanban.shared_blocker_probe_seconds``; the others are held with respawn guard reason
+ ``shared_blocker`` instead of each re-discovering the same wall. A human unblock of a card lets
+-that card probe at once (still one probe at a time). When a probe ends without re-asserting X,
+-X clears: held ``ready`` cards dispatch normally and cards still ``blocked`` behind X are
+-unblocked by :func:`release_cleared_blockers`.
++that card probe at once (still one probe at a time). Every card parked behind X keeps its own
++wake (``kanban_timed_park``: a blocker park with no wake is given one after the probe interval),
++so the probe still runs when no card behind X sits ``ready``. When X clears, held ``ready``
++cards dispatch normally and cards still ``blocked`` or ``scheduled`` behind X are woken by
++:func:`release_cleared_blockers`.
+ 
+-Neutral outcomes (crash, timeout, reclaim, spawn failure, rate limit, give-up) say nothing about
+-the external condition, so they neither assert nor clear a blocker.
++Neutral outcomes (crash, timeout, reclaim, spawn failure, rate limit, give-up, failure) say
++nothing about the external condition, so they neither assert nor clear a blocker.
+ 
+ Matching on normalized error text was considered and left out: crash/timeout/protocol-violation
+ errors share fixed preambles across unrelated cards (``_error_fingerprint`` keeps 80 chars), and
+@@ -45,6 +58,27 @@ NEUTRAL_OUTCOMES = frozenset({
+ })
+ # Only blockers asserted this recently are considered (bounds the scan on old boards).
+ _LOOKBACK_SECONDS = 14 * 86400
++# A run without the id that ended this way is evidence the wall is gone: the card finished,
++# or handed off to review / back from review.
++CLEAR_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested"})
++# Run metadata / tool arg: the caller says the card's shared blocker is gone.
++CLEAR_FLAG = "clear_blocker"
++CONDITION_MET_EVENT = "condition_met"   # kanban_wake_check.CONDITION_MET_EVENT
++
++
++def run_effect(outcome: Optional[str], metadata) -> tuple[str, Optional[str]]:
++    """What one closed run says about the card's shared blocker: ``("assert", id)``,
++    ``("clear", None)`` (completed/handed off, or ``clear_blocker``), or ``("pass", None)``
++    (a neutral outcome or a re-park without the id: says nothing). [daveey]"""
++    from hermes_cli import kanban_db as kb
++
++    meta = kb._json_dict(metadata)
++    bid = normalize_blocker_id(meta.get("blocker_id"))
++    if bid is not None:
++        return "assert", bid
++    if meta.get(CLEAR_FLAG) is True or (outcome or "") in CLEAR_OUTCOMES:
++        return "clear", None
++    return "pass", None
+ 
+ _ID_RE = re.compile(r"[^a-z0-9._-]+")
+ 
+@@ -77,7 +111,8 @@ class BlockerState:
+     blocker_id: str
+     asserted_at: int = 0
+     cleared_at: int = 0
+-    cleared_by: Optional[tuple[str, int]] = None   # (task_id, run_id) of the clearing run
++    cleared_by: Optional[tuple[str, Optional[int]]] = None   # (task_id, run_id or None) that cleared it
++    cleared_via: str = ""                           # "run" or "condition_met"
+     reason: str = ""                                # summary of the newest asserting run
+     # task_id -> ended_at of the asserting run the card is still behind
+     behind: dict[str, int] = field(default_factory=dict)
+@@ -126,6 +161,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+             "WHERE task_id = ? ORDER BY id", (tid,),
+         ).fetchall()
+         current: Optional[tuple[str, int]] = None   # (blocker, asserting ended_at)
++        asserting_run: Optional[int] = None
+         for run in runs:
+             started = kb._to_epoch(run["started_at"]) or 0
+             if current is not None and current[0] in states:
+@@ -134,17 +170,28 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+             if run["ended_at"] is None:
+                 continue
+             ended = kb._to_epoch(run["ended_at"]) or 0
+-            bid = _meta_blocker(kb, run["metadata"])
+-            if bid is not None:
++            effect, bid = run_effect(run["outcome"], run["metadata"])
++            if effect == "assert" and bid is not None:
+                 if current is not None and current[0] != bid and current[0] in states:
+                     _mark_cleared(states[current[0]], tid, run["id"], ended)
+-                current = (bid, ended)
++                current, asserting_run = (bid, ended), int(run["id"])
+                 continue
+-            if (run["outcome"] or "") in NEUTRAL_OUTCOMES:
++            if effect == "pass":
+                 continue
+             if current is not None and current[0] in states:
+                 _mark_cleared(states[current[0]], tid, run["id"], ended)
+             current = None
++        if current is not None and current[0] in states:
++            # The card's own wake_check exiting 0 after it parked behind X is evidence too.
++            # Ordered by event id after the asserting run's own events (same-second safe).
++            met = conn.execute(
++                "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = ? AND id > COALESCE("
++                "(SELECT MAX(id) FROM task_events WHERE task_id = ? AND run_id = ?), 0) "
++                "ORDER BY id DESC LIMIT 1", (tid, CONDITION_MET_EVENT, tid, asserting_run),
++            ).fetchone()
++            if met is not None:
++                _mark_cleared(states[current[0]], tid, None,
++                              max(kb._to_epoch(met["created_at"]) or 0, current[1]), via=CONDITION_MET_EVENT)
+         if current is not None and live and current[0] in states:
+             states[current[0]].behind[tid] = current[1]
+     for st in states.values():
+@@ -153,10 +200,12 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+     return states
+ 
+ 
+-def _mark_cleared(st: BlockerState, task_id: str, run_id: int, ended: int) -> None:
++def _mark_cleared(st: BlockerState, task_id: str, run_id: Optional[int], ended: int, *,
++                  via: str = "run") -> None:
+     if ended >= st.cleared_at:
+         st.cleared_at = ended
+-        st.cleared_by = (task_id, int(run_id))
++        st.cleared_by = (task_id, int(run_id) if run_id is not None else None)
++        st.cleared_via = via
+ 
+ 
+ def blocker_for_task(states: dict[str, BlockerState], task_id: str) -> Optional[BlockerState]:
+@@ -173,7 +222,7 @@ def _unblocked_since_assertion(conn: sqlite3.Connection, task_id: str, blocker_i
+ 
+     newest = 0
+     for row in conn.execute(
+-        "SELECT id, payload FROM task_events WHERE kind IN ('blocked', 'continued', 'block_loop_detected') "
++        "SELECT id, payload FROM task_events WHERE kind IN ('blocked', 'scheduled', 'continued', 'block_loop_detected') "
+         "AND payload LIKE ? ORDER BY id DESC LIMIT 50", (f'%"{blocker_id}"%',),
+     ):
+         if normalize_blocker_id(kb._json_dict(row["payload"]).get("blocker_id")) == blocker_id:
+@@ -215,30 +264,39 @@ def shared_blocker_guard(
+ 
+ 
+ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+-    """Unblock ``blocked`` cards behind a blocker a later probe cleared. Returns task ids."""
++    """Wake ``blocked`` and ``scheduled`` cards behind a blocker that later evidence cleared.
++    Returns task ids."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
+ 
+     released: list[str] = []
+     for st in blocker_states(conn, now=now).values():
+         if st.is_open or st.cleared_by is None:
+             continue
++        by_task, by_run = st.cleared_by
+         for tid, asserted in sorted(st.behind.items()):
+-            if asserted >= st.cleared_at:
++            if asserted > st.cleared_at or tid == by_task:
+                 continue
+             row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+-            if row is None or row["status"] != "blocked":
+-                continue
+-            if not kb.unblock_task(conn, tid):
++            if row is None or row["status"] not in ("blocked", "scheduled"):
+                 continue
+-            by_task, by_run = st.cleared_by
++            payload = {"blocker_id": st.blocker_id, "cleared_by_task": by_task, "cleared_by_run": by_run,
++                       "cleared_via": st.cleared_via or "run"}
++            if row["status"] == "blocked":
++                if not kb.unblock_task(conn, tid):
++                    continue
++                with kb.write_txn(conn):
++                    kb._append_event(conn, tid, CLEARED_EVENT, payload)
++            else:
++                with kb.write_txn(conn):
++                    if kwc._wake(conn, tid, CLEARED_EVENT, payload) is None:
++                        continue
++            how = (f"{by_task}'s wake_check exited 0" if st.cleared_via == CONDITION_MET_EVENT
++                   else f"{by_task} run {by_run} ended without hitting it")
+             with kb.write_txn(conn):
+-                kb._append_event(conn, tid, CLEARED_EVENT, {
+-                    "blocker_id": st.blocker_id, "cleared_by_task": by_task, "cleared_by_run": by_run,
+-                })
+                 kb._insert_comment(
+                     conn, tid, "dispatcher",
+-                    f"shared blocker `{st.blocker_id}` cleared: {by_task} run {by_run} ended without "
+-                    "hitting it, so this card was unblocked automatically.",
++                    f"shared blocker `{st.blocker_id}` cleared: {how}, so this card was woken automatically.",
+                     int(time.time()),
+                 )
+             released.append(tid)
+@@ -306,7 +364,9 @@ def render_blocker_context(conn: sqlite3.Connection, task_id: str) -> str:
+         lines.append("")
+         lines.append(
+             f"This run is the probe for `{mine.blocker_id}`. Check first whether it still holds. If it "
+-            f"does, end again with `blocker_id: \"{mine.blocker_id}\"`. If it is gone, carry on: ending "
+-            "without that id clears it and releases the other parked cards.")
++            f"does, end again with `blocker_id: \"{mine.blocker_id}\"`. If it is gone, carry on: "
++            "completing or handing off clears it and wakes the other parked cards. A park without the "
++            "id does NOT clear it; if you park for another reason and saw the wall gone, pass "
++            "`clear_blocker: true`.")
+     lines.append("")
+     return "\n".join(lines)
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index f9a8cc725e..2855926275 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -73,12 +73,60 @@ def implied_wake(payload: dict, event_at: int) -> int:
+     return scheduled_until(reason if isinstance(reason, str) else None, now=event_at) or event_at + DEFAULT_WAKE_SECONDS
+ 
+ 
++def blocker_wake_seconds(cfg: Optional[dict] = None) -> int:
++    """Wake delay for a shared-blocker park that named no wake: the shared probe interval,
++    clamped to ``[MIN_WAKE_SECONDS, kanban_wake_check.GUARD_SECONDS]``. The woken card goes
++    ``ready`` and ``shared_blocker_guard`` lets one card per interval probe, so a board whose
++    every card is parked behind the blocker still probes it. [daveey]"""
++    from hermes_cli.kanban_shared_blockers import probe_interval_seconds
++    from hermes_cli.kanban_wake_check import GUARD_SECONDS
++
++    return max(MIN_WAKE_SECONDS, min(probe_interval_seconds(cfg), GUARD_SECONDS))
++
++
++def needs_blocker_wake(kind: Optional[str], *, blocker_id: Optional[str], human_request,
++                       open_parent: bool) -> bool:
++    """A blocker park with no other way back: no human ask, no open parent to wait on, and not
++    an ``assignment`` (routed to a supervisor's repair card). Such a park used to land plain
++    ``blocked`` and wait for the blocker to clear, which nothing probed. [daveey]"""
++    return bool(blocker_id) and not human_request and not open_parent and kind != "assignment"
++
++
++def park_mode(kind: Optional[str], reason: Optional[str], *, parents_satisfied: bool,
++              blocker_id: Optional[str] = None, human_request=None, wake_check: Optional[str] = None,
++              clock_only: bool = False) -> Optional[str]:
++    """How ``block_task`` parks: ``"timed"`` (:func:`park` with the caller's wake), ``"blocker"``
++    (:func:`park` with ``blocker_wake``) or None (a block / todo / triage via ``route_block``).
++
++    A blocker never cancels a timed park: the 2026-10-28 cards passed SCHEDULED_UNTIL, a
++    wake_check and a blocker_id, and the blocker made ``block_task`` drop the other two. A
++    visible human ask behind a blocker stays a block. A blocker park that brought no timing of
++    its own (no SCHEDULED_UNTIL, wake_check or clock_only) wakes on the probe cadence. [daveey]"""
++    if blocker_id and human_request:
++        return None
++    has_timing = bool(_MARKER.search(reason or "") or wake_check or clock_only)
++    if blocker_id and not has_timing:
++        if needs_blocker_wake(kind, blocker_id=blocker_id, human_request=human_request,
++                              open_parent=not parents_satisfied):
++            return "blocker"
++        return None
++    if is_timed_park(kind, reason, parents_satisfied=parents_satisfied):
++        return "timed"
++    if blocker_id and not parents_satisfied:
++        return None
++    if blocker_id and kind != "assignment":
++        # A blocker park that brought a wake_check / clock_only but no SCHEDULED_UNTIL: keep
++        # that probe (a plain block would drop it) on the default wake.
++        return "timed"
++    return None
++
++
+ def is_timed_park(kind: Optional[str], reason: Optional[str], *, parents_satisfied: bool,
+                   blocker_id: Optional[str] = None) -> bool:
+     """Whether a ``block_task`` call is really a wait on time, not on a human.
+     Behind a shared blocker (``blocker_id``) a parent-less ``dependency`` is a wait on that
+-    blocker (its probe wakes it), not on time; ``kind='time'`` and a ``SCHEDULED_UNTIL=``
+-    marker still park with their wake. [daveey]"""
++    blocker, not on time (:func:`park_mode` gives it the blocker wake instead); ``kind='time'``
++    and a ``SCHEDULED_UNTIL=`` marker still park with their wake. [daveey]"""
+     if kind == TIME_KIND or (kind == "dependency" and parents_satisfied and not blocker_id):
+         return True
+     return _MARKER.search(reason or "") is not None
+@@ -88,28 +136,38 @@ def park(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str], requested_kind: Optional[str],
+     source_status: str = "ready", expected_run_id: Optional[int] = None, from_untyped_block: bool = False,
+     wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
+-    awaiting=None, blocker_id: Optional[str] = None,
++    awaiting=None, blocker_id: Optional[str] = None, run_metadata: Optional[dict] = None,
++    blocker_wake: bool = False,
+ ) -> bool:
+     """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn.
+     ``from_untyped_block``: an untyped ``blocked`` card with no live run (classify-in-place) instead.
+     ``awaiting`` names the producer (``kanban_awaiting.gate``: refused or escalated otherwise).
+-    ``blocker_id`` (a shared external blocker, ``kanban_shared_blockers``) is stamped on the closed
+-    run's metadata and the event, so the card still counts as behind that blocker while it keeps
+-    its own wake time and wake check. [daveey]"""
++
++    ``blocker_id`` (``kanban_shared_blockers``) lands on the closed run's metadata and on the
++    event, as on a plain block, so the card stays behind the blocker while it waits on its own
++    wake. ``blocker_wake``: the caller named a blocker and no wake at all. The card then wakes
++    after :func:`blocker_wake_seconds`; its producer is the shared probe cadence, so the awaiting
++    gate is not consulted. [daveey]"""
+     from hermes_cli import kanban_awaiting as kaw
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
+ 
+     now = int(time.time())
+-    wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
++    if blocker_wake:
++        wake_at = now + blocker_wake_seconds()
++    else:
++        wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
+     guard = ("status = 'blocked' AND block_kind IS NULL AND current_run_id IS NULL" if from_untyped_block
+              else "status IN ('running', 'ready')")
+-    try:
+-        record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+-                          clock_only=clock_only, op="block")
+-    except kaw.RepeatedPark as rp:
+-        return kaw.escalate(conn, task_id, record=rp.record, reason=reason,
+-                            expected_run_id=expected_run_id) is not None
++    if blocker_wake:
++        record = {"kind": "clock", "inferred": True, "shared_blocker": blocker_id}
++    else:
++        try:
++            record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
++                              clock_only=clock_only, op="block")
++        except kaw.RepeatedPark as rp:
++            return kaw.escalate(conn, task_id, record=rp.record, reason=reason,
++                                expected_run_id=expected_run_id) is not None
+     wake_check = wake_check or kaw.card_probe(record)
+     wake_check, check_every = kwc.validate_park(
+         wake_at=wake_at, wake_check=wake_check, check_every=check_every, clock_only=clock_only)
+@@ -121,16 +179,20 @@ def park(
+         params = (task_id, int(expected_run_id))
+     if conn.execute(sql, params).rowcount != 1:
+         return False
++    meta = dict(run_metadata or {})
++    if blocker_id:
++        meta["blocker_id"] = blocker_id
+     run_id = kb._end_or_synthesize_run(
+-        conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
+-        metadata={"blocker_id": blocker_id} if blocker_id else None,
+-        synthesize=bool(reason or blocker_id),
++        conn, task_id, outcome="scheduled", status="scheduled", summary=reason, metadata=meta or None,
++        synthesize=bool(reason or meta),
+     )
+     kb._append_event(conn, task_id, "scheduled", {
+         "reason": reason, "timed_park": True, "requested_kind": requested_kind,
+         "wake_at": wake_at, "resume_status": source_status,
+         **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record,
+         **({"blocker_id": blocker_id} if blocker_id else {}),
++        **({"blocker_wake": True} if blocker_wake else {}),
++        **({"clear_blocker": True} if meta.get("clear_blocker") else {}),
+     }, run_id=run_id)
+     kwc.set_check(conn, task_id, wake_check, check_every, now=now)
+     return True
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 09db772ddd..a14eed0cb0 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -161,6 +161,7 @@ def validate_park(*, wake_at: Optional[int], wake_check: Optional[str],
+ 
+ def planned_wake(conn: sqlite3.Connection, task_id: str, *, op: str, reason: Optional[str] = None,
+                  kind: Optional[str] = None, blocker_id: Optional[str] = None,
++                 human_request: Any = None, wake_check: Optional[str] = None, clock_only: bool = False,
+                  resume_after: int = 0, now: Optional[int] = None) -> Optional[int]:
+     """The wake time a park call would set, or None when the call is not a timed park
+     (``op`` is ``schedule``, ``block`` or ``continue``)."""
+@@ -171,10 +172,17 @@ def planned_wake(conn: sqlite3.Connection, task_id: str, *, op: str, reason: Opt
+     if op == "schedule":
+         return ktp.scheduled_payload(reason, now=now)["wake_at"]
+     if op == "block":
+-        if not ktp.is_timed_park(
+-                kind, reason, parents_satisfied=kb._parents_satisfied(conn, task_id), blocker_id=blocker_id):
+-            return None
+-        return ktp.scheduled_until(reason, now=now) or now + ktp.DEFAULT_WAKE_SECONDS
++        from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++        mode = ktp.park_mode(kind, reason, parents_satisfied=kb._parents_satisfied(conn, task_id),
++                             blocker_id=normalize_blocker_id(blocker_id), human_request=human_request,
++                             wake_check=wake_check, clock_only=clock_only)
++        if mode == "timed":
++            return ktp.scheduled_until(reason, now=now) or now + ktp.DEFAULT_WAKE_SECONDS
++        if mode == "blocker":
++            return now + ktp.blocker_wake_seconds()
++        if kb._probe_parks(kind, wake_check, clock_only, human_request):
++            return ktp.scheduled_until(reason, now=now) or now + ktp.DEFAULT_WAKE_SECONDS
++        return None
+     if op == "continue":
+         return now + int(resume_after) if resume_after and int(resume_after) > 0 else None
+     raise ValueError(f"unknown park op {op!r}")
+diff --git a/tests/hermes_cli/test_kanban_agent_stop_routing.py b/tests/hermes_cli/test_kanban_agent_stop_routing.py
+index 0cbf7a43b5..9a70934980 100644
+--- a/tests/hermes_cli/test_kanban_agent_stop_routing.py
++++ b/tests/hermes_cli/test_kanban_agent_stop_routing.py
+@@ -67,11 +67,18 @@ def test_repeated_agent_block_stays_agent_but_approval_stays_human(board):
+ 
+ 
+ def test_impossible_dependency_loop_is_not_a_human_question(board):
++    """A parent-less dependency behind a shared blocker parks ``scheduled`` on the probe cadence
++    (kanban_timed_park.park_mode), so a repeat is the probe re-asserting the wall, not a loop
++    for the breaker; it never lands in the human inbox either way. [daveey]"""
+     conn, path = board
+     tid = kb.create_task(conn, title="Missing dependency", assignee="default", session_id="owner")
+     for _ in range(kb.BLOCK_RECURRENCE_LIMIT):
+         assert kb.block_task(conn, tid, kind="dependency", reason="Waiting on missing prerequisite",
+                              blocker_id="test-shared-wall")
+-        if kb.get_task(conn, tid).status != "triage":
+-            assert kb.unblock_task(conn, tid)
+-    assert_agent(conn, path, tid)
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert kb.unblock_task(conn, tid)
++    assert kb.block_task(conn, tid, kind="dependency", reason="Waiting on missing prerequisite",
++                         blocker_id="test-shared-wall")
++    task = kb.get_task(conn, tid)
++    assert (task.status, task.block_kind) == ("scheduled", None)
++    assert activity._read_counts(path, activity.BLOCKED_STATUSES) == {}
+diff --git a/tests/hermes_cli/test_kanban_blocker_park_wake.py b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+new file mode 100644
+index 0000000000..0b96a0dc6e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+@@ -0,0 +1,287 @@
++"""Shared-blocker parks keep their way back, and only evidence clears the blocker. [daveey]
++
++Repro of 2026-10-28 04:15-04:33 PDT: two cards called ``kanban_block`` with a
++``SCHEDULED_UNTIL=`` reason, a wake_check and ``blocker_id``. ``block_task`` skipped the
++timed park whenever ``blocker_id`` was set, so both landed plain ``blocked`` with no wake
++and no probe row. A parent chat then re-parked one with ``kanban_schedule`` and no id;
++``blocker_states`` read that run as "ended without the blocker" and cleared it, and
++``release_cleared_blockers`` unblocked the other card although the wall still stood.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++from datetime import datetime, timedelta
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_shared_blockers as ksb
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli.kanban_continuation import pending_wake
++import tools.kanban_tools as kt
++
++BID = "github-askevepodcast-suspended"
++WAKE = "exit 1"  # "not yet": a real probe would curl the account
++AWAIT = {"kind": "external", "ref": "github-support-ticket-40037",
++         "why": "GitHub support reinstates a suspended account after review"}
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "3600")
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
++                "HERMES_SESSION_ID", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK",
++                "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(ksb, "probe_interval_seconds", lambda cfg=None: 1800)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return home
++
++
++def _spawn_noop(task, workspace, board=None):
++    return None
++
++
++def _tomorrow() -> str:
++    return (datetime.now() + timedelta(days=1)).replace(microsecond=0).isoformat()
++
++
++def _as_worker(monkeypatch, conn, tid: str) -> None:
++    kb.claim_task(conn, tid)
++    kbd._set_worker_pid(conn, tid, os.getpid())
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(conn, tid)))
++
++
++def _as_parent(monkeypatch) -> None:
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
++
++
++def _worker_block_behind(monkeypatch, conn, title: str, *, kind: str = "capability") -> str:
++    """The 04:15 call: kanban_block with SCHEDULED_UNTIL + wake_check + blocker_id."""
++    tid = kb.create_task(conn, title=title, assignee="default")
++    _as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_block({
++        "reason": f"SCHEDULED_UNTIL={_tomorrow()} Eve's GitHub account is suspended (403 on GET /user)",
++        "kind": kind, "blocker_id": BID, "wake_check": WAKE, "awaiting": AWAIT,
++    }))
++    assert "error" not in out, out
++    _as_parent(monkeypatch)
++    return tid
++
++
++def _has_way_back(conn, tid: str) -> bool:
++    task = kb.get_task(conn, tid)
++    if task.status not in ("blocked", "scheduled"):
++        return True
++    if task.status == "scheduled" and (pending_wake(conn, tid) or {}).get("wake_at"):
++        return True
++    if kwc.get_state(conn, tid):
++        return True
++    if kb.unsatisfied_parents(conn, tid):
++        return True
++    return bool(task.human_request)
++
++
++def _run_meta(conn, run_id: int) -> dict:
++    raw = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0]
++    return json.loads(raw or "{}")
++
++
++# --- AC1: kanban_block keeps the timed park when blocker_id is set ------------------------
++
++@pytest.mark.parametrize("kind", ["capability", "time"])
++def test_block_with_blocker_and_scheduled_until_parks_with_wake(kanban_home, monkeypatch, kind):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="eve memory", assignee="default")
++        _as_worker(monkeypatch, conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++        until = _tomorrow()
++    out = json.loads(kt._handle_block({
++        "reason": f"SCHEDULED_UNTIL={until} account suspended; wakes when /-/memory.md returns 200",
++        "kind": kind, "blocker_id": BID, "wake_check": WAKE, "awaiting": AWAIT,
++    }))
++    assert "error" not in out, out
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, tid)
++        assert task.status == "scheduled"
++        wake = pending_wake(conn, tid)
++        assert wake and wake["wake_at"] == int(datetime.fromisoformat(until).timestamp())
++        assert wake.get("blocker_id") == BID
++        state = kwc.get_state(conn, tid)
++        assert state is not None and state["cmd"] == WAKE
++        assert _run_meta(conn, run_id).get("blocker_id") == BID
++        assert tid in ksb.blocker_states(conn)[BID].behind
++
++
++def test_block_with_blocker_and_no_wake_is_given_one(kanban_home, monkeypatch):
++    """AC3 for the blocker path: a blocker park with no timed marker still gets a wake (the
++    shared probe cadence), so a board whose every card is parked behind X still probes X."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="ci", assignee="default")
++        _as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_block({"reason": "Actions refuses jobs: billing", "kind": "capability",
++                                       "blocker_id": "github-actions-billing"}))
++    assert "error" not in out, out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "scheduled"
++        wake = pending_wake(conn, tid)
++        assert wake and 0 < wake["wake_at"] - time.time() <= 1800 + 5
++        assert _has_way_back(conn, tid)
++        # Kernel path (CLI/dispatcher callers) behaves the same.
++        k = kb.create_task(conn, title="k", assignee="default")
++        kb.claim_task(conn, k)
++        assert kb.block_task(conn, k, reason="billing", kind="capability", blocker_id="github-actions-billing")
++        assert kb.get_task(conn, k).status == "scheduled" and _has_way_back(conn, k)
++
++
++def test_blocker_park_with_human_request_stays_a_visible_block(kanban_home):
++    hr = {"action": "Raise the Actions spending limit", "why_human": "billing owner only",
++          "interaction": "external", "scope": "github org billing", "evidence": "job annotation"}
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="h", assignee="default")
++        kb.claim_task(conn, tid)
++        assert kb.block_task(conn, tid, reason="billing", kind="needs_input",
++                             blocker_id="github-actions-billing", human_request=hr)
++        assert kb.get_task(conn, tid).status == "blocked" and _has_way_back(conn, tid)
++
++
++# --- AC2: a re-park without the id does not clear an open blocker -------------------------
++
++def _repark(monkeypatch, op: str, who: str, tid: str) -> None:
++    until = _tomorrow()
++    with kbc.connect_closing() as conn:
++        # The card wakes (wake_at / probe cadence) and sits ready, held by the guard.
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        conn.commit()
++        if who == "worker":
++            _as_worker(monkeypatch, conn, tid)   # it is the probe
++        else:
++            _as_parent(monkeypatch)              # the parent chat acts on it
++    args = {} if who == "worker" else {"task_id": tid}
++    if op == "schedule":
++        out = kt._handle_schedule({**args, "reason": f"SCHEDULED_UNTIL={until} still suspended",
++                                   "wake_check": WAKE, "awaiting": AWAIT})
++    elif op == "block":
++        out = kt._handle_block({**args, "reason": f"SCHEDULED_UNTIL={until} still suspended", "kind": "time",
++                                "wake_check": WAKE, "awaiting": AWAIT})
++    else:
++        out = kt._handle_continue({**args, "checkpoint": "still suspended; re-check later",
++                                   "resume_after_seconds": 3600, "wake_check": WAKE, "awaiting": AWAIT})
++    assert "error" not in json.loads(out), out
++    _as_parent(monkeypatch)
++
++
++@pytest.mark.parametrize("op,who", [
++    ("schedule", "parent"), ("schedule", "worker"),
++    ("block", "parent"), ("block", "worker"),
++    ("continue", "worker"),
++])
++def test_repark_without_blocker_id_keeps_blocker_open(kanban_home, monkeypatch, op, who):
++    """The 04:28 sequence: a, b behind X; a is re-parked without the id; b must stay parked."""
++    with kbc.connect_closing() as conn:
++        a = _worker_block_behind(monkeypatch, conn, "a")
++        b = _worker_block_behind(monkeypatch, conn, "b")
++    _repark(monkeypatch, op, who, a)
++    with kbc.connect_closing() as conn:
++        st = ksb.blocker_states(conn)[BID]
++        assert st.is_open, "a re-park without blocker_id cleared the blocker"
++        assert set(st.behind) == {a, b}
++        res = kbd.dispatch_once(conn, spawn_fn=_spawn_noop)
++        assert b not in (res.shared_blocker_released or [])
++        assert kb.get_task(conn, b).status == "scheduled"
++        assert not [e for e in kb.list_events(conn, b) if e.kind == ksb.CLEARED_EVENT]
++
++
++def test_completion_clears_and_wakes_parked_cards(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        a = _worker_block_behind(monkeypatch, conn, "a")
++        b = _worker_block_behind(monkeypatch, conn, "b")
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (a,))
++        conn.commit()
++        kb.claim_task(conn, a)
++        assert kb.complete_task(conn, a, result="account reinstated")
++        assert not ksb.blocker_states(conn)[BID].is_open
++        res = kbd.dispatch_once(conn, spawn_fn=_spawn_noop)
++        assert b in res.shared_blocker_released
++        assert kb.get_task(conn, b).status != "scheduled"
++        ev = [e for e in kb.list_events(conn, b) if e.kind == ksb.CLEARED_EVENT]
++        assert ev and ev[0].payload["cleared_by_task"] == a
++
++
++def test_explicit_clear_blocker_opt_out(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        a = _worker_block_behind(monkeypatch, conn, "a")
++        b = _worker_block_behind(monkeypatch, conn, "b")
++        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (a,))
++        conn.commit()
++    out = json.loads(kt._handle_schedule({"task_id": a, "reason": "account is back; waiting on a deploy now", "clock_only": True,
++                                          "clear_blocker": True}))
++    assert "error" not in out, out
++    with kbc.connect_closing() as conn:
++        assert not ksb.blocker_states(conn)[BID].is_open
++        res = kbd.dispatch_once(conn, spawn_fn=_spawn_noop)
++        assert b in res.shared_blocker_released
++
++
++def test_wake_check_success_on_a_card_behind_clears(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        a = _worker_block_behind(monkeypatch, conn, "a")
++        b = _worker_block_behind(monkeypatch, conn, "b")
++        state = kwc.get_state(conn, a)
++        assert kwc.apply_result(conn, a, state["cmd"], 0, "200 OK", generation=state["generation"]) \
++            == kwc.CONDITION_MET_EVENT
++        st = ksb.blocker_states(conn)[BID]
++        assert not st.is_open and st.cleared_by[0] == a
++        res = kbd.dispatch_once(conn, spawn_fn=_spawn_noop)
++        assert b in res.shared_blocker_released
++
++
++# --- AC3: no park path leaves a card with no way back -------------------------------------
++
++@pytest.mark.parametrize("args", [
++    {"reason": "billing", "kind": "capability", "blocker_id": "x-wall"},
++    {"reason": "billing", "kind": "transient", "blocker_id": "x-wall"},
++    {"reason": "billing", "kind": "dependency", "blocker_id": "x-wall"},
++    {"reason": "billing", "blocker_id": "x-wall"},
++    {"reason": "billing", "kind": "time", "blocker_id": "x-wall", "clock_only": True},
++    {"reason": "billing", "kind": "needs_input", "blocker_id": "x-wall"},
++    {"reason": "billing", "kind": "capability"},
++    {"reason": "billing", "kind": "needs_input"},
++    {"reason": "a soak", "kind": "time", "clock_only": True},
++])
++def test_every_block_park_has_a_way_back_or_is_refused(kanban_home, monkeypatch, args):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="p", assignee="default")
++        _as_worker(monkeypatch, conn, tid)
++    out = json.loads(kt._handle_block(dict(args)))
++    with kbc.connect_closing() as conn:
++        if "error" in out:
++            assert out.get("code") or out.get("reason_code") or out["error"]
++            assert kb.get_task(conn, tid).status == "running"
++            return
++        assert _has_way_back(conn, tid), (args, kb.get_task(conn, tid).status)
++
++
++def test_park_invariant_kernel_refuses_blocker_park_it_cannot_wake(kanban_home, monkeypatch):
++    """The blocked/untyped classify-in-place path with a blocker gets a wake too."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="breaker", assignee="default")
++        conn.execute("UPDATE tasks SET status = 'blocked', block_kind = NULL, current_run_id = NULL "
++                     "WHERE id = ?", (tid,))
++        conn.commit()
++        assert kb.block_task(conn, tid, reason="billing", kind="capability", blocker_id="x-wall")
++        assert _has_way_back(conn, tid), kb.get_task(conn, tid).status
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index 1c6d64827b..e4f6f3eb0e 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -58,6 +58,19 @@ def _blocked_behind(conn, title: str, blocker_id=BID) -> str:
+     return tid
+ 
+ 
++def _legacy_blocked_behind(conn, title: str, blocker_id=BID) -> str:
++    """A card parked behind the blocker before blocker parks got their own wake: plain
++    ``blocked`` with no wake (the shape of cards parked before the fix, which only
++    ``probe_stranded_blockers`` can bring back)."""
++    from unittest import mock
++
++    from hermes_cli import kanban_timed_park as ktp
++    with mock.patch.object(ktp, "park_mode", lambda *a, **k: None):   # the pre-fix kernel
++        tid = _blocked_behind(conn, title, blocker_id=blocker_id)
++    assert kb.get_task(conn, tid).status == "blocked"
++    return tid
++
++
+ def _age_runs(conn, seconds: int) -> None:
+     """Shift every run and event into the past (as if ``seconds`` had elapsed)."""
+     with kb.write_txn(conn):
+@@ -75,7 +88,7 @@ def test_block_records_blocker_on_run_and_event(kanban_home):
+         tid = _blocked_behind(conn, "a", blocker_id="  GitHub Actions Billing! ")
+         run = conn.execute("SELECT metadata FROM task_runs WHERE task_id = ?", (tid,)).fetchone()
+         assert json.loads(run["metadata"]) == {"blocker_id": BID}
+-        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'",
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'scheduled')",
+                           (tid,)).fetchone()
+         assert json.loads(ev["payload"])["blocker_id"] == BID
+         # Control: a plain block stores no blocker metadata.
+@@ -103,7 +116,7 @@ def test_unblocked_cards_behind_open_blocker_get_one_probe(kanban_home, spawns):
+         # Probe hits the wall again and re-asserts: the rest stay held within the interval.
+         assert kb.block_task(conn, probe, reason="still refused", kind="capability", blocker_id=BID)
+         # Probe re-assertion is not an unblock loop: no triage escalation.
+-        assert kb.get_task(conn, probe).status == "blocked"
++        assert kb.get_task(conn, probe).status == "scheduled"
+         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+         assert _spawned_ids(res) == []
+         assert {t for t, r in res.respawn_guarded if r == ksb.GUARD_REASON} == set(cards) - {probe}
+@@ -134,7 +147,7 @@ def test_cleared_blocker_releases_blocked_cards_without_human_unblock(kanban_hom
+         kb.unblock_task(conn, a)                     # human retries just one card
+         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+         assert _spawned_ids(res) == [a]
+-        assert kb.get_task(conn, b).status == "blocked"
++        assert kb.get_task(conn, b).status == "scheduled"
+         kb.complete_task(conn, a, result="CI ran")
+         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+         assert res.shared_blocker_released == [b]
+@@ -276,7 +289,7 @@ def test_wake_check_on_human_ask_block_is_refused_not_dropped(kanban_home):
+ def test_lone_blocked_card_behind_open_blocker_is_probed_after_interval(kanban_home, spawns):
+     _spawned, fake_spawn = spawns
+     with kbc.connect_closing() as conn:
+-        tid = _blocked_behind(conn, "alone")
++        tid = _legacy_blocked_behind(conn, "alone")
+         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+         assert _spawned_ids(res) == []                 # within the interval: stays blocked
+         assert kb.get_task(conn, tid).status == "blocked"
+@@ -290,7 +303,7 @@ def test_lone_blocked_card_behind_open_blocker_is_probed_after_interval(kanban_h
+ def test_all_blocked_behind_blocker_get_exactly_one_probe(kanban_home, spawns):
+     _spawned, fake_spawn = spawns
+     with kbc.connect_closing() as conn:
+-        cards = [_blocked_behind(conn, f"c{i}") for i in range(3)]
++        cards = [_legacy_blocked_behind(conn, f"c{i}") for i in range(3)]
+         _age_runs(conn, 1900)
+         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+         assert len(_spawned_ids(res)) == 1
+@@ -317,3 +330,21 @@ def test_human_ask_behind_blocker_is_not_auto_probed(kanban_home, spawns):
+         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+         assert _spawned_ids(res) == []
+         assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_blocker_wake_and_stranded_probe_together_yield_one_probe(kanban_home, spawns):
++    """A legacy ``blocked`` card and a blocker-wake ``scheduled`` card behind the same blocker:
++    once the scheduled card's wake is due, the two wake paths still start ONE probe. [daveey]"""
++    from hermes_cli.kanban_continuation import wake_due_continuations
++    _spawned, fake_spawn = spawns
++    with kbc.connect_closing() as conn:
++        legacy = _legacy_blocked_behind(conn, "legacy")
++        parked = _blocked_behind(conn, "parked")
++        assert kb.get_task(conn, parked).status == "scheduled"
++        _age_runs(conn, 1900)
++        assert parked in wake_due_continuations(conn, now=int(time.time()) + 1900)
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert len(_spawned_ids(res)) == 1
++        assert kb.get_task(conn, legacy).status == "blocked" or _spawned_ids(res) == [legacy]
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == []
+diff --git a/tests/hermes_cli/test_kanban_timed_park.py b/tests/hermes_cli/test_kanban_timed_park.py
+index d2f64b8428..30b3869a85 100644
+--- a/tests/hermes_cli/test_kanban_timed_park.py
++++ b/tests/hermes_cli/test_kanban_timed_park.py
+@@ -103,11 +103,16 @@ def test_needs_input_without_marker_still_blocks_for_a_human(kanban_home: Path)
+         assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).block_kind) == ("blocked", "needs_input")
+ 
+ 
+-def test_shared_blocker_dependency_keeps_sticky_needs_input(kanban_home: Path) -> None:
++def test_shared_blocker_dependency_parks_with_a_wake(kanban_home: Path) -> None:
++    """A parent-less dependency behind a shared blocker used to land sticky needs_input with no
++    wake (nothing probed it); it now parks scheduled on the shared probe cadence. [daveey]"""
++    from hermes_cli.kanban_continuation import pending_wake
++
+     with kbc.connect_closing() as conn:
+         tid = _running(conn)
+         assert kb.block_task(conn, tid, reason="CI billing", kind="dependency", blocker_id="gh-billing")
+-        assert kb.get_task(conn, tid).block_kind == "needs_input"
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert (pending_wake(conn, tid) or {}).get("blocker_id") == "gh-billing"
+ 
+ 
+ def test_kanban_block_tool_time_kind_on_goal_mode_card(kanban_home: Path, monkeypatch) -> None:
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index d306aeb08a..b7361f4663 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1017,6 +1017,14 @@ def _blocker_id_arg(args: dict) -> Optional[str]:
+     return bid
+ 
+ 
++def _clear_blocker_arg(args: dict, blocker_id: Optional[str] = None) -> bool:
++    """Validated ``clear_blocker``: the caller saw the card's shared blocker gone. [daveey]"""
++    raw = args.get("clear_blocker", False)
++    _check(isinstance(raw, bool), "clear_blocker must be true or false")
++    _check(not (raw and blocker_id), "clear_blocker says the wall is gone; blocker_id says it still stands. Pass one")
++    return raw
++
++
+ def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
+     """``(wake_check, check_every, clock_only)`` from a park call, validated. [daveey]"""
+     from hermes_cli import kanban_wake_check as kwc
+@@ -1071,7 +1079,8 @@ def _park_guard(conn, tid: str, op: str, wake: tuple, **plan: Any) -> None:
+     """Refuse a park that wakes > 2 h away with no wake_check and no clock_only. [daveey]"""
+     from hermes_cli import kanban_wake_check as kwc
+ 
+-    wake_at = kwc.planned_wake(conn, tid, op=op, **plan)
++    wake_at = kwc.planned_wake(conn, tid, op=op, **plan, **({"wake_check": wake[0], "clock_only": wake[2]}
++                                                            if op == "block" else {}))
+     err = kwc.guard_error(wake_at=wake_at, wake_check=wake[0], clock_only=wake[2])
+     _check(err is None, f"kanban_{op} {err}", "invalid_args")
+ 
+@@ -1174,6 +1183,7 @@ def _handle_block(args: dict, **kw) -> str:
+                f"finished or cannot proceed for another reason, call kanban_complete instead — "
+                f"the completion judge will evaluate it.")
+         blocker_id = _blocker_id_arg(args)
++        clear_blocker = _clear_blocker_arg(args, blocker_id)
+         wake = _wake_check_args(args)
+         awaiting, wake = _awaiting_arg(args, wake)
+         from hermes_cli.kanban_block_policy import ERROR_CODE, block_policy_error
+@@ -1181,10 +1191,12 @@ def _handle_block(args: dict, **kw) -> str:
+                                      clock_only=wake[2], blocker_id=blocker_id, reason=reason)
+         _check(_policy is None, _policy or "", ERROR_CODE)
+         _standing_wait_guard(kb, conn, tid, kind, args.get("human_request"), reason)
+-        _park_guard(conn, tid, "block", wake, reason=reason, kind=kind, blocker_id=blocker_id)
++        _park_guard(conn, tid, "block", wake, reason=reason, kind=kind, blocker_id=blocker_id,
++                    human_request=args.get("human_request"))
+         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+                            blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1], awaiting=awaiting,
+-                           clock_only=wake[2], human_request=kb.redact_review_value(args.get("human_request")))
++                           clock_only=wake[2], human_request=kb.redact_review_value(args.get("human_request")),
++                           clear_blocker=clear_blocker)
+         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+         escalated = _escalated(kb, conn, tid)
+         if escalated:
+@@ -1198,10 +1210,14 @@ def _handle_block(args: dict, **kw) -> str:
+             # A wait on time, not on a human: parked with a wake time (kanban_timed_park). [daveey]
+             from hermes_cli.kanban_continuation import pending_wake
+             parked = pending_wake(conn, tid) or {}
++            note = ("Parked as a timed wait (scheduled), not a human block: it wakes when "
++                    "wake_check exits 0, at wake_at, or earlier on `hermes kanban unblock`.")
++            if parked.get("blocker_wake"):
++                note = (f"Parked behind shared blocker `{blocker_id}` (scheduled): it wakes at wake_at "
++                        "(the shared probe interval) to probe the wall, or as soon as the blocker clears.")
+             return _ok_landed(kb, conn, tid, "scheduled", requested_kind=kind, wake_at=parked.get("wake_at"),
+-                              **_wake_check_echo(wake),
+-                              note=("Parked as a timed wait (scheduled), not a human block: it wakes when "
+-                                    "wake_check exits 0, at wake_at, or earlier on `hermes kanban unblock`."))
++                              **_wake_check_echo(wake), **({"blocker_id": blocker_id} if blocker_id else {}),
++                              note=note)
+         if kind == "dependency" and landed_kind != kind:
+             # block_task re-kinds a dependency wait that no open parent can satisfy.
+             extra["requested_kind"] = kind
+@@ -1233,10 +1249,12 @@ def _handle_schedule(args: dict, **kw) -> str:
+                "the wake), or kanban_complete so the completion judge can evaluate it.")
+         wake = _wake_check_args(args)
+         awaiting, wake = _awaiting_arg(args, wake)
++        clear_blocker = _clear_blocker_arg(args)
+         _park_guard(conn, tid, "schedule", wake, reason=reason)
+         ok = kb.schedule_task(
+             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
+-            wake_check=wake[0], check_every=wake[1], clock_only=wake[2], awaiting=awaiting)
++            wake_check=wake[0], check_every=wake[1], clock_only=wake[2], awaiting=awaiting,
++            clear_blocker=clear_blocker)
+         _check(ok, f"could not schedule {tid} (unknown id, not in todo/ready/running/blocked, or it "
+                    "waits on a human answer: needs_input/capability asks stay blocked, never scheduled)")
+         escalated = _escalated(kb, conn, tid)
+@@ -1264,6 +1282,9 @@ def _handle_continue(args: dict, **kw) -> str:
+     blocker_id = _blocker_id_arg(args)
+     if blocker_id:
+         metadata = {**(metadata or {}), "blocker_id": blocker_id}
++    if _clear_blocker_arg(args, blocker_id):
++        from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
++        metadata = {**(metadata or {}), CLEAR_FLAG: True}
+     from hermes_cli.kanban_continuation import continue_task
+     with _board(args.get("board")) as (kb, conn):
+         wake = _wake_check_args(args)
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 49a23372e0..2f729e2434 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -256,6 +256,29 @@ HUMAN_REQUEST = {
+ }
+ 
+ 
++_BLOCKER_ID_DESC = (
++    "Optional. Set ONLY when the wall is outside this card and would stop other "
++    "cards too (CI billing/quota refused, a provider or service outage, a release "
++    "pipeline down): a short slug such as 'github-actions-billing'. Reuse an id "
++    "from 'Open shared blockers' in your context when it is the same wall. The "
++    "dispatcher then holds every ready card behind it and runs one probe card per "
++    "interval. The blocker clears only on evidence the wall is gone: a card behind "
++    "it completes or hands off for review, a park passes clear_blocker=true, a run "
++    "names a different blocker_id, or a wake_check of a card behind it exits 0. "
++    "Then every parked card behind it wakes. A later park WITHOUT the id (by you or "
++    "a parent chat, via kanban_block, kanban_schedule or kanban_continue) does NOT "
++    "clear it: the card stays behind the blocker."
++)
++_CLEAR_BLOCKER_PROP = {
++    "clear_blocker": {"type": "boolean", "description": (
++        "Optional, default false. True records that the shared blocker this card is "
++        "parked behind is gone (you checked it), although this run parks for another "
++        "reason; that clears the blocker and wakes the other cards behind it. Never "
++        "combine with blocker_id."
++    )},
++}
++
++
+ KANBAN_BLOCK_SCHEMA = _schema(
+     "kanban_block",
+     (
+@@ -311,14 +334,13 @@ KANBAN_BLOCK_SCHEMA = _schema(
+                 "(default 24h). The others surface to a human. Omit only if none apply."
+             ),
+         },
+-        "blocker_id": _prop("string", (
+-            "Optional. Set ONLY when the wall is outside this card and would stop other "
+-            "cards too (CI billing/quota refused, a provider or service outage, a release "
+-            "pipeline down): a short slug such as 'github-actions-billing'. Reuse an id "
+-            "from 'Open shared blockers' in your context when it is the same wall. The "
+-            "dispatcher then holds every card behind it and runs one probe card per "
+-            "interval; a run that ends without the id clears it and releases the rest."
++        "blocker_id": _prop("string", _BLOCKER_ID_DESC + (
++            " With SCHEDULED_UNTIL, kind='time', wake_check or clock_only the card parks "
++            "'scheduled' with that wake and stays behind the blocker; with none of them it "
++            "parks 'scheduled' and wakes after the shared probe interval. With human_request "
++            "it stays a visible block."
+         )),
++        **_CLEAR_BLOCKER_PROP,
+         **_NEEDS_PROP,
+         **_WAKE_CHECK_PROPS,
+     },
+@@ -340,7 +362,10 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+         "names the owner card doing it (create it on the gateway that holds the "
+         "capability), and a wait on David is a kanban_block needs_input ask, never "
+         "a park. A wait on another card on this board is a parent link "
+-        "(kanban_link), not a park."
++        "(kanban_link), not a park. This tool takes no blocker_id: a card already "
++        "behind a shared blocker stays behind it when parked here (the park says "
++        "nothing about the wall), and the blocker stays open for every other card; "
++        "pass clear_blocker=true only when you saw the wall gone."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+@@ -348,6 +373,7 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+             "Optional reason or machine-readable wake-up marker recorded on "
+             "the completed run and scheduled event."
+         )),
++        **_CLEAR_BLOCKER_PROP,
+         **_NEEDS_PROP,
+         **_WAKE_CHECK_PROPS,
+     },
+@@ -392,14 +418,8 @@ KANBAN_CONTINUE_SCHEMA = _schema(
+         "metadata": {"type": "object", "description": (
+             "Optional machine-readable state (e.g. {\"pids\": [...], \"ci_run\": ...})."
+         )},
+-        "blocker_id": _prop("string", (
+-            "Optional. Set ONLY when the wall is outside this card and would stop other "
+-            "cards too (CI billing/quota refused, a provider or service outage, a release "
+-            "pipeline down): a short slug such as 'github-actions-billing'. Reuse an id "
+-            "from 'Open shared blockers' in your context when it is the same wall. The "
+-            "dispatcher then holds every card behind it and runs one probe card per "
+-            "interval; a run that ends without the id clears it and releases the rest."
+-        )),
++        "blocker_id": _prop("string", _BLOCKER_ID_DESC),
++        **_CLEAR_BLOCKER_PROP,
+     },
+     ["checkpoint"],
+ )
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # A client-less auto-continue runs as the session's stored source
 
-Patch: [`patches/0713-fix-tui-a-client-less-auto-continue-runs-as-the-sess.patch`](patches/0713-fix-tui-a-client-less-auto-continue-runs-as-the-sess.patch)
+Patch: [`patches/0785-fix-tui-a-client-less-auto-continue-runs-as-the-sess.patch`](patches/0785-fix-tui-a-client-less-auto-continue-runs-as-the-sess.patch)
 (fork commit `355e6a6a87`, card t_01a183149a00c941)
 
 ## Why

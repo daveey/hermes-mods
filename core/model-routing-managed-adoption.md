@@ -1,6 +1,6 @@
 # Live agents adopt the managed routing policy; aux and main counters split
 
-Patch: 0619 (daveey/hermes `341a8f5c09`).
+Patch: 0617 (daveey/hermes `341a8f5c09`).
 
 ## Behavior
 

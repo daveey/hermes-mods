@@ -1,6 +1,6 @@
 # PM refuses a target gap in-process, not through a worker
 
-Patch **0601** (source `992410c317`).
+Patch **0624** (source `992410c317`).
 
 ## Behavior
 

@@ -1,6 +1,6 @@
 # Replica rows are decoded once per distinct stored text
 
-Patch **0557** (source `5ca5255515`).
+Patch **0536** (source `5ca5255515`).
 
 ## Behavior
 

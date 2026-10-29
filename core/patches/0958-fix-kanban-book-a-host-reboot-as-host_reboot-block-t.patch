@@ -1,0 +1,1094 @@
+From 43cb700f697aad1aa2ed693bad637eca417ad016 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:12:39 +0000
+Subject: [PATCH] fix(kanban): book a host reboot as host_reboot, block the
+ card whose sudo shutdown caused it [daveey]
+
+2026-10-29, hermes-hub: a worker's test subprocess ran `sudo -n /sbin/shutdown -r now` from its workspace.
+The dead-worker sweep booked every running card `crashed` ("pid N not alive"), counted a failure on each,
+and retried the culprit, which rebooted the hub twice more (self-heal kanban-f6d16c4695).
+
+Every spawn already records worker_started_at = "<boot_id>:<pid1 start>|<start>". In _reclaim_dead_workers,
+when that boot id differs from the current one (both known), the worker died with its host:
+- the run outcome and event are `host_reboot`, and a bystander is requeued WITHOUT counting a failure;
+- hermes_cli/kanban_host_reboot.py reads the spawn boot's journal (`journalctl -b <boot> _COMM=sudo`,
+  cached per boot) for an executed shutdown/reboot/poweroff/halt/systemctl reboot. If its PWD is in the
+  card's workspace (or a path naming the card id), or in the assignee profile's scratch dir while the card
+  is that profile's only reboot victim, the card is the culprit: tripped at once with block_kind
+  `capability`, the journal line in last_failure_error, and a comment on it and its linked cards.
+
+Tests: tests/hermes_cli/test_kanban_host_reboot.py (journal parsing, boot compare, workspace culprit +
+bystander, profile-scratch sole victim, two victims -> neither blocked, plain reboot -> all requeued
+uncounted, same-boot death still `crashed`). 4 integration tests fail without the dispatcher change.
+Replayed on the real hub runs: 5623/5633 (workspace) and 5639 (bb-tuner scratch) -> host_reboot + blocked;
+bystanders 5629/5634 -> host_reboot, uncounted.
+
+Public-series adaptation: also carries source merge-only resolutions and restores
+respawn-guard regression tests and the stalled stripe trace field omitted by
+earlier curated patches. See mirror-958-verification.md for the exact inventory.
+
+---
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index e85ed5976d..d14a7c8de2 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -421,7 +421,7 @@ describe('kanban work in flight ($kanbanBusySessionIds)', () => {
+   })
+ 
+   it('folds blocked-only project rows over finished/unseen results after goal completion', () => {
+-    const row = { goal_active: false, kanban_active: 0, kanban_blocked: 1, kanban_unseen: 1 }
++    const row = { goal_active: false, kanban_active: 0, kanban_blocked: 1, kanban_observed_at: Date.now() / 1000, kanban_unseen: 1 }
+ 
+     for (const state of ['idle', 'unread', 'draft'] as const) {
+       expect(withRowActivity(state, row)).toBe('background')
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 7495cd155b..a72f0446a8 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -82,8 +82,13 @@ export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions, $k
+     for (const row of rows) {
+       // [daveey] `kanban_unknown`: the backend could not read the session's cards (local boards or another
+       // gateway's replica). Unknown is not "no work", so the row stays off done until a read succeeds.
+-      if ((row.kanban_active ?? 0) > 0 || (row.kanban_blocked ?? 0) > 0 || row.kanban_unknown === true ||
+-          (row.kanban_remote_stale ?? 0) > 0 || !hasFreshKanbanObservation(row)) {
++      if (
++        (row.kanban_active ?? 0) > 0 ||
++        (row.kanban_blocked ?? 0) > 0 ||
++        row.kanban_unknown === true ||
++        (row.kanban_remote_stale ?? 0) > 0 ||
++        !hasFreshKanbanObservation(row)
++      ) {
+         ids.push(row.id)
+       }
+     }
+@@ -318,7 +323,7 @@ export const withRowActivity = (
+   state: SessionDotState,
+   row: Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active' | 'kanban_blocked'> &
+     Partial<Pick<SessionInfo, 'kanban_held' | 'kanban_parked'>> &
+-    Partial<Pick<SessionInfo, 'kanban_unseen' | 'offline_cached' | 'kanban_observed_at' | 'kanban_remote_stale' | 'kanban_unknown'>>
++    Partial<Pick<SessionInfo, 'kanban_observed_at' | 'kanban_remote_stale' | 'kanban_unknown' | 'kanban_unseen' | 'offline_cached'>>
+ ): SessionDotState =>
+   row.offline_cached
+     ? 'idle'
+@@ -562,6 +567,7 @@ export type StripeTraceRow = Pick<SessionInfo, 'id'> &
+       | 'kanban_held'
+       | 'kanban_observed_at'
+       | 'kanban_parked'
++      | 'kanban_stalled'
+       | 'kanban_waiting_on'
+       | 'offline_cached'
+       | 'offline_synced_at'
+@@ -602,6 +608,7 @@ export function formatStripeTransition(
+     ['kanban_active', row.kanban_active],
+     ['kanban_parked', row.kanban_parked],
+     ['kanban_held', row.kanban_held],
++    ['kanban_stalled', row.kanban_stalled],
+     ['kanban_blocked', row.kanban_blocked],
+     ['kanban_waiting_on', row.kanban_waiting_on],
+     ['kanban_observed_at', row.kanban_observed_at],
+diff --git a/hermes_cli/kanban_block_routing.py b/hermes_cli/kanban_block_routing.py
+index 2d3eddc00c..95cc8d713d 100644
+--- a/hermes_cli/kanban_block_routing.py
++++ b/hermes_cli/kanban_block_routing.py
+@@ -74,7 +74,7 @@ def supervisor_stop(conn, task_id: str, reason: str, reason_code: str) -> bool:
+ 
+     with kb.write_txn(conn):
+         changed = conn.execute(
+-            "UPDATE tasks SET status = 'triage', block_kind = 'transient' "
++            "UPDATE tasks SET status = 'triage', block_kind = 'transient', human_request = NULL "
+             "WHERE id = ? AND status IN ('ready', 'review')", (task_id,),
+         ).rowcount
+         if not changed:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 1e80e59181..c8aba1c80f 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -33,6 +33,8 @@ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
+ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code_kind
+ from hermes_cli import kanban_worker_scope as _worker_scope
++from hermes_cli import kanban_host_reboot as _host_reboot
++from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+ from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
+ 
+ if TYPE_CHECKING:
+@@ -1268,31 +1270,6 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
+     return " ".join(lines)[-400:]
+ 
+ 
+-@dataclass
+-class _DeadWorker:
+-    """How ``detect_crashed_workers`` should book one dead worker."""
+-
+-    kind: str
+-    code: Optional[int]
+-    error_text: str
+-    event_kind: str
+-    event_payload: dict
+-    protocol_violation: bool = False
+-    rate_limited: bool = False
+-    terminal_provider: bool = False
+-    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's credential/model — trips at once."""
+-    unknown_skill: bool = False  # died of ``Unknown skill(s)``: blocked as ``assignment`` at once [daveey]
+-    stdlib_shadow: bool = False  # traceback from a workspace ``<stdlib>.py``: blocked at once [daveey]
+-
+-    @property
+-    def run_outcome(self) -> str:
+-        if self.event_kind in {"oom_killed", "signaled"}:
+-            return self.kind
+-        # A rate-limited requeue is recorded as ``rate_limited`` so board history
+-        # doesn't show a phantom crash for a quota wall.
+-        return "rate_limited" if self.rate_limited else "crashed"
+-
+-
+ def _classify_dead_worker(
+     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+     run_id: Optional[int] = None, conn: Optional[sqlite3.Connection] = None,
+@@ -1400,6 +1377,7 @@ class _CrashSweep:
+ 
+     crashed: list[str] = field(default_factory=list)
+     rate_limited: list[str] = field(default_factory=list)
++    host_rebooted: list[str] = field(default_factory=list)  # reboot bystanders, requeued uncounted [daveey]
+     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
+     # ``_record_task_failure`` (needs its own write_txn).
+     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
+@@ -1413,11 +1391,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+     sweep = _CrashSweep()
+     with _kb.write_txn(conn):
+         rows = conn.execute(
+-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id "
+-            "FROM tasks "
++            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id, "
++            "workspace_path FROM tasks "
+             "WHERE status = 'running' AND worker_pid IS NOT NULL"
+         ).fetchall()
+         host_prefix = _kb._host_prefix()
++        now_boot, reboot_victims = _host_reboot.victims(rows, lambda r: _kb._claim_is_local(r["claim_lock"] or "",
++                                                                                          host_prefix))
+         for row in rows:
+             lock = row["claim_lock"] or ""
+             if not _kb._claim_is_local(lock, host_prefix):
+@@ -1433,6 +1413,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+             pid = int(row["worker_pid"])
+             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board,
+                                          run_id=row["current_run_id"], conn=conn)
++            _host_reboot.note(dead, row, now_boot, reboot_victims)  # [daveey]
+             retry_status = _kb._retry_status_for_run(conn, row["id"])
+             dead.event_payload["retry_status"] = retry_status
+             cur = conn.execute(
+@@ -1471,7 +1452,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                     (dead.error_text[:500], row["id"]),
+                 )
+-            if dead.rate_limited:
++            if dead.host_reboot and not dead.reboot_culprit:
++                # A bystander of a reboot: back to its source phase, no failure counted. [daveey]
++                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?",
++                             (dead.error_text[:500], row["id"]))
++                sweep.host_rebooted.append(row["id"])
++            elif dead.rate_limited:
+                 sweep.rate_limited.append(row["id"])
+                 try:
+                     from hermes_cli import kanban_provider_walls as _walls
+@@ -1531,9 +1517,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                     "protocol_violation_limit": violation_limit,
+                 },
+             )
+-        elif dead.terminal_provider or dead.unknown_skill or dead.stdlib_shadow:
+-            # No retry heals a revoked credential, a gone model, a missing skill or a stdlib shadow: block now.
+-            flag = "unknown_skill" if dead.unknown_skill else "stdlib_shadow" if dead.stdlib_shadow else "terminal_provider"
++        elif dead.terminal_provider or dead.unknown_skill or dead.stdlib_shadow or dead.reboot_culprit:
++            # No retry heals a revoked credential, a gone model, a missing skill, a stdlib shadow or this
++            # card's own sudo shutdown of the host (a retry reboots it again): block now.
++            flag = "unknown_skill" if dead.unknown_skill else "stdlib_shadow" if dead.stdlib_shadow else \
++                "reboot_culprit" if dead.reboot_culprit else "terminal_provider"
+             tripped = _record_task_failure(
+                 conn, tid,
+                 error=error_text,
+@@ -1541,9 +1529,11 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
+                 force_trip=True,
+                 release_claim=False,
+                 end_run=False,
+-                event_payload_extra={"pid": pid, "claimer": claimer, flag: True},
+-                block_kind="transient" if dead.terminal_provider else "assignment",
++                event_payload_extra={"pid": pid, "claimer": claimer, flag: dead.reboot_culprit or True},
++                block_kind="transient" if dead.terminal_provider else "capability" if dead.reboot_culprit else "assignment",
+             )
++            if dead.reboot_culprit:
++                _host_reboot.comment_culprit(conn, tid, dead.reboot_culprit)
+         else:
+             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+             extra = {"pid": pid, "claimer": claimer}
+@@ -1584,6 +1574,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
+     # requeues did NOT count a failure and are NOT crashes.
+     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
++    detect_crashed_workers._last_host_rebooted = sweep.host_rebooted  # type: ignore[attr-defined]
+     # Fired only now, after the reclaim txn AND breaker accounting have
+     # committed, so subscribers always observe fully durable board state.
+     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
+diff --git a/hermes_cli/kanban_db_dispatch_dead_worker.py b/hermes_cli/kanban_db_dispatch_dead_worker.py
+new file mode 100644
+index 0000000000..d06d5b13c5
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_dead_worker.py
+@@ -0,0 +1,36 @@
++"""``_DeadWorker``: how the dead-worker sweep books one dead worker (moved out of kanban_db_dispatch). [daveey]"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Optional
++
++from hermes_cli.kanban_host_reboot import HOST_REBOOT_OUTCOME
++
++
++@dataclass
++class _DeadWorker:
++    """How ``detect_crashed_workers`` should book one dead worker."""
++
++    kind: str
++    code: Optional[int]
++    error_text: str
++    event_kind: str
++    event_payload: dict
++    protocol_violation: bool = False
++    rate_limited: bool = False
++    terminal_provider: bool = False
++    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's credential/model — trips at once."""
++    unknown_skill: bool = False  # died of ``Unknown skill(s)``: blocked as ``assignment`` at once [daveey]
++    stdlib_shadow: bool = False  # traceback from a workspace ``<stdlib>.py``: blocked at once [daveey]
++    host_reboot: bool = False  # the host rebooted under the worker: no failure counted [daveey]
++    reboot_culprit: Optional[dict] = None  # this card's own sudo shutdown (journal line): blocked at once [daveey]
++
++    @property
++    def run_outcome(self) -> str:
++        if self.host_reboot:
++            return HOST_REBOOT_OUTCOME
++        if self.event_kind in {"oom_killed", "signaled"}:
++            return self.kind
++        # A rate-limited requeue is recorded as ``rate_limited`` so board history
++        # doesn't show a phantom crash for a quota wall.
++        return "rate_limited" if self.rate_limited else "crashed"
+diff --git a/hermes_cli/kanban_host_reboot.py b/hermes_cli/kanban_host_reboot.py
+new file mode 100644
+index 0000000000..13ef8fe568
+--- /dev/null
++++ b/hermes_cli/kanban_host_reboot.py
+@@ -0,0 +1,188 @@
++"""Tell a host reboot from a worker crash in the dead-worker sweep, and name the card that rebooted the host. [daveey]
++
++On 2026-10-29 a Kanban worker on hermes-hub ran a test suite whose subprocess executed
++``sudo -n /sbin/shutdown -r now``. The dispatcher booked every running card as ``crashed`` ("pid N not
++alive"), retried the culprit, and the culprit rebooted the hub twice more.
++
++Every spawn already records ``worker_started_at = "<boot_id>:<pid1 start>|<start time>"``
++(``_process_fingerprint``). When that boot id is not the current one, the worker died with its host:
++
++- the run is booked ``host_reboot`` (not ``crashed``) and no failure is counted: a reboot is not the card's fault;
++- the journal of the spawn's boot is read (``journalctl -b <boot> _COMM=sudo``) for a sudo
++  shutdown/reboot/poweroff. If its ``PWD`` lies in the card's workspace (or a path naming the card id), or in
++  the assignee profile's scratch dir while this card is that profile's only reboot victim, the card is the
++  culprit: it is blocked (``capability``) quoting the journal line instead of being retried.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import re
++import sqlite3
++import subprocess
++from pathlib import Path
++from typing import Callable, Iterable, Optional
++
++HOST_REBOOT_OUTCOME = "host_reboot"
++_log = logging.getLogger(__name__)
++
++_SUDO_RE = re.compile(r"\bsudo\[\d+\]:\s+(?P<user>\S+)\s*:\s*(?P<fields>.*)$")
++_POWER_RE = re.compile(
++    r"^(?:\S*/)?(?:shutdown|reboot|poweroff|halt)(?:\s|$)"
++    r"|^(?:\S*/)?systemctl(?:\s+\S+)*?\s+(?:reboot|poweroff|halt|kexec)(?:\s|$)"
++    r"|^(?:\S*/)?(?:tel)?init\s+[06]\b"
++)
++_REFUSED_RE = re.compile(r"command not allowed|incorrect password|a password is required|NOT in sudoers")
++_BOOT_RE = re.compile(r"^[0-9a-f]{32}$")
++
++# Previous boots' journals never change, so one read per boot id is enough.
++_journal_cache: dict[str, list[dict]] = {}
++
++
++def boot_of(worker_started_at) -> str:
++    """The boot id a spawn fingerprint was taken on ("" for legacy/int/UNVERIFIED fingerprints)."""
++    s = str(worker_started_at or "")
++    if "|" not in s:
++        return ""
++    return s.split("|", 1)[0].split(":", 1)[0].strip()
++
++
++def current_boot() -> str:
++    try:
++        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
++    except OSError:
++        return ""
++
++
++def rebooted_since(worker_started_at, now_boot: Optional[str] = None) -> bool:
++    """True only when both boot ids are known and differ (never on an unreadable /proc)."""
++    spawn = boot_of(worker_started_at)
++    now = current_boot() if now_boot is None else now_boot
++    return bool(spawn and now and spawn != now)
++
++
++def parse_power_commands(journal_text: str) -> list[dict]:
++    """sudo journal lines that ran (not refused) a shutdown/reboot/poweroff/halt command."""
++    found = []
++    for line in journal_text.splitlines():
++        m = _SUDO_RE.search(line)
++        if not m or _REFUSED_RE.search(line):
++            continue
++        fields = {}
++        for part in m.group("fields").split(" ; "):
++            k, sep, v = part.partition("=")
++            if sep:
++                fields[k.strip()] = v.strip()
++        cmd = fields.get("COMMAND", "")
++        if cmd and _POWER_RE.search(cmd):
++            found.append({"line": line.strip()[:400], "user": m.group("user"), "pwd": fields.get("PWD", ""),
++                          "command": cmd})
++    return found
++
++
++def _read_journal(boot: str) -> str:
++    p = subprocess.run(["journalctl", "-b", boot, "_COMM=sudo", "--no-pager", "-q", "-o", "short-iso"],
++                       capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL, check=False)
++    return p.stdout if p.returncode == 0 else ""
++
++
++def power_commands(spawn_boot: str, reader: Optional[Callable[[str], str]] = None) -> list[dict]:
++    """Power commands sudo ran during the boot ``spawn_boot`` (dashed /proc form accepted). [] when unreadable."""
++    boot = spawn_boot.replace("-", "").lower()
++    if not _BOOT_RE.match(boot):
++        return []
++    if reader is None and boot in _journal_cache:
++        return _journal_cache[boot]
++    try:
++        found = parse_power_commands((reader or _read_journal)(boot))
++    except (OSError, subprocess.SubprocessError, ValueError):
++        return []
++    if reader is None:
++        _journal_cache[boot] = found
++    return found
++
++
++def _under(path: str, root) -> bool:
++    if not path or not root:
++        return False
++    p, r = os.path.normpath(path), os.path.normpath(str(root))
++    return p == r or p.startswith(r.rstrip("/") + "/")
++
++
++def profile_scratch_dirs(assignee: Optional[str], hermes_root: Path) -> list[Path]:
++    if not assignee:
++        return []
++    if assignee == "default":
++        return [hermes_root / "cache" / "scratch"]
++    return [hermes_root / "profiles" / assignee / "cache" / "scratch"]
++
++
++def hermes_root() -> Path:
++    """The root Hermes home (``~/.hermes``), even when this process runs under a profile."""
++    from hermes_constants import get_hermes_home
++    home = Path(get_hermes_home())
++    return home.parent.parent if home.parent.name == "profiles" else home
++
++
++def victims(rows, is_local: Callable) -> tuple[str, dict]:
++    """(current boot, {assignee: number of this host's running cards spawned on an earlier boot})."""
++    now = current_boot()
++    counts: dict = {}
++    for row in rows:
++        if is_local(row) and rebooted_since(row["worker_started_at"], now):
++            counts[row["assignee"]] = counts.get(row["assignee"], 0) + 1
++    return now, counts
++
++
++def note(dead, row, now_boot: str, reboot_victims: dict) -> None:
++    """Rebook a dead worker (``_DeadWorker``) whose spawn boot is not this boot as a host reboot, naming the
++    card as the culprit when the spawn boot's journal shows it ran the sudo shutdown. No-op otherwise."""
++    if not rebooted_since(row["worker_started_at"], now_boot):
++        return
++    spawn_boot = boot_of(row["worker_started_at"])
++    dead.host_reboot = True
++    dead.event_kind = HOST_REBOOT_OUTCOME
++    dead.event_payload.update(host_reboot=True, spawn_boot=spawn_boot, current_boot=now_boot)
++    culprit = find_culprit(power_commands(spawn_boot), task_id=row["id"], workspace_path=row["workspace_path"],
++                           assignee=row["assignee"], sole_profile_victim=reboot_victims.get(row["assignee"]) == 1)
++    head = f"host rebooted under worker pid {dead.event_payload.get('pid')} (boot {spawn_boot[:8]} -> {now_boot[:8]})"
++    if culprit:
++        dead.reboot_culprit = culprit
++        dead.event_payload["reboot_culprit"] = culprit
++        dead.error_text = (f"{head}: THIS card rebooted the host. Journal ({culprit['match']}): {culprit['line']} "
++                           "Blocked instead of retried: remove whatever runs the real shutdown (e.g. a test "
++                           "subprocess with the real sudo on PATH), then unblock. ") + dead.error_text
++    else:
++        dead.error_text = f"{head}; requeued without counting a failure. " + dead.error_text
++
++
++def comment_culprit(conn, task_id: str, culprit: dict) -> None:
++    """Say on the culprit card and on its linked cards which command rebooted the host."""
++    from hermes_cli import kanban_db as kb
++    try:
++        links = conn.execute("SELECT parent_id AS other FROM task_links WHERE child_id = ? UNION "
++                             "SELECT child_id FROM task_links WHERE parent_id = ?", (task_id, task_id)).fetchall()
++        kb.add_comment(conn, task_id, "dispatcher", (
++            f"host-reboot: this card's worker rebooted the host. Journal ({culprit.get('match')}): "
++            f"`{culprit.get('line')}`. Blocked instead of retried; a retry would reboot it again."))
++        for link in links:
++            kb.add_comment(conn, link["other"], "dispatcher", f"host-reboot: linked card {task_id} rebooted the "
++                           f"host (`{culprit.get('command')}` in {culprit.get('pwd')}); it is blocked.")
++    except (sqlite3.Error, ValueError):  # the block already landed; a missing comment must not undo the sweep
++        _log.warning("kanban: host-reboot comment failed for %s", task_id, exc_info=True)
++
++
++def find_culprit(commands: Iterable[dict], *, task_id: str, workspace_path: Optional[str],
++                 assignee: Optional[str], sole_profile_victim: bool,
++                 root: Optional[Path] = None) -> Optional[dict]:
++    """The journal power command this card issued, with how it was matched; None when it was a bystander."""
++    root = root or hermes_root()
++    for rec in commands:
++        pwd = rec.get("pwd") or ""
++        if workspace_path and _under(pwd, workspace_path):
++            return {**rec, "match": "workspace"}
++        if task_id and task_id in pwd.split("/"):
++            return {**rec, "match": "task_id"}
++        if sole_profile_victim and any(_under(pwd, d) for d in profile_scratch_dirs(assignee, root)):
++            return {**rec, "match": "profile_scratch"}
++    return None
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 1edeadc1c8..b2502fc8c5 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -30,7 +30,7 @@ from typing import Any, Callable, Iterable, Iterator
+ 
+ _log = logging.getLogger(__name__)
+ 
+-# Operational parked work stays active in the display, not runnable in the scheduler.
++# Operational parked/review work remains unfinished, not runnable in the scheduler.
+ ACTIVE_STATUSES = ("todo", "ready", "running", "scheduled", "review")
+ # Only validated explicit requests paint the sidebar red, in either parked status.
+ BLOCKED_STATUSES = ("blocked", "triage")
+@@ -38,6 +38,7 @@ BLOCKED_STATUSES = ("blocked", "triage")
+ _CACHE_TTL_S = 3.0
+ _cache_lock = threading.Lock()
+ _cache: tuple[float, dict[str, int], dict[str, int], dict[str, int], dict[str, int]] | None = None
++_cache_scope: tuple[str, ...] | None = None
+ _cache_fingerprint: tuple = ()
+ _waiting_cache: list[dict[str, frozenset[str]]] = [{}]
+ # (parked, held) per session from the same snapshot as ``_cache`` (see ``_read_parked``); the sink is set while
+@@ -69,7 +70,6 @@ _annotate_flight_result: tuple | None = None
+ _last_annotation: dict[tuple[str, ...], tuple] = {}
+ _annotate_waiters = 0
+ WAITING_ON_CAP = 50
+-_cache_scope: tuple[str, ...] | None = None
+ 
+ 
+ def _origin_scope() -> tuple[str, ...]:
+@@ -83,6 +83,7 @@ def _origin_scope() -> tuple[str, ...]:
+             os.environ.get('HERMES_MAIL_CONFIG', str(Path.home() / '.config/hermes-mail/config.json')))
+ 
+ 
++
+ def _board_db_paths() -> list[Path]:
+     from hermes_cli import kanban_db
+ 
+@@ -562,6 +563,8 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+     """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards. ``human_request`` may be
+     the decoded dict or the stored JSON text (``_stored_needs_human`` reads both). [daveey]"""
+     status = task.get("status")
++    if status == "unknown" and task.get("unfinished"):
++        return "active"
+     if status in BLOCKED_STATUSES:
+         return "blocked" if _stored_needs_human(task.get("human_request"), task.get("block_kind")) else "active"
+     return "active" if status in ACTIVE_STATUSES else None
+diff --git a/hermes_cli/web_routers/chat_ws.py b/hermes_cli/web_routers/chat_ws.py
+index 20cd568cbd..2e88ab4984 100644
+--- a/hermes_cli/web_routers/chat_ws.py
++++ b/hermes_cli/web_routers/chat_ws.py
+@@ -698,16 +698,6 @@ async def pty_ws(ws: WebSocket) -> None:
+ # session id, so agent emits fan out to both sinks.
+ 
+ 
+-def _ws_client_kind(ws: WebSocket) -> Optional[str]:
+-    """[daveey] ``"agent"`` when the client connected with ``?client=agent`` (agent scripts driving the backend),
+-    else None (the renderer; today's behaviour). Client-declared: it only makes ``session.create`` default to
+-    hidden and keeps ``prompt.submit`` out of last_human_input.json; it grants nothing."""
+-    from tui_gateway.transport import AGENT_CLIENT_KIND
+-
+-    query = getattr(ws, "query_params", None) or {}
+-    return AGENT_CLIENT_KIND if query.get("client", "") == AGENT_CLIENT_KIND else None
+-
+-
+ @router.websocket("/api/ws")
+ async def gateway_ws(ws: WebSocket) -> None:
+     if not await _close_unless_sidecar_allowed(ws):
+@@ -726,7 +716,6 @@ async def gateway_ws(ws: WebSocket) -> None:
+         ws,
+         auth_identity=getattr(ws, "_hermes_auth_identity", None),
+         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
+-        client_kind=_ws_client_kind(ws),
+     )
+ 
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 8a5e29aab5..d225f55bea 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -754,26 +754,6 @@ def _validate_request_entry(payload) -> None:
+                 raise ValueError("human_request/block_kind require blocked status or metadata_only classification")
+ 
+ 
+-def _classification_actor(request: Request) -> str:
+-    """Use the existing sensitive-endpoint gate, never a payload actor or worker env.
+-
+-    Dashboard sessions (including the shared loopback token) are trusted operators;
+-    there is no worker/operator role distinction within that credential. A worker
+-    holding it has the same authority. Service token principals alone do not pass
+-    this gate. Annotation records evidence, not approval or OS authentication.
+-    """
+-    from hermes_cli.web_server import _require_token
+-
+-    if request is None:
+-        raise HTTPException(status_code=401, detail="Unauthorized")
+-    _require_token(request)
+-    session = getattr(request.state, "session", None)
+-    if getattr(request.app.state, "auth_required", False):
+-        assert session is not None  # enforced by the canonical gate above
+-        return f"dashboard:{session.provider}:{session.user_id}"
+-    return "dashboard:loopback-token"
+-
+-
+ def _classify_request(conn, task_id, payload, actor: str) -> bool:
+     from hermes_cli.kanban_human_request_migration import classify_parked_request
+ 
+@@ -918,7 +898,9 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
+ @router.patch("/tasks/{task_id}")
+ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None), request: Request = None):
+     _validate_request_entry(payload)
+-    actor = _classification_actor(request) if payload.metadata_only else ""
++    from plugins.kanban.dashboard.plugin_api_human_request import classification_actor
++
++    actor = classification_actor(request) if payload.metadata_only else ""
+     with _board_conn(board) as (board, conn):
+         _require_task(conn, task_id)
+         if payload.metadata_only:
+@@ -1106,7 +1088,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None), reque
+     """Apply the same patch to every id. Independent iteration — per-task
+     failures don't abort siblings; returns per-id outcome for partials."""
+     _validate_request_entry(payload)
+-    actor = _classification_actor(request) if payload.metadata_only else ""
++    from plugins.kanban.dashboard.plugin_api_human_request import classification_actor
++
++    actor = classification_actor(request) if payload.metadata_only else ""
+     ids = [i for i in (payload.ids or []) if i]
+     if not ids:
+         raise HTTPException(status_code=400, detail="ids is required")
+diff --git a/plugins/kanban/dashboard/plugin_api_human_request.py b/plugins/kanban/dashboard/plugin_api_human_request.py
+new file mode 100644
+index 0000000000..5d9529341d
+--- /dev/null
++++ b/plugins/kanban/dashboard/plugin_api_human_request.py
+@@ -0,0 +1,22 @@
++"""Trusted actor resolution for audited human-request classification."""
++from fastapi import HTTPException, Request
++
++
++def classification_actor(request: Request) -> str:
++    """Use the existing sensitive-endpoint gate, never a payload actor or worker env.
++
++    Dashboard sessions (including the shared loopback token) are trusted operators;
++    there is no worker/operator role distinction within that credential. A worker
++    holding it has the same authority. Service token principals alone do not pass
++    this gate. Annotation records evidence, not approval or OS authentication.
++    """
++    from hermes_cli.web_server import _require_token
++
++    if request is None:
++        raise HTTPException(status_code=401, detail="Unauthorized")
++    _require_token(request)
++    session = getattr(request.state, "session", None)
++    if getattr(request.app.state, "auth_required", False):
++        assert session is not None  # enforced by the canonical gate above
++        return f"dashboard:{session.provider}:{session.user_id}"
++    return "dashboard:loopback-token"
+diff --git a/tests/hermes_cli/test_api_ws_client_kind.py b/tests/hermes_cli/test_api_ws_client_kind.py
+index 2dc148af02..221c44c3dd 100644
+--- a/tests/hermes_cli/test_api_ws_client_kind.py
++++ b/tests/hermes_cli/test_api_ws_client_kind.py
+@@ -49,12 +49,19 @@ def _one_rpc(client, query: str) -> None:
+         assert "result" in reply, reply
+ 
+ 
+-def test_client_agent_param_sets_agent_client_kind(client, seen):
+-    _one_rpc(client, "&client=agent")
++@pytest.mark.parametrize("query", ["&client=agent", "&client=AGENT"])
++def test_client_agent_param_sets_agent_client_kind(client, seen, query):
++    _one_rpc(client, query)
+     assert seen == ["agent"]
+ 
+ 
+-@pytest.mark.parametrize("query", ["", "&client=renderer", "&client=AGENT"])
+-def test_without_agent_param_client_kind_is_unset(client, seen, query):
+-    _one_rpc(client, query)
++def test_without_client_param_client_kind_is_unset(client, seen):
++    _one_rpc(client, "")
+     assert seen == [None]
++
++
++def test_other_client_kind_is_not_agent(client, seen):
++    from tui_gateway.transport import AGENT_CLIENT_KIND
++
++    _one_rpc(client, "&client=renderer")
++    assert seen == ["renderer"] and seen[0] != AGENT_CLIENT_KIND
+diff --git a/tests/hermes_cli/test_kanban_host_reboot.py b/tests/hermes_cli/test_kanban_host_reboot.py
+new file mode 100644
+index 0000000000..d9d2ddf650
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_host_reboot.py
+@@ -0,0 +1,150 @@
++"""A host reboot is not a worker crash, and the card that rebooted the host is blocked, not retried. [daveey]
++
++2026-10-29, hermes-hub: a worker's test subprocess ran ``sudo -n /sbin/shutdown -r now``. The sweep booked every
++running card ``crashed`` ("pid N not alive") and retried the culprit, which rebooted the hub twice more.
++"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_host_reboot as hr
++
++OLD_BOOT = "1db9ba69-7f38-412b-b960-a4c38ce49d08"
++NOW_BOOT = "3a7a1e43-81f7-4df4-846e-ed5f0a469284"
++
++# Lines as journalctl -o short-iso prints them on hermes-hub (paths shortened to the test home below).
++JOURNAL = """\
++2026-10-29T12:30:01+00:00 hermes-hub sudo[1200]:   ubuntu : PWD=/srv ; USER=root ; COMMAND=/usr/bin/systemctl restart ssh
++2026-10-29T12:37:00+00:00 hermes-hub sudo[1201]:   ubuntu : command not allowed ; PWD={ws_other} ; USER=root ; COMMAND=/usr/sbin/shutdown -k now
++2026-10-29T12:38:06+00:00 hermes-hub sudo[1202]:   ubuntu : PWD={pwd} ; USER=root ; COMMAND=/sbin/shutdown -r now
++2026-10-29T12:38:06+00:00 hermes-hub sudo[1202]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
++"""
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++    monkeypatch.setattr(kbd, "_worker_final_output", lambda *a, **kw: "")
++    monkeypatch.setattr(hr, "current_boot", lambda: NOW_BOOT)
++    monkeypatch.setattr(hr, "hermes_root", lambda: tmp_path)
++    hr._journal_cache.clear()
++    return tmp_path
++
++
++def _journal(monkeypatch, text):
++    seen = []
++
++    def reader(boot):
++        seen.append(boot)
++        return text
++    monkeypatch.setattr(hr, "_read_journal", reader)
++    return seen
++
++
++def _running(conn, title, *, assignee="default", boot=OLD_BOOT, workspace=None, pid=71001):
++    tid = kb.create_task(conn, title=title, assignee=assignee)
++    host = kb._claimer_id().split(":", 1)[0]
++    kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid=?, worker_started_at=?, started_at=?, workspace_path=? WHERE id=?",
++                     (pid, f"{boot}:22|66427451", int(time.time()) - 600, workspace, tid))
++    return tid
++
++
++def _run(conn, tid):
++    return conn.execute("SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                        (tid,)).fetchone()
++
++
++def test_parse_power_commands_keeps_only_executed_power_commands():
++    found = hr.parse_power_commands(JOURNAL.format(ws_other="/w/b", pwd="/w/a/rbs/b"))
++    assert [(f["pwd"], f["command"]) for f in found] == [("/w/a/rbs/b", "/sbin/shutdown -r now")]
++    more = hr.parse_power_commands(
++        "x sudo[1]:   ubuntu : TTY=pts/1 ; PWD=/p ; USER=root ; COMMAND=/usr/bin/systemctl --no-wall reboot\n"
++        "x sudo[2]:   ubuntu : PWD=/p ; USER=root ; COMMAND=/usr/bin/systemctl status reboot.target\n")
++    assert [f["command"] for f in more] == ["/usr/bin/systemctl --no-wall reboot"]
++
++
++def test_boot_compare_needs_both_ids():
++    assert hr.boot_of(f"{OLD_BOOT}:22|5") == OLD_BOOT
++    assert hr.boot_of(12345) == "" and hr.boot_of(None) == "" and hr.boot_of("unverified") == ""
++    assert hr.rebooted_since(f"{OLD_BOOT}:22|5", NOW_BOOT)
++    assert not hr.rebooted_since(f"{NOW_BOOT}:22|5", NOW_BOOT)
++    assert not hr.rebooted_since(f"{OLD_BOOT}:22|5", "")  # unreadable /proc: never guess a reboot
++
++
++def test_culprit_in_its_workspace_is_blocked_and_bystander_requeued_uncounted(home, monkeypatch):
++    ws_a, ws_b = home / "kanban/workspaces/t_a", home / "kanban/workspaces/t_b"
++    seen = _journal(monkeypatch, JOURNAL.format(ws_other=ws_b, pwd=f"{ws_a}/rbs/b"))
++    with kbc.connect() as conn:
++        culprit = _running(conn, "re-verify mac-fixer", workspace=str(ws_a), pid=71001)
++        bystander = _running(conn, "upkeep", workspace=str(ws_b), pid=71002)
++        parent = kb.create_task(conn, title="downstream card", assignee="default")
++        kb.link_tasks(conn, culprit, parent)  # a linked (child) card hears about it too
++        kbd.detect_crashed_workers(conn)
++
++        c, b = kb.get_task(conn, culprit), kb.get_task(conn, bystander)
++        assert c.status == "triage" and c.block_kind == "capability"
++        assert "THIS card rebooted the host" in c.last_failure_error
++        assert "COMMAND=/sbin/shutdown -r now" in c.last_failure_error
++        assert _run(conn, culprit)["outcome"] == "host_reboot"
++
++        assert b.status == "ready" and b.consecutive_failures == 0
++        assert _run(conn, bystander)["outcome"] == "host_reboot"
++        assert "requeued without counting a failure" in b.last_failure_error
++
++        comments = {t: [x.body for x in kb.list_comments(conn, t)] for t in (culprit, parent)}
++        assert any("rebooted the host" in x for x in comments[culprit])
++        assert any(culprit in x for x in comments[parent])
++        kinds = [e.kind for e in kb.list_events(conn, bystander)]
++        assert "host_reboot" in kinds and "crashed" not in kinds
++    assert seen == [OLD_BOOT.replace("-", "")]  # one journal read for the spawn boot, cached
++
++
++def test_profile_scratch_matches_only_the_profiles_sole_victim(home, monkeypatch):
++    scratch = home / "profiles/bb-tuner/cache/scratch/mf/pre/st-822415ff"
++    _journal(monkeypatch, JOURNAL.format(ws_other="/nowhere", pwd=scratch))
++    with kbc.connect() as conn:
++        sole = _running(conn, "bb recovery", assignee="bb-tuner", workspace=str(home / "ws/x"), pid=71011)
++        other = _running(conn, "default card", assignee="default", workspace=str(home / "ws/y"), pid=71012)
++        kbd.detect_crashed_workers(conn)
++        assert kb.get_task(conn, sole).block_kind == "capability"
++        assert kb.get_task(conn, other).status == "ready"
++
++
++def test_profile_scratch_with_two_victims_of_that_profile_blocks_neither(home, monkeypatch):
++    scratch = home / "profiles/bb-tuner/cache/scratch/mf"
++    _journal(monkeypatch, JOURNAL.format(ws_other="/nowhere", pwd=scratch))
++    with kbc.connect() as conn:
++        a = _running(conn, "a", assignee="bb-tuner", pid=71021)
++        b = _running(conn, "b", assignee="bb-tuner", pid=71022)
++        kbd.detect_crashed_workers(conn)
++        for t in (a, b):
++            task = kb.get_task(conn, t)
++            assert task.status == "ready" and task.consecutive_failures == 0
++
++
++def test_plain_reboot_requeues_everything_uncounted(home, monkeypatch):
++    _journal(monkeypatch, "")  # e.g. a console/EC2 reboot: no sudo power command in the journal
++    with kbc.connect() as conn:
++        tid = _running(conn, "job", workspace=str(home / "ws/z"))
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.consecutive_failures == 0
++        assert _run(conn, tid)["outcome"] == "host_reboot"
++        assert kbd.detect_crashed_workers._last_host_rebooted == [tid]  # type: ignore[attr-defined]
++
++
++def test_same_boot_death_is_still_a_crash(home, monkeypatch):
++    seen = _journal(monkeypatch, JOURNAL.format(ws_other="/x", pwd="/y"))
++    with kbc.connect() as conn:
++        tid = _running(conn, "job", boot=NOW_BOOT)
++        kbd.detect_crashed_workers(conn)
++        assert _run(conn, tid)["outcome"] == "crashed"
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++    assert seen == []  # no journal read without a reboot
+diff --git a/tests/hermes_cli/test_kanban_pr_continuation.py b/tests/hermes_cli/test_kanban_pr_continuation.py
+index 9df2b5eca1..532dd2772e 100644
+--- a/tests/hermes_cli/test_kanban_pr_continuation.py
++++ b/tests/hermes_cli/test_kanban_pr_continuation.py
+@@ -8,6 +8,7 @@ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli.kanban_guard_helpers import worker_ran
+ from tests.hermes_cli.test_kanban_park_invariants import kanban_home
+ 
+ __all__ = ["kanban_home"]  # register the shared isolated-board fixture
+@@ -39,6 +40,7 @@ def test_immediate_checkpoint_with_open_pr_dispatches(monkeypatch, all_assignees
+         assert "Continue implementation of existing PR" in kb.build_worker_context(conn, tid)
+ 
+ 
++@pytest.mark.usefixtures("worker_ran")
+ def test_guard_notice_cannot_supersede_real_handoff(monkeypatch):
+     now = int(time.time())
+     monkeypatch.setattr(time, "time", lambda: now)
+@@ -55,30 +57,6 @@ def test_guard_notice_cannot_supersede_real_handoff(monkeypatch):
+         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+ 
+ 
+-@pytest.mark.parametrize("mode", ["scheduled", "crashed", "new_pr_report", "missing_checkpoint"])
+-def test_non_immediate_or_superseded_continuation_still_guards(monkeypatch, mode):
+-    now = int(time.time())
+-    monkeypatch.setattr(time, "time", lambda: now)
+-    with kbc.connect() as conn:
+-        tid = kb.create_task(conn, title="external wait", assignee="a")
+-        kb.claim_task(conn, tid)
+-        kb.add_comment(conn, tid, "a", f"PR {URL}")
+-        result = kc.continue_task(conn, tid, checkpoint="Existing PR",
+-                                  resume_after_seconds=60 if mode == "scheduled" else 0)
+-        assert result["ok"]
+-        if mode == "scheduled":
+-            kc.wake_due_continuations(conn, now=now + 61)
+-        elif mode == "crashed":
+-            kb.claim_task(conn, tid)
+-            kb._end_run(conn, tid, outcome="crashed", status="crashed", summary="worker failed")
+-        elif mode == "new_pr_report":
+-            monkeypatch.setattr(time, "time", lambda: now + 1)
+-            kb.add_comment(conn, tid, "a", f"External PR remains: {URL}")
+-        else:
+-            conn.execute("UPDATE task_runs SET metadata='{}' WHERE id=?", (result["run_id"],))
+-        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+-
+-
+ @pytest.mark.parametrize("author,body,expected", [
+     ("a", "Focused checks passed", None),
+     ("a", f"New PR report {URL}", "active_pr"),
+@@ -100,7 +78,6 @@ def test_checkpoint_orders_only_real_pr_comments(monkeypatch, author, body, expe
+         assert kbd.check_respawn_guard(conn, tid) == expected
+ 
+ 
+-
+ @pytest.mark.parametrize("watermark", [None, True, "1", -1])
+ def test_invalid_or_legacy_checkpoint_watermark_fails_closed(monkeypatch, watermark):
+     now = int(time.time())
+@@ -120,3 +97,45 @@ def test_invalid_or_legacy_checkpoint_watermark_fails_closed(monkeypatch, waterm
+         conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(data), row["id"]))
+         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+ 
++
++@pytest.mark.parametrize("mode", ["scheduled", "crashed", "new_pr_report", "missing_checkpoint"])
++def test_non_immediate_or_superseded_continuation_still_guards(monkeypatch, mode):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="external wait", assignee="a")
++        kb.claim_task(conn, tid)
++        kb.add_comment(conn, tid, "a", f"PR {URL}")
++        result = kc.continue_task(conn, tid, checkpoint="Existing PR",
++                                  resume_after_seconds=60 if mode == "scheduled" else 0)
++        assert result["ok"]
++        if mode == "scheduled":
++            kc.wake_due_continuations(conn, now=now + 61)
++        elif mode == "crashed":
++            kb.claim_task(conn, tid)
++            kb._end_run(conn, tid, outcome="crashed", status="crashed", summary="worker failed")
++        elif mode == "new_pr_report":
++            monkeypatch.setattr(time, "time", lambda: now + 1)
++            kb.add_comment(conn, tid, "a", f"External PR remains: {URL}")
++        else:
++            conn.execute("UPDATE task_runs SET metadata='{}' WHERE id=?", (result["run_id"],))
++        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
++
++
++def test_never_run_card_with_pr_in_handoff_is_not_held():
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="review PR", assignee="a")
++        kb.add_comment(conn, tid, "impl", f"Please review {URL}")
++        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++        assert kbd.check_respawn_guard(conn, tid) is None
++
++
++def test_worker_that_opened_pr_then_crashed_is_still_held(monkeypatch):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="impl", assignee="a")
++        kb.claim_task(conn, tid)
++        monkeypatch.setattr(time, "time", lambda: now + 5)
++        kb.add_comment(conn, tid, "a", f"Opened {URL}")
++        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+diff --git a/tests/hermes_cli/test_kanban_request_lifecycle.py b/tests/hermes_cli/test_kanban_request_lifecycle.py
+index 622260ead3..4ce2518202 100644
+--- a/tests/hermes_cli/test_kanban_request_lifecycle.py
++++ b/tests/hermes_cli/test_kanban_request_lifecycle.py
+@@ -27,7 +27,7 @@ def test_failure_breaker_never_resurrects_legacy_request(tmp_path):
+         conn.commit()
+         assert db._record_task_failure(conn, task, "spawn unavailable",
+                                        outcome="spawn_failed", force_trip=True)
+-        assert db.get_task(conn, task).status == "blocked"
++        assert db.get_task(conn, task).status == "triage"
+         assert db.get_task(conn, task).human_request is None
+     finally:
+         conn.close()
+@@ -72,7 +72,7 @@ def test_completion_retires_request(tmp_path):
+         conn.close()
+ 
+ 
+-@pytest.mark.parametrize("transition", ["archive", "claim", "review", "schedule", "invalidate"])
++@pytest.mark.parametrize("transition", ["archive", "claim", "review", "schedule", "invalidate", "supervisor"])
+ def test_legacy_request_retired_by_lifecycle_transition(tmp_path, transition):
+     conn = connect(tmp_path / "board.db")
+     try:
+@@ -87,7 +87,10 @@ def test_legacy_request_retired_by_lifecycle_transition(tmp_path, transition):
+             assert plugin_api._set_status_direct(conn, parent, "ready")
+             return db.get_task(conn, task).status == "todo"
+ 
++        from hermes_cli.kanban_block_routing import supervisor_stop
++
+         actions = {
++            "supervisor": lambda: supervisor_stop(conn, task, "Guard held execution", "respawn_guard_hold"),
+             "archive": lambda: db.archive_task(conn, task),
+             "claim": lambda: db.claim_task(conn, task) is not None,
+             "review": lambda: db.request_review(conn, task),
+diff --git a/tests/tui_gateway/test_projects_rpc.py b/tests/tui_gateway/test_projects_rpc.py
+index 4c74248b7d..81b0622152 100644
+--- a/tests/tui_gateway/test_projects_rpc.py
++++ b/tests/tui_gateway/test_projects_rpc.py
+@@ -800,7 +800,7 @@ def test_tree_rows_carry_session_activity_stamps(monkeypatch, tmp_path):
+         assert rows["s_goal"].get("goal_active") is True
+         assert rows["s_cards"]["kanban_active"] == 2 and rows["s_cards"]["kanban_blocked"] == 1
+         assert rows["s_cards"]["kanban_remote_stale"] == 1
+-        assert rows["s_cards"]["kanban_waiting_on"] == ["t_waiting"]
++        assert rows["s_cards"]["kanban_waiting_on"] == ["t_open"]
+         assert all("kanban_unknown" not in row for row in rows.values())
+         # Control: an idle session carries none of them.
+         assert not {"goal_active", "kanban_active", "kanban_remote_stale", "background_active", "cron_active"} & rows["s_quiet"].keys()
+diff --git a/tui_gateway/human_input.py b/tui_gateway/human_input.py
+index 5dd6b5720d..db74105712 100644
+--- a/tui_gateway/human_input.py
++++ b/tui_gateway/human_input.py
+@@ -34,9 +34,9 @@ def is_human_typed_submit(rid, params: dict, text) -> bool:
+     """True for a ``prompt.submit`` a person typed in a client (not an injected or relayed turn)."""
+     if rid is None or not isinstance(params, dict):
+         return False
+-    from tui_gateway.transport import is_agent_client
++    from tui_gateway.transport import current_transport, is_agent_transport
+ 
+-    if is_agent_client():  # an agent script over /api/ws?client=agent, not a person at a keyboard
++    if is_agent_transport(current_transport()):  # an agent script over /api/ws?client=agent, not a person typing
+         return False
+     if any(params.get(k) is not None for k in _INTERNAL_PARAMS):
+         return False
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index e646a6133e..739de00ae4 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -395,7 +395,6 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) ->
+     explicit_cwd, session_cwd, remote_cwd = _resolve_create_cwd(params, source, profile_home)
+     _enable_gateway_prompts()
+     from .methods_session_model_guard import create_overrides
+-    from .methods_session_hidden import create_hidden  # [daveey] agent clients' chats are born hidden
+     try:
+         session_model_override, create_reasoning_override, create_service_tier_override = create_overrides(params)
+     except ValueError as exc:
+@@ -419,11 +418,11 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) ->
+             "history": history, "history_lock": threading.Lock(), "history_version": 0, "image_counter": 0,
+             "seeded": bool(history),  # gates _persist_branch_seed: only create-time history is unpersisted
+             "cwd": session_cwd, "inflight_turn": None, "last_active": now,
+-            "model_override": session_model_override, "composer_override_profile": composer_override_profile,
+-            "create_reasoning_override": create_reasoning_override,
++            "composer_override_profile": composer_override_profile, "create_reasoning_override": create_reasoning_override,
+             "create_service_tier_override": create_service_tier_override,
+             "parent_session_id": parent_session_id, "pending_title": _str_param(params, "title") or None,
+-            "pending_hidden": create_hidden(params), "agent_created": agent_created, "room_plumbing": _flag(params, "room_plumbing"),
++            "pending_hidden": _flag(params, "hidden") if "hidden" in params else agent_created,  # human_input.py
++            "agent_created": agent_created, "room_plumbing": _flag(params, "room_plumbing"),
+             "follow_profile_config": _flag(params, "follow_profile_config"),
+             "profile_home": str(profile_home) if profile_home is not None else None,
+             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
+diff --git a/tui_gateway/methods_session_hidden.py b/tui_gateway/methods_session_hidden.py
+deleted file mode 100644
+index 78e3574953..0000000000
+--- a/tui_gateway/methods_session_hidden.py
++++ /dev/null
+@@ -1,20 +0,0 @@
+-"""``session.create``'s born-hidden default for agent clients. [daveey]
+-
+-Agents that drive the Desktop backend over ``/api/ws?client=agent`` (proof cards, the patching-local-hermes
+-``gateway_rpc.py``) mint throwaway chats; those are born hidden so they never land in the user's sidebar.
+-Hidden only changes the default list: the chat still runs, auto-continues and receives kanban notices.
+-The marker is client-declared, so this picks a default and is not a security boundary.
+-"""
+-
+-from __future__ import annotations
+-
+-from tui_gateway.transport import is_agent_client
+-from utils import is_truthy_value
+-
+-
+-def create_hidden(params: dict) -> bool:
+-    """The ``pending_hidden`` intent for a new session: an explicit ``hidden`` always wins (``false``
+-    included); without one, a session created over an agent-declared transport is born hidden."""
+-    if params.get("hidden") is not None:
+-        return is_truthy_value(params["hidden"])
+-    return is_agent_client()
+diff --git a/tui_gateway/transport.py b/tui_gateway/transport.py
+index 5c37f2d847..292c10b8b6 100644
+--- a/tui_gateway/transport.py
++++ b/tui_gateway/transport.py
+@@ -54,22 +54,6 @@ def current_transport() -> Optional[Transport]:
+     return _current_transport.get()
+ 
+ 
+-#: ``client_kind`` an ``/api/ws`` client declares with ``?client=agent`` (an agent script driving the backend,
+-#: e.g. the patching-local-hermes ``gateway_rpc.py``). Client-declared, NOT a security boundary: it only picks
+-#: defaults (chats born hidden, submits not counted as human input). [daveey]
+-AGENT_CLIENT_KIND = "agent"
+-
+-
+-def current_client_kind() -> Optional[str]:
+-    """``client_kind`` of the transport bound to this request (None for renderer / stdio / unmarked clients)."""
+-    return getattr(current_transport(), "client_kind", None)
+-
+-
+-def is_agent_client() -> bool:
+-    """True when the bound transport declared itself an agent client (``/api/ws?client=agent``)."""
+-    return current_client_kind() == AGENT_CLIENT_KIND
+-
+-
+ def bind_transport(transport: Optional[Transport]):
+     """Bind *transport* for the current context; returns a token for :func:`reset_transport`."""
+     return _current_transport.set(transport)
+diff --git a/tui_gateway/ws.py b/tui_gateway/ws.py
+index e94295c0ec..4fe3035b09 100644
+--- a/tui_gateway/ws.py
++++ b/tui_gateway/ws.py
+@@ -107,9 +107,6 @@ class WSTransport:
+         #: for legacy-token/stdio. RPC params can never populate it: sole identity authority for browser controllers
+         #: and for the ``user_id`` the agent is built with (``server._session_auth_user_id``).
+         self.auth_identity = auth_identity
+-        #: [daveey] Client-declared kind from ``/api/ws?client=agent`` (``transport.AGENT_CLIENT_KIND``); None for the
+-        #: renderer and every unmarked client. Only picks defaults, never authority (see transport.current_client_kind).
+-        self.client_kind = client_kind
+         self._closed = False
+         # Why this side gave up on the socket (first cause wins); None while open or after a plain close().
+         # handle_ws's read loop reads it to end a dropped peer as a disconnect, not a receive crash.
+@@ -326,12 +323,10 @@ class _SendFailed(Exception):
+     """Raised by handle_ws._reply when a reply could not be written: ends the read loop."""
+ 
+ 
+-async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: str | None = None,
+-                    client_kind: str | None = None) -> None:
++async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: str | None = None) -> None:
+     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``. *auth_identity* is the server-minted
+     ``{user_id, provider}`` recorded at WS-upgrade auth, stored as ``WSTransport.auth_identity`` (the only identity
+-    authority for browser-controller registration); callers that omit it (harnesses, embedded TUI child) get None.
+-    *client_kind* is the client-declared ``?client=`` marker stored as ``WSTransport.client_kind`` (None = renderer)."""
++    authority for browser-controller registration); callers that omit it (harnesses, embedded TUI child) get None."""
+     peer, transport = _ws_peer_label(ws), None
+     messages = parse_errors = dispatch_crashes = send_failures = 0
+     disconnect_reason = "not_connected"
+@@ -426,7 +421,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
+         _disable_nagle(ws)
+         _log.info("ws accepted peer=%s", peer)
+         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity,
+-                                client_kind=client_kind)
++                                client_kind=_ws_client_kind(ws))
+         # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
+         skin_payload = await asyncio.to_thread(server.resolve_skin)
+         # change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote legacy
+
+-- 
+2.43.0

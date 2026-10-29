@@ -1,6 +1,6 @@
 # e2e-upgrade runs on bubblewrap-capable hub slots
 
-Patch **0677** (`74c5d8f71f`).
+Patch **0684** (`74c5d8f71f`).
 
 ## Behavior
 
@@ -28,7 +28,7 @@ This mirror did not re-run that test. A live `e2e-upgrade` shard on a `ci-bwrap`
 
 ## Applying
 
-`git am -3` 0677. Workflow and test only.
+`git am -3` 0684. Workflow and test only.
 
 ## Gotchas
 

@@ -1,0 +1,326 @@
+From 566cbacc5333bc5101a7e9ca66e5f27c6be7eedc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 19:54:44 +0000
+Subject: [PATCH] fix(state): revalidate macOS deleted-WAL holders after path
+ comparison [daveey]
+
+---
+ hermes_state_dbfile.py                        |  83 +++++++----
+ .../test_darwin_holder_snapshot.py            | 141 ++++++++++++++++++
+ .../test_deleted_wal_generation_guard.py      |   3 +-
+ 3 files changed, 199 insertions(+), 28 deletions(-)
+ create mode 100644 tests/hermes_state/test_darwin_holder_snapshot.py
+
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index 814abf3018..d2a5ad6ca5 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -309,6 +309,21 @@ def _darwin_all_pids(lib) -> list[int]:
+         size *= 2
+ 
+ 
++def _darwin_fd_target(pid: int, fd: int):
++    """Read one live vnode descriptor; a closed fd is not a held snapshot."""
++    import ctypes
++
++    record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
++    if _darwin_libproc().proc_pidfdinfo(pid, fd, _DARWIN_PIDFDVNODEPATHINFO, record,
++                                      _DARWIN_FD_RECORD_SIZE) <= 0:
++        return None
++    raw = record.raw
++    identity = (struct.unpack_from("<I", raw, _DARWIN_FD_DEV_OFFSET)[0],
++                struct.unpack_from("<Q", raw, _DARWIN_FD_INO_OFFSET)[0])
++    target = raw[_DARWIN_FD_PATH_OFFSET:].split(b"\x00", 1)[0].decode("utf-8", "replace")
++    return target, identity
++
++
+ def _iter_darwin_fd_targets():
+     """Yield ``(pid, fd, last pathname, (st_dev, st_ino))`` for every vnode fd libproc reports.
+ 
+@@ -332,15 +347,9 @@ def _iter_darwin_fd_targets():
+             continue
+         for offset in range(0, used - _DARWIN_PROC_FD_INFO_SIZE + 1, _DARWIN_PROC_FD_INFO_SIZE):
+             fd = struct.unpack_from("<i", listing.raw, offset)[0]
+-            record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
+-            if lib.proc_pidfdinfo(pid, fd, _DARWIN_PIDFDVNODEPATHINFO, record,
+-                                  _DARWIN_FD_RECORD_SIZE) <= 0:
+-                continue
+-            raw = record.raw
+-            identity = (struct.unpack_from("<I", raw, _DARWIN_FD_DEV_OFFSET)[0],
+-                        struct.unpack_from("<Q", raw, _DARWIN_FD_INO_OFFSET)[0])
+-            target = raw[_DARWIN_FD_PATH_OFFSET:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+-            yield pid, fd, target, identity
++            current = _darwin_fd_target(pid, fd)
++            if current is not None:
++                yield pid, fd, *current
+ 
+ 
+ def _darwin_clean_key(base: str) -> tuple:
+@@ -375,47 +384,70 @@ class _DarwinFdScan:
+     def __init__(self, deadline: float):
+         self.deadline = deadline
+         self.done = threading.Event()
+-        self.candidates: list[tuple[int, str, tuple[int, int]]] = []
++        self.candidates: list[tuple[int, int, str, tuple[int, int]]] = []
+         self.error: BaseException | None = None
+         self.expired = False
+         self.waiters = 0
+         # ``base -> (key, watched)`` of every caller that joined; a clean verdict for each is
+         # recorded before this pass stops being in flight (see :meth:`run`).
+         self.watchers: dict[str, tuple[tuple, dict[str, str]]] = {}
++        self.verdicts: dict[str, list[tuple[int, str]]] = {}
+ 
+     def run(self) -> None:
+         global _DARWIN_SCAN_IN_FLIGHT
+         try:
+-            for pid, _fd, target, identity in _iter_darwin_fd_targets():
++            for pid, fd, target, identity in _iter_darwin_fd_targets():
+                 if time.monotonic() > self.deadline:
+                     self.expired = True
+                     break
+                 if target.casefold().endswith(("-wal", "-shm")):
+-                    self.candidates.append((pid, target, identity))
++                    self.candidates.append((pid, fd, target, identity))
++            self._judge_watchers()
+         except BaseException as exc:
+             self.error = exc
+         finally:
+             with _DARWIN_SCAN_LOCK:
+-                # Cache clean verdicts BEFORE clearing the in-flight slot: a caller that missed the
+-                # cache and then finds no pass in flight re-checks the cache under this lock, so it
+-                # reuses this pass instead of starting another (the gap used to let it rescan).
+-                if self.error is None and not self.expired:
+-                    for base, (key, watched) in list(self.watchers.items()):
+-                        with contextlib.suppress(Exception):
+-                            if not _darwin_holders(self.candidates, watched):
+-                                _darwin_clean_until[base] = (
+-                                    time.monotonic() + _DARWIN_FD_CLEAN_TTL_SECONDS, key)
+                 if _DARWIN_SCAN_IN_FLIGHT is self:
+                     _DARWIN_SCAN_IN_FLIGHT = None
+             self.done.set()
+ 
++    def _judge_watchers(self) -> None:
++        """Judge registered paths on the bounded worker, never under the join lock."""
++        global _DARWIN_SCAN_IN_FLIGHT
++        while True:
++            if time.monotonic() > self.deadline:
++                self.expired = True
++                return
++            with _DARWIN_SCAN_LOCK:
++                pending = [(base, watched) for base, (_key, watched) in self.watchers.items()
++                           if base not in self.verdicts]
++                if not pending:
++                    # Publish caches and retire the flight atomically: every caller
++                    # that joined this pass has a verdict, including late joiners.
++                    for base, (key, _watched) in self.watchers.items():
++                        if not self.verdicts[base]:
++                            _darwin_clean_until[base] = (
++                                time.monotonic() + _DARWIN_FD_CLEAN_TTL_SECONDS, key)
++                    if _DARWIN_SCAN_IN_FLIGHT is self:
++                        _DARWIN_SCAN_IN_FLIGHT = None
++                    return
++            for base, watched in pending:
++                self.verdicts[base] = _darwin_holders(self.candidates, watched)
++                if time.monotonic() > self.deadline:
++                    self.expired = True
++                    return
++
+ 
+ def _darwin_holders(candidates, watched: dict[str, str]) -> list[tuple[int, str]]:
+     holders: list[tuple[int, str]] = []
+-    for pid, target, identity in candidates:
++    for pid, fd, target, identity in candidates:
+         literal = watched.get(target.casefold())
+         if literal is not None and _identity_is_truly_unlinked(identity, literal):
+-            holders.append((pid, target))
++            # Revalidate AFTER stat: last-close may unlink and close the fd
++            # while we compare paths. A historical vnode cannot keep a WAL alive.
++            current = _darwin_fd_target(pid, fd)
++            if current is not None and current[1] == identity:
++                holders.append((pid, target))
+     return holders
+ 
+ 
+@@ -485,10 +517,7 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
+         return []
+     if scan.error is not None:
+         raise scan.error
+-    holders = _darwin_holders(scan.candidates, watched)
+-    if not holders:
+-        _darwin_clean_until[base] = (time.monotonic() + _DARWIN_FD_CLEAN_TTL_SECONDS, key)
+-    return holders
++    return scan.verdicts[base]
+ 
+ 
+ def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
+diff --git a/tests/hermes_state/test_darwin_holder_snapshot.py b/tests/hermes_state/test_darwin_holder_snapshot.py
+new file mode 100644
+index 0000000000..4328314b41
+--- /dev/null
++++ b/tests/hermes_state/test_darwin_holder_snapshot.py
+@@ -0,0 +1,141 @@
++"""A scan snapshot is not evidence that a descriptor is still held at verdict time."""
++import os
++import threading
++import time
++
++import pytest
++
++import hermes_state_dbfile as dbfile
++
++
++@pytest.mark.parametrize("current", [None, ("/other-wal", (3, 4)), ("/held-wal", (1, 2))])
++def test_scan_revalidates_descriptors_before_publishing(tmp_path, monkeypatch, current):
++    wal = str(tmp_path / "state.db-wal")
++    monkeypatch.setattr(dbfile, "_iter_darwin_fd_targets", lambda: iter([(42, 7, wal, (1, 2))]))
++    monkeypatch.setattr(dbfile, "_darwin_fd_target", lambda pid, fd: current, raising=False)
++    monkeypatch.setattr(dbfile, "_darwin_clean_until", {})
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_IN_FLIGHT", None)
++    result = dbfile._iter_darwin_sidecar_holders(tmp_path / "state.db")
++    assert result == ([(42, wal)] if current is not None and current[1] == (1, 2) else [])
++
++
++def test_revalidation_is_bounded_and_does_not_cache_timeout(tmp_path, monkeypatch):
++    gate = threading.Event()
++    wal = str(tmp_path / "state.db-wal")
++    monkeypatch.setattr(dbfile, "_iter_darwin_fd_targets", lambda: iter([(42, 7, wal, (1, 2))]))
++    monkeypatch.setattr(dbfile, "_darwin_clean_until", {})
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_IN_FLIGHT", None)
++    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", 0.1)
++
++    def revalidate(pid, fd):
++        gate.wait(10)
++        return wal, (1, 2)
++
++    monkeypatch.setattr(dbfile, "_darwin_fd_target", revalidate)
++    scan = None
++    try:
++        started = time.monotonic()
++        assert dbfile._iter_darwin_sidecar_holders(tmp_path / "state.db") == []
++        assert time.monotonic() - started < 5
++        scan = dbfile._DARWIN_SCAN_IN_FLIGHT
++        assert scan is not None
++        assert not dbfile._darwin_clean_until
++    finally:
++        gate.set()
++        if scan is not None:
++            assert scan.done.wait(5)
++    assert not dbfile._darwin_clean_until
++
++
++@pytest.mark.platforms("macos")
++def test_native_scan_does_not_refuse_after_normal_sidecar_close(tmp_path, monkeypatch):
++    wal = tmp_path / "state.db-wal"
++    wal.write_bytes(b"linked sidecar")
++    held = wal.open("rb")
++    original = dbfile._iter_darwin_fd_targets
++    # This test exercises descriptor lifecycle, not loaded-host scan throughput.
++    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", 60)
++    monkeypatch.setattr(dbfile, "_darwin_clean_until", {})
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_IN_FLIGHT", None)
++
++    def enumerate_then_close():
++        candidates = [row for row in original()
++                      if row[0] == os.getpid() and row[1] == held.fileno()]
++        assert candidates
++        yield from candidates
++        wal.unlink()
++        held.close()
++
++    monkeypatch.setattr(dbfile, "_iter_darwin_fd_targets", enumerate_then_close)
++    try:
++        assert dbfile._iter_darwin_sidecar_holders(tmp_path / "state.db") == []
++        assert dbfile._darwin_clean_until
++    finally:
++        held.close()
++
++
++def test_descriptor_closing_during_path_comparison_is_not_a_holder(tmp_path, monkeypatch):
++    wal = str(tmp_path / "state.db-wal")
++    closed = False
++
++    def compare(identity, path):
++        nonlocal closed
++        assert path == wal  # unrelated database paths must never be stat'ed
++        closed = True
++        return True
++
++    monkeypatch.setattr(dbfile, "_identity_is_truly_unlinked", compare)
++    monkeypatch.setattr(dbfile, "_darwin_fd_target", lambda pid, fd: None if closed else (wal, (1, 2)))
++    monkeypatch.setattr(dbfile, "_iter_darwin_fd_targets", lambda: iter([
++        (42, 7, wal, (1, 2)), (43, 8, "/unrelated/state.db-wal", (3, 4))]))
++    monkeypatch.setattr(dbfile, "_darwin_clean_until", {})
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_IN_FLIGHT", None)
++    assert dbfile._iter_darwin_sidecar_holders(tmp_path / "state.db") == []
++    assert closed
++    assert dbfile._darwin_clean_until
++
++
++def test_late_watcher_joins_while_verdict_is_computed_without_lock(tmp_path, monkeypatch):
++    from tests.waiting import wait_until
++
++    first = str(tmp_path / "first.db")
++    second = str(tmp_path / "second.db")
++    entered = threading.Event()
++    release = threading.Event()
++    calls = []
++
++    def targets():
++        calls.append("scan")
++        yield 42, 7, first + "-wal", (1, 2)
++        yield 42, 8, second + "-wal", (3, 4)
++
++    def revalidate(pid, fd):
++        assert dbfile._DARWIN_SCAN_LOCK.acquire(blocking=False)
++        dbfile._DARWIN_SCAN_LOCK.release()
++        if fd == 7:
++            entered.set()
++            assert release.wait(10)
++            return first + "-wal", (1, 2)
++        return second + "-wal", (3, 4)
++
++    monkeypatch.setattr(dbfile, "_iter_darwin_fd_targets", targets)
++    monkeypatch.setattr(dbfile, "_darwin_fd_target", revalidate)
++    monkeypatch.setattr(dbfile, "_darwin_clean_until", {})
++    monkeypatch.setattr(dbfile, "_DARWIN_SCAN_IN_FLIGHT", None)
++    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", 30)
++    results = {}
++    threads = [threading.Thread(target=lambda path=path: results.update(
++        {path: dbfile._iter_darwin_sidecar_holders(path)})) for path in (first, second)]
++    try:
++        threads[0].start()
++        assert entered.wait(5)
++        threads[1].start()
++        wait_until(lambda: dbfile._DARWIN_SCAN_IN_FLIGHT.waiters == 2,
++                   what="late watcher joins during first verdict")
++    finally:
++        release.set()
++        for thread in threads:
++            if thread.ident is not None:
++                thread.join(10)
++    assert results == {first: [(42, first + "-wal")], second: [(42, second + "-wal")]}
++    assert calls == ["scan"]
+diff --git a/tests/hermes_state/test_deleted_wal_generation_guard.py b/tests/hermes_state/test_deleted_wal_generation_guard.py
+index b940265fcf..1bf68c79f8 100644
+--- a/tests/hermes_state/test_deleted_wal_generation_guard.py
++++ b/tests/hermes_state/test_deleted_wal_generation_guard.py
+@@ -602,7 +602,7 @@ def _scan_threads():
+             if t.name == hermes_state_dbfile._DARWIN_FD_SCAN_THREAD_NAME and t.is_alive()]
+ 
+ 
+-def test_darwin_concurrent_callers_during_slow_scan_share_one_scan_thread(tmp_path, fake_darwin_scan):
++def test_darwin_concurrent_callers_during_slow_scan_share_one_scan_thread(tmp_path, fake_darwin_scan, monkeypatch):
+     import threading
+ 
+     from tests.waiting import wait_until
+@@ -611,6 +611,7 @@ def test_darwin_concurrent_callers_during_slow_scan_share_one_scan_thread(tmp_pa
+     sidecar = os.path.realpath(str(path) + "-wal")
+     Path(sidecar).write_bytes(b"current generation")
+     fake_darwin_scan["yield"] = [(4242, 7, sidecar, (0, 0))]  # identity != the linked file: retired
++    monkeypatch.setattr(hermes_state_dbfile, "_darwin_fd_target", lambda pid, fd: (sidecar, (0, 0)))
+     results: list = []
+ 
+     def caller():
+-- 
+2.55.0
+

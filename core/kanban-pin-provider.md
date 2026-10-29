@@ -1,6 +1,6 @@
 # Bind a concrete Kanban model pin to its provider
 
-Patch 0653 (`9c943cbd2f`).
+Patch 0663 (`9c943cbd2f`).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ A concrete model pinned without a provider resolves its provider at pin time, in
 
 ## Applying
 
-Apply 0653 after 0652 on the fork; both patches were verified with `git am -3` in a disposable worktree at `90a63800fb`.
+Apply 0663 after 0662 on the fork; both patches were verified with `git am -3` in a disposable worktree at `90a63800fb`.
 
 ## Gotchas
 

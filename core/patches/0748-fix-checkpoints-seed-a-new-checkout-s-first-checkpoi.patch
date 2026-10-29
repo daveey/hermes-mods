@@ -1,0 +1,543 @@
+From 64d749323e1fbad79d7664ad785cb62ddcad103e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:24:52 +0000
+Subject: [PATCH] fix(checkpoints): seed a new checkout's first checkpoint from
+ its own git index [daveey]
+
+Follow-up to 72755549d1. That commit prices `git add -A` before running it and skips a
+folder over the staging budget. Its coverage limit: the first snapshot of a big fresh
+checkout has a cold checkpoint index, so every file is priced (and would be hashed and
+written). A hermes-agent worktree (19,009 files, 208 MB) at a load factor of 40 is
+priced at ~1134 s against a 30 s budget, so it got no checkpoint until the host went
+quiet, retried hourly.
+
+The checkout's own index already holds each tracked file's blob id and stat data.
+CheckpointManager._seed_from_repo_index, run when a project has no checkpoint index:
+- only when working_dir is the top level of a git checkout (clone or linked worktree);
+- copies that index (mtime kept), drops the untracked-cache/fsmonitor extensions, and
+  force-removes tracked entries the checkpoint excludes (DEFAULT_EXCLUDES, .gitignore),
+  so the tree equals what a cold add produces;
+- gives up (no index left, the cold path runs as before) on a split index, conflicts,
+  assume-unchanged or skip-worktree entries, which would hide changes from git add;
+- copies the blobs the store lacks from the repository as one pack (pack-objects
+  --window=0 into a temp file in the store, then the store's index-pack), with lazy
+  fetch off, so the checkpoint never depends on the repository's object store and
+  nothing is written into the user's repository. A sibling worktree whose blobs are
+  already in the store copies nothing.
+The estimate for a seeded index uses the cold free estimate and then
+`ls-files -o -m`, so only files new or changed relative to the checkout's index count.
+
+Tests (tests/tools/test_checkpoint_manager.py::TestColdIndexSeeding):
+- test_cold_20k_file_worktree_is_snapshotted_within_budget_under_load: a cold 20,000-file
+  worktree with an edit, a delete and a new file at load_factor 40 is snapshotted inside
+  the budget with one git add; content checked; every object is in the store. Red on main.
+- test_second_worktree_reuses_the_stores_blobs: no second pack. Red on main.
+- test_untracked_heavy_tree_is_still_skipped[no-repo|untracked-in-repo]: control, still
+  skipped with no git add.
+- test_seeded_snapshot_equals_a_cold_one: seeded tree == cold tree of a plain copy
+  (node_modules/, *.pyc, a force-added gitignored file stay out); fails with the
+  exclusion drop disabled.
+- test_assume_unchanged_entry_does_not_hide_an_edit: fails with the flag guard disabled.
+Live (hermes-hub, real manager, cold hermes-agent worktree, load_factor forced to 40):
+origin/main skips it in 2.2 s with no checkpoint; this commit snapshots it in 5.7 s.
+
+Undo: git revert this commit.
+Hub card t_01a1827b171dd664.
+---
+ tests/fixtures/resolution_allowlist.json      |  10 +
+ tests/tools/test_checkpoint_manager.py        | 153 ++++++++++++
+ tools/checkpoint_manager.py                   | 223 +++++++++++++++++-
+ .../user-guide/checkpoints-and-rollback.md    |   2 +-
+ 4 files changed, 383 insertions(+), 5 deletions(-)
+
+diff --git a/tests/fixtures/resolution_allowlist.json b/tests/fixtures/resolution_allowlist.json
+index eddafab5f2..0ddde7feb4 100644
+--- a/tests/fixtures/resolution_allowlist.json
++++ b/tests/fixtures/resolution_allowlist.json
+@@ -513,6 +513,16 @@
+     "symbol": "_run_git",
+     "kind": "bare_which"
+   },
++  {
++    "path": "tools/checkpoint_manager.py",
++    "symbol": "_checkout_index",
++    "kind": "bare_which"
++  },
++  {
++    "path": "tools/checkpoint_manager.py",
++    "symbol": "_pack_from_repo",
++    "kind": "bare_which"
++  },
+   {
+     "path": "tools/checkpoint_manager_profile_rename.py",
+     "symbol": "migrate_profile_checkpoint_projects",
+diff --git a/tests/tools/test_checkpoint_manager.py b/tests/tools/test_checkpoint_manager.py
+index 8565595909..21bdf9cbff 100644
+--- a/tests/tools/test_checkpoint_manager.py
++++ b/tests/tools/test_checkpoint_manager.py
+@@ -1698,6 +1698,159 @@ class TestStagingBudget:
+         assert result == {"took": False, "adds": 0}, (result, out.stderr[-2000:])
+ 
+ 
++class TestColdIndexSeeding:
++    """A fresh git checkout has no checkpoint index, so its first snapshot priced every file and a big
++    worktree (19k files) on a loaded host was skipped until the host went quiet. The checkout's own
++    index seeds the checkpoint index, so only files that differ from it are priced and hashed."""
++
++    _GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
++
++    @classmethod
++    def _git(cls, cwd, *args):
++        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
++        env.update(cls._GIT_ENV)
++        return subprocess.run(
++            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
++            cwd=str(cwd), env=env, check=True, capture_output=True, text=True,
++        ).stdout
++
++    @classmethod
++    def _repo_with_worktree(cls, tmp_path, populate):
++        repo = tmp_path / "repo"
++        repo.mkdir()
++        cls._git(repo, "init", "-q", "-b", "main")
++        populate(repo)
++        cls._git(repo, "add", "-A")
++        cls._git(repo, "add", "-f", ".")
++        cls._git(repo, "commit", "-q", "-m", "init")
++        wt = tmp_path / "wt"
++        cls._git(repo, "worktree", "add", "-q", str(wt), "HEAD")  # the cold checkout
++        return repo, wt
++
++    @staticmethod
++    def _store_git(*args):
++        import tools.checkpoint_manager as cm
++        store = cm._store_path()
++        ok, out, err = cm._run_git(list(args), store, str(store.parent))
++        assert ok, err
++        return out
++
++    @staticmethod
++    def _tip(mgr, wt):
++        return mgr.list_checkpoints(str(wt))[0]["hash"]
++
++    def test_cold_20k_file_worktree_is_snapshotted_within_budget_under_load(
++        self, tmp_path, checkpoint_base, monkeypatch,
++    ):
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++
++        def populate(repo):
++            for d in range(200):
++                sub = repo / f"pkg{d}"
++                sub.mkdir()
++                for f in range(100):
++                    (sub / f"mod{f}.py").write_text(f"# {d}/{f}\n" + "x = 1\n" * 20)
++
++        _repo, wt = self._repo_with_worktree(tmp_path, populate)
++        time.sleep(1.1)
++        (wt / "pkg0" / "mod0.py").write_text("changed in the worktree\n")
++        (wt / "new_file.py").write_text("untracked\n")
++        (wt / "pkg1" / "mod1.py").unlink()
++
++        TestStagingBudget._loaded(monkeypatch, 40.0)  # cold estimate: 20,000 files x40 >> 30 s budget
++        adds = TestStagingBudget._spy_adds(monkeypatch)
++        mgr = CheckpointManager(enabled=True)
++        started = time.monotonic()
++        assert mgr.ensure_checkpoint(str(wt), "first") is True
++        took = time.monotonic() - started
++        assert took < cm.staging.budget_s(cm._GIT_TIMEOUT * 2), took
++        assert len(adds) == 1
++
++        tip = self._tip(mgr, wt)
++        names = set(self._store_git("ls-tree", "-r", "--name-only", tip).splitlines())
++        assert len(names) == 20000  # 20,000 tracked - 1 deleted + 1 new
++        assert "new_file.py" in names and "pkg1/mod1.py" not in names
++        assert self._store_git("show", f"{tip}:pkg0/mod0.py") == "changed in the worktree"
++        assert self._store_git("show", f"{tip}:pkg5/mod7.py").startswith("# 5/7")
++        # Every object the checkpoint names is in the store itself (copied, not borrowed).
++        missing = [line for line in self._store_git("rev-list", "--objects", "--missing=print", tip).splitlines()
++                   if line.startswith("?")]
++        assert missing == []
++
++    @pytest.mark.parametrize("layout", ["no-repo", "untracked-in-repo"])
++    def test_untracked_heavy_tree_is_still_skipped(self, layout, work_dir, checkpoint_base, monkeypatch):
++        """Control: seeding only vouches for files the checkout's index already knows."""
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        if layout == "untracked-in-repo":
++            self._git(work_dir, "init", "-q")
++            self._git(work_dir, "add", "-A")
++            self._git(work_dir, "commit", "-q", "-m", "readme only")
++        TestStagingBudget._sub_cap_tree(work_dir)
++        TestStagingBudget._loaded(monkeypatch, 40.0)
++        adds = TestStagingBudget._spy_adds(monkeypatch)
++        assert CheckpointManager(enabled=True).ensure_checkpoint(str(work_dir), "snap") is False
++        assert adds == []
++
++    def test_seeded_snapshot_equals_a_cold_one(self, tmp_path, checkpoint_base, monkeypatch):
++        """The seeded tree matches what a cold add of the same files produces: tracked files the
++        checkpoint excludes (node_modules/, *.pyc, force-added gitignored files) stay out."""
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++
++        def populate(repo):
++            (repo / "main.py").write_text("print('hi')\n")
++            (repo / ".gitignore").write_text("secret.txt\n")
++            (repo / "secret.txt").write_text("force-added\n")
++            (repo / "node_modules").mkdir()
++            (repo / "node_modules" / "dep.js").write_text("module.exports = 1\n")
++            (repo / "lib").mkdir()
++            (repo / "lib" / "mod.pyc").write_bytes(b"\0pyc")
++            (repo / "lib" / "keep.py").write_text("x = 1\n")
++
++        _repo, wt = self._repo_with_worktree(tmp_path, populate)
++        time.sleep(1.1)
++        (wt / "main.py").write_text("print('edited')\n")
++        (wt / "lib" / "new.py").write_text("y = 2\n")
++
++        plain = tmp_path / "plain"
++        shutil.copytree(wt, plain, ignore=shutil.ignore_patterns(".git"))
++        mgr = CheckpointManager(enabled=True)
++        assert mgr.ensure_checkpoint(str(wt), "seeded") is True
++        assert mgr.ensure_checkpoint(str(plain), "cold") is True
++        seeded_tree = self._store_git("rev-parse", f"{self._tip(mgr, wt)}^{{tree}}")
++        cold_tree = self._store_git("rev-parse", f"{self._tip(mgr, plain)}^{{tree}}")
++        names = self._store_git("ls-tree", "-r", "--name-only", seeded_tree).splitlines()
++        assert "node_modules/dep.js" not in names and "lib/mod.pyc" not in names and "secret.txt" not in names
++        assert seeded_tree == cold_tree, names
++
++    def test_assume_unchanged_entry_does_not_hide_an_edit(self, tmp_path, checkpoint_base, monkeypatch):
++        """An index bit that makes git skip a file must not be inherited by the checkpoint index."""
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        _repo, wt = self._repo_with_worktree(tmp_path, lambda r: (r / "conf.py").write_text("old\n"))
++        self._git(wt, "update-index", "--assume-unchanged", "conf.py")
++        (wt / "conf.py").write_text("new\n")
++        mgr = CheckpointManager(enabled=True)
++        assert mgr.ensure_checkpoint(str(wt), "snap") is True
++        assert self._store_git("show", f"{self._tip(mgr, wt)}:conf.py") == "new"
++
++    def test_second_worktree_reuses_the_stores_blobs(self, tmp_path, checkpoint_base, monkeypatch):
++        """A sibling worktree of a repo already in the store copies no blobs again."""
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        repo, wt = self._repo_with_worktree(tmp_path, lambda r: (r / "a.py").write_text("a\n"))
++        wt2 = tmp_path / "wt2"
++        self._git(repo, "worktree", "add", "-q", str(wt2), "HEAD")
++        mgr = CheckpointManager(enabled=True)
++        assert mgr.ensure_checkpoint(str(wt), "one") is True
++        packs = set((cm._store_path() / "objects" / "pack").glob("*.pack"))
++        assert len(packs) == 1
++        assert mgr.ensure_checkpoint(str(wt2), "two") is True
++        assert set((cm._store_path() / "objects" / "pack").glob("*.pack")) == packs
++
++
+ def test_slow_dir_backoff_file_with_bom_is_read(tmp_path):
+     """Windows tools BOM files they touch; the persisted back-off must still load."""
+     import tools.checkpoint_staging as staging
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index 09441e0776..fa761f6256 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -363,12 +363,14 @@ def _run_git(
+     allowed_returncodes: Optional[set[int]] = None,
+     index_file: Optional[Path] = None,
+     extra_env: Optional[dict[str, str]] = None,
++    input_text: Optional[str] = None,
+ ) -> tuple[bool, str, str]:
+     """Run a git command against the shared store.  Returns (ok, stdout, stderr).
+ 
+     ``allowed_returncodes`` suppresses error logging for known/expected non-zero
+     exits while preserving the normal ``ok = (returncode == 0)`` contract.
+     Example: ``git diff --cached --quiet`` returns 1 when changes exist.
++    ``input_text`` is written to git's stdin (otherwise stdin is closed).
+     """
+     normalized_working_dir = _normalize_path(working_dir)
+     if not normalized_working_dir.exists():
+@@ -393,14 +395,18 @@ def _run_git(
+     try:
+         # NUL-delimited git output contains literal filenames, not text lines.
+         text_options = {} if "-z" in args else {"text": True, "encoding": "utf-8", "errors": "replace"}
++        if input_text is None:
++            stdin_options: dict = {"stdin": subprocess.DEVNULL}
++        else:
++            stdin_options = {"input": input_text if text_options else input_text.encode("utf-8")}
+         result = subprocess.run(
+             cmd,
+             capture_output=True,
+             **text_options,
++            **stdin_options,
+             timeout=timeout,
+             env=env,
+             cwd=str(normalized_working_dir),
+-            stdin=subprocess.DEVNULL,
+             # Checkpoints fire several bare git calls per turn from the
+             # console-less desktop/gateway backend; suppress the per-call
+             # conhost flash on Windows (no-op on POSIX).
+@@ -444,6 +450,101 @@ def _git_out(args: list[str], store: Path, working_dir: str, rc: Optional[set[in
+     return out if ok else ""
+ 
+ 
++def _repo_git_env() -> dict:
++    """Env for git reading the checkout's OWN repository (not the store).
++
++    Same config isolation as the store (no user hooks, fsmonitor daemons or
++    prompts), no inherited repository overrides, and no lazy fetch: a blob a
++    partial clone lacks must fail the seed, not trigger a network fetch."""
++    from tools.environments.local import build_subprocess_env
++
++    env = selected_git_env(build_subprocess_env(scrub_secrets=False, inherit_profile_home=False))
++    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_COMMON_DIR",
++              "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
++        env.pop(k, None)
++    env["GIT_CONFIG_GLOBAL"] = os.devnull
++    env["GIT_CONFIG_SYSTEM"] = os.devnull
++    env["GIT_CONFIG_NOSYSTEM"] = "1"
++    env["GIT_NO_LAZY_FETCH"] = "1"
++    env["GIT_TERMINAL_PROMPT"] = "0"
++    return env
++
++
++def _checkout_index(working_dir: str) -> Optional[tuple[Path, Path]]:
++    """``(index file, common git dir)`` when ``working_dir`` is the top level of
++    a git checkout (a clone or a linked worktree) that has an index, else None."""
++    env = _repo_git_env()
++    git = shutil.which("git", path=env.get("PATH", ""))
++    if git is None:
++        return None
++    try:
++        result = subprocess.run(
++            [git, "rev-parse", "--path-format=absolute", "--show-toplevel",
++             "--git-path", "index", "--git-common-dir"],
++            capture_output=True, text=True, encoding="utf-8", errors="replace",
++            env=env, cwd=working_dir, timeout=_GIT_TIMEOUT,
++            stdin=subprocess.DEVNULL, creationflags=windows_hide_flags(), check=False,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        return None
++    lines = result.stdout.splitlines()
++    if result.returncode != 0 or len(lines) != 3:
++        return None
++    top, index, common = (Path(line) for line in lines)
++    try:
++        if top.resolve() != Path(working_dir).resolve() or not index.is_file():
++            return None
++    except OSError:
++        return None
++    return index, common
++
++
++def _pack_from_repo(working_dir: str, common_dir: Path, store: Path, shas: list[str]) -> tuple[bool, str]:
++    """Copy objects ``shas`` from the checkout's repository into the store as one pack.
++
++    ``pack-objects`` (in the repository, delta search off: stored data is
++    reused) writes into a temp file inside the store; the store's own
++    ``index-pack`` then verifies and installs it. Nothing is written into the
++    user's repository."""
++    env = _repo_git_env()
++    git = shutil.which("git", path=env.get("PATH", ""))
++    if git is None:
++        return False, "git is not installed or not on PATH"
++    pack_dir = store / "objects" / "pack"
++    tmp = pack_dir / f"tmp_pack_seed_{os.getpid()}"
++    try:
++        pack_dir.mkdir(parents=True, exist_ok=True)
++        with open(tmp, "wb") as out:
++            result = subprocess.run(
++                [git, "pack-objects", "--stdout", "-q", "--window=0"],
++                input=("\n".join(shas) + "\n").encode(), stdout=out, stderr=subprocess.PIPE,
++                env=env, cwd=working_dir, timeout=_GIT_TIMEOUT,
++                creationflags=windows_hide_flags(), check=False,
++            )
++        if result.returncode != 0:
++            return False, f"pack-objects in {common_dir} failed: {result.stderr.decode(errors='replace').strip()}"
++        store_env = _git_env(store, working_dir)
++        with open(tmp, "rb") as src:
++            result = subprocess.run(
++                [git, "index-pack", "--stdin"],
++                stdin=src, capture_output=True,
++                env=store_env, cwd=working_dir, timeout=_GIT_TIMEOUT,
++                creationflags=windows_hide_flags(), check=False,
++            )
++        if result.returncode != 0:
++            return False, f"index-pack failed: {result.stderr.decode(errors='replace').strip()}"
++        return True, ""
++    except subprocess.TimeoutExpired as exc:
++        return False, f"copying {len(shas)} objects from {common_dir} timed out after {exc.timeout}s"
++    except OSError as exc:
++        return False, f"copying objects from {common_dir} failed: {exc}"
++    finally:
++        try:
++            tmp.unlink()
++        except OSError:
++            pass
++
++
+ def _ref_tip(store: Path, working_dir: str, ref: str) -> Optional[str]:
+     """Commit sha at ``ref``, or None when the ref does not exist yet."""
+     return _git_out(["rev-parse", "--verify", ref + "^{commit}"], store, working_dir, {128}) or None
+@@ -1490,11 +1591,21 @@ class CheckpointManager:
+             # First snapshot for this project.
+             index_file.parent.mkdir(parents=True, exist_ok=True)
+ 
++        # No snapshot to seed from: a git checkout's own index already carries
++        # the stat data and blob ids of every tracked file, so seed from it
++        # (copying the blobs the store lacks) and git hashes only what differs
++        # from that index instead of the whole tree.
++        seeded = False
++        if warm_since is None and not index_file.exists():
++            seeded = self._seed_from_repo_index(store, working_dir, index_file)
++
+         # Price the add before running it: files under the cap still cost a
+         # hash each, and a tree of them can outlast the timeout (a fresh source
+         # checkout on a loaded laptop). Over budget, skip the add instead of
+         # blocking the turn until git is killed.
+-        over = self._over_staging_budget(store, working_dir, index_file, scan, warm_since)
++        over = self._over_staging_budget(
++            store, working_dir, index_file, scan, warm_since, precise=seeded,
++        )
+         if over is not None:
+             staging.mark_slow(store, working_dir)
+             logger.warning(
+@@ -1641,9 +1752,110 @@ class CheckpointManager:
+                 logger.info("Checkpoint: removed %d partial file(s) left by the timed-out git add", len(removed))
+         return ok, out, err
+ 
++    def _seed_from_repo_index(self, store: Path, working_dir: str, index_file: Path) -> bool:
++        """Seed a cold project index from the git checkout's own index.
++
++        A fresh checkout (a new worktree) has never been snapshotted, so every
++        file would be hashed and written as a new object: 37 s for a
++        hermes-agent worktree on a loaded hub, over the staging budget. The
++        checkout's own index already holds each tracked file's blob id and stat
++        data. Copying it lets ``git add -A`` rehash only files that differ from
++        it; the blobs the store lacks are copied from the repository as one pack
++        (``pack-objects`` reuses the stored data, ~2 s for that worktree), so the
++        checkpoint never depends on the repository's object store.
++
++        Only when ``working_dir`` is the checkout's top level and every entry is
++        a plain stage-0 entry (no conflicts, assume-unchanged or skip-worktree
++        bits, which would hide changes from ``git add``). Tracked files the
++        checkpoint excludes (``DEFAULT_EXCLUDES``, the project's .gitignore) are
++        dropped, so the snapshot matches a cold add. Any failure leaves no index
++        behind (the cold path then prices and stages as before). Callers hold
++        the checkpoint store lock.
++        """
++        repo = _checkout_index(working_dir)
++        if repo is None:
++            return False
++        repo_index, common_dir = repo
++
++        def abandon(why: str) -> bool:
++            logger.debug("Checkpoint: not seeding %s from its git index: %s", working_dir, why)
++            for leftover in (index_file, Path(f"{index_file}.lock")):
++                try:
++                    leftover.unlink()
++                except OSError:
++                    pass
++            return False
++
++        try:
++            index_file.parent.mkdir(parents=True, exist_ok=True)
++            # copy2 keeps the index mtime: git's racy-clean check is anchored to it.
++            shutil.copy2(repo_index, index_file)
++        except OSError as exc:
++            return abandon(f"copy failed: {exc}")
++
++        # Drop extensions tied to the checkout (untracked cache, fsmonitor); a
++        # split index fails here (its shared part is not in the store).
++        ok, _, err = _run_git(
++            ["-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
++             "update-index", "--no-untracked-cache", "--no-fsmonitor"],
++            store, working_dir, index_file=index_file, allowed_returncodes={128},
++        )
++        if not ok:
++            return abandon(err or "update-index failed")
++
++        ok, out, err = _run_git(
++            ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
++            store, working_dir, index_file=index_file, allowed_returncodes={128},
++        )
++        if not ok:
++            return abandon(err or "ls-files failed")
++        excluded = [p for p in out.split("\x00") if p]
++        if excluded:
++            self._unstage(store, working_dir, index_file, excluded)
++
++        ok, out, err = _run_git(
++            ["ls-files", "-z", "-v", "--stage"],
++            store, working_dir, index_file=index_file, allowed_returncodes={128},
++        )
++        if not ok:
++            return abandon(err or "ls-files failed")
++        blobs: set[str] = set()
++        for record in filter(None, out.split("\x00")):
++            meta, _, _path = record.partition("\t")
++            parts = meta.split()
++            if len(parts) != 4:
++                return abandon(f"unexpected ls-files record {meta!r}")
++            tag, mode, sha, stage_no = parts
++            if tag != "H" or stage_no != "0":
++                return abandon(f"index entry flagged {tag}/{stage_no}")
++            if mode != "160000":  # a gitlink names a commit of another repo
++                blobs.add(sha)
++        if not blobs:
++            return abandon("empty index")
++
++        ok, out, err = _run_git(
++            ["cat-file", "--batch-check=%(objectname)"], store, working_dir,
++            input_text="\n".join(sorted(blobs)) + "\n",
++        )
++        if not ok:
++            return abandon(err or "cat-file failed")
++        missing = [line.split()[0] for line in out.splitlines() if line.endswith(" missing")]
++        if missing:
++            started = time.time()
++            ok, err = _pack_from_repo(working_dir, common_dir, store, missing)
++            if not ok:
++                staging.clear_timeout_debris(store, started, None)
++                return abandon(err)
++        logger.debug(
++            "Checkpoint: seeded %s from its git index (%d entries, %d blobs copied)",
++            working_dir, len(blobs), len(missing),
++        )
++        return True
++
+     def _over_staging_budget(
+         self, store: Path, working_dir: str, index_file: Path,
+         scan: staging.TreeScan, warm_since: Optional[float],
++        *, precise: bool = False,
+     ) -> Optional[staging.AddEstimate]:
+         """The add's estimate when it would not finish inside the staging budget, else None.
+ 
+@@ -1651,9 +1863,12 @@ class CheckpointManager:
+         index; files modified since the last snapshot on a warm one). Only when
+         that is over budget does git list what it would really hash
+         (``ls-files -o -m``: new and stat-changed, gitignored files dropped),
+-        which is a directory walk with no hashing."""
++        which is a directory walk with no hashing. ``precise`` (an index seeded
++        from the checkout's own) prices the free estimate as a cold index: that
++        index's mtime says nothing about files left dirty before it was written,
++        so only the listing may narrow it."""
+         budget = staging.budget_s(_GIT_TIMEOUT * 2)
+-        est = staging.estimate(scan, warm_since)
++        est = staging.estimate(scan, None if precise else warm_since)
+         if est.seconds <= budget:
+             return None
+         ok, out, _ = _run_git(
+diff --git a/website/docs/user-guide/checkpoints-and-rollback.md b/website/docs/user-guide/checkpoints-and-rollback.md
+index 3b58042943..8ed2b2bbe6 100644
+--- a/website/docs/user-guide/checkpoints-and-rollback.md
++++ b/website/docs/user-guide/checkpoints-and-rollback.md
+@@ -259,7 +259,7 @@ With a container terminal backend (`docker`, `singularity`, `modal`, `daytona`,
+ - **Directory scope** — Hermes skips overly broad directories (root `/`, home `$HOME`).
+ - **Repository size** — directories with more than 50,000 files are skipped.
+ - **Per-file size cap** — files larger than `max_file_size_mb` (default 10 MB) are excluded from the snapshot. Prevents accidentally swallowing datasets, model weights, or generated media.
+-- **Staging budget** — before staging, Hermes estimates how long `git add` will take (the files it has to hash, scaled by the machine's current load). A folder whose snapshot would not finish in half the git timeout (for example the first snapshot of a large fresh checkout on a busy laptop) is skipped instead of blocking the turn. Such a folder, like one whose staging really timed out, is not retried for 60 minutes by any Hermes process (the back-off is kept in the checkpoint store).
++- **Staging budget** — before staging, Hermes estimates how long `git add` will take (the files it has to hash, scaled by the machine's current load). A folder whose snapshot would not finish in half the git timeout (for example the first snapshot of a large fresh checkout on a busy laptop) is skipped instead of blocking the turn. Such a folder, like one whose staging really timed out, is not retried for 60 minutes by any Hermes process (the back-off is kept in the checkpoint store). The first snapshot of a git checkout (for example a new worktree) starts from that checkout's own index and copies the file contents git already stores, so only files that differ from the index are hashed and a big clean checkout fits the budget.
+ - **Total store size cap** — when the store exceeds `max_total_size_mb` (default 500 MB), the oldest commit per project is dropped round-robin. Each drop is reclaimed before deciding whether another is necessary. Every project keeps at least one snapshot. A failed Git operation stops pruning and is reported; maintenance never discards more history to compensate for failed reclamation.
+ - **Real pruning, off the hot path** — `max_snapshots` and the size cap are enforced by rewriting the per-project ref at checkpoint time (cheap); the store is then marked `.gc-pending` and the periodic prune runs `git gc --prune=now` once, so loose objects don't accumulate and a tool call never waits on a full repack.
+ - **Concurrent operations** — snapshots, restores, diffs and maintenance use one process-shared store lock. An operation reports a busy store rather than running GC over another process's unpublished objects. A restore applies its selected tree before pruning the safety snapshot's history.
+-- 
+2.55.0
+

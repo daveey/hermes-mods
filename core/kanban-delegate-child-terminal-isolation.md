@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/0692-fix-kanban-daveey-delegate-children-get-their-own-te.patch`: per-child terminal snapshot overlay, worker-shell `--board`, `boards list` own-DB counts,
+- `patches/0704-fix-kanban-daveey-delegate-children-get-their-own-te.patch`: per-child terminal snapshot overlay, worker-shell `--board`, `boards list` own-DB counts,
   fenced `kanban list`, refusal text.
 
 ## Behavior

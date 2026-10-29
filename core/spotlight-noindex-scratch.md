@@ -1,6 +1,6 @@
 # Spotlight-free scratch and uv cache on macOS
 
-Patch **0664** (`c04d111c0e`).
+Patch **0679** (`c04d111c0e`).
 
 ## Behavior
 
@@ -41,13 +41,13 @@ marker files inside the home folder are not a documented exclusion. Renaming to 
 - The migration runs lazily on the first `get_scratch_dir()`/`uv_cache_dir()` call after the update. A host can also
   be migrated by hand: `mv scratch scratch.noindex && ln -s scratch.noindex scratch` in `<home>/cache`.
 
-## Follow-up patch (0683)
+## Follow-up patch (0692)
 
-**0683** (`59528bfd7c`) is a test fix, not a product change.
+**0692** (`59528bfd7c`) is a test fix, not a product change.
 
 - Scratch and uv-cache Spotlight tests no longer monkeypatch `sys.platform = 'darwin'`. Migration, symlink, dangling-link, conflict and `HERMES_SPOTLIGHT_INDEX_CACHE` opt-out run on the real macOS host via `@pytest.mark.platforms("macos")` and call `get_scratch_dir` / `uv_cache_dir`. Non-macOS hosts only assert `get_scratch_dir` stays a plain directory (`@pytest.mark.platforms("not macos")`, `test_other_platforms_keep_a_plain_scratch_dir`).
 - Two scratch-prune tests scan only their own psutil children.
-- The same commit binds a leading `Request` on the direct caller in `tests/hermes_cli/test_session_detail_malformed_db.py::test_messages_endpoint_reports_corruption` (`request=`, `session_id=`, explicit `order`). That file was not re-run by this mirror. Mark that path untested here. The history-page callers with the same shift are [transcript-page-request-arg.md](transcript-page-request-arg.md) (0684).
+- The same commit binds a leading `Request` on the direct caller in `tests/hermes_cli/test_session_detail_malformed_db.py::test_messages_endpoint_reports_corruption` (`request=`, `session_id=`, explicit `order`). That file was not re-run by this mirror. Mark that path untested here. The history-page callers with the same shift are [transcript-page-request-arg.md](transcript-page-request-arg.md) (0693).
 
 Do not put the darwin contracts back behind a `sys.platform` fake. `ensure_spotlight_noindex_dir(path, platform=)` is the pure-data seam; the shipped tests use the native marker instead.
 

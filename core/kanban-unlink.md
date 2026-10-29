@@ -1,6 +1,6 @@
 # kanban_unlink, and a worker may close the card it parked
 
-Patch **0685** (`14e8670d85`).
+Patch **0694** (`14e8670d85`).
 
 ## Behavior
 
@@ -40,7 +40,7 @@ This mirror did not re-run those files. The CLI `hermes kanban unlink` entry poi
 
 ## Applying
 
-`git am -3` 0685. Needs `unlink_tasks` already on the board DB (earlier kanban-link patches).
+`git am -3` 0694. Needs `unlink_tasks` already on the board DB (earlier kanban-link patches).
 
 ## Gotchas
 

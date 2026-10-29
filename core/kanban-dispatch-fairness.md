@@ -1,6 +1,6 @@
 # Kanban board fairness and ready-age diagnostics
 
-Patches 0643 (`42769fa2b4`) and 0644 (`a595876fe8`).
+Patches 0652 (`42769fa2b4`) and 0653 (`a595876fe8`).
 
 ## Behavior
 
@@ -23,7 +23,7 @@ Upstream regression tests (execution results are recorded separately):
 
 ## Applying
 
-Apply 0643 then 0644 after their earlier Kanban dependencies, using `git am -3`.
+Apply 0652 then 0653 after their earlier Kanban dependencies, using `git am -3`.
 
 ## Gotchas
 

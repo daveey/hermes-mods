@@ -1,6 +1,6 @@
 # Kanban sync seams (client side, flag off by default)
 
-Patch **0445** (`5cd9bd0161`). It is phase 1 of [kanban-central-service.md](kanban-central-service.md), where the patch
+Patch **0451** (`5cd9bd0161`). It is phase 1 of [kanban-central-service.md](kanban-central-service.md), where the patch
 is called "proposed 0193". It adds the core seams a sync plugin needs. It ships no network code, and with
 `kanban.sync.enabled: false` (the default) nothing changes.
 
@@ -74,9 +74,9 @@ ratchet, the pure worker-context helpers moved to `kanban_db_context.py`.
 - The upstream kanban suite (`-k kanban`) gives the same failing test ids as clean main, both with the flag off and
   with it on (shadow mode, no server).
 
-## Config docs (0458)
+## Config docs (0464)
 
-Patch **0458** (source `a7d87690e0`) documents `kanban.sync.enabled` in `website/docs/user-guide/configuration.md`
+Patch **0464** (source `a7d87690e0`) documents `kanban.sync.enabled` in `website/docs/user-guide/configuration.md`
 (off by default; boards opened afterwards gain the sync tables and outbox triggers). Docs only; it fixes the
 upstream docs-drift ratchet test, which fails when a config default has no documentation.
 

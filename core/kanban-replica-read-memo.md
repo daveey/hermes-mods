@@ -1,6 +1,6 @@
 # The sidebar re-reads hub.db's task rows only when they change
 
-Patch **0580** (source `512f93867f`). Follows [kanban-replica-decode-memo.md](kanban-replica-decode-memo.md) (0557).
+Patch **0592** (source `512f93867f`). Follows [kanban-replica-decode-memo.md](kanban-replica-decode-memo.md) (0536).
 
 After the chat-closeout fix ([backend-writable-open-guard.md](backend-writable-open-guard.md)), replaying
 `GET /api/profiles/sessions/sidebar` every 2 s against the live `~/.hermes` still spent most of its kanban time in the
@@ -14,7 +14,7 @@ task rows (~23 MB of JSON) from `hub.db`.
 2. **Why didn't a file-stat key on `hub.db` alone fix it?** `hub.db`'s WAL changes ~45 times a minute (outbox, cursor,
    request ledger), while its `replica` task rows change only when a pull lands (minutes apart when quiet).
 3. **Why was each rebuild expensive?** `_read_remote_links` fetched every row's `data` and looped over all of them in
-   Python even when 0557's decode memo already held every decoded row; then `superseded` scanned every ledger row for
+   Python even when 0536's decode memo already held every decoded row; then `superseded` scanned every ledger row for
    each of ~2.4k legacy cards (~500k `supersedes` calls per rebuild).
 
 ## Behavior
@@ -60,7 +60,7 @@ delete), `test_hub_staleness_cutoff_is_never_served_from_the_memo`, `test_meta_a
 
 ## Applying
 
-`git am -3`; needs 0557 (decode memo) and the origin-ledger/legacy series.
+`git am -3`; needs 0536 (decode memo) and the origin-ledger/legacy series.
 
 ## Gotchas
 

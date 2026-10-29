@@ -1,6 +1,6 @@
 # Local Kanban cards count once per compression lineage
 
-Patch: `0671`; core commit `a3a632954c`.
+Patch: `0682, 0695`; core commit `a3a632954c`.
 
 ## Behavior
 
@@ -42,7 +42,7 @@ The initial reproduction failed eight cases before the fix; held/stalled and gen
 
 ## Applying
 
-Apply the ordered `core/patches` series, including `0671`, with `git am -3 --empty=keep`. On the original core parent, `0671` also applies alone. Keep earlier curated patches and their published numbering unchanged.
+Apply the ordered `core/patches` series, including `0682, 0695`, with `git am -3 --empty=keep`. On the original core parent, `0682, 0695` also applies alone. Keep earlier curated patches and their published numbering unchanged.
 
 ## Gotchas
 

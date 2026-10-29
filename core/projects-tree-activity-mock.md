@@ -1,6 +1,6 @@
 # Projects tree activity test matches the snapshot shape
 
-Patch **0687** (`a95245bfb9`). Test harness only.
+Patch **0699** (`a95245bfb9`). Test harness only.
 
 ## Behavior
 
@@ -22,7 +22,7 @@ The existing `test_tree_rows_carry_session_activity_stamps` is the entry path. T
 
 ## Applying
 
-`git am -3` 0687. Test file only.
+`git am -3` 0699. Test file only.
 
 ## Gotchas
 

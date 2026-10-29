@@ -1,6 +1,6 @@
 # Test real-home guard: a checkout's own identity probes are readable
 
-Patch **0629** (source `a40af33743`). Test infrastructure only.
+Patch **0635** (source `a40af33743`). Test infrastructure only.
 
 ## Behavior
 

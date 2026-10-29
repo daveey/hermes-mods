@@ -1,0 +1,303 @@
+From 0d3797b3617f5a442e6d10af407d2eac98c4e7b4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:12:54 -0700
+Subject: [PATCH] fix(kanban): refuse reclaim of a foreign live lease [daveey]
+
+A replica reclaim of a card another gateway still leases closed the run.
+The close synced, and the owner's terminal-worker reaper SIGTERMed the
+live worker (David-MBP 2026-10-28 23:05, during the core-update drain).
+reclaim_task now records reclaim_refused and leaves the run open. The
+reaper skips a run whose task is still running under that worker. A dead
+worker during a drain hold is requeued to ready and not claimed again
+until the hold lifts.
+---
+ hermes_cli/kanban_db.py                       |  4 +-
+ hermes_cli/kanban_db_dispatch.py              |  4 +-
+ hermes_cli/kanban_db_dispatch_queries.py      | 29 ++++++++++-
+ hermes_cli/kanban_db_sync.py                  | 47 +++++++++++++++++
+ tests/agent/test_core_update_drain.py         | 52 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_sync_leases.py   | 31 +++++++++++
+ .../test_kanban_terminal_worker_reaper.py     | 32 ++++++++++++
+ 7 files changed, 194 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index d37c226e60..d07d466460 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2632,8 +2632,8 @@ def reclaim_task(
+     ).fetchone()
+     if not row:
+         return False
+-    if row["status"] != "running" and row["claim_lock"] is None:
+-        # Nothing to reclaim — already ready / blocked / done.
++    idle = row["status"] != "running" and row["claim_lock"] is None
++    if idle or _sync.refuse_foreign_reclaim(conn, task_id):
+         return False
+     prev_lock = row["claim_lock"]
+     termination = _terminate_reclaimed_worker(
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 13f4a356b3..1e80e59181 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -33,7 +33,7 @@ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
+ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code_kind
+ from hermes_cli import kanban_worker_scope as _worker_scope
+-from hermes_cli.kanban_db_dispatch_queries import lane_rows
++from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
+ 
+ if TYPE_CHECKING:
+     from hermes_cli.kanban_db import Task
+@@ -689,7 +689,7 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
+ 
+ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
+     pid, fingerprint = int(row["worker_pid"]), row["worker_started_at"]
+-    if pid == os.getpid() or not _kb._claim_is_local(row["claim_lock"], host_prefix):
++    if skip_reap(conn, row, pid, host_prefix):
+         return
+     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
+         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index c8d0ab311b..7631767384 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -1,4 +1,5 @@
+-"""Read-only native dispatcher lane queries."""
++"""Read-only native dispatcher lane queries, plus the reaper's live-owner check."""
++import os
+ import sqlite3
+ 
+ 
+@@ -10,3 +11,29 @@ def lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
+         "ORDER BY priority DESC, created_at ASC"
+     ).fetchall()
+ 
++
++def still_current_worker(conn: sqlite3.Connection, row, pid: int) -> bool:
++    """True when this ended run is still the card's live worker.
++
++    A replica can close the run row while this host's worker is still the
++    card's current one. Signalling then kills a live worker.
++    """
++    task = conn.execute(
++        "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?",
++        (row["task_id"],),
++    ).fetchone()
++    return bool(
++        task is not None and task["status"] == "running"
++        and (task["worker_pid"] == pid or task["current_run_id"] == row["id"])
++    )
++
++
++def skip_reap(conn: sqlite3.Connection, row, pid: int, host_prefix: str) -> bool:
++    """True when this run must not be signalled."""
++    from hermes_cli import kanban_db as _kb
++
++    return (
++        pid == os.getpid()
++        or not _kb._claim_is_local(row["claim_lock"], host_prefix)
++        or still_current_worker(conn, row, pid)
++    )
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 6dd1cd22fe..51602cd8e8 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -825,6 +825,53 @@ def held_by_us_live(conn: sqlite3.Connection, task_id: str, now: Optional[int] =
+     return row["lease_holder"] == _state(conn)["gateway_id"] and int(row["lease_expires"]) > now_ms
+ 
+ 
++def foreign_live_lease(conn: sqlite3.Connection, task_id: str, now: Optional[float] = None) -> Optional[str]:
++    """Gateway id of an unexpired Board lease held by someone else, else None.
++
++    A primary board mirrors cards running on another machine (``status='running'``,
++    ``claim_lock`` NULL, ``lease_holder`` = them). Operator reclaim on that replica
++    used to close the run row; the close synced and the owner's terminal-worker
++    reaper SIGTERMed the live worker (David-MBP 2026-10-28 23:05, pid 1522 drain
++    window: hub workers 631696/762267 died ~3 min after a Mac reclaim the Board
++    refused). Empty when this gateway holds the lease, the lease has expired, or
++    the board does not sync.
++    """
++    if board_mode(conn) != "primary":
++        return None
++    row = conn.execute(
++        "SELECT lease_holder, lease_expires FROM tasks WHERE id = ?", (task_id,),
++    ).fetchone()
++    if row is None or row["lease_holder"] is None or row["lease_expires"] is None:
++        return None
++    if row["lease_holder"] == _state(conn)["gateway_id"]:
++        return None
++    now_ms = int((time.time() if now is None else now) * 1000)
++    if int(row["lease_expires"]) <= now_ms:
++        return None
++    return str(row["lease_holder"])
++
++
++def refuse_foreign_reclaim(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when reclaim must not close the run: another gateway still holds the lease.
++
++    Writes ``reclaim_refused`` and leaves the run open. Closing it here syncs an
++    ended run to the lease owner, whose terminal-worker reaper then SIGTERMs the
++    live process.
++    """
++    holder = foreign_live_lease(conn, task_id)
++    if not holder:
++        return False
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli import kanban_db as _kb
++    with write_txn(conn):
++        _kb._append_event(conn, task_id, "reclaim_refused", {
++            "reason": "foreign_live_lease",
++            "lease_holder": holder,
++            "manual": True,
++        })
++    return True
++
++
+ def held_elsewhere_sql(conn: sqlite3.Connection, alias: str = "") -> str:
+     """SQL condition (``AND NOT ...``) that leaves out cards whose Board lease another gateway holds.
+ 
+diff --git a/tests/agent/test_core_update_drain.py b/tests/agent/test_core_update_drain.py
+index 28e117632d..a9cf7ee91a 100644
+--- a/tests/agent/test_core_update_drain.py
++++ b/tests/agent/test_core_update_drain.py
+@@ -184,3 +184,55 @@ def test_estop_still_skips_the_whole_tick(tmp_path, monkeypatch):
+     probes = _run_one_tick(tmp_path, monkeypatch)
+     assert probes == [] and spawned == []
+     assert _statuses(ids)["child"] == "todo"
++
++
++def test_hold_requeues_a_dead_worker_and_does_not_claim_until_the_hold_lifts(tmp_path, monkeypatch):
++    """A worker that dies during a drain hold goes back to ready and is not claimed again while the hold is up."""
++    import subprocess
++    import sys
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setattr(drain, "_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "default")
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
++
++    child = subprocess.Popen([sys.executable, "-c", "pass"])
++    child.wait()
++    spawned = []
++
++    def spawn(task, ws, board=None):
++        spawned.append(task.id)
++        return 1
++
++    with kbc.connect_closing(board="default") as conn:
++        tid = kb.create_task(conn, title="died-during-drain", assignee="default")
++        kb.claim_task(conn, tid)
++        kbd._set_worker_pid(conn, tid, child.pid)
++        aged = int(time.time()) - 3600
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (aged, tid))
++        _write(tmp_path, {"pid": os.getpid(), "started_at": time.time(), "reason": "core update"})
++
++        held = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=0)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready", (task.status, held.crashed)
++        assert task.worker_pid is None
++        assert spawned == []
++
++        spawned.clear()
++        kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=0)
++        assert kb.get_task(conn, tid).status == "ready"
++        assert spawned == []
++
++        (tmp_path / drain.HOLD_RELPATH).unlink()
++        kbd.dispatch_once(conn, spawn_fn=spawn)
++        assert spawned == [tid]
++        assert kb.get_task(conn, tid).status == "running"
+diff --git a/tests/hermes_cli/test_kanban_sync_leases.py b/tests/hermes_cli/test_kanban_sync_leases.py
+index e57a8bc40f..ec13d5ac64 100644
+--- a/tests/hermes_cli/test_kanban_sync_leases.py
++++ b/tests/hermes_cli/test_kanban_sync_leases.py
+@@ -218,3 +218,34 @@ def test_operator_reclaim_releases_the_lease(primary, lease_client):
+     run_uid = lease_client.calls[0][1]["run_uid"]
+     assert kb.reclaim_task(conn, tid, reason="operator")
+     assert lease_client.calls[-1][0] == "release" and lease_client.calls[-1][1]["run_uid"] == run_uid
++
++
++def test_reclaim_of_a_foreign_live_lease_does_not_end_the_run(primary, lease_client):
++    """A replica must not close a run another gateway still holds.
++
++    David-MBP 2026-10-28 23:05: reclaim of hub-leased cards (claim_lock NULL here)
++    ended the run; the Board refused the status change; the hub reaper SIGTERMed
++    the live workers ~3 min later.
++    """
++    conn = primary
++    tid = kb.create_task(conn, title="hub-owned", assignee="worker")
++    kb.claim_task(conn, tid)
++    run_uid = lease_client.calls[0][1]["run_uid"]
++    far = int((time.time() + 3600) * 1000)
++    conn.execute(
++        "UPDATE tasks SET lease_holder = ?, lease_expires = ?, claim_lock = NULL, worker_pid = NULL WHERE id = ?",
++        ("hub", far, tid),
++    )
++    before = conn.execute(
++        "SELECT status, ended_at FROM task_runs WHERE task_id = ?", (tid,),
++    ).fetchall()
++    assert kb.reclaim_task(conn, tid, reason="no local worker") is False
++    assert kb.get_task(conn, tid).status == "running"
++    after = conn.execute(
++        "SELECT status, ended_at FROM task_runs WHERE task_id = ?", (tid,),
++    ).fetchall()
++    assert after == before
++    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
++    assert "reclaim_refused" in kinds
++    assert "reclaimed" not in kinds
++    assert not any(kind == "release" and req.get("run_uid") == run_uid for kind, req in lease_client.calls)
+diff --git a/tests/hermes_cli/test_kanban_terminal_worker_reaper.py b/tests/hermes_cli/test_kanban_terminal_worker_reaper.py
+index 11064bc29c..864127cc9a 100644
+--- a/tests/hermes_cli/test_kanban_terminal_worker_reaper.py
++++ b/tests/hermes_cli/test_kanban_terminal_worker_reaper.py
+@@ -130,6 +130,38 @@ def test_fresh_terminal_run_is_left_alone_until_grace_passes(conn):
+         proc.wait()
+ 
+ 
++def test_closed_run_does_not_reap_the_still_running_worker(conn):
++    """A replica can stamp ended_at on the run while the task is still running under this host's worker.
++
++    That is the 2026-10-28 hub kill: Mac reclaim closed the run, the Board refused the status
++    change, and reap_terminal_workers SIGTERMed pids that were still the card's current worker.
++    """
++    proc = _sleeper()
++    signals = []
++
++    def signal_fn(pid, sig):
++        signals.append(pid)
++        os.kill(pid, sig)
++
++    try:
++        tid = kb.create_task(conn, title="still going", assignee="coder")
++        kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        run_id = kb._current_run_id(conn, tid)
++        kbd._set_worker_pid(conn, tid, proc.pid)
++        lock = conn.execute("SELECT claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()["claim_lock"]
++        conn.execute(
++            "UPDATE task_runs SET ended_at = ?, claim_lock = ? WHERE id = ?",
++            (int(time.time()) - 600, lock, run_id),
++        )
++        assert kb.get_task(conn, tid).status == "running"
++        assert kbd.reap_terminal_workers(conn, signal_fn=signal_fn) == []
++        assert signals == [] and proc.poll() is None
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++
++
+ def test_one_failing_row_does_not_abort_the_sweep(conn):
+     """A signal failure on one run is logged and skipped; the other rows are still reaped."""
+     broken, healthy = _sleeper(), _sleeper()
+-- 
+2.55.0
+

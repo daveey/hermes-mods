@@ -1,6 +1,6 @@
 # Gateway plist runs under the core-update launcher
 
-Patch **0527** (source `4148caceab`).
+Patch **0539** (source `4148caceab`).
 
 ## Behavior
 

@@ -1,6 +1,6 @@
 # Kanban strong tier names its model; cron.model_provider pairs only with cron.model
 
-Patches: 0541 0542.
+Patches: 0554 0555.
 
 ## Behavior
 
@@ -65,6 +65,6 @@ fork/upstream merge-base. The patches are not independent. Then set
 
 No. This changes core dispatch and cron routing.
 
-## Follow-up patch (0562)
+## Follow-up patch (0563)
 
-**0562** documents `kanban.strong_model` / `strong_provider` in `website/docs/user-guide/configuration.md` (docs-drift ratchet). No code change.
+**0563** documents `kanban.strong_model` / `strong_provider` in `website/docs/user-guide/configuration.md` (docs-drift ratchet). No code change.

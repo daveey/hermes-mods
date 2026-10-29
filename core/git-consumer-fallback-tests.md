@@ -1,6 +1,6 @@
 # Git-consumer fallback test boundaries
 
-Patch 0662 (`c70f80b17d`), following 0638 (`b98c132d9d`). Test-only; production behavior is unchanged.
+Patch 0672 (`c70f80b17d`), following 0645 (`b98c132d9d`). Test-only; production behavior is unchanged.
 
 ## Behavior
 
@@ -20,7 +20,7 @@ Why 2: `pm.client.ensure` calls `is_runtime` before target-gap checks or acquisi
 
 Root: consumer contract tests depended on PM implementation internals and runtime readiness rather than the consumer's public boundary.
 
-Why not caught: a clean source checkout does not have the missing-runtime install stamp. Patch 0638 addressed an earlier target-gap refusal, but not runtime discovery preceding it. The new runtime-state parameter reproduces this gap; dedicated unmocked tests cover the real preflight-to-fallback path.
+Why not caught: a clean source checkout does not have the missing-runtime install stamp. Patch 0645 addressed an earlier target-gap refusal, but not runtime discovery preceding it. The new runtime-state parameter reproduces this gap; dedicated unmocked tests cover the real preflight-to-fallback path.
 
 Evidence boundary: the missing-runtime mechanism is proven, but is not asserted to be the uniquely established cause of the original mirror incident.
 
@@ -39,11 +39,11 @@ Canonical `scripts/run_tests.sh`, using an existing PM-built test interpreter on
 - `tests/tools/test_checkpoint_manager.py`: 63 passed.
 - `tests/tools/test_working_diff.py`: 6 passed.
 
-The final post-rebase run passed all 86 tests. Applying public patches 0659–0662 with `git am -3` at `a9ed7fc9ff` succeeded; the applied public tree then passed the 17 consumer/runtime/PM-target tests. No full-repository or Windows run is claimed.
+The final post-rebase run passed all 86 tests. Applying public patches 0669, 0670, 0671, 0672 with `git am -3` at `a9ed7fc9ff` succeeded; the applied public tree then passed the 17 consumer/runtime/PM-target tests. No full-repository or Windows run is claimed.
 
 ## Applying
 
-Apply in curated series order, after 0661. The follow-up is append-only; do not replace 0638 or duplicate the source commit.
+Apply in curated series order, after 0671. The follow-up is append-only; do not replace 0645 or duplicate the source commit.
 
 ## Gotchas
 

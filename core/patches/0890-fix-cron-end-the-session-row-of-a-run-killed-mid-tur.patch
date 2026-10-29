@@ -1,0 +1,466 @@
+From fec6ced730a04f85fe0949df184b530850c30420 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 02:57:32 +0000
+Subject: [PATCH] fix(cron): end the session row of a run killed mid-turn when
+ its execution is recovered [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+recover_interrupted_executions() and terminalize_dead_owner() marked a dead owner's
+attempt 'unknown' but never touched its state.db session: _finalize_cron_session only
+runs in the owner, so a run killed by a gateway restart left its cron_<job>_* row
+untitled with ended_at NULL forever (6 such rows on hermes-hub in 7 days).
+
+Recovery now titles (if untitled) '<job name> · <time> (interrupted)' and ends those
+rows with end_reason 'cron_interrupted' (plus the compression tip). The ledger has no
+session id, so the row is matched as the unended cron_<job_id>_* session started between
+the attempt's claim and the next claim of the same job, which keeps a newer live run out.
+Bounded (15 s daemon thread), never raises. backfill_interrupted_cron_sessions() repairs
+already-recovered attempts.
+
+Tests: tests/cron/test_interrupted_cron_session_end.py (4 red before, 6 green after);
+tests/cron 1532 passed.
+---
+ cron/executions.py                            |  16 ++
+ cron/interrupted_sessions.py                  | 220 ++++++++++++++++++
+ .../cron/test_interrupted_cron_session_end.py | 163 +++++++++++++
+ 3 files changed, 399 insertions(+)
+ create mode 100644 cron/interrupted_sessions.py
+ create mode 100644 tests/cron/test_interrupted_cron_session_end.py
+
+diff --git a/cron/executions.py b/cron/executions.py
+index 78c5825391..87a6766dc5 100644
+--- a/cron/executions.py
++++ b/cron/executions.py
+@@ -425,9 +425,23 @@ def recover_interrupted_executions() -> int:
+             _prune_unlocked(conn)
+     for record in recovered:
+         _emit_execution_state(record)
++    _end_interrupted_sessions(recovered)
+     return changed
+ 
+ 
++def _end_interrupted_sessions(records: list[dict[str, Any]]) -> None:
++    """Close the state.db session rows of attempts whose owner died mid-turn: its
++    ``_finalize_cron_session`` never ran, so nothing else would ever end them. Bounded, never raises."""
++    if not records:
++        return
++    try:
++        from cron.interrupted_sessions import end_interrupted_cron_sessions
++
++        end_interrupted_cron_sessions(records)
++    except Exception:  # health: allow BLE001 -- recovery boundary: the ledger is already settled
++        logger.warning("cron: ending interrupted session rows failed", exc_info=True)
++
++
+ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
+     """Record one attempt as ``unknown`` with a cause this process actually observed.
+ 
+@@ -480,6 +494,8 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
+         record = _fetch(conn, execution_id)
+         _prune_unlocked(conn)
+     _emit_execution_state(record)
++    if record is not None:
++        _end_interrupted_sessions([record])
+     return True
+ 
+ 
+diff --git a/cron/interrupted_sessions.py b/cron/interrupted_sessions.py
+new file mode 100644
+index 0000000000..7b9cb2a79e
+--- /dev/null
++++ b/cron/interrupted_sessions.py
+@@ -0,0 +1,220 @@
++"""End the state.db session rows of cron executions that were interrupted mid-turn.
++
++A cron run's session row is titled and ended by the scheduler's ``_finalize_cron_session`` after the
++agent turn returns. When the owning process dies mid-turn (gateway restart, core update, OOM), that
++step never runs: ``recover_interrupted_executions`` marks the ledger row ``unknown`` in the next
++process, but nothing closed the session row, so it stayed untitled and ``ended_at IS NULL`` forever
++(it looks like a live run in every session list).
++
++The ledger does not store the session id. The scheduler names the session
++``cron_<job_id>_<YYYYmmdd_HHMMSS>`` right after it claims the execution, so the session of an
++interrupted attempt is the unended ``cron_<job_id>_*`` row that started at/after the attempt's claim
++and before the next claim of the same job (or the recovery time). The upper bound keeps a newer live
++run of the same job out of the match.
++
++Everything here is best-effort: bounded by a timeout, never raises, logs once per failure.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++END_REASON = "cron_interrupted"
++# The session row is created a few ms after the claim; allow clock/rounding skew.
++_CLAIM_SKEW_SECONDS = 5.0
++# What a ledger/state.db/jobs.json read or write here can raise.
++_STORAGE_ERRORS = (sqlite3.Error, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError)
++DEFAULT_TIMEOUT_SECONDS = 15.0
++
++
++def _ts(value: Any) -> Optional[float]:
++    if not value:
++        return None
++    try:
++        return datetime.fromisoformat(str(value)).timestamp()
++    except (TypeError, ValueError):
++        return None
++
++
++def _job_title_base(job_id: str) -> str:
++    try:
++        from cron.jobs import get_job
++
++        job = get_job(job_id) or {}
++        name = str(job.get("name") or "").strip()
++    except _STORAGE_ERRORS as exc:  # jobs.json unreadable: the id-based title still works
++        logger.debug("cron interrupted-session: job %s lookup failed: %s", job_id, exc)
++        name = ""
++    return " ".join(name.split())[:60].strip() or f"cron {job_id}"
++
++
++def _fmt_when(started_at: float) -> str:
++    try:
++        from hermes_time import now as _hermes_now
++
++        tz = _hermes_now().tzinfo
++        return datetime.fromtimestamp(float(started_at), tz=tz).strftime("%b %d %H:%M")
++    except (ImportError, ValueError, OSError, OverflowError):
++        return datetime.fromtimestamp(float(started_at)).strftime("%b %d %H:%M")
++
++
++def _next_claims(job_ids: set[str]) -> dict[str, list[float]]:
++    """Every claim time per job, from the ledger (sorted)."""
++    from cron import executions
++
++    out: dict[str, list[float]] = {j: [] for j in job_ids}
++    if not job_ids:
++        return out
++    with executions._transaction() as conn:
++        marks = ",".join("?" for _ in job_ids)
++        for row in conn.execute(
++            f"SELECT job_id, claimed_at FROM executions WHERE job_id IN ({marks})", tuple(job_ids)
++        ):
++            ts = _ts(row["claimed_at"])
++            if ts is not None:
++                out[row["job_id"]].append(ts)
++    for v in out.values():
++        v.sort()
++    return out
++
++
++def _candidate_sessions(db, record: dict[str, Any], claims: list[float]) -> list[dict[str, Any]]:
++    job_id = str(record.get("job_id") or "")
++    claimed = _ts(record.get("claimed_at"))
++    if not job_id or claimed is None:
++        return []
++    upper = _ts(record.get("finished_at"))
++    later = [c for c in claims if c > claimed]
++    if later:
++        upper = min(later[0], upper) if upper is not None else later[0]
++    escaped = job_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
++    sql = (
++        "SELECT id, started_at, title FROM sessions "
++        "WHERE id LIKE ? ESCAPE '\\' AND ended_at IS NULL AND started_at >= ?"
++    )
++    params: list[Any] = [f"cron\\_{escaped}\\_%", claimed - _CLAIM_SKEW_SECONDS]
++    if upper is not None:
++        sql += " AND started_at < ?"
++        params.append(upper)
++    return [dict(r) for r in db._read_all(sql + " ORDER BY started_at", params)]
++
++
++def _title_interrupted(db, session_id: str, job_id: str, started_at: float) -> None:
++    base = f"{_job_title_base(job_id)} · {_fmt_when(started_at)} (interrupted)"
++    for title in (base, f"{base} {session_id[-6:]}"):
++        try:
++            if db.set_session_title(session_id, title):
++                return
++        except ValueError:  # title already used by another row: try the id-stamped one
++            continue
++
++
++def _end_one(db, sid: str) -> int:
++    ended = 0
++    targets = [sid]
++    try:
++        tip = db.get_compression_tip(sid)
++        if tip and tip != sid:
++            targets.append(tip)
++    except _STORAGE_ERRORS as exc:
++        logger.debug("cron interrupted-session: compression tip of %s failed: %s", sid, exc)
++    for target in targets:
++        row = db.get_session(target)
++        if row is None or row.get("ended_at") is not None:
++            continue
++        db.end_session(target, END_REASON)
++        ended += 1
++    return ended
++
++
++def _end_sessions_body(records: list[dict[str, Any]], db_path: Optional[Path]) -> int:
++    from hermes_state import SessionDB
++
++    claims = _next_claims({str(r.get("job_id")) for r in records if r.get("job_id")})
++    db = SessionDB(db_path=db_path)
++    ended = 0
++    try:
++        for record in records:
++            job_id = str(record.get("job_id") or "")
++            try:
++                for sess in _candidate_sessions(db, record, claims.get(job_id, [])):
++                    sid = sess["id"]
++                    if not sess.get("title"):
++                        _title_interrupted(db, sid, job_id, float(sess["started_at"]))
++                    n = _end_one(db, sid)
++                    if n:
++                        ended += n
++                        logger.info("Job '%s': ended interrupted cron session %s (execution %s)",
++                                    job_id, sid, record.get("id"))
++            except _STORAGE_ERRORS as exc:
++                logger.warning("Job '%s': could not end interrupted cron session for execution %s: %s",
++                               job_id, record.get("id"), " ".join(str(exc).split()))
++    finally:
++        try:
++            db.close()
++        except (sqlite3.Error, OSError) as exc:
++            logger.debug("cron interrupted-session: state.db close failed: %s", exc)
++    return ended
++
++
++def end_interrupted_cron_sessions(
++    records: Iterable[dict[str, Any]], *, db_path: Optional[Path] = None,
++    timeout_seconds: Optional[float] = DEFAULT_TIMEOUT_SECONDS,
++) -> int:
++    """Title (if untitled) and end the session rows of interrupted executions *records*.
++
++    Returns the number of session rows ended. Never raises; gives up after *timeout_seconds*
++    (``None``/``<=0`` runs inline) so a locked state.db cannot stall the scheduler tick.
++    """
++    recs = [dict(r) for r in records if r]
++    if not recs:
++        return 0
++    result: list[int] = []
++
++    def _runner() -> None:
++        try:
++            result.append(_end_sessions_body(recs, db_path))
++        except BaseException:  # health: allow BLE001 -- thread boundary: must never escape into the scheduler
++            logger.warning("cron interrupted-session cleanup failed", exc_info=True)
++
++    if not timeout_seconds or timeout_seconds <= 0:
++        _runner()
++        return result[0] if result else 0
++    from agent.memory_provider import spawn_context_thread
++
++    # Context-bound: a profile-scoped HERMES_HOME override must resolve the same state.db here.
++    worker = spawn_context_thread(_runner, name="cron-interrupted-sessions")
++    worker.start()
++    worker.join(timeout_seconds)
++    if worker.is_alive():
++        logger.warning("cron interrupted-session cleanup exceeded %.1fs; rows may stay unended until "
++                       "the next recovery", timeout_seconds)
++        return 0
++    return result[0] if result else 0
++
++
++def backfill_interrupted_cron_sessions(
++    *, days: float = 7.0, db_path: Optional[Path] = None,
++    timeout_seconds: Optional[float] = None,
++) -> int:
++    """One-shot repair: end the sessions of every ``unknown`` (interrupted) execution in the last
++    *days*. Safe to rerun; only unended rows are touched."""
++    from cron import executions
++
++    try:
++        cutoff = executions._hermes_now().timestamp() - days * 86400
++        with executions._transaction() as conn:
++            rows = [dict(r) for r in conn.execute(
++                "SELECT * FROM executions WHERE status='unknown'")]
++    except _STORAGE_ERRORS as exc:
++        logger.warning("cron interrupted-session backfill: ledger read failed: %s", exc)
++        return 0
++    rows = [r for r in rows if (_ts(r.get("claimed_at")) or 0) >= cutoff]
++    return end_interrupted_cron_sessions(rows, db_path=db_path, timeout_seconds=timeout_seconds)
+diff --git a/tests/cron/test_interrupted_cron_session_end.py b/tests/cron/test_interrupted_cron_session_end.py
+new file mode 100644
+index 0000000000..71006eac7e
+--- /dev/null
++++ b/tests/cron/test_interrupted_cron_session_end.py
+@@ -0,0 +1,163 @@
++"""A cron run killed mid-turn must not leave its state.db session row unended forever.
++
++The owner process dies before ``_finalize_cron_session`` runs (gateway restart); the next process's
++``recover_interrupted_executions`` marks the ledger row ``unknown`` and must also title + end the
++session row (end_reason ``cron_interrupted``), without touching a newer live run of the same job.
++"""
++
++from __future__ import annotations
++
++from datetime import datetime
++
++import pytest
++
++
++@pytest.fixture
++def env(monkeypatch, tmp_path):
++    from cron import executions
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
++    import hermes_state
++    from hermes_state import SessionDB
++
++    # Production code opens the default state.db: point it at this test's file.
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
++    db = SessionDB(db_path=tmp_path / "state.db")
++    yield executions, db, tmp_path
++    db.close()
++
++
++def _session_for(db, execution, job_id, *, offset=0.0, suffix="000001"):
++    sid = f"cron_{job_id}_20261029_{suffix}"
++    db.create_session(sid, source="cron")
++    started = datetime.fromisoformat(execution["claimed_at"]).timestamp() + offset
++    db._execute_write(lambda c: c.execute("UPDATE sessions SET started_at=? WHERE id=?", (started, sid)))
++    return sid
++
++
++def _kill_owner(monkeypatch, executions):
++    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-gateway")
++    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started: False)
++
++
++def test_recovery_ends_and_titles_interrupted_session(monkeypatch, env):
++    executions, db, _ = env
++    rec = executions.create_execution("job1", source="builtin")
++    executions.mark_execution_running(rec["id"])
++    sid = _session_for(db, rec, "job1")
++    _kill_owner(monkeypatch, executions)
++
++    assert executions.recover_interrupted_executions() == 1
++
++    row = db.get_session(sid)
++    assert row["ended_at"] is not None
++    assert row["end_reason"] == "cron_interrupted"
++    assert row["title"] and row["title"].endswith("(interrupted)")
++    assert row["title"].startswith("cron job1 · ")
++
++
++def test_recovery_keeps_existing_title_and_uses_job_name(monkeypatch, env):
++    executions, db, _ = env
++    monkeypatch.setattr("cron.jobs.get_job", lambda jid: {"id": jid, "name": "x reply discovery"})
++    rec = executions.create_execution("job2", source="builtin")
++    executions.mark_execution_running(rec["id"])
++    titled = _session_for(db, rec, "job2")
++    db.set_session_title(titled, "already titled")
++    _kill_owner(monkeypatch, executions)
++
++    executions.recover_interrupted_executions()
++
++    row = db.get_session(titled)
++    assert row["title"] == "already titled"
++    assert row["end_reason"] == "cron_interrupted"
++
++
++def test_recovery_does_not_end_a_newer_live_run_of_the_same_job(monkeypatch, env):
++    executions, db, _ = env
++    old = executions.create_execution("job3", source="builtin")
++    executions.mark_execution_running(old["id"])
++    old_sid = _session_for(db, old, "job3", suffix="000001")
++    _kill_owner(monkeypatch, executions)
++    # The replacement process already claimed and started the next run of the same job.
++    new = executions.create_execution("job3", source="builtin")
++    executions.mark_execution_running(new["id"])
++    new_sid = _session_for(db, new, "job3", suffix="000002")
++
++    assert executions.recover_interrupted_executions() == 1
++
++    assert db.get_session(old_sid)["end_reason"] == "cron_interrupted"
++    live = db.get_session(new_sid)
++    assert live["ended_at"] is None and live["title"] is None
++
++
++def test_terminalize_dead_owner_ends_session(monkeypatch, env):
++    executions, db, _ = env
++    rec = executions.create_execution("job4", source="builtin")
++    executions.mark_execution_running(rec["id"])
++    sid = _session_for(db, rec, "job4")
++    _kill_owner(monkeypatch, executions)
++
++    assert executions.terminalize_dead_owner(rec["id"], reason="worker exited 137") is True
++    assert db.get_session(sid)["end_reason"] == "cron_interrupted"
++
++
++def test_session_cleanup_failure_never_breaks_recovery(monkeypatch, env):
++    executions, _db, _ = env
++    rec = executions.create_execution("job5", source="builtin")
++    executions.mark_execution_running(rec["id"])
++    _kill_owner(monkeypatch, executions)
++    import cron.interrupted_sessions as mod
++
++    def _boom(*_a, **_k):
++        raise RuntimeError("database is locked")
++
++    monkeypatch.setattr(mod, "_end_sessions_body", _boom)
++
++    assert executions.recover_interrupted_executions() == 1
++    assert executions.get_execution(rec["id"])["status"] == "unknown"
++
++
++def test_backfill_ends_sessions_of_already_recovered_executions(monkeypatch, env):
++    executions, db, _ = env
++    rec = executions.create_execution("job6", source="builtin")
++    executions.mark_execution_running(rec["id"])
++    sid = _session_for(db, rec, "job6")
++    _kill_owner(monkeypatch, executions)
++    import cron.interrupted_sessions as mod
++
++    # Simulate the pre-fix recovery: ledger marked unknown, session left open.
++    monkeypatch.setattr(mod, "end_interrupted_cron_sessions", lambda *a, **k: 0)
++    executions.recover_interrupted_executions()
++    assert db.get_session(sid)["ended_at"] is None
++    monkeypatch.undo()
++    monkeypatch.setattr(executions, "EXECUTIONS_FILE", env[2] / "cron" / "executions.db")
++    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", env[2] / "state.db")
++
++    assert mod.backfill_interrupted_cron_sessions(days=1) == 1
++    assert db.get_session(sid)["end_reason"] == "cron_interrupted"
++    assert mod.backfill_interrupted_cron_sessions(days=1) == 0
++
++
++def test_cleanup_thread_keeps_profile_scoped_hermes_home(monkeypatch, tmp_path):
++    """The bounded worker thread must open the state.db of the caller's (context-local) home."""
++    from cron import executions
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    import hermes_state
++    from hermes_state import SessionDB
++
++    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
++    # Default path resolves from get_hermes_home() (the context-local override), not a pinned file.
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
++    token = set_hermes_home_override(tmp_path)
++    try:
++        db = SessionDB(db_path=tmp_path / "state.db")
++        rec = executions.create_execution("job7", source="builtin")
++        executions.mark_execution_running(rec["id"])
++        sid = _session_for(db, rec, "job7")
++        _kill_owner(monkeypatch, executions)
++        assert executions.recover_interrupted_executions() == 1
++        assert db.get_session(sid)["end_reason"] == "cron_interrupted"
++        db.close()
++    finally:
++        reset_hermes_home_override(token)
+-- 
+2.55.0
+

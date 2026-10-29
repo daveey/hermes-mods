@@ -18,7 +18,7 @@ shell root) with the lines as `details`:
 
 - **Core Kanban check**: the row's own `kanban_active` + `kanban_blocked` counts (the backend sums them over the
   compression lineage, so they match the sidebar badge; see [kanban-session-links.md](kanban-session-links.md)).
-  Fresh evidence needs no extra request. Patch **0383** refreshes missing, expired or unknown evidence before warning: it captures the row owner (omitted connection = registry primary), walks ancestry and queries `/api/session-kanban-tasks` with that connection/profile pinned. The whole refresh is bounded to 2.5 seconds. Read failures, malformed ancestry/task responses, stale replicas and unknown obligations remain uncertain; a successful empty answer archives without a spurious task warning.
+  Fresh evidence needs no extra request. Patch **0389** refreshes missing, expired or unknown evidence before warning: it captures the row owner (omitted connection = registry primary), walks ancestry and queries `/api/session-kanban-tasks` with that connection/profile pinned. The whole refresh is bounded to 2.5 seconds. Read failures, malformed ancestry/task responses, stale replicas and unknown obligations remain uncertain; a successful empty answer archives without a spurious task warning.
 - **Plugin guards**: new `ctx.registerArchiveGuard(guard)` on the plugin context. The guard receives
   `{ sessionId, session, ids, profile, connectionId }` (the row's owning gateway, so cross-gateway rows are
   checked on their own gateway). Guards run in parallel. Each is capped at 2.5 s, and one that throws or times out
@@ -57,7 +57,7 @@ Plugin: `node --test desktop-plugins/session-tasks/test/projections.test.mjs`.
 the kanban-session-links patches, or the Kanban line never shows). Then rebuild Desktop. The session-tasks plugin
 hot-reloads, but its guard only takes effect once the rebuilt Desktop provides `registerArchiveGuard`.
 
-## Regression diagnosis and verification (0383)
+## Regression diagnosis and verification (0389)
 
 Two independent defects produced similar warnings: the session-tasks plugin rejected an omitted archive connection before issuing REST, despite the guard contract defining it as registry primary; core classified expired sidebar observations as unknown without attempting a new read. Existing tests supplied resolved owners or tested only the conservative failure branch, not successful revalidation. The plugin now resolves primary through the SDK registry and pins the inventory profile; it never substitutes the active gateway. Dialog copy in all existing locale overlays describes a status check, not proof of linked work.
 
@@ -83,10 +83,10 @@ These are automated client tests, not proof that a running Desktop bundle has lo
 which misses the hotkey and tile menu and breaks on markup changes. The core part is a small generic guard API,
 and the data-specific check (machines) stays in a plugin.
 
-## Follow-up patch (0560)
+## Follow-up patch (0561)
 
-**0560** (source `5c653ed500`): the archive hotkey and tile menu archive without a selected row and resolved the owner from Recents only. While a remote gateway's pooled backend reconnects, the unified list has none of its rows, so an open hub chat had no owner and the preflight showed "Task status unavailable" for a chat with nothing linked. The owner is now resolved like resume and branch do (tagged project-tree/cron/messaging row, else the owner hint) in `archive-owner.ts`, and `refresh-archive-tasks.ts` logs why the task preflight returned unknown. Tests: `archive-linked-confirm.test.tsx` (new cases).
+**0561** (source `5c653ed500`): the archive hotkey and tile menu archive without a selected row and resolved the owner from Recents only. While a remote gateway's pooled backend reconnects, the unified list has none of its rows, so an open hub chat had no owner and the preflight showed "Task status unavailable" for a chat with nothing linked. The owner is now resolved like resume and branch do (tagged project-tree/cron/messaging row, else the owner hint) in `archive-owner.ts`, and `refresh-archive-tasks.ts` logs why the task preflight returned unknown. Tests: `archive-linked-confirm.test.tsx` (new cases).
 
-## Follow-up patches (0617)
+## Follow-up patches (0615)
 
-**0617** (`dd4f150218`): the archive preflight read Kanban task status with 2 s per read / 2.5 s overall and reported "task status unknown" whenever the backend was slower. Reads now allow 6 s, retry once on a timeout, within a 14 s budget. Code: `apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts`; test: `confirm-linked-archive.test.ts`.
+**0615** (`dd4f150218`): the archive preflight read Kanban task status with 2 s per read / 2.5 s overall and reported "task status unknown" whenever the backend was slower. Reads now allow 6 s, retry once on a timeout, within a 14 s budget. Code: `apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts`; test: `confirm-linked-archive.test.ts`.

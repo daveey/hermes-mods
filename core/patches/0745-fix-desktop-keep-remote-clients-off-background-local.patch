@@ -1,0 +1,729 @@
+From 4c17b356e9d72009dfcdb7693b35e26e34ddf10f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:27:03 -0700
+Subject: [PATCH] fix(desktop): keep remote clients off background local spawns
+ [daveey] (#149)
+
+---
+ .../electron/backend-dial-claim.test.ts       | 22 +++++-
+ apps/desktop/electron/backend-dial-claim.ts   | 14 +++-
+ .../electron/connection-registry-view.test.ts | 16 +++++
+ .../electron/connection-registry-view.ts      | 20 ++++++
+ .../electron/desktop-remote-route.test.ts     |  4 +-
+ apps/desktop/electron/desktop-remote-route.ts |  9 ++-
+ .../electron/environment-registry.test.ts     | 54 +++++++++++++++
+ apps/desktop/electron/environment-registry.ts | 69 +++++++++++++++++++
+ apps/desktop/electron/main.ts                 | 62 ++++++++---------
+ apps/desktop/src/api/plugins.test.ts          |  2 +
+ apps/desktop/src/api/plugins.ts               |  3 +
+ apps/desktop/src/store/hub-sync.test.ts       | 12 ++++
+ apps/desktop/src/store/hub-sync.ts            |  1 +
+ .../src/store/project-tree-background.ts      | 34 +++++++++
+ .../src/store/projects-hub-replica.test.ts    | 20 ++++++
+ apps/desktop/src/store/projects.ts            | 32 +--------
+ 16 files changed, 307 insertions(+), 67 deletions(-)
+ create mode 100644 apps/desktop/electron/connection-registry-view.test.ts
+ create mode 100644 apps/desktop/electron/connection-registry-view.ts
+ create mode 100644 apps/desktop/electron/environment-registry.test.ts
+ create mode 100644 apps/desktop/electron/environment-registry.ts
+ create mode 100644 apps/desktop/src/store/project-tree-background.ts
+
+diff --git a/apps/desktop/electron/backend-dial-claim.test.ts b/apps/desktop/electron/backend-dial-claim.test.ts
+index 72c6b55cb2..24e68183e2 100644
+--- a/apps/desktop/electron/backend-dial-claim.test.ts
++++ b/apps/desktop/electron/backend-dial-claim.test.ts
+@@ -1,10 +1,30 @@
+ import { describe, expect, it, vi } from 'vitest'
+ 
+-import { BackendDialClaims } from './backend-dial-claim'
++import { backendDialClaimKey, BackendDialClaims } from './backend-dial-claim'
+ import { backendScopeKey, parseBackendScopeKey } from './connection-registry'
+ import { resolveDesktopConnectionRequest } from './desktop-profile'
+ 
+ describe('BackendDialClaims (#90812)', () => {
++  it.each([null, 'local'] as const)('does not substitute explicit local and primary descriptors (first: %s)', async firstId => {
++    const claims = new BackendDialClaims()
++    let finish!: (value: string) => void
++    const first = claims.run(backendDialClaimKey(firstId, 'default'), () => new Promise<string>(resolve => { finish = resolve }))
++    const secondId = firstId === null ? 'local' : null
++    const secondDial = vi.fn(async () => secondId === 'local' ? 'local' : 'remote')
++    const second = claims.run(backendDialClaimKey(secondId, 'default'), secondDial)
++    finish(firstId === 'local' ? 'local' : 'remote')
++    expect(await first).toBe(firstId === 'local' ? 'local' : 'remote')
++    expect(await second).toBe(secondId === 'local' ? 'local' : 'remote')
++    expect(secondDial).toHaveBeenCalledOnce()
++  })
++
++  it('normalizes equivalent explicit local dials without changing pool keys', () => {
++    expect(backendDialClaimKey('local', null)).toBe(backendDialClaimKey('local', 'default'))
++    expect(backendDialClaimKey(undefined, null)).toBe(backendDialClaimKey(null, 'default'))
++    expect(backendDialClaimKey('office', 'work')).toBe(backendScopeKey('office', 'work'))
++    expect(backendScopeKey('local', 'default')).toBe('default')
++  })
++
+   it('coalesces two concurrent dials for the same (connectionId, profile) onto ONE backend spawn', async () => {
+     const claims = new BackendDialClaims()
+     let spawns = 0
+diff --git a/apps/desktop/electron/backend-dial-claim.ts b/apps/desktop/electron/backend-dial-claim.ts
+index e71ffe5f4e..4115f4c41c 100644
+--- a/apps/desktop/electron/backend-dial-claim.ts
++++ b/apps/desktop/electron/backend-dial-claim.ts
+@@ -1,8 +1,18 @@
++import { backendScopeKey } from './connection-registry'
++
++/** An omitted owner follows primary routing; explicit local must never join it. */
++export function backendDialClaimKey(connectionId: null | string | undefined, profile: null | string | undefined): string {
++  const id = String(connectionId ?? '').trim()
++
++  return id === 'local' ? `conn:local::${String(profile ?? '').trim() || 'default'}` : backendScopeKey(id, profile)
++}
++
+ /**
+  * backend-dial-claim.ts
+  *
+- * Single-owner reconnect/dial claim for backend spawns, keyed by the pool
+- * scope key from backendScopeKey(connectionId, profile) (#90812).
++ * Single-owner reconnect/dial claim for backend spawns, keyed by
++ * backendDialClaimKey(connectionId, profile). Unlike pool scope, an omitted
++ * connection can resolve remotely and must not alias an explicit local dial.
+  *
+  * Why this exists: reconnectGateway()'s in-flight lock lives at renderer
+  * module scope, so it only dedupes reconnects INSIDE one window. Two windows
+diff --git a/apps/desktop/electron/connection-registry-view.test.ts b/apps/desktop/electron/connection-registry-view.test.ts
+new file mode 100644
+index 0000000000..ac7f0153d3
+--- /dev/null
++++ b/apps/desktop/electron/connection-registry-view.test.ts
+@@ -0,0 +1,16 @@
++import { expect, test } from 'vitest'
++
++import { createRegistryConnectionSanitizer } from './connection-registry-view'
++
++test('renderer view removes credential envelopes and header values and preserves display metadata', () => {
++  const sanitize = createRegistryConnectionSanitizer({
++    decrypt: token => token ? 'synthetic-secret' : '',
++    preview: token => token ? 'synthetic…' : null,
++    installId: id => id === 'env' ? 'installation' : undefined
++  })
++
++  expect(sanitize({id:'env',label:'Environment gateway',token:{value:'secret'},headers:{Authorization:'header-secret'}})).toEqual({
++    id:'env',label:'Environment gateway',installId:'installation',tokenSet:true,tokenPreview:'synthetic…',headerNames:['Authorization']
++  })
++  expect(sanitize({id:'local',kind:'local'})).toEqual({id:'local',kind:'local',tokenSet:false,tokenPreview:null,headerNames:[]})
++})
+diff --git a/apps/desktop/electron/connection-registry-view.ts b/apps/desktop/electron/connection-registry-view.ts
+new file mode 100644
+index 0000000000..ab49d73f08
+--- /dev/null
++++ b/apps/desktop/electron/connection-registry-view.ts
+@@ -0,0 +1,20 @@
++export function createRegistryConnectionSanitizer(deps: {
++  decrypt: (token: unknown) => string
++  preview: (token: string) => string | null
++  installId: (id: string) => string | undefined
++}) {
++  return (entry: Record<string, any>) => {
++    const { token, headers, ...rest } = entry
++    const decrypted = deps.decrypt(token)
++    const knownInstallId = deps.installId(entry.id)
++
++    return {
++      ...rest,
++      tokenSet: Boolean(decrypted),
++      tokenPreview: deps.preview(decrypted),
++      ...(knownInstallId ? { installId: knownInstallId } : {}),
++      // Header values and token envelopes never cross the renderer IPC boundary.
++      headerNames: headers && typeof headers === 'object' ? Object.keys(headers) : []
++    }
++  }
++}
+diff --git a/apps/desktop/electron/desktop-remote-route.test.ts b/apps/desktop/electron/desktop-remote-route.test.ts
+index 2d687133f5..566c5c70cb 100644
+--- a/apps/desktop/electron/desktop-remote-route.test.ts
++++ b/apps/desktop/electron/desktop-remote-route.test.ts
+@@ -39,7 +39,7 @@ test('profile remote wins precedence and carries one exact registry id', () => {
+   assert.equal(route?.connectionId, 'worker')
+ })
+ 
+-test('environment route wins over global but never claims a registry id', () => {
++test('environment route claims only the exact registry primary envelope', () => {
+   const route = resolveDesktopRemoteRoute({
+     config: { mode: 'remote', remote: { url: 'https://global.test', token: tokenB } },
+     env: { url: 'https://env.test', token: 'token-a' },
+@@ -47,7 +47,7 @@ test('environment route wins over global but never claims a registry id', () =>
+   })
+ 
+   assert.equal(route?.source, 'env')
+-  assert.equal(route?.connectionId, undefined)
++  assert.equal(route?.connectionId, 'env')
+   assert.equal(route?.kind === 'remote' ? route.url : null, 'https://env.test')
+ })
+ 
+diff --git a/apps/desktop/electron/desktop-remote-route.ts b/apps/desktop/electron/desktop-remote-route.ts
+index f54299c6d1..dae142b1a7 100644
+--- a/apps/desktop/electron/desktop-remote-route.ts
++++ b/apps/desktop/electron/desktop-remote-route.ts
+@@ -130,7 +130,14 @@ export function resolveDesktopRemoteRoute({
+       )
+     }
+ 
+-    return { authMode: 'token', kind: 'remote', source: 'env', token: envToken, url: envUrl }
++    return withConnectionId(
++      { authMode: 'token' as const, kind: 'remote' as const, source: 'env' as const, token: envToken, url: envUrl },
++      matchingConnectionId(
++        registry,
++        { authMode: 'token', kind: 'remote', token: { encoding: 'plain', value: envToken }, url: envUrl },
++        'primary'
++      )
++    )
+   }
+ 
+   if (config.mode === 'ssh') {
+diff --git a/apps/desktop/electron/environment-registry.test.ts b/apps/desktop/electron/environment-registry.test.ts
+new file mode 100644
+index 0000000000..6c31e0879d
+--- /dev/null
++++ b/apps/desktop/electron/environment-registry.test.ts
+@@ -0,0 +1,54 @@
++import assert from 'node:assert/strict'
++
++import { test } from 'vitest'
++
++import { normalizeRegistry, resolveRegistryLocalRoute, reuseMatchingPrimaryRemoteBackend } from './connection-registry'
++import { resolveDesktopRemoteRoute } from './desktop-remote-route'
++import { EnvironmentRegistry } from './environment-registry'
++
++const env = { url: 'https://env.test', token: 'process-only-token' }
++
++test('env primary has an owner and registry requests reuse it without a local spawn', async () => {
++  const stored = normalizeRegistry(null)
++  const overlay = new EnvironmentRegistry(env)
++  const registry = overlay.read(stored)
++  assert.equal(overlay.read(stored), registry)
++  const route = resolveDesktopRemoteRoute({ config: { mode: 'local' }, env, registry })
++  assert.equal(route?.connectionId, registry.primary)
++
++  const reused = await reuseMatchingPrimaryRemoteBackend({
++    registry,
++    connectionId: registry.primary,
++    source: registry.connections.find(c => c.id === registry.primary)!,
++    profile: 'research',
++    ensurePrimary: async () => ({ mode: 'remote', connectionId: route?.connectionId })
++  })
++
++  assert.equal(reused?.sharedRemote, true)
++  assert.equal(reused?.profile, 'research')
++  assert.equal(resolveRegistryLocalRoute('default', { globalRemote: true }).delegate, false)
++})
++
++test('env selection and credentials never persist, but saved source edits survive', () => {
++  const stored = normalizeRegistry({ primary: 'saved', lastUsed: 'saved', connections: [
++    { id: 'saved', kind: 'remote', label: 'Saved', url: 'https://saved.test' },
++    { id: 'environment-gateway', kind: 'remote', label: 'Existing', url: 'https://existing.test' }
++  ] })
++
++  const overlay = new EnvironmentRegistry(env)
++  const registry = overlay.read(stored)
++  assert.notEqual(registry.primary, 'environment-gateway')
++
++  const next = { ...registry, lastUsed: registry.primary, connections: registry.connections.map(c =>
++    c.id === 'saved' ? { ...c, label: 'Renamed' } : c) }
++
++  const persisted = overlay.stored(next, stored)
++  assert.equal(persisted.primary, 'saved')
++  assert.equal(persisted.lastUsed, 'saved')
++  assert.equal(persisted.connections.find(c => c.id === 'saved')?.label, 'Renamed')
++  assert.equal(JSON.stringify(persisted).includes(env.token), false)
++  assert.equal(JSON.stringify(persisted).includes(env.url), false)
++  assert.throws(() => overlay.assertEditable(registry.primary), /environment/)
++  overlay.assertEditable('local')
++  assert.equal(new EnvironmentRegistry({}).read(persisted), persisted)
++})
+diff --git a/apps/desktop/electron/environment-registry.ts b/apps/desktop/electron/environment-registry.ts
+new file mode 100644
+index 0000000000..51aab3ebae
+--- /dev/null
++++ b/apps/desktop/electron/environment-registry.ts
+@@ -0,0 +1,69 @@
++import { connectionIdForLabel, type ConnectionRegistry } from './connection-registry'
++
++/** The env route is a process-local source, never a saved gateway or credential. */
++export class EnvironmentRegistry {
++  private views = new WeakMap<ConnectionRegistry, ConnectionRegistry>()
++  private environmentId: string | null = null
++
++  constructor(private readonly env: { url?: string; token?: string }) {}
++
++  read(stored: ConnectionRegistry): ConnectionRegistry {
++    const url = String(this.env.url || '').trim()
++
++    if (!url) {
++      return stored
++    }
++
++    const cached = this.views.get(stored)
++
++    if (cached) {
++      return cached
++    }
++
++    const id = connectionIdForLabel('Environment gateway', stored.connections.map(c => c.id))
++
++    const view: ConnectionRegistry = {
++      ...stored,
++      primary: id,
++      lastUsed: id,
++      connections: [
++        ...stored.connections,
++        {
++          id,
++          kind: 'remote',
++          label: 'Environment gateway',
++          url,
++          authMode: 'token',
++          token: { encoding: 'plain', value: String(this.env.token || '').trim() }
++        }
++      ]
++    }
++
++    this.environmentId = id
++    this.views.set(stored, view)
++
++    return view
++  }
++
++  /** Keep edits to saved sources, but never persist the env source or its selection. */
++  stored(next: ConnectionRegistry, previous: ConnectionRegistry): ConnectionRegistry {
++    const id = this.environmentId
++
++    if (!id) {
++      return next
++    }
++
++    return {
++      ...next,
++      connections: next.connections.filter(c => c.id !== id),
++      primary: next.primary === id ? previous.primary : next.primary,
++      lastUsed: next.lastUsed === id ? previous.lastUsed : next.lastUsed
++    }
++  }
++
++  assertEditable(id: unknown): void {
++    if (this.environmentId && id === this.environmentId) {
++      throw new Error('This gateway is configured by HERMES_DESKTOP_REMOTE_URL; change the environment to edit it.')
++    }
++  }
++}
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index ea94dc2220..dd567bb98c 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -72,7 +72,7 @@ import {
+ } from './backend-claim'
+ import { dashboardFallbackArgs, serveBackendArgs } from './backend-command'
+ import { createBackendConnectionState } from './backend-connection-state'
+-import { BackendDialClaims } from './backend-dial-claim'
++import { backendDialClaimKey, BackendDialClaims } from './backend-dial-claim'
+ import type { HostBackendRecord } from './backend-discovery'
+ import { buildDesktopBackendEnv, pooledProfileBackendEnv, profileBackendParentEnv } from './backend-env'
+ import { createBackendExitRecoveryLatch } from './backend-exit-recovery'
+@@ -214,6 +214,7 @@ import {
+ } from './connection-registry'
+ import type { RegistryConnection } from './connection-registry'
+ import type { RosterProfileMetadata } from './connection-registry'
++import { createRegistryConnectionSanitizer } from './connection-registry-view'
+ import { liveWindowState, overlayWindowState } from './connection-window-state'
+ import { describeCrashReason, installCrashForensics } from './crash-forensics'
+ import {
+@@ -251,6 +252,7 @@ import { decodeResponseBody, displayTranscriptHeaders } from './display-transcri
+ import { preReadyDockLaunchSteps } from './dock-launch-order'
+ import { embedHostOrigin } from './embed-host'
+ import { installEmbedReferer } from './embed-referer'
++import { EnvironmentRegistry } from './environment-registry'
+ import { createAmbientClaimArbiter } from './event-dedupe'
+ import { openExternalUrl as externalOpen, type ExternalOpenDeps, reportPreOpenStatFailure } from './external-open'
+ import {
+@@ -1951,7 +1953,7 @@ function registerMediaProtocol(): void {
+     // reconnect dial for the same (connectionId, profile) scope; coalescing
+     // here avoids bootstrapping a second SSH tunnel / remote dashboard.
+     resolveRemoteConnection: ({ connectionId, profile }) =>
+-      backendDialClaims.run(backendScopeKey(connectionId, profile), () =>
++      backendDialClaims.run(backendDialClaimKey(connectionId, profile), () =>
+         connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
+       )
+   })
+@@ -8975,7 +8977,16 @@ function writeDesktopConnectionConfig(config) {
+  * user who registered nothing and then pointed Settings -> Gateway at a remote,
+  * and until that heals, every launch re-homes them onto a local backend.
+  */
++const environmentRegistry = new EnvironmentRegistry({
++  url: process.env.HERMES_DESKTOP_REMOTE_URL,
++  token: process.env.HERMES_DESKTOP_REMOTE_TOKEN
++})
++
+ function readDesktopConnectionsRegistry() {
++  return environmentRegistry.read(readStoredDesktopConnectionsRegistry())
++}
++
++function readStoredDesktopConnectionsRegistry() {
+   let mtime = null
+ 
+   try {
+@@ -9086,6 +9097,7 @@ function preserveCorruptRegistrySidecar() {
+ }
+ 
+ function writeDesktopConnectionsRegistry(registry) {
++  registry = environmentRegistry.stored(registry, connectionRegistryCache || registry)
+   fs.mkdirSync(path.dirname(DESKTOP_CONNECTIONS_REGISTRY_PATH), { recursive: true })
+   // Owner-only for the same reason as connection.json: entries carry
+   // safeStorage-encrypted tokens plus URLs and SSH host/user/keyPath.
+@@ -9099,25 +9111,11 @@ function writeDesktopConnectionsRegistry(registry) {
+  * boundary — the renderer gets a preview + set flag, mirroring
+  * sanitizeDesktopConnectionConfig.
+  */
+-function sanitizeRegistryConnection(entry) {
+-  const { token, headers, ...rest } = entry
+-  const decrypted = decryptDesktopSecret(token)
+-  // Last-known stable backend identity (from roster enumeration / Test) so
+-  // Settings can hint "Same backend as <label>" on connections that are two
+-  // addresses for one box. Display-only; absent until a probe has seen it.
+-  const knownInstallId = connectionInstallIds.get(entry.id)?.id
+-
+-  return {
+-    ...rest,
+-    tokenSet: Boolean(decrypted),
+-    tokenPreview: tokenPreview(decrypted),
+-    ...(knownInstallId ? { installId: knownInstallId } : {}),
+-    // Header VALUES are secrets (Cloudflare Access client secrets etc.) and
+-    // never cross the IPC boundary — the renderer only needs the names to
+-    // render the edit form.
+-    headerNames: headers && typeof headers === 'object' ? Object.keys(headers) : []
+-  }
+-}
++const sanitizeRegistryConnection = createRegistryConnectionSanitizer({
++  decrypt: decryptDesktopSecret,
++  preview: tokenPreview,
++  installId: id => connectionInstallIds.get(id)?.id
++})
+ 
+ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()) {
+   // Same keyring signal the v1 sanitize exposes: lets the Connections panel
+@@ -9155,6 +9153,7 @@ function sanitizeConnectionsRegistry(registry = readDesktopConnectionsRegistry()
+  * (normalizeConnectionInput drops tokens on non-token entries).
+  */
+ async function saveRegistryConnection(input: any = {}) {
++  environmentRegistry.assertEditable(input.id)
+   const registry = readDesktopConnectionsRegistry()
+   const existing = input.id ? registry.connections.find(c => c.id === input.id) : null
+   const incomingToken = typeof input.token === 'string' ? input.token.trim() : ''
+@@ -9973,14 +9972,14 @@ async function ensureTerminalBackend(webContentsId: number) {
+   // reconnect dial for the same (connectionId, profile) scope; coalescing
+   // here avoids bootstrapping a second SSH tunnel / remote dashboard.
+   if (windowRoute?.registryScoped && windowRoute.connectionId) {
+-    return backendDialClaims.run(backendScopeKey(windowRoute.connectionId, windowRoute.profile), () =>
++    return backendDialClaims.run(backendDialClaimKey(windowRoute.connectionId, windowRoute.profile), () =>
+       ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)
+     )
+   }
+ 
+   const profile = windowRoute?.profile ?? primaryProfileKey()
+ 
+-  return backendDialClaims.run(backendScopeKey(null, profile), () => ensureBackend(profile))
++  return backendDialClaims.run(backendDialClaimKey(null, profile), () => ensureBackend(profile))
+ }
+ 
+ // Loopback reach for the browser pane. Scoped to the SSH connection that
+@@ -15600,7 +15599,7 @@ async function connectDesktopProfileRoute(
+   let connection
+ 
+   try {
+-    connection = await backendDialClaims.run(scopeKey, () =>
++    connection = await backendDialClaims.run(backendDialClaimKey(route.connectionId, route.profile), () =>
+       route.connectionId
+         ? ensureRegistryBackend(route.connectionId, route.profile, '', { spawnPriority })
+         : ensureBackend(route.profile, { spawnPriority })
+@@ -15749,7 +15748,7 @@ function revalidatePool() {
+ function redialPoolBackendAfterResume(poolKey: string) {
+   const { connectionId, profile } = parseBackendScopeKey(poolKey)
+ 
+-  return backendDialClaims.run(poolKey, () =>
++  return backendDialClaims.run(backendDialClaimKey(connectionId, profile), () =>
+     connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
+   )
+ }
+@@ -16113,7 +16112,7 @@ ipcMain.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) =
+   // Roster enumeration deliberately does not dial connect-on-demand SSH
+   // sources. Publish one credential-free seed route so a plugin can be the
+   // first caller that opens the tunnel.
+-  const sshSeeds = undialedSshRouteSeeds(agents, registry.connections)
++  const sshSeeds = undialedSshRouteSeeds(agents, registry.connections.map(source => ({ ...source })))
+ 
+   if (sshSeeds.length > 0) {
+     agents = [
+@@ -16166,7 +16165,7 @@ ipcMain.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) =
+   return buildRegistryProfileRoutes({
+     agents,
+     primaryConnectionId: registry.primary,
+-    sources: registry.connections
++    sources: registry.connections.map(source => ({ ...source }))
+   })
+ })
+ ipcMain.handle('hermes:ssh-config:hosts', async () => ({ hosts: collectSshConfigHosts() }))
+@@ -16238,6 +16237,7 @@ ipcMain.handle('hermes:connections:save', async (_event, payload) => {
+   return { ok: true, connection: saved, registry: sanitizeConnectionsRegistry() }
+ })
+ ipcMain.handle('hermes:connections:remove', async (_event, id) => {
++  environmentRegistry.assertEditable(id)
+   const key = String(id || '')
+   managedConnectionUpdateGate.assertCanMutate(key)
+   const registry = removeConnection(readDesktopConnectionsRegistry(), key)
+@@ -16557,7 +16557,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
+             // bootstrapping a second SSH tunnel / remote dashboard.
+             const descriptor: any = await withEnumerationDeadline(
+               Promise.resolve(
+-                backendDialClaims.run(backendScopeKey(connection.id, null), () =>
++                backendDialClaims.run(backendDialClaimKey(connection.id, null), () =>
+                   ensureRegistryBackend(connection.id, null)
+                 )
+               ),
+@@ -16798,7 +16798,7 @@ ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
+ 
+         // Claim-guarded (#90812): coalesce with a concurrent renderer dial
+         // for the same connection instead of bootstrapping a second backend.
+-        const descriptor: any = await backendDialClaims.run(backendScopeKey(connection.id, null), () =>
++        const descriptor: any = await backendDialClaims.run(backendDialClaimKey(connection.id, null), () =>
+           ensureRegistryBackend(connection.id, null)
+         )
+ 
+@@ -17638,7 +17638,7 @@ async function dispatchRegistryApiRequest(
+ 
+   const connection: any = request?.passive
+     ? await ensureRegistryBackend(registryConnectionId, routeProfile, '', { passive: true })
+-    : await backendDialClaims.run(backendScopeKey(registryConnectionId, routeProfile), () =>
++    : await backendDialClaims.run(backendDialClaimKey(registryConnectionId, routeProfile), () =>
+         ensureRegistryBackend(registryConnectionId, routeProfile, '', { spawnPriority })
+       )
+ 
+@@ -19555,7 +19555,7 @@ app.whenReady().then(() => {
+   try {
+     transcriptCacheHost = installTranscriptCache({
+       backendFor: (connectionId, { passive }) =>
+-        backendDialClaims.run(backendScopeKey(connectionId, null), () =>
++        backendDialClaims.run(backendDialClaimKey(connectionId, null), () =>
+           ensureRegistryBackend(connectionId, null, '', { passive })
+         ),
+       getJson: (descriptor, requestPath, opts) => getJsonForBackend(descriptor, requestPath, opts),
+diff --git a/apps/desktop/src/api/plugins.test.ts b/apps/desktop/src/api/plugins.test.ts
+index 75c17d3acb..704002d00c 100644
+--- a/apps/desktop/src/api/plugins.test.ts
++++ b/apps/desktop/src/api/plugins.test.ts
+@@ -13,6 +13,8 @@ describe('plugin REST qualified owner', () => {
+   })
+ 
+   it.each([
++    { opts: { connectionId: 'local', passive: true }, expected: { connectionId: 'local', passive: true } },
++    { opts: { connectionId: 'local', passive: false }, expected: { connectionId: 'local' } },
+     { opts: {}, expected: { connectionId: 'ambient-gw', profile: 'ambient' } },
+     { opts: { connectionId: 'owner' }, expected: { connectionId: 'owner' } },
+     { opts: { connectionId: 'owner', profile: null }, expected: { connectionId: 'owner' } },
+diff --git a/apps/desktop/src/api/plugins.ts b/apps/desktop/src/api/plugins.ts
+index 05ddd6c239..6c33476c65 100644
+--- a/apps/desktop/src/api/plugins.ts
++++ b/apps/desktop/src/api/plugins.ts
+@@ -47,6 +47,8 @@ export interface PluginRestOptions {
+   /** Single-file multipart upload (see HermesApiRequest.upload). */
+   upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
+   timeoutMs?: number
++  /** Read an already-running backend without starting one for a background probe. */
++  passive?: boolean
+   /** [daveey] Send this call to ONE registry connection (its id) instead of
+    *  the active gateway — for plugins that read every gateway at once (the
+    *  Kanban board). The ambient profile is NOT carried: a profile name belongs
+@@ -90,6 +92,7 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
+     body: opts.body,
+     upload: opts.upload,
+     timeoutMs: opts.timeoutMs,
++    ...(opts.passive ? { passive: true } : {}),
+     ...(opts.connectionId ? { connectionId: opts.connectionId } : {}),
+     ...(opts.profile !== undefined ? profileScoped(opts.profile) : opts.connectionId ? {} : profileScoped())
+   })
+diff --git a/apps/desktop/src/store/hub-sync.test.ts b/apps/desktop/src/store/hub-sync.test.ts
+index 32ece311d8..12585aa101 100644
+--- a/apps/desktop/src/store/hub-sync.test.ts
++++ b/apps/desktop/src/store/hub-sync.test.ts
+@@ -54,6 +54,17 @@ afterEach(() => {
+ })
+ 
+ describe('gateway names', () => {
++  it('uses passive reads before registry hydration and for non-primary probes', async () => {
++    $connectionsRegistry.set(null)
++    rest.handler = () => new Error('backend not running')
++    expect(await learnHubGatewayName('local')).toBe(false)
++    expect(pluginRest).toHaveBeenLastCalledWith('hub-sync', '/status', expect.objectContaining({connectionId: 'local', passive: true}))
++    registry({id:'local'}, {id:'remote'})
++    rest.handler = () => ({gateway:'remote',available:true})
++    expect(await learnHubGatewayName('remote')).toBe(true)
++    expect(pluginRest).toHaveBeenLastCalledWith('hub-sync', '/status', expect.objectContaining({connectionId: 'remote', passive: true}))
++  })
++
+   it('learns a connection\'s hub name from its own /status and persists it', async () => {
+     registry({ id: 'local' }, { id: 'conn-7', label: 'Studio' })
+     rest.handler = (path, opts) => (path === '/status' && opts.connectionId === 'conn-7' ? { available: true, gateway: 'mini' } : new Error('x'))
+@@ -97,6 +108,7 @@ describe('gateway names', () => {
+ describe('hubSessionOwner', () => {
+   it('maps the replica owner to its registry connection; own records map to the primary', async () => {
+     registry({ id: 'local' }, { id: 'conn-mini', label: 'mini' })
++
+     rest.handler = (path, opts) => {
+       expect(opts.connectionId).toBe('local') // reads always go to the window's own gateway
+ 
+diff --git a/apps/desktop/src/store/hub-sync.ts b/apps/desktop/src/store/hub-sync.ts
+index ed689fdb3f..1852278d79 100644
+--- a/apps/desktop/src/store/hub-sync.ts
++++ b/apps/desktop/src/store/hub-sync.ts
+@@ -203,6 +203,7 @@ export async function hubGet<T extends object>(
+   try {
+     const result = await pluginRest<T & { available?: boolean }>(HUB_SYNC_PLUGIN, path, {
+       connectionId,
++      passive: true,
+       timeoutMs: READ_TIMEOUT_MS
+     })
+ 
+diff --git a/apps/desktop/src/store/project-tree-background.ts b/apps/desktop/src/store/project-tree-background.ts
+new file mode 100644
+index 0000000000..0cfb7d5c04
+--- /dev/null
++++ b/apps/desktop/src/store/project-tree-background.ts
+@@ -0,0 +1,34 @@
++import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
++import { hermesApi } from '@/hermes'
++import { requestGatewayForAgent } from '@/store/gateway'
++
++export interface ProjectTreePayload {
++  projects: SidebarProjectTree[]
++  active_id: null | string
++  scoped_session_ids: string[]
++}
++
++// Background fanout reads all profiles on a gateway, with an older-gateway RPC
++// fallback. This device is observational only: an absent local backend is not
++// a reason to start one on a remote-only client.
++export async function fetchRemoteProjectTree(
++  connectionId: string,
++  profile: string,
++  previewLimit: number,
++  timeoutMs: number
++): Promise<ProjectTreePayload> {
++  try {
++    return await hermesApi<ProjectTreePayload>({
++      connectionId,
++      path: `/api/profiles/projects/tree?preview_limit=${previewLimit}`,
++      ...(connectionId === 'local' ? { passive: true } : {}),
++      timeoutMs
++    })
++  } catch (error) {
++    if (connectionId === 'local') {throw error}
++
++    return requestGatewayForAgent<ProjectTreePayload>(
++      connectionId, profile, 'projects.tree', { preview_limit: previewLimit }, timeoutMs
++    )
++  }
++}
+diff --git a/apps/desktop/src/store/projects-hub-replica.test.ts b/apps/desktop/src/store/projects-hub-replica.test.ts
+index 5e6e76be56..2fec521ce0 100644
+--- a/apps/desktop/src/store/projects-hub-replica.test.ts
++++ b/apps/desktop/src/store/projects-hub-replica.test.ts
+@@ -111,6 +111,26 @@ beforeEach(ctx => {
+ })
+ 
+ describe('remote project groups from the hub replica', () => {
++  it('does not wake a local backend for background trees, but reads one already running', async () => {
++    vi.mocked(activeGatewayConnectionId).mockReturnValue(conn)
++    $connectionsRegistry.set({connections:[{id:'local',kind:'local',label:'This device'},{id:conn,kind:'remote',label:'remote'}],primary:conn} as never)
++    vi.mocked(hubGatewayProjects).mockResolvedValue(null)
++    vi.mocked(hermesApi).mockRejectedValue(new Error('passive backend unavailable'))
++    await refreshProjectTree()
++    await flush()
++    expect(hermesApi).toHaveBeenCalledWith(expect.objectContaining({connectionId:'local',passive:true}))
++    expect(requestGatewayForAgent).not.toHaveBeenCalled()
++    const clock = vi.spyOn(Date,'now').mockReturnValue(Date.now() + 120_000)
++
++    try {
++      vi.mocked(hermesApi).mockResolvedValue({projects:[{...localTree[0],id:'p_warm',label:'warm-only'}],scoped_session_ids:[]})
++      await refreshProjectTree()
++      await flush()
++      expect($projectTree.get().some(node => node.id === 'gw:local:p_warm')).toBe(true)
++      expect(requestGatewayForAgent).not.toHaveBeenCalled()
++    } finally { clock.mockRestore() }
++  })
++
+   it("draws an unreachable gateway's groups from the replica, renameable, rows owned by that connection", async () => {
+     vi.mocked(hermesApi).mockRejectedValue(new Error('ssh: connect timed out'))
+     vi.mocked(requestGatewayForAgent).mockRejectedValue(new Error('ssh: connect timed out'))
+diff --git a/apps/desktop/src/store/projects.ts b/apps/desktop/src/store/projects.ts
+index 08b0ffc105..f3af2709dd 100644
+--- a/apps/desktop/src/store/projects.ts
++++ b/apps/desktop/src/store/projects.ts
+@@ -67,6 +67,7 @@ import {
+ import { $hiddenGatewayIds } from './gateway-visibility'
+ import { hubGatewayForConnection, hubGatewayProjects, hubRequest, learnHubGatewayName } from './hub-sync'
+ import { type OfflineReplicaRecord, offlineSessionsFromReplica } from './offline-sessions'
++import { fetchRemoteProjectTree, type ProjectTreePayload } from './project-tree-background'
+ 
+ // First-class, per-profile Projects (named, multi-folder workspaces). State is
+ // served by the live gateway's `projects.*` JSON-RPC methods, which wrap the
+@@ -455,12 +456,6 @@ export async function refreshProjects(): Promise<void> {
+   }
+ }
+ 
+-interface ProjectTreePayload {
+-  projects: SidebarProjectTree[]
+-  active_id: null | string
+-  scoped_session_ids: string[]
+-}
+-
+ // Expanded previews need the complete existing tree window before the renderer
+ // finds its two recency groups. Keep the normal three-row payload unchanged.
+ const projectTreePreviewLimit = () => ($sidebarShowAllSessions.get() ? 2000 : 3)
+@@ -549,29 +544,6 @@ function reapplyLastProjectTree(): void {
+   }
+ }
+ 
+-// A remote's sessions live in every profile it serves (nous-1 keeps none in
+-// `default`), so read its all-profiles REST tree: each row carries its own
+-// `profile`, which with the connection stamp is the exact owner a click
+-// resumes on. An older gateway without that route answers with the one
+-// profile `projects.tree` serves.
+-async function fetchRemoteProjectTree(connectionId: string, profile: string): Promise<ProjectTreePayload> {
+-  try {
+-    return await hermesApi<ProjectTreePayload>({
+-      connectionId,
+-      path: `/api/profiles/projects/tree?preview_limit=${projectTreePreviewLimit()}`,
+-      timeoutMs: REMOTE_TREE_TIMEOUT_MS
+-    })
+-  } catch {
+-    return requestGatewayForAgent<ProjectTreePayload>(
+-      connectionId,
+-      profile,
+-      'projects.tree',
+-      { preview_limit: projectTreePreviewLimit() },
+-      REMOTE_TREE_TIMEOUT_MS
+-    )
+-  }
+-}
+-
+ // [daveey] The hub replica's copy of a remote's tree (hermes-hub >= 1.9.0): what the overview shows for a gateway
+ // this run hasn't reached yet (cold start) or can't reach (asleep), so its groups never vanish and a shared rename
+ // made while it sleeps shows. Null when the replica has nothing for it (no hub-sync, older client, unknown name).
+@@ -623,7 +595,7 @@ async function refreshRemoteProjectTree(connectionId: string, profile: string):
+       await fillFromReplica(connectionId, entry)
+     }
+ 
+-    const res = await fetchRemoteProjectTree(connectionId, profile)
++    const res = await fetchRemoteProjectTree(connectionId, profile, projectTreePreviewLimit(), REMOTE_TREE_TIMEOUT_MS)
+ 
+     entry.projects = res.projects ?? []
+     entry.fetchedAt = Date.now()
+-- 
+2.55.0
+

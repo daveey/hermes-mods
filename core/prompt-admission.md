@@ -1,6 +1,6 @@
 # Durable exact-owner prompt admission
 
-Patches **0441**, **0442**, **0443**, **0444**, **0446** (sources `a0c15d5af9`, `957b76cb38`, `991588aed4`,
+Patches **0447**, **0448**, **0449**, **0450**, **0452** (sources `a0c15d5af9`, `957b76cb38`, `991588aed4`,
 `5012b9868d`, `1f220668a6`).
 
 ## Behavior
@@ -21,8 +21,8 @@ Patches **0441**, **0442**, **0443**, **0444**, **0446** (sources `a0c15d5af9`, 
 `hermes_state_prompt_admission.py` holds the receipt table and state machine on top of `hermes_state_sessions.py`;
 `tui_gateway/methods_prompt.py` (+ `methods_prompt_admission.py`) exposes it as RPCs declared in
 `tui_gateway/contracts/prompt_voice.py` and `events.py`. The design note lives in `tui_gateway/PROMPT_ADMISSION.md`.
-The Desktop half is `gateway-event/admitted-message.ts`. 0442 is the follow-up commit with the same subject as 0441 (same
-file set); 0444 narrows the event payload to the generated wire type; 0446 fixes the code-health gate without
+The Desktop half is `gateway-event/admitted-message.ts`. 0448 is the follow-up commit with the same subject as 0447 (same
+file set); 0450 narrows the event payload to the generated wire type; 0452 fixes the code-health gate without
 changing the guards.
 
 ## Code
@@ -40,11 +40,11 @@ changing the guards.
 
 ## Applying
 
-`git am -3 core/patches/0441-*.patch` through `0446`; then regenerate contracts with `scripts/gen_gateway_contracts.py`.
+`git am -3 core/patches/0447-*.patch` through `0452`; then regenerate contracts with `scripts/gen_gateway_contracts.py`.
 
 ## Gotchas
 
-- 0441 and 0442 are near-duplicates by subject; keep both, 0442 is the later content.
+- 0447 and 0448 are near-duplicates by subject; keep both, 0448 is the later content.
 - Every new RPC needs a contract entry or the contract-coverage test fails.
 
 ## Plugin?

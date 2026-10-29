@@ -1,0 +1,100 @@
+From c074a30228f7add59febf1f60066ae7cf08f642c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:41:46 +0000
+Subject: [PATCH] test(kanban-sync): guard that a lapsed mirror-only review
+ grant requeues to review [daveey]
+
+Follow-up to 9f23cabf55 (t_01a182bbad9df5ac). Hypothesis: a review card written
+running by the Board's lease grant, whose local claim never landed, would be
+requeued to ready by reconcile_orphaned_running once the 180 s grace and the
+lease lapsed, because _retry_status_for_run reads the current run's claimed event.
+
+It does not happen against the real Board: grantLease (hermes-hub
+worker/src/transitions.ts) writes a claimed event with run_uid and
+source_status=review in the grant transaction; it syncs down bound to the grant's
+run, which current_run_uid points at. The fake Board omitted that event (the new
+test was RED against it for both a fresh review card and one after an
+implementation run); it now emits it like the Board does, and the test is a guard.
+---
+ tests/hermes_cli/kanban_sync_fake_board.py    |  9 +++++
+ tests/hermes_cli/test_kanban_sync_run_rows.py | 37 +++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/tests/hermes_cli/kanban_sync_fake_board.py b/tests/hermes_cli/kanban_sync_fake_board.py
+index ae8999014e..06d0e277cb 100644
+--- a/tests/hermes_cli/kanban_sync_fake_board.py
++++ b/tests/hermes_cli/kanban_sync_fake_board.py
+@@ -8,6 +8,8 @@ Implements the contract the client relies on: row ops (per-field LWW by HLC on t
+ from __future__ import annotations
+ 
+ import copy
++import json
++import time
+ from typing import Any, Optional
+ 
+ from hermes_cli import kanban_sync_client as ksc
+@@ -149,6 +151,13 @@ class FakeHub:
+                 version = self.svc._put(b, "tasks", task, {"status": "running", "current_run_uid": run,
+                                                            "lease_holder": gw, "lease_expires": 9_999_999_999_999},
+                                         gw, op_id, hlc)["version"]
++                # As the Board's grantLease (hermes-hub worker/src/transitions.ts): the claimed event, tagged with
++                # the lane the claim came from, so a reviewer run retries to ``review``.
++                payload = {"holder": gw, "run_uid": run, "expires": 9_999_999_999_999,
++                           **({"source_status": "review"} if body.get("lane") == "review" else {})}
++                self.svc._put(b, "task_events", f"ev-{run}", {"task_id": task, "run_uid": run, "kind": "claimed",
++                                                              "payload": json.dumps(payload),
++                                                              "created_at": int(time.time())}, gw, op_id, hlc)
+         elif body["action"] == "renew":
+             if not cur or cur["holder"] != self.gateway or cur["run_uid"] != run:
+                 return {"status": "rejected", "reason": "lease_lost", "lease": cur}
+diff --git a/tests/hermes_cli/test_kanban_sync_run_rows.py b/tests/hermes_cli/test_kanban_sync_run_rows.py
+index 33f70b97b7..7dbeeac795 100644
+--- a/tests/hermes_cli/test_kanban_sync_run_rows.py
++++ b/tests/hermes_cli/test_kanban_sync_run_rows.py
+@@ -131,6 +131,43 @@ def test_board_grant_row_mid_claim_is_not_reconciled(live, kanban_home, svc):
+     gate.__exit__(None, None, None)  # the unused lease is released, as the refused claim does
+ 
+ 
++def _age_out_mirror_only_claim(live, tid):
++    """Past the grace with the lease lapsed: the claim that the grant began never landed locally."""
++    live.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int(time.time() - 5) * 1000, tid))
++    live.execute("UPDATE task_events SET created_at = created_at - ? WHERE task_id = ? AND kind = 'claimed'",
++                 (kd.ORPHAN_CLAIM_GRACE_SECONDS + 60, tid))
++    live.commit()
++
++
++@pytest.mark.parametrize("prior_impl_run", [False, True], ids=["fresh-review-card", "after-implementation-run"])
++def test_board_grant_row_for_review_card_requeues_to_review_after_grace(live, kanban_home, svc, prior_impl_run):
++    """Follow-up to the grant-row test (t_01a182bbad9df5ac): once the grace passed and the lease lapsed, the
++    mirror-only ``running`` row of a REVIEW card is a real orphan. No local claim opened a run, so the current
++    run (if any) is not the reviewer's; the card must still go back to ``review``, not to ``ready``."""
++    tid = kb.create_task(live, title="review mirror-only", assignee="worker")
++    if prior_impl_run:
++        _round(kanban_home, svc)
++        assert kb.claim_task(live, tid, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++        assert kb.request_review(live, tid, summary="impl done")
++    else:
++        live.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
++        live.commit()
++    assert kb.get_task(live, tid).status == "review"
++    _round(kanban_home, svc)
++    gate = sync.claim_gate(live, tid, int(time.time()) + 900, lane="review")
++    assert gate.lease is not None and gate.lease.granted
++    _round(kanban_home, svc)  # the grant's row reaches us: running, our lease, no local claim
++    row = live.execute("SELECT status, claim_lock, lease_holder FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (row["status"], row["claim_lock"], row["lease_holder"]) == ("running", None, ME)
++
++    _age_out_mirror_only_claim(live, tid)
++    assert kd.reconcile_orphaned_running(live) == [tid]
++    assert kb.get_task(live, tid).status == "review"
++    (ev,) = [e for e in kb.list_events(live, tid) if e.kind == "reconciled"]
++    assert ev.payload["retry_status"] == "review"
++    gate.__exit__(None, None, None)
++
++
+ def test_a_run_that_ends_before_its_first_push_survives_the_grants_own_run_row(live, kanban_home, svc):
+     """The Board's grant wrote the run row before the local claim did; that copy reaching the gateway after the
+     run already ended (a slow round) must not reopen it."""
+-- 
+2.55.0
+

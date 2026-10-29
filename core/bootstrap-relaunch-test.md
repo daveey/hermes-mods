@@ -1,6 +1,6 @@
 # Real-bootstrap relaunch test survives the bootstrap preload
 
-Patch **0676** (`c1267464b7`). Test harness only. Product installs are unchanged.
+Patch **0683** (`c1267464b7`). Test harness only. Product installs are unchanged.
 
 ## Behavior
 
@@ -26,7 +26,7 @@ No product entry path changed, so none is claimed.
 
 ## Applying
 
-`git am -3` 0676. Test file only; an empty apply on a tree that already has the import is a no-op, not a product change.
+`git am -3` 0683. Test file only; an empty apply on a tree that already has the import is a no-op, not a product change.
 
 ## Gotchas
 

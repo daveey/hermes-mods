@@ -1,6 +1,6 @@
 # Desktop: new Home sessions stay visible across sidebar views
 
-Patch **0403** (`2f45b7b686`).
+Patch **0410** (`2f45b7b686`).
 
 ## Behavior
 
@@ -25,7 +25,7 @@ Placement is computed once in `workspace-groups.ts` and reused by `sidebar/index
 
 ## Applying
 
-`git am -3` after 0402; no config.
+`git am -3` after 0409; no config.
 
 ## Gotchas
 

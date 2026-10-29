@@ -1,0 +1,331 @@
+From dbf62bea792643c94f8a361066633e443266a323 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:13:37 -0700
+Subject: [PATCH] fix(desktop): re-list while a failed sidebar list leaves
+ owners stale; log freshness flips [daveey]
+
+A failed list stamps its owners stale and their rows paint as cached copies (no
+red/grey stripe, 0/0 kanban badge) until a successful list. Nothing re-listed on
+its own: after a Desktop restart whose first list failed, this Mac's rows stayed
+blank 15:30-15:46 PDT until the user switched gateways, and the session status
+auditor filed missing red / badge mismatch / missing waiting for every such row.
+
+- useSessionListActions re-lists with 15/30/60 s backoff while an owner a LIST
+  marked stale is still stale; status-probe outages (hub-sync) are not retried.
+- [session-freshness] desktop.log line on every owner freshness flip with the
+  request that caused it.
+---
+ .../hooks/use-session-list-actions.test.tsx   | 77 +++++++++++++++++++
+ .../session/hooks/use-session-list-actions.ts | 57 +++++++++++++-
+ .../src/store/offline-sessions.test.ts        | 11 +++
+ apps/desktop/src/store/offline-sessions.ts    | 46 ++++++++++-
+ 4 files changed, 186 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index dd3d3b867f..6461f8e2ce 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -1378,3 +1378,80 @@ describe('actual hub poller + list refresh freshness', () => {
+     60_000
+   )
+ })
++
++// [daveey] A failed list leaves its owners stale (rows paint as cached copies: no stripe, no kanban badge) and only a
++// successful list repairs that. After a Desktop restart whose first list failed, nothing re-listed for 16 min.
++describe('re-lists while a failed list leaves owners stale', () => {
++  it('retries with backoff until a list succeeds, then stops', async () => {
++    const { _resetOfflineSessionsForTests, sessionOwnerIsFresh } = await import('@/store/offline-sessions')
++    _resetOfflineSessionsForTests()
++    vi.useFakeTimers()
++    const owner = row('mine', { connection_id: 'local' })
++    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [owner] }))
++    const { result, unmount } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
++
++    try {
++      await act(async () => {
++        await result.current.refreshSessions()
++      })
++      listSidebarSessions.mockRejectedValue(new Error('Timed out connecting to Hermes backend'))
++      await act(async () => {
++        await result.current.refreshSessions().catch(() => undefined)
++      })
++      expect(sessionOwnerIsFresh('local', 'default')).toBe(false)
++      const callsAfterFailure = listSidebarSessions.mock.calls.length
++
++      // First retry at 15 s fails again; the next waits 30 s.
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(15_000)
++      })
++      expect(listSidebarSessions.mock.calls.length).toBe(callsAfterFailure + 1)
++      expect(sessionOwnerIsFresh('local', 'default')).toBe(false)
++
++      listSidebarSessions.mockResolvedValue(sidebar({ sessions: [owner] }))
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(29_000)
++      })
++      expect(listSidebarSessions.mock.calls.length).toBe(callsAfterFailure + 1)
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(1_000)
++      })
++      expect(listSidebarSessions.mock.calls.length).toBe(callsAfterFailure + 2)
++      expect(sessionOwnerIsFresh('local', 'default')).toBe(true)
++
++      // Fresh again: no more retries.
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(120_000)
++      })
++      expect(listSidebarSessions.mock.calls.length).toBe(callsAfterFailure + 2)
++    } finally {
++      unmount()
++      vi.useRealTimers()
++      _resetOfflineSessionsForTests()
++    }
++  })
++
++  it('does not re-list a gateway the status probe marked unreachable', async () => {
++    const { _resetOfflineSessionsForTests, recordSessionGatewayUnavailable } = await import('@/store/offline-sessions')
++    _resetOfflineSessionsForTests()
++    vi.useFakeTimers()
++    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('mine')] }))
++    const { result, unmount } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
++
++    try {
++      await act(async () => {
++        await result.current.refreshSessions()
++      })
++      const calls = listSidebarSessions.mock.calls.length
++      act(() => recordSessionGatewayUnavailable('conn-mini'))
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(120_000)
++      })
++      expect(listSidebarSessions.mock.calls.length).toBe(calls)
++    } finally {
++      unmount()
++      vi.useRealTimers()
++      _resetOfflineSessionsForTests()
++    }
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+index 967ffb2261..8ba155dace 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.ts
+@@ -19,7 +19,7 @@ import {
+   SIDEBAR_FILTERED_PAGE_SIZE,
+   SIDEBAR_SESSIONS_PAGE_SIZE
+ } from '@/store/layout'
+-import { recordSessionListResult } from '@/store/offline-sessions'
++import { $sessionListFreshness, recordSessionListResult, staleSessionOwners } from '@/store/offline-sessions'
+ import { messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
+ import {
+   $messagingSessions,
+@@ -44,7 +44,11 @@ import {
+   setSessionsLoading,
+   stampMessagingRowsWithListServer
+ } from '@/store/session'
+-import { noteSessionListSource, takeSessionListRefreshReason } from '@/store/session-dot-state'
++import {
++  markSessionListRefreshReason,
++  noteSessionListSource,
++  takeSessionListRefreshReason
++} from '@/store/session-dot-state'
+ import {
+   $removedSessionIds,
+   captureSessionTombstoneGenerations,
+@@ -58,6 +62,9 @@ import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions
+ 
+ import { refreshRetainedKanban, withKanbanEvidence } from './refresh-retained-kanban'
+ 
++/** [daveey] Backoff for re-listing while a failed list leaves owners stale (last value repeats). */
++export const STALE_LIST_RETRY_MS = [15_000, 30_000, 60_000]
++
+ function sidebarRequestConnection(): string | undefined {
+   return getApiRequestConnection() ?? undefined
+ }
+@@ -601,6 +608,52 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
+     [refreshSessions]
+   )
+ 
++  // [daveey] A failed list leaves its owners stale: their rows paint as cached copies (no red/grey stripe, 0/0 kanban
++  // badge) and only a SUCCESSFUL list makes them live again. Nothing used to re-list on its own: after a Desktop
++  // restart whose first hub list failed, this Mac's rows stayed blank for 16 min, until the user switched gateways.
++  // Re-list with backoff while any owner is stale; any successful refresh (this one or another) ends it.
++  useEffect(() => {
++    let timer: ReturnType<typeof setTimeout> | null = null
++    let attempt = 0
++
++    const clear = () => {
++      if (timer !== null) {
++        clearTimeout(timer)
++        timer = null
++      }
++    }
++
++    const schedule = (state: Record<string, boolean>) => {
++      if (!staleSessionOwners(state).length) {
++        attempt = 0
++        clear()
++
++        return
++      }
++
++      if (timer !== null) {
++        return
++      }
++
++      const delay = STALE_LIST_RETRY_MS[Math.min(attempt, STALE_LIST_RETRY_MS.length - 1)]
++      timer = setTimeout(() => {
++        timer = null
++        attempt += 1
++        markSessionListRefreshReason('stale-owner-retry')
++        void refreshSessions()
++          .catch(() => undefined)
++          .finally(() => schedule($sessionListFreshness.get()))
++      }, delay)
++    }
++
++    const unsubscribe = $sessionListFreshness.subscribe(schedule)
++
++    return () => {
++      unsubscribe()
++      clear()
++    }
++  }, [refreshSessions])
++
+   return {
+     loadMoreMessagingForPlatform,
+     loadMoreSessions,
+diff --git a/apps/desktop/src/store/offline-sessions.test.ts b/apps/desktop/src/store/offline-sessions.test.ts
+index b6271ca5bb..62da0bb739 100644
+--- a/apps/desktop/src/store/offline-sessions.test.ts
++++ b/apps/desktop/src/store/offline-sessions.test.ts
+@@ -15,6 +15,7 @@ import {
+   type OfflineReplicaRecord,
+   offlineSessionsFromReplica,
+   recordSessionListResult,
++  sessionOwnerIsFresh,
+   syncedAgoLabel
+ } from './offline-sessions'
+ 
+@@ -246,6 +247,7 @@ describe('mergeOfflineFallback', () => {
+ 
+   it('a retained row of a failed list is stamped stale-list only when no replica copy replaces it', () => {
+     recordSessionListResult([], [], 'conn-mini', 'all', [], true)
++
+     const merged = mergeOfflineFallback(
+       [live('c1', { connection_id: 'conn-mini' }), live('busy', { connection_id: 'conn-mini' })],
+       cached
+@@ -333,6 +335,15 @@ describe('mergeOfflineFallback', () => {
+     ])
+   })
+ 
++  it('an error naming another gateway still marks that gateway stale', () => {
++    const previous = [live('mine', { connection_id: 'local' }), live('hubrow', { connection_id: 'conn-hub' })]
++
++    recordSessionListResult(previous, [], 'conn-hub', 'all', [{ connection_id: 'local', profile: 'default' }], true)
++
++    expect(sessionOwnerIsFresh('local', 'default')).toBe(false)
++    expect(sessionOwnerIsFresh('conn-hub', 'default')).toBe(false)
++  })
++
+   it('keeps reference identity when nothing is added', () => {
+     const rows = [live('l1')]
+ 
+diff --git a/apps/desktop/src/store/offline-sessions.ts b/apps/desktop/src/store/offline-sessions.ts
+index b6bff9de51..a34e67382f 100644
+--- a/apps/desktop/src/store/offline-sessions.ts
++++ b/apps/desktop/src/store/offline-sessions.ts
+@@ -65,17 +65,44 @@ export const $sessionListFreshness = atom<Record<string, boolean>>({})
+ const ownerKey = (connection: string | undefined, profile: string | undefined) =>
+   `${connection?.trim() || 'local'}\u0000${profileOf(profile)}`
+ 
+-function publishFreshness(next: Record<string, boolean>): void {
++/** [daveey] desktop.log line per owner whose freshness changed, with what changed it. A stale owner's rows paint as
++ *  cached copies (no stripe, no kanban badge), and a 16 min stretch of that after a restart left no trace of which
++ *  list failed. Diagnostics only; never throws. */
++function logFreshnessFlips(previous: Record<string, boolean>, next: Record<string, boolean>, reason: string): void {
++  try {
++    const flips = [...new Set([...Object.keys(previous), ...Object.keys(next)])]
++      .filter(key => previous[key] !== next[key])
++      .map(key => `${key.replace('\u0000', '/')}:${previous[key] ?? '-'}->${next[key] ?? '-'}`)
++
++    if (flips.length && typeof window !== 'undefined') {
++      window.hermesDesktop?.logLine?.(`[session-freshness] ${flips.join(' ')} reason=${reason}`)
++    }
++  } catch {
++    // diagnostics only
++  }
++}
++
++function publishFreshness(next: Record<string, boolean>, reason: string): void {
+   const previous = $sessionListFreshness.get()
+ 
+   if (
+     Object.keys(previous).length !== Object.keys(next).length ||
+     Object.keys(next).some(key => previous[key] !== next[key])
+   ) {
++    logFreshnessFlips(previous, next, reason)
+     $sessionListFreshness.set(next)
+   }
+ }
+ 
++/** [daveey] Owner keys a sidebar LIST marked stale (failed request, or an error naming them). A gateway the hub-sync
++ *  status probe calls unreachable is not here: re-listing it would only flap against the probe. */
++const listStaleOwners = new Set<string>()
++
++/** [daveey] Owners whose last list failed (`connection/profile`) and are still stale. Only a successful list makes
++ *  them live again, so the sidebar re-lists while this is non-empty instead of waiting for an unrelated refresh. */
++export const staleSessionOwners = (state = $sessionListFreshness.get()): string[] =>
++  [...listStaleOwners].filter(key => state[key] === false).map(key => key.replace('\u0000', '/'))
++
+ export function sessionOwnerIsFresh(
+   connection: string | undefined,
+   profile?: string,
+@@ -92,7 +119,7 @@ export function recordSessionGatewayUnavailable(connection: string): void {
+   )
+ 
+   next[ownerKey(connection, '*')] = false
+-  publishFreshness(next)
++  publishFreshness(next, `gateway-unavailable conn=${connection}`)
+ }
+ 
+ /** Called only by the owning, non-superseded sidebar refresh. */
+@@ -135,6 +162,7 @@ export function recordSessionListResult(
+   const primary = $connectionsRegistry.get()?.primary?.trim() || 'local'
+   const gatewayOf = (id: null | string | undefined) => id?.trim() || primary
+   const requestGateway = gatewayOf(connection)
++
+   const covers = (ownerConnection: null | string | undefined, errorConnection?: null | string) =>
+     errorConnection?.trim()
+       ? gatewayOf(errorConnection) === gatewayOf(ownerConnection)
+@@ -160,7 +188,18 @@ export function recordSessionListResult(
+     }
+   }
+ 
+-  publishFreshness(next)
++  for (const [key, fresh] of Object.entries(next)) {
++    if (fresh) {
++      listStaleOwners.delete(key)
++    } else if (owners.has(key)) {
++      listStaleOwners.add(key)
++    }
++  }
++
++  publishFreshness(
++    next,
++    `list conn=${connection?.trim() || 'local'} profile=${profile}${failed ? ' failed' : ''}${errors.length ? ` errors=${errors.length}` : ''}`
++  )
+ }
+ 
+ /**
+@@ -377,6 +416,7 @@ export function hideOfflineSession(row: SessionInfo): void {
+ 
+ export function _resetOfflineSessionsForTests(): void {
+   archivedWhileOffline.clear()
++  listStaleOwners.clear()
+   $sessionListFreshness.set({})
+   $offlineSessions.set([])
+ }
+-- 
+2.55.0
+

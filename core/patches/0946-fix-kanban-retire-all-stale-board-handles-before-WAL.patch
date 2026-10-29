@@ -1,0 +1,744 @@
+From 1e1ec687ef81e7a18d8df348346a49ab3f3f5c37 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 11:36:16 +0000
+Subject: [PATCH] fix(kanban): retire all stale board handles before WAL reopen
+ [daveey]
+
+---
+ agent/kanban_turn_recovery.py                 |   3 +-
+ hermes_cli/backup_sqlite.py                   |   9 +-
+ hermes_cli/kanban_generation.py               | 153 +++++++++++
+ hermes_cli/kanban_lockguard.py                |   8 +
+ hermes_cli/kanban_placement_forward.py        |   3 +-
+ hermes_cli/kanban_session_activity.py         |  27 +-
+ hermes_cli/kanban_worker_recovery.py          |   3 +-
+ hermes_cli/kanban_worktree_gc.py              |   9 +-
+ hermes_cli/sqlite_safe_read.py                |   4 +
+ tests/agent/test_kanban_turn_recovery.py      |  21 ++
+ .../test_kanban_auxiliary_lockguard.py        | 258 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_lockguard.py     |   2 +-
+ .../hermes_cli/test_kanban_worker_recovery.py |  17 ++
+ 13 files changed, 492 insertions(+), 25 deletions(-)
+ create mode 100644 hermes_cli/kanban_generation.py
+ create mode 100644 tests/hermes_cli/test_kanban_auxiliary_lockguard.py
+
+diff --git a/agent/kanban_turn_recovery.py b/agent/kanban_turn_recovery.py
+index 93263e875e..2247c10a52 100644
+--- a/agent/kanban_turn_recovery.py
++++ b/agent/kanban_turn_recovery.py
+@@ -220,7 +220,8 @@ def worker_claim_is_live() -> bool:
+         return False
+     now = _now()
+     try:
+-        conn = sqlite3.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True)
++        from hermes_cli import kanban_lockguard
++        conn = kanban_lockguard.connect(f"{Path(db_path).absolute().as_uri()}?mode=ro", uri=True)
+         try:
+             conn.row_factory = sqlite3.Row
+             row = conn.execute(
+diff --git a/hermes_cli/backup_sqlite.py b/hermes_cli/backup_sqlite.py
+index f0c2d2f1ad..b87da725d7 100644
+--- a/hermes_cli/backup_sqlite.py
++++ b/hermes_cli/backup_sqlite.py
+@@ -52,7 +52,14 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
+                 os.close(secure_fd)
+         # timeout=0.0 disables sqlite3's implicit busy wait so the progress callback owns the
+         # full locked-source deadline instead of adding the default timeout before each callback.
+-        conn = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
++        # Imported backups run inside the gateway/CLI alongside live board readers.
++        # The standalone pre-stop script is already isolated from the backend's locks.
++        try:
++            from hermes_cli.kanban_lockguard import connect as source_connect
++        except ImportError:
++            # The pre-stop emergency script must also work with only the stdlib available.
++            source_connect = sqlite3.connect
++        conn = source_connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
+         backup_conn = sqlite3.connect(str(dst))
+         busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
+ 
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+new file mode 100644
+index 0000000000..b9e5e472da
+--- /dev/null
++++ b/hermes_cli/kanban_generation.py
+@@ -0,0 +1,153 @@
++"""Retire every known handle to a dead Kanban WAL generation before opening another.
++
++SQLite shares its WAL-index mapping per inode, not per Connection. Opening one replacement
++while a sibling still holds the old mapping simply inherits the broken view. Never force-close
++a foreign thread's handle or roll back an outstanding transaction to get past that boundary.
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++import weakref
++from urllib.parse import unquote
++
++_lock = threading.RLock()
++_connections: weakref.WeakSet = weakref.WeakSet()
++_reader_caches: list = []
++_poisoned: set[str] = set()
++
++
++class DeletedWalGenerationError(sqlite3.OperationalError):
++    """Retry after the remaining active handles leave the dead WAL generation."""
++
++
++def _path(database) -> str | None:
++    value = os.fspath(database)
++    if isinstance(value, bytes):
++        value = os.fsdecode(value)
++    if value.startswith("file:"):
++        value = unquote(value[5:].split("?", 1)[0])
++    if not value or value == ":memory:":
++        return None
++    return os.path.realpath(value)
++
++
++def remember(conn) -> None:
++    from hermes_cli.kanban_lockguard import _db_file, shm_identity
++
++    path = _db_file(conn)
++    if path is None:
++        return
++    # Opening the WAL-index before recording its identity also covers unguarded/unsupported
++    # connections; database_list alone does not necessarily attach the shared-memory file.
++    try:
++        conn.execute("PRAGMA journal_mode").fetchone()
++    except sqlite3.Error:
++        return
++    with _lock:
++        conn._hermes_generation_path = os.path.realpath(path)
++        conn._hermes_generation_shm = shm_identity(path)
++        conn._hermes_generation_thread = threading.get_ident()
++        _connections.add(conn)
++
++
++def forget(conn) -> None:
++    with _lock:
++        _connections.discard(conn)
++
++
++def register_reader_cache(evict) -> None:
++    """A cache eviction must wait for its borrowers before closing its handles."""
++    with _lock:
++        if evict not in _reader_caches:
++            _reader_caches.append(evict)
++
++
++def evict_readers(path: str) -> None:
++    from hermes_cli import kanban_session_activity as activity
++
++    with activity._RO_CACHE_LOCK:
++        entries = [(key, entry) for key, entry in activity._RO_CACHE.items() if os.path.realpath(key) == path]
++    for key, entry in entries:
++        # Never wait while a caller might hold the cache lock: borrowers take that lock
++        # on error. A busy borrower owns its lifecycle and will release it for a retry.
++        if not entry[2].acquire(blocking=False):
++            raise DeletedWalGenerationError(f"kanban DB {path}: stale reader is still borrowed; retry")
++        try:
++            with activity._RO_CACHE_LOCK:
++                if activity._RO_CACHE.get(key) is not entry:
++                    continue
++                if entry[0].in_transaction:
++                    raise DeletedWalGenerationError(f"kanban DB {path}: stale cached reader has a transaction; retry")
++                del activity._RO_CACHE[key]
++            entry[0].close()
++        finally:
++            entry[2].release()
++
++
++def open_ro(path, check_same_thread: bool = True) -> sqlite3.Connection:
++    """Never create a missing board; retry read/write only to initialize missing WAL sidecars."""
++    from hermes_cli import kanban_lockguard
++
++    for mode in ("ro", "rw"):
++        conn = None
++        try:
++            conn = kanban_lockguard.connect(path.resolve().as_uri() + f"?mode={mode}",
++                                           uri=True, timeout=0.5, check_same_thread=check_same_thread)
++            conn.execute("PRAGMA query_only = ON")
++            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
++            return conn
++        except sqlite3.Error as exc:
++            if conn is not None:
++                conn.close()
++            if isinstance(exc, DeletedWalGenerationError) or not isinstance(exc, sqlite3.OperationalError) or mode == "rw":
++                raise
++    raise AssertionError("unreachable")
++
++
++def _handles(path):
++    with _lock:
++        return [c for c in _connections if c._hermes_generation_path == path]
++
++
++def recover(database) -> None:
++    from hermes_cli.kanban_lockguard import shm_identity, stranded_sidecars
++
++    path = _path(database)
++    if path is None:
++        return
++    current = shm_identity(path)
++    handles = _handles(path)
++    stale = any(c._hermes_generation_shm is not None and c._hermes_generation_shm != current for c in handles)
++    with _lock:
++        poisoned = path in _poisoned
++    # Also refuse unregistered legacy handles on first/uncached opens. Once poisoned,
++    # keep refusing retries and mode=rw fallbacks until the last dead mapping is gone.
++    stranded = stranded_sidecars(path) if stale or poisoned or not handles else []
++    if not stale and not stranded:
++        with _lock:
++            _poisoned.discard(path)
++        return
++    with _lock:
++        _poisoned.add(path)
++        caches = list(_reader_caches)
++    # No registry lock across a cache's borrower lock (close() unregisters under _lock).
++    for evict in caches:
++        evict(path)
++    for conn in _handles(path):
++        if conn._hermes_generation_shm is None or conn._hermes_generation_shm == current:
++            continue
++        if conn._hermes_generation_thread != threading.get_ident() or conn.in_transaction:
++            raise DeletedWalGenerationError(
++                f"kanban DB {path}: deleted WAL/SHM generation still has an active transaction "
++                "or a foreign-thread handle; retry after its owner closes it (not corruption)"
++            )
++        conn.close()
++    if stranded_sidecars(path):
++        raise DeletedWalGenerationError(
++            f"kanban DB {path}: an unregistered handle still holds a deleted WAL/SHM generation; "
++            "refusing to inherit its stale mapping (not corruption)"
++        )
++    with _lock:
++        _poisoned.discard(path)
+diff --git a/hermes_cli/kanban_lockguard.py b/hermes_cli/kanban_lockguard.py
+index 5b91a09bc4..3f3108d177 100644
+--- a/hermes_cli/kanban_lockguard.py
++++ b/hermes_cli/kanban_lockguard.py
+@@ -66,6 +66,8 @@ class _GuardMixin:
+         _release(self)
+         try:
+             super().close()  # type: ignore[misc]
++            from hermes_cli.kanban_generation import forget
++            forget(self)
+         except sqlite3.ProgrammingError:
+             # Cross-thread close refused: the connection stays open, so put the guard back.
+             if held is not None:
+@@ -127,6 +129,8 @@ def _apply(conn: Any, held_path: Optional[str] = None) -> bool:
+     conn._hermes_lockguard_path = path
+     if getattr(conn, "_hermes_lockguard_finalizer", None) is None:
+         conn._hermes_lockguard_finalizer = weakref.finalize(conn, _lockguard.release, held)
++    if hasattr(conn, "_hermes_generation_shm") and conn._hermes_generation_shm is None:
++        conn._hermes_generation_shm = shm_identity(path)
+     return True
+ 
+ 
+@@ -145,9 +149,13 @@ def guard(conn: sqlite3.Connection) -> bool:
+ 
+ def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+     """Drop-in ``sqlite3.connect`` for Kanban board files: same arguments, guarded result."""
++    from hermes_cli.kanban_generation import recover, remember
++    recover(database)
+     kwargs["factory"] = guarded_factory(kwargs.get("factory", sqlite3.Connection))
+     conn = sqlite3.connect(database, *args, **kwargs)
+     guard(conn)
++    if isinstance(conn, _GuardMixin):
++        remember(conn)
+     return conn
+ 
+ 
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 0ba05f0d9e..abb2e067ad 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -86,7 +86,8 @@ def forward_argv(task, board: Optional[str], worker_cmd: list) -> Optional[list]
+         path = kb.kanban_db_path(board=board)
+         if not os.path.exists(path):
+             return None
+-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)  # noqa: kanban-lockguard — short-lived read-only handle, closed in the finally below
++        from hermes_cli import kanban_lockguard
++        conn = kanban_lockguard.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+         try:
+             st = state(conn, task.id)
+         finally:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 1be2e48dff..b2502fc8c5 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -478,17 +478,7 @@ def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[s
+     return found, fresh
+ 
+ 
+-def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+-    """Read-only open that survives a WAL db whose -wal/-shm were just removed (plain ``mode=ro`` then fails);
+-    never creates the file."""
+-    try:
+-        conn = _kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5, check_same_thread=check_same_thread)
+-        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+-        return conn
+-    except sqlite3.OperationalError:
+-        conn = _kanban_lockguard.connect(f"file:{path}?mode=rw", uri=True, timeout=0.5, check_same_thread=check_same_thread)
+-        conn.execute("PRAGMA query_only = ON")
+-        return conn
++from hermes_cli.kanban_generation import open_ro as _open_ro
+ 
+ 
+ # Linked-card reads run on every sidebar refresh across ~16 boards and replicas; a fresh connection pays schema
+@@ -496,7 +486,11 @@ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+ # so keep one read-only connection per file, shared across the threadpool (one per thread would hold ~3 fds per
+ # board per worker). An idle autocommit reader holds no snapshot, so it never blocks writers or checkpoints.
+ _RO_CACHE: dict[str, tuple[sqlite3.Connection, tuple[int, int], threading.Lock, tuple[int, int] | None]] = {}
+-_RO_CACHE_LOCK = threading.Lock()
++_RO_CACHE_LOCK = threading.RLock()
++
++
++from hermes_cli.kanban_generation import recover as _recover_generation, evict_readers, register_reader_cache
++register_reader_cache(evict_readers)
+ 
+ 
+ @contextlib.contextmanager
+@@ -505,6 +499,7 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
+     replaced (new inode: a rebuilt replica), after any sqlite error, or when its ``-shm`` generation is gone (the
+     connection is stranded on a deleted WAL index and would fail with ``disk I/O error`` or read stale rows until
+     restart; kanban-759104eb56). Raises ``sqlite3.OperationalError`` when the file is missing, like ``_open_ro``."""
++    _recover_generation(path)
+     key = str(path)
+     try:
+         st = os.stat(path)
+@@ -517,10 +512,6 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
+         if entry is not None and entry[1] != ident:
+             stale = _RO_CACHE.pop(key)[0]
+             entry = None
+-        elif entry is not None and entry[3] is not None and _kanban_lockguard.shm_identity(path) != entry[3]:
+-            _log.warning("kanban board %s: cached reader was on a deleted WAL/SHM generation; reopening", path)
+-            stale = _RO_CACHE.pop(key)[0]
+-            entry = None
+         if stale is not None:
+             # Close BEFORE reopening: a new connection in this process would otherwise share SQLite's
+             # per-inode WAL-index mapping with the stranded one and inherit its dead -shm.
+@@ -532,6 +523,10 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
+             _RO_CACHE[key] = entry
+     conn, _ident, lock, _shm = entry
+     with lock:  # bodies read every result they start: an unfinished cursor would pin a WAL snapshot
++        with _RO_CACHE_LOCK:
++            if _RO_CACHE.get(key) is not entry:
++                from hermes_cli.kanban_generation import DeletedWalGenerationError
++                raise DeletedWalGenerationError(f"kanban DB {path}: reader was evicted while waiting; retry")
+         conn.row_factory = None
+         try:
+             yield conn
+diff --git a/hermes_cli/kanban_worker_recovery.py b/hermes_cli/kanban_worker_recovery.py
+index 671f059058..78644abf00 100644
+--- a/hermes_cli/kanban_worker_recovery.py
++++ b/hermes_cli/kanban_worker_recovery.py
+@@ -60,7 +60,8 @@ def register_worker_session(session_db, session_id: str) -> bool:
+             ).fetchone()
+         if session != ("kanban", profile):
+             return False
+-        with closing(sqlite3.connect(Path(board).resolve().as_uri() + "?mode=rw", uri=True, timeout=2)) as conn, conn:
++        from hermes_cli import kanban_lockguard
++        with closing(kanban_lockguard.connect(Path(board).resolve().as_uri() + "?mode=rw", uri=True, timeout=2)) as conn, conn:
+             conn.execute("BEGIN IMMEDIATE")
+             row = conn.execute(
+                 "SELECT t.status, t.current_run_id, t.claim_lock, t.claim_expires, "
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 33e318be04..94e2ec5eaa 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -16,6 +16,7 @@ import time
+ from pathlib import Path
+ 
+ from hermes_cli import kanban_db_workspace as ws
++from hermes_cli import kanban_lockguard
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -70,9 +71,9 @@ def gc_task_worktrees(conn: sqlite3.Connection, *, older_than_days: int = 7,
+ def _read_board(path: Path):
+     """No creation, with WAL read-only fallback; an unreadable board aborts GC."""
+     try:
+-        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)
++        conn = kanban_lockguard.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)
+     except sqlite3.OperationalError:
+-        conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=1)
++        conn = kanban_lockguard.connect(path.as_uri() + "?mode=rw", uri=True, timeout=1)
+     try:
+         conn.execute("PRAGMA query_only=ON")
+         conn.row_factory = sqlite3.Row
+@@ -114,7 +115,7 @@ def _sweep_repo(repo_root: str) -> None:
+     if not days:
+         return
+     # Use the shared enumerator without opening/creating the selected board.
+-    with contextlib.closing(sqlite3.connect(":memory:")) as empty:
++    with contextlib.closing(kanban_lockguard.connect(":memory:")) as empty:
+         boards = ws._sibling_board_db_files(empty)
+     selected = kb.kanban_db_path().resolve()
+     if selected.is_file() and selected not in boards:
+@@ -150,7 +151,7 @@ def _sweep_repo(repo_root: str) -> None:
+         log.warning("Orphan task worktree preserved and tombstoned: %s", path)
+     for board in boards:
+         # mode=rw refuses to fabricate a missing board after discovery.
+-        with contextlib.closing(sqlite3.connect(board.as_uri() + "?mode=rw", uri=True, timeout=1,
++        with contextlib.closing(kanban_lockguard.connect(board.as_uri() + "?mode=rw", uri=True, timeout=1,
+                                                isolation_level=None)) as conn:
+             conn.row_factory = sqlite3.Row
+             gc_task_worktrees(conn, older_than_days=days, repo_root=repo_root)
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index 30dd88a8e2..6892d09181 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -235,6 +235,10 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
+                 path)
+             return None
+         try:
++            # Untracked read-only caches may still hold SQLite locks. On POSIX use a
++            # never-closed descriptor even when this registry is empty (or force=True).
++            if hasattr(os, "pread"):
++                return read_header_lock_safe(path, length=length)
+             with open(path, "rb") as handle:
+                 return handle.read(length)
+         except OSError:
+diff --git a/tests/agent/test_kanban_turn_recovery.py b/tests/agent/test_kanban_turn_recovery.py
+index 522a133cc4..adf691a777 100644
+--- a/tests/agent/test_kanban_turn_recovery.py
++++ b/tests/agent/test_kanban_turn_recovery.py
+@@ -242,6 +242,27 @@ def test_claim_ownership_matrix(clear_kanban_env, tmp_path, overrides):
+     assert worker_claim_is_live() is (overrides == {})
+ 
+ 
++def test_claim_check_uses_guarded_wal_reader(clear_kanban_env, tmp_path):
++    from hermes_cli import kanban_lockguard
++    from contextlib import closing
++    db = _make_board(tmp_path)
++    with closing(sqlite3.connect(db)) as conn:
++        conn.execute("PRAGMA journal_mode=WAL")
++    _pin_carrier(clear_kanban_env, db)
++    real = kanban_lockguard.connect
++    calls = []
++
++    def checked(*args, **kwargs):
++        conn = real(*args, **kwargs)
++        assert kanban_lockguard.is_guarded(conn)
++        calls.append(True)
++        return conn
++
++    clear_kanban_env.setattr(kanban_lockguard, "connect", checked)
++    assert worker_claim_is_live()
++    assert calls == [True]
++
++
+ def test_claim_check_fails_closed_without_a_board(clear_kanban_env, tmp_path):
+     """No proof, no retry: a missing board must not authorise model re-entry."""
+     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_live")
+diff --git a/tests/hermes_cli/test_kanban_auxiliary_lockguard.py b/tests/hermes_cli/test_kanban_auxiliary_lockguard.py
+new file mode 100644
+index 0000000000..f98767f07d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_auxiliary_lockguard.py
+@@ -0,0 +1,258 @@
++"""Auxiliary board readers must survive raw I/O while they hold a WAL view."""
++from contextlib import closing
++import sqlite3
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli import kanban_worktree_gc as gc
++from hermes_cli import kanban_placement_forward as placement
++from hermes_cli import kanban_lockguard
++
++
++@pytest.fixture
++def board(tmp_path):
++    path = tmp_path / "kanban.db"
++    with closing(sqlite3.connect(path)) as conn:
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE tasks (id TEXT)")
++        conn.execute("INSERT INTO tasks VALUES ('one')")
++        conn.commit()
++    return path
++
++
++def _assert_reader_survives(conn, path):
++    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
++    for suffix in ("", "-shm"):
++        with open(str(path) + suffix, "rb") as stream:
++            stream.read(16)
++    subprocess.run(
++        [sys.executable, "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
++         "c.execute(\"INSERT INTO tasks (id) VALUES ('two')\"); c.commit(); c.close()", str(path)],
++        check=True, timeout=20,
++    )
++    assert not kanban_lockguard.stranded_sidecars(path)
++    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++
++
++@pytest.mark.platforms("linux")
++def test_gc_reader_survives_stray_close(board):
++    with gc._read_board(board) as conn:
++        _assert_reader_survives(conn, board)
++
++
++@pytest.mark.platforms("linux")
++def test_placement_reader_survives_stray_close(board, monkeypatch):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_db as kb
++
++    monkeypatch.setattr(kb, "kanban_db_path", lambda **kwargs: board)
++
++    def read_state(conn, task_id):
++        _assert_reader_survives(conn, board)
++        return {"target": "hub"}
++
++    monkeypatch.setattr(placement, "state", read_state)
++    assert placement.forward_argv(SimpleNamespace(id="one", skills=[]), None, ["hermes"])
++
++
++def _strand(path):
++    for suffix in ("", "-shm"):
++        with open(str(path) + suffix, "rb") as stream:
++            stream.read(16)
++    subprocess.run(
++        [sys.executable, "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
++         "c.execute(\"INSERT INTO tasks (id) VALUES ('two')\"); c.commit(); c.close()", str(path)],
++        check=True, timeout=20,
++    )
++    assert kanban_lockguard.stranded_sidecars(path)
++
++
++@pytest.mark.platforms("linux")
++def test_recovery_retires_all_alias_caches_and_idle_board_handles(board, monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++    alias = board.with_name("alias.db")
++    alias.symlink_to(board)
++    activity._reset_cache_for_tests()
++    reader = None
++    try:
++        with monkeypatch.context() as m:
++            m.setattr(kanban_lockguard, "guard", lambda conn: False)
++            reader = kanban_lockguard.connect(board)
++            reader.execute("SELECT * FROM tasks").fetchall()
++            for path in (board, alias):
++                with activity.cached_ro(path) as conn:
++                    conn.execute("SELECT * FROM tasks").fetchall()
++        _strand(board)
++        with activity.cached_ro(board) as conn:
++            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++        assert not kanban_lockguard.stranded_sidecars(board)
++        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
++            reader.execute("SELECT 1")
++    finally:
++        if reader is not None:
++            reader.close()
++        activity._reset_cache_for_tests()
++
++
++@pytest.mark.platforms("linux")
++def test_recovery_does_not_rollback_a_live_transaction(board, monkeypatch):
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++    with monkeypatch.context() as m:
++        m.setattr(kanban_lockguard, "guard", lambda conn: False)
++        reader = kanban_lockguard.connect(board)
++        reader.execute("BEGIN")
++        reader.execute("SELECT * FROM tasks").fetchall()
++    try:
++        _strand(board)
++        with pytest.raises(DeletedWalGenerationError):
++            kanban_lockguard.connect(board)
++        assert reader.in_transaction
++    finally:
++        reader.rollback()
++        reader.close()
++    with closing(kanban_lockguard.connect(board)) as fresh:
++        assert fresh.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("registered", [False, True])
++def test_unregistered_stranded_peer_refuses_retries_and_ro_fallback(board, monkeypatch, registered):
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++    raw = sqlite3.connect(board)
++    raw.execute("SELECT * FROM tasks").fetchall()
++    peer = None
++    try:
++        if registered:
++            with monkeypatch.context() as m:
++                m.setattr(kanban_lockguard, "guard", lambda conn: False)
++                peer = kanban_lockguard.connect(board)
++        _strand(board)
++        for _ in range(2):
++            with pytest.raises(DeletedWalGenerationError):
++                kanban_lockguard.connect(board)
++        with pytest.raises(DeletedWalGenerationError):
++            with gc._read_board(board):
++                pass
++    finally:
++        raw.close()
++        if peer is not None:
++            peer.close()
++    with closing(kanban_lockguard.connect(board)) as conn:
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++
++
++@pytest.mark.platforms("linux")
++def test_foreign_thread_handle_refused_until_owner_closes(board, monkeypatch):
++    import threading
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++    opened, release = threading.Event(), threading.Event()
++    errors = []
++
++    def owner():
++        try:
++            with closing(kanban_lockguard.connect(board)) as conn:
++                conn.execute("SELECT * FROM tasks").fetchall()
++                opened.set()
++                assert release.wait(10)
++        except BaseException as exc:
++            errors.append(exc)
++            opened.set()
++
++    with monkeypatch.context() as m:
++        m.setattr(kanban_lockguard, "guard", lambda conn: False)
++        thread = threading.Thread(target=owner)
++        thread.start()
++        assert opened.wait(10)
++    try:
++        assert not errors
++        _strand(board)
++        with pytest.raises(DeletedWalGenerationError, match="foreign-thread"):
++            kanban_lockguard.connect(board)
++    finally:
++        release.set()
++        thread.join(10)
++    assert not thread.is_alive()
++    assert not errors
++    with closing(kanban_lockguard.connect(board)) as conn:
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++
++
++@pytest.mark.platforms("linux")
++def test_borrowed_cache_is_not_closed_or_waited_on_during_recovery(board, monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++    activity._reset_cache_for_tests()
++    try:
++        with monkeypatch.context() as m:
++            m.setattr(kanban_lockguard, "guard", lambda conn: False)
++            with activity.cached_ro(board) as borrowed:
++                borrowed.execute("SELECT * FROM tasks").fetchall()
++                _strand(board)
++                with pytest.raises(DeletedWalGenerationError, match="borrowed"):
++                    kanban_lockguard.connect(board)
++                # Still open (never closed under the borrower, even on this same thread).
++                assert not borrowed.in_transaction
++        with activity.cached_ro(board) as conn:
++            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++        assert not kanban_lockguard.stranded_sidecars(board)
++    finally:
++        activity._reset_cache_for_tests()
++
++
++@pytest.mark.platforms("linux")
++def test_gc_write_handle_survives_stray_close(board, monkeypatch):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_db as kb
++    with closing(sqlite3.connect(board)) as conn:
++        conn.execute("ALTER TABLE tasks ADD COLUMN workspace_path TEXT")
++    monkeypatch.setattr(gc, "retention_days", lambda: 7)
++    monkeypatch.setattr(gc.ws, "_sibling_board_db_files", lambda conn: [board])
++    monkeypatch.setattr(kb, "kanban_db_path", lambda: board)
++    monkeypatch.setattr(gc.ws, "_git", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=""))
++    calls = []
++
++    def collect(conn, **kwargs):
++        _assert_reader_survives(conn, board)
++        calls.append(True)
++
++    monkeypatch.setattr(gc, "gc_task_worktrees", collect)
++    gc._sweep_repo(str(board.parent))
++    assert calls == [True]
++
++
++@pytest.mark.platforms("linux")
++def test_imported_backup_guards_source_and_preserves_snapshot(board, tmp_path, monkeypatch):
++    from hermes_cli.backup_sqlite import _safe_copy_db
++    real_connect = kanban_lockguard.connect
++    calls = []
++
++    def checked(*args, **kwargs):
++        conn = real_connect(*args, **kwargs)
++        assert kanban_lockguard.is_guarded(conn)
++        _assert_reader_survives(conn, board)
++        calls.append(True)
++        return conn
++
++    monkeypatch.setattr(kanban_lockguard, "connect", checked)
++    destination = tmp_path / "snapshot.db"
++    assert _safe_copy_db(board, destination)
++    assert calls == [True]
++    with closing(sqlite3.connect(destination)) as snapshot:
++        assert snapshot.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++
++
++@pytest.mark.platforms("linux")
++def test_preopen_probe_does_not_drop_untracked_readers_locks(board):
++    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
++    with closing(sqlite3.connect(board)) as reader:
++        reader.execute("SELECT * FROM tasks").fetchall()
++        assert read_header_bytes_preopen(board, length=16) == b"SQLite format 3\x00"
++        subprocess.run(
++            [sys.executable, "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
++             "c.execute(\"INSERT INTO tasks (id) VALUES ('two')\"); c.commit(); c.close()", str(board)],
++            check=True, timeout=20,
++        )
++        assert not kanban_lockguard.stranded_sidecars(board)
++        assert reader.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
+diff --git a/tests/hermes_cli/test_kanban_lockguard.py b/tests/hermes_cli/test_kanban_lockguard.py
+index 37b39c1ae8..718f64e854 100644
+--- a/tests/hermes_cli/test_kanban_lockguard.py
++++ b/tests/hermes_cli/test_kanban_lockguard.py
+@@ -232,7 +232,7 @@ def test_kanban_modules_open_boards_only_through_the_guard():
+     root = Path(__file__).resolve().parents[2] / "hermes_cli"
+     allowed = {
+         # state.db / hub.db / in-memory / offline copies, not live boards
+-        "kanban_worker_recovery.py", "kanban_transfer.py", "kanban_worktree_gc.py",
++        "kanban_worker_recovery.py", "kanban_transfer.py",
+         "kanban_origin_ledger.py", "kanban_lockguard.py",
+         # connects only inside its own short-lived child (`python -m hermes_cli.kanban_db_recover`);
+         # in-process callers (kanban_ops, the dispatcher) reach it only through spawn_recovery()
+diff --git a/tests/hermes_cli/test_kanban_worker_recovery.py b/tests/hermes_cli/test_kanban_worker_recovery.py
+index b4c734b048..cd93f1d48d 100644
+--- a/tests/hermes_cli/test_kanban_worker_recovery.py
++++ b/tests/hermes_cli/test_kanban_worker_recovery.py
+@@ -67,6 +67,23 @@ def test_crash_and_budget_continuation_survives_reopen(worker, outcome):
+     assert "does not increase" in result
+ 
+ 
++def test_registration_uses_guarded_wal_board(worker, monkeypatch):
++    from hermes_cli import kanban_lockguard
++    worker.conn.execute("PRAGMA journal_mode=WAL")
++    real = kanban_lockguard.connect
++    calls = []
++
++    def checked(*args, **kwargs):
++        conn = real(*args, **kwargs)
++        assert kanban_lockguard.is_guarded(conn)
++        calls.append(True)
++        return conn
++
++    monkeypatch.setattr(kanban_lockguard, "connect", checked)
++    assert recovery.register_worker_session(worker, "worker")
++    assert calls == [True]
++
++
+ def test_open_run_is_not_its_own_recovery(worker):
+     assert recovery.register_worker_session(worker, "worker")
+     assert recovery.build_recovery_context(worker.conn, "t_one") == ""
+-- 
+2.55.0
+

@@ -1,0 +1,1065 @@
+From cc29d783ed4fe3aef41b5b84cc2f4e8224b084ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:22:10 +0000
+Subject: [PATCH] feat(core-update): pause auto-continuable Desktop turns at a
+ step boundary for a drain window [daveey]
+
+hermes-sync's drain window held update admission until every turn in flight ended, so one
+long autonomous turn held the update for whole windows, again and again (t_01a1827558218fed).
+
+The drainer now writes <root>/core-update/pause-request {version, expires_at} beside its hold
+once every remaining turn is one the updated backend auto-continues. admission_fence.pause_requested
+honours it only under the hold and before expires_at. The agent loop consults a per-turn
+step_boundary_pause hook after a step's tool results are appended and persisted, before the
+next model call, never mid-tool or mid-call. tui_gateway/update_pause.py installs the hook,
+declines turns the startup sweep would not resume (resume_on_startup off, opted out, attempt or
+pause cap, stale, hosted room), stamps the marker reason=core_update_pause, keeps it past the
+terminal frame, and shows 'Paused for a Hermes update; continues automatically'. The turn's
+admission reservation is released as the turn thread ends, so the update applies. The restarted
+backend's sweep continues the turn with a pause note that uses no crash attempt (pauses are
+counted apart, max 3). If the window ends without an update, a bounded watcher continues the turn in place.
+---
+ agent/conversation_loop.py                    |   4 +
+ agent/turn_iteration_prep.py                  |  28 ++
+ hermes_cli/admission_fence.py                 |  39 +++
+ tests/agent/test_step_boundary_pause.py       | 159 ++++++++++
+ .../hermes_cli/test_admission_fence_pause.py  |  53 ++++
+ tests/tui_gateway/test_update_pause.py        | 294 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  17 +-
+ tui_gateway/session_auto_continue.py          |  21 +-
+ tui_gateway/turn_marker.py                    |  31 +-
+ tui_gateway/update_pause.py                   | 194 ++++++++++++
+ 10 files changed, 833 insertions(+), 7 deletions(-)
+ create mode 100644 tests/agent/test_step_boundary_pause.py
+ create mode 100644 tests/hermes_cli/test_admission_fence_pause.py
+ create mode 100644 tests/tui_gateway/test_update_pause.py
+ create mode 100644 tui_gateway/update_pause.py
+
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index ab578e21c8..d5b961dfa1 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1699,6 +1699,9 @@ def _run_conversation_turn(
+         name: getattr(s, name)
+         for name in inspect.signature(finalize_turn).parameters if name != "agent"
+     })
++    # [daveey] A core-update pause at a step boundary (turn_iteration_prep.begin_iteration).
++    if _paused := vars(agent).pop("_step_boundary_paused", None):
++        result["paused_for_update"] = _paused
+     if s._compression_timeout_exhausted:
+         # Reuse the gateway's context-recovery contract: transcript stays intact while
+         # future input can move to a clean session (#98722).
+@@ -1736,6 +1739,7 @@ def run_conversation(
+ 
+     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
+     agent._turn_user_intervened = False
++    vars(agent).pop("_step_boundary_paused", None)  # [daveey] per-turn core-update pause verdict
+     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
+     # it does not embed the same pixels a second time into the same request (#76411).
+     with native_turn_images(user_message):
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index 5300e91385..0ef1ec8f83 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -349,6 +349,22 @@ class IterationStart:
+     _turn_exit_reason: Any
+ 
+ 
++def _step_boundary_pause(agent: Any, messages: Any, api_call_count: Any) -> Any:
++    """The installed pause hook's reason, consulted only at a real step boundary: at least one model
++    call ran this turn and the transcript ends on a tool result. A failing hook never pauses."""
++    hook = getattr(agent, "step_boundary_pause", None)
++    if not callable(hook) or not api_call_count or not messages:
++        return None
++    last = messages[-1]
++    if not isinstance(last, dict) or last.get("role") != "tool":
++        return None
++    try:
++        return hook() or None
++    except Exception:
++        logger.debug("step boundary pause hook failed", exc_info=True)
++        return None
++
++
+ def begin_iteration(
+     agent: Any, *, messages: Any, conversation_history: Any, original_user_message: Any,
+     api_call_count: Any, interrupted: Any, _turn_exit_reason: Any,
+@@ -387,6 +403,18 @@ def begin_iteration(
+             agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+         return _verdict("break")
+ 
++    # [daveey] Core-update pause (t_01a1827558218fed): the step boundary is here, after every tool
++    # result of the previous step is appended and before the next model call. The Desktop/TUI gateway
++    # installs ``step_boundary_pause`` per turn; a reason ends the turn as an interrupt it auto-continues
++    # on the updated backend. Persist first, so the next backend sees every finished tool result.
++    _pause = _step_boundary_pause(agent, messages, api_call_count)
++    if _pause:
++        agent._persist_session(messages, conversation_history)
++        agent._step_boundary_paused = _pause
++        interrupted = True
++        _turn_exit_reason = f"paused_for_update({_pause})"
++        return _verdict("break")
++
+     # Aggregate input budget for detached auxiliary forks bounds the whole review, not
+     # each request; checked between iterations so the crossing request's writes landed.
+     if _review_input_budget_exhausted(agent):
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+index 604f0a65ac..00c49d15bd 100644
+--- a/hermes_cli/admission_fence.py
++++ b/hermes_cli/admission_fence.py
+@@ -147,6 +147,45 @@ def clear_hold(home):
+         (root / "holds" / "hermes-sync").unlink(missing_ok=True)
+ 
+ 
++# [daveey] Core-update pause request (t_01a1827558218fed). hermes-sync's drain window writes this JSON
++# file beside the hold ({"version": 1, "expires_at": <epoch s>, ...}) to ask turns the next backend can
++# auto-continue to end at their next step boundary. It counts only while the hold stands and before
++# expires_at, so a file a crashed drainer leaves behind never outlives its window. hermes-sync writes it
++# directly (no core call), so the format is the contract: keep it backward compatible.
++PAUSE_REQUEST = "pause-request"
++
++
++def pause_requested(home):
++    """Cheap boundary check: one stat when no request exists. Never raises."""
++    root = Path(home) / "core-update"
++    try:
++        (root / PAUSE_REQUEST).stat()
++    except OSError:
++        return False
++    try:
++        body = json.loads((root / PAUSE_REQUEST).read_text(encoding="utf-8"))
++        expires_at = float(body["expires_at"])
++    except (OSError, ValueError, TypeError, KeyError):
++        return False
++    try:
++        return expires_at > time.time() and is_held(root)
++    except OSError:
++        return False
++
++
++def request_pause(home, *, expires_at, pid=None):
++    root = Path(home) / "core-update"
++    root.mkdir(parents=True, exist_ok=True)
++    tmp = root / f".{PAUSE_REQUEST}.{os.getpid()}.tmp"
++    tmp.write_text(json.dumps({"version": 1, "pid": pid or os.getpid(), "requested_at": time.time(),
++                               "expires_at": float(expires_at)}) + "\n", encoding="utf-8")
++    os.replace(tmp, root / PAUSE_REQUEST)
++
++
++def clear_pause_request(home):
++    (Path(home) / "core-update" / PAUSE_REQUEST).unlink(missing_ok=True)
++
++
+ def main():
+     import argparse
+ 
+diff --git a/tests/agent/test_step_boundary_pause.py b/tests/agent/test_step_boundary_pause.py
+new file mode 100644
+index 0000000000..8a9e353561
+--- /dev/null
++++ b/tests/agent/test_step_boundary_pause.py
+@@ -0,0 +1,159 @@
++"""[daveey] A core-update pause ends a turn only at a step boundary.
++
++The boundary is after every tool result of the step is appended and persisted, and before the next model
++call; never during a running tool or a model call. ``agent.step_boundary_pause`` (installed per turn by the
++Desktop/TUI gateway) is consulted there; a truthy reason ends the turn as an interrupt the gateway can
++auto-continue.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from run_agent import AIAgent
++
++
++def _tool_call(i: int) -> SimpleNamespace:
++    return SimpleNamespace(id=f"call_{i}", type="function",
++                           function=SimpleNamespace(name="web_search", arguments='{"query": "x"}'))
++
++
++def _tool_response(i: int) -> SimpleNamespace:
++    message = SimpleNamespace(content=None, reasoning_content=None, reasoning=None, tool_calls=[_tool_call(i)])
++    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
++                           model="test/model", usage=None)
++
++
++def _final_response() -> SimpleNamespace:
++    message = SimpleNamespace(content="done", reasoning_content=None, reasoning=None, tool_calls=None)
++    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
++                           model="test/model", usage=None)
++
++
++def _tool_definition() -> dict:
++    return {"type": "function", "function": {
++        "name": "web_search", "description": "Search the web",
++        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
++
++
++def _make_agent(events: list, tool_seconds: float = 0.0, on_tool_start=None):
++    with (
++        patch("model_tools.get_tool_definitions", return_value=[_tool_definition()]),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++        patch("agent.model_metadata.get_model_context_length", return_value=256_000),
++        patch("agent.context_compressor.get_model_context_length", return_value=256_000),
++    ):
++        agent = AIAgent(api_key="test", base_url="https://openrouter.ai/api/v1",
++                        model="test/model", quiet_mode=True, skip_context_files=True, skip_memory=True,
++                        max_iterations=10)
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent._disable_streaming = True
++    agent.tool_delay = 0
++    agent.save_trajectories = False
++    agent.max_compression_attempts = 1
++    compressor = MagicMock()
++    compressor.protect_first_n = 3
++    compressor.protect_last_n = 20
++    compressor.threshold_tokens = 999_999_999
++    compressor.context_length = 1_000_000_000
++    compressor.last_prompt_tokens = -1
++    compressor._verify_compaction_cleared_threshold = False
++    compressor.awaiting_real_usage_after_compression = False
++    compressor.should_compress.return_value = False
++    compressor.should_compress_info.return_value = (False, None)
++    compressor.should_compress_preflight.return_value = False
++    compressor.should_defer_preflight_to_real_usage.return_value = False
++    compressor.get_active_compression_failure_cooldown.return_value = None
++    compressor.select_context.return_value = None
++    compressor.get_automatic_compaction_status_message.return_value = ""
++    agent.compression_enabled = False
++    agent.context_compressor = compressor
++
++    def _execute(assistant_message, messages, *_args):
++        call = assistant_message.tool_calls[0]
++        events.append(("tool_start", call.id))
++        if on_tool_start is not None:
++            on_tool_start()
++        time.sleep(tool_seconds)
++        messages.append({"role": "tool", "name": call.function.name, "tool_call_id": call.id, "content": "ok"})
++        events.append(("tool_end", call.id))
++
++    agent._execute_tool_calls = _execute
++    return agent
++
++
++def _run(agent, responses, events):
++    agent.client.chat.completions.create.side_effect = responses
++
++    def _persist(messages, *_a, **_k):
++        events.append(("persist", [m.get("role") for m in messages]))
++
++    with (
++        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
++        patch.object(agent, "_persist_session", side_effect=_persist),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        return agent.run_conversation("do some tool work")
++
++
++def test_pause_requested_during_a_running_tool_ends_the_turn_after_it():
++    """The request lands while a 2-s tool runs: the tool finishes, its result is persisted, then the turn
++    ends with no further model call."""
++    events: list = []
++    requested = threading.Event()
++
++    def _hook():
++        events.append(("hook", requested.is_set()))
++        return "core_update_pause" if requested.is_set() else None
++
++    agent = _make_agent(events, tool_seconds=2.0, on_tool_start=requested.set)
++    agent.step_boundary_pause = _hook
++    started = time.monotonic()
++    result = _run(agent, [_tool_response(1), _tool_response(2), _final_response()], events)
++
++    assert time.monotonic() - started >= 2.0  # the tool ran to completion
++    assert agent.client.chat.completions.create.call_count == 1
++    assert result["interrupted"] is True
++    assert result["completed"] is False
++    assert result["paused_for_update"] == "core_update_pause"
++    names = [e[0] for e in events]
++    # Consulted only at the boundary: after the tool ended, never while it ran.
++    assert names.index("tool_end") < names.index("hook")
++    hook_at = names.index("hook")
++    # The tool result was persisted at the boundary, before the turn ended.
++    assert any(e[0] == "persist" and e[1][-1] == "tool" for e in events[hook_at:])
++
++
++def test_hook_declining_lets_the_turn_run_to_completion():
++    events: list = []
++    agent = _make_agent(events)
++    agent.step_boundary_pause = lambda: None
++    result = _run(agent, [_tool_response(1), _final_response()], events)
++    assert agent.client.chat.completions.create.call_count == 2
++    assert result["completed"] is True and result["final_response"] == "done"
++    assert not result.get("paused_for_update")
++
++
++def test_no_hook_is_unchanged():
++    events: list = []
++    agent = _make_agent(events)
++    result = _run(agent, [_tool_response(1), _final_response()], events)
++    assert result["completed"] is True
++    assert "paused_for_update" not in result
++
++
++def test_not_consulted_before_the_first_model_call():
++    """A turn that has not run a step yet has no boundary to pause at (nothing to continue from)."""
++    events: list = []
++    calls: list = []
++    agent = _make_agent(events)
++    agent.step_boundary_pause = lambda: calls.append(1) or None
++    _run(agent, [_final_response()], events)
++    assert calls == []
+diff --git a/tests/hermes_cli/test_admission_fence_pause.py b/tests/hermes_cli/test_admission_fence_pause.py
+new file mode 100644
+index 0000000000..3992c64528
+--- /dev/null
++++ b/tests/hermes_cli/test_admission_fence_pause.py
+@@ -0,0 +1,53 @@
++"""[daveey] The core-update pause request: hermes-sync's drain window asks auto-continuable Desktop turns to
++pause at their next step boundary. The request is ``<root>/core-update/pause-request`` beside the admission
++hold, and it only counts while that hold stands and before its ``expires_at`` (scoped to one window)."""
++
++from __future__ import annotations
++
++import json
++import time
++
++from hermes_cli import admission_fence as af
++
++
++def _hold(root):
++    af.set_hold(root)
++
++
++def test_no_request_file_means_no_pause(tmp_path):
++    _hold(tmp_path)
++    assert af.pause_requested(tmp_path) is False
++
++
++def test_request_under_the_hold_is_active(tmp_path):
++    _hold(tmp_path)
++    af.request_pause(tmp_path, expires_at=time.time() + 60)
++    assert af.pause_requested(tmp_path) is True
++    body = json.loads((tmp_path / "core-update" / "pause-request").read_text())
++    assert body["version"] == 1 and body["expires_at"] > time.time()
++
++
++def test_request_without_the_hold_is_ignored(tmp_path):
++    """A stale file a crashed drainer left behind must not pause turns once its window is over."""
++    af.request_pause(tmp_path, expires_at=time.time() + 60)
++    assert af.pause_requested(tmp_path) is False
++
++
++def test_expired_request_is_ignored(tmp_path):
++    _hold(tmp_path)
++    af.request_pause(tmp_path, expires_at=time.time() - 1)
++    assert af.pause_requested(tmp_path) is False
++
++
++def test_unreadable_request_is_ignored(tmp_path):
++    _hold(tmp_path)
++    (tmp_path / "core-update" / "pause-request").write_text("{not json")
++    assert af.pause_requested(tmp_path) is False
++
++
++def test_clear_removes_the_request(tmp_path):
++    _hold(tmp_path)
++    af.request_pause(tmp_path, expires_at=time.time() + 60)
++    af.clear_pause_request(tmp_path)
++    assert af.pause_requested(tmp_path) is False
++    af.clear_pause_request(tmp_path)  # idempotent
+diff --git a/tests/tui_gateway/test_update_pause.py b/tests/tui_gateway/test_update_pause.py
+new file mode 100644
+index 0000000000..aeb4315fc1
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause.py
+@@ -0,0 +1,294 @@
++"""[daveey] Core-update pause: a Desktop turn the restarted backend can auto-continue pauses at a step
++boundary when hermes-sync's drain window asks (``<root>/core-update/pause-request``), so a long turn no
++longer holds an update for a whole window. The turn keeps its interrupted-turn marker (``reason:
++core_update_pause``), releases its admission reservation, and the next backend continues it with a note
++that does not use up a crash-resume attempt. Turns that cannot be auto-continued are untouched.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++import time
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker, record_turn_start
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++def _session(agent=None, **extra):
++    return {"agent": agent if agent is not None else types.SimpleNamespace(), "session_key": "session-key",
++            "history": [], "history_lock": threading.RLock(), "history_version": 0, "running": False,
++            "attached_images": [], "image_counter": 0, "cols": 80, "slash_worker": None,
++            "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None, **extra}
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    return tmp_path
++
++
++def _request_pause(root):
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 120)
++
++
++# ── The boundary hook ────────────────────────────────────────────────────────────────────────────────
++
++
++def test_no_request_no_pause(home):
++    record_turn_start(home, "session-key", "the prompt")
++    assert up.boundary_pause_hook(_session(profile_home=str(home)), "session-key")() is None
++    assert "reason" not in read_turn_marker(home, "session-key")
++
++
++def test_resumable_turn_pauses_and_its_marker_survives_the_turn_end(home):
++    record_turn_start(home, "session-key", "the prompt")
++    session = _session(profile_home=str(home))
++    _request_pause(home)
++
++    assert up.boundary_pause_hook(session, "session-key")() == up.PAUSE_REASON
++
++    marker = read_turn_marker(home, "session-key")
++    assert marker["auto_continue"] is True
++    assert marker["reason"] == "core_update_pause"
++    assert marker["pauses"] == 1 and marker["attempts"] == 0
++    assert marker["prompt"] == "the prompt"
++    # The paused turn's terminal frame must not retire the marker: the next backend continues from it.
++    server._retire_turn_marker(session, "session-key")
++    assert read_turn_marker(home, "session-key") is not None
++
++
++@pytest.mark.parametrize("case", ["resume_on_startup_off", "auto_continue_disabled", "bot_room", "opted_out",
++                                  "attempts_used_up", "pauses_used_up", "stale", "no_marker"])
++def test_turn_that_cannot_be_auto_continued_is_untouched(home, monkeypatch, case):
++    cfg = {"desktop": {"auto_continue": dict(CFG["desktop"]["auto_continue"])}}
++    extra = {}
++    if case == "resume_on_startup_off":
++        cfg["desktop"]["auto_continue"]["resume_on_startup"] = False
++    if case == "auto_continue_disabled":
++        cfg["desktop"]["auto_continue"]["enabled"] = False
++    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
++    if case == "bot_room":
++        extra["source"] = "bot_room"
++    if case != "no_marker":
++        record_turn_start(home, "session-key", "the prompt", auto_continue=case != "opted_out",
++                          attempts=2 if case == "attempts_used_up" else 0,
++                          pauses=up.MAX_PAUSES if case == "pauses_used_up" else 0)
++    if case == "stale":
++        later = time.time() + 4 * 3600  # past the 240-min freshness window
++        monkeypatch.setattr(up, "_now", lambda: later)
++    _request_pause(home)
++
++    assert up.boundary_pause_hook(_session(profile_home=str(home), **extra), "session-key")() is None
++    marker = read_turn_marker(home, "session-key")
++    assert marker is None or "reason" not in marker
++
++
++# ── The whole turn ───────────────────────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture()
++def turn_env(monkeypatch, tmp_path, home):
++    frames: list = []
++    watchers: list = []
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None, *a, **k: frames.append((event, payload)))
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(up, "start_in_place_watcher", lambda sid, session, key: watchers.append((sid, key)))
++    return types.SimpleNamespace(frames=frames, watchers=watchers)
++
++
++def test_paused_turn_releases_its_reservation_keeps_its_marker_and_says_so(turn_env, home):
++    seen = {}
++
++    def _run(message, **kwargs):
++        seen["reservations_in_turn"] = af.state(home)["reservations"]
++        _request_pause(home)  # the drain window asks while the turn is mid-step
++        reason = agent.step_boundary_pause()
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False,
++                "paused_for_update": reason}
++
++    agent = types.SimpleNamespace(session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None)
++    session = _session(agent=agent, running=True, profile_home=str(home))
++    server._run_prompt_submit("rid", "ui-sid", session, "the prompt")
++
++    assert seen["reservations_in_turn"] == 1
++    assert af.state(home)["reservations"] == 0  # the drain can apply
++    marker = read_turn_marker(home, "session-key")
++    assert marker is not None and marker["reason"] == "core_update_pause" and marker["auto_continue"] is True
++    statuses = [p.get("text") for e, p in turn_env.frames if e == "status.update" and p]
++    assert up.PAUSE_STATUS_TEXT in statuses
++    (complete,) = [p for e, p in turn_env.frames if e == "message.complete"]
++    assert up.PAUSE_STATUS_TEXT in complete["text"]
++    assert session["running"] is False
++    assert agent.step_boundary_pause is None  # per-turn hook, never left on the cached agent
++    assert turn_env.watchers == [("ui-sid", "session-key")]
++
++
++def test_turn_without_a_request_ends_normally(turn_env, home):
++    def _run(message, **kwargs):
++        assert agent.step_boundary_pause() is None
++        return {"final_response": "done", "messages": []}
++
++    agent = types.SimpleNamespace(session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None)
++    server._run_prompt_submit("rid", "ui-sid", _session(agent=agent, running=True, profile_home=str(home)), "go")
++    assert read_turn_marker(home, "session-key") is None
++    assert turn_env.watchers == []
++
++
++def test_next_user_turn_retires_its_own_marker_again(turn_env, home):
++    """The pause's keep-the-marker flag belongs to the paused turn only."""
++    session = _session(running=True, profile_home=str(home))
++    calls = {"n": 0}
++
++    def _run(message, **kwargs):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            _request_pause(home)
++            return {"final_response": "", "messages": [], "interrupted": True,
++                    "paused_for_update": session["agent"].step_boundary_pause()}
++        return {"final_response": "done", "messages": []}
++
++    session["agent"] = types.SimpleNamespace(session_id="session-key", run_conversation=_run,
++                                             clear_interrupt=lambda: None)
++    server._run_prompt_submit("rid", "ui-sid", session, "first")
++    af.clear_pause_request(home)
++    af.clear_hold(home)
++    session["running"] = True
++    server._run_prompt_submit("rid", "ui-sid", session, "second")
++    assert read_turn_marker(home, "session-key") is None
++
++
++def test_continuation_turn_carries_the_pause_count_not_an_attempt(turn_env, home):
++    seen = []
++
++    def _run(message, **kwargs):
++        seen.append(read_turn_marker(home, "session-key"))
++        return {"final_response": "done", "messages": []}
++
++    agent = types.SimpleNamespace(session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None)
++    session = _session(agent=agent, running=True, profile_home=str(home), _auto_continue_attempt=0,
++                       _auto_continue_pauses=1, _auto_continue_prompt="the original prompt")
++    server._run_prompt_submit("rid", "ui-sid", session, up.pause_note("the original prompt"))
++    (marker,) = seen
++    assert (marker["attempts"], marker["pauses"], marker["prompt"]) == (0, 1, "the original prompt")
++    assert "reason" not in marker
++    assert "_auto_continue_pauses" not in session
++
++
++# ── Resume on the new backend ────────────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture()
++def schedule_env(monkeypatch, home):
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
++    monkeypatch.setattr(server, "_wait_agent", lambda session, rid, timeout=30.0: None)
++    submitted: list = []
++    monkeypatch.setattr(server, "_run_prompt_submit",
++                        lambda rid, sid, session, text, **kw: submitted.append((text, kw)))
++    return submitted
++
++
++def test_paused_turn_continues_with_the_pause_note_and_no_attempt_used(schedule_env, home):
++    record_turn_start(home, "session-key", "fix the flaky test", attempts=1)
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    session = _session()
++
++    result = server._maybe_schedule_auto_continue("sid", session, "session-key")
++
++    assert result is not None and result["attempt"] == 1  # unchanged: a pause is not a crash
++    assert session["_auto_continue_attempt"] == 1
++    assert session["_auto_continue_pauses"] == 1
++    (text, kwargs), = schedule_env
++    assert text == up.pause_note("fix the flaky test")
++    assert "paused at a step boundary" in text and "every tool result above is complete" in text.lower()
++    assert "fix the flaky test" in text
++    assert kwargs["display_kind"] == "auto_continue"
++
++
++def test_crash_marker_still_uses_the_crash_note(schedule_env, home):
++    record_turn_start(home, "session-key", "fix the flaky test")
++    session = _session()
++    server._maybe_schedule_auto_continue("sid", session, "session-key")
++    (text, _), = schedule_env
++    assert text.startswith("[System note: Your previous turn was interrupted")
++    assert session["_auto_continue_attempt"] == 1
++
++
++def test_startup_sweep_picks_up_a_paused_turn_of_a_dead_backend(home):
++    from tui_gateway import startup_resume as sr
++    import json
++    record_turn_start(home, "session-key", "the prompt")
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    path = home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries["session-key"]["writer_pid"] = 2 ** 22 - 3  # the pre-update backend has exited
++    entries["session-key"].pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++    assert [r["session_key"] for r in sr.pending_resumes(home, CFG)] == ["session-key"]
++
++
++# ── A window that ends without a restart ─────────────────────────────────────────────────────────────
++
++
++def test_in_place_resume_decision(home):
++    record_turn_start(home, "session-key", "the prompt")
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    session = _session(profile_home=str(home))
++    no_skew = lambda: None
++
++    _request_pause(home)
++    assert up.in_place_resume_action(session, "session-key", skew=no_skew) == "wait"
++    af.clear_pause_request(home)
++    assert up.in_place_resume_action(session, "session-key", skew=no_skew) == "wait"  # hold still up
++    af.clear_hold(home)
++    # The checkout moved: this backend retires once idle and the new one continues the turn.
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: ("a", "b")) == "leave"
++    # No update happened (window expired, apply refused): continue here.
++    assert up.in_place_resume_action(session, "session-key", skew=no_skew) == "resume"
++    session["running"] = True  # the user sent a new message first
++    assert up.in_place_resume_action(session, "session-key", skew=no_skew) == "done"
++    session["running"] = False
++    record_turn_start(home, "session-key", "a newer turn")
++    assert up.in_place_resume_action(session, "session-key", skew=no_skew) == "done"
++
++
++def test_marker_writer_is_this_process(home):
++    record_turn_start(home, "session-key", "p")
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    import json
++    entry = json.loads((home / "desktop" / "interrupted_turns.json").read_text())["session-key"]
++    assert entry["writer_pid"] == os.getpid() and entry["paused_at"] > 0
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 43cecc4a2e..e0a8912043 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -210,12 +210,15 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     marker_home = _session_home(session)
+     marker_key = str(session.get("session_key") or "")
+     marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
++    marker_pauses = int(session.pop("_auto_continue_pauses", 0) or 0)
+     marker_text = session.pop("_auto_continue_prompt", None) or text
++    # [daveey] A core-update pause kept the previous turn's marker; this turn owns (and retires) its own.
++    session.pop("_update_pause_marker_key", None)
+     if isinstance(marker_text, str) and marker_text.strip():
+         with session["history_lock"]:
+             session["_active_turn_marker_key"] = marker_key
+         record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
+-                          auto_continue=auto_continue,
++                          auto_continue=auto_continue, **({"pauses": marker_pauses} if marker_pauses else {}),
+                           **({"notification_category": "diagnostic"}
+                              if notification_category == "diagnostic" else {}))
+         with session["history_lock"]:
+@@ -869,6 +872,9 @@ def _invoke_agent(
+     agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
+         "session.title", sid, {"session_id": _k, "title": t})
+     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
++    # [daveey] Core-update pause: consulted by the agent loop at each step boundary of this turn only.
++    from tui_gateway.update_pause import boundary_pause_hook
++    agent.step_boundary_pause = boundary_pause_hook(session, st.marker_key) if st.marker_key else None
+     try:
+         from agent.notification_presentation import notification_turn, event_presentation_muted
+         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
+@@ -880,6 +886,7 @@ def _invoke_agent(
+             if submitted_row is not None and getattr(agent, "_pending_cli_user_message", None) is submitted_row:
+                 agent._pending_cli_user_message = None
+     finally:
++        agent.step_boundary_pause = None
+         # Stop AND join before anything emits: a tick surviving past message.complete would
+         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
+         _usage_stop.set()
+@@ -1270,6 +1277,10 @@ def _run_admitted_prompt(
+             status_note = _absorb_turn_result(
+                 sid, session, st, text, display_kind, display_metadata)
+             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
++            paused_for_update = isinstance(st.result, dict) and bool(st.result.get("paused_for_update"))
++            if paused_for_update:
++                from tui_gateway.update_pause import announce_pause
++                announce_pause(sid, payload)
+             # [daveey] A client Stop ended this turn: persist "Stopped by <login>" so the chat says why it
+             # went quiet (methods_session_interrupt._record_stop_notice; a no-op for any other ending).
+             _record_stop_notice(session, status)
+@@ -1278,6 +1289,10 @@ def _run_admitted_prompt(
+                 from tui_gateway.free_tier_task_done import note_task_done
+                 note_task_done(session, st.result, st.agent, display_kind)
+             _emit("message.complete", sid, payload)
++            if paused_for_update:
++                # The new backend continues it; if no update replaces this one, continue it here.
++                from tui_gateway import update_pause
++                update_pause.start_in_place_watcher(sid, session, st.marker_key)
+             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+             if status == "complete":
+                 _after_complete_turn(sid, session, st, raw)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index d8dd035649..f241dceb10 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -44,6 +44,9 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
+     (``_stop_turns_before_exit`` flags it) so the next boot auto-continues it like a crash."""
+     if session.get("_exit_keeps_turn_marker"):
+         return
++    # [daveey] A core-update pause keeps its marker: the next backend (or the in-place watcher) continues it.
++    if session.get("_update_pause_marker_key"):
++        return
+     home = _session_home(session)
+     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
+         if key:
+@@ -92,7 +95,14 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     if session.get("_auto_continue_scheduled"):
+         return None
+     session["_auto_continue_scheduled"] = True
+-    attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"])
++    # [daveey] A core-update pause is not a crash: no attempt is used and the note says the step finished.
++    paused = marker.get("reason") == "core_update_pause"
++    if paused:
++        from tui_gateway.update_pause import pause_note
++        attempt, text = marker["attempts"], pause_note(marker["prompt"])
++    else:
++        attempt, text = marker["attempts"] + 1, _auto_continue_note(marker["prompt"])
++    pauses = int(marker.get("pauses") or 0)
+ 
+     def kickoff() -> None:
+         rid = f"__auto_continue__{int(time.time() * 1000)}"
+@@ -125,12 +135,14 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+             # Marker inputs read back by _run_prompt_submit: attempt count (crash breaker) and the ORIGINAL prompt (no
+             # nested notes). Set here, not at schedule time, so a bail above leaves nothing for a racing user turn.
+             session["_auto_continue_attempt"], session["_auto_continue_prompt"] = attempt, marker["prompt"]
++            session["_auto_continue_pauses"] = pauses
+         try:
+             from gateway.warning_notifications import render_notification
+             diagnostic = marker.get("notification_category") == "diagnostic"
+             with _session_profile_runtime_scope(session):
+                 def announce():
+-                    _emit("status.update", sid, {"kind": "process", "text": "Resuming interrupted turn…"})
++                    _emit("status.update", sid, {"kind": "process", "text": "Resuming paused turn…" if paused
++                                                 else "Resuming interrupted turn…"})
+                     _emit("message.start", sid)
+                 render_notification(announce, platform="tui", diagnostic=diagnostic)
+                 _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
+@@ -141,8 +153,9 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     if _start_session_work(kickoff, name=f"auto-continue-{sid}", home=session.get("profile_home")) is None:
+         session["_auto_continue_scheduled"] = False
+         return None
+-    logger.info("auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago, writer pid %s: %s, "
+-                "reader pid %s)", session_key, attempt, age, marker.get("writer_pid"), writer_state, os.getpid())
++    logger.info("auto-continue scheduled for session %s (attempt %d%s, interrupted %.0fs ago, writer pid %s: %s, "
++                "reader pid %s)", session_key, attempt, ", core-update pause" if paused else "", age,
++                marker.get("writer_pid"), writer_state, os.getpid())
+     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
+ 
+ 
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index cb3d96db0b..98c9d7742e 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -113,14 +113,19 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> None:
+ 
+ 
+ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
+-                      auto_continue: bool = True, notification_category: str | None = None) -> None:
++                      auto_continue: bool = True, notification_category: str | None = None,
++                      pauses: int = 0) -> None:
+     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
+-    this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume."""
++    this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume.
++    ``pauses`` = core-update pauses this logical turn already took (``mark_turn_paused``), counted apart
++    from crash attempts so a pause never uses one up."""
+     if not session_key or not prompt:
+         return
+     now = time.time()
+     entry = {"attempts": max(0, int(attempts)), "prompt": prompt[:_MAX_PROMPT_CHARS], "started_at": now,
+              "auto_continue": bool(auto_continue), **_writer_identity()}
++    if pauses:
++        entry["pauses"] = max(0, int(pauses))
+     if notification_category == "diagnostic":
+         entry["notification_category"] = notification_category
+     # Identity only — never the prompt: this log is read on crash triage and must not carry turn content.
+@@ -134,6 +139,26 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
+         _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
+ 
+ 
++def mark_turn_paused(home: Path | str, session_key: str, reason: str) -> bool:
++    """[daveey] Stamp a live turn's marker as paused at a step boundary for a core update: ``reason``,
++    ``paused_at``, ``pauses`` + 1, and this process as its writer. ``auto_continue`` stays as recorded.
++    True when a marker existed to stamp."""
++    stamped = []
++
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not isinstance(entry, dict):
++            return None
++        entry.update(reason=str(reason), paused_at=time.time(), pauses=int(entry.get("pauses") or 0) + 1,
++                     **_writer_identity())
++        stamped.append(True)
++        return entries
++
++    if session_key:
++        _update(home, session_key, mutate, "pause")
++    return bool(stamped)
++
++
+ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | None:
+     """The marker left by a turn that never concluded, or None."""
+     if not session_key:
+@@ -146,8 +171,10 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+             return None
+         return {"attempts": max(0, int(entry.get("attempts") or 0)), "prompt": prompt, "started_at": _started_at(entry),
+                 "auto_continue": bool(entry.get("auto_continue", True)),
++                "pauses": max(0, int(entry.get("pauses") or 0)),
+                 # Writer identity when present: extra keys only, so a marker written by an older build still reads.
+                 **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
++                **({"reason": str(entry["reason"])} if entry.get("reason") else {}),
+                 **({"notification_category": "diagnostic"}
+                    if entry.get("notification_category") == "diagnostic" else {})}
+     except Exception:
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+new file mode 100644
+index 0000000000..3e8fb008ea
+--- /dev/null
++++ b/tui_gateway/update_pause.py
+@@ -0,0 +1,194 @@
++"""[daveey] Core-update pause for Desktop/TUI turns (t_01a1827558218fed).
++
++hermes-sync's drain window holds update admission while the turns in flight finish, so one long turn used
++to hold an update for the whole window, again and again. Once the window has waited a while and every
++remaining turn is one the updated backend auto-continues, the drainer writes a pause request beside the
++hold (``hermes_cli.admission_fence.pause_requested``). Each such turn then ends at its next step boundary
++(after its tool results are persisted, before the next model call; ``agent.turn_iteration_prep``), keeps
++its interrupted-turn marker stamped ``reason: core_update_pause``, and releases its admission reservation,
++so the update applies. The next backend's startup sweep continues the turn with ``pause_note`` and no
++crash-resume attempt is used. Pauses are counted apart (``MAX_PAUSES`` per turn) so they cannot loop.
++
++A turn the next backend would not auto-continue is never paused. A paused turn whose window ends without
++an update (expired, apply refused) continues in place (``start_in_place_watcher``), so it never hangs.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++import time
++from pathlib import Path
++from typing import Any, Callable
++
++logger = logging.getLogger(__name__)
++
++PAUSE_REASON = "core_update_pause"
++MAX_PAUSES = 3
++PAUSE_STATUS_TEXT = "Paused for a Hermes update; continues automatically"
++# The update itself takes a few minutes: a turn that would age out of the freshness window meanwhile is
++# not paused (mirrors hermes-sync's AUTO_CONTINUE_UPDATE_MARGIN_S).
++UPDATE_MARGIN_S = 600.0
++WATCH_POLL_S = 5.0
++WATCH_MAX_S = 6 * 3600.0
++# A skewed backend normally retires once idle and its successor continues the turn. One that is still
++# here this long after the checkout moved has no retirement path (e.g. a stdio TUI): continue in place.
++LEAVE_GRACE_S = 900.0
++
++
++def _now() -> float:
++    return time.time()
++
++
++def _home(session: dict) -> Path:
++    from tui_gateway import server
++    return Path(session.get("profile_home") or server._hermes_home)
++
++
++def _root(session: dict) -> Path:
++    from hermes_constants import get_default_hermes_root
++    return get_default_hermes_root(home=_home(session))
++
++
++def pause_requested(session: dict) -> bool:
++    from hermes_cli.admission_fence import pause_requested as requested
++    try:
++        return requested(_root(session))
++    except Exception:
++        return False
++
++
++def not_resumable_reason(session: dict, marker_key: str) -> str | None:
++    """None when the next backend will auto-continue this turn (the startup sweep's rules); else why not."""
++    from tui_gateway import server
++    from tui_gateway.startup_resume import _settings
++    from tui_gateway.turn_marker import read_turn_marker
++    if session.get("source") == "bot_room":
++        return "hosted room turn"
++    try:
++        on_startup, fresh_s, max_attempts, _ = _settings(server._load_cfg())
++    except Exception:
++        return "config unreadable"
++    if not on_startup:
++        return "desktop.auto_continue.resume_on_startup is off"
++    marker = read_turn_marker(_home(session), marker_key)
++    if marker is None:
++        return "no turn marker"
++    if not marker["auto_continue"]:
++        return "turn opted out of auto-continue"
++    if marker["attempts"] >= max_attempts:
++        return "crash-resume attempts used up"
++    if marker["pauses"] >= MAX_PAUSES:
++        return f"already paused {marker['pauses']} times"
++    if _now() - marker["started_at"] + UPDATE_MARGIN_S > fresh_s:
++        return "turn older than the auto-continue freshness window"
++    return None
++
++
++def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | None]:
++    """The per-turn ``agent.step_boundary_pause``: one stat per step while no pause is requested."""
++    declined: list[str] = []
++
++    def hook() -> str | None:
++        if not marker_key or not pause_requested(session):
++            return None
++        why = not_resumable_reason(session, marker_key)
++        if why:
++            if not declined:
++                declined.append(why)
++                logger.info("core-update pause: session %s keeps running (%s)", marker_key, why)
++            return None
++        from tui_gateway.turn_marker import mark_turn_paused
++        if not mark_turn_paused(_home(session), marker_key, PAUSE_REASON):
++            return None
++        with session["history_lock"]:
++            session["_update_pause_marker_key"] = marker_key
++        logger.info("core-update pause: session %s paused at a step boundary for a Hermes update", marker_key)
++        return PAUSE_REASON
++
++    return hook
++
++
++def pause_note(prompt: str) -> str:
++    from tui_gateway.session_history import _AUTO_CONTINUE_NOTE_PREFIX
++    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} — it was paused at a step boundary for a Hermes update. Every "
++            "tool result above is complete; continue with the next step and don't redo finished steps. "
++            f"The paused request was:]\n\n{prompt}")
++
++
++def announce_pause(sid: str, payload: dict) -> None:
++    """Make the pause visible: a status line plus the terminal frame's text."""
++    from tui_gateway import server
++    server._emit("status.update", sid, {"kind": "process", "text": PAUSE_STATUS_TEXT})
++    text = payload.get("text")
++    payload["text"] = f"{text}\n\n{PAUSE_STATUS_TEXT}" if isinstance(text, str) and text.strip() else PAUSE_STATUS_TEXT
++    payload.pop("rendered", None)
++    payload["paused_for_update"] = True
++
++
++def _detect_skew():
++    from gateway.code_skew import detect_code_skew
++    return detect_code_skew()
++
++
++def in_place_resume_action(session: dict, marker_key: str, *, skew: Callable[[], Any] | None = None) -> str:
++    """What a paused turn's own backend does now: ``wait`` (the window is still up), ``leave`` (the
++    checkout moved: the next backend continues it), ``resume`` (no update replaced us: continue here) or
++    ``done`` (the user or another path already moved on)."""
++    from hermes_cli.admission_fence import is_held
++    from tui_gateway.turn_marker import read_turn_marker
++    if pause_requested(session):
++        return "wait"
++    try:
++        held = is_held(_root(session) / "core-update")
++    except OSError:
++        held = True
++    if held:
++        return "wait"
++    if (skew or _detect_skew)() is not None:
++        return "leave"
++    with session["history_lock"]:
++        busy = bool(session.get("running") or session.get("_closing") or session.get("_finalized"))
++    if busy:
++        return "done"
++    marker = read_turn_marker(_home(session), marker_key)
++    if not marker or marker.get("reason") != PAUSE_REASON:
++        return "done"
++    return "resume"
++
++
++def start_in_place_watcher(sid: str, session: dict, marker_key: str) -> threading.Thread:
++    """Bounded daemon: continue the paused turn here when its window ends without an update."""
++
++    def run() -> None:
++        from tui_gateway import server
++        started, left_at = time.monotonic(), None
++        while time.monotonic() - started < WATCH_MAX_S:
++            time.sleep(WATCH_POLL_S)
++            try:
++                action = in_place_resume_action(session, marker_key)
++                if action == "leave":
++                    if left_at is None:
++                        left_at = time.monotonic()
++                        logger.info("core-update pause: checkout moved; session %s continues on the next backend",
++                                    marker_key)
++                    if time.monotonic() - left_at < LEAVE_GRACE_S:
++                        continue
++                    logger.info("core-update pause: backend still not replaced after %.0fs; continuing session "
++                                "%s here", LEAVE_GRACE_S, marker_key)
++                    action = "resume"
++                if action == "wait":
++                    continue
++                if action == "resume":
++                    if left_at is None:
++                        logger.info("core-update pause: window ended without an update; continuing session %s "
++                                    "here", marker_key)
++                    if server._maybe_schedule_auto_continue(sid, session, marker_key) is None:
++                        continue  # admission refused or not yet idle: the next poll decides again
++                return
++            except Exception:
++                logger.debug("core-update pause watcher for %s failed a poll", marker_key, exc_info=True)
++
++    thread = threading.Thread(target=run, daemon=True, name=f"update-pause-watch-{sid}")
++    thread.start()
++    return thread
+-- 
+2.55.0
+

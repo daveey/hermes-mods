@@ -1,6 +1,6 @@
 # Live Git configuration test isolation
 
-Patch: 0657 (c431bbb32e).
+Patch: 0667 (c431bbb32e).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ The per-test environment removes Git location variables. The session guard recor
 
 ## Applying
 
-Apply after 0656. Included to preserve the public append order before 0658.
+Apply after 0666. Included to preserve the public append order before 0668.
 
 ## Gotchas
 

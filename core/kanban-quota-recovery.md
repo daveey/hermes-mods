@@ -43,7 +43,7 @@ latest run, so the `outcome=rate_limited` branch stopped firing and the stamp ma
 
 ## Applying
 
-`git am -3 --empty=keep` after 0248-0251 (it shares the guard code).
+`git am -3 --empty=keep` after 0248, 0249, 0250, 0251 (it shares the guard code).
 
 ## Gotchas
 

@@ -1,0 +1,393 @@
+From 2f4774720dffc10774a4f2e9ff2294dfcc9f1230 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:55:26 -0700
+Subject: [PATCH] fix(kanban): audited orchestrator re-point of a completion
+ contract that can never pass [daveey]
+
+A finished card whose completion gate can never pass had no way out except a
+human "approve closing this card" ask. Seen 2026-10-28: a card bound to a PR on a
+suspended GitHub account (the merge already lived on the repo's new home) blocked
+on David, and a card bound to OWNER/REPO for a repo with no required checks would
+have hit the same wall at the end of a multi-hour run.
+
+- `hermes kanban edit <id> --completion-contract <local-only|OWNER/REPO|PR URL>
+  --reason "..."` (kanban_db_operator.set_completion_contract): validated like
+  kanban_create, refused on done/archived cards, with an empty reason, mixed with
+  other edit flags, or inside a kanban worker (HERMES_KANBAN_TASK), like unblock.
+  Records a contract_changed event (from, to, reason, actor) and a CONTRACT
+  CHANGED comment, and notifies the board sync.
+- Gate: gh exits 1 on GraphQL NOT_FOUND before the `repository is None` check, so a
+  suspended/moved/invisible repo was classified infra ("retry completion") forever.
+  It is now auth, as that check intended. The auth and no-required-checks details
+  name the orchestrator re-point and tell a worker to block without a human_request.
+---
+ hermes_cli/kanban.py                          |  40 +++++-
+ hermes_cli/kanban_db_operator.py              |  47 +++++++
+ hermes_cli/kanban_parser.py                   |   9 +-
+ hermes_cli/kanban_pr_acceptance.py            |  17 ++-
+ .../test_kanban_edit_operator_fields.py       | 122 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_pr_transport.py  |  35 +++++
+ 6 files changed, 265 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 25aeb361b6..97ab9b5fb3 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1301,7 +1301,45 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+ _OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runtime_seconds", "session_id")
+ 
+ 
++def _cmd_edit_contract(args: argparse.Namespace) -> int:
++    """``hermes kanban edit <id> --completion-contract X --reason Y``: the audited way out
++    of a completion gate that can never pass. Orchestrator-only, like unblock: a worker
++    that could re-point its own card's gate would make the gate meaningless. [daveey]"""
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return _err(
++            "kanban edit: --completion-contract is orchestrator-only; a worker can't change its own "
++            "card's gate. Block without a human_request so the owning chat re-points it", 2,
++        )
++    others = [f"--{name.replace('_', '-')}" for name in (
++        "title", "body", "priority", "result", "summary", "metadata", *_OPERATOR_EDIT_FLAGS,
++    ) if getattr(args, name, None) is not None]
++    if others or getattr(args, "force", False):
++        return _err(
++            "kanban edit: --completion-contract can't be combined with other edit flags "
++            f"({', '.join(others) or '--force'}); run them as separate edits", 2,
++        )
++    with kbc.connect_closing() as conn:
++        try:
++            change = kbo.set_completion_contract(
++                conn, args.task_id, args.completion_contract,
++                reason=getattr(args, "reason", None) or "", actor=_profile_author(),
++            )
++        except kbo.KanbanEditRefused as exc:
++            return _err(f"kanban edit: {exc}", 2)
++    if change is None:
++        return _err(f"cannot edit {args.task_id} (unknown id)")
++    if not change:
++        print(f"Edited {args.task_id} (completion_contract unchanged)")
++        return 0
++    print(f"Edited {args.task_id} (completion_contract: {change['old']!r} -> {change['new']!r})")
++    return 0
++
++
+ def _cmd_edit(args: argparse.Namespace) -> int:
++    if getattr(args, "completion_contract", None) is not None:
++        return _cmd_edit_contract(args)
++    if getattr(args, "reason", None) is not None:
++        return _err("kanban edit: --reason only applies to --completion-contract", 2)
+     result = getattr(args, "result", None)
+     raw_metadata = getattr(args, "metadata", None)
+     summary = getattr(args, "summary", None)
+@@ -1317,7 +1355,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     if all(value is None for value in (title, body, priority, result)) and not has_operator:
+         return _err(
+             "kanban edit: provide --title, --body, --priority, --result, --max-retries, --goal-mode, "
+-            "--goal-max-turns, --max-runtime-seconds, or --session-id", 2,
++            "--goal-max-turns, --max-runtime-seconds, --session-id, or --completion-contract", 2,
+         )
+     if getattr(args, "force", False) and operator["session_id"] is None:
+         return _err("kanban edit: --force only applies to --session-id", 2)
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+index 055b3899cd..6e6fae6bc3 100644
+--- a/hermes_cli/kanban_db_operator.py
++++ b/hermes_cli/kanban_db_operator.py
+@@ -71,6 +71,53 @@ def edit_operator_fields(
+     return changes
+ 
+ 
++def set_completion_contract(
++    conn: sqlite3.Connection, task_id: str, contract: str, *, reason: str, actor: str,
++    board: Optional[str] = None,
++) -> Optional[dict[str, Any]]:
++    """Operator re-point of a card's completion contract (``hermes kanban edit
++    --completion-contract``). The PR gate binds a published PR once and a worker
++    can't replace it, so a contract that can never pass (the repo was suspended or
++    moved, or its base branch has no required checks) used to park a finished card
++    on a human ask forever. ``contract`` is validated like ``kanban_create``'s
++    (``local-only``, ``OWNER/REPO`` or an exact PR URL). Refuses
++    (:class:`KanbanEditRefused`) an empty ``reason``, an invalid value, or a
++    ``done``/``archived`` card. Returns ``{"old", "new"}`` (``{}`` when unchanged),
++    ``None`` for an unknown id. Appends a ``contract_changed`` event (from, to,
++    reason, actor) and a ``CONTRACT CHANGED:`` comment. [daveey]"""
++    from hermes_cli.kanban_pr_acceptance import validate_contract
++
++    reason = (reason or "").strip()
++    actor = (actor or "").strip() or "operator"
++    if not reason:
++        raise KanbanEditRefused("--completion-contract requires --reason (recorded as an event and a comment)")
++    try:
++        new = validate_contract((contract or "").strip())
++    except ValueError as exc:
++        raise KanbanEditRefused(str(exc)) from None
++    now = int(time.time())
++    with _kb.write_txn(conn):
++        row = conn.execute(
++            "SELECT status, completion_contract FROM tasks WHERE id = ?", (task_id,),
++        ).fetchone()
++        if row is None:
++            return None
++        if row["status"] in ("done", "archived"):
++            raise KanbanEditRefused(
++                f"{task_id} is {row['status']}; a closed card's completion contract is history"
++            )
++        old = (row["completion_contract"] or "").strip() or "local-only"
++        if old == new:
++            return {}
++        conn.execute("UPDATE tasks SET completion_contract = ? WHERE id = ?", (new, task_id))
++        _kb._append_event(conn, task_id, "contract_changed", {
++            "from": old, "to": new, "reason": reason[:2000], "actor": actor,
++        })
++        _kb._insert_comment(conn, task_id, actor, f"CONTRACT CHANGED: {old} -> {new}: {reason}", now)
++    _kb.notify_task_updated(conn, task_id, ["completion_contract"], board=board)
++    return {"old": old, "new": new}
++
++
+ def reopen_done_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: str, actor: str,
+ ) -> Optional[str]:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 9de2303cc8..1b98bc80d4 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -431,8 +431,13 @@ _SPECS = [
+         _arg("--session-id", metavar="SID", dest="session_id",
+              help="Backfill the originating chat session id (refuses to overwrite one without --force)"),
+         _arg("--force", action="store_true", help="With --session-id: overwrite a non-empty session_id"),
+-    ], help="Edit task fields, operator fields (retries, goal mode, runtime cap, session), "
+-            "or recovery fields on an already-completed task"),
++        _arg("--completion-contract", metavar="CONTRACT", dest="completion_contract",
++             help="Orchestrator only: re-point the completion gate (local-only, OWNER/REPO or an exact "
++                  "PR URL) when the bound one can never pass, e.g. the repo moved or was suspended. "
++                  "Requires --reason; can't be combined with other edit flags"),
++        _arg("--reason", help="With --completion-contract: why (recorded as an event and a comment)"),
++    ], help="Edit task fields, operator fields (retries, goal mode, runtime cap, session, completion "
++            "contract), or recovery fields on an already-completed task"),
+     _cmd("reopen", [
+         _TASK_ID,
+         _arg("--reason", required=True, help="Why the done task is reopened (event + comment)"),
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index cea7808807..7e55103f2e 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -18,6 +18,12 @@ from urllib.parse import quote
+ 
+ _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
++# The way out of a contract that can never pass. A worker can't take it (orchestrator-only),
++# so the worker blocks WITHOUT a human_request: the owning chat clears agent-owned parks,
++# and David never gets a "approve closing this card" ask. [daveey]
++_REPOINT_HINT = ("this contract can never pass: the orchestrator (not this card's worker, and not a human ask) "
++                 "re-points it with `hermes kanban edit <task> --completion-contract <local-only|OWNER/REPO|PR URL> "
++                 "--reason \"...\"`; a worker blocks without a human_request and names the evidence.")
+ 
+ 
+ def validate_contract(value: str | None) -> str:
+@@ -54,6 +60,11 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
+             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
++        # GraphQL NOT_FOUND makes gh exit 1 before the ``repository is None`` check below
++        # can classify it: a repo this login can't see, or one that was renamed, moved or
++        # suspended. Retrying never helps, so it is never ``infra``. [daveey]
++        if "Could not resolve to a Repository" in (exc.stderr or ""):
++            raise _GateAuthError(f"repository not found on {endpoint.split('?')[0]}") from None
+         raise
+     value = json.loads(result.stdout)
+     if isinstance(value, dict) and value.get("errors"):
+@@ -199,7 +210,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                                     for r in rule["parameters"]["required_status_checks"])
+         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+         if not required:
+-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
++            receipt["detail"] = ("No repository-required checks are configured on the PR's base branch, so "
++                                 f"{_REPOINT_HINT} (Create non-CI tasks with a local-only contract.)")
+             return receipt
+         phase = "reading check runs"
+         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
+@@ -245,7 +257,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
+         receipt.update(classification="auth",
+                        detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
+-                              "fix that profile's GitHub credentials/access to the repository, then retry completion.")
++                              "fix that profile's GitHub credentials/access to the repository, then retry completion. "
++                              f"If the repository was renamed, moved or suspended instead, {_REPOINT_HINT}")
+         return receipt
+     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError) as exc:
+         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
+diff --git a/tests/hermes_cli/test_kanban_edit_operator_fields.py b/tests/hermes_cli/test_kanban_edit_operator_fields.py
+index b4b206e4ec..e2a81dc370 100644
+--- a/tests/hermes_cli/test_kanban_edit_operator_fields.py
++++ b/tests/hermes_cli/test_kanban_edit_operator_fields.py
+@@ -231,3 +231,125 @@ def test_reopen_requires_reason(kanban_home, capsys):
+         _main(["reopen", tid])
+     assert _main(["reopen", tid, "--reason", "   "]) == 2
+     assert _show(tid)["task"]["status"] == "done"
++
++
++# --- completion contract -------------------------------------------------------
++# A finished card whose bound PR can never be read (its repo was suspended) used to
++# park on a human "approve closing this card" ask: nothing could re-point the gate.
++
++
++_GONE_PR = "https://github.com/gone-owner/repo/pull/336"
++
++
++def _contract_events(task_id: str) -> list[dict]:
++    with kbc.connect_closing() as conn:
++        return [e.payload for e in kb.list_events(conn, task_id) if e.kind == "contract_changed"]
++
++
++def _contract(task_id: str) -> str:
++    with kbc.connect_closing() as conn:
++        return conn.execute("SELECT completion_contract FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
++
++
++def _gate_reads_a_vanished_repo(monkeypatch) -> list:
++    """The real gate with only its GitHub read replaced: the bound repo no longer resolves."""
++    from hermes_cli import kanban_pr_acceptance as kpa
++
++    calls: list = []
++
++    def gone(contract, published_pr, assignee=None):
++        calls.append(contract)
++        return {"ok": False, "classification": "auth", "head_sha": None, "pr_url": contract,
++                "checks": [], "recovery": "x", "detail": "repository not found on graphql"}
++
++    monkeypatch.setattr(kpa, "collect_acceptance", gone)
++    return calls
++
++
++def test_contract_repoint_lets_a_card_bound_to_a_vanished_repo_complete(kanban_home, monkeypatch):
++    calls = _gate_reads_a_vanished_repo(monkeypatch)
++    tid = _new(completion_contract=_GONE_PR)
++    with kbc.connect_closing() as conn:
++        assert not kb.complete_task(conn, tid, summary="AC-8 passed live", force=True)
++    assert calls == [_GONE_PR]
++    rc = _main(["edit", tid, "--completion-contract", "local-only",
++                "--reason", "repo suspended; the merge commit is on the new home"])
++    assert rc == 0
++    assert _contract(tid) == "local-only"
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, tid, summary="AC-8 passed live", force=True)
++    assert calls == [_GONE_PR]  # local-only: the gate is not consulted again
++    assert _show(tid)["task"]["status"] == "done"
++
++
++def test_contract_repoint_records_event_and_comment(kanban_home, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_PROFILE", "operator-x")
++    tid = _new(completion_contract=_GONE_PR)
++    assert _main(["edit", tid, "--completion-contract", "new-owner/repo", "--reason", "repo moved"]) == 0
++    assert f"completion_contract: '{_GONE_PR}' -> 'new-owner/repo'" in capsys.readouterr().out
++    assert _contract(tid) == "new-owner/repo"
++    events = _contract_events(tid)
++    assert len(events) == 1
++    assert events[0]["from"] == _GONE_PR and events[0]["to"] == "new-owner/repo"
++    assert events[0]["reason"] == "repo moved" and events[0]["actor"]
++    with kbc.connect_closing() as conn:
++        bodies = [c.body for c in kb.list_comments(conn, tid)]
++    assert f"CONTRACT CHANGED: {_GONE_PR} -> new-owner/repo: repo moved" in bodies
++
++
++def test_contract_repoint_works_on_a_blocked_card(kanban_home):
++    tid = _new(completion_contract=_GONE_PR)
++    with kbc.connect_closing() as conn:
++        assert kb.block_task(conn, tid, reason="gate can't read the PR")
++    assert _main(["edit", tid, "--completion-contract", "local-only", "--reason", "repo suspended"]) == 0
++    assert _contract(tid) == "local-only"
++    assert _show(tid)["task"]["status"] == "blocked"  # re-pointing never unblocks by itself
++
++
++def test_contract_repoint_same_value_appends_nothing(kanban_home, capsys):
++    tid = _new(completion_contract="owner/repo")
++    assert _main(["edit", tid, "--completion-contract", "owner/repo", "--reason", "noop"]) == 0
++    assert "unchanged" in capsys.readouterr().out
++    assert _contract_events(tid) == []
++
++
++@pytest.mark.parametrize("argv_tail, needle", [
++    (["--completion-contract", "local-only"], "requires --reason"),
++    (["--completion-contract", "local-only", "--reason", "   "], "requires --reason"),
++    (["--completion-contract", "not a contract", "--reason", "x"], "completion_contract must be"),
++    (["--completion-contract", "local-only", "--reason", "x", "--title", "renamed"], "can't be combined"),
++    (["--completion-contract", "local-only", "--reason", "x", "--max-retries", "3"], "can't be combined"),
++    (["--reason", "x", "--title", "renamed"], "--reason only applies"),
++])
++def test_contract_repoint_refusals_change_nothing(kanban_home, capsys, argv_tail, needle):
++    tid = _new(title="card", completion_contract=_GONE_PR)
++    assert _main(["edit", tid, *argv_tail]) == 2
++    assert needle in capsys.readouterr().err
++    assert _contract(tid) == _GONE_PR
++    assert _show(tid)["task"]["title"] == "card"
++    assert _contract_events(tid) == []
++
++
++def test_contract_repoint_is_refused_inside_a_kanban_worker(kanban_home, monkeypatch, capsys):
++    tid = _new(completion_contract=_GONE_PR)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    assert _main(["edit", tid, "--completion-contract", "local-only", "--reason", "let me out"]) == 2
++    assert "orchestrator-only" in capsys.readouterr().err
++    assert _contract(tid) == _GONE_PR
++    assert _contract_events(tid) == []
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_contract_repoint_refuses_closed_cards(kanban_home, capsys, status):
++    tid = _done() if status == "done" else _new()
++    if status == "archived":
++        with kbc.connect_closing() as conn:
++            assert kb.archive_task(conn, tid)
++    assert _main(["edit", tid, "--completion-contract", "owner/repo", "--reason", "x"]) == 2
++    assert "history" in capsys.readouterr().err
++    assert _contract(tid) == "local-only"
++
++
++def test_contract_repoint_refuses_unknown_task(kanban_home, capsys):
++    assert _main(["edit", "t_nope", "--completion-contract", "local-only", "--reason", "x"]) == 1
++    assert "unknown id" in capsys.readouterr().err
+diff --git a/tests/hermes_cli/test_kanban_pr_transport.py b/tests/hermes_cli/test_kanban_pr_transport.py
+index f9abc9a154..55a9b53ad1 100644
+--- a/tests/hermes_cli/test_kanban_pr_transport.py
++++ b/tests/hermes_cli/test_kanban_pr_transport.py
+@@ -94,3 +94,38 @@ def test_wrapper_interpolation_uses_assignee_scope(tmp_path, monkeypatch):
+         assert gate._gh_command_prefix(str(target)) == [sys.executable, "target-scope"]
+     finally:
+         reset_secret_scope(token)
++
++
++@pytest.mark.platforms("posix")
++def test_graphql_repo_not_found_is_auth_with_the_repoint_path(tmp_path, monkeypatch):
++    """gh exits 1 on a GraphQL NOT_FOUND (a suspended, moved or invisible repo), before the
++    ``repository is None`` check runs. A retry never passes, so it is ``auth`` and names the
++    orchestrator's re-point, never ``infra``/"retry completion". [daveey]"""
++    monkeypatch.setenv("PATH", "")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    folder = tmp_path / "bin"
++    folder.mkdir()
++    gh = folder / "gh"
++    gh.write_text(
++        f"#!{sys.executable}\n"
++        "import sys\n"
++        "sys.stderr.write(\"gh: Could not resolve to a Repository with the name 'gone/repo'.\\n\")\n"
++        "sys.exit(1)\n"
++    )
++    gh.chmod(0o755)
++    receipt = gate.collect_acceptance("https://github.com/gone/repo/pull/336", None)
++    assert receipt["classification"] == "auth"
++    assert "repository not found on graphql" in receipt["detail"]
++    assert "--completion-contract" in receipt["detail"]
++    assert "Could not resolve" not in receipt["detail"]  # gh's stderr is never persisted
++
++
++def test_no_required_checks_names_the_repoint_path(monkeypatch):
++    pr = {"data": {"repository": {"pullRequest": {
++        "headRefOid": "a" * 40, "baseRefName": "feature/stack", "state": "OPEN",
++        "baseRef": {"branchProtectionRule": None}}}}}
++    monkeypatch.setattr(gate, "_api", lambda endpoint, **kw: pr if endpoint == "graphql" else [[]])
++    receipt = gate.collect_acceptance("https://github.com/acme/repo/pull/7", None)
++    assert receipt["ok"] is False and receipt["classification"] == "missing"
++    assert "No repository-required checks" in receipt["detail"]
++    assert "--completion-contract" in receipt["detail"]
+-- 
+2.55.0
+

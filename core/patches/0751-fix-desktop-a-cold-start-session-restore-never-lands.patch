@@ -1,0 +1,183 @@
+From a1ea00192f9a6d2a2535bfe5af238611a29de9f9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 05:49:47 -0700
+Subject: [PATCH] fix(desktop): a cold-start session restore never lands under
+ a send already in flight from the fresh chat [daveey]
+
+Launch 2 of e2e/update/first-run.spec.ts: the user pressed Enter on the fresh
+chat as soon as the composer enabled; the resume-last-session restore then
+navigated to the remembered chat mid session.create, the send aborted as a
+session switch ([submit-drift-abort] mid-create / post-create-null) and the
+message was dropped. A fresh-chat send in flight now spends the restore latch:
+the chat the user sent in is where they stay.
+---
+ .../hooks/use-desktop-integrations.test.tsx   | 46 ++++++++++++++++++-
+ .../contrib/hooks/use-desktop-integrations.ts | 12 ++++-
+ .../hooks/use-session-actions/index.ts        |  5 ++
+ apps/desktop/src/store/composer.ts            | 26 +++++++++++
+ 4 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
+index cab4f50ca9..351caba543 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
++++ b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
+@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { registerTerminalContextMenu } from '@/app/right-sidebar/terminal/terminal-context-menu'
+ import { setApiRequestConnection, setApiRequestProfile } from '@/hermes'
+ import { createClientSessionState } from '@/lib/chat-runtime'
+-import { adoptNewSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
++import { adoptNewSessionDraft, beginFreshChatSend, stashSessionDraft, takeSessionDraft } from '@/store/composer'
+ import { $confirmRequest, runConfirm, settleConfirm } from '@/store/confirm'
+ import { $hubInstalledOverride } from '@/store/hub-actions'
+ import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
+@@ -220,6 +220,50 @@ describe('useDesktopIntegrations', () => {
+       expect(takeSessionDraft('remembered-session').text).toBe('typed while booting')
+     })
+ 
++    it('does not restore over a send already in flight from the fresh chat', () => {
++      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
++      // Enter on the fresh chat as soon as the composer enabled; the session list lands mid-create.
++      const endSend = beginFreshChatSend()
++      const result = render({ profileReady: true, sessions: [] })
++
++      try {
++        result.rerender({
++          activeProfile: 'default',
++          locationPathname: '/',
++          profileReady: true,
++          resumeExhaustedSessionId: null,
++          resumeLastSession: true,
++          routedSessionId: null,
++          sessions: [session({ id: 'remembered-session', profile: 'default' })]
++        })
++
++        expect(navigate).not.toHaveBeenCalled()
++      } finally {
++        endSend()
++      }
++
++      // The latch is spent: a later list refresh never yanks the user off the chat they sent in.
++      result.rerender({
++        activeProfile: 'default',
++        locationPathname: '/',
++        profileReady: true,
++        resumeExhaustedSessionId: null,
++        resumeLastSession: true,
++        routedSessionId: null,
++        sessions: [session({ id: 'remembered-session', profile: 'default', title: 'again' })]
++      })
++      expect(navigate).not.toHaveBeenCalled()
++    })
++
++    it('still restores once a fresh-chat send has settled (control)', () => {
++      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
++      beginFreshChatSend()()
++
++      render({ profileReady: true, sessions: [session({ id: 'remembered-session', profile: 'default' })] })
++
++      expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true })
++    })
++
+     it('waits for sessions before validating a remembered session route', () => {
+       window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
+ 
+diff --git a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+index e11c66b8b6..88f4180e4c 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-desktop-integrations.ts
+@@ -14,7 +14,7 @@ import { pathFromHermesDeepLink, resolveHermesOpenPath } from '@/lib/hermes-open
+ import { canonicalizeCombo } from '@/lib/keybinds/combo'
+ import { runBuiltinAction } from '@/lib/keybinds/plugin-actions'
+ import { storedSessionIdForNotification } from '@/lib/session-ids'
+-import { announceNewSessionDraftKey } from '@/store/composer'
++import { announceNewSessionDraftKey, freshChatSendInFlight } from '@/store/composer'
+ import { recordAction } from '@/store/desktop-metrics'
+ import { $comboIndex } from '@/store/keybinds'
+ import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
+@@ -156,6 +156,16 @@ export function useDesktopIntegrations({
+           return
+         }
+ 
++        // The user already sent from the fresh chat (Enter as soon as the
++        // composer enabled, before the session list arrived): that send owns
++        // the window. Navigating now would abort it as a session switch and
++        // drop the message; the new chat it creates is where they are.
++        if (freshChatSendInFlight()) {
++          restoredRef.current = true
++
++          return
++        }
++
+         const route = getRememberedRoute(activeProfile)
+         const routeSession = route ? routeSessionId(route) : null
+         const last = getRememberedSessionId(activeProfile)
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index fe9b9766fa..532bdba778 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -38,6 +38,7 @@ import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
+ import {
+   announceGoneSessionDraft,
+   announceNewSessionDraftKey,
++  beginFreshChatSend,
+   migrateSessionDraft,
+   requestComposerDraftSync,
+   rotateFreshDraftKeyUnlessPending
+@@ -675,6 +676,8 @@ export function useSessionActions({
+       const startingRouteToken = getRouteToken()
+ 
+       creatingSessionRef.current = true
++      // Holds off the cold-start restore until this create settles (store/composer.ts).
++      const endFreshChatSend = beginFreshChatSend()
+ 
+       try {
+         // An explicit one-shot workspace target (null → detached, string → that
+@@ -849,6 +852,8 @@ export function useSessionActions({
+ 
+         return created.session_id
+       } finally {
++        endFreshChatSend()
++
+         // Keep the guard up while a navigate to the new stored id is pending;
+         // otherwise clear immediately (abort, error, or create without stored id).
+         if (!pendingCreatedStoredSessionIdRef.current) {
+diff --git a/apps/desktop/src/store/composer.ts b/apps/desktop/src/store/composer.ts
+index 4916fecaea..b63045aa64 100644
+--- a/apps/desktop/src/store/composer.ts
++++ b/apps/desktop/src/store/composer.ts
+@@ -590,6 +590,32 @@ export function migrateSessionDraft(fromKey: string | null | undefined, toKey: s
+  */
+ let announcedNewSessionDraftKey: string | null = null
+ 
++/**
++ * Sends from the fresh chat whose `session.create` is still in flight.
++ *
++ * The cold-start resume-last-session restore may only replace the fresh chat
++ * while the user has not acted on it: once they hit Send there, the send owns
++ * the window. Restoring mid-create moved the route under the send, which then
++ * aborted as a session switch and dropped the message (first-run E2E, launch 2:
++ * Enter as soon as the composer enabled, restore landing a second later).
++ */
++let freshChatSendsInFlight = 0
++
++/** Mark a fresh-chat send in flight; call the returned release once (idempotent). */
++export function beginFreshChatSend(): () => void {
++  freshChatSendsInFlight += 1
++  let released = false
++
++  return () => {
++    if (!released) {
++      released = true
++      freshChatSendsInFlight = Math.max(0, freshChatSendsInFlight - 1)
++    }
++  }
++}
++
++export const freshChatSendInFlight = (): boolean => freshChatSendsInFlight > 0
++
+ export function announceNewSessionDraftKey(toKey: string | null | undefined): void {
+   announcedNewSessionDraftKey = toKey?.trim() || null
+ }
+-- 
+2.55.0
+

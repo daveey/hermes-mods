@@ -1,6 +1,6 @@
 # Sidebar status-stripe transitions are logged with their row inputs
 
-Patch **0555** (source `be06ecfc28`). Related: [sidebar-status-stripe.md](sidebar-status-stripe.md).
+Patch **0534** (source `be06ecfc28`). Related: [sidebar-status-stripe.md](sidebar-status-stripe.md).
 
 ## Behavior
 

@@ -1,6 +1,6 @@
 # Sidebar tells parked kanban work from running work
 
-Patch **0510** (source `cde62e1cf4`).
+Patch **0517** (source `cde62e1cf4`).
 
 ## Behavior
 
@@ -55,7 +55,7 @@ work too.
 
 ## Applying
 
-`git am -3` 0510. The published patch is adapted to the linear series: it keeps patch 0364's field order and adds `kanban_held | kanban_parked`. It does not adopt the fork merge order of those fields. It touches only the row stamp and the stripe inputs. If `sessionStatusStripe` gained more call
+`git am -3` 0517. The published patch is adapted to the linear series: it keeps patch 0369's field order and adds `kanban_held | kanban_parked`. It does not adopt the fork merge order of those fields. It touches only the row stamp and the stripe inputs. If `sessionStatusStripe` gained more call
 sites, route their kanban arguments through `kanbanStripeCounts`.
 
 ## Gotchas

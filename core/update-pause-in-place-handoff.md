@@ -1,8 +1,8 @@
 # A core-update-paused turn waits for a successor backend only while one is coming
 
-Patch: [`patches/0704-fix-core-update-a-paused-turn-continues-in-place-onc.patch`](patches/0704-fix-core-update-a-paused-turn-continues-in-place-onc.patch)
-(fork commit `e96d22b072`), [`patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch`](patches/0712-daveey-Report-background-jobs-interrupted-by-core-up.patch)
-(fork commit `549b7f1e71`, owned background jobs stopped for the pause), and [`patches/0717-daveey-Report-background-jobs-an-idle-chat-loses-whe.patch`](patches/0717-daveey-Report-background-jobs-an-idle-chat-loses-whe.patch)
+Patch: [`patches/0772-fix-core-update-a-paused-turn-continues-in-place-onc.patch`](patches/0772-fix-core-update-a-paused-turn-continues-in-place-onc.patch)
+(fork commit `e96d22b072`), [`patches/0779-daveey-Report-background-jobs-interrupted-by-core-up.patch`](patches/0779-daveey-Report-background-jobs-interrupted-by-core-up.patch)
+(fork commit `549b7f1e71`, owned background jobs stopped for the pause), and [`patches/0789-daveey-Report-background-jobs-an-idle-chat-loses-whe.patch`](patches/0789-daveey-Report-background-jobs-an-idle-chat-loses-whe.patch)
 (fork commit `91f48a91a2`, idle-chat jobs reported when the backend exits)
 
 ## Why
@@ -64,7 +64,7 @@ covers the decision order.
 
 Not covered by a test: a live drain window where the paused turn's serve survives the update.
 
-## Second attempt (fork `26691e1ce5`, patch [`0725`](patches/0725-fix-core-update-a-paused-turn-continues-within-90-s-.patch))
+## Second attempt (fork `26691e1ce5`, patch [`0859`](patches/0859-fix-core-update-a-paused-turn-continues-within-90-s-.patch))
 
 The first live sample failed acceptance. On David-MBP, 2026-10-28 PDT, serve 13052 survived the update.
 Session 2b256c paused at 17:17:53, and the watcher logged "checkout moved" at 17:22:19. A kanban notice
@@ -107,9 +107,9 @@ Tests (`tests/tui_gateway/test_update_pause_recovery.py`, real watcher thread on
 Not covered: a `/goal` continuation claims the session directly, so it bypasses the gate and can overwrite the
 paused marker after a carried turn. This was there before the fix. Follow-up card: hub `t_01a18533d0a0182d`.
 
-## Follow-up patch (0712)
+## Follow-up patch (0779)
 
-**0712** (fork `549b7f1e71`): a permitted core-update pause stops owned background jobs and says so. It does not try to keep them alive across the update.
+**0779** (fork `549b7f1e71`): a permitted core-update pause stops owned background jobs and says so. It does not try to keep them alive across the update.
 
 At the step boundary, before any signal, the pause journals each owned running job that is not `persist_on_release`: redacted session id, command head (80 chars), start time, notify flag, and `kill_state=pending`. It then calls `kill_process(source="core_update_pause", consume_output=False)` and journals each outcome before the next kill. `core_update_pause` is a lifecycle kill source, so `persist_on_release` jobs are still skipped. A lifecycle kill logs one INFO line: `lifecycle kill session=<chat> process=<id> source=<source>`. An operator kill does not. The completion notice for a notified job says `killed by the Hermes update`.
 
@@ -124,9 +124,9 @@ Tests:
 
 A live scheduler submitting a real background job, and a real drain window, are untested in this patch. The tests drive the registry and the marker directly.
 
-## Follow-up patch (0717)
+## Follow-up patch (0789)
 
-**0717** (fork `91f48a91a2`): an idle chat's background jobs are reported when the backend exits. The step-boundary pause never sees them, because the turn already ended.
+**0789** (fork `91f48a91a2`): an idle chat's background jobs are reported when the backend exits. The step-boundary pause never sees them, because the turn already ended.
 
 Skew retirement, the updater restart, idle exit and a Desktop quit all end in `_shutdown_sessions` then `agent.close`, which killed owned jobs with `source=agent_close` and `consume_output=True`. The notify the chat waited on never arrived, and nothing recorded why.
 
@@ -152,9 +152,9 @@ Tests in `tests/tui_gateway/test_shutdown_job_receipts.py`:
 
 A live scheduler submitting a real background job, and a real backend exit, are untested in this patch. The tests drive the registry and the marker directly.
 
-## Follow-up patch (0719)
+## Follow-up patch (0791)
 
-**0719** (fork `64e81da1a0`): a synthesized notification turn that carries an inherited core-update-paused marker re-arms the in-place watcher exactly once whether it succeeds, raises, or is refused during input preparation. The original paused prompt remains available to continue when the session becomes idle.
+**0791** (fork `64e81da1a0`): a synthesized notification turn that carries an inherited core-update-paused marker re-arms the in-place watcher exactly once whether it succeeds, raises, or is refused during input preparation. The original paused prompt remains available to continue when the session becomes idle.
 
 `_rearm_carried_pause_watcher` in `tui_gateway/prompt_turn.py` runs in the turn's innermost `finally`, after post-turn housekeeping. A turn that recorded its own marker does not use this carried-pause path. `_paused_marker_carried` remains set until a later turn records its own marker, so marker-retirement paths do not erase the paused request.
 
@@ -166,11 +166,11 @@ Tests in `tests/tui_gateway/test_update_pause_superseded.py`:
 
 These drive `_notif_run_submit` with a fresh session and a marker inherited from the previous backend. They assert the original prompt survives, the watcher is armed once, the session is idle, and the resume decision is `resume`. Watcher startup is captured by a fixture; these tests do not execute a live update or the resumed agent turn.
 
-Applying: append 0719 in series order. It depends on the earlier carried-marker support already in the fork; it is not a standalone replacement for 0704.
+Applying: append 0791 in series order. It depends on the earlier carried-marker support already in the fork; it is not a standalone replacement for 0772.
 
-## Follow-up patch (0728)
+## Follow-up patch (0870)
 
-**0728** (fork `9b77743e86`, patch [`0728`](patches/0728-fix-update-pause-a-goal-continuation-waits-for-a-cor.patch)): a /goal continuation no longer runs ahead of a core-update-paused turn. `_run_post_turn_followups` claims the session directly for the goal tick (not through `_notif_claim_turn`, so the 0725 `continuation_due` gate never saw it), and the continuation is a real turn, not a synthesized one. After a notice turn carried the paused marker, the goal tick recorded its own marker over it and retired it, so the paused request was replaced instead of continued.
+**0870** (fork `9b77743e86`, patch [`0870`](patches/0870-fix-update-pause-a-goal-continuation-waits-for-a-cor.patch)): a /goal continuation no longer runs ahead of a core-update-paused turn. `_run_post_turn_followups` claims the session directly for the goal tick (not through `_notif_claim_turn`, so the 0859 `continuation_due` gate never saw it), and the continuation is a real turn, not a synthesized one. After a notice turn carried the paused marker, the goal tick recorded its own marker over it and retired it, so the paused request was replaced instead of continued.
 
 `_goal_waits_for_paused_turn` in `tui_gateway/prompt_turn.py` drops the goal tick while `_paused_marker_carried` or `_update_pause_marker_key` is set, or `update_pause.continuation_due(session)` holds. The paused turn's continuation (or the user's next message) ends with its own goal evaluation, so the goal resumes after it. Marking the continuation synthesized instead was rejected: it would keep the marker but still run before the paused turn.
 
@@ -182,4 +182,4 @@ Tests in `tests/tui_gateway/test_update_pause_superseded.py`:
 
 The goal judge is stubbed; no live update or real goal evaluation runs in these tests.
 
-Applying: append 0728 after 0725.
+Applying: append 0870 after 0859.

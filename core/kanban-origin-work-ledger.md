@@ -55,7 +55,7 @@ Desktop consumers apply freshness consistently to rows, tabs, navigation and arc
 | 0326 | Bound projection reads and suppress late publication. |
 | 0328 | Reconcile legacy origin work across proven session aliases. |
 | 0342 | Update merged done-state test fixture to require fresh evidence. |
-| 0361 | Integration fixes for origin ownership: shared creation/origin helpers, drawer/SDK wiring, archive copy, profile-dot fixtures and test-runner integration. |
+| 0363 | Integration fixes for origin ownership: shared creation/origin helpers, drawer/SDK wiring, archive copy, profile-dot fixtures and test-runner integration. |
 
 ## Code
 
@@ -77,7 +77,7 @@ Python suites under `tests/hermes_cli/`:
 - `test_kanban_origin_observation.py`, `test_kanban_origin_projection.py`, `test_kanban_origin_evidence.py`: exact owner/version/snapshot evidence and conservative projection.
 - `test_kanban_session_activity.py`, `test_kanban_remote_identity.py`, `test_kanban_activity_scope.py`, `test_kanban_origin_alias_release.py`: shared readers, profile isolation and legacy aliases.
 - `test_kanban_pr_acceptance.py`, `test_kanban_goal_receipt.py`: release receipts tied to completion gates.
-- `tests/tui_gateway/test_projects_rpc.py`: project-row integration fixtures in 0361.
+- `tests/tui_gateway/test_projects_rpc.py`: project-row integration fixtures in 0363.
 
 Desktop suites under `apps/desktop/src/`:
 
@@ -93,7 +93,7 @@ Run the relevant Python files with `bash scripts/run_tests.sh <files>` in an iso
 
 ## Applying
 
-Apply the complete ordered series, not this noncontiguous subset alone. It builds on existing session links, hub replica reads, PR acceptance and goal handoff. Patch 0361 integrates overlapping changes after the earlier feature commits. Read [hub-sync-replica.md](hub-sync-replica.md) for cached sidebar behavior and [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md) for later unfinished-state presentation.
+Apply the complete ordered series, not this noncontiguous subset alone. It builds on existing session links, hub replica reads, PR acceptance and goal handoff. Patch 0363 integrates overlapping changes after the earlier feature commits. Read [hub-sync-replica.md](hub-sync-replica.md) for cached sidebar behavior and [kanban-unfinished-visibility.md](kanban-unfinished-visibility.md) for later unfinished-state presentation.
 
 ## Gotchas
 
@@ -106,15 +106,15 @@ Apply the complete ordered series, not this noncontiguous subset alone. It build
 
 Hub/courier and Desktop plugins consume these seams, including profile-pinned REST, but transactional creation, durable release evidence, shared activity projection and Desktop owner routing require core changes. Updating a disk plugin alone does not activate them.
 
-## Remote inventory sharing (0402) and terminal release of attested remote cards (0455)
+## Remote inventory sharing (0409) and terminal release of attested remote cards (0461)
 
-Patch **0402** (`7f0a44e948`): `kanban_session_activity._remote_links` is cached per origin scope for `_CACHE_TTL_S`
+Patch **0409** (`7f0a44e948`): `kanban_session_activity._remote_links` is cached per origin scope for `_CACHE_TTL_S`
 while no store it reads (boards, hub replica, origin ledger) changed, single-flight so concurrent readers wait for
 one projection; failures are not cached. `_legacy_remote_links` writes the origin-work snapshot only when the
 inventory changed, and a locked snapshot write is logged instead of failing the read (previously it marked every
 sidebar row `kanban_unknown`). Tests: `tests/hermes_cli/test_kanban_remote_inventory_cache.py`.
 
-Patch **0455** (`d52e183104`), requires 0402, 0398 (scope heartbeat) and 0399–0401:
+Patch **0461** (`d52e183104`), requires 0409, 0404 (scope heartbeat) and 0405, 0406, 0407:
 
 - **Behavior.** A remote shepherd card that its owner attests done or archived leaves the origin session's open
   counts (explicit row, `unfinished=False`, `released=True`). Attestation needs a fresh hub sync, identity fields
@@ -130,9 +130,9 @@ Patch **0455** (`d52e183104`), requires 0402, 0398 (scope heartbeat) and 0399–
 - **Residual.** Five ledger-bound goal cards owned by hub task `t_b11f0591` still need owner verification; the
   ledger `project()` is untouched.
 
-## Follow-up patch (0710)
+## Follow-up patch (0777)
 
-**0710** (fork `44f3ca1e39`): legacy goal completions, long receipts, and owner-observed archives.
+**0777** (fork `44f3ca1e39`): legacy goal completions, long receipts, and owner-observed archives.
 
 - A goal card completed before the board's first `goal_verified` event can verify as `basis=legacy_completed` when the closing run is `completed`, the contract is `local-only` (or the completion event, if the board still has it, is that run's and is before the receipt epoch). A receipt-era card without a receipt stays unverified. A board that never recorded a receipt gets no legacy pass.
 - Receipt evidence may match the closing run's full `summary` when the completed event stored only `_first_line(evidence, 400)`. Comparing the event's first line alone is not enough; the run id must be the event's run and the judged evidence must equal the run summary.

@@ -1,6 +1,6 @@
 # Boot-pinned imports resolve git through locate_command
 
-Patch: [`patches/0709-fix-gateway-resolve-boot-pinned-git-through-locate_c.patch`](patches/0709-fix-gateway-resolve-boot-pinned-git-through-locate_c.patch)
+Patch: [`patches/0776-fix-gateway-resolve-boot-pinned-git-through-locate_c.patch`](patches/0776-fix-gateway-resolve-boot-pinned-git-through-locate_c.patch)
 (fork commit `1b95d56bae`)
 
 ## Why
@@ -33,7 +33,7 @@ A live gateway boot after an in-place checkout move is untested in this patch.
 
 ## Applying
 
-`git am -3 core/patches/0709-fix-gateway-resolve-boot-pinned-git-through-locate_c.patch`. It only touches `gateway/boot_pinned_imports.py` and its new test.
+`git am -3 core/patches/0776-fix-gateway-resolve-boot-pinned-git-through-locate_c.patch`. It only touches `gateway/boot_pinned_imports.py` and its new test.
 
 ## Gotchas
 

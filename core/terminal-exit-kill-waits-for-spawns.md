@@ -1,6 +1,6 @@
 # Graceful exit kill waits for foreground spawns not yet registered
 
-Patch **0577** (source `51ae32d755`).
+Patch **0583** (source `51ae32d755`).
 
 ## Behavior
 
@@ -32,7 +32,7 @@ the existing tests in the same file; no new test targets it.
 
 ## Applying
 
-Standalone; `git am -3` 0577 on a tree that has the foreground registry (`_live_foreground`, `_spawns_in_flight`).
+Standalone; `git am -3` 0583 on a tree that has the foreground registry (`_live_foreground`, `_spawns_in_flight`).
 
 ## Gotchas
 

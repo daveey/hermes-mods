@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/0573-fix-anthropic-pre-request-token-check-stays-on-the-p.patch`: the per-request credential check reads only the pool entry the session is pinned to; model-aware pool resolution skips expired entries; 401 recovery warns when the failing key is another entry's.
+- `patches/0579-fix-anthropic-pre-request-token-check-stays-on-the-p.patch`: the per-request credential check reads only the pool entry the session is pinned to; model-aware pool resolution skips expired entries; 401 recovery warns when the failing key is another entry's.
 
 What you see: with several Claude accounts in the credential pool, a session that rotated to account B keeps sending B's token. Before, every request swapped the first pool entry's token back in; when that token had expired the turn looped on "OAuth access token has expired", refreshed B twice for nothing (spending B's single-use refresh tokens) and gave up ("Non-retryable client error" or a fallback model).
 

@@ -1,0 +1,320 @@
+From 47ae53b158057763cba308ce65ea131764c9035c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:29:15 +0000
+Subject: [PATCH] fix(lsp): do not killpg a reused server pid when the reader
+ exits during init [daveey]
+
+The crash mock exits right after initialize. Cleanup calls kill_process_tree
+while asyncio has not reaped the session leader (start_new_session, so
+pgid == pid). getpgid then succeeding is not identity: a new group leader
+also has pgid == pid, and the live-system guard blocks that foreign killpg
+(CI run 40785286726, first attempt; retry passed).
+
+Record the spawn-time create_time and refuse the group signal unless the PID
+is still that incarnation. A parent walk that loses the process mid-flight
+treats it as a stale PID, the same no-op already allowed when Process() fails.
+
+Problem: test_reader_exit_at_end_of_initialization_retires_client failed with
+live-system guard blocked os.killpg(966, 9).
+Why 1: kill_process_tree killpg'd a PGID outside the test subtree (deadline.py:489).
+Why 2: the server had exited; a live foreign group leader now owned that PID,
+or the guard's parent walk failed closed when the child vanished.
+Why 3: killpg was keyed only by PID. The comment named the TOCTOU and left it.
+Root: process-group teardown had no spawn-time incarnation check.
+Not caught: the guard turns the wrong kill into a test error; nothing simulated
+getpgid succeeding on a reaped PID.
+---
+ agent/deadline.py                         | 42 ++++++++++++++--
+ agent/lsp/client.py                       | 16 ++++--
+ tests/_fixtures/live_system_guard.py      |  5 ++
+ tests/agent/lsp/test_client_e2e.py        | 31 ++++++++++++
+ tests/agent/test_deadline.py              | 61 +++++++++++++++++++++++
+ tests/test_live_system_guard_self_test.py | 27 ++++++++++
+ 6 files changed, 174 insertions(+), 8 deletions(-)
+
+diff --git a/agent/deadline.py b/agent/deadline.py
+index 25874505a2..44d6012f9d 100644
+--- a/agent/deadline.py
++++ b/agent/deadline.py
+@@ -436,7 +436,23 @@ def _process_tree_snapshot(pid: int, *, hard_kill: bool):
+                 logger.debug("kill_process_tree: target already gone or resume refused", exc_info=True)
+ 
+ 
+-def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
++def process_create_time(pid: int) -> Optional[float]:
++    """Start time of ``pid``, or None if it is gone or unreadable.
++
++    Compared exactly. A reused PID has a later start time, and psutil returns
++    the same float for one incarnation, so a mismatch means the number no longer
++    names the process that was spawned.
++    """
++    try:
++        import psutil
++        return float(psutil.Process(int(pid)).create_time())
++    except Exception:
++        return None
++
++
++def kill_process_tree(
++    pid: int, *, sig: Optional[int] = None, create_time: Optional[float] = None,
++) -> bool:
+     """Terminate ``pid`` and all its descendants, portably; True when anything was signalled.
+ 
+     Windows: ``taskkill /F /T`` (``sig`` ignored). POSIX: snapshot descendants via
+@@ -444,7 +460,18 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
+     escape a stale snapshot. Signal identity-checked descendants before their
+     parent, then its group when ``pid`` leads one. Stopping is best-effort with a
+     bounded wait; unavailable psutil still leaves process-group cleanup. Other
+-    signals do not suspend recipients. ``sig`` defaults to ``SIGKILL``."""
++    signals do not suspend recipients. ``sig`` defaults to ``SIGKILL``.
++
++    ``create_time``, when passed, is the incarnation captured at spawn. A PID
++    that no longer has that start time is not signalled: after the leader exits
++    the number can already belong to an unrelated process group. Without a stamp,
++    the start time is sampled on entry and checked again immediately before the
++    group signal, so a PID reused during the snapshot wait is not killpg'd either.
++    """
++    if create_time is not None and process_create_time(pid) != create_time:
++        # Gone, or the PID now names a different process. Do not snapshot: that
++        # would SIGSTOP the unrelated process before the group signal.
++        return False
+     if sys.platform == "win32":
+         try:
+             from hermes_cli._subprocess_compat import windows_hide_flags
+@@ -465,6 +492,9 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
+     import signal as _signal
+     if sig is None:
+         sig = _signal.SIGKILL
++    # None means the target was already gone on entry. A later getpgid success is
++    # PID reuse, not the process we were asked to kill.
++    identity = create_time if create_time is not None else process_create_time(pid)
+ 
+     with _process_tree_snapshot(int(pid), hard_kill=sig == _signal.SIGKILL) as descendants:
+         signalled = False
+@@ -478,8 +508,12 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
+             except Exception:
+                 continue
+         try:
+-            # getpgid→killpg has an inherent TOCTOU shared by every killpg site; the psutil
+-            # sweep below is identity-aware (PID + create time) and does not.
++            # Recheck immediately before the group signal. The snapshot can spend
++            # seconds waiting for SIGSTOP; on a CPU-throttled host the leader can
++            # exit, be reaped, and have its PID reused in that window. getpgid
++            # succeeding is not identity: a new session leader also has pgid == pid.
++            if identity is None or process_create_time(pid) != identity:
++                return signalled
+             pgid = os.getpgid(pid)
+         except (ProcessLookupError, PermissionError, OSError):
+             pgid = None
+diff --git a/agent/lsp/client.py b/agent/lsp/client.py
+index fb7bfe4010..e48f72ffb4 100644
+--- a/agent/lsp/client.py
++++ b/agent/lsp/client.py
+@@ -155,6 +155,7 @@ class LSPClient:
+         self._seed_first_push = seed_diagnostics_on_first_push
+ 
+         self._proc: Optional[asyncio.subprocess.Process] = None
++        self._proc_born: Optional[float] = None
+         self._stderr_task: Optional[asyncio.Task] = None
+         # Ring buffer of the most recent server stderr lines, surfaced when spawn/initialize fails.
+         self._stderr_tail: list[str] = []
+@@ -265,6 +266,8 @@ class LSPClient:
+                 env=delegated_child_subprocess_env({**hermes_subprocess_env(), **(self._env or {})}), cwd=self._cwd,
+                 start_new_session=True, creationflags=windows_hide_flags(),
+             )
++            from agent.deadline import process_create_time
++            self._proc_born = process_create_time(self._proc.pid)
+         except FileNotFoundError as e:
+             raise LSPProtocolError(f"LSP server binary not found: {cmd[0]} ({e})") from e
+         # stderr must be drained or the pipe buffer fills and the server hangs.
+@@ -437,10 +440,15 @@ class LSPClient:
+                 # after SIGTERM can let an ignoring descendant become reparented and escape.
+                 # Windows maps this to a synchronous taskkill /T /F (up to 15s), so the
+                 # kill runs off the event loop.
+-                from agent.deadline import kill_process_tree
+-
+-                if not await asyncio.to_thread(kill_process_tree, proc.pid):
+-                    proc.kill()
++                from agent.deadline import kill_process_tree, process_create_time
++
++                born = self._proc_born
++                if not await asyncio.to_thread(kill_process_tree, proc.pid, create_time=born):
++                    # proc.kill() is the same PID-keyed signal. Fall back only while
++                    # the incarnation we spawned is still at that PID (a refused kill),
++                    # not when the PID was reused or the process is already gone.
++                    if born is None or process_create_time(proc.pid) == born:
++                        proc.kill()
+                 with contextlib.suppress(asyncio.TimeoutError):
+                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+             except ProcessLookupError:
+diff --git a/tests/_fixtures/live_system_guard.py b/tests/_fixtures/live_system_guard.py
+index 7153882878..0c74649607 100644
+--- a/tests/_fixtures/live_system_guard.py
++++ b/tests/_fixtures/live_system_guard.py
+@@ -176,6 +176,11 @@ def _live_system_guard(request, monkeypatch):
+             for parent in walker.parents():
+                 if parent.pid == test_pid:
+                     return True
++        except _psutil.NoSuchProcess:
++            # Vanished mid-walk (reaped while the kill was in flight). The signal
++            # is a no-op, same as a stale PID. Failing closed here flakes any test
++            # whose own child exits between getpgid and this walk.
++            return True
+         except Exception:
+             return False
+         return False
+diff --git a/tests/agent/lsp/test_client_e2e.py b/tests/agent/lsp/test_client_e2e.py
+index 79c1123356..0611a983cb 100644
+--- a/tests/agent/lsp/test_client_e2e.py
++++ b/tests/agent/lsp/test_client_e2e.py
+@@ -135,6 +135,37 @@ async def test_reader_exit_at_end_of_initialization_retires_client(tmp_path: Pat
+     await client.shutdown()
+ 
+ 
++@pytest.mark.asyncio
++async def test_cleanup_kill_carries_the_spawn_stamp(tmp_path, monkeypatch):
++    """Hard-kill must name the incarnation captured at spawn, not whatever owns the PID later."""
++    calls: list[tuple] = []
++
++    def record(pid, sig=None, create_time=None):
++        calls.append((pid, create_time))
++        return True
++
++    monkeypatch.setattr("agent.deadline.kill_process_tree", record)
++    client = _client(tmp_path, "slow")
++    start = asyncio.create_task(client.start())
++    while client._proc is None:
++        await asyncio.sleep(0)
++    proc = client._proc
++    pid = proc.pid
++    born = client._proc_born
++    assert born is not None
++    try:
++        await client._cleanup_process()
++        assert calls == [(pid, born)]
++    finally:
++        if not start.done():
++            start.cancel()
++            await asyncio.gather(start, return_exceptions=True)
++        if proc.returncode is None:
++            proc.kill()
++            with contextlib.suppress(ProcessLookupError, asyncio.TimeoutError):
++                await asyncio.wait_for(proc.wait(), timeout=5)
++
++
+ @pytest.mark.asyncio
+ async def test_cancelled_start_terminates_spawned_server(tmp_path: Path):
+     """An outer startup budget may cancel initialize before the manager registers the client."""
+diff --git a/tests/agent/test_deadline.py b/tests/agent/test_deadline.py
+index 70b479e631..9fa20577ae 100644
+--- a/tests/agent/test_deadline.py
++++ b/tests/agent/test_deadline.py
+@@ -487,6 +487,67 @@ class TestKillProcessTree:
+         proc.wait(timeout=10)  # reaped: PID is gone from the process table
+         assert kill_process_tree(proc.pid) is False
+ 
++    def test_reaped_pid_is_not_signalled_when_getpgid_succeeds(self, monkeypatch):
++        """A reaped session leader's PID can be reused before killpg.
++
++        ``getpgid`` then succeeds and ``pgid == pid`` for the new group leader.
++        Signalling it is the live-system-guard flake in
++        ``test_reader_exit_at_end_of_initialization_retires_client`` (and, without
++        the guard, a SIGKILL of an unrelated process group).
++        """
++        proc = subprocess.Popen(
++            [sys.executable, "-c", "pass"],
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            start_new_session=True,
++        )
++        proc.wait(timeout=10)
++        signalled: list[tuple] = []
++
++        def reused_getpgid(pid):
++            if pid == proc.pid:
++                return proc.pid
++            raise ProcessLookupError(pid)
++
++        monkeypatch.setattr(os, "getpgid", reused_getpgid)
++        monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append(("killpg", pgid, sig)))
++        monkeypatch.setattr(os, "kill", lambda pid, sig, *a, **k: signalled.append(("kill", pid, sig)))
++
++        assert kill_process_tree(proc.pid) is False
++        assert signalled == []
++
++    def test_spawn_stamp_does_not_signal_a_different_incarnation(self):
++        """A live process at a reused PID must survive a kill stamped for the old one."""
++        victim = subprocess.Popen(
++            [sys.executable, "-c", "import time; time.sleep(60)"],
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            start_new_session=True,
++        )
++        try:
++            import psutil
++            stale = psutil.Process(victim.pid).create_time() - 100.0
++            assert kill_process_tree(victim.pid, create_time=stale) is False
++            assert victim.poll() is None
++        finally:
++            victim.kill()
++            victim.wait(timeout=5)
++
++    def test_matching_create_time_still_kills(self):
++        proc = subprocess.Popen(
++            [sys.executable, "-c", "import time; time.sleep(30)"],
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            start_new_session=True,
++        )
++        import psutil
++        born = psutil.Process(proc.pid).create_time()
++        assert kill_process_tree(proc.pid, create_time=born) is True
++        proc.wait(timeout=5)
++
+     def test_non_group_leader_falls_back_to_single_kill(self):
+         # Child in OUR process group: killpg would signal the test runner.
+         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+diff --git a/tests/test_live_system_guard_self_test.py b/tests/test_live_system_guard_self_test.py
+index 21a073c4da..01093891cd 100644
+--- a/tests/test_live_system_guard_self_test.py
++++ b/tests/test_live_system_guard_self_test.py
+@@ -179,6 +179,33 @@ def test_os_killpg_blocks_foreign_pgid():
+         os.killpg(FOREIGN_PID, signal.SIGTERM)
+ 
+ 
++@pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
++def test_killpg_allows_own_child_when_parent_walk_loses_it(monkeypatch):
++    """A child that vanishes during the parent walk is a stale PID, not a foreign one.
++
++    Failing closed there is the other half of the LSP reader-exit flake: the
++    server is our session leader, then reaped between getpgid and the walk.
++    """
++    import psutil
++
++    proc = subprocess.Popen(
++        [sys.executable, "-c", "import time; time.sleep(30)"],
++        stdin=subprocess.DEVNULL,
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++        start_new_session=True,
++    )
++    try:
++        def vanished(self):
++            raise psutil.NoSuchProcess(self.pid)
++
++        monkeypatch.setattr(psutil.Process, "parents", vanished)
++        os.killpg(proc.pid, signal.SIGKILL)
++    finally:
++        proc.kill()
++        proc.wait(timeout=5)
++
++
+ # ──────────────────── subprocess regex bypasses ────────────────
+ 
+ 
+-- 
+2.55.0
+

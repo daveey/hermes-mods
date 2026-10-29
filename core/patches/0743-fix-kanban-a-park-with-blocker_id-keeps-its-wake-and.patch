@@ -1,0 +1,500 @@
+From c52339ad1359cda816f7fd72bc739f10751c03ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 11:46:46 +0000
+Subject: [PATCH] fix(kanban): a park with blocker_id keeps its wake, and a
+ blocker with only blocked cards still gets a probe [daveey]
+
+block_task skipped the timed park whenever blocker_id was set, so kind=time /
+SCHEDULED_UNTIL parks behind a shared blocker landed 'blocked' with no wake_at
+and their wake_check was silently dropped (t_e7dc822c). And since only ready
+cards were spaced into probes, a blocker whose cards were all 'blocked' was
+never probed or cleared.
+
+- timed parks (kind=time or SCHEDULED_UNTIL) behind a blocker park scheduled
+  with their wake and wake check; blocker_id rides on the closed run so the
+  card still counts as behind the blocker
+- probe_stranded_blockers: when no card behind an open blocker is ready or
+  running and the probe interval has passed, unblock one blocked card (no
+  human ask) as the probe
+- an agent-owned block (no kind/capability/transient/needs_input, no
+  human_request) that brings a wake_check / clock_only parks scheduled on it
+  (subject to the usual producer gate) instead of landing blocked and dropping
+  the probe; on any other block the probe is refused with the reason
+- worker context says a timed wait keeps its wake with blocker_id
+---
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 52e52b2637..dedfeab5d9 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1259,6 +1259,9 @@ def _guarded_park(conn, op: str, wake, refused: dict, park, awaiting=None, **pla
+         except kaw.AwaitingError as exc:
+             refused[tid] = f"cannot {op} {tid}: {exc}"
+             return False
++        except ValueError as exc:   # e.g. a wake_check on a block that is not a timed park
++            refused[tid] = f"cannot {op} {tid}: {exc}"
++            return False
+     return run
+ 
+ 
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8580692e4e..98ca853bb8 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3156,6 +3156,33 @@ def edit_task(
+     return True
+ 
+ 
++def _has_probe(wake_check: Optional[str], clock_only: bool) -> bool:
++    return bool(wake_check and str(wake_check).strip()) or bool(clock_only)
++
++
++def _probe_parks(kind: Optional[str], wake_check: Optional[str], clock_only: bool,
++                 human_request: Optional[dict]) -> bool:
++    """An agent-owned block (no kind, capability, transient, needs_input) with no human ask that
++    brings a wake_check / clock_only is a wait on that probe: park it scheduled so the probe runs.
++    [daveey]"""
++    from hermes_cli.kanban_block_policy import AGENT_OWNED_KINDS
++    return _has_probe(wake_check, clock_only) and not human_request and kind in AGENT_OWNED_KINDS
++
++
++def _refuse_untimed_probe(kind: Optional[str], wake_check: Optional[str], clock_only: bool) -> None:
++    """A wake_check / clock_only only means something on a park. On a block that lands
++    ``blocked`` (a human ask, an assignment, a dependency on an open parent) it would be dropped
++    and nothing would run it, so refuse instead. [daveey]"""
++    if not _has_probe(wake_check, clock_only):
++        return
++    what = "wake_check" if wake_check and str(wake_check).strip() else "clock_only"
++    raise ValueError(
++        f"refused: {what} only applies to a timed park (kind='time', a SCHEDULED_UNTIL=<ISO8601> "
++        f"reason, or an agent-owned block with no human_request). This block (kind={kind!r}) would "
++        f"land '{'todo' if kind == 'dependency' else 'blocked'}' and drop the {what}, so nothing "
++        "would run it. Use kind='time' to wait on it, or drop it for a human ask.")
++
++
+ def block_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+@@ -3181,7 +3208,7 @@ def block_task(
+     durable repair card and the original waits in ``todo`` on that dependency
+     (including explicit classification of a breaker-parked card).
+     """
+-    from hermes_cli.kanban_human_request import validate_human_request
++    from hermes_cli.kanban_human_request import reject_timed_request, validate_human_request
+     human_request = validate_human_request(human_request, kind=kind)
+     if kind is not None and kind not in VALID_BLOCK_KINDS:
+         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+@@ -3206,10 +3233,16 @@ def block_task(
+             # [daveey] Park untyped clock waits as scheduled too, not blocked + kind=time;
+             # otherwise Desktop lists them under "For you" with an unblock button.
+             from hermes_cli import kanban_timed_park as ktp
+-            if not blocker_id and ktp.is_timed_park(kind, reason, parents_satisfied=_parents_satisfied(conn, task_id)):
++            from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++            if (ktp.is_timed_park(kind, reason, parents_satisfied=_parents_satisfied(conn, task_id),
++                                  blocker_id=blocker_id)
++                    or _probe_parks(kind, wake_check, clock_only, human_request)):
++                reject_timed_request(human_request)
+                 return ktp.park(conn, task_id, reason=reason, requested_kind=kind, source_status="ready",
+                                 from_untyped_block=True, wake_check=wake_check,
+-                                check_every=check_every, clock_only=clock_only, awaiting=awaiting)
++                                check_every=check_every, clock_only=clock_only, awaiting=awaiting,
++                                blocker_id=normalize_blocker_id(blocker_id))
++            _refuse_untimed_probe(kind, wake_check, clock_only)
+             requested_kind, rekind_reason = kind, None
+             if kind == "assignment":
+                 kind, rekind_reason = assignment_routing.classify(get_task(conn, task_id), kind, reason, human_request=human_request)
+@@ -3235,12 +3268,17 @@ def block_task(
+         kind, rekind_reason, exhausted_budget = classify_stop(conn, task_id, kind, reason, blocker_id, human_request=human_request)
+         no_open_parent = _parents_satisfied(conn, task_id)
+         from hermes_cli import kanban_timed_park as ktp
+-        if not blocker_id and ktp.is_timed_park(kind, reason, parents_satisfied=no_open_parent):
+-            if human_request is not None:
+-                raise ValueError("human_request cannot be combined with automatic timed resumption")
++        from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++        # A timed park keeps its wake time and wake check behind a shared blocker too; the
++        # blocker id rides on the closed run, so the card still counts as behind it. [daveey]
++        if (ktp.is_timed_park(kind, reason, parents_satisfied=no_open_parent, blocker_id=blocker_id)
++                or _probe_parks(requested_kind, wake_check, clock_only, human_request)):
++            reject_timed_request(human_request)
+             return ktp.park(conn, task_id, reason=reason, requested_kind=kind,
+                             source_status=source_status, expected_run_id=expected_run_id,
+-                            wake_check=wake_check, check_every=check_every, clock_only=clock_only, awaiting=awaiting)
++                            wake_check=wake_check, check_every=check_every, clock_only=clock_only, awaiting=awaiting,
++                            blocker_id=normalize_blocker_id(blocker_id))
++        _refuse_untimed_probe(kind, wake_check, clock_only)
+         # Parent-less ``dependency`` behind a shared blocker: sticky ``needs_input`` (todo would respawn it).
+         if kind == "dependency" and no_open_parent:
+             kind = "needs_input"
+@@ -3261,7 +3299,6 @@ def block_task(
+         if rekind_reason:
+             payload["requested_kind"] = requested_kind
+             payload["rekind_reason"] = rekind_reason
+-        from hermes_cli.kanban_shared_blockers import normalize_blocker_id
+         blocker_id = normalize_blocker_id(blocker_id)
+         if blocker_id:
+             payload["blocker_id"] = blocker_id
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index b57fd68861..be279990ea 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -202,6 +202,9 @@ class DispatchResult:
+     shared_blocker_released: list[str] = field(default_factory=list)
+     """Blocked task ids unblocked because a probe cleared the shared blocker
+     they were parked behind (``kanban_shared_blockers``). [daveey]"""
++    shared_blocker_probed: list[str] = field(default_factory=list)
++    """Blocked task ids unblocked as the probe of an open shared blocker that had no
++    ready/running card behind it (``probe_stranded_blockers``). [daveey]"""
+     quota_block_released: list[str] = field(default_factory=list)
+     """Guard-hold blocks on a quota wall released once another card completed after them
+     (``kanban_db_dispatch_quota.release_recovered_quota_blocks``). [daveey]"""
+@@ -2430,11 +2433,15 @@ def _run_reclaim_phase(
+     from hermes_cli.kanban_continuation import wake_due_continuations
+     result.woken_continuations = wake_due_continuations(conn)
+     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+-    from hermes_cli.kanban_shared_blockers import release_cleared_blockers
++    from hermes_cli.kanban_shared_blockers import probe_stranded_blockers, release_cleared_blockers
+     try:
+         result.shared_blocker_released = release_cleared_blockers(conn)
+     except Exception:
+         _kb._log.warning("kanban: releasing cleared shared blockers failed", exc_info=True)
++    try:
++        result.shared_blocker_probed = probe_stranded_blockers(conn)
++    except Exception:
++        _kb._log.warning("kanban: probing stranded shared blockers failed", exc_info=True)
+     try:
+         from hermes_cli import kanban_provider_walls as _walls
+         _walls.alert_on_storm(conn, board=board)
+diff --git a/hermes_cli/kanban_human_request.py b/hermes_cli/kanban_human_request.py
+index 312ef6a7e4..e66b969614 100644
+--- a/hermes_cli/kanban_human_request.py
++++ b/hermes_cli/kanban_human_request.py
+@@ -39,3 +39,9 @@ def validate_initial_request(value, initial_status, triage):
+     if request is not None and (initial_status != "blocked" or triage):
+         raise ValueError("human_request requires initial_status='blocked' without triage")
+     return request
++
++
++def reject_timed_request(value):
++    """Automatic wake-up and a pending human action cannot share a block."""
++    if value is not None:
++        raise ValueError("human_request cannot be combined with automatic timed resumption")
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 1ca9aed075..dd2e75b12b 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -112,6 +112,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+             ],
+             "rate_limited": res.rate_limited,
+             "shared_blocker_released": res.shared_blocker_released,
++            "shared_blocker_probed": res.shared_blocker_probed,
+             "skipped_locked": res.skipped_locked,
+             "skipped_owned": res.skipped_owned,
+             "dispatch_owner": res.dispatch_owner,
+@@ -161,6 +162,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
+         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
+     if res.shared_blocker_released:
+         print(f"Released (shared blocker cleared): {', '.join(res.shared_blocker_released)}")
++    if res.shared_blocker_probed:
++        print(f"Released (probe for an idle shared blocker): {', '.join(res.shared_blocker_probed)}")
+     if res.skipped_locked:
+         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
+     if res.skipped_owned:
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 0b5b45c81b..206b54b800 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -36,6 +36,7 @@ from typing import Optional
+ 
+ GUARD_REASON = "shared_blocker"
+ CLEARED_EVENT = "shared_blocker_cleared"
++PROBE_RELEASED_EVENT = "shared_blocker_probe_released"
+ DEFAULT_PROBE_SECONDS = 1800
+ MAX_BLOCKER_ID_CHARS = 64
+ # Outcomes that prove nothing about an external condition.
+@@ -244,6 +245,47 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+     return released
+ 
+ 
++def probe_stranded_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None,
++                            interval: Optional[int] = None) -> list[str]:
++    """Unblock ONE ``blocked`` card per open blocker that nothing else would probe. Returns task ids.
++
++    :func:`shared_blocker_guard` only spaces out ``ready`` cards, so a blocker whose cards are all
++    ``blocked`` (a lone card, or every card re-asserted) was never probed and never cleared: the
++    cards sat forever (t_e7dc822c). When no card behind the blocker is ``ready`` or ``running`` and
++    the probe interval has passed since the newest assertion or probe start, the card whose
++    assertion is oldest is unblocked; it then spawns as the probe. Cards carrying a human ask
++    (``human_request``) are left for the human. [daveey]"""
++    from hermes_cli import kanban_db as kb
++
++    now = int(time.time()) if now is None else int(now)
++    if interval is None:
++        interval = probe_interval_seconds()
++    probed: list[str] = []
++    for st in blocker_states(conn, now=now).values():
++        if not st.is_open or not st.behind:
++            continue
++        ids = sorted(st.behind)
++        marks = ",".join("?" * len(ids))
++        rows = conn.execute(
++            f"SELECT id, status, human_request FROM tasks WHERE id IN ({marks})", ids).fetchall()
++        if any(r["status"] in ("ready", "running") for r in rows):
++            continue   # the ready-card guard already spaces those probes
++        last = max([st.asserted_at, *st.probe_starts.values()])
++        if now - last < interval:
++            continue
++        candidates = sorted((st.behind[r["id"]], r["id"]) for r in rows
++                            if r["status"] == "blocked" and not r["human_request"])
++        for _asserted, tid in candidates:
++            if not kb.unblock_task(conn, tid):
++                continue
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, PROBE_RELEASED_EVENT, {
++                    "blocker_id": st.blocker_id, "idle_seconds": now - last})
++            probed.append(tid)
++            break
++    return probed
++
++
+ def render_blocker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     """Worker-context section naming open blockers so workers reuse the same id."""
+     states = [s for s in blocker_states(conn).values() if s.is_open]
+@@ -252,7 +294,9 @@ def render_blocker_context(conn: sqlite3.Connection, task_id: str) -> str:
+     lines = ["## Open shared blockers on this board",
+              "External walls other cards already hit. If yours is one of them, stop early and end "
+              "with kanban_block/kanban_continue passing the same `blocker_id` instead of rediscovering "
+-             "it; only one card probes a blocker at a time."]
++             "it; only one card probes a blocker at a time. A timed wait (kind='time' or a "
++             "SCHEDULED_UNTIL= reason) keeps its wake time and wake_check when it also passes "
++             "blocker_id."]
+     mine = None
+     for st in sorted(states, key=lambda s: -s.asserted_at):
+         if task_id in st.behind:
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index 7c5b5576b1..f9a8cc725e 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -73,9 +73,13 @@ def implied_wake(payload: dict, event_at: int) -> int:
+     return scheduled_until(reason if isinstance(reason, str) else None, now=event_at) or event_at + DEFAULT_WAKE_SECONDS
+ 
+ 
+-def is_timed_park(kind: Optional[str], reason: Optional[str], *, parents_satisfied: bool) -> bool:
+-    """Whether a ``block_task`` call is really a wait on time, not on a human."""
+-    if kind == TIME_KIND or (kind == "dependency" and parents_satisfied):
++def is_timed_park(kind: Optional[str], reason: Optional[str], *, parents_satisfied: bool,
++                  blocker_id: Optional[str] = None) -> bool:
++    """Whether a ``block_task`` call is really a wait on time, not on a human.
++    Behind a shared blocker (``blocker_id``) a parent-less ``dependency`` is a wait on that
++    blocker (its probe wakes it), not on time; ``kind='time'`` and a ``SCHEDULED_UNTIL=``
++    marker still park with their wake. [daveey]"""
++    if kind == TIME_KIND or (kind == "dependency" and parents_satisfied and not blocker_id):
+         return True
+     return _MARKER.search(reason or "") is not None
+ 
+@@ -84,11 +88,14 @@ def park(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str], requested_kind: Optional[str],
+     source_status: str = "ready", expected_run_id: Optional[int] = None, from_untyped_block: bool = False,
+     wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
+-    awaiting=None,
++    awaiting=None, blocker_id: Optional[str] = None,
+ ) -> bool:
+     """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn.
+     ``from_untyped_block``: an untyped ``blocked`` card with no live run (classify-in-place) instead.
+-    ``awaiting`` names the producer (``kanban_awaiting.gate``: refused or escalated otherwise). [daveey]"""
++    ``awaiting`` names the producer (``kanban_awaiting.gate``: refused or escalated otherwise).
++    ``blocker_id`` (a shared external blocker, ``kanban_shared_blockers``) is stamped on the closed
++    run's metadata and the event, so the card still counts as behind that blocker while it keeps
++    its own wake time and wake check. [daveey]"""
+     from hermes_cli import kanban_awaiting as kaw
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
+@@ -115,12 +122,15 @@ def park(
+     if conn.execute(sql, params).rowcount != 1:
+         return False
+     run_id = kb._end_or_synthesize_run(
+-        conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
++        conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
++        metadata={"blocker_id": blocker_id} if blocker_id else None,
++        synthesize=bool(reason or blocker_id),
+     )
+     kb._append_event(conn, task_id, "scheduled", {
+         "reason": reason, "timed_park": True, "requested_kind": requested_kind,
+         "wake_at": wake_at, "resume_status": source_status,
+         **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record,
++        **({"blocker_id": blocker_id} if blocker_id else {}),
+     }, run_id=run_id)
+     kwc.set_check(conn, task_id, wake_check, check_every, now=now)
+     return True
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 8041303be1..09db772ddd 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -171,8 +171,8 @@ def planned_wake(conn: sqlite3.Connection, task_id: str, *, op: str, reason: Opt
+     if op == "schedule":
+         return ktp.scheduled_payload(reason, now=now)["wake_at"]
+     if op == "block":
+-        if blocker_id or not ktp.is_timed_park(
+-                kind, reason, parents_satisfied=kb._parents_satisfied(conn, task_id)):
++        if not ktp.is_timed_park(
++                kind, reason, parents_satisfied=kb._parents_satisfied(conn, task_id), blocker_id=blocker_id):
+             return None
+         return ktp.scheduled_until(reason, now=now) or now + ktp.DEFAULT_WAKE_SECONDS
+     if op == "continue":
+diff --git a/tests/hermes_cli/test_kanban_cli.py b/tests/hermes_cli/test_kanban_cli.py
+index 5bcf4b8524..8617aa85d0 100644
+--- a/tests/hermes_cli/test_kanban_cli.py
++++ b/tests/hermes_cli/test_kanban_cli.py
+@@ -311,4 +311,7 @@ def test_cli_block_agent_owned_allowed_with_wake_check(kanban_home):
+     out = kc.run_slash(f"block {tid} disk full --kind transient --wake-check 'test -f /tmp/x'")
+     assert "agent_owned_block" not in out
+     with kbc.connect_closing() as conn:
+-        assert kb.get_task(conn, tid).status in ("blocked", "scheduled")
++        # The probe is honored (a scheduled park with its wake row), never silently dropped.
++        assert kb.get_task(conn, tid).status == "scheduled"
++        row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()
++        assert row is not None and row["cmd"] == "test -f /tmp/x"
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index 0ad9733f84..1c6d64827b 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -210,3 +210,110 @@ def test_block_tool_validates_and_reports_blocker(kanban_home, monkeypatch):
+     assert out.get("blocker_id") == BID
+     assert ksb.normalize_blocker_id("A b/C") == "a-b-c"
+     assert ksb.normalize_blocker_id("x" * 100) == "x" * 64
++
++
++# --- a park with blocker_id must keep a way to wake (t_01a18246d7ae8a78) -------------------------
++
++def _future_iso(seconds: int) -> str:
++    from datetime import datetime, timezone
++    return datetime.fromtimestamp(int(time.time()) + seconds, tz=timezone.utc).isoformat()
++
++
++def test_timed_park_with_blocker_keeps_wake_and_probe(kanban_home):
++    with kbc.connect_closing() as conn:
++        other = _blocked_behind(conn, "other")
++        tid = kb.create_task(conn, title="waits on CI window", assignee="default")
++        kb.claim_task(conn, tid)
++        reason = f"SCHEDULED_UNTIL={_future_iso(36 * 3600)} watcher wakes it"
++        assert kb.block_task(conn, tid, reason=reason, kind="time", blocker_id=BID, wake_check="exit 1")
++        task = kb.get_task(conn, tid)
++        assert task.status == "scheduled"
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
++                          "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        payload = json.loads(ev["payload"])
++        assert payload["wake_at"] > time.time() + 30 * 3600
++        assert payload["blocker_id"] == BID
++        row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()
++        assert row is not None and row["cmd"] == "exit 1"
++        st = ksb.blocker_states(conn)[BID]
++        assert st.is_open and set(st.behind) == {tid, other}
++
++
++def test_planned_wake_counts_blocker_parks(kanban_home):
++    from hermes_cli import kanban_wake_check as kwc
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="default")
++        kb.claim_task(conn, tid)
++        wake = kwc.planned_wake(conn, tid, op="block", kind="time", blocker_id=BID,
++                                reason=f"SCHEDULED_UNTIL={_future_iso(5 * 3600)}")
++        assert wake is not None and wake > time.time() + 4 * 3600
++
++
++def test_wake_check_on_agent_owned_block_is_honored_not_dropped(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="default")
++        kb.claim_task(conn, tid)
++        assert kb.block_task(conn, tid, reason="billing", kind="capability", blocker_id=BID,
++                             wake_check="exit 1")
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()["cmd"] == "exit 1"
++        assert tid in ksb.blocker_states(conn)[BID].behind
++
++
++def test_wake_check_on_human_ask_block_is_refused_not_dropped(kanban_home):
++    hr = {"action": "raise the GitHub spending limit", "why_human": "billing owner",
++          "interaction": "approval", "scope": "org billing", "evidence": "job annotation"}
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="default")
++        kb.claim_task(conn, tid)
++        with pytest.raises(ValueError, match="wake_check"):
++            kb.block_task(conn, tid, reason="billing", kind="needs_input", blocker_id=BID,
++                          wake_check="exit 1", human_request=hr)
++        assert kb.get_task(conn, tid).status == "running"
++        assert conn.execute("SELECT 1 FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone() is None
++
++
++def test_lone_blocked_card_behind_open_blocker_is_probed_after_interval(kanban_home, spawns):
++    _spawned, fake_spawn = spawns
++    with kbc.connect_closing() as conn:
++        tid = _blocked_behind(conn, "alone")
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == []                 # within the interval: stays blocked
++        assert kb.get_task(conn, tid).status == "blocked"
++        _age_runs(conn, 1900)
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == [tid]               # the interval passed: it is the probe
++        assert conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = ?",
++                            (tid, ksb.PROBE_RELEASED_EVENT)).fetchone()
++
++
++def test_all_blocked_behind_blocker_get_exactly_one_probe(kanban_home, spawns):
++    _spawned, fake_spawn = spawns
++    with kbc.connect_closing() as conn:
++        cards = [_blocked_behind(conn, f"c{i}") for i in range(3)]
++        _age_runs(conn, 1900)
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert len(_spawned_ids(res)) == 1
++        probe = _spawned_ids(res)[0]
++        assert [kb.get_task(conn, t).status for t in cards if t != probe] == ["blocked", "blocked"]
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)    # probe in flight: nothing more
++        assert _spawned_ids(res) == []
++        # The probe re-asserts: no new probe until the interval passes again.
++        assert kb.block_task(conn, probe, reason="still refused", kind="capability", blocker_id=BID)
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == []
++
++
++def test_human_ask_behind_blocker_is_not_auto_probed(kanban_home, spawns):
++    _spawned, fake_spawn = spawns
++    hr = {"action": "raise the GitHub spending limit", "why_human": "billing owner",
++          "interaction": "approval", "scope": "org billing", "evidence": "job annotation"}
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="needs David", assignee="default")
++        kb.claim_task(conn, tid)
++        assert kb.block_task(conn, tid, reason="billing", kind="needs_input", blocker_id=BID,
++                             human_request=hr)
++        _age_runs(conn, 1900)
++        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
++        assert _spawned_ids(res) == []
++        assert kb.get_task(conn, tid).status == "blocked"
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index 501ae51a5e..0c6d2b702d 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -1659,10 +1659,21 @@ def test_block_agent_owned_is_rejected_with_typed_error(worker_env, kind):
+ 
+ def test_block_agent_owned_allowed_with_wake_check_routes_scheduled(worker_env):
+     from tools import kanban_tools as kt
+-    d = json.loads(kt._handle_block({
++    from hermes_cli import kanban_db_connect as kbc
++    # A probe with no producer is refused with the reason (it was silently dropped before).
++    refused = json.loads(kt._handle_block({
+         "reason": "waiting on disk", "kind": "transient",
+         "wake_check": "test -f /tmp/never", "check_every": 600}))
+-    assert d.get("ok") is True
++    assert "opaque_probe_wait" in refused.get("error", ""), refused
++    d = json.loads(kt._handle_block({
++        "reason": "waiting on disk", "kind": "transient",
++        "wake_check": "test -f /tmp/never", "check_every": 600,
++        "awaiting": {"kind": "external", "ref": "disk vendor ticket 42", "why": "vendor is resizing the volume"}}))
++    assert d.get("ok") is True, d
++    assert d.get("status") == "scheduled"
++    with kbc.connect_closing() as conn:
++        row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (worker_env,)).fetchone()
++    assert row is not None and row["cmd"] == "test -f /tmp/never"
+ 
+ 
+ def test_block_capability_with_human_request_allowed():
+
+-- 
+2.43.0

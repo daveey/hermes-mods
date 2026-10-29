@@ -1,6 +1,6 @@
 # Core-update drain hold (no new Kanban claims while an update drains)
 
-Patches **0459** (source `d6dc1fe8d7`) and **0471** (source `08f65aa7e6`: the hold suppresses spawns only; wake
+Patches **0465** (source `d6dc1fe8d7`) and **0477** (source `08f65aa7e6`: the hold suppresses spawns only; wake
 probes, promotion and reclaim keep running).
 
 ## Behavior
@@ -11,7 +11,7 @@ Kanban dispatcher claims nothing new. Running workers are never touched: they fi
 board drains instead of refilling between update checks. When the updater removes the file (or dies), dispatch
 resumes on the next tick.
 
-The hold suppresses claims only (0471). Each tick still runs the rest of the dispatcher's bookkeeping: stale-claim
+The hold suppresses claims only (0477). Each tick still runs the rest of the dispatcher's bookkeeping: stale-claim
 reclaim, crash/timeout detection, due `wake_check` probes, timed wakes and todo -> ready promotion. A card parked on a
 probe wakes on time and a chain whose parent finished advances to `ready`; it is just not claimed until the hold
 lifts. The "ready queue non-empty but 0 spawned" warning stays quiet while the hold is live. The e-stop (`hermes
@@ -30,7 +30,7 @@ defers forever.
 - `gateway/kanban_watchers_common.py::_kanban_dispatch_gate()` returns `"estop"` (`check_paused`), `"drain"`
   (`check_drain_hold`) or `None`; `_kanban_dispatch_allowed()` is `gate is None`. An older core without the module
   (ImportError) dispatches as before.
-- `gateway/kanban_watchers.py` (embedded dispatcher loop, 0471): `"estop"` skips the tick; `"drain"` runs
+- `gateway/kanban_watchers.py` (embedded dispatcher loop, 0477): `"estop"` skips the tick; `"drain"` runs
   `dispatcher.tick_once(suppress_spawn=True)`, skips auto-decompose and health publishing, and resets the stuck-tick
   counter; `None` is the normal tick.
 - `gateway/kanban_watchers_dispatcher.py`: `suppress_spawn` sets `max_spawn=0` for `dispatch_once`, so
@@ -55,10 +55,10 @@ is outside core; any supervisor can use the same file contract.
 - `test_unparseable_hold_counts_only_briefly`: counts inside the grace window, not after.
 - `test_profile_home_honors_fleet_root_hold`
 - `test_estop_and_drain_are_distinct_gates`
-- `test_live_hold_runs_wake_probes_and_promotion_but_claims_nothing` (0471): one real tick of the embedded
+- `test_live_hold_runs_wake_probes_and_promotion_but_claims_nothing` (0477): one real tick of the embedded
   dispatcher loop on a real board under a live hold. A due `wake_check` probe runs and wakes its card, a todo card
   whose parent is done is promoted, and a spawnable ready card is not claimed (spawn function never called). Red on
-  the 0459 loop (the probe never ran).
+  the 0465 loop (the probe never ran).
 - `test_without_hold_the_same_tick_claims`: control, the same board claims its ready card with no hold.
 - `test_estop_still_skips_the_whole_tick`: no probe, no promotion, no claim under the e-stop.
 
@@ -66,15 +66,15 @@ A real updater driving the hold end to end is untested here.
 
 ## Applying
 
-Apply 0459 after the Kanban watcher patches, then 0471. 0459 only adds a guard after `check_paused`. If that function
+Apply 0465 after the Kanban watcher patches, then 0477. 0465 only adds a guard after `check_paused`. If that function
 moved, re-add the same `check_drain_hold("kanban", logger)` call wherever the dispatcher decides whether to claim.
-0471 needs the dispatcher's `max_spawn` budget gate to run after the reclaim/promotion phase (upstream
+0477 needs the dispatcher's `max_spawn` budget gate to run after the reclaim/promotion phase (upstream
 `_dispatch_once_locked` order); if that order changes, a zero budget may skip bookkeeping again.
 
 ## Gotchas
 
-- Before 0471 the hold skipped the whole tick: wake probes, promotions and reclaims stopped for its full length
-  (16-17 min observed). A host on 0459 without 0471 still behaves that way.
+- Before 0477 the hold skipped the whole tick: wake probes, promotions and reclaims stopped for its full length
+  (16-17 min observed). A host on 0465 without 0477 still behaves that way.
 - The hold stops new claims only. It doesn't interrupt running workers or Desktop turns; the updater must wait for
   them itself.
 - Hosts on a core older than this patch ignore the file. An updater has to treat such hosts as "drain can't stop

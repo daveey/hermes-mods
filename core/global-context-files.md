@@ -1,6 +1,6 @@
 # Global context files: user-level rules in every session, whatever its cwd
 
-Patch: `patches/0552-feat-prompt-agent.global_context_files-user-level-ru.patch`
+Patch: `patches/0568-feat-prompt-agent.global_context_files-user-level-ru.patch`
 
 Upstream loads `AGENTS.md` only along the git-root → cwd chain. A user-level rules file such as `~/AGENTS.md`
 therefore reaches only sessions whose cwd is `~` (or a repo with no AGENTS.md of its own). Kanban workers run in
@@ -68,7 +68,7 @@ Neighbours run green with the patch: `tests/agent/test_prompt_builder.py`, `test
 
 ## Applying
 
-`git am core/patches/0552-*.patch`, then set the key, e.g.
+`git am core/patches/0568-*.patch`, then set the key, e.g.
 `hermes config set agent.global_context_files '["~/AGENTS.md"]'` (it prints a false "not a recognized config key"
 warning on cores without the patch's default). New sessions pick it up; open sessions keep their cached prompt.
 
@@ -83,6 +83,6 @@ warning on cores without the patch's default). New sessions pick it up; open ses
 - No plugin alternative: plugin prompt sections are appended after the context tier and can't dedupe against the
   project chain.
 
-## Follow-up patch (0568)
+## Follow-up patch (0574)
 
-**0568** documents `agent.global_context_files` in `website/docs/user-guide/configuration.md` to clear the red docs-drift check on main. No code change.
+**0574** documents `agent.global_context_files` in `website/docs/user-guide/configuration.md` to clear the red docs-drift check on main. No code change.

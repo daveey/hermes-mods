@@ -1,0 +1,137 @@
+From 7e8e8f4a599ac10d35b97c8b721db426debf6ea9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:50:49 -0700
+Subject: [PATCH] fix(turn lease): busy state.db is not another writer on
+ Desktop/TUI
+
+Desktop/TUI acquire the turn lease with wait_seconds=0, so one sqlite
+'database is locked' during acquire hit the already-passed deadline and
+returned False, which the facade reports as 'This chat has another active
+writer' (session_busy). Seen on chat 20261025_234720_c405df right after a
+core-update backend restart: no lease row existed, and the failure
+coincided with a state.db write-lock warning.
+
+acquire_session_turn_lease gains contended_wait_seconds, a floor for the
+busy-DB retry budget only; the facade passes 15s. A real holder still
+fails fast.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/turn_facade_lease.py                    |  4 ++
+ hermes_state_compression.py                   | 16 +++++---
+ tests/hermes_state/test_session_turn_lease.py | 37 +++++++++++++++++++
+ 3 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index d3d5d5b2de..f4131c13b4 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -25,6 +25,7 @@ _REASON_LEASE_LOST = "session turn lease lost"
+ 
+ LEASE_TTL_SECONDS = 300.0
+ LEASE_WAIT_SECONDS = 1800.0
++BUSY_DB_WAIT_SECONDS = 15.0  # floor for riding out a state.db write-lock spike, even with no holder wait
+ # SessionDB's default write patience: a renewal waits this long for the write lock, never past the authority.
+ _REFRESH_WRITE_PATIENCE_S = 20.0
+ # Headroom before expiry for one BEGIN IMMEDIATE blocked in the writer's 1s busy handler, plus jitter.
+@@ -454,6 +455,9 @@ def admit_durable_turn_lease(
+         wait_seconds=0.0 if task_context['platform'] in {"desktop", "tui"} else LEASE_WAIT_SECONDS,
+         on_wait=_on_wait, on_contended=_on_contended,
+         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
++        # A busy state.db is not another writer: Desktop/TUI skip the holder wait but must not
++        # turn a write-lock spike into "This chat has another active writer".
++        contended_wait_seconds=BUSY_DB_WAIT_SECONDS,
+     ):
+         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
+         return admission
+diff --git a/hermes_state_compression.py b/hermes_state_compression.py
+index 9b63b759e2..6ed241d269 100644
+--- a/hermes_state_compression.py
++++ b/hermes_state_compression.py
+@@ -599,16 +599,20 @@ class SessionCompressionMixin:
+         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
+         wait_seconds: float = 1800.0, poll_interval_seconds: float = 1.0, on_wait=None,
+         wait_notice_interval_seconds: float = 15.0, should_abort=None, acquire_patience_s: float = 0.5,
+-        on_contended=None,
++        on_contended=None, contended_wait_seconds: float = 0.0,
+     ) -> bool:
+         """Wait for a cross-process turn lease without holding a SQLite lock. ``on_wait(elapsed)`` is
+         best-effort: called when another holder has the lease and about every
+         ``wait_notice_interval_seconds`` after. A busy database is not a holder: the attempt is
+         retried at once with a longer write patience, and ``on_contended()`` is called instead,
+-        since the busy writer may be the holder's last flush. ``should_abort()`` True (e.g.
+-        ``/stop``) returns False at once."""
++        since the busy writer may be the holder's last flush. ``contended_wait_seconds`` floors the
++        budget for that busy-database retry, so a caller that will not wait for a holder
++        (``wait_seconds=0``) still rides out a brief write-lock spike instead of reporting it as a
++        holder. ``should_abort()`` True (e.g. ``/stop``) returns False at once."""
+         from hermes_state import classify_persistence_error
+-        deadline = time.monotonic() + max(0.0, float(wait_seconds))
++        started = time.monotonic()
++        deadline = started + max(0.0, float(wait_seconds))
++        contended_deadline = max(deadline, started + max(0.0, float(contended_wait_seconds)))
+         patience = acquire_patience_s
+         wait_started = None
+         last_notice_at = None
+@@ -636,8 +640,8 @@ class SessionCompressionMixin:
+                     except Exception:
+                         logger.debug("session turn lease on_contended callback failed", exc_info=True)
+                 patience = min(acquire_patience_s + max(0.0, float(poll_interval_seconds)),
+-                               max(acquire_patience_s, deadline - time.monotonic()))
+-                if not self._sleep_before_write_retry(deadline, 0.0):
++                               max(acquire_patience_s, contended_deadline - time.monotonic()))
++                if not self._sleep_before_write_retry(contended_deadline, 0.0):
+                     return False
+                 continue
+             patience = acquire_patience_s
+diff --git a/tests/hermes_state/test_session_turn_lease.py b/tests/hermes_state/test_session_turn_lease.py
+index 6968eac533..c8eb80afac 100644
+--- a/tests/hermes_state/test_session_turn_lease.py
++++ b/tests/hermes_state/test_session_turn_lease.py
+@@ -402,6 +402,43 @@ def test_acquire_turn_lease_retries_sqlite_lock(tmp_path, monkeypatch):
+     db.release_session_turn_lease("shared", holder)
+ 
+ 
++def test_zero_wait_acquire_rides_out_sqlite_lock(tmp_path, monkeypatch):
++    """Desktop/TUI pass wait_seconds=0 (no waiting on a holder). A busy write lock is not a
++    holder: with a contended budget the retry wins the lease instead of failing as 'another
++    active writer' (2026-10-28, chat 20261025_234720_c405df)."""
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("shared", source="test")
++    holder = f"pid={os.getpid()}:turn=desktop"
++    attempts = {"n": 0}
++    original = db.try_acquire_session_turn_lease
++
++    def flaky_acquire(*args, **kwargs):
++        attempts["n"] += 1
++        if attempts["n"] == 1:
++            raise sqlite3.OperationalError("database is locked")
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(db, "try_acquire_session_turn_lease", flaky_acquire)
++    assert db.acquire_session_turn_lease(
++        "shared", holder, wait_seconds=0.0, contended_wait_seconds=5.0, acquire_patience_s=0.05,
++    )
++    assert attempts["n"] >= 2
++    db.release_session_turn_lease("shared", holder)
++
++
++def test_zero_wait_acquire_still_fails_fast_on_a_real_holder(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("shared", source="test")
++    other = f"pid={os.getpid()}:turn=other"
++    assert db.try_acquire_session_turn_lease("shared", other, ttl_seconds=60)
++    started = time.monotonic()
++    assert not db.acquire_session_turn_lease(
++        "shared", f"pid={os.getpid()}:turn=desktop", wait_seconds=0.0, contended_wait_seconds=5.0,
++    )
++    assert time.monotonic() - started < 1.0
++    db.release_session_turn_lease("shared", other)
++
++
+ def test_acquire_turn_lease_locked_for_the_whole_wait_times_out(tmp_path, monkeypatch):
+     db = SessionDB(tmp_path / "state.db")
+     db.create_session("shared", source="test")
+-- 
+2.55.0
+

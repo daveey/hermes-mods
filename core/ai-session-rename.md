@@ -340,7 +340,7 @@ On current `upstream/main`, `git am -3 --empty=keep` of 0020 **alone fails**. Th
   locale files and `overlay-gaps.json`.
 
 0019 (⌘⇧A archive) is not required. Verified on a scratch clone of upstream/main: `0002 0004 0018 0020` and
-`0002 0004 0018 0019 0020` both apply cleanly. The full series 0001–0020 also applies in order, except 0013.
+`0002 0004 0018 0019 0020` both apply cleanly. The full series 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009, 0010, 0011, 0012, 0013, 0014, 0015, 0016, 0017, 0018, 0019, 0020 also applies in order, except 0013.
 
 ```sh
 cd ~/.hermes/hermes-agent   # your hermes-agent checkout

@@ -1,0 +1,211 @@
+From 1bab43d41f186b1185fe7ac5de22425a0d9626e2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:22:44 -0700
+Subject: [PATCH] perf(skills): stat-keyed frontmatter cache for skill lookup
+ (kanban admission 20s timeouts) (#176)
+
+* perf(skills): memoize SKILL.md frontmatter parses by file stat so kanban admission stops re-parsing the whole catalog per pinned skill
+
+* fix(skills): bind frontmatter cache entry to the fstat of the bytes read; keep parser object in entry
+
+* fix(skills): preserve universal newline decoding in cached reads
+
+* test(ci): add session_move to prompt-surface snapshot (main red since 59009a4979)
+
+(cherry picked from commit 7e621eb9ba611a942c1052b7f953eaeddd9f83d3)
+
+* fix(telemetry): v4 schema lists the session_move toolset [daveey]
+
+59009a4979 added the session_move toolset, which joins
+shared_metrics_contract.TOOLSET_NAMES, but the v4 schema's
+tool_enabled_unused toolset enum was not updated, so
+test_v3_schema_accepts_exactly_the_contract_values fails on main.
+
+* fix(ci): document kanban.create_overlap_check; LSP spawn test fake carries pid [daveey]
+
+Main went red on two tests: d0cc66e9f4 added the kanban.create_overlap_check
+config key without docs (docs drift ratchet), and 47ae53b158 made LSPClient._spawn
+read proc.pid, which the windows-hide-flags test fake lacked.
+---
+ tests/tools/test_safe_frontmatter_cache.py | 103 +++++++++++++++++++++
+ tools/skills_tool_plugin.py                |  43 ++++++++-
+ 2 files changed, 144 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_safe_frontmatter_cache.py
+
+diff --git a/tests/tools/test_safe_frontmatter_cache.py b/tests/tools/test_safe_frontmatter_cache.py
+new file mode 100644
+index 0000000000..48b0afa53d
+--- /dev/null
++++ b/tests/tools/test_safe_frontmatter_cache.py
+@@ -0,0 +1,103 @@
++"""_safe_frontmatter memoizes path parses without hiding edits, deletions or collisions."""
++from unittest.mock import patch
++
++from tools import skills_tool as st
++from tools import skills_tool_plugin as sp
++
++
++def _skill(d, name, desc="x"):
++    d.mkdir(parents=True, exist_ok=True)
++    f = d / "SKILL.md"
++    f.write_text(f"---\nname: {name}\ndescription: {desc}\n---\nbody\n")
++    return f
++
++
++def test_unchanged_file_parsed_once(tmp_path):
++    f = _skill(tmp_path / "a", "a")
++    real = st._parse_frontmatter
++    with patch.object(st, "_parse_frontmatter", side_effect=real) as m:
++        for _ in range(5):
++            assert sp._safe_frontmatter(f)["name"] == "a"
++    assert m.call_count == 1
++
++
++def test_path_read_preserves_universal_newlines(tmp_path):
++    for newline in (b"\r", b"\r\n", b"\n"):
++        f = tmp_path / "SKILL.md"
++        f.write_bytes(newline.join((b"---", b"name: x", b"description: |", b"  a", b"  b", b"---", b"body")))
++        expected = st._parse_frontmatter(sp._read_skill_text(f))[0]
++        assert expected["name"] == "x"
++        assert sp._safe_frontmatter(f) == expected
++        assert sp._safe_frontmatter(f) == expected
++
++
++def test_edit_invalidates(tmp_path):
++    f = _skill(tmp_path / "a", "a")
++    assert sp._safe_frontmatter(f)["name"] == "a"
++    f.write_text("---\nname: renamed\ndescription: x\n---\n")
++    assert sp._safe_frontmatter(f)["name"] == "renamed"
++
++
++def test_deletion_returns_empty(tmp_path):
++    f = _skill(tmp_path / "a", "a")
++    sp._safe_frontmatter(f)
++    f.unlink()
++    assert sp._safe_frontmatter(f) == {}
++
++
++def test_result_is_private_copy(tmp_path):
++    f = _skill(tmp_path / "a", "a")
++    sp._safe_frontmatter(f)["name"] = "mutated"
++    assert sp._safe_frontmatter(f)["name"] == "a"
++
++
++def test_alias_collision_still_detected_from_cache(tmp_path):
++    root = tmp_path / "skills"
++    _skill(root / "one", "dup")
++    _skill(root / "two", "dup")
++    for _ in range(2):  # second pass runs entirely from cache
++        assert len(st._collect_skill_candidates("dup", None, [root])) == 2
++
++
++def test_work_bound_across_repeated_lookups(tmp_path):
++    root = tmp_path / "skills"
++    for i in range(20):
++        _skill(root / f"s{i}", f"alias{i}")
++    real = st._parse_frontmatter
++    with patch.object(st, "_parse_frontmatter", side_effect=real) as m:
++        for _ in range(3):
++            for i in range(20):
++                st._collect_skill_candidates(f"alias{i}", None, [root])
++    assert m.call_count == 20
++
++
++def test_symlink_retarget_mid_lookup_does_not_poison_old_target(tmp_path):
++    a = _skill(tmp_path / "a", "aaa")
++    b = _skill(tmp_path / "b", "bbb")
++    link = tmp_path / "link.md"
++    link.symlink_to(a)
++    real_stat = sp.Path.stat
++    calls = {"n": 0}
++
++    def flip(self, *args, **kw):  # retarget right after the lookup stat, restore after the read
++        out = real_stat(self, *args, **kw)
++        if self == link and calls["n"] == 0:
++            calls["n"] = 1
++            link.unlink()
++            link.symlink_to(b)
++        return out
++
++    with patch.object(sp.Path, "stat", flip):
++        sp._safe_frontmatter(link)
++    link.unlink()
++    link.symlink_to(a)
++    assert sp._safe_frontmatter(link)["name"] == "aaa"
++
++
++def test_successive_patched_parsers_do_not_share_entries(tmp_path):
++    f = _skill(tmp_path / "a", "a")
++    seen = []
++    for i in range(5):
++        with patch.object(st, "_parse_frontmatter", lambda text, i=str(i): ({"v": i}, "")):
++            seen.append(sp._safe_frontmatter(f)["v"])
++    assert seen == ["0", "1", "2", "3", "4"]
+diff --git a/tools/skills_tool_plugin.py b/tools/skills_tool_plugin.py
+index 08fb285677..6feae3fca5 100644
+--- a/tools/skills_tool_plugin.py
++++ b/tools/skills_tool_plugin.py
+@@ -3,6 +3,7 @@ file-serving helpers shared with the local-skill path. Helpers tests patch on th
+ (``_is_skill_disabled``, ``_parse_frontmatter``, ``skill_matches_platform``) resolve lazily."""
+ 
+ import json
++import os
+ import logging
+ from contextlib import suppress
+ from pathlib import Path
+@@ -42,12 +43,50 @@ def _truncate_description(description: str) -> str:
+     return description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
+ 
+ 
++_FRONTMATTER_CACHE: dict = {}
++_FRONTMATTER_CACHE_MAX = 4096
++
++
+ def _safe_frontmatter(path: Path | None = None, *, content: str | None = None) -> dict[str, Any]:
+     """Frontmatter of *path* (or of *content*), ``{}`` on any read/parse failure.
+-    Parses via ``tools.skills_tool._parse_frontmatter`` so test patches are honored."""
++    Parses via ``tools.skills_tool._parse_frontmatter``; replacing that callable invalidates cached entries.
++
++    Path parses are memoized per process, keyed on the file's identity and stat
++    (path, dev, ino, size, mtime_ns, ctime_ns) plus the parser in use, so a catalog scan that
++    resolves many skills parses each unchanged SKILL.md once; any edit, replace or deletion
++    changes the key (or the stat fails) and re-parses. Callers get a private deep copy."""
++    import copy
+     from tools import skills_tool as _st
++    parser = _st._parse_frontmatter
++
++    def _ident(p) -> tuple:
++        s = Path(p).stat()
++        return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
++
++    key = before = text = None
++    if content is None and path is not None:
++        with suppress(Exception):
++            before = _ident(path)
++            hit = _FRONTMATTER_CACHE.get((str(path), *before))
++            if hit is not None and hit[0] is parser:  # entry holds the parser, so no id() reuse
++                return copy.deepcopy(hit[1])
++        with suppress(Exception):
++            # Bind the bytes parsed to the identity they are cached under: fstat the very
++            # descriptor that is read, so a symlink retargeted mid-lookup files the content
++            # under the identity of what was really read (a later lookup of the old target misses).
++            with open(path, encoding="utf-8-sig", errors="replace") as fh:
++                s = os.fstat(fh.fileno())
++                text = fh.read()
++            key = (str(path), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+     with suppress(Exception):
+-        return _st._parse_frontmatter(_read_skill_text(path) if content is None else content)[0]
++        if text is None:
++            text = _read_skill_text(path) if content is None else content
++        result = parser(text)[0]
++        if key is not None and isinstance(result, dict):
++            if len(_FRONTMATTER_CACHE) >= _FRONTMATTER_CACHE_MAX:
++                _FRONTMATTER_CACHE.clear()
++            _FRONTMATTER_CACHE[key] = (parser, copy.deepcopy(result))
++        return result
+     return {}
+ 
+ 
+-- 
+2.55.0
+

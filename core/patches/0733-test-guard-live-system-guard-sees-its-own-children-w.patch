@@ -1,0 +1,191 @@
+From a80d30f3e1c6b1793a4abbb783f630e5794554de Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 02:22:10 -0700
+Subject: [PATCH] test(guard): live-system guard sees its own children without
+ psutil
+
+psutil is a core dependency only on Python >= 3.14, so on a 3.11 dev venv
+(MacBook) the guard's subtree walk answered 'foreign' for every pid,
+including a fixture's own direct Popen child: 6 teardown ERRORs in
+tests/hermes_cli/test_gateway_start_refused.py (live_pid's proc.kill()).
+
+Without psutil the guard now walks ppids via /proc or 'ps -o ppid=' (the real
+check_output), fails closed when a parent is unreadable, and treats a stale
+pid as a no-op like the psutil path. Foreign pids (init, our own parent) stay
+blocked. Regression tests in tests/test_live_system_guard_self_test.py.
+---
+ tests/_fixtures/live_system_guard.py      | 63 ++++++++++++++++++++++-
+ tests/test_live_system_guard_self_test.py | 62 ++++++++++++++++++++++
+ 2 files changed, 124 insertions(+), 1 deletion(-)
+
+diff --git a/tests/_fixtures/live_system_guard.py b/tests/_fixtures/live_system_guard.py
+index 7fb35b7ce9..7153882878 100644
+--- a/tests/_fixtures/live_system_guard.py
++++ b/tests/_fixtures/live_system_guard.py
+@@ -4,6 +4,7 @@ Imported into ``tests/conftest.py`` so pytest registers the fixture there;
+ ``pytest_plugins`` is not an option because ``tests/conftest.py`` is not the
+ rootdir conftest (the rootdir is the repo root, where ``pyproject.toml`` lives).
+ """
++import subprocess
+ from pathlib import Path
+ 
+ import pytest
+@@ -47,6 +48,56 @@ _GATEWAY_LOOKALIKE_MARK = "spawns_gateway_lookalike"
+ _LIVE_GUARD_PROTECTED_GIT_ROOTS = (PROJECT_ROOT,)
+ 
+ 
++def _parent_pid_without_psutil(pid: int, check_output) -> int | None:
++    """Parent PID of ``pid`` from /proc or ``ps``; None when it cannot be read.
++
++    The guard's subtree walk uses psutil when it is installed. psutil is a
++    core dependency only on Python >= 3.14, so an older dev venv (MacBook,
++    3.11) has none, and the walk used to answer "foreign" for EVERY pid,
++    including a fixture's own direct ``Popen`` child (6 teardown errors in
++    test_gateway_start_refused.py). ``check_output`` must be the REAL
++    ``subprocess.check_output`` (captured before the guard patches it).
++    """
++    try:
++        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
++            stat = fh.read()
++        # Field 4 (ppid) follows the ``(comm)`` field, which may contain spaces.
++        return int(stat.rsplit(")", 1)[1].split()[1])
++    except (OSError, ValueError, IndexError):
++        pass
++    try:
++        out = check_output(
++            ["ps", "-o", "ppid=", "-p", str(pid)],
++            stderr=subprocess.DEVNULL,
++            timeout=5,
++        )
++        text = out.decode() if isinstance(out, (bytes, bytearray)) else str(out)
++        return int(text.strip())
++    except Exception:
++        return None
++
++
++def _pid_in_subtree_without_psutil(pid: int, root: int, check_output) -> bool:
++    """True iff ``root`` is an ancestor of ``pid``, walking ppids without psutil.
++
++    Fails closed: an unreadable parent ends the walk with False, so a real
++    gateway pid (parent launchd/systemd/init) is still refused.
++    """
++    seen: set[int] = set()
++    current = pid
++    for _ in range(128):
++        parent = _parent_pid_without_psutil(current, check_output)
++        if parent is None or parent <= 0 or parent in seen:
++            return False
++        if parent == root:
++            return True
++        if parent == 1:
++            return False
++        seen.add(parent)
++        current = parent
++    return False
++
++
+ @pytest.fixture(autouse=True)
+ def _live_system_guard(request, monkeypatch):
+     """Block real os.kill / systemctl / gateway-pid scans during tests.
+@@ -80,6 +131,8 @@ def _live_system_guard(request, monkeypatch):
+     import subprocess as _subprocess
+ 
+     test_pid = _os.getpid()
++    # The real one: the guard patches subprocess.check_output further down.
++    _real_check_output = _subprocess.check_output
+     lookalike_ok = request.node.get_closest_marker(_GATEWAY_LOOKALIKE_MARK) is not None
+     # Capture the test process's existing children at fixture start —
+     # any *new* children spawned by the test are also allowlisted via
+@@ -105,7 +158,15 @@ def _live_system_guard(request, monkeypatch):
+         if pid == test_pid or pid in _initial_children:
+             return True
+         if _psutil is None:
+-            return False
++            try:
++                _os.kill(pid, 0)  # the guarded kill passes signal 0 through
++            except ProcessLookupError:
++                return True  # stale PID, same as the psutil path: a no-op kill
++            except PermissionError:
++                return False  # another user's process is never ours
++            except OSError:
++                pass
++            return _pid_in_subtree_without_psutil(pid, test_pid, _real_check_output)
+         try:
+             walker = _psutil.Process(pid)
+         except Exception:
+diff --git a/tests/test_live_system_guard_self_test.py b/tests/test_live_system_guard_self_test.py
+index 4ea03e988b..21a073c4da 100644
+--- a/tests/test_live_system_guard_self_test.py
++++ b/tests/test_live_system_guard_self_test.py
+@@ -111,6 +111,68 @@ def test_os_kill_blocks_negative_one():
+         os.kill(-1, signal.SIGTERM)
+ 
+ 
++@pytest.fixture
++def _own_sleeper():
++    """A fixture's own Popen child, killed in teardown (the shape of live_pid in
++    tests/hermes_cli/test_gateway_start_refused.py). A guard that misjudges it
++    as foreign turns the teardown into an ERROR."""
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++    try:
++        yield proc
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
++def test_fixture_popen_child_can_be_killed_under_guard(_own_sleeper):
++    """The test's own direct child is in its subtree, with or without psutil."""
++    os.kill(_own_sleeper.pid, signal.SIGKILL)
++    assert _own_sleeper.wait(timeout=10) == -signal.SIGKILL
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX ppid walk")
++def test_subtree_walk_without_psutil_finds_child_and_grandchild():
++    """psutil is a core dep only on Python >= 3.14; the fallback ppid walk must
++    still see our own children and grandchildren (MacBook 3.11 venv, Oct 2026)."""
++    from tests._fixtures.live_system_guard import _pid_in_subtree_without_psutil
++
++    real_check_output = subprocess.check_output  # the guard passes ``ps`` through
++    child = subprocess.Popen(
++        [sys.executable, "-c",
++         "import subprocess, sys, time; "
++         "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
++         "print(g.pid, flush=True); time.sleep(60)"],
++        stdout=subprocess.PIPE, text=True,
++    )
++    grandchild = None
++    try:
++        assert child.stdout is not None
++        grandchild = int(child.stdout.readline())
++        me = os.getpid()
++        assert _pid_in_subtree_without_psutil(child.pid, me, real_check_output) is True
++        assert _pid_in_subtree_without_psutil(grandchild, me, real_check_output) is True
++        # Not weakened for foreign pids: init, and our own parent (the pytest launcher).
++        assert _pid_in_subtree_without_psutil(1, me, real_check_output) is False
++        assert _pid_in_subtree_without_psutil(os.getppid(), me, real_check_output) is False
++    finally:
++        if grandchild is not None:
++            os.kill(grandchild, signal.SIGKILL)
++        child.kill()
++        child.wait()
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX ppid walk")
++def test_subtree_walk_without_psutil_fails_closed_when_ppid_unreadable():
++    from tests._fixtures.live_system_guard import _pid_in_subtree_without_psutil
++
++    def _broken(*a, **k):
++        raise OSError("no ps")
++
++    # /proc may still answer on Linux; a pid that does not exist has no /proc entry.
++    assert _pid_in_subtree_without_psutil(2**22 + 12345, os.getpid(), _broken) is False
++
++
+ @pytest.mark.skipif(not hasattr(os, "killpg"), reason="killpg POSIX-only")
+ def test_os_killpg_blocks_foreign_pgid():
+     with pytest.raises(RuntimeError, match="live-system guard"):
+-- 
+2.55.0
+

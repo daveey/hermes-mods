@@ -1,6 +1,6 @@
 # Sidebar paints from a boot snapshot before the backend is up
 
-Patch **0571** (source `6daea0b007`). Builds on [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md) and
+Patch **0577** (source `6daea0b007`). Builds on [desktop-sidebar-replica-live.md](desktop-sidebar-replica-live.md) and
 [hub-sync-replica.md](hub-sync-replica.md).
 
 ## Behavior
@@ -58,7 +58,7 @@ Not re-run on the Linux mirror host (they need the Desktop node toolchain); they
 
 ## Applying
 
-`git am -3` 0571 after 0528 and the hub-sync replica patches. The Electron main change needs an app rebuild and
+`git am -3` 0577 after 0537 and the hub-sync replica patches. The Electron main change needs an app rebuild and
 restart; a disk-plugin hot reload cannot activate it.
 
 ## Gotchas
@@ -71,6 +71,6 @@ restart; a disk-plugin hot reload cannot activate it.
 
 No. It needs the Electron main process and the pre-render store; the hub-sync half already is a bundled plugin.
 
-## Follow-up patches (0621)
+## Follow-up patches (0623)
 
-**0621** (`ff8ec1d78c`): replica recents showed "Subagent: ..." rows in Home, because hub replica rows (other gateways, and this gateway's own boot snapshot) only went through the source rule and a delegate child keeps its parent's source. The replica recents rule now drops rows the owner stamps `is_internal_child`. Exact-id opens are unaffected. Code: `apps/desktop/src/store/offline-sessions.ts`; test in `offline-sessions.test.ts`.
+**0623** (`ff8ec1d78c`): replica recents showed "Subagent: ..." rows in Home, because hub replica rows (other gateways, and this gateway's own boot snapshot) only went through the source rule and a delegate child keeps its parent's source. The replica recents rule now drops rows the owner stamps `is_internal_child`. Exact-id opens are unaffected. Code: `apps/desktop/src/store/offline-sessions.ts`; test in `offline-sessions.test.ts`.

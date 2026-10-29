@@ -1,6 +1,6 @@
 # Kanban central sync client (phase 2) and its live-soak fixes
 
-Patches **0466**, **0468**, **0470**, **0472**, **0475**, **0502**, **0503**, **0506**, **0507**, **0508**, **0509**, **0534**
+Patches **0472**, **0474**, **0476**, **0478**, **0481**, **0509**, **0510**, **0513**, **0514**, **0515**, **0516**, **0547**
 (sources `6053646f27`, `726d5b5525`, `9dc26ab68c`, `a7caf2ddb7`, `41a47a3c32`, `0fabd3eb47`, `07a0dd02b8`,
 `da1a3a8443`, `20ca50ce3f`, `e1db6f8e77`, `193659fa7e`, `5c1a2bd67e`). Builds on [kanban-central-service.md](kanban-central-service.md) and
 [kanban-sync-seams.md](kanban-sync-seams.md); the two earlier client fixes are in [kanban-sync-client-fixes.md](kanban-sync-client-fixes.md).
@@ -13,20 +13,20 @@ Patches **0466**, **0468**, **0470**, **0472**, **0475**, **0502**, **0503**, **
   `hermes kanban sync` has import and diff commands.
 - Fields with an unanswered local edit are not overwritten by a pull; a rejected op is marked and a primary board
   restores the service's row.
-- A card the service never acknowledged (`sync_version` NULL) is sent as its full row on edit (0468) and ahead of any
-  child row in the batch (0509); child rows (runs, comments, events, attachments, chat links) always go whole (0508).
+- A card the service never acknowledged (`sync_version` NULL) is sent as its full row on edit (0474) and ahead of any
+  child row in the batch (0516); child rows (runs, comments, events, attachments, chat links) always go whole (0515).
 - Transient rejections (unknown table, storage error, depends_on_rejected, not_found for a card the gateway still has)
-  back off by time (2 s doubling to 5 min, 20 attempts) instead of retrying every round (0507, 0508).
-- `sync diff` counts an acknowledged-but-unpulled row as in flight and pulls the replica first (0475).
-- A worker process builds its own hub lease client from the enrollment (0472); `kanban.sync` is read with the repo's
-  YAML loader, so ruamel-only venvs work (0470).
+  back off by time (2 s doubling to 5 min, 20 attempts) instead of retrying every round (0514, 0515).
+- `sync diff` counts an acknowledged-but-unpulled row as in flight and pulls the replica first (0481).
+- A worker process builds its own hub lease client from the enrollment (0478); `kanban.sync` is read with the repo's
+  YAML loader, so ruamel-only venvs work (0476).
 - Process start no longer opens a capture gap: trigger drop/create and the uid backfill run in one write transaction,
-  and `install_triggers` is a no-op when the installed set already matches (0502).
+  and `install_triggers` is a no-op when the installed set already matches (0509).
 - The sync loop holds the Board's WebSocket feed per synced board and runs a round on a change frame or within 0.5 s
-  of a local outbox write, else at the poll period; without `websockets` it polls (0503).
+  of a local outbox write, else at the poll period; without `websockets` it polls (0510).
 - Chat links become a synced table `task_chat_links` reconciled every 60 s per board, so any gateway's replica can
-  answer a chat's open cards on other gateways; missing links are released, never deleted (0506).
-- Core's timestamp columns stay in Unix seconds whatever the feed sends (0534): `_local_fields` turns a millisecond
+  answer a chat's open cards on other gateways; missing links are released, never deleted (0513).
+- Core's timestamp columns stay in Unix seconds whatever the feed sends (0547): `_local_fields` turns a millisecond
   value (> 1e11) in `SECONDS_COLUMNS` (tasks created/started/completed, runs started/ended, events/comments/
   attachments/chat links created) into seconds, and the first open of each synced file rewrites rows already in ms
   (`kanban_sync_state.seconds_repaired`, uncaptured). Before it, the Board's lease grants wrote `task_runs.started_at`
@@ -51,11 +51,11 @@ rebuild, full-row sends, transient backoff, capture gap, feed watcher, no-PyYAML
 `tests/hermes_cli/kanban_sync_fake_board.py` (fake service) and `tests/hermes_cli/test_kanban_chat_links.py`
 (reconcile, replica answers, links diff, CLI). `tests/hermes_cli/test_kanban_sync_apply.py`
 (`test_millisecond_timestamps_from_the_wire_are_stored_in_seconds`, `test_rows_already_in_milliseconds_are_repaired_once_on_open`)
-covers 0534. A live Board service is not exercised by these tests.
+covers 0547. A live Board service is not exercised by these tests.
 
 ## Applying
 
-`git am -3` the twelve patches in number order after `0465`.
+`git am -3` the twelve patches in number order after `0471`.
 
 ## Gotchas
 

@@ -1,0 +1,517 @@
+From 72755549d128f853cc541e3ce05c11ba601d879a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 10:39:09 +0000
+Subject: [PATCH] [daveey] checkpoints: price git add before running it;
+ persist the slow-folder back-off in the store
+
+agent-23a0c3b69f came back after 4d28e047a7: on the MacBook at 2026-10-28T08:48:30Z
+`git add -A` timed out again in /Users/me/code/_wt/resume-stale-managed-pin (a
+hermes-core-wt checkout). The size cap only keeps files over max_file_size_mb out of
+the add; every other file still costs a hash, and on a first snapshot a compressed
+object write. Measured on hermes-hub (16 cores, load 11-14): a hermes-agent checkout
+(19,021 files, 209 MB, nothing near the cap) takes 37 s on its first add, so on a
+laptop at load ~56 it cannot finish in 60 s. The back-off that followed lived in one
+process's memory, so every new process paid the 60 s again.
+
+- tools/checkpoint_staging.py: the tree walk also keeps size and mtime of every file
+  under the cap. estimate() prices the add from those (1.1 ms per file + 28 MB/s,
+  the hub's first-add rates, scaled by load average / cores); budget = half the add
+  timeout. The slow-folder back-off is written to <store>/info/slow-dirs.json (wall
+  clock, clamped to one period) as well as the process registry.
+- CheckpointManager._take: before git add, a cold index prices every file and a warm
+  one only files modified since the last snapshot. Over budget, git ls-files -o -m
+  (new + stat-changed, gitignored dropped; no hashing) narrows it. Still over: skip
+  the add, mark the folder slow, and log the folder, the estimate and the 3 biggest
+  files. Returns in ~2 s instead of blocking the turn for 60 s.
+- The index is seeded with `read-tree -m`, which keeps the stat data of unchanged
+  entries, and its mtime is restored to the last add's, so git rehashes only changed
+  files (a plain read-tree made it rehash the whole tree every turn: 18.8 s vs 0.03 s
+  for the hermes checkout) and the estimate's "changed since" anchor survives a
+  skipped or killed add.
+- ensure_checkpoint reads the back-off from the store, so a fresh process skips too.
+
+Coverage limit: a tree that is over budget on a cold index (first snapshot of a big
+checkout on a loaded host) stays unsnapshotted, retried hourly, until the host is
+idle enough to fit it in budget. Before this change it timed out instead.
+
+Tests (tests/tools/test_checkpoint_manager.py::TestStagingBudget):
+- test_sub_cap_tree_over_budget_is_skipped_without_git_add (400 x 64 KB at load x40:
+  no git add, < 5 s, warning names folder/budget/biggest file) - red on main
+- test_back_off_survives_a_new_process[budget|timeout] (fresh interpreter, real load
+  factor, same store: no git add) - red on main
+- controls, green on both: the same tree is snapshotted when idle; a warm index
+  prices only changed files; gitignored weight does not count.
+Live (real manager, no patches, 300 x 9 MB tree on the hub): main blocked 61.6 s
+(timeout) and a second process 60.3 s; this commit skips in 2.2 s and a second
+process in 0.0 s.
+
+Undo: git revert this commit.
+Hub card t_01a181f638cd95f0.
+---
+ tests/tools/test_checkpoint_manager.py        | 129 ++++++++++++++++++
+ tools/checkpoint_manager.py                   |  77 ++++++++++-
+ tools/checkpoint_staging.py                   | 129 ++++++++++++++++--
+ .../user-guide/checkpoints-and-rollback.md    |   1 +
+ 4 files changed, 321 insertions(+), 15 deletions(-)
+
+diff --git a/tests/tools/test_checkpoint_manager.py b/tests/tools/test_checkpoint_manager.py
+index 3097af9ad1..9d91484eb4 100644
+--- a/tests/tools/test_checkpoint_manager.py
++++ b/tests/tools/test_checkpoint_manager.py
+@@ -1567,3 +1567,132 @@ class TestGitTimeoutRecovery:
+         assert CheckpointManager(enabled=True).ensure_checkpoint(str(work_dir), "snap") is False
+         msgs = [r.getMessage() for r in caplog.records if r.levelno >= 30]
+         assert any("huge.sqlite" in m and str(work_dir.resolve()) in m for m in msgs), msgs
++
++
++class TestStagingBudget:
++    """Files under ``max_file_size_mb`` still cost a hash each: a tree of them can outlast the add
++    timeout (agent-23a0c3b69f came back after the size cap shipped, on a source checkout under
++    load). The add is priced before it runs, and the back-off survives a new process."""
++
++    @staticmethod
++    def _spy_adds(monkeypatch):
++        import tools.checkpoint_manager as cm
++        real_run = subprocess.run
++        adds = []
++
++        def spy(cmd, *a, **kw):
++            if len(cmd) > 1 and cmd[-2:] == ["add", "-A"]:
++                adds.append(cmd)
++            return real_run(cmd, *a, **kw)
++
++        monkeypatch.setattr(cm.subprocess, "run", spy)
++        return adds
++
++    @staticmethod
++    def _sub_cap_tree(root, n=400, size=64 * 1024):
++        for i in range(n):
++            d = root / f"pkg{i % 20}"
++            d.mkdir(exist_ok=True)
++            (d / f"mod{i}.bin").write_bytes(os.urandom(size))
++
++    @staticmethod
++    def _loaded(monkeypatch, factor):
++        # The MacBook hit ran at load ~56: the same tree costs that many times more there.
++        import tools.checkpoint_staging as staging
++        monkeypatch.setattr(staging, "load_factor", lambda: factor, raising=False)
++
++    def test_sub_cap_tree_over_budget_is_skipped_without_git_add(
++        self, work_dir, checkpoint_base, monkeypatch, caplog,
++    ):
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        self._sub_cap_tree(work_dir)  # 400 x 64 KB, every file under the 10 MB cap
++        self._loaded(monkeypatch, 40.0)
++        adds = self._spy_adds(monkeypatch)
++        caplog.set_level("DEBUG", logger="tools.checkpoint_manager")
++
++        mgr = CheckpointManager(enabled=True)
++        started = time.monotonic()
++        assert mgr.ensure_checkpoint(str(work_dir), "snap") is False
++        assert time.monotonic() - started < 5
++        assert adds == [], "git add ran on a tree priced over the staging budget"
++        msgs = [r.getMessage() for r in caplog.records if r.levelno >= 30]
++        assert any(str(work_dir.resolve()) in m and "budget" in m and "mod" in m for m in msgs), msgs
++
++        # The next turn backs off without walking the tree again.
++        mgr.new_turn()
++        assert mgr.ensure_checkpoint(str(work_dir), "snap-2") is False
++        assert adds == []
++
++    def test_same_tree_is_snapshotted_when_the_host_is_idle(self, work_dir, checkpoint_base, monkeypatch):
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        self._sub_cap_tree(work_dir)
++        self._loaded(monkeypatch, 1.0)
++        adds = self._spy_adds(monkeypatch)
++        assert CheckpointManager(enabled=True).ensure_checkpoint(str(work_dir), "snap") is True
++        assert len(adds) == 1
++
++    def test_warm_index_prices_only_changed_files(self, work_dir, checkpoint_base, monkeypatch):
++        """After a snapshot the index keeps stat data, so an unchanged heavy tree costs ~nothing:
++        the budget must not lock a big repo out once it has been snapshotted."""
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        self._sub_cap_tree(work_dir)
++        self._loaded(monkeypatch, 1.0)
++        mgr = CheckpointManager(enabled=True)
++        assert mgr.ensure_checkpoint(str(work_dir), "snap") is True
++        time.sleep(2.1)
++        self._loaded(monkeypatch, 40.0)
++        (work_dir / "main.py").write_text("print('changed')\n")
++        mgr.new_turn()
++        assert mgr.ensure_checkpoint(str(work_dir), "snap-2") is True
++        assert len(mgr.list_checkpoints(str(work_dir))) == 2
++
++    def test_gitignored_weight_does_not_count(self, work_dir, checkpoint_base, monkeypatch):
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        (work_dir / ".gitignore").write_text("cache/\n")
++        (work_dir / "cache").mkdir()
++        self._sub_cap_tree(work_dir / "cache")  # over budget, but git never stages it
++        self._loaded(monkeypatch, 40.0)
++        assert CheckpointManager(enabled=True).ensure_checkpoint(str(work_dir), "snap") is True
++
++    @pytest.mark.parametrize("cause", ["budget", "timeout"])
++    def test_back_off_survives_a_new_process(self, cause, work_dir, checkpoint_base, monkeypatch, tmp_path):
++        import sys
++        import tools.checkpoint_manager as cm
++        monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
++        if cause == "budget":
++            self._sub_cap_tree(work_dir)
++            self._loaded(monkeypatch, 40.0)
++        else:
++            TestGitTimeoutRecovery._timeout_add(monkeypatch, [], [])
++        assert CheckpointManager(enabled=True).ensure_checkpoint(str(work_dir), "snap") is False
++
++        # A fresh interpreter: no in-process registry, real load factor, the same store.
++        child = tmp_path / "child.py"
++        child.write_text(
++            "import json, subprocess, sys\n"
++            "from pathlib import Path\n"
++            "import tools.checkpoint_manager as cm\n"
++            "cm.CHECKPOINT_BASE = Path(sys.argv[1])\n"
++            "adds = []\n"
++            "real = subprocess.run\n"
++            "def spy(cmd, *a, **kw):\n"
++            "    if cmd[-2:] == ['add', '-A']:\n"
++            "        adds.append(cmd)\n"
++            "    return real(cmd, *a, **kw)\n"
++            "cm.subprocess.run = spy\n"
++            "took = cm.CheckpointManager(enabled=True).ensure_checkpoint(sys.argv[2], 'child')\n"
++            "print(json.dumps({'took': took, 'adds': len(adds)}))\n"
++        )
++        env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
++        out = subprocess.run(
++            [sys.executable, str(child), str(checkpoint_base), str(work_dir)],
++            capture_output=True, text=True, env=env, cwd=str(Path(cm.__file__).parents[1]), timeout=120,
++            check=False,
++        )
++        assert out.returncode == 0, out.stderr
++        result = json.loads(out.stdout.strip().splitlines()[-1])
++        assert result == {"took": False, "adds": 0}, (result, out.stderr[-2000:])
+diff --git a/tools/checkpoint_manager.py b/tools/checkpoint_manager.py
+index 5646a0cf78..09441e0776 100644
+--- a/tools/checkpoint_manager.py
++++ b/tools/checkpoint_manager.py
+@@ -935,9 +935,9 @@ class CheckpointManager:
+ 
+         self._checkpointed_dirs.add(abs_dir)
+ 
+-        backoff = staging.slow_remaining_s(_resolve_checkpoint_base(), abs_dir)
++        backoff = staging.slow_remaining_s(_store_path(), abs_dir)
+         if backoff:
+-            logger.debug("Checkpoint skipped: %s timed out staging; retry in %d min", abs_dir, backoff // 60 + 1)
++            logger.debug("Checkpoint skipped: %s is too slow to stage; retry in %d min", abs_dir, backoff // 60 + 1)
+             return False
+ 
+         try:
+@@ -1440,6 +1440,10 @@ class CheckpointManager:
+         # Seed the per-project index from the last checkpoint, if any, so the
+         # diff/commit machinery sees only changes since then.  On first call,
+         # clear the index so ``git add -A`` produces a clean tree.
++        # ``read-tree -m`` keeps the stat data of entries that still match the
++        # ref, so ``git add -A`` rehashes only files changed since the last
++        # snapshot (a plain read-tree made it rehash the whole tree every turn).
++        warm_since: Optional[float] = None
+         if index_file.exists():
+             # Reset index to current ref tip to avoid accumulating stale paths.
+             ok_ref, ref_commit, _ = _run_git(
+@@ -1448,12 +1452,35 @@ class CheckpointManager:
+                 allowed_returncodes={128},
+             )
+             if ok_ref and ref_commit:
+-                _run_git(
+-                    ["read-tree", ref_commit],
++                try:
++                    index_mtime = index_file.stat().st_mtime
++                except OSError:
++                    index_mtime = None
++                ok_seed, _, _ = _run_git(
++                    ["read-tree", "-m", ref_commit],
+                     store, working_dir,
+                     index_file=index_file,
+                     allowed_returncodes={128},
+                 )
++                if ok_seed:
++                    warm_since = index_mtime
++                    if index_mtime is not None:
++                        # Keep the mtime of the last add's stat refresh: git
++                        # treats entries modified at or after it as racy and
++                        # rehashes them, and so does the estimate below. A
++                        # skipped or killed add then leaves the next turn's
++                        # estimate anchored to the last real snapshot.
++                        try:
++                            os.utime(index_file, (time.time(), index_mtime))
++                        except OSError:
++                            warm_since = None
++                else:
++                    _run_git(
++                        ["read-tree", ref_commit],
++                        store, working_dir,
++                        index_file=index_file,
++                        allowed_returncodes={128},
++                    )
+             else:
+                 try:
+                     index_file.unlink()
+@@ -1463,12 +1490,27 @@ class CheckpointManager:
+             # First snapshot for this project.
+             index_file.parent.mkdir(parents=True, exist_ok=True)
+ 
++        # Price the add before running it: files under the cap still cost a
++        # hash each, and a tree of them can outlast the timeout (a fresh source
++        # checkout on a loaded laptop). Over budget, skip the add instead of
++        # blocking the turn until git is killed.
++        over = self._over_staging_budget(store, working_dir, index_file, scan, warm_since)
++        if over is not None:
++            staging.mark_slow(store, working_dir)
++            logger.warning(
++                "Checkpoint of %s skipped before staging: %s, over the %.0fs budget "
++                "(biggest files: %s); not retried for %d min",
++                working_dir, over.text(), staging.budget_s(_GIT_TIMEOUT * 2),
++                scan.biggest_text(), staging._SLOW_DIR_BACKOFF_S // 60,
++            )
++            return False
++
+         # Stage with per-project index; files over max_file_size_mb are
+         # excluded before git reads them.
+         ok, _, err = self._stage_all(store, working_dir, index_file, scan)
+         if not ok:
+             if err.startswith("git timed out"):
+-                staging.mark_slow(_resolve_checkpoint_base(), working_dir)
++                staging.mark_slow(store, working_dir)
+                 logger.warning(
+                     "Checkpoint of %s timed out staging (biggest files: %s); not retried for %d min",
+                     working_dir, scan.biggest_text(), staging._SLOW_DIR_BACKOFF_S // 60,
+@@ -1599,6 +1641,31 @@ class CheckpointManager:
+                 logger.info("Checkpoint: removed %d partial file(s) left by the timed-out git add", len(removed))
+         return ok, out, err
+ 
++    def _over_staging_budget(
++        self, store: Path, working_dir: str, index_file: Path,
++        scan: staging.TreeScan, warm_since: Optional[float],
++    ) -> Optional[staging.AddEstimate]:
++        """The add's estimate when it would not finish inside the staging budget, else None.
++
++        A free estimate from the tree walk comes first (every file on a cold
++        index; files modified since the last snapshot on a warm one). Only when
++        that is over budget does git list what it would really hash
++        (``ls-files -o -m``: new and stat-changed, gitignored files dropped),
++        which is a directory walk with no hashing."""
++        budget = staging.budget_s(_GIT_TIMEOUT * 2)
++        est = staging.estimate(scan, warm_since)
++        if est.seconds <= budget:
++            return None
++        ok, out, _ = _run_git(
++            ["ls-files", "-z", "-o", "-m", "--exclude-standard"],
++            store, working_dir, index_file=index_file,
++        )
++        if not ok:
++            return est
++        listed = set(filter(None, out.split("\x00")))
++        est = staging.estimate(scan, None, only=listed)
++        return est if est.seconds > budget else None
++
+     @staticmethod
+     def _unstage(store: Path, working_dir: str, index_file: Path, paths: list[str]) -> None:
+         """Remove literal ``paths`` from the project index (absent ones are ignored).
+diff --git a/tools/checkpoint_staging.py b/tools/checkpoint_staging.py
+index 3305b1c66a..4e800db246 100644
+--- a/tools/checkpoint_staging.py
++++ b/tools/checkpoint_staging.py
+@@ -4,10 +4,17 @@ The size cap (``checkpoints.max_file_size_mb``) has to act BEFORE staging. ``git
+ compresses every file it stages, so a cap applied afterwards (``_drop_oversize_from_index``) still
+ paid for a multi-GB file in full: the add ran past its timeout, the snapshot was lost, and the killed
+ git left a partial pack and its index lock in the store.
++
++The cap alone does not bound the add: a tree of many files under the cap (a fresh source checkout)
++still costs one hash, and on a first snapshot one compressed object write, per file. ``estimate``
++prices the add before it runs, and a folder over the budget is skipped without waiting out the
++timeout. Skipped and timed-out folders back off in a file inside the store, so a new process (the
++next ``hermes chat``, a respawned backend) does not pay for the same folder again.
+ """
+ from __future__ import annotations
+ 
+ import heapq
++import json
+ import logging
+ import os
+ import re
+@@ -19,11 +26,26 @@ from typing import Optional
+ 
+ logger = logging.getLogger("tools.checkpoint_manager")
+ 
+-# A folder whose staging timed out is not snapshotted again for this long (per process): every new
+-# turn would otherwise wait out the full timeout again for a snapshot that cannot finish.
++# A folder whose staging timed out (or was priced over budget) is not snapshotted again for this long:
++# every new turn would otherwise wait out the full timeout again for a snapshot that cannot finish.
++# Persisted in the store (wall clock, so it means the same in every process); a sleep only shortens it.
+ _SLOW_DIR_BACKOFF_S = 3600
++_SLOW_DIRS_FILE = "slow-dirs.json"
+ _slow_dirs: dict[tuple[str, str], float] = {}
+-_now = time.monotonic
++_now = time.time
++
++# Cost model for ``git add -A`` into the checkpoint store, measured on hermes-hub (16 cores, load
++# average 11-14, git 2.55) with a bare store and a separate index, as _stage_all runs it:
++#   first add, 20,000 x 4 KB files (78 MB)      25.2 s  -> ~1.1 ms per file (hash + loose-object write)
++#   first add, 120 x 8 MB files (960 MB)        34.1 s  -> ~28 MB/s (hash + zlib)
++#   first add, a hermes-agent checkout (19,021 files, 209 MB) 37.1 s; the same tree after a
++#   stat-less read-tree 18.8 s; with a stat-carrying index 0.03 s.
++# Every file git has to (re)hash is priced at first-add rates; that pessimism covers rehash-only
++# adds of objects already in the store. The estimate is scaled by load average / cores (the MacBook
++# hit ran at load ~56) and must fit in half the add timeout.
++ADD_SECONDS_PER_FILE = 0.0011
++ADD_BYTES_PER_SECOND = 28 * 1024 * 1024
++BUDGET_FRACTION = 0.5
+ 
+ # Temp files a killed git writes into the store: pack-objects/index-pack output in objects/pack,
+ # loose-object temps in objects/??/.
+@@ -36,11 +58,13 @@ _MTIME_SLACK_S = 2.0
+ 
+ @dataclass
+ class TreeScan:
+-    """One walk of a working tree: entry count (capped), oversize files, biggest files."""
++    """One walk of a working tree: entry count (capped), oversize files, biggest files, and the
++    size and mtime of every regular file under the cap (what ``git add -A`` may have to hash)."""
+ 
+     count: int = 0
+     oversize: list[str] = field(default_factory=list)
+     biggest: list[tuple[int, str]] = field(default_factory=list)
++    files: dict[str, tuple[int, float]] = field(default_factory=dict)
+ 
+     def biggest_text(self) -> str:
+         return ", ".join(f"{rel} ({size / 1048576:.1f} MB)" for size, rel in self.biggest) or "none"
+@@ -72,6 +96,8 @@ def scan_tree(path: str, cap_bytes: int, max_entries: int) -> TreeScan:
+                 rel = full.relative_to(root).as_posix()
+                 if cap_bytes > 0 and st.st_size > cap_bytes:
+                     scan.oversize.append(rel)
++                else:
++                    scan.files[rel] = (st.st_size, st.st_mtime)
+                 if len(heap) < 3:
+                     heapq.heappush(heap, (st.st_size, rel))
+                 elif st.st_size > heap[0][0]:
+@@ -142,17 +168,100 @@ def clear_timeout_debris(store: Path, since: float, index_file: Optional[Path])
+     return removed
+ 
+ 
+-def mark_slow(base: Path, working_dir: str) -> None:
+-    _slow_dirs[(str(base), working_dir)] = _now() + _SLOW_DIR_BACKOFF_S
++@dataclass
++class AddEstimate:
++    """What ``git add -A`` is expected to hash, and how long that takes on this host now."""
++
++    files: int
++    bytes: int
++    seconds: float
++
++    def text(self) -> str:
++        return f"{self.files} files / {self.bytes / 1048576:.0f} MB to hash, ~{self.seconds:.0f}s"
++
++
++def load_factor() -> float:
++    """How much slower than the measured rates this host runs right now (>= 1)."""
++    try:
++        return max(1.0, os.getloadavg()[0] / (os.cpu_count() or 1))
++    except (AttributeError, OSError):  # no getloadavg (Windows)
++        return 1.0
++
++
++def estimate(scan: TreeScan, fresh_since: Optional[float], only: Optional[set[str]] = None) -> AddEstimate:
++    """Price the add.
++
++    ``fresh_since`` is the mtime of an index that carries stat data from the last snapshot: git
++    skips files unchanged since then, so only files modified at or after it count (None = a cold
++    index, every file is hashed). ``only`` narrows to the paths git itself reports as new or
++    modified (``ls-files -o -m``), which also drops gitignored files the walk counted."""
++    files = nbytes = 0
++    cutoff = None if fresh_since is None else fresh_since - _MTIME_SLACK_S
++    for rel, (size, mtime) in scan.files.items():
++        if only is not None:
++            if rel not in only:
++                continue
++        elif cutoff is not None and mtime < cutoff:
++            continue
++        files += 1
++        nbytes += size
++    seconds = (files * ADD_SECONDS_PER_FILE + nbytes / ADD_BYTES_PER_SECOND) * load_factor()
++    return AddEstimate(files, nbytes, seconds)
++
++
++def budget_s(add_timeout_s: float) -> float:
++    return add_timeout_s * BUDGET_FRACTION
+ 
+ 
+-def slow_remaining_s(base: Path, working_dir: str) -> float:
+-    """Seconds left in ``working_dir``'s back-off window, 0 when it may be snapshotted."""
+-    key = (str(base), working_dir)
++def _slow_file(store: Path) -> Path:
++    return store / "info" / _SLOW_DIRS_FILE
++
++
++def _read_slow(store: Path) -> dict[str, float]:
++    try:
++        data = json.loads(_slow_file(store).read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return {}
++    if not isinstance(data, dict):
++        return {}
++    return {k: float(v) for k, v in data.items() if isinstance(k, str) and isinstance(v, (int, float))}
++
++
++def mark_slow(store: Path, working_dir: str) -> None:
++    """Back ``working_dir`` off for ``_SLOW_DIR_BACKOFF_S``, in this process and in the store.
++
++    Callers hold the checkpoint store lock, so the read-modify-write does not race."""
++    now = _now()
++    until = now + _SLOW_DIR_BACKOFF_S
++    _slow_dirs[(str(store), working_dir)] = until
++    entries = {k: v for k, v in _read_slow(store).items() if v > now}
++    entries[working_dir] = until
++    path = _slow_file(store)
++    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        tmp.write_text(json.dumps(entries, indent=0, sort_keys=True), encoding="utf-8")
++        os.replace(tmp, path)
++    except OSError as exc:
++        logger.warning("Checkpoint: could not persist the back-off for %s: %s", working_dir, exc)
++        try:
++            tmp.unlink()
++        except OSError:
++            pass
++
++
++def slow_remaining_s(store: Path, working_dir: str) -> float:
++    """Seconds left in ``working_dir``'s back-off window, 0 when it may be snapshotted.
++
++    Reads this process's registry first, then the store's file (another process's back-off)."""
++    key = (str(store), working_dir)
+     until = _slow_dirs.get(key)
++    if until is None:
++        until = _read_slow(store).get(working_dir)
+     if until is None:
+         return 0.0
+-    left = until - _now()
++    # Clamp: a wall clock set back must not stretch the window past one back-off period.
++    left = min(until - _now(), float(_SLOW_DIR_BACKOFF_S))
+     if left <= 0:
+         _slow_dirs.pop(key, None)
+         return 0.0
+diff --git a/website/docs/user-guide/checkpoints-and-rollback.md b/website/docs/user-guide/checkpoints-and-rollback.md
+index d9a8ea916e..3b58042943 100644
+--- a/website/docs/user-guide/checkpoints-and-rollback.md
++++ b/website/docs/user-guide/checkpoints-and-rollback.md
+@@ -259,6 +259,7 @@ With a container terminal backend (`docker`, `singularity`, `modal`, `daytona`,
+ - **Directory scope** — Hermes skips overly broad directories (root `/`, home `$HOME`).
+ - **Repository size** — directories with more than 50,000 files are skipped.
+ - **Per-file size cap** — files larger than `max_file_size_mb` (default 10 MB) are excluded from the snapshot. Prevents accidentally swallowing datasets, model weights, or generated media.
++- **Staging budget** — before staging, Hermes estimates how long `git add` will take (the files it has to hash, scaled by the machine's current load). A folder whose snapshot would not finish in half the git timeout (for example the first snapshot of a large fresh checkout on a busy laptop) is skipped instead of blocking the turn. Such a folder, like one whose staging really timed out, is not retried for 60 minutes by any Hermes process (the back-off is kept in the checkpoint store).
+ - **Total store size cap** — when the store exceeds `max_total_size_mb` (default 500 MB), the oldest commit per project is dropped round-robin. Each drop is reclaimed before deciding whether another is necessary. Every project keeps at least one snapshot. A failed Git operation stops pruning and is reported; maintenance never discards more history to compensate for failed reclamation.
+ - **Real pruning, off the hot path** — `max_snapshots` and the size cap are enforced by rewriting the per-project ref at checkpoint time (cheap); the store is then marked `.gc-pending` and the periodic prune runs `git gc --prune=now` once, so loose objects don't accumulate and a tool call never waits on a full repack.
+ - **Concurrent operations** — snapshots, restores, diffs and maintenance use one process-shared store lock. An operation reports a busy store rather than running GC over another process's unpublished objects. A restore applies its selected tree before pruning the safety snapshot's history.
+-- 
+2.55.0
+

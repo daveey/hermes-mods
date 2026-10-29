@@ -1,0 +1,265 @@
+From d55299af3eb632e0319f256cace6333c3f0255bc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:17:37 +0000
+Subject: [PATCH] fix(tui_gateway): a notification turn no longer swallows a
+ core-update-paused turn [daveey]
+
+A synthesized turn (process completion, kanban notice, wake-up) that landed on a session paused for a
+core update wrote its own crash marker over the core_update_pause one and cleared it on completion, and
+the in-place watcher read the busy session as 'user moved on'. The paused request was never continued
+(David-MBP session 5ab65c, 2026-10-28 07:50). Synthesized turns now run without a marker of their own
+while a paused one exists, the watcher waits for them, and they re-arm the watcher on completion; a typed
+message still retires the pause.
+---
+ .../test_update_pause_superseded.py           | 132 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  25 +++-
+ tui_gateway/session_auto_continue.py          |   2 +-
+ tui_gateway/session_notifications.py          |   8 +-
+ tui_gateway/update_pause.py                   |   6 +-
+ 5 files changed, 167 insertions(+), 6 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_superseded.py
+
+diff --git a/tests/tui_gateway/test_update_pause_superseded.py b/tests/tui_gateway/test_update_pause_superseded.py
+new file mode 100644
+index 0000000000..795a05aae0
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_superseded.py
+@@ -0,0 +1,132 @@
++"""[daveey] A synthesized turn (background-process completion, kanban notice, subagent result) that lands on
++a session whose turn is paused for a core update must not swallow the pause.
++
++Live, David-MBP 2026-10-28: session 5ab65c was asked to pause at 07:43:15; after the update its next turn
++was a process_complete notification (07:50:12), not an auto-continue. That turn wrote its own marker over
++the ``core_update_pause`` one and cleared it when it finished, so neither the in-place watcher (session
++busy -> "done") nor any startup sweep ever continued the paused request. A typed user message still
++retires the pause: the user moved on.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++
++
++class _InlineThread:
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++    def is_alive(self):
++        return False
++
++    def join(self, timeout=None):
++        return None
++
++
++@pytest.fixture()
++def env(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    watchers: list = []
++    monkeypatch.setattr(up, "start_in_place_watcher", lambda sid, session, key: watchers.append((sid, key)))
++    return types.SimpleNamespace(home=tmp_path, watchers=watchers)
++
++
++def _paused_session(home):
++    """Run one turn that pauses at a step boundary, then end the window (hold and request gone)."""
++    session = {"session_key": "session-key", "history": [], "history_lock": threading.RLock(),
++               "history_version": 0, "running": True, "attached_images": [], "image_counter": 0, "cols": 80,
++               "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++               "profile_home": str(home)}
++    calls = {"n": 0}
++
++    def _run(message, **kwargs):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            af.set_hold(home)
++            af.request_pause(home, expires_at=time.time() + 120)
++            return {"final_response": "", "messages": [], "interrupted": True, "completed": False,
++                    "paused_for_update": session["agent"].step_boundary_pause()}
++        return {"final_response": "noted", "messages": []}
++
++    session["agent"] = types.SimpleNamespace(session_id="session-key", run_conversation=_run,
++                                             clear_interrupt=lambda: None)
++    server._run_prompt_submit("rid", "ui-sid", session, "the long task")
++    af.clear_pause_request(home)
++    af.clear_hold(home)
++    marker = read_turn_marker(home, "session-key")
++    assert marker is not None and marker["reason"] == up.PAUSE_REASON
++    return session
++
++
++def test_notification_turn_on_a_paused_session_keeps_the_paused_turn_continuable(env):
++    session = _paused_session(env.home)
++
++    session["running"] = True  # the notification poller claimed the idle session
++    assert server._notif_run_submit("__notif__1", "ui-sid", session, "[Background process proc_1 finished]")
++
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None, "the paused request was dropped by the notification turn"
++    assert marker["reason"] == up.PAUSE_REASON
++    assert marker["prompt"] == "the long task"
++    assert marker["pauses"] == 1 and marker["attempts"] == 0
++    # Re-armed: the in-place watcher (pause turn's + this turn's) continues it once the session is idle.
++    assert env.watchers == [("ui-sid", "session-key"), ("ui-sid", "session-key")]
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "resume"
++
++
++def test_watcher_waits_while_a_synthesized_turn_runs_over_the_pause(env):
++    session = _paused_session(env.home)
++    session["running"] = True
++    session["_paused_marker_carried"] = "session-key"
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "wait"
++    session.pop("_paused_marker_carried")
++    assert up.in_place_resume_action(session, "session-key", skew=lambda: None) == "done"
++
++
++def test_typed_user_message_on_a_paused_session_still_retires_the_pause(env):
++    session = _paused_session(env.home)
++
++    session["running"] = True
++    server._run_prompt_submit("rid-2", "ui-sid", session, "actually, do something else")
++
++    assert read_turn_marker(env.home, "session-key") is None
++    assert env.watchers == [("ui-sid", "session-key")]  # only the pause turn's own
++
++
++def test_notification_turn_without_a_pause_leaves_no_marker(env):
++    session = _paused_session(env.home)
++    server._run_prompt_submit("rid-2", "ui-sid", session, "user moved on")  # pause retired
++    assert read_turn_marker(env.home, "session-key") is None
++
++    session["running"] = True
++    assert server._notif_run_submit("__notif__2", "ui-sid", session, "[Background process proc_2 finished]")
++
++    assert read_turn_marker(env.home, "session-key") is None
++    assert env.watchers == [("ui-sid", "session-key")]
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 662b4d6331..843527dcde 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -207,6 +207,21 @@ def _admit_prompt_turn(
+     return images, agent
+ 
+ 
++def _carry_paused_marker(session: dict, home, marker_key: str) -> bool:
++    """[daveey] A synthesized turn (process completion, kanban notice, wake-up) landing on a turn paused for
++    a core update runs without a marker of its own: writing one would overwrite the paused request and its
++    retirement would drop it, so the paused turn never continued. Only a typed message retires the pause."""
++    from tui_gateway.turn_marker import read_turn_marker
++    from tui_gateway.update_pause import PAUSE_REASON
++    marker = read_turn_marker(home, marker_key) if marker_key else None
++    if not marker or marker.get("reason") != PAUSE_REASON:
++        return False
++    with session["history_lock"]:
++        session["_paused_marker_carried"] = marker_key
++    logger.info("core-update pause: synthesized turn on %s keeps the paused turn's marker", marker_key)
++    return True
++
++
+ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+                         notification_category: str | None = None) -> str:
+     """Write the durable crash marker; returns the session key it was written under (compression
+@@ -219,8 +234,12 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     marker_pauses = int(session.pop("_auto_continue_pauses", 0) or 0)
+     killed_jobs = session.pop("_auto_continue_killed_jobs", None)
+     marker_text = session.pop("_auto_continue_prompt", None) or text
++    session.pop("_paused_marker_carried", None)
++    synthesized = session.pop("_synthesized_turn", False)
+     # [daveey] A core-update pause kept the previous turn's marker; this turn owns (and retires) its own.
+     session.pop("_update_pause_marker_key", None)
++    if synthesized and not marker_attempt and _carry_paused_marker(session, marker_home, marker_key):
++        return ""
+     if isinstance(marker_text, str) and marker_text.strip():
+         with session["history_lock"]:
+             session["_active_turn_marker_key"] = marker_key
+@@ -1297,10 +1316,12 @@ def _run_admitted_prompt(
+                 from tui_gateway.free_tier_task_done import note_task_done
+                 note_task_done(session, st.result, st.agent, display_kind)
+             _emit("message.complete", sid, payload)
+-            if paused_for_update:
++            # Kept until the next turn records its marker, so the backstop retire below also leaves it.
++            carried = session.get("_paused_marker_carried")
++            if paused_for_update or carried:
+                 # The new backend continues it; if no update replaces this one, continue it here.
+                 from tui_gateway import update_pause
+-                update_pause.start_in_place_watcher(sid, session, st.marker_key)
++                update_pause.start_in_place_watcher(sid, session, str(st.marker_key or carried))
+             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+             if status == "complete":
+                 _after_complete_turn(sid, session, st, raw)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index b1b7aa240e..4775b9e9a9 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -70,7 +70,7 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
+     if session.get("_exit_keeps_turn_marker"):
+         return
+     # [daveey] A core-update pause keeps its marker: the next backend (or the in-place watcher) continues it.
+-    if session.get("_update_pause_marker_key"):
++    if session.get("_update_pause_marker_key") or session.get("_paused_marker_carried"):
+         return
+     home = _session_home(session)
+     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 8a3e3f69c7..0eb825ec94 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -232,8 +232,12 @@ def _notif_run_submit(rid, sid, session, text, **kwargs):
+         _notif_release_turn(session)
+         return False
+     session.pop("_turn_owner_refusal", None)
+-    with stage(session):
+-        accepted = _run_prompt_submit(rid, sid, session, text, **kwargs)
++    session["_synthesized_turn"] = True  # [daveey] keeps a core-update-paused marker (prompt_turn)
++    try:
++        with stage(session):
++            accepted = _run_prompt_submit(rid, sid, session, text, **kwargs)
++    finally:
++        session.pop("_synthesized_turn", None)
+     reason = session.pop("_turn_owner_refusal", None)
+     if not accepted and reason in _OWNER_REFUSAL_CODES:
+         _notif_note_owner_refusal(session, reason)
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 99baa377a3..322cd070cd 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -265,7 +265,11 @@ def in_place_resume_action(session: dict, marker_key: str, *, skew: Callable[[],
+         busy = bool(session.get("running") or session.get("_closing") or session.get("_finalized")
+                     or session.get("_auto_continue_scheduled"))
+     if busy:
+-        return "done"
++        # A synthesized turn running over the paused marker (prompt_turn._carry_paused_marker) is not the
++        # user moving on: wait for it, then continue the paused turn.
++        with session["history_lock"]:
++            carried = session.get("_paused_marker_carried") == marker_key and session.get("running")
++        return "wait" if carried else "done"
+     marker = read_turn_marker(_home(session), marker_key)
+     if not marker or marker.get("reason") != PAUSE_REASON:
+         return "done"
+-- 
+2.55.0
+

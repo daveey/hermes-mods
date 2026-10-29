@@ -1,20 +1,20 @@
 # Project groups of every gateway from the hub; rename another gateway's project while it sleeps
 
-Patches: 0602 (core CLI), 0603 (Desktop). Phase 6b of [kanban-central-service.md](kanban-central-service.md)
+Patches: 0626 (core CLI), 0627 (Desktop). Phase 6b of [kanban-central-service.md](kanban-central-service.md)
 (approved by David 2026-10-27, cut straight over with no soak). Needs hermes-hub client 1.9.0 on every gateway and
 the hub-sync plugin's `GET /projects` (hermes-mods `plugins/hub-sync`).
 
 ## What it does
 
-- **Each gateway publishes its project tree.** `hermes project tree` (0602) prints every profile's own sidebar tree as
+- **Each gateway publishes its project tree.** `hermes project tree` (0626) prints every profile's own sidebar tree as
   JSON: the same read-only `build_tree` call the all-profiles REST route makes (`profile_project_trees` in
   `hermes_cli/web_routers/profiles.py`, shared by both), lanes without session rows, previews as `previewIds`, every
   claimed `sessionIds`. The hermes-hub collector publishes one `projects` record per node
   (`<profile>/<p_id | auto:<hash> | none>`) and stamps each session record with its node (`project`).
 - **Shared name, icon, color.** An explicit project's `name`, `icon` and `color` are hub shared fields (per-field HLC,
   like session titles). Any gateway sets them; the owner applies them with `hermes project update <id> --FIELD=V`
-  (0602) when it is next awake. AUTO and Home groups are not settable (`not_settable`).
-- **The Desktop draws an unreachable remote from the replica** (0603). `refreshRemoteProjectTree`
+  (0626) when it is next awake. AUTO and Home groups are not settable (`not_settable`).
+- **The Desktop draws an unreachable remote from the replica** (0627). `refreshRemoteProjectTree`
   (`src/store/projects.ts`) paints a remote's groups from hub-sync `/projects` before its first live answer this run
   and whenever its live fetch fails, so an asleep gateway's groups stay. An awake gateway's live tree still wins.
 - **Rename and Appearance on another gateway's declared project.** Its node carries `remoteProject`
@@ -35,7 +35,7 @@ the hub-sync plugin's `GET /projects` (hermes-mods `plugins/hub-sync`).
 ## Live (2026-10-27, primary on all three gateways)
 
 - Rollout: Worker deploys 5eb77cd3 (#39), 6e15543a (#43), 9ebb69f4 (#44); client 1.9.2 on MacBook, mini and hub; core
-  0602-0603 on all three. Published nodes: MacBook 24, hub 14, mini 5. The Hub DO served the new features 272 s
+  0626, 0627 on all three. Published nodes: MacBook 24, hub 14, mini 5. The Hub DO served the new features 272 s
   after the first deploy.
 - Sleeping-owner test (mini's `hermes-mail` poller and `hermes-hub-watch` stopped): a rename plus color set from the
   MacBook took 0.2-0.4 s per request and showed on the MacBook and the hub at once (about 1 s), marked as not yet
@@ -44,7 +44,7 @@ the hub-sync plugin's `GET /projects` (hermes-mods `plugins/hub-sync`).
   82 s on 1.9.1 (the watcher's light cycle re-collected only sessions/Inbox, fixed in #44), 8 s on 1.9.2.
 - An owner-local `hermes project update` reached the other two in about 2 min (tree cadence; the owner's own
   Desktop shows it at once).
-- Not yet checked: the Desktop half (0603) in the Hermes Desktop UI, which needs the MacBook Desktop restarted on
+- Not yet checked: the Desktop half (0627) in the Hermes Desktop UI, which needs the MacBook Desktop restarted on
   the new build.
 
 ## Gotchas

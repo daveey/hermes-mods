@@ -8,17 +8,17 @@ Patch series (mirrors of the curated commits; the numbers are apply order):
 
 | Patch | Commit | Adds |
 |---|---|---|
-| 0633 | `c0ca2b2922` | initial recovery module, CLI, dispatcher hook |
-| 0634 | `96fa4223ab` | tombstone-aware fill; reconcile never re-pushes deleted rows |
-| 0635 | `ff003baaa4` | contention and index-damage recovery |
-| 0636 | `bf6093e0c0` | `<db>.recovery.lock` shared with the live-guard swap tool |
-| 0637 | `949f16241e` | stale-index handling, `contended`, `stranded_holders`, `installed_unverified`, child timeout |
-| 0639 | `1bbcb03fa9` | lint fixes and UTF-8 handling |
-| 0640 | `1bc374222c` | lint fixes |
-| 0648 | `86dba5f9a3` | holder record (`<db>.recover.pid` JSON) |
-| 0649 | `baed59f27c` | process-start identity in the holder record |
-| 0652 | `a934e39df2` | shared safe pid-existence probe and explicit proc-stat encoding |
-| 0659 | `adff0a11d6` | document automatic-recovery and recovery-assignee configuration keys in the user guide |
+| 0640 | `c0ca2b2922` | initial recovery module, CLI, dispatcher hook |
+| 0641 | `96fa4223ab` | tombstone-aware fill; reconcile never re-pushes deleted rows |
+| 0642 | `ff003baaa4` | contention and index-damage recovery |
+| 0643 | `bf6093e0c0` | `<db>.recovery.lock` shared with the live-guard swap tool |
+| 0644 | `949f16241e` | stale-index handling, `contended`, `stranded_holders`, `installed_unverified`, child timeout |
+| 0647 | `1bbcb03fa9` | lint fixes and UTF-8 handling |
+| 0649 | `1bc374222c` | lint fixes |
+| 0657 | `86dba5f9a3` | holder record (`<db>.recover.pid` JSON) |
+| 0658 | `baed59f27c` | process-start identity in the holder record |
+| 0662 | `a934e39df2` | shared safe pid-existence probe and explicit proc-stat encoding |
+| 0669 | `adff0a11d6` | document automatic-recovery and recovery-assignee configuration keys in the user guide |
 
 ## Behavior
 
@@ -146,10 +146,10 @@ scripts/run_tests.sh tests/hermes_cli/test_kanban_db_recover.py
 Apply on the fork after its earlier Kanban dependencies, in order (not directly on current upstream; see the [verification record](mirror-651-verification.md)):
 
 ```bash
-git am -3 --empty=keep ~/code/hermes-mods/core/patches/0633-*.patch   # then 0634 0635 0636 0637 0639 0640 0648 0649
+git am -3 --empty=keep ~/code/hermes-mods/core/patches/0640-*.patch   # then 0641 0642 0643 0644 0647 0649 0657 0658
 ```
 
-- Apply these in order; later ones modify the module the first creates. 0638, 0641-0647 and 0650-0651 are unrelated. 0652 replaces the holder liveness check with `gateway.status._pid_exists` and uses explicit UTF-8-sig for proc-stat reads; all 28 recovery tests passed again after it.
+- Apply these in order; later ones modify the module the first creates. 0645, 0650, 0651, 0652, 0653, 0654, 0655, 0656 and 0659, 0660 are unrelated. 0662 replaces the holder liveness check with `gateway.status._pid_exists` and uses explicit UTF-8-sig for proc-stat reads; all 28 recovery tests passed again after it.
 - The live-guard `swap_db.py` must take the same `<db>.recovery.lock` for the manual-swap exclusion to hold.
 - Restart the gateway/dispatcher so `_start_auto_recovery` is loaded. No desktop rebuild.
 - Nothing to enable: automatic recovery is on by default.

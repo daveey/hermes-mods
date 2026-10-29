@@ -1,6 +1,6 @@
 # Kanban pins pass the managed routing registry at create time
 
-Patch: 0670 (core `abe20b1815`).
+Patch: 0685 (core `abe20b1815`).
 
 ## Behavior
 
@@ -65,8 +65,8 @@ before the change and green after, including `test_kanban_model_assignment`, `te
 
 ## Applying
 
-`git am -3 core/patches/0670-*.patch` after 0666 (the spaced-pin guard), which touches the same
-`kanban_db` create path. 0669 also touches `kanban_db.py` (worker context only); apply 0669 first
+`git am -3 core/patches/0685-*.patch` after 0674 (the spaced-pin guard), which touches the same
+`kanban_db` create path. 0678 also touches `kanban_db.py` (worker context only); apply 0678 first
 so the context lines match this series.
 
 ## Gotchas
@@ -75,17 +75,17 @@ so the context lines match this series.
   startup (exit 1 for non-workers).
 - Dispatch with no `kanban.orchestrator_profile` holds a family mismatch under the guard rather than
   creating a supervisor repair card. A registry-refused pin that is not a family mismatch is cleared
-  instead (0711), and that same tick dispatches on the profile default.
+  instead (0778), and that same tick dispatches on the profile default.
 
 ## plugin?
 
 No. The check must run inside `kanban_db.create_task` and the dispatcher's guard, which plugins cannot wrap.
 
-Skill pins are a separate check: [kanban-skill-pin-validation.md](kanban-skill-pin-validation.md) (0681).
+Skill pins are a separate check: [kanban-skill-pin-validation.md](kanban-skill-pin-validation.md) (0690).
 
-## Follow-up patch (0711)
+## Follow-up patch (0778)
 
-**0711** (fork `60466c1011`): a stored pin the routing registry refuses, and that is not a vendor/provider family mismatch, is cleared when no supervisor can take the assignment block.
+**0778** (fork `60466c1011`): a stored pin the routing registry refuses, and that is not a vendor/provider family mismatch, is cleared when no supervisor can take the assignment block.
 
 `route_model_mismatch` still tries `block_task(kind='assignment')`. On `AssignmentRoutingError`, if the error is `ModelPinNotInRegistryError` and `_family_mismatch` is false, `clear_refused_pin` compare-and-swaps that exact pin to NULL, appends `model_override_cleared`, comments, and returns None so this tick dispatches on the profile default. It never substitutes another model or a paid provider. A concurrent `set-model` that changes the pin wins the compare-and-swap (clear returns false). Dry-run does not write. A family mismatch, a registered pin, and a pin the registry also refuses that fails the family check are left on the old path.
 
@@ -97,4 +97,4 @@ Tests in `tests/hermes_cli/test_kanban_refused_pin_clear.py`:
 - `test_dry_run_tick_changes_nothing`
 - `test_registered_pin_is_untouched`
 
-The CLI `hermes kanban set-model` path is not what this patch changes. Create-time refusal stays 0670.
+The CLI `hermes kanban set-model` path is not what this patch changes. Create-time refusal stays 0685.

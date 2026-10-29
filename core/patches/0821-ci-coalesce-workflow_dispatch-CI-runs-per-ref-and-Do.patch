@@ -1,0 +1,318 @@
+From 76a514de64c488ca032329698ed2667e48a175a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:03:00 -0700
+Subject: [PATCH] ci: coalesce workflow_dispatch CI runs per ref and Docker
+ main runs (runner starvation) (#158)
+
+* ci: main pushes cancel superseded main runs of hermes-hub workflows
+
+A per-run concurrency group on main meant cancel-in-progress never cancelled
+older main runs, so each push piled a full CI on the hermes-hub pool and
+starved short required PR jobs (PR #145 stall). Tags and release calls keep
+per-run groups.
+
+* ci(docker): coalesce standalone main Docker runs into one group (63-run docker-ci backlog); allowlist BootPinnedFinder git lookup
+
+Main pushes/dispatches of docker.yml shared nothing (group = run_id), so every
+merge queued its own build+publish on the 4 docker-ci runners. Standalone main
+runs now share docker-refs/heads/main-standalone without cancel-in-progress:
+an in-flight publish is never cancelled, only the newest pending run survives.
+Release calls (release-phase test/publish) keep per-run groups.
+
+Also adds the reviewed allowlist row for gateway/boot_pinned_imports.py
+(shutil.which('git') from 4b29ad8e4de), which made
+test_bare_which_and_known_path_tables_are_allowlisted red on main.
+
+Task: t_01a18284c98aa108
+
+* ci: drop resolution allowlist row (main resolved boot_pinned_imports which() site)
+
+* fix(kanban): probe notify holder pid via _pid_exists, not os.kill(pid, 0)
+
+Windows footguns lint (blocking) is red on main since bf9ca96750:
+os.kill(pid, 0) sends CTRL_C_EVENT on Windows. gateway.status._pid_exists
+uses psutil (EPERM counts as alive, matching the old PermissionError path).
+---
+ .github/workflows/ci.yaml              |  16 ++-
+ .github/workflows/docker.yml           |  19 ++-
+ tests/ci/_gha_expr.py                  |   9 ++
+ tests/ci/test_ci_concurrency_groups.py | 188 +++++++++++++++++++++++++
+ 4 files changed, 220 insertions(+), 12 deletions(-)
+ create mode 100644 tests/ci/test_ci_concurrency_groups.py
+
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 10c12beadf..09e0fa9921 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -55,12 +55,18 @@ permissions:
+ # A per-run group queued one full suite per push and saturated the shared
+ # hermes-hub runners. [daveey]
+ # Manual gate: a workflow_dispatch run (e.g. a green-gate run on main HEAD)
+-# gets its own group `ci-dispatch-<run_id>`. Before, it shared `ci-main`: it
+-# held the slot while pushes behind it were superseded one by one, and a
+-# pending dispatch could itself be cancelled by the next push. Now a dispatch
+-# is never superseded and never blocks the push group; pushes still coalesce.
++# gets its own group per ref (and per strict_acceptance value), separate from
++# `ci-main`: a push never supersedes or blocks a dispatch, and vice versa.
++# Dispatches on one ref coalesce like pushes: the dispatch in flight always
++# finishes (cancel-in-progress is false), and only the NEWEST pending dispatch
++# waits behind it; an older pending one is superseded (the newer one tests the
++# ref's newer HEAD). A per-run_id group (250ee8a8a8) let every dispatch stack a
++# full suite on the shared hermes-hub runners: on 2026-10-28 three dispatches
++# on main (09:48, 11:23, 13:41) sat queued at once and starved short required
++# PR jobs (check-common-ancestor, supply-chain) for over an hour. A stable
++# release dispatch (inputs.release) keeps its own run_id group. [daveey]
+ concurrency:
+-  group: ci-${{ inputs.release == true && github.run_id || github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.ref == 'refs/heads/main' && 'main' || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
++  group: ci-${{ inputs.release == true && github.run_id || github.event_name == 'workflow_dispatch' && format('dispatch-{0}-{1}', github.ref, inputs.strict_acceptance) || github.ref == 'refs/heads/main' && 'main' || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
+   cancel-in-progress: ${{ inputs.release != true && github.event_name == 'pull_request' }}
+ 
+ jobs:
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+index 14de333125..3cd663b5f8 100644
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -47,14 +47,19 @@ on:
+ permissions:
+   contents: read
+ 
+-# Concurrency: push/release runs are NEVER cancelled so every merge gets
+-# its own image.  PR runs reuse a PR-scoped group with
+-# cancel-in-progress: true so rapid pushes to the same PR collapse to
+-# the latest commit. Release runs include the run_id: several reusable calls
+-# (test/publish) of this workflow live inside ONE parent run, and a
+-# shared group would cancel the parent mid-release.
++# Concurrency:
++# * Standalone main runs (push/dispatch) share ONE group without
++#   cancel-in-progress. An in-flight build/publish is never cancelled, and
++#   GitHub keeps only the newest pending main run (older pending ones are
++#   superseded). One run per merge left 60+ main runs queued on the docker-ci
++#   pool (t_01a18284c98aa108); the newest main image covers skipped SHAs.
++# * PR runs reuse a PR-scoped group with cancel-in-progress: true so rapid
++#   pushes to the same PR collapse to the latest commit.
++# * Release calls (release-phase != standalone) include the run_id: several
++#   reusable calls (test/publish) of this workflow live inside ONE parent run,
++#   and a shared group would cancel the parent mid-release.
+ concurrency:
+-  group: docker-${{ github.event.pull_request.number || (github.ref == 'refs/heads/main' && github.run_id) || github.ref }}-${{ inputs.release-phase || 'standalone' }}
++  group: docker-${{ github.event.pull_request.number || (github.ref == 'refs/heads/main' && (inputs.release-phase || 'standalone') != 'standalone' && github.run_id) || github.ref }}-${{ inputs.release-phase || 'standalone' }}
+   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+ 
+ env:
+diff --git a/tests/ci/_gha_expr.py b/tests/ci/_gha_expr.py
+index df26adc800..0042b4998c 100644
+--- a/tests/ci/_gha_expr.py
++++ b/tests/ci/_gha_expr.py
+@@ -182,6 +182,15 @@ class _Parser:
+             return json.dumps(args[0])
+         if name == "fromJSON":
+             return json.loads(args[0])
++        if name == "format":
++            template, *values = args
++
++            def _sub(match: re.Match[str]) -> str:
++                if match.group(0) in ("{{", "}}"):
++                    return match.group(0)[0]
++                return to_string(values[int(match.group(1))])
++
++            return re.sub(r"\{\{|\}\}|\{(\d+)\}", _sub, to_string(template))
+         if name == "contains":
+             hay, needle = args
+             if isinstance(hay, list):
+diff --git a/tests/ci/test_ci_concurrency_groups.py b/tests/ci/test_ci_concurrency_groups.py
+new file mode 100644
+index 0000000000..87fa019df8
+--- /dev/null
++++ b/tests/ci/test_ci_concurrency_groups.py
+@@ -0,0 +1,188 @@
++"""Replay ci.yaml's concurrency group (and every called workflow's) per event.
++
++GitHub keeps at most one running and one pending run per concurrency group; a
++new pending run supersedes the older pending one, and ``cancel-in-progress``
++additionally cancels the running one. These tests evaluate the real
++expressions from the workflow files with ``tests.ci._gha_expr`` for push,
++dispatch, PR and release events and assert the coalescing rules:
++
++* pushes to main share ``ci-main`` and never cancel a running push;
++* dispatches on one ref share one group and never cancel a running dispatch
++  (so dispatches cannot stack one full suite each on the hermes-hub pool);
++* a dispatch and a push never share a group, and neither does a release;
++* PRs collapse per PR with cancel-in-progress;
++* two caller runs that can be in flight together never put a called workflow
++  in the same group (which would let one cancel the other's in-flight jobs).
++"""
++
++from __future__ import annotations
++
++import itertools
++from functools import cache
++from pathlib import Path
++from typing import Any
++
++import pytest
++from ruamel.yaml import YAML
++
++from tests.ci import _gha_expr as gha
++
++WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
++_YAML = YAML(typ="safe")
++
++
++@cache
++def _load(name: str) -> dict[str, Any]:
++    return _YAML.load((WORKFLOWS / name).read_text(encoding="utf-8"))
++
++
++def _ctx(event: str, ref: str, run_id: int, *, inputs: dict[str, Any] | None = None,
++         pr: int | None = None) -> dict[str, Any]:
++    github: dict[str, Any] = {
++        "event_name": event,
++        "ref": ref,
++        "ref_type": "tag" if ref.startswith("refs/tags/") else "branch",
++        "run_id": run_id,
++        "event": {"pull_request": {"number": pr}} if pr is not None else {},
++    }
++    return {"github": github, "inputs": inputs or {}}
++
++
++def _group(workflow: str, ctx: dict[str, Any]) -> tuple[str, bool]:
++    conc = _load(workflow)["concurrency"]
++    group = gha.render(conc["group"], ctx)
++    cancel = gha.truthy(gha.render(conc.get("cancel-in-progress", False), ctx))
++    return str(group), cancel
++
++
++def _ci(ctx: dict[str, Any]) -> tuple[str, bool]:
++    return _group("ci.yaml", ctx)
++
++
++MAIN = "refs/heads/main"
++BRANCH = "refs/heads/fix/some-branch"
++
++PUSH_A = _ctx("push", MAIN, 101)
++PUSH_B = _ctx("push", MAIN, 102)
++DISPATCH_MAIN_A = _ctx("workflow_dispatch", MAIN, 201, inputs={"release": False, "strict_acceptance": ""})
++DISPATCH_MAIN_B = _ctx("workflow_dispatch", MAIN, 202, inputs={"release": False, "strict_acceptance": ""})
++DISPATCH_MAIN_STRICT = _ctx("workflow_dispatch", MAIN, 203, inputs={"release": False, "strict_acceptance": "1"})
++DISPATCH_BRANCH = _ctx("workflow_dispatch", BRANCH, 204, inputs={"release": False, "strict_acceptance": ""})
++RELEASE_A = _ctx("workflow_dispatch", MAIN, 301, inputs={"release": True, "strict_acceptance": ""})
++RELEASE_B = _ctx("workflow_call", MAIN, 302, inputs={"release": True})
++PR_7_A = _ctx("pull_request", "refs/pull/7/merge", 401, pr=7)
++PR_7_B = _ctx("pull_request", "refs/pull/7/merge", 402, pr=7)
++PR_8 = _ctx("pull_request", "refs/pull/8/merge", 403, pr=8)
++
++
++def test_main_pushes_coalesce_without_cancelling():
++    assert _ci(PUSH_A) == _ci(PUSH_B) == ("ci-main", False)
++
++
++def test_dispatches_on_one_ref_coalesce_without_cancelling():
++    group_a, cancel_a = _ci(DISPATCH_MAIN_A)
++    group_b, cancel_b = _ci(DISPATCH_MAIN_B)
++    assert group_a == group_b, "two dispatches on main must share one group (one runs, newest waits)"
++    assert not cancel_a and not cancel_b, "a running dispatch is never cancelled"
++    assert str(DISPATCH_MAIN_A["github"]["run_id"]) not in group_a
++
++
++def test_dispatch_never_shares_a_group_with_push_release_or_other_ref():
++    dispatch, _ = _ci(DISPATCH_MAIN_A)
++    assert dispatch != _ci(PUSH_A)[0]
++    assert dispatch != _ci(DISPATCH_BRANCH)[0]
++    assert dispatch != _ci(DISPATCH_MAIN_STRICT)[0], "a strict-acceptance dispatch must not supersede a plain gate"
++    assert dispatch != _ci(RELEASE_A)[0]
++
++
++def test_release_runs_never_coalesce_or_cancel():
++    assert _ci(RELEASE_A) == ("ci-301", False)
++    assert _ci(RELEASE_B) == ("ci-302", False)
++
++
++def test_pull_requests_collapse_per_pr_and_cancel():
++    assert _ci(PR_7_A) == _ci(PR_7_B) == ("ci-7", True)
++    assert _ci(PR_8)[0] != _ci(PR_7_A)[0]
++
++
++def _callees() -> list[str]:
++    names = set()
++    for job in _load("ci.yaml")["jobs"].values():
++        uses = job.get("uses", "")
++        if uses.startswith("./.github/workflows/"):
++            names.add(uses.rsplit("/", 1)[1])
++    return sorted(n for n in names if "concurrency" in _load(n))
++
++
++CONCURRENT_CALLERS = {
++    "push-main": PUSH_A,
++    "dispatch-main": DISPATCH_MAIN_A,
++    "dispatch-main-strict": DISPATCH_MAIN_STRICT,
++    "dispatch-branch": DISPATCH_BRANCH,
++    "release": RELEASE_A,
++    "pr-7": PR_7_A,
++    "pr-8": PR_8,
++}
++
++
++def test_concurrent_callers_are_in_distinct_ci_groups():
++    groups = {name: _ci(ctx)[0] for name, ctx in CONCURRENT_CALLERS.items()}
++    assert len(set(groups.values())) == len(groups), groups
++
++
++@pytest.mark.parametrize("callee", _callees())
++def test_concurrent_callers_never_share_a_callee_group(callee):
++    """Callers in different ci.yaml groups can run at once; their children must not collide."""
++    rendered = {name: _group(callee, ctx)[0] for name, ctx in CONCURRENT_CALLERS.items()}
++    for (a, ga), (b, gb) in itertools.combinations(rendered.items(), 2):
++        assert ga != gb, f"{callee}: {a} and {b} share child group {ga!r}"
++
++
++def test_callee_set_covers_the_hub_workflows():
++    callees = _callees()
++    assert "tests.yml" in callees and "lint.yml" in callees, callees
++
++
++def test_format_matches_actions_semantics():
++    assert gha.evaluate("format('dispatch-{0}-{1}', 'a', '')", {}) == "dispatch-a-"
++    assert gha.evaluate("format('{{x}} {0}', 3)", {}) == "{x} 3"
++
++
++# docker.yml owns its own push/PR triggers and is also called by
++# stable-release.yml with a release-phase input.
++def _docker(ctx: dict[str, Any]) -> tuple[str, bool]:
++    return _group("docker.yml", ctx)
++
++
++DOCKER_PUSH_A = _ctx("push", MAIN, 501)
++DOCKER_PUSH_B = _ctx("push", MAIN, 502)
++DOCKER_DISPATCH_MAIN = _ctx("workflow_dispatch", MAIN, 503)
++DOCKER_RELEASE_TEST = _ctx("workflow_call", MAIN, 601, inputs={"release-phase": "test"})
++DOCKER_RELEASE_PUBLISH = _ctx("workflow_call", MAIN, 601, inputs={"release-phase": "publish"})
++DOCKER_RELEASE_OTHER = _ctx("workflow_call", MAIN, 602, inputs={"release-phase": "test"})
++DOCKER_RELEASE_TAG = _ctx("workflow_call", "refs/tags/v1.2.3", 603, inputs={"release-phase": "test"})
++
++
++def test_docker_main_pushes_coalesce_without_cancelling():
++    """Main pushes keep one running + newest pending; a running publish is never cancelled."""
++    group_a, cancel_a = _docker(DOCKER_PUSH_A)
++    group_b, cancel_b = _docker(DOCKER_PUSH_B)
++    assert group_a == group_b == "docker-refs/heads/main-standalone"
++    assert not cancel_a and not cancel_b
++    assert _docker(DOCKER_DISPATCH_MAIN) == (group_a, False)
++
++
++def test_docker_release_calls_keep_per_run_groups_apart_from_main_pushes():
++    test_group, test_cancel = _docker(DOCKER_RELEASE_TEST)
++    publish_group, _ = _docker(DOCKER_RELEASE_PUBLISH)
++    assert test_group == "docker-601-test" and not test_cancel
++    assert publish_group == "docker-601-publish", "test and publish calls of one release must not collide"
++    assert _docker(DOCKER_RELEASE_OTHER)[0] != test_group, "two releases never supersede each other"
++    main_push = _docker(DOCKER_PUSH_A)[0]
++    for ctx in (DOCKER_RELEASE_TEST, DOCKER_RELEASE_PUBLISH, DOCKER_RELEASE_OTHER, DOCKER_RELEASE_TAG):
++        assert _docker(ctx)[0] != main_push, "a main push must never supersede a release call"
++
++
++def test_docker_pull_requests_collapse_per_pr_and_cancel():
++    assert _docker(PR_7_A) == _docker(PR_7_B) == ("docker-7-standalone", True)
++    assert _docker(PR_8)[0] != _docker(PR_7_A)[0]
+-- 
+2.55.0
+

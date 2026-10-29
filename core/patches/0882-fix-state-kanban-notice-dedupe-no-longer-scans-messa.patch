@@ -1,0 +1,129 @@
+From 593b19f369d23a93b1024337838a638a6e33da3b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 02:20:18 +0000
+Subject: [PATCH] fix(state): kanban notice dedupe no longer scans messages or
+ takes the write lock when already delivered [daveey]
+
+py-spy of a hermes-hub serve holding the state.db write lock caught the unloaded-notice sweep in
+record_kanban_notice's BEGIN IMMEDIATE txn running a notice_id query planned as SCAN over all messages.
+Drive it from the lineage sessions (index search) and answer already-delivered notices from a read connection.
+---
+ hermes_state_messages.py                    | 25 ++++++++--
+ tests/test_kanban_notice_write_lock_hold.py | 55 +++++++++++++++++++++
+ 2 files changed, 76 insertions(+), 4 deletions(-)
+ create mode 100644 tests/test_kanban_notice_write_lock_hold.py
+
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index f57070b391..31470d3a56 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -118,6 +118,14 @@ def _stale_holder(row, now: float) -> bool:
+     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
+ 
+ 
++# Drive from the lineage sessions through idx_messages_session_active. The previous ``JOIN lineage`` form let the
++# planner SCAN the whole messages table (300k rows / 1.9 GB on hermes-hub) inside BEGIN IMMEDIATE, holding the
++# state.db write lock for as long as a cold scan took. [daveey]
++_NOTICE_BY_ID_SQL = (
++    "SELECT m.id FROM messages m WHERE m.session_id IN (SELECT id FROM lineage) "
++    "AND m.display_kind='kanban_notice' AND json_extract(m.display_metadata, '$.notice_id') = ? LIMIT 1")
++
++
+ class SessionMessagesMixin:
+     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
+ 
+@@ -499,10 +507,8 @@ class SessionMessagesMixin:
+         keys = [str(k) for k in metadata.get("kanban_event_keys") or () if k]
+         from hermes_state_sessions import _LINEAGE_CTE_SQL  # watermark is lineage-stamped
+ 
+-        def _do(conn):
+-            existing = conn.execute(_LINEAGE_CTE_SQL +
+-                "SELECT m.id FROM messages m JOIN lineage l ON m.session_id=l.id WHERE m.display_kind='kanban_notice' "
+-                "AND json_extract(m.display_metadata, '$.notice_id') = ? LIMIT 1", (session_id, session_id, notice_id)).fetchone()
++        def _existing(conn):
++            existing = conn.execute(_LINEAGE_CTE_SQL + _NOTICE_BY_ID_SQL, (session_id, session_id, notice_id)).fetchone()
+             if existing is None and keys:
+                 existing = conn.execute(
+                     _LINEAGE_CTE_SQL + " SELECT m.id FROM messages m, "
+@@ -510,6 +516,17 @@ class SessionMessagesMixin:
+                     "WHERE m.session_id IN (SELECT id FROM lineage) AND m.display_kind = 'kanban_notice' "
+                     "AND json_valid(m.display_metadata) AND j.value IN (" + ",".join("?" * len(keys)) + ") LIMIT 1",
+                     (session_id, session_id, *keys)).fetchone()
++            return existing
++
++        # Already delivered (the common case: the unloaded sweep re-offers every done card each tick): answer
++        # from a read connection and never take the WAL write lock. Re-checked inside the writer txn below.
++        with self._read_ctx() as rconn:
++            seen = _existing(rconn)
++        if seen is not None:
++            return seen[0], False
++
++        def _do(conn):
++            existing = _existing(conn)
+             if existing is not None:
+                 return existing[0], False
+             self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=reject_active_turn)
+diff --git a/tests/test_kanban_notice_write_lock_hold.py b/tests/test_kanban_notice_write_lock_hold.py
+new file mode 100644
+index 0000000000..e46231ceb4
+--- /dev/null
++++ b/tests/test_kanban_notice_write_lock_hold.py
+@@ -0,0 +1,55 @@
++"""A kanban notice that is already delivered must not hold the state.db write lock. [daveey]
++
++hermes-hub 2026-10-29: 328 "write lock unavailable" warnings. py-spy of the holder (a desktop-ssh
++``hermes serve``) caught the unloaded-notice sweep thread inside ``record_kanban_notice``'s writer txn
++(hermes_state_messages.py:505): the notice-id dedupe query planned ``SCAN m`` over all 300k messages
++(1.9 GB) while holding BEGIN IMMEDIATE, and the sweep re-offers every done card every 30 s.
++"""
++import sqlite3
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_messages import _NOTICE_BY_ID_SQL
++from hermes_state_sessions import _LINEAGE_CTE_SQL
++
++META = {"notice_id": "n:1", "kanban_event_keys": ["default:1"]}
++
++
++@pytest.fixture
++def db(tmp_path):
++    d = SessionDB(tmp_path / "state.db")
++    d.create_session("chat", "desktop")
++    yield d
++    d.close()
++
++
++def test_notice_dedupe_query_never_scans_messages(db):
++    conn = db._conn
++    plan = [r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + _LINEAGE_CTE_SQL + _NOTICE_BY_ID_SQL, ("chat", "chat", "x"))]
++    assert not any(p.startswith("SCAN m") for p in plan), plan
++    assert any("SEARCH m USING" in p for p in plan), plan
++
++
++def test_already_delivered_notice_takes_no_write_lock(db, monkeypatch):
++    rid, inserted = db.record_kanban_notice("chat", "hello", META)
++    assert inserted
++
++    def boom(*a, **k):
++        raise AssertionError("duplicate notice opened a write txn")
++
++    monkeypatch.setattr(db, "_execute_write", boom)
++    assert db.record_kanban_notice("chat", "hello", META) == (rid, False)
++    # dedupe by event key alone (a different notice_id) is also answered without the writer
++    assert db.record_kanban_notice("chat", "x", {"notice_id": "n:2", "kanban_event_keys": ["default:1"]}) == (rid, False)
++
++
++def test_duplicate_notice_while_another_process_holds_write_lock(db, tmp_path):
++    rid, _ = db.record_kanban_notice("chat", "hello", META)
++    other = sqlite3.connect(tmp_path / "state.db", isolation_level=None)
++    other.execute("BEGIN IMMEDIATE")
++    try:
++        assert db.record_kanban_notice("chat", "hello", META) == (rid, False)
++    finally:
++        other.execute("ROLLBACK")
++        other.close()
+-- 
+2.55.0
+

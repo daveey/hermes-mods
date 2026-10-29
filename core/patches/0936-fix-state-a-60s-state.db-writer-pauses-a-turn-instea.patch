@@ -1,0 +1,913 @@
+From 4ee467592cb9f229670a0cd7b162132f95dc2314 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:20:13 -0700
+Subject: [PATCH] fix(state): a >60s state.db writer pauses a turn instead of
+ ending it; name the lock holder on macOS [daveey]
+
+A flush whose only failure is a busy writer now retries (up to 600 s, interrupt-aware) with the
+transcript held in memory; other persistence failures still fail closed. hermes_state_lockowners
+gains a Darwin F_GETLK child probe and stops claiming 'holder released' when it cannot look.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/session_persistence.py                 |  50 ++-
+ hermes_state_lockowners.py                   | 269 ++++++++++++--
+ tests/agent/test_session_lock_retry.py       | 139 ++++++++
+ tests/hermes_state/test_lockowners_darwin.py | 347 +++++++++++++++++++
+ 4 files changed, 780 insertions(+), 25 deletions(-)
+ create mode 100644 tests/agent/test_session_lock_retry.py
+ create mode 100644 tests/hermes_state/test_lockowners_darwin.py
+
+diff --git a/agent/session_persistence.py b/agent/session_persistence.py
+index f715c72f51..6da8ecd23e 100644
+--- a/agent/session_persistence.py
++++ b/agent/session_persistence.py
+@@ -31,6 +31,24 @@ from agent.transcript_repair import sync_flushed_message_markers
+ 
+ logger = logging.getLogger("run_agent")  # origin module's name: log records / caplog filters unchanged
+ 
++# How long a flush keeps retrying a busy state.db writer before failing the turn closed.
++# SessionDB gives up per operation at 60s; one long holder (load spike, slow fsync on a 12 GB
++# db) must pause a healthy turn, not end it. Ten minutes still surfaces a genuinely wedged writer.
++_LOCKED_FLUSH_RETRY_BUDGET_S = 600.0
++# Tests that exercise the retry set this; the suite otherwise fails a locked flush at once, because
++# many tests inject a permanent "database is locked" to assert fail-closed behaviour.
++_LOCKED_FLUSH_RETRY_BUDGET_OVERRIDE_S: Optional[float] = None
++
++
++def _locked_flush_retry_budget_s() -> float:
++    import os
++
++    if _LOCKED_FLUSH_RETRY_BUDGET_OVERRIDE_S is not None:
++        return _LOCKED_FLUSH_RETRY_BUDGET_OVERRIDE_S
++    if os.environ.get("HERMES_TEST_ISOLATION"):
++        return 0.0
++    return _LOCKED_FLUSH_RETRY_BUDGET_S
++
+ # Flags marking ephemeral recovery scaffolding the loop pops before appending the real response.
+ # Persistence must skip them or a resumed session replays synthetic turns / breaks prefix-cache reuse.
+ _EPHEMERAL_SCAFFOLDING_FLAGS = (
+@@ -468,9 +486,37 @@ class SessionPersistenceMixin:
+     _repair_message_sequence = _forward("agent.agent_runtime_helpers", "repair_message_sequence")
+ 
+     def _flush_messages_to_session_db(self, messages: list[dict], conversation_history: Optional[list[dict]] = None):
+-        """Serialize direct and turn-boundary session flushes per agent."""
++        """Serialize flushes and wait out writer contention without replaying tools.
++
++        SessionDB's per-operation deadline bounds contention diagnostics, not the lifetime
++        of a healthy turn. Keep the unmarked transcript here until it is durable; never
++        report success and run a side effect against process-only state. Other failures
++        (especially a lost turn lease) still fail closed.
++        """
++        import threading
++        import time
++
++        budget_s = _locked_flush_retry_budget_s()
++        deadline = time.monotonic() + budget_s
+         with _persist_lock(self):
+-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
++            while True:
++                self._last_persistence_error_cause = None
++                result = self._flush_messages_to_session_db_unlocked(messages, conversation_history)
++                if result is not False or self._last_persistence_error_cause != "locked":
++                    return result
++                if getattr(self, "_interrupt_requested", False):
++                    return False
++                if time.monotonic() >= deadline:
++                    # A writer wedged this long is an incident, not contention: fail closed so the
++                    # turn ends with the "storage busy" explanation instead of hanging forever.
++                    logger.warning("Session DB writer busy for over %.0fs for %s; giving up on this flush",
++                                   budget_s, getattr(self, "session_id", None))
++                    return False
++                logger.warning("Session DB writer still busy for %s; retaining transcript and retrying flush",
++                               getattr(self, "session_id", None))
++                # Avoid spinning when a connection reports BUSY immediately. SessionDB
++                # rolls failed transactions back; message markers advance only on commit.
++                threading.Event().wait(0.25)
+ 
+     def _flush_messages_to_session_db_unlocked(
+         self, messages: list[dict], conversation_history: Optional[list[dict]] = None, _adoption_budget: int = 1,
+diff --git a/hermes_state_lockowners.py b/hermes_state_lockowners.py
+index f57aa53b87..66d255efca 100644
+--- a/hermes_state_lockowners.py
++++ b/hermes_state_lockowners.py
+@@ -1,19 +1,24 @@
+-"""Who holds the SQLite write lock on state.db right now (Linux ``/proc/locks``).
++"""Who holds the SQLite write lock on state.db right now.
+ 
+ The "database is locked for over Ns" failure names the victim but not the holder, and the
+ open-descriptor scan (``hermes_state_holders``) cannot tell a reader from the one writer: every
+ Hermes process has the DB open. SQLite's unix VFS takes ``fcntl`` byte-range locks whose offsets
+-encode the lock kind, and the kernel exports them with the owning pid, so the holder can be named
+-at the moment the deadline passes.
++encode the lock kind.
++
++Linux exports those locks in ``/proc/locks``. Darwin has no equivalent, so a child process runs
++``F_GETLK`` on the write-class bytes. The probe must not open the db or ``-shm`` in the waiter:
++on Darwin, ``close()`` of any fd for an inode drops every fcntl lock that process holds on it,
++including SQLite's. ``F_GETLK`` itself does not set a lock.
+ """
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import os
++import subprocess
+ import sys
+ from pathlib import Path
+-from typing import Dict, List, Tuple
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -31,6 +36,111 @@ _MAIN_LOCK_NAMES = {
+     _PENDING_BYTE + 1: "RESERVED",
+ }
+ 
++# A finished probe with no holder. Unsupported platforms and a failed probe must not use this.
++_RELEASED_DETAIL = (
++    "no write-class lock held at the deadline (the holder released just before it)"
++)
++_UNKNOWN_PLATFORM = "this platform has no lock-owner diagnostic"
++
++# F_GETLK does not block. The bound only covers a wedged interpreter startup.
++_DARWIN_PROBE_TIMEOUT_S = 5.0
++
++# Darwin struct flock is not the Linux layout: l_start, l_len, l_pid, l_type, l_whence.
++# l_len must be 1. l_len 0 means "to EOF" and would match every later lock on the file.
++_DARWIN_PROBE_SCRIPT = """\
++import fcntl
++import json
++import os
++import struct
++import sys
++
++
++def getlk(fd, start):
++    buf = struct.pack("@qqihh", start, 1, 0, fcntl.F_WRLCK, os.SEEK_SET)
++    out = fcntl.fcntl(fd, fcntl.F_GETLK, buf)
++    _start, _length, pid, typ, _whence = struct.unpack("@qqihh", out)
++    return pid, typ
++
++
++def main():
++    probes = json.loads(sys.argv[2])
++    base = os.path.realpath(sys.argv[1])
++    fds = {}
++    hits = []
++    try:
++        for item in probes:
++            sidecar = item["sidecar"]
++            start = item["start"]
++            if sidecar not in fds:
++                try:
++                    # Read-only. F_GETLK queries; it does not set a lock or write the file.
++                    fds[sidecar] = os.open(base + sidecar, os.O_RDONLY)
++                except FileNotFoundError:
++                    fds[sidecar] = None
++                except OSError as exc:
++                    print(
++                        json.dumps(
++                            {
++                                "probed": False,
++                                "error": f"{sidecar or 'db'}: {exc.strerror or exc}",
++                            }
++                        ),
++                        flush=True,
++                    )
++                    return
++            fd = fds[sidecar]
++            if fd is None:
++                continue
++            pid, typ = getlk(fd, start)
++            if typ != fcntl.F_WRLCK:
++                continue
++            hits.append({"sidecar": sidecar, "start": start, "pid": pid})
++    finally:
++        for fd in fds.values():
++            if isinstance(fd, int):
++                os.close(fd)
++    print(json.dumps({"probed": True, "base": base, "hits": hits}), flush=True)
++
++
++main()
++"""
++
++
++def darwin_write_lock_probes() -> tuple[tuple[str, int], ...]:
++    """Write-class bytes a Darwin probe asks ``F_GETLK`` about, in report order.
++
++    WAL read slots (123-127) and the dead-man switch are shared locks; they never block a
++    writer. The shared range at pending+2 is the same. Checkpoint, recover, and PENDING are
++    included even though a normal ``BEGIN IMMEDIATE`` does not hold them.
++    """
++    return (
++        ("-shm", 120),
++        ("-shm", 121),
++        ("-shm", 122),
++        ("", _PENDING_BYTE),
++        ("", _PENDING_BYTE + 1),
++    )
++
++
++def lock_owner_probe_kind(platform: str) -> str:
++    """``linux``, ``darwin``, or ``""`` when this platform cannot name the holder."""
++    if platform.startswith("linux"):
++        return "linux"
++    if platform == "darwin":
++        return "darwin"
++    return ""
++
++
++def format_write_lock_holder_detail(
++    probed: bool, holders: list[str], unavailable: str = ""
++) -> str:
++    """Log detail. An unfinished probe must say unknown, never that the holder released."""
++    if not probed:
++        return f"write-lock holder unknown ({unavailable or _UNKNOWN_PLATFORM})"
++    if holders:
++        return " | ".join(holders)
++    return _RELEASED_DETAIL
++
+ 
+ def _describe_range(sidecar: str, start: int, end: int) -> str:
+     if sidecar == "-shm":
+@@ -46,7 +156,19 @@ def _describe_range(sidecar: str, start: int, end: int) -> str:
+     return f"db bytes {start}-{end}"
+ 
+ 
+-def parse_proc_locks(text: str, inodes: dict[tuple[int, int], str]) -> list[tuple[int, str, str]]:
++def _holder_line(base: str, pid: int, kind: str, sidecar: str) -> str:
++    from hermes_state_holders import describe_holder_pid
++
++    if pid > 0:
++        who = describe_holder_pid(pid)
++    else:
++        who = "OFD lock, owner pid not exported by the kernel"
++    return f"{who} holds {kind} lock on {Path(base + sidecar).name}"
++
++
++def parse_proc_locks(
++    text: str, inodes: dict[tuple[int, int], str]
++) -> list[tuple[int, str, str]]:
+     """``(pid, lock kind, sidecar)`` for every WRITE lock on one of ``inodes``.
+ 
+     ``inodes`` maps ``(st_dev, st_ino)`` to ``""`` (main file), ``"-wal"`` or ``"-shm"``. Read locks
+@@ -78,13 +200,7 @@ def parse_proc_locks(text: str, inodes: dict[tuple[int, int], str]) -> list[tupl
+     return found
+ 
+ 
+-def state_db_write_lock_holders(db_path) -> list[str]:
+-    """Operator-facing lines naming the processes that hold a write-class lock on ``db_path``.
+-
+-    Empty when nothing is held or the platform has no ``/proc/locks``.
+-    """
+-    if not sys.platform.startswith("linux"):
+-        return []
++def _linux_write_lock_holders(db_path) -> list[str]:
+     base = os.path.realpath(os.fspath(db_path))
+     inodes: dict[tuple[int, int], str] = {}
+     for sidecar in ("", "-wal", "-shm"):
+@@ -102,23 +218,130 @@ def state_db_write_lock_holders(db_path) -> list[str]:
+                 text = handle.read()
+         except OSError:
+             return []
+-        held.extend(entry for entry in parse_proc_locks(text, inodes) if entry not in held)
+-    from hermes_state_holders import describe_holder_pid
++        held.extend(
++            entry for entry in parse_proc_locks(text, inodes) if entry not in held
++        )
++    return [_holder_line(base, pid, kind, sidecar) for pid, kind, sidecar in held]
++
+ 
++def lines_from_darwin_hits(base: str, hits) -> list[str]:
++    """Name write-class hits. Bytes outside the probe plan are ignored."""
++    if not isinstance(hits, list):
++        return []
++    allowed = set(darwin_write_lock_probes())
+     lines = []
+-    for pid, kind, sidecar in held:
+-        who = describe_holder_pid(pid) if pid > 0 else "OFD lock, owner pid not exported by the kernel"
+-        lines.append(f"{who} holds {kind} lock on {Path(base + sidecar).name}")
++    for hit in hits:
++        if not isinstance(hit, dict):
++            continue
++        sidecar = hit.get("sidecar")
++        start = hit.get("start")
++        pid = hit.get("pid")
++        if (
++            not isinstance(sidecar, str)
++            or type(start) is not int
++            or type(pid) is not int
++        ):
++            continue
++        if (sidecar, start) not in allowed:
++            continue
++        lines.append(
++            _holder_line(base, pid, _describe_range(sidecar, start, start), sidecar)
++        )
++    return lines
++
++
++def _probe_failure_text(stderr: str, stdout: str) -> str:
++    line = ""
++    for part in f"{stderr}\n{stdout}".splitlines():
++        part = part.strip()
++        if part:
++            line = part
++    return (line or "probe exited nonzero")[:160]
++
++
++def interpret_darwin_probe(
++    returncode: int, stdout: str, stderr: str
++) -> tuple[bool, list[str], str]:
++    """``(probed, lines, unavailable)`` from a child probe. Failure is not an empty hold."""
++    if returncode != 0:
++        return (
++            False,
++            [],
++            f"darwin lock probe failed: {_probe_failure_text(stderr, stdout)}",
++        )
++    try:
++        payload = json.loads(stdout)
++    except json.JSONDecodeError:
++        return False, [], "darwin lock probe returned no result"
++    if not isinstance(payload, dict) or not payload.get("probed"):
++        error = (
++            payload.get("error", "unknown error")
++            if isinstance(payload, dict)
++            else "unknown error"
++        )
++        return False, [], f"darwin lock probe failed: {error}"
++    base = payload.get("base")
++    if not isinstance(base, str) or not base:
++        return False, [], "darwin lock probe returned no result"
++    return True, lines_from_darwin_hits(base, payload.get("hits")), ""
++
++
++def _darwin_write_lock_holders(db_path) -> tuple[bool, list[str], str]:
++    # Child, not an in-process open: Darwin close() of any fd on this inode drops every
++    # fcntl lock the waiter holds, and a live Hermes process is multithreaded so this is
++    # spawn+exec, not fork. The script is stdlib-only; the test runner clears PYTHONPATH.
++    probes = [
++        {"sidecar": sidecar, "start": start}
++        for sidecar, start in darwin_write_lock_probes()
++    ]
++    try:
++        proc = subprocess.run(
++            [
++                sys.executable,
++                "-c",
++                _DARWIN_PROBE_SCRIPT,
++                os.path.abspath(os.fspath(db_path)),
++                json.dumps(probes),
++            ],
++            capture_output=True,
++            text=True,
++            timeout=_DARWIN_PROBE_TIMEOUT_S,
++            check=False,
++        )
++    except subprocess.TimeoutExpired:
++        return False, [], f"darwin lock probe exceeded {_DARWIN_PROBE_TIMEOUT_S:.0f}s"
++    except OSError as exc:
++        return False, [], f"darwin lock probe failed: {exc.strerror or exc}"
++    return interpret_darwin_probe(proc.returncode, proc.stdout, proc.stderr)
++
++
++def _collect_write_lock_holders(db_path) -> tuple[bool, list[str], str]:
++    kind = lock_owner_probe_kind(sys.platform)
++    if kind == "linux":
++        return True, _linux_write_lock_holders(db_path), ""
++    if kind == "darwin":
++        return _darwin_write_lock_holders(db_path)
++    return False, [], _UNKNOWN_PLATFORM
++
++
++def state_db_write_lock_holders(db_path) -> list[str]:
++    """Operator-facing lines naming the processes that hold a write-class lock on ``db_path``.
++
++    Empty when nothing is held, this platform cannot name holders, or the probe failed.
++    ``log_write_lock_holders`` distinguishes those; only a finished probe with no holder
++    claims the holder released.
++    """
++    _probed, lines, _why = _collect_write_lock_holders(db_path)
+     return lines
+ 
+ 
+ def log_write_lock_holders(db_path, patience_s: float) -> None:
+     """One WARNING naming the write-lock holders at the moment a writer gave up waiting."""
+-    holders = state_db_write_lock_holders(db_path)
+-    if holders:
+-        detail = " | ".join(holders)
+-    else:
+-        detail = "no write-class lock held at the deadline (the holder released just before it)"
++    probed, holders, why = _collect_write_lock_holders(db_path)
++    detail = format_write_lock_holder_detail(probed, holders, why)
+     logger.warning(
+-        "state.db write lock unavailable for %.0fs (%s): %s", patience_s, Path(db_path).name, detail
++        "state.db write lock unavailable for %.0fs (%s): %s",
++        patience_s,
++        Path(db_path).name,
++        detail,
+     )
+diff --git a/tests/agent/test_session_lock_retry.py b/tests/agent/test_session_lock_retry.py
+new file mode 100644
+index 0000000000..6722358c38
+--- /dev/null
++++ b/tests/agent/test_session_lock_retry.py
+@@ -0,0 +1,139 @@
++"""A writer outliving SessionDB's 60s patience must pause, not kill, a tool turn."""
++import sqlite3
++import threading
++import time
++from unittest.mock import patch
++
++import pytest
++
++import agent.session_persistence as sp
++from agent.session_persistence import SessionPersistenceMixin
++from tests.agent.test_tool_call_incremental_persistence import (
++    _attach_real_session_db,
++    _make_agent,
++    _mock_response,
++    _mock_tool_call,
++)
++
++
++def test_multistep_turn_survives_writer_longer_than_sixty_seconds(tmp_path, monkeypatch):
++    monkeypatch.setattr(sp, "_LOCKED_FLUSH_RETRY_BUDGET_OVERRIDE_S", 600.0)
++    agent = _make_agent()
++    path = tmp_path / "state.db"
++    db = _attach_real_session_db(agent, path, "long-writer")
++    ready, release = threading.Event(), threading.Event()
++    held_for, executed = [], []
++
++    def writer():
++        conn = sqlite3.connect(path)
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            start = time.monotonic()
++            ready.set()
++            release.wait(65)
++            held_for.append(time.monotonic() - start)
++            conn.rollback()
++        finally:
++            conn.close()
++
++    worker = threading.Thread(target=writer)
++    responses = iter([
++        _mock_response("", "tool_calls", [_mock_tool_call(call_id="c1")]),
++        _mock_response("", "tool_calls", [_mock_tool_call(call_id="c2")]),
++        _mock_response("done"),
++    ])
++    requests = []
++
++    def respond(**kwargs):
++        requests.append(kwargs)
++        if len(requests) == 2:
++            worker.start()
++            assert ready.wait(10)
++        return next(responses)
++
++    def execute(assistant_message, messages, effective_task_id, api_call_count=0):
++        call_id = assistant_message.tool_calls[0].id
++        executed.append(call_id)
++        messages.append({"role": "tool", "tool_call_id": call_id, "name": "web_search", "content": call_id})
++        assert agent._flush_messages_to_session_db(messages) is True
++
++    agent.client.chat.completions.create.side_effect = respond
++    try:
++        with (
++            patch.object(agent, "_execute_tool_calls", side_effect=execute),
++            patch.object(agent, "_cleanup_task_resources"),
++            patch("agent.title_generator.maybe_auto_title"),
++        ):
++            result = agent.run_conversation("perform two steps")
++        assert result["final_response"] == "done"
++        assert executed == ["c1", "c2"]
++        assert held_for[0] > 60
++        rows = db.get_messages_as_conversation("long-writer")
++        assert [row["role"] for row in rows] == ["user", "assistant", "tool", "assistant", "tool", "assistant"]
++        assert [row["tool_call_id"] for row in rows if row["role"] == "tool"] == ["c1", "c2"]
++        assert agent._flush_messages_to_session_db(result["messages"]) is True
++        assert db.get_messages_as_conversation("long-writer") == rows
++    finally:
++        release.set()
++        if worker.ident is not None:
++            worker.join(10)
++        db.close()
++
++
++@pytest.mark.parametrize("cause", ["disk", "corrupt", "turn_lease", "unknown"])
++def test_non_lock_failure_still_fails_closed(cause):
++    class Agent(SessionPersistenceMixin):
++        def _flush_messages_to_session_db_unlocked(self, *args):
++            self._last_persistence_error_cause = cause
++            return False
++
++    assert Agent()._flush_messages_to_session_db([]) is False
++
++
++def test_lock_retry_stops_when_interrupted(monkeypatch):
++    monkeypatch.setattr(sp, "_LOCKED_FLUSH_RETRY_BUDGET_OVERRIDE_S", 600.0)
++    class Agent(SessionPersistenceMixin):
++        _interrupt_requested = True
++
++        def _flush_messages_to_session_db_unlocked(self, *args):
++            self._last_persistence_error_cause = "locked"
++            return False
++
++    assert Agent()._flush_messages_to_session_db([]) is False
++
++
++def test_lock_retry_gives_up_after_budget(monkeypatch):
++    monkeypatch.setattr(sp, "_LOCKED_FLUSH_RETRY_BUDGET_OVERRIDE_S", 0.0)
++    calls = []
++
++    class Agent(SessionPersistenceMixin):
++        def _flush_messages_to_session_db_unlocked(self, *args):
++            calls.append(1)
++            self._last_persistence_error_cause = "locked"
++            return False
++
++    assert Agent()._flush_messages_to_session_db([]) is False
++    assert len(calls) == 1
++
++
++def test_lock_retry_succeeds_once_writer_releases(monkeypatch):
++    monkeypatch.setattr(sp, "_LOCKED_FLUSH_RETRY_BUDGET_OVERRIDE_S", 600.0)
++    attempts = []
++
++    class Agent(SessionPersistenceMixin):
++        def _flush_messages_to_session_db_unlocked(self, *args):
++            attempts.append(1)
++            if len(attempts) < 3:
++                self._last_persistence_error_cause = "locked"
++                return False
++            return True
++
++    assert Agent()._flush_messages_to_session_db([]) is True
++    assert len(attempts) == 3
++
++
++def test_budget_defaults(monkeypatch):
++    monkeypatch.setenv("HERMES_TEST_ISOLATION", "1")
++    assert sp._locked_flush_retry_budget_s() == 0.0
++    monkeypatch.delenv("HERMES_TEST_ISOLATION")
++    assert sp._locked_flush_retry_budget_s() == sp._LOCKED_FLUSH_RETRY_BUDGET_S == 600.0
+diff --git a/tests/hermes_state/test_lockowners_darwin.py b/tests/hermes_state/test_lockowners_darwin.py
+new file mode 100644
+index 0000000000..36bda62137
+--- /dev/null
++++ b/tests/hermes_state/test_lockowners_darwin.py
+@@ -0,0 +1,347 @@
++"""Darwin write-lock holder diagnostic.
++
++Linux reads ``/proc/locks``. Darwin has no such file, and opening the db or ``-shm`` in the
++waiter drops every fcntl lock that process holds (``close`` releases them all). The probe
++runs in a child. An unsupported platform must say the holder is unknown, not that it released.
++"""
++
++import json
++import logging
++import os
++import sqlite3
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++import hermes_state_lockowners as lockowners
++from hermes_state_lockowners import (
++    darwin_write_lock_probes,
++    format_write_lock_holder_detail,
++    lines_from_darwin_hits,
++    lock_owner_probe_kind,
++    log_write_lock_holders,
++    state_db_write_lock_holders,
++)
++from tests.waiting import wait_until
++
++_RELEASED = (
++    "no write-class lock held at the deadline (the holder released just before it)"
++)
++
++
++def test_unprobed_detail_says_holder_unknown_not_released():
++    detail = format_write_lock_holder_detail(False, ["should not be used"])
++    assert "unknown" in detail
++    assert "released" not in detail
++    assert "no write-class lock held" not in detail
++    assert detail == (
++        "write-lock holder unknown (this platform has no lock-owner diagnostic)"
++    )
++
++
++def test_empty_completed_probe_still_says_holder_released():
++    assert format_write_lock_holder_detail(True, []) == _RELEASED
++    named = format_write_lock_holder_detail(
++        True, ["PID 1 (x) holds WAL write lock on state.db-shm"]
++    )
++    assert "released" not in named
++    assert " | " not in named
++
++
++def test_probe_kind_is_linux_prefix_darwin_or_unsupported():
++    assert lock_owner_probe_kind("linux") == "linux"
++    assert lock_owner_probe_kind("linux2") == "linux"
++    assert lock_owner_probe_kind("darwin") == "darwin"
++    assert lock_owner_probe_kind("win32") == ""
++    assert lock_owner_probe_kind("freebsd") == ""
++
++
++def test_darwin_probe_offsets_are_wal_write_class_and_pending_reserved():
++    assert set(darwin_write_lock_probes()) == {
++        ("-shm", 120),
++        ("-shm", 121),
++        ("-shm", 122),
++        ("", 0x40000000),
++        ("", 0x40000001),
++    }
++    assert len(darwin_write_lock_probes()) == 5
++
++
++def test_darwin_hits_name_each_write_class_byte_and_ignore_read_slots():
++    lines = lines_from_darwin_hits(
++        "state.db",
++        [
++            {"sidecar": "-shm", "start": 120, "pid": 42},
++            {"sidecar": "-shm", "start": 121, "pid": 42},
++            {"sidecar": "-shm", "start": 122, "pid": 42},
++            {"sidecar": "-shm", "start": 123, "pid": 42},
++            {"sidecar": "", "start": 0x40000000, "pid": 7},
++            {"sidecar": "", "start": 0x40000001, "pid": -1},
++            {"sidecar": "", "start": 0x40000002, "pid": 7},
++        ],
++    )
++    assert [line.split(" holds ", 1)[1] for line in lines] == [
++        "WAL write lock on state.db-shm",
++        "WAL checkpoint lock on state.db-shm",
++        "WAL recover lock on state.db-shm",
++        "PENDING lock on state.db",
++        "RESERVED lock on state.db",
++    ]
++    assert lines[0].startswith("PID 42 ")
++    assert "OFD lock, owner pid not exported by the kernel" in lines[-1]
++
++
++def test_log_says_unknown_when_platform_has_no_probe(tmp_path, monkeypatch, caplog):
++    monkeypatch.setattr(lockowners, "lock_owner_probe_kind", lambda _platform: "")
++    db = tmp_path / "state.db"
++    with caplog.at_level(logging.WARNING, logger="hermes_state_lockowners"):
++        log_write_lock_holders(db, 60)
++    assert "unknown" in caplog.text
++    assert "released" not in caplog.text
++    assert "no write-class lock held" not in caplog.text
++    assert "state.db" in caplog.text
++
++
++def test_probe_timeout_logs_unknown_not_released(tmp_path, monkeypatch, caplog):
++    monkeypatch.setattr(lockowners, "lock_owner_probe_kind", lambda _platform: "darwin")
++
++    def _timeout(*_args, **_kwargs):
++        raise subprocess.TimeoutExpired(cmd="probe", timeout=5)
++
++    monkeypatch.setattr(lockowners.subprocess, "run", _timeout)
++    with caplog.at_level(logging.WARNING, logger="hermes_state_lockowners"):
++        log_write_lock_holders(tmp_path / "state.db", 60)
++    assert "unknown" in caplog.text
++    assert "exceeded 5s" in caplog.text
++    assert "released" not in caplog.text
++
++
++def test_probe_garbage_logs_unknown_not_released(tmp_path, monkeypatch, caplog):
++    monkeypatch.setattr(lockowners, "lock_owner_probe_kind", lambda _platform: "darwin")
++
++    def _garbage(args, **_kwargs):
++        return subprocess.CompletedProcess(args, 0, stdout="not-json", stderr="")
++
++    monkeypatch.setattr(lockowners.subprocess, "run", _garbage)
++    with caplog.at_level(logging.WARNING, logger="hermes_state_lockowners"):
++        log_write_lock_holders(tmp_path / "state.db", 60)
++    assert "unknown" in caplog.text
++    assert "no result" in caplog.text
++    assert "released" not in caplog.text
++
++
++def test_darwin_spawn_passes_the_probe_plan_to_a_bounded_child(tmp_path, monkeypatch):
++    monkeypatch.setattr(lockowners, "lock_owner_probe_kind", lambda _platform: "darwin")
++    captured = {}
++
++    def _fake_run(args, **kwargs):
++        captured["args"] = args
++        captured["timeout"] = kwargs.get("timeout")
++        payload = '{"probed": true, "base": "state.db", "hits": []}'
++        return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
++
++    monkeypatch.setattr(lockowners.subprocess, "run", _fake_run)
++    assert state_db_write_lock_holders(tmp_path / "state.db") == []
++    assert captured["args"][0] == sys.executable
++    assert captured["args"][1] == "-c"
++    assert captured["args"][2] == lockowners._DARWIN_PROBE_SCRIPT
++    asked = {
++        (item["sidecar"], item["start"]) for item in json.loads(captured["args"][4])
++    }
++    assert asked == set(darwin_write_lock_probes())
++    assert captured["timeout"] == lockowners._DARWIN_PROBE_TIMEOUT_S
++    assert 0 < captured["timeout"] <= 5
++
++
++def _init_db(path: Path, journal_mode: str) -> None:
++    conn = sqlite3.connect(path)
++    conn.execute(f"PRAGMA journal_mode={journal_mode}")
++    conn.execute("CREATE TABLE t(x)")
++    conn.commit()
++    conn.close()
++
++
++def _hold_immediate(db: Path) -> subprocess.Popen:
++    proc = subprocess.Popen(
++        [
++            sys.executable,
++            "-c",
++            textwrap.dedent(
++                f"""
++                import sqlite3, sys
++                c = sqlite3.connect({str(db)!r}, isolation_level=None)
++                c.execute("BEGIN IMMEDIATE")
++                c.execute("INSERT INTO t VALUES (1)")
++                print("held", flush=True)
++                sys.stdin.read()
++                """
++            ),
++        ],
++        stdin=subprocess.PIPE,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++    assert proc.stdout is not None
++    line = proc.stdout.readline()
++    if line.strip() != "held":
++        err = proc.stderr.read() if proc.stderr is not None else ""
++        proc.kill()
++        proc.wait(timeout=5)
++        raise AssertionError(f"holder did not take the lock: {line!r} {err!r}")
++    return proc
++
++
++def _stop_holder(proc: subprocess.Popen) -> None:
++    if proc.poll() is not None:
++        return
++    if proc.stdin is not None and not proc.stdin.closed:
++        proc.stdin.close()
++    try:
++        proc.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        proc.kill()
++        proc.wait(timeout=5)
++
++
++def _file_bytes(db: Path) -> dict[str, bytes]:
++    return {
++        path.name: path.read_bytes()
++        for path in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm"))
++        if path.exists()
++    }
++
++
++def _compete(db: Path) -> str:
++    proc = subprocess.run(
++        [
++            sys.executable,
++            "-c",
++            textwrap.dedent(
++                f"""
++                import sqlite3, sys
++                c = sqlite3.connect({str(db)!r}, timeout=0, isolation_level=None)
++                try:
++                    c.execute("BEGIN IMMEDIATE")
++                except sqlite3.OperationalError as exc:
++                    print("blocked", exc)
++                    raise SystemExit(2)
++                print("acquired")
++                """
++            ),
++        ],
++        capture_output=True,
++        text=True,
++        timeout=5,
++        check=False,
++    )
++    return proc.stdout.strip()
++
++
++@pytest.mark.platforms("macos")
++def test_live_subprocess_writer_is_named_and_files_are_not_written(tmp_path, caplog):
++    db = tmp_path / "state.db"
++    _init_db(db, "wal")
++    holder = _hold_immediate(db)
++    try:
++        before = _file_bytes(db)
++        lines = state_db_write_lock_holders(db)
++        assert len(lines) == 1, lines
++        assert f"PID {holder.pid} " in lines[0]
++        assert "WAL write lock on state.db-shm" in lines[0]
++        assert _file_bytes(db) == before
++        caplog.clear()
++        with caplog.at_level(logging.WARNING, logger="hermes_state_lockowners"):
++            log_write_lock_holders(db, 60)
++        assert f"PID {holder.pid} " in caplog.text
++        assert "WAL write" in caplog.text
++        assert "released" not in caplog.text
++        assert "unknown" not in caplog.text
++    finally:
++        _stop_holder(holder)
++    wait_until(
++        lambda: state_db_write_lock_holders(db) == [],
++        timeout=2,
++        what="write lock released after holder exit",
++    )
++    caplog.clear()
++    with caplog.at_level(logging.WARNING, logger="hermes_state_lockowners"):
++        log_write_lock_holders(db, 60)
++    assert _RELEASED in caplog.text
++    assert "unknown" not in caplog.text
++
++
++@pytest.mark.platforms("macos")
++def test_probe_does_not_drop_parent_sqlite_locks(tmp_path):
++    # This process holds the lock. Do not open the db, wal, or shm here: Darwin close()
++    # would drop it and the competitor assertion would fail for the wrong reason.
++    db = tmp_path / "state.db"
++    _init_db(db, "wal")
++    parent = sqlite3.connect(db, isolation_level=None)
++    try:
++        parent.execute("BEGIN IMMEDIATE")
++        parent.execute("INSERT INTO t VALUES (1)")
++        assert _compete(db).startswith("blocked"), "lock was not held before the probe"
++        lines = state_db_write_lock_holders(db)
++        assert any(
++            f"PID {os.getpid()} " in line and "WAL write lock on state.db-shm" in line
++            for line in lines
++        ), lines
++        assert _compete(db).startswith("blocked"), lines
++        parent.execute("INSERT INTO t VALUES (2)")
++        parent.commit()
++        assert parent.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
++    finally:
++        parent.close()
++    assert _compete(db).startswith("acquired")
++
++
++@pytest.mark.platforms("macos")
++def test_rollback_immediate_holder_is_named_reserved(tmp_path):
++    db = tmp_path / "state.db"
++    _init_db(db, "delete")
++    holder = _hold_immediate(db)
++    try:
++        lines = state_db_write_lock_holders(db)
++        assert len(lines) == 1, lines
++        assert f"PID {holder.pid} " in lines[0]
++        assert f"RESERVED lock on {db.name}" in lines[0]
++        assert "WAL write" not in lines[0]
++    finally:
++        _stop_holder(holder)
++
++
++@pytest.mark.platforms("macos")
++def test_child_script_reports_only_the_offsets_it_is_given(tmp_path):
++    db = tmp_path / "state.db"
++    _init_db(db, "wal")
++    holder = _hold_immediate(db)
++    try:
++        missed = _run_probe_script(db, [{"sidecar": "-shm", "start": 121}])
++        assert missed["probed"] is True
++        assert missed["hits"] == []
++        found = _run_probe_script(db, [{"sidecar": "-shm", "start": 120}])
++        assert found["hits"] == [{"sidecar": "-shm", "start": 120, "pid": holder.pid}]
++    finally:
++        _stop_holder(holder)
++
++
++def _run_probe_script(db: Path, probes: list[dict]) -> dict:
++    proc = subprocess.run(
++        [
++            sys.executable,
++            "-c",
++            lockowners._DARWIN_PROBE_SCRIPT,
++            str(db),
++            json.dumps(probes),
++        ],
++        capture_output=True,
++        text=True,
++        timeout=lockowners._DARWIN_PROBE_TIMEOUT_S,
++        check=False,
++    )
++    assert proc.returncode == 0, proc.stderr
++    return json.loads(proc.stdout)
+-- 
+2.55.0
+

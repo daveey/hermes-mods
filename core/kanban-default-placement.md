@@ -1,8 +1,8 @@
 # Kanban default placement: a card with no local-only need is created on the routed gateway
 
-Patches **0565** (source `89b72a8684`), **0567** (`8d1ca16533`, `hub_cli_path()` fix-up), **0569** (`d57aebb0cb`,
-configuration docs), **0572** (`5ac187baca`, carried options) and **0630** (`7f117fa465`, the hub task id comes back;
-no duplicate on retry), **0642** (`ae139f8d31`, identity failures refuse explicit pins) and **0646**
+Patches **0571** (source `89b72a8684`), **0573** (`8d1ca16533`, `hub_cli_path()` fix-up), **0575** (`d57aebb0cb`,
+configuration docs), **0578** (`5ac187baca`, carried options) and **0636** (`7f117fa465`, the hub task id comes back;
+no duplicate on retry), **0651** (`ae139f8d31`, identity failures refuse explicit pins) and **0655**
 (`4f6e223fe8`, title-only host markers, visible local decisions and creator-scoped archive). Companion: [kanban-capability-routing.md](kanban-capability-routing.md) (the route back).
 
 ## Behavior
@@ -19,7 +19,7 @@ kanban:
 `kanban_create` then creates the card on the target through
 `hermes-hub create-task <gw> <title> --body ... --assignee ... --id <request id> --origin-session <chat> --origin-profile <p> --creator-session <kanban.placement.creator_session[target]>`.
 The card shows in the chat that asked for it and runs (and burns CPU) on the target. The tool result carries
-`placed: {gateway, request_id, task_id, origin_session, queued_only, retry}`. Since **0630** the tool waits up to
+`placed: {gateway, request_id, task_id, origin_session, queued_only, retry}`. Since **0636** the tool waits up to
 `kanban.placement.wait_seconds` (default 10 s) for the target to make the card and returns its id as the top-level
 `task_id` with the target's `status` (`ready`...), the same shape as a local create. If the target has not made it
 yet, the result is `ok: true, task_id: null, status: "queued"` and the note says the card IS created and that
@@ -31,7 +31,7 @@ The card stays local (created here as before) when any of these holds:
 - the caller passed `placement="local"` (new `placement` parameter on `kanban_create`; `placement=<target>` pins it remote and skips the marker check);
 - it has a project, a `dir`/`worktree` workspace, a non-default board or a non-default assignee
   (`kanban.placement.assignees`, default `["default"]`); a card with parents is created here but, since
-  **0695**, still runs on the target once its parents finish (see "Deferred placement" below), unless
+  **0715**, still runs on the target once its parents finish (see "Deferred placement" below), unless
   `kanban.placement.defer_parents: false` or another rule here keeps it local;
 - it is courier creation for another gateway (`origin_intent`);
 - it uses options `hermes-hub create-task` cannot carry: `initial_status`, `human_request`, `tenant` (and, with a
@@ -39,7 +39,7 @@ The card stays local (created here as before) when any of these holds:
   `completion_contract`; see "Carried options" below);
 - a `requires` need that this gateway holds is not held by the target, or it names a profile tool that only this gateway validates;
 - its text matches a local marker regex (Chrome, CDP, Keychain, TCC, Apple apps, launchd, Desktop app/DOM,
-  AWS SSO profiles...) or one of its skills matches a local skill marker. Since **0646**, built-in bare host-name
+  AWS SSO profiles...) or one of its skills matches a local skill marker. Since **0655**, built-in bare host-name
   markers (`MacBook`, `Mac mini`, `the mini` and the built-in machine-name spelling) scan only the title;
   mentioning a host in the body as a repro or verification step does not itself pin the card. Desktop DOM,
   CDP and Chrome markers still scan both title and body. `local_markers` replaces the built-in list and every
@@ -52,13 +52,13 @@ An explicit foreign gateway pin instead fails with `placement_unavailable` and c
 means the hub was offline: the request is queued durably and sent on the next sync, so the card is not duplicated
 locally (`queued_only: true`). An unset `route` (the default `placement: {}`) is exactly upstream behaviour.
 
-**0642: explicit pins fail closed even if gateway identity lookup raises.** An explicit name other than
+**0651: explicit pins fail closed even if gateway identity lookup raises.** An explicit name other than
 `auto`, `local` or `here` is refused, with a lowercased pin and `created: false`; no local row is written.
 A name cannot be assumed to mean this gateway if identity lookup failed. If identity was successfully resolved
 before a later exception, a pin matching that known own gateway still stays local. No pin, `auto`, `local`
 and `here` retain the local fallback; courier decisions (`origin_intent`) remain local.
 
-**0646: a marker-local create explains itself.** A successful automatic `kanban_create` kept local by a
+**0655: a marker-local create explains itself.** A successful automatic `kanban_create` kept local by a
 marker returns `placement: {where: "local", why: "local marker: mentions 'macbook'"}` (with the actual reason)
 and a separate top-level `remedy`: `if the work doesn't need this machine, archive and re-create with placement='hub'`.
 Hub placement and structural local keeps do not get these marker fields. A worker may use `kanban_archive`
@@ -77,26 +77,26 @@ gateway has, so capability routing opens an owner card back there.
 
 - `hermes_cli/kanban_placement.py`: `decide(args, ...)` returns `{where, why}` (plus `pin` on refusal) and never raises;
   its exception path uses `_raw_explicit_pin()` to refuse unresolved explicit names, preserving local fallback
-  only for unpinned/local choices, a known own-gateway pin, or courier creation (**0642**).
+  only for unpinned/local choices, a known own-gateway pin, or courier creation (**0651**).
   `TITLE_ONLY_LOCAL_MARKERS` and `_local_marker(title, body, skills, cfg)` implement the host-name split;
-  `LOCAL_MARKER_REMEDY` supplies the recovery text (**0646**).
+  `LOCAL_MARKER_REMEDY` supplies the recovery text (**0655**).
   `create_remote()` runs the hub CLI through the injectable `hub_runner`; `request_id()` is stable per
   (gateway, idempotency key or title+body+assignee+origin+skills) so an exact retry reuses the hub request;
   `remote_task_id()` reads the hub's `sent` table; `target_live()` checks the hub `meta.last_ok` and the target's registry record.
 - `tools/kanban_tools.py` `_place_remote()` is called from `kanban_create` when there is no `origin_intent` and no
-  explicit origin. Since **0646**, it returns `(tool_result, None)` for remote results/refusals,
+  explicit origin. Since **0655**, it returns `(tool_result, None)` for remote results/refusals,
   `(None, marker_placement)` for a marker-local decision, or `(None, None)` for other local keeps.
   `_handle_create()` exposes the marker decision and top-level remedy after local creation.
 - `hermes_cli/kanban.py::worker_may_archive()` shares the creator/claim gate between CLI `_cmd_archive()` and
-  `tools/kanban_tools.py::_handle_archive()`. **0646** registers `kanban_archive` in the schemas and toolsets;
+  `tools/kanban_tools.py::_handle_archive()`. **0655** registers `kanban_archive` in the schemas and toolsets;
   `agent/prompt_builder.py` teaches workers the archive/re-create remedy.
 - `tools/kanban_tools_schemas.py` adds the `placement` parameter; `hermes_cli/config_defaults.py` adds `kanban.placement: {}`.
-- **0567** adds `hermes_cli/kanban_capability_registry.py::hub_cli_path(configured=None)`: configured value, then
+- **0573** adds `hermes_cli/kanban_capability_registry.py::hub_cli_path(configured=None)`: configured value, then
   `PATH`, then `~/.local/bin/hermes-hub`, else the bare name. Gateway and worker processes (launchd, Hermes Python.app)
   lack the login shell's `PATH`, so a bare `hermes-hub` raised ENOENT and every cross-gateway create failed. Capability
   routing (`kanban_capability_routing._hub_cli`) and placement both use it.
 
-- **0630** — why: a chat got `task_id: null` back, read it as "not created", called `kanban_create` again and
+- **0636** — why: a chat got `task_id: null` back, read it as "not created", called `kanban_create` again and
   made a stray card. The request result reached the MacBook only in its next full `hermes-hub sync` (~30 s on a busy
   Mac), and an origin-bound create stays `waiting` on the hub until that sync accepts the binding, so the 8 s poll of
   the local `sent` table never saw it. `kanban_placement.await_task_id()` now asks
@@ -110,8 +110,8 @@ gateway has, so capability routing opens an owner card back there.
 
 `hermes_cli/kanban_placement.py` (new), `hermes_cli/kanban_capability_registry.py` (`hub_cli_path`),
 `hermes_cli/kanban_capability_routing.py` (`_hub_cli`), `tools/kanban_tools.py` (`_place_remote` + call site),
-`tools/kanban_tools_schemas.py`, `hermes_cli/config_defaults.py`, `website/docs/user-guide/configuration.md` (0569).
-0646 also changes `hermes_cli/kanban.py`, `toolsets.py` and `agent/prompt_builder.py`.
+`tools/kanban_tools_schemas.py`, `hermes_cli/config_defaults.py`, `website/docs/user-guide/configuration.md` (0575).
+0655 also changes `hermes_cli/kanban.py`, `toolsets.py` and `agent/prompt_builder.py`.
 
 ## Tests
 
@@ -125,29 +125,29 @@ gateway has, so capability routing opens an owner card back there.
 - a non-live target falls back to local; `decide` never raises; `target_live` needs a recent sync and a fresh target record;
 - a chat card is created on the hub bound to its chat; the hub task id is returned once applied; an unpersisted session creates an unbound hub card;
 - a Mac-only card never calls the hub; a hub refusal falls back to a local card; an offline hub is queued, not duplicated; a retry reuses the request id;
-- 0630 (each RED without the change): `test_task_id_comes_back_once_the_outcome_fetch_sees_the_hub_apply_it`,
+- 0636 (each RED without the change): `test_task_id_comes_back_once_the_outcome_fetch_sees_the_hub_apply_it`,
   `test_task_id_comes_back_while_the_origin_binding_is_still_waiting`, `test_old_client_gets_one_detached_sync_and_the_task_id`,
   `test_still_queued_after_the_wait_says_the_card_is_created_and_not_to_call_again`,
   `test_identical_retry_returns_the_same_request_and_sends_no_second_card`, `test_remote_task_id_reads_a_plain_create_output`.
   The hermes-hub side (`outcomes`) is tested in the hermes-hub repo (`client/tests/test_outcomes_cli.py`). Live: a plain
   `hermes chat -q` that called `kanban_create` once got back hub task id `t_01a18119d1bf4d6e` in 12.5 s and left exactly
   one hub card.
-- 0567: `test_hub_cli_resolves_without_the_login_shell_path` (PATH without the install dir, `~/.local/bin` fallback, configured value wins, routing uses it) and `test_remote_body_names_the_capability_to_route_back_with`.
+- 0573: `test_hub_cli_resolves_without_the_login_shell_path` (PATH without the install dir, `~/.local/bin` fallback, configured value wins, routing uses it) and `test_remote_body_names_the_capability_to_route_back_with`.
 
-- 0590–0591 (`fc317cf6f7`, `2ddf72b986`): `placement=<gateway>` that cannot be honoured returns `tool_error` code `placement_unavailable` and creates no card (never a silent local card). Tests: unrouted pin (`mini`, typos); no route configured (the hub-worker case, `placement='macbook'` on `hub`); hub refusal of a pinned card; structural limit and non-live target through the tool; exception while placing; `origin_session` set; `decide()` returns `refuse`. Controls: `placement` `local`, `here`, the own gateway name (any case, with or without a route) still create locally.
+- 0600, 0601 (`fc317cf6f7`, `2ddf72b986`): `placement=<gateway>` that cannot be honoured returns `tool_error` code `placement_unavailable` and creates no card (never a silent local card). Tests: unrouted pin (`mini`, typos); no route configured (the hub-worker case, `placement='macbook'` on `hub`); hub refusal of a pinned card; structural limit and non-live target through the tool; exception while placing; `origin_session` set; `decide()` returns `refuse`. Controls: `placement` `local`, `here`, the own gateway name (any case, with or without a route) still create locally.
 
-- **0642**, in the placement test file: `test_decide_refuses_explicit_pin_when_identity_lookup_raises`
+- **0651**, in the placement test file: `test_decide_refuses_explicit_pin_when_identity_lookup_raises`
   checks unresolved names versus no pin/auto/local/here and courier controls;
   `test_decide_keeps_a_known_own_gateway_local_when_a_later_step_raises` checks known-own versus foreign pins;
   `test_identity_lookup_failure_refuses_explicit_pin_and_creates_no_row` checks the tool error, lowercased pin,
   no hub call and no local row. `test_identity_lookup_failure_still_creates_local_and_here` and
   `test_identity_lookup_failure_without_a_pin_still_creates_locally` cover local tool controls.
-- **0646**, in the placement test file: `test_marker_cases_a_through_e` covers a MacBook title staying local,
+- **0655**, in the placement test file: `test_marker_cases_a_through_e` covers a MacBook title staying local,
   a body-only verification mention going to hub, Desktop DOM/CDP/Chrome body markers staying local,
   the verbatim sidebar-projection regression fixture (`fixtures/t_01a180aae388e142_body.txt`) going to hub,
   and a local-only skill staying local. `test_local_marker_decision_is_in_the_create_result` checks the
   exact placement/remedy shape and its absence for hub and structural local results.
-- **0646**, `tests/tools/test_kanban_creator_archive.py`:
+- **0655**, `tests/tools/test_kanban_creator_archive.py`:
   `test_worker_tool_archives_an_unclaimed_card_it_created`,
   `test_worker_tool_refuses_a_claimed_card_and_someone_elses`,
   `test_worker_cli_archives_only_an_unclaimed_card_it_created` and
@@ -158,7 +158,7 @@ gateway has, so capability routing opens an owner card back there.
 
 Untested: the CLI (`hermes kanban create`) and `execute_code` creation paths do not call placement (only the `kanban_create` tool does), and `test_kanban_create_entry_parity.py` has no placement case.
 
-## Deferred placement for cards with parents (0695)
+## Deferred placement for cards with parents (0715)
 
 Why: parents are local links, so a card with parents was always created and run on the creating gateway. Every
 orchestrator fan-out child (`parents=[self]`) and every follow-up of a laptop card ran on the laptop: on the
@@ -214,7 +214,7 @@ for the work: the local stub and the remote card. A `kanban.sync.pickup` worker 
 [kanban-central-service.md](kanban-central-service.md)) could run such a card under a Board lease instead of a
 forwarded copy; this patch does not depend on it.
 
-## Carried options (0572)
+## Carried options (0578)
 
 hermes-hub 1.8.0 adds `create-task --option KEY=JSON`. When `hermes-hub create-task --help` lists `--option`,
 placement passes `skills`, `max_runtime_seconds`, `priority`, `model`, `provider`, `goal_mode`, `goal_max_turns`,
@@ -240,13 +240,13 @@ and `test_anthropic_pool_pin.py`, 68 passed): `test_options_a_new_client_carries
 `test_new_client_carries_skills_goal_mode_and_pins_as_fields`, `test_old_client_keeps_a_goal_card_local_and_skills_in_the_body`,
 `test_kanban_cli_create_takes_reasoning_effort`. Untested: the real `hermes-hub` binary (the runner is stubbed).
 
-Applying: `git am -3` 0572 after 0565–0569. Gotcha: a gateway whose hub client is older than 1.8.0 behaves as before
+Applying: `git am -3` 0578 after 0571, 0572, 0573, 0574, 0575. Gotcha: a gateway whose hub client is older than 1.8.0 behaves as before
 until the client self-updates (up to an hour plus the 10 min cache).
 
 ## Applying
 
-`git am -3` 0565, then 0567 and 0569. Needs the capability-routing patches (0536–0540) and a hermes-hub CLI with `create-task --origin-session/--creator-session`.
-0642 (`ae139f8d31`) extends the 0590–0591 explicit-pin refusal behavior; apply it before 0646
+`git am -3` 0571, then 0573 and 0575. Needs the capability-routing patches (0549, 0550, 0551, 0552, 0553) and a hermes-hub CLI with `create-task --origin-session/--creator-session`.
+0651 (`ae139f8d31`) extends the 0600, 0601 explicit-pin refusal behavior; apply it before 0655
 (`4f6e223fe8`), whose placement changes build on it.
 
 ## Gotchas
@@ -259,4 +259,4 @@ until the client self-updates (up to an hour plus the 10 min cache).
 - Bare host-name body mentions no longer pin by default; Desktop DOM/CDP/Chrome mentions still do.
 - The target worker sees a normal card with the footer note; it has no dependency link back to the creating chat's local cards.
 - Plugin? None; the route and markers are plain config in `shared-config.json`.
-- The public patch 0565 has the private AWS profile names in its marker list and one test string replaced by `example-org` / `example-sso` / `--profile example` (a scrub, same line counts); set your own `extra_local_markers`.
+- The public patch 0571 has the private AWS profile names in its marker list and one test string replaced by `example-org` / `example-sso` / `--profile example` (a scrub, same line counts); set your own `extra_local_markers`.

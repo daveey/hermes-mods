@@ -1,6 +1,6 @@
 # Non-CI retention observation slice
 
-Patch **0391** (`16c20ad165`, core PR #82).
+Patch **0398** (`16c20ad165`, core PR #82).
 
 ## Behavior
 
@@ -21,7 +21,7 @@ Patch **0391** (`16c20ad165`, core PR #82).
 
 ## Applying
 
-Part of the ordered series (0391); apply the full series from the documented merge base.
+Part of the ordered series (0398); apply the full series from the documented merge base.
 
 ## Gotchas
 

@@ -1,6 +1,6 @@
 # Two tests pass under a copied-binary venv interpreter on macOS
 
-Patch **0701** (`437b89b73e`). Test harness only. Product installs are unchanged.
+Patch **0755** (`437b89b73e`). Test harness only. Product installs are unchanged.
 
 ## Behavior
 
@@ -23,4 +23,4 @@ No product entry path changed, so none is claimed.
 
 ## Applying
 
-`git am -3` 0701. Test files only.
+`git am -3` 0755. Test files only.

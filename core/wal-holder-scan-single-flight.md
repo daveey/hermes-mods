@@ -2,9 +2,9 @@
 
 Patches:
 
-- `patches/0550-perf-state-cache-clean-macOS-deleted-WAL-holder-scan.patch` (cache plus a first lock)
-- `patches/0551-fix-state-one-deleted-WAL-holder-scan-in-flight-per-.patch` (shared pass, deadline, identity-keyed cache)
-- `patches/0574-fix-state-darwin-holder-scan-caches-clean-verdicts-b.patch` (race fix: clean verdicts are cached before the pass leaves flight)
+- `patches/0565-perf-state-cache-clean-macOS-deleted-WAL-holder-scan.patch` (cache plus a first lock)
+- `patches/0567-fix-state-one-deleted-WAL-holder-scan-in-flight-per-.patch` (shared pass, deadline, identity-keyed cache)
+- `patches/0580-fix-state-darwin-holder-scan-caches-clean-verdicts-b.patch` (race fix: clean verdicts are cached before the pass leaves flight)
 
 Before every `state.db` open, `refuse_deleted_wal_generation` checks that no process still holds a deleted
 `-wal` / `-shm` generation. On macOS that check walks every pid's descriptors through libproc (`ctypes`). Each call
@@ -16,9 +16,9 @@ backend on 2026-10-27 had 4–5 abandoned `_scan` threads alive at once (py-spy)
 fixed by [notification-held-handoff.md](notification-held-handoff.md). These patches stop the scan from adding to
 it.
 
-0550 cached clean verdicts for 30 s and put a lock around the walk. But the lock was released when the caller's
+0565 cached clean verdicts for 30 s and put a lock around the walk. But the lock was released when the caller's
 wait ran out while the thread kept running, so the next caller still started a second walk beside it. The cache
-also hid a WAL generation retired inside the window. 0551 fixes both.
+also hid a WAL generation retired inside the window. 0567 fixes both.
 
 ## Behavior
 
@@ -71,15 +71,15 @@ is taken before the walk, so a change during the walk makes the entry miss next 
   - `test_darwin_clean_verdict_is_dropped_once_a_sidecar_is_unlinked`: reuse while unchanged, kept across a WAL
     append, and a fresh walk after the WAL is unlinked.
 - The real-libproc macOS tests in the same file pass, including
-  `test_iter_finds_self_after_wal_unlink_on_darwin`, which failed with 0550 alone (cached clean verdict).
-- `tests/hermes_state/test_state_db_darwin_fd_scan_hang.py` (from 0550): hung-vnode fail-open within budget,
+  `test_iter_finds_self_after_wal_unlink_on_darwin`, which failed with 0565 alone (cached clean verdict).
+- `tests/hermes_state/test_state_db_darwin_fd_scan_hang.py` (from 0565): hung-vnode fail-open within budget,
   healthy holder reported, clean verdict reused and single-flight across 8 threads, timed-out walk not cached. Its
   autouse fixture also resets `_DARWIN_SCAN_IN_FLIGHT`, because a hung fake walk never leaves the slot.
 
 Untested: behavior under real GIL contention in a running Desktop backend. The tests drive the walk with a fake
 enumeration.
 
-## Race fix (0574, source `d563fb1463`)
+## Race fix (0580, source `d563fb1463`)
 
 A caller that missed the clean cache and then found no pass in flight started a second libproc pass: the finished
 pass cleared `_DARWIN_SCAN_IN_FLIGHT` before any waiter had cached its verdict. Now each joiner registers its
@@ -89,11 +89,11 @@ watched)` re-checks the cache under that lock and returns the `_DARWIN_SCAN_CACH
 `_darwin_holders` is the shared holder filter. Test: `tests/hermes_state/test_state_db_darwin_fd_scan_hang.py::
 test_caller_arriving_after_pass_but_before_cache_write_reuses_it` (deterministic; the older single-flight test failed 1
 in 3 to 2 in 8 runs before, 0 in 15 after). That file passes on the mirror host (68 passed across the three files
-checked for 0572-0574). Gotcha: a pass that errors or expires still caches nothing.
+checked for 0578, 0579, 0580). Gotcha: a pass that errors or expires still caches nothing.
 
 ## Apply
 
-`git am core/patches/0550-*.patch core/patches/0551-*.patch core/patches/0574-*.patch`. Takes effect when the backend or gateway restarts.
+`git am core/patches/0565-*.patch core/patches/0567-*.patch core/patches/0580-*.patch`. Takes effect when the backend or gateway restarts.
 
 ## Gotchas
 

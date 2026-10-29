@@ -1,0 +1,252 @@
+From 35c922ec0688de34c05026bd430240e0fc09cf03 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:36:09 -0700
+Subject: [PATCH] fix(kanban remote notices): persist the delivered-notice memo
+ across restarts [daveey]
+
+54a602e068 stopped re-writing delivered remote notices on every sweep, but kept the
+record in memory only, so the first pass after every backend restart re-opened a
+writable SessionDB and re-ran append_kanban_notice for every delivered notice (494 on
+the MacBook 2026-10-29: a burst of "30 writable SessionDB() opens in 60s" warnings for
+~1 min after each of the ~14 core-update restarts that night).
+
+Record each persisted notice key in the remote-notices ledger (new `swept` table, next
+to the claim rows, not in the 13 GB state.db) and load it once per process. Measured on
+the live data in a fresh process: first pass 494 opens / 5.2 s wall / 4.0 s CPU; the
+next fresh process 0 opens / 0.1 s. An unwritable notice is still never recorded; an
+unusable ledger falls back to the in-memory memo; rows older than 90 days are pruned
+(a card still in the replica then costs one deduplicated append).
+
+Five whys: restart re-writes 494 notices <- the "already delivered" record lived only
+in process memory <- 54a602e068 fixed the per-pass cost and deferred durability as a
+follow-up <- the existing ledger's delivered rows mean "announced", not "persisted by
+the sweep" (stale states are recorded silently), so they could not serve as the mark
+<- root: no durable idempotency key for the sweep's own writes. Not caught: the test
+asserted "a restart re-checks once" as intended behavior and no test counted opens
+across a restart.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tui_gateway/test_kanban_remote_notices.py | 74 +++++++++++++++++--
+ tui_gateway/kanban_remote_notices.py          | 67 ++++++++++++++++-
+ 2 files changed, 130 insertions(+), 11 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+index 1a7e09f076..809180609c 100644
+--- a/tests/tui_gateway/test_kanban_remote_notices.py
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -349,11 +349,12 @@ def test_legacy_fresh_rows_reoffered_once_and_stale_rows_left(tmp_path, caplog):
+                        transcript_has=lambda key, tid: False) == []
+ 
+ 
+-def test_sweep_skips_persisted_notices_without_opening_store_until_restart(tmp_path):
++def test_sweep_skips_persisted_notices_without_opening_store_even_after_restart(tmp_path):
+     from tui_gateway import kanban_remote_notices as krn
+ 
+     krn._reset_for_tests()
+     _tid, replica = _replicate(tmp_path, f"FINAL SEND for @session:default@macbook/{CHAT}: memo proof")
++    ledger = tmp_path / "remote-notices.db"
+     opens = []
+     with SessionDB(tmp_path / "state.db") as db:
+         for sid in (CHAT, OTHER):
+@@ -364,14 +365,70 @@ def test_sweep_skips_persisted_notices_without_opening_store_until_restart(tmp_p
+             opens.append(sid)
+             yield db, db.get_compression_tip(sid) or sid
+ 
+-        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 2
++        def sweep():
++            return sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger)
++
++        assert len(sweep()) == 2
+         assert len(opens) == 2
+         for _ in range(3):
+-            assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener) == []
++            assert sweep() == []
+         assert len(opens) == 2
+-        krn._reset_for_tests()  # a restarted backend re-checks once and finds the rows: still one notice per chat
+-        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 2
++        krn._reset_for_tests()  # a restarted backend loads the ledger: no store opened, no notice re-written
++        assert sweep() == []
++        assert len(opens) == 2
++        ledger.unlink()  # a lost ledger: re-checks once, finds the rows (still one notice per chat), records again
++        for suffix in ("-wal", "-shm"):
++            ledger.with_name(ledger.name + suffix).unlink(missing_ok=True)
++        krn._reset_for_tests()
++        assert len(sweep()) == 2
+         assert len(opens) == 4 and len(db.get_messages(CHAT)) == 1
++        krn._reset_for_tests()
++        assert sweep() == [] and len(opens) == 4
++
++
++def test_sweep_keeps_working_in_memory_when_the_ledger_is_unusable(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    krn._reset_for_tests()
++    _tid, replica = _replicate(tmp_path, "unusable ledger proof")
++    ledger = tmp_path / "remote-notices.db"
++    ledger.mkdir()  # sqlite cannot open a directory
++    opens = []
++    with SessionDB(tmp_path / "state.db") as db:
++        for sid in (CHAT, OTHER):
++            db.create_session(sid, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            opens.append(sid)
++            yield db, sid
++
++        def sweep():
++            return sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger)
++
++        assert len(sweep()) == 2
++        assert sweep() == [] and len(opens) == 2
++        assert len(db.get_messages(CHAT)) == 1
++
++
++def test_swept_rows_older_than_the_keep_window_are_pruned_on_load(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    krn._reset_for_tests()
++    ledger = tmp_path / "remote-notices.db"
++    conn = krn._ledger(ledger)
++    with conn:
++        krn._swept(conn)
++        conn.executemany("INSERT INTO swept VALUES (?,?,?,?,?)", [
++            ("hub.db", "default", CHAT, "old", time.time() - krn.SWEPT_KEEP_S - 60),
++            ("hub.db", "default", CHAT, "new", time.time())])
++    conn.close()
++    krn._load_swept(ledger)
++    assert ("hub.db", "default", CHAT, "new") in krn._delivered
++    assert ("hub.db", "default", CHAT, "old") not in krn._delivered
++    conn = krn._ledger(ledger)
++    assert [r[0] for r in conn.execute("SELECT notice_id FROM swept")] == ["new"]
++    conn.close()
+ 
+ 
+ def test_sweep_does_not_remember_a_notice_it_could_not_write(tmp_path):
+@@ -387,6 +444,9 @@ def test_sweep_does_not_remember_a_notice_it_could_not_write(tmp_path):
+         def opener(profile, sid):
+             yield (None, None) if missing or sid != CHAT else (db, sid)
+ 
+-        assert not sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)
++        ledger = tmp_path / "remote-notices.db"
++        assert not sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger)
++        krn._reset_for_tests()  # nothing was recorded for the unwritten notice, so a restart still retries it
+         missing = False
+-        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener)) == 1
++        assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                        ledger=ledger)) == 1
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 0efbe8030a..1ea2e9e2bd 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -407,12 +407,17 @@ def release(claim: dict, *, ledger: Optional[Path] = None) -> bool:
+         return False
+ 
+ 
+-# [daveey] Notices this process already persisted (or found persisted), keyed (replica, profile, session, notice_id).
++# [daveey] Notices already persisted (or found persisted), keyed (replica, profile, session, notice_id).
+ # Without it every 30 s pass re-ran append_kanban_notice for every done/blocked remote card: one state.db writer txn
+ # plus a lineage json scan each (441 per pass on the MacBook 2026-10-28, ~1 core of the Desktop backend, and write
+-# contention for live turns). A restart re-checks each once; a new event has a new notice_id.
++# contention for live turns). The keys are also written to the ledger's ``swept`` table, so a restarted backend
++# loads them instead of re-writing every notice once (443 opens of the 13 GB state.db, ~7 min and ~200 s CPU after
++# each restart, 2026-10-29). A new event has a new notice_id; rows untouched for SWEPT_KEEP_S are pruned (a card
++# still in the replica then costs one deduplicated append).
+ _DELIVERED_MAX = 50_000
++SWEPT_KEEP_S = 90 * 86400.0
+ _delivered: dict[tuple, None] = {}
++_swept_loaded: set[str] = set()
+ 
+ 
+ def _remember_delivered(key: tuple) -> None:
+@@ -421,10 +426,55 @@ def _remember_delivered(key: tuple) -> None:
+         _delivered.pop(next(iter(_delivered)))
+ 
+ 
++def _swept(conn: sqlite3.Connection) -> None:
++    conn.execute("CREATE TABLE IF NOT EXISTS swept (replica TEXT NOT NULL, profile TEXT NOT NULL, session TEXT NOT NULL, "
++                 "notice_id TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (replica, profile, session, notice_id))")
++
++
++def _load_swept(ledger: Optional[Path]) -> None:
++    """Once per process and ledger: prune old ``swept`` rows and remember the rest. Unreadable: in-memory only."""
++    name = str(ledger or ledger_path())
++    if name in _swept_loaded:
++        return
++    try:
++        conn = _ledger(ledger)
++        try:
++            with conn:
++                _swept(conn)
++                conn.execute("DELETE FROM swept WHERE at < ?", (time.time() - SWEPT_KEEP_S,))
++            for row in conn.execute("SELECT replica, profile, session, notice_id FROM swept ORDER BY at"):
++                _remember_delivered(tuple(row))
++        finally:
++            conn.close()
++        _swept_loaded.add(name)
++    except sqlite3.Error:
++        logger.debug("remote notice ledger unreadable; delivered notices kept in memory only", exc_info=True)
++
++
++def _record_swept(keys: list[tuple], ledger: Optional[Path]) -> None:
++    if not keys:
++        return
++    try:
++        conn = _ledger(ledger)
++        try:
++            with conn:
++                _swept(conn)
++                now = time.time()
++                conn.executemany("INSERT OR REPLACE INTO swept (replica, profile, session, notice_id, at) "
++                                 "VALUES (?,?,?,?,?)", [(*key, now) for key in keys])
++        finally:
++            conn.close()
++    except sqlite3.Error:
++        logger.debug("remote notice ledger unwritable; %d delivered notices kept in memory only", len(keys),
++                     exc_info=True)
++
++
+ def _reset_for_tests() -> None:
++    """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
+     global _index_memo
+     _index_memo = None
+     _delivered.clear()
++    _swept_loaded.clear()
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -468,7 +518,16 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+     except sqlite3.Error:
+         logger.debug("remote Kanban replica unavailable", exc_info=True)
+         return []
+-    delivered = []
++    _load_swept(ledger)
++    delivered, swept = [], []
++    try:
++        _sweep_rows(rows, me, live, path, session_db, ledger, delivered, swept)
++    finally:
++        _record_swept(swept, ledger)
++    return delivered
++
++
++def _sweep_rows(rows, me, live, path, session_db, ledger, delivered: list, swept: list) -> None:
+     for owner, key, raw in rows:
+         try:
+             task = json.loads(raw)
+@@ -503,6 +562,7 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+                     if db is not None and text:
+                         row_id = db.append_kanban_notice(tip, text, metadata)
+                         _remember_delivered(memo_key)
++                        swept.append(memo_key)
+                         delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
+                         at = _terminal_at(task)
+                         ack({"session": sid, "ref": f"{owner}/{key}",
+@@ -510,4 +570,3 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+                              "notice_key": event_key}, ledger=ledger)
+         except Exception:
+             logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
+-    return delivered
+-- 
+2.55.0
+

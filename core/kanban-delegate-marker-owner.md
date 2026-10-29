@@ -37,7 +37,7 @@ legacy unbound marker. Not re-run when this doc was written (untested here).
 
 ## Applying
 
-`git am -3 --empty=keep` in order, after 0169-0172.
+`git am -3 --empty=keep` in order, after 0169, 0170, 0171, 0172.
 
 ## Gotchas
 

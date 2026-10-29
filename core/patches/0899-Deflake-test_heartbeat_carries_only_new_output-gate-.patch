@@ -1,0 +1,75 @@
+From fc9d28e2a606bd8a2d90a858f7cab937f2c13bb6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 05:19:37 +0000
+Subject: [PATCH] Deflake test_heartbeat_carries_only_new_output: gate child on
+ fifo instead of sleep
+
+---
+ tests/tools/test_process_heartbeat.py | 42 ++++++++++++++++++++-------
+ 1 file changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/tests/tools/test_process_heartbeat.py b/tests/tools/test_process_heartbeat.py
+index ac48189eb8..3cc13f42f5 100644
+--- a/tests/tools/test_process_heartbeat.py
++++ b/tests/tools/test_process_heartbeat.py
+@@ -40,25 +40,47 @@ def _wait_until(pred, timeout: float, interval: float = 0.05) -> bool:
+ def test_heartbeat_carries_only_new_output_and_stops_at_exit(tmp_path, monkeypatch):
+     monkeypatch.setattr(pr, "HEARTBEAT_MIN_SECONDS", 1)
+     monkeypatch.setattr(pr, "HEARTBEAT_TICK_SECONDS", 0.1)
++    # The child advances only when released through a fifo, never on a wall-clock sleep: a quiet
++    # tick queues nothing, so two lines make two beats only if the first beat is seen before the
++    # second line is written. fd 3 is read-write so the non-blocking release always has a reader.
++    hold = tmp_path / "hold"
++    os.mkfifo(hold)
+     registry = ProcessRegistry()
+-    session = registry.spawn_local("echo first; sleep 2.5; echo second; sleep 2.5", cwd=str(tmp_path))
++    session = registry.spawn_local(
++        f"exec 3<>{shlex.quote(str(hold))}; echo first; read -r _ <&3; echo second; read -r _ <&3",
++        cwd=str(tmp_path),
++    )
+     session.notify_on_complete = True
+-    assert registry.arm_heartbeat(session, 1) == 1
+ 
+-    assert _wait_until(lambda: registry.poll(session.id)["status"] != "running", timeout=20)
+-    # Give the completion event a moment to be enqueued after the reader observes EOF.
+-    assert _wait_until(lambda: any(e.get("type") == "completion" for e in list(registry.completion_queue.queue)),
+-                       timeout=5)
++    def beats_now() -> list:
++        return [e for e in list(registry.completion_queue.queue) if e.get("type") == "heartbeat"]
++
++    try:
++        assert registry.arm_heartbeat(session, 1) == 1
++        wait_until(lambda: len(beats_now()) >= 1, timeout=_HEARTBEAT_WAIT, what="first heartbeat")
++        assert registry.poll(session.id)["status"] == "running"
++        _release_hold(hold)
++        wait_until(lambda: len(beats_now()) >= 2, timeout=_HEARTBEAT_WAIT, what="second heartbeat")
++        assert registry.poll(session.id)["status"] == "running"
++        _release_hold(hold)
++        wait_until(lambda: registry.poll(session.id)["status"] != "running",
++                   timeout=_HEARTBEAT_WAIT, what="child exit")
++        # The completion event is enqueued shortly after the reader observes EOF.
++        wait_until(lambda: any(e.get("type") == "completion" for e in list(registry.completion_queue.queue)),
++                   timeout=_HEARTBEAT_WAIT, what="completion event")
++    finally:
++        _release_hold(hold)
++        registry.kill_process(session.id)
+     events = _drain(registry.completion_queue)
+     beats = [e for e in events if e["type"] == "heartbeat"]
+     completion = [e for e in events if e["type"] == "completion"]
+ 
+-    assert len(beats) >= 2, events
+-    assert [b["seq"] for b in beats] == list(range(1, len(beats) + 1))
++    assert len(beats) == 2, events
++    assert [b["seq"] for b in beats] == [1, 2]
+     assert all(b["session_id"] == session.id and b["interval"] == 1 for b in beats)
+     # Output is a delta: every produced line appears in exactly one heartbeat, never twice.
+-    joined = "".join(b["output"] for b in beats)
+-    assert joined.count("first") == 1 and joined.count("second") == 1, [b["output"] for b in beats]
++    assert "first" in beats[0]["output"] and "second" not in beats[0]["output"], beats
++    assert "second" in beats[1]["output"] and "first" not in beats[1]["output"], beats
+     assert len(completion) == 1
+     # Heartbeats never outlive the process: nothing after the completion notice.
+     assert events.index(completion[0]) > events.index(beats[-1])
+-- 
+2.55.0
+

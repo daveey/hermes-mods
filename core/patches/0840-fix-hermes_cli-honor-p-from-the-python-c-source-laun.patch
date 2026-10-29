@@ -1,0 +1,194 @@
+From 06f3498b163fb79c896a6f2a92803cea39825e9e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:54:18 +0000
+Subject: [PATCH] fix(hermes_cli): honor -p from the python -c source launcher
+ [daveey]
+
+Problem: hermes-hub skills-sync at 2026-10-28T23:42Z printed
+"config set failed" for profiles bb-tuner and coach. hermes -p
+profile exits 2: the profile name is not a hermes command.
+Why 1: _apply_profile_override did not consume -p, so argparse took
+the profile name as the command.
+Why 2: _looks_like_hermes_invocation() is false when argv[0] is -c.
+Why 3: the POSIX launcher is python -c and rewrites argv[0] only
+after importing hermes_cli.main, which scans -p at import.
+It does set sys._hermes_pin_default_home before that import.
+Root (happened): 1ccc80512e required a hermes/main.py argv[0] and did
+not treat the source launcher (-c plus the pin flag) as the CLI.
+Root (not caught): the regression covered pytest argv[0] and
+python -m, not the generated launcher.
+Recurrence: first hit, six minutes after 1ccc80512e.
+
+Both argv[0] == -c and the pin flag are required. hermes --run-module
+leaves the flag set after runpy replaces argv[0]; that -p stays foreign.
+---
+ hermes_cli/main.py                           |  10 +-
+ hermes_cli/main_profile_argv.py              |   9 ++
+ tests/hermes_cli/test_ux_messages_startup.py | 101 +++++++++++++++++++
+ 3 files changed, 116 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 239ed1dea5..47101215ff 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -520,10 +520,12 @@ def explicit_cli_profile() -> str | None:
+ def _apply_profile_override() -> None:
+     """Pre-parse --profile/-p and set HERMES_HOME before imports.
+ 
+-    Only a Hermes CLI process owns ``-p``/``--profile``. Importing this module
+-    from pytest (or any other entry point) must ignore that argv: a separate
+-    ``-p usage_guard_probe`` is a plugin flag, not a profile, and resolving it
+-    ``sys.exit``s the importer. Sticky ``active_profile`` is unchanged.
++    Only a Hermes CLI process owns ``-p``/``--profile``. That includes the
++    POSIX source launcher (``python -c``, argv[0] ``-c``, pin flag set).
++    Importing this module from pytest (or any other entry point) must ignore
++    that argv: a separate ``-p usage_guard_probe`` is a plugin flag, not a
++    profile, and resolving it ``sys.exit``s the importer. Sticky
++    ``active_profile`` is unchanged.
+     """
+     global _explicit_cli_profile
+     _explicit_cli_profile = None
+diff --git a/hermes_cli/main_profile_argv.py b/hermes_cli/main_profile_argv.py
+index 9ae0e456e0..abfcf1d0e3 100644
+--- a/hermes_cli/main_profile_argv.py
++++ b/hermes_cli/main_profile_argv.py
+@@ -35,8 +35,17 @@ def _looks_like_hermes_invocation() -> bool:
+     pytest's separate ``-p <plugin>`` and any other entry point's argv must
+     not select a profile. ``python -m hermes_cli.main`` sets ``argv[0]`` to
+     this package's ``main.py``; the console script's basename is ``hermes``.
++    The POSIX source launcher is ``python -c`` (``argv[0]`` is ``-c``) and
++    sets ``sys._hermes_pin_default_home`` before this import
++    (``hermes_cli._launchers.PIN_DEFAULT_HOME_FLAG``). Both are required:
++    a bare ``python -c`` has no mark, and ``hermes --run-module pytest``
++    keeps the mark but runpy replaces ``argv[0]``, so that ``-p`` stays foreign.
+     """
++    # Launcher mark, not argv[0] alone: the wrapper rewrites argv[0] only
++    # after this module has already scanned for ``-p``.
+     argv0 = sys.argv[0] if sys.argv else ""
++    if argv0 == "-c" and getattr(sys, "_hermes_pin_default_home", False):
++        return True
+     base = os.path.basename(argv0).lower()
+     for suffix in (".exe", "-script.pyw", "-script.py"):
+         if base.endswith(suffix):
+diff --git a/tests/hermes_cli/test_ux_messages_startup.py b/tests/hermes_cli/test_ux_messages_startup.py
+index 89823492d1..faf2591a6f 100644
+--- a/tests/hermes_cli/test_ux_messages_startup.py
++++ b/tests/hermes_cli/test_ux_messages_startup.py
+@@ -106,6 +106,9 @@ print("OK")
+ @pytest.mark.parametrize("argv0", [
+     "/usr/lib/python3.14/site-packages/pytest/__main__.py",
+     "/opt/ci/run_tests_parallel.py",
++    # Bare ``python -c`` (no launcher mark). The source launcher's argv[0]
++    # is also ``-c``; that path is covered by the pin-flag test below.
++    "-c",
+ ])
+ def test_importing_main_with_foreign_separate_dash_p_does_not_resolve_a_profile(tmp_path, argv0):
+     """Importing hermes_cli.main must not treat another program's ``-p <plugin>`` as ``--profile``.
+@@ -164,6 +167,104 @@ def test_apply_ignores_foreign_separate_dash_p_without_a_profile_lookup(tmp_path
+     assert _main.explicit_cli_profile() is None
+ 
+ 
++def test_pin_flag_without_dash_c_argv_does_not_select_dash_p(tmp_path, monkeypatch):
++    """``hermes --run-module`` sets the pin flag, then runpy replaces argv[0].
++
++    A later import of this module (pytest's ``-p usage_guard_probe``) must
++    not treat that leftover mark as a Hermes CLI invocation.
++    """
++    from hermes_cli import main as _main
++
++    home = tmp_path / "profiles" / "default"
++    home.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(sys, "argv", [
++        "/usr/lib/python3.14/site-packages/pytest/__main__.py",
++        "tests/hermes_cli/test_codex_credential_host_binding.py",
++        "-p",
++        "usage_guard_probe",
++        "--tb=short",
++    ])
++    monkeypatch.setattr(sys, "_hermes_pin_default_home", True, raising=False)
++    looked_up: list[str] = []
++
++    def _boom(name: str) -> str:
++        looked_up.append(name)
++        raise AssertionError(f"profile lookup of {name}")
++
++    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", _boom)
++    _main._apply_profile_override()
++    assert looked_up == []
++    assert _main.explicit_cli_profile() is None
++
++
++def test_source_launcher_python_dash_c_still_selects_dash_p(tmp_path, monkeypatch):
++    """The installed launcher is ``python -c``; argv[0] is ``-c`` at import.
++
++    It sets ``sys._hermes_pin_default_home`` before importing ``hermes_cli.main``.
++    That mark is what makes ``-p`` ours. Without it, ``-p bb-tuner`` is left
++    for argparse and the profile name is reported as an unknown command.
++    """
++    from hermes_cli import main as _main
++
++    root = tmp_path / ".hermes"
++    profile = root / "profiles" / "bb-tuner"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setattr(sys, "argv", ["-c", "-p", "bb-tuner", "config", "get", "x"])
++    monkeypatch.setattr(sys, "_hermes_pin_default_home", True, raising=False)
++    _main._apply_profile_override()
++    assert os.environ["HERMES_HOME"] == str(profile)
++    assert _main.explicit_cli_profile() == "bb-tuner"
++    assert "bb-tuner" not in sys.argv
++
++
++_LAUNCHER_IMPORT = """\
++import os
++import sys
++
++root, profile_name = sys.argv[1], sys.argv[2]
++os.environ["HERMES_HOME"] = root
++# POSIX source launcher: python -c, pin flag set before importing main.
++sys._hermes_pin_default_home = True
++sys.argv = ["-c", "-p", profile_name, "config", "get", "skills.external_dirs"]
++import hermes_cli.main
++
++home = os.environ["HERMES_HOME"]
++assert home.rstrip("/").endswith("/profiles/" + profile_name), home
++assert hermes_cli.main.explicit_cli_profile() == profile_name
++assert profile_name not in sys.argv
++print("OK")
++"""
++
++
++def test_importing_main_from_source_launcher_consumes_dash_p(tmp_path):
++    """Import-time scan must honor ``-p`` when the launcher marked the process."""
++    root = tmp_path / ".hermes"
++    profile = root / "profiles" / "coach"
++    profile.mkdir(parents=True)
++    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
++    probe = tmp_path / "probe_launcher_import.py"
++    probe.write_text(_LAUNCHER_IMPORT, encoding="utf-8")
++    env = os.environ.copy()
++    env["PYTHONPATH"] = os.pathsep.join(
++        [str(_REPO), env["PYTHONPATH"]] if env.get("PYTHONPATH") else [str(_REPO)]
++    )
++    env["HERMES_HOME"] = str(root)
++    result = subprocess.run(
++        [sys.executable, str(probe), str(root), "coach"],
++        cwd=_REPO,
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=90,
++        check=False,
++    )
++    assert result.returncode == 0, result.stderr + result.stdout
++    assert result.stdout.strip().splitlines()[-1] == "OK"
++
++
+ @pytest.mark.parametrize("argv0", ["hermes", "/opt/hermes/hermes_cli/main.py"])
+ def test_real_hermes_invocation_still_selects_dash_p(tmp_path, monkeypatch, argv0):
+     from hermes_cli import main as _main
+-- 
+2.55.0
+

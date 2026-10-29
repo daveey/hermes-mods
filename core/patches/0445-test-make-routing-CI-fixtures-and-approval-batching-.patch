@@ -1,0 +1,161 @@
+From a3c3c9e9280f617bae6cd7c26d3216945af9d237 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 06:31:58 +0000
+Subject: [PATCH 440/453] test: make routing CI fixtures and approval batching
+ deterministic [daveey]
+
+(cherry picked from commit a3c3c9e9280f617bae6cd7c26d3216945af9d237)
+---
+ .../test_system_prompt_switch_invalidation.py |  3 ++
+ .../test_child_notice_profile_admission.py    | 28 +++++++++++---
+ .../tui_gateway/test_approval_unadvertised.py | 37 +++++++++++++++++++
+ tests/tui_gateway/test_protocol.py            | 27 --------------
+ 4 files changed, 63 insertions(+), 32 deletions(-)
+ create mode 100644 tests/tui_gateway/test_approval_unadvertised.py
+
+diff --git a/tests/agent/test_system_prompt_switch_invalidation.py b/tests/agent/test_system_prompt_switch_invalidation.py
+index 448721a30a..0f5fdf1fb5 100644
+--- a/tests/agent/test_system_prompt_switch_invalidation.py
++++ b/tests/agent/test_system_prompt_switch_invalidation.py
+@@ -85,6 +85,9 @@ def test_compression_tip_adoption_applies_the_identity_check(db):
+         agent.session_id = "parent"
+         agent.model, agent.provider = model, provider
+         agent.pass_session_id = False
++        # Ordinary exact-model agents have no class allocation. An unspecced
++        # MagicMock otherwise fabricates truthy provenance and a nonexistent DB.
++        agent.model_routing = None
+         agent.context_compressor = None
+         agent._memory_manager = None
+         assert _adopt_live_compression_child(agent, db, "parent") is not None
+diff --git a/tests/gateway/test_child_notice_profile_admission.py b/tests/gateway/test_child_notice_profile_admission.py
+index 07adb374ac..68029baae2 100644
+--- a/tests/gateway/test_child_notice_profile_admission.py
++++ b/tests/gateway/test_child_notice_profile_admission.py
+@@ -278,9 +278,17 @@ async def test_batched_completions_follow_the_owning_profile(
+ 
+     rig = _build_rig(monkeypatch, tmp_path, request, surface_a, "all")
+     runner = rig.runner
++    flush = runner._flush_process_completion_batch
++    release = asyncio.Event()
++
++    async def flush_when_enqueued(key):
++        await release.wait()
++        await flush(key)
++
++    monkeypatch.setattr(runner, "_flush_process_completion_batch", flush_when_enqueued)
+ 
+     async def consume(leg):
+-        runner._completion_notification_batch_window = 0.01
++        release.clear()
+         if owner == "live_handoff":
+             _transfer_to_parent(rig, leg)
+         leg.proc.output_buffer = "PROCESS_RESULT"
+@@ -297,10 +305,20 @@ async def test_batched_completions_follow_the_owning_profile(
+         pair = [("PROCESS_RESULT", evt), ("COMPANION_RESULT", companion)]
+         if path in {"batch_foreground_first", "batch_boundary_first"}:
+             pair.reverse()
+-        outcomes = await asyncio.gather(*(
+-            runner._enqueue_process_completion_notification(text, event)
+-            for text, event in pair
+-        ))
++        from tests.waiting import async_wait_until
++
++        tasks = [asyncio.create_task(runner._enqueue_process_completion_notification(text, event))
++                 for text, event in pair]
++        try:
++            # Profile admission can exceed 10ms on a loaded runner. Both events
++            # must be admitted (or suppressed) before this test closes its batch;
++            # keep the real filtering, route keys, delivery and settlement intact.
++            await async_wait_until(lambda: sum(t.done() for t in tasks) + sum(
++                len(entries) for entries in runner._completion_notification_batches.values()) == len(pair),
++                what="both completion admissions")
++        finally:
++            release.set()
++            outcomes = await asyncio.gather(*tasks)
+         assert outcomes[pair.index(("PROCESS_RESULT", evt))] is (True if leg.surfaced else None)
+         assert outcomes[pair.index(("COMPANION_RESULT", companion))] is (None if boundary else True)
+         texts = "\n".join(event.text for event, _sid, _home in rig.admitted)
+diff --git a/tests/tui_gateway/test_approval_unadvertised.py b/tests/tui_gateway/test_approval_unadvertised.py
+new file mode 100644
+index 0000000000..8272440ce4
+--- /dev/null
++++ b/tests/tui_gateway/test_approval_unadvertised.py
+@@ -0,0 +1,37 @@
++"""Unsupported websocket clients synchronously withdraw unsendable approvals."""
++from tests.tui_gateway.test_protocol import _silent_ws, _ws_session, server
++
++__all__ = ["server"]  # Shared pytest fixture, discovered by name.
++
++
++def test_approval_for_a_ws_client_that_never_advertised_settles_the_queue_entry(server, monkeypatch):
++    """A queue withdrawal must precede polling, regardless of host scheduling latency."""
++    from tools import approval as approval_mod
++    from tools import approval_gateway_wait as wait_mod
++
++    peer = _silent_ws()
++    _ws_session(server, "ws-old-approval", peer)
++    monkeypatch.setattr(wait_mod._ctx, "_get_approval_timeout", lambda: 3)
++    monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
++    # Assert synchronous withdrawal before the real wait, not a sub-second
++    # budget that includes imports/hooks and OS scheduling on a loaded runner.
++    poll = wait_mod._poll_event
++    observed = []
++
++    def already_set(event, session_key, **kwargs):
++        observed.append(event.is_set())
++        assert event.is_set(), "unsupported client left an approval waiting for a human"
++        return poll(event, session_key, **kwargs)
++
++    monkeypatch.setattr(wait_mod, "_poll_event", already_set)
++    approval_mod.register_gateway_notify("ws-old-approval", lambda data: server._emit_approval_request("ws-old-approval", data))
++    try:
++        decision = wait_mod._await_gateway_decision(
++            "ws-old-approval", approval_mod._gateway_notify_cbs["ws-old-approval"],
++            {"command": "rm -rf build", "description": "", "pattern_key": "dangerous", "pattern_keys": ["dangerous"]})
++    finally:
++        approval_mod.unregister_gateway_notify("ws-old-approval")
++    assert observed == [True]
++    assert decision["choice"] is None and decision["cancelled"]
++    assert peer.frames == []
++    assert "ws-old-approval" not in approval_mod._gateway_queues
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index 41697ed77d..796039c5c4 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -1917,33 +1917,6 @@ def test_unregister_live_transport_stops_delivery(capture, monkeypatch):
+     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
+ 
+ 
+-def test_approval_for_a_ws_client_that_never_advertised_settles_the_queue_entry(server, monkeypatch):
+-    """The approval wait is owned by ``tools.approval``'s queue, not by ``server_requests``. When the request
+-    cannot be sent (the only client predates server→client requests) the queue entry must be withdrawn too,
+-    otherwise ``_await_gateway_decision`` idles for the whole approvals.timeout with no prompt anywhere
+-    (#112548). The decision is a withdrawal (``cancelled`` cause), never a user deny."""
+-    from tools import approval as approval_mod
+-    from tools import approval_gateway_wait as wait_mod
+-
+-    peer = _silent_ws()
+-    _ws_session(server, "ws-old-approval", peer)
+-    monkeypatch.setattr(wait_mod._ctx, "_get_approval_timeout", lambda: 3)
+-    monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
+-    approval_mod.register_gateway_notify("ws-old-approval", lambda data: server._emit_approval_request("ws-old-approval", data))
+-    try:
+-        t0 = time.monotonic()
+-        decision = wait_mod._await_gateway_decision(
+-            "ws-old-approval", approval_mod._gateway_notify_cbs["ws-old-approval"],
+-            {"command": "rm -rf build", "description": "", "pattern_key": "dangerous", "pattern_keys": ["dangerous"]})
+-        waited = time.monotonic() - t0
+-    finally:
+-        approval_mod.unregister_gateway_notify("ws-old-approval")
+-    assert waited < 1, decision
+-    assert decision["choice"] is None and decision["cancelled"]
+-    assert peer.frames == []
+-    assert "ws-old-approval" not in approval_mod._gateway_queues
+-
+-
+ def test_approval_that_ends_before_its_settle_hook_attaches_is_still_withdrawn(server):
+     """The client can answer (``approval.respond`` RPC, or another surface) between the frame going out and
+     the settle hook attaching; ``register_gateway_settle`` then reports the entry gone. The sent request must
+-- 
+2.54.0 (Apple Git-157)
+

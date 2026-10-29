@@ -1,0 +1,163 @@
+From f88977402bf912bea0651ca05a2682214b055f2b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:13:43 -0700
+Subject: [PATCH] fix(kanban): placement='hermes-hub' resolves to the 'hub'
+ gateway instead of refusing the card [daveey]
+
+Models pin the hub by its host name (hermes-hub: EC2 host, hermes-hub client, docs, memory and
+the kanban_create schema's own example 'MacBook -> hermes-hub'), but the gateway is named 'hub',
+so decide() refused: "placement 'hermes-hub' is not a routed gateway (only 'hub')" and no card
+was created (6 sessions incl. 4 cron runs, 10-24..10-28).
+
+canonical_pin() resolves kanban.placement.aliases and 'hermes-<gw>' when <gw> is this gateway or a
+routed one, before the route/own-gateway checks; unknown names are still refused. Schema text now
+names 'hub' as the gateway.
+---
+ hermes_cli/kanban_placement.py            | 44 ++++++++++++++++++++---
+ tests/hermes_cli/test_kanban_placement.py | 42 ++++++++++++++++++++++
+ tools/kanban_tools_schemas.py             |  3 +-
+ 3 files changed, 83 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 8207b7e02c..853f5009f8 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -41,6 +41,9 @@ answer (:func:`await_task_id`) and returns its task id like a local create. Stil
+ as "not created" once called kanban_create again and made a duplicate card. An identical retry
+ maps to the same request id (:func:`request_id`) and is never sent twice.
+ 
++A pinned name resolves aliases first (:func:`canonical_pin`): ``hermes-<gw>`` (the hub's host is
++``hermes-hub``, its gateway ``hub``) and ``kanban.placement.aliases``.
++
+ Unset ``route`` (upstream default) never places anything remotely.
+ """
+ from __future__ import annotations
+@@ -283,9 +286,40 @@ def _uncarried(args: dict, c: _Cfg, carries: Optional[bool]) -> list[str]:
+     return [] if carries else legacy
+ 
+ 
+-def explicit_foreign_pin(args: dict, self_gw: Optional[str]) -> str:
+-    """The gateway the caller pinned that is neither this gateway nor 'local'/'auto', else ''."""
+-    pin = str(args.get("placement") or "auto").strip().lower()
++def canonical_pin(pin, self_gw: Optional[str] = None, cfg: Optional[dict] = None) -> str:
++    """``pin`` lowercased, with a host-style alias resolved to its gateway name.
++
++    The hub gateway is named ``hub`` but its machine is ``hermes-hub`` (EC2 host, the hermes-hub
++    client, every doc and memory line), so models pin ``placement='hermes-hub'`` and got refused
++    ("not a routed gateway (only 'hub')"). ``kanban.placement.aliases`` (``{alias: gateway}``) maps
++    any name; built in, ``hermes-<gw>`` means ``<gw>`` when ``<gw>`` is this gateway or a routed one.
++    Unknown names pass through unchanged (and are refused as before). Never raises.
++    """
++    try:
++        p = str(pin or "").strip().lower()
++        raw = config() if cfg is None else cfg
++        raw = raw if isinstance(raw, dict) else {}
++        aliases = raw.get("aliases")
++        if isinstance(aliases, dict):
++            hit = {str(k).strip().lower(): str(v).strip().lower() for k, v in aliases.items()}.get(p)
++            if hit:
++                return hit
++        known = {str(self_gw or "").strip().lower()}
++        route = raw.get("route")
++        if isinstance(route, dict):
++            known |= {str(k).strip().lower() for k in route} | {str(v).strip().lower() for v in route.values()}
++        known.discard("")
++        if p.startswith("hermes-") and p[len("hermes-"):] in known:
++            return p[len("hermes-"):]
++        return p
++    except Exception:
++        return str(pin or "").strip().lower()
++
++
++def explicit_foreign_pin(args: dict, self_gw: Optional[str], cfg: Optional[dict] = None) -> str:
++    """The gateway the caller pinned that is neither this gateway nor 'local'/'auto', else ''.
++    Aliases resolve first (:func:`canonical_pin`)."""
++    pin = canonical_pin(args.get("placement") or "auto", self_gw, cfg)
+     if pin in ("", "auto", "local", "here", (self_gw or "").lower()):
+         return ""
+     return pin
+@@ -321,7 +355,7 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         known = sg.strip().lower() if isinstance(sg, str) else ""
+         out = _decide(args, origin_intent=origin_intent, now=now, cfg=cfg, self_gw=sg, live=live,
+                       locate=locate, carries=carries)
+-        pin = explicit_foreign_pin(args, sg)
++        pin = explicit_foreign_pin(args, sg, cfg)
+         if pin and origin_intent is None and out.get("where") == "local" and not out.get("defer"):
+             return {"where": "refuse", "why": out.get("why", ""), "pin": pin}
+         return out
+@@ -348,7 +382,7 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         target = c.target(self_gw)
+         if not target:
+             return {"where": "local", "why": "no placement route for this gateway"}
+-        pin = str(args.get("placement") or "auto").strip().lower()
++        pin = canonical_pin(args.get("placement") or "auto", self_gw, c.raw)
+         if pin in ("local", "here", (self_gw or "").lower()):
+             return {"where": "local", "why": "placement pinned local by the caller"}
+         explicit = pin not in ("", "auto")
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 3c39e19e2d..09483dbff9 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -981,3 +981,45 @@ def test_dispatcher_spawns_the_forwarder_for_a_deferred_card(mac, monkeypatch):
+     tail = spawned[child][spawned[child].index("--") + 1:]
+     assert "chat" in tail  # the worker it execs on fallback
+     assert "hermes_cli.kanban_placement_forward" not in spawned[plain]
++
++
++# --- gateway aliases: 'hermes-hub' is the hub's host name, 'hub' its gateway name ------------------
++# Coach signature (6 sessions, 10-24..10-28): placement='hermes-hub' was refused as "not a routed
++# gateway (only 'hub')", so cron runs and chats created no card at all. [daveey]
++
++@pytest.mark.parametrize("pin", ["hermes-hub", "Hermes-Hub", " hermes-hub "])
++def test_host_style_alias_of_the_routed_target_is_placed_there(pin):
++    d = decide({"title": "CI fix", "placement": pin})
++    assert d["where"] == "hub", d
++
++
++def test_host_style_alias_of_own_gateway_means_local():
++    # On the hub (no route there), placement='hermes-hub' is this gateway: create locally.
++    assert decide({"title": "x", "placement": "hermes-hub"}, cfg={}, self_gw="hub")["where"] == "local"
++    assert kp.explicit_foreign_pin({"placement": "hermes-hub"}, "hub", {}) == ""
++
++
++def test_configured_alias_maps_any_name_and_unknown_names_still_refuse():
++    cfg = {**ROUTE, "aliases": {"ec2-hub": "hub"}}
++    assert decide({"title": "x", "placement": "ec2-hub"}, cfg=cfg)["where"] == "hub"
++    # Only a known gateway behind the 'hermes-' prefix resolves; anything else is refused as before.
++    d = decide({"title": "x", "placement": "hermes-mini"})
++    assert d["where"] == "refuse" and d["pin"] == "hermes-mini", d
++    assert decide({"title": "x", "placement": "hermes"})["where"] == "refuse"
++
++
++def test_hermes_hub_pin_through_the_tool_creates_on_the_hub_not_refused(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hermes-hub"}))
++    assert out.get("ok"), out
++    assert out["placed"]["gateway"] == "hub" and mac["calls"], out
++    assert _local_count() == 0
++
++
++def test_hermes_hub_pin_on_the_hub_itself_creates_locally(mac, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", dict)
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hermes-hub"}))
++    assert out.get("ok") and out["task_id"] and "placed" not in out, out
++    assert _local_count() == 1
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 2f729e2434..766858ad84 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -691,7 +691,8 @@ KANBAN_CREATE_SCHEMA = _schema(
+                     "if it waits too long."},
+         "placement": _prop("string", (
+                 "Where the card runs. 'auto' (default): on a gateway with a "
+-                "kanban.placement route (e.g. the MacBook -> hermes-hub), a "
++                "kanban.placement route (e.g. the MacBook -> 'hub', the gateway "
++                "on the hermes-hub host; 'hermes-hub' is accepted as an alias), a "
+                 "card with no local-only need is created on the target "
+                 "gateway, still linked to this chat. 'local' pins it here "
+                 "(use it when the work needs this machine: its Chrome, "
+-- 
+2.55.0
+

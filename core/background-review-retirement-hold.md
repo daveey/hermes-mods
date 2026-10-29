@@ -1,8 +1,8 @@
 # A running background review holds backend retirement
 
-Patches: [`patches/0700-fix-retirement-a-running-background-review-holds-the.patch`](patches/0700-fix-retirement-a-running-background-review-holds-the.patch) (fork commit `4101ef7442`),
-[`patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch`](patches/0703-fix-update-stop-a-stale-dashboard-backend-through-it.patch) (fork commit `2d9f16aa2c`, the `hermes update` stop path),
-[`patches/0706-fix-retirement-expose-background-reviews-to-cross-pr.patch`](patches/0706-fix-retirement-expose-background-reviews-to-cross-pr.patch) (fork commit `a75e611b06`, the cross-process admission reservation)
+Patches: [`patches/0735-fix-retirement-a-running-background-review-holds-the.patch`](patches/0735-fix-retirement-a-running-background-review-holds-the.patch) (fork commit `4101ef7442`),
+[`patches/0758-fix-update-stop-a-stale-dashboard-backend-through-it.patch`](patches/0758-fix-update-stop-a-stale-dashboard-backend-through-it.patch) (fork commit `2d9f16aa2c`, the `hermes update` stop path),
+[`patches/0761-fix-retirement-expose-background-reviews-to-cross-pr.patch`](patches/0761-fix-retirement-expose-background-reviews-to-cross-pr.patch) (fork commit `a75e611b06`, the cross-process admission reservation)
 
 ## Why
 
@@ -25,7 +25,7 @@ change, which was lost.
 - Once a review is older than `BACKGROUND_REVIEW_HARD_CAP_S` (900 s), it stops counting, so a wedged review cannot
   starve retirement.
 - `busy_ledger()` reports `background_review:<n>` for the idle-exit watchdog and `/api/health/idle`.
-- `hermes update`'s dashboard step (`_kill_stale_dashboard_processes(restart_managed=True)`, patch 0703) no longer
+- `hermes update`'s dashboard step (`_kill_stale_dashboard_processes(restart_managed=True)`, patch 0758) no longer
   sends a plain SIGTERM first. For each stale backend whose port (spawn ledger, host rendezvous record, or a
   non-zero `--port`) and session token (`HERMES_DASHBOARD_SESSION_TOKEN` in its environment, or the rendezvous
   token) it can find, it calls `POST /api/health/retirement` `prepare`. While `GET /api/health/idle` reports
@@ -39,7 +39,7 @@ change, which was lost.
 - `begin_background_review` also takes an installation-root cross-process admission reservation
   (`admission_fence.reserve` on `get_default_hermes_root`, not the profile home) before the review is admitted, and
   keeps it until `end_background_review`. A review with no turn lease still counts as one reservation, so an update
-  hold that already reads reservations sees it. Patch 0700 left the drain probe unchanged on purpose; this patch
+  hold that already reads reservations sees it. Patch 0735 left the drain probe unchanged on purpose; this patch
   does not add a probe either. The review now holds the reservation that reader already counts.
 - A new review is refused while an update hold stands (`reserve` returns None because the hold is set). Another
   review's reservation does not by itself refuse a new one; each review takes its own. `OSError` or `TimeoutError`
@@ -64,7 +64,7 @@ change, which was lost.
 - `_spawn_background_review_now` holds the fence for the thread's whole run, and skips cleanly (run token released)
   on a retiring backend.
 
-`tests/hermes_cli/test_update_stale_dashboard_review.py` (patch 0703; 3 of 5 fail without it, and the 2 controls
+`tests/hermes_cli/test_update_stale_dashboard_review.py` (patch 0758; 3 of 5 fail without it, and the 2 controls
 pass both ways). The backend is a real child process: a real `RetirementFence` behind an HTTP listener that checks
 the session token from its environment, plus a SIGTERM handler that records what the shutdown would do to a review
 still running:
@@ -75,7 +75,7 @@ still running:
 - A wedged review: the update gives up at its deadline and stops the backend as before.
 - Controls: a backend with no review, and one with no reachable fence, are stopped at once as before.
 
-`tests/hermes_cli/test_background_review_update_admission.py` (patch 0706; 6 tests, posix):
+`tests/hermes_cli/test_background_review_update_admission.py` (patch 0761; 6 tests, posix):
 
 - A review with no turn lease holds one installation-root reservation until end. `set_hold` sees `reservations == 1`
   while `active_count() == 0`. After that hold is set, a second `begin_background_review` returns None and the
@@ -99,8 +99,8 @@ does not. The drain probe is the existing admission reader; it is not a new poll
 
 ## Applying
 
-`git am -3 core/patches/0706-fix-retirement-expose-background-reviews-to-cross-pr.patch` after 0700. It touches
-`hermes_cli/backend_retirement.py`, which 0700 and 0703 also touch.
+`git am -3 core/patches/0761-fix-retirement-expose-background-reviews-to-cross-pr.patch` after 0735. It touches
+`hermes_cli/backend_retirement.py`, which 0735 and 0758 also touch.
 
 ## Gotchas
 

@@ -1,6 +1,6 @@
 # Explicit per-board dispatch ownership
 
-Patches: **0362 0363 0366 0367 0368 0369**.
+Patches: **0367 0368 0371 0372 0373 0374**.
 
 ## Behavior
 
@@ -26,12 +26,12 @@ Native archive moves a database and sidecar together; recreating the slug is a n
 
 | Patch | Role |
 |---|---|
-| 0362 | Explicit runtime identity and native dispatch gate; operator API/CLI. |
-| 0363 | Stable database metadata identity and gateway decomposition gate. |
-| 0366 | Isolate per-board pre-dispatch failures. |
-| 0367 | Separate authority from display metadata and preserve lifecycle semantics. |
-| 0368 | Reject relocated connections; capture/revalidate native database identity. |
-| 0369 | Preserve lifecycle errors and report lock contention consistently. |
+| 0367 | Explicit runtime identity and native dispatch gate; operator API/CLI. |
+| 0368 | Stable database metadata identity and gateway decomposition gate. |
+| 0371 | Isolate per-board pre-dispatch failures. |
+| 0372 | Separate authority from display metadata and preserve lifecycle semantics. |
+| 0373 | Reject relocated connections; capture/revalidate native database identity. |
+| 0374 | Preserve lifecycle errors and report lock contention consistently. |
 
 ## Code
 
@@ -61,7 +61,7 @@ Run these with `bash scripts/run_tests.sh <files>` in the isolated applied check
 
 ## Applying
 
-Apply all ownership follow-ups, not only 0362. Before activation, stop all older dispatchers that can reach the board and drain workers at a safe idle window; then upgrade every dispatcher. Mixed-version operation is unsupported because older code ignores ownership and may lock an unresolved alias. Metadata writes alone are not rollout. No automatic migration from earlier unreleased display-metadata storage is provided.
+Apply all ownership follow-ups, not only 0367. Before activation, stop all older dispatchers that can reach the board and drain workers at a safe idle window; then upgrade every dispatcher. Mixed-version operation is unsupported because older code ignores ownership and may lock an unresolved alias. Metadata writes alone are not rollout. No automatic migration from earlier unreleased display-metadata storage is provided.
 
 ## Gotchas
 

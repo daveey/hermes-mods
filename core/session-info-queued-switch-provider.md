@@ -1,6 +1,6 @@
 # session.info keeps a queued model switch's provider
 
-Patch **0556** (source `3458007706`).
+Patch **0535** (source `3458007706`).
 
 ## Behavior
 

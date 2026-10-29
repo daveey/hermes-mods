@@ -1,0 +1,297 @@
+From 1c1cffe8d6cef04306db2da99df33451be440a7e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 21:49:39 -0700
+Subject: [PATCH 449/453] kanban: typed OOM recovery (2x MemoryMax w/
+ MemAvailable admission), toolchain env defaults, OOM-rate detector
+
+(cherry picked from commit 1c1cffe8d6cef04306db2da99df33451be440a7e)
+---
+ hermes_cli/kanban_db_dispatch.py             |  11 +-
+ hermes_cli/kanban_worker_scope.py            | 132 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_oom_recovery.py |  86 ++++++++++++
+ 3 files changed, 226 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_oom_recovery.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 8aae0053da..048df15db4 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1188,6 +1188,8 @@ def _classify_dead_worker(
+     failure = _worker_scope.read_failure(task_id, run_id, log or "") if task_id else None
+     if failure:
+         kind = "oom_killed" if failure["scope_result"] == "oom-kill" else "signaled"
++        if kind == "oom_killed":
++            _worker_scope.note_oom_kill(task_id, board)
+         dead = _DeadWorker(kind, None, _worker_scope.describe(failure), kind,
+                            {"pid": pid, "claimer": claimer, **failure})
+     else:
+@@ -2983,7 +2985,7 @@ def _open_worker_log(task: Task, board: Optional[str]):
+     return open(log_path, "ab")
+ 
+ 
+-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
++def _restart_safe_worker_argv(task: Task, command: list[str], board: Optional[str] = None) -> list[str]:
+     """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
+ 
+     Kanban workers are long-lived agentic runs that outlive the dispatcher
+@@ -3013,12 +3015,14 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
+             )
+         return command
+ 
+-    return _worker_scope.retain_failed_scope(restart_safe_gateway_child_argv(
++    argv = _worker_scope.retain_failed_scope(restart_safe_gateway_child_argv(
+         command,
+         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+         require_restart_safe_scope=True,
+         outlives_parent=True,
+     ).argv)
++    # Typed OOM recovery: a task whose last run(s) were OOM-killed gets a raised cap.
++    return _worker_scope.apply_oom_recovery(argv, task.id, board)
+ 
+ 
+ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+@@ -3137,7 +3141,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
+     # A worker spawned by a managed systemd gateway must leave the gateway's
+     # cgroup before startup; otherwise restarting the service kills the worker
+     # that is performing the handoff.
+-    cmd = _restart_safe_worker_argv(task, cmd)
++    cmd = _restart_safe_worker_argv(task, cmd, board)
++    _worker_scope.apply_toolchain_env(env)
+     from tools.process_registry import systemd_user_bus_env
+     env = systemd_user_bus_env(env)
+     log_f = _open_worker_log(task, board)
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+index a618594772..dc78c92910 100644
+--- a/hermes_cli/kanban_worker_scope.py
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -122,3 +122,135 @@ def release_failure(metadata: dict) -> None:
+     unit = metadata.get("systemd_unit")
+     if unit:
+         _systemctl("reset-failed", unit)
++
++
++# --- Typed OOM recovery -------------------------------------------------------
++# An ``oom_killed`` run is a resource failure, not a generic crash: the retry
++# gets a doubled MemoryMax (bounded by MemAvailable admission) instead of dying
++# at the same cap again.
++OOM_CAP_CEILING_BYTES = 12 * 1024 ** 3
++OOM_ADMISSION_RESERVE_BYTES = 4 * 1024 ** 3   # always left for the host
++OOM_ALERT_THRESHOLD = 5                       # kills per 24h before a card opens
++OOM_ALERT_WINDOW_SECONDS = 24 * 3600
++_MEMORY_MAX_PROP = "MemoryMax="
++
++
++def mem_available_bytes() -> int | None:
++    try:
++        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
++            if line.startswith("MemAvailable:"):
++                return int(line.split()[1]) * 1024
++    except (OSError, ValueError, IndexError):
++        pass
++    return None
++
++
++def raised_memory_max(base: int, consecutive_ooms: int, mem_available: int | None) -> int:
++    """Cap for the next run: base * 2**n, <= 12 GiB, admitted only if it fits in MemAvailable.
++
++    Unknown MemAvailable refuses the raise (returns base) rather than guessing.
++    """
++    if consecutive_ooms <= 0 or mem_available is None:
++        return base
++    want = min(base << min(consecutive_ooms, 8), OOM_CAP_CEILING_BYTES)
++    admitted = mem_available - OOM_ADMISSION_RESERVE_BYTES
++    if want <= base or admitted <= base:
++        return base
++    return min(want, admitted)
++
++
++def consecutive_oom_runs(task_id: str, board: str | None = None) -> int:
++    """Number of most-recent finished runs, in a row, that ended ``oom_killed``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    try:
++        with kbc.connect_closing(board=board) as conn:
++            rows = conn.execute(
++                "SELECT outcome FROM task_runs WHERE task_id = ? AND outcome IS NOT NULL "
++                "ORDER BY id DESC LIMIT 8", (task_id,)).fetchall()
++    except Exception:
++        return 0
++    n = 0
++    for row in rows:
++        if row[0] != "oom_killed":
++            break
++        n += 1
++    return n
++
++
++def apply_oom_recovery(argv: list[str], task_id: str, board: str | None = None) -> list[str]:
++    """Rewrite the scope's MemoryMax property after prior OOM kills; no-op otherwise."""
++    n = consecutive_oom_runs(task_id, board)
++    if not n:
++        return argv
++    for i, arg in enumerate(argv):
++        if arg == "--":
++            break
++        if arg.startswith(_MEMORY_MAX_PROP):
++            try:
++                base = int(arg[len(_MEMORY_MAX_PROP):])
++            except ValueError:
++                return argv
++            new = raised_memory_max(base, n, mem_available_bytes())
++            if new > base:
++                argv = list(argv)
++                argv[i] = f"{_MEMORY_MAX_PROP}{new}"
++            return argv
++    return argv
++
++
++# Heavy JS toolchains get bounded parallelism by default inside workers
++# (an explicit repo/user env value still wins).
++WORKER_TOOLCHAIN_ENV = {
++    "VITEST_MAX_WORKERS": "2",
++    "VITEST_MIN_WORKERS": "1",
++    "JEST_MAX_WORKERS": "2",
++}
++_NODE_HEAP_FLAG = "--max-old-space-size=3072"
++
++
++def apply_toolchain_env(env: dict) -> None:
++    for key, value in WORKER_TOOLCHAIN_ENV.items():
++        env.setdefault(key, value)
++    node_options = env.get("NODE_OPTIONS", "")
++    if "max-old-space-size" not in node_options:
++        env["NODE_OPTIONS"] = (node_options + " " + _NODE_HEAP_FLAG).strip()
++
++
++def note_oom_kill(task_id: str, board: str | None = None, *, now: int | None = None) -> str | None:
++    """Count OOM kills in 24h; above the threshold open one card per incident.
++
++    Later kills in the same incident (an open alert card exists) become comments.
++    Returns the alert task id, or None. Never raises.
++    """
++    import time
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    now = int(now if now is not None else time.time())
++    try:
++        with kbc.connect_closing(board=board) as conn:
++            kills = conn.execute(
++                "SELECT COUNT(*) FROM task_runs WHERE outcome = 'oom_killed' AND ended_at >= ?",
++                (now - OOM_ALERT_WINDOW_SECONDS,)).fetchone()[0] + 1  # + this run, not yet booked
++            if kills <= OOM_ALERT_THRESHOLD:
++                return None
++            key = "worker-oom-rate-alert"
++            open_card = conn.execute(
++                "SELECT id FROM tasks WHERE idempotency_key = ? AND status NOT IN ('done', 'archived') "
++                "ORDER BY created_at DESC LIMIT 1", (key,)).fetchone()
++            if open_card:
++                kb.add_comment(conn, open_card[0], "oom-detector",
++                               f"Another worker OOM kill ({task_id}); {kills} in the last 24h.")
++                return open_card[0]
++            return kb.create_task(
++                conn, title=f"Worker OOM kills: {kills} in 24h",
++                body=(f"{kills} kanban worker scopes were OOM-killed in the last 24h "
++                      f"(threshold {OOM_ALERT_THRESHOLD}); latest: {task_id}. Retries get a doubled "
++                      "MemoryMax up to 12 GiB; check `journalctl --user | grep oom-kill` and the "
++                      "victims' last output for the heavy step."),
++                assignee="default", created_by="oom-detector", priority=70,
++                idempotency_key=key, board=board)
++    except Exception:
++        import logging
++        logging.getLogger(__name__).warning("oom detector failed", exc_info=True)
++        return None
+diff --git a/tests/hermes_cli/test_kanban_oom_recovery.py b/tests/hermes_cli/test_kanban_oom_recovery.py
+new file mode 100644
+index 0000000000..69d5480b4f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_oom_recovery.py
+@@ -0,0 +1,86 @@
++"""Typed OOM recovery: raised cap, MemAvailable admission, toolchain env, rate detector."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_worker_scope as scope
++
++GiB = 1024 ** 3
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    from pathlib import Path
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _run(conn, tid, outcome, ended=None):
++    conn.execute(
++        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) VALUES (?,?,?,?,?)",
++        (tid, "crashed", 1, ended or int(time.time()), outcome))
++    conn.commit()
++
++
++ARGV = ["systemd-run", "--user", "--scope", "--property", f"MemoryMax={4 * GiB}", "--", "hermes"]
++
++
++def test_oom_run_doubles_cap_and_caps_at_12gib(kanban_home, monkeypatch):
++    monkeypatch.setattr(scope, "mem_available_bytes", lambda: 40 * GiB)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="x", assignee="a")
++        assert scope.apply_oom_recovery(ARGV, tid) == ARGV          # no OOM yet
++        _run(conn, tid, "oom_killed")
++    assert f"MemoryMax={8 * GiB}" in scope.apply_oom_recovery(ARGV, tid)
++    with kbc.connect() as conn:
++        _run(conn, tid, "oom_killed")
++        _run(conn, tid, "oom_killed")
++    assert f"MemoryMax={12 * GiB}" in scope.apply_oom_recovery(ARGV, tid)
++    assert scope.apply_oom_recovery(ARGV, tid)[-2:] == ["--", "hermes"]
++
++
++def test_non_oom_latest_run_resets_streak(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="x", assignee="a")
++        _run(conn, tid, "oom_killed")
++        _run(conn, tid, "crashed")
++    assert scope.consecutive_oom_runs(tid) == 0
++
++
++def test_admission_refuses_raise_when_memavailable_low():
++    assert scope.raised_memory_max(4 * GiB, 1, 6 * GiB) == 4 * GiB     # 6-4 reserve = 2 < base
++    assert scope.raised_memory_max(4 * GiB, 1, None) == 4 * GiB
++    assert scope.raised_memory_max(4 * GiB, 2, 10 * GiB) == 6 * GiB    # partial, bounded by avail-reserve
++    assert scope.raised_memory_max(4 * GiB, 1, 23 * GiB) == 8 * GiB
++
++
++def test_toolchain_env_defaults_do_not_override():
++    env = {"VITEST_MAX_WORKERS": "6", "NODE_OPTIONS": "--foo"}
++    scope.apply_toolchain_env(env)
++    assert env["VITEST_MAX_WORKERS"] == "6"
++    assert env["JEST_MAX_WORKERS"] == "2"
++    assert env["NODE_OPTIONS"] == "--foo --max-old-space-size=3072"
++    scope.apply_toolchain_env(env)
++    assert env["NODE_OPTIONS"].count("max-old-space-size") == 1
++
++
++def test_detector_opens_one_card_then_comments(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="victim", assignee="a")
++        for _ in range(4):
++            _run(conn, tid, "oom_killed")
++    assert scope.note_oom_kill(tid) is None            # 5th kill: at threshold, not over
++    with kbc.connect() as conn:
++        _run(conn, tid, "oom_killed")
++    alert = scope.note_oom_kill(tid)                   # 6th
++    assert alert
++    assert scope.note_oom_kill(tid) == alert           # same incident -> comment
++    with kbc.connect() as conn:
++        assert len(kb.list_comments(conn, alert)) == 1
++        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key='worker-oom-rate-alert'").fetchone()[0] == 1
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,354 @@
+From 2248ff852705eab0969c2ea7edbf810e8daa8666 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 05:37:39 -0700
+Subject: [PATCH] fix(kanban): kanban_origin_adopt without courier context
+ names the exact hermes-hub adopt-task next step [daveey] (#145)
+
+* fix(kanban): [daveey] kanban_origin_adopt without courier context names the exact hermes-hub adopt-task next step
+
+kanban_origin_adopt only runs inside a courier-delivered adoption. Called from a chat (or a worker) it
+returned origin_context_required with no way forward: a hub worker told its origin chat to call the
+tool, the chat was refused, and the card sat blocked on a human (t_a5cc12d9).
+
+The refusal now carries next_step, the exact command, and run_on, the gateway to run it on:
+- chat: hermes-hub adopt-task <owner-gw> <profile>/<board>/<task> --origin-session $HERMES_SESSION_ID
+  --id adopt:<task>:<session>, owner gateway/profile read from this gateway's hermes-hub replica
+  (courier ids, never SSH aliases); placeholders when the card is unknown or ambiguous.
+- card on this same gateway: hermes kanban --board <b> notify-subscribe <task> --platform tui.
+- worker: the command for the origin gateway (from HERMES_ORIGIN_SESSION) plus delegate, a
+  hermes-hub create-task that gets it run there.
+Tracks t_01a181e3f7620552.
+
+* fix(kanban): [daveey] adopt next_step keeps owner+origin profiles, validates every part, no self-addressed delegate
+
+Review on #145: the worker delegate's links --expect dropped the owner profile (3-part ref = default
+profile, so a non-default card never verified); the command omitted --origin-profile, so it was filled
+from the running CLI not the chat; task/board/session went into a shell command unvalidated. Now: 4-part
+expect ref, --origin-profile from the chat (worker: its HERMES_ORIGIN_SESSION profile), each part must be
+a route name else stays a <placeholder> with complete=false, and a worker whose origin chat is on this
+same gateway gets the notify-subscribe path instead of a create-task addressed to itself.
+
+* fix(kanban): [daveey] adopt_next_step catches only the profile lookup's own errors (health BLE001)
+---
+ hermes_cli/kanban_origin.py                   | 113 ++++++++++++-
+ .../hermes_cli/test_kanban_origin_adoption.py | 149 ++++++++++++++++++
+ tools/kanban_tools.py                         |  12 +-
+ 3 files changed, 271 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index f8d12297a6..4c4163f387 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -23,10 +23,11 @@ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ import json
+ import os
+ import re
++import shlex
+ import sqlite3
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Iterable, Optional
++from typing import Any, Iterable, Mapping, Optional
+ 
+ ENV = "HERMES_ORIGIN_SESSION"
+ 
+@@ -144,6 +145,116 @@ def resolve(explicit: Optional[str] = None) -> Optional[Origin]:
+     return origin
+ 
+ 
++def _replica_task_owners(task_id: str, board: str) -> list[tuple[str, str]]:
++    """``(gateway, profile)`` of every hermes-hub replica task record keyed ``<profile>/<board>/<task_id>``."""
++    path = _hub_db()
++    if path is None:
++        return []
++    try:
++        conn = _ro(path)
++        try:
++            rows = conn.execute("SELECT gw, key FROM replica WHERE coll = 'tasks' AND key LIKE ? ESCAPE '\\'",
++                                ("%/" + re.sub(r"([%_\\])", r"\\\1", f"{board}/{task_id}"),)).fetchall()
++        finally:
++            conn.close()
++    except sqlite3.Error:
++        return []
++    owners = []
++    for gw, key in rows:
++        parts = str(key or "").split("/")
++        if len(parts) == 3 and parts[1:] == [board, task_id] and gw:
++            owners.append((str(gw), parts[0]))
++    return sorted(set(owners))
++
++
++def _request_id(task_id: str, session: str) -> str:
++    return f"adopt:{task_id}:{session}"[:128]
++
++
++# One name in a hermes-hub route (gateway, profile, board, task, session), as hermes-hub validates it; it is
++# also what keeps the command shell-safe unquoted and never parsed as a flag (no leading '-').
++_SAFE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
++
++
++def _safe(value: Any, placeholder: str) -> str:
++    text = str(value or "").strip()
++    return text if _SAFE_NAME.match(text) else placeholder
++
++
++def adopt_next_step(task_id: str, board: str, *, env: Optional[Mapping[str, str]] = None) -> dict[str, Any]:
++    """The supported way to attach an existing card to a chat, for a ``kanban_origin_adopt`` call that has no
++    courier context. That tool only runs inside a courier-delivered adoption; a chat (or a worker) gets the
++    exact ``hermes-hub adopt-task`` command instead, filled from args, the hub replica and the session env.
++
++    Returns ``{next_step, run_on, complete, message}`` plus ``delegate`` for a worker whose origin chat is on
++    another gateway: a ``hermes-hub create-task`` that gets the command run there. Unknown or unsafe parts stay
++    ``<placeholders>`` and ``complete`` is False: such a command must be filled in before it is run.
++    """
++    env = os.environ if env is None else env
++    me, _ = gateway_names()
++    me = _safe(me, "")
++    task_id = _safe(task_id, "<task-id>")
++    board = _safe(board, "<board>")
++    try:
++        from hermes_cli.profiles import current_profile_name
++        my_profile = _safe(current_profile_name("default"), "default")
++    except (ImportError, OSError, ValueError):
++        my_profile = "default"
++    worker = bool((env.get("HERMES_KANBAN_TASK") or "").strip())
++    if worker:
++        # The card lives here; the adoption request must be queued FROM the origin chat's gateway.
++        owner_gw, owner_profile = me or "<owner-gateway>", my_profile
++        try:
++            origin = parse_origin(ambient_origin_ref()) if ambient_origin_ref() else None
++        except OriginError:
++            origin = None
++        run_on = _safe(origin and origin.gateway, "<origin-gateway>")
++        session = _safe(origin and origin.session, "<origin-session-id>")
++        origin_profile = _safe(origin and origin.profile, "<origin-profile>")
++        unknown_owner = False
++    else:
++        owners = _replica_task_owners(task_id, board)
++        unknown_owner = len(owners) != 1
++        owner_gw, owner_profile = ((_safe(owners[0][0], "<owner-gateway>"), _safe(owners[0][1], "<owner-profile>"))
++                                   if len(owners) == 1 else ("<owner-gateway>", "<owner-profile>"))
++        run_on = me or "<this-gateway>"
++        session = _safe(env.get("HERMES_SESSION_ID"), "<origin-session-id>")
++        # "custom" = a HERMES_HOME outside ~/.hermes: no profile name to pass; the CLI resolves its own.
++        origin_profile = my_profile if my_profile != "custom" else ""
++    if me and owner_gw == me and (not worker or run_on == me):
++        # Card and chat on the same gateway: a tui subscription binds them, no courier involved.
++        pflag = "" if owner_profile == my_profile else f"-p {owner_profile} "
++        step = f"hermes {pflag}kanban --board {board} notify-subscribe {task_id} --platform tui --chat-id {session}"
++        who = ("A worker is fenced from that on its own board: report to the chat with cross_session instead, or "
++               "have the chat run it:" if worker else "Bind this chat to it by running in a terminal here:")
++        return {"next_step": step, "run_on": me, "complete": "<" not in step,
++                "message": f"{task_id} and the chat are both on this gateway ({me}); kanban_origin_adopt is only for "
++                           f"a courier-delivered adoption. {who} {step}"}
++    step = (f"hermes-hub adopt-task {owner_gw} {owner_profile}/{board}/{task_id} --origin-session {session} "
++            + (f"--origin-profile {origin_profile} " if origin_profile else "")
++            + f"--id {_request_id(task_id, session)}")
++    out: dict[str, Any] = {"next_step": step, "run_on": run_on, "complete": "<" not in step}
++    if worker:
++        title = f"Attach {owner_gw} card {task_id} to chat {session}"
++        body = (f"Run on this gateway: {step}  Then confirm with: hermes-hub links {session} "
++                f"--expect {owner_gw}/{owner_profile}/{board}/{task_id}")
++        out["delegate"] = (f"hermes-hub create-task {run_on} {shlex.quote(title)} --body {shlex.quote(body)} "
++                           "--assignee default --origin-session ''")
++        out["message"] = (
++            "kanban_origin_adopt only runs inside a courier-delivered adoption; a worker cannot attach its card to "
++            f"a chat with it. The origin chat's gateway ({run_on}) must queue the request: {step} . From this "
++            f"worker, get it run there with: {out['delegate']} (do not ask a human to call kanban_origin_adopt).")
++    else:
++        out["message"] = (
++            "kanban_origin_adopt only runs inside a courier-delivered adoption, never from a chat. Attach the card "
++            f"to this chat by running in a terminal on this gateway ({run_on}): {step}"
++            + (f" ({task_id} on board {board!r} is not in this gateway's hermes-hub replica, so fill in the owner "
++               "gateway and profile: `hermes-hub tasks --all` lists them.)" if unknown_owner else ""))
++    if not out["complete"]:
++        out["message"] += " Replace every <placeholder> before running it."
++    return out
++
++
+ def bind(conn: Any, task_id: str, origin: Origin, *, board: Optional[str] = None) -> dict[str, Any]:
+     """Subscribe ``origin`` to ``task_id`` (platform 'hub'); idempotent. Returns the binding receipt."""
+     from hermes_cli import kanban_db_notify as kbn
+diff --git a/tests/hermes_cli/test_kanban_origin_adoption.py b/tests/hermes_cli/test_kanban_origin_adoption.py
+index 4bd082f121..a7191b7375 100644
+--- a/tests/hermes_cli/test_kanban_origin_adoption.py
++++ b/tests/hermes_cli/test_kanban_origin_adoption.py
+@@ -171,3 +171,152 @@ def test_registered_adoption_tool_requires_trusted_context(board):
+     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+     refused = json.loads(registry.dispatch("kanban_origin_adopt", {"task_id": tid, "board": "default"}))
+     assert refused.get("code") == "origin_context_required", refused
++
++
++# --- Refusal outside courier context names the supported CLI path [daveey] -------------------------------------
++
++def _hub_state(tmp_path, monkeypatch, me, tasks=()):
++    """A minimal hermes-hub state dir: this gateway's id plus replica rows (gw, profile/board/task)."""
++    import sqlite3
++    state = tmp_path / "hub-state"
++    state.mkdir(exist_ok=True)
++    with sqlite3.connect(state / "hub.db") as db:
++        db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
++        db.execute("CREATE TABLE IF NOT EXISTS replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, "
++                   "data TEXT, PRIMARY KEY (gw, coll, key))")
++        db.execute("INSERT OR REPLACE INTO meta VALUES ('gateway', ?)", (me,))
++        for gw in {me, *(t[0] for t in tasks)}:
++            db.execute("INSERT OR REPLACE INTO replica (gw, coll, key, data) VALUES (?, 'gateway', 'info', '{}')", (gw,))
++        for gw, key in tasks:
++            db.execute("INSERT OR REPLACE INTO replica (gw, coll, key, data) VALUES (?, 'tasks', ?, '{}')", (gw, key))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for name in ("HERMES_KANBAN_TASK", "HERMES_ORIGIN_SESSION", "HERMES_SESSION_ID", "HERMES_PROFILE_NAME"):
++        monkeypatch.delenv(name, raising=False)
++
++
++def _refuse(task_id, board="default"):
++    from tools import kanban_tools  # registers the tool
++    from tools.registry import registry
++    return json.loads(registry.dispatch("kanban_origin_adopt", {"task_id": task_id, "board": board}))
++
++
++def test_chat_refusal_names_exact_adopt_task_command(board, tmp_path, monkeypatch):
++    _hub_state(tmp_path, monkeypatch, "macbook", [("hub", "default/default/t_remote1")])
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261025_234720_c405df")
++    refused = _refuse("t_remote1")
++    assert refused["code"] == "origin_context_required", refused
++    assert refused["handoff_complete"] is False
++    assert refused["next_step"] == ("hermes-hub adopt-task hub default/default/t_remote1 "
++                                    "--origin-session 20261025_234720_c405df --origin-profile default "
++                                    "--id adopt:t_remote1:20261025_234720_c405df")
++    assert refused["run_on"] == "macbook"
++    assert refused["complete"] is True
++    assert "hermes-hub adopt-task" in refused["error"]
++
++
++def test_chat_refusal_uses_owner_profile_and_board_from_replica(board, tmp_path, monkeypatch):
++    _hub_state(tmp_path, monkeypatch, "macbook", [("mini", "bb-dev/bb/t_bb1"), ("hub", "default/default/t_other")])
++    monkeypatch.setenv("HERMES_SESSION_ID", "s_chat")
++    monkeypatch.setenv("HERMES_PROFILE", "work")
++    refused = _refuse("t_bb1", board="bb")
++    assert refused["next_step"] == ("hermes-hub adopt-task mini bb-dev/bb/t_bb1 --origin-session s_chat "
++                                    "--origin-profile work --id adopt:t_bb1:s_chat")
++
++
++def test_chat_refusal_with_unknown_owner_keeps_placeholders(board, tmp_path, monkeypatch):
++    _hub_state(tmp_path, monkeypatch, "macbook")
++    refused = _refuse("t_nowhere")
++    assert refused["code"] == "origin_context_required"
++    assert refused["next_step"].startswith("hermes-hub adopt-task <owner-gateway> <owner-profile>/default/t_nowhere ")
++    assert "--origin-session <origin-session-id>" in refused["next_step"]
++    assert refused["run_on"] == "macbook"
++    assert refused["complete"] is False
++    assert "not in this gateway's hermes-hub replica" in refused["error"]
++    assert "Replace every <placeholder>" in refused["error"]
++
++
++@pytest.mark.parametrize("task_id,board_slug,session", [
++    ("t_x; touch /tmp/pwned", "default", "s_ok"),
++    ("t_x", "de fault", "s_ok"),
++    ("t_x", "default", "$(id)"),
++    ("t_x", "default", "--help"),
++])
++def test_unsafe_values_become_placeholders_never_shell_text(board, tmp_path, monkeypatch, task_id, board_slug, session):
++    _hub_state(tmp_path, monkeypatch, "macbook", [("hub", "default/default/t_x")])
++    monkeypatch.setenv("HERMES_SESSION_ID", session)
++    refused = _refuse(task_id, board=board_slug)
++    assert refused["complete"] is False
++    for bad in (";", "$(", " de fault", "--help", "touch"):
++        assert bad not in refused["next_step"]
++
++
++def test_chat_refusal_for_card_on_this_gateway_subscribes_instead(board, tmp_path, monkeypatch):
++    _conn, tid = board
++    _hub_state(tmp_path, monkeypatch, "hub", [("hub", f"default/default/{tid}")])
++    monkeypatch.setenv("HERMES_SESSION_ID", "s_local")
++    refused = _refuse(tid)
++    assert refused["next_step"] == (f"hermes kanban --board default notify-subscribe {tid} "
++                                    "--platform tui --chat-id s_local")
++    assert refused["run_on"] == "hub"
++
++
++def test_chat_refusal_for_card_on_another_local_profile_names_it(board, tmp_path, monkeypatch):
++    _hub_state(tmp_path, monkeypatch, "hub", [("hub", "work/release/t_rel1")])
++    monkeypatch.setenv("HERMES_SESSION_ID", "s_local")
++    refused = _refuse("t_rel1", board="release")
++    assert refused["next_step"] == ("hermes -p work kanban --board release notify-subscribe t_rel1 "
++                                    "--platform tui --chat-id s_local")
++
++
++def test_worker_refusal_points_at_origin_gateway_cli(board, tmp_path, monkeypatch):
++    _conn, tid = board
++    _hub_state(tmp_path, monkeypatch, "hub", [("hub", f"default/default/{tid}"), ("macbook", "default/default/t_x")])
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_ORIGIN_SESSION", "@session:default@macbook/20261025_234720_c405df")
++    refused = _refuse(tid)
++    assert refused["next_step"] == (f"hermes-hub adopt-task hub default/default/{tid} "
++                                    "--origin-session 20261025_234720_c405df --origin-profile default "
++                                    f"--id adopt:{tid}:20261025_234720_c405df")
++    assert refused["run_on"] == "macbook"
++    assert refused["complete"] is True
++    assert refused["delegate"].startswith("hermes-hub create-task macbook ")
++    assert "--origin-session ''" in refused["delegate"]
++    assert f"--expect hub/default/default/{tid}" in refused["delegate"]
++    assert "kanban_origin_adopt" not in refused["next_step"]
++
++
++def test_worker_refusal_carries_non_default_profiles(board, tmp_path, monkeypatch):
++    """Owner card on profile bb-dev, origin chat on profile personal: both must survive into the command and the
++    links check (a 3-part --expect ref means the default profile)."""
++    _conn, tid = board
++    _hub_state(tmp_path, monkeypatch, "mini", [("mini", f"bb-dev/default/{tid}"), ("macbook", "personal/default/t_y")])
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_PROFILE", "bb-dev")
++    monkeypatch.setenv("HERMES_ORIGIN_SESSION", "@session:personal@macbook/s_mac")
++    refused = _refuse(tid)
++    assert refused["next_step"] == (f"hermes-hub adopt-task mini bb-dev/default/{tid} --origin-session s_mac "
++                                    f"--origin-profile personal --id adopt:{tid}:s_mac")
++    assert f"--expect mini/bb-dev/default/{tid}" in refused["delegate"]
++
++
++def test_worker_refusal_without_known_origin_names_placeholders(board, tmp_path, monkeypatch):
++    _conn, tid = board
++    _hub_state(tmp_path, monkeypatch, "hub", [("hub", f"default/default/{tid}")])
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    refused = _refuse(tid)
++    assert refused["next_step"].startswith(f"hermes-hub adopt-task hub default/default/{tid} --origin-session <origin-session-id>")
++    assert refused["run_on"] == "<origin-gateway>"
++    assert refused["complete"] is False
++    assert refused["delegate"].startswith("hermes-hub create-task <origin-gateway> ")
++
++
++def test_worker_with_origin_on_same_gateway_gets_no_self_addressed_delegate(board, tmp_path, monkeypatch):
++    _conn, tid = board
++    _hub_state(tmp_path, monkeypatch, "hub", [("hub", f"default/default/{tid}")])
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_ORIGIN_SESSION", "@session:default@hub/s_here")
++    refused = _refuse(tid)
++    assert "delegate" not in refused
++    assert refused["next_step"] == f"hermes kanban --board default notify-subscribe {tid} --platform tui --chat-id s_here"
++    assert "cross_session" in refused["error"]
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index a3174fc05b..1baa792519 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1936,8 +1936,16 @@ def _handle_origin_adopt(args: dict, **kw) -> str:
+     _reject_delegated_child_mutation("kanban_origin_adopt")
+     intent = kw.get("origin_intent")
+     if intent is None:
+-        return tool_error("authenticated origin courier context required", code="origin_context_required",
+-                          handoff_complete=False)
++        # Never a dead end: name the supported CLI path (hermes-hub adopt-task) filled in from args. [daveey]
++        from hermes_cli.kanban_origin import adopt_next_step
++        try:
++            hint = adopt_next_step(str(args.get("task_id") or "<task-id>"), str(args.get("board") or "default"))
++        except Exception:
++            logger.debug("kanban_origin_adopt next_step failed", exc_info=True)
++            hint = {}
++        message = hint.pop("message", "")
++        return tool_error(f"authenticated origin courier context required. {message}".strip().rstrip("."),
++                          code="origin_context_required", handoff_complete=False, **hint)
+     from hermes_cli.kanban_origin import OriginError
+     from hermes_cli.kanban_origin_creation import adopt_with_origin
+     if (not isinstance(intent, dict) or not isinstance(intent.get("owner"), dict)
+-- 
+2.55.0
+

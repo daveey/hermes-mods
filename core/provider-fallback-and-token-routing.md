@@ -1,18 +1,18 @@
 # Provider fallback failures and token-unit model routing
 
-Patches **0480**, **0481** (sources `1164b8813f`, `582fab6bfb`) and **0504**, **0520** (`d83286a1bd`, `d56b621070`).
+Patches **0486**, **0487** (sources `1164b8813f`, `582fab6bfb`) and **0511**, **0527** (`d83286a1bd`, `d56b621070`).
 
 ## Behavior
 
 - A fallback ladder that recovers still warns about the entry that failed; a failed fallback is logged and surfaced
-  in cron and in the gateway reply, and the CLI reports a secondary startup failure (0480).
+  in cron and in the gateway reply, and the CLI reports a secondary startup failure (0486).
 - Quota holds need the entire chain to be quota-exhausted: an all-quota chain keeps its classification and the
   earliest window (an invalid hint publishes no window), an all-relogin chain keeps terminal-auth classification,
-  mixed chains inherit neither, an empty chain has none (0480). TUI "not configured" envelopes are produced only for
+  mixed chains inherit neither, an empty chain has none (0486). TUI "not configured" envelopes are produced only for
   a homogeneous chain.
-- Fallback diagnostics are kept within health caps (refactor, 0481).
-- Model-routing context caps compare a token estimate, not UTF-8 bytes (0504); auxiliary class routing does the
-  same, and `title_generation` is served without attested JSON while other tasks still require it (0520).
+- Fallback diagnostics are kept within health caps (refactor, 0487).
+- Model-routing context caps compare a token estimate, not UTF-8 bytes (0511); auxiliary class routing does the
+  same, and `title_generation` is served without attested JSON while other tasks still require it (0527).
 
 ## How it works
 
@@ -35,7 +35,7 @@ entry paths each have a test); `tests/agent/test_model_routing_request_context.p
 
 ## Applying
 
-`git am -3` in number order. 0481 depends on 0480.
+`git am -3` in number order. 0487 depends on 0486.
 
 ## Gotchas
 

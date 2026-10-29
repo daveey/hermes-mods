@@ -1,6 +1,6 @@
 # Kanban: default CLI assignee and stale-triage sweep
 
-Patch **0452** (`34d27c11a0`).
+Patch **0458** (`34d27c11a0`).
 
 ## Behavior
 

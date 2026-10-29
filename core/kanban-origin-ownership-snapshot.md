@@ -23,9 +23,9 @@ It returns the qualified binding generation (version, hash, publication/observat
 
 ## Applying
 
-Patch 0516 (real-home guard accepts linked worktrees) is a prerequisite for running these tests in a linked worktree; 0517 is the feature. Apply in order.
+Patch 0523 (real-home guard accepts linked worktrees) is a prerequisite for running these tests in a linked worktree; 0524 is the feature. Apply in order.
 
-**0593** (source `a2c2b3eba8`), test-only follow-up to the 0516 guard: a read of `<checkout>/../manifest.json` is allowed, because `hermes_bootstrap`'s sealed-payload probe reads that sibling on first import. Writes of that file, and any other sibling, stay refused. Test: `test_payload_manifest_beside_a_guarded_checkout_is_readable_not_writable` in `tests/hermes_cli/test_real_home_tripwire.py`. The same commit's capability-routing PATH isolation is covered in [kanban-capability-routing.md](kanban-capability-routing.md).
+**0589** (source `a2c2b3eba8`), test-only follow-up to the 0523 guard: a read of `<checkout>/../manifest.json` is allowed, because `hermes_bootstrap`'s sealed-payload probe reads that sibling on first import. Writes of that file, and any other sibling, stay refused. Test: `test_payload_manifest_beside_a_guarded_checkout_is_readable_not_writable` in `tests/hermes_cli/test_real_home_tripwire.py`. The same commit's capability-routing PATH isolation is covered in [kanban-capability-routing.md](kanban-capability-routing.md).
 
 ## Gotchas
 

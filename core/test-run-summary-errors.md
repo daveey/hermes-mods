@@ -1,6 +1,6 @@
 # The parallel run summary counts setup errors
 
-Patch **0680** (`ed23639b30`).
+Patch **0689** (`ed23639b30`).
 
 ## Behavior
 
@@ -22,7 +22,7 @@ The terminal `scripts/run_tests.sh` entry point is untested here. Only the paral
 
 ## Applying
 
-`git am -3` 0680. Script plus its unit test.
+`git am -3` 0689. Script plus its unit test.
 
 ## Gotchas
 

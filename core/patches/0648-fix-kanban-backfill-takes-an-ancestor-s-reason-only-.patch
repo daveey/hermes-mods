@@ -1,0 +1,132 @@
+From ede1d69bd11ae97b4c32d40e29735e20029289d6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 06:26:31 +0000
+Subject: [PATCH] fix(kanban): backfill takes an ancestor's reason only from
+ rows written before the copy [daveey]
+
+A copy is always written after the row it copies; an ancestor's same-chat row written later is an
+independent shepherd of that ancestor (often a link added afterwards), not the source. Without the
+ordering check ~150 later shepherd rows on the hub's default board were promoted to origin.
+Dry run on board copies now: runners 54 origin / 255 shepherd, default 859 / 1348.
+---
+ hermes_cli/kanban_db_notify.py                | 45 +++++++++++++------
+ .../test_kanban_notify_inheritance.py         | 24 +++++++++-
+ 2 files changed, 54 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index 62a6eaeaae..2a84f1e6c4 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -306,10 +306,12 @@ def stamp_legacy_hub_sub_provenance(conn: sqlite3.Connection) -> int:
+     Before provenance stamping, the origin binding and hermes-hub shepherd subs were both bare 'hub' rows, and
+     inheritance copied them to children with the CHILD's creation time, so a copied observer looked exactly
+     like a fresh origin binding and kept spreading down the program. Resolve each row through the card graph:
+-    a row whose chat also sits on one of the card's parents or its creator task is an inherited copy and takes
+-    that ancestor's resolved reason; any other row is the card's own, ``origin`` when written within
+-    ``LEGACY_ORIGIN_BIND_WINDOW_S`` of the card's creation, else ``shepherd``. Idempotent and cheap once done
+-    (no unstamped rows left). Returns the number of rows stamped."""
++    a row whose chat also sits on one of the card's parents or its creator task, written no later than the row,
++    is an inherited copy and takes that ancestor's resolved reason; any other row is the card's own, ``origin``
++    when written within ``LEGACY_ORIGIN_BIND_WINDOW_S`` of the card's creation, else ``shepherd``. Known
++    ambiguity: where old code collapsed a copied observer and the same chat's origin binding into one row
++    (``INSERT OR IGNORE``), it is stamped ``shepherd`` (under-inherits, never over-inherits). Idempotent and
++    cheap once done (no unstamped rows left). Returns the number of rows stamped."""
+     rows = conn.execute(
+         "SELECT s.task_id, s.chat_id, s.thread_id, s.created_at AS sub_at, t.created_at AS task_at "
+         "FROM kanban_notify_subs s LEFT JOIN tasks t ON t.id = s.task_id "
+@@ -339,28 +341,43 @@ def stamp_legacy_hub_sub_provenance(conn: sqlite3.Connection) -> int:
+ 
+     resolved: dict[tuple[str, str], str] = {}
+ 
+-    def _stamped(task_id: str, chat_id: str) -> Optional[str]:
++    def _row(task_id: str, chat_id: str) -> Optional[tuple[Optional[str], int]]:
++        """``(reason or None, created_at)`` of the card's hub row for ``chat_id``; None without one."""
++        key = (task_id, chat_id)
++        if key in pending:
++            return None if key not in resolved else (resolved[key], int(pending[key]["sub_at"] or 0))
+         row = conn.execute(
+-            "SELECT delivery_metadata FROM kanban_notify_subs WHERE task_id = ? AND platform = 'hub' AND chat_id = ? "
+-            "ORDER BY thread_id LIMIT 1", (task_id, chat_id)).fetchone()
++            "SELECT delivery_metadata, created_at FROM kanban_notify_subs WHERE task_id = ? AND platform = 'hub' "
++            "AND chat_id = ? ORDER BY thread_id LIMIT 1", (task_id, chat_id)).fetchone()
+         if row is None:
+             return None
+-        return _decode_notify_delivery_metadata(row["delivery_metadata"]).get("reason") or "origin"
++        return (_decode_notify_delivery_metadata(row["delivery_metadata"]).get("reason") or "origin",
++                int(row["created_at"] or 0))
+ 
+     def _resolve(task_id: str, chat_id: str, seen: frozenset) -> Optional[str]:
+         key = (task_id, chat_id)
+         if key in resolved:
+             return resolved[key]
+         if key not in pending:
+-            return _stamped(task_id, chat_id)
+-        inherited = [reason for anc in sorted(_ancestors(task_id)) if anc not in seen
+-                     for reason in [_resolve(anc, chat_id, seen | {task_id})] if reason is not None]
++            got = _row(task_id, chat_id)
++            return got[0] if got else None
++        row = pending[key]
++        sub_at = int(row["sub_at"] or 0)
++        # Only an ancestor row written no later than this one can be its source: a copy is written after the
++        # row it copies. A later same-chat row on an ancestor is an independent shepherd of that ancestor.
++        inherited = []
++        for anc in sorted(_ancestors(task_id)):
++            if anc in seen:
++                continue
++            reason = _resolve(anc, chat_id, seen | {task_id})
++            got = _row(anc, chat_id)
++            if reason is not None and got is not None and got[1] <= sub_at:
++                inherited.append(reason)
+         if inherited:
+-            reason = "origin" if any(r in OWNING_SUB_REASONS for r in inherited) else "shepherd"
++            reason = "shepherd" if all(r in OBSERVER_SUB_REASONS for r in inherited) else "origin"
+         else:
+-            row = pending[key]
+             bound_at_creation = (row["task_at"] is not None and row["sub_at"] is not None
+-                                 and int(row["sub_at"]) <= int(row["task_at"]) + LEGACY_ORIGIN_BIND_WINDOW_S)
++                                 and sub_at <= int(row["task_at"]) + LEGACY_ORIGIN_BIND_WINDOW_S)
+             reason = "origin" if bound_at_creation else "shepherd"
+         resolved[key] = reason
+         return reason
+diff --git a/tests/hermes_cli/test_kanban_notify_inheritance.py b/tests/hermes_cli/test_kanban_notify_inheritance.py
+index 5fb0d30d07..566d0d8dfe 100644
+--- a/tests/hermes_cli/test_kanban_notify_inheritance.py
++++ b/tests/hermes_cli/test_kanban_notify_inheritance.py
+@@ -178,7 +178,8 @@ def test_backfill_stops_legacy_observer_copies_spreading(kanban_home, edge):
+         else:
+             parent = kb.create_task(conn, title="linked", assignee="w")
+             kb.link_tasks(conn, grand, parent)
+-        p_at = kb.get_task(conn, parent).created_at
++        p_at = g_at + 7200  # created after the observer subscribed to the grandparent
++        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (p_at, parent))
+         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (parent,))
+         for chat in ("macbook/default/origin", "macbook/default/observer"):  # what the old code wrote
+             _legacy_hub(conn, parent, chat, p_at)
+@@ -242,3 +243,24 @@ def test_board_open_survives_a_fenced_backfill(kanban_home, monkeypatch):
+         assert _sub_keys(conn, child) == []
+     finally:
+         conn.close()
++
++
++def test_backfill_ignores_ancestor_rows_written_after_the_row(kanban_home):
++    """A copy is written after the row it copies: an ancestor's same-chat row written LATER is not the source,
++    so a late unstamped shepherd on the parent stays a shepherd even when the ancestor's later row is owning."""
++    conn = kbc.connect()
++    try:
++        grand = kb.create_task(conn, title="program", assignee="default")
++        parent = kb.create_task(conn, title="fan-out", assignee="w", creator_task_id=grand)
++        p_at = kb.get_task(conn, parent).created_at
++        _legacy_hub(conn, parent, "macbook/default/x", p_at + 600)
++        conn.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id, created_at, "
++                     "delivery_metadata) VALUES (?, 'hub', 'macbook/default/x', '', ?, '{\"reason\": \"origin\"}')",
++                     (grand, p_at + 5000))
++        conn.commit()
++        assert kbn.stamp_legacy_hub_sub_provenance(conn) == 1
++        assert _reasons(conn, parent) == {"macbook/default/x": "shepherd"}
++        child = kb.create_task(conn, title="next", assignee="w", creator_task_id=parent)
++        assert _sub_keys(conn, child) == []
++    finally:
++        conn.close()
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # Unfinished Kanban visibility and conditional holds
 
-Patch: `0358`. Complements [sidebar-status-stripe.md](sidebar-status-stripe.md).
+Patch: `0359`. Complements [sidebar-status-stripe.md](sidebar-status-stripe.md).
 
 ## Behavior
 

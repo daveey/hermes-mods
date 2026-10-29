@@ -1,0 +1,402 @@
+From 463b78b4e48a1e05838f00bfd02be2e1bf3822c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 08:02:04 -0700
+Subject: [PATCH] fix(serve): re-exec a serve whose checkout moved while it
+ waited out an update [daveey]
+
+A Desktop serve that boots during `hermes update` waits in wait_for_update_clear, but by then
+hermes_cli.main, hermes_cli.config and the provider plugins are already imported and
+get_version_info() is cached (the fireworks plugin reads it at import). David-MBP 2026-10-28:
+serve pid 50733 started 07:02:38, cached commit cc29d783ed by 07:02:39 (the source:git stamp
+still matched HEAD), the checkout moved to 42ea812e27 at 07:02:50, the stamp at 07:03:36, the
+wait cleared at 07:03:40.6, and /api/health reported cc29d783ed for the process's whole life
+while code_skew's boot fingerprint (read after the wait) said 42ea812e27. The stamp lag was not
+the cause: the stamp was current 4 s before the wait cleared.
+
+cmd_dashboard now reads the checkout revision just before the wait. After a wait that ended
+because the update finished, the serve re-execs itself in place (same pid, argv and fds, before
+the one-shot SSH token is read) when the checkout moved during the wait or the cached identity
+names a commit other than HEAD (it moved between launch and the wait). Capped at 2 re-execs;
+POSIX only.
+
+Tests: tests/hermes_cli/test_serve_update_wait_reexec.py runs cmd_dashboard in a child process
+while a fake update moves HEAD then the stamp then releases the marker; /api/health commit must
+equal the code_skew boot fingerprint and HEAD (fails before this change with cc29d783ed).
+---
+ hermes_cli/main.py                            |   8 +-
+ hermes_cli/serve_update_wait.py               | 103 +++++++++
+ tests/hermes_cli/test_serve_update_wait.py    |  10 +
+ .../test_serve_update_wait_reexec.py          | 202 ++++++++++++++++++
+ 4 files changed, 321 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_serve_update_wait_reexec.py
+
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 27246bcea0..a64b435cb2 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -986,6 +986,7 @@ def _read_git_revision_fingerprint(repo_root: Path) -> str | None:
+         return None
+ 
+ 
++
+ def _termux_bundled_skills_fingerprint() -> str:
+     """Cheap invalidation key for Termux bundled-skill startup sync."""
+     git_fp = _read_git_revision_fingerprint(PROJECT_ROOT)
+@@ -2799,9 +2800,12 @@ def cmd_dashboard(args):
+         # [daveey] Never boot a backend on a tree a core update is about to swap: wait out a live
+         # update or hermes-sync's admission hold (bounded, logged) before the one-shot SSH token is
+         # consumed and before the agent stack is imported (hermes_cli/serve_update_wait.py).
+-        from hermes_cli.serve_update_wait import wait_for_update_clear
++        # If the checkout moved while this process waited (or its cached identity is not HEAD),
++        # re-exec in place so the modules and the /api/health commit all come from the new tree.
++        from hermes_cli import serve_update_wait as _update_gate
+ 
+-        wait_for_update_clear()
++        _before_wait = _update_gate.checkout_fingerprint()
++        _update_gate.reexec_if_checkout_moved(_update_gate.wait_for_update_clear(), _before_wait)
+ 
+     _ssh_session_token = _read_ssh_session_token_file(_token_file) if _token_file else None
+     _mcp_discovery_after_bind = _dashboard_prepare_runtime(args, _headless_backend)
+diff --git a/hermes_cli/serve_update_wait.py b/hermes_cli/serve_update_wait.py
+index 0a1c4b8271..0fc7ca38a9 100644
+--- a/hermes_cli/serve_update_wait.py
++++ b/hermes_cli/serve_update_wait.py
+@@ -133,3 +133,106 @@ def wait_for_update_clear(*, update_probe: Optional[Callable[[], bool]] = None,
+                 f"(bound {update_timeout_s if live else hold_timeout_s:.0f}s)")
+             waiting_on = reason
+         sleep(_env_seconds("HERMES_SERVE_UPDATE_POLL_S", POLL_S) or POLL_S)
++
++
++# ── re-exec once the wait is over ─────────────────────────────────────────────────────────────
++#
++# Waiting is not enough on its own. By the time the gate runs, ``hermes_cli.main``, its subcommand
++# parsers, ``hermes_cli.config`` and the bundled provider plugins are already imported, and
++# ``get_version_info()`` is already cached (the fireworks plugin reads it at import, and so does
++# the startup update-debt check). David-MBP 2026-10-28: serve pid 50733 started at 07:02:38.2,
++# filled that cache with cc29d783ed by 07:02:39 (the stamp is ``source: git``, so it is checked
++# against the live HEAD, which was still cc29d783ed then), waited until 07:03:40.6 while the
++# checkout moved to 42ea812e27 at 07:02:50, and then reported ``commit: cc29d783ed`` on
++# ``/api/health`` for its whole life, with old-tree modules loaded next to new ones.
++#
++# So when the checkout moved while this process waited (the revision read just before the wait
++# differs from the one on disk now), or the cached identity names a commit other than HEAD (it moved
++# between launch and the wait), the serve re-execs itself: same pid, same argv, same inherited fds (Desktop's READY pipe), before the one-shot SSH
++# token is read. The new image imports everything, identity included, from the new tree.
++
++REEXEC_ENV = "HERMES_SERVE_REEXEC_COUNT"
++MAX_REEXECS = 2  # a stamp that never matches HEAD must not loop; the skew watchdog still applies
++
++
++def _sha(fingerprint: Optional[str]) -> Optional[str]:
++    if not fingerprint:
++        return None
++    sha = fingerprint.rsplit(":", 1)[-1]
++    return sha if sha and sha != "unresolved" else None
++
++
++def checkout_fingerprint() -> Optional[str]:
++    """The revision of the checkout this process runs from (``hermes_cli.main``'s cheap reader)."""
++    try:
++        from hermes_cli.main import PROJECT_ROOT, _read_git_revision_fingerprint
++
++        return _read_git_revision_fingerprint(PROJECT_ROOT)
++    except Exception:
++        return None
++
++
++def _cached_commit() -> Optional[str]:
++    """The commit ``get_version_info()`` already cached, without filling the cache."""
++    try:
++        from hermes_cli import version_info as vi
++
++        cached = vi._cached_version_info
++        return cached.commit if cached is not None else None
++    except Exception:
++        return None
++
++
++def stale_after_wait(launch_fingerprint: Optional[str], current_fingerprint: Optional[str],
++                     cached_commit: Optional[str]) -> Optional[str]:
++    """Why this process no longer matches the checkout on disk, or ``None`` when it does."""
++    if current_fingerprint is None:
++        return None  # no git checkout to compare with (zip/nix installs): nothing to say
++    if launch_fingerprint is not None and launch_fingerprint != current_fingerprint:
++        return f"the checkout moved from {_sha(launch_fingerprint) or launch_fingerprint} to " \
++               f"{_sha(current_fingerprint) or current_fingerprint} while this backend waited"
++    head = _sha(current_fingerprint)
++    if head and cached_commit and cached_commit != head:
++        return f"its cached code identity is {cached_commit[:10]} but the checkout is at {head[:10]}"
++    return None
++
++
++def reexec_if_checkout_moved(result: str, launch_fingerprint: Optional[str], *,
++                             current_fingerprint: Optional[Callable[[], Optional[str]]] = None,
++                             cached_commit: Optional[Callable[[], Optional[str]]] = None,
++                             execv: Optional[Callable[[str, list], None]] = None,
++                             log: Optional[Callable[[str], None]] = None) -> bool:
++    """After :func:`wait_for_update_clear`: re-exec this serve if the code it loaded is stale.
++
++    Only a wait that ended because the update finished (``"cleared"``) re-execs: with nothing to
++    wait for nothing moved, and after a timeout the update is still running, so a new image would
++    only wait again. Returns False when no re-exec happened (``execv`` replaces the process
++    otherwise; a stub ``execv`` in tests returns True)."""
++    try:
++        count = int(os.environ.pop(REEXEC_ENV, "0") or 0)  # never leaks into the agent's children
++    except ValueError:
++        count = 0
++    if result != "cleared":
++        return False
++    emit = log or _stderr
++    why = stale_after_wait(launch_fingerprint, (current_fingerprint or checkout_fingerprint)(),
++                           (cached_commit or _cached_commit)())
++    if why is None:
++        return False
++    if count >= MAX_REEXECS:
++        emit(f"serve: {why}, but this backend already re-executed {count} times; starting anyway")
++        return False
++    if os.name == "nt":
++        # execv on Windows spawns a new pid, which the client's READY pipe does not follow.
++        emit(f"serve: {why}; cannot re-exec in place on Windows, starting anyway")
++        return False
++    argv = list(getattr(sys, "orig_argv", None) or [sys.executable, *sys.argv])
++    emit(f"serve: {why}; re-executing so this backend runs and reports only the new code")
++    os.environ[REEXEC_ENV] = str(count + 1)
++    for stream in (sys.stdout, sys.stderr):
++        try:
++            stream.flush()
++        except Exception:
++            pass
++    (execv or os.execv)(sys.executable, argv)
++    return True
+diff --git a/tests/hermes_cli/test_serve_update_wait.py b/tests/hermes_cli/test_serve_update_wait.py
+index 609cbac586..79189de23f 100644
+--- a/tests/hermes_cli/test_serve_update_wait.py
++++ b/tests/hermes_cli/test_serve_update_wait.py
+@@ -56,6 +56,16 @@ def serve_harness(monkeypatch):
+     fake_web.start_server = _start_server  # type: ignore[attr-defined]
+     monkeypatch.setitem(sys.modules, "hermes_cli.web_server", fake_web)
+     monkeypatch.setenv("HERMES_SERVE_UPDATE_POLL_S", "0.02")
++    # A fresh serve process: no identity cached by an earlier test. And never exec over pytest:
++    # the re-exec path is exercised for real in a child process below.
++    import hermes_cli.version_info as vi
++    monkeypatch.setattr(vi, "_cached_version_info", None)
++
++    def _no_exec(*_a):
++        raise AssertionError("cmd_dashboard tried to re-exec the test process")
++
++    monkeypatch.setattr(os, "execv", _no_exec)
++    monkeypatch.setattr(suw, "checkout_fingerprint", lambda: "git:refs/heads/main:" + "a" * 40)
+ 
+     args = types.SimpleNamespace(
+         ssh_session_token_file="/nonexistent/token", headless_backend=True, isolated=True,
+diff --git a/tests/hermes_cli/test_serve_update_wait_reexec.py b/tests/hermes_cli/test_serve_update_wait_reexec.py
+new file mode 100644
+index 0000000000..809f159928
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_update_wait_reexec.py
+@@ -0,0 +1,202 @@
++"""[daveey] A serve that waited out a core update must run and report only the new commit.
++
++David-MBP 2026-10-28: Desktop serve pid 50733 started at 07:02:38 during an update. Before its
++update gate ran it had imported ``hermes_cli.main``/``config``/the provider plugins and cached
++``get_version_info()`` (commit cc29d783ed: the ``source: git`` stamp still matched HEAD). The
++checkout moved to 42ea812e27 at 07:02:50, the stamp followed at 07:03:36, the gate cleared at
++07:03:40 and the serve started anyway, reporting ``commit: cc29d783ed`` on ``/api/health`` while
++the code_skew boot fingerprint (read after the wait) said 42ea812e27.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import serve_update_wait as suw
++
++REPO = Path(__file__).resolve().parents[2]
++OLD = "cc29d783ed4fe3aef41b5b84cc2f4e8224b084ee"
++NEW = "42ea812e27cc380c1db74d39ecbf87b98eda5617"
++
++# One serve process, run for real through cmd_dashboard: everything but the update gate, the
++# re-exec, code_skew and /api/health is stubbed. The checkout HEAD, the install stamp and the
++# update marker are files in ``state`` so the test can move them while the serve waits.
++_CHILD = textwrap.dedent("""
++    import asyncio, json, os, sys, threading, time, types
++    from pathlib import Path
++
++    repo, state = sys.argv[1], Path(sys.argv[2])
++    sys.path.insert(0, repo)
++    head, stamp, marker = state / "HEAD", state / "stamp", state / "marker"
++    with open(state / "incarnations", "a") as f:
++        f.write(f"{os.getpid()}\\n")
++
++    def fingerprint(_root=None):
++        return "git:refs/heads/main:" + head.read_text().strip()
++
++    import hermes_cli.main as main_mod
++    main_mod._read_git_revision_fingerprint = fingerprint
++
++    import hermes_cli.version_info as vi
++
++    def info(commit):
++        return vi.VersionInfo("0.0.0", "0.0.0", 0, commit, "main", "git", False, None)
++
++    def stamp_info():  # install-stamp.json, source: git -> trusted only while it names HEAD
++        commit = stamp.read_text().strip()
++        return info(commit) if commit == head.read_text().strip() else None
++
++    vi._stamp_version_info = stamp_info
++    vi._resolve_repo_dir = lambda: Path(repo)
++    vi._git_version_info = lambda _d: info(head.read_text().strip())
++    vi._reset_version_info_cache()  # importing main already cached the real tree's identity:
++    vi.get_version_info()  # cache it from the fake HEAD, as the fireworks plugin import does
++
++    import hermes_cli.serve_update_wait as suw
++    suw.update_live = marker.exists
++    suw.admission_hold_present = lambda: False
++    if marker.exists():  # the update: checkout move, then the stamp, then the marker release
++        def update():
++            time.sleep(0.3); head.write_text(sys.argv[3])
++            time.sleep(0.3); stamp.write_text(sys.argv[3])
++            time.sleep(0.2); marker.unlink()
++        threading.Thread(target=update, daemon=True).start()
++
++    for name in ("_dashboard_lifecycle_flags", "_dashboard_sanitize_desktop_env", "_attach_to_host_backend",
++                 "_route_named_profile_dashboard", "_maybe_setup_dashboard_auth_interactively"):
++        setattr(main_mod, name, lambda *a, **k: None)
++    main_mod._dashboard_validate_serve_args = lambda *a, **k: "nonce"
++    main_mod._dashboard_prepare_runtime = lambda *a, **k: False
++    main_mod._ssh_bootstrap_server_kwargs = lambda *a, **k: {}
++
++    def read_token(_path):
++        with open(state / "token_reads", "a") as f:
++            f.write(f"{os.getpid()}\\n")
++        return "tok"
++
++    main_mod._read_ssh_session_token_file = read_token
++    import hermes_cli.resource_limits as rl
++    rl.apply_nofile_soft_limit = lambda: None
++    import hermes_cli.observability.shared_metrics_process as smp
++    smp.begin_process = lambda *a, **k: None
++
++    def start_server(**_kw):
++        from gateway import code_skew
++        code_skew.record_boot_fingerprint()  # what the web_server lifespan does
++        from hermes_cli.web_routers import status
++        health = asyncio.run(status.get_health())
++        (state / "result.json").write_text(json.dumps({
++            "health_commit": health["commit"], "boot": code_skew._boot_fingerprint,
++            "head": head.read_text().strip(), "pid": os.getpid()}))
++
++    web = types.ModuleType("hermes_cli.web_server")
++    web.start_server = start_server
++    web.app = types.SimpleNamespace(state=types.SimpleNamespace(auth_required=False))
++    sys.modules["hermes_cli.web_server"] = web
++
++    main_mod.cmd_dashboard(types.SimpleNamespace(
++        ssh_session_token_file=str(state / "token"), headless_backend=True, isolated=True,
++        host="127.0.0.1", port=0, no_open=True, insecure=False, open_profile=""))
++""")
++
++
++def _run_serve(tmp_path, *, update_running: bool, new: str = NEW):
++    state = tmp_path / "state"
++    state.mkdir()
++    (state / "HEAD").write_text(OLD)
++    (state / "stamp").write_text(OLD)
++    if update_running:
++        (state / "marker").write_text("update")
++    script = tmp_path / "serve_child.py"
++    script.write_text(_CHILD)
++    home = tmp_path / "home"
++    home.mkdir()
++    env = {k: v for k, v in os.environ.items() if k != "HERMES_SERVE_REEXEC_COUNT"}
++    env.update(HERMES_HOME=str(home), HERMES_SERVE_UPDATE_POLL_S="0.05")
++    proc = subprocess.run([sys.executable, str(script), str(REPO), str(state), new],
++                          env=env, capture_output=True, text=True, timeout=120)
++    assert proc.returncode == 0, proc.stderr[-4000:]
++    result = json.loads((state / "result.json").read_text())
++    incarnations = (state / "incarnations").read_text().split()
++    token_reads = (state / "token_reads").read_text().split()
++    return result, incarnations, token_reads, proc.stderr
++
++
++@pytest.mark.skipif(os.name == "nt", reason="re-exec in place is POSIX only")
++def test_serve_that_waited_out_an_update_reports_the_commit_it_runs(tmp_path):
++    result, incarnations, token_reads, stderr = _run_serve(tmp_path, update_running=True)
++
++    assert result["head"] == NEW
++    assert result["boot"].rsplit(":", 1)[-1] == NEW, "code_skew boot fingerprint is not HEAD"
++    assert result["health_commit"] == NEW, (
++        f"/api/health reports {result['health_commit'][:10]} after the checkout moved to {NEW[:10]}")
++    # In place: same pid (Desktop's READY pipe and process handle stay valid), one re-exec,
++    # and the one-shot SSH token was read once, by the new image only.
++    assert len(incarnations) == 2 and len(set(incarnations)) == 1 == len(set(token_reads))
++    assert token_reads == incarnations[:1]
++    assert "re-executing" in stderr
++
++
++@pytest.mark.skipif(os.name == "nt", reason="re-exec in place is POSIX only")
++def test_serve_with_no_update_does_not_reexec(tmp_path):
++    result, incarnations, token_reads, stderr = _run_serve(tmp_path, update_running=False)
++    assert result["health_commit"] == result["head"] == OLD
++    assert len(incarnations) == 1 and len(token_reads) == 1
++    assert "re-executing" not in stderr
++
++
++# ── the decision itself ───────────────────────────────────────────────────────────────────────
++
++FP_OLD, FP_NEW = f"git:refs/heads/main:{OLD}", f"git:refs/heads/main:{NEW}"
++
++
++def _decide(result, launch, current, cached, monkeypatch, count=None):
++    if count is None:
++        monkeypatch.delenv(suw.REEXEC_ENV, raising=False)
++    else:
++        monkeypatch.setenv(suw.REEXEC_ENV, str(count))
++    calls, lines = [], []
++    out = suw.reexec_if_checkout_moved(result, launch, current_fingerprint=lambda: current,
++                                       cached_commit=lambda: cached,
++                                       execv=lambda exe, argv: calls.append((exe, argv)),
++                                       log=lines.append)
++    return out, calls, lines
++
++
++@pytest.mark.parametrize("launch,cached", [(FP_OLD, OLD), (FP_OLD, None), (FP_NEW, OLD)])
++def test_checkout_moved_or_identity_stale_reexecs(monkeypatch, launch, cached):
++    monkeypatch.setattr(os, "name", "posix")
++    out, calls, lines = _decide("cleared", launch, FP_NEW, cached, monkeypatch)
++    assert out is True and len(calls) == 1
++    assert calls[0][0] == sys.executable
++    assert os.environ[suw.REEXEC_ENV] == "1"
++    assert any("re-executing" in line for line in lines)
++
++
++@pytest.mark.parametrize("result", ["clear", "update-timeout", "hold-timeout"])
++def test_no_reexec_unless_the_wait_saw_the_update_finish(monkeypatch, result):
++    out, calls, _ = _decide(result, FP_OLD, FP_NEW, OLD, monkeypatch)
++    assert out is False and calls == []
++
++
++def test_no_reexec_when_nothing_moved_or_no_checkout(monkeypatch):
++    assert _decide("cleared", FP_NEW, FP_NEW, NEW, monkeypatch)[:2] == (False, [])
++    assert _decide("cleared", FP_NEW, FP_NEW, None, monkeypatch)[:2] == (False, [])
++    assert _decide("cleared", None, None, OLD, monkeypatch)[:2] == (False, [])
++
++
++def test_reexec_is_capped_and_the_counter_never_leaks(monkeypatch):
++    monkeypatch.setattr(os, "name", "posix")
++    out, calls, lines = _decide("cleared", FP_OLD, FP_NEW, OLD, monkeypatch, count=suw.MAX_REEXECS)
++    assert out is False and calls == []
++    assert any("starting anyway" in line for line in lines)
++    assert suw.REEXEC_ENV not in os.environ
++    _decide("clear", FP_NEW, FP_NEW, NEW, monkeypatch, count=1)
++    assert suw.REEXEC_ENV not in os.environ
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # Session list previews are computed for the page rows only
 
-Patch **0554** (source `4c32c4aad3`).
+Patch **0533** (source `4c32c4aad3`).
 
 ## Behavior
 

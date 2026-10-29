@@ -1,0 +1,208 @@
+From a38da79f8aa3e896eb48e418327fe2ba25049434 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 02:52:11 +0000
+Subject: [PATCH] [daveey] kanban tools: database errors carry a hint naming
+ the safe fallback (self-heal agent-6eb3a51e94)
+
+A bare 'kanban_show: disk I/O error' left an agent with no route; it wrote the live
+board with raw sqlite3 and deleted its -shm/.corrupt.*.bak files. sqlite3.DatabaseError
+and KanbanDbCorruptError now return a 'hint': retry once, then 'hermes kanban [--board b]
+<verb>' in a fresh process, never raw writes or deleting board files, 'recover' when
+integrity_check fails, block if the CLI fails too. Other errors are unchanged.
+---
+ tests/tools/test_kanban_db_error_hint.py | 82 ++++++++++++++++++++++++
+ tools/kanban_tools.py                    |  5 +-
+ tools/kanban_tools_db_hint.py            | 69 ++++++++++++++++++++
+ 3 files changed, 153 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tools/test_kanban_db_error_hint.py
+ create mode 100644 tools/kanban_tools_db_hint.py
+
+diff --git a/tests/tools/test_kanban_db_error_hint.py b/tests/tools/test_kanban_db_error_hint.py
+new file mode 100644
+index 0000000000..4fba24d80a
+--- /dev/null
++++ b/tests/tools/test_kanban_db_error_hint.py
+@@ -0,0 +1,82 @@
++"""A kanban tool whose board raises a SQLite error must name the safe fallback (self-heal agent-6eb3a51e94).
++
++On 2026-10-27 five kanban_* calls returned a bare ``kanban_show: disk I/O error``. With no next step the agent
++wrote the live board with raw ``sqlite3`` (INSERT/UPDATE) and deleted its ``-shm`` and ``.corrupt.*.bak``
++files. The error now carries a ``hint``: retry once, then ``hermes kanban <verb>`` in a fresh process, never
++raw sqlite3 writes or deleting the board's files, ``hermes kanban recover`` when the integrity check fails,
++block when the CLI fails too.
++"""
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++
++@pytest.fixture
++def board_raises(monkeypatch, tmp_path):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(key, raising=False)
++    from tools import kanban_tools
++
++    def install(exc):
++        def _broken(*_a, **_k):
++            raise exc
++        monkeypatch.setattr(kanban_tools, "_board", _broken)
++    return install
++
++
++def _dispatch(name, args):
++    from tools import kanban_tools  # registers the handlers
++    from tools.registry import registry
++    return json.loads(registry.dispatch(name, args))
++
++
++def _assert_safe_hint(result):
++    hint = result.get("hint") or ""
++    assert hint, result
++    assert "hermes kanban" in hint
++    assert "hermes kanban recover" in hint
++    assert "sqlite3" in hint and "never" in hint.lower()
++    assert "-shm" in hint and ".corrupt" in hint
++    assert "kanban_block" in hint or "block" in hint.lower()
++
++
++def test_disk_io_error_on_show_carries_the_cli_fallback_hint(board_raises):
++    board_raises(sqlite3.OperationalError("disk I/O error"))
++    result = _dispatch("kanban_show", {"task_id": "t_x"})
++    assert "disk I/O error" in result["error"]
++    _assert_safe_hint(result)
++    assert "hermes kanban show t_x" in result["hint"]
++
++
++def test_disk_io_error_on_comment_names_the_comment_verb(board_raises):
++    board_raises(sqlite3.OperationalError("disk I/O error"))
++    result = _dispatch("kanban_comment", {"task_id": "t_x", "body": "note"})
++    _assert_safe_hint(result)
++    assert "hermes kanban comment" in result["hint"]
++
++
++def test_database_error_and_corrupt_board_carry_the_hint(board_raises):
++    board_raises(sqlite3.DatabaseError("database disk image is malformed"))
++    _assert_safe_hint(_dispatch("kanban_show", {"task_id": "t_x"}))
++    from hermes_cli.kanban_db_connect import KanbanDbCorruptError
++    board_raises(KanbanDbCorruptError(Path("/x/kanban.db"), None, "integrity_check failed"))
++    _assert_safe_hint(_dispatch("kanban_list", {}))
++
++
++def test_named_board_hint_puts_the_board_flag_before_the_verb(board_raises):
++    board_raises(sqlite3.OperationalError("disk I/O error"))
++    result = _dispatch("kanban_show", {"task_id": "t_x", "board": "ops"})
++    assert "hermes kanban --board ops show t_x" in result["hint"]
++    assert "hermes kanban --board ops recover" in result["hint"]
++
++
++def test_other_errors_get_no_db_hint(board_raises):
++    board_raises(ValueError("unknown board 'nope'"))
++    result = _dispatch("kanban_show", {"task_id": "t_x"})
++    assert "hint" not in result, result
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 5497208ade..8037c100cc 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -22,6 +22,7 @@ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+ from hermes_cli import kanban_overlap
+ from tools.kanban_tools_placement import _marker_placement_fields, _placement_refused, _runs_where
++from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+@@ -247,9 +248,7 @@ def _kanban_handler(tool_name: str, *, classify_rejections: bool = False) -> Cal
+ 
+                 if not isinstance(e, ValueError):
+                     logger.exception(f"{tool_name} failed")
+-                if classify_rejections:
+-                    return tool_error(f"{tool_name}: {e}", rejection="error")
+-                return tool_error(f"{tool_name}: {e}")
++                return generic_tool_error(tool_name, args, e, classify_rejections)
+         return wrapper
+     return deco
+ 
+diff --git a/tools/kanban_tools_db_hint.py b/tools/kanban_tools_db_hint.py
+new file mode 100644
+index 0000000000..ee9a853f76
+--- /dev/null
++++ b/tools/kanban_tools_db_hint.py
+@@ -0,0 +1,69 @@
++"""Kanban tool error bodies: the safe next step when the board's database fails. [daveey]
++
++A bare ``kanban_show: disk I/O error`` once left an agent with no route, and it wrote the live board with raw
++``sqlite3`` (INSERT/UPDATE) and deleted its ``-shm`` and ``.corrupt.*.bak`` files (self-heal agent-6eb3a51e94).
++A SQLite failure now carries a ``hint``: retry once, then the same change through ``hermes kanban <verb>`` in a
++fresh process, never raw writes or deleting the board's files, ``hermes kanban recover`` when the integrity
++check fails, block when the CLI fails too.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++from tools.registry import tool_error
++
++# Tool -> CLI verb with its arguments, for the hint. Unlisted tools use their own name minus ``kanban_``.
++_CLI_ARGS = {
++    "kanban_show": "show {task_id}",
++    "kanban_comment": 'comment {task_id} "<body>"',
++    "kanban_unblock": "unblock {task_id}",
++    "kanban_block": 'block {task_id} "<reason>"',
++    "kanban_complete": 'complete {task_id} --summary "<summary>"',
++    "kanban_create": 'create "<title>" --assignee <profile>',
++    "kanban_list": "list",
++    "kanban_link": "link {parent_id} {child_id}",
++    "kanban_unlink": "unlink {parent_id} {child_id}",
++    "kanban_heartbeat": "heartbeat {task_id}",
++    "kanban_request_review": 'request-review {task_id} --summary "<summary>"',
++}
++
++
++def _is_db_failure(exc: BaseException) -> bool:
++    if isinstance(exc, sqlite3.DatabaseError):  # OperationalError ("disk I/O error"), "malformed", ...
++        return True
++    from hermes_cli.kanban_db_connect import KanbanDbCorruptError
++    return isinstance(exc, KanbanDbCorruptError)
++
++
++def db_error_hint(tool_name: str, args: dict, exc: BaseException) -> Optional[str]:
++    """The fallback procedure for a board whose database failed, or None for any other error."""
++    if not _is_db_failure(exc):
++        return None
++    args = args if isinstance(args, dict) else {}
++    board = str(args.get("board") or "").strip()
++    cli = f"hermes kanban --board {board}" if board else "hermes kanban"
++    template = _CLI_ARGS.get(tool_name, tool_name.removeprefix("kanban_").replace("_", "-") + " ...")
++    fields = {"task_id": args.get("task_id") or "<id>", "parent_id": args.get("parent_id") or "<parent>",
++              "child_id": args.get("child_id") or "<child>"}
++    verb = template.format(**fields)
++    return (
++        f"The board's database failed in this process. 1) Retry this call once. 2) If it fails again, make the "
++        f"same change with the CLI in a fresh process: `{cli} {verb}` (the terminal tool). 3) Never write "
++        "kanban.db with sqlite3 (INSERT/UPDATE/DELETE) and never delete its -wal, -shm or .corrupt.*.bak files: "
++        "that bypasses the board's transitions and corrupts it under open connections. 4) If "
++        "`sqlite3 -readonly <board>/kanban.db 'pragma integrity_check'` does not print ok, run "
++        f"`{cli} recover` (one owner; a second run names the holder). 5) If the CLI fails too, stop and "
++        "kanban_block with the error text."
++    )
++
++
++def generic_tool_error(tool_name: str, args: dict, exc: BaseException, classify_rejections: bool) -> str:
++    """The error body for an unclassified handler failure: ``<tool>: <exc>``, a ``rejection`` class when the
++    tool classifies rejections, and the database-fallback ``hint`` when the board's database failed."""
++    extra: dict = {"rejection": "error"} if classify_rejections else {}
++    hint = db_error_hint(tool_name, args, exc)
++    if hint:
++        extra["hint"] = hint
++    return tool_error(f"{tool_name}: {exc}", **extra)
+-- 
+2.55.0
+

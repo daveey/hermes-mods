@@ -1,0 +1,139 @@
+From a9a6fa2de60a1ed1a5e54415b1224c464607b481 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 16:04:43 +0000
+Subject: [PATCH] fix(kanban): keep `kanban create --json` output parseable
+ when it warns about an unlinked card [daveey]
+
+run_slash appended create's stderr "not linked to any chat" warning after
+the JSON object, so json.loads failed (test_cli_create_runs_on, run from an
+agent shell). --json now returns stdout only via run_slash; create carries
+the warning in a "warning" field (and still prints it to stderr on the CLI).
+The hermetic test env also drops HERMES_SESSION_ID/HERMES_RPC_SOCKET/
+HERMES_KERNEL_SENTINEL, the agent-invoked markers it still leaked.
+---
+ hermes_cli/kanban.py                | 18 +++++++---
+ tests/_fixtures/env_filter.py       |  6 ++++
+ tests/hermes_cli/test_kanban_cli.py | 51 +++++++++++++++++++++++++++++
+ 3 files changed, 70 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e4e2fa06fa..f5a1a7d978 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -478,17 +478,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             from hermes_cli.kanban_capability_routing import preflight
+             placement = preflight(conn, task_id, board=getattr(args, "board", None))
+         task = kb.get_task(conn, task_id)
++    unlinked_warning = None
+     if not in_worker and not session_id and not idem_hit and _agent_invoked():
+         # An agent shelled out but no chat could be stamped (unknown/missing session env:
+         # ssh to another host, `env -i`, another profile...). Say so loudly: an unlinked card
+         # silently never shows in the chat's task strip or sidebar badge. [daveey]
+-        print(f"⚠  {task_id} is not linked to any chat (no known HERMES_SESSION_KEY/ID in this "
+-              "environment), so it won't show in the chat's task strip. Create cards with the "
+-              "kanban_create tool instead, or link it to the chat: "
+-              f"hermes kanban notify-subscribe {task_id} --platform tui --chat-id <session_id>",
+-              file=sys.stderr)
++        unlinked_warning = (
++            f"{task_id} is not linked to any chat (no known HERMES_SESSION_KEY/ID in this "
++            "environment), so it won't show in the chat's task strip. Create cards with the "
++            "kanban_create tool instead, or link it to the chat: "
++            f"hermes kanban notify-subscribe {task_id} --platform tui --chat-id <session_id>")
++        print(f"⚠  {unlinked_warning}", file=sys.stderr)
+     if getattr(args, "json", False):
+         out = _task_to_dict(task)
++        if unlinked_warning:  # also in the payload: run_slash returns only stdout for --json
++            out["warning"] = unlinked_warning
+         if origin_binding:
+             out["origin_binding"] = origin_binding
+         if placement:
+@@ -1845,6 +1849,10 @@ def run_slash(rest: str) -> str:
+             print(f"error: {exc}", file=sys.stderr)
+ 
+     out, err = buf_out.getvalue().rstrip(), buf_err.getvalue().rstrip()
++    if out and getattr(args, "json", False):
++        # --json callers parse the result: stderr diagnostics would make it invalid JSON, so
++        # they stay out of it (commands that warn put the warning in the payload). [daveey]
++        return out
+     if err and out:
+         return f"{out}\n{err}"
+     return err if err else (out or "(no output)")
+diff --git a/tests/_fixtures/env_filter.py b/tests/_fixtures/env_filter.py
+index 455f16b422..efebcc0011 100644
+--- a/tests/_fixtures/env_filter.py
++++ b/tests/_fixtures/env_filter.py
+@@ -158,6 +158,12 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
+     "HERMES_SESSION_THREAD_ID",
+     "HERMES_SESSION_SOURCE",
+     "HERMES_SESSION_KEY",
++    # Also agent-session markers (``hermes_cli.kanban._AGENT_ENV_MARKERS``): a test run from an
++    # agent shell or execute_code kernel otherwise takes the CLI's agent-invoked path (e.g. the
++    # "not linked to any chat" warning on ``kanban create``) that CI never sees.
++    "HERMES_SESSION_ID",
++    "HERMES_RPC_SOCKET",
++    "HERMES_KERNEL_SENTINEL",
+     "HERMES_GATEWAY_SESSION",
+     "HERMES_CRON_SESSION",
+     "_HERMES_GATEWAY",
+diff --git a/tests/hermes_cli/test_kanban_cli.py b/tests/hermes_cli/test_kanban_cli.py
+index 8617aa85d0..1572e9ee2e 100644
+--- a/tests/hermes_cli/test_kanban_cli.py
++++ b/tests/hermes_cli/test_kanban_cli.py
+@@ -315,3 +315,54 @@ def test_cli_block_agent_owned_allowed_with_wake_check(kanban_home):
+         assert kb.get_task(conn, tid).status == "scheduled"
+         row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()
+         assert row is not None and row["cmd"] == "test -f /tmp/x"
++
++
++# ---------------------------------------------------------------------------
++# --json stays machine-readable when create warns about an unlinked card
++# ---------------------------------------------------------------------------
++
++
++def _create_unlinked_from_agent(monkeypatch, *flags):
++    # An agent shell whose session can't be stamped: an unknown HERMES_SESSION_ID marks the
++    # call agent-invoked, but no chat links the card, so create warns.
++    monkeypatch.setenv("HERMES_SESSION_ID", "no-such-session")
++    return kc.run_slash('create "agent card" --assignee default ' + " ".join(flags))
++
++
++def test_create_json_via_slash_is_pure_json_with_unlinked_warning_field(kanban_home, monkeypatch):
++    out = _create_unlinked_from_agent(monkeypatch, "--json")
++    payload = json.loads(out)  # nothing appended after the object
++    assert payload["id"].startswith("t_")
++    assert "is not linked to any chat" in payload["warning"]
++    assert payload["id"] in payload["warning"]
++
++
++def test_create_json_cli_keeps_stdout_pure_and_warns_on_stderr(kanban_home, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_SESSION_ID", "no-such-session")
++    parser = argparse.ArgumentParser()
++    kc.build_parser(parser.add_subparsers(dest="_top"))
++    args = parser.parse_args(["kanban", "create", "agent card", "--assignee", "default", "--json"])
++    kc.kanban_command(args)
++    captured = capsys.readouterr()
++    payload = json.loads(captured.out)
++    assert "is not linked to any chat" in payload["warning"]
++    assert "is not linked to any chat" in captured.err
++
++
++def test_create_text_mode_still_shows_unlinked_warning(kanban_home, monkeypatch):
++    out = _create_unlinked_from_agent(monkeypatch)
++    assert out.startswith("Created t_")
++    assert "is not linked to any chat" in out
++
++
++def test_create_json_without_warning_has_no_warning_field(kanban_home, monkeypatch):
++    for name in kc._AGENT_ENV_MARKERS:
++        monkeypatch.delenv(name, raising=False)
++    payload = json.loads(kc.run_slash('create "plain card" --assignee default --json'))
++    assert "warning" not in payload
++
++
++def test_hermetic_env_drops_agent_session_markers():
++    # A test run launched from an agent shell or kernel must not look agent-invoked.
++    import os
++    assert not any(os.environ.get(n) for n in kc._AGENT_ENV_MARKERS), kc._AGENT_ENV_MARKERS
+-- 
+2.55.0
+

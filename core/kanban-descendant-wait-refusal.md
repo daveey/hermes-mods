@@ -1,6 +1,6 @@
 # Refuse waits on a card's own descendants
 
-Patch 0641 (`653386ca43`).
+Patch 0650 (`653386ca43`).
 
 ## Behavior
 
@@ -20,7 +20,7 @@ New cases in `tests/hermes_cli/test_kanban_awaiting.py` exercise inferred child 
 
 ## Applying
 
-Apply 0641 after no-producer-no-park and continuation patches with `git am -3`.
+Apply 0650 after no-producer-no-park and continuation patches with `git am -3`.
 
 ## Gotchas
 

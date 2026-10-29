@@ -1,0 +1,324 @@
+From 945b93122693b37e42556f1a9395c75b94db5f57 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 18:27:42 +0000
+Subject: [PATCH] fix(tests): picker and test paths no longer block on live
+ models.dev/portal; update re-prepares the retirement fence [daveey]
+
+CI run 40724540437 (main d55299af) Python shards failed or flaked on five
+network- or race-dependent tests. Each was reproduced deterministically.
+
+- providers.is_aggregator() fetched models.dev in the foreground on a cold
+  cache, although the flag only comes from HERMES_OVERLAYS. The picker's
+  read path (_strip_aggregator_overlaps) blocked 7-10s in CI. It is now
+  cache-only. The test asserts on the request thread with no network lookup
+  instead of a 2s wall clock, and it fails red on the base.
+- test_multiplex_tool_cache_scope: A's native-vision verdict came from the
+  live models.dev catalog; it is pinned to a fixture catalog.
+- test_config_rmw_lock: switch_model's catalog lookups fetched models.dev
+  inside the writer's lock span (a 31s fetch reproduces 'first writer never
+  reached save_config'). The tests now run with models.dev offline.
+- test_connector_accounts_rpc: an account connect minted a guest identity
+  LIVE against portal.nousresearch.com ('no reply' under a slow portal).
+  ensure_guest_identity is stubbed, as in test_connector_account_surface.
+- dashboard_procs._await_background_reviews: a review ending between a
+  refused prepare and the idle probe stopped the backend without committing
+  the fence. One re-prepare now commits it, with scripted tests for the
+  retry and its one-retry bound. The stand-in backend's event log is locked
+  and written atomically.
+---
+ hermes_cli/dashboard_procs.py                 |  9 +++
+ hermes_cli/providers.py                       |  8 ++-
+ tests/hermes_cli/test_config_rmw_lock.py      |  9 +++
+ tests/hermes_cli/test_inventory_pricing.py    | 44 ++++++++++---
+ .../test_update_stale_dashboard_review.py     | 66 ++++++++++++++++++-
+ .../tools/test_multiplex_tool_cache_scope.py  |  9 +++
+ .../test_connector_accounts_rpc.py            |  5 ++
+ 7 files changed, 137 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_cli/dashboard_procs.py b/hermes_cli/dashboard_procs.py
+index 7c5a5c3ae3..26b14d8a63 100644
+--- a/hermes_cli/dashboard_procs.py
++++ b/hermes_cli/dashboard_procs.py
+@@ -680,6 +680,11 @@ def _await_background_reviews(pids: list[int]) -> None:
+     started = _time.monotonic()
+     deadline = started + _review_retire_deadline_s()
+     waited: set[int] = set()
++    # A refused prepare followed by a non-review idle answer, after a review was seen: the review
++    # most likely ended between the two requests (or the idle GET timed out). Re-prepare on the
++    # next pass instead of stopping unfenced, so the commit still bars a new turn/review from
++    # starting before the stop. One retry per non-review answer; a review answer re-arms it.
++    retried: set[int] = set()
+     while pending:
+         for pid, endpoint in list(pending.items()):
+             permit = _retirement_request(endpoint, {"action": "prepare"}) or {}
+@@ -696,8 +701,12 @@ def _await_background_reviews(pids: list[int]) -> None:
+                 continue
+             detail = str(((_retirement_request(endpoint, None) or {}).get("detail")) or "")
+             if not detail.startswith("background_review:"):
++                if pid in waited and pid not in retried:
++                    retried.add(pid)
++                    continue
+                 del pending[pid]  # nothing a wait protects (or an old backend): stop as before
+                 continue
++            retried.discard(pid)
+             if pid not in waited:
+                 waited.add(pid)
+                 from hermes_cli.backend_retirement import BACKGROUND_REVIEW_WAIT_S
+diff --git a/hermes_cli/providers.py b/hermes_cli/providers.py
+index f67d6810c3..7d50808436 100644
+--- a/hermes_cli/providers.py
++++ b/hermes_cli/providers.py
+@@ -260,11 +260,15 @@ def get_label(provider_id: str) -> str:
+ 
+ 
+ def is_aggregator(provider: str) -> bool:
+-    """Return True when the provider is a multi-model aggregator."""
++    """Return True when the provider is a multi-model aggregator.
++
++    Never touches the network: the flag comes from ``HERMES_OVERLAYS`` (models.dev carries no
++    aggregator field), so a cold models.dev cache must not turn this predicate into a blocking
++    foreground fetch on read paths such as the picker payload (``_strip_aggregator_overlaps``)."""
+     provider_norm = normalize_provider(provider or "")
+     if provider_norm.startswith("custom:"):
+         return True
+-    pdef = get_provider(provider_norm)
++    pdef = get_provider(provider_norm, allow_network=False)
+     return pdef.is_aggregator if pdef else False
+ 
+ 
+diff --git a/tests/hermes_cli/test_config_rmw_lock.py b/tests/hermes_cli/test_config_rmw_lock.py
+index 5cf6459e68..028572ada3 100644
+--- a/tests/hermes_cli/test_config_rmw_lock.py
++++ b/tests/hermes_cli/test_config_rmw_lock.py
+@@ -28,6 +28,15 @@ def client(monkeypatch, _isolate_hermes_home):
+     from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
+ 
+     monkeypatch.setattr("hermes_cli.model_cost_guard.expensive_model_warning", lambda *_a, **_k: None)
++    # The sandboxed home has no models.dev cache, so switch_model's catalog lookups
++    # (get_label, get_model_capabilities/get_model_info with allow_network=True) fetch it live
++    # inside the writer's lock span. A slow models.dev in CI kept the first writer from reaching
++    # save_config within the race helper's 30s wait. These tests are about lock serialization:
++    # run them offline (fetch fails fast, the catalog backoff arms, nothing else changes).
++    def _offline(*_a, **_k):
++        raise OSError("models.dev is offline in this test")
++
++    monkeypatch.setattr("agent.models_dev._fetch_models_dev_from_network", _offline)
+     cfg = load_config()
+     cfg["model"] = {"provider": "openrouter", "default": "openai/gpt-5.5"}
+     save_config(cfg)
+diff --git a/tests/hermes_cli/test_inventory_pricing.py b/tests/hermes_cli/test_inventory_pricing.py
+index e2a4414f19..e5ec508d9e 100644
+--- a/tests/hermes_cli/test_inventory_pricing.py
++++ b/tests/hermes_cli/test_inventory_pricing.py
+@@ -6,7 +6,6 @@ same way the `hermes model` CLI picker does.
+ """
+ 
+ from threading import Event
+-from time import monotonic
+ 
+ import pytest
+ 
+@@ -108,17 +107,39 @@ def test_apply_pricing_omits_sale_when_original_not_cheaper(monkeypatch):
+ 
+ 
+ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch):
+-    """A cold pricing endpoint must not delay the first picker payload."""
++    """A cold pricing endpoint (or a cold models.dev cache) must not delay the first picker payload.
++
++    Event/thread based, not wall-clock: any blocking pricing fetch or network lookup made on the
++    request thread is recorded, and the background prewarm is awaited on an Event."""
++    import socket
++    import threading
++
++    request_thread = threading.get_ident()
++    on_request_path: list[str] = []
+     fetch_started = Event()
+     release_fetch = Event()
+ 
+-    def fake_pricing(_slug, *, force_refresh=False, cached_only=False):
++    def fake_pricing(slug, *, force_refresh=False, cached_only=False):
+         if cached_only:
+             return {}
++        if threading.get_ident() == request_thread:
++            on_request_path.append(f"pricing fetch: {slug}")
++            return {}
+         fetch_started.set()
+-        release_fetch.wait(timeout=5)
++        release_fetch.wait(timeout=30)
+         return {}
+ 
++    real_getaddrinfo = socket.getaddrinfo
++
++    def guarded_getaddrinfo(host, *args, **kwargs):
++        # Every outbound fetch resolves its host first (requests/urllib3, hermes_bootstrap's
++        # happy-eyeballs connect). A cold models.dev registry fetched in the foreground by
++        # providers.is_aggregator() blocked a CI picker for 7-10s here.
++        if threading.get_ident() == request_thread:
++            on_request_path.append(f"network lookup: {host}")
++            raise OSError("network is off the request path in this test")
++        return real_getaddrinfo(host, *args, **kwargs)
++
+     row = {
+         "slug": "openrouter",
+         "name": "OpenRouter",
+@@ -137,9 +158,15 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
+     monkeypatch.setattr(inv, "_apply_capabilities", lambda _rows, **_kwargs: None)
+     monkeypatch.setattr(inv, "_apply_featured", lambda _rows, **_kwargs: None)
+     monkeypatch.setattr(inv, "_pricing_prewarm_threads", {})
++    # Cold models.dev: no memory cache, no disk cache in the sandboxed HERMES_HOME.
++    from agent import models_dev
++
++    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
++    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
++    monkeypatch.setattr(models_dev, "_models_dev_retry_after", 0)
++    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+ 
+     try:
+-        started_at = monotonic()
+         payload = inv.build_model_options_payload(
+             inv.ConfigContext(
+                 current_provider="openrouter",
+@@ -149,16 +176,15 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
+                 custom_providers=[],
+             )
+         )
+-        elapsed = monotonic() - started_at
+         assert payload["providers"][0]["slug"] == "openrouter"
+         assert "pricing" not in payload["providers"][0]
+-        assert elapsed < 2.0, f"cold picker blocked for {elapsed:.2f}s"
+-        assert fetch_started.wait(timeout=1), "pricing should prewarm in the background"
++        assert on_request_path == [], f"cold picker blocked on: {on_request_path}"
++        assert fetch_started.wait(timeout=30), "pricing should prewarm in the background"
+     finally:
+         threads = list(inv._pricing_prewarm_threads.values())
+         release_fetch.set()
+         for thread in threads:
+-            thread.join(timeout=2)
++            thread.join(timeout=30)
+ 
+ 
+ def test_cold_nous_entitlement_keeps_models_unselectable(monkeypatch):
+diff --git a/tests/hermes_cli/test_update_stale_dashboard_review.py b/tests/hermes_cli/test_update_stale_dashboard_review.py
+index 12e1b4bbff..ec1f0b836d 100644
+--- a/tests/hermes_cli/test_update_stale_dashboard_review.py
++++ b/tests/hermes_cli/test_update_stale_dashboard_review.py
+@@ -51,9 +51,17 @@ _BACKEND = textwrap.dedent(
+     token = os.environ["HERMES_DASHBOARD_SESSION_TOKEN"]
+     state = {"in_call": False, "running": True, "events": []}
+ 
++    log_lock = threading.Lock()
++
+     def log(event):
+-        state["events"].append(event)
+-        out.with_suffix(".events").write_text(json.dumps(state["events"]))
++        # Review thread, HTTP handler threads and the SIGTERM handler all log: serialize the
++        # append+write (no lost update) and publish atomically (the test never reads a torn file).
++        with log_lock:
++            state["events"].append(event)
++            path = out.with_suffix(".events")
++            tmp = path.with_suffix(".events.tmp")
++            tmp.write_text(json.dumps(state["events"]))
++            os.replace(tmp, path)
+ 
+     hold = fence.begin_background_review() if calls else None
+ 
+@@ -271,3 +279,57 @@ def test_control_backend_without_a_reachable_fence_is_stopped_as_today(tmp_path,
+             proc.kill()
+     assert result["killed"] == [proc.pid]
+     assert elapsed < 5, elapsed
++
++
++def test_review_ending_between_prepare_and_idle_probe_still_commits_the_fence(monkeypatch, fast_poll):
++    """The review can end between the update's refused ``prepare`` and its idle probe. That idle
++    answer must not turn into an unfenced stop: the update re-prepares and commits, so no new
++    turn or review can start between the review's end and the SIGTERM (scripted, no timing)."""
++    endpoint = ("127.0.0.1", 1, "tok")
++    answers = iter([
++        ({"action": "prepare"}, {"ok": False, "idle": False}),   # review running
++        (None, {"ok": True, "idle": False, "detail": "background_review:1"}),
++        ({"action": "prepare"}, {"ok": False, "idle": False}),   # review still running ...
++        (None, {"ok": True, "idle": True, "detail": None}),       # ... and ends right here
++        ({"action": "prepare"}, {"ok": True, "idle": True, "token": "permit"}),
++        ({"action": "commit", "token": "permit"}, {"ok": True}),
++    ])
++    seen = []
++
++    def scripted(ep, body):
++        assert ep == endpoint
++        expected, reply = next(answers)
++        assert body == expected, (body, expected)
++        seen.append(body)
++        return reply
++
++    monkeypatch.setattr(dashboard_procs, "_retirement_endpoint", lambda pid: endpoint)
++    monkeypatch.setattr(dashboard_procs, "_retirement_request", scripted)
++    dashboard_procs._await_background_reviews([4242])
++    assert seen[-1] == {"action": "commit", "token": "permit"}, seen
++
++
++def test_a_backend_that_stays_unpreparable_after_its_review_is_stopped_as_before(monkeypatch, fast_poll):
++    """The re-prepare is one retry, not a loop: a fence that keeps refusing while the backend reports
++    something other than a review is stopped the old way (no 900 s hang)."""
++    endpoint = ("127.0.0.1", 1, "tok")
++    answers = iter([
++        ({"action": "prepare"}, {"ok": False, "idle": False}),
++        (None, {"ok": True, "idle": False, "detail": "background_review:1"}),
++        ({"action": "prepare"}, {"ok": False, "idle": False}),
++        (None, {"ok": True, "idle": False, "detail": "turn_in_flight"}),
++        ({"action": "prepare"}, {"ok": False, "idle": False}),
++        (None, {"ok": True, "idle": False, "detail": "turn_in_flight"}),
++    ])
++    seen = []
++
++    def scripted(ep, body):
++        expected, reply = next(answers)
++        assert body == expected, (body, expected)
++        seen.append(body)
++        return reply
++
++    monkeypatch.setattr(dashboard_procs, "_retirement_endpoint", lambda pid: endpoint)
++    monkeypatch.setattr(dashboard_procs, "_retirement_request", scripted)
++    dashboard_procs._await_background_reviews([4242])
++    assert len(seen) == 6 and {"action": "commit", "token": "permit"} not in seen
+diff --git a/tests/tools/test_multiplex_tool_cache_scope.py b/tests/tools/test_multiplex_tool_cache_scope.py
+index dcb08e279c..935a41421b 100644
+--- a/tests/tools/test_multiplex_tool_cache_scope.py
++++ b/tests/tools/test_multiplex_tool_cache_scope.py
+@@ -84,9 +84,18 @@ def test_home_keyed_caches_serve_each_profile_its_own_config(tmp_path, monkeypat
+ 
+     import agent.auxiliary_client as ac
+     import agent.image_token_cost as itc
++    from agent import models_dev
+     import tools.computer_use.tool as cu
+     from tools import mcp_tool_loop
+ 
++    # A's "native path" verdict comes from the catalog (gpt-4o accepts images). Pin that catalog:
++    # the sandboxed home has no models.dev cache, so the live fetch decided the verdict and an
++    # unreachable models.dev in CI flipped A to aux vision.
++    catalog = {"openai": {"id": "openai", "models": {
++        "gpt-4o": {"id": "gpt-4o", "modalities": {"input": ["text", "image"], "output": ["text"]}},
++        "gpt-4o-mini": {"id": "gpt-4o-mini", "modalities": {"input": ["text", "image"], "output": ["text"]}}}}}
++    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda *_a, **_k: catalog)
++
+     ac._reset_aux_semaphores()
+ 
+     with _scoped(a):
+diff --git a/tests/tui_gateway/test_connector_accounts_rpc.py b/tests/tui_gateway/test_connector_accounts_rpc.py
+index 259b60e79e..72282fad2a 100644
+--- a/tests/tui_gateway/test_connector_accounts_rpc.py
++++ b/tests/tui_gateway/test_connector_accounts_rpc.py
+@@ -17,6 +17,11 @@ from tui_gateway import server
+ def _gate(monkeypatch):
+     live.reset_for_tests()
+     monkeypatch.setattr("tools.connectors.connectors_available", lambda: True)
++    # An account-owned connect first ensures a guest identity; in the sandboxed home there is none,
++    # so unstubbed it minted one LIVE against portal.nousresearch.com on the RPC worker, and a
++    # slow portal in CI meant "no reply" inside _rpc's 5s wait. These tests are about alias
++    # routing, not provisioning (tests/hermes_cli/test_anon_* cover that).
++    monkeypatch.setattr("tools.connectors.ensure_guest_identity", lambda: None)
+     yield
+     live.reset_for_tests()
+ 
+-- 
+2.55.0
+

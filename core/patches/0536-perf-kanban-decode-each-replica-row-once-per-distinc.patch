@@ -1,0 +1,204 @@
+From 5ca52555159118eb7709016cc805820e77400534 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 15:58:13 -0700
+Subject: [PATCH] perf(kanban): decode each replica row once per distinct text,
+ not per rebuild [daveey]
+
+The remote-links projection behind the sidebar's kanban badges rebuilds
+whenever kanban.db or hub.db changes, which on a busy host is every
+sidebar refresh. Each rebuild re-parsed every replica row and re-hashed it
+twice (legacy record digest, owner-evidence task_hash): ~0.2 s of JSON
+encode/decode per rebuild on a 6k-row hub.db.
+
+_read_remote_links now memoizes the per-row decode (task, legacy digest,
+owner evidence) keyed on the row's exact stored text, replacing the memo
+with the current rows on every read so it stays bounded and an edited row
+always decodes afresh. _owner_attests_terminal takes the precomputed
+evidence. On the live replica a rebuild drops from 0.29 s to 0.09 s with
+identical cards; a cache-missing /api/profiles/sessions/sidebar (with the
+preview fix) drops from ~2 s to ~0.6 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 53eb47bc5b..7a5cda344c 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -422,7 +422,8 @@ def _scope_heartbeats(info_rows: list[tuple[str, str]]) -> dict[tuple[str, str,
+ 
+ 
+ def _owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str | None, board: str,
+-                            heartbeats: dict[tuple[str, str, str], float], now: float, stale: bool) -> bool:
++                            heartbeats: dict[tuple[str, str, str], float], now: float, stale: bool,
++                            evidence: dict[str, Any]) -> bool:
+     """The owner itself, recently, published this card as closed.
+ 
+     Release needs all of: a fresh hub sync; a profile-qualified record whose own identity fields match its
+@@ -431,15 +432,13 @@ def _owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str |
+     this exact (profile, board) within ``SCOPE_HEARTBEAT_FRESH_S``, so an offline owner's last word is not taken
+     as current. Absence of a row is never release. This is the same rule a local board applies to its own
+     cards (``done``/``archived`` are not counted), applied only to evidence the owner signed. Pre-ledger
+-    cards had no other release path, so every one of them stayed open forever. [daveey]
++    cards had no other release path, so every one of them stayed open forever. ``evidence`` is the task's
++    ``_owner_evidence`` (``_decode_replica_task``). [daveey]
+     """
+-    from hermes_cli.kanban_origin_ledger import _owner_evidence
+-
+     if stale or owner_profile is None or task.get('status') not in TERMINAL_STATUSES:
+         return False
+     if task.get('profile') != owner_profile or task.get('board') != board or task.get('gateway') != gw:
+         return False
+-    evidence = _owner_evidence(task)
+     if not evidence:
+         return False
+     # A card bound through the origin ledger keeps the ledger's stricter release: its owner must
+@@ -482,6 +481,29 @@ def _fold_legacy_aliases(tasks: dict[tuple, dict[str, Any]], raw: dict[tuple, di
+         del tasks[key]
+ 
+ 
++# (replica path, gw, record key) -> (row text, decoded row) from the last replica read: the projection rebuilds on
++# every kanban.db / hub.db change, and re-parsing and re-hashing thousands of unchanged rows cost ~0.3 s per
++# sidebar refresh. Keyed on the exact stored text, so an edited row always decodes afresh. [daveey]
++_replica_decoded: dict[tuple[str, str, str], tuple[Any, tuple[dict[str, Any], str | None, dict[str, Any]]]] = {}
++
++
++def _decode_replica_task(record_key: str, data: Any) -> tuple[dict[str, Any], str | None, dict[str, Any]]:
++    """``(task, legacy record digest or None, owner evidence)`` of one replica row; a pure function of its text.
++    Callers treat ``task`` as read-only: it is shared across reads of an unchanged row."""
++    from hermes_cli.kanban_origin_ledger import _owner_evidence
++    from hermes_cli.kanban_origin_legacy import record_digest
++
++    try:
++        t = json.loads(data)
++    except (TypeError, ValueError) as exc:
++        raise ValueError('invalid replica task data') from exc
++    if not isinstance(t, dict) or not t.get('id'):
++        raise ValueError('invalid replica task data')
++    digest = record_digest(t) if len(str(record_key).split('/')) == 2 else None
++    evidence = _owner_evidence(t) if t.get('status') in TERMINAL_STATUSES else {}
++    return t, digest, evidence
++
++
+ def _read_remote_links(path: Path, now: float | None = None, *,
+                        qualified_out: set | None = None) -> list[dict[str, Any]]:
+     """Replica cards linked to a session on this gateway, one row per (session, card).
+@@ -509,13 +531,14 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+     released: set[tuple[str, str | None, str, str]] = set()
+     seen_at: dict[str, float] = {}
+     legacy_records: dict[tuple, dict] = {}
++    global _replica_decoded
++    previous_decoded, decoded = _replica_decoded, {}
+     for gw, record_key, data, updated, version in rows:
+-        try:
+-            t = json.loads(data)
+-        except (TypeError, ValueError) as exc:
+-            raise ValueError('invalid replica task data') from exc
+-        if not isinstance(t, dict) or not t.get('id'):
+-            raise ValueError('invalid replica task data')
++        memo_key = (str(path), str(gw), str(record_key))
++        hit = previous_decoded.get(memo_key)
++        row = hit[1] if hit is not None and hit[0] == data else _decode_replica_task(record_key, data)
++        decoded[memo_key] = (data, row)
++        t, digest, evidence = row
+         if isinstance(t, dict) and t.get("id"):
+             seen_at[str(gw)] = max(seen_at.get(str(gw), 0.0), (updated or 0) / 1000.0)
+             parts = str(record_key).split('/')
+@@ -524,16 +547,15 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+             elif len(parts) == 2:
+                 owner_profile = None
+                 board, tid = parts
+-                from hermes_cli.kanban_origin_legacy import record_digest
+                 legacy_records[(str(gw), None, board, tid)] = {
+-                    'key': record_key, 'version': version, 'digest': record_digest(t)}
++                    'key': record_key, 'version': version, 'digest': digest}
+             else:
+                 raise ValueError('invalid replica task key')
+             if not all(parts) or tid != str(t['id']):
+                 raise ValueError('replica task identity mismatch')
+             key = (str(gw), owner_profile, board, tid)
+             raw[key] = t
+-            if _owner_attests_terminal(t, str(gw), owner_profile, board, heartbeats, now, stale):
++            if _owner_attests_terminal(t, str(gw), owner_profile, board, heartbeats, now, stale, evidence):
+                 released.add(key)
+             elif owner_profile is None or t.get('status') not in LISTED_STATUSES:
+                 # Legacy links carry no authoritative release receipt. Preserve
+@@ -541,6 +563,7 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                 # terminal evidence or the qualified ledger projection supersedes it.
+                 t = {**t, 'reported_status': t.get('status'), 'status': 'unknown', 'unfinished': True}
+             tasks[key] = t
++    _replica_decoded = decoded
+     blank_before = {key for key in tasks if key[1] is None}
+     _fold_legacy_aliases(tasks, raw)
+     # Only a proven-identity alias is the same card as its qualified twin (folded above, links carried
+diff --git a/tests/hermes_cli/test_kanban_replica_decode_memo.py b/tests/hermes_cli/test_kanban_replica_decode_memo.py
+new file mode 100644
+index 0000000000..83dd493efc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_decode_memo.py
+@@ -0,0 +1,63 @@
++"""Replica rows are decoded (JSON parse, legacy digest, owner-evidence hash) once per distinct row text. [daveey]
++
++The remote-links projection rebuilds whenever kanban.db or hub.db changes (every few seconds on a busy host),
++and every rebuild re-parsed and re-hashed the whole replica: ~0.3 s of each sidebar refresh on a 6k-row hub.db.
++A row's decode is a pure function of its stored text, so only new or edited rows may pay for it again.
++"""
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli.test_kanban_remote_terminal_release import NOW, card, counted, observed, replica, update
++
++
++@pytest.fixture(autouse=True)
++def _origin_profile(monkeypatch):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++
++
++@pytest.fixture()
++def decodes(monkeypatch):
++    """Count the expensive per-row work: owner-evidence hashes and legacy record digests."""
++    from hermes_cli import kanban_origin_ledger, kanban_origin_legacy
++
++    calls = []
++    real_evidence, real_digest = kanban_origin_ledger._owner_evidence, kanban_origin_legacy.record_digest
++    monkeypatch.setattr(kanban_origin_ledger, '_owner_evidence', lambda t: calls.append(t['id']) or real_evidence(t))
++    monkeypatch.setattr(kanban_origin_legacy, 'record_digest', lambda t: calls.append(t['id']) or real_digest(t))
++    return calls
++
++
++def _records():
++    return [('default/default/t_1', observed(card('done', tid='t_1'))),
++            ('default/default/t_2', observed(card('running', tid='t_2'))),
++            ('default/t_3', card('running', tid='t_3'))]
++
++
++def test_unchanged_replica_is_not_decoded_again(tmp_path, decodes):
++    path = replica(tmp_path, _records())
++    first = activity._read_remote_links(path, now=NOW)
++    assert decodes, 'the guard is no longer observing the per-row decode'
++
++    decodes.clear()
++    assert activity._read_remote_links(path, now=NOW) == first
++    assert decodes == []
++
++
++def test_edited_row_is_decoded_again_and_changes_the_answer(tmp_path, decodes):
++    path = replica(tmp_path, _records())
++    assert {r['id'] for r in counted(activity._read_remote_links(path, now=NOW))} == {'t_2', 't_3'}
++
++    decodes.clear()
++    update(path, 'default/default/t_2', observed(card('done', tid='t_2')))
++    assert {r['id'] for r in counted(activity._read_remote_links(path, now=NOW))} == {'t_3'}
++    assert decodes == ['t_2']
++
++
++def test_tampered_row_never_reuses_its_old_evidence(tmp_path):
++    path = replica(tmp_path, _records())
++    assert {r['id'] for r in counted(activity._read_remote_links(path, now=NOW))} == {'t_2', 't_3'}
++
++    # Same evidence block, different payload: the hash no longer binds, so t_1 is not released.
++    update(path, 'default/default/t_1', {**observed(card('done', tid='t_1')), 'title': 'edited in transit'})
++    assert {r['id'] for r in counted(activity._read_remote_links(path, now=NOW))} == {'t_1', 't_2', 't_3'}
+
+-- 
+2.43.0

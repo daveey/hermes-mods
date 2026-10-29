@@ -1,0 +1,405 @@
+From 81c2bebb123fd5b235db653d6587935775bb1cd6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 01:02:49 -0700
+Subject: [PATCH] fix(model-routing): resume a chat on the default when the
+ policy no longer approves its stored model [daveey]
+
+With model_routing.enforce_subscription_only on, every resume adapter replayed the session row's stored
+concrete model/provider as a pin. A chat saved on a retired or unregistered model (claude-opus-4-6) or on a
+paid route (openrouter/...) then failed closed at agent build on every attempt and could never be reopened:
+hermes-hub, 10-28 00:07 PDT, session 20261027_085427_ac4078, "agent build failed ... Managed subscription
+policy rejects unregistered or ambiguous concrete pin".
+
+Why: the stored tuple is history, not a new request, yet Desktop (tui_gateway restore_class_overrides), CLI
+--resume and one-shot (stored_session_route), the API server (_stored_session_model) and persisted exact pins
+(restore_route, used by the API and messaging gateways) all re-requested it as an explicit pin. Reproduced live
+on hermes-hub (core 69c52e9402) with a probe session stored on claude-opus-4-6: the Desktop build and
+`hermes -z --resume` both refuse with the error above; `hermes chat --resume` announces "Model restored from
+session: claude-opus-4-6" and is then served claude-opus-5-5.
+Not caught: the enforcement rollout probed only fresh sessions; nothing resumed a pre-enforcement chat.
+
+Fix: agent.model_routing_restore.stale_managed_pin() asks the same pin_policy() the runtime enforces. Each
+adapter drops a tuple the policy would refuse, so the session runs on the configured default (logged at INFO).
+Approved pins still restore exactly, nothing changes with the policy off, and an explicit request for the
+stale model still refuses.
+
+Changed expectations: three tests from 40f638ec5b/20ede5adee asserted that a restored paid pin fails closed:
+test_restored_pin_is_not_managed_authorization, the gateway deferred-runtime test (was
+test_restored_paid_pin_still_hits_billing_guard) and the Desktop builder test (was
+test_desktop_saved_paid_override_never_sends). Each now resumes on the configured default and keeps its safety
+checks: an explicit request for the paid tuple still refuses before any allocation, the Desktop and gateway
+builds run the default with an empty fallback chain, the builder test sends nothing, and the gateway test
+captures only native subscription sends. A persisted exact pin is written only after pin_policy approved it
+(model_routing_managed.py resolve_managed_runtime; all 127 on hermes-hub at 10-28 01:45 PDT are subscription
+tuples), so one goes stale only when the registry later drops its route, which used to make every such chat
+un-resumable.
+
+Tests: tests/agent/test_resume_stale_managed_pin.py, one per entry path; 6 fail with the wiring reverted.
+---
+ agent/model_routing_restore.py                |  40 +++++-
+ gateway/platforms/api_server.py               |   6 +-
+ hermes_cli/cli_model_switch_mixin.py          |   3 +
+ tests/agent/test_model_routing_restore.py     |   8 +-
+ tests/agent/test_resume_stale_managed_pin.py  | 118 ++++++++++++++++++
+ .../gateway/test_deferred_managed_runtime.py  |  36 ++++--
+ tests/tui_gateway/test_managed_entry.py       |  14 ++-
+ tui_gateway/class_routing.py                  |  16 ++-
+ 8 files changed, 217 insertions(+), 24 deletions(-)
+ create mode 100644 tests/agent/test_resume_stale_managed_pin.py
+
+diff --git a/agent/model_routing_restore.py b/agent/model_routing_restore.py
+index 2d61055e95..fee5d8cf96 100644
+--- a/agent/model_routing_restore.py
++++ b/agent/model_routing_restore.py
+@@ -1,7 +1,43 @@
+ """Restore persisted routing intent without granting new routing permissions."""
+ import json
++import logging
+ 
+-from agent.model_routing import CLASSES, ModelRoutingError
++from agent.model_routing import CLASSES, ModelRoutingError, is_class_selector
++
++
++def stale_managed_pin(model, provider, config=None):
++    """Whether the managed subscription policy would refuse this stored concrete tuple as a pin.
++
++    A session row's model is history, not a new request. Replaying a retired, unregistered or paid tuple
++    fails closed at agent build on every attempt, so the chat could never be reopened; resume adapters
++    drop such a tuple and the session runs on the configured default. Off-policy, class selectors and
++    approved tuples are never stale, and an explicit request for the same model still refuses.
++    """
++    if not isinstance(model, str) or not model.strip() or is_class_selector(model.strip()):
++        return False
++    from agent.model_routing_managed import managed_config, pin_policy
++    try:
++        config = managed_config(config)
++    except ModelRoutingError:
++        return False  # an invalid policy is the runtime's error to report, not a reason to drop history
++    if config is None:
++        return False
++    try:
++        pin_policy(model.strip(), provider or None, config)
++    except ModelRoutingError:
++        logging.getLogger(__name__).info(
++            "resume: stored model %r (provider %r) is not an approved subscription route; using the default",
++            model, provider)
++        return True
++    return False
++
++
++def stale_session_pin(row):
++    """``stale_managed_pin`` for a stored session row, read through the canonical runtime reader."""
++    if not isinstance(row, dict):
++        return False
++    from hermes_state import SessionDB
++    return stale_managed_pin(row.get("model"), SessionDB.session_gateway_runtime(row).get("provider"))
+ 
+ 
+ def restore_route(model, config):
+@@ -23,7 +59,7 @@ def restore_route(model, config):
+         provider = route.get("selected_provider")
+         if not isinstance(model, str) or not model or not isinstance(provider, str) or not provider or provider == "auto":
+             raise ModelRoutingError("Persisted exact pin lacks a concrete model/provider tuple")
+-        return model, provider
++        return None if stale_managed_pin(model, provider) else (model, provider)
+     level = route.get("requested_class")
+     if level in CLASSES:
+         return "class:" + level, "auto"
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index aaa97d989a..168a0eb8b1 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1963,11 +1963,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+ 
+     def _stored_session_model(self, session: Any) -> Optional[str]:
+         """The model persisted on a session row, minus the virtual alias (replaying
+-        "hermes-agent" upstream as a provider model id 400s)."""
++        "hermes-agent" upstream as a provider model id 400s) and minus a tuple the managed
++        subscription policy no longer approves (history, not a request; replaying it fails closed)."""
+         stored = session.get("model") if isinstance(session, dict) else None
+         if not stored or stored == self._model_name:
+             return None
+-        return stored
++        from agent.model_routing_restore import stale_session_pin
++        return None if stale_session_pin(session) else stored
+ 
+     @staticmethod
+     def _clean_runtime_id(value: Any, *, max_len: int = 200) -> str:
+diff --git a/hermes_cli/cli_model_switch_mixin.py b/hermes_cli/cli_model_switch_mixin.py
+index 98c2eff2b9..84c59fb4f4 100644
+--- a/hermes_cli/cli_model_switch_mixin.py
++++ b/hermes_cli/cli_model_switch_mixin.py
+@@ -58,6 +58,9 @@ def stored_session_route(session_meta, *, current_model, current_provider):
+     runtime = _SessionDB.session_gateway_runtime(session_meta)
+     base_url = runtime.get("base_url") or None
+     provider = _heal_bare_custom_provider(runtime.get("provider") or None, base_url=base_url, model=stored_model)
++    from agent.model_routing_restore import stale_managed_pin
++    if stale_managed_pin(stored_model, provider):
++        return None  # history the managed policy no longer approves: keep the launch default
+     provider_changed = bool(provider) and provider != current_provider
+     if stored_model == current_model and not provider_changed:
+         return None
+diff --git a/tests/agent/test_model_routing_restore.py b/tests/agent/test_model_routing_restore.py
+index db16b2e39a..a72338e6a5 100644
+--- a/tests/agent/test_model_routing_restore.py
++++ b/tests/agent/test_model_routing_restore.py
+@@ -111,8 +111,10 @@ def test_incomplete_exact_tuple_fails_closed(provider):
+ def test_restored_pin_is_not_managed_authorization(routing_home, tmp_path):
+     routing_home["model_routing"]["enforce_subscription_only"] = True
+     atomic_config_write(tmp_path / "config.yaml", routing_home)
+-    model, provider = restore_route("paid", {"model_routing": {
+-        "selected_model": "paid", "selected_provider": "openrouter", "requested_class": "deep", "exact_pin": True}})
++    # A persisted pin the policy refuses is history: resume drops it (the session runs on its configured
++    # default) instead of replaying it, and an explicit request for the same tuple still refuses unallocated.
++    assert restore_route("paid", {"model_routing": {
++        "selected_model": "paid", "selected_provider": "openrouter", "requested_class": "deep", "exact_pin": True}}) is None
+     with pytest.raises(ModelRoutingError, match="rejects"):
+-        resolve_runtime_provider(requested=provider, target_model=model, routing_session_id="stale")
++        resolve_runtime_provider(requested="openrouter", target_model="paid", routing_session_id="stale")
+     assert not (tmp_path / "model-routing.sqlite3").exists()
+diff --git a/tests/agent/test_resume_stale_managed_pin.py b/tests/agent/test_resume_stale_managed_pin.py
+new file mode 100644
+index 0000000000..ed38a4fc3d
+--- /dev/null
++++ b/tests/agent/test_resume_stale_managed_pin.py
+@@ -0,0 +1,118 @@
++"""A resumed chat whose stored model is not an approved subscription route resumes on the profile default.
++
++With ``enforce_subscription_only`` on, every resume adapter re-requested the session row's stored concrete tuple as
++a pin. A chat saved on a retired or unregistered model (``claude-opus-4-6``, an aggregator slug) or on a paid route
++therefore failed closed at agent build on every attempt and could never be reopened (hub, 10-28 00:07 PDT:
++"agent build failed ... rejects unregistered or ambiguous concrete pin"). The stored tuple is history, not a new
++request: each adapter now drops it and the session runs on the configured default. An approved pin still restores
++exactly, nothing changes with the policy off, and an explicit request for that model still refuses.
++"""
++import json
++
++import pytest
++
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_restore import stale_managed_pin
++from hermes_cli.config import atomic_config_write
++from tests.hermes_cli import test_model_routing_runtime as runtime_fixtures
++
++routing_home = runtime_fixtures.routing_home
++
++APPROVED = ("anthropic-deep", "anthropic")
++RETIRED = ("claude-opus-4-6", "anthropic")
++PAID = ("anthropic-deep", "openrouter")
++
++
++@pytest.fixture
++def enforced(routing_home, tmp_path):
++    routing_home["model_routing"]["enforce_subscription_only"] = True
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    return routing_home
++
++
++def row(model, provider):
++    return {"model": model, "model_config": json.dumps({"provider": provider}), "billing_provider": provider,
++            "title": "ASG runners Opus takeover"}
++
++
++def test_only_an_unapproved_stored_tuple_is_stale_under_enforcement(enforced):
++    assert stale_managed_pin(*RETIRED)
++    assert stale_managed_pin(*PAID)
++    assert not stale_managed_pin(*APPROVED)
++    assert not stale_managed_pin("class:deep", "auto")
++    assert not stale_managed_pin("", None)
++    assert not stale_managed_pin(None, None)
++
++
++def test_nothing_is_stale_with_the_policy_off(routing_home):
++    assert not stale_managed_pin(*RETIRED)
++    assert not stale_managed_pin(*PAID)
++
++
++def test_desktop_resume_of_a_stale_model_follows_the_profile(enforced):
++    from tui_gateway.server import _stored_session_runtime_overrides
++    assert _stored_session_runtime_overrides(row(*RETIRED)) == {}
++    assert _stored_session_runtime_overrides(row(*PAID)) == {}
++    kept = _stored_session_runtime_overrides(row(*APPROVED))
++    assert (kept["model_override"]["model"], kept["provider_override"]) == APPROVED
++
++
++def test_desktop_resume_is_unchanged_with_the_policy_off(routing_home):
++    from tui_gateway.server import _stored_session_runtime_overrides
++    kept = _stored_session_runtime_overrides(row(*RETIRED))
++    assert (kept["model_override"]["model"], kept["provider_override"]) == RETIRED
++
++
++def test_cli_resume_of_a_stale_model_keeps_the_launch_default(enforced):
++    from tests.hermes_cli.test_resume_model_restore import _make_stub
++    stub = _make_stub(model="class:deep", provider="auto", requested_provider="auto", base_url="", api_key="k")
++    stub._restore_session_model(row(*RETIRED))
++    assert (stub.model, stub.provider) == ("class:deep", "auto")
++    stub._restore_session_model(row(*APPROVED))
++    assert (stub.model, stub.provider) == APPROVED
++
++
++def test_oneshot_resume_of_a_stale_model_keeps_the_ambient_choice(enforced):
++    from hermes_cli.oneshot import _ModelChoice, _apply_stored_session_runtime
++    choice = _apply_stored_session_runtime(_ModelChoice("class:deep", "auto"), row(*RETIRED), explicit_model=False)
++    assert (choice.model, choice.provider) == ("class:deep", "auto")
++    choice = _apply_stored_session_runtime(_ModelChoice("class:deep", "auto"), row(*APPROVED), explicit_model=False)
++    assert (choice.model, choice.provider) == APPROVED
++
++
++def test_api_session_resume_of_a_stale_model_follows_the_default(enforced):
++    from gateway.platforms.api_server import APIServerAdapter
++    adapter = object.__new__(APIServerAdapter)
++    adapter._model_name = "hermes-agent"
++    assert adapter._stored_session_model(row(*RETIRED)) is None
++    assert adapter._stored_session_model(row(*PAID)) is None
++    assert adapter._stored_session_model(row(*APPROVED)) == "anthropic-deep"
++
++
++def test_an_explicit_request_for_a_stale_model_still_refuses(enforced):
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    with pytest.raises(ModelRoutingError, match="rejects"):
++        resolve_runtime_provider(requested="anthropic", target_model="claude-opus-4-6", routing_session_id="s")
++
++
++def pin(model, provider):
++    return {"model_routing": {"exact_pin": True, "selected_model": model, "selected_provider": provider}}
++
++
++def test_a_persisted_exact_pin_the_policy_no_longer_approves_is_not_restored(enforced):
++    from agent.model_routing_restore import restore_route
++    assert restore_route(RETIRED[0], json.dumps(pin(*RETIRED))) is None
++    assert restore_route(PAID[0], pin(*PAID)) is None
++    assert restore_route(APPROVED[0], pin(*APPROVED)) == APPROVED
++
++
++def test_messaging_gateway_resume_drops_a_stale_exact_pin(enforced):
++    from types import SimpleNamespace
++    from gateway.run_class_routing import stored_route
++    rows = {"old": {"model": RETIRED[0], "model_config": json.dumps(pin(*RETIRED))},
++            "ok": {"model": APPROVED[0], "model_config": json.dumps(pin(*APPROVED))}}
++    entries = {key: SimpleNamespace(session_id=key) for key in rows}
++    runner = SimpleNamespace(session_store=SimpleNamespace(_entries=entries),
++                             _session_db=SimpleNamespace(get_session=rows.get))
++    assert stored_route(runner, "old") is None
++    assert stored_route(runner, "ok") == APPROVED
+diff --git a/tests/gateway/test_deferred_managed_runtime.py b/tests/gateway/test_deferred_managed_runtime.py
+index 5bc051c922..e6ecad30a0 100644
+--- a/tests/gateway/test_deferred_managed_runtime.py
++++ b/tests/gateway/test_deferred_managed_runtime.py
+@@ -6,7 +6,6 @@ import pytest
+ import run_agent  # bootstrap discovery before the isolated-home guard
+ 
+ from agent.i18n import t
+-from agent.model_routing import ModelRoutingError
+ from gateway.run import GatewayRunner
+ from gateway.session import Platform, SessionSource
+ from hermes_cli.config import atomic_config_write
+@@ -113,17 +112,40 @@ async def test_background_deferred_route_sends_native(managed, runner, native_tr
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize('surface', ['compression', 'background'])
+-async def test_restored_paid_pin_still_hits_billing_guard(managed, runner, native_transport, surface):
++async def test_restored_paid_pin_resumes_on_the_default_route(managed, runner, native_transport, surface):
++    """A persisted pin the policy now refuses is history, not authorization: deferred work runs on the
++    configured default (class:deep) and nothing reaches the paid route or the configured paid fallback."""
+     restore(runner, 'paid')
++    built = []
++
++    def compress(agent, messages, request, **kwargs):
++        built.append((agent.model, agent.provider, bool(agent.model_routing.get('exact_pin')), agent._fallback_chain))
++        return SimpleNamespace(status='nothing_to_do')
++
++    real_resolve = runner._resolve_session_agent_runtime
++
++    def resolve(**kwargs):
++        result = real_resolve(**kwargs)
++        runner._session_db = None
++        return result
++
+     with patch('gateway.run._load_gateway_config', return_value=managed):
+         if surface == 'compression':
+-            with pytest.raises(ModelRoutingError, match='Managed subscription policy'):
+-                await runner._run_manual_compression(source(), SimpleNamespace(session_id='pin'), [], None)
++            with patch('agent.conversation_compression_manual.compress_now', side_effect=compress):
++                result = await runner._run_manual_compression(
++                    source(), SimpleNamespace(session_id='pin'), [{'role': 'user', 'content': 'hi'}], None)
++            assert result == t('gateway.compress.nothing_to_do')
++            assert built == [('anthropic-deep', 'anthropic', False, [])]
+         else:
++            runner._resolve_session_agent_runtime = resolve
+             await runner._run_background_task_inner('Say ok', source(), 'job')
+-            runner._delivery_adapter_for(source()).emit_warning.assert_awaited_once()
+-            runner._delivery_adapter_for(source()).send.assert_not_awaited()
+-    assert native_transport == []
++            adapter = runner._delivery_adapter_for(source())
++            adapter.emit_warning.assert_not_awaited()
++            assert 'ok' in adapter.send.call_args.kwargs['content']
++            assert native_transport
++    assert all(body['model'] == 'anthropic-deep' and url.startswith('https://api.anthropic.com/')
++               and headers.get('authorization', '').startswith('Bearer sk-ant-oat')
++               for url, headers, body in native_transport)
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/tui_gateway/test_managed_entry.py b/tests/tui_gateway/test_managed_entry.py
+index 372c508d61..45c9b89fa8 100644
+--- a/tests/tui_gateway/test_managed_entry.py
++++ b/tests/tui_gateway/test_managed_entry.py
+@@ -12,7 +12,10 @@ routing_home = fixtures.routing_home
+ streaming_route = fixtures.streaming_route
+ 
+ 
+-def test_desktop_saved_paid_override_never_sends(managed, monkeypatch, tmp_path):
++def test_desktop_saved_paid_override_resumes_on_the_default(managed, monkeypatch, tmp_path):
++    """A Desktop row saved on a paid route is history, not authorization: resume drops the stale override and the
++    real builder runs the configured default (class:deep) with no paid fallback. Nothing is sent, and an explicit
++    request for the paid tuple still refuses."""
+     monkeypatch.chdir(tmp_path)
+     from hermes_cli.config import load_config
+     monkeypatch.setattr(server, '_load_cfg', load_config)
+@@ -21,9 +24,12 @@ def test_desktop_saved_paid_override_never_sends(managed, monkeypatch, tmp_path)
+     monkeypatch.setattr(server, '_load_enabled_toolsets', lambda platform: [])
+     monkeypatch.setattr(server, '_startup_system_prompt', lambda *a: '')
+     monkeypatch.setattr(server, '_get_db', lambda: None)
+-    overrides = server._stored_session_runtime_overrides({
+-        'model': 'vendor/paid', 'model_config': {'model': 'vendor/paid', 'provider': 'openrouter'}})
++    paid = {'model': 'vendor/paid', 'provider': 'openrouter'}
++    overrides = server._stored_session_runtime_overrides({'model': 'vendor/paid', 'model_config': dict(paid)})
++    assert 'model_override' not in overrides and 'provider_override' not in overrides
+     with patch('httpx.Client.send') as send, patch('model_tools.get_tool_definitions', return_value=[]):
++        agent = server._make_agent('ui', 'stale-paid', **overrides)
++        assert (agent.model, agent.provider, agent._fallback_chain) == ('anthropic-deep', 'anthropic', [])
+         with pytest.raises(ModelRoutingError):
+-            server._make_agent('ui', 'stale-paid', **overrides)
++            server._make_agent('ui', 'explicit-paid', model_override=dict(paid), provider_override='openrouter')
+         send.assert_not_called()
+diff --git a/tui_gateway/class_routing.py b/tui_gateway/class_routing.py
+index 3bb2e4b978..828e5f38de 100644
+--- a/tui_gateway/class_routing.py
++++ b/tui_gateway/class_routing.py
+@@ -35,13 +35,17 @@ def probe_class_runtime(model, provider, config):
+ 
+ 
+ def restore_class_overrides(model, config, overrides):
+-    from agent.model_routing_restore import restore_route
++    from agent.model_routing_restore import restore_route, stale_managed_pin
+     restored = restore_route(model, config)
+-    if restored is None:
+-        return overrides
+-    model, provider = restored
+-    overrides["model_override"] = {"model": model, "provider": provider}
+-    overrides["provider_override"] = provider
++    if restored is not None:
++        model, provider = restored
++        overrides["model_override"] = {"model": model, "provider": provider}
++        overrides["provider_override"] = provider
++    target = overrides.get("model_override") or {}
++    if stale_managed_pin(target.get("model"), overrides.get("provider_override") or target.get("provider")):
++        # History, not a request: resume on the profile default instead of failing closed at agent build.
++        overrides.pop("model_override", None)
++        overrides.pop("provider_override", None)
+     return overrides
+ 
+ 
+-- 
+2.55.0
+

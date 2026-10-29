@@ -1,6 +1,6 @@
 # Cross-gateway capability routing: a wall opens an owner card where the capability lives
 
-Patches: **0536 0537 0538 0539 0540** (feature, two review follow-ups, create-parity test, no-producer-no-park integration). Companion: hermes-hub client 1.7.2 (`capabilities` collection). Builds on [assignment capabilities](kanban-assignment-capabilities.md) (0300).
+Patches: **0549 0550 0551 0552 0553** (feature, two review follow-ups, create-parity test, no-producer-no-park integration). Companion: hermes-hub client 1.7.2 (`capabilities` collection). Builds on [assignment capabilities](kanban-assignment-capabilities.md) (0300).
 
 ## Behavior
 
@@ -56,15 +56,15 @@ Apply after 0300 (shared `requires` validation). Needs hermes-hub client >= 1.7.
 
 Core: the block/schedule transitions, create preflight and the dispatcher tick are core transactions. The transport half lives in the hermes-hub client.
 
-## Follow-up patches (0561, 0567)
+## Follow-up patches (0562, 0573)
 
-**0561** is a lint fix (ruff FURB167/RUF100 and Windows-footgun rules) in `kanban_awaiting.py`, `kanban_capability_registry.py`, `kanban_capability_routing.py` and `tests/cron/test_cron_model_provider_pairing.py`; no behavior change. **0567** adds `hub_cli_path()` (configured value, then `PATH`, then `~/.local/bin`) and routing's `_hub_cli` uses it; see [kanban-default-placement.md](kanban-default-placement.md).
+**0562** is a lint fix (ruff FURB167/RUF100 and Windows-footgun rules) in `kanban_awaiting.py`, `kanban_capability_registry.py`, `kanban_capability_routing.py` and `tests/cron/test_cron_model_provider_pairing.py`; no behavior change. **0573** adds `hub_cli_path()` (configured value, then `PATH`, then `~/.local/bin`) and routing's `_hub_cli` uses it; see [kanban-default-placement.md](kanban-default-placement.md).
 
-**0593** (source `a2c2b3eba8`), test-only: the capability-routing fixture drops PATH entries that contain a real `hermes-hub`, so `hub_cli_path()` assertions do not depend on the host having the client installed (`test_replay_t5bc8e125_block_opens_macbook_owner_card_and_parks`). The same commit lets the real-home guard read the checkout's sibling `manifest.json`; that exemption is covered in [kanban-origin-ownership-snapshot.md](kanban-origin-ownership-snapshot.md).
+**0589** (source `a2c2b3eba8`), test-only: the capability-routing fixture drops PATH entries that contain a real `hermes-hub`, so `hub_cli_path()` assertions do not depend on the host having the client installed (`test_replay_t5bc8e125_block_opens_macbook_owner_card_and_parks`). The same commit lets the real-home guard read the checkout's sibling `manifest.json`; that exemption is covered in [kanban-origin-ownership-snapshot.md](kanban-origin-ownership-snapshot.md).
 
-## Follow-up patch (0686)
+## Follow-up patch (0696)
 
-**0686** (`41a1d7ce4d`): `owner_status()` used to read the owner card id only from `result['task']`. An applied create that came back as `{"output": <hermes kanban create --json text>}` (clipped, so often not valid JSON) made the wait-check exit 2 `done without a task id` and wake the waiting card even though the owner card was done.
+**0696** (`41a1d7ce4d`): `owner_status()` used to read the owner card id only from `result['task']`. An applied create that came back as `{"output": <hermes kanban create --json text>}` (clipped, so often not valid JSON) made the wait-check exit 2 `done without a task id` and wake the waiting card even though the owner card was done.
 
 `owner_task_id` reads, in order: `task`, `task_id`, `id`, then `output`'s JSON `id` / `task_id`, then the first `"id": "t_…"` in the output text. rc 2 only when none of those holds an id.
 

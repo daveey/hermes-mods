@@ -1,6 +1,6 @@
 # Move-to-project creates the folder the gateway lacks
 
-Patch **0675** (`69c52e9402`).
+Patch **0681** (`69c52e9402`).
 
 ## Behavior
 
@@ -32,7 +32,7 @@ Desktop vitest was not re-run by this mirror. Live Desktop move against a real m
 
 ## Applying
 
-`git am -3` 0675 after the series through 0674. Touches only `projects.ts` and its cross-gateway move test.
+`git am -3` 0681 after the series through 0680. Touches only `projects.ts` and its cross-gateway move test.
 
 ## Gotchas
 

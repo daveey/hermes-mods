@@ -1,0 +1,249 @@
+From 192b9db93edf0cfe5bf9011681ef75a8cb717cec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:33:00 -0700
+Subject: [PATCH] feat(kanban sync): report this machine's load to the Board
+ registry every 30 s
+
+hermes_cli/machine_metrics.py reads CPU load (getloadavg, cpu count), memory in
+use (/proc/meminfo on Linux; sysctl hw.memsize + vm_stat on macOS) and free disk
+under the kanban home. The sync loop POSTs it to /v2/machines/me/metrics at most
+every 30 s; a Board without the route (404/405) is asked again after 10 min, and
+no failure reaches the sync loop. Display only (Desktop Runners panel meters).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_client.py         |   7 ++
+ hermes_cli/machine_metrics.py            | 103 +++++++++++++++++++++++
+ tests/hermes_cli/test_machine_metrics.py |  78 +++++++++++++++++
+ 3 files changed, 188 insertions(+)
+ create mode 100644 hermes_cli/machine_metrics.py
+ create mode 100644 tests/hermes_cli/test_machine_metrics.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 7616ec2ffc..6994403ab9 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -148,6 +148,10 @@ class Hub:
+         """The machine registry (RFC "One machine registry"): ``{me, machines: [{name, labels, pinned_only, ...}]}``."""
+         return self._call("GET", "/v2/machines")
+ 
++    def report_metrics(self, metrics: dict) -> dict:
++        """This machine's own load for the registry (display only; see hermes_cli.machine_metrics)."""
++        return self._call("POST", "/v2/machines/me/metrics", metrics)
++
+ 
+ # --- boards ---------------------------------------------------------------------------------------
+ 
+@@ -747,6 +751,8 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+     wake = threading.Event()
+     watchers: dict[str, threading.Thread] = {}
+     next_links = 0.0
++    from hermes_cli.machine_metrics import Reporter
++    metrics = Reporter(hub.report_metrics)
+     while keep_running():
+         boards = board_paths()
+         for slug, _path in boards:
+@@ -761,6 +767,7 @@ def run_forever(keep_running: Callable[[], bool], interval: Optional[float] = No
+         if time.monotonic() >= next_links:
+             reconcile_links(boards, ident.gateway)
+             next_links = time.monotonic() + LINKS_EVERY_S
++        metrics.report_due()
+         wait_for_work(wake, [p for _s, p in boards], period, keep_running)
+ 
+ 
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+new file mode 100644
+index 0000000000..bdf74546c3
+--- /dev/null
++++ b/hermes_cli/machine_metrics.py
+@@ -0,0 +1,103 @@
++"""This machine's load, reported to the Board's machine registry for display (Desktop Runners panel).
++
++``collect()`` reads CPU load, memory in use and free disk with a few cheap OS calls; the kanban sync loop
++sends it with ``report_due()`` at most every :data:`REPORT_EVERY_S`. Display only: placement never reads it.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import re
++import shutil
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++_log = logging.getLogger(__name__)
++
++REPORT_EVERY_S = 30.0
++# A Board without the route (older deploy) answers 404/405: ask again rarely, not every 30 s.
++UNSUPPORTED_RETRY_S = 600.0
++_GB = 1024 ** 3
++
++
++def _linux_mem_used_pct(meminfo: str) -> Optional[float]:
++    values = {k: int(v) for k, v in re.findall(r"^(\w+):\s+(\d+) kB", meminfo, re.MULTILINE)}
++    total, avail = values.get("MemTotal"), values.get("MemAvailable")
++    if not total or avail is None:
++        return None
++    return round(100.0 * (total - avail) / total, 1)
++
++
++def _macos_mem_used_pct(memsize: int, vm_stat: str) -> Optional[float]:
++    page = re.search(r"page size of (\d+) bytes", vm_stat)
++    pages = {k.strip().lower(): int(v) for k, v in re.findall(r"^([^:\n]+):\s+(\d+)\.", vm_stat, re.MULTILINE)}
++    if not page or not memsize:
++        return None
++    # Activity Monitor's "available": free + inactive + speculative + purgeable pages.
++    avail = sum(pages.get(k, 0) for k in ("pages free", "pages inactive", "pages speculative", "pages purgeable"))
++    return round(max(0.0, min(100.0, 100.0 * (memsize - avail * int(page.group(1))) / memsize)), 1)
++
++
++def _mem_used_pct() -> Optional[float]:
++    try:
++        if sys.platform.startswith("linux"):
++            return _linux_mem_used_pct(Path("/proc/meminfo").read_text())
++        if sys.platform == "darwin":
++            memsize = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
++                                         timeout=5, check=True).stdout.strip())
++            vm = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=5, check=True).stdout
++            return _macos_mem_used_pct(memsize, vm)
++    except (OSError, ValueError, subprocess.SubprocessError):
++        return None
++    return None
++
++
++def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
++    """``{cpu_load1, cpus, mem_used_pct, disk_free_gb, disk_total_gb}``; a value that cannot be read is left out."""
++    out: dict[str, Any] = {}
++    try:
++        out["cpu_load1"] = round(os.getloadavg()[0], 2)
++    except (OSError, AttributeError):
++        pass
++    if os.cpu_count():
++        out["cpus"] = int(os.cpu_count())
++    mem = _mem_used_pct()
++    if mem is not None:
++        out["mem_used_pct"] = mem
++    try:
++        if disk_path is None:
++            from hermes_cli import kanban_db
++            disk_path = kanban_db.kanban_home()
++        usage = shutil.disk_usage(disk_path)
++        out["disk_free_gb"] = round(usage.free / _GB, 1)
++        out["disk_total_gb"] = round(usage.total / _GB, 1)
++    except (OSError, ImportError):
++        pass
++    return out
++
++
++class Reporter:
++    """Sends ``collect()`` to the Board at most every REPORT_EVERY_S; never raises into the sync loop."""
++
++    def __init__(self, send: Callable[[dict], Any], *, collect_fn: Optional[Callable[[], dict]] = None,
++                 clock: Callable[[], float] = time.monotonic) -> None:
++        self.send, self.collect_fn, self.clock = send, collect_fn, clock
++        self.next_at = 0.0
++
++    def report_due(self) -> bool:
++        now = self.clock()
++        if now < self.next_at:
++            return False
++        self.next_at = now + REPORT_EVERY_S
++        try:
++            self.send((self.collect_fn or collect)())
++            return True
++        except Exception as exc:  # health: allow BLE001 -- load reporting must never stop kanban sync
++            status = getattr(exc, "status", None)
++            if status in (404, 405):
++                self.next_at = now + UNSUPPORTED_RETRY_S
++            _log.debug("machine metrics not reported (%s: %s)", type(exc).__name__, exc)
++            return False
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+new file mode 100644
+index 0000000000..5b415837bf
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -0,0 +1,78 @@
++"""Machine load reporting for the Board registry: readers per platform, the 30 s reporter, the sync-loop hook."""
++from pathlib import Path
++
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import machine_metrics as mm
++
++MEMINFO = "MemTotal:       65000000 kB\nMemFree:         1000000 kB\nMemAvailable:   13000000 kB\n"
++VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
++Pages free:                               65536.
++Pages active:                            500000.
++Pages inactive:                          131072.
++Pages speculative:                        65536.
++Pages purgeable:                              0.
++"""
++
++
++def test_linux_memory_reader():
++    assert mm._linux_mem_used_pct(MEMINFO) == 80.0
++    assert mm._linux_mem_used_pct("MemTotal: 1 kB\n") is None
++
++
++def test_macos_memory_reader():
++    memsize = 16 * 1024 ** 3  # 16 GB; available = (65536+131072+65536) pages * 16 KB = 4 GB
++    assert mm._macos_mem_used_pct(memsize, VM_STAT) == 75.0
++    assert mm._macos_mem_used_pct(memsize, "no page size here") is None
++
++
++def test_collect_reads_this_machine(tmp_path: Path):
++    out = mm.collect(disk_path=tmp_path)
++    assert out["cpus"] >= 1 and out["cpu_load1"] >= 0
++    assert 0 < out["disk_free_gb"] <= out["disk_total_gb"]
++    assert 0 <= out["mem_used_pct"] <= 100  # this platform's reader (linux or macos)
++    assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb"}
++
++
++def test_reporter_sends_at_most_every_30s_and_backs_off_on_old_board():
++    sent, now = [], [1000.0]
++    r = mm.Reporter(sent.append, collect_fn=lambda: {"cpus": 4}, clock=lambda: now[0])
++    assert r.report_due() and sent == [{"cpus": 4}]
++    now[0] += 29
++    assert not r.report_due() and len(sent) == 1
++    now[0] += 1
++    assert r.report_due() and len(sent) == 2
++
++    def old_board(_m):
++        raise ksc.HubError(404, "not found")
++    r = mm.Reporter(old_board, collect_fn=dict, clock=lambda: now[0])
++    assert r.report_due() is False  # never raises into the sync loop
++    assert r.next_at == now[0] + mm.UNSUPPORTED_RETRY_S
++
++    def flaky(_m):
++        raise OSError("network down")
++    r = mm.Reporter(flaky, collect_fn=dict, clock=lambda: now[0])
++    assert r.report_due() is False
++    assert r.next_at == now[0] + mm.REPORT_EVERY_S
++
++
++def test_hub_report_metrics_posts_to_own_route(monkeypatch):
++    calls = []
++    hub = ksc.Hub(ksc.Identity(url="https://board.test", key="k" * 16, gateway="gw"))
++    monkeypatch.setattr(hub, "_call", lambda method, path, body=None: calls.append((method, path, body)) or {})
++    hub.report_metrics({"cpus": 8})
++    assert calls == [("POST", "/v2/machines/me/metrics", {"cpus": 8})]
++
++
++def test_sync_loop_reports_metrics_once_per_window(monkeypatch):
++    reported = []
++    monkeypatch.setattr(ksc, "load_identity", lambda: ksc.Identity(url="https://board.test", key="k" * 16, gateway="gw"))
++    monkeypatch.setattr(ksc.Hub, "report_metrics", lambda self, m: reported.append(m))
++    monkeypatch.setattr(ksc.sync, "set_lease_client", lambda c: None)
++    monkeypatch.setattr(ksc, "board_paths", list)
++    monkeypatch.setattr(ksc, "sync_all_once", lambda hub: [])
++    monkeypatch.setattr(ksc, "reconcile_links", lambda boards, gw: None)
++    monkeypatch.setattr(ksc, "wait_for_work", lambda *a, **k: "period")
++    monkeypatch.setattr(mm, "collect", lambda disk_path=None: {"cpus": 2})
++    rounds = iter([True, True, True, False])
++    ksc.run_forever(lambda: next(rounds), interval=1)
++    assert reported == [{"cpus": 2}]  # three rounds inside one 30 s window
+-- 
+2.55.0
+

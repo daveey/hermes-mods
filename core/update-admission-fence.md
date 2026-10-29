@@ -1,6 +1,6 @@
 # Cross-process update admission fence
 
-Patch **0496** (source `dc5c245525`, squash of the PR #98 series).
+Patch **0503** (source `dc5c245525`, squash of the PR #98 series).
 
 ## Behavior
 
@@ -32,7 +32,7 @@ and the prompt dispatch modules.
 
 ## Applying
 
-`git am -3 core/patches/0496-*.patch`. It touches `kanban_db.py`; later kanban patches assume it.
+`git am -3 core/patches/0503-*.patch`. It touches `kanban_db.py`; later kanban patches assume it.
 
 ## Gotchas
 

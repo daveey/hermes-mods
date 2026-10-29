@@ -1,6 +1,6 @@
 # websockets keepalive drops Hermes already handles log one INFO line
 
-Patch: 0600 (daveey/hermes `52ea3523cd`).
+Patch: 0622 (daveey/hermes `52ea3523cd`).
 
 ## Why
 
@@ -82,7 +82,7 @@ connect = None`). The ratchet blocks new findings; existing ones are grandfather
 
 ## Applying
 
-Applies after 0596 (which adds HX014 to the same rule table). New module + one-keyword edits per call site.
+Applies after 0610 (which adds HX014 to the same rule table). New module + one-keyword edits per call site.
 
 ## Gotchas
 

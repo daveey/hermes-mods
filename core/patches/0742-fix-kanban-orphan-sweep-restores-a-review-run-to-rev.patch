@@ -1,0 +1,260 @@
+From 9f23cabf55131bbc23db2bb56ae3a4e4454aa251 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 12:15:42 +0000
+Subject: [PATCH] fix(kanban): orphan sweep restores a review run to review and
+ skips claims in flight [daveey]
+
+reconcile_orphaned_running hard-coded status='ready'. Every other release path uses
+_retry_status_for_run, so a reviewer run caught by the sweep became an implementation run
+(MacBook t_01a18189ff87b1c1, 2026-10-28: an Opus worker redid finished work).
+
+The sweep also fired on claims still being published. On a primary board the Board's lease
+grant writes the card 'running'; the feed applies that row (_upsert_task + _mirror_lease)
+before, or instead of, the local claim CAS (claim_and_open_run sets claim_lock atomically, so
+it is not the source). The card reads running/claim_lock NULL with our lease mirrored, and the
+sweep requeued it (39 false "dead/gone worker" reconciles on 8 cards in one drain window).
+
+Now: requeue to _retry_status_for_run (payload retry_status, comment names it); defer a card
+with a 'claimed' event younger than ORPHAN_CLAIM_GRACE_SECONDS (180 s = grant RPC 30 s + claim
+txn busy timeout 120 s + release RPC 30 s) or a live Board lease this gateway holds.
+---
+ hermes_cli/kanban_db_dispatch.py              | 41 +++++++++++++---
+ hermes_cli/kanban_db_sync.py                  | 16 +++++++
+ .../gateway/test_kanban_reconcile_orphans.py  | 48 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_sync_run_rows.py | 29 ++++++++++-
+ 4 files changed, 127 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index f44433e708..b57fd68861 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -979,15 +979,37 @@ def detect_stale_running(
+     return reclaimed
+ 
+ 
++# A ``claimed`` event younger than this means a claim may still be publishing, so the orphan sweep leaves
++# the card alone. One claim publication (``claim_task``/``claim_review_task``) is: the Board lease grant
++# RPC (``kanban_sync_client.HTTP_TIMEOUT_S`` = 30 s), the claim txn's ``BEGIN IMMEDIATE`` (busy timeout,
++# ``DEFAULT_BUSY_TIMEOUT_MS`` = 120 s), then, when the CAS was refused, the release RPC of the unused
++# lease (30 s): 180 s worst case. The Board's grant row can reach the local DB anywhere in that window
++# and leaves the card ``running`` with no ``claim_lock``. A real orphan waits at most this long more.
++ORPHAN_CLAIM_GRACE_SECONDS = 180
++
++
++def _claim_in_flight(conn: sqlite3.Connection, task_id: str, now: int) -> bool:
++    """A claim on ``task_id`` may still be publishing: claimed within the grace, or the Board
++    lease mirror says this gateway holds an unexpired lease on it."""
++    if conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' AND created_at >= ? LIMIT 1",
++        (task_id, now - ORPHAN_CLAIM_GRACE_SECONDS),
++    ).fetchone():
++        return True
++    return _kb._sync.held_by_us_live(conn, task_id, now)
++
++
+ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+     """Requeue ``running`` cards with broken claim bookkeeping; returns their ids.
+ 
+     A task ``running`` with NULL ``claim_lock``/``claim_expires`` (crash
+     mid-claim, manual SQL, DB restore) is a zombie forever: ``release_stale_claims``
+     needs ``claim_expires``, ``detect_crashed_workers`` needs a host-local lock +
+-    pid, ``detect_stale_running`` is off by default. Orphans go back to ``ready``
+-    with a comment, leaked run closed, ``reconciled`` event; a row with a live
+-    host-local PID is deferred so no duplicate spawns beside it.
++    pid, ``detect_stale_running`` is off by default. Orphans go back to their
++    claimed source phase (``review`` for a reviewer run, else ``ready``) with a
++    comment, leaked run closed, ``reconciled`` event; a row with a live
++    host-local PID, or with a claim still in flight (:func:`_claim_in_flight`),
++    is deferred so no duplicate spawns beside it.
+     """
+     now = int(time.time())
+     reconciled: list[str] = []
+@@ -1006,14 +1028,20 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+                 "pid %s is alive on this host — deferring", tid, pid,
+             )
+             continue
++        if _claim_in_flight(conn, tid, now):
++            _kb._log.debug("kanban reconcile: task %s has a claim in flight — deferring", tid)
++            continue
+         with _kb.write_txn(conn):
++            # Restore the claimed source phase, as every other release path does:
++            # a reviewer run must go back to review, not to an implementation run.
++            retry_status = _kb._retry_status_for_run(conn, tid)
+             cur = conn.execute(
+-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
++                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                 "last_heartbeat_at = NULL "
+                 "WHERE id = ? AND status = 'running' "
+                 "  AND claim_lock IS ? AND claim_expires IS ?",
+-                (tid, row["claim_lock"], row["claim_expires"]),
++                (retry_status, tid, row["claim_lock"], row["claim_expires"]),
+             )
+             if cur.rowcount != 1:
+                 continue
+@@ -1023,6 +1051,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+                 "claim_expires": _kb._to_epoch(row["claim_expires"]),
+                 "worker_pid": int(pid) if pid else None,
+                 "now": now,
++                "retry_status": retry_status,
+             }
+             run_id = _kb._end_run(
+                 conn, tid,
+@@ -1033,7 +1062,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
+             _kb._insert_comment(
+                 conn, tid, "dispatcher",
+                 "reconciliation: card was 'running' with no valid claim "
+-                "(dead/gone worker) — requeued to ready",
++                f"(dead/gone worker) — requeued to {retry_status}",
+                 now,
+             )
+             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 1d548da99a..9cfb94d2e2 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -753,6 +753,22 @@ def release_lease(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str]
+         _log.info("kanban sync: lease release for %s failed (%s); it expires on the server", task_id, exc)
+ 
+ 
++def held_by_us_live(conn: sqlite3.Connection, task_id: str, now: Optional[int] = None) -> bool:
++    """True when the mirrored Board lease on ``task_id`` is this gateway's and has not expired.
++
++    The Board's lease grant writes the card ``running`` and the feed can apply that row before (or,
++    when the claim is then refused and its lease released, instead of) the local claim CAS, so the
++    card reads ``running`` with no ``claim_lock`` while the claim is still being published. False on
++    a board that is not primary (no lease mirror)."""
++    if board_mode(conn) != "primary":
++        return False
++    row = conn.execute("SELECT lease_holder, lease_expires FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or row["lease_holder"] is None or row["lease_expires"] is None:
++        return False
++    now_ms = int((time.time() if now is None else now) * 1000)
++    return row["lease_holder"] == _state(conn)["gateway_id"] and int(row["lease_expires"]) > now_ms
++
++
+ def held_elsewhere_sql(conn: sqlite3.Connection, alias: str = "") -> str:
+     """SQL condition (``AND NOT ...``) that leaves out cards whose Board lease another gateway holds.
+ 
+diff --git a/tests/gateway/test_kanban_reconcile_orphans.py b/tests/gateway/test_kanban_reconcile_orphans.py
+index a252b0925c..2b4d3a7374 100644
+--- a/tests/gateway/test_kanban_reconcile_orphans.py
++++ b/tests/gateway/test_kanban_reconcile_orphans.py
+@@ -22,6 +22,7 @@ Inspired by openai/symphony's tracker reconciliation (Apache-2.0), idea-level.
+ from __future__ import annotations
+ 
+ import subprocess
++import time
+ from pathlib import Path
+ 
+ import pytest
+@@ -62,6 +63,24 @@ def _orphan_running(conn, tid, *, claim_lock=None, claim_expires=None,
+     conn.commit()
+ 
+ 
++def _orphaned_claim(conn, lane, *, claimed_age=None):
++    """Claim a card through ``lane`` (``ready`` or ``review``), then drop its claim bookkeeping as a
++    dead claimer would. The ``claimed`` event is aged past the in-flight grace unless ``claimed_age``."""
++    tid = kb.create_task(conn, title=f"{lane}-orphan", assignee="w")
++    if lane == "review":
++        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        conn.commit()
++        assert kb.claim_review_task(conn, tid)
++    else:
++        assert kb.claim_task(conn, tid)
++    age = 3600 if claimed_age is None else claimed_age  # well past ORPHAN_CLAIM_GRACE_SECONDS
++    conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'claimed'",
++                 (int(time.time()) - age, tid))
++    conn.commit()
++    _orphan_running(conn, tid)
++    return tid
++
++
+ class TestReconcileOrphanedRunning:
+     def test_null_claim_lock_orphan_requeued(self, conn):
+         """running + claim_lock NULL → requeued to ready with a note."""
+@@ -141,6 +160,35 @@ class TestReconcileOrphanedRunning:
+ 
+         assert kbd.reconcile_orphaned_running(conn) == [tid]
+ 
++    def test_review_run_orphan_requeued_to_review(self, conn):
++        """A reviewer run that lost its claim goes back to ``review``: requeueing it to ``ready``
++        spawns an implementation worker on finished work (MacBook t_01a18189ff87b1c1)."""
++        tid = _orphaned_claim(conn, "review")
++
++        assert kbd.reconcile_orphaned_running(conn) == [tid]
++
++        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "review"
++        recon = [e for e in kb.list_events(conn, tid) if e.kind == "reconciled"]
++        assert recon[-1].payload["retry_status"] == "review"
++        assert any("requeued to review" in (c.body or "") for c in kb.list_comments(conn, tid))
++
++    def test_implementation_run_orphan_still_requeued_to_ready(self, conn):
++        tid = _orphaned_claim(conn, "ready")
++
++        assert kbd.reconcile_orphaned_running(conn) == [tid]
++
++        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "ready"
++        assert any("requeued to ready" in (c.body or "") for c in kb.list_comments(conn, tid))
++
++    def test_card_claimed_within_grace_is_not_reconciled(self, conn):
++        """A ``claimed`` event younger than the claim-publication grace means a claim is in flight
++        (the Board's grant row can land before, or instead of, the local claim): leave it."""
++        tid = _orphaned_claim(conn, "review", claimed_age=5)
++
++        assert kbd.reconcile_orphaned_running(conn) == []
++        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "running"
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == "reconciled"]
++
+     def test_non_running_statuses_ignored(self, conn):
+         for status in ("todo", "ready", "blocked", "done"):
+             tid = kb.create_task(conn, title=f"s-{status}", assignee="w")
+diff --git a/tests/hermes_cli/test_kanban_sync_run_rows.py b/tests/hermes_cli/test_kanban_sync_run_rows.py
+index f241df11ff..33f70b97b7 100644
+--- a/tests/hermes_cli/test_kanban_sync_run_rows.py
++++ b/tests/hermes_cli/test_kanban_sync_run_rows.py
+@@ -97,13 +97,40 @@ def test_stale_lock_reclaim_survives_the_echo_of_the_runs_earlier_push(live, kan
+ def test_orphan_sweep_survives_the_echo_of_the_runs_earlier_push(live, kanban_home, svc):
+     tid, uid = _claimed(live, kanban_home, svc, "orphan")
+     _round(kanban_home, svc)
+-    live.execute("UPDATE tasks SET claim_lock = NULL, worker_pid = NULL WHERE id = ?", (tid,))
++    # A dead claimer long ago: no local claim and a lease mirror that already lapsed (a live one we hold
++    # means a claim may still be in flight, which the sweep leaves alone).
++    live.execute("UPDATE tasks SET claim_lock = NULL, worker_pid = NULL, lease_expires = ? WHERE id = ?",
++                 (int(time.time() - 5) * 1000, tid))
++    live.execute("UPDATE task_events SET created_at = created_at - 3600 WHERE task_id = ? AND kind = 'claimed'",
++                 (tid,))
+     assert kd.reconcile_orphaned_running(live) == [tid]
+     _round(kanban_home, svc)
+     _round(kanban_home, svc)
+     _assert_ended(live, svc, uid, "reclaimed")
+ 
+ 
++def test_board_grant_row_mid_claim_is_not_reconciled(live, kanban_home, svc):
++    """The MacBook incident (t_01a18189ff87b1c1, 10-28): the Board's lease grant writes the card
++    ``running``; the feed applied that row before the local claim landed (the claim was refused by the
++    update admission hold and its lease released). Locally the card read ``running`` with no claim and
++    no worker, the orphan sweep requeued the review card to ``ready``, and an implementation worker ran
++    it again. A card whose Board lease this gateway still holds has a claim in flight: leave it."""
++    tid = kb.create_task(live, title="review mid-claim", assignee="worker")
++    live.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
++    live.commit()
++    _round(kanban_home, svc)
++    gate = sync.claim_gate(live, tid, int(time.time()) + 900, lane="review")
++    assert gate.lease is not None and gate.lease.granted
++    _round(kanban_home, svc)  # the grant's row reaches us: running, our lease, no local claim
++    row = live.execute("SELECT status, claim_lock, lease_holder FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (row["status"], row["claim_lock"], row["lease_holder"]) == ("running", None, ME)
++
++    assert kd.reconcile_orphaned_running(live) == []
++    assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
++    assert not [e for e in kb.list_events(live, tid) if e.kind == "reconciled"]
++    gate.__exit__(None, None, None)  # the unused lease is released, as the refused claim does
++
++
+ def test_a_run_that_ends_before_its_first_push_survives_the_grants_own_run_row(live, kanban_home, svc):
+     """The Board's grant wrote the run row before the local claim did; that copy reaching the gateway after the
+     run already ended (a slow round) must not reopen it."""
+-- 
+2.55.0
+
