@@ -774,7 +774,8 @@ def blocks_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Opt
     backend then reports code skew and the Desktop restarts, killing in-flight turns in every chat), repacks
     the running Hermes.app, or writes a source file in the tree (backends lazily import from it, so even a
     transient edit can load live, and `hermes update` stamps the version `.dirty`). Writes to gitignored
-    paths (logs, venv, node_modules, build output) stay allowed. `COACH_ALLOW_LIVE=1` in the command (or the
+    paths (logs, venv, build output) stay allowed, except `<live>[/<dir>]/node_modules` (cp/rsync/copytree into it,
+    or npm/pnpm/yarn/bun install run there): it is the live dependency install. `COACH_ALLOW_LIVE=1` in the command (or the
     process env, for write_file/patch/execute_code) is the escape hatch for a change the user explicitly asked
     to make in the live tree."""
     if not checkout:
@@ -826,6 +827,9 @@ PY_CHDIR_RE = re.compile(r"""\bos\.chdir\(\s*(?:os\.path\.expanduser\(\s*)?(['"]
 PY_LITERAL_RE = re.compile(r"""(['"])((?:(?!\1)[^\\\n]|\\.)*)\1""")
 INPLACE_EDIT_RE = re.compile(r"(\bsed\s+(?:-\w+\s+)*-i\b|\bperl\s+-\w*i\w*\b)")
 FILE_CMD_RE = re.compile(r"(?:^|(?<=[;&|(\n]))\s*(?:sudo\s+)?(cp|mv|install|rsync|ln|tee|rm|truncate|touch|patch)(?=\s)")
+PKG_INSTALL_RE = re.compile(r"(?:^|(?<=[;&|(\n]))\s*(?:sudo\s+)?(?:[A-Z_][A-Z0-9_]*=\S*\s+)*(npm|pnpm|yarn|bun)\b"
+                            r"[^;&|\n]*?\s(install|i|ci|add|update|up|upgrade|uninstall|remove|rm|un|link|ln|dedupe|"
+                            r"prune|rebuild)(?![-\w])")
 GIT_FILE_WRITE_RE = re.compile(r"\bgit\b((?:\s+-C\s+(?:\"[^\"]*\"|'[^']*'|\S+))?)[^;&|\n]*?\s(stash|apply|rm|mv)(?![-\w])")
 
 
@@ -848,8 +852,23 @@ def _ignored(path: str, root: str) -> bool:
         return False
 
 
+def _in_node_modules(rel: str) -> bool:
+    """`<live>/node_modules/...` or `<live>/<dir>/node_modules/...`: gitignored, but it is the dependency install the
+    running backends and the `hermes update` completion tail resolve from. A hand-copied package there that is not
+    in package-lock.json shadows the lock's tree (2026-10-29: an extraneous hoisted @rolldown/plugin-babel broke the
+    web typecheck and the update tail failed 6x), so writes into it are refused like source writes."""
+    parts = Path(rel).parts
+    return bool(parts) and (parts[0] == "node_modules" or (len(parts) > 1 and parts[1] == "node_modules"))
+
+
+def _writable_ignored(path: str, root: str) -> bool:
+    """Gitignored and safe to write (logs, venv, build output): node_modules is ignored but not writable."""
+    return _ignored(path, root) and not _in_node_modules(_rel(path, root))
+
+
 def _live_write_target(target: str, base: str, root: str) -> Optional[str]:
-    """`target` (resolved against `base`) as a root-relative path, when it is a non-ignored path inside the tree."""
+    """`target` (resolved against `base`) as a root-relative path, when it is a non-ignored path inside the tree
+    (node_modules counts as not ignored)."""
     t = (target or "").strip().strip("\"'")
     if not t or t.startswith("&") or "$" in t or "`" in t or "\n" in t or set(t) <= {"_"}:
         return None
@@ -865,7 +884,7 @@ def _live_write_target(target: str, base: str, root: str) -> Optional[str]:
         rp = str(Path(t).resolve())
     except Exception:
         rp = t
-    if rp == root or _ignored(rp, root):
+    if rp == root or _writable_ignored(rp, root):
         return None
     return _rel(rp, root)
 
@@ -965,7 +984,7 @@ def _terminal_live_write(raw: str, cmd: str, wd: str, root: str) -> Optional[str
         d = _target_dir(cmd, m.start(1), "", wd) or ""
         words = [w for w in _seg_words(seg)[1:] if not w.startswith("-")]
         if name == "patch":
-            if d and _inside(d, root) and not _ignored(d, root):
+            if d and _inside(d, root) and not _writable_ignored(d, root):
                 return "`patch`"
             continue
         if name in ("cp", "install", "rsync", "ln"):
@@ -974,6 +993,21 @@ def _terminal_live_write(raw: str, cmd: str, wd: str, root: str) -> Optional[str
             hit = _live_write_target(w, d, root)
             if hit:
                 return f"`{name}` of `{hit}`"
+    for m in PKG_INSTALL_RE.finditer(cmd):
+        words = _seg_words(_segment(cmd, m.start(1)))
+        if any(w in ("-g", "--global", "--location=global") for w in words):
+            continue
+        explicit = ""
+        for i, w in enumerate(words):
+            if w in ("--prefix", "-C", "--dir", "--cwd") and i + 1 < len(words):
+                explicit = words[i + 1]
+            elif w.startswith(("--prefix=", "--dir=", "--cwd=")):
+                explicit = w.split("=", 1)[1]
+        d = _target_dir(cmd, m.start(1), explicit, wd)
+        if d and _inside(d, root):
+            sub = _rel(os.path.normpath(d), root)
+            nm = "node_modules" if sub in (".", "") else f"{sub}/node_modules"
+            return f"`{m.group(1)} {m.group(2)}` into `{nm}`"
     for m in GIT_FILE_WRITE_RE.finditer(cmd):
         rest = cmd[m.end():]
         if m.group(2) == "stash" and re.match(r"\s+(list|show)\b", rest):
@@ -1006,6 +1040,16 @@ WRITE_BLOCK_PREFIXES = ("a ", "write_file", "patch", "`sed", "`perl", "`cp", "`m
 
 def block_message(what: str, checkout: Path) -> str:
     path = str(checkout).replace(str(Path.home()), "~", 1)
+    if "node_modules" in what:
+        return (f"COACH LIVE-CHECKOUT GUARD: blocked {what} in {path}, the checkout every running Hermes backend "
+                "executes. Its node_modules is the dependency install the backends and the `hermes update` completion "
+                "tail resolve from: a package hand-installed or copied there that is not in package-lock.json shadows "
+                "the lock's tree (2026-10-29: an extra hoisted @rolldown/plugin-babel broke the web typecheck and the "
+                "update tail failed 6x). To get a test or build working, use a worktree with its own node_modules: "
+                "`~/.hermes/bin/hermes-core-wt new <slug>` (no hermes-core-wt on this host: `git -C "
+                f"{path} worktree add -b fix/<slug> ~/code/_wt/<slug> origin/main`), then `npm ci` and test there. "
+                "Only if the user explicitly asked for this exact change in the live tree, rerun with "
+                "`COACH_ALLOW_LIVE=1` at the start of the command.")
     if what.startswith(WRITE_BLOCK_PREFIXES):
         return (f"COACH LIVE-CHECKOUT GUARD: blocked {what} in {path}, the checkout every running Hermes backend "
                 "executes. Backends lazily import from this tree, so even a transient edit can be loaded live, and "

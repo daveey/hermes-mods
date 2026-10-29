@@ -42,8 +42,13 @@ there: output redirects, `sed -i`/`perl -pi`, `cp/mv/install/rsync/ln` destinati
 path (relative paths resolve against the last `cd`/`workdir`/`os.chdir`). Why: backends lazily import from the tree,
 so even a transient edit can load live, and `hermes update` stamps the version `.dirty` (2026-10-28: a heredoc
 `open(p,'w').write(...)` on `hermes_cli/kanban_wake_check.py`, reverted a minute later). Gitignored paths (`logs/`,
-`venv/`, `node_modules/`) and reads (`read_file`, `cat`, `grep`, `sed -n`, `git log/status/diff`, `git stash list`,
-`git apply --check`) pass. Escape hatch: `COACH_ALLOW_LIVE=1` at the start of the command or in the `execute_code`
+`venv/`, build output) and reads (`read_file`, `cat`, `grep`, `sed -n`, `git log/status/diff`, `git stash list`,
+`git apply --check`) pass. `node_modules/` at the tree root or one level down (`web/node_modules`) is gitignored but
+refused: `cp/mv/rsync/ln` into it (terminal), Python `shutil.copytree`/write calls naming it (terminal heredoc and
+`execute_code`), and `npm/pnpm/yarn/bun install|i|ci|add|update|remove|...` run with cwd (`cd`/`workdir`) or
+`--prefix`/`-C`/`--dir` in the tree (`-g` passes). It is the live dependency install the backends and the
+`hermes update` tail resolve from (2026-10-29: a hand-copied `@rolldown/plugin-babel` not in package-lock.json broke
+the web typecheck and the update tail failed 6x); the refusal points to a worktree with its own `npm ci`. Escape hatch: `COACH_ALLOW_LIVE=1` at the start of the command or in the `execute_code`
 source; for `write_file`/`patch`, in the process env. Tests: `tests/test_live_checkout_writes.py`.
 **Compute envelope (`compute_envelope.py`; `pre_tool_call` on `kanban_block` + `pre_verify`).** The standing rule
 (rent-machine skill, `~/AGENTS.md`): after the user's go on a job that needs a GPU, an agent may rent one single-GPU

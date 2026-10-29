@@ -128,3 +128,89 @@ def test_pre_tool_call_hook_refuses_live_writes(live, tmp_path):
     out = hooks["pre_tool_call"](tool_name="patch", args={"path": str(live / "run_agent.py")})
     assert out and out["action"] == "block"
     assert hooks["pre_tool_call"](tool_name="terminal", args={"command": f"cd {live} && git status"}) is None
+
+
+# ── node_modules hand-installs (2026-10-29 hub incident: a CI-verify session npm-installed
+# @rolldown/plugin-babel in /tmp and shutil.copytree'd it into the live root node_modules; the extraneous hoisted
+# copy broke the web typecheck and every `hermes update` completion tail failed 6x). node_modules is gitignored,
+# but it is the live install the running backends and the update tail resolve from, so writes into it are refused.
+
+@pytest.fixture
+def live_nm(live):
+    (live / ".gitignore").write_text("logs/\nvenv/\n*.log\nnode_modules/\ndist/\n")
+    for d in ("node_modules/@rolldown", "web/node_modules", "logs", "dist"):
+        (live / d).mkdir(parents=True, exist_ok=True)
+    return live
+
+
+INCIDENT_NM = ("python3 << 'PY'\nimport os, shutil\nsrc = \"/tmp/babel-install/node_modules\"\n"
+               "dst = \"{dst}\"\nfor name in os.listdir(src):\n"
+               "    shutil.copytree(os.path.join(src, name), os.path.join(dst, name), symlinks=True)\nPY")
+
+
+def test_terminal_cp_into_live_node_modules_is_refused(live_nm):
+    for cmd in (f"cp -r /tmp/babel-install/node_modules/@rolldown/plugin-babel {live_nm}/node_modules/@rolldown/",
+                f"cd {live_nm} && cp -a /tmp/x/node_modules/flru node_modules/",
+                f"rsync -a /tmp/x/node_modules/verkit/ {live_nm}/web/node_modules/verkit/",
+                f"mv /tmp/x/node_modules/flru ~/.hermes/hermes-agent/node_modules/flru",
+                f"ln -s /tmp/x/node_modules/flru {live_nm}/node_modules/flru",
+                INCIDENT_NM.format(dst=f"{live_nm}/node_modules")):
+        what = blk("terminal", {"command": cmd}, live_nm)
+        assert what and "node_modules" in what, cmd
+
+
+def test_terminal_npm_install_in_live_tree_is_refused(live_nm):
+    for args in ({"command": "npm install @rolldown/plugin-babel@0.2.3", "workdir": str(live_nm)},
+                 {"command": "npm i flru", "workdir": str(live_nm / "web")},
+                 {"command": "npm ci"}, {"command": f"cd {live_nm} && npm ci"},
+                 {"command": f"cd {live_nm}/web && pnpm add verkit"},
+                 {"command": f"cd {live_nm} && yarn add flru"},
+                 {"command": f"npm install --prefix {live_nm} flru"}):
+        if args["command"] == "npm ci":
+            args = {**args, "workdir": str(live_nm)}
+        what = blk("terminal", args, live_nm)
+        assert what and "node_modules" in what, args
+
+
+def test_execute_code_copytree_into_live_node_modules_is_refused(live_nm):
+    code = ("import shutil\nshutil.copytree('/tmp/babel-install/node_modules/@rolldown/plugin-babel', "
+            f"'{live_nm}/node_modules/@rolldown/plugin-babel', symlinks=True)")
+    what = blk("execute_code", {"code": code}, live_nm)
+    assert what and "node_modules" in what
+    code2 = f"open('{live_nm}/web/node_modules/flru/index.js', 'w').write('x')"
+    assert blk("execute_code", {"code": code2}, live_nm)
+    code3 = "from hermes_tools import terminal\nterminal('npm install flru', workdir='/x')\n" \
+            f"terminal('cd {live_nm} && npm install flru')"
+    assert blk("execute_code", {"code": code3}, live_nm)
+
+
+def test_node_modules_controls_pass(live_nm, tmp_path, monkeypatch):
+    wt = tmp_path / "code" / "_wt" / "fix"
+    (wt / "node_modules").mkdir(parents=True)
+    for args in ({"command": f"cp -r /tmp/x/node_modules/flru {wt}/node_modules/"},
+                 {"command": "npm install @rolldown/plugin-babel@0.2.3", "workdir": str(wt)},
+                 {"command": f"cd {wt} && npm ci"},
+                 {"command": "mkdir -p /tmp/babel-install && cd /tmp/babel-install && npm install flru"},
+                 {"command": "npm install -g flru", "workdir": str(live_nm)},
+                 {"command": f"cd {live_nm} && npm run build && ls node_modules/.bin"},
+                 {"command": f"cd {live_nm} && npx vitest run src/a.test.ts"},
+                 {"command": f"cp {live_nm}/node_modules/flru/package.json /tmp/pkg.json"},
+                 {"command": f"cd {live_nm} && echo hi >> logs/agent.log"},
+                 {"command": f"echo x > {live_nm}/venv/marker"},
+                 {"command": f"cp /tmp/bundle.js {live_nm}/dist/bundle.js"},
+                 {"command": "COACH_ALLOW_LIVE=1 npm ci", "workdir": str(live_nm)},
+                 {"command": f"COACH_ALLOW_LIVE=1 cp -r /tmp/x/flru {live_nm}/node_modules/"}):
+        assert not blk("terminal", args, live_nm), args
+    assert not blk("execute_code", {"code": f"import shutil\nshutil.copytree('/tmp/a', '{wt}/node_modules/a')"},
+                   live_nm)
+    assert not blk("write_file", {"path": str(live_nm / "logs" / "a.log"), "content": "x"}, live_nm)
+    nm_code = f"import shutil\nshutil.copytree('/tmp/a', '{live_nm}/node_modules/a')"
+    monkeypatch.setenv("COACH_ALLOW_LIVE", "1")
+    assert not blk("execute_code", {"code": nm_code}, live_nm)
+
+
+def test_node_modules_block_message_points_to_worktree(live_nm, tmp_path):
+    what = blk("terminal", {"command": "npm install flru", "workdir": str(live_nm)}, live_nm)
+    msg = rules.block_message(what, live_nm)
+    assert "node_modules" in msg and "worktree" in msg and "hermes-core-wt new" in msg
+    assert "COACH_ALLOW_LIVE=1" in msg and "package-lock" in msg
