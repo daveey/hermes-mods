@@ -1,0 +1,118 @@
+From 655cd3743f5cad22672436c15241d032c4a7b094 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:05:58 +0000
+Subject: [PATCH] fix(compression): wait out the deterministic fallback instead
+ of the LLM idle window [daveey]
+
+Problem: test_over_window_request_commits_the_deterministic_fallback_on_the_first_stall
+failed its first CI attempt (job 123475790090) with out is live. Logs: deterministic
+fallback "produced no compression" after "no progress for 6.4s, ceiling 2.0s". Retry passed.
+
+Why 1: the pinned deterministic retry was aborted and handed back the caller's list
+(conversation_compression.py "produced no compression" when result_msgs is messages).
+Why 2: that retry inherited the over-window collapsed ceiling, which the stall test
+sets to the 2s LLM idle window. The no-LLM commit does not touch_progress, so one
+silent window aborts it. Wall clock was 6.4s against a 2.0s ceiling.
+Why 3: the idle window is the hung-socket detector. The deterministic rung is local
+work (prompt rebuild, SQLite, malloc_trim) with no socket and no heartbeats.
+Why 4: commit 401122f7f3c widened the shared budget 0.4s to 2.0s instead of splitting
+the two waits, so the next throttled runner missed it again.
+
+Root (happened): one wall-clock budget serves hung-socket detection and local commit
+completion. Root (not caught): the test that asserts the commit uses a budget the
+commit can miss, and CI retry greened the job.
+
+The deterministic pinned retry now waits for the worker. 120s is only a hang
+backstop; the wait returns as soon as the commit lands. A SIGSTOP/SIGCONT duty
+cycle (15ms run / 400ms stop) reproduces the CI assertion on the old code and
+passes on this one. The stall-interrupted comment was shortened so the file stays
+at its main line cap.
+---
+ agent/conversation_compression.py             |  8 ++--
+ ...ompression_stall_deterministic_fallback.py | 39 +++++++++++++++++--
+ 2 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index c8bb7b3c0bf..24e5bc6621c 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -668,11 +668,9 @@ class CompressionCommitFence:
+ # Defaults for the in-agent progress-aware wrap; mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys.
+ DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
+ DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
++DETERMINISTIC_FALLBACK_WAIT_SECONDS = DEFAULT_CONTEXT_TIMEOUT_SECONDS
+ 
+-# Unlike explicit_interrupt, a /stop after the stall window arms the durable backoff (no automatic re-entry).
+-# Distinct from ``explicit_interrupt``: a /stop that arrived after the summary stream had already crossed
+-# the no-progress stall window (#96775). Ordinary early /stop stays cooldown-neutral; this class arms the
+-# durable backoff so the next automatic turn does not re-enter the same stalled strategy.
++# Unlike explicit_interrupt, a /stop after the stall window arms the durable backoff (#96775).
+ STALL_INTERRUPTED_FAILURE_CLASS = "stall_interrupted"
+ 
+ # Daemon pool so a fence-cancelled hung worker cannot block interpreter exit; never shut down per call.
+@@ -1007,6 +1005,8 @@ def _run_pinned_compression_retry(
+     ceiling = max(float(total_ceiling_seconds), idle)
+     deterministic = route.get("deterministic") is True
+     if deterministic:
++        idle = max(idle, DETERMINISTIC_FALLBACK_WAIT_SECONDS)
++        ceiling = max(ceiling, idle)
+         logger.warning(
+             "Context compression stalled on every summary route — committing the %s (no summary model) "
+             "before continuing without compression", route["label"],
+diff --git a/tests/agent/test_compression_stall_deterministic_fallback.py b/tests/agent/test_compression_stall_deterministic_fallback.py
+index 7dd805cc81c..7e5168d09c6 100644
+--- a/tests/agent/test_compression_stall_deterministic_fallback.py
++++ b/tests/agent/test_compression_stall_deterministic_fallback.py
+@@ -90,9 +90,9 @@ def _wait_cancelled_workers_settled():
+ 
+ @pytest.fixture
+ def fast_timeouts(monkeypatch):
+-    # The idle window bounds each attempt INCLUDING the deterministic rung's no-LLM compress pass (prompt
+-    # rebuild, SQLite commit, malloc_trim), which outran a 0.4 s window on loaded CI runners. 2 s keeps a
+-    # stall cheap while leaving that work several times its normal cost.
++    # Stall detection only. The deterministic rung does not inherit this window: it waits for the
++    # local commit and returns when that work finishes. Sharing this budget with that commit outran
++    # 0.4s, then 2.0s, on loaded CI runners.
+     monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (2.0, 20.0))
+ 
+ 
+@@ -299,3 +299,36 @@ def test_over_window_request_commits_the_deterministic_fallback_on_the_first_sta
+     assert out is not live and len(out) < len(live)
+     assert len(_summary_rows(out)) == 1, "the over-window request got a committed deterministic handoff"
+     assert getattr(agent, "_last_compression_timed_out", None) is not True
++
++
++def test_deterministic_pinned_retry_outlasts_the_llm_idle_window():
++    """The LLM idle window detects a silent socket. The deterministic rung is local work
++    (prompt rebuild, SQLite, malloc_trim) and must still commit when that work outlasts
++    the window — a CPU-throttled runner's wall clock does, and widening the shared budget
++    (0.4s, then 2.0s) did not hold."""
++    from agent.context_compressor import DETERMINISTIC_SUMMARY_ROUTE
++
++    original = [{"role": "user", "content": "keep-me"}]
++    recovered = [{"role": "assistant", "content": SUMMARY_PREFIX + " handoff"}]
++    llm_idle = 0.05
++
++    def worker(fence: CompressionCommitFence):
++        remaining = (fence.deadline_monotonic or 0.0) - time.monotonic()
++        assert remaining > llm_idle, "the deterministic fence inherited the LLM idle window"
++        # Outlast the idle window the caller passed. The delay is the behaviour under test.
++        time.sleep(llm_idle * 4)  # health: allow HX013 -- the sleep is the LLM idle window this commit must outlast
++        return recovered, "compressed-prompt"
++
++    started = time.monotonic()
++    result = cc._run_pinned_compression_retry(
++        dict(DETERMINISTIC_SUMMARY_ROUTE),
++        worker=worker, messages=original, system_prompt_fallback="degraded-prompt",
++        idle_timeout_seconds=llm_idle, total_ceiling_seconds=llm_idle,
++        on_commit_overrun=None, on_timeout_cause=None, telemetry_agent=None, new_fence=None,
++    )
++    elapsed = time.monotonic() - started
++
++    assert result is not None, "a slow local commit must not be abandoned as a silent socket"
++    assert result[0] is recovered and result[1] == "compressed-prompt"
++    # The wait returns when the worker finishes, not when a generous hang backstop expires.
++    assert elapsed < 2.0, f"deterministic wait blocked for {elapsed:.1f}s instead of returning on completion"
+-- 
+2.55.0
+

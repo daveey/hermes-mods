@@ -1,0 +1,464 @@
+From e4180d75354006a0c6f9865b3535314b213961b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:15:09 +0000
+Subject: [PATCH] fix(kanban): a /slug in a URL or path is not a board
+ reference [daveey]
+
+create_overlap refused seven unrelated creates on 2026-10-29 14:01-15:01 PDT
+(hub t_01a189b2d186a986). Three changes:
+
+1. A plain-word slug (hermes, bb, runners) is referenced only by `board <slug>`,
+   `--board <slug>`, `<slug> board`, `@task:<slug>@gw/...` or `<gateway>/<slug>`
+   as a whole token (hub/runners). `/<slug>` inside a URL, path or slash list
+   (github.com/daveey/hermes, ~/code/hermes, Slack/Discord/BB Inbox) no longer
+   counts. A non-plain slug keeps 004623277d's rules (/unconventional-collab
+   anywhere, the slug in the title).
+2. Naming a plain-word board needs 2 shared title words that are >= 25% of the
+   longer title. One word ("skill", "create") or the hostname David-MBP matched
+   some card on a board of hundreds by chance.
+3. The hub replica's frozen legacy `<board>/<id>` row no longer outvotes its
+   qualified `<profile>/<board>/<id>` twin: done t_d6973c6f was named via its
+   legacy "running" row.
+
+Problem: 7 creates refused (ci-flaky-cards x3, three chat cards, this card's
+  own first create); every named card was unrelated, one done since 10-26.
+Why 1: _names_board('hermes', ...) is True for any body with a daveey/hermes CI
+  link: _explicit_board_ref matched `/` + slug anywhere.
+Why 2: 004623277d kept `/slug` as "explicit" because it is the gateway/board
+  form (hub/runners); the regex had no notion of which token precedes the `/`.
+Why 3: the board rule needed only one shared title word, sized for the
+  hyphenated Stage B case, so a weak signal on a plain-word board refused.
+Why 4 (done card): the replica query filtered status per row before the
+  dedupe, and the legacy pre-profile row (version 4, last written 10-2x) still
+  says running.
+Root (happened): board-reference detection was a substring rule with no model
+  of URLs/paths, and the evidence bar did not scale with how common the slug
+  and the shared words are.
+Root (not caught): 004623277d's tests came from one incident (a bare word in a
+  title) and asserted only bare-word negatives and `/slug` positives; no test
+  put a plain-word slug inside a URL or path, though the core repo's own name
+  is `hermes`. No test seeded a legacy replica row next to its qualified twin.
+Recurrence: second fix to this guard in a day; the first fixed the reported
+  shape only. This adds the observed corpus (real titles and trigger lines)
+  as regression cases so the next shape is checked against all of them.
+
+Tests: tests/tools/test_kanban_create_overlap_url_slug.py (25, red on base),
+  test_explicit_board_reference_still_names_the_board now shares >= 2 words
+  and also asserts one shared word does not refuse.
+---
+ hermes_cli/kanban_overlap.py                  | 104 ++++++---
+ tests/tools/test_kanban_create_overlap.py     |   8 +-
+ .../test_kanban_create_overlap_url_slug.py    | 208 ++++++++++++++++++
+ 3 files changed, 285 insertions(+), 35 deletions(-)
+ create mode 100644 tests/tools/test_kanban_create_overlap_url_slug.py
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index bcbaecb6526..b21260c40d7 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -6,15 +6,21 @@ open cards on every board of this gateway (live board DBs) and every other gatew
+ ``hub.db``), so the answer no longer depends on which chat asks or which board the card lands on.
+ 
+ An open card matches when:
+-- the new card names its board, is not being created on that board, and the titles share a word, or
++- the new card names its board, is not being created on that board, and the titles share a word (for a
++  plain-word slug, 2 words that are a quarter of the longer title: one shared word or a hostname with any of
++  the hundreds of cards on ``bb`` or ``hermes`` is chance, not overlap), or
+ - both titles share at least half of the longer title's significant words (3 or more).
+ 
+-Naming a board means an explicit reference (``/<slug>``, ``board <slug>``, ``<slug> board``) in the
+-title or body, or the slug itself in the title when the slug is not a single plain word
+-(``unconventional-collab``, not ``runners`` or ``hermes``). A bare plain word that equals a board
+-slug does not count.
++Naming a board means an explicit reference in the title or body: ``board <slug>``, ``--board <slug>``,
++``<slug> board``, ``@task:<slug>@...`` / ``@task:<slug>/...`` or ``<gateway>/<slug>`` for a known gateway
++(``hub/runners``). A plain-word slug (``hermes``, ``bb``, ``runners``) inside a URL, a filesystem path or a
++slash list is NOT a reference: ``github.com/daveey/hermes``, ``~/code/hermes``, ``Slack/Discord/BB Inbox``.
++A slug that is not one plain word (``unconventional-collab``) is specific enough that ``/<slug>`` anywhere
++or the slug itself in the title still names it (``Metta-AI/unconventional-collab``). A bare plain word that
++equals a board slug does not count.
+ 
+-Never matched: closed cards, the creator's own card, the new card's parents, cards the same chat or the same
++Never matched: closed cards (a replica's stale legacy ``<board>/<id>`` row never outvotes its qualified
++``<profile>/<board>/<id>`` twin), the creator's own card, the new card's parents, cards the same chat or the same
+ worker created (fan-out), the waiting card a capability-owner create quotes, and another capability-owner
+ card for that same waiting card. A missing or unreadable replica is skipped and logged, never a block.
+ ``kanban.create_overlap_check: false`` turns the check off.
+@@ -34,6 +40,7 @@ EVENT = "create_overlap"
+ OPEN = ("todo", "ready", "running", "scheduled", "blocked", "review", "triage")
+ MAX_SHOWN = 8
+ MIN_SHARED = 3
++PLAIN_BOARD_SCORE = 0.25
+ _STOP = frozenset("""
+ a an and are as at be by for from in into is it its of on or the then this that to via with without after before
+ when not no all new card task fix add run make use using update ensure follow up followup self heal
+@@ -58,22 +65,34 @@ def _plain_word_slug(slug: str) -> bool:
+     return bool(re.fullmatch(r"[a-z]+", (slug or "").lower()))
+ 
+ 
+-def _explicit_board_ref(slug: str, text: str) -> bool:
+-    """``/<slug>`` (``hub/runners``, ``Metta-AI/<slug>``), ``board <slug>`` or ``<slug> board``."""
++_SEP = r"[\s:=`'\\\"]+"
++_END = r"(?![a-z0-9_-])"
++
++
++def _explicit_board_ref(slug: str, text: str, gateways: Iterable[str] = ()) -> bool:
++    """``board <slug>``, ``--board <slug>``, ``<slug> board``, ``@task:<slug>@gw/...``, ``<gateway>/<slug>``.
++
++    A plain-word slug after a ``/`` in a URL, path or slash list (``github.com/daveey/hermes``,
++    ``~/code/hermes``, ``Slack/Discord/BB Inbox``) is not a reference (hub t_01a189b2d186a986);
++    a slug that is not one plain word (``Metta-AI/unconventional-collab``) still is.
++    """
+     s = re.escape((slug or "").lower())
+     if not s:
+         return False
+-    return bool(re.search(
+-        rf"(?:/|\bboard[\s:=`'\\\"]+){s}(?![a-z0-9_-])"
+-        rf"|(?<![a-z0-9_-]){s}(?![a-z0-9_-])[\s:=`'\\\"]+board\b",
+-        (text or "").lower(),
+-    ))
++    forms = [rf"\bboard{_SEP}{s}{_END}", rf"(?<![a-z0-9_-]){s}{_END}{_SEP}board\b", rf"@task:{s}(?=[@/])"]
++    gws = "|".join(re.escape(g.lower()) for g in sorted(set(gateways)) if g)
++    if gws:
++        # ``hub/runners`` or ``hub/runners/t_...`` as a whole token, never a segment of a longer path or URL.
++        forms.append(rf"(?<![\w./:~@-])(?:{gws})/{s}{_END}(?!/(?!t_[0-9a-f]))")
++    if not _plain_word_slug(slug):
++        forms.append(rf"/{s}{_END}")
++    return bool(re.search("|".join(forms), (text or "").lower()))
+ 
+ 
+-def _names_board(slug: str, title: str, body: str) -> bool:
++def _names_board(slug: str, title: str, body: str, gateways: Iterable[str] = ()) -> bool:
+     if not slug or slug == "default":
+         return False
+-    if _explicit_board_ref(slug, title) or _explicit_board_ref(slug, body):
++    if _explicit_board_ref(slug, title, gateways) or _explicit_board_ref(slug, body, gateways):
+         return True
+     # A bare slug token in the title names the board only when it is not a plain word.
+     # "runners" in "bb-linux runners can't run jobs" is not a board reference.
+@@ -83,13 +102,21 @@ def _names_board(slug: str, title: str, body: str) -> bool:
+     return bool(re.search(rf"(?<![a-z0-9_-]){s}(?![a-z0-9_-])", (title or "").lower()))
+ 
+ 
+-def _reasons(card: dict, new_words: set[str], title: str, body: str, target_board: str) -> tuple[list[str], float]:
++def _reasons(card: dict, new_words: set[str], title: str, body: str, target_board: str,
++             gateways: Iterable[str] = ()) -> tuple[list[str], float]:
+     reasons, score = [], 0.0
+     theirs = words(card.get("title") or "")
+     shared = new_words & theirs
+-    # A board named in passing (a path, a log line) is not enough: the titles must share a word too.
+-    if (card["board"] != target_board and shared - words(card["board"])
+-            and _names_board(card["board"], title, body)):
++    # A board named in passing (a path, a log line) is not enough: the titles must share a word too. A plain-word
++    # board (``hermes``, ``bb``) holds hundreds of cards, so one common word ("skill", "create") or a hostname
++    # ("David-MBP") matches some card there by chance: it needs 2 shared words that are a quarter of the title.
++    named = shared - words(card["board"])
++    if _plain_word_slug(card["board"]):
++        named_enough = len(named) >= 2 and len(shared) / max(len(new_words), len(theirs)) >= PLAIN_BOARD_SCORE
++    else:
++        named_enough = bool(named)
++    if (card["board"] != target_board and named_enough
++            and _names_board(card["board"], title, body, gateways)):
+         reasons.append(f"the new card names board {card['board']!r}")
+     if new_words and theirs:
+         score = len(shared) / max(len(new_words), len(theirs))
+@@ -141,13 +168,21 @@ def _replica_cards(self_gw: Optional[str]) -> Iterable[dict]:
+     marks = ",".join("?" * len(OPEN))
+     try:
+         with cached_ro(path) as c:
+-            rows = c.execute(f"SELECT gw, data FROM replica WHERE coll = 'tasks' AND gw != ? "
++            rows = c.execute(f"SELECT gw, key, data FROM replica WHERE coll = 'tasks' AND gw != ? "
+                              f"AND json_extract(data, '$.status') IN ({marks})", (self_gw or "", *OPEN)).fetchall()
++            keys = c.execute("SELECT gw, key FROM replica WHERE coll = 'tasks' AND gw != ?",
++                             (self_gw or "",)).fetchall()
+     except sqlite3.Error as exc:
+         _log.warning("kanban create overlap: replica %s unreadable, other gateways skipped (%s)", path, exc)
+         return
++    # A legacy ``<board>/<id>`` row is a frozen pre-profile snapshot: t_d6973c6f was done under
++    # ``default/hermes/t_d6973c6f`` and still "running" under ``hermes/t_d6973c6f``. When a qualified
++    # ``<profile>/<board>/<id>`` twin exists it is the card's state, so the legacy row never counts.
++    qualified = {(gw, str(key).split("/", 1)[1]) for gw, key in keys if str(key).count("/") == 2}
+     seen = set()
+-    for gw, raw in rows:
++    for gw, rkey, raw in rows:
++        if str(rkey).count("/") == 1 and (gw, str(rkey)) in qualified:
++            continue
+         try:
+             t = json.loads(raw)
+         except ValueError:
+@@ -207,18 +242,21 @@ def find(*, title: str, body: str, target_board: str, session_id: Optional[str],
+         waiting = capability_owner_waiting_id(title, body)
+         new_words = words(title)
+         out = []
+-        for source in (_local_cards(self_gw), _replica_cards(self_gw)):
+-            for card in source:
+-                if (card["id"] in skip or card["id"] == waiting
+-                        or (waiting and _sibling_owner(card.get("title") or "", waiting))
+-                        or (session_id and card["session_id"] == session_id)
+-                        or (self_tid and card["creator_task_id"] == self_tid)
+-                        or (family and card.get("key_family") == family)):
+-                    continue
+-                reasons, score = _reasons(card, new_words, title, body, target_board)
+-                if reasons:
+-                    out.append({**{k: card[k] for k in ("id", "board", "gateway", "status", "title", "chats")},
+-                                "why": "; ".join(reasons), "_score": score, "_local": card["local"]})
++        cards = [*_local_cards(self_gw), *_replica_cards(self_gw)]
++        gateways = {g for g in (self_gw, *(c["gateway"] for c in cards)) if g}
++        if gateways & {"hub", "hermes-hub"}:
++            gateways |= {"hub", "hermes-hub"}
++        for card in cards:
++            if (card["id"] in skip or card["id"] == waiting
++                    or (waiting and _sibling_owner(card.get("title") or "", waiting))
++                    or (session_id and card["session_id"] == session_id)
++                    or (self_tid and card["creator_task_id"] == self_tid)
++                    or (family and card.get("key_family") == family)):
++                continue
++            reasons, score = _reasons(card, new_words, title, body, target_board, gateways)
++            if reasons:
++                out.append({**{k: card[k] for k in ("id", "board", "gateway", "status", "title", "chats")},
++                            "why": "; ".join(reasons), "_score": score, "_local": card["local"]})
+         out.sort(key=lambda m: (-m["_score"], m["status"] not in ("running", "ready", "scheduled"), m["id"]))
+         return out
+     except Exception:  # health: allow BLE001 -- a broken check must never block creating a card
+diff --git a/tests/tools/test_kanban_create_overlap.py b/tests/tools/test_kanban_create_overlap.py
+index 036912b4df6..bb92ccefc34 100644
+--- a/tests/tools/test_kanban_create_overlap.py
++++ b/tests/tools/test_kanban_create_overlap.py
+@@ -233,14 +233,18 @@ def test_bare_plain_word_in_the_body_does_not_name_that_board(home):
+ 
+ 
+ def test_explicit_board_reference_still_names_the_board(home):
++    # Titles share 4 words (bb, macos, workspace, build) but not half of them: only the board reference
++    # matches. One shared word ("bb") is not enough for a plain-word board (hub t_01a189b2d186a986).
+     owner = _runners_owner()
+-    out = _create(title="CI: bb-linux fleet is down",
++    out = _create(title="CI: bb macOS workspace build is stuck",
+                   body="See hub/runners. The bb fleet is stuck.")
+     assert out.get("code") == "create_overlap", out
+     assert owner in [m["id"] for m in out["matches"]]
+-    named = _create(title="CI: the bb runners board is down", body="The bb fleet is stuck.")
++    named = _create(title="CI: bb macOS workspace build on the runners board is stuck", body="The bb fleet is stuck.")
+     assert named.get("code") == "create_overlap", named
+     assert owner in [m["id"] for m in named["matches"]]
++    one_word = _create(title="CI: bb-linux fleet is down", body="See hub/runners. The bb fleet is stuck.")
++    assert one_word.get("ok") is True, one_word
+ 
+ 
+ def test_hyphenated_slug_in_the_title_still_names_the_board(home):
+diff --git a/tests/tools/test_kanban_create_overlap_url_slug.py b/tests/tools/test_kanban_create_overlap_url_slug.py
+new file mode 100644
+index 00000000000..74bd57a7477
+--- /dev/null
++++ b/tests/tools/test_kanban_create_overlap_url_slug.py
+@@ -0,0 +1,208 @@
++"""create_overlap: a ``/hermes`` in a URL or path is not the ``hermes`` board. [daveey]
++
++Hub t_01a189b2d186a986. On 2026-10-29 (14:01-15:01 PDT) kanban_create refused seven unrelated cards. The
++core repo is daveey/hermes and the config checkout ~/code/hermes, so every CI link and path "named" board
++``hermes``; a slash list (``Slack/Discord/BB Inbox``) named board ``bb``; one shared title word ("skill",
++"create") or the hostname David-MBP then matched some open card there. One named card (t_d6973c6f) had been
++done since 10-26: the hub replica still holds its frozen pre-profile row ``hermes/t_d6973c6f`` = running
++next to the current ``default/hermes/t_d6973c6f`` = done.
++
++Titles and the triggering body lines below are the real ones from those creates.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++# Open cards on the MacBook's hermes board that the refusals named (titles as in the hub replica).
++TIMEOUTS = ("t_01a188f6e0f05080", "Desktop backend timeouts on David-MBP: 51 in 30 min")
++STALLS = ("t_01a189901d50acc8", "Fix recurring local Desktop session GET stalls after 24c3eda: 9.43s at 14:26 PDT")
++SKILL_SYNC = ("t_d6973c6f", "Fix: Auto-stash dirty skill files during hermes-sync to prevent fleet sync failures")
++
++RUN_URL = "https://github.com/daveey/hermes/actions/runs/18934051234/job/53995310442"
++
++
++def _flaky_body(test_id: str) -> str:
++    # scripts/ci/flaky_kanban.py::_card_body, as filed by the hub cron ci-flaky-cards.
++    return (f"Flaky test: `{test_id}`\n\nIt failed on its first attempt and passed when CI retried it "
++            f"({RUN_URL}, branch `main`).\nThe retry keeps the job green, so this card is the only signal.\n\n"
++            "Usual cause on the hub runners: a fixed wall-clock deadline that a CPU-throttled container misses.")
++
++
++FLAKY = [
++    "tests/hermes_cli/test_update_stale_dashboard_review.py::test_control_backend_with_no_review_is_stopped_as_today",
++    "tests/tools/test_skill_manager_tool.py::TestSkillMutationLock::test_concurrent_patches_keep_both_updates",
++    "tests/scripts/desktop_update/test_desktop_update_posix_handoff_protocol.py"
++    "::test_line_two_stays_young_through_the_r6_release_wait",
++]
++
++OBSERVED = {
++    "14:01:14 idle backend CPU": (
++        "Desktop backends burn ~40% of a core each with no turn work: request-thread SQL, tui-notif-pollers, "
++        "hub-sync (David-MBP 10-29)",
++        "Done when the fix is committed and pushed, or a PR is merged per the daveey/hermes AGENTS.md, with tests."),
++    "14:40:59 deflake stale dashboard review": (f"Deflake {FLAKY[0]}", _flaky_body(FLAKY[0])),
++    "14:40:59 deflake skill manager": (f"Deflake {FLAKY[1]}", _flaky_body(FLAKY[1])),
++    "14:46:25 lease live check": (
++        "Live check on David-MBP: lease fix f0f483955b stops the 'run_uid required' warnings and logs a lapsed "
++        "renewal after a sleep",
++        "Fix f0f483955b (card t_01a1893335f58583, PR https://github.com/daveey/hermes/pull/219) is proven in "
++        "tests; ~/code/hermes/state holds the probe."),
++    "14:51:57 lid-close live check": (
++        "Live check on David-MBP: Kanban runs held across a real lid-close (60+ min) survive now that the "
++        "awake-time fix is live",
++        "- On the `hermes` board, run 108 (t_01a1889b057a1d39) ended `timed_out` at 11:29:14 on 10-29, 37 s "
++        "after the wake."),
++    "14:52:05 deflake posix handoff": (f"Deflake {FLAKY[2]}", _flaky_body(FLAKY[2])),
++}
++
++# This card's own first create (15:01 PDT): refused with 14 matches on board bb.
++SELF_TITLE = ("create_overlap guard: '/hermes' in a URL or path counts as naming the hermes board, so unrelated "
++              "cards are refused (follow-up to 004623277d)")
++SELF_BODY = (
++    "In `hermes_cli/kanban_overlap.py`, `_explicit_board_ref(slug, text)` counts `/<slug>` anywhere. The core "
++    "repo is daveey/hermes and the config checkout is ~/code/hermes, so ordinary URLs and paths "
++    "(`https://github.com/daveey/hermes/actions/runs/...`, `~/code/hermes/...`) name the board called hermes.\n"
++    "This card's own first create (15:01 PDT) was refused with 14 matches on the bb board: its body says "
++    "\"the bb board\".")
++# 14:37 PDT, chat 20261026_170127_f07c32: refused with 8 matches on board bb.
++RECON_TITLE = ("PR-approval reconciler can't read PR #1950's ask (checked: 0 every minute): accept the observed "
++               "wordings, report unparsed asks, check asks when filed")
++RECON_BODY = (
++    "- `home/scripts/pr_approval_reconcile.py` (daveey/hermes@state, 8a3e3118) runs every minute on the MacBook.\n"
++    "  - action: \"Approve PR #1950 at head 21cb9c1c2 on GitHub, or OK the bb approval ask in Slack/Discord/BB "
++    "Inbox. Unblock = queue merges+deploys and I verify; archive = close the PR, findings stay open.\"\n"
++    "  - a fixed surface list; this ask says \"slack/discord/bb inbox\".")
++# Open bb cards that share exactly one generic title word with those creates.
++BB_ONE_WORD = ["Merge-train cards stuck in review on daveey-mini", "BB release refused by the hub gate",
++               "Voice create flow drops the wake word", "PR #2041 approval: kb client latency", "Hub ask queue drains"]
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_db as kb
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++def _replica(tmp_path, rows):
++    """hub.db with ``(gw, key, task)`` rows, keys as the hub writes them (legacy ``<board>/<id>`` included)."""
++    path = tmp_path / "hub-state" / "hub.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    db = sqlite3.connect(path)
++    db.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, data TEXT)")
++    for gw, key, task in rows:
++        db.execute("INSERT INTO replica VALUES (?,?,?,?)", (gw, "tasks", key, json.dumps(task)))
++    db.commit()
++    db.close()
++
++
++def _mac(tid, title, status, key=None, board="hermes"):
++    return ("macbook", key or f"default/{board}/{tid}",
++            {"id": tid, "board": board, "title": title, "status": status, "gateway": "macbook"})
++
++
++@pytest.fixture
++def macbook_hermes(home, tmp_path):
++    _replica(tmp_path, [
++        _mac(*TIMEOUTS, "todo"), _mac(*STALLS, "ready"),
++        _mac(*SKILL_SYNC, "running", key=f"hermes/{SKILL_SYNC[0]}"),  # frozen legacy row
++        _mac(*SKILL_SYNC, "done"),
++    ])
++
++
++def _bb_board(titles=BB_ONE_WORD):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_boards as kbb
++    from hermes_cli import kanban_db_connect as kbc
++    kbb.create_board("bb")
++    conn = kbc.connect(board="bb")
++    try:
++        return [kb.create_task(conn, title=t, assignee="default", session_id="other-chat") for t in titles]
++    finally:
++        conn.close()
++
++
++def _create(title, body, **args):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_create({"title": title, "body": body, "assignee": "default", "requires": [],
++                                         **args}))
++
++
++@pytest.mark.parametrize("row", sorted(OBSERVED))
++def test_observed_refusals_now_create(macbook_hermes, row):
++    title, body = OBSERVED[row]
++    out = _create(title, body)
++    assert out.get("code") != "create_overlap", out
++    assert out.get("ok") is True, out
++
++
++def test_this_cards_own_first_create_is_not_refused(macbook_hermes):
++    _bb_board()
++    out = _create(SELF_TITLE, SELF_BODY)
++    assert out.get("ok") is True, out
++
++
++def test_slash_list_naming_bb_is_not_a_board_reference(home):
++    _bb_board()
++    out = _create(RECON_TITLE, RECON_BODY)
++    assert out.get("ok") is True, out
++
++
++@pytest.mark.parametrize(("slug", "text"), [
++    ("hermes", "Flaked in https://github.com/daveey/hermes/actions/runs/1 (branch main)"),
++    ("hermes", "See ~/code/hermes/home/scripts and /home/ubuntu/.hermes/hermes/x"),
++    ("hermes", "per the daveey/hermes AGENTS.md"),
++    ("bb", "OK the bb approval ask in Slack/Discord/BB Inbox"),
++    ("hermes", "macbook/hermes-agent and hub/hermes/extra/path"),
++])
++def test_plain_slug_inside_a_url_or_path_is_not_a_reference(slug, text):
++    from hermes_cli.kanban_overlap import _names_board
++    assert _names_board(slug, "Deflake tests/tools/x.py::test_y", text, {"hub", "macbook", "mini"}) is False
++
++
++@pytest.mark.parametrize("text", [
++    "on the `hermes` board", "board hermes", "board: hermes", "hermes kanban --board hermes create",
++    "--board=hermes", "see @task:hermes@macbook/t_01a188f6e0f05080", "macbook/hermes", "macbook/hermes/t_d6973c6f",
++])
++def test_real_board_references_still_count(text):
++    from hermes_cli.kanban_overlap import _names_board
++    assert _names_board("hermes", "unrelated title", text, {"hub", "macbook", "mini"}) is True
++
++
++def test_true_duplicate_naming_a_plain_word_board_is_still_refused(macbook_hermes):
++    out = _create("David-MBP desktop backend timeouts again: 40 in 30 min",
++                  "Same as before; file it on board hermes.")
++    assert out.get("code") == "create_overlap", out
++    assert [m["id"] for m in out["matches"]] == [TIMEOUTS[0]]
++
++
++def test_one_shared_word_with_a_named_plain_board_does_not_refuse(macbook_hermes):
++    out = _create("Rotate the Desktop signing key", "Filed for the hermes board.")
++    assert out.get("ok") is True, out
++
++
++def test_a_done_card_is_never_named_through_its_stale_legacy_replica_row(macbook_hermes):
++    # Same title as the done card plus an explicit board reference: only an open card could be named.
++    out = _create(SKILL_SYNC[1], "On the hermes board.")
++    assert SKILL_SYNC[0] not in [m.get("id") for m in out.get("matches") or []], out
++    assert out.get("ok") is True, out
++
++
++def test_legacy_row_without_a_qualified_twin_still_counts(home, tmp_path):
++    _replica(tmp_path, [_mac(*STALLS, "ready", key=f"hermes/{STALLS[0]}")])
++    out = _create("Desktop session GET stalls recurring after 24c3eda at 14:26 PDT", "")
++    assert out.get("code") == "create_overlap", out
++    assert [m["id"] for m in out["matches"]] == [STALLS[0]]
+-- 
+2.55.0
+

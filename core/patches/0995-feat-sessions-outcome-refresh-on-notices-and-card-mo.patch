@@ -1,0 +1,1456 @@
+From 851e72eed448a002074ad3b4ed8f2462d7078f2b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:34:23 -0700
+Subject: [PATCH] feat(sessions): outcome refresh on notices and card moves,
+ notice guarantee, fan-out filter, restart and draft repairs [daveey]
+
+Session-outcome contract, core behavior (lane A2):
+- A kanban notice row written by the live poller, the unloaded sweeper or the remote sweep refreshes the
+  chat's stored outcome (trigger notice).
+- card_change_pass (unloaded sweeper loop) reads each board's status events, refreshes every linked chat
+  (trigger card_change) and marks the card's earlier "blocked" notices display_metadata.stale once it
+  leaves blocked.
+- Notice guarantee: a chat ending on a kanban notice older than 5 min with no live turn gets ONE close-out
+  wake (notice row claimed by CAS, 2 started per hour per lineage, chats held by another backend left to
+  it); a notice about a card blocked on a human never wakes and refreshes to decision; a refused wake or a
+  spent budget refreshes to unresolved{notice_tail}.
+- Fan-out: no notice or card-change refresh for released links, archived chats or moved_to_gateway copies.
+- desktop.auto_continue.resume_on_startup defaults on: boot continues fresh interrupted turns nobody reopens.
+- The orphan reap tells a parent chat when its subagent was killed mid-work (unresolved{subagent_killed}).
+- Maintenance archives interactive drafts with no message older than 24 h (hourly, any auto_archive setting).
+- kanban human_request accepts optional choices: 2-6 {label, value}.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/run.py                                |   8 +-
+ hermes_cli/cli_auto_maintenance.py            |   1 +
+ hermes_cli/config_defaults.py                 |   4 +-
+ hermes_cli/kanban_human_request.py            |  25 +-
+ hermes_cli/web_server_sessions.py             |  12 +-
+ hermes_state_maintenance.py                   |  46 ++++
+ hermes_state_outcome.py                       |   6 +-
+ .../test_kanban_human_request_choices.py      |  51 ++++
+ .../hermes_state/test_empty_draft_archive.py  |  61 +++++
+ tests/tui_gateway/test_notice_guarantee.py    | 115 +++++++++
+ .../test_session_outcome_notices.py           | 166 +++++++++++++
+ .../test_session_outcome_restarts.py          |  93 ++++++++
+ tests/tui_gateway/test_startup_resume.py      |   7 +-
+ tools/kanban_tools_schemas.py                 |   9 +
+ tui_gateway/kanban_remote_notices.py          |  15 +-
+ tui_gateway/kanban_unloaded.py                |  14 +-
+ tui_gateway/notice_fanout.py                  | 177 ++++++++++++++
+ tui_gateway/notice_guarantee.py               | 221 ++++++++++++++++++
+ tui_gateway/reap_notices.py                   |  65 ++++++
+ tui_gateway/session_notifications.py          |   2 +
+ tui_gateway/session_reaper.py                 |   2 +
+ tui_gateway/startup_resume.py                 |   8 +-
+ 22 files changed, 1084 insertions(+), 24 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_human_request_choices.py
+ create mode 100644 tests/hermes_state/test_empty_draft_archive.py
+ create mode 100644 tests/tui_gateway/test_notice_guarantee.py
+ create mode 100644 tests/tui_gateway/test_session_outcome_notices.py
+ create mode 100644 tests/tui_gateway/test_session_outcome_restarts.py
+ create mode 100644 tui_gateway/notice_fanout.py
+ create mode 100644 tui_gateway/notice_guarantee.py
+ create mode 100644 tui_gateway/reap_notices.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index c8b6c0f58af..6a278607665 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4566,8 +4566,9 @@ def _profile_sessions_dir(launch: Optional[tuple[Path, Path]]) -> Path:
+ 
+ 
+ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = None) -> None:
+-    """Stale-session auto-archive plus auto-prune/VACUUM for ONE profile's state.db; both are gated
+-    by sessions.min_interval_hours (VACUUM additionally by its own throttles). Opens its own
++    """Empty-draft archive (hourly, ungated), stale-session auto-archive and auto-prune/VACUUM for ONE
++    profile's state.db; the last two are gated by sessions.min_interval_hours (VACUUM additionally by its
++    own throttles). Opens its own
+     SessionDB — SQLite connections are thread-bound.
+ 
+     Profile-scoped by its caller: ``acquire()``, ``get_hermes_home()`` and ``load_config()`` all
+@@ -4579,10 +4580,9 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
+     from hermes_cli.config import load_config as _load_full_config
+     from hermes_state_registry import acquire, release_or_close
+     _sess_cfg = (_load_full_config().get("sessions") or {})
+-    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
+-        return
+     _adb = acquire()
+     try:
++        _adb.maybe_archive_empty_drafts()  # [daveey] ungated: empty drafts > 24 h are never a chat to resolve
+         if _sess_cfg.get("auto_archive", False):
+             _adb.maybe_auto_archive(
+                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+diff --git a/hermes_cli/cli_auto_maintenance.py b/hermes_cli/cli_auto_maintenance.py
+index f291231329f..7e344b7c0ae 100644
+--- a/hermes_cli/cli_auto_maintenance.py
++++ b/hermes_cli/cli_auto_maintenance.py
+@@ -44,6 +44,7 @@ def _run_state_db_auto_maintenance(session_db) -> None:
+             except Exception as _exc:
+                 logger.debug(skip_msg, _exc)
+ 
++        session_db.maybe_archive_empty_drafts()  # [daveey] not gated by sessions.auto_archive
+         cfg = (_load_full_config().get("sessions") or {})
+ 
+         # Auto-archive is independent of auto_prune: run it before prune's early return.
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 86a749025f9..cafd8201b04 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2765,8 +2765,8 @@ DEFAULT_CONFIG = {
+             "freshness_minutes": 15,
+             "max_attempts": 2,  # Crash-loop breaker: max automatic re-runs of one interrupted turn.
+             # Resume every interrupted session when the backend starts (app relaunch, `hermes update`),
+-            # not only the ones the user re-opens. Same freshness/attempt guards apply.
+-            "resume_on_startup": False,
++            # not only the ones the user re-opens. Same freshness/attempt guards apply. [daveey] on by default.
++            "resume_on_startup": True,
+         },
+         # Reopen a desktop app that `hermes update` / `hermes desktop --build-only` had to stop to
+         # swap in the rebuilt bundle (macOS/Linux). Off = upstream behaviour: a headless update
+diff --git a/hermes_cli/kanban_human_request.py b/hermes_cli/kanban_human_request.py
+index e66b9696143..e511acb4a2c 100644
+--- a/hermes_cli/kanban_human_request.py
++++ b/hermes_cli/kanban_human_request.py
+@@ -8,6 +8,26 @@ from typing import Any
+ INTERACTIONS = frozenset({"approval", "reply", "user_terminal", "physical", "external"})
+ FIELDS = ("action", "why_human", "interaction", "scope", "evidence")
+ NONHUMAN_KINDS = frozenset({"dependency", "transient", "time"})
++# [daveey] Optional decision buttons for a blocked card (session-outcome contract): 2-6 short {label, value}.
++MIN_CHOICES, MAX_CHOICES = 2, 6
++CHOICE_LABEL_MAX, CHOICE_VALUE_MAX = 60, 120
++
++
++def _validate_choices(value: Any) -> list[dict]:
++    if not isinstance(value, list) or not MIN_CHOICES <= len(value) <= MAX_CHOICES:
++        raise ValueError(f"human_request choices must be a list of {MIN_CHOICES}-{MAX_CHOICES} {{label, value}} items")
++    out = []
++    for choice in value:
++        label = choice.get("label") if isinstance(choice, dict) else None
++        val = choice.get("value") if isinstance(choice, dict) else None
++        if (not isinstance(label, str) or not label.strip() or len(label.strip()) > CHOICE_LABEL_MAX
++                or not isinstance(val, str) or not val.strip() or len(val.strip()) > CHOICE_VALUE_MAX):
++            raise ValueError(f"each human_request choice needs a label (<= {CHOICE_LABEL_MAX} chars) and a value "
++                             f"(<= {CHOICE_VALUE_MAX} chars)")
++        out.append({"label": label.strip(), "value": val.strip()})
++    if len({c["value"] for c in out}) != len(out):
++        raise ValueError("human_request choice values must be distinct")
++    return out
+ 
+ 
+ def validate_human_request(value: Any, *, kind: str | None = None) -> dict | None:
+@@ -22,7 +42,10 @@ def validate_human_request(value: Any, *, kind: str | None = None) -> dict | Non
+         raise ValueError("human_request interaction must be approval, reply, user_terminal, physical or external")
+     if kind in NONHUMAN_KINDS:
+         raise ValueError("human_request cannot accompany dependency, transient or time waits")
+-    return {field: value[field].strip() for field in FIELDS}
++    request = {field: value[field].strip() for field in FIELDS}
++    if value.get("choices") is not None:
++        request["choices"] = _validate_choices(value["choices"])
++    return request
+ 
+ 
+ def needs_human(value: Any, *, kind: str | None = None) -> bool:
+diff --git a/hermes_cli/web_server_sessions.py b/hermes_cli/web_server_sessions.py
+index 66b72fb46fd..0c9452d04a1 100644
+--- a/hermes_cli/web_server_sessions.py
++++ b/hermes_cli/web_server_sessions.py
+@@ -216,7 +216,7 @@ _last_auto_archive_check: dict[str, float] = {}
+ 
+ 
+ def _maybe_auto_archive_for_profile(profile: Optional[str]) -> None:
+-    """Config-gated stale-session auto-archive for ``profile``; never raises.
++    """Config-gated stale-session auto-archive plus the ungated empty-draft archive for ``profile``; never raises.
+     ``hermes serve`` runs neither CLI nor gateway startup hooks, so this
+     session-list trigger is what makes ``sessions.auto_archive`` work there."""
+     try:
+@@ -240,8 +240,6 @@ def _maybe_auto_archive_for_profile(profile: Optional[str]) -> None:
+             cfg = (_load_full_config().get("sessions") or {})
+         finally:
+             reset_hermes_home_override(_home_token)
+-        if not cfg.get("auto_archive", False):
+-            return
+         from hermes_cli.profiles import _check_gateway_running
+ 
+         # A live gateway owns this profile's store and runs the same sweep on its own
+@@ -256,9 +254,11 @@ def _maybe_auto_archive_for_profile(profile: Optional[str]) -> None:
+             return
+         db = _open_session_db_for_profile(profile, read_only=False)
+         try:
+-            db.maybe_auto_archive(
+-                idle_days=float(cfg.get("auto_archive_days", 3)),
+-                min_interval_hours=int(cfg.get("min_interval_hours", 24)))
++            db.maybe_archive_empty_drafts()  # [daveey] not gated by sessions.auto_archive
++            if cfg.get("auto_archive", False):
++                db.maybe_auto_archive(
++                    idle_days=float(cfg.get("auto_archive_days", 3)),
++                    min_interval_hours=int(cfg.get("min_interval_hours", 24)))
+         finally:
+             db.close()
+     except Exception as exc:
+diff --git a/hermes_state_maintenance.py b/hermes_state_maintenance.py
+index f8c80ee6153..56c6b3d77a0 100644
+--- a/hermes_state_maintenance.py
++++ b/hermes_state_maintenance.py
+@@ -319,6 +319,52 @@ class SessionMaintenanceMixin:
+             self._auto_archive_lineage(row[0])
+         return len(rows)
+ 
++    # [daveey] Session-outcome contract, "Drafts": a chat opened and never used is not a sidebar row to resolve.
++    DRAFT_SOURCES = ("desktop", "tui", "cli")
++    DRAFT_MAX_AGE_S = 86400.0
++    DRAFT_SWEEP_INTERVAL_S = 3600.0
++
++    def archive_empty_drafts(self, *, older_than_s: float = DRAFT_MAX_AGE_S) -> int:
++        """Archive (soft-hide, sweep provenance) interactive rows that never got a message and were last
++        touched ``older_than_s`` ago. Pinned rows, the hidden canonical Bot Chat and compression
++        continuations are exempt. Returns rows archived."""
++        cutoff = time.time() - float(older_than_s)
++        rows = self._read_all(
++            f"""
++            SELECT s.id FROM sessions s
++            WHERE s.archived = 0
++              AND COALESCE(s.message_count, 0) = 0
++              AND s.source IN ({_placeholders(self.DRAFT_SOURCES)})
++              AND COALESCE(s.end_reason, '') <> 'compression'
++              AND {_not_pinned_sql()}
++              AND NOT (COALESCE(s.hidden, 0) <> 0 AND COALESCE(s.title, '') = ?)
++              AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
++              AND NOT EXISTS (SELECT 1 FROM sessions p WHERE p.id = s.parent_session_id
++                                AND p.end_reason = 'compression')
++              AND {_LAST_ACTIVE_SQL} < ?
++            """, (*self.DRAFT_SOURCES, self.CANONICAL_BOT_CHAT_TITLE, cutoff))
++        for row in rows:
++            self._auto_archive_lineage(row[0])
++        if rows:
++            logger.info("state.db: archived %d empty draft session(s) older than %.0fh", len(rows),
++                        older_than_s / 3600)
++        return len(rows)
++
++    def maybe_archive_empty_drafts(self) -> int:
++        """:meth:`archive_empty_drafts` at most once per ``DRAFT_SWEEP_INTERVAL_S`` (state_meta
++        ``last_draft_archive``). Runs whatever ``sessions.auto_archive`` says. Never raises."""
++        try:
++            now = time.time()
++            since = _seconds_since(now, self.get_meta("last_draft_archive"))
++            if since is not None and since < self.DRAFT_SWEEP_INTERVAL_S:
++                return 0
++            count = self.archive_empty_drafts()
++            self.set_meta("last_draft_archive", str(now))
++            return count
++        except Exception:  # health: allow BLE001 -- a maintenance chore must never break its tick; logged
++            logger.warning("state.db empty-draft archive failed", exc_info=True)
++            return 0
++
+     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
+                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
+                        **filters) -> int:
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 198692098e8..b4226d8d5df 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -203,7 +203,8 @@ def _row(db: Any, sid: str) -> Optional[dict[str, Any]]:
+ def _tail(db: Any, sid: str) -> list[dict[str, Any]]:
+     """The last active transcript rows, newest first."""
+     rows = db._read_all(
+-        "SELECT id, role, content, tool_calls, tool_name, finish_reason, display_kind, timestamp FROM messages"
++        "SELECT id, role, content, tool_calls, tool_name, finish_reason, display_kind, display_metadata, timestamp"
++        " FROM messages"
+         " WHERE session_id = ? AND active = 1 AND role IN ('user', 'assistant', 'tool')"
+         " ORDER BY id DESC LIMIT ?", (sid, _TAIL_ROWS))
+     return [dict(r) for r in rows]
+@@ -360,7 +361,8 @@ def _declaration_holds(declared: dict, tail: list[dict]) -> bool:
+ def _tail_reason(tail: list[dict]) -> Optional[str]:
+     last = tail[0]
+     if last.get("display_kind") == _NOTICE_KIND:
+-        return "notice_tail"
++        # The orphan reap's notice to a parent whose subagent a restart killed (tui_gateway/reap_notices.py).
++        return "subagent_killed" if '"subagent_killed"' in str(last.get("display_metadata") or "") else "notice_tail"
+     if last["role"] in ("user", "tool") or (last["role"] == "assistant" and last.get("tool_calls")):
+         return "interrupted"
+     if (last.get("finish_reason") or "").strip().lower() in _ERROR_FINISH_REASONS:
+diff --git a/tests/hermes_cli/test_kanban_human_request_choices.py b/tests/hermes_cli/test_kanban_human_request_choices.py
+new file mode 100644
+index 00000000000..f89f2f6920b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_human_request_choices.py
+@@ -0,0 +1,51 @@
++"""A blocked card's ``human_request`` may carry decision ``choices`` (2-6 short {label, value}); they survive
++validation and storage on create and block, and a malformed list is refused. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as db
++from hermes_cli.kanban_db_connect import connect_closing
++from hermes_cli.kanban_human_request import validate_human_request
++
++CHOICES = [{"label": "Ship it", "value": "ship"}, {"label": "Hold", "value": "hold"}]
++REQUEST = dict(action="Reply ship or hold in this chat. Unblock = deploy; archive = drop it.",
++               why_human="Release owner decision required", interaction="approval", scope="Staging only",
++               evidence="Release policy", choices=CHOICES)
++
++
++def _stored(tid):
++    with connect_closing() as conn:
++        return json.loads(conn.execute("SELECT human_request FROM tasks WHERE id = ?", (tid,)).fetchone()[0])
++
++
++def test_choices_are_kept_on_create_and_on_block():
++    with connect_closing() as conn:
++        tid = db.create_task(conn, title="Deploy?", assignee="owner", initial_status="blocked",
++                             human_request=REQUEST, lint_blocked=False)
++    assert _stored(tid)["choices"] == CHOICES
++    with connect_closing() as conn:
++        other = db.create_task(conn, title="Deploy later?", assignee="owner")
++        assert db.block_task(conn, other, reason="owner decides", kind="needs_input", human_request=REQUEST)
++    assert _stored(other)["choices"] == CHOICES
++
++
++@pytest.mark.parametrize("bad", [
++    "ship or hold",                                              # not a list
++    [{"label": "Only one", "value": "one"}],                     # fewer than 2
++    [{"label": f"c{i}", "value": f"v{i}"} for i in range(7)],    # more than 6
++    [{"label": "Ship", "value": ""}, {"label": "Hold", "value": "hold"}],     # empty value
++    [{"label": "x" * 61, "value": "a"}, {"label": "Hold", "value": "hold"}],  # label too long
++    [{"label": "A", "value": "same"}, {"label": "B", "value": "same"}],       # duplicate value
++])
++def test_invalid_choices_are_rejected(bad):
++    with pytest.raises(ValueError, match="choice"):
++        validate_human_request({**REQUEST, "choices": bad})
++    with connect_closing() as conn, pytest.raises(ValueError, match="choice"):
++        db.create_task(conn, title="Bad ask", assignee="owner", initial_status="blocked",
++                       human_request={**REQUEST, "choices": bad}, lint_blocked=False)
++
++
++def test_a_request_without_choices_is_unchanged():
++    plain = {k: v for k, v in REQUEST.items() if k != "choices"}
++    assert validate_human_request(plain) == plain
+diff --git a/tests/hermes_state/test_empty_draft_archive.py b/tests/hermes_state/test_empty_draft_archive.py
+new file mode 100644
+index 00000000000..91a64de13f4
+--- /dev/null
++++ b/tests/hermes_state/test_empty_draft_archive.py
+@@ -0,0 +1,61 @@
++"""Drafts (session-outcome contract, lane A2): maintenance archives interactive rows that never got a message and
++are older than 24 h; pinned rows and young drafts stay. The pass runs from the gateway's state.db maintenance
++tick whatever ``sessions.auto_archive`` says. [daveey]"""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def db(tmp_path):
++    handle = SessionDB(db_path=tmp_path / "state.db")
++    yield handle
++    handle.close()
++
++
++def _draft(db, sid, age_h, *, source="desktop", pinned=False):
++    db.create_session(sid, source=source)
++    then = time.time() - age_h * 3600
++    db._conn.execute("UPDATE sessions SET started_at = ?, last_activity_at = ?, pinned = ? WHERE id = ?",
++                     (then, then, int(pinned), sid))
++    db._conn.commit()
++
++
++def _archived(db, sid):
++    return bool(db.get_session(sid)["archived"])
++
++
++def test_old_empty_drafts_are_archived_pinned_and_young_ones_stay(db):
++    _draft(db, "old", 30)
++    _draft(db, "pinned", 30, pinned=True)
++    _draft(db, "young", 2)
++    _draft(db, "used", 30)
++    db.append_message("used", role="user", content="hello")
++    db._conn.execute("UPDATE sessions SET last_activity_at = ? WHERE id = 'used'", (time.time() - 30 * 3600,))
++    db._conn.execute("UPDATE messages SET timestamp = ? WHERE session_id = 'used'", (time.time() - 30 * 3600,))
++    db._conn.commit()
++    _draft(db, "telegram", 30, source="telegram")
++
++    assert db.maybe_archive_empty_drafts() == 1
++
++    assert [s for s in ("old", "pinned", "young", "used", "telegram") if _archived(db, s)] == ["old"]
++    assert db.maybe_archive_empty_drafts() == 0  # throttled for the hour
++
++
++def test_gateway_maintenance_tick_archives_drafts_without_auto_archive(monkeypatch, db):
++    from gateway import run
++    from hermes_cli import config
++    import hermes_state_registry
++    _draft(db, "old", 30)
++    monkeypatch.setattr(config, "load_config", lambda: {"sessions": {"auto_archive": False, "auto_prune": False}})
++    monkeypatch.setattr(hermes_state_registry, "acquire", lambda *a, **k: db)
++    monkeypatch.setattr(hermes_state_registry, "release_or_close", lambda handle: None)
++
++    run._housekeeping_state_db_maintenance()
++
++    assert _archived(db, "old")
+diff --git a/tests/tui_gateway/test_notice_guarantee.py b/tests/tui_gateway/test_notice_guarantee.py
+new file mode 100644
+index 00000000000..c001b7aee48
+--- /dev/null
++++ b/tests/tui_gateway/test_notice_guarantee.py
+@@ -0,0 +1,115 @@
++"""Notice guarantee (session-outcome contract, lane A2): a chat whose last message is a kanban notice older than
++5 minutes, with no live turn, gets ONE close-out wake (budget 2/h); a wake that does not start, or a spent budget,
++leaves the stored outcome ``unresolved{notice_tail}``; a notice about a card blocked on a human never wakes and
++refreshes to ``decision``. [daveey]"""
++
++from __future__ import annotations
++
++import contextlib
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as ksa
++from hermes_state import SessionDB
++from tui_gateway import notice_guarantee as ng
++
++CHAT = "20261029_130000_a2guar"
++HUMAN = {"action": "Reply ship or hold here. Unblock = deploy; archive = drop it.",
++         "why_human": "Only David approves prod.", "interaction": "approval", "scope": "prod deploy",
++         "evidence": "CI green", "choices": [{"label": "Ship", "value": "ship"}, {"label": "Hold", "value": "hold"}]}
++
++
++@pytest.fixture
++def db(tmp_path):
++    so._reset_hooks_for_tests()
++    ksa._reset_cache_for_tests()
++    handle = SessionDB(tmp_path / "state.db")
++    handle.create_session(CHAT, "desktop")
++    handle.append_message(CHAT, "user", "run the deploy card")
++    handle.append_message(CHAT, "assistant", "Started the deploy card; I will report when it lands.")
++    yield handle
++    handle.close()
++    so._reset_hooks_for_tests()
++
++
++def _notice(db, text, *, age=600.0, **meta):
++    row = db.append_kanban_notice(CHAT, text, {"notice_id": f"n:{text}:{time.time()}", "display_text": text, **meta})
++    db._write_rowcount("UPDATE messages SET timestamp = ? WHERE id = ?", (time.time() - age, row))
++    return row
++
++
++def _run(db, verdict="started"):
++    calls = []
++
++    def wake(sid, msg_id):
++        calls.append((sid, msg_id))
++        return verdict
++
++    @contextlib.contextmanager
++    def opener(chat_id):
++        yield db, db.get_compression_tip(chat_id) or chat_id
++
++    out = ng.guarantee_pass(stores=lambda: iter([db]), holders=list, session_db=opener, wake=wake,
++                            spawn=lambda job: job())
++    return out, calls
++
++
++def _closeout(db, row):
++    return db._read_one("SELECT json_extract(display_metadata, '$.closeout.state') FROM messages WHERE id = ?",
++                        (row,))[0]
++
++
++def test_an_unanswered_notice_gets_one_closeout_wake(db):
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++
++    out, calls = _run(db)
++
++    assert calls == [(CHAT, row)] and [o["result"] for o in out] == ["dispatched"]
++    assert _closeout(db, row) == "started"
++    assert _run(db) == ([], [])  # claimed: never woken twice
++
++
++def test_young_notice_waits_for_the_grace_window(db):
++    _notice(db, "✔ Kanban t_aaa done — deploy card", age=30)
++    assert _run(db) == ([], [])
++
++
++def test_a_refused_wake_leaves_the_outcome_notice_tail(db):
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++
++    _out, calls = _run(db, verdict="refused")
++
++    assert len(calls) == 1 and _closeout(db, row) == "refused"
++    stored = so.get_outcome(CHAT, db=db)
++    assert (stored["kind"], stored["reason"]) == ("unresolved", "notice_tail")
++
++
++def test_a_spent_budget_refreshes_instead_of_waking(db):
++    for n in range(ng.WAKES_PER_HOUR):
++        _notice(db, f"earlier close-out {n}", closeout={"state": "started", "at": time.time() - 600})
++    _notice(db, "✔ Kanban t_aaa done — deploy card")
++
++    out, calls = _run(db)
++
++    assert calls == [] and [o["result"] for o in out] == ["refreshed:budget"]
++    stored = so.get_outcome(CHAT, db=db)
++    assert (stored["kind"], stored["reason"]) == ("unresolved", "notice_tail")
++
++
++def test_a_blocked_on_human_notice_never_wakes_and_reads_decision(db):
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="prod deploy", assignee="worker", session_id=CHAT,
++                             initial_status="blocked", human_request=HUMAN, lint_blocked=False)
++    _notice(db, f"⏸ Kanban {tid} blocked: needs approval — prod deploy", task_id=tid)
++    ksa._reset_cache_for_tests()
++
++    out, calls = _run(db)
++
++    assert calls == [] and [o["result"] for o in out] == ["refreshed:human"]
++    stored = so.get_outcome(CHAT, db=db)
++    assert stored["kind"] == "decision"
++    assert stored["items"][0]["card_id"] == tid and [c["value"] for c in stored["items"][0]["choices"]] == ["ship", "hold"]
+diff --git a/tests/tui_gateway/test_session_outcome_notices.py b/tests/tui_gateway/test_session_outcome_notices.py
+new file mode 100644
+index 00000000000..e5a4e337337
+--- /dev/null
++++ b/tests/tui_gateway/test_session_outcome_notices.py
+@@ -0,0 +1,166 @@
++"""Session-outcome call sites on the notice paths (lane A2): a notice row written by the live poller or the
++unloaded sweeper refreshes the chat's stored outcome; a linked card's status change refreshes it and marks the
++card's earlier "blocked" notices stale; notices never fan out to released links, archived chats or chats moved
++to another gateway. [daveey]"""
++
++from __future__ import annotations
++
++import contextlib
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli import kanban_session_activity as ksa
++from hermes_state import SessionDB
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import kanban_unloaded as ku
++from tui_gateway import notice_fanout as nf
++from tui_gateway import server
++
++CHAT = "20261029_120000_a2chat"
++LATER = time.time() + 3600
++
++
++@pytest.fixture
++def db(tmp_path, monkeypatch):
++    so._reset_hooks_for_tests()
++    nf._reset_for_tests()
++    ksa._reset_cache_for_tests()
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "0")  # the passive-row path
++    handle = SessionDB(tmp_path / "state.db")
++    handle.create_session(CHAT, "desktop")
++    handle.append_message(CHAT, "user", "start the cards")
++    handle.append_message(CHAT, "assistant", "Started the deploy card and subscribed this chat to its result.")
++    yield handle
++    handle.close()
++    nf._reset_for_tests()
++    so._reset_hooks_for_tests()
++
++
++def _opener(db):
++    @contextlib.contextmanager
++    def opener(chat_id):
++        if db.get_session(chat_id) is None:
++            yield None, None
++        else:
++            yield db, db.get_compression_tip(chat_id) or chat_id
++    return opener
++
++
++def _card(*, done=True, chat=CHAT):
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="deploy card", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat)
++        if done:
++            kb.complete_task(conn, tid, summary="deployed")
++        return tid
++
++
++def _notices(db):
++    return [m for m in db.get_messages(CHAT) if m.get("display_kind") == "kanban_notice"]
++
++
++def test_live_poller_notice_write_refreshes_the_outcome(db, monkeypatch):
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    so.refresh_outcome(CHAT, "manual", db=db)
++    assert so.get_outcome(CHAT, db=db)["kind"] == "done"
++    _card()
++    session = {"session_key": CHAT, "history": []}
++    texts = server._collect_kanban_notifications(session)
++    assert texts
++
++    verdict, _fresh, _kwargs = server._kb_persist_batch(session, texts, False)
++
++    assert verdict == "written"
++    stored = so.get_outcome(CHAT, db=db)
++    assert (stored["kind"], stored.get("reason")) == ("unresolved", "notice_tail")
++
++
++def test_unloaded_sweeper_notice_write_refreshes_the_outcome(db):
++    so.refresh_outcome(CHAT, "manual", db=db)
++    _card()
++
++    assert len(ku.sweep_once(set(), now=LATER, session_db=_opener(db))) == 1
++
++    stored = so.get_outcome(CHAT, db=db)
++    assert (stored["kind"], stored.get("reason")) == ("unresolved", "notice_tail")
++
++
++def test_card_status_change_refreshes_and_marks_its_blocked_notice_stale(db):
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="flaky deploy", assignee="worker", session_id=CHAT)
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT)
++        assert kb.block_task(conn, tid, reason="registry is down")
++    ku.sweep_once(set(), now=LATER, session_db=_opener(db))  # writes the "⏸ … blocked" notice
++    [blocked] = _notices(db)
++    assert f"Kanban {tid} blocked" in blocked["content"]
++    assert nf.card_change_pass(session_db=_opener(db)) == []  # first pass seeds the cursor
++    ksa._reset_cache_for_tests()
++    assert so.refresh_outcome(CHAT, "manual", db=db)["on"][0]["state"] == "blocked"
++
++    with contextlib.closing(kbc.connect()) as conn:
++        assert kb.schedule_task(conn, tid, reason="registry back at 14:00", clock_only=True)
++    ksa._reset_cache_for_tests()
++    changed = nf.card_change_pass(session_db=_opener(db))
++
++    assert [(c["task_id"], c["status"], c["skipped"]) for c in changed] == [(tid, "scheduled", None)]
++    stored = so.get_outcome(CHAT, db=db)
++    assert stored["kind"] == "waiting" and stored["on"][0]["state"] == "scheduled"
++    [row] = _notices(db)
++    assert row["display_metadata"]["stale"] is True and row["display_metadata"]["stale_tasks"] == [tid]
++
++
++@pytest.mark.parametrize("how", ["archived", "moved"])
++def test_sweeper_skips_archived_and_moved_chats(db, how):
++    tid = _card()
++    if how == "archived":
++        db.set_session_archived(CHAT, True)
++    else:
++        db.end_session(CHAT, "moved_to_gateway:hub")
++
++    assert ku.sweep_once(set(), now=LATER, session_db=_opener(db)) == []
++    assert _notices(db) == []
++    with contextlib.closing(kbc.connect()) as conn:  # dropped, not left for the next pass
++        assert kbn.unseen_events_for_sub(conn, kinds=("completed",), task_id=tid, platform="tui", chat_id=CHAT,
++                                         thread_id="")[1] == []
++
++
++def test_card_change_skips_archived_chats(db):
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="card", assignee="worker", session_id=CHAT)
++    nf.card_change_pass(session_db=_opener(db))
++    db.set_session_archived(CHAT, True)
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary="done")
++    assert [c["skipped"] for c in nf.card_change_pass(session_db=_opener(db))] == ["archived"]
++
++
++def test_remote_notices_skip_released_links():
++    task = {"id": "t_remote", "status": "blocked", "sessions": [
++        {"gw": "mac", "rel": "shepherd", "profile": "default", "session": "kept"},
++        {"gw": "mac", "rel": "shepherd", "profile": "default", "session": "gone", "released": 1}]}
++    import json
++    [(_owner, _key, _task, links)] = list(krn._sweep_cards([("hub", "default/default/t_remote", 1,
++                                                              json.dumps(task))], "mac"))
++    assert [link["session"] for link in links] == ["kept"]
++
++
++def test_the_unloaded_sweeper_loop_runs_the_card_change_and_guarantee_passes(monkeypatch):
++    import threading
++
++    from tui_gateway import notice_guarantee as ng
++    stop = threading.Event()
++    ran = []
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_FIRST_S", "0")
++    monkeypatch.setattr(ku, "sweep_once", lambda *a, **k: [])
++    monkeypatch.setattr(krn, "sweep_remote_notices", lambda **k: [])
++    monkeypatch.setattr(nf, "card_change_pass", lambda **k: ran.append("card_change") or [])
++    monkeypatch.setattr(ng, "guarantee_pass", lambda **k: ran.append("guarantee") or stop.set() or [])
++
++    ku._loop(stop)
++
++    assert ran == ["card_change", "guarantee"]
+diff --git a/tests/tui_gateway/test_session_outcome_restarts.py b/tests/tui_gateway/test_session_outcome_restarts.py
+new file mode 100644
+index 00000000000..1738f43a2f1
+--- /dev/null
++++ b/tests/tui_gateway/test_session_outcome_restarts.py
+@@ -0,0 +1,93 @@
++"""Restarts (session-outcome contract, lane A2): the backend boot sweep continues a chat a restart interrupted
++even when no Desktop reopens it (on by default, existing freshness window), and the orphan reap tells a parent
++chat when its subagent was killed mid-work. [daveey]"""
++
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_state import SessionDB
++from tui_gateway import server
++from tui_gateway import startup_resume as sr
++
++DEAD_PID = 2 ** 22 - 3  # never a live process
++
++
++def _marker(home, key, age):
++    path = home / "desktop" / "interrupted_turns.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    data = json.loads(path.read_text()) if path.exists() else {}
++    data[key] = {"prompt": "finish the migration", "started_at": time.time() - age, "attempts": 0,
++                 "auto_continue": True, "writer_pid": DEAD_PID}
++    path.write_text(json.dumps(data))
++
++
++def test_boot_continues_a_fresh_unopened_chat_and_not_a_stale_one(monkeypatch):
++    from hermes_cli import config
++    from hermes_constants import get_hermes_home
++    home = get_hermes_home()
++    _marker(home, "fresh-chat", age=60)
++    _marker(home, "stale-chat", age=3 * 3600)  # past the default 15 min window
++    # Default config apart from the settle delay: resume_on_startup is not set anywhere.
++    monkeypatch.setattr(config, "load_config", lambda: {"desktop": {"auto_continue": {
++        "resume_on_startup_delay_seconds": 0}}})
++    resumed = []
++    monkeypatch.setitem(server._methods, "session.resume",
++                        lambda rid, params: resumed.append(params["session_id"]) or {"result": {"auto_continue": {}}})
++
++    thread = sr.start_startup_resume_sweep()
++
++    assert thread is not None, "the boot sweep must run without resume_on_startup in config"
++    thread.join(10)
++    assert resumed == ["fresh-chat"]
++
++
++@pytest.fixture
++def db(tmp_path):
++    so._reset_hooks_for_tests()
++    handle = SessionDB(db_path=tmp_path / "state.db")
++    yield handle
++    handle.close()
++    so._reset_hooks_for_tests()
++
++
++def _age(db, sid, seconds):
++    then = time.time() - seconds
++    db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (then, sid))
++    db._conn.execute("UPDATE messages SET timestamp = ? WHERE session_id = ?", (then, sid))
++    db._conn.commit()
++
++
++@pytest.mark.parametrize("last_role, told", [("tool", True), ("assistant", False)])
++def test_a_reaped_subagent_mid_work_tells_its_parent(monkeypatch, db, last_role, told):
++    db.create_session("parent", source="desktop")
++    db.append_message("parent", role="user", content="audit the three repos")
++    db.append_message("parent", role="assistant", content="Delegated the audit to a subagent.")
++    db.create_session("child", source="subagent", parent_session_id="parent")
++    db._conn.execute("UPDATE sessions SET title = 'repo auditor' WHERE id = 'child'")
++    db._conn.commit()
++    db.append_message("child", role="user", content="audit repo A")
++    if last_role == "tool":
++        db.append_message("child", role="assistant", content="", tool_calls=[
++            {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}])
++        db.append_message("child", role="tool", content="ok", tool_call_id="c1", tool_name="terminal")
++    else:
++        db.append_message("child", role="assistant", content="Repo A is clean.")
++    _age(db, "child", 8 * 3600)
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_SESSION_TTL_S", 6 * 3600)
++
++    assert "child" in server._sweep_orphaned_session_rows()
++
++    notices = [m for m in db.get_messages("parent") if m.get("display_kind") == "kanban_notice"]
++    if not told:
++        assert notices == []
++        return
++    [notice] = notices
++    assert "subagent repo auditor was stopped by a restart before finishing" in notice["content"]
++    stored = so.get_outcome("parent", db=db)
++    assert (stored["kind"], stored["reason"]) == ("unresolved", "subagent_killed")
+diff --git a/tests/tui_gateway/test_startup_resume.py b/tests/tui_gateway/test_startup_resume.py
+index 12c91ffd644..ad09deae4e2 100644
+--- a/tests/tui_gateway/test_startup_resume.py
++++ b/tests/tui_gateway/test_startup_resume.py
+@@ -24,8 +24,9 @@ CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True,
+                                      "max_attempts": 2}}}
+ 
+ 
+-def test_disabled_by_default():
+-    assert sr._settings({})[0] is False
++def test_enabled_by_default_and_explicit_false_disables():
++    assert sr._settings({})[0] is True  # [daveey] session-outcome contract: on unless turned off
++    assert sr._settings({"desktop": {"auto_continue": {"resume_on_startup": False}}})[0] is False
+     assert sr._settings(CFG)[0] is True
+     off = {"desktop": {"auto_continue": {"enabled": False, "resume_on_startup": True}}}
+     assert sr._settings(off)[0] is False
+@@ -77,5 +78,5 @@ def test_one_failure_does_not_stop_the_sweep(tmp_path):
+ 
+ def test_start_is_noop_when_disabled(monkeypatch):
+     from hermes_cli import config
+-    monkeypatch.setattr(config, "load_config", dict)
++    monkeypatch.setattr(config, "load_config", lambda: {"desktop": {"auto_continue": {"resume_on_startup": False}}})
+     assert sr.start_startup_resume_sweep() is None
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 151a0b01e91..f25af8e0b80 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -256,6 +256,15 @@ HUMAN_REQUEST = {
+         "interaction": {"type": "string", "enum": ["approval", "reply", "user_terminal", "physical", "external"]},
+         "scope": {"type": "string", "minLength": 1},
+         "evidence": {"type": "string", "minLength": 1},
++        "choices": {
++            "type": "array", "minItems": 2, "maxItems": 6,
++            "description": "Optional decision buttons David can click instead of typing, e.g. "
++                           "[{\"label\": \"Ship it\", \"value\": \"ship\"}, {\"label\": \"Hold\", \"value\": \"hold\"}].",
++            "items": {"type": "object", "properties": {
++                "label": {"type": "string", "minLength": 1, "maxLength": 60},
++                "value": {"type": "string", "minLength": 1, "maxLength": 120}},
++                "required": ["label", "value"], "additionalProperties": False},
++        },
+     },
+     "required": ["action", "why_human", "interaction", "scope", "evidence"],
+     "additionalProperties": False,
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 7620e0fc27d..39ab92f4dda 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -136,13 +136,19 @@ def _index(path: Path) -> tuple[str, dict]:
+         links = task.get("sessions") if isinstance(task.get("sessions"), list) else []
+         for link in links:
+             if (isinstance(link, dict) and link.get("gw") == me and link.get("rel") in LINK_RELS
+-                    and link.get("session")):
++                    and link.get("session") and not _released(link)):
+                 index.setdefault((str(link.get("profile") or "default"), str(link["session"])), []).append(
+                     {"gw": str(gw), "key": str(key), "task": task})
+     _index_memo = (str(path), sig, me, index)
+     return me, index
+ 
+ 
++def _released(link: dict) -> bool:
++    """[daveey] The owner released this chat's link: its notices stop (session-outcome fan-out filter)."""
++    from tui_gateway.notice_fanout import link_released
++    return link_released(link)
++
++
+ def _ledger(path: Optional[Path] = None) -> sqlite3.Connection:
+     path = path or ledger_path()
+     path.parent.mkdir(parents=True, exist_ok=True)
+@@ -584,7 +590,7 @@ def _sweep_cards(rows: list[tuple], me: str):
+         if not done and task.get("status") != "blocked":
+             continue
+         links = [link for link in task.get("sessions") or [] if isinstance(link, dict)
+-                 and link.get("rel") == "shepherd" and link.get("gw") == me]
++                 and link.get("rel") == "shepherd" and link.get("gw") == me and not _released(link)]
+         if not links:
+             continue
+         yield owner, key, task, links
+@@ -604,8 +610,13 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+         with session_db(profile, sid) as (db, tip):
+             if db is None or not text:
+                 return
++            from tui_gateway.notice_fanout import chat_skip_reason
++            if chat_skip_reason(db, sid) is not None:  # [daveey] archived chat or a copy moved to another gateway
++                return
+             if not settled((sid, tip), ref, state):
+                 row_id = db.append_kanban_notice(tip, text, metadata)
++                from hermes_state_outcome import refresh_outcomes_quietly
++                refresh_outcomes_quietly([tip], "notice", db=db)  # [daveey] unloaded sweeper's remote rows too
+                 delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
+                 swept.append(memo_key)
+                 ack({"session": sid, "ref": ref, "state": state, "notice_key": event_key}, ledger=ledger)
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 4a7a60d8054..6ca6b292cb3 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -354,9 +354,14 @@ def _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, ki
+     with session_db(sub["chat_id"]) as (db, tip):
+         if db is None or tip is None:
+             return None  # no store holds this chat (deleted): leave the cursor alone
+-        old, new, claimed = _kbn.claim_unseen_events_for_sub(conn, kinds=kinds, durable=True, **ident)
++        from tui_gateway.notice_fanout import chat_skip_reason
++        skip = chat_skip_reason(db, sub["chat_id"])  # [daveey] archived / moved copy: the notice goes nowhere
++        old, new, claimed = _kbn.claim_unseen_events_for_sub(conn, kinds=kinds, durable=skip is None, **ident)
+         if not claimed:
+             return None  # a live poller or another sweeper got there first
++    if skip is not None:
++        logger.info("kanban notice for %s/%s not delivered to chat %s: %s", slug, ident["task_id"], tip, skip)
++        return None
+     texts = [t for t in (fmt(sub, task, ev, slug) for ev in claimed) if t]
+     if task and getattr(task, "status", "") == "archived":
+         with contextlib.suppress(Exception):
+@@ -418,6 +423,8 @@ def _persist_notice(conn, _kbn, session_db, ident, tip, text, metadata, old, new
+             if db is None:
+                 raise RuntimeError(f"chat {ident['chat_id']} disappeared before its notice was written")
+             db.append_kanban_notice(tip, text, metadata)
++            from hermes_state_outcome import refresh_outcomes_quietly
++            refresh_outcomes_quietly([tip], "notice", db=db)  # [daveey] a passive row is the chat's last word
+         return True
+     except SessionTurnLeaseLostError:
+         with contextlib.suppress(Exception):
+@@ -468,6 +475,11 @@ def _loop(stop: threading.Event) -> None:
+             sweep_once(live_session_ids(), grace_s=grace)
+         except Exception:
+             logger.warning("kanban unloaded sweep failed", exc_info=True)
++        # [daveey] Session outcome: refresh chats whose cards moved, then make sure no notice ends a chat unanswered.
++        from tui_gateway.notice_fanout import card_change_pass
++        from tui_gateway.notice_guarantee import guarantee_pass
++        card_change_pass()
++        guarantee_pass()
+         stop.wait(interval)
+ 
+ 
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+new file mode 100644
+index 00000000000..3e629bd1dea
+--- /dev/null
++++ b/tui_gateway/notice_fanout.py
+@@ -0,0 +1,177 @@
++"""Which chats a card's change reaches, and what a change does to the chat's earlier notices. [daveey]
++
++Session-outcome contract, "Fan-out" and "Stale notices":
++
++- A notice or a card-change refresh never goes to a chat whose link to the card is released, nor to a chat row
++  that is archived or was handed to another gateway (``end_reason`` ``moved_to_gateway:<gw>``, the copy left
++  behind by ``session_handover``). One block once reached five chats: the creator, a shepherd, a released link
++  and two moved copies (session-state audit 2026-10-29, ``t_e5cfb7c4``).
++- A notice is a snapshot of the card when it was written. When the card leaves ``blocked``, its earlier
++  "blocked" notice rows in the chat get ``display_metadata.stale = true`` (the Desktop dims them) and the
++  card's id joins ``display_metadata.stale_tasks``; a row about several cards is stale once all of them moved on.
++- :func:`card_change_pass` (run from the unloaded sweeper's loop, every backend) reads each board's new status
++  events since the last pass and, for every chat linked to a changed card, marks those notices and refreshes the
++  chat's stored outcome (trigger ``card_change``). The first pass of a process only seeds its cursor; the other
++  refresh points (turn end, notice write, reap) cover what changed while no backend ran. Every step is
++  idempotent, so two backends running the pass at once write the same result.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import re
++import sqlite3
++from typing import Any, Callable, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++MOVED_PREFIX = "moved_to_gateway:"
++# Task events that can change a card's status (and so a linked chat's outcome). Chatter (heartbeats, comments,
++# attachments, model tiers) is not read: thousands a day.
++STATUS_EVENT_KINDS = (
++    "created", "blocked", "unblocked", "scheduled", "promoted", "promoted_manual", "claimed", "reclaimed",
++    "spawned", "completed", "archived", "gave_up", "crashed", "timed_out", "review_requested",
++    "changes_requested", "review_reopened", "reopened", "status", "dependency_wait", "triage_swept", "moved",
++    "continued", "continuation_woken", "condition_met",
++)
++MAX_EVENTS_PER_PASS = 2000
++_BLOCKED_LINE = re.compile(r"Kanban (t_[0-9A-Za-z_]+) blocked")
++_TASK_ID = re.compile(r"Kanban (t_[0-9A-Za-z_]+)")
++_cursors: dict[str, int] = {}
++
++
++def _reset_for_tests() -> None:
++    _cursors.clear()
++
++
++def chat_skip_reason(db: Any, chat_id: str) -> Optional[str]:
++    """``"archived"`` / ``"moved"`` when no notice or refresh should reach ``chat_id`` here, else None. The row
++    and its compression tip are both checked (archive flips a whole lineage; a move ends the tip)."""
++    ids = list(dict.fromkeys(i for i in (chat_id, db.get_compression_tip(chat_id)) if i))
++    marks = ",".join("?" * len(ids))
++    for row in db._read_all(f"SELECT archived, end_reason FROM sessions WHERE id IN ({marks})", tuple(ids)):
++        if str(row["end_reason"] or "").startswith(MOVED_PREFIX):
++            return "moved"
++        if row["archived"]:
++            return "archived"
++    return None
++
++
++def link_released(link: Any) -> bool:
++    """A replica ``sessions[]`` link (or ``task_chat_links`` row) the owner released: no notices go there."""
++    return isinstance(link, dict) and str(link.get("released") or "0").lower() not in ("0", "false", "")
++
++
++def _decode(raw: Any) -> dict:
++    if isinstance(raw, dict):
++        return dict(raw)
++    try:
++        value = json.loads(raw) if raw else {}
++    except (TypeError, ValueError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _notice_tasks(content: str, meta: dict) -> set[str]:
++    ids = {str(t) for t in (meta.get("task_ids") or ()) if t}
++    if meta.get("task_id"):
++        ids.add(str(meta["task_id"]))
++    return ids | set(_TASK_ID.findall(content or ""))
++
++
++def mark_stale_blocked_notices(db: Any, sid: str, task_id: str) -> int:
++    """Mark the chat lineage's earlier "blocked" notices about ``task_id`` as outdated. Returns rows changed."""
++    from hermes_state_sessions import _LINEAGE_CTE_SQL
++    rows = db._read_all(
++        _LINEAGE_CTE_SQL + " SELECT id, content, display_metadata FROM messages WHERE session_id IN "
++        "(SELECT id FROM lineage) AND display_kind = 'kanban_notice' AND content LIKE ?",
++        (sid, sid, f"%Kanban {task_id} blocked%"))
++    changed = 0
++    for row in rows:
++        content = str(row["content"] or "")
++        if task_id not in _BLOCKED_LINE.findall(content):
++            continue
++        meta = _decode(row["display_metadata"])
++        stale_tasks = sorted({*(meta.get("stale_tasks") or ()), task_id})
++        stale = set(stale_tasks) >= _notice_tasks(content, meta)
++        if meta.get("stale_tasks") == stale_tasks and bool(meta.get("stale")) == stale:
++            continue
++        meta.update(stale_tasks=stale_tasks, **({"stale": True} if stale else {}))
++        changed += db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
++                                      (json.dumps(meta, ensure_ascii=False), row["id"], row["display_metadata"]))
++    return changed
++
++
++def _linked_chats(conn: sqlite3.Connection, task_id: str, created_by: Optional[str]) -> list[str]:
++    """Chats linked to the card on this board: its creating chat and its ``tui`` subscribers, minus chats
++    whose every ``task_chat_links`` row for the card is released."""
++    chats = [created_by] if created_by else []
++    chats += [str(r[0]) for r in conn.execute(
++        "SELECT chat_id FROM kanban_notify_subs WHERE task_id = ? AND LOWER(platform) = 'tui' AND chat_id != ''",
++        (task_id,))]
++    released: set[str] = set()
++    with contextlib.suppress(sqlite3.Error):  # boards that never synced have no link table
++        rows = conn.execute("SELECT chat_session, MIN(released) FROM task_chat_links WHERE task_id = ? "
++                            "GROUP BY chat_session", (task_id,)).fetchall()
++        released = {str(r[0]) for r in rows if r[1]}
++    return [c for c in dict.fromkeys(chats) if c not in released]
++
++
++def _changed_tasks(conn: sqlite3.Connection, ident: str) -> list[str]:
++    top = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
++    since = _cursors.get(ident)
++    _cursors[ident] = top
++    if since is None or top <= since:
++        return []
++    kinds = ",".join("?" * len(STATUS_EVENT_KINDS))
++    rows = conn.execute(f"SELECT task_id FROM task_events WHERE id > ? AND id <= ? AND kind IN ({kinds}) "
++                        f"ORDER BY id DESC LIMIT ?", (since, top, *STATUS_EVENT_KINDS, MAX_EVENTS_PER_PASS))
++    return list(dict.fromkeys(str(r[0]) for r in rows))
++
++
++def apply_card_change(db: Any, tip: str, chat_id: str, task_id: str, status: str) -> Optional[str]:
++    """One linked chat's share of a card change: stale notices when the card is not blocked, then a refresh.
++    Returns why the chat was skipped, else None."""
++    from hermes_state_outcome import refresh_outcomes_quietly
++    if (why := chat_skip_reason(db, chat_id)) is not None:
++        return why
++    if status != "blocked":
++        with contextlib.suppress(Exception):
++            mark_stale_blocked_notices(db, tip, task_id)
++    refresh_outcomes_quietly([tip], "card_change", db=db)
++    return None
++
++
++def _fan_out_change(conn: sqlite3.Connection, _kb: Any, session_db: Callable, slug: str, tid: str) -> list[dict]:
++    task = _kb.get_task(conn, tid)
++    status = str(getattr(task, "status", "") or "")
++    out = []
++    for chat in _linked_chats(conn, tid, getattr(task, "session_id", None)):
++        with session_db(chat) as (db, tip):
++            if db is None:
++                continue
++            skipped = apply_card_change(db, tip, chat, tid, status)
++        out.append({"board": slug, "task_id": tid, "chat_id": chat, "session_id": tip, "status": status,
++                    "skipped": skipped})
++    return out
++
++
++def card_change_pass(*, session_db: Optional[Callable] = None, slugs: Optional[Iterable[str]] = None) -> list[dict]:
++    """Refresh every chat linked to a card whose status moved since the last pass (see module doc). Never
++    raises; returns ``[{board, task_id, chat_id, session_id, status, skipped}]``."""
++    from hermes_cli import kanban_db as _kb
++    from hermes_cli import kanban_db_connect as _kbc
++    from tui_gateway import kanban_unloaded as ku
++    session_db = session_db or ku.find_session_db
++    done: list[dict] = []
++    for slug in (list(slugs) if slugs is not None else ku._board_slugs(_kb)):
++        try:
++            with contextlib.closing(_kbc.connect(board=slug)) as conn:
++                ident = str(_kb.kanban_db_path(slug).resolve())
++                for tid in _changed_tasks(conn, ident):
++                    done += _fan_out_change(conn, _kb, session_db, slug, tid)
++        except Exception:
++            logger.warning("card-change outcome pass failed on board %s", slug, exc_info=True)
++    return done
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+new file mode 100644
+index 00000000000..3d39269303e
+--- /dev/null
++++ b/tui_gateway/notice_guarantee.py
+@@ -0,0 +1,221 @@
++"""A kanban notice row is always followed by a turn or by an outcome. [daveey]
++
++Session-outcome contract, "Notice guarantee". A notice is written as a transcript row and a turn is started
++separately, best-effort (live poller, unloaded sweeper wake, chat-closeout). Restarts lose some of those turns:
++16 of 65 sidebar chats ended on a notice nobody answered (session-state audit 2026-10-29). Each pass of the
++unloaded sweeper's loop therefore looks, in every profile store, for chats whose last active message is a
++``kanban_notice`` older than ``GRACE_S`` with no live turn, and:
++
++- a notice about a card blocked on a human never wakes: the chat's outcome is refreshed (it reads ``decision``);
++- otherwise the notice row is claimed (``display_metadata.closeout``, compare-and-swap on the row, so exactly one
++  backend acts on it) and ONE close-out turn is started with ``server._wake_session_turn``; the claim records the
++  verdict;
++- a chat whose close-out budget (``WAKES_PER_HOUR`` started close-outs in its lineage) is spent, or whose wake did
++  not start, gets a refresh instead, which stores ``unresolved{notice_tail}``. The auditor repairs those.
++
++Ownership follows the unloaded sweeper's: a chat another live backend holds is that backend's (its own pass
++handles it); a chat with a live turn is skipped. The close-out prompt row is itself a notice, stamped as claimed,
++so a close-out never wakes another one.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++import threading
++import time
++from typing import Any, Callable, Iterator, Optional
++
++logger = logging.getLogger(__name__)
++
++GRACE_S = 300.0
++WAKES_PER_HOUR = 2
++LOOKBACK_S = 3 * 86400.0
++MAX_PARALLEL_WAKES = 2
++CLOSEOUT_TEXT = (
++    "[Kanban close-out] The Kanban notice above reached this chat and no turn followed it. Act on it now: check "
++    "what the card delivered or why it stopped, fix or follow up on anything an agent can, then end with a short "
++    "summary for the user, the decision you need from them, or what you are still waiting on.")
++CLOSEOUT_DISPLAY = "Close-out turn for the Kanban notice above"
++_wake_slots = threading.BoundedSemaphore(MAX_PARALLEL_WAKES)
++
++_CANDIDATES_SQL = """
++SELECT s.id AS sid, m.id AS msg_id, m.timestamp, m.content, m.display_metadata
++  FROM sessions s
++  JOIN messages m ON m.id = (SELECT id FROM messages WHERE session_id = s.id AND active = 1
++                               AND role IN ('user', 'assistant', 'tool') ORDER BY id DESC LIMIT 1)
++ WHERE s.archived = 0 AND COALESCE(s.muted, 0) = 0
++   AND COALESCE(s.end_reason, '') <> 'compression' AND COALESCE(s.end_reason, '') NOT LIKE 'moved_to_gateway:%'
++   AND {last_active} >= ? AND m.display_kind = 'kanban_notice' AND m.timestamp <= ?
++"""
++
++_STARTED_SQL = """
++SELECT COUNT(*) FROM messages WHERE session_id IN (SELECT id FROM lineage) AND display_kind = 'kanban_notice'
++   AND json_valid(display_metadata) AND json_extract(display_metadata, '$.closeout.state') = 'started'
++   AND json_extract(display_metadata, '$.closeout.at') > ?
++"""
++
++
++def candidates(db: Any, now: float) -> list[dict]:
++    """Chats in ``db`` whose last active message is a kanban notice older than ``GRACE_S`` and not yet claimed."""
++    from hermes_state_common import _sql_session_last_active
++    from tui_gateway.notice_fanout import _decode
++    rows = db._read_all(_CANDIDATES_SQL.format(last_active=_sql_session_last_active("s")),
++                        (now - LOOKBACK_S, now - GRACE_S))
++    out = []
++    for row in rows:
++        meta = _decode(row["display_metadata"])
++        if "closeout" not in meta:
++            out.append({"sid": str(row["sid"]), "msg_id": int(row["msg_id"]), "content": str(row["content"] or ""),
++                        "meta": meta, "raw_meta": row["display_metadata"]})
++    return out
++
++
++def started_last_hour(db: Any, sid: str, now: float) -> int:
++    from hermes_state_sessions import _LINEAGE_CTE_SQL
++    return int(db._read_one(_LINEAGE_CTE_SQL + _STARTED_SQL, (sid, sid, now - 3600.0))[0])
++
++
++def _claim(db: Any, cand: dict, now: float) -> bool:
++    meta = {**cand["meta"], "closeout": {"state": "claimed", "at": now, "pid": os.getpid()}}
++    return db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
++                              (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) == 1
++
++
++def _stamp(db: Any, msg_id: int, verdict: str) -> None:
++    from tui_gateway.notice_fanout import _decode
++    row = db._read_one("SELECT display_metadata FROM messages WHERE id = ?", (msg_id,))
++    meta = _decode(row["display_metadata"] if row else None)
++    meta["closeout"] = {**(meta.get("closeout") or {}), "state": verdict}
++    db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ?",
++                       (json.dumps(meta, ensure_ascii=False), msg_id))
++
++
++def blocked_on_human(cand: dict) -> bool:
++    """True when a card this notice is about is (still) parked on a validated human request."""
++    from hermes_cli import kanban_db as _kb
++    from hermes_cli import kanban_db_connect as _kbc
++    from tui_gateway.kanban_unloaded import _blocked_on_human
++    from tui_gateway.notice_fanout import _notice_tasks
++    meta = cand["meta"]
++    keys = [str(k) for k in meta.get("kanban_event_keys") or () if ":" in str(k) and not str(k).startswith("remote:")]
++    board = meta.get("board") or (keys[0].rsplit(":", 1)[0] if keys else None)
++    tasks = _notice_tasks(cand["content"], meta)
++    if not tasks:
++        return False
++    with contextlib.closing(_kbc.connect(board=board) if board else _kbc.connect()) as conn:
++        return any(_blocked_on_human(_kb.get_task(conn, tid)) for tid in sorted(tasks))
++
++
++def _wake(sid: str, msg_id: int) -> str:
++    from tui_gateway import server
++    meta = {"display_text": CLOSEOUT_DISPLAY, "closeout": {"state": "self", "of": msg_id}}
++    return server._wake_session_turn(sid, CLOSEOUT_TEXT, display_kind="kanban_notice", display_metadata=meta,
++                                     label="notice-closeout")
++
++
++def _spawn(job: Callable[[], Any]) -> None:
++    from agent.memory_provider import spawn_context_thread
++    spawn_context_thread(job, name="notice-closeout").start()
++
++
++def _refresh(db: Any, sid: str) -> None:
++    from hermes_state_outcome import refresh_outcomes_quietly
++    refresh_outcomes_quietly([sid], "notice", db=db)
++
++
++def _closeout_job(session_db, wake, sid: str, msg_id: int) -> str:
++    """Worker: the wake, then the verdict on the claimed row; a wake that did not start refreshes the outcome."""
++    try:
++        try:
++            verdict = str(wake(sid, msg_id) or "error")
++        except Exception:
++            logger.warning("notice close-out wake of %s failed", sid, exc_info=True)
++            verdict = "error"
++        with session_db(sid) as (db, tip):
++            if db is not None:
++                _stamp(db, msg_id, verdict)
++                if verdict != "started":
++                    _refresh(db, tip or sid)
++        logger.info("notice close-out of %s: %s", sid, verdict)
++        return verdict
++    finally:
++        _wake_slots.release()
++
++
++def _handle(db, cand: dict, now: float, *, holders, session_db, wake, spawn) -> str:
++    from hermes_state_outcome import _live_turn
++    from tui_gateway.kanban_unloaded import _other_holder
++    sid = cand["sid"]
++    if _other_holder(holders, {sid}):
++        return "skipped:held"
++    if _live_turn(db, sid):
++        return "skipped:live"
++    if blocked_on_human(cand):
++        _refresh(db, sid)
++        return "refreshed:human"
++    if started_last_hour(db, sid, now) >= WAKES_PER_HOUR:
++        _refresh(db, sid)
++        return "refreshed:budget"
++    if not _wake_slots.acquire(blocking=False):
++        return "skipped:slots"
++    try:
++        claimed = _claim(db, cand, now)
++    except Exception:
++        _wake_slots.release()
++        raise
++    if not claimed:
++        _wake_slots.release()
++        return "skipped:claimed"
++    try:
++        spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"]))
++    except Exception:
++        _wake_slots.release()
++        _stamp(db, cand["msg_id"], "error")
++        _refresh(db, sid)
++        logger.warning("notice close-out for %s could not start", sid, exc_info=True)
++        return "error"
++    return "dispatched"
++
++
++@contextlib.contextmanager
++def _profile_store(profile: Optional[str]) -> Iterator[Any]:
++    from tui_gateway import server
++    with server._profile_db({"profile": profile} if profile else None, writer=True) as db:
++        yield db
++
++
++def _stores() -> Iterator[Any]:
++    from tui_gateway.session_notifications import _readopt_wake_profiles
++    for profile in _readopt_wake_profiles():
++        try:
++            with _profile_store(profile) as db:
++                if db is not None:
++                    yield db
++        except Exception:
++            logger.debug("notice guarantee: profile %s store unavailable", profile, exc_info=True)
++
++
++def guarantee_pass(*, now: Optional[float] = None, stores: Callable[[], Iterator[Any]] = _stores,
++                   holders: Optional[Callable[[], list]] = None, session_db: Optional[Callable] = None,
++                   wake: Callable[[str, int], str] = _wake, spawn: Callable[[Callable], Any] = _spawn) -> list[dict]:
++    """One pass over every store (see module doc). Returns ``[{session_id, msg_id, result}]``. Never raises."""
++    from tui_gateway import kanban_unloaded as ku
++    now = time.time() if now is None else now
++    holders = holders or ku.registry_holders
++    session_db = session_db or ku.find_session_db
++    out: list[dict] = []
++    try:
++        for db in stores():
++            for cand in candidates(db, now):
++                try:
++                    result = _handle(db, cand, now, holders=holders, session_db=session_db, wake=wake, spawn=spawn)
++                except Exception:
++                    logger.warning("notice guarantee failed for %s", cand["sid"], exc_info=True)
++                    result = "error"
++                out.append({"session_id": cand["sid"], "msg_id": cand["msg_id"], "result": result})
++    except Exception:
++        logger.warning("notice guarantee pass failed", exc_info=True)
++    return out
+diff --git a/tui_gateway/reap_notices.py b/tui_gateway/reap_notices.py
+new file mode 100644
+index 00000000000..4c1dee83102
+--- /dev/null
++++ b/tui_gateway/reap_notices.py
+@@ -0,0 +1,65 @@
++"""Tell a parent chat when the startup orphan reap closed its subagent mid-work. [daveey]
++
++A delegate child row that a backend restart killed while it was mid-tool or waiting on its next model call ends
++``startup_orphan_reap`` with its last active message a tool or user row. Its parent never got a result (13 such
++children in 14 days on the MacBook, session-state audit 2026-10-29). For each one the reap appends ONE notice to
++the parent's live tip ("subagent <title> was stopped by a restart before finishing") and refreshes the parent's
++outcome, which then reads ``unresolved{subagent_killed}`` until a turn answers it (the notice guarantee wakes it).
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Iterable
++
++logger = logging.getLogger(__name__)
++
++_CHILDREN_SQL = """
++SELECT s.id, s.title, s.parent_session_id,
++       (SELECT role FROM messages WHERE session_id = s.id AND active = 1 AND role IN ('user', 'assistant', 'tool')
++         ORDER BY id DESC LIMIT 1) AS last_role
++  FROM sessions s
++ WHERE s.id IN ({marks}) AND s.parent_session_id IS NOT NULL
++   AND (s.source = 'subagent' OR {delegate} IS NOT NULL)
++"""
++
++
++def killed_subagents(db: Any, swept: Iterable[str]) -> list[dict]:
++    """The reaped rows that are delegate children stopped mid-work: ``[{id, title, parent}]``."""
++    from hermes_state_common import _sql_json_extract
++    ids = [s for s in dict.fromkeys(swept) if s]
++    if not ids:
++        return []
++    sql = _CHILDREN_SQL.format(marks=",".join("?" * len(ids)),
++                               delegate=_sql_json_extract("s.model_config", "$._delegate_from"))
++    return [{"id": str(r["id"]), "title": r["title"] or "subagent", "parent": str(r["parent_session_id"])}
++            for r in db._read_all(sql, tuple(ids)) if r["last_role"] in ("tool", "user")]
++
++
++def notify_parents_of_killed_subagents(db: Any, swept: Iterable[str]) -> list[str]:
++    """Append one notice per killed child to its parent's tip and refresh that parent. Returns the parents
++    notified. Never raises (a parent mid-turn refuses the row; that is logged and skipped)."""
++    from hermes_state_outcome import refresh_outcomes_quietly
++    notified: list[str] = []
++    try:
++        children = killed_subagents(db, swept)
++    except Exception:
++        logger.warning("killed-subagent lookup after the orphan reap failed", exc_info=True)
++        return notified
++    for child in children:
++        tip = db.get_compression_tip(child["parent"]) or child["parent"]
++        text = (f"⚠ subagent {child['title']} was stopped by a restart before finishing (child session "
++                f"{child['id']}); its result never came back. Check what it got done and redo or re-delegate the rest.")
++        metadata = {"notice_id": f"subagent-killed:{child['id']}", "display_text": text,
++                    "subagent_killed": child["id"]}
++        try:
++            db.append_kanban_notice(tip, text, metadata)
++        except Exception:
++            logger.warning("could not tell parent %s that subagent %s was reaped", tip, child["id"], exc_info=True)
++            continue
++        notified.append(tip)
++    refresh_outcomes_quietly(notified, "reap", db=db)
++    if notified:
++        logger.info("orphan reap: told %d parent chat(s) their subagent was stopped mid-work: %s",
++                    len(notified), ", ".join(notified))
++    return notified
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 263eea6e78e..5f4709f86b8 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -867,6 +867,8 @@ def _kb_persist_batch(session: dict, batch: list, diagnostic: bool) -> tuple:
+             row_id, inserted = db.record_kanban_notice(target, text, metadata, message=staged)
+             if not inserted:
+                 return "busy", batch, {}  # raced another consumer for some of these keys: re-filter next poll
++            from hermes_state_outcome import refresh_outcomes_quietly
++            refresh_outcomes_quietly([target], "notice", db=db)  # [daveey] until its turn ends, the notice is the tail
+     except (SessionTurnLeaseLostError, CompressionSessionClosedError):
+         return "busy", batch, {}
+     except Exception as exc:
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 5341d476f51..945ba6fb063 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -460,6 +460,8 @@ def _sweep_orphaned_session_rows() -> list[str]:
+             len(swept), ", ".join(swept))
+         from hermes_state_outcome import refresh_outcomes_quietly  # [daveey] reaped rows end mid-turn
+         refresh_outcomes_quietly(swept, "reap", db=db)
++        from tui_gateway.reap_notices import notify_parents_of_killed_subagents
++        notify_parents_of_killed_subagents(db, swept)  # [daveey] a child killed mid-work tells its parent
+         # [daveey] A reaped chat keeps its kanban subscriptions; kanban_unloaded.py delivers their results to the
+         # transcript, but say which chats depend on that so a missing notice is traceable.
+         try:
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index 528bd275d27..d336f9b91f9 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -2,8 +2,8 @@
+ 
+ Auto-continue (``session_auto_continue._maybe_schedule_auto_continue``) only fires from ``session.resume``, i.e. when
+ the user re-opens each interrupted session. After an app restart or ``hermes update`` that means visiting every
+-session that was mid-turn and telling it to continue. With ``desktop.auto_continue.resume_on_startup: true`` the
+-backend does that itself at boot: for each fresh turn marker (``turn_marker``) whose writer process is gone, it runs
++session that was mid-turn and telling it to continue. With ``desktop.auto_continue.resume_on_startup`` (default on)
++the backend does that itself at boot: for each fresh turn marker (``turn_marker``) whose writer process is gone, it runs
+ an in-process ``session.resume`` — the same handler the Desktop calls — which schedules the continuation turn. The
+ sessions run detached until a client attaches; opening one later reuses the live session and streams the turn.
+ 
+@@ -55,7 +55,9 @@ def _settings(cfg: dict | None) -> tuple[bool, float, int, float]:
+     ac = desktop.get("auto_continue") if isinstance(desktop, dict) else None
+     ac = ac if isinstance(ac, dict) else {}
+     enabled = ac.get("enabled", True) not in (False, "false", "False", 0, "0", "off", "no")
+-    on_start = ac.get("resume_on_startup", False) in (True, "true", "True", 1, "1", "on", "yes")
++    # [daveey] On by default (session-outcome contract, "Restarts"): a chat a restart interrupted continues even
++    # when no Desktop reopens it. ``resume_on_startup: false`` turns it off.
++    on_start = ac.get("resume_on_startup", True) in (True, "true", "True", 1, "1", "on", "yes")
+     try:
+         fresh = max(0.0, float(ac.get("freshness_minutes", 15))) * 60.0
+     except (TypeError, ValueError):
+-- 
+2.55.0
+

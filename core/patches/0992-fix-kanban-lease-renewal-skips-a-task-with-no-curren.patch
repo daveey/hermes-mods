@@ -1,0 +1,120 @@
+From f0f483955b50f61706fcaa41a09eeac8b4cf9b68 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:54:02 +0000
+Subject: [PATCH] fix(kanban): lease renewal skips a task with no current run
+ and logs a rescued lapsed lease [daveey]
+
+heartbeat_expiry sent run_uid='' once the run had ended (continued/blocked), which the Board refuses
+with 400 'run_uid required' and agent.log reported as a failed renewal. A granted renewal of a lapsed
+lease (first heartbeat after macOS sleep) was silent; it now logs at INFO how long the lease had lapsed.
+---
+ hermes_cli/kanban_db_sync.py                | 16 +++++--
+ tests/hermes_cli/test_kanban_sync_leases.py | 52 +++++++++++++++++++++
+ 2 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 6660befe401..7d008a9e079 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -770,16 +770,19 @@ def heartbeat_expiry(conn: sqlite3.Connection, task_id: str, expires: int) -> in
+         return expires
+     lease_expires = row["lease_expires"]
+     ttl_s = max(expires - int(time.time()), 1)
+-    if _renewal_due(task_id, lease_expires, ttl_s):
+-        lease_expires = _renew(conn, task_id, row["run_uid"], ttl_s) or lease_expires
++    # [daveey] No current run (it just ended continued/blocked): there is no run uid to renew under and the Board
++    # refuses an empty one (400 "run_uid required"), so make no call; the bound below still applies.
++    if row["run_uid"] and _renewal_due(task_id, lease_expires, ttl_s):
++        lease_expires = _renew(conn, task_id, row["run_uid"], ttl_s, lease_expires) or lease_expires
+     return min(expires, lease_expires // 1000 - LEASE_SAFETY_MARGIN_SECONDS)
+ 
+ 
+-def _renew(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str], ttl_s: int) -> Optional[int]:
++def _renew(conn: sqlite3.Connection, task_id: str, run_uid: str, ttl_s: int,
++           old_expires_ms: Optional[int] = None) -> Optional[int]:
+     from hermes_cli.kanban_db_connect import write_txn
+     state = _state(conn)
+     try:
+-        lease = _client().renew(board_id=state["board_id"], task_uid=task_id, run_uid=run_uid or "",
++        lease = _client().renew(board_id=state["board_id"], task_uid=task_id, run_uid=run_uid,
+                                 gateway_id=state["gateway_id"], ttl_s=ttl_s)
+     except _CLIENT_ERRORS as exc:
+         _log.warning("kanban sync: lease renewal for %s failed (%s: %s)", task_id, type(exc).__name__, exc)
+@@ -789,6 +792,11 @@ def _renew(conn: sqlite3.Connection, task_id: str, run_uid: Optional[str], ttl_s
+             conn.execute("UPDATE tasks SET lease_expires = ?, "
+                          "lease_version = COALESCE(?, lease_version) WHERE id = ?",
+                          (lease.expires_ms, lease.version, task_id))
++            # [daveey] A renewal that rescues a lapsed lease (the first heartbeat after macOS sleep) is the only
++            # evidence that path ran; log it like the session-turn lease does.
++            left_s = None if old_expires_ms is None else old_expires_ms / 1000 - time.time()
++            if left_s is not None and left_s <= LEASE_SAFETY_MARGIN_SECONDS:
++                _log.info("kanban sync: lease of %s renewed %ds after it lapsed", task_id, max(0, int(-left_s)))
+             return lease.expires_ms
+         _log.warning("kanban sync: lease for %s lost to %s (%s)", task_id, lease.holder, lease.reason)
+         conn.execute("UPDATE tasks SET lease_holder = ? WHERE id = ?", (lease.holder, task_id))
+diff --git a/tests/hermes_cli/test_kanban_sync_leases.py b/tests/hermes_cli/test_kanban_sync_leases.py
+index c8fd1ad2ca7..fb6ecfbf2fa 100644
+--- a/tests/hermes_cli/test_kanban_sync_leases.py
++++ b/tests/hermes_cli/test_kanban_sync_leases.py
+@@ -247,6 +247,58 @@ def test_first_heartbeat_after_sleep_renews_a_lapsed_lease(primary, lease_client
+     assert conn.execute("SELECT claim_expires FROM tasks WHERE id = ?", (tid,)).fetchone()[0] > time.time() + 600
+ 
+ 
++def test_heartbeat_with_no_current_run_makes_no_renewal_call(primary, lease_client, caplog):
++    """A heartbeat that lands after the run ended (continued/blocked, ``current_run_id`` NULL) has no run uid to
++    renew under; the Board refuses an empty one (hub 400 "run_uid required"), so no call and no warning."""
++    conn = primary
++    tid = kb.create_task(conn, title="run ended", assignee="worker")
++    lock = "host:1"
++    kb.claim_task(conn, tid, ttl_seconds=900, claimer=lock)
++    lease_ms = int((time.time() + 200) * 1000)  # a third of the lease used up: a renewal would be due
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET current_run_id = NULL, lease_expires = ? WHERE id = ?", (lease_ms, tid))
++    lease_client.renew_mode = "offline"  # what the hub's 400 surfaces as, should a call slip through
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db_sync"):
++        kb.heartbeat_claim(conn, tid, ttl_seconds=900, claimer=lock)
++    assert lease_client.count("renew") == 0
++    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
++    claim_expires = conn.execute("SELECT claim_expires FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert claim_expires <= lease_ms // 1000 - sync.LEASE_SAFETY_MARGIN_SECONDS  # still bounded by the lease
++
++
++def _renewal_logs(caplog):
++    return [r.getMessage() for r in caplog.records if "renewed" in r.getMessage() and "lapsed" in r.getMessage()]
++
++
++def test_renewal_of_a_lapsed_lease_logs_how_long_it_had_lapsed(primary, lease_client, caplog):
++    conn = primary
++    tid = kb.create_task(conn, title="slept", assignee="worker")
++    lock = "host:1"
++    kb.claim_task(conn, tid, ttl_seconds=900, claimer=lock)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int((time.time() - 338) * 1000), tid))
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db_sync"):
++        assert kb.heartbeat_claim(conn, tid, ttl_seconds=900, claimer=lock)
++    assert lease_client.count("renew") == 1
++    [msg] = _renewal_logs(caplog)
++    assert msg in (f"kanban sync: lease of {tid} renewed {n}s after it lapsed" for n in (338, 339))
++    [rec] = [r for r in caplog.records if r.getMessage() == msg]
++    assert rec.levelno == logging.INFO
++
++
++def test_renewal_inside_the_normal_window_logs_nothing(primary, lease_client, caplog):
++    conn = primary
++    tid = kb.create_task(conn, title="on time", assignee="worker")
++    lock = "host:1"
++    kb.claim_task(conn, tid, ttl_seconds=900, claimer=lock)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int((time.time() + 400) * 1000), tid))
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_db_sync"):
++        assert kb.heartbeat_claim(conn, tid, ttl_seconds=900, claimer=lock)
++    assert lease_client.count("renew") == 1
++    assert [r.getMessage() for r in caplog.records if r.name == "hermes_cli.kanban_db_sync"] == []
++
++
+ def test_live_worker_with_a_valid_lease_keeps_its_claim(primary, lease_client):
+     """Control for the test above: same stale claim, lease still valid -> extended."""
+     conn = primary
+-- 
+2.55.0
+

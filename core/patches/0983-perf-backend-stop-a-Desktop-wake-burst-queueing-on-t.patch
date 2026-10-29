@@ -1,0 +1,348 @@
+From 24c3eda1034ba6447bfe6263e4f04de11a255362 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:46:59 +0000
+Subject: [PATCH] perf(backend): stop a Desktop wake burst queueing on the
+ config parse and the ledger rebuild [daveey]
+
+A wake burst (/api/sessions/<id>, /api/session-kanban-tasks, kanban boards,
+profiles sessions, /api/status at once) ran 6-9 s on a loaded Mac and tripped
+the Desktop's 5 s timeouts. py-spy on a hub backend under the same burst:
+
+- /api/status parsed the ~2500-line config.yaml on every call for the
+  _config_version stamp (~40 ms of GIL-held YAML each, 101 samples/burst).
+  read_config_version_stamp now caches the parse on the file signature;
+  parse errors still re-read, warn and raise. -> 5 samples/burst.
+- /api/session-kanban-tasks asks for stale_ok, but in links_reader=replica
+  mode replica_cards -> _ledger_owners called _remote_links() without it, so
+  the strip waited on _links_lock for every ledger rebuild (any board write).
+  stale_ok now reaches _ledger_owners. -> 143 -> 21 samples/burst.
+
+Tests: test_config_version_stamp_cache.py (new), two stale_ok tests in
+test_kanban_chat_links.py; red on the old code, green now.
+---
+ hermes_cli/config_version_stamp.py            | 62 +++++++++++---
+ hermes_cli/kanban_chat_links.py               | 17 ++--
+ hermes_cli/kanban_session_activity.py         |  2 +-
+ .../test_config_version_stamp_cache.py        | 83 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_chat_links.py    | 46 ++++++++++
+ 5 files changed, 192 insertions(+), 18 deletions(-)
+ create mode 100644 tests/hermes_cli/test_config_version_stamp_cache.py
+
+diff --git a/hermes_cli/config_version_stamp.py b/hermes_cli/config_version_stamp.py
+index 51b5325e2df..d6de305ec5d 100644
+--- a/hermes_cli/config_version_stamp.py
++++ b/hermes_cli/config_version_stamp.py
+@@ -7,6 +7,8 @@ raw stamp directly. ``_coerce_config_version`` stays module-private here.
+ 
+ from __future__ import annotations
+ 
++import os
++import threading
+ from typing import Optional, Tuple
+ 
+ from hermes_cli.config_defaults import DEFAULT_CONFIG
+@@ -23,13 +25,54 @@ def _coerce_config_version(value) -> int:
+     return max(version, 0)
+ 
+ 
++# [daveey] path -> (file_signature, root type name or None for a mapping, stamp or _NO_KEY).
++# ``/api/status`` reads the stamp on every poll; re-parsing a ~2500-line config.yaml there held the
++# GIL ~40 ms per call and, in a Desktop wake burst, stretched every other request queued behind it
++# (2026-10-29: /api/sessions/<id>, /api/session-kanban-tasks past the 5 s client timeout). Only
++# successful parses are cached; a parse error re-reads, warns and raises exactly as before.
++_NO_KEY = object()
++_stamp_cache: dict[str, tuple[tuple, Optional[str], object]] = {}
++_stamp_cache_lock = threading.Lock()
++
++
++def _parsed_stamp(config_path) -> tuple[Optional[str], object]:
++    """``(non-mapping root type name or None, stamp value or _NO_KEY)`` for config.yaml, re-parsed
++    only when its file signature changes. Parse errors propagate and are not cached."""
++    from hermes_cli.config import fast_safe_load
++    from utils import file_signature
++
++    try:
++        sig = file_signature(os.stat(config_path))
++    except OSError:
++        sig = None
++    key = str(config_path)
++    if sig is not None:
++        with _stamp_cache_lock:
++            hit = _stamp_cache.get(key)
++        if hit is not None and hit[0] == sig:
++            return hit[1], hit[2]
++    with open(config_path, encoding="utf-8-sig") as f:
++        config = fast_safe_load(f)
++    if config is None:
++        config = {}  # empty file / bare document: valid first-run state
++    if isinstance(config, dict):
++        result: tuple[Optional[str], object] = (None, config.get("_config_version", _NO_KEY))
++    else:
++        result = (type(config).__name__, _NO_KEY)
++    if sig is not None:
++        with _stamp_cache_lock:
++            _stamp_cache[key] = (sig, result[0], result[1])
++    return result
++
++
+ def read_config_version_stamp(*, raise_on_parse_error: bool = False) -> tuple[Optional[int], int]:
+     """Single raw read behind ``check_config_version()``: ``(stamp, latest_version)`` where
+     *stamp* is ``None`` when config.yaml parsed but carries no ``_config_version`` key (a
+     never-stamped current-schema file, not an ancient install — ``migrate_config()`` gives it only
+     the legacy-key steps). A missing file, or malformed YAML under a tolerant caller, reads as
+-    ``latest`` exactly as ``check_config_version()`` always reported it."""
+-    from hermes_cli.config import InvalidUserConfigError, _warn_config_parse_failure, fast_safe_load, get_config_path
++    ``latest`` exactly as ``check_config_version()`` always reported it. The parse is cached on
++    the file's signature (``_parsed_stamp``), so a rewrite is seen on the next call."""
++    from hermes_cli.config import InvalidUserConfigError, _warn_config_parse_failure, get_config_path
+ 
+     latest = _coerce_config_version(DEFAULT_CONFIG.get("_config_version", 1)) or 1
+     config_path = get_config_path()
+@@ -37,8 +80,7 @@ def read_config_version_stamp(*, raise_on_parse_error: bool = False) -> tuple[Op
+         return latest, latest
+ 
+     try:
+-        with open(config_path, encoding="utf-8-sig") as f:
+-            config = fast_safe_load(f)
++        non_mapping, value = _parsed_stamp(config_path)
+     except Exception as e:
+         _warn_config_parse_failure(config_path, e)
+         if raise_on_parse_error:
+@@ -47,20 +89,18 @@ def read_config_version_stamp(*, raise_on_parse_error: bool = False) -> tuple[Op
+             ) from e
+         return latest, latest
+ 
+-    if config is None:
+-        config = {}  # empty file / bare document: valid first-run state
+-    if not isinstance(config, dict):
++    if non_mapping is not None:
+         # A list/scalar root parses fine but is just as unusable as broken YAML: save_config()
+         # would refuse it later, after .env was already rewritten. Strict callers see it up front.
+         if raise_on_parse_error:
+             raise InvalidUserConfigError(
+                 f"Cannot inspect {config_path}: config.yaml top-level value must be "
+-                f"a mapping, got {type(config).__name__}"
++                f"a mapping, got {non_mapping}"
+             )
+-        config = {}
+-    if "_config_version" not in config:
+         return None, latest
+-    return _coerce_config_version(config.get("_config_version")), latest
++    if value is _NO_KEY:
++        return None, latest
++    return _coerce_config_version(value), latest
+ 
+ 
+ def check_config_version(*, raise_on_parse_error: bool = False) -> tuple[int, int]:
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index a16c7162e76..b6996a8768b 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -152,13 +152,14 @@ def _read_replica(path: Path, gateway: str, profile: str) -> tuple[list[dict[str
+     return rows, pulled
+ 
+ 
+-def _ledger_owners() -> dict[tuple[str, str], list[tuple[str, str, str, bool]]]:
++def _ledger_owners(stale_ok: bool = False) -> dict[tuple[str, str], list[tuple[str, str, str, bool]]]:
+     """``(board, id) -> [(owner gateway, owner profile, session, released)]`` from the origin-ledger projection. A
+     synced board is one file per gateway with one row per id, shared by that gateway's profiles, so the replica
+-    row carries no owner profile: the ledger only labels it (``_owner_of``)."""
++    row carries no owner profile: the ledger only labels it (``_owner_of``). ``stale_ok`` is ``_remote_links``'s:
++    take the last projection instead of waiting on a rebuild."""
+     from hermes_cli.kanban_session_activity import _remote_links
+     try:
+-        cards = _remote_links()
++        cards = _remote_links(stale_ok=True) if stale_ok else _remote_links()
+     except Exception as exc:  # health: allow BLE001 -- the profile is a label; a failed ledger read must not hide cards
+         _log.info("kanban chat links: owner profiles unavailable (%s: %s)", type(exc).__name__, exc)
+         return {}
+@@ -204,7 +205,8 @@ def _ledger_fallback(board: str, gateway: str, profile: str, statuses: tuple[str
+ 
+ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES,
+                   replicas: Optional[list[tuple[str, Path]]] = None, *, now: Optional[float] = None,
+-                  ledger_fallback: bool = True, unreadable_out: Optional[list[str]] = None) -> list[dict[str, Any]]:
++                  ledger_fallback: bool = True, unreadable_out: Optional[list[str]] = None,
++                  stale_ok: bool = False) -> list[dict[str, Any]]:
+     """This gateway's chats' (``session_ids``, one lineage; ``None`` = every chat) unreleased links to cards created
+     on OTHER gateways, from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends.
+ 
+@@ -216,7 +218,10 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+     - an unreadable replica keeps its last rows, stale; on a cold start the ledger's rows for that board, stale.
+       ``ledger_fallback=False`` (links_diff) skips both, so a diff never compares the ledger with itself;
+       ``unreadable_out`` collects the boards whose replica could not be read;
+-    - one row per (chat, card); the key carries the owner profile the ledger names for it, else ``default``."""
++    - one row per (chat, card); the key carries the owner profile the ledger names for it, else ``default``;
++    - ``stale_ok`` (the Desktop linked-card strip): the owner labels come from the last ledger projection rather
++      than waiting behind a rebuild of it. [daveey] Without it the strip's ``stale_ok`` stopped at this call and
++      ``/api/session-kanban-tasks`` queued on ``_links_lock`` for every board write (3-7 s in a wake burst)."""
+     from hermes_cli.profiles import get_active_profile_name
+     ids = None if session_ids is None else set(str(s) for s in session_ids if s)
+     if ids is not None and not ids:
+@@ -251,7 +256,7 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             rows, pulled = hit
+             stale = True
+         if owners is None and rows:
+-            owners = _ledger_owners()
++            owners = _ledger_owners(stale_ok)
+         for r in rows:
+             if ids is not None and r["chat_session"] not in ids:
+                 continue
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index b2502fc8c55..30f95224380 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1738,7 +1738,7 @@ def _remote_cards(ids: list[str] | None, statuses: tuple[str, ...], stale_ok: bo
+         except _ksc.SyncUnavailable:
+             gateway = None
+         if gateway:
+-            return _links.replica_cards(ids, gateway, statuses)
++            return _links.replica_cards(ids, gateway, statuses, stale_ok=stale_ok)
+     return _remote_links(stale_ok=True) if stale_ok else _remote_links()
+ 
+ 
+diff --git a/tests/hermes_cli/test_config_version_stamp_cache.py b/tests/hermes_cli/test_config_version_stamp_cache.py
+new file mode 100644
+index 00000000000..94049771d79
+--- /dev/null
++++ b/tests/hermes_cli/test_config_version_stamp_cache.py
+@@ -0,0 +1,83 @@
++"""``read_config_version_stamp`` re-parses config.yaml only when the file changes.
++
++``/api/status`` reads the stamp on every Desktop poll. A full YAML parse of a ~2500-line config there
++held the GIL ~40 ms per call and stretched every request queued behind it in a wake burst. [daveey]
++"""
++
++import os
++
++import pytest
++
++from hermes_cli import config_version_stamp as cvs
++
++
++@pytest.fixture
++def hermes_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    getattr(cvs, "_stamp_cache", {}).clear()
++    yield home
++    getattr(cvs, "_stamp_cache", {}).clear()
++
++
++@pytest.fixture
++def parses(monkeypatch):
++    from hermes_cli import config
++
++    real = config.fast_safe_load
++    count = [0]
++
++    def counting(stream):
++        count[0] += 1
++        return real(stream)
++
++    monkeypatch.setattr(config, "fast_safe_load", counting)
++    return count
++
++
++def _write(home, text):
++    path = home / "config.yaml"
++    path.write_text(text, encoding="utf-8")
++    return path
++
++
++def test_an_unchanged_config_is_parsed_once(hermes_home, parses):
++    _write(hermes_home, "_config_version: 7\nmodel:\n  default: x\n")
++    assert cvs.check_config_version()[0] == 7
++    assert cvs.check_config_version()[0] == 7
++    assert cvs.read_config_version_stamp()[0] == 7
++    assert parses[0] == 1
++
++
++def test_a_rewrite_is_seen_on_the_next_read(hermes_home, parses):
++    path = _write(hermes_home, "_config_version: 7\n")
++    assert cvs.check_config_version()[0] == 7
++    path.write_text("_config_version: 9\n", encoding="utf-8")  # same size
++    st = path.stat()
++    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
++    assert cvs.check_config_version()[0] == 9
++    _write(hermes_home, "model: {}\n")  # stamp removed
++    assert cvs.read_config_version_stamp()[0] is None
++    assert parses[0] == 3
++
++
++def test_parse_errors_are_not_cached_and_still_raise_for_strict_callers(hermes_home, parses):
++    from hermes_cli.config import InvalidUserConfigError
++
++    _write(hermes_home, "_config_version: [unclosed\n")
++    _, latest = cvs.check_config_version()
++    assert cvs.check_config_version() == (latest, latest)  # tolerant: latest/latest, as before
++    with pytest.raises(InvalidUserConfigError):
++        cvs.check_config_version(raise_on_parse_error=True)
++    assert parses[0] >= 3  # every call re-read the broken file
++
++
++def test_a_non_mapping_root_stays_unusable_from_the_cache(hermes_home, parses):
++    from hermes_cli.config import InvalidUserConfigError
++
++    _write(hermes_home, "- a\n- b\n")
++    assert cvs.read_config_version_stamp()[0] is None
++    with pytest.raises(InvalidUserConfigError, match="must be a mapping, got list"):
++        cvs.check_config_version(raise_on_parse_error=True)
++    assert parses[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index ac8e33b43b8..16333d1007e 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -251,3 +251,49 @@ def test_unknown_replica_card_waits_like_a_parked_one(live, kanban_home, monkeyp
+     assert ksa.active_task_counts() == {"s1": 2, "s2": 1}
+     parked, held = ksa.parked_task_counts()
+     assert parked == {"s1": 2} and held == {}
++
++
++def test_session_tasks_stale_ok_reaches_the_replica_owner_labels(live, kanban_home, monkeypatch, tmp_path):
++    """[daveey] The Desktop strip's ``stale_ok`` must reach ``_ledger_owners``: it used to stop at
++    ``replica_cards``, so ``/api/session-kanban-tasks`` waited on every ledger rebuild in replica mode."""
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_remote", "from replica", "running", OTHER)], [("t_remote", ME, "s1", "shepherd", 0)])
++    _switch_to_replica(kanban_home, monkeypatch, rep)
++    calls = []
++
++    def remote_links(stale_ok=False):
++        calls.append(stale_ok)
++        return [_ledger_row("t_remote", "s1")]
++
++    monkeypatch.setattr(ksa, "_remote_links", remote_links)
++    assert [t["id"] for t in ksa.session_tasks(["s1"], stale_ok=True)] == ["t_remote"]
++    assert calls == [True]
++    calls.clear()
++    assert [t["id"] for t in ksa.session_tasks(["s1"])] == ["t_remote"]
++    assert calls == [False]  # every other reader keeps read-your-writes
++
++
++def test_session_tasks_stale_ok_does_not_wait_behind_a_ledger_rebuild(live, kanban_home, monkeypatch, tmp_path):
++    """A rebuild holding ``_links_lock`` (a board write moved the fingerprint) must not hold the strip."""
++    import threading
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_remote", "from replica", "running", OTHER)], [("t_remote", ME, "s1", "shepherd", 0)])
++    _switch_to_replica(kanban_home, monkeypatch, rep)
++    monkeypatch.setattr(ksa, "_remote_links", _real_remote_links)  # the real cache + lock, not the stub
++    monkeypatch.setattr(ksa, "_project_remote_links", lambda: [_ledger_row("t_remote", "s1")])
++    fp = ["v1"]
++    monkeypatch.setattr(ksa, "_links_fingerprint", lambda: (fp[0],))
++    assert [t["id"] for t in ksa.session_tasks(["s1"], stale_ok=True)] == ["t_remote"]  # primes the projection
++    fp[0] = "v2"  # a board write: the projection is stale and a rebuild is due
++    out: list = []
++    with ksa._links_lock:  # a rebuild in flight
++        th = threading.Thread(target=lambda: out.append(ksa.session_tasks(["s1"], stale_ok=True)), daemon=True)
++        th.start()
++        th.join(timeout=3)
++        finished = not th.is_alive()
++    th.join(timeout=5)
++    assert finished, "stale_ok session_tasks waited on _links_lock"
++    assert [t["id"] for t in out[0]] == ["t_remote"]
++
++
++_real_remote_links = ksa._remote_links
+-- 
+2.55.0
+

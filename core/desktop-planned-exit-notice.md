@@ -1,6 +1,6 @@
 # A core-update restart is not a crash; backend-exit cards dedupe and clear
 
-Source: daveey/hermes `77e6a1eda3` (the patch number arrives with the next mirror reconciliation).
+Patch: `patches/0972-fix-desktop-a-core-update-restart-is-not-a-crash-exi.patch` (source `77e6a1eda3`).
 
 ## Why
 

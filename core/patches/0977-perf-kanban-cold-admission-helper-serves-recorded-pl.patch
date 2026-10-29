@@ -1,0 +1,1686 @@
+From a89427ce204990d0a6a90e3075da0362987b0e9d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:45:27 -0700
+Subject: [PATCH] perf(kanban): cold admission helper serves recorded plugin
+ discovery and skill frontmatter [daveey] (#202)
+
+* perf(kanban): cold admission helper serves recorded plugin discovery and skill frontmatter [daveey]
+
+A fresh kanban admission helper under macOS background-tier I/O spent 24-44 s validating its
+first card on the mini: provider discovery at hermes_cli.config import (5-10 s), loading all
+plugins to learn whether terminal/file resolve (10-17 s), and re-parsing every SKILL.md for
+frontmatter aliases (4-9 s). Each is now done once and reused by later cold processes, with
+results identical to a fresh run:
+
+- hermes_cli.config: the OPTIONAL_ENV_VARS additions (provider env vars, the core snapshot,
+  platform manifest entries) run on first use, in the eager order, under a re-entrant lock;
+  every dict method and the two derived frozensets trigger them.
+- hermes_cli.plugins_snapshot: a discovery records its plugin toolset keys / portable MCP names
+  with a stat-only fingerprint of its inputs and whether any plugin touched a built-in tool or
+  toolset. _profile_capabilities serves that record (discovery suppressed) only when it is
+  current, collision-free and grants every needed toolset; otherwise it runs the full discovery
+  as before and records it.
+- tools.skill_frontmatter_index: a cross-process, stat-revalidated index of SKILL.md parses
+  under HERMES_HOME/cache, keyed by path + (dev, ino, size, mtime_ns, ctime_ns), stamped with
+  the parser's code digest; only JSON-exact values; stock parser only.
+
+* fix(kanban-cold): registry stages read the import-time home; failed stage retries; YAML loader rebinding bypasses the index [daveey]
+
+Review of #202: a first OPTIONAL_ENV_VARS touch under another profile's home override read that
+profile's provider/platform plugins process-wide (the eager import read the import-time home).
+The stages now run under the home captured at install. A stage that raises leaves the registry
+pending (as the failed eager import did) instead of half-built. The frontmatter index token now
+covers the loaded YAML entry points, and a rebound yaml_load bypasses the index.
+
+* fix(config): keep the import-time home initialization the eager provider discovery did [daveey]
+
+Importing hermes_cli.config used to run load_config() inside provider discovery, so
+ensure_hermes_home() secured the home once at import. With the env-var additions deferred,
+the first ensure moved to the first config read and re-secured a home whose mode changed
+after import (test_config_format_write_failure_is_owed_not_reported_complete: a 0555
+profile home was reset to 0700, so the config write it must refuse succeeded).
+config_env_registry.install(ensure_home=ensure_hermes_home) now runs it at import, logging
+and dropping errors as the eager path swallowed them.
+Test: test_importing_config_still_secures_the_home_once (red before, green after); the
+lazy-registry test helper now carries the runner's sys.path to its child.
+
+* test(kanban-cold): subprocess probes carry the runner's sys.path [daveey]
+
+A runner that provides dependencies through PYTHONPATH (the hub's hermes env) lost them in
+the probes' children (ModuleNotFoundError: ruamel); same remedy as
+test_update_post_commit_safety._child_env.
+
+* test(config): pin HERMES_HOME_MODE in the import-secures-home test so it holds on container CI runners [daveey]
+
+The secure-dir policy skips an implicit chmod when it detects a container (CI runners are
+detected as one), so the home stayed 0755 there. An explicit HERMES_HOME_MODE applies on
+hosts and containers; the test still fails without the import-time ensure.
+---
+ agent/skill_utils.py                          |   3 +
+ hermes_cli/config.py                          |  65 +++--
+ hermes_cli/config_defaults.py                 |   6 +-
+ hermes_cli/config_env_registry.py             | 139 +++++++++++
+ hermes_cli/kanban_capabilities.py             |  47 +++-
+ hermes_cli/plugins.py                         |  26 +-
+ hermes_cli/plugins_snapshot.py                | 210 ++++++++++++++++
+ .../test_config_lazy_env_registry.py          | 204 +++++++++++++++
+ ...est_kanban_capabilities_plugin_snapshot.py | 235 ++++++++++++++++++
+ tests/tools/test_skill_frontmatter_index.py   | 211 ++++++++++++++++
+ tools/skill_frontmatter_index.py              | 224 +++++++++++++++++
+ tools/skills_tool.py                          |   1 +
+ tools/skills_tool_plugin.py                   |  18 ++
+ toolsets.py                                   |   4 +
+ 14 files changed, 1340 insertions(+), 53 deletions(-)
+ create mode 100644 hermes_cli/config_env_registry.py
+ create mode 100644 hermes_cli/plugins_snapshot.py
+ create mode 100644 tests/hermes_cli/test_config_lazy_env_registry.py
+ create mode 100644 tests/hermes_cli/test_kanban_capabilities_plugin_snapshot.py
+ create mode 100644 tests/tools/test_skill_frontmatter_index.py
+ create mode 100644 tools/skill_frontmatter_index.py
+
+diff --git a/agent/skill_utils.py b/agent/skill_utils.py
+index eebbeb15a16..22966522d79 100644
+--- a/agent/skill_utils.py
++++ b/agent/skill_utils.py
+@@ -86,6 +86,9 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
+     return frontmatter, body
+ 
+ 
++_DEFAULT_PARSE_FRONTMATTER = parse_frontmatter  # tools.skill_frontmatter_index: patched -> no persisted parses
++
++
+ def skill_matches_platform_list(platforms: Any) -> bool:
+     """Return True when *platforms* is compatible with the current OS."""
+     if not platforms:
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 8d7227492eb..e54ade82033 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -3999,33 +3999,11 @@ def config_command(args):
+     sys.exit(1)
+ 
+ 
+-# ---- OPTIONAL_ENV_VARS injection from provider profiles and platform plugins (once, at import) ----
+-
+-def _inject_profile_env_vars() -> None:
+-    """Expose env_vars of every ``auth_type="api_key"`` provider in providers/ via OPTIONAL_ENV_VARS
+-    without editing this file."""
+-    try:
+-        from providers import list_providers
+-        for _pp in list_providers():
+-            if _pp.auth_type != "api_key":
+-                continue
+-            for _var in _pp.env_vars:
+-                if _var in OPTIONAL_ENV_VARS:
+-                    continue
+-                _is_key = not _var.endswith(("_BASE_URL", "_URL"))
+-                _label = _pp.display_name or _pp.name
+-                OPTIONAL_ENV_VARS[_var] = {
+-                    "description": f"{_label} {'API key' if _is_key else 'base URL override'}",
+-                    "prompt": f"{_label} {'API key' if _is_key else 'base URL (leave empty for default)'}",
+-                    "url": _pp.signup_url or None,
+-                    "password": _is_key,
+-                    "category": "provider",
+-                    "advanced": True}
+-    except Exception:
+-        pass
++# ---- OPTIONAL_ENV_VARS injection from provider profiles and platform plugins (once, on first use) ----
+ 
++from hermes_cli import config_env_registry as _env_registry
++from hermes_cli.config_env_registry import _inject_profile_env_vars  # moved there [daveey]
+ 
+-_inject_profile_env_vars()
+ 
+ 
+ PlatformManifestSource = Literal["all", "bundled", "user"]
+@@ -4150,7 +4128,7 @@ def _manifest_secret_envs(manifests) -> frozenset[str]:
+     names = {name.upper() for _dir, manifest in manifests
+              for name, is_secret, meta in _platform_manifest_env_entries(manifest)
+              if is_secret and (meta.get("category") or "messaging") == "messaging"}
+-    return frozenset(names - {n.upper() for n in CORE_DECLARED_ENV_NAMES})
++    return frozenset(names - {n.upper() for n in _derived_env_names("CORE_DECLARED_ENV_NAMES")})
+ 
+ 
+ def platform_manifest_secret_envs(home: Optional[Path] = None, source: PlatformManifestSource = "user", *,
+@@ -4158,8 +4136,9 @@ def platform_manifest_secret_envs(home: Optional[Path] = None, source: PlatformM
+     """Secret env names declared by one source's platform plugin manifests: ``"user"`` reads only
+     ``home``'s user-installed plugins, which belong to that profile alone; ``"bundled"`` returns
+     the set read once at import (re-read strictly if that read hit an I/O error)."""
+-    if source == "bundled" and BUNDLED_PLATFORM_SECRET_ENVS is not None:
+-        return BUNDLED_PLATFORM_SECRET_ENVS
++    bundled = _derived_env_names("BUNDLED_PLATFORM_SECRET_ENVS")
++    if source == "bundled" and bundled is not None:
++        return bundled
+     return _manifest_secret_envs(_platform_plugin_manifests(home, source, strict=strict))
+ 
+ 
+@@ -4204,8 +4183,28 @@ def _inject_platform_plugin_env_vars() -> frozenset[str] | None:
+     return _manifest_secret_envs(bundled) if bundled is not None else None
+ 
+ 
+-# Names declared in core, before any platform manifest is read. A manifest never reclassifies
+-# one: the config form keeps the core entry, and the child-env scrub keeps a plugin that lists
+-# OPENAI_API_KEY from turning a provider key into an adapter secret.
+-CORE_DECLARED_ENV_NAMES: frozenset[str] = frozenset(OPTIONAL_ENV_VARS)
+-BUNDLED_PLATFORM_SECRET_ENVS: frozenset[str] | None = _inject_platform_plugin_env_vars()
++# The OPTIONAL_ENV_VARS additions run on first use, in this order (config_env_registry) [daveey].
++# CORE_DECLARED_ENV_NAMES: names declared in core, before any platform manifest is read. A
++# manifest never reclassifies one: the config form keeps the core entry, and the child-env scrub
++# keeps a plugin that lists OPENAI_API_KEY from turning a provider key into an adapter secret.
++def _env_registry_stages():
++    _inject_profile_env_vars()
++    yield "CORE_DECLARED_ENV_NAMES", frozenset(dict.keys(OPTIONAL_ENV_VARS))
++    yield "BUNDLED_PLATFORM_SECRET_ENVS", _inject_platform_plugin_env_vars()
++
++
++def _derived_env_names(name: str):
++    """A derived name as the eager global was read: an explicit module binding (a test's
++    monkeypatch) wins over the lazily computed value."""
++    if name in globals():
++        return globals()[name]
++    return _env_registry.value(name)
++
++
++def __getattr__(name: str):  # CORE_DECLARED_ENV_NAMES, BUNDLED_PLATFORM_SECRET_ENVS
++    if name in ("CORE_DECLARED_ENV_NAMES", "BUNDLED_PLATFORM_SECRET_ENVS"):
++        return _env_registry.value(name)
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++
++
++_env_registry.install(_env_registry_stages, ensure_home=ensure_hermes_home)
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index d2c0fc08d1c..86a749025f9 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -16,8 +16,8 @@ LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
+ DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
+ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
+ 
+-
+ from hermes_cli.config_defaults_aux import auxiliary_defaults as _aux
++from hermes_cli.config_env_registry import EnvVarRegistry as _EnvVarRegistry
+ from hermes_cli.config_defaults_routing import routing_defaults
+ 
+ 
+@@ -2865,7 +2865,7 @@ def _base_url(name, prompt_name=None):
+ # Optional environment variables that enhance functionality. Feeds the dashboard keys page and setup
+ # checklists; category: provider|tool|skill|messaging|setting, advanced=True hides from checklists,
+ # tools=[...] lists the model tools the key unlocks.
+-OPTIONAL_ENV_VARS = {
++OPTIONAL_ENV_VARS = _EnvVarRegistry({  # its import-time additions run on first use [daveey]
+     # ── Provider (handled in provider selection, not shown in checklists) ──
+     "NOUS_BASE_URL": _base_url("Nous Portal"),
+     "HERMES_ANON_API_SECRET": _env(
+@@ -3279,4 +3279,4 @@ OPTIONAL_ENV_VARS = {
+     "HERMES_EPHEMERAL_SYSTEM_PROMPT": _setting(
+         "Ephemeral system prompt injected at API-call time (never persisted to sessions)",
+         "Ephemeral system prompt", None),
+-}
++})
+diff --git a/hermes_cli/config_env_registry.py b/hermes_cli/config_env_registry.py
+new file mode 100644
+index 00000000000..cd3ddb477c7
+--- /dev/null
++++ b/hermes_cli/config_env_registry.py
+@@ -0,0 +1,139 @@
++"""``OPTIONAL_ENV_VARS``' import-time additions, run on first use. [daveey]
++
++``hermes_cli.config`` adds every api-key provider's env vars and every platform plugin
++manifest's entries to ``OPTIONAL_ENV_VARS``, then derives ``CORE_DECLARED_ENV_NAMES`` (between
++the two stages) and ``BUNDLED_PLATFORM_SECRET_ENVS``. Doing that at import discovered every
++provider plugin and read every platform manifest in each process importing the config module,
++which a cold background helper (the kanban admission check) paid without reading the dict.
++
++:class:`EnvVarRegistry` runs the stages on the first read or write of the dict and
++:func:`value` on the first read of a derived name: once, in the eager order, under a re-entrant
++lock (other threads wait; a nested touch from inside a stage sees the partial dict, as a read
++during the eager import did). Leaf module: imports nothing from ``hermes_cli.config``.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++from typing import Any, Callable, Iterator, Optional
++
++logger = logging.getLogger(__name__)
++_lock = threading.RLock()
++_stages: Optional[Callable[[], Iterator[tuple[str, Any]]]] = None
++_home: Optional[str] = None
++_values: dict[str, Any] = {}
++_state = 0  # 0 pending, 1 running (the running thread holds the lock), 2 done
++
++
++def install(stages: Callable[[], Iterator[tuple[str, Any]]],
++            ensure_home: Optional[Callable[[], None]] = None) -> None:
++    """Register the additions (a generator publishing each derived ``(name, value)`` as soon as
++    it exists). Called by ``hermes_cli.config`` at import, so a reload re-runs them.
++
++    ``ensure_home`` runs now: the eager provider discovery called ``load_config()`` at import,
++    so importing the config module initialized and secured the home once (ensure_hermes_home's
++    per-process memo). A later mode change (an operator's chmod, a read-only mount) must not be
++    "repaired" by a first ensure moved to the first config read. Errors are logged and dropped,
++    as the eager path swallowed them inside ``_inject_profile_env_vars``.
++
++    The Hermes home bound now is the one the stages read later: the eager import read the
++    provider and platform plugins of the home bound at import, and a first touch from a turn
++    scoped to another profile must not swap in that profile's plugins process-wide."""
++    global _stages, _state, _home
++    from hermes_constants import get_hermes_home
++
++    with _lock:
++        _stages, _state, _home = stages, 0, str(get_hermes_home())
++        _values.clear()
++    if ensure_home is not None:
++        try:
++            ensure_home()
++        except Exception:  # health: allow BLE001 -- the eager import swallowed this too
++            logger.debug("Hermes home initialization at config import failed", exc_info=True)
++
++
++def ensure() -> None:
++    """Run the additions once. The lock is held across the stages' imports (as the eager import
++    held the config module's import lock); a stage that re-enters sees the partial dict."""
++    global _state
++    if _state == 2 or _stages is None:
++        return
++    with _lock:
++        if _state or _stages is None:
++            return
++        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++        _state = 1
++        token = set_hermes_home_override(_home)
++        try:
++            for name, val in _stages():
++                _values[name] = val
++            _state = 2
++        except BaseException:
++            # The eager import failed here; leave the work pending so the next touch retries
++            # rather than serving a half-built registry.
++            _values.clear()
++            _state = 0
++            raise
++        finally:
++            reset_hermes_home_override(token)
++
++
++def value(name: str) -> Any:
++    ensure()
++    return _values[name]
++
++
++def done() -> bool:
++    return _state == 2
++
++
++class EnvVarRegistry(dict):
++    """A dict whose every read/write method first runs the registered additions."""
++
++    __slots__ = ()
++
++
++def _hooked(name: str):
++    base = getattr(dict, name)
++
++    def method(self, *args, **kwargs):
++        ensure()
++        return base(self, *args, **kwargs)
++    method.__name__ = method.__qualname__ = name
++    method.__doc__ = base.__doc__
++    return method
++
++
++for _name in ("__getitem__", "__setitem__", "__delitem__", "__contains__", "__iter__", "__len__",
++              "__reversed__", "__repr__", "__eq__", "__ne__", "__or__", "__ror__", "__ior__",
++              "__reduce__", "__reduce_ex__", "__sizeof__", "get", "keys", "values", "items", "copy",
++              "setdefault", "pop", "popitem", "update", "clear"):
++    setattr(EnvVarRegistry, _name, _hooked(_name))
++del _name
++
++
++def _inject_profile_env_vars() -> None:
++    """Expose env_vars of every ``auth_type="api_key"`` provider in providers/ via OPTIONAL_ENV_VARS
++    without editing this file."""
++    from hermes_cli.config_defaults import OPTIONAL_ENV_VARS
++    try:
++        from providers import list_providers
++        for _pp in list_providers():
++            if _pp.auth_type != "api_key":
++                continue
++            for _var in _pp.env_vars:
++                if _var in OPTIONAL_ENV_VARS:
++                    continue
++                _is_key = not _var.endswith(("_BASE_URL", "_URL"))
++                _label = _pp.display_name or _pp.name
++                OPTIONAL_ENV_VARS[_var] = {
++                    "description": f"{_label} {'API key' if _is_key else 'base URL override'}",
++                    "prompt": f"{_label} {'API key' if _is_key else 'base URL (leave empty for default)'}",
++                    "url": _pp.signup_url or None,
++                    "password": _is_key,
++                    "category": "provider",
++                    "advanced": True}
++    except Exception:  # health: allow BLE001 -- moved verbatim from config.py: a broken provider plugin must not break config
++        pass
+diff --git a/hermes_cli/kanban_capabilities.py b/hermes_cli/kanban_capabilities.py
+index b5be4d97ea5..bbcb15ccb17 100644
+--- a/hermes_cli/kanban_capabilities.py
++++ b/hermes_cli/kanban_capabilities.py
+@@ -7,6 +7,7 @@ backends never prove access to a host repository, even when mounts might make it
+ from __future__ import annotations
+ 
+ from contextlib import ExitStack
++import sys
+ from pathlib import Path
+ from collections.abc import Iterable
+ 
+@@ -219,11 +220,45 @@ def _check_policy_shape(config) -> None:
+         raise ValueError("terminal.backend must be a nonempty string")
+ 
+ 
+-def _profile_capabilities(assignee: str) -> set[str]:
++def _cli_toolsets(config: dict, home: Path, needed: set[str] | None) -> set[str]:
++    """The profile's cli toolsets, as ``_get_platform_tools`` resolves them after plugin discovery.
++
++    [daveey] With ``needed`` (the toolsets the caller must find), a recorded discovery for this
++    profile (``plugins_snapshot.load``: inputs unchanged, no plugin touched a built-in tool or
++    toolset) is served instead of importing every plugin; under those conditions discovery cannot
++    change whether ``terminal``/``file`` resolve. The served answer is used only when it grants
++    every needed toolset; otherwise, and with no usable record, the full discovery runs as before
++    and records its result for the next cold process.
++    """
++    from hermes_cli import plugins as plugins_mod, plugins_snapshot
++    from hermes_cli.tools_config import _get_platform_tools
++
++    # agent.disabled_toolsets resolution imports model_tools, whose import is the one-time plugin
++    # discovery of a process; importing it with discovery suppressed would leave a long-lived
++    # process without plugin tools, so such a first import goes the full way.
++    disabled = (config.get("agent") or {}).get("disabled_toolsets")
++    if needed is not None and not (disabled and "model_tools" not in sys.modules):
++        snapshot = plugins_snapshot.load(home)
++        if snapshot is not None:
++            with plugins_snapshot.serving(snapshot):
++                served = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
++            if needed <= served:
++                return served
++    manager = plugins_mod.get_plugin_manager()
++    fresh = not manager._discovered
++    stamp = plugins_snapshot.fingerprint(home) if fresh else None
++    toolsets = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
++    if fresh and manager._discovered:
++        plugins_snapshot.record(stamp, home)
++    return toolsets
++
++
++def _profile_capabilities(assignee: str, required: list[str] | None = None) -> set[str]:
++    """Capabilities ``assignee``'s policy grants. ``required`` (validate_assignment's list) only
++    lets the toolset lookup skip plugin discovery when a recorded one already grants it."""
+     from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+     from hermes_cli.config_effective import load_user_config_effective
+     from hermes_cli.profiles import resolve_profile_env
+-    from hermes_cli.tools_config import _get_platform_tools
+     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+     from tools.terminal_scope import build_profile_terminal_scope, reset_terminal_scope, set_terminal_scope
+     from utils import load_yaml_file_readonly
+@@ -244,7 +279,11 @@ def _profile_capabilities(assignee: str) -> set[str]:
+         if "backend" in config.get("terminal", {}):
+             terminal["TERMINAL_ENV"] = config["terminal"]["backend"]
+         stack.callback(reset_terminal_scope, set_terminal_scope(terminal))
+-        toolsets = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
++        needed = None
++        if required is not None:
++            needed = {"terminal"} if {"terminal", "git"} & set(required) else set()
++            needed |= {"file"} & set(required)
++        toolsets = _cli_toolsets(config, home, needed)
+         available = set(toolsets) & {"terminal", "file", "kanban"}
+         # [daveey] Every assignee runs as a dispatcher-spawned worker, and model_tools._select_tool_names adds
+         # the kanban toolset to every such worker whatever platform_toolsets.cli says; only
+@@ -294,7 +333,7 @@ def validate_assignment(
+         # Unassigned drafts cannot dispatch; assign_task validates before binding.
+         return required
+     try:
+-        available = _profile_capabilities(assignee)
++        available = _profile_capabilities(assignee, required)
+     except Exception as exc:
+         raise CapabilityMismatchError(assignee, [n for n in required if n in _CAPABILITIES],
+                                       reason=f"profile policy unavailable: {exc}") from exc
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index ae2d7457839..5970965a4b5 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -1782,8 +1782,10 @@ def start_background_plugin_discovery() -> None:
+ 
+         def _run() -> None:
+             try:
++                from hermes_cli import plugins_snapshot
++                stamp = plugins_snapshot.fingerprint()  # inputs as the sweep is about to read them
+                 manager.discover_and_load()
+-                _persist_plugin_toolset_keys()
++                plugins_snapshot.record(stamp)
+             except Exception:
+                 logger.warning("background plugin discovery failed", exc_info=True)
+ 
+@@ -1805,21 +1807,19 @@ def _plugin_toolset_keys_cache_path() -> Path:
+ 
+ 
+ def _persist_plugin_toolset_keys() -> None:
+-    """Persist discovered plugin toolset keys + portable MCP names (best-effort)."""
+-    try:
+-        from utils import atomic_json_write
+-        keys = sorted({ts_key for ts_key, _, _ in get_plugin_toolsets()})
+-        try:
+-            portable = sorted(get_plugin_manager().get_portable_mcp_servers())
+-        except Exception:
+-            portable = []
+-        atomic_json_write(_plugin_toolset_keys_cache_path(), {"toolset_keys": keys, "portable_mcp": portable}, indent=None, mode=0o600)
+-    except Exception:
+-        logger.debug("plugin toolset key persist failed", exc_info=True)
++    """Persist discovered plugin toolset keys + portable MCP names (best-effort), unstamped: a
++    reader that needs the inputs to be unchanged (plugins_snapshot.load) ignores this record."""
++    from hermes_cli import plugins_snapshot
++    plugins_snapshot.record(None)
+ 
+ 
+ def _nowait_plugin_set(cache_field: str, live: Callable[[PluginManager], set[str]]) -> set[str]:
+-    """Shared body of the ``*_nowait`` probes: live registry, else last launch's cache, else block."""
++    """Shared body of the ``*_nowait`` probes: an active recorded snapshot (plugins_snapshot.serving),
++    else live registry, else last launch's cache, else block."""
++    from hermes_cli import plugins_snapshot
++    snapshot = plugins_snapshot.active()
++    if snapshot is not None:
++        return set(snapshot.toolset_keys if cache_field == "toolset_keys" else snapshot.portable_mcp)
+     manager = get_plugin_manager()
+     t = _background_discovery_thread
+     in_flight = t is not None and t.is_alive()
+diff --git a/hermes_cli/plugins_snapshot.py b/hermes_cli/plugins_snapshot.py
+new file mode 100644
+index 00000000000..28c31b4a973
+--- /dev/null
++++ b/hermes_cli/plugins_snapshot.py
+@@ -0,0 +1,210 @@
++"""Persisted record of one plugin discovery, for readers that only need its toolset effects. [daveey]
++
++The kanban admission check (``kanban_capabilities._profile_capabilities``) asks one question of a
++profile's toolset policy: does the cli platform grant ``terminal`` and ``file``? Answering it by
++discovering every plugin imports ~60 plugins in a cold helper process, which took 10-17 s on a
++loaded Mac under background-tier I/O. Plugin discovery can change that answer in only three ways:
++
++* a plugin tool takes a built-in tool name (an override), or lands in a built-in toolset;
++* the ``TOOLSETS`` table or the registry's toolset aliases change while plugins load;
++* the plugin toolset keys / portable MCP names it reports differ (read by ``_get_platform_tools``).
++
++:func:`record` writes, after a real discovery, the keys and names it found plus whether any
++of the first two happened, stamped with :func:`fingerprint` of the discovery inputs taken BEFORE
++the sweep. :func:`load` returns that record only while the fingerprint still matches and the
++sweep showed no built-in collision; any other state returns None, and callers run the full
++discovery exactly as before. The fingerprint is stat-only (no file reads, no imports).
++"""
++
++from __future__ import annotations
++
++import contextvars
++import hashlib
++import json
++import logging
++import os
++import sys
++from contextlib import contextmanager
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Iterator, Optional
++
++from hermes_constants import get_hermes_home
++
++logger = logging.getLogger(__name__)
++
++SNAPSHOT_VERSION = 1
++# Files a discovery sweep reads or imports under a plugin root.
++_PLUGIN_SUFFIXES = (".py", ".yaml", ".yml", ".json", ".toml", ".pth")
++_SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv", ".mypy_cache", ".pytest_cache"}
++# Core modules whose code decides what discovery loads and how toolsets resolve.
++_CORE_MODULES = (
++    "hermes_cli/plugins.py", "hermes_cli/plugins_loader.py", "hermes_cli/plugins_discovery.py",
++    "hermes_cli/plugins_manifest.py", "hermes_cli/plugin_capabilities.py", "hermes_cli/plugins_snapshot.py",
++    "hermes_cli/tools_config.py", "toolsets.py", "tools/registry.py", "model_tools.py",
++)
++# Env flags discovery reads. (HERMES_HOME is not one: the home the sweep scans is hashed itself,
++# so a helper that scopes into a profile and that profile's own sessions share one record.)
++_ENV_INPUTS = ("HERMES_SAFE_MODE", "HERMES_ENABLE_PROJECT_PLUGINS", "HERMES_BUNDLED_PLUGINS",
++               "HERMES_NEMO_RELAY_PLUGINS_TOML")
++
++
++@dataclass(frozen=True)
++class Snapshot:
++    toolset_keys: frozenset[str]
++    portable_mcp: frozenset[str]
++
++
++_active: contextvars.ContextVar[Optional[Snapshot]] = contextvars.ContextVar("plugin_snapshot", default=None)
++
++
++def active() -> Optional[Snapshot]:
++    """The snapshot ``plugins._nowait_plugin_set`` serves instead of discovering, if one is active."""
++    return _active.get()
++
++
++@contextmanager
++def serving(snapshot: Snapshot) -> Iterator[None]:
++    """Serve ``snapshot`` to the ``*_nowait`` probes, with discovery suppressed so nothing inside
++    loads plugins behind the reader's back (the manager stays undiscovered for later consumers)."""
++    from hermes_cli.plugins_discovery import suppress_plugin_discovery
++
++    token = _active.set(snapshot)
++    try:
++        with suppress_plugin_discovery():
++            yield
++    finally:
++        _active.reset(token)
++
++
++def _cache_path(home: Path) -> Path:
++    return home / "cache" / "plugin_toolset_keys.json"
++
++
++def _stat_entry(path: Path, label: str) -> list:
++    try:
++        st = path.stat()
++    except OSError as exc:
++        return [label, "missing", exc.errno]
++    return [label, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
++
++
++def _walk_root(root: Path, label: str, out: list) -> None:
++    if not root.is_dir():
++        out.append([label, "absent"])
++        return
++    seen: set[tuple[int, int]] = set()
++    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
++        try:
++            st = os.stat(dirpath)
++        except OSError:
++            continue
++        if (st.st_dev, st.st_ino) in seen:  # a symlink cycle
++            dirnames[:] = []
++            continue
++        seen.add((st.st_dev, st.st_ino))
++        rel = os.path.relpath(dirpath, root)
++        # The directory's own entry changes when a file is added, removed or renamed.
++        out.append([f"{label}:{rel}/", st.st_dev, st.st_ino, st.st_mtime_ns])
++        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
++        for name in sorted(filenames):
++            if name.endswith(_PLUGIN_SUFFIXES):
++                out.append(_stat_entry(Path(dirpath) / name, f"{label}:{rel}/{name}"))
++
++
++def fingerprint(home: Optional[Path] = None) -> Optional[str]:
++    """Stat-only digest of what a discovery sweep in ``home`` reads: every plugin root's files
++    (bundled, user, opt-in project), the profile config and .env, the discovery env flags, the
++    site-packages dirs (a pip install or uninstall changes an entry-point set), and the core
++    modules that gate plugins and resolve toolsets. Independent of the calling process's script,
++    cwd and priority, so every process scanning ``home`` with the same inputs shares one record.
++    None when it cannot be computed."""
++    try:
++        from hermes_cli import plugins as _plugins
++
++        home = Path(home) if home is not None else get_hermes_home()
++        repo = Path(__file__).resolve().parent.parent
++        parts: list = [SNAPSHOT_VERSION, sys.version, sys.prefix, str(home), str(repo)]
++        parts.append([[name, os.environ.get(name)] for name in _ENV_INPUTS])
++        for name in ("config.yaml", ".env"):
++            parts.append(_stat_entry(home / name, name))
++        for rel in _CORE_MODULES:
++            parts.append(_stat_entry(repo / rel, rel))
++        # Installed distributions (entry-point plugins) live in site dirs; a pip install or
++        # uninstall changes the directory. Script and source dirs on sys.path differ per caller
++        # and hold no distributions, so they are left out to keep the record shared.
++        for entry in sorted({e for e in sys.path if e and os.path.basename(e) in ("site-packages", "dist-packages")}):
++            parts.append(_stat_entry(Path(entry), f"syspath:{entry}"))
++        roots = [("bundled", Path(_plugins.get_bundled_plugins_dir())), ("user", home / "plugins")]
++        if _plugins._env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
++            roots.append(("project", Path.cwd() / ".hermes" / "plugins"))
++        for label, root in roots:
++            files: list = []
++            _walk_root(root, label, files)
++            parts.append([label, str(root), files])
++        return hashlib.sha256(json.dumps(parts, default=str).encode()).hexdigest()
++    except Exception:
++        logger.debug("plugin discovery fingerprint failed", exc_info=True)
++        return None
++
++
++def builtin_collision() -> Optional[str]:
++    """Why the live (discovered) plugin set may change built-in toolset membership, or None."""
++    import toolsets
++    from hermes_cli import plugins as _plugins
++    from tools.registry import registry
++
++    if toolsets.TOOLSETS != toolsets._STATIC_TOOLSETS:
++        return "TOOLSETS changed during discovery"
++    if getattr(registry, "_toolset_aliases", None):
++        return "registry toolset aliases present"
++    static_tools = {t for key in toolsets._STATIC_TOOLSETS
++                    for t in toolsets.resolve_toolset(key, include_registry=False)}
++    for name in sorted(_plugins.get_plugin_manager()._plugin_tool_names):
++        if name in static_tools:
++            return f"plugin tool {name!r} takes a built-in tool name"
++        entry = registry.get_entry(name)
++        if entry is not None and entry.toolset in toolsets._STATIC_TOOLSETS:
++            return f"plugin tool {name!r} lands in built-in toolset {entry.toolset!r}"
++    return None
++
++
++def record(stamp: Optional[str], home: Optional[Path] = None) -> None:
++    """Persist the live registry's toolset effects, stamped with the pre-sweep ``stamp``
++    (best-effort: a failed write only means the next reader discovers again)."""
++    try:
++        from hermes_cli import plugins as _plugins
++        from utils import atomic_json_write
++
++        home = Path(home) if home is not None else get_hermes_home()
++        keys = sorted({ts_key for ts_key, _, _ in _plugins.get_plugin_toolsets()})
++        try:
++            portable = sorted(_plugins.get_plugin_manager().get_portable_mcp_servers())
++        except Exception:  # health: allow BLE001 -- same fallback as the record this extends: no portable MCP names
++            portable = []
++        blob = {"toolset_keys": keys, "portable_mcp": portable, "version": SNAPSHOT_VERSION,
++                "fingerprint": stamp, "builtin_collision": builtin_collision()}
++        atomic_json_write(_cache_path(home), blob, indent=None, mode=0o600)  # type: ignore[arg-type]
++    except Exception:
++        logger.debug("plugin discovery snapshot write failed", exc_info=True)
++
++
++def load(home: Optional[Path] = None) -> Optional[Snapshot]:
++    """The last recorded discovery for ``home`` when its inputs are unchanged and it showed no
++    built-in collision; None otherwise (missing, corrupt, older format, stale, or colliding)."""
++    home = Path(home) if home is not None else get_hermes_home()
++    try:
++        blob = json.loads(_cache_path(home).read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    if not isinstance(blob, dict) or blob.get("version") != SNAPSHOT_VERSION:
++        return None
++    stamp = blob.get("fingerprint")
++    if not isinstance(stamp, str) or blob.get("builtin_collision") is not None:
++        return None
++    keys, portable = blob.get("toolset_keys"), blob.get("portable_mcp")
++    if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in (keys, portable)):
++        return None
++    if fingerprint(home) != stamp:
++        return None
++    return Snapshot(frozenset(keys or ()), frozenset(portable or ()))
+diff --git a/tests/hermes_cli/test_config_lazy_env_registry.py b/tests/hermes_cli/test_config_lazy_env_registry.py
+new file mode 100644
+index 00000000000..713d53a78a6
+--- /dev/null
++++ b/tests/hermes_cli/test_config_lazy_env_registry.py
+@@ -0,0 +1,204 @@
++"""OPTIONAL_ENV_VARS' import-time additions run on first use, with the eager import's results. [daveey]
++
++Importing ``hermes_cli.config`` used to discover every provider plugin and read every platform
++manifest; the kanban admission helper paid that in each cold process without reading the dict.
++"""
++import json
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++def _py(code: str, tmp_path, prelude: str = "", extra_env: dict | None = None) -> dict:
++    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_", "PYTEST"))}
++    home = tmp_path / "hermes"
++    home.mkdir(exist_ok=True)
++    # The runner may provide dependencies through sys.path rather than site-packages.
++    env.update(HERMES_HOME=str(home), HOME=str(tmp_path),
++               PYTHONPATH=os.pathsep.join([str(REPO), *(os.path.abspath(p) for p in sys.path if p)]))
++    env.update(extra_env or {})
++    p = subprocess.run([sys.executable, "-c", textwrap.dedent(prelude) + textwrap.dedent(code)], env=env, capture_output=True, text=True, check=False,
++                       timeout=180, cwd=str(tmp_path))
++    line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), None)
++    assert line, p.stdout[-2000:] + p.stderr[-4000:]
++    return json.loads(line[7:])
++
++
++DUMP = """
++    import json
++    import hermes_cli.config as c
++    def dump():
++        return {"keys": list(c.OPTIONAL_ENV_VARS.keys()), "values": json.loads(json.dumps(dict(c.OPTIONAL_ENV_VARS.items()), default=str)),
++                "core": sorted(c.CORE_DECLARED_ENV_NAMES),
++                "bundled": None if c.BUNDLED_PLATFORM_SECRET_ENVS is None else sorted(c.BUNDLED_PLATFORM_SECRET_ENVS)}
++"""
++
++
++def test_importing_config_discovers_no_providers(tmp_path):
++    r = _py("""
++        import providers, hermes_cli.config as c
++        print("RESULT " + __import__("json").dumps({"providers": bool(providers._discovered), "state": c._env_registry._state}))
++    """, tmp_path)
++    assert r == {"providers": False, "state": 0}
++
++
++@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs POSIX modes, non-root")
++def test_importing_config_still_secures_the_home_once(tmp_path):
++    """The eager import secured the home (load_config inside provider discovery); a later
++    permission change must survive the first config read, as it did then.
++
++    HERMES_HOME_MODE is explicit because the secure-dir policy skips an implicit chmod inside a
++    container (CI runners are detected as one); an explicit mode applies on hosts and containers."""
++    r = _py("""
++        import json, os, stat
++        from pathlib import Path
++        home = Path(os.environ["HERMES_HOME"])
++        home.chmod(0o755)
++        import hermes_cli.config as c
++        secured = stat.S_IMODE(home.stat().st_mode)
++        home.chmod(0o555)
++        try:
++            c.load_config_readonly()
++            after = stat.S_IMODE(home.stat().st_mode)
++        finally:
++            home.chmod(0o755)
++        print("RESULT " + json.dumps({"secured": oct(secured), "after": oct(after)}))
++    """, tmp_path, extra_env={"HERMES_HOME_MODE": "0700"})
++    assert r == {"secured": "0o700", "after": "0o555"}
++
++
++@pytest.mark.parametrize("touch", [
++    "list(c.OPTIONAL_ENV_VARS)",
++    "len(c.OPTIONAL_ENV_VARS)",
++    "'OPENROUTER_API_KEY' in c.OPTIONAL_ENV_VARS",
++    "c.OPTIONAL_ENV_VARS.get('OPENROUTER_API_KEY')",
++    "dict(c.OPTIONAL_ENV_VARS)",
++    "{**c.OPTIONAL_ENV_VARS}",
++    "json.dumps(c.OPTIONAL_ENV_VARS, default=str)",
++    "c.CORE_DECLARED_ENV_NAMES",
++    "c.BUNDLED_PLATFORM_SECRET_ENVS",
++    "__import__('hermes_cli.config_defaults', fromlist=['x']).OPTIONAL_ENV_VARS.items()",
++    "c.get_missing_env_vars()",
++])
++def test_every_access_style_sees_the_complete_registry(tmp_path, touch):
++    r = _py(f"""
++        first = {touch}
++        d = dump()
++        c._env_registry._state == 2 or print("NOT RUN")
++        print("RESULT " + json.dumps({{"dump": d, "state": c._env_registry._state}}))
++    """, tmp_path, DUMP)
++    ref = _py("""
++        c._env_registry.ensure()
++        print("RESULT " + json.dumps({"dump": dump(), "state": c._env_registry._state}))
++    """, tmp_path, DUMP)
++    assert r["state"] == 2 and r["dump"] == ref["dump"]
++
++
++def test_core_snapshot_is_taken_between_provider_and_platform_additions(tmp_path):
++    r = _py("""
++        import hermes_cli.config_defaults as d
++        base = list(dict.keys(d.OPTIONAL_ENV_VARS))     # the static table, read without the hook
++        out = dump()
++        print("RESULT " + json.dumps({"base": base, **out}))
++    """, tmp_path, DUMP)
++    keys, core, base = r["keys"], set(r["core"]), r["base"]
++    assert keys[: len(base)] == base                     # additions append, in order
++    provider_added = core - set(base)
++    platform_added = set(keys) - core
++    assert provider_added and platform_added             # both stages contributed
++    assert core == set(keys[: len(core)])                # the snapshot is a prefix: providers first
++    assert set(r["bundled"] or ()) <= set(keys) and not set(r["bundled"] or ()) & {k.upper() for k in core}
++
++
++def test_reload_reruns_the_additions_as_the_eager_import_did(tmp_path):
++    # config_defaults is not reloaded, so the eager import re-ran its additions on an already full
++    # dict: the snapshot then held every key and no bundled platform name stayed outside it.
++    r = _py("""
++        import importlib
++        before = dump()
++        importlib.reload(c)
++        after = dump()
++        print("RESULT " + json.dumps({"before": before, "after": after, "state": c._env_registry._state}))
++    """, tmp_path, DUMP)
++    assert r["state"] == 2 and r["after"]["keys"] == r["before"]["keys"]
++    assert r["after"]["core"] == sorted(r["before"]["keys"]) and r["after"]["bundled"] == []
++
++
++def test_concurrent_first_touches_run_the_additions_once(tmp_path):
++    r = _py("""
++        import json, threading, time
++        import hermes_cli.config as c
++        calls = []
++        real = c._inject_profile_env_vars
++        def slow():
++            calls.append(1); time.sleep(0.3); real()
++        c._inject_profile_env_vars = slow
++        sizes = []
++        ts = [threading.Thread(target=lambda: sizes.append(len(c.OPTIONAL_ENV_VARS))) for _ in range(8)]
++        [t.start() for t in ts]; [t.join() for t in ts]
++        print("RESULT " + json.dumps({"calls": len(calls), "sizes": sorted(set(sizes)), "core": len(c.CORE_DECLARED_ENV_NAMES)}))
++    """, tmp_path)
++    assert r["calls"] == 1 and len(r["sizes"]) == 1 and r["core"] <= r["sizes"][0]
++
++
++def test_first_touch_under_another_profile_reads_the_import_home(tmp_path):
++    """The eager import read the plugins of the home bound at import; a first touch from a turn
++    scoped to another profile must not pull that profile's plugins in process-wide."""
++    other = tmp_path / "other"
++    manifest = other / "plugins" / "platforms" / "zzplat"
++    manifest.mkdir(parents=True)
++    (manifest / "plugin.yaml").write_text(
++        "name: zzplat\nkind: platform\nversion: 0.1.0\nrequires_env:\n  - ZZPLAT_BOT_TOKEN\n")
++    r = _py(f"""
++        import json
++        import hermes_cli.config as c
++        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
++        tok = set_hermes_home_override({str(other)!r})
++        try:
++            seen = "ZZPLAT_BOT_TOKEN" in c.OPTIONAL_ENV_VARS
++        finally:
++            reset_hermes_home_override(tok)
++        print("RESULT " + json.dumps({{"seen": seen}}))
++    """, tmp_path)
++    assert r["seen"] is False
++    # control: the same manifest under the import home is picked up
++    import shutil
++    shutil.copytree(other / "plugins", tmp_path / "hermes" / "plugins")
++    r = _py("""
++        import json
++        import hermes_cli.config as c
++        print("RESULT " + json.dumps({"seen": "ZZPLAT_BOT_TOKEN" in c.OPTIONAL_ENV_VARS}))
++    """, tmp_path)
++    assert r["seen"] is True
++
++
++def test_a_failing_stage_is_retried_not_served_half_built(tmp_path):
++    r = _py("""
++        import json
++        import hermes_cli.config as c
++        real = c._inject_platform_plugin_env_vars
++        calls = []
++        def boom():
++            calls.append(1)
++            if len(calls) == 1:
++                raise RuntimeError("manifest read failed")
++            return real()
++        c._inject_platform_plugin_env_vars = boom
++        try:
++            len(c.OPTIONAL_ENV_VARS)
++            first = "no error"
++        except RuntimeError as exc:
++            first = str(exc)
++        state_after_failure = c._env_registry._state
++        n = len(c.OPTIONAL_ENV_VARS)
++        print("RESULT " + json.dumps({"first": first, "state": state_after_failure, "calls": len(calls),
++                                      "done": c._env_registry.done(), "n": n}))
++    """, tmp_path)
++    assert r["first"] == "manifest read failed" and r["state"] == 0
++    assert r["calls"] == 2 and r["done"] is True
+diff --git a/tests/hermes_cli/test_kanban_capabilities_plugin_snapshot.py b/tests/hermes_cli/test_kanban_capabilities_plugin_snapshot.py
+new file mode 100644
+index 00000000000..50b4f4537f9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capabilities_plugin_snapshot.py
+@@ -0,0 +1,235 @@
++"""Kanban admission serves a recorded plugin discovery only when discovery cannot change the answer.
++
++Each case runs ``validate_assignment`` in a fresh interpreter (the admission helper's cold
++path) against a real isolated profile with real user plugins, and compares it with a full
++discovery. [daveey]
++"""
++import json
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[2]
++
++PROBE = textwrap.dedent("""
++    import json, sys
++    from hermes_cli import plugins as P
++    calls = []
++    _orig = P.PluginManager._discover_and_load_inner
++    def _spy(self, *a, **k):
++        calls.append(1)
++        return _orig(self, *a, **k)
++    P.PluginManager._discover_and_load_inner = _spy
++    import providers
++    from hermes_cli.kanban_capabilities import CapabilityMismatchError, validate_assignment
++    req = json.loads(sys.argv[2])
++    try:
++        out = {"granted": validate_assignment(sys.argv[1], requires=req)}
++    except CapabilityMismatchError as exc:
++        out = {"missing": exc.missing}
++    out["discoveries"] = len(calls)
++    out["providers_discovered"] = bool(providers._discovered)
++    print("RESULT " + json.dumps(out))
++""")
++
++
++def _plugin(home: Path, name: str, body: str) -> Path:
++    d = home / "plugins" / name
++    d.mkdir(parents=True, exist_ok=True)
++    (d / "plugin.yaml").write_text(f"name: {name}\nversion: 0.1.0\ndescription: test plugin\n")
++    (d / "__init__.py").write_text(textwrap.dedent(body))
++    return d
++
++
++TOOL = """
++    def _schema(name):
++        return {"name": name, "description": "t", "parameters": {"type": "object", "properties": {}}}
++
++    def register(ctx):
++        ctx.register_tool(name=%r, toolset=%r, schema=_schema(%r), handler=lambda args, **kw: "{}"%s)
++"""
++
++
++def _tool_plugin(home, name, tool, toolset, override=False):
++    return _plugin(home, name, TOOL % (tool, toolset, tool, ", override=True" if override else ""))
++
++
++@pytest.fixture
++def home(tmp_path):
++    h = tmp_path / "hermes"
++    h.mkdir()
++    return h
++
++
++def _config(home: Path, text: str) -> None:
++    (home / "config.yaml").write_text(textwrap.dedent(text))
++
++
++def _run(home: Path, requires=("terminal", "file"), assignee="default", *, cwd=None, extra_path=None) -> dict:
++    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_", "PYTEST"))}
++    # The runner may provide dependencies through sys.path rather than site-packages.
++    pythonpath = os.pathsep.join([str(REPO), *([str(extra_path)] if extra_path else []),
++                                  *(os.path.abspath(p) for p in sys.path if p)])
++    env.update(HERMES_HOME=str(home), HOME=str(home.parent), PYTHONPATH=pythonpath, PYTHONDONTWRITEBYTECODE="1")
++    proc = subprocess.run([sys.executable, "-c", PROBE, assignee, json.dumps(list(requires))], cwd=str(cwd or home.parent),
++                          env=env, capture_output=True, text=True, timeout=120, check=False)
++    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
++    assert line, proc.stdout[-2000:] + proc.stderr[-4000:]
++    return json.loads(line[len("RESULT "):])
++
++
++def _verdict(r: dict) -> dict:
++    return {k: r[k] for k in ("granted", "missing") if k in r}
++
++
++ENABLED = "plugins:\n  enabled: [%s]\n"
++OVERRIDE = "plugins:\n  enabled: [%s]\n  entries:\n    %s:\n      allow_tool_override: true\n"
++
++
++def test_second_cold_process_serves_the_record_without_discovery(home):
++    _tool_plugin(home, "extra", "extra_ping", "extra")
++    _config(home, "platform_toolsets:\n  cli: [terminal, file, extra]\n" + ENABLED % "extra")
++    first = _run(home)
++    assert first["discoveries"] == 1 and first["granted"] == ["terminal", "file"]
++    blob = json.loads((home / "cache" / "plugin_toolset_keys.json").read_text())
++    assert "extra" in blob["toolset_keys"] and blob["builtin_collision"] is None and blob["fingerprint"]
++    second = _run(home)
++    assert _verdict(second) == _verdict(first)
++    assert second["discoveries"] == 0
++    # The config-module import no longer discovers providers either (it ran via plugins before).
++    assert second["providers_discovered"] is False
++
++
++@pytest.mark.parametrize("cli", [
++    None,                                   # platform default composite
++    "[hermes-cli]",                         # explicit composite
++    "[terminal]",                           # file missing -> refusal on both paths
++    "[file, extra]",                        # terminal missing
++    "[]",                                   # explicit empty
++    "[terminal, file, no_mcp]",
++])
++@pytest.mark.parametrize("disabled", [None, "[debugging]", "[extra]", "[terminal]"])
++def test_served_answer_equals_full_discovery(home, cli, disabled):
++    _tool_plugin(home, "extra", "extra_ping", "extra")
++    text = ENABLED % "extra"
++    if cli is not None:
++        text += f"platform_toolsets:\n  cli: {cli}\n"
++    if disabled is not None:
++        text += f"agent:\n  disabled_toolsets: {disabled}\n"
++    _config(home, text)
++    full = _run(home)
++    served = _run(home)
++    assert full["discoveries"] == 1
++    assert _verdict(served) == _verdict(full)
++    if "granted" in full and disabled is None:
++        assert served["discoveries"] == 0
++    else:
++        # A refusal is never taken from the record (the full discovery reconfirms it), and a
++        # disabled_toolsets list needs model_tools, whose first import is a process's discovery.
++        assert served["discoveries"] == 1
++
++
++def test_plugin_overriding_a_builtin_tool_is_never_served(home):
++    # A plugin that takes over the `terminal` tool into its own toolset: disabling that toolset
++    # strips terminal at runtime, which only a real discovery can see.
++    _tool_plugin(home, "evil", "terminal", "evil", override=True)
++    _config(home, OVERRIDE % ("evil", "evil") + "agent:\n  disabled_toolsets: [evil]\n")
++    first = _run(home)
++    blob = json.loads((home / "cache" / "plugin_toolset_keys.json").read_text())
++    assert blob["builtin_collision"] and "terminal" in blob["builtin_collision"]
++    second = _run(home)
++    assert _verdict(second) == _verdict(first)
++    assert second["discoveries"] == 1
++
++
++def test_plugin_tool_in_a_builtin_toolset_is_never_served(home):
++    _tool_plugin(home, "squat", "squat_tool", "terminal")
++    _config(home, ENABLED % "squat")
++    _run(home)
++    blob = json.loads((home / "cache" / "plugin_toolset_keys.json").read_text())
++    assert "built-in toolset 'terminal'" in blob["builtin_collision"]
++    assert _run(home)["discoveries"] == 1
++
++
++def test_editing_a_plugin_invalidates_the_record(home):
++    plugin = _tool_plugin(home, "extra", "extra_ping", "extra")
++    _config(home, ENABLED % "extra")
++    assert _run(home)["granted"] == ["terminal", "file"]
++    assert _run(home)["discoveries"] == 0
++    # The plugin now puts a tool into the built-in `terminal` toolset: the record is stale, the
++    # next process discovers for real and records the collision, so it is never served again.
++    (plugin / "__init__.py").write_text(textwrap.dedent(TOOL % ("extra_ping", "terminal", "extra_ping", "")))
++    after = _run(home)
++    assert after["discoveries"] == 1 and after["granted"] == ["terminal", "file"]
++    blob = json.loads((home / "cache" / "plugin_toolset_keys.json").read_text())
++    assert "built-in toolset 'terminal'" in blob["builtin_collision"]
++    assert _run(home)["discoveries"] == 1
++
++
++def test_new_plugin_dir_and_config_edit_invalidate_the_record(home):
++    _config(home, "platform_toolsets:\n  cli: [terminal, file]\n")
++    _run(home)
++    assert _run(home)["discoveries"] == 0
++    _tool_plugin(home, "late", "late_ping", "late")
++    assert _run(home)["discoveries"] == 1
++    assert _run(home)["discoveries"] == 0
++    _config(home, "platform_toolsets:\n  cli: [terminal, file]\n" + ENABLED % "late")
++    assert _run(home)["discoveries"] == 1
++
++
++@pytest.mark.parametrize("blob", ["", "{not json", "[]", json.dumps({"toolset_keys": [], "portable_mcp": []}),
++                                  json.dumps({"version": 1, "fingerprint": "0" * 64, "builtin_collision": None,
++                                              "toolset_keys": [], "portable_mcp": []})])
++def test_missing_corrupt_old_or_stale_record_runs_full_discovery(home, blob):
++    _config(home, "platform_toolsets:\n  cli: [terminal, file]\n")
++    (home / "cache").mkdir()
++    (home / "cache" / "plugin_toolset_keys.json").write_text(blob)
++    r = _run(home)
++    assert r["discoveries"] == 1 and r["granted"] == ["terminal", "file"]
++
++
++def test_served_refusal_falls_back_to_full_resolution(monkeypatch, tmp_path):
++    """In-process: when the served answer lacks a needed toolset, the full path decides."""
++    from hermes_cli import kanban_capabilities as kc, plugins_snapshot
++    import hermes_cli.tools_config as tc
++
++    monkeypatch.setattr(plugins_snapshot, "load", lambda home: plugins_snapshot.Snapshot(frozenset(), frozenset()))
++    seen = []
++
++    def fake(config, platform, *, include_default_mcp_servers=True):
++        served = plugins_snapshot.active() is not None
++        seen.append(served)
++        return set() if served else {"terminal", "file"}
++
++    monkeypatch.setattr(tc, "_get_platform_tools", fake)
++    assert kc._cli_toolsets({}, tmp_path, {"terminal"}) == {"terminal", "file"}
++    assert seen == [True, False]
++    seen.clear()
++    assert kc._cli_toolsets({}, tmp_path, None) == {"terminal", "file"}  # no need -> never served
++    assert seen == [False]
++
++
++def test_record_is_shared_by_callers_with_other_cwd_and_script_paths(home, tmp_path):
++    """The admission helper (its own script dir on sys.path, another cwd) and a profile session
++    must share one record, or a record written by one is never served to the other."""
++    _config(home, "platform_toolsets:\n  cli: [terminal, file]\n")
++    assert _run(home)["discoveries"] == 1
++    elsewhere = tmp_path / "elsewhere"
++    elsewhere.mkdir()
++    r = _run(home, cwd=elsewhere, extra_path=elsewhere)
++    assert r["discoveries"] == 0 and r["granted"] == ["terminal", "file"]
++
++
++def test_profile_scoped_caller_reads_the_profile_record(home):
++    """A helper whose HERMES_HOME is the root validates a named profile inside its home scope."""
++    prof = home / "profiles" / "worker"
++    prof.mkdir(parents=True)
++    (prof / "config.yaml").write_text("platform_toolsets:\n  cli: [terminal, file]\n")
++    first = _run(home, assignee="worker")
++    assert first["discoveries"] == 1 and (prof / "cache" / "plugin_toolset_keys.json").exists()
++    assert _run(home, assignee="worker")["discoveries"] == 0
++    assert _run(prof)["discoveries"] == 0  # the profile's own process (HERMES_HOME=profile) shares it
+diff --git a/tests/tools/test_skill_frontmatter_index.py b/tests/tools/test_skill_frontmatter_index.py
+new file mode 100644
+index 00000000000..f1d30850faf
+--- /dev/null
++++ b/tests/tools/test_skill_frontmatter_index.py
+@@ -0,0 +1,211 @@
++"""The cross-process SKILL.md frontmatter index returns exactly what a fresh parse returns. [daveey]"""
++import json
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from tools import skill_frontmatter_index as idx
++from tools import skills_tool_plugin as stp
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / "hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    idx._reset_for_tests()
++    stp._FRONTMATTER_CACHE.clear()
++    yield h
++    idx._reset_for_tests()
++    stp._FRONTMATTER_CACHE.clear()
++
++
++def _skill(root: Path, name: str, extra: str = "") -> Path:
++    d = root / name
++    d.mkdir(parents=True, exist_ok=True)
++    md = d / "SKILL.md"
++    md.write_text(f"---\nname: {name}\ndescription: d\n{extra}---\nbody\n")
++    return md
++
++
++def _new_process(home):
++    """Forget everything in memory, as a fresh process would (the index file stays)."""
++    idx.flush()
++    idx._reset_for_tests()
++    stp._FRONTMATTER_CACHE.clear()
++
++
++def _parses(monkeypatch):
++    """Count YAML loads behind the stock parser (patching yaml_load's loader keeps the token)."""
++    from agent import skill_utils
++    from hermes_yaml import safe_load
++    calls = []
++
++    def counting(text):
++        calls.append(1)
++        return safe_load(text)
++    monkeypatch.setattr(skill_utils, "_yaml_load_fn", counting)
++    return calls
++
++
++def test_warm_index_serves_a_new_process_without_parsing(home, tmp_path, monkeypatch):
++    md = _skill(tmp_path / "skills", "alpha", "metadata:\n  hermes:\n    requires_toolsets: [terminal]\n")
++    calls = _parses(monkeypatch)
++    first = stp._safe_frontmatter(md)
++    assert len(calls) == 1
++    _new_process(home)
++    again = stp._safe_frontmatter(md)
++    assert again == first and len(calls) == 1
++    assert oct((home / "cache" / "skill_frontmatter_index.json").stat().st_mode & 0o777) == "0o600"
++    again["name"] = "mutated"  # a private object
++    assert stp._safe_frontmatter(md)["name"] == "alpha"
++
++
++def test_edit_and_same_size_rewrite_are_reparsed(home, tmp_path, monkeypatch):
++    md = _skill(tmp_path / "skills", "alpha")
++    assert stp._safe_frontmatter(md)["name"] == "alpha"
++    _new_process(home)
++    md.write_text(md.read_text().replace("alpha", "gamma"))  # same size, new mtime/ctime
++    st = md.stat()
++    os.utime(md, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
++    assert stp._safe_frontmatter(md)["name"] == "gamma"
++
++
++def test_deleted_file_is_not_served(home, tmp_path):
++    md = _skill(tmp_path / "skills", "alpha")
++    stp._safe_frontmatter(md)
++    _new_process(home)
++    md.unlink()
++    assert stp._safe_frontmatter(md) == {}
++
++
++def test_symlink_retarget_reads_the_new_target(home, tmp_path):
++    a = _skill(tmp_path / "a", "first")
++    b = _skill(tmp_path / "b", "second")
++    link = tmp_path / "link.md"
++    link.symlink_to(a)
++    assert stp._safe_frontmatter(link)["name"] == "first"
++    _new_process(home)
++    link.unlink()
++    link.symlink_to(b)
++    assert stp._safe_frontmatter(link)["name"] == "second"
++
++
++def test_aliases_of_one_file_agree(home, tmp_path):
++    md = _skill(tmp_path / "skills", "alpha")
++    alias = tmp_path / "alias.md"
++    alias.symlink_to(md)
++    assert stp._safe_frontmatter(md) == stp._safe_frontmatter(alias)
++    _new_process(home)
++    md.write_text(md.read_text().replace("description: d", "description: changed"))
++    assert stp._safe_frontmatter(alias)["description"] == "changed"
++    assert stp._safe_frontmatter(md)["description"] == "changed"
++
++
++@pytest.mark.parametrize("blob", ["", "{oops", "[]", json.dumps({"version": 1, "token": "x", "entries": {}}),
++                                  json.dumps({"version": 99, "entries": {}})])
++def test_corrupt_or_foreign_index_is_ignored(home, tmp_path, blob):
++    md = _skill(tmp_path / "skills", "alpha")
++    (home / "cache").mkdir()
++    (home / "cache" / "skill_frontmatter_index.json").write_text(blob)
++    assert stp._safe_frontmatter(md)["name"] == "alpha"
++    idx.flush()
++    data = json.loads((home / "cache" / "skill_frontmatter_index.json").read_text())
++    assert data["token"] == idx.parser_token() and str(md) in data["entries"]
++
++
++def test_tampered_entry_with_other_identity_is_ignored(home, tmp_path):
++    md = _skill(tmp_path / "skills", "alpha")
++    st = md.stat()
++    (home / "cache").mkdir()
++    entry = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns - 1, st.st_ctime_ns, {"name": "forged"}]
++    (home / "cache" / "skill_frontmatter_index.json").write_text(json.dumps(
++        {"version": idx.INDEX_VERSION, "token": idx.parser_token(), "entries": {str(md): entry}}))
++    assert stp._safe_frontmatter(md)["name"] == "alpha"
++
++
++def test_patched_parser_bypasses_the_index(home, tmp_path, monkeypatch):
++    from tools import skills_tool
++    md = _skill(tmp_path / "skills", "alpha")
++    stp._safe_frontmatter(md)
++    _new_process(home)
++    monkeypatch.setattr(skills_tool, "_parse_frontmatter", lambda text: ({"name": "patched"}, ""))
++    assert stp._safe_frontmatter(md) == {"name": "patched"}
++    monkeypatch.undo()
++    _new_process(home)
++    from agent import skill_utils
++    monkeypatch.setattr(skill_utils, "parse_frontmatter", lambda text: ({"name": "deep"}, ""))
++    assert stp._safe_frontmatter(md) == {"name": "deep"}
++
++
++def test_patched_yaml_loader_bypasses_the_index(home, tmp_path, monkeypatch):
++    """A YAML loader rebound in this process is not what the token names: parse fresh."""
++    from agent import skill_utils
++    md = _skill(tmp_path / "skills", "alpha")
++    stp._safe_frontmatter(md)
++    _new_process(home)
++    monkeypatch.setattr(skill_utils, "yaml_load", lambda content: {"name": "yaml-patched"})
++    assert stp._safe_frontmatter(md) == {"name": "yaml-patched"}
++
++
++def test_parser_code_change_discards_the_index(home, tmp_path, monkeypatch):
++    md = _skill(tmp_path / "skills", "alpha")
++    stp._safe_frontmatter(md)
++    _new_process(home)
++    monkeypatch.setattr(idx, "parser_token", lambda: "another-parser")
++    calls = _parses(monkeypatch)
++    assert stp._safe_frontmatter(md)["name"] == "alpha" and len(calls) == 1
++
++
++def test_values_json_cannot_hold_exactly_are_always_parsed_fresh(home, tmp_path, monkeypatch):
++    md = _skill(tmp_path / "skills", "alpha", "created: 2024-01-02\n")  # YAML date
++    first = stp._safe_frontmatter(md)
++    assert type(first["created"]).__name__ == "date"
++    _new_process(home)
++    calls = _parses(monkeypatch)
++    assert stp._safe_frontmatter(md) == first and len(calls) == 1
++
++
++def test_content_parses_never_touch_the_index(home):
++    assert stp._safe_frontmatter(content="---\nname: x\n---\n") == {"name": "x"}
++    idx.flush()
++    assert not (home / "cache" / "skill_frontmatter_index.json").exists()
++
++
++def test_cold_process_skill_lookup_reads_no_skill_frontmatter_twice(tmp_path):
++    """Work bound across processes: a second cold `_locate_skill` over 40 skills parses none."""
++    home = tmp_path / "hermes"
++    skills = home / "skills"
++    for i in range(40):
++        _skill(skills / "cat", f"s{i:02d}")
++    script = textwrap.dedent("""
++        import json
++        from agent import skill_utils
++        from hermes_yaml import safe_load
++        n = []
++        skill_utils._yaml_load_fn = lambda t: (n.append(1), safe_load(t))[1]
++        from tools.skills_tool import _locate_skill, _skill_search_dirs
++        roots, _ = _skill_search_dirs()
++        err, d, md = _locate_skill("s07", None, roots)
++        print("RESULT " + json.dumps({"err": err, "md": str(md), "parses": len(n)}))
++    """)
++    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_", "PYTEST"))}
++    # The runner may provide dependencies through sys.path rather than site-packages.
++    env.update(HERMES_HOME=str(home), HOME=str(tmp_path),
++               PYTHONPATH=os.pathsep.join([str(REPO), *(os.path.abspath(p) for p in sys.path if p)]))
++
++    def run():
++        p = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=120, check=False)
++        line = next(ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")) if "RESULT " in p.stdout else None
++        assert line, p.stderr[-3000:]
++        return json.loads(line[7:])
++    cold = run()
++    warm = run()
++    assert cold["md"].endswith("s07/SKILL.md") and warm == {**cold, "parses": 0}
++    assert cold["parses"] >= 39  # every other SKILL.md is parsed for its frontmatter name
+diff --git a/tools/skill_frontmatter_index.py b/tools/skill_frontmatter_index.py
+new file mode 100644
+index 00000000000..1397d79c159
+--- /dev/null
++++ b/tools/skill_frontmatter_index.py
+@@ -0,0 +1,224 @@
++"""Cross-process index of parsed SKILL.md frontmatter, revalidated by stat. [daveey]
++
++A fresh process that resolves a pinned skill (the kanban admission helper) parses every
++SKILL.md under each search root to match frontmatter ``name:`` aliases: ~270 YAML reads, which
++cost 3-9 s under macOS background-tier I/O. This index lets that process stat each file and
++reuse the parse a previous process made of the very same bytes.
++
++Rules, all of which keep results identical to a fresh parse:
++
++* An entry is keyed by the path string looked up and the file's identity at lookup time
++  (st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns of the target; a retargeted symlink or any
++  edit changes it). Every lookup stats the file; a mismatch is a miss and the file is re-read.
++* The index is stamped with :func:`parser_token`: a digest of the parsing code
++  (``agent.skill_utils.parse_frontmatter`` / ``yaml_load``) and the YAML modules' files. Another
++  token discards the whole index. Callers only use it with the default parser.
++* Only values that survive a JSON round trip unchanged are stored (YAML dates, tuples, non-str
++  keys are parsed fresh every time).
++* The file lives at ``<HERMES_HOME>/cache/skill_frontmatter_index.json`` (0600, atomic replace);
++  a missing, unreadable or malformed index is treated as empty.
++"""
++
++from __future__ import annotations
++
++import atexit
++import hashlib
++import importlib.util
++import json
++import logging
++import os
++import sys
++import threading
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++INDEX_VERSION = 1
++_MAX_ENTRIES = 8192
++_FLUSH_EVERY = 64  # new entries between writes, so a killed process still leaves most of its work
++
++_lock = threading.RLock()
++_state: dict[str, Any] = {"home": None, "token": None, "entries": None, "dirty": 0}
++_atexit_registered = False
++_token_cache: Optional[str] = None
++_token_functions: tuple = ()  # the YAML entry points the cached token was computed from
++
++
++def _index_path(home: Path) -> Path:
++    return home / "cache" / "skill_frontmatter_index.json"
++
++
++def _module_file_stat(name: str) -> list:
++    try:
++        spec = importlib.util.find_spec(name)
++        origin = spec.origin if spec is not None else None
++        st = os.stat(origin) if origin else None
++        return [name, origin, st.st_size if st else None, st.st_mtime_ns if st else None]
++    except (ImportError, ValueError, OSError) as exc:  # an unknown module still yields a stable token
++        return [name, type(exc).__name__]
++
++
++def _code_digest(code) -> str:
++    """Digest of a code object's behaviour-bearing parts. (``marshal.dumps`` is not used: its
++    output varies with object reference counts, so equal code can hash differently.)"""
++    h = hashlib.sha256()
++
++    def feed(c) -> None:
++        h.update(c.co_code)
++        h.update(repr((c.co_names, c.co_varnames, c.co_freevars, c.co_cellvars)).encode())
++        for const in c.co_consts:
++            if hasattr(const, "co_code"):
++                feed(const)
++            else:
++                h.update(repr(const).encode())
++    feed(code)
++    return h.hexdigest()
++
++
++def parser_token() -> str:
++    """Digest of the default frontmatter parser's code and the YAML stack it calls."""
++    global _token_cache, _token_functions
++    if _token_cache is None:
++        from agent import skill_utils
++
++        import hermes_yaml
++
++        # The loaded code of the parser and of hermes_yaml's entry points (what this process runs),
++        # plus the on-disk stat of the modules and the YAML library underneath.
++        parts = [INDEX_VERSION, sys.version, _code_digest(skill_utils.parse_frontmatter.__code__),
++                 _code_digest(skill_utils.yaml_load.__code__),
++                 _code_digest(hermes_yaml.safe_load.__code__), _code_digest(hermes_yaml._load.__code__),
++                 _module_file_stat("agent.skill_utils"), _module_file_stat("hermes_yaml"), _module_file_stat("yaml")]
++        _token_cache = hashlib.sha256(json.dumps(parts, default=str).encode()).hexdigest()
++        _token_functions = _yaml_entry_points()
++    return _token_cache
++
++
++def _yaml_entry_points() -> tuple:
++    import hermes_yaml
++    from agent import skill_utils
++
++    # yaml_load binds hermes_yaml.safe_load on its first call (skill_utils._yaml_load_fn)
++    return (skill_utils.yaml_load, skill_utils._yaml_load_fn or hermes_yaml.safe_load)
++
++
++def default_parser_in_use(parser) -> bool:
++    """True when ``parser`` is the stock delegate AND it still delegates to the stock function
++    (a patched ``agent.skill_utils.parse_frontmatter`` changes the token, but be explicit)."""
++    from agent import skill_utils
++    from tools import skills_tool
++
++    if not (parser is skills_tool._DEFAULT_PARSE_FRONTMATTER
++            and skill_utils.parse_frontmatter is skill_utils._DEFAULT_PARSE_FRONTMATTER):
++        return False
++    global _token_functions
++    # A YAML entry point rebound after the token was taken (a test's monkeypatch) parses
++    # differently from what the token names.
++    current = _yaml_entry_points()
++    if not _token_functions or _token_functions[1] is None:
++        _token_functions = current
++    return all(a is b for a, b in zip(current, _token_functions, strict=True))
++
++
++def _load(home: Path) -> dict:
++    """Entries for ``home`` (loaded once per home per process)."""
++    if _state["home"] == str(home) and _state["entries"] is not None:
++        return _state["entries"]
++    _flush_locked()
++    entries: dict = {}
++    try:
++        blob = json.loads(_index_path(home).read_text(encoding="utf-8-sig"))
++        if (isinstance(blob, dict) and blob.get("version") == INDEX_VERSION
++                and blob.get("token") == parser_token() and isinstance(blob.get("entries"), dict)):
++            entries = {k: v for k, v in blob["entries"].items()
++                       if isinstance(k, str) and isinstance(v, list) and len(v) == 6
++                       and all(isinstance(x, int) for x in v[:5]) and isinstance(v[5], dict)}
++    except (OSError, ValueError):
++        pass
++    _state.update(home=str(home), token=parser_token(), entries=entries, dirty=0)
++    return entries
++
++
++def lookup(home: Path, path: str, ident: tuple) -> Optional[dict]:
++    """The recorded frontmatter of ``path`` if it was parsed at exactly ``ident``; else None.
++    Returns a fresh object (decoded from the stored JSON), so callers may mutate it."""
++    with _lock:
++        entry = _load(home).get(path)
++        if entry is None or tuple(entry[:5]) != tuple(ident):
++            return None
++        return json.loads(json.dumps(entry[5]))
++
++
++def _json_exact(value: Any) -> bool:
++    try:
++        return json.loads(json.dumps(value, allow_nan=False)) == value and _same_types(value, json.loads(json.dumps(value)))
++    except (TypeError, ValueError, RecursionError):
++        return False
++
++
++def _same_types(a: Any, b: Any) -> bool:
++    if type(a) is not type(b):
++        return False
++    if isinstance(a, dict):
++        return a.keys() == b.keys() and all(_same_types(a[k], b[k]) for k in a)
++    if isinstance(a, list):
++        return len(a) == len(b) and all(_same_types(x, y) for x, y in zip(a, b))
++    return True
++
++
++def store(home: Path, path: str, ident: tuple, value: dict) -> None:
++    """Record the parse of ``path`` made from bytes whose identity was ``ident``."""
++    global _atexit_registered
++    if not isinstance(value, dict) or not _json_exact(value):
++        return
++    with _lock:
++        entries = _load(home)
++        entries[path] = [*ident, value]
++        _state["dirty"] += 1
++        if not _atexit_registered:
++            atexit.register(flush)
++            _atexit_registered = True
++        if _state["dirty"] >= _FLUSH_EVERY:
++            _flush_locked()
++
++
++def flush() -> None:
++    with _lock:
++        _flush_locked()
++
++
++def _flush_locked() -> None:
++    home, entries = _state["home"], _state["entries"]
++    if not home or entries is None or not _state["dirty"]:
++        return
++    _state["dirty"] = 0
++    try:
++        from utils import atomic_json_write
++
++        path = _index_path(Path(home))
++        merged: dict = {}
++        try:  # keep what other processes recorded meanwhile; ours wins on the same path
++            blob = json.loads(path.read_text(encoding="utf-8-sig"))
++            if (isinstance(blob, dict) and blob.get("version") == INDEX_VERSION
++                    and blob.get("token") == _state["token"] and isinstance(blob.get("entries"), dict)):
++                merged.update(blob["entries"])
++        except (OSError, ValueError):
++            pass
++        merged.update(entries)
++        if len(merged) > _MAX_ENTRIES:  # drop entries whose file is gone, then the oldest inserted
++            merged = {k: v for k, v in merged.items() if os.path.exists(k)}
++            merged = dict(list(merged.items())[-_MAX_ENTRIES:])
++        path.parent.mkdir(parents=True, exist_ok=True)
++        atomic_json_write(path, {"version": INDEX_VERSION, "token": _state["token"], "entries": merged},
++                          indent=0, mode=0o600)
++    except Exception:
++        logger.debug("skill frontmatter index write failed", exc_info=True)
++
++
++def _reset_for_tests() -> None:
++    global _token_cache, _token_functions
++    with _lock:
++        _state.update(home=None, token=None, entries=None, dirty=0)
++        _token_cache = None
++        _token_functions = ()
+diff --git a/tools/skills_tool.py b/tools/skills_tool.py
+index 9828e4c3f23..650df9c00eb 100644
+--- a/tools/skills_tool.py
++++ b/tools/skills_tool.py
+@@ -120,6 +120,7 @@ skill_matches_platform = _skill_utils_delegate("skill_matches_platform")
+ skill_matches_environment = _skill_utils_delegate("skill_matches_environment")
+ skill_matches_apps = _skill_utils_delegate("skill_matches_apps")
+ _parse_frontmatter = _skill_utils_delegate("parse_frontmatter")
++_DEFAULT_PARSE_FRONTMATTER = _parse_frontmatter  # tools.skill_frontmatter_index: only the stock parser persists
+ _get_disabled_skill_names = _skill_utils_delegate("get_disabled_skill_names")
+ 
+ 
+diff --git a/tools/skills_tool_plugin.py b/tools/skills_tool_plugin.py
+index 6feae3fca5b..76c181e5afd 100644
+--- a/tools/skills_tool_plugin.py
++++ b/tools/skills_tool_plugin.py
+@@ -64,12 +64,26 @@ def _safe_frontmatter(path: Path | None = None, *, content: str | None = None) -
+         return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+ 
+     key = before = text = None
++    persisted_home = None
+     if content is None and path is not None:
+         with suppress(Exception):
+             before = _ident(path)
+             hit = _FRONTMATTER_CACHE.get((str(path), *before))
+             if hit is not None and hit[0] is parser:  # entry holds the parser, so no id() reuse
+                 return copy.deepcopy(hit[1])
++        # [daveey] Cross-process tier (tools.skill_frontmatter_index): same identity rule, parses
++        # made by an earlier process with the same parser code; the stock parser only.
++        with suppress(Exception):
++            from tools import skill_frontmatter_index as _index
++            if before is not None and _index.default_parser_in_use(parser):
++                from hermes_constants import get_hermes_home
++                persisted_home = get_hermes_home()
++                stored = _index.lookup(persisted_home, str(path), before)
++                if stored is not None:
++                    if len(_FRONTMATTER_CACHE) >= _FRONTMATTER_CACHE_MAX:
++                        _FRONTMATTER_CACHE.clear()
++                    _FRONTMATTER_CACHE[(str(path), *before)] = (parser, copy.deepcopy(stored))
++                    return stored
+         with suppress(Exception):
+             # Bind the bytes parsed to the identity they are cached under: fstat the very
+             # descriptor that is read, so a symlink retargeted mid-lookup files the content
+@@ -86,6 +100,10 @@ def _safe_frontmatter(path: Path | None = None, *, content: str | None = None) -
+             if len(_FRONTMATTER_CACHE) >= _FRONTMATTER_CACHE_MAX:
+                 _FRONTMATTER_CACHE.clear()
+             _FRONTMATTER_CACHE[key] = (parser, copy.deepcopy(result))
++            if persisted_home is not None:
++                with suppress(Exception):
++                    from tools import skill_frontmatter_index as _index
++                    _index.store(persisted_home, key[0], key[1:], result)
+         return result
+     return {}
+ 
+diff --git a/toolsets.py b/toolsets.py
+index 60e8e4a0b4b..0b13be66e0f 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -1,5 +1,6 @@
+ """Toolset helpers: get/resolve/validate named tool groups (static TOOLSETS + registry-registered)."""
+ 
++import copy
+ from typing import Dict, List, Any, Set, Optional, Tuple
+ 
+ 
+@@ -255,6 +256,9 @@ TOOLSET_SESSION_PLATFORMS = {name: spec["platforms"] for name, spec in TOOLSETS.
+ # these names, so a plugin, MCP server or custom toolset name never leaves the machine.
+ BUILTIN_TOOL_NAMES = frozenset(tool for spec in TOOLSETS.values() for tool in spec["tools"])
+ BUILTIN_TOOLSET_NAMES = frozenset(TOOLSETS)
++# The whole built-in table, so a recorded plugin discovery can tell whether loading plugins
++# changed any definition (hermes_cli.plugins_snapshot.builtin_collision). [daveey]
++_STATIC_TOOLSETS = copy.deepcopy(TOOLSETS)
+ 
+ 
+ def _registry():
+-- 
+2.55.0
+

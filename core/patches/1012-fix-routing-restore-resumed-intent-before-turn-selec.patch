@@ -1,0 +1,233 @@
+From 1643c0f08179e78974a7313a01703be9d3fcad57 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 15:40:50 -0700
+Subject: [PATCH] fix(routing): restore resumed intent before turn selection
+ and recover stale class routes [daveey]
+
+---
+ agent/model_routing_state.py                  |  9 ++-
+ hermes_cli/cli_chat_turn_mixin.py             |  5 ++
+ .../test_model_routing_stale_recovery.py      | 81 +++++++++++++++++++
+ tests/agent/test_model_routing_state.py       |  8 +-
+ .../test_chat_resume_route_order.py           | 54 +++++++++++++
+ 5 files changed, 149 insertions(+), 8 deletions(-)
+ create mode 100644 tests/agent/test_model_routing_stale_recovery.py
+ create mode 100644 tests/hermes_cli/test_chat_resume_route_order.py
+
+diff --git a/agent/model_routing_state.py b/agent/model_routing_state.py
+index 028a9060d8f..2b5b1f675c4 100644
+--- a/agent/model_routing_state.py
++++ b/agent/model_routing_state.py
+@@ -79,15 +79,16 @@ class RoutingState:
+             identity = previous["selected_provider"], previous["selected_model"]
+             allowed = any((r["provider"], r["model"]) == identity and
+                           r["billing"] == previous["billing_group"] for r in candidates)
+-            if identity not in excluded:
+-                if not allowed:
+-                    raise ModelRoutingError("Sticky route is no longer eligible; explicit failure selection required")
++            if allowed and identity not in excluded:
+                 if exact_pin and not previous.get("exact_pin"):
+                     previous["exact_pin"] = True
+                     db.execute("UPDATE routes SET metadata=? WHERE root=? AND class=?",
+                                (json.dumps(previous), root, level))
+                 return previous
+-            if previous.get("exact_pin"):
++            # A sticky class selection is a preference, not an exact-model pin.
++            # Re-select only from the current class's filtered candidates; prepare
++            # still runs before commit, so failed credentials cannot publish it.
++            if previous.get("exact_pin") or exact_pin:
+                 raise ModelRoutingError("Exact pinned route cannot fail over")
+         if not candidates:
+             raise ModelRoutingError(f"No eligible {level} routes under billing/capability policy")
+diff --git a/hermes_cli/cli_chat_turn_mixin.py b/hermes_cli/cli_chat_turn_mixin.py
+index b504a796390..76981ef7fd5 100644
+--- a/hermes_cli/cli_chat_turn_mixin.py
++++ b/hermes_cli/cli_chat_turn_mixin.py
+@@ -65,6 +65,11 @@ class CLIChatTurnMixin:
+         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
+         self._last_turn_interrupted = False
+ 
++        # Direct/oneshot callers skip run()'s preload. Restore before taking the
++        # turn-route snapshot, not inside _init_agent after its overrides exist.
++        if (getattr(self, "_resumed", False) and self._session_db and not self.conversation_history
++                and not self._load_resumed_history_late()):
++            return None
+         if not self._ensure_runtime_credentials():
+             return None
+ 
+diff --git a/tests/agent/test_model_routing_stale_recovery.py b/tests/agent/test_model_routing_stale_recovery.py
+new file mode 100644
+index 00000000000..32bfca6a63e
+--- /dev/null
++++ b/tests/agent/test_model_routing_stale_recovery.py
+@@ -0,0 +1,81 @@
++"""Recovery from stale sticky selections never weakens exact pins or preparation."""
++import sqlite3
++
++import pytest
++
++from agent.model_routing import ModelRoutingError, resolve_model_route
++from agent.model_routing_state import RoutingState
++from tests.agent.test_model_routing import policy
++
++
++@pytest.mark.parametrize("cause", ["removed", "capability", "unavailable"])
++@pytest.mark.parametrize("stored_pin,current_pin", [(False, False), (True, False), (False, True)])
++def test_stale_route_recovery_and_exact_pin_fence(tmp_path, cause, stored_pin, current_pin):
++    cfg = policy()
++    path = tmp_path / "routes.db"
++    args = dict(config=cfg, session_id="original", state_path=path)
++    first = resolve_model_route("class:deep", exact_pin=stored_pin, **args)
++    state = RoutingState(path)
++    state.link_continuation("child", "original")
++    routes = cfg["model_routing"]["routes"]["deep"]
++    selected = next(r for r in routes if r["model"] == first["model"])
++    kwargs = {}
++    if cause == "removed":
++        routes.remove(selected)
++    elif cause == "capability":
++        selected["capabilities"]["vision"] = False
++        kwargs["requirements"] = {"vision": True}
++    else:
++        kwargs["eligible"] = lambda r: r["model"] != first["model"]
++    if stored_pin or current_pin:
++        with pytest.raises(ModelRoutingError, match="Exact pinned route"):
++            resolve_model_route("class:deep", exact_pin=current_pin, **kwargs, **args)
++        assert state.peek("original", "deep") == first["metadata"]
++    else:
++        new = resolve_model_route("class:deep", **kwargs, **args)
++        assert new["model"] != first["model"]
++        assert new["metadata"]["requested_class"] == "deep"
++        assert new["metadata"]["reason"] == "same-class-failover"
++        assert new["metadata"]["billing_group"] == "subscription"
++        assert state.peek("child", "deep") == new["metadata"]
++        assert resolve_model_route("class:deep", **kwargs, **args) == new
++
++
++@pytest.mark.parametrize("prepare_fails", [False, True])
++def test_automatic_recovery_is_transactional(tmp_path, prepare_fails):
++    cfg = policy()
++    path = tmp_path / "routes.db"
++    args = dict(config=cfg, session_id="original", state_path=path)
++    first = resolve_model_route("class:deep", **args)
++    state = RoutingState(path)
++    with sqlite3.connect(path) as db:
++        counters = db.execute("SELECT * FROM counters ORDER BY pool").fetchall()
++    cfg["model_routing"]["routes"]["deep"] = [
++        r for r in cfg["model_routing"]["routes"]["deep"] if r["model"] != first["model"]]
++
++    def prepare(metadata):
++        assert metadata["selected_model"] != first["model"]
++        assert state.peek("original", "deep") == first["metadata"]
++        if prepare_fails:
++            raise RuntimeError("unready client")
++
++    if prepare_fails:
++        with pytest.raises(RuntimeError, match="unready client"):
++            resolve_model_route("class:deep", prepare=prepare, **args)
++        assert state.peek("original", "deep") == first["metadata"]
++        with sqlite3.connect(path) as db:
++            assert db.execute("SELECT * FROM counters ORDER BY pool").fetchall() == counters
++    else:
++        result = resolve_model_route("class:deep", prepare=prepare, **args)
++        assert state.peek("original", "deep") == result["metadata"]
++
++
++def test_no_same_class_alternative_does_not_cross_tiers(tmp_path):
++    cfg = policy()
++    path = tmp_path / "routes.db"
++    args = dict(config=cfg, session_id="original", state_path=path)
++    first = resolve_model_route("class:deep", **args)
++    cfg["model_routing"]["routes"]["deep"] = []
++    with pytest.raises(ModelRoutingError, match="No eligible deep routes"):
++        resolve_model_route("class:deep", **args)
++    assert RoutingState(path).peek("original", "deep") == first["metadata"]
+diff --git a/tests/agent/test_model_routing_state.py b/tests/agent/test_model_routing_state.py
+index 07d32ecc175..bc611554615 100644
+--- a/tests/agent/test_model_routing_state.py
++++ b/tests/agent/test_model_routing_state.py
+@@ -34,17 +34,17 @@ def test_profile_state_isolation_and_resume(tmp_path, monkeypatch):
+     assert resolve_model_route("class:deep", session_id="shared-id") == first
+ 
+ 
+-def test_revoked_funding_requires_explicit_failure_not_silent_switch(tmp_path):
++def test_revoked_funding_reselects_an_unpinned_route_in_same_class(tmp_path):
+     cfg = policy()
+     args = dict(config=cfg, session_id="same", state_path=tmp_path / "routes.db")
+     chosen = resolve_model_route("class:deep", **args)
+     for r in cfg["model_routing"]["routes"]["deep"]:
+         if r["provider"] == chosen["provider"]:
+             r["funding_verified"] = False
+-    with pytest.raises(ModelRoutingError, match="Sticky route"):
+-        resolve_model_route("class:deep", **args)
+-    alternative = resolve_model_route("class:deep", excluded=[(chosen["provider"], chosen["model"])], **args)
++    alternative = resolve_model_route("class:deep", **args)
+     assert alternative["provider"] != chosen["provider"]
++    assert alternative["metadata"]["requested_class"] == "deep"
++    assert resolve_model_route("class:deep", **args) == alternative
+ 
+ 
+ def test_lineage_arriving_before_parent_shares_identity(tmp_path):
+diff --git a/tests/hermes_cli/test_chat_resume_route_order.py b/tests/hermes_cli/test_chat_resume_route_order.py
+new file mode 100644
+index 00000000000..23552372a42
+--- /dev/null
++++ b/tests/hermes_cli/test_chat_resume_route_order.py
+@@ -0,0 +1,54 @@
++"""Direct/oneshot chat must restore intent before snapshotting the turn route."""
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
++
++
++@pytest.mark.parametrize("explicit_pin", [False, True])
++def test_chat_restores_before_route_and_credentials(explicit_pin):
++    # Stop at construction: this exercises the real chat entry ordering without
++    # a provider call. The restore adapter itself owns explicit-override handling.
++    shell = SimpleNamespace(
++        _resumed=True, _session_db=object(), conversation_history=[],
++        _secret_capture_callback=lambda *a: None, _active_agent_route_signature="restored",
++        agent=None, model="launch-default", _explicit_model_override=explicit_pin)
++    calls = []
++
++    def restore():
++        calls.append("restore")
++        shell.conversation_history = [{"role": "user", "content": "history"}]
++        if not explicit_pin:
++            shell.model = "stored-model"
++        return True
++
++    def credentials():
++        calls.append("credentials")
++        assert shell.conversation_history
++        return True
++
++    def route(message):
++        calls.append("route")
++        assert shell.model == ("launch-default" if explicit_pin else "stored-model")
++        return {"signature": "restored", "model": shell.model, "runtime": {}}
++
++    shell._load_resumed_history_late = restore
++    shell._ensure_runtime_credentials = credentials
++    shell._resolve_turn_agent_config = route
++    shell._init_agent = Mock(return_value=False)
++    assert CLIChatTurnMixin.chat(shell, "hello") is None
++    assert calls == ["restore", "credentials", "route"]
++    assert shell._init_agent.call_args.kwargs["model_override"] == shell.model
++
++
++def test_chat_does_not_resolve_or_send_when_restore_refuses():
++    shell = SimpleNamespace(
++        _resumed=True, _session_db=object(), conversation_history=[],
++        _secret_capture_callback=lambda *a: None,
++        _load_resumed_history_late=Mock(return_value=False),
++        _ensure_runtime_credentials=Mock(), _resolve_turn_agent_config=Mock())
++    assert CLIChatTurnMixin.chat(shell, "hello") is None
++    shell._ensure_runtime_credentials.assert_not_called()
++    shell._resolve_turn_agent_config.assert_not_called()
+-- 
+2.55.0
+

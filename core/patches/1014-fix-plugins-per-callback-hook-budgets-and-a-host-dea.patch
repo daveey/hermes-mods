@@ -1,0 +1,365 @@
+From f5271c08c08bc394323756da9b9f0d87cf7a09f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 23:08:05 +0000
+Subject: [PATCH] fix(plugins): per-callback hook budgets and a host
+ deadline/abandon signal for bounded hooks [daveey]
+
+A turn-end pre_verify checker that makes bounded model calls (coach: judge 60s + confirm 90s) ran under the
+global 30s plugins.hook_callback_timeout: the host abandoned it, suppressed the callback for 60s (the next
+turn's check was skipped), and the abandoned worker went on to record a nudge the host had discarded.
+
+- A callback may declare its own bound: callback.hermes_hook_timeout (clamped to 600s, bounded hooks only,
+  never turns the threaded path on when the global timeout is 0).
+- current_hook_call() exposes the host's HookCallBudget on the worker: remaining() and an abandoned Event set
+  the moment the host stops waiting; a late finish is logged as 'result discarded'.
+- Call identity falls back to session_id, so one session's running pre_verify doesn't skip another's.
+---
+ hermes_cli/plugins.py                         |   2 +-
+ hermes_cli/plugins_dispatch.py                |  59 ++++-
+ tests/hermes_cli/test_hook_callback_budget.py | 203 ++++++++++++++++++
+ website/docs/user-guide/features/hooks.md     |   1 +
+ 4 files changed, 263 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_hook_callback_budget.py
+
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 5970965a4b5..df572802eda 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -55,7 +55,7 @@ from hermes_cli.plugins_dispatch import (
+     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS, PLUGIN_SECTIONS_END, PLUGIN_SECTIONS_START,
+     SYSTEM_PROMPT_SECTION_POSITIONS, _EVENT_EMIT_DEPTH_CAP, _EVENT_PENDING_CAP,
+     _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
+-    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
++    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, HOOK_CALLBACK_TIMEOUT_ATTR, PluginDispatchMixin, current_hook_call, PluginSystemPromptSection,
+     RenderedPluginSystemPromptSection, _EventSubscription, format_system_prompt_sections,
+     is_valid_system_prompt_section_id,
+ )
+diff --git a/hermes_cli/plugins_dispatch.py b/hermes_cli/plugins_dispatch.py
+index 3ca7e6baa5a..b41bb266717 100644
+--- a/hermes_cli/plugins_dispatch.py
++++ b/hermes_cli/plugins_dispatch.py
+@@ -155,6 +155,50 @@ class _QueuedPluginEvent:
+ _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
+ _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
+ _HOOK_SKIPPED = object()  # returned by _run_hook_callback_bounded on skip/timeout
++# [daveey] A callback may declare its own wall-clock budget with this attribute (seconds, > 0), e.g. a
++# turn-end checker that makes bounded model calls. It replaces ``plugins.hook_callback_timeout`` for that
++# callback only, is clamped to ``_MAX_HOOK_CALLBACK_TIMEOUT_SECS``, and applies only on the bounded path
++# (it never turns the threaded path on when the global timeout is <= 0, nor bounds an unbounded hook).
++HOOK_CALLBACK_TIMEOUT_ATTR = "hermes_hook_timeout"
++
++
++class HookCallBudget:
++    """The host's deadline for one bounded hook-callback call, visible to the callback on its worker
++    thread through :func:`current_hook_call`. ``abandoned`` is set the moment the host stops waiting,
++    so a late callback can tell its result will be discarded (and must not claim it was delivered)."""
++
++    __slots__ = ("abandoned", "deadline", "hook_name", "timeout")
++
++    def __init__(self, hook_name: str, timeout: float, deadline: float) -> None:
++        self.hook_name = hook_name
++        self.timeout = timeout
++        self.deadline = deadline  # time.monotonic() value
++        self.abandoned = threading.Event()
++
++    def remaining(self) -> float:
++        """Seconds until the host gives up (0 once abandoned or past the deadline)."""
++        if self.abandoned.is_set():
++            return 0.0
++        return max(0.0, self.deadline - time.monotonic())
++
++
++_CURRENT_HOOK_CALL: contextvars.ContextVar[Optional[HookCallBudget]] = contextvars.ContextVar(
++    "hermes_current_hook_call", default=None)
++
++
++def current_hook_call() -> Optional[HookCallBudget]:
++    """The :class:`HookCallBudget` of the bounded hook call running on this thread, else ``None``
++    (synchronous/unbounded hooks, or code not running inside a hook callback)."""
++    return _CURRENT_HOOK_CALL.get()
++
++
++def hook_callback_timeout_for(cb: Callable, default: float) -> float:
++    """Effective budget for *cb*: its ``hermes_hook_timeout`` attribute when a positive number
++    (clamped to the max), else *default*."""
++    raw = getattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, None)
++    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not raw > 0:
++        return default
++    return min(float(raw), _MAX_HOOK_CALLBACK_TIMEOUT_SECS)
+ 
+ 
+ def _hook_call_identity(kwargs: dict[str, Any]) -> Optional[str]:
+@@ -170,6 +214,11 @@ def _hook_call_identity(kwargs: dict[str, Any]) -> Optional[str]:
+         value = kwargs.get(field)
+         if isinstance(value, str) and value:
+             return value
++    # [daveey] Turn-scoped hooks with no call id (pre_verify) fire at most once at a time per session:
++    # another session's running call is different work, not a duplicate to skip.
++    value = kwargs.get("session_id")
++    if isinstance(value, str) and value:
++        return f"session:{value}"
+     return None
+ 
+ 
+@@ -229,7 +278,8 @@ class PluginDispatchMixin:
+         for cb in self._hooks.get(hook_name, []):
+             try:
+                 if use_timeout:
+-                    ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
++                    ret = self._run_hook_callback_bounded(
++                        hook_name, cb, kwargs, hook_callback_timeout_for(cb, timeout))
+                     if ret is _HOOK_SKIPPED:
+                         if fail_closed:  # policy hook: fail closed with a block directive
+                             results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+@@ -307,6 +357,8 @@ class PluginDispatchMixin:
+             self._hook_running_callbacks[gate_key] = token
+ 
+         context = contextvars.copy_context()
++        budget = HookCallBudget(hook_name, timeout, time.monotonic() + timeout)
++        context.run(_CURRENT_HOOK_CALL.set, budget)
+         done = threading.Event()
+         outcome: dict[str, Any] = {}
+         failure: dict[str, BaseException] = {}
+@@ -329,6 +381,10 @@ class PluginDispatchMixin:
+             finally:
+                 _release_token()
+                 done.set()
++                if budget.abandoned.is_set():
++                    logger.warning(
++                        "Hook '%s' callback %s finished %.1fs after the host stopped waiting — result discarded",
++                        hook_name, callback_name, time.monotonic() - budget.deadline)
+ 
+         thread = threading.Thread(target=_runner, name=f"hermes-hook-{callback_name}"[:40], daemon=True)
+         try:
+@@ -340,6 +396,7 @@ class PluginDispatchMixin:
+                 hook_name, callback_name, exc)
+             return _HOOK_SKIPPED
+         if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
++            budget.abandoned.set()  # before any bookkeeping: the callback must see it as soon as possible
+             with self._hook_timeout_lock:
+                 # See #6622.
+                 self._hook_timeout_suppressed_until[suppression_key] = (
+diff --git a/tests/hermes_cli/test_hook_callback_budget.py b/tests/hermes_cli/test_hook_callback_budget.py
+new file mode 100644
+index 00000000000..adfe56ac994
+--- /dev/null
++++ b/tests/hermes_cli/test_hook_callback_budget.py
+@@ -0,0 +1,203 @@
++"""Per-callback hook budgets and the host-deadline contract for bounded hook callbacks [daveey].
++
++A turn-end checker (``pre_verify``) that makes bounded model calls can declare its own budget with the
++``hermes_hook_timeout`` attribute instead of raising ``plugins.hook_callback_timeout`` for every hook.
++While it runs, :func:`current_hook_call` exposes the host's deadline, and ``abandoned`` is set the moment
++the host stops waiting, so a late callback can tell its result is discarded.
++"""
++
++import logging
++import threading
++import time
++
++import pytest
++
++from hermes_cli.plugins import (
++    HOOK_CALLBACK_TIMEOUT_ATTR,
++    PluginManager,
++    current_hook_call,
++    get_pre_verify_continue_message,
++)
++from hermes_cli.plugins_dispatch import hook_callback_timeout_for
++from tests.waiting import wait_until
++
++
++@pytest.fixture
++def global_timeout(monkeypatch):
++    def _set(value: float) -> None:
++        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: value)
++    return _set
++
++
++def _sleeper(seconds: float, result):
++    def cb(**_kwargs):
++        time.sleep(seconds)  # health: allow HX013 -- a slow callback is the behaviour under test
++        return result
++    return cb
++
++
++class TestCallbackBudget:
++    def test_declared_budget_outlives_global_timeout(self, global_timeout):
++        """RED before: a 0.3s callback under a 0.1s global bound is abandoned and skipped."""
++        global_timeout(0.1)
++        cb = _sleeper(0.3, {"action": "continue", "message": "m"})
++        setattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, 2.0)
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        assert mgr.invoke_hook("pre_verify", session_id="s1") == [{"action": "continue", "message": "m"}]
++
++    def test_declared_budget_still_abandons_past_it(self, global_timeout):
++        """The budget is a bound, not an exemption: past it the callback is skipped as before."""
++        global_timeout(5.0)
++        hold = threading.Event()
++
++        def cb(**_kwargs):
++            hold.wait(5.0)
++            return "late"
++        setattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, 0.1)
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        t0 = time.monotonic()
++        assert mgr.invoke_hook("pre_verify", session_id="s1") == []
++        assert time.monotonic() - t0 < 2.0
++        hold.set()
++
++    @pytest.mark.parametrize("raw", [True, -1, 0, "90", None, float("nan")])
++    def test_invalid_declared_budget_uses_global(self, raw):
++        def cb(**_kwargs):
++            return None
++        if raw is not None:
++            setattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, raw)
++        assert hook_callback_timeout_for(cb, 30.0) == 30.0
++
++    def test_declared_budget_is_clamped(self):
++        from hermes_cli.plugins import _MAX_HOOK_CALLBACK_TIMEOUT_SECS
++
++        def cb(**_kwargs):
++            return None
++        setattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, 10_000)
++        assert hook_callback_timeout_for(cb, 30.0) == _MAX_HOOK_CALLBACK_TIMEOUT_SECS
++
++    def test_declared_budget_does_not_enable_threading_when_disabled(self, global_timeout):
++        """plugins.hook_callback_timeout <= 0 keeps every hook synchronous, declared budget or not."""
++        global_timeout(0)
++        seen = []
++
++        def cb(**_kwargs):
++            seen.append((threading.current_thread() is threading.main_thread(), current_hook_call()))
++            time.sleep(0.2)  # health: allow HX013 -- outlives the declared budget on purpose
++            return "done"
++        setattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, 0.05)
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        assert mgr.invoke_hook("pre_verify", session_id="s1") == ["done"]
++        assert seen == [(True, None)]
++
++
++class TestHookCallDeadline:
++    def test_callback_sees_host_deadline(self, global_timeout):
++        global_timeout(5.0)
++        seen = {}
++
++        def cb(**_kwargs):
++            call = current_hook_call()
++            seen["hook"], seen["timeout"] = call.hook_name, call.timeout
++            seen["remaining"], seen["abandoned"] = call.remaining(), call.abandoned.is_set()
++        setattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, 3.0)
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        mgr.invoke_hook("pre_verify", session_id="s1")
++        assert seen["hook"] == "pre_verify" and seen["timeout"] == 3.0
++        assert 2.0 < seen["remaining"] <= 3.0
++        assert seen["abandoned"] is False
++        assert current_hook_call() is None  # nothing leaks to the caller thread
++
++    def test_abandoned_flag_set_when_host_stops_waiting(self, global_timeout, caplog):
++        """A late callback learns it was abandoned, and its finish is logged as discarded."""
++        global_timeout(0.1)
++        observed = {}
++        finished = threading.Event()
++
++        def cb(**_kwargs):
++            call = current_hook_call()
++            observed["abandoned"] = call.abandoned.wait(5.0)
++            observed["remaining"] = call.remaining()
++            finished.set()
++            return {"action": "continue", "message": "late nudge"}
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
++            assert mgr.invoke_hook("pre_verify", session_id="s1") == []
++            assert finished.wait(5.0)
++            deadline = time.monotonic() + 2.0
++            while "result discarded" not in caplog.text and time.monotonic() < deadline:
++                time.sleep(0.01)
++        assert observed == {"abandoned": True, "remaining": 0.0}
++        assert "timed out after 0.1s" in caplog.text
++        assert "result discarded" in caplog.text
++
++    def test_pre_verify_message_returned_within_budget(self, global_timeout):
++        """End to end through the host helper the agent loop calls: a declared budget keeps a
++        slower-than-global checker's continue message."""
++        global_timeout(0.1)
++        cb = _sleeper(0.3, {"action": "continue", "message": "check again"})
++        setattr(cb, HOOK_CALLBACK_TIMEOUT_ATTR, 2.0)
++        import hermes_cli.plugins as plugins_mod
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        old = plugins_mod._plugin_manager
++        plugins_mod._plugin_manager = mgr
++        try:
++            assert get_pre_verify_continue_message(session_id="s1", final_response="x") == "check again"
++        finally:
++            plugins_mod._plugin_manager = old
++
++
++class TestSessionCallIdentity:
++    @staticmethod
++    def _run(mgr, session_id):
++        t = threading.Thread(target=mgr.invoke_hook, args=("pre_verify",), kwargs={"session_id": session_id},
++                             daemon=True)
++        t.start()
++        return t
++
++    def test_other_sessions_turn_end_check_is_not_skipped(self, global_timeout):
++        """RED before: session B's pre_verify was skipped 'while still running' because session A's ran."""
++        global_timeout(5.0)
++        hold, starts = threading.Event(), []
++
++        def cb(session_id="", **_kwargs):
++            starts.append(session_id)
++            hold.wait(5.0)
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        first = self._run(mgr, "a")
++        wait_until(lambda: starts == ["a"], timeout=5.0)
++        second = self._run(mgr, "b")
++        try:
++            second.join(0.5)  # a skipped call returns at once; a running one blocks on `hold`
++            assert second.is_alive(), "session b's check was skipped while session a's ran"
++            wait_until(lambda: len(starts) == 2, timeout=5.0)
++        finally:
++            hold.set()
++            first.join(5.0)
++            second.join(5.0)
++        assert sorted(starts) == ["a", "b"]
++
++    def test_same_session_still_deduplicated(self, global_timeout):
++        global_timeout(5.0)
++        hold, starts = threading.Event(), []
++
++        def cb(session_id="", **_kwargs):
++            starts.append(session_id)
++            hold.wait(5.0)
++        mgr = PluginManager()
++        mgr._hooks["pre_verify"] = [cb]
++        first = self._run(mgr, "a")
++        wait_until(lambda: starts == ["a"], timeout=5.0)
++        second = self._run(mgr, "a")
++        second.join(5.0)  # skipped at once: it never waits on `hold`
++        assert not second.is_alive()
++        hold.set()
++        first.join(5.0)
++        assert starts == ["a"]
+diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
+index 2d4d4bc1824..9cc97a39084 100644
+--- a/website/docs/user-guide/features/hooks.md
++++ b/website/docs/user-guide/features/hooks.md
+@@ -394,6 +394,7 @@ def register(ctx):
+ - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
+ - Callback exceptions are logged and skipped; later callbacks continue. A callback that fails the same way on every call (typically a signature naming a field the hook does not send, e.g. `tool_data` instead of `tool_name`/`args`) is reported **once** at WARNING — the message lists the fields the hook provides — and identical repeats go to DEBUG, so a mis-declared plugin cannot flood the log.
+ - If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
++- A callback that needs a different bound (e.g. a turn-end checker making bounded model calls) declares it on itself: `callback.hermes_hook_timeout = 85` (seconds, clamped to 600; only on timeout-bounded hooks, never when the global timeout is `0`). While it runs on the worker, `hermes_cli.plugins.current_hook_call()` returns the host's budget: `.remaining()` seconds until the host gives up, and `.abandoned` (a `threading.Event`) set the moment it does, so the callback can fit its work into the deadline and never record a result the host discarded. A callback that finishes after abandonment is logged as `result discarded`. Turn-scoped hooks with no call id (`pre_verify`) are deduplicated per session, so one session's running check never skips another session's.
+ - The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
+ - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
+ - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
+-- 
+2.55.0
+

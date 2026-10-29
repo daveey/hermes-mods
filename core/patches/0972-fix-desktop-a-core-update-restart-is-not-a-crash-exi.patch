@@ -1,0 +1,1119 @@
+From 77e6a1eda30d40e87ccc4f81550e0cf73a677f7e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 09:37:51 -0700
+Subject: [PATCH] fix(desktop): a core-update restart is not a crash; exit
+ cards dedupe and clear on reconnect [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hermes-sync's core update (`hermes update --yes`) SIGTERMs the Desktop-owned backend while it holds the
+update marker. The exit supervisor sent `hermes:backend-exit` before its respawn path read that marker, so the
+renderer raised the red "Hermes stopped working in the background" card (durationMs 0, fresh id each time)
+four times on 2026-10-29 (07:29, 08:14, 08:38, 09:10), and nothing dismissed it once the respawned backend
+was serving again.
+
+- main: sendBackendExit classifies the exit (electron/backend-exit-report.ts) with the same predicate the
+  skew checker uses (updateInFlight, update hand-off, live update marker); a planned one carries
+  `planned: 'update'`. A probe failure reports unexpected, so a real crash is never hidden.
+- renderer: a planned exit shows one quiet "Updating Hermes…" info notice post-boot and never fails the
+  boot overlay; the crash card has a stable id so repeats replace it; the gateway socket's reopen dismisses
+  both.
+
+- code health: the sender lives in backend-exit-report.ts (main.ts shrinks); ja/ru/zh boot copy moves to
+  ja_boot.ts/ru_boot.ts/zh_boot.ts like the other locales (unchanged strings plus the two new keys).
+
+Tests: electron/backend-exit-report.test.ts (planned, unexpected, probe failure, sender: planned/unexpected/
+soft re-home); use-gateway-boot-exit-notice.test.tsx (planned exit after boot, planned exit during boot, unexpected + repeated exits
+keep one card, recovery clears the cards) - all four red on the previous hook.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../electron/backend-exit-report.test.ts      |  71 +++++++
+ apps/desktop/electron/backend-exit-report.ts  |  67 ++++++
+ apps/desktop/electron/main.ts                 |  29 +--
+ .../use-gateway-boot-exit-notice.test.tsx     | 198 ++++++++++++++++++
+ .../src/app/gateway/hooks/use-gateway-boot.ts |  32 ++-
+ apps/desktop/src/global.d.ts                  |   3 +
+ apps/desktop/src/i18n/ar_boot.ts              |   3 +
+ apps/desktop/src/i18n/de_boot.ts              |   3 +
+ apps/desktop/src/i18n/en_boot.ts              |   3 +
+ apps/desktop/src/i18n/es_boot.ts              |   3 +
+ apps/desktop/src/i18n/fr_boot.ts              |   3 +
+ apps/desktop/src/i18n/ja.ts                   |  68 +-----
+ apps/desktop/src/i18n/ja_boot.ts              |  67 ++++++
+ apps/desktop/src/i18n/ru.ts                   |  55 +----
+ apps/desktop/src/i18n/ru_boot.ts              |  57 +++++
+ apps/desktop/src/i18n/types_boot.ts           |   2 +
+ apps/desktop/src/i18n/zh-hant_boot.ts         |   3 +
+ apps/desktop/src/i18n/zh.ts                   |  60 +-----
+ apps/desktop/src/i18n/zh_boot.ts              |  65 ++++++
+ locales/_keys.desktop.json                    |   2 +
+ 20 files changed, 602 insertions(+), 192 deletions(-)
+ create mode 100644 apps/desktop/electron/backend-exit-report.test.ts
+ create mode 100644 apps/desktop/electron/backend-exit-report.ts
+ create mode 100644 apps/desktop/src/app/gateway/hooks/use-gateway-boot-exit-notice.test.tsx
+ create mode 100644 apps/desktop/src/i18n/ja_boot.ts
+ create mode 100644 apps/desktop/src/i18n/ru_boot.ts
+ create mode 100644 apps/desktop/src/i18n/zh_boot.ts
+
+diff --git a/apps/desktop/electron/backend-exit-report.test.ts b/apps/desktop/electron/backend-exit-report.test.ts
+new file mode 100644
+index 00000000000..51d24392ee8
+--- /dev/null
++++ b/apps/desktop/electron/backend-exit-report.test.ts
+@@ -0,0 +1,71 @@
++import { describe, expect, it, vi } from 'vitest'
++
++import { classifyBackendExit, createBackendExitSender } from './backend-exit-report'
++
++describe('classifyBackendExit', () => {
++  it('marks a SIGTERM during a core update (live marker) as a planned update restart', async () => {
++    await expect(classifyBackendExit({ code: null, signal: 'SIGTERM' }, async () => true)).resolves.toEqual({
++      code: null,
++      signal: 'SIGTERM',
++      planned: 'update'
++    })
++  })
++
++  it('reports an exit with no update in progress as unexpected', async () => {
++    const payload = { code: 1, signal: null, error: 'boom' }
++
++    await expect(classifyBackendExit(payload, async () => false)).resolves.toEqual(payload)
++  })
++
++  it('reports the exit as unexpected when the update probe fails, so a real crash is never hidden', async () => {
++    const payload = { code: null, signal: 'SIGKILL' }
++
++    await expect(
++      classifyBackendExit(payload, async () => {
++        throw new Error('marker unreadable')
++      })
++    ).resolves.toEqual(payload)
++  })
++})
++
++describe('createBackendExitSender', () => {
++  function harness({ planned = false, silenced = false } = {}) {
++    const send = vi.fn()
++    const log = vi.fn()
++
++    const sender = createBackendExitSender({
++      isSilenced: () => silenced,
++      isPlannedRestart: async () => planned,
++      window: () => ({ isDestroyed: () => false, webContents: { isDestroyed: () => false, send } }),
++      log
++    })
++
++    return { log, send, sender }
++  }
++
++  it('sends a planned update exit with planned set and logs it', async () => {
++    const { log, send, sender } = harness({ planned: true })
++
++    await sender({ code: null, signal: 'SIGTERM' })
++
++    expect(send).toHaveBeenCalledWith('hermes:backend-exit', { code: null, signal: 'SIGTERM', planned: 'update' })
++    expect(log).toHaveBeenCalledWith(expect.stringContaining('planned update'))
++  })
++
++  it('sends an unexpected exit unchanged', async () => {
++    const { log, send, sender } = harness()
++
++    await sender({ code: 1, signal: null })
++
++    expect(send).toHaveBeenCalledWith('hermes:backend-exit', { code: 1, signal: null })
++    expect(log).not.toHaveBeenCalled()
++  })
++
++  it('stays silent during an intentional soft re-home', async () => {
++    const { send, sender } = harness({ silenced: true })
++
++    await sender({ code: null, signal: 'SIGTERM' })
++
++    expect(send).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/electron/backend-exit-report.ts b/apps/desktop/electron/backend-exit-report.ts
+new file mode 100644
+index 00000000000..7bee3c33ef1
+--- /dev/null
++++ b/apps/desktop/electron/backend-exit-report.ts
+@@ -0,0 +1,67 @@
++/**
++ * [daveey] What the renderer is told when the primary backend child exits.
++ *
++ * A planned restart (a core update — `hermes update` stops the Desktop-owned
++ * backend while it holds the update marker — or this app's own update
++ * hand-off) is not a crash: the payload carries `planned: 'update'` so the
++ * renderer shows a quiet "Updating Hermes…" notice instead of the red
++ * "stopped working in the background" card. Anything else, including a probe
++ * that throws, is reported as unexpected: a real crash must never be hidden.
++ */
++export type BackendExitPayload = {
++  code: number | null
++  signal: string | null
++  error?: string
++  planned?: 'update'
++}
++
++export async function classifyBackendExit(
++  payload: BackendExitPayload,
++  isPlannedRestart: () => boolean | Promise<boolean>
++): Promise<BackendExitPayload> {
++  let planned = false
++
++  try {
++    planned = Boolean(await isPlannedRestart())
++  } catch {
++    planned = false
++  }
++
++  return planned ? { ...payload, planned: 'update' } : payload
++}
++
++type ExitWindow = {
++  isDestroyed(): boolean
++  webContents?: { isDestroyed(): boolean; send(channel: string, payload: BackendExitPayload): void } | null
++}
++
++/**
++ * `sendBackendExit` for the primary window: silent while `isSilenced` (an intentional soft re-home), otherwise
++ * classifies the exit and sends `hermes:backend-exit`. Returns the send's promise for tests; main ignores it.
++ */
++export function createBackendExitSender(deps: {
++  isSilenced: () => boolean
++  isPlannedRestart: () => boolean | Promise<boolean>
++  window: () => ExitWindow | null | undefined
++  log: (line: string) => void
++}) {
++  return (payload: BackendExitPayload): Promise<void> => {
++    if (deps.isSilenced()) {
++      return Promise.resolve()
++    }
++
++    return classifyBackendExit(payload, deps.isPlannedRestart).then(classified => {
++      if (classified.planned) {
++        deps.log('[supervisor] backend exit during a planned update; renderer shows the quiet updating notice')
++      }
++
++      const win = deps.window()
++
++      if (!win || win.isDestroyed() || !win.webContents || win.webContents.isDestroyed()) {
++        return
++      }
++
++      win.webContents.send('hermes:backend-exit', classified)
++    })
++  }
++}
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index bd7f009f102..b759a26268e 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -77,6 +77,7 @@ import { backendDialClaimKey, BackendDialClaims } from './backend-dial-claim'
+ import type { HostBackendRecord } from './backend-discovery'
+ import { buildDesktopBackendEnv, pooledProfileBackendEnv, profileBackendParentEnv } from './backend-env'
+ import { createBackendExitRecoveryLatch } from './backend-exit-recovery'
++import { createBackendExitSender } from './backend-exit-report'
+ import { isReauthRequiredError, waitForHermesReady } from './backend-health'
+ import {
+   backendCommandMatches,
+@@ -6516,25 +6517,15 @@ function getWindowState(win = mainWindow) {
+   }
+ }
+ 
+-function sendBackendExit(payload) {
+-  // Intentional soft re-home (gateway mode apply) kills the child on purpose —
+-  // don't surface the "backend stopped" error toast / boot-failure path.
+-  if (softRehomeInProgress) {
+-    return
+-  }
+-
+-  if (!mainWindow || mainWindow.isDestroyed()) {
+-    return
+-  }
+-
+-  const { webContents } = mainWindow
+-
+-  if (!webContents || webContents.isDestroyed()) {
+-    return
+-  }
+-
+-  webContents.send('hermes:backend-exit', payload)
+-}
++// [daveey] Soft re-home (gateway mode apply) kills the child on purpose and stays silent; a core update or our own
++// update hand-off is a planned restart, not a crash (backend-exit-report.ts).
++const sendBackendExit = createBackendExitSender({
++  isSilenced: () => softRehomeInProgress,
++  isPlannedRestart: async () =>
++    updateInFlight || isQuittingForHandoff || Boolean(await readLiveUpdateMarker(HERMES_HOME)),
++  window: () => mainWindow,
++  log: rememberLog
++})
+ 
+ function sendClosePreviewRequested() {
+   if (!mainWindow || mainWindow.isDestroyed()) {
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-exit-notice.test.tsx b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-exit-notice.test.tsx
+new file mode 100644
+index 00000000000..be721aad78b
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-exit-notice.test.tsx
+@@ -0,0 +1,198 @@
++import { act, cleanup, render } from '@testing-library/react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import { $desktopBoot } from '@/store/boot'
++import { closeSecondaryGateways } from '@/store/gateway'
++import { $notifications, clearNotifications } from '@/store/notifications'
++import { $activeGatewayProfile } from '@/store/profile'
++import { $connection, $gatewayState } from '@/store/session'
++
++import { FakeWebSocket } from '../../../test/fake-gateway-socket'
++
++import { takeGatewaySurvivor } from './gateway-hmr-survivor'
++import { BACKEND_EXIT_TOAST_ID, BACKEND_UPDATING_TOAST_ID, useGatewayBoot } from './use-gateway-boot'
++
++// [daveey] The backend-exit notices. hermes-sync's core update SIGTERMs the Desktop-owned backend several times a
++// day and main marks that exit `planned: 'update'`; seen 2026-10-29 07:29/08:14/08:38/09:10 as four red "stopped
++// working in the background" cards that never cleared. Shares the fake socket with use-gateway-boot.test.tsx.
++
++vi.mock(import('@/store/terminal-backend-warning'), () => ({
++  warnIfTerminalBackendUnavailable: vi.fn(async () => false)
++}))
++
++const primaryConn = {
++  authMode: 'token' as const,
++  baseUrl: 'https://vps.example.com',
++  connectionId: 'primary-vps',
++  profile: 'default',
++  token: 't',
++  wsUrl: 'wss://vps.example.com/api/ws?token=t'
++}
++
++let backendExit: null | ((payload: unknown) => void) = null
++
++function fakeDesktop() {
++  const unsubscribe = () => () => undefined
++
++  return {
++    getConnection: vi.fn(async () => primaryConn),
++    getGatewayWsUrl: vi.fn(async (conn?: { wsUrl?: string }) => conn?.wsUrl ?? primaryConn.wsUrl),
++    getBootProgress: vi.fn(async () => ({
++      error: null,
++      fakeMode: false,
++      message: '',
++      phase: 'init',
++      progress: 0,
++      retryable: false,
++      running: true,
++      timestamp: Date.now()
++    })),
++    onBootProgress: vi.fn(unsubscribe),
++    onBackendExit: vi.fn(callback => {
++      backendExit = callback
++
++      return () => {
++        backendExit = null
++      }
++    }),
++    onConnectionApplied: vi.fn(unsubscribe),
++    onPowerResume: vi.fn(unsubscribe),
++    revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
++    onWindowStateChanged: vi.fn(unsubscribe),
++    touchBackend: vi.fn(async () => undefined),
++    profile: { get: vi.fn(async () => ({ profile: 'default' })) }
++  }
++}
++
++function Harness() {
++  useGatewayBoot({
++    beforeConnectionSwitch: () => undefined,
++    handleGatewayEvent: () => undefined,
++    handleServerRequest: () => false,
++    onConnectionReady: () => undefined,
++    onGatewayReady: () => undefined,
++    refreshHermesConfig: async () => undefined,
++    refreshSessions: async () => undefined
++  })
++
++  return null
++}
++
++function closeSurvivor() {
++  try {
++    takeGatewaySurvivor()?.gateway.close()
++  } catch {
++    // ignore
++  }
++}
++
++const originalWebSocket = globalThis.WebSocket
++
++beforeEach(() => {
++  closeSurvivor()
++  closeSecondaryGateways()
++  clearNotifications()
++  backendExit = null
++  $activeGatewayProfile.set('default')
++  $connection.set(null)
++  vi.useFakeTimers()
++  FakeWebSocket.mode = 'open'
++  FakeWebSocket.instances = []
++  FakeWebSocket.pingMode = 'pong'
++  ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
++  $gatewayState.set('idle')
++  $desktopBoot.set({
++    error: null,
++    fakeMode: false,
++    message: '',
++    phase: 'init',
++    progress: 0,
++    running: true,
++    timestamp: Date.now(),
++    visible: true
++  })
++})
++
++afterEach(() => {
++  cleanup()
++  closeSurvivor()
++  closeSecondaryGateways()
++  clearNotifications()
++  $connection.set(null)
++  vi.useRealTimers()
++  ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
++  delete (window as { hermesDesktop?: unknown }).hermesDesktop
++})
++
++async function flushAsync() {
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(0)
++  })
++}
++
++const errorIds = () => $notifications.get().filter(entry => entry.kind === 'error').map(entry => entry.id)
++
++it('a planned core-update exit after boot shows one quiet updating notice and no crash card', async () => {
++  render(<Harness />)
++  await flushAsync()
++  expect($desktopBoot.get().visible).toBe(false)
++
++  act(() => backendExit?.({ code: null, signal: 'SIGTERM', planned: 'update' }))
++  act(() => backendExit?.({ code: null, signal: 'SIGTERM', planned: 'update' }))
++
++  expect(errorIds()).toEqual([])
++  expect($notifications.get().map(entry => [entry.id, entry.kind])).toEqual([[BACKEND_UPDATING_TOAST_ID, 'info']])
++  expect($notifications.get()[0]?.action).toBeUndefined()
++})
++
++it('a planned core-update exit while the boot overlay is up does not fail the boot', async () => {
++  const desktop = fakeDesktop()
++  desktop.getConnection = vi.fn(() => new Promise<never>(() => undefined))
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++
++  render(<Harness />)
++  await flushAsync()
++  expect($desktopBoot.get().visible).toBe(true)
++
++  act(() => backendExit?.({ code: null, signal: 'SIGTERM', planned: 'update' }))
++
++  expect($desktopBoot.get().error).toBeNull()
++  expect($notifications.get()).toHaveLength(0)
++})
++
++it('an unexpected exit still raises the crash card, and repeated exits keep exactly one', async () => {
++  render(<Harness />)
++  await flushAsync()
++
++  act(() => backendExit?.({ code: null, signal: 'SIGTERM' }))
++  act(() => backendExit?.({ code: 1, signal: null }))
++  act(() => backendExit?.({ code: null, signal: 'SIGKILL' }))
++
++  expect(errorIds()).toEqual([BACKEND_EXIT_TOAST_ID])
++})
++
++it('the crash card and the updating notice clear once the backend serves again', async () => {
++  render(<Harness />)
++  await flushAsync()
++  expect($gatewayState.get()).toBe('open')
++
++  act(() => backendExit?.({ code: null, signal: 'SIGTERM' }))
++  act(() => backendExit?.({ code: null, signal: 'SIGTERM', planned: 'update' }))
++  expect(
++    $notifications
++      .get()
++      .map(entry => entry.id)
++      .sort()
++  ).toEqual([BACKEND_EXIT_TOAST_ID, BACKEND_UPDATING_TOAST_ID].sort())
++
++  // The old child's socket drops; the respawned backend accepts the reconnect.
++  act(() => FakeWebSocket.instances.at(-1)!.drop())
++  expect($gatewayState.get()).not.toBe('open')
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(15_000)
++  })
++
++  expect($gatewayState.get()).toBe('open')
++  expect($notifications.get()).toHaveLength(0)
++})
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+index 89a3534ea28..6101f617295 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+@@ -66,7 +66,7 @@ import {
+   registerGatewaySwitchLifecycle
+ } from '@/store/gateway-switch'
+ import { watchLocalRuntimeJobs } from '@/store/local-runtime-jobs'
+-import { notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
++import { dismissNotification, notify, notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
+ import { loadPoolLimits } from '@/store/pool-limits'
+ import {
+   $activeGatewayProfile,
+@@ -148,6 +148,9 @@ const BOOT_RETRY_MAX_ATTEMPTS = 5
+ // Base delay for boot retries. Deliberately slower than the socket reconnect
+ // loop's 300ms: each attempt may rebuild an SSH master + remote dashboard.
+ const BOOT_RETRY_BASE_DELAY_MS = 2_000
++// [daveey] Stable ids for the backend-exit notices: a repeat replaces, a reopen dismisses.
++export const BACKEND_EXIT_TOAST_ID = 'backend-exit'
++export const BACKEND_UPDATING_TOAST_ID = 'backend-updating'
+ 
+ // While any of the RECONNECT_ATTEMPT_TIMEOUT_MS-bounded awaits below is
+ // pending, `reconnecting` never clears, so scheduleReconnect()/
+@@ -1088,6 +1091,9 @@ export function useGatewayBoot({
+       reportPrimaryGatewayState(st)
+ 
+       if (st === 'open') {
++        // [daveey] The backend is serving again: whatever exit notice is up is stale.
++        dismissNotification(BACKEND_EXIT_TOAST_ID)
++        dismissNotification(BACKEND_UPDATING_TOAST_ID)
+         bootSnapshotSuperseded = true
+         openedAt = Date.now()
+         reauthNotified = false
+@@ -1414,11 +1420,30 @@ export function useGatewayBoot({
+       }
+     })
+ 
+-    const offExit = desktop.onBackendExit(() => {
++    const offExit = desktop.onBackendExit(exit => {
+       if ($gatewaySwitching.get()) {
+         return
+       }
+ 
++      // [daveey] A core update (or our own update hand-off) stopped the backend
++      // on purpose and main is already parked to respawn it when the update
++      // ends: not a crash. No red card and no failed boot overlay (main's boot
++      // progress already says "An update is finishing"); post-boot, one quiet
++      // notice that the socket's reopen dismisses.
++      if (exit?.planned === 'update') {
++        if (!$desktopBoot.get().running && !$desktopBoot.get().visible) {
++          notify({
++            id: BACKEND_UPDATING_TOAST_ID,
++            kind: 'info',
++            title: translateNow('boot.errors.backendUpdating'),
++            message: translateNow('boot.errors.backendUpdatingMessage'),
++            durationMs: 0
++          })
++        }
++
++        return
++      }
++
+       noteBackendExited()
+ 
+       // While the boot overlay is up it already shows the failure with its own
+@@ -1437,7 +1462,10 @@ export function useGatewayBoot({
+       // Post-boot: the shell's restart intent recycles a local service via main
+       // (or re-dials a remote one) and does not depend on this hook's
+       // reconnect gate, unlike reconnectGateway().
++      // [daveey] One card per outage: a repeat exit replaces it (stable id) and
++      // the socket's reopen dismisses it.
+       notify({
++        id: BACKEND_EXIT_TOAST_ID,
+         kind: 'error',
+         title: translateNow('boot.errors.backendStopped'),
+         message: translateNow('boot.errors.backgroundExited'),
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index d4b6d09834b..946f01dd8b1 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -1782,4 +1782,7 @@ export interface HermesSelectPathsOptions {
+ export interface BackendExit {
+   code: number | null
+   signal: string | null
++  error?: string
++  // [daveey] Set by main when a core update / update hand-off stopped the backend on purpose.
++  planned?: 'update'
+ }
+diff --git a/apps/desktop/src/i18n/ar_boot.ts b/apps/desktop/src/i18n/ar_boot.ts
+index fd35bf15f4c..4ade4ac6439 100644
+--- a/apps/desktop/src/i18n/ar_boot.ts
++++ b/apps/desktop/src/i18n/ar_boot.ts
+@@ -16,6 +16,9 @@ export const arBoot = {
+       backgroundExited: 'خرجت عملية Hermes الخلفية.',
+       backgroundExitedDuringStartup: 'خرجت عملية Hermes الخلفية أثناء بدء التشغيل.',
+       backendStopped: 'توقف الخلفية',
++      backendUpdating: 'جارٍ تحديث Hermes…',
++      backendUpdatingMessage:
++        'يعيد Hermes التشغيل لإكمال تحديث. ستُعاد محادثاتك الاتصال تلقائيًا.',
+       desktopBootFailed: 'فشل تشغيل سطح المكتب',
+       gatewayConnectionLost: 'انقطع الاتصال بالبوابة',
+       gatewayConnectionLostDetail:
+diff --git a/apps/desktop/src/i18n/de_boot.ts b/apps/desktop/src/i18n/de_boot.ts
+index c5db238463f..c2874c89dac 100644
+--- a/apps/desktop/src/i18n/de_boot.ts
++++ b/apps/desktop/src/i18n/de_boot.ts
+@@ -17,6 +17,9 @@ export const deBoot = {
+       backgroundExited: 'Der Hermes-Hintergrundprozess wurde beendet.',
+       backgroundExitedDuringStartup: 'Der Hermes-Hintergrundprozess wurde während des Starts beendet.',
+       backendStopped: 'Backend gestoppt',
++      backendUpdating: 'Hermes wird aktualisiert…',
++      backendUpdatingMessage:
++        'Hermes startet neu, um ein Update abzuschließen. Deine Chats verbinden sich von selbst wieder.',
+       restartHermes: 'Hermes neu starten',
+       openLogs: 'Logs öffnen',
+       desktopBootFailed: 'Desktop-Start fehlgeschlagen',
+diff --git a/apps/desktop/src/i18n/en_boot.ts b/apps/desktop/src/i18n/en_boot.ts
+index 1cf4b950bf9..55055a8e981 100644
+--- a/apps/desktop/src/i18n/en_boot.ts
++++ b/apps/desktop/src/i18n/en_boot.ts
+@@ -18,6 +18,9 @@ export const enBoot = {
+         'The service that runs your chats closed unexpectedly. Restart it to keep going — your chats and settings are safe.',
+       backgroundExitedDuringStartup: 'Hermes stopped right after it started.',
+       backendStopped: 'Hermes stopped working in the background',
++      backendUpdating: 'Updating Hermes…',
++      backendUpdatingMessage:
++        'Hermes is restarting to finish an update. Your chats will reconnect on their own.',
+       restartHermes: 'Restart Hermes',
+       openLogs: 'Open logs',
+       desktopBootFailed: "Hermes couldn't start",
+diff --git a/apps/desktop/src/i18n/es_boot.ts b/apps/desktop/src/i18n/es_boot.ts
+index bc381ab9fe5..1ffe91e893e 100644
+--- a/apps/desktop/src/i18n/es_boot.ts
++++ b/apps/desktop/src/i18n/es_boot.ts
+@@ -18,6 +18,9 @@ export const esBoot = {
+         'El servicio que ejecuta tus chats se cerró de forma inesperada. Reinícialo para continuar; tus chats y ajustes están a salvo.',
+       backgroundExitedDuringStartup: 'Hermes se detuvo justo después de iniciarse.',
+       backendStopped: 'Hermes dejó de funcionar en segundo plano',
++      backendUpdating: 'Actualizando Hermes…',
++      backendUpdatingMessage:
++        'Hermes se está reiniciando para terminar una actualización. Tus chats se reconectarán solos.',
+       restartHermes: 'Reiniciar Hermes',
+       openLogs: 'Abrir registros',
+       desktopBootFailed: 'Hermes no pudo iniciarse',
+diff --git a/apps/desktop/src/i18n/fr_boot.ts b/apps/desktop/src/i18n/fr_boot.ts
+index 1aea1588b14..16cf10185f3 100644
+--- a/apps/desktop/src/i18n/fr_boot.ts
++++ b/apps/desktop/src/i18n/fr_boot.ts
+@@ -17,6 +17,9 @@ export const frBoot = {
+       backgroundExited: "Le processus en arrière-plan de Hermes s'est arrêté.",
+       backgroundExitedDuringStartup: "Le processus en arrière-plan de Hermes s'est arrêté pendant le démarrage.",
+       backendStopped: 'Backend arrêté',
++      backendUpdating: 'Mise à jour de Hermes…',
++      backendUpdatingMessage:
++        'Hermes redémarre pour terminer une mise à jour. Vos discussions se reconnecteront d\'elles-mêmes.',
+       restartHermes: 'Redémarrer Hermes',
+       openLogs: 'Ouvrir les journaux',
+       desktopBootFailed: 'Échec du démarrage',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 7440e4d9383..2ca406149c0 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -4,6 +4,7 @@ import { jaArchiveTasks } from './archive-task-copy'
+ import { defineLocale, type TranslationOverrides } from './define-locale'
+ import { introJa } from './intro-ja'
+ import { jaAuxTasks } from './ja_aux_tasks'
++import { jaBoot } from './ja_boot'
+ import { jaConnectors } from './ja_connectors'
+ import { jaLocalModels } from './ja_local_models'
+ import { jaModelMenu } from './ja_model_menu'
+@@ -88,66 +89,7 @@ export const jaOverrides = {
+     revealMissing: 'そのフォルダーはこのコンピューターにありません'
+   },
+ 
+-  boot: {
+-    ready: 'Hermes Desktop の準備ができました',
+-    desktopBootFailedWithMessage: message => `デスクトップの起動に失敗しました: ${message}`,
+-    steps: {
+-      connectingGateway: 'ライブデスクトップゲートウェイに接続中',
+-      loadingSettings: 'Hermes の設定を読み込み中',
+-      loadingSessions: '最近のセッションを読み込み中',
+-      retryingRemoteBackend: 'リモート Hermes バックエンドに再接続中…',
+-      startingDesktopConnection: 'デスクトップ接続を開始中',
+-      startingHermesDesktop: 'Hermes Desktop を起動中…'
+-    },
+-    errors: {
+-      backgroundExited: 'Hermes バックグラウンドプロセスが終了しました。',
+-      backgroundExitedDuringStartup: '起動中に Hermes バックグラウンドプロセスが終了しました。',
+-      backendStopped: 'バックエンドが停止しました',
+-      desktopBootFailed: 'デスクトップの起動に失敗しました',
+-      gatewayConnectionLost: 'ゲートウェイへの接続が切断されました',
+-      gatewayConnectionLostDetail:
+-        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
+-      gatewaySignInRequired: 'ゲートウェイへのサインインが必要です',
+-      ipcBridgeUnavailable: 'デスクトップ IPC ブリッジが利用できません。'
+-    },
+-    failure: {
+-      title: 'Hermes を起動できませんでした',
+-      description:
+-        'バックグラウンドゲートウェイが起動しませんでした。以下の回復手順をお試しください。チャットや設定は削除されません。',
+-      remoteTitle: 'リモートゲートウェイへのサインインが必要です',
+-      remoteDescription:
+-        'リモートゲートウェイのセッションが期限切れです。再接続するにはもう一度サインインしてください。チャットや設定は削除されません。',
+-      retry: '再試行',
+-      repairInstall: 'インストールを修復',
+-      useLocalGateway: 'ローカルゲートウェイを使用',
+-      gatewaySettings: 'ゲートウェイ設定',
+-      back: '戻る',
+-      openLogs: 'ログを開く',
+-      repairHint: '修復はインストーラーを再実行します。新しいマシンでは数分かかる場合があります。',
+-      remoteSignInHint: signInLabel =>
+-        `保存済みのリモートブラウザセッションからサインアウトし、${signInLabel}を開きます。代わりにバンドルされたバックエンドに切り替えるには「ローカルゲートウェイを使用」を選択してください。`,
+-      signOutAndSignIn: 'サインアウトして再サインイン',
+-      remoteFailureHint:
+-        '「ゲートウェイ設定」でゲートウェイの URL とサインインを確認するか、ローカルゲートウェイに切り替えてください。',
+-      cloudDownTitle: 'Nous Cloud エージェントが停止しています',
+-      cloudDownDescription:
+-        'このゲートウェイが接続している Nous 管理のクラウドエージェントがサーバーエラーを返しています。ここから再起動することはできません。ステータスを確認するか、ローカルゲートウェイに切り替えるか、サポートに連絡してください。',
+-      cloudDownHint:
+-        '下のボタンから Nous Portal（インスタンスの状態と操作）を開くか、Discord でサポートを受けられます。',
+-      cloudDownCheckPortal: 'Portal のステータスを確認',
+-      cloudDownDiscord: 'Discord でサポートを受ける',
+-      hideRecentLogs: '最近のログを非表示',
+-      showRecentLogs: '最近のログを表示',
+-      signedInTitle: 'サインインしました',
+-      signedInMessage: 'リモートゲートウェイに再接続中…',
+-      signInIncompleteTitle: 'サインインが完了していません',
+-      signInIncompleteMessage: '認証が完了する前にログインウィンドウが閉じられました。',
+-      signInFailed: 'サインインに失敗しました',
+-      signInToRemoteGateway: 'リモートゲートウェイにサインイン',
+-      signInWithProvider: provider => `${provider} でサインイン`,
+-      identityProvider: 'ID プロバイダー'
+-    }
+-  },
++  boot: jaBoot.boot,
+ 
+   notifications: {
+     sharedProfileWarning:
+@@ -3845,8 +3787,10 @@ export const jaOverrides = {
+     deleteFailed: '削除に失敗しました',
+     archived: 'アーカイブしました',
+     archiveFailed: 'アーカイブに失敗しました',
+-    archiveLinkedTitle: (title: string) => (title ? `「${title}」をアーカイブしますか？` : 'このチャットをアーカイブしますか？'),
+-    archiveLinkedBody: '以下の関連作業の状態を確認してください。アーカイブはチャットを隠すだけで、タスクやマシンを停止しません。',
++    archiveLinkedTitle: (title: string) =>
++      title ? `「${title}」をアーカイブしますか？` : 'このチャットをアーカイブしますか？',
++    archiveLinkedBody:
++      '以下の関連作業の状態を確認してください。アーカイブはチャットを隠すだけで、タスクやマシンを停止しません。',
+     archiveLinkedConfirm: 'アーカイブする',
+     archiveLinkedCancel: '残す',
+     ...jaArchiveTasks,
+diff --git a/apps/desktop/src/i18n/ja_boot.ts b/apps/desktop/src/i18n/ja_boot.ts
+new file mode 100644
+index 00000000000..c94d2365efd
+--- /dev/null
++++ b/apps/desktop/src/i18n/ja_boot.ts
+@@ -0,0 +1,67 @@
++import type { TranslationOverrides } from './define-locale'
++
++// The boot screen's copy, composed by ja.ts.
++export const jaBoot = {
++  boot: {
++    ready: 'Hermes Desktop の準備ができました',
++    desktopBootFailedWithMessage: message => `デスクトップの起動に失敗しました: ${message}`,
++    steps: {
++      connectingGateway: 'ライブデスクトップゲートウェイに接続中',
++      loadingSettings: 'Hermes の設定を読み込み中',
++      loadingSessions: '最近のセッションを読み込み中',
++      retryingRemoteBackend: 'リモート Hermes バックエンドに再接続中…',
++      startingDesktopConnection: 'デスクトップ接続を開始中',
++      startingHermesDesktop: 'Hermes Desktop を起動中…'
++    },
++    errors: {
++      backgroundExited: 'Hermes バックグラウンドプロセスが終了しました。',
++      backgroundExitedDuringStartup: '起動中に Hermes バックグラウンドプロセスが終了しました。',
++      backendStopped: 'バックエンドが停止しました',
++      backendUpdating: 'Hermes を更新中…',
++      backendUpdatingMessage: 'アップデートを完了するため Hermes を再起動しています。チャットは自動で再接続されます。',
++      desktopBootFailed: 'デスクトップの起動に失敗しました',
++      gatewayConnectionLost: 'ゲートウェイへの接続が切断されました',
++      gatewayConnectionLostDetail:
++        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
++      gatewaySignInRequired: 'ゲートウェイへのサインインが必要です',
++      ipcBridgeUnavailable: 'デスクトップ IPC ブリッジが利用できません。'
++    },
++    failure: {
++      title: 'Hermes を起動できませんでした',
++      description:
++        'バックグラウンドゲートウェイが起動しませんでした。以下の回復手順をお試しください。チャットや設定は削除されません。',
++      remoteTitle: 'リモートゲートウェイへのサインインが必要です',
++      remoteDescription:
++        'リモートゲートウェイのセッションが期限切れです。再接続するにはもう一度サインインしてください。チャットや設定は削除されません。',
++      retry: '再試行',
++      repairInstall: 'インストールを修復',
++      useLocalGateway: 'ローカルゲートウェイを使用',
++      gatewaySettings: 'ゲートウェイ設定',
++      back: '戻る',
++      openLogs: 'ログを開く',
++      repairHint: '修復はインストーラーを再実行します。新しいマシンでは数分かかる場合があります。',
++      remoteSignInHint: signInLabel =>
++        `保存済みのリモートブラウザセッションからサインアウトし、${signInLabel}を開きます。代わりにバンドルされたバックエンドに切り替えるには「ローカルゲートウェイを使用」を選択してください。`,
++      signOutAndSignIn: 'サインアウトして再サインイン',
++      remoteFailureHint:
++        '「ゲートウェイ設定」でゲートウェイの URL とサインインを確認するか、ローカルゲートウェイに切り替えてください。',
++      cloudDownTitle: 'Nous Cloud エージェントが停止しています',
++      cloudDownDescription:
++        'このゲートウェイが接続している Nous 管理のクラウドエージェントがサーバーエラーを返しています。ここから再起動することはできません。ステータスを確認するか、ローカルゲートウェイに切り替えるか、サポートに連絡してください。',
++      cloudDownHint:
++        '下のボタンから Nous Portal（インスタンスの状態と操作）を開くか、Discord でサポートを受けられます。',
++      cloudDownCheckPortal: 'Portal のステータスを確認',
++      cloudDownDiscord: 'Discord でサポートを受ける',
++      hideRecentLogs: '最近のログを非表示',
++      showRecentLogs: '最近のログを表示',
++      signedInTitle: 'サインインしました',
++      signedInMessage: 'リモートゲートウェイに再接続中…',
++      signInIncompleteTitle: 'サインインが完了していません',
++      signInIncompleteMessage: '認証が完了する前にログインウィンドウが閉じられました。',
++      signInFailed: 'サインインに失敗しました',
++      signInToRemoteGateway: 'リモートゲートウェイにサインイン',
++      signInWithProvider: provider => `${provider} でサインイン`,
++      identityProvider: 'ID プロバイダー'
++    }
++  }
++} satisfies Pick<TranslationOverrides, 'boot'>
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index e88d050fc5f..641117abf64 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -3,6 +3,7 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
+ import { ruArchiveTasks } from './archive-task-copy'
+ import { defineLocale, type TranslationOverrides } from './define-locale'
+ import { ruAuxTasks } from './ru_aux_tasks'
++import { ruBoot } from './ru_boot'
+ import { ruConnectors } from './ru_connectors'
+ import { ruModelMenu } from './ru_model_menu'
+ import { ruNotices } from './ru_notices'
+@@ -98,56 +99,7 @@ export const ruOverrides = {
+     pathCopied: 'Путь скопирован',
+     revealMissing: 'Этой папки нет на этом компьютере'
+   },
+-  boot: {
+-    ready: 'Hermes Desktop готов',
+-    desktopBootFailedWithMessage: message => `Не удалось запустить приложение: ${message}`,
+-    steps: {
+-      connectingGateway: 'Подключение к шлюзу',
+-      loadingSettings: 'Загрузка настроек Hermes',
+-      loadingSessions: 'Загрузка последних сеансов',
+-      retryingRemoteBackend: 'Переподключение к удалённому бэкенду Hermes…',
+-      startingDesktopConnection: 'Запуск подключения приложения',
+-      startingHermesDesktop: 'Запуск Hermes Desktop…'
+-    },
+-    errors: {
+-      backgroundExited: 'Фоновый процесс Hermes завершён.',
+-      backgroundExitedDuringStartup: 'Фоновый процесс Hermes завершился при запуске.',
+-      backendStopped: 'Бэкенд остановлен',
+-      desktopBootFailed: 'Не удалось запустить приложение',
+-      gatewayConnectionLost: 'Соединение с шлюзом потеряно',
+-      gatewaySignInRequired: 'Требуется вход в шлюз',
+-      ipcBridgeUnavailable: 'IPC-мост приложения недоступен.'
+-    },
+-    failure: {
+-      title: 'Hermes не удалось запустить',
+-      description:
+-        'Фоновый шлюз не запустился. Попробуйте один из шагов восстановления ниже. Ничто из этого не удаляет ваши чаты и настройки.',
+-      remoteTitle: 'Требуется вход в удалённый шлюз',
+-      remoteDescription:
+-        'Сессия удалённого шлюза истекла. Войдите снова, чтобы переподключиться. Ничто из этого не удаляет ваши чаты и настройки.',
+-      retry: 'Повторить',
+-      repairInstall: 'Восстановить установку',
+-      useLocalGateway: 'Использовать локальный шлюз',
+-      gatewaySettings: 'Настройки шлюза',
+-      back: 'Назад',
+-      openLogs: 'Открыть журналы',
+-      repairHint: 'Восстановление перезапускает установщик — на чистой машине это может занять несколько минут.',
+-      remoteSignInHint: signInLabel =>
+-        `Выход из сохранённой сессии удалённого браузера, затем открытие ${signInLabel}. Чтобы перейти на встроенный бэкенд, используйте локальный шлюз.`,
+-      signOutAndSignIn: 'Выйти и войти',
+-      remoteFailureHint: 'Проверьте URL шлюза и вход в настройках шлюза или переключитесь на локальный шлюз.',
+-      hideRecentLogs: 'Скрыть недавние журналы',
+-      showRecentLogs: 'Показать недавние журналы',
+-      signedInTitle: 'Вы вошли в систему',
+-      signedInMessage: 'Переподключение к удалённому шлюзу…',
+-      signInIncompleteTitle: 'Вход не завершён',
+-      signInIncompleteMessage: 'Окно входа закрылось до завершения аутентификации.',
+-      signInFailed: 'Не удалось войти',
+-      signInToRemoteGateway: 'Войти в удалённый шлюз',
+-      signInWithProvider: provider => `Войти через ${provider}`,
+-      identityProvider: 'вашему провайдеру аутентификации'
+-    }
+-  },
++  boot: ruBoot.boot,
+   notifications: {
+     sharedProfileWarning:
+       'Другая установка Hermes использует этот профиль. Обе установки используют общие настройки и данные, поэтому изменения могут конфликтовать. Можно продолжить работу или закрыть другую установку перед внесением изменений.',
+@@ -4029,7 +3981,8 @@ export const ruOverrides = {
+     archived: 'В архиве',
+     archiveFailed: 'Архивирование не удалось',
+     archiveLinkedTitle: (title: string) => (title ? `Архивировать «${title}»?` : 'Архивировать этот чат?'),
+-    archiveLinkedBody: 'Проверьте статус связанной работы ниже. Архивирование лишь скрывает чат и не останавливает задачи или машины.',
++    archiveLinkedBody:
++      'Проверьте статус связанной работы ниже. Архивирование лишь скрывает чат и не останавливает задачи или машины.',
+     archiveLinkedConfirm: 'Всё равно архивировать',
+     archiveLinkedCancel: 'Оставить чат',
+     ...ruArchiveTasks,
+diff --git a/apps/desktop/src/i18n/ru_boot.ts b/apps/desktop/src/i18n/ru_boot.ts
+new file mode 100644
+index 00000000000..26c497f268f
+--- /dev/null
++++ b/apps/desktop/src/i18n/ru_boot.ts
+@@ -0,0 +1,57 @@
++import type { TranslationOverrides } from './define-locale'
++
++// The boot screen's copy, composed by ru.ts.
++export const ruBoot = {
++  boot: {
++    ready: 'Hermes Desktop готов',
++    desktopBootFailedWithMessage: message => `Не удалось запустить приложение: ${message}`,
++    steps: {
++      connectingGateway: 'Подключение к шлюзу',
++      loadingSettings: 'Загрузка настроек Hermes',
++      loadingSessions: 'Загрузка последних сеансов',
++      retryingRemoteBackend: 'Переподключение к удалённому бэкенду Hermes…',
++      startingDesktopConnection: 'Запуск подключения приложения',
++      startingHermesDesktop: 'Запуск Hermes Desktop…'
++    },
++    errors: {
++      backgroundExited: 'Фоновый процесс Hermes завершён.',
++      backgroundExitedDuringStartup: 'Фоновый процесс Hermes завершился при запуске.',
++      backendStopped: 'Бэкенд остановлен',
++      backendUpdating: 'Обновление Hermes…',
++      backendUpdatingMessage: 'Hermes перезапускается, чтобы завершить обновление. Чаты переподключатся сами.',
++      desktopBootFailed: 'Не удалось запустить приложение',
++      gatewayConnectionLost: 'Соединение с шлюзом потеряно',
++      gatewaySignInRequired: 'Требуется вход в шлюз',
++      ipcBridgeUnavailable: 'IPC-мост приложения недоступен.'
++    },
++    failure: {
++      title: 'Hermes не удалось запустить',
++      description:
++        'Фоновый шлюз не запустился. Попробуйте один из шагов восстановления ниже. Ничто из этого не удаляет ваши чаты и настройки.',
++      remoteTitle: 'Требуется вход в удалённый шлюз',
++      remoteDescription:
++        'Сессия удалённого шлюза истекла. Войдите снова, чтобы переподключиться. Ничто из этого не удаляет ваши чаты и настройки.',
++      retry: 'Повторить',
++      repairInstall: 'Восстановить установку',
++      useLocalGateway: 'Использовать локальный шлюз',
++      gatewaySettings: 'Настройки шлюза',
++      back: 'Назад',
++      openLogs: 'Открыть журналы',
++      repairHint: 'Восстановление перезапускает установщик — на чистой машине это может занять несколько минут.',
++      remoteSignInHint: signInLabel =>
++        `Выход из сохранённой сессии удалённого браузера, затем открытие ${signInLabel}. Чтобы перейти на встроенный бэкенд, используйте локальный шлюз.`,
++      signOutAndSignIn: 'Выйти и войти',
++      remoteFailureHint: 'Проверьте URL шлюза и вход в настройках шлюза или переключитесь на локальный шлюз.',
++      hideRecentLogs: 'Скрыть недавние журналы',
++      showRecentLogs: 'Показать недавние журналы',
++      signedInTitle: 'Вы вошли в систему',
++      signedInMessage: 'Переподключение к удалённому шлюзу…',
++      signInIncompleteTitle: 'Вход не завершён',
++      signInIncompleteMessage: 'Окно входа закрылось до завершения аутентификации.',
++      signInFailed: 'Не удалось войти',
++      signInToRemoteGateway: 'Войти в удалённый шлюз',
++      signInWithProvider: provider => `Войти через ${provider}`,
++      identityProvider: 'вашему провайдеру аутентификации'
++    }
++  }
++} satisfies Pick<TranslationOverrides, 'boot'>
+diff --git a/apps/desktop/src/i18n/types_boot.ts b/apps/desktop/src/i18n/types_boot.ts
+index aa21611a199..bea30a8b476 100644
+--- a/apps/desktop/src/i18n/types_boot.ts
++++ b/apps/desktop/src/i18n/types_boot.ts
+@@ -14,6 +14,8 @@ export interface BootTranslations {
+     backgroundExited: string
+     backgroundExitedDuringStartup: string
+     backendStopped: string
++    backendUpdating: string
++    backendUpdatingMessage: string
+     restartHermes: string
+     openLogs: string
+     desktopBootFailed: string
+diff --git a/apps/desktop/src/i18n/zh-hant_boot.ts b/apps/desktop/src/i18n/zh-hant_boot.ts
+index 5bcba08f41d..50eda646941 100644
+--- a/apps/desktop/src/i18n/zh-hant_boot.ts
++++ b/apps/desktop/src/i18n/zh-hant_boot.ts
+@@ -16,6 +16,9 @@ export const zhHantBoot = {
+       backgroundExited: 'Hermes 背景程序已結束。',
+       backgroundExitedDuringStartup: 'Hermes 背景程序在啟動期間結束。',
+       backendStopped: '後端已停止',
++      backendUpdating: '正在更新 Hermes…',
++      backendUpdatingMessage:
++        'Hermes 正在重新啟動以完成更新，聊天會自動重新連線。',
+       desktopBootFailed: '桌面啟動失敗',
+       gatewayConnectionLost: '與閘道的連線已中斷',
+       gatewayConnectionLostDetail:
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index ef835f9e004..0c24856cae0 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -4,6 +4,7 @@ import { zhArchiveTasks } from './archive-task-copy'
+ import { defineLocale, type TranslationOverrides } from './define-locale'
+ import { introZh } from './intro-zh'
+ import { zhAuxTasks } from './zh_aux_tasks'
++import { zhBoot } from './zh_boot'
+ import { zhConnectorCard } from './zh_connector_card'
+ import { zhLocalModels } from './zh_local_models'
+ import { zhModelMenu } from './zh_model_menu'
+@@ -119,64 +120,7 @@ export const zhOverrides = {
+     revealMissing: '该文件夹不在这台电脑上'
+   },
+ 
+-  boot: {
+-    ready: 'Hermes 桌面版已就绪',
+-    desktopBootFailedWithMessage: message => `桌面启动失败：${message}`,
+-    steps: {
+-      connectingGateway: '正在连接桌面网关',
+-      loadingSettings: '正在加载 Hermes 设置',
+-      loadingSessions: '正在加载最近会话',
+-      retryingRemoteBackend: '正在重新连接远程 Hermes 后端…',
+-      startingDesktopConnection: '正在启动桌面连接',
+-      startingHermesDesktop: '正在启动 Hermes 桌面版…'
+-    },
+-    errors: {
+-      backgroundExited: 'Hermes 后台进程已退出。',
+-      backgroundExitedDuringStartup: 'Hermes 后台进程在启动期间退出。',
+-      backendStopped: '后端已停止',
+-      desktopBootFailed: '桌面启动失败',
+-      gatewayConnectionLost: '与网关的连接已断开',
+-      gatewayConnectionLostDetail:
+-        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
+-      gatewaySignInRequired: '需要登录网关',
+-      ipcBridgeUnavailable: '桌面 IPC 桥不可用。'
+-    },
+-    failure: {
+-      title: 'Hermes 无法启动',
+-      description: '后台网关没有启动。请尝试下面的恢复步骤；这里不会删除你的对话或设置。',
+-      remoteTitle: '需要重新登录远程网关',
+-      remoteDescription: '你的远程网关会话已过期。请重新登录以恢复连接。这些操作不会删除你的对话或设置。',
+-      retry: '重试',
+-      repairInstall: '修复安装',
+-      useLocalGateway: '使用本地网关',
+-      gatewaySettings: '网关设置',
+-      back: '返回',
+-      openLogs: '打开日志',
+-      repairHint: '修复会重新运行安装器，在新机器上可能需要几分钟。',
+-      bundledReinstallHint: '捆绑安装无法从应用内部自修复——重新安装 Hermes Desktop 以恢复其后端。',
+-      reinstallApp: '重新安装 Hermes Desktop',
+-      remoteSignInHint: signInLabel =>
+-        `先退出已保存的远程浏览器会话，然后打开${signInLabel}。也可以使用本地网关切换到随应用提供的后端。`,
+-      signOutAndSignIn: '退出并重新登录',
+-      remoteFailureHint: '在“网关设置”中检查网关 URL 和登录，或切换到本地网关。',
+-      cloudDownTitle: 'Nous Cloud 代理已宕机',
+-      cloudDownDescription:
+-        '此网关连接的 Nous 托管云代理正在返回服务器错误。无法在此处重启——请检查其状态、切换到本地网关或获取支持。',
+-      cloudDownHint: '使用下方按钮打开 Nous Portal（查看实例状态与操作）或加入 Discord 获取支持。',
+-      cloudDownCheckPortal: '查看 Portal 状态',
+-      cloudDownDiscord: '在 Discord 获取帮助',
+-      hideRecentLogs: '隐藏最近日志',
+-      showRecentLogs: '显示最近日志',
+-      signedInTitle: '已登录',
+-      signedInMessage: '正在重新连接远程网关…',
+-      signInIncompleteTitle: '登录未完成',
+-      signInIncompleteMessage: '登录窗口在认证完成前关闭。',
+-      signInFailed: '登录失败',
+-      signInToRemoteGateway: '登录远程网关',
+-      signInWithProvider: provider => `使用 ${provider} 登录`,
+-      identityProvider: '你的身份提供方'
+-    }
+-  },
++  boot: zhBoot.boot,
+ 
+   notifications: {
+     sharedProfileWarning:
+diff --git a/apps/desktop/src/i18n/zh_boot.ts b/apps/desktop/src/i18n/zh_boot.ts
+new file mode 100644
+index 00000000000..a72ca40a588
+--- /dev/null
++++ b/apps/desktop/src/i18n/zh_boot.ts
+@@ -0,0 +1,65 @@
++import type { TranslationOverrides } from './define-locale'
++
++// The boot screen's copy, composed by zh.ts.
++export const zhBoot = {
++  boot: {
++    ready: 'Hermes 桌面版已就绪',
++    desktopBootFailedWithMessage: message => `桌面启动失败：${message}`,
++    steps: {
++      connectingGateway: '正在连接桌面网关',
++      loadingSettings: '正在加载 Hermes 设置',
++      loadingSessions: '正在加载最近会话',
++      retryingRemoteBackend: '正在重新连接远程 Hermes 后端…',
++      startingDesktopConnection: '正在启动桌面连接',
++      startingHermesDesktop: '正在启动 Hermes 桌面版…'
++    },
++    errors: {
++      backgroundExited: 'Hermes 后台进程已退出。',
++      backgroundExitedDuringStartup: 'Hermes 后台进程在启动期间退出。',
++      backendStopped: '后端已停止',
++      backendUpdating: '正在更新 Hermes…',
++      backendUpdatingMessage: 'Hermes 正在重启以完成更新，聊天会自动重新连接。',
++      desktopBootFailed: '桌面启动失败',
++      gatewayConnectionLost: '与网关的连接已断开',
++      gatewayConnectionLostDetail:
++        'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
++      gatewaySignInRequired: '需要登录网关',
++      ipcBridgeUnavailable: '桌面 IPC 桥不可用。'
++    },
++    failure: {
++      title: 'Hermes 无法启动',
++      description: '后台网关没有启动。请尝试下面的恢复步骤；这里不会删除你的对话或设置。',
++      remoteTitle: '需要重新登录远程网关',
++      remoteDescription: '你的远程网关会话已过期。请重新登录以恢复连接。这些操作不会删除你的对话或设置。',
++      retry: '重试',
++      repairInstall: '修复安装',
++      useLocalGateway: '使用本地网关',
++      gatewaySettings: '网关设置',
++      back: '返回',
++      openLogs: '打开日志',
++      repairHint: '修复会重新运行安装器，在新机器上可能需要几分钟。',
++      bundledReinstallHint: '捆绑安装无法从应用内部自修复——重新安装 Hermes Desktop 以恢复其后端。',
++      reinstallApp: '重新安装 Hermes Desktop',
++      remoteSignInHint: signInLabel =>
++        `先退出已保存的远程浏览器会话，然后打开${signInLabel}。也可以使用本地网关切换到随应用提供的后端。`,
++      signOutAndSignIn: '退出并重新登录',
++      remoteFailureHint: '在“网关设置”中检查网关 URL 和登录，或切换到本地网关。',
++      cloudDownTitle: 'Nous Cloud 代理已宕机',
++      cloudDownDescription:
++        '此网关连接的 Nous 托管云代理正在返回服务器错误。无法在此处重启——请检查其状态、切换到本地网关或获取支持。',
++      cloudDownHint: '使用下方按钮打开 Nous Portal（查看实例状态与操作）或加入 Discord 获取支持。',
++      cloudDownCheckPortal: '查看 Portal 状态',
++      cloudDownDiscord: '在 Discord 获取帮助',
++      hideRecentLogs: '隐藏最近日志',
++      showRecentLogs: '显示最近日志',
++      signedInTitle: '已登录',
++      signedInMessage: '正在重新连接远程网关…',
++      signInIncompleteTitle: '登录未完成',
++      signInIncompleteMessage: '登录窗口在认证完成前关闭。',
++      signInFailed: '登录失败',
++      signInToRemoteGateway: '登录远程网关',
++      signInWithProvider: provider => `使用 ${provider} 登录`,
++      identityProvider: '你的身份提供方'
++    }
++  }
++} satisfies Pick<TranslationOverrides, 'boot'>
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index d99227812e0..e2252049303 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -500,6 +500,8 @@
+     "boot.causes.timedOut",
+     "boot.desktopBootFailedWithMessage",
+     "boot.errors.backendStopped",
++    "boot.errors.backendUpdating",
++    "boot.errors.backendUpdatingMessage",
+     "boot.errors.backgroundExited",
+     "boot.errors.backgroundExitedDuringStartup",
+     "boot.errors.connectionSettings",
+-- 
+2.55.0
+

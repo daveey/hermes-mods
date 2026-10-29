@@ -1,0 +1,586 @@
+From ee38ea9522f91da32f092457e8d082091866504a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:18:14 -0700
+Subject: [PATCH] fix(core-update): checkpoint capped turns without
+ retry-window loops [daveey] (#205)
+
+* fix(core-update): checkpoint capped turns without retry-window loops [daveey]
+
+* fix(core-update): parked capped pause keeps continuation eligibility [daveey]
+
+A capped turn parked between drain windows was aged from started_at by the
+in-place continue, the startup sweep and the notice hold, so under the default
+15-min freshness a park longer than the window dropped the marker. Its live
+writer now restamps parked_at while parking (and once as parking ends); all
+three readers measure core_update_pause freshness via turn_marker.freshness_since.
+---
+ tests/tui_gateway/test_update_pause.py     |   5 +-
+ tests/tui_gateway/test_update_pause_cap.py | 259 +++++++++++++++++++++
+ tui_gateway/session_auto_continue.py       |   6 +-
+ tui_gateway/startup_resume.py              |   5 +-
+ tui_gateway/turn_marker.py                 |  28 +++
+ tui_gateway/update_pause.py                |  87 ++++++-
+ 6 files changed, 378 insertions(+), 12 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_cap.py
+
+diff --git a/tests/tui_gateway/test_update_pause.py b/tests/tui_gateway/test_update_pause.py
+index df5128130b9..9294d4baf5a 100644
+--- a/tests/tui_gateway/test_update_pause.py
++++ b/tests/tui_gateway/test_update_pause.py
+@@ -86,7 +86,7 @@ def test_resumable_turn_pauses_and_its_marker_survives_the_turn_end(home):
+ 
+ 
+ @pytest.mark.parametrize("case", ["resume_on_startup_off", "auto_continue_disabled", "bot_room", "opted_out",
+-                                  "attempts_used_up", "pauses_used_up", "stale", "no_marker"])
++                                  "attempts_used_up", "stale", "no_marker"])
+ def test_turn_that_cannot_be_auto_continued_is_untouched(home, monkeypatch, case):
+     cfg = {"desktop": {"auto_continue": dict(CFG["desktop"]["auto_continue"])}}
+     extra = {}
+@@ -99,8 +99,7 @@ def test_turn_that_cannot_be_auto_continued_is_untouched(home, monkeypatch, case
+         extra["source"] = "bot_room"
+     if case != "no_marker":
+         record_turn_start(home, "session-key", "the prompt", auto_continue=case != "opted_out",
+-                          attempts=2 if case == "attempts_used_up" else 0,
+-                          pauses=up.MAX_PAUSES if case == "pauses_used_up" else 0)
++                          attempts=2 if case == "attempts_used_up" else 0)
+     if case == "stale":
+         later = time.time() + 4 * 3600  # past the 240-min freshness window
+         monkeypatch.setattr(up, "_now", lambda: later)
+diff --git a/tests/tui_gateway/test_update_pause_cap.py b/tests/tui_gateway/test_update_pause_cap.py
+new file mode 100644
+index 00000000000..fc1bbdd8a29
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_cap.py
+@@ -0,0 +1,259 @@
++"""A spent pause budget must drain, not veto the checkpoint or loop between windows."""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tui_gateway import server, update_pause as up
++from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker, record_turn_start
++from tests.tui_gateway.test_update_pause import _session
++
++pytest_plugins = ["tests.tui_gateway.test_update_pause"]
++
++
++@pytest.fixture()
++def drainer(home):
++    import fcntl
++    path = home / "cache" / "core-update" / "drain.lock"
++    path.parent.mkdir(parents=True)
++    with path.open("a+") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        yield lock
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("pauses", [3, 8])
++def test_spent_budget_drains_next_window_without_restart_loop(turn_env, home, drainer, monkeypatch, pauses):
++    """A capped turn checkpoints and stays idle across failed windows.
++
++    Admission and ordering proof only; the separate real-drainer integration harness
++    exercises the window clock and apply callback.
++    """
++    skew: list = [None]
++    monkeypatch.setattr(up, "_detect_skew", lambda: skew[0])
++    calls = []
++    session = _session(profile_home=str(home), running=True,
++                       _auto_continue_pauses=pauses, _auto_continue_prompt="original work")
++
++    def run(message, **kwargs):
++        calls.append(message)
++        assert af.state(home)["reservations"] == 1
++        af.set_hold(home)
++        af.request_pause(home, expires_at=time.time() + 900)
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False,
++                "paused_for_update": session["agent"].step_boundary_pause()}
++
++    import types
++    session["agent"] = types.SimpleNamespace(session_id="session-key", run_conversation=run,
++                                             clear_interrupt=lambda: None)
++    server._run_prompt_submit("r", "sid", session, up.pause_note("original work"))
++    marker = read_turn_marker(home, "session-key")
++    assert marker and marker["reason"] == up.PAUSE_REASON
++    assert marker["pauses"] == pauses + 1 and marker["attempts"] == 0
++    assert af.state(home)["reservations"] == 0
++    assert session["running"] is False
++
++    # Another gate prevented the first apply. Expiration is NOT evidence of progress.
++    af.clear_pause_request(home)
++    af.clear_hold(home)
++    for _ in range(4):
++        assert up.in_place_resume_action(session, "session-key") == "wait"
++        assert server._maybe_schedule_auto_continue("sid", session, "session-key") is None
++    assert len(calls) == 1
++    parked = read_turn_marker(home, "session-key")
++    assert parked.pop("parked_at") >= marker.get("paused_at", 0) and parked == marker
++
++    # The next window sees the capped turn already idle; it cannot consume another window.
++    af.set_hold(home)
++    assert af.state(home) == {"version": 1, "held": True, "reservations": 0}
++    skew[0] = ("old", "new")  # updater applies after the admission proof
++    af.clear_hold(home)
++    assert up.in_place_resume_action(session, "session-key") == "leave"
++    assert read_turn_marker(home, "session-key")["prompt"] == "original work"
++
++
++@pytest.mark.platforms("posix")
++def test_spent_budget_recovers_when_drainer_exits(schedule_env, home, drainer, monkeypatch):
++    import fcntl
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    record_turn_start(home, "session-key", "original work", pauses=up.MAX_PAUSES)
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    session = _session(profile_home=str(home))
++    assert up.in_place_resume_action(session, "session-key") == "wait"
++    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is None
++    assert schedule_env == []
++    # flock is released on clean exit or process death; the leftover file is not a hold.
++    fcntl.flock(drainer, fcntl.LOCK_UN)
++    assert up.in_place_resume_action(session, "session-key") == "resume"
++    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is not None
++    assert len(schedule_env) == 1
++    assert session["_auto_continue_attempt"] == 0
++    assert "original work" in schedule_env[0][0]
++
++
++@pytest.mark.platforms("posix")
++def test_foreign_root_keeps_the_requesting_drainers_lock(home, tmp_path, monkeypatch):
++    import fcntl
++    import json
++    root = tmp_path / "other-install"
++    root.mkdir()
++    lock_path = home / "cache" / "core-update" / "drain.lock"
++    lock_path.parent.mkdir(parents=True)
++    session = _session(profile_home=str(root))
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    record_turn_start(root, "session-key", "original work", pauses=up.MAX_PAUSES)
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 120)
++    request = root / "core-update" / "pause-request"
++    body = json.loads(request.read_text())
++    body["drain_lock"] = str(lock_path)
++    request.write_text(json.dumps(body))
++    with lock_path.open("a+") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        assert up.boundary_pause_hook(session, "session-key")() == up.PAUSE_REASON
++        af.clear_pause_request(root)
++        af.clear_hold(root)
++        assert not (root / "cache" / "core-update" / "drain.lock").exists()
++        assert up.in_place_resume_action(session, "session-key") == "wait"
++        assert server._maybe_schedule_auto_continue("sid", session, "session-key") is None
++    assert up.in_place_resume_action(session, "session-key") == "resume"
++
++
++@pytest.mark.platforms("posix")
++def test_below_threshold_still_recovers_between_windows(home, drainer, monkeypatch):
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    record_turn_start(home, "session-key", "original work")
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    assert up.in_place_resume_action(_session(profile_home=str(home)), "session-key") == "resume"
++
++
++@pytest.mark.platforms("posix")
++def test_capped_retry_keeps_notice_hold_bounded(home, drainer, monkeypatch):
++    import types
++    from tests.tui_gateway.test_update_pause import _InlineThread
++    clock = [0.0]
++    observations = []
++    session = _session(profile_home=str(home), _kanban_pending=["queued owner notice"])
++    record_turn_start(home, "session-key", "original work", pauses=up.MAX_PAUSES)
++    mark_turn_paused(home, "session-key", up.PAUSE_REASON)
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    monkeypatch.setattr(up.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(up, "WATCH_MAX_S", up.HOLD_MAX_S + 60)
++    def tick(seconds):
++        clock[0] += seconds
++        if clock[0] > up.HOLD_MAX_S + 20:
++            observations.append(up.continuation_due(session))
++    monkeypatch.setattr(up, "time", types.SimpleNamespace(monotonic=lambda: clock[0], sleep=tick, time=time.time))
++    up.start_in_place_watcher("sid", session, "session-key")
++    assert observations and not any(observations)
++    assert session["_kanban_pending"] == ["queued owner notice"]
++    assert read_turn_marker(home, "session-key")["prompt"] == "original work"
++
++
++# ── Parking never outlives continuation eligibility (default 15-min freshness) ──────────────────────
++
++DEFAULT_FRESHNESS_CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True,
++                                                       "freshness_minutes": 15, "max_attempts": 2}}}
++_LONG_PARK_S = 25 * 60.0  # one failed window + gap + most of the next: longer than the freshness window
++
++
++@pytest.fixture()
++def wall(monkeypatch):
++    """One clock for wall time (markers, freshness) and monotonic time (watcher, stamp throttle)."""
++    import types
++    clock = [time.time(), 0.0]
++
++    def advance(seconds):
++        clock[0] += seconds
++        clock[1] += seconds
++
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    monkeypatch.setattr(up, "_now", lambda: clock[0])
++    monkeypatch.setattr(up, "_mono", lambda: clock[1])
++    monkeypatch.setattr(up, "time", types.SimpleNamespace(monotonic=lambda: clock[1], sleep=advance,
++                                                          time=lambda: clock[0]))
++    return types.SimpleNamespace(now=lambda: clock[0], advance=advance)
++
++
++def _capped_pause_under_drainer(home, monkeypatch):
++    monkeypatch.setattr(server, "_load_cfg", lambda: DEFAULT_FRESHNESS_CFG)
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    session = _session(profile_home=str(home))
++    record_turn_start(home, "session-key", "original work", pauses=up.MAX_PAUSES)
++    af.set_hold(home)
++    af.request_pause(home, expires_at=time.time() + 120)
++    assert up.boundary_pause_hook(session, "session-key")() == up.PAUSE_REASON  # age 0 + margin < 15 min
++    af.clear_pause_request(home)
++    af.clear_hold(home)  # the window expired without applying
++    return session
++
++
++@pytest.mark.platforms("posix")
++def test_long_park_then_drainer_exit_continues_in_place(schedule_env, home, drainer, wall, monkeypatch):
++    """(a) Parked past the freshness window, then the drainer exits: the watcher continues the turn."""
++    import fcntl
++    from tests.tui_gateway.test_update_pause import _InlineThread
++    session = _capped_pause_under_drainer(home, monkeypatch)
++    monkeypatch.setattr(up.threading, "Thread", _InlineThread)
++    parked_from = wall.now()
++    sleep = up.time.sleep
++
++    def tick(seconds):
++        sleep(seconds)
++        if wall.now() - parked_from >= _LONG_PARK_S and not drainer.closed:
++            assert read_turn_marker(home, "session-key")["reason"] == up.PAUSE_REASON
++            assert schedule_env == []  # parked the whole time, never restarted
++            fcntl.flock(drainer, fcntl.LOCK_UN)  # drainer gave up / hit its hard max
++            drainer.close()
++
++    up.time.sleep = tick
++    up.start_in_place_watcher("sid", session, "session-key")
++    assert drainer.closed, "watcher returned before the drainer exited"
++    (text, kwargs), = schedule_env
++    assert text == up.pause_note("original work")
++    assert kwargs["display_kind"] == "auto_continue"
++    assert session["_auto_continue_attempt"] == 0  # a pause, not a crash
++    assert read_turn_marker(home, "session-key") is not None  # the continuation owns it now
++
++
++@pytest.mark.platforms("posix")
++def test_long_park_then_update_applies_startup_sweep_resumes(home, drainer, wall, monkeypatch):
++    """(b) Parked past the freshness window, then the update applies: the next backend resumes it."""
++    import json
++    from tui_gateway import startup_resume as sr
++    session = _capped_pause_under_drainer(home, monkeypatch)
++    for _ in range(int(_LONG_PARK_S // up.WATCH_POLL_S)):  # the watcher's polls while parked
++        wall.advance(up.WATCH_POLL_S)
++        assert up.in_place_resume_action(session, "session-key") == "wait"
++    monkeypatch.setattr(up, "_detect_skew", lambda: ("old", "new"))  # the second window applied
++    assert up.in_place_resume_action(session, "session-key") == "leave"
++    path = home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries["session-key"]["writer_pid"] = 2 ** 22 - 3  # the pre-update backend has exited
++    entries["session-key"].pop("writer_start_time", None)
++    path.write_text(json.dumps(entries))
++    wall.advance(120.0)  # the new backend boots and runs its sweep
++    assert [r["session_key"] for r in sr.pending_resumes(home, DEFAULT_FRESHNESS_CFG)] == ["session-key"]
++    assert read_turn_marker(home, "session-key")["prompt"] == "original work"
++    # The freshness bound still applies once nothing keeps the turn parked.
++    wall.advance(15 * 60.0)
++    assert sr.pending_resumes(home, DEFAULT_FRESHNESS_CFG) == []
++
++
++@pytest.mark.platforms("posix")
++def test_wall_clock_jump_while_parked_still_continues(schedule_env, home, drainer, monkeypatch):
++    """A laptop asleep while parked: wall time jumps past the freshness window between two polls,
++    and the drainer is gone at wake. The turn still continues (review probe, round 1)."""
++    import fcntl
++    session = _capped_pause_under_drainer(home, monkeypatch)
++    assert up.in_place_resume_action(session, "session-key") == "wait"
++    later = time.time() + 16 * 60
++    monkeypatch.setattr(time, "time", lambda: later)
++    monkeypatch.setattr(up, "_now", lambda: later)
++    fcntl.flock(drainer, fcntl.LOCK_UN)
++    assert up.in_place_resume_action(session, "session-key") == "resume"
++    assert server._maybe_schedule_auto_continue("sid", session, "session-key") is not None
++    (text, _), = schedule_env
++    assert text == up.pause_note("original work")
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index ed0543d86b0..2a924e0e034 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -167,8 +167,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+                     "marker is ownership evidence and the owner clears it", session_key,
+                     marker.get("writer_pid"), os.getpid())
+         return None
++    from tui_gateway.update_pause import drain_retry_pending
++    from tui_gateway.turn_marker import freshness_since
++    if drain_retry_pending(session, marker):
++        return None
+     enabled, freshness_secs, max_attempts = _auto_continue_config()
+-    age = time.time() - marker["started_at"]
++    age = time.time() - freshness_since(marker)
+     # [daveey] A background-job receipt is a delivery, not a turn to redo: it keeps longer than a turn.
+     from tui_gateway.exit_job_receipts import JOBS_REASON, JOBS_RECEIPT_MAX_AGE_S, jobs_stopped_note
+     receipt = marker.get("reason") == JOBS_REASON
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index 9633d5ba181..528bd275d27 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -27,6 +27,7 @@ from tui_gateway.turn_marker import (
+     UPDATE_HOLD_QUEUE_REASON,
+     _load,
+     _marker_path,
++    freshness_since,
+     marker_writer_state,
+     read_turn_marker,
+ )
+@@ -87,7 +88,7 @@ def _skip_reason(m: dict | None, now: float, fresh: float, max_attempts: int) ->
+         return "unreadable or empty prompt"
+     if not m.get("auto_continue", True):
+         return "auto_continue off (a tool already ran in an at-most-once turn, or its owner recovers it)"
+-    if now - m["started_at"] > _max_age(m, fresh):
++    if now - freshness_since(m) > _max_age(m, fresh):
+         return f"older than the {_max_age(m, fresh) / 60:.0f} min freshness window"
+     if m["attempts"] >= max_attempts:
+         return f"attempt cap reached ({m['attempts']}/{max_attempts})"
+@@ -146,7 +147,7 @@ def _paused_markers_remain(home: Path, cfg: dict | None) -> bool:
+     _, fresh, max_attempts, _ = _settings(cfg)
+     now = time.time()
+     return any(entry.get("reason") in _RETRY_REASONS and entry.get("auto_continue", True)
+-               and now - float(entry.get("started_at") or 0) <= _max_age(entry, fresh)
++               and now - freshness_since(entry) <= _max_age(entry, fresh)
+                and int(entry.get("attempts") or 0) < max_attempts
+                for _, h in _homes(home) for key in _load(_marker_path(h))
+                if (entry := read_turn_marker(h, key)) is not None)
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 5204257396e..c7e55ce12df 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -44,6 +44,20 @@ def _started_at(entry: dict) -> float:
+     return float(entry.get("started_at") or 0)
+ 
+ 
++def freshness_since(marker: dict) -> float:
++    """[daveey] When a marker's auto-continue freshness clock starts: ``started_at``, except a core-update
++    pause its live writer kept parked between drain windows (``mark_turn_parked``) counts from the last
++    time it was confirmed parked. Waiting on the drainer is not the turn going stale, and every reader of
++    freshness (in-place continue, startup sweep, notice hold) must agree or a parked turn is dropped."""
++    started = _started_at(marker)
++    if marker.get("reason") != "core_update_pause":
++        return started
++    try:
++        return max(started, float(marker.get("parked_at") or 0))
++    except (TypeError, ValueError):
++        return started
++
++
+ def _writer_identity() -> dict:
+     """Best-effort identity of the process writing this marker. ``writer_pid`` alone already answers "who wrote
+     this, and are they still alive?" (``marker_writer_state``); ``writer_start_time`` pairs the pid with its create
+@@ -192,6 +206,19 @@ def mark_turn_paused(home: Path | str, session_key: str, reason: str,
+     return False
+ 
+ 
++def mark_turn_parked(home: Path | str, session_key: str) -> bool:
++    """[daveey] Restamp ``parked_at`` on a core-update pause its live writer keeps idle between drain
++    windows (``update_pause.drain_retry_pending``). Reason, prompt and counters untouched."""
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not isinstance(entry, dict) or entry.get("reason") != "core_update_pause":
++            return None
++        entry["parked_at"] = time.time()
++        return entries
++
++    return bool(session_key) and _update(home, session_key, mutate, "park")
++
++
+ def record_killed_jobs(home: Path | str, session_key: str, killed_jobs: list) -> bool:
+     """[daveey] Replace an existing marker's ``killed_jobs`` (reason, prompt and counters untouched).
+     True when a marker existed and the write landed."""
+@@ -254,6 +281,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+                 # Writer identity when present: extra keys only, so a marker written by an older build still reads.
+                 **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
+                 **({"reason": str(entry["reason"])} if entry.get("reason") else {}),
++                **({"parked_at": float(entry["parked_at"])} if entry.get("parked_at") else {}),
+                 **({"until_tool": True} if entry.get("until_tool") else {}),
+                 **({"notification_category": "diagnostic"}
+                    if entry.get("notification_category") == "diagnostic" else {}),
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 4646a3fab42..af3d2b04a27 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -7,10 +7,13 @@ hold (``hermes_cli.admission_fence.pause_requested``). Each such turn then ends
+ (after its tool results are persisted, before the next model call; ``agent.turn_iteration_prep``), keeps
+ its interrupted-turn marker stamped ``reason: core_update_pause``, and releases its admission reservation,
+ so the update applies. The next backend's startup sweep continues the turn with ``pause_note`` and no
+-crash-resume attempt is used. Pauses are counted apart (``MAX_PAUSES`` per turn) so they cannot loop.
++crash-resume attempt is used. After ``MAX_PAUSES`` checkpoints, a failed window no longer restarts
++the turn while its drainer holds ``cache/core-update/drain.lock``: it stays idle for the next window.
++The threshold bounds no-progress continuations, never the checkpoint needed to let the update apply.
+ 
+ A turn the next backend would not auto-continue is never paused. A paused turn whose window ends without
+-an update (expired, apply refused) continues in place (``start_in_place_watcher``), so it never hangs.
++an update (expired, apply refused) continues in place (``start_in_place_watcher``), unless its pause
++budget is spent and the drainer still runs. Drainer exit/cancellation releases that wait automatically.
+ When the update did move the checkout, the turn is left for a successor only while one is coming: this
+ process's skew watchdog runs and its idle proof holds (or a retirement is already under way). A backend
+ kept busy by other work for ``NO_REPLACEMENT_S``, one no watchdog retires, or one that has not begun
+@@ -64,6 +67,8 @@ KICKOFF_HOLD_S = 120.0 + DUE_HOLD_S
+ # Automatic turns never wait for a paused turn longer than this past the window's end (a continuation that
+ # keeps failing to schedule, e.g. a live foreign marker writer, must not starve the chat's notices).
+ HOLD_MAX_S = LEAVE_GRACE_S + WATCH_POLL_S
++# A capped pause parked between drain windows restamps its freshness clock this often (``_keep_parked``).
++PARK_STAMP_S = 30.0
+ 
+ 
+ def _now() -> float:
+@@ -112,8 +117,6 @@ def not_resumable_reason(session: dict, marker_key: str) -> str | None:
+         return "turn opted out of auto-continue"
+     if marker["attempts"] >= max_attempts:
+         return "crash-resume attempts used up"
+-    if marker["pauses"] >= MAX_PAUSES:
+-        return f"already paused {marker['pauses']} times"
+     if _now() - marker["started_at"] + UPDATE_MARGIN_S > fresh_s:
+         return "turn older than the auto-continue freshness window"
+     return None
+@@ -191,6 +194,18 @@ def stop_owned_jobs_for_update_pause(jobs: list[dict], save: Callable[[], bool],
+     return True
+ 
+ 
++def _drainer_lock(session: dict) -> Path:
++    """The v1 request may come from a drainer serving several installation roots."""
++    import json
++    fallback = _root(session) / "cache" / "core-update" / "drain.lock"
++    try:
++        body = json.loads((_root(session) / "core-update" / "pause-request").read_text(encoding="utf-8-sig"))
++        path = Path(body.get("drain_lock") or fallback)
++        return path if path.is_absolute() else fallback
++    except (OSError, ValueError, TypeError, AttributeError):
++        return fallback
++
++
+ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | None]:
+     """The per-turn ``agent.step_boundary_pause``: one stat per step while no pause is requested."""
+     declined: list[str] = []
+@@ -225,8 +240,11 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+         except Exception:
+             logger.warning("core-update pause: background cleanup failed; refusing pause for %s", marker_key, exc_info=True)
+             return None
++        drainer_lock = _drainer_lock(session)  # request disappears when the window ends
+         with session["history_lock"]:
+             session["_update_pause_marker_key"] = marker_key
++            session["_update_pause_drainer_lock"] = drainer_lock
++            session.pop("_update_pause_parked_stamp", None)  # a new pause starts unparked
+         logger.info("core-update pause: session %s paused at a step boundary for a Hermes update", marker_key)
+         return PAUSE_REASON
+ 
+@@ -280,6 +298,34 @@ def _detect_skew():
+     return detect_code_skew()
+ 
+ 
++def drain_retry_pending(session: dict, marker: dict) -> bool:
++    """A capped pause stays idle between windows of its live drainer, not in a pause/continue loop.
++
++    Only the original writer defers here: a replacement must recover its dead writer's marker.
++    The flock (not file existence or a PID) releases on cancellation/crash. Code skew also
++    releases this gate so the existing updated-backend handoff/recovery bounds still apply.
++    """
++    import os
++    if (marker.get("reason") != PAUSE_REASON or marker.get("pauses", 0) < MAX_PAUSES
++            or marker.get("writer_pid") != os.getpid() or _detect_skew() is not None):
++        return False
++    if os.name != "posix":
++        return False  # hermes-sync's POSIX drain protocol is not present
++    import fcntl
++    try:
++        path = session.get("_update_pause_drainer_lock") or _root(session) / "cache" / "core-update" / "drain.lock"
++        with Path(path).open("rb") as lock:
++            try:
++                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except BlockingIOError:
++                return True
++    except FileNotFoundError:
++        return False
++    except OSError:
++        return True  # unreadable lock is not evidence that the drainer exited
++    return False
++
++
+ def in_place_resume_action(session: dict, marker_key: str, *, skew: Callable[[], Any] | None = None) -> str:
+     """What a paused turn's own backend does now: ``wait`` (the window is still up), ``carried`` (the window
+     is over but a synthesized turn runs over the pause: wait for it), ``leave`` (the checkout moved: the next
+@@ -309,10 +355,36 @@ def in_place_resume_action(session: dict, marker_key: str, *, skew: Callable[[],
+     if not marker or marker.get("reason") != PAUSE_REASON:
+         return "done"
+     if (skew or _detect_skew)() is not None:
++        _keep_parked(session, marker_key, last=True)
+         return "leave"
++    if drain_retry_pending(session, marker):
++        _keep_parked(session, marker_key)
++        return "wait"
++    _keep_parked(session, marker_key, last=True)
+     return "resume"
+ 
+ 
++def _keep_parked(session: dict, marker_key: str, *, last: bool = False) -> None:
++    """Restamp the parked marker's freshness clock (``turn_marker.freshness_since``) while this writer
++    keeps a capped pause idle between drain windows: it may wait out several windows (up to the
++    drainer's lifetime), and an age measured from ``started_at`` would then drop it as stale at the
++    in-place continue or the next backend's startup sweep. Throttled to ``PARK_STAMP_S`` of wall time;
++    ``last`` stamps once more as parking ends (drainer exit, checkout moved) so a wall-clock jump while
++    parked (a sleeping laptop) cannot age it out at that edge. Afterwards the usual window applies."""
++    from tui_gateway.turn_marker import mark_turn_parked
++    with session["history_lock"]:
++        prev = session.get("_update_pause_parked_stamp")
++        if last:
++            if prev is None:
++                return  # never parked: a plain pause keeps its started_at clock
++            session.pop("_update_pause_parked_stamp", None)
++        elif prev is not None and 0 <= _now() - prev < PARK_STAMP_S:
++            return
++        else:
++            session["_update_pause_parked_stamp"] = _now()
++    mark_turn_parked(_home(session), marker_key)
++
++
+ def replacement_outlook() -> str:
+     """Whether a successor backend is on its way for a skewed process: ``coming`` (a retirement is
+     preparing/committed, or the skew watchdog runs and the idle proof it retires through holds),
+@@ -354,7 +426,7 @@ def continuation_due(session: dict) -> bool:
+ 
+ def _durable_continuation_due(session: dict) -> bool:
+     from tui_gateway import server
+-    from tui_gateway.turn_marker import marker_writer_state, read_turn_marker
++    from tui_gateway.turn_marker import freshness_since, marker_writer_state, read_turn_marker
+     key = str(session.get("session_key") or "")
+     marker = read_turn_marker(_home(session), key)
+     if not marker or marker.get("reason") != PAUSE_REASON or not marker.get("auto_continue", True):
+@@ -365,7 +437,7 @@ def _durable_continuation_due(session: dict) -> bool:
+     # indefinitely starve automatic delivery when the startup reader skips them.
+     with server._session_profile_runtime_scope(session):
+         enabled, freshness, attempts = server._auto_continue_config()
+-    if not (enabled and _now() - marker["started_at"] <= freshness and marker["attempts"] < attempts):
++    if not (enabled and _now() - freshness_since(marker) <= freshness and marker["attempts"] < attempts):
+         return False
+     # Same cap as the in-place hold (HOLD_MAX_S): a continuation this backend keeps failing to admit
+     # (a live foreign owner, a startup sweep that gave up) must not refuse the chat's notices for the
+@@ -442,6 +514,9 @@ def start_in_place_watcher(sid: str, session: dict, marker_key: str) -> threadin
+                     _release_automatic_turns(session, watching=True)
+                 try:
+                     action = in_place_resume_action(session, marker_key)
++                    if action == "wait" and over_at is None and _window_over(session):
++                        # A capped pause may wait across windows, but notices still keep their bounded hold.
++                        over_at = time.monotonic()
+                     if action in ("leave", "resume", "carried"):
+                         if over_at is None:
+                             over_at = time.monotonic()
+-- 
+2.55.0
+

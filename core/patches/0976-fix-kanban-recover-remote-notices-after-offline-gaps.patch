@@ -1,0 +1,540 @@
+From cc6ccb397052446059724a9d03deccb73225bf7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:43:58 -0700
+Subject: [PATCH] fix(kanban): recover remote notices after offline gaps
+ [daveey] (#214)
+
+Owner timestamps reject notices arriving more than six hours late, and replica updated_at is server time. Persist a host baseline and immutable first-seen terminal times shared by both consumers. Seed all terminal history only from a complete synchronized snapshot; never give frozen legacy keys a local freshness window. Cache unchanged snapshots to avoid per-chat ledger transactions.
+---
+ .../tui_gateway/test_kanban_remote_arrival.py | 135 ++++++++++++++++++
+ .../test_kanban_remote_bootstrap.py           |  65 +++++++++
+ .../test_kanban_remote_observations.py        |  56 ++++++++
+ tui_gateway/kanban_remote_notices.py          |  44 ++++--
+ tui_gateway/kanban_remote_observations.py     | 116 +++++++++++++++
+ 5 files changed, 402 insertions(+), 14 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_arrival.py
+ create mode 100644 tests/tui_gateway/test_kanban_remote_bootstrap.py
+ create mode 100644 tests/tui_gateway/test_kanban_remote_observations.py
+ create mode 100644 tui_gateway/kanban_remote_observations.py
+
+diff --git a/tests/tui_gateway/test_kanban_remote_arrival.py b/tests/tui_gateway/test_kanban_remote_arrival.py
+new file mode 100644
+index 00000000000..5b780df9e69
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_arrival.py
+@@ -0,0 +1,135 @@
++"""Offline catch-up is new evidence, but a fresh host's retained history is not."""
++import contextlib
++import json
++import sqlite3
++
++import pytest
++
++from hermes_state import SessionDB
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, OTHER, _card, _hub as _base_hub
++from tui_gateway import kanban_remote_notices as krn
++
++
++def _hub(tmp_path, cards):
++    path = _base_hub(tmp_path, cards)
++    with sqlite3.connect(path) as conn:
++        conn.executemany("INSERT INTO meta VALUES (?,?)", [("cursor", "100"), ("head", "100")])
++    return path
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++@pytest.mark.parametrize("status", ["done", "blocked"])
++def test_offline_arrival_once_after_baseline(tmp_path, door, status):
++    terminal = 1_800_000_000.0
++    clock = [terminal - 60]
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield db, sid
++
++        def poll():
++            if door == "collect":
++                got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=clock[0])
++                for claim in got:
++                    key = claim["event_key"]
++                    db.append_kanban_notice(CHAT, claim["text"], {"notice_id": key, "kanban_event_keys": [key]})
++                    assert krn.ack(claim, ledger=ledger)
++                return got
++            return krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                            ledger=ledger, now=clock[0])
++
++        assert poll() == []  # host was already observing before going offline
++        clock[0] = terminal + 8 * 3600
++        card = _card("t_arrived", CHAT, status=status, at=terminal)
++        with sqlite3.connect(replica) as conn:
++            conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)",
++                         (card["key"], json.dumps(card["task"])))
++        krn._reset_for_tests()  # a new backend after the offline interval
++        assert len(poll()) == 1
++        krn._reset_for_tests()
++        assert poll() == []
++        other_door = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=clock[0])
++        assert other_door == []
++        assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                        ledger=ledger, now=clock[0]) == []
++        assert len(db.get_messages(CHAT)) == 1
++
++
++@pytest.mark.parametrize("door", ["collect", "sweep"])
++def test_bootstrap_history_stays_silent_across_chats_and_restart(tmp_path, door):
++    now = 1_800_000_000.0
++    cards = [_card("t_history", OTHER, status="done", at=now - 8 * 3600)]
++    replica = _hub(tmp_path, cards)
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(OTHER, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield db, sid
++
++        if door == "collect":
++            assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++        else:
++            assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                            ledger=ledger, now=now, live_ids={OTHER}) == []
++        krn._reset_for_tests()
++        assert krn.collect(OTHER, "default", hub_db=replica, ledger=ledger, now=now + 60) == []
++        assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                        ledger=ledger, now=now + 60) == []
++        assert db.get_messages(OTHER) == []
++
++
++def test_release_and_replica_rewrite_do_not_extend_arrival_window(tmp_path):
++    now = 1_800_000_000.0
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    card = _card("t_retry", CHAT, status="done", at=now - 8 * 3600)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)", (card["key"], json.dumps(card["task"])))
++    got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    assert len(got) == 1
++    assert krn.release(got[0], ledger=ledger)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE replica SET seq=2")
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.FRESH_S + 1) == []
++
++
++def test_late_legacy_and_superseded_rows_do_not_get_local_freshness(tmp_path):
++    now = 1_800_000_000.0
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    old = _card("t_legacy", CHAT, status="blocked", at=now - 61 * 3600)
++    new = _card("t_legacy", CHAT, status="running", at=now)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)",
++                     ("default/t_legacy", json.dumps(old["task"])))
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,2)", (new["key"], json.dumps(new["task"])))
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++
++
++def test_completion_notice_fallback_catches_up_after_baseline(tmp_path):
++    now = 1_800_000_000.0
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    card = _card("t_fallback", CHAT, status="done", at=now - 8 * 3600)
++    del card["task"]["completed_at"]
++    card["task"]["completion_notice"]["created_at"] = now - 8 * 3600
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)", (card["key"], json.dumps(card["task"])))
++    assert len(krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)) == 1
+diff --git a/tests/tui_gateway/test_kanban_remote_bootstrap.py b/tests/tui_gateway/test_kanban_remote_bootstrap.py
+new file mode 100644
+index 00000000000..b2d6a739d33
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_bootstrap.py
+@@ -0,0 +1,65 @@
++"""Bootstrap completeness and shared observations do not replay retained history."""
++import contextlib
++import json
++import sqlite3
++
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_arrival import CHAT, _card, _hub
++from tui_gateway import kanban_remote_notices as krn
++
++
++@contextlib.contextmanager
++def _missing(profile, sid):
++    yield None, None
++
++
++@pytest.mark.parametrize("readiness", ["partial", "missing", "no_gateway"])
++def test_partial_first_sync_cannot_seed_baseline(tmp_path, readiness):
++    now = 1_800_000_000.0
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    with sqlite3.connect(replica) as conn:
++        if readiness == "partial":
++            conn.execute("UPDATE meta SET v='0' WHERE k='cursor'")
++        elif readiness == "missing":
++            conn.execute("DELETE FROM meta WHERE k IN ('cursor','head')")
++        else:
++            conn.execute("UPDATE meta SET v='' WHERE k='gateway'")
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=_missing,
++                                    ledger=ledger, now=now) == []
++    old = _card("t_late_history", CHAT, status="blocked", at=now - 5 * 86400)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)", (old["key"], json.dumps(old["task"])))
++        conn.execute("DELETE FROM meta")
++        conn.executemany("INSERT INTO meta VALUES (?,?)", [("gateway", "macbook"), ("cursor", "100"), ("head", "100")])
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + 30) == []
++
++
++def test_sweep_seeds_done_history_without_completion_evidence(tmp_path):
++    now = 1_800_000_000.0
++    card = _card("t_history_without_notice", CHAT, status="done", at=now - 5 * 86400)
++    del card["task"]["completion_notice"]
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=_missing,
++                                    ledger=ledger, now=now) == []
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + 30) == []
++
++
++def test_new_chat_link_does_not_refresh_history(tmp_path):
++    now = 1_800_000_000.0
++    card = _card("t_unlinked_history", CHAT, status="done", at=now - 5 * 86400)
++    links = card["task"].pop("sessions")
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    card["task"]["sessions"] = links
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE replica SET data=?,seq=2", (json.dumps(card["task"]),))
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + 30) == []
+diff --git a/tests/tui_gateway/test_kanban_remote_observations.py b/tests/tui_gateway/test_kanban_remote_observations.py
+new file mode 100644
+index 00000000000..bf667ee70f4
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_observations.py
+@@ -0,0 +1,56 @@
++"""Catch-up must defer partial feeds; unchanged polls must not repeat observation work."""
++import json
++import sqlite3
++
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_arrival import CHAT, _card, _hub
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import kanban_remote_observations as obs
++
++
++def test_partial_catchup_on_established_host_is_deferred_not_settled(tmp_path):
++    now = 1_800_000_000.0
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now - 8 * 3600) == []
++    card = _card("t_partial_arrival", CHAT, status="done", at=now - 8 * 3600)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE meta SET v='101' WHERE k='head'")
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,101)", (card["key"], json.dumps(card["task"])))
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE meta SET v='101' WHERE k='cursor'")
++    assert len(krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + 1)) == 1
++
++
++def test_unchanged_snapshot_avoids_decode_and_ledger_work(tmp_path, monkeypatch):
++    now = 1_800_000_000.0
++    card = _card("t_cached", CHAT, status="done", at=now)
++    replica = _hub(tmp_path, [card])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    first = obs.observe(replica, ledger, now)
++
++    def forbidden(*args, **kwargs):
++        pytest.fail("unchanged snapshot decoded rows or opened the observation ledger")
++
++    monkeypatch.setattr(krn, "_task_rows", forbidden)
++    monkeypatch.setattr(obs, "_persist", forbidden)
++    assert obs.observe(replica, ledger, now + krn.FRESH_S + 1) == first
++
++
++def test_cached_first_seen_still_ages_out(tmp_path):
++    now = 1_800_000_000.0
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now) == []
++    card = _card("t_expiring", CHAT, status="done", at=now - 8 * 3600)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,1)", (card["key"], json.dumps(card["task"])))
++    first = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++    assert len(first) == 1
++    assert krn.release(first[0], ledger=ledger)
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.FRESH_S + 1) == []
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index c346035e382..7620e0fc27d 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -13,8 +13,10 @@ one notice per terminal state (done, blocked), claimed in a small SQLite ledger
+ across every backend on this host. A claim is in flight (holder pid + process start, the same probe the local
+ tui path uses) until the notice is in the chat transcript; only then is the row ``delivered``. A holder that
+ died first is re-offered, unless that key is already in the transcript. A refused turn releases its claim
+-(``release``) so the owner of the chat re-claims it. Only states that became terminal within ``FRESH_S`` are
+-announced; older ones are recorded silently, so a first run never floods a chat with history. A legacy
++(``release``) so the owner of the chat re-claims it. Freshness is the later of the owner's terminal time
++and this host's durable first observation of that terminal state. The initial replica snapshot seeds old
++states silently (and frozen legacy keys never get a local window), so a fresh host never floods history.
++A legacy
+ ``delivered=1`` row from before this (claimed before the write) inside ``FRESH_S`` whose notice is in no
+ transcript of the chat is re-offered once.
+ 
+@@ -360,6 +362,8 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+     try:
+         with _lock:
+             me, index = _index(path)
++        from tui_gateway.kanban_remote_observations import observe
++        fresh_times = observe(path, ledger, now)
+         cards = []
+         for sid in (session_key, *lineage):
+             cards.extend(dict(c, sid=sid) for c in index.get((profile, sid), ()))
+@@ -380,8 +384,10 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                 state = f"{task['status']}@{int(at) if at else 0}"
+                 if (ref, state) in offered:
+                     continue
+-                at_fresh = _fresh_at(task)  # same bound as the sweep
++                at_fresh = fresh_times.get((card["gw"], card["key"], state), _fresh_at(task))
+                 fresh = at_fresh is not None and now - at_fresh <= FRESH_S
++                if not fresh and (card["gw"], card["key"], state) not in fresh_times:
++                    continue  # partial sync: don't permanently settle a not-yet-observed arrival
+                 if fresh and skip is not None and conn.execute(
+                         "SELECT 1 FROM notices WHERE session=? AND ref=? AND state=?",
+                         (session_key, ref, state)).fetchone() is None and skip(str(task["id"])):
+@@ -508,7 +514,10 @@ def _record_swept(keys: list[tuple], ledger: Optional[Path]) -> None:
+ 
+ def _reset_for_tests() -> None:
+     """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
++    from tui_gateway.kanban_remote_observations import _memo
++
+     global _index_memo
++    _memo.clear()
+     _index_memo = None
+     _delivered.clear()
+     _swept_loaded.clear()
+@@ -563,9 +572,8 @@ def _sweep_payload(owner: str, key: str, task: dict, me: str, profile: str, sid:
+     return event_key, metadata, format_notice(owner, key, task)
+ 
+ 
+-def _sweep_cards(rows: list[tuple], me: str, now: float, counts: dict):
+-    """``(owner, key, task, links)`` for canonical, freshly terminal cards linked to chats on ``me``. Linked
+-    terminal cards older than ``FRESH_S`` (or of unknown age) are counted in ``counts['stale']``."""
++def _sweep_cards(rows: list[tuple], me: str):
++    """Canonical terminal cards linked here, before freshness or open-chat filtering."""
+     for owner, key, _seq, raw in rows:
+         try:
+             task = json.loads(raw)
+@@ -579,10 +587,6 @@ def _sweep_cards(rows: list[tuple], me: str, now: float, counts: dict):
+                  and link.get("rel") == "shepherd" and link.get("gw") == me]
+         if not links:
+             continue
+-        at = _fresh_at(task)
+-        if at is None or now - at > FRESH_S:
+-            counts["stale"] = counts.get("stale", 0) + 1
+-            continue
+         yield owner, key, task, links
+ 
+ 
+@@ -610,10 +614,15 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+         logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
+ 
+ 
+-def _deliver_fresh(rows, me, now, path, live, session_db, ledger, settled, delivered, swept, counts) -> None:
+-    for owner, key, task, links in _sweep_cards(rows, me, now, counts):
++def _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept,
++                   counts) -> None:
++    for owner, key, task, links in cards:
+         at = _terminal_at(task)
+         ref, state = f"{owner}/{key}", f"{task['status']}@{int(at) if at else 0}"
++        observed_at = fresh_times.get((owner, key, state), _fresh_at(task))
++        if observed_at is None or now - observed_at > FRESH_S:
++            counts["stale"] = counts.get("stale", 0) + 1
++            continue
+         for link in links:
+             _deliver_link(owner, key, task, link, me=me, ref=ref, state=state, path=path, live=live,
+                           session_db=session_db, ledger=ledger, settled=settled,
+@@ -628,7 +637,7 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+     with ``collect``, so running both yields one transcript row.
+ 
+     [daveey] Same guards as ``collect``: one canonical replica row per card (a frozen legacy-key row is never
+-    read), only states that became terminal within ``FRESH_S``, and nothing the ledger already settled.
++    read), only states fresh by owner time or durable local arrival, and nothing the ledger already settled.
+     A successful append is also recorded in the ledger's ``swept`` table, so a restart does not reopen
+     state.db for a notice this process already persisted. Without the guards a rollout that changed the
+     blocked notice key replayed 293 ``blocked`` notices from days earlier, of cards long done, into idle
+@@ -650,6 +659,13 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+     except sqlite3.Error:
+         logger.debug("remote Kanban replica unavailable", exc_info=True)
+         return []
++    from tui_gateway.kanban_remote_observations import observe
++    cards = list(_sweep_cards(rows, me))
++    try:
++        fresh_times = observe(Path(path), ledger, now)
++    except (OSError, sqlite3.Error):
++        logger.debug("remote kanban observation failed; defer notices", exc_info=True)
++        return []
+     _load_swept(ledger)
+     delivered: list[dict] = []
+     swept: list = []
+@@ -667,7 +683,7 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+                         ledger_conn.append(None)
+                 return _ledger_settled(ledger_conn[0], sessions, ref, state)
+ 
+-            _deliver_fresh(rows, me, now, path, live, session_db, ledger, settled, delivered, swept, counts)
++            _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept, counts)
+         stale = counts.get("stale", 0)
+         if stale and stale != _last_stale.get(str(path)):
+             _last_stale[str(path)] = stale
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+new file mode 100644
+index 00000000000..1634b05879c
+--- /dev/null
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -0,0 +1,116 @@
++"""Durable local arrival times, separate from notice claims and owner clocks."""
++from __future__ import annotations
++
++import contextlib
++import json
++import threading
++from pathlib import Path
++
++_lock = threading.Lock()
++_memo: dict[tuple, tuple] = {}
++
++
++def _snapshot(replica: Path, previous=None) -> tuple[bool, list[tuple] | None, tuple | None]:
++    """Read readiness and ALL canonical terminal states from the same SQLite snapshot.
++
++    The hub client sets gateway before pulling and commits each feed page. Until
++    cursor reaches head, an empty/partial replica must not establish a baseline.
++    Include unlinked cards and historical done cards without completion evidence:
++    linking a chat or switching between sweep and collect must not resurrect them.
++    """
++    from tui_gateway.kanban_remote_notices import _canonical, _ro, _task_rows, _TERMINAL
++
++    with contextlib.closing(_ro(replica)) as conn:
++        conn.execute("BEGIN")
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
++            return False, [], None
++        meta = dict(conn.execute("SELECT k,v FROM meta WHERE k IN ('gateway','cursor','head')"))
++        ready = False
++        with contextlib.suppress(TypeError, ValueError):
++            ready = bool(meta.get("gateway")) and int(str(meta.get("cursor"))) >= int(str(meta.get("head")))
++        if not ready:
++            return False, [], None
++        cols = {row[1] for row in conn.execute("PRAGMA table_info(replica)")}
++        signature = None
++        if "seq" in cols:
++            signature = (*sorted(meta.items()), *conn.execute(
++                "SELECT COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll='tasks'").fetchone())
++        if signature is not None and signature == previous:
++            return True, None, signature
++        cards = []
++        for owner, key, _seq, raw in _canonical(_task_rows(conn, meta.get("gateway"))):
++            with contextlib.suppress(TypeError, ValueError):
++                task = json.loads(raw)
++                if isinstance(task, dict) and task.get("status") in _TERMINAL:
++                    cards.append((owner, key, task))
++    return ready, cards, signature
++
++
++def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple, float | None]:
++    """Seed retained history once; later current-key states receive one local window."""
++    from tui_gateway.kanban_remote_notices import FRESH_S, _fresh_at, _ledger, _terminal_at
++
++    with contextlib.closing(_ledger(ledger)) as conn:
++        conn.execute("CREATE TABLE IF NOT EXISTS observation_sources (source TEXT PRIMARY KEY)")
++        conn.execute("CREATE TABLE IF NOT EXISTS observations (source TEXT, ref TEXT, state TEXT, "
++                     "first_seen REAL, PRIMARY KEY(source, ref, state))")
++        # Serialize baseline + snapshot: concurrent backends must agree which is first.
++        conn.execute("BEGIN IMMEDIATE")
++        try:
++            initial = conn.execute("SELECT 1 FROM observation_sources WHERE source=?", (source,)).fetchone() is None
++            if initial:
++                conn.execute("INSERT INTO observation_sources VALUES (?)", (source,))
++            fresh = {}
++            for owner, key, task in cards:
++                at = _fresh_at(task)
++                terminal = _terminal_at(task)
++                state = f"{task['status']}@{int(terminal) if terminal else 0}"
++                ref = f"{owner}/{key}"
++                # Unknown ages and frozen legacy keys cannot establish local freshness.
++                seen = now if at is not None and key.count('/') >= 2 and (not initial or now - at <= FRESH_S) else None
++                row = conn.execute("SELECT first_seen FROM observations WHERE source=? AND ref=? AND state=?",
++                                   (source, ref, state)).fetchone()
++                if row is None:
++                    conn.execute("INSERT INTO observations VALUES (?,?,?,?)", (source, ref, state, seen))
++                first = row[0] if row is not None else seen
++                fresh[(owner, key, state)] = max(at, first) if at is not None and first is not None else at
++            conn.commit()
++            return fresh
++        except BaseException:
++            conn.rollback()
++            raise
++
++
++def _file_id(path: Path) -> tuple | None:
++    try:
++        stat = path.stat()
++        return stat.st_dev, stat.st_ino
++    except FileNotFoundError:
++        return None
++
++
++def observe(replica: Path, ledger, now: float) -> dict[tuple, float | None]:
++    """Only changed replica snapshots decode cards and touch the observation ledger.
++
++    Cache timestamps, not freshness verdicts: a quiet replica must still age out.
++    Ledger replacement invalidates the cache; acknowledgements need not invalidate it.
++    """
++    from tui_gateway.kanban_remote_notices import ledger_path
++
++    ledger = Path(ledger) if ledger is not None else ledger_path()
++    key = (str(replica.resolve()), str(ledger.resolve()))
++    with _lock:
++        cached = _memo.get(key)
++        if cached is not None and cached[2] != _file_id(ledger):
++            cached = None
++        ready, cards, signature = _snapshot(replica, cached[0] if cached else None)
++        if not ready:
++            return {}
++        if cards is None and cached is not None:
++            return cached[1]
++        fresh = _persist(key[0], cards or [], ledger, now)
++        _memo[key] = (signature, fresh, _file_id(ledger))
++        while len(_memo) > 16:
++            _memo.pop(next(iter(_memo)))
++        return fresh
++
+-- 
+2.55.0
+

@@ -1,0 +1,248 @@
+From 905ced15fba41fe1266270715bc4de3378feb159 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:35:28 +0000
+Subject: [PATCH] fix(gateway): an agent adopting the gateway's bare session
+ row records its model_config [daveey]
+
+The gateway SessionStore creates a bare session row (model_config NULL) when a message
+arrives. admit_durable_turn_lease then saw the row, set _session_db_created=True and so
+skipped the agent's lazy create_session, which is the only writer of the agent's init
+model_config (model_routing, max_iterations, reasoning_config, max_tokens). Gateway
+(Slack) rows under `model.default: class:deep` therefore carried only gateway_runtime and
+_usage_anchor, and stored_route resumed them as a concrete pin after a restart.
+
+- SessionDB.seed_session_model_config fills only the keys a row lacks (existing keys,
+  including explicit nulls, win), atomically.
+- The lease calls it when it adopts a row this agent did not create.
+- model_tools._resolve_active_context_length uses class_context_length for a class
+  marker instead of probing the catalog with 'class:deep' (bogus warning + 256K fallback).
+
+Tests: tests/gateway/test_class_row_provenance.py drives the gateway turn path
+(TurnRunner._build_fresh_agent + run_conversation + _sync_session_model_from_agent) on a
+bare row and asserts model_config.model_routing == the allocation store; fails before,
+passes after. tests/tools/test_tool_search_context_provider.py covers the class gate.
+---
+ agent/turn_facade_lease.py                    | 19 ++++
+ hermes_state_sessions.py                      | 20 ++++
+ model_tools.py                                |  6 ++
+ tests/gateway/test_class_row_provenance.py    | 98 +++++++++++++++++++
+ .../test_tool_search_context_provider.py      | 16 +++
+ 5 files changed, 159 insertions(+)
+ create mode 100644 tests/gateway/test_class_row_provenance.py
+
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index 103cebe80b9..8924b5b8640 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -432,6 +432,20 @@ def _durable_session_exists(db, session_id: str) -> Optional[bool]:
+         return None
+ 
+ 
++def _seed_adopted_row_model_config(agent, db, session_id: str) -> None:
++    """Fill the init model_config keys an existing row lacks (never overwrites); best effort."""
++    if getattr(agent, "_persist_disabled", False):
++        return
++    seed = getattr(db, "seed_session_model_config", None)
++    row_config = getattr(agent, "_session_row_model_config", None)
++    if not callable(seed) or not callable(row_config):
++        return
++    try:
++        seed(session_id, row_config())
++    except Exception:
++        logger.warning("Could not record the agent's model_config on an adopted session row", exc_info=True)
++
++
+ def session_was_taken_over(agent, session_id: str) -> bool:
+     """The stand-down latch follows compression, but never a different profile or fork."""
+     taken = getattr(agent, "_taken_over_session_id", None)
+@@ -536,6 +550,11 @@ def admit_durable_turn_lease(
+             # Row proven to exist — suppress the redundant create attempt. A missing row leaves
+             # the flag alone: the flush heals a row deleted under a live agent (#123583). So does
+             # an unknown one: the create is an upsert that never overwrites an existing row.
++            if not getattr(agent, "_session_db_created", False):
++                # Another writer made the row (the gateway's bare SessionStore row), so the skipped
++                # create was this agent's only chance to record its init model_config: without it a
++                # class session's row lost ``model_routing`` and resumed as a concrete pin.
++                _seed_adopted_row_model_config(agent, db, agent.session_id)
+             agent._session_db_created = True
+         # Reload only a transcript that may exist: callers may seed a fresh id in memory before its
+         # row is written, and reloading an absent row would erase that seed. An unknown row still
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index 3d13fc381d6..ce1f92e12e4 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -834,6 +834,26 @@ class SessionSessionsMixin:
+             return
+         self._write_model_config_patch(session_id, patch)
+ 
++    def seed_session_model_config(self, session_id: str, defaults: dict[str, Any]) -> None:
++        """Add the ``defaults`` keys the row's model_config lacks, atomically; existing keys (including an
++        explicit ``None``) always win. For an agent adopting a row another writer created first (the
++        gateway's bare SessionStore row): the create upsert would have kept that writer's model_config
++        whole, so the agent's init config (``model_routing``, ``max_iterations``) never reached it."""
++        if not session_id or not isinstance(defaults, dict) or not defaults:
++            return
++
++        def _do(conn):
++            row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
++            if row is None:
++                return
++            config = _parse_model_config(row[0])
++            missing = {k: v for k, v in defaults.items() if k not in config}
++            if not missing:
++                return
++            config.update(missing)
++            conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (json.dumps(config), session_id))
++        self._execute_write(_do)
++
+     def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
+         """Read one key out of a session's model_config JSON (tolerant parse)."""
+         session = self.get_session(session_id) or {}
+diff --git a/model_tools.py b/model_tools.py
+index d87f665831b..1e23913a138 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -613,6 +613,12 @@ def _resolve_active_context_length() -> int:
+         model_id, model_cfg = _active_model_config()
+         if not model_id:
+             return 0
++        from agent.model_routing import is_class_selector
++        if is_class_selector(model_id):
++            # A class marker is not a catalog slug: probing it logs a bogus "could not determine context
++            # length" and gates tool search on the 256K fallback. Use the class's conservative window.
++            from gateway.run_class_routing import class_context_length
++            return int(class_context_length(model_id) or 0)
+         from agent.model_metadata import get_cached_context_length, get_model_context_length
+         # Honor explicit `model.context_length` in config.yaml — short-circuits the OpenRouter /models probe
+         # at get_model_context_length step 0, so non-OpenRouter providers don't pay the ~2-3s OpenRouter
+diff --git a/tests/gateway/test_class_row_provenance.py b/tests/gateway/test_class_row_provenance.py
+new file mode 100644
+index 00000000000..1883f1aa5ac
+--- /dev/null
++++ b/tests/gateway/test_class_row_provenance.py
+@@ -0,0 +1,98 @@
++"""A gateway session row created before the agent keeps the agent's class provenance.
++
++The gateway SessionStore writes a bare row (no model_config) when a message arrives. The agent's turn
++lease then sees that row and marks it created, so the agent's own lazy create (the only writer of its
++init model_config: model_routing, max_iterations, ...) never ran. The row then looked like a concrete
++pin to ``stored_route`` after a gateway restart.
++"""
++import json
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from run_agent import AIAgent
++from gateway.run_turn_runner import TurnRunner
++from gateway.turn_context import TurnContext
++from gateway.session import Platform, SessionSource
++from tests.gateway.test_pre_agent_fallback_notice import _runner_with_real_runtime_resolution
++from tests.agent import test_model_routing_agent
++from tests.tui_gateway import test_class_routing
++
++routing_home = test_model_routing_agent.routing_home
++streaming_route = test_model_routing_agent.streaming_route
++native_transport = test_class_routing.native_transport
++
++
++def _row_config(db, session_id):
++    return json.loads(db.get_session(session_id)["model_config"] or "{}")
++
++
++def test_gateway_bare_row_gets_class_provenance(routing_home, streaming_route, native_transport):
++    from hermes_state import SessionDB
++    from hermes_constants import get_hermes_home
++    from agent.model_routing_state import RoutingState
++    from gateway.run_class_routing import stored_route
++    from gateway.run_turn import GatewayTurnMixin
++
++    db = SessionDB()
++    runner = _runner_with_real_runtime_resolution()
++    runner._session_db = db
++    session_id, session_key = "gw-class-row", "test-session-key"
++    runner.session_store._entries = {session_key: SimpleNamespace(session_id=session_id)}
++    source = SessionSource(platform=Platform.SLACK, chat_id="c", user_id="u")
++    # The gateway SessionStore's bare row (gateway/session_recovery.py::_db_create_kwargs).
++    db.create_session(session_id=session_id, source="slack", user_id="u", session_key=session_key,
++                      chat_id="c", model_config=None)
++    ctx = TurnContext(
++        source=source, message="hi", history=[], session_id=session_id, session_key=session_key,
++        user_config=routing_home, AIAgent=AIAgent,
++        resolve_display_setting=lambda *_a: False, _run_still_current=lambda: True,
++        _hooks_ref=SimpleNamespace(loaded_hooks=False),
++    )
++    with patch("gateway.run._resolve_gateway_model", return_value="class:deep"), \
++            patch("gateway.run._get_channel_override", return_value=None), \
++            patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("legacy billing bypass")), \
++            patch("model_tools.get_tool_definitions", return_value=[]):
++        model, runtime = runner._resolve_session_agent_runtime(source=source, user_config=routing_home)
++        assert model == "class:deep"
++        agent = TurnRunner(runner, ctx)._build_fresh_agent(
++            {"model": model, "runtime": runtime}, "slack", "", 5, None, {}, True)
++        try:
++            assert agent.run_conversation("Say ok")["final_response"] == "ok"
++            # The post-turn gateway writer (gateway_runtime) must merge, not replace.
++            GatewayTurnMixin._sync_session_model_from_agent(
++                SimpleNamespace(_session_db=SimpleNamespace(_db=db)), session_id, agent)
++        finally:
++            agent.release_clients()
++
++    allocation = RoutingState(get_hermes_home() / "model-routing.sqlite3").peek(session_id, "deep")
++    assert allocation and allocation["requested_class"] == "deep"
++    config = _row_config(db, session_id)
++    assert config.get("model_routing") == allocation
++    assert config.get("max_iterations") == agent.max_iterations
++    assert config["gateway_runtime"]["provider"] == "anthropic"
++    # Gateway restart: the stored row resumes the class, not a concrete pin.
++    assert stored_route(runner, session_key) is not None
++    assert stored_route(runner, session_key)[0] == "class:deep"
++    db.close()
++
++
++def test_existing_row_keys_are_never_overwritten(routing_home, streaming_route, native_transport):
++    """Seeding only fills keys the row lacks: an earlier writer's value (an explicit pin's cleared
++    route, a gateway_runtime) wins over the agent's init config."""
++    from hermes_state import SessionDB
++
++    db = SessionDB()
++    db.create_session(session_id="gw-class-keep", source="slack", model_config={
++        "max_iterations": 7, "gateway_runtime": {"provider": "earlier"}})
++    with patch("model_tools.get_tool_definitions", return_value=[]):
++        agent = AIAgent(model="class:deep", provider="auto", session_id="gw-class-keep", session_db=db,
++                        skip_context_files=True, skip_memory=True, quiet_mode=True, max_iterations=5)
++        try:
++            agent.run_conversation("Say ok")
++        finally:
++            agent.release_clients()
++    config = _row_config(db, "gw-class-keep")
++    assert config["max_iterations"] == 7
++    assert config["gateway_runtime"] == {"provider": "earlier"}
++    assert config["model_routing"]["requested_class"] == "deep"
++    db.close()
+diff --git a/tests/tools/test_tool_search_context_provider.py b/tests/tools/test_tool_search_context_provider.py
+index 19b516ac02a..7f872ed52a3 100644
+--- a/tests/tools/test_tool_search_context_provider.py
++++ b/tests/tools/test_tool_search_context_provider.py
+@@ -117,3 +117,19 @@ class TestResolveActiveContextLengthProviderAware:
+ 
+         assert ctx == 150_000
+         assert captured["config_ctx"] == 150_000
++
++
++def test_class_default_uses_class_window_not_catalog_probe():
++    """``model.default: class:deep`` is a marker, not a slug: the gate must not run the catalog
++    resolver on it (that logged "Could not determine context length for model 'class:deep'")."""
++    import model_tools
++    from unittest.mock import MagicMock
++
++    probe = MagicMock(side_effect=AssertionError("catalog probe on a class marker"))
++    with patch("hermes_cli.config.load_config", return_value={"model": {"default": "class:deep"}}), \
++         patch("gateway.run_class_routing.class_context_length", return_value=200_000) as window, \
++         patch("agent.model_metadata.get_model_context_length", probe):
++        ctx = model_tools._resolve_active_context_length()
++    assert ctx == 200_000
++    assert window.call_args.args == ("class:deep",)
++    probe.assert_not_called()
+-- 
+2.55.0
+

@@ -1,0 +1,119 @@
+From e9df2cf147392f4afddab5e409d6762429380b3e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:12:00 -0700
+Subject: [PATCH] fix(api): a class request on a reused session serves its own
+ class, not the session's first [daveey]
+
+Implicit api-<hash> fingerprint sessions (and explicit X-Hermes-Session-Id
+continuations) restored the session row's first class selector, which beat the
+request body, so class:standard/deep turns ran on the class:fast route. An
+explicit class: request now supersedes a different persisted selection; the
+/model override and confirmed lock still win.
+---
+ gateway/platforms/api_server_class_routing.py | 17 ++++++
+ tests/gateway/test_api_class_session_reuse.py | 59 +++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+ create mode 100644 tests/gateway/test_api_class_session_reuse.py
+
+diff --git a/gateway/platforms/api_server_class_routing.py b/gateway/platforms/api_server_class_routing.py
+index 00f145a0a8e..33e4ae1bd08 100644
+--- a/gateway/platforms/api_server_class_routing.py
++++ b/gateway/platforms/api_server_class_routing.py
+@@ -42,12 +42,29 @@ def initial_runtime(adapter, *, default_model, requested_model,
+     return _resolve_runtime_agent_kwargs()
+ 
+ 
++def _class_request_supersedes(requested_model, session_selector):
++    """An explicit class request beats a session's standing selection of anything else.
++
++    Routing state is keyed per (session, class), but the persisted session row records
++    only the first selection. Without this, a reused session (an implicit fingerprint id
++    or an explicit X-Hermes-Session-Id) silently served every later ``class:<level>``
++    request on the first class's route. The session ``/model`` override and a confirmed
++    runtime lock still win; requests that name no class keep the persisted selection.
++    """
++    requested = (requested_model or "").strip()
++    return is_class_selector(requested) and bool(session_selector) and session_selector != requested
++
++
+ def prepare_runtime(adapter, session_id, session_model, confirmed_runtime_lock,
+                     requested_model, route, gateway_session_key):
+     from gateway.run import _resolve_gateway_model
+     from gateway.platforms.api_server import _ProviderAuthResolutionError
+     restored = restore_session_route(adapter, session_id, session_model, confirmed_runtime_lock)
++    if restored and _class_request_supersedes(requested_model, restored[0]):
++        restored = None
+     session_model = restored[0] if restored else session_model
++    if not confirmed_runtime_lock and _class_request_supersedes(requested_model, session_model):
++        session_model = None
+     model = _resolve_gateway_model()
+     try:
+         if restored and not adapter._session_model_override_for(gateway_session_key or session_id):
+diff --git a/tests/gateway/test_api_class_session_reuse.py b/tests/gateway/test_api_class_session_reuse.py
+new file mode 100644
+index 00000000000..56ed495c739
+--- /dev/null
++++ b/tests/gateway/test_api_class_session_reuse.py
+@@ -0,0 +1,59 @@
++"""A class request on a reused API session must serve its own class, never the
++class the session was first allocated for (implicit fingerprint ids and explicit
++X-Hermes-Session-Id continuation alike)."""
++from unittest.mock import patch
++
++import pytest
++
++from tests.gateway.test_api_class_routing import adapter, native_transport, routing_home
++
++
++@pytest.fixture
++def all_classes_stream(routing_home, tmp_path):
++    from hermes_cli.config import atomic_config_write
++    routing_home["model"] = {"context_length": 100000}
++    for routes in routing_home["model_routing"]["routes"].values():
++        for route in routes:
++            route["capabilities"]["streaming"] = True
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++
++
++async def _post_classes(adapter, headers):
++    from aiohttp import web
++    from aiohttp.test_utils import TestClient, TestServer
++    app = web.Application()
++    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
++    session_ids = []
++    with patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("paid default")), \
++            patch("model_tools.get_tool_definitions", return_value=[]):
++        async with TestClient(TestServer(app)) as client:
++            for level in ("fast", "standard", "deep"):
++                response = await client.post("/v1/chat/completions", headers=headers, json={
++                    "model": "class:" + level, "provider": "auto", "stream": False,
++                    "messages": [{"role": "user", "content": "Reply with exactly: ROUTE_OK"}]})
++                text = await response.text()
++                assert response.status == 200, text
++                session_ids.append(response.headers.get("X-Hermes-Session-Id"))
++    return session_ids
++
++
++def _served_models(native_transport):
++    return [body["model"] for _, _, body in native_transport]
++
++
++@pytest.mark.asyncio
++async def test_implicit_session_serves_each_requested_class(
++        adapter, routing_home, all_classes_stream, native_transport):
++    session_ids = await _post_classes(adapter, {})
++    assert len(set(session_ids)) == 1 and session_ids[0].startswith("api-")  # same derived session
++    assert _served_models(native_transport) == ["anthropic-fast", "anthropic-standard", "anthropic-deep"]
++
++
++@pytest.mark.asyncio
++async def test_explicit_session_header_serves_each_requested_class(
++        adapter, routing_home, all_classes_stream, native_transport):
++    adapter._api_key = "test-key"
++    session_ids = await _post_classes(adapter, {
++        "Authorization": "Bearer test-key", "X-Hermes-Session-Id": "explicit-class-session"})
++    assert session_ids == ["explicit-class-session"] * 3
++    assert _served_models(native_transport) == ["anthropic-fast", "anthropic-standard", "anthropic-deep"]
+-- 
+2.55.0
+

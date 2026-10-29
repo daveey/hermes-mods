@@ -1,0 +1,662 @@
+From bc67ee012ff6da73d262701d75ee7b02c91beb98 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:45:37 -0700
+Subject: [PATCH] fix(kanban): stale checks count only awake time, from the
+ run's own start [daveey]
+
+A Mac lid-close longer than an hour made the first dispatcher pass after wake
+SIGTERM every live host-local worker: release_stale_claims' heartbeat backstop
+(60 min), detect_stale_running and enforce_max_runtime all measured wall-clock
+time, so the sleep read as worker silence (44 kills since 10-22, 8 cards gave up).
+
+- hermes_cli/kanban_suspend_ledger.py: each dispatcher pass stamps kanban.db;
+  a gap over max(300, 3 x kanban.dispatch_interval_seconds) is recorded as a
+  suspend (pruned after 7 d). awake_seconds() subtracts recorded suspends.
+- _run_reclaim_phase records the pass before any stale check.
+- release_stale_claims / detect_stale_running measure heartbeat age in awake
+  time from max(last_heartbeat_at, active run started_at), so a fresh run is
+  never stale against its predecessor's heartbeat; enforce_max_runtime and the
+  stale sweep's elapsed use awake time too. Thresholds and TTLs unchanged.
+  An empty ledger (always-on hub) keeps the old wall-clock behaviour.
+
+Size caps: _extend_live_stale_claim and _defer_reclaim_for_live_worker move
+unchanged into hermes_cli/kanban_db_stale_claims.py (re-exported).
+---
+ hermes_cli/kanban_db.py                       |  51 ++--
+ hermes_cli/kanban_db_dispatch.py              |  48 +---
+ hermes_cli/kanban_db_stale_claims.py          |  76 ++++++
+ hermes_cli/kanban_suspend_ledger.py           | 124 ++++++++++
+ .../hermes_cli/test_kanban_suspend_ledger.py  | 226 ++++++++++++++++++
+ 5 files changed, 453 insertions(+), 72 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_stale_claims.py
+ create mode 100644 hermes_cli/kanban_suspend_ledger.py
+ create mode 100644 tests/hermes_cli/test_kanban_suspend_ledger.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8a97ecd862c..d2b6a98ca54 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2490,19 +2490,26 @@ def release_stale_claims(
+     now = int(time.time())
+     reclaimed = 0
+     host_prefix = _host_prefix()
++    from hermes_cli.kanban_suspend_ledger import awake_seconds  # [daveey]
+     stale = conn.execute(
+-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
+-        "       assignee "
+-        "FROM tasks "
+-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+-        "  AND claim_expires < ?", (now,),
++        "SELECT t.id, t.claim_lock, t.worker_pid, t.worker_started_at, t.claim_expires, "
++        "       t.last_heartbeat_at, t.assignee, r.started_at AS run_started_at "
++        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
++        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
++        "  AND t.claim_expires < ?", (now,),
+     ).fetchall()
+     for row in stale:
+         host_local = _claim_is_local(row["claim_lock"], host_prefix)
+         hb = _to_epoch(row["last_heartbeat_at"])
+         # Backstop: a heartbeat older than the max-stale threshold means no
+         # observable progress — reclaim even if the PID is alive (logic loop).
+-        heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
++        # [daveey] Measured from the newer of the heartbeat and the active run's start (a fresh run
++        # is never stale against its predecessor's heartbeat), counting awake time only: a host
++        # suspend recorded by the dispatcher (``kanban_suspend_ledger``) is not worker silence.
++        run_started = _to_epoch(_row_get(row, "run_started_at"))
++        hb_ref = max(hb, run_started) if hb is not None and run_started is not None else hb
++        hb_awake_age = awake_seconds(conn, hb_ref, now) if hb_ref is not None else None
++        heartbeat_stale = hb_awake_age is not None and hb_awake_age > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+         started_at = _row_get(row, "worker_started_at")
+         live = host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at) and not heartbeat_stale
+         lease_lost = _sync.lease_lost(conn, row["id"], now, _resolve_claim_ttl_seconds() if live else None)  # [daveey] asks the Board
+@@ -2544,6 +2551,7 @@ def release_stale_claims(
+                     "now": now,
+                     "host_local": host_local,
+                     "heartbeat_stale": bool(heartbeat_stale),
++                    "heartbeat_awake_age": _opt_int(hb_awake_age),  # [daveey]
+                     "retry_status": retry_status,
+                 },
+             )
+@@ -2581,36 +2589,6 @@ def _record_reclaim(
+     return run_id
+ 
+ 
+-def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
+-    """TTL-expired claim whose host-local worker is alive: extend instead of
+-    reclaiming (``claim_extended`` event). CAS on the same expired lock so a
+-    concurrent reclaimer wins cleanly."""
+-    new_expires = now + _resolve_claim_ttl_seconds()
+-    with write_txn(conn):
+-        cur = conn.execute(
+-            "UPDATE tasks SET claim_expires = ? "
+-            "WHERE id = ? AND status = 'running' "
+-            "  AND claim_lock IS ? "
+-            "  AND claim_expires IS NOT NULL "
+-            "  AND claim_expires < ?", (new_expires, row["id"], row["claim_lock"], now),
+-        )
+-        if cur.rowcount != 1:
+-            return
+-        run_id = _extend_run_claim(conn, row["id"], new_expires)
+-        _append_event(
+-            conn, row["id"], "claim_extended",
+-            {
+-                "reason": "pid_alive",
+-                "worker_pid": int(row["worker_pid"]),
+-                "claim_lock": row["claim_lock"],
+-                "claim_expires_was": _to_epoch(row["claim_expires"]),
+-                "claim_expires_now": new_expires,
+-                "last_heartbeat_at": _to_epoch(row["last_heartbeat_at"]),
+-            },
+-            run_id=run_id,
+-        )
+-
+-
+ def reclaim_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
+ ) -> bool:
+@@ -4721,6 +4699,7 @@ from hermes_cli.kanban_db_workspace import (
+     _managed_scratch_path_info,
+     _scratch_workspace,
+ )
++from hermes_cli.kanban_db_stale_claims import _extend_live_stale_claim
+ from hermes_cli.kanban_db_dispatch import (
+     DEFAULT_FAILURE_LIMIT,
+     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index c8aba1c80f9..857bbfe7a1c 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
+ 
+ from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+ from hermes_cli import kanban_db_dispatch_guard_notice as _guard_notice
++from hermes_cli.kanban_db_stale_claims import _defer_reclaim_for_live_worker
++from hermes_cli.kanban_suspend_ledger import awake_seconds as _awake_seconds, record_dispatch_pass as _record_dispatch_pass
+ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as _guard_hold_started_at
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
+ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code_kind
+@@ -732,39 +734,6 @@ def _worker_survived_termination(termination: dict) -> bool:
+     )
+ 
+ 
+-def _defer_reclaim_for_live_worker(
+-    conn: sqlite3.Connection,
+-    task_id: str,
+-    claim_lock: Optional[str],
+-    now: int,
+-    termination: dict,
+-    *,
+-    reason: str,
+-) -> None:
+-    """Hold a claim whose worker survived termination instead of releasing it.
+-
+-    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
+-    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
+-    The next tick retries the kill; not spawning a duplicate is what lets the
+-    throttled worker finally die.
+-    """
+-    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
+-    with _kb.write_txn(conn):
+-        cur = conn.execute(
+-            "UPDATE tasks SET claim_expires = ? "
+-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+-            (grace, task_id, claim_lock),
+-        )
+-        if cur.rowcount != 1:
+-            return
+-        run_id = _kb._current_run_id(conn, task_id)
+-        if run_id is not None:
+-            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
+-        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
+-        payload.update(termination)
+-        _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+-
+-
+ def heartbeat_worker(
+     conn: sqlite3.Connection,
+     task_id: str,
+@@ -834,7 +803,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
+             continue
+         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
+         # so retries must be measured from the active task_runs row.
+-        elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never kill
++        # [daveey] Awake time only: a host suspend (``kanban_suspend_ledger``) is not runtime.
++        elapsed = _awake_seconds(conn, _kb._to_epoch(row["active_started_at"]) or now, now)  # unreadable: never kill
+         limit = int(row["max_runtime_seconds"])
+         if elapsed < limit:
+             continue
+@@ -939,12 +909,15 @@ def detect_stale_running(
+     for row in rows:
+         if row["active_started_at"] is None:
+             continue
+-        elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never reclaim
++        # [daveey] Awake time only (``kanban_suspend_ledger``): a host suspend is neither runtime
++        # nor heartbeat silence, else the first pass after a long lid-close kills every live worker.
++        active_started = _kb._to_epoch(row["active_started_at"]) or now  # unreadable clock: never reclaim
++        elapsed = _awake_seconds(conn, active_started, now)
+         if elapsed < stale_timeout_seconds:
+             continue
+ 
+         last_hb = _kb._to_epoch(row["last_heartbeat_at"])
+-        hb_age = (now - last_hb) if last_hb is not None else None
++        hb_age = _awake_seconds(conn, max(last_hb, active_started), now) if last_hb is not None else None
+         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+             continue
+ 
+@@ -2483,6 +2456,9 @@ def _run_reclaim_phase(
+         result.remote_archived = apply_stop_requests(conn)
+     except Exception:
+         _kb._log.warning("kanban: applying remote stop requests failed", exc_info=True)
++    # [daveey] Before any stale check: a long gap since the last pass is a host suspend, which the
++    # heartbeat backstop, the stale sweep and max_runtime must not count (``kanban_suspend_ledger``).
++    _record_dispatch_pass(conn)
+     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+     if reconcile_orphans:
+         result.reconciled_orphans = reconcile_orphaned_running(conn)
+diff --git a/hermes_cli/kanban_db_stale_claims.py b/hermes_cli/kanban_db_stale_claims.py
+new file mode 100644
+index 00000000000..491cc241bee
+--- /dev/null
++++ b/hermes_cli/kanban_db_stale_claims.py
+@@ -0,0 +1,76 @@
++"""Stale-claim helpers shared by ``kanban_db.release_stale_claims`` and the dispatcher sweeps.
++
++Moved out of ``kanban_db`` / ``kanban_db_dispatch`` (file-size caps); both re-export them.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++
++def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
++    """TTL-expired claim whose host-local worker is alive: extend instead of
++    reclaiming (``claim_extended`` event). CAS on the same expired lock so a
++    concurrent reclaimer wins cleanly."""
++    from hermes_cli import kanban_db as _kb
++
++    new_expires = now + _kb._resolve_claim_ttl_seconds()
++    with _kb.write_txn(conn):
++        cur = conn.execute(
++            "UPDATE tasks SET claim_expires = ? "
++            "WHERE id = ? AND status = 'running' "
++            "  AND claim_lock IS ? "
++            "  AND claim_expires IS NOT NULL "
++            "  AND claim_expires < ?", (new_expires, row["id"], row["claim_lock"], now),
++        )
++        if cur.rowcount != 1:
++            return
++        run_id = _kb._extend_run_claim(conn, row["id"], new_expires)
++        _kb._append_event(
++            conn, row["id"], "claim_extended",
++            {
++                "reason": "pid_alive",
++                "worker_pid": int(row["worker_pid"]),
++                "claim_lock": row["claim_lock"],
++                "claim_expires_was": _kb._to_epoch(row["claim_expires"]),
++                "claim_expires_now": new_expires,
++                "last_heartbeat_at": _kb._to_epoch(row["last_heartbeat_at"]),
++            },
++            run_id=run_id,
++        )
++
++
++def _defer_reclaim_for_live_worker(
++    conn: sqlite3.Connection,
++    task_id: str,
++    claim_lock: Optional[str],
++    now: int,
++    termination: dict,
++    *,
++    reason: str,
++) -> None:
++    """Hold a claim whose worker survived termination instead of releasing it.
++
++    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
++    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
++    The next tick retries the kill; not spawning a duplicate is what lets the
++    throttled worker finally die.
++    """
++    from hermes_cli import kanban_db as _kb
++
++    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
++    with _kb.write_txn(conn):
++        cur = conn.execute(
++            "UPDATE tasks SET claim_expires = ? "
++            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
++            (grace, task_id, claim_lock),
++        )
++        if cur.rowcount != 1:
++            return
++        run_id = _kb._current_run_id(conn, task_id)
++        if run_id is not None:
++            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
++        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
++        payload.update(termination)
++        _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+diff --git a/hermes_cli/kanban_suspend_ledger.py b/hermes_cli/kanban_suspend_ledger.py
+new file mode 100644
+index 00000000000..bda16bcbc21
+--- /dev/null
++++ b/hermes_cli/kanban_suspend_ledger.py
+@@ -0,0 +1,124 @@
++"""Suspend ledger: which wall-clock spans this host's dispatcher spent asleep. [daveey]
++
++A Mac lid-close stops every process, so a worker sends no heartbeat while it sleeps. The stale
++checks that measure ``now - last_heartbeat_at`` (or ``now - started_at``) in wall-clock time then
++read a long sleep as a wedged worker and SIGTERM it on the first pass after wake.
++
++Each dispatcher pass calls :func:`record_dispatch_pass` before the reclaim sweeps. When the gap
++since the previous pass exceeds :func:`gap_threshold_seconds` (``max(300, 3 x
++kanban.dispatch_interval_seconds)``), the span ``[previous, now]`` is recorded as suspended. The
++checks then use :func:`awake_seconds`, which subtracts recorded spans from a wall-clock window.
++
++The ledger lives in ``kanban.db`` (two small tables created lazily here), so a gateway restart or a
++one-shot ``hermes kanban dispatch`` sees the same history. Spans that ended more than 7 days ago are
++pruned. A host that never sleeps (the hub) keeps an empty ledger, and :func:`awake_seconds` then
++equals the wall-clock difference. A missing table (no pass recorded yet) also reads as empty.
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from typing import Optional
++
++_log = logging.getLogger(__name__)
++
++MIN_GAP_SECONDS = 300
++GAP_INTERVAL_MULTIPLE = 3
++RETENTION_SECONDS = 7 * 86400
++DEFAULT_INTERVAL_SECONDS = 60
++
++_DDL = (
++    "CREATE TABLE IF NOT EXISTS kanban_suspend_ledger ("
++    " start INTEGER NOT NULL, end INTEGER NOT NULL)",
++    "CREATE TABLE IF NOT EXISTS kanban_dispatch_stamp ("
++    " id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL)",
++)
++
++
++def gap_threshold_seconds(interval_seconds: Optional[float] = None) -> int:
++    """A gap between passes longer than this counts as a suspend."""
++    interval = interval_seconds if interval_seconds is not None else _configured_interval_seconds()
++    try:
++        interval = float(interval)
++    except (TypeError, ValueError):
++        interval = DEFAULT_INTERVAL_SECONDS
++    return int(max(MIN_GAP_SECONDS, GAP_INTERVAL_MULTIPLE * max(interval, 0)))
++
++
++def _configured_interval_seconds() -> float:
++    try:
++        from hermes_cli.config import load_config_readonly
++        raw = ((load_config_readonly() or {}).get("kanban") or {}).get("dispatch_interval_seconds")
++        return float(raw or DEFAULT_INTERVAL_SECONDS)
++    except Exception:  # health: allow BLE001 -- an unreadable config must never stop a dispatch pass
++        _log.debug("kanban: reading kanban.dispatch_interval_seconds failed; using %ss",
++                   DEFAULT_INTERVAL_SECONDS, exc_info=True)
++        return DEFAULT_INTERVAL_SECONDS
++
++
++def record_dispatch_pass(
++    conn: sqlite3.Connection, *, now: Optional[int] = None, interval_seconds: Optional[float] = None,
++) -> Optional[tuple[int, int]]:
++    """Stamp this pass; record ``[previous, now]`` as suspended when the gap is over the threshold.
++
++    Returns the recorded span, else ``None``. Never raises: a failure leaves the checks on wall-clock
++    time, which is the pre-ledger behaviour.
++    """
++    from hermes_cli.kanban_db import write_txn
++
++    now = int(time.time()) if now is None else int(now)
++    threshold = gap_threshold_seconds(interval_seconds)
++    recorded = None
++    try:
++        with write_txn(conn):
++            for ddl in _DDL:
++                conn.execute(ddl)
++            row = conn.execute("SELECT at FROM kanban_dispatch_stamp WHERE id = 1").fetchone()
++            previous = int(row[0]) if row is not None else None
++            if previous is not None and now - previous > threshold:
++                conn.execute("INSERT INTO kanban_suspend_ledger (start, end) VALUES (?, ?)", (previous, now))
++                recorded = (previous, now)
++            conn.execute(
++                "INSERT INTO kanban_dispatch_stamp (id, at) VALUES (1, ?) "
++                "ON CONFLICT(id) DO UPDATE SET at = excluded.at", (now,))
++            conn.execute("DELETE FROM kanban_suspend_ledger WHERE end < ?", (now - RETENTION_SECONDS,))
++    except (sqlite3.Error, RuntimeError):
++        _log.warning("kanban: recording the dispatcher pass stamp failed", exc_info=True)
++        return None
++    if recorded is not None:
++        _log.info("kanban: dispatcher was suspended for %ss (%s -> %s); stale checks skip it",
++                  recorded[1] - recorded[0], recorded[0], recorded[1])
++    return recorded
++
++
++def suspended_intervals(conn: sqlite3.Connection) -> list[tuple[int, int]]:
++    """Recorded suspend spans, oldest first; empty when none (or no table yet)."""
++    try:
++        rows = conn.execute("SELECT start, end FROM kanban_suspend_ledger ORDER BY start, end").fetchall()
++    except sqlite3.OperationalError:
++        return []
++    return [(int(r[0]), int(r[1])) for r in rows]
++
++
++def awake_seconds(conn: sqlite3.Connection, since: float, now: float) -> float:
++    """``now - since`` minus the overlap of recorded suspends with ``[since, now]``."""
++    total = now - since
++    if total <= 0:
++        return total
++    try:
++        rows = conn.execute(
++            "SELECT start, end FROM kanban_suspend_ledger WHERE end > ? AND start < ? ORDER BY start",
++            (since, now),
++        ).fetchall()
++    except sqlite3.OperationalError:
++        return total
++    asleep = 0.0
++    cursor = since  # merge overlapping spans so none is subtracted twice
++    for start, end in rows:
++        lo, hi = max(float(start), cursor), min(float(end), now)
++        if hi > lo:
++            asleep += hi - lo
++            cursor = hi
++    return max(0.0, total - asleep)
+diff --git a/tests/hermes_cli/test_kanban_suspend_ledger.py b/tests/hermes_cli/test_kanban_suspend_ledger.py
+new file mode 100644
+index 00000000000..b6eea71cf4c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_suspend_ledger.py
+@@ -0,0 +1,226 @@
++"""Sleep-aware stale checks: time the Mac spent suspended is not counted as worker idleness. [daveey]
++
++The dispatcher records a gap between two of its passes that is far longer than its interval as a
++suspend (``kanban_suspend_ledger``). The heartbeat backstop of ``release_stale_claims``,
++``detect_stale_running`` and ``enforce_max_runtime`` then measure awake time only, so a lid-close
++longer than an hour no longer SIGTERMs live workers on the first pass after wake.
++"""
++
++import os
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_suspend_ledger as ledger
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    conn = kbc.connect(tmp_path / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++@pytest.fixture
++def child():
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
++    try:
++        # The fingerprint needs the process to exist; give exec a moment.
++        for _ in range(50):
++            if kbd._process_fingerprint(proc.pid):
++                break
++            time.sleep(0.05)
++        yield proc
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def _running(conn, pid, *, hb_age, started_age=None, max_runtime=None) -> str:
++    """A host-local running card with a live worker ``pid``, an expired claim and a heartbeat
++    ``hb_age`` seconds old."""
++    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=max_runtime)
++    kb.claim_task(conn, tid)
++    kbd._set_worker_pid(conn, tid, pid)
++    now = int(time.time())
++    started = now - (started_age if started_age is not None else hb_age)
++    with kb.write_txn(conn):
++        conn.execute(
++            "UPDATE tasks SET worker_started_at = ?, started_at = ?, claim_expires = ?, "
++            "last_heartbeat_at = ? WHERE id = ?",
++            (kbd._process_fingerprint(pid), started, now - 60, now - hb_age, tid))
++        conn.execute("UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
++                     "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
++                     (started, now - hb_age, tid))
++    return tid
++
++
++def _suspend(conn, start, end):
++    """Record a suspend the way the dispatcher does: a pass at ``start``, the next at ``end``."""
++    ledger.record_dispatch_pass(conn, now=start, interval_seconds=60)
++    ledger.record_dispatch_pass(conn, now=end, interval_seconds=60)
++
++
++def _reaping_kill(proc, killed):
++    """signal_fn that really signals the child and reaps it, so the sweep sees it gone."""
++    def kill(pid, sig):
++        killed.append((pid, sig))
++        os.kill(pid, sig)
++        proc.wait(timeout=10)
++    return kill
++
++
++def _alive(pid):
++    try:
++        os.kill(pid, 0)
++    except OSError:
++        return False
++    return True
++
++
++def test_live_worker_with_recorded_suspend_keeps_claim(board, child):
++    now = int(time.time())
++    tid = _running(board, child.pid, hb_age=2 * 3600)
++    _suspend(board, now - 2 * 3600 + 60, now - 30)
++
++    killed = []
++    assert kb.release_stale_claims(board, signal_fn=lambda p, s: killed.append(p)) == 0
++    assert killed == []
++    kinds = [e.kind for e in kb.list_events(board, tid)]
++    assert "reclaimed" not in kinds
++    assert "claim_extended" in kinds
++    task = kb.get_task(board, tid)
++    assert task.status == "running" and task.claim_expires > now
++    assert child.poll() is None and _alive(child.pid)
++
++
++def test_live_worker_without_suspend_is_reclaimed_heartbeat_stale(board, child):
++    tid = _running(board, child.pid, hb_age=2 * 3600)
++    killed = []
++
++    assert kb.release_stale_claims(board, signal_fn=_reaping_kill(child, killed)) == 1
++    ev = [e for e in kb.list_events(board, tid) if e.kind == "reclaimed"]
++    assert ev and ev[-1].payload["heartbeat_stale"] is True
++    assert killed and killed[0][0] == child.pid
++
++
++def test_suspend_ended_61_min_ago_without_heartbeat_is_reclaimed(board, child):
++    now = int(time.time())
++    # Heartbeat right before a 1-h sleep; awake 61 min since wake with no heartbeat.
++    tid = _running(board, child.pid, hb_age=3600 + 61 * 60)
++    _suspend(board, now - 3600 - 61 * 60, now - 61 * 60)
++
++    killed = []
++    assert kb.release_stale_claims(board, signal_fn=_reaping_kill(child, killed)) == 1
++    ev = [e for e in kb.list_events(board, tid) if e.kind == "reclaimed"]
++    assert ev and ev[-1].payload["heartbeat_stale"] is True
++
++
++def test_ledger_records_gap_only_above_threshold_and_fresh_connection_reads_it(board, tmp_path):
++    now = int(time.time())
++    assert ledger.gap_threshold_seconds(60) == 300
++    assert ledger.gap_threshold_seconds(200) == 600
++
++    ledger.record_dispatch_pass(board, now=now - 10_000, interval_seconds=60)
++    ledger.record_dispatch_pass(board, now=now - 10_000 + 300, interval_seconds=60)  # == threshold: awake
++    ledger.record_dispatch_pass(board, now=now - 5000, interval_seconds=60)  # gap 4700 s: suspended
++    ledger.record_dispatch_pass(board, now=now - 4940, interval_seconds=60)  # normal tick
++
++    fresh = kbc.connect(tmp_path / "kanban.db")
++    try:
++        assert ledger.suspended_intervals(fresh) == [(now - 10_000 + 300, now - 5000)]
++        assert ledger.awake_seconds(fresh, now - 10_000, now) == 10_000 - 4700
++        # Partial overlap is clipped to the window.
++        assert ledger.awake_seconds(fresh, now - 6000, now) == 6000 - 1000
++        assert ledger.awake_seconds(fresh, now - 100, now) == 100
++    finally:
++        fresh.close()
++
++
++def test_ledger_prunes_intervals_older_than_seven_days(board):
++    now = int(time.time())
++    _suspend(board, now - 9 * 86400, now - 8 * 86400)
++    ledger.record_dispatch_pass(board, now=now - 8 * 86400 + 60, interval_seconds=60)
++    assert ledger.suspended_intervals(board) == [(now - 9 * 86400, now - 8 * 86400)]
++    ledger.record_dispatch_pass(board, now=now, interval_seconds=60)  # also a gap: ~8 d
++    assert ledger.suspended_intervals(board) == [(now - 8 * 86400 + 60, now)]
++
++
++def test_awake_seconds_without_ledger_table_is_wall_clock(board):
++    assert ledger.awake_seconds(board, 1000, 5000) == 4000
++
++
++def test_max_runtime_skips_suspended_time(board, child):
++    now = int(time.time())
++    tid = _running(board, child.pid, hb_age=60, started_age=2 * 3600, max_runtime=3600)
++    _suspend(board, now - 5400 - 600, now - 600)  # 90-min suspend: 30 min awake
++
++    killed = []
++    assert kbd.enforce_max_runtime(board, signal_fn=lambda p, s: killed.append(p)) == []
++    assert killed == []
++    assert kb.get_task(board, tid).status == "running"
++    assert child.poll() is None
++
++
++def test_max_runtime_without_suspend_times_out(board, child):
++    tid = _running(board, child.pid, hb_age=60, started_age=2 * 3600, max_runtime=3600)
++    killed = []
++
++    assert kbd.enforce_max_runtime(board, signal_fn=lambda p, s: killed.append(p)) == [tid]
++    runs = kb.list_runs(board, tid)
++    assert runs[-1].outcome == "timed_out"
++    assert killed and killed[0] == child.pid
++
++
++def test_detect_stale_running_skips_suspended_time(board, child):
++    now = int(time.time())
++    tid = _running(board, child.pid, hb_age=6 * 3600, started_age=6 * 3600)
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (now + 900, tid))
++    _suspend(board, now - 6 * 3600 + 120, now - 60)
++
++    killed = []
++    assert kbd.detect_stale_running(board, stale_timeout_seconds=4 * 3600,
++                                    signal_fn=lambda p, s: killed.append(p)) == []
++    assert killed == []
++    assert "reclaim_deferred" not in [e.kind for e in kb.list_events(board, tid)]
++    assert kb.get_task(board, tid).status == "running"
++
++
++def test_reclaim_phase_records_gap_before_reclaim(board, child, monkeypatch):
++    """End to end: the first dispatcher pass after a 2-h lid-close keeps the live worker."""
++    now = int(time.time())
++    monkeypatch.setattr(ledger, "_configured_interval_seconds", lambda: 60)
++    tid = _running(board, child.pid, hb_age=2 * 3600)
++    ledger.record_dispatch_pass(board, now=now - 2 * 3600 + 30, interval_seconds=60)  # pass before sleep
++
++    kbd._run_reclaim_phase(board, kbd.DispatchResult(), stale_timeout_seconds=0,
++                           failure_limit=2, reconcile_orphans=False)
++
++    assert ledger.suspended_intervals(board)[-1][0] == now - 2 * 3600 + 30
++    assert "reclaimed" not in [e.kind for e in kb.list_events(board, tid)]
++    assert kb.get_task(board, tid).status == "running"
++    assert child.poll() is None
++
++
++def test_fresh_run_is_not_stale_against_its_predecessors_heartbeat(board, child):
++    """A run claimed 20 s ago inherits the task's 2-h-old heartbeat from its previous run (the card
++    was parked). It is judged from its own start: not heartbeat-stale, claim extended, no kill."""
++    now = int(time.time())
++    tid = _running(board, child.pid, hb_age=2 * 3600, started_age=20)
++    killed = []
++
++    assert kb.release_stale_claims(board, signal_fn=lambda p, s: killed.append(p)) == 0
++    assert killed == []
++    kinds = [e.kind for e in kb.list_events(board, tid)]
++    assert "reclaimed" not in kinds and "claim_extended" in kinds
++    assert kb.get_task(board, tid).claim_expires > now
+-- 
+2.55.0
+

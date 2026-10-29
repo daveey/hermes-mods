@@ -1,0 +1,485 @@
+From 920d59d19156f94291c23778ab3d79437d7c830e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 09:02:03 -0700
+Subject: [PATCH] fix(kanban remote notices): the unloaded-chat sweep stops
+ replaying stale and superseded cards [daveey] (#198)
+
+* fix(kanban remote notices): the unloaded-chat sweep stops replaying stale and superseded cards [daveey]
+
+Problem: 2026-10-29 00:22-00:36Z, right after the MacBook took 5bab4bb450, sweep_remote_notices
+appended 293 "blocked" notices into ~216 idle chats for cards done days earlier (G1 t_cc5aeb02,
+G6a t_414dafc6, G10b t_4bf9a311: "Held in ready by the respawn guard (active_pr) for 360 min", 10-24).
+
+Why 1: the sweep read replica row default/t_cc5aeb02 (status blocked, run.ended_at 10-24) beside the
+  current default/default/t_cc5aeb02 (done). The owner's hermes-hub client switched task keys from
+  <board>/<id> to <profile>/<board>/<id>; the old rows stay frozen in the replica (hub copy today: 2,795
+  ids with both shapes, newest legacy write 61 h ago).
+Why 2: the sweep had none of collect()'s guards: no FRESH_S bound on the terminal time, no ledger check,
+  and every replica row was read, so superseded rows counted as live state.
+Why 3: 5bab4bb450 changed the blocked notice key to remote:<gw>:<key>:blocked@<ts>:<profile>:<sid>; no
+  transcript held that key, so transcript-key dedupe (the sweep's only guard) let every stale blocked row
+  through once per linked idle chat.
+Root (happened): the poller and the sweep are two consumers of the same replica with separately coded
+  admission rules; the freshness/identity rules lived only in collect().
+Root (not caught): sweep tests seeded only fresh, canonical rows; none had an old terminal time, a
+  legacy-key row, or a ledger row settled by collect().
+
+Fix:
+- _canonical(): one replica row per (owner gateway, task id), most qualified key then newest seq. Used by
+  both collect()'s index and the sweep.
+- The sweep announces only states that became terminal within FRESH_S (completed_at / run.ended_at, else
+  completion_notice.created_at); older linked cards are counted and logged once per change.
+- The sweep skips a notice the ledger already settled (acked, or recorded silently by collect(), e.g. a
+  local placeholder covers it). Legacy pre-ack delivered=1 rows (no notice_key) are not trusted.
+
+Tests (RED on origin/main, GREEN here): the three incident ids with legacy blocked rows beside done rows
+append nothing; a 4-day-old blocked card appends nothing; a recent superseded legacy row yields only the
+done notice from both sweep and poller in either row order; a ledger-settled notice is not swept; control:
+fresh done + blocked notices are swept exactly once and acked, also after a restart.
+Replay against the hub's real replica copy (gateway=macbook, fake store with no transcript dedupe):
+origin/main 491 appends (155 blocked), this change 174 (17 blocked), all cards terminal within 6 h.
+
+* fix(kanban remote notices): canonical rows drop only superseded legacy keys; collect uses the sweep's freshness clock [daveey]
+
+Review follow-up on PR 198: grouping on the task id alone could merge two profiles' cards sharing an id.
+A legacy <board>/<id> row is now dropped only when that gateway has a current row for the same board+id.
+collect() measures freshness with _fresh_at like the sweep (completion_notice.created_at fallback).
+
+* test(kanban): CLI judge-gate fixture uses a shaped task id [daveey]
+
+_cmd_complete rejects a token that is not t_ plus 4..64 before the judge.
+test_non_goal_mode_task_skips_gate passed t1 and exited 2 (not a task id)
+on the PR 198 merge of 1d223ec into 00462327, and the same code is on main
+since 1184aefb32. The sibling rejection tests then passed without reaching
+the judge. Use t_goal, the id the fixture already pretends to load.
+---
+ .../tui_gateway/test_kanban_remote_notices.py | 136 ++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 210 +++++++++++++-----
+ 2 files changed, 294 insertions(+), 52 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+index 809180609cd..dfb99a86694 100644
+--- a/tests/tui_gateway/test_kanban_remote_notices.py
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -450,3 +450,139 @@ def test_sweep_does_not_remember_a_notice_it_could_not_write(tmp_path):
+         missing = False
+         assert len(sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
+                                         ledger=ledger)) == 1
++
++
++# [daveey] 2026-10-29 00:22Z on the MacBook the unloaded-chat sweep appended 293 stale "blocked" notices into idle
++# chats: frozen legacy-key replica rows (``<board>/<id>``, published before the owner switched to
++# ``<profile>/<board>/<id>``) of cards done days earlier. Examples below are three of them.
++REPLAYED = ("t_cc5aeb02", "t_414dafc6", "t_4bf9a311")
++LEGACY_BLOCKED_AT = 1792843956.0  # 2026-10-24, "Held in ready by the respawn guard (active_pr) for 360 min"
++SWEPT_AT = 1793233342.0  # 2026-10-29 00:22:22Z, first stale append
++
++
++def _legacy(card: dict) -> dict:
++    """The same card under the pre-board-qualified replica key."""
++    return {"key": card["key"].split("/", 1)[1], "task": card["task"]}
++
++
++def _sweep_db(tmp_path, sessions):
++    db = SessionDB(tmp_path / "state.db")
++    for sid in sessions:
++        db.create_session(sid, "desktop")
++
++    @contextlib.contextmanager
++    def opener(profile, sid):
++        yield (db, db.get_compression_tip(sid) or sid) if sid in sessions else (None, None)
++
++    return db, opener
++
++
++def test_sweep_does_not_replay_stale_blocked_legacy_rows_of_done_cards(tmp_path):
++    """The 00:22Z incident: days-old legacy blocked rows beside current done rows append nothing."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    cards = []
++    for tid in REPLAYED:
++        old = _card(tid, CHAT, status="blocked", at=LEGACY_BLOCKED_AT,
++                    summary="Held in ready by the respawn guard (active_pr) for 360 min")
++        cards.append(_legacy(old))
++        cards.append(_card(tid, CHAT, status="done", at=LEGACY_BLOCKED_AT + 2 * 86400))
++    replica = _hub(tmp_path, cards)
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    db, opener = _sweep_db(tmp_path, (CHAT,))
++    with db:
++        assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                    ledger=ledger, now=SWEPT_AT) == []
++        assert db.get_messages(CHAT) == []
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=SWEPT_AT,
++                       transcript_has=lambda key, tid: False) == []
++
++
++def test_sweep_skips_a_four_day_old_blocked_card_even_with_no_newer_row(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    replica = _hub(tmp_path, [_card("t_old_blocked", CHAT, status="blocked", at=now - 4 * 86400)])
++    krn._reset_for_tests()
++    db, opener = _sweep_db(tmp_path, (CHAT,))
++    with db:
++        assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                    ledger=tmp_path / "ledger.db", now=now) == []
++        assert db.get_messages(CHAT) == []
++
++
++def test_superseded_legacy_row_is_ignored_even_when_recent(tmp_path):
++    """Canonical row wins regardless of age: a fresh legacy blocked row beside the current done row yields
++    exactly the done notice, from the sweep and from the poller."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    stale_view = _legacy(_card("t_moved", CHAT, status="blocked", at=now - 600, summary="old block"))
++    current = _card("t_moved", CHAT, status="done", at=now - 60, summary="real handoff")
++    for order in ([stale_view, current], [current, stale_view]):
++        sub = tmp_path / str(len(list(tmp_path.iterdir())))
++        sub.mkdir()
++        replica = _hub(sub, order)
++        krn._reset_for_tests()
++        got = krn.collect(OTHER, "default", hub_db=replica, ledger=sub / "ledger.db", now=now)
++        assert got == []  # not linked to OTHER
++        db, opener = _sweep_db(sub, (CHAT,))
++        with db:
++            out = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                       ledger=sub / "ledger.db", now=now)
++            assert len(out) == 1
++            texts = [m["content"] for m in db.get_messages(CHAT)]
++            assert len(texts) == 1 and "done" in texts[0] and "old block" not in texts[0]
++        krn._reset_for_tests()
++        polled = krn.collect(CHAT, "default", hub_db=replica, ledger=sub / "poll-ledger.db", now=now)
++        assert [p["state"].split("@")[0] for p in polled] == ["done"]
++
++
++def test_sweep_skips_a_notice_the_ledger_settled_silently(tmp_path):
++    """A notice collect() recorded without announcing (a local placeholder covers it) is not swept later."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    replica = _hub(tmp_path, [_card("t_placeholder", CHAT, status="done", at=now - 30)])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now, skip=lambda tid: True) == []
++    db, opener = _sweep_db(tmp_path, (CHAT,))
++    with db:
++        assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                    ledger=ledger, now=now) == []
++        assert db.get_messages(CHAT) == []
++
++
++def test_sweep_still_delivers_genuine_fresh_notices_once(tmp_path):
++    """Control: fresh done and blocked cards on an idle chat are each swept exactly once."""
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    replica = _hub(tmp_path, [_card("t_fresh_done", CHAT, status="done", at=now - 120, summary="shipped"),
++                              _card("t_fresh_blocked", CHAT, status="blocked", at=now - 90, summary="need a yes")])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    db, opener = _sweep_db(tmp_path, (CHAT,))
++    with db:
++        out = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger, now=now)
++        assert sorted(item["task_id"] for item in out) == ["t_fresh_blocked", "t_fresh_done"]
++        krn._reset_for_tests()  # a restarted backend: the ledger and transcript keys still dedupe
++        assert sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener,
++                                    ledger=ledger, now=now) == []
++        texts = [m["content"] for m in db.get_messages(CHAT)]
++        assert len(texts) == 2 and any("need a yes" in t for t in texts)
++    for item in ("t_fresh_done", "t_fresh_blocked"):
++        assert _ledger_row(ledger, CHAT, f"hub/default/default/{item}")["delivered"] == 1
++
++
++def test_canonical_drops_only_superseded_legacy_rows():
++    from tui_gateway import kanban_remote_notices as krn
++
++    rows = [("hub", "default/t_a", 1, "legacy-a"), ("hub", "default/default/t_a", 9, "current-a"),
++            ("hub", "other/default/t_a", 5, "other-profile-a"),  # same board + id, another profile: kept
++            ("hub", "bb/t_orphan", 2, "legacy-only"),  # no current row: kept (freshness decides)
++            ("mini", "default/t_a", 3, "other-gateway-legacy")]  # another owner gateway: kept
++    assert sorted(r[3] for r in krn._canonical(rows)) == [
++        "current-a", "legacy-only", "other-gateway-legacy", "other-profile-a"]
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 1ea2e9e2bdc..c346035e382 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -71,6 +71,41 @@ def _terminal_at(task: dict) -> Optional[float]:
+     return None
+ 
+ 
++def _fresh_at(task: dict) -> Optional[float]:
++    """When the card reached its terminal state, for the freshness bound. Falls back to the owner's published
++    ``completion_notice.created_at`` (records without ``completed_at``). Not part of the ledger identity."""
++    at = _terminal_at(task)
++    if at is not None:
++        return at
++    notice = task.get("completion_notice")
++    if isinstance(notice, dict) and notice.get("created_at"):
++        with contextlib.suppress(TypeError, ValueError):
++            return float(notice["created_at"])
++    return None
++
++
++def _task_rows(conn: sqlite3.Connection, me: Optional[str] = None) -> list[tuple]:
++    """``(gw, key, seq, data)`` task rows of the replica, other gateways only when ``me`` is given."""
++    cols = {row[1] for row in conn.execute("PRAGMA table_info(replica)")}
++    seq = "seq" if "seq" in cols else "0"
++    sql = f"SELECT gw, key, {seq}, data FROM replica WHERE coll = 'tasks'"
++    return conn.execute(sql + " AND gw != ?", (me,)).fetchall() if me else conn.execute(sql).fetchall()
++
++
++def _canonical(rows: list[tuple]) -> list[tuple]:
++    """Drop replica rows a newer key form supersedes. [daveey]
++
++    The owner's hermes-hub client once published tasks as ``<board>/<id>``; it now publishes
++    ``<profile>/<board>/<id>``. The replica keeps the old rows frozen in whatever status they had then
++    (2026-10-29 MacBook: 252 hub rows, e.g. ``default/t_cc5aeb02`` still ``blocked`` beside a ``done``
++    ``default/default/t_cc5aeb02``), so reading every row replays states the card left days ago. A legacy row
++    is dropped when the same gateway has any current row for that board and id; current rows are all kept
++    (two profiles' cards may share a board name and an id).
++    """
++    current = {(str(row[0]), "/".join(str(row[1]).split("/")[-2:])) for row in rows if str(row[1]).count("/") >= 2}
++    return [row for row in rows if str(row[1]).count("/") >= 2 or (str(row[0]), str(row[1])) not in current]
++
++
+ def _index(path: Path) -> tuple[str, dict]:
+     """``(this gateway, {(profile, session): [card, ...]})`` for terminal cards owned by other gateways, cached on
+     the replica's task-row signature (one decode per change, shared by every chat's poll)."""
+@@ -83,11 +118,11 @@ def _index(path: Path) -> tuple[str, dict]:
+         memo = _index_memo
+         if memo is not None and memo[0] == str(path) and memo[1] == sig and memo[2] == me:
+             return me, memo[3]
+-        rows = conn.execute("SELECT gw, key, data FROM replica WHERE coll = 'tasks'").fetchall()
++        rows = _canonical(_task_rows(conn))
+     finally:
+         conn.close()
+     index: dict[tuple[str, str], list[dict]] = {}
+-    for gw, key, data in rows:
++    for gw, key, _seq, data in rows:
+         if not me or gw == me:
+             continue  # this gateway's own cards notify through local tui subscriptions
+         try:
+@@ -345,7 +380,8 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                 state = f"{task['status']}@{int(at) if at else 0}"
+                 if (ref, state) in offered:
+                     continue
+-                fresh = at is not None and now - at <= FRESH_S
++                at_fresh = _fresh_at(task)  # same bound as the sweep
++                fresh = at_fresh is not None and now - at_fresh <= FRESH_S
+                 if fresh and skip is not None and conn.execute(
+                         "SELECT 1 FROM notices WHERE session=? AND ref=? AND state=?",
+                         (session_key, ref, state)).fetchone() is None and skip(str(task["id"])):
+@@ -418,6 +454,7 @@ _DELIVERED_MAX = 50_000
+ SWEPT_KEEP_S = 90 * 86400.0
+ _delivered: dict[tuple, None] = {}
+ _swept_loaded: set[str] = set()
++_last_stale: dict[str, int] = {}  # replica -> stale count last logged, so the sweep logs a change, not every pass
+ 
+ 
+ def _remember_delivered(key: tuple) -> None:
+@@ -475,6 +512,7 @@ def _reset_for_tests() -> None:
+     _index_memo = None
+     _delivered.clear()
+     _swept_loaded.clear()
++    _last_stale.clear()
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -496,12 +534,105 @@ def _session_db(profile, sid):
+         db.close()
+ 
+ 
++def _ledger_settled(conn: Optional[sqlite3.Connection], sessions: tuple, ref: str, state: str) -> bool:
++    """True when the ledger already settled this notice for one of ``sessions``: acked after a transcript write,
++    or recorded silently by ``collect`` (stale, or covered by a local placeholder). A legacy pre-ack
++    ``delivered=1`` row (no ``notice_key``) is not trusted; the transcript key decides for those."""
++    if conn is None:
++        return False
++    marks = ",".join("?" * len(sessions))
++    row = conn.execute(
++        f"SELECT 1 FROM notices WHERE session IN ({marks}) AND ref=? AND state=? AND delivered=1 "
++        "AND notice_key IS NOT NULL LIMIT 1", (*sessions, ref, state)).fetchone()
++    return row is not None
++
++
++def _sweep_payload(owner: str, key: str, task: dict, me: str, profile: str, sid: str) -> tuple:
++    """``(event_key, metadata, text)`` of one swept notice, keyed like ``collect``'s."""
++    notice = task.get("completion_notice")
++    if task.get("status") == "done":
++        event_id = notice["event_id"]
++        event_key = _event_key(owner, key, notice)
++        metadata = {"notice_id": f"remote:{owner}:{key}:{event_id}:{profile}:{sid}",
++                    "board": task.get("board", "default"), "task_id": task["id"],
++                    "gateway": owner, "event_ids": [event_id], "kanban_event_keys": [event_key]}
++        return event_key, metadata, _completion_text(owner, key, task, me, profile, sid)
++    event_key = _shared_key(owner, key, task, profile, sid)
++    metadata = {"notice_id": event_key, "board": task.get("board", "default"),
++                "task_id": task["id"], "gateway": owner, "kanban_event_keys": [event_key]}
++    return event_key, metadata, format_notice(owner, key, task)
++
++
++def _sweep_cards(rows: list[tuple], me: str, now: float, counts: dict):
++    """``(owner, key, task, links)`` for canonical, freshly terminal cards linked to chats on ``me``. Linked
++    terminal cards older than ``FRESH_S`` (or of unknown age) are counted in ``counts['stale']``."""
++    for owner, key, _seq, raw in rows:
++        try:
++            task = json.loads(raw)
++        except (TypeError, ValueError):
++            continue
++        notice = task.get("completion_notice") if isinstance(task, dict) else None
++        done = task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice
++        if not done and task.get("status") != "blocked":
++            continue
++        links = [link for link in task.get("sessions") or [] if isinstance(link, dict)
++                 and link.get("rel") == "shepherd" and link.get("gw") == me]
++        if not links:
++            continue
++        at = _fresh_at(task)
++        if at is None or now - at > FRESH_S:
++            counts["stale"] = counts.get("stale", 0) + 1
++            continue
++        yield owner, key, task, links
++
++
++def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session_db, ledger, settled,
++                  delivered: list, swept: list) -> None:
++    """Append one fresh notice unless the memo or the ledger already settled it. A failed write is not remembered."""
++    profile, sid = link.get("profile"), link.get("session")
++    if not profile or not sid or sid in live:
++        return
++    try:
++        event_key, metadata, text = _sweep_payload(owner, key, task, me, profile, sid)
++        memo_key = (str(path), profile, sid, metadata["notice_id"])
++        if memo_key in _delivered:
++            return
++        with session_db(profile, sid) as (db, tip):
++            if db is None or not text:
++                return
++            if not settled((sid, tip), ref, state):
++                row_id = db.append_kanban_notice(tip, text, metadata)
++                delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
++                swept.append(memo_key)
++                ack({"session": sid, "ref": ref, "state": state, "notice_key": event_key}, ledger=ledger)
++            _remember_delivered(memo_key)
++    except Exception:
++        logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
++
++
++def _deliver_fresh(rows, me, now, path, live, session_db, ledger, settled, delivered, swept, counts) -> None:
++    for owner, key, task, links in _sweep_cards(rows, me, now, counts):
++        at = _terminal_at(task)
++        ref, state = f"{owner}/{key}", f"{task['status']}@{int(at) if at else 0}"
++        for link in links:
++            _deliver_link(owner, key, task, link, me=me, ref=ref, state=state, path=path, live=live,
++                          session_db=session_db, ledger=ledger, settled=settled,
++                          delivered=delivered, swept=swept)
++
++
+ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session_db, live_ids=None,
+-                         ledger=None) -> list[dict]:
++                         ledger=None, now: Optional[float] = None) -> list[dict]:
+     """Persist addressed notices, then ack the ledger. Write-first: a failed append leaves no delivered row
+     and the next sweep retries (no claim-before-durable). ``live_ids`` are open chats; their poller writes the
+     row and starts the turn, so this sweep skips them. Done and blocked share one ``kanban_event_keys`` value
+     with ``collect``, so running both yields one transcript row.
++
++    [daveey] Same guards as ``collect``: one canonical replica row per card (a frozen legacy-key row is never
++    read), only states that became terminal within ``FRESH_S``, and nothing the ledger already settled.
++    A successful append is also recorded in the ledger's ``swept`` table, so a restart does not reopen
++    state.db for a notice this process already persisted. Without the guards a rollout that changed the
++    blocked notice key replayed 293 ``blocked`` notices from days earlier, of cards long done, into idle
++    chats (MacBook 2026-10-29 00:22Z).
+     """
+     from hermes_cli.kanban_origin import _hub_db, gateway_names
+ 
+@@ -511,62 +642,37 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+     me = gateway if gateway is not None else gateway_names()[0]
+     if not me:
+         return []
++    now = time.time() if now is None else now
+     live = set(live_ids or ())
+     try:
+         with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+-            rows = conn.execute("SELECT gw,key,data FROM replica WHERE coll='tasks' AND gw!=?", (me,)).fetchall()
++            rows = _canonical(_task_rows(conn, me))
+     except sqlite3.Error:
+         logger.debug("remote Kanban replica unavailable", exc_info=True)
+         return []
+     _load_swept(ledger)
+-    delivered, swept = [], []
++    delivered: list[dict] = []
++    swept: list = []
++    counts: dict = {}
+     try:
+-        _sweep_rows(rows, me, live, path, session_db, ledger, delivered, swept)
++        with contextlib.ExitStack() as stack:
++            ledger_conn: list = []
++
++            def settled(sessions: tuple, ref: str, state: str) -> bool:
++                if not ledger_conn:
++                    try:
++                        ledger_conn.append(stack.enter_context(contextlib.closing(_ledger(ledger))))
++                    except (OSError, sqlite3.Error):
++                        logger.debug("remote kanban ledger unreadable; transcript keys dedupe alone", exc_info=True)
++                        ledger_conn.append(None)
++                return _ledger_settled(ledger_conn[0], sessions, ref, state)
++
++            _deliver_fresh(rows, me, now, path, live, session_db, ledger, settled, delivered, swept, counts)
++        stale = counts.get("stale", 0)
++        if stale and stale != _last_stale.get(str(path)):
++            _last_stale[str(path)] = stale
++            logger.info("remote kanban sweep: %d linked terminal card(s) older than %.0fh not announced",
++                        stale, FRESH_S / 3600)
+     finally:
+         _record_swept(swept, ledger)
+     return delivered
+-
+-
+-def _sweep_rows(rows, me, live, path, session_db, ledger, delivered: list, swept: list) -> None:
+-    for owner, key, raw in rows:
+-        try:
+-            task = json.loads(raw)
+-            notice = task.get("completion_notice")
+-            done = task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice
+-            blocked = task.get("status") == "blocked"
+-            if not done and not blocked:
+-                continue
+-            for link in task.get("sessions", []):
+-                if link.get("rel") != "shepherd" or link.get("gw") != me:
+-                    continue
+-                profile, sid = link.get("profile"), link.get("session")
+-                if not profile or not sid or sid in live:
+-                    continue
+-                if done:
+-                    event_id = notice["event_id"]
+-                    event_key = _event_key(owner, key, notice)
+-                    metadata = {"notice_id": f"remote:{owner}:{key}:{event_id}:{profile}:{sid}",
+-                                "board": task.get("board", "default"), "task_id": task["id"],
+-                                "gateway": owner, "event_ids": [event_id],
+-                                "kanban_event_keys": [event_key]}
+-                    text = _completion_text(owner, key, task, me, profile, sid)
+-                else:
+-                    event_key = _shared_key(owner, key, task, profile, sid)
+-                    metadata = {"notice_id": event_key, "board": task.get("board", "default"),
+-                                "task_id": task["id"], "gateway": owner, "kanban_event_keys": [event_key]}
+-                    text = format_notice(owner, key, task)
+-                memo_key = (str(path), profile, sid, metadata["notice_id"])
+-                if memo_key in _delivered:
+-                    continue
+-                with session_db(profile, sid) as (db, tip):
+-                    if db is not None and text:
+-                        row_id = db.append_kanban_notice(tip, text, metadata)
+-                        _remember_delivered(memo_key)
+-                        swept.append(memo_key)
+-                        delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
+-                        at = _terminal_at(task)
+-                        ack({"session": sid, "ref": f"{owner}/{key}",
+-                             "state": f"{task['status']}@{int(at) if at else 0}",
+-                             "notice_key": event_key}, ledger=ledger)
+-        except Exception:
+-            logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
+-- 
+2.55.0
+
