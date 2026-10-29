@@ -236,6 +236,22 @@ def test_disk_config_is_cached_and_detached(disk_api):
     assert len(calls) == 1
 
 
+def test_other_profile_config_failure_does_not_evict_the_owner_config(disk_api, tmp_path):
+    """Every profile's fleet poll calls service(); profiles without runners.yaml raise. That used to
+    clear the one shared cache entry, so the owner re-parsed its config on each poll."""
+    module, client, path, calls, cfg, constants = disk_api
+    owner_home = constants.get_hermes_home()
+    other = tmp_path / 'other-home'
+    other.mkdir()
+    for _ in range(3):
+        constants.get_hermes_home = lambda: other
+        with pytest.raises(OSError):
+            module.service()
+        constants.get_hermes_home = lambda: owner_home
+        module.service()
+    assert len(calls) == 1
+
+
 def test_atomic_replace_same_size_mtime_invalidates(disk_api):
     import os
     module, client, path, calls, cfg, _ = disk_api

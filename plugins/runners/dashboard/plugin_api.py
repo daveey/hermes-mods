@@ -39,9 +39,12 @@ def active_profile():
     return profile_name_for_home(get_hermes_home())
 
 
-# One entry, not a growing per-profile cache. Never cache a Service or a response:
+# One entry per profile home (bounded by the number of profiles; an entry is replaced when its
+# file changes and dropped when it fails). A single shared entry made every other profile's poll
+# (no runners.yaml -> FileNotFoundError) discard the owner's parsed config, so the owner re-parsed
+# and re-validated it (~0.6 s) on each fleet poll. Never cache a Service or a response:
 # snapshot owner/revision checks and profile authorization still run per request.
-_config_cache = None
+_config_cache = {}
 
 
 def _signature(path):
@@ -52,26 +55,26 @@ def _signature(path):
 
 def service():
     from hermes_constants import get_hermes_home
-    global _config_cache
     ConfigFile, Service = _backend()
     with _lock:
+        home = Path(get_hermes_home()).resolve()
         try:
-            home = Path(get_hermes_home()).resolve()
             path = home / 'runners.yaml'
             key = (home, active_profile(), _signature(path))
-            if _config_cache is None or _config_cache[0] != key:
-                # Drop the previous owner/revision BEFORE parsing. An invalid,
+            cached = _config_cache.get(home)
+            if cached is None or cached[0] != key:
+                # Drop this home's previous owner/revision BEFORE parsing. An invalid,
                 # missing or concurrently changed file must never use stale data.
-                _config_cache = None
+                _config_cache.pop(home, None)
                 config = ConfigFile(path).load()
                 if _signature(path) != key[2]:
                     raise RuntimeError('configuration_changed')
-                _config_cache = (key, config)
+                _config_cache[home] = cached = (key, config)
             # Detach mutable structures so responses/services cannot poison the
             # validated cache, including its owner epoch and config revision.
-            config = deepcopy(_config_cache[1])
+            config = deepcopy(cached[1])
         except Exception:
-            _config_cache = None
+            _config_cache.pop(home, None)
             raise
     return Service(home / 'runners/state.sqlite', config)
 
