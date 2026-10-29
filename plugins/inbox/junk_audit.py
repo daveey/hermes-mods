@@ -114,6 +114,45 @@ def file_card(res: dict, now: float, runner=subprocess.run) -> str | None:
         return None
 
 
+def _family_of(kind: str, f: dict) -> str:
+    """Poster family a finding belongs to: a sender's normalised label, else the key family before ':'."""
+    if kind == "senders":
+        label = str(f["sender"])
+    else:
+        label = str(f.get("key") or "unlabelled").split(":", 1)[0]
+    return "-".join(label.split("·", 1)[0].strip().lower().replace("_", " ").split()) or "unlabelled"
+
+
+def by_family(res: dict) -> dict:
+    out: dict = {}
+    for kind in ("senders", "reposted_keys", "test_cards"):
+        for f in res[kind]:
+            out.setdefault(_family_of(kind, f), {"senders": [], "reposted_keys": [], "test_cards": []})[kind].append(f)
+    return {fam: dict(r, fresh=any(x["fresh"] for k in ("senders", "reposted_keys", "test_cards") for x in r[k]))
+            for fam, r in out.items()}
+
+
+def file_cards(res: dict, now: float, runner=subprocess.run) -> dict:
+    """One Kanban card per poster family with fresh junk (idempotent per family per UTC day)."""
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    made = {}
+    for fam, r in sorted(by_family(res).items()):
+        if not r["fresh"]:
+            continue
+        argv = ["hermes", "kanban", "create", f"Inbox junk audit {day}: poster family {fam}",
+                "--assignee", "default", "--body-file", "-", "--json", "--created-by", "inbox-junk-audit",
+                "--idempotency-key", f"inbox-junk-audit:{fam}:{day}", "--no-requires"]
+        p = runner(argv, input=card_body(r), capture_output=True, text=True, timeout=120)
+        if p.returncode != 0:
+            print(f"card create failed for {fam} rc={p.returncode}: {(p.stderr or p.stdout)[-300:]}", file=sys.stderr)
+            continue
+        try:
+            made[fam] = json.loads(p.stdout or "{}").get("id")
+        except ValueError:
+            made[fam] = None
+    return made
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--json", help="read items from this file instead of `hermes-hub inbox --all --json`")
@@ -129,10 +168,10 @@ def main(argv=None) -> int:
         items = json.loads(p.stdout)
     now = time.time()
     res = audit(items, now)
-    card = file_card(res, now) if res["fresh"] and not a.dry_run else None
+    cards = file_cards(res, now) if res["fresh"] and not a.dry_run else {}
     print(json.dumps({"items_7d": res["window_items"], "senders": len(res["senders"]),
                       "reposted_keys": len(res["reposted_keys"]), "test_cards": len(res["test_cards"]),
-                      "fresh": res["fresh"], "card": card}))
+                      "fresh": res["fresh"], "cards": cards}))
     if a.dry_run:
         print(card_body(res))
     return 0

@@ -241,3 +241,26 @@ def test_junk_audit_finds_reposted_keys_untouched_senders_and_test_cards():
     assert argv[argv.index("--idempotency-key") + 1].startswith("inbox-junk-audit:")
     assert "gh-actions-billing" in kw["input"]
     assert audit.audit([i for i in items if i["key"] == "ok:1"], now)["fresh"] is False
+
+
+def test_junk_audit_files_one_kanban_card_per_poster_family():
+    audit = _load("_inbox_junk_audit_fam", HERE / "junk_audit.py")
+    now = 2_000_000.0
+    item = lambda **kw: dict({"gw": "hub", "state": "archived", "outcome": "archived", "poster": None}, **kw)  # noqa: E731
+    items = [item(key="gh-actions-billing:a", title="billing lock", created_at=now - 3 * 86400),
+             item(key="gh-actions-billing:a", title="billing lock", created_at=now - 3600),
+             item(key="x-dm:TEST-1", title="TEST: dm", created_at=now - 3600, state="resolved"),
+             item(key="x-dm:TEST-2", title="TEST: dm2", created_at=now - 3600, state="resolved")]
+    res = audit.audit(items, now)
+    calls = []
+
+    class P:
+        returncode, stdout, stderr = 0, '{"id": "t_fam"}', ""
+
+    made = audit.file_cards(res, now, runner=lambda argv, **kw: calls.append((argv, kw)) or P())
+    assert sorted(made) == ["gh-actions-billing", "x-dm"]
+    keys = [a[a.index("--idempotency-key") + 1] for a, _ in calls]
+    assert len(set(keys)) == 2 and all(k.startswith("inbox-junk-audit:") for k in keys)
+    by_key = {a[a.index("--idempotency-key") + 1]: kw["input"] for a, kw in calls}
+    only_dm = [v for k, v in by_key.items() if ":x-dm:" in k][0]
+    assert "x-dm" in only_dm and "gh-actions-billing" not in only_dm
