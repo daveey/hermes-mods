@@ -249,6 +249,8 @@ def _setup_cli(parser) -> None:
     u.add_argument("--fix-commit", required=True, help="SHA or GitHub commit URL of the fix that stops the noise")
     uk = sub.add_parser("unarchive-key", help="let a key David archived be posted again (a genuinely new decision)")
     uk.add_argument("key")
+    j = sub.add_parser("junk", help="mark a card as junk: archive, mute its poster family, file a five-whys card")
+    j.add_argument("session_id")
     a = sub.add_parser("archive", help="archive a message")
     a.add_argument("session_id")
     t = sub.add_parser("types", help="list card types, or show one")
@@ -334,6 +336,13 @@ def _run_cli(args) -> int:
         ok = inbox.archive(args.session_id)
         print("archived" if ok else "not an inbox message")
         return 0 if ok else 1
+    if cmd == "junk":
+        result = inbox.junk(args.session_id)
+        if not result:
+            print("not an inbox message", file=sys.stderr)
+            return 1
+        print(json.dumps(result))
+        return 0
     if cmd == "unmute":
         try:
             inbox.unmute(args.poster, fix_commit=args.fix_commit)
@@ -346,7 +355,7 @@ def _run_cli(args) -> int:
         inbox.unarchive_key(args.key)
         print(f"released key {args.key!r}")
         return 0
-    print("usage: hermes inbox {post,list,archive,act,outcome,types,unmute,unarchive-key}")
+    print("usage: hermes inbox {post,list,archive,junk,act,outcome,types,unmute,unarchive-key}")
     return 2
 
 

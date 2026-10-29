@@ -354,12 +354,25 @@ test('sidebar row: RowActions renders the row action buttons before Archive and 
   store.$items.set([XPOST])
   const tree = m.RowActions({ store, item: XPOST })
   const kids = tree.props.children
-  assert.equal(kids.length, 2)
+  assert.equal(kids.length, 3)  // approve, Junk, Archive
   assert.equal(kids[0].props.action.id, 'approve')
+  assert.equal(kids[1].props.action.id, 'junk')
   kids[0].props.onClick()
   await new Promise(r => setTimeout(r, 0))
   assert.deepEqual(ctx.calls[0][1].body, { action: 'approve' })
-  assert.equal(m.RowActions({ store, item: { session_id: 'old' } }).props.onClick != null, true)  // plain Archive
+  assert.equal(m.RowActions({ store, item: { session_id: 'old' } }).props.children.length, 2)  // Junk + Archive
+})
+
+test('Junk row button POSTs /items/<id>/junk', async () => {
+  const ctx = fakeCtx(() => ({ ok: true, items: [] }))
+  const store = m.createStore(ctx)
+  const it = { session_id: 'j1', gateway: 'local' }
+  store.$items.set([it])
+  const kids = m.RowActions({ store, item: it }).props.children
+  kids[0].props.onClick()
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(ctx.calls[0][0], '/items/j1/junk')
+  assert.equal(ctx.calls[0][1].method, 'POST')
 })
 
 test('review fixes: prompt actions never become row buttons; counter counts code points; tooltip shows the template', () => {
@@ -717,7 +730,7 @@ test('sidebar row Archive goes through act (steps when the row is the open chat)
   const { ctx, store } = keyStore('x1')
   const only = { session_id: 'n2', gateway: 'local' }
   store.$items.set([only])
-  const archive = m.RowActions({ store, item: only })
+  const archive = m.RowActions({ store, item: only }).props.children[1]
   host.state.focusedStoredSessionId = { get: () => 'n2', listen: () => () => {} }
   const stepped = []
   ctx.openNextSession = sid => (stepped.push(sid), true)
