@@ -30,12 +30,18 @@ def test_isolation(home):
     return any(target == r.resolve() or target.is_relative_to((r / "profiles").resolve()) for r in roots)
 
 
-_TEST = re.compile(r"\b(?:TEST|scratch|drill|ignore)\b", re.I)
-_STATUS = re.compile(r"\b(?:was rejected|failed|expired|came back|missing guards|still on disk|alert|sent to)\b|\bposted:|^Fixed:", re.I)
+# Upper-case TEST only: real titles say "wave-speed test". Fixture signatures are matched case-insensitively.
+_TEST_CS = re.compile(r"\bTEST\b")
+_TEST_CI = re.compile(r"\b(?:scratch|drill|ignore)\b|\b(?:live|e2e|smoke) test\b|\btest (?:card|post|ask)\b|CTESTLIVE|9999-\d\d-\d\d", re.I)
+
+
+def _is_test(text):
+    return bool(_TEST_CS.search(text) or _TEST_CI.search(text))
+_STATUS = re.compile(r"\b(?:was rejected|failed|expired|came back|missing guards|still on disk|sent to)\b|\bposted:|^Fixed:", re.I)
 
 
 def reason(*, home, poster, ask, actions, type_name="default", title="", body="", key="", **_):
-    if _TEST.search(title) or _TEST.search(str(key or "")):
+    if _is_test(title) or _is_test(str(key or "")):
         return "content_test"
     if not poster or not str(poster).strip():
         return "poster_missing"
