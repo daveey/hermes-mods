@@ -332,6 +332,28 @@ class Lifecycle(unittest.TestCase):
         self._ended(3600)
         self.assertEqual([r['action'] for r in self.m.sweep()], ['removed'])
 
+    def test_sweep_keeps_a_tree_with_uncommitted_changes(self):
+        # outside the card's scratch dir (dir/worktree workspace): unsaved work waits for the GC's 7-day archive
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute("update tasks set workspace_path=''")
+        (self.tree / 'a').write_text('unsaved')
+        self._ended(3600)
+        self.assertEqual([r['action'] for r in self.m.sweep()], ['kept: uncommitted/untracked changes'])
+        self.assertEqual((self.tree / 'a').read_text(), 'unsaved')
+        self.assertIn(f'KEEP {self.tree} (registered to task): uncommitted', self.m.LOG.read_text())
+
+    def test_sweep_dry_run_removes_nothing_and_writes_no_log(self):
+        # mac-worktree-gc --all-repos --dry-run runs `__init__.py sweep --dry-run`: report, change nothing
+        self.m.live_cwds = lambda: [str(self.tree)]
+        self.call(self.result)  # completion keeps it for the live process
+        self.m.live_cwds = lambda: []
+        self._ended(3600)
+        log_before = self.m.LOG.read_text()
+        self.assertEqual([r['action'] for r in self.m.sweep(dry_run=True)], ['would remove'])
+        self.assertTrue(self.tree.exists())
+        self.assertEqual(self.m.LOG.read_text(), log_before)
+        self.assertEqual([r['action'] for r in self.m.sweep()], ['removed'])
+
     def test_completion_starts_one_detached_sweep_an_hour(self):
         self.call(self.result)
         self.assertEqual(len(self.m.spawned_sweeps), 1)
