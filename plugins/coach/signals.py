@@ -101,6 +101,22 @@ GUARD_RES = (
     ("key-owner-mismatch", re.compile(r"^Credential auth failure: the failing key belongs to pool entry \S+, but the "
                                       r"session is attributed to entry \S+")),
 )
+# A platform adapter's "[X] Failed to connect to X" whose final exception says the host is unreachable (laptop
+# asleep/offline, DNS down, Wi-Fi switch): the adapter marks it retryable and the gateway retries with backoff, so
+# one attempt is not a defect (plugin-0561bb7919). A real outage is the gateway's own NEEDS_ATTENTION warning after
+# agent.reconnect_attention_after of continuous failure (run_adapters._flag_reconnect_needs_attention), filed once
+# per host/profile/platform. Certificate/auth/other exceptions on connect still file.
+CONNECT_FAIL_RE = re.compile(r"^\[[^\]]+\] Failed to connect to \S")
+# the final exception, by type alone (exact class names: ClientConnectorCertificateError/SSL errors do not match)
+NETWORK_EXC_RE = re.compile(r"^(?:[\w.]*\.)?(?:ClientConnectorDNSError|gaierror|ConnectionRefusedError|"
+                            r"ConnectionResetError|ClientConnectionResetError):")
+# ... or a generic connect/OS error whose text names a can't-reach-the-host condition
+NETWORK_RE = re.compile(r"^(?:[\w.]*\.)?(?:ClientConnectorError|OSError|ConnectionError):.*(?:"
+                        r"nodename nor servname provided|Name or service not known|"
+                        r"Temporary failure in name resolution|Network is unreachable|No route to host|"
+                        r"Connection refused|Connection reset by peer)", re.I)
+ATTENTION_RE = re.compile(r"^(\S+) has been failing/reconnecting continuously for ([\d.]+) hours \((\d+) attempts\)"
+                          r".*NEEDS_ATTENTION")
 RECONNECT_STORM = 20               # more than this many library reconnects in RECONNECT_WINDOW_S files one defect
 RECONNECT_WINDOW_S = 3600
 
@@ -212,7 +228,8 @@ def _provider_of(exc_type: str, msg: str = "") -> str:
     return m.group(1).lower() if m else "unknown"
 
 
-def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Optional[list] = None) -> List[dict]:
+def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Optional[list] = None,
+                 host: str = "", prof: str = "default") -> List[dict]:
     """Records (header + continuation lines) -> traceback, hook-exception and credential-guard signals. Library
     auto-reconnects are not signals; each is appended to `reconnects` (when given) for the storm count. Provider
     401/403s raised while opening a stream are handled by core's retry loop: not signals either, each is appended
@@ -251,6 +268,15 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                                                         + r["cont"]))[:1500],
                         "fp": fp("agent", "credential-guard", prov, gkind)})
             continue
+        am = ATTENTION_RE.match(r["msg"])
+        if am:
+            key, hours, attempts = am.groups()
+            out.append({"kind": "errors", "component": "gateway", "at": r["at"], "session_id": "",
+                        "symptom": f"{key} NEEDS_ATTENTION on {host or 'this host'} ({prof}): failing/reconnecting "
+                                   f"continuously for {hours} hours ({attempts} attempts)",
+                        "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
+                        "fp": fp("gateway", "needs-attention", host, prof, key)})
+            continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue
         # the last chained exception block
@@ -269,6 +295,9 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         if TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line):
             continue
+        last = exc_line or next((l for l in reversed(block) if l and not l[0].isspace()), "")  # socket.gaierror
+        if CONNECT_FAIL_RE.match(r["msg"]) and (NETWORK_EXC_RE.match(last) or NETWORK_RE.match(last)):
+            continue  # a retried platform connect with no network; a long outage files via NEEDS_ATTENTION
         comp, plug = component_of([f[0] for f in frames])
         if r["level"] == "WARNING" and not any(_own_frame(p) for p, _fn in frames):
             continue  # a library logging a handled exception (e.g. mcp's PermissionError); nothing of ours to fix
@@ -371,7 +400,7 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
         lines = read_new(h / "logs" / "errors.log", cur, f"errors:{prof}", now)
         recs: List[dict] = []
         prof_auth: List[dict] = []
-        for s in parse_errors(lines, recs, prof_auth):
+        for s in parse_errors(lines, recs, prof_auth, host=host, prof=prof):
             if s["at"] >= now - BACKFILL_S:
                 s["profile"] = prof
                 out.append(s)

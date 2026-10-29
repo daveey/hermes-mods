@@ -188,11 +188,79 @@ def test_reconnect_message_with_a_hermes_frame_or_hermes_failed_to_connect_still
     own = ['  File "/home/you/.hermes/hermes-agent/gateway/platforms/discord.py", line 40, in start',
            "    await self.client.start(token)"] + RECONNECT_TAILS["close-1000"]
     assert len(sg.parse_errors(reconnect_rec(own))) == 1
-    ours = reconnect_rec(RECONNECT_TAILS["dns"], logger="hermes_plugins.platforms__discord.adapter",
-                         msg="[Discord] Failed to connect to Discord: Cannot connect to host discord.com:443")
+    # a Hermes "Failed to connect" whose final exception is not a network error is ours to look at
+    ours = reconnect_rec(ADAPTER_FRAME + ["discord.errors.LoginFailure: Improper token has been passed."],
+                         logger="hermes_plugins.platforms__discord.adapter",
+                         msg="[Discord] Failed to connect to Discord: Improper token has been passed.")
     assert len(sg.parse_errors(ours)) == 1
+    # the DNS case is no longer filed per attempt (plugin-0561bb7919): see the NETWORK_TAILS tests below
+    dns = reconnect_rec(RECONNECT_TAILS["dns"], logger="hermes_plugins.platforms__discord.adapter",
+                        msg="[Discord] Failed to connect to Discord: Cannot connect to host discord.com:443")
+    assert sg.parse_errors(dns) == []
     # a Hermes logger saying "Attempting a reconnect" is ours to look at, frames or not
     assert len(sg.parse_errors(reconnect_rec(RECONNECT_TAILS["reset"], logger="gateway.run"))) == 1
+
+
+ADAPTER = "/home/you/.hermes/hermes-agent/plugins/platforms/discord/adapter.py"
+ADAPTER_FRAME = [f'  File "{ADAPTER}", line 1660, in connect', "    await self._client.start(self.config.token)"]
+NETWORK_TAILS = {
+    # the real MacBook record (plugin-0561bb7919): the laptop had no network after sleep/wake
+    "dns": RECONNECT_TAILS["dns"][-3:-1] + [
+        "aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host discord.com:443 ssl:default "
+        "[nodename nor servname provided, or not known]"],
+    "dns-linux": ["socket.gaierror: [Errno -3] Temporary failure in name resolution"],
+    "dns-unknown": ["socket.gaierror: [Errno -2] Name or service not known"],
+    "refused": ["aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host discord.com:443 "
+                "ssl:default [Connection refused]"],
+    "unreachable": ["OSError: [Errno 51] Network is unreachable"],
+    "reset": ["ConnectionResetError: [Errno 54] Connection reset by peer"],
+}
+
+
+def connect_fail_rec(tail, msg="[Discord] Failed to connect to Discord: Cannot connect to host discord.com:443"):
+    return reconnect_rec(ADAPTER_FRAME + tail, logger="hermes_plugins.platforms__discord.adapter", msg=msg)
+
+
+@pytest.mark.parametrize("variant", sorted(NETWORK_TAILS))
+def test_platform_connect_failure_with_no_network_is_not_a_defect(variant):
+    # the adapter marks it retryable and the gateway retries with backoff; one failed attempt is not an outage
+    # (the gateway's NEEDS_ATTENTION warning after reconnect_attention_after is the outage signal)
+    assert sg.parse_errors(connect_fail_rec(NETWORK_TAILS[variant])) == []
+
+
+def test_network_error_outside_a_platform_connect_still_files():
+    # the same DNS error from another Hermes code path (not the retried adapter connect) is still a signal
+    rec = connect_fail_rec(NETWORK_TAILS["dns"], msg="[Discord] Failed to send message: Cannot connect to host")
+    assert len(sg.parse_errors(rec)) == 1
+    # a certificate failure while connecting is not "no network": it files
+    cert = ["aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host discord.com:443 "
+            "ssl:True [SSLCertVerificationError: certificate has expired]"]
+    assert len(sg.parse_errors(connect_fail_rec(cert))) == 1
+
+
+ATTENTION = ("{at},000 WARNING gateway.run_adapters: {key} has been failing/reconnecting continuously for 2.0 hours "
+             "(41 attempts) — flagging NEEDS_ATTENTION. Retries continue, but this usually means a permanent "
+             "problem (revoked credentials, missing intents, broken sidecar). Check `hermes status` / "
+             "`/platform list`.")
+
+
+def test_needs_attention_warning_files_one_defect_per_host_profile_platform(tmp_path):
+    h = tmp_path / "home"
+    (h / "logs").mkdir(parents=True)
+    at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(NOW - 300))
+    (h / "logs" / "errors.log").write_text("\n".join([ATTENTION.format(at=at, key="discord")] * 2
+                                                     + [ATTENTION.format(at=at, key="telegram")]) + "\n")
+    sigs = kinds(sg.collect(h, {}, "macbook", NOW), "errors")
+    disc = [s for s in sigs if "discord" in s["symptom"]]
+    assert len(disc) == 1 and disc[0]["count"] == 2  # same platform twice: one defect
+    assert disc[0]["component"] == "gateway" and "NEEDS_ATTENTION" in disc[0]["symptom"]
+    assert "macbook" in disc[0]["symptom"] and "(default)" in disc[0]["symptom"]
+    tele = [s for s in sigs if "telegram" in s["symptom"]]
+    assert len(tele) == 1 and tele[0]["fp"] != disc[0]["fp"]  # per platform
+    other = tmp_path / "other"
+    (other / "logs").mkdir(parents=True)
+    (other / "logs" / "errors.log").write_text(ATTENTION.format(at=at, key="discord") + "\n")
+    assert kinds(sg.collect(other, {}, "mini", NOW), "errors")[0]["fp"] != disc[0]["fp"]  # per host
 
 
 def _reconnect_log(home, n, start):
