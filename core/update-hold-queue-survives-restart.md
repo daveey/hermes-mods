@@ -21,9 +21,12 @@ Now:
   - **Accepted just before the restart:** once the hold lifts and the turn starts, the turn's own marker replaces the
     `update_hold_queue` entry. A turn the SIGTERM killed is continued as an interrupted turn, not sent again. A turn
     that already answered is not replayed.
-  - **Renderer reload under the hold (0741):** Desktop reconnects to the same backend, and `session.resume` reuses the
-    live record. The live queue still owns the prompt, so the marker is not replayed. The marker stays for a later
-    restart. Before 0741 the warm resume replayed the text while the queue drained it again when the hold lifted.
+  - **Renderer reload to the same backend (0741):** Desktop reconnects to the same backend, and `session.resume`
+    reuses the live record. While the live queue holds the prompt, the marker is not replayed, and it stays for a
+    later restart. During the hold itself the replay was already blocked: `_start_session_work` reserves fresh
+    admission, and the hold refuses it. Before 0741 the duplicate was reachable only while admission was open and the
+    queue still held the prompt. That is the ≤250 ms before the retry timer drains after the hold lifts, or a queue
+    retrying on transient contention. In that window the warm resume replayed the text and the queue drained it too.
   - **Reload that outlasted the orphan grace:** the reaper drops the in-memory queue and keeps the marker, so the next
     resume in the same backend replays it once. The old record's retry timer sends nothing.
   - **Stop under the hold:** `session.interrupt` purges the queue and retires the marker, so the next backend does not
@@ -76,6 +79,15 @@ Now:
   `test_prompt_answered_just_before_the_restart_is_not_sent_again`.
 - Renderer reload: `test_renderer_reload_under_the_hold_leaves_the_prompt_to_the_live_queue` (through
   `_resume_reuse_live_locked`; failed before 0741), `test_renderer_gone_long_enough_to_reap_the_session_replays_once_in_the_same_backend`.
+  The first test stubs `_start_session_work`, so it shows the guard holds with admission open; it does not show the
+  race happening live. 0741's commit message says "under the update hold". The reachable window is the narrower one
+  under Behavior.
+- Cross-process probe (real `python -m tui_gateway.entry` processes, isolated HERMES_HOME, live code `4edd4010e0`,
+  2026-10-29 00:37 PDT). It sets the hold and submits (`queued`, marker journaled), warm-resumes on the same backend
+  (no `auto_continue`), and SIGTERMs. On a fresh backend it resumes: the replay is scheduled, the probe text is an
+  active user row exactly once (accept row retired, replay row active), there is one `tui prompt accepted ...
+  kind=user` line, and no `shown as not sent`. All 9 checks passed. The script is not in the fork; it is kept beside
+  this incident's hand-over note.
 - Stop: `test_stop_under_the_hold_discards_the_prompt_for_the_next_backend_too` (through the `session.interrupt` RPC).
 
 Untested: the Desktop renderer's own handling of the `queued` reply (no Desktop test). The tests use stub
