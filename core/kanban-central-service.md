@@ -70,7 +70,13 @@ to verify. With one source of truth it is the card's status.
   `hermes kanban sync diff` compares this gateway's live cards with the replica. In `primary` mode the live board
   also takes this gateway's own cards from the feed (edits made elsewhere, lease changes) and claims through service
   leases. It never takes another gateway's cards, so the dispatcher's sweeps (stale claims, orphans, concurrency
-  counts) never see foreign work; cross-gateway reads come from the replica. The switch and `kanban.sync.boards`
+  counts) never see foreign work; cross-gateway reads come from the replica. The one exception is a link whose
+  child is this gateway's card and whose parent another gateway owns: the live board keeps it, and the parent's
+  status is mirrored from the replica into the local-only `kanban_sync_remote_parents`, so the promoter, the claim
+  and the Board's own claim check gate on the same parents (`kanban_db.parent_states`). A parent on neither gates
+  too; after 10 min its child is blocked "parent <id> missing from this board". Dropping such links let the
+  owner re-promote a child the Board refused every lease (60 promoted/claim_rejected events in 7 min, 2026-10-28).
+  Tests: `test_kanban_cross_gateway_parents.py`. The switch and `kanban.sync.boards`
   are read from the kanban root's `config.yaml`, because kanban storage is shared by every profile on a host.
   Tests: `test_kanban_sync_client.py` (against an in-memory fake of the service contract), plus the phase 1 suites.
 
