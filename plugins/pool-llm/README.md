@@ -22,7 +22,9 @@ $B serve --port 8765                                         # local SDK-compati
 `OPENAI_BASE_URL=http://127.0.0.1:8765/v1`, any non-empty API key. It serves Anthropic `POST /v1/messages` (Claude
 Code system prefix and `mcp__` tool names added for the OAuth token, tool names restored in the reply) and OpenAI
 `POST /v1/responses` / `POST /v1/chat/completions` on the Codex backend (unsupported keys like `max_output_tokens`
-and `temperature` dropped, `store=false`). Non-streaming only. Each reply carries an `x-hermes-pool-route` header
+and `temperature` dropped, `store=false`). `POST /v1/embeddings` is forwarded to OpenRouter (key `OPENROUTER_API_KEY` from Hermes's `.env`; a bare model such
+as `text-embedding-3-large` becomes `openai/text-embedding-3-large` and the reply names the model as asked; upstream
+errors keep their status; the key is never logged). Non-streaming only. Each reply carries an `x-hermes-pool-route` header
 (provider, model, account). Only models the managed routing registry lists as subscription routes are accepted.
 
 On a 429/quota/credit error the account is marked exhausted in the pool and the call retries on the next account;

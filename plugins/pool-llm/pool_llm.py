@@ -16,7 +16,7 @@ Must run inside the Hermes runtime (it imports ``agent.*``). From a shell or a f
 
 ``serve`` lets an unmodified harness use the pool: set ``ANTHROPIC_BASE_URL=http://127.0.0.1:8765`` and
 ``OPENAI_BASE_URL=http://127.0.0.1:8765/v1`` (any non-empty API key). It answers Anthropic ``POST /v1/messages`` on the
-Claude pool and OpenAI ``POST /v1/responses`` / ``POST /v1/chat/completions`` on the Codex pool. Every response carries
+Claude pool and OpenAI ``POST /v1/responses`` / ``POST /v1/chat/completions`` on the Codex pool, and ``POST /v1/embeddings`` via OpenRouter. Every response carries
 ``x-hermes-pool-route`` (provider, model, account label) so a run can record the served path.
 
 Library use (Hermes interpreter): ``complete(messages, provider="anthropic", model=...)`` -> dict, or
@@ -298,6 +298,61 @@ def _chat_completions(body: dict, route: dict) -> dict:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
 
+class UpstreamError(Exception):
+    """Non-2xx answer from an upstream passthrough; ``status_code`` is passed on to the caller."""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
+
+
+def _openrouter_key() -> str:
+    from hermes_cli.config import get_env_value
+    return get_env_value("OPENROUTER_API_KEY") or ""
+
+
+def _http_post(url: str, headers: dict, data: bytes) -> tuple:
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def embeddings(body: dict, *, get_key: Optional[Callable[[], str]] = None, post: Optional[Callable] = None) -> dict:
+    """POST /v1/embeddings: passthrough to OpenRouter (the account pool has no embeddings backend)."""
+    asked = body.get("model")
+    if not asked or "input" not in body:
+        raise ValueError("embeddings needs 'model' and 'input'")
+    key = (get_key or _openrouter_key)()
+    if not key:
+        raise UpstreamError(401, "OPENROUTER_API_KEY is not set in Hermes's .env")
+    up = dict(body)
+    up["model"] = asked if "/" in asked else f"openai/{asked}"
+    status, raw = (post or _http_post)(OPENROUTER_EMBEDDINGS_URL,
+                                       {"content-type": "application/json", "authorization": f"Bearer {key}"},
+                                       json.dumps(up).encode())
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    if not 200 <= status < 300:
+        raise UpstreamError(status if 400 <= status < 600 else 502, text.replace(key, "***")[:2000])
+    try:
+        out = json.loads(text)
+    except ValueError:
+        raise UpstreamError(502, "non-JSON embeddings response: " + text.replace(key, "***")[:300])
+    if not isinstance(out, dict) or not out.get("data"):
+        raise UpstreamError(502, "embeddings response has no data: " + text.replace(key, "***")[:500])
+    out["model"] = asked
+    out.setdefault("object", "list")
+    out.setdefault("usage", {"prompt_tokens": 0, "total_tokens": 0})
+    return out
+
+
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     pools: dict = {}
@@ -341,6 +396,8 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
                 elif path.endswith("/responses"):
                     resolve_model("openai-codex", body.get("model"))
                     out = codex_responses(body, pool=pool_for("openai-codex"), route=route)
+                elif path.endswith("/embeddings"):
+                    out = embeddings(body)
                 elif path.endswith("/chat/completions"):
                     out = _chat_completions(body, route)
                 else:
