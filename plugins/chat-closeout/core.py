@@ -657,7 +657,8 @@ def ask_relay_due(row: dict[str, Any], cards: dict[str, dict[str, Any]], *, unse
 PLAIN_ASK_RULE = (
     "For a card waiting on the user, say in plain words: what is stuck (the work, by what it does), the one thing "
     "the user must do and where (the page, app or link; read the card with kanban_show if the ask is vague), and "
-    "what happens after they do it. Card ids are not the explanation: name the work. If an agent can do the step "
+    "what happens after they do it: quote the card's ask line verbatim, including what unblocking and what "
+    "archiving the card mean. Card ids are not the explanation: name the work. If an agent can do the step "
     "itself, do it instead of asking.")
 
 
@@ -665,7 +666,9 @@ def _ask_line(c: dict[str, Any]) -> str:
     ask = ask_of(c)
     if not ask:
         return ""
-    return (f"\n  needs the user to: {ask['action'][:400]}\n  why only the user: {ask['why_human'][:200]}"
+    # The ask travels verbatim (never truncated): it is the one line the user must act on, and it carries what
+    # unblock and archive mean (core kanban_ask_lint requires both on agent-filed user blocks).
+    return (f"\n  needs the user to: {ask['action']}\n  why only the user: {ask['why_human'][:200]}"
             f" ({ask['interaction']}; scope: {ask['scope'][:160]})")
 
 
@@ -687,9 +690,21 @@ def ask_relay_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], ids:
     return "\n".join(lines)
 
 
+def _ask_notice_lines(cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> list[str]:
+    """One "Needs you" line per card waiting on the user: its title and its ask, verbatim. A user-blocked card with no
+    validated ask still gets a line that says so, so the notice never reads as "blocked" with nothing to do."""
+    lines = []
+    for tid in sorted(set(ids)):
+        c = cards.get(tid) or {}
+        title = " ".join(str(c.get("title") or tid).split())[:120]
+        ask = ask_of(c)
+        lines.append(f"Needs you: {title}: {ask['action']}" if ask
+                     else f"Needs you: {title} (the card names no ask; this turn asks the agent to spell it out)")
+    return lines
+
+
 def ask_notice_text(cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> str:
-    titles = [str((cards.get(t) or {}).get("title") or t) for t in sorted(set(ids))]
-    return ("Needs you: " + "; ".join(titles))[:160]
+    return "\n".join(_ask_notice_lines(cards, ids))
 
 
 def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:
@@ -715,9 +730,13 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> st
 
 def notice_text(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:
     n = len(row.get("batch") or [])
-    blocked = sum(1 for i in row.get("batch") or [] if needs_human(cards.get(i)))
-    tail = f"; {blocked} waiting on you" if blocked else ""
-    return f"Close-out: the {n} card{'s' if n != 1 else ''} this chat waited on settled{tail}"
+    waiting = [i for i in row.get("batch") or [] if needs_human(cards.get(i))
+               and (cards.get(i) or {}).get("status") in ("blocked", "triage")
+               and (cards.get(i) or {}).get("block_kind") not in NONHUMAN_BLOCK_KINDS]
+    head = f"Close-out: the {n} card{'s' if n != 1 else ''} this chat waited on settled"
+    if not waiting:
+        return head
+    return "\n".join([f"{head}; {len(waiting)} waiting on you"] + _ask_notice_lines(cards, waiting))
 
 
 # ---- state.db: when did the user last type ---------------------------------------------------------------------
