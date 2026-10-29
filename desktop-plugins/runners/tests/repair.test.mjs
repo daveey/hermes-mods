@@ -139,6 +139,25 @@ test('reopen-existing: the same session id opens twice and no second repair is r
   }
 })
 
+test('hover-then-click: a real pointer (mouseenter, then click) keeps the popover open', async () => {
+  const f = harness({ repair: repairRecord() })
+  const ui = await mount(React.createElement(P.Panel, { view: f.view, now: NOW, repairClient: f.repairClient }))
+  try {
+    const slot = ui.container.querySelector(`[data-runner-slot="${ENTITY}"]`)
+    const { MouseEvent } = ui.container.ownerDocument.defaultView
+    await React.act(async () =>
+      slot.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: ui.container.ownerDocument.body })))
+    await ui.flush()
+    assert.ok(ui.container.querySelector('[data-repair-action]'), 'hover opens the popover')
+    const action = await openAction(ui, ENTITY)
+    assert.equal(action.textContent, 'Open repair session')
+    await ui.click(action)
+    assert.deepEqual(f.opens, [['same_session', { route }]])
+  } finally {
+    await ui.close()
+  }
+})
+
 test('disabled-without-incident: the action stays disabled and opens nothing', async () => {
   const f = harness({ incident: false })
   const ui = await mount(React.createElement(P.Panel, { view: f.view, now: NOW, repairClient: f.repairClient }))

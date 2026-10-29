@@ -445,7 +445,9 @@ function CiRow({ m, now, repairClient, route, sourceError }) {
         return h(Slot, {
           key, state: s.state, slotId: s.id,
           title: `${text(s.runner)} · ${SLOT_TITLE[s.state]}\n${(s.labels || []).join(', ')}`,
-          onClick: interactive ? () => setOpenKey(openKey === key ? null : key) : undefined,
+          // Hover already opened this slot's popover, so a click must open, not toggle:
+          // a real pointer always enters before it clicks.
+          onClick: interactive ? () => setOpenKey(key) : undefined,
           onMouseEnter: interactive ? () => setOpenKey(key) : undefined
         })
       })),
