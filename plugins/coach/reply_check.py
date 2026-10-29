@@ -755,9 +755,38 @@ def confirm_system() -> str:
     return CONFIRM_SYS + (f"\n\nUSER ENVIRONMENT (what this user's agents can reach):\n{prof}" if prof.strip() else "")
 
 
+NOTICE_RE = re.compile(
+    r"^\s*(?:\[(?:chat-closeout|false-stop recovery|owner-wake|goal continuation|babysitter)[^\]]*\]"
+    r"|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b)", re.I)
+
+
+def notice_turn(user_ask: str) -> bool:
+    """Only anchored automation envelopes, never a human question mentioning a notice."""
+    return bool(NOTICE_RE.search(user_ask or ""))
+
+
+NOTICE_CONTEXT = """AUTOMATED NOTICE, not a human request for a read-only status update. The notice supplies a worker's
+handoff; it does not establish that this agent acted on each unresolved item. Evaluate each unresolved agent-fixable
+leftover independently: finishing the main repair does not excuse a separate verification or deployment gap.
+An existing owner counts only with evidence this turn of recent progress on that specific work, not merely a running
+status or a message sent to it. Do not assume a generic card lookup checked every cited owner. A queued card can be a
+legitimate capacity wait when the turn actually checked capacity/progress; a real timed soak or physical-user-only
+check is not report_only. A newly assigned concrete fix still counts as started.
+When only unit tests passed and live verification remains, check whether a live check or an attributable future-event
+check is actually armed. Merely saying 'the next event will test it' is not an armed check. Do not require unsafe live
+side effects, a physical device, or bypassing an explicit scope restriction. Score only from the shown evidence.
+Apply these distinctions before selecting the outcome; a resolved primary issue alone cannot label a separate
+unattended leftover as fixed. Keep the same JSON schema."""
+
+
 def confirm_prompt(user_ask: str, rich_log: list[str], reply: str) -> str:
     log = "\n".join(rich_log[-40:]) or "(no tool calls this turn)"
-    return (f"USER'S REQUEST (latest):\n{(user_ask or '')[:1500]}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
+    ask = user_ask or ""
+    notice = notice_turn(ask)
+    # Notices put the closeout/action instruction after long handoffs. Keep both ends within the same budget.
+    request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else ask[:1500]
+    context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
+    return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
             f"truncated):\n{log[:7000]}\n\nAGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
@@ -961,7 +990,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           thresholds: Optional[dict] = None,
           confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = 0.5,
           kanban_down: Optional[bool] = None,
-          human_asks: Optional[Callable[[], list]] = None) -> Optional[dict]:
+          human_asks: Optional[Callable[[], list]] = None,
+          audit: Optional[Callable[[dict], None]] = None) -> Optional[dict]:
     """Return {"rule", "p", "evidence", "nudge"} for the top rule over threshold, else None.
     `human_asks()` lists asks waiting on the user from cards linked to the chat ([{id, title, action}]); it is called
     only when the reply says nothing needs the user, and a hit is the deterministic `denied_ask` rule.
@@ -1047,7 +1077,9 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     ths = thresholds or {}
     th_scr = ths.get("report_only_screen", ths.get("report_only", threshold))
     th_ro = th_scr
-    if "report_only" in cands and confirm is not None and v["report_only"] >= confirm_floor:
+    screen_p = v["report_only"]
+    confirm_attempted = "report_only" in cands and confirm is not None and screen_p >= confirm_floor
+    if confirm_attempted and confirm is not None:
         try:
             c2 = confirm()
         except Exception:
@@ -1060,6 +1092,14 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             th_ro = ths.get("report_only", th_scr)
         else:
             v["report_only_src"] = "screen_fallback"
+    if audit is not None and "report_only" in cands:
+        try:
+            audit({"event": "report_only_scored", "screen_p": screen_p,
+                   "confirm_attempted": confirm_attempted, "floor": confirm_floor,
+                   "source": v.get("report_only_src", "screen"), "final_p": v["report_only"],
+                   "threshold": th_ro, "passing": v["report_only"] >= th_ro})
+        except Exception:
+            pass  # telemetry never changes a verdict
     if thresholds:
         thresholds = {**thresholds, "report_only": th_ro}
         passing = [r for r in cands if v[r] >= thresholds.get(r, threshold)]

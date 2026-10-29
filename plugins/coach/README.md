@@ -127,6 +127,42 @@ Earlier passes (same day): the original target (precision >= 0.85, recall >= 0.6
 was not reached by a single judge; Sonnet 0.67 / 0.43, Opus 0.82 / 0.39 at 0.75 on original labels, and the prompt rule
 about named gaps in finished work moved Opus to 0.69 / 0.47 at 0.75 on consensus labels. Eval spend was not metered per call: the labeling passes alone used 1.17M input tokens (0.51M Sonnet, 0.66M Opus), the
 cascade eval added one Sonnet screen call per candidate and one Opus call per screen p >= floor, so no dollar figure is claimed.
+Notice-turn audit (2026-10-29, PT): 229 automated rows were traced to actual stored messages. Excluding 24
+non-final/interrupted rows leaves 205 final replies and 22 labelled report-only positives (7 of the original 29
+slip texts were not final replies). All 22 positives pass the regex; the screen is the bottleneck, not System One
+(which only screens handoff/confirm). Historical `reply_checked` events did not retain judge probabilities, so a
+missing confirmation cannot distinguish a below-floor score from an unlogged judge error.
+
+The confirmation prompt now recognizes anchored completion/closeout/recovery/owner-wake envelopes, retains both
+ends of long handoffs, and distinguishes each unattended leftover, unverified owner and live-check gap. Human
+confirmation prompts remain byte-identical. The production screen floor stays **0.75**: lowering it fails the
+precision gate on train. Full replay uses subscription-pool Sonnet/Opus calls, notice text as the ask, and reconstructed
+real tool arguments. These are offline model scores, not a simulation of daily caps, hook deadlines or nudge delivery.
+
+| Automated replay, pooled 205 finals / 22 positives | Baseline precision / recall | Notice-context precision / recall |
+|---|---|---|
+| Screen floor 0.75 (shipped) | 0.000 / 0.000 (0 TP, 1 FP) | 0.000 / 0.000 (0 TP, 1 FP) |
+| Screen floor 0.60 (not shipped) | 0.583 / 0.318 | 0.533 / 0.364 |
+| Screen floor 0.50 (not shipped) | 0.474 / 0.409 | 0.440 / 0.500 |
+| Confirm every candidate (not shipped) | 0.188 / 0.591 | 0.220 / 0.909 |
+
+On train (137 rows / 15 positives), notice context at floor 0.50 gives P 0.529 / R 0.600; confirming every candidate
+gives P 0.226 / R 0.933. Neither reaches P 0.85. No threshold relaxation ships. This is an observability/context
+correction, **not a claim that automated recall improved at the deployed operating point**. The requested automated
+P >= 0.85 / R >= 0.60 targets remain unmet. Cached regression of production gates on the original held-out human
+set (357 rows / 59 positives) stays 22 TP / 1 FP, P 0.957 / R 0.373; all 357 human prompts are byte-identical.
+No fresh human model calls were needed; the original human recall target remains unmet, not newly regressed.
+
+`report_only_scored` now records `screen_p`, `final_p`, `floor`, `threshold`, `confirm_attempted`, `source` and `passing`,
+plus session, turn number and notice flag, even for below-threshold verdicts. It records no ask/reply/evidence text.
+Telemetry fails open and adds no model call. It covers parsed judge decisions, not early deterministic/guard returns,
+System One skips or judge failures. Separate host logs still govern whether a hook timed out or a nudge reached the
+agent: a nudge event is not delivery proof. Tests: `tests/test_report_only_notices.py` (eight synthetic cases: anchored
+recognition, long-notice instruction retention, human prompt invariance, low-score and confirmation/fallback telemetry,
+scope limits, telemetry failure, real hook wiring). Together with `test_reply_check.py`, `test_report_only_drafts.py`,
+`test_system_one_screen.py`, and `test_status_only.py`: **83 passed** under the Hermes venv. The existing scope fixtures
+remain unfired.
+
 Unverified owner (deterministic, runs before the screen and judge, no AI call): when the reply's last 1,500 chars hand
 the problem to another owner ("I'm leaving them to that session", "not from my change", "another session is landing
 it", "the owner has it", "that's that card's to fix") outside a quotation, and this turn's tool log has no check of or

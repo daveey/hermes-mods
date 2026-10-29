@@ -420,6 +420,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                            confirm=confirm, confirm_floor=rc.CONFIRM_FLOOR,
                            kanban_down=kanban_down,
                            human_asks=lambda: rc.session_human_asks(session_id),
+                           audit=lambda event: store.log({**event, "session_id": session_id,
+                                                          "turn": coach.turn_number(session_id),
+                                                          "notice": rc.notice_turn(ask)}),
                            **({"thresholds": thresholds} if thresholds else {}))
             if hit and hit["rule"] == "unverified" and repos:
                 msg = _diff_review(session_id, so, hit, ask, log_lines, changed_paths, final_response, repos)
