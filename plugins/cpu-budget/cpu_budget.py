@@ -49,6 +49,7 @@ DEFAULTS = {
     "max_gap_s": 90,
     "repeat_min_s": 1800,
 }
+_SELF_RE = re.compile(r"mac-load-recorder\s+sample|cpu_budget\.py\s+--config")
 _PS_RE = re.compile(r"^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(\S+)\s*(.*)$")
 
 Identity = Tuple[int, float]  # (pid, start epoch)
@@ -86,7 +87,7 @@ def parse_ps(out: str) -> List[dict]:
 def run_ps() -> Optional[str]:
     try:
         env = dict(os.environ, LC_ALL="C")
-        res = subprocess.run(["/bin/ps", "-Ao", "pid=,lstart=,cputime=,args="], capture_output=True, text=True,
+        res = subprocess.run(["/bin/ps", "-Aww", "-o", "pid=,lstart=,cputime=,args="], capture_output=True, text=True,
                              timeout=20, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -98,7 +99,7 @@ def snapshot(rows: List[dict], services: List[dict], self_pid: int) -> Dict[str,
     out: Dict[str, Dict[Identity, float]] = {s["name"]: {} for s in services}
     pats = [(s["name"], re.compile(s["match"])) for s in services]
     for r in rows:
-        if r["pid"] == self_pid or "cpu_budget" in r["args"] or "mac-load-recorder" in r["args"]:
+        if r["pid"] == self_pid or _SELF_RE.search(r["args"]):
             continue
         for name, pat in pats:
             if pat.search(r["args"]):
@@ -110,12 +111,12 @@ def snapshot(rows: List[dict], services: List[dict], self_pid: int) -> Dict[str,
 # ---------------------------------------------------------------- idle probes
 def probe_process_absent(spec: dict, rows: List[dict], now: float, since: float) -> Tuple[str, str]:
     """active if any process args match a pattern (CI runners, builds); unknown without a ps table."""
-    if rows is None:
-        return "unknown", "no ps table"
+    if rows is None or not spec.get("patterns"):
+        return "unknown", "no ps table" if rows is None else "no patterns configured"
     for pat in spec["patterns"]:
         rx = re.compile(pat)
         for r in rows:
-            if "cpu_budget" in r["args"] or "mac-load-recorder" in r["args"]:
+            if _SELF_RE.search(r["args"]):
                 continue
             if rx.search(r["args"]):
                 return "active", "process %d matches %s" % (r["pid"], pat)
@@ -126,6 +127,8 @@ def probe_files_quiet(spec: dict, rows: Any, now: float, since: float) -> Tuple[
     """active if any file under the globs changed since ``since - quiet_s``; unknown if a directory is missing."""
     import glob as _glob
     quiet = float(spec.get("quiet_s", 120))
+    if not spec.get("globs"):
+        return "unknown", "no globs configured"
     newest = 0.0
     for pattern in spec["globs"]:
         pattern = os.path.expanduser(pattern)
@@ -146,17 +149,33 @@ def probe_files_quiet(spec: dict, rows: Any, now: float, since: float) -> Tuple[
 PROBES = {"process_absent": probe_process_absent, "files_quiet": probe_files_quiet}
 
 
-def evaluate_idle(probes: List[dict], rows: Any, now: float, since: float,
-                  registry: Optional[dict] = None) -> Tuple[str, List[str]]:
-    reg = registry or PROBES
+def probe_key(spec: dict) -> str:
+    return "%s/%s" % (spec.get("kind"), spec.get("name", spec.get("type")))
+
+
+def evaluate_idle(probes: List[dict], rows: Any, now: float, since: float, registry: Optional[dict] = None,
+                  prev: Optional[dict] = None, seen: Optional[dict] = None) -> Tuple[str, List[str]]:
+    """``prev`` = each probe's status at the previous sample, ``seen`` is filled with this sample's raw status.
+
+    A point-in-time probe (ps) cannot see the interval between samples, so an interval is idle only if the
+    probe was idle at BOTH ends: active at the previous sample means the interval is active, no previous
+    reading means unknown.
+    """
+    reg = PROBES if registry is None else registry
     detail, idle_kinds, worst = [], set(), "idle"
     for spec in probes:
-        fn = reg.get(spec["type"])
+        fn = reg.get(spec.get("type"))
         try:
             status, why = fn(spec, rows, now, since) if fn else ("unknown", "unknown probe type")
         except Exception as exc:  # a probe bug must read as unknown, never idle
             status, why = "unknown", "probe error: %s" % exc
-        detail.append("%s/%s=%s (%s)" % (spec.get("kind"), spec.get("name", spec["type"]), status, why))
+        if seen is not None:
+            seen[probe_key(spec)] = status
+        if prev is not None and status == "idle":
+            before = prev.get(probe_key(spec), "unknown")
+            if before != "idle":
+                status, why = ("active" if before == "active" else "unknown"), "%s at previous sample; %s" % (before, why)
+        detail.append("%s=%s (%s)" % (probe_key(spec), status, why))
         if status == "idle":
             idle_kinds.add(spec.get("kind"))
         elif status == "active":
@@ -175,6 +194,8 @@ def account_interval(prev: dict, cur: Dict[str, Dict[Identity, float]], services
     """Return {cpu: {svc: seconds}, reasons: [...]} ; reasons non-empty = interval incomplete."""
     cpu: Dict[str, float] = {}
     reasons: List[str] = []
+    if now < prev_ts:
+        reasons.append("clock_back")
     if now - prev_ts > max_gap_s:
         reasons.append("gap:%ds" % (now - prev_ts))
     for s in services:
@@ -310,7 +331,7 @@ class Detector:
         if last_ts is not None and 0 <= now - last_ts < self.cfg["min_interval_s"] - 3:
             return {"action": "skipped_too_soon"}
         out = self.ps_fn()
-        rows = parse_ps(out) if out else None
+        rows = (parse_ps(out) if out else None) or None  # unparseable/empty table = no sample
         if rows is None:
             # no sample: keep the old baseline; the next interval will be long (gap) and so incomplete
             st["last_failure"] = now
@@ -318,13 +339,16 @@ class Detector:
             return {"action": "ps_failed"}
         cur = snapshot(rows, self.services, self.self_pid)
         result: Dict[str, Any] = {"action": "sampled"}
-        if last_ts is None or "snap" not in st:
-            st.update(last_ts=now, snap=_jsonable_snap(cur), window=None)
+        seen: Dict[str, str] = {}
+        if last_ts is None or "snap" not in st or now < last_ts:
+            # first run, lost state, or the wall clock stepped back: re-baseline, drop the window and streak
+            evaluate_idle(self.probes, rows, now, now, self.registry, None, seen)
+            st.update(last_ts=now, snap=_jsonable_snap(cur), window=None, streak=[], probe_prev=seen)
             self._save(st)
-            return {"action": "baseline"}
+            return {"action": "baseline" if last_ts is None or "snap" not in st else "clock_back"}
         prev = _load_snap(st["snap"])
         acc = account_interval(prev, cur, self.services, last_ts, now, self.cfg["max_gap_s"])
-        idle, evidence = evaluate_idle(self.probes, rows, now, last_ts, self.registry)
+        idle, evidence = evaluate_idle(self.probes, rows, now, last_ts, self.registry, st.get("probe_prev", {}), seen)
         win = st.get("window") or {"start": last_ts, "cpu": {}, "wall_s": 0.0, "intervals": 0,
                                     "bad": [], "evidence": []}
         dt = now - last_ts
@@ -338,7 +362,7 @@ class Detector:
         if idle != "idle" and "idle:" + idle not in win["bad"]:
             win["bad"].append("idle:" + idle)
         win["evidence"] = evidence
-        st.update(last_ts=now, snap=_jsonable_snap(cur), window=win)
+        st.update(last_ts=now, snap=_jsonable_snap(cur), window=win, probe_prev=seen)
         if now - win["start"] >= self.cfg["window_s"]:
             result.update(self._close_window(st, win, now))
             st["window"] = None

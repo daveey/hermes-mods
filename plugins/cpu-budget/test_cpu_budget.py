@@ -125,7 +125,8 @@ class FakeKanban:
 
 
 def start(sim):
-    assert sim.step(0.0 + 30)["action"] == "baseline"
+    assert sim.step(30)["action"] == "baseline"
+    sim.status_prev_primed = True
 
 
 # ------------------------------------------------------------------ accounting
@@ -413,3 +414,61 @@ def test_failure_injection_spinner_script(tmp_path, monkeypatch):
     assert c2 - c1 >= 2.5  # ~4 s of cpu, cputime granularity on Linux is 1 s
     acc = cb.account_interval(a, b, services, T0, T0 + 30, 90)
     assert acc["reasons"] == [] and acc["cpu"]["spin"] == pytest.approx(c2 - c1)
+
+
+# ------------------------------------------------------------------ review findings (clock, point-in-time probes, empty specs)
+def test_clock_stepping_back_rebaselines_and_never_inflates_cpu(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(300, 30)
+    sim.now -= 230
+    sim.cpu = {k: v + 9.0 for k, v in sim.cpu.items()}
+    assert sim.det.tick()["action"] == "clock_back"
+    sim.run(1200, 30)
+    assert {w["window"] for w in sim.windows()} == {"idle_ok"} and not sim.runner.calls  # true load is 30%
+
+
+def test_point_in_time_probe_active_at_previous_sample_taints_next_interval(tmp_path):
+    sim = Sim(tmp_path)
+    start(sim)
+    sim.run(270, 120)
+    sim.status["ci"] = "active"
+    sim.step(30, 120)  # a CI job is seen at this sample...
+    sim.status["ci"] = "idle"
+    sim.step(30, 120)  # ...and gone at the next: the interval in between had CI activity
+    assert "idle:active" in sim.det._load()["window"]["bad"]
+    # and the very first interval after a baseline has no previous reading, so it is unknown
+    st = {}
+    assert cb.evaluate_idle(sim.det.probes, [], T0, T0 - 30, {"fake": lambda s, r, n, sc: ("idle", "x")},
+                            prev=st)[0] == "unknown"
+
+
+def test_empty_specs_and_unparseable_ps_are_not_evidence(tmp_path):
+    assert cb.probe_files_quiet({"globs": []}, None, T0, T0 - 30)[0] == "unknown"
+    assert cb.probe_process_absent({"patterns": []}, [], T0, T0)[0] == "unknown"
+    assert cb.evaluate_idle([{"type": "files_quiet", "kind": "conversation", "globs": []},
+                             {"type": "process_absent", "kind": "ci", "patterns": []}], [], T0, T0)[0] == "unknown"
+    det = cb.Detector({"services": SERVICES, "probes": []}, tmp_path, None, ps_fn=lambda: "garbage line\n",
+                      clock=lambda: T0)
+    assert det.tick()["action"] == "ps_failed"
+    assert cb.evaluate_idle([{"kind": "ci"}], [], T0, T0)[0] == "unknown"  # spec without a type
+    assert cb.evaluate_idle([{"type": "x", "kind": "ci"}], [], T0, T0, registry={})[0] == "unknown"
+
+
+def test_self_exclusion_does_not_hide_builds_named_like_the_detector():
+    rows = [{"pid": 9, "start": 0, "cpu_s": 0, "args": "pytest plugins/cpu-budget/test_cpu_budget.py"}]
+    assert cb.probe_process_absent({"patterns": ["pytest"]}, rows, T0, T0)[0] == "active"
+    own = [{"pid": 9, "start": 0, "cpu_s": 0, "args": "/usr/bin/python3 /x/mac-load-recorder sample --threshold 20"}]
+    assert cb.probe_process_absent({"patterns": ["python3"]}, own, T0, T0)[0] == "idle"
+
+
+def test_ps_is_called_wide_so_launchd_does_not_truncate_args(monkeypatch):
+    seen = {}
+
+    def fake(argv, *a, **k):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "1 Thu Jan  1 00:00:00 1970 0:00.00 x\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    cb.run_ps()
+    assert "-Aww" in seen["argv"]
