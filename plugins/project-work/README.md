@@ -179,8 +179,10 @@ and always calls native `next()`. A background worker retries uncertain deliveri
 Deterministic invalid requests are acknowledged and retained in the journal's
 `rejected(payload, reason, rejected_at)` table, not retried forever. Transport failures
 remain pending. The journal is independent of the controller effect lock; network stalls do not block
-Bolt acknowledgement. Register refuses non-sandboxed terminal/code backends and Docker
-custom host mounts. Verify actual implicit mounts and profile routing in deployment.
+Bolt acknowledgement. Register refuses non-sandboxed terminal/code backends, a Docker
+cwd mount, Docker extra args other than `--runtime=runsc` (gVisor), and any Docker volume
+except a read-only single regular file `<profile home>/sandbox-bin/<file>:/usr/local/bin/<name>:ro`
+(no symlinks, owned by the gateway uid; tests in `tests/test_ingress_security.py`). Verify actual implicit mounts and profile routing in deployment.
 Reconciliation backfills active threads and approval attempts. Successfully archived
 threads are checked at most once per five minutes for the first 24 hours, then only
 authenticated live ingress reopens them. Old ledger archives without `archived_at`

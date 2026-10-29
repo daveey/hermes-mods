@@ -1,5 +1,7 @@
 """Profile-local project-work entry point; no private defaults or target discovery."""
 import importlib
+import os
+import stat
 
 from pathlib import Path
 import sys
@@ -27,9 +29,51 @@ def require_sandbox():
     backend = config.get('env_type')
     if backend not in {'docker', 'modal', 'daytona', 'vercel'}:
         raise PermissionError('Project work requires a sandboxed terminal/code backend')
-    if backend == 'docker' and any(config.get(key) for key in (
-            'docker_volumes', 'docker_extra_args', 'docker_mount_cwd_to_workspace')):
-        raise PermissionError('Project work forbids host mounts and custom Docker arguments')
+    if backend != 'docker':
+        return
+    if config.get('docker_mount_cwd_to_workspace'):
+        raise PermissionError('Project work forbids mounting the host cwd into the sandbox')
+    extra = list(config.get('docker_extra_args') or [])
+    if extra not in _ALLOWED_DOCKER_ARGS:
+        raise PermissionError('Project work forbids custom Docker arguments other than --runtime=runsc')
+    volumes = config.get('docker_volumes') or []
+    if volumes:
+        try:
+            from hermes_constants import get_hermes_home
+            tool_dir = os.path.realpath(os.path.join(str(get_hermes_home()), 'sandbox-bin'))
+        except Exception as exc:  # fail closed: no profile home, no mounts
+            raise PermissionError('Project work cannot verify host mounts without a profile home') from exc
+        for volume in volumes:
+            _check_tool_mount(volume, tool_dir)
+
+
+# gVisor only tightens the default runc sandbox; every other argument refuses.
+_ALLOWED_DOCKER_ARGS = ([], ['--runtime=runsc'], ['--runtime', 'runsc'])
+
+
+def _check_tool_mount(volume, tool_dir):
+    """Allow only a read-only mount of one regular file from <home>/sandbox-bin into /usr/local/bin."""
+    refuse = PermissionError(f'Project work forbids host mount {volume!r}: only '
+                             '<profile>/sandbox-bin/<file>:/usr/local/bin/<name>:ro is allowed')
+    if not isinstance(volume, str):
+        raise refuse
+    parts = volume.split(':')
+    if len(parts) != 3 or parts[2] != 'ro':
+        raise refuse
+    src, dst = parts[0], parts[1]
+    # Relative, '..', or a symlink anywhere in the path (including sandbox-bin itself) refuses.
+    if not os.path.isabs(src) or os.path.normpath(src) != src or os.path.realpath(src) != src:
+        raise refuse
+    if os.path.dirname(src) != tool_dir:
+        raise refuse
+    try:
+        st = os.lstat(src)
+    except OSError:
+        raise refuse from None
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        raise refuse
+    if os.path.normpath(dst) != dst or os.path.dirname(dst) != '/usr/local/bin':
+        raise refuse
 
 
 def register(ctx):

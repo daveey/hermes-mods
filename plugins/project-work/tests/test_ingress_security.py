@@ -121,6 +121,126 @@ def test_registration_sandbox_gate(monkeypatch, config, allowed):
         with pytest.raises(PermissionError): plugin.require_sandbox()
 
 
+@pytest.fixture
+def tool_home(tmp_path, monkeypatch):
+    home = tmp_path.resolve() / 'profile'
+    (home / 'sandbox-bin').mkdir(parents=True)
+    tool = home / 'sandbox-bin' / 'gh'
+    tool.write_bytes(b'\x7fELF')
+    monkeypatch.setitem(sys.modules, 'hermes_constants', types.SimpleNamespace(get_hermes_home=lambda: home))
+    return home, tool
+
+
+def gate(monkeypatch, **config):
+    config = {'env_type': 'docker', **config}
+    monkeypatch.setitem(sys.modules, 'tools.terminal_tool', types.SimpleNamespace(_get_env_config=lambda: config))
+    return plugin.require_sandbox
+
+
+@pytest.mark.parametrize('args', [['--runtime=runsc'], ['--runtime', 'runsc'], []])
+def test_sandbox_accepts_runsc_runtime_arg(monkeypatch, args):
+    gate(monkeypatch, docker_extra_args=args)()
+
+
+@pytest.mark.parametrize('args', [['--privileged'], ['-v', '/:/host'], ['--runtime=runsc', '--privileged'],
+                                  ['--runtime=runc'], ['--network=host'], ['--cap-add=ALL']])
+def test_sandbox_refuses_other_extra_args(monkeypatch, args):
+    with pytest.raises(PermissionError): gate(monkeypatch, docker_extra_args=args)()
+
+
+def test_sandbox_accepts_sandbox_bin_ro_file_mount(monkeypatch, tool_home):
+    _, tool = tool_home
+    gate(monkeypatch, docker_extra_args=['--runtime=runsc'],
+         docker_volumes=[f'{tool}:/usr/local/bin/gh:ro'])()
+
+
+@pytest.mark.parametrize('mode', ['', ':rw', ':ro,rw', ':z'])
+def test_sandbox_refuses_rw_mount(monkeypatch, tool_home, mode):
+    _, tool = tool_home
+    with pytest.raises(PermissionError): gate(monkeypatch, docker_volumes=[f'{tool}:/usr/local/bin/gh{mode}'])()
+
+
+def test_sandbox_refuses_dir_mount(monkeypatch, tool_home):
+    home, _ = tool_home
+    (home / 'sandbox-bin' / 'sub').mkdir()
+    with pytest.raises(PermissionError):
+        gate(monkeypatch, docker_volumes=[f'{home / "sandbox-bin" / "sub"}:/usr/local/bin/sub:ro'])()
+    with pytest.raises(PermissionError):
+        gate(monkeypatch, docker_volumes=[f'{home / "sandbox-bin"}:/usr/local/bin/x:ro'])()
+
+
+def test_sandbox_refuses_docker_socket_mount(monkeypatch, tool_home):
+    with pytest.raises(PermissionError):
+        gate(monkeypatch, docker_volumes=['/var/run/docker.sock:/usr/local/bin/docker.sock:ro'])()
+
+
+def test_sandbox_refuses_socket_in_sandbox_bin(monkeypatch, tool_home):
+    import socket
+    home, _ = tool_home
+    path = home / 'sandbox-bin' / 's'
+    sock = socket.socket(socket.AF_UNIX)
+    try:
+        monkeypatch.chdir(path.parent)  # AF_UNIX paths are capped near 108 bytes
+        sock.bind('s')
+        with pytest.raises(PermissionError): gate(monkeypatch, docker_volumes=[f'{path}:/usr/local/bin/s:ro'])()
+    finally:
+        sock.close()
+
+
+def test_sandbox_refuses_symlinked_src(monkeypatch, tool_home, tmp_path):
+    home, _ = tool_home
+    target = tmp_path / 'secret'
+    target.write_text('x')
+    link = home / 'sandbox-bin' / 'link'
+    link.symlink_to(target)
+    with pytest.raises(PermissionError): gate(monkeypatch, docker_volumes=[f'{link}:/usr/local/bin/link:ro'])()
+
+
+def test_sandbox_refuses_symlinked_sandbox_bin_dir(monkeypatch, tmp_path):
+    home, real = tmp_path.resolve() / 'profile', tmp_path.resolve() / 'elsewhere'
+    real.mkdir(); home.mkdir()
+    (real / 'gh').write_text('x')
+    (home / 'sandbox-bin').symlink_to(real)
+    monkeypatch.setitem(sys.modules, 'hermes_constants', types.SimpleNamespace(get_hermes_home=lambda: home))
+    with pytest.raises(PermissionError):
+        gate(monkeypatch, docker_volumes=[f'{home / "sandbox-bin" / "gh"}:/usr/local/bin/gh:ro'])()
+
+
+@pytest.mark.parametrize('where', ['home', 'other-sandbox-bin'])
+def test_sandbox_refuses_src_outside_sandbox_bin(monkeypatch, tool_home, tmp_path, where):
+    home, _ = tool_home
+    path = home / 'config.yaml' if where == 'home' else tmp_path.resolve() / 'other' / 'sandbox-bin' / 'gh'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('x')
+    with pytest.raises(PermissionError): gate(monkeypatch, docker_volumes=[f'{path}:/usr/local/bin/x:ro'])()
+
+
+@pytest.mark.parametrize('src', ['{home}/sandbox-bin/../sandbox-bin/gh', 'sandbox-bin/gh', '{home}/sandbox-bin/missing'])
+def test_sandbox_refuses_dotdot_relative_or_missing_src(monkeypatch, tool_home, src):
+    home, _ = tool_home
+    with pytest.raises(PermissionError):
+        gate(monkeypatch, docker_volumes=[src.format(home=home) + ':/usr/local/bin/gh:ro'])()
+
+
+@pytest.mark.parametrize('dst', ['/etc/passwd', '/usr/local/bin/../../etc/gh', '/usr/local/bin/sub/gh', '/usr/local/bin'])
+def test_sandbox_refuses_dst_outside_usr_local_bin(monkeypatch, tool_home, dst):
+    _, tool = tool_home
+    with pytest.raises(PermissionError): gate(monkeypatch, docker_volumes=[f'{tool}:{dst}:ro'])()
+
+
+def test_sandbox_refuses_mount_cwd_even_with_allowed_mount(monkeypatch, tool_home):
+    _, tool = tool_home
+    with pytest.raises(PermissionError):
+        gate(monkeypatch, docker_mount_cwd_to_workspace=True, docker_extra_args=['--runtime=runsc'],
+             docker_volumes=[f'{tool}:/usr/local/bin/gh:ro'])()
+
+
+def test_sandbox_refuses_one_bad_volume_among_good(monkeypatch, tool_home):
+    _, tool = tool_home
+    with pytest.raises(PermissionError):
+        gate(monkeypatch, docker_volumes=[f'{tool}:/usr/local/bin/gh:ro', '/var/run/docker.sock:/var/run/docker.sock'])()
+
+
 def test_unsafe_backend_refuses_before_registration(env, tmp_path, monkeypatch):
     service, _, _ = env
     (tmp_path / 'project-work.json').write_text('{}')
