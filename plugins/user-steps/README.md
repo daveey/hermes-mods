@@ -403,7 +403,7 @@ turn-end hook). Tests: `tests/test_clarify_early.py`.
 From the repository root:
 
 ```sh
-uv run --with pytest --with fastapi --with httpx pytest -q plugins/user-steps/tests
+uv run --with pytest --with pyyaml --with fastapi --with httpx python -m pytest -q -p no:cacheprovider plugins/user-steps/tests
 HERMES_DESKTOP_DIR=/path/to/test-dependencies node --test --test-reporter=tap desktop-plugins/user-steps/decision-queue.test.mjs desktop-plugins/user-steps/decision-queue.browser.test.mjs desktop-plugins/user-steps/test/*.test.mjs desktop-plugins/session-tasks/test/*.test.mjs desktop-plugins/blocked-panel/test/*.test.mjs
 ```
 
@@ -413,6 +413,11 @@ jsdom, esbuild and Playwright with installed Chromium. If omitted, the tests use
 No Playwright dependency is added to the runtime plugin.
 
 The standalone runner omits core-only integration tests when core is unavailable.
+The `user-steps` workflow runs that suite without core on Python 3.11 and 3.14.
+`tests/test_core_compatibility.py` forces both early-answer import branches and
+checks that missing/incompatible publication capabilities still refuse registration;
+`test_registered_producer_revise_and_consumer_hook` supplies a supported-core fixture
+without bypassing that capability check.
 For the full backend suite, use an isolated core worktree with this feature:
 
 ```sh

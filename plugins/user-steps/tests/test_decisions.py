@@ -258,6 +258,13 @@ def test_registered_producer_revise_and_consumer_hook(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path)); monkeypatch.setenv('HERMES_GATEWAY_ID', 'test-gateway')
     monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
     plugin = load_module('registered_producer', ROOT / '__init__.py')
+    # This test exercises registration on a supported core. Keep the real
+    # capability check; only supply the external core module in standalone runs.
+    import sys
+    import types
+    gate = types.ModuleType('agent.pre_final_gate')
+    gate.__dict__['PRE_FINAL_GATE_CAPABILITIES'] = {'needs_buffer': True, 'post_transform_release': True}
+    monkeypatch.setitem(sys.modules, 'agent.pre_final_gate', gate)
     monkeypatch.setattr(plugin.core, 'home', lambda: tmp_path)
     monkeypatch.setattr(plugin.core, 'server_owner', lambda sid: dict(OWNER, storedSessionId=sid))
     class Registry:

@@ -17,12 +17,13 @@ VIA = "for-you-queue"
 try:  # core module; a plugin on an older core registers nothing (see __init__.register)
     from tools.clarify_early import EarlyAnswer
 except ImportError:
-    from dataclasses import dataclass
-
-    @dataclass
     class EarlyAnswer:  # same shape, so tests and older cores still work
-        result: dict
-        commit: Callable[[], Any]
+        # Sibling loaders publish modules only after exec_module, avoiding half-loaded
+        # modules in other threads. A dataclass with postponed annotations requires
+        # sys.modules during class creation, so keep this fallback a plain container.
+        def __init__(self, result: dict, commit: Callable[[], Any]):
+            self.result = result
+            self.commit = commit
 
 
 def _load_sibling(name: str):
