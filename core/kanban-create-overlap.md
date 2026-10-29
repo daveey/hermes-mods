@@ -1,6 +1,6 @@
 # kanban_create refuses a second owner for work an open card already does
 
-Patch: [`patches/0726-feat-kanban-kanban_create-refuses-a-second-owner-for.patch`](patches/0726-feat-kanban-kanban_create-refuses-a-second-owner-for.patch) (fork commit `d0cc66e9f4`)
+Patch: [`patches/0726-feat-kanban-kanban_create-refuses-a-second-owner-for.patch`](patches/0726-feat-kanban-kanban_create-refuses-a-second-owner-for.patch) (fork commit `d0cc66e9f4`); CLI/REST entry paths: [`patches/0729-feat-kanban-hermes-kanban-create-and-REST-POST-tasks.patch`](patches/0729-feat-kanban-hermes-kanban-create-and-REST-POST-tasks.patch) (fork commit `b3ae470c6d`)
 
 ## Why
 
@@ -38,6 +38,20 @@ than 2 overrides in 7 days end up archived (a duplicate let through).
 
 The tool description says "count owners by board/project, not by your chat's links".
 
+Every create entry path runs the same check (patch 0729):
+
+- `kanban_create` tool: `distinct_from` + `distinct_reason`; the refusal is the tool result.
+- `hermes kanban create` (terminal, execute_code, crons): `--distinct-from <id>` (repeatable) +
+  `--distinct-reason`; a refusal exits 2, prints the refusal JSON on stdout with `--json`, else the note and
+  matches on stderr, with a ready-to-paste `--distinct-from ...` retry hint.
+- Dashboard/REST `POST /tasks`: JSON fields `distinct_from` + `distinct_reason`; a refusal is HTTP 409 with the
+  refusal object as `detail`.
+
+On every path an `idempotency_key` retry (a non-archived card with that key exists) skips the check, and a keyed
+creator is never blocked by open cards from its own key family (the text before the first `:`, e.g.
+`coach-fix:*`, `selfheal:*`): automated creators (coach and self-heal crons, open-asks, user-steps) dedupe by key.
+Parents never match; courier-applied cards are not re-checked.
+
 Off switch: `kanban.create_overlap_check: false`. A missing or unreadable replica or board is skipped and
 logged; a crash in the check creates the card as before (never a block).
 
@@ -48,6 +62,9 @@ logged; a crash in the check creates the card as before (never a block).
   which the asking gateway already checked) and records an accepted override on the new card.
 - `tools/kanban_tools_schemas.py`: `distinct_from`, `distinct_reason`, description line.
 - `hermes_cli/config_defaults.py`: `kanban.create_overlap_check: True`.
+- `hermes_cli/kanban.py` `_cmd_create` + `hermes_cli/kanban_parser.py` (0729): CLI gate and flags.
+- `plugins/kanban/dashboard/plugin_api.py` `create_task` (0729): REST gate and body fields.
+- `kanban_overlap.key_family` (0729): the idempotency-key family exemption, shared by all three paths.
 - `tests/conftest.py`: `HERMES_HUB_STATE` points at a per-test dir so a host's live replica never leaks in.
 
 ## Tests
@@ -62,7 +79,15 @@ logged; a crash in the check creates the card as before (never a block).
 - `tests/hermes_cli/test_kanban_create_entry_parity.py::test_placed_tool_create_is_overlap_checked_before_it_leaves`
   (registry dispatch, placement route to another gateway): a duplicate never reaches the courier; distinct work is
   still placed.
-- Untested: the CLI (`hermes kanban create`) and REST create paths do not run the check.
+- CLI entry path, `tests/hermes_cli/test_kanban_create_entry_parity.py`:
+  `test_cli_create_refuses_a_duplicate_owner` (refused, `--json` and plain output, nothing created),
+  `test_cli_create_override_is_accepted_and_recorded` (`--distinct-from` without a reason refused; with
+  `--distinct-reason` created plus the override event), `test_cli_create_with_idempotency_key_skips_its_own_family`
+  (key retry returns the card; same family not blocked; another family refused),
+  `test_cli_create_never_matches_its_parent`. Red before 0729.
+- REST entry path, same file: `test_rest_create_refuses_a_duplicate_owner` (409 `create_overlap`, nothing
+  created), `test_rest_create_override_is_accepted_and_recorded` (409 without reason; 200 plus override event with
+  it). Red before 0729.
 
 ## Applying
 
