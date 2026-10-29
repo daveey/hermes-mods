@@ -65,3 +65,13 @@ def test_error_also_backs_off(tmp_path, monkeypatch):
     assert len(calls) == 1
     tick(1600)
     assert len(calls) == 2
+
+
+def test_kanban_worker_transcript_row_is_dropped_never_woken(tmp_path, monkeypatch):
+    led, calls, tick = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(plugin, '_session_source', lambda sid: 'kanban')
+    tick(1000)
+    tick(5000)
+    assert calls == []
+    assert led.pending() == []
+    assert led.get('chat')['failure_since'] is None

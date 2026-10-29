@@ -454,6 +454,12 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
     done: list[dict] = []
     for row in led.pending():
         sid = row["session_id"]
+        if _session_source(sid).lower() in SKIP_PLATFORMS:
+            # A worker/cron transcript is not a chat: it cannot be resumed (resume is refused), so a ledger row for
+            # it (stamped by a turn that ran without HERMES_KANBAN_TASK) would retry and raise ask-failed forever.
+            led.write(sid, batch=[], open=[], failure_since=None, retry_after=0)
+            logger.info("chat-closeout: dropped ledger row of non-chat session %s", sid)
+            continue
         cards = read(row["batch"])
         fix = core.reconcile(row, cards)
         fix.update(core.reconcile_done({**row, **fix}, cards,
@@ -519,6 +525,21 @@ def _session_scope(sid: str) -> tuple[Optional[Path], str]:
         finally:
             c.close()
     return None, "default"
+
+
+def _session_source(sid: str) -> str:
+    """state.db ``sessions.source`` of ``sid`` ('' when unknown)."""
+    path, _ = _session_scope(sid)
+    if path is None:
+        return ""
+    c = core.ro_connect(path)
+    try:
+        r = c.execute("SELECT source FROM sessions WHERE id=?", (sid,)).fetchone()
+        return (r[0] or "") if r else ""
+    except Exception:
+        return ""
+    finally:
+        c.close()
 
 
 def _moved_owner(sid: str) -> Optional[str]:
