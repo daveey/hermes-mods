@@ -22,6 +22,15 @@ orange), "load not reported" until the machine's core has the reporter, and "(N 
 CI machines show load and free disk only when the runners collector probes their host (no RAM there); the
 others have no meter line.
 
+Investigate: each gateway row has an **Investigate** button. It posts the machine and its current numbers to
+`POST /v1/investigations` on the gateway that served the gateway section; that gateway creates a Kanban card
+with `placement=<machine>` (so the card runs ON that machine; a cross-gateway create for machines without
+pickup) and the `machine-investigate` skill, or returns the one already open or blocked (never a duplicate).
+The row then shows `Investigating · t_…` (click opens the card), `Needs you · <ask>` while the card is blocked,
+or `Investigated 12m ago · <verdict>` (click opens the result; the button starts a new one). Status comes from
+the fleet response: each gateway row carries `investigation` (newest card with key `investigate-machine:<name>:…`
+in the board replicas; a create not yet replicated shows as queued for 15 min).
+
 Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`),
 red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing
 running is grey with "not seen for N min". A section the gateway cannot read says Unknown/Stale with the reason.
@@ -62,5 +71,10 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
   `test_ci_machines_take_load_from_collector_host_probes` (reporter and Board route: core
   `tests/hermes_cli/test_machine_metrics.py`, hermes-hub `worker/test/machines.test.ts`)
 - open panel updates in place, one request per poll, no polling while hidden: "open panel updates in place"
+
+- Investigate: start / already running / queued / needs you / done / error / old host:
+  `investigate.test.mjs`; route create with placement, reuse of open/blocked, restart after done, refusals,
+  fleet rows carry the latest: `test_api.py` `test_investigation_route_*`, `test_fleet_rows_carry_their_latest_investigation`;
+  what the card runs: `skills/devops/machine-investigate/tests/test_collect.py`
 
 Not covered: native Desktop rendering (checked by hand after hermes-sync).

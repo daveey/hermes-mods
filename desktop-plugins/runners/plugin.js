@@ -408,7 +408,7 @@ function openCard(run) {
   host.navigate?.('/kanban')
 }
 
-function GatewayRow({ m, now }) {
+function GatewayRow({ m, now, investigator, route }) {
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const meta = [
@@ -427,8 +427,82 @@ function GatewayRow({ m, now }) {
       ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] }))),
     h('span', { className: 'hermes-fleet-count' }, m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
     h('span', { className: 'hermes-fleet-meta' }, [meta, m.reason].filter(Boolean).join(' · ')),
-    h(Meters, { load: m.load, now })
+    h(Meters, { load: m.load, now }),
+    investigator && route ? h(Investigate, { m, now, investigator, route }) : null
   )
+}
+
+const INV_OPEN = ['queued', 'created', 'triage', 'todo', 'ready', 'scheduled', 'running', 'review']
+
+// What the row says about its machine's latest investigation card, and what a click does.
+export function investigationView(inv, now = Date.now()) {
+  if (!inv) return { state: 'none', text: '', button: 'Investigate', opens: false }
+  const id = inv.task ? ` · ${inv.task}` : ''
+  if (INV_OPEN.includes(inv.status))
+    return { state: 'running', text: `Investigating${id}`, button: inv.task ? 'Open investigation' : 'Investigation queued', opens: !!inv.task }
+  if (inv.status === 'blocked')
+    return { state: 'blocked', text: `Needs you${inv.verdict ? ` · ${text(inv.verdict)}` : id}`, button: 'Open investigation', opens: !!inv.task }
+  const when = inv.completed_at || inv.created_at
+  return {
+    state: 'done',
+    text: `Investigated${when ? ` ${ago(now - when * 1000)}` : ''}${inv.verdict ? ` · ${text(inv.verdict)}` : id}`,
+    button: 'Investigate', opens: false, result: !!inv.task
+  }
+}
+
+// POST /v1/investigations on the gateway that served the gateway section. The gateway creates the card
+// ON the machine (placement=<machine>) or returns the one already open, so a second click never duplicates.
+export function createInvestigator(ctx) {
+  const pending = new Map()
+  async function start(route, m) {
+    if (!validRoute(route)) throw Object.assign(new Error('No gateway route for this machine'), { safe: true })
+    if (pending.has(m.name)) return pending.get(m.name)
+    const load = m.load ? Object.fromEntries(
+      ['cpu_load1', 'cpus', 'mem_used_pct', 'disk_free_gb', 'disk_total_gb'].filter((k) => typeof m.load[k] === 'number').map((k) => [k, m.load[k]])) : null
+    const p = ctx.rest(`/v1/investigations?profile=${encodeURIComponent(route.targetProfile)}`, {
+      method: 'POST', body: { machine: m.name, load }, connectionId: route.connectionId, timeoutMs: 30000
+    }).then((res) => {
+      if (!res?.investigation) throw Object.assign(new Error('Invalid investigation response'), { safe: true })
+      return res
+    })
+    pending.set(m.name, p)
+    try { return await p } finally { pending.delete(m.name) }
+  }
+  return { start }
+}
+
+function Investigate({ m, now, investigator, route }) {
+  const [local, setLocal] = useState(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  // The fleet poll is the truth once it knows about the card; until then show what the POST returned.
+  const inv = m.investigation || local
+  const v = investigationView(inv, now)
+  const open = (i) => i?.task && openCard({ task: i.task, board: i.board || 'default' })
+  return h('span', { className: `hermes-fleet-inv is-${v.state}`, 'data-investigate': m.name },
+    h('button', {
+      type: 'button', disabled: busy || (v.state === 'running' && !v.opens),
+      'data-investigate-action': m.name,
+      title: v.opens ? 'Open the investigation card' : `Start a card on ${m.name} that finds what is loading it and fixes what is safe`,
+      onClick: async () => {
+        if (v.opens) return open(inv)
+        setBusy(true)
+        setError('')
+        try {
+          const res = await investigator.start(route, m)
+          setLocal(res.investigation)
+          open(res.investigation)
+        } catch (e) {
+          setError(e?.safe ? e.message : `Could not start: ${text(e?.message || 'error')}`)
+        } finally { setBusy(false) }
+      }
+    }, busy ? 'Starting…' : v.button),
+    v.text ? h(v.result ? 'button' : 'span', {
+      type: v.result ? 'button' : undefined, className: 'hermes-fleet-inv-text',
+      title: v.result ? 'Open the investigation result' : undefined,
+      onClick: v.result ? () => open(inv) : undefined
+    }, v.text) : null,
+    error ? h('span', { role: 'alert', className: 'hermes-fleet-inv-error' }, error) : null)
 }
 
 function CiRow({ m, now, repairClient, route, sourceError }) {
@@ -506,14 +580,14 @@ function SectionNote({ section }) {
   return h('div', { className: 'hermes-fleet-note', role: 'status' }, msg)
 }
 
-export function Panel({ view, now, repairClient }) {
+export function Panel({ view, now, repairClient, investigator }) {
   const s = summarize(view)
   return h('div', { className: 'hermes-fleet' },
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'Gateway workers'),
       h('span', null, `${s.gBusy} / ${s.gSlots} slots busy`)),
     h(SectionNote, { section: view.gateways }),
-    ...view.gateways.machines.map((m) => h(GatewayRow, { key: m.name, m, now })),
+    ...view.gateways.machines.map((m) => h(GatewayRow, { key: m.name, m, now, investigator, route: view.gateways.route })),
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'CI workers (GitHub Actions)'),
       h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
@@ -555,6 +629,7 @@ export function Runners({ ctx }) {
   const visible = useVisible()
   const transport = useMemo(() => createTransport(ctx), [ctx])
   const repairClient = useMemo(() => createRepairClient(ctx), [ctx])
+  const investigator = useMemo(() => createInvestigator(ctx), [ctx])
   const query = useQuery({
     queryKey: ['runners', 'fleet'],
     queryFn: () => transport.poll(),
@@ -584,7 +659,7 @@ export function Runners({ ctx }) {
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
       style: { width: 'min(640px, calc(100vw - 24px))', maxHeight: '70vh', overflowY: 'auto' }
-    }, view ? h(Panel, { view, now, repairClient }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
+    }, view ? h(Panel, { view, now, repairClient, investigator }) : h('div', { className: 'hermes-fleet-note' }, query.error ? `Unavailable: ${text(query.error.message)}` : 'Loading…'))
   )
 }
 
@@ -605,6 +680,14 @@ const CSS = `
 .hermes-fleet-bar>span{display:block;height:100%;background:var(--ui-text-secondary)}
 .hermes-fleet-bar.is-high>span{background:#d9822b}
 .hermes-fleet-warning{color:var(--ui-text-secondary)}
+.hermes-fleet-inv{grid-column:2/4;display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;color:var(--ui-text-tertiary)}
+.hermes-fleet-inv>button:first-child{font-size:11px;padding:0 6px;border:1px solid var(--ui-stroke-secondary);border-radius:4px;background:transparent;color:var(--ui-text-secondary);cursor:pointer}
+.hermes-fleet-inv>button:disabled{opacity:.55;cursor:default}
+.hermes-fleet-inv-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px;background:none;border:0;padding:0;color:inherit;font:inherit;text-align:left}
+button.hermes-fleet-inv-text{cursor:pointer;text-decoration:underline dotted}
+.hermes-fleet-inv.is-running .hermes-fleet-inv-text{color:var(--ui-text-secondary)}
+.hermes-fleet-inv.is-blocked .hermes-fleet-inv-text{color:#d9822b}
+.hermes-fleet-inv-error{color:#d64545}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
 .hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}

@@ -177,8 +177,79 @@ def _gateway_section():
     registry = node.registry()  # core caches it for REGISTRY_TTL_S; a failed read keeps the last value
     read_at = node._REGISTRY.get('at')
     age = time.monotonic() - read_at if registry is not None and read_at is not None else None
-    return fleet.gateway_workers(registry, leases, now_ms, registry_age_s=age,
-                                 local_cap=_local_cap())
+    section = fleet.gateway_workers(registry, leases, now_ms, registry_age_s=age,
+                                    local_cap=_local_cap())
+    try:
+        inv = _investigate()
+        found = inv.latest(_board_dirs(), {m['name'] for m in section['machines']})
+        inv.attach(section['machines'], found, _pending, time.time())
+    except (OSError, sqlite3.Error):
+        pass  # the panel shows no investigation state rather than failing the fleet view
+    return section
+
+
+def _investigate():
+    with _lock:
+        name = 'hermes_runners_investigate'
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / 'investigate.py')
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            sys.modules[name] = module
+        return sys.modules[name]
+
+
+def _board_dirs():
+    """Board replicas (every synced gateway's cards) and this machine's own boards."""
+    from hermes_cli import kanban_sync_client as ksc
+    from hermes_cli.kanban_db import kanban_home
+    return [ksc.shadow_path('x').parent, Path(kanban_home()), Path(kanban_home()) / 'boards']
+
+
+# machine -> {at, task, request_id}: a create that has not shown up in the replicas yet.
+_pending = {}
+_investigate_lock = threading.Lock()
+
+
+def _create_card(args):
+    """Through the kanban_create tool handler, so placement (cross-gateway create, runs_on) and the
+    idempotency key behave exactly as for an agent's create."""
+    import json
+    from tools.kanban_tools import _handle_create
+    return json.loads(_handle_create(dict(args)))
+
+
+@router.post('/investigations', status_code=202)
+def investigate(payload: dict):
+    """Start (or return the open) investigation card for one gateway machine."""
+    import time
+    inv = _investigate()
+    machine = (payload or {}).get('machine')
+    if not isinstance(machine, str) or not inv.NAME.match(machine):
+        raise HTTPException(400, 'invalid_machine')
+    from hermes_cli import kanban_worker_node as node
+    registry = node.registry()
+    if registry is None:
+        raise HTTPException(503, 'registry_unavailable')
+    if machine not in (registry.get('machines') or {}):
+        raise HTTPException(404, 'unknown_machine')
+    with _investigate_lock:
+        current = inv.latest(_board_dirs(), {machine}).get(machine)
+        if inv.is_open(current) or inv.needs_user(current):
+            return dict(created=False, machine=machine, investigation=current)
+        p = _pending.get(machine)
+        if p and time.time() - p['at'] < inv.PENDING_S and (current is None or p['at'] > (current['created_at'] or 0)):
+            return dict(created=False, machine=machine, investigation=dict(task=p.get('task'), status='queued'))
+        args = inv.card_args(machine, payload.get('load'), time.time())
+        res = _create_card(args)
+        if not res.get('ok', True) or res.get('error'):
+            raise HTTPException(502, str(res.get('error') or 'create_failed')[:200])
+        task = res.get('task_id')
+        _pending[machine] = dict(at=time.time(), task=task, request_id=(res.get('placed') or {}).get('request_id'))
+        _fleet_cache.update(at=None, value=None)
+        return dict(created=True, machine=machine,
+                    investigation=dict(task=task, status=res.get('status') or 'queued',
+                                       runs_where=res.get('runs_where') or machine))
 
 
 def _local_cap():

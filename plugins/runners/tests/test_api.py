@@ -467,3 +467,82 @@ def test_local_cap_reads_the_kanban_home_config_for_every_profile(api, monkeypat
     assert module._local_cap() == 8
     (tmp_path / 'config.yaml').unlink()
     assert module._local_cap() == 8
+
+
+def _investigate_env(module, monkeypatch, tmp_path, machines=('mini', 'hub')):
+    node = types.ModuleType('hermes_cli.kanban_worker_node')
+    node.registry = lambda: {'me': 'macbook', 'machines': {m: {'state': 'active'} for m in machines}}
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_worker_node', node)
+    pkg = sys.modules.get('hermes_cli') or types.ModuleType('hermes_cli')
+    monkeypatch.setitem(sys.modules, 'hermes_cli', pkg)
+    monkeypatch.setattr(pkg, 'kanban_worker_node', node, raising=False)
+    monkeypatch.setattr(module, '_board_dirs', lambda: [tmp_path])
+    module._pending.clear()
+    created = []
+    def create(args):
+        created.append(args)
+        return {'ok': True, 'task_id': f't_00000000000{len(created)}', 'status': 'created', 'runs_where': args['placement']}
+    monkeypatch.setattr(module, '_create_card', create)
+    return created
+
+
+def _shadow_card(tmp_path, tid, machine, status, created_at, result=None):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / 'default.db')
+    db.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT, status TEXT, result TEXT, idempotency_key TEXT, '
+               'created_at INTEGER, completed_at INTEGER, human_request TEXT)')
+    db.execute('INSERT INTO tasks VALUES (?,?,?,?,?,?,?)',
+               (tid, status, result, f'investigate-machine:{machine}:{created_at}', created_at, None, None))
+    db.commit()
+    db.close()
+
+
+def test_investigation_route_creates_a_card_placed_on_the_machine(api, monkeypatch, tmp_path):
+    module, client, _ = api
+    created = _investigate_env(module, monkeypatch, tmp_path)
+    body = {'machine': 'mini', 'load': {'cpu_load1': 13.8, 'cpus': 8, 'disk_free_gb': 20}}
+    assert client.post(PREFIX + '/investigations', json=body).status_code == 401
+    res = client.post(PREFIX + '/investigations', json=body, headers=TOKEN)
+    assert res.status_code == 202
+    assert res.json()['created'] is True and res.json()['investigation']['task'] == 't_000000000001'
+    (args,) = created
+    assert args['placement'] == 'mini' and args['skills'] == ['machine-investigate', 'five-whys']
+    assert args['idempotency_key'].startswith('investigate-machine:mini:')
+    assert 'CPU load1 13.8 on 8 cores (172%)' in args['body'] and 'disk 20 GB free' in args['body']
+    # A second click before the card reaches the replicas returns the queued one, not a duplicate.
+    again = client.post(PREFIX + '/investigations', json=body, headers=TOKEN).json()
+    assert again['created'] is False and again['investigation']['task'] == 't_000000000001'
+    assert len(created) == 1
+
+
+def test_investigation_route_reuses_an_open_or_blocked_card_and_restarts_after_done(api, monkeypatch, tmp_path):
+    module, client, _ = api
+    created = _investigate_env(module, monkeypatch, tmp_path)
+    _shadow_card(tmp_path, 't_aaaa00000001', 'hub', 'running', 100)
+    res = client.post(PREFIX + '/investigations', json={'machine': 'hub'}, headers=TOKEN).json()
+    assert res['created'] is False and res['investigation']['task'] == 't_aaaa00000001' and not created
+    _shadow_card(tmp_path, 't_aaaa00000002', 'mini', 'blocked', 100)
+    res = client.post(PREFIX + '/investigations', json={'machine': 'mini'}, headers=TOKEN).json()
+    assert res['created'] is False and res['investigation']['status'] == 'blocked' and not created
+    _shadow_card(tmp_path, 't_aaaa00000003', 'mini', 'done', 200, 'mini: fine now')
+    res = client.post(PREFIX + '/investigations', json={'machine': 'mini'}, headers=TOKEN).json()
+    assert res['created'] is True and len(created) == 1
+
+
+def test_investigation_route_refuses_unknown_or_malformed_machines(api, monkeypatch, tmp_path):
+    module, client, _ = api
+    created = _investigate_env(module, monkeypatch, tmp_path)
+    assert client.post(PREFIX + '/investigations', json={'machine': 'nope'}, headers=TOKEN).status_code == 404
+    assert client.post(PREFIX + '/investigations', json={'machine': '../x'}, headers=TOKEN).status_code == 400
+    assert not created
+
+
+def test_fleet_rows_carry_their_latest_investigation(api, monkeypatch, tmp_path):
+    module, _, _ = api
+    _investigate_env(module, monkeypatch, tmp_path)
+    _shadow_card(tmp_path, 't_aaaa00000004', 'mini', 'done', 300, 'mini: two BabyBear rpc loops\nmore')
+    inv = module._investigate()
+    rows = [dict(name='mini'), dict(name='hub')]
+    inv.attach(rows, inv.latest([tmp_path], {'mini', 'hub'}), {'hub': {'at': 1000.0, 'task': None}}, 1001.0)
+    assert rows[0]['investigation']['verdict'] == 'mini: two BabyBear rpc loops'
+    assert rows[1]['investigation']['status'] == 'queued'
