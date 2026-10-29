@@ -38,7 +38,9 @@ Not covered: embeddings (no pool path) and models the pool doesn't carry; those 
   "credit balance is too low", "no credits remaining" or `insufficient_quota` gets one line naming the helper.
 - `pre_tool_call`: a `kanban_block`, blocked `kanban_create`, `inbox_post` or `action_request` asking the user to add
   or buy API credit (or linking the Anthropic/OpenAI billing pages) is refused once per session when the session
-  never ran the helper. Retrying goes through.
+  never ran the helper. Retrying goes through. Only LLM provider credit counts (the same `_about_llm_credit` check as
+  the coach rule: the billing target nearest the ask, by sentence then paragraph, decides): an ask to raise the
+  GitHub Actions spending limit or fund AWS/Vast/Cloudflare passes, while a bare "add $250 of credit" still holds.
 
 The coach plugin's `credit_ask` reply rule is the final-reply half of the same guard.
 

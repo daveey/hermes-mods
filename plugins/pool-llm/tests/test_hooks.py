@@ -76,3 +76,31 @@ def test_unrelated_block_passes():
     args = {"reason": "1) Open https://github.com/settings/billing and fix the Actions payment failure"}
     assert h.pre_tool_call(tool_name="kanban_block", args=args, session_id="s4") is None
     assert h.pre_tool_call(tool_name="kanban_block", args={"reason": "needs a passkey tap"}, session_id="s4") is None
+
+
+# Live false positive: the GitHub Actions billing watchdog's block (the pool can't pay that bill).
+GH_ACTIONS_BLOCK = ("GitHub Actions billing: the spending limit is exhausted and CI is queued.\n\n"
+                    "1) Open https://github.com/settings/billing and raise the spending limit for Actions to $50. "
+                    "2) Then unblock this card.")
+
+
+def test_github_actions_spending_limit_block_is_not_held():
+    h = fresh()
+    assert h.credit_ask("kanban_block", {"reason": GH_ACTIONS_BLOCK}) is None
+    assert h.pre_tool_call(tool_name="kanban_block", args={"reason": GH_ACTIONS_BLOCK}, session_id="s5") is None
+    for other in ("Raise the AWS budget to $500 for the EC2 runners.", "Add $40 of credit to the Vast.ai account.",
+                  "Top up the Cloudflare billing balance by $20."):
+        assert h.credit_ask("kanban_block", {"reason": other}) is None, other
+
+
+def test_anthropic_credit_block_is_held():
+    h = fresh()
+    args = {"reason": "1) Add $250 of credit to the Anthropic API billing (the eval returns 400 'credit balance is "
+                      "too low'). 2) Unblock this card.", "kind": "needs_input"}
+    first = h.pre_tool_call(tool_name="kanban_block", args=args, session_id="s6")
+    assert first and first["action"] == "block"
+    # a bare money ask with no billing target still holds
+    assert h.credit_ask("kanban_block", {"reason": "Please add $250 of credit so the run can finish."})
+    # LLM credit in its own paragraph holds even when another paragraph mentions GitHub Actions
+    mixed = "CI on GitHub Actions is green.\n\nAdd $100 of OpenAI API credits; the eval hits insufficient_quota."
+    assert h.credit_ask("kanban_block", {"reason": mixed})
