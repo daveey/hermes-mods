@@ -133,6 +133,8 @@ export function nextItemAfter(items, item) {
 }
 
 const ARCHIVE = { id: 'archive', label: 'Archive', icon: 'archive', kind: 'archive' }
+// Owner reports a card as noise: archive + mute its poster family + file a five-whys Kanban card.
+const JUNK = { id: 'junk', label: 'Junk (mute poster, file five-whys)', icon: 'trash', kind: 'junk' }
 const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(str(navigator.platform || navigator.userAgent))
 const LEGACY_DO_IT = { id: 'do_it', label: 'Do it', icon: 'play', style: 'primary', kind: 'accept' }
 
@@ -439,6 +441,21 @@ export function createStore(ctx) {
 
   // Run one of the item's card-type actions. Returns false when cancelled.
   const act = async (item, action, input) => {
+    if (action && action.kind === 'junk') {
+      if (item && item.hub) return hubSend(item, 'junk')
+      $busy.set(item.session_id)
+      $items.set($items.get().filter(i => i !== item))
+      try {
+        await ctx.rest(itemPath(item, 'junk'), restOpts(item, routedGateway(), { method: 'POST' }))
+        return true
+      } catch (e) {
+        host.notifyError?.(e, 'Could not mark inbox message as junk')
+        return false
+      } finally {
+        $busy.set('')
+        void refresh()
+      }
+    }
     if (item && item.hub) {
       if (!action || action.kind === 'archive') return hubSend(item, 'archive')
       if (!HUB_ACTION_KINDS.has(action.kind)) return false
@@ -562,11 +579,13 @@ function RowActionButton({ action, onClick }) {
 export function RowActions({ store, item }) {
   const extra = rowActions(item)
   const archive = jsx(ArchiveButton, { onClick: () => void store.act(item, ARCHIVE) })
-  if (!extra.length) return archive
+  const junk = jsx(RowActionButton, { action: JUNK, onClick: () => void store.act(item, JUNK) }, 'junk')
+  if (!extra.length) return jsxs('span', { className: 'flex items-center gap-0.5', children: [junk, archive] })
   return jsxs('span', {
     className: 'flex items-center gap-0.5',
     children: [
       ...extra.map(a => jsx(RowActionButton, { action: a, onClick: () => void store.act(item, a) }, a.id)),
+      junk,
       archive
     ]
   })

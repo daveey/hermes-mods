@@ -10,6 +10,7 @@ POST /items/{sid}/act[?profile=p]      {action, input?} run a card action; promp
 POST /items/{sid}/accept[?profile=p]   alias for act(first prompt action); returns {accept_prompt, ...};
                                  409 on a card with resolve actions (an older Desktop's Do it)
 POST /items/{sid}/archive[?profile=p]  archive the session (outcome 'archived')
+POST /items/{sid}/junk[?profile=p]     archive + mute the poster family + file a five-whys card
 GET  /outcome?key=K[&profile=p]  {found, state, outcome, value, fields, at, session_id, type, task}
 GET  /types[?profile=p]          {types:[...]}
 GET  /types/{name}[?profile=p]   the resolved type (with source) or 404
@@ -177,6 +178,16 @@ async def archive(session_id: str, profile: Optional[str] = None) -> Dict[str, A
     if not ok:
         raise HTTPException(status_code=404, detail="not an inbox message")
     return {"ok": True}
+
+
+@router.post("/items/{session_id}/junk")
+async def junk(session_id: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    """Owner marks a card as junk: archive, mute the poster family, file a five-whys Kanban card."""
+    inbox = _inbox(profile)
+    result = await asyncio.to_thread(lambda: inbox.junk(session_id))
+    if not result:
+        raise HTTPException(status_code=404, detail="not an inbox message")
+    return result
 
 
 @router.get("/outcome")
