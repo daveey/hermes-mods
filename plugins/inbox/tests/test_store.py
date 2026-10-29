@@ -29,7 +29,8 @@ def env(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
     db._inbox_keep_open = True
     clock = {"t": 1_000_000.0}
-    from ask_fixtures import decision_inbox
+    from ask_fixtures import decision_inbox, register_test_posters
+    register_test_posters(tmp_path)
     inbox = decision_inbox(store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"]))
     yield inbox, db, clock
     db.close()
@@ -146,7 +147,8 @@ def test_tool_handler(env, monkeypatch):
     plugin = _load("_inbox_plugin_test", HERE / "__init__.py")
     monkeypatch.setattr(plugin, "store_module", lambda: type("M", (), {"Inbox": lambda *a, **k: inbox}))
     monkeypatch.setattr(plugin, "_poster_for", lambda sid: ("cron · audit", "/work"))
-    out = json.loads(plugin.handle_post({"title": "t", "body": "b", "accept_prompt": "p"}, session_id="x"))
+    out = json.loads(plugin.handle_post({"title": "t", "body": "b", "accept_prompt": "p",
+                                         "ask": __import__("ask_fixtures").ASK}, session_id="x"))
     assert out["posted"] and db.get_session(out["session_id"])["cwd"] == "/work"
     bad = json.loads(plugin.handle_post({"title": "", "body": "b", "accept_prompt": "p"}))
     assert bad["posted"] is False and "title" in bad["error"]
@@ -169,7 +171,9 @@ def test_for_home_binds_a_profiles_own_state_db(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     prof = tmp_path / "profiles" / "p1"
     prof.mkdir(parents=True)
-    r = store.Inbox.for_home(prof).post("t", "b", "do", key="k")
+    from ask_fixtures import ASK, register_test_posters
+    register_test_posters(prof)
+    r = store.Inbox.for_home(prof).post("t", "b", "do", key="k", poster="t", ask=ASK)
     from hermes_state import SessionDB
     db = SessionDB(db_path=prof / "state.db")
     try:
@@ -226,12 +230,14 @@ def test_tool_and_cli_pass_prompt_label(env, monkeypatch):
     monkeypatch.setattr(plugin, "store_module", lambda: type("M", (), {"Inbox": lambda *a, **k: inbox}))
     monkeypatch.setattr(plugin, "_poster_for", lambda sid: ("cron · audit", "/work"))
     out = json.loads(plugin.handle_post({"title": "t", "body": "b", "accept_prompt": "long p",
-                                         "prompt_label": "stop the box"}, session_id="x"))
+                                         "prompt_label": "stop the box",
+                                         "ask": __import__("ask_fixtures").ASK}, session_id="x"))
     assert "**Do it:** stop the box" in db.get_messages(out["session_id"])[0]["content"]
     import argparse
     ap = argparse.ArgumentParser()
     plugin._setup_cli(ap)
-    args = ap.parse_args(["post", "t2", "--body", "b", "--prompt", "p", "--prompt-label", "do the thing", "--poster", "t"])
+    args = ap.parse_args(["post", "t2", "--body", "b", "--prompt", "p", "--prompt-label", "do the thing", "--poster", "t",
+                          "--ask", json.dumps(__import__("ask_fixtures").ASK)])
     assert plugin._run_cli(args) == 0
     sid = [i for i in inbox.list() if i["title"] == "t2"][0]["session_id"]
     assert "**Do it:** do the thing" in db.get_messages(sid)[0]["content"]
@@ -240,14 +246,19 @@ def test_tool_and_cli_pass_prompt_label(env, monkeypatch):
 # ── noise breaker: a poster David keeps archiving is refused ───────────────────
 def _env_with_tasks(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from ask_fixtures import ASK, register_test_posters, with_default_ask
+    register_test_posters(tmp_path)
     from hermes_state import SessionDB
     db = SessionDB(db_path=tmp_path / "state.db")
     db._inbox_keep_open = True
     clock = {"t": 1_000_000.0}
     tasks = []
-    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"],
-                        task_creator=lambda **kw: tasks.append(kw) or "t_mute1")
+    inbox = with_default_ask(store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"],
+                                         task_creator=lambda **kw: tasks.append(kw) or "t_mute1"))
     return inbox, db, clock, tasks
+
+
+_FIX = "abcdef1234567"
 
 
 def _post_and_archive(inbox, clock, poster, n):
@@ -257,62 +268,79 @@ def _post_and_archive(inbox, clock, poster, n):
         inbox.archive(r["session_id"])
 
 
-def test_poster_muted_after_three_ignored_cards(tmp_path, monkeypatch):
+def test_poster_family_muted_after_two_ignored_cards(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
-    _post_and_archive(inbox, clock, "cron · ci-main-watch", 3)
+    _post_and_archive(inbox, clock, "cron · ci-main-watch", store.MUTE_AFTER)
     with pytest.raises(store.PosterMuted):
         inbox.post("Main CI red @ 4", "red", "fix it", key="ci:4", poster="cron · ci-main-watch")
     assert not [i for i in inbox.list() if i["key"] == "ci:4"]
-    # one fix card for the poster, idempotent across repeated refusals
+    # the mute is family-keyed: a different label of the same family is refused too
     with pytest.raises(store.PosterMuted):
-        inbox.post("Main CI red @ 5", "red", "fix it", key="ci:5", poster="cron · ci-main-watch")
-    assert {t["idempotency_key"] for t in tasks} == {"inbox-muted:cron · ci-main-watch"}
+        inbox.post("Main CI red @ 5", "red", "fix it", key="ci:5", poster="cron · other-job")
+    # one fix card for the family, idempotent across repeated refusals
+    assert {t["idempotency_key"] for t in tasks} == {"inbox-muted:cron"}
     assert tasks[0]["assignee"] == "default"
-    # other posters are unaffected
-    assert inbox.post("Approve spend", "b", "go", poster="cron · audit")["updated"] is False
+    # other families are unaffected
+    assert inbox.post("Approve spend", "b", "go", poster="coach")["updated"] is False
     db.close()
 
 
-def test_accepted_card_breaks_the_streak(tmp_path, monkeypatch):
+def test_accepted_card_does_not_break_the_streak_but_a_resolved_decision_does(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
-    _post_and_archive(inbox, clock, "coach", 2)
+    _post_and_archive(inbox, clock, "coach", 1)
     clock["t"] += 60
     r = inbox.post("useful", "b", "go", key="u", poster="coach")
-    inbox.accept(r["session_id"])
-    _post_and_archive(inbox, clock, "coach", 2)
+    inbox.accept(r["session_id"])  # a generic Do it on a repair is not a decision
+    _post_and_archive(inbox, clock, "coach", 1)
+    with pytest.raises(store.PosterMuted):
+        inbox.post("blocked", "b", "go", poster="coach")
+    clock["t"] += 60
+    inbox.unmute("coach", fix_commit=_FIX)
+    # a resolved decision resets the streak
+    _post_and_archive(inbox, clock, "coach", 1)
+    clock["t"] += 60
+    d = inbox.post("pick", "b", "go", key="pick", poster="coach")
+    db.set_session_archived(d["session_id"], False)
+    import sqlite3
+    with sqlite3.connect(inbox.path) as side:
+        side.execute("UPDATE items SET state='resolved' WHERE session_id=?", (d["session_id"],))
+    _post_and_archive(inbox, clock, "coach", 1)
     assert inbox.post("still allowed", "b", "go", poster="coach")["updated"] is False
-    assert tasks == []
     db.close()
 
 
-def test_sidebar_archive_counts_and_unmute_and_window(tmp_path, monkeypatch):
+def test_sidebar_archive_counts_and_unmute_needs_a_fix_commit(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
-    for i in range(3):  # archived through the session door, not inbox.archive
+    for i in range(store.MUTE_AFTER):  # archived through the session door, not inbox.archive
         clock["t"] += 60
-        r = inbox.post(f"x{i}", "b", "go", key=f"x{i}", poster="p")
+        r = inbox.post(f"x{i}", "b", "go", key=f"x{i}", poster="coach")
         db.set_session_archived(r["session_id"], True)
     with pytest.raises(store.PosterMuted):
-        inbox.post("x3", "b", "go", poster="p")
+        inbox.post("x3", "b", "go", poster="coach")
     clock["t"] += 60
-    inbox.unmute("p")
-    assert inbox.post("after unmute", "b", "go", poster="p")["updated"] is False
+    with pytest.raises(ValueError):
+        inbox.unmute("coach")
+    with pytest.raises(ValueError):
+        inbox.unmute("coach", fix_commit="fixed it, trust me")
+    inbox.unmute("coach", fix_commit=_FIX)
+    assert inbox.post("after unmute", "b", "go", poster="coach")["updated"] is False
     db.close()
 
 
 def test_mute_expires_after_window(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
-    _post_and_archive(inbox, clock, "p", 3)
+    _post_and_archive(inbox, clock, "coach", store.MUTE_AFTER)
     clock["t"] += store.MUTE_WINDOW_S + 1
-    assert inbox.post("a week later", "b", "go", poster="p")["updated"] is False
+    assert inbox.post("a week later", "b", "go", poster="coach")["updated"] is False
     db.close()
 
 
 def test_rekey_update_of_open_card_is_not_refused(tmp_path, monkeypatch):
     inbox, db, clock, tasks = _env_with_tasks(tmp_path, monkeypatch)
     clock["t"] += 60
-    inbox.post("open one", "b", "go", key="keep", poster="p")
-    _post_and_archive(inbox, clock, "p", 3)
-    assert inbox.post("open one v2", "b2", "go", key="keep", poster="p")["updated"] is True
+    inbox.post("open one", "b", "go", key="keep", poster="coach")
+    _post_and_archive(inbox, clock, "coach", store.MUTE_AFTER)
+    assert inbox.post("open one v2", "b2", "go", key="keep", poster="coach")["updated"] is True
     db.close()
 
 
@@ -323,7 +351,7 @@ def test_mute_card_failure_is_visible_not_silent(tmp_path, monkeypatch, capsys, 
     def fenced(**kw):
         raise RuntimeError("board writes are fenced (HERMES_DELEGATED_CHILD_CONTEXT)")
     inbox._task_creator = fenced
-    _post_and_archive(inbox, clock, "p-fenced", 3)
+    _post_and_archive(inbox, clock, "p-fenced", store.MUTE_AFTER)
     with caplog.at_level("WARNING"):
         with pytest.raises(store.PosterMuted):
             inbox.post("x", "b", "go", key="k:x", poster="p-fenced")

@@ -246,6 +246,7 @@ def _setup_cli(parser) -> None:
     b.add_argument("--include-archived", action="store_true")
     u = sub.add_parser("unmute", help="let a poster muted as noise post again (after fixing it)")
     u.add_argument("poster")
+    u.add_argument("--fix-commit", required=True, help="SHA or GitHub commit URL of the fix that stops the noise")
     uk = sub.add_parser("unarchive-key", help="let a key David archived be posted again (a genuinely new decision)")
     uk.add_argument("key")
     a = sub.add_parser("archive", help="archive a message")
@@ -334,7 +335,11 @@ def _run_cli(args) -> int:
         print("archived" if ok else "not an inbox message")
         return 0 if ok else 1
     if cmd == "unmute":
-        inbox.unmute(args.poster)
+        try:
+            inbox.unmute(args.poster, fix_commit=args.fix_commit)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         print(f"unmuted {args.poster!r}")
         return 0
     if cmd == "unarchive-key":

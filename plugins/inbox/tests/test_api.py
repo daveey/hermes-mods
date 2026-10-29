@@ -22,6 +22,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(api, "_profile", lambda: "default")
     app = fastapi.FastAPI()
     app.include_router(api.router)
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from ask_fixtures import register_test_posters
+    register_test_posters(tmp_path)
     return TestClient(app), api, tmp_path
 
 
@@ -30,8 +34,10 @@ def test_root_lists_profile_items_and_accepts_them_by_profile(client):
     st = api._store()
     prof = root / "profiles" / "alpha-follow"
     prof.mkdir(parents=True)
-    a = st.Inbox.for_home(prof).post("Reply in thread?", "who asked what", "post it", key="slack:C1:1.0:x")
-    b = st.Inbox().post("Root item", "b", "do", poster="t")
+    from ask_fixtures import ASK, register_test_posters
+    register_test_posters(prof)
+    a = st.Inbox.for_home(prof).post("Reply in thread?", "who asked what", "post it", key="slack:C1:1.0:x", poster="t", ask=ASK)
+    b = st.Inbox().post("Root item", "b", "do", poster="t", ask=ASK)
     items = {i["session_id"]: i for i in c.get("/items").json()["items"]}
     assert items[a["session_id"]]["profile"] == "alpha-follow"
     assert items[b["session_id"]]["profile"] == "default"
@@ -45,7 +51,7 @@ def test_root_lists_profile_items_and_accepts_them_by_profile(client):
 
 def test_rest_post_passes_prompt_label(client):
     c, api, root = client
-    r = c.post("/items", json={"title": "t", "body": "b", "accept_prompt": "the whole long prompt", "poster": "t",
+    r = c.post("/items", json={"title": "t", "body": "b", "accept_prompt": "the whole long prompt", "poster": "t", "ask": __import__("ask_fixtures").ASK,
                                "prompt_label": "stop the idle box"})
     assert r.status_code == 200, r.text
     from hermes_state import SessionDB

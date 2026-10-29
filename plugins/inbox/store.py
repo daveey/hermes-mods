@@ -60,7 +60,7 @@ class AgentOwnedPost(ValueError):
 
     def __init__(self, reason, task=None):
         self.reason, self.task = reason, task
-        super().__init__(f"refused: {reason}" + (f"; kanban={task}" if task else ""))
+        super().__init__(f"refused: {reason}" + (f"; Kanban card {task} filed" if task else ""))
 
 
 class AgentFixablePost(AgentOwnedPost):
@@ -545,12 +545,12 @@ class Inbox:
                 # (one key per DM/post) are covered per key by the archive rule above, where Archive = dismissed.
                 ignored = self._ignored_streak(side, db, poster, now) if named else 0
                 if ignored >= MUTE_AFTER:
-                    self._file_mute_card(group, title, body)
+                    self._file_mute_card(policy_module().family(poster) or group, title, body)
                     raise PosterMuted(
-                        f"poster {group!r} is muted: its last {ignored} inbox cards were archived with no "
+                        f"poster family {policy_module().family(poster) or group!r} is muted: its last {ignored} inbox cards were archived with no "
                         f"action, so its posts are noise to David. Route what it reports to a Kanban card "
                         f"(an agent fixes it) and post to the Inbox only a decision David alone can make. "
-                        f"Unmute after fixing the poster: `hermes inbox unmute {group!r}`.")
+                        f"Unmute after fixing the poster: `hermes inbox unmute {policy_module().family(poster) or group!r} --fix-commit <sha>`.")
                 from hermes_state_ids import new_session_id
                 sid = new_session_id()
                 rt = routing_module()
@@ -821,7 +821,7 @@ class Inbox:
              f"action, so the inbox now refuses its posts. Find the code that posts as this poster "
              f"and change it: problems an agent can fix go to a Kanban card (assignee default), "
              f"routine status goes nowhere, and only a decision David alone can make goes to the "
-             f"Inbox. Then run `hermes inbox unmute '{poster}'` on the gateway that refused it.\n\n"
+             f"Inbox. Then run `hermes inbox unmute '{poster}' --fix-commit <sha>` on the gateway that refused it.\n\n"
              f"Refused post:\n\n**{title}**\n\n{body[:3000]}"),
             f"inbox-muted:{poster}")
 

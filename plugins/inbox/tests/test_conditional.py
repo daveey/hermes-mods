@@ -145,7 +145,8 @@ def test_competing_processes_have_exactly_one_winner(env, refresh):
     if refresh:
         condition = ["--expected", json.dumps(post(inbox, if_absent=True)["snapshot"])]
     def run(_):
-        return cli(inbox.home, "post", "Draft", "--prompt", "Review", "--key", "draft:example", *condition)
+        return cli(inbox.home, "post", "Draft", "--prompt", "Review", "--key", "draft:example", *condition,
+                   "--poster", "cli", "--ask", json.dumps(__import__("ask_fixtures").ASK))
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(run, range(4)))
     assert sorted(r.returncode for r in results) == [0, 3, 3, 3], [(r.stdout, r.stderr) for r in results]

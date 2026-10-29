@@ -11,11 +11,13 @@ callers (tool/CLI/REST/forwarders that hand a caller's accept_prompt through) su
 """
 import ast
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
 
 HERE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).parent))
 REPO = HERE.parents[1]
 
 
@@ -59,6 +61,7 @@ def find_callers(root: Path) -> list[dict]:
                 if any(c["site"] == site for c in out):
                     continue
                 out.append(dict(site=site, has_prompt=has_prompt, poster=_literal_kw(n, "poster"),
+                                has_ask=any(kw.arg in ("ask", None) for kw in n.keywords),
                                 type=_literal_kw(n, "type")))
     return out
 
@@ -74,11 +77,15 @@ def store(monkeypatch, tmp_path):
 
 
 def _replay(store, caller):
+    """Replay a call site's real shape. Pass-through sites (poster/ask handed down from the caller) get the
+    shipped 'cli' poster and a valid ask; literal posters are replayed verbatim and must be registered."""
+    from ask_fixtures import ASK
     kw = {}
-    if isinstance(caller["poster"], str):
-        kw["poster"] = caller["poster"]
+    kw["poster"] = caller["poster"] if isinstance(caller["poster"], str) else "cli"
     if isinstance(caller["type"], str):
         kw["type"] = caller["type"]
+    if caller.get("has_ask"):
+        kw["ask"] = ASK
     store.Inbox().post("replay", "replay body", "replay instruction" if caller["has_prompt"] else "",
                        key=f"replay:{caller['site']}", **kw)
 
