@@ -26,6 +26,11 @@ the last successful hub pull is older than 180 s. `pending` lists this gateway's
 record. Allowed actions: sessions `rename{title}`/`archive`/`unarchive`/`pin`/`unpin`; inbox `act{action, input?}`/
 `archive`; tasks `create`/`comment`/`complete`/`block`/`unblock`/`archive`/`assign`.
 
+`published` decode caching compares each row's raw JSON across hub database writes, so an unrelated
+replica/meta commit does not re-decode all local sessions and task handoffs. Same-version content
+changes, additions, deletions and invalid JSON remain visible on the next read. Covered by
+`tests/test_published_decode.py`; the replica's separate seq-based cache is unchanged.
+
 ## Consumers
 
 Session links qualify the origin by gateway/profile and the supplied lineage IDs.

@@ -263,6 +263,7 @@ class View:
                          (coll, self.gateway))
         key = (str(self.path), table, coll, self.gateway)
         sig = _file_sig(self.path) if self.path is not None else None
+        hit = None
         if sig is not None:
             with _DECODED_LOCK:
                 hit = _DECODED.get(key)
@@ -270,9 +271,14 @@ class View:
                 return hit[1]
             if table == "replica" and _has_seq(self.conn):
                 return self._decoded_replica_incremental(key, sig, coll, hit)
+        # Local staging can rewrite published rows without changing version/seq.
+        # Reuse only byte-identical JSON, not a high-water mark. Unrelated replica
+        # commits used to re-decode every local task (including large handoffs).
+        previous = {r["key"]: (r["data"], d) for r, d in hit[1]} if table == "published" and hit else {}
         out = []
         for r in self.conn.execute(sql, args):
-            d = _loads(r["data"])
+            old = previous.get(r["key"])
+            d = old[1] if old is not None and old[0] == r["data"] else _loads(r["data"])
             if d is not None:
                 out.append((dict(r), d))
         if sig is not None:
