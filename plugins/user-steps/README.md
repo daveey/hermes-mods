@@ -448,6 +448,14 @@ stores are per host: `python3 ~/.hermes/plugins/user-steps/stale_watch.py` (`--d
 Tests: `tests/test_stale_watch.py` (2 h reply -> one card; rerun -> no duplicate; retired -> none; CLI args;
 cross-session pair -> one card; a single-session request -> none).
 
+It also opens one card per delivered decision (key `user-steps-failed-decision:<operationId>`) whose admitted turn
+ended in a failed-turn boundary before any tool ran and was not continued (no `auto_continue` row, no later user
+message) within 10 min. The tile closes at admission, so a turn a backend restart killed otherwise loses the
+decision silently. Core now continues such a turn after a restart (the marker stays auto-continuable until the
+first tool starts); this card is the net for when that recovery misses. Tests: `tests/test_failed_decision_watch.py`
+(failed without tools -> one card, rerun same key; flat receipt shape; continued / tools ran / recent / succeeded
+-> none; decline / undelivered -> none).
+
 A reply that only lists decisions waiting in other chats, queues or cards is a status report. A step whose
 evidence sits in that paragraph is not minted, unless the span itself is a direct request and does not contain
 the digest marker. The extractor prompt also receives up to 30 titles of open asks in other sessions
