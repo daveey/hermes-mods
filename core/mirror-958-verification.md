@@ -89,7 +89,7 @@ Result: **196 passed, 0 failed**, 10 files, 25.6 seconds. After the final secret
 | `tests/hermes_cli/test_kanban_scratch_gc.py` | 22 |
 | `tests/hermes_cli/test_kanban_wait_replica.py` | 26 |
 
-Desktop Vitest: `gateway-device-icon.test.ts` passed **4** tests. `session-dot-state.test.ts` did not collect: the borrowed dependency tree was incomplete (last missing import: `@tanstack/react-query`). Initial missing `driver.js`, testing-library and icon/core packages were supplied in an isolated scratch dependency directory; no live install or test source was modified. No stripe-test pass, full Desktop suite, typecheck, live reboot or full repository test pass is claimed.
+Desktop Vitest attempts failed during dependency resolution in the borrowed dependency tree; retained runner output shows `@testing-library/react` missing from `vitest.setup.ts`, preventing both target files from collecting. Additional dependencies were installed only in an isolated scratch directory, but no successful Desktop result is verified from the retained output. No device-icon or stripe-test pass, full Desktop suite, typecheck, live reboot or full repository test pass is claimed.
 
 Feature docs list source tests for porting. Except for the executions above, those lists and quoted source-author results are not fresh validation claims.
 
