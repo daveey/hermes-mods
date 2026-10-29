@@ -30,7 +30,8 @@ TOOLSET = "browser_focus"
 
 _LOGIN_URL = re.compile(
     r"accounts\.google\.com/[^\s'\"]*(signin|challenge|ServiceLogin)|appleid\.apple\.com|login\.microsoftonline\.com"
-    r"|/(login|signin|sign-in|sign_in|log-in|auth/|oauth|sso|mfa|2fa|two-factor|verify|challenge|captcha)\b",
+    r"|/(login|signin|sign-in|sign_in|log-in|auth/|oauth|sso|mfa|2fa|two-factor|verify|challenge|captcha"
+    r"|signup|sign-up|sign_up|join|register|registration)\b",
     re.I)
 _LOGIN_TEXT = re.compile(r"\b(captcha|verify you are human|two-factor|2-step verification|enter the code)\b", re.I)
 _ASKS_BROWSER = re.compile(r"\b(chrome|browser|tab|window|sign-in page|login page)\b", re.I)
@@ -39,8 +40,47 @@ _ASKS_ACTION = re.compile(
     r"|type (the|your)|select|choose|allow|confirm|accept|complete)\b", re.I)
 _URL = re.compile(r"https?://[^\s'\"<>|)\]]+")
 
+# Page kinds a reply can ask about, and how a tab shows it is that page (URL or title). A reply's words pick the
+# kinds; the raised tab must be one of them, else the hook says nothing (agent-07dbafdef0).
+_REPLY_KINDS = {
+    "signup": re.compile(r"\b(sign(ing)?[- ]?up|signup|register|registration|create (an |a |your |the )?account)\b", re.I),
+    "captcha": re.compile(r"\b(captcha|verify you are human|human verification)\b", re.I),
+    "signin": re.compile(r"\b(sign(ed|ing)? in|sign-in|log(ged|ging)? in|login|log-in|2fa|two-factor|verification code"
+                         r"|enter the code)\b", re.I),
+}
+_SIGNUP_TAB = re.compile(r"/(signup|sign-up|sign_up|join|register|registration|create[-_]?account)\b"
+                         r"|\b(sign up|join|create (an |your )?account|register)\b", re.I)
+_SIGNIN_TAB = re.compile(r"\b(sign in|log in|login|two-factor|2-step|verification)\b", re.I)
+_CAPTCHA_TAB = re.compile(r"captcha|challenge|verify|arkose|are you human", re.I)
+
+
+def tab_is_kind(tab: dict, kind: str) -> bool:
+    url, title = str(tab.get("url", "")), str(tab.get("title", ""))
+    both = f"{url} {title}"
+    signup = bool(_SIGNUP_TAB.search(both))
+    signin = bool(_LOGIN_URL.search(url) or _SIGNIN_TAB.search(title))
+    if kind == "signup":
+        return signup
+    if kind == "signin":
+        return signin
+    if kind == "captcha":   # captchas live on sign-in/sign-up pages or their own challenge page
+        return bool(_CAPTCHA_TAB.search(both)) or signin or signup
+    return False
+
+
+def reply_target(text: str) -> tuple[str | None, tuple[str, ...]]:
+    """(host, kinds) of the page a reply asks the user to use: the host of a URL in it, and the page kinds its
+    words name. Both empty = the reply names no page, so nothing can be checked and nothing is raised."""
+    host = None
+    for u in _URL.findall(text or ""):
+        host = re.sub(r"^https?://([^/]+).*", r"\1", u).lower()
+        break
+    kinds = tuple(k for k, rx in _REPLY_KINDS.items() if rx.search(text or ""))
+    return host, kinds
+
 _browser_sessions: dict[str, float] = {}   # session_id -> last browser_exec time
 _last_focus: dict[str, float] = {}         # session_id|url-key -> time, to avoid focus-stealing loops
+_last_raised: dict[str, str] = {}          # session_id -> URL of the tab last raised ("" = nothing matched)
 _lock = threading.Lock()
 SESSION_TTL_S = 3600
 REFOCUS_S = 90
@@ -89,8 +129,7 @@ def pick_tab(tabs: list[dict], match: str | None = None) -> dict | None:
     if match:
         m = match.lower()
         hit = [t for t in pages if m in str(t.get("url", "")).lower() or m in str(t.get("title", "")).lower()]
-        if hit:
-            return hit[0]
+        return hit[0] if hit else None   # never another tab: that was the false "in front" of agent-07dbafdef0
     login = [t for t in pages if _LOGIN_URL.search(str(t.get("url", ""))) or "sign in" in str(t.get("title", "")).lower()]
     return (login or pages)[0]   # /json/list is most-recently-active first
 
@@ -169,33 +208,43 @@ def _unattended(session_id: str = "") -> bool:
     return bool(os.environ.get("HERMES_KANBAN_TASK")) or str(session_id or "").startswith("cron_")
 
 
-def focus(match: str | None = None, require_login: bool = False) -> dict:
-    """Show the agent Chrome and raise it. require_login (the automatic tool-result path): only when a tab is
-    actually on a sign-in page (matching `match` if given); otherwise do nothing, never fall back to another tab."""
+def focus(match: str | None = None, require_login: bool = False, kinds: tuple[str, ...] = ()) -> dict:
+    """Show the agent Chrome and raise it.
+    - match: tab URL/title substring. A match that hits no tab raises NOTHING and returns focused=false with the
+      open tabs, so the caller learns the page it wants is not there (never a fallback to another tab).
+    - kinds: the tab must be one of these page kinds (signup/signin/captcha); same no-fallback rule.
+    - require_login (the automatic tool-result path): the tab must be on a sign-in page."""
     if _quiet():
         return {"focused": False, "error": "quiet mode is on; not raising windows"}
     chromes = agent_chromes()
     if not chromes:
         return {"focused": False, "error": "no agent-driven Chrome is running"}
-    pid, port, tab = chromes[0][0], chromes[0][1], None
+    strict = bool(match or kinds or require_login)
+    pid, port, tab, seen = chromes[0][0], chromes[0][1], None, []
     for c_pid, c_port in chromes:   # several visible agent Chromes: take the one holding the wanted tab
         try:
             tabs = _get(f"http://127.0.0.1:{c_port}/json/list")
         except Exception as e:
             log.debug("browser-focus: CDP list failed on %s: %s", c_port, e)
             continue
+        seen += [str(t.get("url", ""))[:200] for t in tabs
+                 if t.get("type") == "page" and not str(t.get("url", "")).startswith(("chrome://", "devtools://"))]
         if require_login:
             tabs = [t for t in tabs if _LOGIN_URL.search(str(t.get("url", "")))]
+        if kinds:
+            tabs = [t for t in tabs if any(tab_is_kind(t, k) for k in kinds)]
         t = pick_tab(tabs, match)
-        hit = t and (not match or match.lower() in (str(t.get("url", "")) + str(t.get("title", ""))).lower())
-        if require_login and not hit:
-            continue
-        if t and (tab is None or hit):
+        if t:
             pid, port, tab = c_pid, c_port, t
-            if hit:
-                break
-    if require_login and tab is None:
-        return {"focused": False, "error": "no tab is on a sign-in page"}
+            break
+    if strict and tab is None:
+        if require_login and not (match or kinds):
+            err = "no tab is on a sign-in page"
+        else:
+            want = " ".join(x for x in (match or "", f"({'/'.join(kinds)} page)" if kinds else "") if x)
+            err = (f"no tab matches {want}; nothing was raised. Open that page first (browser_exec), then call "
+                   "browser_focus again before telling the user it is in front")
+        return {"focused": False, "error": err, "open_tabs": seen[:10]}
     shown = _chrome_agent(["show", "--minutes", str(SHOW_MINUTES)])
     try:
         if tab:
@@ -245,6 +294,7 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
     res = focus(host or None, require_login=True)
     if not res.get("focused"):
         return None
+    _remember(session_id, res)
     return result + NOTE.format(title=(res.get("tab") or {}).get("title") or "?")
 
 
@@ -270,10 +320,71 @@ def transform_llm_output(response_text: str = "", session_id: str = "", **_):
         used = time.time() - _browser_sessions.get(session_id or "", 0) < SESSION_TTL_S
     if not used or _throttled(f"{session_id}|reply"):
         return None
-    res = focus(_login_url_in(response_text))
-    if not res.get("focused"):
+    host, kinds = reply_target(response_text)
+    if not (host or kinds):
+        return None   # the reply names no page, so a raised tab can't be checked against it: say nothing
+    res = focus(host, kinds=kinds)
+    _remember(session_id, res)
+    tab = res.get("tab") if res.get("focused") else None
+    if not tab:
+        return None   # the page the reply asks about isn't open: never claim it is in front
+    title = str(tab.get("title") or tab.get("url") or "").strip()[:80]
+    return response_text.rstrip() + f"\n\n_I've brought the Chrome window to the front for you, on \"{title}\"._"
+
+
+def _remember(session_id: str, res: dict) -> None:
+    res = res or {}
+    with _lock:
+        _last_raised[session_id or ""] = str((res.get("tab") or {}).get("url") or "") if res.get("focused") else ""
+
+
+# The user says the page/window the agent pointed at isn't there: the agent must look before it answers.
+_CANT_SEE = re.compile(
+    r"\b(i\s+)?(don'?t|dont|do not|can'?t|cant|cannot|can not|didn'?t|didnt|not)\s+(see|find|seeing|get)\b"
+    r"|\bwhere(?:'s| is)\s+the\s+(window|tab|page|captcha|browser)\b|\bnothing\s+(popped|showed|came)\s+up\b", re.I)
+_CANT_SEE_WHAT = re.compile(r"\b(window|tab|page|captcha|browser|chrome|popup|pop-up|sign[- ]?in|sign[- ]?up|login"
+                            r"|anything|it|button|code)\b", re.I)
+
+
+def cant_see(message: str) -> bool:
+    for s in re.split(r"(?<=[.!?])\s+|\n+", message or ""):
+        if _CANT_SEE.search(s) and _CANT_SEE_WHAT.search(s):
+            return True
+    return False
+
+
+def _used_browser(session_id: str, history: Any) -> bool:
+    with _lock:
+        if time.time() - _browser_sessions.get(session_id or "", 0) < SESSION_TTL_S:
+            return True
+    for m in reversed(list(history or [])[-80:]):
+        if not isinstance(m, dict):
+            continue
+        for tc in m.get("tool_calls") or []:
+            tc = tc if isinstance(tc, dict) else {}
+            if ((tc.get("function") or {}).get("name") or tc.get("name")) in ("browser_exec", "browser_focus"):
+                return True
+        if m.get("role") == "tool" and m.get("name") in ("browser_exec", "browser_focus"):
+            return True
+    return False
+
+
+def pre_llm_call(session_id: str = "", user_message: Any = None, conversation_history: Any = None, **_):
+    """One-turn note, only when the user says they can't see the page in a session that drove the browser."""
+    try:
+        msg = user_message if isinstance(user_message, str) else json.dumps(user_message or "")
+        if _unattended(session_id) or not cant_see(msg) or not _used_browser(session_id, conversation_history):
+            return None
+        with _lock:
+            last = _last_raised.get(session_id or "")
+        where = f"the last tab raised was {last}" if last else "no tab matching your last ask was raised"
+        return {"context": ("[browser-focus] The user says they can't see the page/window you asked them to use. "
+                            "Before replying, check the browser first (list tabs / screenshot with browser_exec) and "
+                            f"confirm the page is really open; {where}. If it isn't there, open it, then call "
+                            "browser_focus with a match for it, and say it is in front only if that returns the tab.")}
+    except Exception as e:
+        log.debug("browser-focus pre_llm_call: %s", e)
         return None
-    return response_text.rstrip() + "\n\n_I've brought the Chrome window to the front for you._"
 
 
 SCHEMA = {
@@ -281,8 +392,10 @@ SCHEMA = {
     "description": ("Bring the agent-driven Chrome window (the one browser_exec controls) to the front of the user's "
                     "screen and switch it to the tab that needs them. Call it whenever you are about to ask the user "
                     "to do anything in that browser (sign in, 2FA, captcha, click, approve) so they don't have to "
-                    "hunt for the window. `match` picks the tab by URL/title substring; default is a sign-in tab, "
-                    "else the most recent tab."),
+                    "hunt for the window. `match` picks the tab by URL/title substring; a match that hits no tab "
+                    "raises nothing and returns focused=false with `open_tabs` (open the page first). Without "
+                    "`match`: a sign-in tab, else the most recent tab. Tell the user it is in front only when the "
+                    "returned `tab` is the page you are asking them to use."),
     "parameters": {"type": "object", "properties": {
         "match": {"type": "string", "description": "Substring of the tab URL or title to show (optional)."},
         "hide": {"type": "boolean", "description": ("true = the user is finished: send a hidden (virtual-display) "
@@ -291,10 +404,14 @@ SCHEMA = {
 }
 
 
-def handle(args: dict, **_) -> str:
+def handle(args: dict, session_id: str = "", **_) -> str:
     try:
         args = args or {}
-        return json.dumps(hide() if args.get("hide") else focus(args.get("match") or None))
+        if args.get("hide"):
+            return json.dumps(hide())
+        res = focus(args.get("match") or None)
+        _remember(session_id, res)
+        return json.dumps(res)
     except Exception as e:
         return json.dumps({"focused": False, "error": f"{type(e).__name__}: {e}"})
 
@@ -306,3 +423,4 @@ def register(ctx) -> None:
                       description="Bring the agent's Chrome window/tab to the front for the user")
     ctx.register_hook("transform_tool_result", transform_tool_result)
     ctx.register_hook("transform_llm_output", transform_llm_output)
+    ctx.register_hook("pre_llm_call", pre_llm_call)
