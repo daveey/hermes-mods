@@ -29,6 +29,11 @@ class SQLiteCards:
         if self.fail: raise RuntimeError('failure after comment insert')
         return cid
 
+    def archive_task(self, c, task_id):
+        with self.write_txn(c):
+            return c.execute("UPDATE tasks SET status='archived' WHERE id=? AND status!='archived'",
+                             (task_id,)).rowcount == 1
+
 
 def setup(tmp_path, effect='revise', bind=True):
     path = tmp_path / 'kanban.db'
@@ -47,10 +52,10 @@ def setup(tmp_path, effect='revise', bind=True):
 
 
 @pytest.mark.parametrize('effect', ['approve', 'revise', 'decline'])
-def test_atomic_retry_exact_authority_and_no_lifecycle_changes(tmp_path, effect):
+def test_atomic_retry_exact_authority_and_only_closes_the_card(tmp_path, effect):
     adapter, backend, path, op = setup(tmp_path, effect)
     with sqlite3.connect(path) as c:
-        before = c.execute('SELECT * FROM tasks').fetchall()
+        before = c.execute("SELECT * FROM tasks WHERE id!='card'").fetchall()
     backend.fail = True
     with pytest.raises(RuntimeError): adapter.deliver(op)
     with sqlite3.connect(path) as c:
@@ -61,7 +66,9 @@ def test_atomic_retry_exact_authority_and_no_lifecycle_changes(tmp_path, effect)
     assert adapter.deliver(op) == first
     assert adapter.readback(op, first)
     with sqlite3.connect(path) as c:
-        assert c.execute('SELECT * FROM tasks').fetchall() == before
+        # The decided card is archived (it no longer asks David); every other row is untouched.
+        assert c.execute("SELECT status FROM tasks WHERE id='card'").fetchone()[0] == 'archived'
+        assert c.execute("SELECT * FROM tasks WHERE id!='card'").fetchall() == before
         assert c.execute('SELECT * FROM task_deps').fetchall() == [('card', 'child')]
         assert c.execute('SELECT count(*) FROM task_comments').fetchone()[0] == 1
         state, metadata = c.execute('SELECT state,decision FROM user_steps_card_bindings').fetchone()

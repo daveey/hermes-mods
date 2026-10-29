@@ -39,7 +39,7 @@ def test_real_core_card_binding_comment_metadata_atomic(tmp_path, monkeypatch, e
         assert cards.QualifiedCardDelivery(home=tmp_path).deliver(op) == receipt
         assert adapter.readback(op, receipt)
         with sqlite3.connect(path) as c:
-            assert c.execute('SELECT status FROM tasks').fetchone()[0] == 'blocked'
+            assert c.execute('SELECT status FROM tasks').fetchone()[0] == 'archived'
             assert c.execute('SELECT count(*) FROM task_comments').fetchone()[0] == 1
     finally:
         reset_hermes_home_override(token)

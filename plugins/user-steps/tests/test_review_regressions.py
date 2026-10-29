@@ -159,9 +159,14 @@ class ProducerCards(SQLiteCards):
         assert kwargs['initial_status'] == 'blocked'
         assert kwargs['parents'] == ()
         with self.write_txn(c):
+            # Core idempotency: a live (non-archived) card with the key is returned; an archived one is not.
+            hit = c.execute("SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived'",
+                            (kwargs['idempotency_key'],)).fetchone()
+            if hit: return hit[0]
+            tid = 'created' + str(c.execute('SELECT count(*) FROM tasks').fetchone()[0] or '')
             c.execute('INSERT INTO tasks VALUES (?,?,?,?,?,NULL,NULL)',
-                      ('created', 'blocked', kwargs['body'], kwargs['session_id'], kwargs['idempotency_key']))
-        return 'created'
+                      (tid, 'blocked', kwargs['body'], kwargs['session_id'], kwargs['idempotency_key']))
+        return tid
 
 
 def producer_setup(tmp_path, monkeypatch):
@@ -181,6 +186,8 @@ def producer_payload():
 
 
 def test_producer_creates_binds_before_publish_and_rebinds_revision(tmp_path, monkeypatch):
+    """Contract: bind before publish; a replacement for an UNDECIDED card rebinds that card; after a decision
+    the decided card is archived and the replacement is bound to a fresh card (appended alias)."""
     plugin, adapter, path = producer_setup(tmp_path, monkeypatch)
     payload = producer_payload()
     out = json.loads(plugin.publish_action_request({'request': payload, 'decisionCard': {'board': 'default'}}, session_id=OWNER['storedSessionId']))
@@ -189,15 +196,23 @@ def test_producer_creates_binds_before_publish_and_rebinds_revision(tmp_path, mo
     with sqlite3.connect(path) as c:
         assert c.execute('SELECT request FROM user_steps_card_bindings').fetchone()[0] == cards.DecisionInbox._encode(r)
         assert c.execute('SELECT idempotency_key FROM tasks').fetchone()[0] == adapter.creation_key(r)
-    op = s.decide(OWNER, decision(r, choice='decline'))['operation']
+    payload['aliases'] = [ref]; payload['scope']['markdown'] = 'Undecided replacement'
+    undecided = json.loads(plugin.publish_action_request({'request': payload, 'requestId': r['requestId'], 'expectedRevision': 1}, session_id=OWNER['storedSessionId']))['request']
+    assert undecided['aliases'] == [ref]
+    with sqlite3.connect(path) as c:
+        assert c.execute('SELECT task,revision,state FROM user_steps_card_bindings').fetchall() == [(ref['id'], 2, 'bound')]
+    op = s.decide(OWNER, decision(undecided, choice='decline'))['operation']
     receiver = cards.DecisionDelivery(tmp_path / 'inbox.db', runs=Runs(), card_receiver=adapter)
     assert s.dispatch(OWNER, op['operationId'], receiver)['operation']['dispatchState'] == 'delivered'
-    payload['aliases'] = [ref]; payload['scope']['markdown'] = 'Replacement plan'
-    revised = json.loads(plugin.publish_action_request({'request': payload, 'requestId': r['requestId'], 'expectedRevision': 1}, session_id=OWNER['storedSessionId']))['request']
+    payload['scope']['markdown'] = 'Replacement plan'
+    revised = json.loads(plugin.publish_action_request({'request': payload, 'requestId': r['requestId'], 'expectedRevision': 2}, session_id=OWNER['storedSessionId']))['request']
+    fresh = revised['aliases'][-1]
+    assert revised['aliases'][0] == ref and fresh['type'] == 'kanban' and fresh['id'] != ref['id']
     with sqlite3.connect(path) as c:
-        assert c.execute('SELECT revision,state FROM user_steps_card_bindings').fetchone() == (2, 'bound')
-        assert c.execute('SELECT status FROM tasks').fetchone()[0] == 'blocked'
-    assert revised['revision'] == 2
+        assert dict((t, (rev, st)) for t, rev, st in c.execute('SELECT task,revision,state FROM user_steps_card_bindings')) == {
+            ref['id']: (2, 'decline'), fresh['id']: (3, 'bound')}
+        assert dict(c.execute('SELECT id,status FROM tasks')) == {ref['id']: 'archived', fresh['id']: 'blocked'}
+    assert revised['revision'] == 3
 
 
 def test_producer_rejects_arbitrary_alias_without_publishing(tmp_path, monkeypatch):

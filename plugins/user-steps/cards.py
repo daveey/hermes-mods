@@ -219,9 +219,14 @@ class QualifiedCardDelivery:
     Source aliases grant no authority. Producers create a dedicated blocked card with
     creation_key(request) and the exact session_id, then bind the canonical request
     before exposing its decision. Existing arbitrary/legacy cards cannot be adopted.
-    These are decision metadata cards, not execution scheduling transitions: ALL
-    effects preserve tasks/dependencies/claims. Approve authorizes the frozen scope
-    only; the composite separately admits a turn to the owning session.
+    These are decision metadata cards, not execution scheduling transitions. Once a
+    decision is committed (comment + receipt) the card no longer asks David anything,
+    so delivery archives it (human_request cleared). A card other cards depend on
+    stays blocked: archiving would release them, and a decision never schedules
+    execution. Only the LAST kanban alias is live: a replacement revision after a
+    decision gets a fresh card (replacement_card) and earlier cards keep their decided
+    binding. Approve authorizes the frozen scope only; the composite separately admits
+    a turn to the owning session.
     """
     def __init__(self, home=None, backend=None):
         self.home = Path(home) if home else None
@@ -301,10 +306,48 @@ class QualifiedCardDelivery:
                 'scope': scope,
                 'evidence': f"ActionRequest {request['requestId']} revision {request['revision']} in the For you queue"}
 
+    @staticmethod
+    def live_refs(request):
+        """The card that carries this revision's ask: the last kanban alias (earlier ones are retired)."""
+        return [r for r in request['aliases'] if r['type'] == 'kanban'][-1:]
+
     def bind_request(self, request, expected_revision):
-        for ref in request['aliases']:
-            if ref['type'] == 'kanban':
-                self.bind(request, ref, expected_revision=expected_revision)
+        for ref in self.live_refs(request):
+            self.bind(request, ref, expected_revision=expected_revision)
+
+    _CLOSED = ('archived', 'done')
+
+    def replacement_card(self, current, replacement):
+        """A fresh decision card for a replacement revision whose live card is already closed (decided).
+
+        Returns its alias for the caller to append, or None when the live card still asks (rebind it).
+        """
+        live = self.live_refs(current)
+        if not live: return None
+        c = _ro_connect(self._path(live[0], current['owner']))
+        try: status = self._task(c, live[0]['id'])['status']
+        finally: c.close()
+        if status not in self._CLOSED: return None
+        return self.prepare(dict(replacement, revision=current['revision'] + 1), live[0]['board'])
+
+    def discard(self, ref, owner):
+        """Best-effort close of a fresh card whose replacement was not published."""
+        api = self._api()
+        c = api.connect(self._path(ref, owner))
+        try: api.archive_task(c, ref['id'])
+        finally: c.close()
+
+    @staticmethod
+    def _has_dependents(c, task_id):
+        try:
+            return c.execute('SELECT 1 FROM task_links WHERE parent_id=? LIMIT 1', (task_id,)).fetchone() is not None
+        except sqlite3.OperationalError:
+            return False
+
+    def _close_decided(self, api, c, task_id):
+        """Archive a decided card (clears its human_request) unless other cards wait on it."""
+        if self._task(c, task_id)['status'] in self._CLOSED or self._has_dependents(c, task_id): return
+        api.archive_task(c, task_id)
 
     def close_withdrawn(self, request, reason):
         """Archive the decision card(s) of a request the store already moved to ``withdrawn``.
@@ -316,8 +359,7 @@ class QualifiedCardDelivery:
             raise RuntimeError('Only a withdrawn request closes its decision card')
         api = self._api()
         owner = DecisionInbox._encode(request['owner'])
-        for ref in request['aliases']:
-            if ref['type'] != 'kanban': continue
+        for ref in self.live_refs(request):
             c = api.connect(self._path(ref, request['owner']))
             try:
                 with api.write_txn(c):
@@ -410,8 +452,9 @@ class QualifiedCardDelivery:
                               "state='bound',operation=NULL,decision=NULL WHERE task=?",
                               (request['revision'], body, fp, ref['id']))
                 else:
-                    if expected_revision != 0 or request['revision'] != 1:
-                        raise RuntimeError('Initial card binding must be revision 1')
+                    # Revision 1, or a replacement's fresh card (the previous card was decided and closed).
+                    if request['revision'] != expected_revision + 1:
+                        raise RuntimeError('Initial card binding revision CAS conflict')
                     c.execute('INSERT INTO user_steps_card_bindings VALUES (?,?,?,?,?,?,?,NULL,NULL)',
                               (ref['id'], *target, 'bound'))
             return {'ref': ref, 'revision': request['revision']}
@@ -433,8 +476,7 @@ class QualifiedCardDelivery:
     def validate(self, op):
         """Read-only preflight; delivery still repeats CAS inside the write transaction."""
         request = op['intent']['request']
-        for ref in request['aliases']:
-            if ref['type'] != 'kanban': continue
+        for ref in self.live_refs(request):
             if op['owner'] != request['owner']:
                 raise RuntimeError('Card owner mismatch')
             c = _ro_connect(self._path(ref, op['owner']))
@@ -457,7 +499,7 @@ class QualifiedCardDelivery:
 
     def deliver(self, op):
         request = op['intent']['request']
-        refs = [r for r in request['aliases'] if r['type'] == 'kanban']
+        refs = self.live_refs(request)
         if not refs: return []
         effect = op['intent']['effect']
         if (op['owner'] != request['owner'] or effect not in ('approve', 'revise', 'decline') or
@@ -494,12 +536,14 @@ class QualifiedCardDelivery:
                         if changed.rowcount != 1: raise RuntimeError('Card decision CAS conflict')
                         c.execute('INSERT INTO user_steps_card_receipts VALUES (?,?,?,?)',
                                   (op['operationId'], ref['id'], payload, cid))
+                # After the decision commit; a failed archive is retried by the next deliver (receipt path).
+                self._close_decided(api, c, ref['id'])
                 receipts.append({'ref': ref, 'commentId': cid})
             finally: c.close()
         return receipts
 
     def readback(self, op, receipts):
-        refs = [r for r in op['intent']['request']['aliases'] if r['type'] == 'kanban']
+        refs = self.live_refs(op['intent']['request'])
         if [r['ref'] for r in receipts] != refs: return False
         for receipt in receipts:
             c = _ro_connect(self._path(receipt['ref'], op['owner']))
@@ -512,6 +556,11 @@ class QualifiedCardDelivery:
                 if not row or tuple(row) != (self._payload(op), receipt['commentId']): return False
                 if not binding or tuple(binding) != (self._payload(op), op['intent']['effect'], op['operationId']): return False
                 if not comment or tuple(comment) != (receipt['ref']['id'], 'user-steps', self._comment(op)): return False
+                # Decided means closed, except a card other cards wait on (kept blocked, see _close_decided).
+                status = self._task(c, receipt['ref']['id'])['status']
+                if status not in self._CLOSED and not (
+                        status == 'blocked' and self._has_dependents(c, receipt['ref']['id'])):
+                    return False
             except sqlite3.OperationalError:
                 return False
             finally: c.close()

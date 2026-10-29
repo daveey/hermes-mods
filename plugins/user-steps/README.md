@@ -116,8 +116,8 @@ The producer can request `decisionCard: {"board": "default"}` alongside `request
 to create a dedicated blocked metadata card. It does not accept an existing card
 ID. Core creation preserves its mutation fence; the exact owner/session, creation
 key, immutable request snapshot and card fingerprint are bound before the request
-transaction becomes visible. Replacement requests retain those exact card aliases
-and rebind with revision CAS. Other Kanban references belong in `scope.sourceRefs`,
+transaction becomes visible. Replacement requests retain those exact card aliases;
+an undecided card is rebound with revision CAS. Other Kanban references belong in `scope.sourceRefs`,
 not in mutation-authorizing aliases. Failed publication can leave an inert blocked
 card; it cannot expose an unbound decision or schedule execution.
 The card carries a `human_request` (core refuses a blocked card without one,
@@ -125,6 +125,14 @@ The card carries a `human_request` (core refuses a blocked card without one,
 on David: `action` = request title, `interaction` = `approval` (approval),
 `reply` (choice/input) or `external` (external_step), `scope` = the scope's first
 paragraph, `evidence` = `ActionRequest <id> revision <n> in the For you queue`.
+Once David decides (approve, revise or decline), delivery commits the decision
+comment + receipt and then archives the card, which clears its `human_request`;
+card readback requires it closed, and a retried delivery re-attempts a failed
+archive. Exception: a card other cards depend on (`task_links` children) stays
+blocked, because archiving would release them and a decision never schedules
+execution. A replacement revision after a decision gets a fresh card (same
+creation key; core idempotency skips archived cards), appended as a new alias:
+only the last kanban alias is live, earlier cards keep their decided binding.
 
 ## Persistence and API
 

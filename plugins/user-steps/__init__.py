@@ -337,9 +337,19 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         if args.get('requestId'):
             if 'expectedRevision' not in args: raise core.ActionError('expectedRevision required')
             if 'decisionCard' in args: raise core.ActionError('Cannot add a card to a replacement')
-            old_refs = [ref for ref in st.get(owner, rid)['aliases'] if ref['type'] == 'kanban']
+            current = st.get(owner, rid)
+            old_refs = [ref for ref in current['aliases'] if ref['type'] == 'kanban']
             if refs != old_refs: raise core.ActionError('Replacement must retain exact producer card aliases')
-            out = st.revise(owner, rid, args['expectedRevision'], payload, bind=adapter.bind_request)
+            # A decided card was archived: the replacement asks again on a fresh card (appended alias).
+            fresh = adapter.replacement_card(current, payload) if old_refs else None
+            if fresh: payload['aliases'] = list(payload.get('aliases', [])) + [fresh]
+            try:
+                out = st.revise(owner, rid, args['expectedRevision'], payload, bind=adapter.bind_request)
+            except Exception:
+                if fresh:
+                    try: adapter.discard(fresh, owner)
+                    except Exception: pass  # stays inert; a repeat publish reuses it via the creation key
+                raise
         else:
             if 'expectedRevision' in args: raise core.ActionError('New requests have no expectedRevision')
             if refs: raise core.ActionError('Card aliases must be created by decisionCard, not supplied')

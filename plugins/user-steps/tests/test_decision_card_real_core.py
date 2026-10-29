@@ -99,18 +99,103 @@ def test_decision_card_publishes_through_real_core_with_a_human_request(real, ki
             cards.DecisionInbox._encode(r), 'bound')
 
 
-def test_deciding_a_real_core_decision_card_comments_on_it(real):
+def _decide(plugin, adapter, path, r, choice, key='key-1'):
+    s = plugin.core.ActionStore()
+    op = s.decide(OWNER, decision(r, key=key, choice=choice, text='Change the plan'))['operation']
+    receiver = cards.DecisionDelivery(path.parent / 'inbox.db', runs=Runs(), card_receiver=adapter)
+    return s.dispatch(OWNER, op['operationId'], receiver)['operation']
+
+
+def _tasks(path):
+    with sqlite3.connect(path) as c:
+        c.row_factory = sqlite3.Row
+        return [dict(r) for r in c.execute('SELECT * FROM tasks ORDER BY created_at, rowid')]
+
+
+@pytest.mark.parametrize('effect,prefix', [('approve', 'Approved'), ('revise', 'Revision requested'),
+                                           ('decline', 'Declined;')])
+def test_deciding_a_real_core_decision_card_comments_then_archives_it(real, effect, prefix):
+    """David answered: the card no longer asks him anything (archived, human_request cleared)."""
+    plugin, adapter, path, kb = real
+    r = _publish(plugin, producer_payload())['request']
+    op = _decide(plugin, adapter, path, r, effect)
+    assert op['dispatchState'] == 'delivered'
+    with sqlite3.connect(path) as c:
+        assert c.execute('SELECT state FROM user_steps_card_bindings').fetchone()[0] == effect
+        assert c.execute('SELECT body FROM task_comments').fetchone()[0].startswith(prefix)
+        kinds = [k for (k,) in c.execute("SELECT kind FROM task_events WHERE kind IN ('commented','archived') ORDER BY id")]
+    task = _task(path)
+    assert task['status'] == 'archived'
+    assert task['human_request'] is None
+    assert kinds[-1] == 'archived'
+
+
+def test_a_decision_card_with_dependents_stays_blocked_so_nothing_is_released(real):
+    """Archiving promotes children; a decision never schedules execution, so a card others wait on is kept."""
+    plugin, adapter, path, kb = real
+    r = _publish(plugin, producer_payload())['request']
+    card = r['aliases'][0]['id']
+    from hermes_cli.kanban_db_connect import connect
+    c = connect(path)
+    try:
+        child = kb.create_task(c, title='Implement it', assignee='default', parents=(card,))
+    finally:
+        c.close()
+    assert _decide(plugin, adapter, path, r, 'decline')['dispatchState'] == 'delivered'
+    rows = {t['id']: t for t in _tasks(path)}
+    assert rows[card]['status'] == 'blocked'
+    assert rows[child]['status'] == 'todo'
+
+
+def test_a_replacement_after_a_decision_gets_a_fresh_card_that_asks_again(real):
+    plugin, adapter, path, kb = real
+    payload = producer_payload()
+    r = _publish(plugin, payload)['request']
+    old = r['aliases'][0]
+    assert _decide(plugin, adapter, path, r, 'revise')['dispatchState'] == 'delivered'
+    payload['aliases'] = [old]; payload['scope']['markdown'] = 'Replacement plan'
+    out = json.loads(plugin.publish_action_request({'request': payload, 'requestId': r['requestId'],
+                                                    'expectedRevision': 1}, session_id=OWNER['storedSessionId']))
+    assert 'error' not in out, out
+    revised = out['request']
+    kanban = [a for a in revised['aliases'] if a['type'] == 'kanban']
+    assert kanban[0] == old and len(kanban) == 2
+    rows = {t['id']: t for t in _tasks(path)}
+    assert rows[old['id']]['status'] == 'archived'
+    fresh = rows[kanban[1]['id']]
+    assert fresh['status'] == 'blocked' and fresh['block_kind'] == 'needs_input'
+    assert json.loads(fresh['human_request'])['evidence'] == \
+        f"ActionRequest {r['requestId']} revision 2 in the For you queue"
+    with sqlite3.connect(path) as c:
+        assert c.execute('SELECT revision,state FROM user_steps_card_bindings WHERE task=?',
+                         (fresh['id'],)).fetchone() == (2, 'bound')
+    # Revision 2 is decided on the fresh card alone; the retired card keeps its revision-1 decision.
+    assert _decide(plugin, adapter, path, revised, 'approve', key='key-2')['dispatchState'] == 'delivered'
+    rows = {t['id']: t for t in _tasks(path)}
+    assert rows[fresh['id']]['status'] == 'archived'
+    with sqlite3.connect(path) as c:
+        states = dict(c.execute('SELECT task,state FROM user_steps_card_bindings'))
+    assert states == {old['id']: 'revise', fresh['id']: 'approve'}
+
+
+def test_an_archive_that_failed_after_the_decision_commit_is_retried(real, monkeypatch):
     plugin, adapter, path, kb = real
     r = _publish(plugin, producer_payload())['request']
     s = plugin.core.ActionStore()
-    op = s.decide(OWNER, decision(r, choice='decline'))['operation']
-    receiver = cards.DecisionDelivery(path.parent / 'inbox.db', runs=Runs(), card_receiver=adapter)
-    assert s.dispatch(OWNER, op['operationId'], receiver)['operation']['dispatchState'] == 'delivered'
-    with sqlite3.connect(path) as c:
-        assert c.execute('SELECT state FROM user_steps_card_bindings').fetchone()[0] == 'decline'
-        body = c.execute('SELECT body FROM task_comments').fetchone()[0]
-    assert body.startswith('Declined;')
+    op = s.decide(OWNER, decision(r, choice='approve'))['operation']
+    from types import SimpleNamespace
+    api = adapter._api()
+    def boom(*a, **k): raise RuntimeError('archive failed')
+    adapter._api = lambda: SimpleNamespace(**{**vars(api), 'archive_task': boom})
+    with pytest.raises(RuntimeError, match='archive failed'):
+        adapter.deliver(op)
     assert _task(path)['status'] == 'blocked'
+    del adapter._api
+    receipts = adapter.deliver(op)
+    assert adapter.readback(op, receipts)
+    assert _task(path)['status'] == 'archived'
+    with sqlite3.connect(path) as c:
+        assert c.execute('SELECT count(*) FROM task_comments').fetchone()[0] == 1
 
 
 def test_withdrawing_a_card_bound_request_archives_its_decision_card(real):

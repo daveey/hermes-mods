@@ -84,7 +84,7 @@ def test_card_revision_uses_real_core_atomic_comment(tmp_path, monkeypatch):
         with sqlite3.connect(path) as c:
             assert c.execute('SELECT count(*) FROM task_comments').fetchone()[0] == 1
             assert c.execute("SELECT count(*) FROM task_events WHERE kind='commented'").fetchone()[0] == 1
-            assert c.execute('SELECT status FROM tasks').fetchone()[0] == 'blocked'
+            assert c.execute('SELECT status FROM tasks').fetchone()[0] == 'archived'
         for effect in ('approve', 'decline'):
             changed = copy.deepcopy(op); changed['intent']['effect'] = effect
             with pytest.raises(RuntimeError, match='payload conflict'): adapter.deliver(changed)
