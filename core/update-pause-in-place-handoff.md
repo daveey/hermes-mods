@@ -64,6 +64,49 @@ covers the decision order.
 
 Not covered by a test: a live drain window where the paused turn's serve survives the update.
 
+## Second attempt (fork `26691e1ce5`, patch [`0725`](patches/0725-fix-core-update-a-paused-turn-continues-within-90-s-.patch))
+
+The first live sample failed acceptance. On David-MBP, 2026-10-28 PDT, serve 13052 survived the update.
+Session 2b256c paused at 17:17:53, and the watcher logged "checkout moved" at 17:22:19. A kanban notice
+was accepted at 17:22:21, and the turn continued only from the 300 s backstop at 17:30:39, 502 s after the
+gateway was back.
+
+Why:
+1. The hand-off wait left the paused session idle and claimable. A notice turn claimed it 2 s after the
+   move (`_notif_claim_turn` had no notion of a pending continuation) and ran over the pause for 8 min.
+   While it ran, the backend was busy, so no retirement could come either.
+2. While that carried turn ran, the watcher only waited. The outlook timer was then restarted by the
+   flips after it, so only the backstop could fire.
+
+Behavior now:
+- **Automatic turns wait for the paused turn.** From the end of the window until the continuation records
+  its marker, `_notif_claim_turn` refuses automatic turns, and every caller requeues them: kanban notices,
+  process completions, `/loop`, heartbeats and wake-ups. `update_pause.continuation_due` reads the window live
+  while a watcher runs, so a notice between two polls is caught.
+  - The hold is bounded three ways: `DUE_HOLD_S` past the watcher's last poll; `KICKOFF_HOLD_S` (135 s) after
+    scheduling, which covers the agent build; and `HOLD_MAX_S` (305 s) past the window's end, so a
+    continuation that keeps failing to schedule can't starve the chat.
+- **Every bound counts from the first sight of the move.** That includes a synthesized turn already running
+  over the pause, which is the new `carried` action. A flipping outlook can't restart the bound.
+- **`coming` is capped.** An outlook that says `coming` but never begins retiring (`RetirementFence.retiring()`)
+  continues here after `HANDOFF_WAIT_S` (90 s), which is two skew-watchdog polls plus a margin. `blocked` still
+  continues at 60 s. `retiring` keeps the hand-off, and only the backstop retries then, because the fence refuses
+  in-place work.
+- **Each outlook change is logged** ("replacement outlook for session … is …"), so the next live window shows
+  the decision path.
+
+Tests (`tests/tui_gateway/test_update_pause_recovery.py`, real watcher thread on a virtual clock). The first four were run against the first-attempt code and fail there; the fifth needs the new hold API:
+- `test_replacement_outlook_that_never_retires_continues_within_the_hand_off_bound`
+- `test_fluctuating_outlook_counts_from_the_move_not_from_the_last_flip`
+- `test_automatic_turn_waits_for_the_paused_turn_once_the_window_is_over` (the live sequence: a notice right after the move is refused; continuation within 100 s; hold lapses after `KICKOFF_HOLD_S`)
+- `test_synthesized_turn_over_the_pause_then_continues_at_once` (a carried 480 s turn; the paused turn continues on the first poll after it)
+- `test_a_continuation_that_never_schedules_stops_holding_automatic_turns`
+
+`test_skew_with_a_replacement_coming_does_not_continue_in_place` now bounds the hand-off at `HANDOFF_WAIT_S`.
+
+Not covered: a `/goal` continuation claims the session directly, so it bypasses the gate and can overwrite the
+paused marker after a carried turn. This was there before the fix. Follow-up card: hub `t_01a18533d0a0182d`.
+
 ## Follow-up patch (0712)
 
 **0712** (fork `549b7f1e71`): a permitted core-update pause stops owned background jobs and says so. It does not try to keep them alive across the update.
