@@ -47,7 +47,7 @@ class Model(BaseHTTPRequestHandler):
                 script = ("from pathlib import Path; import threading,time; "
                           "end=time.monotonic()+60; "
                           "exec(\"while not Path(" + repr(str(marker)) + ").exists() and time.monotonic()<end: threading.Event().wait(.05)\")")
-                command = "exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(script)
+                command = "exec " + shlex.quote(str(self.server.python)) + " -c " + shlex.quote(script)
                 self.server.commands.append(command)
                 tool = dict(index=0, id=f"call_fixture_{step}", type="function", function=dict(name="terminal",
                     arguments=json.dumps(dict(command=command, background=True, notify=True))))
@@ -74,6 +74,26 @@ class Model(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(chunk).encode())
 
 
+def _fixture_python(home):
+    # Approval text is redacted, so a numeric build stamp in sys.executable
+    # cannot be compared losslessly. Keep the exact command allowlist and use
+    # a private, stable alias to the same interpreter instead.
+    python = home / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    assert python.samefile(sys.executable)
+    return python
+
+
+def _coach_diagnostics(home):
+    try:
+        return (home / "coach" / "log.jsonl").read_text()
+    except OSError as exc:
+        # Early startup/approval failures may precede coach's first log write.
+        # Diagnostics in finally must not replace the original exception.
+        return f"Coach log unavailable: {exc}"
+
+
 def test_process_ownership_over_production_serve(tmp_path):
     from websockets.sync.client import connect
     import hermes_yaml as yaml
@@ -83,6 +103,7 @@ def test_process_ownership_over_production_serve(tmp_path):
     env.update(HERMES_DASHBOARD_SESSION_TOKEN=token, HERMES_DESKTOP_READY_FILE=str(home / "ready.json"))
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Model)
     provider.calls, provider.step, provider.home, provider.commands = [], 0, home, []
+    provider.python = _fixture_python(home)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     endpoint = f"http://127.0.0.1:{provider.server_port}/v1"
@@ -142,4 +163,4 @@ def test_process_ownership_over_production_serve(tmp_path):
             print("TOOLS", [f for f in (frames.frames if frames else [])
                             if f.get("params", {}).get("type") in ("tool.complete", "status.update")])
             print("PROVIDER STEPS", provider.step)
-            print("COACH", (home / "coach" / "log.jsonl").read_text())
+            print("COACH", _coach_diagnostics(home))
