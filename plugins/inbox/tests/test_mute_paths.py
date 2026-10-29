@@ -20,13 +20,18 @@ def _load_plugin(monkeypatch, tmp_path):
     spec.loader.exec_module(mod)
     store = mod.store_module()
     monkeypatch.setattr(store, "kanban_task_creator", lambda **kw: "t_test")  # no real board
+    import sys
+    sys.path.insert(0, str(HERE / "tests"))
+    from ask_fixtures import register_test_posters
+    register_test_posters(tmp_path)
     return mod, store
 
 
 def _mute(store, poster):
+    from ask_fixtures import ASK
     inbox = store.Inbox()
     for i in range(store.MUTE_AFTER):
-        inbox.archive(inbox.post(f"noise {i}", "b", "do", key=f"n{i}", poster=poster)["session_id"])
+        inbox.archive(inbox.post(f"noise {i}", "b", "do", key=f"n{i}", poster=poster, ask=ASK)["session_id"])
 
 
 def _cli(mod, argv):
@@ -35,20 +40,28 @@ def _cli(mod, argv):
     return mod._run_cli(p.parse_args(argv))
 
 
+_ASK_JSON = json.dumps({"interaction": "preference", "why_human": "Only the owner can choose the proposed wording",
+                        "action": "Choose this wording"})
+_FIX = "abcdef1234567"
+
+
 def test_cli_post_refused_then_unmute(monkeypatch, tmp_path, capsys):
     mod, store = _load_plugin(monkeypatch, tmp_path)
     _mute(store, "cron · noisy")
-    assert _cli(mod, ["post", "again", "--body", "b", "--prompt", "do", "--poster", "cron · noisy"]) == 1
+    post = ["post", "again", "--body", "b", "--prompt", "do", "--poster", "cron · noisy", "--ask", _ASK_JSON]
+    assert _cli(mod, post) == 1
     assert "muted" in capsys.readouterr().err
-    assert _cli(mod, ["unmute", "cron · noisy"]) == 0
-    assert _cli(mod, ["post", "again", "--body", "b", "--prompt", "do", "--poster", "cron · noisy"]) == 0
+    assert _cli(mod, ["unmute", "cron · noisy", "--fix-commit", "not-a-sha"]) == 1  # needs a real commit
+    assert _cli(mod, ["unmute", "cron · noisy", "--fix-commit", _FIX]) == 0
+    assert _cli(mod, post) == 0
 
 
 def test_tool_post_refused(monkeypatch, tmp_path):
     mod, store = _load_plugin(monkeypatch, tmp_path)
     _mute(store, "kanban · noisy worker")
     monkeypatch.setattr(mod, "_poster_for", lambda sid: ("kanban · noisy worker", None))
-    out = json.loads(mod.handle_post({"title": "again", "body": "b", "accept_prompt": "do"}, session_id="s"))
+    out = json.loads(mod.handle_post({"title": "again", "body": "b", "accept_prompt": "do",
+                                      "ask": json.loads(_ASK_JSON)}, session_id="s"))
     assert out["posted"] is False and "PosterMuted" in out["error"]
 
 
@@ -62,11 +75,14 @@ def test_rest_post_refused(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "_profile", lambda: "default")
     store = api._store()
     monkeypatch.setattr(store, "kanban_task_creator", lambda **kw: "t_test")
+    sys.path.insert(0, str(HERE / "tests"))
+    from ask_fixtures import register_test_posters
+    register_test_posters(tmp_path)
     _mute(store, "rest-poster")
     app = fastapi.FastAPI()
     app.include_router(api.router)
     r = TestClient(app).post("/items", json={"title": "again", "body": "b", "accept_prompt": "do",
-                                             "poster": "rest-poster"})
+                                             "poster": "rest-poster", "ask": json.loads(_ASK_JSON)})
     assert r.status_code == 400 and "muted" in r.text
 
 
@@ -98,7 +114,8 @@ def test_agent_fixable_posts_refused_before_any_card_exists(monkeypatch, tmp_pat
 def test_owner_decisions_still_post(monkeypatch, tmp_path):
     mod, store = _load_plugin(monkeypatch, tmp_path)
     inbox = store.Inbox()
-    inbox.post("Approve the Q3 budget?", "b", "Approve it and tell finance.", poster="cron · finance")
+    from ask_fixtures import ASK
+    inbox.post("Approve the Q3 budget?", "b", "Approve it and tell finance.", poster="cron · finance", ask=ASK)
     inbox.post("Unblock t_y?", "Which DB?", "Unblock kanban card t_y with answer: use Postgres.",
-               poster="kanban · hands digest")
+               poster="kanban · hands digest", ask=ASK)
     assert len(inbox.list()) == 2

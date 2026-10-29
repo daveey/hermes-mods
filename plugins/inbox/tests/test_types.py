@@ -58,7 +58,8 @@ def env(tmp_path, monkeypatch, skills):
     db._inbox_keep_open = True
     clock = {"t": 1_000_000.0}
     reg = ct.Registry(tmp_path, skill_dirs=[skills])
-    from ask_fixtures import decision_inbox
+    from ask_fixtures import decision_inbox, register_test_posters
+    register_test_posters(tmp_path)
     inbox = decision_inbox(store.Inbox(home=tmp_path, db_factory=lambda: db, clock=lambda: clock["t"], types=reg))
     yield inbox, db, clock
     db.close()
@@ -410,7 +411,7 @@ def test_cli_post_act_outcome_types(env, monkeypatch, capsys):
         rc = plugin._run_cli(ap.parse_args(list(argv)))
         return rc, capsys.readouterr()
     rc, out = run("post", "X post pending: Q7", "--type", "x-post", "--key", "x-post:Q7",
-                  "--field", "id=Q7", "--field", "text=a=b")
+                  "--field", "id=Q7", "--field", "text=a=b", "--poster", "cli")
     assert rc == 0, out.err
     sid = json.loads(out.out)["session_id"]
     assert store.public_item(inbox.get(sid))["fields"] == {"id": "Q7", "text": "a=b"}
@@ -424,7 +425,7 @@ def test_cli_post_act_outcome_types(env, monkeypatch, capsys):
     assert rc == 0 and "x-post" in out.out and "approve, edit, skip, rewrite" in out.out
     rc, out = run("types", "x-post")
     assert rc == 0 and json.loads(out.out)["source"] == "skill:x-presence"
-    rc, out = run("post", "t", "--type", "x-post", "--field", "id=Q8")
+    rc, out = run("post", "t", "--type", "x-post", "--field", "id=Q8", "--poster", "cli")
     assert rc == 1 and "requires field" in out.err
 
 
@@ -461,7 +462,9 @@ def tenv(tmp_path, monkeypatch):
     reg = ct.Registry(tmp_path, skill_dirs=[])
     reg.define("chore", TASKY)
     kb = FakeKanban()
-    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db, types=reg, task_creator=kb)
+    from ask_fixtures import decision_inbox, register_test_posters
+    register_test_posters(tmp_path)
+    inbox = decision_inbox(store.Inbox(home=tmp_path, db_factory=lambda: db, types=reg, task_creator=kb))
     yield inbox, db, kb
     db.close()
 
@@ -601,7 +604,9 @@ def test_task_creates_a_real_kanban_card_on_a_temp_board(tmp_path, monkeypatch):
     db._inbox_keep_open = True
     reg = ct.Registry(tmp_path, skill_dirs=[])
     reg.define("chore", TASKY)
-    inbox = store.Inbox(home=tmp_path, db_factory=lambda: db, types=reg)  # default creator = core API
+    from ask_fixtures import decision_inbox, register_test_posters
+    register_test_posters(tmp_path)
+    inbox = decision_inbox(store.Inbox(home=tmp_path, db_factory=lambda: db, types=reg))  # default creator = core API
     sid = _post_chore(inbox, "C5")
     item = inbox.act(sid, "skip", "real")
     tid = item["outcome_task"]
@@ -649,11 +654,13 @@ def test_rest_task_act_outcome_and_failure(tmp_path, monkeypatch, skills):
     st = api._store()
     kb = FakeKanban()
     monkeypatch.setattr(st, "kanban_task_creator", kb)
+    from ask_fixtures import register_test_posters
+    register_test_posters(tmp_path)
     app = fastapi.FastAPI()
     app.include_router(api.router)
     c = TestClient(app)
     assert c.put("/types/chore", json=TASKY).status_code == 200
-    sid = c.post("/items", json={"title": "Chore R1", "type": "chore", "key": "chore:R1",
+    sid = c.post("/items", json={"poster": "t", "ask": __import__("ask_fixtures").ASK, "title": "Chore R1", "type": "chore", "key": "chore:R1",
                                  "fields": {"id": "R1"}}).json()["session_id"]
     kb.fail = RuntimeError("kanban down")
     r = c.post(f"/items/{sid}/act", json={"action": "plain"})
@@ -680,8 +687,12 @@ def test_task_act_on_another_profile(tmp_path, monkeypatch):
     prof.mkdir(parents=True)
     reg = st.types_module().Registry(prof, skill_dirs=[])
     reg.define("chore", TASKY)
+    from ask_fixtures import register_test_posters
+    register_test_posters(prof)
     inbox = st.Inbox.for_home(prof, types=reg)
-    sid = inbox.post("x", "", type="chore", key="chore:P1", fields={"id": "P1"})["session_id"]
+    sid = inbox.post("x", "", type="chore", key="chore:P1", fields={"id": "P1"}, poster="t", ask=__import__("ask_fixtures").ASK)["session_id"]
+    from ask_fixtures import register_test_posters
+    register_test_posters(tmp_path)
     app = fastapi.FastAPI()
     app.include_router(api.router)
     c = TestClient(app)
@@ -702,6 +713,8 @@ def client(tmp_path, monkeypatch, skills):
     st = api._store()
     reg_cls = st.types_module().Registry
     monkeypatch.setattr(st.types_module(), "_default_skill_dirs", lambda home: [skills])
+    from ask_fixtures import register_test_posters
+    register_test_posters(tmp_path)
     app = fastapi.FastAPI()
     app.include_router(api.router)
     return TestClient(app), api, tmp_path, reg_cls
@@ -710,7 +723,7 @@ def client(tmp_path, monkeypatch, skills):
 def test_rest_items_act_outcome(client):
     c, api, root, _ = client
     assert c.get("/ping").json() == {"ok": True, "api": 3}
-    r = c.post("/items", json={"title": "X post pending: Q1", "body": "", "type": "x-post", "key": "x-post:Q1",
+    r = c.post("/items", json={"poster": "t", "ask": __import__("ask_fixtures").ASK, "title": "X post pending: Q1", "body": "", "type": "x-post", "key": "x-post:Q1",
                                "fields": {"id": "Q1", "text": "draft"}})
     assert r.status_code == 200, r.text
     sid = r.json()["session_id"]
@@ -727,18 +740,18 @@ def test_rest_items_act_outcome(client):
     assert c.post(f"/items/{sid}/act", json={"action": "skip"}).status_code == 409  # closed
     assert c.post("/items/nope/act", json={"action": "skip"}).status_code == 404
     assert c.get("/outcome", params={"key": "zzz"}).json() == {"found": False, "key": "zzz"}
-    assert c.post("/items", json={"title": "t", "type": "x-post", "fields": {"id": "Q"}}).status_code == 400
+    assert c.post("/items", json={"poster": "t", "ask": __import__("ask_fixtures").ASK, "title": "t", "type": "x-post", "fields": {"id": "Q"}}).status_code == 400
 
 
 def test_rest_prompt_action_and_accept_alias(client):
     c, api, root, _ = client
-    sid = c.post("/items", json={"title": "x", "type": "x-post", "key": "x-post:Q2",
+    sid = c.post("/items", json={"poster": "t", "ask": __import__("ask_fixtures").ASK, "title": "x", "type": "x-post", "key": "x-post:Q2",
                                  "fields": {"id": "Q2", "text": "d"}}).json()["session_id"]
     r = c.post(f"/items/{sid}/accept")  # an older Desktop's Do it on a decision card
     assert r.status_code == 409 and "own actions" in r.text
     r = c.post(f"/items/{sid}/act", json={"action": "rewrite", "input": "punchier"})
     assert r.json()["prompt"].startswith("Rewrite X draft Q2: punchier.")
-    legacy = c.post("/items", json={"title": "y", "body": "b", "accept_prompt": "go", "poster": "t"}).json()["session_id"]
+    legacy = c.post("/items", json={"title": "y", "body": "b", "accept_prompt": "go", "poster": "t", "ask": __import__("ask_fixtures").ASK}).json()["session_id"]
     assert c.post(f"/items/{legacy}/accept").json()["accept_prompt"] == "go"
 
 
@@ -747,7 +760,9 @@ def test_rest_act_and_outcome_by_profile(client):
     st = api._store()
     prof = root / "profiles" / "alpha"
     prof.mkdir(parents=True)
-    sid = st.Inbox.for_home(prof).post("x", "", type="x-post", key="x-post:P1",
+    from ask_fixtures import register_test_posters
+    register_test_posters(prof)
+    sid = st.Inbox.for_home(prof).post("x", "", type="x-post", key="x-post:P1", poster="t", ask=__import__("ask_fixtures").ASK,
                                        fields={"id": "P1", "text": "t"})["session_id"]
     assert c.post(f"/items/{sid}/act", json={"action": "approve"}).status_code == 404  # wrong profile
     r = c.post(f"/items/{sid}/act?profile=alpha", json={"action": "approve"})
