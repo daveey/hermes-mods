@@ -38,3 +38,19 @@ def test_plain_status_mentioning_credit_is_not_flagged():
 
 def test_rule_is_on_by_default():
     assert "credit_ask" in rc.DEFAULT_RULES and "credit_ask" in rc.settings()["rules"]
+
+
+# Live false positive (hermes chat -q 20261029_173219_f18d43): a reply echoing a terminal result verbatim repeated
+# pool-llm's hint, whose old wording "Don't ask the user to buy credit" matched.
+ECHOED_HINT = ("openai.RateLimitError: Error code: 429 - You have no credits remaining\n\npool-llm: this is a paid API "
+               "key out of credit. Don't ask the user to buy credit: run the call on the Hermes subscription account pool "
+               "instead (Claude Max + ChatGPT accounts, rotates on limits).")
+
+
+def test_echoed_pool_llm_hint_is_not_an_ask():
+    assert rc.credit_ask(ECHOED_HINT, ["-> terminal(command=\"echo '...no credits remaining'\")"]) is None
+
+
+def test_ask_in_code_or_quote_is_not_an_ask_but_plain_ask_still_is():
+    assert rc.credit_ask("The old skill said `add credits to the API org`.", []) is None
+    assert rc.credit_ask("Please add credits to the OpenAI API org so the eval can continue.", [])

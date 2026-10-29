@@ -355,7 +355,9 @@ CREDIT_ASK_NUDGE = (
 
 def credit_ask(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     """The phrase asking the user to buy API credit, when the turn never ran the pool helper; else None."""
-    m = CREDIT_ASK_RE.search(reply or "")
+    # pool-llm's own hint (echoed tool output) and quoted/code text are not an ask
+    text = "\n".join(l for l in _CODE_QUOTE.sub(" ", reply or "").splitlines() if "pool-llm:" not in l)
+    m = CREDIT_ASK_RE.search(text)
     if not m or any(POOL_HELPER_RE.search(l or "") for l in (tool_log or [])):
         return None
     return m.group(0).strip()

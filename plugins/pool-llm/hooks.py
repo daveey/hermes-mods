@@ -16,7 +16,7 @@ from typing import Any, Optional
 MARK = "pool-llm:"
 HELPER = "~/.hermes/plugins/pool-llm/bin/hermes-pool-llm"
 CREDIT_ERROR_RE = re.compile(r"credit balance is too low|no credits remaining|insufficient_quota", re.I)
-HINT = (f"{MARK} this is a paid API key out of credit. Don't ask the user to buy credit: run the call on the Hermes "
+HINT = (f"{MARK} this is a paid API key out of credit; that needs no user action. Run the call on the Hermes "
         f"subscription account pool instead (Claude Max + ChatGPT accounts, rotates on limits). One call: `{HELPER} ask "
         f"--provider anthropic|openai --model <m> \"...\"`; an unmodified SDK harness: `{HELPER} serve --port 8765` then "
         "ANTHROPIC_BASE_URL=http://127.0.0.1:8765 OPENAI_BASE_URL=http://127.0.0.1:8765/v1 (any API key). "
