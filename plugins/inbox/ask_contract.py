@@ -40,6 +40,10 @@ def _is_test(text):
 _STATUS = re.compile(r"\b(?:was rejected|failed|expired|came back|missing guards|still on disk|sent to)\b|\bposted:|^Fixed:", re.I)
 
 
+# Outgoing-action notices: the type's resolve actions do not make "X DM sent" a decision.
+_SENT_NOTICE = re.compile(r"^\s*X\s+(?:DM\s+|reply\s+|post\s+)?(?:sent|posted)\b", re.I)
+
+
 def reason(*, home, poster, ask, actions, type_name="default", title="", body="", key="", **_):
     if _is_test(title) or _is_test(str(key or "")):
         return "content_test"
@@ -50,6 +54,8 @@ def reason(*, home, poster, ask, actions, type_name="default", title="", body=""
         return "poster_unregistered"
     if type_name not in row["allowed_types"] and "*" not in row["allowed_types"]:
         return "poster_type_forbidden"
+    if _SENT_NOTICE.search(title or ""):
+        return "content_status"
     if any(a.get("kind") == "resolve" for a in actions):
         return None
     if _STATUS.search(title) or _STATUS.search(body):

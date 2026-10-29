@@ -135,3 +135,13 @@ def test_refusal_repeats_become_comments_on_the_same_kanban_card(tmp_path, monke
         assert db.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
         comments = db.execute("SELECT body FROM task_comments WHERE task_id=?", (first,)).fetchall()
         assert any("Second evidence" in body for (body,) in comments)
+
+
+@pytest.mark.parametrize("title", ["X DM sent to Buck (@b), Thu Oct 22 11:40 PM PT", "X posted: Q-7", "X reply sent to @a"])
+def test_sent_notices_are_refused_even_on_resolve_types(tmp_path, title):
+    """Outgoing 'sent/posted' notices carry the x-dm/x-post resolve actions but are status, not a decision."""
+    policy = load("_ask_sent", "ask_contract.py")
+    assert policy.reason(home=tmp_path, poster="x-dm", ask=None, actions=[{"kind": "resolve"}],
+                         title=title, type_name="x-dm") == "content_status"
+    assert policy.reason(home=tmp_path, poster="x-dm", ask=None, actions=[{"kind": "resolve"}],
+                         title="Reply to Buck?", type_name="x-dm") is None
