@@ -50,8 +50,9 @@ python3 -B $S <sha> --once                            # one check: exit 0 done, 
 ```
 
 Exit codes: 0 done (prints the run URLs or tags); 1 stalled (nothing queued or running will finish it,
-and the failing run's URL is printed); 2 timed out (default 120 min) or not yet with `--once`; 3 the sha isn't
-on `origin/<branch>` (default `main`; `--branch` to change). `--dispatch` (requires `--workflow`) re-runs the
+and the failing run's URL is printed), or `gh run list` failed 5 times in a row (prints `gh kept failing`: a `gh`
+auth or repo problem, not a CI failure); 2 timed out (default 120 min) or not yet with `--once` (a failed listing
+included); 3 the sha isn't on `origin/<branch>` (default `main`; `--branch` to change). `--dispatch` (requires `--workflow`) re-runs the
 workflow via `gh workflow run` on a stall, at most twice, instead of exiting 1. Pass several shas to wait
 until one run or tag contains all of them.
 
@@ -71,9 +72,10 @@ How to run it from an agent:
   older than 24 h. In those cases the job can still die without a word. So after any update or restart, check
   each wait you promised with `process_manage poll` (or `--once`). If a deploy or a promised report depends
   on the wait, put that step on a durable Kanban card with a `wake_check`, not a chat-owned chain.
-- When a script chains steps after the wait, send the wait's output to a log file (`>> log 2>&1`), never
-  through `| tail -n`. tail prints nothing until the wait exits, so a killed or hung wait leaves no record of
-  what it was waiting on.
+- When a script chains steps after the wait, send the wait's output to a log file (`>> log 2>&1`) and test the
+  wait's own exit code; never pipe it through `| tail -n`. tail prints nothing until the wait exits, so a killed
+  or hung wait leaves no record of what it was waiting on. And `wait | tail && deploy` tests tail's exit status,
+  so it deploys after a failed wait.
 - In a Kanban worker there is no async notify, and a poll loop burns `max_runtime_seconds` (most worker
   timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
@@ -152,6 +154,9 @@ workers to stop chasing tests.
    (don't write a new probe script: this one already handles the in-progress and zero-steps cases), started in
    the background with notify on `ACTIONS OK` / `STILL BLOCKED`. The probe re-runs a cheap Linux workflow, so it
    doesn't depend on someone pushing. "I raised the limit" isn't proof: confirm with the probe before relaying it.
+   For a one-shot "are we still blocked?", don't scan recent runs: once repos are on self-hosted runners, no
+   hosted job may have run for hours, so recent runs prove nothing. Re-run the refused job itself
+   (`gh run rerun <run id> -R O/R --failed`, ~60 s, reuses upstream job outputs) and read its annotation.
 2. **List everyone who is waiting before it clears**, and save the list to a scratch file so it survives compaction:
    - chats: `session_search` on the exact phrases `"payments have failed"` and `"spending limit"`. One search
      misses sessions that only quoted the other phrase.

@@ -27,6 +27,14 @@ Run the checker once per wake; schedule the next look with `kanban_continue(resu
 | blocked_unknown | diagnose (rulesets, required checks, queue); do not guess or ask |
 | ready | attempt the normal merge (never `--admin`, never self-approve, never add bypass labels) |
 
+`ready` still waits on unresolved review threads, which the script's `gh pr view` fields omit; a Graphite queue
+label just sits on such a PR ("will be added once it meets the requirements"). List them:
+`gh api graphql -f query='{repository(owner:"O",name:"R"){pullRequest(number:N){reviewThreads(first:50){nodes{id isResolved comments(first:1){nodes{author{login} body}}}}}}}'`.
+The user requires each one fixed or refuted in its thread, bots included: reply with the
+`addPullRequestReviewThreadReply` mutation, then `resolveReviewThread`. A fix push dismisses the approval, so
+re-request the reviewer yourself (`gh api -X POST repos/O/R/pulls/N/requested_reviewers -f 'reviewers[]=<login>'`)
+instead of blocking on it.
+
 `checks_pending` with the new head's run stuck `pending` (no jobs) usually means an older run is holding the
 workflow's concurrency group. Cancelled runs do this when an `if: always()` gate or report job
 ("All required checks pass", timing report, aggregate) still waits for a busy runner, and a main group

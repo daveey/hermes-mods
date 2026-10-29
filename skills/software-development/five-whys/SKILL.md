@@ -48,9 +48,7 @@ system is idle.
 
 When David confirms he replaced the recovery plan through another operator, adopt that intended end-state before further remediation; absent retired services are not an outage to reverse. Stop obsolete restoration work, notify its owners and retire superseded tracking in the same turn—not merely promise reconciliation. Record supersession separately from successful implementation: for withdrawn Kanban goals, comment the changed mandate, use `hermes kanban archive <task-id>`, then read back status. Do not force completion against unmet original acceptance criteria or claim queued remote notices have stopped remote work.
 
-Separate registration, host/service health, operational readiness, job activity, and successful workload execution. Unknown or expired observations prove neither health nor idleness; an empty bounded job query cannot override a busy signal. For runner investigations, require independent fresh registration, host/service and readiness evidence across two distinct collection cycles, plus a separately evidenced successful build before declaring success. Do not launch a build merely to satisfy that gate during diagnosis-only work; report the missing proof instead.
-
-For the bounded runner evidence workflow, see [Runner verification evidence](references/runner-verification.md).
+Separate registration, host/service health, operational readiness, job activity, and successful workload execution. Unknown or expired observations prove neither health nor idleness; an empty bounded job query cannot override a busy signal. Runner success needs two fresh collection cycles plus an attributable build: [Runner verification evidence](references/runner-verification.md).
 
 ### 1. State the problem as an observed fact
 
@@ -81,8 +79,9 @@ notification's truncated list. Separate creation rate, retained inventory and ac
 not prove failed cleanup.
 
 For filesystem-age alerts, inspect the timestamp implementation on the running OS. On Linux, `st_ctime` is
-metadata-change time, not creation time; compare GNU `stat -c '%W|%Z' <path>` (birth time versus ctime) before
-trusting a "new files/worktrees" count. Treat `%W = 0` as unknown, not a recent birth. Use a fixed report-time
+metadata-change time, not creation time, and Git activity makes old worktrees look new; compare GNU
+`stat -c '%W|%Z' <path>` (birth time versus ctime) and the creation-call history before trusting a "new
+files/worktrees" count. Treat `%W = 0` as unknown, not a recent birth. Use a fixed report-time
 cutoff when checking the original alert, and label later measurements separately rather than claiming they
 reconstruct a changing inventory exactly.
 
@@ -98,6 +97,11 @@ For each answer:
   most common way the method fails.
 
 **For a slow agent, read the execution log before explaining the delay.** Resolve the active worker session from its task/run, read timestamped tool calls and results, then inspect the output paths those calls actually used and query live publication state. Heartbeats prove liveness, not progress; an unchanged data directory says nothing about a separate build directory. Show the user a compact timeline of concrete operations/errors rather than another supervision promise. Separate dependency waits, productive execution, tool timeouts, recovery, rework and deployment; run counts alone do not measure wasted work. Tie resource failures to the operation stopped: a per-worker OOM does not establish global concurrency pressure. Inspect existing controls before calling them absent; missing, bypassed and misconfigured controls need different fixes. Preserve useful work before taking over.
+
+**When state changed and no code path explains it** (a counter reset, a row rewritten, a file swapped), look for
+another actor before filesystem or log forensics: open cards on that subsystem on every board and host, their latest
+comments, and sessions working on the same object. Agents often write to a host over ssh from another host, so the
+target host's logs, process list and session DB never show the change; the actor's card or transcript does.
 
 ### 3. Branch where causes split
 
@@ -180,7 +184,11 @@ too big for now, file it (card or issue with the chain) and say so in the report
 Choose enforcement at the failure point rather than relying only on prose: capability preflight before placement; bounded typed recovery for checkpoints, quota and exhausted budgets; per-job memory feasibility plus aggregate resource admission; and end-to-end origin visibility and deployed-revision checks. Pair each with failure-injection acceptance. State the coverage limits of containment: stopping new idle workers does not constrain already-running producers or restore disk space, and a guard holding the cleanup lock may prevent reclamation until its owner coordinates release. Never present such a brake as capacity recovery.
 
 After the countermeasures ship, verify each one against live data before calling the chain closed: the guard's own
-telemetry (did it fire, how often, what did it fall back to), not the worker's "done" summary. A guard that "works"
+telemetry (did it fire, how often, what did it fall back to), not the worker's "done" summary. A live check proves
+the guard only when the failure's precondition was present: the change under test touched the failing path (e.g.
+the update's diff changed the module that broke) and the process was in the vulnerable state (e.g. booted before
+the update). Write that precondition into the live-check acceptance and confirm it before citing the result; when
+it was absent, report "no regression; prevention not yet observed live". A guard that "works"
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
@@ -250,10 +258,9 @@ Countermeasures:
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
-- Treating a filesystem timestamp as creation evidence without checking platform semantics. Linux `st_ctime` is metadata-change time, not birth time; Git activity can make old worktrees look newly created. Compare true birth (`stat -c %W` on GNU systems) with creation-call history before attributing a burst. A generic safety GC or written cleanup instruction does not prove that a creator reaps its own trees; require lifecycle tests and live plugin discovery before suppressing its alerts.
 - Recovering a damaged SQLite database by hand as the symptom fix. Several agents chasing the same alert
   each swap a rebuilt copy in, and every `mv` or sidecar `rm` under open WAL connections corrupts the next
-  copy (hub kanban.db, 2026-10-28). For a Kanban board, the symptom fix is `hermes kanban [--board <slug>]
+  copy. For a Kanban board, the symptom fix is `hermes kanban [--board <slug>]
   recover` (single-owner lock; a second run names the holder's card, so comment there), proven by
   `sqlite3 -readonly <db> 'pragma integrity_check'` = `ok` plus its loss report. Other databases: the
   sqlite-live-guard `swap_db.py` helper. Never hand-run dump/`.recover` then `mv`.

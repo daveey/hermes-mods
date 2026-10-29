@@ -176,4 +176,10 @@ verify that integration before promising autonomous builds.
 - `missing_scope` → the app lacks that scope; tell an admin which one (the error names it).
 - For a thread in an unknown channel, search the bot's observation index before dumping a guessed channel's history; large unrelated threads obscure the target. Use [thread discovery](references/thread-discovery.md), then verify the full thread live.
 - Observation starts when the bot joins; an index miss requires live history discovery, not an absence claim.
+- A bot that "hasn't answered": tell no traffic from no reply before calling it an outage or parking a card on its
+  next turn ([silence triage](references/silence-triage.md)).
+- A wrong bot reply: first find the profile that answered (one gateway can host several bot profiles; match the
+  workspace via `Authenticated as … (team: T…)` in each profile's agent.log), then grep that profile's `state.db`
+  messages for the reply. A profile without this plugin has no `observed.sqlite` and no channel context, so
+  searching the follower/observation stores of another profile finds nothing.
 - Bot-token search uses observations/history; `assistant.search.context` requires a user-event `action_token`.

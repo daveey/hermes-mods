@@ -106,6 +106,12 @@ or the new card's title gets a ` (2)` suffix.
 
 ## Inbox card types
 
+Self-heal never asks the user: the lane auto-approves every investigation's proposal (`auto_approve`, default on, in
+`coach/selfheal-config.json`) and the only self-heal card in the Inbox is the fix card's "Fixed: …" result. Any new
+self-heal path or monitor must keep that: no Do-it proposal cards; open legacy `selfheal` cards are resolved with
+`hermes inbox act <sid> do_it` on the hub, then `self_heal.py sync` files the fixes. Lane admission counts only
+*running* cards, so a bulk approval admits every fix at once past the 3-running / $200 caps; say so when you do one.
+
 Improvement cards are `coach-improvement` typed (`inbox-types/coach-improvement.yaml`, fields `id`): **Review** (the
 check-whether-it-helps prompt), **Keep** (resolve; a canary is promoted at once), **Undo** (`task`: runs
 `coach-apply revert`), **Not now** (resolve; nothing of that kind + target is proposed for 14 days), **Never**
@@ -150,12 +156,12 @@ Undone notices are always plain cards.
 - A new curriculum `adopted` test that needs a fact the digest lacks: add a counter to `call_features()` /
   `CMD_FEATURES` in `session_digest.py` (names only, never argument text), bump `DIGEST_V`, re-ship, rerun every feed.
   Sanity-check new adoption counts against real sessions before trusting them (agent-run commands count too).
-- Reply-check rules match one model's failure modes, so silence after a default-model change means nothing. Opus fails
-  by asking ("Want me to…?", caught by `confirm`). GPT-6 Astra fails by reporting accurately and stopping ("not fixed;
-  nothing needs you"), which no rule matched, so the check logged 0 nudges in 4 days. After any `model.default`
-  change, blind-judge a few hundred of the new model's endings (fixed / started / proposed / offered / report_only)
-  and compare them per trigger (human question vs action ask vs automated event) with the old model's, before trusting
-  the detectors. Questions about a problem are where models diverge most. Explicit "fix X" asks barely differ.
+- Reply-check rules match one model's failure modes, so silence after a default-model change means nothing: Opus fails
+  by asking ("Want me to…?", the `confirm` rule), GPT-6 Astra by reporting accurately and stopping ("not fixed; nothing
+  needs you"), which no rule matched. Re-baseline per model and trigger before trusting the detectors, attributing
+  each turn to the model that served it: fallback and mid-chat switches serve some turns on another model, so
+  `sessions.model` and the digest's per-session `model` mislabel them. Recipe: the Evaluation section of the
+  hermes-training skill's `coach-detectors.md` reference.
 - An instruction fix (`~/AGENTS.md`, SOUL.md, a skill) is live only in sessions whose prompt contains it. Core loads
   AGENTS.md from the git-root → cwd chain only, so a home-level rule reached 0% of Kanban workers (scratch cwd), 0%
   of cron and 55% of chats (those opened in a project folder missed it) until the fork's `agent.global_context_files`
