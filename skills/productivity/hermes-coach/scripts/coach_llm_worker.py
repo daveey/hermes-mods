@@ -309,11 +309,14 @@ class CodexBackend:
         return out
 
 
-def build_backend(provider):
-    """The backend for `provider` from Hermes credentials: (backend, hello-info) or raises SystemExit-able ValueError."""
+def build_backend(provider, model=None):
+    """The backend for `provider` from Hermes credentials: (backend, hello-info) or raises SystemExit-able ValueError.
+    `model` is the model the backend will serve: under a managed subscription policy (model_routing
+    enforce_subscription_only) the credential is resolved for that exact (model, provider) pin, and without it Hermes
+    pairs the provider with model.default, which a policy rejects for any other provider."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from agent.usage_pricing import get_pricing_entry
-    rt = resolve_runtime_provider(requested=provider)
+    rt = resolve_runtime_provider(requested=provider, target_model=model or None)
     mode, key, base = rt.get("api_mode"), rt.get("api_key"), rt.get("base_url")
 
     def get_price(model, prov, url):
@@ -343,7 +346,7 @@ def serve(default_provider, backends, build=build_backend, lines=None):
             req = json.loads(line)
             prov = req.get("provider") or default_provider
             if prov not in backends:
-                backends[prov] = build(prov)[0]
+                backends[prov] = build(prov, req.get("model"))[0]
             be = backends[prov]
             if req.get("op") == "price":
                 _reply(be.price(req["model"]))
@@ -359,8 +362,8 @@ def serve(default_provider, backends, build=build_backend, lines=None):
 def main():
     provider = os.environ.get("COACH_EVAL_PROVIDER") or "anthropic"
     try:
-        be, info = build_backend(provider)
-    except ValueError as exc:
+        be, info = build_backend(provider, os.environ.get("COACH_WORKER_MODEL"))
+    except Exception as exc:
         _reply({"fatal": str(exc)})
         return 2
     _reply(dict(info, ready=True))

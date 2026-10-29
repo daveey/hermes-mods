@@ -77,6 +77,23 @@ status check or FYI).
 """
 
 MAX_STEPS = 1
+# cut "start" (bench-v3 turn mode): the replay starts at David's message and the model runs the whole turn itself, up
+# to START_STEPS requests; each tool call gets an output simulated from the original turn's REAL tool outputs.
+# Why: at the "final" cut (right before the original final reply) Opus and Astra stop at the same rate (13/48 vs
+# 12/48 on the turns whose original reply was undecided); live, the gap is in the trajectory: on question turns Opus
+# called a fix/start tool in 15/24 turns, Astra in 14/57.
+START_STEPS = 8
+SIM_SYS = """You simulate the machine for a replay of a real Hermes agent session. You get the REAL record of the tool \
+calls the original agent made during this turn and their REAL outputs: that is the ground truth about the machine, the \
+repos, the Kanban board and the sessions at that moment. Another agent is now replaying the same turn and has made one \
+tool call. Write the raw output that call would most plausibly have returned on the same machine at the same moment.
+- Stay consistent with the real record. When the record holds output for the same or an overlapping query, reuse it \
+(verbatim where it applies, trimmed to what this call would print).
+- A call that changes state (edits or writes a file, creates/updates/blocks a card, starts a worker or job, sends a \
+message, runs a fix or a deploy) returns a plausible, short success output for that action (ids like t_replay01).
+- When the record says nothing about it, invent a short output that fits the record; never contradict it.
+- Output ONLY the tool result: no commentary, no hints about what to do next, no mention of a replay or simulation. \
+At most 1800 characters. JSON tools return JSON."""
 STUB_RESULT = ("[replay: this call ran and succeeded; its output is not shown in this replay. Do not treat the missing "
                "output as a problem or mention it. Assume it showed what you expected, and continue the turn.]")
 OUTCOMES = ("fixed", "started", "proposed", "offered", "report_only", "na")
@@ -295,11 +312,13 @@ class TranscriptRunner(ce.DirectRunner):
         if not isinstance(prompt, dict):
             return super().prepare(prompt, home=home, cwd=cwd, model=model, toolsets=toolsets, ignore_rules=ignore_rules)
         r = TReq()
-        r.provider = self.provider_for(model, ignore_rules)
+        r.provider = prompt.get("provider") or self.provider_for(model, ignore_rules)  # the tool simulator: own wire
         p = self.price(model, r.provider)
         r.model, r.price = model, p
         if "messages" in prompt:
             r.system, r.user, r.messages, r.tools = compose(home, cwd, self.preload), "", prompt["messages"], prompt["tools"]
+            if prompt.get("system_extra"):
+                r.system += "\n\n" + prompt["system_extra"]
             r.max_tokens, r.thinking = self.transcript_max_tokens, None
         else:
             r.system, r.user, r.messages, r.tools = prompt["system"], prompt["user"], None, None
@@ -340,8 +359,55 @@ def compose(home, cwd, preload):
     return _SYS_CACHE[k]
 
 
+def turn_split(ep):
+    """(messages up to and including David's message, the original turn's tool steps after it) of a transcript
+    episode. The turn's message is the last user message that isn't the trim note."""
+    ms = ep["messages"]
+    i = max(j for j, m in enumerate(ms) if m["role"] == "user" and not str(m.get("content") or "").startswith(
+        "[context trimmed for length"))
+    return ms[:i + 1], [m for m in ms[i + 1:] if m["role"] != "user"]
+
+
+def ground_text(body, limit=24000):
+    """The original turn's calls and REAL outputs as plain text for the tool simulator (oldest steps dropped first)."""
+    names, parts = {}, []
+    for m in body:
+        if m["role"] == "assistant":
+            for c in m.get("tool_calls") or []:
+                names[c["id"]] = c["name"]
+                parts.append(f"CALL {c['name']}({clip(str(c.get('arguments') or ''), 600, 200)})")
+        elif m["role"] == "tool":
+            parts.append(f"OUTPUT of {names.get(m.get('tool_call_id'), '?')}:\n{m.get('content') or ''}")
+    text = "\n\n".join(parts)
+    return text if len(text) <= limit else "[older steps omitted]\n" + text[-limit:]
+
+
+_GUIDE = {}
+
+
+def model_guidance(model, tool_names):
+    """The model-gated blocks live Hermes adds to a tool-enabled session's system prompt (agent/system_prompt.py
+    _guidance_parts, agent.tool_use_enforcement / execution_guidance "auto"): tool-use enforcement + execution
+    discipline for gpt/codex-family models, nothing for Claude. Read from the installed Hermes so it can't drift."""
+    if model in _GUIDE:
+        return _GUIDE[model]
+    import subprocess
+    py, root = ce.hermes_interpreter()
+    code = ("import json,sys\nsys.path.insert(0, sys.argv[1])\nimport hermes_bootstrap\nfrom agent import prompt_builder as pb\n"
+            "m, names = sys.argv[2].lower(), set(json.loads(sys.argv[3]))\nparts = []\n"
+            "if any(p in m for p in pb.TOOL_USE_ENFORCEMENT_MODELS):\n    parts.append(pb.TOOL_USE_ENFORCEMENT_GUIDANCE)\n"
+            "if any(p in m for p in pb.EXECUTION_GUIDANCE_MODELS):\n    parts.append(pb.execution_guidance_text(names))\n"
+            "print(json.dumps('\\n\\n'.join(parts)))\n")
+    out = subprocess.run([py, "-I", "-c", code, root, model, json.dumps(sorted(tool_names))], capture_output=True, text=True,
+                         timeout=120, cwd=root)
+    if out.returncode != 0:
+        raise RuntimeError(f"model_guidance: {out.stderr[-400:]}")
+    _GUIDE[model] = json.loads(out.stdout.strip().splitlines()[-1])
+    return _GUIDE[model]
+
+
 def judge_text(iid, ep, rep):
-    counts = dict(ep["orig_tools"])
+    counts = {} if rep.get("cut") == "start" else dict(ep["orig_tools"])
     for c in rep["calls"]:
         counts[c["name"]] = counts.get(c["name"], 0) + 1
     tools = ", ".join(f"{k}×{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])) or "(none)"
@@ -394,8 +460,12 @@ def render_reply(text, calls):
 
 
 def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root=None, live=None, runner=None,
-        limit=None, log=print, replies_path=None, max_steps=None, agents_md=None):
-    """replies_path: a JSON-lines cache of finished replays; a rerun after a crash reuses them (no new spend)."""
+        limit=None, log=print, replies_path=None, max_steps=None, agents_md=None, cut="final", sim_model=None,
+        sim_provider=None, guidance=None):
+    """replies_path: a JSON-lines cache of finished replays; a rerun after a crash reuses them (no new spend).
+    cut "final": replay up to the original final reply, score the next request (a tool call = continued).
+    cut "start": replay from David's message; the model runs the turn (tool outputs simulated by sim_model from the
+    original turn's real outputs) and the whole turn (its calls + final reply) is labeled with the eval-set rubric."""
     lines = [json.loads(x) for x in Path(bench).read_text().splitlines() if x.strip()]
     meta = next(e for e in lines if e.get("id") == "_meta")
     eps = [e for e in lines if e.get("id") != "_meta"]
@@ -415,14 +485,73 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
         agents = agents_md if agents_md is not None else meta.get("agents_md")
         if agents is not None:
             (Path(cwd) / "AGENTS.md").write_text(agents)
-        steps_cap = max_steps or meta.get("max_steps") or MAX_STEPS
+        steps_cap = max_steps or (START_STEPS if cut == "start" else meta.get("max_steps") or MAX_STEPS)
+        sim_model = sim_model or os.environ.get("COACH_SIM_MODEL") or "gpt-6-astra"
+        sim_provider = sim_provider or os.environ.get("COACH_SIM_PROVIDER") or (
+            "anthropic" if sim_model.startswith("claude") else "openai-codex")
+        extra = "" if cut != "start" else guidance if guidance is not None else \
+            model_guidance(model, [t["function"]["name"] for t in meta["tools"]])
         work = [(ep, k) for k in range(repeats) for ep in eps]
+
+        def simulate(ep, ground, call, seen):
+            user = (f"DAVID'S MESSAGE THIS TURN:\n{clip(ep['user_ask'], 1500, 300)}\n\nREAL RECORD OF THE ORIGINAL TURN:\n"
+                    f"{ground or '(the original agent called no tools this turn)'}\n\n"
+                    + (f"OUTPUTS YOU ALREADY GAVE THE REPLAYING AGENT (stay consistent):\n{seen[-6000:]}\n\n" if seen else "")
+                    + f"THE CALL TO ANSWER NOW:\n{call['name']}({clip(str(call.get('arguments') or ''), 3000, 500)})")
+            for attempt in range(3):
+                try:
+                    got = budget.call(runner, {"system": SIM_SYS, "user": user, "provider": sim_provider},
+                                      model=sim_model, ignore_rules=True)
+                    break
+                except RuntimeError as exc:
+                    log(f"  {ep['id']} sim: {str(exc)[:160]}")
+                    if attempt == 2:
+                        raise
+            if got is None:
+                return None
+            return clip((got[0] or "").strip() or "(no output)", 1800, 200)
+
+        def rollout_start(ep, k):
+            msgs, body = turn_split(ep)
+            msgs, ground, seen = list(msgs), ground_text(body), ""
+            calls, text, cost = [], "", 0.0
+            for step in range(steps_cap):
+                for attempt in range(3):
+                    try:
+                        got = budget.call(runner, {"messages": msgs, "tools": meta["tools"], "system_extra": extra},
+                                          home=root, cwd=cwd, model=model)
+                        break
+                    except RuntimeError as exc:
+                        log(f"  {ep['id']}#{k} step {step}: {str(exc)[:160]}")
+                        if attempt == 2:
+                            raise
+                if got is None:
+                    return None
+                text, usage = got
+                cost += float((usage or {}).get("estimated_cost_usd") or 0)
+                new = [dict(c, id=f"r{k}s{step}c{i}") for i, c in enumerate((usage or {}).get("tool_calls") or [])]
+                if not new:
+                    if not text.strip():
+                        text = ce.REFUSAL_TEXT if (usage or {}).get("stop_reason") == "refusal" else ce.EMPTY_TEXT
+                    return {"text": text.strip(), "calls": calls, "steps": step + 1, "capped": False,
+                            "cost": round(cost, 4), "cut": "start"}
+                calls += new
+                outs = []
+                for c in new:
+                    o = simulate(ep, ground, c, seen)
+                    if o is None:
+                        return None
+                    seen += f"\n{c['name']}({clip(str(c.get('arguments') or ''), 300, 80)}) ->\n{clip(o, 600, 200)}\n"
+                    outs.append({"role": "tool", "tool_call_id": c["id"], "content": o})
+                msgs = msgs + [{"role": "assistant", "content": text, "tool_calls": new}] + outs
+            return {"text": text.strip(), "calls": calls, "steps": steps_cap, "capped": True, "cost": round(cost, 4),
+                    "cut": "start"}
 
         def one(item):
             ep, k = item
             try:
                 if ep["kind"] == "transcript":
-                    return ep, k, rollout(ep, k)
+                    return ep, k, (rollout_start if cut == "start" else rollout)(ep, k)
                 got = budget.call(runner, ce.replay_prompt(ep), home=root, cwd=cwd, model=model)
             except Exception as exc:
                 log(f"  {ep['id']}#{k}: {str(exc)[:200]}")
@@ -503,7 +632,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
                 iid = hashlib.sha1(f"{ep['id']}|{k}|{random.random()}".encode()).hexdigest()[:12]
                 key[iid] = (ep, k)
                 if ep["kind"] == "transcript":
-                    if not rep["calls"]:
+                    if not rep["calls"] or rep.get("cut") == "start":
                         ro_items.append((iid, ep, rep))
                 else:
                     ctl_items.append((iid, ep, rep["text"]))
@@ -517,7 +646,7 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
             row = {"episode": ep["id"], "pattern": ep["pattern"], "repeat": k, "steps": rep["steps"],
                    "reply": render_reply(rep["text"], rep["calls"])[:1500]}
             if ep["kind"] == "transcript":
-                if rep["calls"]:
+                if rep["calls"] and rep.get("cut") != "start":
                     outcome = "continued"  # it kept acting instead of ending the turn here: not stopped
                 elif iid in labels:
                     outcome = labels[iid]["outcome"]
@@ -546,7 +675,8 @@ def run(bench, model, repeats=2, budget_usd=15.0, jobs=4, judge_model=None, root
         for c in by_ctx.values():
             c.update(rate=round(c["fail"] / c["n"], 4), ci95=wilson(c["fail"], c["n"]))
         complete = not limit and not budget.stopped and ro["n"] == n_ro and ctl["n"] == n_ctl
-        return {"mode": "model-bench", "bench": "bench-v3", "model": model,
+        return {"mode": "model-bench", "bench": "bench-v3" + ("-turn" if cut == "start" else ""), "cut": cut,
+                "sim_model": sim_model if cut == "start" else None, "max_steps": steps_cap, "model": model,
                 "provider": os.environ.get("COACH_EVAL_PROVIDER") or "anthropic", "judge_model": judge_model,
                 "repeats": repeats, "episodes": {"report_only": n_ro // repeats, "control": n_ctl // repeats},
                 "by_pattern": {"report_only": ro, "control": ctl}, "by_context_model": by_ctx,
@@ -598,6 +728,9 @@ def main(argv=None):
     r.add_argument("--max-steps", type=int, help="requests per rollout (default: the bench's, else 1)")
     r.add_argument("--agents-md", help="ablation: use this file as the global AGENTS.md instead of the bench's")
     r.add_argument("--root", help="private eval home (default ~/.cache/coach-eval/root-v3); one per concurrent run")
+    r.add_argument("--cut", choices=("final", "start"), default="final",
+                   help="final: next request after the original investigation; start: the whole turn from David's message")
+    r.add_argument("--sim-model", help="cut start: the tool-output simulator (default gpt-6-astra on openai-codex)")
     a = ap.parse_args(argv)
     if a.cmd == "build":
         if Path(a.out).exists():
@@ -608,7 +741,8 @@ def main(argv=None):
     res = run(a.bench, a.model, a.repeats, a.budget, a.jobs, limit=a.limit,
               log=lambda s: print(s, file=sys.stderr, flush=True),
               replies_path=Path(a.out).with_suffix(".replies.jsonl") if a.out else None, max_steps=a.max_steps,
-              agents_md=Path(a.agents_md).read_text() if a.agents_md else None, root=a.root)
+              agents_md=Path(a.agents_md).read_text() if a.agents_md else None, root=a.root, cut=a.cut,
+              sim_model=a.sim_model)
     md = markdown(res)
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)

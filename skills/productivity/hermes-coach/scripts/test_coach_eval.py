@@ -913,8 +913,8 @@ class CodexWire(unittest.TestCase):
                 return {"input": 3.0}
         built = []
 
-        def build(p):
-            built.append(p)
+        def build(p, model=None):
+            built.append((p, model))
             return Anth(), {}
         lines = [json.dumps(self.req), json.dumps(dict(self.req, provider="anthropic")),
                  json.dumps(dict(self.req, provider="anthropic", op="price")), json.dumps(dict(self.req, op="nope"))]
@@ -924,7 +924,8 @@ class CodexWire(unittest.TestCase):
         out = [json.loads(x) for x in buf.getvalue().splitlines()]
         self.assertEqual([out[0]["text"], out[1]["text"], out[2]["input"], out[3]["error"]],
                          ["from codex", "from anthropic", 3.0, "unknown op"])
-        self.assertEqual(built, ["anthropic"])
+        # the backend is resolved for the request's model (a managed subscription policy pins (model, provider))
+        self.assertEqual(built, [("anthropic", self.req.get("model"))])
 
     def test_runner_prices_a_zero_route_and_sends_the_judge_to_anthropic(self):
         from unittest.mock import patch

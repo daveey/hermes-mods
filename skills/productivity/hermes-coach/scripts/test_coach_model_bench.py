@@ -136,5 +136,73 @@ class Run(unittest.TestCase):
         self.assertEqual(mb.wilson(0, 0), (0.0, 1.0))
 
 
+class TurnStart(unittest.TestCase):
+    """cut="start": the replay begins at David's message, the model runs the turn, its tool calls get outputs
+    simulated from the original turn's REAL outputs, and the whole turn is labeled (tool calls don't excuse a
+    report-only ending)."""
+
+    def setUp(self):
+        Run.setUp(self)
+        # the original turn: user message, a call with its real output, a trailing call
+        self.ep_msgs = [{"role": "user", "content": "earlier ask"}, {"role": "assistant", "content": "earlier reply",
+                                                                     "tool_calls": []}] + MSGS
+
+    def runner(self, final_text):
+        test = self
+
+        class R(FakeRunner):
+            sims, first = [], []
+
+            def __call__(self, prompt, **kw):
+                if isinstance(prompt, dict) and prompt.get("system") == mb.SIM_SYS:
+                    self.sims.append(prompt)
+                    test.assertEqual(prompt["provider"], "openai-codex")
+                    return "SIMULATED OUTPUT", {}
+                if isinstance(prompt, dict) and "messages" in prompt:
+                    ms = prompt["messages"]
+                    if ms[-1]["role"] == "user":
+                        self.first.append(ms)
+                        return "", {"tool_calls": [{"name": "terminal", "arguments": "{\"command\": \"ls\"}"}]}
+                    test.assertEqual(ms[-1]["content"], "SIMULATED OUTPUT")
+                    test.assertEqual(prompt["system_extra"], "GUIDE")
+                    return final_text, {}
+                return FakeRunner.__call__(self, prompt, **kw)
+        return R(final_text)
+
+    def bench_with_turn(self):
+        lines = [json.loads(x) for x in self.bench.read_text().splitlines()]
+        for e in lines:
+            if e.get("kind") == "transcript":
+                e["messages"] = self.ep_msgs
+        self.bench.write_text("".join(json.dumps(e) + "\n" for e in lines))
+
+    def test_turn_split_cuts_at_davids_message(self):
+        head, body = mb.turn_split({"messages": self.ep_msgs[:3] + [
+            {"role": "user", "content": "[context trimmed for length: 2 earlier tool calls of this turn omitted]"}]
+            + self.ep_msgs[3:]})
+        self.assertEqual(head[-1]["content"], "why is the badge wrong?")
+        self.assertEqual([m["role"] for m in body], ["assistant", "tool"])
+        self.assertIn("OUTPUT of terminal:\na b", mb.ground_text(body))
+
+    def test_a_turn_that_investigates_then_reports_is_stopped(self):
+        self.bench_with_turn()
+        r = self.runner("It is still broken; the owner has it.")
+        res = mb.run(self.bench, "m", repeats=1, runner=r, root=self.tmp / "root", live=self.live, log=lambda *_: None,
+                     cut="start", guidance="GUIDE")
+        ro = res["by_pattern"]["report_only"]
+        self.assertEqual((ro["n"], ro["fail"], ro["acted"]), (3, 3, 3))  # called a tool, still a report-only turn
+        self.assertEqual(res["cut"], "start")
+        # the replay starts at David's message: none of the original turn's calls are shown to the model
+        self.assertTrue(all(ms[-1]["content"] == "why is the badge wrong?" for ms in r.first))
+        # the simulator is grounded in the original turn's real output
+        self.assertTrue(all("OUTPUT of terminal:\na b" in p["user"] for p in r.sims))
+
+    def test_a_turn_that_starts_a_fix_is_not_stopped(self):
+        self.bench_with_turn()
+        res = mb.run(self.bench, "m", repeats=1, runner=self.runner("Started a card to fix it."), root=self.tmp / "root",
+                     live=self.live, log=lambda *_: None, cut="start", guidance="GUIDE")
+        self.assertEqual(res["by_pattern"]["report_only"]["fail"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
