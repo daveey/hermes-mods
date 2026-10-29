@@ -545,3 +545,11 @@ def test_review_swap_helper_records_the_recovery_holder_card_env(tmp_path, monke
     monkeypatch.setattr(swap_db, "check_replacement", spy)
     assert swap_db.main(["--db", str(live), "--replacement", str(rep), "--wait", "0"]) == 0
     assert seen["record"]["task_id"] == "t_viaholderenv" and seen["record"].get("proc_start")
+
+
+def test_non_board_folders_under_boards_are_not_live(tmp_home):
+    """``boards/_archived/`` is not a board (kanban-e808885f9e): a stray empty db there may be moved away."""
+    assert _block("terminal", command="mv ~/.hermes/kanban/boards/_archived/kanban.db ~/.hermes/archive/x.db") is None
+    assert _block("terminal", command="rm ~/.hermes/kanban/boards/_archived/refpin-1/kanban.db") is None
+    assert _block("terminal", command="mv ~/.hermes/kanban/boards/ops/kanban.db /tmp/x")
+    assert _block("terminal", command="mv ~/.hermes/kanban/boards/ops_2/kanban.db-wal /tmp/x")

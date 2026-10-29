@@ -43,6 +43,8 @@ LOG_ENV = "HERMES_SQLITE_GUARD_LOG"
 _LIVE_NAME = re.compile(r"\.db(?:-wal|-shm|-journal)?$")
 # Paths under the Hermes home that never hold a live database.
 _NOT_LIVE_PARTS = ("/cache/", "/archive/", "/backups/", "/.hermes-sync-trash/", "/tmp/", "kanban-recovery")
+_BOARDS_CHILD = re.compile(r"/kanban/boards/([^/]+)/")
+_BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")  # core kanban_db._BOARD_SLUG_RE
 _NOT_LIVE_MARKERS = (".bak", ".corrupt.", ".pre-", ".recovered", ".new", ".orig", ".snapshot")
 _HOME_PREFIX = re.compile(
     r"^(?:~|\$\{?HOME\}?|/home/[^/]+|/Users/[^/]+|/root)/\.hermes(?:/|$)|^\$\{?HERMES_HOME\}?(?:/|$)")
@@ -127,7 +129,12 @@ def is_live(path: str, in_home: bool = False) -> bool:
     full = _expand(path)
     home = _home().rstrip("/") + "/"
     rel = "/" + (full[len(home):] if full.startswith(home) else _HOME_PREFIX.sub("", path))
-    return not any(part in rel for part in _NOT_LIVE_PARTS)
+    if any(part in rel for part in _NOT_LIVE_PARTS):
+        return False
+    # Only a board-slug folder under kanban/boards/ holds a board (core's ``named_board_db_files``); ``_archived/``
+    # and other non-slug folders hold archived copies or strays no Hermes process opens.
+    board = _BOARDS_CHILD.search(rel)
+    return not (board and not _BOARD_SLUG.match(board.group(1)))
 
 
 def _tokens(cmd: str) -> list[str]:
