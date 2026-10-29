@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 if __package__:
     from . import core
     from . import owner_wake
+    from . import routing
 else:  # pytest imports the hyphenated plugin dir without a parent package
     _spec = importlib.util.spec_from_file_location("chat_closeout_core", Path(__file__).with_name("core.py"))
     core = importlib.util.module_from_spec(_spec)
@@ -36,6 +37,10 @@ else:  # pytest imports the hyphenated plugin dir without a parent package
     owner_wake = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(owner_wake)
     owner_wake = sys.modules.setdefault("chat_closeout_owner_wake", owner_wake)
+    _spec = importlib.util.spec_from_file_location("chat_closeout_routing", Path(__file__).with_name("routing.py"))
+    routing = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(routing)
+    routing = sys.modules.setdefault("chat_closeout_routing", routing)
 
 logger = logging.getLogger("chat_closeout")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -491,17 +496,39 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
             logger.warning("chat-closeout: wake failed for %s", sid, exc_info=True)
             result = "error"
         if result == "started":
-            led.write(sid, wake_result="started")
+            led.write(sid, wake_result="started", failure_since=None, retry_after=0)
             logger.info("chat-closeout: woke %s for its close-out (%d cards settled, %d new; wake #%d)", sid,
                         len(row["batch"]), len(new_ids), int(row.get("wake_count") or 0) + 1)
         else:
             # busy/refused/error: undo the coverage + count; a later tick (or the owning backend) retries
             led.write(sid, covered=set(row.get("covered") or []), closing=None, wakes=row.get("wakes") or [],
                       wake_count=int(row.get("wake_count") or 0))
-            led.release(sid, due, result)
+            led.release(sid, due, result, now=now,
+                        backoff=0 if result == "busy" else owner_wake.CLAIM_TTL_S)
             logger.info("chat-closeout: close-out wake of %s deferred (%s)", sid, result)
         done.append({"session_id": sid, "result": result, "sig": due})
     return done
+
+
+def _session_scope(sid: str) -> tuple[Optional[Path], str]:
+    for path in state_dbs():
+        c = core.ro_connect(path)
+        try:
+            if c.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone():
+                return path, path.parent.name if path.parent.parent.name == "profiles" else "default"
+        finally:
+            c.close()
+    return None, "default"
+
+
+def _moved_owner(sid: str) -> Optional[str]:
+    path, _ = _session_scope(sid)
+    return routing.moved_owner(sid, db_path=path)
+
+
+def _handoff_ask(led, sid: str, gateway: str, key: str, prompt: str, now: float) -> str:
+    _, profile = _session_scope(sid)
+    return routing.handoff(led, sid, gateway, key, prompt, now, profile=profile)
 
 
 def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Callable[..., str]) -> dict:
@@ -517,21 +544,26 @@ def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Ca
     led.write(sid, covered=set(row.get("covered") or []) | set(ids), relayed=relayed, wakes=wakes,
               wake_count=int(row.get("wake_count") or 0) + 1)
     try:
-        result = wake(sid, core.ask_relay_prompt(row, cards, ids), display_kind="kanban_notice",
-                      display_metadata={"display_text": core.ask_notice_text(cards, ids), "ask_relay": True,
-                                        "task_ids": ids},
-                      label="chat-closeout")
+        gateway = _moved_owner(sid)
+        prompt = core.ask_relay_prompt(row, cards, ids)
+        if gateway:
+            result = _handoff_ask(led, sid, gateway, key, prompt, now)
+        else:
+            result = wake(sid, prompt, display_kind="kanban_notice",
+                          display_metadata={"display_text": core.ask_notice_text(cards, ids), "ask_relay": True,
+                                            "task_ids": ids}, label="chat-closeout")
     except Exception:
         logger.warning("chat-closeout: ask relay wake failed for %s", sid, exc_info=True)
         result = "error"
-    if result == "started":
-        led.write(sid, wake_result="started")
+    if result in ("started", "forwarded"):
+        led.write(sid, wake_result=result, failure_since=None, retry_after=0)
         logger.info("chat-closeout: relayed %d ask(s) to %s while %d card(s) still work (%s)", len(ids), sid,
                     sum(1 for t in batch if not core.is_settled(cards.get(t))), ", ".join(ids))
     else:
         led.write(sid, covered=set(before["covered"] or []), relayed=set(before["relayed"] or []),
                   wakes=before["wakes"] or [], wake_count=int(before["wake_count"] or 0))
-        led.release(sid, key, result)
+        led.release(sid, key, result, now=now,
+                    backoff=0 if result == "busy" else owner_wake.CLAIM_TTL_S)
         logger.info("chat-closeout: ask relay to %s deferred (%s)", sid, result)
     return {"session_id": sid, "result": result, "sig": key, "ask_relay": ids}
 
@@ -676,6 +708,28 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                f"settled {int((now - float(at)) / 60)} min ago and no close-out turn ran "
                f"(last wake: {row.get('wake_result') or 'none'}).")
         candidates.append((key, f"No close-out for chat {row['session_id']}", msg))
+    for row in led.pending():
+        since = row.get("failure_since")
+        if since is None:
+            continue
+        sig = core.ask_relay_key(row, read(row["batch"]))
+        if not sig:
+            continue
+        key = f"chat-closeout:ask-failed:{row['session_id']}:{int(since)}"
+        first = seen_mono.setdefault(key, mono)
+        if now - since >= core.STALE_S and mono - first >= core.STALE_S:
+            candidates.append((key, f"Ask relay stuck for chat {row['session_id']}",
+                               f"Chat {row['session_id']}: ask relay has not been delivered for "
+                               f"{int((now-since)/60)} min (last result: {row.get('wake_result')})."))
+    for handoff in routing.stalled(led, now, 0):
+        key = f"chat-closeout:handoff:{handoff['id']}"
+        first = seen_mono.setdefault(key, mono)
+        if now - handoff['created_at'] < core.STALE_S or mono - first < core.STALE_S:
+            continue
+        candidates.append((key, f"Ask handoff unconfirmed for chat {handoff['session_id']}",
+                           f"Courier request {handoff['id']} for chat {handoff['session_id']} has no "
+                           "successful delivery receipt. Inspect the target before retrying; do not resend "
+                           "an uncertain send automatically."))
     live = {k for k, _, _ in candidates}
     failures: dict[str, int] = _state.setdefault("post_failures", {})
     for k in [k for k in seen_mono if k not in live]:
@@ -710,6 +764,11 @@ def _still_observed(key: str, unseen: dict[str, int], led) -> bool:
     parts = key.split(":")
     if len(parts) >= 3 and parts[1] == "unseen":
         return unseen.get(parts[2], 0) > 0
+    if len(parts) >= 3 and parts[1] == "handoff":
+        return any(r['id'] == parts[2] for r in routing.stalled(led, time.time(), 0))
+    if len(parts) >= 4 and parts[1] == "ask-failed":
+        row = led.get(parts[2]) or {}
+        return row.get("failure_since") is not None and int(row["failure_since"]) == int(parts[3])
     if len(parts) >= 4 and parts[1] == "no-closeout":
         row = led.get(parts[2]) or {}
         return row.get("settled_sig") == parts[3] and row.get("done_sig") != parts[3]
@@ -758,7 +817,7 @@ def start_thread() -> Optional[threading.Event]:
 
 
 def register(ctx) -> None:
-    logger.info("chat-closeout: loaded owner-final-proof-v2 module=%s core=%s", __file__, core.__file__)
+    logger.info("chat-closeout: loaded moved-ask-backoff-v3 module=%s core=%s", __file__, core.__file__)
     ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)

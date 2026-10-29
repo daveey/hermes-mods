@@ -411,7 +411,8 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 
 _MIGRATE = (("covered", "TEXT NOT NULL DEFAULT '[]'"), ("closing", "TEXT"),
             ("wakes", "TEXT NOT NULL DEFAULT '[]'"), ("wake_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("relayed", "TEXT NOT NULL DEFAULT '[]'"))
+            ("relayed", "TEXT NOT NULL DEFAULT '[]'"),
+            ("retry_after", "REAL"), ("failure_since", "REAL"))
 _JSON_SETS = ("batch", "open", "covered", "relayed")
 
 
@@ -474,18 +475,22 @@ class Ledger:
             c = self._conn()
             try:
                 cur = c.execute("UPDATE waiting SET claim_sig=?, claim_at=?, claim_pid=?, wake_result='claimed' "
-                                "WHERE session_id=? AND COALESCE(claim_sig,'') != ? AND COALESCE(done_sig,'') != ?",
-                                (sig, now, os.getpid(), sid, sig, sig))
+                                "WHERE session_id=? AND COALESCE(claim_sig,'') != ? AND COALESCE(done_sig,'') != ? "
+                                "AND COALESCE(retry_after,0) <= ?",
+                                (sig, now, os.getpid(), sid, sig, sig, now))
                 return cur.rowcount == 1
             finally:
                 c.close()
 
-    def release(self, sid: str, sig: str, result: str) -> None:
+    def release(self, sid: str, sig: str, result: str, *, now: Optional[float] = None,
+                backoff: float = 0) -> None:
+        now = time.time() if now is None else now
         with self._lock:
             c = self._conn()
             try:
-                c.execute("UPDATE waiting SET claim_sig=NULL, wake_result=? WHERE session_id=? AND claim_sig=?",
-                          (result, sid, sig))
+                c.execute("UPDATE waiting SET claim_sig=NULL, wake_result=?, retry_after=?, "
+                          "failure_since=COALESCE(failure_since,?) WHERE session_id=? AND claim_sig=?",
+                          (result, now + backoff if backoff else 0, now, sid, sig))
             finally:
                 c.close()
 

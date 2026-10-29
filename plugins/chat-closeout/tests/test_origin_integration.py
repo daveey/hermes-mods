@@ -43,7 +43,7 @@ def origin(tmp_path, monkeypatch):
         CREATE TABLE origin_creation_intents (task_id TEXT, binding_json TEXT);
         CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, run_id INTEGER,
                                   created_at REAL, payload TEXT);
-        CREATE TABLE task_runs (id INTEGER, task_id TEXT, status TEXT, outcome TEXT, ended_at REAL);
+        CREATE TABLE task_runs (id INTEGER, task_id TEXT, status TEXT, outcome TEXT, ended_at REAL, summary TEXT);
     ''')
     owner.execute('INSERT INTO origin_creation_intents VALUES (?,?)',
                   ('t_same', json.dumps({k: v for k, v in binding.items() if k != 'publication_version'})))
@@ -59,7 +59,7 @@ def origin(tmp_path, monkeypatch):
             owner.execute('DELETE FROM task_events')
             owner.execute('DELETE FROM task_runs')
             owner.execute("INSERT INTO task_events VALUES (1,'t_same','completed',1,?,'{}')", (now,))
-            owner.execute("INSERT INTO task_runs VALUES (1,'t_same','done','completed',?)", (now,))
+            owner.execute("INSERT INTO task_runs VALUES (1,'t_same','done','completed',?,NULL)", (now,))
         task = {**binding['owner'], 'id': 't_same', 'status': status, 'origin_bindings': [binding]}
         task = ledger.observe_owner_task(owner, task, now=now)
         owner.commit()

@@ -170,6 +170,10 @@ def test_integration_parked_card_wakes_chat_and_archived_chat_gets_a_supervisor_
     sys.path.insert(0, core_src)
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'kanban.db'))
+    # Isolated fixture board only; inherited worker DB/identity must never reach it.
+    for key in ('HERMES_KANBAN_TASK', 'HERMES_DELEGATED_CHILD_CONTEXT', 'HERMES_DELEGATED_CHILD_OWNER'):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv('HERMES_HUB_STATE', str(tmp_path / 'hub-state'))
     monkeypatch.setenv('CHAT_CLOSEOUT_OWNER_WAKE_DB', str(tmp_path / 'ow.db'))
     from hermes_cli import kanban_db as kb
@@ -384,6 +388,10 @@ def test_integration_supervisor_card_names_a_card_parked_on_the_orphan(tmp_path,
     sys.path.insert(0, core_src)
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'kanban.db'))
+    # Isolated fixture board only; inherited worker DB/identity must never reach it.
+    for key in ('HERMES_KANBAN_TASK', 'HERMES_DELEGATED_CHILD_CONTEXT', 'HERMES_DELEGATED_CHILD_OWNER'):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv('HERMES_HUB_STATE', str(tmp_path / 'hub-state'))
     monkeypatch.setenv('CHAT_CLOSEOUT_OWNER_WAKE_DB', str(tmp_path / 'ow.db'))
     from hermes_cli import kanban_db as kb
