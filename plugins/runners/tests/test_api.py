@@ -441,13 +441,92 @@ def test_fleet_route_builds_once_per_cache_window(disk_api, monkeypatch):
     module, client, _, _, _, _ = disk_api
     calls = []
     monkeypatch.setattr(module, '_gateway_section', lambda: calls.append(1) or dict(state='ready', machines=[]))
-    module._fleet_cache.update(at=None, value=None)
+    module._fleet_cache.clear()
     for _ in range(5):
         assert client.get(PREFIX + '/fleet', headers=TOKEN).status_code == 200
     assert len(calls) == 1
-    module._fleet_cache['at'] -= module.FLEET_CACHE_S + 1
+    module._fleet_cache[module.active_profile()]['at'] -= module.FLEET_CACHE_S + 1
     client.get(PREFIX + '/fleet', headers=TOKEN)
     assert len(calls) == 2
+
+
+PROFILES = 'default alpha alpha-askeve alpha-follow askeve-builder bb-tuner ci-sweeper coach goal-disposition-check mac-ops'.split()
+
+
+def test_fleet_profiles_do_not_evict_each_other_or_serialize(api, monkeypatch):
+    """The Desktop polls every profile at once. A scalar cache keyed by the last profile rebuilt on
+    every request, and a global lock held through the build made ten polls wait for ten builds."""
+    import threading, time
+    module, client, _ = api
+    module._fleet_cache.clear()
+    current = threading.local()
+    monkeypatch.setattr(module, 'active_profile', lambda: current.name)
+    builds, running, peak, guard = [], [0], [0], threading.Lock()
+    def slow_build(profile):
+        with guard:
+            builds.append(profile)
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.3)
+        with guard:
+            running[0] -= 1
+        return dict(contract_version=1, profile=profile, gateways={}, ci={})
+    monkeypatch.setattr(module, '_build_fleet', slow_build)
+    results = {}
+    def poll(name):
+        current.name = name
+        results[name] = module.fleet_view()['profile']  # the route's sync body; threads stand in for the threadpool
+    def burst():
+        threads = [threading.Thread(target=poll, args=(n,)) for n in PROFILES]
+        start = time.monotonic()
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        return time.monotonic() - start
+    first = burst()
+    assert results == {n: n for n in PROFILES}
+    assert sorted(builds) == sorted(PROFILES)
+    assert first < 0.3 * len(PROFILES) / 2, first  # parallel, not ten builds back to back
+    assert peak[0] > 1
+    assert burst() < 0.3  # every profile served from its own entry; none was evicted by the others
+    assert len(builds) == len(PROFILES)
+
+
+def test_fleet_same_profile_polls_share_one_build(api, monkeypatch):
+    import threading, time
+    module, client, _ = api
+    module._fleet_cache.clear()
+    monkeypatch.setattr(module, 'active_profile', lambda: 'default')
+    builds = []
+    def slow_build(profile):
+        builds.append(profile)
+        time.sleep(0.2)
+        return dict(contract_version=1, profile=profile, gateways={}, ci={})
+    monkeypatch.setattr(module, '_build_fleet', slow_build)
+    threads = [threading.Thread(target=module.fleet_view) for _ in range(6)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len(builds) == 1
+
+
+def test_local_cap_parses_config_once_until_it_changes(api, monkeypatch, tmp_path):
+    module, _, _ = api
+    kdb = types.ModuleType('hermes_cli.kanban_db')
+    kdb.kanban_home = lambda: tmp_path
+    dispatch = types.ModuleType('hermes_cli.kanban_db_dispatch')
+    dispatch.resolve_max_in_progress = lambda configured: configured if configured is not None else 8
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_db', kdb)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_db_dispatch', dispatch)
+    import yaml
+    parsed = []
+    real = yaml.safe_load
+    monkeypatch.setattr(yaml, 'safe_load', lambda text: parsed.append(1) or real(text))
+    module._cap_cache = None
+    (tmp_path / 'config.yaml').write_text('kanban:\n  max_in_progress: 16\n')
+    assert [module._local_cap() for _ in range(10)] == [16] * 10
+    assert len(parsed) == 1
+    (tmp_path / 'config.yaml').write_text('kanban:\n  max_in_progress: 24\n')
+    assert module._local_cap() == 24
+    assert len(parsed) == 2
 
 
 def test_local_cap_reads_the_kanban_home_config_for_every_profile(api, monkeypatch, tmp_path):

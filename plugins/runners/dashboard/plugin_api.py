@@ -246,10 +246,39 @@ def investigate(payload: dict):
             raise HTTPException(502, str(res.get('error') or 'create_failed')[:200])
         task = res.get('task_id')
         _pending[machine] = dict(at=time.time(), task=task, request_id=(res.get('placed') or {}).get('request_id'))
-        _fleet_cache.update(at=None, value=None)
+        _fleet_invalidate()
         return dict(created=True, machine=machine,
                     investigation=dict(task=task, status=res.get('status') or 'queued',
                                        runs_where=res.get('runs_where') or machine))
+
+
+# (path, signature) -> parsed ``kanban.max_in_progress``. The cap is machine-wide, so one entry
+# serves every profile route; re-parsing the (large) config with pure-Python YAML cost ~0.15 s of
+# GIL-held CPU per fleet build, ten times per poll burst.
+_cap_cache = None
+_cap_lock = threading.Lock()
+
+
+def _configured_cap(path):
+    import yaml
+    try:
+        sig = _signature(path)
+    except OSError:
+        return None
+    global _cap_cache
+    with _cap_lock:
+        if _cap_cache is not None and _cap_cache[0] == (path, sig):
+            return _cap_cache[1]
+    try:
+        raw = (yaml.safe_load(path.read_text()) or {})
+        raw = (raw.get('kanban') or {}).get('max_in_progress')
+        configured = int(raw) if raw is not None and int(raw) > 0 else None
+    except (OSError, yaml.YAMLError, AttributeError, TypeError, ValueError):
+        return None  # unreadable/invalid: never cached, retried next build
+    if _signature(path) == sig:  # changed while parsing: do not cache
+        with _cap_lock:
+            _cap_cache = ((path, sig), configured)
+    return configured
 
 
 def _local_cap():
@@ -259,16 +288,9 @@ def _local_cap():
     active profile's config gave the memory-derived default (8 on the hub) to every non-default
     profile route, and the panel showed whichever profile answered last.
     """
-    import yaml
     from hermes_cli.kanban_db import kanban_home
     from hermes_cli.kanban_db_dispatch import resolve_max_in_progress
-    try:
-        raw = (yaml.safe_load((kanban_home() / 'config.yaml').read_text()) or {})
-        raw = (raw.get('kanban') or {}).get('max_in_progress')
-        configured = int(raw) if raw is not None and int(raw) > 0 else None
-    except (OSError, yaml.YAMLError, AttributeError, TypeError, ValueError):
-        configured = None
-    return resolve_max_in_progress(configured)
+    return resolve_max_in_progress(_configured_cap(kanban_home() / 'config.yaml'))
 
 
 def _ci_section():
@@ -284,25 +306,39 @@ def _ci_section():
 
 
 FLEET_CACHE_S = 5
-_fleet_cache = dict(at=None, profile=None, value=None)
-_fleet_lock = threading.Lock()
+# profile -> dict(at, value, lock). Each profile has its own entry and its own single-flight lock, so
+# the Desktop's concurrent per-profile polls neither evict each other (a scalar cache keyed by the
+# last profile missed on every other profile) nor queue behind one global build lock.
+_fleet_cache = {}
+_fleet_guard = threading.Lock()  # protects the dict only; never held while building
+
+
+def _fleet_entry(profile):
+    with _fleet_guard:
+        return _fleet_cache.setdefault(profile, dict(at=None, value=None, lock=threading.Lock()))
+
+
+def _fleet_invalidate():
+    with _fleet_guard:
+        for entry in _fleet_cache.values():
+            entry.update(at=None, value=None)
 
 
 @router.get('/fleet')
 def fleet_view():
     """Machines and slots: gateway workers (Board registry + leases) and CI workers (collector).
 
-    One build per FLEET_CACHE_S per profile, single-flight: any number of open panels polling
-    costs one registry read, a few indexed SQLite reads and one inventory projection.
+    One build per FLEET_CACHE_S per profile, single-flight per profile: any number of open panels
+    polling a profile costs one registry read, a few indexed SQLite reads and one inventory projection.
     """
     import time
     profile = active_profile()
-    with _fleet_lock:
-        c = _fleet_cache
-        if c['value'] is not None and c['profile'] == profile and time.monotonic() - c['at'] < FLEET_CACHE_S:
-            return c['value']
+    entry = _fleet_entry(profile)
+    with entry['lock']:
+        if entry['value'] is not None and time.monotonic() - entry['at'] < FLEET_CACHE_S:
+            return entry['value']
         value = _build_fleet(profile)
-        c.update(at=time.monotonic(), profile=profile, value=value)
+        entry.update(at=time.monotonic(), value=value)
         return value
 
 
