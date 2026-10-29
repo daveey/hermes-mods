@@ -56,6 +56,27 @@ REFERENCE = (r"(?:https://github\.com/" + REPO + r"/pull/" + NUMBER
 SURFACE = r"(?:Discord|Slack|(?:the\s+)?(?:BB\s+)?Inbox)"
 SURFACES = SURFACE + r"(?:(?:\s*/\s*|,\s*(?:or\s+)?|\s+or\s+)" + SURFACE + r")*"
 HEAD_CLAUSE = r"(?:head|sha|commit)\s+" + HEX
+# Scope is metadata, not free-form worker instructions. Labels are short slugs,
+# not prose; fullmatch also rejects second refs, heads, clauses and URL tails.
+SCOPE_REFERENCE = (r"(?:https://github\.com/" + REPO + r"/pull/" + NUMBER
+                   + r"|" + REPO + r"#" + NUMBER
+                   + r"|" + REPO + r" +PR *#" + NUMBER
+                   + r"|PR *#" + NUMBER + r"|(?:Repo(?:sitory)? *:? +)?" + REPO + r")")
+SCOPE = re.compile(
+    r" *" + SCOPE_REFERENCE + r"(?: +\([A-Za-z0-9][A-Za-z0-9._-]{0,63}\))?"
+    + r"(?:,? +(?:head|sha|commit) +" + HEX + r")?(?: +only)? *", re.I | re.ASCII)
+
+
+def _scope_failure(hr):
+    scope = hr.get("scope")
+    # Standalone parser callers may omit scope if the action resolves itself.
+    if scope is None or (isinstance(scope, str) and not scope.strip(" ")):
+        return ""
+    if not isinstance(scope, str) or not SCOPE.fullmatch(scope):
+        return f"Unrecognised scope text: {scope!r}."
+    return ""
+
+
 ACTION = re.compile(
     r"\s*(?:please\s+)?(?:Approve|OK|Authorize)\s+" + REFERENCE
     + r"(?:\s+(?:at\s+)?" + HEAD_CLAUSE + r"|\s*\(" + HEAD_CLAUSE + r"\))?"
@@ -116,7 +137,7 @@ def request_target(row):
     supply an execution/approval head. Unknown/mixed authorizations are rejected.
     """
     hr = _request(row)
-    if not hr or hr.get("interaction") not in ("approval", "reply", "external"):
+    if not hr or hr.get("interaction") not in ("approval", "reply", "external") or _scope_failure(hr):
         return None
     action = hr.get("action")
     if not isinstance(action, str):
@@ -184,6 +205,9 @@ def parse_failure_reason(row) -> str:
                ("PR number (N)", number), ("head (SHA)", head)) if value is None]
     reason = "Not a supported PR-only approval request; use the canonical wording without additional authorization."
     hr = _request(row) or {}
+    scope_failure = _scope_failure(hr)
+    if scope_failure:
+        reason += " " + scope_failure
     action = hr.get("action")
     lifecycle = LIFECYCLE.search(action) if isinstance(action, str) else None
     if lifecycle:

@@ -154,6 +154,16 @@ The strict action accepts optional `please`, optional `at head/sha/commit SHA`, 
   Diagnostics quote the first unrecognised clause and its outcome side; malformed sections get
   a syntax diagnostic. Replace the canonical template's ellipses with concrete supported clauses.
 
+The optional `scope` field is also fullmatched, never treated as free-form instructions:
+  one PR URL, `OWNER/REPO#N`, `OWNER/REPO PR #N`, `PR #N`, bare `OWNER/REPO`, or
+  legacy `Repo:`/`Repository OWNER/REPO`. It may have one parenthetical slug label (1–64
+  ASCII alphanumeric/`.`/`_`/`-` characters, starting alphanumeric), one optional head/sha/commit
+  plus 7–40 hex digits separated by spaces (optional comma), and trailing `only`.
+  Only ASCII spaces separate scope tokens; extra prose, repeated fields, URL tails and other
+  punctuation fail closed. Missing/empty scope remains supported for standalone parser callers;
+  structured filing still requires nonblank scope. Scope heads remain correction hints only.
+  Diagnostics quote the unrecognised scope text.
+
 For structured `kanban_block` and `kanban_create(initial_status='blocked')`, an approval-looking request
 that cannot strictly parse receives one deterministic wording hold per process-local session/tool/action+scope.
 The message offers:
@@ -182,6 +192,13 @@ covered named destructive verbs and repeated keys, not unknown operations; thus 
 could pass while the stated PR-only contract failed. The fix fullmatches each atom and tests unknown
 verb classes on both outcomes, with filing-boundary diagnostics. Authority, owner, head, receipt and
 CAS checks are unchanged; this parser still never grants permission.
+
+The separate scope-field gap had the same validation-boundary cause: `_context` concatenated
+scope solely for repository resolution, while `request_target` only screened the action and
+its lifecycle suffix. Scope tests exercised resolution and ambiguity but not extra instructions.
+`tests/test_pr_scope_allowlist.py` now covers the full positive grammar, unknown instructions,
+label/length bounds, extra heads, URL tails, JSON, and scope-head non-authority;
+`tests/test_pr_approval_filing.py` checks the scope diagnostic through both create and block hooks.
 
 ### Cited evidence and vendor entitlements
 
