@@ -29,7 +29,7 @@ SHELL_TOOLS = {"terminal", "process_manage", "process"}
 def classify(tool_name: str, args: Any) -> Optional[str]:
     args = args if isinstance(args, dict) else {}
     if tool_name in SHELL_TOOLS:
-        return guard.check_shell(str(args.get("command") or ""))
+        return guard.check_shell(str(args.get("command") or ""), cwd=args.get("workdir") or None)
     if tool_name in {"tool_call", "mcp__tool_call"}:
         for call in args.get("calls") or []:
             if isinstance(call, dict):

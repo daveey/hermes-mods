@@ -188,16 +188,75 @@ def check_argv(argv: list[str]) -> Optional[str]:
     return None
 
 
-def check_shell(text: str) -> Optional[str]:
-    if os.environ.get(OPT_OUT, "0") not in ("", "0"):
+SCRIPT_MAX_BYTES = 64 * 1024
+SCRIPT_MAX_DEPTH = 2
+
+
+def _script_arg(argv: list[str]) -> Optional[str]:
+    """The local file this simple command runs as a shell script, if it names one."""
+    name = os.path.basename(argv[0])
+    if name in SHELLS:
+        for a in argv[1:]:
+            if not a.startswith("-"):
+                return a
         return None
+    if name in ("source", "."):
+        return argv[1] if len(argv) > 1 else None
+    return argv[0] if "/" in argv[0] else None
+
+
+def _read_script(path: str, cwd: Optional[str]) -> Optional[str]:
+    """Text of a local shell script (<= 64 KB), or None when missing, binary or not a shell script."""
+    try:
+        full = os.path.expanduser(path)
+        if not os.path.isabs(full):
+            full = os.path.join(cwd or os.getcwd(), full)
+        if not os.path.isfile(full):
+            return None
+        with open(full, "rb") as fh:
+            raw = fh.read(SCRIPT_MAX_BYTES)
+    except OSError:
+        return None
+    if b"\0" in raw:
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    if text.startswith("#!"):
+        words = text.split("\n", 1)[0][2:].split()
+        interp = [os.path.basename(w) for w in words if not w.startswith("-")]
+        if interp and interp[0] == "env":
+            interp = interp[1:]
+        if not interp or interp[0] not in SHELLS | {"ksh", "ash"}:
+            return None
+    return text
+
+
+def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool) -> Optional[str]:
     for argv, env in commands(text):
+        if argv[0] == "cd" and len(argv) > 1 and not argv[1].startswith("-"):
+            target = os.path.expanduser(argv[1])
+            cwd = target if os.path.isabs(target) else os.path.join(cwd or os.getcwd(), target)
+            continue
         if OPT_OUT in env:
             continue
         why = check_argv(argv)
+        if not why and in_script:  # `step pytest python3 -m pytest -q`: a heavy command passed as arguments
+            why = next((w for w in (check_argv(argv[k:]) for k in range(1, len(argv))) if w), None)
         if why:
             return why
+        ref = _script_arg(argv)
+        if ref and depth < SCRIPT_MAX_DEPTH:
+            body = _read_script(ref, cwd)
+            if body:
+                inner = _scan(body, cwd, depth + 1, True)
+                if inner:
+                    return f"{ref} \u2192 {inner}"
     return None
+
+
+def check_shell(text: str, cwd: Optional[str] = None) -> Optional[str]:
+    if os.environ.get(OPT_OUT, "0") not in ("", "0"):
+        return None
+    return _scan(text, cwd, 0, False)
 
 
 def message(why: str) -> str:

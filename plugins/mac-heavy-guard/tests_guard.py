@@ -144,3 +144,75 @@ def test_claude_hook_blocks_and_allows():
     assert r.returncode == 2 and "MAC_HEAVY_OK=1" in r.stderr
     assert _hook("pytest tests/test_x.py").returncode == 0
     assert _hook("MAC_HEAVY_OK=1 npm ci").returncode == 0
+
+
+# --- scripts: a local shell script is scanned like inline text ---------------------------------
+
+def _script(tmp_path, body, name="ci.sh"):
+    f = tmp_path / name
+    f.write_text("#!/bin/bash\n" + body)
+    f.chmod(0o755)
+    return f
+
+
+SCRIPT_BODIES = ["python3 -m pytest -q -p no:cacheprovider\n", "npm ci --prefix workers/upload\n"]
+
+
+@pytest.mark.parametrize("body", SCRIPT_BODIES)
+@pytest.mark.parametrize("form", ["./ci.sh", "bash ci.sh", "sh ci.sh", "(nohup ./ci.sh > log 2>&1 &)",
+                                  "source ci.sh", ". ./ci.sh", "chmod +x ci.sh && ./ci.sh > ci.log 2>&1"])
+def test_blocks_script_with_heavy_line(tmp_path, body, form):
+    _script(tmp_path, body)
+    res = plugin._pre_tool_call(tool_name="terminal", args={"command": form, "workdir": str(tmp_path)})
+    assert res and res["action"] == "block", form
+    assert "blocked" in res["message"] and "ci.sh \u2192" in res["message"]
+
+
+def test_blocks_script_after_cd(tmp_path, monkeypatch):
+    _script(tmp_path, SCRIPT_BODIES[0])
+    elsewhere = tmp_path / "other"
+    elsewhere.mkdir()
+    assert blocked("terminal", command=f"cd {tmp_path} && ./ci.sh", workdir=str(elsewhere))
+    assert not blocked("terminal", command="./ci.sh", workdir=str(elsewhere))
+
+
+def test_blocks_command_passed_to_function(tmp_path):
+    _script(tmp_path, 'step(){ echo "=== $1"; shift; "$@"; }\nstep pytest python3 -m pytest -q\n')
+    assert blocked("terminal", command="./ci.sh", workdir=str(tmp_path))
+    # inline text keeps its old behaviour: arguments are not treated as commands
+    assert not blocked("terminal", command="echo run python3 -m pytest -q")
+
+
+def test_follows_scripts_two_levels_deep(tmp_path):
+    _script(tmp_path, "python3 -m pytest -q\n", "c.sh")
+    _script(tmp_path, "./c.sh\n", "b.sh")
+    _script(tmp_path, "./b.sh\n", "a.sh")
+    assert blocked("terminal", command="./b.sh", workdir=str(tmp_path))  # b -> c: two scripts followed
+    assert not blocked("terminal", command="./a.sh", workdir=str(tmp_path))  # a -> b -> c: third not followed
+
+
+def test_allows_narrow_missing_optout_and_non_shell_scripts(tmp_path):
+    _script(tmp_path, "python3 -m pytest -q tests/test_one.py\n", "narrow.sh")
+    assert not blocked("terminal", command="./narrow.sh", workdir=str(tmp_path))
+    assert not blocked("terminal", command="./missing.sh", workdir=str(tmp_path))
+    assert not blocked("terminal", command="bash missing.sh", workdir=str(tmp_path))
+    _script(tmp_path, SCRIPT_BODIES[0])
+    assert not blocked("terminal", command="MAC_HEAVY_OK=1 ./ci.sh", workdir=str(tmp_path))
+    _script(tmp_path, "MAC_HEAVY_OK=1 python3 -m pytest -q\n", "inline_ok.sh")
+    assert not blocked("terminal", command="./inline_ok.sh", workdir=str(tmp_path))
+    (tmp_path / "t.py").write_text("#!/usr/bin/env python3\npytest\n")
+    assert not blocked("terminal", command="./t.py", workdir=str(tmp_path))
+    (tmp_path / "big.sh").write_text("#!/bin/sh\n" + "# x\n" * 20000 + "python3 -m pytest -q\n")
+    assert not blocked("terminal", command="./big.sh", workdir=str(tmp_path))  # past the 64 KB read cap
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="guard only acts on macOS")
+def test_claude_hook_blocks_script(tmp_path):
+    import os
+    _script(tmp_path, SCRIPT_BODIES[0])
+    env = dict(os.environ)
+    env.pop("MAC_HEAVY_OK", None)
+    r = subprocess.run([sys.executable, str(HERE / "claude_hook.py")], input=json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "./ci.sh > ci.log 2>&1"}}),
+        capture_output=True, text=True, env=env, cwd=tmp_path)
+    assert r.returncode == 2 and "ci.sh" in r.stderr and "whole pytest suite" in r.stderr
