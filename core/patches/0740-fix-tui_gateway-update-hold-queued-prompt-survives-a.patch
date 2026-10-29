@@ -1,0 +1,290 @@
+From 0d1e39ba3e434e8d8b06e23d69ec94b852f4e4fa Mon Sep 17 00:00:00 2001
+From: David Bloomin <452472+daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 05:35:29 +0000
+Subject: [PATCH] fix(tui_gateway): update-hold queued prompt survives a long
+ drain window; replay lease path covered
+
+Review follow-up on 2f26519116 (t_01a186190e59f122).
+
+- A prompt queued behind the core-update hold is journaled as an update_hold_queue
+  turn marker. It was bound by the 15 min turn freshness window, but the drain
+  window holds admission up to 15 min and the apply takes 1-4 min more, so a prompt
+  queued early was dropped at the post-restart resume (its accept row already
+  retired). It now has its own 1 h bound (UPDATE_HOLD_QUEUE_MAX_AGE_S), in both
+  session.resume auto-continue and the startup sweep, and joins the sweep's
+  update-recovery retry set like core-update pauses.
+- Card fix 3 (retry died on session_turn_lease / session_busy): the MacBook log at
+  17:44:32 PDT shows "state.db write lock unavailable for 0s" then "session turn
+  lease wait timed out" in the same ms, with no holder wait: Desktop admits with
+  wait_seconds=0, so a busy state.db was reported as another writer. Fixed by
+  7e8e8f4a59 (BUSY_DB_WAIT_SECONDS floor), now on the MacBook (fb393b96b3). New
+  test drives the hold-queue replay through the real Desktop lease admission with
+  a dead pre-restart lease row and a state.db write lock held past the first
+  attempt; it fails if either
+  the dead-pid reclaim or the busy-DB floor is removed.
+---
+ .../test_update_hold_submit_queue.py          | 141 ++++++++++++++++--
+ tui_gateway/session_auto_continue.py          |   8 +-
+ tui_gateway/startup_resume.py                 |  20 ++-
+ tui_gateway/turn_marker.py                    |   8 +
+ 4 files changed, 161 insertions(+), 16 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_hold_submit_queue.py b/tests/tui_gateway/test_update_hold_submit_queue.py
+index 2ea3987dba..de89502d2d 100644
+--- a/tests/tui_gateway/test_update_hold_submit_queue.py
++++ b/tests/tui_gateway/test_update_hold_submit_queue.py
+@@ -5,6 +5,8 @@ The update drainer holds admission for a bounded drain window while in-flight tu
+ user an error for the message they had just sent. The message now joins the durable queue (persisted at
+ accept) and the admission retry runs it once the hold lifts. A retiring backend keeps its 5035.
+ """
++import json
++import sqlite3
+ import threading
+ import types
+ 
+@@ -122,14 +124,18 @@ def test_hold_reply_validates_as_prompt_submit_result(held):
+     assert PromptSubmitResult.model_validate(resp["result"]).status == "queued"
+ 
+ 
+-def test_queued_hold_prompt_is_dispatched_after_the_update_restart(held, monkeypatch):
+-    """The update restarts the backend while the hold is up: the in-memory queue is gone, the marker is not."""
+-    from tui_gateway.turn_marker import read_turn_marker
+-    _submit()
+-    marker = read_turn_marker(held.home, "session-key")
+-    assert marker and marker["reason"] == "update_hold_queue" and marker["prompt"] == "hello there"
++def _age_marker(home, key, seconds):
++    """Backdate the journaled marker, as if the prompt was queued ``seconds`` before the resume."""
++    from tui_gateway import turn_marker
++    path = turn_marker._marker_path(home)
++    entries = json.loads(path.read_text())
++    entries[key]["started_at"] -= seconds
++    path.write_text(json.dumps(entries))
+ 
+-    # --- process restart: the old queue/timers vanish, the old writer pid is dead ---
++
++def _restart(held, monkeypatch, run_prompt_submit):
++    """The update restarts the backend while the hold is up: the in-memory queue, its timer and the old
++    process are gone; only the durable state (turn marker, state.db) survives. Returns the reborn session."""
+     held.timers.clear()
+     server._sessions.pop("sid", None)
+     af.clear_hold(held.home)
+@@ -140,14 +146,129 @@ def test_queued_hold_prompt_is_dispatched_after_the_update_restart(held, monkeyp
+         "attached_images": [], "profile_home": str(held.home),
+     }
+     server._sessions["sid"] = reborn
+-    ran = []
+     monkeypatch.setattr(server, "_start_session_work", lambda target, **kw: target() or True)
+     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_adopt_stored_continuation_source", lambda *a, **k: None)
+     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+-    monkeypatch.setattr(server, "_run_prompt_submit",
+-                        lambda rid, sid, session, text, **kw: ran.append((text, kw.get("display_kind"))))
++    monkeypatch.setattr(server, "_run_prompt_submit", run_prompt_submit)
++    return reborn
++
++
++def test_queued_hold_prompt_is_dispatched_after_the_update_restart(held, monkeypatch):
++    from tui_gateway.turn_marker import read_turn_marker
++    _submit()
++    marker = read_turn_marker(held.home, "session-key")
++    assert marker and marker["reason"] == "update_hold_queue" and marker["prompt"] == "hello there"
++    ran = []
++    reborn = _restart(held, monkeypatch, lambda rid, sid, session, text, **kw: ran.append((text, kw.get("display_kind"))))
+     assert server._maybe_schedule_auto_continue("sid", reborn, "session-key") is not None
+     assert ran == [("hello there", None)], "the user's own text, verbatim, not an auto-continue note"
++
++
++def test_hold_prompt_older_than_the_turn_freshness_window_still_replays(held, monkeypatch):
++    """The drain window holds admission up to 15 min and the apply takes 1-4 min more, so a prompt queued
++    early in the window is past the 15 min turn freshness window by the post-restart resume."""
++    _submit()
++    _age_marker(held.home, "session-key", 20 * 60)
++    ran = []
++    reborn = _restart(held, monkeypatch, lambda rid, sid, session, text, **kw: ran.append(text))
++    assert server._maybe_schedule_auto_continue("sid", reborn, "session-key") is not None
++    assert ran == ["hello there"]
++
++
++def test_hold_prompt_past_its_own_bound_is_dropped_and_an_ordinary_turn_keeps_15_min(held, monkeypatch):
++    from tui_gateway.turn_marker import UPDATE_HOLD_QUEUE_MAX_AGE_S, read_turn_marker, record_turn_start
++    _submit()
++    _age_marker(held.home, "session-key", UPDATE_HOLD_QUEUE_MAX_AGE_S + 60)
++    ran = []
++    reborn = _restart(held, monkeypatch, lambda rid, sid, session, text, **kw: ran.append(text))
++    assert server._maybe_schedule_auto_continue("sid", reborn, "session-key") is None
++    assert ran == [] and read_turn_marker(held.home, "session-key") is None
++    # Control: the wider bound is only for hold-queued prompts; a crashed turn at 20 min stays stale.
++    record_turn_start(held.home, "session-key", "a crashed turn")
++    _age_marker(held.home, "session-key", 20 * 60)
++    reborn.pop("_auto_continue_scheduled", None)
++    assert server._maybe_schedule_auto_continue("sid", reborn, "session-key") is None
++    assert ran == []
++
++
++def test_startup_sweep_retries_hold_prompts_past_the_turn_freshness_window(held):
++    from tui_gateway import startup_resume
++    _submit()
++    _age_marker(held.home, "session-key", 20 * 60)
++    cfg = {"desktop": {"auto_continue": {"resume_on_startup": True}}}
++    rows = startup_resume.pending_resumes(held.home, cfg, log_skips=False)
++    # The writer is this (live) test process, so the boot sweep holds it back until the old writer is gone,
++    # but keeps retrying: the hold-queue reason is in the update-recovery retry set and within its age bound.
++    assert rows == [] and startup_resume._paused_markers_remain(held.home, cfg)
++
++
++def _desktop_lease_replay(db, admitted):
++    """A ``_run_prompt_submit`` stand-in that takes the real Desktop turn-lease admission the replay goes
++    through (agent.run_conversation -> admit_durable_turn_lease, platform desktop: wait_seconds=0)."""
++    from agent.turn_facade_lease import admit_durable_turn_lease
++
++    def run(rid, sid, session, text, **kw):
++        agent = types.SimpleNamespace(
++            _session_db=db, session_id="session-key", _persist_disabled=False, _interrupt_requested=False,
++            _interrupt_message=None, _execution_thread_id=None, _session_turn_lease_refresh_interval=60.0,
++            platform="desktop", statuses=[])
++        agent._emit_status = agent._emit_warning = agent.statuses.append
++        agent._touch_activity = lambda *a, **k: None
++        agent._liveness_activity_lock = lambda: threading.Lock()
++        admission = admit_durable_turn_lease(
++            agent, session_id="session-key", relay_turn_id="session-key:t:replay",
++            task_context={"session_id": "session-key", "task_id": "t", "platform": "desktop"},
++            conversation_history=[])
++        admitted.append((text, admission.early_result, list(agent.statuses)))
++        if admission.lease is not None:
++            admission.lease.release()
++    return run
++
++
++def test_replay_after_restart_takes_the_lease_over_a_stale_pre_restart_row_and_a_busy_state_db(
++        held, monkeypatch):
++    """Card fix 3 (live 17:44:32 PDT: "state.db write lock unavailable for 0s" then "session turn lease wait
++    timed out", failure_reason=session_busy, no turn running). The replay must not die on the lease when the
++    only row is the dead pre-restart backend's and state.db is briefly write-locked by another writer."""
++    import hermes_state
++    from hermes_state import SessionDB
++    from hermes_state_pidns import holder_namespace_token
++    monkeypatch.setattr("agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0))
++    db = SessionDB(held.home / "state.db")
++    db.create_session("session-key", source="desktop")
++    _submit()
++    # The pre-restart backend's unexpired lease row (its pid is gone after the update restart).
++    dead = f"pid=424242{holder_namespace_token()}:turn=before-update:platform=desktop"
++    assert db.try_acquire_session_turn_lease("session-key", dead, ttl_seconds=300)
++    monkeypatch.setattr(hermes_state, "psutil", types.SimpleNamespace(pid_exists=lambda pid: pid != 424242))
++    # Another process holds the state.db write lock when the replay asks for the lease, past the first
++    # attempt's write patience; it lets go before the retry. Without the busy-DB floor (BUSY_DB_WAIT_SECONDS)
++    # a wait_seconds=0 Desktop admission never retries and reports "another active writer".
++    blocker = sqlite3.connect(str(held.home / "state.db"), timeout=0, isolation_level=None,
++                              check_same_thread=False)
++    blocker.execute("BEGIN IMMEDIATE")
++    attempts = []
++    first_try = db.try_acquire_session_turn_lease
++
++    def try_acquire(*a, **kw):
++        attempts.append(1)
++        if len(attempts) == 2:
++            blocker.commit()
++        return first_try(*a, **kw)
++
++    monkeypatch.setattr(db, "try_acquire_session_turn_lease", try_acquire)
++    admitted = []
++    reborn = _restart(held, monkeypatch, _desktop_lease_replay(db, admitted))
++    try:
++        assert server._maybe_schedule_auto_continue("sid", reborn, "session-key") is not None
++    finally:
++        blocker.close()
++    assert len(admitted) == 1 and len(attempts) >= 2, "the busy first attempt was retried"
++    text, early, statuses = admitted[0]
++    assert text == "hello there"
++    assert early is None, f"replay refused: {early and early.get('final_response')}"
++    assert not any("another active writer" in str(s) for s in statuses), statuses
++    assert db.session_turn_lease_owner("session-key") is None, "the replay released its lease"
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index b0d272c5a0..5d42118d9b 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -138,7 +138,7 @@ def _adopt_stored_continuation_source(sid: str, session: dict, session_key: str)
+         _clear_session_context(tokens)
+ 
+ 
+-UPDATE_HOLD_QUEUE_REASON = "update_hold_queue"
++from tui_gateway.turn_marker import UPDATE_HOLD_QUEUE_MAX_AGE_S, UPDATE_HOLD_QUEUE_REASON
+ 
+ 
+ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
+@@ -172,7 +172,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     # [daveey] A background-job receipt is a delivery, not a turn to redo: it keeps longer than a turn.
+     from tui_gateway.exit_job_receipts import JOBS_REASON, JOBS_RECEIPT_MAX_AGE_S, jobs_stopped_note
+     receipt = marker.get("reason") == JOBS_REASON
+-    if not enabled or age > (JOBS_RECEIPT_MAX_AGE_S if receipt else freshness_secs) or marker["attempts"] >= max_attempts:
++    # An update-hold queued prompt waited out the drain window + apply: its own bound (turn_marker.py).
++    max_age = (JOBS_RECEIPT_MAX_AGE_S if receipt
++               else max(freshness_secs, UPDATE_HOLD_QUEUE_MAX_AGE_S) if marker.get("reason") == UPDATE_HOLD_QUEUE_REASON
++               else freshness_secs)
++    if not enabled or age > max_age or marker["attempts"] >= max_attempts:
+         clear_turn_marker(home, session_key)  # stale/disabled/crash-looping: a manual message continues
+         return None
+     with session["history_lock"]:
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index c6fb30fa73..9633d5ba18 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -22,18 +22,30 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from tui_gateway.exit_job_receipts import JOBS_REASON, JOBS_RECEIPT_MAX_AGE_S
+-from tui_gateway.turn_marker import _load, _marker_path, marker_writer_state, read_turn_marker
++from tui_gateway.turn_marker import (
++    UPDATE_HOLD_QUEUE_MAX_AGE_S,
++    UPDATE_HOLD_QUEUE_REASON,
++    _load,
++    _marker_path,
++    marker_writer_state,
++    read_turn_marker,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+ _ids = itertools.count(1)
+ # [daveey] Markers the boot sweep retries while an old writer may still be exiting: core-update pauses and
+-# background-job receipts (``exit_job_receipts``). A receipt also outlives the turn freshness window.
+-_RETRY_REASONS = frozenset({"core_update_pause", JOBS_REASON})
++# background-job receipts (``exit_job_receipts``), and prompts queued behind the update hold. A receipt and a
++# hold-queued prompt also outlive the turn freshness window.
++_RETRY_REASONS = frozenset({"core_update_pause", JOBS_REASON, UPDATE_HOLD_QUEUE_REASON})
+ 
+ 
+ def _max_age(marker: dict, fresh: float) -> float:
+-    return JOBS_RECEIPT_MAX_AGE_S if marker.get("reason") == JOBS_REASON else fresh
++    if marker.get("reason") == JOBS_REASON:
++        return JOBS_RECEIPT_MAX_AGE_S
++    if marker.get("reason") == UPDATE_HOLD_QUEUE_REASON:
++        return max(fresh, UPDATE_HOLD_QUEUE_MAX_AGE_S)
++    return fresh
+ 
+ 
+ def _settings(cfg: dict | None) -> tuple[bool, float, int, float]:
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 640e12ea71..5204257396 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -25,6 +25,14 @@ _MAX_ENTRIES = 32
+ # Enough to re-submit any realistic prompt; guards against a multi-megabyte paste being journaled.
+ _MAX_PROMPT_CHARS = 64_000
+ 
++# A prompt accepted behind the core-update admission hold (session_auto_continue._queue_submit_behind_update_hold)
++# is journaled under this reason so the post-restart ``session.resume`` sends it. It is the user's own unsent
++# message, not a turn to redo, so it is not bound by the 15 min turn freshness window: hermes-sync's drain
++# window holds admission for up to 15 min and the apply then takes 1-4 min, plus the backend restart and the
++# Desktop reconnect. One hour covers that with margin; an older one is dropped (the row stays "not sent").
++UPDATE_HOLD_QUEUE_REASON = "update_hold_queue"
++UPDATE_HOLD_QUEUE_MAX_AGE_S = 3600.0
++
+ _lock = threading.Lock()
+ 
+ 
+-- 
+2.55.0
+
