@@ -160,11 +160,16 @@ def _run_tests_full(args: list[str]) -> Optional[str]:
     return "the whole Hermes test suite (run_tests.sh with no test paths)"
 
 
+def _is_run_tests(token: str) -> bool:
+    # No whitespace: `echo "... with scripts/run_tests.sh"` is prose, not the runner.
+    return not any(c.isspace() for c in token) and os.path.basename(token) in RUN_TESTS
+
+
 def check_argv(argv: list[str]) -> Optional[str]:
     first = os.path.basename(argv[0])
-    if (PY.match(first) or first in SHELLS) and len(argv) > 1 and os.path.basename(argv[1]) in RUN_TESTS:
+    if (PY.match(first) or first in SHELLS) and len(argv) > 1 and _is_run_tests(argv[1]):
         argv = argv[1:]
-    if argv and os.path.basename(argv[0]) in RUN_TESTS:
+    if argv and _is_run_tests(argv[0]):
         return _run_tests_full(argv[1:])
     argv = _strip_runner(argv)
     if not argv:

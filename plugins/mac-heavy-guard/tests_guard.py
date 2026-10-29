@@ -100,6 +100,15 @@ LIGHT = [
 ]
 
 
+def test_script_echo_naming_run_tests_is_not_the_runner(tmp_path):
+    # Regression: hermes-core-wt's `echo "... with scripts/run_tests.sh"` blocked `hermes-core-wt new`.
+    f = _script(tmp_path, 'echo "running ${#files[@]} test file(s) with scripts/run_tests.sh"\n'
+                          './scripts/run_tests.sh "${files[@]}"\n', name="wt.sh")
+    assert not blocked("terminal", command=str(f))
+    g = _script(tmp_path, "cd repo && ./scripts/run_tests.sh -j 4\n", name="full.sh")
+    assert blocked("terminal", command=str(g))
+
+
 @pytest.mark.parametrize("cmd", HEAVY)
 def test_blocks_heavy_terminal(cmd):
     assert blocked("terminal", command=cmd), cmd
