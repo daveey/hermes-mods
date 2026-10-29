@@ -1,0 +1,719 @@
+From a65917ae056c4fdcb50950658e44b4a18236396e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:52:27 +0000
+Subject: [PATCH] fix(cron): [daveey] block stale model pins the managed
+ routing registry rejects; gated ticks keep the last verdict
+
+The mini's imsg-spam-classifier (pinned to claude-sonnet-5, registry lists only
+claude-sonnet-5-5) died before the model on every woken run since 10/28 with
+"Managed subscription policy rejects unregistered or ambiguous concrete pin",
+yet showed last_status=ok. Two gaps:
+
+- Cron was the one surface the stored-pin-vs-registry fixes skipped. The
+  provider-key preflight swallowed ManagedPinRejectedError as a non-auth error
+  and failed open. New cron/managed_pin.py runs pin_policy on the model the job
+  would run on (job pin > cron.model > model.default):
+  - preflight: blocked_config naming the pin, its source and the allowed pins
+    (alert once), checked before provider_key;
+  - `hermes cron create/edit` (cronjob tool create/update) refuse such a pin
+    with code model_pin_not_in_routing_registry, only when the call sets the pin;
+  - `hermes cron doctor` lists enabled jobs whose pins the registry rejects.
+- A wakeAgent=false / unchanged-monitor tick went through mark_job_run(success)
+  and reset failure_streak, last_status and preflight_alerted, so a 100% agent
+  failure read as recovered and the alert-once alert re-fired on every wake.
+  Gated ticks now pass agent_skipped=True and keep the last real verdict (a job
+  with no verdict yet still records ok).
+
+test_managed_entry: the stale paid pin is now refused at preflight
+(blocked_config); the runtime refusal is kept under cron.preflight: false.
+---
+ cron/jobs.py                                  |  27 +++-
+ cron/managed_pin.py                           |  78 +++++++++++
+ cron/scheduler.py                             |   6 +
+ cron/scheduler_preflight.py                   |  11 ++
+ hermes_cli/cron.py                            |  14 +-
+ tests/cron/test_managed_entry.py              |  26 +++-
+ tests/cron/test_preflight_managed_pin.py      | 122 ++++++++++++++++++
+ tests/cron/test_silent_tick_keeps_streak.py   |  77 +++++++++++
+ tests/hermes_cli/test_cron_managed_pin_cli.py |  96 ++++++++++++++
+ tools/cronjob_job_args.py                     |  19 +++
+ tools/cronjob_tools.py                        |  11 +-
+ 11 files changed, 473 insertions(+), 14 deletions(-)
+ create mode 100644 cron/managed_pin.py
+ create mode 100644 tests/cron/test_preflight_managed_pin.py
+ create mode 100644 tests/cron/test_silent_tick_keeps_streak.py
+ create mode 100644 tests/hermes_cli/test_cron_managed_pin_cli.py
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 44aff815fa..aa1fd40488 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2364,7 +2364,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
+ 
+ def _record_run_outcome(
+     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
+-    status: Optional[str], now: str,
++    status: Optional[str], now: str, *, agent_skipped: bool = False,
+ ) -> None:
+     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
+     job["last_run_at"] = now
+@@ -2372,10 +2372,16 @@ def _record_run_outcome(
+     # The transient manual-run context is single-fire: the run that just completed consumed it.
+     job.pop("manual_run_prompt", None)
+     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
+-    job["last_status"] = status or (
+-        "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
+-    job["last_error"] = None if success else error
+-    if success:
++    # [daveey] A gated tick (agent suppressed) keeps the last real run's verdict; only a job with
++    # no verdict yet records it as ok.
++    keep_verdict = agent_skipped and success and job.get("last_status") is not None
++    if not keep_verdict:
++        job["last_status"] = status or (
++            "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
++        job["last_error"] = None if success else error
++    if keep_verdict:
++        job.pop("last_fire_error", None)
++    elif success:
+         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
+         # the forward-failure stamp so it only describes CURRENT auto-fire health.
+         job.pop("preflight_alerted", None)
+@@ -2391,7 +2397,8 @@ def _record_run_outcome(
+         # survives success (latest failure wins); the recency window is the consumer's
+         # call. Delivery failures keep their own sticky last_delivery_error.
+         job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
+-    job["last_delivery_error"] = delivery_error
++    if not keep_verdict:
++        job["last_delivery_error"] = delivery_error
+     # Clear both claims: the run is over, so the job is claimable again.
+     job["fire_claim"] = None
+     job.pop("pending_slot", None)
+@@ -2462,6 +2469,7 @@ def mark_job_run(
+     ladder_rung: bool = False,
+     quota_hold_seconds: Optional[float] = None,
+     recover_consumed_fire: bool = False,
++    agent_skipped: bool = False,
+ ) -> bool:
+     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
+     and retire the record as a terminal completion when the repeat limit is reached.
+@@ -2483,6 +2491,10 @@ def mark_job_run(
+     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
+     consumed fire when the provider reopens; manual runs retain the natural schedule
+     (cron/quota_hold.py, #89376).
++
++    ``agent_skipped``: a gate (``wakeAgent=false`` script, unchanged monitor) suppressed the agent,
++    so this successful tick is not evidence of agent health. ``last_status``, ``last_error``,
++    ``failure_streak`` and ``preflight_alerted`` keep the last real run's values. [daveey]
+     """
+     def apply(jobs, _i, job):
+         if expected_fire_owner is not None:
+@@ -2493,7 +2505,8 @@ def mark_job_run(
+                     job_id)
+                 return False
+         now = _hermes_now().isoformat()
+-        _record_run_outcome(job, success, error, delivery_error, status, now)
++        _record_run_outcome(job, success, error, delivery_error, status, now,
++                            agent_skipped=agent_skipped)
+         _advance_after_run(job, now, ladder_rung=ladder_rung)
+         from cron import quota_hold
+         from cron.unreachable_retry import clear_state, plan_retry
+diff --git a/cron/managed_pin.py b/cron/managed_pin.py
+new file mode 100644
+index 0000000000..eb939c0651
+--- /dev/null
++++ b/cron/managed_pin.py
+@@ -0,0 +1,78 @@
++"""Stored cron model pins vs the managed routing registry. [daveey]
++
++Under ``model_routing.enforce_subscription_only`` every concrete model goes through
++``pin_policy``, which needs an exact registry match. A job pinned before the registry changed
++then dies at every woken run, before the model, with "Managed subscription policy rejects
++unregistered or ambiguous concrete pin". This module runs that same check where it can be
++acted on: the scheduler preflight (blocked_config, alert once), ``hermes cron create/edit``
++(refuse the pin) and ``hermes cron doctor`` (list it). Kanban's sibling is
++``hermes_cli.kanban_model_assignment._check_managed_pin``.
++"""
++from typing import Optional
++
++CODE = "model_pin_not_in_routing_registry"
++
++
++def effective_model(job: dict, cfg: dict) -> tuple[str, str]:
++    """``(model, source)`` with run_job's precedence: job pin > cron.model > main model.
++
++    ``source`` is ``"job"``, ``"cron.model"``, ``"model.default"`` or ``""`` (nothing set; HERMES_MODEL is
++    process env, not a stored pin, so it is left to the run path).
++    """
++    if str(job.get("model") or "").strip():
++        return str(job["model"]).strip(), "job"
++    cron = cfg.get("cron")
++    cron = cron if isinstance(cron, dict) else {}
++    if str(cron.get("model") or "").strip():
++        return str(cron["model"]).strip(), "cron.model"
++    main = cfg.get("model")
++    main = main if isinstance(main, str) else (
++        (main.get("default") or main.get("model") or main.get("name")) if isinstance(main, dict) else "")
++    return (str(main).strip(), "model.default") if str(main or "").strip() else ("", "")
++
++
++def rejected_pin(model: Optional[str], provider: Optional[str], cfg: Optional[dict]) -> Optional[list]:
++    """The registry's allowed pins when ``model`` would be refused; None when it passes or no policy."""
++    from agent.model_routing import is_class_selector
++    from agent.model_routing_managed import ManagedPinRejectedError, managed_config, pin_policy
++
++    model = (model or "").strip()
++    if not model or is_class_selector(model) or cfg is None:
++        return None
++    managed = managed_config(cfg)
++    if managed is None:
++        return None
++    try:
++        pin_policy(model, (provider or "").strip() or None, managed)
++    except ManagedPinRejectedError as exc:
++        return exc.allowed
++    return None
++
++
++def rejection_message(model: str, provider: Optional[str], allowed: list, *, job_id: Optional[str] = None,
++                      source: str = "job") -> str:
++    on = f" on provider {provider!r}" if provider else ""
++    where = {"job": "this job's model pin", "cron.model": "config cron.model (the cron fleet default)",
++             "model.default": "config model.default"}.get(source, "the model")
++    fix = (f"`hermes cron edit {job_id} --model <one of those>`" if source == "job" and job_id
++           else f"set {source} to one of those" if source != "job" else "pin one of those")
++    return (f"{CODE}: {where} {model!r}{on} is not in this host's model routing registry "
++            f"(managed subscription policy), so every run fails before the model. Allowed: "
++            f"{', '.join(allowed) or 'none'}. Fix: {fix}.")
++
++
++def job_pin_issue(job: dict, cfg: Optional[dict]) -> Optional[str]:
++    """Rejection message for the model this job would run on, or None."""
++    if job.get("no_agent") or cfg is None:
++        return None
++    model, source = effective_model(job, cfg)
++    provider = job.get("provider") if source == "job" else None
++    allowed = rejected_pin(model, provider, cfg)
++    if allowed is None:
++        return None
++    return rejection_message(model, provider, allowed, job_id=job.get("id"), source=source)
++
++
++def load_config() -> dict:
++    from hermes_cli.config_effective import load_user_config_effective
++    return load_user_config_effective()
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 723998727e..58ef464352 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1599,6 +1599,7 @@ def _apply_monitor_gate(
+     if not _mon.changed:
+         # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
+         logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
++        job["_agent_skipped"] = True  # [daveey] not an agent run: mark_job_run keeps the last real outcome
+         return (
+             True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None,
+         ), extra_prompt, None
+@@ -2428,6 +2429,7 @@ def _prepare_job_prompt(
+         if _ran_ok and not _parse_wake_gate(_script_output):
+             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
+             note_cron_skipped(job)
++            job["_agent_skipped"] = True  # [daveey] not an agent run: mark_job_run keeps the last real outcome
+             silent_doc = (
+                 f"# Cron Job: {job_name}\n\n"
+                 f"**Job ID:** {job_id}\n"
+@@ -3336,6 +3338,10 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
+         mark_kwargs["expected_fire_owner"] = fire_owner
+     if d.blocked_config:
+         mark_kwargs["status"] = "blocked_config"
++    if job.pop("_agent_skipped", False) and d.success:
++        # [daveey] A gate tick (wakeAgent=false / unchanged monitor) says nothing about agent health:
++        # resetting the streak and alert marker here hid a job whose every woken run failed.
++        mark_kwargs["agent_skipped"] = True
+     # A run that removed its own record has nothing left to mark; the delivery above is its result.
+     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
+         job["id"], d.success, d.error, **mark_kwargs)
+diff --git a/cron/scheduler_preflight.py b/cron/scheduler_preflight.py
+index e58ad3b15b..bf3e132bf6 100644
+--- a/cron/scheduler_preflight.py
++++ b/cron/scheduler_preflight.py
+@@ -387,6 +387,14 @@ def _empty_requested_mcp_toolsets(job: dict, cfg: dict) -> Optional[str]:
+         "the job's toolsets.")
+ 
+ 
++def _preflight_check_managed_pin(job: dict, cfg: dict) -> Optional[str]:
++    """The model this job would run on fails the managed routing registry (``pin_policy``).
++
++    Config, not a transient: the run would die before the model on every wake. [daveey]"""
++    from cron.managed_pin import job_pin_issue
++    return job_pin_issue(job, cfg)
++
++
+ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+     """Pre-dispatch validation: return a reason (missing key, unconfigured delivery, unready skill)
+     so the caller refuses BEFORE building agent machinery or burning an LLM call. Every check fails
+@@ -396,6 +404,9 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+     follows the alert-once pattern from the dead-pin auto-pause (#73506).
+     """
+     for name, check in (
++        # Before provider_key: that probe treats the policy's ManagedPinRejectedError as a non-auth
++        # error and fails open, so a stale pin died at every woken run instead of blocking once.
++        ("managed_pin", lambda: _preflight_check_managed_pin(job, cfg)),
+         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
+         ("skills", lambda: _preflight_check_skills(job)),
+         ("delivery", lambda: _preflight_check_delivery(job))):
+diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
+index 6e134b35cf..245b7d7771 100644
+--- a/hermes_cli/cron.py
++++ b/hermes_cli/cron.py
+@@ -695,8 +695,14 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
+     return f"next_run_at is {amount} overdue — job is not firing (is the scheduler running?)"
+ 
+ 
+-def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
++def _cron_doctor_issues_for_job(job: dict[str, Any], cfg: Optional[dict] = None) -> list[str]:
+     issues: list[str] = []
++    if cfg is not None and job.get("enabled", True):
++        # [daveey] A pin the managed routing registry rejects fails every run before the model.
++        from cron.managed_pin import job_pin_issue
++        with contextlib.suppress(Exception):
++            if pin_issue := job_pin_issue(job, cfg):
++                issues.append(pin_issue)
+     last_status = str(job.get("last_status") or "").strip().lower()
+     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
+     if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
+@@ -736,7 +742,11 @@ def cron_doctor() -> int:
+     """Run read-only cron health checks and return a shell-friendly status."""
+     from cron.jobs import list_jobs
+     jobs = list_jobs(include_disabled=False)
+-    findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
++    cfg = None
++    with contextlib.suppress(Exception):
++        from cron.managed_pin import load_config
++        cfg = load_config()
++    findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job, cfg))]
+     if not findings:
+         print(color("✓ Cron doctor found no issues", Colors.GREEN))
+         note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."
+diff --git a/tests/cron/test_managed_entry.py b/tests/cron/test_managed_entry.py
+index dc6744687d..faff7e4d7b 100644
+--- a/tests/cron/test_managed_entry.py
++++ b/tests/cron/test_managed_entry.py
+@@ -8,7 +8,7 @@ routing_home = fixtures.routing_home
+ streaming_route = fixtures.streaming_route
+ 
+ 
+-def test_paid_cron_job_fails_without_send(managed):
++def _run_paid_job():
+     from cron.scheduler import run_job
+     with patch('model_tools.get_tool_definitions', return_value=[]), \
+          patch('cron.scheduler_delivery._resolve_origin', return_value=None), \
+@@ -18,6 +18,24 @@ def test_paid_cron_job_fails_without_send(managed):
+          patch('httpx.Client.send') as send:
+         success, _, _, error = run_job({'id': 'stale-paid-cron', 'name': 'paid cron',
+                                        'model': 'vendor/paid', 'provider': 'openrouter', 'prompt': 'Say ok'})
+-        assert not success
+-        assert 'Managed subscription policy' in error
+-        send.assert_not_called()
++    return success, error, send
++
++
++def test_paid_cron_job_fails_without_send(managed):
++    # [daveey] The preflight now refuses the stale pin as blocked_config (alert once) before any
++    # runtime is built; the run still fails and nothing is sent.
++    success, error, send = _run_paid_job()
++    assert not success
++    assert '[blocked_config]' in error and 'model_pin_not_in_routing_registry' in error
++    send.assert_not_called()
++
++
++def test_paid_cron_job_fails_without_send_when_preflight_is_off(managed, tmp_path):
++    """``cron.preflight: false``: the runtime policy itself still refuses the pin with no send."""
++    from hermes_cli.config import atomic_config_write
++    managed['cron'] = {'preflight': False}
++    atomic_config_write(tmp_path / 'config.yaml', managed)
++    success, error, send = _run_paid_job()
++    assert not success
++    assert 'Managed subscription policy' in error
++    send.assert_not_called()
+diff --git a/tests/cron/test_preflight_managed_pin.py b/tests/cron/test_preflight_managed_pin.py
+new file mode 100644
+index 0000000000..da74bdd4d5
+--- /dev/null
++++ b/tests/cron/test_preflight_managed_pin.py
+@@ -0,0 +1,122 @@
++"""Cron preflight refuses a pin the managed routing registry rejects. [daveey]
++
++On the mini (``model_routing.enforce_subscription_only: true``) the ``imsg-spam-classifier`` job
++was pinned to ``claude-sonnet-5``, which the registry no longer lists (only ``claude-sonnet-5-5``).
++Every woken run died before the model with "Managed subscription policy rejects unregistered or
++ambiguous concrete pin": the provider-key preflight swallowed the ManagedPinRejectedError as a
++non-auth error and failed open, so the job errored on every wake instead of showing
++``blocked_config`` once. Entry path: ``run_job`` against a temp config.yaml (the
++test_preflight_config harness), plus ``run_one_job`` for the alert-once bookkeeping.
++"""
++import sys
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).parent.parent.parent))
++
++import cron.jobs as cron_jobs
++import cron.scheduler as sched
++from tests.cron.test_preflight_config import _job, _run_job_patched
++
++
++def managed_yaml(enforce=True):
++    lines = ["model_routing:", "  enabled: true", "  policy_version: 1", "  allow_metered: false",
++             f"  enforce_subscription_only: {'true' if enforce else 'false'}", "  routes:"]
++    for level, provider, model in (("deep", "anthropic", "claude-opus-5-5"),
++                                   ("standard", "anthropic", "claude-sonnet-5-5"),
++                                   ("standard", "openai-codex", "gpt-6.1-sol")):
++        if f"    {level}:" not in lines:
++            lines.append(f"    {level}:")
++        lines += [f"      - provider: {provider}", f"        model: {model}", "        billing: subscription",
++                  "        weight: 1", "        eligible: true", "        funding_verified: true",
++                  "        capabilities: {tools: true, streaming: true}"]
++    return "\n".join(lines) + "\n"
++
++
++def _write_config(home, enforce=True):
++    (home / "config.yaml").write_text(
++        "model:\n  default: claude-opus-5-5\n  provider: anthropic\n" + managed_yaml(enforce), encoding="utf-8")
++
++
++def _run(tmp_path, **job_overrides):
++    job = _job(**job_overrides)
++    with cron_jobs.use_cron_store(tmp_path):
++        cron_jobs.save_jobs([job])
++        return _run_job_patched(job, tmp_path)
++
++
++@pytest.mark.parametrize("provider", [None, "anthropic"])
++def test_unregistered_pin_is_blocked_config_naming_allowed_pins(tmp_path, provider):
++    _write_config(tmp_path)
++    success, output, _final, error, agent_constructed = _run(
++        tmp_path, model="claude-sonnet-5", provider=provider)
++    assert agent_constructed is False
++    assert success is False
++    assert "[blocked_config]" in (error or "")
++    assert "'claude-sonnet-5'" in error
++    # Names what the job CAN pin, so the alert is actionable.
++    assert "claude-sonnet-5-5" in error and "claude-opus-5-5" in error
++    assert "hermes cron edit pf-test --model" in error
++    assert "BLOCKED" in output
++
++
++def test_registered_pin_runs(tmp_path):
++    _write_config(tmp_path)
++    success, _output, _final, error, agent_constructed = _run(
++        tmp_path, model="claude-sonnet-5-5", provider="anthropic")
++    assert "[blocked_config]" not in (error or "")
++    assert agent_constructed is True
++    assert success is True, error
++
++
++def test_policy_off_does_not_block(tmp_path):
++    _write_config(tmp_path, enforce=False)
++    success, _output, _final, error, agent_constructed = _run(tmp_path, model="claude-sonnet-5")
++    assert "[blocked_config]" not in (error or "")
++    assert agent_constructed is True
++    assert success is True, error
++
++
++def test_unpinned_job_on_rejected_cron_model_is_blocked(tmp_path):
++    """The fleet default ``cron.model`` is a stored pin too."""
++    (tmp_path / "config.yaml").write_text(
++        "model:\n  default: claude-opus-5-5\n  provider: anthropic\ncron:\n  model: claude-sonnet-5\n"
++        + managed_yaml(), encoding="utf-8")
++    success, _output, _final, error, agent_constructed = _run(tmp_path)
++    assert agent_constructed is False and success is False
++    assert "[blocked_config]" in (error or "") and "cron.model" in error
++
++
++def test_rejected_pin_alerts_once_across_woken_runs(tmp_path):
++    """Two woken runs of the stale-pin job deliver ONE alert and persist blocked_config."""
++    _write_config(tmp_path)
++    job = _job(model="claude-sonnet-5")
++    deliveries = []
++
++    def fake_deliver(job, content, adapters=None, loop=None, **kwargs):
++        deliveries.append(content)
++
++    with cron_jobs.use_cron_store(tmp_path):
++        cron_jobs.save_jobs([job])
++        for _tick in range(2):
++            fresh = next(j for j in cron_jobs.load_jobs() if j["id"] == job["id"])
++            with patch("cron.scheduler._hermes_home", tmp_path), \
++                 patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
++                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
++                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
++                 patch("hermes_state_registry.acquire", return_value=MagicMock()), \
++                 patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
++                 patch("hermes_cli.runtime_provider.resolve_runtime_provider",
++                       return_value={"api_key": "k", "base_url": "https://example.invalid/v1",
++                                     "provider": "anthropic", "api_mode": "chat_completions"}), \
++                 patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
++                 patch("run_agent.AIAgent") as mock_agent_cls:
++                assert sched.run_one_job(fresh) is True
++                assert mock_agent_cls.called is False
++        stored = next(j for j in cron_jobs.load_jobs() if j["id"] == job["id"])
++
++    assert stored["last_status"] == "blocked_config"
++    assert len(deliveries) == 1, deliveries
++    assert "claude-sonnet-5-5" in deliveries[0]
+diff --git a/tests/cron/test_silent_tick_keeps_streak.py b/tests/cron/test_silent_tick_keeps_streak.py
+new file mode 100644
+index 0000000000..70e239d65c
+--- /dev/null
++++ b/tests/cron/test_silent_tick_keeps_streak.py
+@@ -0,0 +1,77 @@
++"""A tick whose gate suppressed the agent is not a healthy agent run. [daveey]
++
++The mini's ``imsg-spam-classifier`` failed every woken run for a day, yet showed
++``last_status=ok``: the silent once-a-minute ticks between wakes (wake-gate script printing
++``{"wakeAgent": false}``, or an unchanged monitor) went through ``mark_job_run(success=True)``,
++which reset ``failure_streak`` to 0 and cleared ``preflight_alerted``. So a 100% agent failure
++read as "1 failure, recovered", repeatedly, and an alert-once blocked_config alert re-fired on
++every wake. Entry path: ``run_one_job`` for both gates, with a real job store.
++"""
++import sys
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).parent.parent.parent))
++
++import cron.jobs as cron_jobs
++import cron.scheduler as sched
++from cron.monitor import MonitorOutcome
++from tests.cron.test_preflight_config import _job
++
++
++def _tick(tmp_path, job_id, *, gate):
++    fresh = next(j for j in cron_jobs.load_jobs() if j["id"] == job_id)
++    extra = []
++    if gate == "wake_gate":
++        extra.append(patch.object(sched, "_run_job_script_with_claim_heartbeat",
++                                  return_value=(True, '{"wakeAgent": false}')))
++    else:
++        extra.append(patch("cron.monitor.check_monitor", return_value=MonitorOutcome(ok=True, changed=False)))
++    from contextlib import ExitStack
++    with ExitStack() as stack:
++        for p in [patch("cron.scheduler._hermes_home", tmp_path),
++                  patch("cron.scheduler_delivery._resolve_origin", return_value=None),
++                  patch("hermes_cli.env_loader.load_hermes_dotenv"),
++                  patch("hermes_cli.env_loader.reset_secret_source_cache"),
++                  patch("hermes_state_registry.acquire", return_value=MagicMock()),
++                  patch.object(sched, "_deliver_result"), *extra]:
++            stack.enter_context(p)
++        agent_cls = stack.enter_context(patch("run_agent.AIAgent"))
++        assert sched.run_one_job(fresh) is True
++        assert agent_cls.called is False
++
++
++@pytest.mark.parametrize("gate", ["wake_gate", "monitor_no_change"])
++def test_silent_tick_keeps_failure_streak_and_alert_marker(tmp_path, gate):
++    overrides = {"script": "gate.py"} if gate == "wake_gate" else {"monitor_script": "mon.py"}
++    job = _job(**overrides)
++    with cron_jobs.use_cron_store(tmp_path):
++        cron_jobs.save_jobs([job])
++        assert cron_jobs.mark_job_run(job["id"], False, "[blocked_config] stale pin", status="blocked_config")
++        cron_jobs.mark_preflight_alerted(job["id"])
++        _tick(tmp_path, job["id"], gate=gate)
++        stored = cron_jobs.get_job(job["id"])
++        assert stored["failure_streak"] == 1
++        assert stored["last_status"] == "blocked_config"
++        assert stored["last_error"] == "[blocked_config] stale pin"
++        assert stored.get("preflight_alerted")
++        # The tick still counts as a fire for scheduling.
++        assert stored["last_run_at"]
++        # A real healthy run afterwards still resets everything.
++        assert cron_jobs.mark_job_run(job["id"], True)
++        healed = cron_jobs.get_job(job["id"])
++        assert healed["failure_streak"] == 0 and healed["last_status"] == "ok"
++        assert not healed.get("preflight_alerted")
++
++
++def test_silent_tick_on_a_fresh_job_still_reads_ok(tmp_path):
++    """No prior run: the gate tick records ok (nothing to preserve)."""
++    job = _job(script="gate.py")
++    with cron_jobs.use_cron_store(tmp_path):
++        cron_jobs.save_jobs([job])
++        _tick(tmp_path, job["id"], gate="wake_gate")
++        stored = cron_jobs.get_job(job["id"])
++        assert stored["last_status"] == "ok"
++        assert int(stored.get("failure_streak") or 0) == 0
+diff --git a/tests/hermes_cli/test_cron_managed_pin_cli.py b/tests/hermes_cli/test_cron_managed_pin_cli.py
+new file mode 100644
+index 0000000000..54cd4109d7
+--- /dev/null
++++ b/tests/hermes_cli/test_cron_managed_pin_cli.py
+@@ -0,0 +1,96 @@
++"""``hermes cron create/edit`` refuse a pin the managed routing registry rejects; doctor lists them.
++
++Same contract as kanban's create-time check (abe20b1815): under
++``model_routing.enforce_subscription_only`` the job's pin must pass ``pin_policy`` when it is set,
++not only when the job wakes. [daveey]
++"""
++import argparse
++import sys
++from argparse import Namespace
++from pathlib import Path
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).parent.parent.parent))
++
++from cron.jobs import create_job, get_job, list_jobs
++from hermes_cli.cron import cron_command
++from hermes_cli.subcommands.cron import build_cron_parser
++from tests.cron.test_preflight_managed_pin import managed_yaml
++
++
++@pytest.fixture()
++def managed_home(tmp_path, monkeypatch):
++    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
++    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
++    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++
++    def configure(enforce=True):
++        (tmp_path / "config.yaml").write_text(
++            "model:\n  default: claude-opus-5-5\n  provider: anthropic\n" + managed_yaml(enforce),
++            encoding="utf-8")
++
++    configure()
++    return configure
++
++
++def _cli(*argv):
++    parser = argparse.ArgumentParser(prog="hermes")
++    build_cron_parser(parser.add_subparsers(dest="command"), cmd_cron=cron_command)
++    return cron_command(parser.parse_args(["cron", *argv]))
++
++
++def test_cron_edit_rejects_unregistered_pin(managed_home, capsys):
++    job = create_job(prompt="classify", schedule="every 1h", model="claude-sonnet-5-5", provider="anthropic")
++    rc = _cli("edit", job["id"], "--model", "claude-sonnet-5", "--provider", "anthropic")
++    out = capsys.readouterr().out
++    assert rc == 1
++    assert "model_pin_not_in_routing_registry" in out
++    assert "claude-sonnet-5-5" in out
++    assert get_job(job["id"])["model"] == "claude-sonnet-5-5"  # unchanged
++
++
++def test_cron_edit_accepts_registered_pin(managed_home, capsys):
++    job = create_job(prompt="classify", schedule="every 1h", model="claude-sonnet-5")
++    rc = _cli("edit", job["id"], "--model", "claude-sonnet-5-5", "--provider", "anthropic")
++    assert rc in (0, None), capsys.readouterr().out
++    assert get_job(job["id"])["model"] == "claude-sonnet-5-5"
++
++
++def test_cron_edit_of_unrelated_field_is_not_refused(managed_home, capsys):
++    """Only setting a pin is checked, so a stale-pinned job can still be renamed/paused."""
++    job = create_job(prompt="classify", schedule="every 1h", model="claude-sonnet-5")
++    rc = _cli("edit", job["id"], "--name", "renamed")
++    assert rc in (0, None), capsys.readouterr().out
++    assert get_job(job["id"])["name"] == "renamed"
++
++
++def test_cron_create_rejects_unregistered_pin(managed_home, capsys):
++    rc = cron_command(Namespace(
++        cron_command="create", schedule="every 1h", prompt="classify", name="x", deliver=None,
++        repeat=None, skill=None, skills=None, script=None, workdir=None, no_agent=False,
++        model="claude-sonnet-5", provider=None))
++    out = capsys.readouterr().out
++    assert rc == 1
++    assert "model_pin_not_in_routing_registry" in out
++    assert list_jobs(include_disabled=True) == []
++
++
++def test_cron_edit_policy_off_accepts_any_pin(managed_home, capsys):
++    managed_home(enforce=False)
++    job = create_job(prompt="classify", schedule="every 1h")
++    rc = _cli("edit", job["id"], "--model", "claude-sonnet-5", "--provider", "anthropic")
++    assert rc in (0, None), capsys.readouterr().out
++    assert get_job(job["id"])["model"] == "claude-sonnet-5"
++
++
++def test_cron_doctor_lists_rejected_pin(managed_home, capsys):
++    bad = create_job(prompt="classify", schedule="every 1h", model="claude-sonnet-5")
++    good = create_job(prompt="ok", schedule="every 1h", model="claude-sonnet-5-5")
++    rc = cron_command(Namespace(cron_command="doctor"))
++    out = capsys.readouterr().out
++    assert rc == 1
++    assert bad["id"] in out and "model_pin_not_in_routing_registry" in out
++    assert "claude-sonnet-5-5" in out
++    assert good["id"] not in out
+diff --git a/tools/cronjob_job_args.py b/tools/cronjob_job_args.py
+index 046995c2a6..e33d9de66b 100644
+--- a/tools/cronjob_job_args.py
++++ b/tools/cronjob_job_args.py
+@@ -413,6 +413,25 @@ def _validate_cron_base_url(
+         "for a custom base_url.")
+ 
+ 
++def _validate_managed_pin(model: Optional[str], provider: Optional[str],
++                          job_id: Optional[str] = None) -> Optional[str]:
++    """[daveey] Refuse a model pin the managed routing registry rejects (cron sibling of kanban's
++    create-time check): otherwise every woken run dies before the model. None when no managed
++    policy, no pin, or the config can't be read (the scheduler preflight still guards the run)."""
++    model = (model or "").strip()
++    if not model:
++        return None
++    from cron.managed_pin import load_config, rejected_pin, rejection_message
++    try:
++        allowed = rejected_pin(model, provider, load_config())
++    except Exception:
++        logger.debug("managed pin check failed open", exc_info=True)
++        return None
++    if allowed is None:
++        return None
++    return rejection_message(model, (provider or "").strip() or None, allowed, job_id=job_id)
++
++
+ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
+     """Scripts must be relative paths within HERMES_HOME/scripts/ (absolute / ~ / drive-letter
+     rejected — prompt-injection guard). Error string if blocked, else None; empty = clear."""
+diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
+index fcf41ec19f..57d0e0f91c 100644
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -63,7 +63,8 @@ from tools.cronjob_job_args import (
+     _validate_bot_chat_deliver,
+     _validate_context_from_refs,
+     _validate_cron_base_url,
+-    _validate_cron_script_path)
++    _validate_cron_script_path,
++    _validate_managed_pin)
+ from tools.registry import registry, tool_error
+ 
+ 
+@@ -678,6 +679,8 @@ def _action_create(a: dict[str, Any]) -> str:
+         # A model-supplied base_url must not route a named provider's stored credential
+         # to an attacker endpoint.
+         or _validate_cron_base_url(a["provider"], a["base_url"])
++        # A pin the managed routing registry rejects would fail every run before the model.
++        or _validate_managed_pin(a["model"], a["provider"])
+         # bot-chat targets are machine-local: fail the CREATE, not the run.
+         or _validate_bot_chat_deliver(deliver)
+         # failure_deliver shares deliver's grammar and validators.
+@@ -864,6 +867,12 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
+         updates["model"] = _normalize_optional_job_value(a["model"])
+     if a["provider"] is not None:
+         updates["provider"] = _normalize_optional_job_value(a["provider"])
++    if a["model"] is not None or a["provider"] is not None:
++        # Only when this update sets the pin, so a stale-pinned job can still be renamed/paused.
++        pin_error = _validate_managed_pin(
++            _pick(updates, job, "model"), _pick(updates, job, "provider"), job.get("id"))
++        if pin_error:
++            return pin_error
+     if a["pinned"] is not None:
+         updates["pinned"] = bool(a["pinned"])
+     if a["base_url"] is not None:
+-- 
+2.55.0
+
