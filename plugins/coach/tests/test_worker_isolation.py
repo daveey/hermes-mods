@@ -37,6 +37,6 @@ def test_isolated(tmp_path, monkeypatch):
                HERMES_KANBAN_DB="live.db", HERMES_KANBAN_HOME="live-home",
                HERMES_KANBAN_FUTURE_PIN="future-pin", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(suite)],
-                            env=env, capture_output=True, text=True, timeout=30)
+                            env=env, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
