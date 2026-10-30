@@ -7,7 +7,9 @@
  *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks
  *   Stuck        a running card with no event for 2 h, a parked card whose agent-owned wait stalled
  *                (backend `wait.wait_state === 'stalled'`), or a sub-agent whose tool count has not moved
- *                for 30 min; each with numbered steps and Nudge agent / Open card
+ *                for 30 min; each with numbered steps and Nudge agent / Open card. A stale chip (session-tasks'
+ *                last-known copy after a failed read) is never stuck or needs-you: it lists under Waiting as
+ *                "status unknown", since the card may have been answered or archived since
  *   In progress  running and in-review cards, sub-agents, background processes, rented machines
  *   Waiting      parked cards and what they wait on
  *   footer       finished and not-yet-started cards, folded
@@ -88,6 +90,9 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     seen(c.activityAt)
     const last = Math.max(Number(c.activityAt) || 0, Number(c.since) || 0)
     const on = c.waitingOn ? `waiting on ${c.waitingOn}${c.waitingSince ? ` since ${clock(c.waitingSince, nowMs)}` : ''}` : ''
+    // A stale chip is session-tasks' last-known copy after a failed read: the card may have been answered,
+    // re-blocked or archived since, so it is never stuck (no nudge) or needs-you, only "status unknown".
+    if (c.stale) { out.waiting.push({ ...item(c), detail: `status unknown · last known: ${c.look === 'needs-you' ? 'needs you' : c.state || 'unknown'}${last ? ` (${ago(last, nowMs)})` : ''}; the card could not be re-read` }); continue }
     if (c.look === 'needs-you') { if (!isAsked(c)) out.unasked.push({ ...item(c), detail: on || 'needs you' }); continue }
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if (c.state === 'running') {

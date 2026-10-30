@@ -64,6 +64,23 @@ test('a running card just under the threshold, or with fresh activity, is not st
   assert.equal(out.active.length, 2)
 })
 
+test('a stale (last-known) card is never stuck or needs-you: its state is unknown, not evidence', () => {
+  // closeout-notice-stale-decision: the owner read failed after the user approved a decision card, so session-tasks
+  // kept the last-known "running" chip (stale) for hours after the card re-blocked and was archived; the panel
+  // called it "no progress since 21:48" and drafted a nudge about a question already answered.
+  const old = { activityAt: S - m.STUCK_CARD_S - 5, since: S - m.STUCK_CARD_S - 100, activity: 'heartbeat', stale: true }
+  const sorted = m.classify([
+    card('t_gone', 'running', old),
+    card('t_ask', 'blocked', { look: 'needs-you', stale: true }),
+    card('t_live', 'running', { ...old, stale: false })
+  ], { nowMs: NOW })
+  assert.deepEqual(sorted.stuck.map(i => i.id), ['t_live'])
+  assert.deepEqual(sorted.unasked, [])
+  assert.deepEqual(sorted.waiting.map(i => i.id), ['t_gone', 't_ask'])
+  assert.match(sorted.waiting[0].detail, /status unknown · last known: running/)
+  assert.doesNotMatch(sorted.waiting[0].detail, /no progress/)
+})
+
 test('trackSubagents: first sight counts from now, a new tool call resets, finished ones are forgotten', () => {
   const memory = new Map(), sub = n => ({ key: 'sub:x', kind: 'sub', toolCount: n })
   assert.equal(m.trackSubagents([sub(1)], NOW, memory).get('sub:x'), 0)
