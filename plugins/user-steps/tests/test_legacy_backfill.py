@@ -234,6 +234,9 @@ def test_whether_title_gives_both_options(env):
     ('Choose whether to use A or B or C', []),
     ('Choose whether to restart the box now, or something else', []),
     ('Decide whether to keep the volume or shut it down', ['Keep the volume', 'Shut it down']),
+    # live hub ask 7c20f1fe: a 'confirm whether X, then do Y or Z' title is not an A-or-B choice
+    ('Confirm whether CI has moved to EKS, then unblock the gen-3/gen-4 on-demand switch or archive it', []),
+    ('Decide whether to check CI, then unblock the switch or archive it', []),
 ])
 def test_whether_alternatives(text, expected):
     assert core._whether_alternatives(text) == expected

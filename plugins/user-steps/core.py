@@ -2094,17 +2094,19 @@ def _question_alternatives(span: str, source: str) -> list[str]:
     return out
 
 
-_WHETHER = re.compile(r"\bwhether\s+(?:or\s+not\s+)?(?:to\s+)?(.+?)\s*,?\s+or\s+(?:to\s+)?(.+?)[\s.?!]*$", re.I)
+_WHETHER = re.compile(r"\bwhether\s+to\s+(.+?)\s*,?\s+or\s+(?:to\s+)?(.+?)[\s.?!]*$", re.I)
 
 
 def _whether_alternatives(text: str) -> list[str]:
     """The two alternatives of a 'Choose whether to A or B' step text (the title the card shows). Both are
-    verbatim slices of that title; an 'or not' / 'something else' tail, or a third 'or', yields none."""
+    verbatim slices of that title; an 'or not' / 'something else' tail, a third 'or', or a clause break inside an
+    option ('whether CI moved, then unblock X or archive it' is not two options) yields none."""
     m = _WHETHER.search(re.sub(r"[*_`]+", "", _ws(text)))
     if not m or re.search(r"\bor\b", m.group(1), re.I) or re.search(r"\bor\b", m.group(2), re.I):
         return []
     out = [part.strip(' ,;:') for part in m.groups()]
     if any(_ALT_OTHER.match(p) or re.fullmatch(r"not", p, re.I) or len(p.split()) < 2 or len(p) > OPTION_MAX
+           or re.search(r"[;:]|,\s*(?:then|and|so|but)\b|\bthen\b", p, re.I)
            for p in out):
         return []
     return [_cap(p) for p in out]
