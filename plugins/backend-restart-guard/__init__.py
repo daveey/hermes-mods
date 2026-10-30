@@ -47,7 +47,8 @@ def enabled() -> bool:
 def _segments(text: str) -> list[list[str]]:
     """argv lists split on shell control operators; unbalanced quoting falls back to whitespace splitting."""
     try:
-        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()\n")
+        lex.whitespace = " \t\r"  # unquoted newlines are command boundaries, not argument whitespace
         lex.whitespace_split = True
         lex.commenters = ""
         tokens = list(lex)
@@ -68,10 +69,10 @@ def _segments(text: str) -> list[list[str]]:
 
 def _is_wrapped(argv: list[str]) -> bool:
     """`<...>/hermes-sync pause-turns ... -- CMD` (optionally behind python/sudo/env)."""
-    for i, tok in enumerate(argv[:-1]):
-        if os.path.basename(tok) == "hermes-sync" and argv[i + 1] == "pause-turns":
-            return True
-    return False
+    argv = _strip(argv)
+    if argv and re.fullmatch(r"python(?:3(?:\.\d+)?)?", os.path.basename(argv[0])):
+        argv = argv[1:]
+    return len(argv) >= 2 and os.path.basename(argv[0]) == "hermes-sync" and argv[1] == "pause-turns"
 
 
 def _strip(argv: list[str]) -> list[str]:
@@ -99,10 +100,26 @@ def _check_argv(argv: list[str], depth: int = 0) -> Optional[str]:
         return None
     prog = os.path.basename(argv[0])
     args = argv[1:]
-    if prog in SHELLS and depth < 3 and "-c" in args and args.index("-c") + 1 < len(args):
-        return check_shell(args[args.index("-c") + 1], depth + 1)
-    if prog == "ssh" and depth < 3 and len(args) > 1:
-        return check_shell(" ".join(args[1:]), depth + 1)
+    if prog in SHELLS and depth < 3:
+        for i, arg in enumerate(args[:-1]):
+            if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", arg):
+                return check_shell(args[i + 1], depth + 1)
+    if prog == "ssh" and depth < 3:
+        # OpenSSH options with separate arguments must not become the remote program.
+        i = 0
+        takes_value = set("BbcDEeFIiJLlmOopQRSWw")
+        while i < len(args):
+            arg = args[i]
+            if arg == "--":
+                i += 1
+                break
+            if not arg.startswith("-") or arg == "-":
+                break
+            i += 1
+            if len(arg) == 2 and arg[1] in takes_value:
+                i += 1
+        # Skip the destination; ssh joins the remaining args into a remote shell string.
+        return check_shell(" ".join(args[i + 1:]), depth + 1)
     if prog == "systemctl":
         verbs = [a for a in args if not a.startswith("-")]
         if verbs and verbs[0] in DISRUPTIVE and any(UNIT.match(u) for u in verbs[1:]):
