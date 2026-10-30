@@ -6,7 +6,9 @@ identity, RPC dispatch and session persistence use their production paths.
 import sys
 import pytest
 
-pytest.importorskip('tui_gateway.server')
+from core_runtime import require_isolated_core
+
+require_isolated_core()
 from tests.tui_gateway.test_prompt_admission import owner  # noqa: F401
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

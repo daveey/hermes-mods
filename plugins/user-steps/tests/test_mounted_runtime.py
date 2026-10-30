@@ -3,7 +3,9 @@ import sys
 
 import pytest
 
-pytest.importorskip('tui_gateway.server')
+from core_runtime import require_isolated_core
+
+require_isolated_core()
 from fastapi.testclient import TestClient
 from hermes_cli import web_server, web_server_dashboard as dashboard
 from test_decisions import ROOT, request

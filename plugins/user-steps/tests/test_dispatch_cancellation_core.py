@@ -2,7 +2,9 @@
 import copy
 import pytest
 
-pytest.importorskip('tui_gateway.server')
+from core_runtime import require_isolated_core
+
+require_isolated_core()
 from tests.tui_gateway.test_prompt_admission import owner, call  # noqa: F401
 from tui_gateway import server
 from fastapi import FastAPI

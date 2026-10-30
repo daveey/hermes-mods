@@ -427,7 +427,13 @@ HERMES_DESKTOP_DIR=/path/to/test-dependencies node --test --test-reporter=tap de
 `sys.path`, so the real-core Kanban tests (`test_decision_card_real_core.py`, `test_card_delivery_core.py`)
 run instead of skipping. Inside a Kanban worker the delegated-write fence covers `~/.hermes`, so pass
 `--basetemp` outside it (e.g. `--basetemp ~/.cache/us-pytest`) or those tests skip. The three
-`tui_gateway` tests still need `run-core-integration.sh <core worktree>`.
+`tui_gateway` tests (`test_runtime_integration.py`, `test_dispatch_cancellation_core.py`,
+`test_mounted_runtime.py`) skip with that instruction unless core's `tests.conftest` is the
+active plugin; run them with `run-core-integration.sh <core worktree>`. `tests/core_runtime.py`
+gates them before any core import: importing `tui_gateway.server` from a self-updating install
+under a foreign interpreter (e.g. the legacy `~/.hermes/hermes-agent/.venv` python) lets core's
+bootstrap re-exec the pytest process into the install runtime, which has no pytest, and the run
+dies with exit 1 and no output.
 
 `HERMES_DESKTOP_DIR` points to a package directory containing React, react-dom,
 jsdom, esbuild and Playwright with installed Chromium. If omitted, the tests use
@@ -443,11 +449,14 @@ without bypassing that capability check.
 For the full backend suite, use an isolated core worktree with this feature:
 
 ```sh
-bash plugins/user-steps/run-core-integration.sh /path/to/isolated/core/worktree
+git -C ~/.hermes/hermes-agent worktree add --detach ~/code/hermes-core-wt-usteps HEAD   # once
+bash plugins/user-steps/run-core-integration.sh ~/code/hermes-core-wt-usteps
 ```
 
 This copies source fixtures into the core test checkout, runs the canonical isolated
-runner, and cleans those copies. It preserves the home-I/O and mutation guards.
+runner, and cleans those copies. It preserves the home-I/O and mutation guards. It refuses
+the live install itself (`$HERMES_HOME/hermes-agent`) and forwards extra arguments to
+`scripts/run_tests.sh` (e.g. `-k mounted`).
 Verified: 127 backend tests passed without skips, including actual FastAPI routing,
 runtime identity, RPC admission and durable user-row readback (model execution alone
 is suppressed), plus real-core card transactions. 115 DOM/browser/plugin tests
