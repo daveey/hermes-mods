@@ -29,9 +29,18 @@ def test_session_links_preserves_evidence_and_owner(hub):
 
 
 # Use a sibling isolated checkout by default, never an installed/live producer.
-# CI can point this explicitly at its hermes-hub source checkout.
-PRODUCER = Path(os.environ.get("HERMES_HUB_CLIENT_REAL") or
-                Path(__file__).resolve().parents[4] / "hub/client/hermes_hub.py")
+# CI can point this explicitly at its hermes-hub source checkout. The sibling is named
+# `hub` or `hermes-hub` depending on the host (hermes-hub on the hub).
+def _default_producer():
+    code = Path(__file__).resolve().parents[4]
+    for name in ("hub", "hermes-hub"):
+        cand = code / name / "client/hermes_hub.py"
+        if cand.is_file():
+            return cand
+    return code / "hub/client/hermes_hub.py"
+
+
+PRODUCER = Path(os.environ.get("HERMES_HUB_CLIENT_REAL") or _default_producer())
 
 
 @pytest.mark.parametrize("human_request", [EVIDENCE, {"action": "Choose a window."}])

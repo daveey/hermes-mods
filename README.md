@@ -140,4 +140,10 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 See [AGENTS.md](AGENTS.md). Every commit is scanned for secrets (`.githooks/pre-commit`, plus
 gitleaks in CI). The hook refuses to commit when gitleaks or the private denylist is missing;
 `./install.sh --tools` installs gitleaks (brew on macOS, the pinned release into `~/.local/bin` on Linux).
-Tests: `python3 -m unittest tests/test_precommit_hook.py tests/test_sqlite_ro_guard.py`.
+Tests: `scripts/test-all` runs every suite (`tests/`, each `plugins/<name>/`, `tools/*`) in its own process and
+prints one line per suite, then the tail of every failing one; it exits 0 only if all pass. A bare `pytest -q` at
+the repo root does not work: plugins reuse test-module names, some need a core checkout, and a test importing core's
+`hermes_bootstrap` can re-exec the interpreter and exit 1 with no output (the runner sets
+`HERMES_DISABLE_LAZY_INSTALLS=1` and reports such a death as `SILENT-EXIT`). Options: `-k NAME` (substring, repeatable),
+`-j N`, `--timeout SECS`, `--list`, `--hermes-core PATH` (also runs `tests/integration_f3`; skipped with a reason
+otherwise). Proof that one broken plugin is reported by name: `python3 -m pytest -q tests/test_test_all.py`.

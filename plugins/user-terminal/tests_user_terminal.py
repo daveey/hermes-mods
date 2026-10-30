@@ -50,6 +50,13 @@ def _confirm_env(monkeypatch):
     monkeypatch.delenv("HERMES_USER_TERMINAL_CONFIRM", raising=False)
 
 
+# The job runner wraps the command in BSD/macOS `script -q FILE cmd...`; util-linux `script` takes
+# `-c cmd FILE`, so tests that execute the runner script itself can only pass on macOS.
+needs_bsd_script = pytest.mark.skipif(sys.platform != "darwin",
+                                      reason="job runner uses macOS `script -q FILE cmd` syntax (util-linux differs)")
+
+
+@needs_bsd_script
 def test_default_runs_without_asking(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
     monkeypatch.setattr(ut, "confirm_mode", lambda: "off")
@@ -79,6 +86,7 @@ def test_confirm_file_follows_mode(tmp_path, monkeypatch, mode, origin, asks):
     assert (ut.create_job("true", "", str(tmp_path), origin) / "confirm").exists() is asks
 
 
+@needs_bsd_script
 def test_confirm_runs_and_captures(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
     job = ut.create_job("echo hello-from-job; exit 3", "testing", str(tmp_path), confirm=True)
@@ -331,6 +339,7 @@ class FakeCourier(threading.Thread):
             time.sleep(0.1)
 
 
+@needs_bsd_script
 def test_round_trip_remote_to_mac_and_back(remote, monkeypatch, tmp_path):
     base, mac = remote
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
