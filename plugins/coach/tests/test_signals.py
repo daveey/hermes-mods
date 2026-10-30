@@ -925,6 +925,14 @@ def _worker_home(tmp_path):
     return h
 
 
+def _primed_worker_home(tmp_path):
+    """A worker home whose (empty) log the detector has already seen once, so crashes appended after it are new
+    (the first pass over a log only seeds the cursor: kanban-e001f2d4a0)."""
+    h, cur = _worker_home(tmp_path), {}
+    assert _storms(sg.collect(h, cur, "hubhost", NOW - 600)) == []
+    return h, cur
+
+
 def _append_worker(h, *blocks):
     with (h / "logs" / "managed-worker.log").open("a") as f:
         f.write("".join(blocks))
@@ -936,7 +944,7 @@ def _storms(sigs):
 
 def test_worker_crash_storm_across_two_passes_files_one_signal(tmp_path):
     """(a) 3 pids dying with the same exception over two passes file exactly one storm signal."""
-    h, cur = _worker_home(tmp_path), {}
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, _worker_block(101), _worker_block(102))
     assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
     _append_worker(h, _worker_block(103))
@@ -956,30 +964,30 @@ def test_worker_crash_storm_across_two_passes_files_one_signal(tmp_path):
 
 def test_two_worker_crashes_are_not_a_storm(tmp_path):
     """(b) 2 pids give none."""
-    h = _worker_home(tmp_path)
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, _worker_block(101), _worker_block(102))
-    assert _storms(sg.collect(h, {}, "hubhost", NOW)) == []
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
 
 
 def test_three_different_worker_exceptions_are_not_a_storm(tmp_path):
     """(c) 3 pids with 3 different exceptions give none."""
-    h = _worker_home(tmp_path)
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, _worker_block(101, "agent.a.FooError", "foo broke"),
                    _worker_block(102, "agent.b.BarError", "bar broke"),
                    _worker_block(103, "ValueError", "baz broke"))
-    assert _storms(sg.collect(h, {}, "hubhost", NOW)) == []
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
 
 
 def test_worker_storm_message_numbers_are_normalized(tmp_path):
     """the same crash with a different pid/number in its message is still one storm"""
-    h = _worker_home(tmp_path)
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, *[_worker_block(p, "RuntimeError", f"worker {p} lost lease 7{p}") for p in (101, 102, 103)])
-    assert len(_storms(sg.collect(h, {}, "hubhost", NOW))) == 1
+    assert len(_storms(sg.collect(h, cur, "hubhost", NOW))) == 1
 
 
 def test_worker_storm_continuing_inside_the_window_files_no_second_signal(tmp_path):
     """(d) the storm keeps going in the next pass inside WORKER_STORM_S: no second signal; after it, one again."""
-    h, cur = _worker_home(tmp_path), {}
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, *[_worker_block(p) for p in (101, 102, 103)])
     assert len(_storms(sg.collect(h, cur, "hubhost", NOW))) == 1
     _append_worker(h, *[_worker_block(p) for p in (104, 105, 106, 107)])
@@ -989,7 +997,7 @@ def test_worker_storm_continuing_inside_the_window_files_no_second_signal(tmp_pa
 
 
 def test_worker_crashes_outside_the_window_do_not_add_up(tmp_path):
-    h, cur = _worker_home(tmp_path), {}
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, _worker_block(101), _worker_block(102))
     sg.collect(h, cur, "hubhost", NOW)
     _append_worker(h, _worker_block(103))
@@ -998,7 +1006,7 @@ def test_worker_crashes_outside_the_window_do_not_add_up(tmp_path):
 
 def test_worker_log_cursor_advances_so_lines_are_never_reread(tmp_path):
     """(f) a pass reads each line once: the same 2 crashes never count twice, and the cursor offset moves."""
-    h, cur = _worker_home(tmp_path), {}
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, _worker_block(101), _worker_block(102))
     sg.collect(h, cur, "hubhost", NOW)
     size = (h / "logs" / "managed-worker.log").stat().st_size
@@ -1010,10 +1018,45 @@ def test_worker_log_cursor_advances_so_lines_are_never_reread(tmp_path):
     assert cur["worker:default"]["off"] == size
 
 
+def test_worker_backlog_at_first_sight_files_nothing(tmp_path):
+    """kanban-e001f2d4a0: the log has no timestamps, so crashes already in it when the detector first reads it
+    (new host, new profile, cursor reset) are old news, not a live storm: the first pass only seeds the cursor."""
+    h, cur = _worker_home(tmp_path), {}
+    _append_worker(h, *[_worker_block(p) for p in range(39500, 39525)])
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+    assert cur["worker:default"]["off"] == (h / "logs" / "managed-worker.log").stat().st_size
+    assert _storms(sg.collect(h, cur, "hubhost", NOW + 60)) == []
+
+
+def test_worker_storm_after_first_sight_still_files(tmp_path):
+    """after the first (seeding) pass, 3 new crash blocks still file one storm, and the details say which byte
+    range of the log the crashes came from (so a late or replayed signal is visible in the card evidence)."""
+    h, cur = _worker_home(tmp_path), {}
+    _append_worker(h, *[_worker_block(p) for p in range(201, 226)])
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+    start = (h / "logs" / "managed-worker.log").stat().st_size
+    _append_worker(h, *[_worker_block(p) for p in (301, 302, 303)])
+    end = (h / "logs" / "managed-worker.log").stat().st_size
+    st = _storms(sg.collect(h, cur, "hubhost", NOW + 60))
+    assert len(st) == 1, st
+    d = st[0]["details"]
+    assert all(p in d for p in ("301", "302", "303")) and "201" not in d
+    assert "first seen this pass" in d and f"bytes {start}-{end}" in d
+
+
+def test_worker_log_missing_at_first_sight_then_created_counts_its_crashes(tmp_path):
+    """a log that does not exist yet at first sight is seeded at offset 0: crashes written into it later are new."""
+    h, cur = tmp_path / "home", {}
+    (h / "logs").mkdir(parents=True)
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+    _append_worker(h, *[_worker_block(p) for p in (101, 102, 103)])
+    assert len(_storms(sg.collect(h, cur, "hubhost", NOW + 60))) == 1
+
+
 def test_worker_storm_scrubs_secrets_from_details(tmp_path):
-    h = _worker_home(tmp_path)
+    h, cur = _primed_worker_home(tmp_path)
     _append_worker(h, *[_worker_block(p, "RuntimeError", "bad key sk-ant-abc123DEF456ghi789") for p in (1, 2, 3)])
-    st = _storms(sg.collect(h, {}, "hubhost", NOW))
+    st = _storms(sg.collect(h, cur, "hubhost", NOW))
     assert len(st) == 1 and "sk-ant-abc123" not in st[0]["details"] + st[0]["symptom"]
 
 

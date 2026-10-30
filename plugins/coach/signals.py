@@ -169,8 +169,9 @@ def homes(home: Path) -> List[Tuple[str, Path]]:
     return out
 
 
-def read_new(path: Path, cur: dict, key: str, now: float) -> List[str]:
-    """New complete lines of `path` since cur[key] = {"ino", "off"}; updates cur. First sight: the last MAX_READ."""
+def read_new(path: Path, cur: dict, key: str, now: float, span: Optional[list] = None) -> List[str]:
+    """New complete lines of `path` since cur[key] = {"ino", "off"}; updates cur. First sight: the last MAX_READ.
+    `span`, if given, receives the [start, end) byte range consumed."""
     try:
         st = path.stat()
     except OSError:
@@ -188,10 +189,27 @@ def read_new(path: Path, cur: dict, key: str, now: float) -> List[str]:
         data = f.read(st.st_size - off)
     end = data.rfind(b"\n") + 1  # leave a half-written last line for the next pass
     cur[key] = {"ino": st.st_ino, "off": off + end}
+    if span is not None:
+        span[:] = [off, off + end]
     lines = data[:end].decode("utf-8", "replace").splitlines()
     if off and lines and not c:  # started mid-file: the first line may be partial
         lines = lines[1:]
     return lines
+
+
+def seed_only_first_sight(path: Path, cur: dict, key: str) -> bool:
+    """For logs whose lines carry no timestamp: on first sight (no cursor for `key`) set the cursor at the end of
+    `path` and return True, so the caller files nothing. A backlog read on first sight (new host, new profile,
+    cursor reset) cannot be told from new lines and would replay old events as live (kanban-e001f2d4a0). A log
+    that does not exist yet is seeded at offset 0 (ino None), so everything later written to it counts as new."""
+    if cur.get(key):
+        return False
+    try:
+        st = path.stat()
+        cur[key] = {"ino": st.st_ino, "off": st.st_size}
+    except OSError:
+        cur[key] = {"ino": None, "off": 0}
+    return True
 
 
 # ── collectors: each returns raw signals {kind, key, component, symptom, details, at, session_id?, quote?, fp} ─
@@ -492,7 +510,8 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
                                f"with {c['exc'].split('.')[-1]}: {_scrub(c['msg'])[:120]}",
                     "details": _scrub(f"{len(pids)} managed kanban workers died with {c['exc']} within "
                                       f"{WORKER_STORM_S // 60} min (logs/managed-worker.log). pids: "
-                                      f"{', '.join(pids)}\nLatest (pid {c['pid']}):\n{tb}")[:1500],
+                                      f"{', '.join(pids)}\n{_span_note(c)}"
+                                      f"Latest (pid {c['pid']}):\n{tb}")[:1500],
                     "fp": fp("kanban", "worker-storm", c["exc"], norm)})
     if evs or filed:
         cur["worker_storm"] = {"ev": evs[-200:], "filed": filed}
@@ -501,11 +520,26 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
     return out
 
 
+def _span_note(c: dict) -> str:
+    """Where the latest crash came from: the log has no timestamps, so the byte range read this pass is what
+    shows a late or replayed signal in the card evidence (kanban-e001f2d4a0)."""
+    if not c.get("span"):
+        return ""
+    prof = c.get("profile") or "default"
+    return (f"Latest crash first seen this pass in {prof} logs/managed-worker.log bytes "
+            f"{c['span'][0]}-{c['span'][1]} (log lines carry no timestamps).\n")
+
+
 def collect_worker(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     crashes: List[dict] = []
     for prof, h in homes(home):
-        for c in parse_worker_crashes(read_new(h / "logs" / "managed-worker.log", cur, f"worker:{prof}", now)):
+        path, key = h / "logs" / "managed-worker.log", f"worker:{prof}"
+        if seed_only_first_sight(path, cur, key):
+            continue  # first sight: the backlog is old crashes, not a live storm (kanban-e001f2d4a0)
+        span: list = []
+        for c in parse_worker_crashes(read_new(path, cur, key, now, span)):
             c["pid"] = c["pid"] if prof == "default" else f"{prof}:{c['pid']}"
+            c["profile"], c["span"] = prof, list(span)
             crashes.append(c)
     return worker_storms(cur, crashes, now, host)
 
