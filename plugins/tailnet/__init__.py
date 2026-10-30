@@ -16,7 +16,9 @@ turn uses the auto-tier scope and runs now. Any other turn (channel thread, anot
 approval-tier broker request (grant=once) that DMs the owner host + command + requester; the command runs only
 when the model calls the tool again with that request_id after the owner approved, and it runs the command
 stored with the request, not new model text. Only the same Slack user + channel (or the owner's DM) can collect
-it. MAC_OPS_* identity is honoured only outside a gateway process. This plugin never approves anything.
+it. MAC_OPS_* identity is honoured only outside a gateway process. This plugin never approves anything. The one
+exception to the request is a profile's own ``auto_hosts`` opt-in: its local turns (no chat user) run on the auto
+scope on those hosts, audited with ``approval: auto_hosts``.
 
 Approval text (shown in full, never cut; refused if over the broker's 1000-char limit): gateway-bound requester,
 host and a sha256 of the exact job first, then the model-written reason/command JSON-quoted so they can't fake a
@@ -28,6 +30,7 @@ Config (profile config.yaml)::
       enabled: true
       hosts_file: ~/.hermes/tailnet/hosts.yaml     # default: <hermes home>/tailnet/hosts.yaml
       broker: ~/.local/bin/token-broker
+      auto_hosts: [mini]     # this profile's local turns (CLI, Desktop, cron; never a chat user) skip approval here
 
 hosts.yaml::
 
@@ -73,6 +76,8 @@ ADDR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,100}$")
 USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,40}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,100}$")
 REQ_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f-]{27}|req_[A-Za-z0-9_-]{6,60}|[A-Za-z0-9_-]{8,64}")
+AUTO = "auto_hosts"       # audit value of `approval` for a turn local_auto let through
+LOCAL_USER_RE = re.compile(r"^(?:uid|sid):[A-Za-z0-9_-]+$")  # the gateway's same-user local peer ids
 KEY_BLOCK = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S)
 
 
@@ -191,6 +196,15 @@ def requester(inv: Inventory, extra_owners: frozenset = frozenset()) -> dict:
                 and chat.startswith("D"))
     return {"owner": bool(is_owner), "user": user or "", "channel": chat, "thread": thread, "name": name,
             "platform": platform, "via": "session", "bot_home": ""}
+
+
+def local_auto(req: dict, host: str) -> bool:
+    """True when this profile's ``tailnet.auto_hosts`` lists the host and the turn has no chat user behind it: no
+    identity at all (CLI, cron) or the gateway's local peer in a local chat (Desktop). Read per profile, so it never
+    reaches a profile that faces Slack, and a Slack id or channel never matches."""
+    hosts = {str(h).strip().lower() for h in settings().get("auto_hosts") or []}
+    user, chat = req.get("user") or "", req.get("channel") or ""
+    return host in hosts and ((not user and not chat) or bool(LOCAL_USER_RE.match(user) and chat.startswith("local-")))
 
 
 def who(req: dict) -> str:
@@ -422,7 +436,7 @@ def _finish(kind: str, host: str, what: str, req: dict, why: str, scope: str, re
     audit(rec)
     status = "rc=%s" % rc if res.get("ran") else "did not run"
     thread_line(req, f"tailnet {kind} on {host}: `{what[:160]}` -> {status} "
-                     f"({'owner DM' if req['owner'] else 'approved'}; scope {scope})")
+                     f"({'owner DM' if req['owner'] else approval if approval == AUTO else 'approved'}; scope {scope})")
     if not res.get("ran"):
         return json.dumps({"ok": False, "ran": False, "error": res.get("error"), "detail": res.get("detail")})
     return json.dumps({"ok": rc == 0, "ran": True, "host": host, "rc": rc, "stdout": out, "stderr": err,
@@ -431,16 +445,23 @@ def _finish(kind: str, host: str, what: str, req: dict, why: str, scope: str, re
 
 def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, payload: dict,
           args: dict, timeout: int, extra: str = "", prepare: Optional[Callable[[dict], dict]] = None) -> str:
-    """Owner DM turn -> run now on the auto scope. Otherwise open (or collect) a per-command approval.
+    """Owner DM turn, or a local turn on an auto_hosts host -> run now on the auto scope. Otherwise open (or
+    collect) a per-command approval.
 
     ``prepare`` (non-owner new requests only) may pin request-specific state into the payload, e.g. a
     content-addressed copy of a file to upload, before it is fingerprinted and shown to the owner."""
     rid = str(args.get("request_id") or "").strip()
-    if req["owner"] and not rid:
+    if prepare and not rid and not req["owner"]:
+        try:
+            payload = prepare(payload)
+        except Exception as exc:
+            return _jerr(f"cannot stage the request: {type(exc).__name__}", ran=False)
+    auto = not rid and not req["owner"] and local_auto(req, host)
+    if (req["owner"] or auto) and not rid:
         fp = fingerprint(payload)
         res = run_via_broker(inv.scope, _reason(kind, host, what, req, why, fp, extra)[:MAX_REASON], payload,
                              timeout=timeout)
-        return _finish(kind, host, what, req, why, inv.scope, res)
+        return _finish(kind, host, what, req, why, inv.scope, res, approval=AUTO if auto else "")
     pending = _pending_load()
     if rid:
         p = pending.get(rid)
@@ -476,11 +497,6 @@ def _gate(inv: Inventory, req: dict, kind: str, host: str, what: str, why: str, 
         return _finish(p["kind"], p["host"], p["what"], {"owner": False, "user": req["user"], "channel": req["channel"],
                                                          "thread": req["thread"]}, p["why"], inv.approval_scope, res,
                        approval=rid)
-    if prepare:
-        try:
-            payload = prepare(payload)
-        except Exception as exc:
-            return _jerr(f"cannot stage the request: {type(exc).__name__}", ran=False)
     fp = fingerprint(payload)
     reason = _reason(kind, host, what, req, why, fp, extra)
     if len(reason) > MAX_REASON:
@@ -641,7 +657,7 @@ SCHEMAS = {
                       "tailnet_exec. Lists names only; no credentials.", {}, [], tool_hosts),
     "tailnet_exec": ("Run a shell command on one of the owner's tailnet machines over ssh. Credentials come from the "
                      "token broker per call and never reach you. In the owner's own Slack DM it runs now. For anyone "
-                     "else, or any other context, it opens an approval request that DMs the owner the host, command "
+                     "else, or any other context (unless this profile lists the host in auto_hosts), it opens an approval request that DMs the owner the host, command "
                      "and requester and returns a request_id; nothing runs until the owner approves, then call again "
                      "with request_id. Use this instead of refusing or handing someone a command to paste.",
                      {"host": {"type": "string"}, "command": {"type": "string"},

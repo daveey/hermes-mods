@@ -112,6 +112,8 @@ def env(tmp_path, monkeypatch):
                      ("THREAD_ID", thread), ("USER_NAME", name)):
             monkeypatch.setenv("HERMES_SESSION_" + k, v)
     e.session = session
+    e.auto_hosts = lambda hosts: monkeypatch.setattr(
+        tn, "settings", lambda: {"broker": str(bindir / "token-broker"), "auto_hosts": hosts})
     e.broker_log = lambda: [json.loads(x) for x in (state / "broker.log").read_text().splitlines()] \
         if (state / "broker.log").exists() else []
     e.ssh_log = lambda: [json.loads(x) for x in (state / "ssh.log").read_text().splitlines()] \
@@ -180,6 +182,61 @@ def test_non_owner_turn_requests_approval_and_runs_nothing(env, sess):
 
 def test_no_session_at_all_is_non_owner(env):
     r = call(tn.tool_exec, host="mini", command="hostname", reason="from cron")
+    assert r["status"] == "approval_requested" and env.ssh_log() == []
+
+
+# ---- tailnet.auto_hosts: local turns skip approval on the listed hosts only
+
+DESKTOP = dict(platform="api_server", ctype="dm", chat="local-abc123", user="uid:1000")
+
+
+@pytest.mark.parametrize("sess", [None, DESKTOP, dict(DESKTOP, user="sid:a1"),
+                                  dict(platform="cron", ctype="", chat="", user="")])
+def test_auto_hosts_local_turn_runs_now_on_auto_scope(env, sess):
+    env.auto_hosts(["MINI"])
+    if sess:
+        env.session(**sess)
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="from a local session")
+    assert r["ran"] and r["ok"]
+    (b,) = env.broker_log()
+    assert b[0] == "exec" and b[b.index("--scope") + 1] == "user/tailnet-ssh-key" and "--request-id" not in b
+    a = env.audit()[-1]
+    assert a["ran"] and a["approval"] == "auto_hosts" and not a["owner_turn"]
+
+
+def test_auto_hosts_local_put_runs_the_pinned_content(env):
+    env.auto_hosts(["mini"])
+    r = call(tn.tool_copy, host="mini", direction="put", remote_path="/tmp/x", local_name="x", content="hi",
+             reason="from a local session")
+    assert r["ran"] and env.broker_log()[0][0] == "exec"
+    assert not (env.home / "tailnet" / "files" / "x").exists()     # shared staging stays owner-only
+    assert env.ssh_log()[0]["prog"] == "scp"
+
+
+def test_auto_hosts_does_not_cover_other_hosts(env):
+    env.auto_hosts(["mini"])
+    r = call(tn.tool_exec, host="imac", command="hostname", reason="from a local session")
+    assert r["status"] == "approval_requested" and env.ssh_log() == []
+
+
+def test_no_auto_hosts_keeps_approval_for_local_turns(env):
+    env.session(**DESKTOP)
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="from a local session")
+    assert r["status"] == "approval_requested" and env.ssh_log() == []
+
+
+@pytest.mark.parametrize("sess", [
+    dict(ctype="channel", chat="C0CHAN", user=OWNER),      # owner, but in a channel
+    dict(ctype="channel", chat="C0CHAN", user="U0OTHER"),  # someone else in a channel
+    dict(ctype="im", chat="D0OTHER", user="U0OTHER"),      # someone else's DM
+    dict(ctype="im", chat="local-abc", user="U0OTHER"),    # a real user id in a local-looking chat
+    dict(ctype="channel", chat="C0CHAN", user="uid:1000"), # a local-looking id in a real channel
+    dict(ctype="channel", chat="C0CHAN", user=""),         # a channel with no user id
+])
+def test_auto_hosts_never_covers_a_chat_turn(env, sess):
+    env.auto_hosts(["mini"])
+    env.session(**sess)
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="from a chat")
     assert r["status"] == "approval_requested" and env.ssh_log() == []
 
 
