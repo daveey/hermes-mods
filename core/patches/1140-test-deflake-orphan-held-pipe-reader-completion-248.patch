@@ -1,0 +1,243 @@
+From 37463a2e7b5c0332c6b751555f86ac09b75ab513 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:41:04 -0700
+Subject: [PATCH 1140/1157] test: deflake orphan-held pipe reader completion
+ (#248)
+
+* perf(serve): parent-death watchdog verifies the start marker once per 30s instead of forking ps every 2s
+
+* fix: narrow except
+
+* test: synchronize orphan-pipe reader regressions on child exit [daveey]
+
+* fix(tools): a deleted process cwd no longer crashes execute_code or the file tools [daveey]
+
+A backend whose cwd was removed (worktree shipped or GC'd) failed every
+execute_code call with 'dispatch error: [Errno 2]': _resolve_child_cwd
+evaluated a bare os.getcwd() before its own staging-dir fallback. Add
+agent.runtime_cwd.process_cwd() ("" on FileNotFoundError/PermissionError),
+build terminal_tool_config._safe_getcwd on it, and route every tools/ cwd
+consumer through it (code_execution_env, file_tools_paths, mcp_tool_config,
+file_operations_search, process_registry, environments/local).
+
+tests/tools/test_deleted_process_cwd.py: regressions for each path plus an
+AST guard that fails on any new unguarded os.getcwd() under tools/.
+
+* fix(kanban): comments record origin_gateway; wait-comment probe; refuse author-matching wake checks; wake_probe_stale [daveey]
+
+A parked card's wake check counted comments WHERE author='macbook'; the Mac's reply arrived through the
+example-hub relay as 'hub:gw:macbook', so t_01a17f81686694ec stayed parked 38 h after the answer
+(self-heal desktop-00c4a3bda2).
+
+- task_comments.origin_gateway (nullable, machine-local, back-filled from hub:gw:<x> / <x>/t_... authors);
+  add_comment(origin_gateway=) / 'kanban comment --origin-gateway' (relay sender), default from the author
+  spelling, else this gateway.
+- 'hermes kanban wait-comment <task> --after-id N [--from-gateway X] [--contains T]': 0 match, 1 not yet,
+  2 cannot tell; a gateway matches origin_gateway or any author spelling of it.
+- Park guard (kanban_awaiting.resolve): a wake_check filtering task_comments by author (=, like, glob, in)
+  is refused with code author_probe naming the wait-comment command; author != own still parks.
+  Off switch: kanban.author_probe_guard: false. wake_check tool description says so.
+- Detection: wake_probe_stale. A parked card whose reason/probe names a example-hub request whose owner card
+  is done, while its probe still exits 1, wakes once with a dispatcher comment.
+
+Tests: tests/hermes_cli/test_kanban_comment_origin.py (16 red before, 19 green after).
+
+* refactor(kanban): comment-id queries move to kanban_db_comment_ids; origin migration in kanban_comment_origin; narrow excepts [daveey]
+
+Code-health offsets for the origin_gateway change: kanban_db.py stays under its line cap,
+_migrate_add_optional_columns under CC 20, no blind excepts.
+
+* fix(plugins): serve has_hook from a fingerprint-checked hook record so cold kanban assign skips plugin discovery [daveey]
+
+assign_task -> notify_task_updated -> has_hook ran a full plugin discovery in every
+cold gate helper (38-57s under macOS background QoS on the mini). Every discovery
+now records the hook names its plugins handle (registered or manifest-declared),
+stamped with the pre-sweep plugins_snapshot fingerprint, in cache/plugin_hooks.json.
+has_hook on an undiscovered manager answers from that record while the fingerprint
+matches; True still discovers in the invoke that follows. Missing, stale or corrupt
+records, and sweeps in which a plugin load timed out, fall back to full discovery.
+
+* test+docs: manifest-declared hook served True; hook-registration contract [daveey]
+
+* test: synchronize orphan-pipe reader regressions on child exit [daveey]
+---
+ tests/tools/process_registry_fixtures.py | 48 ++++++++++++++++++++
+ tests/tools/test_process_registry.py     | 58 ++++++++----------------
+ 2 files changed, 68 insertions(+), 38 deletions(-)
+ create mode 100644 tests/tools/process_registry_fixtures.py
+
+diff --git a/tests/tools/process_registry_fixtures.py b/tests/tools/process_registry_fixtures.py
+new file mode 100644
+index 00000000000..3bfd04d3d9f
+--- /dev/null
++++ b/tests/tools/process_registry_fixtures.py
+@@ -0,0 +1,48 @@
++"""Real-process fixtures for process-registry pipe regressions."""
++
++import os
++import signal
++import subprocess
++import sys
++
++import pytest
++
++
++@pytest.fixture()
++def orphan_pipe():
++    """An exited direct child with stdout held by an explicitly released orphan."""
++    # A sleep would eventually release stdout and let a broken blocking reader
++    # pass. Keep the orphan alive until teardown, regardless of runner load.
++    proc = subprocess.Popen(
++        [sys.executable, "-c", """
++import os
++# orphan-pipe-fixture
++if os.fork() == 0:
++    os.read(0, 1)
++    os._exit(0)
++print('started', flush=True)
++os._exit(0)
++"""],
++        stdin=subprocess.PIPE,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        text=True,
++        encoding="utf-8",
++        errors="replace",
++        start_new_session=True,
++    )
++    try:
++        # Child startup is not reader completion: establish that precondition
++        # separately so descheduling the child doesn't consume the reader budget.
++        assert proc.wait(timeout=60) == 0
++        yield proc
++    finally:
++        # The known group ID survives reaping its leader; getpgid(proc.pid)
++        # doesn't, and would leak the orphan after wait()/poll().
++        try:
++            os.killpg(proc.pid, signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        proc.wait(timeout=60)
++        proc.stdin.close()
++        proc.stdout.close()
+diff --git a/tests/tools/test_process_registry.py b/tests/tools/test_process_registry.py
+index 7b2518e73a7..c4abb655ba5 100644
+--- a/tests/tools/test_process_registry.py
++++ b/tests/tools/test_process_registry.py
+@@ -12,6 +12,7 @@ import time
+ import pytest
+ from unittest.mock import MagicMock, patch
+ 
++from tests.tools import process_registry_fixtures
+ from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+ from tools.process_registry import (
+     ProcessRegistry,
+@@ -21,6 +22,9 @@ from tools.process_registry import (
+ )
+ 
+ 
++orphan_pipe = process_registry_fixtures.orphan_pipe
++
++
+ @pytest.fixture()
+ def registry():
+     """Create a fresh ProcessRegistry."""
+@@ -2019,7 +2023,7 @@ class TestHandleProcessTransformHook:
+ # Reader loop: orphaned grandchild holding the stdout pipe (issue #68915)
+ # =========================================================================
+ 
+-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: select() on pipes")
++@pytest.mark.platforms("posix")
+ class TestReaderLoopOrphanedPipe:
+     """Regression tests for issue #68915.
+ 
+@@ -2032,18 +2036,9 @@ class TestReaderLoopOrphanedPipe:
+     a descendant still holds the pipe open.
+     """
+ 
+-    def test_reader_exits_when_orphan_holds_pipe(self, registry):
+-        """Reader loop must return promptly after the direct child exits,
+-        even though a backgrounded descendant keeps the pipe open."""
+-        proc = subprocess.Popen(
+-            ["sh", "-c", "echo started; sleep 30 & exit 0"],
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-            text=True,
+-            encoding="utf-8",
+-            errors="replace",
+-            start_new_session=True,
+-        )
++    def test_reader_exits_when_orphan_holds_pipe(self, registry, orphan_pipe):
++        """Completion must not require EOF from the orphan-held stdout pipe."""
++        proc = orphan_pipe
+         s = _make_session(sid="proc_orphan_reader")
+         s.process = proc
+         s.pid = proc.pid
+@@ -2058,9 +2053,9 @@ class TestReaderLoopOrphanedPipe:
+         t = threading.Thread(target=_run, daemon=True)
+         t.start()
+         try:
+-            # The direct child exits immediately; the reader must notice and
+-            # return well before the 30s descendant releases the pipe.
+-            assert done.wait(timeout=10.0), (
++            # The fixture still holds the orphan's stdin open, so stdout cannot
++            # reach EOF even if this runner is descheduled for a long time.
++            assert done.wait(timeout=60.0), (
+                 "_reader_loop is still blocked on the orphan-held pipe "
+                 "(issue #68915) — session.exited would never flip and "
+                 "notify_on_complete would never fire"
+@@ -2071,23 +2066,12 @@ class TestReaderLoopOrphanedPipe:
+             assert "started" in s.output_buffer
+             assert s.id in registry._finished
+         finally:
+-            try:
+-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+-            except (ProcessLookupError, PermissionError):
+-                pass
+-
+-    def test_reader_exit_fires_notify_on_complete(self, registry):
+-        """The autonomous completion notification must not depend on a
+-        poll()/wait() call when an orphan holds the pipe."""
+-        proc = subprocess.Popen(
+-            ["sh", "-c", "sleep 30 & echo bg-started"],
+-            stdout=subprocess.PIPE,
+-            stderr=subprocess.STDOUT,
+-            text=True,
+-            encoding="utf-8",
+-            errors="replace",
+-            start_new_session=True,
+-        )
++            proc.stdin.close()
++            t.join(timeout=60)
++
++    def test_reader_exit_fires_notify_on_complete(self, registry, orphan_pipe):
++        """Autonomous notification must not depend on a poll()/wait() call."""
++        proc = orphan_pipe
+         s = _make_session(sid="proc_orphan_notify")
+         s.process = proc
+         s.pid = proc.pid
+@@ -2103,7 +2087,7 @@ class TestReaderLoopOrphanedPipe:
+         t = threading.Thread(target=_run, daemon=True)
+         t.start()
+         try:
+-            assert done.wait(timeout=10.0), (
++            assert done.wait(timeout=60.0), (
+                 "_reader_loop blocked — completion notification lost (#68915)"
+             )
+             # Exactly one completion event must have been queued.
+@@ -2112,10 +2096,8 @@ class TestReaderLoopOrphanedPipe:
+             assert item["session_id"] == s.id
+             assert item["exit_code"] == 0
+         finally:
+-            try:
+-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+-            except (ProcessLookupError, PermissionError):
+-                pass
++            proc.stdin.close()
++            t.join(timeout=60)
+ 
+ # =========================================================================
+ # systemd cgroup isolation for gateway-spawned local executors (#70716)
+-- 
+2.55.0
+

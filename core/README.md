@@ -14,12 +14,27 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1134 patches, one entry per non-merge source commit through `3c5a9b706d469de90c8a876a7cdcb3f84b90a7ac`.
+1157 patches, one entry per non-merge source commit through `91edcccfb07ff63042a60d5fb7d1745c2ea8130f`.
 Canonical ordinals follow `git log --reverse --no-merges upstream/main..origin/main` at the frozen snapshot.
-Upstream exclusion tip and merge-base: `088f657ecf77674c7b8e2ededf4e3576d82e042c`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
-The current snapshot's reconciliation and executed checks are in [mirror-1134-verification.md](mirror-1134-verification.md).
+Upstream exclusion tip: `ef35e8b9e1a8bc7f0efb50e4f2d68f1ec052f6a8`; merge-base: `5608b5faf19ac22d023e62a8fd9675a42d1a61c6`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
+The current snapshot's executed checks are in [mirror-1157-verification.md](mirror-1157-verification.md); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Append-only follow-ups after 1134
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Bounded update pauses and pending clarification](update-pause-followups.md) | 1135 1143 | Pause cap and clarify withdrawal. |
+| [Stable discovery records](plugin-metadata-fingerprint.md) | 1137 1138 | Ignore metadata-only ctime; preserve inode invalidation. |
+| [CI prerequisites](ci-planner-and-tmux.md) | 1139 1156 | Planner source graph and test-job tmux. |
+| [Runtime test synchronization](runtime-test-synchronization.md) | 1136 1140 1146 1147 1148 1155 1157 | Event-based tests and current gateway fixtures. |
+| [Annotation prewarm](annotation-prewarm.md) | 1141 | Read the session-list annotation during serve boot. |
+| [Source tags and class routing](session-source-class-routing.md) | 1142 1144 1149 1152 1153 | Refusal fields, tool labels, worker and CLI class policy. |
+| [Remote notice acknowledgement evidence](remote-notice-ack-evidence.md) | 1145 | Distinguish keyed delivery from stale settlement. |
+| [Worker capability relay](worker-capability-relay.md) | 1150 | Route needs through the card's home gateway. |
+| [Managed worker environment identity](managed-worker-env-identity.md) | 1151 | Recognize the bound live worker ancestor. |
+| [Custom-label launchd gateway](custom-label-launchd-gateway.md) | 1154 | Exact-home supervisor discovery, detached restart and manual-owner handback. |
 
 ## Newly reconciled feature and compatibility entries
 

@@ -1,0 +1,960 @@
+From f4edd107899c9832f5266d8b818df102a34dc9c7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 23:17:05 -0700
+Subject: [PATCH 1150/1157] fix(kanban): worker-node capability routing relays
+ to the card's home gateway [daveey]
+
+A Board worker node runs no example-hub sync, so kanban_block(needs=[...]) there found no holder
+(no hub.db) and answered no_capability_holder; worker-1 run 10113 of MacBook card
+t_01a18b13ee350599 then asked David to run the Mac tests by hand.
+
+- route(): without a replica, a copied card parks on the same capability-owner ids, relayed to its
+  home gateway (created_on); the home's wake probe (owner_status) routes it with its own registry:
+  create-task to a remote holder, or a local owner card (idempotency_key = request id, runs_on
+  machine:<home>) when the home holds the need. A worker node's own card gets
+  capability_registry_unavailable instead of a misleading no_capability_holder.
+- A holder record that lapsed recently (restart/sleep) parks and retries for RELAY_RETRY_S instead
+  of refusing; after the window the card wakes with the typed error. Hours-old data still refuses.
+- human_request lint: agent_route_gap refuses 'run X and paste results' asks justified by a failed
+  agent route; agent_relay_ask also matches 'from a Hermes chat there'.
+- Placement on a worker node says it has no replica and names the needs= route.
+---
+ hermes_cli/kanban_awaiting.py                 |   2 +-
+ hermes_cli/kanban_block_policy.py             |  43 +-
+ hermes_cli/kanban_capability_routing.py       | 382 ++++++++++++++++--
+ hermes_cli/kanban_placement.py                |  13 +-
+ .../test_kanban_capability_relay.py           | 277 +++++++++++++
+ .../test_kanban_capability_routing.py         |   2 +
+ tests/tools/test_kanban_agent_relay_ask.py    |  44 ++
+ 7 files changed, 726 insertions(+), 37 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_capability_relay.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 5aac903c807..6fd5a08126a 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -349,7 +349,7 @@ def _check_card(conn: sqlite3.Connection, task_id: str, awaiting: dict, text: st
+         # A cross-gateway capability owner card, named by its hermes-hub request id until the holder
+         # applies it (kanban_capability_routing). Live while the request is pending or the card runs.
+         from hermes_cli.kanban_capability_routing import owner_status
+-        rc, out = owner_status(ref)
++        rc, out = owner_status(ref, conn)  # this txn's conn: a relay's route event is not committed yet
+         if rc == 2:
+             raise AwaitingError(INVALID_AWAITING, f"capability owner request is not live: {out[-200:]}")
+         awaiting["observed"] = out[-120:]
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index 392022b20a9..370ec3ba286 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -86,8 +86,45 @@ _RELAY = re.compile(
+     r"\b(?:from|in|via|using)\s+your\s+own\s+(?:hermes\s+)?(?:desktop\s+|cli\s+)?(?:or\s+cli\s+)?"
+     r"(?:chat|session|agent)\b"
+     r"|\b(?:ask|tell|have|get)\s+your\s+(?:own\s+)?(?:hermes\s+)?(?:desktop\s+|cli\s+)?"
+-    r"(?:chat|session|agent)\b",
++    r"(?:chat|session|agent)\b"
++    # "or from a Hermes chat there" (MacBook card t_01a18b13ee350599): the same relay through any chat. [daveey]
++    r"|\b(?:from|in|via|using)\s+(?:a|an|any|the)\s+hermes\s+(?:desktop\s+|cli\s+)?(?:chat|session)\b",
++    re.IGNORECASE)
++
++ROUTE_GAP_CODE = "agent_route_gap"
++# The typed answers of the agent routes (capability routing, placement, supervisor routing). A human_request that
++# cites one of them as its reason asks David to do an agent's step because the route failed. [daveey]
++_ROUTE_GAP = re.compile(
++    r"\bno_capability_holder\b|\bcapability_registry_(?:unavailable|stale)\b|\bno_capable_supervisor\b"
++    r"|\bplacement_unavailable\b|\bnot live\b(?=[^.;\n]{0,40}\bplacement)|\bplacement\b[^.;\n]{0,60}\bnot live\b"
++    r"|\bno agent route\b|\bno gateway holds\b",
+     re.IGNORECASE)
++# ... and asks him to run the step and hand back its output: an agent's step, not a grant or a sign-in.
++_RUN_AND_REPORT = re.compile(
++    r"\b(?:paste|post|send|report|share|copy)\b[^.;\n]{0,40}\b(?:results?|output|logs?|pass/fail)\b",
++    re.IGNORECASE)
++
++
++def agent_route_gap_error(human_request) -> Optional[str]:
++    """Typed refusal for a human_request that asks David to run a step and report back because an agent route failed.
++
++    MacBook card t_01a18b13ee350599, run on worker-1, asked David to "run the 8 drain test files ... and paste the
++    results", with why_human "No agent route to the MacBook ... no gateway holds host:macbook" and evidence
++    "needs=['host:macbook'] -> no_capability_holder". A MacBook chat did the step in 9 minutes. A route failure is
++    a routing bug for an agent to fix, never David's task.
++    """
++    if not isinstance(human_request, dict):
++        return None
++    text = " ".join(str(human_request.get(k) or "") for k in ("why_human", "evidence", "action"))
++    m = _ROUTE_GAP.search(text)
++    if not m or not _RUN_AND_REPORT.search(str(human_request.get("action") or "")):
++        return None  # a grant only David can give (the documented no_capability_holder ask) stays allowed
++    return (f"{ROUTE_GAP_CODE}: this human_request asks David to do a step because an agent route failed "
++            f"({m.group(0)!r}). That is a routing gap, not his task. Instead: (1) retry kanban_block(needs=[...]) "
++            "(a briefly stale holder now parks and retries; a Board worker node relays the need to the card's home "
++            "gateway); (2) kanban_create the owner card on the holder's gateway or pin it with runs_on="
++            "['machine:<holder>'] and park on it; (3) if routing is broken, kanban_create a card to fix it and park "
++            "on that card. Keep human_request for what only David can do: approve, pay, sign in, a physical step.")
+ 
+ 
+ def agent_relay_ask_error(action: str) -> Optional[str]:
+@@ -122,7 +159,7 @@ def user_ask_lint_error(human_request) -> Optional[str]:
+     if not isinstance(human_request, dict):
+         return None
+     action = " ".join(str(human_request.get("action") or "").split())
+-    relay = agent_relay_ask_error(action)
++    relay = agent_relay_ask_error(action) or agent_route_gap_error(human_request)
+     if relay:
+         return relay
+     missing = [label for label, rx in (("what unblocking the card does", _UNBLOCK),
+@@ -140,7 +177,7 @@ def user_ask_lint_error(human_request) -> Optional[str]:
+ def ask_lint_check(human_request) -> tuple:
+     """``_check`` args for the tool entry points: ``(ok, message, rejection)``."""
+     err = user_ask_lint_error(human_request)
+-    code = RELAY_ASK_CODE if err and err.startswith(RELAY_ASK_CODE) else ASK_LINT_CODE
++    code = next((c for c in (RELAY_ASK_CODE, ROUTE_GAP_CODE) if err and err.startswith(c)), ASK_LINT_CODE)
+     return err is None, err or "", code
+ 
+ 
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 3909d03a35a..4ccf8e79bbb 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -18,14 +18,30 @@ Refusals are typed (:class:`CapabilityRouteError`), and nothing is written:
+ 
+ * ``no_capability_holder`` -- no gateway holds it: if only David can grant it, block with
+   kind='needs_input' and a ``human_request`` naming the exact command.
+-* ``capability_registry_stale`` -- a holder exists but was not live-checked recently; stale
+-  registry data never routes.
++* ``capability_registry_stale`` -- a holder exists but its record is more than ``RELAY_RETRY_S``
++  past the freshness window; stale registry data never routes. (A record that lapsed more recently
++  parks and retries, see Relay below.)
+ * ``capability_held_locally`` -- this gateway holds it: the wall is the worker's profile
+   (kind='assignment') or a real failure, not a missing capability.
+ * ``capability_route_exhausted`` -- this card already routed that need once; the existing owner
+   card must finish or report why. A REJECTED owner request may be re-routed once more (a new
+   generation of the request id).
+ 
++Relay (gateways without a hermes-hub replica, and a holder that is briefly not live-checked):
++
++* A Board worker node runs no hermes-hub sync: it has no registry to look the holder up in and no
++  ``create-task``. When it runs a card copied from another gateway (``created_on``), routing parks the
++  card on the same ``capability-owner:<card>:<need>`` ids and records a ``relay`` route to that home
++  gateway. The idle copy is evicted, so the home's dispatcher runs the wake probe, and
++  :func:`owner_status` there routes the need with the home's own registry: ``create-task`` to a remote
++  holder under the same request id, or, when the home holds the need itself, a local owner card keyed
++  by that id (``idempotency_key``) and pinned to the home machine. A worker node's OWN card has no home
++  to relay to: ``capability_registry_unavailable``.
++* A holder whose record lapsed recently (a gateway restarting or asleep) is not a refusal: the card
++  parks the same way, relayed to this gateway itself, and the probe retries routing for
++  ``RELAY_RETRY_S``. A relay that still finds no holder after that window wakes the card with the
++  typed error in the probe output, and the next ``route()`` for that need raises it.
++
+ Retries are safe: an id that was already sent is re-sent from its stored envelope (same gateway,
+ title, body and overlap override), so ``hermes-hub`` sees an exact retry, never a conflicting one.
+ A fresh envelope carries ``distinct_from`` for the waiting card and the cards it awaits: the owner
+@@ -50,6 +66,11 @@ ROUTED_EVENT = "capability_routed"
+ WAKE_EVERY = 120
+ WAKE_HORIZON = 72 * 3600
+ HUB_TIMEOUT = 60
++# How long a relayed route keeps retrying a holder that is missing or stale before it wakes the card
++# with the typed error (a gateway restart or a laptop asleep must not fail the route). [daveey]
++RELAY_RETRY_S = 1800
++RELAY_HOME = "home"      # relayed by a worker node to the card's home gateway
++RELAY_RETRY = "retry"    # parked on this gateway itself until a stale holder is live-checked again
+ # Stable: a resend of a fresh envelope must byte-match, and the target records it on the new card.
+ DISTINCT_REASON = (
+     "capability owner card for the waiting card and the cards it awaits; "
+@@ -278,35 +299,108 @@ def owner_body(task, need: str, *, self_gw: str, board: str, reason: str) -> str
+     )
+ 
+ 
+-def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[int] = None,
+-          board: Optional[str] = None, now: Optional[float] = None, require_unclaimed: bool = False,
+-          **lookup) -> dict:
+-    """Route ``needs`` for a running/ready card: create owner cards, then park it on them.
++def has_replica() -> bool:
++    """True when this gateway runs hermes-hub sync (its ``hub.db`` replica exists). Board worker nodes don't."""
++    try:
++        return reg.hub_db_path().exists()
++    except OSError:
++        return False
+ 
+-    Raises CapabilityRouteError or ValueError. Refusals decided before any hermes-hub call write
+-    nothing. A failure after some owner requests were queued says so; retrying the same call is
+-    safe (exact resend of the stored envelopes). ``require_unclaimed`` (placement preflight) parks
+-    only a ``ready`` card nobody has claimed meanwhile.
++
++def card_home(conn, task_id: str) -> Optional[str]:
++    """The Board gateway that created ``task_id`` when this file holds a COPY of it (a worker node runs another
++    gateway's card, :mod:`hermes_cli.kanban_worker_node`); None for this gateway's own cards or unsynced boards."""
++    try:
++        from hermes_cli import kanban_db_sync as sync
++        st = sync.sync_state(conn)
++        if not st or "created_on" not in sync.table_columns(conn, "tasks"):
++            return None
++        row = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    except Exception:  # health: allow BLE001 -- an unreadable sync state means "not a copy"
++        return None
++    home = row[0] if row else None
++    return str(home) if home and home != st.get("gateway_id") else None
++
++
++def _own_gateway(conn) -> Optional[str]:
++    """This board file's Board gateway id (the ``machine:<name>`` this gateway leases as), None if unsynced."""
++    try:
++        from hermes_cli import kanban_db_sync as sync
++        st = sync.sync_state(conn)
++        return str(st["gateway_id"]) if st and st.get("gateway_id") else None
++    except Exception:  # health: allow BLE001 -- an unreadable sync state means "unsynced board"
++        return None
++
++
++def _briefly_stale(exc: CapabilityRouteError, now: float) -> bool:
++    """True when the newest stale holder record lapsed within the last ``RELAY_RETRY_S`` (a restart or a
++    short sleep): worth a timed retry. Older data means the holder's probe is down; that still refuses."""
++    ats = [float(at) for _gw, at in (exc.details.get("stale") or []) if at]
++    return bool(ats) and now - max(ats) < reg.stale_after() + RELAY_RETRY_S
++
++
++def _park_relay(conn, task_id: str, needs: list[str], *, reason: str, gateway: str, mode: str,
++                generations: dict, now: float, expected_run_id: Optional[int], require_unclaimed: bool,
++                self_gw: Optional[str] = None, why: str = "") -> dict:
++    """Park ``task_id`` on owner request ids that ``gateway`` will route (:func:`owner_status` there).
++
++    ``mode`` RELAY_HOME: a worker node hands the routing to the card's home gateway. RELAY_RETRY: this
++    gateway retries a stale holder itself. Same ids, wake_check and event shape as a direct route, plus
++    ``relay`` and the reason the probe needs to write the owner card.
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_timed_park as ktp
+ 
+-    needs = reg.normalize_needs(needs)
+-    if not needs:
+-        raise ValueError("needs is empty")
+-    task = kb.get_task(conn, task_id)
+-    if task is None:
+-        raise ValueError(f"unknown task {task_id}")
+-    if task.status not in ("running", "ready"):
+-        raise CapabilityRouteError("capability_route_invalid_state",
+-                                   f"{task_id} is {task.status}; only a running or ready card can be routed")
+-    now = time.time() if now is None else now
++    me = self_gw or reg.self_gateway() or _own_gateway(conn) or "this gateway"
++    routes = [{"need": n, "gateway": gateway, "checked_at": None, "request_id": request_id(task_id, n, generations.get(n, 1)),
++               "generation": generations.get(n, 1), "relay": mode, "relayed_at": int(now), "from_gateway": me}
++              for n in needs]
++    ids = ",".join(r["request_id"] for r in routes)
++    until = datetime.fromtimestamp(int(now) + WAKE_HORIZON, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++    if mode == RELAY_HOME:
++        summary = (f"relayed {', '.join(needs)} to {gateway}, this card's home gateway: {me} is a Board worker "
++                   f"node with no hermes-hub registry, so {gateway} opens the owner card(s) with its own")
++    else:
++        summary = (f"the holder of {', '.join(needs)} was not live-checked recently ({why[:300]}); this gateway "
++                   f"retries routing every {WAKE_EVERY // 60} min for {RELAY_RETRY_S // 60} min")
++    park_reason = (f"Waiting on capability owner card(s): {summary} (request {ids}). Wakes when they are done. "
++                   f"SCHEDULED_UNTIL={until}\n{(reason or '').strip()[:1500]}")
++    wake_check = f"hermes kanban wait-check capability-owner {ids}"
++    excerpt = redact_sensitive_text((reason or "").strip(), force=True)[:3000]
++    with kb.write_txn(conn):
++        cur = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if require_unclaimed and (cur is None or cur[0] != "ready" or cur[1] is not None):
++            raise CapabilityRouteError("capability_route_invalid_state",
++                                       f"{task_id} was claimed meanwhile; not parked", details={"routes": routes})
++        source = kb._retry_status_for_run(conn, task_id) if cur and cur[0] == "running" else "ready"
++        # The event first: the park's producer check (kanban_awaiting) reads it through owner_status.
++        kb._append_event(conn, task_id, ROUTED_EVENT, {
++            "routes": routes, "local": [], "self_gateway": me, "relay": mode, "reason": excerpt,
++            "awaiting": [{"kind": "card", "ref": f"{gateway}/request/{r['request_id']}",
++                          "why": f"capability {r['need']} ({mode} relay)"} for r in routes],
++        })
++        ok = ktp.park(conn, task_id, reason=park_reason, requested_kind="capability", source_status=source,
++                      expected_run_id=expected_run_id, wake_check=wake_check, check_every=WAKE_EVERY,
++                      awaiting={"kind": "card", "ref": routes[0]["request_id"], "gateway": gateway,
++                                "why": f"capability owner for {', '.join(needs)}, routed by {gateway}"})
++        if not ok:
++            raise CapabilityRouteError("capability_route_invalid_state",
++                                       f"{task_id} could not be parked (claim lost?)", details={"routes": routes})
++    return {"status": "scheduled", "routes": routes, "wake_check": wake_check, "local": [], "relay": mode}
++
++
++def _route_generations(conn, task_id: str, needs: list[str]) -> dict[str, int]:
++    """Request-id generation per need; raises the typed refusal for a need already routed (or failed)."""
+     previous = _previous_routes(conn, task_id)
+     generations: dict[str, int] = {}
+     for need in needs:
+         p = previous.get(need)
+         if p is None:
+             continue
++        if p.get("failed_code"):
++            # A relayed route that found no holder within RELAY_RETRY_S: the typed answer, not a re-relay.
++            raise CapabilityRouteError(p["failed_code"], str(p.get("failed") or "")[:1500],
++                                       details={"need": need, "request_id": p.get("request_id")})
+         sent = _sent(p.get("request_id") or "")
+         gen = int(p.get("generation") or 1)
+         if sent is not None and sent["state"] in ("rejected", "expired") and gen < 2:
+@@ -320,6 +414,53 @@ def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[i
+             f"{p.get('request_id')}` and `hermes-hub requests`. If it is done and the grant was "
+             "insufficient, comment the exact gap on it and reopen it there.",
+             details={"need": need, **p})
++    return generations
++
++
++def _relay_home(conn, task_id: str, needs: list[str]) -> str:
++    """The home gateway a worker node relays ``task_id`` to; typed refusal for the worker's own card."""
++    home = card_home(conn, task_id)
++    if home is None:
++        raise CapabilityRouteError(
++            "capability_registry_unavailable",
++            f"this gateway has no hermes-hub replica (a Board worker node runs no hermes-hub sync), so it "
++            f"cannot see which gateway holds {', '.join(needs)} or open an owner card there, and {task_id} "
++            "was created here, so there is no home gateway to relay to. Create such work on a gateway "
++            "with hermes-hub (hub, macbook) or pin it to the holder with runs_on=['machine:<holder>']. "
++            "Never ask David to run the step: it is an agent route gap.",
++            details={"needs": needs})
++    return home
++
++
++def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[int] = None,
++          board: Optional[str] = None, now: Optional[float] = None, require_unclaimed: bool = False,
++          **lookup) -> dict:
++    """Route ``needs`` for a running/ready card: create owner cards, then park it on them.
++
++    Raises CapabilityRouteError or ValueError. Refusals decided before any hermes-hub call write
++    nothing. A failure after some owner requests were queued says so; retrying the same call is
++    safe (exact resend of the stored envelopes). ``require_unclaimed`` (placement preflight) parks
++    only a ``ready`` card nobody has claimed meanwhile.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_timed_park as ktp
++
++    needs = reg.normalize_needs(needs)
++    if not needs:
++        raise ValueError("needs is empty")
++    task = kb.get_task(conn, task_id)
++    if task is None:
++        raise ValueError(f"unknown task {task_id}")
++    if task.status not in ("running", "ready"):
++        raise CapabilityRouteError("capability_route_invalid_state",
++                                   f"{task_id} is {task.status}; only a running or ready card can be routed")
++    now = time.time() if now is None else now
++    generations = _route_generations(conn, task_id, needs)
++    if not has_replica():
++        # A Board worker node (no hermes-hub sync): hand the routing to the card's home gateway.
++        return _park_relay(conn, task_id, needs, reason=reason, gateway=_relay_home(conn, task_id, needs),
++                           mode=RELAY_HOME, generations=generations, now=now, expected_run_id=expected_run_id,
++                           require_unclaimed=require_unclaimed, self_gw=lookup.get("self_gw"))
+     self_gw = lookup.pop("self_gw", None) or reg.self_gateway()
+     if not self_gw:
+         raise CapabilityRouteError("capability_hub_unavailable",
+@@ -339,6 +480,12 @@ def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[i
+         try:
+             decided = plan(fresh_needs, now=now, self_gw=self_gw, **lookup)
+         except CapabilityRouteError as exc:
++            if exc.code == "capability_registry_stale" and not queued and _briefly_stale(exc, now):
++                # The holder's record lapsed just now (restart, sleep): wait and retry routing on this
++                # gateway's own probe instead of failing the worker. Hours-old data still refuses.
++                return _park_relay(conn, task_id, fresh_needs, reason=reason, gateway=self_gw, mode=RELAY_RETRY,
++                                   generations=generations, now=now, expected_run_id=expected_run_id,
++                                   require_unclaimed=require_unclaimed, self_gw=self_gw, why=str(exc))
+             if not (queued and exc.code == "capability_held_locally"):
+                 raise
+             decided = {"routes": [], "local": exc.details.get("local", [])}
+@@ -473,40 +620,211 @@ def owner_task_id(result: Any) -> Optional[str]:
+     return m.group(1) if m else None
+ 
+ 
+-def owner_status(rid: str) -> tuple[int, str]:
+-    """(rc, message) for one owner request: 0 done, 1 pending, 2 cannot tell / rejected."""
++def owner_status(rid: str, conn=None) -> tuple[int, str]:
++    """(rc, message) for one owner request: 0 done, 1 pending, 2 cannot tell / rejected.
++
++    The hermes-hub ``sent`` row decides when this gateway sent the request. Otherwise a relayed route for
++    ``rid`` (see the module doc) is applied or tracked here: the home gateway routes it on its first probe.
++    ``conn`` is the board holding the waiting card (default: the probe's ``HERMES_KANBAN_DB``). [daveey]
++    """
++    status, why = _sent_status(rid)
++    if status is not None:
++        return status
++    relayed = _relay_status(rid, conn)
++    return relayed if relayed is not None else (2, why)
++
++
++def _sent_status(rid: str) -> tuple[Optional[tuple[int, str]], str]:
++    """``((rc, message), "")`` from this gateway's hermes-hub ``sent`` row, or ``(None, why)`` without one."""
+     try:
+         db = reg._ro(reg.hub_db_path())
+-    except Exception as exc:
+-        return 2, f"error: hermes-hub replica unreadable: {exc}"
++    except Exception as exc:  # health: allow BLE001 -- unreadable replica: fall through to the relay check
++        return None, f"error: hermes-hub replica unreadable: {exc}"
+     try:
+         row = db.execute("SELECT body, state, result FROM sent WHERE id = ?", (rid,)).fetchone()
+         if row is None:
+-            return 2, f"error: no hermes-hub request {rid} on this gateway"
++            return None, f"error: no hermes-hub request {rid} on this gateway"
+         body = json.loads(row[0] or "{}")
+         state = row[1]
+         if state in ("rejected", "expired", "failed"):
+-            return 2, f"error: request {rid} {state}: {str(row[2])[:300]}"
++            return (2, f"error: request {rid} {state}: {str(row[2])[:300]}"), ""
+         if state != "done":
+-            return 1, f"{rid} request {state}"
++            return (1, f"{rid} request {state}"), ""
+         result = json.loads(row[2] or "{}") or {}
+         tid = owner_task_id(result)
+         if not tid:
+-            return 2, f"error: request {rid} done without a task id: {str(row[2])[:300]}"
++            return (2, f"error: request {rid} done without a task id: {str(row[2])[:300]}"), ""
+         gw = body.get("to_gw")
+         board = (body.get("key") or "default/default/new").split("/")[1] if body.get("key") else "default"
+         rec = db.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?",
+                          (gw, f"default/{board}/{tid}")).fetchone()
+         if rec is None:
+-            return 1, f"{rid} -> {gw}/{tid} not replicated yet"
++            return (1, f"{rid} -> {gw}/{tid} not replicated yet"), ""
+         status = json.loads(rec[0]).get("status")
+-        return (0 if status in ("done", "archived") else 1), f"{rid} -> {gw}/{tid} {status}"
+-    except Exception as exc:  # cannot tell, never "not yet"
+-        return 2, f"error: {exc}"
++        return ((0 if status in ("done", "archived") else 1), f"{rid} -> {gw}/{tid} {status}"), ""
++    except Exception as exc:  # health: allow BLE001 -- cannot tell, never "not yet"; reported as rc 2
++        return (2, f"error: {exc}"), ""
+     finally:
+         db.close()
+ 
+ 
++def _task_of(rid: str) -> Optional[str]:
++    """The waiting card id inside ``capability-owner:<card>:<need>``."""
++    if not rid.startswith(OWNER_PREFIX):
++        return None
++    tid = rid[len(OWNER_PREFIX):].split(":", 1)[0]
++    return tid or None
++
++
++def _route_entry(conn, task_id: str, rid: str) -> tuple[Optional[dict], Optional[dict]]:
++    """The newest ``capability_routed`` route for ``rid`` and its event payload (None, None if never routed)."""
++    entry = payload = None
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
++                               (task_id, ROUTED_EVENT)):
++        try:
++            p = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        for r in p.get("routes") or []:
++            if isinstance(r, dict) and r.get("request_id") == rid:
++                entry, payload = r, p
++    return entry, payload
++
++
++def _relay_status(rid: str, conn=None) -> Optional[tuple[int, str]]:
++    """Track or apply a relayed route for ``rid``; None when ``rid`` was never relayed on this board."""
++    from hermes_cli import kanban_db as kb
++
++    tid = _task_of(rid)
++    if not tid:
++        return None
++    own = conn is None
++    if own:
++        try:
++            from hermes_cli import kanban_db_connect as kbc
++            conn = kbc.connect()
++        except Exception:  # health: allow BLE001 -- no board: not a relay we can see
++            return None
++    try:
++        local = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
++                             "ORDER BY created_at DESC LIMIT 1", (rid,)).fetchone()
++        if local is not None:
++            return (0 if local[1] == "done" else 1), f"{rid} -> local owner {local[0]} {local[1]}"
++        entry, payload = _route_entry(conn, tid, rid)
++        if entry is None:
++            return None
++        if entry.get("failed_code"):
++            return 0, f"{rid} capability route failed: {entry.get('failed')}"
++        if entry.get("owner_task"):  # a local owner card that was since archived
++            return 2, f"error: {rid} local owner {entry['owner_task']} is gone"
++        if not entry.get("relay"):
++            return None
++        task = kb.get_task(conn, tid)
++        if task is None or card_home(conn, tid) is not None or not has_replica():
++            # Still the worker node's copy: the home gateway's probe routes it once the copy is handed back.
++            return 1, f"{rid} relayed to {entry.get('gateway')}; it routes there"
++        return _apply_relay(conn, task, entry, payload or {})
++    finally:
++        if own:
++            conn.close()
++
++
++def _relay_fail(conn, task_id: str, entry: dict, code: str, message: str) -> tuple[int, str]:
++    from hermes_cli import kanban_db as kb
++
++    with kb.write_txn(conn):
++        kb._append_event(conn, task_id, ROUTED_EVENT, {"routes": [{**entry, "failed_code": code,
++                                                                   "failed": message[:1500]}]})
++    return 0, f"{entry['request_id']} capability route failed: {code}: {message[:600]}"
++
++
++def _apply_relay(conn, task, entry: dict, payload: dict, *, now: Optional[float] = None) -> tuple[int, str]:
++    """On the gateway that holds the waiting card: route one relayed need with this gateway's registry."""
++    from hermes_cli import kanban_db as kb
++
++    now = time.time() if now is None else now
++    need, rid = entry["need"], entry["request_id"]
++    self_gw = reg.self_gateway() or _own_gateway(conn) or "this gateway"
++    from_gw = entry.get("from_gateway") or payload.get("self_gateway") or self_gw
++    reason = payload.get("reason") or ""
++    board = kb.get_current_board() or "default"
++    age = now - float(entry.get("relayed_at") or now)
++    try:
++        decided = plan([need], now=now, self_gw=self_gw)
++    except CapabilityRouteError as exc:
++        if exc.code == "capability_held_locally":
++            return _local_owner(conn, task, entry, need=need, rid=rid, self_gw=self_gw, from_gw=from_gw,
++                                reason=reason)
++        if exc.code in ("capability_registry_stale", "no_capability_holder") and age < RELAY_RETRY_S:
++            return 1, f"{rid}: {exc.code}, retrying for {int((RELAY_RETRY_S - age) // 60)} more min"
++        return _relay_fail(conn, task.id, entry, exc.code, str(exc))
++    gw = decided["routes"][0]["gateway"]
++    title = redact_sensitive_text(f"Capability owner: {need} for {self_gw}/{task.id} ({(task.title or '')[:80]})",
++                                  force=True)
++    body = owner_body(task, need, self_gw=self_gw, board=board, reason=reason)
++    argv = [_hub_cli(), "create-task", gw, title, "--body", body, "--assignee", _owner_assignee(),
++            "--origin-session", "", "--id", rid, *_overlap_option_argv(None, overlap_exclusions(conn, task.id))]
++    rc, out = _create_task(argv)
++    if rc not in (0, 3):
++        if age < RELAY_RETRY_S:
++            return 1, f"{rid}: hermes-hub create-task to {gw} failed (exit {rc}), retrying: {out[-200:]}"
++        return _relay_fail(conn, task.id, entry, "capability_hub_unavailable",
++                           f"hermes-hub create-task to {gw} failed (exit {rc}): {out[-400:]}")
++    with kb.write_txn(conn):
++        kb._append_event(conn, task.id, ROUTED_EVENT, {
++            "routes": [{"need": need, "gateway": gw, "request_id": rid, "generation": entry.get("generation", 1),
++                        "queued_only": rc == 3, "relayed_from": from_gw}],
++            "local": [], "self_gateway": self_gw,
++            "awaiting": [{"kind": "card", "ref": f"{gw}/request/{rid}", "why": f"capability {need}"}],
++        })
++    return 1, f"{rid} sent to {gw} (relayed from {from_gw})"
++
++
++def _local_owner(conn, task, entry: dict, *, need: str, rid: str, self_gw: str, from_gw: str,
++                 reason: str) -> tuple[int, str]:
++    """The waiting card's own gateway holds the need: the owner card is a local card pinned to this machine."""
++    from hermes_cli import kanban_db as kb
++
++    excerpt = redact_sensitive_text((reason or "").strip(), force=True)[:3000]
++    title = redact_sensitive_text(f"Capability owner: {need} for {task.id} ({(task.title or '')[:80]})", force=True)
++    body = (
++        f"Capability owner card for waiting card {task.id} (\"{redact_sensitive_text((task.title or '')[:160], force=True)}\") "
++        f"on this board. It was running on {from_gw}, which does not hold `{need}`; this gateway ({self_gw}) "
++        "holds it (live-checked).\n\n"
++        "## Action (from the waiting card, inside its approved plan)\n"
++        f"{excerpt or '(no reason given; read the waiting card first)'}\n\n"
++        "## Do\n"
++        f"1. Read the waiting card: kanban_show(task_id='{task.id}').\n"
++        f"2. Perform exactly the scoped action above on this machine with `{need}`. Keep it to the minimum the "
++        "waiting card needs.\n"
++        "3. If the action goes beyond the waiting card's approved plan or scope, do NOT do it: block THIS card "
++        "with kind='needs_input' and a human_request naming the exact command. The waiting worker does not ask "
++        "David; this card does.\n\n"
++        "## Readback\n"
++        f"Record the evidence in your completion summary AND kanban_comment(task_id='{task.id}', body=<result>) "
++        "so the waiting worker sees it.\n\n"
++        "## Wake\n"
++        f"{task.id} is parked on this card: completing it wakes {task.id} within about {WAKE_EVERY // 60} min, "
++        f"and it resumes on {from_gw}.\n"
++    )
++    own = _own_gateway(conn)
++    try:
++        owner = kb.create_task(conn, title=title, body=body, assignee=_owner_assignee(),
++                               created_by="capability-relay", idempotency_key=rid,
++                               runs_on=[f"machine:{own}"] if own else None)
++    except ValueError:  # an unsynced board has no runs_on: the card is local anyway
++        owner = kb.create_task(conn, title=title, body=body, assignee=_owner_assignee(),
++                               created_by="capability-relay", idempotency_key=rid)
++    with kb.write_txn(conn):
++        kb._append_event(conn, task.id, ROUTED_EVENT, {
++            "routes": [{"need": need, "gateway": self_gw, "request_id": rid, "generation": entry.get("generation", 1),
++                        "owner_task": owner, "relayed_from": from_gw}],
++            "local": [need], "self_gateway": self_gw,
++            "awaiting": [{"kind": "card", "ref": owner, "why": f"capability {need}"}],
++        })
++    return 1, f"{rid} -> local owner {owner} (this gateway holds {need})"
++
++
+ def wait_check(target: str) -> tuple[int, str]:
+     rids = [r for r in (target or "").split(",") if r.strip()]
+     if not rids:
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index fa39d12ee1b..6cb1a22b7ce 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -611,12 +611,23 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+                     "why": f"has parents: created here and forwarded to {target} once they finish"}
+         dead = (live or (lambda t: target_live(t, now=now, live_seconds=c.live_seconds())))(target)
+         if dead:
+-            return {"where": "local", "why": f"{target} not live: {dead}"}
++            return {"where": "local", "why": _target_not_live_why(target, dead)}
+         return {"where": target, "why": "no local-only need" if not explicit else "placement pinned by the caller"}
+     except Exception as exc:  # placement must never break card creation
+         return {"where": "local", "why": f"placement check failed: {exc}"}
+ 
+ 
++def _target_not_live_why(target: str, dead: str) -> str:
++    from hermes_cli.kanban_capability_routing import has_replica
++    if not has_replica():
++        # A Board worker node runs no hermes-hub sync, so it never sees any gateway as live. Say so, with the
++        # route that works from here (worker-1 run 10113 read "not live" as a dead MacBook). [daveey]
++        dead = (f"this gateway has no hermes-hub replica (a Board worker node), so it cannot place cards on other "
++                f"gateways. Use kanban_block(needs=[...]): a worker node relays the need to the card's home "
++                f"gateway, which opens the owner card on {target}")
++    return f"{target} not live: {dead}"
++
++
+ def _default_runner(argv: list[str], timeout: float = HUB_TIMEOUT) -> tuple[int, str, str]:
+     try:
+         p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+diff --git a/tests/hermes_cli/test_kanban_capability_relay.py b/tests/hermes_cli/test_kanban_capability_relay.py
+new file mode 100644
+index 00000000000..f3555d33b3e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capability_relay.py
+@@ -0,0 +1,277 @@
++"""Capability routing from a Board worker node relays to the card's home gateway. [daveey]
++
++Replays MacBook card t_01a18b13ee350599 (2026-10-29 21:35 PDT): its run on worker-1 needed a MacBook-only step,
++``kanban_block(needs=['host:macbook'])`` answered ``no_capability_holder`` because worker-1 runs no hermes-hub sync
++(no ``hub.db`` replica, no capability registry, no ``create-task``), and the worker asked David to run the tests.
++Now the worker parks the card on the same owner request id and the home gateway, which has the registry,
++opens the owner card where the capability is held. Two gateways on the in-memory fake Board.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_capability_registry as reg
++from hermes_cli import kanban_capability_routing as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import BOARD, Gateway
++
++HOME, WORKER = "macbook", "worker-1"
++NEED = "host:macbook"
++REASON = ("Run the 8 hermes-sync drain test files with the Mac's /usr/bin/python3 at 8a00314ae7 and record "
++          "pass/fail per file.")
++HUB_SCHEMA = """
++CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
++CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT,
++  updated_at INTEGER, PRIMARY KEY (gw, coll, key));
++CREATE TABLE sent (id TEXT PRIMARY KEY, body TEXT, state TEXT, result TEXT, created_at REAL,
++  done_at REAL, posted INTEGER DEFAULT 0);
++"""
++
++
++class Gw(Gateway):
++    """A gateway plus its hermes-hub side: a mail identity, and (unless a worker node) a hub.db replica."""
++
++    def __init__(self, root, name, svc, monkeypatch, *, pickup, hub_replica):
++        self.root = root / name
++        super().__init__(root, name, svc, monkeypatch, pickup=pickup)
++        mail = self.root / "mail.json"
++        mail.write_text(json.dumps({"gateway": name}))
++        self.state = self.root / "hub-state"
++        self.state.mkdir()
++        self.hub = None
++        if hub_replica:
++            self.hub = sqlite3.connect(self.state / "hub.db")
++            self.hub.executescript(HUB_SCHEMA)
++            self.hub.execute("INSERT INTO meta VALUES ('gateway', ?)", (name,))
++            self.hub.commit()
++        self.enter()
++
++    def enter(self):
++        conn = super().enter()
++        if hasattr(self, "state"):
++            self.mp.setenv("HERMES_MAIL_CONFIG", str(self.root / "mail.json"))
++            self.mp.setenv("HERMES_HUB_STATE", str(self.state))
++            self.mp.setenv("HERMES_KANBAN_DB", str(self.home / "kanban.db"))
++        return conn
++
++    def holds(self, *caps, ok=True, at=None):
++        """This gateway's own probe results (``<kanban home>/kanban/capabilities.json``)."""
++        self.enter()
++        at = time.time() if at is None else at
++        path = reg.registry_path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(json.dumps({"schema": reg.SCHEMA, "gateway": self.name, "refreshed_at": at,
++                                    "capabilities": [{"name": c, "ok": ok, "checked_at": at} for c in caps]}))
++
++    def peer_holds(self, gw, *caps, at=None):
++        """Another gateway's capabilities record in this gateway's hermes-hub replica."""
++        at = time.time() if at is None else at
++        rec = {"schema": reg.SCHEMA, "gateway": gw, "refreshed_at": at,
++               "capabilities": [{"name": c, "ok": True, "checked_at": at} for c in caps]}
++        self.hub.execute("INSERT OR REPLACE INTO replica VALUES (?, 'capabilities', 'info', 1, 1, ?, ?)",
++                         (gw, json.dumps(rec), int(at)))
++        self.hub.commit()
++
++
++@pytest.fixture
++def pair(tmp_path, monkeypatch):
++    svc = FakeService(lease_runs=True)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    home = Gw(tmp_path, HOME, svc, monkeypatch, pickup=False, hub_replica=True)
++    worker = Gw(tmp_path, WORKER, svc, monkeypatch, pickup="explicit", hub_replica=False)
++    home.holds(NEED)
++    worker.holds("sudo:nopasswd")
++    calls: list[list[str]] = []
++
++    def fake_hub(argv):  # `hermes-hub create-task` on the home: journal the request in its `sent`
++        calls.append(argv)
++        rid = argv[argv.index("--id") + 1]
++        body = {"id": rid, "to_gw": argv[2], "coll": "tasks", "key": "default/default/new", "action": "create",
++                "args": {"title": argv[3], "body": argv[argv.index("--body") + 1]}}
++        home.hub.execute("INSERT OR IGNORE INTO sent (id, body, state, created_at) VALUES (?, ?, 'local', ?)",
++                         (rid, json.dumps(body), time.time()))
++        home.hub.commit()
++        return 0, rid
++
++    monkeypatch.setattr(kcr, "hub_runner", fake_hub)
++    yield home, worker, svc, calls
++    for g in (home, worker):
++        g.conn.close()
++        if g.hub is not None:
++            g.hub.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _worker_runs_home_card(home, worker):
++    home.enter()
++    tid = kb.create_task(home.conn, title="Drain fix: run the Mac half of the hermes-sync tests",
++                         assignee="default", runs_on=[f"machine:{WORKER}"])
++    home.round()
++    worker.round()
++    worker.tick()
++    task = kb.get_task(worker.conn, tid)
++    assert task is not None and task.status == "running"
++    return tid, task.current_run_id
++
++
++def _hand_back(home, worker):
++    """The worker pushes the park and evicts its idle copy; the home pulls it."""
++    worker.round()
++    worker.tick()
++    worker.round()
++    home.round()
++
++
++def test_worker_node_needs_relays_home_and_opens_the_owner_card_on_the_holder(pair):
++    home, worker, _svc, calls = pair
++    tid, run_id = _worker_runs_home_card(home, worker)
++
++    # On worker-1 (no hub.db): before the fix this raised no_capability_holder.
++    worker.enter()
++    assert not reg.hub_db_path().exists()
++    res = kcr.route(worker.conn, tid, [NEED], reason=REASON, expected_run_id=run_id)
++    rid = kcr.request_id(tid, NEED)
++    assert res["status"] == "scheduled"
++    assert [(r["need"], r["gateway"], r["request_id"]) for r in res["routes"]] == [(NEED, HOME, rid)]
++    assert res["wake_check"] == f"hermes kanban wait-check capability-owner {rid}"
++    assert kb.get_task(worker.conn, tid).status == "scheduled"
++    # The worker's own probe run says "relayed", never an error that would wake the card.
++    rc, msg = kcr.owner_status(rid)
++    assert rc == 1 and "relayed to macbook" in msg
++
++    _hand_back(home, worker)
++    assert kb.get_task(worker.conn, tid) is None  # evicted: the home now runs the wake probe
++    home.enter()
++    assert kb.get_task(home.conn, tid).status == "scheduled"
++
++    # The home's wake probe routes it. The home holds host:macbook itself: the owner card is a local card
++    # pinned to this machine, keyed by the same request id. No hermes-hub request is needed for that.
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 1, msg
++    owner = home.conn.execute("SELECT id, status, assignee, body, runs_on FROM tasks WHERE idempotency_key = ?",
++                              (rid,)).fetchone()
++    assert owner is not None and owner["status"] in ("ready", "todo")
++    assert json.loads(owner["runs_on"]) == [f"machine:{HOME}"]
++    assert tid in owner["body"] and REASON in owner["body"] and NEED in owner["body"]
++    assert calls == []
++    # Probing again is idempotent: still pending, still one owner card.
++    assert kcr.wait_check(rid)[0] == 1
++    assert home.conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (rid,)).fetchone()[0] == 1
++
++    # The owner finishes on the MacBook: the waiting card's probe passes and the card wakes.
++    assert kb.complete_task(home.conn, owner["id"], result="90 tests passed")
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 0 and owner["id"] in msg
++
++
++def test_relayed_need_held_by_a_third_gateway_is_sent_through_the_homes_hermes_hub(pair):
++    home, worker, _svc, calls = pair
++    need = "aws:767406518141:admin"
++    home.peer_holds("hub", need)
++    tid, run_id = _worker_runs_home_card(home, worker)
++    worker.enter()
++    res = kcr.route(worker.conn, tid, [need], reason=REASON, expected_run_id=run_id)
++    rid = res["routes"][0]["request_id"]
++    _hand_back(home, worker)
++    home.enter()
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 1, msg
++    [argv] = calls
++    assert argv[1:3] == ["create-task", "hub"] and argv[argv.index("--id") + 1] == rid
++    assert tid in argv[argv.index("--body") + 1]
++    # From here on it is an ordinary owner request on the home's hermes-hub.
++    home.hub.execute("UPDATE sent SET state='done', result=? WHERE id=?", (json.dumps({"task": "t_owner"}), rid))
++    home.hub.execute("INSERT INTO replica VALUES ('hub', 'tasks', 'default/default/t_owner', 1, 1, ?, 0)",
++                     (json.dumps({"id": "t_owner", "status": "done"}),))
++    home.hub.commit()
++    assert kcr.wait_check(rid)[0] == 0
++    assert len(calls) == 1
++
++
++def test_a_briefly_stale_holder_is_retried_then_fails_typed(pair, monkeypatch):
++    """The holder restarted (its record lapsed): the probe keeps retrying, then wakes the card with the
++    typed reason instead of leaving it parked forever."""
++    home, worker, _svc, _calls = pair
++    home.holds(NEED, at=time.time() - reg.DEFAULT_STALE_AFTER_SECONDS - 300)
++    tid, run_id = _worker_runs_home_card(home, worker)
++    worker.enter()
++    rid = kcr.route(worker.conn, tid, [NEED], reason=REASON, expected_run_id=run_id)["routes"][0]["request_id"]
++    _hand_back(home, worker)
++    home.enter()
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 1 and "retrying" in msg
++    # The record comes back within the window: the next probe routes it.
++    home.holds(NEED)
++    assert kcr.wait_check(rid)[0] == 1
++    assert home.conn.execute("SELECT 1 FROM tasks WHERE idempotency_key = ?", (rid,)).fetchone()
++
++
++def test_a_relay_that_finds_no_holder_wakes_the_card_with_the_typed_reason(pair, monkeypatch):
++    home, worker, _svc, _calls = pair
++    tid, run_id = _worker_runs_home_card(home, worker)
++    worker.enter()
++    rid = kcr.route(worker.conn, tid, ["ssh:nowhere"], reason=REASON,
++                    expected_run_id=run_id)["routes"][0]["request_id"]
++    _hand_back(home, worker)
++    home.enter()
++    real = time.time
++    monkeypatch.setattr(kcr.time, "time", lambda: real() + kcr.RELAY_RETRY_S + 60)
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 0 and "no_capability_holder" in msg
++    # The next worker run asking again gets the typed refusal, not a second relay.
++    assert kcr.wait_check(rid)[0] == 0
++    with kb.write_txn(home.conn):
++        home.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    with pytest.raises(kcr.CapabilityRouteError) as exc:
++        kcr.route(home.conn, tid, ["ssh:nowhere"], reason=REASON)
++    assert exc.value.code == "no_capability_holder"
++
++
++def test_a_worker_nodes_own_card_gets_a_typed_registry_error(pair):
++    """No home to relay to: the error says the registry is unavailable here, not that nobody holds it."""
++    _home, worker, _svc, _calls = pair
++    worker.enter()
++    tid = kb.create_task(worker.conn, title="worker's own", assignee="default")
++    with kb.write_txn(worker.conn):
++        worker.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    with pytest.raises(kcr.CapabilityRouteError) as exc:
++        kcr.route(worker.conn, tid, [NEED], reason=REASON)
++    assert exc.value.code == "capability_registry_unavailable"
++
++
++def test_on_a_hub_gateway_a_stale_holder_parks_and_retries_instead_of_failing(pair):
++    """The hub-side path of the 21:36 restart window: the holder's record lapsed while it restarted."""
++    home, _worker, _svc, calls = pair
++    need = "aws:767406518141:admin"
++    home.peer_holds("hub", need, at=time.time() - reg.DEFAULT_STALE_AFTER_SECONDS - 300)
++    home.enter()
++    tid = kb.create_task(home.conn, title="home card", assignee="default")
++    with kb.write_txn(home.conn):
++        home.conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    res = kcr.route(home.conn, tid, [need], reason=REASON)
++    rid = res["routes"][0]["request_id"]
++    assert res["status"] == "scheduled" and res["relay"] == kcr.RELAY_RETRY and calls == []
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 1 and "retrying" in msg and calls == []
++    home.peer_holds("hub", need)  # the holder is live-checked again
++    assert kcr.wait_check(rid)[0] == 1
++    [argv] = calls
++    assert argv[1:3] == ["create-task", "hub"] and argv[argv.index("--id") + 1] == rid
++
++
++def test_placement_on_a_worker_node_names_the_relay_instead_of_a_dead_target(pair):
++    from hermes_cli import kanban_placement as kp
++    _home, worker, _svc, _calls = pair
++    worker.enter()
++    why = kp._target_not_live_why("macbook", "no recent hermes-hub sync")
++    assert "Board worker node" in why and "needs=" in why
+diff --git a/tests/hermes_cli/test_kanban_capability_routing.py b/tests/hermes_cli/test_kanban_capability_routing.py
+index 4ae56ce21a4..70460f745bc 100644
+--- a/tests/hermes_cli/test_kanban_capability_routing.py
++++ b/tests/hermes_cli/test_kanban_capability_routing.py
+@@ -214,6 +214,8 @@ def test_need_no_gateway_holds_gets_typed_refusal_pointing_at_human_request(env,
+ 
+ 
+ def test_stale_registry_data_triggers_no_routing(env, monkeypatch):
++    """Hours-old data (the holder's probe is down) refuses; a record that lapsed minutes ago parks and
++    retries instead (test_kanban_capability_relay)."""
+     from tools import kanban_tools as kt
+     publish(env["hub"], "macbook", {f"aws:{ACCOUNT}:admin": time.time() - 2 * 3600})
+     with kbc.connect_closing() as conn:
+diff --git a/tests/tools/test_kanban_agent_relay_ask.py b/tests/tools/test_kanban_agent_relay_ask.py
+index 4db08e2facc..39517c9e418 100644
+--- a/tests/tools/test_kanban_agent_relay_ask.py
++++ b/tests/tools/test_kanban_agent_relay_ask.py
+@@ -133,3 +133,47 @@ def test_macbook_holding_broker_account_admin_gets_the_secrets_need(tmp_path):
+                  self_gw="hub")
+     assert exc.value.code == "no_capability_holder"
+     assert "relay" in str(exc.value)  # the refusal must not invite a "go ask your chat" human ask
++
++
++# --- route-gap asks: MacBook card t_01a18b13ee350599 (worker-1 run 10113, 2026-10-29 21:35 PDT) ---------
++
++# Its exact human_request: every agent route failed, so it asked David to run the tests and paste results.
++ROUTE_GAP_10113 = {
++    "action": ("On the MacBook (or from a Hermes chat there), run the 8 drain test files at 8a00314ae7 (steps in "
++               "the card reason) and paste the results here. Unblock = I record the Mac results and send this for "
++               "review. Archive = drop the Mac check and ship on Linux + CI evidence alone."),
++    "why_human": ("No agent route to the MacBook from this worker: no gateway holds host:macbook, david-mbp is not "
++                  "live for card placement, and no supervisor profile is configured."),
++    "interaction": "reply",
++    "scope": "Read-only test run in a throwaway worktree plus a read-only log grep on the MacBook.",
++    "evidence": ("kanban_block needs=['host:macbook'] -> no_capability_holder; kanban_create placement=example-laptop -> "
++                 "'david-mbp not live'; kind=assignment -> no_capable_supervisor."),
++}
++
++
++def test_the_10113_route_gap_ask_is_refused():
++    from hermes_cli.kanban_block_policy import user_ask_lint_error
++    err = user_ask_lint_error(ROUTE_GAP_10113)
++    assert err and err.startswith("agent_relay_ask"), err  # "from a Hermes chat there" is a relay ask too
++    without_relay = {**ROUTE_GAP_10113, "action": ROUTE_GAP_10113["action"].replace(
++        " (or from a Hermes chat there)", "")}
++    err = user_ask_lint_error(without_relay)
++    assert err and err.startswith("agent_route_gap"), err
++    assert "needs=" in err and "runs_on" in err
++
++
++def test_a_grant_after_no_capability_holder_is_still_allowed():
++    """The documented path: no gateway holds it and only David can grant it."""
++    from hermes_cli.kanban_block_policy import user_ask_lint_error
++    grant = {**ROUTE_GAP_10113, "interaction": "user_terminal",
++             "action": ("Approve the one-time KMS grant: run_in_user_terminal will show `aws kms create-grant ...` "
++                        "on the MacBook. Unblock = the hub refreshes the secret; archive = keep the manual copy.")}
++    assert user_ask_lint_error(grant) is None
++
++
++def test_block_entry_refuses_the_10113_route_gap_ask(worker_env):
++    from tools import kanban_tools as kt
++    hr = {**ROUTE_GAP_10113, "action": ROUTE_GAP_10113["action"].replace(" (or from a Hermes chat there)", "")}
++    d = json.loads(kt._handle_block({"reason": "Mac step left", "kind": "needs_input", "human_request": hr}))
++    assert d.get("rejection") == "agent_route_gap", d
++    assert _status(worker_env) == "running"
+-- 
+2.55.0
+

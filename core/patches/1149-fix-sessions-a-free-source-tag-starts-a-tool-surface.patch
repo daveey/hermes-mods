@@ -1,0 +1,407 @@
+From 7c00ede0c42d16a2ad194df1eb21461ae76f98bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:31:48 +0000
+Subject: [PATCH 1149/1157] fix(sessions): a free --source tag starts a
+ tool-surface session again; a class: route defers to the agent [daveey]
+
+hermes chat --oneshot --source bb-reviewer (and peer-mail, bb-judge) failed with invalid_params (source)
+once the CLI created sessions through session.create: CanonicalCreateParams.source was a closed Literal and
+build_policy refused anything outside SURFACES. A well-formed lowercase tag that is not a surface, platform
+or routing label now runs as the tool surface and keeps its own stored label (sidebar_exclude_sources and
+--source filters still name it).
+
+--source tool on a class: model failed with 'Class routing requires a durable session/job identity':
+route_runtime resolved the selector with no session id. It now defers class resolution to AIAgent
+(prepare_agent_route), like the messaging path does.
+---
+ agent/managed_worker.py                       |  7 +-
+ apps/shared/src/gateway-contract.generated.ts |  2 +-
+ apps/shared/src/gateway-contract.openrpc.json |  9 +--
+ gateway/run_turn_prepare.py                   |  2 +
+ gateway/session_policy.py                     | 35 ++++++++--
+ gateway/session_worker_construct.py           | 17 +++++
+ hermes_cli/_parser.py                         |  2 +-
+ .../test_policy_class_route_deferred.py       | 53 ++++++++++++++
+ .../test_session_create_free_source.py        | 69 +++++++++++++++++++
+ .../test_session_policy_refusal_fields.py     |  3 +-
+ tui_gateway/contracts/canonical_sessions.py   |  6 +-
+ 11 files changed, 184 insertions(+), 21 deletions(-)
+ create mode 100644 tests/gateway/test_policy_class_route_deferred.py
+ create mode 100644 tests/gateway/test_session_create_free_source.py
+
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index 0643ec1b503..4ab586ed991 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -345,7 +345,7 @@ def execute(frame, channel):
+     from tools.process_registry import process_registry
+     process_registry.recover_from_checkpoint()
+     # Store construction binds the delegation ledger before tool discovery.
+-    from gateway.session_policy import restore_policy, policy_scope, register_worker_hooks
++    from gateway.session_policy import restore_policy, policy_scope, register_worker_hooks, surface_label
+     policy = restore_policy(frame['policy'])
+     register_worker_hooks(policy)
+     discover_profile_mcp(policy)
+@@ -367,8 +367,9 @@ def execute(frame, channel):
+                 # execution (agent/runtime_session_child.py) and retires with it.
+                 enabled_toolsets=list(policy.toolsets), max_iterations=policy.max_turns,
+                 reasoning_config=policy.reasoning_config,
+-                # ``tool`` / ``oneshot`` are storage labels for a CLI-surface agent (session_policy.SURFACES).
+-                platform=policy.platform if policy.source in ('tool', 'oneshot') else policy.source,
++                # ``tool`` / ``oneshot`` / a free ``--source`` tag are storage labels for a CLI-surface agent
++                # (session_policy.SURFACES, surface_label).
++                platform=policy.platform if surface_label(policy.source) in ('tool', 'oneshot') else policy.source,
+                 gateway_session_key=frame['route'], user_id=frame['user_id'], chat_id=frame['chat_id'],
+                 skip_context_files=policy.ignore_rules, load_soul_identity=not policy.ignore_rules,
+                 skip_memory=policy.ignore_rules, skip_background_review=True, quiet_mode=True,
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 0d011531bd8..30c209fc7ec 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -5063,7 +5063,7 @@ export type WorkerPersistResult = Record<string, unknown>
+ export interface CanonicalCreateParams {
+   profile?: string | null
+   request_id?: string | null
+-  source?: 'cli' | 'tui' | 'gui' | 'acp' | 'tool' | 'oneshot'
++  source?: string
+   cwd?: string | null
+   row_cwd?: string | null
+   model?: string | null
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index cb218abda99..ff77c9bda6c 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -8628,14 +8628,7 @@
+           },
+           "source": {
+             "default": "cli",
+-            "enum": [
+-              "cli",
+-              "tui",
+-              "gui",
+-              "acp",
+-              "tool",
+-              "oneshot"
+-            ],
++            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+             "title": "Source",
+             "type": "string"
+           },
+diff --git a/gateway/run_turn_prepare.py b/gateway/run_turn_prepare.py
+index a828ed37afd..19e7ae5df2f 100644
+--- a/gateway/run_turn_prepare.py
++++ b/gateway/run_turn_prepare.py
+@@ -63,6 +63,8 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str
+             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
+             fallback_entry.get('model') or 'default')
+         return fallback_entry['model'], _runtime_agent_kwargs(runtime)
++    if runtime.get('class_deferred'):
++        return runtime['model'], _runtime_agent_kwargs(runtime)
+     return model, _runtime_agent_kwargs(runtime)
+ 
+ 
+diff --git a/gateway/session_policy.py b/gateway/session_policy.py
+index 47d7366bcda..e761c468043 100644
+--- a/gateway/session_policy.py
++++ b/gateway/session_policy.py
+@@ -89,6 +89,28 @@ _KEEP_STORED_LABEL = frozenset({'tool', 'oneshot'})
+ STORED_AS_LOCAL = frozenset(SURFACES) - _KEEP_STORED_LABEL
+ # Routing labels and the accounting placeholder: never a creating surface.
+ _NOT_A_SURFACE = frozenset({None, '', 'local', 'unknown'})
++# [daveey] A free ``--source`` tag (``bb-reviewer``, ``peer-mail``): a script's integration label. It runs as
++# ``tool`` and is stored under its own name, so ``sessions.sidebar_exclude_sources`` and ``--source`` filters can
++# still name it. A messaging platform name, a routing label or another surface's alias is never a free tag.
++FREE_LABEL_PATTERN = r'^[a-z0-9][a-z0-9._-]{0,63}$'
++_RESERVED_LABELS = frozenset({'local', 'unknown', 'desktop', 'cron', 'kanban', 'bot_room', 'a2a', 'subagent',
++                              'gateway', 'webui', 'dashboard'})
++
++
++def is_free_label(label):
++    """Whether *label* is a free integration tag: well formed, and not a surface or a reserved name."""
++    import re
++    if not isinstance(label, str) or label in SURFACES or not re.fullmatch(FREE_LABEL_PATTERN, label):
++        return False
++    from gateway.config import Platform
++    return label not in _RESERVED_LABELS and label not in {p.value for p in Platform}
++
++
++def surface_label(label):
++    """The ``SURFACES`` label *label* behaves as: itself, ``tool`` for a free tag, else None."""
++    if label in SURFACES:
++        return label
++    return 'tool' if is_free_label(label) else None
+ 
+ 
+ def created_surface(label):
+@@ -252,7 +274,7 @@ class LocalSessionPolicy:
+     def current_toolsets(self, config):
+         """The next turn's toolsets from its resolved *config*: a following session without an explicit
+         toolset pick runs the profile's current selection (main #124211), else the frozen launch set."""
+-        if (not self.follows_profile or self.source not in SURFACES or self.editor_mcp_json is not None
++        if (not self.follows_profile or surface_label(self.source) is None or self.editor_mcp_json is not None
+                 or 'toolsets' in json.loads(self.request_json)):
+             return self.toolsets
+         # The workspace decision is the creation-time one: a project file the agent writes mid-session must
+@@ -423,9 +445,10 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
+         from gateway.session_a2a import build_forward_policy
+         return build_forward_policy(params, config, private_secrets=private_secrets)
+     unknown = sorted(set(params) - CREATE_FIELDS)
+-    if unknown or not isinstance(source, str) or source not in SURFACES:
++    kind = surface_label(source)
++    if unknown or kind is None:
+         _refuse(f'params.{unknown[0]}' if unknown else 'source',
+-                'unknown create field' if unknown else f'not a surface: {source!r}')
++                'unknown create field' if unknown else f'not a surface or a free tag: {source!r}')
+     bad_bypass = next((name for name in BYPASS_FIELDS if name in params and type(params[name]) is not bool), None)
+     if bad_bypass:
+         _refuse(bad_bypass, 'must be a boolean')
+@@ -458,7 +481,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
+     # The posture is opt-in (``session.create`` only) and needs a folder the client named: the daemon's own
+     # directory (the fallback above) is no workspace, and ``tool`` is a third-party integration. An explicit
+     # pick wins anyway; skipping it here also spares the probe.
+-    named = workspace_posture and source != 'tool' and 'cwd' in params and 'toolsets' not in params
++    named = workspace_posture and kind != 'tool' and 'cwd' in params and 'toolsets' not in params
+     coding_posture = named and _in_coding_workspace(config, source, cwd)
+     enabled = _resolve_toolsets(params, config, source, safe_mode, coding_posture, bypass=ignore_user_config)
+     terminal = build_profile_terminal_scope(get_hermes_home()) if profile_terminal else default_terminal_scope()
+@@ -482,7 +505,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
+     private_editor_request(request, private_secrets)
+     _extract_config_secrets(config, private_secrets)
+     _extract_config_secrets(terminal, private_secrets, (None,))
+-    return LocalSessionPolicy(source, SURFACES[source], cwd, model, tuple(sorted(enabled)),
++    return LocalSessionPolicy(source, SURFACES[kind], cwd, model, tuple(sorted(enabled)),
+                               json.dumps(config), json.dumps(request, sort_keys=True), json.dumps(terminal),
+                               safe_mode=safe_mode, ignore_user_config=ignore_user_config,
+                               coding_posture=coding_posture, client_env_json=client_env,
+@@ -996,6 +1019,8 @@ def restore_policy(data):
+         policy = LocalSessionPolicy(**data)
+         from gateway.session_a2a import is_forward_policy
+         surfaces = {**SURFACES, 'cron': 'cron', 'kanban': 'cli', 'bot_room': 'bot_room'}
++        if is_free_label(policy.source):
++            surfaces[policy.source] = SURFACES['tool']
+         if ((not is_forward_policy(policy) and
+              (policy.source not in surfaces or policy.platform != surfaces[policy.source]))
+                 or not isinstance(policy.cwd, str) or not Path(policy.cwd).is_absolute()
+diff --git a/gateway/session_worker_construct.py b/gateway/session_worker_construct.py
+index 9858152be25..c9b0b864a2f 100644
+--- a/gateway/session_worker_construct.py
++++ b/gateway/session_worker_construct.py
+@@ -147,6 +147,20 @@ def _dict_list(value):
+     return value is None or (isinstance(value, list) and all(isinstance(e, dict) for e in value))
+ 
+ 
++def _deferred_class_runtime(frozen, model, provider, key, launch_url):
++    """[daveey] A ``class:`` route is not resolved here: allocation is sticky per session, and only ``AIAgent``
++    (``prepare_agent_route``) holds the session id, so resolving now failed every turn with "Class routing
++    requires a durable session/job identity". Same deferral as the messaging path
++    (``gateway.run_class_routing.class_session_runtime``). A launch key or URL is not deferred: the resolver
++    refuses explicit credentials for a class selector, and that refusal stays."""
++    from agent.model_routing import is_class_selector
++    target = model or (frozen.get('model') or {}).get('default')
++    if key or launch_url or not is_class_selector(target):
++        return None
++    requested = provider or 'auto'
++    return {'provider': requested, 'requested_provider': requested, 'model': target, 'class_deferred': True}
++
++
+ def route_runtime(policy, frozen, model, key, *, fallback=True):
+     """``(runtime, fallback_entry)`` for a launch-policy route: the session's FROZEN config and launch
+     credential, walking its own fallback chain on an AuthError unless ``fallback=False`` (a session
+@@ -158,6 +172,9 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
+     from hermes_cli.runtime_provider_custom import _resolve_named_custom_runtime
+     provider = (frozen.get('model') or {}).get('provider')
+     launch_url = json.loads(policy.request_json).get('base_url')
++    deferred = _deferred_class_runtime(frozen, model, provider, key, launch_url)
++    if deferred is not None:
++        return deferred, None
+     if launch_url:
+         # The creation request is immutable identity, not the current selection: once a canonical
+         # model mutation moved the route off the launch endpoint, the policy's selection wins.
+diff --git a/hermes_cli/_parser.py b/hermes_cli/_parser.py
+index 48b4250efca..4cbe4f152bf 100644
+--- a/hermes_cli/_parser.py
++++ b/hermes_cli/_parser.py
+@@ -315,7 +315,7 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
+     inherited(chat_parser, "--safe-mode", action="store_true", default=SUPPRESS,
+               help="Troubleshooting mode: disable ALL customizations — user config, AGENTS.md/memory injection, plugins, and MCP servers (implies --ignore-user-config and --ignore-rules). Use to isolate whether a problem comes from your setup or from Hermes itself.")
+     add("--source", default=None,
+-        help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.")
++        help="Session source tag (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists; any other lowercase tag (e.g. 'peer-mail') runs as 'tool' and is stored under its own name for --source filters and sessions.sidebar_exclude_sources. Messaging platform names are refused.")
+     add("--origin-session", default=None,
+         help="This session works for a chat on ANOTHER gateway (@session:<profile>@<gateway>/<id>): it gets the kanban tools and every card it creates shows in that chat's task list. Exits 2 with a typed error if the binding could never be read back there.")
+     inherited(chat_parser, "--tui", action="store_true", default=SUPPRESS,
+diff --git a/tests/gateway/test_policy_class_route_deferred.py b/tests/gateway/test_policy_class_route_deferred.py
+new file mode 100644
+index 00000000000..b7cc249993e
+--- /dev/null
++++ b/tests/gateway/test_policy_class_route_deferred.py
+@@ -0,0 +1,53 @@
++"""[daveey] A launch-policy session on a ``class:`` model defers class resolution to the agent boundary.
++
++``hermes chat -Q --oneshot --source tool`` on a profile whose default is ``class:deep`` failed every turn with
++"Class routing requires a durable session/job identity": ``route_runtime`` resolved the selector with no session
++id. Class allocation is sticky per session, so it belongs to ``AIAgent`` (``prepare_agent_route``), which owns the
++session id, exactly as the messaging path defers it (``gateway.run_class_routing.class_session_runtime``).
++"""
++import pytest
++
++CLASS_CONFIG = {'model': {'default': 'class:deep', 'provider': 'auto'},
++                'model_routing': {'enabled': True, 'policy_version': 1, 'routes': {}}}
++
++
++def _policy(tmp_path, config, **params):
++    from gateway.session_policy import build_policy
++    return build_policy({'source': 'tool', 'cwd': str(tmp_path), 'toolsets': [], **params}, config,
++                        profile_terminal=False)
++
++
++# The CLI sends its resolved model (``model='class:deep'``); another client may leave the profile default.
++PICKS = [{'model': 'class:deep'}, {}]
++
++
++@pytest.mark.parametrize('pick', PICKS, ids=['picked', 'profile-default'])
++@pytest.mark.parametrize('fallback', [True, False])
++def test_a_class_route_is_deferred_not_resolved_without_a_session(tmp_path, fallback, pick):
++    from gateway.session_worker_construct import route_runtime
++    policy = _policy(tmp_path, CLASS_CONFIG, **pick)
++    frozen, model = policy.effective()
++    runtime, fallback_entry = route_runtime(policy, frozen, model, None, fallback=fallback)
++    assert fallback_entry is None
++    assert (runtime['provider'], runtime['requested_provider']) == ('auto', 'auto')
++    assert not runtime.get('api_key') and not runtime.get('base_url')
++
++
++@pytest.mark.parametrize('pick', PICKS, ids=['picked', 'profile-default'])
++def test_the_in_process_turn_hands_the_class_selector_to_the_agent(tmp_path, pick):
++    from types import SimpleNamespace
++    from gateway.run_turn_prepare import _resolve_policy_agent_runtime
++    policy = _policy(tmp_path, CLASS_CONFIG, **pick)
++    runner = SimpleNamespace(session_authority=None)
++    model, kwargs = _resolve_policy_agent_runtime(runner, policy)
++    assert model == 'class:deep'
++    assert kwargs['provider'] == 'auto' and kwargs['api_key'] is None
++
++
++def test_a_class_route_with_a_launch_key_still_refuses(tmp_path):
++    from agent.model_routing import ModelRoutingError
++    from gateway.session_worker_construct import route_runtime
++    policy = _policy(tmp_path, CLASS_CONFIG, model='class:deep')
++    frozen, model = policy.effective()
++    with pytest.raises(ModelRoutingError):
++        route_runtime(policy, frozen, model, 'sk-launch', fallback=False)
+diff --git a/tests/gateway/test_session_create_free_source.py b/tests/gateway/test_session_create_free_source.py
+new file mode 100644
+index 00000000000..da4ba9d2f79
+--- /dev/null
++++ b/tests/gateway/test_session_create_free_source.py
+@@ -0,0 +1,69 @@
++"""[daveey] ``hermes chat --source <tag>``: a free integration tag still starts a session.
++
++Scripts tag their one-shots (``bb-reviewer``, ``bb-judge``, ``peer-mail``, ``selfheal-replay``) so
++``sessions.sidebar_exclude_sources`` and ``hermes sessions list --source`` can name them. Once the CLI
++created its sessions through ``session.create``, the closed create contract refused every such tag with
++``invalid_params (source)``, so the BB merge queue's reviewer and every hermes-mail prompt failed before
++reaching a model. A free tag runs as the ``tool`` surface and keeps its own label on the row.
++"""
++import json
++
++import pytest
++
++from tests.gateway.test_resume_latest_local_cli import _call, _listed, _owner
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('tag', ['bb-reviewer', 'peer-mail', 'selfheal.replay_2'])
++async def test_a_free_tag_creates_a_tool_surface_session_stored_under_its_own_label(tmp_path, monkeypatch, capsys, tag):
++    store, authority, owner = _owner(tmp_path / 'home', monkeypatch)
++    try:
++        created = await _call(owner, 'session.create', request_id='r', source=tag, cwd=str(tmp_path), toolsets=[],
++                              model='m')
++        assert isinstance(created, dict), created
++        sid = created['session_id']
++        row = authority.db.get_session(sid)
++        assert (row['source'], row['created_source']) == (tag, tag)
++        from gateway.session_policy import restore_policy
++        from hermes_state_local import local_receipt
++        policy = restore_policy(local_receipt(authority.db, sid)['policy'])
++        assert (policy.source, policy.platform) == (tag, 'cli')
++        assert sid in _listed(authority.db, tag, capsys)
++        assert sid not in _listed(authority.db, 'cli', capsys)
++        # The peer refresh keeps the label (only cli/tui/gui/acp rows are relabelled local).
++        live = authority.sessions[sid]
++        store._record_gateway_session_peer(sid, live.route, live.source)
++        assert authority.db.get_session(sid)['source'] == tag
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('tag', ['telegram', 'cron', 'kanban', 'local', 'desktop', 'a2a', 'Bad Tag', '', 'x' * 65])
++async def test_platform_names_routing_labels_and_malformed_tags_are_still_refused(tmp_path, monkeypatch, tag):
++    store, _authority, owner = _owner(tmp_path / 'home', monkeypatch)
++    try:
++        refused = await _call(owner, 'session.create', request_id='r', source=tag, cwd=str(tmp_path), toolsets=[],
++                              model='m')
++        assert refused == 'invalid_params'
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
++
++
++def test_a_free_tag_policy_survives_a_restore(tmp_path):
++    from dataclasses import asdict
++    from gateway.session_policy import build_policy, restore_policy
++    policy = build_policy({'source': 'bb-judge', 'cwd': str(tmp_path), 'toolsets': [], 'model': 'm'},
++                          {'model': {'default': 'm'}}, profile_terminal=False)
++    restored = restore_policy(json.loads(json.dumps(asdict(policy))))
++    assert (restored.source, restored.platform) == ('bb-judge', 'cli')
++
++
++def test_the_create_contract_accepts_a_free_tag_and_refuses_a_malformed_one():
++    from tui_gateway.contracts.canonical_sessions import CanonicalCreateParams
++    assert CanonicalCreateParams.model_validate({'source': 'bb-reviewer'}).source == 'bb-reviewer'
++    from pydantic import ValidationError
++    with pytest.raises(ValidationError):
++        CanonicalCreateParams.model_validate({'source': 'Bad Tag'})
+diff --git a/tests/gateway/test_session_policy_refusal_fields.py b/tests/gateway/test_session_policy_refusal_fields.py
+index 350c9d20596..c85605e9c16 100644
+--- a/tests/gateway/test_session_policy_refusal_fields.py
++++ b/tests/gateway/test_session_policy_refusal_fields.py
+@@ -25,7 +25,8 @@ def _refusal(params, cfg=None, **kwargs):
+ 
+ @pytest.mark.parametrize('extra, field', [
+     ({'bogus': 1}, 'params.bogus'),                    # an unknown create field
+-    ({'source': 'nope'}, 'source'),                     # not a known surface
++    ({'source': 'Nope'}, 'source'),                     # not a surface or a well-formed free tag
++    ({'source': 'telegram'}, 'source'),                 # a platform name is never a free tag
+     ({'source': 'cli', 'safe_mode': 'yes'}, 'safe_mode'),
+     ({'source': 'cli', 'ignore_user_config': 1}, 'ignore_user_config'),
+     ({'source': 'cli', 'api_key': '   '}, 'api_key'),
+diff --git a/tui_gateway/contracts/canonical_sessions.py b/tui_gateway/contracts/canonical_sessions.py
+index 642364a17f0..869803d37af 100644
+--- a/tui_gateway/contracts/canonical_sessions.py
++++ b/tui_gateway/contracts/canonical_sessions.py
+@@ -4,7 +4,7 @@ Reuse upstream authority-only value shapes; these overrides do not widen METHODS
+ """
+ from typing import Literal
+ 
+-from pydantic import RootModel
++from pydantic import Field, RootModel
+ 
+ from .base import JsonValue, Params, Result
+ from .common import ProfileParams, TranscriptMessage
+@@ -20,7 +20,9 @@ class CanonicalSessionParams(ProfileParams):
+ 
+ class CanonicalCreateParams(ProfileParams):
+     request_id: str | None = None
+-    source: Literal['cli', 'tui', 'gui', 'acp', 'tool', 'oneshot'] = 'cli'
++    # A surface (cli, tui, gui, acp, tool, oneshot) or a free integration tag (``bb-reviewer``, ``peer-mail``)
++    # that runs as ``tool`` under its own stored label [daveey]; gateway.session_policy.surface_label decides.
++    source: str = Field('cli', pattern=r'^[a-z0-9][a-z0-9._-]{0,63}$')
+     cwd: str | None = None
+     # The sessions-row ``cwd`` when it differs from the execution ``cwd`` (the classic CLI records
+     # main's stamp: the launch dir, ``""`` = none); ``cwd`` stays where the tools run.
+-- 
+2.55.0
+

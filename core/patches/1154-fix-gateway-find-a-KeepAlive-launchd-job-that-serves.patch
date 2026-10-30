@@ -1,0 +1,403 @@
+From 0e47c674ecdf17ce7985b55ab0f85799480b08ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:17:56 +0000
+Subject: [PATCH 1154/1157] fix(gateway): find a KeepAlive launchd job that
+ serves the home under any label; hand a supervised home back [daveey]
+
+Self-heal defect gateway-e2cd786685 (mini): ~/.app-hermes is supervised by com.example.myapp.hermes,
+not ai.hermes.gateway*. During that job's restart gap a client's ensure found "no service" and spawned an
+unmanaged gateway (no idle exit) under com.nousresearch.hermes.runtime.*; every KeepAlive restart was then
+refused by it (already_running, exit 75 loop) for good.
+
+- gateway_runtime_service._launchd: when no canonical job exists, scan ~/Library/LaunchAgents for a loaded,
+  KeepAlive, non-Disabled job whose HERMES_HOME resolves to this exact home and whose argv runs
+  `gateway run` (a launcher's --home must match too). Start it with a plain kickstart; never spawn beside it.
+- start_detached_replacement (gateway restart --detach) starts a discovered service instead of spawning.
+- run_bootstrap: a --external-supervisor start refused by a live owner that identifies as "manual"
+  writes that owner's planned-stop marker (graceful drain) and still exits 1, so the supervisor's next
+  restart takes the home over. Supervised, Desktop or silent owners are never asked.
+- Tests: test_gateway_runtime_custom_launchd.py (discovery, ensure, restart --detach) and a handback
+  matrix in test_gateway_start_refused.py.
+---
+ gateway/run_bootstrap.py                      |  36 ++++
+ hermes_cli/gateway_runtime_service.py         |  62 +++++++
+ hermes_cli/gateway_runtime_start.py           |  16 ++
+ .../test_gateway_runtime_custom_launchd.py    | 164 ++++++++++++++++++
+ .../hermes_cli/test_gateway_start_refused.py  |  39 +++++
+ 5 files changed, 317 insertions(+)
+ create mode 100644 tests/hermes_cli/test_gateway_runtime_custom_launchd.py
+
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 8409b3a35b7..c9b5a2b4b57 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -27,6 +27,41 @@ def _start_deferred_state_db_integrity_check(evidence: dict) -> None:
+ # Log-record parity with the origin module.
+ logger = logging.getLogger("gateway.run")
+ 
++
++def _hand_home_back_to_supervisor(existing_pid: int) -> None:
++    """[daveey] A supervised start refused by a MANUAL owner of this home asks that owner to drain.
++
++    gateway-e2cd786685: during a KeepAlive job's restart gap a client spawned an unmanaged gateway for
++    the job's home (it has no idle exit), and every supervised restart after that was refused by it,
++    forever. This start still refuses (exit 1, the supervisor's normal retry); it only writes the
++    owner's planned-stop marker, which the owner's own watcher turns into a graceful drain, so the
++    supervisor's next restart finds the home free. Only when this process runs for an external
++    supervisor (``--external-supervisor``) and the owner itself answers ``identify`` with this pid and
++    ``launch_supervisor == "manual"``: a supervised owner (an old copy still draining, gateway-cc28b19bca),
++    a Desktop-managed one, or one that does not answer is never asked to stop.
++    """
++    import sys
++    if "--external-supervisor" not in sys.argv[1:]:
++        return
++    try:
++        from gateway.control_socket import identify_gateway, launch_supervisor
++        from gateway.run import get_hermes_home
++        identity = identify_gateway(get_hermes_home()) or {}
++        if identity.get("pid") != existing_pid or launch_supervisor(identity) != "manual":
++            return
++        from gateway.status import write_planned_stop_marker
++        if not write_planned_stop_marker(existing_pid):
++            return
++    except Exception:  # health: allow BLE001 -- the handback is best-effort; the refusal stands either way
++        logger.debug("Supervisor handback for PID %d failed", existing_pid, exc_info=True)
++        return
++    logger.warning("Asked the unsupervised gateway (PID %d) holding this home to drain so its "
++                   "supervisor can take over; the supervisor's next restart starts here.", existing_pid)
++    from gateway.run_exit_reason import last_start_refusal
++    refusal = last_start_refusal()
++    if refusal is not None:
++        refusal["handback"] = "planned_stop_requested"
++
+ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: bool) -> bool:
+     """Handle a live gateway PID under this HERMES_HOME: replace it (``--replace``) or refuse.
+     Returns False when startup must abort (refused, permission denied, target still alive)."""
+@@ -47,6 +82,7 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
+             f"   Or stop it first:    hermes gateway stop\n")
+         from gateway.run_exit_reason import note_start_refused
+         note_start_refused("already_running", owner_pid=existing_pid)
++        _hand_home_back_to_supervisor(existing_pid)
+         return False
+ 
+     # Never signal a process not provably ours (a poisoned PID record → cross-profile restart loop).
+diff --git a/hermes_cli/gateway_runtime_service.py b/hermes_cli/gateway_runtime_service.py
+index 794b054271f..59e69475317 100644
+--- a/hermes_cli/gateway_runtime_service.py
++++ b/hermes_cli/gateway_runtime_service.py
+@@ -215,6 +215,68 @@ def _launchd(home: Path, deadline: float) -> ExistingService | None:
+         _verify_binding(verify_launchd_plist, definition, label, home)
+         # Load ONLY the existing file, never bootout/rewrite or kickstart -k.
+         return ExistingService("launchd", ("launchctl", "bootstrap", domains[0], str(plist)))
++    return _custom_launchd_job(home.resolve(), account_home / "Library/LaunchAgents", domains[0], deadline)
++
++
++# Trailing ``gateway run`` flags a supervised job may carry; anything else is not a plain gateway run.
++_CUSTOM_JOB_RUN_FLAGS = frozenset({"--quiet", "--external-supervisor", "--replace"})
++
++
++def _custom_job_runs_gateway_for(argv: list, home: Path) -> bool:
++    """``argv`` ends in ``<hermes | -m hermes_cli.main> [--profile X] gateway run [flags]``, optionally behind
++    a launcher wrapper; any ``--home`` the wrapper names must be this home too."""
++    if not argv or not all(isinstance(arg, str) for arg in argv):
++        return False
++    for index, arg in enumerate(argv):
++        if arg == "--home" and index + 1 < len(argv):
++            if Path(argv[index + 1]).expanduser().resolve() != home:
++                return False
++    starts = [i for i in range(len(argv) - 1) if argv[i] == "gateway" and argv[i + 1] == "run"]
++    if len(starts) != 1 or not set(argv[starts[0] + 2:]) <= _CUSTOM_JOB_RUN_FLAGS:
++        return False
++    before = argv[:starts[0]]
++    if len(before) >= 2 and before[-2] in {"--profile", "-p"}:
++        before = before[:-2]
++    entry = before[-1] if before else ""
++    return entry == "hermes_cli.main" or Path(entry).name in {"hermes", "hermes.exe"}
++
++
++def _custom_launchd_job(home: Path, agents: Path, domain: str, deadline: float) -> ExistingService | None:
++    """[daveey] A KeepAlive LaunchAgent that serves THIS home under a label Hermes did not install.
++
++    Hosts that supervise a gateway themselves (the mini: ``com.example.myapp.hermes`` pins
++    ``HERMES_HOME`` and runs ``gateway run --external-supervisor`` under a launcher) have no
++    ``ai.hermes.gateway*`` job, so this probe used to answer "no service" and the client spawned an
++    unmanaged gateway inside the job's restart gap. That spawn has no idle exit, so it held the home and
++    every KeepAlive restart was refused forever (self-heal defect gateway-e2cd786685). Matched exactly:
++    the plist's ``HERMES_HOME`` resolves to this home (a profile under it is another home), KeepAlive is
++    on, the job is not Disabled, it runs ``gateway run``, and it is loaded in the gui domain. The result
++    is a plain ``kickstart`` (start it if stopped), never ``-k``, ``bootstrap`` or a plist rewrite."""
++    from hermes_cli.gateway_runtime_service_identity import read_definition
++    try:
++        plists = sorted(agents.glob("*.plist"))
++    except OSError:
++        return None
++    for plist in plists:
++        try:
++            definition = plistlib.loads(read_definition(plist))
++        except (OSError, ValueError, ExpatError, plistlib.InvalidFileException):
++            continue  # an unreadable agent cannot be shown to serve this home
++        if not isinstance(definition, dict) or definition.get("Disabled") or not definition.get("KeepAlive"):
++            continue
++        label, env = definition.get("Label"), definition.get("EnvironmentVariables")
++        configured = env.get("HERMES_HOME") if isinstance(env, dict) else None
++        if not isinstance(label, str) or not label or not isinstance(configured, str) or not configured:
++            continue
++        if not Path(configured).is_absolute() or Path(configured).expanduser().resolve() != home:
++            continue
++        if not _custom_job_runs_gateway_for(definition.get("ProgramArguments") or [], home):
++            continue
++        result = _run(["launchctl", "print", f"{domain}/{label}"], deadline)
++        if result.returncode != 0:
++            continue  # installed but not loaded: launchd is not supervising it now
++        return ExistingService("launchd", ("launchctl", "kickstart", f"{domain}/{label}"),
++                               "state = running" in result.stdout)
+     return None
+ 
+ 
+diff --git a/hermes_cli/gateway_runtime_start.py b/hermes_cli/gateway_runtime_start.py
+index e5fb1ff4d46..d9d00399848 100644
+--- a/hermes_cli/gateway_runtime_start.py
++++ b/hermes_cli/gateway_runtime_start.py
+@@ -103,6 +103,22 @@ def start_detached_replacement(profile_home: Path, *, force: bool = False) -> in
+     ``gateway ensure`` starts an absent one. In the foreground, the restarting client (Desktop's
+     bounded, piped call) would itself become the long-lived gateway it only meant to restart."""
+     import time
++    # [daveey] A service manager that owns this home (any label, gateway-e2cd786685) starts the
++    # replacement; an unmanaged spawn here would hold the home against that supervisor's restarts.
++    from hermes_cli.gateway_runtime_service import discover_existing_gateway_service, start_existing_gateway_service
++    deadline = time.monotonic() + 30
++    try:
++        service = discover_existing_gateway_service(profile_home, deadline=deadline)
++    except (RuntimeStartError, TimeoutError):
++        service = None  # unknown supervisor state: keep the old spawn rather than leave the home down
++    if service is not None:
++        try:
++            start_existing_gateway_service(service, deadline=deadline)
++        except (RuntimeStartError, TimeoutError) as exc:
++            print(f"✗ Could not start the gateway's service ({' '.join(service.start_argv)}): {exc}", file=sys.stderr)
++            return 1
++        print(f"✓ Handed the restart to the gateway's service ({' '.join(service.start_argv)})")
++        return 0
+     try:
+         spawn_unmanaged_gateway(profile_home, deadline=time.monotonic() + 30, force=force)
+     except RuntimeStartError as exc:
+diff --git a/tests/hermes_cli/test_gateway_runtime_custom_launchd.py b/tests/hermes_cli/test_gateway_runtime_custom_launchd.py
+new file mode 100644
+index 00000000000..a453b88fe79
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_runtime_custom_launchd.py
+@@ -0,0 +1,164 @@
++"""A KeepAlive launchd job that serves the home under a label Hermes did not install.
++
++The mini supervises ``~/.app-hermes`` as ``com.example.myapp.hermes`` (``~/.hermes`` is a symlink
++to it). Discovery only knew ``ai.hermes.gateway[-suffix]``, so during the job's restart gap a client
++saw "no service", spawned an unmanaged gateway (no idle exit), and every KeepAlive restart was then
++refused by that owner for good (self-heal defect gateway-e2cd786685). The launchctl boundary is a
++stub: nothing here touches a real service manager.
++"""
++import plistlib
++import pwd
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++LABEL = "com.example.myapp.hermes"
++
++
++def _agent(tmp_path, home, **overrides):
++    argv = [str(tmp_path / ".hermes/bin/hermes-gateway-launcher"), "--home", str(home), "--",
++            str(tmp_path / "code/hermes-agent/.venv/bin/hermes"), "gateway", "run", "--external-supervisor"]
++    definition = dict(Label=LABEL, KeepAlive=True, RunAtLoad=True, ProgramArguments=argv,
++                      EnvironmentVariables=dict(HERMES_HOME=str(home), HOME=str(tmp_path)))
++    definition.update(overrides)
++    agents = tmp_path / "Library/LaunchAgents"
++    agents.mkdir(parents=True, exist_ok=True)
++    (agents / f"{LABEL}.plist").write_bytes(plistlib.dumps(definition))
++    # An unrelated agent of the same home that is not a gateway must never be picked.
++    (agents / "com.example.myapp.brain.plist").write_bytes(plistlib.dumps(dict(
++        Label="com.example.myapp.brain", KeepAlive=True, ProgramArguments=["/usr/bin/python3", "brain.py"],
++        EnvironmentVariables=dict(HERMES_HOME=str(home)))))
++    return definition
++
++
++def _mini_home(tmp_path):
++    """``~/.hermes`` -> ``~/.app-hermes``: the client asks for the symlink, the plist pins the target."""
++    real = tmp_path / ".bb-hermes"
++    real.mkdir(mode=0o700)
++    link = tmp_path / ".hermes"
++    link.symlink_to(real)
++    return link, real
++
++
++def _launchctl(monkeypatch, service, *, loaded=(LABEL,), state="not running"):
++    calls = []
++
++    def run(argv, *_a, **_k):
++        calls.append(list(argv))
++        assert argv[0] == "launchctl"
++        if argv[1] == "print":
++            label = argv[2].rsplit("/", 1)[1]
++            if label in loaded and argv[2].startswith("gui/"):
++                return SimpleNamespace(returncode=0, stdout=f"{argv[2]} = {{\n\tstate = {state}\n}}\n")
++            return SimpleNamespace(returncode=113, stdout="")
++        return SimpleNamespace(returncode=0, stdout="")
++
++    monkeypatch.setattr(service, "_run", run)
++    return calls
++
++
++@pytest.fixture
++def account(tmp_path, monkeypatch):
++    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path), pw_name="owner"))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    return tmp_path
++
++
++def test_custom_label_keepalive_job_for_this_home_is_the_service(account, monkeypatch):
++    from hermes_cli import gateway_runtime_service as service
++    link, real = _mini_home(account)
++    _agent(account, real)
++    calls = _launchctl(monkeypatch, service)
++
++    found = service._launchd(link, time.monotonic() + 5)
++
++    assert found is not None, "a KeepAlive job serving this home under another label is the service"
++    assert found.backend == "launchd"
++    # Plain kickstart (start if stopped), never -k: a running owner is left alone.
++    assert found.start_argv[:2] == ("launchctl", "kickstart") and found.start_argv[-1].endswith("/" + LABEL)
++    assert "-k" not in found.start_argv and found.running is False
++    service.start_existing_gateway_service(found, deadline=time.monotonic() + 5)
++    assert calls[-1][:2] == ["launchctl", "kickstart"]
++
++
++def test_running_custom_job_is_awaited_not_restarted(account, monkeypatch):
++    from hermes_cli import gateway_runtime_service as service
++    link, real = _mini_home(account)
++    _agent(account, real)
++    calls = _launchctl(monkeypatch, service, state="running")
++    found = service._launchd(link, time.monotonic() + 5)
++    assert found is not None and found.running is True
++    service.start_existing_gateway_service(found, deadline=time.monotonic() + 5)
++    assert not any(c[1] == "kickstart" for c in calls)
++
++
++@pytest.mark.parametrize("case", ["other_home", "no_keepalive", "disabled", "not_a_gateway", "not_loaded",
++                                  "launcher_other_home", "profile_home"])
++def test_custom_job_must_be_an_exact_keepalive_gateway_of_this_home(case, account, monkeypatch):
++    from hermes_cli import gateway_runtime_service as service
++    link, real = _mini_home(account)
++    other = account / ".other-hermes"
++    other.mkdir()
++    overrides = {
++        "other_home": {"EnvironmentVariables": dict(HERMES_HOME=str(other))},
++        "no_keepalive": {"KeepAlive": False},
++        "disabled": {"Disabled": True},
++        "not_a_gateway": {"ProgramArguments": [str(account / "code/hermes-agent/.venv/bin/hermes"), "dashboard"]},
++        "launcher_other_home": {"ProgramArguments": [str(account / ".hermes/bin/hermes-gateway-launcher"), "--home",
++                                                     str(other), "--", "hermes", "gateway", "run"]},
++    }.get(case, {})
++    if case == "profile_home":
++        # A profile under the home is a different home: the root's job does not serve it by this rule.
++        link = real / "profiles" / "worker"
++        link.mkdir(parents=True)
++    _agent(account, real, **overrides)
++    _launchctl(monkeypatch, service, loaded=() if case == "not_loaded" else (LABEL,))
++    assert service._launchd(link, time.monotonic() + 5) is None
++
++
++def test_ensure_starts_the_custom_supervisor_and_never_spawns(account, monkeypatch):
++    """The live failure: an absent owner inside the job's restart gap. Before the fix ensure spawned."""
++    from hermes_cli import gateway_runtime as runtime, gateway_runtime_service as service, gateway_runtime_start as start
++    link, real = _mini_home(account)
++    _agent(account, real)
++    calls = _launchctl(monkeypatch, service)
++    spawned = []
++    monkeypatch.setattr(service.sys, "platform", "darwin")  # os-marker: ok — launchctl and the plist dir are stubbed; the logic is host-independent
++    monkeypatch.setattr("hermes_cli.service_manager._s6_running", lambda: False)
++    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **k: runtime.GatewayDiscovery("absent"))
++    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda target, **k: spawned.append(Path(target)))
++
++    runtime.ensure_gateway_runtime(link, timeout=0.3)
++
++    assert spawned == [], "a supervised home must never get an unmanaged gateway"
++    assert any(c[:2] == ["launchctl", "kickstart"] and c[-1].endswith("/" + LABEL) for c in calls)
++
++
++def test_detached_replacement_hands_the_home_to_the_custom_supervisor(account, monkeypatch, capsys):
++    """`gateway restart --detach` with no canonical service used to spawn unmanaged right away."""
++    from hermes_cli import gateway_runtime_service as service, gateway_runtime_start as start
++    link, real = _mini_home(account)
++    _agent(account, real)
++    calls = _launchctl(monkeypatch, service)
++    monkeypatch.setattr(service.sys, "platform", "darwin")  # os-marker: ok — launchctl and the plist dir are stubbed; the logic is host-independent
++    monkeypatch.setattr("hermes_cli.service_manager._s6_running", lambda: False)
++    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda *a, **k: pytest.fail("spawned beside a supervisor"))
++
++    assert start.start_detached_replacement(link) == 0
++    assert any(c[:2] == ["launchctl", "kickstart"] and c[-1].endswith("/" + LABEL) for c in calls)
++    assert LABEL in capsys.readouterr().out
++
++
++def test_detached_replacement_without_any_service_still_spawns(account, monkeypatch):
++    from hermes_cli import gateway_runtime_service as service, gateway_runtime_start as start
++    link, _real = _mini_home(account)
++    _launchctl(monkeypatch, service, loaded=())
++    monkeypatch.setattr(service.sys, "platform", "darwin")  # os-marker: ok — launchctl and the plist dir are stubbed; the logic is host-independent
++    monkeypatch.setattr("hermes_cli.service_manager._s6_running", lambda: False)
++    spawned = []
++    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda target, **k: spawned.append(Path(target)))
++    assert start.start_detached_replacement(link) == 0
++    assert spawned == [link]
+diff --git a/tests/hermes_cli/test_gateway_start_refused.py b/tests/hermes_cli/test_gateway_start_refused.py
+index 235b100fa43..e66e03c39a0 100644
+--- a/tests/hermes_cli/test_gateway_start_refused.py
++++ b/tests/hermes_cli/test_gateway_start_refused.py
+@@ -175,3 +175,42 @@ def test_reset_clears_the_refusal(monkeypatch, live_pid):
+     note_start_refused("already_running", owner_pid=live_pid)
+     reset_start_refusal()
+     assert last_start_refusal() is None
++
++
++# [daveey] gateway-e2cd786685: a client-spawned (manual) gateway owned the home that a KeepAlive job
++# supervises, so every supervised restart was refused forever. A supervised start refused by a live
++# MANUAL owner of the same home asks that owner to drain (planned-stop marker) and still exits 1, so
++# the supervisor's next restart takes the home over. A supervised owner is never asked.
++@pytest.mark.parametrize("owner_supervisor,supervised_start,expect_handback", [
++    ("manual", True, True),        # the live failure
++    ("launchd", True, False),      # an old supervised copy still draining (gateway-cc28b19bca): wait, never stop it
++    ("external", True, False),
++    ("desktop", True, False),
++    ("manual", False, False),      # a plain second `gateway run` never stops anyone
++    (None, True, False),           # owner did not answer identify: unknown, leave it
++])
++def test_supervised_start_refused_by_manual_owner_hands_the_home_back(
++        monkeypatch, live_pid, owner_supervisor, supervised_start, expect_handback):
++    gateway_cli, gateway_run = _prepare_cli(monkeypatch)
++    from gateway import control_socket, status
++
++    async def _no_host_decision(replace, force=False):
++        return None
++
++    monkeypatch.setattr(gateway_run, "_host_attach_or_none", _no_host_decision)
++    monkeypatch.setattr(status, "get_running_pid", lambda *a, **k: live_pid)
++    identity = {} if owner_supervisor is None else {"pid": live_pid, "launch_supervisor": owner_supervisor}
++    monkeypatch.setattr(control_socket, "identify_gateway", lambda *a, **k: identity)
++    marked = []
++    monkeypatch.setattr(status, "write_planned_stop_marker", lambda pid: marked.append(pid) or True)
++    argv = ["hermes", "gateway", "run", *(["--external-supervisor"] if supervised_start else [])]
++    monkeypatch.setattr(sys, "argv", argv)
++
++    assert _run_cli(gateway_cli) == 1  # still a refusal: launchd's next restart takes over
++    row = _assert_refused("already_running", live_pid, True)
++    if expect_handback:
++        assert marked == [live_pid]
++        assert row["handback"] == "planned_stop_requested"
++    else:
++        assert marked == []
++        assert "handback" not in row
+-- 
+2.55.0
+

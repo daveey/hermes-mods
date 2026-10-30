@@ -1,0 +1,96 @@
+From 7b484e3d0dd51ece15e15ca7cb236b3a02387d25 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 23:22:48 -0700
+Subject: [PATCH 1146/1157] test(compression): synchronize same-turn stall
+ fallback regression (#258)
+
+---
+ .../agent/test_compression_stall_fallback.py  | 50 ++++++++++++++-----
+ 1 file changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/tests/agent/test_compression_stall_fallback.py b/tests/agent/test_compression_stall_fallback.py
+index d6cb8dfab25..e4fdb884d2d 100644
+--- a/tests/agent/test_compression_stall_fallback.py
++++ b/tests/agent/test_compression_stall_fallback.py
+@@ -289,8 +289,8 @@ def test_stall_after_prompt_reading_still_funds_the_fallback():
+ def test_same_turn_fallback_retry_is_not_gated_by_the_primary_stall_backoff(tmp_path, monkeypatch):
+     """The cancelled primary worker persists ``stall_interrupted`` while the fallback retry is already
+     running; that cooldown must not no-op the retry (#112387). Real AIAgent, real ``compress_context``
+-    and facade timeout wrap; only the summary route (``compress``) is stubbed: the primary route stalls
+-    silently until the host cancels its fence, the pinned fallback route returns a real compressed list."""
++    and facade timeout wrap. Synchronize the injected stall with summary entry instead of racing
++    worker startup against a subsecond idle budget; the pinned fallback returns a real compressed list."""
+     import os
+     import time
+     from pathlib import Path
+@@ -317,32 +317,56 @@ def test_same_turn_fallback_retry_is_not_gated_by_the_primary_stall_backoff(tmp_
+     original = [{"role": "user", "content": f"m{i} " + "x" * 400} for i in range(20)]
+     live = list(original)
+     routes = []
++    primary_entered = threading.Event()
++    release_primary = threading.Event()
++    primary_attempt = []
+ 
+     def fake_compress(messages, **kwargs):
+         route = take_pinned_summary_route()
+         routes.append((route["label"] if route else None, kwargs.get("bypass_cooldown", False)))
+         if route is None:
+-            cancelled = getattr(compressor, "_compression_cancelled_check", None)
+-            deadline = time.monotonic() + 5
+-            while time.monotonic() < deadline and not (callable(cancelled) and cancelled()):
+-                time.sleep(0.0005)
++            primary_entered.set()
++            assert release_primary.wait(60), "host did not cancel the primary attempt"
++            cancelled = compressor._compression_cancelled_check
++            assert cancelled(), "the real host fence must cancel before summary unwind"
+             raise AuxiliaryExplicitCancellation()
+         return [{"role": "user", "content": "summary of earlier turns"}, original[-1]]
+ 
+     compressor.compress = fake_compress
+     real_route = cc.resolve_compression_fallback_route
++    real_await = cc._await_worker_within_budget
++
++    def stall_after_summary_entry(future, fence, **kwargs):
++        if not primary_attempt:
++            primary_attempt.append((future, fence))
++            assert primary_entered.wait(60), "primary summary never started"
++            # Advance only this fence's idle observation once the summary is
++            # running. Both host timeout detection and worker stall classification
++            # see the same stall, without expiring the total execution deadline.
++            monkeypatch.setattr(fence, "seconds_since_progress", lambda: 60.0)
++        return real_await(future, fence, **kwargs)
+ 
+     def route_after_primary_unwound():
+-        # Pin the race outcome from the report: the primary persisted its backoff before the retry ran.
+-        deadline = time.monotonic() + 3
+-        while time.monotonic() < deadline and compressor._summary_failure_cooldown_until <= time.monotonic():
+-            time.sleep(0.001)
++        # Join the actual worker, not just its cooldown write: lease release and
++        # rollback must finish before retrying. Never silently miss this ordering.
++        future, fence = primary_attempt[0]
++        assert fence.is_cancelled
++        release_primary.set()
++        future.result(timeout=60)
++        assert compressor._summary_failure_cooldown_until > time.monotonic()
+         return real_route()
+ 
+-    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (0.4, 4.0))
++    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (60.0, 120.0))
++    monkeypatch.setattr(cc, "_await_worker_within_budget", stall_after_summary_entry)
+     monkeypatch.setattr(cc, "resolve_compression_fallback_route", route_after_primary_unwound)
+-    with _patch_chain([CHAIN_ENTRY]):
+-        out_msgs, _prompt = agent._compress_context(live, "sys", approx_tokens=50_000)
++    try:
++        with _patch_chain([CHAIN_ENTRY]):
++            out_msgs, _prompt = agent._compress_context(live, "sys", approx_tokens=50_000)
++    finally:
++        release_primary.set()
++        if primary_attempt:
++            primary_attempt[0][0].result(timeout=60)
++        db.close()
+ 
+     assert [r[0] for r in routes] == [None, "fallback_chain[0](custom)"]
+     assert routes[1][1] is True, "the same-turn retry must bypass the cooldown the primary just armed"
+-- 
+2.55.0
+
