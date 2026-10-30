@@ -88,23 +88,78 @@ class MirrorTests(unittest.TestCase):
     def test_faithful_replay_and_cleanup(self):
         self.verify()
 
-    def test_inventory_missing_duplicate_reordered_headers(self):
+    def test_inventory_missing_and_duplicate_headers(self):
         originals = [p.read_bytes() for p in self.files]
-        cases = [b'not a header\n', originals[0].split(b'\n')[0] + b'\n',
-                 originals[1].split(b'\n')[0] + b'\n']
-        for header in cases:
-            with self.subTest(header=header):
-                self.files[0].write_bytes(header + originals[0].split(b'\n', 1)[1])
-                # Duplicate case edits the second header, since the first is valid.
-                if header == cases[1]:
-                    self.files[1].write_bytes(header + originals[1].split(b'\n', 1)[1])
-                self.verify(error='header mismatch')
+        first, second = (data.split(b'\n')[0] + b'\n' for data in originals)
+        cases = [('missing', 0, b'not a header\n', 'header mismatch at ordinal 1'),
+                 ('duplicate', 1, first, 'Duplicate source header .* ordinals 0001 and 0002'),
+                 ('duplicate', 0, second, 'Duplicate source header .* ordinals 0001 and 0002')]
+        for kind, index, header, error in cases:
+            with self.subTest(kind=kind, index=index):
+                self.files[index].write_bytes(header + originals[index].split(b'\n', 1)[1])
+                self.verify(error=error)
                 for path, data in zip(self.files, originals):
                     path.write_bytes(data)
 
+    def test_header_outside_source_range(self):
+        path = self.files[1]
+        path.write_bytes(path.read_bytes().replace(self.tip.encode(), self.base.encode(), 1))
+        self.verify(error='outside the source range at ordinals 0002')
+
     def test_missing_patch(self):
         self.files[1].unlink()
-        self.verify(error='count differs')
+        self.verify(error='omitted source commits ' + self.tip)
+
+    def commit_at(self, subject, epoch):
+        # mirror.git strips GIT_* from the environment, so pin dates directly.
+        self.git('add', '.')
+        stamp = f'{epoch} +0000'
+        subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=Fixture', '-c', 'user.email=f@example.com',
+                        '-c', 'commit.gpgSign=false', 'commit', '-qm', subject], check=True,
+                       env=dict(GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp, PATH='/usr/bin:/bin',
+                                HOME=str(self.root), GIT_CONFIG_NOSYSTEM='1'))
+        return self.git('rev-parse', 'HEAD')
+
+    def merged_branch_series(self):
+        """Mainline commits published first; an older-dated branch commit merged later is appended."""
+        self.git('switch', '-qc', 'side', self.base)
+        self.write('side.py', 'side = True\n')
+        side = self.commit_at('side branch, dated before the mainline commits', 1_000_000_000)
+        self.git('switch', '-q', 'main')
+        self.git('reset', '-q', '--hard', self.base)
+        self.write('runtime.py', 'value = 1\n')
+        one = self.commit_at('mainline one', 1_000_000_100)
+        self.write('second.py', 'second = True\n')
+        two = self.commit_at('mainline two', 1_000_000_200)
+        self.git('merge', '-q', '--no-ff', '-m', 'merge side', 'side')
+        self.tip = self.git('rev-parse', 'HEAD')
+        order = self.git('rev-list', '--reverse', '--no-merges', self.base + '..' + self.tip).split()
+        self.assertEqual(order[0], side, 'fixture must sort the branch commit first in rev-list order')
+        for file in self.patches.glob('*.patch'):
+            file.unlink()
+        for number, sha in enumerate([one, two, side], 1):
+            self.git('format-patch', '-q', '--no-signature', '-1', sha, '--start-number', str(number),
+                     '-o', str(self.patches))
+        self.files = sorted(self.patches.glob('*.patch'))
+        return one, two, side
+
+    def test_merged_branch_commit_appended_after_later_mainline_commit_passes(self):
+        self.merged_branch_series()
+        self.verify()
+
+    def test_merged_branch_duplicate_header_fails(self):
+        # The 1282 incident: the slot of the appended branch commit repeats the previous header.
+        one, two, side = self.merged_branch_series()
+        self.files[2].unlink()
+        self.git('format-patch', '-q', '--no-signature', '-1', two, '--start-number', '3', '-o', str(self.patches))
+        self.files = sorted(self.patches.glob('*.patch'))
+        self.verify(error=f'Duplicate source header {two} at ordinals 0002 and 0003')
+
+    def test_merged_branch_omitted_commit_fails(self):
+        one, two, side = self.merged_branch_series()
+        self.files[2].unlink()
+        self.files = self.files[:2]
+        self.verify(error='omitted source commits ' + side)
 
     def test_duplicate_and_gap_ordinals(self):
         old = self.files[1]
@@ -165,6 +220,30 @@ class MirrorTests(unittest.TestCase):
         policy.write_text(json.dumps(obj))
         self.verify(policy=policy, error='snapshot mismatch')
 
+    def rename_policy(self, **overrides):
+        blob = self.git('rev-parse', self.tip + ':second.py')
+        rule = dict(applied='public.py', source_blob=blob, applied_blob=blob)
+        rule.update(overrides)
+        file = self.policy()
+        obj = json.loads(file.read_text())
+        obj['renames'] = [rule]
+        file.write_text(json.dumps(obj))
+        return file
+
+    def test_public_path_rename_is_explicit_and_content_pinned(self):
+        # A private file name renamed in the public series: the rule names only the public path.
+        path = self.files[-1]
+        path.write_bytes(path.read_bytes().replace(b'second.py', b'public.py'))
+        self.verify(error='Tree path inventory differs')
+        self.verify(policy=self.policy(), error='Tree path inventory differs')
+        self.verify(policy=self.rename_policy())
+        self.verify(policy=self.rename_policy(source_blob='c' * 40), error='matches no unique source path')
+        self.verify(policy=self.rename_policy(applied_blob='c' * 40), error='Unused or altered rename rule')
+        self.verify(policy=self.rename_policy(applied='other.py'), error='Unused or altered rename rule')
+
+    def test_unused_rename_rule_fails(self):
+        self.verify(policy=self.rename_policy(), error='Unused or altered rename rule')
+
     def test_mode_change_is_not_normalized(self):
         path = self.files[-1]
         path.write_bytes(path.read_bytes().replace(b'new file mode 100644', b'new file mode 100755'))
@@ -196,7 +275,10 @@ class MirrorTests(unittest.TestCase):
         cases = [dict(good, extra=True), dict(good, base=self.one),
                  dict(good, substitutions=[['', 'public']]),
                  dict(good, substitutions=[['same', 'same']]),
-                 dict(good, fingerprints={'second.py': ['not-a-hash', 'b' * 40]})]
+                 dict(good, fingerprints={'second.py': ['not-a-hash', 'b' * 40]}),
+                 dict(good, renames=[{'applied': 'public.py'}]),
+                 dict(good, renames=[dict(applied='x', source_blob='a' * 40, applied_blob='b' * 40)] * 2),
+                 dict(good, renames={'public.py': 'a' * 40})]
         for obj in cases:
             with self.subTest(policy=obj):
                 file.write_text(json.dumps(obj))

@@ -14,10 +14,16 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1253 patches, one entry per non-merge source commit through `2dc64603e1ed4f667baa8293c4345136072ba773`.
-Ordinals 0001-1202 are the published numbers and never move. Ordinals 1203 onward are appended in first-parent merge order, not `git log --reverse --no-merges` order: three source commits that reached the fork through merged branches sort earlier in the log, and replaying them there conflicts with mainline commits already published. Each patch is identified by its SHA header. Patch 1228 carries the merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
+1299 patches, one entry per non-merge source commit through `1e40faadc04282fa17694def89b6e0f1c51847d4`.
+Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
+in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
+first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
+later-dated mainline commits: ordinals 1203 onward include such entries, and 1282 (`3c2af6ee2e`, merged with PR #312)
+follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
+position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
+to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `2d2808ee84549f9836b0056750265058e5488a8a`; merge-base: `5608b5faf19ac22d023e62a8fd9675a42d1a61c6`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
-The current snapshot's executed checks are in [mirror-1253-verification.md](mirror-1253-verification.md) (previous snapshot: [mirror-1235-verification.md](mirror-1235-verification.md)) (earlier: [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+The current snapshot's executed checks are in [mirror-1299-verification.md](mirror-1299-verification.md), with its policy [mirror-policy-1299.json](mirror-policy-1299.json) (previous snapshots: [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
 
@@ -70,7 +76,9 @@ These rows document the 67 source commits absent from the previous 1067-entry mi
 
 ## Merge-aware mirror verification
 
-Documentation coverage (`python3 -B core/check_coverage.py`) remains unchanged.
+Documentation coverage (`python3 -B core/check_coverage.py`, the pre-commit gate) also refuses
+two staged patches with the same first-line SHA header, naming both ordinals. It needs no source
+repository, so it cannot see omitted commits; the verifier below does.
 It is not a source-equivalence check. Before publishing a new series, separately run:
 
 ```sh
@@ -78,18 +86,31 @@ python3 -B core/verify_mirror.py \
   --source-repo /path/to/source-repo \
   --source-tip FROZEN_FORK_COMMIT \
   --base FROZEN_UPSTREAM_COMMIT \
-  --patch-dir core/patches
+  --patch-dir core/patches \
+  --policy core/mirror-policy-NNNN.json
 ```
 
-Use frozen commit IDs, not moving refs, in publication evidence. `--base` is the
+Exit 0 is the acceptance step for every mirror pass; record its JSON line in the snapshot's
+`mirror-NNNN-verification.md`. Use frozen commit IDs, not moving refs, in publication evidence. `--base` is the
 upstream exclusion tip for `base..source-tip`; the replay starts at its merge-base
 with the source tip, not at an upstream tip that may have advanced. The verifier
-resolves inputs once, checks exact non-merge SHA headers and unique contiguous
-ordinals, applies all mail patches with `git am -3 --empty=keep`, then checks the
+resolves inputs once and checks the inventory: patch ordinals contiguous from
+0001, every patch's first line a `From <sha>` header, no header repeated, and the
+header set equal to the set of `git rev-list --no-merges base..source-tip`. A
+duplicate names both ordinals and an omission names the missing source commits.
+The order of the series is not compared with rev-list order, since published
+ordinals never move and merged-branch commits are appended after later-dated
+mainline ones. It then applies all mail patches in published order with
+`git am -3 --empty=keep`, and checks the
 complete committed tree (paths, modes, object kinds and blob content). Successful
 application alone cannot hide a merge-only runtime resolution or a removed test.
 It verifies final source equivalence, not each intermediate commit's contents or
 commit metadata: curated merge-linearization overlays remain supported.
+The source repository must hold every blob the curated overlay patches name in their
+`index` lines (0378 is the first): a fresh clone of the fork lacks some of them, and
+`git am -3` then stops with "sha1 information is lacking". Point `--source-repo` at the
+long-lived fork checkout, or give a scratch clone its objects as an alternate
+(`echo <checkout>/.git/objects > <clone>/objects/info/alternates`).
 
 The source checkout HEAD is never changed. A uniquely owned detached worktree is
 removed in `finally` on replay/comparison success or failure; other worktrees are
@@ -126,17 +147,29 @@ match, and every fingerprint must be used; an altered blob or stale snapshot
 fails. Fingerprints require independent review for semantic equivalence: they
 are exact reviewed pairs, not a semantic-equivalence algorithm or path exemptions.
 
-Run the stdlib-only fixture suite (also used by the core-mirror CI workflow):
+A public rename of a file whose source name is private (the contributor-marker files
+under `contributors/emails/`) goes in the optional `renames` list:
+`{"applied": "public/path", "source_blob": "BLOB_ID", "applied_blob": "BLOB_ID"}`.
+The rule names only the public path. Its source side is the one source-only path in the
+same directory with the same mode and exactly `source_blob`, so no private file name enters
+the policy. Every rule must be used, and any source-only or applied-only path left unpaired
+still fails as a path-inventory difference.
+
+Run the stdlib-only fixture suites (also used by the core-mirror CI workflow):
 
 ```sh
-python3 -B -m unittest discover -s core -p test_verify_mirror.py -v
+python3 -B -m unittest discover -s core -p 'test_*.py' -v
 ```
 
-The fixtures exercise faithful replay, missing/duplicated/reordered headers,
-missing/duplicate/gapped ordinals, omitted merge-only runtime resolution, deleted
+The fixtures exercise faithful replay, missing and duplicated headers (naming both
+ordinals), headers outside the source range, omitted commits (named), a merged-branch
+commit appended after later-dated mainline commits (passes), the same series with that
+slot holding a duplicate or left out (fails), missing/duplicate/gapped ordinals, omitted merge-only runtime resolution, deleted
 regression tests despite successful replay, explicit directional privacy rules,
-snapshot-bound fingerprints and altered content, malformed policies, file modes,
+snapshot-bound fingerprints and altered content, content-pinned public renames, malformed policies, file modes,
 advanced upstream bases, CLI privacy, and cleanup after replay/comparison failure.
+`test_check_coverage.py` covers the pre-commit gate: duplicate staged SHA headers fail
+naming both ordinals, the staged copy is what counts, and uncovered patches still fail.
 Cleanup fixtures preserve source HEAD and a sibling worktree, inject transient
 and persistent removal errors, and explicitly clean up their own recovery fixture.
 No private repository, network, runtime change or third-party Python package is
@@ -794,8 +827,10 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Kanban park and owner-archive fixes](kanban-park-and-owner-archive-fixes.md) | 1258 1259 1264 1274 | Refuse already-met parks, wake on producer completion and allow scoped capability-owner cleanup locally or through a home-relay request. |
 | [Sandbox background watcher idle-reap fixes](sandbox-bg-watcher-idle-reap.md) | 1262 | Keep active sandbox environments through idle cleanup and reattach a failed poller handle before declaring its process lost. |
 | [Affected tests include PM toolchain changes](ci-affected-tests-pm-toolchain.md) | 1270 | Select the full Python suite for shared PM interpreter and activation inputs while leaving unrelated PM data narrow. |
-| [Kanban supervisor requests](kanban-supervisor-requests.md) | 1278 1279 1280 1281 1282 | A worker files a durable, deduplicated `kanban_supervisor_request` to unlink edges between cards its task created; the dispatcher tick executes it with a lease and receipts, link ops are refused up front, and a worker's shell `unlink` is guarded. |
+| [Kanban supervisor requests](kanban-supervisor-requests.md) | 1278 1279 1280 1281 | A worker files a durable, deduplicated `kanban_supervisor_request` to unlink edges between cards its task created; the dispatcher tick executes it with a lease and receipts, link ops are refused up front, and a worker's shell `unlink` is guarded. |
 | [1281-entry mirror snapshot](mirror-1281-verification.md) | verification report | Replay and tree-comparison evidence for the 28 entries appended after the 1253 snapshot. |
+| [Attach e2e probe uses installed Node](attach-probe-node.md) | 1282 | The attach-handshake e2e helper passes the suite's Node as `HERMES_NODE`, and a new test fails if attach ever reaches PM provisioning. |
+| [1299-entry mirror snapshot](mirror-1299-verification.md) | verification report | Duplicate 1282 replaced by the omitted `3c2af6ee2e`; `verify_mirror.py` exits 0 end to end with policy [mirror-policy-1299.json](mirror-policy-1299.json). |
 | [Kanban scratch archive](kanban-scratch-archive.md) | 1299 | `gc_task_scratch` archives (bundle, diff, untracked tar, meta) then removes aged terminal scratch holding git clones; retention `kanban.worktree_retention_days` (default 7, 0 disables). |
 | [Bounded launcher preflight](launch-preflight-bound.md) | 1284 1285 1286 1287 | The launch-time PM currency probe has a 1 s deadline; unknown defers repair and `hermes update` keeps the full check. |
 | [TUI/e2e CI timing stability](tui-ci-timing-stability.md) | 1283 1297 1298 | A single durable-flush seam for the TUI, no-op in tests, plus synchronized receipt tests and a glyph-layout tolerance. |

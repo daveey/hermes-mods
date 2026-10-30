@@ -1,12 +1,11 @@
 # Kanban supervisor requests (durable worker graph-edit handoff)
 
-Patches: 1278 1279 1280 1281 1282
+Patches: 1278 1279 1280 1281
 
 - `patches/1278-feat-kanban-durable-supervisor-requests-for-worker-g.patch`
 - `patches/1279-fix-kanban-supervisor-requests-refuse-link-ops-up-fr.patch`
 - `patches/1280-fix-kanban-short-first-sentence-for-kanban_superviso.patch`
 - `patches/1281-docs-kanban-kanban_supervisor_request-description-ow.patch`
-- `patches/1282-docs-kanban-kanban_supervisor_request-description-ow.patch` (further reword of the same schema description: own-card edges are refused; description text only, no code change)
 
 Source: fork PR #315 (rebase-merged; four commits). 1278 is the feature, 1279 refuses link ops up front and narrows the late wake, 1280 and 1281 only reword the tool's schema description.
 
