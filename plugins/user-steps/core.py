@@ -1658,6 +1658,19 @@ class ActionStore:
         return c
 
     @contextmanager
+    def _read(self):
+        # Rollback-journal readers must not request RESERVED/PENDING writer locks:
+        # even a no-op BEGIN IMMEDIATE commit waits for every other shared reader,
+        # then blocks new polls at schema/PRAGMA reads for the full busy timeout.
+        c = self._connect()
+        try:
+            c.execute('PRAGMA query_only=ON')
+            c.execute('BEGIN')
+            yield c
+        finally:
+            c.close()  # Ends the snapshot, including when decoding/validation fails.
+
+    @contextmanager
     def _tx(self):
         c = self._connect()
         try:
@@ -1684,12 +1697,12 @@ class ActionStore:
         return body
 
     def get(self, owner, rid):
-        with self._tx() as c: return self._get(c, owner, rid)
+        with self._read() as c: return self._get(c, owner, rid)
 
     def requests(self, owner, *, include_withdrawn=False):
         # Withdrawn rows are omitted by default: route bodies mounted before this state existed call this, and
         # renderers that predate it reject a whole queue that holds an unknown state.
-        with self._tx() as c:
+        with self._read() as c:
             ids = c.execute('SELECT id, state FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
                             (self._ns(owner), owner['storedSessionId'])).fetchall()
             return [self._get(c, owner, row[0]) for row in ids if include_withdrawn or row[1] != 'withdrawn']
@@ -1721,7 +1734,7 @@ class ActionStore:
         return r
 
     def history(self, owner, rid):
-        with self._tx() as c:
+        with self._read() as c:
             self._get(c, owner, rid)
             return [json.loads(row[0]) for row in c.execute(
                 'SELECT body FROM revisions WHERE namespace=? AND id=? ORDER BY revision', (self._ns(owner), rid))]
@@ -1771,7 +1784,7 @@ class ActionStore:
         return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
     def operation(self, owner, oid=None, key=None):
-        with self._tx() as c: return self._operation(c, owner, oid, key)
+        with self._read() as c: return self._operation(c, owner, oid, key)
 
     def decide(self, owner, decision):
         _object(decision, ('requestId', 'expectedRevision', 'choiceId', 'idempotencyKey'), ('revisionText',))
@@ -1872,14 +1885,14 @@ class ActionStore:
             return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
     def pending_owners(self):
-        with self._tx() as c:
+        with self._read() as c:
             owners = {_json(op['owner']): op['owner'] for row in c.execute('SELECT body FROM operations')
                       if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')}
             return list(owners.values())
 
     def undelivered(self, gateway_id, profile):
         """Recorded-but-undelivered operations (any effect) of this gateway/profile, oldest first."""
-        with self._tx() as c:
+        with self._read() as c:
             return [op for row in c.execute('SELECT body FROM operations WHERE namespace=? ORDER BY rowid',
                                             (_json([gateway_id, profile]),))
                     if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')]
@@ -1911,17 +1924,17 @@ class ActionStore:
         return body
 
     def view(self, owner, rid):
-        with self._tx() as c: return self._view(c, owner, rid)
+        with self._read() as c: return self._view(c, owner, rid)
 
     def views(self, owner, *, include_withdrawn=False):
-        with self._tx() as c:
+        with self._read() as c:
             rows = c.execute('SELECT id, state FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
                              (self._ns(owner), owner['storedSessionId'])).fetchall()
             return [self._view(c, owner, row['id']) for row in rows
                     if include_withdrawn or row['state'] != 'withdrawn']
 
     def created_at(self, owner, rid):
-        with self._tx() as c:
+        with self._read() as c:
             life = self._life(c, owner, rid)
             return life['created_at'] if life is not None else None
 
@@ -2006,7 +2019,7 @@ class ActionStore:
 
     def unnotified_withdrawals(self, owner):
         """Withdrawals the owning chat did not make itself (system/user) and has not been told about."""
-        with self._tx() as c:
+        with self._read() as c:
             rows = c.execute("SELECT r.id FROM requests r JOIN lifecycle l ON l.namespace=r.namespace AND l.id=r.id "
                              "WHERE r.namespace=? AND r.session=? AND r.state='withdrawn' AND l.notified_at IS NULL "
                              "ORDER BY r.rowid", (self._ns(owner), owner['storedSessionId'])).fetchall()
