@@ -55,7 +55,8 @@ _NOT_ASK = re.compile(
     r"you (already|have already)|you (said|answered|approved|asked|told)|no (more|further) (input|action)|"
     r"(isn'?t|is not|aren'?t|are not) waiting on you|not waiting on you|the card asks|it asked|"
     r"i'?ll stop asking|nothing from this work is waiting|nothing\b[^.]{0,60}\bneeds? (you|david)|"
-    r"no\b[^.]{0,40}\bwaiting on you|(was|were|had been|had) (waiting|blocked) (on|for) (you|david)|never (create|say|tell|ask|put))\b",
+    r"no\b[^.]{0,40}\bwaiting on you|(was|were|had been|had) (waiting|blocked) (on|for) (you|david)|never (create|say|tell|ask|put)|"
+    r"nothing\b[^.]{0,60}\b(?:from|on) your (?:side|end))\b",
     re.I)
 # --- shapes added after the week-of-10-12 corrections (imperatives, user-named headings, "I can't" claims) ---
 _VERB = (r"(?:open|check|tap|click|press|sign in|log in|go to|change|enable|disable|raise|switch (?:off|on)|"
@@ -91,6 +92,13 @@ _LEFTOVER = re.compile(
 _DAVID_ACTION = re.compile(
     r"\bneeds? (you|david)\b|\bdavid'?s call\b|\bdavid (must|should|needs? to)\b|\bwaiting on (you|david)\b"
     r"|\bneeds? your\b", re.I)
+# A handoff that hands the reader a step without naming David (10-30: "need an unblock from your side",
+# "Please run this from your side: `ssh …`"). Worker handoffs only; "please <verb>" is checked via _PLEASE_VERB.
+_HANDBACK = re.compile(
+    r"\b(?:needs?|requires?)\b[^.!?]{0,60}\b(?:from|on) your (?:side|end)\b"
+    r"|\b(?:run|do|unblock|approve|merge|restart|click|open)\b[^.!?]{0,60}\b(?:from|on) your "
+    r"(?:side|end|terminal|machine|mac|laptop)\b"
+    r"|\bin your (?:own )?terminal\b", re.I)
 
 
 def _strip_noise(text: str) -> str:
@@ -214,10 +222,12 @@ def _strip_quotes(text: str) -> str:
 
 
 def find_leftovers(text: str) -> list[str]:
-    """Sentences in a worker handoff that hand a decision/action to David."""
+    """Sentences in a worker handoff that hand a decision/action to David, named or not ("please run …",
+    "… from your side")."""
     out: list[str] = []
     for s in sentences(text):
-        if (_LEFTOVER.search(s) or _DAVID_ACTION.search(s)) and not _NOT_ASK.search(s) and s not in out:
+        hit = _LEFTOVER.search(s) or _DAVID_ACTION.search(s) or _PLEASE_VERB.search(s) or _HANDBACK.search(s)
+        if hit and not _NOT_ASK.search(s) and s not in out:
             out.append(s)
     return out
 

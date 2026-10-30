@@ -922,6 +922,14 @@ def _chat_delivery_gate(session_id: str, tool_name: str, args: dict) -> dict | N
 
 
 FYI_PREFIX = "FYI (unverified, not an ask for David): "
+# Core relays a FINAL SEND line only while the line starts with it (hermes_cli/kanban_final_send._HEAD): an FYI mark
+# on such a leftover goes after the header, or the chat never receives the line.
+_FINAL_SEND_HEAD = re.compile(r"^([\s>*`_-]*FINAL[ _]SEND\s+for\s+`?@session:[^\s:`]+`?:\s*)", re.I)
+
+
+def _fyi(s: str) -> str:
+    m = _FINAL_SEND_HEAD.match(s)
+    return m.group(1) + FYI_PREFIX + s[m.end():] if m else FYI_PREFIX + s
 
 
 def _worker_complete(session_id: str, args: dict) -> dict | None:
@@ -943,7 +951,7 @@ def _worker_complete(session_id: str, args: dict) -> dict | None:
     for s in left:
         if s in keep_ok or FYI_PREFIX in s:
             continue
-        out = out.replace(s, FYI_PREFIX + s, 1)
+        out = out.replace(s, _fyi(s), 1)
         changed = True
     core.log_event("worker_handoff", session=session_id, leftovers=left, rewritten=changed)
     if not changed:

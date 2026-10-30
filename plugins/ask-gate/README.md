@@ -53,6 +53,15 @@ Replay (`scripts/replay_repeat.py`, coach digests, MacBook + hub, last 30 days, 
 with asks, 9 holds (0.23%); hand-checked all 9: 7 real restatements (incl. the incident reply), 1 duplicate digest,
 1 false hold (a live phone-pairing step re-asked over 1 h).
 
+**Worker handoff leftovers (L3).** `core.find_leftovers` reads a worker's `kanban_complete` summary for sentences
+that hand David a step: they name him ("David's call", "needs you"), or they don't but still tell the reader to act
+("please run/open/…", "need an unblock from your side", "run this … from your side / in your terminal"). Each
+leftover the judge does not pass as a checked `ok` is rewritten `FYI (unverified, not an ask for David): …`. In a
+`FINAL SEND for @session:<ref>:` line the mark goes after the header, because core relays the line only while it
+starts with it. "Nothing … from your side/end" is status, not a leftover. Why: on 10-30 a hub worker's handoff told
+David "Please run this from your side:" above an `ssh … hermes kanban unblock` loop, and no shape matched.
+Tests: `tests/test_ask_gate.py` (`week_1026`, `shell_command_handback`, `final_send_leftover_keeps_its_header`).
+
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
 delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>
