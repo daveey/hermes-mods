@@ -1,0 +1,930 @@
+From a9d6f64dc8001259a1a9b4f08ce2169ce012a9aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 01:35:13 +0000
+Subject: [PATCH] fix(gateway): one exit deadline tied to the supervisor stop
+ budget covers the whole exit, not just stop() [daveey]
+
+systemd SIGKILLed the hub gateway 70s after SIGTERM although stop() had finished at +47.6s: the
+work after stop() (cron/housekeeping thread waits up to 65s/35s, MCP shutdown, asyncio.run's
+default-executor join up to 300s) had no deadline, the stop() watchdog was already disarmed, and
+the SIGKILL left no stack dump and a previous_unclean_exit on the next boot (gateway-a2bcd6fabc).
+
+- gateway/exit_deadline.py: armed once by the stop-signal handler (and by stop() for non-signal
+  stops, never shorter than that stop's leash + tail): deadline = stop time + live TimeoutStopSec
+  / launchd ExitTimeOut / HERMES_GATEWAY_EXIT_BUDGET_S - min(5s, budget/4). Disarmed only in
+  _exit_after_graceful_shutdown. On fire: faulthandler dump, gateway.exit_deadline exit-diag
+  record with phase timings, ledger reason=exit_deadline, os._exit.
+- _start_gateway_shutdown_tail clamps the cron/housekeeping waits and the MCP budget to the time
+  left.
+- Routing saves and the session-peer record use 2s state.db patience while exiting, falling back
+  to sessions.json, instead of 20s per attempt.
+- check_systemd_timing_alignment also flags a stop() leash + tail that exceeds TimeoutStopSec.
+
+Tests: tests/gateway/test_exit_deadline.py drives the real signal handler, tail and exit funnel
+in a subprocess with a 6s budget (red before: still alive at 10s; green: exits in budget, ledger
+exit_deadline + dump) and the short routing-save patience against a held BEGIN IMMEDIATE.
+---
+ gateway/exit_deadline.py                 | 245 +++++++++++++++++++++++
+ gateway/run.py                           |  30 +--
+ gateway/run_shutdown.py                  |  16 +-
+ gateway/run_startup.py                   |  10 +
+ gateway/session_persistence.py           |  17 +-
+ gateway/session_recovery.py              |   5 +
+ gateway/shutdown_forensics.py            |  59 ++++--
+ hermes_state_gateway.py                  |  18 +-
+ tests/gateway/test_exit_deadline.py      | 226 +++++++++++++++++++++
+ tests/gateway/test_shutdown_forensics.py |  29 +++
+ 10 files changed, 610 insertions(+), 45 deletions(-)
+ create mode 100644 gateway/exit_deadline.py
+ create mode 100644 tests/gateway/test_exit_deadline.py
+
+diff --git a/gateway/exit_deadline.py b/gateway/exit_deadline.py
+new file mode 100644
+index 00000000000..41055ae8375
+--- /dev/null
++++ b/gateway/exit_deadline.py
+@@ -0,0 +1,245 @@
++"""One process-exit deadline for a gateway stop, tied to the supervisor's SIGKILL budget.
++
++systemd SIGKILLs the gateway ``TimeoutStopSec`` after SIGTERM, and launchd does the same at the
++live ``ExitTimeOut``. The shutdown watchdog in :mod:`gateway.shutdown_watchdog` covers only
++``stop()``: it is disarmed when ``stop()`` returns, but the process still has a tail to run (the
++cron/housekeeping thread waits in ``_start_gateway_shutdown_tail``, MCP shutdown, then the
++default-executor join inside ``asyncio.run``, up to 300s). A slow tail was SIGKILLed with no stack
++dump and no ledger stamp, so the next boot reported ``previous_unclean_exit``.
++
++This module holds ONE deadline for the whole exit: ``signal time + supervisor budget - margin``.
++It is armed by the stop-signal handler (and by ``stop()`` for non-signal stops), stays armed past
++``stop()``, and is disarmed only by ``_exit_after_graceful_shutdown``. When it fires it dumps every
++thread's stack, writes a ``gateway.exit_deadline`` exit-diag record with phase timings, stamps the
++lifecycle ledger ``reason="exit_deadline"`` and ``os._exit``s before the supervisor's SIGKILL.
++
++The tail and the routing saves read :func:`remaining_s` / :func:`is_exiting` so a normal stop
++finishes inside the budget and the deadline only fires for a truly wedged tail.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++import sys
++import threading
++import time
++from datetime import UTC, datetime
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++# Fire this long before the supervisor's SIGKILL so the dump + ledger stamp land. Short budgets
++# (tests, tiny TimeoutStopSec) use a quarter of the budget instead.
++EXIT_DEADLINE_MARGIN_S = 5.0
++# Explicit budget override (seconds, before the margin). Used by tests and by supervisors the
++# gateway cannot query.
++BUDGET_ENV = "HERMES_GATEWAY_EXIT_BUDGET_S"
++# state.db write patience for routing saves once the gateway is exiting: the default 20s patience
++# made two saves eat 40s of a 70s TimeoutStopSec while a Desktop serve held the write lock.
++DRAIN_DB_PATIENCE_S = 2.0
++
++_lock = threading.Lock()
++_done = threading.Event()
++_state: dict[str, Any] = {}
++
++
++def _reset_for_tests() -> None:
++    with _lock:
++        _state.clear()
++        _done.clear()
++
++
++def margin_for(budget_s: float) -> float:
++    return min(EXIT_DEADLINE_MARGIN_S, max(0.0, budget_s) / 4.0)
++
++
++def resolve_supervisor_stop_budget_s(
++    launchd_exit_timeout_s: Optional[float] = None,
++) -> tuple[Optional[float], str]:
++    """Seconds between the stop signal and the supervisor's SIGKILL, plus where it came from.
++    ``(None, "none")`` when no supervisor budget applies (foreground run, unknown supervisor)."""
++    raw = os.environ.get(BUDGET_ENV, "").strip()
++    if raw:
++        with contextlib.suppress(ValueError):
++            value = float(raw)
++            if value > 0:
++                return value, "env"
++    if launchd_exit_timeout_s:
++        with contextlib.suppress(TypeError, ValueError):
++            if float(launchd_exit_timeout_s) > 0:
++                return float(launchd_exit_timeout_s), "launchd"
++    with contextlib.suppress(Exception):
++        from gateway.shutdown_forensics import current_systemd_timeout_stop_s
++        value = current_systemd_timeout_stop_s()
++        if value:
++            return value, "systemd"
++    return None, "none"
++
++
++def is_exiting() -> bool:
++    """True once a stop armed the exit deadline (signal or ``stop()``)."""
++    return bool(_state.get("armed"))
++
++
++def remaining_s() -> Optional[float]:
++    """Seconds left before the deadline fires; ``None`` when no deadline is set (yet)."""
++    deadline = _state.get("deadline_mono")
++    if deadline is None:
++        return None
++    return max(0.0, deadline - time.monotonic())
++
++
++# Left on the deadline after the cron/housekeeping waits: MCP shutdown (5s) + the exit funnel.
++TAIL_RESERVE_S = 7.0
++
++
++def clamp_wait(default_s: float, reserve_s: float = TAIL_RESERVE_S, *, phase: str = "") -> float:
++    """``default_s`` capped to the time left minus ``reserve_s`` (for the steps after it).
++    ``phase`` marks the start of the wait for the exit-diag phase timings."""
++    if phase:
++        mark_phase(phase)
++    left = remaining_s()
++    if left is None:
++        return default_s
++    return max(0.0, min(default_s, left - reserve_s))
++
++
++def mark_phase(name: str) -> None:
++    """Record ``name`` at its elapsed time since the stop began (for the exit-diag record)."""
++    started = _state.get("started_mono")
++    if started is None:
++        return
++    with _lock:
++        _state.setdefault("phases", {})[name] = round(time.monotonic() - started, 3)
++
++
++def arm(
++    reason: str, *, launchd_exit_timeout_s: Optional[float] = None,
++    min_budget_s: Optional[float] = None,
++    snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None,
++    exit_code: int = 1,
++) -> bool:
++    """Arm the exit deadline once per process; later calls only add a phase mark. Never raises.
++
++    The budget is resolved on the watchdog thread (``systemctl show`` is a subprocess and this is
++    called from the event loop's signal handler); until it resolves, :func:`remaining_s` is None
++    and waits keep their defaults. ``min_budget_s`` keeps a non-signal stop (in-band restart, not
++    supervisor-timed) from getting a shorter leash than its configured drain.
++    """
++    started = time.monotonic()
++    with _lock:
++        if _state.get("armed"):
++            _state.setdefault("phases", {}).setdefault(reason, round(started - _state["started_mono"], 3))
++            return False
++        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(BUDGET_ENV):
++            return False  # in-process stop() tests must never get a delayed os._exit
++        _state.update(armed=True, reason=reason, started_mono=started,
++                      started_at=datetime.now(UTC).isoformat(), phases={reason: 0.0})
++
++    def _watch() -> None:
++        budget, source = resolve_supervisor_stop_budget_s(launchd_exit_timeout_s)
++        if min_budget_s is not None and (budget is None or budget < min_budget_s) and source != "env":
++            budget, source = float(min_budget_s), f"{source}+min" if budget else "min"
++        if budget is None:
++            logger.debug("Exit deadline: no supervisor stop budget; not enforcing one")
++            return
++        deadline = started + budget - margin_for(budget)
++        with _lock:
++            _state.update(budget_s=budget, budget_source=source, deadline_mono=deadline)
++        logger.info("Exit deadline armed (%s): %.0fs supervisor budget from %s, fires at +%.1fs",
++                    reason, budget, source, deadline - started)
++        while True:
++            left = deadline - time.monotonic()
++            if left <= 0:
++                break
++            if _done.wait(timeout=min(left, 1.0)):
++                return
++        if _done.is_set():
++            return
++        _fire(exit_code, snapshot_fn)
++
++    try:
++        threading.Thread(target=_watch, daemon=True, name="gateway-exit-deadline").start()
++    except Exception:
++        logger.debug("Failed to start exit deadline thread", exc_info=True)
++        return False
++    return True
++
++
++def arm_for_signal(runner: Any) -> None:
++    """Stop-signal handler hook: start the deadline at the signal, with the supervisor budget."""
++    arm("signal", launchd_exit_timeout_s=getattr(runner, "_launchd_exit_timeout_s", None))
++
++
++def arm_for_stop(runner: Any, stop_leash_s: float, snapshot_fn: Callable[[], dict[str, Any]]) -> None:
++    """``stop()`` hook. A signal stop armed the deadline already (this only marks the phase); a
++    non-signal stop (in-band restart, not supervisor-timed) gets at least its own stop() leash
++    plus the tail, so it is never cut shorter than before."""
++    by_signal = getattr(runner, "_stop_requested_by_signal", False)
++    arm("stop", launchd_exit_timeout_s=getattr(runner, "_launchd_exit_timeout_s", None),
++        min_budget_s=None if by_signal else stop_leash_s + TAIL_RESERVE_S, snapshot_fn=snapshot_fn)
++
++
++def disarm() -> None:
++    """Called by the graceful exit funnel just before ``os._exit``."""
++    _done.set()
++
++
++def _exit_diag_record() -> dict[str, Any]:
++    with _lock:
++        return {
++            "reason": _state.get("reason"),
++            "budget_s": _state.get("budget_s"),
++            "budget_source": _state.get("budget_source"),
++            "margin_s": margin_for(_state.get("budget_s") or 0.0),
++            "started_at": _state.get("started_at"),
++            "elapsed_s": round(time.monotonic() - _state.get("started_mono", time.monotonic()), 3),
++            "phases": dict(_state.get("phases") or {}),
++        }
++
++
++def _fire(exit_code: int, snapshot_fn: Optional[Callable[[], dict[str, Any]]]) -> None:
++    """Dump stacks, record, stamp the ledger, hard-exit. Every step is best-effort."""
++    record = _exit_diag_record()
++    if snapshot_fn is not None:
++        try:
++            record["snapshot"] = snapshot_fn()
++        except Exception as exc:  # health: allow BLE001 -- forensic snapshot of a wedged process; recorded, never raised
++            record["snapshot"] = {"snapshot_error": repr(exc)}
++    from gateway.shutdown_watchdog import (
++        _hard_exit, _mark_exited_quietly, get_shutdown_watchdog_dump_path)
++    with contextlib.suppress(Exception):
++        import faulthandler
++        dump_path = get_shutdown_watchdog_dump_path()
++        dump_path.parent.mkdir(parents=True, exist_ok=True)
++        header = {"event": "exit_deadline_fired", "pid": os.getpid(),
++                  "fired_at": datetime.now(UTC).isoformat(), **record}
++        with open(dump_path, "a", encoding="utf-8") as fh:
++            fh.write(json.dumps(header, default=str) + "\n--- faulthandler dump (all threads) ---\n")
++            fh.flush()
++            faulthandler.dump_traceback(file=fh, all_threads=True)
++            fh.write("--- end dump ---\n")
++    with contextlib.suppress(Exception):
++        sys.stderr.write(
++            f"Gateway exit deadline fired {record['elapsed_s']:.1f}s after stop "
++            f"(budget {record['budget_s']}s from {record['budget_source']}); forcing exit.\n")
++        sys.stderr.flush()
++    with contextlib.suppress(Exception):
++        from hermes_cli.gateway_exit_diag import make_exit_diag
++        make_exit_diag()("gateway.exit_deadline", **record)
++    with contextlib.suppress(Exception):
++        logger.critical("Exit deadline fired %.1fs after stop (budget %ss from %s, phases %s); "
++                        "forcing exit before the supervisor's SIGKILL", record["elapsed_s"],
++                        record["budget_s"], record["budget_source"], record["phases"])
++    with contextlib.suppress(Exception):
++        from gateway.status import release_gateway_runtime_lock, remove_pid_file
++        remove_pid_file()
++        release_gateway_runtime_lock()
++    with contextlib.suppress(Exception):
++        from hermes_logging import drain_log_queue
++        drain_log_queue(timeout=1.0)
++    _mark_exited_quietly(exit_code, "exit_deadline")
++    _hard_exit(exit_code)
+diff --git a/gateway/run.py b/gateway/run.py
+index 6a278607665..d02456ff364 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -47,6 +47,7 @@ from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+ from hermes_cli.fallback_config import pre_agent_fallback_notice
+ from gateway.turn_executor import _UnboundedThreadExecutor
+ from gateway.run_exit_reason import note_start_refused
++from gateway import exit_deadline
+ 
+ # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
+ _AGENT_CACHE_MAX_SIZE = 128
+@@ -5194,6 +5195,8 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
+ 
+             _best_effort(_log_context, "format_context_for_log failed: %s")
+             _best_effort(_diagnostic, "spawn_async_diagnostic failed: %s")
++        # ONE deadline for the whole exit (supervisor SIGKILL budget), armed past stop(): see gateway.exit_deadline.
++        _best_effort(lambda: exit_deadline.arm_for_signal(runner), "Exit deadline arm failed: %s")
+         if not planned_takeover:
+             # Supervisor/operator SIGNAL stop (bootout, kickstart -k, systemd, s6, bare kill) — the
+             # only kind launchd times with ExitTimeOut. In-band SIGUSR1 restarts never pass through
+@@ -5648,12 +5651,15 @@ async def _start_gateway_shutdown_tail(
+     # cron_thread.join() would block the loop, so that delivery could never run — it timed out and the
+     # message was silently dropped (#58818). Awaiting keeps the loop alive so the in-flight delivery
+     # finishes before we tear down.
++    # Each wait is clamped to what is left of the exit deadline, minus the steps after it.
+     cron_stop.set()
+     _stop_cron_provider(cron_provider)
+-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
++    _cron_wait = exit_deadline.clamp_wait(_CRON_SHUTDOWN_DRAIN_TIMEOUT, phase="cron_wait")
++    if not await _await_thread_exit(cron_thread, timeout=_cron_wait):
+         logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
+-                       "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
+-    await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)
++                       "delivery may have been dropped.", _cron_wait)
++    await _await_thread_exit(housekeeping_thread, timeout=exit_deadline.clamp_wait(
++        _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT, phase="housekeeping_wait"))
+ 
+     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+     _planned_stop_watcher_stop.set()
+@@ -5662,7 +5668,8 @@ async def _start_gateway_shutdown_tail(
+     # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
+     # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
+     try:
+-        await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
++        await _shutdown_mcp_servers_nonblocking(
++            timeout=exit_deadline.clamp_wait(5.0, 2.0, phase="mcp"), config=getattr(runner, "config", None))
+     except Exception:
+         logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+ 
+@@ -5956,17 +5963,9 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
+     thread — exactly the hang a wedged worker causes. It bypasses ``atexit``, so PID/lock release and the
+     bounded log drain (file handlers sit behind a ``QueueListener`` thread) are done here explicitly.
+ 
+-    Graceful teardown is already complete by the time this runs, so there is nothing left that needs a clean
+-    interpreter shutdown. See #53107.
+-    ``os._exit`` bypasses ``atexit`` handlers, so we cannot rely on the ``atexit``-registered
+-    ``remove_pid_file`` / ``release_gateway_runtime_lock`` (registered in ``start_gateway``) to run. The
+-    full-shutdown path releases both explicitly in ``_stop_impl``, but the EARLY exit paths —
+-    clean-fatal-config (#51228) and startup-aborted-before-running — raise ``SystemExit`` right after
+-    ``runner.start()`` without going through ``_stop_impl``, so on those paths ``atexit`` was the only thing
+-    releasing them. Now that those paths are routed through this backstop (#53107), release both here
+-    explicitly. Both calls are idempotent — ``remove_pid_file`` only unlinks a PID file that belongs to this
+-    process, and ``release_gateway_runtime_lock`` no-ops when the lock is already released — so this is a
+-    no-op on the normal shutdown path and the actual cleanup on the early-exit paths.
++    Graceful teardown is already complete by the time this runs (#53107). The early exit paths
++    (clean-fatal-config #51228, startup-aborted) skip ``_stop_impl``, so the idempotent PID/lock release
++    here is their only cleanup and a no-op on the normal path.
+     """
+     for stream in (sys.stdout, sys.stderr):
+         with suppress(Exception):
+@@ -5991,6 +5990,7 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
+         from hermes_logging import drain_log_queue
+         drain_log_queue(timeout=1.0)
+ 
++    exit_deadline.disarm()  # here and only here: the exit deadline covers everything up to os._exit
+     for _step in (_release_locks, _mark_exited, _drain_logs):
+         _best_effort(_step)
+     os._exit(exit_code)
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index c27401c1e4c..697386c2b47 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -29,6 +29,7 @@ from gateway.restart import (
+ )
+ from gateway.run_common import _UNSET
+ from gateway.run_shutdown_session_end import GatewaySessionEndMixin
++from gateway import exit_deadline
+ from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
+ from gateway.run_shutdown_restart_wait import RESTART_CANCELLED, GatewayRestartWaitMixin
+ 
+@@ -178,9 +179,8 @@ def _delivery_target_key(platform_value: str, chat_id, thread_id, *, profile: Op
+ 
+ 
+ def _effective_watchdog_leash(runner: object) -> float:
+-    """Thread-watchdog leash for the stop in progress: effective drain + grace, clamped under
+-    launchd's live ``ExitTimeOut`` minus the dump margin. Lives here (not in gateway.restart)
+-    because restart.py cannot import shutdown_watchdog without a cycle."""
++    """Thread-watchdog leash for the stop in progress: drain + grace, clamped under launchd's live
++    ``ExitTimeOut`` minus the dump margin (here: restart.py can't import shutdown_watchdog)."""
+     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
+ 
+ 
+@@ -2188,17 +2188,16 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin):
+     async def _stop_impl(self) -> None:
+         """Run every ``_stop_*`` phase under the thread-based shutdown watchdog."""
+         from gateway.run import GatewayRunner
+-        # Thread-based watchdog (asyncio timeouts cannot recover a frozen loop): dumps stacks and
+-        # os._exit past drain+grace so the service manager revives us. Skipped under pytest.
+-        # Arm a plain OS thread at the start of stop(); if teardown never finishes within drain+grace it
+-        # dumps faulthandler stacks and os._exit so KeepAlive/systemd can revive. Skip under pytest so
+-        # stop()-driving unit tests don't get a delayed hard-exit in the worker. See #66892.
++        # Thread watchdog (asyncio timeouts can't recover a frozen loop): stack dump + os._exit past drain+grace,
++        # skipped under pytest (#66892). It covers stop() only; gateway.exit_deadline covers up to os._exit.
+         _watchdog_done = threading.Event()
+         self._shutdown_watchdog_done = _watchdog_done
+         # Shutdown-path doubles may lack the deferred-worker counter.
+         ctx = GatewayShutdownMixin._StopContext(
+             deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
+         )
++        exit_deadline.arm_for_stop(
++            self, _effective_watchdog_leash(self), lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx))
+         if not os.environ.get("PYTEST_CURRENT_TEST"):
+             arm_shutdown_watchdog(
+                 _effective_watchdog_leash(self), done_event=_watchdog_done,
+@@ -2222,6 +2221,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin):
+             await GatewayRunner._stop_persist_exit_state(self, ctx)
+         finally:
+             _watchdog_done.set()
++            exit_deadline.mark_phase("stop_done")
+ 
+     async def stop(
+         self, *, restart: bool = False, detached_restart: bool = False, service_restart: bool = False
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index a3ae8f58a80..df353015565 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -981,10 +981,20 @@ class GatewayStartupMixin:
+         an upgrade may encode the old default, so SIGKILL hits mid-drain). Never raises."""
+         with _log_suppressed(logging.DEBUG, "check_systemd_timing_alignment failed: %s"):
+             from gateway.shutdown_forensics import check_systemd_timing_alignment
++            from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+             _alignment = check_systemd_timing_alignment(
+                 self._restart_drain_timeout,
+                 getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT),
++                stop_leash_s=resolve_shutdown_watchdog_delay(self._restart_drain_timeout),
+             )
++            if _alignment is not None and _alignment.get("tail_mismatch"):
++                logger.warning(
++                    "systemd unit %s has TimeoutStopSec=%.0fs but a stop may need %.0fs (stop() leash "
++                    "plus the post-stop tail). The exit deadline will cut the tail short before SIGKILL; "
++                    "run `hermes gateway install --force` or shorten agent.restart_drain_timeout.",
++                    _alignment.get("unit", "(unknown)"), _alignment["timeout_stop_sec"],
++                    _alignment["stop_envelope_s"],
++                )
+             if _alignment is not None and _alignment.get("mismatch"):
+                 logger.warning(
+                     "Stale systemd unit detected: %s has TimeoutStopSec=%.0fs but drain_timeout=%.0fs "
+diff --git a/gateway/session_persistence.py b/gateway/session_persistence.py
+index e3db3473578..036ac75c093 100644
+--- a/gateway/session_persistence.py
++++ b/gateway/session_persistence.py
+@@ -5,6 +5,7 @@ load/save paths (state.db gateway_routing primary, sessions.json legacy mirror).
+ from __future__ import annotations
+ 
+ import contextlib
++import functools
+ import logging
+ import json
+ import threading
+@@ -22,6 +23,9 @@ logger = logging.getLogger("gateway.session")
+ # deliberate ``store._db = None`` (JSONL fallback).
+ _DB_UNPINNED = object()
+ 
++# Routing writers that take ``patience_s`` (shortened while the gateway is exiting).
++_PATIENCE_WRITERS = frozenset({"save_gateway_routing_entry", "replace_gateway_routing_entries"})
++
+ # Self-documenting sentinel written first into sessions.json; "_" keys are skipped on load.
+ _SESSIONS_JSON_README = (
+     "LEGACY MIRROR of the gateway routing index (the primary copy lives in the gateway_routing "
+@@ -230,9 +234,18 @@ class SessionPersistenceMixin:
+             return str(self.sessions_dir)
+ 
+     def _routing_db_method(self, name: str):
+-        """Bound ``_routing_db.<name>`` if the handle exists and has it, else None."""
++        """Bound ``_routing_db.<name>`` if the handle exists and has it, else None. Once the
++        gateway is exiting, writes use the short drain patience: a save blocked by another
++        process's state.db write lock falls back to sessions.json in seconds instead of eating
++        20s of the supervisor's stop budget per attempt."""
+         method = getattr(self._routing_db or None, name, None)
+-        return method if callable(method) else None
++        if not callable(method):
++            return None
++        if name in _PATIENCE_WRITERS:
++            from gateway import exit_deadline
++            if exit_deadline.is_exiting():
++                return functools.partial(method, patience_s=exit_deadline.DRAIN_DB_PATIENCE_S)
++        return method
+ 
+     def _load_routing_rows_locked(self) -> bool:
+         """Load state.db routing entries into ``_entries``; False when there is no loader or the
+diff --git a/gateway/session_recovery.py b/gateway/session_recovery.py
+index 6bcaa449da1..d3238905ee6 100644
+--- a/gateway/session_recovery.py
++++ b/gateway/session_recovery.py
+@@ -4,6 +4,7 @@ peer). Mixin split out of ``gateway/session.py``; bound onto ``SessionStore`` vi
+ 
+ from __future__ import annotations
+ 
++import functools
+ import logging
+ import json
+ import math
+@@ -340,6 +341,10 @@ class SessionRecoveryMixin:
+         peer = dict(
+             source=source.platform.value, user_id=source.user_id, session_key=session_key,
+             chat_id=source.chat_id, chat_type=source.chat_type, thread_id=source.thread_id)
++        from gateway import exit_deadline
++        if exit_deadline.is_exiting():
++            # Best-effort bookkeeping: while exiting, never spend the stop budget on a held lock.
++            recorder = functools.partial(recorder, patience_s=exit_deadline.DRAIN_DB_PATIENCE_S)
+         try:
+             recorder(
+                 session_id, **peer, display_name=display_name or source.chat_name,
+diff --git a/gateway/shutdown_forensics.py b/gateway/shutdown_forensics.py
+index b62644b6273..d9275ea7833 100644
+--- a/gateway/shutdown_forensics.py
++++ b/gateway/shutdown_forensics.py
+@@ -18,6 +18,8 @@ import time
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
++from gateway.exit_deadline import TAIL_RESERVE_S
++
+ from gateway.restart import DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, resolve_systemd_timeout_stop_sec
+ import contextlib
+ 
+@@ -197,32 +199,61 @@ def context_as_json(ctx: dict[str, Any]) -> str:
+         return "{}"
+ 
+ 
+-def check_systemd_timing_alignment(
+-    drain_timeout: float, cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
+-) -> Optional[dict[str, Any]]:
+-    """At startup, sanity-check that systemd's TimeoutStopSec covers stop. A stale unit file
+-    (upgraded without re-running ``hermes setup``) can have ``TimeoutStopSec`` below the stop
+-    budget, so systemd SIGKILLs the cgroup mid-drain (a phantom ``code=killed status=9`` in the
+-    journal). ``None`` when aligned OR undeterminable (not under systemd, no ``systemctl``);
+-    otherwise a dict with ``timeout_stop_sec``/``drain_timeout``/``expected_min``/``mismatch``.
+-    """
++def current_systemd_unit() -> Optional[str]:
++    """The ``*.service`` unit this process runs in, or ``None`` when not under systemd."""
+     if not os.environ.get("INVOCATION_ID"):
+         return None  # Not running under systemd (or at least not directly)
+     # /proc/self/cgroup: "0::/user.slice/.../hermes-gateway.service"
+-    unit_name: Optional[str] = None
+     with contextlib.suppress(OSError), open("/proc/self/cgroup", encoding="utf-8") as fh:
+         for line in fh:
+             parts = reversed(line.strip().split("/"))
+             unit_name = next((p for p in parts if p.endswith(".service")), None)
+             if unit_name:
+-                break
++                return unit_name
++    return None
++
++
++def current_systemd_timeout_stop_s() -> Optional[float]:
++    """Live ``TimeoutStopSec`` (seconds) of this process's unit; ``None`` when undeterminable.
++    Runs ``systemctl`` (up to ~4s): never call it on the event loop."""
++    unit_name = current_systemd_unit()
++    if (timeout_us := _systemd_timeout_stop_us(unit_name) if unit_name else None) is None:
++        return None
++    return timeout_us / 1_000_000.0
++
++
++# Worst-case work after stop() returns: MCP shutdown + the exit funnel. The cron/housekeeping
++# waits are clamped to the exit deadline, so they are not part of the envelope.
++SHUTDOWN_TAIL_RESERVE_S = TAIL_RESERVE_S
++
++
++def check_systemd_timing_alignment(
++    drain_timeout: float, cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
++    *, stop_leash_s: Optional[float] = None, tail_s: float = SHUTDOWN_TAIL_RESERVE_S,
++) -> Optional[dict[str, Any]]:
++    """At startup, sanity-check that systemd's TimeoutStopSec covers stop. A stale unit file
++    (upgraded without re-running ``hermes setup``) can have ``TimeoutStopSec`` below the stop
++    budget, so systemd SIGKILLs the cgroup mid-drain (a phantom ``code=killed status=9`` in the
++    journal). ``None`` when undeterminable (not under systemd, no ``systemctl``); otherwise a
++    dict with ``timeout_stop_sec``/``drain_timeout``/``expected_min``/``mismatch``.
++
++    ``stop_leash_s`` (the stop() watchdog leash) adds the tail check: the leash plus the
++    post-stop() tail must also fit, or a stop that uses its whole leash is SIGKILLed in the tail
++    (``tail_mismatch``). The exit deadline then cuts it, but the drain was sized wrong.
++    """
++    unit_name = current_systemd_unit()
+     if (timeout_us := _systemd_timeout_stop_us(unit_name) if unit_name else None) is None:
+         return None
+     timeout_stop_sec = timeout_us / 1_000_000.0
+     expected = float(resolve_systemd_timeout_stop_sec(drain_timeout, cron_drain_timeout))
+-    return {"unit": unit_name, "timeout_stop_sec": timeout_stop_sec, "drain_timeout": drain_timeout,
+-            "cron_drain_timeout": cron_drain_timeout, "expected_min": expected,
+-            "mismatch": timeout_stop_sec < expected}
++    result: dict[str, Any] = {
++        "unit": unit_name, "timeout_stop_sec": timeout_stop_sec, "drain_timeout": drain_timeout,
++        "cron_drain_timeout": cron_drain_timeout, "expected_min": expected,
++        "mismatch": timeout_stop_sec < expected, "tail_mismatch": False}
++    if stop_leash_s is not None:
++        envelope = float(stop_leash_s) + float(tail_s)
++        result.update(stop_envelope_s=envelope, tail_mismatch=envelope > timeout_stop_sec)
++    return result
+ 
+ 
+ def _systemd_timeout_stop_us(unit_name: str) -> Optional[int]:
+diff --git a/hermes_state_gateway.py b/hermes_state_gateway.py
+index 3f8c93737d4..767299fc1b7 100644
+--- a/hermes_state_gateway.py
++++ b/hermes_state_gateway.py
+@@ -235,7 +235,7 @@ class SessionGatewayMixin:
+         self, session_id: str, *, source: str, user_id: str | None = None, session_key: str | None = None,
+         chat_id: str | None = None, chat_type: str | None = None, thread_id: str | None = None, display_name: str | None = None,
+         origin_json: str | None = None, include_compression_ancestors: bool = False,
+-        transport_profile: str | None = None) -> None:
++        transport_profile: str | None = None, patience_s: float | None = None) -> None:
+         """Persist the gateway routing peer for an existing session row. ``display_name`` / ``origin_json``:
+         ``None`` leaves the stored value untouched (consumers read routing data from state.db, not
+         sessions.json). ``include_compression_ancestors`` keeps a compression lineage on one routing peer
+@@ -291,11 +291,14 @@ class SessionGatewayMixin:
+                     (session_id, source, source, user_id, session_key, chat_id, chat_type, thread_id, display_name,
+                      origin_json, self._own_profile_name(), transport_profile, time.time()),
+                 )
+-        self._execute_write(_do)
++        self._execute_write(_do, patience_s=patience_s)
+ 
+-    def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = "") -> None:
++    def save_gateway_routing_entry(
++        self, session_key: str, entry_json: str, *, scope: str = "", patience_s: Optional[float] = None,
++    ) -> None:
+         """Upsert one gateway routing entry (session_key -> SessionEntry JSON); ``scope``
+-        namespaces the index per sessions_dir so two stores never share routing state."""
++        namespaces the index per sessions_dir so two stores never share routing state.
++        ``patience_s`` overrides the write-lock patience (short while the gateway exits)."""
+         if not session_key or not entry_json:
+             return
+         self._write_sql(
+@@ -305,9 +308,12 @@ class SessionGatewayMixin:
+                    entry_json = excluded.entry_json,
+                    updated_at = excluded.updated_at""",
+             (scope, session_key, entry_json, time.time()),
++            patience_s=patience_s,
+         )
+ 
+-    def replace_gateway_routing_entries(self, entries: dict[str, str], *, scope: str = "") -> None:
++    def replace_gateway_routing_entries(
++        self, entries: dict[str, str], *, scope: str = "", patience_s: Optional[float] = None,
++    ) -> None:
+         """Atomically replace the routing index for *scope* (keys absent from *entries*
+         are removed); other scopes untouched."""
+         now = time.time()
+@@ -318,7 +324,7 @@ class SessionGatewayMixin:
+                     "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+                     "VALUES (?, ?, ?, ?)",
+                     [(scope, k, v, now) for k, v in entries.items() if k and v])
+-        self._execute_write(_do)
++        self._execute_write(_do, patience_s=patience_s)
+ 
+     def load_gateway_routing_entries(self, *, scope: str = "") -> dict[str, str]:
+         """Load routing entries for *scope* as {session_key: entry_json}."""
+diff --git a/tests/gateway/test_exit_deadline.py b/tests/gateway/test_exit_deadline.py
+new file mode 100644
+index 00000000000..7542ceda2f3
+--- /dev/null
++++ b/tests/gateway/test_exit_deadline.py
+@@ -0,0 +1,226 @@
++"""One exit deadline for a supervised gateway stop.
++
++systemd SIGKILLs the gateway TimeoutStopSec after SIGTERM. stop() had a thread watchdog, but the
++work AFTER stop() (cron/housekeeping thread waits in ``_start_gateway_shutdown_tail`` and the
++default-executor join inside ``asyncio.run``) had none, so a slow tail was SIGKILLed with no stack
++dump and the next boot reported ``previous_unclean_exit`` (defect gateway-a2bcd6fabc).
++
++These tests drive the REAL signal handler, shutdown tail and exit funnel of ``gateway.run`` in a
++subprocess (a deadline that ``os._exit``s cannot be tested in-process) with a 6s supervisor budget.
++"""
++from __future__ import annotations
++
++import json
++import os
++import signal
++import sqlite3
++import subprocess
++import sys
++import textwrap
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[2]
++
++_BUDGET_S = 6.0
++# The child must be gone inside the supervisor budget (systemd would SIGKILL at 6s).
++_EXIT_WITHIN_S = _BUDGET_S
++
++_CHILD = textwrap.dedent(
++    """
++    import asyncio, os, signal, sys, threading, time
++    sys.path.insert(0, {repo!r})
++    from gateway import run as gr
++    from gateway.lifecycle_ledger import record_startup
++
++    BLOCK_EXECUTOR = {block_executor!r}
++
++    class Runner:
++        _signal_initiated_shutdown = False
++        _unplanned_signal = None
++        _stop_requested_by_signal = False
++        _launchd_exit_timeout_s = None
++        _restart_requested = False
++        _restart_via_service = False
++        should_exit_with_failure = False
++        exit_reason = None
++        exit_code = None
++        config = None
++        def __init__(self):
++            self._shutdown_event = asyncio.Event()
++        async def stop(self):
++            self._shutdown_event.set()
++        async def wait_for_shutdown(self):
++            await self._shutdown_event.wait()
++
++    async def start():
++        runner = Runner()
++        sig = [False]
++        handler = gr._start_gateway_make_shutdown_signal_handler(runner, sig)
++        loop = asyncio.get_running_loop()
++        loop.add_signal_handler(signal.SIGTERM, handler, signal.SIGTERM)
++        cron_stop = threading.Event()
++        # A cron ticker blocked in a 60s delivery wait that ignores cron_stop.
++        cron_thread = threading.Thread(target=time.sleep, args=(60,), daemon=True)
++        cron_thread.start()
++        housekeeping = threading.Thread(target=cron_stop.wait, daemon=True)
++        housekeeping.start()
++        pw_stop = threading.Event()
++        pw_thread = threading.Thread(target=pw_stop.wait, daemon=True)
++        pw_thread.start()
++        if BLOCK_EXECUTOR:
++            # A routing save stuck on the state.db lock in the default executor: asyncio.run
++            # joins it (up to 300s) after start_gateway returns.
++            loop.run_in_executor(None, time.sleep, 60)
++        print("READY", flush=True)
++        await runner.wait_for_shutdown()
++        return await gr._start_gateway_shutdown_tail(
++            runner, None, cron_stop, None, cron_thread, housekeeping, pw_stop, pw_thread, sig)
++
++    record_startup()
++    try:
++        ok = asyncio.run(start())
++        code = 0 if ok else 1
++    except SystemExit as e:
++        code = e.code if isinstance(e.code, int) else 1
++    gr._exit_after_graceful_shutdown(code)
++    """
++)
++
++
++def _spawn(tmp_path: Path, *, block_executor: bool) -> tuple[subprocess.Popen, Path]:
++    home = tmp_path / "home"
++    (home / "logs").mkdir(parents=True)
++    script = tmp_path / "child.py"
++    script.write_text(_CHILD.format(repo=str(REPO), block_executor=block_executor))
++    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
++    env.pop("INVOCATION_ID", None)  # never read the real unit's TimeoutStopSec
++    env.update(HERMES_HOME=str(home), HERMES_GATEWAY_EXIT_BUDGET_S=str(_BUDGET_S),
++               PYTHONPATH=str(REPO))
++    proc = subprocess.Popen([sys.executable, str(script)], env=env, cwd=str(REPO),
++                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    deadline = time.monotonic() + 60
++    while time.monotonic() < deadline:
++        line = proc.stdout.readline()
++        if not line:
++            break
++        if line.strip() == "READY":
++            return proc, home
++    proc.kill()
++    pytest.fail(f"child never became ready: {proc.stdout.read()}")
++
++
++def _stop_and_time(proc: subprocess.Popen) -> float:
++    started = time.monotonic()
++    proc.send_signal(signal.SIGTERM)
++    try:
++        proc.wait(timeout=_EXIT_WITHIN_S + 4)
++    except subprocess.TimeoutExpired:
++        proc.kill()
++        proc.wait()
++        return float("inf")
++    finally:
++        # Drain output so the pipe never blocks the child.
++        threading.Thread(target=proc.stdout.read, daemon=True).start()
++    return time.monotonic() - started
++
++
++def _ledger(home: Path) -> dict:
++    from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
++    return json.loads(get_lifecycle_sentinel_path(home).read_text())
++
++
++def _exit_diag(home: Path) -> list[dict]:
++    path = home / "logs" / "gateway-exit-diag.log"
++    if not path.exists():
++        return []
++    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
++
++
++def test_wedged_tail_exits_inside_supervisor_budget_with_dump(tmp_path):
++    """A tail blocked past the budget (cron wait + executor join) is cut at the exit deadline:
++    the process exits before the supervisor's SIGKILL, stamps the ledger and leaves a dump."""
++    proc, home = _spawn(tmp_path, block_executor=True)
++    elapsed = _stop_and_time(proc)
++    assert elapsed < _EXIT_WITHIN_S, f"gateway still alive {elapsed:.1f}s after SIGTERM (budget {_BUDGET_S}s)"
++    ledger = _ledger(home)
++    assert ledger["phase"] == "exited"
++    assert ledger["exit_reason"] == "exit_deadline"
++    dump = (home / "logs" / "gateway-shutdown-watchdog.log").read_text()
++    assert '"event": "exit_deadline_fired"' in dump
++    assert "faulthandler dump" in dump
++    records = [r for r in _exit_diag(home) if r.get("tag") == "gateway.exit_deadline"]
++    assert records, _exit_diag(home)
++    assert records[0]["budget_s"] == _BUDGET_S
++    assert "signal" in records[0]["phases"]
++
++
++def test_slow_cron_wait_is_clamped_and_exit_stays_graceful(tmp_path):
++    """Only the cron wait is slow: it is clamped to the time left, so the normal graceful
++    exit runs inside the budget and the deadline never has to fire."""
++    proc, home = _spawn(tmp_path, block_executor=False)
++    elapsed = _stop_and_time(proc)
++    assert elapsed < _EXIT_WITHIN_S, f"gateway still alive {elapsed:.1f}s after SIGTERM (budget {_BUDGET_S}s)"
++    ledger = _ledger(home)
++    assert ledger["exit_reason"] == "graceful_shutdown"
++    assert not [r for r in _exit_diag(home) if r.get("tag") == "gateway.exit_deadline"]
++
++
++def test_routing_save_uses_short_patience_while_exiting(tmp_path, monkeypatch):
++    """While the gateway is exiting, a routing save blocked by another state.db writer gives up
++    after the short drain patience (not the 20s default) and falls back to sessions.json."""
++    import hermes_constants
++    import hermes_state
++    from gateway import exit_deadline
++    from gateway.config import GatewayConfig, Platform
++    from gateway.session import SessionSource, SessionStore
++
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: str(tmp_path))
++    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
++    entry = store.get_or_create_session(SessionSource(
++        platform=Platform.LOCAL, chat_id="cli", chat_name="CLI", chat_type="dm", user_id="u1"))
++
++    holder = sqlite3.connect(str(tmp_path / "state.db"), timeout=0, isolation_level=None)
++    holder.execute("BEGIN IMMEDIATE")
++    monkeypatch.setattr(exit_deadline, "is_exiting", lambda: True)
++    try:
++        started = time.monotonic()
++        store.update_session(entry.session_key, last_prompt_tokens=777)
++        elapsed = time.monotonic() - started
++    finally:
++        holder.execute("ROLLBACK")
++        holder.close()
++        store._db.close()
++    # One fast-path attempt + one full-rewrite attempt, each at the drain patience.
++    assert elapsed < 3 * exit_deadline.DRAIN_DB_PATIENCE_S + 1.0, elapsed
++    mirror = json.loads((tmp_path / "sessions" / "sessions.json").read_text())
++    assert mirror[entry.session_key]["last_prompt_tokens"] == 777
++
++
++def test_budget_resolution_order(monkeypatch):
++    from gateway import exit_deadline, shutdown_forensics
++    monkeypatch.setattr(shutdown_forensics, "current_systemd_timeout_stop_s", lambda: 70.0)
++    monkeypatch.delenv(exit_deadline.BUDGET_ENV, raising=False)
++    assert exit_deadline.resolve_supervisor_stop_budget_s() == (70.0, "systemd")
++    assert exit_deadline.resolve_supervisor_stop_budget_s(60) == (60.0, "launchd")
++    monkeypatch.setenv(exit_deadline.BUDGET_ENV, "9")
++    assert exit_deadline.resolve_supervisor_stop_budget_s(60) == (9.0, "env")
++    assert exit_deadline.margin_for(70) == exit_deadline.EXIT_DEADLINE_MARGIN_S
++    assert exit_deadline.margin_for(6) == 1.5
++
++
++def test_arm_is_skipped_for_in_process_pytest_stops(monkeypatch):
++    """stop()-driving unit tests must never get a delayed os._exit in the pytest worker."""
++    from gateway import exit_deadline
++    monkeypatch.delenv(exit_deadline.BUDGET_ENV, raising=False)
++    exit_deadline._reset_for_tests()
++    try:
++        assert exit_deadline.arm("stop") is False
++        assert exit_deadline.is_exiting() is False
++        assert exit_deadline.clamp_wait(65.0, 7.0) == 65.0
++    finally:
++        exit_deadline._reset_for_tests()
+diff --git a/tests/gateway/test_shutdown_forensics.py b/tests/gateway/test_shutdown_forensics.py
+index a51cbefe5b4..545313466a5 100644
+--- a/tests/gateway/test_shutdown_forensics.py
++++ b/tests/gateway/test_shutdown_forensics.py
+@@ -165,3 +165,32 @@ class TestParseSystemdDuration:
+ # ---------------------------------------------------------------------------
+ # check_systemd_timing_alignment
+ # ---------------------------------------------------------------------------
++
++
++class TestSystemdTimingAlignmentTail:
++    """The stop() leash plus the post-stop tail must fit TimeoutStopSec (defect gateway-a2bcd6fabc)."""
++
++    def _under_unit(self, monkeypatch, timeout_s: float):
++        monkeypatch.setattr(sf, "current_systemd_unit", lambda: "hermes-gateway.service")
++        monkeypatch.setattr(sf, "_systemd_timeout_stop_us", lambda unit: int(timeout_s * 1_000_000))
++
++    def test_tail_mismatch_when_leash_plus_tail_exceeds_timeout(self, monkeypatch):
++        self._under_unit(monkeypatch, 70)
++        result = sf.check_systemd_timing_alignment(0, 30, stop_leash_s=65)
++        assert result["mismatch"] is False
++        assert result["tail_mismatch"] is True
++        assert result["stop_envelope_s"] == 65 + sf.SHUTDOWN_TAIL_RESERVE_S
++
++    def test_default_leash_fits_default_unit(self, monkeypatch):
++        self._under_unit(monkeypatch, 70)
++        result = sf.check_systemd_timing_alignment(0, 30, stop_leash_s=60)
++        assert result["tail_mismatch"] is False
++
++    def test_timeout_stop_s_reads_live_unit(self, monkeypatch):
++        self._under_unit(monkeypatch, 70)
++        assert sf.current_systemd_timeout_stop_s() == 70.0
++
++    def test_not_under_systemd(self, monkeypatch):
++        monkeypatch.delenv("INVOCATION_ID", raising=False)
++        assert sf.current_systemd_unit() is None
++        assert sf.check_systemd_timing_alignment(0, 30, stop_leash_s=60) is None
+-- 
+2.55.0
+

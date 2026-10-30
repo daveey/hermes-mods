@@ -1,0 +1,172 @@
+From f5c7bb2e7c3e9ed48e43741de6d67bae6c32b2fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:55:28 -0700
+Subject: [PATCH] fix(test): avoid pytest logger registry capture race (#234)
+
+* fix(test): avoid pytest logger registry capture race
+
+* fix(kanban): keep placement attribution out of chat routing [daveey]
+
+* fix(kanban): exclude placement placeholders from live pollers [daveey]
+
+* fix(kanban): derive scope-heartbeat freshness from the owner's published collector period [daveey]
+
+Remote-terminal release, origin-ledger owner liveness and wait probes each trusted an owner's
+task_scopes[].observed_at for a fixed window (450 s, 450 s, 600 s). On the loaded hub the gap between
+clean scope reads reached ~440 s (default-board reads timing out at 180 s), so closed remote cards
+flapped "never released" in session-idle-check, both directions.
+
+New hermes_cli/kanban_scope_heartbeat.py is the one rule: window = clamp(2.5 x
+scope_heartbeat_period_s, 450, 1800), where the owner's hermes-hub collector publishes the period in
+gateway/info. An owner that publishes none keeps the 450 s floor. Tests pin window >= 2.5 x period
+and exercise each reader (release, projection horizon, ledger, wait probe).
+
+* test(update): publish stand-in backend port atomically [daveey] (#229)
+
+* fix(kanban): admit board reads per board so a cold board cannot queue the others [daveey]
+
+Mac 16:30 cold start (loop-watch, 9 records): GET /api/plugins/kanban/board
+took 6-20 s. Every board read waited at web_read_coalescing.py:51 on the one
+asyncio.Semaphore(1) shared by all of _read_board, so a cheap read of one board
+queued behind a cold read of another (the runners board hit the Desktop's 6 s
+timeout). Hub repro with the real data: runners read admit_wait 6.1 s, run 0.4 s.
+
+coalesced_read gains admission_key/max_concurrent: one in-flight read per
+group, at most N groups at once. _read_board groups by board, N=4, so a burst
+still holds a bounded number of AnyIO workers; /api/profiles keeps one slot.
+
+* fix(test): avoid pytest logger registry capture race
+---
+ .github/workflows/bootstrap-installer.yml     |  2 +-
+ pyproject.toml                                |  3 +-
+ .../test_pytest_logging_concurrency.py        | 56 +++++++++++++++++++
+ uv.lock                                       |  8 +--
+ 4 files changed, 63 insertions(+), 6 deletions(-)
+ create mode 100644 tests/scripts/test_pytest_logging_concurrency.py
+
+diff --git a/.github/workflows/bootstrap-installer.yml b/.github/workflows/bootstrap-installer.yml
+index 9bc95e09e7f..78522aaed8d 100644
+--- a/.github/workflows/bootstrap-installer.yml
++++ b/.github/workflows/bootstrap-installer.yml
+@@ -118,7 +118,7 @@ jobs:
+ 
+       - name: Prepare isolated acceptance-test dependencies
+         shell: bash
+-        run: python -m scripts.ci.python_packages pytest==9.1.1 pytest-asyncio==1.3.0 ruamel.yaml==0.18.17 packaging==26.0
++        run: python -m scripts.ci.python_packages pytest==9.0.3 pytest-asyncio==1.3.0 ruamel.yaml==0.18.17 packaging==26.0
+ 
+       - name: Current installer to PM worker to published command
+         shell: bash
+diff --git a/pyproject.toml b/pyproject.toml
+index 6de4bd21be7..6aa4fd70d44 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -528,7 +528,8 @@ all = [
+ # Build and test tooling never ships in runtime payloads.
+ dev = [
+   "debugpy==1.8.20",
+-  "pytest==9.1.1",
++  # 9.1+ races logger registration during capture setup (pytest-dev/pytest#15237).
++  "pytest==9.0.3",
+   "pytest-asyncio==1.3.0",
+   "mcp==2.0.0",
+   "httpx2==2.7.0",
+diff --git a/tests/scripts/test_pytest_logging_concurrency.py b/tests/scripts/test_pytest_logging_concurrency.py
+new file mode 100644
+index 00000000000..240e29321fd
+--- /dev/null
++++ b/tests/scripts/test_pytest_logging_concurrency.py
+@@ -0,0 +1,56 @@
++"""The test environment must tolerate logger registration during capture setup.
++
++pytest 9.1's live registry scan can corrupt teardown for unrelated threaded
++cron tests; see https://github.com/pytest-dev/pytest/issues/15237.
++"""
++
++import logging
++import threading
++
++from _pytest.logging import LogCaptureHandler, catching_logs
++
++
++def test_capture_setup_tolerates_concurrent_logger_registration(monkeypatch):
++    # Use a private registry: the trigger must not affect pytest's outer capture.
++    manager = logging.Manager(logging.root)
++    monkeypatch.setattr(logging.Logger, "manager", manager)
++    register = threading.Event()
++    registered = threading.Event()
++
++    def register_logger():
++        if register.wait(timeout=30):
++            logging.getLogger("capture.concurrent-registration")
++            registered.set()
++
++    worker = threading.Thread(target=register_logger)
++
++    class TriggerLogger(logging.Logger):
++        @property
++        def propagate(self):
++            # If capture scans loggers, force registration between iterator steps.
++            # Root-only capture need not inspect this logger at all.
++            register.set()
++            assert registered.wait(timeout=30)
++            return True
++
++        @propagate.setter
++        def propagate(self, value):
++            pass
++
++    manager.loggerDict["capture.trigger"] = TriggerLogger("capture.trigger")
++    handler = LogCaptureHandler()
++    capture = catching_logs(handler)
++    worker.start()
++    try:
++        with capture:
++            register.set()
++            assert registered.wait(timeout=30)
++            logging.getLogger("capture.concurrent-registration").warning("captured")
++        assert [record.getMessage() for record in handler.records] == ["captured"]
++        assert handler not in logging.root.handlers
++    finally:
++        register.set()
++        worker.join(timeout=30)
++        assert not worker.is_alive()
++        # Failed __enter__ in the regressed dependency leaves a root handler behind.
++        logging.root.removeHandler(handler)
+diff --git a/uv.lock b/uv.lock
+index b5af60f4f02..f95b7be3300 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2693,7 +2693,7 @@ dev = [
+     { name = "debugpy", specifier = "==1.8.20" },
+     { name = "httpx2", specifier = "==2.7.0" },
+     { name = "mcp", specifier = "==2.0.0" },
+-    { name = "pytest", specifier = "==9.1.1" },
++    { name = "pytest", specifier = "==9.0.3" },
+     { name = "pytest-asyncio", specifier = "==1.3.0" },
+     { name = "ruff", specifier = "==0.15.10" },
+     { name = "setuptools", specifier = "==83.0.0" },
+@@ -5192,7 +5192,7 @@ wheels = [
+ 
+ [[package]]
+ name = "pytest"
+-version = "9.1.1"
++version = "9.0.3"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "colorama", marker = "sys_platform == 'win32'" },
+@@ -5201,9 +5201,9 @@ dependencies = [
+     { name = "pluggy" },
+     { name = "pygments" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/e4/47/b9efed96c114afcfa3c9d3fe98a76a1d14c74a9e266d397cf6eb64be5e01/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313", size = 1636369, upload-time = "2026-06-19T10:58:32.857Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/7d/0d/549bd94f1a0a402dc8cf64563a117c0f3765662e2e668477624baeec44d5/pytest-9.0.3.tar.gz", hash = "sha256:b86ada508af81d19edeb213c681b1d48246c1a91d304c6c81a427674c17eb91c", size = 1572165, upload-time = "2026-04-07T17:16:18.027Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c", size = 386536, upload-time = "2026-06-19T10:58:31.347Z" },
++    { url = "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl", hash = "sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9", size = 375249, upload-time = "2026-04-07T17:16:16.13Z" },
+ ]
+ 
+ [[package]]
+-- 
+2.55.0
+

@@ -1,0 +1,616 @@
+From e78c9b3b55d13be34deb758ed3bd9edee267c86b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:35:24 -0700
+Subject: [PATCH] fix(sidebar): a turn running outside this window's stream
+ keeps its row working [daveey]
+
+A Kanban close-out turn the backend woke in an unopened chat painted the row's
+stored outcome (red for a decision) while the agent was still working. The
+renderer learns about turns only from its own stream and from the ACTIVE
+gateway's session.active_list poll, so a turn in a chat on another gateway
+(local while hub is active), or held by another process (SSH-isolated serve,
+dashboard, CLI), never reached $sessionDotStateById.
+
+Session list/tree rows now carry `turn_live: true` when the row's lineage holds
+a live durable turn lease (state.db session_turn_leases, any process, any
+profile; dead holder pids ignored). withRowActivity folds it to 'working', so
+the outcome stripe yields to it like any live turn and data-working is set.
+---
+ .../src/app/chat/sidebar/session-row.test.tsx |  25 +++
+ .../src/store/session-dot-state.test.ts       |  31 ++++
+ apps/desktop/src/store/session-dot-state.ts   |  54 +++---
+ apps/desktop/src/types/hermes.ts              |   1 +
+ hermes_cli/turn_session_activity.py           | 145 ++++++++++++++++
+ hermes_cli/web_routers/profiles.py            |   5 +-
+ hermes_cli/web_routers/sessions.py            |   2 +
+ .../hermes_cli/test_turn_session_activity.py  | 155 ++++++++++++++++++
+ tests/tui_gateway/test_projects_rpc.py        |  10 +-
+ tui_gateway/methods_projects.py               |   7 +-
+ 10 files changed, 408 insertions(+), 27 deletions(-)
+ create mode 100644 hermes_cli/turn_session_activity.py
+ create mode 100644 tests/hermes_cli/test_turn_session_activity.py
+
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+index a15b3a1c50e..ca07b7a824f 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+@@ -906,6 +906,31 @@ describe('SidebarSessionRow stored outcome', () => {
+     expect(container.querySelector('[data-sidebar-stripe]')).toBeNull()
+   })
+ 
++  // [daveey] A Kanban close-out turn the backend woke in a chat this window never opened: no stream state, only
++  // the row's `turn_live` stamp. The decision must yield to it (working, no red stripe), and paint red again after.
++  it('a backend-reported running turn (turn_live) overrides a decision outcome; without it the decision is red', () => {
++    const decision = { kind: 'decision', items: [{ id: 'us_1', question: 'Merge PR #12?' }] }
++
++    const live = renderRow(
++      makeSession({ message_count: 4, outcome: decision, title: 'Close-out', turn_live: true } as Partial<
++        SessionInfo
++      > & { title: string })
++    )
++
++    expect(live.container.querySelector('[data-sidebar-stripe]')).toBeNull()
++    expect(live.container.querySelector('[data-working="true"]')).not.toBeNull()
++    live.unmount()
++
++    const settled = renderRow(
++      makeSession({ message_count: 4, outcome: decision, title: 'Close-out' } as Partial<SessionInfo> & {
++        title: string
++      })
++    )
++
++    expect(settled.container.querySelector('[data-sidebar-stripe]')?.getAttribute('data-sidebar-stripe')).toBe('stuck')
++    expect(settled.container.querySelector('[data-working="true"]')).toBeNull()
++  })
++
+   it('reads the park from row.muted', () => {
+     const { container } = renderRow(
+       makeSession({ message_count: 4, muted: true, title: 'Parked' } as Partial<SessionInfo> & { title: string })
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index d14a7c8de2c..fbb3c317f65 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -614,6 +614,37 @@ describe('withRowActivity', () => {
+ 
+     expect(withRowActivity('idle', { goal_active: false, kanban_active: 0, kanban_observed_at: Date.now() / 1000 })).toBe('idle')
+   })
++
++  // [daveey] A backend-woken Kanban close-out turn in a chat this window never opened (or one on a gateway other
++  // than the active one) reaches the renderer only as the row's `turn_live` stamp.
++  it('a running turn the backend reports (turn_live) reads as working over every non-live state', () => {
++    for (const state of ['idle', 'unread', 'draft', 'background'] as const) {
++      expect(withRowActivity(state, { turn_live: true })).toBe('working')
++      expect(hasLiveTurn(withRowActivity(state, { turn_live: true, kanban_active: 2 }))).toBe(true)
++    }
++
++    // A live turn the stream already knows keeps its own, more specific state.
++    for (const state of ['working', 'stalled', 'needs-input'] as const) {
++      expect(withRowActivity(state, { turn_live: true })).toBe(state)
++    }
++
++    // An offline cached copy proves nothing about now.
++    expect(withRowActivity('idle', { offline_cached: true, turn_live: true })).toBe('idle')
++  })
++
++  it('a decision outcome yields to a running close-out turn and paints red again once it ends', () => {
++    const decision = { kind: 'decision', summary: 'Pick A or B' } as const
++    const row = { kanban_active: 0, kanban_observed_at: Date.now() / 1000 }
++
++    const during = withRowActivity('idle', { ...row, turn_live: true })
++    expect(during).toBe('working')
++    expect(sessionStatusStripe(during, true, false, 0, false, null, 0, 0, 0, decision as never)).toBeNull()
++
++    // Control: no live turn, so the stored decision still paints the red stripe.
++    const after = withRowActivity('idle', row)
++    expect(after).toBe('idle')
++    expect(sessionStatusStripe(after, true, false, 0, false, null, 0, 0, 0, decision as never)).toBe('stuck')
++  })
+ })
+ 
+ // [daveey] A chat that was not loaded anywhere when its cards finished.
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 523f3a092d1..33169e3542b 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -386,26 +386,40 @@ export const kanbanStripeCounts = (row: KanbanCounts): { blocked: number; stalle
+  *  comes from the project tree and is in neither — so a session with an active
+  *  /goal, open kanban cards or a live background job painted done (green).
+  *  Same claim (and priority) as the store: it beats idle/unread/draft only. */
+-export const withRowActivity = (
+-  state: SessionDotState,
+-  row: Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active' | 'kanban_blocked'> &
+-    Partial<Pick<SessionInfo, 'kanban_held' | 'kanban_parked'>> &
+-    Partial<Pick<SessionInfo, 'kanban_observed_at' | 'kanban_remote_stale' | 'kanban_unknown' | 'kanban_unseen' | 'offline_cached'>>
+-): SessionDotState =>
+-  row.offline_cached
+-    ? 'idle'
+-    : (state === 'idle' || state === 'unread' || state === 'draft') &&
+-        (row.goal_active === true ||
+-          liveKanbanCount(row) > 0 ||
+-          row.kanban_unknown === true ||
+-          (row.kanban_remote_stale ?? 0) > 0 ||
+-          !hasFreshKanbanObservation(row) ||
+-          (row.kanban_blocked ?? 0) > 0 ||
+-          (row.background_active ?? 0) > 0)
+-      ? 'background'
+-      : (state === 'idle' || state === 'draft') && (row.kanban_unseen ?? 0) > 0
+-        ? 'unread'
+-        : state
++type RowActivity = Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active' | 'kanban_blocked'> &
++  Partial<Pick<SessionInfo, 'kanban_held' | 'kanban_parked'>> &
++  Partial<Pick<SessionInfo, 'kanban_observed_at' | 'kanban_remote_stale' | 'kanban_unknown' | 'kanban_unseen' | 'offline_cached'>> &
++  Partial<Pick<SessionInfo, 'turn_live'>>
++
++/** [daveey] Work the row's own stamps say is still in flight outside a turn: a goal, cards, a background job. */
++const rowHasBackgroundWork = (row: RowActivity): boolean =>
++  row.goal_active === true ||
++  liveKanbanCount(row) > 0 ||
++  row.kanban_unknown === true ||
++  (row.kanban_remote_stale ?? 0) > 0 ||
++  !hasFreshKanbanObservation(row) ||
++  (row.kanban_blocked ?? 0) > 0 ||
++  (row.background_active ?? 0) > 0
++
++export const withRowActivity = (state: SessionDotState, row: RowActivity): SessionDotState => {
++  if (row.offline_cached) {
++    return 'idle'
++  }
++
++  // [daveey] A turn the backend reports running (any process, any gateway) is a live turn even when this window
++  // never saw its stream: a backend-woken close-out turn in an unopened chat, or a chat on a gateway other than the
++  // active one (only the active gateway's `session.active_list` is polled). It beats every non-live state, so the
++  // stored outcome (a red decision) yields to it like any live turn.
++  if (row.turn_live === true && !hasLiveTurn(state)) {
++    return 'working'
++  }
++
++  if ((state === 'idle' || state === 'unread' || state === 'draft') && rowHasBackgroundWork(row)) {
++    return 'background'
++  }
++
++  return (state === 'idle' || state === 'draft') && (row.kanban_unseen ?? 0) > 0 ? 'unread' : state
++}
+ 
+ /** Whether this turn is the session's own, live: brighter title, and the row's
+  *  age yields to the actions menu. Wider than the arc — a turn waiting on an
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 06bcc4f7c70..b373ea54d5c 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -704,6 +704,7 @@ export interface SessionInfo {
+   /** [daveey] What those processes are (oldest first, capped): the sidebar's
+    *  process badge lists each command and its age, with a Stop button. */
+   background_processes?: SessionBackgroundProcess[]
++  turn_live?: boolean // [daveey] a live turn lease on the lineage, any process (hermes_cli/turn_session_activity.py)
+   /** [daveey] Set when this conversation's latest reply links an open GitHub
+    *  PR still waiting on a code review: `stuck` when the review is on the
+    *  viewer (or nobody / others asked >24h ago), `parked` when only other
+diff --git a/hermes_cli/turn_session_activity.py b/hermes_cli/turn_session_activity.py
+new file mode 100644
+index 00000000000..67d5bc70ed7
+--- /dev/null
++++ b/hermes_cli/turn_session_activity.py
+@@ -0,0 +1,145 @@
++"""Which sessions have a turn running right now, in any Hermes process. [daveey]
++
++The sidebar learns that a turn runs from its own stream events and from the ACTIVE gateway's
++``session.active_list`` poll. A turn started anywhere else never reaches it: a Kanban close-out turn
++the backend wakes in a chat on a gateway the window is not looking at, a turn held by an SSH-isolated
++``serve`` backend or the dashboard process, or a CLI/gateway turn. The row then painted its stored
++outcome (red for a decision) or green while the agent was still working in it.
++
++Session-list endpoints now stamp ``turn_live: true`` on each row whose compression lineage holds a
++live durable turn lease (state.db ``session_turn_leases``, held from admission to flush of every turn
++by any surface, keyed by the lineage root). A lease whose holder pid is provably dead does not count.
++Cached for a couple of seconds because the sidebar polls.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import re
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any, Iterable
++
++_log = logging.getLogger(__name__)
++
++_CACHE_TTL_S = 2.0
++_cache_lock = threading.Lock()
++_cache: tuple[float, frozenset[str]] | None = None
++
++
++def _state_db_paths() -> list[Path]:
++    paths: list[Path] = []
++    try:
++        from hermes_constants import get_hermes_home
++
++        home = Path(get_hermes_home())
++        paths.append(home / "state.db")
++        profiles = home / "profiles"
++        if profiles.is_dir():
++            paths.extend(sorted(profiles.glob("*/state.db")))
++    except OSError:
++        _log.debug("state.db paths unavailable", exc_info=True)
++    return [p for p in paths if p.is_file()]
++
++
++def _open_ro(path: Path) -> sqlite3.Connection:
++    """Read-only open; ``mode=ro`` refuses a WAL db whose -shm is absent, so fall back to query_only."""
++    try:
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
++        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
++        return conn
++    except sqlite3.OperationalError:
++        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=2.0)
++        conn.execute("PRAGMA query_only=ON")
++        return conn
++
++
++_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
++
++
++def _holder_dead(holder: str) -> bool:
++    """Display-grade liveness: True when the holder's ``pid=`` is not a running process on this host.
++
++    Lease reclaim refuses to probe unstamped holders (it waits out the TTL so a false reclaim never
++    ends a live turn), but that would leave a crashed turn painting "working" for up to the lease TTL.
++    A wrong answer here only repaints a row, so probe directly. Unparseable holders count as live."""
++    match = _PID_RE.search(holder or "")
++    pid = int(match.group(1)) if match else 0
++    if pid <= 0 or pid == os.getpid() or os.name == "nt":
++        return False
++    try:
++        os.kill(pid, 0)  # windows-footgun: ok — nt returns above
++    except ProcessLookupError:
++        return True
++    except (OSError, OverflowError):  # PermissionError: alive, another user's
++        return False
++    return False
++
++
++def _collect(now: float) -> frozenset[str]:
++    live: set[str] = set()
++    for path in _state_db_paths():
++        try:
++            conn = _open_ro(path)
++        except (sqlite3.Error, OSError):
++            _log.debug("turn leases unreadable in %s", path, exc_info=True)
++            continue
++        try:
++            rows = conn.execute(
++                "SELECT conversation_id, holder FROM session_turn_leases WHERE expires_at > ?", (now,)
++            ).fetchall()
++        except sqlite3.Error:  # no lease table yet (nothing ever ran a turn there) or a busy/odd store
++            rows = []
++        finally:
++            conn.close()
++        live.update(cid for cid, holder in rows if cid and not _holder_dead(str(holder or "")))
++    return frozenset(live)
++
++
++def live_turn_session_ids() -> frozenset[str]:
++    """Lineage-root ids with a live turn lease in any profile's state.db, cached briefly."""
++    global _cache
++    mono = time.monotonic()
++    with _cache_lock:
++        if _cache is not None and mono < _cache[0]:
++            return _cache[1]
++    live = _collect(time.time())
++    with _cache_lock:
++        _cache = (mono + _CACHE_TTL_S, live)
++    return live
++
++
++def _row_ids(row: dict[str, Any]) -> Iterable[str]:
++    for sid in (row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())):
++        if sid:
++            yield sid
++
++
++def annotate_turn_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Stamp ``turn_live: true`` on each row whose lineage holds a live turn lease; pop it otherwise.
++    Never raises: the list must render without it."""
++    if not rows:
++        return rows
++    try:
++        live = live_turn_session_ids()
++    except (sqlite3.Error, OSError):
++        _log.debug("turn activity unavailable", exc_info=True)
++        return rows
++    for row in rows:
++        if any(sid in live for sid in _row_ids(row)):
++            row["turn_live"] = True
++        else:
++            row.pop("turn_live", None)
++    return rows
++
++
++def _invalidate_cache() -> None:
++    global _cache
++    with _cache_lock:
++        _cache = None
++
++
++_reset_cache_for_tests = _invalidate_cache
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 68cae1ff490..06dd7842eb3 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -39,6 +39,7 @@ from hermes_cli.kanban_session_activity import annotate_kanban_activity, one_ann
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity
++from hermes_cli.turn_session_activity import annotate_turn_activity
+ from hermes_cli.review_session_activity import annotate_review_wait
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
+@@ -515,6 +516,7 @@ def get_profiles_sessions(
+     annotate_goal_activity(window)
+     annotate_cron_activity(window)
+     annotate_background_activity(window)
++    annotate_turn_activity(window)
+     annotate_review_wait(window)
+     return {"sessions": window, "total": sum(totals.values()), "profile_totals": totals,
+             "limit": limit, "offset": offset, "errors": errors,
+@@ -621,7 +623,8 @@ def get_profiles_sessions_sidebar(
+         rows[key].sort(key=_recency, reverse=True)
+         win = _pinned_window(rows[key], 0, cap[key])
+         _strip_session_list_rows(win)
+-        return annotate_review_wait(annotate_background_activity(annotate_cron_activity(annotate_goal_activity(annotate_kanban_activity(win)))))
++        return annotate_review_wait(annotate_turn_activity(annotate_background_activity(annotate_cron_activity(
++            annotate_goal_activity(annotate_kanban_activity(win))))))
+ 
+     storage = _corrupt_profile_stores(scanned)
+     retryable = _retryable_profile_errors(errors, scanned)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 9618f13f4b5..0f1a3972549 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -24,6 +24,7 @@ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity, stop_session_process
++from hermes_cli.turn_session_activity import annotate_turn_activity
+ from hermes_cli.review_session_activity import annotate_review_wait
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
+@@ -255,6 +256,7 @@ def get_sessions(
+             annotate_goal_activity(sessions)
+             annotate_cron_activity(sessions)
+             annotate_background_activity(sessions)
++            annotate_turn_activity(sessions)
+             annotate_review_wait(sessions)
+             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
+             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
+diff --git a/tests/hermes_cli/test_turn_session_activity.py b/tests/hermes_cli/test_turn_session_activity.py
+new file mode 100644
+index 00000000000..2ef829029e3
+--- /dev/null
++++ b/tests/hermes_cli/test_turn_session_activity.py
+@@ -0,0 +1,155 @@
++"""turn_live stamping on session-list rows: a turn running in any process keeps the row live. [daveey]"""
++
++import os
++import sqlite3
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_cli import turn_session_activity as tsa
++
++
++def _leases(db_path, rows):
++    db_path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(db_path)
++    conn.execute(
++        "CREATE TABLE IF NOT EXISTS session_turn_leases (conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL,"
++        " acquired_at REAL NOT NULL, expires_at REAL NOT NULL)"
++    )
++    conn.executemany("INSERT INTO session_turn_leases VALUES (?, ?, ?, ?)", rows)
++    conn.commit()
++    conn.close()
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    tsa._reset_cache_for_tests()
++    yield tmp_path
++    tsa._reset_cache_for_tests()
++
++
++@pytest.fixture
++def dead_pid():
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _holder(pid, sid):
++    return f"pid={pid}:turn={sid}:{sid}:abcd1234:platform=desktop"
++
++
++def test_live_lease_stamps_row_and_its_lineage_tip(home):
++    now = time.time()
++    _leases(home / "state.db", [("root_a", _holder(os.getpid(), "root_a"), now - 5, now + 600)])
++    rows = tsa.annotate_turn_activity([
++        {"id": "root_a"},
++        # A compression tip carries its root: the lease is keyed by the root.
++        {"id": "tip_a", "_lineage_root_id": "root_a"},
++        {"id": "other"},
++    ])
++    assert [r.get("turn_live") for r in rows] == [True, True, None]
++
++
++def test_no_lease_no_stamp_and_stale_stamp_is_removed(home):
++    _leases(home / "state.db", [])
++    rows = tsa.annotate_turn_activity([{"id": "a", "turn_live": True}])
++    assert "turn_live" not in rows[0]
++
++
++def test_expired_lease_does_not_count(home):
++    now = time.time()
++    _leases(home / "state.db", [("a", _holder(os.getpid(), "a"), now - 900, now - 1)])
++    assert "turn_live" not in tsa.annotate_turn_activity([{"id": "a"}])[0]
++
++
++def test_lease_of_dead_holder_does_not_count(home, dead_pid):
++    now = time.time()
++    _leases(home / "state.db", [("a", _holder(dead_pid, "a"), now - 5, now + 600)])
++    assert "turn_live" not in tsa.annotate_turn_activity([{"id": "a"}])[0]
++
++
++def test_lease_held_by_another_live_process_counts(home):
++    # The SSH-isolated serve / dashboard / gateway hold turns the listing backend never ran.
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++    try:
++        now = time.time()
++        _leases(home / "state.db", [("a", _holder(proc.pid, "a"), now - 5, now + 600)])
++        assert tsa.annotate_turn_activity([{"id": "a"}])[0].get("turn_live") is True
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def test_profile_state_dbs_are_read(home):
++    now = time.time()
++    _leases(home / "state.db", [])
++    _leases(home / "profiles" / "work" / "state.db", [("p", _holder(os.getpid(), "p"), now - 5, now + 600)])
++    assert tsa.annotate_turn_activity([{"id": "p", "profile": "work"}])[0].get("turn_live") is True
++
++
++def test_missing_lease_table_and_missing_db_never_raise(home):
++    sqlite3.connect(home / "state.db").close()  # a store with no lease table yet
++    assert tsa.annotate_turn_activity([{"id": "a"}]) == [{"id": "a"}]
++    assert tsa.annotate_turn_activity([]) == []
++
++
++# ── list endpoints: the rows the sidebar paints carry the stamp ─────────────────────────────────
++
++
++@pytest.fixture
++def rest(monkeypatch, _isolate_hermes_home):
++    starlette = pytest.importorskip("starlette.testclient")
++    import hermes_state
++    from hermes_cli import profiles
++    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
++    from hermes_constants import get_hermes_home
++    from hermes_state import SessionDB
++
++    home = get_hermes_home()
++    home.mkdir(parents=True, exist_ok=True)
++    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
++    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
++    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: home / "profiles")
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        for sid in ("busy_chat", "idle_chat"):
++            db.create_session(sid, source="desktop")
++            db.append_message(sid, role="user", content="go")
++            db.append_message(sid, role="assistant", content="done")
++        # The close-out turn another backend process runs in busy_chat.
++        assert db.try_acquire_session_turn_lease("busy_chat", _holder(os.getpid(), "busy_chat"), ttl_seconds=600)
++    finally:
++        db.close()
++    tsa._reset_cache_for_tests()
++    c = starlette.TestClient(app)
++    c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
++    yield c
++    tsa._reset_cache_for_tests()
++
++
++def _by_id(rows):
++    return {r["id"]: r for r in rows}
++
++
++def test_api_sessions_rows_carry_turn_live(rest):
++    rows = _by_id(rest.get("/api/sessions?order=recent&limit=20").json()["sessions"])
++    assert rows["busy_chat"].get("turn_live") is True
++    assert "turn_live" not in rows["idle_chat"]
++
++
++def test_api_profiles_sessions_rows_carry_turn_live(rest):
++    rows = _by_id(rest.get("/api/profiles/sessions?profile=all&limit=20").json()["sessions"])
++    assert rows["busy_chat"].get("turn_live") is True
++    assert "turn_live" not in rows["idle_chat"]
++
++
++def test_api_profiles_sidebar_rows_carry_turn_live(rest):
++    body = rest.get("/api/profiles/sessions/sidebar?profile=all").json()
++    rows = _by_id(body["recents"]["sessions"])
++    assert rows["busy_chat"].get("turn_live") is True
++    assert "turn_live" not in rows["idle_chat"]
+diff --git a/tests/tui_gateway/test_projects_rpc.py b/tests/tui_gateway/test_projects_rpc.py
+index 81b06221528..4ae2461b9a3 100644
+--- a/tests/tui_gateway/test_projects_rpc.py
++++ b/tests/tui_gateway/test_projects_rpc.py
+@@ -765,14 +765,14 @@ def test_tree_rows_carry_session_activity_stamps(monkeypatch, tmp_path):
+     """[daveey] Project-mode rows older than the recents page are the sidebar's only copy:
+     they must carry goal/kanban/cron/background stamps or the row paints done (green)."""
+     from hermes_cli import (cron_session_activity, goal_session_activity,
+-                            kanban_session_activity, process_session_activity)
++                            kanban_session_activity, process_session_activity, turn_session_activity)
+ 
+     launch_home = _profile_dir(tmp_path, "launch")
+     repo = tmp_path / "repos" / "activity"
+     repo.mkdir(parents=True)
+     _bind_profiles(monkeypatch, tmp_path, {"default": launch_home})
+     project = _create_project(launch_home, "Act", repo, use=True)
+-    for sid in ("s_goal", "s_cards", "s_quiet"):
++    for sid in ("s_goal", "s_cards", "s_quiet", "s_turn"):
+         _create_session(launch_home, sid, repo)
+ 
+     monkeypatch.setattr(goal_session_activity, "active_goal_sessions", lambda: frozenset({"s_goal"}))
+@@ -789,6 +789,8 @@ def test_tree_rows_carry_session_activity_stamps(monkeypatch, tmp_path):
+     monkeypatch.setattr(kanban_session_activity, "_all_counts", counts)
+     monkeypatch.setattr(cron_session_activity, "cron_owner_sessions", lambda: frozenset())
+     monkeypatch.setattr(process_session_activity, "_owned_processes", lambda: {"s_quiet": set()})
++    # A turn another process runs (a backend-woken close-out turn) holds this lineage's turn lease.
++    monkeypatch.setattr(turn_session_activity, "live_turn_session_ids", lambda: frozenset({"s_turn"}))
+ 
+     with _serving_launch_profile(launch_home):
+         tree = _call("projects.tree", {"preview_limit": 5})
+@@ -802,5 +804,7 @@ def test_tree_rows_carry_session_activity_stamps(monkeypatch, tmp_path):
+         assert rows["s_cards"]["kanban_remote_stale"] == 1
+         assert rows["s_cards"]["kanban_waiting_on"] == ["t_open"]
+         assert all("kanban_unknown" not in row for row in rows.values())
++        assert rows["s_turn"].get("turn_live") is True
+         # Control: an idle session carries none of them.
+-        assert not {"goal_active", "kanban_active", "kanban_remote_stale", "background_active", "cron_active"} & rows["s_quiet"].keys()
++        assert not {"goal_active", "kanban_active", "kanban_remote_stale", "background_active", "cron_active",
++                    "turn_live"} & rows["s_quiet"].keys()
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index 02e6e5208d4..a422744f2e8 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -358,7 +358,7 @@ def _project_tree_row(r: dict, automated_sources: list[str] | None = None) -> di
+ 
+ def _annotate_tree_activity(sessions: list[dict]) -> list[dict]:
+     """[daveey] Stamp the same activity fields the session lists carry (``kanban_active`` /
+-    ``kanban_blocked``, ``goal_active``, ``cron_active``, ``background_active``, ``review_wait``) on tree rows.
++    ``kanban_blocked``, ``goal_active``, ``cron_active``, ``background_active``, ``turn_live``, ``review_wait``) on tree rows.
+     In project mode an older session's ONLY loaded row is this one (it's past the recents
+     page), so without them the sidebar painted it done (green) while its /goal, cards or
+     background jobs were still in flight. ``build_tree`` passes these dicts through by
+@@ -369,8 +369,9 @@ def _annotate_tree_activity(sessions: list[dict]) -> list[dict]:
+         from hermes_cli.kanban_session_activity import annotate_kanban_activity
+         from hermes_cli.process_session_activity import annotate_background_activity
+         from hermes_cli.review_session_activity import annotate_review_wait
+-        annotate_review_wait(annotate_background_activity(annotate_cron_activity(
+-            annotate_goal_activity(annotate_kanban_activity(sessions)))))
++        from hermes_cli.turn_session_activity import annotate_turn_activity
++        annotate_review_wait(annotate_turn_activity(annotate_background_activity(annotate_cron_activity(
++            annotate_goal_activity(annotate_kanban_activity(sessions))))))
+     except Exception:  # the tree must render without them
+         pass
+     return sessions
+-- 
+2.55.0
+

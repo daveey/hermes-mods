@@ -1,0 +1,377 @@
+From 81dbc4704a4b1d86fa0bfea39e33b1e33107528e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 01:38:42 +0000
+Subject: [PATCH] fix(kanban): scope PR respawn holds to comment writer runs
+ [daveey]
+
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     | 56 ++++++++++-
+ tests/hermes_cli/kanban_guard_helpers.py      | 23 +++++
+ .../test_kanban_dependency_review.py          |  7 +-
+ .../test_kanban_pr_comment_provenance.py      | 94 +++++++++++++++++++
+ .../hermes_cli/test_kanban_pr_continuation.py | 24 ++---
+ 5 files changed, 186 insertions(+), 18 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pr_comment_provenance.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 8170c4796ec..98db65c1329 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -162,6 +162,47 @@ def _pr_comments_predate_first_run(conn: sqlite3.Connection, task_id: str, newes
+     return first_run is None or newest_pr_at < _kb._to_epoch(first_run)
+ 
+ 
++def _comment_rejections(conn: sqlite3.Connection, task_id: str, urls: Iterable[str]) -> None:
++    from hermes_cli.kanban_db_dispatch_pr_rejection import comment_rejection
++
++    for url in dict.fromkeys(urls):
++        if pr_state(url) == "REJECTED":
++            comment_rejection(conn, task_id, url, _rejections[url.rstrip("/").lower()])
++
++
++def _foreign_pr_comment_ids(conn: sqlite3.Connection, task_id: str) -> set[int]:
++    """Known foreign writers are FYI; absent or unreadable provenance fails closed.
++
++    The display author is a profile shared by workers and chats, not ownership.
++    Read events once per card, rather than issuing a query per comment.
++    """
++    foreign: set[int] = set()
++    seen: set[int] = set()
++    for row in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented'",
++        (task_id,),
++    ):
++        try:
++            data = json.loads(row[0])
++        except (ValueError, TypeError):
++            return set()  # cannot associate this unreadable event with a comment
++        if not isinstance(data, dict) or type(data.get("comment_id")) is not int:
++            return set()
++        cid = data["comment_id"]
++        if cid in seen:
++            foreign.discard(cid)  # ambiguous duplicate provenance fails closed
++            continue
++        seen.add(cid)
++        writer = data.get("writer_run_id")
++        if "writer_run_id" not in data:
++            foreign.add(cid)
++        elif type(writer) is int:
++            run = conn.execute("SELECT task_id FROM task_runs WHERE id = ?", (writer,)).fetchone()
++            if run is not None and run[0] != task_id:
++                foreign.add(cid)
++    return foreign
++
++
+ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[str]:
+     """Respawn-guard step 4: ``"active_pr"`` when a comment in the last 24 h names a PR, else None.
+ 
+@@ -178,16 +219,19 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     crash/reclaim is not a handoff, so the worker that opened the PR is still not re-spawned
+     against it. A latest immediate checkpoint also permits a same-second PR report;
+     scheduled checkpoints do not get that same-second exception. Dispatcher guard
+-    notices are diagnostic, not new PR publication evidence, and cannot invalidate
+-    an existing handoff.
+-    Also lifted once EVERY PR named in those comments is MERGED or CLOSED (gh, cached; any
++    notices and comments known to come from another card's run or a chat are
++    diagnostic/FYI, not new PR publication evidence, and cannot invalidate an
++    existing handoff. Missing or unreadable provenance remains fail-closed.
++    Also lifted once EVERY PR named in publication comments is MERGED or CLOSED (gh, cached; any
+     gh failure keeps the hold), or has a completed queue rejection requiring repair. [daveey]
+     """
+     from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_dispatch as _kbd
+ 
++    foreign_ids = _foreign_pr_comment_ids(conn, task_id)
+     pr_times: list[int] = []
+     pr_urls: list[str] = []
++    fyi_urls: list[str] = []
+     latest_pr_comment_id = 0
+     for t, c in _kbd._rows_since(conn, "task_comments", task_id, now - _kbd._RESPAWN_GUARD_PR_WINDOW,
+                                  cols=", id, body, author", unreadable=now):  # duplicate-PR risk: fail closed
+@@ -195,11 +239,17 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+         if c["author"] == "kanban-dispatcher" and body.startswith("[respawn-guard]"):
+             continue  # a diagnostic must not rearm its own handoff barrier
+         urls = _kbd._RESPAWN_GUARD_PR_URL_RE.findall(body)
++        if c["id"] in foreign_ids:
++            fyi_urls.extend(urls)
++            continue
+         if urls:
+             latest_pr_comment_id = max(latest_pr_comment_id, c["id"])
+             pr_times.append(t)
+             pr_urls.extend(urls)
+     if not pr_times:
++        # Foreign handoffs may still carry queue-rejection repair instructions,
++        # but cannot create a duplicate-publication hold.
++        _comment_rejections(conn, task_id, fyi_urls)
+         return None
+     if _pr_comments_predate_first_run(conn, task_id, max(pr_times)):
+         # Not held, but a queue-rejected PR in the handoff still gets its repair note,
+diff --git a/tests/hermes_cli/kanban_guard_helpers.py b/tests/hermes_cli/kanban_guard_helpers.py
+index e1e952dbd45..00cc9f8a07e 100644
+--- a/tests/hermes_cli/kanban_guard_helpers.py
++++ b/tests/hermes_cli/kanban_guard_helpers.py
+@@ -1,9 +1,32 @@
+ """Fixture for guard tests that model a card whose worker already ran (and so may have opened a PR)."""
++import time
++
+ import pytest
+ 
++from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_dispatch_pr_state as prs
+ 
+ 
++def worker_comment(conn, task_id, author, body):
++    """Model an owning worker, including the provenance the real tools stamp."""
++    row = conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None:
++        run_id = conn.execute(
++            "INSERT INTO task_runs (task_id, profile, status, started_at) VALUES (?, ?, 'running', ?)",
++            (task_id, author, int(time.time())),
++        ).lastrowid
++    else:
++        run_id = row[0]
++    with pytest.MonkeyPatch.context() as env:
++        env.setenv("HERMES_KANBAN_TASK", task_id)
++        env.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++        return _add_comment(conn, task_id, author, body)
++
++
++_add_comment = kb.add_comment
++
++
+ @pytest.fixture
+ def worker_ran(monkeypatch):
++    monkeypatch.setattr(kb, "add_comment", worker_comment)
+     monkeypatch.setattr(prs, "_pr_comments_predate_first_run", lambda *a, **k: False)
+diff --git a/tests/hermes_cli/test_kanban_dependency_review.py b/tests/hermes_cli/test_kanban_dependency_review.py
+index 8a5798952af..adda3fe340d 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review.py
++++ b/tests/hermes_cli/test_kanban_dependency_review.py
+@@ -5,6 +5,7 @@ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as dispatch
+ from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli.kanban_guard_helpers import worker_comment
+ 
+ PR = "https://github.com/example/repo/pull/10"
+ 
+@@ -22,7 +23,7 @@ def parked(conn, *, authenticated=True):
+     task = kb.create_task(conn, title="implementation", assignee="dev")
+     kb.claim_task(conn, task)
+     run = kb.get_task(conn, task).current_run_id
+-    kb.add_comment(conn, task, "dev", PR)
++    worker_comment(conn, task, "dev", PR)
+     reviews = [kb.create_task(conn, title="review", assignee="reviewer") for _ in range(2)]
+     for review in reviews:
+         kb.link_tasks(conn, review, task, expected_child_run_id=run)
+@@ -73,7 +74,7 @@ def test_dependency_and_comments_do_not_grant_generic_retry(board, mode):
+                        verdict="changes_required",
+                        pr=PR + "1" if mode == "unrelated" else PR)
+     if mode == "new_pr":
+-        kb.add_comment(board, task, "dev", PR + "1")
++        worker_comment(board, task, "dev", PR + "1")
+     if mode == "noop_assign":
+         kb.assign_task(board, task, "dev")
+     kb.add_comment(board, task, "reviewer", "changes_required " + PR)
+@@ -116,5 +117,5 @@ def test_exact_head_approval_of_unrelated_pr_stays_held(board):
+ def test_new_pr_after_exact_head_approval_stays_held(board):
+     task, reviews = parked(board)
+     finish_reviews(board, reviews, metadata={"verdict": "APPROVE", "head": HEAD})
+-    kb.add_comment(board, task, "reviewer", "Opened a new head " + PR + "9")
++    worker_comment(board, task, "dev", "Opened a new head " + PR + "9")
+     assert dispatch.check_respawn_guard(board, task) == "active_pr"
+diff --git a/tests/hermes_cli/test_kanban_pr_comment_provenance.py b/tests/hermes_cli/test_kanban_pr_comment_provenance.py
+new file mode 100644
+index 00000000000..c030d0e84d3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_comment_provenance.py
+@@ -0,0 +1,94 @@
++"""Only the owning worker's PR publication can supersede its checkpoint."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli.test_kanban_park_invariants import kanban_home
++
++__all__ = ["kanban_home"]
++pytestmark = pytest.mark.usefixtures("kanban_home")
++URL = "https://github.com/example/project/pull/12"
++NEW_URL = "https://github.com/example/project/pull/13"
++
++
++def _worker_comment(conn, tid, run_id, monkeypatch, body):
++    with monkeypatch.context() as env:
++        env.setenv("HERMES_KANBAN_TASK", tid)
++        env.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++        return kb.add_comment(conn, tid, "a", body)
++
++
++@pytest.mark.parametrize("writer", ["chat", "foreign_worker", "foreign_run"])
++def test_foreign_pr_comment_after_continued_does_not_rearm(monkeypatch, writer):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++        kb.claim_task(conn, tid)
++        run_id = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        _worker_comment(conn, tid, run_id, monkeypatch, f"Opened {URL}")
++        monkeypatch.setattr(time, "time", lambda: now + 1)
++        assert kc.continue_task(conn, tid, checkpoint="merge existing PR", resume_after_seconds=60)["ok"]
++        monkeypatch.setattr(time, "time", lambda: now + 2)
++        if writer == "chat":
++            monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++            kb.add_comment(conn, tid, "a", f"FYI sibling PR {NEW_URL}")
++        else:
++            other = kb.create_task(conn, title="sibling", assignee="a")
++            kb.claim_task(conn, other)
++            other_run = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (other,)).fetchone()[0]
++            # Normal cross-card writes omit writer_run_id; a mismatched run must
++            # also be rejected even if an imported event explicitly carries it.
++            cid = _worker_comment(conn, other if writer == "foreign_worker" else tid,
++                                  other_run, monkeypatch, f"FYI {NEW_URL}")
++            if writer == "foreign_worker":
++                with monkeypatch.context() as env:
++                    env.setenv("HERMES_KANBAN_TASK", other)
++                    env.setenv("HERMES_KANBAN_RUN_ID", str(other_run))
++                    kb.add_comment(conn, tid, "a", f"FYI {NEW_URL}")
++            else:
++                assert cid
++        assert prs.active_pr_reason(conn, tid, now + 62) is None
++
++
++@pytest.mark.parametrize("provenance", [
++    "own", "missing_event", "malformed_event", "invalid_json", "unknown_run", "boolean_run", "duplicate_event",
++])
++def test_own_or_unreadable_pr_comment_after_continued_still_guards(monkeypatch, provenance):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++        kb.claim_task(conn, tid)
++        run_id = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        _worker_comment(conn, tid, run_id, monkeypatch, f"Opened {URL}")
++        monkeypatch.setattr(time, "time", lambda: now + 1)
++        assert kc.continue_task(conn, tid, checkpoint="merge existing PR", resume_after_seconds=60)["ok"]
++        monkeypatch.setattr(time, "time", lambda: now + 2)
++        cid = _worker_comment(conn, tid, run_id, monkeypatch, f"New publication {NEW_URL}")
++        event = conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind='commented' ORDER BY id DESC LIMIT 1",
++                             (tid,)).fetchone()[0]
++        mutations = {
++            "missing_event": ("DELETE FROM task_events WHERE id=?", (event,)),
++            "malformed_event": ("UPDATE task_events SET payload=? WHERE id=?",
++                                (json.dumps({"comment_id": cid, "writer_run_id": []}), event)),
++            "unknown_run": ("UPDATE task_events SET payload=? WHERE id=?",
++                            (json.dumps({"comment_id": cid, "writer_run_id": -1}), event)),
++            "boolean_run": ("UPDATE task_events SET payload=? WHERE id=?",
++                            (json.dumps({"comment_id": cid, "writer_run_id": True}), event)),
++            "invalid_json": ("UPDATE task_events SET payload='{' WHERE id=?", (event,)),
++            "duplicate_event": (
++                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'commented', ?, ?)",
++                (tid, json.dumps({"comment_id": cid}), now + 2),
++            ),
++        }
++        if provenance in mutations:
++            conn.execute(*mutations[provenance])
++        assert prs.active_pr_reason(conn, tid, now + 62) == "active_pr"
+diff --git a/tests/hermes_cli/test_kanban_pr_continuation.py b/tests/hermes_cli/test_kanban_pr_continuation.py
+index 532dd2772ef..242eb02daf7 100644
+--- a/tests/hermes_cli/test_kanban_pr_continuation.py
++++ b/tests/hermes_cli/test_kanban_pr_continuation.py
+@@ -8,7 +8,7 @@ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_dispatch_pr_state as prs
+-from tests.hermes_cli.kanban_guard_helpers import worker_ran
++from tests.hermes_cli.kanban_guard_helpers import worker_comment, worker_ran
+ from tests.hermes_cli.test_kanban_park_invariants import kanban_home
+ 
+ __all__ = ["kanban_home"]  # register the shared isolated-board fixture
+@@ -29,11 +29,11 @@ def test_immediate_checkpoint_with_open_pr_dispatches(monkeypatch, all_assignees
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="finish owned PR", assignee="a")
+         kb.claim_task(conn, tid)
+-        kb.add_comment(conn, tid, "a", f"Draft work remains: {URL}")
++        worker_comment(conn, tid, "a", f"Draft work remains: {URL}")
+         result = kc.continue_task(conn, tid, checkpoint="Continue implementation of existing PR")
+         assert result["ok"] and result["status"] == "ready"
+         monkeypatch.setattr(time, "time", lambda: now + 1)
+-        kb.add_comment(conn, tid, "kanban-dispatcher", f"[respawn-guard] Held on {URL}")
++        worker_comment(conn, tid, "kanban-dispatcher", f"[respawn-guard] Held on {URL}")
+         dispatched = kbd.dispatch_once(conn, spawn_fn=lambda task, *a, **k: spawned.append(task.id) or 1)
+         assert tid not in dict(dispatched.respawn_guarded)
+         assert spawned == [tid]
+@@ -46,14 +46,14 @@ def test_guard_notice_cannot_supersede_real_handoff(monkeypatch):
+     monkeypatch.setattr(time, "time", lambda: now)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="review fixes", assignee="a")
+-        kb.add_comment(conn, tid, "a", f"PR {URL}")
++        worker_comment(conn, tid, "a", f"PR {URL}")
+         monkeypatch.setattr(time, "time", lambda: now + 1)
+         kb._append_event(conn, tid, "unblocked", {"reason": "finish this PR"})
+         monkeypatch.setattr(time, "time", lambda: now + 2)
+-        kb.add_comment(conn, tid, "kanban-dispatcher", f"[respawn-guard] Held on {URL}")
++        worker_comment(conn, tid, "kanban-dispatcher", f"[respawn-guard] Held on {URL}")
+         assert kbd.check_respawn_guard(conn, tid) is None
+         # An actual later work report still forms a new barrier.
+-        kb.add_comment(conn, tid, "a", f"Waiting for external owner: {URL}")
++        worker_comment(conn, tid, "a", f"Waiting for external owner: {URL}")
+         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+ 
+ 
+@@ -71,10 +71,10 @@ def test_checkpoint_orders_only_real_pr_comments(monkeypatch, author, body, expe
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="owned PR", assignee="a")
+         kb.claim_task(conn, tid)
+-        kb.add_comment(conn, tid, "a", f"Draft {URL}")
++        worker_comment(conn, tid, "a", f"Draft {URL}")
+         assert kc.continue_task(conn, tid, checkpoint="finish owned PR")["ok"]
+         monkeypatch.setattr(time, "time", lambda: now + delay)
+-        kb.add_comment(conn, tid, author, body)
++        worker_comment(conn, tid, author, body)
+         assert kbd.check_respawn_guard(conn, tid) == expected
+ 
+ 
+@@ -85,7 +85,7 @@ def test_invalid_or_legacy_checkpoint_watermark_fails_closed(monkeypatch, waterm
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="legacy checkpoint", assignee="a")
+         kb.claim_task(conn, tid)
+-        kb.add_comment(conn, tid, "a", f"Draft {URL}")
++        worker_comment(conn, tid, "a", f"Draft {URL}")
+         result = kc.continue_task(conn, tid, checkpoint="finish", metadata={"comment_id_at_checkpoint": 999999})
+         assert result["ok"]
+         row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='continued'",
+@@ -105,7 +105,7 @@ def test_non_immediate_or_superseded_continuation_still_guards(monkeypatch, mode
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="external wait", assignee="a")
+         kb.claim_task(conn, tid)
+-        kb.add_comment(conn, tid, "a", f"PR {URL}")
++        worker_comment(conn, tid, "a", f"PR {URL}")
+         result = kc.continue_task(conn, tid, checkpoint="Existing PR",
+                                   resume_after_seconds=60 if mode == "scheduled" else 0)
+         assert result["ok"]
+@@ -116,7 +116,7 @@ def test_non_immediate_or_superseded_continuation_still_guards(monkeypatch, mode
+             kb._end_run(conn, tid, outcome="crashed", status="crashed", summary="worker failed")
+         elif mode == "new_pr_report":
+             monkeypatch.setattr(time, "time", lambda: now + 1)
+-            kb.add_comment(conn, tid, "a", f"External PR remains: {URL}")
++            worker_comment(conn, tid, "a", f"External PR remains: {URL}")
+         else:
+             conn.execute("UPDATE task_runs SET metadata='{}' WHERE id=?", (result["run_id"],))
+         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+@@ -137,5 +137,5 @@ def test_worker_that_opened_pr_then_crashed_is_still_held(monkeypatch):
+         tid = kb.create_task(conn, title="impl", assignee="a")
+         kb.claim_task(conn, tid)
+         monkeypatch.setattr(time, "time", lambda: now + 5)
+-        kb.add_comment(conn, tid, "a", f"Opened {URL}")
++        worker_comment(conn, tid, "a", f"Opened {URL}")
+         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+-- 
+2.55.0
+

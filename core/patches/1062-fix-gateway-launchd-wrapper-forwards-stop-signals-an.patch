@@ -1,0 +1,412 @@
+From 2bc71d8f0a923f5666393a3b306af97a4d4221e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:09:06 +0000
+Subject: [PATCH] fix(gateway): launchd wrapper forwards stop signals and
+ outlives the draining gateway [daveey]
+
+The signed-bundle launchd wrapper (the job's main pid) had the default SIGTERM
+disposition: it died at launchd's first SIGTERM while the gateway was still
+draining, launchd counted the job as ended and started new gateways into a host
+the old one still owned (start_refused owner_alive=true; MacBook 2026-10-29,
+self-heal gateway-cc28b19bca). It now catches SIGTERM/SIGHUP/SIGUSR1/SIGUSR2,
+forwards them to its child, keeps waiting and exits with the child's status
+(128+N kept); a signal before the spawn is queued.
+
+The gateway counts repeat stop signals during one shutdown as one (the group
+signal plus each forwarder used to start a second snapshot/deadline/stop pass),
+logs each repeat with its number, and the exit-signal record carries
+stop_signals. A start refused under --external-supervisor carries
+external_supervisor=true so the self-heal collector can route it to this fix.
+The SIGUSR1 handler factory moves with the new helper to gateway/run_signal_handlers.py.
+---
+ gateway/run.py                                |  18 +--
+ gateway/run_signal_handlers.py                |  40 ++++++
+ hermes_cli/gateway_exit_diag.py               |   4 +
+ hermes_cli/gateway_launchd.py                 |  22 ++-
+ tests/gateway/test_repeat_stop_signals.py     |  90 ++++++++++++
+ .../test_gateway_launchd_wrapper_signals.py   | 128 ++++++++++++++++++
+ 6 files changed, 281 insertions(+), 21 deletions(-)
+ create mode 100644 gateway/run_signal_handlers.py
+ create mode 100644 tests/gateway/test_repeat_stop_signals.py
+ create mode 100644 tests/hermes_cli/test_gateway_launchd_wrapper_signals.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index d02456ff364..bf853196967 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -47,6 +47,7 @@ from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+ from hermes_cli.fallback_config import pre_agent_fallback_notice
+ from gateway.turn_executor import _UnboundedThreadExecutor
+ from gateway.run_exit_reason import note_start_refused
++from gateway.run_signal_handlers import _start_gateway_make_restart_signal_handler, repeat_stop_signal
+ from gateway import exit_deadline
+ 
+ # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
+@@ -5119,22 +5120,9 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
+             root.setLevel(_stderr_level)
+ 
+ 
+-def _start_gateway_make_restart_signal_handler(runner):
+-    """Build the SIGUSR1 handler: log what the signal means, then the drain-aware service restart."""
+-    def restart_signal_handler():
+-        # systemd's `reload` verb (ExecReload=kill -USR1) lands here too; say so, because operators
+-        # expect `reload` to mean an in-process config reload, not a drain-and-relaunch (#117267).
+-        logger.info(
+-            "SIGUSR1 received (systemctl reload / hermes gateway restart): performing a graceful "
+-            "gateway restart — drain active turns, exit, supervisor relaunches. Not an in-process "
+-            "config reload.")
+-        runner.request_restart(detached=False, via_service=True)
+-    return restart_signal_handler
+-
+-
+ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
+     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
+-    planned_stop_seen = [False]
++    planned_stop_seen, stop_signals = [False], [0]  # [daveey] stop_signals: see repeat_stop_signal
+ 
+     def shutdown_signal_handler(received_signal=None):
+         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
+@@ -5161,6 +5149,8 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
+             planned_stop_seen[0] = True
+         elif planned_stop_seen[0] and not planned_takeover:
+             planned_stop = True
++        if repeat_stop_signal(runner, stop_signals, received_signal):
++            return
+         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
+         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
+ 
+diff --git a/gateway/run_signal_handlers.py b/gateway/run_signal_handlers.py
+new file mode 100644
+index 00000000000..43a132e4ae9
+--- /dev/null
++++ b/gateway/run_signal_handlers.py
+@@ -0,0 +1,40 @@
++"""Gateway lifecycle-signal helpers split out of ``gateway.run`` (SIGUSR1 restart, repeat stop signals)."""
++
++from __future__ import annotations
++
++import logging
++
++# Same logger as gateway.run: these lines belong to the gateway's lifecycle log.
++logger = logging.getLogger("gateway.run")
++
++
++def _start_gateway_make_restart_signal_handler(runner):
++    """Build the SIGUSR1 handler: log what the signal means, then the drain-aware service restart."""
++    def restart_signal_handler():
++        # systemd's `reload` verb (ExecReload=kill -USR1) lands here too; say so, because operators
++        # expect `reload` to mean an in-process config reload, not a drain-and-relaunch (#117267).
++        logger.info(
++            "SIGUSR1 received (systemctl reload / hermes gateway restart): performing a graceful "
++            "gateway restart — drain active turns, exit, supervisor relaunches. Not an in-process "
++            "config reload.")
++        runner.request_restart(detached=False, via_service=True)
++    return restart_signal_handler
++
++
++def repeat_stop_signal(runner, counter: list, received_signal) -> bool:
++    """[daveey] Count one stop signal; True when a shutdown already started (the caller then does nothing).
++
++    One launchd stop can reach the gateway several times within a few ms (the job's group signal plus each
++    forwarder: signed wrapper, core-update launcher, stderr_timestamp). Each used to start its own shutdown
++    pass (forensics snapshot + detached diagnostic, deadline arm, ``runner.stop()``); repeats are now only
++    logged with their number, and the count rides on the exit-signal record (``stop_signals``).
++    """
++    counter[0] += 1
++    runner._stop_signal_count = counter[0]
++    if counter[0] == 1:
++        return False
++    if isinstance(unplanned := getattr(runner, "_unplanned_signal", None), dict):
++        unplanned["stop_signals"] = counter[0]
++    logger.info("Received %s again during shutdown (stop signal #%d) — already stopping, ignored",
++                getattr(received_signal, "name", None) or "planned-stop marker", counter[0])
++    return True
+diff --git a/hermes_cli/gateway_exit_diag.py b/hermes_cli/gateway_exit_diag.py
+index 31c962c80bc..48468ac8a77 100644
+--- a/hermes_cli/gateway_exit_diag.py
++++ b/hermes_cli/gateway_exit_diag.py
+@@ -39,6 +39,10 @@ def nonzero_exit_record() -> tuple[str, dict]:
+     if (sig := last_signal_exit()) is not None:
+         return "gateway.exit_signal", sig
+     if (refusal := last_start_refusal()) is not None:
++        # [daveey] A refusal by a LIVE owner under a service manager means the supervisor restarted into a gateway
++        # still draining (gateway-cc28b19bca); the coach self-heal collector keys on this flag.
++        if "--external-supervisor" in sys.argv[1:]:
++            refusal = {**refusal, "external_supervisor": True}
+         return "gateway.start_refused", refusal
+     return "gateway.exit_nonzero", {}
+ 
+diff --git a/hermes_cli/gateway_launchd.py b/hermes_cli/gateway_launchd.py
+index 71e09cd3c1a..e71a355e9ad 100644
+--- a/hermes_cli/gateway_launchd.py
++++ b/hermes_cli/gateway_launchd.py
+@@ -216,13 +216,20 @@ def _gateway_run_command() -> list[str]:
+                            python=_gw().get_python_path())
+ 
+ 
+-# [daveey] Inline source of the signed-bundle launchd wrapper (see ``launchd_program_arguments``). Default
+-# SIGTERM disposition on purpose: launchd signals the job's process group, so the gateway gets exactly one
+-# SIGTERM, the same as under the osascript wrapper. Signal deaths map to 128+N like the JXA wrapper.
+-# gateway.status matches SIGNED_LAUNCHD_WRAPPER_MARKER so the wrapper's ps line is never taken for the gateway.
++# [daveey] Inline source of the signed-bundle launchd wrapper (see ``launchd_program_arguments``). The wrapper is
++# the launchd job's main pid, so it must not end before the gateway: it catches SIGTERM/SIGHUP/SIGUSR1/SIGUSR2,
++# forwards each to its child (the ``sh -c exec`` launcher chain) and keeps waiting, then exits with the child's
++# status. With the default disposition it died at launchd's first SIGTERM while the gateway was still draining,
++# launchd counted the job as ended and started new gateways into a host the old one still owned
++# (start_refused owner_alive=true, defect gateway-cc28b19bca). A signal that lands before the child exists is
++# queued and delivered right after the spawn. Signal deaths map to 128+N like the JXA wrapper. One line on
++# purpose: gateway.status matches SIGNED_LAUNCHD_WRAPPER_MARKER on the wrapper's ps line.
+ _SIGNED_WRAPPER_SOURCE = (
+-    "import signal, subprocess, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); "
+-    "rc = subprocess.Popen(['/bin/sh', '-c', sys.argv[1]]).wait(); "
++    "import signal, subprocess, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); kid = []; pend = []; "
++    "fwd = lambda n, _f: kid[0].send_signal(n) if kid else pend.append(n); "
++    "[signal.signal(s, fwd) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2)]; "  # windows-footgun: ok — inline source run only by the macOS launchd job
++    "kid.append(subprocess.Popen(['/bin/sh', '-c', sys.argv[1]])); "
++    "[kid[0].send_signal(n) for n in pend]; rc = kid[0].wait(); "
+     "sys.exit(128 - rc if rc < 0 else rc)"
+ )
+ 
+@@ -289,7 +296,8 @@ def launchd_program_arguments(
+     for "osascript", a grant that also covers every unrelated script on the Mac. A signed bundle with
+     ``NSLocalNetworkUsageDescription`` keeps LAN access (verified live on macOS 26.6), and its grants survive
+     rebuilds because TCC keys them by bundle id + team. It waits for ``/bin/sh -c exec …`` like JXA's
+-    ``system()`` and dies on launchd's SIGTERM like osascript, so lifecycle semantics are unchanged.
++    ``system()``, but unlike osascript it forwards launchd's stop signals to the gateway and lives until the
++    gateway exits, so launchd never counts the job as ended while the gateway still drains.
+     """
+     shell = f"exec {shlex.join(command)} >> {shlex.quote(str(stdout_log))} 2>> {shlex.quote(str(stderr_log))}"
+     if responsible is not None:
+diff --git a/tests/gateway/test_repeat_stop_signals.py b/tests/gateway/test_repeat_stop_signals.py
+new file mode 100644
+index 00000000000..4f838ddf01a
+--- /dev/null
++++ b/tests/gateway/test_repeat_stop_signals.py
+@@ -0,0 +1,90 @@
++"""[daveey] Repeat stop signals during one shutdown count as one (defect gateway-cc28b19bca).
++
++Under launchd the gateway can get the same SIGTERM from several forwarders in one stop (launchd's group
++signal, the signed wrapper, the core-update launcher, stderr_timestamp). Each used to start its own
++shutdown pass: another forensics snapshot + detached diagnostic, another deadline arm and another
++``runner.stop()`` task.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import signal
++from types import SimpleNamespace
++
++import gateway.run as run_mod
++
++
++def test_three_sigterms_start_one_shutdown(monkeypatch, caplog):
++    arms, diags = [], []
++    monkeypatch.setattr(run_mod.exit_deadline, "arm_for_signal", lambda runner: arms.append(1))
++    import gateway.shutdown_forensics as forensics
++    monkeypatch.setattr(forensics, "spawn_async_diagnostic", lambda *a, **k: diags.append(1))
++
++    stops = []
++
++    async def stop():
++        stops.append(1)
++
++    runner = SimpleNamespace(_signal_initiated_shutdown=False, stop=stop)
++    flag = [False]
++    handler = run_mod._start_gateway_make_shutdown_signal_handler(runner, flag)
++
++    async def main():
++        for _ in range(3):
++            handler(signal.SIGTERM)
++        for _ in range(3):
++            await asyncio.sleep(0)  # let the stop() task(s) run
++
++    with caplog.at_level(logging.INFO, logger=run_mod.logger.name):
++        asyncio.run(main())
++
++    assert stops == [1]
++    assert arms == [1]
++    assert diags == [1]
++    assert flag[0] is True
++    assert runner._stop_signal_count == 3
++    repeats = [r.getMessage() for r in caplog.records if "again during shutdown" in r.getMessage()]
++    assert len(repeats) == 2 and "#3" in repeats[-1]
++
++
++def test_signal_exit_record_carries_the_repeat_count(monkeypatch):
++    """The unplanned-signal record (what gateway.exit_signal logs) says how many copies one stop absorbed."""
++    monkeypatch.setattr(run_mod.exit_deadline, "arm_for_signal", lambda runner: None)
++    import gateway.shutdown_forensics as forensics
++    monkeypatch.setattr(forensics, "spawn_async_diagnostic", lambda *a, **k: None)
++
++    async def stop():
++        return None
++
++    runner = SimpleNamespace(_signal_initiated_shutdown=False, stop=stop)
++    handler = run_mod._start_gateway_make_shutdown_signal_handler(runner, [False])
++
++    async def main():
++        handler(signal.SIGTERM)
++        assert "stop_signals" not in runner._unplanned_signal
++        handler(signal.SIGTERM)
++        handler(signal.SIGTERM)
++        await asyncio.sleep(0)
++
++    asyncio.run(main())
++    assert runner._unplanned_signal["signal"] == "SIGTERM"
++    assert runner._unplanned_signal["stop_signals"] == 3
++
++
++def test_start_refused_record_flags_an_external_supervisor(monkeypatch):
++    """The coach collector keys on this flag: a live owner refusing a supervised start is this defect."""
++    import sys
++
++    from gateway import run_exit_reason
++    from hermes_cli.gateway_exit_diag import nonzero_exit_record
++    import gateway.run_shutdown as rs
++    monkeypatch.setattr(rs, "_last_signal_exit", None)
++    monkeypatch.setattr(run_exit_reason, "_last_start_refusal",
++                        {"reason": "host_refused", "owner_pid": 97265, "owner_alive": True})
++    monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run", "--replace", "--external-supervisor"])
++    tag, rec = nonzero_exit_record()
++    assert tag == "gateway.start_refused" and rec["external_supervisor"] is True and rec["owner_alive"] is True
++    monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
++    assert "external_supervisor" not in nonzero_exit_record()[1]
+diff --git a/tests/hermes_cli/test_gateway_launchd_wrapper_signals.py b/tests/hermes_cli/test_gateway_launchd_wrapper_signals.py
+new file mode 100644
+index 00000000000..54c18ce184e
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_launchd_wrapper_signals.py
+@@ -0,0 +1,128 @@
++"""[daveey] The signed-bundle launchd wrapper must outlive a draining gateway on a stop signal.
++
++launchd treats the job's main process (the wrapper) as the job: if the wrapper dies at the first SIGTERM while
++the gateway still drains, launchd thinks the job ended and starts a new gateway into a host the old one still
++owns (start_refused owner_alive=true, defect gateway-cc28b19bca). These run on any POSIX host: the wrapper is
++plain Python, only its interpreter differs on macOS.
++"""
++
++from __future__ import annotations
++
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from gateway import status
++from hermes_cli.gateway_launchd import _SIGNED_WRAPPER_SOURCE, launchd_program_arguments
++
++pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX signals")
++
++# A gateway stand-in: records each signal it gets, drains for DRAIN_S after the first SIGTERM, exits 7.
++_DRAINING_CHILD = r"""
++import os, signal, sys, time
++log = sys.argv[1]
++def note(n, _f):
++    with open(log, "a") as fh:
++        fh.write(signal.Signals(n).name + "\n")
++    if n == signal.SIGTERM and not getattr(note, "draining", False):
++        note.draining = True
++for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2):
++    signal.signal(s, note)
++with open(log, "a") as fh:
++    fh.write("READY %d\n" % os.getpid())
++while not getattr(note, "draining", False):
++    time.sleep(0.02)
++time.sleep(float(os.environ.get("DRAIN_S", "1.5")))
++sys.exit(7)
++"""
++
++
++def _start(tmp_path: Path):
++    child_py = tmp_path / "child.py"
++    child_py.write_text(_DRAINING_CHILD)
++    sig_log = tmp_path / "signals.log"
++    command = [sys.executable, str(child_py), str(sig_log)]
++    wrapper = subprocess.Popen(
++        launchd_program_arguments(command, tmp_path / "out.log", tmp_path / "err.log",
++                                  responsible=Path(sys.executable)),
++        start_new_session=True,  # its own group leader, as launchd makes it
++    )
++    deadline = time.monotonic() + 10
++    while time.monotonic() < deadline:
++        if sig_log.exists() and "READY" in sig_log.read_text():
++            break
++        time.sleep(0.02)
++    else:
++        os.killpg(wrapper.pid, signal.SIGKILL)
++        raise AssertionError("child never became ready: " + (tmp_path / "err.log").read_text())
++    return wrapper, sig_log
++
++
++def _signals(sig_log: Path) -> list[str]:
++    return [ln for ln in sig_log.read_text().splitlines() if not ln.startswith("READY")]
++
++
++def _finish(wrapper) -> int:
++    try:
++        return wrapper.wait(timeout=10)
++    finally:
++        if wrapper.poll() is None:
++            os.killpg(wrapper.pid, signal.SIGKILL)
++            wrapper.wait()
++
++
++def test_wrapper_outlives_draining_child_on_sigterm_and_returns_its_status(tmp_path):
++    """SIGTERM to the wrapper alone (launchd's main pid): the wrapper forwards it, stays alive for the whole
++    drain, and exits with the child's status, so launchd sees the job end only when the gateway has."""
++    wrapper, sig_log = _start(tmp_path)
++    t0 = time.monotonic()
++    os.kill(wrapper.pid, signal.SIGTERM)
++    time.sleep(0.7)  # health: allow HX013 -- the wrapper must still be alive mid-drain: the delay is the behaviour
++    assert wrapper.poll() is None, "wrapper died before its draining child (launchd would restart into it)"
++    rc = _finish(wrapper)
++    assert rc == 7
++    assert time.monotonic() - t0 >= 1.4
++    assert _signals(sig_log) == ["SIGTERM"]
++
++
++@pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2])
++def test_wrapper_forwards_other_lifecycle_signals_and_keeps_waiting(tmp_path, sig):
++    wrapper, sig_log = _start(tmp_path)
++    os.kill(wrapper.pid, sig)
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline and not _signals(sig_log):
++        time.sleep(0.02)
++    assert _signals(sig_log) == [sig.name]
++    assert wrapper.poll() is None
++    os.kill(wrapper.pid, signal.SIGTERM)
++    assert _finish(wrapper) == 7
++
++
++def test_wrapper_group_stop_still_waits_for_child(tmp_path):
++    """A process-group SIGTERM (bootout of the whole job) reaches the child directly and via the wrapper;
++    the wrapper still waits and returns the child's status."""
++    wrapper, sig_log = _start(tmp_path)
++    os.killpg(wrapper.pid, signal.SIGTERM)
++    time.sleep(0.7)  # health: allow HX013 -- the wrapper must still be alive mid-drain: the delay is the behaviour
++    assert wrapper.poll() is None
++    assert _finish(wrapper) == 7
++    assert set(_signals(sig_log)) == {"SIGTERM"}
++
++
++def test_wrapper_maps_child_signal_death_to_128_plus_n(tmp_path):
++    command = [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"]
++    wrapper = subprocess.Popen(
++        launchd_program_arguments(command, tmp_path / "o", tmp_path / "e", responsible=Path(sys.executable)),
++        start_new_session=True)
++    assert _finish(wrapper) == 128 + 9
++
++
++def test_wrapper_source_stays_one_ps_line_and_keeps_status_marker():
++    """gateway.status recognizes the wrapper by this marker on one ps line; a newline would split it."""
++    assert "\n" not in _SIGNED_WRAPPER_SOURCE
++    assert status.SIGNED_LAUNCHD_WRAPPER_MARKER in _SIGNED_WRAPPER_SOURCE
+-- 
+2.55.0
+

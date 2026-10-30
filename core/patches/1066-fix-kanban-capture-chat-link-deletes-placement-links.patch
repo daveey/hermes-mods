@@ -1,0 +1,321 @@
+From aba16a22103b05f93a7ad49c7f9ab9a0ff4f955d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:56:42 -0700
+Subject: [PATCH] fix(kanban): capture chat-link deletes; placement links leave
+ live and the Board [daveey] (#243)
+
+A local DELETE on task_chat_links had no capture trigger, so the Board kept
+the row forever: 231 released kanban-placement-* links on the hub became a
+shadow-only child_mismatch at pending=0 (2026-10-30, t_01a18a6ec4732371).
+
+- task_chat_links joins _DELETE_CAPTURED (delete op + tombstone; evict and
+  pulls delete under applying, so nothing echoes).
+- reconcile deletes placement-attribution links (is_placeholder_session)
+  instead of releasing them.
+- sync_board queues a Board delete for this gateway's placement links the
+  live file already lost (retire_lost_placeholder_links). Real chat links
+  missing from live are untouched and stay a reported mismatch.
+---
+ hermes_cli/kanban_chat_links.py               |  17 +-
+ hermes_cli/kanban_db_sync.py                  |   5 +-
+ hermes_cli/kanban_sync_client.py              |  38 +++++
+ tests/hermes_cli/test_kanban_chat_links.py    |   4 +-
+ .../test_kanban_sync_placeholder_links.py     | 160 ++++++++++++++++++
+ 5 files changed, 217 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_placeholder_links.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index ac74bf27811..be486eece7e 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -95,10 +95,19 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     want = _local_links(conn, gateway)
+     if ledger:
+         want.update(_ledger_links(board, gateway))
+-    have = {r[0]: r[1] for r in conn.execute(
+-        "SELECT uid, released FROM task_chat_links WHERE chat_gateway = ?", (gateway,))}
+-    added = changed = released = 0
++    from hermes_cli.kanban_placement import is_placeholder_session
++    rows = conn.execute("SELECT uid, released, chat_session FROM task_chat_links WHERE chat_gateway = ?",
++                        (gateway,)).fetchall()
++    have = {r[0]: r[1] for r in rows}
++    # A placement attribution id is not a chat: its link is deleted (captured, so the Board drops it too), never
++    # merely released; a released one still counted in every diff and replica read.
++    placeholders = {r[0] for r in rows if is_placeholder_session(r[2])}
++    added = changed = released = retired = 0
+     with write_txn(conn):
++        for uid in placeholders - set(want):
++            conn.execute("DELETE FROM task_chat_links WHERE uid = ?", (uid,))
++            have.pop(uid)
++            retired += 1
+         for uid, link in want.items():
+             if uid not in have:
+                 conn.execute(
+@@ -113,7 +122,7 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+             if uid not in want and not was_released:
+                 conn.execute("UPDATE task_chat_links SET released = 1 WHERE uid = ?", (uid,))
+                 released += 1
+-    return {"added": added, "changed": changed, "released": released}
++    return {"added": added, "changed": changed, "released": released, "retired": retired}
+ 
+ 
+ TERMINAL_STATUSES = ("done", "archived")
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 06a18f5363c..c76e89cf85d 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -153,7 +153,10 @@ def repair_ms_timestamps(conn: sqlite3.Connection) -> int:
+ _UID_TABLES = ("task_comments", "task_events", "task_runs", "task_attachments", "task_chat_links")
+ # Append-only rows leave only with their task; a delete trigger there would echo
+ # every cascade row of a task delete the service already cascades itself.
+-_DELETE_CAPTURED = ("tasks", "task_links", "task_attachments")
++# Chat links are not append-only: a local delete with no trigger left the Board's row behind forever, a shadow-only
++# ``task_chat_links`` mismatch nothing could heal (238 retired placement links on the hub, 2026-10-30). No local
++# path cascades them with a task delete, and evict deletes under ``applying``, so the trigger echoes nothing.
++_DELETE_CAPTURED = ("tasks", "task_links", "task_attachments", "task_chat_links")
+ 
+ _NOW_MS_SQL = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+ # UUIDv7 inline (no subquery: SQLite may evaluate an uncorrelated subquery once per statement).
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 30b6a7dcca8..b284864eb17 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -623,6 +623,7 @@ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+                 sync.wake_dispatcher()  # a foreign parent moved: re-gate its children now
+             result.repaired = repair_divergence(live, replica, gateway)
+             repair_missing_children(live, replica, gateway)
++            retire_lost_placeholder_links(live, replica, gateway)
+             if mode == "primary":
+                 heal_clobbered_completions(live)
+         finally:
+@@ -1108,6 +1109,43 @@ def repair_missing_children(live: sqlite3.Connection, shadow: sqlite3.Connection
+                              "(an uncaptured write); re-queued", table, uid)
+ 
+ 
++def retire_lost_placeholder_links(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> int:
++    """Delete from the Board this gateway's placement-attribution chat links (``kanban-placement*`` sessions) that the
++    live file no longer holds. Such a link is never a chat (``is_placeholder_session``), so its absence from live is
++    the intended state, and before chat-link deletes were captured a local delete left the Board's row behind for
++    good: a shadow-only ``task_chat_links`` mismatch at pending=0 (238 rows on the hub, 2026-10-30). Real chat links
++    missing from live are left alone, so the diff keeps reporting them. Returns the number of deletes queued."""
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_placement import is_placeholder_session
++    lost = [(u, s) for u, s in shadow.execute(
++        "SELECT uid, chat_session FROM task_chat_links WHERE chat_gateway = ? AND uid IS NOT NULL", (gateway,))
++        if is_placeholder_session(s)]
++    if not lost:
++        return 0
++    queued = 0
++    with write_txn(live):
++        have = _live_uids(live, "task_chat_links")
++        held = {u for t, u in live.execute(
++            "SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state IN ('pending', 'rejected')")
++            if t == "task_chat_links"}
++        held |= {u for t, u in live.execute("SELECT table_name, row_uid FROM kanban_sync_tombstones")
++                 if t == "task_chat_links"}
++        now_ms = time.time_ns() // 1_000_000
++        for uid, _session in lost:
++            if uid in have or uid in held:
++                continue
++            live.execute(
++                "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++                "VALUES (?, 'task_chat_links', ?, 'delete', '{}', NULL, '', ?)", (sync.uuid7(), uid, now_ms))
++            live.execute("INSERT OR REPLACE INTO kanban_sync_tombstones (table_name, row_uid, deleted_at) "
++                         "VALUES ('task_chat_links', ?, ?)", (uid, now_ms))
++            queued += 1
++    if queued:
++        _log.warning("kanban sync: %d placement chat links absent from live but still on the service; "
++                     "delete queued", queued)
++    return queued
++
++
+ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, list[str]]:
+     """Queue the local values of this gateway's cards that the service never received.
+ 
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 16333d1007e..9f8278d9f4a 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -54,11 +54,11 @@ def test_reconcile_writes_created_and_shepherd_links_once_and_through_capture(li
+     with kbc.write_txn(live):
+         live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (?, 'tui', 's_watcher', 1)", (mine,))
+         live.execute("DELETE FROM kanban_sync_outbox")
+-    assert links.reconcile(live, "default", ME) == {"added": 2, "changed": 0, "released": 0}
++    assert links.reconcile(live, "default", ME) == {"added": 2, "changed": 0, "released": 0, "retired": 0}
+     assert _links(live) == {(mine, "s_creator", "created", 0), (mine, "s_watcher", "shepherd", 0)}
+     queued = [r[0] for r in live.execute("SELECT table_name FROM kanban_sync_outbox")]
+     assert queued.count("task_chat_links") == 2  # pushed like any synced row
+-    assert links.reconcile(live, "default", ME) == {"added": 0, "changed": 0, "released": 0}  # idempotent
++    assert links.reconcile(live, "default", ME) == {"added": 0, "changed": 0, "released": 0, "retired": 0}  # idempotent
+     with kbc.write_txn(live):
+         live.execute("DELETE FROM kanban_notify_subs")
+     assert links.reconcile(live, "default", ME)["released"] == 1  # an unsubscribe releases, never deletes
+diff --git a/tests/hermes_cli/test_kanban_sync_placeholder_links.py b/tests/hermes_cli/test_kanban_sync_placeholder_links.py
+new file mode 100644
+index 00000000000..7ff7c17716f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_placeholder_links.py
+@@ -0,0 +1,160 @@
++"""Placement-attribution chat links (``kanban-placement*`` sessions) leave the Board with the live file.
++
++Production (hub, 2026-10-30): 238 released placement links stayed on the Board after the live rows were deleted
++locally with no capture trigger, a shadow-only ``task_chat_links`` mismatch at pending=0 that blocked a clean diff.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = "macbook", "default"
++PLACEMENT = "kanban-placement-macbook"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _round(kanban_home, svc):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++def _diff(live):
++    shadow = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        return ksc.diff(live, shadow, ME)
++    finally:
++        shadow.close()
++
++
++def _board_live(svc, uid):
++    row = svc.board(BOARD)["rows"].get("task_chat_links", {}).get(uid)
++    return row is not None and not row.get("deleted_at")
++
++
++def _insert_link(live, tid, session, *, applying=False):
++    """A chat link written the way the pre-filter reconcile wrote placement links (captured unless ``applying``)."""
++    uid = links.link_uid(tid, ME, None, session, "created")
++    with kbc.write_txn(live):
++        if applying:
++            live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                     "released, created_at) VALUES (?, ?, ?, NULL, ?, 'created', 0, 1)", (uid, tid, ME, session))
++        if applying:
++            live.execute("UPDATE kanban_sync_state SET applying = 0")
++    return uid
++
++
++def _uncaptured_delete(live, uid):
++    """The production state: the live row vanished with no capture, so the Board kept it."""
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("DELETE FROM task_chat_links WHERE uid = ?", (uid,))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++def _settle(kanban_home, svc, n=3):
++    for _ in range(n):
++        _round(kanban_home, svc)
++
++
++def test_a_local_chat_link_delete_is_captured_and_reaches_the_board(live, svc, kanban_home):
++    tid = kb.create_task(live, title="watched", assignee="worker", session_id="s_creator")
++    uid = _insert_link(live, tid, "s_watcher")
++    _settle(kanban_home, svc)
++    assert _board_live(svc, uid)
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM task_chat_links WHERE uid = ?", (uid,))
++    ops = [(r[0], r[1]) for r in live.execute(
++        "SELECT op, row_uid FROM kanban_sync_outbox WHERE table_name = 'task_chat_links' AND state = 'pending'")]
++    assert ("delete", uid) in ops
++    assert live.execute("SELECT 1 FROM kanban_sync_tombstones WHERE table_name = 'task_chat_links' AND row_uid = ?",
++                        (uid,)).fetchone()
++    _settle(kanban_home, svc)
++    assert not _board_live(svc, uid)
++    assert _diff(live)["child_mismatch"] == {}
++
++
++def test_reconcile_deletes_a_placement_link_and_the_board_drops_it(live, svc, kanban_home):
++    tid = kb.create_task(live, title="placed", assignee="worker", session_id=PLACEMENT)
++    uid = _insert_link(live, tid, PLACEMENT)  # what reconcile wrote before placeholder sessions were filtered
++    _settle(kanban_home, svc)
++    assert _board_live(svc, uid)
++    counts = links.reconcile(live, BOARD, ME, ledger=False)
++    assert counts["retired"] == 1 and counts["released"] == 0
++    assert not live.execute("SELECT 1 FROM task_chat_links WHERE uid = ?", (uid,)).fetchone()
++    _settle(kanban_home, svc)
++    assert not _board_live(svc, uid)
++    d = _diff(live)
++    assert d["child_mismatch"] == {} and d["pending"] == 0
++    assert links.reconcile(live, BOARD, ME, ledger=False) == {"added": 0, "changed": 0, "released": 0, "retired": 0}
++
++
++def test_a_placement_link_lost_from_live_without_capture_is_deleted_from_the_board(live, svc, kanban_home, caplog):
++    tid = kb.create_task(live, title="placed", assignee="worker", session_id=PLACEMENT)
++    uid = _insert_link(live, tid, PLACEMENT)
++    _settle(kanban_home, svc)
++    _uncaptured_delete(live, uid)
++    shadow = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        assert ksc.diff(live, shadow, ME)["child_mismatch"] == {"task_chat_links": 1}  # the production symptom
++    finally:
++        shadow.close()
++    _settle(kanban_home, svc)
++    assert not _board_live(svc, uid)
++    assert "placement chat links absent from live" in caplog.text
++    d = _diff(live)
++    assert d["child_mismatch"] == {} and d["pending"] == 0 and d["clean"]
++    queued = sum("placement chat links absent from live" in r.message for r in caplog.records)
++    _settle(kanban_home, svc)
++    assert sum("placement chat links absent from live" in r.message for r in caplog.records) == queued  # once
++
++
++def test_a_real_chat_link_lost_from_live_stays_a_reported_mismatch(live, svc, kanban_home):
++    tid = kb.create_task(live, title="watched", assignee="worker", session_id="s_creator")
++    uid = _insert_link(live, tid, "s_real_chat")
++    _settle(kanban_home, svc)
++    _uncaptured_delete(live, uid)
++    _settle(kanban_home, svc)
++    assert _board_live(svc, uid)  # never deleted on the replica's say-so
++    assert not [r for r in live.execute("SELECT op FROM kanban_sync_outbox WHERE table_name = 'task_chat_links' "
++                                        "AND op = 'delete'")]
++    assert _diff(live)["child_mismatch"] == {"task_chat_links": 1}
++
++
++def test_a_delete_under_applying_is_not_captured(live):
++    assert "kanban_sync_task_chat_links_del" in sync.wanted_triggers(live)
++    tid = kb.create_task(live, title="copy", assignee="worker")
++    uid = _insert_link(live, tid, "s_chat", applying=True)
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("DELETE FROM task_chat_links WHERE uid = ?", (uid,))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name = 'task_chat_links'").fetchone()
+-- 
+2.55.0
+

@@ -1,0 +1,285 @@
+From cb1aa70f614b02b06193ec91b831298c9355bc9e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:02:46 +0000
+Subject: [PATCH] fix(routing): rotate auxiliary OAuth accounts before
+ excluding a class route [daveey]
+
+---
+ agent/auxiliary_class_routing.py              | 43 +++++++-
+ .../test_auxiliary_class_pool_recovery.py     | 98 +++++++++++++++++++
+ tests/agent/test_auxiliary_class_routing.py   | 58 +++++++++++
+ 3 files changed, 196 insertions(+), 3 deletions(-)
+ create mode 100644 tests/agent/test_auxiliary_class_pool_recovery.py
+
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index 48d5d01fc0d..2742cc38725 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -159,6 +159,37 @@ def _retryable(exc):
+     return any(predicate(exc) for predicate, _ in aux._FALLBACK_REASONS)
+ 
+ 
++def _recover_class_pool(runtime, exc, attempted):
++    """An account quota is not a failed route. Rotate only the fenced pool. [daveey]
++
++    Re-resolution still enforces the original class/pin and OAuth-only boundary.
++    A (provider, model, account) is recovered at most once per logical call,
++    including when concurrent writers or a broken pool reselect that account.
++    """
++    from agent import auxiliary_client as aux
++    if aux._is_overloaded_error(exc):
++        return False
++    if aux._is_payment_error(exc):
++        status, reason = 402, "billing"
++    elif aux._is_rate_limit_error(exc):
++        status, reason = 429, "rate_limit"
++    else:
++        return False
++    pool = runtime.get("credential_pool")
++    entry = pool.current() if pool else None
++    if entry is None:
++        return False
++    identity = runtime["provider"], runtime["model"], entry.id
++    if identity in attempted:
++        return False
++    attempted.add(identity)
++    return pool.mark_exhausted_and_rotate(
++        status_code=getattr(exc, "status_code", None) or status,
++        credential_id=entry.id, model=runtime["model"], failure_reason=reason,
++        error_context={"message": str(exc)},
++    ) is not None
++
++
+ def _complete(task, runtime, client, kwargs):
+     from agent import auxiliary_client as aux
+     return aux._validate_llm_response(aux._relay_sync_completion(
+@@ -194,6 +225,7 @@ def _stream_with_recovery(task, options, request):
+     # Lazy allocation: an unconsumed generator must not leak a client or consume
+     # an allocation. Once any chunk escapes, replay would duplicate output.
+     failed = []
++    attempted = set()
+     while True:
+         runtime, client, kwargs = _prepare(task, options, request, failed)
+         delivered = False
+@@ -206,7 +238,8 @@ def _stream_with_recovery(task, options, request):
+         except Exception as exc:
+             if delivered or not _retryable(exc):
+                 raise
+-            failed.append((runtime["provider"], runtime["model"]))
++            if not _recover_class_pool(runtime, exc, attempted):
++                failed.append((runtime["provider"], runtime["model"]))
+         finally:
+             stream.close()
+ 
+@@ -221,6 +254,7 @@ def class_routed_sync(callback):
+         if options.get("stream"):
+             return _stream_with_recovery(task, options, request)
+         failed = []
++        attempted = set()
+         while True:
+             runtime, client, kwargs = _prepare(task, options, request, failed)
+             try:
+@@ -228,7 +262,8 @@ def class_routed_sync(callback):
+             except Exception as exc:
+                 if not _retryable(exc):
+                     raise
+-                failed.append((runtime["provider"], runtime["model"]))
++                if not _recover_class_pool(runtime, exc, attempted):
++                    failed.append((runtime["provider"], runtime["model"]))
+             finally:
+                 aux._close_cached_client(client, close_async=True)
+     return wrapped
+@@ -242,6 +277,7 @@ def class_routed_async(callback):
+         if request is None:
+             return await callback(task, **options)
+         failed = []
++        attempted = set()
+         while True:
+             runtime, sync_client, kwargs = _prepare(task, options, request, failed)
+             client, _ = aux._to_async_client(sync_client, runtime["model"])
+@@ -256,7 +292,8 @@ def class_routed_async(callback):
+             except Exception as exc:
+                 if not _retryable(exc):
+                     raise
+-                failed.append((runtime["provider"], runtime["model"]))
++                if not _recover_class_pool(runtime, exc, attempted):
++                    failed.append((runtime["provider"], runtime["model"]))
+             finally:
+                 aux._close_cached_client(client, close_async=True)
+                 aux._close_cached_client(sync_client, close_async=True)
+diff --git a/tests/agent/test_auxiliary_class_pool_recovery.py b/tests/agent/test_auxiliary_class_pool_recovery.py
+new file mode 100644
+index 00000000000..57114c219b0
+--- /dev/null
++++ b/tests/agent/test_auxiliary_class_pool_recovery.py
+@@ -0,0 +1,98 @@
++"""Account quota is not route exhaustion; all class entry paths rotate before failover."""
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from agent import auxiliary_class_routing as routing
++from agent import auxiliary_client as aux
++
++
++class QuotaError(Exception):
++    status_code = 429
++
++
++@pytest.mark.parametrize("path", ["sync", "async", "stream"])
++@pytest.mark.parametrize("succeed", [True, False])
++def test_class_quota_rotates_native_pool_before_excluding_route(monkeypatch, path, succeed):
++    attempts, exclusions, closed = [], [], []
++    entry = SimpleNamespace(id="account-a")
++    pool = Mock()
++    pool.current.return_value = entry
++    pool.mark_exhausted_and_rotate.return_value = SimpleNamespace(id="account-b")
++    runtime = {"provider": "anthropic", "model": "fast-model", "api_mode": "anthropic_messages",
++               "api_key": "test-only", "credential_pool": pool}
++
++    def prepare(task, options, request, failed):
++        exclusions.append(list(failed))
++        if failed:
++            raise routing.ModelRoutingError("exhausted test route")
++        return runtime, SimpleNamespace(), {}
++
++    def complete(*args, **kwargs):
++        attempts.append(entry.id)
++        if len(attempts) == 1 or not succeed:
++            raise QuotaError("Rate limit exceeded for this account")
++        return "YES"
++
++    monkeypatch.setattr(routing, "_class_request", lambda *args: object())
++    monkeypatch.setattr(routing, "_prepare", prepare)
++    monkeypatch.setattr(routing, "_complete", complete)
++    monkeypatch.setattr(aux, "_close_cached_client", lambda client, **kw: closed.append(client))
++    monkeypatch.setattr(aux, "_to_async_client", lambda client, model: (client, model))
++    monkeypatch.setattr(aux, "_validate_llm_response", lambda response, task: response)
++
++    async def async_complete(*args, **kwargs):
++        return complete()
++
++    def stream(*args, **kwargs):
++        yield complete()
++
++    monkeypatch.setattr(aux, "_relay_async_completion", async_complete)
++    monkeypatch.setattr(routing, "_stream", stream)
++
++    def run():
++        if path == "async":
++            return asyncio.run(routing.class_routed_async(Mock())())
++        result = routing.class_routed_sync(Mock())(stream=path == "stream")
++        return list(result) if path == "stream" else result
++
++    if succeed:
++        assert run() == (["YES"] if path == "stream" else "YES")
++        assert exclusions == [[], []]
++    else:
++        with pytest.raises(routing.ModelRoutingError, match="exhausted test route"):
++            run()
++        assert exclusions == [[], [], [("anthropic", "fast-model")]]
++    assert len(attempts) == 2  # a pool that keeps returning the same account cannot loop
++    assert pool.mark_exhausted_and_rotate.call_count == 1
++    call = pool.mark_exhausted_and_rotate.call_args.kwargs
++    assert call["credential_id"] == "account-a"
++    assert call["model"] == "fast-model"
++    assert call["failure_reason"] == "rate_limit"
++
++
++def test_delivered_stream_does_not_rotate_or_replay(monkeypatch):
++    pool = Mock()
++    runtime = {"provider": "anthropic", "model": "fast-model", "credential_pool": pool}
++    monkeypatch.setattr(routing, "_class_request", lambda *args: object())
++    monkeypatch.setattr(routing, "_prepare", lambda *args: (runtime, object(), {}))
++
++    def stream(*args):
++        yield "first"
++        raise QuotaError("Rate limit exceeded")
++
++    monkeypatch.setattr(routing, "_stream", stream)
++    result = routing.class_routed_sync(Mock())(stream=True)
++    assert next(result) == "first"
++    with pytest.raises(QuotaError):
++        next(result)
++    pool.mark_exhausted_and_rotate.assert_not_called()
++
++
++@pytest.mark.parametrize("exc", [TimeoutError("network timeout"), QuotaError("model temporarily at capacity upstream")])
++def test_non_account_failures_do_not_bench_pool(exc):
++    pool = Mock()
++    assert not routing._recover_class_pool({"credential_pool": pool}, exc, set())
++    pool.mark_exhausted_and_rotate.assert_not_called()
+diff --git a/tests/agent/test_auxiliary_class_routing.py b/tests/agent/test_auxiliary_class_routing.py
+index 72d5dfe7ec0..8f89696da1b 100644
+--- a/tests/agent/test_auxiliary_class_routing.py
++++ b/tests/agent/test_auxiliary_class_routing.py
+@@ -111,6 +111,64 @@ def test_auxiliary_same_class_recovery_on_wire(mode, failure, routing_home, stre
+     assert all(h["authorization"].startswith("Bearer sk-ant-oat") for _, h, _ in native_transport)
+ 
+ 
++@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
++@pytest.mark.parametrize("failure", [429, 402])
++def test_account_recovery_keeps_exact_route_on_wire(mode, failure, routing_home, streaming_route,
++                                                    native_transport, monkeypatch, tmp_path):
++    import json
++    import httpx
++    from copy import deepcopy
++    from hermes_cli.config import atomic_config_write
++
++    # Paid entry remains first: recovery may only visit the two OAuth accounts.
++    auth_path = tmp_path / "auth.json"
++    auth = json.loads(auth_path.read_text())
++    entries = auth["credential_pool"]["anthropic"]
++    first = next(e for e in entries if e["auth_type"] == "oauth")
++    second = deepcopy(first)
++    second.update(id="second-subscription", label="second-subscription", priority=2,
++                  access_token=first["access_token"] + "-second")
++    entries.append(second)
++    auth_path.write_text(json.dumps(auth))
++    routing_home["model_routing"]["enforce_subscription_only"] = True
++    routing_home["auxiliary"] = {"title": {"model": "anthropic-deep", "provider": "anthropic"}}
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    attempts = []
++    original = httpx.MockTransport.handle_request
++
++    def respond(transport, request):
++        body = json.loads(request.content)
++        token = request.headers["authorization"]
++        attempts.append((body["model"], token))
++        if token == "Bearer " + first["access_token"]:
++            return httpx.Response(failure, json={"type": "error", "error": {
++                "type": "rate_limit_error" if failure == 429 else "billing_error",
++                "message": "Rate limit exceeded" if failure == 429 else "credit balance is too low"}}, request=request)
++        return original(transport, request)
++
++    monkeypatch.setattr(httpx.MockTransport, "handle_request", respond)
++    info = {}
++    kwargs = dict(messages=[{"role": "user", "content": "ok"}],
++                  main_runtime={"session_id": "account-recovery-owner"}, route_info=info)
++    if mode == "stream":
++        result = "".join(c.choices[0].delta.content or "" for c in aux.call_llm("title", stream=True, **kwargs))
++    elif mode == "async":
++        result = asyncio.run(aux.async_call_llm("title", **kwargs)).choices[0].message.content
++    else:
++        result = aux.call_llm("title", **kwargs).choices[0].message.content
++    assert result == "ok"
++    assert {model for model, _ in attempts} == {"anthropic-deep"}
++    assert attempts[0][1] == "Bearer " + first["access_token"]
++    assert attempts[-1][1] == "Bearer " + second["access_token"]
++    assert info["reason"] == "allocation"  # account rotation, not route failover
++    persisted = json.loads(auth_path.read_text())["credential_pool"]["anthropic"]
++    failed_entry = next(e for e in persisted if e["id"] == first["id"])
++    if failure == 402:
++        assert failed_entry["last_status"] == "exhausted"
++    else:
++        assert failed_entry.get("model_cooldowns")
++
++
+ @pytest.mark.parametrize("capability", ["vision", "json", "context_tokens"])
+ def test_auxiliary_capabilities_fail_before_wire(capability, routing_home, streaming_route,
+                                                 native_transport, tmp_path):
+-- 
+2.55.0
+

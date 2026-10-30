@@ -1,0 +1,118 @@
+From fe22329f73ed3efe1ef2976dac51bf8474ed6840 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:20:42 -0700
+Subject: [PATCH] perf(tui): throttle change-watcher session digest to once per
+ 3s on a busy state.db
+
+---
+ tests/tui_gateway/test_change_watcher.py      |  1 +
+ .../test_change_watcher_sessions.py           | 38 +++++++++++++++++++
+ tui_gateway/change_watcher.py                 | 10 +++++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/tests/tui_gateway/test_change_watcher.py b/tests/tui_gateway/test_change_watcher.py
+index 2c484deed6d..4ca212fbaff 100644
+--- a/tests/tui_gateway/test_change_watcher.py
++++ b/tests/tui_gateway/test_change_watcher.py
+@@ -18,6 +18,7 @@ from tui_gateway import server
+ 
+ @pytest.fixture()
+ def watcher_home(tmp_path, monkeypatch):
++    monkeypatch.setattr(server, "SESSION_DIGEST_MIN_S", 0.0)
+     (tmp_path / "config.yaml").write_text("display: {}\n")
+     (tmp_path / "cron").mkdir()
+ 
+diff --git a/tests/tui_gateway/test_change_watcher_sessions.py b/tests/tui_gateway/test_change_watcher_sessions.py
+index 3d697c412d1..36d71f72cb5 100644
+--- a/tests/tui_gateway/test_change_watcher_sessions.py
++++ b/tests/tui_gateway/test_change_watcher_sessions.py
+@@ -2,9 +2,16 @@ from __future__ import annotations
+ 
+ import sqlite3
+ 
++import pytest
++
+ from tui_gateway import server
+ 
+ 
++@pytest.fixture(autouse=True)
++def _no_digest_throttle(monkeypatch):
++    monkeypatch.setattr(server, "SESSION_DIGEST_MIN_S", 0.0)
++
++
+ def _seed_store(path):
+     conn = sqlite3.connect(path)
+     conn.executescript(
+@@ -59,3 +66,34 @@ def test_sessions_signature_changes_for_session_metadata_updates(tmp_path, monke
+     conn.close()
+ 
+     assert server._sessions_sig() != before
++
++
++def test_busy_db_is_not_redigested_more_often_than_min_interval(tmp_path, monkeypatch):
++    db_path = tmp_path / "state.db"
++    _seed_store(db_path)
++    monkeypatch.setattr(server, "_watcher_home", lambda: tmp_path)
++    monkeypatch.setattr(server, "_served_profile_homes", [])
++    monkeypatch.setattr(server, "SESSION_DIGEST_MIN_S", 3.0)
++    server._sessions_db_sig_cache.clear()
++    server._sessions_digest_at.clear()
++    clock = [1000.0]
++    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
++    reads = []
++    import hermes_state
++    orig = hermes_state._connect_tracked_db
++    monkeypatch.setattr(hermes_state, "_connect_tracked_db",
++                        lambda *a, **k: (reads.append(1), orig(*a, **k))[1])
++
++    before = server._sessions_sig()
++    assert len(reads) == 1
++    for i in range(5):  # a busy db: the mtime moves on every pass
++        conn = sqlite3.connect(db_path)
++        conn.execute("UPDATE sessions SET title = ?", (f"T{i}",))
++        conn.commit()
++        conn.close()
++        clock[0] += 0.5
++        assert server._sessions_sig() == before
++    assert len(reads) == 1  # no re-digest inside the window
++    clock[0] += 3.0
++    assert server._sessions_sig() != before  # trailing edge still fires
++    assert len(reads) == 2
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index 5669174eabd..f458b4e5eb0 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -132,6 +132,11 @@ _SESSION_SIGNATURE_FIELDS = (
+ # normal 0.5 s watch pass stat-only; SQLite is read only after another process
+ # actually commits.
+ _sessions_db_sig_cache: dict[str, tuple[int | None, tuple | None]] = {}
++# A busy fleet commits to state.db continuously, so the mtime guard alone re-digests every
++# session row (thousands) on nearly every 0.5 s pass. Re-digest a moved db at most this often;
++# the cached mtime stays stale in between, so the change is still seen on the trailing edge.
++SESSION_DIGEST_MIN_S = 3.0
++_sessions_digest_at: dict[str, float] = {}
+ 
+ 
+ def _session_db_content_sig(db_path: Path):
+@@ -149,6 +154,10 @@ def _session_db_content_sig(db_path: Path):
+ 
+     if cached is not None and cached[0] == mtime:
+         return cached[1]
++    now = time.monotonic()
++    if (cached is not None and cached[1] is not None
++            and now - _sessions_digest_at.get(cache_key, -SESSION_DIGEST_MIN_S) < SESSION_DIGEST_MIN_S):
++        return cached[1]
+     if not db_path.exists():
+         _sessions_db_sig_cache[cache_key] = (mtime, None)
+ 
+@@ -188,6 +197,7 @@ def _session_db_content_sig(db_path: Path):
+             conn.close()
+ 
+     _sessions_db_sig_cache[cache_key] = (mtime, signature)
++    _sessions_digest_at[cache_key] = now
+ 
+     return signature
+ 
+-- 
+2.55.0
+

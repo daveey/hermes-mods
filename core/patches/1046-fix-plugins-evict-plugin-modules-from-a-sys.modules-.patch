@@ -1,0 +1,291 @@
+From 94c8655d2f5938d62ec0159ef69c25de08983740 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 01:41:40 +0000
+Subject: [PATCH] fix(plugins): evict plugin modules from a sys.modules
+ snapshot; a concurrent import no longer drops a random plugin [daveey]
+
+Problem: hermes-hub agent.log logged "Failed to load plugin '<x>': dictionary
+changed size during iteration" every 10-40 min, a different plugin each time
+(session-outcome, krea, deepinfra, openai, nous, telegram-platform,
+browser-browserbase, meta-ai-image-gen; 2026-10-29/30). That process then ran
+without the plugin (for session-outcome: no judge, gate or tool).
+
+Why 1: _load_directory_module raised RuntimeError before exec_module, so
+  _load_plugin's except recorded loaded.error and skipped register() -
+  evidence: every failing plugin is a directory plugin; the new end-to-end
+  test reproduces loaded.error == "dictionary changed size during iteration".
+Why 2: _evict_modules (plugins_loader.py:157) built its list with
+  `for n in sys.modules`, walking the live dict - evidence: a 5 s stress
+  (thread churning sys.modules while calling _evict_modules) raised 24 times.
+Why 3: the gateway imports on other threads at any time (agent turns, cron,
+  kanban, other plugins' deadline-worker threads), and per-module import locks
+  do not serialize sys.modules writes against a Python-level iteration.
+Root (happened): module eviction assumed exclusive access to a process-global
+  dict; the same pattern was copied into plugin_host_child (unload and failed
+  import), _launchers and plugin_dev.
+Root (not caught): the failure was logged as a WARNING with no traceback
+  (exc_info only under HERMES_PLUGINS_DEBUG), so the message never pointed at
+  Hermes code, and no test loaded a plugin while another thread imported.
+Recurrence: first fix for this race.
+
+Countermeasures:
+- symptom/root: every sys.modules scan in the plugin paths iterates
+  sys.modules.copy() (one C call, atomic under the GIL); plugin_host_child gets
+  a shared _evict_modules helper.
+- detection: "Failed to load plugin" warnings now end with
+  "(raised at <file>:<line> in <func>)" for the innermost frame.
+- tests (tests/hermes_cli/test_plugins_loader.py): a trap key makes a second
+  thread insert into sys.modules mid-scan, deterministically.
+  test_evict_modules_tolerates_concurrent_import,
+  test_plugin_host_child_evict_tolerates_concurrent_import and
+  test_directory_plugin_loads_while_another_thread_imports fail on the base
+  commit (RuntimeError / missing helper / loaded.error) and pass here;
+  test_load_failure_warning_names_where_it_raised covers the log suffix.
+
+Kanban: t_01a18a72cafa9d67
+---
+ hermes_cli/_launchers.py                |   2 +-
+ hermes_cli/plugin_dev.py                |   2 +-
+ hermes_cli/plugin_host_child.py         |  14 ++-
+ hermes_cli/plugins_loader.py            |  22 ++++-
+ tests/hermes_cli/test_plugins_loader.py | 108 ++++++++++++++++++++++++
+ 5 files changed, 139 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/_launchers.py b/hermes_cli/_launchers.py
+index 5364493b129..e7b50744e22 100644
+--- a/hermes_cli/_launchers.py
++++ b/hermes_cli/_launchers.py
+@@ -430,7 +430,7 @@ def _hermes_closure_repair():
+             shutil.rmtree(staging, ignore_errors=True)
+         if not verified():
+             return
+-    for name in [n for n in sys.modules if n.split('.')[0] in ('hermes_cli', 'hermes_bootstrap', 'hermes_constants', 'pm')]:
++    for name in [n for n in sys.modules.copy() if n.split('.')[0] in ('hermes_cli', 'hermes_bootstrap', 'hermes_constants', 'pm')]:
+         del sys.modules[name]
+     tree = os.path.normcase(os.path.realpath(root))
+     sys.path[:] = [str(closure)] + [p for p in sys.path if p and os.path.normcase(os.path.realpath(p)) != tree
+diff --git a/hermes_cli/plugin_dev.py b/hermes_cli/plugin_dev.py
+index bee268a5607..9ba1c08a9ca 100644
+--- a/hermes_cli/plugin_dev.py
++++ b/hermes_cli/plugin_dev.py
+@@ -64,7 +64,7 @@ def _doctor_runtime(plugin_path: Path):
+     from tools.registry import registry
+     entries_before = {entry.name: entry for entry in registry._snapshot_entries()}
+     policy_before = dict(registry._plugin_override_policy)
+-    modules_before = {name for name in sys.modules if _is_plugin_module(name)}
++    modules_before = {name for name in sys.modules.copy() if _is_plugin_module(name)}
+     manager = PluginManager()
+     try:
+         manifests = manager._scan_directory(plugins_root, source="user")
+diff --git a/hermes_cli/plugin_host_child.py b/hermes_cli/plugin_host_child.py
+index c9aee6a290a..5bb8a45495e 100644
+--- a/hermes_cli/plugin_host_child.py
++++ b/hermes_cli/plugin_host_child.py
+@@ -38,6 +38,14 @@ logger = logging.getLogger("hermes_cli.plugin_host_child")
+ _ENTRY_POINTS_GROUP = "hermes_agent.plugins"
+ 
+ 
++def _evict_modules(module_name: str) -> None:
++    """Drop ``module_name`` and its submodules from ``sys.modules``, iterating a copy: the host runs plugin
++    code on several threads, and walking the live dict while one of them imports raises RuntimeError."""
++    prefix = module_name + "."
++    for name in [m for m in sys.modules.copy() if m == module_name or m.startswith(prefix)]:
++        sys.modules.pop(name, None)
++
++
+ class RemoteRegistration:
+     """Child-side twin of ``PluginRegistration``: ``dispose()`` releases the Hermes-side entry."""
+ 
+@@ -396,8 +404,7 @@ class HostRuntime:
+                 self.owners.pop(ref, None)
+         module_name = self.modules.pop(plugin_key, "")
+         if module_name:
+-            for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
+-                sys.modules.pop(name, None)
++            _evict_modules(module_name)
+         return {"errors": errors}
+ 
+     def op_shutdown(self, _params: dict[str, Any]) -> None:
+@@ -484,8 +491,7 @@ def _import_plugin(params: dict[str, Any]) -> Any:
+     try:
+         spec.loader.exec_module(module)
+     except BaseException:
+-        for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
+-            sys.modules.pop(name, None)
++        _evict_modules(module_name)
+         raise
+     return module
+ 
+diff --git a/hermes_cli/plugins_loader.py b/hermes_cli/plugins_loader.py
+index 7374c859275..1e27a9f4159 100644
+--- a/hermes_cli/plugins_loader.py
++++ b/hermes_cli/plugins_loader.py
+@@ -16,6 +16,7 @@ import logging
+ import re
+ import sys
+ import threading
++import traceback
+ import types
+ from contextlib import contextmanager
+ from functools import wraps
+@@ -154,8 +155,11 @@ def run_with_load_deadline(plugin_key: str, ctx: PluginContext, fn: Callable[[],
+ def _evict_modules(module_name: str) -> None:
+     """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``."""
+     prefix = f"{module_name}."
+-    for name in [n for n in sys.modules if n == module_name or n.startswith(prefix)]:
+-        del sys.modules[name]
++    # Iterate a copy: other threads (gateway turns, cron, kanban, other deadline workers) import modules at
++    # any moment, and walking the live dict raised "dictionary changed size during iteration", failing a
++    # random plugin's load. ``dict.copy()`` is one C call, so it is atomic under the GIL.
++    for name in [n for n in sys.modules.copy() if n == module_name or n.startswith(prefix)]:
++        sys.modules.pop(name, None)
+ 
+ 
+ def _serialized_replacement(method):
+@@ -185,6 +189,17 @@ def _load_error_text(exc: BaseException) -> str:
+     return str(exc)
+ 
+ 
++def _load_error_origin(exc: BaseException) -> str:
++    """`` (raised at <file>:<line> in <func>)`` for the innermost frame, so a load failure logged without
++    a traceback (the default; HERMES_PLUGINS_DEBUG=1 adds one) still says whether Hermes or the plugin
++    raised it. The sys.modules eviction race was logged for days with only its message to go on."""
++    frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ is not None else []
++    if not frames:
++        return ""
++    last = frames[-1]
++    return f" (raised at {last.filename}:{last.lineno} in {last.name})"
++
++
+ def _dist_installed(req: str) -> Optional[bool]:
+     """Best-effort presence probe on a requirement's distribution name; ``None`` when unprobeable."""
+     dist = re.split(r"[<>=!~\[;\s]", req, maxsplit=1)[0].strip()
+@@ -534,7 +549,8 @@ class PluginLoaderMixin:
+             # register() may have subscribed before raising; a failed plugin must leave no callable reachable
+             # from later event dispatch.
+             self._remove_plugin_subscriptions(plugin_key)
+-            logger.warning("Failed to load plugin '%s': %s", manifest.name, _load_error_text(exc), exc_info=_PLUGINS_DEBUG)
++            logger.warning("Failed to load plugin '%s': %s%s", manifest.name, _load_error_text(exc),
++                           _load_error_origin(exc), exc_info=_PLUGINS_DEBUG)
+         # The failure path swept this plugin's whole ledger (not just the registration_start slice), so
+         # discovery-time pre-registrations are gone too.
+         # There is no live tool left to credit — attribution and the registry agree at zero. Only the
+diff --git a/tests/hermes_cli/test_plugins_loader.py b/tests/hermes_cli/test_plugins_loader.py
+index 82ca101db94..675a0cd8151 100644
+--- a/tests/hermes_cli/test_plugins_loader.py
++++ b/tests/hermes_cli/test_plugins_loader.py
+@@ -34,3 +34,111 @@ def test_nested_plugin_load_runs_inline_on_deadline_worker(monkeypatch):
+     assert observed_threads[0] is observed_threads[1]
+     # The outer timeout abandons only contexts still loading, not a nested load that already finished.
+     assert abandoned == ["outer", "hung"]
++
++
++# ── sys.modules eviction vs. concurrent imports ─────────────────────────────
++# On hermes-hub, "Failed to load plugin '<x>': dictionary changed size during iteration" dropped a random
++# plugin every 10-40 min: _evict_modules walked the live sys.modules while another thread imported.
++# The trap key below makes that interleaving deterministic: the first time the eviction scan compares
++# against it, a *separate thread* imports (inserts into sys.modules) and finishes before the scan resumes.
++
++import sys
++import types
++
++
++class _ImportsOnCompare(str):
++    __hash__ = str.__hash__
++
++    def __new__(cls, value):
++        obj = super().__new__(cls, value)
++        obj.armed = False
++        obj.fired = False
++        obj.inserted = f"{value}__concurrent_import"
++        return obj
++
++    def __eq__(self, other):
++        if self.armed and not self.fired:
++            self.fired = True
++            worker = threading.Thread(
++                target=sys.modules.__setitem__, args=(self.inserted, types.ModuleType(self.inserted)))
++            worker.start()
++            worker.join()
++        return str.__eq__(self, other)
++
++
++@pytest.fixture
++def concurrent_import_trap():
++    trap = _ImportsOnCompare("_hermes_test_concurrent_import_trap")
++    sys.modules[trap] = types.ModuleType(str(trap))
++    try:
++        yield trap
++    finally:
++        trap.armed = False
++        sys.modules.pop(trap, None)
++        sys.modules.pop(trap.inserted, None)
++
++
++def test_evict_modules_tolerates_concurrent_import(concurrent_import_trap):
++    sys.modules["_hermes_test_evict_me"] = types.ModuleType("_hermes_test_evict_me")
++    sys.modules["_hermes_test_evict_me.sub"] = types.ModuleType("_hermes_test_evict_me.sub")
++    concurrent_import_trap.armed = True
++
++    plugins_loader._evict_modules("_hermes_test_evict_me")
++
++    assert concurrent_import_trap.fired, "the trap never fired, so the race was not exercised"
++    assert "_hermes_test_evict_me" not in sys.modules
++    assert "_hermes_test_evict_me.sub" not in sys.modules
++
++
++def test_plugin_host_child_evict_tolerates_concurrent_import(concurrent_import_trap):
++    from hermes_cli import plugin_host_child
++
++    sys.modules["_hermes_test_child_evict"] = types.ModuleType("_hermes_test_child_evict")
++    concurrent_import_trap.armed = True
++
++    plugin_host_child._evict_modules("_hermes_test_child_evict")
++
++    assert concurrent_import_trap.fired
++    assert "_hermes_test_child_evict" not in sys.modules
++
++
++def test_directory_plugin_loads_while_another_thread_imports(tmp_path, monkeypatch, concurrent_import_trap):
++    """End to end: the real load path (_load_plugin -> deadline worker -> _load_directory_module) must
++    register the plugin, not log "Failed to load plugin", when an import lands mid-eviction."""
++    from hermes_cli.plugins import PluginManager, PluginManifest
++
++    plugin_dir = tmp_path / "race_probe"
++    plugin_dir.mkdir()
++    (plugin_dir / "__init__.py").write_text("LOADED = []\ndef register(ctx):\n    LOADED.append(1)\n")
++    manifest = PluginManifest(name="race_probe", source="user", path=str(plugin_dir))
++    manager = PluginManager()
++    monkeypatch.setattr(manager, "_runs_in_plugin_host", lambda _m: False)
++    concurrent_import_trap.armed = True
++
++    manager._load_plugin(manifest)
++
++    loaded = manager._plugins["race_probe"]
++    assert concurrent_import_trap.fired
++    assert loaded.error is None, loaded.error
++    assert loaded.enabled
++    assert loaded.module.LOADED == [1]
++
++
++def test_load_failure_warning_names_where_it_raised(tmp_path, monkeypatch, caplog):
++    """Without HERMES_PLUGINS_DEBUG the warning carries no traceback; it must still name the raising frame."""
++    import logging
++
++    from hermes_cli.plugins import PluginManager, PluginManifest
++
++    plugin_dir = tmp_path / "raises_probe"
++    plugin_dir.mkdir()
++    (plugin_dir / "__init__.py").write_text("def register(ctx):\n    raise RuntimeError('boom')\n")
++    manager = PluginManager()
++    monkeypatch.setattr(manager, "_runs_in_plugin_host", lambda _m: False)
++
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
++        manager._load_plugin(PluginManifest(name="raises_probe", source="user", path=str(plugin_dir)))
++
++    assert manager._plugins["raises_probe"].error == "boom"
++    [line] = [r.getMessage() for r in caplog.records if "Failed to load plugin 'raises_probe'" in r.getMessage()]
++    assert f"raised at {plugin_dir / '__init__.py'}:2 in register" in line
+-- 
+2.55.0
+

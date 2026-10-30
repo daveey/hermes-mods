@@ -1,0 +1,281 @@
+From 5d6e55125569b0da6198b1694f62c38858543acb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:17:44 -0700
+Subject: [PATCH] fix(kanban): foreign copies keep the Board's dependency edges
+ (evict, pickup, round repair) [daveey] (#233)
+
+* fix(kanban): foreign copies keep the Board's dependency edges (evict, pickup, round repair) [daveey]
+
+Hub 2026-10-29: sync diff stayed clean=False with pending=0 on three task_links edges the Board held and the
+live file lacked.
+
+- evict() deleted every edge of an evicted copy, including the edge from it to one of our cards. The copy
+  t_01a189a30ea5c64d was evicted in the 9 s between its review hand-off and re-pickup (23:19:50), so the hub
+  child t_01a189f115bdb5ef lost its gate: 51 promoted / 97 claim_rejected parents_not_done since. evict now
+  keeps an edge whose child is still in the file (own_partition's rule: the child owns the edge).
+- import_cards copied a card's runs/comments/attachments/events but not its parent edges, while the feed
+  applies every later edge of a present copy. A pickup now carries them (t_01a189ecd7fcbec2,
+  t_01a189fc4590278f, parents done on the MacBook).
+- repair_partition_links only restored foreign-parent edges to our own cards whose parent was absent. It now
+  restores any replica edge from a foreign parent to a card in the file, parent present or not, under the same
+  tombstone/outbox guards, so the next round heals edges already lost (no echo: applied with capture off).
+
+Edges between own cards are untouched and a missing one is still a diff mismatch (regression test).
+
+Kanban: t_01a18a0726a2d2d0
+
+* fix(kanban): a picked-up copy's foreign parents are mirrored at import, not next round [daveey]
+
+Review of #233: importing a ready copy with its parent edges left the foreign parent missing from the mirror
+until the next sync round, so the same-tick claim read it as not done, demoted the copy to todo and pushed
+that (and a claim_rejected event) to the Board. import_cards refreshes the mirror from the open replica.
+Test: a ready copy with a done foreign parent is claimable right after pickup (red without the refresh).
+
+Kanban: t_01a18a0726a2d2d0
+---
+ hermes_cli/kanban_sync_partition_repair.py    |  15 +-
+ hermes_cli/kanban_worker_node.py              |  14 +-
+ .../hermes_cli/test_kanban_sync_copy_links.py | 153 ++++++++++++++++++
+ 3 files changed, 174 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_copy_links.py
+
+diff --git a/hermes_cli/kanban_sync_partition_repair.py b/hermes_cli/kanban_sync_partition_repair.py
+index a220164caa4..0660b0e2761 100644
+--- a/hermes_cli/kanban_sync_partition_repair.py
++++ b/hermes_cli/kanban_sync_partition_repair.py
+@@ -9,11 +9,14 @@ from hermes_cli.kanban_db_connect import write_txn
+ 
+ 
+ def repair_partition_links(live: sqlite3.Connection, replica: sqlite3.Connection, gateway: str) -> list[str]:
+-    """Restore replica edges from foreign parents to local children, without echoing them.
++    """Restore replica edges from foreign parents to cards in this file, without echoing them.
+ 
+-    The old partition consumed these changes without applying them. A newer filter
+-    cannot recover them by pulling from the advanced cursor. Only primary boards
+-    may replay them; local tombstones and unanswered operations retain precedence.
++    The old partition consumed these changes without applying them, and a newer filter cannot recover them by
++    pulling from the advanced cursor. Two later paths lost them the same way: evicting a picked-up foreign parent
++    dropped its edges to our children, and a picked-up copy arrived without its own parent edges (hub 2026-10-29,
++    t_01a189f115bdb5ef promoted 51 times against the Board's parents_not_done). So every edge whose child is in
++    this file is restored, whether the parent is a local copy or absent. Only primary boards may replay them;
++    local tombstones and unanswered operations retain precedence.
+     Run after both pulls and before refreshing the foreign-parent status mirror.
+     """
+     if sync.board_mode(live) != "primary":
+@@ -32,14 +35,12 @@ def repair_partition_links(live: sqlite3.Connection, replica: sqlite3.Connection
+         held = {(t, u) for t, u in live.execute(
+             "SELECT table_name, row_uid FROM kanban_sync_outbox WHERE state IN ('pending', 'rejected') "
+             "UNION SELECT table_name, row_uid FROM kanban_sync_tombstones")}
+-        mine = {r[0] for r in live.execute(
+-            "SELECT id FROM tasks WHERE created_on = ? OR created_on IS NULL", (gateway,))}
+         present = {r[0] for r in live.execute("SELECT id FROM tasks")}
+         applying = sync.sync_state(live)["applying"]
+         live.execute("UPDATE kanban_sync_state SET applying = 1")
+         for parent, child in edges:
+             uid = f"{parent}>{child}"
+-            if child not in mine or parent in present:
++            if child not in present:
+                 continue
+             if any(key in held for key in (("task_links", uid), ("tasks", parent), ("tasks", child))):
+                 continue
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 550ecc37451..ce342508bfb 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -266,7 +266,11 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+                 continue
+             for table in present:
+                 conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (tid,))
+-            conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
++            # The copy's own edges go with it; an edge from it to a card still in this file belongs to that child
++            # (own_partition keeps it, the Board still holds it). Dropping it un-gated a hub child of a copy evicted
++            # between review hand-off and re-pickup: 51 promoted / 97 claim_rejected parents_not_done (2026-10-29).
++            conn.execute("DELETE FROM task_links WHERE child_id = ? OR (parent_id = ? AND child_id NOT IN "
++                         "(SELECT id FROM tasks WHERE id != ?))", (tid, tid, tid))
+             conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
+             gone.append(tid)
+         conn.execute("UPDATE kanban_sync_state SET applying = 0")
+@@ -330,6 +334,11 @@ def _changes_for(replica: sqlite3.Connection, tid: str, card: sqlite3.Row) -> li
+             version = int(row["sync_version"] or 0) if "sync_version" in row.keys() else 0
+             out.append(sync.RemoteChange(0, table, row["uid"], "upsert", ksc._row_fields(replica, table, row),
+                                          version, "", ""))
++    # Its parent edges too: once the copy is here the feed applies its later links (own_partition), so a copy
++    # without the earlier ones disagreed with the Board for as long as it ran.
++    for row in replica.execute("SELECT * FROM task_links WHERE child_id = ? ORDER BY parent_id", (tid,)).fetchall():
++        out.append(sync.RemoteChange(0, "task_links", f"{row['parent_id']}>{tid}", "upsert",
++                                     ksc._row_fields(replica, "task_links", row), 0, "", ""))
+     return out
+ 
+ 
+@@ -346,6 +355,9 @@ def import_cards(conn: sqlite3.Connection, replica: sqlite3.Connection, ids: Ite
+     if changes:
+         cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+         sync.apply_remote_changes(conn, changes, new_cursor=cursor, observers=False)
++        # The copy's foreign parents are gated by the mirror; filled only in the sync round, a parent read as
++        # missing in this tick would demote the ready copy to todo and push that to the Board.
++        sync.refresh_remote_parents(conn, replica)
+     return done
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_copy_links.py b/tests/hermes_cli/test_kanban_sync_copy_links.py
+new file mode 100644
+index 00000000000..373ab5eec36
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_copy_links.py
+@@ -0,0 +1,153 @@
++"""Dependency edges of picked-up foreign copies stay what the Board holds (hub, 2026-10-29).
++
++Two paths dropped edges from the live file while the Board kept them, so ``diff`` reported settled
++``task_links`` mismatches with pending=0:
++
++* ``evict`` deleted every edge of an evicted copy, including the edge from it to one of OUR cards: the hub
++  child t_01a189f115bdb5ef of the copy t_01a189a30ea5c64d (evicted between its review hand-off and re-pickup)
++  lost its gate and was promoted 51 times while the Board refused every lease ``parents_not_done``.
++* ``import_cards`` copied a card's runs/comments/events but not its parent edges, although the feed applies
++  every later edge of a copy (``own_partition`` keeps a link whose child is in the file).
++
++The next sync round restores edges already lost that way (``repair_partition_links``)."""
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.test_kanban_cross_gateway_parents import (
++    BOARD, ME, OTHER, _other, _round, kanban_home, live, svc,
++)
++
++__all__ = ["kanban_home", "live", "svc"]
++
++
++def _import(live, *ids):
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        replica.row_factory = ksc.sqlite3.Row
++        assert wn.import_cards(live, replica, list(ids)) == list(ids)
++    finally:
++        replica.close()
++
++
++def _diff(live):
++    shadow = ksc.open_shadow(BOARD, ME)
++    try:
++        return ksc.diff(live, shadow, ME)
++    finally:
++        shadow.close()
++
++
++def _edges(live, tid):
++    return sorted(tuple(r) for r in live.execute(
++        "SELECT parent_id, child_id FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid)))
++
++
++def _drop_uncaptured(live, parent, child):
++    """The pre-fix loss: an edge deleted with capture suppressed (old ``evict``) or never imported."""
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent, child))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++def _foreign_parent_with_own_child(live, svc, kanban_home):
++    _other(svc, "p", "tasks", "t_copy", {"title": "theirs", "status": "running", "created_at": 1,
++                                         "created_on": OTHER})
++    _round(kanban_home, svc)
++    _import(live, "t_copy")
++    # A worker running the copy here files a follow-up card of ours that waits on it.
++    child = kb.create_task(live, title="follow-up", assignee="worker", parents=["t_copy"])
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert _edges(live, child) == [("t_copy", child)]
++    assert _diff(live)["child_mismatch"] == {}
++    return child
++
++
++def test_evicting_a_foreign_parent_keeps_its_edge_to_our_child(live, svc, kanban_home):
++    child = _foreign_parent_with_own_child(live, svc, kanban_home)
++    with kbc.write_txn(live):  # the copy is handed back for review: unclaimed, not running
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("UPDATE tasks SET status = 'review', claim_lock = NULL WHERE id = 't_copy'")
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    assert wn.evict(live) == ["t_copy"]
++    assert _edges(live, child) == [("t_copy", child)]
++    kb.recompute_ready(live)
++    assert kb.get_task(live, child).status == "todo"  # before the fix: promoted, then refused by the Board
++    _round(kanban_home, svc)
++    assert _diff(live)["child_mismatch"] == {}
++
++
++def test_a_round_restores_a_lost_edge_from_a_present_foreign_parent_to_our_child(live, svc, kanban_home):
++    child = _foreign_parent_with_own_child(live, svc, kanban_home)
++    _drop_uncaptured(live, "t_copy", child)  # hub t_01a189a30ea5c64d>t_01a189f115bdb5ef after re-pickup
++    assert _diff(live)["child_mismatch"] == {"task_links": 1}
++    _round(kanban_home, svc)
++    assert _edges(live, child) == [("t_copy", child)]
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name = 'task_links'").fetchone()
++    assert _diff(live)["child_mismatch"] == {}
++
++
++def _foreign_child_of_done_parent(svc, kanban_home, status="running"):
++    _other(svc, "dp", "tasks", "t_done", {"title": "parent", "status": "done", "created_at": 1,
++                                          "created_on": OTHER})
++    _other(svc, "dc", "tasks", "t_kid", {"title": "kid", "status": status, "created_at": 2,
++                                         "created_on": OTHER, "assignee": "worker"})
++    _other(svc, "dl", "task_links", "t_done>t_kid", {"parent_id": "t_done", "child_id": "t_kid"})
++    _round(kanban_home, svc)
++
++
++def test_a_picked_up_copy_carries_its_parent_edges(live, svc, kanban_home):
++    _foreign_child_of_done_parent(svc, kanban_home)
++    _import(live, "t_kid")
++    assert kb.get_task(live, "t_done") is None
++    assert _edges(live, "t_kid") == [("t_done", "t_kid")]
++    assert _diff(live)["child_mismatch"] == {}
++    _round(kanban_home, svc)
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name = 'task_links'").fetchone()
++    assert _diff(live)["child_mismatch"] == {}
++
++
++def test_a_ready_copy_with_a_done_foreign_parent_is_claimable_right_after_pickup(live, svc, kanban_home):
++    _foreign_child_of_done_parent(svc, kanban_home, status="ready")
++    _import(live, "t_kid")
++    assert kb.parent_states(live, "t_kid") == [("t_done", "done")]
++    assert kb.claim_task(live, "t_kid") is not None
++    kid = kb.get_task(live, "t_kid")
++    assert kid is not None and kid.status == "running"
++    assert not live.execute("SELECT 1 FROM task_events WHERE task_id = 't_kid' AND kind = 'claim_rejected'").fetchone()
++
++
++def test_a_round_restores_the_parent_edge_of_a_copy_imported_without_it(live, svc, kanban_home):
++    _foreign_child_of_done_parent(svc, kanban_home)
++    _import(live, "t_kid")
++    _drop_uncaptured(live, "t_done", "t_kid")  # hub t_01a189c2ac722da1>t_01a189ecd7fcbec2 (old import)
++    assert _diff(live)["child_mismatch"] == {"task_links": 1}
++    _round(kanban_home, svc)
++    assert _edges(live, "t_kid") == [("t_done", "t_kid")]
++    assert _diff(live)["child_mismatch"] == {}
++
++
++def test_an_evicted_copy_takes_its_own_parent_edges_with_it(live, svc, kanban_home):
++    _foreign_child_of_done_parent(svc, kanban_home)
++    _import(live, "t_kid")
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("UPDATE tasks SET status = 'done', claim_lock = NULL WHERE id = 't_kid'")
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    assert wn.evict(live) == ["t_kid"]
++    assert _edges(live, "t_kid") == []
++    _round(kanban_home, svc)
++    assert _edges(live, "t_kid") == []  # the copy is gone: nothing to restore onto
++
++
++def test_an_edge_between_own_cards_missing_live_is_still_a_mismatch(live, svc, kanban_home):
++    parent = kb.create_task(live, title="parent", assignee="worker")
++    child = kb.create_task(live, title="child", assignee="worker", parents=[parent])
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert _diff(live)["child_mismatch"] == {}
++    _drop_uncaptured(live, parent, child)
++    assert _diff(live)["child_mismatch"] == {"task_links": 1}
+-- 
+2.55.0
+

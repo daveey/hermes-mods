@@ -1,0 +1,347 @@
+From dcc9cc4039ce7fc6c3bc0ced0add191bd02bbf2a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:40:48 +0000
+Subject: [PATCH] perf(kanban): cache attention counts per origin scope and
+ share done-check verdicts [daveey]
+
+/api/profiles/projects/tree annotates every profile in one request. attention_task_counts kept a
+single-slot cache, so each profile evicted the previous one and the 30 s TTL never hit: every tree
+poll (Desktop, every 10 s) re-ran every registered done check for every profile (48 board reads on
+the hub, 1.1 s isolated, 2-2.5 s in the live backend under load) and evicted the default profile,
+whose next /api/sessions/<id> re-ran them too (5.05 s -> Desktop 5 s timeout, 10-29 18:42 PDT).
+
+Now the counts are cached per scope (bounded at 64 scopes, in kanban_session_activity_attention.py), and a done check's verdict is memoised
+for the same TTL by (visible boards, board, card id, completed_at, title, summary), so profiles on
+one kanban root share it. Measured on the hub's real boards: tree 1.1 s -> 0.1 s, default annotate
+after a tree 0.19 s -> 0.007 s, zero attention board reads on a warm poll.
+---
+ hermes_cli/kanban_session_activity.py         |  48 +++----
+ .../kanban_session_activity_attention.py      |  68 ++++++++++
+ .../test_kanban_attention_scope_cache.py      | 126 ++++++++++++++++++
+ 3 files changed, 212 insertions(+), 30 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity_attention.py
+ create mode 100644 tests/hermes_cli/test_kanban_attention_scope_cache.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 1162ce063b9..8383ac562d3 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -19,6 +19,8 @@ from hermes_cli import kanban_activity_identity as _identity
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+ from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbeats
+ from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases, _moved_evidence, _retire_moved
++from hermes_cli.kanban_session_activity_attention import AttentionCache as _AttentionCache
++from hermes_cli.kanban_session_activity_attention import run_checks as _run_done_checks
+ import contextlib
+ import json
+ import logging
+@@ -1765,23 +1767,21 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+ ATTENTION_WINDOW_S = 24 * 3600
+ _ATTENTION_TTL_S = 30.0
+ _done_checks: dict[str, Callable[[dict[str, Any]], bool]] = {}
+-_attention_cache: tuple[float, dict[str, int]] | None = None
+-_attention_scope: tuple[str, ...] | None = None
++# [daveey] Per origin scope, with done-check verdicts shared across scopes (see the module).
++_attention = _AttentionCache(_ATTENTION_TTL_S)
+ 
+ 
+ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool]) -> Callable[[], None]:
+     """Register ``fn(card) -> bool`` (True = this completed card needs attention). ``card`` has ``id``, ``title``,
+     ``summary`` (latest run summary, else ``result``), ``completed_at``, ``board`` and ``board_path``. Re-registering a
+     name replaces it; the returned callable unregisters."""
+-    global _attention_cache
+     _done_checks[name] = fn
+-    _attention_cache = None
++    _attention.clear()
+ 
+     def _dispose() -> None:
+-        global _attention_cache
+         if _done_checks.get(name) is fn:
+             _done_checks.pop(name, None)
+-            _attention_cache = None
++            _attention.clear()
+ 
+     return _dispose
+ 
+@@ -1821,44 +1821,32 @@ def _read_recent_done(path: Path, since: float) -> list[tuple[str, dict[str, Any
+ def attention_task_counts(now: float | None = None) -> dict[str, int]:
+     """``{session_id: completed cards a registered check flags}`` over the last ``ATTENTION_WINDOW_S``. Cached;
+     a check that raises counts as False."""
+-    global _attention_cache, _attention_scope
+     if not _done_checks:
+         return {}
+     scope = _origin_scope()
+     mono = time.monotonic()
+-    with _cache_lock:
+-        if _attention_cache is not None and _attention_scope == scope and mono < _attention_cache[0]:
+-            return _attention_cache[1]
++    hit = _attention.get(scope, mono)
++    if hit is not None:
++        return hit
+     since = (time.time() if now is None else now) - ATTENTION_WINDOW_S
+     checks = list(_done_checks.values())
+-    verdicts: dict[tuple[str, str], bool] = {}
++    paths = list(_board_db_paths())
++    boards = tuple(str(p) for p in paths)
+     pairs: set[tuple[str, str]] = set()
+-    for path in _board_db_paths():
++    for path in paths:
+         try:
+             recent = _read_recent_done(path, since)
+         except sqlite3.Error as exc:
+             _log.debug("kanban attention read failed for %s: %s", path, exc)
+             continue
+         for sid, card in recent:
+-            key = (str(path), str(card["id"]))
+-            if key not in verdicts:
+-                flagged = False
+-                for check in checks:
+-                    try:
+-                        if check(card):
+-                            flagged = True
+-                            break
+-                    except Exception:
+-                        _log.debug("kanban done check failed on %s", card.get("id"), exc_info=True)
+-                verdicts[key] = flagged
+-            if verdicts[key]:
+-                pairs.add((sid, key[1]))
++            key = (boards, str(path), str(card["id"]), card.get("completed_at"), card.get("title"), card.get("summary"))
++            if _attention.verdict(key, mono, lambda card=card: _run_done_checks(checks, card)):
++                pairs.add((sid, key[2]))
+     counts: dict[str, int] = {}
+     for sid, _tid in pairs:
+         counts[sid] = counts.get(sid, 0) + 1
+-    with _cache_lock:
+-        _attention_scope = scope
+-        _attention_cache = (mono + _ATTENTION_TTL_S, counts)
++    _attention.put(scope, mono, counts)
+     return counts
+ 
+ 
+@@ -2045,7 +2033,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+ 
+ 
+ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+-    global _cache, _attention_cache, _remote_last, _links_cache, _snapshot_saved, _remote_read_memo
++    global _cache, _remote_last, _links_cache, _snapshot_saved, _remote_read_memo
+     global _hub_signature_memo, _annotate_flight_scope, _annotate_flight_result, _annotate_waiters
+     _remote_read_memo = None
+     _hub_signature_memo = None
+@@ -2059,7 +2047,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+         _links_cache = None
+     with _cache_lock:
+         _cache = None
+-        _attention_cache = None
++        _attention.clear()
+         if not keep_remote:
+             _remote_last = None
+             _snapshot_saved = None
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+new file mode 100644
+index 00000000000..0c5dec1b748
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -0,0 +1,68 @@
++"""Attention-count caches for ``kanban_session_activity``: per origin scope, with shared done-check verdicts. [daveey]
++
++One process annotates several profiles in one request (``/api/profiles/projects/tree`` walks every profile). A
++single-slot cache was evicted by every other scope, so its 30 s TTL never hit: each tree poll re-ran every done check
++for every profile (48 board reads, 2-2.5 s on the hub) and evicted the default scope, whose next
++``/api/sessions/<id>`` re-ran them too.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++from typing import Any, Callable
++
++_log = logging.getLogger("hermes_cli.kanban_session_activity")
++
++
++def run_checks(checks: list[Callable[[dict[str, Any]], bool]], card: dict[str, Any]) -> bool:
++    """True when any check flags ``card``; a check that raises counts as False."""
++    for check in checks:
++        try:
++            if check(card):
++                return True
++        except Exception:  # health: allow BLE001 -- a registered plugin check may raise anything; it counts as False
++            _log.debug("kanban done check failed on %s", card.get("id"), exc_info=True)
++    return False
++
++
++class AttentionCache:
++    """``counts``: ``{scope: (expires_mono, counts)}``, bounded at ``max_scopes``. ``verdicts``:
++    ``{(boards, board_path, id, completed_at, title, summary): (expires_mono, flagged)}``. A check reads only the
++    card and the boards, so another profile on the same kanban root gets the same verdict within the TTL."""
++
++    def __init__(self, ttl_s: float, max_scopes: int = 64) -> None:
++        self.ttl_s = ttl_s
++        self.max_scopes = max_scopes
++        self.counts: dict[tuple[str, ...], tuple[float, dict[str, int]]] = {}
++        self.verdicts: dict[tuple, tuple[float, bool]] = {}
++        self._lock = threading.Lock()
++
++    def clear(self) -> None:
++        with self._lock:
++            self.counts.clear()
++            self.verdicts.clear()
++
++    def get(self, scope: tuple[str, ...], mono: float) -> dict[str, int] | None:
++        with self._lock:
++            hit = self.counts.get(scope)
++        return hit[1] if hit is not None and mono < hit[0] else None
++
++    def put(self, scope: tuple[str, ...], mono: float, counts: dict[str, int]) -> None:
++        with self._lock:
++            self.counts[scope] = (mono + self.ttl_s, counts)
++            for store in (self.counts, self.verdicts):
++                for key in [k for k, v in store.items() if v[0] <= mono]:
++                    store.pop(key, None)
++            while len(self.counts) > self.max_scopes:
++                self.counts.pop(next(iter(self.counts)))
++
++    def verdict(self, key: tuple, mono: float, compute: Callable[[], bool]) -> bool:
++        with self._lock:
++            memo = self.verdicts.get(key)
++        if memo is not None and mono < memo[0]:
++            return memo[1]
++        flagged = compute()
++        with self._lock:
++            self.verdicts[key] = (mono + self.ttl_s, flagged)
++        return flagged
+diff --git a/tests/hermes_cli/test_kanban_attention_scope_cache.py b/tests/hermes_cli/test_kanban_attention_scope_cache.py
+new file mode 100644
+index 00000000000..b520d4e0e3b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_attention_scope_cache.py
+@@ -0,0 +1,126 @@
++"""Attention counts stay cached per origin scope when one process alternates profiles. [daveey]
++
++``/api/profiles/projects/tree`` annotates every profile in one request. With a single-slot attention cache each
++profile evicted the previous one, so every tree poll re-ran every done check for every profile (48 board reads,
++2-2.5 s on the hub) and the default profile's next ``/api/sessions/<id>`` re-ran them again.
++"""
++
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import profiles
++
++
++def _make_board(path: Path, rows) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.executescript("""
++        CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT NOT NULL, session_id TEXT,
++                            completed_at INTEGER, result TEXT);
++        CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, summary TEXT);
++    """)
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)", rows)
++    conn.commit()
++    conn.close()
++
++
++@pytest.fixture
++def two_profiles(tmp_path, monkeypatch):
++    """Two origin profiles on one shared kanban root, as on the hub."""
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    current = ["default"]
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: current[0])
++    now = int(time.time())
++    _make_board(tmp_path / "kanban.db", [("t1", "x (split to follow-up)", "done", "s1", now - 60, None),
++                                         ("t2", "clean", "done", "s2", now - 60, None)])
++    calls: list[str] = []
++
++    def check(card):
++        calls.append(card["id"])
++        return "split to follow-up" in (card.get("title") or "")
++
++    ksa._reset_cache_for_tests()
++    dispose = ksa.register_done_check("test", check)
++    yield current, calls
++    dispose()
++    ksa._reset_cache_for_tests()
++
++
++def test_alternating_scopes_keep_their_attention_cache(two_profiles, monkeypatch):
++    current, _calls = two_profiles
++    reads = []
++    real = ksa._read_recent_done
++    monkeypatch.setattr(ksa, "_read_recent_done", lambda *a: reads.append(a[0]) or real(*a))
++    for name in ("default", "work", "default", "work", "default"):
++        current[0] = name
++        assert ksa.attention_task_counts() == {"s1": 1}
++    # One board read per scope, not one per call: the second visit of each scope is a cache hit.
++    assert len(reads) == 2
++
++
++def test_done_check_verdict_is_shared_across_scopes_on_the_same_boards(two_profiles):
++    current, calls = two_profiles
++    ksa.attention_task_counts()
++    current[0] = "work"
++    ksa.attention_task_counts()
++    assert sorted(calls) == ["t1", "t2"]  # each card checked once, not once per profile
++
++
++def test_scopes_seeing_different_boards_do_not_share_verdicts(two_profiles):
++    current, calls = two_profiles
++    ksa.attention_task_counts()
++    from hermes_cli import kanban_db
++
++    _make_board(kanban_db.boards_root() / "extra" / "kanban.db", [])
++    current[0] = "work"
++    ksa.attention_task_counts()
++    assert sorted(calls) == ["t1", "t1", "t2", "t2"]  # the board set is part of the verdict's input
++
++
++def test_projects_tree_poll_then_session_detail_do_not_rerun_checks(two_profiles):
++    """The production pattern: a tree request annotates each profile in turn, then the default profile's
++    ``/api/sessions/<id>`` annotates its row. Neither re-runs the done checks within the TTL."""
++    current, calls = two_profiles
++    for _poll in range(3):
++        for name in ("default", "work", "coach"):  # one tree request
++            current[0] = name
++            ksa.annotate_kanban_activity([{"id": "s1"}])
++        current[0] = "default"  # the session detail request
++        row = {"id": "s1"}
++        ksa.annotate_kanban_activity([row])
++        assert row["kanban_attention"] == 1
++    assert sorted(calls) == ["t1", "t2"]
++
++
++def test_card_change_reruns_its_check(two_profiles, tmp_path, monkeypatch):
++    current, calls = two_profiles
++    ksa.attention_task_counts()
++    with sqlite3.connect(tmp_path / "kanban.db") as db:
++        db.execute("UPDATE tasks SET title='clean now', completed_at=completed_at+1 WHERE id='t1'")
++    ksa._attention.counts.clear()  # past the scope TTL
++    current[0] = "work"
++    assert ksa.attention_task_counts() == {}
++    assert sorted(calls) == ["t1", "t1", "t2"]
++
++
++def test_registering_a_check_clears_cached_attention(two_profiles):
++    assert ksa.attention_task_counts() == {"s1": 1}
++    dispose = ksa.register_done_check("everything", lambda card: True)
++    try:
++        assert ksa.attention_task_counts() == {"s1": 1, "s2": 1}
++    finally:
++        dispose()
++    assert ksa.attention_task_counts() == {"s1": 1}
++
++
++def test_scope_cache_is_bounded(two_profiles, monkeypatch):
++    current, _calls = two_profiles
++    monkeypatch.setattr(ksa._attention, "max_scopes", 3)
++    for i in range(10):
++        current[0] = f"p{i}"
++        ksa.attention_task_counts()
++    assert len(ksa._attention.counts) == 3
+-- 
+2.55.0
+

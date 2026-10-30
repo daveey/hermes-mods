@@ -1,0 +1,217 @@
+From 70c97472348d83a2b9025b347c20b3e6b899ecf9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 23:35:02 +0000
+Subject: [PATCH] fix(ci): separate completion gates from live-comment pollers
+ [daveey]
+
+---
+ .github/FAST-LANE.md                     |  6 ++-
+ .github/workflows/ci.yaml                |  4 +-
+ .github/workflows/supply-chain-audit.yml |  2 +-
+ scripts/fork-ci-runner.sh                | 12 ++---
+ tests/ci/test_fast_runner_routing.py     |  3 --
+ tests/ci/test_fork_runner_routing.py     | 64 ++++++++++++++++++------
+ 6 files changed, 62 insertions(+), 29 deletions(-)
+
+diff --git a/.github/FAST-LANE.md b/.github/FAST-LANE.md
+index e901a297c52..bc70deebbf2 100644
+--- a/.github/FAST-LANE.md
++++ b/.github/FAST-LANE.md
+@@ -5,8 +5,10 @@
+ `hermes-hub`, Docker `docker-ci`, or long-lived observer `hermes-hub-poll` lanes.
+ Jobs keep their existing names, conditions, dependencies, steps, permissions,
+ timeouts and required-result semantics. In particular, neither heavy tests nor
+-the advisory full-tree `ruff + ty diff` moves here. Existing aggregators stay on
+-the poll lane; no checks are added to that lane.
++the advisory full-tree `ruff + ty diff` moves here. Completion aggregates and the
++CI timing report use the general `hermes-hub` lane, never the observer-only pool:
++long-running live-comment pollers can await those very jobs and occupy every slot.
++The `!cancelled()` condition still keeps superseded runs from latching their group.
+ 
+ ## Evidence behind admission
+ 
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 0920077f867..e9b1618ebcb 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -462,7 +462,7 @@ jobs:
+       # to block a merge. A separate run also stops it from holding this
+       # run open. That is what blocked ``gh run rerun``.
+     if: ${{ !cancelled() }}
+-    runs-on: [self-hosted, hermes-hub-poll]
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     outputs:
+       needs-json: ${{ steps.evaluate.outputs.needs-json }}
+@@ -497,7 +497,7 @@ jobs:
+     name: CI timing report
+     needs: [all-checks-pass]
+     if: ${{ !cancelled() }}
+-    runs-on: [self-hosted, hermes-hub-poll]
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     steps:
+       - name: Checkout code
+diff --git a/.github/workflows/supply-chain-audit.yml b/.github/workflows/supply-chain-audit.yml
+index 09ce688f1ab..db951717d37 100644
+--- a/.github/workflows/supply-chain-audit.yml
++++ b/.github/workflows/supply-chain-audit.yml
+@@ -233,7 +233,7 @@ jobs:
+     name: Aggregate review statuses
+     needs: [scan, dep-bounds]
+     if: ${{ !cancelled() }}
+-    runs-on: [self-hosted, hermes-hub-poll]
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 15
+     outputs:
+       review_status: ${{ steps.merge.outputs.review_status }}
+diff --git a/scripts/fork-ci-runner.sh b/scripts/fork-ci-runner.sh
+index f3a27d7e486..4f29a1c3eec 100755
+--- a/scripts/fork-ci-runner.sh
++++ b/scripts/fork-ci-runner.sh
+@@ -23,12 +23,10 @@ rm -f ./*.bak
+ sed -i.bak -E 's/^([[:space:]]*runs-on:[[:space:]]*)(\[self-hosted, hermes-hub\]|ubuntu-latest|ubuntu-24\.04)[[:space:]]*$/\1[self-hosted, hermes-hub-poll]/' ci-review-comment.yml
+ rm -f ./*.bak
+ 
+-# Aggregator/report jobs (cheap: checkout + a python script) go to the poll
+-# runners and skip on cancellation. With `if: always()` on a [hermes-hub] test
+-# runner, a CANCELLED run (superseded PR head) still waited for a busy heavy
+-# runner to run its aggregator, held the ci-<PR> concurrency group, and left
+-# the new head's run `pending` (PR #53, PR #50). `!cancelled()` keeps
+-# failure/skip reporting; a cancelled run now completes at once.
++# Aggregator/report jobs use general capacity, never the observer-only pool:
++# live-comment pollers can await these jobs and fill every poll slot (PR #221).
++# Keep cancellation skipping: a CANCELLED run's always() gate used to hold
++# its concurrency group while queued (PR #53, PR #50).
+ # Detect gets 5 min: a 1-min cap was cancelling whole runs on a loaded hub
+ # (checkout 52s + compare-API retry), which skipped every lane.
+ python3 - <<'PY'
+@@ -44,7 +42,7 @@ for f, names in JOBS.items():
+         assert m, (f, name)
+         block = m.group(0)
+         new = re.sub(r'(?m)^(    if: )always\(\)$', r"\1${{ !cancelled() }}", block)
+-        new = re.sub(r'(?m)^(    runs-on: )\[self-hosted, hermes-hub\]$', r'\1[self-hosted, hermes-hub-poll]', new)
++        new = re.sub(r'(?m)^(    runs-on: )\[self-hosted, hermes-hub(?:-poll)?\]$', r'\1[self-hosted, hermes-hub]', new)
+         t = t.replace(block, new)
+     if f == 'ci.yaml':
+         t = re.sub(r"(  detect:\n    name: Detect affected areas\n    runs-on: [^\n]*\n    timeout-minutes: )1\n",
+diff --git a/tests/ci/test_fast_runner_routing.py b/tests/ci/test_fast_runner_routing.py
+index 5bc80ad7da3..07fec688aa5 100644
+--- a/tests/ci/test_fast_runner_routing.py
++++ b/tests/ci/test_fast_runner_routing.py
+@@ -59,9 +59,6 @@ def test_observers_and_long_work_do_not_compete_for_fast_slots():
+     workflows = _workflows()
+     for wf, name in [
+         ("ci-review-comment.yml", "comment"),
+-        ("ci.yaml", "all-checks-pass"),
+-        ("ci.yaml", "ci-timings"),
+-        ("supply-chain-audit.yml", "aggregate"),
+     ]:
+         assert workflows[wf]["jobs"][name]["runs-on"] == ["self-hosted", "hermes-hub-poll"]
+     for wf in ["tests.yml", "js-tests.yml", "docs-site-checks.yml", "rust-tests.yml", "remote-backends.yml"]:
+diff --git a/tests/ci/test_fork_runner_routing.py b/tests/ci/test_fork_runner_routing.py
+index ded669f5833..a7ed0936998 100644
+--- a/tests/ci/test_fork_runner_routing.py
++++ b/tests/ci/test_fork_runner_routing.py
+@@ -1,24 +1,28 @@
+-"""[daveey] fork routing invariants for the self-hosted hermes-hub runners.
++"""Fork completion jobs must skip cancellation and never await observer slots.
+ 
+-A job-level ``if: always()`` on a heavy ``[self-hosted, hermes-hub]`` runner
+-runs even after its run is CANCELLED, so a superseded PR run sits ``queued``
+-until a busy test runner frees up, holding the ``ci-<PR>`` concurrency group
+-and leaving the new head ``pending`` (PR #53, PR #50). Aggregators must use
+-``!cancelled()`` and the cheap poll-only runners instead.
++A superseded run's always() gate used to hold its concurrency group (PRs 53/50).
++Moving it onto poll slots introduced another dependency: live-comment observers
++can await the very completion jobs queued behind them (PR 221).
+ """
+ from __future__ import annotations
+ 
+ import pathlib
++import re
++import shutil
++import subprocess
+ 
+ import pytest
+ from ruamel.yaml import YAML
+ 
+ _YAML = YAML(typ="safe")
+-
+ ROOT = pathlib.Path(__file__).resolve().parents[2]
+ WORKFLOWS = ROOT / ".github" / "workflows"
+ HEAVY = "hermes-hub"
+ POLL = "hermes-hub-poll"
++COMPLETION = {
++    "ci.yaml": ("all-checks-pass", "ci-timings"),
++    "supply-chain-audit.yml": ("aggregate",),
++}
+ 
+ 
+ def _jobs():
+@@ -45,23 +49,55 @@ def test_no_always_job_waits_for_a_heavy_hub_runner():
+         if "always()" in str(job.get("if", "")) and HEAVY in _labels(job)
+     ]
+     assert not offenders, (
+-        "job-level always() on [self-hosted, hermes-hub] keeps cancelled runs queued; "
+-        f"use `${{{{ !cancelled() }}}}` + [self-hosted, {POLL}]: {offenders}")
++        "job-level always() on hermes-hub keeps cancelled runs queued; "
++        f"use !cancelled() on completion jobs: {offenders}"
++    )
+ 
+ 
+ @pytest.mark.parametrize("wf,name", [
+-    ("ci.yaml", "all-checks-pass"),
+-    ("ci.yaml", "ci-timings"),
+-    ("supply-chain-audit.yml", "aggregate"),
++    (wf, name) for wf, names in COMPLETION.items() for name in names
+ ])
+-def test_aggregators_run_on_poll_runners_and_skip_on_cancel(wf, name):
++def test_aggregators_do_not_wait_for_observers_and_skip_on_cancel(wf, name):
+     data = _YAML.load((WORKFLOWS / wf).read_text(encoding="utf-8"))
+     job = data["jobs"][name]
+-    assert _labels(job) == {"self-hosted", POLL}
++    assert _labels(job) == {"self-hosted", HEAVY}
++    assert POLL not in _labels(job)
+     cond = str(job.get("if", ""))
+     assert "!cancelled()" in cond and "always()" not in cond
+ 
+ 
++@pytest.mark.parametrize("original_label", [POLL, HEAVY, "ubuntu-latest"])
++def test_fork_rewriter_preserves_completion_capacity(tmp_path, original_label):
++    # Run the real upstream-reapply entry point twice, without touching the checkout.
++    shutil.copytree(ROOT / ".github", tmp_path / ".github")
++    for relative in ("scripts/fork-ci-runner.sh", "scripts/ci/required_results.py", "tests/ci/conftest.py"):
++        dest = tmp_path / relative
++        dest.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(ROOT / relative, dest)
++    for wf, names in COMPLETION.items():
++        path = tmp_path / ".github/workflows" / wf
++        text = path.read_text()
++        for name in names:
++            match = re.search(r"(?m)^  " + re.escape(name) + r":\n(?:(?!  \S).*\n)*", text)
++            assert match
++            block = match.group(0)
++            label = original_label if original_label == "ubuntu-latest" else f"[self-hosted, {original_label}]"
++            changed = re.sub(r"(?m)^    runs-on: .*$", f"    runs-on: {label}", block)
++            changed = re.sub(r"(?m)^    if: .*$", "    if: always()", changed)
++            text = text.replace(block, changed)
++        path.write_text(text)
++    for _ in range(2):
++        subprocess.run(["bash", "scripts/fork-ci-runner.sh"], cwd=tmp_path, check=True, capture_output=True)
++        for wf, names in COMPLETION.items():
++            data = _YAML.load((tmp_path / ".github/workflows" / wf).read_text())
++            for name in names:
++                job = data["jobs"][name]
++                assert _labels(job) == {"self-hosted", HEAVY}
++                assert job["if"] == "${{ !cancelled() }}"
++        observer = _YAML.load((tmp_path / ".github/workflows/ci-review-comment.yml").read_text())
++        assert _labels(observer["jobs"]["comment"]) == {"self-hosted", POLL}
++
++
+ def test_detect_timeout_tolerates_a_loaded_hub():
+     data = _YAML.load((WORKFLOWS / "ci.yaml").read_text(encoding="utf-8"))
+     assert data["jobs"]["detect"]["timeout-minutes"] >= 5
+-- 
+2.55.0
+
