@@ -5,17 +5,11 @@ Subject: [PATCH] fix(desktop): desktop.relaunch_after_rebuild reopens the app
  a headless update stopped for the bundle swap [daveey]
 
 ---
- hermes_cli/config_defaults.py                 |   4 +
- hermes_cli/main_desktop.py                    |  75 ++++++++++
- .../hermes_cli/test_desktop_swap_relaunch.py  | 131 ++++++++++++++++++
- 3 files changed, 210 insertions(+)
- create mode 100644 tests/hermes_cli/test_desktop_swap_relaunch.py
-
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index 0d26efc903..cd580af266 100644
+index 18a820e97d28566ba8a3225d1b875e9249ea965b..d5bf4e7b35d7373b166176f8165251df4ff7eb11 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
-@@ -2675,6 +2675,10 @@ DEFAULT_CONFIG = {
+@@ -2665,6 +2665,10 @@ DEFAULT_CONFIG = {
              # not only the ones the user re-opens. Same freshness/attempt guards apply.
              "resume_on_startup": False,
          },
@@ -26,118 +20,9 @@ index 0d26efc903..cd580af266 100644
      },
  
      "nous": {
-diff --git a/hermes_cli/main_desktop.py b/hermes_cli/main_desktop.py
-index 2326a395b9..9d20d012e8 100644
---- a/hermes_cli/main_desktop.py
-+++ b/hermes_cli/main_desktop.py
-@@ -262,6 +262,7 @@ def _swap_staged_desktop_app(desktop_dir: Path, staging_dir: Path) -> Optional[P
-         shutil.rmtree(staging_dir, ignore_errors=True)
-         return None
-     release_dir = desktop_dir / "release"
-+    relaunch: list[list[str]] = []
-     try:
-         staged_root = _desktop_unpacked_root(staged_exe, staging_dir)
-         live_root = release_dir / staged_root.name
-@@ -275,9 +276,11 @@ def _swap_staged_desktop_app(desktop_dir: Path, staging_dir: Path) -> Optional[P
-             # wait for it — only the update hand-offs do). Either way a renderer alive
-             # past the rename below keeps fetching its old hashed chunks from disk and
-             # dies on the next lazy import, so stop it on every platform (#109643).
-+            launches = _desktop_main_launches(desktop_dir)
-             stopped = _stop_desktop_processes_locking_build(desktop_dir, also_posix=True)
-             if stopped:
-                 logger.info("stopped desktop processes before staged app promotion: %s", stopped)
-+                relaunch = [argv for pid, argv in launches.items() if pid in stopped]
-             _rename_riding_out_file_lock(live_root, previous)
-         try:
-             _rename_riding_out_file_lock(staged_root, live_root)
-@@ -289,12 +292,84 @@ def _swap_staged_desktop_app(desktop_dir: Path, staging_dir: Path) -> Optional[P
-             shutil.rmtree(previous, ignore_errors=True)
-     except (OSError, ValueError) as exc:
-         logger.warning("desktop stage-and-swap failed, live app kept: %s", exc)
-+        _relaunch_stopped_desktops(desktop_dir, relaunch)  # whatever is live now, the user had it open
-         return None
-     finally:
-         shutil.rmtree(staging_dir, ignore_errors=True)
-+    _relaunch_stopped_desktops(desktop_dir, relaunch)
-     return live_root / staged_exe.relative_to(staged_root)
- 
- 
-+def _desktop_main_launches(desktop_dir: Path) -> dict[int, list[str]]:
-+    """``{pid: argv[1:]}`` of desktop MAIN processes running from this build's ``release`` tree.
-+
-+    Electron helpers (renderer/GPU/utility/zygote) run the same exe but carry ``--type=``; only the
-+    main process is worth reopening. POSIX only; never raises."""
-+    if sys.platform == "win32":
-+        return {}
-+    try:
-+        import psutil
-+        release_dir = (desktop_dir / "release").resolve()
-+        procs = list(psutil.process_iter(["pid", "exe", "cmdline"]))
-+    except Exception:
-+        return {}
-+    launches: dict[int, list[str]] = {}
-+    for proc in procs:
-+        try:
-+            info = proc.info
-+            exe, cmdline = info.get("exe"), info.get("cmdline") or []
-+            if not exe or release_dir not in Path(exe).resolve().parents:
-+                continue
-+            if any(str(arg).startswith("--type=") for arg in cmdline[1:]):
-+                continue
-+            launches[int(info["pid"])] = [str(arg) for arg in cmdline[1:]]
-+        except Exception:
-+            continue
-+    return launches
-+
-+
-+def _desktop_relaunch_after_rebuild_enabled() -> bool:
-+    try:
-+        from hermes_cli.config import load_config
-+        desktop = (load_config() or {}).get("desktop") or {}
-+        return bool(isinstance(desktop, dict) and desktop.get("relaunch_after_rebuild"))
-+    except Exception:
-+        return False
-+
-+
-+def _relaunch_stopped_desktops(desktop_dir: Path, launches: list[list[str]]) -> list[list[str]]:
-+    """Reopen desktop apps the swap stopped (``desktop.relaunch_after_rebuild``). A headless update has
-+    no other party that will: the in-app Update hand-off already quit the app before we got here, so
-+    nothing is ever stopped (and reopened) twice. Detached; never raises. Returns the argv tails opened."""
-+    if not launches or sys.platform == "win32" or not _desktop_relaunch_after_rebuild_enabled():
-+        return []
-+    exe = _desktop_packaged_executable(desktop_dir)
-+    if exe is None:
-+        logger.warning("desktop app was stopped for the rebuild but no launchable app is left to reopen")
-+        return []
-+    opened: list[list[str]] = []
-+    seen: set[tuple[str, ...]] = set()
-+    for args in launches:
-+        if tuple(args) in seen:  # the single-instance lock would only focus a duplicate
-+            continue
-+        seen.add(tuple(args))
-+        if sys.platform == "darwin":
-+            bundle = exe.parents[2]  # Hermes.app/Contents/MacOS/Hermes
-+            cmd = ["/usr/bin/open", str(bundle)] + (["--args", *args] if args else [])
-+        else:
-+            cmd = [str(exe), *args]
-+        try:
-+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-+                             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
-+        except OSError as exc:
-+            logger.warning("could not reopen the desktop app after the rebuild: %s", exc)
-+            continue
-+        logger.info("reopened the desktop app stopped for the rebuild: %s", cmd)
-+        print(f"  ✓ Reopened the desktop app that was stopped for the rebuild ({bundle if sys.platform == 'darwin' else exe})")
-+        opened.append(args)
-+    return opened
-+
-+
- def _discard_desktop_staging(staging_dir: Path) -> None:
-     shutil.rmtree(staging_dir, ignore_errors=True)
- 
 diff --git a/tests/hermes_cli/test_desktop_swap_relaunch.py b/tests/hermes_cli/test_desktop_swap_relaunch.py
 new file mode 100644
-index 0000000000..f7b4f022cb
+index 0000000000000000000000000000000000000000..f7b4f022cb7e50815f27effd7c6cd70e88a1b1d1
 --- /dev/null
 +++ b/tests/hermes_cli/test_desktop_swap_relaunch.py
 @@ -0,0 +1,131 @@
@@ -273,5 +158,4 @@ index 0000000000..f7b4f022cb
 +
 +    assert main_desktop._desktop_main_launches(desktop_dir) == {1: [], 4: ["--some-flag"]}
 -- 
-2.54.0 (Apple Git-157)
-
+2.55.0

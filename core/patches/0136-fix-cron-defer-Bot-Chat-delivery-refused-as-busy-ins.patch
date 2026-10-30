@@ -17,96 +17,9 @@ key (queued receipt, not a delivery error). A drained replay refused the
 same way goes back to queued (busy_attempts counter, capped at
 MAX_BUSY_ATTEMPTS then ambiguous). Other failures stay final.
 ---
- cron/bot_chat_delivery.py              | 11 +++
- cron/scheduler_delivery.py             | 34 ++++++++++
- tests/cron/test_bot_chat_busy_defer.py | 94 ++++++++++++++++++++++++++
- 3 files changed, 139 insertions(+)
- create mode 100644 tests/cron/test_bot_chat_busy_defer.py
-
-diff --git a/cron/bot_chat_delivery.py b/cron/bot_chat_delivery.py
-index 1a53db5453..881a7c6fb1 100644
---- a/cron/bot_chat_delivery.py
-+++ b/cron/bot_chat_delivery.py
-@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
- _warned_unreadable: set[Path] = set()
- _running: set[Path] = set()
- _running_lock = threading.Lock()
-+# A replay refused because the Bot Chat is busy (SESSION_NOT_OWNED / MAX_CONCURRENT_SESSIONS) never
-+# ran, so it goes back to ``queued``; after this many consecutive busy drains (one per tick, so
-+# about two hours) it settles as ``ambiguous`` instead of spawning a refused child forever.
-+MAX_BUSY_ATTEMPTS = 120
- 
- 
- def _root() -> Path:
-@@ -134,6 +138,13 @@ def _drain(root: Path) -> None:
-             # The claim survives uncertainty; one failed attempt must not stop peers.
-             error = f"{type(exc).__name__}: {exc}"
-             logger.exception("Deferred Bot Chat delivery %s failed", record["id"])
-+        busy = job.pop("_bot_chat_busy_requeue", None)
-+        if busy and not job.get("_bot_chat_delivery_receipts"):
-+            attempts = int(record.get("busy_attempts") or 0) + 1
-+            record.update(busy_attempts=attempts, error=error,
-+                          status="queued" if attempts < MAX_BUSY_ATTEMPTS else "ambiguous")
-+            atomic_json_write(path, record, fsync_dir=True, mode=0o600)
-+            continue
-         receipt = job.get("_bot_chat_delivery_receipts", {}).get(
-             f"bot-chat:{record['profile'] or '(own)'}")
-         status = "transferred" if receipt else "ambiguous" if error else "settled"
-diff --git a/cron/scheduler_delivery.py b/cron/scheduler_delivery.py
-index 715f088cd4..9667ebadbf 100644
---- a/cron/scheduler_delivery.py
-+++ b/cron/scheduler_delivery.py
-@@ -722,6 +722,19 @@ _BOT_CHAT_STDERR_TAIL = 500
- # stdout is the model's answer; only a short tail is persisted (jobs.json / ledger).
- _BOT_CHAT_STDOUT_TAIL = 200
- _BOT_CHAT_BANNER_PREFIXES = ("Resumed session", "session_id:")
-+# Admission refusals meaning "another writer holds this Bot Chat right now — come back later"
-+# (hermes_cli.active_sessions). The CLI refuses before reading the query, so the turn never ran
-+# and the payload is deferred for replay instead of being recorded as a final failure.
-+_BOT_CHAT_BUSY_REASONS = frozenset({"SESSION_NOT_OWNED", "MAX_CONCURRENT_SESSIONS"})
-+_REFUSAL_PREFIX = "hermes-refusal-reason: "
-+
-+
-+def _bot_chat_refusal_reason(stderr) -> Optional[str]:
-+    """The machine-readable refusal code a ``-Q`` child printed (format_refusal_stderr), if any."""
-+    for line in (stderr or "").splitlines():
-+        if line.startswith(_REFUSAL_PREFIX):
-+            return line[len(_REFUSAL_PREFIX):].strip() or None
-+    return None
- 
- 
- def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) -> subprocess.CompletedProcess:
-@@ -938,6 +951,27 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
-         result = _run_bot_chat_turn(argv, env, report_file, timeout_s)
-         if result.returncode != 0:
-             tail = _format_failure_streams(result)
-+            reason = _bot_chat_refusal_reason(getattr(result, "stderr", None))
-+            if reason in _BOT_CHAT_BUSY_REASONS:
-+                # Another delivery child (or CLI session) holds the Bot Chat lease: the turn was
-+                # refused at admission and never ran, so defer under the same key — replayed
-+                # exactly once by the deferred lane when the session frees.
-+                target = f"bot-chat:{profile_label}"
-+                logger.info("Job '%s': Bot Chat %s busy (%s); deferring receipt=%s",
-+                            job_id, profile_label, reason, key)
-+                if deferred is not None:
-+                    # Replay refused again: tell the drain to put its claim back to queued.
-+                    job["_bot_chat_busy_requeue"] = reason
-+                    return f"{target} busy ({reason}) (receipt {key}): requeued; do not resend"
-+                from cron.bot_chat_delivery import defer
-+                pending = defer(key, dict(job), content, profile, home, for_failure=for_failure)
-+                status = pending["status"]
-+                job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
-+                    "status": status, "delivery_id": key}
-+                if status == "settled":
-+                    return None
-+                return (f"{target} {status} (receipt {key}): session busy ({reason}); "
-+                        "completion unverified; do not resend")
-             logger.warning(
-                 "Job '%s': bot-chat delivery to profile '%s' failed at %s: %s",
-                 job_id, profile_label, home, tail)
 diff --git a/tests/cron/test_bot_chat_busy_defer.py b/tests/cron/test_bot_chat_busy_defer.py
 new file mode 100644
-index 0000000000..193442db23
+index 0000000000000000000000000000000000000000..193442db2322c1393b6b89ad241c2b67eea0c90d
 --- /dev/null
 +++ b/tests/cron/test_bot_chat_busy_defer.py
 @@ -0,0 +1,94 @@
@@ -205,5 +118,5 @@ index 0000000000..193442db23
 +    record = queue.read_pending(key)
 +    assert record["status"] == "ambiguous" and "SESSION_NOT_OWNED" in record["error"]
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

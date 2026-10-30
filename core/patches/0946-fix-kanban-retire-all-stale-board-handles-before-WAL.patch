@@ -5,28 +5,11 @@ Subject: [PATCH] fix(kanban): retire all stale board handles before WAL reopen
  [daveey]
 
 ---
- agent/kanban_turn_recovery.py                 |   3 +-
- hermes_cli/backup_sqlite.py                   |   9 +-
- hermes_cli/kanban_generation.py               | 153 +++++++++++
- hermes_cli/kanban_lockguard.py                |   8 +
- hermes_cli/kanban_placement_forward.py        |   3 +-
- hermes_cli/kanban_session_activity.py         |  27 +-
- hermes_cli/kanban_worker_recovery.py          |   3 +-
- hermes_cli/kanban_worktree_gc.py              |   9 +-
- hermes_cli/sqlite_safe_read.py                |   4 +
- tests/agent/test_kanban_turn_recovery.py      |  21 ++
- .../test_kanban_auxiliary_lockguard.py        | 258 ++++++++++++++++++
- tests/hermes_cli/test_kanban_lockguard.py     |   2 +-
- .../hermes_cli/test_kanban_worker_recovery.py |  17 ++
- 13 files changed, 492 insertions(+), 25 deletions(-)
- create mode 100644 hermes_cli/kanban_generation.py
- create mode 100644 tests/hermes_cli/test_kanban_auxiliary_lockguard.py
-
 diff --git a/agent/kanban_turn_recovery.py b/agent/kanban_turn_recovery.py
-index 93263e875e..2247c10a52 100644
+index eecea3149168f6f7a1a56b580d5fd05633138a7b..58acda4777ca347ae64fc924294c32506fa08b51 100644
 --- a/agent/kanban_turn_recovery.py
 +++ b/agent/kanban_turn_recovery.py
-@@ -220,7 +220,8 @@ def worker_claim_is_live() -> bool:
+@@ -240,7 +240,8 @@ def worker_claim_is_live(
          return False
      now = _now()
      try:
@@ -36,29 +19,9 @@ index 93263e875e..2247c10a52 100644
          try:
              conn.row_factory = sqlite3.Row
              row = conn.execute(
-diff --git a/hermes_cli/backup_sqlite.py b/hermes_cli/backup_sqlite.py
-index f0c2d2f1ad..b87da725d7 100644
---- a/hermes_cli/backup_sqlite.py
-+++ b/hermes_cli/backup_sqlite.py
-@@ -52,7 +52,14 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
-                 os.close(secure_fd)
-         # timeout=0.0 disables sqlite3's implicit busy wait so the progress callback owns the
-         # full locked-source deadline instead of adding the default timeout before each callback.
--        conn = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
-+        # Imported backups run inside the gateway/CLI alongside live board readers.
-+        # The standalone pre-stop script is already isolated from the backend's locks.
-+        try:
-+            from hermes_cli.kanban_lockguard import connect as source_connect
-+        except ImportError:
-+            # The pre-stop emergency script must also work with only the stdlib available.
-+            source_connect = sqlite3.connect
-+        conn = source_connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
-         backup_conn = sqlite3.connect(str(dst))
-         busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
- 
 diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
 new file mode 100644
-index 0000000000..b9e5e472da
+index 0000000000000000000000000000000000000000..b9e5e472dad2c9f716e4646b2604a9f4f4cdc24f
 --- /dev/null
 +++ b/hermes_cli/kanban_generation.py
 @@ -0,0 +1,153 @@
@@ -216,7 +179,7 @@ index 0000000000..b9e5e472da
 +    with _lock:
 +        _poisoned.discard(path)
 diff --git a/hermes_cli/kanban_lockguard.py b/hermes_cli/kanban_lockguard.py
-index 5b91a09bc4..3f3108d177 100644
+index 5b91a09bc4e650127b4bc631a4f0091f04b11f1b..3f3108d1772e0dab50d290f97d50dc831909c382 100644
 --- a/hermes_cli/kanban_lockguard.py
 +++ b/hermes_cli/kanban_lockguard.py
 @@ -66,6 +66,8 @@ class _GuardMixin:
@@ -252,7 +215,7 @@ index 5b91a09bc4..3f3108d177 100644
  
  
 diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
-index 0ba05f0d9e..abb2e067ad 100644
+index 0ba05f0d9e7aeba6ca504a805e32bf961fdaf55d..abb2e067add4f4262f41a1ceb588fc777c338f11 100644
 --- a/hermes_cli/kanban_placement_forward.py
 +++ b/hermes_cli/kanban_placement_forward.py
 @@ -86,7 +86,8 @@ def forward_argv(task, board: Optional[str], worker_cmd: list) -> Optional[list]
@@ -266,10 +229,10 @@ index 0ba05f0d9e..abb2e067ad 100644
              st = state(conn, task.id)
          finally:
 diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
-index 1be2e48dff..b2502fc8c5 100644
+index b40e9152872500d464315e0149435b079ee97bf5..1edeadc1c8ff918fce8368a9fcda0b4af1b71edb 100644
 --- a/hermes_cli/kanban_session_activity.py
 +++ b/hermes_cli/kanban_session_activity.py
-@@ -478,17 +478,7 @@ def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[s
+@@ -477,17 +477,7 @@ def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[s
      return found, fresh
  
  
@@ -288,7 +251,7 @@ index 1be2e48dff..b2502fc8c5 100644
  
  
  # Linked-card reads run on every sidebar refresh across ~16 boards and replicas; a fresh connection pays schema
-@@ -496,7 +486,11 @@ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+@@ -495,7 +485,11 @@ def _open_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
  # so keep one read-only connection per file, shared across the threadpool (one per thread would hold ~3 fds per
  # board per worker). An idle autocommit reader holds no snapshot, so it never blocks writers or checkpoints.
  _RO_CACHE: dict[str, tuple[sqlite3.Connection, tuple[int, int], threading.Lock, tuple[int, int] | None]] = {}
@@ -301,7 +264,7 @@ index 1be2e48dff..b2502fc8c5 100644
  
  
  @contextlib.contextmanager
-@@ -505,6 +499,7 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
+@@ -504,6 +498,7 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
      replaced (new inode: a rebuilt replica), after any sqlite error, or when its ``-shm`` generation is gone (the
      connection is stranded on a deleted WAL index and would fail with ``disk I/O error`` or read stale rows until
      restart; kanban-759104eb56). Raises ``sqlite3.OperationalError`` when the file is missing, like ``_open_ro``."""
@@ -309,7 +272,7 @@ index 1be2e48dff..b2502fc8c5 100644
      key = str(path)
      try:
          st = os.stat(path)
-@@ -517,10 +512,6 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
+@@ -516,10 +511,6 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
          if entry is not None and entry[1] != ident:
              stale = _RO_CACHE.pop(key)[0]
              entry = None
@@ -320,7 +283,7 @@ index 1be2e48dff..b2502fc8c5 100644
          if stale is not None:
              # Close BEFORE reopening: a new connection in this process would otherwise share SQLite's
              # per-inode WAL-index mapping with the stranded one and inherit its dead -shm.
-@@ -532,6 +523,10 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
+@@ -531,6 +522,10 @@ def cached_ro(path: Path) -> Iterator[sqlite3.Connection]:
              _RO_CACHE[key] = entry
      conn, _ident, lock, _shm = entry
      with lock:  # bodies read every result they start: an unfinished cursor would pin a WAL snapshot
@@ -332,7 +295,7 @@ index 1be2e48dff..b2502fc8c5 100644
          try:
              yield conn
 diff --git a/hermes_cli/kanban_worker_recovery.py b/hermes_cli/kanban_worker_recovery.py
-index 671f059058..78644abf00 100644
+index 671f05905846334579f26434a47a64df5dfc299d..78644abf00cd574334ac0894b0487666edef7b32 100644
 --- a/hermes_cli/kanban_worker_recovery.py
 +++ b/hermes_cli/kanban_worker_recovery.py
 @@ -60,7 +60,8 @@ def register_worker_session(session_db, session_id: str) -> bool:
@@ -346,7 +309,7 @@ index 671f059058..78644abf00 100644
              row = conn.execute(
                  "SELECT t.status, t.current_run_id, t.claim_lock, t.claim_expires, "
 diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
-index 33e318be04..94e2ec5eaa 100644
+index 33e318be04c063033a6f47221152d46f398397fe..94e2ec5eaa789994a555bc0b56aa1467234afab2 100644
 --- a/hermes_cli/kanban_worktree_gc.py
 +++ b/hermes_cli/kanban_worktree_gc.py
 @@ -16,6 +16,7 @@ import time
@@ -388,7 +351,7 @@ index 33e318be04..94e2ec5eaa 100644
              conn.row_factory = sqlite3.Row
              gc_task_worktrees(conn, older_than_days=days, repo_root=repo_root)
 diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
-index 30dd88a8e2..6892d09181 100644
+index 30dd88a8e285fad3bd6bc9d8f0b34369f7a62997..6892d091812bc7d2724d465b6fc40b3847fc3f9b 100644
 --- a/hermes_cli/sqlite_safe_read.py
 +++ b/hermes_cli/sqlite_safe_read.py
 @@ -235,6 +235,10 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
@@ -403,10 +366,10 @@ index 30dd88a8e2..6892d09181 100644
                  return handle.read(length)
          except OSError:
 diff --git a/tests/agent/test_kanban_turn_recovery.py b/tests/agent/test_kanban_turn_recovery.py
-index 522a133cc4..adf691a777 100644
+index c38b8e2edc8f825f4deceed69e2fc45a127f908b..025e9804191d4a2dacb7e150fed9f5276bc55ffb 100644
 --- a/tests/agent/test_kanban_turn_recovery.py
 +++ b/tests/agent/test_kanban_turn_recovery.py
-@@ -242,6 +242,27 @@ def test_claim_ownership_matrix(clear_kanban_env, tmp_path, overrides):
+@@ -234,6 +234,27 @@ def test_claim_ownership_matrix(clear_kanban_env, tmp_path, overrides):
      assert worker_claim_is_live() is (overrides == {})
  
  
@@ -436,7 +399,7 @@ index 522a133cc4..adf691a777 100644
      clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_live")
 diff --git a/tests/hermes_cli/test_kanban_auxiliary_lockguard.py b/tests/hermes_cli/test_kanban_auxiliary_lockguard.py
 new file mode 100644
-index 0000000000..f98767f07d
+index 0000000000000000000000000000000000000000..f98767f07d53753c933d5af2b65455ce8404c17a
 --- /dev/null
 +++ b/tests/hermes_cli/test_kanban_auxiliary_lockguard.py
 @@ -0,0 +1,258 @@
@@ -699,7 +662,7 @@ index 0000000000..f98767f07d
 +        assert not kanban_lockguard.stranded_sidecars(board)
 +        assert reader.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
 diff --git a/tests/hermes_cli/test_kanban_lockguard.py b/tests/hermes_cli/test_kanban_lockguard.py
-index 37b39c1ae8..718f64e854 100644
+index 37b39c1ae8ce5c2936c0ead4e3f51bf0594bcc06..718f64e8540ec444942ac07b71f6495d718fc117 100644
 --- a/tests/hermes_cli/test_kanban_lockguard.py
 +++ b/tests/hermes_cli/test_kanban_lockguard.py
 @@ -232,7 +232,7 @@ def test_kanban_modules_open_boards_only_through_the_guard():
@@ -712,7 +675,7 @@ index 37b39c1ae8..718f64e854 100644
          # connects only inside its own short-lived child (`python -m hermes_cli.kanban_db_recover`);
          # in-process callers (kanban_ops, the dispatcher) reach it only through spawn_recovery()
 diff --git a/tests/hermes_cli/test_kanban_worker_recovery.py b/tests/hermes_cli/test_kanban_worker_recovery.py
-index b4c734b048..cd93f1d48d 100644
+index b4c734b048f0d599d43848971962eabf0751a01f..cd93f1d48d50d2d5021bbd18cee405f3b56c0b22 100644
 --- a/tests/hermes_cli/test_kanban_worker_recovery.py
 +++ b/tests/hermes_cli/test_kanban_worker_recovery.py
 @@ -67,6 +67,23 @@ def test_crash_and_budget_continuation_survives_reopen(worker, outcome):

@@ -20,28 +20,9 @@ Subject: [PATCH] fix(agent): withhold rejected final output until final
 
 Co-authored-by: daveey <daveey@users.noreply.github.com>
 ---
- agent/final_gate_fallback.py                  |  40 ++++
- agent/pre_final_gate.py                       | 128 ++++++++---
- agent/turn_final_response.py                  |  37 +++-
- agent/turn_finalizer.py                       |  26 ++-
- agent/turn_stop_gates.py                      |  75 +++++--
- .../agent/test_final_gate_budget_contract.py  |  26 +++
- tests/agent/test_final_gate_composition.py    |  68 ++++++
- .../test_final_gate_unresolved_composition.py |  75 +++++++
- tests/agent/test_final_transform_buffer.py    |  65 ++++++
- tests/agent/test_pre_final_gate.py            | 202 ++++++++++++++++++
- .../test_pre_final_gate_assessor_order.py     |   9 +-
- website/docs/user-guide/features/hooks.md     |  19 ++
- 12 files changed, 706 insertions(+), 64 deletions(-)
- create mode 100644 agent/final_gate_fallback.py
- create mode 100644 tests/agent/test_final_gate_budget_contract.py
- create mode 100644 tests/agent/test_final_gate_composition.py
- create mode 100644 tests/agent/test_final_gate_unresolved_composition.py
- create mode 100644 tests/agent/test_final_transform_buffer.py
-
 diff --git a/agent/final_gate_fallback.py b/agent/final_gate_fallback.py
 new file mode 100644
-index 0000000000..180ae6f81e
+index 0000000000000000000000000000000000000000..180ae6f81e00d09dd341b4f3d27a0d02b03c9f2b
 --- /dev/null
 +++ b/agent/final_gate_fallback.py
 @@ -0,0 +1,40 @@
@@ -86,7 +67,7 @@ index 0000000000..180ae6f81e
 +        agent._discard_final_gate_buffer()
 +        agent._final_gate_buffer = None
 diff --git a/agent/pre_final_gate.py b/agent/pre_final_gate.py
-index ce07d57f61..cdb1031c88 100644
+index ce07d57f61a5c5c1e02a0f4bfcf72370fedde121..cdb1031c88e35b571ac6a3915611ff10df1ed5b2 100644
 --- a/agent/pre_final_gate.py
 +++ b/agent/pre_final_gate.py
 @@ -10,6 +10,12 @@ a candidate; unbuffered legacy gates run after verification and the kanban guard
@@ -285,278 +266,9 @@ index ce07d57f61..cdb1031c88 100644
      decision.append = "\n\n".join(appends)
      return decision
  
-diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
-index ec0fe4c8b8..d0ae8fb429 100644
---- a/agent/turn_final_response.py
-+++ b/agent/turn_final_response.py
-@@ -329,11 +329,13 @@ def finish_text_response(
-     ):
-         messages.pop()
- 
-+    _held = (final_response, "".join(getattr(agent, "_final_gate_buffer", None) or []))
-     _sg = apply_stop_gates(
-         agent, final_msg, final_response=final_response, messages=messages,
-         conversation_history=conversation_history,
-         pending_verification_response=_pending_verification_response,
-         pending_verification_response_previewed=_pending_verification_response_previewed,
-+        defer_stream=True,
-     )
-     _pending_verification_response = _sg.pending_verification_response
-     _pending_verification_response_previewed = _sg.pending_verification_response_previewed
-@@ -353,10 +355,8 @@ def finish_text_response(
-             agent, final_response, turn_id=getattr(agent, "_current_turn_id", "") or "", logger=logger,
-         )
-     if _transformed:
--        if _promoted:
--            final_msg["api_content"] = final_response
--        else:
--            final_msg["content"] = final_response
-+        final_msg["api_content" if _promoted else "content"] = final_response
-+    _release_deferred_stream(agent, _sg, final_response, *_held)
- 
-     append_message(messages, final_msg)
-     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
-@@ -375,3 +375,32 @@ def finish_text_response(
-     if not agent.quiet_mode:
-         agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
-     return _verdict("break")
-+
-+
-+def _release_deferred_stream(agent, verdict, response, candidate, buffered):
-+    """Release only the reconciled reply, preserving streaming egress rules.
-+
-+    A buffered candidate is private until output transforms reconcile it too: releasing in
-+    the stop gate leaks a retired ask even when the durable reply is replaced by a transform.
-+    """
-+    if not verdict.stream_deferred:
-+        return
-+    from agent.memory_manager import StreamingContextScrubber
-+    from agent.think_scrubber import StreamingThinkScrubber
-+
-+    agent._discard_final_gate_buffer()
-+    if getattr(agent, "_interrupt_requested", False):
-+        return
-+    if response == candidate:
-+        # Keep original sanitization and paragraph breaks, including when an
-+        # equal gate replacement already cleared the mutable buffer.
-+        text = buffered
-+    else:
-+        # Replacements need fresh scrubbers, not the exhausted original state.
-+        think, context = StreamingThinkScrubber(), StreamingContextScrubber()
-+        text = think.feed(response) + think.flush()
-+        text = context.feed(text) + context.flush()
-+        prefix = "\n\n" if buffered.startswith("\n\n") else ""
-+        text = prefix + text.lstrip("\n") if text else ""
-+    if text:
-+        agent._deliver_stream_text(text)
-diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
-index c0acbcbaa9..c38011b76e 100644
---- a/agent/turn_finalizer.py
-+++ b/agent/turn_finalizer.py
-@@ -139,6 +139,12 @@ def _resolve_budget_fallback(
-         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
-     ):
-         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
-+        from agent.pre_final_gate import eligible_callbacks, needs_buffer, turn_messages
-+        _gate_budget_output = bool(eligible_callbacks(agent))
-+        _budget_context = turn_messages(messages)
-+        _budget_start = len(messages)
-+        if needs_buffer(agent):
-+            agent._final_gate_buffer = []
-         if _pending_verification_response:
-             # A verification gate withheld a composed answer, then the budget ran out:
-             # preserve it rather than make another fallible call. The explicit pending
-@@ -179,6 +185,16 @@ def _resolve_budget_fallback(
-                 _turn_exit_reason = interrupted_during_api_call_reason(agent)
-                 final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
- 
-+        from agent.pre_final_gate import UnresolvedFallback
-+        if _gate_budget_output and not isinstance(_pending_verification_response, UnresolvedFallback):
-+            from agent.final_gate_fallback import validate_budget_response
-+            # The summary helper adds an unflagged user nudge. Keep the real
-+            # turn context for validation, not that internal summary instruction.
-+            _budget_context.extend(row for row in messages[_budget_start:] if row.get("role") == "assistant")
-+            final_response, replaced = validate_budget_response(agent, final_response, _budget_context)
-+            if replaced:
-+                preserved_verification_fallback = False
-+
-     # A kanban worker must record a terminal outcome whether or not a fallback path
-     # was eligible, so the dispatcher learns the worker could not complete. Only the
-     # dispatcher-owned worker owns the task: an in-process delegate_task child or cron run
-@@ -551,13 +567,12 @@ def _prepare_final_gate_fallback(
-         if isinstance(final_response, str) and final_response and final_response not in held_text:
-             boundary_response += "\n\n" + final_response
-         final_response = boundary_response
-+    # Accepted text was flushed by the stop/tool gates. Remaining deltas were
-+    # never validated (including error/interrupt exits), so cannot be released.
-     try:
--        if unresolved:
--            agent._discard_final_gate_buffer()
--        else:
--            agent._flush_final_gate_buffer()
-+        agent._discard_final_gate_buffer()
-     except Exception:
--        logger.debug("pre_final_gate buffer flush failed", exc_info=True)
-+        logger.debug("pre_final_gate buffer discard failed", exc_info=True)
-     agent._final_gate_buffer = None
-     return final_response, unresolved
- 
-@@ -578,6 +593,7 @@ def finalize_turn(
- ):
-     """Run the post-loop finalization and return the turn ``result`` dict."""
-     from agent.conversation_loop import logger
-+
-     final_response, unresolved = _prepare_final_gate_fallback(
-         agent, final_response, _pending_verification_response, interrupted=interrupted, failed=failed,
-         exit_reason=_turn_exit_reason, api_call_count=api_call_count, messages=messages, logger=logger,
-diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
-index 7ce4d46f98..3628d05b6e 100644
---- a/agent/turn_stop_gates.py
-+++ b/agent/turn_stop_gates.py
-@@ -34,6 +34,7 @@ class StopGateVerdict:
-     pending_verification_response: Any
-     pending_verification_response_previewed: Any
-     boundary: str = ""
-+    stream_deferred: bool = False
- 
-     def exit_reason(self, finish_reason: Any) -> str:
-         if self.boundary:
-@@ -102,8 +103,18 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
- 
- 
- def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
--    """Real content: persist and emit as interim so the user sees the attempted answer;
--    only the nudge is flagged synthetic (#65919)."""
-+    """Keep buffered candidates private until final output transformation.
-+
-+    Unbuffered legacy responses still emit and persist as verification interims.
-+    """
-+    if getattr(agent, "_final_gate_buffer", None) is not None:
-+        # Output transforms have not reconciled this candidate yet. Retain it
-+        # only as ephemeral model context, exactly like a held gate candidate.
-+        # The budget fallback still traverses final output transformation.
-+        agent._discard_final_gate_buffer()
-+        final_msg[_PFG_FLAG] = True
-+        append_message(messages, final_msg)
-+        return
-     agent._emit_interim_assistant_message(final_msg)
-     append_message(messages, final_msg)
-     try:
-@@ -116,6 +127,7 @@ def apply_stop_gates(
-     agent: Any, final_msg: dict[str, Any], *, final_response: Any, messages: list[dict[str, Any]],
-     conversation_history: Any, pending_verification_response: Any,
-     pending_verification_response_previewed: Any,
-+    defer_stream: bool = False,
- ) -> StopGateVerdict:
-     """Check buffered candidates before verify-on-stop → pre_verify → kanban. Nudges
-     are user-role rows appended only after the assistant answer row, so role alternation
-@@ -154,11 +166,20 @@ def apply_stop_gates(
-     _decision = _pre_final_gate_decision(agent, final_response, messages, pending_verification_response)
-     if _decision.recheck_accepted:
-         pending_verification_response = None
-+    if _decision.replacement is not None:
-+        agent._discard_final_gate_buffer()
-+        final_response = _decision.replacement
-+        final_msg.clear()
-+        final_msg.update(role="assistant", content=final_response)
-+        pending_verification_response = None
-+        pending_verification_response_previewed = False
-     if _decision.hold or (
-         _decision.unresolved_fallback is not None and getattr(agent, "_interrupt_requested", False)
-     ):
-         # Silent hold [daveey]: no interim emit, no flush, buffered deltas dropped. The candidate
-         # survives only as the budget-exhaustion fallback; both rows are ephemeral scaffolding.
-+        # hold=True is bounded: every hold increments _pre_final_gate_attempts, which
-+        # max_attempts() caps, so a plugin cannot hold a turn indefinitely.
-         agent._pre_final_gate_attempts = getattr(agent, "_pre_final_gate_attempts", 0) + 1
-         agent._discard_final_gate_buffer()
-         final_msg["finish_reason"] = "pre_final_gate_hold"
-@@ -173,8 +194,8 @@ def apply_stop_gates(
-     if _decision.unresolved_fallback is not None:
-         agent._discard_final_gate_buffer()
-         final_response = _decision.unresolved_fallback.render(_decision.boundary)
--        final_msg["content"] = final_response
--        final_msg.pop("api_content", None)
-+        final_msg.clear()
-+        final_msg.update(role="assistant", content=final_response)
-         return StopGateVerdict(False, final_response, None, False, _decision.boundary)
-     if early_gate:
-         # Acceptance clears the old rejection before another gate can nudge.
-@@ -184,9 +205,14 @@ def apply_stop_gates(
-                                           conversation_history, _continue)
-         if verdict is not None:
-             return verdict
--    if _decision.append:
--        final_response = _append_to_final(agent, final_msg, final_response, _decision.append)
--    else:
-+    stream_deferred = defer_stream and getattr(agent, "_final_gate_buffer", None) is not None
-+    if _decision.replacement is not None and not stream_deferred:
-+        agent._deliver_stream_text(final_response)
-+    elif _decision.append:
-+        final_response = _append_to_final(
-+            agent, final_msg, final_response, _decision.append, deliver=not stream_deferred,
-+        )
-+    elif not stream_deferred:
-         agent._flush_final_gate_buffer()
-     return StopGateVerdict(
-         continue_turn=False, final_response=final_response,
-@@ -195,6 +221,7 @@ def apply_stop_gates(
-             else pending_verification_response
-         ),
-         pending_verification_response_previewed=pending_verification_response_previewed,
-+        stream_deferred=stream_deferred,
-     )
- 
- 
-@@ -251,16 +278,23 @@ _PFG_FLAG = "_pre_final_gate_synthetic"
- def _pre_final_gate_decision(agent, final_response, messages, pending=None):
-     from agent.pre_final_gate import GateDecision, _unavailable, evaluate
- 
--    if getattr(agent, "_interrupt_requested", False):
--        return GateDecision()
--    try:
--        return evaluate(agent, final_response, messages, getattr(agent, "_pre_final_gate_attempts", 0), pending)
--    except Exception:
--        logger.warning("pre_final_gate evaluation failed", exc_info=True)
--        return _unavailable(pending)
--
--
--def _append_to_final(agent, final_msg, final_response: str, extra: str) -> str:
-+    decision = GateDecision()
-+    if not getattr(agent, "_interrupt_requested", False):
-+        try:
-+            decision = evaluate(agent, final_response, messages, getattr(agent, "_pre_final_gate_attempts", 0), pending)
-+        except Exception:
-+            logger.warning("pre_final_gate evaluation failed", exc_info=True)
-+            decision = _unavailable(pending)
-+    # Check after callback completion too: cancellation can arrive during a slow
-+    # callback or its failure path. Unvalidated buffered text must not escape.
-+    if (getattr(agent, "_interrupt_requested", False)
-+            and getattr(agent, "_final_gate_buffer", None) is not None):
-+        return GateDecision(hold=True, nudge="Turn interrupted.",
-+                            replacement="Response interrupted before validation.")
-+    return decision
-+
-+
-+def _append_to_final(agent, final_msg, final_response: str, extra: str, *, deliver: bool = True) -> str:
-     """Deliver with ``extra`` appended: rewrite the row, release the buffer, stream the suffix so
-     streamed text and the final answer still match."""
-     suffix = "\n\n" + extra
-@@ -268,7 +302,8 @@ def _append_to_final(agent, final_msg, final_response: str, extra: str) -> str:
-     key = "api_content" if final_msg.get("api_content") and not final_msg.get("content") else "content"
-     if isinstance(final_msg.get(key), str):
-         final_msg[key] = final_msg[key].rstrip() + suffix
--    agent._flush_final_gate_buffer()
--    if getattr(agent, "_streamed_assistant_text_parts", None):  # only extend a live stream
--        agent._deliver_stream_text(suffix)
-+    if deliver:
-+        agent._flush_final_gate_buffer()
-+        if getattr(agent, "_streamed_assistant_text_parts", None):  # only extend a live stream
-+            agent._deliver_stream_text(suffix)
-     return final_response
 diff --git a/tests/agent/test_final_gate_budget_contract.py b/tests/agent/test_final_gate_budget_contract.py
 new file mode 100644
-index 0000000000..ab56fb57a1
+index 0000000000000000000000000000000000000000..ab56fb57a1f92b8360e04a4955662bee451ee8e8
 --- /dev/null
 +++ b/tests/agent/test_final_gate_budget_contract.py
 @@ -0,0 +1,26 @@
@@ -588,7 +300,7 @@ index 0000000000..ab56fb57a1
 +    assert decision.replacement == "Checked."
 diff --git a/tests/agent/test_final_gate_composition.py b/tests/agent/test_final_gate_composition.py
 new file mode 100644
-index 0000000000..df26879459
+index 0000000000000000000000000000000000000000..df2687945952c278aa7be85855b2c139a8022e5d
 --- /dev/null
 +++ b/tests/agent/test_final_gate_composition.py
 @@ -0,0 +1,68 @@
@@ -662,7 +374,7 @@ index 0000000000..df26879459
 +    assert result.replacement == "Request suppressed."
 diff --git a/tests/agent/test_final_gate_unresolved_composition.py b/tests/agent/test_final_gate_unresolved_composition.py
 new file mode 100644
-index 0000000000..1d6e3cd12e
+index 0000000000000000000000000000000000000000..1d6e3cd12e933192ebfaeb1b1e19931ef9069fc5
 --- /dev/null
 +++ b/tests/agent/test_final_gate_unresolved_composition.py
 @@ -0,0 +1,75 @@
@@ -743,7 +455,7 @@ index 0000000000..1d6e3cd12e
 +    assert agent._final_gate_buffer is None
 diff --git a/tests/agent/test_final_transform_buffer.py b/tests/agent/test_final_transform_buffer.py
 new file mode 100644
-index 0000000000..60fccc0474
+index 0000000000000000000000000000000000000000..60fccc04748079cc1d5ee4cd7a925691da1caf57
 --- /dev/null
 +++ b/tests/agent/test_final_transform_buffer.py
 @@ -0,0 +1,65 @@
@@ -813,7 +525,7 @@ index 0000000000..60fccc0474
 +    _run(agent, _buffered(lambda **kw: None))
 +    assert run.shown == "\n\nFinal answer."
 diff --git a/tests/agent/test_pre_final_gate.py b/tests/agent/test_pre_final_gate.py
-index ead170ca14..4ed634e3ce 100644
+index ead170ca145770214402825c46430d57dfedde1a..4ed634e3ced4ab0dabec75aefb67b655ba9fea78 100644
 --- a/tests/agent/test_pre_final_gate.py
 +++ b/tests/agent/test_pre_final_gate.py
 @@ -105,6 +105,208 @@ def test_hold_once_never_shows_or_persists_first_answer(agent):
@@ -1026,7 +738,7 @@ index ead170ca14..4ed634e3ce 100644
  def test_unresolved_hold_at_budget_never_releases_diagnosis(agent, streaming):
      agent.max_iterations = 1
 diff --git a/tests/agent/test_pre_final_gate_assessor_order.py b/tests/agent/test_pre_final_gate_assessor_order.py
-index 71af13d4c9..745670e81d 100644
+index 71af13d4c9b3e928b1507ff6dac4917ad0896653..745670e81dfd2b14799af22fb693531b43a33cbc 100644
 --- a/tests/agent/test_pre_final_gate_assessor_order.py
 +++ b/tests/agent/test_pre_final_gate_assessor_order.py
 @@ -27,7 +27,10 @@ def test_initial_assessor_runs_before_ordinary_hold(reverse):
@@ -1055,10 +767,10 @@ index 71af13d4c9..745670e81d 100644
 +    assert calls == ["ordinary", "assessor"]
      assert result.unresolved_fallback is pending
 diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
-index 1472deb461..2d4d4bc182 100644
+index 88f664cacfe49f99d24b6cc50056ebbf5f4ec8e3..23c9e4f7d704e869499341278e7a0547f2e0356d 100644
 --- a/website/docs/user-guide/features/hooks.md
 +++ b/website/docs/user-guide/features/hooks.md
-@@ -903,6 +903,25 @@ def my_gate(session_id: str, platform: str, model: str, final_response: str,
+@@ -906,6 +906,25 @@ def my_gate(session_id: str, platform: str, model: str, final_response: str,
  - `None` — deliver unchanged.
  - `{"hold": True, "nudge": "..."}` — withhold the answer and continue the turn. The nudge goes to the model as a private synthetic user message. The held answer is kept only as the fallback if the iteration budget runs out.
  - `{"append": "..."}` — deliver with `"\n\n" + text` appended.

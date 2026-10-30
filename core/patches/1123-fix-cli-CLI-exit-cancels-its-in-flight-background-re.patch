@@ -1,0 +1,300 @@
+From 6b890a10bbcd2f1db14c613e917f940ed64be921 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:52:22 +0000
+Subject: [PATCH] fix(cli): CLI exit cancels its in-flight background review;
+ one-shots never fork one [daveey]
+
+On 2026-10-29 20:16 PDT (MacBook, core cb1aa70f, session 20261029_201245_dfaf9b), a post-turn
+review fork's first API call returned after CLI cleanup had run. Its skill_view call then failed
+with "cannot schedule new futures after interpreter shutdown". The review runs on a daemon
+bg-review thread. TUI session finalize cancels it (#102895) and serve retirement fences it, but the
+classic CLI exit path did neither, so the process exited underneath a review that was still
+dispatching tools. On hermes-hub, 142 of 142 platform=cli review forks between 10-29 23:01 and
+10-30 03:40 UTC never completed. Each one only cost a full-history request.
+
+- cli_shutdown._cancel_background_review_on_exit: the CLI session end owns the review. It runs
+  the same bounded cancel the TUI uses, first in _run_cleanup (before resource teardown) and in
+  _finalize_single_query (before memory shutdown).
+- Single-query CLI agents (-q, kanban workers) and hermes -z are built with
+  skip_background_review=True (cron precedent). The process exits right after the turn, so the
+  review could never finish. Interactive CLI reviews are unchanged.
+
+Test: tests/hermes_cli/test_cli_exit_cancels_background_review.py. A subprocess runs the real
+_run_cleanup plus interpreter shutdown with a review in flight. Before the fix it fails with
+TOOL_REFUSED "cannot schedule new futures after interpreter shutdown"; after the fix the review
+is cancelled and dispatches no tool. Also tests that -q/-z pass skip_background_review and that
+interactive mode keeps it.
+---
+ cli.py                                        |   3 +
+ hermes_cli/cli_agent_setup_mixin.py           |   3 +
+ hermes_cli/cli_shutdown.py                    |  20 ++-
+ hermes_cli/oneshot.py                         |   2 +
+ ...test_cli_exit_cancels_background_review.py | 169 ++++++++++++++++++
+ 5 files changed, 196 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_cli_exit_cancels_background_review.py
+
+diff --git a/cli.py b/cli.py
+index 698af35663d..30ad2147d04 100644
+--- a/cli.py
++++ b/cli.py
+@@ -51,6 +51,7 @@ from hermes_cli.cli_tui_runtime_mixin import CLITuiRuntimeMixin
+ from hermes_cli.cli_shutdown import (
+     _CLEANUP_STEPS,
+     _arm_exit_watchdog,
++    _cancel_background_review_on_exit,
+     _emit_interrupted_session_end,
+     _exit_watchdog_timeout,
+     _finalize_single_query,
+@@ -516,6 +517,8 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
+         # step raising must not skip the reset. No-op unless the TUI ran.
+         # See #36823.
+         _reset_terminal_input_modes_on_exit()
++        # The session's review fork ends before the resources it may still be using are torn down.
++        _cancel_background_review_on_exit()
+ 
+         for step, swallow in _CLEANUP_STEPS:
+             with suppress(swallow):
+diff --git a/hermes_cli/cli_agent_setup_mixin.py b/hermes_cli/cli_agent_setup_mixin.py
+index 76a7cd39ce7..df0a7b5f614 100644
+--- a/hermes_cli/cli_agent_setup_mixin.py
++++ b/hermes_cli/cli_agent_setup_mixin.py
+@@ -732,6 +732,9 @@ class CLIAgentSetupMixin:
+                 provider_data_collection=self._provider_data_collection,
+                 openrouter_min_coding_score=self._openrouter_min_coding_score,
+                 session_id=self.session_id, platform="cli", session_db=self._session_db,
++                # A single-query process exits right after its turn, so a post-turn review fork
++                # could never finish; it would only cost a full-history request (cron precedent).
++                skip_background_review=single_query_mode,
+                 clarify_callback=clarify_callback, connection_callback=connection_callback,
+                 reasoning_callback=self._current_reasoning_callback(),
+                 fallback_model=self._fallback_model, thinking_callback=self._on_thinking,
+diff --git a/hermes_cli/cli_shutdown.py b/hermes_cli/cli_shutdown.py
+index 74d45bc5bfc..02816b6977f 100644
+--- a/hermes_cli/cli_shutdown.py
++++ b/hermes_cli/cli_shutdown.py
+@@ -124,6 +124,23 @@ def _shutdown_agent_memory_provider(agent) -> None:
+         agent.shutdown_memory_provider()
+ 
+ 
++def _cancel_background_review_on_exit() -> None:
++    """The CLI session ends with the process, so its in-flight background review ends first.
++
++    The review fork runs on a daemon thread that nothing else on the CLI exit path owns. Left alone
++    it outlives teardown and dispatches tools into an exiting interpreter ("cannot schedule new
++    futures after interpreter shutdown"). Same cancel the TUI's session finalize uses (#102895):
++    bounded ack, then teardown proceeds. Never raises.
++    """
++    agent = _cli()._active_agent_ref
++    if agent is None:
++        return
++    with suppress(Exception):
++        from agent.background_review import cancel_background_review_for_live_turn
++        cancel_background_review_for_live_turn(
++            agent, message="session ended (cli exit)", tool_reason="session ended")
++
++
+ def _stop_cli_wake_word() -> None:
+     from tools.wake_word import stop_listening
+     if _cli()._cli_wake_owner is not None:
+@@ -343,8 +360,9 @@ def _finalize_single_query(cli) -> None:
+     process's stale ``cli_close`` end-stamp, because phase 1 has already run it.
+     """
+     import cli as cli_module
+-    from cli import _flush_one_shot_session_store, _notify_single_query_session_finalize, _run_cleanup, _shutdown_agent_memory_provider, _wait_for_oneshot_background_completions
++    from cli import _cancel_background_review_on_exit, _flush_one_shot_session_store, _notify_single_query_session_finalize, _run_cleanup, _shutdown_agent_memory_provider, _wait_for_oneshot_background_completions
+     try:
++        _cancel_background_review_on_exit()  # before memory shutdown: the review writes memory
+         try:
+             _flush_one_shot_session_store(cli)
+         except Exception:
+diff --git a/hermes_cli/oneshot.py b/hermes_cli/oneshot.py
+index 957a4d2553f..4e50d24960f 100644
+--- a/hermes_cli/oneshot.py
++++ b/hermes_cli/oneshot.py
+@@ -618,6 +618,8 @@ def _run_agent(
+             # HERMES_INTERACTIVE (never set), hook approval via HERMES_ACCEPT_HOOKS=1, dangerous
+             # commands via HERMES_YOLO_MODE=1, skill secret capture degrades gracefully.
+             clarify_callback=_oneshot_clarify_callback,
++            # The process exits right after this turn: a post-turn review fork could never finish.
++            skip_background_review=True,
+         )
+         # Belt-and-braces: no streaming display callbacks may bypass our stdout capture.
+         agent.suppress_status_output = True
+diff --git a/tests/hermes_cli/test_cli_exit_cancels_background_review.py b/tests/hermes_cli/test_cli_exit_cancels_background_review.py
+new file mode 100644
+index 00000000000..8d470361216
+--- /dev/null
++++ b/tests/hermes_cli/test_cli_exit_cancels_background_review.py
+@@ -0,0 +1,169 @@
++"""The classic CLI owns its post-turn background review: exit cancels it, one-shots never fork it.
++
++Observed 2026-10-29 20:16 PDT (session 20261029_201245_dfaf9b, core cb1aa70f): the foreground turn
++answered, the review fork spawned, CLI cleanup ran memory shutdown, then the review's first API call
++returned and its ``skill_view`` call failed with ``cannot schedule new futures after interpreter
++shutdown``. The review is a daemon ``bg-review`` thread. The TUI cancels it at session finalize
++(#102895) and serve fences it during retirement, but the CLI exit path did neither, so the process
++exited underneath a review that was still dispatching tools. On hermes-hub, 142 of 142 CLI review
++forks in one 4.6 h window never completed.
++"""
++
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import textwrap
++import types
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[2]
++
++# A parent agent with a live review fork, an in-flight "API call" that returns after the CLI has
++# exited, and then the fork's first tool dispatch through a real pool, which is where the
++# reported failure happened. An atexit handler keeps finalization running past the API return, the
++# way the real CLI's MCP and terminal teardown did (4.4 s on the MacBook).
++_SCRIPT = textwrap.dedent(
++    """
++    import atexit, concurrent.futures, sys, threading, time
++    sys.path.insert(0, {repo!r})
++    import cli
++    from agent.background_review import finish_background_review_run, prepare_background_review_run
++
++    class Fork:
++        def __init__(self):
++            self.interrupted = threading.Event()
++        def hard_interrupt(self, message=None, tool_reason=None):
++            print("FORK_INTERRUPTED", tool_reason, "|", message, flush=True)
++            self.interrupted.set()
++
++    class Parent:
++        session_id = "s-review-exit"
++        _session_messages = []
++        def shutdown_memory_provider(self, *_a):
++            pass
++
++    parent, fork = Parent(), Fork()
++    parent._background_review_lock = threading.Lock()
++    run = prepare_background_review_run(parent)
++    started = threading.Event()
++
++    def review():
++        try:
++            assert run.begin_request(fork)
++            started.set()
++            if fork.interrupted.wait(1.0):  # the in-flight API call; returns after main exits
++                print("REVIEW_STOPPED_BEFORE_TOOLS", flush=True)
++                return
++            try:
++                with concurrent.futures.ThreadPoolExecutor(1) as pool:
++                    pool.submit(lambda: None).result()
++                print("TOOL_DISPATCHED", flush=True)
++            except RuntimeError as exc:
++                print("TOOL_REFUSED", exc, flush=True)
++        finally:
++            finish_background_review_run(parent, run)
++
++    atexit.register(time.sleep, 2.5)
++    threading.Thread(target=review, daemon=True, name="bg-review").start()
++    started.wait(5)
++    cli._active_agent_ref = parent
++    for step, _exc in cli._CLEANUP_STEPS:  # resource teardown is not under test here
++        setattr(cli, step, lambda: None)
++    cli._run_cleanup(notify_session_finalize=False)
++    print("CLI_EXITED", flush=True)
++    """
++)
++
++
++def test_cli_exit_cancels_in_flight_review_before_it_dispatches_a_tool(tmp_path):
++    env = {**os.environ, "HERMES_HOME": str(tmp_path), "HERMES_EXIT_WATCHDOG_S": "0"}
++    env.pop("PYTEST_CURRENT_TEST", None)
++    proc = subprocess.run(
++        [sys.executable, "-c", _SCRIPT.format(repo=str(REPO))],
++        capture_output=True, text=True, timeout=120, check=False, env=env, cwd=str(tmp_path),
++    )
++    out = proc.stdout + proc.stderr
++    assert "CLI_EXITED" in proc.stdout, out
++    assert "TOOL_REFUSED" not in out, out
++    assert "TOOL_DISPATCHED" not in out, out
++    assert "REVIEW_STOPPED_BEFORE_TOOLS" in proc.stdout, out
++    assert "FORK_INTERRUPTED session ended | session ended (cli exit)" in proc.stdout, out
++    # The cancel ran before teardown: the fork was interrupted before the CLI reported exit.
++    assert proc.stdout.index("FORK_INTERRUPTED") < proc.stdout.index("CLI_EXITED"), out
++
++
++def test_cli_exit_without_a_review_is_a_no_op(monkeypatch):
++    import cli as cli_mod
++
++    parent = types.SimpleNamespace(session_id="s", _session_messages=[], shutdown_memory_provider=lambda *_a: None)
++    monkeypatch.setattr(cli_mod, "_active_agent_ref", parent)
++    cli_mod._cancel_background_review_on_exit()  # no review attributes at all: must not raise
++    monkeypatch.setattr(cli_mod, "_active_agent_ref", None)
++    cli_mod._cancel_background_review_on_exit()
++
++
++def _cli_capturing_agent_kwargs(monkeypatch, *, single_query: bool):
++    import cli as cli_mod
++    import run_agent
++    from hermes_cli import mcp_startup
++
++    cli = cli_mod.HermesCLI(compact=True)
++    cli._session_db = object()
++    cli._resumed = False
++    cli.conversation_history = []
++    cli._install_tool_callbacks = lambda: None
++    cli._ensure_runtime_credentials = lambda: True
++    if single_query:
++        cli._single_query_mode = True
++    monkeypatch.setattr(mcp_startup, "ensure_mcp_discovery_before_agent_build", lambda **_kw: None)
++    captured = {}
++
++    def _fake_agent(*_a, **kw):
++        captured.update(kw)
++        return types.SimpleNamespace()
++
++    monkeypatch.setattr(run_agent, "AIAgent", _fake_agent)
++    assert cli._init_agent() is True
++    return captured
++
++
++def test_single_query_cli_agent_skips_background_review(monkeypatch):
++    assert _cli_capturing_agent_kwargs(monkeypatch, single_query=True).get("skip_background_review") is True
++
++
++def test_interactive_cli_agent_keeps_background_review(monkeypatch):
++    assert not _cli_capturing_agent_kwargs(monkeypatch, single_query=False).get("skip_background_review")
++
++
++def test_oneshot_z_agent_skips_background_review(monkeypatch):
++    import hermes_cli.oneshot as oneshot_mod
++
++    captured = {}
++
++    class _FakeAgent:
++        def __init__(self, **kwargs):
++            captured.update(kwargs)
++
++        def __setattr__(self, name, _value):
++            pass
++
++        def run_conversation(self, _prompt, conversation_history=None):
++            return {"final_response": "pong", "session_id": "s"}
++
++        def close(self):
++            pass
++
++    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: None)
++    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": {"default": "m", "provider": "custom"}})
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kw: {
++        "api_key": "k", "base_url": "https://x.example/v1", "provider": "custom", "api_mode": "chat_completions",
++        "credential_pool": None})
++    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda _cfg, _p: [])
++    monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **_kw: None)
++    monkeypatch.setattr("run_agent.AIAgent", _FakeAgent)
++
++    oneshot_mod._run_agent("say OK")
++
++    assert captured.get("skip_background_review") is True
+-- 
+2.55.0
+

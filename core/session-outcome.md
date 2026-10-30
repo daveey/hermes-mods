@@ -2,16 +2,16 @@
 
 Patches:
 
-- `patches/0993-feat-sessions-stored-chat-outcome-server-side-mute-t.patch`
-- `patches/0994-fix-sessions-outcome-refresh-off-the-messaging-reply.patch`
-- `patches/0995-feat-sessions-outcome-refresh-on-notices-and-card-mo.patch`
-- `patches/0996-feat-desktop-paint-the-sidebar-from-the-stored-sessi.patch`
-- `patches/0997-feat-desktop-push-old-local-B-parks-to-the-backend-o.patch`
-- `patches/0998-fix-desktop-unmute-clears-the-stale-muted-outcome-bo.patch`
-- `patches/0999-refactor-desktop-bring-session-outcome-under-the-cod.patch`
-- `patches/1003-fix-sessions-CLI-and-web-outcome-refresh-load-plugin.patch`
-- `patches/1034-fix-tui-reach-split-module-helpers-through-server-so.patch`
-- `patches/1036-fix-sessions-notice-guarantee-judges-remote-notices-.patch`
+- `patches/1005-feat-sessions-stored-chat-outcome-server-side-mute-t.patch`
+- `patches/1006-fix-sessions-outcome-refresh-off-the-messaging-reply.patch`
+- `patches/1007-feat-sessions-outcome-refresh-on-notices-and-card-mo.patch`
+- `patches/1008-feat-desktop-paint-the-sidebar-from-the-stored-sessi.patch`
+- `patches/1009-feat-desktop-push-old-local-B-parks-to-the-backend-o.patch`
+- `patches/1010-fix-desktop-unmute-clears-the-stale-muted-outcome-bo.patch`
+- `patches/1011-refactor-desktop-bring-session-outcome-under-the-cod.patch`
+- `patches/1015-fix-sessions-CLI-and-web-outcome-refresh-load-plugin.patch`
+- `patches/1077-fix-tui-reach-split-module-helpers-through-server-so.patch`
+- `patches/1079-fix-sessions-notice-guarantee-judges-remote-notices-.patch`
 
 Every chat needs one shared answer to "is this done, waiting on me, or stuck?" instead of each surface re-deriving it from the transcript. This series stores that answer on the session row and paints the Desktop sidebar from it.
 
@@ -27,7 +27,7 @@ Every chat needs one shared answer to "is this done, waiting on me, or stuck?" i
 
 ## How it works
 
-`hermes_state_outcome.py` derives, stores and refreshes; the gateway, TUI gateway, reaper and notice paths call the refresh. `tui_gateway/notice_guarantee.py`, `notice_fanout.py` and `reap_notices.py` implement the wake and fan-out filter. Desktop code moves the stripe into `sidebar/session-row-stripe.tsx`, outcome types into `types/session-outcome.ts` and copy into `i18n/en_session_row_status.ts` (0999, no behavior change).
+`hermes_state_outcome.py` derives, stores and refreshes; the gateway, TUI gateway, reaper and notice paths call the refresh. `tui_gateway/notice_guarantee.py`, `notice_fanout.py` and `reap_notices.py` implement the wake and fan-out filter. Desktop code moves the stripe into `sidebar/session-row-stripe.tsx`, outcome types into `types/session-outcome.ts` and copy into `i18n/en_session_row_status.ts` (1011, no behavior change).
 
 ## Code
 
@@ -49,7 +49,7 @@ Older backends lack `muted`/`outcome`; the Desktop keeps the local park list as 
 
 The user-steps plugin supplies the decision provider; a judge plugin is optional.
 
-## Follow-up patches (1034, 1036)
+## Follow-up patches (1077, 1079)
 
-- **1034** (`7ae59acf25c`): `turn_outcome.py` imported `_session_db` straight from `session_workdir`, but split `tui_gateway` modules are written against `server.py`'s globals (`bind_module` rebinds them there), so the raw copy raised `NameError: _get_db` on every Desktop/TUI turn end and the stored outcome never refreshed (the old test hid it by stubbing the module's `_get_db`). `turn_outcome`, `kanban_unloaded`, `notice_guarantee`, `kanban_remote_notices` and `methods_bot_relay` now reach split helpers through `server`; the same bug had `session_notifications._readopt_wake_profiles` return only the launch store, so the unloaded sweep and the notice guarantee never searched named profiles' stores. Tests: `tests/tui_gateway/test_split_module_imports.py` (3; an AST guard failing on any direct import of a `bind_module` split module's function from another tui_gateway module), `test_turn_outcome_refresh.py` (3, adds `test_refresh_uses_server_bound_session_db`), busy/wake tests now patch server's helpers.
-- **1036** (`0a2eb8797bf`, notice guarantee for remote notices; extends the guarantee from 0995): a notice about a card on another gateway stores the OWNER's board name plus `gateway=<owner>`, and `blocked_on_human` opened that board locally. `kanban_db_connect` refused ("kanban board bb does not exist"), `guarantee_pass` logged and moved on without marking the row, and the same notice was retried every pass (349 warnings in one window) while the chat never got a close-out. Now: both remote-notice writers (sweep metadata, collect items) record `blocked_on_human` from the replicated task (`remote_blocked_on_human`: status / block_kind / human_request) and the open-chat poller copies it onto its persisted row; `notice_guarantee.blocked_on_human` returns that stored flag for a notice with a foreign `gateway` or only `remote:` event keys and never opens a local board; a local notice whose board is gone reads as not blocked; a candidate whose handling raises is stamped `closeout.state = "error"` once (compare-and-swap, `_give_up`) and its outcome refreshed (`unresolved{notice_tail}`) for the auditor instead of being retried forever. Tests: `tests/tui_gateway/test_notice_guarantee.py` (9: remote flag and no local board, only-remote-keys poller row, missing board still closes out, stamped error once), `tests/tui_gateway/test_kanban_remote_notices.py` (22, covers the stored flag). Tests were added or changed by these commits; they were not re-run for this mirror.
+- **1077** (`7ae59acf25c`): `turn_outcome.py` imported `_session_db` straight from `session_workdir`, but split `tui_gateway` modules are written against `server.py`'s globals (`bind_module` rebinds them there), so the raw copy raised `NameError: _get_db` on every Desktop/TUI turn end and the stored outcome never refreshed (the old test hid it by stubbing the module's `_get_db`). `turn_outcome`, `kanban_unloaded`, `notice_guarantee`, `kanban_remote_notices` and `methods_bot_relay` now reach split helpers through `server`; the same bug had `session_notifications._readopt_wake_profiles` return only the launch store, so the unloaded sweep and the notice guarantee never searched named profiles' stores. Tests: `tests/tui_gateway/test_split_module_imports.py` (3; an AST guard failing on any direct import of a `bind_module` split module's function from another tui_gateway module), `test_turn_outcome_refresh.py` (3, adds `test_refresh_uses_server_bound_session_db`), busy/wake tests now patch server's helpers.
+- **1079** (`0a2eb8797bf`, notice guarantee for remote notices; extends the guarantee from 1007): a notice about a card on another gateway stores the OWNER's board name plus `gateway=<owner>`, and `blocked_on_human` opened that board locally. `kanban_db_connect` refused ("kanban board bb does not exist"), `guarantee_pass` logged and moved on without marking the row, and the same notice was retried every pass (349 warnings in one window) while the chat never got a close-out. Now: both remote-notice writers (sweep metadata, collect items) record `blocked_on_human` from the replicated task (`remote_blocked_on_human`: status / block_kind / human_request) and the open-chat poller copies it onto its persisted row; `notice_guarantee.blocked_on_human` returns that stored flag for a notice with a foreign `gateway` or only `remote:` event keys and never opens a local board; a local notice whose board is gone reads as not blocked; a candidate whose handling raises is stamped `closeout.state = "error"` once (compare-and-swap, `_give_up`) and its outcome refreshed (`unresolved{notice_tail}`) for the auditor instead of being retried forever. Tests: `tests/tui_gateway/test_notice_guarantee.py` (9: remote flag and no local board, only-remote-keys poller row, missing board still closes out, stamped error once), `tests/tui_gateway/test_kanban_remote_notices.py` (22, covers the stored flag). Tests were added or changed by these commits; they were not re-run for this mirror.

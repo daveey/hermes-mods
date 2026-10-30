@@ -1,0 +1,131 @@
+From 6742069b71800ffaf3e8a9b375981c885bf85e90 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:14:50 +0000
+Subject: [PATCH] test(tui_gateway): port upstream notification-refusal tests
+ onto the fork's owner-refusal backoff
+
+The rebound-namespace test now binds the fork's refusal/hold helpers and _run_admitted_prompt (the
+NameError was the isolated namespace, not product code). The backoff test keeps upstream's doubling
+requeue wait but expects the fork's one notice per refusal streak, advances the clock past the
+owner-refusal hold between retries, and lets the owner go before the accepted dispatch. [daveey]
+---
+ .../test_notification_admission_refusal.py    | 19 ++++++++++++-
+ .../test_notification_refusal_backoff.py      | 28 +++++++++++++++----
+ 2 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/tests/tui_gateway/test_notification_admission_refusal.py b/tests/tui_gateway/test_notification_admission_refusal.py
+index af72a6dca53..0a3c21e42cd 100644
+--- a/tests/tui_gateway/test_notification_admission_refusal.py
++++ b/tests/tui_gateway/test_notification_admission_refusal.py
+@@ -22,7 +22,9 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
+         'type': 'completion', 'session_id': 'owned-process', 'session_key': 'owned'}
+     session = {'history_lock': threading.RLock(), '_closing': True, 'running': True}
+     emitted = []
+-    namespace = dict(time=time, logger=logging.getLogger(__name__),
++    # Fork: with the requeue backoff bound below, the ten refusals would sleep ~30 s of real time.
++    fake_time = SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=lambda _s: None)
++    namespace = dict(time=fake_time, logger=logging.getLogger(__name__),
+         _emit=lambda *args: emitted.append(args),
+         _session_turn_admission=_session_turn_admission,
+         _ensure_active_session_slot=lambda *args: None,
+@@ -35,6 +37,21 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
+     # Also bind the retry helper when present; old code must fail on the receipt, not an absent test import.
+     if hasattr(session_notifications, '_notif_defer_event'):
+         namespace['_notif_defer_event'] = rebind(session_notifications._notif_defer_event, namespace)
++    # Fork: the fork's owner-refusal backoff (_notif_owner_refused / _notif_owner_preflight) and per-session
++    # hold (_notif_hold_for) sit on the same claim/submit/requeue path; bind them into the isolated namespace
++    # too, else the rebound dispatcher dies on a NameError instead of exercising the refusal.
++    for name in ('_notif_run_submit', '_notif_owner_refused', '_notif_owner_preflight', '_notif_note_owner_refusal',
++                 '_notif_refusal_backoff', '_notif_hold_for', '_notif_retry_completions',
++                 '_notification_event_requires_owner'):
++        if hasattr(session_notifications, name):
++            namespace[name] = rebind(getattr(session_notifications, name), namespace)
++    for name in ('_OWNER_REFUSAL_CODES', '_NOTIF_REFUSAL_BACKOFF_S', '_NOTIF_REFUSAL_BACKOFF_MAX_S',
++                 '_notif_held_lock'):
++        if hasattr(session_notifications, name):
++            namespace[name] = getattr(session_notifications, name)
++    # Fork: _run_prompt_submit stages the turn, then runs it through _run_admitted_prompt.
++    if hasattr(prompt_turn, '_run_admitted_prompt'):
++        namespace['_run_admitted_prompt'] = rebind(prompt_turn._run_admitted_prompt, namespace)
+     # The dispatcher binds the session's DB row before admission; this session has no store.
+     namespace['_ensure_session_db_row'] = lambda _session: True
+     original_queue = process_registry.completion_queue
+diff --git a/tests/tui_gateway/test_notification_refusal_backoff.py b/tests/tui_gateway/test_notification_refusal_backoff.py
+index 39bd252bcf8..5a887448ef1 100644
+--- a/tests/tui_gateway/test_notification_refusal_backoff.py
++++ b/tests/tui_gateway/test_notification_refusal_backoff.py
+@@ -1,6 +1,7 @@
+ """Refused producer turns must not hot-loop against the canonical ledger (#140385)."""
+ 
+ import contextlib
++import itertools
+ import queue
+ import threading
+ from types import SimpleNamespace
+@@ -26,8 +27,15 @@ def test_canonical_busy_notification_backs_off_without_consuming_work(monkeypatc
+         emitted = []
+         monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+         waits = []
+-        monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1))
+-        session = {"history_lock": threading.RLock(), "session_key": key, "running": False}
++        # Fork: the fork's owner-refusal backoff (_notif_owner_refused, 30 s doubling) reads time.monotonic()
++        # and holds every automatic claim until it elapses. A clock that jumps past it between calls makes
++        # each dispatch below a real retry against the still-busy owner, which is what this test measures.
++        clock = itertools.count(step=10_000)
++        monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1,
++                                                            monotonic=lambda: next(clock)))
++        # Fork: the fork's ownership refusal re-attaches the staged submit row to warm history, so the
++        # session carries the history list every live session has.
++        session = {"history_lock": threading.RLock(), "history": [], "session_key": key, "running": False}
+         registry = SimpleNamespace(completion_queue=queue.Queue())
+         monkeypatch.setattr("tools.process_registry.process_registry", registry)
+         monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda *a: "")
+@@ -48,7 +56,11 @@ def test_canonical_busy_notification_backs_off_without_consuming_work(monkeypatc
+         assert session["running"] is False
+         assert db.get_messages_as_conversation(key) == []
+         assert waits and waits[0] > 0, "refused notification must yield before its caller requeues it"
+-        assert not emitted, "a retained notification must not paint a failed user turn"
++        # Fork: the first ownership refusal of a streak shows ONE notice naming where the chat is open
++        # (test_notification_owner_refusal_backoff); it must not be a failed user turn bubble.
++        assert len(emitted) == 1, emitted
++        assert "open in another Hermes window or device" in emitted[0][2]["text"]
++        emitted.clear()
+         assert registry.completion_queue.get_nowait() is event
+         assert not completed
+ 
+@@ -56,16 +68,22 @@ def test_canonical_busy_notification_backs_off_without_consuming_work(monkeypatc
+         for _ in range(8):
+             dispatch()
+             assert registry.completion_queue.get_nowait() is event
++        assert not emitted, "retries inside a refusal streak stay silent"
++        assert not completed
+         assert waits == [0.25, 0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0], waits
+         assert waits[-1] == server._NOTIF_REFUSAL_BACKOFF_MAX_S
+ 
+         # Human submissions still report ownership refusals.
+         assert server._run_prompt_submit("human", "ui", session, "hello") is False
+-        assert emitted[0][0] == "error"
++        # Fork: the refusal is a terminal turn error (message.complete carrying error_surface), not "error".
++        assert emitted and emitted[0][2]["error_surface"]["code"] == "SESSION_NOT_OWNED", emitted
+ 
+         # A later accepted notification settles once and never takes the refusal delay.
+         waits.clear()
+         monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: True)
++        # Fork: inside a refusal streak the poller probes ownership first (_notif_owner_preflight);
++        # "accepted" means the other owner let go, so that probe now passes too.
++        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: None)
+         dispatch()
+         assert len(completed) == 1
+         assert registry.completion_queue.empty()
+@@ -77,7 +95,7 @@ def test_a_refusal_that_is_not_requeued_does_not_delay_the_poller(monkeypatch):
+     """Kanban and /loop callers keep their notice themselves; the poller thread must not sleep for them
+     (it also drives the kanban and loop polls)."""
+     waits = []
+-    monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1))
++    monkeypatch.setattr(server, "time", SimpleNamespace(sleep=waits.append, time=lambda: 1, monotonic=lambda: 1))
+     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: False)
+     session = {"history_lock": threading.RLock(), "running": True}
+     assert server._notif_submit("r", "ui", session, "tick", "loop wakeup send failed") is False
+-- 
+2.55.0
+

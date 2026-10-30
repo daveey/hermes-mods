@@ -1,0 +1,199 @@
+From 61335886fdf2a88a3041fce9e02682b52d71fa1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 23:16:14 +0000
+Subject: [PATCH] perf(status): cache parsed large YAML on disk by content and
+ stop re-parsing config.yaml per /api/status (cold first-burst status 2.7-3.1s
+ -> 0.6s)
+
+---
+diff --git a/hermes_yaml.py b/hermes_yaml.py
+index 4cd43d3cbda1f22974c29fc59dbabef50455f892..5e91e4f0d13d759d1f4d1e5ada8b5790b2801278 100644
+--- a/hermes_yaml.py
++++ b/hermes_yaml.py
+@@ -4,7 +4,11 @@ Ruamel's native schema includes bare y/n booleans and rejects duplicate keys.
+ Every operation owns its parser/emitter; instances must not be shared by threads.
+ """
+ 
++import hashlib
++import marshal
++import os
+ from io import StringIO
++from pathlib import Path
+ from typing import Any, IO, overload
+ 
+ from ruamel.yaml import YAML
+@@ -25,6 +29,55 @@ def _load(document: str | bytes, *, pure: bool) -> Any:
+     return yaml.load(document)
+ 
+ 
++# Parsed-document cache. The pure-Python parser costs ~0.07 s per 120 KB config and ~0.4 s for the
++# largest bundled locale; a freshly started backend parses every profile's config plus every locale
++# while serving its first requests, so those parses compete with them for the GIL. Large documents are
++# therefore kept on disk, keyed by the sha256 of their exact bytes (+ parser version), so a restart
++# re-reads instead of re-parsing. ``marshal`` only round-trips plain str/int/float/bool/None/list/dict
++# and loads without executing code; a document with anything else (timestamps, ...) is not cached.
++_CACHE_MIN_BYTES = 16 * 1024
++_CACHE_MAX_ENTRIES = 256
++_CACHE_TAG = "hy1"
++
++
++def _cache_dir() -> Path | None:
++    try:
++        from hermes_constants import get_default_hermes_root
++
++        return get_default_hermes_root() / "cache" / "yaml-parse"
++    except (ImportError, OSError):
++        return None
++
++
++def _cache_key(document: bytes) -> str:
++    import ruamel.yaml
++
++    h = hashlib.sha256(f"{_CACHE_TAG}|{ruamel.yaml.__version__}|".encode())
++    h.update(document)
++    return h.hexdigest()
++
++
++def _cache_read(path: Path) -> tuple[bool, Any]:
++    try:
++        return True, marshal.loads(path.read_bytes())
++    except (OSError, ValueError, EOFError, TypeError):
++        return False, None
++
++
++def _cache_write(directory: Path, path: Path, value: Any) -> None:
++    try:
++        blob = marshal.dumps(value)
++        directory.mkdir(parents=True, exist_ok=True)
++        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
++        tmp.write_bytes(blob)
++        os.replace(tmp, path)
++        entries = sorted(directory.glob("*.bin"), key=lambda p: p.stat().st_mtime)
++        for old in entries[: max(0, len(entries) - _CACHE_MAX_ENTRIES)]:
++            old.unlink(missing_ok=True)
++    except (OSError, ValueError):
++        pass
++
++
+ def safe_load(stream: str | bytes | IO[str] | IO[bytes]) -> Any:
+     """Read standard YAML data; existing configs use YAML 1.1 booleans.
+ 
+@@ -32,10 +85,20 @@ def safe_load(stream: str | bytes | IO[str] | IO[bytes]) -> Any:
+     documents the pure parser accepts (``[{url: http://h}]``), so a C rejection is re-read pure.
+     """
+     document = stream if isinstance(stream, (str, bytes)) else stream.read()
++    raw = document.encode("utf-8") if isinstance(document, str) else document
++    directory = _cache_dir() if len(raw) >= _CACHE_MIN_BYTES else None
++    path = directory / f"{_cache_key(raw)}.bin" if directory is not None else None
++    if path is not None:
++        hit, value = _cache_read(path)
++        if hit:
++            return value
+     try:
+-        return _load(document, pure=False)
++        value = _load(document, pure=False)
+     except YAMLError:
+-        return _load(document, pure=True)
++        value = _load(document, pure=True)
++    if path is not None:
++        _cache_write(directory, path, value)
++    return value
+ 
+ 
+ @overload
+diff --git a/tests/gateway/test_config_loader_no_reparse.py b/tests/gateway/test_config_loader_no_reparse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce3709d114b369eb4c05bc79182e15573f6e8dfc
+--- /dev/null
++++ b/tests/gateway/test_config_loader_no_reparse.py
+@@ -0,0 +1,23 @@
++"""GET /api/status loads the gateway config every request; an unchanged config.yaml must not re-parse."""
++import hermes_yaml
++import utils
++from gateway import config_loader
++
++
++def test_read_yaml_layers_parses_unchanged_config_once(tmp_path, monkeypatch):
++    monkeypatch.setattr(hermes_yaml, "_cache_dir", lambda: tmp_path / "cache")
++    (tmp_path / "config.yaml").write_text("# pad\n" * 4000 + "gateway:\n  platforms: {}\nx: yes\n", encoding="utf-8")
++    parses = []
++    real = hermes_yaml._load
++    monkeypatch.setattr(hermes_yaml, "_load", lambda *a, **k: parses.append(1) or real(*a, **k))
++    utils._YAML_FILE_CACHE.clear()
++
++    first = config_loader.read_yaml_layers(tmp_path)
++    first["x"] = "caller mutation"  # the shared cached object must not leak caller edits
++    second = config_loader.read_yaml_layers(tmp_path)
++    assert len(parses) == 1
++    assert second["x"] is True
++
++    (tmp_path / "config.yaml").write_text("# pad\n" * 4000 + "x: no\n", encoding="utf-8")
++    assert config_loader.read_yaml_layers(tmp_path)["x"] is False
++    assert len(parses) == 2
+diff --git a/tests/test_hermes_yaml.py b/tests/test_hermes_yaml.py
+index 1233df9cbb18a8ee61cf0c080e557792dd477c7d..4f325881fc73c698ec2913da1f892da94c292bbc 100644
+--- a/tests/test_hermes_yaml.py
++++ b/tests/test_hermes_yaml.py
+@@ -105,3 +105,59 @@ def test_parallel_calls_do_not_share_parser_or_emitter_state():
+     with pytest.raises(yaml.YAMLError):
+         yaml.safe_dump(object())
+     assert yaml.safe_load(yaml.safe_dump({"healthy": True})) == {"healthy": True}
++
++
++class TestParsedDocumentDiskCache:
++    """Large documents are cached on disk by content; semantics must not change."""
++
++    @staticmethod
++    def _big(extra: str = "") -> str:
++        return "# pad\n" * 4000 + "flag: yes\nname: x\n" + extra
++
++    def test_second_load_skips_the_parser_and_matches(self, tmp_path, monkeypatch):
++        monkeypatch.setattr(yaml, "_cache_dir", lambda: tmp_path)
++        doc = self._big()
++        first = yaml.safe_load(doc)
++        assert first == {"flag": True, "name": "x"}  # YAML 1.1 boolean
++        assert len(list(tmp_path.glob("*.bin"))) == 1
++
++        def boom(*_a, **_k):
++            raise AssertionError("parser ran on a cache hit")
++
++        monkeypatch.setattr(yaml, "_load", boom)
++        second = yaml.safe_load(doc)
++        assert second == first and second is not first
++        second["name"] = "mutated"
++        assert yaml.safe_load(doc)["name"] == "x"
++
++    def test_changed_content_misses(self, tmp_path, monkeypatch):
++        monkeypatch.setattr(yaml, "_cache_dir", lambda: tmp_path)
++        assert yaml.safe_load(self._big())["name"] == "x"
++        assert yaml.safe_load(self._big("other: 1\n"))["other"] == 1
++
++    def test_duplicate_keys_still_rejected_and_not_cached(self, tmp_path, monkeypatch):
++        monkeypatch.setattr(yaml, "_cache_dir", lambda: tmp_path)
++        doc = self._big("name: y\n")
++        for _ in range(2):
++            with pytest.raises(Exception):
++                yaml.safe_load(doc)
++        assert not list(tmp_path.glob("*.bin"))
++
++    def test_non_marshalable_values_are_not_cached(self, tmp_path, monkeypatch):
++        monkeypatch.setattr(yaml, "_cache_dir", lambda: tmp_path)
++        out = yaml.safe_load(self._big("when: 2026-10-29\n"))
++        assert str(out["when"]) == "2026-10-29"
++        assert not list(tmp_path.glob("*.bin"))
++
++    def test_corrupt_entry_falls_back_to_parse(self, tmp_path, monkeypatch):
++        monkeypatch.setattr(yaml, "_cache_dir", lambda: tmp_path)
++        doc = self._big()
++        yaml.safe_load(doc)
++        for f in tmp_path.glob("*.bin"):
++            f.write_bytes(b"\x00garbage")
++        assert yaml.safe_load(doc)["name"] == "x"
++
++    def test_small_documents_bypass_the_cache(self, tmp_path, monkeypatch):
++        monkeypatch.setattr(yaml, "_cache_dir", lambda: tmp_path)
++        assert yaml.safe_load("a: 1\n") == {"a": 1}
++        assert not list(tmp_path.glob("*.bin"))
+-- 
+2.55.0
+

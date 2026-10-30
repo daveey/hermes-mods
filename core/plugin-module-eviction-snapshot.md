@@ -2,13 +2,13 @@
 
 Patches:
 
-- `patches/1046-fix-plugins-evict-plugin-modules-from-a-sys.modules-.patch`
+- `patches/1089-fix-plugins-evict-plugin-modules-from-a-sys.modules-.patch`
 
 A concurrent import no longer drops a random plugin at load.
 
 ## Behavior
 
-- 1046: `_evict_modules` and the same pattern in `plugin_host_child`, `_launchers` and `plugin_dev` iterate a snapshot of `sys.modules`, so another thread importing no longer raises `dictionary changed size during iteration` and leaves the plugin unregistered.
+- 1089: `_evict_modules` and the same pattern in `plugin_host_child`, `_launchers` and `plugin_dev` iterate a snapshot of `sys.modules`, so another thread importing no longer raises `dictionary changed size during iteration` and leaves the plugin unregistered.
 
 ## How it works
 

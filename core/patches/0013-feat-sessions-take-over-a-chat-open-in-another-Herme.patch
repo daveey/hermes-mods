@@ -28,255 +28,11 @@ moved: every submit was refused SESSION_NOT_OWNED until that process let go.
   turn, pending clarify), RPC (ack / timeout / already_owner / fail closed),
   and a two-process end-to-end.
 ---
- apps/shared/src/gateway-contract.generated.ts |  37 ++-
- apps/shared/src/gateway-contract.openrpc.json | 106 +++++-
- hermes_cli/active_sessions.py                 | 135 ++++++++
- .../test_active_session_takeover.py           | 209 ++++++++++++
- tests/tui_gateway/test_session_takeover.py    | 308 ++++++++++++++++++
- .../tui_gateway/test_session_takeover_e2e.py  | 161 +++++++++
- tui_gateway/contracts/events.py               |   7 +-
- tui_gateway/contracts/sessions.py             |  22 ++
- tui_gateway/methods_session_interrupt.py      |   2 +
- tui_gateway/methods_session_takeover.py       | 222 +++++++++++++
- tui_gateway/server.py                         |   2 +-
- 11 files changed, 1197 insertions(+), 14 deletions(-)
- create mode 100644 tests/hermes_cli/test_active_session_takeover.py
- create mode 100644 tests/tui_gateway/test_session_takeover.py
- create mode 100644 tests/tui_gateway/test_session_takeover_e2e.py
- create mode 100644 tui_gateway/methods_session_takeover.py
-
-diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
-index 6c49e4eb96..e306df9f57 100644
---- a/apps/shared/src/gateway-contract.generated.ts
-+++ b/apps/shared/src/gateway-contract.generated.ts
-@@ -3513,6 +3513,17 @@ export interface SessionInterruptResult {
-   turn_isolation?: boolean | null
- }
- export type InterruptStatus = 'interrupted' | 'not_interrupted'
-+export interface SessionTakeOverResult {
-+  status: TakeOverStatus
-+  previous_owner?: SessionPreviousOwner | null
-+  acknowledged: boolean
-+}
-+export type TakeOverStatus = 'taken_over' | 'already_owner'
-+export interface SessionPreviousOwner {
-+  surface: string
-+  pid?: number | null
-+  started_at?: number | null
-+}
- export interface SessionCorrectionParams {
-   session_id: string
-   profile?: string | null
-@@ -4660,9 +4671,20 @@ export interface SetupReadyPayload {
-   finished_at: number
-   [key: string]: unknown
- }
--/** Every ``_emit("error", …)`` site sets exactly ``message``. */
-+/** Every ``_emit("error", …)`` site sets ``message``; ``error_surface`` rides when the gateway already knows the machine code (the takeover watcher's ``SESSION_NOT_OWNED``). */
- export interface ErrorPayload {
-   message: string
-+  error_surface?: ErrorSurface | null
-+}
-+/** ``agent/error_surface.py::_surface`` — advisory {layer, code, retryable} (+ identity, + auth hint, + ``resets_at`` epoch seconds when the provider named when its limit lifts). */
-+export interface ErrorSurface {
-+  layer: string
-+  code: string
-+  retryable: boolean
-+  provider?: string | null
-+  model?: string | null
-+  resets_at?: number | null
-+  [key: string]: unknown
- }
- /** ``tui_gateway/model_switch.py`` capability-refresh notice. */
- export interface NoticePayload {
-@@ -4710,16 +4732,6 @@ export interface BillingBlock {
-   message: string
-   unverified?: boolean | null
- }
--/** ``agent/error_surface.py::_surface`` — advisory {layer, code, retryable} (+ identity, + auth hint, + ``resets_at`` epoch seconds when the provider named when its limit lifts). */
--export interface ErrorSurface {
--  layer: string
--  code: string
--  retryable: boolean
--  provider?: string | null
--  model?: string | null
--  resets_at?: number | null
--  [key: string]: unknown
--}
- /** Committed SQLite row addresses for the agent's current-turn suffix. Missing ids are unproven, never negative acknowledgements. ``complete`` permits retiring the whole local turn only when the original turn boundary, every row and final body are still accounted for; compaction, redirects and partial writes conservatively leave it false. Row ids are scoped to the owning profile's store, as in ``SessionMessage.row_id``. */
- export interface PersistedTurn {
-   row_ids: number[]
-@@ -5410,6 +5422,8 @@ export interface RpcMethods {
-   'session.status': { params: SessionStatusParams; result: SessionStatusResult }
-   /** Inject text into the next tool result without interrupting the turn. */
-   'session.steer': { params: SessionCorrectionParams; result: SessionCorrectionResult }
-+  /** Move this chat's active-session lease here from another Hermes window/process; the old owner stops its turn and acknowledges (``acknowledged`` false when it did not within the timeout). */
-+  'session.take_over': { params: SessionParams; result: SessionTakeOverResult }
-   /** Read or set a live session's title; a title set before the row exists is queued. */
-   'session.title': { params: SessionTitleParams; result: SessionTitleResult }
-   /** Drop the last user turn (and everything after it) from an idle session. */
-@@ -5727,6 +5741,7 @@ export const RPC_METHODS = [
-   'session.start_chat',
-   'session.status',
-   'session.steer',
-+  'session.take_over',
-   'session.title',
-   'session.undo',
-   'session.usage',
-diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
-index fb9663d6ca..87faad93b7 100644
---- a/apps/shared/src/gateway-contract.openrpc.json
-+++ b/apps/shared/src/gateway-contract.openrpc.json
-@@ -3642,6 +3642,24 @@
-         }
-       }
-     },
-+    {
-+      "name": "session.take_over",
-+      "summary": "Move this chat's active-session lease here from another Hermes window/process; the old owner stops its turn and acknowledges (``acknowledged`` false when it did not within the timeout).",
-+      "params": [
-+        {
-+          "name": "params",
-+          "schema": {
-+            "$ref": "#/components/schemas/SessionParams"
-+          }
-+        }
-+      ],
-+      "result": {
-+        "name": "result",
-+        "schema": {
-+          "$ref": "#/components/schemas/SessionTakeOverResult"
-+        }
-+      }
-+    },
-     {
-       "name": "session.title",
-       "summary": "Read or set a live session's title; a title set before the row exists is queued.",
-@@ -13944,11 +13962,22 @@
-       },
-       "ErrorPayload": {
-         "additionalProperties": false,
--        "description": "Every ``_emit(\"error\", \u2026)`` site sets exactly ``message``.",
-+        "description": "Every ``_emit(\"error\", \u2026)`` site sets ``message``; ``error_surface`` rides when the gateway\nalready knows the machine code (the takeover watcher's ``SESSION_NOT_OWNED``).",
-         "properties": {
-           "message": {
-             "title": "Message",
-             "type": "string"
-+          },
-+          "error_surface": {
-+            "anyOf": [
-+              {
-+                "$ref": "#/components/schemas/ErrorSurface"
-+              },
-+              {
-+                "type": "null"
-+              }
-+            ],
-+            "default": null
-           }
-         },
-         "required": [
-@@ -31768,6 +31797,44 @@
-         "title": "SessionParams",
-         "type": "object"
-       },
-+      "SessionPreviousOwner": {
-+        "additionalProperties": false,
-+        "properties": {
-+          "surface": {
-+            "title": "Surface",
-+            "type": "string"
-+          },
-+          "pid": {
-+            "anyOf": [
-+              {
-+                "type": "integer"
-+              },
-+              {
-+                "type": "null"
-+              }
-+            ],
-+            "default": null,
-+            "title": "Pid"
-+          },
-+          "started_at": {
-+            "anyOf": [
-+              {
-+                "type": "number"
-+              },
-+              {
-+                "type": "null"
-+              }
-+            ],
-+            "default": null,
-+            "title": "Started At"
-+          }
-+        },
-+        "required": [
-+          "surface"
-+        ],
-+        "title": "SessionPreviousOwner",
-+        "type": "object"
-+      },
-       "SessionReclaimedPayload": {
-         "additionalProperties": false,
-         "description": "``session_lifecycle._announce_session_reclaimed`` (broadcast).",
-@@ -32396,6 +32463,35 @@
-         "title": "SessionStatusResult",
-         "type": "object"
-       },
-+      "SessionTakeOverResult": {
-+        "additionalProperties": false,
-+        "properties": {
-+          "status": {
-+            "$ref": "#/components/schemas/TakeOverStatus"
-+          },
-+          "previous_owner": {
-+            "anyOf": [
-+              {
-+                "$ref": "#/components/schemas/SessionPreviousOwner"
-+              },
-+              {
-+                "type": "null"
-+              }
-+            ],
-+            "default": null
-+          },
-+          "acknowledged": {
-+            "title": "Acknowledged",
-+            "type": "boolean"
-+          }
-+        },
-+        "required": [
-+          "status",
-+          "acknowledged"
-+        ],
-+        "title": "SessionTakeOverResult",
-+        "type": "object"
-+      },
-       "SessionTitleParams": {
-         "additionalProperties": false,
-         "properties": {
-@@ -36597,6 +36693,14 @@
-         "title": "SystemBatteryResult",
-         "type": "object"
-       },
-+      "TakeOverStatus": {
-+        "enum": [
-+          "taken_over",
-+          "already_owner"
-+        ],
-+        "title": "TakeOverStatus",
-+        "type": "string"
-+      },
-       "TaskIdResult": {
-         "additionalProperties": false,
-         "description": "The side agent runs detached; its answer lands on the parent session as an event carrying\nthis ``task_id``.",
 diff --git a/hermes_cli/active_sessions.py b/hermes_cli/active_sessions.py
-index 7a279f9737..976fa0fc9b 100644
+index 6202d46cc872fdf5ee3efda3ea0befd911d9b119..b07aa2246d4c1208cbe8a63950a70aad1c5c0750 100644
 --- a/hermes_cli/active_sessions.py
 +++ b/hermes_cli/active_sessions.py
-@@ -574,6 +574,141 @@ def try_acquire_active_session(
+@@ -632,6 +632,141 @@ def try_acquire_active_session(
      return lease, None
  
  
@@ -420,7 +176,7 @@ index 7a279f9737..976fa0fc9b 100644
      # running under a profile HERMES_HOME override.
 diff --git a/tests/hermes_cli/test_active_session_takeover.py b/tests/hermes_cli/test_active_session_takeover.py
 new file mode 100644
-index 0000000000..d1029fdd06
+index 0000000000000000000000000000000000000000..d1029fdd06f4c4b095d542ddedeec07f674e2161
 --- /dev/null
 +++ b/tests/hermes_cli/test_active_session_takeover.py
 @@ -0,0 +1,209 @@
@@ -635,7 +391,7 @@ index 0000000000..d1029fdd06
 +        holder.communicate()
 diff --git a/tests/tui_gateway/test_session_takeover.py b/tests/tui_gateway/test_session_takeover.py
 new file mode 100644
-index 0000000000..cdd5fe5d9c
+index 0000000000000000000000000000000000000000..cdd5fe5d9c8f66eb2425b3361e71b07e76e6d603
 --- /dev/null
 +++ b/tests/tui_gateway/test_session_takeover.py
 @@ -0,0 +1,308 @@
@@ -949,7 +705,7 @@ index 0000000000..cdd5fe5d9c
 +    lease.release()
 diff --git a/tests/tui_gateway/test_session_takeover_e2e.py b/tests/tui_gateway/test_session_takeover_e2e.py
 new file mode 100644
-index 0000000000..98fce434a7
+index 0000000000000000000000000000000000000000..98fce434a7048315704225d10df3e75b32973d4e
 --- /dev/null
 +++ b/tests/tui_gateway/test_session_takeover_e2e.py
 @@ -0,0 +1,161 @@
@@ -1115,10 +871,10 @@ index 0000000000..98fce434a7
 +            if proc is not None:
 +                proc.communicate()
 diff --git a/tui_gateway/contracts/events.py b/tui_gateway/contracts/events.py
-index b9b012e67b..2b6ff7fb32 100644
+index cddb893776da8eb221e084810b64ad16a0771085..a6a90600f414265c2213d630033353f499024080 100644
 --- a/tui_gateway/contracts/events.py
 +++ b/tui_gateway/contracts/events.py
-@@ -90,9 +90,11 @@ event("free_tier.challenge", FreeTierChallengePayload,
+@@ -112,9 +112,11 @@ event("free_tier.challenge", FreeTierChallengePayload,
  
  
  class ErrorPayload(Payload):
@@ -1131,7 +887,7 @@ index b9b012e67b..2b6ff7fb32 100644
  
  
  event("error", ErrorPayload, doc="A session-level failure outside a turn (agent init, model switch, compression, resume).")
-@@ -161,6 +163,9 @@ class ErrorSurface(Payload):
+@@ -248,6 +250,9 @@ class ErrorSurface(Payload):
      model_config = Payload.model_config | {"extra": "allow"}
  
  
@@ -1142,10 +898,10 @@ index b9b012e67b..2b6ff7fb32 100644
      """``agent/billing_links.py::BillingBlock.to_dict`` (+ ``unverified`` from conversation_loop)."""
  
 diff --git a/tui_gateway/contracts/sessions.py b/tui_gateway/contracts/sessions.py
-index 9de8a849c7..b0f118dd28 100644
+index 0c7b11f68c5e97205c2a60c01c571626f0bbf391..a99cc5cdea17c37cdff3cfbf36f8b42b183e4f2f 100644
 --- a/tui_gateway/contracts/sessions.py
 +++ b/tui_gateway/contracts/sessions.py
-@@ -620,6 +620,28 @@ method("session.interrupt", params=SessionInterruptParams, result=SessionInterru
+@@ -621,6 +621,28 @@ method("session.interrupt", params=SessionInterruptParams, result=SessionInterru
         doc="Stop the running turn (and streaming TTS); retires the crash-recovery marker.")
  
  
@@ -1175,10 +931,10 @@ index 9de8a849c7..b0f118dd28 100644
      queued = "queued"
      redirected = "redirected"
 diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
-index 6cedbcff1e..8f93439766 100644
+index 43ba3505edecffc5523751fee6e379ddb52c3860..a6641706abac5a2d6a0f625ef2308dd3469eccab 100644
 --- a/tui_gateway/methods_session_interrupt.py
 +++ b/tui_gateway/methods_session_interrupt.py
-@@ -147,3 +147,5 @@ _correction_method("session.redirect", "redirect", "redirected",
+@@ -179,3 +179,5 @@ _correction_method("session.redirect", "redirect", "redirected",
  def register(server) -> None:
      """Publish this module's helpers onto ``server`` (rebound to its globals) and install handlers."""
      bind_module(globals(), server, skip=("_",))
@@ -1186,7 +942,7 @@ index 6cedbcff1e..8f93439766 100644
 +    methods_session_takeover.register(server)
 diff --git a/tui_gateway/methods_session_takeover.py b/tui_gateway/methods_session_takeover.py
 new file mode 100644
-index 0000000000..1038d06b35
+index 0000000000000000000000000000000000000000..1038d06b3509e8a19da85405ec6dbdef2d115e2e
 --- /dev/null
 +++ b/tui_gateway/methods_session_takeover.py
 @@ -0,0 +1,222 @@
@@ -1412,19 +1168,5 @@ index 0000000000..1038d06b35
 +    start the revocation watcher."""
 +    bind_module(globals(), server, skip=("_",))
 +    server._start_takeover_watcher()
-diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index 849d42bfda..f1987cb61f 100644
---- a/tui_gateway/server.py
-+++ b/tui_gateway/server.py
-@@ -193,7 +193,7 @@ _LONG_HANDLERS = frozenset({
-     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
-     "session.resume", "session.save", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
-     "onboarding.ensure_setup_profile", "onboarding.ensure_setup_session", "onboarding.reset_setup_profile",
--    "session.start_chat",
-+    "session.start_chat", "session.take_over",  # take_over waits for the old owner's ack
-     "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
-     "shared_metrics.set",  # consent reconcile waits on the metrics store's write lock
- })
 -- 
-2.54.0 (Apple Git-157)
-
+2.55.0

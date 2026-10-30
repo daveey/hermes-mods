@@ -25,18 +25,9 @@ time) and tests/e2e/core/terminal/test_held_session_notification_refusal.py (rea
 job completing while a second process holds the durable turn lease: 111 attempts/111 cards in 40 s before,
 1/1 after).
 ---
- .../test_held_session_notification_refusal.py | 120 ++++++++++++
- ...test_notification_owner_refusal_backoff.py | 176 ++++++++++++++++++
- tui_gateway/prompt_turn.py                    |   6 +
- tui_gateway/session_notifications.py          |  70 ++++++-
- tui_gateway/user_messages.py                  |   6 +
- 5 files changed, 375 insertions(+), 3 deletions(-)
- create mode 100644 tests/e2e/core/terminal/test_held_session_notification_refusal.py
- create mode 100644 tests/tui_gateway/test_notification_owner_refusal_backoff.py
-
 diff --git a/tests/e2e/core/terminal/test_held_session_notification_refusal.py b/tests/e2e/core/terminal/test_held_session_notification_refusal.py
 new file mode 100644
-index 0000000000..b6d0aa95f9
+index 0000000000000000000000000000000000000000..b6d0aa95f9996c00221ad5262a390a41c87338a6
 --- /dev/null
 +++ b/tests/e2e/core/terminal/test_held_session_notification_refusal.py
 @@ -0,0 +1,120 @@
@@ -162,7 +153,7 @@ index 0000000000..b6d0aa95f9
 +    assert "internal error" not in errors[0]["text"], report
 diff --git a/tests/tui_gateway/test_notification_owner_refusal_backoff.py b/tests/tui_gateway/test_notification_owner_refusal_backoff.py
 new file mode 100644
-index 0000000000..81e77cf558
+index 0000000000000000000000000000000000000000..81e77cf558e1938c76766094d05164304427f8fa
 --- /dev/null
 +++ b/tests/tui_gateway/test_notification_owner_refusal_backoff.py
 @@ -0,0 +1,176 @@
@@ -342,149 +333,8 @@ index 0000000000..81e77cf558
 +    for _ in range(2):
 +        assert server._run_prompt_submit("rid", poller_env.sid, poller_env.session, "hello") is False
 +    assert len(_counts(poller_env)[1]) == 2
-diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
-index e0a8912043..723ef05301 100644
---- a/tui_gateway/prompt_turn.py
-+++ b/tui_gateway/prompt_turn.py
-@@ -153,6 +153,9 @@ def _admit_prompt_turn(
-             if _retain_unadmitted_submit_row(session["history"], staged):
-                 session["history_version"] = int(session.get("history_version", 0)) + 1
-         reason = getattr(ownership_refusal, "reason", None) or "SESSION_COORDINATION_UNAVAILABLE"
-+        # [daveey] Read by the notification poller (_notif_after_submit): a synthesized turn refused for
-+        # ownership backs off instead of re-running every poll (139 refusal cards in 110 s, 2026-10-28).
-+        session["_turn_owner_refusal"] = reason
-         _emit_terminal_turn_error(
-             sid, session, str(ownership_refusal),
-             error_surface={"layer": "gateway", "code": reason, "retryable": False})
-@@ -160,6 +163,9 @@ def _admit_prompt_turn(
-     with session["history_lock"]:
-         if not owns(session):
-             return None
-+        # This process owns the chat again: any notification refusal backoff is over. [daveey]
-+        for key in ("_turn_owner_refusal", "_notif_owner_refused_until", "_notif_owner_refusal_delay"):
-+            session.pop(key, None)
-         if session.get("_closing") or (
-             queued_prompt_generation is not None
-             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
-diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
-index 122bbc0be6..3a4ab23df4 100644
---- a/tui_gateway/session_notifications.py
-+++ b/tui_gateway/session_notifications.py
-@@ -171,7 +171,10 @@ def _notif_release_turn(session: dict) -> None:
- def _notif_claim_turn(session: dict) -> bool:
-     """Claim the idle session (running=True) under history_lock; False if a turn is live.
-     After the user's Stop no automatic turn starts: the cancel latch holds notifications
--    (requeued by the callers) until the next user prompt clears it."""
-+    (requeued by the callers) until the next user prompt clears it. While another backend owns
-+    the chat (owner-refusal backoff) no automatic turn starts either."""
-+    if _notif_owner_refused(session):
-+        return False
-     with _session_turn_admission(session) as admitted:
-         if not admitted or session.get("running") or session.get("_turn_cancel_requested"):
-             return False
-@@ -183,19 +186,66 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
-     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
- 
- 
-+# [daveey] A synthesized turn (process completion, subagent result, /loop, /heartbeat, bot DM, kanban notice)
-+# that the admission gate refuses because another live process holds the chat: SESSION_NOT_OWNED is
-+# deterministic until that owner lets go, so the poller waits (doubling backoff) instead of re-running the turn
-+# on its next pass. Before, a refused completion went straight back on the queue and the poller re-ran it every
-+# ~0.8 s, painting a "Your message was not answered" card each time (139 in 110 s on 2026-10-28). The first
-+# refusal of a streak shows its card; later probes in the streak are silent.
-+_OWNER_REFUSAL_BACKOFF_S = 30.0
-+_OWNER_REFUSAL_BACKOFF_MAX_S = 300.0
-+_OWNER_REFUSAL_CODES = ("SESSION_NOT_OWNED", "SESSION_COORDINATION_UNAVAILABLE")
-+
-+
-+def _notif_owner_refused(session: dict) -> bool:
-+    """True while an owner-refusal backoff holds this session's automatic turns."""
-+    return time.monotonic() < float(session.get("_notif_owner_refused_until") or 0)
-+
-+
-+def _notif_note_owner_refusal(session: dict, reason: str) -> None:
-+    delay = float(session.get("_notif_owner_refusal_delay") or _OWNER_REFUSAL_BACKOFF_S)
-+    session["_notif_owner_refusal_delay"] = min(delay * 2, _OWNER_REFUSAL_BACKOFF_MAX_S)
-+    session["_notif_owner_refused_until"] = time.monotonic() + delay
-+    logger.info("automatic turn for session %s refused (%s): another owner holds the chat; next try in %.0fs",
-+                session.get("session_key") or "", reason, delay)
-+
-+
-+def _notif_owner_preflight(sid: str, session: dict) -> bool:
-+    """False = refused silently. Only inside a refusal streak (its card already shown): probe ownership
-+    before anything is emitted, so a later retry while the chat is still held elsewhere stays invisible."""
-+    if not session.get("_notif_owner_refusal_delay"):
-+        return True
-+    refusal = _ensure_active_session_slot(sid, session)
-+    if refusal is None:
-+        return True
-+    _notif_note_owner_refusal(session, str(getattr(refusal, "reason", None) or "refused"))
-+    return False
-+
-+
- def _notif_run_submit(rid, sid, session, text, **kwargs):
-     """Run a turn this caller just claimed via _notif_claim_turn.
- 
-     A plain stage() adopts the freshly claimed generation instead of inheriting a stale
-     one from an enclosing worker context (which would refuse the new turn and leak it)."""
-     from tui_gateway.turn_admission import stage
-+    if not _notif_owner_preflight(sid, session):
-+        _notif_release_turn(session)
-+        return False
-+    session.pop("_turn_owner_refusal", None)
-     with stage(session):
--        return _run_prompt_submit(rid, sid, session, text, **kwargs)
-+        accepted = _run_prompt_submit(rid, sid, session, text, **kwargs)
-+    reason = session.pop("_turn_owner_refusal", None)
-+    if not accepted and reason in _OWNER_REFUSAL_CODES:
-+        _notif_note_owner_refusal(session, reason)
-+    return accepted
- 
- 
- def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> Any:
-     """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure.
-     Returns the gate's verdict (False = refused, no turn runs)."""
-+    if not _notif_owner_preflight(sid, session):
-+        _notif_release_turn(session)
-+        return False
-     try:
-         from gateway.warning_notifications import render_notification
-         with _session_profile_runtime_scope(session):
-@@ -351,6 +401,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
-         if wakeup.lstrip().startswith("/"):
-             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
-         else:
-+            if not _notif_owner_preflight(sid, session):  # still held elsewhere: no dangling message.start
-+                _notif_release_turn(session)
-+                with contextlib.suppress(Exception):
-+                    mgr.abandon_tick()
-+                return
-             _emit("message.start", sid)
-             _notif_run_submit(rid, sid, session, wakeup)
-     except Exception as exc:
-@@ -687,10 +742,19 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
-     if diagnostic_process_event(evt):
-         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
-     try:
--        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
-+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-+                                 "notification poller dispatch failed", **kwargs)
-     except Exception:
-         release_event_delivery(evt, claim)
-         return
-+    if accepted is False and _notif_owner_refused(session):
-+        # Another backend owns the chat: the event waits here for the backoff instead of being marked
-+        # delivered while no turn ran (a subagent result used to be dropped this way). [daveey]
-+        release_event_delivery(evt, claim)
-+        from tools.process_registry import process_registry
-+        if not _notif_hold_for(session, evt, process_registry.completion_queue):
-+            process_registry.completion_queue.put(evt)
-+        return
-     complete_event_delivery(evt, claim)
- 
- 
 diff --git a/tui_gateway/user_messages.py b/tui_gateway/user_messages.py
-index 09a7fb3482..9ccd7160ff 100644
+index 09a7fb3482dc2a5f230a43e46fecdedebaf4ccb2..9ccd7160ffd5513d2e1bdeb5aebad553adc2e8d7 100644
 --- a/tui_gateway/user_messages.py
 +++ b/tui_gateway/user_messages.py
 @@ -36,6 +36,12 @@ _TURN_ERROR_CODE_COPY: dict[str, tuple[str, str]] = {

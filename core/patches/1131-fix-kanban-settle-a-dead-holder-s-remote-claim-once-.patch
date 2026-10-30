@@ -1,0 +1,183 @@
+From 7d30fc98d3eb0bb5388bc9a5f9227816902149e4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 05:05:26 +0000
+Subject: [PATCH] fix(kanban): settle a dead holder's remote claim once the
+ card left that state [daveey]
+
+collect() and the sweep only walk cards that are terminal now, so a claim whose
+holder died after the card moved on (blocked, then unblocked/rescheduled) was
+never looked at again: delivered=0 with a dead holder forever (MacBook ledger
+row 842, t_01a18622e706e70a, held >24 h). The sweep now acks such rows as stale
+(delivered=1, holder cleared, settled='stale') and records them in swept,
+without delivering the stale text. A live holder, a card still in that state,
+or a card missing from the replica is left alone. Builds on 5bab4bb450.
+---
+ .../tui_gateway/test_kanban_remote_notices.py | 49 ++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 80 ++++++++++++++++++-
+ 2 files changed, 128 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+index 96b6cf70099..cb3eefac8ef 100644
+--- a/tests/tui_gateway/test_kanban_remote_notices.py
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -631,3 +631,52 @@ def test_both_remote_writers_record_blocked_on_human(tmp_path, monkeypatch):
+         assert verdict == "written"
+         rows = [m for m in live.get_messages(CHAT) if m.get("display_kind") == "kanban_notice"]
+     assert rows[-1]["display_metadata"].get("blocked_on_human") is True
++
++
++# [daveey] MacBook remote-notices.db row 842 (2026-10-28 22:51 PDT): t_01a18622e706e70a's blocked notice was claimed
++# by pid 35287, which died before the transcript write. The card was unblocked at 23:20, so neither collect nor the
++# sweep (both walk terminal cards only) looked at the row again: delivered=0 with a dead holder for over 24 h.
++ROW_842_TASK = "t_01a18622e706e70a"
++ROW_842_BLOCKED_AT = 1793253046
++
++
++def test_sweep_settles_a_dead_holder_claim_whose_card_left_that_state(tmp_path):
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = ROW_842_BLOCKED_AT + 30 * 3600.0
++    moved = _card(ROW_842_TASK, CHAT, status="ready", at=ROW_842_BLOCKED_AT)  # unblocked: no longer terminal
++    held = _card("t_still_blocked", CHAT, status="blocked", at=ROW_842_BLOCKED_AT)  # still in the claimed state
++    alive = _card("t_live_holder", CHAT, status="ready", at=ROW_842_BLOCKED_AT)  # moved on, but holder is alive
++    replica = _hub(tmp_path, [moved, held, alive])
++    ledger = tmp_path / "remote-notices.db"
++    state = f"blocked@{ROW_842_BLOCKED_AT}"
++    dead = _dead_pid()
++    me, start = kbn._my_holder()
++    krn._reset_for_tests()
++    conn = krn._ledger(ledger)
++    with conn:
++        for card, pid, pstart in ((moved, dead, None), (held, dead, None), (alive, me, start)):
++            ref = f"hub/{card['key']}"
++            conn.execute("INSERT INTO notices (session, ref, state, at, delivered, holder_pid, holder_start, "
++                         "notice_key, legacy_seen) VALUES (?,?,?,?,0,?,?,?,1)",
++                         (CHAT, ref, state, ROW_842_BLOCKED_AT + 5, pid, pstart,
++                          f"remote:hub:{card['key']}:{state}:default:{CHAT}"))
++    conn.close()
++
++    db, opener = _sweep_db(tmp_path, (CHAT,))
++    with db:
++        sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger, now=now)
++        assert not any(ROW_842_TASK in (m.get("content") or "") for m in db.get_messages(CHAT))  # no stale text
++
++    row = _ledger_row(ledger, CHAT, f"hub/{moved['key']}")
++    assert (row["delivered"], row["holder_pid"], row["holder_start"], row.get("settled")) == (1, None, None, "stale")
++    with sqlite3.connect(ledger) as c:
++        swept = c.execute("SELECT replica, profile, session, notice_id FROM swept").fetchall()
++    assert swept == [(str(replica), "default", CHAT, f"remote:hub:{moved['key']}:{state}:default:{CHAT}")]
++    for card, pid in ((held, dead), (alive, me)):
++        other = _ledger_row(ledger, CHAT, f"hub/{card['key']}")
++        assert (other["delivered"], other["holder_pid"], other.get("settled")) == (0, pid, None)
++
++    # Idempotent; the still-terminal row stays with collect's dead-holder re-offer path.
++    sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger, now=now)
++    assert _ledger_row(ledger, CHAT, f"hub/{held['key']}")["delivered"] == 0
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index d1322164a93..5ef58e83e72 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -159,7 +159,7 @@ def _ledger(path: Optional[Path] = None) -> sqlite3.Connection:
+                  "at REAL NOT NULL, delivered INTEGER NOT NULL, PRIMARY KEY (session, ref, state))")
+     cols = {row[1] for row in conn.execute("PRAGMA table_info(notices)")}
+     for name, decl in (("holder_pid", "INTEGER"), ("holder_start", "INTEGER"), ("notice_key", "TEXT"),
+-                       ("legacy_seen", "INTEGER NOT NULL DEFAULT 0")):
++                       ("legacy_seen", "INTEGER NOT NULL DEFAULT 0"), ("settled", "TEXT")):
+         if name not in cols:
+             conn.execute(f"ALTER TABLE notices ADD COLUMN {name} {decl}")
+     return conn
+@@ -580,6 +580,83 @@ def _ledger_settled(conn: Optional[sqlite3.Connection], sessions: tuple, ref: st
+     return row is not None
+ 
+ 
++def _current_states(rows: list[tuple]) -> dict:
++    """``{ref: (state, task)}`` for every canonical replica card, terminal or not, keyed like the ledger."""
++    out: dict[str, tuple] = {}
++    for owner, key, _seq, raw in rows:
++        try:
++            task = json.loads(raw)
++        except (TypeError, ValueError):
++            continue
++        if not isinstance(task, dict) or not task.get("status"):
++            continue
++        at = _terminal_at(task) if task.get("status") in _TERMINAL else None
++        out[f"{owner}/{key}"] = (f"{task['status']}@{int(at) if at else 0}", task)
++    return out
++
++
++def _stale_notice_id(row, task: dict) -> tuple[str, str]:
++    """``(profile, notice_id)`` the sweep would have used for this ledger row, for the ``swept`` record."""
++    sid, key = str(row["session"]), str(row["notice_key"] or "")
++    profile = next((str(link.get("profile") or "default") for link in task.get("sessions") or []
++                    if isinstance(link, dict) and link.get("session") == sid), "")
++    if not profile and key.endswith(f":{sid}"):
++        profile = key[:-len(sid) - 1].rsplit(":", 1)[-1]
++    profile = profile or "default"
++    if str(row["state"]).startswith("done@") and key and not key.endswith(f":{profile}:{sid}"):
++        return profile, f"{key}:{profile}:{sid}"
++    return profile, key or f"remote:{row['ref']}:{row['state']}:{profile}:{sid}"
++
++
++def _settle_stale_claims(rows: list[tuple], path, ledger) -> int:
++    """Settle in-flight claims nobody can finish: the holder is dead AND the card left the notice's state. [daveey]
++
++    ``collect`` and the sweep only walk cards that are terminal NOW, so a claim whose holder died after the card
++    moved on (blocked, then unblocked or rescheduled) was never looked at again: it sat ``delivered=0`` with a dead
++    holder forever and showed up in every audit (MacBook row 842, t_01a18622e706e70a, held >24 h). Such a row is
++    acked as stale (``delivered=1``, holder cleared, ``settled='stale'``) and recorded in ``swept``. Its text is
++    never delivered: it describes a state the card is no longer in. A live holder, a card still in that state
++    (the re-offer path owns it) and a card missing from the replica (partial sync) are left alone. Never raises.
++    """
++    try:
++        states = _current_states(rows)
++        conn = _ledger(ledger)
++        try:
++            claims = conn.execute(
++                "SELECT session, ref, state, holder_pid, holder_start, notice_key FROM notices "
++                "WHERE delivered=0 AND holder_pid IS NOT NULL").fetchall()
++            keys, settled = [], 0
++            for row in claims:
++                current = states.get(str(row["ref"]))
++                if current is None or current[0] == row["state"]:
++                    continue
++                if _holder_is_me(row["holder_pid"]) or _holder_alive(row["holder_pid"], row["holder_start"]):
++                    continue
++                with conn:
++                    cur = conn.execute(
++                        "UPDATE notices SET delivered=1, holder_pid=NULL, holder_start=NULL, legacy_seen=1, "
++                        "settled='stale', notice_key=IFNULL(notice_key, ?) WHERE session=? AND ref=? AND state=? "
++                        "AND delivered=0 AND holder_pid IS ?",
++                        (f"stale:{row['ref']}:{row['state']}", row["session"], row["ref"], row["state"],
++                         row["holder_pid"]))
++                if cur.rowcount != 1:
++                    continue
++                settled += 1
++                profile, notice_id = _stale_notice_id(row, current[1])
++                keys.append((str(path), profile, str(row["session"]), notice_id))
++                logger.info("remote kanban: settled stale claim %s %s for chat %s (holder %s dead, card now %s)",
++                            row["ref"], row["state"], row["session"], row["holder_pid"], current[0])
++        finally:
++            conn.close()
++        _record_swept(keys, ledger)
++        for key in keys:
++            _remember_delivered(key)
++        return settled
++    except Exception:
++        logger.debug("remote kanban stale-claim settle failed", exc_info=True)
++        return 0
++
++
+ def _sweep_payload(owner: str, key: str, task: dict, me: str, profile: str, sid: str) -> tuple:
+     """``(event_key, metadata, text)`` of one swept notice, keyed like ``collect``'s."""
+     notice = task.get("completion_notice")
+@@ -766,6 +843,7 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+         logger.debug("remote kanban observation failed; defer notices", exc_info=True)
+         return []
+     _load_swept(ledger)
++    _settle_stale_claims(rows, path, ledger)
+     delivered: list[dict] = []
+     swept: list = []
+     counts: dict = {}
+-- 
+2.55.0
+

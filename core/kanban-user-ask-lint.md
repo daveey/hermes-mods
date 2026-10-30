@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/0982-fix-kanban-a-block-on-David-must-say-what-unblock-an.patch`
+- `patches/0986-fix-kanban-a-block-on-David-must-say-what-unblock-an.patch`
 
 Asks like "Pick A, B or C" left the card showing only "blocked" with nothing to act on.
 

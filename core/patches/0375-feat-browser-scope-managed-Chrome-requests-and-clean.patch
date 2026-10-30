@@ -5,65 +5,9 @@ Subject: [PATCH] feat(browser): scope managed Chrome requests and cleanup by
  owner [daveey]
 
 ---
- gateway/run_shutdown.py                      |   2 +-
- hermes_cli/config_defaults.py                |   4 +-
- tests/gateway/test_shutdown_kill_off_loop.py |   2 +-
- tests/tools/test_browser_agent_lifecycle.py  | 178 +++++++++++++++++++
- tools/browser_agent_lifecycle.py             | 139 +++++++++++++++
- tools/browser_tool_lifecycle.py              |  11 +-
- tools/browser_use_cli.py                     |  31 +++-
- 7 files changed, 356 insertions(+), 11 deletions(-)
- create mode 100644 tests/tools/test_browser_agent_lifecycle.py
- create mode 100644 tools/browser_agent_lifecycle.py
-
-diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
-index d37b410283..064c4a48aa 100644
---- a/gateway/run_shutdown.py
-+++ b/gateway/run_shutdown.py
-@@ -1813,7 +1813,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
- 
-         def _cleanup_browsers() -> None:
-             from tools.browser_tool_lifecycle import cleanup_all_browsers
--            cleanup_all_browsers()
-+            cleanup_all_browsers(process_shutdown=True)
- 
-         _step("cleanup_all_environments", _cleanup_environments)
-         _step("cleanup_all_browsers", _cleanup_browsers)
-diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index 174396c8b7..828adacfba 100644
---- a/hermes_cli/config_defaults.py
-+++ b/hermes_cli/config_defaults.py
-@@ -445,12 +445,12 @@ DEFAULT_CONFIG = {
-         # Local browser engine for both drivers. "auto" = Chrome; "lightpanda" = faster navigation,
-         # no screenshots (Browser Use mode spawns `lightpanda serve` per session; built-in tools
-         # pass `--engine <value>` to agent-browser with Chrome fallback); "chrome" = explicit.
--        # Ignored while a cloud provider, Camofox, cdp_url or use_real_profile is active. Also
--        # settable via AGENT_BROWSER_ENGINE.
-+        # Ignored with a provider, Camofox, cdp_url or use_real_profile; also settable via AGENT_BROWSER_ENGINE.
-         "engine": "auto",
-         # With a cloud provider, auto-spawn local Chromium for LAN/localhost URLs instead
-         "auto_local_for_private_urls": True,
-         "cdp_url": "",  # persistent CDP endpoint for attaching to an existing Chromium/Chrome
-+        "managed_agent": {"endpoint": "", "installation_id": ""},
-         # Consent to browse with the user's REAL logins locally: runs on a Hermes-managed SNAPSHOT
-         # of the ACTIVE default-Chromium profile (Local State -> profile.last_used; cookies, logins,
-         # prefs copied and re-synced per fresh session) driven by Hermes' packaged Chromium. The
-diff --git a/tests/gateway/test_shutdown_kill_off_loop.py b/tests/gateway/test_shutdown_kill_off_loop.py
-index 12950cdb65..440cd14767 100644
---- a/tests/gateway/test_shutdown_kill_off_loop.py
-+++ b/tests/gateway/test_shutdown_kill_off_loop.py
-@@ -44,7 +44,7 @@ def _make_phase_runner(monkeypatch, events):
-     )
-     monkeypatch.setattr(
-         "tools.browser_tool_lifecycle.cleanup_all_browsers",
--        lambda: events.append(("cleanup_browsers", threading.current_thread())),
-+        lambda *, process_shutdown: events.append(("cleanup_browsers" if process_shutdown else "reset_browsers", threading.current_thread())),
-     )
-     return runner, loop_thread
- 
 diff --git a/tests/tools/test_browser_agent_lifecycle.py b/tests/tools/test_browser_agent_lifecycle.py
 new file mode 100644
-index 0000000000..5fa2d0a958
+index 0000000000000000000000000000000000000000..5fa2d0a958e2dd0d9f525c39447e6b66ee33ec9b
 --- /dev/null
 +++ b/tests/tools/test_browser_agent_lifecycle.py
 @@ -0,0 +1,178 @@
@@ -247,7 +191,7 @@ index 0000000000..5fa2d0a958
 +    assert len({env['BU_NAME'] for _, env, _ in executions}) == 4
 diff --git a/tools/browser_agent_lifecycle.py b/tools/browser_agent_lifecycle.py
 new file mode 100644
-index 0000000000..752747fb78
+index 0000000000000000000000000000000000000000..752747fb78961931dc9d62e038e22a687c471090
 --- /dev/null
 +++ b/tools/browser_agent_lifecycle.py
 @@ -0,0 +1,139 @@
@@ -390,107 +334,6 @@ index 0000000000..752747fb78
 +    """Process shutdown only: records carry the original installation and profile."""
 +    with _lock:
 +        _release(list(_leases))
-diff --git a/tools/browser_tool_lifecycle.py b/tools/browser_tool_lifecycle.py
-index 8ac65a5aad..543d99885f 100644
---- a/tools/browser_tool_lifecycle.py
-+++ b/tools/browser_tool_lifecycle.py
-@@ -81,6 +81,8 @@ def _emergency_cleanup_all_sessions():
-         # origin's fresh import fails, e.g. #112437): no resolvable state, nothing to clean.
-         return
- 
-+    from tools.browser_agent_lifecycle import release_all
-+    _best_effort("Managed browser release on exit", release_all)
-     # Own sessions first so their owner_pid files are gone before the reaper scans.
-     # Real-profile Chrome is launched directly (not by agent-browser), so the
-     # session cleanup never reaps it.
-@@ -621,6 +623,8 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
-     if task_id is None:
-         task_id = "default"
- 
-+    from tools.browser_agent_lifecycle import release_task
-+    _best_effort("Managed browser task release", lambda: release_task(task_id))
-     session_keys = [task_id]
-     sidecar_key = f"{task_id}{_bt._LOCAL_SUFFIX}"
-     with _bt._cleanup_lock:
-@@ -742,8 +746,13 @@ def _cleanup_single_browser_session(task_id: str) -> None:
-     _bt.logger.debug("Removed task %s from active sessions", task_id)
- 
- 
--def cleanup_all_browsers() -> None:
-+def cleanup_all_browsers(*, process_shutdown: bool = False) -> None:
-     """Clean up all active browser sessions (shutdown) and reset cached lookups."""
-+    from tools.browser_agent_lifecycle import release_all
-+    # /browser connect also calls this legacy reset seam from a single chat.
-+    # It must not revoke managed capabilities belonging to sibling sessions.
-+    if process_shutdown:
-+        _best_effort("Managed browser release", release_all)
-     with _bt._cleanup_lock:
-         task_ids = list(_bt._active_sessions.keys())
-     for task_id in task_ids:
-diff --git a/tools/browser_use_cli.py b/tools/browser_use_cli.py
-index d06cc827b8..ba20b0f882 100644
---- a/tools/browser_use_cli.py
-+++ b/tools/browser_use_cli.py
-@@ -692,6 +692,18 @@ def stop_harness_daemons() -> None:
-             _run_cli_killing_process_group([*cmd, "--reload"], "", {**env, "BU_NAME": name}, 15)
- 
- 
-+def _resolve_exec_route(env, session, task_id, local, local_sidecar):
-+    from tools import browser_agent_lifecycle as managed_browser
-+    try:
-+        managed = managed_browser.configured_route(_read_browser_cfg(), env)
-+    except managed_browser.ManagedBrowserError as exc:
-+        return None, str(exc)
-+    # Match before discovery: an idle browser has no /json/version yet.
-+    if managed:
-+        return managed, None
-+    return None, _route_backend(env, session, task_id, bool(local), force_local_sidecar=local_sidecar)
-+
-+
- def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                  task_id: Optional[str] = None, local: bool = False):
-     """Run Python code through the browser-use CLI, and return its output"""
-@@ -721,7 +733,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
-             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                               "dashes, or underscores (e.g. 'r7k2').")
-         env["BU_NAME"] = session
--    route_err = _route_backend(env, session, task_id, bool(local), force_local_sidecar=local_sidecar)
-+    from tools import browser_agent_lifecycle as managed_browser
-+    managed, route_err = _resolve_exec_route(env, session, task_id, local, local_sidecar)
-     if route_err:
-         return tool_error(route_err)
-     if local_sidecar:
-@@ -732,7 +745,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
-     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
-     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
-     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
--    if session and not private_browser:
-+    if session and not private_browser and not managed:
-         code = _OWN_TAB_PREAMBLE + code
- 
-     workspace = _workspace_dir(task_id)
-@@ -748,11 +761,17 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
-     started = time.time()
- 
-     def dispatch() -> dict[str, Any]:
--        _attach_vault_supervisor(env, task_id)
--        with _driven_daemons_lock:
--            _driven_daemons.add(env.get("BU_NAME", "default"))
-         try:
--            return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
-+            lease = (managed_browser.request_lease(managed, task_id, session, timeout, env)
-+                     if managed else contextlib.nullcontext())
-+            with lease:
-+                _attach_vault_supervisor(env, task_id)
-+                if not managed:
-+                    with _driven_daemons_lock:
-+                        _driven_daemons.add(env.get("BU_NAME", "default"))
-+                return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
-+        except managed_browser.ManagedBrowserError as exc:
-+            return {"error_result": tool_error(str(exc))}
-         except subprocess.TimeoutExpired:
-             return {"error_result": tool_error(
-                 f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
 -- 
 2.55.0
 

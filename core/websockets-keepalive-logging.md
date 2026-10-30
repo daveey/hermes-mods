@@ -11,7 +11,7 @@ On 2026-10-27 at 20:49:20Z on hermes-hub (and 16:08 PT on the MacBook) errors.lo
 ```
 Problem: errors.log 20:49:20,534 "ERROR websockets.client: keepalive ping failed", traceback through
   sync/connection.py keepalive -> send_context -> TimeoutError -> ConnectionClosedError
-  ("sent 1011 (internal error) keepalive ping timeout"). No session; Kanban sync kept working.
+  ("sent 1039 (internal error) keepalive ping timeout"). No session; Kanban sync kept working.
 Why 1: the Board server (mailbox) stopped answering pings on one board's feed socket for 20 s. It drops every
   board's socket together several times a day (79 drops on the hub that day, 7 boards in the same minute).
 Why 2: Hermes already handles this. FeedWatcher logs one INFO line "feed socket closed ... reconnecting in 1s"

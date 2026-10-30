@@ -4,109 +4,11 @@ Date: Sun, 25 Oct 2026 18:18:12 +0000
 Subject: [PATCH] feat(desktop): checkpoint scoped registry reconnect [daveey]
 
 ---
- apps/desktop/electron/main.ts                 |  42 +++++
- apps/desktop/electron/preload.ts              |   2 +
- .../registry-reconnect-service.test.ts        | 128 +++++++++++++
- .../electron/registry-reconnect-service.ts    | 153 ++++++++++++++++
- .../electron/registry-reconnect.test.ts       | 171 ++++++++++++++++++
- apps/desktop/electron/registry-reconnect.ts   | 125 +++++++++++++
- .../electron/registry-retirement-http.test.ts |  46 +++++
- .../electron/registry-retirement-http.ts      |  53 ++++++
- apps/desktop/src/global.d.ts                  |   2 +
- 9 files changed, 722 insertions(+)
- create mode 100644 apps/desktop/electron/registry-reconnect-service.test.ts
- create mode 100644 apps/desktop/electron/registry-reconnect-service.ts
- create mode 100644 apps/desktop/electron/registry-reconnect.test.ts
- create mode 100644 apps/desktop/electron/registry-reconnect.ts
- create mode 100644 apps/desktop/electron/registry-retirement-http.test.ts
- create mode 100644 apps/desktop/electron/registry-retirement-http.ts
-
-diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
-index 074ca22535..4bd2dd5f03 100644
---- a/apps/desktop/electron/main.ts
-+++ b/apps/desktop/electron/main.ts
-@@ -528,6 +528,7 @@ import {
-   createQuitTeardownCoordinator,
-   type QuitTeardownTask
- } from './quit-teardown'
-+import { createRegistryReconnectService } from './registry-reconnect-service'
- import * as remoteLifecycle from './remote-lifecycle'
- import {
-   attachPowerResumeRemoteRevalidation,
-@@ -9867,6 +9868,7 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
- 
- async function teardownSshConnection(profile) {
-   const scope = sshScopeKey(profile)
-+  registryReconnectService.assertCanStop(scope)
-   sshIsolatedKeepalives.stop(scope)
-   const state = sshConnections.get(scope)
- 
-@@ -11306,6 +11308,10 @@ async function ensureRegistryBackend(
-     return ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation, opts)
-   }
- 
-+  if (source.kind === 'ssh') {
-+    managedConnectionUpdateGate.assertCanDial(id, managedUpdateCorrelation)
-+  }
-+
-   const entry = {
-     process: null,
-     port: null,
-@@ -12430,6 +12436,7 @@ const poolStopper = createPoolStopper({
- })
- 
- function stopPoolBackend(profile: string): Promise<void> {
-+  registryReconnectService.assertCanStop(profile)
-   const entry = backendPool.get(profile)
- 
-   const stopping = releaseLocalBackendSlotAfterExit(
-@@ -16143,6 +16150,41 @@ ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => appl
- // Storage-level CRUD for named agent sources. Routing/pooling consumption of
- // the registry lands separately; these handlers only manage the persisted
- // list, so they are safe to ship ahead of the switchover.
-+const registryReconnectService = createRegistryReconnectService({
-+  pool: backendPool,
-+  states: sshConnections,
-+  gate: managedConnectionUpdateGate,
-+  key: backendScopeKey,
-+  isSsh: id => readDesktopConnectionsRegistry().connections.some(source => source.id === id && source.kind === 'ssh'),
-+  inFlight: key => Boolean(backendDialClaims.inFlight(key) || poolStopper.inFlight(key) || sshBootstrapCoordinator.pending.has(key)),
-+  request: (descriptor, requestPath, options) => fetchJsonForBackend(descriptor, requestPath, options),
-+  terminate: async state => {
-+    const expected = { ...state, profile: state.remoteProfile || '' }
-+
-+    if (state.remotePlatform === 'Windows') {
-+      await terminateOwnedWindowsDashboardForUpdate(state.ssh,
-+        { hermesPath: state.hermesPath, hermesHome: state.hermesHome, python: state.pythonPath }, expected)
-+    } else if (state.remotePlatform === 'Linux' || state.remotePlatform === 'Darwin') {
-+      await remoteLifecycle.terminateOwnedDashboardForUpdate(state.ssh, expected)
-+    } else {
-+      throw new Error('Unsupported registry SSH platform')
-+    }
-+  },
-+  close: async (key, state) => {
-+    sshIsolatedKeepalives.stop(key)
-+    terminalIpc.disposeTerminalSessionsForSshScope(key)
-+    // The owned serve is already confirmed stopped. Closing its transport
-+    // must never fall back to generic remote disconnect/kill.
-+    await state.ssh.close().catch(error => sshRememberLog(`[registry-reconnect] transport close: ${String(error)}`))
-+  },
-+  onCleanupError: error => sshRememberLog(`[registry-reconnect] cleanup: ${String(error)}`),
-+  reopen: (id, profile, correlation) => ensureRegistryBackend(id, profile, correlation)
-+})
-+
-+ipcMain.handle('hermes:connections:reconnect-target', (_event, id, profile) =>
-+  registryReconnectService.target(id, profile))
-+ipcMain.handle('hermes:connections:reconnect', (_event, target) => registryReconnectService.run(target))
-+
- ipcMain.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
- ipcMain.handle('hermes:connections:save', async (_event, payload) => {
-   const saved = await saveRegistryConnection(payload)
 diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
-index 4e64400a0a..40077e84c0 100644
+index f52efd6489eb86913c15aff6832c1688c41d5345..71934bbbe33db493f21880e5fb825d238de6eff8 100644
 --- a/apps/desktop/electron/preload.ts
 +++ b/apps/desktop/electron/preload.ts
-@@ -289,6 +289,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+@@ -302,6 +302,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
      setLaunchMode: mode => ipcRenderer.invoke('hermes:connections:set-launch-mode', mode),
      setLastUsed: id => ipcRenderer.invoke('hermes:connections:set-last-used', id),
      test: id => ipcRenderer.invoke('hermes:connections:test', id),
@@ -117,7 +19,7 @@ index 4e64400a0a..40077e84c0 100644
      // Optional excludeIds skips rows the caller updates through another path.
 diff --git a/apps/desktop/electron/registry-reconnect-service.test.ts b/apps/desktop/electron/registry-reconnect-service.test.ts
 new file mode 100644
-index 0000000000..1dcdfa61be
+index 0000000000000000000000000000000000000000..1dcdfa61be554401397c2947ca0e568257097b96
 --- /dev/null
 +++ b/apps/desktop/electron/registry-reconnect-service.test.ts
 @@ -0,0 +1,128 @@
@@ -251,7 +153,7 @@ index 0000000000..1dcdfa61be
 +})
 diff --git a/apps/desktop/electron/registry-reconnect-service.ts b/apps/desktop/electron/registry-reconnect-service.ts
 new file mode 100644
-index 0000000000..fc1abfd8e5
+index 0000000000000000000000000000000000000000..fc1abfd8e5c05526d64ee8c7c29a796d05ad03f6
 --- /dev/null
 +++ b/apps/desktop/electron/registry-reconnect-service.ts
 @@ -0,0 +1,153 @@
@@ -410,7 +312,7 @@ index 0000000000..fc1abfd8e5
 +}
 diff --git a/apps/desktop/electron/registry-reconnect.test.ts b/apps/desktop/electron/registry-reconnect.test.ts
 new file mode 100644
-index 0000000000..d1f7304b15
+index 0000000000000000000000000000000000000000..d1f7304b155aebeceb3eb4b5d51c6726450c9e7e
 --- /dev/null
 +++ b/apps/desktop/electron/registry-reconnect.test.ts
 @@ -0,0 +1,171 @@
@@ -587,7 +489,7 @@ index 0000000000..d1f7304b15
 +})
 diff --git a/apps/desktop/electron/registry-reconnect.ts b/apps/desktop/electron/registry-reconnect.ts
 new file mode 100644
-index 0000000000..635552c096
+index 0000000000000000000000000000000000000000..635552c096035c5fee1049c81837f87c2dd9d070
 --- /dev/null
 +++ b/apps/desktop/electron/registry-reconnect.ts
 @@ -0,0 +1,125 @@
@@ -718,7 +620,7 @@ index 0000000000..635552c096
 +}
 diff --git a/apps/desktop/electron/registry-retirement-http.test.ts b/apps/desktop/electron/registry-retirement-http.test.ts
 new file mode 100644
-index 0000000000..d29667fb09
+index 0000000000000000000000000000000000000000..d29667fb09c1669572a9952a42c6fdd43c7d97fc
 --- /dev/null
 +++ b/apps/desktop/electron/registry-retirement-http.test.ts
 @@ -0,0 +1,46 @@
@@ -770,7 +672,7 @@ index 0000000000..d29667fb09
 +})
 diff --git a/apps/desktop/electron/registry-retirement-http.ts b/apps/desktop/electron/registry-retirement-http.ts
 new file mode 100644
-index 0000000000..d2b1cd9d17
+index 0000000000000000000000000000000000000000..d2b1cd9d17d28c48e6308774a553197596180525
 --- /dev/null
 +++ b/apps/desktop/electron/registry-retirement-http.ts
 @@ -0,0 +1,53 @@
@@ -828,10 +730,10 @@ index 0000000000..d2b1cd9d17
 +  }
 +}
 diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
-index 601ed7b0d4..3a1e438214 100644
+index 0a0cd490b6b6e84d333a49f7534801a1f93ceb1f..57e42bddc5229dd0472eb225f07a4d9ecf7970dc 100644
 --- a/apps/desktop/src/global.d.ts
 +++ b/apps/desktop/src/global.d.ts
-@@ -242,6 +242,8 @@ declare global {
+@@ -247,6 +247,8 @@ declare global {
          test: (id: string) => Promise<DesktopConnectionTestResult>
          // Drain/update/restore one Desktop-managed SSH install. External URL
          // and cloud sources are refused without touching their processes.

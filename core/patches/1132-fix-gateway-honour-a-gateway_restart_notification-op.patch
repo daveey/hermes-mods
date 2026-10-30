@@ -1,0 +1,194 @@
+From 23c56bb2b1bf9df584111228c35602880745f558 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 05:16:25 +0000
+Subject: [PATCH] fix(gateway): honour a gateway_restart_notification opt-out
+ written after boot on the next shutdown [daveey]
+
+The multiplexing gateway snapshots every served profile's config at boot, so an
+opt-out added to a profile's config.yaml while the gateway ran still posted one
+more 'Hermes is restarting' home-channel notice on the next shutdown. The
+home-channel shutdown pass now re-reads the flag from that profile's config.yaml
+(falls back to the cached value when unreadable/absent). Adds a regression test
+that a served profile with gateway_restart_notification: false gets neither the
+shutdown nor the online notice.
+---
+diff --git a/gateway/config.py b/gateway/config.py
+index 8f97b5bd260b95bb6e952bf170cb963f0afd64e6..a5ef1a1d196c7c9a9ad84998b4903c48a385a2cd 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -851,6 +851,38 @@ def load_gateway_config() -> GatewayConfig:
+     return config
+ 
+ 
++def restart_notification_enabled_on_disk(home: Optional[Path], platform: "Platform", cached: bool) -> bool:
++    """``gateway_restart_notification`` for *platform* as ``home``'s config.yaml says NOW. [daveey]
++
++    The running gateway keeps the config it loaded at boot (served profiles' in ``_profile_configs``),
++    so an opt-out written after boot used to take effect only after one more "restarting" notice
++    went out on the next shutdown. The shutdown pass re-reads the flag here so the edit counts at
++    once. Falls back to *cached* when there is no home, no readable file, or no value for the
++    platform; a top-level ``<platform>:`` block wins over ``platforms.<platform>``, as in the loader.
++    """
++    if home is None:
++        return cached
++    from gateway import config_loader
++
++    try:
++        yaml_cfg = config_loader.read_yaml_layers(Path(home))
++        gateway_section = yaml_cfg.get("gateway")
++        merged = config_loader.merge_platform_sections(yaml_cfg, gateway_section, {})
++    except Exception:  # deliberate boundary: a malformed/unreadable config keeps the boot-time value
++        logger.debug("restart-notification re-read failed for %s", home, exc_info=True)
++        return cached
++    name = getattr(platform, "value", platform)
++    for block in (yaml_cfg.get(name), merged.get(name)):
++        if not isinstance(block, dict):
++            continue
++        extra = block.get("extra")
++        extra = extra if isinstance(extra, dict) else {}
++        value = block.get("gateway_restart_notification", extra.get("gateway_restart_notification"))
++        if value is not None:
++            return _coerce_bool(value, cached)
++    return cached
++
++
+ def _validate_gateway_config(config: GatewayConfig) -> None:
+     """Validate and sanitize a loaded GatewayConfig in place (after all sources are merged)."""
+     try:
+diff --git a/gateway/run_shutdown_notice_gate.py b/gateway/run_shutdown_notice_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa2f014b74fe1cee7fde61551cb0da8402a7b6d4
+--- /dev/null
++++ b/gateway/run_shutdown_notice_gate.py
+@@ -0,0 +1,48 @@
++"""Whether a restart/shutdown notice may go to a platform: the ``gateway_restart_notification`` gate.
++
++Split out of ``gateway/run_shutdown.py``; bound onto ``GatewayRunner`` via ``GatewayShutdownMixin``.
++"""
++
++from __future__ import annotations
++
++import logging
++from pathlib import Path
++from typing import Optional
++
++from gateway.config import Platform, restart_notification_enabled_on_disk
++
++logger = logging.getLogger("gateway.run")
++
++
++class GatewayShutdownNoticeGateMixin:
++    """``gateway_restart_notification`` checks for shutdown/cron-interrupt notices."""
++
++    def _restart_notification_allowed(self, platform: Platform) -> bool:
++        """False when the platform config sets ``gateway_restart_notification=false``."""
++        platform_cfg = self.config.platforms.get(platform)
++        return platform_cfg is None or bool(platform_cfg.gateway_restart_notification)
++
++    def _profile_config_home(self, profile: Optional[str]) -> Optional[Path]:
++        """The HERMES_HOME whose config.yaml configures *profile* (``None`` = the launch profile)."""
++        if profile is None:
++            from gateway.run import _hermes_home
++            return _hermes_home
++        return (getattr(self, "_served_profile_homes", None) or {}).get(profile)
++
++    def _notice_allowed(self, platform: Platform, what: str, platform_cfg=None, *, profile_home=None) -> bool:
++        """``_restart_notification_allowed`` with the INFO suppression line for shutdown notices.
++
++        ``platform_cfg`` is a SERVED profile's own platform entry; ``self.config`` is the launch profile's.
++        With ``profile_home`` the flag is re-read from that profile's config.yaml: the cached config is
++        the boot-time one, and an opt-out written since must already silence this shutdown. [daveey]
++        """
++        allowed = (self._restart_notification_allowed(platform) if platform_cfg is None
++                   else bool(platform_cfg.gateway_restart_notification))
++        if profile_home is not None:
++            allowed = restart_notification_enabled_on_disk(profile_home, platform, allowed)
++        if allowed:
++            return True
++        logger.info(
++            "Shutdown notification suppressed for %s: %s has gateway_restart_notification=false", what, platform.value,
++        )
++        return False
+diff --git a/tests/gateway/test_planned_restart_notice_multiplex.py b/tests/gateway/test_planned_restart_notice_multiplex.py
+index 121b5f6d2e9ca8fb07f26e414c7f190d1661f6ff..77aac6d2b84139a9c802f8fcb2384037b526c1fd 100644
+--- a/tests/gateway/test_planned_restart_notice_multiplex.py
++++ b/tests/gateway/test_planned_restart_notice_multiplex.py
+@@ -239,3 +239,75 @@ async def test_a_served_profiles_reconnect_replays_the_owed_notice(multiplex_run
+     coder.send.assert_awaited_once()
+     assert coder.send.await_args.args[:2] == ("coder-home", ONLINE_NOTICE)
+     assert not marker.exists(), "the owed target was reached on reconnect: the obligation is discharged"
++
++
++@pytest.mark.asyncio
++async def test_served_profile_opt_out_gets_neither_shutdown_nor_online_notice(multiplex_runner, tmp_path, monkeypatch):
++    """A served profile with ``gateway_restart_notification: false`` hears nothing on a restart.
++
++    Both halves of the restart pair: the "Hermes is restarting" home-channel broadcast on the way
++    down and the "Gateway online" notice on the way up. The launch profile (no opt-out) is the
++    control and still gets both. [daveey]
++    """
++    runner, _marker = multiplex_runner
++    monkeypatch.setattr("gateway.drain_control.drain_notification_suppressed", lambda: False)
++    runner._profile_configs["coder"].platforms[Platform.TELEGRAM].gateway_restart_notification = False
++    runner._served_profile_homes = {"coder": tmp_path / "coder-home-dir"}
++    runner._restart_requested = True
++    runner._restart_command_source = None
++    runner._snapshot_running_agents = list
++    launch, coder = _adapter(), _adapter()
++    runner.adapters[Platform.DISCORD] = launch
++    runner._profile_adapters["coder"][Platform.TELEGRAM] = coder
++
++    await runner._notify_active_sessions_of_shutdown()
++    await runner._replay_pending_planned_restart_notification()
++
++    coder.send.assert_not_awaited()
++    assert launch.send.await_count == 2, "control: the launch profile gets the shutdown AND the online notice"
++
++
++@pytest.mark.asyncio
++async def test_opt_out_written_after_boot_silences_the_next_shutdown(multiplex_runner, tmp_path, monkeypatch):
++    """The boot-time config said notify; the profile's config.yaml was edited to opt out since.
++
++    The next shutdown must already honour the file, not the stale in-memory copy: otherwise an
++    opt-out added to a live gateway still posts one more "restarting" notice. [daveey]
++    """
++    runner, _marker = multiplex_runner
++    monkeypatch.setattr("gateway.drain_control.drain_notification_suppressed", lambda: False)
++    coder_home = tmp_path / "coder-home-dir"
++    coder_home.mkdir()
++    (coder_home / "config.yaml").write_text(
++        "platforms:\n  telegram:\n    enabled: true\n    gateway_restart_notification: false\n", encoding="utf-8")
++    runner._served_profile_homes = {"coder": coder_home}
++    runner._restart_requested = True
++    runner._restart_command_source = None
++    runner._snapshot_running_agents = list
++    launch, coder = _adapter(), _adapter()
++    runner.adapters[Platform.DISCORD] = launch
++    runner._profile_adapters["coder"][Platform.TELEGRAM] = coder
++    assert runner._profile_configs["coder"].platforms[Platform.TELEGRAM].gateway_restart_notification
++
++    await runner._notify_active_sessions_of_shutdown()
++
++    coder.send.assert_not_awaited()
++    launch.send.assert_awaited_once(), "control: a profile with no opt-out on disk is still notified"
++
++
++@pytest.mark.parametrize("text, cached, expected", [
++    ("platforms:\n  slack:\n    gateway_restart_notification: false\n", True, False),
++    ("slack:\n  gateway_restart_notification: 'false'\n", True, False),
++    ("platforms:\n  slack:\n    extra:\n      gateway_restart_notification: false\n", True, False),
++    ("platforms:\n  slack:\n    gateway_restart_notification: true\n", False, True),
++    ("platforms:\n  slack:\n    enabled: true\n", True, True),
++    ("platforms:\n  slack:\n    enabled: true\n", False, False),
++    (": : not yaml [\n", False, False),
++    (None, True, True),
++])
++def test_restart_notification_enabled_on_disk(tmp_path, text, cached, expected):
++    from gateway.config import restart_notification_enabled_on_disk
++    if text is not None:
++        (tmp_path / "config.yaml").write_text(text, encoding="utf-8")
++    assert restart_notification_enabled_on_disk(tmp_path, Platform.SLACK, cached) is expected
++    assert restart_notification_enabled_on_disk(None, Platform.SLACK, cached) is cached
+-- 
+2.55.0
+

@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/1017-fix-plugins-per-callback-hook-budgets-and-a-host-dea.patch`
+- `patches/1059-fix-plugins-per-callback-hook-budgets-and-a-host-dea.patch`
 
 A turn-end `pre_verify` checker that makes bounded model calls (the coach: judge 60 s + confirm 90 s) ran under the global 30 s `plugins.hook_callback_timeout`. The host abandoned it, suppressed the callback for 60 s (so the next turn's check was skipped), and the abandoned worker still recorded a nudge the host had already discarded.
 

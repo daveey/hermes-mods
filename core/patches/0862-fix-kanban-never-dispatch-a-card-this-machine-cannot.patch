@@ -40,17 +40,8 @@ Tests: tests/hermes_cli/test_kanban_runs_on_dispatch.py (acceptance: one free sl
 another machine ahead of an eligible ready card, the ready card spawns that tick; fails on 131f0a3467 with
 spawned == []). Kanban dispatch/sync/worker-node suites: 27 files, 326 tests passed.
 ---
- gateway/kanban_watchers.py                    |  10 +-
- hermes_cli/kanban_db_dispatch.py              | 118 ++++++++++---
- hermes_cli/kanban_db_sync.py                  |  12 ++
- hermes_cli/kanban_ops.py                      |   9 +-
- hermes_cli/kanban_worker_node.py              |  39 ++++-
- .../test_kanban_runs_on_dispatch.py           | 157 ++++++++++++++++++
- 6 files changed, 306 insertions(+), 39 deletions(-)
- create mode 100644 tests/hermes_cli/test_kanban_runs_on_dispatch.py
-
 diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
-index a2c634b434..fe269f469c 100644
+index a2c634b43431957fb9090e086a304212292ac12c..fe269f469c158a162800e130424996bdcedeb47d 100644
 --- a/gateway/kanban_watchers.py
 +++ b/gateway/kanban_watchers.py
 @@ -355,14 +355,8 @@ class GatewayKanbanWatchersMixin:
@@ -70,196 +61,8 @@ index a2c634b434..fe269f469c 100644
                          last_warn_at = now
                  except asyncio.CancelledError:
                      logger.debug("kanban dispatcher: cancelled")
-diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
-index 7888ffc115..5df71a6534 100644
---- a/hermes_cli/kanban_db_dispatch.py
-+++ b/hermes_cli/kanban_db_dispatch.py
-@@ -183,6 +183,13 @@ class DispatchResult:
-     """``(task_id, assignee, current_running_count)`` deferred because the
-     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
-     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
-+    skipped_ineligible: list[tuple[str, str]] = field(default_factory=list)
-+    """``(task_id, reason)`` ready/review cards this machine cannot lease (``runs_on`` / creator labels exclude
-+    it, ``pinned_only``): the Board would refuse the claim (``labels_mismatch``), so they are never candidates
-+    and never hold a slot or the review reservation. [daveey]"""
-+    claim_deferred: list[tuple[str, str]] = field(default_factory=list)
-+    """``(task_id, reason)`` whose claim the Board lease deferred this tick (``lease_held``, ``labels_mismatch``,
-+    ``offline``). The tick moves on to the next candidate; the stuck warning names these. [daveey]"""
-     crashed: list[str] = field(default_factory=list)
-     """Task ids reclaimed because their worker PID disappeared."""
-     remote_archived: list[str] = field(default_factory=list)
-@@ -252,6 +259,12 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-         if res.skipped_owned:
-             counts["skipped_owned"] = counts.get("skipped_owned", 0) + 1
-+        for _task_id, reason in res.claim_deferred:
-+            key = f"claim_deferred({reason})"
-+            counts[key] = counts.get(key, 0) + 1
-+        for _task_id, reason in res.skipped_ineligible:
-+            key = f"skipped_ineligible({reason})"
-+            counts[key] = counts.get(key, 0) + 1
-         if res.memory_pressure:
-             pressure = res.memory_pressure
-         if res.at_capacity:
-@@ -264,6 +277,22 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-     return ", ".join(parts)
- 
- 
-+def stuck_warning(bad_ticks: int, results: Iterable[Optional[DispatchResult]]) -> str:
-+    """The "dispatcher stuck" line for the CLI daemon and the embedded gateway dispatcher.
-+
-+    When the Board deferred claims or the queue held cards this machine cannot lease, the line says so and points
-+    at the Board leases and ``runs_on``; it only blames profile health when nothing else explains the zero."""
-+    results = list(results)
-+    held = describe_suppression(results)
-+    msg = (f"kanban dispatcher stuck: ready queue non-empty for {bad_ticks} consecutive ticks but 0 workers "
-+           f"spawned.{f' Last tick held back: {held}.' if held else ''}")
-+    lease_bound = any(res is not None and (res.claim_deferred or res.skipped_ineligible) for res in results)
-+    if lease_bound:
-+        return (msg + " The Board lease refused or deferred claims: check the cards' runs_on / placement "
-+                "(`hermes kanban show <id>`) and which machine holds or may take their Board lease.")
-+    return msg + " Check profile health (venv, PATH, credentials) and `hermes kanban list --status ready`."
-+
-+
- def all_at_capacity(results: Iterable[Optional[DispatchResult]]) -> bool:
-     """True when every board's tick that ran was held only by a full concurrency cap (nothing could spawn).
- 
-@@ -2015,12 +2044,23 @@ def dispatch_profile_allowlist_summary() -> str:
-             "profile, or the config could not be read — omit the key to allow any)")
- 
- 
-+def _local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
-+    """Cards in ``status`` this machine cannot lease (``kanban_worker_node.local_refusals``); never raises."""
-+    try:
-+        from hermes_cli.kanban_worker_node import local_refusals
-+        return local_refusals(conn, status)
-+    except Exception:  # health: allow BLE001 -- eligibility is advisory; the Board lease still decides
-+        _kb._log.debug("kanban dispatch: local eligibility check failed", exc_info=True)
-+        return {}
-+
-+
- def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
--    rows = conn.execute(
--        "SELECT DISTINCT assignee FROM tasks "
-+    refused = _local_refusals(conn, status)
-+    rows = [row for row in conn.execute(
-+        "SELECT id, assignee FROM tasks "
-         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
-         (status,),
--    ).fetchall()
-+    ).fetchall() if row["id"] not in refused]
-     if not rows:
-         return False
-     profile_exists = _profile_exists_fn()
-@@ -2338,8 +2378,12 @@ def _dispatch_lane_task(
-         _count_spawn(assignee)
-         return True
-     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-+    _kb._sync.pop_claim_deferral(task_id)
-     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
-     if claimed is None:
-+        deferral = _kb._sync.pop_claim_deferral(task_id)
-+        if deferral is not None:  # the Board said no this tick: the caller moves on to the next candidate
-+            result.claim_deferred.append((task_id, deferral))
-         return False
-     try:
-         resolved_branch_name = None
-@@ -2687,10 +2731,14 @@ def _dispatch_once_locked(
-         except Exception:
-             _kb._log.debug("kanban dispatch: triage sweep failed", exc_info=True)
-     _kb._sync.worker_pickup(conn, spawn_budget, dry_run, _profile_exists_fn)  # worker node (RFC "Placement")
--    ready_rows = lane_rows(conn, "ready")
-+    # Cards this machine cannot lease (runs_on for another machine, ...) are never candidates: before 10-28 a
-+    # review card pinned to the hub sat first in the MacBook's review lane, took the review reservation every
-+    # tick, and the Board refused its lease every tick, so the eligible ready queue never started.
-+    ready_rows = _eligible_rows(conn, lane_rows(conn, "ready"), "ready", result)
-     # Review rows are enumerated up front so the budget split can see whether
-     # review work exists at all.
--    review_rows = lane_rows(conn, "review") if review_dispatch_enabled() else []
-+    review_rows = (_eligible_rows(conn, lane_rows(conn, "review"), "review", result)
-+                   if review_dispatch_enabled() else [])
-     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
-     # skipped_unassigned — "busy, retry later" differs from "needs routing".
-     # Resolved BEFORE the review reservation so the reservation can see which
-@@ -2727,22 +2775,32 @@ def _dispatch_once_locked(
-     )
-     default_assignee = _resolve_default_assignee(default_assignee)
-     spawned = 0
--    for row in ready_rows:
--        if ready_budget is not None and spawned >= ready_budget:
--            break
--        row_assignee = row["assignee"]
--        if not row_assignee:
--            # Honour kanban.default_assignee so an unassigned task doesn't
--            # park in 'ready' forever.
--            if not default_assignee or not _apply_default_assignee(
--                conn, row["id"], default_assignee, dry_run=dry_run,
--            ):
--                result.skipped_unassigned.append(row["id"])
--                continue
--            row_assignee = default_assignee
--            result.auto_assigned_default.append(row["id"])
--        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
--            spawned += 1
-+    next_ready = 0
-+
-+    def _run_ready(limit: Optional[int]) -> None:
-+        # Resumable: a deferred or refused claim never ends the tick, the loop moves on to the next row, and
-+        # a second call after the review lane continues where this one stopped.
-+        nonlocal spawned, next_ready
-+        while next_ready < len(ready_rows):
-+            if limit is not None and spawned >= limit:
-+                return
-+            row = ready_rows[next_ready]
-+            next_ready += 1
-+            row_assignee = row["assignee"]
-+            if not row_assignee:
-+                # Honour kanban.default_assignee so an unassigned task doesn't
-+                # park in 'ready' forever.
-+                if not default_assignee or not _apply_default_assignee(
-+                    conn, row["id"], default_assignee, dry_run=dry_run,
-+                ):
-+                    result.skipped_unassigned.append(row["id"])
-+                    continue
-+                row_assignee = default_assignee
-+                result.auto_assigned_default.append(row["id"])
-+            if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
-+                spawned += 1
-+
-+    _run_ready(ready_budget)
- 
-     # A review agent (sdlc-review) approves (→ done) or requests changes
-     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
-@@ -2756,9 +2814,27 @@ def _dispatch_once_locked(
-             continue
-         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
-             spawned += 1
-+    # The review reservation is only a hold: a slot no review took (its claim deferred, guarded, capped) goes
-+    # back to the ready rows still waiting this tick.
-+    _run_ready(spawn_budget)
-     return result
- 
- 
-+def _eligible_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row], status: str,
-+                   result: DispatchResult) -> list[sqlite3.Row]:
-+    refused = _local_refusals(conn, status) if rows else {}
-+    if not refused:
-+        return rows
-+    kept = []
-+    for row in rows:
-+        reason = refused.get(row["id"])
-+        if reason is None:
-+            kept.append(row)
-+        else:
-+            result.skipped_ineligible.append((row["id"], reason))
-+    return kept
-+
-+
- def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
-     try:
-         parsed = int(value)
 diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
-index 06d56d70e9..6dd1cd22fe 100644
+index 06d56d70e96f710e90b88d1edc316687e87b3d79..6dd1cd22fe9535700159e2e64d6204b5b6b8d634 100644
 --- a/hermes_cli/kanban_db_sync.py
 +++ b/hermes_cli/kanban_db_sync.py
 @@ -689,6 +689,16 @@ class ClaimGate:
@@ -292,7 +95,7 @@ index 06d56d70e9..6dd1cd22fe 100644
      deadline = lease.expires_ms // 1000 - LEASE_SAFETY_MARGIN_SECONDS
      return ClaimGate(min(expires, deadline), lease=lease, ids=ids)
 diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
-index dd2e75b12b..46b8af0502 100644
+index dd2e75b12bddf86b43559dbc4470731759488881..46b8af0502a1b3eed62b13993fe75e67cc5e6a18 100644
 --- a/hermes_cli/kanban_ops.py
 +++ b/hermes_cli/kanban_ops.py
 @@ -240,14 +240,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -313,7 +116,7 @@ index dd2e75b12b..46b8af0502 100644
                  )
                  health_state["last_warn_at"] = now
 diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
-index 6076d76c11..7d2fb1fbcd 100644
+index 6076d76c110043f9aa9edb01d3962d1caeb3df5a..7d2fb1fbcda315d212114a65441b0bc7aebb8202 100644
 --- a/hermes_cli/kanban_worker_node.py
 +++ b/hermes_cli/kanban_worker_node.py
 @@ -209,16 +209,45 @@ def evict(conn: sqlite3.Connection) -> list[str]:
@@ -386,7 +189,7 @@ index 6076d76c11..7d2fb1fbcd 100644
                  continue
 diff --git a/tests/hermes_cli/test_kanban_runs_on_dispatch.py b/tests/hermes_cli/test_kanban_runs_on_dispatch.py
 new file mode 100644
-index 0000000000..87dbd8c013
+index 0000000000000000000000000000000000000000..87dbd8c0130ee977a9cb9c8f2040164ed8aa7fbd
 --- /dev/null
 +++ b/tests/hermes_cli/test_kanban_runs_on_dispatch.py
 @@ -0,0 +1,157 @@

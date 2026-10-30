@@ -1,0 +1,362 @@
+From 4e1c31106bc88ced5bfe12776175c29b9cbe534c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:24:19 +0000
+Subject: [PATCH] fix(plugins): serve has_hook from a fingerprint-checked hook
+ record so cold kanban assign skips plugin discovery [daveey]
+
+assign_task -> notify_task_updated -> has_hook ran a full plugin discovery in every
+cold gate helper (38-57s under macOS background QoS on the mini). Every discovery
+now records the hook names its plugins handle (registered or manifest-declared),
+stamped with the pre-sweep plugins_snapshot fingerprint, in cache/plugin_hooks.json.
+has_hook on an undiscovered manager answers from that record while the fingerprint
+matches; True still discovers in the invoke that follows. Missing, stale or corrupt
+records, and sweeps in which a plugin load timed out, fall back to full discovery.
+---
+diff --git a/hermes_cli/plugins_loader.py b/hermes_cli/plugins_loader.py
+index de22ba53f4018ea363bd5bd197f305d21db8955d..8a27a0c1f30ab2d2f72b83b2cc0cd20fb09421b6 100644
+--- a/hermes_cli/plugins_loader.py
++++ b/hermes_cli/plugins_loader.py
+@@ -619,6 +619,7 @@ class PluginLoaderMixin:
+             self._dispose_registrations(owned)
+             self._forget_registrations(owned)
+             loaded.error = _load_error_text(exc)
++            loaded.load_timed_out = isinstance(exc, PluginLoadTimeout)
+             # register() may have subscribed before raising; a failed plugin must leave no callable reachable
+             # from later event dispatch.
+             self._remove_plugin_subscriptions(plugin_key)
+diff --git a/hermes_cli/plugins_snapshot.py b/hermes_cli/plugins_snapshot.py
+index 28c31b4a973bca2ff7c706646bfeb7a382c63843..3c505cee342eb948f127114066bf4011e485bdce 100644
+--- a/hermes_cli/plugins_snapshot.py
++++ b/hermes_cli/plugins_snapshot.py
+@@ -189,6 +189,110 @@ def record(stamp: Optional[str], home: Optional[Path] = None) -> None:
+         logger.debug("plugin discovery snapshot write failed", exc_info=True)
+ 
+ 
++# --- Hook presence -------------------------------------------------------------------------------
++# [daveey] ``plugins.has_hook`` gates observer hooks (kanban ``on_kanban_task_updated`` after every
++# assign) and, in a process that never discovered, used to import every plugin first: 38-57 s in a
++# cold background-QoS helper on a loaded Mac. Every discovery now records the hook names its plugins
++# handle, stamped with the same pre-sweep :func:`fingerprint`, in a file of its own (so its writers
++# never invalidate the toolset record above). :func:`load_hooks` serves the set only while the
++# fingerprint matches; a missing, corrupt, stale or incomplete record returns None and the caller
++# discovers exactly as before. The set over-approximates: an over-reported hook only costs the
++# discovery the caller's invoke runs anyway, while an under-reported one would drop an observer, so:
++#
++# * a sweep in which any plugin's load timed out (its register() never finished) does not vouch for
++#   the set; it only adds to a complete record with the same stamp, never writes one of its own;
++# * hooks a manifest declares (``provides_hooks``) count even when the plugin did not register them;
++# * records with the same stamp are unioned, so processes that load the same inputs differently
++#   (another surface, a config-owned shell hook) can only grow the set.
++
++HOOKS_VERSION = 1
++
++
++def _hooks_path(home: Path) -> Path:
++    return home / "cache" / "plugin_hooks.json"
++
++
++def discovered_hooks(manager) -> Optional[set[str]]:
++    """Hook names ``manager``'s sweep handles (registered or declared); None when a plugin's load
++    timed out, since what it would have registered is unknown."""
++    plugins = list(dict(getattr(manager, "_plugins", {}) or {}).values())
++    if any(getattr(p, "load_timed_out", False) for p in plugins):
++        return None
++    names = {name for name, callbacks in dict(getattr(manager, "_hooks", {}) or {}).items() if callbacks}
++    for plugin in plugins:
++        declared = getattr(getattr(plugin, "manifest", None), "provides_hooks", None) or ()
++        if isinstance(declared, (list, tuple)):
++            names.update(h for h in declared if isinstance(h, str))
++    return names
++
++
++def _read_hooks_blob(home: Path) -> Optional[dict]:
++    try:
++        blob = json.loads(_hooks_path(home).read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    if not isinstance(blob, dict) or blob.get("version") != HOOKS_VERSION:
++        return None
++    stamp, hooks = blob.get("fingerprint"), blob.get("hooks")
++    if not isinstance(stamp, str) or not isinstance(hooks, list) or not all(isinstance(h, str) for h in hooks):
++        return None
++    return blob
++
++
++def record_hooks(stamp: Optional[str], manager, home: Optional[Path] = None) -> None:
++    """Persist ``manager``'s hook set stamped with the pre-sweep ``stamp`` (best-effort; see above)."""
++    if stamp is None:
++        return
++    try:
++        from utils import atomic_json_write
++
++        home = Path(home) if home is not None else get_hermes_home()
++        names = discovered_hooks(manager)
++        prior = _read_hooks_blob(home)
++        prior_hooks = set(prior["hooks"]) if prior is not None and prior["fingerprint"] == stamp else None
++        if names is None:
++            if prior_hooks is None:
++                return  # incomplete, and no complete record with these inputs to add to
++            names = prior_hooks | {n for n, cbs in dict(getattr(manager, "_hooks", {}) or {}).items() if cbs}
++        elif prior_hooks is not None:
++            names |= prior_hooks
++        if prior_hooks == names:
++            return  # nothing new; spare the write
++        blob = {"version": HOOKS_VERSION, "fingerprint": stamp, "hooks": sorted(names)}
++        atomic_json_write(_hooks_path(home), blob, indent=None, mode=0o600)  # type: ignore[arg-type]
++    except Exception:
++        logger.debug("plugin hook record write failed", exc_info=True)
++
++
++def load_hooks(home: Optional[Path] = None) -> Optional[frozenset[str]]:
++    """The recorded hook set for ``home`` while its discovery inputs are unchanged; None otherwise."""
++    try:
++        home = Path(home) if home is not None else get_hermes_home()
++        blob = _read_hooks_blob(home)
++        if blob is None or fingerprint(home) != blob["fingerprint"]:
++            return None
++        return frozenset(blob["hooks"])
++    except Exception:
++        logger.debug("plugin hook record read failed", exc_info=True)
++        return None
++
++
++def served_hooks(manager) -> Optional[frozenset[str]]:
++    """What ``plugins.has_hook`` answers from for an undiscovered ``manager``: its home's recorded
++    hook set, or None when discovery must decide (already discovered, discovery suppressed, a
++    background sweep in flight to join instead, or no usable record)."""
++    from hermes_cli import plugins as _plugins
++    from hermes_cli.plugins_discovery import plugin_discovery_suppressed
++
++    if getattr(manager, "_discovered", True) or plugin_discovery_suppressed():
++        return None
++    t = _plugins._background_discovery_thread
++    if t is not None and t.is_alive():
++        return None
++    home = getattr(manager, "home_path", None)
++    return load_hooks(Path(home)) if home is not None else None
++
++
+ def load(home: Optional[Path] = None) -> Optional[Snapshot]:
+     """The last recorded discovery for ``home`` when its inputs are unchanged and it showed no
+     built-in collision; None otherwise (missing, corrupt, older format, stale, or colliding)."""
+diff --git a/tests/hermes_cli/test_plugin_hook_presence_record.py b/tests/hermes_cli/test_plugin_hook_presence_record.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..06c946f7dac5f274d9d5ad083b9aa6db21b5ca83
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_hook_presence_record.py
+@@ -0,0 +1,212 @@
++"""A cold process answers ``has_hook`` from the recorded hook set instead of discovering every plugin.
++
++Each step runs in a fresh interpreter (the kanban gate helper's cold path) against a real isolated
++home with real user plugins: ``assign_task`` gates ``on_kanban_task_updated`` on ``has_hook``, which
++used to import every plugin first (38-57 s on a loaded Mac). The record must never drop an observer:
++a stale, missing or incomplete record falls back to the full discovery. [daveey]
++"""
++import json
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[2]
++
++PROBE = textwrap.dedent("""
++    import json, os, sys
++    from hermes_cli import plugins as P
++    from hermes_cli.plugins_discovery import plugin_discovery_suppressed
++    calls = {"discover_and_load": 0, "sweeps": 0}
++    _orig_dl = P.PluginManager.discover_and_load
++    def _spy_dl(self, *a, **k):
++        if not plugin_discovery_suppressed():
++            calls["discover_and_load"] += 1
++        return _orig_dl(self, *a, **k)
++    P.PluginManager.discover_and_load = _spy_dl
++    _orig_inner = P.PluginManager._discover_and_load_inner
++    def _spy_inner(self, *a, **k):
++        calls["sweeps"] += 1
++        return _orig_inner(self, *a, **k)
++    P.PluginManager._discover_and_load_inner = _spy_inner
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    mode, args = sys.argv[1], json.loads(sys.argv[2])
++    out = {}
++    if mode == "setup":
++        kb.init_db()
++        conn = kbc.connect()
++        out["task_id"] = kb.create_task(conn, title="t", assignee=args.get("assignee", "alice"), requires=args.get("requires"))
++        conn.close()
++    elif mode == "discover":   # a long-lived surface's normal startup discovery
++        P.discover_plugins()
++    elif mode == "assign":
++        conn = kbc.connect()
++        if args.get("kill_in_notify"):
++            def _die(*a, **k):
++                os._exit(9)    # the gate helper killed at its timeout, mid-notify
++            kb.notify_task_updated = _die
++        out["assigned"] = kb.assign_task(conn, args["task_id"], args["profile"])
++        conn.close()
++    out.update(calls)
++    print("RESULT " + json.dumps(out))
++""")
++
++
++def _run(home: Path, mode: str, *, expect_exit: int = 0, **args) -> dict:
++    env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_", "PYTEST"))}
++    pythonpath = os.pathsep.join([str(REPO), *(os.path.abspath(p) for p in sys.path if p)])
++    env.update(HERMES_HOME=str(home), HOME=str(home.parent), PYTHONPATH=pythonpath, PYTHONDONTWRITEBYTECODE="1")
++    proc = subprocess.run([sys.executable, "-c", PROBE, mode, json.dumps(args)], cwd=str(home.parent),
++                          env=env, capture_output=True, text=True, timeout=180, check=False)
++    assert proc.returncode == expect_exit, proc.stdout[-2000:] + proc.stderr[-4000:]
++    if expect_exit:
++        return {}
++    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
++    assert line, proc.stdout[-2000:] + proc.stderr[-4000:]
++    return json.loads(line[len("RESULT "):])
++
++
++def _plugin(home: Path, name: str, body: str, manifest_extra: str = "") -> Path:
++    d = home / "plugins" / name
++    d.mkdir(parents=True, exist_ok=True)
++    (d / "plugin.yaml").write_text(f"name: {name}\nversion: 0.1.0\ndescription: test plugin\n{manifest_extra}")
++    (d / "__init__.py").write_text(textwrap.dedent(body))
++    return d
++
++
++# A plugin that handles a hook nobody gates on kanban assign: discovery has real work to do.
++BYSTANDER = """
++    def register(ctx):
++        ctx.register_hook("on_session_start", lambda **kw: None)
++"""
++
++# An observer that appends every on_kanban_task_updated payload it receives to a file.
++OBSERVER = """
++    import json, os
++    def _on_update(**kw):
++        path = os.path.join(os.environ["HERMES_HOME"], "observed.jsonl")
++        with open(path, "a") as fh:
++            fh.write(json.dumps({"task_id": kw.get("task_id"), "changed_fields": kw.get("changed_fields")}) + "\\n")
++    def register(ctx):
++        ctx.register_hook("on_kanban_task_updated", _on_update)
++"""
++
++SLOW = """
++    import time
++    def register(ctx):
++        time.sleep(5)
++        ctx.register_hook("on_kanban_task_updated", lambda **kw: None)
++"""
++
++
++def _config(home: Path, enabled: list[str], extra: str = "") -> None:
++    (home / "config.yaml").write_text(f"plugins:\n  enabled: [{', '.join(enabled)}]\n{extra}")
++
++
++def _hooks_record(home: Path) -> dict | None:
++    path = home / "cache" / "plugin_hooks.json"
++    return json.loads(path.read_text()) if path.exists() else None
++
++
++def _observed(home: Path) -> list[dict]:
++    path = home / "observed.jsonl"
++    return [json.loads(ln) for ln in path.read_text().splitlines()] if path.exists() else []
++
++
++@pytest.fixture
++def home(tmp_path):
++    h = tmp_path / "hermes"
++    h.mkdir()
++    _plugin(h, "bystander", BYSTANDER)
++    return h
++
++
++@pytest.mark.parametrize("requires", [None, ["terminal", "file"]])
++def test_cold_assign_with_a_recorded_hook_set_does_no_discovery(home, requires):
++    _config(home, ["bystander"])
++    tid = _run(home, "setup", requires=requires, assignee="default" if requires else "alice")["task_id"]
++    _run(home, "discover")
++    record = _hooks_record(home)
++    assert record and "on_session_start" in record["hooks"]
++    assert "on_kanban_task_updated" not in record["hooks"]
++    if requires:
++        _run(home, "assign", task_id=tid, profile="default")  # seeds the admission toolset record too
++    out = _run(home, "assign", task_id=tid, profile="bob" if not requires else "default")
++    assert out["assigned"] is True
++    assert out["sweeps"] == 0 and out["discover_and_load"] == 0, out
++
++
++def test_missing_record_falls_back_to_discovery_and_records_for_the_next_process(home):
++    _config(home, ["bystander"])
++    tid = _run(home, "setup")["task_id"]
++    (home / "cache" / "plugin_hooks.json").unlink(missing_ok=True)
++    first = _run(home, "assign", task_id=tid, profile="bob")
++    assert first["assigned"] is True and first["sweeps"] == 1
++    assert _hooks_record(home) is not None
++    second = _run(home, "assign", task_id=tid, profile="carol")
++    assert second["sweeps"] == 0 and second["discover_and_load"] == 0
++
++
++def test_stale_record_falls_back_and_a_new_observer_still_receives_the_event(home):
++    _config(home, ["bystander"])
++    tid = _run(home, "setup")["task_id"]
++    _run(home, "discover")
++    assert "on_kanban_task_updated" not in _hooks_record(home)["hooks"]
++    # Installing an observer after the record was taken changes the discovery inputs.
++    _plugin(home, "observer", OBSERVER)
++    _config(home, ["bystander", "observer"])
++    out = _run(home, "assign", task_id=tid, profile="bob")
++    assert out["assigned"] is True and out["sweeps"] == 1
++    assert _observed(home) == [{"task_id": tid, "changed_fields": ["assignee"]}]
++
++
++def test_recorded_observer_is_served_true_and_receives_the_event_exactly_once(home):
++    _plugin(home, "observer", OBSERVER)
++    _config(home, ["bystander", "observer"])
++    tid = _run(home, "setup")["task_id"]
++    _run(home, "discover")
++    assert "on_kanban_task_updated" in _hooks_record(home)["hooks"]
++    (home / "observed.jsonl").unlink(missing_ok=True)
++    out = _run(home, "assign", task_id=tid, profile="bob")
++    assert out["assigned"] is True
++    assert out["sweeps"] == 1  # delivery needs the plugin loaded; the record only answered "yes"
++    assert _observed(home) == [{"task_id": tid, "changed_fields": ["assignee"]}]
++
++
++def test_manifest_declared_hook_counts_even_when_not_registered(home):
++    _plugin(home, "declarer", "def register(ctx):\n    pass\n",
++            manifest_extra="provides_hooks: [on_kanban_task_updated]\n")
++    _config(home, ["bystander", "declarer"])
++    _run(home, "setup")
++    _run(home, "discover")
++    assert "on_kanban_task_updated" in _hooks_record(home)["hooks"]
++
++
++def test_sweep_with_a_timed_out_plugin_does_not_vouch_for_the_hook_set(home):
++    _plugin(home, "slow", SLOW)
++    _config(home, ["bystander", "slow"], extra="  load_timeout_seconds: 1\n")
++    tid = _run(home, "setup")["task_id"]
++    _run(home, "discover")
++    assert _hooks_record(home) is None  # the slow plugin might register the observer when it is not slow
++    out = _run(home, "assign", task_id=tid, profile="bob")
++    assert out["sweeps"] == 1
++
++
++def test_assignment_is_committed_before_notify_so_a_killed_helper_leaves_it_whole(home):
++    import sqlite3
++
++    _config(home, ["bystander"])
++    tid = _run(home, "setup")["task_id"]
++    _run(home, "assign", expect_exit=9, task_id=tid, profile="bob", kill_in_notify=True)
++    db = next(home.rglob("kanban.db"))
++    con = sqlite3.connect(db)
++    try:
++        assert con.execute("SELECT assignee FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "bob"
++        events = con.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind = 'assigned'",
++                             (tid,)).fetchall()
++        assert [json.loads(p)["assignee"] for _, p in events] == ["bob"]
++    finally:
++        con.close()
+-- 
+2.55.0
+

@@ -16,28 +16,11 @@ unchanged. needs_buffer=True buffers text deltas for the turn so a held
 answer never streams (no surface can retract streamed text);
 include_background=True opts into kanban workers, subagents and cron.
 ---
- agent/conversation_compression.py         |   2 +-
- agent/pre_final_gate.py                   | 192 ++++++++++++++++++++
- agent/session_persistence.py              |   1 +
- agent/stream_delivery.py                  |  33 +++-
- agent/turn_context.py                     |   8 +-
- agent/turn_final_response.py              |   1 +
- agent/turn_finalizer.py                   |  13 +-
- agent/turn_stop_gates.py                  |  48 +++++
- agent/turn_tool_round.py                  |   2 +
- hermes_cli/config_defaults.py             |   4 +
- hermes_cli/plugins.py                     |   3 +
- tests/agent/test_pre_final_gate.py        | 202 ++++++++++++++++++++++
- website/docs/user-guide/features/hooks.md |  39 +++++
- 13 files changed, 544 insertions(+), 4 deletions(-)
- create mode 100644 agent/pre_final_gate.py
- create mode 100644 tests/agent/test_pre_final_gate.py
-
 diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
-index 3f2ce36b73..0e8e7eef49 100644
+index b265ca006bd51bcd27320588e7a74ea5945a5b79..dc14e7718b1f698c20c6e652db0501e38deb34c4 100644
 --- a/agent/conversation_compression.py
 +++ b/agent/conversation_compression.py
-@@ -2223,7 +2223,7 @@ def _message_text(message: Any) -> str:
+@@ -2169,7 +2169,7 @@ def _message_text(message: Any) -> str:
  
  _SYNTHETIC_USER_FLAGS = (
      "_todo_snapshot_synthetic", "_empty_recovery_synthetic", "_verification_stop_synthetic", "_pre_verify_synthetic",
@@ -48,7 +31,7 @@ index 3f2ce36b73..0e8e7eef49 100644
  
 diff --git a/agent/pre_final_gate.py b/agent/pre_final_gate.py
 new file mode 100644
-index 0000000000..538ae3c774
+index 0000000000000000000000000000000000000000..538ae3c7742ef3e337136baa321625ef5b0fde10
 --- /dev/null
 +++ b/agent/pre_final_gate.py
 @@ -0,0 +1,192 @@
@@ -245,7 +228,7 @@ index 0000000000..538ae3c774
 +    "turn_messages",
 +]
 diff --git a/agent/session_persistence.py b/agent/session_persistence.py
-index 92a5772a3b..f715c72f51 100644
+index 76237a3407e5cc22e2751eb4925d3ddd334c0433..e077c4f7502819e132aac139109b32b146e7f7c9 100644
 --- a/agent/session_persistence.py
 +++ b/agent/session_persistence.py
 @@ -39,6 +39,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
@@ -256,100 +239,11 @@ index 92a5772a3b..f715c72f51 100644
      "_kanban_stop_synthetic",  # kanban worker stop-guard
      "_dropped_toolcall_nudge",  # internal retry instruction; must not replay as user context
  )
-diff --git a/agent/stream_delivery.py b/agent/stream_delivery.py
-index c0d921c501..b7b79e0c4f 100644
---- a/agent/stream_delivery.py
-+++ b/agent/stream_delivery.py
-@@ -59,7 +59,7 @@ class StreamDeliveryMixin:
-         self._stream_reasoning_hooks_enabled = None
- 
-         def deliver(tail: str) -> None:
--            if tail:
-+            if tail and not self._buffer_final_gate_text(tail):
-                 self._deliver_to_stream_callbacks(tail)
-                 self._record_streamed_assistant_text(tail)
- 
-@@ -200,6 +200,9 @@ class StreamDeliveryMixin:
-         different final summary."""
-         if not isinstance(assistant_msg, dict):
-             return
-+        # Interim text is meant to be seen: release any pre_final_gate buffer first so
-+        # ``already_streamed`` below reflects what is on screen.
-+        self._flush_final_gate_buffer()
-         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
-         # Dedup within this message and against earlier deliveries, first occurrence wins.
-         pending: dict[str, str] = {}
-@@ -328,11 +331,39 @@ class StreamDeliveryMixin:
-                 text = text.lstrip("\n")
-         if not text:
-             return
-+        if self._buffer_final_gate_text(text):
-+            return
-+        self._deliver_stream_text(text)
-+
-+    def _deliver_stream_text(self, text: str) -> None:
-         delivered = self._deliver_to_stream_callbacks(text)
-         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
-         if delivered:
-             self._record_streamed_assistant_text(text)
- 
-+    # pre_final_gate buffer [daveey]: while a ``needs_buffer`` pre_final_gate hook is eligible this
-+    # turn (``_final_gate_buffer`` is a list, set per turn), visible text deltas are held here so a
-+    # held answer never reaches the screen. Released on a tool-call response (commentary), when the
-+    # gate delivers, or at turn end; discarded on hold. See agent/pre_final_gate.py.
-+    def _buffer_final_gate_text(self, text: str) -> bool:
-+        buf = getattr(self, "_final_gate_buffer", None)
-+        if buf is None:
-+            return False
-+        buf.append(text)
-+        return True
-+
-+    def _flush_final_gate_buffer(self) -> None:
-+        buf = getattr(self, "_final_gate_buffer", None)
-+        if buf:
-+            text = "".join(buf)
-+            buf.clear()
-+            self._deliver_stream_text(text)
-+
-+    def _discard_final_gate_buffer(self) -> None:
-+        buf = getattr(self, "_final_gate_buffer", None)
-+        if buf:
-+            buf.clear()
-+
-     def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
-         """Fire reasoning callback if registered; superseded writers are fenced like content deltas.
- 
-diff --git a/agent/turn_context.py b/agent/turn_context.py
-index 70d47a6c2e..c76c50c055 100644
---- a/agent/turn_context.py
-+++ b/agent/turn_context.py
-@@ -612,7 +612,7 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
-     ("_harness_metrics_turn", None),
-     ("_iteration_budget_warning_injected", False),
-     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
--    ("_pre_verify_nudges", 0),
-+    ("_pre_verify_nudges", 0), ("_pre_final_gate_attempts", 0),
- )
- 
- 
-@@ -622,6 +622,12 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
-         setattr(agent, name, value)
-     agent._turn_failed_file_mutations = {}
-     agent._turn_file_mutation_paths = set()
-+    # pre_final_gate stream buffer: a list only while a needs_buffer hook applies this turn.
-+    try:
-+        from agent.pre_final_gate import needs_buffer
-+        agent._final_gate_buffer = [] if needs_buffer(agent) else None
-+    except Exception:
-+        agent._final_gate_buffer = None
-     agent._tool_guardrails.reset_for_turn()
-     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
-     if callable(_reset_consol):
 diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
-index 8b0c9b1493..5592fb8995 100644
+index 39d1e735ad2a7c9adee57debc74c27d6d73a11ba..a6c40afd92aa066a7fefb722ea8e2622be6b22b8 100644
 --- a/agent/turn_final_response.py
 +++ b/agent/turn_final_response.py
-@@ -340,6 +340,7 @@ def finish_text_response(
+@@ -383,6 +383,7 @@ def finish_text_response(
      if _sg.continue_turn:
          final_response = None
          return _verdict("continue")
@@ -358,7 +252,7 @@ index 8b0c9b1493..5592fb8995 100644
      # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank
      # assistant row as settled, so a transform after this write would reach the user but never
 diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
-index ecb60b7175..4f2cd54b27 100644
+index 27bdd8fe6a187da2b16f0e7c4bcfbb79be558c22..64b272e4c128cac9af4ad73cd538c0f8c698fd67 100644
 --- a/agent/turn_finalizer.py
 +++ b/agent/turn_finalizer.py
 @@ -25,7 +25,10 @@ from agent.served_model import result_model_fields
@@ -373,7 +267,7 @@ index ecb60b7175..4f2cd54b27 100644
  
  _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
  
-@@ -531,6 +534,14 @@ def finalize_turn(
+@@ -597,6 +600,14 @@ def finalize_turn(
      """Run the post-loop finalization and return the turn ``result`` dict."""
      from agent.conversation_loop import logger
  
@@ -389,19 +283,19 @@ index ecb60b7175..4f2cd54b27 100644
          agent, final_response=final_response, api_call_count=api_call_count,
          interrupted=interrupted, failed=failed, messages=messages,
 diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
-index a762ca3237..f2c0227a6e 100644
+index 40e8d250db7ef88ba2e7042aadc9dd39dcf2c489..64e8fffead9ebf336905a0fa38aec70bb17df0cb 100644
 --- a/agent/turn_stop_gates.py
 +++ b/agent/turn_stop_gates.py
-@@ -3,6 +3,8 @@
- When the model stops with a text answer, three gates may instead append the answer as an
- interim row plus a synthetic user-role nudge and continue the turn: verify-on-stop (#65919),
+@@ -4,6 +4,8 @@ When the model stops with a text answer, four gates may instead append the answe
+ interim row plus a user-role nudge and continue the turn: late language-server verdicts on this
+ turn's edits (a durable row, see ``_late_lsp_verdicts``), verify-on-stop (#65919),
  the ``pre_verify`` plugin hook after code edits, and the kanban worker terminal-tool guard.
 +A fourth, the ``pre_final_gate`` hook [daveey], holds the answer silently (never emitted or
 +persisted) or appends to it; see ``agent/pre_final_gate.py``.
  Each keeps the candidate answer as a budget-exhaustion fallback
  (``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
  this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
-@@ -171,8 +173,54 @@ def apply_stop_gates(
+@@ -217,8 +219,54 @@ def apply_stop_gates(
              "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
          )
          return verdict
@@ -457,10 +351,10 @@ index a762ca3237..f2c0227a6e 100644
 +        agent._deliver_stream_text(suffix)
 +    return final_response
 diff --git a/agent/turn_tool_round.py b/agent/turn_tool_round.py
-index 412b6cf8a4..701d5d3ed8 100644
+index 0afc7ab88dd253ba41cda70f6528a3de37381140..ab661b026f7643831a190e2c0d65e1d0523ae4d7 100644
 --- a/agent/turn_tool_round.py
 +++ b/agent/turn_tool_round.py
-@@ -151,6 +151,8 @@ def run_tool_round(
+@@ -154,6 +154,8 @@ def run_tool_round(
  
      # A UI must never observe an assistant/tool-call row that is only an in-memory
      # projection: emit interim commentary after the DB append.
@@ -470,10 +364,10 @@ index 412b6cf8a4..701d5d3ed8 100644
          agent._emit_interim_assistant_message(assistant_msg)
  
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index c26bd53c94..afe7c1e5ed 100644
+index e4329c0282134133c1697026609c56452aba1028..2f955460ec5cceb04f538947d5cb457c345f3447 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
-@@ -216,6 +216,10 @@ DEFAULT_CONFIG = {
+@@ -204,6 +204,10 @@ DEFAULT_CONFIG = {
          # Also fire `pre_verify` on turns without file edits (changed_paths=[]), so a plugin can check
          # any final answer (e.g. a hand-off or an unverified "done"). False = upstream: edits only.
          "pre_verify_every_turn": False,
@@ -485,7 +379,7 @@ index c26bd53c94..afe7c1e5ed 100644
          # verification evidence exists or the agent explains why it can't check (bounded loop,
          # passive ledger). False (default) because the nudges proved more noise than signal; true =
 diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
-index a652179cd4..ae2d745783 100644
+index eda71a0ee43c89d18e9b9b076deb39a606d6c9f4..26b5f81b661c4783239f7a70b786cf6c2f554114 100644
 --- a/hermes_cli/plugins.py
 +++ b/hermes_cli/plugins.py
 @@ -117,6 +117,9 @@ VALID_HOOKS: set[str] = {
@@ -500,7 +394,7 @@ index a652179cd4..ae2d745783 100644
      # shape as pre/post_api_request plus ``aux_task``; distinct events so turn-scoped
 diff --git a/tests/agent/test_pre_final_gate.py b/tests/agent/test_pre_final_gate.py
 new file mode 100644
-index 0000000000..66c346a9be
+index 0000000000000000000000000000000000000000..66c346a9be24bbb5be79fa09177ac7937d55ba9d
 --- /dev/null
 +++ b/tests/agent/test_pre_final_gate.py
 @@ -0,0 +1,202 @@
@@ -707,10 +601,10 @@ index 0000000000..66c346a9be
 +    assert result["final_response"] == "fast answer" and run.shown == "fast answer"
 +    assert any("timed out" in r.getMessage() for r in caplog.records)
 diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
-index ea15a468b9..1472deb461 100644
+index dfb103090c5961d1d6d956774a3519db6fde783c..88f664cacfe49f99d24b6cc50056ebbf5f4ec8e3 100644
 --- a/website/docs/user-guide/features/hooks.md
 +++ b/website/docs/user-guide/features/hooks.md
-@@ -885,6 +885,45 @@ For standing guidance that should shape the built-in missing-evidence nudge, use
+@@ -888,6 +888,45 @@ For standing guidance that should shape the built-in missing-evidence nudge, use
  
  ---
  
@@ -757,5 +651,5 @@ index ea15a468b9..1472deb461 100644
  
  Fires once per failed API call, at the top of `agent/error_classifier.classify_api_error()`, before the built-in pipeline. Provider plugins use it to own their provider's error quirks without core patches. It is behavior-changing (transform family): the returned classification drives retry, compression, credential rotation, and fallback routing.
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

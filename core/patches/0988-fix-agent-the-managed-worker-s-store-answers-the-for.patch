@@ -1,0 +1,199 @@
+From 9b474b78ea39ed8521d98ac5f5275f3687b6bec1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:15:35 +0000
+Subject: [PATCH] fix(agent): the managed worker's store answers the fork's
+ session_db calls [daveey]
+
+Upstream's surface-parity test (3c34e12465c) found four fork calls a managed worker's
+RuntimeSessionStore could not answer: update_session_model (class metadata), _session_turn_lease_key
+(the stand-down latch), and the contended_wait_seconds / patience_s keywords. The store now accepts
+the keywords and serves the two reads through new receipt ops session.model and session.lease_key;
+a lease-key target outside the worker's lineage answers an opaque key that matches nothing.
+---
+ agent/runtime_session_store.py                | 21 +++++--
+ hermes_state_worker_lifecycle.py              | 40 ++++++++++++
+ ...st_runtime_session_store_surface_parity.py | 61 +++++++++++++++++++
+ 3 files changed, 118 insertions(+), 4 deletions(-)
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index f05c66459eb..643cf95bc6a 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -377,7 +377,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+     def acquire_session_turn_lease(self, session_id, holder, *, ttl_seconds=300.0,
+             wait_seconds=1800.0, poll_interval_seconds=1.0, on_wait=None,
+             wait_notice_interval_seconds=15.0, should_abort=None, acquire_patience_s=0.5,
+-            on_contended=None):
++            on_contended=None, contended_wait_seconds=0.0):
+         # Reuse only the local polling orchestrator, not the SQLite mixin surface. Same signature
+         # as the owner's (``on_contended``: a busy-database notice; the RPC try never raises it).
+         from hermes_state_compression import SessionCompressionMixin
+@@ -386,14 +386,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+             poll_interval_seconds=poll_interval_seconds, on_wait=on_wait,
+             wait_notice_interval_seconds=wait_notice_interval_seconds,
+             should_abort=should_abort, acquire_patience_s=acquire_patience_s,
+-            on_contended=on_contended)
++            on_contended=on_contended, contended_wait_seconds=contended_wait_seconds)
+ 
+     def refresh_session_turn_lease(self, session_id, holder, *, ttl_seconds=300.0, patience_s=None):
+         self._session(session_id)
+         return self._apply('turn.renew', {'holder': holder, 'ttl_seconds': ttl_seconds})['value']
+ 
+-    def release_session_turn_lease(self, session_id, holder):
+-        # DurableTurnLease retains its admission target across physical rotation.
++    def release_session_turn_lease(self, session_id, holder, *, patience_s=None):
++        # DurableTurnLease retains its admission target across physical rotation. ``patience_s`` (the
++        # owner's local write-lock patience) has no meaning for a receipt RPC.
+         self._apply('turn.cleanup', {'target': session_id, 'holder': holder})
+ 
+     def queue_token_counts(self, session_id, **usage):
+@@ -476,6 +477,18 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+         self._session(session_id)
+         self._apply('session.prompt', {'system_prompt': system_prompt})
+ 
++    def update_session_model(self, session_id, model, provider=None, *, base_url=None, api_mode=None,
++                             clear_model_routing=False):
++        self._session(session_id)
++        self._apply('session.model', {'model': model, 'provider': provider, 'base_url': base_url,
++                                      'api_mode': api_mode, 'clear_model_routing': bool(clear_model_routing)})
++
++    def _session_turn_lease_key(self, session_id):
++        # The stand-down latch compares lineage keys; the owner answers only within this lineage.
++        if not session_id:
++            return session_id
++        return self._apply('session.lease_key', {'target': session_id})['value']
++
+     def patch_session_model_config(self, session_id, patch):
+         self._session(session_id)
+         self._apply('session.sidecars', {'patch': patch})
+diff --git a/hermes_state_worker_lifecycle.py b/hermes_state_worker_lifecycle.py
+index 420408b8a66..c999143a15e 100644
+--- a/hermes_state_worker_lifecycle.py
++++ b/hermes_state_worker_lifecycle.py
+@@ -183,7 +183,47 @@ def worker_user_content(db, conn, session_id, payload):
+         (db._encode_content(payload['content']), _row_id(payload), session_id)).rowcount}
+ 
+ 
++
++def worker_model(db, conn, session_id, payload):
++    """``SessionDB.update_session_model`` on the receipt connection (model column + model_config
++    route, Browser lock dropped). [daveey] The fork's class-metadata persistence calls it."""
++    if (set(payload) != {'model', 'provider', 'base_url', 'api_mode', 'clear_model_routing'}
++            or any(payload[k] is not None and not isinstance(payload[k], str)
++                   for k in ('model', 'provider', 'base_url', 'api_mode'))
++            or not isinstance(payload['clear_model_routing'], bool)):
++        raise RuntimeStoreError('invalid_params')
++    patch = {'browser_model_lock': None}
++    if payload['clear_model_routing']:
++        patch['model_routing'] = None
++    if payload['model']:
++        patch['model'] = payload['model']
++    if payload['provider']:
++        route = {'provider': payload['provider'], 'base_url': payload['base_url'] or None,
++                 'api_mode': payload['api_mode'] or None}
++        patch.update(route, gateway_runtime=route)
++    from hermes_state_sessions import _MODEL_CONFIG_ROW_MISSING
++    merged = db._merge_model_config_json(conn, session_id, patch)
++    if merged is not _MODEL_CONFIG_ROW_MISSING:
++        conn.execute('UPDATE sessions SET model=?, model_config=? WHERE id=?', (payload['model'], merged, session_id))
++    return {'value': None}
++
++
++def worker_lease_key(db, conn, session_id, payload):
++    """``SessionDB._session_turn_lease_key`` for this session's lineage only. [daveey] A target outside
++    it answers an opaque key that matches nothing, so a worker can neither read another conversation's
++    lineage nor be told two foreign ids share one."""
++    if set(payload) != {'target'} or not isinstance(payload['target'], str):
++        raise RuntimeStoreError('invalid_params')
++    target = payload['target']
++    key = db._session_turn_lease_key_on_conn(conn, target)
++    if target != session_id and key != db._session_turn_lease_key_on_conn(conn, session_id):
++        return {'value': f'foreign:{target}'}
++    return {'value': key}
++
++
+ WORKER_LIFECYCLE_HANDLERS = {
++    'session.model': worker_model,
++    'session.lease_key': worker_lease_key,
+     'session.title': worker_title,
+     'session.title_source': worker_title_source,
+     'session.next_title': worker_next_title,
+diff --git a/tests/agent/test_runtime_session_store_surface_parity.py b/tests/agent/test_runtime_session_store_surface_parity.py
+index 2ffb4053496..60d81f292a3 100644
+--- a/tests/agent/test_runtime_session_store_surface_parity.py
++++ b/tests/agent/test_runtime_session_store_surface_parity.py
+@@ -4,6 +4,7 @@ owner's SessionDB (Adolanium reg-1 was one missing keyword; the sweep found two
+ the failed-turn boundary's tail role and in-place compaction's held-row liveness)."""
+ import ast
+ import inspect
++import json
+ from pathlib import Path
+ import re
+ 
+@@ -66,3 +67,63 @@ def test_tail_reads_answer_like_the_owner(tmp_path):
+             store.close()
+     finally:
+         db.close()
++
++
++def _worker_store(db, tmp_path, session_id='s'):
++    epoch = begin_runtime_epoch(db, instance_id='fixture')
++    scope = dict(epoch=epoch, execution_id='w', session_id=session_id, generation=0)
++    register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
++    return RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
++
++
++def test_update_session_model_writes_like_the_owner(tmp_path):
++    """[daveey] Class-metadata persistence calls update_session_model on the worker's store."""
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        db.create_session('s', 'cli', model='old', model_config={'browser_model_lock': 'x', 'keep': 1,
++                                                                  'model_routing': {'class': 'c'}})
++        store = _worker_store(db, tmp_path)
++        try:
++            store.update_session_model('s', 'new-model')
++            row = db.get_session('s')
++            assert row['model'] == 'new-model'
++            config = json.loads(row['model_config'])
++            assert config == {'keep': 1, 'model': 'new-model', 'model_routing': {'class': 'c'}}
++            store.update_session_model('s', 'm2', 'prov', base_url='https://x', clear_model_routing=True)
++            config = json.loads(db.get_session('s')['model_config'])
++            # Same merge as the owner's SessionDB.update_session_model (None deletes a key).
++            db.create_session('o', 'cli', model='old', model_config={'browser_model_lock': 'x', 'keep': 1,
++                                                                      'model_routing': {'class': 'c'}})
++            db.update_session_model('o', 'new-model')
++            db.update_session_model('o', 'm2', 'prov', base_url='https://x', clear_model_routing=True)
++            assert config == json.loads(db.get_session('o')['model_config'])
++            assert config['gateway_runtime']['provider'] == 'prov' and config['model'] == 'm2'
++            assert 'model_routing' not in config and 'browser_model_lock' not in config
++            with pytest.raises(Exception):
++                store.update_session_model('other', 'm')
++        finally:
++            store.close()
++    finally:
++        db.close()
++
++
++def test_lease_key_answers_only_inside_the_workers_lineage(tmp_path):
++    """[daveey] session_was_taken_over compares lineage keys through the worker's store."""
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        db.create_session('root', 'cli')
++        db.end_session('root', 'compression')
++        db.create_session('tip', 'cli', parent_session_id='root')
++        db.create_session('a', 'cli')
++        db.create_session('b', 'cli')
++        assert db._session_turn_lease_key('tip') == 'root'
++        store = _worker_store(db, tmp_path, session_id='tip')
++        try:
++            assert store._session_turn_lease_key('tip') == store._session_turn_lease_key('root') == 'root'
++            assert store._session_turn_lease_key('a') != store._session_turn_lease_key('b')
++            assert store._session_turn_lease_key('a') != 'root'
++            assert store._session_turn_lease_key('a') != db._session_turn_lease_key('a')
++        finally:
++            store.close()
++    finally:
++        db.close()
+-- 
+2.55.0
+

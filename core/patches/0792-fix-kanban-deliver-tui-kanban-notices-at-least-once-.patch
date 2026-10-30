@@ -23,21 +23,11 @@ the chat never got a row, and nothing retried.
 - The unloaded sweep stamps kanban_event_keys so live/sweep paths dedup.
 
 ---
- hermes_cli/kanban_db.py                       |   3 +
- hermes_cli/kanban_db_connect.py               |   5 +
- hermes_cli/kanban_db_notify.py                | 188 +++++++++++++-
- hermes_state_messages.py                      |  49 +++-
- .../test_kanban_notice_at_least_once.py       | 244 ++++++++++++++++++
- tui_gateway/kanban_unloaded.py                |   9 +-
- tui_gateway/session_notifications.py          | 156 ++++++++++-
- 7 files changed, 638 insertions(+), 16 deletions(-)
- create mode 100644 tests/tui_gateway/test_kanban_notice_at_least_once.py
-
 diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
-index 4c88960f72..c1b466f4d7 100644
+index d9071819aa96c1de542ae2d2fb24abcca02ccc2f..820bcad519f350ab0687d41bbc4a2444746b7a8e 100644
 --- a/hermes_cli/kanban_db.py
 +++ b/hermes_cli/kanban_db.py
-@@ -1002,6 +1002,9 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
+@@ -1000,6 +1000,9 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
      created_at    INTEGER NOT NULL,
      last_event_id INTEGER NOT NULL DEFAULT 0,
      last_ping_event_id INTEGER NOT NULL DEFAULT 0,
@@ -48,10 +38,10 @@ index 4c88960f72..c1b466f4d7 100644
  );
  
 diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
-index d3fa8935d7..27b2afef78 100644
+index bf195c80a6a4de6d204290cf9c3234bbe120ff57..e85e1950a6a6a0d3c17a88aad31a8613c6dd76ea 100644
 --- a/hermes_cli/kanban_db_connect.py
 +++ b/hermes_cli/kanban_db_connect.py
-@@ -1071,6 +1071,10 @@ _NOTIFY_SUB_COLUMNS = (
+@@ -1070,6 +1070,10 @@ _NOTIFY_SUB_COLUMNS = (
      # (which prefers ``user_id_alt``). NULL is inert.
      ("user_id_alt", "user_id_alt TEXT"),
      ("delivery_metadata", "delivery_metadata TEXT"),
@@ -62,7 +52,7 @@ index d3fa8935d7..27b2afef78 100644
  )
  
  _TASK_RUN_COLUMNS = (
-@@ -1274,6 +1278,7 @@ _REBUILD_SPECS = {
+@@ -1283,6 +1287,7 @@ _REBUILD_SPECS = {
          " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
          " last_event_id INTEGER NOT NULL DEFAULT 0,"
          " last_ping_event_id INTEGER NOT NULL DEFAULT 0,"
@@ -71,10 +61,10 @@ index d3fa8935d7..27b2afef78 100644
          ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
      ),
 diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
-index 15cd7da928..3d97bf95ed 100644
+index 3867e6ad9e86b1e78745fe36401396350b71da32..bf8c729809b94e0dd354853305e8760a0e47f8a2 100644
 --- a/hermes_cli/kanban_db_notify.py
 +++ b/hermes_cli/kanban_db_notify.py
-@@ -368,6 +368,7 @@ def claim_unseen_events_for_sub(
+@@ -488,6 +488,7 @@ def claim_unseen_events_for_sub(
      chat_id: str,
      thread_id: Optional[str] = None,
      kinds: Optional[Iterable[str]] = None,
@@ -82,7 +72,7 @@ index 15cd7da928..3d97bf95ed 100644
  ) -> tuple[int, int, list[Event]]:
      """Atomically claim unseen events for one subscription.
  
-@@ -377,8 +378,25 @@ def claim_unseen_events_for_sub(
+@@ -497,8 +498,25 @@ def claim_unseen_events_for_sub(
      writer lock and only the first claims a given event range. Callers send the
      events, then leave the cursor or call :func:`rewind_notify_cursor` on
      delivery failure.
@@ -108,7 +98,7 @@ index 15cd7da928..3d97bf95ed 100644
          old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
          if old_cursor is None:
              return 0, 0, []
-@@ -388,10 +406,162 @@ def claim_unseen_events_for_sub(
+@@ -508,10 +526,162 @@ def claim_unseen_events_for_sub(
          )
          if not events:
              return old_cursor, old_cursor, []
@@ -272,7 +262,7 @@ index 15cd7da928..3d97bf95ed 100644
  def _cas_cursor(conn: sqlite3.Connection, key: tuple, new_cursor: int, expected: int) -> sqlite3.Cursor:
      """Move ``last_event_id`` only if it still equals ``expected``."""
      return conn.execute(
-@@ -443,7 +613,21 @@ def rewind_notify_cursor(
+@@ -563,7 +733,21 @@ def rewind_notify_cursor(
      notifier advanced the row, so retries never clobber newer progress.
      """
      with _kb.write_txn(conn):
@@ -295,83 +285,9 @@ index 15cd7da928..3d97bf95ed 100644
      return cur.rowcount > 0
  
  
-diff --git a/hermes_state_messages.py b/hermes_state_messages.py
-index c915d56217..8ebdff0599 100644
---- a/hermes_state_messages.py
-+++ b/hermes_state_messages.py
-@@ -462,27 +462,62 @@ class SessionMessagesMixin:
-         one writer txn so two gateway processes cannot both land it. Refuses (SessionTurnLeaseLostError) while
-         another backend runs a live turn in the session: that backend's poller owns delivery. A NULL
-         ``last_read_at`` (never tracked = read) is stamped just before the notice so it reads unread. [daveey]"""
-+        return self.record_kanban_notice(session_id, content, metadata)[0]
-+
-+    def kanban_notice_keys_delivered(self, session_id: str, keys: Any) -> set[str]:
-+        """Which of ``keys`` (``"<board>:<event id>"``) already have a kanban notice row anywhere in this
-+        session's compression lineage: the event-id dedup for at-least-once kanban delivery. [daveey]"""
-+        wanted = {str(k) for k in keys or () if k}
-+        if not wanted:
-+            return set()
-+        from hermes_state_sessions import _LINEAGE_CTE_SQL
-+        with self._read_ctx() as conn:
-+            rows = conn.execute(
-+                _LINEAGE_CTE_SQL + " SELECT DISTINCT j.value FROM messages m, "
-+                "json_each(json_extract(m.display_metadata, '$.kanban_event_keys')) j "
-+                "WHERE m.session_id IN (SELECT id FROM lineage) AND m.display_kind = 'kanban_notice' "
-+                "AND json_valid(m.display_metadata)", (session_id, session_id)).fetchall()
-+        return wanted & {str(r[0]) for r in rows}
-+
-+    def record_kanban_notice(self, session_id: str, content: str, metadata: dict[str, Any], *,
-+                             message: Optional[dict[str, Any]] = None,
-+                             reject_active_turn: bool = True) -> tuple[int, bool]:
-+        """:meth:`append_kanban_notice` returning ``(row id, inserted)``. Besides ``notice_id``, any of
-+        ``metadata['kanban_event_keys']`` already present in the session's lineage counts as delivered (no row is
-+        written and that row's id is returned), checked in the same writer txn. ``message`` supplies the
-+        stamped dict (timestamp, uid) a live turn will adopt; ``reject_active_turn=False`` is for the backend
-+        that just admitted the turn itself. [daveey]"""
-         notice_id = metadata.get("notice_id")
-         if not notice_id:
-             raise ValueError("Kanban notice requires a stable notice_id")
--        msg = {"content": content, "display_kind": "kanban_notice", "display_metadata": metadata}
--        stamp_message_uid(msg)
--        ts = time.time()
-+        msg: dict[str, Any] = dict(message) if message else {"content": content}
-+        msg.update({"content": content, "display_kind": "kanban_notice", "display_metadata": metadata})
-+        if not msg.get("message_uid"):
-+            stamp_message_uid(msg)
-+        ts = float(msg.get("timestamp") or time.time())
-         params = self._message_row_params(session_id, "user", msg, None, ts, keep_reasoning=True)
-+        keys = [str(k) for k in metadata.get("kanban_event_keys") or () if k]
-+        from hermes_state_sessions import _LINEAGE_CTE_SQL  # watermark is lineage-stamped
- 
-         def _do(conn):
-             existing = conn.execute(
-                 "SELECT m.id FROM messages m WHERE m.session_id = ? AND m.display_kind = 'kanban_notice' "
-                 "AND json_extract(m.display_metadata, '$.notice_id') = ? LIMIT 1", (session_id, notice_id)).fetchone()
-+            if existing is None and keys:
-+                existing = conn.execute(
-+                    _LINEAGE_CTE_SQL + " SELECT m.id FROM messages m, "
-+                    "json_each(json_extract(m.display_metadata, '$.kanban_event_keys')) j "
-+                    "WHERE m.session_id IN (SELECT id FROM lineage) AND m.display_kind = 'kanban_notice' "
-+                    "AND json_valid(m.display_metadata) AND j.value IN (" + ",".join("?" * len(keys)) + ") LIMIT 1",
-+                    (session_id, session_id, *keys)).fetchone()
-             if existing is not None:
--                return existing[0]
--            self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
-+                return existing[0], False
-+            self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=reject_active_turn)
-             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
-             self._bump_session_counters(conn, session_id, 1, 0, unit=True)
--            from hermes_state_sessions import _LINEAGE_CTE_SQL  # watermark is lineage-stamped
-             conn.execute(_LINEAGE_CTE_SQL + "UPDATE sessions SET last_read_at = ? WHERE last_read_at IS NULL "
-                          "AND id IN (SELECT id FROM lineage)", (session_id, session_id, ts - 0.001))
--            return msg_id
-+            return msg_id, True
- 
-         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
- 
 diff --git a/tests/tui_gateway/test_kanban_notice_at_least_once.py b/tests/tui_gateway/test_kanban_notice_at_least_once.py
 new file mode 100644
-index 0000000000..84d7e6a173
+index 0000000000000000000000000000000000000000..cb0c0c0ba6dc0b9dde28b254fd5e45aea8f90f18
 --- /dev/null
 +++ b/tests/tui_gateway/test_kanban_notice_at_least_once.py
 @@ -0,0 +1,244 @@
@@ -620,7 +536,7 @@ index 0000000000..84d7e6a173
 +    assert [o["task_id"] for o in out] == [tid]
 +    assert len(_notices(d)) == 1 and tid in _notices(d)[0]["content"]
 diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
-index 5f093e5794..0626bce4f6 100644
+index 5f093e5794976385f7be2605027a5f9a785a7b26..9b985fbbafb0e925e28cc9af0eb0c478d0510bc2 100644
 --- a/tui_gateway/kanban_unloaded.py
 +++ b/tui_gateway/kanban_unloaded.py
 @@ -296,6 +296,11 @@ def sweep_once(
@@ -646,219 +562,6 @@ index 5f093e5794..0626bce4f6 100644
      held_by, verdict = _route_notice(holders, ident, tip, slug, task, texts, now, grace_s)
      persisted = True
      if verdict is None:  # a worker slot is ours: the job wakes, or writes the row itself
-diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
-index 0eb825ec94..39a7153922 100644
---- a/tui_gateway/session_notifications.py
-+++ b/tui_gateway/session_notifications.py
-@@ -534,12 +534,19 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
-             subs = _kbn.list_notify_subs(conn, platform="tui", chat_id=session_key)
-         except Exception:
-             return []
-+        if subs:
-+            # A claim whose holder process died (serve replaced mid-turn) goes back to the cursor. [daveey]
-+            with contextlib.suppress(Exception):
-+                _kbn.recover_orphaned_notify_claims(conn, platform="tui", chat_id=session_key)
-         for sub in subs:
-             if (sub.get("platform") or "").lower() != "tui" or sub.get("chat_id") != session_key:
-                 continue
-             sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-                              thread_id=sub.get("thread_id") or "")
--            _old, _new, events = _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS, **sub_ident)
-+            # durable: the claim stays IN FLIGHT (owned by this process) until the notice is in the transcript
-+            # (_kb_ack_durable acks it); a process that dies first hands it back. [daveey]
-+            _old, _new, events = _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS,
-+                                                                   durable=claims is not None, **sub_ident)
-             if not events:
-                 continue
-             claim = None
-@@ -549,18 +556,25 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
-             task = _kb.get_task(conn, sub["task_id"])
-             from gateway.kanban_watchers_notifier import diagnostic_event
-             from gateway.warning_notifications import DiagnosticText
-+            sub_texts = []
-             for ev in events:
-                 text = _format_kanban_event_text(sub, task, ev, slug)
-                 if text:
-                     text = DiagnosticText(text) if diagnostic_event(ev) else _KanbanText(text)
-+                    text._kb_keys = (f"{slug}:{int(ev.id)}",)  # type: ignore[attr-defined]  # event-id identity
-                     texts.append(text)
-+                    sub_texts.append(text)
-                     if claim is not None:
-                         claim["texts"].append(text)
-             if claim is not None and not claim["texts"]:
-                 claims.remove(claim)  # silent kinds only (archived/unblocked): nothing to deliver or hand back
-+            if not sub_texts:
-+                with contextlib.suppress(Exception):  # nothing to deliver: the claim is complete as is
-+                    _kbn.ack_notify_claim(conn, upto=_new, from_cursor=_old, **sub_ident)
-             # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a
--            # later reopen notify the same session. The claimed cursor prevents replay.
--            if task and getattr(task, "status", "") == "archived":
-+            # later reopen notify the same session. The claimed cursor prevents replay. A sub with notices still in
-+            # flight is removed by their ack instead, so the claim it records survives until delivery. [daveey]
-+            if task and getattr(task, "status", "") == "archived" and (not sub_texts or claim is None):
-                 with contextlib.suppress(Exception):
-                     _kbn.remove_notify_sub(conn, **sub_ident)
-     from hermes_constants import get_hermes_home
-@@ -688,6 +702,8 @@ def _kb_rewind_refused(session: dict, batch: list) -> None:
-     remaining = []
-     for claim in reversed(claims):
-         texts = claim.get("texts") or []
-+        if claim.get("durable"):
-+            continue  # already in the transcript (written before the turn): nothing to hand back [daveey]
-         if texts and all(id(t) in refused for t in texts):
-             if claim.get("remote"):
-                 from tui_gateway import kanban_remote_notices as _krn
-@@ -735,6 +751,117 @@ def _kb_mark_delivered(session: dict, batch: list) -> None:
-     session.pop("_kanban_refused_until", None)
- 
- 
-+def _kb_text_keys(texts) -> list:
-+    return [k for t in texts for k in (getattr(t, "_kb_keys", None) or ())]
-+
-+
-+def _kb_ack_durable(session: dict, durable_ids: set) -> None:
-+    """Mark claims whose every text is now in the transcript (``durable_ids``) and ack them on the board: per
-+    subscription, the contiguous run of durable claims from the earliest outstanding one (an earlier claim still
-+    pending keeps the in-flight marker, so a crash still redelivers it). Never raises. [daveey]"""
-+    from hermes_cli import kanban_db_connect as _kbc
-+    from hermes_cli import kanban_db_notify as _kbn
-+    by_sub: dict = {}
-+    for claim in session.get("_kanban_claims") or []:
-+        if claim.get("remote"):
-+            continue
-+        texts = claim.get("texts") or []
-+        if texts and all(id(t) in durable_ids for t in texts):
-+            claim["durable"] = True
-+        key = (claim["board"], claim["task_id"], claim["platform"], claim["chat_id"], claim.get("thread_id") or "")
-+        by_sub.setdefault(key, []).append(claim)
-+    for (board, task_id, platform, chat_id, thread_id), group in by_sub.items():
-+        group.sort(key=lambda c: int(c["old"]))
-+        run = []
-+        for claim in group:
-+            if not claim.get("durable") or claim.get("acked"):
-+                break
-+            run.append(claim)
-+        if not run:
-+            continue
-+        try:
-+            with contextlib.closing(_kbc.connect(board=board)) as conn:
-+                _kbn.ack_notify_claim(conn, task_id=task_id, platform=platform, chat_id=chat_id, thread_id=thread_id,
-+                                      upto=int(run[-1]["new"]), from_cursor=int(run[0]["old"]))
-+            for claim in run:
-+                claim["acked"] = True
-+        except Exception as exc:
-+            _notif_log_failure("kanban notice ack failed (a restart redelivers; the row dedups)", exc)
-+
-+
-+def _kb_persist_batch(session: dict, batch: list, diagnostic: bool) -> tuple:
-+    """Write this batch's kanban notices into the chat's transcript BEFORE its turn runs, so the claim can be
-+    acknowledged: at-least-once delivery. Returns ``(verdict, batch, kwargs)``:
-+
-+    - ``"written"``: one ``kanban_notice`` row holds the (remaining) batch and is staged for the turn to adopt
-+      (no second row); ``kwargs`` carry its display kind/metadata for the submit.
-+    - ``"delivered"``: every notice is already in the transcript (a redelivery after a crash): no turn.
-+    - ``"busy"``: a turn lease / compaction holds the transcript now: retry on a later poll.
-+    - ``"unkeyed"``: nothing to persist here (remote-only notices, no session store/row): the turn runs as
-+      before and its own user row is the record.
-+
-+    Notices whose event keys are already in the transcript are dropped from ``batch`` (dedup by event id)."""
-+    keys = _kb_text_keys(batch)
-+    if not keys:
-+        return "unkeyed", batch, {}
-+    from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
-+    try:
-+        with _session_db(session) as db:
-+            if db is None or not hasattr(db, "record_kanban_notice"):
-+                return "unkeyed", batch, {}
-+            target = _submit_row_target_key(session)
-+            if not target or db.get_session(target) is None:
-+                return "unkeyed", batch, {}
-+            done = db.kanban_notice_keys_delivered(target, keys)
-+            fresh = [t for t in batch if not (getattr(t, "_kb_keys", None) and set(t._kb_keys) <= done)]
-+            if not fresh:
-+                return "delivered", [], {}
-+            text = "\n".join(fresh)
-+            fresh_keys = _kb_text_keys(fresh)
-+            import hashlib
-+            metadata = {"notice_id": "live:" + hashlib.sha1(",".join(sorted(fresh_keys)).encode()).hexdigest()[:20],
-+                        "display_text": text, "kanban_event_keys": fresh_keys}
-+            if diagnostic:
-+                metadata["notification_category"] = "diagnostic"
-+            from agent.context_compressor import _DB_PERSISTED_MARKER
-+            from agent.message_metadata import stamp_message_timestamp, stamp_message_uid
-+            staged = stamp_message_timestamp({"role": "user", "content": text, "display_kind": "kanban_notice",
-+                                              "display_metadata": metadata})
-+            stamp_message_uid(staged)
-+            row_id, inserted = db.record_kanban_notice(target, text, metadata, message=staged)
-+            if not inserted:
-+                return "busy", batch, {}  # raced another consumer for some of these keys: re-filter next poll
-+    except (SessionTurnLeaseLostError, CompressionSessionClosedError):
-+        return "busy", batch, {}
-+    except Exception as exc:
-+        _notif_log_failure("kanban notice row write failed; the turn records it instead", exc)
-+        return "unkeyed", batch, {}
-+    staged["_row_id"] = row_id
-+    staged[_DB_PERSISTED_MARKER] = True
-+    staged[_SUBMIT_ROW_SESSION_KEY] = target
-+    session["_submit_user_row"] = staged
-+    return "written", fresh, {"display_kind": "kanban_notice", "display_metadata": metadata}
-+
-+
-+def _kb_release_claims(session: dict) -> None:
-+    """The poller is stopping with notices still buffered: hand their claimed ranges back (newest first, CAS) so
-+    the chat's next consumer delivers them now instead of after this process exits. Never raises. [daveey]"""
-+    from hermes_cli import kanban_db_connect as _kbc
-+    from hermes_cli import kanban_db_notify as _kbn
-+    for claim in reversed(session.get("_kanban_claims") or []):
-+        if claim.get("remote") or claim.get("durable") or not claim.get("texts"):
-+            continue
-+        try:
-+            with contextlib.closing(_kbc.connect(board=claim["board"])) as conn:
-+                _kbn.rewind_notify_cursor(
-+                    conn, task_id=claim["task_id"], platform=claim["platform"], chat_id=claim["chat_id"],
-+                    thread_id=claim.get("thread_id") or "", claimed_cursor=claim["new"], old_cursor=claim["old"])
-+        except Exception as exc:
-+            _notif_log_failure("kanban notice release on poller stop failed", exc)
-+    session["_kanban_claims"] = []
-+    session["_kanban_pending"] = []
-+
-+
- def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
-     """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
-     cursor-claimed, so they wait in the buffer instead of dropping the agent turn; a turn the admission gate
-@@ -764,15 +891,32 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
-         diagnostic = split and isinstance(pending[0], DiagnosticText)
-         batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
-         session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
-+    # At-least-once: the notices land in the transcript and the board claim is acked
-+    # BEFORE the turn runs; until then the claim is in flight and a process that dies first hands it back.
-+    verdict, fresh, submit_kwargs = _kb_persist_batch(session, batch, diagnostic)
-+    if verdict == "busy":
-+        with session["history_lock"]:
-+            session["_kanban_pending"] = batch + (session.get("_kanban_pending") or [])
-+        _notif_release_turn(session)
-+        return
-+    if verdict in ("written", "delivered"):
-+        _kb_ack_durable(session, {id(t) for t in batch})
-+    if verdict == "delivered":
-+        _kb_mark_delivered(session, batch)
-+        _notif_release_turn(session)
-+        return
-+    if verdict == "unkeyed" and diagnostic:
-+        submit_kwargs = {"display_metadata": {"notification_category": "diagnostic"}}
-     try:
--        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
--                                 "kanban notification dispatch failed",
--                                 **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
-+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(fresh),
-+                                 "kanban notification dispatch failed", **submit_kwargs)
-     except Exception:
-         accepted = False
-     if accepted is False:
-         _kb_rewind_refused(session, batch)
-     else:
-+        if verdict == "unkeyed":  # the accepted turn's own user row is the record
-+            _kb_ack_durable(session, {id(t) for t in batch})
-         _kb_mark_delivered(session, batch)
- 
- 
+-- 
+2.55.0
+
