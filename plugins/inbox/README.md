@@ -25,7 +25,11 @@ card never duplicates a Kanban card that is already doing the work. Routine stat
 **Ask contract (every door).** `post()` is the one gate for the tool, `hermes inbox post`, REST and any replica
 apply. A post must name a registered `poster` (`posters.yaml`; local extras in `<home>/inbox/posters.yaml`; the
 family is the text before `·`, so `kanban · <title>` is `kanban`) and carry `ask={interaction, why_human, action}`
-(`approval|credential|publish_as_david|physical|preference`), except cards whose type has `resolve` actions. Test
+(`approval|credential|publish_as_david|physical|preference`), except cards whose type has `resolve` actions. Agent-owned
+families (`kanban`, `coach`, `cron`) list the decision types they really post (no `*`), and their resolve-typed
+titles still go through the status/defect wording check (`content_status`/`content_defect`; quoted third-party
+text such as a reply draft's tweet is skipped; `self-heal` opts out with `defect_titles`, since `selfheal_reason`
+gates it). Their non-resolve asks count only when derived from the card's `human_request`. Test
 or status wording (`TEST`, `scratch`, `CTESTLIVE`, `9999-..` dates, `failed`/`expired`/`X DM sent`), an
 unregistered or type-forbidden poster, a missing ask, and any write to the real inbox under pytest/`HERMES_TEST`
 are refused. A refusal is never silent: it becomes a Kanban card (`inbox-refused:<family>:<key>`; repeats are
