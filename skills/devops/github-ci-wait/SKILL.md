@@ -49,7 +49,8 @@ python3 -B $S <sha> --workflow release.yml --tag-glob 'v*'   # released: a v* ta
 python3 -B $S <sha> --once                            # one check: exit 0 done, 1 finished red, 2 not yet
 ```
 
-Exit codes: 0 done (prints the run URLs or tags); 1 stalled (nothing queued or running will finish it,
+Exit codes: 0 done (prints the run URLs or tags; a run that built a later commit containing yours is marked
+`(ran on <sha>, a later commit containing it)`, so cite it as CI on that commit, not on yours); 1 stalled (nothing queued or running will finish it,
 and the failing run's URL is printed), or `gh run list` failed 5 times in a row (prints `gh kept failing`: a `gh`
 auth or repo problem, not a CI failure); 2 timed out (default 120 min) or not yet with `--once` (a failed listing
 included); 3 the sha isn't on `origin/<branch>` (default `main`; `--branch` to change). `--dispatch` (requires `--workflow`) re-runs the

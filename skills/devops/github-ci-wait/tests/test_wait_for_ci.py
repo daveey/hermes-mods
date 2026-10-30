@@ -244,3 +244,33 @@ class BoundedCallTests(unittest.TestCase):
 
     def test_gh_that_keeps_failing_ends_the_wait(self):
         self.assertEqual(self._main([RuntimeError("gh: auth")] * getattr(w, "MAX_CALL_ERRORS", 5)), 1)
+
+    def _main_out(self, listings, *extra):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self._main(listings, *extra)
+        return rc, buf.getvalue()
+
+    def test_pass_on_a_later_commit_names_the_commit_the_run_built(self):
+        # The run proving a commit can have built a later commit containing it. Its URL was printed under the
+        # requested sha alone and quoted as "CI on <sha>"; the line must name the commit the run actually built.
+        green = dict(run("d" * 40), _wf="ci.yml")
+        rc, out = self._main_out([[green]], "--once")
+        self.assertEqual(rc, 0)
+        self.assertIn("passed ccccccccc: ci.yml u/CI/" + "d" * 40 + "0 (ran on dddddddddd, a later commit containing it)",
+                      out)
+
+    def test_pass_on_the_commit_itself_prints_just_the_url(self):
+        green = dict(run("c" * 40), _wf="ci.yml")
+        rc, out = self._main_out([[green]], "--once")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("ran on", out)
+
+    def test_stall_on_a_later_commit_names_the_commit_that_failed(self):
+        # A red run on a later commit may be failing on another change; say which commit it built.
+        red = dict(run("d" * 40, conclusion="failure"), _wf="ci.yml")
+        rc, out = self._main_out([[red]], "--once")
+        self.assertEqual(rc, 1)
+        self.assertIn("(ran on dddddddddd, a later commit containing it)", out)
