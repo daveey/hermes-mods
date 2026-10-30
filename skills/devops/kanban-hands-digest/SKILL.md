@@ -34,6 +34,8 @@ task strip, then `kanban_show` each and report the blocked ones. Also report two
   latest `continued`/`scheduled` event, or a wake cron that no longer exists): they sit unrun
   indefinitely. Re-queue with `hermes kanban unblock <id>` (it accepts scheduled cards). A `needs_input`
   card parked in scheduled is an ask of the user; report it.
+"Is it stuck?" about a long elapsed time in a Desktop worker list: that figure can be card age (`now - task.started_at`, spanning every run and scheduled wait), not the current run. Judge from the current run's start, its `outcome` history and the latest event/comment time. Desktop lists cards from every gateway, so when `kanban_show` says "not found", read the bare id with `cross_task read` (it searches all gateways) instead of hunting boards.
+
 Before presenting an unblock request:
 1. Read the latest task events; delayed crash notices do not establish current state. Distinguish worker failure from an explicit human ask—never substitute the task body's opening sentence.
 2. Report cause → current retry/paused state → recovery owner. For a genuine ask, name the action, device, reason and observable completion condition. Otherwise say no user action is identified; do not repeatedly requeue a refusal or switch providers to evade it.
