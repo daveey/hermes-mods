@@ -268,6 +268,7 @@ Countermeasures:
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
+- Replacing assertion sleeps with positive-condition waits can make negative checks vacuous: an incorrect debounced write may not have run yet. Verify the invariant at its synchronous ownership/pending-state boundary, or explicitly exercise the scheduled work before asserting absence. Mutation-test the forbidden action (for example, adopting a live sibling's outbox) to prove the new wait still catches it; retain the original expected values.
 - Recovering a damaged SQLite database by hand as the symptom fix. Several agents chasing the same alert
   each swap a rebuilt copy in, and every `mv` or sidecar `rm` under open WAL connections corrupts the next
   copy. For a Kanban board, the symptom fix is `hermes kanban [--board <slug>]
