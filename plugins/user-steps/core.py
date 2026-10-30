@@ -359,7 +359,9 @@ Rules:
   {"id": <that open step id>, "verbatim_span": <exact sentence>} in "repeats" instead. When unsure whether it is
   the same decision, list it as a new step.
 - "resolved": ids from OPEN STEPS that the USER'S LAST MESSAGE answered, did, declined or made moot, or that the
-  reply says are now done. Leave a step out when unsure.
+  reply says are now done. Leave a step out when unsure. A step this reply still asks, restates or points at is
+  never resolved (it is a repeat). An automatic notice in USER'S LAST MESSAGE (a Kanban \"✔ [...] done\" notice,
+  an \"[owner-wake]\" note) was not typed by the user and answers no step.
 - Status reports are not asks: "X is in review", "not yet approved", "still open", "waiting on CI/a worker/a
   reviewer". A Kanban card in review is checked by an automated reviewer, not by the user.
 - A sentence that lists, counts or summarizes decisions waiting in other chats, queues or cards ('your For you
@@ -875,6 +877,39 @@ def without_elsewhere(steps: list[dict], mapped: list[dict]) -> list[dict]:
 LLM = Callable[[str, str], str]
 
 
+# A step text shorter than this is too generic to prove a restatement by substring ("Approve it?").
+_RESTATE_MIN_CHARS = 20
+# A turn the runtime started, not the user: Kanban notices (✔ done, ✖ failed, ⏸ blocked, [Kanban ...]), owner
+# wakes, system and chat-close notes. Such a "last message" answers nothing.
+_RUNTIME_MSG = re.compile(r"^\s*(?:[\u2714\u2716\u23f8\u26a0]\ufe0f?\s*\[|\[(?:owner-wake|System|chat-cl|Kanban|Automatic)\b)")
+
+
+def _runtime_message(user_msg: str) -> bool:
+    """The turn's last message is a runtime notice. An empty one is unknown (the hook missed it), not a notice."""
+    return bool(_RUNTIME_MSG.match(user_msg or ""))
+
+
+def _still_asked(step: dict, reply: str, repeats: list[dict], user_msg: str = "") -> bool:
+    """Does this reply still ask the open step? Then the model's "resolved" for it is wrong and is dropped.
+
+    Only in a turn a runtime notice started (nothing the user said can have answered it): the model itself listed
+    the step as a repeat, or the reply quotes the step's text (or the sentence that first asked it). The model
+    resolved an open decision whose reply ended "Your call: \\"<the step's text>\\" is in your For you queue" (a
+    kanban-notice turn): the tile vanished unanswered and the chat's outcome fell to
+    unresolved{no_summary} (hub 20261030_071719_cde14c). After a typed message the model's verdict stands: "Going
+    ahead with <step text>" after the user's "go" is an answer, and a re-ask after a decline must stay retired."""
+    if not _runtime_message(user_msg):
+        return False
+    if any(r.get("id") == step.get("id") for r in repeats):
+        return True
+    body = _norm(reply).replace('"', "")
+    for raw in (step.get("text"), step.get("verbatim_span")):
+        quoted = _norm(str(raw or "")).replace('"', "")
+        if len(quoted) >= _RESTATE_MIN_CHARS and quoted in body:
+            return True
+    return False
+
+
 def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM],
             *, continuity: bool = False, elsewhere: Optional[list] = None) -> dict:
     """{steps, resolved, source: 'model'|'regex', error?}.
@@ -883,6 +918,7 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
     one of them are omitted: neither minted nor framed.
     """
     ids = {s["id"] for s in open_steps}
+    by_id = {s["id"]: s for s in open_steps}
     titles = _elsewhere_titles(elsewhere)
     dropped: list[str] = []
     if llm is not None:
@@ -893,6 +929,7 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
             repeats = [{"id": str(x["id"]), "verbatim_span": str(x["verbatim_span"])}
                        for x in (raw if isinstance(raw, list) else []) if isinstance(x, dict) and str(x.get("id")) in ids
                        and isinstance(x.get("verbatim_span"), str) and locate(reply, x["verbatim_span"]) is not None]
+            resolved = [x for x in resolved if not _still_asked(by_id[x], reply, repeats, user_msg)]
             mapped = elsewhere_mapped(d.get("elsewhere"), reply, titles)
             steps = without_elsewhere(validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), mapped)
             return {"steps": steps, "resolved": resolved, "repeats": repeats, "elsewhere": mapped,

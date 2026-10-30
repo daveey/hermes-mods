@@ -251,7 +251,10 @@ Three triggers:
 - **agent**: only the owning chat, explicitly:
   `action_request {"withdraw": {"requestId", "reason"}}`. The extractor's
   `resolved` list never withdraws a canonical ask (it retires legacy steps only, as
-  before). The per-turn context says how to withdraw, and reports each system/user
+  before). In a turn a runtime row started (a Kanban notice or auto-continue,
+  labeled `[Automatic notice, not typed by the user]` by `pre_llm_call`), it never
+  retires a step the reply still restates (quotes its text, or the model lists it
+  under `repeats`): a notice answers nothing. The per-turn context says how to withdraw, and reports each system/user
   withdrawal to the chat once.
 - **user**: `POST /requests/{id}/withdraw` (Desktop "Not needed").
 

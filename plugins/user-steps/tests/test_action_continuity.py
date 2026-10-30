@@ -257,3 +257,44 @@ def test_regex_repeat_is_suppressed(ledger):
     core.resolve(ledger, "chat", [first["steps"][0]["id"]], "declined", "desktop")
     out = core.process_reply(ASK, "chat", ledger=ledger)
     assert out["steps"] == [] and ASK not in out["text"]
+
+
+@pytest.mark.parametrize("kind, stays_open", [("kanban_notice", True), (None, False)])
+def test_notice_turn_through_hooks_keeps_a_restated_ask_open(ledger, monkeypatch, kind, stays_open):
+    """pre_llm_call -> transform_llm_output: a turn whose newest user row is a kanban notice is labeled automatic, so
+    a reply that restates the open ask cannot resolve it (hub 20261030_071719_cde14c); a typed turn still can."""
+    spec = importlib.util.spec_from_file_location("continuity_plugin_notice",
+                                                  Path(__file__).resolve().parents[1] / "__init__.py")
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    old = seed(ledger, "open")
+    monkeypatch.setattr(plugin, "core", core)
+    monkeypatch.setattr(plugin, "_eligible", lambda *a: True)
+    monkeypatch.setattr(plugin, "_ledger", lambda: ledger)
+    monkeypatch.setattr(plugin, "_framed", lambda *a: False)
+    monkeypatch.setattr(plugin, "_trace", lambda **kw: None)
+    monkeypatch.setattr(core, "server_owner", lambda *a: (_ for _ in ()).throw(core.ActionError("no owner")))
+    seen = []
+    monkeypatch.setattr(plugin, "aux_llm", lambda system, user: seen.append(user) or json.dumps(
+        {"steps": [], "resolved": [old["id"]]}))
+    notice = "✔ [default] @default Kanban t_1 done — deploy prep finished" if kind else "sounds good"
+    row = {"role": "user", "content": notice, **({"display_kind": kind} if kind else {})}
+    plugin.pre_llm_call(session_id="chat", user_message=notice, platform="desktop",
+                        conversation_history=[{"role": "user", "content": "deploy?"}, row])
+    plugin.transform_llm_output("Prep is done. Approve deploying build 731 to staging is still in your For you "
+                                "queue.", "chat", "desktop")
+    still = [s["id"] for s in ledger.read("chat")["steps"] if s.get("status") == "open"]
+    assert still == ([old["id"]] if stays_open else [])
+    assert (plugin.AUTOMATIC_PREFIX in seen[0]) is stays_open
+
+
+def test_turn_message_labels_only_runtime_rows():
+    spec = importlib.util.spec_from_file_location("continuity_plugin_label",
+                                                  Path(__file__).resolve().parents[1] / "__init__.py")
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    hist = [{"role": "user", "content": "x", "display_kind": "kanban_notice"}, {"role": "assistant", "content": "y"}]
+    assert plugin._turn_message("x", hist) == plugin.AUTOMATIC_PREFIX + "x"
+    assert core._runtime_message(plugin._turn_message("x", hist))
+    assert plugin._turn_message("go", [{"role": "user", "content": "go"}]) == "go"
+    assert plugin._turn_message("go", None) == "go"

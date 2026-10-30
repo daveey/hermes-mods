@@ -111,12 +111,29 @@ def _framed(session_id: str) -> bool:
 
 # ---- hooks ---------------------------------------------------------------------------------------------
 
+# Runtime-written user rows (Kanban notices, auto-continue): a turn they start was not started by the user.
+_RUNTIME_KINDS = frozenset({"kanban_notice", "auto_continue"})
+AUTOMATIC_PREFIX = "[Automatic notice, not typed by the user] "
+
+
+def _turn_message(user_message: Any, conversation_history: Any) -> str:
+    """The turn's message as the extractor sees it: labeled automatic when the newest user row is a runtime row
+    (``display_kind``), so a notice can never read as the user answering an open step (core._runtime_message)."""
+    text = user_message if isinstance(user_message, str) else ""
+    for msg in reversed(conversation_history if isinstance(conversation_history, list) else []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            if (msg.get("display_kind") or "") in _RUNTIME_KINDS and not text.startswith(AUTOMATIC_PREFIX):
+                return AUTOMATIC_PREFIX + text
+            break
+    return text
+
+
 def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "", parent_session_id: str = "",
-                 **_: Any) -> dict | None:
+                 conversation_history: Any = None, **_: Any) -> dict | None:
     if not _eligible(session_id, platform, parent_session_id):
         return None
     try:
-        _USER_MSG[session_id] = user_message if isinstance(user_message, str) else ""
+        _USER_MSG[session_id] = _turn_message(user_message, conversation_history)
         own = core.server_owner(session_id)
         st = core.ActionStore(timeout=HOOK_DB_TIMEOUT)
         global _BACKFILLED
