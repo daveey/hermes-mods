@@ -425,3 +425,85 @@ def test_integration_supervisor_card_names_a_card_parked_on_the_orphan(tmp_path,
     # The live chat's wake (real tick, real core reads) names the hub card from the replica.
     assert [s for s, _ in woke] == ['s_live'] and 'still needed by default/t_hubwaiter on hub' in woke[0][1]
     ksa._reset_cache_for_tests()
+
+
+# ---- ended worker / cron owners (t_01a18ba39f9cb81a) -------------------------------------------------------------
+# On 10-28..10-30 four hub cards sat in triage 1.5-3 days: their owners were a kanban-worker session and a cron run
+# that had ended, and SKIP_SOURCES skipped them for good (no wake, no supervisor).
+@pytest.mark.parametrize('source,end_reason', [('kanban', 'cli_close'), ('cron', 'cron_complete')])
+def test_an_ended_worker_or_cron_owner_routes_to_the_supervisor_once(tmp_path, source, end_reason):
+    h = Harness(tmp_path, chats={'chat': {'archived': False, 'end_reason': end_reason, 'source': source}})
+    out = h.tick([card('default/t_4c0d5006', premise='triage:x')])
+    assert h.wakes == []
+    assert h.routes == [(['default/t_4c0d5006'], 'chat', f'an ended {source} session ({end_reason})')]
+    assert out[0]['route'] == 'supervisor' and out[0]['why'] == f'an ended {source} session ({end_reason})'
+    assert h.tick([card('default/t_4c0d5006', premise='triage:x')], now=NOW + 60) == []
+    assert len(h.routes) == 1
+
+
+def test_an_archived_worker_session_routes_to_the_supervisor(tmp_path):
+    h = Harness(tmp_path, chats={'chat': {'archived': True, 'end_reason': None, 'source': 'kanban'}})
+    h.tick([card('default/t_a')])
+    assert h.wakes == [] and h.routes == [(['default/t_a'], 'chat', 'an ended kanban session (archived)')]
+
+
+@pytest.mark.parametrize('source', ['kanban', 'cron', 'webhook', 'subagent'])
+def test_a_live_worker_or_cron_session_is_still_skipped(tmp_path, source):
+    h = Harness(tmp_path, chats={'chat': {'archived': False, 'end_reason': None, 'source': source}})
+    old = card('default/t_old', premise='p_old')
+    old['wait']['waiting_since'] = NOW - 60 * 3600
+    assert h.tick([card('default/t_a'), old]) == [] and h.wakes == [] and h.routes == []
+
+
+def test_a_60h_old_wait_with_an_ended_owner_is_routed_even_after_a_too_old_record(tmp_path):
+    h = Harness(tmp_path, chats={'chat': {'archived': False, 'end_reason': 'cron_complete', 'source': 'cron'},
+                                 'w': {'archived': False, 'end_reason': 'cli_close', 'source': 'kanban'}})
+    fresh_old = card('default/t_d5d83916', premise='triage:a')
+    fresh_old['wait']['waiting_since'] = NOW - 60 * 3600
+    recorded = card('default/t_01a180e08e629ea2', session='w', premise='triage:b')
+    recorded['wait']['waiting_since'] = NOW - 60 * 3600
+    # What the old code wrote for it: a too_old row, which used to strand the card for good.
+    assert h.log.claim('default/t_01a180e08e629ea2', 'triage:b', 'w', NOW - 3600)
+    h.log.finish('default/t_01a180e08e629ea2', 'triage:b', 'too_old', 'none')
+    out = h.tick([fresh_old, recorded])
+    assert h.wakes == []
+    assert sorted(h.routes) == [(['default/t_01a180e08e629ea2'], 'w', 'an ended kanban session (cli_close)'),
+                                (['default/t_d5d83916'], 'chat', 'an ended cron session (cron_complete)')]
+    assert {o['route'] for o in out} == {'supervisor'}
+    rows = {r[0]: r for r in h.log.rows()}
+    assert rows['default/t_01a180e08e629ea2'][3:5] == ('routed', 'supervisor')
+    assert rows['default/t_d5d83916'][3:5] == ('routed', 'supervisor')
+    assert h.tick([fresh_old, recorded], now=NOW + 60) == [] and len(h.routes) == 2
+
+
+def test_an_old_wait_of_an_archived_chat_is_routed_not_recorded(tmp_path):
+    h = Harness(tmp_path, chats={'chat': {'archived': True, 'end_reason': None, 'source': 'desktop'}})
+    old = card('default/t_old')
+    old['wait']['waiting_since'] = NOW - 60 * 3600
+    h.tick([old])
+    assert h.routes == [(['default/t_old'], 'chat', 'archived')]
+
+
+def test_a_60h_old_wait_with_a_live_chat_owner_is_still_recorded_too_old(tmp_path):
+    h = Harness(tmp_path)
+    old = card('default/t_old')
+    old['wait']['waiting_since'] = NOW - 60 * 3600
+    assert h.tick([old]) == [] and h.wakes == [] and h.routes == []
+    assert ('default/t_old', 'blocked:transient:aaa', 'chat', 'too_old', 'none', None) in h.log.rows()
+    # A fresh card of the same live chat still wakes it, and the old one stays recorded.
+    out = h.tick([old, card('default/t_new', premise='p_new')], now=NOW + 60)
+    assert [o['cards'] for o in out] == [['default/t_new']] and len(h.wakes) == 1
+
+
+def test_old_orphan_routes_still_respect_the_hourly_supervisor_cap(tmp_path):
+    chats = {f'w{i}': {'archived': False, 'end_reason': 'cli_close', 'source': 'kanban'} for i in range(10)}
+    h = Harness(tmp_path, chats=chats)
+    cards = []
+    for i in range(10):
+        c = card(f'default/t_{i}', session=f'w{i}', premise=f'p{i}')
+        c['wait']['waiting_since'] = NOW - 60 * 3600
+        cards.append(c)
+    h.tick(cards)
+    assert len(h.routes) == ow.MAX_SUPERVISOR_ROUTES_HOUR
+    h.tick(cards, now=NOW + 3700)  # the rest route in the next window, not recorded too_old
+    assert len(h.routes) == 10

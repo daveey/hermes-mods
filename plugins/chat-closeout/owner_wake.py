@@ -10,8 +10,13 @@ gateways (core ``kanban_session_activity.parked_waits``: what it waits on and wh
 
 - a live owning chat gets ONE supervise turn (in-process ``server._wake_session_turn``, the close-out waker's path)
   naming the cards, what each waits on and since when;
-- an archived, reaped or missing chat routes the card to the board supervisor instead (a ready card on this
+- an archived, reaped or missing chat, or an ENDED worker/cron/webhook/subagent session (a live one is skipped: its
+  dispatcher or parent owns the card), routes the card to the board supervisor instead (a ready card on this
   gateway's default board, assigned to ``kanban.orchestrator_profile`` or ``default``), so the card never orphans.
+  Core lets that supervisor card's worker unblock exactly the cards its body lists (``kanban_unblock``).
+
+A wait older than ``MAX_AGE_S`` when first seen never wakes a chat (recorded ``too_old``), but an orphan's supervisor
+route ignores age, and a ``too_old`` record does not hold it back.
 
 Agent-owned: a transient/capability/assignment block, triage (gave_up / block loop), continuation_exhausted, or a
 park with no named producer. A legacy park whose producer can't be told (an opaque probe, no ``awaiting``) only
@@ -106,11 +111,19 @@ class WakeLog:
                                   "OR claimed_at >= ?)", (card_key, premise, now - CLAIM_TTL_S)))
         return bool(self._run("SELECT 1 FROM fired WHERE card_key=? AND premise=?", (card_key, premise)))
 
-    def claim(self, card_key: str, premise: str, session_id: str, now: float) -> bool:
+    def too_old(self, card_key: str, premise: str) -> bool:
+        """The premise was recorded as history (``too_old``): it never wakes a chat, but may still route."""
+        return bool(self._run("SELECT 1 FROM fired WHERE card_key=? AND premise=? AND result='too_old'",
+                              (card_key, premise)))
+
+    def claim(self, card_key: str, premise: str, session_id: str, now: float, *, over_too_old: bool = False) -> bool:
         """Atomic: True for exactly one caller per (card, premise). An unfinished claim older than CLAIM_TTL_S is
-        dropped first (its backend died between claim and result)."""
+        dropped first (its backend died between claim and result). ``over_too_old``: a ``too_old`` record does not
+        hold the premise (a supervisor route of an orphaned owner's card replaces it)."""
         self._run("DELETE FROM fired WHERE card_key=? AND premise=? AND result IS NULL AND claimed_at < ?",
                   (card_key, premise, now - CLAIM_TTL_S))
+        if over_too_old:
+            self._run("DELETE FROM fired WHERE card_key=? AND premise=? AND result='too_old'", (card_key, premise))
         return self._run("INSERT OR IGNORE INTO fired (card_key, premise, session_id, claimed_at) VALUES (?,?,?,?)",
                          (card_key, premise, session_id, now))[0][0] == 1
 
@@ -206,7 +219,9 @@ def supervisor_body(cards: list[dict[str, Any]], session_id: str, why: str) -> s
         f"nobody would wake for them:\n{lines}\n\n"
         "Supervise each: read the card (cross-gateway: `hermes kanban wait-check task <id> --gateway <gw>`, "
         "cross_task), then clear the cause with this gateway's capabilities within the card's approved plan, create "
-        "the owner card where the capability lives, or reassign it. Do not re-park on the same premise and do not ask "
+        "the owner card where the capability lives, or reassign it. A listed card in triage or blocked whose cause is "
+        "cleared (or that only needs another attempt) can be released with `kanban_unblock(task_id=<id>)`: this card "
+        "may unblock exactly the cards listed above. Do not re-park on the same premise and do not ask "
         f"David unless a real human decision is needed (then a visible blocked ask). {REVERSE_DEPS_RULE} Complete "
         "this card with what you changed.")
 
@@ -238,16 +253,23 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             out.append({**c, "dependents": deps} if deps else c)
         return out
 
-    by_chat: dict[str, list[dict[str, Any]]] = {}
-    for card in cards:
-        if not (due(card) and card.get("session")) or log.fired(str(card["key"]), card["wait"]["premise"], now):
-            continue
+    def old(card: dict[str, Any]) -> bool:
         since = (card.get("wait") or {}).get("waiting_since")
-        if since and now - float(since) > MAX_AGE_S:
-            # History, not news: record it so it never wakes (the board still shows it amber).
-            if log.claim(str(card["key"]), card["wait"]["premise"], str(card["session"]), now):
-                log.finish(str(card["key"]), card["wait"]["premise"], "too_old", "none")
+        try:
+            return bool(since) and now - float(since) > MAX_AGE_S
+        except (TypeError, ValueError):
+            return False
+
+    by_chat: dict[str, list[dict[str, Any]]] = {}
+    recorded: set[tuple[str, str]] = set()  # (card, premise) already recorded too_old: no chat wake, may still route
+    for card in cards:
+        if not (due(card) and card.get("session")):
             continue
+        key, premise = str(card["key"]), card["wait"]["premise"]
+        if log.fired(key, premise, now):
+            if not log.too_old(key, premise):
+                continue
+            recorded.add((key, premise))
         try:
             sid = canonical(str(card["session"])) or str(card["session"])
         except Exception:
@@ -263,15 +285,34 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             info = UNKNOWN
         if info is not None and info.get("unknown"):
             continue  # a store was unreadable: unknown is not gone; the next tick reads again
-        if info is not None and str(info.get("source") or "").lower() in SKIP_SOURCES:
-            continue  # a worker/cron/subagent session: its dispatcher or parent owns the card
         orphaned = None
-        if info is None:
+        source = str((info or {}).get("source") or "").lower()
+        if info is not None and source in SKIP_SOURCES:
+            # A worker/cron/subagent session owns the card only while it runs (its dispatcher or parent is still
+            # there). Once it ended, nothing else wakes for the card: on 10-28 four hub cards sat in triage for days
+            # because their ended worker/cron owners were skipped here for good.
+            if not (info.get("end_reason") or info.get("archived")):
+                continue
+            orphaned = f"an ended {source} session ({info.get('end_reason') or 'archived'})"
+        elif info is None:
             orphaned = "gone"
         elif info.get("archived"):
             orphaned = "archived"
         elif str(info.get("end_reason") or "") in REAPED_END_REASONS:
             orphaned = f"reaped ({info.get('end_reason')})"
+        if orphaned is None:
+            # MAX_AGE_S is for chat wakes only: an old wait is history, not news, so it is recorded (never wakes the
+            # chat; the board still shows it amber). An orphan's supervisor route ignores age (only the hourly cap).
+            fresh = []
+            for c in pending:
+                ck = (str(c["key"]), c["wait"]["premise"])
+                if not old(c) and ck not in recorded:
+                    fresh.append(c)
+                elif ck not in recorded and log.claim(ck[0], ck[1], sid, now):
+                    log.finish(ck[0], ck[1], "too_old", "none")
+            pending = fresh
+            if not pending:
+                continue
         if orphaned is None and wake is None:
             continue  # this process can't run turns (not a Desktop/TUI backend); the owning backend will
         if orphaned is None:
@@ -318,7 +359,7 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
             logger.warning("owner-wake: %d supervisor routes this hour; %s's %d card(s) wait for the next window",
                            MAX_SUPERVISOR_ROUTES_HOUR, sid, len(pending))
             continue
-        claimed = [c for c in pending if log.claim(str(c["key"]), c["wait"]["premise"], sid, now)]
+        claimed = [c for c in pending if log.claim(str(c["key"]), c["wait"]["premise"], sid, now, over_too_old=True)]
         if not claimed:
             continue
         try:
