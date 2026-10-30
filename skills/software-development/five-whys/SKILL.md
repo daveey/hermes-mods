@@ -269,6 +269,7 @@ Countermeasures:
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
 - Replacing assertion sleeps with positive-condition waits can make negative checks vacuous: an incorrect debounced write may not have run yet. Verify the invariant at its synchronous ownership/pending-state boundary, or explicitly exercise the scheduled work before asserting absence. Mutation-test the forbidden action (for example, adopting a live sibling's outbox) to prove the new wait still catches it; retain the original expected values.
+- For SQLite poll stalls, inspect transaction mode even when the SQL is SELECT-only. In rollback-journal mode, `BEGIN IMMEDIATE` followed by a no-op commit still requests an exclusive lock; an existing shared reader can strand it at commit and block new readers at their first PRAGMA/schema access. Reproduce with a held shared transaction on an isolated database. Move purely read-only methods to a query-only deferred snapshot, preserve immediate/FULL-sync mutation transactions, and test populated decoding plus connection cleanup. Do not identify the initial long-lived lock holder from this contention pattern alone.
 - Recovering a damaged SQLite database by hand as the symptom fix. Several agents chasing the same alert
   each swap a rebuilt copy in, and every `mv` or sidecar `rm` under open WAL connections corrupts the next
   copy. For a Kanban board, the symptom fix is `hermes kanban [--board <slug>]
