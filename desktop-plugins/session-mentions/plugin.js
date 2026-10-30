@@ -500,6 +500,18 @@ function cachedRows() {
   return dedupeRows(out)
 }
 
+export const CHANGE_DEBOUNCE_MS = 400
+export const CHANGE_REFRESH_MIN_MS = 30_000
+
+/** Delay before the trailing refresh a sessions.changed event arms: the debounce, stretched so
+ *  forced refreshes are at least CHANGE_REFRESH_MIN_MS apart. */
+export function changeRefreshDelay(now, lastForcedAt, minGap = CHANGE_REFRESH_MIN_MS, debounceMs = CHANGE_DEBOUNCE_MS) {
+  return Math.max(debounceMs, lastForcedAt + minGap - now)
+}
+
+// Set by register(): refreshes the active connection now if a sessions.changed is pending.
+let flushPendingChange = () => {}
+
 function refreshStale() {
   void connections().then(conns => conns.forEach(c => void fetchRows(c)))
 }
@@ -1339,14 +1351,31 @@ export default {
     if (stopWorker) ctx.onDispose(stopWorker)
     else every(() => void courierTick(), COURIER_INTERVAL_MS)
 
+    // sessions.changed fires every ~1-2 s while any turn streams, and a forced fetch of the
+    // active (primary) connection makes Desktop main fan /api/sessions out to EVERY connected
+    // gateway, up to 5 pages each: ~1,500 backend list reads per 40 s on a 20-gateway Desktop
+    // (David-MBP 2026-10-30). The @ list only needs to be fresh when someone types @, so a change
+    // marks rows pending; idle refreshes are capped at one per CHANGE_REFRESH_MIN_MS, and
+    // provide() refreshes a pending change at once.
     let debounce = null
-    const onChanged = () => {
+    let lastForcedAt = 0
+    let changePending = false
+    const forceActive = () => {
       if (debounce) clearTimeout(debounce)
-      debounce = setTimeout(() => {
-        const active = activeConnectionId()
-        const conn = connCache.rows.find(c => c.id === active)
-        if (conn) void fetchRows(conn, true)
-      }, 400)
+      debounce = null
+      changePending = false
+      lastForcedAt = Date.now()
+      const active = activeConnectionId()
+      const conn = connCache.rows.find(c => c.id === active)
+      if (conn) void fetchRows(conn, true)
+    }
+    flushPendingChange = () => {
+      if (changePending) forceActive()
+    }
+    const onChanged = () => {
+      changePending = true
+      if (debounce) return // the armed trailing refresh covers this change too
+      debounce = setTimeout(forceActive, changeRefreshDelay(Date.now(), lastForcedAt))
     }
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host.onEvent
     const off = subscribe('sessions.changed', onChanged)
@@ -1394,6 +1423,7 @@ export default {
       area: COMPOSER_AREAS.atCompletions,
       data: {
         provide: query => {
+          flushPendingChange()
           refreshStale()
           const conns = connCache.rows
           const status = fetchStatus(rowCache, rowInflight, rowErrors, conns)
