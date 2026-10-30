@@ -42,3 +42,13 @@ The fence is a snapshot gate at admission time, not a proof that no turn started
 ## Plugin?
 
 No: it sits inside core admission paths.
+
+## Follow-up patch (1035)
+
+**1035** (`161d7b6752c`): a cron job due inside a hermes-sync drain window started under the admission hold (cron took only the process retirement fence), held the gateway's deferred restart open past the window, and when the updater gave up the restart still ran on the old code (MacBook, 2026-10-29).
+
+- The cron tick takes the cross-process admission reservation for its scan/advance/submit; while the hold stands it dispatches nothing and due jobs stay due (nothing advanced).
+- Each cron run holds its own reservation (`admission_fence.extend`, taken inside the tick's) for its whole life, so the drainer's reservation read sees it and never publishes the intent under it.
+- Gateway: a restart requested while `<home>/core-update/intent` exists is cancelled if the intent goes away before the work drains (the update gave up), instead of relaunching the old code (`gateway/run_shutdown_restart_wait.py`, split out of `run_shutdown.py`).
+
+Code: `cron/scheduler.py`, `cron/scheduler_tick.py`, `hermes_cli/admission_fence.py`, `gateway/run_shutdown.py`, `gateway/run_shutdown_restart_wait.py`. Tests: `tests/cron/test_update_admission_hold.py` (2), `tests/gateway/test_restart_cancel_on_update_giveup.py`. Tests were added or changed by these commits; they were not re-run for this mirror.

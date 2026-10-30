@@ -1,0 +1,610 @@
+From c588564e3e210229f0543c8d22761bf9c623eab4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:51:20 -0700
+Subject: [PATCH] ci: pull requests run only the Python tests their change can
+ reach
+
+ci.yaml detect runs scripts/ci/affected_tests.py on the PR's compare-API file
+list: changed test files, the transitive import closure of changed modules
+(ast, function-level imports count), string patch targets, tests that name a
+changed file by path, plus a smoke set (tests/ci and every tree-scanning test,
+~132 files). Conftest/pyproject/uv.lock/runner/setup-pm changes, >40% of the
+suite, a failed or capped compare, the ci:full-tests label and every non-PR
+event (main push, dispatch, release, release-check) run the full suite. The
+slice count follows test_durations.json; each slice recomputes the selection
+from the same list. Job names say 'affected' when the run is narrowed.
+
+Replay on 83 red PR slice jobs (2026-10-27..29): 45 would have run the full
+suite anyway; on the 30 narrowed runs 21 failing files were selected and every
+skipped one was a failure the PR did not cause (15 fail on >=3 unrelated PRs,
+the rest are load-sensitive files and a prompt-surface break on main).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .github/actions/detect-changes/action.yml |   2 +
+ .github/workflows/ci.yaml                 |  51 +++++
+ .github/workflows/tests.yml               |  35 +++-
+ scripts/ci/affected_tests.py              | 238 ++++++++++++++++++++++
+ tests/ci/test_affected_tests.py           | 128 ++++++++++++
+ tests/ci/test_fast_runner_routing.py      |  31 +++
+ 6 files changed, 481 insertions(+), 4 deletions(-)
+ create mode 100755 scripts/ci/affected_tests.py
+ create mode 100644 tests/ci/test_affected_tests.py
+
+diff --git a/.github/actions/detect-changes/action.yml b/.github/actions/detect-changes/action.yml
+index d28252d48b9..8daf4808b1f 100644
+--- a/.github/actions/detect-changes/action.yml
++++ b/.github/actions/detect-changes/action.yml
+@@ -149,4 +149,6 @@ runs:
+ 
+         echo "Changed files:"
+         printf '%s\n' "${CHANGED:-(none)}"
++        # The Python test planner (ci.yaml detect, scripts/ci/affected_tests.py) reads the same list.
++        printf '%s\n' "${CHANGED:-}" > "$RUNNER_TEMP/detect-changed-files.txt"
+         printf '%s\n' "${CHANGED:-}" | python3 scripts/ci/classify_changes.py
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 09e0fa99214..0920077f867 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -103,6 +103,8 @@ jobs:
+       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
+       e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
+       event_name: ${{ github.event_name }}
++      python_changed: ${{ steps.python-plan.outputs.changed }}
++      python_slices: ${{ steps.python-plan.outputs.slices }}
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+       - name: Detect affected areas
+@@ -137,6 +139,53 @@ jobs:
+                   output.write(f'{lane}={value}\n')
+           PY
+ 
++      - name: Restore per-file duration cache
++        # The planner sizes the slice count from test_durations.json (tests.yml saves it on main).
++        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        with:
++          path: test_durations.json
++          key: test-durations-never-exact
++          restore-keys: |
++            test-durations-
++
++      - name: Plan Python tests (affected files on PRs, full suite otherwise)
++        # Pull requests run the test files their change can reach plus a smoke set
++        # (scripts/ci/affected_tests.py); every other event, the label ci:full-tests, a failed
++        # compare (empty list) or a list at the compare API's 300-file cap runs the full suite.
++        # Main pushes still run everything, so a miss surfaces there. Each tests.yml slice
++        # recomputes the same file list from `changed` and its own checkout.
++        id: python-plan
++        env:
++          EVENT_NAME: ${{ github.event_name }}
++          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full-tests') }}
++        run: |
++          set -euo pipefail
++          changed_file="$RUNNER_TEMP/detect-changed-files.txt"
++          mapfile -t changed < <(grep -v '^$' "$changed_file" 2>/dev/null || true)
++          full=""
++          if [ "$EVENT_NAME" != "pull_request" ]; then full="$EVENT_NAME runs the full suite"
++          elif [ "$FULL_LABEL" = "true" ]; then full="label ci:full-tests"
++          elif [ "${#changed[@]}" -eq 0 ]; then full="no changed-file list from the compare API"
++          elif [ "${#changed[@]}" -ge 300 ]; then full="${#changed[@]} changed files (compare API caps the list at 300)"
++          fi
++          plan_out="$RUNNER_TEMP/python-plan.txt"
++          if [ -n "$full" ]; then
++            python3 scripts/ci/affected_tests.py --full "$full" --github-output "$plan_out" > /dev/null
++          else
++            python3 scripts/ci/affected_tests.py --changed "${changed[@]}" --github-output "$plan_out" > /dev/null
++          fi
++          cat "$plan_out"
++          mode=$(sed -n 's/^mode=//p' "$plan_out")
++          reason=$(sed -n 's/^reason=//p' "$plan_out")
++          slices=$(sed -n 's/^slices=//p' "$plan_out")
++          echo "slices=$slices" >> "$GITHUB_OUTPUT"
++          {
++            echo "changed<<CHANGED_EOF"
++            if [ "$mode" = "affected" ]; then printf '%s\n' "${changed[@]}"; fi
++            echo "CHANGED_EOF"
++          } >> "$GITHUB_OUTPUT"
++          echo "### Python tests: $mode ($reason)" >> "$GITHUB_STEP_SUMMARY"
++
+   # ─────────────────────────────────────────────────────────────────────
+   # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
+   # Skipped workflows (if condition is false) don't spin up runners.
+@@ -154,6 +203,8 @@ jobs:
+     if: needs.detect.outputs.python == 'true' || needs.detect.outputs.e2e == 'true' || needs.detect.outputs.e2e_upgrade == 'true'
+     uses: ./.github/workflows/tests.yml
+     with:
++      python_changed: ${{ needs.detect.outputs.python_changed }}
++      python_slices: ${{ needs.detect.outputs.python_slices }}
+       e2e: ${{ needs.detect.outputs.e2e == 'true' }}
+       e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
+       strict_acceptance: ${{ inputs.strict_acceptance || '' }}
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index bade4c65584..364c0eeb726 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -3,6 +3,18 @@ name: Tests
+ on:
+   workflow_call:
+     inputs:
++      python_changed:
++        description: >-
++          Pull requests: the changed files (newline list) whose affected tests the slices run
++          (scripts/ci/affected_tests.py). Empty runs the full suite.
++        type: string
++        required: false
++        default: ''
++      python_slices:
++        description: JSON list of slice numbers, 1..N (ci.yaml detect sizes it from test_durations.json).
++        type: string
++        required: false
++        default: '[1, 2]'
+       # The E2E jobs below are slow lanes (scripts/ci/classify_changes.py).
+       # ci.yaml passes the classifier's answer; a caller that passes nothing
+       # gets every job.
+@@ -45,13 +57,16 @@ jobs:
+     # takes ~60-70 min under contention. 30 min cancelled both slices at
+     # 45%/78% (run 39732864100). 120 leaves headroom; revisit if the hub
+     # gets more cores.
+-    name: Run tests (${{ matrix.slice }}/2)
++    #
++    # Pull requests usually run one slice of affected files (ci.yaml detect sizes the
++    # matrix, scripts/ci/affected_tests.py); every other event runs both.
++    name: Run tests (${{ inputs.python_changed != '' && 'affected, ' || '' }}${{ matrix.slice }}/${{ strategy.job-total }})
+     runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 120
+     strategy:
+       fail-fast: false
+       matrix:
+-        slice: [1, 2]
++        slice: ${{ fromJSON(inputs.python_slices) }}
+     steps:
+       - name: Checkout code
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+@@ -127,13 +142,25 @@ jobs:
+         # written to the flaky report; the hub's ci-flaky-cards cron turns
+         # each id into one deflake Kanban card. A test that fails twice fails
+         # the job.
++        #
++        # Pull requests pass python_changed: the slice runs only the affected files
++        # (scripts/ci/affected_tests.py, the same selection ci.yaml detect sized).
+         run: |
+           HERMES_TEST_WORKERS="$(python3 scripts/ci/test_workers.py)"
+           export HERMES_TEST_WORKERS
+           echo "HERMES_TEST_WORKERS=$HERMES_TEST_WORKERS (nproc=$(nproc))"
+-          scripts/run_tests.sh
++          if [ -n "$PYTHON_CHANGED" ]; then
++            mapfile -t changed < <(printf '%s\n' "$PYTHON_CHANGED" | grep -v '^$')
++            selection="$RUNNER_TEMP/affected-tests.txt"
++            "$HERMES_PYTHON" scripts/ci/affected_tests.py --changed "${changed[@]}" --files-out "$selection" > /dev/null
++            echo "Affected selection: $(wc -l < "$selection") files"
++            scripts/run_tests.sh --files-from "$selection"
++          else
++            scripts/run_tests.sh
++          fi
+         env:
+-          HERMES_TEST_SLICE: ${{ matrix.slice }}/2
++          PYTHON_CHANGED: ${{ inputs.python_changed }}
++          HERMES_TEST_SLICE: ${{ matrix.slice }}/${{ strategy.job-total }}
+           HERMES_TEST_FILE_TIMEOUT: 600
+           HERMES_TEST_FLAKY_REPORT: ${{ runner.temp }}/flaky-tests/slice-${{ matrix.slice }}.json
+           # Ensure tests don't accidentally call real APIs
+diff --git a/scripts/ci/affected_tests.py b/scripts/ci/affected_tests.py
+new file mode 100755
+index 00000000000..f2c27d7f465
+--- /dev/null
++++ b/scripts/ci/affected_tests.py
+@@ -0,0 +1,238 @@
++#!/usr/bin/env python3
++"""Pick the Python test files a pull request can affect (tests.yml `plan` job).
++
++    affected_tests.py [--repo DIR] [--base REV] [--head REV] [--changed PATH ...] [--full REASON]
++                      [--files-out FILE] [--github-output FILE]
++
++Prints a JSON plan on stdout: {"mode": "full" | "affected" | "none", "reason", "files", "slices"}.
++"full" runs the whole suite (the runner's own discovery); "affected" runs `files` with --files-from;
++"none" means the diff is empty. A change no test imports or names still runs the smoke set.
++
++Selection, unioned:
++  1. changed test files that the full suite would run;
++  2. the transitive import closure: every test file that imports, at any depth through the repo's own
++     modules, a changed module (stdlib `ast`, imports inside functions count, `import a.b` counts a and a.b);
++  3. string references to a changed module ("pkg.mod" / "pkg.mod.attr": monkeypatch and mock.patch targets);
++  4. tests whose text names a changed file by repo path or by a distinctive basename (scripts run by path,
++     workflow YAML, .ts/.mjs read or spawned by Python tests);
++  5. the smoke set: tests/ci plus every test that scans the source tree (rglob/os.walk/git ls-files).
++     They break on changes no import graph reaches: docs drift, prompt surface, code health
++     (replay of 83 red PR slice jobs, 2026-10-29: 16 failures were tree scans the PR never imported).
++The suite falls back to "full" when a changed file shapes every test (WIDE) or the selection is over
++FULL_FRACTION of the suite. Main pushes, release-check branches, dispatch and release runs never call this:
++tests.yml runs the full suite for any event that is not a pull request.
++"""
++from __future__ import annotations
++
++import argparse
++import ast
++import importlib.util
++import json
++import math
++import os
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++
++# Changed paths that change how every test runs: the suite, not a selection, is the honest answer.
++WIDE = (
++    re.compile(r"(^|/)conftest\.py$"),
++    re.compile(r"^(pyproject\.toml|uv\.lock|pytest\.ini|setup\.cfg|tox\.ini)$"),
++    re.compile(r"^scripts/(run_tests\.sh|run_tests_parallel\.py|run-in-hermes-env)$"),
++    re.compile(r"^scripts/ci/(affected_tests|test_workers)\.py$"),
++    re.compile(r"^\.github/actions/setup-pm/"),
++    re.compile(r"^tests/[^/]+\.py$"),  # tests/ helpers imported by name from anywhere (fakes, fixtures)
++)
++TREE_SCAN = re.compile(r"rglob\(|os\.walk\(|ls-files|glob\(\s*[\"']\*\*|\.github/workflows|iter_source|walk_repo")
++FULL_FRACTION = 0.4
++# Basenames too generic to mean one file when a test mentions them.
++GENERIC = {"__init__.py", "README.md", "index.ts", "index.js", "main.py", "utils.py", "config.py", "cli.py",
++           "package.json", "SKILL.md", "types.ts", "constants.py"}
++SLICE_SECONDS = 16 * 300  # one slice: 16 workers x ~5 min of per-file wall time
++MAX_SLICES = 2  # tests.yml's full-suite matrix ([1, 2] on the shared hermes-hub pool)
++DEFAULT_FILE_SECONDS = 3.0
++
++
++def _runner():
++    spec = importlib.util.spec_from_file_location("run_tests_parallel", ROOT / "scripts" / "run_tests_parallel.py")
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def suite(repo: Path) -> list[str]:
++    """The files `scripts/run_tests.sh` with no paths runs: the selection never adds a file outside it."""
++    return [p.relative_to(repo).as_posix() for p in _runner()._discover_files([repo / "tests"])]
++
++
++def module_name(rel: str) -> str | None:
++    if not rel.endswith(".py"):
++        return None
++    parts = rel[:-3].split("/")
++    if parts[-1] == "__init__":
++        parts = parts[:-1]
++    return ".".join(parts) if parts and all(p.isidentifier() for p in parts) else None
++
++
++def tracked_py(repo: Path) -> list[str]:
++    out = subprocess.run(["git", "-C", str(repo), "ls-files", "*.py"], check=True, capture_output=True,
++                         text=True).stdout
++    return [f for f in out.splitlines() if f and "node_modules/" not in f]
++
++
++def imports_of(repo: Path, rel: str, modules: set[str]) -> set[str]:
++    try:
++        tree = ast.parse((repo / rel).read_text(encoding="utf-8", errors="replace"))
++    except (OSError, SyntaxError, ValueError):
++        return set()
++    me = module_name(rel) or ""
++    package = me if rel.endswith("__init__.py") else me.rpartition(".")[0]
++    names: set[str] = set()
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Import):
++            names.update(alias.name for alias in node.names)
++        elif isinstance(node, ast.ImportFrom):
++            base = node.module or ""
++            if node.level:
++                parts = package.split(".") if package else []
++                parts = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
++                base = ".".join(parts + ([base] if base else []))
++            names.add(base)
++            names.update(f"{base}.{alias.name}" if base else alias.name for alias in node.names)
++    found: set[str] = set()
++    for name in names:
++        parts = name.split(".")
++        for i in range(1, len(parts) + 1):  # `import a.b.c` runs a, a.b and a.b.c
++            prefix = ".".join(parts[:i])
++            if prefix in modules:
++                found.add(prefix)
++    return found
++
++
++def importers(repo: Path, changed_modules: set[str]) -> set[str]:
++    """Every tracked .py file that imports a changed module, directly or through other repo modules."""
++    files = tracked_py(repo)
++    by_module = {m: f for f in files if (m := module_name(f))}
++    modules = set(by_module)
++    reverse: dict[str, set[str]] = {}
++    for f in files:
++        for dep in imports_of(repo, f, modules):
++            reverse.setdefault(dep, set()).add(f)
++    seen_files: set[str] = set()
++    frontier = [m for m in changed_modules if m in modules]
++    seen_modules = set(frontier)
++    while frontier:
++        for f in reverse.get(frontier.pop(), ()):
++            if f in seen_files:
++                continue
++            seen_files.add(f)
++            m = module_name(f)
++            if m and m not in seen_modules:
++                seen_modules.add(m)
++                frontier.append(m)
++    return seen_files
++
++
++def _read(repo: Path, rel: str) -> str:
++    try:
++        return (repo / rel).read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        return ""
++
++
++def estimate_seconds(repo: Path, files: list[str]) -> float:
++    try:
++        durations = json.loads((repo / "test_durations.json").read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        durations = {}
++    return sum(float(durations.get(f, DEFAULT_FILE_SECONDS)) for f in files)
++
++
++def slices_for(seconds: float) -> int:
++    return max(1, min(MAX_SLICES, math.ceil(seconds / SLICE_SECONDS)))
++
++
++def plan(repo: Path, changed: list[str], full_reason: str | None = None) -> dict:
++    if full_reason:
++        return {"mode": "full", "reason": full_reason, "files": [], "slices": MAX_SLICES}
++    wide = sorted(c for c in changed if any(p.search(c) for p in WIDE))
++    if wide:
++        return {"mode": "full", "reason": f"changes every test's setup: {', '.join(wide[:5])}", "files": [],
++                "slices": MAX_SLICES}
++    universe = suite(repo)
++    in_suite = set(universe)
++    selected = {c for c in changed if c in in_suite}
++    changed_modules = {m for c in changed if not c.startswith("tests/") and (m := module_name(c))}
++    selected |= importers(repo, changed_modules) & in_suite
++    string_refs = [re.compile(rf"[\"']{re.escape(m)}([\"']|\.)") for m in changed_modules]
++    path_refs = [re.escape(c) for c in changed if "/" in c and Path(c).name not in GENERIC]
++    path_refs += [rf"(?<![\w.-]){re.escape(Path(c).name)}(?![\w-])" for c in changed
++                  if Path(c).name not in GENERIC and len(Path(c).name) >= 8]
++    path_ref = re.compile("|".join(path_refs)) if path_refs else None
++    smoke: set[str] = set()
++    for f in universe:
++        if f in selected:
++            continue
++        text = _read(repo, f)
++        if f.startswith("tests/ci/") or TREE_SCAN.search(text):
++            smoke.add(f)
++        elif any(p.search(text) for p in string_refs) or (path_ref and path_ref.search(text)):
++            selected.add(f)
++    if not changed:
++        return {"mode": "none", "reason": "no changed files", "files": [], "slices": 0}
++    files = sorted(selected | smoke)
++    if len(files) > FULL_FRACTION * len(universe):
++        return {"mode": "full", "reason": f"{len(files)} of {len(universe)} test files affected", "files": [],
++                "slices": MAX_SLICES}
++    return {"mode": "affected",
++            "reason": f"{len(selected)} affected + {len(smoke)} smoke of {len(universe)} test files",
++            "files": files, "slices": slices_for(estimate_seconds(repo, files))}
++
++
++def changed_files(repo: Path, base: str, head: str) -> list[str]:
++    out = subprocess.run(["git", "-C", str(repo), "diff", "--name-only", f"{base}...{head}"], check=True,
++                         capture_output=True, text=True).stdout
++    return [line for line in out.splitlines() if line]
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    ap.add_argument("--repo", default=str(ROOT))
++    ap.add_argument("--base", default="HEAD^1")
++    ap.add_argument("--head", default="HEAD")
++    ap.add_argument("--changed", nargs="*", help="repo-relative paths instead of git diff BASE...HEAD")
++    ap.add_argument("--full", metavar="REASON", help="skip selection: run the full suite for REASON")
++    ap.add_argument("--files-out", help="write the selected files here, one per line")
++    ap.add_argument("--github-output", help="append mode/reason/slices outputs (GITHUB_OUTPUT)")
++    args = ap.parse_args(argv)
++    repo = Path(args.repo).resolve()
++    if args.full:
++        changed = []
++    elif args.changed is not None:
++        changed = args.changed
++    else:
++        try:
++            changed = changed_files(repo, args.base, args.head)
++        except subprocess.CalledProcessError as exc:
++            # No diff means no evidence for a narrower run.
++            changed, args.full = [], f"git diff {args.base}...{args.head} failed: {exc.stderr.strip()[:200]}"
++    result = plan(repo, changed, args.full)
++    if args.files_out:
++        Path(args.files_out).write_text("".join(f"{f}\n" for f in result["files"]), encoding="utf-8")
++    if args.github_output:
++        with open(args.github_output, "a", encoding="utf-8") as out:
++            out.write(f"mode={result['mode']}\n")
++            out.write(f"reason={' '.join(result['reason'].split())}\n")  # one line, or GITHUB_OUTPUT breaks
++            out.write(f"count={len(result['files'])}\n")
++            out.write(f"slices={json.dumps(list(range(1, result['slices'] + 1)))}\n")
++            out.write(f"slice_count={result['slices']}\n")
++    print(json.dumps(result, indent=1))
++    print(f"affected-tests: {result['mode']}: {result['reason']}", file=sys.stderr)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/ci/test_affected_tests.py b/tests/ci/test_affected_tests.py
+new file mode 100644
+index 00000000000..938ca5f18a0
+--- /dev/null
++++ b/tests/ci/test_affected_tests.py
+@@ -0,0 +1,128 @@
++"""scripts/ci/affected_tests.py: which test files a pull request runs (tests.yml `plan` job)."""
++import importlib.util
++import json
++import subprocess
++from pathlib import Path
++
++import pytest
++
++_PATH = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "affected_tests.py"
++_spec = importlib.util.spec_from_file_location("affected_tests_mod", _PATH)
++at = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(at)
++
++
++def _write(root: Path, files: dict[str, str]) -> None:
++    for rel, text in files.items():
++        path = root / rel
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(text, encoding="utf-8")
++
++
++@pytest.fixture
++def repo(tmp_path):
++    files = {
++        "pkg/__init__.py": "",
++        "pkg/core.py": "VALUE = 1\n",
++        "pkg/mid.py": "from pkg import core\n",
++        "pkg/top.py": "def f():\n    import pkg.mid\n",  # function-level import still counts
++        "pkg/other.py": "X = 2\n",
++        "scripts/tool.sh": "echo hi\n",
++        "tests/__init__.py": "",
++        "tests/pkg/test_top.py": "from pkg import top\n",
++        "tests/pkg/test_other.py": "import pkg.other\n",
++        "tests/pkg/test_patch.py": "def test(monkeypatch):\n    monkeypatch.setattr('pkg.core.VALUE', 2)\n",
++        "tests/pkg/test_script.py": "SCRIPT = 'scripts/tool.sh'\n",
++        "tests/pkg/test_scan.py": "from pathlib import Path\nFILES = list(Path('.').rglob('*.py'))\n",
++        "tests/ci/test_wf.py": "X = 1\n",
++        "tests/e2e/test_slow.py": "import pkg.core\n",
++    }
++    files.update({f"tests/filler/test_f{i}.py": "X = 1\n" for i in range(20)})
++    _write(tmp_path, files)
++    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
++    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
++    return tmp_path
++
++
++SMOKE = {"tests/pkg/test_scan.py", "tests/ci/test_wf.py"}
++
++
++def _files(repo, changed):
++    result = at.plan(repo, changed)
++    assert result["mode"] == "affected", result
++    return set(result["files"])
++
++
++def test_changed_test_file_runs(repo):
++    assert _files(repo, ["tests/pkg/test_other.py"]) == {"tests/pkg/test_other.py"} | SMOKE
++
++
++def test_transitive_and_function_level_importers_run(repo):
++    # core <- mid <- top (inside a function) <- test_top
++    assert {"tests/pkg/test_top.py", "tests/pkg/test_patch.py"} <= _files(repo, ["pkg/core.py"])
++    assert "tests/pkg/test_other.py" not in _files(repo, ["pkg/core.py"])
++
++
++def test_string_patch_target_runs(repo):
++    assert "tests/pkg/test_patch.py" in _files(repo, ["pkg/core.py"])
++    assert "tests/pkg/test_patch.py" not in _files(repo, ["pkg/other.py"])
++
++
++def test_non_python_file_named_by_a_test_runs(repo):
++    assert "tests/pkg/test_script.py" in _files(repo, ["scripts/tool.sh"])
++
++
++def test_unreferenced_change_still_runs_the_smoke_set(repo):
++    assert _files(repo, ["docs/guide.md"]) == SMOKE
++
++
++def test_files_outside_the_full_suite_are_never_selected(repo):
++    # tests/e2e is skipped by run_tests_parallel.py discovery: a PR must not run it either.
++    assert "tests/e2e/test_slow.py" not in _files(repo, ["pkg/core.py"])
++    assert "tests/e2e/test_slow.py" not in _files(repo, ["tests/e2e/test_slow.py"])
++
++
++@pytest.mark.parametrize("wide", ["tests/conftest.py", "pkg/conftest.py", "uv.lock", "pyproject.toml",
++                                  "scripts/run_tests_parallel.py", "scripts/ci/affected_tests.py",
++                                  ".github/actions/setup-pm/action.yml", "tests/fakes.py"])
++def test_setup_wide_changes_run_the_full_suite(repo, wide):
++    result = at.plan(repo, ["pkg/other.py", wide])
++    assert result["mode"] == "full" and wide in result["reason"] and result["slices"] == at.MAX_SLICES
++
++
++def test_large_selection_runs_the_full_suite(repo, monkeypatch):
++    monkeypatch.setattr(at, "FULL_FRACTION", 0.1)
++    assert at.plan(repo, ["pkg/core.py"])["mode"] == "full"
++
++
++def test_explicit_full_and_empty_diff(repo):
++    assert at.plan(repo, [], "push to main")["mode"] == "full"
++    assert at.plan(repo, [])["mode"] == "none"
++
++
++def test_slices_follow_measured_durations(repo):
++    (repo / "test_durations.json").write_text(json.dumps({"tests/pkg/test_top.py": 3 * at.SLICE_SECONDS}))
++    assert at.plan(repo, ["pkg/core.py"])["slices"] == min(4, at.MAX_SLICES)
++    assert at.plan(repo, ["pkg/other.py"])["slices"] == 1
++    assert at.slices_for(100 * at.SLICE_SECONDS) == at.MAX_SLICES
++
++
++def test_cli_writes_files_and_github_outputs(repo, tmp_path):
++    files_out, gh_out = tmp_path / "files.txt", tmp_path / "gh.txt"
++    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a"],
++                   check=True)
++    (repo / "pkg" / "other.py").write_text("X = 3\n")
++    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "b"],
++                   check=True)
++    assert at.main(["--repo", str(repo), "--files-out", str(files_out), "--github-output", str(gh_out)]) == 0
++    assert set(files_out.read_text().split()) == {"tests/pkg/test_other.py"} | SMOKE
++    outputs = dict(line.split("=", 1) for line in gh_out.read_text().splitlines())
++    assert outputs["mode"] == "affected" and outputs["slices"] == "[1]" and outputs["count"] == "3"
++
++
++def test_cli_without_a_diff_runs_the_full_suite(repo, tmp_path):
++    gh_out = tmp_path / "gh.txt"
++    assert at.main(["--repo", str(repo), "--base", "nope", "--github-output", str(gh_out)]) == 0
++    outputs = dict(line.split("=", 1) for line in gh_out.read_text().splitlines())
++    assert outputs["mode"] == "full" and "git diff" in outputs["reason"]
++    assert json.loads(outputs["slices"]) == list(range(1, at.MAX_SLICES + 1))
+diff --git a/tests/ci/test_fast_runner_routing.py b/tests/ci/test_fast_runner_routing.py
+index de432522896..aac2e87070a 100644
+--- a/tests/ci/test_fast_runner_routing.py
++++ b/tests/ci/test_fast_runner_routing.py
+@@ -140,3 +140,34 @@ def test_termux_assembly_permissions_run_on_docker_ci_and_fail_on_skip():
+     assert "--fail-on-skip" in run["run"]
+     assert "tests/scripts/test_termux_assembly_permissions.py" in run["run"]
+     assert steps[-1].get("uses") == "./.github/actions/check-clean-worktree"
++
++
++def test_python_slices_match_their_matrix():
++    # The slice count is the matrix size: HERMES_TEST_SLICE and the job name read strategy.job-total,
++    # so a planner that sizes the matrix can never skip or double-run files.
++    wf = _workflows()["tests.yml"]
++    job = wf["jobs"]["test"]
++    assert job["strategy"]["matrix"]["slice"] == "${{ fromJSON(inputs.python_slices) }}"
++    default = wf["on"]["workflow_call"]["inputs"]["python_slices"]["default"]
++    assert default == "[1, 2]"
++    run = next(step for step in job["steps"] if step.get("name") == "Run tests")
++    assert run["env"]["HERMES_TEST_SLICE"] == "${{ matrix.slice }}/${{ strategy.job-total }}"
++    assert "${{ matrix.slice }}/${{ strategy.job-total }}" in job["name"]
++    assert job["runs-on"] == ["self-hosted", "hermes-hub"]
++
++
++def test_pull_requests_pass_their_affected_plan_to_the_slices():
++    ci = _workflows()["ci.yaml"]["jobs"]
++    outputs = ci["detect"]["outputs"]
++    assert outputs["python_changed"] == "${{ steps.python-plan.outputs.changed }}"
++    assert outputs["python_slices"] == "${{ steps.python-plan.outputs.slices }}"
++    plan = next(step for step in ci["detect"]["steps"] if step.get("id") == "python-plan")
++    script = plan["run"]
++    # Only a pull request with a usable changed-file list narrows the run.
++    for full in ('"$EVENT_NAME" != "pull_request"', '"$FULL_LABEL" = "true"', '-eq 0', '-ge 300'):
++        assert full in script
++    assert ci["tests"]["with"]["python_changed"] == "${{ needs.detect.outputs.python_changed }}"
++    assert ci["tests"]["with"]["python_slices"] == "${{ needs.detect.outputs.python_slices }}"
++    run = next(step for step in _workflows()["tests.yml"]["jobs"]["test"]["steps"] if step.get("name") == "Run tests")
++    assert run["env"]["PYTHON_CHANGED"] == "${{ inputs.python_changed }}"
++    assert "affected_tests.py --changed" in run["run"] and "--files-from" in run["run"]
+-- 
+2.55.0
+

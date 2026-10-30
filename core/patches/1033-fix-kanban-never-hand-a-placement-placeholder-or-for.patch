@@ -1,0 +1,219 @@
+From df98c367ae21948cdaa97cf569d9d506519c6e11 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:20:52 +0000
+Subject: [PATCH] fix(kanban): never hand a placement placeholder or foreign
+ chat on as a child card's origin [daveey]
+
+Defect kanban-69709bcf16. A hub worker on a card the MacBook placed (session_id
+kanban-placement-macbook, the kanban.placement creator placeholder) called kanban_create;
+the child routed to the MacBook and _handle_create took the parent card's session_id
+unchecked as its origin. The MacBook asked hub to bind the card to that 'chat', hub refused
+(origin_session_missing) and the rejection reached David's Inbox.
+
+- the parent card's session_id now goes through _persisted_session_id like every other source
+- _persisted_session_id also rejects placement placeholders: hub's state.db gained a
+  kanban-placement-macbook row from a stray completion notice, so presence alone is not proof
+
+Test: tests/tools/test_kanban_placeholder_origin.py (3 red before: origin_session was the
+placeholder / a missing chat; a real chat still passes through).
+---
+ tests/tools/test_kanban_placeholder_origin.py | 90 +++++++++++++++++++
+ tools/kanban_tools.py                         | 26 ++----
+ tools/kanban_tools_placement.py               | 29 ++++++
+ 3 files changed, 125 insertions(+), 20 deletions(-)
+ create mode 100644 tests/tools/test_kanban_placeholder_origin.py
+
+diff --git a/tests/tools/test_kanban_placeholder_origin.py b/tests/tools/test_kanban_placeholder_origin.py
+new file mode 100644
+index 00000000000..a181abbd31b
+--- /dev/null
++++ b/tests/tools/test_kanban_placeholder_origin.py
+@@ -0,0 +1,90 @@
++"""A card's home chat is only ever a real chat, never a placement placeholder. [daveey]
++
++Incident (2026-10-29, defect kanban-69709bcf16): cards the MacBook places on hub carry the placeholder
++session ``kanban-placement-macbook`` (``kanban.placement.creator_session``). A hub worker on such a card
++called kanban_create; the child routed to the MacBook and ``_handle_create`` took the parent card's
++``session_id`` unchecked as the child's origin chat. The MacBook then asked hub to bind the card to that
++"chat", hub refused (``origin_session_missing``) and the rejection surfaced in David's Inbox. Hub's
++state.db has since gained a ``kanban-placement-macbook`` row (a completion notice delivered into it), so a
++"does the session row exist" check alone no longer rejects the placeholder: both checks are needed.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++PLACEHOLDER = "kanban-placement-macbook"
++
++
++@pytest.fixture
++def worker(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_ORIGIN_SESSION",
++                "HERMES_PROFILE", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement as kp
++    from hermes_state import SessionDB
++
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    sent = []
++
++    def fake_create_remote(args, *, target, origin_session, origin_profile, self_gw, cfg=None, hub_cli=None):
++        sent.append({"target": target, "origin_session": origin_session})
++        return {"ok": True, "request_id": "placement:hub:test", "queued_only": True}
++
++    monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "macbook", "why": "test route"})
++    monkeypatch.setattr(kp, "create_remote", fake_create_remote)
++
++    def make_worker(session_id, *, persisted):
++        if persisted:
++            db = SessionDB(db_path=h / "state.db")
++            db.create_session(session_id=session_id, source="cli")
++            db.close()
++        conn = kbc.connect()
++        try:
++            tid = kb.create_task(conn, title="hub worker card", assignee="default", session_id=session_id)
++            kb.claim_task(conn, tid)
++        finally:
++            conn.close()
++        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++        return tid
++
++    return make_worker, sent
++
++
++def _create_child(tid):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_create({"title": "check the MacBook Chrome profile", "assignee": "default",
++                                         "body": "child placed on the MacBook"}))
++
++
++@pytest.mark.parametrize("persisted", [False, True], ids=["no-session-row", "placeholder-row-exists"])
++def test_worker_on_a_placeholder_card_places_a_child_with_no_origin(worker, persisted):
++    make_worker, sent = worker
++    tid = make_worker(PLACEHOLDER, persisted=persisted)
++    out = _create_child(tid)
++    assert out.get("ok") is True, out
++    assert sent == [{"target": "macbook", "origin_session": None}], sent
++
++
++def test_worker_whose_card_session_is_gone_places_a_child_with_no_origin(worker):
++    make_worker, sent = worker
++    tid = make_worker("20261021_191005_0f6f74", persisted=False)
++    assert _create_child(tid).get("ok") is True
++    assert sent == [{"target": "macbook", "origin_session": None}], sent
++
++
++def test_worker_whose_card_has_a_real_chat_keeps_it_as_origin(worker):
++    make_worker, sent = worker
++    tid = make_worker("20261029_053646_1e4483", persisted=True)
++    assert _create_child(tid).get("ok") is True
++    assert sent == [{"target": "macbook", "origin_session": "20261029_053646_1e4483"}], sent
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 873173314ab..a5e5221388c 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -21,7 +21,8 @@ from tools.registry import no_cache_check_fn, registry, tool_error
+ from hermes_cli.config import cfg_get, load_config
+ from hermes_cli.kanban_capabilities import check_tool_create, declaration_required
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+-from tools.kanban_tools_placement import _marker_placement_fields, _placement_refused, _runs_where
++from tools.kanban_tools_placement import (_marker_placement_fields, _persisted_session_id,
++                                          _placement_refused, _runs_where)
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import _blocker_id_arg, _clear_blocker_arg
+ from hermes_cli.kanban_block_policy import ask_lint_check
+@@ -1561,24 +1562,6 @@ def _handle_attachments(args: dict, **kw) -> str:
+                 _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
+ 
+ 
+-def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+-    """Return a session id only when it is present in this profile's state.db."""
+-    if not session_id:
+-        return None
+-    try:
+-        from hermes_state import SessionDB
+-        from hermes_constants import get_hermes_home
+-
+-        state = SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
+-    except Exception:  # state.db may not exist for a CLI/dashboard invocation
+-        logger.debug("Could not open state.db to verify Kanban provenance", exc_info=True)
+-        return None
+-    try:
+-        return session_id if state.get_session(session_id) else None
+-    finally:
+-        state.close()
+-
+-
+ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id, conn=None
+                   ) -> tuple[Optional[str], Optional[dict]]:
+     """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
+@@ -1732,7 +1715,10 @@ def _handle_create(args: dict, **kw) -> str:
+             session_id = args.get("session_id")
+         else:
+             session_id = (_persisted_session_id(args.get("session_id"))
+-                          or (self_task.session_id if self_task else None)
++                          # The parent card's session too: a card placed from another gateway carries
++                          # a placeholder (or a chat that lives elsewhere), and handing that on as a
++                          # child's origin made the owner's bind fail (kanban-69709bcf16). [daveey]
++                          or _persisted_session_id(self_task.session_id if self_task else None)
+                           or _persisted_session_id(_current_origin_session_id())
+                           or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
+         if project_id is None and workspace_kind is None and workspace_path is None:
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index bfb3809f2fb..b3ed45667dc 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -1,10 +1,39 @@
+ """Placement refusals for ``kanban_create`` (split out of :mod:`tools.kanban_tools`). [daveey]"""
+ from __future__ import annotations
+ 
++import logging
+ from typing import Optional
+ 
+ from tools.registry import tool_error
+ 
++logger = logging.getLogger(__name__)
++
++
++def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
++    """Return a session id only when it is a real chat: present in this profile's state.db and not a
++    ``kanban.placement`` creator placeholder (a stray notice can give the placeholder a state.db row,
++    so presence alone does not prove a chat; defect kanban-69709bcf16). [daveey]"""
++    if not session_id:
++        return None
++    try:
++        from hermes_cli.kanban_placement import is_placeholder_session
++        if is_placeholder_session(session_id):
++            return None
++    except Exception:
++        logger.debug("Could not check Kanban placement placeholder", exc_info=True)
++    try:
++        from hermes_state import SessionDB
++        from hermes_constants import get_hermes_home
++
++        state = SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
++    except Exception:  # state.db may not exist for a CLI/dashboard invocation
++        logger.debug("Could not open state.db to verify Kanban provenance", exc_info=True)
++        return None
++    try:
++        return session_id if state.get_session(session_id) else None
++    finally:
++        state.close()
++
+ 
+ def _placement_refused(pin: str, why: str) -> str:
+     """[daveey] A caller-pinned gateway cannot be honoured: say so instead of creating the card here."""
+-- 
+2.55.0
+

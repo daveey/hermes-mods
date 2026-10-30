@@ -33,3 +33,7 @@ Core-only: claim transaction and sync apply are database boundaries, not plugin 
 ## Follow-up patch (0543)
 
 **0543** is a test-only change: `tests/hermes_cli/test_kanban_core_functionality.py` now accepts that a claim seeds the run heartbeat, and the stale-run test asserts it is unchanged.
+
+## Follow-up patch (1029)
+
+**1029** (`c4bdf75a576`): an ended worker's post-run turns still fire the activity heartbeat, and `heartbeat_expiry` renews under the card's *current* run uid, so once the card had a new run the old process renewed (or, when the Board refused, logged a false "lease ... lost to" warning for) another worker's lease. `heartbeat_claim` now checks ownership with the UPDATE's own predicate before any Board call. It moved to `hermes_cli/kanban_db_heartbeat.py` (re-exported from `kanban_db`) to keep `kanban_db.py` under its file-size cap. Test: `tests/hermes_cli/test_kanban_heartbeat_owner.py` (3). Tests were added or changed by these commits; they were not re-run for this mirror.

@@ -1,0 +1,425 @@
+From 0bc4df24bc1dae66bae1721780ea5b68a35be353 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:29:40 -0700
+Subject: [PATCH] fix(kanban): a remote card's notice wakes an idle chat
+ instead of only writing a row [daveey] (#220)
+
+On 2026-10-29 two hub cards' done notices were written into idle David-MBP chat 20261027_134353_5ab65c
+on time (15:24:56Z, 16:53:29Z) as passive kanban_notice rows. No turn ran until a local card's notice
+woke the chat at 18:58Z, 2-3.5 h later. The unloaded sweeper wakes chats for local cards. The remote
+sweep in the same loop only appended the row.
+
+The production sweeper now passes a _RemoteWaker. A fresh remote notice gets the same grace window
+the local sweep gives (the chat's live poller claims first). It is then claimed in the remote ledger,
+the way collect() claims it, and starts ONE turn under the same skip rules, wake budget and slots.
+A refused or failed wake writes the passive row. A turn in flight releases the claim for the next pass.
+Calls without a waker (tests, tools) keep the passive-row behaviour.
+
+Card: hub t_01a18933349f9cdf
+---
+ tests/tui_gateway/test_kanban_remote_wake.py | 164 +++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py         |  81 ++++++++-
+ tui_gateway/kanban_unloaded.py               |  69 +++++++-
+ 3 files changed, 304 insertions(+), 10 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_wake.py
+
+diff --git a/tests/tui_gateway/test_kanban_remote_wake.py b/tests/tui_gateway/test_kanban_remote_wake.py
+new file mode 100644
+index 00000000000..ce9827b829e
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_wake.py
+@@ -0,0 +1,164 @@
++"""A remote card's notice wakes an idle chat, like a local card's, instead of only writing a row. [daveey]
++
++2026-10-29, David-MBP chat 20261027_134353_5ab65c: hub cards t_01a1873edd84d3fc (done 15:23:42Z) and
++t_01a18300e42c3364 (done 16:53:01Z) were written into the idle chat on time as passive ``kanban_notice`` rows
++(15:24:56Z and 16:53:29Z, ledger delivered=1), but no turn ran until a LOCAL card's notice woke the chat at
++18:58Z, 2-3.5 h later. The local unloaded sweep has woken the chat since 10-27 (``kanban_unloaded`` "a row is
++not a turn"); the remote sweep in the same loop only ever wrote the row.
++
++These tests drive the production sweeper loop (``kanban_unloaded._loop``) with the real replica, ledger and
++state.db paths of the sandboxed home; only the agent turn (``wake_turn``) and the worker thread are faked.
++"""
++
++import contextlib
++import json
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_constants import get_hermes_home
++from hermes_state import SessionDB
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import kanban_unloaded as ku
++
++CHAT = "20261027_134353_5ab65c"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    hub = tmp_path / "hub-state"
++    hub.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(hub))
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_FIRST_S", "0")
++    monkeypatch.delenv("HERMES_KANBAN_UNLOADED_WAKE", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_UNLOADED_WAKES_PER_HOUR", raising=False)
++    krn._reset_for_tests()
++    ku._reset_wake_budget_for_tests()
++    with SessionDB(get_hermes_home() / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        db.append_message(CHAT, "user", "start the cards")
++        db.append_message(CHAT, "assistant", "started")
++    yield hub
++    krn._reset_for_tests()
++    ku._reset_wake_budget_for_tests()
++
++
++def _publish(hub, cards, arrived_ago=60.0):
++    """The macbook replica: synchronized (cursor == head), hub-owned cards linked to CHAT, first seen on this
++    host ``arrived_ago`` seconds ago (the durable arrival time both consumers share)."""
++    with sqlite3.connect(hub / "hub.db") as conn:
++        conn.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
++        conn.execute("CREATE TABLE IF NOT EXISTS replica(gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, "
++                     "data TEXT, updated_at INTEGER, PRIMARY KEY (gw, coll, key))")
++        conn.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
++                         [("gateway", "macbook"), ("cursor", "100"), ("head", "100")])
++        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM replica").fetchone()[0]
++        for card in cards:
++            seq += 1
++            conn.execute("INSERT OR REPLACE INTO replica VALUES ('hub','tasks',?,1,?,?,0)",
++                         (f"default/default/{card['id']}", seq, json.dumps(card)))
++    from tui_gateway.kanban_remote_observations import observe
++    observe(hub / "hub.db", None, time.time() - arrived_ago)
++    krn._reset_for_tests()  # a fresh process: only the durable ledger carries the arrival
++
++
++def _done(tid, at, sessions=(CHAT,), summary="shipped the fix"):
++    return {"id": tid, "status": "done", "title": f"card {tid}", "board": "default", "assignee": "default",
++            "completed_at": at, "completion_notice": {"event_id": 81053, "created_at": at,
++                                                      "payload": {"summary": summary}},
++            "sessions": [{"gw": "macbook", "profile": "default", "session": s, "rel": "shepherd"} for s in sessions]}
++
++
++def _blocked_on_david(tid, at):
++    return {"id": tid, "status": "blocked", "title": f"card {tid}", "board": "default", "assignee": "default",
++            "block_kind": "needs_input", "run": {"ended_at": at, "summary": "pick a window"},
++            "human_request": {"action": "Reply A or B. Unblock = A; archive = drop.", "why_human": "owner pick",
++                              "interaction": "reply", "scope": "deploy window", "evidence": "no window chosen"},
++            "sessions": [{"gw": "macbook", "profile": "default", "session": CHAT, "rel": "shepherd"}]}
++
++
++def _one_pass(monkeypatch, wake_verdict="started"):
++    """One iteration of the production sweeper loop; returns the faked wakes it requested."""
++    wakes = []
++
++    def wake(tip, text, metadata):
++        wakes.append((tip, text, metadata))
++        return wake_verdict
++
++    monkeypatch.setattr(ku, "wake_turn", wake)
++    monkeypatch.setattr(ku, "_spawn_thread", lambda job: (job(), "dispatched")[1])
++    stop = threading.Event()
++    monkeypatch.setattr(ku, "sweep_once", lambda *a, **k: stop.set() or [])
++    ku._loop(stop)
++    return wakes
++
++
++def _notice_rows():
++    with SessionDB(get_hermes_home() / "state.db") as db:
++        return [m for m in db.get_messages(CHAT) if m.get("display_kind") == "kanban_notice"]
++
++
++def _ledger(ref):
++    with contextlib.closing(sqlite3.connect(krn.ledger_path())) as conn:
++        conn.row_factory = sqlite3.Row
++        row = conn.execute("SELECT * FROM notices WHERE session=? AND ref=?", (CHAT, ref)).fetchone()
++        return dict(row) if row else None
++
++
++def test_remote_done_notice_wakes_an_idle_chat_once(home, monkeypatch):
++    """Late-delivery path: the sweep starts a turn with the notice instead of leaving a silent row."""
++    now = time.time()
++    _publish(home, [_done("t_01a1873edd84d3fc", now - 75)])
++
++    wakes = _one_pass(monkeypatch)
++
++    assert [w[0] for w in wakes] == [CHAT]
++    assert "t_01a1873edd84d3fc" in wakes[0][1] and "shipped the fix" in wakes[0][1]
++    assert wakes[0][2]["kanban_event_keys"] == ["remote:hub:default/default/t_01a1873edd84d3fc:81053"]
++    assert wakes[0][2]["woken"] is True
++    assert _notice_rows() == []  # the started turn records the notice; no passive duplicate row
++    assert _ledger("hub/default/default/t_01a1873edd84d3fc")["delivered"] == 1
++    # Next pass (and a restarted backend): nothing is woken or written again.
++    assert _one_pass(monkeypatch) == []
++    krn._reset_for_tests()
++    ku._reset_wake_budget_for_tests()
++    assert _one_pass(monkeypatch) == []
++
++
++def test_remote_notice_gives_a_live_poller_the_grace_window_first(home, monkeypatch):
++    """A state that arrived seconds ago belongs to the chat's live poller (any backend): the sweep neither
++    claims it nor writes a row until the grace window has passed."""
++    now = time.time()
++    _publish(home, [_done("t_young", now - 2)], arrived_ago=2)
++
++    assert _one_pass(monkeypatch) == []
++    assert _notice_rows() == []
++    assert _ledger("hub/default/default/t_young") is None
++    # The poller can still claim it.
++    got = krn.collect(CHAT, "default", now=now)
++    assert [item["ref"] for item in got] == ["hub/default/default/t_young"]
++
++
++def test_refused_wake_falls_back_to_one_passive_row(home, monkeypatch):
++    now = time.time()
++    _publish(home, [_done("t_refused", now - 120)])
++
++    wakes = _one_pass(monkeypatch, wake_verdict="refused")
++
++    assert len(wakes) == 1
++    rows = _notice_rows()
++    assert len(rows) == 1 and "t_refused" in rows[0]["content"]
++    assert _ledger("hub/default/default/t_refused")["delivered"] == 1
++    assert _one_pass(monkeypatch, wake_verdict="refused") == []
++    assert len(_notice_rows()) == 1
++
++
++def test_card_blocked_on_david_writes_the_row_without_waking(home, monkeypatch):
++    now = time.time()
++    _publish(home, [_blocked_on_david("t_needs_david", now - 120)])
++
++    assert _one_pass(monkeypatch) == []
++    rows = _notice_rows()
++    assert len(rows) == 1 and "t_needs_david" in rows[0]["content"]
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 39ab92f4dda..1901471c4b5 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -596,9 +596,49 @@ def _sweep_cards(rows: list[tuple], me: str):
+         yield owner, key, task, links
+ 
+ 
++def _settle_claim(claim: dict, memo_key: tuple, ledger) -> None:
++    """The notice reached the chat (a started turn or a written row): ledger delivered, memo and ``swept`` set."""
++    ack(claim, ledger=ledger)
++    _record_swept([memo_key], ledger)
++    _remember_delivered(memo_key)
++
++
++def _persist_claimed(session_db, profile: str, sid: str, text: str, metadata: dict, claim: dict, memo_key: tuple,
++                     ledger) -> bool:
++    """The passive row for a claimed notice whose wake did not start. A chat mid-turn (or any failure) hands the
++    claim back, so the next pass (or the chat's live poller) delivers it instead of nobody. Never raises."""
++    from hermes_state_errors import SessionTurnLeaseLostError
++    try:
++        with session_db(profile, sid) as (db, tip):
++            if db is None:
++                release(claim, ledger=ledger)
++                return False
++            db.append_kanban_notice(tip, text, metadata)
++            from hermes_state_outcome import refresh_outcomes_quietly
++            refresh_outcomes_quietly([tip], "notice", db=db)  # [daveey] the passive row is the chat's last word
++    except SessionTurnLeaseLostError:
++        release(claim, ledger=ledger)
++        logger.info("remote Kanban notice %s for chat %s deferred: a turn is running; retrying next pass",
++                    claim["ref"], sid)
++        return False
++    except Exception:
++        release(claim, ledger=ledger)
++        logger.warning("remote Kanban notice %s for chat %s not written; retrying next pass", claim["ref"], sid,
++                       exc_info=True)
++        return False
++    _settle_claim(claim, memo_key, ledger)
++    return True
++
++
+ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session_db, ledger, settled,
+-                  delivered: list, swept: list) -> None:
+-    """Append one fresh notice unless the memo or the ledger already settled it. A failed write is not remembered."""
++                  delivered: list, swept: list, waker=None, observed_at=None, now=None) -> None:
++    """Deliver one fresh notice unless the memo or the ledger already settled it. A failed write is not remembered.
++
++    Without ``waker`` the notice is a passive row. With one (the production sweeper, ``kanban_unloaded``) the
++    notice is claimed in the ledger, like ``collect`` claims it, and handed to the waker, which starts ONE turn
++    with it and falls back to the row. A row alone is not a turn: an idle chat sat on two hub cards' rows for
++    2-3.5 h until an unrelated local card woke it (David-MBP 2026-10-29). A state younger than the waker's grace
++    window is left for the chat's live poller, which may run in another backend on this host. [daveey]"""
+     profile, sid = link.get("profile"), link.get("session")
+     if not profile or not sid or sid in live:
+         return
+@@ -607,26 +647,47 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+         memo_key = (str(path), profile, sid, metadata["notice_id"])
+         if memo_key in _delivered:
+             return
++        if waker is not None and observed_at is not None and now is not None and now - observed_at < waker.grace_s:
++            return  # a live poller (any backend) claims within seconds; it owns the chat's turn
++        claim = {"session": sid, "ref": ref, "state": state, "notice_key": event_key}
+         with session_db(profile, sid) as (db, tip):
+             if db is None or not text:
+                 return
+             from tui_gateway.notice_fanout import chat_skip_reason
+             if chat_skip_reason(db, sid) is not None:  # [daveey] archived chat or a copy moved to another gateway
+                 return
+-            if not settled((sid, tip), ref, state):
++            if settled((sid, tip), ref, state):
++                _remember_delivered(memo_key)
++                return
++            if waker is None:
+                 row_id = db.append_kanban_notice(tip, text, metadata)
+                 from hermes_state_outcome import refresh_outcomes_quietly
+                 refresh_outcomes_quietly([tip], "notice", db=db)  # [daveey] unloaded sweeper's remote rows too
+                 delivered.append({"task_id": task["id"], "session_id": tip, "message_row": row_id})
+                 swept.append(memo_key)
+-                ack({"session": sid, "ref": ref, "state": state, "notice_key": event_key}, ledger=ledger)
++                ack(claim, ledger=ledger)
++                _remember_delivered(memo_key)
++                return
++            with contextlib.closing(_ledger(ledger)) as conn:
++                verdict = _claim_notice(conn, session=sid, ref=ref, state=state, now=now or time.time(), fresh=True,
++                                        notice_key=event_key, task_id=str(task["id"]),
++                                        transcript_has=lambda k, t: notice_in_transcript(db, tip, k, t))
++        if verdict == "acked":
+             _remember_delivered(memo_key)
++            return
++        if verdict != "offer":
++            return  # another consumer holds it in flight
++        result = waker.deliver(
++            tip, text, metadata, task, now or time.time(),
++            persist=lambda: _persist_claimed(session_db, profile, sid, text, metadata, claim, memo_key, ledger),
++            started=lambda: _settle_claim(claim, memo_key, ledger))
++        delivered.append({"task_id": task["id"], "session_id": tip, "wake": result})
+     except Exception:
+         logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
+ 
+ 
+ def _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept,
+-                   counts) -> None:
++                   counts, waker=None) -> None:
+     for owner, key, task, links in cards:
+         at = _terminal_at(task)
+         ref, state = f"{owner}/{key}", f"{task['status']}@{int(at) if at else 0}"
+@@ -637,11 +698,11 @@ def _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger,
+         for link in links:
+             _deliver_link(owner, key, task, link, me=me, ref=ref, state=state, path=path, live=live,
+                           session_db=session_db, ledger=ledger, settled=settled,
+-                          delivered=delivered, swept=swept)
++                          delivered=delivered, swept=swept, waker=waker, observed_at=observed_at, now=now)
+ 
+ 
+ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session_db, live_ids=None,
+-                         ledger=None, now: Optional[float] = None) -> list[dict]:
++                         ledger=None, now: Optional[float] = None, waker=None) -> list[dict]:
+     """Persist addressed notices, then ack the ledger. Write-first: a failed append leaves no delivered row
+     and the next sweep retries (no claim-before-durable). ``live_ids`` are open chats; their poller writes the
+     row and starts the turn, so this sweep skips them. Done and blocked share one ``kanban_event_keys`` value
+@@ -653,6 +714,9 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+     state.db for a notice this process already persisted. Without the guards a rollout that changed the
+     blocked notice key replayed 293 ``blocked`` notices from days earlier, of cards long done, into idle
+     chats (MacBook 2026-10-29 00:22Z).
++
++    ``waker`` (``kanban_unloaded._RemoteWaker``, passed by the production sweeper) turns each fresh notice into ONE
++    turn in the chat, after a grace window for its live poller; without it the notice is only the passive row.
+     """
+     from hermes_cli.kanban_origin import _hub_db, gateway_names
+ 
+@@ -694,7 +758,8 @@ def sweep_remote_notices(*, replica_path=None, gateway=None, session_db=_session
+                         ledger_conn.append(None)
+                 return _ledger_settled(ledger_conn[0], sessions, ref, state)
+ 
+-            _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept, counts)
++            _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept, counts,
++                           waker=waker)
+         stale = counts.get("stale", 0)
+         if stale and stale != _last_stale.get(str(path)):
+             _last_stale[str(path)] = stale
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 6ca6b292cb3..f31b8fc38a6 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -464,14 +464,79 @@ def open_subscription_sessions(session_ids: list[str]) -> dict[str, int]:
+     return counts
+ 
+ 
++class _RemoteWaker:
++    """Wake policy for remote cards' notices (``kanban_remote_notices.sweep_remote_notices``), shared with local
++    ones: the same skip reasons, per-chat budget, parallel-wake slots and worker thread. A notice that cannot wake
++    its chat is written as the passive row. [daveey]
++
++    Before, the remote sweep only wrote the row: on 2026-10-29 two hub cards' notices sat as rows in an idle
++    David-MBP chat for 2 h and 3.5 h, until a local card's wake ran a turn that finally read them."""
++
++    def __init__(self, wake: Callable[[str, str, dict], str], spawn: Callable[[Callable[[], str]], str],
++                 grace_s: float) -> None:
++        self.wake, self.spawn, self.grace_s = wake, spawn, grace_s
++
++    def deliver(self, tip: str, text: str, metadata: dict, task: dict, now: float, *,
++                persist: Callable[[], bool], started: Callable[[], None]) -> str:
++        """Start one turn with ``text`` in ``tip``, else ``persist()`` the row. Returns the verdict. Never raises."""
++        try:
++            from types import SimpleNamespace
++            view = SimpleNamespace(status=task.get("status"), human_request=task.get("human_request"),
++                                   block_kind=task.get("block_kind"))
++            skip = _wake_skip_reason(view, [text]) or (None if _has_wake_budget(tip, now) else "skipped:budget")
++        except Exception:
++            logger.warning("remote kanban wake routing for %s failed; writing the notice row", tip, exc_info=True)
++            skip = "error"
++        if skip:
++            persist()
++            return skip
++        if not _wake_slots.acquire(blocking=False):
++            persist()
++            return "skipped:slots"
++
++        def job() -> str:
++            try:
++                try:
++                    verdict = str(self.wake(tip, text, {**metadata, "display_text": text, "woken": True}) or "error")
++                except Exception:
++                    logger.warning("remote kanban wake of %s failed", tip, exc_info=True)
++                    verdict = "error"
++                if verdict == "started":
++                    _charge_wake(tip, now)
++                    started()
++                else:
++                    persist()
++                logger.info("remote kanban notice for %s (task=%s): %s", tip, task.get("id"),
++                            "turn started" if verdict == "started" else f"{verdict}, notice row written")
++                return verdict
++            except Exception:
++                logger.warning("remote kanban wake job for %s failed", tip, exc_info=True)
++                return "error"
++            finally:
++                _wake_slots.release()
++
++        try:
++            return self.spawn(job)
++        except Exception:
++            _wake_slots.release()
++            logger.warning("remote kanban sweep could not start a wake for %s", tip, exc_info=True)
++            persist()
++            return "error"
++
++
++def sweep_remote_once(live_ids: set[str], *, grace_s: float = GRACE_S, **kwargs) -> list[dict]:
++    """One remote-notice pass with waking (the production entry; ``kwargs`` go to ``sweep_remote_notices``)."""
++    from tui_gateway.kanban_remote_notices import sweep_remote_notices
++    return sweep_remote_notices(live_ids=live_ids, waker=_RemoteWaker(wake_turn, _spawn_thread, grace_s), **kwargs)
++
++
+ def _loop(stop: threading.Event) -> None:
+     interval = max(1.0, _env_float("HERMES_KANBAN_UNLOADED_SWEEP_S", INTERVAL_S))
+     grace = _env_float("HERMES_KANBAN_UNLOADED_GRACE_S", GRACE_S)
+     stop.wait(_env_float("HERMES_KANBAN_UNLOADED_FIRST_S", FIRST_RUN_DELAY_S))
+     while not stop.is_set():
+         try:
+-            from tui_gateway.kanban_remote_notices import sweep_remote_notices
+-            sweep_remote_notices(live_ids=live_session_ids())
++            sweep_remote_once(live_session_ids(), grace_s=grace)
+             sweep_once(live_session_ids(), grace_s=grace)
+         except Exception:
+             logger.warning("kanban unloaded sweep failed", exc_info=True)
+-- 
+2.55.0
+

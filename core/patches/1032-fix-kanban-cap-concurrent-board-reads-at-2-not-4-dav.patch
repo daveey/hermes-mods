@@ -1,0 +1,103 @@
+From 22df58c65a6a7400dbac9aa9a4d1420723393134 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:40:26 +0000
+Subject: [PATCH] fix(kanban): cap concurrent board reads at 2, not 4 [daveey]
+
+eb8969927d2 admitted one read per board with at most 4 boards at once. Hub
+cold-start A/B (real `hermes serve`, sqlite-backup copy of hub data, Desktop
+burst, 6 s board timeout, alternating runs): the default board's own first
+read timed out in 2/5 runs at cap 4 (base 0/10), from GIL contention with the
+other boards' reads. Cap 2: 0/10 timeouts, default first read median 5.18 s
+(base 4.72 s), runners read median 2.29 s / max 3.25 s (base 4.40 / 5.65 s).
+
+New HTTP test: with three cold boards, only two reads run until one finishes
+(fails at cap 4).
+---
+ plugins/kanban/dashboard/plugin_api.py      |  2 +-
+ tests/plugins/test_kanban_read_admission.py | 60 +++++++++++++++++++++
+ 2 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 7e929524de9..23f539521a6 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -424,7 +424,7 @@ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, c
+             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+ 
+ 
+-_read_board = coalesced_read(get_board, admission_key=lambda a: (a.get("board") or "").strip().lower(), max_concurrent=4)  # a cold board must not queue other boards
++_read_board = coalesced_read(get_board, admission_key=lambda a: (a.get("board") or "").strip().lower(), max_concurrent=2)  # one read per board, at most 2 boards: hub A/B, a cap of 4 made the default board's cold read time out
+ 
+ 
+ # --- GET /session-labels ------------------------------------------------------
+diff --git a/tests/plugins/test_kanban_read_admission.py b/tests/plugins/test_kanban_read_admission.py
+index 0115817c523..be91665b070 100644
+--- a/tests/plugins/test_kanban_read_admission.py
++++ b/tests/plugins/test_kanban_read_admission.py
+@@ -134,3 +134,63 @@ async def test_cold_board_read_does_not_queue_other_boards(tmp_path, monkeypatch
+         release.set()
+         if slow is not None:
+             await asyncio.gather(slow, return_exceptions=True)
++
++
++@pytest.mark.anyio
++async def test_board_reads_hold_at_most_two_workers(tmp_path, monkeypatch):
++    """Per-board admission is still bounded: with three cold boards, the third
++    waits until one of the first two finishes. Hub A/B: a cap of 4 made the
++    default board's own cold read hit the Desktop's 6 s timeout (2/5 runs)."""
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    kb.create_board("other")
++    kb.create_board("third")
++    plugin_path = Path(__file__).resolve().parents[2] / "plugins/kanban/dashboard/plugin_api.py"
++    spec = importlib.util.spec_from_file_location("kanban_admission_cap_test", plugin_path)
++    plugin = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, spec.name, plugin)
++    spec.loader.exec_module(plugin)
++    app = FastAPI()
++    app.include_router(plugin.router, prefix="/api/plugins/kanban")
++
++    release = threading.Event()
++    guard = threading.Lock()
++    state = {"active": 0, "peak": 0, "entered": 0}
++    original = kb.list_tasks
++
++    def blocking_read(*args, **kwargs):
++        with guard:
++            state["active"] += 1
++            state["entered"] += 1
++            state["peak"] = max(state["peak"], state["active"])
++        try:
++            assert release.wait(10), "test did not release board reads"
++            return original(*args, **kwargs)
++        finally:
++            with guard:
++                state["active"] -= 1
++
++    monkeypatch.setattr(kb, "list_tasks", blocking_read)
++    reads = []
++    try:
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++            reads = [asyncio.create_task(client.get(BOARD_PATH, params={"board": b}))
++                     for b in ("default", "other", "third")]
++            for _ in range(300):
++                if state["entered"] >= 2:
++                    break
++                await asyncio.sleep(0.01)
++            await asyncio.sleep(0.3)  # health: allow HX013 -- negative check: window for a wrongly admitted third read to start
++            assert state["entered"] == 2
++            release.set()
++            responses = await asyncio.wait_for(asyncio.gather(*reads), timeout=10)
++            assert all(r.status_code == OK for r in responses)
++            assert state["peak"] == 2
++            assert state["entered"] == 3
++    finally:
++        release.set()
++        if reads:
++            await asyncio.gather(*reads, return_exceptions=True)
+-- 
+2.55.0
+

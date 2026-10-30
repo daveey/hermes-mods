@@ -1,0 +1,352 @@
+From 7ae59acf25c0c476d12d479c509ee07247c3537c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:37:47 +0000
+Subject: [PATCH] fix(tui): reach split-module helpers through server so
+ turn-end outcome refresh works [daveey]
+
+turn_outcome.py imported _session_db straight from session_workdir. Split modules are written
+against server.py's globals (bind_module rebinds them there), so the raw module copy raised
+NameError: _get_db on every Desktop/TUI turn end and the chat's stored outcome never refreshed.
+The test hid it by stubbing session_workdir._get_db (raising=False), which only the test had.
+
+- turn_outcome, kanban_unloaded, notice_guarantee, kanban_remote_notices, methods_bot_relay now
+  call server._name for split helpers. The same bug made session_notifications._readopt_wake_profiles
+  (raw copy: NameError on Path, swallowed) return only the launch store, so the unloaded sweep and
+  the notice guarantee never searched named profiles' stores.
+- test_turn_outcome_refresh: drop the session_workdir._get_db stub; add
+  test_refresh_uses_server_bound_session_db (red before: NameError).
+- test_split_module_imports: AST guard failing on any direct import of a bind_module split
+  module's function from another tui_gateway module.
+- kanban_unloaded busy/wake tests patch server's helpers (the real call path) instead of the
+  module copies, which were inert after the fix.
+---
+ .../tui_gateway/test_kanban_unloaded_busy.py  |  3 +-
+ .../tui_gateway/test_kanban_unloaded_wake.py  |  4 +-
+ .../tui_gateway/test_split_module_imports.py  | 98 +++++++++++++++++++
+ .../tui_gateway/test_turn_outcome_refresh.py  | 24 ++++-
+ tui_gateway/kanban_remote_notices.py          |  4 +-
+ tui_gateway/kanban_unloaded.py                |  8 +-
+ tui_gateway/methods_bot_relay.py              | 14 +--
+ tui_gateway/notice_guarantee.py               |  4 +-
+ tui_gateway/turn_outcome.py                   |  4 +-
+ 9 files changed, 140 insertions(+), 23 deletions(-)
+ create mode 100644 tests/tui_gateway/test_split_module_imports.py
+
+diff --git a/tests/tui_gateway/test_kanban_unloaded_busy.py b/tests/tui_gateway/test_kanban_unloaded_busy.py
+index 4e4a01f29c0..3f1f9dbee1d 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_busy.py
++++ b/tests/tui_gateway/test_kanban_unloaded_busy.py
+@@ -29,7 +29,6 @@ LOGGER = "tui_gateway.kanban_unloaded"
+ @pytest.fixture
+ def db(tmp_path, monkeypatch):
+     from tui_gateway import server
+-    from tui_gateway import session_notifications as sn
+ 
+     d = SessionDB(tmp_path / "state.db")
+     d.create_session(CHAT, "desktop")
+@@ -40,7 +39,7 @@ def db(tmp_path, monkeypatch):
+         yield d if not params else None  # launch store holds the chat; the named profile has none
+ 
+     monkeypatch.setattr(server, "_profile_db", profile_db)
+-    monkeypatch.setattr(sn, "_readopt_wake_profiles", lambda: [None, "other"])
++    monkeypatch.setattr(server, "_readopt_wake_profiles", lambda: [None, "other"])
+     monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "0")
+     ku._reset_overdue_for_tests()
+     yield d
+diff --git a/tests/tui_gateway/test_kanban_unloaded_wake.py b/tests/tui_gateway/test_kanban_unloaded_wake.py
+index ff7bb5aa146..75d4759b5ae 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_wake.py
++++ b/tests/tui_gateway/test_kanban_unloaded_wake.py
+@@ -154,10 +154,10 @@ def test_card_blocked_on_a_human_is_not_woken(db):
+ 
+ def test_diagnostic_only_notice_is_not_woken(db, monkeypatch):
+     from gateway.warning_notifications import DiagnosticText
+-    from tui_gateway import session_notifications as sn
++    from tui_gateway import server
+ 
+     _card()
+-    monkeypatch.setattr(sn, "_format_kanban_event_text", lambda *a: DiagnosticText("worker heartbeat late"))
++    monkeypatch.setattr(server, "_format_kanban_event_text", lambda *a: DiagnosticText("worker heartbeat late"))
+     wake = _Wake()
+ 
+     out = _sweep(db, wake)
+diff --git a/tests/tui_gateway/test_split_module_imports.py b/tests/tui_gateway/test_split_module_imports.py
+new file mode 100644
+index 00000000000..0749e911567
+--- /dev/null
++++ b/tests/tui_gateway/test_split_module_imports.py
+@@ -0,0 +1,98 @@
++"""Guard: helpers of a ``bind_module`` split module are reached through ``server``, never imported directly. [daveey]
++
++A split module (``tui_gateway/<name>.py`` that calls ``bind_module(globals(), server)``) is written against
++server.py's namespace: its functions use names such as ``_get_db``, ``Path`` or ``logger`` that only exist after
++``bind_module`` rebinds them onto server globals. The module object itself keeps the raw, un-rebound copies, so
++``from tui_gateway.session_workdir import _session_db`` imports a function that raises ``NameError`` (or, under a
++``contextlib.suppress``, silently does less) the first time it touches one of those names. turn_outcome.py did
++exactly that and every Desktop turn's outcome refresh failed. Reach split helpers as ``server._name`` instead.
++"""
++
++from __future__ import annotations
++
++import ast
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2] / "tui_gateway"
++EXEMPT = {"server.py", "method_ctx.py"}
++
++
++def _calls_bind_module(tree: ast.Module) -> bool:
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Call):
++            fn = node.func
++            if (getattr(fn, "id", None) or getattr(fn, "attr", None)) == "bind_module":
++                return True
++    return False
++
++
++def _split_modules() -> dict[str, set[str]]:
++    out: dict[str, set[str]] = {}
++    for path in ROOT.glob("*.py"):
++        if path.name in EXEMPT:
++            continue
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        if _calls_bind_module(tree):
++            out[path.stem] = {
++                n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
++            }
++    return out
++
++
++def _imported_split_module(node: ast.ImportFrom) -> str | None:
++    if node.level == 1 and node.module and "." not in node.module:
++        return node.module
++    if node.level == 0 and node.module and node.module.startswith("tui_gateway."):
++        rest = node.module.split(".", 1)[1]
++        return rest if "." not in rest else None
++    return None
++
++
++def _violations() -> list[str]:
++    split = _split_modules()
++    found = []
++    for path in sorted(ROOT.glob("*.py")):
++        if path.name == "server.py":
++            continue
++        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
++            if not isinstance(node, ast.ImportFrom):
++                continue
++            mod = _imported_split_module(node)
++            if mod not in split or mod == path.stem:
++                continue
++            for alias in node.names:
++                if alias.name in split[mod]:
++                    found.append(f"tui_gateway/{path.name}:{node.lineno} imports {mod}.{alias.name}")
++    return found
++
++
++def test_split_module_discovery_sees_the_known_split_modules():
++    split = _split_modules()
++    assert "_session_db" in split.get("session_workdir", set())
++    assert "_bot_mode_delivery_text" in split.get("prompt_turn", set())
++    assert "_readopt_wake_profiles" in split.get("session_notifications", set())
++
++
++def test_no_direct_imports_of_split_module_functions():
++    bad = _violations()
++    assert not bad, (
++        "split-module helpers must be reached through `server` (from tui_gateway import server; "
++        "server._name(...)), not imported directly; their raw module copies lack server's globals:\n  "
++        + "\n  ".join(bad)
++    )
++
++
++def test_guard_flags_the_original_turn_outcome_import(tmp_path, monkeypatch):
++    """The detector itself goes red on the import that shipped the NameError."""
++    import shutil
++
++    fake = tmp_path / "tui_gateway"
++    fake.mkdir()
++    shutil.copy(ROOT / "session_workdir.py", fake / "session_workdir.py")
++    (fake / "turn_outcome.py").write_text(
++        "def f(s):\n    from tui_gateway.session_workdir import _session_db\n    return _session_db(s)\n",
++        encoding="utf-8",
++    )
++    monkeypatch.setattr(sys.modules[__name__], "ROOT", fake)
++    assert _violations() == ["tui_gateway/turn_outcome.py:2 imports session_workdir._session_db"]
+diff --git a/tests/tui_gateway/test_turn_outcome_refresh.py b/tests/tui_gateway/test_turn_outcome_refresh.py
+index bc30aa065f1..b78e9250f13 100644
+--- a/tests/tui_gateway/test_turn_outcome_refresh.py
++++ b/tests/tui_gateway/test_turn_outcome_refresh.py
+@@ -81,8 +81,6 @@ def turn_env(monkeypatch, tmp_path, db):
+     }.items():
+         monkeypatch.setattr(server, name, stub)
+     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+-    from tui_gateway import session_workdir
+-    monkeypatch.setattr(session_workdir, "_get_db", lambda: db, raising=False)
+     yield monkeypatch
+     for sid in [s for s in server._sessions if s.startswith("ui-outcome-")]:
+         server._sessions.pop(sid, None)
+@@ -104,6 +102,28 @@ def test_every_turn_conclusion_refreshes_the_stored_outcome(turn_env, db, reply,
+     assert (stored["kind"], stored.get("reason")) == (kind, reason)
+ 
+ 
++def test_refresh_uses_server_bound_session_db(monkeypatch, db, caplog):
++    """Only ``server._get_db`` is stubbed, as in production: session_workdir's raw module copy has no ``_get_db``
++    (it is rebound onto server globals), so the refresh must reach ``_session_db`` through ``server``."""
++    import logging
++
++    from tui_gateway import session_workdir
++    from tui_gateway.turn_outcome import refresh_turn_outcome
++
++    assert not hasattr(session_workdir, "_get_db"), "the split module must not carry server's _get_db"
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    db.create_session("row-bound", source="desktop")
++    db.append_message("row-bound", role="user", content="rotate the key")
++    db.append_message("row-bound", role="assistant", content=SUMMARY)
++
++    with caplog.at_level(logging.WARNING, logger="tui_gateway.turn_outcome"):
++        refresh_turn_outcome({"session_key": "row-bound"}, agent=None)
++
++    assert not [r for r in caplog.records if "turn-end outcome refresh failed" in r.getMessage()]
++    stored = so.get_outcome("row-bound", db=db)
++    assert stored is not None and stored["kind"] == "done"
++
++
+ def test_orphan_reap_refreshes_each_reaped_row(monkeypatch, db):
+     db.create_session("reaped", source="desktop")
+     db.append_message("reaped", role="user", content="long task")
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 848d7c5b0a6..c19181be93d 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -241,10 +241,10 @@ def _completion_text(gw: str, key: str, task: dict, me: str, profile: str, sid:
+     notice = task.get("completion_notice")
+     if task.get("status") != "done" or not isinstance(notice, dict) or "event_id" not in notice:
+         return None
+-    from tui_gateway.session_notifications import _format_kanban_event_text
++    from tui_gateway import server
+     sub = {"task_id": task["id"], "chat_id": f"{me}/{profile}/{sid}"}
+     ev = SimpleNamespace(kind="completed", payload=notice.get("payload"))
+-    return _format_kanban_event_text(sub, SimpleNamespace(**task), ev, task.get("board", "default"))
++    return server._format_kanban_event_text(sub, SimpleNamespace(**task), ev, task.get("board", "default"))
+ 
+ 
+ def _notice_item(card: dict, session_key: str, me: str, profile: str) -> dict:
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 46c707bb858..f7cbbe2d8e1 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -152,10 +152,9 @@ def find_session_db(chat_id: str) -> Iterator[tuple[Any, Optional[str]]]:
+     raised by the caller's block propagates unchanged (it is never caught here: catching at the ``yield`` and
+     yielding again turns it into "generator didn't stop after throw()", kanban-e5babca565)."""
+     from tui_gateway import server
+-    from tui_gateway.session_notifications import _readopt_wake_profiles
+     with contextlib.ExitStack() as stack:
+         found: tuple[Any, Optional[str]] = (None, None)
+-        for profile in _readopt_wake_profiles():
++        for profile in server._readopt_wake_profiles():
+             scope = contextlib.ExitStack()
+             try:
+                 db = scope.enter_context(server._profile_db({"profile": profile} if profile else None, writer=True))
+@@ -292,7 +291,8 @@ def sweep_once(
+     from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_connect as _kbc
+     from hermes_cli import kanban_db_notify as _kbn
+-    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS, _format_kanban_event_text
++    from tui_gateway import server
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS
+     now = time.time() if now is None else now
+     delivered: list[dict] = []
+     for slug in _board_slugs(_kb):
+@@ -318,7 +318,7 @@ def sweep_once(
+                     continue
+                 try:
+                     done = _sweep_sub(conn, slug, sub, grace_s, now, session_db, _kb, _kbn,
+-                                      _KANBAN_NOTIFY_KINDS, _format_kanban_event_text, wake, holders, spawn)
++                                      _KANBAN_NOTIFY_KINDS, server._format_kanban_event_text, wake, holders, spawn)
+                 except Exception:
+                     logger.warning("kanban unloaded sweep failed for %s/%s", slug, sub.get("task_id"), exc_info=True)
+                     continue
+diff --git a/tui_gateway/methods_bot_relay.py b/tui_gateway/methods_bot_relay.py
+index 4262b811fa6..7b2332688d8 100644
+--- a/tui_gateway/methods_bot_relay.py
++++ b/tui_gateway/methods_bot_relay.py
+@@ -129,10 +129,10 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
+         # The sender fields are whatever the relaying client says. The author labels memory only and grants nothing.
+         from tools.bot_relay import (
+             DeliveryAuthor, delivery_env, delivery_turn_author, relaying_principal_author)
+-        from tui_gateway.methods_browser_control import _is_authenticated_identity, _principal_digest
++        from tui_gateway import server
+         sender_fields = ("from_profile", "from_handle", "from_connection")
+         identity = getattr(current_transport(), "auth_identity", None)
+-        if _is_authenticated_identity(identity):
++        if server._is_authenticated_identity(identity):
+             # A logged-in client's sender fields are NOT trusted — but the delivery is not refused
+             # either: the Desktop is itself a logged-in client on every gateway that requires sign-in
+             # (it mints a ws-ticket carrying the signed-in {user_id, provider} —
+@@ -144,7 +144,7 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
+             # bot-authored. The author is derived from the caller's minted identity instead — stable,
+             # unspoofable, and ``is_bot`` — whether or not the client named a sender. The human-facing
+             # "Message from 🤖 …" signature stays in the text the sender composed.
+-            author = relaying_principal_author(_principal_digest(identity))
++            author = relaying_principal_author(server._principal_digest(identity))
+         else:
+             author = delivery_turn_author(*(params.get(k) for k in sender_fields))
+ 
+@@ -165,8 +165,8 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
+             record = deliver_to_live_owner(owner_home, owner, message, author=author)
+             record = await_delivery(owner_home, record["delivery_id"], _LIVE_WAIT_SECONDS) or record
+             if record["status"] == "settled":
+-                from tui_gateway.prompt_turn import _bot_mode_delivery_text
+-                return _ok(rid, {"reply": _bot_mode_delivery_text((record.get("reply") or "").strip(), successful=True)})
++                from tui_gateway import server
++                return _ok(rid, {"reply": server._bot_mode_delivery_text((record.get("reply") or "").strip(), successful=True)})
+             if record["status"] in ("queued", "claimed"):
+                 # Admitted but not answered within the budget: the receipt stays, the turn still runs.
+                 reply = (f"Queued for @{resolved}'s open Bot Chat; it runs as that chat's next turn and the reply "
+@@ -231,8 +231,8 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
+         # Use the same canonical whole-response predicate as live Bot Chat
+         # completion.  A marker remains a successful turn, but is never sent
+         # back to the relay caller as visible prose.
+-        from tui_gateway.prompt_turn import _bot_mode_delivery_text
+-        reply = _bot_mode_delivery_text((proc.stdout or "").strip(), successful=True)
++        from tui_gateway import server
++        reply = server._bot_mode_delivery_text((proc.stdout or "").strip(), successful=True)
+         return _ok(rid, {"reply": reply})
+     except subprocess.TimeoutExpired:
+         # Every classified refusal has to ride `data.reason`: the Desktop forwards only that field,
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 3d39269303e..f5fc428b6ec 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -188,8 +188,8 @@ def _profile_store(profile: Optional[str]) -> Iterator[Any]:
+ 
+ 
+ def _stores() -> Iterator[Any]:
+-    from tui_gateway.session_notifications import _readopt_wake_profiles
+-    for profile in _readopt_wake_profiles():
++    from tui_gateway import server
++    for profile in server._readopt_wake_profiles():
+         try:
+             with _profile_store(profile) as db:
+                 if db is not None:
+diff --git a/tui_gateway/turn_outcome.py b/tui_gateway/turn_outcome.py
+index 8bf4a8d0e67..7a608bbb2c6 100644
+--- a/tui_gateway/turn_outcome.py
++++ b/tui_gateway/turn_outcome.py
+@@ -19,9 +19,9 @@ def refresh_turn_outcome(session: dict, agent=None) -> None:
+         return
+     try:
+         from hermes_state_outcome import refresh_outcome
+-        from tui_gateway.session_workdir import _session_db
++        from tui_gateway import server  # split helpers only work rebound onto server globals (bind_module)
+ 
+-        with _session_db(session) as db:
++        with server._session_db(session) as db:
+             if db is not None:
+                 refresh_outcome(sid, "turn_end", db=db)
+     except Exception:  # health: allow BLE001 -- the turn already concluded; a failed refresh is logged
+-- 
+2.55.0
+

@@ -4,7 +4,7 @@ Patches:
 
 - `patches/0971-fix-gateway-an-agent-adopting-the-gateway-s-bare-ses.patch`
 - `patches/0974-fix-api-a-class-request-on-a-reused-session-serves-i.patch`
-- `patches/1012-fix-routing-restore-resumed-intent-before-turn-selec.patch`
+- `patches/1015-fix-routing-restore-resumed-intent-before-turn-selec.patch`
 
 Three ways a `class:` model selector was lost or mis-served.
 
@@ -12,7 +12,7 @@ Three ways a `class:` model selector was lost or mis-served.
 
 - 971: when the lease adopts the gateway's bare session row it seeds the agent's init `model_config` (`SessionDB.seed_session_model_config` fills only missing keys atomically), so gateway rows under `class:deep` resume as a class, not a pin. Context-length resolution uses `class_context_length` for a class marker.
 - 974: an explicit `class:` request on a reused API session supersedes a different persisted selection; `/model` and a confirmed lock still win.
-- 1012: resumed intent is restored before turn selection and stale class routes recover.
+- 1015: resumed intent is restored before turn selection and stale class routes recover.
 
 ## How it works
 

@@ -1,0 +1,251 @@
+From eb8969927d21d8bb0676ef5e1e02a01626f10f1b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:13:40 +0000
+Subject: [PATCH] fix(kanban): admit board reads per board so a cold board
+ cannot queue the others [daveey]
+
+Mac 16:30 cold start (loop-watch, 9 records): GET /api/plugins/kanban/board
+took 6-20 s. Every board read waited at web_read_coalescing.py:51 on the one
+asyncio.Semaphore(1) shared by all of _read_board, so a cheap read of one board
+queued behind a cold read of another (the runners board hit the Desktop's 6 s
+timeout). Hub repro with the real data: runners read admit_wait 6.1 s, run 0.4 s.
+
+coalesced_read gains admission_key/max_concurrent: one in-flight read per
+group, at most N groups at once. _read_board groups by board, N=4, so a burst
+still holds a bounded number of AnyIO workers; /api/profiles keeps one slot.
+---
+ hermes_cli/web_read_coalescing.py            | 39 +++++++---
+ plugins/kanban/dashboard/plugin_api.py       |  2 +-
+ tests/hermes_cli/test_web_read_coalescing.py | 76 ++++++++++++++++++++
+ tests/plugins/test_kanban_read_admission.py  | 51 ++++++++++++-
+ 4 files changed, 156 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/web_read_coalescing.py b/hermes_cli/web_read_coalescing.py
+index 3f5b5498a95..05de8c299ec 100644
+--- a/hermes_cli/web_read_coalescing.py
++++ b/hermes_cli/web_read_coalescing.py
+@@ -19,15 +19,25 @@ def _freeze(value):
+     return (type(value), value)
+ 
+ 
+-def coalesced_read(func, *, thread_runner=run_sync):
++def coalesced_read(func, *, thread_runner=run_sync, admission_key=None, max_concurrent=1):
+     """Return an async, in-flight-only wrapper around a synchronous read.
+ 
+-    One worker per decorated function/event loop; identical home + bound
+-    arguments share its result. Arguments must be hashable or built-in
+-    containers of hashable values and must not be mutated during the read.
+-    A custom async thread_runner must await the supplied zero-argument callable
+-    through a context-preserving threadpool, not abandon running work.
++    Identical home + bound arguments share one in-flight result. Arguments must
++    be hashable or built-in containers of hashable values and must not be
++    mutated during the read. A custom async thread_runner must await the
++    supplied zero-argument callable through a context-preserving threadpool,
++    not abandon running work.
++
++    Admission: by default one worker per decorated function/event loop.
++    ``admission_key(bound_arguments)`` splits admission into groups (e.g. one
++    per kanban board): one read per group at a time, at most ``max_concurrent``
++    groups at once, so a slow read of one resource does not queue reads of
++    another while a burst still holds a bounded number of workers. [daveey]
+     """
++    if max_concurrent < 1:
++        raise ValueError("max_concurrent must be >= 1")
++    if admission_key is None and max_concurrent != 1:
++        raise ValueError("max_concurrent needs an admission_key")
+     signature = inspect.signature(func)
+     hints = get_type_hints(func, include_extras=True)
+     signature = signature.replace(
+@@ -42,13 +52,22 @@ def coalesced_read(func, *, thread_runner=run_sync):
+         loop = asyncio.get_running_loop()
+         bound = signature.bind(*args, **kwargs)
+         bound.apply_defaults()
+-        key = (str(get_hermes_home()), _freeze(bound.arguments))
+-        pending, admission = states.setdefault(loop, ({}, asyncio.Semaphore(1)))
++        home = str(get_hermes_home())
++        key = (home, _freeze(bound.arguments))
++        # Group before the read so a bad key fails this caller, not a shared task.
++        group = None if admission_key is None else (home, _freeze(admission_key(bound.arguments)))
++        pending, admission, groups = states.setdefault(loop, ({}, asyncio.Semaphore(max_concurrent), {}))
+         task = pending.get(key)
+         if task is None:
++            group_slot = None if group is None else groups.setdefault(group, asyncio.Semaphore(1))
++
+             async def execute():
+                 try:
+-                    async with admission:
++                    # Group first: a read queued behind its own group holds no shared slot.
++                    if group_slot is None:
++                        async with admission:
++                            return await thread_runner(partial(func, *args, **kwargs))
++                    async with group_slot, admission:
+                         return await thread_runner(partial(func, *args, **kwargs))
+                 finally:
+                     pending.pop(key, None)
+@@ -63,4 +82,4 @@ def coalesced_read(func, *, thread_runner=run_sync):
+ 
+     wrapped.__signature__ = signature
+     wrapped.__annotations__ = hints
+-    return wrapped
+\ No newline at end of file
++    return wrapped
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index d225f55bea7..7e929524de9 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -424,7 +424,7 @@ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, c
+             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
+ 
+ 
+-_read_board = coalesced_read(get_board)
++_read_board = coalesced_read(get_board, admission_key=lambda a: (a.get("board") or "").strip().lower(), max_concurrent=4)  # a cold board must not queue other boards
+ 
+ 
+ # --- GET /session-labels ------------------------------------------------------
+diff --git a/tests/hermes_cli/test_web_read_coalescing.py b/tests/hermes_cli/test_web_read_coalescing.py
+index 946fb825039..b608bb224ec 100644
+--- a/tests/hermes_cli/test_web_read_coalescing.py
++++ b/tests/hermes_cli/test_web_read_coalescing.py
+@@ -66,3 +66,79 @@ async def test_profiles_burst_leaves_threadpool_status_responsive(monkeypatch):
+             assert all(r.json() == {"profiles": [{"name": "example"}]} for r in responses)
+     finally:
+         limiter.total_tokens = previous
++
++
++def _gated_runner(log, gates):
++    async def runner(call):
++        name = call.args[0]
++        log.append(("start", name))
++        await gates[name].wait()
++        log.append(("end", name))
++        return call()
++    return runner
++
++
++@async_test
++async def test_admission_groups_run_concurrently_up_to_cap():
++    from hermes_cli.web_read_coalescing import coalesced_read
++    log = []
++    gates = {n: asyncio.Event() for n in "abcd"}
++    read = coalesced_read(lambda board, n=0: (board, n), thread_runner=_gated_runner(log, gates),
++                          admission_key=lambda a: a["board"], max_concurrent=2)
++    a1 = asyncio.create_task(read("a"))
++    b1 = asyncio.create_task(read("b"))
++    c1 = asyncio.create_task(read("c"))
++    a2 = asyncio.create_task(read("a", 1))  # same group, different args: waits for a1
++    a1_dup = asyncio.create_task(read("a"))  # identical args: coalesces with a1
++    await wait_until(lambda: len(log) == 2)
++    for _ in range(50):
++        await asyncio.sleep(0)  # let queued tasks run; none may be admitted
++    assert sorted(log) == [("start", "a"), ("start", "b")]  # cap 2: c queued, a2 behind a1
++    gates["b"].set()
++    await wait_until(lambda: ("start", "c") in log)
++    assert log.count(("start", "a")) == 1
++    gates["c"].set()
++    gates["a"].set()
++    assert await a1 == ("a", 0) and await a1_dup == ("a", 0)
++    assert await b1 == ("b", 0) and await c1 == ("c", 0) and await a2 == ("a", 1)
++    assert log.count(("start", "a")) == 2
++
++
++@async_test
++async def test_slow_group_does_not_block_other_group():
++    from hermes_cli.web_read_coalescing import coalesced_read
++    gates = {n: asyncio.Event() for n in "ab"}
++    gates["b"].set()
++    read = coalesced_read(lambda board: board, thread_runner=_gated_runner([], gates),
++                          admission_key=lambda a: a["board"], max_concurrent=4)
++    slow = asyncio.create_task(read("a"))
++    for _ in range(50):
++        await asyncio.sleep(0)
++    assert await asyncio.wait_for(read("b"), 1) == "b"
++    assert not slow.done()
++    gates["a"].set()
++    assert await slow == "a"
++
++
++@async_test
++async def test_default_admission_still_serializes_distinct_args():
++    from hermes_cli.web_read_coalescing import coalesced_read
++    log = []
++    gates = {n: asyncio.Event() for n in "ab"}
++    read = coalesced_read(lambda name: name, thread_runner=_gated_runner(log, gates))
++    a = asyncio.create_task(read("a"))
++    b = asyncio.create_task(read("b"))
++    await wait_until(lambda: log)
++    for _ in range(50):
++        await asyncio.sleep(0)  # let queued tasks run; none may be admitted
++    assert len(log) == 1
++    gates["a"].set(); gates["b"].set()
++    assert {await a, await b} == {"a", "b"}
++
++
++def test_max_concurrent_requires_admission_key():
++    from hermes_cli.web_read_coalescing import coalesced_read
++    with pytest.raises(ValueError):
++        coalesced_read(lambda: 1, max_concurrent=2)
++    with pytest.raises(ValueError):
++        coalesced_read(lambda: 1, admission_key=lambda a: 1, max_concurrent=0)
+diff --git a/tests/plugins/test_kanban_read_admission.py b/tests/plugins/test_kanban_read_admission.py
+index 5f42bfea299..0115817c523 100644
+--- a/tests/plugins/test_kanban_read_admission.py
++++ b/tests/plugins/test_kanban_read_admission.py
+@@ -84,4 +84,53 @@ async def test_board_burst_preserves_http_worker_capacity(tmp_path, monkeypatch)
+         release.set()
+         if requests:
+             await asyncio.gather(*requests, return_exceptions=True)
+-        limiter.total_tokens = old_tokens
+\ No newline at end of file
++        limiter.total_tokens = old_tokens
++
++@pytest.mark.anyio
++async def test_cold_board_read_does_not_queue_other_boards(tmp_path, monkeypatch):
++    """Mac 16:30 cold start: a slow read of one board held the only board slot,
++    so reads of every other board waited behind it (6-20 s, Desktop timeout 6 s)."""
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    kb.create_board("other")
++    plugin_path = Path(__file__).resolve().parents[2] / "plugins/kanban/dashboard/plugin_api.py"
++    spec = importlib.util.spec_from_file_location("kanban_admission_multi_test", plugin_path)
++    plugin = importlib.util.module_from_spec(spec)
++    monkeypatch.setitem(sys.modules, spec.name, plugin)
++    spec.loader.exec_module(plugin)
++    app = FastAPI()
++    app.include_router(plugin.router, prefix="/api/plugins/kanban")
++
++    entered = threading.Event()
++    release = threading.Event()
++    first = threading.Lock()
++    original = kb.list_tasks
++
++    def first_read_blocks(*args, **kwargs):
++        if first.acquire(blocking=False):  # only the first (default board) read stalls
++            entered.set()
++            assert release.wait(10), "test did not release board read"
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(kb, "list_tasks", first_read_blocks)
++    slow = None
++    try:
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++            slow = asyncio.create_task(client.get(BOARD_PATH, params={"board": "default"}))
++            for _ in range(300):
++                if entered.is_set():
++                    break
++                await asyncio.sleep(0.01)
++            assert entered.is_set()
++            other = await asyncio.wait_for(client.get(BOARD_PATH, params={"board": "other"}), timeout=3)
++            assert other.status_code == OK
++            assert not slow.done()
++            release.set()
++            assert (await slow).status_code == OK
++    finally:
++        release.set()
++        if slow is not None:
++            await asyncio.gather(slow, return_exceptions=True)
+-- 
+2.55.0
+

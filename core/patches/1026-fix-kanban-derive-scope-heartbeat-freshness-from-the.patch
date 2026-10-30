@@ -1,0 +1,474 @@
+From d384df47938e9a15282ac99dda8116e9ff0298cf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 23:41:45 +0000
+Subject: [PATCH] fix(kanban): derive scope-heartbeat freshness from the
+ owner's published collector period [daveey]
+
+Remote-terminal release, origin-ledger owner liveness and wait probes each trusted an owner's
+task_scopes[].observed_at for a fixed window (450 s, 450 s, 600 s). On the loaded hub the gap between
+clean scope reads reached ~440 s (default-board reads timing out at 180 s), so closed remote cards
+flapped "never released" in session-idle-check, both directions.
+
+New hermes_cli/kanban_scope_heartbeat.py is the one rule: window = clamp(2.5 x
+scope_heartbeat_period_s, 450, 1800), where the owner's hermes-hub collector publishes the period in
+gateway/info. An owner that publishes none keeps the 450 s floor. Tests pin window >= 2.5 x period
+and exercise each reader (release, projection horizon, ledger, wait probe).
+---
+ hermes_cli/kanban_origin_ledger.py            |   7 +-
+ hermes_cli/kanban_scope_heartbeat.py          |  73 +++++++++
+ hermes_cli/kanban_session_activity.py         |  41 ++---
+ hermes_cli/kanban_session_activity_records.py |   8 +-
+ hermes_cli/kanban_wait_replica.py             |  21 ++-
+ .../test_kanban_scope_heartbeat_window.py     | 147 ++++++++++++++++++
+ 6 files changed, 254 insertions(+), 43 deletions(-)
+ create mode 100644 hermes_cli/kanban_scope_heartbeat.py
+ create mode 100644 tests/hermes_cli/test_kanban_scope_heartbeat_window.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 4d319809101..08de56fa81c 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -19,6 +19,8 @@ from contextlib import closing, contextmanager
+ from pathlib import Path
+ from typing import Callable
+ 
++from hermes_cli.kanban_scope_heartbeat import SCOPE_HEARTBEAT_FLOOR_S, scope_window
++
+ 
+ def _json(value) -> str:
+     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+@@ -438,12 +440,13 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                         readable = (info.get('gateway') == owner['gateway'] and len(matching) == 1
+                                     and matching[0].get('state') == 'ok')
+                         heartbeat = matching[0].get('observed_at') if readable else None
++                        window = scope_window(info)
+                     except (ValueError, TypeError, AttributeError):
+-                        readable, heartbeat = False, None
++                        readable, heartbeat, window = False, None, SCOPE_HEARTBEAT_FLOOR_S
+                     # Owner liveness: the collector's per-scope heartbeat (one record per sync) proves it read
+                     # this whole board recently, so an unchanged, current task record is still observed. The
+                     # per-task stamp is accepted too, for records published before scope heartbeats existed.
+-                    live = (_recent(heartbeat, now, 450)
++                    live = (_recent(heartbeat, now, window)
+                             or _recent(_owner_evidence(task).get('observed_at'), now))
+                     current = current and readable and live
+                 if (owner['gateway'], owner['profile']) == (gateway, profile):
+diff --git a/hermes_cli/kanban_scope_heartbeat.py b/hermes_cli/kanban_scope_heartbeat.py
+new file mode 100644
+index 00000000000..94e2c395029
+--- /dev/null
++++ b/hermes_cli/kanban_scope_heartbeat.py
+@@ -0,0 +1,73 @@
++"""How long an owner collector's per-scope heartbeat (``task_scopes[].observed_at``) stays fresh. [daveey]
++
++Every reader of that heartbeat (remote-terminal release in ``kanban_session_activity``, owner liveness in
++``kanban_origin_ledger``, wait probes in ``kanban_wait_replica``) asks this module, so the freshness window
++and the owner's publishing cadence can no longer drift apart as two unrelated constants.
++
++The owner's hermes-hub collector publishes ``scope_heartbeat_period_s`` in its ``gateway/info`` record: the
++longest gap between successive clean reads of a scope over its recent cycles. A loaded hub (load 15-30 on 16
++cores) stretched that gap to ~440 s while the window was a fixed 450 s, so terminal remote cards flapped
++"never released" for part of every cycle. The window is now ``SCOPE_HEARTBEAT_PERIOD_FACTOR`` times the
++published period, never below ``SCOPE_HEARTBEAT_FLOOR_S`` (an owner that publishes no period, i.e. an older
++client) and never above ``SCOPE_HEARTBEAT_MAX_S``, so an offline owner's last word still expires.
++"""
++from __future__ import annotations
++
++import json
++import math
++from typing import Any
++
++SCOPE_HEARTBEAT_FLOOR_S = 450.0
++SCOPE_HEARTBEAT_MAX_S = 1800.0
++SCOPE_HEARTBEAT_PERIOD_FACTOR = 2.5
++
++
++def published_period(info: Any) -> float | None:
++    """The owner's published heartbeat period in seconds, or None when absent or malformed."""
++    period = info.get('scope_heartbeat_period_s') if isinstance(info, dict) else None
++    if isinstance(period, bool) or not isinstance(period, (int, float)):
++        return None
++    if not math.isfinite(period) or period <= 0:
++        return None
++    return float(period)
++
++
++def window_for_period(period: float | None) -> float:
++    """Freshness window for a collector that refreshes each scope at most every ``period`` seconds."""
++    if period is None:
++        return SCOPE_HEARTBEAT_FLOOR_S
++    return min(SCOPE_HEARTBEAT_MAX_S, max(SCOPE_HEARTBEAT_FLOOR_S, SCOPE_HEARTBEAT_PERIOD_FACTOR * period))
++
++
++def scope_window(info: Any) -> float:
++    """Freshness window for heartbeats in one owner's ``gateway/info`` record."""
++    return window_for_period(published_period(info))
++
++
++def fresh(observed_at: Any, now: float, window: float) -> bool:
++    """A heartbeat observed within ``window`` seconds before ``now`` (a future-dated one proves nothing)."""
++    return type(observed_at) in (int, float) and 0 <= now - observed_at <= window
++
++
++def scope_heartbeats(info_rows: list[tuple[str, str]]) -> dict[tuple[str, str, str], tuple[float, float]]:
++    """``(gateway, profile, board) -> (observed_at, window)`` for every scope its owner collector read cleanly;
++    ``window`` is that owner's freshness window (``scope_window``).
++
++    Ambiguous scopes (listed twice) and scopes not in state ``ok`` are absent: they prove nothing."""
++    seen: dict[tuple[str, str, str], list] = {}
++    windows: dict[tuple[str, str, str], float] = {}
++    for gw, raw in info_rows:
++        try:
++            info = json.loads(raw)
++        except (TypeError, ValueError):
++            continue
++        if not isinstance(info, dict) or info.get('gateway') != gw or not isinstance(info.get('task_scopes'), list):
++            continue
++        for scope in info['task_scopes']:
++            if isinstance(scope, dict) and isinstance(scope.get('profile'), str) and isinstance(scope.get('board'), str):
++                key = (str(gw), scope['profile'], scope['board'])
++                seen.setdefault(key, []).append(scope)
++                windows[key] = scope_window(info)
++    return {key: (scopes[0]['observed_at'], windows[key]) for key, scopes in seen.items()
++            if len(scopes) == 1 and scopes[0].get('state') == 'ok'
++            and type(scopes[0].get('observed_at')) in (int, float)}
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index fa79774747b..1162ce063b9 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -16,6 +16,8 @@ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_activity_identity as _identity
++from hermes_cli import kanban_scope_heartbeat as _scope_hb
++from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbeats
+ from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases, _moved_evidence, _retire_moved
+ import contextlib
+ import json
+@@ -580,9 +582,10 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+ # a card; distinct qualified profiles stay separate. Historical unqualified aliases
+ # do not add another count when a qualified record for the same card is available.
+ HUB_STALE_AFTER_S = 180.0  # same as the hub-sync plugin: no successful hub sync for this long = stale
+-# The owner collector publishes each scope heartbeat about every 180s (sawtooth 0..~200s as replicated), so a
+-# 180s window flapped: a closed card was released half the time. Allow ~2.5 collector periods. [daveey]
+-SCOPE_HEARTBEAT_FRESH_S = 450.0
++# Scope-heartbeat freshness is per owner: ``kanban_scope_heartbeat.scope_window`` derives it from the period the
++# owner's collector publishes (floor 450 s, the window every owner gets when it publishes none). A fixed 450 s
++# against a loaded hub's ~440 s cycle flapped closed cards between released and "never released". [daveey]
++SCOPE_HEARTBEAT_FRESH_S = _scope_hb.SCOPE_HEARTBEAT_FLOOR_S
+ _REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority")
+ _remote_last: list[dict[str, Any]] | None = None  # last good read (process lifetime)
+ _remote_scope: tuple[str, ...] | None = None
+@@ -600,35 +603,15 @@ def _meta_float(conn: sqlite3.Connection, key: str) -> float | None:
+ TERMINAL_STATUSES = ("done", "archived")
+ 
+ 
+-def _scope_heartbeats(info_rows: list[tuple[str, str]]) -> dict[tuple[str, str, str], float]:
+-    """``(gateway, profile, board) -> observed_at`` for every scope its owner collector read cleanly.
+-
+-    Ambiguous scopes (listed twice) and scopes not in state ``ok`` are absent: they prove nothing."""
+-    seen: dict[tuple[str, str, str], list] = {}
+-    for gw, raw in info_rows:
+-        try:
+-            info = json.loads(raw)
+-        except (TypeError, ValueError):
+-            continue
+-        if not isinstance(info, dict) or info.get('gateway') != gw or not isinstance(info.get('task_scopes'), list):
+-            continue
+-        for scope in info['task_scopes']:
+-            if isinstance(scope, dict) and isinstance(scope.get('profile'), str) and isinstance(scope.get('board'), str):
+-                seen.setdefault((str(gw), scope['profile'], scope['board']), []).append(scope)
+-    return {key: scopes[0].get('observed_at') for key, scopes in seen.items()
+-            if len(scopes) == 1 and scopes[0].get('state') == 'ok'
+-            and type(scopes[0].get('observed_at')) in (int, float)}
+-
+-
+ def _owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str | None, board: str,
+-                            heartbeats: dict[tuple[str, str, str], float], now: float, stale: bool,
++                            heartbeats: dict[tuple[str, str, str], tuple[float, float]], now: float, stale: bool,
+                             evidence: dict[str, Any]) -> bool:
+     """The owner itself, recently, published this card as closed.
+ 
+     Release needs all of: a fresh hub sync; a profile-qualified record whose own identity fields match its
+     key; a terminal status inside the owner collector's hash-bound observation (``origin_observation``, so a
+     replica row edited or truncated in transit proves nothing); and that collector's per-scope heartbeat for
+-    this exact (profile, board) within ``SCOPE_HEARTBEAT_FRESH_S``, so an offline owner's last word is not taken
++    this exact (profile, board) within that owner's window (``kanban_scope_heartbeat``), so an offline owner's last word is not taken
+     as current. Absence of a row is never release. This is the same rule a local board applies to its own
+     cards (``done``/``archived`` are not counted), applied only to evidence the owner signed. Pre-ledger
+     cards had no other release path, so every one of them stayed open forever. ``evidence`` is the task's
+@@ -647,7 +630,7 @@ def _owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str |
+     if task.get('origin_bindings') and evidence.get('verified') is not True and task.get('status') != 'archived':
+         return False
+     beat = heartbeats.get((gw, owner_profile, board))
+-    return beat is not None and 0 <= now - beat <= SCOPE_HEARTBEAT_FRESH_S
++    return beat is not None and _scope_hb.fresh(beat[0], now, beat[1])
+ 
+ 
+ # (replica path, gw, record key) -> (row text, decoded row) from the last replica read: the projection rebuilds on
+@@ -744,7 +727,7 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+     cards = _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+                              qualified_out=qualified, owners_out=owners, seen_out=seen_at, moved_out=moved)
+     # Reuse ends at the next scope-heartbeat cut-off; the hub-staleness cut-off is the ``stale`` comparison above.
+-    beats = [beat + d for beat in _scope_heartbeats(info_rows).values() for d in (0.0, SCOPE_HEARTBEAT_FRESH_S)]
++    beats = [beat + d for beat, window in _scope_heartbeats(info_rows).values() for d in (0.0, window)]
+     _remote_read_memo = (key, now, min((t for t in beats if t > now), default=float('inf')), list(cards),
+                          frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
+                          dict(seen_at), dict(moved))
+@@ -776,7 +759,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+     stale = offline is not None or last_ok is None or now - last_ok > HUB_STALE_AFTER_S
+     heartbeats = _scope_heartbeats(info_rows)
+     if horizon_out is not None:
+-        cutoffs = [beat + d for beat in heartbeats.values() for d in (0.0, SCOPE_HEARTBEAT_FRESH_S)]
++        cutoffs = [beat + d for beat, window in heartbeats.values() for d in (0.0, window)]
+         if not stale:
+             cutoffs.append(last_ok + HUB_STALE_AFTER_S)
+         horizon_out.extend(t for t in cutoffs if t > now)
+@@ -825,7 +808,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         # (session, card) pair absent from it is a dropped link, not an unreadable replica.
+         owners_out.update((gw, board, tid) for gw, _, board, tid in tasks)
+     if moved_out is not None and not stale:
+-        moved_out.update(_moved_evidence(tasks, heartbeats, now, SCOPE_HEARTBEAT_FRESH_S))
++        moved_out.update(_moved_evidence(tasks, heartbeats, now))
+     blank_before = {key for key in tasks if key[1] is None}
+     _fold_legacy_aliases(tasks, raw)
+     # Only a proven-identity alias is the same card as its qualified twin (folded above, links carried
+diff --git a/hermes_cli/kanban_session_activity_records.py b/hermes_cli/kanban_session_activity_records.py
+index 7efab4b7e0b..27405821a0d 100644
+--- a/hermes_cli/kanban_session_activity_records.py
++++ b/hermes_cli/kanban_session_activity_records.py
+@@ -8,16 +8,16 @@ from __future__ import annotations
+ from typing import Any
+ 
+ 
+-def _moved_evidence(tasks: dict[tuple, dict[str, Any]], heartbeats: dict[tuple[str, str, str], float],
+-                    now: float, fresh_s: float) -> dict[str, Any]:
++def _moved_evidence(tasks: dict[tuple, dict[str, Any]], heartbeats: dict[tuple[str, str, str], tuple[float, float]],
++                    now: float) -> dict[str, Any]:
+     """What a fresh replica proves about where each card lives (``_retire_moved``): the gateways publishing a
+     profile-qualified record per ``(board, id, created_at)``, and the owner scopes whose collector read cleanly within
+-    ``fresh_s`` (``SCOPE_HEARTBEAT_FRESH_S``). [daveey]"""
++    that owner's window (``heartbeats`` values are ``(observed_at, window)``, ``kanban_scope_heartbeat.scope_heartbeats``). [daveey]"""
+     published: dict[tuple[str, str, Any], set[str]] = {}
+     for (gw, owner_profile, board, tid), t in tasks.items():
+         if owner_profile is not None and t.get('created_at') is not None:
+             published.setdefault((board, tid, t.get('created_at')), set()).add(gw)
+-    live = {scope for scope, beat in heartbeats.items() if 0 <= now - beat <= fresh_s}
++    live = {scope for scope, (beat, window) in heartbeats.items() if 0 <= now - beat <= window}
+     return {'published': {k: frozenset(v) for k, v in published.items()}, 'live_scopes': frozenset(live)}
+ 
+ 
+diff --git a/hermes_cli/kanban_wait_replica.py b/hermes_cli/kanban_wait_replica.py
+index 9a7690a1980..b142fda459c 100644
+--- a/hermes_cli/kanban_wait_replica.py
++++ b/hermes_cli/kanban_wait_replica.py
+@@ -6,6 +6,7 @@ import sqlite3
+ import time
+ 
+ from hermes_cli import kanban_capability_registry as registry
++from hermes_cli.kanban_scope_heartbeat import scope_window
+ 
+ # Gateway task_scopes are refreshed each sync; task updated_at only changes on edits.
+ MAX_AGE_SECONDS = 600
+@@ -19,9 +20,9 @@ STATUSES = frozenset(("todo", "ready", "running", "scheduled", "review", "blocke
+ class StaleReplica(ValueError):
+     """The card was seen in the gateway's replica, but that replica is older than MAX_AGE_SECONDS."""
+ 
+-    def __init__(self, gateway, board, age, task):
+-        super().__init__(f"stale replica for {gateway}/{board} (age={age:.0f}s, limit={MAX_AGE_SECONDS}s)")
+-        self.gateway, self.board, self.age, self.task = gateway, board, age, task
++    def __init__(self, gateway, board, age, task, limit=MAX_AGE_SECONDS):
++        super().__init__(f"stale replica for {gateway}/{board} (age={age:.0f}s, limit={limit:.0f}s)")
++        self.gateway, self.board, self.age, self.task, self.limit = gateway, board, age, task, limit
+ 
+ 
+ def read_task(gateway, target, board=None):
+@@ -42,15 +43,19 @@ def read_task(gateway, target, board=None):
+                 or task.get("gateway") != gateway or task.get("profile") != "default"
+                 or task.get("owner_profile") != "default"):
+             raise ValueError(f"invalid replica task {target}")
+-        scopes = []
++        scopes, limit = [], float(MAX_AGE_SECONDS)
+         for (raw,) in db.execute("SELECT data FROM replica WHERE gw=? AND coll='gateway'", (gateway,)):
+-            scopes.extend(json.loads(raw).get("task_scopes", []))
++            info = json.loads(raw)
++            scopes.extend(info.get("task_scopes", []))
++            # A slow owner collector publishes its period: never call a heartbeat stale that the release
++            # readers still count as fresh (kanban_scope_heartbeat). [daveey]
++            limit = max(limit, scope_window(info))
+         matched = [s for s in scopes if s.get("profile") == "default" and s.get("board") == board]
+         if len(matched) != 1 or matched[0].get("state") != "ok":
+             raise ValueError(f"missing successful task-scope observation for {gateway}/{board}")
+         age = time.time() - float(matched[0].get("observed_at") or 0)
+-        if age > MAX_AGE_SECONDS:
+-            raise StaleReplica(gateway, board, age, task)
++        if age > limit:
++            raise StaleReplica(gateway, board, age, task, limit)
+         if age < -60:
+             raise ValueError(f"stale replica for {gateway}/{board} (age={age:.0f}s, limit={MAX_AGE_SECONDS}s)")
+         return task
+@@ -88,7 +93,7 @@ def stale_message(target, stale):
+     status = stale.task.get("status")
+     orphan = " orphan producer;" if orphan_reason(stale.task) else ""
+     return (f"{target} {status} (replica stale:{orphan} gateway={stale.gateway} not synced for {stale.age:.0f}s, "
+-            f"stale_age={stale.age:.0f}s, limit={MAX_AGE_SECONDS}s; last seen {status}, unknown now: not yet)")
++            f"stale_age={stale.age:.0f}s, limit={stale.limit:.0f}s; last seen {status}, unknown now: not yet)")
+ 
+ 
+ def check(gateway, target, *, board=None, until=(), since=()):
+diff --git a/tests/hermes_cli/test_kanban_scope_heartbeat_window.py b/tests/hermes_cli/test_kanban_scope_heartbeat_window.py
+new file mode 100644
+index 00000000000..064147e7caf
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scope_heartbeat_window.py
+@@ -0,0 +1,147 @@
++"""Scope-heartbeat freshness follows the owner's published collector period, in every reader. [daveey]
++
++A loaded hub refreshed each scope heartbeat every ~440 s while every reader used a fixed 450 s window, so terminal
++remote cards flapped between released and "never released" (session-idle-check, 2026-10-29). The owner now
++publishes ``scope_heartbeat_period_s`` and ``kanban_scope_heartbeat`` derives each owner's window from it.
++"""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_scope_heartbeat as hb
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_wait_check as wait
++from tests.hermes_cli import test_kanban_remote_terminal_release as release
++from tests.hermes_cli.test_kanban_remote_terminal_release import NOW, card, counted, observed
++from tests.hermes_cli.test_kanban_wait_replica import TID, pin_replica_clock, put
++from tests.hermes_cli.test_kanban_wait_replica import replica as replica  # noqa: PLC0414 -- pytest fixture
++from tests.hermes_cli.test_kanban_origin_ledger import world as world  # noqa: PLC0414 -- pytest fixture registration
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414 -- pytest fixture registration
++from tests.hermes_cli.test_kanban_origin_scope_heartbeat import project
++from tests.hermes_cli.test_kanban_origin_scope_heartbeat import published as published  # noqa: PLC0414 -- fixture
++
++
++# ---------------------------------------------------------------- the window rule
++
++
++@pytest.mark.parametrize('info,window', [
++    ({}, 450.0),                                         # an older owner publishes no period: the floor
++    ({'scope_heartbeat_period_s': 60}, 450.0),           # a fast collector never shrinks the window below the floor
++    ({'scope_heartbeat_period_s': 440}, 1100.0),         # the loaded hub of 2026-10-29
++    ({'scope_heartbeat_period_s': 100_000}, 1800.0),     # an offline owner's last word still expires
++    ({'scope_heartbeat_period_s': True}, 450.0),         # malformed periods prove nothing
++    ({'scope_heartbeat_period_s': -5}, 450.0),
++    ({'scope_heartbeat_period_s': float('nan')}, 450.0),
++    ({'scope_heartbeat_period_s': '440'}, 450.0),
++    (None, 450.0),
++])
++def test_window_derives_from_published_period(info, window):
++    assert hb.scope_window(info) == window
++
++
++@pytest.mark.parametrize('period', [1, 30, 60, 120, 180, 240, 300, 440, 600, 720])
++def test_window_covers_two_and_a_half_collector_periods(period):
++    """The invariant the fixed constant broke: up to the cap, a heartbeat stays fresh for >= 2.5 periods, so one
++    late cycle cannot expire it."""
++    assert hb.window_for_period(period) >= 2.5 * period
++
++
++def test_floor_still_covers_the_nominal_collector_period():
++    # hermes-hub's watch runs a full sync every 60 s; with a typical board read it republishes every ~180 s.
++    assert hb.SCOPE_HEARTBEAT_FLOOR_S >= 2.5 * 180
++    assert activity.SCOPE_HEARTBEAT_FRESH_S == hb.SCOPE_HEARTBEAT_FLOOR_S
++
++
++# ---------------------------------------------------------------- remote-terminal release (session sidebar counts)
++
++
++def _scopes(beat):
++    return [{'profile': 'default', 'board': 'default', 'state': 'ok', 'observed_at': beat}]
++
++
++def _with_period(path, period):
++    with sqlite3.connect(path) as db:
++        info = json.loads(db.execute("SELECT data FROM replica WHERE coll='gateway'").fetchone()[0])
++        info['scope_heartbeat_period_s'] = period
++        db.execute("UPDATE replica SET data=? WHERE coll='gateway'", (json.dumps(info),))
++    return path
++
++
++@pytest.fixture(autouse=True)
++def _origin_profile(monkeypatch):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++
++
++def test_slow_owner_heartbeat_past_the_floor_still_releases_a_done_card(tmp_path):
++    """The 2026-10-29 flap: the hub's heartbeat was 441 s apart, so for part of each cycle it was > 450 s old."""
++    path = release.replica(tmp_path, [('default/default/t_1', observed(card('done')))], beat=NOW - 500)
++    assert len(counted(activity._read_remote_links(path, now=NOW))) == 1  # no period published: floor, not released
++    _with_period(path, 440)
++    activity._remote_read_memo = None
++    rows = activity._read_remote_links(path, now=NOW)
++    assert counted(rows) == []
++    assert [r['released'] for r in rows] == [True]
++
++
++def test_slow_owner_heartbeat_still_expires_past_its_own_window(tmp_path):
++    path = _with_period(release.replica(tmp_path, [('default/default/t_1', observed(card('done')))], beat=NOW - 1200), 440)
++    assert len(counted(activity._read_remote_links(path, now=NOW))) == 1
++
++
++def test_projection_horizon_uses_each_owners_window(tmp_path):
++    path = _with_period(release.replica(tmp_path, [], beat=NOW - 100), 440)
++    with sqlite3.connect(path) as db:
++        info_rows = list(db.execute("SELECT gw, data FROM replica WHERE coll='gateway'"))
++    assert hb.scope_heartbeats(info_rows) == {('owner', 'default', 'default'): (NOW - 100, 1100.0)}
++    horizon: list = []
++    activity._project_replica(path, NOW, 'origin', [], info_rows, NOW, None, horizon_out=horizon)
++    assert NOW - 100 + 1100.0 in horizon
++
++
++# ---------------------------------------------------------------- origin ledger (owner liveness)
++
++
++def _ledger_info(world, binding, *, observed_at, period=None):
++    _, replica_path, _ = world
++    with sqlite3.connect(replica_path) as db:
++        info = json.loads(db.execute("SELECT data FROM replica WHERE coll='gateway' AND key='info'").fetchone()[0])
++        info['task_scopes'] = [{'profile': binding['owner']['profile'], 'board': binding['owner']['board'],
++                                'state': 'ok', 'observed_at': observed_at}]
++        if period is not None:
++            info['scope_heartbeat_period_s'] = period
++        db.execute("UPDATE replica SET data=? WHERE coll='gateway' AND key='info'", (json.dumps(info),))
++
++
++def test_ledger_keeps_a_slow_owner_live_within_its_window(world, published):
++    _, binding = published
++    _ledger_info(world, binding, observed_at=500)  # 501 s old at now=1001
++    assert project(world)['status'] == 'unknown'
++    _ledger_info(world, binding, observed_at=500, period=440)
++    row = project(world)
++    assert row['status'] == 'ready' and not row['stale']
++
++
++# ---------------------------------------------------------------- wait probes (kanban_wait_replica)
++
++
++def _wait_scope(db, age, period=None):
++    info = {"task_scopes": [{"profile": "default", "board": "default", "state": "ok", "observed_at": time.time() - age}]}
++    if period is not None:
++        info["scope_heartbeat_period_s"] = period
++    db.execute("UPDATE replica SET data=? WHERE coll='gateway'", (json.dumps(info),))
++    db.commit()
++
++
++def test_wait_probe_does_not_call_a_slow_owners_fresh_heartbeat_stale(replica, monkeypatch):
++    put(replica, "done")
++    pin_replica_clock(monkeypatch)
++    _wait_scope(replica, 700)
++    assert wait.check_remote("other", "task", TID)[0] == 3  # past the 600 s probe limit: unknown, not yet
++    _wait_scope(replica, 700, period=440)
++    assert wait.check_remote("other", "task", TID)[0] == 0  # inside that owner's 1100 s window: met
++    _wait_scope(replica, 1237, period=440)
++    code, text = wait.check_remote("other", "task", TID)
++    assert code == 3 and "limit=1100s" in text
+-- 
+2.55.0
+
