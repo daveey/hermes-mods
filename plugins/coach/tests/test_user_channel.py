@@ -175,6 +175,20 @@ def test_same_hermes_bug_in_two_sessions_offers_file_it_once(tmp_path):
     assert core.bug_hits(st, ["s1"]) is None  # filed: never offered again
 
 
+def test_file_it_once_falls_back_to_active_board_without_hermes_board(tmp_path):
+    c, kb, _, st = client(tmp_path, make_db(tmp_path, n_user=1, n_assistant=1))
+
+    def init_db(board=None):
+        if board == "hermes":
+            raise ValueError("kanban board 'hermes' does not exist")
+    kb.init_db = init_db
+    sig = "kanban_create: agent_owned_block"
+    st.bug("s1", sig, "one")
+    st.bug("other", sig, "two")
+    out = post(c, "/file-bug", session_id="s1", sig=sig)  # was HTTP 500
+    assert out["cards"][0]["task_id"] == "t_1" and kb.created[0]["board"] is None and out["board"] == "default"
+
+
 def test_old_bugs_outside_the_week_do_not_count(tmp_path):
     st = core.Store(tmp_path / "coach", clock=lambda: 1_000_000.0)
     st.bug("a", "sig", "")
