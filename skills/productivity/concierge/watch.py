@@ -46,7 +46,8 @@ def describe(sid, old, new):
         return f"{sid} archived: {new['title']}"
     out = []
     # A turn with no summary yet will be reported when its summary lands.
-    if new["turns"] != old["turns"] and new["status"] != EMPTY_STATUS:
+    # A busy session ticks turns often; only wake when what it says changed.
+    if new["turns"] != old["turns"] and new["status"] not in (EMPTY_STATUS, old["status"]):
         out.append(f"finished a turn ({old['turns']}->{new['turns']})")
     if new["awaiting"] != old["awaiting"]:
         out.append("now waiting on the user" if new["awaiting"] else "no longer waiting on the user")
