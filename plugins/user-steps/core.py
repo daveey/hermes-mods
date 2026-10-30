@@ -440,6 +440,43 @@ def _blocks(text: str) -> list[dict]:
     return out
 
 
+def following_fence(reply: str, block: dict) -> str:
+    """The fenced code block that immediately follows ``block`` (only whitespace between), else ''. It is the
+    literal payload of the step the block asks for (a command or message to send), so it must stay with the step."""
+    blocks = _blocks(reply)
+    for i, b in enumerate(blocks):
+        if b["start"] == block["start"] and b["end"] == block["end"]:
+            nxt = blocks[i + 1] if i + 1 < len(blocks) else None
+            if nxt and nxt["code"] and not reply[block["end"]:nxt["start"]].strip():
+                return nxt["text"]
+            return ""
+    return ""
+
+
+def fence_literal(fence: str) -> str:
+    """Inner text of a fenced block (fence lines and info string removed)."""
+    lines = (fence or "").strip().split("\n")
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+PAYLOAD_TITLE_MAX = 120
+
+
+def payload_title(title: str, fence: str) -> str:
+    """A step whose payload is a following code block never gets a title that paraphrases it: keep the title only if
+    it already quotes the literal; else quote the literal (short, one line) or point at the block below."""
+    lit = fence_literal(fence)
+    if not lit or lit in (title or ""):
+        return title
+    if "\n" not in lit and len(lit) <= PAYLOAD_TITLE_MAX:
+        return f"Use this exact text: {lit}"
+    return "Use the exact text in the block below"
+
+
 def locate(reply: str, span: str) -> Optional[dict]:
     """The prose block (not code, not quote) whose text contains ``span`` (markdown/whitespace-insensitive)."""
     ns = _norm(span)
@@ -770,7 +807,12 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
         if recommendation_without_request(span, block["text"]):
             continue  # a recommendation is not permission to manufacture a choice
         text = question_title(text, span, reply, block)
+        fence = following_fence(reply, block)
+        if fence:
+            text = payload_title(text, fence)
         candidate = {"text": text, "kind": kind, "verbatim_span": span, "options": opts}
+        if fence:
+            candidate["payload"] = fence
         key = action_identity(candidate) if continuity else _norm(text)
         if key in seen:
             continue
@@ -1217,7 +1259,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 if budget <= 0 or (action_store is None and _norm(candidate["text"]) in seen):
                     continue
                 step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
-                        "session": session_id, "paragraph": block["text"]}
+                        "session": session_id,
+                        "paragraph": block["text"] + ("\n\n" + candidate["payload"] if candidate.get("payload") else "")}
                 if action_store is not None:
                     canonical = action_store.migrate_step(action_owner, step)
                     step.update(requestId=canonical["requestId"], requestOwner=canonical["owner"],
@@ -2169,8 +2212,13 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
     the exact plan. Nothing here grants execution permission."""
     kind = {'approve': 'approval', 'choose': 'choice', 'do': 'external_step'}.get(step.get('kind'), 'input')
     markdown = step.get('paragraph') or step['text']
+    title = step['text']
+    if step.get('payload'):
+        title = payload_title(title, step['payload'])
+        if step['payload'] not in markdown:
+            markdown = markdown + '\n\n' + step['payload']
     r = {'schemaVersion': 2, 'owner': owner, 'requestId': str(uuid.uuid4()), 'revision': 1, 'kind': kind,
-         'title': step['text'], 'scope': {'markdown': markdown, 'complete': True, 'sourceRefs': [ref]},
+         'title': title, 'scope': {'markdown': markdown, 'complete': True, 'sourceRefs': [ref]},
          'limits': [], 'exclusions': [], 'aliases': [ref], 'state': 'open'}
     no_grant = 'This does not grant execution permission.'
     if kind in ('choice', 'input'):
