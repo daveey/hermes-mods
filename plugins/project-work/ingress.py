@@ -57,14 +57,24 @@ class Ingress:
         def value(name):
             v = sc._VAR_MAP['HERMES_SESSION_' + name].get()
             return v if isinstance(v, str) else ''
-        if value('PLATFORM') != 'slack' or value('PROFILE') != self.policy.ingress_profile:
-            raise PermissionError('Authenticated Slack turn required')
-        key = (value('SCOPE_ID'), value('CHAT_ID'), value('MESSAGE_ID'), value('USER_ID'))
+        platform, chat = value('PLATFORM'), value('CHAT_ID')
+        how = ('Ask the requester to post `!project request <what you want>` in the project '
+               'channel ' + self.policy.channel_id + ' from their own Slack account.')
+        if platform != 'slack' or value('PROFILE') != self.policy.ingress_profile:
+            raise PermissionError('Project work only runs in an authenticated Slack turn for '
+                                  'profile ' + self.policy.ingress_profile + '; this turn is '
+                                  'platform=' + (platform or 'none') + '. ' + how)
+        key = (value('SCOPE_ID'), chat, value('MESSAGE_ID'), value('USER_ID'))
         with self.lock:
             ctx = self.events.get(key)
         allowed_threads = {ctx.thread_id} if ctx and ctx.thread_id else {'', ctx.message_id} if ctx else set()
         if ctx is None or value('THREAD_ID') not in allowed_threads:
-            raise PermissionError('No authenticated Slack event for this turn')
+            if chat != self.policy.channel_id:
+                raise PermissionError('Project work only accepts a human message in the project '
+                                      'channel ' + self.policy.channel_id + '; this turn is in '
+                                      'channel ' + (chat or 'none') + '. ' + how)
+            raise PermissionError('No authenticated human Slack message for this turn (bot posts, '
+                                  'edits and other workspaces are never accepted). ' + how)
         return ctx
 
     def tool(self, name, args):
@@ -117,15 +127,29 @@ class Ingress:
             return None
         return {'channel': ctx.channel_id, 'thread_ts': ctx.message_id, 'text': NOTICES[reason]}
 
+    def log_ignored(self, body):
+        """One line per dropped event so a silent ingress is never mistaken for a dead one."""
+        ev = body.get('event') if isinstance(body, dict) else None
+        if not isinstance(ev, dict) or body.get('type') != 'event_callback':
+            log.debug('Project ingress ignored: not an event callback (type=%s)',
+                      body.get('type') if isinstance(body, dict) else type(body).__name__)
+            return
+        # Reactions, presence and other non-message events stay at debug: they are high volume.
+        level = logging.INFO if ev.get('type') in ('message', 'app_mention') else logging.DEBUG
+        if ev.get('channel') != self.policy.channel_id:
+            log.log(level, 'Project ingress ignored ts=%s channel=%s: outside project channel %s '
+                    '(type=%s bot=%s)', ev.get('ts'), ev.get('channel'), self.policy.channel_id,
+                    ev.get('type'), bool(ev.get('bot_id')))
+            return
+        log.log(level, 'Project ingress ignored ts=%s: not an authenticated human event '
+                '(type=%s subtype=%s bot=%s)', ev.get('ts'), ev.get('type'),
+                ev.get('subtype'), bool(ev.get('bot_id')))
+
     def enqueue(self, body):
         """Queue an authenticated command. Returns a thread notice to send, or None."""
-        ctx = self.observe(body)
+        ctx = self.observe(body) if isinstance(body, dict) else None
         if ctx is None:
-            ev = body.get('event') if isinstance(body, dict) else None
-            if isinstance(ev, dict) and ev.get('channel') == self.policy.channel_id:
-                log.info('Project ingress ignored ts=%s: not an authenticated human event '
-                         '(type=%s subtype=%s bot=%s)', ev.get('ts'), ev.get('type'),
-                         ev.get('subtype'), bool(ev.get('bot_id')))
+            self.log_ignored(body)
             return None
         operation, args, reason = self.classify(ctx, body['event'].get('text', ''))
         if operation:
@@ -165,6 +189,10 @@ def register_tools(ctx, ingress):
         def handler(args, _name=name, **kwargs):
             try:
                 return json.dumps({'ok': True, 'result': ingress.tool(_name, args)})
+            except (PermissionError, ValueError, RuntimeError) as exc:
+                # Plugin-authored refusals: the model needs the reason to tell the requester.
+                return json.dumps({'ok': False, 'error': type(exc).__name__,
+                                   'message': str(exc)[:500]})
             except Exception as exc:
                 return json.dumps({'ok': False, 'error': type(exc).__name__})
         ctx.register_tool(name=name, toolset='project-work', description=description,
