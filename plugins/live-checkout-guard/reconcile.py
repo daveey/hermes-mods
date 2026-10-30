@@ -6,6 +6,9 @@ The caller fetches origin/main first. The archive must contain manifest.json wit
 head/origin/status/untracked, changes.patch (git diff --binary HEAD), and
 untracked.tar.gz. Reconstruction happens in a disposable clone, never live.
 All selected files must still match that snapshot before any replacement occurs.
+The published commit must already be on origin/main; selected leftovers are reset
+to the current live HEAD bytes (without touching its index), leaving it ff-able.
+Afterward merge --ff-only origin/main on the clean live tree to deploy publication.
 This narrow helper refuses symlinks and non-regular files rather than following
 them. Published-absent archived untracked files may be removed, never directories.
 An exclusive cooperating-helper lock and last-moment identity/content checks
@@ -79,6 +82,7 @@ def reconcile(root, archive, published, paths):
         git(root, 'merge-base', '--is-ancestor', archived_origin, 'refs/remotes/origin/main')
     elif archived_origin != git(root, 'remote', 'get-url', 'origin').decode().strip():
         raise ValueError('archive origin mismatch')
+    live_head = git(root, 'rev-parse', 'HEAD').decode().strip()
     paths = list(dict.fromkeys(paths))
     if not paths:
         raise ValueError('no selected paths')
@@ -132,7 +136,7 @@ def reconcile(root, archive, published, paths):
                 if snapshot(target) != expected[name]:
                     raise ValueError('current file differs from archive: ' + name)
                 identities[name] = target.lstat() if target.exists() else None
-                entries = git(root, 'ls-tree', '-z', published, '--', name).split(b'\0')
+                entries = git(root, 'ls-tree', '-z', live_head, '--', name).split(b'\0')
                 entries = [e for e in entries if e]
                 if not entries:
                     replacements[name] = None
@@ -144,6 +148,8 @@ def reconcile(root, archive, published, paths):
                     replacements[name] = (git(root, 'cat-file', 'blob', oid.decode()), mode == b'100755')
             # Validate the entire selection again before the first write.
             def unchanged(name):
+                if git(root, 'rev-parse', 'HEAD').decode().strip() != live_head:
+                    raise ValueError('live HEAD moved during reconciliation')
                 target = safe_path(root, name)
                 old = identities[name]
                 now = target.lstat() if target.exists() else None

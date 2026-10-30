@@ -62,6 +62,20 @@ class ReconcileTests(unittest.TestCase):
         result = self.run_helper('file')
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_reconciliation_on_older_live_head_leaves_clean_ffable_tree(self):
+        self.git('checkout', '-q', '-f', '--detach', self.head)
+        (self.root / 'file').write_bytes(b'archived\n')
+        self.make_archive()
+        manifest_path = self.archive / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest['head'] = self.head
+        manifest_path.write_text(json.dumps(manifest))
+        result = self.run_helper('file')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.git('merge', '--ff-only', 'origin/main')
+        self.assertEqual((self.root / 'file').read_bytes(), b'published\n')
+
     def test_restores_published_bytes_without_index_or_head_changes(self):
         before_head = self.git('rev-parse', 'HEAD')
         before_index = (self.root / '.git/index').read_bytes()
