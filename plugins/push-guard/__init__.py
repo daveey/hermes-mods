@@ -3,7 +3,8 @@
 ``pre_tool_call`` checks terminal / process / execute_code (and nested ``tool_call``) for `git push` whose destination
 is a guarded branch (``$HERMES_HOME/push-guards.json``, see guard.py). A merge-train guard blocks it unless every
 changed file is in an allowed path (docs); a ``require_check`` guard blocks it unless the pushed sha's named CI
-check-run is ``success``, and holds `gh pr merge --admin` to the same rule. ``PUSH_GUARD=off`` in the command skips it.
+check-run is ``success``, and holds every `gh pr merge` to the same rule (admin credentials can bypass
+branch protection without --admin). ``PUSH_GUARD=off`` in the command skips this local hook, not server protection.
 """
 
 from __future__ import annotations

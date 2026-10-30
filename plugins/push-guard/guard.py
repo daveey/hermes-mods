@@ -1,4 +1,4 @@
-"""Refuse direct `git push` of code to a guarded branch, and admin merges that skip its required CI check.
+"""Refuse direct `git push` and PR merges that lack the required exact-head CI check.
 
 Config ``$HERMES_HOME/push-guards.json`` (no file = no-op)::
 
@@ -17,9 +17,10 @@ suffix is accepted: builds before exact matching compared substrings, so ``owner
 * With ``require_check`` (a check-run name): the push goes through only if the exact commit being pushed has a
   check-run of that name whose newest run concluded ``success``
   (``gh api repos/<owner>/<repo>/commits/<sha>/check-runs``). In progress, queued, failed, cancelled, missing or
-  unreadable all block, naming the sha, the check's state and ``use``. ``gh pr merge ... --admin`` on that repo is
-  held to the same rule for the PR's ``headRefOid`` (a plain ``gh pr merge`` is left to GitHub's own branch
-  protection). ``allow`` is ignored for such guards: the check is the gate.
+  unreadable all block, naming the sha, the check's state and ``use``. Every ``gh pr merge`` on that repo is
+  held to the same rule for the PR's ``headRefOid``, with or without ``--admin``: admin credentials can bypass
+  branch protection even in an ordinary merge when admin enforcement is disabled. ``allow`` is ignored for
+  such guards: the check is the gate. Enable server-side admin enforcement too; this hook is defense in depth.
 
 ``PUSH_GUARD=off`` anywhere in the command skips the check (emergencies; say why). Pushes made inside other tools
 (hermes-core-wt, hermes-sync, hermes update) are not agent tool calls and are never seen here.
@@ -267,20 +268,20 @@ def _unverified(g: dict, what: str, reason: str) -> str:
             f"command with `{OVERRIDE}` and say why in your report.")
 
 
-# --- gh pr merge --admin --------------------------------------------------------------------------------------
+# --- gh pr merge ----------------------------------------------------------------------------------------------
 
 GH_MERGE_VALUE_OPTS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--subject",
                        "--match-head-commit", "-A", "--author-email"}
 
 
-def _gh_admin_merges(cmd: str, cwd: str):
-    """Yield (cwd, selector or None, repo flag or None, command text) for each `gh pr merge ... --admin`."""
+def _gh_merges(cmd: str, cwd: str):
+    """Yield (cwd, selector or None, repo flag or None, command text) for every `gh pr merge`."""
     for d, words in _commands(cmd, cwd):
         if os.path.basename(words[0]) != "gh" or words[1:3] != ["pr", "merge"]:
             continue
         rest = words[3:]
-        if "--admin" not in rest:
-            continue
+        if "--disable-auto" in rest:
+            continue  # cancels a queued merge; cannot land a commit
         sel, repo, i = None, None, 0
         while i < len(rest):
             a = rest[i]
@@ -305,17 +306,19 @@ def _merge_repo(cwd: str, sel: Optional[str], repo: Optional[str]) -> str:
     return _slug(_git(cwd, "remote", "get-url", "origin") or "")
 
 
-def check_admin_merge(cmd: str, cwd: str, guards: list[dict]) -> Optional[str]:
+def check_pr_merge(cmd: str, cwd: str, guards: list[dict]) -> Optional[str]:
     checked = [g for g in guards if g["require_check"]]
-    if not checked or "--admin" not in cmd:
+    if not checked:
         return None
-    for d, sel, repo, text in _gh_admin_merges(cmd, cwd):
+    for d, sel, repo, text in _gh_merges(cmd, cwd):
         slug = _merge_repo(d, sel, repo)
         mine = [g for g in checked if g["remote"] == slug]
         if not mine:
             continue
-        what = f"`{text[:100]}` (an admin merge, which skips branch protection)"
-        data, err = _gh_json(["pr", "view", *([sel] if sel else []), "--json", "headRefOid,baseRefName",
+        kind = "admin merge" if "--admin" in text else "PR merge"
+        what = f"`{text[:100]}` ({kind}; exact-head CI is required even for admin credentials)"
+        selector = sel or _git(d, "symbolic-ref", "-q", "--short", "HEAD")
+        data, err = _gh_json(["pr", "view", *([selector] if selector else []), "--json", "headRefOid,baseRefName",
                               "-R", slug], cwd=d)
         if err is not None or not isinstance(data, dict) or not data.get("headRefOid"):
             return _unverified(mine[0], what, f"the PR's head could not be read ({err or 'no headRefOid'})")
@@ -336,7 +339,7 @@ def check_shell(cmd: str, cwd: Optional[str] = None, guards: Optional[list[dict]
     if not guards or OVERRIDE in cmd or ("push" not in cmd and "merge" not in cmd):
         return None
     cwd = _resolve(cwd or os.getcwd())
-    why = check_admin_merge(cmd, cwd, guards)
+    why = check_pr_merge(cmd, cwd, guards)
     if why or "push" not in cmd:
         return why
     for repo, sub, args in _git_calls(cmd, cwd):

@@ -325,9 +325,8 @@ def test_gh_pr_merge_admin_unreadable_pr_is_blocked(core):
     assert got and "could not be read" in got["message"]
 
 
-def test_plain_gh_pr_merge_and_other_repos_are_not_checked(core, tmp_path):
+def test_other_repos_are_not_checked(core, tmp_path):
     work, gh = core
-    assert block("terminal", {"command": "gh pr merge 42 --squash", "workdir": str(work)}) is None
     assert block("terminal", {"command": "gh pr merge 42 --admin -R someone/else", "workdir": str(tmp_path)}) is None
     assert not gh.calls
 
