@@ -1,10 +1,13 @@
 # Frozen decisions stop at a new local conversation
 
+Patches: 1239 1273
+
 Patch **1239**, source `903f425fa63606c267c2b45646beff2a74348d19` (fork PR296).
 Caller-cancellation fix: source `a6ccd8dd8a1d86b582bbd4f563d027d0cb1f80e6`
 (fork PR309, reviewed/tested head `be106488fd9c97ecbc2ea35ec60302d2bb73694a`).
-The PR309 patch export is pending the next contiguous mirror update; applying
-patch 1239 alone does not include the lock-lifetime fix described below.
+The PR309 caller-cancellation fix is exported as patch **1273**:
+`patches/1273-test-gateway-cancel-frozen-decision-reset-caller-dur.patch`.
+Applying patch 1239 alone does not include the lock-lifetime fix described below.
 
 ## Behavior
 

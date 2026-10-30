@@ -1,0 +1,485 @@
+From e7f517469707b43940f23625edd359d961224f9b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:09:27 +0000
+Subject: [PATCH] fix(kanban): a park never waits on something already true:
+ skip done producers, refuse a passing wake_check [daveey]
+
+MacBook card t_01a18c12b9e15db0, run by a hub worker, parked twice (continuations 6 and 7, 10-30) with
+awaiting={kind:'card', ref:'t_01a1848506cae619', inferred:true} and the auto probe `hermes kanban wait-check
+task t_01a1848506cae619`. That card completed two hours earlier and was named only as background (the real
+wait was main CI), so each probe exited 0 at once and the card woke in 7-16 s.
+
+- _live_card_ref skips a done card: a finished card produces nothing later. With no other live card named,
+  inference falls through to the external/clock classification unchanged.
+- A declared awaiting={kind:'card'} on a done card is refused producer_done (local: _check_card; another
+  gateway: confirm_remote on a `done` status word). Remote review/blocked rc-0 statuses stay parkable: a
+  tracker's re-park probe reads a handled status as "not yet" (implicit --from), refusing them would strand it.
+  Deferred placement settles (completes) a forwarded card whose remote run finished between read and confirm.
+- The park-time dry run of an explicit wake_check (kanban_schedule, kanban_continue, kanban_block, the CLI)
+  refuses exit 0 with wake_check_already_true and the probe's output tail; with blocker_id it says the wall is
+  gone and points to clear_blocker=true. Exit 1, a timeout or anything else is unchanged. The dry run carries
+  the dispatcher's probe marker so wait-check's implicit --from matches the first real probe.
+
+Card t_01a18cd86aa64a14. Tests: tests/hermes_cli/test_kanban_park_done_producer.py (8 RED on 418c075690f,
+the 2 park controls pass both ways); test_kanban_cli's block test used `test -f /tmp/x`, which exists on the hub.
+---
+ hermes_cli/kanban_awaiting.py                 |  29 ++-
+ hermes_cli/kanban_cli_park.py                 |   2 +-
+ hermes_cli/kanban_placement_forward.py        |   9 +-
+ hermes_cli/kanban_wake_check.py               |  41 +++-
+ tests/hermes_cli/test_kanban_cli.py           |   5 +-
+ .../test_kanban_park_done_producer.py         | 191 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_placement.py     |  22 ++
+ tests/hermes_cli/test_kanban_wake_check.py    |   3 +-
+ tools/kanban_tools.py                         |   4 +-
+ 9 files changed, 293 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_park_done_producer.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 6fd5a08126a..d36f6a47033 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -53,7 +53,9 @@ AGENT_ACTION_WAIT = "agent_action_wait"
+ HUMAN_WAIT = "human_wait"
+ INVALID_AWAITING = "invalid_awaiting"
+ OPAQUE_PROBE_WAIT = "opaque_probe_wait"
+-CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING, OPAQUE_PROBE_WAIT)
++# The declared producer card is already done: what the park waits for has been produced (it would wake at once).
++PRODUCER_DONE = "producer_done"
++CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING, OPAQUE_PROBE_WAIT, PRODUCER_DONE)
+ # Parks in a row on one premise before the next one escalates instead (the 3rd park = 2nd re-park).
+ REPARK_LIMIT = 2
+ ESCALATION_PREFIX = "repark-escalation:"
+@@ -320,6 +322,22 @@ def card_orphan_reason(conn: sqlite3.Connection, task_id: str, *, _depth: int =
+     return None
+ 
+ 
++def producer_done_error(ref: str, completed: str) -> AwaitingError:
++    return AwaitingError(PRODUCER_DONE, (
++        f"the producer card {ref} is already done (completed {completed}): what you wait for has been produced. "
++        f"Read its result (kanban_show {ref}) and act on it now, or name what you are still waiting on."))
++
++
++def _completed_at(conn: sqlite3.Connection, ref: str) -> Optional[str]:
++    """``completed_at`` (UTC ISO) when ``ref`` is a done card on this board, else None."""
++    row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (ref,)).fetchone()
++    if not row or row[0] != "done":
++        return None
++    if not row[1]:
++        return "at an unrecorded time"
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(row[1])))
++
++
+ def confirm_remote(awaiting: Optional[dict]) -> None:
+     """Confirm a cross-gateway producer card exists, BEFORE any write txn (ssh can take 40 s).
+     ``resolve`` then accepts the card from the process-local confirmation."""
+@@ -340,6 +358,10 @@ def confirm_remote(awaiting: Optional[dict]) -> None:
+     if status in ("archived", "triage") or "orphan producer" in out or "agent-owned park:" in out:
+         raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {ref} on {awaiting['gateway']} "
+                                                f"is {status}, so nobody is producing it. {_REMEDY}")
++    if status == "done":
++        # Its auto probe (``wait-check task``) would exit 0 on the first run: the park wakes at once. Other rc-0
++        # statuses (review, blocked on David) stay parkable: a tracker's re-park probe reads them as handled.
++        raise producer_done_error(ref, f"per {awaiting['gateway']}'s board")
+     _REMOTE_CONFIRMED[(awaiting["gateway"], ref)] = (time.monotonic(), out[-240:] if rc == 3 else out[-120:])
+ 
+ 
+@@ -374,6 +396,9 @@ def _check_card(conn: sqlite3.Connection, task_id: str, awaiting: dict, text: st
+     why = card_orphan_reason(conn, ref)
+     if why:
+         raise AwaitingError(AGENT_ACTION_WAIT, f"the producer card is not live: {why}. {_REMEDY}")
++    done = _completed_at(conn, ref)
++    if done:
++        raise producer_done_error(ref, done)
+ 
+ 
+ def _check_run(conn, task_id, awaiting, text) -> None:
+@@ -490,6 +515,8 @@ def _live_card_ref(conn: sqlite3.Connection, task_id: str, text: str) -> Optiona
+     for ref in dict.fromkeys(_TASK_ID.findall(text or "")):
+         if ref == task_id or dependency_cycle_reason(conn, task_id, ref):
+             continue  # self, own child/descendant, or a card that already waits back
++        if _completed_at(conn, ref):
++            continue  # a finished card produces nothing later; named as background, it would wake the park at once
+         if card_orphan_reason(conn, ref) is None:
+             return ref
+     return None
+diff --git a/hermes_cli/kanban_cli_park.py b/hermes_cli/kanban_cli_park.py
+index d469e892244..2ea91439556 100644
+--- a/hermes_cli/kanban_cli_park.py
++++ b/hermes_cli/kanban_cli_park.py
+@@ -48,7 +48,7 @@ def _cli_wake_check(args: argparse.Namespace):
+ 
+     cmd = kwc.normalize_cmd(getattr(args, "wake_check", None))
+     every = kwc.normalize_every(getattr(args, "check_every", None)) if cmd else None
+-    err = kwc.dry_run_error(cmd)
++    err = kwc.dry_run_error(cmd, blocker_id=getattr(args, "blocker_id", None) or None)
+     if err:
+         raise ValueError(err)
+     return cmd, every, bool(getattr(args, "clock_only", False))
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index abb2e067add..d0507988a12 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -245,7 +245,14 @@ class Forwarder:
+         from hermes_cli import kanban_awaiting as kaw
+         from hermes_cli import kanban_db as kb
+         awaiting = {"kind": "card", "ref": rtid, "gateway": target}
+-        kaw.confirm_remote(awaiting)  # ssh, before the write txn
++        try:
++            kaw.confirm_remote(awaiting)  # ssh, before the write txn
++        except kaw.AwaitingError as exc:
++            # It finished between the settle read and this confirm: settle it (completes this card), once.
++            if exc.code != kaw.PRODUCER_DONE or getattr(self, "_resettled", False):
++                raise
++            self._resettled = True
++            return self._settle(kb.get_task(self.conn, self.task_id), target, rtid)
+         ok = kb.schedule_task(
+             self.conn, self.task_id, expected_run_id=self.run_id, awaiting=awaiting,
+             wake_check=wake_probe(target, rtid), check_every=CHECK_EVERY,
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index bcd4bfcab58..3b1e231996a 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -100,18 +100,49 @@ def output_error(out: str) -> Optional[str]:
+     return m.group(0).strip() or "error" if m else None
+ 
+ 
+-def dry_run_error(cmd: Optional[str], *, cwd: Optional[str] = None, env: Optional[dict] = None) -> Optional[str]:
+-    """Run ``cmd`` once at park time; refusal text when it can never succeed (rc >= 2, could
+-    not start, or exit 0/1 with error output), else None. A timeout is accepted: slow is not
+-    broken. ``HERMES_KANBAN_WAKE_DRYRUN=0`` skips it (tests)."""
++WAKE_CHECK_ALREADY_TRUE = "wake_check_already_true"
++
++
++def refusal_code(message: str) -> Optional[str]:
++    """The stable rejection code of a park-time probe refusal (``WAKE_CHECK_ALREADY_TRUE``), else None."""
++    return WAKE_CHECK_ALREADY_TRUE if (message or "").startswith(WAKE_CHECK_ALREADY_TRUE) else None
++
++
++def already_true_message(out: str, *, blocker_id: Any = None) -> str:
++    """Refusal for a park whose wake_check already exits 0: it would wake at once. [daveey]"""
++    msg = (f"{WAKE_CHECK_ALREADY_TRUE}: this wake_check already passes, so the park would wake at once: the "
++           "condition is already true. Act on it now, or give a probe that tests what you are still waiting for.")
++    if isinstance(blocker_id, str) and blocker_id.strip():
++        msg += (f" It tests shared blocker {blocker_id.strip()!r}, so that wall is gone: carry on with the work, "
++                "or park for your other reason with clear_blocker=true (that clears the blocker and wakes every "
++                "card behind it).")
++    return msg + f" Probe output: {_tail(out)!r}"
++
++
++def dry_run_error(cmd: Optional[str], *, cwd: Optional[str] = None, env: Optional[dict] = None,
++                  blocker_id: Any = None) -> Optional[str]:
++    """Run ``cmd`` once at park time, before the write txn, with the dispatcher's runner and
++    ``PROBE_TIMEOUT_SECONDS`` on this host (the one that registers and runs the park's probe, ``probe_host``).
++    Refusal text when it can never succeed (rc >= 2, could not start, or exit 0/1 with error output), or
++    when it already passes (exit 0: the park would wake at once, ``WAKE_CHECK_ALREADY_TRUE``), else None.
++    A timeout is accepted: slow is not broken. ``HERMES_KANBAN_WAKE_DRYRUN=0`` skips it (tests).
++
++    A worker's dry run carries the probe marker (``HERMES_KANBAN_WAKE_PROBE``) like the dispatcher's runs,
++    so ``wait-check task`` applies the same implicit ``--from`` (a status this card already woke for reads
++    "not yet") and the dry run agrees with the first real probe. [daveey]"""
+     if cmd and re.search(r"\bhermes-hub\s+tasks\b", cmd) and re.search(r"\bt_[0-9a-f]{8,16}\b", cmd):
+         return ("refused: hand-rolled replica task probes hide missing or stale cards. Use "
+                 "`hermes kanban wait-check task <id> --gateway <name> --until done,blocked` instead.")
+     if not cmd or os.environ.get("HERMES_KANBAN_WAKE_DRYRUN") == "0":
+         return None
+-    rc, out = _run_probe(("dry-run", cmd), cmd, cwd or str(Path.home()), env if env is not None else dict(os.environ))
++    env = dict(env if env is not None else os.environ)
++    if env.get("HERMES_KANBAN_TASK"):
++        env["HERMES_KANBAN_WAKE_PROBE"] = "1"
++    rc, out = _run_probe(("dry-run", cmd), cmd, cwd or str(Path.home()), env)
+     if rc == "timeout":
+         return None
++    if rc == 0 and not output_error(out):
++        return already_true_message(out, blocker_id=blocker_id)
+     bad = None
+     if stale_age(rc, out) is not None:
+         return None  # unknown, not yet: the producer's gateway is offline right now
+diff --git a/tests/hermes_cli/test_kanban_cli.py b/tests/hermes_cli/test_kanban_cli.py
+index 1572e9ee2e8..33bb8631526 100644
+--- a/tests/hermes_cli/test_kanban_cli.py
++++ b/tests/hermes_cli/test_kanban_cli.py
+@@ -306,15 +306,16 @@ def test_cli_block_agent_owned_is_rejected_with_typed_error(kanban_home):
+ 
+ 
+ def test_cli_block_agent_owned_allowed_with_wake_check(kanban_home):
++    probe = f"test -f {kanban_home}/never-written"  # not /tmp/x: a park whose probe already passes is refused
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="waiting", assignee="alice")
+-    out = kc.run_slash(f"block {tid} disk full --kind transient --wake-check 'test -f /tmp/x'")
++    out = kc.run_slash(f"block {tid} disk full --kind transient --wake-check '{probe}'")
+     assert "agent_owned_block" not in out
+     with kbc.connect_closing() as conn:
+         # The probe is honored (a scheduled park with its wake row), never silently dropped.
+         assert kb.get_task(conn, tid).status == "scheduled"
+         row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()
+-        assert row is not None and row["cmd"] == "test -f /tmp/x"
++        assert row is not None and row["cmd"] == probe
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_park_done_producer.py b/tests/hermes_cli/test_kanban_park_done_producer.py
+new file mode 100644
+index 00000000000..6af9d3fb39f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_park_done_producer.py
+@@ -0,0 +1,191 @@
++"""A park never waits on something that is already true. [daveey]
++
++MacBook card t_01a18c12b9e15db0, run by a hub worker, was parked twice (continuations 6 and 7, 2026-10-30) with
++``awaiting={kind:'card', ref:'t_01a1848506cae619', inferred:true}`` and the auto-added probe ``hermes kanban
++wait-check task t_01a1848506cae619``. That card had completed two hours earlier; the checkpoint named it only as
++background (the real wait was main CI). ``_live_card_ref`` took the first card id in the text that was not an
++orphan, and a done card is not an orphan, so the probe exited 0 on its first run and each park woke in seconds.
++
++- Inference skips a done card (it produces nothing later).
++- A declared ``awaiting={kind:'card'}`` on a done card is refused ``producer_done`` (local, and on another gateway).
++- An explicit wake_check is run once at park time; exit 0 is refused ``wake_check_already_true`` on every entry
++  path (kanban_schedule, kanban_continue with a wait, kanban_block kind=time, ``hermes kanban schedule``).
++"""
++from __future__ import annotations
++
++import argparse
++
++import pytest
++
++from hermes_cli import kanban_awaiting as kaw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_awaiting as _awaiting_tests
++from tests.hermes_cli.test_kanban_awaiting import _as_worker, _park_payload, _running, _tool
++
++kanban_home = _awaiting_tests.kanban_home  # the shared fixture (HERMES_HOME, board, dry run off)
++
++BUILD = {"kind": "external", "ref": "release build 559", "why": "the build job writes the flag when it lands"}
++
++
++def _done(conn) -> str:
++    tid = _running(conn)
++    assert kb.complete_task(conn, tid, summary="landed the fix")
++    assert kb.get_task(conn, tid).status == "done"
++    return tid
++
++
++@pytest.fixture
++def dry_run(monkeypatch):
++    """The park-time probe runs (the shared fixture turns it off for unrelated tests)."""
++    monkeypatch.delenv("HERMES_KANBAN_WAKE_DRYRUN", raising=False)
++
++
++# -- 1. inference ---------------------------------------------------------------------------------
++
++def test_infer_never_picks_a_done_card(kanban_home) -> None:
++    with kbc.connect_closing() as conn:
++        done, live, tid = _done(conn), _running(conn), _running(conn)
++        only_done = kaw.resolve(conn, tid, awaiting=None, op="schedule",
++                                reason=f"{done} landed the fix earlier; waiting for main CI on 3ca096ffbbc")
++        assert only_done.get("kind") != "card", only_done
++        both = kaw.resolve(conn, tid, awaiting=None, op="schedule",
++                           reason=f"{done} landed the fix; now waiting on {live} to deploy it")
++        assert both == {"kind": "card", "ref": live, "inferred": True}
++
++
++def test_relayed_worker_node_park_naming_a_done_card_infers_no_producer(tmp_path, monkeypatch) -> None:
++    """The t_01a18c12b9e15db0 shape: the home board's card runs on a worker node, whose worker checkpoints with a
++    wait and names a card that is done on the worker's board."""
++    from hermes_cli import kanban_continuation as kcont
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    from tests.hermes_cli.kanban_sync_fake_board import FakeService
++    from tests.hermes_cli.test_kanban_worker_node import HUB, WORKER, Gateway
++
++    svc = FakeService(lease_runs=True)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    sync.consume_dispatcher_wake()
++    home = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    try:
++        home.enter()
++        tid = kb.create_task(home.conn, title="runs on the worker", assignee="default", runs_on=["linux"])
++        home.round()
++        worker.round()
++        worker.tick()
++        assert kb.get_task(worker.conn, tid).status == "running"
++        worker.enter()
++        done = kb.create_task(worker.conn, title="earlier fix", assignee="default")
++        assert kb.complete_task(worker.conn, done, summary="landed")
++        run_id = kb.get_task(worker.conn, tid).current_run_id
++        res = kcont.continue_task(
++            worker.conn, tid, resume_after_seconds=1800, expected_run_id=run_id,
++            checkpoint=f"Fix shipped; {done} completed the earlier half. Waiting for main CI for 3ca096ffbbc.")
++        assert res.get("ok"), res
++        park = _park_payload(worker.conn, tid)
++        assert (park.get("awaiting") or {}).get("kind") != "card", park
++        state = kwc.get_state(worker.conn, tid)
++        assert not state or done not in (state.get("cmd") or ""), state
++    finally:
++        kwc._shutdown_for_tests()
++        for g in (home, worker):
++            g.conn.close()
++        sync.set_lease_client(None)
++        wn.set_registry_fetch(None)
++
++
++# -- 2. declared producer --------------------------------------------------------------------------
++
++def test_schedule_on_a_local_done_producer_is_refused(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        done, tid = _done(conn), _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "waiting for the fix", "awaiting": {"kind": "card", "ref": done}})
++        assert kaw.PRODUCER_DONE in out["error"] and done in out["error"], out
++        assert f"kanban_show {done}" in out["error"] and "already done (completed 20" in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_schedule_on_a_remote_done_producer_is_refused(kanban_home, monkeypatch) -> None:
++    from hermes_cli import kanban_wait_check as kwait
++
++    monkeypatch.setattr(kwait, "check_remote", lambda gw, kind, ref, board=None, until=None: (0, f"{ref} done"))
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "waiting for the MacBook fix",
++                                 "awaiting": {"kind": "card", "ref": "t_01a1848506cae619", "gateway": "macbook"}})
++        assert kaw.PRODUCER_DONE in out["error"] and "t_01a1848506cae619" in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++# -- 3. park-time probe ----------------------------------------------------------------------------
++
++def test_schedule_wake_check_already_true_is_refused(kanban_home, monkeypatch, dry_run) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "waiting for build 559", "awaiting": BUILD,
++                                 "wake_check": "echo build 559 seen; true"})
++        assert kwc.WAKE_CHECK_ALREADY_TRUE in out["error"] and "build 559 seen" in out["error"], out
++        assert out.get("rejection") == kwc.WAKE_CHECK_ALREADY_TRUE, out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_schedule_wake_check_not_yet_parks(kanban_home, monkeypatch, dry_run) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "waiting for build 559", "awaiting": BUILD, "wake_check": "false"})
++        assert out.get("status") == "scheduled", out
++
++
++def test_schedule_wake_check_that_outlives_the_probe_timeout_parks(kanban_home, monkeypatch, dry_run) -> None:
++    monkeypatch.setattr(kwc, "PROBE_TIMEOUT_SECONDS", 1)
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "waiting for build 559", "awaiting": BUILD, "wake_check": "sleep 5"})
++        assert out.get("status") == "scheduled", out
++
++
++def test_continue_with_a_wait_and_a_true_wake_check_is_refused(kanban_home, monkeypatch, dry_run) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("continue", {"checkpoint": "Pushed; waiting for build 559.", "resume_after_seconds": 3600,
++                                 "awaiting": BUILD, "wake_check": "true"})
++        assert kwc.WAKE_CHECK_ALREADY_TRUE in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_block_time_with_a_true_wake_check_is_refused_and_points_to_clear_blocker(
++        kanban_home, monkeypatch, dry_run) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("block", {"kind": "time", "reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z CI billing wall",
++                              "blocker_id": "github-actions-billing", "awaiting": BUILD, "wake_check": "true"})
++        assert kwc.WAKE_CHECK_ALREADY_TRUE in out["error"], out
++        assert "clear_blocker=true" in out["error"] and "github-actions-billing" in out["error"], out
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_cli_schedule_with_a_true_wake_check_exits_nonzero(kanban_home, capsys, dry_run) -> None:
++    from hermes_cli import kanban as kcli
++
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++    rc = kcli.kanban_command(parser.parse_args([
++        "kanban", "schedule", tid, "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for build 559",
++        "--wake-check", "true", "--awaiting", "ci:40443505012", "--awaiting-why", "in progress"]))
++    assert rc != 0
++    assert kwc.WAKE_CHECK_ALREADY_TRUE in capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running"
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 502fcfdd18c..32ad3580103 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1085,6 +1085,28 @@ def test_forwarder_sends_the_card_with_parent_handoffs_and_parks_until_the_hub_c
+         assert len(mac["calls"]) == 1
+ 
+ 
++def test_forwarder_completes_when_the_hub_card_finishes_between_settle_and_park(mac, monkeypatch):
++    """confirm_remote refuses a done producer (producer_done); the forwarder settles it instead of crashing."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_wait_check as kwait
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        assert _forwarder(conn, child, mac, monkeypatch).run() == "parked"
++        kb.unblock_task(conn, child)
++        kb.recompute_ready(conn)
++        reads = iter([(1, HUB_TID + " running"), (0, HUB_TID + " done")])
++        f = _forwarder(conn, child, mac, monkeypatch, check=None)
++        f.check = lambda gw, rtid: next(reads)
++        monkeypatch.setattr(kwait, "check_remote", lambda gw, kind, tid_, **kw: (0, f"{tid_} done"))
++        assert f.run() == "completed"
++        assert kb.get_task(conn, child).status == "done"
++
++
+ def test_forwarder_falls_back_to_a_local_worker_when_the_hub_refuses(mac, monkeypatch):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+diff --git a/tests/hermes_cli/test_kanban_wake_check.py b/tests/hermes_cli/test_kanban_wake_check.py
+index a690c13a268..6fcde121758 100644
+--- a/tests/hermes_cli/test_kanban_wake_check.py
++++ b/tests/hermes_cli/test_kanban_wake_check.py
+@@ -371,7 +371,8 @@ def test_diagnostics_flag_clock_parks_and_failing_probes(kanban_home) -> None:
+ # --- silent forever-waits (t_1132a78a) -----------------------------------------------------
+ 
+ def test_dry_run_rejects_probes_that_can_never_succeed():
+-    assert kwc.dry_run_error("exit 0") is None
++    # exit 0 = the condition already holds: the park would wake at once (wake_check_already_true)
++    assert kwc.dry_run_error("exit 0").startswith(kwc.WAKE_CHECK_ALREADY_TRUE)
+     assert kwc.dry_run_error("exit 1") is None
+     assert "exited 2" in kwc.dry_run_error("exit 2")
+     assert "exited 127" in kwc.dry_run_error("no_such_command_xyz")
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 5c40d92259c..2b8f1774a51 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1060,11 +1060,11 @@ def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
+     try:
+         cmd = kwc.normalize_cmd(args.get("wake_check"))
+         every = kwc.normalize_every(raw_every) if cmd else None
+-        err = kwc.dry_run_error(cmd)
++        err = kwc.dry_run_error(cmd, blocker_id=args.get("blocker_id"))
+         if err:
+             raise ValueError(err)
+     except ValueError as exc:
+-        _check(False, str(exc))
++        _check(False, str(exc), kwc.refusal_code(str(exc)))
+     return (_redact(cmd) if cmd else None), every, clock_only
+ 
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,504 @@
+From c7bdd4fa39f359f832144a4a83f9fea5e8ba4e32 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:42:14 -0700
+Subject: [PATCH] fix(cron): preserve one-shot slots across planned update
+ pauses [daveey] (#299)
+
+---
+ cron/jobs.py                                  |  35 ++---
+ cron/planned_pause.py                         | 123 ++++++++++++++++++
+ cron/scheduler_tick.py                        |   4 +
+ gateway/cron_pause.py                         |  44 +++++++
+ gateway/run_bootstrap.py                      |  24 +---
+ tests/cron/test_restart_deferred_oneshot.py   | 101 ++++++++++++++
+ tests/gateway/test_update_pause_cron_slots.py |  52 ++++++++
+ 7 files changed, 335 insertions(+), 48 deletions(-)
+ create mode 100644 cron/planned_pause.py
+ create mode 100644 gateway/cron_pause.py
+ create mode 100644 tests/cron/test_restart_deferred_oneshot.py
+ create mode 100644 tests/gateway/test_update_pause_cron_slots.py
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 0ccecd02ddd..a8ace70d714 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -3186,30 +3186,6 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
+     return False
+ 
+ 
+-def _retire_expired_oneshot(d: _DueJob) -> bool:
+-    """One-shot grace gate; True when the job must not fire this tick.
+-
+-    A one-shot beyond the grace window must never fire (create/update/resume reject such schedules
+-    and recovery never revives them; only the due scan used to dispatch them hours late). With no
+-    claim stamped, retire it with a diagnostic (never silently delete). A claim may mean a run is
+-    still in flight elsewhere — skip but keep the record so its mark_job_run can land."""
+-    if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
+-        return False
+-    # Due during an outage of its store: it was skipped, not missed; fire it once on recovery.
+-    if store_health.outage_covers(_current_cron_store().cron_dir, d.next_run_dt.timestamp(), ONESHOT_GRACE_SECONDS):
+-        return False
+-    claim = d.job.get("run_claim")
+-    # An outage-covered claim that never reached its fire claim never started: it stays covered.
+-    if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
+-        return False
+-    if not (claim or d.job.get("fire_claim")):
+-        from cron.jobs_oneshot_diagnostics import write_missed
+-        write_missed(d.job, d.next_run)
+-        d.scan.retire(d.job["id"])
+-        d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
+-    return True
+-
+-
+ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool:
+     """One-shot dispatch-limit guard; True when the job must not fire this tick.
+ 
+@@ -3331,14 +3307,15 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
+     if not manual_run and recurring and _fast_forward_missed_recurring(d, grace):
+         return False
+     if kind == "once":
+-        if _retire_expired_oneshot(d) or _oneshot_dispatch_limit_reached(job, scan):
++        from cron.planned_pause import covers, retire_expired
++        if retire_expired(d) or _oneshot_dispatch_limit_reached(job, scan):
+             return False
+         # Durably claim the one-shot for the DURATION of its run: a second scheduler process on the
+         # same HERMES_HOME must not re-dispatch it while in flight, and advancing next_run_at by a
+         # fixed window is not enough for a run that outlives a tick. The other process sees the
+         # fresh claim and skips; mark_job_run() clears it. The TTL only covers a tick that DIES.
+         claim = {"at": now.isoformat(), "by": _machine_id()}
+-        if _elapsed_seconds(now, d.next_run_dt) > ONESHOT_GRACE_SECONDS:  # only an outage lets it through
++        if not covers(job) and _elapsed_seconds(now, d.next_run_dt) > ONESHOT_GRACE_SECONDS:
+             claim["outage"] = True
+         job["run_claim"] = claim
+         scan.persist(job["id"], run_claim=claim)
+@@ -3371,6 +3348,11 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
+     raw_jobs = load_jobs()
+     scan = _DueScan(raw_jobs, _hermes_now())
+     scan.needs_save = _normalize_due_scan_records(raw_jobs)
++    from cron import planned_pause
++    recovered_pause = planned_pause.recover(raw_jobs, scan.now)
++    if recovered_pause is None:
++        return []  # the interval must be durable before any covered slot can be retired
++    scan.needs_save |= recovered_pause[0]
+     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+     # One-shot run-claim TTL, resolved once per scan (see _oneshot_run_claim_ttl_seconds).
+     run_claim_ttl = _oneshot_run_claim_ttl_seconds()
+@@ -3408,6 +3390,7 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
+             return due
+     # Only now is a skipped one-shot claimed or durably due on disk: normal grace applies again.
+     store_health.end_recovery_window(_current_cron_store().cron_dir)
++    planned_pause.finish_recovery(recovered_pause[1])
+     for emit in scan.on_saved:
+         emit()
+     return due
+diff --git a/cron/planned_pause.py b/cron/planned_pause.py
+new file mode 100644
+index 00000000000..10128f2c30f
+--- /dev/null
++++ b/cron/planned_pause.py
+@@ -0,0 +1,123 @@
++"""Durable eligibility for one-shots deferred by a planned runtime pause.
++
++Each suppressed tick/control request publishes its own interval without taking the
++jobs lock (a pause ACK must not wait behind cron I/O). The admitted scan closes and
++consumes only its snapshot, so concurrent pause writers cannot be lost at cleanup.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import math
++import uuid
++from datetime import datetime
++from pathlib import Path
++
++from utils import atomic_write_text
++
++logger = logging.getLogger("cron.jobs")
++
++
++def _path() -> Path:
++    from cron.jobs import _current_cron_store
++    return _current_cron_store().cron_dir / "planned-pauses"
++
++
++def _read(path: Path) -> dict | None:
++    try:
++        window = json.loads(path.read_text(encoding="utf-8-sig"))
++        if (not isinstance(window, dict) or "end" not in window
++                or not isinstance(window.get("start"), (int, float)) or not math.isfinite(window["start"])
++                or (window["end"] is not None and (
++                    not isinstance(window["end"], (int, float)) or not math.isfinite(window["end"])
++                    or window["end"] < window["start"]))):
++            raise ValueError("invalid pause interval")
++        return window
++    except FileNotFoundError:
++        return None
++    except (ValueError, TypeError) as exc:
++        logger.warning("Ignoring malformed planned cron pause %s: %s", path, exc)
++        return None
++
++
++def _write(path: Path, window: dict) -> None:
++    atomic_write_text(path, json.dumps(window), mode=0o600)
++
++
++def begin() -> None:
++    """Publish before suppressing admission; store failures remain observable."""
++    from cron import jobs, store_health
++    try:
++        directory = _path()
++        jobs._ensure_cron_dir(directory)
++        _write(directory / f"{uuid.uuid4().hex}.json", {"start": jobs._hermes_now().timestamp(), "end": None})
++    except OSError as exc:
++        store_health.note_unwritable(exc, "planned cron pause could not be recorded", "pause")
++
++
++def recover(raw_jobs: list[dict], now: datetime) -> tuple[bool, list[Path]] | None:
++    """Under the jobs lock, pin interval ends before modifying jobs; None means retry writes.
++
++    A crash before the jobs save replays the same bounded intervals, never extends them
++    to later slots. The caller removes this snapshot only after its jobs save lands.
++    """
++    from cron import jobs, jobs_time, store_health
++    try:
++        paths = list(_path().glob("*.json"))
++        windows = []
++        for path in paths:
++            window = _read(path)
++            if window is None:
++                continue
++            if window["end"] is None:
++                window["end"] = max(now.timestamp(), window["start"])
++                _write(path, window)
++            windows.append(window)
++    except OSError as exc:
++        store_health.note_unwritable(exc, "planned cron pause recovery deferred", "pause")
++        return None
++    changed = False
++    for job in raw_jobs:
++        schedule = job.get("schedule")
++        if not isinstance(schedule, dict) or schedule.get("kind") != "once" or not job.get("enabled", True):
++            continue
++        due = jobs._parse_aware(job.get("next_run_at"), jobs_time.zone_for_job(job))
++        if due is not None and any(
++            w["start"] - jobs.ONESHOT_GRACE_SECONDS <= due.timestamp() <= w["end"] for w in windows
++        ):
++            job["planned_pause_slot"] = job["next_run_at"]
++            changed = True
++    return changed, paths
++
++
++def covers(job: dict) -> bool:
++    """Editing or resuming onto a different instant invalidates the recovery exemption."""
++    return bool(job.get("next_run_at") and job.get("planned_pause_slot") == job["next_run_at"])
++
++
++def retire_expired(d) -> bool:
++    """Retire stale one-shots, except occurrences deliberately held through a pause/outage."""
++    from cron import jobs, store_health
++    grace = jobs.ONESHOT_GRACE_SECONDS
++    if covers(d.job) or jobs._elapsed_seconds(d.scan.now, d.next_run_dt) <= grace:
++        return False
++    if store_health.outage_covers(jobs._current_cron_store().cron_dir, d.next_run_dt.timestamp(), grace):
++        return False
++    claim = d.job.get("run_claim")
++    if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
++        return False
++    if not (claim or d.job.get("fire_claim")):
++        from cron.jobs_oneshot_diagnostics import write_missed
++        write_missed(d.job, d.next_run)
++        d.scan.retire(d.job["id"])
++        d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))
++    return True
++
++
++def finish_recovery(paths: list[Path]) -> None:
++    """The jobs save landed; do not remove intervals concurrently published by another ticker."""
++    for path in paths:
++        try:
++            path.unlink(missing_ok=True)
++        except OSError as exc:
++            logger.warning("Could not remove recovered cron pause %s: %s", path, exc)
+diff --git a/cron/scheduler_tick.py b/cron/scheduler_tick.py
+index 159458a6c20..7977f1c1dd2 100644
+--- a/cron/scheduler_tick.py
++++ b/cron/scheduler_tick.py
+@@ -41,6 +41,8 @@ def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None
+             return 0
+         with update_admission() as update_admitted:
+             if not update_admitted:
++                from cron.planned_pause import begin
++                begin()
+                 return 0  # due jobs stay due: nothing advanced, they fire on the first tick after the hold
+             return _tick_admitted(verbose, adapters, loop, sync, can_dispatch=can_dispatch,
+                                   headless=headless)
+@@ -175,6 +177,8 @@ def _tick_admitted(
+                 return 0
+ 
+         if can_dispatch is not None and not can_dispatch():
++            from cron.planned_pause import begin
++            begin()
+             _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
+             return 0
+ 
+diff --git a/gateway/cron_pause.py b/gateway/cron_pause.py
+new file mode 100644
+index 00000000000..de58d33030b
+--- /dev/null
++++ b/gateway/cron_pause.py
+@@ -0,0 +1,44 @@
++"""Persist the cron pause before a gateway can exit between ticker cycles."""
++
++import os
++import threading
++
++
++def pause_for_update(runner, loop) -> dict:
++    """Control-socket executor thread: record slots before marshaling the drain onto the loop."""
++    preserve_cron_slots(runner.config)
++    try:
++        from hermes_cli.gateway import _get_restart_drain_timeout
++        drain = float(_get_restart_drain_timeout())
++    except (OSError, ValueError, TypeError):
++        drain = 30.0
++    accepted_box: list[bool] = []
++    done = threading.Event()
++
++    def request() -> None:
++        try:
++            accepted_box.append(runner.request_restart(detached=False, via_service=True))
++        finally:
++            done.set()
++
++    loop.call_soon_threadsafe(request)
++    done.wait(timeout=5.0)
++    accepted = bool(accepted_box and accepted_box[0])
++    return {"pausing": accepted, "already_stopping": not accepted,
++            "pid": os.getpid(), "drain_timeout": drain}
++
++
++def preserve_cron_slots(config) -> None:
++    from cron.planned_pause import begin
++    from cron.scheduler_provider import _profile_cron_scope
++    from gateway.run import _cron_profile_gate, _cron_tick_profile_homes
++    import logging
++
++    for name, home in _cron_tick_profile_homes(config):
++        if not home.is_dir() or not _cron_profile_gate(name, home):
++            continue
++        try:
++            with _profile_cron_scope(home):
++                begin()
++        except (OSError, TimeoutError):
++            logging.getLogger("gateway.run").warning("Could not preserve cron slots for %s", home, exc_info=True)
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 78527ae3f52..6f8c5ba66f4 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -372,27 +372,7 @@ async def _start_gateway_start_control_socket(runner):
+         # manager) relaunches after the code swap.
+         _main_loop = asyncio.get_running_loop()
+ 
+-        def _pause_for_update_handler() -> dict:
+-            try:
+-                from hermes_cli.gateway import _get_restart_drain_timeout
+-                _drain = float(_get_restart_drain_timeout())
+-            except Exception:
+-                _drain = 30.0
+-            accepted_box: list[bool] = []
+-            _done = threading.Event()
+-
+-            def _request() -> None:
+-                try:
+-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
+-                finally:
+-                    _done.set()
+-
+-            _main_loop.call_soon_threadsafe(_request)
+-            _done.wait(timeout=5.0)
+-            accepted = bool(accepted_box and accepted_box[0])
+-            return {
+-                "pausing": accepted, "already_stopping": not accepted,
+-                "pid": os.getpid(), "drain_timeout": _drain}
++        from gateway.cron_pause import pause_for_update
+ 
+         def _rescan_profiles_handler() -> dict:
+             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now
+@@ -410,7 +390,7 @@ async def _start_gateway_start_control_socket(runner):
+             return {"multiplex": bool(getattr(runner.config, "multiplex_profiles", False)), **result}
+ 
+         _control_server = GatewayControlServer(
+-            verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
++            verb_handlers={"pause-for-update": lambda: pause_for_update(runner, _main_loop), "identify": _identify_runtime,
+                            "rescan-profiles": _rescan_profiles_handler,
+                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
+                            "unserve-profile": unserve_profile_verb(runner),
+diff --git a/tests/cron/test_restart_deferred_oneshot.py b/tests/cron/test_restart_deferred_oneshot.py
+new file mode 100644
+index 00000000000..93380819d2d
+--- /dev/null
++++ b/tests/cron/test_restart_deferred_oneshot.py
+@@ -0,0 +1,101 @@
++"""Planned runtime pauses preserve occurrences, not arbitrary stale schedules."""
++from datetime import UTC, datetime, timedelta
++
++import pytest
++
++from tests.cron.test_update_admission_hold import _quiet, _root
++
++
++@pytest.mark.parametrize("gate", ["drain", "admission"])
++def test_oneshot_due_during_long_pause_survives_successor(tmp_path, monkeypatch, gate):
++    from cron import jobs, scheduler
++    from hermes_cli import admission_fence
++
++    _quiet(monkeypatch)
++    now = datetime.now(UTC).replace(microsecond=0)
++    clock = [now]
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock[0])
++    due = now + timedelta(seconds=70)
++    job = jobs.create_job(prompt="run once", schedule=due.isoformat())
++    stale = jobs.create_job(prompt="already missed", schedule=now.isoformat())
++    jobs.update_job(stale["id"], {"next_run_at": (now - timedelta(seconds=121)).isoformat()})
++    future = jobs.create_job(prompt="later", schedule=(now + timedelta(hours=1)).isoformat())
++    root = _root()
++    if gate == "admission":
++        admission_fence.set_hold(root)
++    try:
++        assert scheduler.tick(verbose=False, can_dispatch=lambda: False) == 0
++        kept = jobs.get_job(job["id"])
++        assert kept and kept["next_run_at"] == due.isoformat()
++    finally:
++        if gate == "admission":
++            admission_fence.clear_hold(root)
++    # A successor has no memory of the ticker that was held. Its only evidence is on disk.
++    clock[0] = now + timedelta(seconds=240)
++    selected = jobs.get_due_jobs()
++    assert [j["id"] for j in selected] == [job["id"]]
++    assert jobs.get_due_jobs() == []  # a second owner cannot take the live claim
++    jobs.mark_job_run(job["id"], success=True)
++    assert jobs.get_due_jobs() == []
++    assert jobs.get_job(stale["id"]) is None
++    # Future slots do not gain permanent grace from an old pause.
++    clock[0] = now + timedelta(hours=2)
++    assert jobs.get_due_jobs() == []
++    assert jobs.get_job(future["id"]) is None
++
++
++def test_refusal_and_schedule_edit_do_not_lose_or_widen_recovery(monkeypatch):
++    from cron import jobs, planned_pause, scheduler_gateway_gate
++    now = datetime.now(UTC).replace(microsecond=0)
++    clock = [now]
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock[0])
++    job = jobs.create_job(prompt="run", schedule=(now + timedelta(seconds=30)).isoformat())
++    planned_pause.begin()
++    clock[0] += timedelta(seconds=60)  # first scan is still inside ordinary grace
++    selected = jobs.get_due_jobs()
++    assert [j["id"] for j in selected] == [job["id"]]
++    scheduler_gateway_gate._note_fire_refused([job["id"]], "gateway starting")
++    clock[0] += timedelta(seconds=180)
++    assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]
++    scheduler_gateway_gate._note_fire_refused([job["id"]], "gateway starting")
++    # A new instant cannot inherit the old occurrence's exemption.
++    jobs.update_job(job["id"], {"next_run_at": (clock[0] - timedelta(seconds=180)).isoformat()})
++    assert jobs.get_due_jobs() == []
++    assert jobs.get_job(job["id"]) is None
++
++
++def test_pause_recovery_contains_corruption_and_failed_end_write(monkeypatch):
++    import errno
++    from cron import jobs, planned_pause
++    now = datetime.now(UTC).replace(microsecond=0)
++    clock = [now]
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock[0])
++    job = jobs.create_job(prompt="run", schedule=(now + timedelta(seconds=30)).isoformat())
++    planned_pause.begin()
++    clock[0] += timedelta(seconds=240)
++    with monkeypatch.context() as m:
++        m.setattr(planned_pause, "_write", lambda *_: (_ for _ in ()).throw(OSError(errno.ENOSPC, "full")))
++        assert jobs.get_due_jobs() == []
++        assert jobs.get_job(job["id"]) is not None
++    assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]
++    assert not list(planned_pause._path().glob("*.json"))
++    jobs.mark_job_run(job["id"], success=True)
++    # A corrupt sidecar must not stop unrelated due work.
++    next_job = jobs.create_job(prompt="healthy", schedule=clock[0].isoformat())
++    (planned_pause._path() / "bad.json").write_text('{"bad": true}')
++    assert [j["id"] for j in jobs.get_due_jobs()] == [next_job["id"]]
++
++
++def test_pause_publication_never_waits_on_jobs_lock_and_cleanup_is_snapshot_local():
++    from concurrent.futures import ThreadPoolExecutor
++    from cron import jobs, planned_pause
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with jobs._jobs_lock():
++            pool.submit(planned_pause.begin).result(timeout=5)
++    recovery = planned_pause.recover([], datetime.now(UTC))
++    assert recovery and len(recovery[1]) == 1
++    planned_pause.begin()  # another ticker publishes after the scan snapshot
++    planned_pause.finish_recovery(recovery[1])
++    remaining = list(planned_pause._path().glob("*.json"))
++    assert len(remaining) == 1
++    assert remaining[0] not in recovery[1]
+diff --git a/tests/gateway/test_update_pause_cron_slots.py b/tests/gateway/test_update_pause_cron_slots.py
+new file mode 100644
+index 00000000000..a75ed4e56cc
+--- /dev/null
++++ b/tests/gateway/test_update_pause_cron_slots.py
+@@ -0,0 +1,52 @@
++"""The real pause verb records profile-local cron eligibility before requesting a drain."""
++import asyncio
++from datetime import UTC, datetime, timedelta
++from types import SimpleNamespace
++
++import pytest
++
++
++@pytest.mark.platforms("posix")
++def test_pause_socket_records_cron_pause_before_drain(tmp_path, monkeypatch):
++    from cron import jobs
++    from gateway import run
++    from gateway.control_socket import GatewayControlServer, pause_gateway_for_update
++    from gateway.cron_pause import pause_for_update
++    from hermes_constants import get_hermes_home
++
++    now = datetime.now(UTC).replace(microsecond=0)
++    clock = [now]
++    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock[0])
++    job = jobs.create_job(prompt="due mid update", schedule=(now + timedelta(seconds=70)).isoformat())
++    home = get_hermes_home()
++    foreign, deleted = tmp_path / "foreign", tmp_path / "deleted"
++    foreign.mkdir()
++    monkeypatch.setattr(run, "_cron_tick_profile_homes", lambda _: [
++        ("default", home), ("foreign", foreign), ("deleted", deleted)])
++    monkeypatch.setattr(run, "_cron_profile_gate", lambda name, _: name != "foreign")
++    requested = []
++
++    def request_restart(**kwargs):
++        assert (home / "cron" / "planned-pauses").exists()
++        requested.append(kwargs)
++        return True
++
++    runner = SimpleNamespace(config=SimpleNamespace(), request_restart=request_restart)
++
++    async def scenario():
++        loop = asyncio.get_running_loop()
++        server = GatewayControlServer(home=home, verb_handlers={
++            "pause-for-update": lambda: pause_for_update(runner, loop)})
++        assert await server.start()
++        try:
++            return await loop.run_in_executor(None, lambda: pause_gateway_for_update(home, timeout=10))
++        finally:
++            await server.stop()
++
++    result = asyncio.run(scenario())
++    assert result and result["pausing"]
++    assert requested == [{"detached": False, "via_service": True}]
++    assert not (foreign / "cron").exists()
++    assert not deleted.exists()
++    clock[0] += timedelta(seconds=240)
++    assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]
+-- 
+2.55.0
+

@@ -1,0 +1,111 @@
+From beb0637e9341732ec1a90542fc1d127036906489 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:05:31 +0000
+Subject: [PATCH] fix(kanban): reaper treats a non-finite fingerprint as
+ foreign, not a crash; deterministic stale-fingerprint fixture [daveey]
+
+test_recycled_pid_and_legacy_row_are_never_signalled failed on runner
+tfgar-tests_i-041de77e8ea96c2ba (run 41052721058) at line 96: the stale row's
+worker_pid was never cleared.
+
+Problem: stale fingerprint row kept worker_pid on one runner; passes on hub.
+Why 1: reap_terminal_workers skipped the row: _pid_recycled raised
+  OverflowError (int(inf)) in start_time_fingerprints_match; the per-row
+  except logged at debug and moved on.
+Why 2: the fixture built the stale fingerprint with SQL
+  `worker_started_at - 1000000` on the TEXT value "<boot_id>:<pid1>|<ticks>";
+  SQLite coerces the numeric prefix of boot_id, so "123e4567-..." -> +inf
+  ("3a7a1e43-..." on the hub -> -999997, which happens to work).
+Why 3: _pid_recycled treats junk fingerprints as foreign by catching
+  TypeError/ValueError, but int() of a non-finite float raises OverflowError.
+Root (happened): the junk guard missed OverflowError; fixture
+  relied on boot_id-dependent SQL coercion of a string fingerprint.
+Root (not caught): no test fed a non-finite fingerprint; boot_id varies per
+  host so the fixture only failed on some runners.
+
+Fix: _pid_recycled also catches OverflowError (foreign: never signalled,
+evidence cleared); the fixture shifts the start inside the fingerprint
+string. (Fixing it in gateway.status.start_time_fingerprints_match would
+cover every caller but that file is at its FILE_LINES cap.) Tests: reaper treats an inf fingerprint (SQL-coerced and literal) as foreign:
+never signalled, evidence cleared. Repro: pinning
+current_instantiation_epoch() to "123e4567-..." fails the old fixture and
+passes the new one.
+
+The unchanged old fixture also passes under the pinned bad epoch with this fix.
+---
+ hermes_cli/kanban_db_dispatch.py              |  2 +-
+ .../test_kanban_terminal_worker_reaper.py     | 38 ++++++++++++++++++-
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 94dfb9f9d57..1147dd3aaf3 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -579,7 +579,7 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
+         return True
+     try:
+         return not start_time_fingerprints_match(started_at, current)
+-    except (TypeError, ValueError):
++    except (TypeError, ValueError, OverflowError):  # Overflow: inf, e.g. a TEXT fingerprint SQLite coerced
+         return True
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_terminal_worker_reaper.py b/tests/hermes_cli/test_kanban_terminal_worker_reaper.py
+index 864127cc9af..3b6fb198348 100644
+--- a/tests/hermes_cli/test_kanban_terminal_worker_reaper.py
++++ b/tests/hermes_cli/test_kanban_terminal_worker_reaper.py
+@@ -84,8 +84,14 @@ def test_recycled_pid_and_legacy_row_are_never_signalled(conn):
+     legacy = _sleeper()
+     try:
+         _tid, run_id = _completed_card_with_worker(conn, stranger)
+-        # PID reuse: the recorded fingerprint belongs to a process that no longer exists.
+-        conn.execute("UPDATE task_runs SET worker_started_at = worker_started_at - 1000000 WHERE id=?", (run_id,))
++        # PID reuse: the recorded fingerprint belongs to a process that no longer exists. Shift the
++        # start time inside the "<epoch>|<start>[@<boot>]" string; SQL arithmetic on the TEXT value
++        # coerces the boot_id's numeric prefix instead (a "123e4567-..." boot_id reads as +inf).
++        fp = conn.execute("SELECT worker_started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
++        epoch, _, start = fp.rpartition("|")
++        abs_start, at, boot = start.partition("@")
++        stale = f"{epoch}|{int(abs_start) - 1000000}{at}{boot}"
++        conn.execute("UPDATE task_runs SET worker_started_at = ? WHERE id=?", (stale, run_id))
+         _, legacy_run = _completed_card_with_worker(conn, legacy)
+         conn.execute("UPDATE task_runs SET worker_started_at = NULL WHERE id=?", (legacy_run,))
+ 
+@@ -101,6 +107,34 @@ def test_recycled_pid_and_legacy_row_are_never_signalled(conn):
+             p.wait()
+ 
+ 
++@pytest.mark.parametrize("coerced_sql", [
++    # A TEXT fingerprint coerced by SQLite arithmetic: the "123e4567" boot_id prefix overflows to +inf.
++    "'123e4567-89ab-cdef-0123-456789abcdef:22|5' - 1000000",
++    "9e999",
++])
++def test_unrepresentable_numeric_fingerprint_is_foreign_not_a_crash(conn, coerced_sql):
++    """A fingerprint that int() cannot hold (inf) is a stranger: never signalled, evidence cleared."""
++    proc = _sleeper()
++    signals = []
++
++    def signal_fn(pid, sig):
++        signals.append(pid)
++
++    try:
++        _tid, run_id = _completed_card_with_worker(conn, proc)
++        conn.execute(f"UPDATE task_runs SET worker_started_at = {coerced_sql} WHERE id=?", (run_id,))
++        assert conn.execute("SELECT worker_started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()[0] == float("inf")
++
++        assert kbd._pid_recycled(proc.pid, float("inf")) is True
++        assert kbd.reap_terminal_workers(conn, signal_fn=signal_fn) == []
++
++        assert signals == [] and proc.poll() is None
++        assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()["worker_pid"] is None
++    finally:
++        proc.kill()
++        proc.wait()
++
++
+ def test_fresh_terminal_run_is_left_alone_until_grace_passes(conn):
+     """A worker is still alive for a moment after its own kanban_complete returns
+     (final turn, session persistence): a just-closed run is not signalled."""
+-- 
+2.55.0
+

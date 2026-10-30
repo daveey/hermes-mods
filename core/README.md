@@ -25,7 +25,7 @@ See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation,
 
 | Feature | Patches | Scope |
 |---|---|---|
-| [Frozen decisions stop at reset](frozen-decision-reset.md) | 1239 | Exact two-part user-steps decisions survive compression but cancel at a genuinely new LOCAL conversation, with event/waiter settlement. |
+| [Frozen decisions stop at reset](frozen-decision-reset.md) | 1239 1273 | Exact two-part user-steps decisions survive compression but cancel at a genuinely new LOCAL conversation, with event/waiter settlement. |
 | [Admission, restart and test isolation](mirror-admission-and-test-followups.md) | 1236–1238 1240–1253 | Memory-aware CI, drain/crash isolation, cron and replica guards, bounded restart settlement, missing pins and source test synchronization. |
 
 ## Append-only follow-ups after 1134
@@ -788,3 +788,11 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Dashboard host-attach stale-while-revalidate and update idle probe](dashboard-host-attach-swr-and-update-idle-probe.md) | 1215 1216 1218 1219 1220 | The host-gateway memo is served stale-while-revalidate, control verbs get their own executor, pid liveness uses psutil, and an unanswered idle probe while waiting on a review is not the review ending. |
 | [Test deflakes and the sidecar chmod race](test-deflakes-and-sidecar-chmod-race.md) | 1214 1217 1223 1224 1225 1226 1227 1229 1230 1233 1235 | Deflakes for browser, local-model, desktop send-then-close and preference-store, gateway compression and local-recovery tests, plus the state-db sidecar unlink-between-lstat-and-chmod fix with its test. |
 | [Desktop ConfirmDialog unmount guard](desktop-confirm-dialog-unmount-guard.md) | 1234 | `ConfirmDialog` arms no 600 ms close timer when it unmounts while `onConfirm` is still pending, so no timer fires after teardown. |
+| [Kanban restart, reaper and false-signal fixes](kanban-restart-reaper-and-false-signal-fixes.md) | 1254 1265 1266 1269 1272 | Reject foreign fingerprints safely, drain claims during deferred restart, declare worker restart safety and avoid phantom-reference reports on partial synced boards. |
+| [Cron planned-pause one-shot slots](cron-planned-pause-oneshot-slots.md) | 1255 | Preserve specific one-shot occurrences across planned admission holds and gateway drains without exempting unrelated stale schedules. |
+| [Test-only deflakes and regression coverage, 1254–1277](test-deflakes-batch-1254-1277.md) | 1256 1257 1260 1261 1263 1267 1268 1271 1275 1276 1277 | Test-only readiness, cancellation, evidence, process-reaping, database-handle, admission, cron-slot and teardown-order follow-ups. |
+| [Kanban park and owner-archive fixes](kanban-park-and-owner-archive-fixes.md) | 1258 1259 1264 1274 | Refuse already-met parks, wake on producer completion and allow scoped capability-owner cleanup locally or through a home-relay request. |
+| [Sandbox background watcher idle-reap fixes](sandbox-bg-watcher-idle-reap.md) | 1262 | Keep active sandbox environments through idle cleanup and reattach a failed poller handle before declaring its process lost. |
+| [Affected tests include PM toolchain changes](ci-affected-tests-pm-toolchain.md) | 1270 | Select the full Python suite for shared PM interpreter and activation inputs while leaving unrelated PM data narrow. |
+| [Kanban supervisor requests](kanban-supervisor-requests.md) | 1278 1279 1280 1281 | A worker files a durable, deduplicated `kanban_supervisor_request` to unlink edges between cards its task created; the dispatcher tick executes it with a lease and receipts, link ops are refused up front, and a worker's shell `unlink` is guarded. |
+| [1281-entry mirror snapshot](mirror-1281-verification.md) | verification report | Replay and tree-comparison evidence for the 28 entries appended after the 1253 snapshot. |
