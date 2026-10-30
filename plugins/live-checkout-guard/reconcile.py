@@ -73,7 +73,11 @@ def reconcile(root, archive, published, paths):
     head = manifest['head']
     if not isinstance(head, str) or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', head):
         raise ValueError('invalid archive head')
-    if manifest['origin'] != git(root, 'remote', 'get-url', 'origin').decode().strip():
+    archived_origin = manifest['origin']
+    if isinstance(archived_origin, str) and re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', archived_origin):
+        git(root, 'cat-file', '-e', archived_origin + '^{commit}')
+        git(root, 'merge-base', '--is-ancestor', archived_origin, 'refs/remotes/origin/main')
+    elif archived_origin != git(root, 'remote', 'get-url', 'origin').decode().strip():
         raise ValueError('archive origin mismatch')
     paths = list(dict.fromkeys(paths))
     if not paths:

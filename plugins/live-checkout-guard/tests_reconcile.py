@@ -54,6 +54,14 @@ class ReconcileTests(unittest.TestCase):
             cmd += ['--path', path]
         return subprocess.run(cmd, capture_output=True, text=True)
 
+    def test_archive_origin_commit_is_validated_against_published_history(self):
+        p = self.archive / 'manifest.json'
+        manifest = json.loads(p.read_text())
+        manifest['origin'] = self.head
+        p.write_text(json.dumps(manifest))
+        result = self.run_helper('file')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_restores_published_bytes_without_index_or_head_changes(self):
         before_head = self.git('rev-parse', 'HEAD')
         before_index = (self.root / '.git/index').read_bytes()
