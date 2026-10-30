@@ -16,6 +16,7 @@ the private repo `daveey/hermes` (`~/code/hermes`, branch `state`).
 - Because of the symlinks, editing `~/.hermes/plugins/<name>/…` edits this working tree. The same
   goes for `skill_manage` patches to these skills.
 - Plugin enable/disable state stays in the private repo (`home/plugins-enabled.txt`).
+- A new guard plugin must enter private `home/plugins-every-host.txt` in the same change that adds it.
 - **`hermes-sync` never commits here.** It only pulls, pushes commits you already made, and links.
   Uncommitted edits stay local (and are logged) until you commit them.
 
