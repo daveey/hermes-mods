@@ -10,7 +10,9 @@ Contract: side-session-notes session-outcome-contract.md, "Mods". Core owns stor
 - an outcome judge: is the last assistant message a closing summary? Pool model, ``fast`` tier, thinking off, 6 s budget,
   None (core falls back to its heuristic) on any failure or timeout.
 - ``pre_final_gate``: a reply with no ``session_outcome`` call that would end ``unresolved{no_summary}`` is held
-  once with a request for the call. Never loops: the second miss passes.
+  once with a request for the call. So is a reply the judge could not rule on (timeout, error, unclear answer) that
+  only core's heuristic called a summary: a later refresh whose judge works can still say NO, so the agent declares
+  the outcome instead. Never loops: the second miss passes.
 
 On a core without ``hermes_state_outcome`` everything is a no-op: the tool is not offered, nothing registers and
 the gate passes. Off switch: HERMES_SESSION_OUTCOME_OFF=1.
@@ -27,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -37,6 +40,9 @@ TOOLSET = "session_outcome"
 INTERACTIVE = frozenset({"desktop", "tui", "cli"})
 WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent")
 JUDGE_BUDGET_S = 6.0  # thinking off, a fast-tier call measured 0.7-3.0 s on the hub
+# The gate runs inside a busy Desktop serve process (a 30 s pre_final_gate limit, reply already buffered), where the
+# same call can take longer than in a quiet CLI refresh; it gets a longer budget so the two agree more often.
+GATE_JUDGE_BUDGET_S = 15.0
 # The judge sees at most this many characters of the reply: whole up to here, else head + tail, never only the
 # tail. A long report leads with its answer; a tail-only cut leaves sources and a closing aside, which the judge
 # reads as "not a summary".
@@ -428,6 +434,9 @@ def _judge_input(text: str, request: str = "") -> str:
     return f"{req}<message>\n{_clip(text)}\n</message>"
 
 _JUDGED: dict[tuple, Optional[bool]] = {}
+# Per-call scope set by the gate: the judge's budget there and whether it gave up ({"gave_up": True}). A ContextVar,
+# so a concurrent refresh in another thread keeps the short budget and never marks the gate's trace.
+_GATE_SCOPE: ContextVar[Optional[dict]] = ContextVar("session_outcome_gate_scope", default=None)
 
 
 def _with_budget(fn: Callable[[], Any], budget: float) -> Any:
@@ -463,15 +472,29 @@ def judge(session_id: str, last_assistant_text: str, *, source: Optional[str] = 
         return None
     request = _last_request(session_id)
     key = (session_id, hashlib.sha1(f"{request}\0{text}".encode("utf-8", "replace")).hexdigest())
+    scope = _GATE_SCOPE.get()
     if key in _JUDGED:
-        return _JUDGED[key]
+        verdict = _JUDGED[key]
+        if verdict is None and scope is not None:
+            scope["gave_up"] = True
+        return verdict
+    budget = GATE_JUDGE_BUDGET_S if scope is not None else JUDGE_BUDGET_S
+    t0 = time.monotonic()
     try:
-        raw = _with_budget(lambda: _llm(JUDGE_SYSTEM, _judge_input(text, request)), JUDGE_BUDGET_S)
+        raw = _with_budget(lambda: _llm(JUDGE_SYSTEM, _judge_input(text, request)), budget)
         word = str(raw or "").strip().strip(".!\"'`*").upper()
         verdict = True if word.startswith("YES") else False if word.startswith("NO") else None
-    except Exception:
-        log.debug("session-outcome judge gave up", exc_info=True)
+    except Exception as exc:
+        # INFO, not debug: a judge that gives up makes the gate and a later refresh disagree, so it must be visible.
+        log.info("session-outcome judge gave up for %s after %.1fs%s: %s: %s", session_id, time.monotonic() - t0,
+                 " (gate)" if scope is not None else "", type(exc).__name__, str(exc)[:200])
+        if scope is not None:
+            scope["gave_up"] = True
         return None  # failures are not cached: the next call may get through
+    if verdict is None:
+        log.info("session-outcome judge gave no YES/NO for %s: %r", session_id, str(raw or "")[:40])
+        if scope is not None:
+            scope["gave_up"] = True
     if len(_JUDGED) > 256:
         _JUDGED.clear()
     _JUDGED[key] = verdict
@@ -520,15 +543,27 @@ def _asked_this_turn(session_id: str, msgs: list, attempt: int) -> bool:
 
 
 def _would_be_no_summary(api, session_id: str, reply: str) -> bool:
-    """Would this reply leave the chat unresolved{no_summary}? Core's own derivation answers, skipping the live
-    turn this gate runs inside and treating the unsaved candidate as the last assistant message (it calls the
-    judge, cached, and falls back to its heuristic). A core that can't do that, or any error, never holds."""
+    """Would this reply leave the chat unresolved{no_summary}, now or on a later refresh? Core's own derivation
+    answers, skipping the live turn this gate runs inside and treating the unsaved candidate as the last assistant
+    message (it calls the judge, cached, with the gate's longer budget). A ``done`` that only core's heuristic gave
+    because the judge gave up counts as at risk: a later refresh whose judge works can flip it to no_summary with
+    nobody asked. A core that can't derive, or any error, never holds."""
+    scope: dict = {}
+    token = _GATE_SCOPE.set(scope)
     try:
         out = api.derive_outcome(session_id, ignore_live_turn=True, pending_reply=reply) or {}
     except Exception:
         log.debug("session-outcome derive failed", exc_info=True)
         return False
-    return out.get("kind") == "unresolved" and out.get("reason") == "no_summary"
+    finally:
+        _GATE_SCOPE.reset(token)
+    if out.get("kind") == "unresolved" and out.get("reason") == "no_summary":
+        return True
+    if out.get("kind") == "done" and scope.get("gave_up") and out.get("source", "derived") == "derived":
+        log.info("session-outcome gate: judge gave up on %s and only the heuristic said done; asking for the call",
+                 session_id)
+        return True
+    return False
 
 
 def pre_final_gate(session_id: str = "", platform: str = "", final_response: str = "",

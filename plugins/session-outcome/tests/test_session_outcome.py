@@ -372,14 +372,68 @@ def test_call_flag_is_per_turn(plugin, fake):
     assert gate(plugin, sid="T1", platform="tui", msgs=[{"role": "tool", "tool_call_id": "call_A"}])["hold"]
 
 
-def test_gate_passes_summary_and_undecided_judge_uses_heuristic(plugin, fake):
+def test_gate_passes_judged_summary(plugin, fake):
     plugin._llm = lambda s, u: "YES"
     assert gate(plugin, reply="Merged #12 and deployed; health check green.") is None
     assert fake.derive_calls[-1] == {"sid": "S1", "ignore_live_turn": True,
                                      "pending_reply": "Merged #12 and deployed; health check green."}
-    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
-    assert gate(plugin, reply="Rebased, fixed both failing tests and pushed; CI is green.") is None
+
+
+def test_gate_holds_when_judge_gives_up_and_only_heuristic_says_done(plugin, fake):
+    """A judge that fails in the serving process left the heuristic's `done`; a later refresh whose judge worked
+    said NO and the chat flipped to unresolved{no_summary} with nobody asked (hub 20261030_014232_cc881a). The
+    gate asks for the call instead: the declared outcome wins over any later judge."""
+    reply = "Rebased, fixed both failing tests and pushed; CI is green."
+    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("No eligible fast routes"))
+    first = gate(plugin, reply=reply)
+    assert first and first["hold"] and plugin.TAG in first["nudge"]
+    # never loops: the second miss passes
+    assert gate(plugin, reply=reply, attempt=1) is None
+    plugin._ASKED.clear()
+    # an unclear answer (cached as None) also counts as giving up, on the first call and on a cache hit
+    plugin._llm = lambda s, u: "maybe"
+    assert gate(plugin, reply="Different finished report, all green.")["hold"]
+    plugin._ASKED.clear()
+    assert gate(plugin, reply="Different finished report, all green.")["hold"]
+    plugin._ASKED.clear()
+    # the heuristic's NO still holds as before
     assert gate(plugin, reply="Hmm?")["hold"]
+
+
+def test_gate_judge_gets_longer_budget_and_timeout_holds(plugin, fake, monkeypatch):
+    monkeypatch.setattr(plugin, "JUDGE_BUDGET_S", 0.1)
+    monkeypatch.setattr(plugin, "GATE_JUDGE_BUDGET_S", 0.6)
+
+    def slowish(s, u):
+        time.sleep(0.3)
+        return "YES"
+    plugin._llm = slowish
+    # 0.3 s: over the refresh budget, within the gate's: the gate gets a real verdict and passes
+    assert gate(plugin, reply="Merged #12 and deployed; health check green.") is None
+    plugin._JUDGED.clear()
+    assert plugin.judge("S1", "Another finished report, deployed.") is None  # a refresh still uses 0.1 s
+
+    def slow(s, u):
+        time.sleep(1.0)
+        return "YES"
+    plugin._llm = slow
+    out = gate(plugin, reply="A third finished report, all deployed.")
+    assert out and out["hold"]
+
+
+def test_gate_scope_does_not_leak_into_refresh(plugin, fake):
+    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
+    gate(plugin, reply="Rebased, fixed both failing tests and pushed; CI is green.")
+    assert plugin._GATE_SCOPE.get() is None
+    # a refresh outside the gate still falls back to the heuristic, unchanged
+    assert fake.derive_outcome("S1", ignore_live_turn=True, pending_reply="Rebased and pushed both branches; CI is green now.")[
+        "kind"] == "done"
+
+
+def test_gate_does_not_hold_judged_done_or_outranking_kinds_after_give_up(plugin, fake):
+    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
+    fake.derived["S1"] = {"kind": "waiting", "on": [{"kind": "card", "id": "t_1"}]}
+    assert gate(plugin) is None  # the judge is never reached, nothing gave up
 
 
 def test_gate_fails_open_on_old_core_signature(plugin, fake, monkeypatch):
