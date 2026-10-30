@@ -1,0 +1,594 @@
+From 199f4cfd24d0153aee22c35ee72e9a454e28ef3c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:40:14 +0000
+Subject: [PATCH] fix(cron): agent jobs are held, not failed, while the gateway
+ restarts for an update [daveey]
+
+hermes-hub cron 6b4342ad83d9 recorded three FAILED runs (10-29/30), each seconds after a
+`hermes update` restarted the gateway: the Desktop serve ticker took over the store inside the
+restart gap, dispatched the agent job, and connect_gateway answered "Gateway draining:
+update_paused", which run_canonical_job booked as a failed run (failure_streak 3).
+
+Root: "gateway not ready" was a held fire on the headless tick path only and a job failure on
+every other tick path.
+
+- scheduler_tick: the gateway gate now runs for every tick with no gateway owner bound in the
+  process (headless crontab ticks and the Desktop/standalone tickers), decided by the owner
+  binding rather than the entry point, so a new ticker path is gated by default. The gateway's
+  own ticker (owner bound) skips the probe.
+- scheduler_gateway_gate: a live update fence holds agent jobs (ensure would answer
+  update_paused even over a running gateway); an interactive ticker (may_start) may still let
+  ensure start an absent gateway outside an update; headless never spawns.
+- scheduler_authority: a GatewayUnavailableError before admission in draining/starting/absent
+  raises CronFireNotAdmitted (the probe-vs-connect race). Refusals after submit stay failures.
+- scheduler/jobs: a not-admitted scheduled fire returns its slot to next_run_at, drops the fire
+  claim, undoes a one-shot's dispatch bump, stamps last_fire_error and leaves last_status /
+  failure_streak alone; the ledger row records "Not admitted". Manual fires still fail loudly.
+
+Tests: tests/cron/test_tick_gateway_not_ready.py (desktop tick during update / fenced ready /
+starting / draining holds; race past the gate keeps the job due and streak 0; definite fault and
+post-admission refusal still fail; guard: hermes cron tick, InProcessCronScheduler without owner
+and _start_desktop_cron_ticker all go through the gate, gateway-hosted skips it).
+---
+ cron/jobs.py                              |  33 +++
+ cron/scheduler.py                         |   9 +-
+ cron/scheduler_authority.py               |  50 ++++
+ cron/scheduler_gateway_gate.py            |  81 +++++--
+ cron/scheduler_tick.py                    |   9 +-
+ tests/cron/test_tick_gateway_not_ready.py | 267 ++++++++++++++++++++++
+ 6 files changed, 415 insertions(+), 34 deletions(-)
+ create mode 100644 tests/cron/test_tick_gateway_not_ready.py
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 158d5596980..9a0f1e13c8f 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2371,6 +2371,39 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
+     return _with_job(job_id, apply, False)
+ 
+ 
++def release_unadmitted_fire(
++    job_id: str, slot: Optional[str], detail: str, *, expected_fire_owner: Optional[str] = None,
++) -> bool:
++    """[daveey] Hand back a scheduled fire the gateway never admitted (draining for an update,
++    starting, absent): ``next_run_at`` returns to *slot* so the next ready tick fires it, the fire
++    claim, pending slot and run claim are dropped, a finite one-shot's ``claim_dispatch`` bump is
++    undone, and ``last_fire_error`` records why. ``last_status``/``failure_streak``/``last_run_at``
++    are left alone: nothing ran. Fenced on *expected_fire_owner*: a claim another fire took since
++    is not ours to release. True iff released."""
++    def apply(jobs, _i, job):
++        claim = job.get("fire_claim")
++        if expected_fire_owner is not None and (not isinstance(claim, dict)
++                                                or claim.get("by") != expected_fire_owner):
++            return False
++        kind = job.get("schedule", {}).get("kind")
++        if slot and kind in {"cron", "interval"}:
++            job["next_run_at"] = slot
++        repeat = job.get("repeat") or {}
++        times = repeat.get("times")
++        if (kind == "once" and isinstance(times, int) and times > 0
++                and not extra_fire.is_extra(job) and int(repeat.get("completed") or 0) > 0):
++            repeat["completed"] = int(repeat["completed"]) - 1
++        job["fire_claim"] = None
++        job.pop("pending_slot", None)
++        if job.get("run_claim") is not None:
++            job["run_claim"] = None
++        job["last_fire_error"] = {"at": _hermes_now().isoformat(), "detail": str(detail or "")[:500]}
++        save_jobs(jobs)
++        return True
++
++    return _with_job(job_id, apply, False)
++
++
+ def _record_run_outcome(
+     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
+     status: Optional[str], now: str, *, agent_skipped: bool = False,
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 1bddcb1512b..3e2e426a45d 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -3624,13 +3624,8 @@ def _run_one_job_body(
+         return finish_completed_run(d, fire_owner, execution_id)
+ 
+     except BaseException as e:
+-        from cron.scheduler_authority import CronExecutionUnknown
+-        if isinstance(e, CronExecutionUnknown):
+-            from cron.executions import give_up_execution
+-            from cron.scheduler_authority import pause_for_unknown
+-            pause_for_unknown(job["id"], execution_id, str(e))
+-            give_up_execution(execution_id, reason=str(e))
+-            logger.error("Cron %s paused with unverified admission: %s", job["id"], e)
++        from cron.scheduler_authority import settle_unbooked_fire
++        if settle_unbooked_fire(job, e, fire_owner, execution_id):  # [daveey] held or paused, not failed
+             return False
+         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
+         # Without mark_job_run(False) a finite one-shot is wedged: claim_dispatch consumed
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index eea00d6598a..1515bb98ca9 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -9,6 +9,48 @@ class CronExecutionUnknown(RuntimeError):
+     """The owner may have accepted this fire; never book it as failed or re-fire."""
+ 
+ 
++class CronFireNotAdmitted(RuntimeError):
++    """[daveey] No ready owner was reached and nothing was submitted (the gateway is draining for an
++    update, starting, or absent): a scheduled fire is held and stays due, never booked as a failed
++    run. Raised only before admission; a refusal after submit stays a definite failure."""
++
++    def __init__(self, message, state, reason_code=None):
++        super().__init__(message)
++        self.state, self.reason_code = state, reason_code
++
++
++# GatewayUnavailableError states that mean "not ready yet", not "this owner refuses the job".
++_NOT_READY_STATES = frozenset({'draining', 'starting', 'absent'})
++
++
++def settle_unbooked_fire(job, exc, fire_owner, execution_id):
++    """[daveey] Settle a fire that must not be booked as a failed run; True when it was handled.
++
++    - CronFireNotAdmitted on a scheduled fire: the gateway was not ready (an update's restart gap)
++      and nothing was submitted. The slot goes back on the schedule, the streak and last verdict
++      stay, and the ledger row records the non-admission. Manual fires still fail loudly.
++    - CronExecutionUnknown: the owner may have accepted it, so the job pauses for reconciliation.
++    Every other error returns False and takes the failed-run path."""
++    import logging
++    log = logging.getLogger('cron.scheduler')
++    if isinstance(exc, CronFireNotAdmitted) and job.get('_scheduled_instant'):
++        from cron.executions import finish_execution
++        from cron.jobs import release_unadmitted_fire
++        released = release_unadmitted_fire(
++            job['id'], job['_scheduled_instant'], str(exc), expected_fire_owner=fire_owner or None)
++        finish_execution(execution_id, success=False, error=str(exc), delivery_outcome='suppressed')
++        log.warning('Cron %s held (%s): %s', job['id'],
++                    'slot stays due' if released else 'claim moved on', exc)
++        return True
++    if isinstance(exc, CronExecutionUnknown):
++        from cron.executions import give_up_execution
++        pause_for_unknown(job['id'], execution_id, str(exc))
++        give_up_execution(execution_id, reason=str(exc))
++        log.error('Cron %s paused with unverified admission: %s', job['id'], exc)
++        return True
++    return False
++
++
+ def journal_path(job_id, request_id):
+     from hermes_constants import get_hermes_home
+     key = hashlib.sha256(json.dumps([job_id, request_id]).encode()).hexdigest()
+@@ -143,6 +185,14 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
+     except Exception as exc:
+         if attempted:
+             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
++        from hermes_cli.gateway_client import GatewayUnavailableError
++        if isinstance(exc, GatewayUnavailableError) and exc.state in _NOT_READY_STATES:
++            # The gate's probe said ready, then an update fenced the gateway before connect:
++            # nothing was submitted, so the fire is held for the next tick, not failed.
++            reason = exc.state + (f' ({exc.reason_code})' if exc.reason_code else '')
++            raise CronFireNotAdmitted(
++                f'Not admitted: the gateway is {reason}; the fire stays due: {exc}',
++                exc.state, exc.reason_code) from exc
+         error = f'{type(exc).__name__}: {exc}'
+         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
+ 
+diff --git a/cron/scheduler_gateway_gate.py b/cron/scheduler_gateway_gate.py
+index 8433472d1c4..0280101eefe 100644
+--- a/cron/scheduler_gateway_gate.py
++++ b/cron/scheduler_gateway_gate.py
+@@ -1,17 +1,20 @@
+-"""Headless tick gate: agent jobs need a live gateway; a headless tick never starts one.
+-
+-``run_canonical_job`` reaches the owner through ``connect_gateway`` → ``ensure_gateway_runtime``,
+-which spawns an unmanaged daemon when nothing owns the profile. That is right for an interactive
+-caller (``hermes cron run``) and wrong for ``hermes cron tick`` from a system crontab: every tick
+-would leave a stray gateway behind. Headless surfaces refuse rather than spawn (same policy as
+-approvals), so a headless tick skips its agent jobs while the gateway is down and lets them fire
+-on the next tick once it is up — no run is recorded and the due instant does not move. The
+-in-process ticker never reaches this gate: it runs inside the gateway by definition.
+-
+-"Down" is every outcome but ``ready``: a gateway still ``starting`` (or draining, or one whose
+-control socket does not answer) would otherwise send the tick into ``ensure_gateway_runtime``'s
+-30 s wait and book the deadline as a FAILED run, consuming the slot — the crontab minute is the
+-budget, and a slot lost to a restart window is a missed fire, not a job failure.
++"""Tick gate: agent jobs need a ready gateway; a tick outside the gateway holds them until there is one.
++
++``run_canonical_job`` reaches the owner through ``connect_gateway`` → ``ensure_gateway_runtime``.
++Every tick whose process has no gateway owner bound (``gateway.session_cron.owner_for_home``) dials
++out that way: the system-crontab ``hermes cron tick`` (headless) and the Desktop ``serve`` ticker,
++which takes over a store whenever no gateway pid owns it, including the seconds a ``hermes update``
++restarts the gateway. Only the gateway's own ticker admits in-process and skips this gate.
++
++"Not ready" is every outcome but ``ready``, plus a live update fence: ensure would answer
++``draining``/``update_paused`` (or wait a whole deadline on a ``starting`` owner) and the run would
++be booked FAILED, consuming the slot and growing ``failure_streak`` (hermes-hub 2026-10-29/30, cron
++6b4342ad83d9: three FAILED runs, one per update restart). Held agent jobs are not run, not failed,
++and their due instant does not move: they fire on the first tick that finds the gateway ready.
++
++``may_start``: an interactive owner (the Desktop ticker) may still let ensure start an ABSENT
++gateway outside an update. A headless tick never spawns one: every crontab tick would leave a stray
++daemon behind (headless surfaces refuse rather than spawn, the same policy as approvals).
+ """
+ import logging
+ import os
+@@ -22,24 +25,42 @@ GATEWAY_DOWN_HINT = (
+     "the gateway is not running, so agent jobs cannot fire; they run at the next tick once it is "
+     "up. Start it with `hermes gateway start` (or `hermes gateway install` for a service)."
+ )
++UPDATE_HINT = (
++    "a Hermes update is in progress (gateway update_paused), so agent jobs cannot fire; they run "
++    "at the first tick after the update."
++)
+ # A crontab tick has a minute; a gateway still starting answers within a few seconds or not at all.
+ _HEADLESS_PROBE_TIMEOUT_S = 5.0
+ 
+ 
+-def _gateway_unavailable(home) -> str | None:
+-    """Why a headless tick must hold its agent jobs, or None when a ready owner serves *home*.
+-    Everything short of ``ready`` — absent (``ensure`` would spawn), starting/draining (``ensure``
+-    would wait a whole deadline then fail the run), inaccessible/incompatible (no owner answers) —
+-    is held, never booked as a run."""
++def _update_in_progress(home) -> bool:
++    """The same update fence ``ensure_gateway_runtime`` consults (profile, process, install root)."""
++    from hermes_cli.gateway_runtime import _update_fenced
++    from hermes_constants import get_default_hermes_root, get_process_hermes_home
++
++    try:
++        return _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()})
++    except Exception:  # ensure judges an unreadable fence itself; never stop the tick here
++        logger.debug("update fence check failed for %s", home, exc_info=True)
++        return False
++
++
++def _gateway_unavailable(home, *, may_start: bool = False) -> str | None:
++    """Why this tick must hold its agent jobs, or None when they may dispatch. An update fence holds
++    (ensure answers update_paused even over a running gateway); otherwise ``ready`` dispatches,
++    ``absent`` dispatches only when *may_start*, and starting/draining/inaccessible/incompatible
++    hold (ensure would wait a whole deadline, or no owner answers), never booked as a run."""
+     from hermes_cli.gateway_runtime import discover_gateway_endpoint
+ 
+     if os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip():
+         return None  # explicit remote gateway: connect_gateway never spawns for it
++    if _update_in_progress(home):
++        return UPDATE_HINT
+     observed = discover_gateway_endpoint(home, timeout=_HEADLESS_PROBE_TIMEOUT_S)
+     if observed.state == "ready":
+         return None
+     if observed.state == "absent":
+-        return GATEWAY_DOWN_HINT
++        return None if may_start else GATEWAY_DOWN_HINT
+     reason = observed.state + (f" ({observed.reason_code})" if observed.reason_code else "")
+     return (f"the gateway is {reason}, so agent jobs cannot fire; they run at the next tick once it "
+             "is ready. Check it with `hermes gateway status`.")
+@@ -63,16 +84,16 @@ def _note_fire_refused(job_ids, detail: str) -> None:
+         save_jobs(jobs)
+ 
+ 
+-def refuse_agent_jobs_without_gateway(due_jobs: list) -> list:
+-    """Return the due jobs a headless tick may dispatch; agent jobs are held back (skipped, not
+-    failed) when no ready gateway serves this home. Logs once per tick, not once per job."""
++def refuse_agent_jobs_without_gateway(due_jobs: list, *, may_start: bool = False) -> list:
++    """Return the due jobs this tick may dispatch; agent jobs are held back (skipped, not failed)
++    when no ready gateway serves this home. Logs once per tick, not once per job."""
+     from hermes_constants import get_hermes_home
+ 
+     agent_jobs = [job for job in due_jobs if not job.get("no_agent")]
+     if not agent_jobs:
+         return due_jobs
+     home = get_hermes_home().resolve()
+-    hint = _gateway_unavailable(home)
++    hint = _gateway_unavailable(home, may_start=may_start)
+     if hint is None:
+         return due_jobs
+     ids = [str(job["id"]) for job in agent_jobs]
+@@ -81,3 +102,15 @@ def refuse_agent_jobs_without_gateway(due_jobs: list) -> list:
+         "Cron tick for %s skipped %d agent job(s) (%s): %s",
+         home, len(ids), ", ".join(ids), hint)
+     return [job for job in due_jobs if job.get("no_agent")]
++
++
++def tick_needs_gate(headless: bool) -> bool:
++    """True for every tick whose agent jobs would dial out: headless, or no gateway owner bound in
++    this process (the Desktop ``serve`` ticker, a standalone in-process ticker). Decided by the
++    owner binding itself rather than by which entry point ticks, so a new ticker path is gated."""
++    if headless:
++        return True
++    from gateway import session_cron
++    from hermes_constants import get_hermes_home
++
++    return session_cron.owner_for_home(get_hermes_home()) is None
+diff --git a/cron/scheduler_tick.py b/cron/scheduler_tick.py
+index e6858e90f78..159458a6c20 100644
+--- a/cron/scheduler_tick.py
++++ b/cron/scheduler_tick.py
+@@ -187,9 +187,12 @@ def _tick_admitted(
+ 
+         due_jobs = _sched.get_due_jobs()
+         _sched._sweep_stale_inflight_for_tick(due_jobs)
+-        if headless:
+-            from cron.scheduler_gateway_gate import refuse_agent_jobs_without_gateway
+-            due_jobs = refuse_agent_jobs_without_gateway(due_jobs)
++        # [daveey] Every tick that would dial the gateway (headless, or the Desktop serve ticker that
++        # takes over the store while an update restarts the gateway) holds agent jobs until it is
++        # ready; only the gateway's own ticker admits in-process and skips the probe.
++        from cron import scheduler_gateway_gate as _gw_gate
++        if due_jobs and _gw_gate.tick_needs_gate(headless):
++            due_jobs = _gw_gate.refuse_agent_jobs_without_gateway(due_jobs, may_start=not headless)
+ 
+         if not due_jobs:
+             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
+diff --git a/tests/cron/test_tick_gateway_not_ready.py b/tests/cron/test_tick_gateway_not_ready.py
+new file mode 100644
+index 00000000000..8712da6a0cb
+--- /dev/null
++++ b/tests/cron/test_tick_gateway_not_ready.py
+@@ -0,0 +1,267 @@
++"""A tick outside the gateway holds agent jobs while the gateway is not ready, on every tick path. [daveey]
++
++hermes-hub 2026-10-29/30 (cron 6b4342ad83d9): a Hermes update restarted the gateway, the Desktop
++``serve`` ticker took over the store inside the restart gap, dispatched an agent job, and
++``connect_gateway`` answered ``Gateway draining: update_paused``. ``run_canonical_job`` booked that
++as a FAILED run (failure_streak 3 over three updates). Only headless ticks had the "hold, fire next
++tick" gate. Now every tick whose agent jobs would dial out (no owner bound in this process) goes
++through the gate, and a refusal that races past the gate before admission is a held fire, not a
++failed run.
++"""
++from datetime import timedelta
++from contextlib import asynccontextmanager
++import threading
++
++import pytest
++
++import cron.jobs as J
++import cron.scheduler as S
++from cron import scheduler_authority, scheduler_gateway_gate
++
++
++@pytest.fixture
++def cron_home(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    (home / "cron").mkdir(parents=True)
++    (home / "scripts").mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
++    monkeypatch.setattr(J, "HERMES_DIR", home)
++    monkeypatch.setattr(J, "CRON_DIR", home / "cron")
++    monkeypatch.setattr(J, "JOBS_FILE", home / "cron" / "jobs.json")
++    monkeypatch.setattr(J, "OUTPUT_DIR", home / "cron" / "output")
++    monkeypatch.setattr(S, "_hermes_home", home)
++    monkeypatch.setattr(S, "_sweep_mcp_orphans", lambda: None)
++    monkeypatch.setattr("gateway.session_cron.owner_for_home", lambda home: None)
++    S._running_job_ids.clear()
++    return home
++
++
++def _due_agent_job(name="agent"):
++    job = J.create_job(prompt="summarise inbox", schedule="every 10m", name=name, deliver="local")
++    stored = J.load_jobs()
++    slot = (J._hermes_now() - timedelta(minutes=1)).replace(microsecond=0).isoformat()
++    next(r for r in stored if r["id"] == job["id"])["next_run_at"] = slot
++    J.save_jobs(stored)
++    return job["id"], slot
++
++
++def _stored(job_id):
++    return next(j for j in J.load_jobs() if j["id"] == job_id)
++
++
++def _gateway(monkeypatch, state, *, fenced=False, reason_code=None):
++    """What discovery/the update fence report for this home (ensure reads the same seams)."""
++    from hermes_cli import gateway_runtime
++    from hermes_cli.gateway_runtime import GatewayDiscovery
++
++    monkeypatch.setattr(gateway_runtime, "_update_fenced", lambda homes: fenced)
++    monkeypatch.setattr(gateway_runtime, "discover_gateway_endpoint",
++                        lambda home, timeout=2.0: GatewayDiscovery(state, reason_code=reason_code))
++
++
++def _assert_held(job_id, slot):
++    stored = _stored(job_id)
++    assert stored["last_run_at"] is None and stored["last_status"] is None
++    assert int(stored.get("failure_streak") or 0) == 0
++    assert stored["next_run_at"] == slot, "the slot stays due: it fires on the first ready tick"
++    assert stored.get("fire_claim") is None and "pending_slot" not in stored
++    assert stored["last_fire_error"]["detail"]
++    assert not (J.OUTPUT_DIR / job_id).exists() or not any((J.OUTPUT_DIR / job_id).iterdir()), \
++        "no FAILED output document for a fire that never reached the gateway"
++
++
++# --- (a) a non-headless tick (the Desktop serve ticker) during an update ---------------------------
++
++def test_desktop_tick_during_update_holds_agent_job_instead_of_failing_it(cron_home, monkeypatch):
++    """The live failure: gateway down for the update restart, update fence up. Before the fix the
++    tick dispatched, ensure answered draining/update_paused and the run was booked FAILED."""
++    _gateway(monkeypatch, "absent", fenced=True)
++    job_id, slot = _due_agent_job()
++
++    ran = S.tick(verbose=False)
++
++    assert ran == 0
++    _assert_held(job_id, slot)
++    assert "update" in _stored(job_id)["last_fire_error"]["detail"]
++
++
++def test_desktop_tick_holds_while_update_fence_stands_over_a_ready_gateway(cron_home, monkeypatch):
++    """The fence covers the whole update, not just the restart gap: ensure answers update_paused
++    for a still-running gateway too, so the tick holds then as well."""
++    _gateway(monkeypatch, "ready", fenced=True)
++    job_id, slot = _due_agent_job()
++
++    assert S.tick(verbose=False) == 0
++    _assert_held(job_id, slot)
++
++
++@pytest.mark.parametrize("state,reason", [("starting", None), ("draining", "update_paused"),
++                                          ("draining", "replaced")])
++def test_desktop_tick_holds_while_gateway_starting_or_draining(cron_home, monkeypatch, state, reason):
++    _gateway(monkeypatch, state, reason_code=reason)
++    job_id, slot = _due_agent_job()
++
++    assert S.tick(verbose=False) == 0
++    _assert_held(job_id, slot)
++
++
++def test_desktop_tick_may_still_start_an_absent_gateway(cron_home, monkeypatch):
++    """Desktop is an interactive owner: with no gateway and no update it still dispatches (connect
++    ensures one), unlike a headless crontab tick."""
++    _gateway(monkeypatch, "absent")
++    due = [{"id": "a", "prompt": "x"}, {"id": "s", "no_agent": True}]
++    assert scheduler_gateway_gate.refuse_agent_jobs_without_gateway(due, may_start=True) == due
++    assert scheduler_gateway_gate.refuse_agent_jobs_without_gateway(
++        [dict(j) for j in due], may_start=False) == [due[1]]
++
++
++# --- (b)/(c) the race between the gate's probe and the dispatch -----------------------------------
++
++def _bypass_gate(monkeypatch):
++    """The probe said ready; the update fence went up between the probe and connect."""
++    monkeypatch.setattr(scheduler_gateway_gate, "refuse_agent_jobs_without_gateway",
++                        lambda due, **_kw: due)
++
++
++def _connect_raising(monkeypatch, exc):
++    from hermes_cli import gateway_client
++
++    @asynccontextmanager
++    async def connect(*_a, **_k):
++        raise exc
++        yield
++
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++
++
++def test_run_canonical_job_refused_before_admission_is_not_fired(cron_home, monkeypatch):
++    from hermes_cli.gateway_client import GatewayUnavailableError
++
++    _connect_raising(monkeypatch, GatewayUnavailableError(
++        "Gateway draining: update_paused", "draining", "update_paused"))
++    with pytest.raises(scheduler_authority.CronFireNotAdmitted):
++        scheduler_authority.run_canonical_job({"id": "job"}, execution_id="fire")
++    assert not list((cron_home / "cron" / "admissions").glob("*.json")), "nothing was submitted"
++
++
++def test_update_refusal_racing_past_the_gate_keeps_job_due_and_streak_zero(cron_home, monkeypatch):
++    from hermes_cli.gateway_client import GatewayUnavailableError
++
++    _bypass_gate(monkeypatch)
++    _connect_raising(monkeypatch, GatewayUnavailableError(
++        "Gateway draining: update_paused", "draining", "update_paused"))
++    job_id, slot = _due_agent_job()
++
++    S.tick(verbose=False)
++
++    _assert_held(job_id, slot)
++    assert "update_paused" in _stored(job_id)["last_fire_error"]["detail"]
++    from cron.executions import latest_execution
++    row = latest_execution(job_id)
++    assert row["status"] == "failed" and row["error"].startswith("Not admitted")
++
++
++def test_definite_gateway_fault_before_admission_is_still_a_failure(cron_home, monkeypatch):
++    """Only not-ready states are held; an owner that refuses for a real fault fails the run."""
++    from hermes_cli.gateway_client import GatewayUnavailableError
++
++    _bypass_gate(monkeypatch)
++    _connect_raising(monkeypatch, GatewayUnavailableError(
++        "Gateway inaccessible: control_owner", "inaccessible", "control_owner"))
++    job_id, _slot = _due_agent_job()
++
++    S.tick(verbose=False)
++
++    stored = _stored(job_id)
++    assert stored["last_status"] == "error" and stored["failure_streak"] == 1
++
++
++def test_refusal_after_admission_still_increments_the_streak(cron_home, monkeypatch):
++    from hermes_cli import gateway_client
++
++    class Peer:
++        async def rpc(self, method, **params):
++            if method == "cron.submit":
++                raise gateway_client.GatewayRPCError("owner refused", None, {})
++            assert method == "cron.recover"
++            return {"status": "missing"}
++
++    @asynccontextmanager
++    async def connect(*_a, **_k):
++        yield Peer()
++
++    _bypass_gate(monkeypatch)
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    job_id, _slot = _due_agent_job()
++
++    S.tick(verbose=False)
++
++    stored = _stored(job_id)
++    assert stored["last_status"] == "error" and stored["failure_streak"] == 1
++
++
++# --- detection guard: every ticker entry point goes through the gate ------------------------------
++
++@pytest.fixture
++def gate_calls(cron_home, monkeypatch):
++    calls = []
++
++    def record(due, *, may_start=False):
++        calls.append(may_start)
++        return [j for j in due if j.get("no_agent")]  # hold everything: nothing dispatches
++
++    monkeypatch.setattr(scheduler_gateway_gate, "refuse_agent_jobs_without_gateway", record)
++    monkeypatch.setattr(scheduler_authority, "reconcile_pending", lambda **_k: None)
++    _due_agent_job()
++    return calls
++
++
++def _one_cycle(monkeypatch):
++    stop = threading.Event()
++    real = J.record_ticker_heartbeat
++
++    def beat(*a, **k):
++        real(*a, **k)
++        if k.get("success") is not None or a:
++            stop.set()  # the loop's per-iteration heartbeat: one tick cycle has run
++
++    monkeypatch.setattr(J, "record_ticker_heartbeat", beat)
++    return stop
++
++
++def test_guard_hermes_cron_tick_is_gated_headless(gate_calls):
++    from hermes_cli.cron import cron_tick
++
++    cron_tick()
++    assert gate_calls == [False]
++
++
++def test_guard_single_store_ticker_without_owner_is_gated(gate_calls, monkeypatch):
++    from cron.scheduler_provider import InProcessCronScheduler
++
++    InProcessCronScheduler().start(_one_cycle(monkeypatch), interval=0)
++    assert gate_calls == [True]
++
++
++def test_guard_desktop_ticker_is_gated(gate_calls, cron_home, monkeypatch):
++    """The real ``_start_desktop_cron_ticker`` path (multiplex ticker over served profiles)."""
++    from hermes_cli import profiles, web_server
++
++    monkeypatch.setattr(profiles, "profiles_to_serve", lambda **_k: [("default", cron_home)])
++    monkeypatch.setattr(web_server, "_gateway_owns_cron", lambda name, home: False)
++    monkeypatch.setattr("hermes_logging.enable_profile_log_routing", lambda homes: None)
++
++    web_server._start_desktop_cron_ticker(_one_cycle(monkeypatch), interval=0)
++    assert gate_calls == [True]
++
++
++def test_guard_gateway_hosted_tick_skips_the_gate(gate_calls, cron_home, monkeypatch):
++    """Inside the gateway the job is admitted in-process (owner bound): no probe, no hold."""
++    from cron.scheduler_provider import InProcessCronScheduler
++
++    monkeypatch.setattr("gateway.session_cron.owner_for_home", lambda home: (object(), object()))
++    monkeypatch.setattr(S, "_submit_with_guard", lambda job, pool, fn: None)
++
++    InProcessCronScheduler().start(_one_cycle(monkeypatch), interval=0)
++    assert gate_calls == []
+-- 
+2.55.0
+

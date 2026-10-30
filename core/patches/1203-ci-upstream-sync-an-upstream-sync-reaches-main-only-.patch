@@ -1,0 +1,1114 @@
+From 29953696677a3242410d6b9814b6115c6f058213 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 08:16:34 +0000
+Subject: [PATCH] ci(upstream-sync): an upstream sync reaches main only after a
+ full suite on the fork's runners [daveey]
+
+The 10-29 sync (1a221b37e16 -> 39ac60111ad) was pushed straight to main; main's busy-branch
+concurrency cancelled both push runs, so upstream's new tests first ran on the fork's runners an
+hour later and failed there (tmux). The updater's fork_merge_upstream path pushed main the same way.
+
+- scripts/ci/upstream_sync.py: the gate. Stages a candidate on sync/upstream-<sha>; lands only a
+  head whose upstream-sync.yml run completed green with both Python slices and e2e succeeding on
+  self-hosted runners at exactly that sha (ff, else a non-forced merge commit). Refuses red,
+  pending or unreadable evidence; one candidate in CI at a time; 6 h backoff after a red run;
+  lands other hosts' green candidates; twins of a landed sync are not restaged.
+- .github/workflows/upstream-sync.yml: full suite per candidate, own run_id concurrency group
+  (never cancelled by main).
+- hermes update (fork_merge_upstream): the off-tree merge is handed to the gate; the live tree
+  no longer moves to an untested merge. The strictly-behind push goes through the gate too.
+- scripts/check --commit (the pre-push hook): refuses any branch push that brings upstream
+  commits the fork's main lacks, unless the gate pushes it. Live in installed hooks without
+  reinstall (the hook runs the pushed tree's scripts/check).
+
+Tests: real bare remotes and real pytest verdicts (red refused, green lands), the updater path
+through the real gate subprocess, and the pre-push hook refusing a hand-pushed sync.
+Card t_01a18bb880ab1f28.
+---
+ .github/workflows/upstream-sync.yml           |  30 ++
+ hermes_cli/update_cmd_git.py                  |  56 +++-
+ scripts/check                                 |  13 +
+ scripts/ci/upstream_sync.py                   | 290 ++++++++++++++++
+ .../test_update_fetch_failure_classifier.py   |  11 +-
+ .../test_update_fork_merge_upstream.py        |  71 ++--
+ .../test_update_fork_sync_identity.py         |  10 +-
+ tests/hermes_cli/upstream_gate_fake.py        |  74 +++++
+ tests/scripts/ci/test_upstream_sync.py        | 311 ++++++++++++++++++
+ tests/scripts/test_code_health_cli.py         |  38 +++
+ 10 files changed, 868 insertions(+), 36 deletions(-)
+ create mode 100644 .github/workflows/upstream-sync.yml
+ create mode 100644 scripts/ci/upstream_sync.py
+ create mode 100644 tests/hermes_cli/upstream_gate_fake.py
+ create mode 100644 tests/scripts/ci/test_upstream_sync.py
+
+diff --git a/.github/workflows/upstream-sync.yml b/.github/workflows/upstream-sync.yml
+new file mode 100644
+index 00000000000..b7042e25362
+--- /dev/null
++++ b/.github/workflows/upstream-sync.yml
+@@ -0,0 +1,30 @@
++name: Upstream sync full suite
++
++# The evidence scripts/ci/upstream_sync.py requires before an upstream sync may reach main:
++# the full suite (both Python slices + e2e) on the fork's own self-hosted runners, at exactly
++# the candidate's head. The gate stages each candidate on sync/upstream-<sha>; nothing else
++# should push these branches.
++on:
++  push:
++    branches: ['sync/upstream-*']
++
++permissions:
++  contents: read
++
++# Every candidate has its own immutable SHA branch. A main push, another sync,
++# or a rerun cannot supersede this evidence before publication (main's busy-branch
++# concurrency cancelled both push runs of the 10-29 sync).
++concurrency:
++  group: upstream-sync-${{ github.run_id }}
++  cancel-in-progress: false
++
++jobs:
++  full-suite:
++    name: Full suite
++    uses: ./.github/workflows/tests.yml
++    with:
++      commit: ${{ github.sha }}
++      python_changed: ''
++      python_slices: '[1, 2]'
++      e2e: true
++      e2e_upgrade: false
+diff --git a/hermes_cli/update_cmd_git.py b/hermes_cli/update_cmd_git.py
+index 3611c4758b6..55a889e667d 100644
+--- a/hermes_cli/update_cmd_git.py
++++ b/hermes_cli/update_cmd_git.py
+@@ -330,9 +330,32 @@ def _mark_skip_upstream_prompt():
+         (get_hermes_home() / SKIP_UPSTREAM_PROMPT_FILE).touch()
+ 
+ 
+-def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
+-    """Push updated main to origin (sync fork); True on success."""
+-    return _git_ok(git_cmd, ["push", "origin", "main", "--force-with-lease"], cwd, network=True)
++def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path, head: str = "HEAD") -> bool:
++    """Hand an upstream sync to the fork's CI gate; True only when it is on the fork's main.
++
++    ``scripts/ci/upstream_sync.py`` (the checkout's own copy) stages ``head`` on
++    ``sync/upstream-<sha>`` and lands it on main only once the full suite went green on the fork's
++    runners at exactly that commit. Main is never pushed here directly: an untested sync that reached
++    main this way first ran upstream's new tests on runners that lacked upstream's image (10-29 tmux).
++    """
++    from hermes_cli.update_custody import run as custody_run
++    gate = Path(cwd) / "scripts" / "ci" / "upstream_sync.py"
++    if not gate.is_file():
++        print("  ✗ Upstream sync refused: this checkout has no scripts/ci/upstream_sync.py gate")
++        return False
++    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"}
++    if os.path.isabs(git_cmd[0]):  # the gate runs plain `git`: the updater's resolved one first
++        env["PATH"] = os.pathsep.join((os.path.dirname(git_cmd[0]), env.get("PATH", "")))
++    try:
++        proc = custody_run([sys.executable, str(gate), "--repo", str(cwd), "--head", head], cwd=cwd, env=env,
++                           stdin=subprocess.DEVNULL, timeout=900, capture_output=True, text=True,
++                           encoding="utf-8", errors="replace", creationflags=windows_hide_flags())
++    except (OSError, subprocess.SubprocessError) as exc:
++        print(f"  ✗ Upstream sync gate failed to run: {exc}")
++        return False
++    for line in (proc.stdout or proc.stderr or "").strip().splitlines()[-4:]:
++        print(f"    {line}")
++    return proc.returncode == 0
+ 
+ 
+ def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, input_fn) -> bool:
+@@ -389,7 +412,8 @@ def _synthesize_upstream_merge(git_cmd: list[str], cwd: Path, upstream: str) ->
+                                    cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False).stdout.splitlines()[1:]
+         print("  ✗ Upstream does not merge cleanly into your fork — nothing changed.\n"
+               "    Conflicting paths: " + (", ".join(p for p in conflicts if p.strip())[:400] or "?") + "\n"
+-              "    Resolve by hand: git merge upstream/main, fix, commit, git push origin main")
++              "    Resolve by hand: merge upstream/main on a branch, fix, commit, then land it with\n"
++              "    python3 scripts/ci/upstream_sync.py --head <merge sha>  (never a direct push to main)")
+         return None
+     msg = f"Merge upstream/main ({upstream[:10]}) into fork"
+     commit = _git_stdout(git_cmd, ["commit-tree", tree, "-p", head, "-p", upstream, "-m", msg], cwd)
+@@ -454,14 +478,20 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes:
+                 "  (or set updates.fork_merge_upstream: true to merge on every update)"
+             )
+             return True
+-        # updates.fork_merge_upstream: carry the fork's commits forward by merging upstream into HEAD.
+-        # The merge is computed off-tree (merge-tree + commit-tree), so the live checkout only ever
+-        # fast-forwards — the same custody path as a plain upstream pull — and a conflict moves nothing.
++        # updates.fork_merge_upstream: carry the fork's commits forward by merging upstream into the fork.
++        # The merge is built off-tree (merge-tree + commit-tree) and handed to the fork's CI gate; the
++        # live checkout does not move to it. It arrives through the normal origin pull once the full
++        # suite passed on the fork's runners and the gate landed it on main.
+         merged = _synthesize_upstream_merge(git_cmd, cwd, upstream)
+         if merged is None:
+             return False
+-        target = merged
+-        print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Merging upstream into the fork ({target[:10]})...")
++        print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n"
++              f"→ Handing the upstream merge ({merged[:10]}) to the fork's CI gate...")
++        if _sync_fork_with_upstream(git_cmd, cwd, merged):
++            print("  ✓ An upstream sync that passed the fork's full suite is on main; the next update pulls it")
++        else:
++            print("  ℹ Upstream sync not on main yet (staged, in CI, or refused above); main is unchanged")
++        return True
+     elif upstream_ahead == 0:
+         print("  ✓ Fork is up to date with upstream")
+         return True
+@@ -531,13 +561,13 @@ def _push_synced_fork(git_cmd: list[str], cwd: Path) -> None:
+         return
+     if origin and not _git_ok(git_cmd, ["merge-base", "--is-ancestor", origin, head], cwd):
+         return
+-    print("→ Syncing fork...")
++    print("→ Syncing fork through its CI gate...")
+     if _sync_fork_with_upstream(git_cmd, cwd):
+-        print("  ✓ Fork synced with upstream")
++        print("  ✓ Fork synced with upstream (full suite green on the fork's runners)")
+     else:
+         print(
+-            "  ℹ Got updates from upstream but couldn't push to fork (no write access?)\n"
+-            "    Your local repo is updated, but your fork on GitHub may be behind."
++            "  ℹ Your local repo has upstream's commits; the fork's main gets them once the gate lands\n"
++            "    them (full suite on the fork's runners). The next update checks again."
+         )
+ 
+ 
+diff --git a/scripts/check b/scripts/check
+index 28fd28cf1ac..54089a13ffe 100755
+--- a/scripts/check
++++ b/scripts/check
+@@ -276,6 +276,17 @@ def _selected(parser: argparse.ArgumentParser, only: str | None) -> list[str]:
+     return [name for name in _CHECKS if name in wanted]
+ 
+ 
++def _upstream_sync_refused(rev: str) -> bool:
++    """Pre-push (``--commit``): an untested upstream sync goes through scripts/ci/upstream_sync.py.
++
++    The hook judges every pushed branch with that commit's own scripts/check, so this guard is live
++    in every installed hook without reinstalling it.
++    """
++    from scripts.ci.upstream_sync import guard_push
++
++    return guard_push(Path.cwd(), rev) != 0
++
++
+ def main(argv: list[str] | None = None) -> int:
+     parser = argparse.ArgumentParser(prog="scripts/check", description=__doc__,
+                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+@@ -294,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
+         return install_hook(args.install_hook)
+     if args.uninstall_hook:
+         return uninstall_hooks()
++    if args.commit and _upstream_sync_refused(args.commit):
++        return 1
+     try:
+         results = _run_all(args)
+     except RuntimeError as exc:
+diff --git a/scripts/ci/upstream_sync.py b/scripts/ci/upstream_sync.py
+new file mode 100644
+index 00000000000..a72d5695fdc
+--- /dev/null
++++ b/scripts/ci/upstream_sync.py
+@@ -0,0 +1,290 @@
++#!/usr/bin/env python3
++"""The only way an upstream sync reaches the fork's main: a full suite on the fork's runners first.
++
++    python3 scripts/ci/upstream_sync.py --head REV      # stage, or land once green, one candidate
++    python3 scripts/ci/upstream_sync.py                 # only land staged candidates that went green
++
++A candidate X (a commit that brings upstream/main commits into the fork) is pushed to its own
++branch ``sync/upstream-<X>``. ``.github/workflows/upstream-sync.yml`` runs the full suite there
++(both Python slices and e2e, self-hosted, never cancelled by main's concurrency). Only an X whose
++run completed green, with every required job succeeding on a self-hosted runner at exactly X, is
++landed: a fast-forward when main has not moved, else a non-forced merge commit (main, X). Nothing
++is ever force-pushed. Red, pending or unreadable evidence is a refusal.
++
++Each call also lands any earlier staged candidate that went green (hosts that merged upstream at
++different times converge on one tested sync), keeps at most one candidate in CI, and stops staging
++for RED_BACKOFF_S after a red run so a broken upstream does not loop full suites.
++
++Exit codes: 0 landed (or already on main), 1 refused (red, conflict, error), 2 not yet (staged,
++pending, throttled): run it again with the same head after CI finishes.
++
++The pre-push hook (``scripts/check --install-hook pre-push``, through ``scripts/check --commit``) runs
++``guard_push``: a push of any branch that brings upstream commits the fork's main lacks is refused
++unless this gate is the one pushing.
++"""
++from __future__ import annotations
++
++import argparse
++import calendar
++import json
++import os
++import re
++import shutil
++import subprocess
++import sys
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++WORKFLOW_FILE = "upstream-sync.yml"
++WORKFLOW_PATH = f".github/workflows/{WORKFLOW_FILE}"
++BRANCH_PREFIX = "sync/upstream-"
++# The job names tests.yml gives the full suite (called as job "Full suite"); all must succeed.
++REQUIRED_JOBS = ("Run tests (1/2)", "Run tests (2/2)", "e2e")
++RED_BACKOFF_S = 6 * 3600
++STALE_PENDING_S = 6 * 3600  # a run queued this long never got runners: it no longer holds the slot
++# Set on the gate's own pushes; the pre-push guard lets exactly those through.
++GATE_ENV = "HERMES_UPSTREAM_SYNC_GATE"
++UPSTREAM_REF = "refs/remotes/upstream/main"
++
++LANDED, REFUSED, NOT_YET = 0, 1, 2
++
++
++class GateError(Exception):
++    pass
++
++
++def _run(repo, *args, env=None):
++    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
++                          env=env, timeout=600, check=False)
++
++
++def git(repo, *args, env=None) -> str:
++    proc = _run(repo, *args, env=env)
++    if proc.returncode:
++        raise GateError(f"git {' '.join(args[:2])} failed: {(proc.stderr or proc.stdout).strip()[-300:]}")
++    return proc.stdout.strip()
++
++
++def _is_ancestor(repo, sha, of) -> bool:
++    return _run(repo, "merge-base", "--is-ancestor", sha, of).returncode == 0
++
++
++def _gate_env(stage: str) -> dict:
++    return {**os.environ, GATE_ENV: stage, "GIT_TERMINAL_PROMPT": "0"}
++
++
++def github_pages(endpoint):
++    """Every page of a GitHub API GET: the logged-in gh, else the broker's ``user/github`` scope."""
++    argv = ["gh", "api", "--paginate", "--slurp", endpoint]
++    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=120, check=False)
++    broker = shutil.which("token-broker") or str(Path.home() / ".local/bin/token-broker")
++    if proc.returncode and Path(broker).exists():
++        proc = subprocess.run([broker, "exec", "--scope", "user/github", "--reason",
++                               "upstream sync gate: read fork CI evidence", "--", *argv], encoding="utf-8",
++                              capture_output=True, text=True, timeout=180, check=False)
++    if proc.returncode:
++        raise GateError(f"GitHub API read failed: {(proc.stderr or proc.stdout).strip()[-300:]}")
++    return json.loads(proc.stdout)
++
++
++@dataclass
++class Candidate:
++    head: str
++    status: str  # green | red | pending
++    url: str
++    updated_at: float
++
++
++def _ts(value) -> float:
++    return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")) if value else 0.0
++
++
++def _jobs_green(gh_repo, run_id, request) -> bool:
++    pages = request(f"repos/{gh_repo}/actions/runs/{run_id}/jobs?per_page=100&filter=latest")
++    jobs = {job["name"].rsplit(" / ", 1)[-1]: job for page in pages for job in page["jobs"]}
++    return all(name in jobs and jobs[name]["status"] == "completed"
++               and jobs[name]["conclusion"] == "success"
++               and "self-hosted" in (jobs[name].get("labels") or []) and jobs[name].get("runner_name")
++               for name in REQUIRED_JOBS)
++
++
++def candidates(gh_repo, request) -> dict[str, Candidate]:
++    """Each staged candidate's newest verdict, keyed by head sha."""
++    pages = request(f"repos/{gh_repo}/actions/workflows/{WORKFLOW_FILE}/runs?event=push&per_page=50")
++    runs = sorted((r for page in pages for r in page["workflow_runs"]), key=lambda r: (r.get("run_number", 0), r["id"]))
++    found: dict[str, Candidate] = {}
++    for run in runs:  # oldest first: a later run on the same head replaces the earlier verdict
++        head = run["head_sha"]
++        if run["head_branch"] != BRANCH_PREFIX + head or run["path"] != WORKFLOW_PATH or run["event"] != "push":
++            continue  # evidence counts only from the candidate's own branch and this workflow
++        if run["status"] != "completed":
++            status = "pending"
++        elif run["conclusion"] == "success":
++            status = "green" if _jobs_green(gh_repo, run["id"], request) else "red"
++        elif run["conclusion"] in ("cancelled", "skipped", "stale"):
++            continue  # never reached a verdict: neither evidence nor a failure
++        else:
++            status = "red"
++        found[head] = Candidate(head, status, run["html_url"], _ts(run.get("updated_at") or run.get("created_at")))
++    return found
++
++
++def _fetch_main(repo) -> str:
++    git(repo, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
++    return git(repo, "rev-parse", "refs/remotes/origin/main")
++
++
++def _adds_nothing(repo, head, main) -> bool:
++    """Merging ``head`` into ``main`` changes no file (a twin of a sync that already landed)."""
++    tree = _run(repo, "merge-tree", "--write-tree", "--no-messages", main, head)
++    return tree.returncode == 0 and tree.stdout.split("\n", 1)[0].strip() == git(repo, "rev-parse", f"{main}^{{tree}}")
++
++
++def land(repo, cand: Candidate) -> int:
++    """Put the tested head on main without force: a fast-forward, or a merge commit (main, head)."""
++    main = _fetch_main(repo)
++    if _is_ancestor(repo, cand.head, main):
++        return LANDED
++    target = cand.head
++    if not _is_ancestor(repo, main, cand.head):
++        if _adds_nothing(repo, cand.head, main):
++            return LANDED  # main already holds everything it brings (a newer sync landed first)
++        tree = _run(repo, "merge-tree", "--write-tree", "--no-messages", main, cand.head)
++        tree_sha = (tree.stdout or "").split("\n", 1)[0].strip()
++        if tree.returncode or not tree_sha:
++            print(f"REFUSED: tested sync {cand.head[:10]} conflicts with main {main[:10]}; stage a new candidate")
++            return REFUSED
++        target = git(repo, "commit-tree", tree_sha, "-p", main, "-p", cand.head, "-m",
++                     f"Merge tested upstream sync {cand.head[:10]} into main\n\nFull suite: {cand.url}")
++    push = _run(repo, "push", "-q", "origin", f"{target}:refs/heads/main", env=_gate_env("publish"))
++    if push.returncode:
++        print(f"NOT YET: main moved during publication; run again ({(push.stderr or '').strip()[-200:]})")
++        return NOT_YET
++    _run(repo, "update-ref", "refs/remotes/origin/main", target)
++    # The run (and its verdict) outlives the branch; best effort, a leftover branch is harmless.
++    _run(repo, "push", "-q", "origin", f":refs/heads/{BRANCH_PREFIX}{cand.head}", env=_gate_env("stage"))
++    print(f"LANDED {cand.head} on main as {target}; full suite: {cand.url}")
++    return LANDED
++
++
++def _land_other_greens(repo, found, head, main) -> bool:
++    landed = False
++    for cand in found.values():
++        if cand.status == "green" and cand.head != head and not _is_ancestor(repo, cand.head, main):
++            landed = land(repo, cand) == LANDED or landed
++    return landed
++
++
++def _upstream_point(repo, sha) -> str | None:
++    """The newest upstream/main commit ``sha`` contains; None when unknown (treated as a match)."""
++    if _run(repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode:
++        _run(repo, "fetch", "-q", "origin", f"refs/heads/{BRANCH_PREFIX}{sha}")
++    point = _run(repo, "merge-base", sha, UPSTREAM_REF)
++    return point.stdout.strip() if point.returncode == 0 and point.stdout.strip() else None
++
++
++def _stage_or_wait(repo, head, found, now) -> int:
++    pending = [c for c in found.values() if c.status == "pending" and now - c.updated_at < STALE_PENDING_S]
++    if pending:
++        print(f"NOT YET: another sync candidate is in CI ({pending[0].url}); not staging {head[:10]}")
++        return NOT_YET
++    red = [c for c in found.values() if c.status == "red" and now - c.updated_at < RED_BACKOFF_S
++           and _upstream_point(repo, c.head) in (None, _upstream_point(repo, head))]
++    if red:
++        print(f"NOT YET: a sync candidate with the same upstream failed its full suite within "
++              f"{RED_BACKOFF_S // 3600} h ({red[0].url}); not staging {head[:10]} until upstream moves, "
++              "the backoff ends, or the red candidate is rerun green")
++        return NOT_YET
++    git(repo, "push", "-q", "origin", f"{head}:refs/heads/{BRANCH_PREFIX}{head}", env=_gate_env("stage"))
++    print(f"NOT YET: staged {head} as {BRANCH_PREFIX}{head}; it lands once its full suite is green")
++    return NOT_YET
++
++
++def advance(repo: Path, head: str | None, *, gh_repo: str, request=github_pages, now=None) -> int:
++    """Land green candidates, then report ``head``'s state or stage it (module doc, exit codes)."""
++    now = time.time() if now is None else now
++    try:
++        if head is not None:
++            head = git(repo, "rev-parse", "--verify", f"{head}^{{commit}}")
++        found = candidates(gh_repo, request)
++        landed_other = _land_other_greens(repo, found, head, _fetch_main(repo))
++        if head is None:
++            return LANDED if landed_other else NOT_YET
++        main = _fetch_main(repo)
++        if _is_ancestor(repo, head, main) or _adds_nothing(repo, head, main):
++            print(f"LANDED: main already has everything {head[:10]} brings")
++            return LANDED
++        cand = found.get(head)
++        if cand is None:
++            return _stage_or_wait(repo, head, found, now)
++        if cand.status == "green":
++            return land(repo, cand)
++        if cand.status == "red":
++            print(f"REFUSED: the full suite failed on {head[:10]}: {cand.url}")
++            return REFUSED
++        print(f"NOT YET: the full suite is still running on {head[:10]}: {cand.url}")
++        return NOT_YET
++    except (GateError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
++        print(f"REFUSED: upstream sync evidence/publication failed: {exc}")
++        return REFUSED
++
++
++def brings_upstream(repo, sha, base) -> bool:
++    """``sha`` contains upstream/main commits that ``base`` (the fork's main) lacks."""
++    upstream = _run(repo, "rev-parse", "-q", "--verify", f"{UPSTREAM_REF}^{{commit}}").stdout.strip()
++    if not upstream:
++        return False
++    newest = _run(repo, "merge-base", sha, upstream).stdout.strip()
++    return bool(newest) and not (base and _is_ancestor(repo, newest, base))
++
++
++def guard_push(repo, sha) -> int:
++    """Pre-push: refuse a push that brings upstream/main commits the fork's main lacks.
++
++    Only this gate (stage/publish) may push such a commit; the pushed branch does not matter, as a
++    branch carrying an untested sync reaches main by a PR merge just the same.
++    """
++    if os.environ.get(GATE_ENV) in ("publish", "stage"):
++        return 0
++    base = _run(repo, "rev-parse", "-q", "--verify", "refs/remotes/origin/main").stdout.strip()
++    if not brings_upstream(repo, sha, base):
++        return 0
++    # A stale origin/main (a sync landed since the last fetch) must not refuse a branch built on it.
++    if _run(repo, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main").returncode == 0:
++        base = _run(repo, "rev-parse", "-q", "--verify", "refs/remotes/origin/main").stdout.strip()
++        if not brings_upstream(repo, sha, base):
++            return 0
++    print(f"upstream sync guard: {sha[:10]} brings upstream/main commits that the fork's main lacks.\n"
++          "  An upstream sync lands only after a full suite on the fork's own runners. Run instead:\n"
++          f"    python3 scripts/ci/upstream_sync.py --head {sha[:12]}", file=sys.stderr)
++    return 1
++
++
++def origin_slug(repo) -> str:
++    # The configured URL, not `remote get-url`'s insteadOf-rewritten one: it names the GitHub repo.
++    url = git(repo, "config", "--get", "remote.origin.url")
++    match = re.fullmatch(r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)([^/]+/[^/]+?)(?:\.git)?/?", url)
++    if not match:
++        raise GateError(f"the upstream sync gate needs a GitHub origin, not {url}")
++    return match[1]
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--repo", type=Path, default=Path.cwd())
++    parser.add_argument("--head", help="candidate commit; omitted: only land staged candidates that went green")
++    parser.add_argument("--guard-push", metavar="SHA", help="pre-push check (scripts/check --commit runs it)")
++    args = parser.parse_args(argv)
++    if args.guard_push:
++        return guard_push(args.repo, args.guard_push)
++    try:
++        slug = origin_slug(args.repo)
++    except GateError as exc:
++        print(f"REFUSED: {exc}")
++        return REFUSED
++    return advance(args.repo, args.head, gh_repo=slug)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_update_fetch_failure_classifier.py b/tests/hermes_cli/test_update_fetch_failure_classifier.py
+index 1dd9440573d..9fbf7426a0f 100644
+--- a/tests/hermes_cli/test_update_fetch_failure_classifier.py
++++ b/tests/hermes_cli/test_update_fetch_failure_classifier.py
+@@ -190,13 +190,20 @@ def test_update_and_upstream_network_calls_disable_terminal_prompts(monkeypatch,
+     assert update_cmd_git._sync_with_upstream_if_needed(["git"], tmp_path, assume_yes=True)
+     from hermes_cli.update_custody import git_subcommand
+ 
+-    # The fork push runs only after the update is validated (_push_synced_fork), never inside the sync.
++    # The fork sync runs only after the update is validated (_push_synced_fork), never inside the sync,
++    # and only through the fork's CI gate (scripts/ci/upstream_sync.py), never a direct push to main.
++    (tmp_path / "scripts" / "ci").mkdir(parents=True)
++    (tmp_path / "scripts" / "ci" / "upstream_sync.py").write_text("")
+     update_cmd_git._sync_fork_with_upstream(["git"], tmp_path)
+     # The fork's fast-forward is local (`merge --ff-only` after the fetch): no credential helper ever
+     # runs under the checkout lock fd a mutator inherits (R2).
+     network = [(args, kwargs) for args, kwargs in calls if git_subcommand(args) in {"fetch", "pull", "push", "merge"}]
+-    assert [git_subcommand(args) for args, _ in network] == ["fetch", "fetch", "merge", "push"]
++    assert [git_subcommand(args) for args, _ in network] == ["fetch", "fetch", "merge"]
+     assert network[2][0][-1] == upstream  # the counted commit, not a name a local branch can shadow
++    [gate] = [(args, kwargs) for args, kwargs in calls if args and str(args[0]).endswith("upstream_sync.py")]
++    assert gate[0][1:] == ["--repo", str(tmp_path), "--head", "HEAD"]
++    assert not gate[1].get("pass_fds")  # the gate's fetch/push never hold the update's lock fd
++    network.append(gate)
+     for args, kwargs in network:
+         assert kwargs["stdin"] is subprocess.DEVNULL, args
+         env = kwargs["env"]
+diff --git a/tests/hermes_cli/test_update_fork_merge_upstream.py b/tests/hermes_cli/test_update_fork_merge_upstream.py
+index f86de08195b..93b8dda1f0c 100644
+--- a/tests/hermes_cli/test_update_fork_merge_upstream.py
++++ b/tests/hermes_cli/test_update_fork_merge_upstream.py
+@@ -1,27 +1,41 @@
+-"""Functional test: fork with own commits + updates.fork_merge_upstream merges upstream via ff of a synthesized merge."""
++"""Functional test: fork with own commits + updates.fork_merge_upstream hands a synthesized merge to the CI gate.
++
++The merge never moves the live checkout and never reaches the fork's main untested: the real gate script
++(scripts/ci/upstream_sync.py, in a subprocess) stages it on sync/upstream-<sha>, refuses it red, lands it green.
++"""
+ import subprocess
+-from pathlib import Path
+ from unittest import mock
++
++import pytest
++
+ import hermes_cli.update_cmd_git as g
++from tests.hermes_cli.upstream_gate_fake import FakeFork
++
+ 
+ def sh(*a, cwd=None):
+     return subprocess.run(a, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+ 
+-def mkrepo(tmp):
+-    up = tmp / "up"; up.mkdir(); sh("git", "init", "-q", "-b", "main", cwd=up)
++
++@pytest.fixture
++def repo(tmp_path, monkeypatch):
++    up = tmp_path / "up"; up.mkdir(); sh("git", "init", "-q", "-b", "main", cwd=up)
+     for k, v in {"user.email": "t@t", "user.name": "t"}.items(): sh("git", "config", k, v, cwd=up)
+     (up / "a.txt").write_text("a\n"); (up / "b.txt").write_text("b\n")
+     sh("git", "add", "-A", cwd=up); sh("git", "commit", "-qm", "base", cwd=up)
+-    fork = tmp / "fork.git"; sh("git", "clone", "-q", "--bare", str(up), str(fork))
+-    live = tmp / "live"; sh("git", "clone", "-q", str(fork), str(live))
++    fork = tmp_path / "fork.git"; sh("git", "clone", "-q", "--bare", str(up), str(fork))
++    gate = FakeFork(tmp_path, monkeypatch, fork)
++    live = tmp_path / "live"; sh("git", "clone", "-q", str(fork), str(live))
+     for k, v in {"user.email": "t@t", "user.name": "t"}.items(): sh("git", "config", k, v, cwd=live)
+     sh("git", "remote", "add", "upstream", str(up), cwd=live)
+     (live / "a.txt").write_text("a fork\n"); sh("git", "commit", "-qam", "fork change", cwd=live); sh("git", "push", "-q", "origin", "main", cwd=live)
+-    return up, fork, live
++    gate.adopt(live)
++    return up, fork, live, gate
+ 
+-def run(live, merge_flag, upstream_edit):
++
++def run(live, merge_flag, upstream_edit=None):
+     up = live.parent / "up"
+-    (up / upstream_edit[0]).write_text(upstream_edit[1]); sh("git", "commit", "-qam", "upstream change", cwd=up)
++    if upstream_edit:
++        (up / upstream_edit[0]).write_text(upstream_edit[1]); sh("git", "commit", "-qam", "upstream change", cwd=up)
+     with mock.patch.object(g, "_fork_merges_upstream", return_value=merge_flag), \
+          mock.patch("hermes_cli.update_cmd_commit.arm_commit_point", return_value=None), \
+          mock.patch("hermes_cli.update_cmd_commit.target_syntax_error", return_value=None), \
+@@ -31,26 +45,43 @@ def run(live, merge_flag, upstream_edit):
+     return ok
+ 
+ 
+-
+-def test_flag_off_leaves_fork_untouched(tmp_path):
+-    _up, _fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
++def test_flag_off_leaves_fork_untouched(repo):
++    _up, _fork, live, gate = repo; pre = sh("git", "rev-parse", "HEAD", cwd=live)
+     assert run(live, False, ("b.txt", "b up\n"))
+     assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
++    assert gate.staged() == []
+ 
+ 
+-def test_flag_on_merges_upstream_and_pushes(tmp_path):
+-    _up, fork, live = mkrepo(tmp_path)
++@pytest.mark.parametrize("verdict", ["failure", "success"])
++def test_flag_on_stages_the_merge_and_lands_only_a_green_one(repo, capsys, verdict):
++    _up, _fork, live, gate = repo
++    pre = sh("git", "rev-parse", "HEAD", cwd=live)
+     assert run(live, True, ("b.txt", "b up\n"))
+-    head = sh("git", "rev-parse", "HEAD", cwd=live)
+-    assert (live / "a.txt").read_text() == "a fork\n" and (live / "b.txt").read_text() == "b up\n"
+-    assert len(sh("git", "rev-list", "--parents", "-n1", "HEAD", cwd=live).split()) == 3
+-    assert sh("git", "rev-parse", "main", cwd=fork) == head
++    # Staged for the fork's full suite; neither the live tree nor the fork's main moved.
++    [merged] = gate.staged()
++    assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
++    assert gate.main() == pre
++    assert len(sh("git", "rev-list", "--parents", "-n1", merged, cwd=live).split()) == 3
++    assert sh("git", "show", f"{merged}:b.txt", cwd=live) == "b up" and sh("git", "show", f"{merged}:a.txt", cwd=live) == "a fork"
++    assert "staged" in capsys.readouterr().out
++
++    gate.finish(merged, verdict)
++    assert run(live, True)  # the next update
++    out = capsys.readouterr().out
++    if verdict == "failure":
++        assert gate.main() == pre and "LANDED" not in out
++        assert "full suite failed" in out or "failed its full suite" in out, out
++    else:
++        assert gate.main() == merged and "LANDED" in out, out
++        assert gate.staged() == []  # the twin merge of the next update is not staged again
++    assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
+     assert sh("git", "status", "--porcelain", cwd=live) == ""
+ 
+ 
+-def test_conflict_moves_nothing(tmp_path):
+-    _up, fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
++def test_conflict_moves_nothing(repo):
++    _up, fork, live, gate = repo; pre = sh("git", "rev-parse", "HEAD", cwd=live)
+     assert not run(live, True, ("a.txt", "a upstream conflict\n"))
+     assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
+     assert sh("git", "rev-parse", "main", cwd=fork) == pre
+     assert sh("git", "status", "--porcelain", cwd=live) == ""
++    assert gate.staged() == []
+diff --git a/tests/hermes_cli/test_update_fork_sync_identity.py b/tests/hermes_cli/test_update_fork_sync_identity.py
+index 9bef03b0f93..2998eab2b1b 100644
+--- a/tests/hermes_cli/test_update_fork_sync_identity.py
++++ b/tests/hermes_cli/test_update_fork_sync_identity.py
+@@ -69,7 +69,15 @@ def test_a_local_branch_named_upstream_main_never_changes_what_the_sync_counts_o
+     assert _git(clone, "rev-parse", "HEAD") == commits[2]
+     # The tree-move marker names the merged commit: a killed merge is repaired toward it.
+     assert armed == [commits[2]]
+-    # The deferred fork push checks HEAD against the same remote-tracking commit, not the shadow.
++    # The deferred fork sync checks HEAD against the same remote-tracking commit, not the shadow, and
++    # hands exactly that commit to the CI gate: staged first, on main once its full suite is green.
++    from tests.hermes_cli.upstream_gate_fake import FakeFork
++    gate = FakeFork(tmp_path, monkeypatch, origin)
++    gate.adopt(clone)
++    _push_synced_fork(["git"], clone)
++    assert gate.staged() == [commits[2]]
++    assert _git(origin, "rev-parse", "refs/heads/main") == commits[0]
++    gate.finish(commits[2], "success")
+     _push_synced_fork(["git"], clone)
+     assert _git(origin, "rev-parse", "refs/heads/main") == commits[2]
+ 
+diff --git a/tests/hermes_cli/upstream_gate_fake.py b/tests/hermes_cli/upstream_gate_fake.py
+new file mode 100644
+index 00000000000..4397d278977
+--- /dev/null
++++ b/tests/hermes_cli/upstream_gate_fake.py
+@@ -0,0 +1,74 @@
++"""A real fork gate for updater tests: GitHub-named bare origin plus a fake ``gh`` on PATH.
++
++The bare origin answers to ``https://github.com/example/fork.git`` (``url.<path>.insteadOf``), so
++``scripts/ci/upstream_sync.py`` runs unmodified in a subprocess: real git pushes, and Actions runs
++served by a ``gh`` stub from a JSON file the test writes.
++"""
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++GATE = REPO_ROOT / "scripts" / "ci" / "upstream_sync.py"
++URL = "https://github.com/example/fork.git"
++
++_GH = r'''#!{py}
++import json, sys
++endpoint = [a for a in sys.argv[1:] if not a.startswith("-")][-1]
++runs = json.load(open({runs!r}))
++if "/jobs" in endpoint:
++    run = next(r for r in runs if f"/runs/{{r['id']}}/jobs" in endpoint)
++    jobs = [{{"name": "Full suite / " + n, "status": "completed", "conclusion": run["conclusion"],
++              "labels": ["self-hosted", "hermes-hub"], "runner_name": "hub-1"}}
++            for n in ("Run tests (1/2)", "Run tests (2/2)", "e2e")]
++    print(json.dumps([{{"jobs": jobs}}]))
++else:
++    print(json.dumps([{{"workflow_runs": runs}}]))
++'''
++
++
++class FakeFork:
++    def __init__(self, tmp_path: Path, monkeypatch, bare: Path):
++        self.bare, self.runs_file = bare, tmp_path / "gh-runs.json"
++        self.runs_file.write_text("[]")
++        bindir = tmp_path / "fake-bin"
++        bindir.mkdir(exist_ok=True)
++        gh = bindir / "gh"
++        gh.write_text(_GH.format(py=sys.executable, runs=str(self.runs_file)))
++        gh.chmod(0o755)
++        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
++        monkeypatch.setenv("HOME", str(tmp_path))  # no real token-broker fallback, no global git config
++        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / ".gitconfig"))
++        (tmp_path / ".gitconfig").write_text(
++            f'[user]\n\temail = t@t\n\tname = t\n[url "{bare}"]\n\tinsteadOf = {URL}\n')
++
++    @staticmethod
++    def adopt(clone: Path) -> None:
++        """Point ``clone``'s origin at the GitHub-named URL (resolved to the bare repo) and give it the gate."""
++        subprocess.run(["git", "-C", str(clone), "remote", "set-url", "origin", URL], check=True)
++        gate = clone / "scripts" / "ci" / "upstream_sync.py"
++        gate.parent.mkdir(parents=True, exist_ok=True)
++        gate.write_bytes(GATE.read_bytes())
++        with open(clone / ".git" / "info" / "exclude", "a") as exclude:
++            exclude.write("/scripts/\n")
++
++    def staged(self) -> list[str]:
++        out = subprocess.run(["git", "-C", str(self.bare), "for-each-ref", "--format=%(objectname)",
++                              "refs/heads/sync/"], check=True, capture_output=True, text=True).stdout
++        return out.split()
++
++    def finish(self, sha: str, conclusion: str) -> None:
++        runs = json.loads(self.runs_file.read_text())
++        runs.append({"id": len(runs) + 1, "run_number": len(runs) + 1, "head_sha": sha,
++                     "head_branch": f"sync/upstream-{sha}", "event": "push",
++                     "path": ".github/workflows/upstream-sync.yml", "status": "completed",
++                     "conclusion": conclusion, "html_url": f"https://ci.example/{len(runs) + 1}",
++                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
++        self.runs_file.write_text(json.dumps(runs))
++
++    def main(self) -> str:
++        return subprocess.run(["git", "-C", str(self.bare), "rev-parse", "refs/heads/main"], check=True,
++                              capture_output=True, text=True).stdout.strip()
+diff --git a/tests/scripts/ci/test_upstream_sync.py b/tests/scripts/ci/test_upstream_sync.py
+new file mode 100644
+index 00000000000..1d35e975068
+--- /dev/null
++++ b/tests/scripts/ci/test_upstream_sync.py
+@@ -0,0 +1,311 @@
++"""Upstream sync gate: real bare Git remotes and real pytest verdicts; only GitHub's API is a fixture.
++
++The fixture API reports for each staged ``sync/upstream-<sha>`` branch the verdict a real pytest run
++on that exact checkout produced, so "red is refused, green lands" is decided by real test code.
++"""
++import json
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import Callable
++
++import pytest
++
++from scripts.ci import upstream_sync as sync
++
++
++def git(cwd, *args, env=None):
++    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True,
++                          env=env).stdout.strip()
++
++
++def commit(checkout, files, msg):
++    for name, text in files.items():
++        (checkout / name).write_text(text)
++    git(checkout, "add", ".")
++    git(checkout, "commit", "-q", "-m", msg)
++    return git(checkout, "rev-parse", "HEAD")
++
++
++@pytest.fixture
++def world(tmp_path):
++    """origin (the fork) and upstream bare remotes, and a fork checkout tracking both."""
++    for name in ("origin.git", "upstream.git"):
++        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(tmp_path / name)], check=True)
++    seed = tmp_path / "seed"
++    subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
++    for k, v in (("user.email", "t@example.com"), ("user.name", "T")):
++        git(seed, "config", k, v)
++    commit(seed, {"test_suite.py": "def test_suite(): assert True\n"}, "base")
++    git(seed, "push", "-q", str(tmp_path / "origin.git"), "main")
++    git(seed, "push", "-q", str(tmp_path / "upstream.git"), "main")
++    checkout = tmp_path / "fork"
++    subprocess.run(["git", "clone", "-q", str(tmp_path / "origin.git"), str(checkout)], check=True)
++    for k, v in (("user.email", "t@example.com"), ("user.name", "T")):
++        git(checkout, "config", k, v)
++    git(checkout, "remote", "add", "upstream", str(tmp_path / "upstream.git"))
++    return tmp_path, checkout
++
++
++def upstream_commit(world_root, files, msg):
++    up = world_root / "up-work"
++    if not up.exists():
++        subprocess.run(["git", "clone", "-q", str(world_root / "upstream.git"), str(up)], check=True)
++        for k, v in (("user.email", "u@example.com"), ("user.name", "U")):
++            git(up, "config", k, v)
++    git(up, "pull", "-q")
++    sha = commit(up, files, msg)
++    git(up, "push", "-q", "origin", "main")
++    return sha
++
++
++def merge_upstream(checkout):
++    git(checkout, "fetch", "-q", "upstream")
++    git(checkout, "fetch", "-q", "origin")
++    git(checkout, "checkout", "-q", "--detach", "origin/main")
++    git(checkout, "merge", "-q", "--no-edit", "--no-ff", "upstream/main")
++    return git(checkout, "rev-parse", "HEAD")
++
++
++class FakeActions:
++    """GitHub Actions for the bare origin: a staged sync branch runs real pytest at its head."""
++
++    def __init__(self, origin: Path, scratch: Path):
++        self.origin, self.scratch, self.runs, self.finished = origin, scratch, [], True
++        self.job_override: Callable[[list], None] | None = None
++
++    def ci(self):
++        """Run 'CI' for every staged branch that has no run yet (status pending until finish())."""
++        refs = git(self.origin, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads/sync/")
++        for line in filter(None, refs.splitlines()):
++            branch, sha = line.split()
++            if any(r["head_branch"] == branch for r in self.runs):
++                continue
++            work = self.scratch / f"ci-{sha[:10]}"
++            subprocess.run(["git", "clone", "-q", str(self.origin), str(work)], check=True)
++            git(work, "checkout", "-q", sha)
++            res = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
++                                  "-c", "/dev/null", "--rootdir", str(work), str(work)],
++                                 capture_output=True, text=True, cwd=work, check=False)
++            run_id = len(self.runs) + 1
++            self.runs.append({"id": run_id, "run_number": run_id, "head_sha": sha, "head_branch": branch,
++                              "event": "push", "path": sync.WORKFLOW_PATH,
++                              "status": "completed" if self.finished else "in_progress",
++                              "conclusion": ("success" if res.returncode == 0 else "failure") if self.finished else None,
++                              "html_url": f"https://ci.example/run/{run_id}",
++                              "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
++
++    def request(self, endpoint):
++        if "/jobs?" in endpoint:
++            run = next(r for r in self.runs if f"/runs/{r['id']}/jobs" in endpoint)
++            jobs = [{"name": f"Full suite / {n}", "status": "completed", "conclusion": run["conclusion"],
++                     "labels": ["self-hosted", "hermes-hub"], "runner_name": "hub-1"} for n in sync.REQUIRED_JOBS]
++            if self.job_override:
++                self.job_override(jobs)
++            return [{"jobs": jobs}]
++        assert f"workflows/{sync.WORKFLOW_FILE}/runs" in endpoint
++        return [{"workflow_runs": list(reversed(self.runs))}]
++
++
++def gate(checkout, head, actions, **kw):
++    return sync.advance(checkout, head, gh_repo="example/fork", request=actions.request, **kw)
++
++
++def main_of(world_root):
++    return git(world_root / "origin.git", "rev-parse", "main")
++
++
++@pytest.mark.parametrize("red", [True, False])
++def test_red_sync_is_refused_and_green_sync_lands(world, red):
++    root, checkout = world
++    upstream_commit(root, {"test_upstream.py": f"def test_upstream(): assert {not red}\n"}, "upstream change")
++    head = merge_upstream(checkout)
++    before = main_of(root)
++    actions = FakeActions(root / "origin.git", root)
++
++    assert gate(checkout, head, actions) == sync.NOT_YET  # staged, not landed
++    assert main_of(root) == before
++    assert git(root / "origin.git", "rev-parse", f"sync/upstream-{head}") == head
++    actions.ci()
++    assert actions.runs[0]["conclusion"] == ("failure" if red else "success")  # real pytest verdict
++
++    rc = gate(checkout, head, actions)
++    assert rc == (sync.REFUSED if red else sync.LANDED)
++    assert main_of(root) == (before if red else head)  # green lands the exact tested head (ff)
++
++
++def test_pending_run_does_not_land_then_lands_when_green(world):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    head = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    actions.finished = False
++    gate(checkout, head, actions)
++    actions.ci()
++    assert gate(checkout, head, actions) == sync.NOT_YET
++    assert main_of(root) != head
++    actions.runs[0].update(status="completed", conclusion="success")
++    assert gate(checkout, head, actions) == sync.LANDED
++    assert main_of(root) == head
++
++
++def test_moved_main_gets_a_non_forced_merge_of_the_tested_head(world):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    head = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    gate(checkout, head, actions)
++    actions.ci()
++    # The fork's main moves (a fork-only fix) while the suite runs.
++    other = root / "other"
++    subprocess.run(["git", "clone", "-q", str(root / "origin.git"), str(other)], check=True)
++    git(other, "config", "user.email", "o@example.com")
++    git(other, "config", "user.name", "O")
++    moved = commit(other, {"fork_fix.txt": "fix\n"}, "fork fix")
++    git(other, "push", "-q", "origin", "main")
++
++    assert gate(checkout, head, actions) == sync.LANDED
++    new_main = main_of(root)
++    parents = git(root / "origin.git", "rev-list", "--parents", "-n1", new_main).split()[1:]
++    assert parents == [moved, head]  # main kept, tested head merged, nothing rewritten
++
++
++@pytest.mark.parametrize("fault", ["missing", "skipped", "hosted", "no-runner"])
++def test_incomplete_job_evidence_cannot_land(world, fault):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    head = merge_upstream(checkout)
++    before = main_of(root)
++    actions = FakeActions(root / "origin.git", root)
++    gate(checkout, head, actions)
++    actions.ci()
++
++    def corrupt(jobs):
++        if fault == "missing":
++            jobs.pop()
++        elif fault == "skipped":
++            jobs[-1]["conclusion"] = "skipped"
++        elif fault == "hosted":
++            jobs[-1]["labels"] = ["ubuntu-latest"]
++        else:
++            jobs[-1]["runner_name"] = None
++    actions.job_override = corrupt
++    assert gate(checkout, head, actions) == sync.REFUSED
++    assert main_of(root) == before
++
++
++def test_evidence_from_another_branch_or_cancelled_run_does_not_count(world):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    head = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    actions.runs.append({"id": 9, "run_number": 9, "head_sha": head, "head_branch": "main", "event": "push",
++                         "path": sync.WORKFLOW_PATH, "status": "completed", "conclusion": "success",
++                         "html_url": "x", "updated_at": "2026-10-30T00:00:00Z"})
++    actions.runs.append({"id": 10, "run_number": 10, "head_sha": head, "head_branch": f"sync/upstream-{head}",
++                         "event": "push", "path": sync.WORKFLOW_PATH, "status": "completed",
++                         "conclusion": "cancelled", "html_url": "y", "updated_at": "2026-10-30T00:00:00Z"})
++    assert gate(checkout, head, actions) == sync.NOT_YET  # neither counts: staged for a real run
++    assert main_of(root) != head
++
++
++def staged(root, sha):
++    return bool(git(root / "origin.git", "branch", "--list", f"sync/upstream-{sha}"))
++
++
++def fork_commit_on_main(root, name):
++    other = root / f"fork-{name}"
++    subprocess.run(["git", "clone", "-q", str(root / "origin.git"), str(other)], check=True)
++    git(other, "config", "user.email", "o@example.com")
++    git(other, "config", "user.name", "O")
++    commit(other, {name: "fork\n"}, f"fork {name}")
++    git(other, "push", "-q", "origin", "main")
++
++
++def test_one_candidate_in_flight_and_red_backoff_per_upstream(world):
++    root, checkout = world
++    upstream_commit(root, {"test_u.py": "def test_u(): assert False\n"}, "broken upstream")
++    red_head = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    actions.finished = False
++    gate(checkout, red_head, actions)
++    actions.ci()
++    fork_commit_on_main(root, "a.txt")
++    same_upstream = merge_upstream(checkout)  # main moved, same broken upstream
++    assert gate(checkout, same_upstream, actions) == sync.NOT_YET
++    assert not staged(root, same_upstream)  # one candidate in CI at a time
++
++    actions.runs[0].update(status="completed", conclusion="failure")
++    assert gate(checkout, same_upstream, actions) == sync.NOT_YET  # red backoff: same upstream
++    assert not staged(root, same_upstream)
++    later = time.time() + sync.RED_BACKOFF_S + 60
++    assert gate(checkout, same_upstream, actions, now=later) == sync.NOT_YET
++    assert staged(root, same_upstream)  # staged after the backoff
++
++    upstream_commit(root, {"more.txt": "m\n"}, "more upstream")
++    new_upstream = merge_upstream(checkout)
++    assert gate(checkout, new_upstream, actions) == sync.NOT_YET
++    assert staged(root, new_upstream)  # upstream moved: no backoff
++
++
++def test_another_hosts_green_candidate_is_landed_by_a_bare_call(world):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    head = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    gate(checkout, head, actions)
++    actions.ci()
++    assert sync.advance(checkout, None, gh_repo="example/fork", request=actions.request) == sync.LANDED
++    assert main_of(root) == head
++
++
++def test_unreadable_evidence_is_a_refusal(world):
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    head = merge_upstream(checkout)
++    before = main_of(root)
++
++    def broken(endpoint):
++        raise sync.GateError("API down")
++    assert sync.advance(checkout, head, gh_repo="example/fork", request=broken) == sync.REFUSED
++    assert main_of(root) == before
++
++
++def install_guard(checkout):
++    hook = checkout / ".git" / "hooks" / "pre-push"
++    script = Path(sync.__file__).resolve()
++    hook.write_text("#!/usr/bin/env bash\nstatus=0\nwhile read -r _ l r rs; do\n"
++                    "  [ \"$r\" = refs/heads/main ] || continue\n"
++                    f"  {sys.executable} {script} --repo . --guard-push \"$l\" || status=1\n"
++                    "done\nexit $status\n")
++    hook.chmod(0o755)
++
++
++def test_pre_push_guard_refuses_a_hand_pushed_sync_and_allows_fork_work(world):
++    root, checkout = world
++    install_guard(checkout)
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    head = merge_upstream(checkout)
++    res = subprocess.run(["git", "-C", str(checkout), "push", "origin", f"{head}:refs/heads/main"],
++                         capture_output=True, text=True, check=False)
++    assert res.returncode != 0 and "upstream sync guard" in res.stderr
++    assert main_of(root) != head
++    # The same sync, through the gate's publication, is allowed.
++    actions = FakeActions(root / "origin.git", root)
++    gate(checkout, head, actions)
++    actions.ci()
++    assert gate(checkout, head, actions) == sync.LANDED
++    # Fork-only work brings no new upstream commits and pushes normally.
++    git(checkout, "checkout", "-q", "--detach", main_of(root))
++    fork = commit(checkout, {"fork.txt": "f\n"}, "fork work")
++    git(checkout, "push", "-q", "origin", f"{fork}:refs/heads/main")
++    assert main_of(root) == fork
++
++
++def test_github_transport_reads_all_pages(monkeypatch):
++    def run(command, **kwargs):
++        assert command[:4] == ["gh", "api", "--paginate", "--slurp"]
++        return subprocess.CompletedProcess(command, 0, json.dumps([{"jobs": []}, {"jobs": []}]), "")
++    monkeypatch.setattr(subprocess, "run", run)
++    assert len(sync.github_pages("repos/example/fork/actions/runs/1/jobs?per_page=100")) == 2
+diff --git a/tests/scripts/test_code_health_cli.py b/tests/scripts/test_code_health_cli.py
+index 16c82653ff4..9e7f12bc59c 100644
+--- a/tests/scripts/test_code_health_cli.py
++++ b/tests/scripts/test_code_health_cli.py
+@@ -98,6 +98,7 @@ def _add_engine(repo: Path, checker: bool = True) -> list[str]:
+     _write(repo, {"scripts/ci/prompt_surface.py": "import sys\n\nsys.exit(0)\n"})
+     if checker:
+         shutil.copy2(REPO / "scripts/check", repo / "scripts/check")
++        shutil.copy2(REPO / "scripts/ci/upstream_sync.py", repo / "scripts/ci/upstream_sync.py")
+         shutil.copytree(REPO / "scripts/code_health", repo / "scripts/code_health",
+                         ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
+     return ["agent", "scripts", "tests"]
+@@ -261,6 +262,43 @@ def test_pre_push_judges_a_checker_branch_pushed_from_an_older_checkout(tmp_path
+     assert _remote_ref(remote, "clean") == ""
+ 
+ 
++def test_pre_push_refuses_an_untested_upstream_sync_on_any_branch(tmp_path):
++    """The 10-29 sync reached main by hand pushes; now only the CI gate pushes upstream commits."""
++    repo, remote = _pushable(tmp_path)
++    fork = _branch_with_checker(repo, "fork-main", {"pkg/d.py": "def d():\n    return 4\n"})
++    _git(repo, "push", "-q", "origin", "fork-main:main")
++    _git(repo, "fetch", "-q", "origin")
++    upstream = tmp_path / "upstream.git"
++    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(upstream))
++    _git(repo, "push", "-q", str(upstream), "main:main")  # upstream: main predating the fork commit
++    up_work = tmp_path / "up-work"
++    _git(tmp_path, "clone", "-q", str(upstream), str(up_work))
++    _git(up_work, "config", "user.email", "u@example.invalid")
++    _git(up_work, "config", "user.name", "u")
++    _commit(up_work, {"pkg/up.py": "def up():\n    return 5\n"})
++    _git(up_work, "push", "-q", "origin", "HEAD:main")
++    _git(repo, "remote", "add", "upstream", str(upstream))
++    _git(repo, "fetch", "-q", "upstream")
++    assert _check(repo, "--install-hook", "pre-push").returncode == 0
++
++    _git(repo, "checkout", "-q", "-b", "sync", fork)
++    _git(repo, "merge", "-q", "--no-edit", "refs/remotes/upstream/main")
++    sync = _git(repo, "rev-parse", "HEAD")
++    for ref in ("main", "sync"):  # by hand, to main or to a branch that a PR would merge
++        push = _sh(repo, "git", "push", "origin", f"{sync}:refs/heads/{ref}")
++        assert push.returncode != 0 and "upstream sync guard" in push.stderr, push.stdout + push.stderr
++    assert _remote_ref(remote, "main") == fork and _remote_ref(remote, "sync") == ""
++
++    # The gate's own staging push passes; fork-only work passes.
++    env = {**_env(), "HERMES_UPSTREAM_SYNC_GATE": "stage"}
++    push = _sh(repo, "git", "push", "origin", f"{sync}:refs/heads/sync/upstream-{sync}", env=env)
++    assert push.returncode == 0, push.stdout + push.stderr
++    _git(repo, "checkout", "-q", "-b", "feature", fork)
++    work = _commit(repo, {"pkg/e.py": "def e():\n    return 6\n"})
++    push = _sh(repo, "git", "push", "origin", "feature")
++    assert push.returncode == 0 and _remote_ref(remote, "feature") == work, push.stdout + push.stderr
++
++
+ # --- M5: interpreter choice and the version guard ---------------------------------------------
+ 
+ 
+-- 
+2.55.0
+

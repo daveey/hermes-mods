@@ -1,0 +1,236 @@
+From 05e3479b6b386f3b6e7badf4f33b723e7ae952b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:30:58 +0000
+Subject: [PATCH] perf(dashboard): serve the host-gateway memo
+ stale-while-revalidate so a slow identify is not re-paid per request; control
+ verbs get their own executor
+
+---
+ gateway/control_socket.py             | 15 ++++-
+ gateway/host_attach.py                | 51 +++++++++++++++-
+ hermes_cli/web_server_app.py          | 11 +++-
+ tests/gateway/test_host_attach_swr.py | 84 +++++++++++++++++++++++++++
+ 4 files changed, 156 insertions(+), 5 deletions(-)
+ create mode 100644 tests/gateway/test_host_attach_swr.py
+
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index eca3e4aa28e..ec80437bc81 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -36,6 +36,19 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
+ _MAX_REQUEST_BYTES = 64 * 1024
+ _MAX_RESPONSE_BYTES = 512 * 1024
+ _DEFAULT_CLIENT_TIMEOUT = 2.0
++# Control verbs run on their own small pool, never the loop's default executor: that pool is shared
++# with every other ``run_in_executor(None, ...)`` in the gateway, and an ``identify`` queued behind a
++# burst of them blows the 2 s client budget while the gateway is perfectly healthy.
++_CONTROL_EXECUTOR = None
++
++
++def _control_executor():
++    global _CONTROL_EXECUTOR
++    if _CONTROL_EXECUTOR is None:
++        from concurrent.futures import ThreadPoolExecutor
++
++        _CONTROL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="control-socket")
++    return _CONTROL_EXECUTOR
+ # What a filesystem that cannot host an AF_UNIX node answers: a Docker Desktop (virtiofs) bind mount
+ # refuses the socket, and an inode a previous container left there can be neither stat'ed nor
+ # removed from inside (#123761). Not EADDRINUSE: a live sibling must keep failing loudly.
+@@ -509,7 +522,7 @@ class GatewayControlServer:
+             # Handlers read disk; keep that off the loop that drives every platform
+             # adapter so a fast-polling consumer can't stall heartbeats.
+             response = await asyncio.get_running_loop().run_in_executor(
+-                None, self.handle_request_line, raw.rstrip(b"\n"), self._posix_peer_subject(writer))
++                _control_executor(), self.handle_request_line, raw.rstrip(b"\n"), self._posix_peer_subject(writer))
+             writer.write(response)
+             await asyncio.wait_for(writer.drain(), timeout=_DEFAULT_CLIENT_TIMEOUT)
+         except (TimeoutError, ConnectionError, OSError):
+diff --git a/gateway/host_attach.py b/gateway/host_attach.py
+index c7023c4d688..da698494132 100644
+--- a/gateway/host_attach.py
++++ b/gateway/host_attach.py
+@@ -40,6 +40,7 @@ from __future__ import annotations
+ 
+ import logging
+ import os
++import threading
+ import time
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -218,6 +219,46 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
+     return HostGateway(record.pid, home, (), served_known=False)
+ 
+ 
++#: A dashboard process answers many requests per second and must not pay a slow ``identify`` (the
++#: control-socket client timeout, ~2 s) on each one. ``enable_stale_while_revalidate`` opts a
++#: long-lived process in: an expired memo younger than ``HOST_GATEWAY_MAX_STALE_S`` is served as-is
++#: while ONE background thread re-probes. CLI/lifecycle processes never opt in and keep the
++#: synchronous TTL semantics; record writes still invalidate eagerly in every process.
++HOST_GATEWAY_MAX_STALE_S = 30.0
++_stale_while_revalidate = False
++_refresh_lock = threading.Lock()
++_refresh_running = False
++
++
++def enable_stale_while_revalidate(enabled: bool = True) -> None:
++    global _stale_while_revalidate
++    _stale_while_revalidate = enabled
++
++
++def _refresh_probe_in_background() -> None:
++    global _refresh_running
++    with _refresh_lock:
++        if _refresh_running:
++            return
++        _refresh_running = True
++
++    def _run() -> None:
++        global _cached_probe, _refresh_running
++        try:
++            stamp = _cached_probe
++            result = _probe_host_gateway(0.0)
++            # A record write during the probe invalidated the memo; do not resurrect a stale answer.
++            if _cached_probe is stamp:
++                _cached_probe = (time.monotonic(), result)
++        except Exception:
++            logger.debug("host gateway background re-probe failed", exc_info=True)
++        finally:
++            with _refresh_lock:
++                _refresh_running = False
++
++    threading.Thread(target=_run, name="host-gateway-reprobe", daemon=True).start()
++
++
+ def host_gateway(*, wait_for_channel: float = 0.0) -> Optional[HostGateway]:
+     """The one live host gateway, or ``None``.
+ 
+@@ -226,8 +267,14 @@ def host_gateway(*, wait_for_channel: float = 0.0) -> Optional[HostGateway]:
+     """
+     global _cached_probe
+     now = time.monotonic()
+-    if wait_for_channel <= 0 and _cached_probe is not None and now - _cached_probe[0] < HOST_GATEWAY_CACHE_TTL_S:
+-        return _cached_probe[1]
++    cached = _cached_probe
++    if wait_for_channel <= 0 and cached is not None:
++        age = now - cached[0]
++        if age < HOST_GATEWAY_CACHE_TTL_S:
++            return cached[1]
++        if _stale_while_revalidate and age < HOST_GATEWAY_MAX_STALE_S:
++            _refresh_probe_in_background()
++            return cached[1]
+     result = _probe_host_gateway(wait_for_channel)
+     _cached_probe = (time.monotonic(), result)
+     return result
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 9c1954d24ae..8af16d2c5de 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -278,5 +278,12 @@ async def http_lifespan(app: FastAPI):
+ @asynccontextmanager
+ async def app_lifespan(app: FastAPI):
+     lifespan = http_lifespan if getattr(app.state, "gateway_runner", None) is not None else standalone_lifespan
+-    async with lifespan(app):
+-        yield
++    # A dashboard serves many requests/s: a slow gateway ``identify`` must not be re-paid on each
++    # (stale-while-revalidate for the host-gateway memo; CLI processes keep the synchronous TTL).
++    from gateway import host_attach
++    host_attach.enable_stale_while_revalidate()
++    try:
++        async with lifespan(app):
++            yield
++    finally:
++        host_attach.enable_stale_while_revalidate(False)
+diff --git a/tests/gateway/test_host_attach_swr.py b/tests/gateway/test_host_attach_swr.py
+new file mode 100644
+index 00000000000..cd6036fafef
+--- /dev/null
++++ b/tests/gateway/test_host_attach_swr.py
+@@ -0,0 +1,84 @@
++"""A dashboard must not re-pay a hung gateway's ``identify`` timeout on every request."""
++import json
++import os
++import socket
++import threading
++import time
++
++import pytest
++
++from gateway import control_socket, host_attach
++from gateway import host_rendezvous as hr
++from hermes_constants import get_hermes_home
++
++
++@pytest.fixture(autouse=True)
++def _cold(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
++    host_attach.invalidate_host_gateway_cache()
++    yield
++    host_attach.enable_stale_while_revalidate(False)
++    host_attach.invalidate_host_gateway_cache()
++
++
++@pytest.fixture
++def silent_gateway(monkeypatch):
++    """A live owner whose control socket accepts connections and never answers."""
++    home = get_hermes_home()
++    assert hr.claim_host_lock(hr.ROLE_GATEWAY)[0] is hr.HostLockOutcome.ACQUIRED
++    pid = os.getpid()
++    payload = {"role": hr.ROLE_GATEWAY, "home": str(home), "pid": pid,
++               "createTime": hr.process_create_time(pid), "host": "", "port": None,
++               "protocolVersion": hr.HOST_PROTOCOL_VERSION, "tokenFingerprint": "",
++               "profiles": [], "updatedAt": ""}
++    path = hr.record_path(hr.ROLE_GATEWAY)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(payload), encoding="utf-8")
++    host_attach.invalidate_host_gateway_cache()
++
++    hang = threading.Event()
++
++    def hung_identify(dialled, **kw):  # returns None like a timed-out client
++        hang.wait(1.0)  # accepts, never answers: the caller's budget is spent waiting
++
++    monkeypatch.setattr(control_socket, "identify_gateway", hung_identify)
++    yield hang
++    hang.set()
++
++
++def _spent(n=2):
++    t = time.monotonic()
++    for _ in range(n):
++        host_attach.host_gateway()
++    return time.monotonic() - t
++
++
++def test_dashboard_mode_serves_stale_memo_while_reprobing(silent_gateway, monkeypatch):
++    host_attach.enable_stale_while_revalidate()
++    monkeypatch.setattr(host_attach, "HOST_GATEWAY_CACHE_TTL_S", 0.05)
++    first = host_attach.host_gateway()  # the one probe that pays the hang
++    assert first is not None and first.served_known is False
++    time.sleep(0.1)  # memo now expired
++    spent = _spent(2)
++    assert spent < 0.5, spent
++    assert host_attach.host_gateway() is first or host_attach.host_gateway() is not None
++
++
++def test_cli_mode_keeps_synchronous_probe(silent_gateway, monkeypatch):
++    monkeypatch.setattr(host_attach, "HOST_GATEWAY_CACHE_TTL_S", 0.05)
++    host_attach.host_gateway()
++    time.sleep(0.1)
++    assert _spent(1) >= 0.9  # lifecycle/CLI callers still get a fresh answer
++
++
++def test_stale_memo_older_than_cap_is_reprobed_synchronously(silent_gateway, monkeypatch):
++    host_attach.enable_stale_while_revalidate()
++    monkeypatch.setattr(host_attach, "HOST_GATEWAY_CACHE_TTL_S", 0.05)
++    monkeypatch.setattr(host_attach, "HOST_GATEWAY_MAX_STALE_S", 0.1)
++    host_attach.host_gateway()
++    time.sleep(0.2)
++    assert _spent(1) >= 0.9
++
++
++def test_control_socket_identify_not_queued_behind_default_executor():
++    assert control_socket._control_executor() is control_socket._control_executor()
+-- 
+2.55.0
+

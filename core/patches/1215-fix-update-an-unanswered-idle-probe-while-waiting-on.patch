@@ -1,0 +1,97 @@
+From 28766d9fa305c0c35be7eab7318fe6d22abc7366 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 09:45:44 +0000
+Subject: [PATCH] fix(update): an unanswered idle probe while waiting on a
+ review is not the review ending
+
+A CPU-starved backend can miss the 3s HTTP timeout; the wait then stopped it unfenced
+mid-review window (no commit before SIGTERM). Treat no answer as transient while the pid is
+alive (deadline still bounds), and raise the probe timeout to 10s.
+---
+ hermes_cli/dashboard_procs.py                 | 19 +++++++++++--
+ .../test_update_stale_dashboard_review.py     | 28 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/dashboard_procs.py b/hermes_cli/dashboard_procs.py
+index 0696b697176..d7508017893 100644
+--- a/hermes_cli/dashboard_procs.py
++++ b/hermes_cli/dashboard_procs.py
+@@ -627,7 +627,7 @@ def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int,
+ # (900 s), which is also this wait's own deadline. Every other answer (idle, another kind of busy,
+ # an old backend with no fence, no token, no port) is stopped exactly as before.
+ _REVIEW_RETIRE_POLL_S = 2.0
+-_REVIEW_RETIRE_HTTP_TIMEOUT_S = 3.0
++_REVIEW_RETIRE_HTTP_TIMEOUT_S = 10.0
+ 
+ 
+ def _review_retire_deadline_s() -> float:
+@@ -690,6 +690,16 @@ def _retirement_request(endpoint: tuple[str, int, str], body: dict | None) -> di
+     return payload if isinstance(payload, dict) else None
+ 
+ 
++def _pid_alive(pid: int) -> bool:
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except OSError:
++        return True
++    return True
++
++
+ def _await_background_reviews(pids: list[int]) -> None:
+     """Hold the stop of each backend in *pids* while it runs a background review (see above)."""
+     import time as _time
+@@ -719,7 +729,12 @@ def _await_background_reviews(pids: list[int]) -> None:
+                     print(f"    ✓ {msg}")
+                     logger.warning("dashboard stop: %s", msg)
+                 continue
+-            detail = str(((_retirement_request(endpoint, None) or {}).get("detail")) or "")
++            idle = _retirement_request(endpoint, None)
++            if idle is None and pid in waited and _pid_alive(pid):
++                # No answer at all (a CPU-starved backend missed the HTTP timeout) is not "the
++                # review ended": keep waiting; the deadline still bounds this.
++                continue
++            detail = str((idle or {}).get("detail") or "")
+             if not detail.startswith("background_review:"):
+                 if pid in waited and pid not in retried:
+                     retried.add(pid)
+diff --git a/tests/hermes_cli/test_update_stale_dashboard_review.py b/tests/hermes_cli/test_update_stale_dashboard_review.py
+index b215cd22d0c..f6acb575edf 100644
+--- a/tests/hermes_cli/test_update_stale_dashboard_review.py
++++ b/tests/hermes_cli/test_update_stale_dashboard_review.py
+@@ -381,3 +381,31 @@ def test_a_backend_that_stays_unpreparable_after_its_review_is_stopped_as_before
+     monkeypatch.setattr(dashboard_procs, "_retirement_request", scripted)
+     dashboard_procs._await_background_reviews([4242])
+     assert len(seen) == 6 and {"action": "commit", "token": "permit"} not in seen
++
++
++def test_unanswered_idle_probe_while_waiting_is_not_taken_for_the_review_ending(monkeypatch, fast_poll):
++    """A starved backend can miss the HTTP timeout; no answer must keep the wait, not stop unfenced."""
++    endpoint = ("127.0.0.1", 1, "tok")
++    answers = iter([
++        ({"action": "prepare"}, {"ok": False, "idle": False}),
++        (None, {"ok": True, "idle": False, "detail": "background_review:1"}),
++        ({"action": "prepare"}, {"ok": False, "idle": False}),
++        (None, None),                                             # probe timed out
++        ({"action": "prepare"}, None),                            # so did the prepare
++        (None, None),
++        ({"action": "prepare"}, {"ok": True, "idle": True, "token": "permit"}),
++        ({"action": "commit", "token": "permit"}, {"ok": True}),
++    ])
++    seen = []
++
++    def scripted(ep, body):
++        expected, reply = next(answers)
++        assert body == expected, (body, expected)
++        seen.append(body)
++        return reply
++
++    monkeypatch.setattr(dashboard_procs, "_retirement_endpoint", lambda pid: endpoint)
++    monkeypatch.setattr(dashboard_procs, "_retirement_request", scripted)
++    monkeypatch.setattr(dashboard_procs, "_pid_alive", lambda pid: True)
++    dashboard_procs._await_background_reviews([4242])
++    assert seen[-1] == {"action": "commit", "token": "permit"}, seen
+-- 
+2.55.0
+

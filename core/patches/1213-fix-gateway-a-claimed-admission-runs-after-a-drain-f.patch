@@ -1,0 +1,121 @@
+From 824e710016e69534ac1006da15b52fa7c6065e7e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 04:43:05 -0700
+Subject: [PATCH] fix(gateway): a claimed admission runs after a drain flip;
+ wake drain test joins the drain [daveey] (#268)
+
+The authority-route wake test started the successor while the owner's drain
+still had the wake's claim in flight; the successor's epoch bump made the
+owner's settlement raise stale_epoch, and the row never reached completed
+(flaky on CPU-starved CI runners). A real restart joins in-flight work first
+(_drain_active_agents); the test now does too.
+
+The new claim_in_flight case holds the owner's claim inside its write txn
+until draining is set, and exposed a lost wake: execute_admission rebuilt the
+event without _admitted_before_drain, so run_inbound_hooks' drain gate refused
+a row the claim's in-txn gate had already admitted and settled it completed
+unrun. Claimed rows are in-flight work, so the event is marked admitted.
+---
+ gateway/session_ingress.py                    |  4 ++
+ ...st_wake_admitted_before_drain_authority.py | 46 +++++++++++++++++--
+ 2 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index 2761f5c7230..0a9d036f009 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -257,6 +257,10 @@ async def execute_admission(authority, ref, row):
+         if 'local_automation_v1' in row['payload']:
+             from gateway.session_automation import restore_local_automation
+             event = restore_local_automation(authority, ref, row)
++    # The claim's admission gate ran inside its commit, so no drain had begun when this row was
++    # claimed: it is in-flight work the restart drain waits for, not new work its gate refuses.
++    # Without this a drain that flips between the claim and the turn settles it 'completed' unrun.
++    event._admitted_before_drain = True
+     if event.internal and 'gateway_session_id' in event.metadata:
+         # Main's ownership proof (802fd5782f3): the session the pre-claim check just validated, so the
+         # turn's resolver never re-reads (and on a transient failure drops) an admitted completion.
+diff --git a/tests/gateway/test_wake_admitted_before_drain_authority.py b/tests/gateway/test_wake_admitted_before_drain_authority.py
+index 3edc54a740c..413e100e814 100644
+--- a/tests/gateway/test_wake_admitted_before_drain_authority.py
++++ b/tests/gateway/test_wake_admitted_before_drain_authority.py
+@@ -5,10 +5,13 @@ authority's FIFO (``admit_route_wake``) instead of the classic adapter path the
+ The receipt lets the notifier advance its cursor, so the wake is never re-sent: a drain must leave
+ the committed row queued (or run it), and the restarted gateway's startup recovery must run it, never
+ twice. Real GatewayRunner, DiscordAdapter and SessionAuthority over SQLite; the restart is a second
+-runner and authority over the same state DB.
++runner and authority over the same state DB, started only once the first runner's restart drain
++(``_drain_active_agents``) has joined its in-flight work, as a real restart does: a claim the owner
++committed before the drain began settles under the owner's epoch, never after the successor's.
+ """
+ 
+ import asyncio
++import threading
+ 
+ import pytest
+ 
+@@ -71,13 +74,42 @@ def wake_runs(executed):
+     return [owner for owner, text in executed if text == WAKE]
+ 
+ 
++def hold_owner_wake_claim(monkeypatch):
++    """Parks the owner's claim of the wake inside its write transaction, after the admission gate
++    passed: the claim is in flight (not yet committed or visible) when the restart drain begins.
++    Returns ``(gate_passed, release)`` threading events."""
++    from gateway import session_authority
++    from hermes_state_runtime import get_session_admission
++
++    claim, gate_passed, release = session_authority.claim_session_input, threading.Event(), threading.Event()
++
++    def held_claim(db, **kwargs):
++        guard, head = kwargs.get("_guard"), kwargs.get("head")
++
++        def gate(conn):
++            if guard is not None:
++                guard(conn)
++            row = get_session_admission(db, admission_id=head) if head else None
++            if row and row["principal_id"].startswith("automation") and not gate_passed.is_set():
++                gate_passed.set()
++                assert release.wait(30), "the test never released the held wake claim"
++
++        return claim(db, **{**kwargs, "_guard": gate})
++
++    monkeypatch.setattr(session_authority, "claim_session_input", held_claim)
++    return gate_passed, release
++
++
+ @pytest.mark.asyncio
+-@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
+-async def test_authority_route_runs_a_wake_receipted_before_drain_once_after_restart(monkeypatch, busy):
++@pytest.mark.parametrize("busy,claim_in_flight", [(False, False), (True, False), (False, True)],
++                         ids=["idle", "busy", "claim_in_flight"])
++async def test_authority_route_runs_a_wake_receipted_before_drain_once_after_restart(
++        monkeypatch, busy, claim_in_flight):
+     from gateway.platforms.event import MessageEvent
+     from gateway.run_runtime import recover_profile_native_sessions
+     from gateway.wake import deliver_wake
+ 
++    held = hold_owner_wake_claim(monkeypatch) if claim_in_flight else None
+     executed, hold = [], Hold() if busy else None
+     runner, adapter, authority, source = await authority_route(monkeypatch, "owner", executed, hold)
+     await adapter.handle_message(MessageEvent(text="A", source=source, message_id="A"))
+@@ -89,9 +121,15 @@ async def test_authority_route_runs_a_wake_receipted_before_drain_once_after_res
+             what="the human turn to settle",
+         )
+     await asyncio.wait_for(deliver_wake(adapter, text=WAKE, source=source), 10)  # receipt: no retry
+-    runner._draining = True  # /restart begins before the wake's turn is claimed
++    if held is not None:  # a starved loop: the owner's drain reached the wake's claim first
++        await async_wait_until(held[0].is_set, what="the owner's claim of the wake")
++    runner._draining = True  # /restart begins before the wake's turn is claimed (or committed)
++    if held is not None:
++        held[1].set()
+     if hold is not None:
+         hold.finish.set()
++    _snapshot, timed_out = await runner._drain_active_agents(timeout=30)  # the restart's drain step
++    assert not timed_out
+     await async_wait_until(
+         lambda: admissions(runner, authority, source)[0] == ("messaging", "terminal", "completed"),
+         what="the human turn to settle",
+-- 
+2.55.0
+

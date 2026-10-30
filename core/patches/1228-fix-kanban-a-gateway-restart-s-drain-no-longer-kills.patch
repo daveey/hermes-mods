@@ -1,0 +1,1073 @@
+From b20a8657c3ecc5b66c04a5c94a6c7cafa5a2a010 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 07:04:43 +0000
+Subject: [PATCH] fix(kanban): a gateway restart's drain no longer kills or
+ charges the Kanban runs it waits on [daveey]
+
+2026-10-30, hub and example-laptop: a core update restarted each gateway with managed Kanban
+runs in flight (hub 11, Mac 5+3). The restart's after-turn wait (cap 1800 s) refused
+the submitters' redials as draining/restart_wait/update_paused. Each submitter treated
+that as owner silence and gave up at OWNER_WAIT_S (180 s), its exit made
+_watch_submitter end the very turn the drain was waiting on (Managed worker lost:
+EOFError), and the dead-worker sweep (live waitpid, or the next gateway reading the log
+trailer) booked identical crashes: systemic, gave_up to triage on the first failure.
+
+Worker (kanban_worker_client):
+- A draining/starting answer (GatewayUnavailableError in _TRANSIENT_OWNER_STATES,
+  including restart_wait and update_paused, or GatewayRPCError runtime_draining/retired)
+  counts as an owner answer, up to the owner's own agent.restart_after_turn_timeout.
+  Real silence still fails after OWNER_WAIT_S. A continuous drain ends the worker at
+  cap + OWNER_WAIT_S.
+- After the owner restarted, giving up (or reading an "unknown" receipt) raises
+  OwnerRestartLost and the worker exits KANBAN_OWNER_RESTART_EXIT_CODE (69).
+
+Dispatcher:
+- Exit 69 (reaped or read from the trailer) is kind owner_restart. The run is booked
+  outcome "reclaimed" (metadata owner_restart: true) with ONE "owner_restart_lost"
+  event. The card goes back to ready with consecutive_failures unchanged, and the
+  systemic crash tally skips it.
+- check_respawn_guard spaces the respawn (owner_restart_cooldown, 120 s,
+  HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS). _protocol_violation_streak skips the run.
+
+Tests: test_kanban_worker_owner_restart.py (RED before the fix: 13 of 15), plus the
+silence and restart-wait tests that change meaning. The handoff E2E releases the held
+turn 210 s into the update's drain, and the head column asserts the in-flight run
+completes in one run.
+---
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_db_dispatch.py              | 106 ++----
+ hermes_cli/kanban_db_dispatch_allowlist.py    |  82 +++++
+ hermes_cli/kanban_db_dispatch_dead_worker.py  |   3 +
+ hermes_cli/kanban_db_dispatch_exit_code.py    |   9 +
+ hermes_cli/kanban_owner_unavailable.py        |  34 +-
+ hermes_cli/kanban_worker_client.py            |  70 +++-
+ tests/e2e/core/upgrade/handoff/_scenario.py   |  27 ++
+ .../test_kanban_owner_unavailable.py          |  22 +-
+ .../test_kanban_worker_owner_restart.py       | 336 ++++++++++++++++++
+ .../test_kanban_worker_restart_wait.py        |  10 +-
+ .../test_kanban_worker_socket_recovery.py     |  26 +-
+ 12 files changed, 643 insertions(+), 84 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_allowlist.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_owner_restart.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index cd5a007dae4..d9e2bbb2c5c 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2105,7 +2105,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+         "WHERE task_id = ? AND kind IN ("
+         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
+         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
++        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'owner_restart_lost'"
+         ") ORDER BY id DESC LIMIT 1", (task_id,),
+     ).fetchone()
+     payload = _json_dict(_row_get(row, "payload"))
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 29588f736d5..fa545f870c8 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -34,6 +34,7 @@ from hermes_cli.kanban_suspend_ledger import awake_seconds as _awake_seconds, re
+ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as _guard_hold_started_at
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
+ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code_kind
++from hermes_cli.kanban_db_dispatch_allowlist import _dispatch_profile_allowlist, dispatch_profile_allowlist_summary
+ from hermes_cli import kanban_worker_scope as _worker_scope
+ from hermes_cli import kanban_host_reboot as _host_reboot, kanban_owner_unavailable as _ou  # [daveey]
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+@@ -128,6 +129,14 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
+ # wall, burning a worker slot every tick for hours. Overridable via
+ # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
+ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
++# Spacing after a run lost to its profile owner's restart (``owner_restart_lost``): long enough for
++# the drain to end and the next owner to start, so the respawn does not dial the same drain. [daveey]
++OWNER_RESTART_COOLDOWN_SECONDS = 120
++
++
++def _is_owner_restart_run(run) -> bool:
++    """A ``task_runs`` row the sweep booked as lost to an owner restart (neutral, never a failure)."""
++    return (run["outcome"] or "") == "reclaimed" and bool(_kb._json_dict(run["metadata"]).get("owner_restart"))
+ 
+ # Within this window a GitHub PR URL in a comment blocks re-spawn.
+ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+@@ -1180,7 +1189,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
+     ).fetchall()
+     for row in rows:
+         outcome = row["outcome"] or ""
+-        if outcome == "rate_limited":
++        if outcome == "rate_limited" or _is_owner_restart_run(row):
+             continue
+         head = (row["error"] or "").partition(WORKER_OUTPUT_SEP)[0]  # never the worker's own words
+         if outcome == "crashed" and (
+@@ -1271,7 +1280,7 @@ def _classify_dead_worker(
+         dead = _DeadWorker(kind, None, _worker_scope.describe(failure), kind,
+                            {"pid": pid, "claimer": claimer, **failure})
+     else:
+-        dead = _ou.noted(_classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board), conn, task_id, run_id)
++        dead = _ou.noted(_classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board), conn, task_id, run_id, log)
+     if task_id and not dead.rate_limited:
+         worker_output = _worker_final_output(task_id, board=board)
+         if worker_output:
+@@ -1330,6 +1339,16 @@ def _classify_dead_worker_exit(
+             {"pid": pid, "claimer": claimer, "exit_code": code},
+             rate_limited=True,
+         )
++    if kind == "owner_restart":
++        # The profile owner restarted under the attempt (``KANBAN_OWNER_RESTART_EXIT_CODE``): the
++        # host's event, not the card's, so it never charges the breaker, however many die at once. [daveey]
++        return _DeadWorker(
++            kind, code,
++            f"pid {pid} lost its turn to a gateway restart — requeued without counting a failure",
++            "owner_restart_lost",
++            {"pid": pid, "claimer": claimer, "exit_code": code, "owner_restart": True},
++            owner_restart=True,
++        )
+     if kind == "terminal_provider":
+         # The worker classified its own provider failure as unhealable (credential
+         # revoked, model gone): every further spawn would hit the same wall, so
+@@ -1363,6 +1382,7 @@ class _CrashSweep:
+     rate_limited: list[str] = field(default_factory=list)
+     host_rebooted: list[str] = field(default_factory=list)  # reboot bystanders, requeued uncounted [daveey]
+     owner_unavailable: list[str] = field(default_factory=list)  # owner never answered, requeued uncounted [daveey]
++    owner_restarted: list[str] = field(default_factory=list)  # lost to an owner restart, requeued uncounted [daveey]
+     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
+     # ``_record_task_failure`` (needs its own write_txn).
+     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
+@@ -1449,6 +1469,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                 # A reboot bystander, or an owner that never answered (no turn ran): no failure counted. [daveey]
+                 conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (dead.error_text[:500], row["id"]))
+                 (sweep.owner_unavailable if dead.owner_unavailable else sweep.host_rebooted).append(row["id"])
++            elif dead.owner_restart:  # lost to its owner's restart: requeued, no failure counted [daveey]
++                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?",
++                             (dead.error_text[:500], row["id"]))
++                sweep.owner_restarted.append(row["id"])
+             elif dead.rate_limited:
+                 sweep.rate_limited.append(row["id"])
+                 try:
+@@ -1567,6 +1591,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
+     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+     detect_crashed_workers._last_host_rebooted = sweep.host_rebooted  # type: ignore[attr-defined]
++    detect_crashed_workers._last_owner_restarted = sweep.owner_restarted  # type: ignore[attr-defined]
+     # Fired only now, after the reclaim txn AND breaker accounting have
+     # committed, so subscribers always observe fully durable board state.
+     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
+@@ -1830,6 +1855,13 @@ def check_respawn_guard(
+             ended_at = _kb._to_epoch(latest_run["ended_at"])
+             if ended_at is not None and (now - ended_at) < rl_cooldown:
+                 return "infrastructure_cooldown"
++    if latest_run is not None and _is_owner_restart_run(latest_run):
++        # Lost to its owner's restart: spaced so it does not respawn into the same drain. [daveey]
++        ended_at = _kb._to_epoch(latest_run["ended_at"])
++        cooldown = _kb._env_int("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", OWNER_RESTART_COOLDOWN_SECONDS)
++        if ended_at is not None and (now - ended_at) < cooldown:
++            return "owner_restart_cooldown"
++        return None
+     if latest_run is not None and latest_run["outcome"] == "rate_limited":
+         if rl_cooldown <= 0:
+             # Cooldown disabled — respawn immediately, skipping blocker_auth so
+@@ -1964,75 +1996,6 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
+     return _gated
+ 
+ 
+-def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
+-    """Per-home claim allowlist ``kanban.dispatch_profiles`` (#110995).
+-
+-    On a shared board (one ``kanban.db`` mounted across several Hermes homes),
+-    every home's ``profile_exists`` returns True for ``default`` — the root
+-    profile every home has — so a card assigned to ``default`` is claimable by
+-    every home's dispatcher. A home opts out of foreign claims by declaring
+-    which assignees it may claim::
+-
+-        kanban:
+-          dispatch_profiles: ["sage", "researcher"]   # or "sage,researcher"
+-
+-    Returns ``None`` only when the key is absent from the user config (upstream
+-    behavior: any existing profile is claimable). A present value is
+-    fail-closed: an empty list, ``null`` or a bare ``dispatch_profiles:`` claims
+-    nothing. The user layer is read without the ``DEFAULT_CONFIG`` merge (whose
+-    ``None`` placeholder would make the key look present in every home), and a
+-    config read that raises also claims nothing — a corrupt config on a shared
+-    board must never widen this home's claim scope silently (#113620).
+-    """
+-    try:
+-        from hermes_cli.config_effective import load_user_config_effective
+-        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+-    except Exception as exc:
+-        _kb._log.warning(
+-            "kanban: could not read kanban.dispatch_profiles (%s: %s) — "
+-            "this home claims no cards until the config is readable",
+-            type(exc).__name__, exc,
+-        )
+-        return frozenset()
+-    if not isinstance(kanban, Mapping) or "dispatch_profiles" not in kanban:
+-        return None
+-    raw = kanban["dispatch_profiles"]
+-    if raw is None or (isinstance(raw, str) and not raw.strip()):
+-        _kb._log.warning(
+-            "kanban: kanban.dispatch_profiles is present but empty — this home "
+-            "claims no cards; omit the key to allow any existing profile"
+-        )
+-        return frozenset()
+-    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
+-    allowed = set()
+-    for n in names:
+-        try:
+-            allowed.add(normalize_profile_name(n))
+-        except ValueError:
+-            continue
+-    return frozenset(allowed)
+-
+-
+-def dispatch_profile_allowlist_summary() -> str:
+-    """Human-readable resolution of ``kanban.dispatch_profiles`` for this home.
+-
+-    Surfaced by ``hermes kanban diagnostics`` so an operator on a shared board
+-    can see what a home believes it may claim (#113620): ``any`` (key absent),
+-    the sorted allowed names, or ``none (fail-closed: ...)``.
+-    """
+-    try:
+-        from hermes_cli.profiles import normalize_profile_name
+-    except Exception as exc:
+-        return f"none (fail-closed: profiles unavailable: {exc})"
+-    allowlist = _dispatch_profile_allowlist(normalize_profile_name)
+-    if allowlist is None:
+-        return "any"
+-    if allowlist:
+-        return ", ".join(sorted(allowlist))
+-    return ("none (fail-closed: kanban.dispatch_profiles is present but names no valid "
+-            "profile, or the config could not be read — omit the key to allow any)")
+-
+-
+ def _local_refusals(conn: sqlite3.Connection, status: str) -> dict[str, str]:
+     """Cards in ``status`` this machine cannot lease (``kanban_worker_node.local_refusals``); never raises."""
+     try:
+@@ -2499,6 +2462,7 @@ def _run_reclaim_phase(
+     # went back to ``ready`` and the respawn guard defers them until quota clears.
+     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
+     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
++    result.reclaimed += len(getattr(detect_crashed_workers, "_last_owner_restarted", []))  # [daveey]
+     result.timed_out = enforce_max_runtime(conn)
+     from hermes_cli.kanban_continuation import wake_due_continuations
+     result.woken_continuations = wake_due_continuations(conn)
+diff --git a/hermes_cli/kanban_db_dispatch_allowlist.py b/hermes_cli/kanban_db_dispatch_allowlist.py
+new file mode 100644
+index 00000000000..0073ce41bb9
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_allowlist.py
+@@ -0,0 +1,82 @@
++"""Per-home claim allowlist ``kanban.dispatch_profiles`` (#110995). [daveey]
++
++Split out of ``kanban_db_dispatch`` (code-health file cap); re-exported there.
++"""
++
++from __future__ import annotations
++
++import logging
++
++from typing import Mapping
++from typing import Optional
++
++_log = logging.getLogger("hermes_cli.kanban_db")  # the dispatcher's own log name
++
++
++def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
++    """Per-home claim allowlist ``kanban.dispatch_profiles`` (#110995).
++
++    On a shared board (one ``kanban.db`` mounted across several Hermes homes),
++    every home's ``profile_exists`` returns True for ``default`` — the root
++    profile every home has — so a card assigned to ``default`` is claimable by
++    every home's dispatcher. A home opts out of foreign claims by declaring
++    which assignees it may claim::
++
++        kanban:
++          dispatch_profiles: ["sage", "researcher"]   # or "sage,researcher"
++
++    Returns ``None`` only when the key is absent from the user config (upstream
++    behavior: any existing profile is claimable). A present value is
++    fail-closed: an empty list, ``null`` or a bare ``dispatch_profiles:`` claims
++    nothing. The user layer is read without the ``DEFAULT_CONFIG`` merge (whose
++    ``None`` placeholder would make the key look present in every home), and a
++    config read that raises also claims nothing — a corrupt config on a shared
++    board must never widen this home's claim scope silently (#113620).
++    """
++    try:
++        from hermes_cli.config_effective import load_user_config_effective
++        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
++    except Exception as exc:
++        _log.warning(
++            "kanban: could not read kanban.dispatch_profiles (%s: %s) — "
++            "this home claims no cards until the config is readable",
++            type(exc).__name__, exc,
++        )
++        return frozenset()
++    if not isinstance(kanban, Mapping) or "dispatch_profiles" not in kanban:
++        return None
++    raw = kanban["dispatch_profiles"]
++    if raw is None or (isinstance(raw, str) and not raw.strip()):
++        _log.warning(
++            "kanban: kanban.dispatch_profiles is present but empty — this home "
++            "claims no cards; omit the key to allow any existing profile"
++        )
++        return frozenset()
++    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
++    allowed = set()
++    for n in names:
++        try:
++            allowed.add(normalize_profile_name(n))
++        except ValueError:
++            continue
++    return frozenset(allowed)
++
++
++def dispatch_profile_allowlist_summary() -> str:
++    """Human-readable resolution of ``kanban.dispatch_profiles`` for this home.
++
++    Surfaced by ``hermes kanban diagnostics`` so an operator on a shared board
++    can see what a home believes it may claim (#113620): ``any`` (key absent),
++    the sorted allowed names, or ``none (fail-closed: ...)``.
++    """
++    try:
++        from hermes_cli.profiles import normalize_profile_name
++    except Exception as exc:
++        return f"none (fail-closed: profiles unavailable: {exc})"
++    allowlist = _dispatch_profile_allowlist(normalize_profile_name)
++    if allowlist is None:
++        return "any"
++    if allowlist:
++        return ", ".join(sorted(allowlist))
++    return ("none (fail-closed: kanban.dispatch_profiles is present but names no valid "
++            "profile, or the config could not be read — omit the key to allow any)")
+diff --git a/hermes_cli/kanban_db_dispatch_dead_worker.py b/hermes_cli/kanban_db_dispatch_dead_worker.py
+index 741d30551af..34d65fcdd3b 100644
+--- a/hermes_cli/kanban_db_dispatch_dead_worker.py
++++ b/hermes_cli/kanban_db_dispatch_dead_worker.py
+@@ -26,6 +26,7 @@ class _DeadWorker:
+     host_reboot: bool = False  # the host rebooted under the worker: no failure counted [daveey]
+     reboot_culprit: Optional[dict] = None  # this card's own sudo shutdown (journal line): blocked at once [daveey]
+     owner_unavailable: bool = False  # the profile owner never answered the claim: no failure counted [daveey]
++    owner_restart: bool = False  # the profile owner restarted under the attempt: requeued uncounted [daveey]
+ 
+     @property
+     def run_outcome(self) -> str:
+@@ -33,6 +34,8 @@ class _DeadWorker:
+             return HOST_REBOOT_OUTCOME
+         if self.owner_unavailable:
+             return OWNER_UNAVAILABLE_OUTCOME
++        if self.owner_restart:
++            return "reclaimed"
+         if self.event_kind in {"oom_killed", "signaled"}:
+             return self.kind
+         # A rate-limited requeue is recorded as ``rate_limited`` so board history
+diff --git a/hermes_cli/kanban_db_dispatch_exit_code.py b/hermes_cli/kanban_db_dispatch_exit_code.py
+index 331c01116cb..257d363957d 100644
+--- a/hermes_cli/kanban_db_dispatch_exit_code.py
++++ b/hermes_cli/kanban_db_dispatch_exit_code.py
+@@ -5,6 +5,13 @@ Split out of ``kanban_db_dispatch`` (code-health file cap).
+ 
+ from __future__ import annotations
+ 
++# Worker exit "the profile owner restarted under this attempt" (its restart wait outlasted its own cap,
++# or the restart ended the turn): the host's restart, not the card's fault, so the sweep requeues it as
++# ``reclaimed`` WITHOUT counting a failure (``kanban_worker_client.OwnerRestartLost``). Only for a
++# run the owner ADMITTED; one it never admitted exits 69 (``kanban_owner_unavailable``). 76 == BSD
++# EX_PROTOCOL, unused by any other worker exit. [daveey]
++KANBAN_OWNER_RESTART_EXIT_CODE = 76
++
+ 
+ def exit_code_kind(code: int) -> tuple[str, int]:
+     """``(kind, code)`` for a worker's exit code, however it was observed."""
+@@ -19,4 +26,6 @@ def exit_code_kind(code: int) -> tuple[str, int]:
+         return ("terminal_provider", code)
+     if code == KANBAN_OWNER_UNAVAILABLE_EXIT_CODE:
+         return ("owner_unavailable", code)
++    if code == KANBAN_OWNER_RESTART_EXIT_CODE:
++        return ("owner_restart", code)
+     return ("nonzero_exit", code)
+diff --git a/hermes_cli/kanban_owner_unavailable.py b/hermes_cli/kanban_owner_unavailable.py
+index 830f31b2a81..2982845f9f2 100644
+--- a/hermes_cli/kanban_owner_unavailable.py
++++ b/hermes_cli/kanban_owner_unavailable.py
+@@ -18,6 +18,7 @@ Either way the run falls back to the ordinary ``crashed`` booking.
+ """
+ from __future__ import annotations
+ 
++import re
+ import sqlite3
+ 
+ OWNER_UNAVAILABLE_OUTCOME = "owner_unavailable"
+@@ -50,8 +51,39 @@ def _neutral_streak(conn: sqlite3.Connection, task_id: str) -> int:
+     return streak
+ 
+ 
+-def noted(dead, conn, task_id, run_id):
++# A worker client older than exits 69/76 (still imported in a worker that was in flight when the
++# gateway restart installing them began) gives up with exit 1 and this as its final line. Only the
++# client's own words: it prints nothing of the agent's before refusing. [daveey]
++_LEGACY_REFUSAL_RE = re.compile(
++    r"^Kanban owner refused: Kanban owner silent for \d+s: Gateway (?:draining|starting)\b")
++
++
++def legacy_refusal_in_log(log: str) -> bool:
++    """True when the dead run's own part of the log ends with the old client's drain refusal."""
++    from hermes_cli.kanban_worker_log import current_run_log
++    lines = [ln.strip() for ln in current_run_log(log or "").splitlines() if ln.strip()]
++    return bool(lines) and bool(_LEGACY_REFUSAL_RE.match(lines[-1]))
++
++
++def _note_legacy(dead, conn, task_id, run_id, log) -> None:
++    """Transition drain: rebook an old client's exit-1 drain refusal as the exit the new client would
++    have used. Admitted (a turn ran, the restart took it) -> owner restart (76); else -> 69. [daveey]"""
++    if not (dead.kind == "nonzero_exit" and dead.code == 1 and log and legacy_refusal_in_log(log)):
++        return
++    if conn is not None and task_id and _owner_admitted(conn, task_id, run_id):
++        pid = dead.event_payload.get("pid")
++        dead.kind, dead.owner_restart, dead.event_kind = "owner_restart", True, "owner_restart_lost"
++        dead.event_payload.update(exit_kind="owner_restart", owner_restart=True, detected_by="log")
++        dead.error_text = (f"pid {pid} lost its turn to a gateway restart (pre-fix worker's drain "
++                           "refusal) — requeued without counting a failure")
++        return
++    dead.kind = EXIT_KIND
++    dead.event_payload["detected_by"] = "log"
++
++
++def noted(dead, conn, task_id, run_id, log=None):
+     """``note`` then return *dead* (one expression at the call site)."""
++    _note_legacy(dead, conn, task_id, run_id, log)
+     note(dead, conn, task_id, run_id)
+     return dead
+ 
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index 70aca503f34..667e97f5052 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -15,6 +15,8 @@ import sys
+ import time
+ from typing import Optional
+ 
++from hermes_cli.gateway_client import GatewayClientError as _GatewayClientError
++
+ # A worker that loses its owner (a dropped socket, a restart, `hermes update` draining it or a new
+ # owner still starting) waits for it instead of exiting: the condition is the host's, not the card's,
+ # and a failed exit here spends the card's failure budget and lets the owner end the turn. Asking
+@@ -45,15 +47,67 @@ def admission_answer_budget():
+     return lock_wait + ADMISSION_ANSWER_MARGIN_S
+ 
+ 
++def restart_wait_budget():
++    """Seconds a drain's ``draining``/``starting`` answers keep refreshing the worker's silence budget.
++
++    That owner is alive and holds this attempt's turn until the turn ends or its own cap
++    (``agent.restart_after_turn_timeout``) force-drains it, then stops; the ``OWNER_WAIT_S`` of
++    silence the worker still allows after this covers the stop and the next owner's start, so a
++    continuous drain ends the worker at cap + ``OWNER_WAIT_S``. Counting the refusal as silence ended every Kanban turn a restart
++    waited on ``OWNER_WAIT_S`` into the wait (2026-10-30 hub: 11 runs, all booked crashed). [daveey]"""
++    from gateway.restart import parse_restart_after_turn_timeout
++    raw = os.environ.get('HERMES_RESTART_AFTER_TURN_TIMEOUT', '').strip() or None
++    if raw is None:
++        try:
++            from hermes_cli.config import load_config
++            raw = (load_config().get('agent') or {}).get('restart_after_turn_timeout')
++        except Exception:  # health: allow BLE001 -- an unreadable config falls back to the default cap
++            raw = None
++    return parse_restart_after_turn_timeout(raw)
++
++
++class OwnerRestartLost(_GatewayClientError):
++    """The owner's restart ended this attempt: its restart wait outlasted ``restart_wait_budget`` or
++    the next owner reports the turn ``unknown``. Exits ``KANBAN_OWNER_RESTART_EXIT_CODE``, which the
++    dead-worker sweep requeues without counting a failure. [daveey]"""
++
++
+ @dataclass
+ class _Claim:
+     """What the owner has said about this attempt, carried across connections."""
+     answered: float  # monotonic time of the owner's last answer
+     session_id: Optional[str] = None
+     admission_id: Optional[str] = None
++    waiting: Optional[float] = None  # monotonic time the owner's current restart wait was first seen
++    alive: float = float('-inf')  # monotonic time the owner last refused us from inside that wait
++    restarted: bool = False  # the owner restarted (or began to) during this attempt
+ 
+     def silent_for(self):
+-        return time.monotonic() - self.answered
++        return time.monotonic() - max(self.answered, self.alive)
++
++    def note_refusal(self, exc):
++        """An owner refusing us because it is draining (a restart's after-turn wait, ``hermes update``
++        pausing it) answered over its live control socket or session: it is alive and still runs the
++        turn, so it refreshes the silence budget until the drain outlasts the owner's own cap
++        (``restart_wait_budget``). ``starting`` and a lost transport only mark the restart."""
++        from hermes_cli.gateway_client import GatewayRPCError, GatewayUnavailableError
++        if isinstance(exc, GatewayRPCError):
++            draining = str(exc) in _TRANSIENT_RPC_REASONS
++        elif isinstance(exc, GatewayUnavailableError) and exc.state in _TRANSIENT_OWNER_STATES:
++            # draining comes only from a live control-socket identify (restart_wait) or a live update
++            # fence (update_paused); starting only from a strictly held gateway.lock. An idle exit
++            # is an owner leaving with no work, so not one running this turn.
++            draining = exc.reason_code != 'idle_exit'
++        else:
++            return
++        self.restarted = self.admission_id is not None
++        if not draining:
++            return
++        now = time.monotonic()
++        if self.waiting is None or self.waiting < self.answered:
++            self.waiting = now  # a new drain (the owner answered since the last one)
++        if now - self.waiting < restart_wait_budget():
++            self.alive = now
+ 
+ 
+ async def run(params, board_db):
+@@ -65,7 +119,8 @@ async def run(params, board_db):
+     # A lost socket is not a lost attempt, and exiting here would let ``_watch_submitter`` end the
+     # owner's in-flight turn, so the next connection resumes whatever the last one reached. The
+     # wait is bounded from the owner's last answer: an owner that keeps answering keeps the
+-    # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly.
++    # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly. An owner
++    # refusing us from its restart wait counts as answering, up to that wait's own cap.
+     claim = _Claim(answered=time.monotonic())
+     failures = 0
+     while True:
+@@ -89,12 +144,16 @@ async def run(params, board_db):
+         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
+             if not _restartable(exc):
+                 raise
++            claim.note_refusal(exc)
+             if claim.silent_for() >= OWNER_WAIT_S:
+                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
+                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
+                     f' (HTTP {status})' if status else '')
+                 message = f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}'
++                if claim.restarted:
++                    # An ADMITTED turn lost to the owner's restart: exit 76, requeued uncounted. [daveey]
++                    raise OwnerRestartLost(message) from exc
+                 error = GatewayClientError(message)
+                 # [daveey] No admission answer reached us: the host's condition, not the card's. The
+                 # exit says so and the dispatcher requeues the run uncounted unless the board shows
+@@ -103,6 +162,8 @@ async def run(params, board_db):
+                 error.owner_unavailable = claim.admission_id is None
+                 raise error from exc
+         else:
++            if receipt['status'] == 'unknown' and claim.restarted:
++                raise OwnerRestartLost('Kanban execution unknown after an owner restart; retained by owner')
+             return _exit_code(receipt, params, board_db)
+         failures = 1 if claim.answered != seen else failures + 1
+         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
+@@ -201,6 +262,11 @@ def _submit():
+         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
+             os.environ.pop(key, None)
+         return asyncio.run(run(params, board_db))
++    except OwnerRestartLost as exc:
++        # The owner's restart, not the card: the sweep requeues this exit without a failure. [daveey]
++        from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
++        print(f'Kanban owner restarted: {exc}', file=sys.stderr)
++        return KANBAN_OWNER_RESTART_EXIT_CODE
+     except (KeyError, ValueError, OSError) as exc:
+         print(f'Kanban owner refused: {exc}', file=sys.stderr)
+         if getattr(exc, 'owner_unavailable', False):
+diff --git a/tests/e2e/core/upgrade/handoff/_scenario.py b/tests/e2e/core/upgrade/handoff/_scenario.py
+index 79f02355d8f..4b2069c4803 100644
+--- a/tests/e2e/core/upgrade/handoff/_scenario.py
++++ b/tests/e2e/core/upgrade/handoff/_scenario.py
+@@ -269,6 +269,22 @@ def _quiet_wait(pred, *, timeout: float, what: str, interval: float = 1.0):
+ 
+ # -- the scenario ---------------------------------------------------------------------------------
+ 
++# How long into the update's drain the held kanban turn ends: past the 180 s a worker used to give
++# up on a draining owner (``kanban_worker_client.OWNER_WAIT_S``), well inside the drain's cap. [daveey]
++HOLD_INTO_DRAIN_S = 210
++_DRAIN_STARTED = "Restart requested with"
++
++
++def _release_inside_the_drain(inst, model: Model) -> None:
++    log = inst.hermes_home / "logs" / "gateway.log"
++    deadline = time.monotonic() + 1500
++    while not model.release.is_set() and time.monotonic() < deadline:
++        if log.exists() and _DRAIN_STARTED in log.read_text(errors="replace"):
++            model.release.wait(timeout=HOLD_INTO_DRAIN_S)
++            model.release.set()
++            return
++        time.sleep(1)
++
+ 
+ def run(column: str, root: Path) -> SimpleNamespace:
+     """Boot the fleet, update, let everything settle, and record what the user would see."""
+@@ -309,6 +325,11 @@ def run(column: str, root: Path) -> SimpleNamespace:
+             o.job_id = job["id"]
+             assert not model.cron_calls, "premise: the job ran before it was due"
+ 
++            # The held turn ends inside the update's drain, past the old 180 s worker give-up: the
++            # drain waits for it and the worker outlasts it (it used to give up at 180 s and the
++            # update's drain "completed" on a dead turn). The update returning releases it too.
++            releaser = threading.Thread(target=_release_inside_the_drain, args=(inst, model), daemon=True)
++            releaser.start()
+             o.up = inst.update()
+             o.sha_after = inst.sha()
+ 
+@@ -472,6 +493,12 @@ class HandoffProperties:
+         # The in-flight worker finishes, or the update interrupts it and it is re-queued exactly once.
+         assert len(o.runs[o.card1]) <= 2, f"the in-flight card ran {len(o.runs[o.card1])} times\n{o.diag}"
+         assert len(o.runs[o.card2]) == 1, f"the new card ran {len(o.runs[o.card2])} times\n{o.diag}"
++        if o.column == "head":
++            # The updater under test drains its own restart: the in-flight turn outlives the old
++            # 180 s give-up and finishes in its one run, never booked a crash. (n1's worker is the
++            # previous release's and still gives up at 180 s.) [daveey]
++            outcomes = [r["outcome"] for r in o.runs[o.card1]]
++            assert outcomes == ["completed"], f"the drain lost the in-flight run: {outcomes}\n{o.diag}"
+ 
+ 
+ def dashboard_verdict(o) -> str:
+diff --git a/tests/hermes_cli/test_kanban_owner_unavailable.py b/tests/hermes_cli/test_kanban_owner_unavailable.py
+index bc1160c7072..a95fc2216c5 100644
+--- a/tests/hermes_cli/test_kanban_owner_unavailable.py
++++ b/tests/hermes_cli/test_kanban_owner_unavailable.py
+@@ -75,10 +75,30 @@ def test_owner_that_never_admits_exits_owner_unavailable(monkeypatch, tmp_path,
+     assert "Kanban owner refused: Kanban owner silent for" in capsys.readouterr().err
+ 
+ 
+-def test_owner_that_admitted_then_went_silent_still_exits_1(monkeypatch, tmp_path):
++def test_owner_that_admitted_then_drained_past_its_cap_exits_owner_restart(monkeypatch, tmp_path):
++    # An admitted turn the restart took (the drain outlasted restart_after_turn_timeout): 76, not
++    # 69 (never admitted) and not 1 (a crash). [daveey]
++    from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
+     _fake_clock(monkeypatch)
+     _submit_env(monkeypatch, tmp_path)
+     monkeypatch.setattr(gateway_client, "connect_gateway", _owner(admit_first=True))
++    assert kanban_worker_client._submit() == KANBAN_OWNER_RESTART_EXIT_CODE == 76
++
++
++def test_owner_that_admitted_then_went_silent_still_exits_1(monkeypatch, tmp_path):
++    _fake_clock(monkeypatch)
++    _submit_env(monkeypatch, tmp_path)
++    admit = _owner(admit_first=True)
++    dials = [0]
++
++    @asynccontextmanager
++    async def _connect(*a, **kw):
++        dials[0] += 1
++        if dials[0] > 1:
++            raise ConnectionRefusedError("no owner")  # silence, not a draining answer
++        async with admit(*a, **kw) as client:
++            yield client
++    monkeypatch.setattr(gateway_client, "connect_gateway", _connect)
+     assert kanban_worker_client._submit() == 1
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_owner_restart.py b/tests/hermes_cli/test_kanban_worker_owner_restart.py
+new file mode 100644
+index 00000000000..9261d48d4ed
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_owner_restart.py
+@@ -0,0 +1,336 @@
++"""A gateway restart never kills or charges the Kanban runs it is waiting on. [daveey]
++
++2026-10-30, hermes-hub: ``hermes update`` asked the gateway to restart with 16 managed Kanban runs in
++flight. Its after-turn wait (``agent.restart_after_turn_timeout``, 1800 s) cut each run's submitter
++socket and refused the redial as ``draining``/``restart_wait``, and the submitter counted that refusal
++as owner silence. 180 s in (``OWNER_WAIT_S``) all 11 still running gave up ("Kanban owner silent for
++192s: Gateway draining: restart_wait"), their exit made ``_watch_submitter`` end the very turns the
++wait was waiting on (``Managed worker lost: EOFError``), and the dead-worker sweep booked 11 identical
++crashes as systemic: ``gave_up`` to triage on the first failure.
++
++* A submitter waits out an owner that keeps answering ``restart_wait`` for as long as that owner's
++  own after-turn cap, then gives up only past it.
++* A submitter whose attempt is lost to the owner's restart exits ``KANBAN_OWNER_RESTART_EXIT_CODE``,
++  and the sweep requeues it as ``reclaimed`` without counting a failure, however many die together.
++"""
++
++import asyncio
++import time
++from contextlib import asynccontextmanager
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.drain_control import RESTART_WAIT_REASON
++from hermes_cli import gateway_client, kanban_worker_client
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
++
++GUE = gateway_client.GatewayUnavailableError
++
++
++@pytest.fixture(autouse=True)
++def _env(monkeypatch):
++    monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
++    monkeypatch.setenv("HERMES_RESTART_AFTER_TURN_TIMEOUT", "1800")
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [0.0]
++    monkeypatch.setattr(kanban_worker_client, "time", SimpleNamespace(monotonic=lambda: now[0]))
++
++    async def _sleep(seconds):
++        now[0] += seconds
++    monkeypatch.setattr(kanban_worker_client.asyncio, "sleep", _sleep)
++    return now
++
++
++class _Owner:
++    """First connection admits the claim (pending); the restart then cuts it and refuses every
++    redial with ``refusal`` until ``wait_ends`` (``None``: never). After that a new owner answers
++    the receipt ``final``."""
++
++    def __init__(self, clock, wait_ends, final="terminal", refusal=("draining", RESTART_WAIT_REASON)):
++        self.clock, self.wait_ends, self.final, self.refusal = clock, wait_ends, final, refusal
++        self.dials = 0
++
++    def connect(self):
++        owner = self
++
++        @asynccontextmanager
++        async def _connect(*_, **__):
++            owner.dials += 1
++            first = owner.dials == 1
++            in_wait = not first and (owner.wait_ends is None or owner.clock[0] < owner.wait_ends)
++            if in_wait:
++                if owner.refusal is None:
++                    raise ConnectionRefusedError("owner gone")
++                state, reason = owner.refusal
++                raise GUE(f"Gateway {state}: {reason}", state, reason)
++
++            class _Client:
++                events = asyncio.Queue()
++
++                async def rpc(self, method, **params):
++                    if method == "kanban.run":
++                        return {"session_id": "s1", "receipt": {"status": "pending", "admission_id": "a1"}}
++                    if first:
++                        raise gateway_client.GatewayClientError("Gateway disconnected; turn outcome is unknown")
++                    return {"status": owner.final}
++
++            yield _Client()
++
++        return _connect
++
++
++_RESTARTING = [("draining", RESTART_WAIT_REASON), ("draining", "update_paused"), ("starting", None)]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("refusal", _RESTARTING)
++async def test_a_worker_outlasts_a_restart_wait_longer_than_owner_wait(monkeypatch, clock, tmp_path, refusal):
++    # The turn runs 10 min into the drain (> OWNER_WAIT_S), then the next owner holds its receipt.
++    owner = _Owner(clock, wait_ends=600.0, refusal=refusal)
++    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
++    monkeypatch.setattr(kanban_worker_client, "_exit_code", lambda receipt, params, db: 0)
++    assert await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db")) == 0
++    assert clock[0] >= 600.0 > kanban_worker_client.OWNER_WAIT_S
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("refusal", _RESTARTING)
++async def test_a_restart_wait_past_its_own_cap_ends_the_worker_as_an_owner_restart(
++        monkeypatch, clock, tmp_path, refusal):
++    owner = _Owner(clock, wait_ends=None, refusal=refusal)
++    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
++    with pytest.raises(kanban_worker_client.OwnerRestartLost, match="owner silent"):
++        await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
++    assert clock[0] >= 1800.0 + kanban_worker_client.OWNER_WAIT_S - 20  # the last refresh lands up to one backoff early
++    # Bounded: it never waits on a wedged owner much past the owner's own cap.
++    assert clock[0] < 1800.0 + kanban_worker_client.OWNER_WAIT_S + 60
++
++
++@pytest.mark.asyncio
++async def test_an_owner_silent_with_no_draining_answer_still_fails_at_owner_wait(monkeypatch, clock, tmp_path):
++    owner = _Owner(clock, wait_ends=None, refusal=None)  # refused dials only: no owner says anything
++    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
++    with pytest.raises(gateway_client.GatewayClientError, match="owner silent") as raised:
++        await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
++    assert not isinstance(raised.value, kanban_worker_client.OwnerRestartLost)
++    assert kanban_worker_client.OWNER_WAIT_S <= clock[0] < 2 * kanban_worker_client.OWNER_WAIT_S
++
++
++@pytest.mark.asyncio
++async def test_a_turn_the_restart_killed_reads_as_an_owner_restart(monkeypatch, clock, tmp_path):
++    # Force drain at the cap ended the turn: the next owner answers ``unknown``.
++    owner = _Owner(clock, wait_ends=60.0, final="unknown")
++    monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
++    with pytest.raises(kanban_worker_client.OwnerRestartLost):
++        await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
++
++
++@pytest.mark.asyncio
++async def test_an_unknown_turn_with_no_restart_stays_a_failure(monkeypatch, clock, tmp_path):
++    class _Client:
++        events = asyncio.Queue()
++
++        async def rpc(self, method, **params):
++            return {"session_id": "s1", "receipt": {"status": "unknown", "admission_id": "a1"}}
++
++    @asynccontextmanager
++    async def _connect(*_, **__):
++        yield _Client()
++    monkeypatch.setattr(gateway_client, "connect_gateway", _connect)
++    with pytest.raises(gateway_client.GatewayClientError) as raised:
++        await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
++    assert not isinstance(raised.value, kanban_worker_client.OwnerRestartLost)
++
++
++def test_main_exits_with_the_owner_restart_code(monkeypatch, tmp_path, capsys):
++    for key, value in {"HERMES_KANBAN_BOARD": "default", "HERMES_KANBAN_TASK": "t1", "HERMES_KANBAN_RUN_ID": "1",
++                       "HERMES_KANBAN_CLAIM_LOCK": "h:1", "HERMES_KANBAN_DB": str(tmp_path / "kanban.db")}.items():
++        monkeypatch.setenv(key, value)
++
++    async def _lost(params, board_db):
++        raise kanban_worker_client.OwnerRestartLost("Kanban owner silent for 1990s: Gateway draining: restart_wait")
++    monkeypatch.setattr(kanban_worker_client, "run", _lost)
++    assert kanban_worker_client.main() == KANBAN_OWNER_RESTART_EXIT_CODE
++    assert f"rc={KANBAN_OWNER_RESTART_EXIT_CODE}" in capsys.readouterr().err
++
++
++# --- dispatcher: the sweep books an owner-restart exit as a reclaim, never a crash --------------------
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++    monkeypatch.setattr(kbd, "_worker_final_output", lambda *a, **kw: "")
++    return tmp_path
++
++
++def _running(conn, title, pid):
++    tid = kb.create_task(conn, title=title, assignee="default")
++    host = kb._claimer_id().split(":", 1)[0]
++    kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?", (pid, int(time.time()) - 600, tid))
++    return tid
++
++
++def _reaped(monkeypatch, codes):
++    exits = {pid: ((code & 0xFF) << 8, time.time()) for pid, code in codes.items()}
++    monkeypatch.setattr(kbd, "_recent_worker_exits", exits)
++
++
++def test_eleven_workers_lost_to_one_restart_are_all_requeued_uncounted(board, monkeypatch):
++    with kbc.connect() as conn:
++        pids = list(range(72001, 72012))
++        tids = [_running(conn, f"card {pid}", pid) for pid in pids]
++        _reaped(monkeypatch, {pid: KANBAN_OWNER_RESTART_EXIT_CODE for pid in pids})
++        assert kbd.detect_crashed_workers(conn) == []
++        assert kbd.detect_crashed_workers._last_auto_blocked == []  # type: ignore[attr-defined]
++        assert sorted(kbd.detect_crashed_workers._last_owner_restarted) == sorted(tids)  # type: ignore[attr-defined]
++        for tid in tids:
++            task = kb.get_task(conn, tid)
++            assert task is not None
++            assert task.status == "ready" and task.consecutive_failures == 0
++            outcome, error = conn.execute(
++                "SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++            assert outcome == "reclaimed" and "gateway restart" in error
++            kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
++            assert "crashed" not in kinds and "gave_up" not in kinds
++            assert kinds.count("owner_restart_lost") == 1
++            # Spaced like a quota requeue, so it does not respawn into the same drain.
++            assert kbd.check_respawn_guard(conn, tid) == "owner_restart_cooldown"
++        assert kbd._protocol_violation_streak(conn, tids[0]) == 0
++
++
++def test_a_requeued_owner_restart_respawns_after_its_cooldown(board, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", "0")
++    with kbc.connect() as conn:
++        tid = _running(conn, "card", 74001)
++        _reaped(monkeypatch, {74001: KANBAN_OWNER_RESTART_EXIT_CODE})
++        kbd.detect_crashed_workers(conn)
++        assert kbd.check_respawn_guard(conn, tid) is None
++
++
++def test_same_error_ordinary_crashes_still_trip_the_systemic_hold(board, monkeypatch):
++    with kbc.connect() as conn:
++        pids = [75001, 75002, 75003]
++        tids = [_running(conn, f"card {pid}", pid) for pid in pids]
++        _reaped(monkeypatch, {pid: 1 for pid in pids})
++        assert sorted(kbd.detect_crashed_workers(conn)) == sorted(tids)
++        for tid in tids:
++            kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
++            assert "gave_up" in kinds
++
++
++def test_a_restart_lost_exit_booked_by_the_next_gateway_is_requeued_too(board, monkeypatch):
++    # 2026-10-30 example-laptop: the draining gateway never reaped its workers; the next gateway process
++    # booked their exits ~100 s later from the worker log's exit trailer, as plain crashes.
++    from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
++    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
++    trailer = f"Kanban owner restarted: ...\n{KANBAN_WORKER_EXIT_TRAILER}{KANBAN_OWNER_RESTART_EXIT_CODE}\n"
++    monkeypatch.setattr(kb, "read_worker_log", lambda *a, **kw: trailer)
++    with kbc.connect() as conn:
++        tids = [_running(conn, f"card {pid}", pid) for pid in (76001, 76002, 76003)]
++        assert kbd.detect_crashed_workers(conn) == []
++        for tid in tids:
++            task = kb.get_task(conn, tid)
++            assert task is not None
++            assert task.status == "ready" and task.consecutive_failures == 0
++            kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
++            assert "owner_restart_lost" in kinds and "gave_up" not in kinds and "crashed" not in kinds
++
++
++def test_a_plain_nonzero_exit_is_still_a_crash(board, monkeypatch):
++    with kbc.connect() as conn:
++        tid = _running(conn, "card", 73001)
++        _reaped(monkeypatch, {73001: 1})
++        assert kbd.detect_crashed_workers(conn) == [tid]
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++
++
++def test_owner_restart_is_its_own_exit_not_the_never_admitted_one():
++    # 69 = never admitted (kanban_owner_unavailable, streak breaker); 76 = an admitted turn the
++    # restart took. One code for both would book an admitted loss as a crash.
++    from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind
++    from hermes_cli.kanban_owner_unavailable import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++    assert KANBAN_OWNER_RESTART_EXIT_CODE != KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++    assert exit_code_kind(KANBAN_OWNER_RESTART_EXIT_CODE)[0] == "owner_restart"
++    assert exit_code_kind(KANBAN_OWNER_UNAVAILABLE_EXIT_CODE)[0] == "owner_unavailable"
++
++
++def test_restart_losses_in_a_row_on_one_card_never_block_it(board, monkeypatch):
++    # t_01a18bf8fc6d1564 (c): repeated drains each take one run of the same card.
++    monkeypatch.setenv("HERMES_KANBAN_OWNER_RESTART_COOLDOWN_SECONDS", "0")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="card", assignee="default", max_retries=2)
++        host = kb._claimer_id().split(":", 1)[0]
++        for i, pid in enumerate((77001, 77002, 77003)):
++            kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
++                             (pid, int(time.time()) - 600, tid))
++            _reaped(monkeypatch, {pid: KANBAN_OWNER_RESTART_EXIT_CODE})
++            assert kbd.detect_crashed_workers(conn) == []
++            task = kb.get_task(conn, tid)
++            assert task is not None
++            assert (task.status, task.consecutive_failures, task.block_kind) == ("ready", 0, None), i
++        kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
++        assert kinds.count("owner_restart_lost") == 3
++        assert "crashed" not in kinds and "gave_up" not in kinds
++
++
++_LEGACY = "Kanban owner refused: Kanban owner silent for 184s: Gateway draining: restart_wait"
++
++
++def _legacy_log(monkeypatch, text):
++    from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
++    log = f"{text}\n{KANBAN_WORKER_EXIT_TRAILER}1\n"
++    monkeypatch.setattr(kb, "read_worker_log", lambda *a, **kw: log)
++    monkeypatch.setattr(kbd, "_recent_worker_exits", {})
++
++
++def test_a_pre_fix_worker_refused_by_the_drain_after_admission_is_an_owner_restart(board, monkeypatch):
++    # The transition drain: workers in flight when the update installing this fix restarts the
++    # gateway still run the old client, which exits 1 with this line (t_01a188eb959227ce 7643/7665).
++    _legacy_log(monkeypatch, _LEGACY)
++    with kbc.connect() as conn:
++        tid = _running(conn, "card", 78001)
++        run_id = kb.get_task(conn, tid).current_run_id
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "owner_admitted", {}, run_id=run_id)
++        from hermes_cli import kanban_owner_recovery
++        monkeypatch.setattr(kanban_owner_recovery, "owner_reclaim_blocked", lambda *a, **k: False)
++        assert kbd.detect_crashed_workers(conn) == []
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.consecutive_failures == 0
++        outcome = conn.execute("SELECT outcome FROM task_runs WHERE id=?", (run_id,)).fetchone()[0]
++        assert outcome == "reclaimed"
++        kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
++        assert "owner_restart_lost" in kinds and "crashed" not in kinds and "gave_up" not in kinds
++
++
++def test_a_pre_fix_worker_refused_before_admission_is_owner_unavailable(board, monkeypatch):
++    _legacy_log(monkeypatch, _LEGACY)
++    with kbc.connect() as conn:
++        tid = _running(conn, "card", 78101)
++        assert kbd.detect_crashed_workers(conn) == []
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.consecutive_failures == 0
++        outcome = conn.execute("SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                               (tid,)).fetchone()[0]
++        assert outcome == "owner_unavailable"
++
++
++def test_an_exit_1_whose_last_line_is_not_the_drain_refusal_is_still_a_crash(board, monkeypatch):
++    _legacy_log(monkeypatch, _LEGACY + "\nTraceback (most recent call last): boom")
++    with kbc.connect() as conn:
++        tid = _running(conn, "card", 78201)
++        assert kbd.detect_crashed_workers(conn) == [tid]
++        assert kb.get_task(conn, tid).consecutive_failures == 1
+diff --git a/tests/hermes_cli/test_kanban_worker_restart_wait.py b/tests/hermes_cli/test_kanban_worker_restart_wait.py
+index 58c1a0cb5e8..6847aa19b22 100644
+--- a/tests/hermes_cli/test_kanban_worker_restart_wait.py
++++ b/tests/hermes_cli/test_kanban_worker_restart_wait.py
+@@ -101,12 +101,16 @@ async def test_a_worker_cut_by_a_restart_wait_waits_outside_it(monkeypatch, tmp_
+     owner = _RestartingOwner()
+     monkeypatch.setattr(gateway_client, "connect_gateway", owner.connect())
+ 
+-    # The worker waits for the next owner without reading anything from the restarting one, and an
+-    # owner that never comes back still fails it at OWNER_WAIT_S (which ends the turn it held).
+-    with pytest.raises(gateway_client.GatewayClientError, match="owner silent"):
++    # The worker waits for the next owner without reading anything from the restarting one. An
++    # owner refusing it from the wait is alive and still runs the turn, so the worker outlasts
++    # OWNER_WAIT_S and gives up only past the wait's own cap, as an owner restart (exit 76, requeued
++    # uncounted) rather than a failure.
++    monkeypatch.setenv("HERMES_RESTART_AFTER_TURN_TIMEOUT", "1800")
++    with pytest.raises(kanban_worker_client.OwnerRestartLost, match="owner silent"):
+         await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
+     assert owner.receipts_in_wait == 0
+     assert owner.dials > 2
++    assert clock[0] >= 1800 + kanban_worker_client.OWNER_WAIT_S - 20
+ 
+ 
+ class _Attached(Exception):
+diff --git a/tests/hermes_cli/test_kanban_worker_socket_recovery.py b/tests/hermes_cli/test_kanban_worker_socket_recovery.py
+index 00b8fb1c3b2..86346dd79b2 100644
+--- a/tests/hermes_cli/test_kanban_worker_socket_recovery.py
++++ b/tests/hermes_cli/test_kanban_worker_socket_recovery.py
+@@ -202,21 +202,37 @@ async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("fault", [
+     gateway_client.GatewayClientError("Gateway connection failed; no local fallback"),
+-    GUE("Gateway starting: deadline", "starting", "deadline"),
+     GUE("Gateway inaccessible: invalid_control_peer", "inaccessible", "invalid_control_peer"),
+-    gateway_client.GatewayRPCError("runtime_draining"),
+-], ids=["refused", "starting", "control-reset", "draining"])
++], ids=["refused", "control-reset"])
+ async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch, _worker_env, clock, fault):
+-    # Every restart shape still ends at OWNER_WAIT_S when it never clears.
++    # A restart shape with no live owner answer still ends at OWNER_WAIT_S when it never clears.
+     owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=fault)
+ 
+-    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for 1[89]\ds: {fault}"):
++    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for 1[89]\ds: {fault}") as raised:
+         await _run(owner, monkeypatch, _worker_env)
++    assert not isinstance(raised.value, kanban_worker_client.OwnerRestartLost)
+     assert clock.now >= kanban_worker_client.OWNER_WAIT_S
+     # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second.
+     assert 3 < owner.dials < 40 and owner.calls.count("kanban.run") == 1
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("fault", [
++    GUE("Gateway starting: deadline", "starting", "deadline"),
++    gateway_client.GatewayRPCError("runtime_draining"),
++], ids=["starting", "draining"])
++async def test_a_draining_or_starting_owner_is_waited_on_up_to_its_restart_cap(monkeypatch, _worker_env, clock, fault):
++    # A draining/starting owner is alive and answering: the worker waits past OWNER_WAIT_S, up to the
++    # owner's own restart_after_turn_timeout, then exits as an owner restart (requeued uncounted).
++    monkeypatch.setenv("HERMES_RESTART_AFTER_TURN_TIMEOUT", "1800")
++    owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=fault)
++
++    with pytest.raises(kanban_worker_client.OwnerRestartLost, match=rf"owner silent for 1[89]\ds: {fault}"):
++        await _run(owner, monkeypatch, _worker_env)
++    assert 1800 + kanban_worker_client.OWNER_WAIT_S - 20 <= clock.now < 1800 + kanban_worker_client.OWNER_WAIT_S + 60
++    assert owner.calls.count("kanban.run") == 1
++
++
+ @pytest.mark.asyncio
+ async def test_giving_up_on_a_refused_handshake_names_the_status(monkeypatch, _worker_env, clock):
+     from types import SimpleNamespace
+-- 
+2.55.0
+

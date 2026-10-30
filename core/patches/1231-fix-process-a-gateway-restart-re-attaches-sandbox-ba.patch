@@ -1,0 +1,1024 @@
+From b270a7bd73bac5eb5b3e4a62c67f9a6125bbc0aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 11:53:08 +0000
+Subject: [PATCH] fix(process): a gateway restart re-attaches sandbox
+ background jobs or tells the session its watcher is lost [daveey]
+
+Recovery skipped every pid_scope=sandbox checkpoint entry ("in-sandbox PIDs mean nothing once
+the env handle is gone"), and only Desktop/TUI owners got the exited-while-unwatched wake. A
+Slack session that ended its turn on "I'll report when it finishes" was never woken
+(alpha-askeve 2026-10-30: qa.sh pid 7331 kept running in its persistent container and exited 0
+at 10:50; nobody watched it).
+
+- spawn_via_env records env.reattach_handle() (Docker: exe + container id) and the sandbox temp
+  dir in processes.json.
+- Recovery re-attaches when the container is still running and the job's wrapper files exist
+  (tools/environments/reattach.py: docker exec only, never creates or restarts a container),
+  restarts the poller and the gateway watcher, so the real exit code and output tail arrive.
+- Otherwise the owning session gets a one-shot "watcher lost at restart, status unknown" notice:
+  gateway sessions through a recovered watcher, Desktop chats through the re-adopt sink.
+- Gateway-owned host jobs that exited while unwatched (or exit after re-adoption) now wake their
+  session with the status-unknown completion instead of vanishing.
+- One log line per re-attached or abandoned process, naming the session.
+---
+ .../test_process_recovery_sandbox_reattach.py | 342 ++++++++++++++++++
+ tools/environments/docker.py                  |   7 +
+ tools/environments/reattach.py                | 124 +++++++
+ tools/process_registry.py                     |  43 +--
+ tools/process_registry_checkpoint.py          | 125 +++++--
+ tools/process_registry_notifications.py       |   8 +-
+ tools/process_registry_readopt.py             | 118 +++++-
+ 7 files changed, 707 insertions(+), 60 deletions(-)
+ create mode 100644 tests/tools/test_process_recovery_sandbox_reattach.py
+ create mode 100644 tools/environments/reattach.py
+
+diff --git a/tests/tools/test_process_recovery_sandbox_reattach.py b/tests/tools/test_process_recovery_sandbox_reattach.py
+new file mode 100644
+index 00000000000..59d97694598
+--- /dev/null
++++ b/tests/tools/test_process_recovery_sandbox_reattach.py
+@@ -0,0 +1,342 @@
++"""A gateway restart must not silently drop a background process's completion watcher. [daveey]
++
++Before: ``_recover_from_checkpoint_locked`` skipped every ``pid_scope != "host"`` entry
++("in-sandbox PIDs mean nothing once the env handle is gone"), and only Desktop/TUI owners got
++the "exited while unwatched" wake. A Slack session that ended its turn on "I'll report when
++it finishes" was never woken (alpha-askeve, 2026-10-30, pid 7331 in hermes-8278aebf).
++
++Paths covered, each driven through the real gateway process watcher:
++  (a) sandbox process, sandbox still up: re-attached; its real exit code and output tail are delivered;
++  (b) sandbox gone (no handle / container down / wrapper files missing): a "watcher lost" notice is delivered;
++  (c) gateway-owned host process that exited while no gateway watched it: the unknown-exit wake is delivered.
++"""
++
++import asyncio
++import json
++import shlex
++import subprocess
++import sys
++import time
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++import pytest
++
++from tools.process_registry import ProcessRegistry
++from tools.process_registry_notifications import format_process_notification
++
++GW_KEY = "agent:main:slack:dm:C123:1761813563.000100"
++TUI_KEY = "20261030_074804_142b8369"
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++class LocalShellSandbox:
++    """Stands in for a re-attached sandbox: runs the poller's commands in a local bash."""
++
++    def __init__(self):
++        self.commands: list[str] = []
++
++    def execute(self, command: str, cwd: str = "", timeout: int = 10, **_kw) -> dict:
++        self.commands.append(command)
++        res = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=timeout, check=False)
++        return {"output": res.stdout + res.stderr, "returncode": res.returncode}
++
++
++def _start_wrapped(temp_dir, sid: str, script: str) -> int:
++    """Start *script* exactly as ``spawn_via_env`` wraps it inside a sandbox; return its PID."""
++    q = shlex.quote
++    log, pid, ext = (f"{temp_dir}/hermes_bg_{sid}.{e}" for e in ("log", "pid", "exit"))
++    wrapper = (f"( nohup bash -c {q(script)} > {q(log)} 2>&1; rc=$?; printf '%s\\n' \"$rc\" > {q(ext)} ) "
++               f"> /dev/null 2>&1 & echo $! > {q(pid)} && cat {q(pid)}")
++    out = subprocess.run(["bash", "-c", wrapper], capture_output=True, text=True, timeout=10, check=False).stdout
++    return int(out.strip().splitlines()[-1])
++
++
++def _sandbox_entry(sid: str, pid: int, temp_dir, *, key=GW_KEY, platform="slack", handle=None) -> dict:
++    return {
++        "session_id": sid, "command": "~/work/qa.sh ~/work/wt-main main", "pid": pid, "pid_scope": "sandbox",
++        "started_at": time.time(), "task_id": "profile_alpha-askeve", "owner_task_id": key, "session_key": key,
++        "notify_on_complete": True, "watcher_platform": platform, "watcher_chat_id": "C123" if platform else "",
++        "watcher_interval": 1 if platform else 0,
++        "sandbox_handle": {"backend": "docker", "container_id": "abc123", "docker_exe": "docker"}
++        if handle is None else handle,
++        "sandbox_temp_dir": str(temp_dir), "writer_pid": _dead_pid(), "writer_start_time": None,
++    }
++
++
++@pytest.fixture()
++def checkpoint(tmp_path):
++    path = tmp_path / "processes.json"
++    with patch("tools.process_registry.CHECKPOINT_PATH", path):
++        yield path
++
++
++@pytest.fixture()
++def registry(monkeypatch):
++    reg = ProcessRegistry()
++    monkeypatch.setattr("tools.process_registry.process_registry", reg)
++    return reg
++
++
++def _gateway_runner(monkeypatch, tmp_path):
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    import gateway.run as gateway_run
++
++    (tmp_path / "config.yaml").write_text("display:\n  background_process_notifications: concise\n")
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    runner = GatewayRunner(GatewayConfig())
++    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
++    runner._launching_turn_active = AsyncMock(return_value=False)
++    return runner
++
++
++def _run_recovered_watchers(runner, registry, timeout: float = 20.0) -> list[str]:
++    """Run every recovered watcher the way gateway startup does; return the injected texts."""
++    watchers, registry.pending_watchers = registry.pending_watchers, []
++    assert watchers, "recovery queued no watcher: nothing would ever wake the session"
++
++    async def _go():
++        await asyncio.wait_for(asyncio.gather(*(runner._watch_process(w) for w in watchers)), timeout)
++
++    asyncio.run(_go())
++    return [call.args[0] for call in runner._enqueue_process_completion_notification.await_args_list]
++
++
++# --------------------------------------------------------------------------- (a)
++
++def test_a_alive_sandbox_process_is_reattached_and_its_completion_delivered(
++        checkpoint, registry, tmp_path, monkeypatch, caplog):
++    sandbox = LocalShellSandbox()
++    pid = _start_wrapped(tmp_path, "proc_qa", "sleep 2; echo 'pytest rc=1'; echo DONE; exit 3")
++    checkpoint.write_text(json.dumps([_sandbox_entry("proc_qa", pid, tmp_path)]))
++    handles = []
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment",
++                        lambda handle: handles.append(handle) or sandbox)
++
++    caplog.set_level("INFO", logger="tools.process_registry")
++    assert registry.recover_from_checkpoint(owner="gateway") == 1
++    assert handles == [{"backend": "docker", "container_id": "abc123", "docker_exe": "docker"}]
++    session = registry._running["proc_qa"]
++    assert session.env_ref is sandbox and session.pid_scope == "sandbox"
++    assert any("Re-attached sandbox process proc_qa" in r.getMessage() and GW_KEY in r.getMessage()
++               for r in caplog.records)
++    # A re-attached job stays in the checkpoint (with its handle) for the next restart.
++    saved = {e["session_id"]: e for e in json.loads(checkpoint.read_text())}
++    assert saved["proc_qa"]["sandbox_handle"]["container_id"] == "abc123"
++
++    texts = _run_recovered_watchers(_gateway_runner(monkeypatch, tmp_path), registry)
++    assert len(texts) == 1
++    assert "Background process proc_qa" in texts[0] and "(exit code 3)" in texts[0]
++    assert "DONE" in texts[0]
++    assert registry.get("proc_qa").exit_code == 3
++
++
++def test_a_tui_owned_sandbox_completion_goes_through_the_readopt_sink(checkpoint, registry, tmp_path, monkeypatch):
++    sandbox = LocalShellSandbox()
++    pid = _start_wrapped(tmp_path, "proc_tui", "echo hi; exit 0")
++    checkpoint.write_text(json.dumps([_sandbox_entry("proc_tui", pid, tmp_path, key=TUI_KEY, platform="")]))
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment", lambda handle: sandbox)
++    delivered = []
++    registry.on_unknown_exit = delivered.append
++
++    assert registry.recover_from_checkpoint(owner="tui") == 1
++    deadline = time.monotonic() + 15
++    while not delivered and time.monotonic() < deadline:
++        time.sleep(0.2)
++    assert len(delivered) == 1
++    evt = delivered[0]
++    assert evt["session_key"] == TUI_KEY and evt["exit_code"] == 0 and "hi" in evt["output"]
++    assert evt["park_if_unowned"] is True
++
++
++# --------------------------------------------------------------------------- (b)
++
++@pytest.mark.parametrize("why", ["container_down", "no_handle", "wrapper_files_gone", "container_restarted"])
++def test_b_unreachable_sandbox_delivers_watcher_lost_notice(checkpoint, registry, tmp_path, monkeypatch, caplog, why):
++    sandbox = LocalShellSandbox()
++    if why == "container_restarted":
++        _start_wrapped(tmp_path, "proc_lost", "exit 0")  # stale wrapper files survive in the container's /tmp
++        sandbox.started_at = time.time() + 60
++    entry = _sandbox_entry("proc_lost", 7331, tmp_path, handle={} if why == "no_handle" else None)
++    if why == "wrapper_files_gone":
++        entry["sandbox_temp_dir"] = str(tmp_path / "nowhere")
++    checkpoint.write_text(json.dumps([entry]))
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment",
++                        lambda handle: None if why == "container_down" else sandbox)
++
++    caplog.set_level("INFO", logger="tools.process_registry")
++    registry.recover_from_checkpoint(owner="gateway")
++    assert "proc_lost" not in registry._running
++    assert any("proc_lost" in r.getMessage() and GW_KEY in r.getMessage() and "watcher lost" in r.getMessage()
++               for r in caplog.records)
++    # The notice is one-shot: the entry leaves the checkpoint, so the next restart does not repeat it.
++    assert [e["session_id"] for e in json.loads(checkpoint.read_text())] == []
++
++    texts = _run_recovered_watchers(_gateway_runner(monkeypatch, tmp_path), registry)
++    assert len(texts) == 1
++    assert "proc_lost" in texts[0] and "watcher lost" in texts[0].lower()
++
++
++def test_b_tui_owned_unreachable_sandbox_notice_goes_through_the_readopt_sink(
++        checkpoint, registry, tmp_path, monkeypatch):
++    checkpoint.write_text(json.dumps([_sandbox_entry("proc_tui_lost", 7331, tmp_path, key=TUI_KEY, platform="")]))
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment", lambda handle: None)
++    delivered = []
++    registry.on_unknown_exit = delivered.append
++
++    registry.recover_from_checkpoint(owner="tui")
++    assert len(delivered) == 1
++    assert delivered[0]["completion_reason"] == "watcher_lost"
++    assert "watcher lost" in (format_process_notification(delivered[0]) or "").lower()
++
++
++# --------------------------------------------------------------------------- (c)
++
++def _host_entry(sid: str, pid: int) -> dict:
++    return {
++        "session_id": sid, "command": "bash long_job.sh", "pid": pid, "pid_scope": "host",
++        "host_start_time": ProcessRegistry._safe_host_start_time(pid), "started_at": time.time(),
++        "task_id": "default", "owner_task_id": GW_KEY, "session_key": GW_KEY, "notify_on_complete": True,
++        "watcher_platform": "slack", "watcher_chat_id": "C123", "watcher_interval": 1,
++        "writer_pid": _dead_pid(), "writer_start_time": None,
++    }
++
++
++def test_c_gateway_owned_host_process_that_exited_unwatched_wakes_its_session(
++        checkpoint, registry, tmp_path, monkeypatch):
++    checkpoint.write_text(json.dumps([_host_entry("proc_gone", _dead_pid())]))
++    registry.recover_from_checkpoint(owner="gateway")
++
++    texts = _run_recovered_watchers(_gateway_runner(monkeypatch, tmp_path), registry)
++    assert len(texts) == 1
++    assert "proc_gone" in texts[0] and "status unknown" in texts[0].lower()
++
++
++def test_c_gateway_readopted_host_process_that_exits_later_wakes_its_session(
++        checkpoint, registry, tmp_path, monkeypatch):
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1.5)"])
++    checkpoint.write_text(json.dumps([_host_entry("proc_later", proc.pid)]))
++    assert registry.recover_from_checkpoint(owner="gateway") == 1
++
++    def _reap():
++        proc.wait()
++    import threading
++    threading.Thread(target=_reap, daemon=True).start()
++    texts = _run_recovered_watchers(_gateway_runner(monkeypatch, tmp_path), registry)
++    assert len(texts) == 1
++    assert "proc_later" in texts[0] and "status unknown" in texts[0].lower()
++
++
++# --------------------------------------------------------------------------- plumbing
++
++def test_spawn_via_env_checkpoints_the_reattach_handle_and_temp_dir(checkpoint, registry, tmp_path):
++    class Env(LocalShellSandbox):
++        def get_temp_dir(self):
++            return str(tmp_path)
++
++        def reattach_handle(self):
++            return {"backend": "docker", "docker_exe": "docker", "container_id": "c0ffee"}
++
++    session = registry.spawn_via_env(Env(), "sleep 5", task_id="t", session_key=GW_KEY)
++    try:
++        saved = {e["session_id"]: e for e in json.loads(checkpoint.read_text())}[session.id]
++        assert saved["pid_scope"] == "sandbox"
++        assert saved["sandbox_handle"] == {"backend": "docker", "docker_exe": "docker", "container_id": "c0ffee"}
++        assert saved["sandbox_temp_dir"] == str(tmp_path)
++    finally:
++        registry.kill_process(session.id)
++
++
++def _fake_docker(tmp_path, *, running: str, exec_stderr: str = "", exec_rc: int = 0):
++    exe = tmp_path / "docker"
++    exe.write_text(
++        "#!/usr/bin/env bash\n"
++        f'if [ "$1" = inspect ]; then echo {running}; exit 0; fi\n'
++        f'if [ "$1" = exec ]; then shift 2; '
++        + (f'echo {shlex.quote(exec_stderr)} >&2; exit {exec_rc}; ' if exec_stderr else "")
++        + '"$@"; exit $?; fi\nexit 2\n')
++    exe.chmod(0o755)
++    return str(exe)
++
++
++def test_reattach_docker_returns_an_exec_handle_only_for_a_running_container(tmp_path):
++    from tools.environments.reattach import ReattachedDockerSandbox, reattach_environment
++
++    up = reattach_environment({"backend": "docker", "docker_exe": _fake_docker(tmp_path, running="true"),
++                               "container_id": "abc"})
++    assert isinstance(up, ReattachedDockerSandbox)
++    assert up.execute("echo hi; exit 4") == {"output": "hi\n", "returncode": 4}
++    down_dir = tmp_path / "down"
++    down_dir.mkdir()
++    assert reattach_environment({"backend": "docker", "docker_exe": _fake_docker(down_dir, running="false"),
++                                 "container_id": "abc"}) is None
++    assert reattach_environment({"backend": "ssh", "host": "x"}) is None
++    assert reattach_environment({}) is None
++
++
++def test_reattached_container_that_vanishes_marks_the_job_lost_not_exited(tmp_path):
++    from tools.environments.reattach import ReattachedDockerSandbox, SandboxGoneError
++
++    env = ReattachedDockerSandbox(
++        _fake_docker(tmp_path, running="true", exec_stderr="Error: No such container: abc", exec_rc=1), "abc")
++    with pytest.raises(SandboxGoneError):
++        env.execute("kill -0 1")
++    reg = ProcessRegistry()
++    from tools.process_registry import ProcessSession
++    session = ProcessSession(id="proc_vanish", command="x", pid=7, pid_scope="sandbox", env_ref=env)
++    reg._running[session.id] = session
++    reg._env_poller_loop(session, env, "/tmp/l", "/tmp/p", "/tmp/e")
++    assert session.exited and session.completion_reason == "lost" and session.termination_source == "backend_lost"
++
++
++def test_another_writer_keeps_sandbox_entries_for_their_owners_recovery(checkpoint, tmp_path):
++    """Every Hermes process on the home rewrites processes.json; a sandbox PID cannot be probed, so the
++    entry used to vanish on the next foreign write and a restarted gateway had nothing to re-attach."""
++    live_writer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++    try:
++        mine = _sandbox_entry("proc_live_writer", 7331, tmp_path)
++        mine.update(writer_pid=live_writer.pid, writer_start_time=ProcessRegistry._safe_host_start_time(live_writer.pid))
++        orphan = _sandbox_entry("proc_orphan", 7332, tmp_path)  # writer dead, awaiting the owner's restart
++        stale = {**_sandbox_entry("proc_stale", 7333, tmp_path), "started_at": time.time() - 8 * 24 * 3600}
++        checkpoint.write_text(json.dumps([mine, orphan, stale]))
++        ProcessRegistry()._write_checkpoint()  # an unrelated process (kanban worker, CLI) writes its table
++        kept = {e["session_id"] for e in json.loads(checkpoint.read_text())}
++        assert kept == {"proc_live_writer", "proc_orphan"}
++    finally:
++        live_writer.kill()
++        live_writer.wait()
++
++
++def test_gateway_recovery_leaves_desktop_sandbox_entries_and_settles_its_own(checkpoint, registry, tmp_path, monkeypatch):
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment", lambda handle: None)
++    checkpoint.write_text(json.dumps([
++        _sandbox_entry("proc_gw_lost", 7331, tmp_path),
++        _sandbox_entry("proc_tui_job", 7332, tmp_path, key=TUI_KEY, platform=""),
++    ]))
++    registry.recover_from_checkpoint(owner="gateway")
++    assert [e["session_id"] for e in json.loads(checkpoint.read_text())] == ["proc_tui_job"]
++
++    tui = ProcessRegistry()
++    delivered = []
++    tui.on_unknown_exit = delivered.append
++    tui.recover_from_checkpoint(owner="tui")
++    assert [e["session_id"] for e in delivered] == ["proc_tui_job"]
++    # Settled: the next restart does not repeat the notice.
++    assert json.loads(checkpoint.read_text()) == []
++
++
++def test_docker_level_exec_failure_is_never_read_as_the_job_exiting(tmp_path):
++    """A daemon hiccup (or a paused container) makes `docker exec` fail without running the command;
++    the poller must skip that tick, not conclude from the error text that the PID is gone."""
++    from tools.environments.reattach import ReattachedDockerSandbox
++
++    env = ReattachedDockerSandbox(_fake_docker(
++        tmp_path, running="true", exec_stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
++        exec_rc=1), "abc")
++    assert env.execute('kill -0 "$(cat /tmp/p)" 2>/dev/null; echo $?') == {"output": "", "returncode": 125}
+diff --git a/tools/environments/docker.py b/tools/environments/docker.py
+index 89c22bcc7d0..17d8d0a4aae 100644
+--- a/tools/environments/docker.py
++++ b/tools/environments/docker.py
+@@ -1183,6 +1183,13 @@ class DockerEnvironment(BaseEnvironment):
+         self._mark_recreated()
+         return True
+ 
++    def reattach_handle(self) -> dict | None:
++        """What a later process needs to watch a background job in this container after a restart
++        (``tools.environments.reattach``). [daveey]"""
++        if not self._container_id:
++            return None
++        return {"backend": "docker", "docker_exe": self._docker_exe, "container_id": self._container_id}
++
+     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
+         """Execute a command; if the container was removed out-of-band (idle reaper,
+         docker prune, OOM, daemon restart) recreate it and retry once."""
+diff --git a/tools/environments/reattach.py b/tools/environments/reattach.py
+new file mode 100644
+index 00000000000..2769d491a11
+--- /dev/null
++++ b/tools/environments/reattach.py
+@@ -0,0 +1,124 @@
++"""Re-open a sandbox after a host restart, just far enough to watch a background job. [daveey]
++
++``ProcessRegistry.spawn_via_env`` runs a background command inside a sandbox with a wrapper that
++writes ``hermes_bg_<id>.{log,pid,exit}`` into the sandbox temp dir, then polls those files through
++the environment handle. A gateway restart loses that handle, but a persistent sandbox (a Docker
++container with ``container_persistent: true``) keeps running, and so does the job. The spawn
++records ``env.reattach_handle()`` in the process checkpoint; on recovery,
++:func:`reattach_environment` turns it back into an object with the ``execute()`` the poller needs.
++
++It is deliberately minimal: it never creates, starts or recreates a sandbox (a fresh container
++would not hold the job, and the poller would invent an exit). ``None`` means "cannot re-attach":
++the caller then tells the owning session its watcher was lost.
++"""
++
++from __future__ import annotations
++
++import logging
++import shlex
++import subprocess
++from datetime import UTC, datetime
++from typing import Any, Optional
++
++logger = logging.getLogger("tools.process_registry")
++
++_GONE_PATTERNS = ("No such container", "is not running", "no such container")
++# Printed after the command so a docker-level failure (daemon unreachable, paused container) is never
++# mistaken for the command's own output: the poller would read it as "the job exited".
++_RC_MARKER = "__HERMES_REATTACH_RC="
++
++
++class SandboxGoneError(RuntimeError):
++    """The re-attached sandbox disappeared; the poller then marks the job lost, never exited."""
++
++
++class ReattachedDockerSandbox:
++    """``docker exec`` into an already-running container. No create/start/recreate."""
++
++    def __init__(self, docker_exe: str, container_id: str, started_at: Optional[float] = None):
++        self.docker_exe = docker_exe
++        self.container_id = container_id
++        # When the container (re)started; a job that started before it cannot be running in it.
++        self.started_at = started_at
++
++    def get_temp_dir(self) -> str:
++        return "/tmp"  # no-tmp: ok — the in-container temp dir spawn_via_env used
++
++    def reattach_handle(self) -> dict[str, Any]:
++        return {"backend": "docker", "docker_exe": self.docker_exe, "container_id": self.container_id}
++
++    def execute(self, command: str, cwd: str = "", timeout: int = 10, **_kwargs) -> dict:
++        script = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
++        # A subshell, so an `exit` in the command still reaches the marker line.
++        script = f"( {script}\n)\nprintf '\\n{_RC_MARKER}%s\\n' \"$?\""
++        try:
++            res = subprocess.run([self.docker_exe, "exec", self.container_id, "bash", "-c", script],
++                                 capture_output=True, text=True, timeout=timeout, check=False,
++                                 stdin=subprocess.DEVNULL)
++        except subprocess.TimeoutExpired:
++            return {"output": "", "returncode": 124}
++        stdout, stderr = res.stdout or "", res.stderr or ""
++        body, sep, tail = stdout.rpartition(f"\n{_RC_MARKER}")
++        if not sep:
++            if any(p in stderr for p in _GONE_PATTERNS):
++                raise SandboxGoneError(f"container {self.container_id[:12]} is gone: {stderr.strip()[:200]}")
++            # The command never ran (docker-level failure): an empty result makes the poller skip this tick.
++            logger.debug("re-attached docker exec failed (rc=%s): %s", res.returncode, stderr.strip()[:200])
++            return {"output": "", "returncode": 125}
++        try:
++            rc = int(tail.strip().splitlines()[0])
++        except (ValueError, IndexError):
++            rc = res.returncode
++        return {"output": body + ("\n" if body and not body.endswith("\n") else "") + stderr
++                if stderr else body, "returncode": rc}
++
++    def cleanup(self, **_kwargs) -> None:
++        """Never stops the container: it belongs to the profile, not to this watcher."""
++
++
++def _docker_container_state(docker_exe: str, container_id: str) -> tuple[bool, Optional[float]]:
++    """(running, started_at epoch or None) for *container_id*."""
++    try:
++        res = subprocess.run(
++            [docker_exe, "inspect", "-f", "{{.State.Running}} {{.State.StartedAt}}", container_id],
++            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, check=False)
++    except (OSError, subprocess.SubprocessError) as exc:
++        logger.info("Sandbox re-attach: docker inspect %s failed: %s", container_id[:12], exc)
++        return False, None
++    if res.returncode != 0:
++        return False, None
++    running, _, started = res.stdout.strip().partition(" ")
++    started_at = None
++    try:
++        started_at = datetime.strptime(started.strip()[:19], "%Y-%m-%dT%H:%M:%S").replace(
++            tzinfo=UTC).timestamp()
++    except ValueError:
++        pass
++    return running == "true", started_at
++
++
++def reattach_environment(handle: dict[str, Any]) -> Optional[Any]:
++    """An ``execute()``-capable handle on the still-running sandbox *handle* names, else None."""
++    if not isinstance(handle, dict):
++        return None
++    backend = handle.get("backend")
++    if backend == "docker":
++        exe, cid = str(handle.get("docker_exe") or "docker"), str(handle.get("container_id") or "")
++        if not cid:
++            return None
++        running, started_at = _docker_container_state(exe, cid)
++        return ReattachedDockerSandbox(exe, cid, started_at) if running else None
++    return None  # other backends (ssh, modal, daytona, …) cannot be re-attached yet: lost-watcher notice
++
++
++def env_reattach_handle(env: Any) -> dict[str, Any]:
++    """``env.reattach_handle()`` or ``{}``; never raises (a spawn must not fail on bookkeeping)."""
++    getter = getattr(env, "reattach_handle", None)
++    if not callable(getter):
++        return {}
++    try:
++        handle = getter()
++    except Exception:
++        logger.debug("reattach_handle() failed", exc_info=True)
++        return {}
++    return dict(handle) if isinstance(handle, dict) else {}
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index e68f95dddff..3a9743c5a22 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -27,7 +27,7 @@ _IS_WINDOWS = platform.system() == "Windows"
+ _IS_LINUX = platform.system() == "Linux"
+ from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env, process_cwd
+ from hermes_cli._subprocess_compat import windows_hide_flags
+-from dataclasses import dataclass, field
++from dataclasses import MISSING, dataclass, field
+ from typing import Any, Dict, List, Literal, NamedTuple, Optional
+ 
+ from hermes_cli.config import get_hermes_home
+@@ -573,6 +573,10 @@ class ProcessSession:
+                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
+     output_log: str = ""                        # file the process writes to (worker spawns; no pipe to lose)
+     pty_fallback: str = ""                      # why a pty=true local spawn runs in pipe mode instead
++    # Sandbox spawns: how a later process re-opens the sandbox (``env.reattach_handle()``) and where the
++    # wrapper's hermes_bg_<id>.{log,pid,exit} files live, so a restart can re-attach the watcher. [daveey]
++    sandbox_handle: dict = field(default_factory=dict)
++    sandbox_temp_dir: str = ""
+     # Watcher/notification routing (persisted for crash recovery)
+     watcher_platform: str = ""
+     watcher_chat_id: str = ""
+@@ -613,6 +617,12 @@ class ProcessSession:
+     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
+     # Re-adopted by a Desktop/TUI backend: queue a status-unknown completion when the PID goes. [daveey]
+     _report_lost_exit: bool = field(default=False, repr=False)
++    # Re-adopted by a messaging gateway: when the PID goes, keep the session as an "unknown" exit so the
++    # recovered gateway watcher delivers it, instead of pruning it and ending that watcher silently. [daveey]
++    _lost_exit_via_watcher: bool = field(default=False, repr=False)
++    # A re-attached sandbox job owned by a Desktop/TUI chat: its completion goes through the re-adopt
++    # sink (park + wake the chat), since the chat may not be open in this backend. [daveey]
++    _completion_via_readopt_sink: bool = field(default=False, repr=False)
+     _owned_pgid: Optional[int] = field(default=None, repr=False)  # see ProcessOwnershipMixin
+ 
+     def __post_init__(self):
+@@ -662,9 +672,10 @@ _CHECKPOINT_FIELDS = (
+     "started_at", "task_id", "owner_task_id", "session_key",
+     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+-    "heartbeat_seconds", "persist_on_release", "output_log")
++    "heartbeat_seconds", "persist_on_release", "output_log", "sandbox_handle", "sandbox_temp_dir")
+ _CHECKPOINT_DEFAULTS = {
+-    f.name: ([] if f.name == "watch_patterns" else f.default)
++    f.name: (f.default if f.default is not MISSING
++             else f.default_factory() if f.default_factory is not MISSING else MISSING)  # type: ignore[misc]
+     for f in ProcessSession.__dataclass_fields__.values()
+     if f.name in _CHECKPOINT_FIELDS
+ }
+@@ -1047,26 +1058,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+         self._write_checkpoint()
+         session._completion_event.set()
+ 
+-    def _prune_uncollected_detached(self, session: ProcessSession) -> Optional[ProcessSession]:
+-        """Drop a recovered entry whose PID is gone, without inventing an exit.
+-
+-        An owned systemd scope stays reachable so kill can still reap it. A
+-        scope-less entry is removed: poll/list must not report a collected exit.
+-        """
+-        with session._lock:
+-            session.exited = True
+-        with self._lock:
+-            was_running = self._running.pop(session.id, None) is not None
+-            if session.systemd_unit:
+-                self._finished[session.id] = session
+-            else:
+-                self._finished.pop(session.id, None)
+-        self._write_checkpoint()
+-        if was_running and session._report_lost_exit and session.notify_on_complete:
+-            self._queue_unknown_exit(session)
+-        session._completion_event.set()
+-        return session if session.systemd_unit else None
+-
+     def _uncollected_gone(self, session: Optional[ProcessSession]) -> bool:
+         """True when a detached entry was closed without a collected exit status
+         and the PID is no longer alive. List/poll must not report that as exited."""
+@@ -1298,6 +1289,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+         session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
+                                     persist_on_release=persist_on_release)
+         temp_dir = self._env_temp_dir(env)
++        # Recorded in the checkpoint so a restarted host can re-attach this job's watcher. [daveey]
++        from tools.environments.reattach import env_reattach_handle
++        session.sandbox_handle = env_reattach_handle(env)
++        session.sandbox_temp_dir = temp_dir
+         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
+         q = shlex.quote
+         bg_command = (
+@@ -1621,7 +1616,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+                 "started_at": session.started_at,
+             }
+             _redact_process_result(notification)
+-            self.completion_queue.put(notification)
++            self._put_completion(session, notification)
+ 
+     @staticmethod
+     def _exit_fields(session: ProcessSession) -> dict:
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index 3c99f3e63c5..1e9a38735e8 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -13,6 +13,8 @@ logger = logging.getLogger("tools.process_registry")
+ 
+ # This thread's nesting depth inside the processes.json flock (see _checkpoint_file_lock).
+ _CHECKPOINT_LOCK_HELD = threading.local()
++# How long another writer keeps an orphaned sandbox entry (its writer died) for the owner's recovery.
++_SANDBOX_ORPHAN_KEEP_SECONDS = 7 * 24 * 3600
+ 
+ 
+ class ProcessCheckpointMixin:
+@@ -103,9 +105,20 @@ class ProcessCheckpointMixin:
+         if not isinstance(existing, list):
+             return []
+         kept = []
++        now = time.time()
+         for item in existing:
+             if not isinstance(item, dict) or item.get("session_id") in own_ids:
+                 continue
++            if item.get("pid_scope", "host") != "host" and item.get("pid"):
++                # A sandbox PID cannot be probed from here. Keep the entry while its writer still
++                # supervises it, and as an orphan awaiting its owner's restart recovery for up to
++                # _SANDBOX_ORPHAN_KEEP_SECONDS: dropping it erased the only trace a restarted gateway
++                # could re-attach (or report as lost). [daveey]
++                started = item.get("started_at")
++                fresh = isinstance(started, (int, float)) and now - started < _SANDBOX_ORPHAN_KEEP_SECONDS
++                if self._writer_alive(item) or fresh:
++                    kept.append(item)
++                continue
+             if item.get("pid_scope", "host") != "host" or not item.get("pid"):
+                 continue
+             if self._detached_host_fate(item.get("pid"), item.get("host_start_time")) != "running":
+@@ -113,12 +126,15 @@ class ProcessCheckpointMixin:
+             kept.append(item)
+         return kept
+ 
+-    def _write_checkpoint_locked(self, extra_entries: Optional[list[dict[str, Any]]] = None):
++    def _write_checkpoint_locked(self, extra_entries: Optional[list[dict[str, Any]]] = None,
++                                 drop_ids: frozenset = frozenset()):
++        """``drop_ids``: entries this writer just settled (e.g. a lost-watcher notice sent at recovery)
++        that must leave the file even though no table of ours tracks them."""
+         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
+ 
+         writer = self._writer_identity()
+         with self._lock:
+-            own_ids = set(self._running) | set(self._finished)
++            own_ids = set(self._running) | set(self._finished) | set(drop_ids)
+             entries = []
+             for s in self._running.values():
+                 if s.exited:
+@@ -127,6 +143,10 @@ class ProcessCheckpointMixin:
+                 # even for sessions spawned before this field existed.
+                 if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                     s.host_start_time = self._safe_host_start_time(s.pid)
++                # A recreated container has a new id: persist the handle that reaches the live one. [daveey]
++                if s.env_ref is not None and s.pid_scope != "host":
++                    from tools.environments.reattach import env_reattach_handle
++                    s.sandbox_handle = env_reattach_handle(s.env_ref) or s.sandbox_handle
+                 entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+                 # Redact inline credentials before persisting (~/.hermes/processes.json).
+                 # Recovery uses command only for display (adoption re-validates the
+@@ -217,9 +237,9 @@ class ProcessCheckpointMixin:
+     def _recover_from_checkpoint_locked(self, owner: Optional[str]) -> int:
+         from tools.process_registry import (
+             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
+-            _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
++            _CHECKPOINT_DEFAULTS, _stop_systemd_unit,
+         )
+-        from tools.process_registry_readopt import OWNER_TUI, owner_accepts
++        from tools.process_registry_readopt import OWNER_TUI, UNKNOWN_EXIT_REASON, owner_accepts
+         from tools.process_registry_output_log import adoptable_log
+ 
+         # This host adopts what a crashed predecessor left running, so the jobs it starts must
+@@ -234,6 +254,7 @@ class ProcessCheckpointMixin:
+             return 0
+         recovered = 0
+         unresolved_scope_entries: list[dict[str, Any]] = []
++        settled_ids: set = set()  # sandbox entries answered with a lost-watcher notice: leave the file
+         for entry in entries:
+             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
+             if not pid:
+@@ -251,10 +272,13 @@ class ProcessCheckpointMixin:
+                 continue
+             if not owner_accepts(owner, entry):
+                 continue
+-            if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
+-                logger.info(
+-                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
+-                    entry.get("command", "unknown")[:60], pid, pid_scope)
++            if pid_scope != "host":
++                # In-sandbox PIDs are only reachable through the sandbox: re-attach to it when it is still
++                # up, else tell the owning session its watcher is gone. Never drop it silently. [daveey]
++                if self._recover_sandbox_entry(entry, owner):
++                    recovered += 1
++                else:
++                    settled_ids.add(entry.get("session_id"))
+                 continue
+             # Alive and still ours: re-attach. A start-time probe that cannot
+             # be read is not proof the PID was reused — dropping it would leave
+@@ -275,9 +299,15 @@ class ProcessCheckpointMixin:
+                     entry.get("session_id", "?"), pid)
+                 continue
+             if fate != "running":
+-                if owner == OWNER_TUI and entry.get("notify_on_complete"):
+-                    # Exited while no backend watched it: the chat still gets its wake.
+-                    self._queue_unknown_exit(self._session_from_entry(entry))
++                if entry.get("notify_on_complete"):
++                    # Exited while no host watched it: the owning session still gets its wake, whatever
++                    # kind of host owns it (Desktop chat, messaging gateway, CLI). [daveey]
++                    lost = self._session_from_entry(entry)
++                    how = self._deliver_unwatched_exit(
++                        lost, owner, UNKNOWN_EXIT_REASON, "readopted_after_restart")
++                    logger.info("Process %s (pid=%s) of session %s exited while unwatched; %s",
++                                lost.id, pid, lost.session_key or "-",
++                                f"waking it via {how}" if how else "no wake route recorded")
+                 systemd_unit = entry.get("systemd_unit", "")
+                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
+                     logger.warning(
+@@ -290,8 +320,10 @@ class ProcessCheckpointMixin:
+             # (and recorded exit) outlives its spawner, so tail it from the start.
+             session = self._session_from_entry(entry)
+             session.output_log = log
+-            # A TUI backend reports the eventual exit (status unknown) to the owning chat. [daveey]
++            # A TUI backend reports the eventual exit (status unknown) to the owning chat; a gateway keeps the
++            # exited session for its recovered watcher to deliver. [daveey]
+             session._report_lost_exit = owner == OWNER_TUI
++            session._lost_exit_via_watcher = owner != OWNER_TUI and session.watcher_interval > 0
+             if session.output_log:
+                 self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
+             else:
+@@ -301,22 +333,73 @@ class ProcessCheckpointMixin:
+             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+             # Re-enqueue watcher so gateway can resume notifications
+             if session.watcher_interval > 0:
+-                self.pending_watchers.append({
+-                    "session_id": session.id,
+-                    "check_interval": session.watcher_interval,
+-                    "session_key": session.session_key,
+-                    **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+-                    "notify_on_complete": session.notify_on_complete,
+-                    "parent_session_id": session.parent_session_id,
+-                })
+-        self._write_checkpoint_locked(extra_entries=unresolved_scope_entries)
++                self.pending_watchers.append(self._recovered_watcher(session))
++        self._write_checkpoint_locked(extra_entries=unresolved_scope_entries, drop_ids=frozenset(settled_ids))
+         return recovered
+ 
++    def _recover_sandbox_entry(self, entry: dict[str, Any], owner: Optional[str]) -> bool:
++        """Re-attach a sandbox job's watcher (True), or deliver a "watcher lost" notice to its owning
++        session (False). Logs one line either way, naming the session. [daveey]"""
++        import shlex
++        from tools.process_registry_readopt import OWNER_TUI, WATCHER_LOST_REASON
++
++        session = self._session_from_entry(entry)
++        session.sandbox_handle = dict(entry.get("sandbox_handle") or {})
++        key = session.session_key or "-"
++        temp_dir = str(entry.get("sandbox_temp_dir") or "").rstrip("/")
++        log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
++        env, why = None, ""
++        if not session.sandbox_handle or not temp_dir:
++            why = "no re-attach handle recorded (spawned before handles were persisted, or backend has none)"
++        else:
++            from tools.environments import reattach as _reattach
++            try:
++                env = _reattach.reattach_environment(session.sandbox_handle)
++            except Exception as exc:
++                logger.debug("Sandbox re-attach of %s failed", session.id, exc_info=True)
++                env, why = None, f"re-attach failed: {exc}"
++            if env is None:
++                why = why or f"sandbox is gone ({session.sandbox_handle.get('backend', '?')})"
++            elif (isinstance(getattr(env, "started_at", None), (int, float))
++                  and isinstance(session.started_at, (int, float))
++                  and env.started_at > session.started_at + 5):
++                # The container restarted after the job started: the job died with it, and its old PID
++                # may now belong to something else. [daveey]
++                why = "the sandbox restarted after the job started"
++            else:
++                try:
++                    probe = env.execute(f"test -e {shlex.quote(pid_path)} && echo hermes-bg-present", timeout=10)
++                    present = "hermes-bg-present" in str(probe.get("output", ""))
++                except Exception as exc:  # health: allow BLE001 -- any probe failure means "cannot re-attach"; logged with traceback
++                    logger.debug("Sandbox probe of %s failed", session.id, exc_info=True)
++                    present, why = False, f"probe failed: {exc}"
++                if not present:
++                    why = why or "the job's wrapper files are gone from the sandbox"
++        if why:
++            how = self._deliver_unwatched_exit(session, owner, WATCHER_LOST_REASON, "restart_watcher_lost")
++            logger.warning(
++                "Sandbox process %s (pid=%s) of session %s: watcher lost at restart (%s); %s",
++                session.id, session.pid, key, why,
++                f"notified the session via {how}" if how else "it asked for no notification")
++            return False
++        session.env_ref = env
++        session.detached = False  # the poller collects the real exit code from the wrapper's exit file
++        session._completion_via_readopt_sink = owner == OWNER_TUI
++        self._track_started(session, self._env_poller_loop, f"proc-poller-{session.id}",
++                            (env, log_path, pid_path, exit_path))
++        if session.watcher_interval > 0:
++            self.pending_watchers.append(self._recovered_watcher(session))
++        logger.info("Re-attached sandbox process %s (pid=%s) of session %s: %s",
++                    session.id, session.pid, key, session.command[:60])
++        return True
++
+     @staticmethod
+     def _session_from_entry(entry: dict[str, Any]):
+         from tools.process_registry import ProcessSession, _CHECKPOINT_DEFAULTS, _CHECKPOINT_FIELDS
+ 
+         fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
++        # Never share a mutable default (or the parsed entry's own container) between sessions.
++        fields = {f: (type(v)(v) if isinstance(v, (list, dict)) else v) for f, v in fields.items()}
+         fields.update(
+             command=entry.get("command", "unknown"),
+             owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+diff --git a/tools/process_registry_notifications.py b/tools/process_registry_notifications.py
+index 7f89fc24706..87f5cfe9756 100644
+--- a/tools/process_registry_notifications.py
++++ b/tools/process_registry_notifications.py
+@@ -10,8 +10,12 @@ from contextlib import suppress
+ _DONE = ("completed", "success")
+ _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start",
+                   # A re-adopted orphan (no pipe after a restart) exited; its status was never collected. [daveey]
+-                  "unknown": "exited (status unknown — re-adopted after restart)"}
+-_REASON_OUTCOME = {"lost": "Lost", "failed_start": "Failed to Start", "unknown": "Exited (status unknown)"}
++                  "unknown": "exited (status unknown — re-adopted after restart)",
++                  # A sandbox job whose watcher a restart could not re-attach. [daveey]
++                  "watcher_lost": ("watcher lost at restart — status unknown (the sandbox could not be "
++                                   "re-attached); check the process yourself")}
++_REASON_OUTCOME = {"lost": "Lost", "failed_start": "Failed to Start", "unknown": "Exited (status unknown)",
++                   "watcher_lost": "Watcher Lost (status unknown)"}
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index fa47bc080ce..9b0a0d1585c 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -35,6 +35,10 @@ OWNER_GATEWAY = "gateway"
+ OWNER_TUI = "tui"
+ UNKNOWN_EXIT_REASON = "unknown"
+ UNKNOWN_EXIT_STATUS = "exited (status unknown — re-adopted after restart)"
++# A sandbox job whose watcher could not be re-attached after a restart (sandbox gone, no handle). [daveey]
++WATCHER_LOST_REASON = "watcher_lost"
++WATCHER_LOST_STATUS = ("watcher lost at restart — status unknown (the sandbox could not be re-attached); "
++                       "check the process yourself")
+ DETACHED_SWEEP_SECONDS = 30.0
+ _MAX_PARKED_EVENTS = 256
+ 
+@@ -63,6 +67,8 @@ class ProcessReadoptMixin:
+     # Supplied by ProcessRegistry.
+     _lock: Any
+     _running: dict
++    _finished: dict
++    pending_watchers: list
+     completion_queue: Any
+     _refresh_detached_session: Callable[[Any], Any]
+ 
+@@ -75,6 +81,7 @@ class ProcessReadoptMixin:
+     # ----- unknown-exit completion -----
+ 
+     def _unknown_exit_event(self, session) -> dict[str, Any]:
++        lost = getattr(session, "completion_reason", "") == WATCHER_LOST_REASON
+         return {
+             "type": "completion",
+             "session_id": session.id,
+@@ -83,29 +90,114 @@ class ProcessReadoptMixin:
+             "owner_task_id": session.owner_task_id,
+             "command": session.command,
+             "exit_code": None,
+-            "completion_reason": UNKNOWN_EXIT_REASON,
+-            "termination_source": "readopted_after_restart",
++            "completion_reason": WATCHER_LOST_REASON if lost else UNKNOWN_EXIT_REASON,
++            "termination_source": session.termination_source if lost else "readopted_after_restart",
+             "output": "",
+             "started_at": session.started_at,
+             # The chat may not be open in this backend yet: park instead of dropping.
+             "park_if_unowned": True,
+         }
+ 
++    def _deliver_readopted_event(self, event: dict[str, Any]) -> None:
++        """Hand an event for a re-adopted job to the host's sink (Desktop: park + wake the chat), else the queue."""
++        sink = self.on_unknown_exit
++        if sink is None:
++            self.completion_queue.put(event)
++            return
++        try:
++            sink(event)
++        except Exception:
++            logger.warning("unknown-exit delivery hook failed; queueing %s instead", event.get("session_id"),
++                           exc_info=True)
++            self.completion_queue.put(event)
++
++    def _prune_uncollected_detached(self, session):
++        """Drop a recovered entry whose PID is gone, without inventing an exit.
++
++        An owned systemd scope stays reachable so kill can still reap it. A
++        scope-less entry is removed: poll/list must not report a collected exit.
++        A gateway re-adoption with a completion watcher keeps the session as an
++        ``unknown`` exit instead, so that watcher wakes the owning session. [daveey]
++        """
++        keep_for_watcher = session._lost_exit_via_watcher and session.notify_on_complete
++        with session._lock:
++            session.exited = True
++            if keep_for_watcher:
++                session.exit_code = None
++                session.completion_reason = UNKNOWN_EXIT_REASON
++                session.termination_source = "readopted_after_restart"
++        with self._lock:
++            was_running = self._running.pop(session.id, None) is not None
++            if session.systemd_unit or keep_for_watcher:
++                if keep_for_watcher and was_running:
++                    session.exited_at = time.time()
++                self._finished[session.id] = session
++            else:
++                self._finished.pop(session.id, None)
++        self._write_checkpoint()
++        if was_running and session._report_lost_exit and session.notify_on_complete:
++            self._queue_unknown_exit(session)
++        elif was_running and keep_for_watcher:
++            logger.info("Re-adopted process %s (pid=%s) exited; status unknown — the gateway watcher wakes %s",
++                        session.id, session.pid, session.session_key or "-")
++        session._completion_event.set()
++        return session if (session.systemd_unit or keep_for_watcher) else None
++
++    def _put_completion(self, session, notification: dict[str, Any]) -> None:
++        """Queue a completion; a re-attached job owned by a Desktop/TUI chat goes through the re-adopt
++        sink instead (that chat may not be open in this backend). [daveey]"""
++        if session._completion_via_readopt_sink:
++            notification["park_if_unowned"] = True
++            self._deliver_readopted_event(notification)
++            return
++        self.completion_queue.put(notification)
++
+     def _queue_unknown_exit(self, session) -> None:
+         from tools.process_registry import _redact_process_result
+         event = self._unknown_exit_event(session)
+         _redact_process_result(event)
+-        sink = self.on_unknown_exit
+-        if sink is None:
+-            self.completion_queue.put(event)
+-        else:
+-            try:
+-                sink(event)
+-            except Exception:
+-                logger.warning("unknown-exit delivery hook failed; queueing %s instead", session.id, exc_info=True)
+-                self.completion_queue.put(event)
+-        logger.info("Re-adopted process %s (pid=%s) exited; status unknown — notifying %s",
+-                    session.id, session.pid, session.session_key)
++        self._deliver_readopted_event(event)
++        logger.info("Re-adopted process %s (pid=%s) %s — notifying %s", session.id, session.pid,
++                    "watcher lost" if event["completion_reason"] == WATCHER_LOST_REASON
++                    else "exited; status unknown", session.session_key)
++
++    def _deliver_unwatched_exit(self, session, owner: Optional[str], reason: str, source: str) -> str:
++        """Tell the owning session that a job's outcome was never observed (it exited while no host
++        watched it, or its sandbox watcher could not be re-attached). Every owner type gets a wake:
++        a Desktop/TUI chat through the re-adopt sink, a messaging-gateway session through a recovered
++        process watcher (which reads this exited session), a CLI/managed worker through the queue.
++        Returns how it was delivered (``sink`` | ``watcher`` | ``queue``), or ``""`` when the job asked
++        for no notification. [daveey]"""
++        with session._lock:
++            session.exited = True
++            session.exit_code = None
++            session.completion_reason = reason
++            session.termination_source = source
++        session.exited_at = time.time()
++        if not session.notify_on_complete:
++            return ""
++        if owner != OWNER_TUI and session.watcher_interval > 0:
++            with self._lock:
++                self._finished[session.id] = session
++            session._completion_event.set()
++            self.pending_watchers.append(self._recovered_watcher(session))
++            return "watcher"
++        if owner == OWNER_GATEWAY:
++            return ""  # no watcher route recorded: the gateway has no consumer for a bare queue event
++        self._queue_unknown_exit(session)
++        return "sink" if owner == OWNER_TUI and self.on_unknown_exit is not None else "queue"
++
++    @staticmethod
++    def _recovered_watcher(session) -> dict[str, Any]:
++        from tools.process_registry import _WATCHER_ROUTE_KEYS
++        return {
++            "session_id": session.id,
++            "check_interval": session.watcher_interval,
++            "session_key": session.session_key,
++            **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
++            "notify_on_complete": session.notify_on_complete,
++            "parent_session_id": session.parent_session_id,
++        }
+ 
+     # ----- parked events (owner chat not open in this backend) -----
+ 
+-- 
+2.55.0
+
