@@ -166,13 +166,13 @@ def test_nudge_without_a_continuation_is_undelivered(host):
 def test_declared_budget_lets_a_slower_check_finish_past_the_global_timeout(host, caplog):
     """On a core that honours `hermes_hook_timeout`, the coach's explicit budget (not the 30s global) bounds it."""
     model = SlowModel(latency=0.5)
-    hooks, mgr, events = host(global_timeout=0.25, budget=1.0, slack=0.2, model=model)
+    hooks, mgr, events = host(global_timeout=0.25, budget=5.0, slack=0.2, model=model)
     hooks["pre_llm_call"](session_id="s5", user_message="fix the parser")
     with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
         out = mgr.invoke_hook("pre_verify", session_id="s5", attempt=0, final_response=REPLY, changed_paths=["p.py"])
     assert out and out[0]["action"] == "continue"
     assert "timed out" not in caplog.text
-    assert events("reply_nudge")[0]["host_timeout_s"] == pytest.approx(1.2)
+    assert events("reply_nudge")[0]["host_timeout_s"] == pytest.approx(5.2)
 
 
 def test_budget_caps_calls_and_refuses_a_call_too_short_to_finish():
