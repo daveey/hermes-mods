@@ -615,6 +615,43 @@ def test_fleet_profile_burst_builds_the_machine_wide_gateway_section_once(api, m
     assert len(gateway_builds) == 3
 
 
+def test_fleet_poll_during_a_rebuild_gets_the_previous_value_without_waiting(api, monkeypatch):
+    """A Desktop reconnect burst after a gap longer than FLEET_CACHE_S found every entry stale: one poll
+    rebuilt and the other nine parked AnyIO workers on the lock behind it, slowed by the burst's own GIL
+    contention, while the session reads queued (hub, t_01a18b4b710b722e). A poll that finds a rebuild
+    running now gets the previous value at once; a cold entry still waits for the build."""
+    import threading, time
+    module, _, _ = api
+    module._fleet_invalidate()
+    monkeypatch.setattr(module, 'active_profile', lambda: 'default')
+    monkeypatch.setattr(module, '_ci_section', lambda: dict(state='ready', machines=[]))
+    release, started, builds = threading.Event(), threading.Event(), []
+    def gateway():
+        builds.append(1)
+        if len(builds) > 1:  # the rebuild blocks until the test lets it finish
+            started.set()
+            release.wait(5)
+        return dict(state='ready', machines=[], build=len(builds))
+    monkeypatch.setattr(module, '_gateway_section', gateway)
+    assert module.fleet_view()['gateways']['build'] == 1  # cold: waited for the first build
+    for entry in list(module._fleet_cache.values()) + [module._gateway_cache]:
+        entry['at'] -= module.FLEET_CACHE_S + 1
+    rebuilder = threading.Thread(target=module.fleet_view)
+    rebuilder.start()
+    assert started.wait(5)
+    t0 = time.monotonic()
+    stale = [module._shared_gateway_section() for _ in range(5)]
+    assert time.monotonic() - t0 < 0.5
+    assert [s['build'] for s in stale] == [1] * 5
+    release.set()
+    rebuilder.join(5)
+    assert module._shared_gateway_section()['build'] == 2 and len(builds) == 2
+    # An invalidation (investigation create) is read back: no stale value is served after it.
+    module._fleet_invalidate()
+    release.set()
+    assert module.fleet_view()['gateways']['build'] == 3
+
+
 def test_fleet_gateway_section_failure_is_shared_for_the_window_not_retried_per_profile(api, monkeypatch):
     import threading
     module, _, _ = api
