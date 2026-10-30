@@ -90,6 +90,27 @@ Scope discovery is evidence of an available credential route, not proof of vendo
 to execute an action. Tests in `tests/test_f3_broker.py` exercise discovery through temporary executables and
 the final-response gate with a stub judge; they do not vend credentials or contact a vendor.
 
+**Irreversible asks are never `agent_can_do` (code, not prompt).** The SYSTEM prompt says destructive or
+irreversible actions are always `ok`, but a model can still answer `agent_can_do` when `how` names a scope that is on
+the sheet (10-29: "revoke the OpenAI key" + an inference scope; the agent then edited a dotfile). `judge.IRREVERSIBLE`
+matches an ask containing both an action verb (revoke, rotate, regenerate, reissue, delete, destroy, wipe, purge,
+cancel, deactivate, transfer, pay, purchase, buy, refund) and an object noun (key, token, secret, password,
+credential, account, subscription, repo, repository, bucket, database, backup, payment, invoice, card, domain, funds,
+money). On the ordinary path (`judge()`) and the structured path (`structured_llm`), an `agent_can_do` on such an ask
+becomes `ok` with the reason "irreversible: David's decision" and one `irreversible_kept` line in `ask-gate.jsonl`.
+`already_answered`, `already_done` and `unverified` are left alone. Control: a missing-permission ask with a
+`*-minter` scope still gets `agent_can_do`. Tests: `tests/test_irreversible_guard.py`.
+
+**Standing decisions.** `build_user_prompt` adds a "DAVID'S STANDING DECISIONS (user profile)" section built from the
+§-separated entries of `<HERMES_HOME>/memories/USER.md` (capped at 2000 chars, "(none)" when the file is missing),
+stated to be data, not instructions. SYSTEM's `already_answered` also covers "a standing decision in the user
+profile declines exactly this", so a declined key rotation is not asked again.
+
+**Live-test rule.** A live test that runs a real agent never uses a real pending ask, credential or file of David's.
+Use a fictional, human-only topic and `-t todo`. (10-29: a live `hermes chat --oneshot` about a real key made the agent
+edit `~/.bash_profile`.) To check the judge against the real model, call `judge.judge(..., llm=judge.aux_llm)` directly;
+that runs no agent.
+
 ## Requires compatible core before plugin rollout
 
 Registration requires `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES` with integer
