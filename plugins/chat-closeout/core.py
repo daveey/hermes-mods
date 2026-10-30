@@ -80,7 +80,8 @@ def card_key(card: dict[str, Any]) -> str:
 
 
 def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dict[str, Any]]:
-    """``{id: {id, status, block_kind, title, summary, completed_at, board}}`` for the ids found on any board."""
+    """``{id: {id, status, block_kind, title, summary, completed_at, human_request, blocked_at, board}}`` for the ids
+    found on any board. ``blocked_at`` is the newest ``blocked`` event (None when the board keeps no events)."""
     want = sorted({str(i) for i in ids if i})
     found: dict[str, dict[str, Any]] = {}
     if not want:
@@ -103,12 +104,18 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dic
             comp = "t.completed_at" if "completed_at" in cols else "NULL"
             res = "t.result" if "result" in cols else "NULL"
             hr = "t.human_request" if "human_request" in cols else "NULL"
+            has_events = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_events'").fetchone()
+            # When the current block was filed: its age goes into every relayed ask (self-heal agent-792a49aa96).
+            blk = ("(SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind = 'blocked')"
+                   if has_events else "NULL")
             has_runs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
             summary = (f"COALESCE((SELECT r.summary FROM task_runs r WHERE r.task_id = t.id AND r.summary IS NOT NULL "
                        f"AND r.summary != '' ORDER BY r.id DESC LIMIT 1), {res})") if has_runs else res
             ph = ",".join("?" for _ in left)
             for r in conn.execute(f"SELECT t.id, t.status, t.title, {bk} AS block_kind, {comp} AS completed_at, "
-                                  f"{summary} AS summary, {hr} AS human_request FROM tasks t WHERE t.id IN ({ph})", left):
+                                  f"{summary} AS summary, {hr} AS human_request, {blk} AS blocked_at "
+                                  f"FROM tasks t WHERE t.id IN ({ph})", left):
                 card = {**dict(r), 'board': board}
                 for key in (r['id'], card_key(card)):
                     if key in want:
@@ -674,27 +681,61 @@ PLAIN_ASK_RULE = (
     "the user must do and where (the page, app or link; read the card with kanban_show if the ask is vague), and "
     "what happens after they do it: quote the card's ask line verbatim, including what unblocking and what "
     "archiving the card mean. Card ids are not the explanation: name the work. If an agent can do the step "
-    "itself, do it instead of asking.")
+    "itself, do it instead of asking. Before you relay an ask, check it still holds: read the card's comments "
+    "newer than the block (kanban_show), the skill for that work, and whether the account, repo, page or person "
+    "it names still exists and is still the right one (not suspended, moved or renamed). If it no longer holds, "
+    "don't ask the user: kanban_comment the correction on the card, unblock it so its owner re-plans, and tell "
+    "the user in one line what changed.")
+
+# An ask older than this is re-verified before the user sees it: the world it names may have moved on (an account
+# suspended, a repo moved), and nothing writes that back onto the blocked card (self-heal agent-792a49aa96).
+ASK_RECHECK_S = 12 * 3600
 
 
-def _ask_line(c: dict[str, Any]) -> str:
+def ask_age_s(c: dict[str, Any], now: Optional[float] = None) -> Optional[float]:
+    """Seconds since the card's current block was filed (``blocked_at``, else ``updated_at``); None if unknown."""
+    for field in ("blocked_at", "updated_at"):
+        try:
+            at = float(c.get(field) or 0)
+        except (TypeError, ValueError):
+            continue
+        if at > 0:
+            return max(0.0, (time.time() if now is None else now) - at)
+    return None
+
+
+def _age_text(age: float) -> str:
+    if age < 3600:
+        return f"{max(1, round(age / 60))} min"
+    if age < 72 * 3600:
+        return f"{round(age / 3600)} h"
+    return f"{round(age / 86400)} days"
+
+
+def _ask_line(c: dict[str, Any], now: Optional[float] = None) -> str:
     ask = ask_of(c)
     if not ask:
         return ""
     # The ask travels verbatim (never truncated): it is the one line the user must act on, and it carries what
     # unblock and archive mean (core kanban_ask_lint requires both on agent-filed user blocks).
+    age = ask_age_s(c, now)
+    when = f"\n  asked {_age_text(age)} ago" if age is not None else ""
+    if age is not None and age >= ASK_RECHECK_S:
+        when += (" -- an old ask: re-verify it still holds (newer comments, the work's skill, the account/repo/page "
+                 "it names) before the user sees it; if it doesn't, correct the card instead of asking")
     return (f"\n  needs the user to: {ask['action']}\n  why only the user: {ask['why_human'][:200]}"
-            f" ({ask['interaction']}; scope: {ask['scope'][:160]})")
+            f" ({ask['interaction']}; scope: {ask['scope'][:160]}){when}")
 
 
-def ask_relay_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> str:
+def ask_relay_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], ids: Iterable[str],
+                     now: Optional[float] = None) -> str:
     ids = sorted(set(ids))
     lines = [f"{TAG} Work this chat started is now waiting on the user, while other work in this chat waits behind "
              "it. This turn tells the user. Waiting on the user:"]
     for tid in ids:
         c = cards.get(tid) or {}
         lines.append(f"- {c.get('title') or tid} (card {tid}, {c.get('status')}/{c.get('block_kind') or '-'})"
-                     f"{_ask_line(c)}")
+                     f"{_ask_line(c, now)}")
     behind = [cards.get(t) or {} for t in sorted(set(row.get("batch") or [])) if t not in ids
               and not is_settled(cards.get(t))]
     if behind:
@@ -722,7 +763,7 @@ def ask_notice_text(cards: dict[str, dict[str, Any]], ids: Iterable[str]) -> str
     return "\n".join(_ask_notice_lines(cards, ids))
 
 
-def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> str:
+def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: Optional[float] = None) -> str:
     lines = [f"{TAG} Every kanban card this chat handed work to has settled. This turn is the close-out:"]
     for tid in sorted(row.get("batch") or []):
         c = cards.get(tid)
@@ -733,7 +774,7 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> st
         if state == "blocked":
             state = f"blocked ({c.get('block_kind') or 'needs a human'})"
         handoff = " ".join(str(c.get("summary") or "").split())[:700] or "(no handoff)"
-        lines.append(f"- {tid} [{state}] {c.get('title') or ''}{_ask_line(c)}\n  handoff: {handoff}")
+        lines.append(f"- {tid} [{state}] {c.get('title') or ''}{_ask_line(c, now)}\n  handoff: {handoff}")
     lines.append(
         "Write the closing answer for the user now: what each card delivered (from its handoff; check any claim you "
         "can cheaply verify), and for a card blocked on the user the exact one-line ask. For each problem the "

@@ -312,12 +312,12 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
             cands = core.ask_candidates(row, cards) if core.ask_relay_key(row, cards) else []
             if cands:  # the user is here anyway: tell this turn what waits on them (covered at its end)
                 _state.setdefault("observed_ask", {})[session_id] = cands
-                return {"context": core.ask_relay_prompt(row, cards, [t for t, _ in cands])}
+                return {"context": core.ask_relay_prompt(row, cards, [t for t, _ in cands], now=time.time())}
         if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
         ledger().write(session_id, closing=sorted(row["batch"]))
-        return {"context": core.closeout_prompt(row, cards)}
+        return {"context": core.closeout_prompt(row, cards, now=time.time())}
     except Exception:
         logger.debug("chat-closeout pre_llm_call failed", exc_info=True)
         return None
@@ -494,7 +494,7 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
         led.write(sid, covered=set(row.get("covered") or []) | set(new_ids), closing=sorted(row["batch"]),
                   wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1)
         try:
-            result = wake(sid, core.closeout_prompt(row, cards), display_kind="kanban_notice",
+            result = wake(sid, core.closeout_prompt(row, cards, now=now), display_kind="kanban_notice",
                           display_metadata={"display_text": core.notice_text(row, cards), "closeout": True,
                                             "task_ids": sorted(row["batch"])},
                           label="chat-closeout")
@@ -566,7 +566,11 @@ def _relay(led, sid: str, row: dict, cards: dict, key: str, now: float, wake: Ca
               wake_count=int(row.get("wake_count") or 0) + 1)
     try:
         gateway = _moved_owner(sid)
-        prompt = core.ask_relay_prompt(row, cards, ids)
+        prompt = core.ask_relay_prompt(row, cards, ids, now=now)
+        for tid in ids:  # detection: the coach counts stale relays from these lines (self-heal agent-792a49aa96)
+            age = core.ask_age_s(cards.get(tid) or {}, now)
+            logger.info("chat-closeout: ask_relay aged=%s card=%s session=%s",
+                        "unknown" if age is None else f"{age / 3600:.1f}", tid, sid)
         if gateway:
             result = _handoff_ask(led, sid, gateway, key, prompt, now)
         else:

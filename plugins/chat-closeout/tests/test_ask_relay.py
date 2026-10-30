@@ -184,3 +184,65 @@ def test_unblocked_then_same_block_again_is_a_new_ask(tmp_path, monkeypatch):
     cards['t_parent'] = _blocked()
     assert tick(cards, 1200)
     assert len(calls) == 2
+
+
+# ---- self-heal agent-792a49aa96: a stored ask is not true forever ------------------------------------------------
+NOW = 1_800_000_000.0
+
+
+def _aged(seconds):
+    return {**_blocked(), 'blocked_at': NOW - seconds}
+
+
+def test_old_ask_carries_its_age_and_a_reverify_line():
+    """The live failure: a 22-33 h old ask naming a suspended GitHub account was relayed verbatim, twice."""
+    cards = {'t_parent': _aged(30 * 3600), 't_child': {'status': 'todo', 'title': 'Wire Alpha'}}
+    prompt = core.ask_relay_prompt({'batch': ['t_parent', 't_child']}, cards, ['t_parent'], now=NOW)
+    assert ASK['action'] in prompt  # still verbatim
+    assert 'asked 30 h ago' in prompt
+    low = prompt.lower()
+    assert 'old ask' in low and 're-verify' in low
+    assert 'still holds' in low  # the premise rule
+    assert 'unblock' in low and 'comment' in low  # what to do when it is stale
+
+
+def test_fresh_ask_gets_the_premise_rule_but_no_old_line():
+    cards = {'t_parent': _aged(600), 't_child': {'status': 'todo'}}
+    prompt = core.ask_relay_prompt({'batch': ['t_parent', 't_child']}, cards, ['t_parent'], now=NOW)
+    assert 'asked 10 min ago' in prompt
+    low = prompt.lower()
+    assert 'still holds' in low
+    assert 'old ask' not in low
+
+
+def test_closeout_prompt_carries_the_age_too():
+    prompt = core.closeout_prompt({'batch': ['t_parent']}, {'t_parent': _aged(31 * 3600)}, now=NOW)
+    assert 'asked 31 h ago' in prompt and 'old ask' in prompt.lower()
+
+
+def test_read_cards_returns_latest_block_time(tmp_path):
+    import sqlite3
+    db = tmp_path / 'kanban.db'
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE tasks (id TEXT, status TEXT, title TEXT, block_kind TEXT, completed_at REAL, "
+              "result TEXT, human_request TEXT)")
+    c.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
+              "payload TEXT, created_at INTEGER)")
+    c.execute("INSERT INTO tasks VALUES ('t_p', 'blocked', 'x', 'needs_input', NULL, NULL, ?)", (json.dumps(ASK),))
+    c.executemany("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_p', ?, ?)",
+                  [('blocked', 100), ('unblocked', 200), ('blocked', 300), ('commented', 400)])
+    c.commit()
+    c.close()
+    assert core.read_cards([db], ['t_p'])['t_p']['blocked_at'] == 300
+
+
+def test_relay_logs_ask_age(tmp_path, monkeypatch, caplog):
+    """Detection: each relayed ask logs ``ask_relay aged=<h>`` so the coach can count stale relays."""
+    import logging
+    led, calls, tick = _waker(tmp_path, monkeypatch)
+    cards = {'t_parent': _aged(30 * 3600), 't_child': {'status': 'todo'}}
+    led.write('chat', batch=['t_parent', 't_child'], open=[])
+    with caplog.at_level(logging.INFO, logger='chat_closeout'):
+        assert tick(cards, NOW)
+    assert 'asked 30 h ago' in calls[0][1]
+    assert any('ask_relay aged=30.0 ' in r.getMessage() and 't_parent' in r.getMessage() for r in caplog.records)
