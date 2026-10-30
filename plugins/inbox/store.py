@@ -514,7 +514,7 @@ class Inbox:
             raise JunkPost(f"refused: {junk}. Tests and probes never post to the real Inbox: use a temp "
                            f"HERMES_HOME (or check the card with the module's tests).")
         named = poster  # what the caller called itself: project routing keys on this, never a derived name
-        poster = poster or key_poster(key)
+        poster = policy.effective_poster(self.home, poster or key_poster(key))
         sh = selfheal_reason(poster, type, self.home)
         why = sh or agent_fixable_reason(poster, accept_prompt)
         if why:
@@ -641,6 +641,10 @@ class Inbox:
             reason = f"{reason}: {pol.RETRY_SHAPE}"
         elif reason == "ask_self_attested":
             reason = f"{reason}: {pol.SELF_ATTESTED_MSG}"
+        declared = pol.declared_label(poster)
+        if declared:
+            reason += (f"\n\nThe poster declared itself `{declared}` but this post came from a {family} run, so the "
+                       f"`{family}` rules applied (effective poster `{poster}`).")
         task = None
         try:
             task = (self._task_creator or kanban_task_creator)(

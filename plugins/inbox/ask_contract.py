@@ -13,6 +13,40 @@ def family(poster):
     return "-".join(str(poster or "unlabelled").split("·", 1)[0].strip().lower().replace("_", " ").split())
 
 
+def runtime_family():
+    """The agent-owned family the runtime context proves, or None: a Kanban worker (any door) or a cron run."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return "kanban"
+    cron = os.environ.get("HERMES_CRON_SESSION", "")
+    if not cron:
+        try:  # cron binds it as a ContextVar, not os.environ
+            from gateway.session_context import get_session_env
+            cron = get_session_env("HERMES_CRON_SESSION", "")
+        except Exception:
+            cron = ""
+    return "cron" if str(cron).strip().lower() in ("1", "true", "yes", "on") else None
+
+
+def effective_poster(home, poster):
+    """Bind the caller-declared label to the runtime. The label is trusted only when nothing contradicts it:
+    inside a Kanban/cron run a poster the registry leaves unrestricted (`*`) and non-agent-owned (cli, desktop,
+    oneshot) is re-labelled `<runtime> · <declared>`, so the registry lookup, AGENT_OWNERS and the noise breaker
+    all see the runtime family. Restricted posters (social, slack, coach) keep their own bounded type lists."""
+    rt = runtime_family()
+    if not rt or not poster or family(poster) == rt:
+        return poster
+    row = registry(home).get(family(poster))
+    if row and row.get("owner") not in AGENT_OWNERS and "*" in row.get("allowed_types", []):
+        return f"{rt} · {poster}"[:80]
+    return poster
+
+
+def declared_label(poster):
+    """The caller-declared label of an effective poster built by `effective_poster`, else None."""
+    head, sep, rest = str(poster or "").partition(" · ")
+    return rest if sep and head in ("kanban", "cron") and family(rest) in ("cli", "desktop", "oneshot") else None
+
+
 def registry(home):
     # JSON is a YAML 1.2 subset: no runtime YAML dependency for this safety gate.
     rows = json.loads(Path(__file__).with_name("posters.yaml").read_text())
