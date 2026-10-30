@@ -41,7 +41,8 @@ def test_ask_relay_fires_while_dependent_waits(tmp_path, monkeypatch):
     """The live failure: parent blocked on David, child todo waiting on it. Before the fix the batch never settled,
     so the chat said nothing for 18 h."""
     led, calls, tick = _waker(tmp_path, monkeypatch)
-    cards = {'t_parent': _blocked(), 't_child': {'status': 'todo', 'title': 'Wire Alpha to Ask Eve'}}
+    cards = {'t_parent': _blocked(), 't_child': {'status': 'todo', 'title': 'Wire Alpha to Ask Eve',
+                                                 'parents': ['t_parent']}}
     led.write('chat', batch=['t_parent', 't_child'], open=['t_parent', 't_child'])
     assert core.settled_sig(['t_parent', 't_child'], cards) is None  # the close-out alone never fires here
     out = tick(cards, 1000)
@@ -246,3 +247,45 @@ def test_relay_logs_ask_age(tmp_path, monkeypatch, caplog):
         assert tick(cards, NOW)
     assert 'asked 30 h ago' in calls[0][1]
     assert any('ask_relay aged=30.0 ' in r.getMessage() and 't_parent' in r.getMessage() for r in caplog.records)
+
+
+# ---- self-heal agent-31a66d274a: "waits behind it" only for cards that really depend on the ask ------------------
+def test_unrelated_cards_get_no_waits_behind_line():
+    """The live failure: an optional ask (rotate a leaked key) was relayed as if the chat's other work waited behind
+    it, though no card listed it as a parent. The user was nagged for 43 h about a step nothing needed."""
+    cards = {'t_parent': _aged(600), 't_other': {'status': 'running', 'title': 'Clean up the export job',
+                                                 'parents': []}}
+    prompt = core.ask_relay_prompt({'batch': ['t_parent', 't_other']}, cards, ['t_parent'], now=NOW)
+    low = prompt.lower()
+    assert 'waits behind' not in low and 'queued behind' not in low
+    assert 'nothing else waits on this' in low and 'optional' in low
+    assert ASK['action'] in prompt  # the ask itself still travels verbatim
+
+
+def test_real_parent_link_still_says_waits_behind():
+    cards = {'t_parent': _aged(600), 't_child': {'status': 'todo', 'title': 'Wire Alpha to Ask Eve',
+                                                 'parents': ['t_parent']},
+             't_other': {'status': 'running', 'title': 'Clean up the export job', 'parents': []}}
+    prompt = core.ask_relay_prompt({'batch': ['t_parent', 't_child', 't_other']}, cards, ['t_parent'], now=NOW)
+    low = prompt.lower()
+    assert 'waits behind' in low
+    behind = [ln for ln in prompt.splitlines() if 'behind' in ln.lower()]
+    assert any('Wire Alpha to Ask Eve' in ln for ln in behind)
+    assert not any('Clean up the export job' in ln for ln in behind)
+    assert 'nothing else waits on this' not in low
+
+
+def test_read_cards_returns_parents(tmp_path):
+    import sqlite3
+    db = tmp_path / 'kanban.db'
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE tasks (id TEXT, status TEXT, title TEXT)")
+    c.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT)")
+    c.executemany("INSERT INTO tasks VALUES (?,?,?)", [('t_ask', 'blocked', 'ask'), ('t_kid', 'todo', 'kid'),
+                                                       ('t_solo', 'running', 'solo')])
+    c.execute("INSERT INTO task_links VALUES ('t_ask', 't_kid')")
+    c.commit()
+    c.close()
+    got = core.read_cards([db], ['t_ask', 't_kid', 't_solo'])
+    assert got['t_kid']['parents'] == ['t_ask']
+    assert got['t_solo']['parents'] == [] and got['t_ask']['parents'] == []

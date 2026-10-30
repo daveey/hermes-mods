@@ -113,10 +113,17 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str]) -> dict[str, dic
             summary = (f"COALESCE((SELECT r.summary FROM task_runs r WHERE r.task_id = t.id AND r.summary IS NOT NULL "
                        f"AND r.summary != '' ORDER BY r.id DESC LIMIT 1), {res})") if has_runs else res
             ph = ",".join("?" for _ in left)
+            # Dependency edges: the ask relay says "waits behind it" only for a card that lists the ask card as a
+            # parent (self-heal agent-31a66d274a). No links table = no known edges.
+            parents: dict[str, list[str]] = {}
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_links'").fetchone():
+                for pr in conn.execute(f"SELECT parent_id, child_id FROM task_links WHERE child_id IN ({ph}) "
+                                       "ORDER BY parent_id", left):
+                    parents.setdefault(pr[1], []).append(pr[0])
             for r in conn.execute(f"SELECT t.id, t.status, t.title, {bk} AS block_kind, {comp} AS completed_at, "
                                   f"{summary} AS summary, {hr} AS human_request, {blk} AS blocked_at "
                                   f"FROM tasks t WHERE t.id IN ({ph})", left):
-                card = {**dict(r), 'board': board}
+                card = {**dict(r), 'board': board, 'parents': parents.get(r['id'], [])}
                 for key in (r['id'], card_key(card)):
                     if key in want:
                         if key in found:
@@ -730,19 +737,32 @@ def _ask_line(c: dict[str, Any], now: Optional[float] = None) -> str:
 def ask_relay_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], ids: Iterable[str],
                      now: Optional[float] = None) -> str:
     ids = sorted(set(ids))
-    lines = [f"{TAG} Work this chat started is now waiting on the user, while other work in this chat waits behind "
-             "it. This turn tells the user. Waiting on the user:"]
+    ask_ids = set(ids)
+    # "Waits behind it" is a claim about dependency edges, not about sharing a chat: only cards that list an ask
+    # card as a parent wait on the user's answer (self-heal agent-31a66d274a: an optional ask relayed as a blocker).
+    others = [t for t in sorted(set(row.get("batch") or [])) if t not in ask_ids and not is_settled(cards.get(t))]
+    behind = [cards.get(t) or {} for t in others if ask_ids & set((cards.get(t) or {}).get("parents") or [])]
+    if behind:
+        head = (f"{TAG} Work this chat started is now waiting on the user, and other work in this chat waits behind "
+                "it. This turn tells the user. Waiting on the user:")
+    else:
+        head = (f"{TAG} Work this chat started is now waiting on the user. Nothing else waits on this: no other card "
+                "depends on it, so for the rest of the work it is optional. This turn tells the user once. "
+                "Waiting on the user:")
+    lines = [head]
     for tid in ids:
         c = cards.get(tid) or {}
         lines.append(f"- {c.get('title') or tid} (card {tid}, {c.get('status')}/{c.get('block_kind') or '-'})"
                      f"{_ask_line(c, now)}")
-    behind = [cards.get(t) or {} for t in sorted(set(row.get("batch") or [])) if t not in ids
-              and not is_settled(cards.get(t))]
     if behind:
-        lines.append("Still in progress or queued behind it: " + "; ".join(
+        lines.append("Waits behind it (lists it as a parent): " + "; ".join(
             f"{c.get('title') or '(untitled)'} [{c.get('status') or '?'}]" for c in behind[:8]))
+        tail = "Keep the turn to this ask; the other cards report when they finish."
+    else:
+        tail = ("Don't present it as blocking other work. Say what happens if the user does nothing (the default), "
+                "and don't restate it in later replies; the other cards report when they finish.")
     lines.append("Write a short message for the user now. " + PLAIN_ASK_RULE + " Don't say that nothing needs them. "
-                 "Keep the turn to this ask; the other cards report when they finish.")
+                 + tail)
     return "\n".join(lines)
 
 
