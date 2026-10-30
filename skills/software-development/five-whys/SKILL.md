@@ -72,6 +72,8 @@ level: snapshot the alert store's row count, run the suite, and confirm the coun
 one real run (for example `systemctl --user start <svc>`) and confirm its success line, instead of waiting
 for the next scheduled run.
 
+For multi-gateway queue alerts, distinguish the originating chat's gateway from the card's execution owner before comparing saturation: a local session can wait on hub-only cards. Verify card presence in the owner's fresh snapshot and read that owner's dispatcher logs. A failed `kanban_show` on the origin does not mean the card disappeared. When recovering a claim hold, inspect its child update process and use the updater's existing cooldown with safe holder termination; killing an idle drainer alone can immediately recreate the hold and strand the repair workers.
+
 **Validate what the metric measures before attributing its cause.** Preserve the original report and its
 measurement timestamp before rerunning a detector: even a dry run may overwrite its report, and concurrent
 workers can create or remove evidence. Reconcile every group in the machine-readable report, not just the
