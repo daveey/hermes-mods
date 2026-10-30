@@ -8,6 +8,22 @@ import threading
 
 from .service import AuthContext
 
+log = logging.getLogger(__name__)
+
+# Names the command without starting with it (e.g. a pasted instruction about the command).
+COMMAND_HINT = re.compile(r'!project\b', re.IGNORECASE)
+USAGE = ('To request work, send a new message in this channel that starts with '
+         '`!project request ` followed by what you want, for example:\n'
+         '`!project request Add a one-line comment to README.md`\n'
+         'I reply in that thread with a plan and the exact `!project approve <id> <hash>` line to send.')
+NOTICES = {
+    'not_a_command': "I didn't start anything. This message isn't a `!project` command: "
+                     'the command has to be the first thing in the message.\n' + USAGE,
+    'empty_request': "I didn't start anything. `!project request` needs a description after it.\n" + USAGE,
+    'malformed_approve': "I didn't approve anything. Reply in the plan's thread with the exact "
+                         '`!project approve <id> <hash>` line from the plan message, and nothing else.',
+}
+
 
 class Ingress:
     def __init__(self, policy, client, queue=None):
@@ -60,38 +76,84 @@ class Ingress:
             return self.client.call('request', context=asdict(ctx), text=args['request'])
         return self.client.call('status', context=asdict(ctx), workflow_id=args['workflow_id'])
 
-    async def middleware(self, body, next):
+    async def middleware(self, body, next, client=None):
+        notice = None
         try:
-            self.enqueue(body)
+            notice = self.enqueue(body)
         except Exception:
-            logging.getLogger(__name__).exception('Project ingress append failed')
+            log.exception('Project ingress append failed')
         finally:
             # Native Bolt routing/ack must run even on malformed input or disk failure.
             result = await next()
+        if notice is not None:
+            await send_notice(client, notice)
         return result
 
-    def enqueue(self, body):
-        ctx = self.observe(body)
-        if ctx is None:
-            return
-        text = body['event'].get('text', '')
+    def classify(self, ctx, text):
+        """Return (operation, args, reason). operation None = nothing queued; reason is a log code."""
         # Strip only a leading bot mention, never arbitrary interior content.
-        command = re.sub(r'^<@[A-Z0-9]+>\s*', '', text).strip()
-        operation, args = None, {}
+        command = re.sub(r'^<@[A-Z0-9]+>\s*', '', text or '').strip()
         if command.startswith('!project request '):
-            operation, args = 'request', {'text': command[len('!project request '):]}
-        elif command.startswith('!project approve '):
+            return 'request', {'text': command[len('!project request '):]}, 'request'
+        if command.startswith('!project approve '):
             parts = command.split()
             if len(parts) == 4:
-                operation, args = 'approve', {'workflow_id': parts[2], 'plan_hash': parts[3]}
-        elif ctx.thread_id:
+                return 'approve', {'workflow_id': parts[2], 'plan_hash': parts[3]}, 'approve'
+        if ctx.thread_id:
             # Native observer catches late followups even when the bot isn't mentioned.
             # Unknown threads are ignored by the server, not converted to new workflows.
-            operation, args = 'observe_followup', {'text': text}
+            return 'observe_followup', {'text': text}, 'followup'
+        if command.startswith('!project approve'):
+            return None, {}, 'malformed_approve'
+        if command.startswith('!project request'):
+            return None, {}, 'empty_request'
+        if COMMAND_HINT.search(command):
+            return None, {}, 'not_a_command'
+        return None, {}, 'not_project_traffic'
+
+    def notice_for(self, ctx, reason):
+        """Owner-only usage reply for a top-level near-miss; never for ordinary chat."""
+        if reason not in NOTICES or ctx.thread_id or ctx.user_id not in self.policy.owner_ids:
+            return None
+        return {'channel': ctx.channel_id, 'thread_ts': ctx.message_id, 'text': NOTICES[reason]}
+
+    def enqueue(self, body):
+        """Queue an authenticated command. Returns a thread notice to send, or None."""
+        ctx = self.observe(body)
+        if ctx is None:
+            ev = body.get('event') if isinstance(body, dict) else None
+            if isinstance(ev, dict) and ev.get('channel') == self.policy.channel_id:
+                log.info('Project ingress ignored ts=%s: not an authenticated human event '
+                         '(type=%s subtype=%s bot=%s)', ev.get('ts'), ev.get('type'),
+                         ev.get('subtype'), bool(ev.get('bot_id')))
+            return None
+        operation, args, reason = self.classify(ctx, body['event'].get('text', ''))
         if operation:
             if self.queue is None:
                 raise RuntimeError('Durable ingress queue is required')
             self.queue.append(operation, context=asdict(ctx), **args)
+            log.info('Project ingress queued %s ts=%s thread=%s user=%s', operation,
+                     ctx.message_id, ctx.thread_id, ctx.user_id)
+            return None
+        log.info('Project ingress ignored ts=%s thread=%s user=%s: %s', ctx.message_id,
+                 ctx.thread_id, ctx.user_id, reason)
+        return self.notice_for(ctx, reason)
+
+
+async def send_notice(client, notice):
+    """Post a usage reply in the message's thread; failures are logged, never raised."""
+    if client is None:
+        log.warning('Project ingress notice not sent (thread=%s): no native Slack client',
+                    notice['thread_ts'])
+        return None
+    try:
+        result = await client.chat_postMessage(**notice)
+    except Exception:
+        log.exception('Project ingress notice failed (thread=%s)', notice['thread_ts'])
+        return None
+    ts = result.get('ts') if hasattr(result, 'get') else None
+    log.info('Project ingress notice sent: thread=%s reply_ts=%s', notice['thread_ts'], ts)
+    return ts
 
 
 def register_tools(ctx, ingress):

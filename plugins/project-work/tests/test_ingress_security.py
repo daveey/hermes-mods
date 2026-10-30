@@ -266,3 +266,140 @@ def test_plan_generation_required_and_forwarded():
         controller.call('propose_plan', {'workflow_id': 'id', 'plan_text': 'plan'})
     controller.call('propose_plan', {'workflow_id': 'id', 'plan_text': 'plan', 'generation': 3})
     assert calls == [('id', 'plan', 3)]
+
+
+class FakeSlack:
+    def __init__(self, fail=False):
+        self.posts, self.fail = [], fail
+
+    async def chat_postMessage(self, **kwargs):
+        if self.fail:
+            raise ConnectionError('slack down')
+        self.posts.append(kwargs)
+        return {'ok': True, 'ts': 'reply-ts'}
+
+
+def run_middleware(ingress, event_body, client):
+    async def next_(): return 'routed'
+    return asyncio.run(ingress.middleware(event_body, next_, client=client))
+
+
+def pending(queue):
+    with queue.connect() as db:
+        return [r[0] for r in db.execute('SELECT payload FROM pending')]
+
+
+def test_top_level_owner_request_is_queued_and_logged(env, tmp_path, caplog):
+    # Regression: an owner's top-level `!project request` (no @mention) reaches the queue
+    # that the runtime plans from, and the decision is logged.
+    service, ctx, _ = env
+    queue = cm.DurableIngressQueue(tmp_path / 'queue' / 'q.db', None)
+    ingress, slack = im.Ingress(service.policy, None, queue), FakeSlack()
+    caplog.set_level('INFO')
+    assert run_middleware(ingress, body(ctx, text='!project request Add a README line'), slack) == 'routed'
+    rows = pending(queue)
+    assert len(rows) == 1 and '"operation": "request"' in rows[0] and 'Add a README line' in rows[0]
+    assert slack.posts == []  # the plan reply comes from the runtime, not a usage notice
+    assert 'Project ingress queued request ts=message' in caplog.text
+
+
+def test_pasted_instruction_gets_logged_refusal_and_thread_reply(env, tmp_path, caplog):
+    # Regression for the live miss: the owner sent the step title, not the command.
+    service, ctx, _ = env
+    queue = cm.DurableIngressQueue(tmp_path / 'queue' / 'q.db', None)
+    ingress, slack = im.Ingress(service.policy, None, queue), FakeSlack()
+    caplog.set_level('INFO')
+    text = 'Send the !project request command in the Ask Eve Slack channel from your own account'
+    assert run_middleware(ingress, body(ctx, text=text), slack) == 'routed'
+    assert pending(queue) == []
+    assert 'Project ingress ignored ts=message thread=None user=owner: not_a_command' in caplog.text
+    assert len(slack.posts) == 1
+    post = slack.posts[0]
+    assert post['channel'] == ctx.channel_id and post['thread_ts'] == ctx.message_id
+    assert "isn't a `!project` command" in post['text'] and '`!project request ' in post['text']
+    assert 'Project ingress notice sent: thread=message reply_ts=reply-ts' in caplog.text
+
+
+@pytest.mark.parametrize('text,reason', [
+    ('!project request', 'empty_request'),
+    ('!project approve abc', 'malformed_approve'),
+    ('please run !PROJECT request foo', 'not_a_command'),
+])
+def test_top_level_near_misses_reply_to_owner(env, tmp_path, text, reason, caplog):
+    service, ctx, _ = env
+    queue = cm.DurableIngressQueue(tmp_path / 'queue' / 'q.db', None)
+    ingress, slack = im.Ingress(service.policy, None, queue), FakeSlack()
+    caplog.set_level('INFO')
+    run_middleware(ingress, body(ctx, text=text), slack)
+    assert pending(queue) == [] and len(slack.posts) == 1
+    assert slack.posts[0]['text'] == im.NOTICES[reason]
+    assert f': {reason}' in caplog.text
+
+
+def test_no_reply_for_ordinary_chat_non_owner_or_threads(env, tmp_path, caplog):
+    service, ctx, _ = env
+    queue = cm.DurableIngressQueue(tmp_path / 'queue' / 'q.db', None)
+    ingress, slack = im.Ingress(service.policy, None, queue), FakeSlack()
+    caplog.set_level('INFO')
+    run_middleware(ingress, body(ctx, text='good morning'), slack)
+    assert 'not_project_traffic' in caplog.text
+    stranger = body(ctx, text='Send the !project request command', ts='m2')
+    stranger['event']['user'] = 'stranger'
+    run_middleware(ingress, stranger, slack)
+    # A malformed approve in a thread stays a followup observation, as before.
+    run_middleware(ingress, body(ctx, ts='m3', thread_ts='root', text='!project approve x'), slack)
+    assert slack.posts == []
+    rows = pending(queue)
+    assert len(rows) == 1 and '"operation": "observe_followup"' in rows[0]
+
+
+def test_dropped_channel_event_is_logged(env, tmp_path, caplog):
+    service, ctx, _ = env
+    ingress = im.Ingress(service.policy, None, cm.DurableIngressQueue(tmp_path / 'q' / 'q.db', None))
+    caplog.set_level('INFO')
+    run_middleware(ingress, body(ctx, bot_id='B1', text='!project request x'), FakeSlack())
+    assert 'Project ingress ignored ts=message: not an authenticated human event' in caplog.text
+
+
+@pytest.mark.parametrize('client', [None, 'failing'])
+def test_notice_failure_never_breaks_routing(env, tmp_path, client, caplog):
+    service, ctx, _ = env
+    ingress = im.Ingress(service.policy, None, cm.DurableIngressQueue(tmp_path / 'q' / 'q.db', None))
+    slack = FakeSlack(fail=True) if client else None
+    assert run_middleware(ingress, body(ctx, text='do !project stuff'), slack) == 'routed'
+    assert ('notice failed' if client else 'no native Slack client') in caplog.text
+
+
+def test_bolt_injects_client_into_middleware(env):
+    # slack_bolt builds middleware kwargs from parameter names; `client` must be one of them.
+    import inspect
+    service, _, _ = env
+    params = inspect.signature(im.Ingress(service.policy, None).middleware).parameters
+    assert list(params) == ['body', 'next', 'client']
+
+
+def test_real_bolt_middleware_receives_client(env, tmp_path):
+    # Runs the real slack_bolt kwargs injection when it is installed (gateway env).
+    pytest.importorskip('slack_bolt')
+    from slack_bolt.kwargs_injection.async_utils import build_async_required_kwargs
+    from slack_bolt.request.async_request import AsyncBoltRequest
+    import logging
+    service, ctx, _ = env
+    ingress = im.Ingress(service.policy, None, cm.DurableIngressQueue(tmp_path / 'q' / 'q.db', None))
+    from slack_sdk.web.async_client import AsyncWebClient
+    class RealClient(AsyncWebClient):
+        posts = []
+        async def chat_postMessage(self, **kwargs):
+            self.posts.append(kwargs)
+            return {'ok': True, 'ts': 'reply-ts'}
+    slack = RealClient(token='xoxb-test')
+    request = AsyncBoltRequest(body='{}', mode='socket_mode')
+    request.body = body(ctx, text='Send the !project request command')
+    request.context['client'] = slack
+    async def next_(): return 'routed'
+    kwargs = build_async_required_kwargs(
+        logger=logging.getLogger('t'), required_arg_names=['self', 'body', 'next', 'client'],
+        request=request, response=None, next_func=next_)
+    assert kwargs['client'] is slack
+    assert asyncio.run(ingress.middleware(**kwargs)) == 'routed'
+    assert len(slack.posts) == 1
