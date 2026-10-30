@@ -1644,3 +1644,10 @@ def test_live_file_defect_skips_a_kanban_signal_whose_cards_are_all_closed(store
     d = {**kanban_defect(), "kanban": {"board": "worker-load", "cards": ["t_01a181f353b47ebf"]}}
     out = sh.file_defect(d, store=store, m="live", runner=r, now=NOW, cfg=HUB, budget_fn=OPEN)
     assert out["action"] == "skip" and "now done" in out["why"] and not r.creates()
+
+
+def test_fork_history_is_isolated_from_the_real_fork(tmp_path):
+    """session_commit_fix must not read ~/.hermes/hermes-agent from tests: a real upstream `fix(desktop)` commit
+    (736354aa74fa, 2026-10-22 09:16Z) sits inside the NOW window and made the not-adopted digest test skip."""
+    assert sh._fork_repo() == tmp_path / "no-fork-repo"
+    assert sh.session_commit_fix(defect(at=NOW - 60, host="macbook"), NOW - 60, data=tmp_path) is None
