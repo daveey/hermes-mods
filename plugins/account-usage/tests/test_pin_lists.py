@@ -104,6 +104,7 @@ class PinLists(unittest.TestCase):
         import sys
         script = self.plugin / 'check_compat.py'
         shutil.copy(PLUGIN / 'check_compat.py', script)
+        shutil.copy(PLUGIN / 'pins.py', script.with_name('pins.py'))  # the shared drift definition
         self.pins([sha(OLD), sha(NEW)])
         run = lambda: subprocess.run([sys.executable, str(script), '--core', str(self.core)],
                                      capture_output=True, text=True)

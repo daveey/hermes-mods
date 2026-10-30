@@ -80,7 +80,9 @@ class Execution(unittest.TestCase):
             plugin.register(ctx)
         self.assertIn('post_api_request', hooks)
         self.credentials([entry('B', source='manual').to_dict()])
-        with self.assertRaisesRegex(self.s.SelectionRejected, 'compatibility'):
+        # The refusal now names the real cause (a customized seam), not the drift text.
+        with self.assertRaisesRegex(self.s.SelectionRejected,
+                                    'install raised SelectionRejected at _create_request_openai_client'):
             self.s.SelectionService(self.home, server=self.server).put('runtime-A', provider='anthropic',
                 account_id=_identity_id_for('anthropic', entry('B')), expected_revision=0)
 

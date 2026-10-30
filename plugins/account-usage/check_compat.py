@@ -15,7 +15,6 @@ Pins checked:
   selection.py (a mismatch makes fast-rate-limit-fallback refuse to compose with it).
 """
 import argparse
-import hashlib
 import json
 import subprocess
 import sys
@@ -24,24 +23,24 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parent
 
 
-def _sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else 'missing'
+def _load_pins():
+    """The shared drift definition (pins.py), loaded by path: a hyphenated plugin dir is no package."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('account_usage_pins', PLUGIN / 'pins.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _accepted(value):
-    """A pin is one audited sha256 or a non-empty list of them (every audited core
-    version, so mixed-core rollouts pass). Malformed = nothing accepted (drift)."""
-    digests = [value] if isinstance(value, str) else value
-    if not isinstance(digests, list) or not digests or not all(isinstance(d, str) for d in digests):
-        return frozenset()
-    return frozenset(digests)
+_pins = _load_pins()
+_sha = _pins.sha
+_accepted = _pins.accepted
 
 
 def check(core, plugin=PLUGIN):
     core = Path(core).expanduser().resolve()
     pins = json.loads((plugin / 'execution-compatibility.json').read_text())
-    drift = [{'pin': 'execution-compatibility.json', 'file': rel, 'expected': value, 'actual': _sha(core / rel)}
-             for rel, value in pins.items() if _sha(core / rel) not in _accepted(value)]
+    drift = [{'pin': 'execution-compatibility.json', **item} for item in _pins.pin_drift(core, pins)]
     composition = plugin.parent / 'fast-rate-limit-fallback' / 'account-usage-compatibility.json'
     if composition.is_file():
         expected = json.loads(composition.read_text()).get('selection_sha256')
