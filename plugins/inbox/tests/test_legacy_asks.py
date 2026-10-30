@@ -28,7 +28,7 @@ def test_ask_refusal_names_exact_retry_shape(tmp_path, ask):
     st = load("_la_retry")
     b, cards = box(tmp_path, st)
     with pytest.raises(ValueError) as e:
-        b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky:1", ask=ask)
+        b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky-signin:1", ask=ask)
     msg = str(e.value)
     assert "ask_" in msg
     assert "ask={" in msg and "interaction" in msg and "why_human" in msg and "action" in msg
@@ -48,8 +48,8 @@ def test_retry_with_the_named_ask_is_accepted(tmp_path):
     st = load("_la_accept")
     b, _ = box(tmp_path, st)
     with pytest.raises(ValueError):
-        b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky:1")
-    assert b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky:1", ask=ASK)
+        b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky-signin:1")
+    assert b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky-signin:1", ask=ASK)
 
 
 # -- 2. kanban human_request -> ask, automatically -----------------------------------------------
@@ -90,7 +90,7 @@ def test_explicit_ask_wins_over_card_human_request(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "card_human_request", lambda task_id: {
         "interaction": "credential", "why_human": "card", "action": "card"})
     b, _ = box(tmp_path, st)
-    b.post("Approve spend", "b", "go", poster="kanban · x", key="k:1", ask=ASK)
+    b.post("Approve spend", "b", "go", poster="kanban · x", key="bsky-signin:1", ask=ASK)
     assert json.loads(b._side().execute("select ask_json from items").fetchone()[0]) == ASK
 
 

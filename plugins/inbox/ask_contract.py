@@ -78,7 +78,18 @@ _STATUS = re.compile(r"\b(?:was rejected|failed|expired|came back|missing guards
 _SENT_NOTICE = re.compile(r"^\s*X\s+(?:DM\s+|reply\s+|post\s+)?(?:sent|posted)\b", re.I)
 
 
-def reason(*, home, poster, ask, actions, type_name="default", title="", body="", key="", **_):
+# Agent-owned posters (registry owner kanban/coach/cron) can attest any ask themselves, so an ask counts only when it
+# came from the card's human_request or the key is a known owner-ask family.
+AGENT_OWNERS = frozenset({"kanban", "coach", "cron"})
+OWNER_ASK_KEYS = re.compile(r"^(?:engine-budget:|hub-claude-login(?:$|:)|bsky-signin:|codex-move-to-hub:|"
+                            r"hub-broker-enroll:|gh-quota-app:|phone-calls-p2-|ask-eve-move:|askeve:|selfheal:)")
+SELF_ATTESTED_MSG = ("this poster is agent-owned and the ask is self-attested. If David must act, block your card "
+                     "with kanban_block(human_request={...}) and the Inbox ask is derived from it; otherwise fix it "
+                     "or use a Kanban card")
+
+
+def reason(*, home, poster, ask, actions, type_name="default", title="", body="", key="",
+           from_human_request=False, **_):
     if _is_test(title) or _is_test(str(key or "")):
         return "content_test"
     if not poster or not str(poster).strip():
@@ -100,4 +111,6 @@ def reason(*, home, poster, ask, actions, type_name="default", title="", body=""
         return "ask_invalid"
     if any(not isinstance(ask.get(k), str) or not ask[k].strip() for k in ("why_human", "action")):
         return "ask_invalid"
+    if row.get("owner") in AGENT_OWNERS and not from_human_request and not OWNER_ASK_KEYS.match(str(key or "")):
+        return "ask_self_attested"
     return None

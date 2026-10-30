@@ -524,11 +524,14 @@ class Inbox:
         if not accept_prompt and ct.needs_accept_prompt(tdef):
             raise ValueError("accept_prompt is required (the instruction 'Do it' sends)")
         snap = ct.snapshot(tdef)
-        if not ask and policy.family(poster) == "kanban" and os.environ.get("HERMES_KANBAN_TASK"):
+        from_hr = False
+        if policy.family(poster) == "kanban" and os.environ.get("HERMES_KANBAN_TASK"):
             # A blocked card's human_request IS the owner ask: no second hand-written copy to forget.
-            ask = policy.ask_from_human_request(card_human_request(os.environ["HERMES_KANBAN_TASK"]))
+            hr_ask = policy.ask_from_human_request(card_human_request(os.environ["HERMES_KANBAN_TASK"]))
+            if hr_ask and (not ask or ask == hr_ask):
+                ask, from_hr = hr_ask, True
         refusal = policy.reason(home=self.home, poster=poster, ask=ask, actions=snap["actions"],
-                                type_name=snap["name"], title=title, body=body, key=key)
+                                type_name=snap["name"], title=title, body=body, key=key, from_human_request=from_hr)
         if refusal:
             self._refuse(refusal, title, body, accept_prompt, poster, key)
         tname, fjson, ajson = snap["name"], json.dumps(fvals), json.dumps(snap)
@@ -636,6 +639,8 @@ class Inbox:
                  "title": title, "body": body, "accept_prompt": prompt, "reason": reason}
         if reason in ("ask_missing", "ask_invalid"):
             reason = f"{reason}: {pol.RETRY_SHAPE}"
+        elif reason == "ask_self_attested":
+            reason = f"{reason}: {pol.SELF_ATTESTED_MSG}"
         task = None
         try:
             task = (self._task_creator or kanban_task_creator)(
