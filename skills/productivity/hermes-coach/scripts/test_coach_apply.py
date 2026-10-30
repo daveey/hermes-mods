@@ -627,5 +627,71 @@ class AutoApply(Base):
             return False
 
 
+class PushFailure(Base):
+    def _remote(self, url):
+        git(self.env.data, "remote", "add", "origin", url)
+        br = subprocess.run(["git", "branch", "--show-current"], cwd=self.env.data, capture_output=True, text=True).stdout.strip()
+        git(self.env.data, "config", f"branch.{br}.remote", "origin")
+        git(self.env.data, "config", f"branch.{br}.merge", f"refs/heads/{br}")
+        (self.env.data / "f").write_text("y\n")
+        git(self.env.data, "add", "f")
+        git(self.env.data, "commit", "-q", "-m", "local")
+        self.env.push = True
+
+    def test_failing_remote_logs_stderr_and_files_one_card(self):
+        self._remote(str(self.tmp / "nonexistent.git"))
+        orig, ca.time.sleep = ca.time.sleep, lambda *_: None
+        try:
+            r1 = ca.git_push(self.env, self.env.data)
+            r2 = ca.git_push(self.env, self.env.data)
+        finally:
+            ca.time.sleep = orig
+        self.assertIn("PUSH FAILED", r1)
+        self.assertNotIn("by hand", r1)
+        self.assertIn("nonexistent.git", r1)  # real stderr
+        cards = [json.loads(l) for l in open(os.environ["FAKE_CFG"] + ".cards")]
+        self.assertEqual(len(cards), 2)  # same stable key each time -> the board dedupes
+        for c in cards:
+            self.assertIn("coach-push-failed:data", c)
+            self.assertIn("Unpushed commits: 2", " ".join(c))  # init + local: neither is on any remote
+
+    def test_concurrent_jsonl_appends_rebase_and_push(self):
+        """Another host appended to the same jsonl log and pushed first: union-merge the rebase, push, no card."""
+        bare, other = self.tmp / "race.git", self.tmp / "other"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        log = Path("reports/proposals.jsonl")
+        (self.env.data / log).write_text('{"id": "base"}\n')
+        git(self.env.data, "add", str(log))
+        git(self.env.data, "commit", "-q", "-m", "base")
+        git(self.env.data, "remote", "add", "origin", str(bare))
+        git(self.env.data, "push", "-q", "-u", "origin", "main")
+        subprocess.run(["git", "clone", "-q", str(bare), str(other)], check=True)
+        git(other, "config", "user.email", "o@example.com")
+        git(other, "config", "user.name", "o")
+        with open(other / log, "a") as fh:
+            fh.write('{"id": "theirs"}\n')
+        git(other, "commit", "-q", "-am", "theirs")
+        git(other, "push", "-q")
+        with open(self.env.data / log, "a") as fh:
+            fh.write('{"id": "ours"}\n')
+        git(self.env.data, "commit", "-q", "-am", "ours")
+        self.env.push = True
+        orig, ca.time.sleep = ca.time.sleep, lambda *_: None
+        try:
+            r = ca.git_push(self.env, self.env.data, union_jsonl=True)
+        finally:
+            ca.time.sleep = orig
+        self.assertEqual(r, "pushed")
+        self.assertEqual(ca.unpushed(self.env.data), "0")
+        lines = (self.env.data / log).read_text().splitlines()
+        self.assertEqual(sorted(lines), sorted(['{"id": "base"}', '{"id": "theirs"}', '{"id": "ours"}']))
+        self.assertFalse(os.path.exists(os.environ["FAKE_CFG"] + ".cards"))
+
+    def test_push_succeeds_to_a_good_remote(self):
+        subprocess.run(["git", "init", "-q", "--bare", str(self.tmp / "ok.git")], check=True)
+        self._remote(str(self.tmp / "ok.git"))
+        self.assertEqual(ca.git_push(self.env, self.env.data), "pushed")
+
+
 if __name__ == "__main__":
     unittest.main()

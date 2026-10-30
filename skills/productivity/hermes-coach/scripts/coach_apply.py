@@ -88,14 +88,78 @@ def git_commit(env, repo, paths, msg):
     return head(repo)
 
 
-def git_push(env, repo):
+def _scrub(t):
+    t = re.sub(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "<token>", t or "")
+    return re.sub(r"://[^/@\s]+@", "://<creds>@", t)
+
+
+def unpushed(repo):
+    r = sh(["git", "rev-list", "--count", "@{u}..HEAD"], cwd=repo, check=False)
+    if r.returncode:  # no fetched upstream ref: count commits on no remote-tracking branch
+        r = sh(["git", "rev-list", "--count", "HEAD", "--not", "--remotes"], cwd=repo, check=False)
+    return r.stdout.strip() if r.returncode == 0 else "unknown"
+
+
+def ensure_union_jsonl(repo):
+    """Merge *.jsonl with git's built-in union driver in this checkout (.git/info/attributes).
+
+    The data repo has 4+ writers (digests from every host, engine-budget, coach-apply) appending to the same
+    jsonl logs (spend.jsonl, proposals.jsonl). A plain 3-way rebase of two appends conflicts, the rebase fails
+    and every push retry is rejected non-fast-forward. Union keeps both sides' lines, which is right for
+    append-only logs. Local attributes apply even before a committed .gitattributes reaches the upstream tree."""
+    r = sh(["git", "rev-parse", "--git-path", "info/attributes"], cwd=repo, check=False)
+    if r.returncode:
+        return
+    f = Path(repo) / r.stdout.strip()  # relative to repo, or absolute (then the join keeps it)
+    line = "*.jsonl merge=union"
+    cur = f.read_text() if f.exists() else ""
+    if line not in cur.splitlines():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(cur + ("" if not cur or cur.endswith("\n") else "\n") + line + "\n")
+
+
+def _rebasing(repo):
+    for d in ("rebase-merge", "rebase-apply"):
+        r = sh(["git", "rev-parse", "--git-path", d], cwd=repo, check=False)
+        if r.returncode == 0 and (Path(repo) / r.stdout.strip()).exists():
+            return True
+    return False
+
+
+def git_push(env, repo, tries=3, backoff=2, union_jsonl=False):
+    """Push with fetch/rebase retries. On final failure: log the real stderr and file ONE card (stable key)."""
     if not env.push:
         return "not pushed (push disabled)"
-    for _ in range(3):
-        if sh(["git", "push", "-q"], cwd=repo, check=False).returncode == 0:
+    if union_jsonl:
+        ensure_union_jsonl(repo)
+    err = ""
+    for i in range(tries):
+        r = sh(["git", "push", "-q"], cwd=repo, check=False)
+        if r.returncode == 0:
             return "pushed"
-        sh(["git", "pull", "-q", "--rebase", "--autostash"], cwd=repo, check=False)
-    return "PUSH FAILED: the commit is local, push it by hand"
+        err = _scrub((r.stderr or r.stdout).strip())[-800:]
+        busy = _rebasing(repo)  # another job (coach-feed shares this checkout) is mid-rebase: never abort its rebase
+        rb = sh(["git", "pull", "-q", "--rebase", "--autostash"], cwd=repo, check=False)
+        if rb.returncode:
+            if not busy:
+                sh(["git", "rebase", "--abort"], cwd=repo, check=False)
+            err += "\npull --rebase: " + _scrub((rb.stderr or rb.stdout).strip())[-400:]
+        if i < tries - 1:
+            time.sleep(backoff * (i + 1))
+    n = unpushed(repo)
+    card = ""
+    try:
+        name = Path(repo).name
+        body = (f"coach-apply could not push {name} after {tries} fetch/rebase/push tries.\n"
+                f"Unpushed commits: {n}\n\nstderr:\n{err}\n\n"
+                f"Fix the cause, then `git -C {repo} push`. This card is reused (idempotency key) on later failures.")
+        r = sh([env.hermes, "kanban", "--board", env.board, "create", "--assignee", "default", "--json",
+                "--created-by", "coach", "--idempotency-key", f"coach-push-failed:{name}",
+                "--body", body, f"coach-apply: {name} push failing ({n} unpushed commits)"], check=False)
+        card = f"; card filed: {r.stdout.strip()[-120:]}" if r.returncode == 0 else f"; card FAILED: {r.stderr.strip()[-200:]}"
+    except Exception as e:  # never let reporting break the run
+        card = f"; card error: {e}"
+    return f"PUSH FAILED ({n} unpushed commit(s)): {err}{card}"
 
 
 def repo_of(env, path):
@@ -119,7 +183,7 @@ def push_data(env, msg):
                                          [fx.spend_log_path(env.data), eb.state_dir(env.data) / "budget-stops.jsonl"]
                                          if s.exists()]
     sha = git_commit(env, env.data, paths, msg)
-    return (git_push(env, env.data) if sha else "nothing to commit")
+    return (git_push(env, env.data, union_jsonl=True) if sha else "nothing to commit")
 
 
 def cfg_value(v):
