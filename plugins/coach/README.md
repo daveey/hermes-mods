@@ -789,6 +789,22 @@ ONE card per host and day (`--idempotency-key withheld-notice:<host>:<date>`), c
 `tests/test_withheld_notice_watch.py` (only assistant replies starting with a notice count, not quotes or mentions;
 one card per day then a comment only on new hits; seed and dry-run file nothing).
 
+### Agent probes in a person's chat (`probe_token_watch.py`, no agent, no LLM)
+
+A fix worker proved its fix with `hermes chat --resume <David's chat> --oneshot -q "... Reply exactly ROUTE_..."`
+and left the probe and its bare-token reply as the newest turns of two of his chats (self-heal agent-93a55211b1).
+The user-chat-probe-guard plugin now refuses that; this catches what gets through. A hermes cron job on hermes-hub
+(no-agent, hourly) runs `probe_token_watch.py`: it pulls `~/code/hermes-coach-data` and reads every host's digests
+written in the last 3 days, and flags a user-facing session (desktop, cli, messaging) where a real user turn is
+followed by a `Reply exactly <TOKEN>` turn, or whose `last_reply` is a bare `UPPER_token` after one. A session an agent
+opened for its own test (first user turn is the probe) is not flagged. ONE card per session
+(`--idempotency-key probe-token:<host>:<session>`), later evidence as a comment. `--seed` records current hits as known
+(run once at install); `--dry-run --days N` prints hits and files nothing. Replay over every digest on 2026-10-30
+flags exactly macbook 23ef49 and 55b17f. Tests: `tests/test_probe_token_watch.py` (incident digest and bare-token
+reply flagged; worker/oneshot sources, ordinary short answers, prose "reply exactly the same", agent-opened test
+sessions not flagged; one card per session, nothing on an unchanged rerun, a comment on newer evidence; dry-run files
+nothing).
+
 ## Files
 
 - `__init__.py`: the hooks (`pre_llm_call`, `post_tool_call`, `transform_tool_result`).
