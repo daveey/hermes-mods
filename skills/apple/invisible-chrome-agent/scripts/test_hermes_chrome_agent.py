@@ -254,6 +254,38 @@ class Evict(unittest.TestCase):
 
 
 
+class LaunchUserChromeTest(unittest.TestCase):
+    INF = float("inf")
+
+    def test_agent_front_no_user_chrome_not_shown_launches(self):
+        self.assertTrue(hca.should_launch_user_chrome(True, 0.2, False, self.INF))
+
+    def test_user_chrome_running_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 0.2, True, self.INF))
+
+    def test_show_flag_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 0.2, False, 2.0))
+
+    def test_no_user_action_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 30.0, False, self.INF))
+
+    def test_agent_not_front_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(False, 0.2, False, self.INF))
+
+    def test_cooldown(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 0.2, False, self.INF, since_last_launch=5))
+
+    def test_user_chrome_detection_ignores_agent_and_helpers(self):
+        base = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        def run(lines):
+            with mock.patch.object(hca.subprocess, "run", return_value=mock.Mock(stdout="\n".join(lines))):
+                return hca.user_chrome_running()
+        agent = base + " --user-data-dir=" + hca.PROFILE + " --remote-debugging-port=1"
+        helper = base + " Helper --type=renderer --user-data-dir=/x"
+        self.assertFalse(run([agent, helper, "/bin/zsh"]))
+        self.assertTrue(run([agent, base + " --user-data-dir=/Users/d/Library/Application Support/Google/Chrome"]))
+
+
 class FocusGuardTest(unittest.TestCase):
     """Unrequested focus grabs by the agent Chrome are handed back; asked-for ones are left alone."""
     CHROME, HERMES = 500, 42
