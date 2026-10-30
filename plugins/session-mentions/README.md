@@ -72,6 +72,11 @@ source file to explicitly select that validator. Dispatches are captured in
 memory: these tests send no real hub messages.
 
 The Desktop half runs under Node: `node --test plugins/session-mentions/tests/*.test.mjs`.
+`live-throwaway.test.mjs` covers teardown with a virtual clock: a successful DELETE is followed by
+GET checks for ten seconds of absence, a late close write triggers another DELETE and restarts that
+window, 409 write guards retry, persistent rows/guards time out after thirty seconds, and REST errors
+fail cleanup. Live scripts must await `deleteThrowaway` after `session.close` in `finally`; HTTP 200
+alone does not prove cleanup because a closing runtime may persist its row again.
 `registry-names.test.mjs` covers gateway registry names: a connection whose `/ping` reports `gateway: hub` resolves `@task:default@hub/<id>` and `@session:default@hub/<id>` (unit and through a courier tick against fake backends), the drain `reach` carries it, and `hub-ec2` / `macbook` / hostname refs still resolve. `test_targeting.py` covers the gateway side: `/ping` reports `self_gateway()` (empty when the hub client is missing or broken), and a request routed to a registry name is claimed by the courier whose reach has it, not by a Desktop that lacks it.
 `typeahead-refresh.test.mjs` drives `register()` and the completion sources' `provide`/`subscribe` with a fake
 bridge: cold cache shows Loading then signals and offers the session; a failed session fetch and a failed task
