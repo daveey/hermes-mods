@@ -50,8 +50,8 @@ def child_main():
     config['model'] = dict(default='transport-test', provider='custom',
                            base_url=f'http://127.0.0.1:{server.server_port}/v1')
     (fixture.HOME / 'config.yaml').write_text(yaml.safe_dump(config))
-    import agent.auxiliary_client
-    agent.auxiliary_client.call_llm = fixture.auxiliary
+    fixture.route_gateway_spawn_through_fixture()
+    fixture.stub_judge()
     from hermes_cli.main import main
     sys.argv = ['hermes', 'chat', '--provider', 'custom', '--model', 'transport-test']
     main()

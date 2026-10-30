@@ -26,18 +26,72 @@ def record(kind, value):
         f.write(json.dumps({'kind': kind, 'value': value}) + '\n')
 
 
+def _home_control_socket():
+    """The isolated home's own gateway control socket leaf: ``hermes-gw-<hash>/control.sock``.
+    Derived from HOME (the core naming rule), never read from the racy ``gateway.sock.path``."""
+    import hashlib
+    digest = hashlib.sha256(os.path.normcase(str(HOME.expanduser().resolve(strict=False))).encode()).hexdigest()
+    return f'hermes-gw-{digest[:16]}', 'control.sock'
+
+
+CONTROL_SOCKET = _home_control_socket()
+
+
+def _own_unix_socket(address):
+    """AF_UNIX connects are allowed only to this home's gateway: a socket under HOME, or the
+    short-path control socket core names for HOME (``connect_private``)."""
+    if not isinstance(address, (str, bytes)) or not address:
+        return False
+    path = Path(os.fsdecode(address))
+    if (path.parent.name, path.name) == CONTROL_SOCKET:
+        return True
+    try:
+        return path.resolve().is_relative_to(HOME.resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def network_guard(event, args):
     if event == 'socket.getaddrinfo' and args[0] not in ('127.0.0.1', '::1', None):
         record('blocked_dns', str(args[0]))
         raise RuntimeError('transport acceptance forbids external DNS')
     if event == 'socket.connect':
         address = args[1]
+        if _own_unix_socket(address):
+            return
         if not isinstance(address, tuple) or address[0] not in ('127.0.0.1', '::1'):
             record('blocked_network', str(address))
             raise RuntimeError('transport acceptance forbids non-loopback connections')
 
 
 sys.addaudithook(network_guard)
+ROLE = 'gateway' if sys.argv[1] == 'gateway' else 'client'
+# Every process that can run a turn proves the guard and the judge stub were armed in it.
+record('guard_armed', {'pid': os.getpid(), 'role': ROLE})
+
+
+def route_gateway_spawn_through_fixture():
+    """Clients now run turns in an auto-started gateway daemon (``ensure_gateway_runtime`` ->
+    ``spawn_unmanaged_gateway``), not in-process. Launch that daemon through this file's
+    ``gateway`` mode so the network guard and the deterministic judge run where the turn runs;
+    the daemon itself is the production ``hermes gateway run``."""
+    import subprocess
+    from hermes_cli import gateway_runtime_start as start
+
+    class Popen(subprocess.Popen):
+        def __init__(self, command, *args, **kwargs):
+            if list(command[1:3]) == ['-m', 'hermes_cli.main'] and 'gateway' in command:
+                command = [command[0], str(Path(__file__).resolve()), 'gateway', CASE, *command[3:]]
+            super().__init__(command, *args, **kwargs)
+
+    start.subprocess = SimpleNamespace(**{**vars(subprocess), 'Popen': Popen})
+    # macOS launches through a job helper first; take the Popen path so the rewrite applies.
+    start.start_gateway_job = lambda *args, **kwargs: None
+
+
+def stub_judge():
+    import agent.auxiliary_client
+    agent.auxiliary_client.call_llm = auxiliary
 
 
 class Provider(BaseHTTPRequestHandler):
@@ -71,7 +125,7 @@ class Provider(BaseHTTPRequestHandler):
 
 def auxiliary(*args, **kwargs):
     task = kwargs.get('task')
-    record('auxiliary', {'task': task, 'messages': kwargs.get('messages')})
+    record('auxiliary', {'task': task, 'messages': kwargs.get('messages'), 'pid': os.getpid()})
     verdict = dict(goal='Repair example app', actionable=True, unfinished=True,
                    disposition='abandoned', evidence_refs=['user:0', 'candidate'],
                    boundary_kind=None, continuation_ref=None, confidence=.99)
@@ -88,7 +142,20 @@ def auxiliary(*args, **kwargs):
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
 
+def run_gateway():
+    """``gateway`` mode: the production daemon, with the guard (armed at import) and judge stub."""
+    # Before any core import: hermes_cli.main applies --profile from sys.argv when it loads.
+    sys.argv = ['hermes', *sys.argv[3:]]
+    stub_judge()
+    from hermes_cli.main import main as cli_main
+    cli_main()
+
+
 def main():
+    if sys.argv[1] == 'gateway':
+        run_gateway()
+        return
+    route_gateway_spawn_through_fixture()
     provider = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     threading.Thread(target=provider.serve_forever, daemon=True).start()
     import hermes_yaml as yaml
@@ -96,8 +163,7 @@ def main():
     config['model'] = {'default': 'transport-test', 'provider': 'custom',
                        'base_url': f'http://127.0.0.1:{provider.server_port}/v1'}
     (HOME / 'config.yaml').write_text(yaml.safe_dump(config))
-    import agent.auxiliary_client
-    agent.auxiliary_client.call_llm = auxiliary
+    stub_judge()
     route = sys.argv[1]
     if route == 'cli':
         from hermes_cli.main import main as cli_main
