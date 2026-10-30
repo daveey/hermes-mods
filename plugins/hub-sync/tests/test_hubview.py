@@ -226,6 +226,8 @@ def test_request_online_is_sent(hub, fake_client):
     ({"gateway": "mini", "coll": "mail", "key": "a/b", "action": "pin"}, 400, "coll must be"),
     ({"gateway": "mini", "coll": "tasks", "key": "bb/t_mini", "action": "create", "args": {"title": "x"}}, 400,
      "<board>/new"),
+    ({"gateway": "mini", "coll": "tasks", "key": "x/new/extra", "action": "create", "args": {"title": "x"}}, 400,
+     "<board>/new"),
     ({"gateway": "mini", "coll": "tasks", "key": "bb/t_mini", "action": "comment", "args": {"text": "x", "evil": 1}},
      400, "unexpected args"),
     ({"gateway": "mini", "coll": "inbox", "key": "default/s_mcard", "action": "archive", "base_version": "v"}, 400,
@@ -245,6 +247,19 @@ def test_tasks_create_on_another_gateway(hub):
     res = hv.request({"gateway": "mini", "coll": "tasks", "key": "bb/new", "action": "create",
                       "args": {"title": "Do it there", "body": "b"}})
     assert _sent(state)[res["id"]][0]["args"] == {"title": "Do it there", "body": "b"}
+
+
+@pytest.mark.parametrize("key,sent_key", [("default/new", "default/default/new"),
+                                          ("bb/new", "default/bb/new"),
+                                          ("default/default/new", "default/default/new"),
+                                          ("alpha/bb/new", "alpha/bb/new")])
+def test_tasks_create_key_is_the_owners_shape(hub, key, sent_key):
+    hv, state = hub
+    req = hv.validate({"gateway": "mini", "coll": "tasks", "key": key, "action": "create",
+                       "args": {"title": "x"}}, "laptop", ["mini"])
+    assert req["key"] == sent_key
+    res = hv.request({"gateway": "mini", "coll": "tasks", "key": key, "action": "create", "args": {"title": "x"}})
+    assert _sent(state)[res["id"]][0]["key"] == sent_key
 
 
 def test_inbox_act_keeps_input_verbatim(hub):

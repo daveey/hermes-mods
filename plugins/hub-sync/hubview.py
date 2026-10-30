@@ -652,8 +652,16 @@ def validate(body: Dict[str, Any], own_gateway: Optional[str], known: Iterable[s
     a, _, b = key.partition("/")
     if not a or not b or ".." in key:
         raise RequestError(400, "key must be <profile-or-board>/<id>")
-    if coll == "tasks" and (action == "create") != (b == "new"):
-        raise RequestError(400, "tasks create uses key <board>/new; other task actions need a task id")
+    if coll == "tasks" and action == "create":
+        parts = key.split("/")
+        if parts[-1] != "new" or len(parts) not in (2, 3) or not all(parts):
+            raise RequestError(400, "tasks create uses key <profile>/<board>/new (or <board>/new); "
+                                    "other task actions need a task id")
+        if len(parts) == 2:  # the owner gateway decodes <profile>/<board>/new only
+            key = "default/" + key
+    elif coll == "tasks" and b == "new":
+        raise RequestError(400, "tasks create uses key <profile>/<board>/new (or <board>/new); "
+                                "other task actions need a task id")
     clean = {}
     for k, req in spec.items():
         v = args.get(k)
