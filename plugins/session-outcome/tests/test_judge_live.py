@@ -32,8 +32,24 @@ SCHEDULED_ANSWER = (
     "The session will turn green on its own after the last audit runs on Nov 3. Archiving it now is fine too: the "
     "audit still runs and still posts to your connected channels.")
 
+# A closing report after a blocked-card notice that names a card queued to run the last check. Before the queued-card
+# rule the judge said NO 3/3 ("a queued verification the assistant itself owes").
+QUEUED_CHECK_ANSWER = (
+    "**The safeguard is not deployed.** It turned out to add nothing, so it was archived as superseded. Nothing needs "
+    "you.\n\n"
+    "- **Admin page:** fixed and verified earlier. Sign-in works and unauthenticated requests are denied.\n"
+    "- **The reply check:** flags answers that stop at a diagnosis. It is already live.\n"
+    "- **Why the safeguard was dropped:** on 1,355 real goal stops, 14 ended at a diagnosis. The reply check catches 9; "
+    "the safeguard caught none. It is now off (verified as `{\"mode\":\"off\"}`).\n"
+    "- **Dispatcher bug** that killed new workers 19 seconds after start: the fix is committed and deployed. Its card is "
+    "queued to confirm the fix works on a real card; that check hasn't run yet.")
+QUEUED_CHECK_NOTICE = ("[Automatic notice, not typed by the user; it started this turn]\n"
+                       "Kanban t_1 blocked: Please close this card as superseded, or tell me to activate the guard "
+                       "anyway.")
+
 CASES = [
     ("why is it not green? it has a schedule icon", SCHEDULED_ANSWER, "YES"),
+    (QUEUED_CHECK_NOTICE, QUEUED_CHECK_ANSWER, "YES"),
     ("why is the chat still yellow?",
      "It's yellow because card t_123 is still running the soak test, which ends Friday. The chat turns green by "
      "itself when that card finishes; nothing needs you.", "YES"),

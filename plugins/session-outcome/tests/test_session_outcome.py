@@ -293,6 +293,20 @@ def test_judge_request_is_the_kanban_notice_that_started_the_turn(plugin, home):
     assert "why does the worker" not in seen[-1]
 
 
+@pytest.mark.parametrize("prefix", ["[False-stop recovery]", "[Session babysitter]"])
+def test_judge_request_skips_recovery_reprompts(plugin, home, prefix):
+    # The false-stop monitor wakes a stopped chat with a plain user row that only replays the event above it. Judged
+    # against that re-prompt's rules, a finished report got NO 3/3 and the chat stayed unresolved{no_summary}.
+    _messages(home, [("S1", "user", "old ask", None),
+                     ("S1", "user", "Kanban t_1 blocked: close it as superseded?", "kanban_notice"),
+                     ("S1", "user", prefix + " This chat stopped. Say so in one line.", None)])
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    assert plugin.judge("S1", "Archived it as superseded; nothing needs you.") is True
+    assert seen[-1].startswith("<request>\n" + plugin.NOTICE_PREFIX + "Kanban t_1 blocked")
+    assert prefix not in seen[-1]
+
+
 def test_judge_request_is_capped_and_missing_rows_send_message_only(plugin, home):
     _messages(home, [("S1", "user", "x" * 9000, None)])
     seen = []

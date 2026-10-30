@@ -368,8 +368,11 @@ JUDGE_SYSTEM = (
     "the result. A complete answer, explanation, list of advice or report is YES. Caveats, limits, notes on what was "
     "not changed and optional offers of more help do not make it NO.\n"
     "Things the message only describes as happening later on their own (a scheduled job's next runs, a card or cron "
-    "that finishes by itself, a status that changes later) are not unfinished work: if the assistant owes nothing "
-    "more on the request, answer YES.\n"
+    "that finishes by itself, a check or verification a queued or scheduled card will run, a status that changes "
+    "later, even when the message says it has not run yet) are not unfinished work: if the assistant owes nothing "
+    "more on the request, answer YES. Only the assistant's own promise to do more or report later makes such a "
+    "message NO. A message that says nothing needs the user and lists the remaining items as owned by cards or "
+    "schedules is YES.\n"
     "Answer NO if the work is not finished: mid-task status, a promise that the assistant will do more or report "
     "later, a bare acknowledgement, an error with no result, a question the user must answer before the work can go "
     "on, or a request that the user approve, confirm or act before the work can finish.\n"
@@ -377,12 +380,19 @@ JUDGE_SYSTEM = (
 # The scheduled-later rule: a full answer to "why is it not green?" that named the chat's cron and its next runs got
 # NO 5 times in 5 (and NO with only its first two paragraphs) as "a promise to report later"; asked to reason first,
 # the same model said YES. tests/test_judge_live.py replays it.
+# The queued-card rule: a closing report that said "nothing needs you" but named a card "queued to confirm the fix;
+# that check hasn't run yet" got NO 3/3 (with the kanban notice as request; YES 3/3 with the rule).
 # The judge's request context: the user's latest message, capped. Without it the judge read a finished answer to a
 # question ("what should I ask to vet X?" -> a list of questions) as "a question" and a report with caveats as
 # mid-task, and said NO on both.
 REQUEST_CHARS = 2000
 # Synthetic user rows (kanban done notices, auto-continue) are not the user's request.
 _SYNTHETIC_KINDS = ("kanban_notice", "auto_continue")
+# Recovery re-prompts (the false-stop monitor's and the old session babysitter's headless `chat --resume` turns) are
+# stored as plain user rows. They only replay the event above them, so the request is that event. Judged against the
+# re-prompt's own rules ("say so in one line", "cite an owner card only if you checked it"), a finished report got
+# NO 3/3 and the chat stayed unresolved{no_summary}.
+RECOVERY_PREFIXES = ("[False-stop recovery]", "[Session babysitter]")
 # ...except a kanban notice that started the judged turn: then it is the request, labeled as automatic.
 NOTICE_PREFIX = "[Automatic notice, not typed by the user; it started this turn]\n"
 
@@ -429,7 +439,8 @@ def _last_request(session_id: str) -> str:
                         (sid,)).fetchall()]
                 for content, kind in rows:
                     text = _text(content).strip()
-                    if not text or TAG in text or (kind or "") == "auto_continue":
+                    if (not text or TAG in text or (kind or "") == "auto_continue"
+                            or text.startswith(RECOVERY_PREFIXES)):
                         continue
                     if (kind or "") == "kanban_notice":
                         # A notice newer than any real message started this turn: the reply answers the notice.

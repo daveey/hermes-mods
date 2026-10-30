@@ -23,13 +23,14 @@ the outcome and feeds core the two things only plugins know: open user decisions
   (`pool-llm`'s `complete`, `anthropic`, `fast` tier, thinking off, 8 tokens) with a 6 s budget. Thinking is
   off because the fast model's adaptive thinking spent the whole token budget and about two calls in three came
   back empty. The judge sees the user's latest real request (`<request>`, capped at 2,000 characters; kanban
-  notices, auto-continue rows and this plugin's nudge are skipped) and the reply (`<message>`): without the
+  notices, auto-continue rows, this plugin's nudge and recovery re-prompts (`[False-stop recovery]`,
+  `[Session babysitter]`, which only replay the event above them) are skipped) and the reply (`<message>`): without the
   request it judged a finished answer to "what should I ask?" as "a question". YES → True, NO → False, anything else,
   any error or a timeout → None (core falls back to its heuristic). Verdicts are cached per (session, text).
   The judge reads the whole reply up to 12,000 characters, else its head and tail around an omission marker:
   never only the tail, which hides a long report's answer and gets a finished report judged NO.
   Things the reply only describes as happening later on their own (a cron's next runs, a card that finishes by
-  itself) count as YES when the assistant owes nothing more; only the assistant's own promise to do more or report
+  itself, a check a queued card will run even if it hasn't run yet) count as YES when the assistant owes nothing more; only the assistant's own promise to do more or report
   later is NO. Without that rule a full answer to "why is it not green?" that named the chat's cron got NO every time.
 - **`pre_final_gate`** (buffered): when the turn made no `session_outcome` call, it asks core
   `derive_outcome(sid, ignore_live_turn=True, pending_reply=<the candidate reply>)`. Only
