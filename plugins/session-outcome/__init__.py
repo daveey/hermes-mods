@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+import contextvars
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -450,12 +451,17 @@ _GATE_SCOPE: ContextVar[Optional[dict]] = ContextVar("session_outcome_gate_scope
 
 
 def _with_budget(fn: Callable[[], Any], budget: float) -> Any:
-    """fn() on a daemon thread; TimeoutError past budget (the call is abandoned, never awaited)."""
+    """fn() on a daemon thread; TimeoutError past budget (the call is abandoned, never awaited).
+
+    fn runs in a copy of the caller's context: a bare Thread starts with an empty one, which dropped the
+    profile secret scope (a ContextVar), so in the Desktop serve every gate judge died at 0.0 s with
+    UnscopedSecretError."""
     box: dict = {}
+    ctx = contextvars.copy_context()
 
     def run():
         try:
-            box["v"] = fn()
+            box["v"] = ctx.run(fn)
         except BaseException as exc:  # noqa: BLE001 - reported to the caller below
             box["e"] = exc
 

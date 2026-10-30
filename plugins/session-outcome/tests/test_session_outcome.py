@@ -437,6 +437,19 @@ def test_gate_judge_gets_longer_budget_and_timeout_holds(plugin, fake, monkeypat
     assert out and out["hold"]
 
 
+def test_judge_thread_sees_the_callers_context(plugin):
+    # The profile secret scope is a ContextVar. The judge's budget thread started with an empty context, so in the
+    # Desktop serve every gate judge died at 0.0 s with UnscopedSecretError (no ANTHROPIC_TOKEN in scope).
+    from contextvars import ContextVar
+    scope = ContextVar("test_secret_scope", default=None)
+    token = scope.set({"ANTHROPIC_TOKEN": "x"})
+    try:
+        plugin._llm = lambda s, u: "YES" if scope.get() else (_ for _ in ()).throw(RuntimeError("unscoped"))
+        assert plugin.judge("S1", "Merged #12 and deployed; health check green.") is True
+    finally:
+        scope.reset(token)
+
+
 def test_gate_scope_does_not_leak_into_refresh(plugin, fake):
     plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
     gate(plugin, reply="Rebased, fixed both failing tests and pushed; CI is green.")
