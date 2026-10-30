@@ -113,6 +113,42 @@ class InstallCause(test_execution.Execution):
         first.unload()
         self.assertIs(ClientLifecycleMixin._create_request_anthropic_client, original)
 
+    def test_a_second_home_in_one_process_adopts_the_first_homes_seams(self):
+        # Field case (mini, 2026-10-30 12:37-13:44): one process (the core-update CLI) loads
+        # the plugin for several homes (default + profile scopes). The first home wraps the
+        # seams; the others used to be refused "already customized" and logged
+        # "Account selection is off: install raised SelectionRejected at
+        # _create_request_anthropic_client". The wrappers read the request-local dispatch
+        # bound by their own home's middleware, so sharing them cannot cross accounts.
+        from agent.client_lifecycle import ClientLifecycleMixin
+        original = ClientLifecycleMixin._create_request_anthropic_client
+        first, second = self.integration(), self.integration()
+        second.home = first.home + '-other-profile'
+        self.addCleanup(self.s._install_failures.pop, second.home, None)
+        first.install()
+        patched = ClientLifecycleMixin._create_request_anthropic_client
+        second.install()
+        self.assertTrue(second.active)
+        self.assertIsNone(second.error)
+        self.assertNotIn(second.home, self.s._install_failures)
+        self.assertIs(ClientLifecycleMixin._create_request_anthropic_client, patched)
+        first.unload()  # the owner leaves first: the second home still needs the seams
+        self.assertIs(ClientLifecycleMixin._create_request_anthropic_client, patched)
+        second.unload()
+        self.assertIs(ClientLifecycleMixin._create_request_anthropic_client, original)
+
+    def test_a_second_home_never_dispatches_through_the_first_homes_middleware(self):
+        first, second = self.integration(), self.integration()
+        second.home = first.home + '-other-profile'
+        first.install()
+        second.install()
+        calls = []
+        with patch('hermes_constants.get_hermes_home', return_value=second.home):
+            first.middleware(next_call=lambda request: calls.append('next'), request=object())
+        self.assertEqual(calls, ['next'])  # first ignores a turn of another home
+        first.unload()
+        second.unload()
+
     def test_concurrent_installs_in_two_threads_both_succeed(self):
         from agent.client_lifecycle import ClientLifecycleMixin
         original = ClientLifecycleMixin._create_request_anthropic_client

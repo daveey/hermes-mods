@@ -21,6 +21,7 @@ _install_failures = {}
 _load_abandoned = {}
 _install_lock = threading.RLock()
 _unloaded = []  # set once any integration unloads; install() then gc.collect()s
+_restore_epoch = 0  # finalizers can restore seams reentrantly during an install
 
 # install() proves each seam's live code object came from the audited file. A
 # cold compile of those files costs seconds under load (it used to push plugin
@@ -82,10 +83,15 @@ def audited_digests(value):
     return _pins.accepted(value) or None
 
 
-def _live_owner(value, home):
-    """The live ExecutionIntegration of this plugin that wrapped `value`, else None."""
+def _live_owner(value):
+    """The live ExecutionIntegration of this plugin that wrapped `value`, else None.
+
+    Any home's integration qualifies: the wrappers hold no home state. They act only on
+    the request-local dispatch that the integration of the TURN's own home binds in its
+    middleware (`middleware` ignores other homes' turns), so homes can share one set.
+    A load that finds them adopts them instead of reporting drift."""
     owner = getattr(value, '_account_usage_owner', None)
-    if isinstance(owner, ExecutionIntegration) and owner.active and owner.patches and owner.home == home:
+    if isinstance(owner, ExecutionIntegration) and owner.patches and owner._in_use():
         return owner
     return None
 
@@ -777,8 +783,11 @@ class ExecutionIntegration:
         self._at = 'setup'
         self.patches = []
         self.active = False
-        import threading
-        self._lifetime_lock = threading.RLock()
+        self.sharers = set()  # other integrations (homes) living on the seams this one patched
+        self.adopted = []  # integrations whose seams this one uses instead of patching its own
+        # One reentrant lock owns seam installation AND lifetime transitions.
+        # gc.collect() inside install can run our finalizers on this same thread.
+        self._lifetime_lock = _install_lock
         self._snapshots = set()
 
     def retain_snapshot(self, snapshot):
@@ -788,6 +797,9 @@ class ExecutionIntegration:
             if key not in self._snapshots:
                 self._snapshots.add(key)
                 weakref.finalize(snapshot, self._release_snapshot, key)
+            # Late workers of adopting homes must retain the actual seam owner too.
+            for owner in self.adopted:
+                owner.retain_snapshot(snapshot)
 
     def _release_snapshot(self, key):
         with self._lifetime_lock:
@@ -877,9 +889,25 @@ class ExecutionIntegration:
         # A seam this plugin's earlier, still-live instance already wrapped (a second
         # load in one process) is adopted, not drift. All-or-nothing: a mix of ours
         # and foreign wrappers is still refused below, before anything is patched.
-        owners = [_live_owner(getattr(obj, name), self.home) for obj, name, factory in targets]
+        epoch = _restore_epoch
+        owners = [_live_owner(getattr(obj, name)) for obj, name, factory in targets]
+        if epoch != _restore_epoch:
+            return self._install_locked()
         if all(owners):
+            # A repeated install on the owner itself must not create a self-cycle.
+            adopted = [o for o in {id(o): o for o in owners}.values() if o is not self]
             self.active = True
+            for owner in adopted:
+                owner.sharers.add(self)
+            # A same-thread snapshot finalizer bypasses even a reentrant lock.
+            # Once registered we protect the owners; if restoration happened in
+            # the check-to-registration gap, discard the stale ledger and retry.
+            if epoch != _restore_epoch:
+                self.active = False
+                for owner in adopted:
+                    owner.sharers.discard(self)
+                return self._install_locked()
+            self.adopted = adopted
             _install_failures.pop(self.home, None)
             return
         for (obj, name, factory), owner in zip(targets, owners):
@@ -1062,12 +1090,23 @@ class ExecutionIntegration:
             if not _unloaded:
                 _unloaded.append(True)
             self._restore_if_idle()
+            for owner in self.adopted:  # the owner may have left first, waiting on us
+                owner.sharers.discard(self)
+                if not owner.active:
+                    owner._restore_if_idle()
+
+    def _in_use(self):
+        return self.active or bool(self._snapshots) or any(sharer.active for sharer in list(self.sharers))
 
     def _restore_if_idle(self):
         # A timed-out worker can start its factory AFTER middleware has returned.
-        # Keep transparent adapters until every retained context snapshot dies.
-        if self._snapshots:
+        # Keep transparent adapters until every retained context snapshot dies
+        # and every other home that adopted them has unloaded.
+        if self._snapshots or any(sharer.active for sharer in list(self.sharers)):
             return
+        global _restore_epoch
+        if self.patches:
+            _restore_epoch += 1
         for obj, name, original, wrapper in reversed(self.patches):
             if getattr(obj, name) is wrapper:
                 setattr(obj, name, original)
