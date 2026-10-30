@@ -353,7 +353,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                       tool_log=tool_log, gap_s=gap_s)
             evidence = sh.clean_user(user_message)
             if hit and hit.get("gap_s") is not None:
-                evidence = f"backend stopped mid-turn; chat resumed {hit['gap_s'] // 60} min later. {evidence}"
+                lead = ("update pause continued" if hit.get("symptom", "").startswith("update pause")
+                        else "backend stopped mid-turn; chat resumed")
+                evidence = f"{lead} {hit['gap_s'] // 60} min later. {evidence}"
             sh.handle(hit, session_id, store, evidence=evidence, platform=platform)
         except Exception as exc:
             log.debug("coach self_heal complaint: %s", exc)

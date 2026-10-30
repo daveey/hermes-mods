@@ -72,6 +72,11 @@ CANCEL_LINE_RE = re.compile(r"^\s*<-\s*ERROR\b.*(?:Tool execution cancelled|Oper
 # Core's crash-recovery note (tui_gateway/session_history.py _AUTO_CONTINUE_NOTE_PREFIX): the next user turn after a
 # backend stopped mid-turn. The only trace such a stop leaves, since the cut turn never reaches post_llm_call.
 RESUME_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+# Core's update-pause note (tui_gateway/update_pause.py pause_note) shares that prefix but marks a PLANNED pause: the
+# turn stopped at a step boundary so a Hermes update could land, then continued by itself (gateway-9aaf151a15).
+PAUSE_NOTE_MARK = "paused at a step boundary for a Hermes update"
+# The update's land target: a pause that continued within this is working as designed; a longer one failed.
+PAUSE_LAND_S = 30 * 60
 ERR_LINE_RE = re.compile(r"(?:<-|->)\s*ERROR\b\s*(.*)")
 
 COMPLAINT_SYS = """You watch a power user's chats with his AI agent system "Hermes" (the coding/ops agent, its Desktop
@@ -251,14 +256,25 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
     return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal"}
 
 
+def is_resume_note(user_text) -> bool:
+    """Core's resume note (crash recovery or update pause): a machine-written turn, never a user complaint."""
+    return clean_user(user_text).lstrip().startswith(RESUME_NOTE_PREFIX)
+
+
 def resume_signal(user_text, gap_s: Optional[float] = None) -> Optional[dict]:
     """A user turn that is core's crash-recovery note: the backend stopped mid-turn and Hermes resumed the chat.
     `gap_s` = seconds since the session's last recorded activity (None when unknown)."""
     t = clean_user(user_text)
-    if not t.lstrip().startswith(RESUME_NOTE_PREFIX):
+    if not is_resume_note(t):
         return None
-    v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
-         "symptom": "turn interrupted (backend stopped)"}
+    if PAUSE_NOTE_MARK in t[:400]:
+        if gap_s is None or gap_s <= PAUSE_LAND_S:
+            return None  # a planned update pause that continued in time
+        v = {"p_defect": 0.85, "kind": "interrupted", "component": "gateway",
+             "symptom": "update pause did not continue in time"}
+    else:
+        v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
+             "symptom": "turn interrupted (backend stopped)"}
     return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal",
             "gap_s": None if gap_s is None else int(gap_s)}
 
@@ -450,9 +466,8 @@ def detect_complaint(prev_reply: str, user_text, llm: Optional[Callable[[str, st
     then the cascade (complaint_verdict) on (previous reply + its turn's tool log, user message). Returns
     {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open."""
     try:
-        sig = resume_signal(user_text, gap_s)
-        if sig:
-            return sig
+        if is_resume_note(user_text):
+            return resume_signal(user_text, gap_s)  # machine-written: never sent to the complaint judge
         if not prefilter(user_text):
             return None
         return _verdict(complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context),
