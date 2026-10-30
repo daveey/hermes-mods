@@ -27,7 +27,12 @@ def scan(root: Path) -> list[dict]:
     out: list[dict] = []
     for path in sorted(Path(root).rglob("*.py")):
         rel = path.relative_to(root)
-        if any(p in SKIP_DIRS for p in rel.parts) or rel.name.startswith("test_"):
+        # Nested agent worktrees are stale copies, not deployed producers.
+        # Keep other .claude sources (e.g. hooks) in scope.
+        nested_claude_tree = any(a == '.claude' and b == 'worktrees'
+                                 for a, b in zip(rel.parts, rel.parts[1:]))
+        if (any(p in SKIP_DIRS or p == '.worktrees' for p in rel.parts)
+                or nested_claude_tree or rel.name.startswith("test_")):
             continue
         try:
             text = path.read_text(encoding="utf-8")
