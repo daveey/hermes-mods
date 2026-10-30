@@ -168,6 +168,14 @@ def test_systemd_gateway_cgroup_does_not_own_workers(c, tmp_path):
                           status_fn=lambda _: "done")[0]
 
 
+def test_service_refusal_precedes_generic_gui_guard(c, tmp_path):
+    t = table(c, tmp_path)
+    t[901].update(args="/opt/Python.app/Contents/MacOS/Python collector.py",
+                  service="example.collector", service_manager="launchd")
+    ok, why = c.kill_verdict(t, {}, 901)
+    assert not ok and "a launchd service example.collector" in why
+
+
 def test_loaded_launchd_program_arguments_fallback(c, tmp_path, monkeypatch):
     from types import SimpleNamespace
     import plistlib

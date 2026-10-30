@@ -653,12 +653,12 @@ def kill_verdict(table: dict, tags: dict, pid: int, status_fn=card_status) -> tu
     row = table[pid]
     if row["name"].startswith("hermes") and GATEWAY.search(row["name"]):
         return False, "a Hermes gateway/serve process: ask the user"
-    exe = row["args"].split(" -", 1)[0]
-    if GUI_APP.search(exe) and not re.search(r"/python[\d.]*$", exe.strip()):
-        return False, "a GUI app: ask the user"
     info = service_info(table, tags, pid)
     if info["service"]:
         return False, f"a {info['service_manager']} service {info['service']}: ask on its owner card"
+    exe = row["args"].split(" -", 1)[0]
+    if GUI_APP.search(exe) and not re.search(r"/python[\d.]*$", exe.strip()):
+        return False, "a GUI app: ask the user"
     agent = owner(table, tags, pid)
     task = agent.get("HERMES_OWNER_CARD") or agent.get("HERMES_KANBAN_TASK") or agent.get("HERMES_KANBAN_WORKER_TASK")
     if not task:
