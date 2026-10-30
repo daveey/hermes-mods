@@ -814,3 +814,36 @@ test('embedded queue drops its own frame, heading and minimize control', async (
  assert.equal(el().querySelector('h3').textContent, 'Embedded ask')
  assert.equal(m.openAskCount(), 1)
 })
+
+test('failed recorded decision keeps the ask counted and visible with Retry until confirmed', async () => {
+ await show(null)
+ const r = freshRequest({ title: 'Failing ask' })
+ const resolution = { operationId: 'op-failed-visible', choiceId: 'yes', revision: 1 }
+ const recorded = { ...r, resolution } // core retains open state until delivery confirms
+ let delivered = false; const posts = []
+ const call = async (path, opts = {}) => {
+  if (path.endsWith('/ping')) return { ok: true, api: 2, features: [] }
+  if (opts.method === 'POST') { posts.push(path); delivered = true }
+  const request = { ...recorded, state: delivered ? 'resolved' : 'open' }
+  if (path.includes('/operations/')) return { operation: { operationId: resolution.operationId, dispatchState: delivered ? 'delivered' : 'failed' }, request }
+  return { requests: [request] }
+ }
+ window.hermesDesktop = { api: ({ path, ...opts }) => call(path, opts) }
+ await m.refreshRequests(call)
+ await show(React.createElement(m.ActionQueue, { key: 'failed-visible', embedded: true }))
+ assert.equal(m.openAskCount(), 1, 'recorded open decision remains attention-worthy after remount')
+ assert.match(el().textContent, /delivery unconfirmed/i)
+ assert.ok([...el().querySelectorAll('button')].some(b => b.textContent === 'Retry'))
+ await click('Retry')
+ assert.equal(posts.length, 1)
+ assert.match(posts[0], /operations\/op-failed-visible\/retry/)
+ assert.equal(m.openAskCount(), 0, 'confirmed decision clears')
+ assert.equal(el().querySelector('[data-action-request]'), null)
+})
+
+test('historical confirmed decisions do not resurrect the attention count on a cold renderer', async () => {
+ const r = freshRequest({ state: 'resolved', resolution: { operationId: 'old-delivered', choiceId: 'yes', revision: 1 } })
+ await m.refreshRequests(async () => ({ requests: [r] }))
+ assert.equal(m.openAskCount(), 0)
+ await show(null)
+})

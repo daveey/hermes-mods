@@ -12,7 +12,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 13
+const VERSION = 14
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -1048,11 +1048,24 @@ function readMinimized() {
 function writeMinimized(keys) {
   try { if (keys.length) window.localStorage.setItem(MINIMIZED_KEY, JSON.stringify(keys.slice(-200))); else window.localStorage.removeItem(MINIMIZED_KEY) } catch {}
 }
+/** A recorded decision whose delivery is failed/pending/unconfirmed stays on screen (with Retry) until confirmed. */
+function requestNeedsReadback(scope, r) {
+  if (r.state === 'withdrawn' && !r.resolution) return false // nothing can be pending on a withdrawn revision
+  const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
+  if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
+  return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
+}
 /** Open asks for the focused chat that need the user (agent-pending and dismissed ones excluded). */
 export function openAskCount() {
   const scope = routeKey(decisionRoute())
   if (!decisionRoute().session || canonical.scope !== scope) return 0
-  return canonical.requests.filter(r => !r.resolution && ['open','needs_context'].includes(r.state) && !agentPending(r)).length
+  return canonical.requests.filter(r => {
+    const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
+    // Terminal backend state is durable confirmation, not a new ask on reload.
+    // Still read it back when the expanded queue mounts, and retain local failures.
+    if (['resolved','superseded','cancelled'].includes(r.state) && r.resolution?.revision === r.revision && !op?.decision && !recoverIntent(key, r)) return false
+    return requestNeedsReadback(scope, r) || (!r.resolution && ['open','needs_context'].includes(r.state) && !agentPending(r))
+  }).length
 }
 
 // `embedded`: drawn inside the session panel, which supplies the frame, heading and minimize control.
@@ -1070,12 +1083,7 @@ export function ActionQueue({ embedded = false } = {}) {
   if (!route.session || snap.scope !== scope) return null
   // Closed requests, including withdrawn (moot) asks, are not shown or counted; they still suppress their
   // own legacy references through requestForSource.
-  const needsReadback = r => {
-    if (r.state === 'withdrawn' && !r.resolution) return false // nothing can be pending on a withdrawn revision
-    const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
-    if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
-    return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
-  }
+  const needsReadback = r => requestNeedsReadback(scope, r)
   const requests = snap.requests.filter(r => ((!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r)) && !(agentPending(r) && !needsReadback(r) && isRequestDismissed(r)))
   if (!requests.length && !snap.error) return null
   const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))

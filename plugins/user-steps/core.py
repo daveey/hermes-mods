@@ -1867,6 +1867,7 @@ class ActionStore:
         receipt = None
         confirmed = False
         busy = False
+        failure_class = 'unconfirmed_readback'
         try:
             if receiver is None: raise RuntimeError('No durable delivery receiver configured')
             receipt = (receiver.deliver_early(op, early_tool_call_id) if early_tool_call_id
@@ -1875,6 +1876,11 @@ class ActionStore:
         except Exception as exc:
             # Never expose credentials, receiver URLs or raw transport bodies: only classify.
             busy = 'session is busy' in str(exc).lower()
+            failure_class = 'session_busy' if busy else getattr(exc, 'reason', type(exc).__name__)
+        if not confirmed:
+            import logging
+            logging.getLogger('user-steps').warning(
+                'Decision delivery unconfirmed operation=%s classification=%s', oid, failure_class)
         with self._tx() as c:
             result = self._operation(c, owner, oid); op = result['operation']
             # A slow failed retry cannot downgrade a concurrently confirmed delivery.

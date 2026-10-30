@@ -366,8 +366,18 @@ Paste-control markers or text the core sanitizer would change are rejected with
 422 before recording a decision, including markers in the frozen scope. Text is
 never silently rewritten after the user reviews it.
 
-Production uses `prompt.admission.get`/`prompt.admit` in the already-loaded owning
-serve runtime, never `/v1/runs`, port discovery, session resume or a competing writer.
+TUI-runtime decisions use `prompt.admission.get`/`prompt.admit` in the already-loaded
+owning serve runtime. Gateway local-platform (`local-*`) decisions instead use the
+published gateway runner's profile-scoped authority and durable automation FIFO;
+`operationId` is the immutable producer request identity. Admission readback verifies
+the stored text digest, owner and request identity, including after compression.
+A committed receipt remains readable when the route later rotates; a fresh decision
+cannot target an unrelated replacement conversation. Confirmation means durable
+admission, not successful model completion. Neither path uses `/v1/runs`, port
+discovery, session resume or a competing writer. Unconfirmed delivery remains visible
+with Retry in For-you; classified backend warnings identify the operation without
+logging raw transport details. Tests cover TUI admission, real local gateway FIFO
+(including a compressed child), failed-row retention and terminal receipt outcomes.
 Card bindings are checked read-only first; approve/revise admission and readback
 then precede card decision comments. Decline never admits a turn. Card comments,
 binding decisions and receipts commit together through core's fenced transaction;
