@@ -48,8 +48,16 @@ def test_retry_with_the_named_ask_is_accepted(tmp_path):
     st = load("_la_accept")
     b, _ = box(tmp_path, st)
     with pytest.raises(ValueError):
-        b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky-signin:1")
-    assert b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky-signin:1", ask=ASK)
+        b.post("Sign in to Bluesky", "needs David", "Sign in", poster="cli", key="bsky-signin:1")
+    assert b.post("Sign in to Bluesky", "needs David", "Sign in", poster="cli", key="bsky-signin:1", ask=ASK)
+
+
+def test_agent_owned_retry_with_self_written_ask_is_refused(tmp_path):
+    """A kanban poster can't pass by retrying with the named ask on a familiar key: it must come from human_request."""
+    st = load("_la_selfask")
+    b, _ = box(tmp_path, st)
+    with pytest.raises(st.AgentOwnedPost, match="ask_self_attested"):
+        b.post("Sign in to Bluesky", "needs David", "Sign in", poster="kanban · bsky", key="bsky-signin:1", ask=ASK)
 
 
 # -- 2. kanban human_request -> ask, automatically -----------------------------------------------
@@ -84,14 +92,15 @@ def test_incomplete_human_request_yields_no_ask():
     assert ac.ask_from_human_request("not json") is None
 
 
-def test_explicit_ask_wins_over_card_human_request(tmp_path, monkeypatch):
+def test_explicit_ask_differing_from_card_human_request_is_refused(tmp_path, monkeypatch):
+    """A kanban worker's own ask never replaces its card's human_request, whatever the key."""
     st = load("_la_explicit")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_card")
     monkeypatch.setattr(st, "card_human_request", lambda task_id: {
         "interaction": "credential", "why_human": "card", "action": "card"})
     b, _ = box(tmp_path, st)
-    b.post("Approve spend", "b", "go", poster="kanban · x", key="bsky-signin:1", ask=ASK)
-    assert json.loads(b._side().execute("select ask_json from items").fetchone()[0]) == ASK
+    with pytest.raises(st.AgentOwnedPost, match="ask_self_attested"):
+        b.post("Approve spend", "b", "go", poster="kanban · x", key="bsky-signin:1", ask=ASK)
 
 
 def test_non_kanban_poster_never_inherits(tmp_path, monkeypatch):

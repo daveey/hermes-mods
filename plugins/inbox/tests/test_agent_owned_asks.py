@@ -1,5 +1,5 @@
 """Agent-owned posters (registry owner kanban/coach) cannot self-attest an ask: it must come from the card's
-human_request or the key must be a known owner-ask family. Tool and CLI doors."""
+human_request (no key-prefix exemption). Tool and CLI doors."""
 import argparse
 import importlib.util
 import json
@@ -52,13 +52,30 @@ def test_self_attested_ask_on_unlisted_key_is_refused(env, door, poster):
 
 
 @pytest.mark.parametrize("door", ["tool", "cli"])
-@pytest.mark.parametrize("key,poster", [
-    ("engine-budget:2026-10", "coach · engine budget"), ("hub-claude-login:1", "kanban · a"),
-    ("hub-claude-login", "kanban · a"), ("bsky-signin:daveey", "kanban · a"), ("codex-move-to-hub:2", "kanban · a"),
-    ("hub-broker-enroll:v", "kanban · a"), ("gh-quota-app:t_1", "kanban · a"), ("phone-calls-p2-board", "kanban · a")])
-def test_allowlisted_owner_ask_keys_are_accepted(env, door, key, poster):
+@pytest.mark.parametrize("key,poster,title", [
+    ("selfheal:anything", "kanban · fix things", "Detector misses replies"),
+    ("askeve:deploy-done", "kanban · x", "Ask Eve deploy is done, please look"),
+    ("engine-budget:2026-10", "coach · engine budget", "Raise today's cap"),
+    ("hub-claude-login:1", "kanban · a", "Sign in"), ("bsky-signin:daveey", "kanban · a", "Sign in"),
+    ("phone-calls-p2-board", "kanban · a", "Sign in")])
+def test_key_prefix_never_exempts_a_self_attested_agent_ask(env, door, key, poster, title):
+    """No key family lets an agent-owned poster skip the self-attest rule: keys are caller-chosen."""
+    plugin, st, cards, _ = env
+    assert not post(door, plugin, title, key, poster, ASK)
+    assert not st.Inbox().list()
+    assert "ask_self_attested" in cards[0]["body"]
+
+
+def test_typed_engine_budget_card_from_coach_is_still_accepted(env):
+    """The live spend-raise producer posts a resolve-typed card; the type, not the key, carries the decision."""
     plugin, st, _, _ = env
-    assert post(door, plugin, "Sign in", key, poster, ASK)
+    types = st.Inbox().home / "inbox" / "types"
+    types.mkdir(parents=True, exist_ok=True)
+    src = HERE.parents[1] / "skills" / "productivity" / "hermes-coach" / "inbox-types" / "engine-budget.yaml"
+    (types / "engine-budget.yaml").write_text(src.read_text())
+    r = st.Inbox().post("Engine budget hit", "b", "Raise it", key="engine-budget:2026-10-30",
+                        poster="coach · engine budget", type="engine-budget", fields={"day": "2026-10-30"}, ask=ASK)
+    assert r
 
 
 @pytest.mark.parametrize("door", ["tool", "cli"])

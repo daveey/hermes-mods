@@ -79,10 +79,9 @@ _SENT_NOTICE = re.compile(r"^\s*X\s+(?:DM\s+|reply\s+|post\s+)?(?:sent|posted)\b
 
 
 # Agent-owned posters (registry owner kanban/coach/cron) can attest any ask themselves, so an ask counts only when it
-# came from the card's human_request or the key is a known owner-ask family.
+# came from the card's human_request. No key exemption: keys are caller-chosen, so a key allowlist is a bypass. A
+# recurring owner decision (spend cap, sign-in) uses a resolve-typed card (e.g. engine-budget), accepted above.
 AGENT_OWNERS = frozenset({"kanban", "coach", "cron"})
-OWNER_ASK_KEYS = re.compile(r"^(?:engine-budget:|hub-claude-login(?:$|:)|bsky-signin:|codex-move-to-hub:|"
-                            r"hub-broker-enroll:|gh-quota-app:|phone-calls-p2-|ask-eve-move:|askeve:|selfheal:)")
 SELF_ATTESTED_MSG = ("this poster is agent-owned and the ask is self-attested. If David must act, block your card "
                      "with kanban_block(human_request={...}) and the Inbox ask is derived from it; otherwise fix it "
                      "or use a Kanban card")
@@ -111,6 +110,6 @@ def reason(*, home, poster, ask, actions, type_name="default", title="", body=""
         return "ask_invalid"
     if any(not isinstance(ask.get(k), str) or not ask[k].strip() for k in ("why_human", "action")):
         return "ask_invalid"
-    if row.get("owner") in AGENT_OWNERS and not from_human_request and not OWNER_ASK_KEYS.match(str(key or "")):
+    if row.get("owner") in AGENT_OWNERS and not from_human_request:
         return "ask_self_attested"
     return None

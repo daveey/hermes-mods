@@ -269,6 +269,8 @@ def _selfheal_manual_mode(monkeypatch):
 
 def test_poster_named_project_routes_new_card(env):
     inbox, db, pr = env
+    from ask_fixtures import register_test_posters
+    register_test_posters(inbox.home)  # routing test: the self-attest gate is covered in test_agent_owned_asks
     sh = str(Path(pr).parent / "self-heal")
     _add_project(Path(inbox.home), "self-heal", sh, "p_sh")
     r = inbox.post("Kanban goes unknown", "b", "p", key="selfheal:k1", poster="self-heal", inherited_cwd="/Users/me")
@@ -277,6 +279,8 @@ def test_poster_named_project_routes_new_card(env):
 
 def test_poster_named_project_routes_conditional_post(env):
     inbox, db, pr = env
+    from ask_fixtures import register_test_posters
+    register_test_posters(inbox.home)  # routing test: the self-attest gate is covered in test_agent_owned_asks
     sh = str(Path(pr).parent / "self-heal")
     _add_project(Path(inbox.home), "self-heal", sh, "p_sh")
     r = inbox.post("Cron fails hourly", "b", "p", key="selfheal:k2", poster="Self Heal",
