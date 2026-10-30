@@ -275,3 +275,23 @@ def test_unsupported_platform_never_calls_pmset(monkeypatch):
     monkeypatch.setattr(bt.sys, 'platform', 'linux')
     monkeypatch.setattr(bt.subprocess, 'run', lambda *a, **kw: pytest.fail('must not call pmset'))
     assert REAL_PROBE_POWER(NOW) == {'status': 'unsupported', 'intervals': []}
+
+
+def test_awake_timeouts_are_split_by_conn_and_time_since_wake(tmp_path):
+    wake = NOW - timedelta(minutes=20)
+    write_log(tmp_path, 0, extra=[
+        f'{stamp(wake + timedelta(seconds=20))} [hermes] [hermes:api GET /api/plugins/hub-sync/status] conn=hermes-hub {TIMEOUT}',
+        f'{stamp(wake + timedelta(minutes=4))} [hermes] [hermes:api GET /api/plugins/hub-sync/status] conn=hermes-hub {TIMEOUT}',
+        f'{stamp(wake + timedelta(minutes=5))} [hermes] [hermes:api GET /api/plugins/inbox/items] conn=mac-mini {TIMEOUT}',
+        f'{stamp(NOW - timedelta(minutes=1))} [hermes] /api/status {TIMEOUT}',
+    ])
+    out = bt.scan(tmp_path, NOW, 30, [(wake - timedelta(minutes=5), wake)])
+    assert out['awake_count'] == 4 and out['sleep_count'] == 0
+    assert out['awake_by_conn'] == {'hermes-hub': 2, 'mac-mini': 1, '?': 1}
+    assert out['awake_since_wake'] == {'<1m': 1, '<10m': 2, '>=10m': 1}
+
+
+def test_awake_split_without_any_wake_is_no_wake_seen(tmp_path):
+    write_log(tmp_path, 3)
+    out = bt.scan(tmp_path, NOW, 30, [])
+    assert out['awake_since_wake'] == {'no_wake_seen': 3}

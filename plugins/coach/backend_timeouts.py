@@ -36,6 +36,7 @@ NEEDLE = "Timed out connecting to Hermes backend"
 STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} ")
 API_RE = re.compile(r"\[hermes:api (?:[A-Z]+ )?(\S+?)\]")
 PATH_RE = re.compile(r"(/api/[^\s\]\)'\"?,:]+)")
+CONN_RE = re.compile(r"\bconn=([\w.-]+)")
 TAG_RE = re.compile(r"\[([a-z][\w:.-]*)\]")
 ID_SEG_RE = re.compile(r"^(?=.*\d)[\w.-]{8,}$|^\d+$|^t_[0-9a-f]+$")
 ROTATED = 3
@@ -96,7 +97,8 @@ def iter_timeouts(files: list):
                 if NEEDLE not in line or last_ts is None or counted:
                     continue
                 counted = True
-                yield last_ts, route_of(line)
+                m = CONN_RE.search(line)
+                yield last_ts, route_of(line), (m.group(1) if m else "?")
 
 
 POWER_RE = re.compile(
@@ -145,20 +147,35 @@ def probe_power(now: datetime) -> dict:
         return {'status': 'failed', 'intervals': [], 'error': type(exc).__name__}
 
 
+def wake_bucket(ts: datetime, wake_ends: list) -> str:
+    """Informational only (suppresses nothing): how long after the latest observed wake an awake timeout landed.
+    Stragglers minutes after a wake point at a stale tunnel/route to one remote backend, not at CPU starvation."""
+    prior = [w for w in wake_ends if w <= ts]
+    if not prior:
+        return "no_wake_seen"
+    gap = (ts - prior[-1]).total_seconds()
+    return "<1m" if gap < 60 else "<10m" if gap < 600 else ">=10m"
+
+
 def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     start = now - timedelta(minutes=window_min)
     by_path: Counter = Counter()
     awake_by_path: Counter = Counter()
+    awake_by_conn: Counter = Counter()
+    awake_since_wake: Counter = Counter()
+    wake_ends = sorted(hi for _, hi in intervals)
     sleep_count = 0
     first = last = None
     files = log_files(home)
-    for ts, route in iter_timeouts(files):
+    for ts, route, conn in iter_timeouts(files):
         if start <= ts <= now:
             by_path[route] += 1
             if any(lo <= ts <= hi for lo, hi in intervals):
                 sleep_count += 1
             else:
                 awake_by_path[route] += 1
+                awake_by_conn[conn] += 1
+                awake_since_wake[wake_bucket(ts, wake_ends)] += 1
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     return {"window_start": start.isoformat(sep=" "), "window_end": now.isoformat(sep=" "),
@@ -166,11 +183,13 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
             "by_path": dict(by_path.most_common()),
             "sleep_count": sleep_count, "awake_count": sum(awake_by_path.values()),
             "awake_by_path": dict(awake_by_path.most_common()),
+            "awake_by_conn": dict(awake_by_conn.most_common()),
+            "awake_since_wake": dict(awake_since_wake.most_common()),
             "first": first.isoformat(sep=" ") if first else None, "last": last.isoformat(sep=" ") if last else None}
 
 
 def hours(home: Path) -> dict:
-    c: Counter = Counter(ts.strftime("%Y-%m-%d %H") for ts, _ in iter_timeouts(log_files(home)))
+    c: Counter = Counter(ts.strftime("%Y-%m-%d %H") for ts, _, _c in iter_timeouts(log_files(home)))
     return dict(sorted(c.items()))
 
 
@@ -237,6 +256,8 @@ archive asking "task status unavailable", stale boards.
 Of these, {rep.get("awake_count", rep["count"])} occurred while awake and
 {rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals.
 The threshold applies only to awake timeouts; raw count remains unchanged.
+Awake timeouts by backend connection: {rep.get("awake_by_conn") or "(none)"}; by time since last observed wake:
+{rep.get("awake_since_wake") or "(none)"}.
 
 ## Top request paths
 {_paths_md(rep)}
