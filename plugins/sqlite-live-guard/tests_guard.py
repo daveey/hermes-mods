@@ -553,3 +553,26 @@ def test_non_board_folders_under_boards_are_not_live(tmp_home):
     assert _block("terminal", command="rm ~/.hermes/kanban/boards/_archived/refpin-1/kanban.db") is None
     assert _block("terminal", command="mv ~/.hermes/kanban/boards/ops/kanban.db /tmp/x")
     assert _block("terminal", command="mv ~/.hermes/kanban/boards/ops_2/kanban.db-wal /tmp/x")
+
+
+def test_check_replacement_falls_back_to_query_only_when_ro_open_fails(tmp_path, monkeypatch):
+    live, rep = tmp_path / "live.db", tmp_path / "rep.db"
+    for p in (live, rep):
+        c = sqlite3.connect(p); c.execute("create table t(x)"); c.execute("insert into t values (1)"); c.commit(); c.close()
+    real = sqlite3.connect
+
+    def connect(target, *a, **kw):
+        if "mode=ro" in str(target):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real(target, *a, **kw)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    assert swap_db.check_replacement(live, rep) is None
+    con = swap_db._ro_connect(rep)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            con.execute("insert into t values (2)")
+    finally:
+        con.close()
+    with pytest.raises(sqlite3.OperationalError):
+        swap_db._ro_connect(tmp_path / "missing.db")
+    assert not (tmp_path / "missing.db").exists()

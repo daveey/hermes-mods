@@ -442,3 +442,29 @@ def test_dry_run_changes_nothing_and_failed_restart_does_not_record_cooldown(tmp
     run(tmp_path, f.port, "--threshold-mb", "0", "--pressure-avail-mb", "0", runner=Runner(rc=1))
     assert verdict(capsys)["rc"] == 1
     assert not (tmp_path / "state" / "chrome-recycle.json").exists()
+
+
+def test_session_activity_falls_back_to_query_only_when_ro_open_fails(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    c = sqlite3.connect(db)
+    c.execute("create table sessions(id, started_at, ended_at)")
+    c.execute("create table messages(session_id, timestamp)")
+    c.execute("insert into sessions values ('s1', 10.0, null)")
+    c.execute("insert into messages values ('s1', 20.0)")
+    c.commit(); c.close()
+    real = sqlite3.connect
+
+    def connect(target, *a, **kw):
+        if "mode=ro" in str(target):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real(target, *a, **kw)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    assert cr.session_activity(db, "s1") == (None, 20.0)
+    con = cr._ro_connect(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            con.execute("insert into messages values ('s1', 1)")
+    finally:
+        con.close()
+    assert cr.session_activity(tmp_path / "missing.db", "s1") is None
+    assert not (tmp_path / "missing.db").exists()

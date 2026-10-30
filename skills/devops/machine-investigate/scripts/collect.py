@@ -497,6 +497,23 @@ def clean(apply: bool) -> dict:
             "free_gb_after": round(free_after / 2**30, 1), "actions": actions}
 
 
+def _ro_connect(path: Path, timeout: float = 5):
+    """Read-only open of a live WAL db. mode=ro fails (Apple SQLite) once writers deleted -wal/-shm, so fall back
+    to mode=rw + PRAGMA query_only: same data, never writes, and mode=rw never creates a missing db."""
+    uri = Path(path).resolve().as_posix()
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        if con is not None:
+            con.close()
+        con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+
 def card_status(task_id: str, homes: list[Path] | None = None) -> str | None:
     """Status of a Kanban card from this machine's board DBs and sync-shadow replicas."""
     if not re.fullmatch(r"t_[0-9A-Za-z]{4,40}", task_id or ""):
@@ -507,7 +524,7 @@ def card_status(task_id: str, homes: list[Path] | None = None) -> str | None:
         # evidence/ (millions of files, ~2 min per call), which made `kill` hang once per candidate process.
         for db in sorted({*root.glob("*.db"), *root.glob("*/*.db"), *root.glob("boards/*/*.db")}):
             try:
-                con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+                con = _ro_connect(db, timeout=1)
                 row = con.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 con.close()
             except sqlite3.Error:

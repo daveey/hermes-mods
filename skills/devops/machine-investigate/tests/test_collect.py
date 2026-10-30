@@ -78,6 +78,31 @@ def test_card_status_reads_board_replicas(c, tmp_path):
     assert c.card_status("'; drop", [tmp_path / "kb"]) is None
 
 
+def test_card_status_survives_ro_open_failure_and_stays_read_only(c, tmp_path, monkeypatch):
+    (tmp_path / "kb").mkdir()
+    db = sqlite3.connect(tmp_path / "kb/default.db")
+    db.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+    db.execute("INSERT INTO tasks VALUES ('t_done0001', 'done')")
+    db.commit(); db.close()
+    real = sqlite3.connect
+
+    def connect(target, *a, **kw):
+        if "mode=ro" in str(target):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real(target, *a, **kw)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    assert c.card_status("t_done0001", [tmp_path / "kb"]) == "done"
+    con = c._ro_connect(tmp_path / "kb/default.db")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            con.execute("INSERT INTO tasks VALUES ('x', 'y')")
+    finally:
+        con.close()
+    with pytest.raises(sqlite3.OperationalError):
+        c._ro_connect(tmp_path / "nope.db")
+    assert not (tmp_path / "nope.db").exists()
+
+
 def _fill(path: Path, mb: int):
     path.mkdir(parents=True, exist_ok=True)
     (path / "blob").write_bytes(b"x" * mb * 1024 * 1024)

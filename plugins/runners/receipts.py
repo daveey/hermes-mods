@@ -65,11 +65,28 @@ def _names_subject(markdown, names):
     return False
 
 
+def _ro_connect(path, timeout=5):
+    """Read-only open of a live WAL db. mode=ro fails (Apple SQLite) once writers deleted -wal/-shm, so fall back
+    to mode=rw + PRAGMA query_only: same data, never writes, and mode=rw never creates a missing db."""
+    uri = Path(path).resolve().as_posix()
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        if con is not None:
+            con.close()
+        con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+
 def verify_receipt(operation_id, *, store_path, owner_profile, subject_names):
     if not isinstance(operation_id, str) or not OPERATION_ID.match(operation_id):
         return _refuse('invalid_operation_id')
     try:
-        c = sqlite3.connect('file:%s?mode=ro' % Path(store_path), uri=True, timeout=5)
+        c = _ro_connect(store_path, timeout=5)
         try:
             row = c.execute('SELECT namespace, body FROM operations WHERE id=?', (operation_id,)).fetchone()
         finally:
@@ -89,7 +106,7 @@ def verify_receipt(operation_id, *, store_path, owner_profile, subject_names):
         markdown = scope['markdown']
         if scope.get('complete') is not True or not isinstance(markdown, str):
             return _refuse('scope_incomplete')
-        c = sqlite3.connect('file:%s?mode=ro' % Path(store_path), uri=True, timeout=5)
+        c = _ro_connect(store_path, timeout=5)
         try:
             live = c.execute('SELECT state, revision FROM requests WHERE namespace=? AND id=?',
                              (row[0], body['requestId'])).fetchone()

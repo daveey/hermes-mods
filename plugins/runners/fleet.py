@@ -29,12 +29,29 @@ _EPHEMERAL = re.compile(r'^(.+?)[-_]i-[0-9a-f]{8,}(?:-.*)?$')
 _NUMBERED = re.compile(r'^(.+?)-(\d{1,3})$')
 
 
+def _ro_connect(path, timeout=5):
+    """Read-only open of a live WAL db. mode=ro fails (Apple SQLite) once writers deleted -wal/-shm, so fall back
+    to mode=rw + PRAGMA query_only: same data, never writes, and mode=rw never creates a missing db."""
+    uri = Path(path).resolve().as_posix()
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        if con is not None:
+            con.close()
+        con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+
 def live_leases(shadow_dir, now_ms):
     """Live leases from every board replica: [{board, task, title, holder, started_at}]."""
     out = []
     for path in sorted(Path(shadow_dir).glob('*.db')):
         try:
-            db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)
+            db = _ro_connect(path, timeout=1)
         except sqlite3.Error:
             continue
         try:

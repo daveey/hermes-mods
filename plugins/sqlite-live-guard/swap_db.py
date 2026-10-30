@@ -62,9 +62,26 @@ def holders(db: Path) -> list[tuple[int, str, str]]:
     return out
 
 
+def _ro_connect(path, timeout=5):
+    """Read-only open of a live WAL db. mode=ro fails (Apple SQLite) once writers deleted -wal/-shm, so fall back
+    to mode=rw + PRAGMA query_only: same data, never writes, and mode=rw never creates a missing db."""
+    uri = Path(path).resolve().as_posix()
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        if con is not None:
+            con.close()
+        con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+
 def check_replacement(live: Path, replacement: Path) -> str | None:
     try:
-        con = sqlite3.connect(f"file:{replacement}?mode=ro", uri=True)
+        con = _ro_connect(replacement, timeout=5)
         try:
             rows = [r[0] for r in con.execute("PRAGMA integrity_check")]
             if rows != ["ok"]:
@@ -167,7 +184,7 @@ def swap(db: Path, replacement: Path, units: list[str], wait_s: float = 10.0, al
             if db.exists():
                 os.replace(db, keep)
             os.replace(staged, db)
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            con = _ro_connect(db, timeout=5)
             rows = [r[0] for r in con.execute("PRAGMA integrity_check")]
             con.close()
             print(f"swapped: {db} (integrity {rows[0] if rows else '?'}); originals kept at {keep}*")
