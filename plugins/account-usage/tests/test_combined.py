@@ -155,7 +155,18 @@ class Combined(unittest.TestCase):
             base.__code__ = code
         self.assertIs(fast._audited_recovery_base(original, fast._Fingerprints(self.home)), base)
 
+    def test_long_reset_rotation_and_fallback_through_symlink_home(self):
+        # PluginManager registers through its canonical home; execute through
+        # an alias, as happens when a request retains the scratch symlink.
+        alias = self.home / 'home-alias'
+        alias.symlink_to(self.home, target_is_directory=True)
+        self.execution_home = alias
+        self._long_reset_rotation_and_fallback()
+
     def test_selected_and_unselected_long_reset_rotation_and_fallback(self):
+        self._long_reset_rotation_and_fallback()
+
+    def _long_reset_rotation_and_fallback(self):
         import time
         from types import SimpleNamespace
         from run_agent import AIAgent
@@ -170,6 +181,9 @@ class Combined(unittest.TestCase):
                 self.response = SimpleNamespace(headers={'retry-after': '36000'})
         manager = self.load()
         self.assert_active(manager)
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        scope = set_hermes_home_override(str(getattr(self, 'execution_home', self.home)))
+        self.addCleanup(reset_hermes_home_override, scope)
         delivery = patch('hermes_cli.plugins.get_plugin_manager', return_value=manager)
         delivery.start()
         self.addCleanup(delivery.stop)
@@ -214,7 +228,8 @@ class Combined(unittest.TestCase):
                             patch.object(a, '_persist_session'), patch.object(a, '_save_trajectory'), \
                             patch.object(a, '_cleanup_task_resources'), patch.object(pool, '_persist'), \
                             patch('agent.process_bootstrap.OpenAI', return_value=Mock()), \
-                            patch('agent.turn_api_error.interruptible_backoff_sleep') as sleep, \
+                            patch('agent.turn_api_error.interruptible_backoff_sleep',
+                                side_effect=AssertionError('long-reset recovery must not back off')) as sleep, \
                             patch('agent.auxiliary_client.resolve_provider_client', return_value=(fallback, 'test-fallback')), \
                             patch('hermes_cli.model_normalize.normalize_model_for_provider', side_effect=lambda m, p: m), \
                             patch('agent.model_metadata.get_model_context_length', return_value=128000), \

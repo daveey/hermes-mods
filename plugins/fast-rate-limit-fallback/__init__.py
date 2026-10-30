@@ -234,7 +234,7 @@ def register(ctx):
     if getattr(ctx, '_load_abandoned', False):
         return _abandoned(None, started, phases)
     from hermes_constants import get_hermes_home
-    owner = {'home': str(get_hermes_home()), 'state': None, 'cancelled': False, 'failed': False}
+    owner = {'home': str(Path(get_hermes_home()).resolve()), 'state': None, 'cancelled': False, 'failed': False}
     if _seams_ready():
         # Own cleanup after the guards pass but before touching core, so a failed
         # registration leaves no patch and an incompatible core leaves no owner.
@@ -351,7 +351,9 @@ def _install(owner, mark, own=None):
         state = {'owners': {}, 'patches': []}
 
         def enabled():
-            return str(get_hermes_home()) in state['owners'].values()
+            # Discovery may canonicalize a home while a request retains its
+            # symlink spelling. Ownership is directory identity, not spelling.
+            return str(Path(get_hermes_home()).resolve()) in state['owners'].values()
 
         def long_reset(context):
             delay = _provider_reset_delay(context.get('reset_at')) if isinstance(context, dict) else None

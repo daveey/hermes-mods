@@ -26,6 +26,29 @@ interrupts unwind through cleanup without core's pytest guards patching the
 parent. SIGKILL or machine loss cannot guarantee Python cleanup; any remaining
 snapshot is temporary data, not an untracked live-checkout modification.
 
+## Home identity and composition regression
+
+Ownership compares resolved directory paths at registration and request time.
+A symlink spelling of an enabled home is the same owner, not a foreign profile.
+
+`plugins/account-usage/tests/test_combined.py` exercises real PluginManager
+composition and complete conversations with selected and unselected accounts,
+with both compatible-account rotation and endpoint-incompatible provider fallback.
+`test_long_reset_rotation_and_fallback_through_symlink_home` repeats that matrix
+through a real home symlink; `test_selected_and_unselected_long_reset_rotation_and_fallback`
+retains the original path. Both require the final response, exact attempted
+accounts/providers, cooldowns, unchanged selected-account defaults after rotation,
+and no backoff call.
+The backoff stub raises instead of returning a misleading terminal MagicMock.
+
+Failure chain: discovery canonicalized the home but requests retained a symlink
+alias; string-based ownership disabled eager fallback, so an endpoint-incompatible
+pool entry kept core's retry gate open. The original test exposed this on hosts
+whose scratch directory is a symlink, but had no portable explicit alias fixture.
+Canonicalization removes the ownership mismatch; the alias matrix is the
+cross-platform regression guard. Neither selection adapter code nor its peer
+composition fingerprint changes.
+
 ## Verification
 
 - Full suite against the installed core HEAD: 110 passed, including with
