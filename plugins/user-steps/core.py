@@ -1070,6 +1070,8 @@ def retitle_open_steps(session_id: str, reply: str, *, ledger: Optional["Ledger"
     that produced it. Only open, non-canonical-revised steps whose span sits in ``reply`` change; returns ids."""
     lg = ledger or Ledger()
     fixed: list[str] = []
+    # A stored reply carries its asks as directives (t="..."); the quotes around t would blank the very text we read.
+    reply = re.sub(r'::' + DIRECTIVE + r'\{[^{}]*?\bt="((?:[^"\\]|\\.)*)"\}', lambda m: dec(m.group(1)), reply or "")
     with lg.edit(lg.root(session_id)) as d:
         for s in d["steps"]:
             span = str(s.get("verbatim_span") or "")

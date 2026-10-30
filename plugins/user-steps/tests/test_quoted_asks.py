@@ -105,3 +105,16 @@ def test_retitle_open_steps_repairs_a_step_stored_with_the_recommendation_text(t
     texts = {s['id']: s['text'] for s in ledger.read('sess')['steps']}
     assert texts == {'us_x': QUESTION, 'us_y': 'Pick a region'}
     assert core.retitle_open_steps('sess', STATUS_AND_ASK, ledger=ledger) == []
+
+
+def test_retitle_open_steps_reads_a_stored_reply_whose_asks_are_directives(tmp_path):
+    span = "I'd say yes: without the block, they could grant themselves access."
+    stored = STATUS_AND_ASK.replace(span + ' Reply yes or no here.',
+                                    core.directive(['us_x'], 'sess', span + ' Reply yes or no here.'))
+    assert '::user-step{' in stored
+    ledger = core.Ledger(root_dir=tmp_path, db=tmp_path / 'none.db')
+    with ledger.edit(ledger.root('sess')) as d:
+        d['steps'].append({'id': 'us_x', 'text': span, 'kind': 'input', 'verbatim_span': span, 'options': [],
+                           'status': 'open', 'session': 'sess', 'created': 1})
+    assert core.retitle_open_steps('sess', stored, ledger=ledger) == ['us_x']
+    assert ledger.read('sess')['steps'][0]['text'] == QUESTION
