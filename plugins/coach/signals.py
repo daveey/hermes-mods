@@ -589,6 +589,37 @@ def _signal_storm(cur: dict, prof: str, r: dict, at: float, host: str) -> Option
             "fp": fp("gateway", host, prof, "gateway.exit_signal", "storm")}
 
 
+# A supervised start refused by the SAME live owner pid again and again is not a copy still draining (that one
+# leaves within its drain budget): the owner holds the home and the supervisor loops forever (gateway-e2cd786685,
+# a client-spawned gateway beside the mini's KeepAlive job). The core now asks a manual owner to drain; if one
+# owner is still refusing WEDGE_N+ supervised starts WEDGE_S after its first refusal (no gap over WEDGE_S), that
+# handback failed or the owner is not draining: file it as its own defect (own fingerprint, never folded into the
+# open storm card as a comment). Launchd retries every ~10 s, so a real wedge reaches this in ~10 min.
+WEDGE_N, WEDGE_S = 3, 600
+
+
+def _wedged_owner(cur: dict, prof: str, r: dict, at: float, host: str) -> Optional[dict]:
+    owner = r.get("owner_pid")
+    if owner is None:
+        return None
+    seen = cur.setdefault("gw_wedge", {})
+    for key in [k for k, v in seen.items() if not isinstance(v, list) or len(v) != 3 or at - v[1] > WEDGE_S]:
+        seen.pop(key, None)  # owners that stopped refusing; keeps the cursor small
+    key = f"{prof}:{owner}"
+    first, _last, count = seen.get(key) or (at, at, 0)
+    count += 1
+    if count < WEDGE_N or at - first < WEDGE_S:
+        seen[key] = [first, at, count]
+        return None
+    seen.pop(key, None)  # one signal per wedge; the fingerprint dedupes a later one
+    handback = r.get("handback") or "none"
+    return {"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
+            "symptom": f"gateway ({prof}) on {host} supervisor wedged behind a live owner: {count} supervised "
+                       f"starts refused by owner_pid={owner} over {int(at - first) // 60} min (handback {handback})",
+            "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
+            "fp": fp("gateway", host, prof, "gateway.start_refused", "wedged-owner")}
+
+
 def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
     out = []
     for prof, h in homes(home):
@@ -620,6 +651,8 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                             "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
                             "fp": fp("gateway", host, prof, "gateway.exit_signal", "storm"),
                             "comment_open_card": True})
+                if (sig := _wedged_owner(cur, prof, r, at, host)) is not None:
+                    out.append(sig)
                 continue
             if tag in ("gateway.exit_signal", "gateway.start_refused"):
                 if (sig := _signal_storm(cur, prof, r, at, host)) is not None:
