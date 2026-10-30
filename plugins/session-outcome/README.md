@@ -28,6 +28,9 @@ the outcome and feeds core the two things only plugins know: open user decisions
   any error or a timeout → None (core falls back to its heuristic). Verdicts are cached per (session, text).
   The judge reads the whole reply up to 12,000 characters, else its head and tail around an omission marker:
   never only the tail, which hides a long report's answer and gets a finished report judged NO.
+  Things the reply only describes as happening later on their own (a cron's next runs, a card that finishes by
+  itself) count as YES when the assistant owes nothing more; only the assistant's own promise to do more or report
+  later is NO. Without that rule a full answer to "why is it not green?" that named the chat's cron got NO every time.
 - **`pre_final_gate`** (buffered): when the turn made no `session_outcome` call, it asks core
   `derive_outcome(sid, ignore_live_turn=True, pending_reply=<the candidate reply>)`. Only
   `unresolved{no_summary}` holds the reply, once, with a request for the call. Core's own precedence decides, so
@@ -90,5 +93,10 @@ deps, so run it with the Hermes venv:
 uv run --with pytest python -m pytest -q -p no:cacheprovider plugins/session-outcome/tests
 ~/.hermes/hermes-agent/venv/bin/python -m pytest -q -p no:cacheprovider plugins/session-outcome/tests
 ```
+
+`tests/test_judge_live.py` replays the real prompt on the real pool fast tier (3 runs per case, all must agree):
+replies that were misjudged (the scheduled-cron answer) plus NO cases (promises to report later, a question back, an
+approval ask, a diagnosis with no fix). It makes model calls, so it is opt-in: `SESSION_OUTCOME_LIVE_JUDGE=1`. The
+calls run in a child process, because under pytest core refuses to read the real auth store the pool needs.
 
 Untested: core calling the provider and judge from its own refresh triggers (turn end, notice, card change).

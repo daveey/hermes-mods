@@ -367,10 +367,16 @@ JUDGE_SYSTEM = (
     "Answer YES if the message delivers what was asked: it gives the answer, or reports what was done or found and "
     "the result. A complete answer, explanation, list of advice or report is YES. Caveats, limits, notes on what was "
     "not changed and optional offers of more help do not make it NO.\n"
-    "Answer NO if the work is not finished: mid-task status, a promise to report later, a bare acknowledgement, an "
-    "error with no result, a question the user must answer before the work can go on, or a request that the user "
-    "approve, confirm or act before the work can finish.\n"
+    "Things the message only describes as happening later on their own (a scheduled job's next runs, a card or cron "
+    "that finishes by itself, a status that changes later) are not unfinished work: if the assistant owes nothing "
+    "more on the request, answer YES.\n"
+    "Answer NO if the work is not finished: mid-task status, a promise that the assistant will do more or report "
+    "later, a bare acknowledgement, an error with no result, a question the user must answer before the work can go "
+    "on, or a request that the user approve, confirm or act before the work can finish.\n"
     "Reply with exactly YES or NO.")
+# The scheduled-later rule: a full answer to "why is it not green?" that named the chat's cron and its next runs got
+# NO 5 times in 5 (and NO with only its first two paragraphs) as "a promise to report later"; asked to reason first,
+# the same model said YES. tests/test_judge_live.py replays it.
 # The judge's request context: the user's latest message, capped. Without it the judge read a finished answer to a
 # question ("what should I ask to vet X?" -> a list of questions) as "a question" and a report with caveats as
 # mid-task, and said NO on both.
