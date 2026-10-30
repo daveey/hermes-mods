@@ -118,3 +118,48 @@ test('courier task_comment posts to the task gateway as the sender; task_list fi
   const list = await m.performRequest({ action: 'task_list', args: { status: 'running,blocked' } }, 'local', conns)
   assert.deepEqual(list.tasks.map(t => t.ref).sort(), ['@task:bb@mac-mini/t_bbbb2222', '@task:default/t_aaaa1111'])
 })
+
+test('courier task_read: a gateway that errors (503 draining) is reported unreachable+retryable, never "not found"', async () => {
+  const base = fakeApi()
+  const draining = new Set(['mac-mini'])
+  const api = async req => {
+    if (draining.has(req.connectionId) && req.path.startsWith('/api/plugins/kanban/')) {
+      throw new Error('503: {"error":"gateway_not_ready","state":"ready"}')
+    }
+    return base(req)
+  }
+  const m = await load({ state, connections: async () => conns }, api)
+  const r1 = await m.performRequest({ action: 'task_read', args: { target: '@task:bb@mac-mini/t_bbbb2222' } }, 'local', conns)
+  assert.equal(r1.ok, false)
+  assert.equal(r1.retryable, true)
+  assert.doesNotMatch(r1.error, /not found/)
+  assert.match(r1.error, /could not read task t_bbbb2222: lookup failed on mac-mini: 503/)
+
+  // bare id: other gateways answered 404, the draining one errored -> still unknown, not "not found anywhere"
+  const r2 = await m.performRequest({ action: 'task_read', args: { target: 't_bbbb2222' } }, 'local', conns)
+  assert.equal(r2.ok, false)
+  assert.equal(r2.retryable, true)
+  assert.doesNotMatch(r2.error, /not found on any connected gateway/)
+
+  // once the gateway is back the same ref reads fine; a real miss on healthy gateways stays "not found"
+  draining.clear()
+  const r3 = await m.performRequest({ action: 'task_read', args: { target: '@task:bb@mac-mini/t_bbbb2222' } }, 'local', conns)
+  assert.equal(r3.ok, true)
+  const r4 = await m.performRequest({ action: 'task_read', args: { target: 't_zzzz9999' } }, 'local', conns)
+  assert.equal(r4.ok, false)
+  assert.equal(r4.retryable, undefined)
+  assert.match(r4.error, /not found on any connected gateway/)
+})
+
+test('courier task_read: a failed board listing after a default-board miss is unknown, not "not found"', async () => {
+  const base = fakeApi()
+  const api = async req => {
+    if (req.connectionId === 'mac-mini' && req.path === '/api/plugins/kanban/boards') throw new Error('timeout after 15000ms')
+    return base(req)
+  }
+  const m = await load({ state, connections: async () => conns }, api)
+  const r = await m.performRequest({ action: 'task_read', args: { target: 'mac-mini:t_bbbb2222' } }, 'local', conns)
+  assert.equal(r.ok, false)
+  assert.equal(r.retryable, true)
+  assert.match(r.error, /board list unavailable/)
+})
