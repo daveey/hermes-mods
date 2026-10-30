@@ -191,6 +191,24 @@ def parse_env_tags(out: str) -> dict[int, dict]:
     return tags
 
 
+def valid_owner(value: str) -> str:
+    """`t_<hex>[@host]` or ''. The one validator for HERMES_OWNER_CARD values (service-owner-guard reuses it)."""
+    return value if re.fullmatch(r"t_[0-9a-f]+(?:@[A-Za-z0-9._-]+)?", value or "") else ""
+
+
+def read_owner_md(directory) -> tuple[str, str] | None:
+    """(card, path) from `<directory>/OWNER.md` whose first line is `card: t_<hex>[@host]`, else None.
+    The one OWNER.md parser (service-owner-guard sends this function's source to remote hosts)."""
+    path = Path(directory) / "OWNER.md"
+    try:
+        with path.open() as f:
+            first = f.readline(4096)
+    except OSError:
+        return None
+    match = re.match(r"^card: (t_[0-9a-f]+)(@[A-Za-z0-9._-]+)?(?:\s|$)", first)
+    return (match[1] + (match[2] or ""), str(path)) if match else None
+
+
 def owner(table: dict, tags: dict, pid: int) -> dict:
     """Tags inherited from the nearest tagged ancestor. A GUI app started from a worker keeps the dead
     worker's card id for ever, so card ids count only inside a hermes process tree."""
@@ -205,23 +223,15 @@ def owner(table: dict, tags: dict, pid: int) -> dict:
         agent.update(t)
     # Explicit service ownership is independent of inherited worker tags.
     for q in c:
-        explicit = tags.get(q, {}).get("HERMES_OWNER_CARD", "")
-        if re.fullmatch(r"t_[0-9a-f]+(?:@[A-Za-z0-9._-]+)?", explicit):
+        explicit = valid_owner(tags.get(q, {}).get("HERMES_OWNER_CARD", ""))
+        if explicit:
             agent.update(HERMES_OWNER_CARD=explicit, owner_source="env")
             return agent
     for q in c:
         cwd = table[q].get("cwd")
-        if not cwd:
-            continue
-        try:
-            with (Path(cwd) / "OWNER.md").open() as f:
-                first = f.readline(4096)
-        except OSError:
-            continue
-        match = re.match(r"^card: (t_[0-9a-f]+)(@[A-Za-z0-9._-]+)?(?:\s|$)", first)
-        if match:
-            agent.update(HERMES_OWNER_CARD=match[1] + (match[2] or ""),
-                         owner_source=str(Path(cwd) / "OWNER.md"))
+        found = read_owner_md(cwd) if cwd else None
+        if found:
+            agent.update(HERMES_OWNER_CARD=found[0], owner_source=found[1])
             break
     if "owner_source" not in agent and agent:
         agent["owner_source"] = "env"
