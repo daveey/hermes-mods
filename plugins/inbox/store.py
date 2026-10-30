@@ -110,6 +110,24 @@ _JUNK_KEY = re.compile(r"(?:^|[:_./-])(?:TEST|E2E|SCRATCH|PROBE|SMOKE)(?:[:_./-]
 _TEST_HANDLE = re.compile(r"@(?:[\w.\-]*scratch|(?:[\w.\-]*[_.\-])?test\d*(?![A-Za-z]))", re.I)
 
 
+def _ro_connect(path: Path, timeout: float = 5):
+    """Read-only open of a live WAL db. mode=ro fails (Apple SQLite) once writers deleted -wal/-shm, so fall back
+    to mode=rw + PRAGMA query_only: same data, never writes, and mode=rw never creates a missing db."""
+    import sqlite3
+    uri = Path(path).resolve().as_posix()
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=timeout)
+        con.execute("select 1 from sqlite_master limit 1")
+        return con
+    except sqlite3.OperationalError:
+        if con is not None:
+            con.close()
+        con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+
 def card_human_request(task_id: str):
     """The structured human_request of a Kanban card (dict), or None. Read-only; never raises."""
     import sqlite3
@@ -119,7 +137,7 @@ def card_human_request(task_id: str):
     except Exception:
         path = os.environ.get("HERMES_KANBAN_DB") or str(Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "kanban.db")
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        conn = _ro_connect(Path(path), timeout=5)
     except sqlite3.Error:
         return None
     try:

@@ -129,6 +129,60 @@ def test_card_human_request_reads_a_real_board(tmp_path, monkeypatch):
     assert st.card_human_request("missing") is None
 
 
+def _wal_board_without_sidecars(tmp_path):
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    c = sqlite3.connect(db)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("create table tasks (id text primary key, human_request text)")
+    c.execute("insert into tasks values ('t1', ?)", (json.dumps({"interaction": "credential", "why_human": "w", "action": "a"}),))
+    c.commit()
+    c.close()  # the last close checkpoints and deletes the sidecars, as Hermes writers do
+    for suffix in ("-wal", "-shm"):
+        Path(str(db) + suffix).unlink(missing_ok=True)
+    return db
+
+
+def test_card_human_request_reads_a_wal_board_without_sidecars(tmp_path, monkeypatch):
+    st = load("_la_wal")
+    db = _wal_board_without_sidecars(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    assert st.card_human_request("t1")["interaction"] == "credential"
+
+
+def test_card_human_request_falls_back_when_a_plain_ro_open_fails(tmp_path, monkeypatch):
+    # Apple's SQLite (the MacBook) refuses mode=ro on a WAL db whose -wal/-shm are gone; Linux's opens it.
+    # Simulate that refusal so the fallback is proven on every host, not only where the bug bites.
+    import sqlite3
+    st = load("_la_wal_fallback")
+    db = _wal_board_without_sidecars(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    real = sqlite3.connect
+
+    def connect(target, *a, **kw):
+        if "mode=ro" in str(target):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real(target, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    assert st.card_human_request("t1") == {"interaction": "credential", "why_human": "w", "action": "a"}
+    monkeypatch.setattr(sqlite3, "connect", real)
+    c = real(db)
+    assert c.execute("select count(*) from tasks").fetchone()[0] == 1  # nothing written
+    c.close()
+
+
+def test_card_human_request_never_creates_a_missing_board(tmp_path, monkeypatch):
+    st = load("_la_missing_board")
+    missing = tmp_path / "nope" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(missing))
+    assert st.card_human_request("t1") is None
+    assert not missing.exists()
+    missing.parent.mkdir()
+    assert st.card_human_request("t1") is None
+    assert not missing.exists()
+
+
 # -- 3. test markers inside handles --------------------------------------------------------------
 
 @pytest.mark.parametrize("title", [
