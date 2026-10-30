@@ -58,6 +58,36 @@ def _code_fingerprint(code):
 def _cache_key(relative, digest):
     import sys
     return f'{_FINGERPRINT_VERSION}|{sys.implementation.cache_tag}|{sys.version}|{relative}|{digest}'
+
+
+def audited_digests(value):
+    """A pin is one audited sha256 or a non-empty list of them (one per audited core
+    version, so mixed-core rollouts keep working). Anything else is None: fail closed."""
+    digests = [value] if isinstance(value, str) else value
+    if not isinstance(digests, list) or not digests or not all(isinstance(d, str) for d in digests):
+        return None
+    return frozenset(digests)
+
+
+def check_pins(root, expected):
+    """{relative: matched digest} when every pinned core file is an audited version."""
+    import hashlib
+    from pathlib import Path
+    if not isinstance(expected, dict) or not expected:
+        raise SelectionRejected('Account selection compatibility changed; re-audit the execution plugin')
+    matched = {}
+    for relative, value in expected.items():
+        accepted = audited_digests(value)
+        try:
+            actual = hashlib.sha256((Path(root) / relative).read_bytes()).hexdigest()
+        except OSError:
+            actual = None
+        if accepted is None or actual not in accepted:
+            raise SelectionRejected('Account selection compatibility changed; re-audit the execution plugin')
+        matched[relative] = actual
+    return matched
+
+
 _IDENTITY_HEADERS = frozenset({'authorization', 'x-api-key', 'chatgpt-account-id',
     'x-openai-internal-codex-residency', 'openai-organization', 'openai-project'})
 
@@ -194,7 +224,10 @@ def codex_factory(original):
         kwargs.update(api_key=snapshot.token, base_url=snapshot.base_url,
                       max_retries=0, default_headers=headers)
         client = agent._create_openai_client(kwargs, reason=reason, shared=False)
-        actual = {str(k).lower(): v for k, v in client.default_headers.items()}
+        # The wire headers, merged the way the SDK builds a request: auth first, then
+        # default headers (openai>=2.5x keeps Authorization out of default_headers).
+        actual = {str(k).lower(): v for k, v in (getattr(client, 'auth_headers', None) or {}).items()}
+        actual.update({str(k).lower(): v for k, v in client.default_headers.items()})
         expected = {str(k).lower(): v for k, v in codex_cloudflare_headers(snapshot.token, base_url=snapshot.base_url).items()}
         conflicts = actual.get('authorization') != f'Bearer {snapshot.token}'
         conflicts |= any(actual.get(k) != v for k, v in expected.items() if k in identity_headers)
@@ -744,16 +777,14 @@ class ExecutionIntegration:
         if _unloaded:
             import gc
             gc.collect()  # release completed exception tracebacks from a prior unload
-        import hashlib
         import json
         import inspect
         from pathlib import Path
         from agent import client_lifecycle, turn_api_call, agent_runtime_helpers, chat_completion_helpers
         root = Path(client_lifecycle.__file__).resolve().parents[1]
-        expected = json.loads(Path(__file__).with_name('execution-compatibility.json').read_text())
-        for relative, digest in expected.items():
-            if hashlib.sha256((root / relative).read_bytes()).hexdigest() != digest:
-                raise SelectionRejected('Account selection compatibility changed; re-audit the execution plugin')
+        # Each pin lists every audited version of that file; `expected` maps a file
+        # to the digest this core actually has (one of the audited ones).
+        expected = check_pins(root, json.loads(Path(__file__).with_name('execution-compatibility.json').read_text()))
         self.call_code = turn_api_call.perform_api_call.__code__
         targets = [(client_lifecycle.ClientLifecycleMixin, '_create_request_anthropic_client', anthropic_factory),
                    (client_lifecycle.ClientLifecycleMixin, '_create_request_openai_client', codex_factory),
