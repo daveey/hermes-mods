@@ -263,6 +263,8 @@ Countermeasures:
 
 ## Pitfalls
 
+- For synthetic recurring occurrences, do not allocate identities with `floor(now) - counter`: a one-second scheduling gap cancels a one-step counter increment and reuses a completed slot. Anchor offsets to an immutable per-job timestamp, keep slots inside grace, and exercise exact 0/1/2-second clock advances through the real dedup path. A completed-occurrence warning plus a missing downstream failure stamp can be correct scheduler dedup acting on a broken fixture, not a timeout defect.
+
 - For native-process ownership tests, `Popen` returning does not guarantee that psutil can already observe nonempty argv: the close-on-exec handshake can precede argv publication. Synchronize on the raw argv precondition, not by retrying the ownership verdict (which could mask a parser defect). For a bounded Linux scheduling-gap reproduction, have a controller inspect only the test parent's newborn children, SIGSTOP those with empty `/proc/<pid>/cmdline`, then SIGCONT after a short hold; always resume stopped children in `finally`. An untargeted duty cycle may miss this narrow window, so record baseline failures and fixed passes separately.
 
 - For stat-only cache fingerprints, distinguish semantic inputs from generated metadata: creating an ignored `__pycache__` still moves its parent's mtime. Reproduce at the exact record-write/read boundary by creating the ignored directory and explicitly moving the parent mtime, while retaining real plugin/config invalidation checks. Check a reported CI run's head ancestry before treating a newly delivered flake notice as a post-fix recurrence. A starvation controller must pause all descendants, not only the runner's process group: per-file runners may create new sessions.
