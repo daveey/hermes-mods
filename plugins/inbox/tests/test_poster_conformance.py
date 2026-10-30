@@ -22,7 +22,7 @@ import ask_contract  # noqa: E402
 import poster_scan  # noqa: E402
 
 REPO = HERE.parents[1]
-REFUSED_BY_DESIGN = {"hermes-hub", "hermes-mail", "bsky-cron-error"}
+REFUSED_BY_DESIGN = {"hermes-hub"}
 
 
 def roots():
