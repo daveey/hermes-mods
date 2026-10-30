@@ -174,3 +174,30 @@ def test_session_adoption_persists_turn_for_later_detector(store):
     assert out["adopted"]
     assert file(b, store, runner)["card"] == "t_abcdef05"
     assert not runner.creates()
+
+
+def _occurrence(at=NOW):
+    d = defect("gateway", "gateway (default) on macbook supervisor restarted into a live gateway", source="signal",
+               quote="", session_id=None, at=at, comment_open_card=True)
+    d["fingerprint"] = "gateway-cc28b19bca"
+    return d
+
+
+def test_supervised_refusal_comments_on_the_open_fix_card_instead_of_filing(store):
+    sh.LaneState(store.root).update("gateway-cc28b19bca", status="approved", card="t_abcdef10", fix_card="t_abcdef11",
+                                  component="gateway", symptom="restart storm")
+    runner = Runner()
+    out = file(_occurrence(), store, runner)
+    assert out["card"] == "t_abcdef11" and out["action"] == "skip"
+    comments = [argv for argv, _ in runner.calls if "comment" in argv]
+    assert len(comments) == 1 and comments[0][comments[0].index("comment") + 1] == "t_abcdef11"
+    assert runner.creates() == []
+    assert ev(store, "selfheal_occurrence_comment")[-1]["ok"] is True
+
+
+def test_supervised_refusal_after_the_fix_is_a_recurrence_not_a_comment(store):
+    sh.record_event("fixed", "gateway-cc28b19bca", "t_abcdef11", store=store, now=NOW - 30 * 86400)
+    runner = Runner()
+    out = file(_occurrence(), store, runner)
+    assert out["action"] == "filed"
+    assert not [argv for argv, _ in runner.calls if "comment" in argv]

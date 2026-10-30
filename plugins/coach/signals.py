@@ -610,6 +610,17 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                             "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
                             "fp": fp("gateway", host, prof, tag, str(r.get("reason") or ""))})
                 continue
+            if tag == "gateway.start_refused" and r.get("owner_alive") is True and r.get("external_supervisor"):
+                # The service manager restarted into a gateway still draining (its main pid ended first):
+                # the restart-storm defect itself, so it goes to that lane at once and, while its card is open,
+                # lands there as a comment instead of a new card (gateway-cc28b19bca).
+                out.append({"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
+                            "symptom": f"gateway ({prof}) on {host} supervisor restarted into a live gateway: start "
+                                       f"refused by owner_pid={r.get('owner_pid')} ({r.get('reason')})",
+                            "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
+                            "fp": fp("gateway", host, prof, "gateway.exit_signal", "storm"),
+                            "comment_open_card": True})
+                continue
             if tag in ("gateway.exit_signal", "gateway.start_refused"):
                 if (sig := _signal_storm(cur, prof, r, at, host)) is not None:
                     out.append(sig)
@@ -725,7 +736,7 @@ def to_defect(s: dict) -> dict:
          "quote": s.get("quote") or ""}
     if (s.get("count") or 1) > 1:
         d["details"] = f"(seen {s['count']}x this pass)\n" + d["details"]
-    for k in ("profile", "monitor", "kanban"):
+    for k in ("profile", "monitor", "kanban", "comment_open_card"):
         if s.get(k):
             d[k] = s[k]
     return d

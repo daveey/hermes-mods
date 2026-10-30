@@ -1980,6 +1980,21 @@ def _corruption_comment(d: dict, st: dict, store, runner=None) -> dict:
             "why": "existing SQLite incident" if rc == 0 else "incident comment failed"}
 
 
+def _open_card_comment(d: dict, st: dict, store, runner=None) -> dict:
+    """A signal flagged ``comment_open_card`` (one occurrence of a defect whose card is open): add it there."""
+    card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card")) or st.get("card")
+    if not card:
+        return {"action": "skip", "why": "no open card"}
+    argv = ["hermes", "kanban"] + (["--board", st["board"]] if st.get("board") else [])
+    body = (f"Occurrence on {d.get('host') or '?'}: {d.get('symptom') or ''}\n"
+            f"{str(d.get('details') or '')[-1500:]}")
+    rc, out, err = _run(argv + ["comment", card, body], runner)
+    store.log({"event": "selfheal_occurrence_comment", "fingerprint": d["fingerprint"], "card": card,
+               "ok": rc == 0, "error": (err or out)[-200:] if rc else None})
+    return {"action": "skip" if rc == 0 else "error", "card": card,
+            "why": "occurrence added to the open card" if rc == 0 else "occurrence comment failed"}
+
+
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
                 owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
@@ -2065,6 +2080,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         if (d.get("incident") and m == "live" and hub and not st.get("suppressed")
                 and (st.get("snooze_until") or 0) <= now and st.get("status") in ("filed", "approved", "proposed")):
             return _corruption_comment(d, st, store, runner)
+        if (d.get("comment_open_card") and m == "live" and hub and not st.get("suppressed")
+                and (st.get("snooze_until") or 0) <= now and st.get("status") in ("filed", "approved", "proposed")):
+            return _open_card_comment(d, st, store, runner)
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
         return {"action": "skip", "why": dec["why"]}
     if m == "live" and hub:

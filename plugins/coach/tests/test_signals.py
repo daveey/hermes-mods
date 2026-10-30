@@ -671,6 +671,26 @@ def test_start_refused_by_a_dead_owner_files(home):
     assert "already_running" in gw[0]["symptom"]
 
 
+def test_supervised_start_refused_by_live_owner_goes_to_the_storm_lane_at_once(home):
+    """One refusal by a LIVE owner under --external-supervisor is the restart-storm defect itself (the supervisor's
+    main pid ended before the draining gateway): it files on the storm fingerprint without waiting for 3, and is
+    flagged so an open card gets it as a comment (gateway-cc28b19bca)."""
+    (home / "logs" / "gateway-exit-diag.log").write_text("")
+    from datetime import datetime, timezone
+    row = {"ts": datetime.fromtimestamp(NOW - 60, timezone.utc).isoformat(), "tag": "gateway.start_refused",
+           "level": "info", "pid": 360, "reason": "host_refused", "owner_pid": 97265, "owner_alive": True,
+           "external_supervisor": True}
+    with open(home / "logs" / "gateway-exit-diag.log", "a") as f:
+        f.write(json.dumps(row) + "\n")
+    sigs = sg.collect(home, {}, "macbook", NOW)
+    gw = kinds(sigs, "gateway")
+    assert len(gw) == 1
+    assert gw[0]["fp"] == sg.fp("gateway", "macbook", "default", "gateway.exit_signal", "storm")
+    assert "supervisor restarted into a live gateway" in gw[0]["symptom"]
+    d = sg.to_defect(gw[0])
+    assert d["comment_open_card"] is True
+
+
 def test_signals_and_refused_starts_share_one_restart_storm(home):
     """3+ bounces or refused starts within 10 min on one host+profile is a restart storm: one card."""
     (home / "logs" / "gateway-exit-diag.log").write_text("")
