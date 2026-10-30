@@ -82,7 +82,7 @@ _CANT = re.compile(
 _HOWTO_ASKED = re.compile(
     r"\bhow (?:do|can|would|should|could|to|am i supposed)\b|\bwalk me through\b|\bsteps?\b|\binstructions?\b|"
     r"\bshow me how\b|\bteach me\b|\bwhat should i do\b", re.I)
-_CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
+_CARD_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")  # legacy 8-hex and current 16-hex ids
 # worker handoff leftovers that point at David
 _LEFTOVER = re.compile(
     r"\bdavid'?s (call|decision|choice)\b|\bup to david\b|\bdavid (should|must|needs to|will need to|can)\b"

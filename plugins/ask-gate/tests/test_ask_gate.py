@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from conftest import FIX, llm_returning
+from conftest import FIX, HERE, llm_returning
 
 GOOD = FIX["good"]
 
@@ -641,3 +641,14 @@ def test_linked_cards_include_cards_subscribed_to_the_chat(tmp_path, gate):
     core = gate.core
     ids = [x["id"] for x in core.linked_cards("chat", db_paths=[db])]
     assert ids == ["t_sub", "t_own"]
+
+
+def test_card_ids_match_current_16_hex_ids():
+    """Board ids are now t_ + 16 hex (t_01a18b22ba05938e); the 8-hex-only pattern found none of them, so the
+    deterministic live-status check never saw a current card (found while fixing self-heal agent-31a66d274a)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ask_gate_core_ids", HERE / "core.py")
+    core = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core)
+    assert core.card_ids("see t_01a18b22ba05938e and t_b0192d39, not t_01a18b22ba05938e9") == [
+        "t_01a18b22ba05938e", "t_b0192d39"]
