@@ -39,7 +39,9 @@ OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:\[Message from another Hermes session(?:\s|\])|\[chat-closeout\]|"
     r"⏸\ufe0f?\s+\[[^\]\n]+\]\s+(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
-    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|You've reached the maximum|[✔✓✗✖⚠] )")
+    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum|[✔✓✗✖⚠] )")
+# `[coach]` nudges are stored as user-role turns but are the coach's own text (agent-3ba1979f34): whether the nudge
+# fixed the reply is judged by its reply_nudge_outcome (signals.collect_coach), never by the complaint backstop.
 # Plugin-appended blocks that are not the user's words.
 TRAILER_RE = re.compile(r"\n?\s*(?:\[user-steps\]|--- Attached Context ---|Session link\(s\) @session).*", re.S)
 
@@ -742,6 +744,57 @@ def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = Non
             c["waiting" if now - t <= HANDOFF_GRACE_S else "no_outcome"] += 1
     c["filed"] = c["still_handed_off"] + c["no_outcome"]
     return c
+
+
+# reply_check rules whose nudges get a reply_nudge_outcome (same as signals.OUTCOME_RULES).
+OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
+                 "credit_ask", "laptop_job")
+
+
+def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
+    """reply_nudges per rule over `days`, by their reply_nudge_outcome (agent-3ba1979f34): resolved (not filed),
+    still_failing / no_outcome (filed by signals.collect_coach), waiting (inside the grace window), untracked (a
+    non-handoff nudge from a backend on the old plugin, no `outcome` marker: never filed). For `status`: a rule whose
+    nudges never get outcomes, or never resolve, shows here."""
+    root = Path(root) if root is not None else coach_root()
+    now = time.time() if now is None else now
+    since = now - days * 86400
+    nudges, outcomes = [], []
+    try:
+        with (root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if '"reply_nudge' not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("rule") not in OUTCOME_RULES or float(r.get("ts") or 0) < since:
+                    continue
+                (nudges if r.get("event") == "reply_nudge" else
+                 outcomes if r.get("event") == "reply_nudge_outcome" else []).append(r)
+    except OSError:
+        pass
+    out: dict = {}
+    for n in nudges:
+        rule = n["rule"]
+        c = out.setdefault(rule, {"nudges": 0, "resolved": 0, "still_failing": 0, "no_outcome": 0, "waiting": 0,
+                                  "untracked": 0, "filed": 0})
+        c["nudges"] += 1
+        t = float(n.get("ts") or 0)
+        o = next((o for o in outcomes if o.get("session_id") == n.get("session_id") and o.get("rule") == rule
+                  and not (n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"])
+                  and -5 <= float(o.get("ts") or 0) - t <= HANDOFF_GRACE_S), None)
+        if o is not None:
+            outcomes.remove(o)
+            k = "resolved" if o.get("resolved") is True else "still_failing"
+        elif rule != "handoff" and not n.get("outcome"):
+            k = "untracked"
+        else:
+            k = "waiting" if now - t <= HANDOFF_GRACE_S else "no_outcome"
+        c[k] += 1
+        c["filed"] = c["still_failing"] + c["no_outcome"]
+    return out
 
 
 def coach_root() -> Path:
@@ -2691,6 +2744,7 @@ def main(argv=None) -> int:
                                            for k, v in st.items()},
                           "held_total": sum(len(v.get("held") or []) for v in st.values()),
                           "handoff_nudges": handoff_nudge_counts(),
+                          "nudges": nudge_counts(),
                           "deploy_grace_hours": deploy_grace_s() / 3600}, indent=1))
     return 0
 

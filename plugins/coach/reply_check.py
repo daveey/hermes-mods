@@ -1149,6 +1149,38 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
     return {"p": v["handoff"], "resolved": v["handoff"] < th, "evidence": v.get("evidence") or "", "judged": True}
 
 
+def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
+                  threshold: float = 0.8, thresholds: Optional[dict] = None,
+                  wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
+                  human_asks: Optional[Callable[[], list]] = None) -> dict:
+    """After a nudge of any rule: does the REVISED final reply (with the whole turn's tool log, revision included)
+    still trip the same rule? Re-runs check() limited to that rule, same judge and thresholds (agent-3ba1979f34).
+    Returns {"p", "resolved", "evidence", "judged"}; resolved=None when the judge gave no usable verdict or the check
+    failed (the self-heal collector then files, as it would without an outcome)."""
+    if rule == "handoff":
+        return handoff_outcome(reply, user_ask, tool_log, llm, threshold=threshold, thresholds=thresholds)
+    seen: dict = {"called": False, "v": None}
+
+    def judge(system: str, prompt: str) -> str:
+        seen["called"] = True
+        raw = llm(system, prompt)
+        seen["v"] = parse_verdict(raw)
+        return raw
+    try:
+        hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,
+                    wake=wake, kanban_down=kanban_down, human_asks=human_asks)
+    except Exception:
+        return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
+    if hit:
+        return {"p": hit["p"], "resolved": False, "evidence": hit.get("evidence") or "", "judged": seen["called"]}
+    if seen["called"] and not seen["v"]:
+        return {"p": None, "resolved": None, "evidence": "judge gave no verdict", "judged": True}
+    v = seen["v"] or {}
+    return {"p": float(v.get(rule) or 0.0), "resolved": True,
+            "evidence": (v.get("evidence") if seen["called"] else "") or f"{rule} no longer fires",
+            "judged": seen["called"]}
+
+
 def rule_threshold(rule: str, verdict: dict, thresholds: dict, default: float) -> float:
     """The threshold a verdict is held to: report_only uses its second-opinion threshold only when the strong model
     scored it, otherwise report_only_screen."""

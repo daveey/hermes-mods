@@ -21,8 +21,8 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               reason class; `cause: unrecorded` = an exit path with no cause note); a `gateway.exit_signal`
               (unplanned SIGTERM bounce) or `gateway.start_refused` (second start refused next to a live
               gateway) only as a storm: 3+ in 10 min per profile; a refusal by a dead owner pid always;
-- coach       coach `fixloop_card` (2nd confirmed failure of a fix) and handoff `reply_nudge` events whose
-              `reply_nudge_outcome` says the revised reply still hands off (or none came within 15 min).
+- coach       coach `fixloop_card` (2nd confirmed failure of a fix) and reply_check `reply_nudge` events (any
+              rule) whose `reply_nudge_outcome` says the revised reply still fails (or none came within 15 min).
 Profiles (<home>/profiles/*) are swept too, except the coach log, which lives in <home>/coach only.
 
 Every collector reads from a cursor (<home>/coach/signals-cursor.json: byte offsets + inode per log, last seen
@@ -849,22 +849,32 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
     return out
 
 
-HANDOFF_GRACE_S = 15 * 60  # a handoff nudge waits this long for its reply_nudge_outcome before it files anyway
+HANDOFF_GRACE_S = 15 * 60  # a nudge waits this long for its reply_nudge_outcome before it files anyway
+# reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
+OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
+                 "credit_ask", "laptop_job")
+NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}
 
 
 def _handoff_signal(r: dict, why: str) -> dict:
     ev = str(r.get("evidence") or "")
+    rule = r.get("rule") or "handoff"
+    what = NUDGE_WHAT.get(rule) or f"agent's revised reply still failed the coach {rule} check"
+    reply = str(r.get("reply") or "")
     return {"kind": "coach", "component": "agent", "at": float(r.get("ts") or 0),
             "session_id": r.get("session_id") or "",
-            "symptom": f"agent handed the user a step it could do itself: {ev[:120]}",
-            "details": f"coach reply_check handoff nudge (p={r.get('p')}): {ev}; {why}"[:1500],
-            "fp": fp("agent", "handoff", r.get("session_id") or "")}
+            "symptom": f"{what}: {ev[:120]}",
+            "details": (f"coach reply_check {rule} nudge (p={r.get('p')}): {ev}; {why}"
+                        + (f"; revised reply: {reply}" if reply else ""))[:1500],
+            "fp": fp("agent", rule, r.get("session_id") or "")}
 
 
 def _outcome_matches(n: dict, o: dict) -> bool:
     """The reply_nudge_outcome `o` judges the revision of nudge `n`: same session, same draft when both carry one,
     and logged within the grace window after the nudge."""
     if (o.get("session_id") or "") != (n.get("session_id") or ""):
+        return False
+    if (o.get("rule") or "handoff") != (n.get("rule") or "handoff"):
         return False
     if n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"]:
         return False
@@ -873,10 +883,12 @@ def _outcome_matches(n: dict, o: dict) -> bool:
 
 
 def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
-    """fixloop_card events file at once. A handoff reply_nudge is the guard WORKING (the agent was sent back to fix
-    its reply), so it files only when its reply_nudge_outcome says the revised reply still hands off, or when no
-    outcome arrived within HANDOFF_GRACE_S (crash, a host on the old plugin): a real failure is never lost. Nudges
-    still waiting for an outcome live in cur["coach_handoff_pending"] across passes."""
+    """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
+    agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
+    fails the same rule, or when no outcome arrived within HANDOFF_GRACE_S (crash, a lost continuation): an ignored
+    nudge is never lost. A non-handoff nudge without the `outcome` marker comes from a backend still on the old
+    plugin, where no outcome will ever come: not filed (handoff nudges always were). Nudges still waiting for an
+    outcome live in cur["coach_handoff_pending"] across passes."""
     out = []
     pending: List[dict] = list(cur.get("coach_handoff_pending") or [])
     for ln in read_new(home / "coach" / "log.jsonl", cur, "coach", now):
@@ -889,6 +901,7 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
         at = float(r.get("ts") or now)
         if at < now - BACKFILL_S:
             continue
+        rule = r.get("rule")
         if r.get("event") == "fixloop_card":
             issue = str(r.get("issue") or "a fix that keeps failing")
             out.append({"kind": "coach", "component": "agent", "at": at, "session_id": r.get("session_id") or "",
@@ -896,15 +909,17 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
                         "details": f"coach fix_loop opened review card {r.get('task_id')} after the "
                                    f"{r.get('n') or 2}nd confirmed failure: {issue}"[:1500],
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
-        elif r.get("event") == "reply_nudge" and r.get("rule") == "handoff":
-            pending.append({**{k: r.get(k) for k in ("session_id", "p", "evidence", "draft_id")}, "ts": at})
-        elif r.get("event") == "reply_nudge_outcome" and r.get("rule") == "handoff":
+        elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
+            pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id")}, "ts": at})
+        elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
             if n is None:
                 continue
             pending.remove(n)
             if r.get("resolved") is not True:  # only an explicit "resolved" clears it
-                out.append(_handoff_signal(n, f"the revised reply still handed off (outcome p={r.get('p')})"))
+                still = "still handed off" if rule == "handoff" else f"still failed {rule}"
+                out.append(_handoff_signal({**n, "reply": r.get("reply") or ""},
+                                           f"the revised reply {still} (outcome p={r.get('p')})"))
     keep = []
     for n in pending:
         if now - float(n.get("ts") or 0) > HANDOFF_GRACE_S:

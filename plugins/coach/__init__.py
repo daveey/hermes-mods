@@ -381,7 +381,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                               log_lines, ask)
                 coach.turn_end(session_id, assistant_response)
                 coach.loop_state(session_id)["last_ask"] = coach.turn_context(session_id)[0][:1500]
-                loop = {k: v for k, v in coach.loop_state(session_id).items() if k not in ("diff_reviewed", "handoff_nudge")}
+                loop = {k: v for k, v in coach.loop_state(session_id).items() if k not in ("diff_reviewed", "outcome_nudge")}
                 store._update(session_id, lambda s: s.__setitem__("loop", loop))
         except Exception as exc:
             log.debug("coach post_llm_call: %s", exc)
@@ -415,8 +415,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             turn = coach.turn_number(session_id)
             if budget.abandoned():
                 st = coach.loop_state(session_id)
-                if (st.get("handoff_nudge") or {}).get("turn") == turn:
-                    st.pop("handoff_nudge", None)  # no continuation will come for it
+                if (st.get("outcome_nudge") or {}).get("turn") == turn:
+                    st.pop("outcome_nudge", None)  # no continuation will come for it
                 store.log({**rec, "event": "reply_nudge_abandoned", **timing})
                 return None
             if out.get("rec"):
@@ -460,7 +460,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     out["rule"] = "compute_envelope"
                     return {"action": "continue", "message": msg}
             if attempt and session_id and final_response and platform not in ("cron",):
-                _handoff_outcome(session_id, final_response)
+                _nudge_outcome(session_id, final_response)
             if attempt or not session_id or not final_response or platform in ("cron",):
                 return None
             rc = _load("reply_check")
@@ -553,12 +553,15 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response), **({"guard": guard} if guard else {})})
                 return None
+            tracked = hit["rule"] in rc.RULES
             out["rec"] = {"event": "reply_nudge", "session_id": session_id, "rule": hit["rule"],
                           "p": hit["p"], "evidence": hit["evidence"],
-                          **({"reason": hit["reason"]} if hit.get("reason") else {}), **draft_ref()}
-            if hit["rule"] == "handoff":  # judged again on attempt 1: self-heal files the outcome, not the nudge
-                coach.loop_state(session_id)["handoff_nudge"] = {
-                    "turn": coach.turn_number(session_id), "ask": ask, "log": list(log_lines)[-25:],
+                          **({"reason": hit["reason"]} if hit.get("reason") else {}), **draft_ref(),
+                          **({"outcome": True} if tracked else {})}
+            if tracked:  # judged again on attempt 1 (any rule): self-heal files the outcome, not the nudge
+                coach.loop_state(session_id)["outcome_nudge"] = {
+                    "turn": coach.turn_number(session_id), "rule": hit["rule"], "ask": ask,
+                    "log": list(log_lines)[-25:], "kanban_down": kanban_down,
                     "threshold": cfg["threshold"], "thresholds": thresholds, **draft_ref()}
             return {"action": "continue", "message": hit["nudge"]}
         except Exception as exc:
@@ -571,26 +574,31 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     except Exception as exc:
         log.debug("coach pre_verify host timeout: %s", exc)
 
-    def _handoff_outcome(session_id, final_response):
-        """Attempt >= 1 after this turn's handoff nudge: judge the revised reply once (handoff only, same judge and
-        threshold), log a reply_nudge_outcome, never nudge again. Fail-open."""
+    def _nudge_outcome(session_id, final_response):
+        """Attempt >= 1 after this turn's reply_check nudge (any rule): re-run that rule once on the revised reply and
+        the turn's tool log (same judge and thresholds), log a reply_nudge_outcome, never nudge again. Fail-open.
+        Self-heal files the outcome (signals.collect_coach), not the nudge (agent-e278947864, agent-3ba1979f34)."""
         try:
             st = coach.loop_state(session_id)
-            n = st.get("handoff_nudge")
+            n = st.get("outcome_nudge")
             if not n or n.get("turn") != coach.turn_number(session_id):
                 return
-            st.pop("handoff_nudge", None)  # once per nudge, whatever happens below
+            st.pop("outcome_nudge", None)  # once per nudge, whatever happens below
+            rule = n.get("rule") or "handoff"
             rc = _load("reply_check")
             ask, log_lines = coach.turn_context(session_id)
-            res = rc.handoff_outcome(final_response, ask or n.get("ask") or "", log_lines or n.get("log") or [],
-                                     rc.aux_judge, threshold=n.get("threshold", 0.7),
-                                     thresholds=n.get("thresholds") or None)
-            store.log({"event": "reply_nudge_outcome", "rule": "handoff", "session_id": session_id,
+            log_lines = log_lines or n.get("log") or []
+            res = rc.nudge_outcome(rule, final_response, ask or n.get("ask") or "", log_lines, rc.aux_judge,
+                                   threshold=n.get("threshold", 0.7), thresholds=n.get("thresholds") or None,
+                                   wake=lambda: rc.wake_sources(session_id, log_lines),
+                                   kanban_down=n.get("kanban_down"),
+                                   human_asks=lambda: rc.session_human_asks(session_id))
+            store.log({"event": "reply_nudge_outcome", "rule": rule, "session_id": session_id,
                        **({"draft_id": n["draft_id"]} if n.get("draft_id") else {}),
                        "p": res["p"], "resolved": res["resolved"], "judged": res["judged"],
-                       "evidence": res["evidence"]})
+                       "evidence": res["evidence"], "reply": (final_response or "")[:300]})
         except Exception as exc:
-            log.debug("coach handoff outcome: %s", exc)
+            log.debug("coach nudge outcome: %s", exc)
 
     return coach, {"pre_final_gate": goal_gate, "pre_final_gate:compute_envelope": envelope_gate,
                    "pre_tool_call": pre_tool_call, "pre_verify": pre_verify, "post_llm_call": post_llm_call, "pre_llm_call": pre_llm_call, "post_tool_call": post_tool_call,
