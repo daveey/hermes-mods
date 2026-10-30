@@ -62,6 +62,16 @@ per session and surface holds the block / the turn once with a note to rent with
 Origin: defect agent-962f3f10ff, where three blocks and an "approve $20 / use metta1 directly" menu left a ~$5-10
 experiment blocked for 5 days; `tests/test_compute_envelope.py` replays both verbatim. Env:
 `COACH_COMPUTE_ENVELOPE=0` turns it off, `COACH_COMPUTE_ENVELOPE_USD` changes the cap (default 25).
+**Block-time handoff (`pre_tool_call` on `kanban_block` / `kanban_create` / `tool_call`).** A Kanban ask to the user
+ends the worker's run before the reply check below ever runs. So a `kanban_block` with kind `needs_input`/`capability`
+or a `human_request`, or a `kanban_create` with a `human_request` (direct or through `tool_call`), is judged with the
+reply judge's `handoff` rule (same threshold), using the block text and the turn's tool log. On a hit it is held ONCE
+per session and card with a nudge to try it first (terminal fetch of a private URL, the public site's tab, vault,
+token-broker); the same block again goes through, so it can't loop. Logged `agent_block` / `block_checked` /
+`block_handoff_repeat` (rule `block_handoff`). Judge errors fail open. Origin: defect agent-19492bff76, a worker that
+asked David to open a tailnet URL and click Create after one refused browser call. Off: `COACH_BLOCK_TIME=0` or
+`plugins.entries.coach.settings.block_time: false`; it also follows `COACH_REPLY_RULES` (no `handoff`, no check).
+Tests: `tests/test_block_handoff.py`.
 
 ### Reply check (`pre_verify`, before the turn ends)
 

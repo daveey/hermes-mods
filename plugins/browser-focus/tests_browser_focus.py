@@ -212,6 +212,40 @@ class T(unittest.TestCase):
         self.assertFalse(bf.asks_user_in_browser("The Chrome tab stays hidden. I read the schedule.\nYou can sign in later from your phone."))
         self.assertTrue(bf.asks_user_in_browser("The Nest page is open in Chrome. Please sign in, then say done."))
 
+    # agent-19492bff76: a Kanban worker read "Blocked: URL targets a private or internal address" as "a human must
+    # do it" and blocked the card on David 21 s later. The refusal now says what to try instead.
+    REFUSAL = '{"error": "Blocked: URL targets a private or internal address"}'
+
+    def test_private_url_refusal_gets_the_self_serve_hint(self):
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_x"}), mock.patch.object(bf, "focus") as f:
+            out = bf.transform_tool_result("browser_exec", {}, self.REFUSAL, session_id="w")
+            self.assertIsNotNone(out)
+            self.assertTrue(out.startswith(self.REFUSAL))
+            self.assertIn("does not mean a human is needed", out)
+            self.assertIn("terminal", out)
+            f.assert_not_called()   # a hint only: never raises a window
+            self.assertIsNone(bf.transform_tool_result("browser_exec", {}, out, session_id="w"))   # idempotent
+        page = '{"error": "Blocked: page URL targets a private or internal address (http://10.0.0.1/). x"}'
+        self.assertIn("does not mean a human is needed",
+                      bf.transform_tool_result("browser_exec", {}, page, session_id="w2") or "")
+        self.assertIn("does not mean a human is needed",
+                      bf.transform_tool_result("browser_navigate", {}, self.REFUSAL, session_id="w3") or "")
+
+    def test_other_results_are_unchanged(self):
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_x"}):
+            self.assertIsNone(bf.transform_tool_result("browser_exec", {}, '{"output": "ok"}', session_id="w"))
+            self.assertIsNone(bf.transform_tool_result("terminal", {}, self.REFUSAL, session_id="w"))
+
+    def test_hint_hook_registers_without_osascript(self):
+        ctx = mock.Mock()
+        with mock.patch.object(bf.shutil, "which", return_value=None):
+            bf.register(ctx)
+        hooks = {c.args[0]: c.args[1] for c in ctx.register_hook.call_args_list}
+        self.assertIn("transform_tool_result", hooks)
+        ctx.register_tool.assert_not_called()   # no screen to raise a window on: no browser_focus tool
+        self.assertIn("does not mean a human is needed",
+                      hooks["transform_tool_result"]("browser_exec", {}, self.REFUSAL, session_id="w") or "")
+
 
 if __name__ == "__main__":
     unittest.main()

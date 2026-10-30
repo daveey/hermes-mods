@@ -1232,3 +1232,80 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
     down = kanban_db_down(tool_log) if kanban_down is None else kanban_down
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
             "nudge": nudge_for(best, v["evidence"], kanban_down=down)}
+
+
+# ───────────────────────────── block-time handoff check (agent-19492bff76) ─────────────────────────────
+# The reply-time handoff rule runs in pre_verify, at the end of a turn. A Kanban worker that hands David a step
+# through kanban_block (or a blocked kanban_create with a human_request) ends its run before that check: it asked
+# David to open a tailnet URL and click Create after one refused browser call. pre_tool_call judges the ask once.
+BLOCK_HANDOFF_NUDGE = (
+    "[coach] Held this block once: it asks the user to do a step ({evidence}) that you could plausibly do "
+    "yourself. Try it first with what you have: shell/ssh on the host, browser automation (a private/tailnet URL "
+    "refused by the browser can still be fetched with curl in the terminal, and its form submitted from the public "
+    "site's tab), browser_vault/saved logins, token-broker. If it still truly needs the user (passkey/2FA, their "
+    "judgment, money, a physical action), call the same block again and it will go through; say in why_human "
+    "what you tried and why it failed.")
+
+
+def block_time_enabled() -> bool:
+    """Env COACH_BLOCK_TIME, then config plugins.entries.coach.settings.block_time; default on."""
+    raw: Any = os.environ.get("COACH_BLOCK_TIME")
+    if raw is None:
+        try:
+            from importlib import util as _u
+            import sys as _sys
+            so = _sys.modules.get("_coach_second_opinion")
+            if so is None:
+                spec = _u.spec_from_file_location("_coach_second_opinion_bt",
+                                                  os.path.join(os.path.dirname(__file__), "second_opinion.py"))
+                so = _u.module_from_spec(spec)
+                spec.loader.exec_module(so)
+            raw = so._config_settings().get("block_time")
+        except Exception:
+            raw = None
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("0", "off", "false", "no")
+
+
+def human_block(tool_name: str, args: Any, default_card: str = "") -> Optional[tuple[str, str]]:
+    """(human-facing text, card key) when this call asks a human through Kanban, else None. Covers kanban_block with
+    kind needs_input/capability or a human_request, kanban_create with a human_request, and both through the
+    deferred `tool_call`. Dependency/time/transient parks ask nobody."""
+    a = args if isinstance(args, dict) else {}
+    if tool_name == "tool_call":
+        for c in a.get("calls") or []:
+            if isinstance(c, dict):
+                got = human_block(str(c.get("name") or ""), c.get("arguments"), default_card)
+                if got:
+                    return got
+        return None
+    hr = a.get("human_request")
+    hr_text = json.dumps(hr, ensure_ascii=False) if isinstance(hr, dict) and hr else ""
+    if tool_name == "kanban_block":
+        if not hr_text and str(a.get("kind") or "") not in ("needs_input", "capability"):
+            return None
+        text = "\n".join(s for s in (str(a.get("reason") or ""), hr_text) if s)
+        return (text, str(a.get("task_id") or default_card or "")) if text.strip() else None
+    if tool_name == "kanban_create" and hr_text:
+        return ("\n".join(s for s in (str(a.get("title") or ""), hr_text) if s),
+                "create:" + str(a.get("title") or "")[:120])
+    return None
+
+
+def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
+                  threshold: float = 0.7, thresholds: Optional[dict] = None) -> Optional[dict]:
+    """Judge a Kanban ask to the user with the reply judge's handoff rule. {"p", "evidence", "nudge"} on a hit,
+    else None (also when the judge fails: fail-open)."""
+    msg = ("[The agent is about to block its Kanban card on the user with this ask; nothing else will reach the "
+           "user this turn.]\n" + (text or ""))
+    try:
+        v = parse_verdict(llm(judge_system(), judge_prompt(user_ask, tool_log, msg)))
+    except Exception:
+        return None
+    if not v or v["handoff"] < rule_threshold("handoff", v, thresholds or {}, threshold):
+        return None
+    ev = (v.get("evidence") or "see the block reason")[:200]
+    return {"p": v["handoff"], "evidence": ev, "nudge": BLOCK_HANDOFF_NUDGE.format(evidence=ev)}

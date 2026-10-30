@@ -160,6 +160,10 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             msg = _envelope(session_id, "block", text) if text else None
             if msg:
                 return {"action": "block", "message": msg}
+        if tool_name in ("kanban_block", "kanban_create", "tool_call"):
+            msg = _block_handoff(session_id, tool_name, args)
+            if msg:
+                return {"action": "block", "message": msg}
         try:
             what = rules.blocks_live_checkout(tool_name, args if isinstance(args, dict) else {}, coach.checkout)
         except Exception as exc:
@@ -173,6 +177,39 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception:
             pass
         return {"action": "block", "message": rules.block_message(what, coach.checkout)}
+
+    block_held: set = set()  # (session_id, card) whose human-facing block was held once (agent-19492bff76)
+
+    def _block_handoff(session_id, tool_name, args):
+        """A Kanban ask to the user that the agent could plausibly do itself: hold it ONCE per session and card with
+        the handoff nudge; the same block again goes through (logged), so it can never loop. Fail-open."""
+        try:
+            rc = _load("reply_check")
+            cfg = rc.settings()
+            if "handoff" not in cfg["rules"] or not rc.block_time_enabled():
+                return None
+            got = rc.human_block(tool_name, args, os.environ.get("HERMES_KANBAN_TASK", ""))
+            if not got:
+                return None
+            text, card = got
+            key = (session_id or "", card)
+            if key in block_held:
+                store.log({"event": "block_handoff_repeat", "rule": "block_handoff", "session_id": session_id,
+                           "card": card})
+                return None
+            ask, log_lines = coach.turn_context(session_id) if session_id else ("", [])
+            hit = rc.block_handoff(text, ask, log_lines, rc.aux_judge, threshold=cfg["threshold"],
+                                   thresholds=cfg.get("thresholds"))
+            if not hit:
+                store.log({"event": "block_checked", "rule": "block_handoff", "session_id": session_id, "card": card})
+                return None
+            block_held.add(key)
+            store.log({"event": "agent_block", "rule": "block_handoff", "session_id": session_id, "card": card,
+                       "tool": tool_name, "p": hit["p"], "evidence": hit["evidence"]})
+            return hit["nudge"]
+        except Exception as exc:
+            log.debug("coach block handoff: %s", exc)
+            return None
 
     def _fix_loop(session_id, user_message, turn=None):
         """Judge whether this user message reports that the agent's last fix failed (once per turn, sync,

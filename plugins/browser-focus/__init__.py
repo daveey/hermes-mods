@@ -278,7 +278,27 @@ NOTE = ("\n\n[browser-focus] The Chrome window is now in front of the user, on t
         "to act there, tell them it is already in front (no need to describe which window to find).")
 
 
+# Core's browser SSRF guard (tools/browser_tool.py) refuses private/tailnet URLs with this text. A Kanban worker read
+# it as "a human must do it" and blocked on David 21 s later, though driving the public site worked once nudged
+# (agent-19492bff76). The hint says what to try first; it never blocks and never raises a window.
+_PRIVATE_REFUSAL = re.compile(r"Blocked: (?:page )?URL targets a private or internal address")
+PRIVATE_URL_HINT = (
+    "\n\n[browser-focus] The browser can't open private/tailnet addresses. That does not mean a human is needed: "
+    "fetch the page on the host (terminal: curl it, read the form/redirect it builds), then drive the public site "
+    "(e.g. submit the same form from a github.com tab with browser_exec) before asking the user.")
+
+
+def private_url_hint(tool_name: str = "", result: Any = None) -> str | None:
+    if (not str(tool_name or "").startswith("browser") or not isinstance(result, str)
+            or "[browser-focus] The browser can't open private" in result or not _PRIVATE_REFUSAL.search(result)):
+        return None
+    return result + PRIVATE_URL_HINT
+
+
 def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "", **_):
+    hinted = private_url_hint(tool_name, result)
+    if hinted:
+        return hinted
     if tool_name != "browser_exec" or not isinstance(result, str) or _unattended(session_id):
         return None
     with _lock:
@@ -416,9 +436,16 @@ def handle(args: dict, session_id: str = "", **_) -> str:
         return json.dumps({"focused": False, "error": f"{type(e).__name__}: {e}"})
 
 
+def _hint_only_result(tool_name: str = "", args: Any = None, result: Any = None, **_):
+    return private_url_hint(tool_name, result)
+
+
 def register(ctx) -> None:
     if shutil.which("osascript") is None:
-        return  # no screen to raise a window on (Linux/cloud gateway)
+        # No screen to raise a window on (Linux/cloud gateway), but its browser tools still hit the private-URL
+        # refusal (the hub drives a Mac Chrome): register the hint alone.
+        ctx.register_hook("transform_tool_result", _hint_only_result)
+        return
     ctx.register_tool(name="browser_focus", toolset=TOOLSET, schema=SCHEMA, handler=handle, emoji="🔝",
                       description="Bring the agent's Chrome window/tab to the front for the user")
     ctx.register_hook("transform_tool_result", transform_tool_result)
