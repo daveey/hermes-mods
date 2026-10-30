@@ -3,7 +3,8 @@
 The store's guards act per gateway at post time. This audit reads every gateway's Inbox through
 `hermes-hub inbox --all --json` and reports what still slipped through, so an agent (not David) notices:
 
-- a sender (poster group / key family) with 2+ cards archived untouched in the last 7 days, on any gateway;
+- a sender (poster group / key family) whose newest 2+ cards were all archived untouched (the store's noise-breaker
+  rule: a card David acted on ends the streak) in the last 7 days, on any gateway;
 - a key re-posted after David archived it;
 - a test/probe-titled card.
 
@@ -52,12 +53,25 @@ def audit(items: list[dict], now: float) -> dict:
     fresh = lambda cards: any(float(c.get("created_at") or 0) >= now - FRESH_S for c in cards)  # noqa: E731
     out = {"window_items": len(recent), "senders": [], "reposted_keys": [], "test_cards": []}
 
-    by_sender = defaultdict(list)
+    # Same rule as the store's noise breaker (Store._ignored_streak): the NEWEST cards of a sender are archived
+    # untouched in a row. A card David acted on (accepted / resolved) ends the streak, so a sender whose drafts
+    # he mostly uses is not flagged for two scattered archives.
+    by_sender_all = defaultdict(list)
     for i in recent:
-        if _untouched(i) and i.get("poster"):  # key-family senders are judged per key (reposted_keys)
-            by_sender[(i.get("gw"), _sender(i, st))].append(i)
+        if i.get("poster"):  # key-family senders are judged per key (reposted_keys)
+            by_sender_all[(i.get("gw"), _sender(i, st))].append(i)
+    by_sender = {}
+    for k, cards in by_sender_all.items():
+        streak = []
+        for c in sorted(cards, key=lambda c: float(c.get("created_at") or 0), reverse=True):
+            if c.get("state") == "open":
+                continue
+            if not _untouched(c):
+                break
+            streak.append(c)
+        by_sender[k] = list(reversed(streak))
     for (gw, sender), cards in sorted(by_sender.items()):
-        if len(cards) >= 2:
+        if len(cards) >= st.MUTE_AFTER:
             out["senders"].append({"gw": gw, "sender": sender, "archived_untouched": len(cards),
                                    "fresh": fresh(cards), "titles": [c.get("title") for c in cards][:5]})
 

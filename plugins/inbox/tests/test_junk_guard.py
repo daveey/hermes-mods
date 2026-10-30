@@ -283,3 +283,17 @@ def test_audit_drains_refusals_whose_kanban_routing_was_fenced(tmp_path):
     rows = [json.loads(x) for x in log.read_text().splitlines()]
     assert rows[0]["task"] == "t_new" and "routing_error" not in rows[0] and rows[1]["task"] == "t_done"
     assert audit.drain_refusals(tmp_path, creator) == 0 and len(made) == 1  # idempotent
+
+
+def test_junk_audit_sender_streak_is_broken_by_a_card_david_acted_on():
+    audit = _load("_inbox_junk_audit_streak", HERE / "junk_audit.py")
+    now = 1_800_000_000.0
+
+    def mk(n, age, state, outcome=None):
+        return dict(gw="hub", key=f"k:{n}", title=f"Draft {n}", poster="cron · drafts", state=state,
+                    outcome=outcome, created_at=now - age)
+
+    scattered = [mk(1, 5000, "archived", "archived"), mk(2, 4000, "accepted", "post"), mk(3, 3000, "archived", "archived")]
+    assert audit.audit(scattered, now)["senders"] == []
+    noisy = [mk(1, 5000, "accepted", "post"), mk(2, 4000, "archived", "archived"), mk(3, 3000, "archived", "archived")]
+    assert [f["archived_untouched"] for f in audit.audit(noisy, now)["senders"]] == [2]
