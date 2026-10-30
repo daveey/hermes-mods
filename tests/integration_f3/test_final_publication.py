@@ -14,8 +14,29 @@ def extraction(text=ASK):
             "options": ["blue", "green"] if text == ASK else ["red", "yellow"]}
 
 
+def requests(h):
+    return h.steps.core.ActionStore().requests(h.steps.core.server_owner(h.agent.session_id))
+
+
+def retire(h, step):
+    """Resolve through canonical decision + confirmed delivery, never the legacy ledger API."""
+    core = h.steps.core
+    store = core.ActionStore()
+    owner = core.server_owner(h.agent.session_id)
+    request = store.get(owner, step['requestId'])
+    choice = next(c for c in request['choices'] if c['effect'] == 'answer')
+    result = store.decide(owner, dict(requestId=request['requestId'],
+        expectedRevision=request['revision'], choiceId=choice['id'], revisionText=choice['label'],
+        idempotencyKey='f3-retire-' + step['id']))
+    receiver = SimpleNamespace(deliver=lambda op: {'deliveryId': op['operationId']},
+                               readback=lambda op, receipt: receipt['deliveryId'] == op['operationId'])
+    delivered = store.dispatch(owner, result['operation']['operationId'], receiver)
+    assert delivered['request']['state'] == 'resolved'
+    assert not core.open_steps(h.agent.session_id)
+
+
 class Cards:
-    """Only external delivery is replaced; production sync_card still runs."""
+    """Trap obsolete rolling-card delivery: canonical requests must not call it."""
     def __init__(self):
         self.calls = []
 
@@ -65,7 +86,8 @@ def wire_models(h, monkeypatch, events, candidate=ASK, reject_first=False):
     def extract(system, prompt):
         reply = prompt.split("ASSISTANT REPLY:\n", 1)[1]
         events.append(("extract", reply))
-        return json.dumps({"steps": [extraction(candidate)] if candidate in reply else [], "resolved": []})
+        text = ASK if ASK in reply else candidate
+        return json.dumps({"steps": [extraction(text)] if text in reply else [], "resolved": []})
 
     monkeypatch.setattr(h.ask, "run_judge", judge)
     monkeypatch.setattr(h.steps, "aux_llm", extract)
@@ -97,24 +119,34 @@ def test_exact_source_action_before_publication(harness, monkeypatch, state, fra
         first = Model(h.agent, monkeypatch, [ASK])
         seeded = h.agent.run_conversation("Pick a case with me.")
         assert_delivery(seeded, first, plain=ASK)
-        prior_id = ledger.open_steps(sid)[0]["id"]
-        assert len(cards.calls) == 1
+        step = ledger.open_steps(sid)[0]
+        prior_id = step["id"]
+        assert len(requests(h)) == 1
+        assert not cards.calls
         if state == "resolved":
-            assert h.steps.core.resolve(ledger, ledger.root(sid), [prior_id], "done", "test") == [prior_id]
+            retire(h, step)
         cards.calls.clear()
         events.clear()
 
     before = ledger._read(ledger.root(sid))
+    canonical_before = requests(h)
     model = Model(h.agent, monkeypatch, [ASK])
     result = h.agent.run_conversation("Continue the case discussion.")
-    assert events == [("judge", ASK), ("extract", ASK)]
+    # Approval readiness previews extraction before the final output transform.
+    assert events == [("judge", ASK), ("extract", ASK), ("extract", ASK)]
     after = ledger._read(ledger.root(sid))
     assert len(model.requests) == 1
     if state == "resolved":
         assert result["final_response"] == h.steps.core.HELD_REPLY
         assert ASK not in str(result["messages"])
         assert "::user-step" not in result["final_response"]
-        assert after["steps"] == before["steps"]
+        assert [s['id'] for s in after['steps']] == [s['id'] for s in before['steps']]
+        assert all(s['status'] == 'resolved' and s['resolved_by'] == 'canonical'
+                   for s in after['steps'])
+        mutable = {'status', 'resolution', 'resolved_by', 'resolved_at'}
+        assert [{k: v for k, v in s.items() if k not in mutable} for s in after['steps']] == [
+            {k: v for k, v in s.items() if k not in mutable} for s in before['steps']]
+        assert requests(h) == canonical_before
         assert after["gen"] == before["gen"]
         assert ledger.open_steps(sid) == []
         assert cards.calls == []
@@ -129,24 +161,32 @@ def test_exact_source_action_before_publication(harness, monkeypatch, state, fra
         if state == "open":
             assert opened[0]["id"] == prior_id
             assert after["steps"] == before["steps"]
-            assert cards.calls == []
+            assert requests(h) == canonical_before
         else:
-            assert [call[0] for call in cards.calls] == ["create"]
-            assert ASK in cards.calls[0][3]
+            published = requests(h)
+            assert len(published) == 1
+            assert published[0]['requestId'] == opened[0]['requestId']
+            assert published[0]['title'] == ASK
+            assert published[0]['state'] == 'open'
+        assert cards.calls == []  # rolling cards were replaced by canonical requests
     assert_delivery(result, model, plain=None if state == "resolved" else ASK)
 
 
-def test_held_draft_never_reaches_extraction_or_cards(harness, monkeypatch):
+def test_held_draft_never_publishes_source_actions(harness, monkeypatch):
     h = harness
     events = []
     cards = wire_models(h, monkeypatch, events, candidate=OTHER, reject_first=True)
     model = Model(h.agent, monkeypatch, [ASK, OTHER])
     result = h.agent.run_conversation("Help me choose a case.")
     assert_delivery(result, model, plain=OTHER)
-    assert events == [("judge", ASK), ("judge", OTHER), ("extract", OTHER)]
+    # The readiness gate may preview rejected drafts, but only the accepted draft
+    # may reach the source-writing transform.
+    assert events == [("judge", ASK), ("extract", ASK), ("judge", OTHER),
+                      ("extract", OTHER), ("extract", OTHER)]
     assert len(model.requests) == 2
     assert ASK not in model.shown + str(result["messages"]) + str(cards.calls)
     assert ASK not in str(h.db.get_messages(h.agent.session_id))
-    assert [call[0] for call in cards.calls] == ["create"]
+    assert cards.calls == []
+    assert [r['title'] for r in requests(h)] == [OTHER]
     opened = h.steps.core.Ledger().open_steps(h.agent.session_id)
     assert len(opened) == 1 and opened[0]["text"] == OTHER

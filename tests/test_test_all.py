@@ -1,10 +1,12 @@
 """scripts/test-all: one broken plugin is reported by name, never swallowed, and the exit code says so."""
 import os
+import runpy
 import subprocess
 import sys
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import tempfile
 
 RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "test-all"
@@ -67,9 +69,65 @@ class TestAll(unittest.TestCase):
         f3.mkdir(parents=True)
         (f3 / "test_f3.py").write_text("def test_f3():\n    raise SystemExit('needs core')\n")
         (self.root / "tests" / "test_top.py").write_text("def test_top():\n    pass\n")
-        r = run(self.root)
+        runner = runpy.run_path(str(RUNNER))
+        suite = next(s for s in runner['discover'](self.root, None, False)
+                     if s['name'] == 'tests/integration_f3')
+        result = runner['run_suite'](suite, sys.executable, None, 3, self.root)
+        self.assertEqual(result['status'], 'SKIP')
+        self.assertIn('needs a core checkout', result['reason'])
+        env = dict(os.environ, HOME=str(self.root), PATH='', HERMES_MODS_PYTHON=sys.executable)
+        env.pop('HERMES_CORE_CHECKOUT', None)
+        r = subprocess.run([sys.executable, str(RUNNER), '--root', str(self.root),
+                            '-k', 'integration_f3'], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("skipped tests/integration_f3: needs a core checkout", r.stdout)
+        self.assertIn('skipped tests/integration_f3: needs a core checkout', r.stdout)
+
+    def test_default_core_checkout_is_discovered(self):
+        runner = runpy.run_path(str(RUNNER))
+        core = self.root / '.hermes' / 'hermes-agent'
+        core.mkdir(parents=True)
+        (core / 'hermes_bootstrap.py').touch()
+        with patch('pathlib.Path.home', return_value=self.root), patch.dict(os.environ):
+            os.environ.pop('HERMES_CORE_CHECKOUT', None)
+            found, explicit = runner['find_core'](None)
+        self.assertEqual(found, core.resolve())
+        self.assertFalse(explicit)
+        (self.root / 'tests' / 'integration_f3').mkdir(parents=True)
+        suite = next(s for s in runner['discover'](self.root, found, explicit)
+                     if s['name'] == 'tests/integration_f3')
+        self.assertNotIn('skip', suite)
+
+    def test_integration_f3_runs_with_implicitly_discovered_core(self):
+        f3 = self.root / 'tests' / 'integration_f3'
+        f3.mkdir(parents=True)
+        runner = runpy.run_path(str(RUNNER))
+        core = self.root / 'core'
+        suite = next(s for s in runner['discover'](self.root, core, False)
+                     if s['name'] == 'tests/integration_f3')
+        self.assertNotIn('skip', suite)
+        self.assertEqual(suite['args'], ['--hermes-core', str(core), '--confcutdir', str(f3)])
+        # Real subprocess: no accidental parent conftest, and both CLI/env core selection work.
+        (self.root / 'conftest.py').write_text("raise RuntimeError('parent conftest leaked')\n")
+        (core).mkdir()
+        (core / 'hermes_bootstrap.py').touch()
+        (f3 / 'conftest.py').write_text(
+            "def pytest_addoption(parser):\n    parser.addoption('--hermes-core')\n")
+        (f3 / 'test_f3.py').write_text(
+            "def test_core(request):\n    assert request.config.getoption('--hermes-core')\n")
+        for use_env in (False, True):
+            env = dict(os.environ, HERMES_MODS_PYTHON=sys.executable)
+            env.pop('HERMES_CORE_CHECKOUT', None)
+            args = []
+            if use_env:
+                env['HERMES_CORE_CHECKOUT'] = str(core)
+            else:
+                args = ['--hermes-core', str(core)]
+            r = subprocess.run([sys.executable, str(RUNNER), '--root', str(self.root),
+                                '-k', 'integration_f3', *args], env=env,
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('1 PASS', r.stdout)
+            self.assertNotIn('SKIP', r.stdout)
 
 
 if __name__ == "__main__":

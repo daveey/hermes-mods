@@ -145,5 +145,6 @@ prints one line per suite, then the tail of every failing one; it exits 0 only i
 the repo root does not work: plugins reuse test-module names, some need a core checkout, and a test importing core's
 `hermes_bootstrap` can re-exec the interpreter and exit 1 with no output (the runner sets
 `HERMES_DISABLE_LAZY_INSTALLS=1` and reports such a death as `SILENT-EXIT`). Options: `-k NAME` (substring, repeatable),
-`-j N`, `--timeout SECS`, `--list`, `--hermes-core PATH` (also runs `tests/integration_f3`; skipped with a reason
-otherwise). Proof that one broken plugin is reported by name: `python3 -m pytest -q tests/test_test_all.py`.
+`-j N`, `--timeout SECS`, `--list`, `--hermes-core PATH` (overrides `HERMES_CORE_CHECKOUT`, then
+`~/.hermes/hermes-agent`). `tests/integration_f3` runs whenever core is found; only a missing core skips it
+with a reason. Proof that one broken plugin is reported by name: `python3 -m pytest -q tests/test_test_all.py`.
