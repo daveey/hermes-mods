@@ -14,7 +14,6 @@ import uuid
 
 if __package__:
     from . import relay_files as rf
-    from . import shepherd as _shepherd
 else:  # pytest imports this hyphen-named plugin dir without a parent package
     import importlib.util as _ilu
     from pathlib import Path as _Path
@@ -26,7 +25,6 @@ else:  # pytest imports this hyphen-named plugin dir without a parent package
         return mod
 
     rf = _load_sibling("relay_files")
-    _shepherd = _load_sibling("shepherd")
 
 TOOLSET = "session_mentions"
 PICKUP_TIMEOUT = 30.0  # Desktop drains every ~3s; no claim by then = Desktop not running
@@ -188,8 +186,8 @@ TASK_SCHEMA = {
         "which is searched on every gateway): body, status, latest summary, runs, links, "
         "last `limit` comments/events (default 10).\n"
         "- action=comment: add `message` as a comment on `target`, attributed to this session.\n"
-        "Reading or commenting on a task on another gateway also links it to this session (hermes-hub "
-        "shepherd), so this session's sidebar row stays busy while that card runs.\n"
+        "Reading or commenting does not tie the task to this session; `hermes-hub adopt-task` does that when "
+        "this session really owns the work.\n"
         "Requires the Hermes Desktop app to be running (it relays the request)."
     ),
     "parameters": {
@@ -227,21 +225,7 @@ def handle_task(args: dict, session_id: str | None = None, **_kw) -> str:
     if action == "comment" and not str(args.get("message") or "").strip():
         return _err("message is required for comment — pass the text as `message`")
     out = _relay(f"task_{action}", args, session_id, 0)
-    if action in ("read", "comment"):
-        _adopt_remote_task(args.get("target"), session_id)
     return out
-
-
-def _adopt_remote_task(target, session_id) -> None:
-    """A session that reads or comments on a card on another gateway shepherds it: queue a hermes-hub
-    ``shepherd`` request so this gateway's sidebar counts it as the session's work. Fire-and-forget."""
-    try:
-        if not session_id:
-            return
-        _shepherd.maybe_shepherd(target, session_id, _sender_info(session_id).get("profile") or "default", rf.root())
-    except Exception:
-        pass
-
 
 def _devices_note(base) -> str:
     try:

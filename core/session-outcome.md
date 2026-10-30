@@ -17,7 +17,10 @@ Every chat needs one shared answer to "is this done, waiting on me, or stuck?" i
 
 ## Behavior
 
-- `sessions.outcome_json` / `outcome_at` hold one outcome per chat, and `sessions.muted` is a lineage-wide mute flag. `hermes_state_outcome` derives it by contract precedence 1-8: muted, live turn, open decisions, live work, a held declaration, tail shape, summary judge/heuristic, empty. Plugins add a judge and providers.
+- `sessions.outcome_json` / `outcome_at` hold one outcome per chat, and `sessions.muted` is a lineage-wide mute flag. `hermes_state_outcome` derives it by contract precedence: muted, live turn, open decisions, a lost request, live work, a held declaration, tail shape, summary judge/heuristic, empty.
+- A lost request outranks live work: a typed or steered message that ended on a failed turn (`turn_failed`), or that nothing answered (`interrupted`), paints amber even with open cards, unless the turn declared its outcome. Automated rows after the failure do not close it, a real reply does, and an interrupted automated delivery alone is not one.
+- A recurring cron is not a wait. A finished chat that owns one is `done` and names it in `crons`: the Desktop draws the loop glyph in green and the tooltip says what keeps running. A declared wait on a cron is still honoured.
+- A turn refused for a retryable reason keeps its turn marker and is replayed through auto-continue after 45 s, then 180 s (`_hold_refused_turn`, `_schedule_refused_turn_retry`), with the auto-continue guards; a skewed backend leaves the marker for the boot sweep. Person-written turns and their replays only. A later refused message joins the earlier prompt; a later message that succeeds ends the replay (the model has the earlier row in its history). Plugins add a judge and providers.
 - It refreshes at every Desktop/TUI turn conclusion, every messaging-platform turn end (on a daemon thread, off the reply path), on orphan reap, on kanban notices and card moves, and from CLI/web refresh.
 - A judged outcome stores `judged=true` and the judged message id; a refresh in a process with no judge keeps that verdict for the same message. Judges are called as `fn(sid, text, source=...)`, falling back to `fn(sid, text)`.
 - Notice guarantee: a chat ending on a kanban notice older than 5 min with no live turn gets one close-out wake (claimed by CAS, 2 per hour per lineage). A notice about a card blocked on a human never wakes and refreshes to decision. Earlier "blocked" notices are marked `display_metadata.stale` once the card leaves blocked. No refresh for released links, archived chats or moved copies.
@@ -35,7 +38,7 @@ Every chat needs one shared answer to "is this done, waiting on me, or stuck?" i
 
 ## Tests
 
-Test files added or changed by these commits (not re-run for this mirror): `tests/hermes_state/test_session_outcome.py`, `test_session_outcome_judge.py`, `tests/gateway/test_turn_outcome_refresh.py`, `tests/tui_gateway/test_turn_outcome_refresh.py`, `test_session_outcome_restarts.py`, `tests/hermes_cli/test_session_outcome_surfaces.py`, desktop `session-row.test.tsx`, `session-mute.test.ts`, `session-blocked.test.ts`, `sidebar-automated.test.ts`, `use-session-list-actions.test.tsx`.
+Test files added or changed by these commits (not re-run for this mirror): `tests/hermes_state/test_session_outcome.py`, `test_session_outcome_judge.py`, `tests/tui_gateway/test_refused_turn_retry.py`, desktop `session-outcome.test.ts`, `tests/gateway/test_turn_outcome_refresh.py`, `tests/tui_gateway/test_turn_outcome_refresh.py`, `test_session_outcome_restarts.py`, `tests/hermes_cli/test_session_outcome_surfaces.py`, desktop `session-row.test.tsx`, `session-mute.test.ts`, `session-blocked.test.ts`, `sidebar-automated.test.ts`, `use-session-list-actions.test.tsx`.
 
 ## Applying
 
