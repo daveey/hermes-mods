@@ -319,7 +319,7 @@ _DO = re.compile(r"\b(can you|could you|please) (check|click|tap|open|plug|sign|
 def regex_steps(text: str) -> list[dict]:
     out: list[dict] = []
     for s in sentences(text or ""):
-        if _ASK.search(_blank_quotes(s)) and not _NOT_ASK.search(s) and all(o["verbatim_span"] != s for o in out):
+        if _asks_outside_quotes(s) and not _NOT_ASK.search(s) and all(o["verbatim_span"] != s for o in out):
             kind = "approve" if _APPROVE.search(s) else "do" if _DO.search(s) else "input"
             out.append({"text": s[:300], "kind": kind, "verbatim_span": s, "options": []})
     return out
@@ -660,6 +660,16 @@ def span_is_quoted(span: str, block_text: str) -> bool:
         rest = _QUOTE_RANGE.sub(" ", span)
         return not (_DIRECT_REQUEST.search(_plain(rest)) or _ASK.search(rest))
     return False
+
+
+def _asks_outside_quotes(sentence: str) -> bool:
+    """The sentence asks something in the assistant's own words: some ``_ASK`` match starts outside every quoted
+    range, and the sentence is not merely naming a quoted phrase (``span_is_quoted``, the model path's rule).
+    ``Reply "go" and I'll ship it`` asks (its match starts at the unquoted ``Reply``); ``titled "Reply yes or no
+    here."`` does not (its only match starts inside the quotes)."""
+    ranges = [m.span() for m in _QUOTE_RANGE.finditer(sentence or "")]
+    outside = any(not any(a <= m.start() < b for a, b in ranges) for m in _ASK.finditer(sentence or ""))
+    return outside and not span_is_quoted(sentence, sentence)
 
 
 def _question_in(block_text: str) -> Optional[str]:
