@@ -14,12 +14,19 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1235 patches, one entry per non-merge source commit through `2385895f5ac46acd0461c4ce4daa8dd61f1d1e06`.
+1253 patches, one entry per non-merge source commit through `2dc64603e1ed4f667baa8293c4345136072ba773`.
 Ordinals 0001-1202 are the published numbers and never move. Ordinals 1203 onward are appended in first-parent merge order, not `git log --reverse --no-merges` order: three source commits that reached the fork through merged branches sort earlier in the log, and replaying them there conflicts with mainline commits already published. Each patch is identified by its SHA header. Patch 1228 carries the merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `6337f1f22fe282636165c24568fa6da018653d30`; merge-base: `5608b5faf19ac22d023e62a8fd9675a42d1a61c6`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
-The current snapshot's executed checks are in [mirror-1235-verification.md](mirror-1235-verification.md) (earlier: [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+Upstream exclusion tip: `2d2808ee84549f9836b0056750265058e5488a8a`; merge-base: `5608b5faf19ac22d023e62a8fd9675a42d1a61c6`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
+The current snapshot's executed checks are in [mirror-1253-verification.md](mirror-1253-verification.md) (previous snapshot: [mirror-1235-verification.md](mirror-1235-verification.md)) (earlier: [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Frozen-decision reset and fresh-tip follow-ups
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Frozen decisions stop at reset](frozen-decision-reset.md) | 1239 | Exact two-part user-steps decisions survive compression but cancel at a genuinely new LOCAL conversation, with event/waiter settlement. |
+| [Admission, restart and test isolation](mirror-admission-and-test-followups.md) | 1236–1238 1240–1253 | Memory-aware CI, drain/crash isolation, cron and replica guards, bounded restart settlement, missing pins and source test synchronization. |
 
 ## Append-only follow-ups after 1134
 

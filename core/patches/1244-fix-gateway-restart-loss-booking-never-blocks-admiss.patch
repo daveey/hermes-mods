@@ -1,0 +1,88 @@
+From 962f19153a974b240ceeb6f4fc5bf2d1023c304c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 12:52:55 +0000
+Subject: [PATCH] fix(gateway): restart-loss booking never blocks admission
+ settlement
+
+---
+ gateway/session_kanban_restart.py                 | 15 +++++++++++++--
+ gateway/session_managed_worker.py                 |  5 ++---
+ tests/gateway/test_kanban_restart_stop_booking.py | 11 +++++++++++
+ 3 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/gateway/session_kanban_restart.py b/gateway/session_kanban_restart.py
+index e4a4b8ec08a..99ee4b92c7f 100644
+--- a/gateway/session_kanban_restart.py
++++ b/gateway/session_kanban_restart.py
+@@ -2,8 +2,11 @@
+ import asyncio
+ from functools import partial
+ import json
++import logging
+ from pathlib import Path
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ async def close_and_book_restart_loss(authority, policy, worker):
+     """Return final cleanup; a restart-lost child is closed and booked before unknown publishes.
+@@ -16,11 +19,19 @@ async def close_and_book_restart_loss(authority, policy, worker):
+             (_INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN)):
+         return worker.close
+     await asyncio.to_thread(worker.close)
+-    from gateway.session_runtime_workers import tracked_write
+-    await tracked_write(authority, partial(record_restart_interruption, policy))
++    await book_restart_interruption(authority, policy)
+     return lambda: None
+ 
+ 
++async def book_restart_interruption(authority, policy):
++    """Best-effort booking: a failed board write must never skip settlement of the admission."""
++    from gateway.session_runtime_workers import tracked_write
++    try:
++        await tracked_write(authority, partial(record_restart_interruption, policy))
++    except Exception:
++        logger.warning('Kanban restart-loss booking failed; settling without it', exc_info=True)
++
++
+ def record_restart_interruption(policy):
+     """Supersede the child's interrupted exit with an uncounted owner-restart exit.
+ 
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index aa6aefe032a..afd5117c089 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -634,9 +634,8 @@ async def admit_managed(authority, ref, row, policy):
+             (_INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN)):
+         # The child booked exit 130 (or never bootstrapped). Supersede it BEFORE the
+         # receipt becomes terminal: a runtime Stop must not spend the card's retries.
+-        from gateway.session_kanban_restart import record_restart_interruption
+-        from gateway.session_runtime_workers import tracked_write
+-        await tracked_write(authority, partial(record_restart_interruption, policy))
++        from gateway.session_kanban_restart import book_restart_interruption
++        await book_restart_interruption(authority, policy)
+     return reply
+ 
+ 
+diff --git a/tests/gateway/test_kanban_restart_stop_booking.py b/tests/gateway/test_kanban_restart_stop_booking.py
+index c4dfbe331f7..9177bf082b0 100644
+--- a/tests/gateway/test_kanban_restart_stop_booking.py
++++ b/tests/gateway/test_kanban_restart_stop_booking.py
+@@ -64,3 +64,14 @@ def test_old_attempt_cannot_overwrite_result(tmp_path, monkeypatch, mismatch):
+                 conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+         record_restart_interruption(SimpleNamespace(kanban_json=json.dumps(context)))
+         assert worker_result(context['db'], context) == {}
++
++
++@pytest.mark.asyncio
++async def test_failed_booking_write_does_not_raise(monkeypatch):
++    import gateway.session_kanban_restart as r
++    import gateway.session_runtime_workers as w
++
++    async def boom(authority, fn):
++        raise RuntimeError('database is locked')
++    monkeypatch.setattr(w, 'tracked_write', boom)
++    await r.book_restart_interruption(object(), SimpleNamespace(kanban_json='{}'))
+-- 
+2.55.0
+

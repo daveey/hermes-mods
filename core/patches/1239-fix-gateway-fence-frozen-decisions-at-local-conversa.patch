@@ -1,0 +1,214 @@
+From 903f425fa63606c267c2b45646beff2a74348d19 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 12:03:08 +0000
+Subject: [PATCH] fix(gateway): fence frozen decisions at local conversation
+ reset [daveey]
+
+---
+ gateway/session_automation.py               | 15 ++--
+ hermes_state_runtime.py                     | 38 +++++++--
+ tests/gateway/test_frozen_decision_reset.py | 88 +++++++++++++++++++++
+ 3 files changed, 128 insertions(+), 13 deletions(-)
+ create mode 100644 tests/gateway/test_frozen_decision_reset.py
+
+diff --git a/gateway/session_automation.py b/gateway/session_automation.py
+index f19db6fcc84..f663243a252 100644
+--- a/gateway/session_automation.py
++++ b/gateway/session_automation.py
+@@ -618,16 +618,21 @@ async def _reset_and_retarget_local(authority, runner, session_key, old_session_
+         old_targets = authority.db.get_compression_lineage(old_session_id) or [old_session_id]
+         entry = runner.session_store.reset_session(session_key)
+         if entry is None or entry.session_id in old_targets:
+-            return entry, []
++            return entry, ([], [])
+         return entry, retarget_local_automation(
+             authority.db, epoch=authority.epoch, session_id=owner.session_id,
+             principal_id='automation:' + session_key, old_targets=old_targets, new_target=entry.session_id)
+ 
++    def settle(result):
++        entry, (moved, cancelled) = result
++        for admission_id in cancelled:
++            authority._settle_cancelled(owner, admission_id)
++        if moved:
++            authority._publish_pending(owner)
++        return entry
++
+     async with live.mutation_lock:
+-        entry, moved = await tracked_write(authority, rotate_and_retarget, ordered=True)
+-    if moved:
+-        authority._publish_pending(owner)
+-    return entry
++        return await tracked_write(authority, rotate_and_retarget, settle, ordered=True)
+ 
+ 
+ async def reset_and_rehome_messages(runner, session_key, old_session_id):
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index 49207f5508d..3ca6f869f0a 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -413,15 +413,33 @@ def rehome_queued_inputs(db, *, epoch: int, old_session_id: str, new_session_id:
+     return db._execute_write(write)
+ 
+ 
++def _conversation_bound_automation(row, descriptor):
++    """Closed producer policy: a frozen decision follows compression, never a reset.
++
++    Match the durable producer identity, not model text or a request-id prefix. This also
++    protects decisions queued before the policy shipped, without rewriting their payload.
++    """
++    if descriptor.get('identity') != row['request_id']:
++        return False
++    try:
++        identity = json.loads(row['request_id'])
++    except (TypeError, ValueError):
++        return False
++    return (isinstance(identity, list) and len(identity) == 2 and identity[0] == 'user-steps'
++            and isinstance(identity[1], str) and bool(identity[1]))
++
++
+ def retarget_local_automation(db, *, epoch: int, session_id: str, principal_id: str,
+-                               old_targets, new_target: str) -> list[str]:
++                               old_targets, new_target: str) -> tuple[list[str], list[str]]:
+     """Point a LOCAL owner's still-queued ``principal_id`` automation rows (a Bot Chat's queued
+     ``hermes peer dm`` turns, plugin and completion notices) that name a pre-reset transcript in
+     ``old_targets`` at ``new_target``, in one transaction (the compression-exhaustion auto-reset).
+     A LOCAL FIFO's owner is its receipt id and survives the reset; only the descriptor's ``target``
+-    goes stale, and the drain refuses a stale one (``admission_conflict``), pausing the FIFO for
+-    good. Admission id, request id and seq are kept; the digest is re-keyed to the new payload.
+-    Nothing moves behind an ``unknown`` head. Returns the retargeted admission ids in FIFO order."""
++    goes stale. Generic rows keep their admission id, request id and seq; the digest is re-keyed
++    to the new payload. Nothing moves behind an ``unknown`` head. Frozen user-steps decisions
++    are cancelled instead of retargeted: their approval belongs to the old conversation, not
++    its fresh reset. Their payload/digest stay immutable. Returns (retargeted ids, cancelled
++    ids), each in FIFO order; the caller settles the cancellations for observers."""
+     for value in (session_id, principal_id, new_target, *old_targets):
+         _text(value)
+     old_targets = set(old_targets)
+@@ -431,22 +449,26 @@ def retarget_local_automation(db, *, epoch: int, session_id: str, principal_id:
+         _session(conn, new_target)
+         if conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='unknown'",
+                         (session_id,)).fetchone():
+-            return []
+-        moved = []
++            return [], []
++        moved, cancelled = [], []
+         for row in conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "
+                                 "AND principal_id=? ORDER BY seq", (session_id, principal_id)).fetchall():
+             payload = json.loads(row['payload_json'])
+             descriptor = payload.get('local_automation_v1') if isinstance(payload, dict) else None
+             if not isinstance(descriptor, dict) or descriptor.get('target') not in old_targets:
+                 continue
++            if _conversation_bound_automation(row, descriptor):
++                conn.execute(_CANCEL_QUEUED, (row['admission_id'],))
++                cancelled.append(row['admission_id'])
++                continue
+             descriptor['target'] = new_target
+             digest = admission_fingerprint(canonical_target=session_id, payload={'input': payload, 'intent': row['intent']})
+             conn.execute("UPDATE session_admissions SET payload_json=?,payload_digest=? WHERE admission_id=? AND status='queued'",
+                          (_json(payload), digest, row['admission_id']))
+             moved.append(row['admission_id'])
+-        if moved:
++        if moved or cancelled:
+             conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (session_id,))
+-        return moved
++        return moved, cancelled
+     return db._execute_write(write)
+ 
+ 
+diff --git a/tests/gateway/test_frozen_decision_reset.py b/tests/gateway/test_frozen_decision_reset.py
+new file mode 100644
+index 00000000000..12882625654
+--- /dev/null
++++ b/tests/gateway/test_frozen_decision_reset.py
+@@ -0,0 +1,88 @@
++"""Frozen user-steps decisions follow compression, never a new conversation."""
++import json
++
++import pytest
++
++from tests.gateway.test_local_resume_compression_child import _runner, _compress
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('rotation', ['compression', 'reset', 'compressed-reset'])
++@pytest.mark.parametrize('generic_identity', ['generic-notice', '["user-steps-other","operation"]',
++                                              '["user-steps","operation","extra"]'])
++async def test_queued_frozen_decision_target_fence(tmp_path, monkeypatch, rotation, generic_identity):
++    from gateway import run
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_contract import Principal
++    from gateway.session_local import create_local_session
++    from gateway.session_automation import reset_and_rehome_messages, restore_local_automation
++    from gateway.platforms.event import MessageEvent
++    from hermes_state_runtime import get_session_admission, claim_session_input
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
++    runner = _runner(tmp_path)
++    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
++    monkeypatch.setattr(authority, '_schedule_admitted', lambda *args: None)
++    actor = Principal('human', 'fixture', frozenset({'session:create', 'session:read'}), 'socket')
++    ref = create_local_session(authority, actor, dict(request_id='create', source='gui',
++        cwd=str(tmp_path), model='m', toolsets=[]))
++    live = authority.sessions[ref.session_id]
++    store = runner.session_store
++    try:
++        ids = []
++        for identity, text in [(json.dumps(['user-steps', 'operation'], separators=(',', ':')), 'frozen answer'),
++                               (generic_identity, 'generic automation')]:
++            event = MessageEvent(text=text, source=live.source, internal=True, message_id=identity,
++                metadata={'gateway_session_key': live.route, 'gateway_session_id': ref.session_id})
++            receipt = await authority.admit_automation(runner._adapter_for_source(live.source), event, identity)
++            ids.append(receipt.admission_id)
++        before = [get_session_admission(authority.db, admission_id=i) for i in ids]
++        with authority.db._read_ctx() as conn:
++            digest = conn.execute('SELECT payload_digest FROM session_admissions WHERE admission_id=?', (ids[0],)).fetchone()[0]
++        import asyncio
++        waiter = authority.waiters[ids[0]] = asyncio.get_running_loop().create_future()
++        monkeypatch.setattr(authority, '_schedule', lambda *args: None)
++        events = []
++        publish = live.event_stream.publish
++        def record_event(sid, event, **kwargs):
++            events.append(event)
++            return publish(sid, event, **kwargs)
++        monkeypatch.setattr(live.event_stream, 'publish', record_event)
++        target = ref.session_id
++        if rotation != 'reset':
++            store._record_gateway_session_peer(ref.session_id, live.route, live.source)
++            _compress(authority.db, ref.session_id, 'compressed-child', 'local')
++            store._record_gateway_session_peer('compressed-child', live.route, live.source)
++            assert store.advance_compression_session(live.route, ref.session_id, 'compressed-child')
++            target = 'compressed-child'
++        if rotation != 'compression':
++            old = authority.db.get_compression_tip(ref.session_id)
++            entry, release = await reset_and_rehome_messages(runner, live.route, old)
++            release()
++            target = entry.session_id
++            assert target != ref.session_id
++        rows = [get_session_admission(authority.db, admission_id=i) for i in ids]
++        if rotation != 'compression':
++            assert rows[0]['status'] == 'terminal'
++            assert rows[0]['outcome'] == 'cancelled'
++            assert rows[0]['payload'] == before[0]['payload']
++            with authority.db._read_ctx() as conn:
++                assert conn.execute('SELECT payload_digest FROM session_admissions WHERE admission_id=?', (ids[0],)).fetchone()[0] == digest
++            assert waiter.done() and waiter.result() is None
++            assert [e['admission_id'] for e in events if e.get('outcome') == 'cancelled'] == [ids[0]]
++            expected = ids[1]
++        else:
++            assert restore_local_automation(authority, ref, rows[0]).metadata['gateway_session_id'] == target
++            expected = ids[0]
++        # Generic reset semantics and FIFO remain intact; no new-conversation decision can be claimed.
++        generic = restore_local_automation(authority, ref, rows[1])
++        assert generic.text == 'generic automation'
++        assert generic.metadata['gateway_session_id'] == target
++        claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=ref.session_id)
++        assert claimed['admission_id'] == expected
++        for old, row in zip(before, rows):
++            assert (row['admission_id'], row['request_id'], row['seq']) == (
++                old['admission_id'], old['request_id'], old['seq'])
++    finally:
++        store.close_all_db_handles()
+-- 
+2.55.0
+

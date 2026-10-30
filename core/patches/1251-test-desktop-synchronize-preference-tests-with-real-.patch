@@ -1,0 +1,433 @@
+From 7bf24ed230b5f2690f9814010ab9a9fc2cdbd5c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:41:33 -0700
+Subject: [PATCH] test(desktop): synchronize preference tests with real bridge
+ completion (#300)
+
+* test(desktop): await preference bridge writes instead of fixed ticks [daveey]
+
+* test(desktop): distinguish owned preferences from provisional pending defaults [daveey]
+
+* test(desktop): bound debounce admission waits by condition, not waitFor's 1s default [daveey]
+---
+ .../lib/ui-preferences/guidance-sync.test.ts  | 20 ++++----
+ .../ui-preferences/sync-concurrent.test.ts    | 42 +++++++++-------
+ .../lib/ui-preferences/sync-defaults.test.ts  | 38 ++++++++++----
+ .../src/lib/ui-preferences/sync-store.test.ts | 35 +++++++------
+ .../lib/ui-preferences/sync-test-bridge.ts    | 50 +++++++++++++++++++
+ 5 files changed, 131 insertions(+), 54 deletions(-)
+ create mode 100644 apps/desktop/src/lib/ui-preferences/sync-test-bridge.ts
+
+diff --git a/apps/desktop/src/lib/ui-preferences/guidance-sync.test.ts b/apps/desktop/src/lib/ui-preferences/guidance-sync.test.ts
+index 7dcb04ef1b1..c98848068f8 100644
+--- a/apps/desktop/src/lib/ui-preferences/guidance-sync.test.ts
++++ b/apps/desktop/src/lib/ui-preferences/guidance-sync.test.ts
+@@ -6,6 +6,8 @@ import { afterEach, expect, it, vi } from 'vitest'
+ 
+ import { parseUiPreferencesWrite, readUiPreferences, writeUiPreferences } from '../../../electron/ui-preferences'
+ 
++import { observeSync } from './sync-test-bridge'
++
+ // Transform the stores this file loads while it is collected, outside the
+ // test's timeout: vi.resetModules() keeps the transformed code, so a load only
+ // re-evaluates it. Left to the first load(), the cold transform timed the test
+@@ -18,7 +20,6 @@ window.localStorage.clear()
+ window.sessionStorage.clear()
+ 
+ const dirs: string[] = []
+-const tick = (ms = 400) => new Promise(resolve => setTimeout(resolve, ms))
+ 
+ afterEach(() => {
+   window.localStorage.clear()
+@@ -38,14 +39,14 @@ async function load(file: string) {
+   sync.captureOwnPreferences()
+   sync.hydrateFromSnapshot(readUiPreferences(file))
+ 
+-  const stop = sync.startUiPreferencesSync({
++  const client = observeSync(sync.startUiPreferencesSync, {
+     read: async () => readUiPreferences(file),
+     write: payload => writeUiPreferences(file, parseUiPreferencesWrite(payload))
+   })
+ 
+   return {
+     onboarding: await import('@/store/onboarding'),
+-    stop,
++    ...client,
+     tips: await import('@/store/tips')
+   }
+ }
+@@ -56,16 +57,17 @@ it('onboarding skipped and tips seen or dismissed in one browser stay so in anot
+   const file = path.join(dir, 'ui-preferences.json')
+ 
+   const first = await load(file)
+-  await tick()
+-  first.onboarding.dismissFirstRunOnboarding()
+-  first.tips.showTip({ side: 'top', targets: [], text: 'One', tipId: 'catalog:one' })
+-  first.tips.retireTips(['catalog:two'])
+-  await tick()
++  await first.connected()
++  await first.writeAfter(() => {
++    first.onboarding.dismissFirstRunOnboarding()
++    first.tips.showTip({ side: 'top', targets: [], text: 'One', tipId: 'catalog:one' })
++    first.tips.retireTips(['catalog:two'])
++  })
+   first.stop()
+ 
+   // A phone, or the same Webapp on another origin: its own empty localStorage.
+   const second = await load(file)
+-  await tick()
++  await second.connected()
+   second.stop()
+ 
+   expect(second.onboarding.$desktopOnboarding.get().firstRunSkipped).toBe(true)
+diff --git a/apps/desktop/src/lib/ui-preferences/sync-concurrent.test.ts b/apps/desktop/src/lib/ui-preferences/sync-concurrent.test.ts
+index 1d72b4fc856..61922a54437 100644
+--- a/apps/desktop/src/lib/ui-preferences/sync-concurrent.test.ts
++++ b/apps/desktop/src/lib/ui-preferences/sync-concurrent.test.ts
+@@ -12,6 +12,7 @@ import {
+ } from '../../../electron/ui-preferences'
+ 
+ import type { UiPreferencesBridge } from './sync'
++import { observeSync } from './sync-test-bridge'
+ 
+ // Edits made from a stale view while another client changed the store
+ // (#145536 re-review round 3), against the real native writer on a real file:
+@@ -23,7 +24,6 @@ const FAVORITES = 'hermes.desktop.favorite-models'
+ const dirs: string[] = []
+ const stops: (() => void)[] = []
+ const listeners = new Set<(snapshot: UiPreferencesSnapshot) => void>()
+-const tick = (ms = 400) => new Promise(resolve => setTimeout(resolve, ms))
+ 
+ function storeFile(): string {
+   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-ui-concurrent-'))
+@@ -69,10 +69,16 @@ async function pageLoad(file: string, { net = { online: true }, favoritesStore =
+   sync.hydrateFromSnapshot(net.online && fs.existsSync(file) ? readUiPreferences(file) : null)
+   const store = favoritesStore ? await import('@/store/favorite-models') : null
+   const storage = await import('@/lib/storage')
+-  stops.push(sync.startUiPreferencesSync(bridgeFor(file, net)))
+-  await tick()
++  const client = observeSync(sync.startUiPreferencesSync, bridgeFor(file, net))
++  stops.push(client.stop)
+ 
+-  return { storage, store }
++  if (net.online) {
++    await client.connected()
++  } else {
++    await expect(client.connected()).rejects.toThrow('fetch failed')
++  }
++
++  return { ...client, storage, store }
+ }
+ 
+ const closeTabs = () => stops.splice(0).forEach(stop => stop())
+@@ -93,14 +99,13 @@ it('a favorite another client removed stays removed when a tab that still lists
+   const file = storeFile()
+   await writeUiPreferences(file, { values: { [FAVORITES]: JSON.stringify(['p::X', 'p::Y']) } })
+   window.localStorage.setItem(FAVORITES, JSON.stringify(['p::X', 'p::Y']))
+-  const { store } = await pageLoad(file)
++  const { store, writeAfter } = await pageLoad(file)
+ 
+   // Native unfavorites X; the push lands here, the favorites atom keeps its read.
+   const snapshot = await writeUiPreferences(file, { values: { [FAVORITES]: JSON.stringify(['p::Y']) } })
+   listeners.forEach(callback => callback(snapshot))
+-  await tick(50)
+-  store?.toggleFavoriteModel('p', 'W')
+-  await tick()
++  expect(window.localStorage.getItem(FAVORITES)).toBe(JSON.stringify(['p::Y']))
++  await writeAfter(() => store?.toggleFavoriteModel('p', 'W'))
+ 
+   expect(favorites(file)).toEqual(['p::Y', 'p::W'])
+ })
+@@ -115,7 +120,6 @@ it('an offline star carried over a reload or a takeover joins the favorites nati
+ 
+     const { store } = await pageLoad(file, { net: { online: false } })
+     store?.toggleFavoriteModel('p', 'W')
+-    await tick()
+ 
+     if (carry === 'takeover') {
+       window.dispatchEvent(new PageTransitionEvent('pagehide'))
+@@ -124,7 +128,8 @@ it('an offline star carried over a reload or a takeover joins the favorites nati
+ 
+     closeTabs()
+     await writeUiPreferences(file, { values: { [FAVORITES]: JSON.stringify(['p::A', 'p::N']) } })
+-    await pageLoad(file)
++    const reloaded = await pageLoad(file)
++    await reloaded.flushed()
+ 
+     expect([carry, favorites(file).sort()]).toEqual([carry, ['p::A', 'p::N', 'p::W']])
+     closeTabs()
+@@ -134,26 +139,29 @@ it('an offline star carried over a reload or a takeover joins the favorites nati
+ }, 15_000)
+ 
+ it('a frozen tab whose unsent edit another tab took over never re-sends it over a newer choice', async () => {
++  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+   const file = storeFile()
+   await writeUiPreferences(file, { values: { [MODE]: 'light' } })
+   window.localStorage.setItem(MODE, 'light')
+   const frozenNet = { online: true }
+   const frozen = await pageLoad(file, { favoritesStore: false, net: frozenNet })
+   frozenNet.online = false
+-  frozen.storage.writeKey(MODE, 'dark')
+-  await tick()
++  await frozen.writeAfter(() => frozen.storage.writeKey(MODE, 'dark')).catch(error => {
++    expect(error.message).toBe('fetch failed')
++  })
+ 
+   // That tab stops beating for two minutes; a new tab adopts its edit, then
+   // the user picks again there.
+-  vi.useFakeTimers({ now: Date.now() + 120_000, toFake: ['Date'] })
++  vi.setSystemTime(Date.now() + 120_000)
+   window.sessionStorage.clear()
+   const fresh = await pageLoad(file, { favoritesStore: false })
+-  fresh.storage.writeKey(MODE, 'system')
+-  await tick()
+-  vi.useRealTimers()
++  await fresh.writeAfter(() => fresh.storage.writeKey(MODE, 'system'))
+ 
++  const attempts = frozen.write.mock.calls.length
+   frozenNet.online = true // the frozen tab wakes; its retry fires
+-  await tick(6000)
++  // Exercise the scheduled retry, not an immediately-true negative assertion.
++  await vi.advanceTimersByTimeAsync(6000)
++  expect(frozen.write).toHaveBeenCalledTimes(attempts)
+ 
+   expect(stored(file, MODE)).toBe('system')
+ }, 15_000)
+diff --git a/apps/desktop/src/lib/ui-preferences/sync-defaults.test.ts b/apps/desktop/src/lib/ui-preferences/sync-defaults.test.ts
+index b477c910a81..4eed10dca61 100644
+--- a/apps/desktop/src/lib/ui-preferences/sync-defaults.test.ts
++++ b/apps/desktop/src/lib/ui-preferences/sync-defaults.test.ts
+@@ -12,6 +12,7 @@ import {
+ } from '../../../electron/ui-preferences'
+ 
+ import type { UiPreferencesBridge } from './sync'
++import { observeSync } from './sync-test-bridge'
+ 
+ // A value a store writes for itself at load (its default, a migration from
+ // config) is not the user's choice and must never reach the machine's store
+@@ -53,7 +54,6 @@ window.localStorage.clear()
+ window.sessionStorage.clear()
+ 
+ const dirs: string[] = []
+-const tick = (ms = 400) => new Promise(resolve => setTimeout(resolve, ms))
+ 
+ function storeFile(): string {
+   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-ui-defaults-'))
+@@ -78,18 +78,36 @@ function realBridge(file: string) {
+   return { bridge, push: () => changed?.(readUiPreferences(file)) }
+ }
+ 
++function storageKeys() {
++  return Array.from({ length: window.localStorage.length }, (_, index) => window.localStorage.key(index) ?? '')
++}
++
++function expectNoPendingDefaults(ownKeys: Set<string>) {
++  // A leaked provisional write is queued synchronously. Checking the outbox
++  // catches it even before the debounce fires; stopping sync must not hide it.
++  // A value this client already owned may legitimately be queued during join.
++  const pending = storageKeys()
++    .filter(key => key.startsWith('hermes:ui-preferences:outbox:'))
++    .flatMap(key => Object.keys(JSON.parse(window.localStorage.getItem(key) ?? '{}').values ?? {}))
++    .filter(key => !ownKeys.has(key))
++
++  expect(pending).toEqual([])
++}
++
+ /** One page load, as boot.ts + main.tsx run it: capture, hydrate, then the app's stores. */
+ async function load(file: string, app: () => Promise<void>) {
+   vi.resetModules()
+   const sync = await import('./sync')
+   sync.captureOwnPreferences()
+   sync.hydrateFromSnapshot(readUiPreferences(file))
++  const ownKeys = new Set(storageKeys())
+   const { bridge, push } = realBridge(file)
+-  const stop = sync.startUiPreferencesSync(bridge)
++  const client = observeSync(sync.startUiPreferencesSync, bridge)
+   await app()
+-  await tick()
++  await client.connected()
++  expectNoPendingDefaults(ownKeys)
+ 
+-  return { push, stop }
++  return { ...client, push }
+ }
+ 
+ /** One page load in production order: the app's stores evaluate before main.tsx starts the sync. */
+@@ -98,14 +116,16 @@ async function boot(file: string) {
+   const sync = await import('./sync')
+   sync.captureOwnPreferences()
+   sync.hydrateFromSnapshot(readUiPreferences(file))
++  const ownKeys = new Set(storageKeys())
+ 
+   for (const load of LOAD_WRITERS) {
+     await load()
+   }
+ 
+-  const stop = sync.startUiPreferencesSync(realBridge(file).bridge)
+-  await tick()
+-  stop()
++  const client = observeSync(sync.startUiPreferencesSync, realBridge(file).bridge)
++  await client.connected()
++  expectNoPendingDefaults(ownKeys)
++  client.stop()
+ }
+ 
+ /** Native Desktop's localStorage is another origin's: switch to it. */
+@@ -173,12 +193,10 @@ it('a migrated auto-speak value stays put here while the store lacks it, and a r
+   // Another client's change reaches this joined window: nothing it lacks is pruned.
+   await writeUiPreferences(file, { values: { [THEME]: 'mono' } })
+   native.push()
+-  await tick()
+   expect(window.localStorage.getItem(AUTO_SPEAK)).toBe('true')
+   expect(readUiPreferences(file).values).toEqual({ [THEME]: 'mono' })
+ 
+-  await choose.autoSpeak?.(false)
+-  await tick()
++  await native.writeAfter(() => choose.autoSpeak?.(false))
+   native.stop()
+ 
+   expect(readUiPreferences(file).values).toEqual({ [AUTO_SPEAK]: 'false', [THEME]: 'mono' })
+diff --git a/apps/desktop/src/lib/ui-preferences/sync-store.test.ts b/apps/desktop/src/lib/ui-preferences/sync-store.test.ts
+index 0f7bfafe2f2..de31def7e6b 100644
+--- a/apps/desktop/src/lib/ui-preferences/sync-store.test.ts
++++ b/apps/desktop/src/lib/ui-preferences/sync-store.test.ts
+@@ -13,6 +13,7 @@ import {
+ import { writeKey } from '../storage'
+ 
+ import { captureOwnPreferences, hydrateFromSnapshot, startUiPreferencesSync, type UiPreferencesBridge } from './sync'
++import { observeSync } from './sync-test-bridge'
+ 
+ // The renderer sync against the real native writer on a real file (#145536 review).
+ const DENSITY = 'hermes.desktop.sessionListDensity'
+@@ -21,7 +22,6 @@ const THEME = 'hermes-desktop-theme-v2'
+ const USER_THEMES = 'hermes-desktop-user-themes-v1'
+ const KEYBINDS = 'hermes.desktop.keybinds'
+ const dirs: string[] = []
+-const tick = (ms = 400) => new Promise(resolve => setTimeout(resolve, ms))
+ 
+ function storeFile(): string {
+   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-ui-sync-'))
+@@ -61,11 +61,10 @@ it('a store a fresh client created never removes another client’s values: it i
+   // its default as its module loads, then makes first contact and changes one.
+   captureOwnPreferences()
+   window.localStorage.setItem(KEYBINDS, '{}')
+-  let stop = startUiPreferencesSync(realBridge(file).bridge)
+-  await tick()
+-  writeKey(DENSITY, 'detailed')
+-  await tick()
+-  stop()
++  let client = observeSync(startUiPreferencesSync, realBridge(file).bridge)
++  await client.connected()
++  await client.writeAfter(() => writeKey(DENSITY, 'detailed'))
++  client.stop()
+ 
+   // Native Desktop, another origin, launches with its own preferences.
+   window.localStorage.clear()
+@@ -73,9 +72,9 @@ it('a store a fresh client created never removes another client’s values: it i
+   Object.entries(mine).forEach(([key, value]) => window.localStorage.setItem(key, value))
+   captureOwnPreferences()
+   hydrateFromSnapshot(readUiPreferences(file))
+-  stop = startUiPreferencesSync(realBridge(file).bridge)
+-  await tick()
+-  stop()
++  client = observeSync(startUiPreferencesSync, realBridge(file).bridge)
++  await client.connected()
++  client.stop()
+ 
+   expect(Object.fromEntries(Object.keys(mine).map(key => [key, window.localStorage.getItem(key)]))).toEqual(mine)
+   expect(window.localStorage.getItem(DENSITY)).toBe('detailed')
+@@ -91,16 +90,15 @@ it('a corrupt store is kept aside and open windows follow its replacement, re-im
+   }
+ 
+   const { bridge, push } = realBridge(file)
+-  const stop = startUiPreferencesSync(bridge)
+-  await tick()
+-  expect(window.localStorage.getItem(DENSITY)).toBe('d4')
++  const client = observeSync(startUiPreferencesSync, bridge)
++  await client.connected()
++  await vi.waitFor(() => expect(window.localStorage.getItem(DENSITY)).toBe('d4'))
+ 
+   const torn = '{"version":1,"revision":6,"val'
+   fs.writeFileSync(file, torn)
+   await writeUiPreferences(file, { values: { [DENSITY]: 'compact' } }) // e.g. the Webapp's next write
+-  push()
+-  await tick()
+-  stop()
++  await client.writeAfter(push)
++  client.stop()
+ 
+   const backups = fs.readdirSync(path.dirname(file)).filter(name => name.startsWith('ui-preferences.json.corrupt-'))
+ 
+@@ -138,9 +136,10 @@ it('same-origin tabs keep each other’s unsent changes', async () => {
+   Object.entries(sessionA).forEach(([key, value]) => window.sessionStorage.setItem(key, value))
+   vi.resetModules()
+   const reloadedA = await import('./sync')
+-  const stop = reloadedA.startUiPreferencesSync(realBridge(file).bridge)
+-  await tick()
+-  stop()
++  const client = observeSync(reloadedA.startUiPreferencesSync, realBridge(file).bridge)
++  await client.connected()
++  await client.flushed()
++  client.stop()
+ 
+   expect(readUiPreferences(file).values[DENSITY]).toBe('detailed')
+ })
+diff --git a/apps/desktop/src/lib/ui-preferences/sync-test-bridge.ts b/apps/desktop/src/lib/ui-preferences/sync-test-bridge.ts
+new file mode 100644
+index 00000000000..6532ef6d073
+--- /dev/null
++++ b/apps/desktop/src/lib/ui-preferences/sync-test-bridge.ts
+@@ -0,0 +1,50 @@
++import { afterEach, expect, vi } from 'vitest'
++
++import type { startUiPreferencesSync, UiPreferencesBridge } from './sync'
++
++const stops = new Set<() => void>()
++// Bound on waiting for the 150ms debounce to reach the bridge. A loaded host can
++// fire that timer late; this is a condition wait, so an idle run never waits it out.
++const ADMISSION = { timeout: 10_000 }
++
++afterEach(() => [...stops].forEach(stop => stop()))
++
++/** Observe real transport completion, including a seed write started by join(). */
++export function observeSync(start: typeof startUiPreferencesSync, bridge: UiPreferencesBridge) {
++  const read = vi.spyOn(bridge, 'read')
++  const write = vi.spyOn(bridge, 'write')
++  const stopSync = start(bridge)
++
++  const stop = () => {
++    if (stops.delete(stop)) {
++      stopSync()
++    }
++  }
++
++  stops.add(stop)
++
++  const connected = async () => {
++    const snapshot = await read.mock.results[0].value
++    await Promise.all(write.mock.results.map(result => result.value))
++
++    if (snapshot.exists || write.mock.results.length > 0) {
++      await vi.waitFor(() => expect(window.localStorage.getItem('hermes:ui-preferences:generation')).toBeTruthy())
++    }
++  }
++
++  const writeAfter = async (action: () => unknown) => {
++    const count = write.mock.calls.length
++    await action()
++    // Wait for the debounce to enter the bridge, then await the actual I/O.
++    // The writer may take longer than waitFor's polling budget.
++    await vi.waitFor(() => expect(write.mock.calls.length).toBeGreaterThan(count), ADMISSION)
++    await Promise.all(write.mock.results.slice(count).map(result => result.value))
++  }
++
++  const flushed = async () => {
++    await vi.waitFor(() => expect(write.mock.calls.some(([payload]) => !payload.seed)).toBe(true), ADMISSION)
++    await Promise.all(write.mock.results.map(result => result.value))
++  }
++
++  return { connected, flushed, stop, write, writeAfter }
++}
+-- 
+2.55.0
+

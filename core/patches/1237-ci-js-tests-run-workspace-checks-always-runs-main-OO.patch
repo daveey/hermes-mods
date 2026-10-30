@@ -1,0 +1,437 @@
+From 7a33a706f5505b2752955e3f8032d8555826b979 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 08:11:44 +0000
+Subject: [PATCH] ci(js-tests): run-workspace-checks always runs main; OOM
+ count is per run [daveey]
+
+Review of the admission change: guarding main() on import.meta.url ===
+argv[1] made the CLI exit 0 having run nothing when started through a
+symlink (Node resolves the module URL, not argv[1]). The pure admission
+functions move to workspace-check-admission.mjs, which the test imports,
+and the CLI calls main() unconditionally.
+
+A runner container can serve many jobs, so memory.events oom_kill is
+read before and after and the summary reports the difference; the
+memory.peak line says it is since cgroup start. Tests: the CLI lists
+units through a symlinked path; oom_kill parsing; the real
+apps/desktop manifest test asserts the four units killed together do
+not fit together instead of pinning the exact heavy set.
+---
+ .github/scripts/run-workspace-checks.mjs      | 153 +++---------------
+ .github/scripts/workspace-check-admission.mjs | 127 +++++++++++++++
+ tests-js/run-workspace-checks.test.mjs        |  39 ++++-
+ 3 files changed, 186 insertions(+), 133 deletions(-)
+ create mode 100644 .github/scripts/workspace-check-admission.mjs
+
+diff --git a/.github/scripts/run-workspace-checks.mjs b/.github/scripts/run-workspace-checks.mjs
+index 56188239c74..ee94d1ae6b4 100644
+--- a/.github/scripts/run-workspace-checks.mjs
++++ b/.github/scripts/run-workspace-checks.mjs
+@@ -13,16 +13,7 @@
+ // group that collapses. Children that write to one stdout together interleave
+ // their lines, and a failure is then hard to read.
+ //
+-// Admission is by CPU and by memory. The runner slots are 4 CPUs and 8 GiB
+-// with no swap; four apps/desktop units started together (tsc, the vite build
+-// inside `pack`, two vitest pools) went past 8 GiB and the cgroup OOM killer
+-// SIGKILLed tsc and vite (runs 41009740205, 41016178444). A package declares
+-// the measured peak of each heavy unit in its package.json
+-// `checkMemoryMiB` map; a unit starts only when its peak fits in what the
+-// running units leave of the memory budget. A unit bigger than the whole
+-// budget still runs, alone. The apps/desktop values are each unit's cgroup
+-// memory.peak measured alone in a 4-CPU / 8 GiB / no-swap scope, plus ~10%
+-// (ui vitest 3.1 GiB, tsc + eslint 3.0, pack + packaged-app tests 2.4).
++// Admission is by CPU and by memory: see workspace-check-admission.mjs.
+ //
+ // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
+ // `--concurrency N` sets the CPU limit. `--list` prints the units and exits.
+@@ -31,55 +22,13 @@ import { execFileSync, spawn } from 'node:child_process'
+ import { readFileSync } from 'node:fs'
+ import { availableParallelism, totalmem } from 'node:os'
+ import { join } from 'node:path'
+-import { pathToFileURL } from 'node:url'
++
++import { memoryBudgetMiB, oomKills, schedule, unitsOf } from './workspace-check-admission.mjs'
+ 
+ const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
+ const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+-const MIB = 2 ** 20
+-
+-// A unit with no declared peak: the light checks (tsc + eslint of a small
+-// package, a short vitest run) measure 0.4-1.1 GiB.
+-export const DEFAULT_UNIT_MIB = 1024
+-// Left out of the budget for the runner itself (Runner.Worker, Xvfb, this
+-// process) and for page cache the cgroup also charges.
+-export const RESERVED_MIB = 1024
+ 
+-/**
+- * @typedef {{pkg: string, script: string, memoryMiB: number}} Unit
+- * @typedef {{location: string, path?: string, scripts?: Record<string,string>}} WorkspacePkg
+- */
+-
+-/**
+- * The units of every workspace, each with its declared memory peak.
+- *
+- * @param {WorkspacePkg[]} pkgs
+- * @param {(pkg: WorkspacePkg) => Record<string, number> | undefined} readMemory
+- * @returns {Unit[]}
+- */
+-export function unitsOf(pkgs, readMemory) {
+-  /** @type {Unit[]} */
+-  const units = []
+-  for (const pkg of pkgs) {
+-    const scripts = pkg.scripts || {}
+-    const subs = Object.keys(scripts).filter((s) => /^check:.+$/.test(s))
+-    const names = subs.length > 0 ? subs : scripts.check ? ['check'] : []
+-    const memory = readMemory(pkg) || {}
+-    for (const declared of Object.keys(memory)) {
+-      // A renamed check would otherwise drop back to the default peak and
+-      // be admitted next to the units it was declared to keep out.
+-      if (!names.includes(declared)) {
+-        throw new Error(`${pkg.location}: checkMemoryMiB names "${declared}", which is not a check unit of this package`)
+-      }
+-      if (!Number.isInteger(memory[declared]) || memory[declared] <= 0) {
+-        throw new Error(`${pkg.location}: checkMemoryMiB["${declared}"] must be a positive integer of MiB`)
+-      }
+-    }
+-    for (const script of names) {
+-      units.push({ pkg: pkg.location, script, memoryMiB: memory[script] ?? DEFAULT_UNIT_MIB })
+-    }
+-  }
+-  return units
+-}
++/** @typedef {import('./workspace-check-admission.mjs').Unit} Unit */
+ 
+ /** @returns {Unit[]} */
+ function discoverUnits() {
+@@ -94,79 +43,23 @@ function discoverUnits() {
+   )
+ }
+ 
+-/**
+- * The memory the checks may use, in MiB: the cgroup limit when there is one
+- * (a runner container's `--memory`), else physical memory, less the reserve.
+- *
+- * @param {{constrained?: number, total: number}} machine bytes
+- */
+-export function memoryBudgetMiB({ constrained, total }) {
+-  // constrainedMemory() is 0 or 2^64-1 with no limit set.
+-  const limit = constrained && constrained > 0 && constrained < total ? constrained : total
+-  return Math.max(1, Math.floor(limit / MIB) - RESERVED_MIB)
+-}
+-
+-/**
+- * Start each unit when a CPU slot is free and its memory peak fits in the
+- * budget the running units leave. Queue order is kept, but a later unit that
+- * fits starts before an earlier one that doesn't. A unit larger than the
+- * whole budget starts only when nothing else runs.
+- *
+- * @template R
+- * @param {Unit[]} units
+- * @param {{concurrency: number, budgetMiB: number, run: (unit: Unit) => Promise<R>, onDone?: (r: R) => void}} opts
+- * @returns {Promise<R[]>}
+- */
+-export function schedule(units, { concurrency, budgetMiB, run, onDone }) {
+-  const pending = [...units]
+-  /** @type {R[]} */
+-  const results = []
+-  let running = 0
+-  let usedMiB = 0
+-  return new Promise((resolve, reject) => {
+-    function pump() {
+-      for (let i = 0; i < pending.length && running < concurrency; ) {
+-        const unit = pending[i]
+-        const cost = Math.min(unit.memoryMiB, budgetMiB)
+-        if (running > 0 && usedMiB + cost > budgetMiB) {
+-          i++
+-          continue
+-        }
+-        pending.splice(i, 1)
+-        running++
+-        usedMiB += cost
+-        run(unit).then((res) => {
+-          running--
+-          usedMiB -= cost
+-          results.push(res)
+-          onDone?.(res)
+-          pump()
+-        }, reject)
+-      }
+-      if (pending.length === 0 && running === 0) resolve(results)
+-    }
+-    pump()
+-  })
+-}
+-
+-/** The job cgroup's memory accounting (Linux cgroup v2), or null. */
++/** The job cgroup's memory files (Linux cgroup v2), or null. */
+ function cgroupMemory() {
++  let rel
+   try {
+-    const rel = readFileSync('/proc/self/cgroup', 'utf-8').match(/^0::(.*)$/m)?.[1]
+-    if (rel === undefined) return null
+-    const dir = join('/sys/fs/cgroup', rel)
+-    const read = (/** @type {string} */ f) => {
+-      try {
+-        return readFileSync(join(dir, f), 'utf-8').trim()
+-      } catch {
+-        return null
+-      }
+-    }
+-    const oomKill = read('memory.events')?.match(/^oom_kill (\d+)$/m)?.[1]
+-    return { max: read('memory.max'), peak: read('memory.peak'), oomKill: oomKill === undefined ? null : Number(oomKill) }
++    rel = readFileSync('/proc/self/cgroup', 'utf-8').match(/^0::(.*)$/m)?.[1]
+   } catch {
+     return null
+   }
++  if (rel === undefined) return null
++  const read = (/** @type {string} */ f) => {
++    try {
++      return readFileSync(join('/sys/fs/cgroup', rel, f), 'utf-8').trim()
++    } catch {
++      return null
++    }
++  }
++  return { max: read('memory.max'), peak: read('memory.peak'), oomKill: oomKills(read('memory.events')) }
+ }
+ 
+ /** @param {Unit} unit */
+@@ -220,6 +113,9 @@ async function main() {
+     flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
+   )
+   const budgetMiB = memoryBudgetMiB({ constrained: process.constrainedMemory?.(), total: totalmem() })
++  // A runner container can serve many jobs, so its counters start where the
++  // last job left them; this run's OOM kills are the difference.
++  const oomBefore = cgroupMemory()?.oomKill ?? null
+ 
+   console.log(`running ${units.length} checks, up to ${concurrency} at a time within ${budgetMiB} MiB:`)
+   for (const u of units) console.log(`  ${u.pkg} :: ${u.script}  (${u.memoryMiB} MiB)`)
+@@ -249,10 +145,13 @@ async function main() {
+   // whether the memory limit did it.
+   const mem = cgroupMemory()
+   if (mem) {
+-    console.log(`  cgroup memory: max=${mem.max} peak=${mem.peak ?? 'n/a'} oom_kill=${mem.oomKill ?? 'n/a'}`)
+-    if (mem.oomKill) {
++    const kills = mem.oomKill === null || oomBefore === null ? null : mem.oomKill - oomBefore
++    console.log(
++      `  cgroup memory: max=${mem.max} peak since cgroup start=${mem.peak ?? 'n/a'} oom_kill this run=${kills ?? 'n/a'}`,
++    )
++    if (kills) {
+       console.error(
+-        `::error::the cgroup OOM killer ran ${mem.oomKill} time(s): a check was killed for memory (limit ${mem.max}); fix checkMemoryMiB, not the check`,
++        `::error::the cgroup OOM killer ran ${kills} time(s) during these checks (limit ${mem.max}): fix checkMemoryMiB, not the check`,
+       )
+     }
+   }
+@@ -267,4 +166,4 @@ async function main() {
+   console.log(`\nall ${results.length} checks passed`)
+ }
+ 
+-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main()
++await main()
+diff --git a/.github/scripts/workspace-check-admission.mjs b/.github/scripts/workspace-check-admission.mjs
+new file mode 100644
+index 00000000000..95a89071cdc
+--- /dev/null
++++ b/.github/scripts/workspace-check-admission.mjs
+@@ -0,0 +1,127 @@
++// Which workspace checks run-workspace-checks.mjs may start together.
++//
++// Admission is by CPU and by memory. The runner slots are 4 CPUs and 8 GiB
++// with no swap; four apps/desktop units started together (tsc, the vite build
++// inside `pack`, two vitest pools) went past 8 GiB and the kernel SIGKILLed
++// tsc and vite (runs 41009740205, 41016178444). A package declares the
++// measured peak of each heavy unit in its package.json `checkMemoryMiB` map;
++// a unit starts only when its peak fits in what the running units leave of
++// the memory budget. A unit bigger than the whole budget still runs, alone.
++// The apps/desktop values are each unit's cgroup memory.peak measured alone
++// in a 4-CPU / 8 GiB / no-swap scope, plus ~10% (ui vitest 3.1 GiB,
++// tsc + eslint 3.0, pack + packaged-app tests 2.4).
++//
++// Pure functions only, so tests import them without running the checks.
++
++const MIB = 2 ** 20
++
++// A unit with no declared peak: the light checks (tsc + eslint of a small
++// package, a short vitest run) measure 0.4-1.1 GiB.
++export const DEFAULT_UNIT_MIB = 1024
++// Left out of the budget for the runner itself (Runner.Worker, Xvfb, the
++// npm wrappers) and for page cache the cgroup also charges.
++export const RESERVED_MIB = 1024
++
++/**
++ * @typedef {{pkg: string, script: string, memoryMiB: number}} Unit
++ * @typedef {{location: string, path?: string, scripts?: Record<string,string>}} WorkspacePkg
++ */
++
++/**
++ * The units of every workspace, each with its declared memory peak.
++ *
++ * @param {WorkspacePkg[]} pkgs
++ * @param {(pkg: WorkspacePkg) => Record<string, number> | undefined} readMemory
++ * @returns {Unit[]}
++ */
++export function unitsOf(pkgs, readMemory) {
++  /** @type {Unit[]} */
++  const units = []
++  for (const pkg of pkgs) {
++    const scripts = pkg.scripts || {}
++    const subs = Object.keys(scripts).filter((s) => /^check:.+$/.test(s))
++    const names = subs.length > 0 ? subs : scripts.check ? ['check'] : []
++    const memory = readMemory(pkg) || {}
++    for (const declared of Object.keys(memory)) {
++      // A renamed check would otherwise drop back to the default peak and
++      // be admitted next to the units it was declared to keep out.
++      if (!names.includes(declared)) {
++        throw new Error(`${pkg.location}: checkMemoryMiB names "${declared}", which is not a check unit of this package`)
++      }
++      if (!Number.isInteger(memory[declared]) || memory[declared] <= 0) {
++        throw new Error(`${pkg.location}: checkMemoryMiB["${declared}"] must be a positive integer of MiB`)
++      }
++    }
++    for (const script of names) {
++      units.push({ pkg: pkg.location, script, memoryMiB: memory[script] ?? DEFAULT_UNIT_MIB })
++    }
++  }
++  return units
++}
++
++/**
++ * The memory the checks may use, in MiB: the cgroup limit when there is one
++ * (a runner container's `--memory`), else physical memory, less the reserve.
++ *
++ * @param {{constrained?: number, total: number}} machine bytes
++ */
++export function memoryBudgetMiB({ constrained, total }) {
++  // constrainedMemory() is 0 or 2^64-1 with no limit set.
++  const limit = constrained && constrained > 0 && constrained < total ? constrained : total
++  return Math.max(1, Math.floor(limit / MIB) - RESERVED_MIB)
++}
++
++/**
++ * Start each unit when a CPU slot is free and its memory peak fits in the
++ * budget the running units leave. Queue order is kept, but a later unit that
++ * fits starts before an earlier one that doesn't. A unit larger than the
++ * whole budget starts only when nothing else runs.
++ *
++ * @template R
++ * @param {Unit[]} units
++ * @param {{concurrency: number, budgetMiB: number, run: (unit: Unit) => Promise<R>, onDone?: (r: R) => void}} opts
++ * @returns {Promise<R[]>}
++ */
++export function schedule(units, { concurrency, budgetMiB, run, onDone }) {
++  const pending = [...units]
++  /** @type {R[]} */
++  const results = []
++  let running = 0
++  let usedMiB = 0
++  return new Promise((resolve, reject) => {
++    function pump() {
++      for (let i = 0; i < pending.length && running < concurrency; ) {
++        const unit = pending[i]
++        const cost = Math.min(unit.memoryMiB, budgetMiB)
++        if (running > 0 && usedMiB + cost > budgetMiB) {
++          i++
++          continue
++        }
++        pending.splice(i, 1)
++        running++
++        usedMiB += cost
++        run(unit)
++          .then((res) => {
++            running--
++            usedMiB -= cost
++            results.push(res)
++            onDone?.(res)
++            pump()
++          })
++          .catch(reject)
++      }
++      if (pending.length === 0 && running === 0) resolve(results)
++    }
++    pump()
++  })
++}
++
++/**
++ * The `oom_kill` count of a cgroup v2 `memory.events` file, or null.
++ *
++ * @param {string | null} events
++ */
++export function oomKills(events) {
++  const n = events?.match(/^oom_kill (\d+)$/m)?.[1]
++  return n === undefined ? null : Number(n)
++}
+diff --git a/tests-js/run-workspace-checks.test.mjs b/tests-js/run-workspace-checks.test.mjs
+index 0f2806b22de..8a42e527d1e 100644
+--- a/tests-js/run-workspace-checks.test.mjs
++++ b/tests-js/run-workspace-checks.test.mjs
+@@ -1,4 +1,8 @@
+-import { readFileSync } from 'node:fs'
++import { execFileSync } from 'node:child_process'
++import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { fileURLToPath } from 'node:url'
+ 
+ import { expect, test } from 'vitest'
+ 
+@@ -6,9 +10,10 @@ import {
+   DEFAULT_UNIT_MIB,
+   RESERVED_MIB,
+   memoryBudgetMiB,
++  oomKills,
+   schedule,
+   unitsOf,
+-} from '../.github/scripts/run-workspace-checks.mjs'
++} from '../.github/scripts/workspace-check-admission.mjs'
+ 
+ const GIB = 2 ** 30
+ 
+@@ -101,17 +106,39 @@ test("apps/desktop's real manifest keeps its heavy units from all starting toget
+   const location = 'apps/desktop'
+   const manifest = JSON.parse(readFileSync(new URL('../apps/desktop/package.json', import.meta.url), 'utf-8'))
+   const units = unitsOf([{ location, scripts: manifest.scripts }], () => manifest.checkMemoryMiB)
+-  const heavy = units.filter((u) => u.memoryMiB > DEFAULT_UNIT_MIB).map((u) => u.script)
+-  expect(heavy.sort()).toEqual(
+-    ['check:lint', 'check:test:desktop:all', 'check:test:desktop:platforms', 'check:test:ui'].sort(),
+-  )
+   const budgetMiB = memoryBudgetMiB({ constrained: 8 * GIB, total: 32 * GIB })
++  // The four units that were SIGKILLed together must not fit together.
++  const killedTogether = ['check:lint', 'check:test:desktop:all', 'check:test:desktop:platforms', 'check:test:ui']
++  const declared = units.filter((u) => killedTogether.includes(u.script)).reduce((sum, u) => sum + u.memoryMiB, 0)
++  expect(declared).toBeGreaterThan(budgetMiB)
+   const { results, peakMiB, peakCount } = await trace(units, { concurrency: 4, budgetMiB })
+   expect(results).toHaveLength(units.length)
+   expect(peakMiB).toBeLessThanOrEqual(budgetMiB)
+   expect(peakCount).toBeLessThan(4)
+ })
+ 
++test('the CLI runs when started through a symlinked path, so it never exits green having run nothing', () => {
++  const dir = mkdtempSync(join(tmpdir(), 'rwc-'))
++  try {
++    const link = join(dir, 'run-workspace-checks.mjs')
++    symlinkSync(fileURLToPath(new URL('../.github/scripts/run-workspace-checks.mjs', import.meta.url)), link)
++    const out = execFileSync(process.execPath, [link, '--list'], {
++      cwd: fileURLToPath(new URL('..', import.meta.url)),
++      encoding: 'utf-8',
++    })
++    expect(out).toMatch(/^apps\/desktop :: check:lint {2}\(\d+ MiB\)$/m)
++  } finally {
++    rmSync(dir, { recursive: true, force: true })
++  }
++})
++
++test('oom_kill is read from memory.events, and its absence is not zero', () => {
++  const events = 'low 0\nhigh 0\nmax 12\noom 3\noom_kill 2\noom_group_kill 0\n'
++  expect(oomKills(events)).toBe(2)
++  expect(oomKills('low 0\nmax 0\n')).toBeNull()
++  expect(oomKills(null)).toBeNull()
++})
++
+ test('a declared peak for a check that does not exist is an error, not a silent default', () => {
+   const pkgs = [{ location: 'apps/desktop', scripts: { 'check:lint': 'x' } }]
+   expect(() => unitsOf(pkgs, () => ({ 'check:typecheck': 3000 }))).toThrow(/not a check unit/)
+-- 
+2.55.0
+

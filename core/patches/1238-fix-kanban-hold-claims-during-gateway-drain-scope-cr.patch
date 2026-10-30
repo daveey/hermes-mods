@@ -1,0 +1,611 @@
+From 01a4e743defa83524983aa169d3de558f026defe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:10:51 -0700
+Subject: [PATCH] fix(kanban): hold claims during gateway drain; scope crash
+ output to current run (#297)
+
+* fix(kanban): hold claims during gateway drain and scope diagnostics to their run [daveey]
+
+* fix(kanban): rebase drain admission onto restart-wait; marker-aware legacy refusal detection
+
+* fix(kanban): logs predating the run marker keep their trailer/Session fallback
+---
+ hermes_cli/kanban_db_dispatch.py              |  62 +++-----
+ hermes_cli/kanban_gateway_drain.py            |  24 +++
+ hermes_cli/kanban_owner_unavailable.py        |   3 +-
+ hermes_cli/kanban_worker_log.py               |  48 +++++-
+ .../test_kanban_core_functionality.py         |  27 ++--
+ .../test_kanban_create_skill_validation.py    |   7 +-
+ tests/hermes_cli/test_kanban_gateway_drain.py | 138 ++++++++++++++++++
+ .../test_kanban_managed_worker_loss.py        |  16 +-
+ .../test_kanban_worker_exit_trailer.py        |   6 +-
+ .../test_kanban_worker_owner_restart.py       |  11 +-
+ 10 files changed, 268 insertions(+), 74 deletions(-)
+ create mode 100644 hermes_cli/kanban_gateway_drain.py
+ create mode 100644 tests/hermes_cli/test_kanban_gateway_drain.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index fa545f870c8..94dfb9f9d57 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -381,7 +381,7 @@ _EXIT_TRAILER_RE = re.compile(
+ )
+ 
+ 
+-def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
++def _worker_log_exit_code(task_id: str, board: Optional[str] = None, *, run_id=None) -> Optional[int]:
+     """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
+ 
+     The durable twin of ``_recent_worker_exits``: written by the worker itself
+@@ -390,10 +390,12 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
+     wins — the log is append-mode across re-runs.
+     """
+     try:
+-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
++        raw = _kb.read_worker_log(task_id, tail_bytes=None if run_id is not None else 4000, board=board)
+     except Exception:
+         return None
+-    matches = _EXIT_TRAILER_RE.findall(raw or "")
++    # A log with no run marker predates it (worker spawned before the deploy): last trailer wins, as before.
++    scoped = current_run_log(raw or '', run_id=run_id) if run_id is not None and '[kanban-worker-start]' in (raw or '') else raw or ''
++    matches = _EXIT_TRAILER_RE.findall(scoped)
+     return int(matches[-1]) if matches else None
+ 
+ 
+@@ -1226,37 +1228,7 @@ from hermes_cli.kanban_worker_log import (
+     current_run_log, exit_summary_marker as _exit_summary_marker, log_noise_prefixes as _log_noise_prefixes)
+ 
+ 
+-def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
+-    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
+-
+-    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
+-    (``_default_spawn``), so when it exits without a terminal board call the
+-    reason is usually sitting there: the model's own explanation of why it could
+-    not comply (#88603), or the rendered provider error (#46593). The reap used to
+-    discard it in favour of a canned message on every retry. Trims the CLI exit
+-    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
+-    on a missing/empty log.
+-
+-    ``board`` must come from the dispatching tick: ambient current-board resolution
+-    is wrong for every board but the one the dispatcher thread happens to call
+-    "current", so the log would silently not be found.
+-    """
+-    try:
+-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+-    except Exception:
+-        return ""
+-    if not raw:
+-        return ""
+-    raw = _EXIT_TRAILER_RE.sub("", current_run_log(raw))
+-    cut = raw.rfind(_exit_summary_marker())
+-    if cut != -1:
+-        raw = raw[:cut]
+-    lines = []
+-    for ln in raw.splitlines():
+-        ln = _LOG_CHROME.sub("", ln).strip()
+-        if ln and not ln.startswith((*_log_noise_prefixes(), _worker_scope.SNAPSHOT_PREFIX)):
+-            lines.append(ln)
+-    return " ".join(lines)[-400:]
++from hermes_cli.kanban_worker_log import _worker_final_output
+ 
+ 
+ def _classify_dead_worker(
+@@ -1269,7 +1241,7 @@ def _classify_dead_worker(
+     in the event payload, appended to the error text) so the board and the retry
+     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+     """
+-    log = _kb.read_worker_log(task_id, tail_bytes=4000, board=board) if task_id and run_id else ""
++    log = _kb.read_worker_log(task_id, tail_bytes=None, board=board) if task_id and run_id else ""
+     failure = _worker_scope.read_failure(task_id, run_id, log or "") if task_id else None
+     if failure:
+         kind = "oom_killed" if failure["scope_result"] == "oom-kill" else "signaled"
+@@ -1280,9 +1252,9 @@ def _classify_dead_worker(
+         dead = _DeadWorker(kind, None, _worker_scope.describe(failure), kind,
+                            {"pid": pid, "claimer": claimer, **failure})
+     else:
+-        dead = _ou.noted(_classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board), conn, task_id, run_id, log)
++        dead = _ou.noted(_classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board, run_id=run_id), conn, task_id, run_id, log)
+     if task_id and not dead.rate_limited:
+-        worker_output = _worker_final_output(task_id, board=board)
++        worker_output = _worker_final_output(task_id, board=board, run_id=run_id)
+         if worker_output:
+             dead.error_text += f"{WORKER_OUTPUT_SEP}{worker_output!r}"
+             dead.event_payload["worker_output"] = worker_output
+@@ -1300,6 +1272,7 @@ def _classify_dead_worker_exit(
+     *,
+     task_id: Optional[str] = None,
+     board: Optional[str] = None,
++    run_id: Optional[int] = None,
+ ) -> _DeadWorker:
+     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
+ 
+@@ -1314,7 +1287,7 @@ def _classify_dead_worker_exit(
+     if exit_code is not None:
+         kind, code = _exit_code_kind(int(exit_code))
+     elif kind == "unknown" and task_id:
+-        logged = _worker_log_exit_code(task_id, board=board)
++        logged = _worker_log_exit_code(task_id, board=board, run_id=run_id)
+         if logged is not None:
+             kind, code = _exit_code_kind(logged)
+     if kind == "clean_exit":
+@@ -2329,9 +2302,9 @@ def _dispatch_lane_task(
+         result.spawned.append((task_id, assignee, ""))
+         _count_spawn(assignee)
+         return True
+-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
++    from hermes_cli.kanban_gateway_drain import claim_if_admitting
+     _kb._sync.pop_claim_deferral(task_id)
+-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
++    claimed = claim_if_admitting(conn, task_id, assignee, lane, ttl_seconds)
+     if claimed is None:
+         deferral = _kb._sync.pop_claim_deferral(task_id)
+         if deferral is not None:  # the Board said no this tick: the caller moves on to the next candidate
+@@ -2642,6 +2615,10 @@ def _dispatch_once_locked(
+         # Agent-owned blocks get one triage respawn after 2h; standing human asks are re-checked every tick.
+         from hermes_cli.kanban_block_policy import sweep_blocked_cards
+         sweep_blocked_cards(conn, result)
++    from hermes_cli.kanban_gateway_drain import dispatch_paused
++    if dispatch_paused():
++        _kb._log.info('kanban dispatcher: scheduling paused — gateway draining or restart requested')
++        return result
+     may_spawn, spawn_budget = _tick_spawn_budget(
+         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+     )
+@@ -3038,7 +3015,10 @@ def _open_worker_log(task: Task, board: Optional[str]):
+     log_path = log_dir / f"{task.id}.log"
+     from hermes_cli.kanban_worker_log import rotate_worker_log, worker_log_rotation_config
+     rotate_worker_log(log_path, *worker_log_rotation_config())
+-    return open(log_path, "ab")
++    log = open(log_path, "ab")
++    log.write(f'\n[kanban-worker-start] run_id={task.current_run_id}\n'.encode())
++    log.flush()  # must reach disk before a child can fail (even before importing its client)
++    return log
+ 
+ 
+ def _restart_safe_worker_argv(task: Task, command: list[str], board: Optional[str] = None) -> list[str]:
+diff --git a/hermes_cli/kanban_gateway_drain.py b/hermes_cli/kanban_gateway_drain.py
+new file mode 100644
+index 00000000000..06c5b9d05cc
+--- /dev/null
++++ b/hermes_cli/kanban_gateway_drain.py
+@@ -0,0 +1,24 @@
++"""Hold new Kanban claims while the owning gateway drains for a restart."""
++from pathlib import Path
++
++
++def claim_if_admitting(conn, task_id, assignee, lane, ttl_seconds):
++    """Recheck the assignee's owner immediately before either ready/review claim."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.profiles import resolve_profile_env
++    try:
++        owner_home = resolve_profile_env(assignee)
++    except FileNotFoundError:
++        owner_home = None
++    if dispatch_paused(owner_home):
++        return None
++    claim = kb.claim_review_task if lane == 'review' else kb.claim_task
++    return claim(conn, task_id, ttl_seconds=ttl_seconds)
++
++
++def dispatch_paused(home=None):
++    """Read the owning gateway's lifecycle snapshot; dead snapshots must not park work forever."""
++    from gateway.status import read_runtime_status, runtime_status_pid_is_live
++    record = read_runtime_status(Path(home) / 'gateway_state.json' if home else None)
++    return bool(record and (record.get('gateway_state') == 'draining' or record.get('restart_requested'))
++                and runtime_status_pid_is_live(record))
+diff --git a/hermes_cli/kanban_owner_unavailable.py b/hermes_cli/kanban_owner_unavailable.py
+index 2982845f9f2..75a382e1dd9 100644
+--- a/hermes_cli/kanban_owner_unavailable.py
++++ b/hermes_cli/kanban_owner_unavailable.py
+@@ -61,7 +61,8 @@ _LEGACY_REFUSAL_RE = re.compile(
+ def legacy_refusal_in_log(log: str) -> bool:
+     """True when the dead run's own part of the log ends with the old client's drain refusal."""
+     from hermes_cli.kanban_worker_log import current_run_log
+-    lines = [ln.strip() for ln in current_run_log(log or "").splitlines() if ln.strip()]
++    from hermes_cli.kanban_db_dispatch import _EXIT_TRAILER_RE
++    lines = [ln.strip() for ln in _EXIT_TRAILER_RE.sub("", current_run_log(log or "")).splitlines() if ln.strip()]
+     return bool(lines) and bool(_LEGACY_REFUSAL_RE.match(lines[-1]))
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_log.py b/hermes_cli/kanban_worker_log.py
+index f6a7347e76e..df57fcf93ae 100644
+--- a/hermes_cli/kanban_worker_log.py
++++ b/hermes_cli/kanban_worker_log.py
+@@ -75,7 +75,7 @@ def log_noise_prefixes() -> tuple[str, ...]:
+     return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
+ 
+ 
+-def current_run_log(raw: str) -> str:
++def current_run_log(raw: str, run_id=None) -> str:
+     """[daveey] Only the dead run's own part of the append-only per-task log.
+ 
+     Every run ends with an exit trailer (``[kanban-worker-exit] rc=N``). The dead run's own trailer
+@@ -84,6 +84,15 @@ def current_run_log(raw: str) -> str:
+     so its crash notice read as the worker re-asking the earlier question."""
+     import re
+     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
++    starts = list(re.finditer(r'^\[kanban-worker-start\] run_id=(\d+)[ \t]*$', raw, re.MULTILINE))
++    if starts:
++        start = starts[-1]
++        if run_id is not None and start.group(1) != str(run_id):
++            return ''
++        return raw[start.end():]
++    # No marker anywhere: the log predates the marker (a worker spawned before this version was
++    # deployed), so fall back to the trailer / Session cut below. Readers with a run_id read the whole
++    # file, so "no marker" is never a truncated tail.
+     trailers = list(re.finditer(r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"\d+\s*$", raw.rstrip(), re.MULTILINE))
+     body = raw.rstrip()
+     if trailers and trailers[-1].end() == len(body):
+@@ -94,3 +103,40 @@ def current_run_log(raw: str) -> str:
+     # trailer and this run's Session line is the previous run's reply (t_01a188a461c0178c run 10258).
+     starts = list(re.finditer(r"^Session: \S+[ \t]*$", body, re.MULTILINE))
+     return body[starts[-1].start():] if starts else body
++
++
++def _worker_final_output(task_id: str, board: Optional[str] = None, *, run_id=None) -> str:
++    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
++
++    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
++    (``_default_spawn``), so when it exits without a terminal board call the
++    reason is usually sitting there: the model's own explanation of why it could
++    not comply (#88603), or the rendered provider error (#46593). The reap used to
++    discard it in favour of a canned message on every retry. Trims the CLI exit
++    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
++    on a missing/empty log.
++
++    ``board`` must come from the dispatching tick: ambient current-board resolution
++    is wrong for every board but the one the dispatcher thread happens to call
++    "current", so the log would silently not be found.
++    """
++    from hermes_cli import kanban_db as _kb
++    from hermes_cli.kanban_db_dispatch import _EXIT_TRAILER_RE, _LOG_CHROME, _worker_scope
++    _exit_summary_marker, _log_noise_prefixes = exit_summary_marker, log_noise_prefixes
++    try:
++        raw = _kb.read_worker_log(task_id, tail_bytes=None if run_id is not None else 4000, board=board)
++    except Exception:
++        return ""
++    if not raw:
++        return ""
++    raw = _EXIT_TRAILER_RE.sub("", current_run_log(raw, run_id=run_id))
++    cut = raw.rfind(_exit_summary_marker())
++    if cut != -1:
++        raw = raw[:cut]
++    lines = []
++    for ln in raw.splitlines():
++        ln = _LOG_CHROME.sub("", ln).strip()
++        if ln and not ln.startswith((*_log_noise_prefixes(), _worker_scope.SNAPSHOT_PREFIX)):
++            lines.append(ln)
++    return " ".join(lines)[-400:]
++
+diff --git a/tests/hermes_cli/test_kanban_core_functionality.py b/tests/hermes_cli/test_kanban_core_functionality.py
+index ee64f5aee0c..074eaee7d32 100644
+--- a/tests/hermes_cli/test_kanban_core_functionality.py
++++ b/tests/hermes_cli/test_kanban_core_functionality.py
+@@ -1211,7 +1211,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
+ 
+ 
+ 
+-def _drive_worker_exit(conn, tid, fake_pid, raw_status):
++def _drive_worker_exit(conn, tid, fake_pid, raw_status, worker_output=None):
+     """Claim ``tid``, record ``raw_status`` for its dead worker pid, and run
+     one reaper pass.
+ 
+@@ -1227,6 +1227,9 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
+     host_prefix = _kb._claimer_id().split(":", 1)[0]
+     claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+     assert claimed is not None, "task was not claimable for the next attempt"
++    if worker_output is not None:
++        with _kbd._open_worker_log(claimed, None) as log:
++            log.write(worker_output.encode())
+     _kbd._set_worker_pid(conn, tid, fake_pid)
+     _kbd._record_worker_exit(fake_pid, raw_status)
+     original_alive = _kb._pid_alive
+@@ -1237,20 +1240,20 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
+         _kb._pid_alive = original_alive
+ 
+ 
+-def _drive_protocol_violation(conn, tid, fake_pid):
++def _drive_protocol_violation(conn, tid, fake_pid, worker_output=None):
+     """One clean-exit protocol violation reaper pass for ``tid``.
+ 
+     os.W_EXITCODE(status=0, signal=0) == 0 on POSIX.
+     """
+-    return _drive_worker_exit(conn, tid, fake_pid, 0)
++    return _drive_worker_exit(conn, tid, fake_pid, 0, worker_output)
+ 
+ 
+-def _drive_nonzero_crash(conn, tid, fake_pid):
++def _drive_nonzero_crash(conn, tid, fake_pid, worker_output=None):
+     """One plain non-zero-exit crash reaper pass for ``tid``.
+ 
+     W_EXITCODE(1, 0) == 256 — WIFEXITED True, WEXITSTATUS == 1.
+     """
+-    return _drive_worker_exit(conn, tid, fake_pid, 256)
++    return _drive_worker_exit(conn, tid, fake_pid, 256, worker_output)
+ 
+ 
+ @pytest.mark.platforms("linux")
+@@ -1363,11 +1366,7 @@ def test_dead_worker_reap_surfaces_the_workers_own_last_output(kanban_home, driv
+     conn = kbc.connect()
+     try:
+         tid = kb.create_task(conn, title="handoff", assignee="worker")
+-        log_path = kb.worker_log_path(tid)
+-        log_path.parent.mkdir(parents=True, exist_ok=True)
+-        log_path.write_text(_WORKER_LOG_TAIL)
+-
+-        drive(conn, tid, 991100)
++        drive(conn, tid, 991100, worker_output=_WORKER_LOG_TAIL)
+ 
+         task = kb.get_task(conn, tid)
+         assert "no reassignment operation" in (task.last_failure_error or "")
+@@ -1394,11 +1393,11 @@ def test_dead_worker_reap_reads_the_log_of_the_dispatching_board(kanban_home):
+     conn = kbc.connect(board=board)
+     try:
+         tid = kb.create_task(conn, title="handoff", assignee="worker")
+-        log_path = kb.worker_log_path(tid, board=board)
+-        log_path.parent.mkdir(parents=True, exist_ok=True)
+-        log_path.write_text(_WORKER_LOG_TAIL)
+         host_prefix = kb._claimer_id().split(":", 1)[0]
+-        assert kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
++        claimed = kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
++        assert claimed is not None
++        with kbd._open_worker_log(claimed, board) as log:
++            log.write(_WORKER_LOG_TAIL.encode())
+         kbd._set_worker_pid(conn, tid, 991101)
+         kbd._record_worker_exit(991101, 0)
+         original_alive = kb._pid_alive
+diff --git a/tests/hermes_cli/test_kanban_create_skill_validation.py b/tests/hermes_cli/test_kanban_create_skill_validation.py
+index 0fec51d3613..9a26dcc8a64 100644
+--- a/tests/hermes_cli/test_kanban_create_skill_validation.py
++++ b/tests/hermes_cli/test_kanban_create_skill_validation.py
+@@ -163,9 +163,10 @@ def test_unknown_skill_exit_blocks_as_assignment_without_retry(board, monkeypatc
+         pid = 72000
+         conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+         conn.commit()
+-        log = _kb.worker_log_path(tid)
+-        log.parent.mkdir(parents=True, exist_ok=True)
+-        log.write_text("Error: Unknown skill(s): x\n", encoding="utf-8")
++        task = kb.get_task(conn, tid)
++        assert task is not None
++        with kbd._open_worker_log(task, None) as log:
++            log.write(b'Error: Unknown skill(s): x\n')
+         kbd._record_worker_exit(pid, 1 << 8)
+ 
+         assert tid in kbd.detect_crashed_workers(conn)
+diff --git a/tests/hermes_cli/test_kanban_gateway_drain.py b/tests/hermes_cli/test_kanban_gateway_drain.py
+new file mode 100644
+index 00000000000..1e98f48333a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gateway_drain.py
+@@ -0,0 +1,138 @@
++"""A gateway drain suppresses new claims, and diagnostic logs belong to exactly one run."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'profile_exists', lambda name: True)
++    return tmp_path
++
++
++@pytest.mark.parametrize('state', [dict(gateway_state='draining'), dict(restart_requested=True)])
++def test_drain_suppresses_claims_but_resumes_when_running(home, monkeypatch, state):
++    from gateway import status
++    monkeypatch.setattr(status, 'runtime_status_pid_is_live', lambda record: True)
++    path = home / 'gateway_state.json'
++    path.write_text(json.dumps(state))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='waiting for owner', assignee='default')
++        spawned = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
++        assert spawned == []
++        task = kb.get_task(conn, tid)
++        assert task is not None
++        assert task.status == 'ready' and task.current_run_id is None
++        path.write_text(json.dumps(dict(gateway_state='running', restart_requested=False)))
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
++        assert spawned == [tid]
++
++
++def test_run_marker_excludes_old_output_even_without_session_or_trailer(home, monkeypatch):
++    raw = ('Old force-push approval text\n[kanban-worker-exit] rc=0\n'
++           'Old buffered reply after trailer\n[kanban-worker-start] run_id=42\n'
++           'Kanban owner refused: Gateway draining: restart_wait\n[kanban-worker-exit] rc=69\n')
++    monkeypatch.setattr(kb, 'read_worker_log', lambda *a, **k: raw)
++    out = dispatch._worker_final_output('t_x', run_id=42)
++    assert out == 'Kanban owner refused: Gateway draining: restart_wait'
++    assert dispatch._worker_final_output('t_x', run_id=43) == ''
++
++
++def test_dispatcher_marks_run_before_any_client_output(home):
++    task = SimpleNamespace(id='t_x', current_run_id=42)
++    with dispatch._open_worker_log(task, None) as log:
++        log.write(b'current failure\n')
++    text = kb.read_worker_log('t_x')
++    assert text is not None
++    assert text.index('[kanban-worker-start] run_id=42') < text.index('current failure')
++
++
++def test_long_current_reply_retains_diagnostic_tail(home):
++    with dispatch._open_worker_log(SimpleNamespace(id='t_x', current_run_id=42), None) as log:
++        log.write(('x' * 8000 + '\nCURRENT REASON\n[kanban-worker-exit] rc=1\n').encode())
++    assert dispatch._worker_final_output('t_x', run_id=42).endswith('CURRENT REASON')
++    assert dispatch._worker_log_exit_code('t_x', run_id=42) == 1
++
++
++def test_log_from_before_the_marker_deploy_still_yields_its_exit_code(home):
++    # A worker spawned by the pre-marker dispatcher: no marker anywhere, so fall back to the trailer cut.
++    from hermes_cli.kanban_db import worker_log_path
++    path = worker_log_path('t_old', board=None)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text('earlier run\n[kanban-worker-exit] rc=1\nSession: s\nrefused\n[kanban-worker-exit] rc=69\n')
++    assert dispatch._worker_log_exit_code('t_old', run_id=7) == 69
++    assert dispatch._worker_final_output('t_old', run_id=7).endswith('refused')
++
++
++def test_silent_new_run_does_not_inherit_old_interruption_exit(home, monkeypatch):
++    monkeypatch.setattr(dispatch, '_classify_worker_exit', lambda pid: ('unknown', None))
++    with dispatch._open_worker_log(SimpleNamespace(id='t_x', current_run_id=41), None) as log:
++        log.write(b'[kanban-worker-exit] rc=69\n')
++    with dispatch._open_worker_log(SimpleNamespace(id='t_x', current_run_id=42), None):
++        pass
++    assert dispatch._worker_log_exit_code('t_x', run_id=42) is None
++    dead = dispatch._classify_dead_worker(99999999, 'owner', task_id='t_x', run_id=42)
++    assert dead.event_kind == 'crashed'
++
++
++@pytest.mark.parametrize('reply', ['CURRENT FAILURE', ''])
++def test_crash_notice_never_inherits_previous_run(home, monkeypatch, reply):
++    monkeypatch.setattr(kb, '_pid_alive', lambda pid: False)
++    monkeypatch.setattr(dispatch, '_classify_worker_exit', lambda pid: ('nonzero_exit', 1))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='current output only', assignee='default')
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        assert task is not None
++        log_path = kb.worker_log_path(tid)
++        log_path.parent.mkdir(parents=True, exist_ok=True)
++        log_path.write_text('OLD FORCE PUSH APPROVAL\n[kanban-worker-exit] rc=0\nOLD BUFFERED OUTPUT\n')
++        with dispatch._open_worker_log(task, None) as log:
++            log.write(reply.encode())
++        dispatch._set_worker_pid(conn, tid, 99999999)
++        assert tid in dispatch.detect_crashed_workers(conn)
++        event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='crashed'", (tid,)).fetchone()
++        payload = json.loads(event[0])
++        assert payload.get('worker_output', '') == reply
++        run = conn.execute('SELECT error FROM task_runs WHERE id=?', (task.current_run_id,)).fetchone()
++        assert 'OLD' not in run[0]
++
++
++def test_dead_drain_snapshot_does_not_stop_new_work(home, monkeypatch):
++    from gateway import status
++    monkeypatch.setattr(status, 'runtime_status_pid_is_live', lambda record: False)
++    (home / 'gateway_state.json').write_text(json.dumps({'gateway_state': 'draining'}))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='dead owner', assignee='default')
++        spawned = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
++        assert spawned == [tid]
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_assignee_owner_drain_blocks_claim_before_spawn(home, monkeypatch, lane):
++    from gateway import status
++    from hermes_cli import profiles
++    owner = home / 'profiles' / 'other'
++    owner.mkdir(parents=True)
++    (owner / 'gateway_state.json').write_text(json.dumps({'restart_requested': True}))
++    monkeypatch.setattr(status, 'runtime_status_pid_is_live', lambda record: True)
++    monkeypatch.setattr(profiles, 'resolve_profile_env', lambda name: str(owner))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='profile drain', assignee='other')
++        conn.execute('UPDATE tasks SET status=? WHERE id=?', (lane, tid))
++        conn.commit()
++        spawned = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id))
++        assert spawned == []
++        task = kb.get_task(conn, tid)
++        assert task is not None
++        assert task.status == lane and task.current_run_id is None
+diff --git a/tests/hermes_cli/test_kanban_managed_worker_loss.py b/tests/hermes_cli/test_kanban_managed_worker_loss.py
+index b0422bced80..5bdebbc2166 100644
+--- a/tests/hermes_cli/test_kanban_managed_worker_loss.py
++++ b/tests/hermes_cli/test_kanban_managed_worker_loss.py
+@@ -178,11 +178,11 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
+     run_id = board.running("t_clean", claim_expires_in=900, heartbeat_age=30,
+                            worker_lost="managed_worker_failed")
+     # The worker's own exit trailer says rc=0 (the CLI's epilogue after a lost turn).
+-    log = kb.worker_log_path("t_clean")
+-    log.parent.mkdir(parents=True, exist_ok=True)
+     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+-    log.write_text(f"I fixed the protocol violation from the last run.\n{KANBAN_WORKER_EXIT_TRAILER}0\n",
+-                   encoding="utf-8")
++    task = kb.get_task(board.conn, 't_clean')
++    assert task is not None
++    with kbd._open_worker_log(task, None) as log:
++        log.write(f"I fixed the protocol violation from the last run.\n{KANBAN_WORKER_EXIT_TRAILER}0\n".encode())
+     board.tick(failure_limit=2)
+     run = board.run(run_id)
+     assert run["outcome"] == "crashed"
+@@ -203,11 +203,11 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
+ def test_a_crash_whose_output_quotes_protocol_violation_is_not_one(board):
+     """The streak's text match reads our own error head, never the worker's quoted output."""
+     run_id = board.running("t_quote", claim_expires_in=900, heartbeat_age=30, owner=False)
+-    log = kb.worker_log_path("t_quote")
+-    log.parent.mkdir(parents=True, exist_ok=True)
+     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+-    log.write_text(f"Retrying after the earlier protocol violation.\n{KANBAN_WORKER_EXIT_TRAILER}1\n",
+-                   encoding="utf-8")
++    task = kb.get_task(board.conn, 't_quote')
++    assert task is not None
++    with kbd._open_worker_log(task, None) as log:
++        log.write(f"Retrying after the earlier protocol violation.\n{KANBAN_WORKER_EXIT_TRAILER}1\n".encode())
+     board.tick(failure_limit=5)
+     run = board.run(run_id)
+     assert run["outcome"] == "crashed" and "protocol violation" in run["error"]
+diff --git a/tests/hermes_cli/test_kanban_worker_exit_trailer.py b/tests/hermes_cli/test_kanban_worker_exit_trailer.py
+index 9ab14a38859..459d554f6e0 100644
+--- a/tests/hermes_cli/test_kanban_worker_exit_trailer.py
++++ b/tests/hermes_cli/test_kanban_worker_exit_trailer.py
+@@ -42,10 +42,8 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
+         (pid, int(time.time()) - 120, tid),
+     )
+     conn.commit()
+-    log = kb.worker_log_path(tid)
+-    log.parent.mkdir(parents=True, exist_ok=True)
+-    with open(log, "a", encoding="utf-8") as f:
+-        f.write(f"the model said something\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
++    with kbd._open_worker_log(kb.get_task(conn, tid), None) as f:
++        f.write(f"the model said something\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n".encode())
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/hermes_cli/test_kanban_worker_owner_restart.py b/tests/hermes_cli/test_kanban_worker_owner_restart.py
+index 9261d48d4ed..b53de22695b 100644
+--- a/tests/hermes_cli/test_kanban_worker_owner_restart.py
++++ b/tests/hermes_cli/test_kanban_worker_owner_restart.py
+@@ -181,6 +181,13 @@ def _running(conn, title, pid):
+     return tid
+ 
+ 
++def _marked(tid, text):
++    """Prefix the task's current run start marker, as the dispatcher writes before spawning."""
++    with kbc.connect() as c:
++        rid = c.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++    return f"[kanban-worker-start] run_id={rid}\n{text}"
++
++
+ def _reaped(monkeypatch, codes):
+     exits = {pid: ((code & 0xFF) << 8, time.time()) for pid, code in codes.items()}
+     monkeypatch.setattr(kbd, "_recent_worker_exits", exits)
+@@ -235,7 +242,7 @@ def test_a_restart_lost_exit_booked_by_the_next_gateway_is_requeued_too(board, m
+     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+     monkeypatch.setattr(kbd, "_recent_worker_exits", {})
+     trailer = f"Kanban owner restarted: ...\n{KANBAN_WORKER_EXIT_TRAILER}{KANBAN_OWNER_RESTART_EXIT_CODE}\n"
+-    monkeypatch.setattr(kb, "read_worker_log", lambda *a, **kw: trailer)
++    monkeypatch.setattr(kb, "read_worker_log", lambda tid, **kw: _marked(tid, trailer))
+     with kbc.connect() as conn:
+         tids = [_running(conn, f"card {pid}", pid) for pid in (76001, 76002, 76003)]
+         assert kbd.detect_crashed_workers(conn) == []
+@@ -292,7 +299,7 @@ _LEGACY = "Kanban owner refused: Kanban owner silent for 184s: Gateway draining:
+ def _legacy_log(monkeypatch, text):
+     from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+     log = f"{text}\n{KANBAN_WORKER_EXIT_TRAILER}1\n"
+-    monkeypatch.setattr(kb, "read_worker_log", lambda *a, **kw: log)
++    monkeypatch.setattr(kb, "read_worker_log", lambda tid, **kw: _marked(tid, log))
+     monkeypatch.setattr(kbd, "_recent_worker_exits", {})
+ 
+ 
+-- 
+2.55.0
+
