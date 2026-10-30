@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -39,6 +39,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     runtime_contract = _sib("runtime_contract")
     pr_approval_request = _sib("pr_approval_request")
     chat_delivery = _sib("chat_delivery")
+    superseding = _sib("superseding")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -515,6 +516,10 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             return _refuse(session_id, "approval_reconciled", final_response,
                            asks if howto else retirement_candidates, reconciled.get("message", ""),
                            attempt, budget, howto=howto)
+        denial = None if howto else _superseding_reply_hold(session_id, final_response, attempt, budget)
+        if denial is not None:
+            record_verdict(session_id, "held", final_response)
+            return denial
         held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
         if held is not None and attempt < budget:
             return held
@@ -680,6 +685,63 @@ def _pr_filing_hold(session_id: str, tool_name: str, args: dict, request: dict) 
               "This notice grants no approval and changes no task state."}
 
 
+# Process-local one-shot holds, like _PR_FILING_HELD: a retry of the same ask (or reply) passes this check.
+_SUPERSEDING_HELD: set[tuple[str, str, str]] = set()
+
+
+def _superseding_ask_hold(session_id: str, tool_name: str, args: dict, request: dict) -> dict | None:
+    """Hold an approval ask once when open/recently-done cards on its subject go unnamed (agent-4ee5f101e2).
+    Fails open: a board read error never blocks the ask."""
+    if request.get("interaction") != "approval" or superseding.off():
+        return None
+    try:
+        query = "\n".join([str(args.get("title") or ""), request["action"], request["scope"]])
+        named = "\n".join([query, str(args.get("body") or ""), str(args.get("reason") or ""),
+                           request["evidence"], request["why_human"]])
+        own = {str(x) for x in (args.get("task_id"), os.environ.get("HERMES_KANBAN_TASK")) if x}
+        key = (session_id, tool_name, core.text_hash(query))
+        if key in _SUPERSEDING_HELD:
+            core.log_event("superseding_released", tool=tool_name, session=session_id)
+            return None
+        hits = superseding.matches(core, query, named, exclude=own)
+    except Exception as e:
+        core.log_event("superseding_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+    if not hits:
+        return None
+    _SUPERSEDING_HELD.add(key)
+    core.log_event("superseding_held", tool=tool_name, session=session_id,
+                   cards=[(h["id"], h["score"]) for h in hits])
+    return {"action": "block", "message": superseding.ask_message(core, hits)}
+
+
+def _superseding_reply_hold(session_id: str, text: str, attempt: int, budget: int,
+                            surface: str = "reply") -> dict | None:
+    """A reply/clarify that tells David a change he named has 'no sign' of happening must name the in-flight
+    cards on that subject, or say why none is it. Held once per text; fails open."""
+    if attempt >= budget or superseding.off():
+        return None
+    try:
+        found = superseding.denials(text)
+        if not found:
+            return None
+        users = _user_msgs(session_id)
+        last = users[-1] if users else ""
+        key = (session_id, surface, core.text_hash(" ".join(found)))
+        if key in _SUPERSEDING_HELD:
+            return None
+        hits = superseding.matches(core, last + "\n" + text, text)
+    except Exception as e:
+        core.log_event("superseding_error", tool=surface, session=session_id, error=repr(e)[:300])
+        return None
+    if not hits:
+        return None
+    _SUPERSEDING_HELD.add(key)
+    core.log_event("superseding_held", tool=surface, session=session_id, denials=found[:3],
+                   cards=[(h["id"], h["score"]) for h in hits])
+    return {"hold": True, "nudge": superseding.reply_message(core, hits)}
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -692,6 +754,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         filing = _pr_filing_hold(session_id, tool_name, args, request)
         if filing is not None:
             return filing
+        held = _superseding_ask_hold(session_id, tool_name, args, request)
+        if held is not None:
+            return held
         context = {"session_id": session_id, "tool_name": tool_name,
                    "human_request": request, "args": args}
         reconciled = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
@@ -777,6 +842,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             reconciled = _reconcile_prose(session_id, tool_name, candidates) or _retired_block(session_id, candidates)
             if reconciled is not None:
                 return reconciled
+            denial = _superseding_reply_hold(session_id, "\n".join(candidates), 0, 1, surface="clarify")
+            if denial is not None:
+                return {"action": "block", "message": denial["nudge"]}
         delivery = _chat_delivery_gate(session_id, tool_name, args)
         if delivery is not None:
             return delivery

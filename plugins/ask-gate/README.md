@@ -265,6 +265,35 @@ for a route used this turn, and for unverified. Real-model accuracy is not cover
 `scripts/replay_entitlement.py` replays one entitlement and two credential requests through the live judge (run
 on hub 2026-10-29: 3/3 correct for each case).
 
+### Superseding work (`superseding_work`)
+
+Why (five whys): an approval card asked the user to fund on-demand CI hosts (+$500/month) while his own approved
+migration to autoscaling runners sat blocked on the same board. (1) The card offered only spot vs on-demand. (2) Its
+author looked at the current fleet, not at open cards on that subsystem. (3) Nothing at the ask surface made an
+approval ask rule out superseding work: the evidence check verifies the claim, the overlap check matches duplicate
+text only. (4) When the user then asked "but we just moved to EKS?", the agent searched his literal word, found
+nothing, and replied "no sign that CI has moved". (5) Nothing questioned a reply that denies a change the user
+named on a literal-term search.
+
+Fix (`superseding.py`, deterministic, read-only, fails open):
+- An explicit `human_request` with `interaction: approval` on `kanban_create`/`kanban_block`: topic tokens of title +
+  action + scope (hyphen compounds split, ask boilerplate dropped) are scored against every board's open cards and
+  cards done in the last 7 days (IDF over that set; >= 3 shared tokens and >= 18% weighted coverage; open cards
+  first, at most 6). Cards the ask already names by id (title, body, reason, evidence, why_human), the card being
+  blocked, and the worker's own card are dropped. Anything left holds the call once with the list ("name each and
+  say why it does not replace this ask"), logged `superseding_held`; a retry of the same ask passes
+  (`superseding_released`).
+- A final reply or `clarify` question that says "no sign / no evidence / found nothing / hasn't moved" is matched
+  (with the user's last message) the same way and held once with the in-flight cards unless it names them.
+- Known cost: on a busy board most approval asks share a subject with something, so expect one hold per approval
+  ask; in a replay of the hub's last approval cards most hits were genuinely related (sibling asks, the migration).
+- Kill switch: `ask_gate.superseding_work: false` in config, or env `ASK_GATE_SUPERSEDING_OFF=1`.
+
+Tests: `tests/test_superseding_work.py` (the incident's real create args against a fixture board holding the
+runner-migration card: held on both tools, found on another board, passes once named, passes on retry; an unrelated
+ask, a non-approval interaction, a done card older than 7 days and both kill switches (env, config) are not held; a recent done card
+is; the incident reply, a reply naming the card, a reply without a denial, and a clarify denial).
+
 ## Approval-store reconciliation adapters
 
 Before judging an explicit `human_request` on create/block, `approval_reconciliation.preflight` consults
