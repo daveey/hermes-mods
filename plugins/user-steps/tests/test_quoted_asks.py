@@ -90,3 +90,18 @@ def test_plain_real_ask_is_still_extracted_with_its_own_text():
 def test_bare_phrase_span_resolves_to_the_block_that_says_it_not_the_one_that_quotes_it():
     out = run(STATUS_AND_ASK, steps(('Reply yes or no here.', 'Reply yes or no here.')))
     assert [s['text'] for s in out] == [QUESTION]
+
+
+def test_retitle_open_steps_repairs_a_step_stored_with_the_recommendation_text(tmp_path):
+    span = "I'd say yes: without the block, they could grant themselves access. Reply yes or no here."
+    ledger = core.Ledger(root_dir=tmp_path, db=tmp_path / 'none.db')
+    root = ledger.root('sess')
+    with ledger.edit(root) as d:
+        d['steps'].append({'id': 'us_x', 'text': span.replace(' Reply yes or no here.', ''), 'kind': 'input',
+                           'verbatim_span': span, 'options': [], 'status': 'open', 'session': 'sess', 'created': 1})
+        d['steps'].append({'id': 'us_y', 'text': 'Pick a region', 'kind': 'input', 'verbatim_span': 'not in reply',
+                           'options': [], 'status': 'open', 'session': 'sess', 'created': 1})
+    assert core.retitle_open_steps('sess', STATUS_AND_ASK, ledger=ledger) == ['us_x']
+    texts = {s['id']: s['text'] for s in ledger.read('sess')['steps']}
+    assert texts == {'us_x': QUESTION, 'us_y': 'Pick a region'}
+    assert core.retitle_open_steps('sess', STATUS_AND_ASK, ledger=ledger) == []

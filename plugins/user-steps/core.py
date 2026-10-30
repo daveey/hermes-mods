@@ -1064,6 +1064,27 @@ def add_step(session_id: str, question: str, options: list, *, ledger: Optional[
     return dict(step)
 
 
+def retitle_open_steps(session_id: str, reply: str, *, ledger: Optional["Ledger"] = None) -> list[str]:
+    """Repair open steps minted before ``question_title`` existed: a step whose text is the recommendation
+    sentence ("I'd say yes: ...") takes the question the reply asked, found via ``question_title`` in the reply
+    that produced it. Only open, non-canonical-revised steps whose span sits in ``reply`` change; returns ids."""
+    lg = ledger or Ledger()
+    fixed: list[str] = []
+    with lg.edit(lg.root(session_id)) as d:
+        for s in d["steps"]:
+            span = str(s.get("verbatim_span") or "")
+            if s.get("status") != "open" or s.get("session") != session_id or not span:
+                continue
+            block = locate(reply, span)
+            if block is None or _norm(span) not in _norm(block["text"]):
+                continue
+            title = question_title(s.get("text", ""), span, reply, block)
+            if title and title != s.get("text"):
+                s["text"] = title
+                fixed.append(s["id"])
+    return fixed
+
+
 # ---- resolve / pipeline --------------------------------------------------------------------------------
 
 def resolve(ledger: Ledger, root: str, ids: list[str], resolution: str, by: str) -> list[str]:
