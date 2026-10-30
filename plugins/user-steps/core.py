@@ -1112,13 +1112,45 @@ def _canonical_open(step: dict) -> bool:
 
 def open_steps(session_id: str, ledger: Optional["Ledger"] = None) -> list[dict]:
     """Public helper (session-outcome): this chat's open steps across its lineage, oldest first, public fields
-    plus ``choices``. A step whose canonical request was already decided or withdrawn is left out."""
+    plus ``choices``. A step whose canonical request was already decided or withdrawn is left out; an open
+    canonical request of the chat with no open ledger step is added (``_open_canonical_only``)."""
     if not session_id:
         return []
     lg = ledger or Ledger()
     opened = sorted(lg.open_steps(session_id), key=lambda s: s.get("created", 0))
-    return [{**public_step(s), **({"choices": s["choices"]} if s.get("choices") else {})}
-            for s in opened if _canonical_open(s)]
+    out = [{**public_step(s), **({"choices": s["choices"]} if s.get("choices") else {})}
+           for s in opened if _canonical_open(s)]
+    return out + _open_canonical_only(session_id, lg, opened)
+
+
+def _open_canonical_only(session_id: str, lg: "Ledger", opened: list[dict]) -> list[dict]:
+    """Open, undecided canonical requests of this chat's lineage that no open ledger step mirrors.
+
+    The For you queue shows canonical requests; the ledger is a legacy mirror. When the two disagree (the extractor
+    retired the ledger step of a backfilled request while the request itself stayed open), the chat's outcome must
+    follow what the user sees: a ``decision``, not unresolved{no_summary} (hub 20261030_071719_cde14c). Any error
+    adds nothing."""
+    if not (home() / "user-steps" / "actions.sqlite3").is_file():
+        return []
+    mirrored_rids = {s.get("requestId") for s in opened if s.get("requestId")}
+    mirrored_steps = {s.get("id") for s in opened}
+    out: list[dict] = []
+    try:
+        store = ActionStore()
+        for sid in lineage(session_id, lg.db) or [session_id]:
+            for r in store.requests(server_owner(sid)):
+                if r.get("state") not in ("open", "needs_context") or r.get("resolution"):
+                    continue
+                aliased = {a.get("id") for a in r.get("aliases") or [] if a.get("type") == "user_step"}
+                if r["requestId"] in mirrored_rids or aliased & mirrored_steps:
+                    continue
+                choices = [{"label": c["label"], "value": str(c.get("id") or c["label"])}
+                           for c in r.get("choices") or [] if c.get("label")]
+                out.append({"id": r["requestId"], "text": r.get("title", ""), "kind": r.get("kind"),
+                            "status": "open", "session": sid, **({"choices": choices} if choices else {})})
+    except Exception:
+        return out
+    return out
 
 
 def add_step(session_id: str, question: str, options: list, *, ledger: Optional["Ledger"] = None,

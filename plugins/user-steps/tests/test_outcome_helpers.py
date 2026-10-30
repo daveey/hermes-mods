@@ -43,6 +43,32 @@ def test_open_steps_lists_open_only_oldest_first(home):
     assert core.open_steps("", ledger=lg) == []
 
 
+def test_open_steps_follows_an_open_canonical_request_whose_ledger_step_was_retired(home):
+    """hub 20261030_071719_cde14c: the extractor retired the ledger step while its canonical request (what the For
+    you queue shows) stayed open; session-outcome read the ledger only and the chat fell to unresolved{no_summary}."""
+    add_session(home, "S1")
+    lg = ledger(home)
+    step = core.add_step("S1", "Build the combined admin per build-plan.md?", ["Go", "Hold"], ledger=lg)
+    req = core.ActionStore().migrate_step(core.server_owner("S1"), step)
+    assert [s["id"] for s in core.open_steps("S1", ledger=lg)] == [step["id"]]  # mirrored once, not twice
+    core.resolve(lg, lg.root("S1"), [step["id"]], "answered in chat", "model")
+    got = core.open_steps("S1", ledger=lg)
+    assert [s["id"] for s in got] == [req["requestId"]]
+    assert got[0]["text"] == "Build the combined admin per build-plan.md?" and got[0]["status"] == "open"
+    assert [c["label"] for c in got[0]["choices"]][:2] == ["Go", "Hold"]
+
+
+def test_open_steps_drops_a_decided_canonical_request(home):
+    add_session(home, "S1")
+    lg = ledger(home)
+    step = core.add_step("S1", "Build the combined admin per build-plan.md?", ["Go", "Hold"], ledger=lg)
+    owner = core.server_owner("S1")
+    req = core.ActionStore().migrate_step(owner, step)
+    core.resolve(lg, lg.root("S1"), [step["id"]], "answered in chat", "model")
+    core.ActionStore().withdraw(owner, req["requestId"], by="user", reason="not needed")
+    assert core.open_steps("S1", ledger=lg) == []
+
+
 @pytest.mark.parametrize("span", ["I'd say yes.", "Yes, please.", "Sure", "Sounds good!", "OK then", "Go ahead."])
 def test_assent_echo_is_dropped(span):
     reply = f"The build is green.\n\n{span}"
