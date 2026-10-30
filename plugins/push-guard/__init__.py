@@ -1,8 +1,9 @@
-"""push-guard: refuse direct `git push` of code to a guarded branch; point at the repo's land tool.
+"""push-guard: refuse direct `git push` of code to a guarded branch; point at the repo's landing path.
 
 ``pre_tool_call`` checks terminal / process / execute_code (and nested ``tool_call``) for `git push` whose destination
-is a guarded branch (``$HERMES_HOME/push-guards.json``, see guard.py) and blocks it unless every changed file is in an
-allowed path (docs). ``PUSH_GUARD=off`` in the command skips it.
+is a guarded branch (``$HERMES_HOME/push-guards.json``, see guard.py). A merge-train guard blocks it unless every
+changed file is in an allowed path (docs); a ``require_check`` guard blocks it unless the pushed sha's named CI
+check-run is ``success``, and holds `gh pr merge --admin` to the same rule. ``PUSH_GUARD=off`` in the command skips it.
 """
 
 from __future__ import annotations
