@@ -1,0 +1,615 @@
+From 1e40faadc04282fa17694def89b6e0f1c51847d4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 09:36:06 -0700
+Subject: [PATCH] fix(kanban): archive then remove aged terminal scratch
+ holding git clones [daveey]
+
+Completion cleanup and gc_task_scratch keep every scratch tree with Git
+metadata, so a worker's clone outlived its card forever (David-MBP: 2.7 GiB
+of 10-23..10-26 leftovers pinning 9 install envs, ~0.2 GiB/day more).
+
+gc_task_scratch now archives each standalone repo of a terminal scratch
+workspace whose card finished more than kanban.worktree_retention_days ago
+(default 7, 0 disables) to <kanban home>/archive/scratch/<board>/<task>/<rel>/
+(commits.bundle of refs not reachable from remote-tracking refs, verified;
+tracked.diff = git diff --binary HEAD; untracked.tar; meta.json), then removes
+the tree and appends a workspace_archived event. A linked worktree or
+submodule (.git file), a bare repo, scan errors, any failed archive step, a
+live card, an active child or a live sharer keep it. Archiving runs outside
+the board write lock; the owner is re-checked under the lock before the tree
+is renamed away.
+---
+ hermes_cli/kanban_ops.py                      |   2 +-
+ hermes_cli/kanban_scratch_archive.py          | 175 ++++++++++++
+ hermes_cli/kanban_worktree_gc.py              |  81 +++++-
+ .../test_kanban_scratch_gc_archive.py         | 252 ++++++++++++++++++
+ 4 files changed, 505 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_scratch_archive.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_gc_archive.py
+
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index d9e45a513fa..602a9681ded 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -334,7 +334,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
+     with kbc.connect_closing() as conn:
+         removed_ws = gc_task_worktrees(conn, older_than_days=wt_days)
+     with kbc.connect_closing() as conn:
+-        removed_ws += gc_task_scratch(conn)
++        removed_ws += gc_task_scratch(conn, older_than_days=wt_days)
+ 
+     removed_events = 0
+     if event_days:
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+new file mode 100644
+index 00000000000..59f0c4321e1
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -0,0 +1,175 @@
++"""Archive-then-remove for aged terminal scratch workspaces holding git clones. [daveey]
++
++Completion cleanup and ``gc_task_scratch`` keep every scratch tree that holds
++Git metadata, so a worker's clone survives its card forever. Past
++``kanban.worktree_retention_days`` this module saves each standalone repo's
++unique work under ``<kanban home>/archive/scratch/<board>/<task>/<relpath>/``:
++
++* ``commits.bundle``: refs and HEAD not reachable from the repo's
++  remote-tracking refs (omitted when there are none), verified before use;
++* ``tracked.diff``: ``git diff --binary HEAD`` (omitted when empty);
++* ``untracked.tar``: ``git ls-files --others --exclude-standard`` (omitted when
++  empty);
++* ``meta.json``: remotes, HEAD, branch, task id, completed_at.
++
++Anything it cannot prove safe keeps the workspace: a linked worktree or
++submodule (a ``.git`` FILE: the worktree GC owns those), a bare repository,
++any scan error, or any failed archive step. Symlinks are recorded, never
++followed.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import shutil
++import stat
++import subprocess
++import tarfile
++import time
++from pathlib import Path
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++_GIT_TIMEOUT = 600
++
++
++class ArchiveRefused(Exception):
++    """The tree must be kept; the message says why."""
++
++
++def find_repos(root: Path) -> list[Path]:
++    """Standalone repos (a ``.git`` directory) below *root*, *root* included.
++
++    Raises :class:`ArchiveRefused` for a linked worktree/submodule, a bare
++    repository, a non-directory root, or any scan error. Never follows
++    symlinks and never descends into a ``.git`` directory.
++    """
++    repos: list[Path] = []
++    pending = [root]
++    try:
++        if not stat.S_ISDIR(root.lstat().st_mode):
++            raise ArchiveRefused(f"{root} is not a directory")
++        while pending:
++            directory = pending.pop()
++            names: set[str] = set()
++            with os.scandir(directory) as entries:
++                for entry in entries:
++                    names.add(entry.name)
++                    mode = entry.stat(follow_symlinks=False).st_mode
++                    if entry.name == ".git":
++                        if stat.S_ISDIR(mode):
++                            repos.append(Path(directory))
++                            continue
++                        raise ArchiveRefused(
++                            f"linked worktree or submodule at {entry.path} (left to the worktree GC)")
++                    if stat.S_ISDIR(mode):
++                        pending.append(Path(entry.path))
++            if ".git" not in names and {"HEAD", "objects"} <= names and names & {"refs", "reftable"}:
++                raise ArchiveRefused(f"bare repository at {directory}")
++    except OSError as exc:
++        raise ArchiveRefused(f"scan uncertain: {exc!r}") from exc
++    return sorted(repos)
++
++
++def _env(repo: Path) -> dict[str, str]:
++    from hermes_cli._subprocess_compat import noninteractive_repo_git_env
++    env = noninteractive_repo_git_env(repo)
++    if env is None:
++        raise ArchiveRefused(f"cannot harden git for {repo} (filter discovery failed)")
++    return env
++
++
++def _git(repo: Path, env: dict[str, str], *args: str, ok=(0,)) -> subprocess.CompletedProcess:
++    proc = subprocess.run(
++        ["git", "-C", str(repo), *args], capture_output=True, timeout=_GIT_TIMEOUT,
++        check=False, stdin=subprocess.DEVNULL, env=env,
++    )
++    if proc.returncode not in ok:
++        err = proc.stderr.decode("utf-8", "replace").strip()[:500]
++        raise ArchiveRefused(f"git {' '.join(args[:3])} failed in {repo} (rc {proc.returncode}): {err}")
++    return proc
++
++
++def _text(proc: subprocess.CompletedProcess) -> str:
++    return proc.stdout.decode("utf-8", "replace").strip()
++
++
++def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional[int]) -> dict:
++    """Write one repo's archive into *dest* (created). Raises on any failure."""
++    env = _env(repo)
++    dest.mkdir(parents=True, exist_ok=True)  # the root repo archives into the fresh partial dir
++    head = _text(_git(repo, env, "rev-parse", "--verify", "-q", "HEAD^{commit}", ok=(0, 1))) or None
++    branch = _text(_git(repo, env, "symbolic-ref", "-q", "--short", "HEAD", ok=(0, 1))) or None
++    remotes: dict[str, str] = {}
++    for line in _text(_git(repo, env, "remote", "-v")).splitlines():
++        parts = line.split()
++        if len(parts) >= 2:
++            remotes.setdefault(parts[0], parts[1])
++
++    # Commits not reachable from any remote-tracking ref.
++    refs = [r for r in _text(_git(repo, env, "for-each-ref", "--format=%(refname)")).splitlines()
++            if r and not r.startswith("refs/remotes/")]
++    if head:
++        refs.append("HEAD")
++    unpushed = [r for r in refs
++                if _text(_git(repo, env, "rev-list", "-n1", r, "--not", "--remotes"))]
++    files = ["meta.json"]
++    if unpushed:
++        bundle = dest / "commits.bundle"
++        _git(repo, env, "bundle", "create", str(bundle), *unpushed, "--not", "--remotes")
++        _git(repo, env, "bundle", "verify", str(bundle))
++        files.append(bundle.name)
++
++    base = head or _text(_git(repo, env, "hash-object", "-t", "tree", "--stdin"))
++    diff = _git(repo, env, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color", base).stdout
++    if diff:
++        (dest / "tracked.diff").write_bytes(diff)
++        files.append("tracked.diff")
++
++    raw = _git(repo, env, "ls-files", "--others", "--exclude-standard", "-z").stdout
++    untracked = [os.fsdecode(p) for p in raw.split(b"\0") if p]
++    if untracked:
++        with tarfile.open(dest / "untracked.tar", "w") as tar:
++            for rel in untracked:
++                # Embedded repos are listed as directories; they are archived on their own.
++                tar.add(str(repo / rel.rstrip("/")), arcname=rel.rstrip("/"), recursive=False)
++        files.append("untracked.tar")
++
++    meta = {
++        "task_id": task_id, "completed_at": completed_at, "source": str(repo),
++        "head": head, "branch": branch, "remotes": remotes, "unpushed_refs": unpushed,
++        "untracked_count": len(untracked), "files": files, "archived_at": int(time.time()),
++    }
++    (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
++    return meta
++
++
++def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
++                      completed_at: Optional[int]) -> Path:
++    """Archive every standalone repo in *workspace* to *archive_dir*; return the final dir.
++
++    Built in a ``.partial`` sibling and renamed into place, so a failure leaves
++    no half archive that looks complete. Raises :class:`ArchiveRefused` (or
++    ``OSError``) on any failure; the caller then keeps the workspace.
++    """
++    repos = find_repos(workspace)
++    if not repos:
++        raise ArchiveRefused("no standalone git repository found")
++    partial = archive_dir.with_name(archive_dir.name + f".partial-{os.getpid()}")
++    shutil.rmtree(partial, ignore_errors=True)
++    try:
++        partial.mkdir(parents=True)
++        for repo in repos:
++            rel = repo.relative_to(workspace)
++            archive_repo(repo, partial / rel if rel.parts else partial,
++                         task_id=task_id, completed_at=completed_at)
++        final = archive_dir
++        if final.exists():
++            final = archive_dir.with_name(f"{archive_dir.name}-{int(time.time())}")
++        partial.rename(final)
++        return final
++    except BaseException:
++        shutil.rmtree(partial, ignore_errors=True)
++        raise
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 4d5a9802438..e5c09849de4 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -10,6 +10,7 @@ import contextlib
+ import hashlib
+ import json
+ import logging
++import os
+ import re
+ import sqlite3
+ import time
+@@ -33,23 +34,32 @@ def retention_days() -> int:
+         return 0
+ 
+ 
+-def gc_task_scratch(conn: sqlite3.Connection) -> int:
++def gc_task_scratch(conn: sqlite3.Connection, *, older_than_days: int | None = None) -> int:
+     """Retry terminal scratch cleanup, failing closed on any unreadable board.
+ 
+     Only task records establish ownership; never infer it from directory names.
+     Read every board before the first removal, even if an earlier board reports
+     a live sharer. Keep the selected owner locked against concurrent resumption.
++
++    A tree that is kept only because it holds standalone git clones is archived
++    and then removed once its card finished more than *older_than_days* ago
++    (default ``kanban.worktree_retention_days``; 0 disables). [daveey]
+     """
+     import shutil
+ 
+     from hermes_cli import kanban_db as kb
+ 
++    days = retention_days() if older_than_days is None else older_than_days
+     removed = 0
++    aged: list[tuple[str, Path, int | None]] = []
+     with kb.write_txn(conn):
+         try:
+             rows = conn.execute(
+-                "SELECT id, workspace_path FROM tasks WHERE workspace_kind='scratch' "
+-                f"AND status IN {ws._TERMINAL_STATUSES_SQL}"
++                "SELECT t.id, t.workspace_path, t.completed_at, t.created_at, "
++                "(SELECT MAX(created_at) FROM task_events e WHERE e.task_id=t.id "
++                " AND e.kind NOT LIKE 'workspace%') AS last_event "
++                "FROM tasks t WHERE t.workspace_kind='scratch' "
++                f"AND t.status IN {ws._TERMINAL_STATUSES_SQL}"
+             ).fetchall()
+             for board in ws._sibling_board_db_files(conn):
+                 with _read_board(board) as other:
+@@ -63,18 +73,81 @@ def gc_task_scratch(conn: sqlite3.Connection) -> int:
+                 continue
+             if ws._has_active_children(conn, row["id"]):
+                 continue
+-            if not ws._scratch_tree_removable(path):
++            removable = ws._scratch_tree_removable(path)
++            if not removable and not _finished_before(row, days):
+                 continue
+             if ws._defer_shared_workspace_cleanup(conn, row["id"], path):
+                 continue
++            if not removable:
++                aged.append((row["id"], path, row["completed_at"]))
++                continue
+             ws.release_lsp_clients(str(path))
+             shutil.rmtree(path, ignore_errors=True)
+             if not path.exists():
+                 ws._log_scratch_removal(conn, row["id"], path, "scratch workspace (GC retry)")
+                 removed += 1
++    # Archiving runs git for minutes on big clones: never hold the board's write lock for it.
++    for task_id, path, completed_at in aged:
++        removed += _archive_and_remove_scratch(conn, task_id, path, completed_at)
+     return removed
+ 
+ 
++def _finished_before(row: sqlite3.Row, days: int) -> bool:
++    if days <= 0:
++        return False
++    since = row["completed_at"] or row["last_event"] or row["created_at"]
++    return bool(since and since <= time.time() - days * 86400)
++
++
++def _board_slug(conn: sqlite3.Connection) -> str:
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++    db_file = _main_db_file(conn)
++    return board_slug_for_path(db_file) if db_file else "default"
++
++
++def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Path,
++                                completed_at: int | None) -> int:
++    """Archive every git repo in an aged scratch tree, then remove it; 1 when removed.
++
++    Any refusal or failure keeps the workspace and logs why. The owner is
++    re-checked under the write lock after archiving, and the tree is renamed
++    away inside that lock so a resumed card can never see it half-deleted.
++    """
++    import shutil
++    import subprocess
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_scratch_archive as sa
++
++    archive_dir = kb.kanban_home() / "archive" / "scratch" / _board_slug(conn) / task_id
++    try:
++        final = sa.archive_workspace(path, archive_dir, task_id=task_id, completed_at=completed_at)
++    except (sa.ArchiveRefused, OSError, subprocess.SubprocessError, ValueError) as exc:
++        log.info("Keeping aged scratch workspace for task %s: %s (%s)", task_id, path, exc)
++        return 0
++    ws.release_lsp_clients(str(path))
++    trash = path.with_name(f".{path.name}.gc-{os.getpid()}")
++    with kb.write_txn(conn):
++        if (not ws._is_terminal_task(conn, task_id) or ws._has_active_children(conn, task_id)
++                or ws._defer_shared_workspace_cleanup(conn, task_id, path)):
++            log.info("Keeping scratch workspace for task %s after archiving it to %s: "
++                     "the card is live again or shares the path: %s", task_id, final, path)
++            return 0
++        try:
++            path.rename(trash)
++        except OSError as exc:
++            log.info("Keeping aged scratch workspace for task %s: cannot move %s away (%s); "
++                     "archive at %s", task_id, path, exc, final)
++            return 0
++        kb._append_event(conn, task_id, "workspace_archived", {"path": str(path), "archive": str(final)})
++        ws._log_scratch_removal(conn, task_id, path, "scratch workspace (aged, git archived)")
++    shutil.rmtree(trash, ignore_errors=True)
++    if trash.exists():
++        log.warning("Archived scratch workspace for task %s was not fully removed: %s", task_id, trash)
++    return 1
++
++
+ def gc_task_worktrees(conn: sqlite3.Connection, *, older_than_days: int = 7,
+                      repo_root: str | None = None) -> int:
+     """Reap terminal rows only, retaining active children and cross-board sharers.
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_archive.py b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+new file mode 100644
+index 00000000000..cb734f57de3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+@@ -0,0 +1,252 @@
++"""Aged terminal scratch holding git clones is archived, then removed. [daveey]"""
++import argparse
++import json
++import os
++import subprocess
++import tarfile
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_ops
++
++OLD = int(time.time()) - 10 * 86400
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
++    return tmp_path
++
++
++def _run(*args, cwd=None):
++    return subprocess.run(
++        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
++         "-c", "init.defaultBranch=main", *args],
++        cwd=cwd, check=True, capture_output=True, text=True,
++    ).stdout.strip()
++
++
++@pytest.fixture
++def remote(tmp_path):
++    src = tmp_path / "seed"
++    src.mkdir()
++    _run("init", "-q", cwd=src)
++    (src / "tracked.txt").write_text("one\n")
++    _run("add", ".", cwd=src)
++    _run("commit", "-q", "-m", "seed", cwd=src)
++    bare = tmp_path / "remote.git"
++    _run("clone", "-q", "--bare", str(src), str(bare))
++    return bare
++
++
++def _task(status="done", completed_at=OLD, clone_into="repo", remote=None):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="scratch with clone")
++        path = kb.workspaces_root() / tid
++        path.mkdir(parents=True)
++        (path / "notes.txt").write_text("scratch")
++        if remote is not None:
++            target = path if clone_into == "." else path / clone_into
++            if clone_into == ".":
++                _run("clone", "-q", str(remote), str(target / "tmpclone"))
++                for entry in (target / "tmpclone").iterdir():
++                    entry.rename(target / entry.name)
++                (target / "tmpclone").rmdir()
++            else:
++                _run("clone", "-q", str(remote), str(target))
++        with kb.write_txn(conn):
++            conn.execute(
++                "UPDATE tasks SET status=?, workspace_kind='scratch', workspace_path=?, "
++                "completed_at=?, created_at=? WHERE id=?",
++                (status, str(path), completed_at, OLD, tid),
++            )
++    return tid, path
++
++
++def _gc(days=7):
++    return kanban_ops._cmd_gc(argparse.Namespace(
++        event_retention_days=0, log_retention_days=0, worktree_retention_days=days,
++    ))
++
++
++def _archive(tid, board_slug="default"):
++    return kb.kanban_home() / "archive" / "scratch" / board_slug / tid
++
++
++def _events(tid):
++    with kbc.connect_closing() as conn:
++        return [(r["kind"], json.loads(r["payload"] or "null"))
++                for r in conn.execute("SELECT kind, payload FROM task_events WHERE task_id=?", (tid,))]
++
++
++def test_clean_pushed_clone_is_archived_and_removed(board, remote):
++    tid, path = _task(remote=remote)
++    assert _gc() == 0
++    assert not path.exists()
++    meta = json.loads((_archive(tid) / "repo" / "meta.json").read_text())
++    assert meta["task_id"] == tid and meta["completed_at"] == OLD
++    assert meta["branch"] == "main" and meta["head"]
++    assert meta["remotes"]["origin"] == str(remote)
++    assert sorted(os.listdir(_archive(tid) / "repo")) == ["meta.json"]
++    archived = [p for k, p in _events(tid) if k == "workspace_archived"]
++    assert archived == [{"path": str(path), "archive": str(_archive(tid))}]
++    assert not [p for p in path.parent.iterdir() if p.name.startswith(".")]
++
++
++def test_uncommitted_and_untracked_land_in_diff_and_tar(board, remote):
++    tid, path = _task(remote=remote)
++    (path / "repo" / "tracked.txt").write_text("one\nlocal edit\n")
++    (path / "repo" / "new.txt").write_text("brand new\n")
++    (path / "repo" / "node_modules").symlink_to(board)  # never followed
++    assert _gc() == 0
++    assert not path.exists()
++    dest = _archive(tid) / "repo"
++    assert "+local edit" in (dest / "tracked.diff").read_text()
++    with tarfile.open(dest / "untracked.tar") as tar:
++        names = tar.getnames()
++        assert "new.txt" in names
++        assert tar.extractfile("new.txt").read() == b"brand new\n"
++        assert tar.getmember("node_modules").issym()
++
++
++def test_unpushed_commit_lands_in_verified_bundle(board, remote, tmp_path):
++    tid, path = _task(remote=remote)
++    repo = path / "repo"
++    (repo / "tracked.txt").write_text("two\n")
++    _run("commit", "-q", "-am", "unpushed work", cwd=repo)
++    sha = _run("rev-parse", "HEAD", cwd=repo)
++    assert _gc() == 0
++    assert not path.exists()
++    bundle = _archive(tid) / "repo" / "commits.bundle"
++    check = tmp_path / "check"
++    _run("clone", "-q", str(remote), str(check))
++    _run("bundle", "verify", str(bundle), cwd=check)
++    assert sha in _run("bundle", "list-heads", str(bundle), cwd=check)
++
++
++def test_workspace_that_is_itself_a_clone(board, remote):
++    tid, path = _task(remote=remote, clone_into=".")
++    (path / "extra.txt").write_text("x")
++    assert _gc() == 0
++    assert not path.exists()
++    dest = _archive(tid)
++    assert json.loads((dest / "meta.json").read_text())["task_id"] == tid
++    with tarfile.open(dest / "untracked.tar") as tar:
++        assert {"extra.txt", "notes.txt"} <= set(tar.getnames())
++
++
++def test_young_workspace_is_kept(board, remote):
++    _, path = _task(remote=remote, completed_at=int(time.time()) - 3600)
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir()
++
++
++def test_retention_zero_keeps_it(board, remote):
++    tid, path = _task(remote=remote)
++    assert _gc(days=0) == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not _archive(tid).exists()
++
++
++@pytest.mark.parametrize("status", ["ready", "running", "blocked", "review"])
++def test_nonterminal_card_keeps_it(board, remote, status):
++    tid, path = _task(remote=remote, status=status)
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not _archive(tid).exists()
++
++
++def test_active_child_keeps_it(board, remote):
++    tid, path = _task(remote=remote)
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="needs artifacts", parents=[tid])
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not _archive(tid).exists()
++
++
++def test_live_sharer_on_another_board_keeps_it(board, remote):
++    tid, path = _task(remote=remote)
++    kb.create_board("other")
++    with kbc.connect_closing(board="other") as conn:
++        sharer = kb.create_task(conn, title="live sharer")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(path), sharer))
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not _archive(tid).exists()
++
++
++def test_linked_worktree_inside_keeps_it(board, remote):
++    tid, path = _task(remote=remote)
++    _run("worktree", "add", "-q", "-b", "side", str(path / "wt"), cwd=path / "repo")
++    assert (path / "wt" / ".git").is_file()
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir() and (path / "wt").is_dir()
++    assert not _archive(tid).exists()
++
++
++def test_bare_repo_inside_keeps_it(board, remote):
++    tid, path = _task(remote=remote)
++    _run("clone", "-q", "--bare", str(remote), str(path / "mirror.git"))
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir()
++    assert not _archive(tid).exists()
++
++
++def test_unwritable_archive_dir_keeps_everything(board, remote):
++    tid, path = _task(remote=remote)
++    (path / "repo" / "new.txt").write_text("keep me\n")
++    root = kb.kanban_home() / "archive" / "scratch"
++    root.mkdir(parents=True)
++    root.chmod(0o500)
++    try:
++        assert _gc() == 0
++    finally:
++        root.chmod(0o700)
++    assert (path / "repo" / "new.txt").read_text() == "keep me\n"
++    assert (path / "notes.txt").exists()
++    assert list(root.iterdir()) == []
++    assert not [k for k, _ in _events(tid) if k == "workspace_archived"]
++
++
++def test_failed_archive_step_keeps_it_and_leaves_no_partial(board, remote, monkeypatch):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, path = _task(remote=remote)
++    real = sa._git
++
++    def broken(repo, env, *args, **kw):
++        if args[0] == "ls-files":
++            raise sa.ArchiveRefused("injected")
++        return real(repo, env, *args, **kw)
++
++    monkeypatch.setattr(sa, "_git", broken)
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir()
++    parent = _archive(tid).parent
++    assert not parent.exists() or list(parent.iterdir()) == []
++
++
++def test_named_board_archives_under_its_slug(board, remote):
++    kb.create_board("other")
++    with kbc.connect_closing(board="other") as conn:
++        tid = kb.create_task(conn, title="named board clone")
++        path = kb.workspaces_root(board="other") / tid
++        path.mkdir(parents=True)
++        _run("clone", "-q", str(remote), str(path / "repo"))
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done', workspace_kind='scratch', workspace_path=?, "
++                         "completed_at=? WHERE id=?", (str(path), OLD, tid))
++        from hermes_cli.kanban_worktree_gc import gc_task_scratch
++        assert gc_task_scratch(conn, older_than_days=7) == 1
++    assert not path.exists()
++    assert (_archive(tid, "other") / "repo" / "meta.json").is_file()
+-- 
+2.55.0
+

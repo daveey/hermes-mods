@@ -1,0 +1,133 @@
+From 9136931704e0b8d3d806f51663c722f280ff42ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 08:57:23 -0700
+Subject: [PATCH] fix(serve): record update-gate waits and re-execs in
+ logs/serve-update-gate.log [daveey]
+
+Desktop SSH serves write stderr to a per-spawn desktop-ssh/<id>/<nonce>.log that
+Desktop deletes when the backend is replaced, so a gate wait or a re-exec left no
+trace after the next update (desktop.log stopped carrying serve gate lines). Each
+gate message is now also appended, with a timestamp and pid, to
+<HERMES_HOME>/logs/serve-update-gate.log (rotated at 2 MB, write errors ignored),
+and the re-executed image records 're-executed image #N gated on <sha>' under the
+same pid, so a live re-exec can be proven after the fact.
+---
+ hermes_cli/serve_update_wait.py               | 38 +++++++++++++++++++
+ .../test_serve_update_wait_reexec.py          | 29 ++++++++++++++
+ 2 files changed, 67 insertions(+)
+
+diff --git a/hermes_cli/serve_update_wait.py b/hermes_cli/serve_update_wait.py
+index 8abb4cf22f9..918acfb848b 100644
+--- a/hermes_cli/serve_update_wait.py
++++ b/hermes_cli/serve_update_wait.py
+@@ -78,8 +78,42 @@ def admission_hold_present(root: Optional[Path] = None) -> bool:
+         return False  # a hint, not a fence: an unreadable hold must not delay every start
+ 
+ 
++GATE_LOG_NAME = "serve-update-gate.log"
++GATE_LOG_MAX_BYTES = 2_000_000
++
++
++def gate_log_path() -> Optional[Path]:
++    """``<HERMES_HOME>/logs/serve-update-gate.log``: the durable, host-wide record of gate decisions.
++
++    stderr alone is not enough: Desktop SSH serves write it to a per-spawn
++    ``desktop-ssh/<id>/<nonce>.log`` that Desktop deletes when the backend is replaced, so a wait
++    or a re-exec left no trace once the next update retired that serve (t_01a1832a732d95e8)."""
++    from hermes_constants import get_hermes_home
++
++    return Path(get_hermes_home()) / "logs" / GATE_LOG_NAME
++
++
++def _record(msg: str) -> None:
++    path = gate_log_path()
++    if path is None:
++        return
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        try:
++            if path.stat().st_size > GATE_LOG_MAX_BYTES:
++                os.replace(path, path.with_name(path.name + ".1"))
++        except FileNotFoundError:
++            pass
++        stamp = time.strftime("%Y-%m-%d %H:%M:%S%z")
++        with open(path, "a", encoding="utf-8") as f:
++            f.write(f"{stamp} pid={os.getpid()} {msg}\n")
++    except OSError as exc:  # a log write must never stop a backend from starting
++        print(f"serve: cannot record to {path}: {exc}", file=sys.stderr, flush=True)
++
++
+ def _stderr(msg: str) -> None:
+     print(msg, file=sys.stderr, flush=True)
++    _record(msg)
+ 
+ 
+ def wait_for_update_clear(*, update_probe: Optional[Callable[[], bool]] = None,
+@@ -221,6 +255,10 @@ def reexec_if_checkout_moved(result: str, launch_fingerprint: Optional[str], *,
+         count = int(os.environ.pop(REEXEC_ENV, "0") or 0)  # never leaks into the agent's children
+     except ValueError:
+         count = 0
++    if count and log is None:
++        # The durable after-half of a re-exec: same pid as the "re-executing" record before it.
++        fp = (current_fingerprint or checkout_fingerprint)()
++        _record(f"serve: re-executed image #{count} gated on {_sha(fp) or fp or 'no checkout'}")
+     if result not in ("cleared", "clear"):
+         return False
+     if result == "clear":
+diff --git a/tests/hermes_cli/test_serve_update_wait_reexec.py b/tests/hermes_cli/test_serve_update_wait_reexec.py
+index eb604cdf53a..aede2f8ef9f 100644
+--- a/tests/hermes_cli/test_serve_update_wait_reexec.py
++++ b/tests/hermes_cli/test_serve_update_wait_reexec.py
+@@ -132,6 +132,11 @@ def _run_serve(tmp_path, *, update_running: bool, new: str = NEW, moved_before_g
+     return result, incarnations, token_reads, proc.stderr
+ 
+ 
++def _gate_log(tmp_path) -> str:
++    path = tmp_path / "home" / "logs" / suw.GATE_LOG_NAME
++    return path.read_text() if path.exists() else ""
++
++
+ @pytest.mark.skipif(os.name == "nt", reason="re-exec in place is POSIX only")
+ def test_serve_that_waited_out_an_update_reports_the_commit_it_runs(tmp_path):
+     result, incarnations, token_reads, stderr = _run_serve(tmp_path, update_running=True)
+@@ -145,6 +150,14 @@ def test_serve_that_waited_out_an_update_reports_the_commit_it_runs(tmp_path):
+     assert len(incarnations) == 2 and len(set(incarnations)) == 1 == len(set(token_reads))
+     assert token_reads == incarnations[:1]
+     assert "re-executing" in stderr
++    # Durable record in <HERMES_HOME>/logs (Desktop deletes the per-spawn stderr log): the wait,
++    # the re-exec and the re-executed image, all stamped with the one pid.
++    pid = incarnations[0]
++    lines = _gate_log(tmp_path).splitlines()
++    assert any(f"pid={pid} serve: a core update is in progress; waiting" in ln for ln in lines), lines
++    assert any(f"pid={pid} serve: the checkout moved from {OLD[:10]}" in ln and "re-executing so this backend runs" in ln
++               for ln in lines), lines
++    assert any(f"pid={pid} serve: re-executed image #1 gated on {NEW}" in ln for ln in lines), lines
+ 
+ 
+ @pytest.mark.skipif(os.name == "nt", reason="re-exec in place is POSIX only")
+@@ -153,6 +166,22 @@ def test_serve_with_no_update_does_not_reexec(tmp_path):
+     assert result["health_commit"] == result["head"] == OLD
+     assert len(incarnations) == 1 and len(token_reads) == 1
+     assert "re-executing" not in stderr
++    assert _gate_log(tmp_path) == ""  # nothing waited, nothing re-executed: nothing recorded
++
++
++def test_gate_record_survives_an_unwritable_home_and_rotates(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
++    path = suw.gate_log_path()
++    assert path is not None and path == tmp_path / "h" / "logs" / suw.GATE_LOG_NAME
++    suw._stderr("serve: one")
++    assert f"pid={os.getpid()} serve: one" in path.read_text()
++    monkeypatch.setattr(suw, "GATE_LOG_MAX_BYTES", 1)
++    suw._stderr("serve: two")
++    assert "serve: one" in path.with_name(path.name + ".1").read_text()
++    assert "serve: two" in path.read_text() and "serve: one" not in path.read_text()
++    monkeypatch.setattr(suw, "gate_log_path", lambda: tmp_path / "file" / "x.log")
++    (tmp_path / "file").write_text("not a dir")
++    suw._stderr("serve: three")  # must not raise
+ 
+ 
+ @pytest.mark.skipif(os.name == "nt", reason="re-exec in place is POSIX only")
+-- 
+2.55.0
+

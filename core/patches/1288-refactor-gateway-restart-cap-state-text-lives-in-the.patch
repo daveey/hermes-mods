@@ -1,0 +1,117 @@
+From 75a805fbfd24a610f9329b62da57236d45b5b376 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:28:19 +0000
+Subject: [PATCH] refactor(gateway): restart cap state text lives in the
+ restart-wait mixin [daveey]
+
+---
+ gateway/run_shutdown.py                       |  2 +-
+ gateway/run_shutdown_restart_wait.py          |  6 +++
+ hermes_cli/update_gateway_fence.py            |  5 +++
+ tests/gateway/test_core_update_kanban_wait.py | 41 +++++++++++++++++++
+ 4 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index bc1fb3ee613..05b056c6850 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -1585,7 +1585,7 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         logger.info(
+             "Restart requested with %d active work unit(s); "
+             "deferring stop() until they finish (cap=%.0fs) so in-flight "
+-            "turns are not amputated (#77184)", active, timeout,
++            "turns are not amputated (#77184); %s", active, timeout, self._restart_cap_state_text(),
+         )
+         self._scale_to_zero_status("draining", "restart wait: status mark failed")
+         loop = asyncio.get_running_loop()
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index 48783a5d6b5..578f8c8e407 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -57,6 +57,12 @@ class GatewayRestartWaitMixin:
+             )
+         return since, expired
+ 
++    def _restart_cap_state_text(self) -> str:
++        """Log suffix naming whether this restart carries a core-update intent (the Kanban-only cap)."""
++        if getattr(self, "_restart_update_intent", None) is not None:
++            return f"core-update intent present: Kanban-only cap {CORE_UPDATE_KANBAN_WAIT_S:.0f}s armed"
++        return "no core-update intent: ordinary restart, Kanban-only cap not armed"
++
+     def _describe_active_work(self) -> list:
+         """One dict per in-flight work unit the restart wait is holding for, so an observer
+         (``hermes update``, ``hermes gateway status``) can name it instead of printing a bare count.
+diff --git a/hermes_cli/update_gateway_fence.py b/hermes_cli/update_gateway_fence.py
+index 0526a662ec6..e1d1ff42edc 100644
+--- a/hermes_cli/update_gateway_fence.py
++++ b/hermes_cli/update_gateway_fence.py
+@@ -53,6 +53,11 @@ def _intent_pid(home: Path) -> Optional[int]:
+         pid = int(data["pid"])
+     except (OSError, ValueError, KeyError, TypeError):
+         return None
++    # An "unfenced" intent (hermes-sync on a host with no launcher gate, e.g. the hub) only tells the gateway
++    # that its restart belongs to a core update. No launcher parks on it, so the update must still verify
++    # its own gateway restart.
++    if isinstance(data, dict) and data.get("kind") == "unfenced":
++        return None
+     return pid if pid > 1 else None
+ 
+ 
+diff --git a/tests/gateway/test_core_update_kanban_wait.py b/tests/gateway/test_core_update_kanban_wait.py
+index c35375aaebc..59b45c60a89 100644
+--- a/tests/gateway/test_core_update_kanban_wait.py
++++ b/tests/gateway/test_core_update_kanban_wait.py
+@@ -1,5 +1,7 @@
+ """Only confirmed Kanban work gets a short core-update restart wait."""
+ import asyncio
++import json
++import os
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
+@@ -127,3 +129,42 @@ async def test_cooperative_stop_booking_before_admission_settlement(monkeypatch,
+     monkeypatch.setattr(booking, 'record_restart_interruption', recorded)
+     assert await managed.admit_managed(authority, None, row, policy) == 'reply'
+     assert recorded.call_count == int(expected)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('has_intent', [True, False])
++async def test_restart_line_states_whether_the_kanban_cap_is_armed(monkeypatch, tmp_path, caplog, has_intent):
++    """The hub's missing cap (14:38Z) could not be read from the log: the line showed only cap=1800s."""
++    runner, _ = make_restart_runner()
++    intent = tmp_path / 'intent'
++    intent.write_text('{"pid": 1, "kind": "unfenced"}\n')  # exactly what hermes-sync's unfenced path writes
++    runner._restart_update_intent = intent if has_intent else None
++    runner._restart_after_turn_timeout = 30
++    runner._active_work_count = runner._awaitable_work_count = lambda: 1
++    runner._describe_active_work = list
++    monkeypatch.setattr(wait, 'kanban_managed_count', lambda _: 1, raising=False)
++    clock = [0.0]
++    monkeypatch.setattr(asyncio, 'get_running_loop', lambda: SimpleNamespace(time=lambda: clock[0]))
++    async def advance(seconds):
++        clock[0] += seconds
++    monkeypatch.setattr(asyncio, 'sleep', advance)
++    with caplog.at_level('INFO', logger='gateway.run'):
++        await runner._await_active_work_before_restart()
++    line = next(r.getMessage() for r in caplog.records if 'Restart requested with' in r.getMessage())
++    if has_intent:
++        assert 'core-update intent present: Kanban-only cap 15s armed' in line
++    else:
++        assert 'no core-update intent: ordinary restart' in line
++
++
++def test_unfenced_intent_is_not_a_launcher_fence(tmp_path):
++    """hermes-sync's unfenced intent (hub) arms the gateway cap but parks no launcher, so `hermes update`
++    must keep its own gateway-restart verification."""
++    from hermes_cli.update_gateway_fence import ancestor_fence_owner
++    home = tmp_path / 'h'
++    (home / 'core-update').mkdir(parents=True)
++    path = home / 'core-update' / 'intent'
++    path.write_text(json.dumps({'pid': os.getppid(), 'created_at': 0, 'kind': 'unfenced'}) + '\n')
++    assert ancestor_fence_owner([home]) is None
++    path.write_text(json.dumps({'pid': os.getppid(), 'created_at': 0}) + '\n')
++    assert ancestor_fence_owner([home]) == os.getppid()
+-- 
+2.55.0
+
