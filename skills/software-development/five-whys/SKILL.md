@@ -261,6 +261,7 @@ Countermeasures:
 
 ## Pitfalls
 
+- For stat-only cache fingerprints, distinguish semantic inputs from generated metadata: creating an ignored `__pycache__` still moves its parent's mtime. Reproduce at the exact record-write/read boundary by creating the ignored directory and explicitly moving the parent mtime, while retaining real plugin/config invalidation checks. Check a reported CI run's head ancestry before treating a newly delivered flake notice as a post-fix recurrence. A starvation controller must pause all descendants, not only the runner's process group: per-file runners may create new sessions.
 - Writing the chain after the fix is chosen, so the chain is built to justify it. Do the chain first; let it pick
   the fix.
 - Answers that restate the question ("it failed because it errored"). Each why must add new information.
