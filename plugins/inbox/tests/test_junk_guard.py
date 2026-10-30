@@ -91,9 +91,10 @@ def test_post_with_no_poster_and_no_key_is_refused(env):
 
 
 def test_keyed_post_without_poster_is_refused_not_attributed(env):
-    """v2: a key no longer stands in for a registered poster; the registry is fail-closed."""
+    """v2: a key no longer stands in for a registered poster; the registry is fail-closed. The refusal names the
+    missing poster (poster_missing_keyed + the --poster hint) rather than a generic unregistered family."""
     inbox, *_ = env
-    with pytest.raises(store.AgentOwnedPost, match="poster_unregistered"):
+    with pytest.raises(store.AgentOwnedPost, match="poster_missing_keyed: .*--poster"):
         inbox.post("GitHub Actions: pick billing limit", "b", "fix", key="gh-actions-billing:2026-10")
 
 

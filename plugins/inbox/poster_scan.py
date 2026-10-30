@@ -53,3 +53,96 @@ def scan(root: Path) -> list[dict]:
                     if _const(el) == "--poster" and _const(items[i + 1]) is not None:
                         out.append({"site": f"{rel}:{n.lineno}", "poster": _const(items[i + 1])})
     return out
+
+
+# --- Inbox posts that name no poster ----------------------------------------------------------------------------
+# A keyed post with no poster gets the derived poster "key · <prefix>" (store.key_poster), whose family "key" is never
+# registered: the gate refuses it on every run (cron-3299286b9a). scan() only sees literal posters, so it cannot flag
+# a call that names none. scan_missing() does, for the three ways Python code reaches the Inbox:
+#   argv     ["hermes", "inbox", "post", ...] with no "--poster" in the list or the enclosing function
+#   payload  an Inbox payload dict literal ({"key", "type", "title", ...}) without a "poster" key
+#   call     inbox.post(..., key=...) / inbox_guard.post(payload) whose enclosing function never mentions a poster
+# "Mentions a poster" is deliberately coarse: a transport that forwards the caller's poster (inbox_guard) or a
+# wrapper that sets it via dict(card, poster=...) is fine; only a function with no poster anywhere is flagged.
+
+_PAYLOAD_KEYS = {"key", "type", "title"}
+_PAYLOAD_BODY = {"fields", "body"}
+_SNAPSHOT_KEYS = {"session_id", "state", "outcome"}  # an outcome/readback snapshot, not a post payload
+_POSTER_WORDS = {"--poster", "poster"}  # a set, so this module's own literals never look like an argv pair
+_INBOX_POST = "inbox post"
+
+
+def _iter_sources(root: Path):
+    for path in sorted(Path(root).rglob("*.py")):
+        rel = path.relative_to(root)
+        nested_claude_tree = any(a == '.claude' and b == 'worktrees' for a, b in zip(rel.parts, rel.parts[1:]))
+        if (any(p in SKIP_DIRS or p == '.worktrees' for p in rel.parts)
+                or nested_claude_tree or rel.name.startswith("test_")):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (SyntaxError, UnicodeDecodeError, OSError):
+            continue
+        if "inbox" in text.lower():
+            yield rel, tree
+
+
+def _mentions_poster(node) -> bool:
+    for n in ast.walk(node):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in _POSTER_WORDS:
+            return True
+        if isinstance(n, ast.keyword) and (n.arg == "poster" or n.arg is None):  # poster= or **kwargs forwarding
+            return True
+        if isinstance(n, ast.Name) and n.id == "poster":
+            return True
+    return False
+
+
+def _scopes(tree):
+    """(node, enclosing function or module) for every node."""
+    def walk(node, scope):
+        for child in ast.iter_child_nodes(node):
+            inner = child if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else scope
+            yield child, inner
+            yield from walk(child, inner)
+    yield from walk(tree, tree)
+
+
+def _is_inbox_post_argv(node) -> bool:
+    """[<hermes>, "inbox", "post", ...]: the subcommand follows the program, so it never starts the list."""
+    vals = [_const(e) for e in node.elts]
+    return any(f"{vals[i]} {vals[i + 1]}" == _INBOX_POST for i in range(1, len(vals) - 1))
+
+
+def _is_inbox_post_call(node: ast.Call) -> bool:
+    f = node.func
+    if not (isinstance(f, ast.Attribute) and f.attr == "post"):
+        return False
+    base = f.value
+    name = (base.id if isinstance(base, ast.Name) else base.attr if isinstance(base, ast.Attribute)
+            else _callee(base) if isinstance(base, ast.Call) else "")
+    return "inbox" in name.lower()
+
+
+def scan_missing(root: Path) -> list[dict]:
+    """Return ``{site, kind}`` for every Inbox-posting call under ``root`` that names no poster."""
+    out: list[dict] = []
+    for rel, tree in _iter_sources(root):
+        for n, scope in _scopes(tree):
+            kind = None
+            if isinstance(n, (ast.List, ast.Tuple)) and _is_inbox_post_argv(n):
+                kind = "argv"
+            elif isinstance(n, ast.Dict):
+                keys = {_const(k) for k in n.keys if k is not None}
+                if (_PAYLOAD_KEYS <= keys and keys & _PAYLOAD_BODY and not keys & _SNAPSHOT_KEYS
+                        and not keys & _POSTER_WORDS and None not in n.keys):
+                    out.append({"site": f"{rel}:{n.lineno}", "kind": "payload"})
+                continue
+            elif isinstance(n, ast.Call) and _is_inbox_post_call(n):
+                if not n.args and not any(k.arg == "key" for k in n.keywords):
+                    continue  # not a keyed post (e.g. an HTTP client's .post(url=...))
+                kind = "call"
+            if kind and not _mentions_poster(scope):
+                out.append({"site": f"{rel}:{n.lineno}", "kind": kind})
+    return out

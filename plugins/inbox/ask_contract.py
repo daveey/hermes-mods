@@ -129,15 +129,28 @@ SELF_ATTESTED_MSG = ("this poster is agent-owned and the ask is self-attested. I
                      "or use a Kanban card")
 
 
+def missing_poster_hint(home, type_name=None):
+    """Retry text for poster_missing_keyed: the registered families that may post this card type."""
+    t = type_name or "default"
+    fams = sorted(f for f, row in registry(home).items()
+                  if t in row.get("allowed_types", ()) or "*" in row.get("allowed_types", ()))
+    return (f"this keyed post named no poster, so it was labelled 'key · <prefix>', which is never registered. "
+            f"Pass --poster <family> (CLI), poster= (tool/API) or \"poster\" in the inbox_guard payload; "
+            f"families allowed to post type {t!r}: {', '.join(fams) or 'none (register one in posters.yaml)'}")
+
+
 def reason(*, home, poster, ask, actions, type_name="default", title="", body="", key="",
            from_human_request=False, **_):
     if _is_test(title) or _is_test(str(key or "")):
         return "content_test"
     if not poster or not str(poster).strip():
         return "poster_missing"
-    row = registry(home).get(family(poster))
+    reg = registry(home)
+    row = reg.get(family(poster))
     if not row:
-        return "poster_unregistered"
+        # A keyed post that named no poster gets the derived "key · <prefix>" (store.key_poster). That family is never
+        # registered, so it can never pass: say so, and missing_poster_hint() names what to pass (cron-3299286b9a).
+        return "poster_missing_keyed" if family(poster) == "key" else "poster_unregistered"
     if type_name not in row["allowed_types"] and "*" not in row["allowed_types"]:
         return "poster_type_forbidden"
     if _SENT_NOTICE.search(title or ""):
