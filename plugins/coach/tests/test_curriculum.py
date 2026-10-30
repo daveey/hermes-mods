@@ -3,7 +3,6 @@ adoption tests, and that every command a tip names exists in the current Hermes 
 import importlib.util
 import json
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -382,14 +381,25 @@ def test_every_hermes_command_in_a_tip_is_declared():
         assert not missing, (e["id"], missing)
 
 
-@pytest.mark.skipif(not shutil.which("hermes"), reason="hermes CLI not on PATH")
-def test_declared_commands_exist_in_current_build():
+@pytest.mark.skipif(importlib.util.find_spec("hermes_cli") is None, reason="hermes_cli not importable: no build to check")
+def test_declared_commands_exist_in_current_build(tmp_path, monkeypatch):
+    # The build under test is the hermes_cli this interpreter imports, run in a private home. The installed `hermes`
+    # launcher resolves its dependency environment from HERMES_HOME, so under a fresh home it exits 1 before argparse
+    # ("no dependency environment is committed"), and under the real home it checks that install, not this build.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def cli(*args):
+        return subprocess.run([sys.executable, "-m", "hermes_cli.main", *args], capture_output=True, text=True,
+                              timeout=60, cwd=tmp_path)
+
     cmds = sorted({c for e in cur.load(None) for c in e.get("commands") or []} | {"hermes kanban create"})
     for c in cmds:
-        r = subprocess.run(c.split() + ["--help"], capture_output=True, text=True, timeout=60)
+        argv = c.split()
+        assert argv[0] == "hermes", c
+        r = cli(*argv[1:], "--help")
         assert r.returncode == 0 and "usage" in (r.stdout + r.stderr).lower(), (c, r.stderr[-300:])
     # flags the tips name
-    k = subprocess.run(["hermes", "kanban", "create", "--help"], capture_output=True, text=True, timeout=60).stdout
+    k = cli("kanban", "create", "--help").stdout
     assert "--triage" in k and "--max-runtime" in k
-    top = subprocess.run(["hermes", "--help"], capture_output=True, text=True, timeout=60).stdout
+    top = cli("--help").stdout
     assert "--worktree" in top and "-w" in top

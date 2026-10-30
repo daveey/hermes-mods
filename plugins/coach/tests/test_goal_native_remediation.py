@@ -35,6 +35,24 @@ def probe(url):
                        "/dev/null", "--write-out", "%{http_code}", "--", url])
 
 
+def use_home_allowlist(monkeypatch):
+    """Govern approvals by the private home's ``command_allowlist`` only.
+
+    tools.approval reads the launch profile's allowlist once at import and only
+    re-reads it for a context-local home override, not for a HERMES_HOME env
+    change. Without this the test inherits whatever home pytest started under:
+    the real ~/.hermes permanently approves 'script execution via -e/-c flag'
+    (so the repair ran on that approval, not this test's allowlist), and a fresh
+    home approves nothing (so the repair sat pending_approval). Swap in fresh
+    state, then load it from the private home; monkeypatch restores both.
+    """
+    from tools import approval
+    monkeypatch.setattr(approval, "_permanent_approved", set())
+    monkeypatch.setattr(approval, "_permanent_approved_by_home", {})
+    monkeypatch.setattr(approval, "_permanent_baseline_by_home", {})
+    approval.load_permanent_allowlist()
+
+
 @pytest.fixture
 def app(tmp_path):
     state = tmp_path / "status"
@@ -76,15 +94,20 @@ def test_native_repair_held_text_stop(agent, app, tmp_path, monkeypatch, case):
     # Real profile settings and native approval guards. Only these disposable
     # commands are preapproved; no global auto-approval or production config.
     repaired_status = "503" if case == "failure" else "200"
-    repair = shlex.join([sys.executable, "-c",
-                        "from pathlib import Path; Path(" + repr(str(state)) + ").write_text("
-                        + repr(repaired_status) + ")"])
+    # A script file, not `python -c '...; ...'`: an exact-text allowlist entry never covers a command whose
+    # arguments a shell re-reads (tools.approval_floors._has_allowlist_shell_operator), so the -c form only ran
+    # where the launch home happened to approve the 'script execution via -e/-c flag' pattern for every command.
+    script = tmp_path / "repair.py"
+    script.write_text("from pathlib import Path\nPath(" + repr(str(state)) + ").write_text("
+                      + repr(repaired_status) + ")\n")
+    repair = shlex.join([sys.executable, str(script)])
     readback = probe(base + "/unrelated" if case == "wrong_path" else target)
     initial = probe(target)
     (home / "config.yaml").write_text(
         f"terminal:\n  backend: local\n  cwd: {tmp_path}\n"
         + "approvals:\n  mode: manual\ncommand_allowlist: "
         + json.dumps([initial, repair, readback]) + "\n")
+    use_home_allowlist(monkeypatch)
     (home / "coach").mkdir()
     (home / "coach" / "goal-disposition.json").write_text('{"mode":"enforce"}')
     events, seen = [], []
@@ -242,6 +265,7 @@ def test_native_shell_function_cannot_certify_uncontacted_app(app, tmp_path, mon
         'terminal:\n  backend: local\n  cwd: ' + str(tmp_path)
         + '\n  shell_init_files: ' + json.dumps([str(init)])
         + '\napprovals:\n  mode: manual\ncommand_allowlist: ' + json.dumps([command]) + '\n')
+    use_home_allowlist(monkeypatch)
     result = json.loads(registry.dispatch('terminal', {'command': command, 'workdir': str(tmp_path)}, task_id='default'))
     print('NATIVE_RESULT', result)
     print('APP_REQUESTS', requests, 'APP_STATE', state.read_text())
@@ -288,6 +312,7 @@ def test_native_isolated_readback_ignores_shell_and_environment(app, tmp_path, m
         "terminal:\n  backend: local\n  cwd: " + str(tmp_path)
         + "\n  shell_init_files: " + json.dumps([str(init)])
         + "\napprovals:\n  mode: manual\ncommand_allowlist: " + json.dumps([command]) + "\n")
+    use_home_allowlist(monkeypatch)
     args = {"command": command, "workdir": str(tmp_path), "http_readback": True}
     result = json.loads(registry.dispatch("terminal", args, task_id="default"))
     assert result["exit_code"] == 0 and result["output"] == status, result

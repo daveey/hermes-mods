@@ -19,7 +19,7 @@ def _isolated_worker_context(monkeypatch, tmp_path):
     Keep HERMES_HOME alone: tests that need a full home already supply one.
     """
     for key in tuple(os.environ):
-        if key == "HERMES_DELEGATED_CHILD_CONTEXT" or key.startswith("HERMES_KANBAN_"):
+        if key in ("HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_SINGLE_QUERY_SESSION") or key.startswith("HERMES_KANBAN_"):
             monkeypatch.delenv(key)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))

@@ -1192,6 +1192,7 @@ class AgentCoach:
         s["turn_tools"] = 0
         s["turn_log"].clear()
         s["turn_rich"].clear()
+        s.pop("turn_commits", None)
         s["turn_t0"] = time.time()  # wall clock: the diff review asks git for commits made since the turn began
         if isinstance(user_message, str) and user_message.strip():
             s["ask"] = user_message[:2000]
@@ -1224,6 +1225,12 @@ class AgentCoach:
     def kanban_db_down(self, sid: str) -> bool:
         """The session's last Kanban call was refused because the board couldn't be read (stale view or damage)."""
         return bool(self._s(sid).get("kanban_db_down"))
+
+    def turn_commit_lines(self, sid: str) -> list[str]:
+        """This turn's terminal commands that mention `git ... commit`, uncut (`-> terminal(<command>)`): the 140-char
+        turn_log and 300-char rich log can cut `cd <long path> && git commit` before the commit, so the diff review
+        reads the commit dirs from these."""
+        return list(self._s(sid).get("turn_commits") or [])
 
     def turn_rich(self, sid: str) -> list[str]:
         """This turn's tool log with real arguments (kanban_create title and body, delegate goals, patch paths), for the
@@ -1280,6 +1287,8 @@ class AgentCoach:
             arg = ""
         s["turn_log"].append(f"-> {tool}({arg[:140]})")
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
+        if tool == "terminal" and "commit" in arg and "git" in arg:
+            s.setdefault("turn_commits", deque(maxlen=20)).append(f"-> terminal({arg[:8000]})")
         if failed(tool, result, status):
             s["turn_log"].append(f"   <- ERROR {str(result)[:120]}")
         if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers

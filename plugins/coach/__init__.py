@@ -469,7 +469,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             so = _load("second_opinion")
             # unverified + this turn changed a git repo -> one bounded diff review on the strong model. The rule
             # joins the judged set only for such turns, so diff_review off (default) = the old behaviour exactly.
-            repos = (so.changed_repos(log_lines, changed_paths)
+            # turn_log keeps 140 chars of a command, which can cut `cd <long path> && git commit` before the commit,
+            # so the commit dirs come from the uncut commit commands too.
+            repos = (so.changed_repos(log_lines + coach.turn_commit_lines(session_id), changed_paths)
                      if so.setting("diff_review") and "unverified" in rc.prefilter(final_response)
                      and coach.loop_state(session_id).get("diff_reviewed") != coach.turn_number(session_id) else {})
             only = list(cfg["rules"]) + (["unverified"] if repos and "unverified" not in cfg["rules"] else [])
