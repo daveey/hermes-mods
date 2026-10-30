@@ -15,6 +15,8 @@ import threading
 
 import pytest
 
+from gateway_reaper import stop_gateways_under
+
 ROOT = Path(__file__).resolve().parents[1]
 CHILD = Path(__file__).with_name('transport_child.py')
 PROMPTS = {
@@ -145,6 +147,8 @@ def test_guard_over_transport(tmp_path, route, case):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=15)
+            # Before reading state.db: the child's auto-started gateway outlives it.
+            stop_gateways_under(home)
             (home / 'wire.json').write_text(json.dumps(frames.frames, indent=2))
     wire = json.dumps(frames.frames)
     channels = {}

@@ -26,6 +26,15 @@ def _isolated_worker_context(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _reap_test_home_gateways(tmp_path):
+    """Stop gateways a test's subprocesses auto-started under tmp_path. They detach from the
+    child and would otherwise hold the tmp home's state.db WAL/SHM after pytest deletes it."""
+    yield
+    from gateway_reaper import stop_gateways_under
+    stop_gateways_under(tmp_path)
+
+
+@pytest.fixture(autouse=True)
 def _no_dependency_sync_in_tmp_home(tmp_path):
     """Regression guard: a test basetemp must never hold a uv cache or a built environment."""
     yield
