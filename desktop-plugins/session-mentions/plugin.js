@@ -35,7 +35,10 @@ const MAX_MATCHES = 8
 const MAX_RECENT = 15
 const COURIER_INTERVAL_MS = 3_000
 const UNSUPPORTED_BACKOFF_MS = 5 * 60_000
-const ERROR_BACKOFF_MS = 30_000
+// A failed drain retries soon: the gateway calls this Mac's courier gone after 20 s without a drain
+// (user-terminal COURIER_FRESH_S), so a backoff at or above that turns ONE timed-out GET (a loaded
+// Mac) into "no Hermes Desktop connected" for the remote agent. Pinned by courier-liveness.test.mjs.
+const ERROR_BACKOFF_MS = 5_000
 const HOME_BEAT_MS = 5_000 // server treats the home courier as gone after 20s of silence
 const HOME_COURIER_ID = 'home-courier'
 const FORWARD_PICKUP_MS = 20_000
@@ -1072,7 +1075,10 @@ async function handleTell(text) {
 // ── courier for the cross_session agent tool ─────────────────────────────────
 
 const courierState = new Map() // connectionId -> {until}
-let courierBusy = false
+// Per connection, not one flag for the whole tick: a stalled backend (this Mac's own gateway under
+// load, 10 s timeouts) must not hold back the drain of every other gateway, whose liveness window is 20 s.
+const courierInflight = new Set()
+export const RESULT_RETRY_MS = [1_000, 3_000, 5_000, null]
 
 export async function performRequest(req, origin, conns) {
   const args = req?.args || {}
@@ -1160,6 +1166,28 @@ export function ownerSurface(platform) {
   return ids.length > 0 && ids.every(id => OWNER_SURFACES.has(id))
 }
 
+// Desktop mints a fresh gateway ticket over the control socket before each REST call to its own
+// backend (core local-gateway.ts mintLocalGatewayTicket). These errors all come from that step,
+// so the request itself was never sent: retrying cannot run a command twice. A loaded Mac stalls
+// that socket for a few seconds at a time (10-30: load 105 on 16 cores, 773 such errors).
+export const PRE_SEND_RE = /Gateway ticket (bootstrap failed|control socket missing|connection closed|deadline)|Invalid gateway ticket|fresh private ticket/i
+export const PRE_SEND_RETRY_MS = [1_000, 2_000, 3_000, 4_000, 5_000, 5_000]
+
+const PRE_SEND_BUDGET_MS = 25_000 // inside the gateway's wait for the answer (START_RESULT_S 60, status POLL_S+30)
+
+export async function apiPreSendRetry(connectionId, path, opts, delays = PRE_SEND_RETRY_MS) {
+  const started = Date.now()
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await api(connectionId, path, opts)
+    } catch (error) {
+      if (attempt >= delays.length || Date.now() - started > PRE_SEND_BUDGET_MS) throw error
+      if (!PRE_SEND_RE.test(String(error?.message || error))) throw error
+      await sleep(delays[attempt])
+    }
+  }
+}
+
 export async function performUserTerminal(req, origin, conns) {
   const home = conns.find(isHome)
   if (!home) return { ok: false, error: 'this Desktop has no local backend to open a terminal on' }
@@ -1175,10 +1203,10 @@ export async function performUserTerminal(req, origin, conns) {
   try {
     if (args.job_id) {
       const wait = Math.max(0, Math.min(25, Number(args.wait_s) || 0))
-      const res = await api(home.id, `${UT_BASE}/status/${enc(args.job_id)}?gateway=${enc(gateway)}&wait_s=${wait}`, { timeoutMs: (wait + 20) * 1000 })
+      const res = await apiPreSendRetry(home.id, `${UT_BASE}/status/${enc(args.job_id)}?gateway=${enc(gateway)}&wait_s=${wait}`, { timeoutMs: (wait + 20) * 1000 })
       return { ...res, device }
     }
-    const res = await api(home.id, `${UT_BASE}/start`, {
+    const res = await apiPreSendRetry(home.id, `${UT_BASE}/start`, {
       method: 'POST',
       body: {
         command: String(args.command || ''),
@@ -1260,10 +1288,8 @@ export function outboxPath(conn, conns) {
 const isHome = conn => conn?.kind === 'local'
 
 export async function courierTick() {
-  if (courierBusy) return
-  courierBusy = true
-  try {
-    const conns = await connections()
+  const conns = await connections()
+  {
     const home = conns.find(isHome)
     if (home && Date.now() - lastHomeBeat >= HOME_BEAT_MS) {
       // Tell this gateway its own courier is alive, so other Macs' Desktops (which reach it through
@@ -1278,6 +1304,8 @@ export async function courierTick() {
       conns.map(async conn => {
         const st = courierState.get(conn.id)
         if (st && Date.now() < st.until) return
+        if (courierInflight.has(conn.id)) return
+        courierInflight.add(conn.id)
         let res
         try {
           res = await relay(conn.id, outboxPath(conn, conns), { timeoutMs: 10_000 })
@@ -1285,6 +1313,8 @@ export async function courierTick() {
           const msg = String(error?.message || error)
           courierState.set(conn.id, { until: Date.now() + (/404|not found/i.test(msg) ? UNSUPPORTED_BACKOFF_MS : ERROR_BACKOFF_MS) })
           return
+        } finally {
+          courierInflight.delete(conn.id)
         }
         courierState.delete(conn.id)
         for (const req of Array.isArray(res?.requests) ? res.requests : []) {
@@ -1296,13 +1326,21 @@ export async function courierTick() {
             } catch (error) {
               result = { ok: false, error: String(error?.message || error) }
             }
-            await api(conn.id, `/api/plugins/${PLUGIN_ID}/result`, { method: 'POST', body: { id: req.id, result } }).catch(() => undefined)
+            // Keyed by request id, so a repeat is harmless; one dropped POST strands the remote agent
+            // until its wait runs out ("claimed the request but sent no answer in time").
+            for (const delay of RESULT_RETRY_MS) {
+              try {
+                await api(conn.id, `/api/plugins/${PLUGIN_ID}/result`, { method: 'POST', body: { id: req.id, result } })
+                break
+              } catch {
+                if (delay == null) break
+                await sleep(delay)
+              }
+            }
           })()
         }
       })
     )
-  } finally {
-    courierBusy = false
   }
 }
 
