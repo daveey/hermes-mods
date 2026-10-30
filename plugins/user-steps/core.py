@@ -1530,7 +1530,10 @@ def validate_action(value):
         if not isinstance(value[field], list): raise ActionError('Expected array')
     for limit in value['limits']:
         _object(limit, ('key', 'value'), ('permissionRequired',))
-        for text in limit.values(): _string(text)
+        _string(limit['key']); _string(limit['value'])
+        # permissionRequired is a flag, not text: a bare True used to fail as 'Expected nonempty string'.
+        if 'permissionRequired' in limit and type(limit['permissionRequired']) is not bool:
+            raise ActionError('permissionRequired must be a boolean')
     for text in value['exclusions']: _string(text)
     _object(value['outcomes'], ('revise',) if value['kind'] == 'approval' else (),
             ('approve', 'decline', 'answer') if value['kind'] == 'approval' else ('revise', 'approve', 'decline', 'answer'))
