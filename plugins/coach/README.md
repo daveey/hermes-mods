@@ -792,6 +792,22 @@ ONE card per host and day (`--idempotency-key withheld-notice:<host>:<date>`), c
 `tests/test_withheld_notice_watch.py` (only assistant replies starting with a notice count, not quotes or mentions;
 one card per day then a comment only on new hits; seed and dry-run file nothing).
 
+### Restart notices to a team home channel (`restart_notice_config_watch.py`, no agent, no LLM)
+
+A gateway posts "Hermes is restarting" / "Gateway online" to each platform's home channel unless
+`platforms.<platform>.gateway_restart_notification: false` (default true). alpha-askeve's home channel was a team
+Slack channel and got 26 such notices in 7 h before the opt-out was added. A hermes cron job on hermes-hub (no-agent,
+hourly, "restart-notice config watch (hub)") runs `restart_notice_config_watch.py`: it reads `<HERMES_HOME>/config.yaml`
+(profile `default`) and every `profiles/*/config.yaml`, takes each platform with a home channel (`home_channel.chat_id`
+in config.yaml or a non-empty `<PLATFORM>_HOME_CHANNEL` in the profile's `.env`), and files ONE card per host, profile
+and platform (`--idempotency-key restart-notice-config:<host>:<profile>:<platform>`) when the flag is not false (top
+level or under `extra`, read like core's `_coerce_bool`). A home channel that should keep the notices (an owner DM) is
+allow-listed in `<HERMES_HOME>/restart-notice-allow.txt` as `<profile>` or `<profile>:<platform>`. An unreadable
+config is reported, not skipped. `--dry-run` prints the JSON and files nothing; a clean real run prints nothing. Tests:
+`tests/test_restart_notice_config_watch.py` (config.yaml and `.env` home channels flagged, explicit true flagged;
+top-level/extra/string false, flow-style YAML and no home channel quiet; allow-list by profile and profile:platform;
+unreadable config reported; dry-run files nothing, a real run files one keyed card; clean run silent).
+
 ### Agent probes in a person's chat (`probe_token_watch.py`, no agent, no LLM)
 
 A fix worker proved its fix with `hermes chat --resume <David's chat> --oneshot -q "... Reply exactly ROUTE_..."`

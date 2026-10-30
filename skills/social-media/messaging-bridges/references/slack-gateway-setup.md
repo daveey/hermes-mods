@@ -39,7 +39,10 @@ other step yourself and hand them one short numbered list.
    `SLACK_ALLOWED_USERS=<U…>` in `.env` so only they can drive the agent.
 7. Run the gateway supervised: `hermes gateway install` (launchd). Then confirm `[Slack] Socket Mode connected`
    and `✓ slack connected` in `gateway.log`, and send a test DM with `chat.postMessage` to the member id
-   (a user id as `channel` opens the DM). Tell the user to reply and optionally `/sethome` in that DM.
+   (a user id as `channel` opens the DM). Tell the user to reply and optionally `/sethome` in that DM. A home
+   channel other people read (any channel, not the user's DM) also needs
+   `platforms.slack.gateway_restart_notification: false` in that profile's config.yaml, or every gateway restart
+   posts restart/online notices there (slack-workspace-bot skill, Operator setup step 6).
 
 ## App settings URLs
 
