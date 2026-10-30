@@ -250,10 +250,19 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
     import json
 
     def sink(rep: dict) -> None:
-        top = rep["awaiting"][0]["chain"][-3:] if rep["awaiting"] else []
-        logger.warning("loop-watch: slow request %s %s %.2fs (started %s, responded=%s, samples=%d) awaiting=%s",
+        chain = rep["awaiting"][0]["chain"] if rep["awaiting"] else []
+        top = chain[-3:]
+        # Behind a BaseHTTPMiddleware the request task only waits on call_next's stream (anyio Event.wait), which
+        # names no handler: name the busiest worker thread instead, where the handler's time actually went.
+        busy = ""
+        if chain and _middleware_hop(tuple(chain[:-3])):
+            workers = rep.get("worker_threads") or []
+            if workers:
+                w = workers[0]
+                busy = " busy=%s(%d): %s" % (w["thread"], w["n"], " > ".join(w["stack"][-3:]))
+        logger.warning("loop-watch: slow request %s %s %.2fs (started %s, responded=%s, samples=%d) awaiting=%s%s",
                        rep["method"], rep["path"], rep["total_s"], rep["started"], rep["responded"], rep["samples"],
-                       " > ".join(top) or "-")
+                       " > ".join(top) or "-", busy)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
