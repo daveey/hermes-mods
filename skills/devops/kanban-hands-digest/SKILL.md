@@ -61,6 +61,7 @@ Applies to every board-status reply, including "why are only N running": what wa
    An old scope-hold comment ("STOP remediation until told") on a card counts as superseded only with evidence, such as sibling cards in the same program now landing under the same authority. Say in your reply that you treated it as lifted and offer to re-hold.
 3. Do sign-in/OAuth blockers yourself through the hub's agent browser before asking him for anything (same reference). Only a step that truly needs his hand or device (a password not in the vault, Touch ID, a physical action) goes to him, and only after you have tried the self-service route.
 4. A "walk me through it" request still means doing everything automatable yourself; the walk-through covers only what remains.
+5. Never post a For-you step (user-step `do`/`input`) for a change you can make yourself (a config edit, a setting, locating where a value lives): he clicks Done without knowing what it meant, and a follow-up "where did you change it?" gets "I don't know what you're asking, just fix it". Make the change, verify it, report it. If he clicks Done on such a step anyway, re-read the state; if it didn't change, do it yourself instead of asking.
 
 When the user's step is done, re-queue the card yourself (`kanban_unblock`, or the CLI for triage) after a
 comment saying what changed. Don't wait for the card to notice. Go global (the digest script below, all
