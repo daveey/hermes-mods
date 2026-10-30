@@ -78,6 +78,12 @@ workers can create or remove evidence. Reconcile every group in the machine-read
 notification's truncated list. Separate creation rate, retained inventory and actual leaks; a burst alone does
 not prove failed cleanup.
 
+For Hermes transcript-row counts in `state.db` ("notice stored twice", "duplicate row"), check `active`,
+`compacted` and `message_uid` before hunting a second writer: in-place compaction rewinds each retained tail row
+to `active=0, compacted=0` and re-inserts it as a new active row with the same `message_uid` and timestamp
+(`_archive_and_compact_on_conn` in `hermes_state_messages.py`). Count visible rows (`active=1` or
+`compacted=1`) per session; two visible rows are a real double insert, one visible plus superseded copies is not.
+
 For filesystem-age alerts, inspect the timestamp implementation on the running OS. On Linux, `st_ctime` is
 metadata-change time, not creation time, and Git activity makes old worktrees look new; compare GNU
 `stat -c '%W|%Z' <path>` (birth time versus ctime) and the creation-call history before trusting a "new
