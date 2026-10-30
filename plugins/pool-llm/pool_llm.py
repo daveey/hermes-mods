@@ -279,13 +279,19 @@ def _chat_to_responses(messages: list, model: str) -> dict:
 
 
 def complete(messages: list, *, provider: str = "anthropic", model: Optional[str] = None, tier: Optional[str] = None,
-             max_tokens: int = 4096) -> dict:
-    """One chat turn on the pool. Returns {text, provider, model, route}."""
+             max_tokens: int = 4096, thinking: Optional[dict] = None) -> dict:
+    """One chat turn on the pool. Returns {text, provider, model, route}.
+
+    ``thinking`` is the Anthropic ``thinking`` field (e.g. ``{"type": "disabled"}`` for a short classifier answer,
+    which adaptive thinking would otherwise eat); other providers ignore it."""
     provider = canonical_provider(provider)
     model = resolve_model(provider, model, tier)
     route: dict = {}
     if provider == "anthropic":
-        resp = anthropic_messages(_chat_to_anthropic(messages, max_tokens, model), route=route)
+        body = _chat_to_anthropic(messages, max_tokens, model)
+        if thinking is not None:
+            body["thinking"] = thinking
+        resp = anthropic_messages(body, route=route)
         text = "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text")
     else:
         resp = codex_responses(_chat_to_responses(messages, model), route=route)

@@ -20,7 +20,11 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - **Judge**: is the last assistant message a closing summary? Desktop, tui and cli chats only: any other
   `source=` (core passes it), or a session row whose source is known and not interactive, gets None with no model
   call. One call on the subscription pool
-  (`pool-llm`'s `complete`, `anthropic`, `fast` tier) with a 3 s budget. YES → True, NO → False, anything else,
+  (`pool-llm`'s `complete`, `anthropic`, `fast` tier, thinking off, 8 tokens) with a 6 s budget. Thinking is
+  off because the fast model's adaptive thinking spent the whole token budget and about two calls in three came
+  back empty. The judge sees the user's latest real request (`<request>`, capped at 2,000 characters; kanban
+  notices, auto-continue rows and this plugin's nudge are skipped) and the reply (`<message>`): without the
+  request it judged a finished answer to "what should I ask?" as "a question". YES → True, NO → False, anything else,
   any error or a timeout → None (core falls back to its heuristic). Verdicts are cached per (session, text).
   The judge reads the whole reply up to 12,000 characters, else its head and tail around an omission marker:
   never only the tail, which hides a long report's answer and gets a finished report judged NO.
@@ -51,7 +55,9 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - decide writes ledger steps with options and choices, then declares;
 - the provider returns open steps as decision items;
 - the judge: YES/NO, timeout → None, failure or unclear answer → None, the default path calls pool `fast` tier;
-- the judge gets a long reply's head and tail (whole when short);
+- the judge gets a long reply's head and tail (whole when short), wrapped in `<message>`;
+- the judge gets the user's latest real request (synthetic rows and the nudge skipped, capped), or none;
+- the default pool path turns thinking off (`pool-llm` `complete(thinking=...)` puts it in the Anthropic body);
 - the gate asks once and passes the second miss (by nudge tag and by the in-memory backup), passes after a tool
   call, on a summary, on an undecided judge, and when a wait or an open step outranks;
 - non-interactive sources (cron, slack, Kanban worker) get no tool and no gate; tui and cli do;

@@ -241,12 +241,50 @@ def test_judge_sees_head_and_tail_of_a_long_reply(plugin):
     reply = head + ("x" * 30000) + tail
     assert plugin.judge("S1", reply) is True
     sent = seen[-1]
-    assert sent.startswith(head) and sent.endswith(tail)
+    assert sent.startswith("<message>\n" + head) and sent.endswith(tail + "\n</message>")
     assert "middle of the message omitted" in sent
-    assert len(sent) <= plugin.JUDGE_INPUT_CHARS + 60
+    assert len(sent) <= plugin.JUDGE_INPUT_CHARS + 80
     short = "Deployed v3 and verified the health check passes."
     plugin.judge("S2", short)
-    assert seen[-1] == short
+    assert seen[-1] == f"<message>\n{short}\n</message>"
+
+
+def _messages(home, rows):
+    db = sqlite3.connect(home / "state.db")
+    db.execute("create table messages (id integer primary key, session_id text, role text, content text, "
+               "display_kind text)")
+    db.executemany("insert into messages (session_id, role, content, display_kind) values (?,?,?,?)", rows)
+    db.commit()
+    db.close()
+
+
+def test_judge_sees_the_users_latest_request(plugin, home):
+    # Without the request the judge called a finished answer to "what should I ask to vet X?" (a list of
+    # questions) "a question", and said NO. Synthetic user rows (kanban notices, auto-continue, this plugin's own
+    # nudge) are not the request.
+    _messages(home, [("S1", "user", "old ask", None),
+                     ("S1", "user", "what questions should i ask to vet an earthquake model", None),
+                     ("S1", "assistant", "Ask about the ETAS baseline...", None),
+                     ("S1", "user", "Kanban card t_1 finished", "kanban_notice"),
+                     ("S1", "user", "continue", "auto_continue"),
+                     ("S1", "user", plugin.NUDGE, None)])
+    seen = []
+    plugin._llm = lambda s, u: seen.append((s, u)) or "YES"
+    assert plugin.judge("S1", "1. What does ETAS score on the same test set?") is True
+    system, sent = seen[-1]
+    assert sent == ("<request>\nwhat questions should i ask to vet an earthquake model\n</request>\n\n"
+                    "<message>\n1. What does ETAS score on the same test set?\n</message>")
+    assert "<request>" in system and "<message>" in system
+
+
+def test_judge_request_is_capped_and_missing_rows_send_message_only(plugin, home):
+    _messages(home, [("S1", "user", "x" * 9000, None)])
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    plugin.judge("S1", "Done: shipped.")
+    assert seen[-1].startswith("<request>\n" + "x" * plugin.REQUEST_CHARS + "\n</request>")
+    plugin.judge("C1", "Done: shipped, cli.")  # no user rows for this chat
+    assert seen[-1] == "<message>\nDone: shipped, cli.\n</message>"
 
 
 def test_judge_only_interactive_sources(plugin):
@@ -296,6 +334,8 @@ def test_judge_default_path_is_pool_fast_tier(plugin, monkeypatch):
     plugin._llm = plugin._pool_llm
     assert plugin.judge("S1", "Done: merged and deployed.") is True
     assert seen["tier"] == "fast"
+    # Thinking off, or a thinking block eats the tiny budget and the answer comes back empty.
+    assert seen["thinking"] == {"type": "disabled"} and seen["max_tokens"] >= 8
 
 
 # ---- pre_final_gate -----------------------------------------------------------------------------------

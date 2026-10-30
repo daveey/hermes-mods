@@ -116,3 +116,17 @@ def test_provider_aliases():
     assert pl.canonical_provider("Claude") == "anthropic"
     with pytest.raises(ValueError):
         pl.canonical_provider("bedrock")
+
+
+def test_complete_passes_thinking_into_the_anthropic_body(monkeypatch):
+    # A short classifier answer (session-outcome's YES/NO judge) turns thinking off: adaptive thinking spent the
+    # whole max_tokens and the text came back empty.
+    sent = []
+    monkeypatch.setattr(pl, "resolve_model", lambda provider, model, tier: "claude-haiku-5-5")
+    monkeypatch.setattr(pl, "anthropic_messages",
+                        lambda body, route=None: sent.append(body) or {"content": [{"type": "text", "text": "NO"}]})
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    r = pl.complete(msgs, tier="fast", max_tokens=8, thinking={"type": "disabled"})
+    assert r["text"] == "NO" and sent[-1]["thinking"] == {"type": "disabled"} and sent[-1]["max_tokens"] == 8
+    pl.complete(msgs, tier="fast")
+    assert "thinking" not in sent[-1]
