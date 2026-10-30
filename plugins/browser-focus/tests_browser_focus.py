@@ -238,13 +238,48 @@ class T(unittest.TestCase):
 
     def test_hint_hook_registers_without_osascript(self):
         ctx = mock.Mock()
-        with mock.patch.object(bf.shutil, "which", return_value=None):
+        with mock.patch.object(bf.shutil, "which", return_value=None), mock.patch.object(bf, "remote_cdp", return_value=None):
             bf.register(ctx)
         hooks = {c.args[0]: c.args[1] for c in ctx.register_hook.call_args_list}
         self.assertIn("transform_tool_result", hooks)
         ctx.register_tool.assert_not_called()   # no screen to raise a window on: no browser_focus tool
         self.assertIn("does not mean a human is needed",
                       hooks["transform_tool_result"]("browser_exec", {}, self.REFUSAL, session_id="w") or "")
+
+    def test_registers_browser_focus_without_osascript_when_remote_chrome_configured(self):
+        ctx = mock.Mock()
+        with mock.patch.object(bf.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"BROWSER_CDP_URL": "http://127.0.0.1:9333"}):
+            bf.register(ctx)
+        self.assertEqual(ctx.register_tool.call_args.kwargs["name"], "browser_focus")
+
+    def test_remote_cdp_from_env_and_config(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as h, mock.patch.dict(os.environ, {"HERMES_HOME": h}):
+            os.environ.pop("BROWSER_CDP_URL", None)
+            with mock.patch.object(bf, "_hermes_home", return_value=h):
+                self.assertIsNone(bf.remote_cdp())
+                open(os.path.join(h, "config.yaml"), "w").write("browser:\n  cdp_url: ws://10.1.2.3:9444/devtools/x\n")
+                self.assertEqual(bf.remote_cdp(), "http://10.1.2.3:9444")
+            os.environ["BROWSER_CDP_URL"] = "http://m:1"
+            self.assertEqual(bf.remote_cdp(), "http://m:1")
+
+    def test_focus_activates_tab_over_remote_endpoint_without_local_chrome(self):
+        gh = {"id": "g1", "type": "page", "title": "GitHub", "url": "https://github.com/x"}
+        calls = []
+        def fake_get(url, timeout=3):
+            calls.append(url)
+            return [TABS[0], gh] if url.endswith("/json/list") else "Target activated"
+        with mock.patch.object(bf, "agent_chromes", return_value=[]), mock.patch.object(bf, "_quiet", return_value=False), \
+                mock.patch.object(bf, "remote_cdp", return_value="http://mac:9333"), mock.patch.object(bf, "_get", fake_get), \
+                mock.patch.object(bf, "_chrome_agent_cli", return_value=None):
+            r = bf.focus("github.com")
+            self.assertTrue(r["focused"])
+            self.assertEqual(r["tab"]["url"], "https://github.com/x")
+            self.assertIn("http://mac:9333/json/activate/g1", calls)
+            miss = bf.focus("nothere.example")
+            self.assertFalse(miss["focused"])
+            self.assertEqual(len([c for c in calls if "activate" in c]), 1)
 
 
 if __name__ == "__main__":

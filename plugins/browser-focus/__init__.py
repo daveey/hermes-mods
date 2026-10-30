@@ -113,6 +113,22 @@ def agent_chromes(home: str | None = None, ps_output: str | None = None) -> list
     return found
 
 
+def remote_cdp() -> str | None:
+    """Base URL (http://host:port) of the Chrome DevTools endpoint browser_exec is pointed at, from
+    BROWSER_CDP_URL or config.yaml `browser.cdp_url`. On a gateway with no screen (the hub) this is the only way to
+    reach the Chrome the user watches, so focus() works through it instead of local process discovery."""
+    raw = (os.environ.get("BROWSER_CDP_URL") or "").strip()
+    if not raw:
+        try:
+            import yaml
+            with open(os.path.join(_hermes_home(), "config.yaml")) as f:
+                raw = str((((yaml.safe_load(f) or {}).get("browser") or {}).get("cdp_url")) or "").strip()
+        except Exception:
+            raw = ""
+    m = re.match(r"^(?:https?|wss?)://([^/\s?#]+)", raw)
+    return f"http://{m.group(1)}" if m else None
+
+
 def _get(url: str, timeout: float = 3):
     with urllib.request.urlopen(url, timeout=timeout) as r:
         body = r.read().decode()
@@ -216,14 +232,17 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
     - require_login (the automatic tool-result path): the tab must be on a sign-in page."""
     if _quiet():
         return {"focused": False, "error": "quiet mode is on; not raising windows"}
-    chromes = agent_chromes()
+    chromes = [(p, f"http://127.0.0.1:{pt}", pt) for p, pt in agent_chromes()]
+    remote = remote_cdp()
+    if remote and not any(base == remote for _, base, _ in chromes):
+        chromes.append((0, remote, 0))   # pid 0 = no local process to raise (hub / remote Chrome): CDP only
     if not chromes:
         return {"focused": False, "error": "no agent-driven Chrome is running"}
     strict = bool(match or kinds or require_login)
-    pid, port, tab, seen = chromes[0][0], chromes[0][1], None, []
-    for c_pid, c_port in chromes:   # several visible agent Chromes: take the one holding the wanted tab
+    pid, base, port, tab, seen = chromes[0][0], chromes[0][1], chromes[0][2], None, []
+    for c_pid, c_base, c_port in chromes:   # several visible agent Chromes: take the one holding the wanted tab
         try:
-            tabs = _get(f"http://127.0.0.1:{c_port}/json/list")
+            tabs = _get(f"{c_base}/json/list")
         except Exception as e:
             log.debug("browser-focus: CDP list failed on %s: %s", c_port, e)
             continue
@@ -235,7 +254,7 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
             tabs = [t for t in tabs if any(tab_is_kind(t, k) for k in kinds)]
         t = pick_tab(tabs, match)
         if t:
-            pid, port, tab = c_pid, c_port, t
+            pid, base, port, tab = c_pid, c_base, c_port, t
             break
     if strict and tab is None:
         if require_login and not (match or kinds):
@@ -245,14 +264,18 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
             err = (f"no tab matches {want}; nothing was raised. Open that page first (browser_exec), then call "
                    "browser_focus again before telling the user it is in front")
         return {"focused": False, "error": err, "open_tabs": seen[:10]}
-    shown = _chrome_agent(["show", "--minutes", str(SHOW_MINUTES)])
+    shown = _chrome_agent(["show", "--minutes", str(SHOW_MINUTES)]) if pid else False
+    activated = False
     try:
         if tab:
-            _get(f"http://127.0.0.1:{port}/json/activate/{tab['id']}")
+            _get(f"{base}/json/activate/{tab['id']}")
+            activated = True
     except Exception as e:
         log.debug("browser-focus: CDP activate failed: %s", e)
-    app = activate_app(pid)
-    if shown and tab and _LOGIN_URL.search(str(tab.get("url", ""))):
+    app = activate_app(pid) if pid else False
+    if not activated and tab:
+        tab = None   # never claim a tab is in front when the activate call failed
+    if shown and tab and port and _LOGIN_URL.search(str(tab.get("url", ""))):
         _watch_login(port, tab["id"])
     return {"focused": bool(app or tab), "app_activated": app, "pid": pid, "shown_on_main_display": shown,
             "tab": {"title": tab.get("title"), "url": str(tab.get("url", ""))[:200]} if tab else None}
@@ -441,7 +464,7 @@ def _hint_only_result(tool_name: str = "", args: Any = None, result: Any = None,
 
 
 def register(ctx) -> None:
-    if shutil.which("osascript") is None:
+    if shutil.which("osascript") is None and not remote_cdp():
         # No screen to raise a window on (Linux/cloud gateway), but its browser tools still hit the private-URL
         # refusal (the hub drives a Mac Chrome): register the hint alone.
         ctx.register_hook("transform_tool_result", _hint_only_result)
