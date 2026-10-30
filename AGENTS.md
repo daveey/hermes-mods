@@ -20,19 +20,41 @@ the private repo `daveey/hermes` (`~/code/hermes`, branch `state`).
 - **`hermes-sync` never commits here.** It only pulls, pushes commits you already made, and links.
   Uncommitted edits stay local (and are logged) until you commit them.
 
+## Work in a detached worktree, never the live checkout
+
+`~/code/hermes-mods` is a deployment checkout loaded by running agents. Do not edit it (including
+through plugin/skill symlinks), commit, stash, reset, rebase, or restore files there.
+
+```sh
+git -C ~/code/hermes-mods fetch origin
+git -C ~/code/hermes-mods worktree add --detach ~/code/mods-work origin/main
+cd ~/code/mods-work
+# edit and run targeted tests here; stage only your paths, commit, then publish:
+git push origin HEAD:main
+# If rejected: fetch/rebase in this worktree and retry; never stash the live tree.
+git -C ~/code/hermes-mods worktree remove ~/code/mods-work
+```
+
+Sync deploys published commits; a manual `git merge --ff-only origin/main` is allowed only on a clean
+live checkout. `live-checkout-guard` enforces common file/shell tool paths (not an OS sandbox).
+`skill_manage` remains allowed; persistent uncommitted edits are detected by hermes-sync.
+To reconcile archived leftovers, use `plugins/live-checkout-guard/reconcile.py --help`: it requires
+an applicable archive, unchanged archived bytes, and a target commit already on origin/main.
+A new guard also belongs in private `home/plugins-every-host.txt`; export must never rewrite that policy.
+
 ## Adding or changing a mod
 
 1. Decide public or private. Public = generally useful, with no personal data (family, finances,
    home network, hostnames/IPs, emails, account IDs) and nothing employer-internal. Otherwise, put
    it in `~/.hermes` as usual; the private repo picks it up.
-2. Write it **here**:
+2. Write it **in the detached worktree** at the same relative paths:
    - new agent plugin: `plugins/<name>/` (`plugin.yaml`, `__init__.py`, tests). Its Desktop half goes in `desktop-plugins/<name>/plugin.js`.
    - new skill: `skills/<category>/<name>/SKILL.md` (write the file directly; `skill_manage create`
      would land it in `~/.hermes/skills`, i.e. the private repo). Patch existing ones with `skill_manage`.
    - moving an existing private mod here: `git mv`-equivalent: copy it in, commit and push, then run
      `~/code/hermes/hermes-sync run`. It replaces the `~/.hermes` copy with a link (the old copy is
      kept in `~/.hermes/.hermes-sync-trash/`) and removes the copy from the private repo.
-3. Test the live copy (it's linked, so the live copy is this tree). The whole-repo gate is `scripts/test-all`
+3. Test the worktree copy before publication; verify linked registration after deployment. The whole-repo gate is `scripts/test-all`
    (exit 0 = every suite passed; `-k <plugin>` for one). Never a bare `pytest` at the root. On the MacBook run
    only the targeted suite (`-k`); the full run belongs on the hub. A new plugin's tests are picked up
    automatically; one with a non-pytest runner gets an entry in `SUITE_OVERRIDES` in that script.
