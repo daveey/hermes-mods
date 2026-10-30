@@ -36,6 +36,23 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 | L3 | `pre_tool_call` | Explicit `human_request` on `kanban_create`/`kanban_block` is validated and judged as a complete structured request (see below), never via unrelated body/reason text. Status or operational failure alone is not an ask. Legacy prose explicitly saying the user must act retains its `Checked:` gate; worker `kanban_complete` handoffs retain the existing verified-ask/FYI rewrite. |
 | L4 | ledger | `~/.hermes/state/ask-ledger.sqlite` (not synced). When the user's message answers or dismisses an open ask ("done", "i keep completing it", "stop asking", "you can do it") the aux model classifies it and the topic/answer is stored. L1 shows it in every chat (cross-session); L2's judge treats a repeat as `already_answered`. A cheap regex gates the classifier call, so unrelated messages cost nothing. |
 
+**Repeat asks (L2, no model call).** The judge passes a true, unanswered ask as `ok` every time, so nothing stopped a
+chat from restating the same optional ask reply after reply. Every ask item a delivered reply shows (list items under
+a heading count one by one) is recorded in the ledger's `shown_asks` table (session, topic tokens, text, the fact
+tokens of its paragraph). Before the judge, an item whose topic this chat (compression lineage) already showed in
+2 delivered replies within 48 h, the first at least 1 h ago, is held with: *Asked N times, last at T, still in
+For-you or on its card. Don't restate it. If nothing waits on it, say once that silence means no, then close the
+card.* Not held: an item that brings a new fact (a date, time, amount, deadline/expiry/cost/charge/failure word not
+in the earlier showings), an item the user's last message is about, a how-to answer, repeats minutes apart while the
+user works a step live. Topic match (`core.same_topic`) is conservative: a shared card id, or >=2 shared content
+tokens covering >=60% of the shorter ask, never when both name identifiers that share none (PR 10 vs PR 12). Logs
+`ask_repeat_held` (or `ask_repeat_released` once the two-nudge budget is spent: the reply then goes to the judge as
+before). Held drafts are not counted as shown. Why: self-heal agent-31a66d274a (four replies over 43 h asked David to
+revoke a leaked key and decide on secret hiding; nothing waited on either). Tests: `tests/test_repeat_ask.py`.
+Replay (`scripts/replay_repeat.py`, coach digests, MacBook + hub, last 30 days, 2026-10-30): 3,884 replies, 838
+with asks, 9 holds (0.23%); hand-checked all 9: 7 real restatements (incl. the incident reply), 1 duplicate digest,
+1 false hold (a live phone-pairing step re-asked over 1 h).
+
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
 delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>

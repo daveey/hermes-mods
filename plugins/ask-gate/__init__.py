@@ -524,6 +524,9 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             verdicts = [{"i": 0, "verdict": "unverified", "reason": "Handoff was not opened."}]
         elif asks:
             tools = core.merge_tool_logs(core.tools_from_messages(turn_messages or []), LOG.get(session_id))
+            repeat = None if howto else _repeat_gate(session_id, asks, attempt, budget, final_response)
+            if repeat is not None:
+                return repeat
             # Re-read evidence even when the draft text has not changed.
             verdicts = run_judge(session_id, asks, tools, final_response)
         else:
@@ -534,6 +537,7 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
                        verdicts=[(v["verdict"], v.get("reason", "")) for v in verdicts])
         if not bad:
             ledger().set_open_asks(session_id, asks)
+            _record_shown(session_id, asks, final_response)
             record_verdict(session_id, "ok", final_response)
             return None
         if attempt < budget:
@@ -551,6 +555,34 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
                     "No action or approval is requested by this notice."}
         core.log_event("gate_error", session=session_id, error=repr(e))
         return None
+
+
+def _repeat_gate(session_id: str, asks: list[str], attempt: int, budget: int, draft: str) -> dict | None:
+    """Hold a reply that restates an ask this chat already showed REPEAT_MAX_SHOWN times in 48 h with no new fact
+    (self-heal agent-31a66d274a). Deterministic, before the judge: the judge passes a true, unanswered ask as ok
+    every time, so only a count stops the restatement. Past the hold budget the reply goes on to the judge as
+    before. Fails open."""
+    try:
+        reps = core.repeated_asks(core.ask_items(asks), ledger().shown_rows(session_id), _user_msgs(session_id),
+                                  reply=draft)
+    except Exception as e:
+        core.log_event("ask_repeat_error", session=session_id, error=repr(e)[:300])
+        return None
+    if not reps:
+        return None
+    core.log_event("ask_repeat_held" if attempt < budget else "ask_repeat_released", session=session_id,
+                   attempt=attempt, repeats=[{"item": r["item"][:200], "n": r["n"]} for r in reps[:5]])
+    if attempt >= budget:
+        return None
+    record_verdict(session_id, "held", draft)
+    return {"hold": True, "nudge": core.repeat_nudge(reps)}
+
+
+def _record_shown(session_id: str, asks: list[str], reply: str) -> None:
+    try:
+        ledger().record_shown(session_id, core.ask_items(asks), core.text_hash(reply), reply=reply)
+    except Exception as e:
+        core.log_event("ask_shown_error", session=session_id, error=repr(e)[:300])
 
 
 def _handoff_gate(session_id: str, final_response: str, turn_messages: list | None, attempt: int) -> dict | None:
