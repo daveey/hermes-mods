@@ -126,7 +126,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
   head's run `pending`. Read back `status`/`conclusion` after `gh run cancel` before reporting it done; if stuck,
   `gh api -X POST repos/O/R/actions/runs/<id>/force-cancel`. When asked about one latched run, sweep the whole
   queue with `scripts/ci_latch_sweep.py OWNER/REPO` (dry run, then `--apply`): it selects only superseded-head runs
-  whose open jobs are all gate/report jobs, re-reads each run before cancelling, and never touches re-runs
+  whose open jobs are all gate/report jobs still waiting for a runner (a gate already running is left to finish), re-reads each run before cancelling, and never touches re-runs
   (`run_attempt>1`), runs with no jobs listed, or current-head runs; it exits 1 on any failed read or cancel. A `main` group
   without cancel-in-progress serializes, so a superseded main run latched on its timing report blocks the next one.
   Root fix: `if: ${{ !cancelled() }}` and run gate/report jobs on a light runner label; PRs pick it up only after
