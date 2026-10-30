@@ -72,11 +72,25 @@ source file to explicitly select that validator. Dispatches are captured in
 memory: these tests send no real hub messages.
 
 The Desktop half runs under Node: `node --test plugins/session-mentions/tests/*.test.mjs`.
-`live-throwaway.test.mjs` covers teardown with a virtual clock: a successful DELETE is followed by
-GET checks for ten seconds of absence, a late close write triggers another DELETE and restarts that
-window, 409 write guards retry, persistent rows/guards time out after thirty seconds, and REST errors
-fail cleanup. Live scripts must await `deleteThrowaway` after `session.close` in `finally`; HTTP 200
-alone does not prove cleanup because a closing runtime may persist its row again.
+`live-throwaway.test.mjs` covers both hide and teardown with a virtual clock: fresh snapshot revision
+fences and UUIDs on PATCH/DELETE, DELETE generation fences, persistence/busy retries, and immediate
+errors for upgrade/stale/unknown conflicts. A successful DELETE is followed by GET checks for ten
+seconds of absence; a late close write triggers another fenced DELETE and restarts that window.
+Persistent rows/guards time out after thirty seconds, and REST errors fail cleanup.
+Live scripts must await `deleteThrowaway` after `session.close` in `finally`; HTTP 200 alone does
+not prove cleanup because a closing runtime may persist its row again.
+
+### Live throwaway mutation recipe
+
+Create sessions with `source: 'scratch'`. After the first prompt persists, call `hideThrowaway`.
+Before each mutation attempt GET `/api/sessions/<encoded-key>/mutation-snapshot?profile=default`.
+Use a fresh UUID `request_id` and the returned `runtime_revision` as `expected_revision` in the
+hide PATCH body (`hidden: true, profile: 'default'`). DELETE takes those fields in its query
+string **plus** `expected_generation=runtime_generation`. Retry only explicit 409
+`detail: 'session_busy'`, re-reading the snapshot first. Upgrade/stale conflicts are errors,
+not write guards. Renderer hides use
+`host.setPersistedSessionHidden(route,{sessionId,profile,hidden:true})` rather than raw PATCH.
+The renderer recipe is documented here but is not exercised by the helper's Node tests.
 `registry-names.test.mjs` covers gateway registry names: a connection whose `/ping` reports `gateway: hub` resolves `@task:default@hub/<id>` and `@session:default@hub/<id>` (unit and through a courier tick against fake backends), the drain `reach` carries it, and `hub-ec2` / `macbook` / hostname refs still resolve. `test_targeting.py` covers the gateway side: `/ping` reports `self_gateway()` (empty when the hub client is missing or broken), and a request routed to a registry name is claimed by the courier whose reach has it, not by a Desktop that lacks it.
 `typeahead-refresh.test.mjs` drives `register()` and the completion sources' `provide`/`subscribe` with a fake
 bridge: cold cache shows Loading then signals and offers the session; a failed session fetch and a failed task
