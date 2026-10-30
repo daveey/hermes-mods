@@ -69,7 +69,8 @@ def libs():
     if _lib is None:
         _collect = _load("sog_collect", _collect_path())
         lib = _load("sog_lookup_lib", HERE / "lookup_lib.py")
-        lib.valid_owner, lib.read_owner_md = _collect.valid_owner, _collect.read_owner_md
+        for name in ("valid_owner", "read_owner_md", "parse_ps", "chain", "env_tags", "owner"):
+            setattr(lib, name, getattr(_collect, name))
         _lib = lib
     return _collect, _lib
 
@@ -87,7 +88,11 @@ def remote_script(spec: dict) -> str:
     return "\n".join([
         "from __future__ import annotations\nimport json, os, plistlib, re, subprocess, sys\nfrom pathlib import Path",
         (HERE / "lookup_lib.py").read_text(),  # declares valid_owner = read_owner_md = None ...
-        inspect.getsource(collect.valid_owner), inspect.getsource(collect.read_owner_md),  # ... defined here
+        "import platform\nMAC = platform.system() == 'Darwin'",
+        "TAG_KEYS = " + repr(collect.TAG_KEYS), "TASK_KEYS = " + repr(collect.TASK_KEYS),
+        "TAG_RE = re.compile(" + repr(collect.TAG_RE.pattern) + ")",
+        *[inspect.getsource(getattr(collect, name)) for name in (
+            "valid_owner", "read_owner_md", "short_name", "parse_ps", "chain", "parse_env_tags", "env_tags", "owner")],
         "def run(argv, timeout=5):\n"
         "    try:\n"
         "        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)\n"
@@ -216,18 +221,30 @@ def _systemctl(args: list, host) -> list:
 
 
 def _kill(prog: str, args: list, host) -> list:
-    if host:  # local targets only
-        return []
-    valued = {"-s", "-n"} if prog == "kill" else {"-u", "-U", "-g", "-G", "-P", "-t", "-s", "-n", "-o"}
+    if prog == "pkill":
+        # pgrep accepts the matching flags, not pkill's signal selector.
+        match_args, i = [], 0
+        while i < len(args):
+            a = args[i]
+            if a == "--signal":
+                i += 2
+                continue
+            if re.fullmatch(r"-(?:[0-9]+|(?:SIG)?[A-Z][A-Z0-9]+)", a) or a.startswith("--signal="):
+                i += 1
+                continue
+            match_args.append(a)
+            i += 1
+        args = match_args
+    valued = {"-s", "-n"} if prog == "kill" else {"-u", "-U", "-g", "-G", "-P", "-t", "-s"}
     pos, full, i = [], False, 0
     while i < len(args):
         a = args[i]
         i += 1
         if a in valued:
-            if prog == "kill" and a == "-s" and i < len(args) and args[i] in {"0", "EXIT"}:
+            if prog == "kill" and a in {"-s", "-n"} and i < len(args) and args[i] in {"0", "EXIT"}:
                 return []
             i += 1
-        elif a in {"-l", "-L", "-0"}:
+        elif prog == "kill" and a in {"-l", "-L", "-0"}:
             return []  # list signals / existence probe
         elif a.startswith("-") and len(a) > 1:
             if prog != "kill" and not a.startswith("--") and "f" in a[1:]:
@@ -235,12 +252,16 @@ def _kill(prog: str, args: list, host) -> list:
         else:
             pos.append(a)
     if prog == "kill":
-        return [{"tool": "kill", "verb": "kill", "host": None, "pid": int(p), "label": p, "key": p}
-                for p in pos if p.isdigit() and int(p) > 1]
+        pids = [int(p) for p in pos if p.isdigit() and int(p) > 1]
+        if host and len(pids) > 1:
+            label = ",".join(map(str, pids))
+            return [{"tool": "kill", "verb": "kill", "host": host, "pids": pids, "label": label, "key": label}]
+        return [{"tool": "kill", "verb": "kill", "host": host, "pid": p, "label": str(p), "key": str(p)}
+                for p in pids]
     if not pos:
         return []
-    return [{"tool": "kill", "verb": prog, "host": None, "pattern": pos[0], "full": full,
-             "label": pos[0], "key": pos[0]}]
+    return [{"tool": "kill", "verb": prog, "host": host, "pattern": pos[0], "full": full,
+             "label": pos[0], "key": pos[0], "pgrep_args": (["-x", pos[0]] if prog == "killall" else args)}]
 
 
 def _extract(argv: list, host, depth: int, out: list) -> None:
@@ -318,14 +339,17 @@ def _host_name(host) -> str:
 def _lookup(act: dict) -> dict:
     host = act["host"]
     if act["tool"] == "kill":
-        return _lookup_pids(act)
-    if act["tool"] == "launchctl":
+        if not host:
+            return _lookup_pids(act)
+        spec = dict(act, kind="pids")
+        spec.pop("host", None)
+    elif act["tool"] == "launchctl":
         spec = {"kind": "launchd", "label": act["label"], "domain": act["domain"], "plist": act["plist"]}
     else:
         spec = {"kind": "systemd", "unit": act["unit"], "user": act["user"]}
     if not host:
         return local_lookup(spec)
-    opts = [o for o in host["opts"] if o not in {"-t", "-tt", "-T"}]
+    opts = [o for o in host["opts"] if o not in {"-t", "-tt", "-T", "-n", "-f"}]
     prefix = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] + opts + [host["dest"]]
     return remote_lookup(prefix, spec)
 
@@ -398,18 +422,22 @@ def _evaluate(text: str, actions: list) -> Optional[str]:
         target = act["label"] if act["tool"] != "kill" or "pid" not in act else f"pid {act['pid']}"
         status = res.get("status")
         if status == "found":
-            owner = res["owner"]
-            card = owner.split("@")[0]
-            if mine and mine == card:
-                continue
-            if card in approved:
-                _log(host, act, owner, "override owner-approved")
-                continue
-            _log(host, act, owner, "refused")
-            what = f"{target} (pid {res['label']})" if act["tool"] == "kill" and "pattern" in act else target
-            return (f"Refused: {what} is owned by card {owner} ({res.get('source', '?')}). Ask on that card "
-                    f"with the measured cost (CPU-time delta over >= 60 s). Stop it only after the owner agrees, "
-                    f"then add owner-approved={card} to the command.")
+            # One remote lookup may match several separately owned processes. An approval
+            # for the first owner must not hide a later, unapproved owner.
+            for found in res.get("owners", [res]):
+                owner = found["owner"]
+                card = owner.split("@")[0]
+                if mine and mine == card:
+                    continue
+                if card in approved:
+                    _log(host, act, owner, "override owner-approved")
+                    continue
+                _log(host, act, owner, "refused")
+                what = f"{target} (pid {found['label']})" if act["tool"] == "kill" and ("pattern" in act or "pids" in act) else target
+                return (f"Refused: {what} is owned by card {owner} ({found.get('source', '?')}). Ask on that card "
+                        f"with the measured cost (CPU-time delta over >= 60 s). Stop it only after the owner agrees, "
+                        f"then add owner-approved={card} to the command.")
+            continue
         if status == "failed":
             _log(host, act, "-", f"lookup failed ({res.get('error', '?')}); " +
                  ("override owner-checked=none" if persistent and checked_none else

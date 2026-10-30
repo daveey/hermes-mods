@@ -143,8 +143,39 @@ def _systemd(spec, run):
     return {"status": "none"}
 
 
+def _pids(spec, run):
+    rc, out = run(["ps", "-Ao", "pid=,ppid=,pcpu=,rss=,etime=,args="], 5)
+    if rc != 0:
+        return {"status": "failed", "error": "ps failed"}
+    table = parse_ps(out)
+    if "pid" in spec or "pids" in spec:
+        pids = [p for p in spec.get("pids", [spec.get("pid")]) if p in table]
+    else:
+        argv = ["pgrep"] + spec["pgrep_args"]
+        rc, out = run(argv, 5)
+        if rc not in (0, 1):
+            return {"status": "failed", "error": "pgrep failed"}
+        matches = [line.split()[0] for line in out.splitlines() if line.split()]
+        pids = [int(p) for p in matches if p.isdigit() and int(p) in table and int(p) > 1]
+    every = sorted({q for p in pids for q in chain(table, p)})
+    for q in every:
+        cwd = _cwd_of(q, run)
+        if cwd:
+            table[q]["cwd"] = cwd
+    tags = env_tags(every)
+    owners = []
+    for p in pids:
+        agent = owner(table, tags, p)
+        if agent.get("HERMES_OWNER_CARD"):
+            owners.append({"status": "found", "owner": agent["HERMES_OWNER_CARD"],
+                           "source": "pid %s: %s" % (p, agent.get("owner_source", "env")), "label": str(p)})
+    return dict(owners[0], owners=owners) if owners else {"status": "none"}
+
+
 def find_owner(spec, run):
     try:
+        if spec.get("kind") == "pids":
+            return _pids(spec, run)
         return _launchd(spec, run) if spec.get("kind") == "launchd" else _systemd(spec, run)
     except Exception as exc:  # a lookup bug must read as "failed", never as "no owner"
         return {"status": "failed", "error": repr(exc)[:200]}
