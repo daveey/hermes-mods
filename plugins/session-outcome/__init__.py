@@ -545,15 +545,30 @@ def _call_ids(msg: dict) -> list[str]:
     return ids
 
 
-def _called_this_turn(session_id: str, msgs: list) -> bool:
+def _own_turn(msgs: list) -> list[dict]:
+    """The part of ``turn_messages`` this turn wrote: from the last user row that is not this plugin's nudge.
+
+    Core's ``turn_messages`` starts at the last TYPED user row, so a turn a kanban notice (or another runtime row)
+    started also carries every earlier turn back to that message, with their session_outcome calls and nudges.
+    Counted here, the previous turn's call let the notice turn's reply pass undeclared and unasked, and the judge's
+    NO left the chat unresolved{no_summary} (hub 20261030_043755_29ecb6). The nudge stays inside its own turn."""
     msgs = [m for m in msgs if isinstance(m, dict)]
+    for idx in range(len(msgs) - 1, -1, -1):
+        m = msgs[idx]
+        if m.get("role") == "user" and TAG not in str(m.get("content") or ""):
+            return msgs[idx:]
+    return msgs
+
+
+def _called_this_turn(session_id: str, msgs: list) -> bool:
+    msgs = _own_turn(msgs)
     if any(TOOL in _tool_names(m) for m in msgs):
         return True
     return any((session_id, cid) in _CALLED for m in msgs for cid in _call_ids(m))
 
 
 def _asked_this_turn(session_id: str, msgs: list, attempt: int) -> bool:
-    if any(isinstance(m, dict) and m.get("role") == "user" and TAG in str(m.get("content") or "") for m in msgs):
+    if any(m.get("role") == "user" and TAG in str(m.get("content") or "") for m in _own_turn(msgs)):
         return True
     return attempt > 0 and time.time() - _ASKED.get(session_id, 0) < 900
 

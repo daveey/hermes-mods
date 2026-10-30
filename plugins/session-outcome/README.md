@@ -41,6 +41,10 @@ the outcome and feeds core the two things only plugins know: open user decisions
   never asks twice in a turn. A core whose `derive_outcome` lacks those keywords, or any error, passes.
 - **Per-turn call record**: a call is recorded as (session, tool call id) and counts only for a gate whose turn
   holds that call id, so it never carries into the next turn.
+- **The gate's turn starts at the last user row that is not its own nudge**, kanban notices included. Core's
+  `turn_messages` starts at the last *typed* message, so a turn a notice started also carried the earlier turns:
+  their `session_outcome` call let the notice turn's reply pass undeclared and unasked, and their nudge counted as
+  "already asked".
 - **`decide` is all or nothing**: every item is validated before any write; a failed write or a rejected
   declaration removes the steps this call added (pre-existing steps it matched are kept).
 - **No core**: without `hermes_state_outcome` the plugin loads, the tool is not offered, the gate passes and
@@ -56,6 +60,8 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - decide is all or nothing: a bad later item writes nothing; a failed write or a rejected declaration keeps nothing
   this call added;
 - the call record is per turn (same turn passes, the next turn and another chat are asked);
+- a notice-started turn ignores the earlier turns' call (by tool name and by call id) and nudge, and still counts
+  its own call and nudge;
 - the judge skips non-interactive sources (by `source=` and by session row) without a model call;
 - decide writes ledger steps with options and choices, then declares;
 - the provider returns open steps as decision items;

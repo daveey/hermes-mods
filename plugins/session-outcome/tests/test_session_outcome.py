@@ -388,6 +388,53 @@ def test_call_flag_is_per_turn(plugin, fake):
     assert gate(plugin, sid="T1", platform="tui", msgs=[{"role": "tool", "tool_call_id": "call_A"}])["hold"]
 
 
+def _notice_turn_after_declared_turn(plugin, earlier_rows):
+    """Core's turn_messages() starts at the last TYPED user row, so a turn a kanban notice started also carries
+    every earlier turn back to that message (hub 20261030_043755_29ecb6: rows 401771-401797, then notice 402180)."""
+    return [
+        {"role": "user", "content": "stop the restart messages"},
+        *earlier_rows,
+        {"role": "assistant", "content": "Both bots stopped sending restart messages."},
+        {"role": "user", "content": "✔ Kanban t_x done — fixed", "display_kind": "kanban_notice"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_N", "function": {"name": "cross_task"}}]},
+        {"role": "tool", "tool_call_id": "call_N", "tool_name": "cross_task", "content": "{}"},
+    ]
+
+
+def test_gate_ignores_an_earlier_turns_call_in_a_notice_started_turn(plugin):
+    """The previous turn's session_outcome call must not count for the turn a notice started: that left the
+    notice turn's reply undeclared and unasked, and the judge's NO made it unresolved{no_summary}."""
+    msgs = _notice_turn_after_declared_turn(plugin, [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_D", "function": {"name": "session_outcome"}}]},
+        {"role": "tool", "tool_call_id": "call_D", "tool_name": "session_outcome", "content": "{\"ok\": true}"},
+    ])
+    out = gate(plugin, reply="The crash is fixed; one related card is still open.", msgs=msgs)
+    assert out and out["hold"] and plugin.TAG in out["nudge"]
+    # a call made inside the notice turn still counts
+    msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": "call_E",
+                                                                       "function": {"name": "session_outcome"}}]})
+    plugin._ASKED.clear()
+    assert gate(plugin, reply="The crash is fixed.", msgs=msgs) is None
+
+
+def test_gate_ignores_an_earlier_turns_call_id_in_a_notice_started_turn(plugin):
+    out = json.loads(plugin.handle({"kind": "done", "summary": "ok"}, session_id="S1", tool_call_id="call_D"))
+    assert out["declared"]
+    msgs = _notice_turn_after_declared_turn(plugin, [{"role": "tool", "tool_call_id": "call_D", "content": "{}"}])
+    assert gate(plugin, reply="The crash is fixed; one related card is still open.", msgs=msgs)["hold"]
+
+
+def test_gate_ignores_an_earlier_turns_nudge_in_a_notice_started_turn(plugin):
+    """An earlier turn's nudge is not 'asked this turn': the notice turn is still asked once."""
+    msgs = _notice_turn_after_declared_turn(plugin, [{"role": "user", "content": plugin.NUDGE,
+                                                      "_pre_final_gate_synthetic": True}])
+    out = gate(plugin, reply="The crash is fixed; one related card is still open.", msgs=msgs)
+    assert out and out["hold"]
+    # the nudge inside this turn still stops a loop
+    msgs.append({"role": "user", "content": out["nudge"], "_pre_final_gate_synthetic": True})
+    assert gate(plugin, reply="The crash is fixed.", msgs=msgs, attempt=1) is None
+
+
 def test_gate_passes_judged_summary(plugin, fake):
     plugin._llm = lambda s, u: "YES"
     assert gate(plugin, reply="Merged #12 and deployed; health check green.") is None
