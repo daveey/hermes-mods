@@ -36,6 +36,16 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 | L3 | `pre_tool_call` | Explicit `human_request` on `kanban_create`/`kanban_block` is validated and judged as a complete structured request (see below), never via unrelated body/reason text. Status or operational failure alone is not an ask. Legacy prose explicitly saying the user must act retains its `Checked:` gate; worker `kanban_complete` handoffs retain the existing verified-ask/FYI rewrite. |
 | L4 | ledger | `~/.hermes/state/ask-ledger.sqlite` (not synced). When the user's message answers or dismisses an open ask ("done", "i keep completing it", "stop asking", "you can do it") the aux model classifies it and the topic/answer is stored. L1 shows it in every chat (cross-session); L2's judge treats a repeat as `already_answered`. A cheap regex gates the classifier call, so unrelated messages cost nothing. |
 
+**Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
+worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
+delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>
+chat", or a structured ask naming a chat this turn's `cross_session` send was refused for. The refusal names the
+exact `FINAL SEND for @session:<ref>: <text>` line (a worker's refused send subscribes the chat to its card) and
+non-worker `cross_session` as the route. Not matched: "reply in this chat", "tell me", physical/external
+`human_request`s, sentences that already name `cross_session`/`FINAL SEND`. Runs before the judge and fails open; a
+refusal logs `chat_delivery_ask_refused`. Why: self-heal agent-c25865e208 (workers asked David for hours to type a
+line into a repair chat that a FINAL SEND delivered).
+
 **Terminal hand-offs (L2, no model call).** Before the judge, `handoff.py` looks for a sentence that hands the user a
 step a shell could do: an imperative (run / paste / type / enter / add / install…, after a sentence start, a comma,
 "please", "you need to", "I'd rather you") aimed at something only a shell does (`sudo`, `ssh`, `authorized_keys`,
@@ -363,3 +373,8 @@ do not.
 
 Known borderline: "Steps 3 and 5 need you to approve broader access once in Chrome." is judged `agent_can_do` when a
 signed-in Chrome profile exists. The hold only asks the agent to verify or try first.
+
+Chat-delivery false-positive scan (2026-10-30, every non-dependency/time/transient `blocked` event on the hub's
+boards: 224 asks): `chat_delivery` matched 3, all real asks to relay text into a Hermes chat (runners
+t_f15d182d, t_01a185154afb4293; default t_a5cc12d9). `tests/test_chat_delivery.py` pins those and the 4 real blocks a
+first draft matched wrongly.

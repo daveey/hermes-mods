@@ -673,6 +673,9 @@ probabilities (0-1):
   only the user knows, and macOS privacy permission grants are NOT handoffs (score low).
   A CONDITIONAL ask ("if X isn't set up, you'll need to...", "may still need you if...") counts as a handoff when
   the agent could have checked X itself (membership, login state, a config value) and didn't: score it high.
+  Asking the user to type, send or relay a message into a Hermes chat/session is a handoff (score high): an agent
+  delivers it with cross_session, and a Kanban worker that was refused that send puts a `FINAL SEND for
+  @session:<ref>: <text>` line in kanban_complete. "Workers are refused sending into Desktop chats" is not a reason.
 - confirm: the message ends by asking permission for a next step that is reversible and clearly within what the
   user already asked for (e.g. "Want me to run the tests / apply the fix / commit it?"). Asking before something
   irreversible, external-facing (sending messages/emails, spending money, deleting data, force-push, publishing),

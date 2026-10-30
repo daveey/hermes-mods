@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -38,6 +38,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     approval_adapter_loading = _sib("approval_adapter_loading")
     runtime_contract = _sib("runtime_contract")
     pr_approval_request = _sib("pr_approval_request")
+    chat_delivery = _sib("chat_delivery")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -629,6 +630,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             reconciled = _reconcile_prose(session_id, tool_name, candidates) or _retired_block(session_id, candidates)
             if reconciled is not None:
                 return reconciled
+        delivery = _chat_delivery_gate(session_id, tool_name, args)
+        if delivery is not None:
+            return delivery
         if tool_name == "kanban_complete" and _is_worker():
             return _worker_complete(session_id, args)
         if tool_name not in ("kanban_create", "kanban_block"):
@@ -668,6 +672,37 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
         return None
     except Exception as e:
         core.log_event("l3_error", error=repr(e))
+        return None
+
+
+def _chat_delivery_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
+    """Refuse a human ask to deliver text into a Hermes chat: FINAL SEND / cross_session does that (agent-c25865e208).
+    Deterministic, before any judge; fails open (a detector error never blocks the call)."""
+    try:
+        refused = chat_delivery.refused_targets(_tools_now(session_id)) if session_id else []
+        ref = None
+        request = args.get("human_request")
+        if tool_name == "kanban_block" and str(args.get("kind") or "") not in _WORKER_NO_ASK_KINDS:
+            ref = (chat_delivery.check_request(request, refused, str(args.get("reason") or "")) if request is not None
+                   else chat_delivery.find_delivery(str(args.get("reason") or ""), refused=refused))
+        elif tool_name == "kanban_create" and (args.get("initial_status") == "blocked" or request is not None):
+            ref = (chat_delivery.check_request(request, refused, str(args.get("body") or "")) if request is not None
+                   else chat_delivery.find_delivery(str(args.get("title") or "") + "\n" + str(args.get("body") or ""),
+                                                    refused=refused))
+        elif tool_name == "kanban_complete" and _is_worker():
+            summary = str(args.get("summary") or args.get("result") or "")
+            for s in core.find_leftovers(summary):
+                if "FINAL SEND" in s.upper():
+                    continue
+                ref = chat_delivery.find_delivery(s, structured=True, refused=refused)
+                if ref:
+                    break
+        if not ref:
+            return None
+        core.log_event("chat_delivery_ask_refused", tool=tool_name, session=session_id, ref=ref)
+        return {"action": "block", "message": chat_delivery.refusal(ref, worker=_is_worker())}
+    except Exception as e:
+        core.log_event("chat_delivery_error", tool=tool_name, session=session_id, error=repr(e)[:300])
         return None
 
 
