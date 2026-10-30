@@ -12,6 +12,7 @@ ASK = {"interaction": "approval", "why_human": "Only David can approve", "action
 TYPES = HERE.parents[1] / "skills" / "productivity" / "hermes-coach" / "inbox-types" / "engine-budget.yaml"
 CRON_ENV = ("HERMES_CRON_SESSION", "1")
 KANBAN_ENV = ("HERMES_KANBAN_TASK", "t_card")
+SHELL_ENV = ("HERMES_KANBAN_WORKER_TASK", "t_card")  # what a worker's shell child sees
 
 
 def _load(name, rel):
@@ -24,7 +25,7 @@ def _load(name, rel):
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    for k in ("HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_CRON_SESSION"):
+    for k in ("HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_CRON_SESSION", "HERMES_KANBAN_WORKER_TASK"):
         monkeypatch.delenv(k, raising=False)
     plugin = _load("_ef_plugin", "__init__.py")
     st = plugin.store_module()
@@ -55,7 +56,7 @@ def post(door, plugin, title, poster, *, ask=None, type=None):
 
 
 @pytest.mark.parametrize("door", ["tool", "cli"])
-@pytest.mark.parametrize("marker", [KANBAN_ENV, CRON_ENV])
+@pytest.mark.parametrize("marker", [KANBAN_ENV, CRON_ENV, SHELL_ENV])
 @pytest.mark.parametrize("poster", ["cli", "desktop", "oneshot"])
 def test_declared_inbox_family_cannot_post_defect_typed_card_from_agent_run(env, door, marker, poster):
     plugin, st, cards, mp = env
@@ -67,7 +68,7 @@ def test_declared_inbox_family_cannot_post_defect_typed_card_from_agent_run(env,
 
 
 @pytest.mark.parametrize("door", ["tool", "cli"])
-@pytest.mark.parametrize("marker", [KANBAN_ENV, CRON_ENV])
+@pytest.mark.parametrize("marker", [KANBAN_ENV, CRON_ENV, SHELL_ENV])
 @pytest.mark.parametrize("poster", ["cli", "desktop", "oneshot"])
 def test_declared_inbox_family_cannot_self_attest_an_ask_from_agent_run(env, door, marker, poster):
     plugin, st, cards, mp = env

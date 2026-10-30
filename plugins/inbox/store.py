@@ -538,9 +538,10 @@ class Inbox:
             raise ValueError("accept_prompt is required (the instruction 'Do it' sends)")
         snap = ct.snapshot(tdef)
         from_hr = False
-        if policy.family(poster) == "kanban" and os.environ.get("HERMES_KANBAN_TASK"):
+        task_id = os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK")
+        if policy.family(poster) == "kanban" and task_id:
             # A blocked card's human_request IS the owner ask: no second hand-written copy to forget.
-            hr_ask = policy.ask_from_human_request(card_human_request(os.environ["HERMES_KANBAN_TASK"]))
+            hr_ask = policy.ask_from_human_request(card_human_request(task_id))
             if hr_ask and (not ask or ask == hr_ask):
                 ask, from_hr = hr_ask, True
         refusal = policy.reason(home=self.home, poster=poster, ask=ask, actions=snap["actions"],

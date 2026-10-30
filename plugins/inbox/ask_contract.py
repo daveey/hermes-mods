@@ -15,7 +15,8 @@ def family(poster):
 
 def runtime_family():
     """The agent-owned family the runtime context proves, or None: a Kanban worker (any door) or a cron run."""
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    # The terminal tool strips HERMES_KANBAN_TASK from shell children; HERMES_KANBAN_WORKER_TASK survives there.
+    if os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK"):
         return "kanban"
     cron = os.environ.get("HERMES_CRON_SESSION", "")
     if not cron:
