@@ -32,6 +32,8 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 
 ## What isn't a plugin
 
+- **[Process safety](tools/process-safety/)**: Linux owned-session scheduling fault injection and an opt-in systemd user GPG SSH-agent health timer, with regression tests.
+
 - **[core/](core/)**: my changes to Hermes's own source: keyboard shortcuts, multi-gateway projects,
   session takeover, fork-friendly `hermes update`, and more. There's one doc per feature (behavior,
   code, tests, gotchas), plus `git am`-ready patches, so you or your agent can add them to your
