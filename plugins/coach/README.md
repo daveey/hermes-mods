@@ -778,6 +778,17 @@ matcher or skill guidance that let them through. `--dry-run` prints the JSON and
 `tests/test_create_overlap_watch.py` (only recent archived overrides count across boards; exactly 2 files nothing,
 3 files one card with a stable week key; dry-run files nothing).
 
+### Bare ask-gate notices (`withheld_notice_watch.py`, no agent, no LLM)
+
+ask-gate used to swap a whole reply for "I withheld a request ..." (17 in 7 sessions, Oct 27-29). It now holds
+first and keeps the draft minus the refused ask, so a delivered bare notice is a defect. A hermes cron job on
+hermes-hub (no-agent, hourly) runs `withheld_notice_watch.py`: it scans `state.db` for assistant replies that start
+with "I withheld a" / "The workflow remains stopped" / "I suppressed a repeated" newer than its last scan and files
+ONE card per host and day (`--idempotency-key withheld-notice:<host>:<date>`), commenting on it for later hits.
+`--seed` marks history as seen (run once at install); `--dry-run --hours N` prints hits and files nothing. Tests:
+`tests/test_withheld_notice_watch.py` (only assistant replies starting with a notice count, not quotes or mentions;
+one card per day then a comment only on new hits; seed and dry-run file nothing).
+
 ## Files
 
 - `__init__.py`: the hooks (`pre_llm_call`, `post_tool_call`, `transform_tool_result`).

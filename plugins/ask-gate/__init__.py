@@ -348,22 +348,122 @@ def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, se
 
 
 # ---- L2 -----------------------------------------------------------------------------------------------
+# A refused ask (closed lifecycle, recorded terminal answer, stopped workflow, unreconcilable approval) is first
+# HELD with a nudge naming the ask and why, so the agent resends without it. Only once the hold budget is spent
+# is the reply replaced, and then by the draft minus the refused ask sentences plus one plain sentence on why.
+# A bare "I withheld a request" notice is the last resort when the ask cannot be cut out cleanly.
+_REFUSED_NOTE = ("(I left a request out of this reply: {why}. This note grants no new permission or "
+                 "execution authorization.)")
+_BARE_NOTICE = ("I withheld a request after checking authoritative approval or lifecycle state. "
+                "No new permission or execution authorization is granted by this notice.")
+
+
+def _plain_why(verdict: str, message: str) -> str:
+    """One user-facing clause for the final note, from the refusal kind / adapter message."""
+    m = (message or "").lower()
+    if verdict == "workflow_stopped":
+        return "you stopped this workflow"
+    if verdict == "unverified":
+        return "it did not pass the current-state check, so I am not asking you for it"
+    if verdict == "retired" or "is retired" in m:
+        return "you already gave a final answer on it"
+    if verdict.startswith("user_step"):
+        return ("that step is already closed" if "retired" in verdict
+                else "its current state could not be checked, so I am not asking you for it")
+    if "already approved" in m:
+        return "that exact approval scope is already approved, so there is nothing to ask"
+    if "is denied" in m:
+        return "that exact approval scope was already denied"
+    if "approval state could not be reconciled" in m:
+        return "its current approval state could not be checked, so I am not asking you for it"
+    return "its approval or lifecycle state could not be confirmed, so I am not asking you for it"
+
+
+def _user_step_directives(text: str) -> list[str]:
+    out = [m.group(0) for m in user_step_lifecycle._DIRECTIVE.finditer(text or "")]
+    return out or [ln.strip() for ln in (text or "").splitlines() if user_step_lifecycle._MARKER.search(ln)]
+
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _has_ask(text: str, howto: bool) -> bool:
+    return bool(core.find_asks(text, howto=howto) or handoff.find_handoffs(text))
+
+
+def _strip_refused(text: str, refused: list[str], howto: bool, directives_only: bool) -> str | None:
+    """The draft without the refused ask sentences, or None when they can't be cut out cleanly."""
+    out = user_step_lifecycle._DIRECTIVE.sub("", text)
+    for ask in sorted({a for a in refused if isinstance(a, str) and a.strip()}, key=len, reverse=True):
+        out = out.replace(ask, "")
+    lines = []
+    for line in out.splitlines():
+        if user_step_lifecycle._MARKER.search(line):
+            continue
+        if not directives_only and _has_ask(line, howto):
+            kept = [s for s in _SENT_SPLIT.split(line) if not _has_ask(s, howto)]
+            line = " ".join(kept)
+        if line.strip() and not re.sub(r"[\s\-*•>#.,;:)(\d]+", "", line):
+            continue  # only a dangling bullet / number left
+        lines.append(line.rstrip())
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if user_step_lifecycle._MARKER.search(result):
+        return None
+    if not directives_only and _has_ask(result, howto):
+        return None
+    if any(len(a) > 20 and a in result for a in refused):
+        return None
+    return result
+
+
+def _refuse(session_id: str, verdict: str, draft: str, refused: list[str], why: str,
+            attempt: int, budget: int, howto: bool = False, directives_only: bool = False) -> dict:
+    try:
+        ledger().set_open_asks(session_id, [])
+    except Exception as e:
+        core.log_event("pending_clear_error", session=session_id, error=repr(e))
+    reason = re.sub(r"^ask-gate:\s*", "", why or "").strip() or "Its current state could not be confirmed."
+    if attempt < budget:
+        try:
+            record_verdict(session_id, "held", draft)
+        except Exception:
+            pass
+        core.log_event("refused_held", session=session_id, verdict=verdict, attempt=attempt, asks=refused[:3])
+        listed = "\n".join(f"- {a.strip()[:300]}" for a in refused[:5]) or "- (the request in your reply)"
+        return {"hold": True, "nudge": (
+            "ask-gate: your reply was NOT delivered. It asks David to:\n" + listed + "\n"
+            f"Refused because: {reason}\n"
+            "Resend the reply without that request. Keep your findings and results, and state the real blocker "
+            "in plain words (what is stuck, and what you will do about it). Do not re-ask it in other words.")}
+    try:
+        record_verdict(session_id, verdict, draft)
+    except Exception:
+        pass
+    note = _REFUSED_NOTE.format(why=_plain_why(verdict, why))
+    try:
+        kept = _strip_refused(draft, refused, howto, directives_only)
+    except Exception as e:
+        core.log_event("refused_strip_error", session=session_id, error=repr(e))
+        kept = None
+    core.log_event("refused_replaced", session=session_id, verdict=verdict, kept=bool(kept))
+    if kept is None:
+        return {"replace": _BARE_NOTICE + " " + note}
+    return {"replace": (kept + "\n\n" + note) if kept else note}
+
+
 def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", final_response: str = "",
                    turn_messages: list | None = None, attempt: int = 0,
                    hold_budget: int | None = None, **_: Any) -> dict | None:
     if not _gate_eligible(session_id, platform) or not isinstance(final_response, str):
         return None
+    budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
     # Exact source reconciliation must not fail open when unrelated history or
     # audit storage is corrupt. Reporting is best-effort, suppression is not.
     exact = user_step_lifecycle.preflight({"session_id": session_id, "draft": final_response})
     if exact is not None:
-        try:
-            record_verdict(session_id, exact["reason"], final_response)
-            ledger().set_open_asks(session_id, [])
-        except Exception:
-            pass
-        return {"replace": "I withheld a user-step request after checking its lifecycle state. "
-                "No new permission or execution authorization is granted by this notice."}
+        return _refuse(session_id, exact.get("reason") or "user_step", final_response,
+                       _user_step_directives(final_response), exact.get("message", ""),
+                       attempt, budget, directives_only=True)
     rejected = False
     try:
         users = _user_msgs(session_id)
@@ -372,29 +472,26 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
         retirement_candidates = asks + handoff.find_handoffs(final_response)
         if not howto and retirement_candidates and ledger().workflow_stopped(session_id):
             rejected = True
-            record_verdict(session_id, "workflow_stopped", final_response)
-            return {"replace": "The workflow remains stopped. I withheld a request to act on it."}
+            return _refuse(session_id, "workflow_stopped", final_response, retirement_candidates,
+                           "David stopped this workflow, so asking him to act on it is not allowed until he "
+                           "resumes it himself.", attempt, budget, howto=howto)
         retired = core.retired_matches(retirement_candidates, ledger().retired_for(session_id, retirement_candidates))
         if retired:
             rejected = True
-            record_verdict(session_id, "retired", final_response)
-            return {"replace":
-                    "I suppressed a repeated request because this action has a recorded terminal answer. "
-                    "This record does not authorize performing or reopening it."}
+            refused = [retirement_candidates[i] for i in sorted(retired) if i < len(retirement_candidates)]
+            return _refuse(session_id, "retired", final_response, refused or retirement_candidates,
+                           "David already gave a terminal answer to this ask (revoked, cancelled, completed or "
+                           "impossible). Do not ask again; this record does not authorize doing or reopening it.",
+                           attempt, budget, howto=howto)
         reconciled = lifecycle.preflight({"session_id": session_id, "tool_name": "pre_final_gate",
                                           "draft": final_response, "howto": howto})
         if reconciled is None:
             reconciled = _reconcile_prose(session_id, "pre_final_gate", asks if howto else retirement_candidates)
         if reconciled is not None:
             rejected = True
-            record_verdict(session_id, "approval_reconciled", final_response)
-            try:
-                ledger().set_open_asks(session_id, [])
-            except Exception as e:
-                core.log_event("pending_clear_error", session=session_id, error=repr(e))
-            return {"replace": "I withheld a request after checking authoritative approval or lifecycle state. "
-                    "No new permission or execution authorization is granted by this notice."}
-        budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
+            return _refuse(session_id, "approval_reconciled", final_response,
+                           asks if howto else retirement_candidates, reconciled.get("message", ""),
+                           attempt, budget, howto=howto)
         held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
         if held is not None and attempt < budget:
             return held
@@ -420,14 +517,9 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             record_verdict(session_id, "held", final_response)
             return {"hold": True, "nudge": judge_mod.nudge(asks, verdicts)}
         record_verdict(session_id, "unverified", final_response)
-        # The entire draft is withheld, including its otherwise valid asks.
-        # Never save a pending question the user did not actually see.
-        try:
-            ledger().set_open_asks(session_id, [])
-        except Exception as e:
-            core.log_event("pending_clear_error", session=session_id, error=repr(e))
-        return {"replace": "I withheld a request that did not pass the current-state check. "
-                "No action or approval is requested by this notice."}
+        # The judge's held asks still fail after the retry budget: drop them, keep the rest of the reply.
+        return _refuse(session_id, "unverified", final_response, asks,
+                       "It did not pass the current-state check.", budget, budget, howto=howto)
     except Exception as e:
         # Reporting/pending-ledger failures must not resurrect a rejected draft.
         # Preserve the existing fail-open policy only before a rejection exists.

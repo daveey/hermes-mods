@@ -280,6 +280,20 @@ the plugin entry point, the actual structured hook, failure rollback, foreign re
 full live PluginManager discovery and real private adapters still require deployment verification.
 
 This seam alone is not an installed approval integration: without a matching adapter the ordinary gate remains.
+## Refused asks: hold first, then drop only the ask
+
+When the final hook refuses an ask (closed user step, recorded terminal answer, stopped workflow,
+unreconcilable or already-decided approval, or a negative judge verdict past its budget), it first
+returns `{"hold": True, "nudge": ...}` while `attempt < budget`: the nudge names the refused ask and
+the reason in words and tells the agent to resend without it, keeping its findings and the real
+blocker. Once the budget is spent (or `hold_budget=0`) the reply is replaced by the draft minus the
+refused ask sentences plus one plain note on why ("(I left a request out of this reply: ...)"). The
+bare "I withheld a request ..." notice remains only when the ask cannot be cut out cleanly or the gate
+errors after a rejection; coach's `withheld_notice_watch.py` files a Kanban card for any such
+delivery. Tests: `tests/test_refusal_hold.py` (hold names ask + reason for approval-unreconciled,
+approved, stopped and retired; budget-spent replacement keeps the findings for each; a resent draft
+without the ask is delivered; an ask-only draft never leaks).
+
 ## Positive rejection survives reporting failures
 
 Once the final hook has rejected a draft for stopped workflow, retired answer, authoritative
