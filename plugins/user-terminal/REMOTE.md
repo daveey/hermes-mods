@@ -29,6 +29,12 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
    `test_owner_dm_refusal_routes_to_ops_not_paste_it`.
 4. No Desktop courier for that Mac online -> the tool errors at once (no outbox write). A live courier that does
    not claim the request within 15 s -> error and the request is withdrawn.
+5. A loaded Mac must not read as "no Desktop connected" or fail the run on one stall
+   (`../session-mentions/tests/courier-liveness.test.mjs`). The courier drains each gateway on its own (a stalled
+   backend can't hold the others back). Its error backoff (5 s) plus the drain timeout and the tick interval stays
+   under `COURIER_FRESH_S` (20 s). A failure in the Desktop's gateway-ticket step comes before the request is sent,
+   so it is retried for up to 25 s. A failure after sending (`Timed out connecting…` on `start`) is never retried,
+   so nothing can run twice. The result POST back to the gateway is retried, because it is keyed by request id.
 
 ## How it works
 
@@ -62,7 +68,7 @@ remote agent polls results/<id>.json; one start request, then status requests of
 cd plugins/user-terminal && uv run --with pytest --with fastapi --with httpx python -m pytest -q -p no:cacheprovider tests_user_terminal.py
 cd plugins/slack-workspace && uv run --with pytest python -m pytest -q -p no:cacheprovider tests_ownerops.py
 cd plugins/mac-ops && uv run --with pytest python -m pytest -q -p no:cacheprovider tests_mac_ops.py
-cd plugins/session-mentions && node --test --test-reporter=tap tests/user-terminal.test.mjs
+cd plugins/session-mentions && node --test --test-reporter=tap tests/user-terminal.test.mjs tests/courier-liveness.test.mjs
 ```
 
 ## Why (five whys)
