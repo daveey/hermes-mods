@@ -1,0 +1,168 @@
+From 8ab83c27c80c1e2dce70158ca0ddefcf22724c07 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 01:41:27 -0700
+Subject: [PATCH] fix(ci): refresh JS apt indexes and require real Nix sandbox
+ (#254)
+
+* fix(ci): detect job checks out the full tree so the Python test planner finds scripts/ci/affected_tests.py
+
+* fix(ci): refresh apt indexes before JS runtime provisioning [daveey]
+
+* ci(nix): require Nix's build sandbox (sandbox=true, sandbox-fallback=false) [daveey]
+
+The default fallback built unsandboxed on runners without namespaces, so pm-packages-exec saw the host
+/lib64 loader and failed ('sandbox unexpectedly carries a host loader'). docker-ci runners now provide
+the namespaces (daveey/hermes@state 9e93cdd2, hosts/hermes-ci-capacity/NIX-SANDBOX.md); a runner that
+can't now fails closed instead of proving nothing.
+
+* test(ci): keep sandbox policy invariant; rely on real Nix execution proof [daveey]
+---
+ .github/workflows/js-tests.yml              |  5 +-
+ .github/workflows/nix.yml                   |  9 ++++
+ tests/ci/test_nix_workflow_sandbox.py       | 35 +++++++++++++
+ tests/scripts/ci/test_js_system_packages.py | 55 +++++++++++++++++++++
+ 4 files changed, 103 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ci/test_nix_workflow_sandbox.py
+ create mode 100644 tests/scripts/ci/test_js_system_packages.py
+
+diff --git a/.github/workflows/js-tests.yml b/.github/workflows/js-tests.yml
+index cf12f01160a..68705bb644e 100644
+--- a/.github/workflows/js-tests.yml
++++ b/.github/workflows/js-tests.yml
+@@ -39,7 +39,10 @@ jobs:
+       - name: Install zsh and a virtual display for Electron
+         if: runner.os == 'Linux'
+         run: |
+-          sudo apt-get update -qq
++          # tfgar AMIs are baked in us-west-2; cloud-init rewrites apt sources to
++          # the regional mirror on boot, so baked lists are stale (#259). Fail on
++          # any partial index fetch instead of installing against stale lists.
++          sudo apt-get update --error-on=any
+           sudo apt-get install -y zsh xvfb \
+             libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+             xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+diff --git a/.github/workflows/nix.yml b/.github/workflows/nix.yml
+index 670e4e8a367..549018adef3 100644
+--- a/.github/workflows/nix.yml
++++ b/.github/workflows/nix.yml
+@@ -100,6 +100,15 @@ jobs:
+         with:
+           extra_nix_config: |
+             experimental-features = nix-command flakes
++            # Every derivation builds in Nix's namespace sandbox, and Nix
++            # refuses to build at all when the runner cannot provide one.
++            # Nix's default fallback builds unsandboxed instead, and then the
++            # host /lib64 loader is visible to the builder, so pm-packages-exec
++            # (which must prove the binaries run without it) fails or proves
++            # nothing. The docker-ci runners provide the namespaces
++            # (daveey/hermes@state hosts/hermes-ci-capacity/NIX-SANDBOX.md).
++            sandbox = true
++            sandbox-fallback = false
+             # A store path that does not substitute is a cache miss and not a
+             # build failure. Build it here instead.
+             fallback = true
+diff --git a/tests/ci/test_nix_workflow_sandbox.py b/tests/ci/test_nix_workflow_sandbox.py
+new file mode 100644
+index 00000000000..3ea51e2b21b
+--- /dev/null
++++ b/tests/ci/test_nix_workflow_sandbox.py
+@@ -0,0 +1,35 @@
++"""nix.yml must build every flake check inside a real Nix sandbox, never a silent unsandboxed fallback.
++
++pm-packages-exec (nix/checks.nix) refuses to pass when the host /lib64 loader is visible to the builder.
++With Nix's default sandbox-fallback the runner without namespace support builds unsandboxed, so that
++guard failed with "sandbox unexpectedly carries a host loader" (PR254, docker-ci). The job runs on the
++runner itself (no `container:`), whose rootless job container provides the namespaces.
++"""
++
++from pathlib import Path
++
++from ruamel.yaml import YAML
++
++WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "nix.yml"
++
++
++def _job():
++    return YAML(typ="safe").load(WORKFLOW.read_text())["jobs"]["flake-check"]
++
++
++def _nix_config():
++    steps = [s for s in _job()["steps"] if str(s.get("uses", "")).startswith("cachix/install-nix-action@")]
++    assert len(steps) == 1, steps
++    settings = {}
++    for line in steps[0]["with"]["extra_nix_config"].splitlines():
++        line = line.strip()
++        if line and not line.startswith("#"):
++            key, _, value = line.partition("=")
++            settings[key.strip()] = value.strip()
++    return settings
++
++
++def test_flake_check_requires_the_sandbox():
++    settings = _nix_config()
++    assert settings.get("sandbox") == "true"
++    assert settings.get("sandbox-fallback") == "false"
+diff --git a/tests/scripts/ci/test_js_system_packages.py b/tests/scripts/ci/test_js_system_packages.py
+new file mode 100644
+index 00000000000..e899c96501b
+--- /dev/null
++++ b/tests/scripts/ci/test_js_system_packages.py
+@@ -0,0 +1,55 @@
++"""Execute JS runner provisioning against an apt client with empty indexes."""
++
++import json
++import os
++from pathlib import Path
++import subprocess
++
++import pytest
++
++import hermes_yaml as yaml
++
++
++WORKFLOW = Path(__file__).resolve().parents[3] / ".github/workflows/js-tests.yml"
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("update_status", [0, 100])
++def test_js_provisioning_refreshes_indexes_and_fails_closed(tmp_path, update_status):
++    workflow = yaml.safe_load(WORKFLOW.read_text())
++    step = next(
++        step for step in workflow["jobs"]["check"]["steps"]
++        if step.get("name") == "Install zsh and a virtual display for Electron"
++    )
++    sudo = tmp_path / "sudo"
++    sudo.write_text('#!/bin/sh\nexec "$@"\n')
++    sudo.chmod(0o755)
++    apt = tmp_path / "apt-get"
++    apt.write_text(
++        "#!/usr/bin/env python3\n"
++        "import json, os, pathlib, sys\n"
++        "root = pathlib.Path(os.environ['APT_TEST_ROOT'])\n"
++        "with (root / 'calls').open('a') as log:\n"
++        "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
++        "if sys.argv[1] == 'update':\n"
++        "    status = int(os.environ['APT_UPDATE_STATUS'])\n"
++        "    if not status: (root / 'indexes').touch()\n"
++        "    sys.exit(status)\n"
++        "sys.exit(0 if (root / 'indexes').exists() else 100)\n"
++    )
++    apt.chmod(0o755)
++    env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}",
++               APT_TEST_ROOT=str(tmp_path), APT_UPDATE_STATUS=str(update_status))
++    result = subprocess.run(
++        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
++        env=env, capture_output=True, text=True, check=False,
++    )
++    calls = [json.loads(line) for line in (tmp_path / "calls").read_text().splitlines()]
++    assert result.returncode == update_status, result.stderr
++    assert calls[0] == ["update", "--error-on=any"]
++    if update_status:
++        assert len(calls) == 1
++    else:
++        assert len(calls) == 2
++        assert calls[1][:2] == ["install", "-y"]
++        assert {"zsh", "xvfb", "libnotify4", "libxss1", "xdg-utils"} <= set(calls[1][2:])
+-- 
+2.55.0
+

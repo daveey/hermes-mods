@@ -3,7 +3,9 @@ import sys
 
 import pytest
 
-pytest.importorskip('tui_gateway.server')
+from core_runtime import require_isolated_core
+
+require_isolated_core()
 from fastapi.testclient import TestClient
 from hermes_cli import web_server, web_server_dashboard as dashboard
 from test_decisions import ROOT, request
@@ -18,6 +20,10 @@ def mounted(monkeypatch):
     plugin = dict(name='user-steps', source='bundled', _dir=str(ROOT / 'dashboard'),
                   _api_file='plugin_api.py')
     monkeypatch.setattr(web_server, '_get_dashboard_plugins', lambda **kw: [plugin])
+    # Core now discovers each secondary profile independently. Publish this
+    # synthetic bundled plugin there too; retain the real file/consent gate.
+    from hermes_cli import web_server_plugin_profiles
+    monkeypatch.setattr(web_server_plugin_profiles, 'profile_dashboard_plugins', lambda home: [plugin])
     from hermes_cli import plugins_cmd
     monkeypatch.setattr(plugins_cmd, '_get_enabled_set', lambda: {'user-steps'})
     monkeypatch.setattr(plugins_cmd, '_get_disabled_set', lambda: set())

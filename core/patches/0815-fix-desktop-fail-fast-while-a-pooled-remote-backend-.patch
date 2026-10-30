@@ -18,17 +18,8 @@ request redials; its answer (HTTP errors included) reopens the gate. A plain req
 does not take the remote down (slow endpoint) but drops the answer mark so the next dispatch
 re-probes /api/health. Fast-fails log as one line with no stack.
 ---
- .../electron/api-request-failure.test.ts      |   9 +
- apps/desktop/electron/api-request-failure.ts  |   7 +-
- apps/desktop/electron/main.ts                 |  68 ++++-
- .../desktop/electron/remote-down-gate.test.ts | 183 ++++++++++++++
- apps/desktop/electron/remote-down-gate.ts     | 238 ++++++++++++++++++
- 5 files changed, 492 insertions(+), 13 deletions(-)
- create mode 100644 apps/desktop/electron/remote-down-gate.test.ts
- create mode 100644 apps/desktop/electron/remote-down-gate.ts
-
 diff --git a/apps/desktop/electron/api-request-failure.test.ts b/apps/desktop/electron/api-request-failure.test.ts
-index fb48c51c53..7bffbcc509 100644
+index fb48c51c5320f9aac54b1ae98b64485e0180c3a6..7bffbcc5092fd9f753ead0da861f8ef5ad43c2d3 100644
 --- a/apps/desktop/electron/api-request-failure.test.ts
 +++ b/apps/desktop/electron/api-request-failure.test.ts
 @@ -1,6 +1,7 @@
@@ -53,7 +44,7 @@ index fb48c51c53..7bffbcc509 100644
 +  })
  })
 diff --git a/apps/desktop/electron/api-request-failure.ts b/apps/desktop/electron/api-request-failure.ts
-index 49ead90ec3..f8a751fda0 100644
+index 49ead90ec323e5131a2f7c7f5879faae016e90ed..f8a751fda07bb9996a156c411e35cead12df6462 100644
 --- a/apps/desktop/electron/api-request-failure.ts
 +++ b/apps/desktop/electron/api-request-failure.ts
 @@ -25,7 +25,12 @@ export function formatApiRequestFailure(
@@ -70,118 +61,9 @@ index 49ead90ec3..f8a751fda0 100644
    const route = `conn=${conn}${profile ? ` profile=${profile}` : ''}`
  
    return `[hermes:api ${method} ${path}] ${route} ${detail}`.slice(0, 6000)
-diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
-index c7d12aa6cc..bd7f009f10 100644
---- a/apps/desktop/electron/main.ts
-+++ b/apps/desktop/electron/main.ts
-@@ -535,6 +535,7 @@ import {
-   type QuitTeardownTask
- } from './quit-teardown'
- import { createSshReuseProbe, wireRegistryReconnect } from './registry-reconnect-wiring'
-+import { dispatchThroughRemoteDownGate, RemoteDownGate } from './remote-down-gate'
- import * as remoteLifecycle from './remote-lifecycle'
- import {
-   attachPowerResumeRemoteRevalidation,
-@@ -2002,6 +2003,9 @@ const pooledRemoteLiveness = new RemoteLivenessTracker(undefined, REMOTE_POOLED_
- 
- const remoteRevalidation = new RemoteRevalidationCoordinator()
- const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
-+// [daveey] Per pool key: a remote backend that just reset/refused/failed its dispatch probe fails its requests fast
-+// until a backoff trial answers again (remote-down-gate.ts).
-+const remoteDownGate = new RemoteDownGate()
- // Single-owner reconnect/dial claim (#90812): reconnectGateway()'s in-flight
- // lock is per-renderer, so two windows racing one wake can both invoke the
- // backend ensure IPC and double-dial a pooled SSH backend. Main owns backend
-@@ -11355,6 +11359,7 @@ async function ensureRegistryBackend(
-           rememberLog(
-             `Pooled remote backend "${key}" failed its dispatch probe (${error?.message || error}); reconnecting on demand.`
-           )
-+          remoteDownGate.markDown(key, `dispatch probe failed: ${error?.message || error}`)
-           await stopPoolBackend(key, 'revalidate')
- 
-           if (source.kind === 'ssh') {
-@@ -17637,20 +17642,42 @@ async function dispatchRegistryApiRequest(
-   // passive read would otherwise inherit its "no warm backend" rejection.
-   const spawnPriority = spawnPriorityFrom(request?.priority)
- 
--  const connection: any = request?.passive
--    ? await ensureRegistryBackend(registryConnectionId, routeProfile, '', { passive: true })
--    : await backendDialClaims.run(backendDialClaimKey(registryConnectionId, routeProfile), () =>
--        ensureRegistryBackend(registryConnectionId, routeProfile, '', { spawnPriority })
--      )
-+  const connect = (): Promise<any> =>
-+    request?.passive
-+      ? ensureRegistryBackend(registryConnectionId, routeProfile, '', { passive: true })
-+      : backendDialClaims.run(backendDialClaimKey(registryConnectionId, routeProfile), () =>
-+          ensureRegistryBackend(registryConnectionId, routeProfile, '', { spawnPriority })
-+        )
- 
--  const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
-+  let requestPath = ''
-+  let connection: any = null
- 
--  const response = await fetchJsonForBackend(connection, requestPath, {
--    method: request?.method,
--    body: request?.body,
--    upload: request?.upload,
--    timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
--  })
-+  const send = (descriptor: any) => {
-+    connection = descriptor
-+    requestPath = pathForRegistryBackendRequest(request.path, requestProfile, descriptor)
-+
-+    return fetchJsonForBackend(descriptor, requestPath, {
-+      method: request?.method,
-+      body: request?.body,
-+      upload: request?.upload,
-+      timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-+    })
-+  }
-+
-+  // [daveey] Remote (non-local) connections go through the down gate: while the pooled backend is known down
-+  // (reset, refused, failed dispatch probe) its requests reject at once instead of each burning a 4-10 s timeout.
-+  const gateKey = remoteDownGateKey(registryConnectionId, routeProfile)
-+
-+  const response = gateKey
-+    ? await dispatchThroughRemoteDownGate({
-+        gate: remoteDownGate,
-+        key: gateKey,
-+        connect,
-+        request: send,
-+        forgetAnswer: baseUrl => remoteAnswerLedger.forget(baseUrl),
-+        log: rememberLog
-+      })
-+    : await send(await connect())
- 
-   desktopProfilePreferences.afterProfileRequest(registryConnectionId, request, response, connection.mode)
- 
-@@ -17659,6 +17686,23 @@ async function dispatchRegistryApiRequest(
-     : response
- }
- 
-+// Pool key the down gate tracks for a registry request, or null when the request stays on this machine.
-+function remoteDownGateKey(connectionId, profile): null | string {
-+  try {
-+    const registry = readDesktopConnectionsRegistry()
-+    const id = registryDialConnectionId(connectionId, registry.primary)
-+    const source = registry.connections.find(c => c.id === id)
-+
-+    if (!source || source.kind === 'local') {
-+      return null
-+    }
-+
-+    return backendScopeKey(id, profile)
-+  } catch {
-+    return null
-+  }
-+}
-+
- function registryConnectionKind(connectionId) {
-   const registry = readDesktopConnectionsRegistry()
-   const source = registry.connections.find(connection => connection.id === connectionId)
 diff --git a/apps/desktop/electron/remote-down-gate.test.ts b/apps/desktop/electron/remote-down-gate.test.ts
 new file mode 100644
-index 0000000000..6dc1385ab4
+index 0000000000000000000000000000000000000000..486f8d356ac7db1b1e67ed84dd0608d2e06605ad
 --- /dev/null
 +++ b/apps/desktop/electron/remote-down-gate.test.ts
 @@ -0,0 +1,183 @@
@@ -370,7 +252,7 @@ index 0000000000..6dc1385ab4
 +})
 diff --git a/apps/desktop/electron/remote-down-gate.ts b/apps/desktop/electron/remote-down-gate.ts
 new file mode 100644
-index 0000000000..56c6d64c67
+index 0000000000000000000000000000000000000000..56c6d64c675684b65c10f22030df286a2775f4c5
 --- /dev/null
 +++ b/apps/desktop/electron/remote-down-gate.ts
 @@ -0,0 +1,238 @@

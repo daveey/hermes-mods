@@ -617,3 +617,65 @@ def test_handoff_nudge_counts_show_resolved_versus_filed(tmp_path):
     c = sh.handoff_nudge_counts(tmp_path, now=now)
     assert c == {"days": 7, "nudges": 4, "resolved": 1, "still_handed_off": 1, "no_outcome": 1, "waiting": 1,
                  "filed": 2}
+
+
+# ── gateway-9aaf151a15: core's update-pause note is a planned pause, not a backend crash ──
+def _pause_note(prompt="fix the panel"):
+    """The exact text of tui_gateway/update_pause.py pause_note() (no killed jobs)."""
+    return ("[System note: Your previous turn was interrupted mid-run — it was paused at a step boundary for a Hermes "
+            "update. Every tool result above is complete; continue with the next step and don't redo finished steps. "
+            f"The paused request was:]\n\n{prompt}")
+
+
+def test_update_pause_note_within_land_window_files_nothing():
+    llm, calls = judge(0.95, "gateway", "turn interrupted")
+    assert sh.resume_signal(_pause_note(), gap_s=540) is None
+    assert sh.resume_signal(_pause_note(), gap_s=None) is None
+    # nor does the note fall through to the complaint judge
+    assert sh.detect_complaint("working on it", _pause_note(), llm, gap_s=540) is None and not calls
+
+
+def test_update_pause_note_that_did_not_continue_in_time_files_its_own_signal():
+    llm, calls = judge(0.0)
+    hit = sh.detect_complaint("working on it", _pause_note(), llm, gap_s=2400)
+    assert hit and hit["source"] == "signal" and hit["component"] == "gateway" and not calls
+    assert hit["symptom"] == "update pause did not continue in time" and hit["gap_s"] == 2400
+    crash = sh.resume_signal("[System note: Your previous turn was interrupted mid-run — the app or its backend "
+                             "process stopped before the turn could finish. The interrupted request was:]\n\nx", 2400)
+    assert hit["fingerprint"] != crash["fingerprint"]
+
+
+def test_pre_llm_call_update_pause_note_files_nothing(tmp_path, on):
+    llm, calls = judge(0.95)
+    now = [1000.0]
+    store = core.Store(tmp_path / "coach", clock=lambda: now[0])
+    _, hooks = plugin.build(store=store, checkout=None, selfheal_sync=True, selfheal_llm=llm)
+    hooks["post_llm_call"](session_id="s1", assistant_response="Working on the panel fix now.")
+    now[0] += 540  # the observed 9-minute update pause
+    hooks["pre_llm_call"](session_id="s1", user_message=_pause_note())
+    assert events(tmp_path) == [] and not calls
+
+
+def test_incident_replay_keeps_update_pause_note_quiet(tmp_path):
+    """Detection guard: the replay runs resume notes through resume_signal like production; a pause note is a
+    negative turn that must not fire, while a crash note still does."""
+    ir = load("selfheal_incident_replay_pause", ROOT / "eval" / "selfheal_incident_replay.py")
+    d = tmp_path / "data"
+    d.mkdir()
+    crash = ("[System note: Your previous turn was interrupted mid-run — the app or its backend process stopped "
+             "before the turn could finish. The interrupted request was:]\n\nfix it")
+    turns = [("p", 0, _pause_note(), "working", 540), ("k", 0, crash, "working", 1200), ("z", 0, "hi", "", None)]
+    (d / "turns.jsonl").write_text("".join(json.dumps({"sid": s, "idx": i, "text": t, "prev_reply": p}) + "\n"
+                                           for s, i, t, p, _ in turns))
+    (d / "turns2.jsonl").write_text("".join(json.dumps({"sid": s, "idx": i, "prev_log": [], "gap_s": g}) + "\n"
+                                            for s, i, _, _, g in turns))
+    (d / "episodes.json").write_text(json.dumps([{"eid": "Z", "sid": "z", "first": 0, "last": 0,
+                                                  "turns": [{"sid": "z", "idx": 0}]}]))
+    (d / "fivewhys.jsonl").write_text(json.dumps({"eid": "Z", "real_incident": True}) + "\n")
+    llm, calls = judge(0.95, "gateway", "turn interrupted", "agent_fault")
+    ir.run(type("A", (), {"hermes_root": "", "data": str(d), "out": str(tmp_path / "o"), "limit": 0, "workers": 1,
+                          "tag": "t"})(), llm=llm)
+    res = ir.score(d, ir.jl(tmp_path / "o" / "verdicts.jsonl"), 0.65, 0.65, False, relabel=False)
+    fired = {(f["sid"], f["idx"]): f for f in res["fps"]}
+    assert ("p", 0) not in fired
+    assert fired[("k", 0)]["sym"] == "turn interrupted (backend stopped)"

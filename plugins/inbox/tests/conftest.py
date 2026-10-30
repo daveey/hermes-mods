@@ -20,3 +20,5 @@ def isolated_stores(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)

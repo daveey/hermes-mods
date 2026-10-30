@@ -1,0 +1,113 @@
+From 0b1715a3f43632faf61e9216b1b36d4618229b35 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 08:15:49 -0700
+Subject: [PATCH] fix(kanban): a Board-synced host with no hub replica cannot
+ call an id phantom [daveey] (#316)
+
+* fix(kanban): a Board-synced host with no hub replica can't call an id phantom [daveey]
+
+replica_task_resolution treated "no hub.db" as authoritative ("nothing exists beyond the local board").
+That holds on a standalone host, but a host whose boards sync to the Board service keeps only part of
+each board in its file (own cards plus claimed copies), and a Board worker node runs no hermes-hub
+sync at all. So worker-1's completion of t_01a18d195d03d5b7 naming the real MacBook-board card
+t_01a18d13cfd3dc82 recorded suspected_hallucinated_references.
+
+No replica is now authoritative only when kanban.sync is off; with sync on, an unresolved id is
+unknown and not flagged (completion scan and the diagnostics re-check). A standalone host still
+flags a made-up id.
+
+* refactor(kanban): keep kanban_session_activity.py at its line cap (code-health ratchet) [daveey]
+---
+ hermes_cli/kanban_session_activity.py         | 12 ++---
+ tests/hermes_cli/test_kanban_false_signals.py | 44 +++++++++++++++++++
+ 2 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index babba1b40fb..5f571b02ba9 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -18,6 +18,7 @@ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_activity_identity as _identity
+ from hermes_cli import kanban_annotation_disk as _annotation_copy
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
++from hermes_cli.kanban_db_sync import sync_enabled as _board_sync_enabled
+ from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbeats
+ from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases, _moved_evidence, _retire_moved
+ from hermes_cli.kanban_session_activity_attention import AttentionCache as _AttentionCache
+@@ -457,13 +458,12 @@ def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[s
+     """Which ``t_<hex>`` ids exist as tasks in the hermes-hub replica of any gateway (same file ``_remote_links``
+     reads; replica keys are ``[profile/]board/<id>``, so qualified ``@task:p@gw/<id>`` refs resolve by id).
+ 
+-    Returns ``(found, authoritative)``. ``authoritative`` is False when a replica exists but cannot answer
+-    (unreadable, offline, or not synced within ``HUB_STALE_AFTER_S``): an id absent from it is then *unknown*,
+-    not missing, and callers must not flag it. No replica at all (no hub installed) is authoritative: nothing
+-    exists beyond the local board."""
++    Returns ``(found, authoritative)``; False when a replica exists but can't answer (unreadable, offline, or not
++    synced within ``HUB_STALE_AFTER_S``): absent ids are *unknown*, never flagged. No replica is authoritative only
++    when ``kanban.sync`` is off; a Board-synced host (worker node: no hub sync) holds a partial board. [daveey]"""
+     path = _hub_db_path()
+-    if path is None or not ids:
+-        return set(), True
++    if path is None or not ids:  # sync_enabled never raises: an unreadable config reads as sync off (standalone)
++        return set(), not ids or not _board_sync_enabled()
+     try:
+         conn = _open_ro(path)
+         try:
+diff --git a/tests/hermes_cli/test_kanban_false_signals.py b/tests/hermes_cli/test_kanban_false_signals.py
+index 45360a92449..7d0afd1daaf 100644
+--- a/tests/hermes_cli/test_kanban_false_signals.py
++++ b/tests/hermes_cli/test_kanban_false_signals.py
+@@ -72,6 +72,50 @@ def test_unknown_id_flagged_without_any_replica(board):
+     assert len(_phantom_events(conn, tid)) == 1
+ 
+ 
++HOME_BOARD_ID = "t_01a18d13cfd3dc82"  # a real card on the home board that this worker node never claimed
++
++
++@pytest.fixture
++def worker_node(tmp_path, monkeypatch):
++    """A Board worker node: its boards sync to the Board service, it runs no hermes-hub sync (no ``hub.db``), and
++    its live file holds only the cards it claimed."""
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hubstate"))
++    support.write_sync_config(home, True)
++    leases = support.lease_client()
++    next(leases)
++    conn = kbc.connect(home / "kanban.db")
++    yield conn
++    conn.close()
++    leases.close()
++
++
++def test_worker_node_summary_naming_unclaimed_home_board_card_is_not_flagged(worker_node):
++    """(a) worker-1 completed t_01a18d195d03d5b7 naming t_01a18d13cfd3dc82, a real MacBook-board card it never
++    copied; with no hub replica the scan used to call the local file the whole world and flag it."""
++    conn = worker_node
++    assert kb.get_task(conn, HOME_BOARD_ID) is None  # not in this node's partial view
++    tid = _complete_with_summary(conn, f"the MacBook board shows {HOME_BOARD_ID} as archived")
++    assert _phantom_events(conn, tid) == []
++    events = kb.list_events(conn, tid)
++    assert not [d for d in kd.compute_task_diagnostics(kb.get_task(conn, tid), events, [], now=int(time.time()))
++                if d.kind == "prose_phantom_refs"]
++
++
++def test_standalone_host_without_hub_still_flags_made_up_id(board, tmp_path):
++    """(b) No Board sync and no hub replica: the local board is everything, so a made-up id is still flagged
++    (and stays flagged in diagnostics)."""
++    conn, hub = board
++    support.write_sync_config(tmp_path / ".hermes", False)
++    assert not hub.exists()
++    tid = _complete_with_summary(conn, f"made up {UNKNOWN_ID}")
++    payloads = [r[0] for r in _phantom_events(conn, tid)]
++    assert len(payloads) == 1 and UNKNOWN_ID in payloads[0]
++    events = kb.list_events(conn, tid)
++    diags = kd.compute_task_diagnostics(kb.get_task(conn, tid), events, [], now=int(time.time()))
++    assert [d.data["phantom_refs"] for d in diags if d.kind == "prose_phantom_refs"] == [[UNKNOWN_ID]]
++
++
+ @pytest.mark.parametrize("kw", [{"fresh": False}, {"offline": True}])
+ def test_stale_or_offline_replica_does_not_flag(board, kw):
+     conn, hub = board
+-- 
+2.55.0
+

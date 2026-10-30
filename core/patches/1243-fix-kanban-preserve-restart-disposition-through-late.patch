@@ -1,0 +1,220 @@
+From adc1eb199ffc3b05e39a3ac4f908574be8a78432 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 11:10:33 +0000
+Subject: [PATCH] fix(kanban): preserve restart disposition through late child
+ exits [daveey]
+
+---
+ gateway/session_kanban_restart.py             | 22 ++++-
+ gateway/session_managed_worker.py             |  5 +-
+ tests/gateway/test_core_update_kanban_wait.py | 24 +++++
+ tests/gateway/test_kanban_runtime_stop.py     | 95 +++++++++++++++++++
+ 4 files changed, 143 insertions(+), 3 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_runtime_stop.py
+
+diff --git a/gateway/session_kanban_restart.py b/gateway/session_kanban_restart.py
+index 9700ec2062f..e4a4b8ec08a 100644
+--- a/gateway/session_kanban_restart.py
++++ b/gateway/session_kanban_restart.py
+@@ -1,8 +1,26 @@
+-"""Owner-side disposition of a Kanban turn that cooperatively accepted a runtime Stop."""
++"""Owner-side disposition of a Kanban turn interrupted by a runtime Stop."""
++import asyncio
++from functools import partial
+ import json
+ from pathlib import Path
+ 
+ 
++async def close_and_book_restart_loss(authority, policy, worker):
++    """Return final cleanup; a restart-lost child is closed and booked before unknown publishes.
++
++    Closing first prevents its late130 from overwriting76. Other losses retain ordinary cleanup.
++    The returned no-op means the caller's finally never closes that same child twice.
++    """
++    from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
++    if (not policy.kanban_json or worker.stop_cause not in
++            (_INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN)):
++        return worker.close
++    await asyncio.to_thread(worker.close)
++    from gateway.session_runtime_workers import tracked_write
++    await tracked_write(authority, partial(record_restart_interruption, policy))
++    return lambda: None
++
++
+ def record_restart_interruption(policy):
+     """Supersede the child's interrupted exit with an uncounted owner-restart exit.
+ 
+@@ -23,6 +41,6 @@ def record_restart_interruption(policy):
+                 or tuple(run) != ('running', context['claim_lock'], context['task_id'])):
+             return
+         kb._append_event(conn, task.id, 'worker_result', {
+-            'claim_lock': context['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
++            'pid': task.worker_pid, 'claim_lock': context['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
+             'last_output': 'Kanban attempt interrupted by gateway restart/shutdown; requeued uncounted.',
+             'owner_restart': True}, run_id=context['run_id'])
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index 85442376842..aa6aefe032a 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -667,6 +667,7 @@ async def execute_managed(authority, ref, row, policy):
+     authority.adopt_agent(ref.session_id, row['generation'], worker)
+     accepted = usage = None
+     scope = None
++    close_worker = worker.close
+     try:
+         # The interpreter behind the handle introduces itself first; the owner verifies that
+         # identity (alive, same birth, descends from the handle) before reserving for it.
+@@ -736,6 +737,8 @@ async def execute_managed(authority, ref, row, policy):
+                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
+             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
+             raise
++        from gateway.session_kanban_restart import close_and_book_restart_loss
++        close_worker = await close_and_book_restart_loss(authority, policy, worker)
+         await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
+         live = authority.sessions[ref.session_id]
+         with live.event_stream.lock:
+@@ -752,4 +755,4 @@ async def execute_managed(authority, ref, row, policy):
+         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
+     finally:
+         workers.pop(ref.session_id, None)
+-        await asyncio.to_thread(worker.close)
++        await asyncio.to_thread(close_worker)
+diff --git a/tests/gateway/test_core_update_kanban_wait.py b/tests/gateway/test_core_update_kanban_wait.py
+index bafa6604df2..c35375aaebc 100644
+--- a/tests/gateway/test_core_update_kanban_wait.py
++++ b/tests/gateway/test_core_update_kanban_wait.py
+@@ -25,6 +25,30 @@ def test_count_confirmed_workers_across_profiles(tmp_path):
+     assert kanban_managed_count(runner) == 2
+ 
+ 
++def test_default_gateway_drain_bound_is_75_seconds():
++    from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
++    runner, _ = make_restart_runner()
++    # Same core path on hub and Mac; launchd may shorten, never extend, this watchdog.
++    assert wait.CORE_UPDATE_KANBAN_WAIT_S + resolve_shutdown_watchdog_delay(runner._restart_drain_timeout) == 75.0
++
++
++def test_real_managed_counts_reach_the_short_wait(tmp_path):
++    from gateway.session_managed_worker import ManagedWorker
++    runner, _ = make_restart_runner()
++    card = ManagedWorker(SimpleNamespace())
++    card.kanban_card = True
++    runner.session_authority = SimpleNamespace(_managed_workers={'s': card}, sessions={})
++    assert runner._active_work_count() == runner._awaitable_work_count() == 1
++    since, expired = runner._kanban_restart_wait_state(tmp_path / 'intent', 0.0, None)
++    assert (since, expired) == (0.0, False)
++    assert runner._kanban_restart_wait_state(tmp_path / 'intent', 15.0, since) == (0.0, True)
++    # A real managed human worker is not a card, even though it has the same process class.
++    human = ManagedWorker(SimpleNamespace())
++    runner.session_authority._managed_workers['human'] = human
++    assert runner._awaitable_work_count() == 2
++    assert runner._kanban_restart_wait_state(tmp_path / 'intent', 16.0, since) == (None, False)
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize('other', [None, 'chat', 'cron', 'api', 'mutation', 'unclassified'])
+ async def test_core_update_caps_only_kanban_wait(monkeypatch, tmp_path, other):
+diff --git a/tests/gateway/test_kanban_runtime_stop.py b/tests/gateway/test_kanban_runtime_stop.py
+new file mode 100644
+index 00000000000..0ac909fc925
+--- /dev/null
++++ b/tests/gateway/test_kanban_runtime_stop.py
+@@ -0,0 +1,95 @@
++"""Runtime Stop -> managed settlement -> authoritative exit76, including a late child130."""
++import asyncio
++import json
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import session_managed_worker as managed
++from gateway.run_runtime import stop_authority_turns
++from gateway.session_kanban import worker_result
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli.kanban_owner_recovery import managed_run_exit_code
++from hermes_state_runtime import RuntimeStoreError
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('unacknowledged', [True, False])
++async def test_runtime_stop_preserves_uncounted_exit_after_child_close(tmp_path, monkeypatch, unacknowledged):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='managed restart', assignee='default')
++        kb.claim_task(conn, tid, claimer='host:1')
++        task = kb.get_task(conn, tid)
++        assert task is not None
++        params = {'task_id': tid, 'run_id': task.current_run_id, 'claim_lock': 'host:1'}
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET worker_pid=79101 WHERE id=?', (tid,))
++    context = dict(params, db=str(tmp_path / 'kanban.db'))
++    policy = SimpleNamespace(source='kanban', kanban_json=json.dumps(context))
++    row = {'admission_id': 'a', 'generation': 1, 'principal_id': 'p'}
++    ref = SimpleNamespace(session_id='s')
++    trace = []
++    stream = SimpleNamespace(lock=threading.RLock(), publish=lambda *a: None)
++    authority = SimpleNamespace(pending_results={}, _managed_workers={}, _mutation_tasks=set(),
++        pending_stops={}, executing={'s': 1}, waiters={}, adopt_agent=lambda *a: None,
++        _publish_pending=lambda *a: None,
++        sessions={'s': SimpleNamespace(event_stream=stream, controls=SimpleNamespace(snapshot=lambda *a: None))})
++    class Worker(managed.ManagedWorker):
++        def __init__(self):
++            super().__init__(SimpleNamespace(wait=lambda *a: 0))
++            self.frames = 0
++            self.writer = SimpleNamespace(start=lambda: None)
++        async def next_frame(self, *args, **kwargs):
++            self.frames += 1
++            if self.frames == 1:
++                return {}
++            if self.frames == 2:
++                stop_authority_turns(authority, reason='Gateway restarting')
++                assert self.stop_cause == 'Gateway restarting' and self.stop.is_set()
++                if unacknowledged:
++                    raise RuntimeStoreError('managed_worker_stopped')
++                return {'type': 'result', 'result': {'interrupted': True, 'final_response': ''}}
++            return {'type': 'finished'}
++        def send(self, frame):
++            pass
++        def close(self):
++            # A child can book130 even after receiving Stop but before its pipe closes.
++            with kbc.connect() as conn, kb.write_txn(conn):
++                kb._append_event(conn, tid, 'worker_result',
++                    {'pid': 79102, 'claim_lock': 'host:1', 'exit_code': 130}, run_id=params['run_id'])
++                kb._append_event(conn, tid, 'worker_bound',
++                    {'pid': 79102, 'claim_lock': 'host:1'}, run_id=params['run_id'])
++            trace.append('closed')
++            self.closed.set()
++    worker = Worker()
++    async def spawn(*args):
++        authority._managed_workers['s'] = worker
++        return worker, worker.process
++    async def text(*args):
++        return 'prompt', None
++    monkeypatch.setattr('gateway.session_context_refs.managed_turn_text', text)
++    monkeypatch.setattr('gateway.session_policy.workspace_ready', lambda _: True)
++    monkeypatch.setattr(managed, '_spawn_registered_worker', spawn)
++    monkeypatch.setattr(managed, 'reserve_admission_worker', lambda *a, **k:
++        {'pid': 79102, 'birth': 1, 'session_id': 's', 'execution_id': 'e', 'secret': ''})
++    monkeypatch.setattr(managed, '_bootstrap', lambda *a: {'api_key': ''})
++    monkeypatch.setattr(managed, 'accept_result', lambda result: (result, {}))
++    monkeypatch.setattr(managed, '_settled_session_usage', lambda *a: {})
++    monkeypatch.setattr(managed, '_record_lost_attempt', lambda *a: None)
++    async def lose(*args):
++        assert trace == ['closed']
++        assert worker_result(context['db'], params)['exit_code'] == 76
++        trace.append('unknown published')
++    monkeypatch.setattr(managed, '_settle_lost', lose)
++    if unacknowledged:
++        with pytest.raises(managed.ManagedExecutionUnknown):
++            await managed.admit_managed(authority, ref, row, policy)
++    else:
++        assert await managed.admit_managed(authority, ref, row, policy) == ''
++        assert authority.pending_results['a']['runtime_stop_cause'] == 'Gateway restarting'
++    with kbc.connect() as conn:
++        # Even a client that missed the drain and exits1 cannot override the owner's76.
++        assert managed_run_exit_code(conn, tid, 79101, 'host:1') == 76
++    assert trace.count('closed') == 1
+-- 
+2.55.0
+

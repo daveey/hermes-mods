@@ -232,8 +232,15 @@ def register(ctx):
     except Exception:
         # Preserve observation and a fail-closed refusal path for queued intents.
         # Never emit raw loader exceptions: custom factories may carry secrets.
-        integration.disable()
-        log.warning(integration.error)
+        if integration.core_unimportable:
+            # A bare interpreter (hermes-sync's plugin-cache warm, a stale venv) that cannot
+            # import core's agent runtime never serves a turn: nothing to refuse, nothing to
+            # warn about. Name the type and module only (never the message).
+            kind, where, _ = integration.failure
+            log.info("account-usage: selection inactive here, install raised %s at %s", kind, where)
+        else:
+            integration.disable()
+            log.warning(integration.error)
     mark("install")
     where = f"pid={os.getpid()} role={_process_role()}"
     if getattr(ctx, "_load_abandoned", False):

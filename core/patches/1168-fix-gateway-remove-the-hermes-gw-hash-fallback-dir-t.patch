@@ -1,0 +1,173 @@
+From 7e2dc3898a2726577214e606d4d0e6536c6f68f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 07:02:42 +0000
+Subject: [PATCH] fix(gateway): remove the hermes-gw-<hash> fallback dir the
+ control socket created on stop [daveey]
+
+cleanup_files only rmdir'ed hermes-gw-<hash> on the squat-proof mkdtemp path,
+so every clean stop of a gateway with an over-long home left an empty
+hermes-gw-<hash> dir in XDG_RUNTIME_DIR or /tmp (930+ on hermes-hub, ~5 per
+coach transport test run). Record the dir's (st_dev, st_ino) when _bind_posix
+creates it and rmdir it on stop only while it is still that inode and empty;
+a pre-existing dir is never touched.
+---
+ gateway/control_socket.py                    | 12 +++
+ tests/gateway/test_control_socket.py         | 84 +++++++++++++++++++-
+ tests/gateway/test_runtime_token_identity.py |  4 +-
+ 3 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index cc2779f340e..3123a00219f 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -219,6 +219,9 @@ class GatewayControlServer:
+         self._bind_path: Optional[Path] = None
+         self._pointer_file: Optional[Path] = None
+         self._fallback_root: Optional[Path] = None  # mkdtemp root created for a squatted fallback
++        # The shared-temp ``hermes-gw-<hash>`` dir this server mkdir'ed, with its (st_dev, st_ino):
++        # removed on stop only while it is still that inode and empty, never one it found existing.
++        self._created_dir: Optional[tuple[Path, tuple[int, int]]] = None
+         self._file_identities = {}
+         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
+             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
+@@ -263,6 +266,8 @@ class GatewayControlServer:
+         if pointer_file is not None:
+             with contextlib.suppress(FileExistsError):
+                 bind_path.parent.mkdir(mode=0o700)
++                info = bind_path.parent.lstat()
++                self._created_dir = (bind_path.parent, (info.st_dev, info.st_ino))
+             if not _private_directory(bind_path.parent):
+                 # Another local user pre-created the predictable shared-temp name; bootstrap treats
+                 # a missing listener as fatal, so move to an unpredictable private root instead.
+@@ -314,6 +319,13 @@ class GatewayControlServer:
+                 if self._file_identities.get(path) == (info.st_dev, info.st_ino):
+                     path.unlink()
+         self._file_identities.clear()
++        if self._created_dir is not None:
++            directory, identity = self._created_dir
++            self._created_dir = None
++            with contextlib.suppress(OSError):  # non-empty (ENOTEMPTY) or already gone: leave it
++                info = directory.lstat()
++                if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == identity:
++                    directory.rmdir()
+         if self._fallback_root is not None:
+             with contextlib.suppress(OSError):
+                 (self._fallback_root / f"hermes-gw-{_home_hash(self._home)}").rmdir()
+diff --git a/tests/gateway/test_control_socket.py b/tests/gateway/test_control_socket.py
+index 7f802868cd7..376fe32a928 100644
+--- a/tests/gateway/test_control_socket.py
++++ b/tests/gateway/test_control_socket.py
+@@ -228,7 +228,89 @@ def test_stale_socket_file_is_replaced_on_bind(home: Path):
+         finally:
+             await server.stop()
+ 
+-    assert _run(scenario()) == {"pid": 7}
++    try:
++        assert _run(scenario()) == {"pid": 7}
++    finally:
++        if bind.parent != home:  # the test made this fallback dir, so the server must leave it
++            bind.parent.rmdir()
++
++
++def _long_home(tmp_path: Path) -> Path:
++    deep = tmp_path / ("x" * 120) / ".hermes"
++    deep.mkdir(parents=True)
++    return deep
++
++
++def _start_stop(home: Path) -> Path:
++    async def scenario():
++        server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 1}})
++        assert await server.start()
++        bind = server._bind_path
++        assert bind is not None and bind.exists()
++        await server.stop()
++        return bind
++
++    return _run(scenario())
++
++
++def test_stop_removes_the_fallback_dir_it_created(tmp_path: Path):
++    home = _long_home(tmp_path)
++    bind, pointer = resolve_server_socket_path(home)
++    assert pointer is not None and not bind.parent.exists()
++    try:
++        assert _start_stop(home) == bind
++        assert not bind.parent.exists()  # no hermes-gw-<hash> dir left behind
++        assert not pointer.exists()
++    finally:
++        if bind.parent.exists():
++            bind.parent.rmdir()
++
++
++def test_stop_keeps_a_fallback_dir_it_did_not_create(tmp_path: Path):
++    home = _long_home(tmp_path)
++    bind, _ = resolve_server_socket_path(home)
++    bind.parent.mkdir(mode=0o700)  # pre-existing (e.g. another process made it)
++    try:
++        assert _start_stop(home) == bind
++        assert bind.parent.is_dir() and not bind.exists()
++    finally:
++        bind.parent.rmdir()
++
++
++def test_stop_keeps_a_fallback_dir_replaced_or_refilled_after_start(tmp_path: Path):
++    home = _long_home(tmp_path)
++    bind, _ = resolve_server_socket_path(home)
++
++    async def scenario(mutate):
++        server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 1}})
++        assert await server.start()
++        assert server._bind_path is not None
++        mutate(server._bind_path.parent)
++        await server.stop()
++
++    # A file someone else dropped into the dir keeps it (only an empty dir is removed).
++    try:
++        _run(scenario(lambda d: (d / "other").touch()))
++        assert (bind.parent / "other").exists()
++    finally:
++        (bind.parent / "other").unlink()
++        bind.parent.rmdir()
++
++    # A dir swapped for a different inode at the same name is not ours to remove.
++    def swap(d: Path):
++        d.rename(d.with_name(d.name + "-moved"))
++        d.mkdir(mode=0o700)
++
++    moved = bind.parent.with_name(bind.parent.name + "-moved")
++    try:
++        _run(scenario(swap))
++        assert bind.parent.is_dir()
++    finally:
++        for d in (bind.parent, moved):
++            for child in d.iterdir() if d.exists() else ():
++                child.unlink()
++            if d.exists():
++                d.rmdir()
+ 
+ 
+ @pytest.fixture()
+diff --git a/tests/gateway/test_runtime_token_identity.py b/tests/gateway/test_runtime_token_identity.py
+index f07601d8bd6..b855fdfd9d6 100644
+--- a/tests/gateway/test_runtime_token_identity.py
++++ b/tests/gateway/test_runtime_token_identity.py
+@@ -162,6 +162,8 @@ def test_ordinary_daemon_keeps_control_auth_and_loop_witness(tmp_path, layout):
+                 process.send_signal(signal.SIGINT)
+                 assert process.wait(timeout=20) == 0
+                 assert not control_path.exists()
++                if control_path.parent != home:  # the fallback dir the gateway made goes with it
++                    assert not control_path.parent.exists()
+                 assert not (home / 'gateway.sock.path').exists()
+                 if port:
+                     with socket.socket() as peer:
+@@ -177,5 +179,5 @@ def test_ordinary_daemon_keeps_control_auth_and_loop_witness(tmp_path, layout):
+                     except subprocess.TimeoutExpired:
+                         process.kill()
+                         process.wait(timeout=5)
+-                if control_path is not None and control_path.parent != home:
++                if control_path is not None and control_path.parent != home and control_path.parent.exists():
+                     control_path.parent.rmdir()
+-- 
+2.55.0
+

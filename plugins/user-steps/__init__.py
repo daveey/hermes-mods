@@ -35,6 +35,8 @@ log = logging.getLogger("user-steps")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 _USER_MSG: dict[str, str] = {}
 _BACKFILLED = False
+# Hooks that sit in front of every reply wait at most this long for the asks DB, never the store's 30 s default.
+HOOK_DB_TIMEOUT = 5
 
 
 def _eligible(session_id: str, platform: str = "", parent_session_id: str = "") -> bool:
@@ -109,14 +111,31 @@ def _framed(session_id: str) -> bool:
 
 # ---- hooks ---------------------------------------------------------------------------------------------
 
+# Runtime-written user rows (Kanban notices, auto-continue): a turn they start was not started by the user.
+_RUNTIME_KINDS = frozenset({"kanban_notice", "auto_continue"})
+AUTOMATIC_PREFIX = "[Automatic notice, not typed by the user] "
+
+
+def _turn_message(user_message: Any, conversation_history: Any) -> str:
+    """The turn's message as the extractor sees it: labeled automatic when the newest user row is a runtime row
+    (``display_kind``), so a notice can never read as the user answering an open step (core._runtime_message)."""
+    text = user_message if isinstance(user_message, str) else ""
+    for msg in reversed(conversation_history if isinstance(conversation_history, list) else []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            if (msg.get("display_kind") or "") in _RUNTIME_KINDS and not text.startswith(AUTOMATIC_PREFIX):
+                return AUTOMATIC_PREFIX + text
+            break
+    return text
+
+
 def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "", parent_session_id: str = "",
-                 **_: Any) -> dict | None:
+                 conversation_history: Any = None, **_: Any) -> dict | None:
     if not _eligible(session_id, platform, parent_session_id):
         return None
     try:
-        _USER_MSG[session_id] = user_message if isinstance(user_message, str) else ""
+        _USER_MSG[session_id] = _turn_message(user_message, conversation_history)
         own = core.server_owner(session_id)
-        st = core.ActionStore()
+        st = core.ActionStore(timeout=HOOK_DB_TIMEOUT)
         global _BACKFILLED
         if not _BACKFILLED:
             _BACKFILLED = True
@@ -184,11 +203,18 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
         except core.ActionError:
             action_owner = None  # no authenticated owner: ledger-only, no canonical request is minted
         if action_owner:
-            chat.reconcile(core, core.ActionStore(), action_owner, aux_llm)
+            # Own try block: a lookup failure (e.g. "database is locked") must not skip recording this
+            # reply's asks below (self-heal plugin-dca5d02c20).
+            try:
+                chat.reconcile(core, core.ActionStore(timeout=HOOK_DB_TIMEOUT), action_owner, aux_llm)
+            except Exception as exc:
+                log.warning("user-steps reconcile failed; still recording this reply's asks: %r", exc)
+                _trace(hook="transform", session=session_id, platform=platform, reconcile_error=repr(exc)[:300])
         out = core.process_reply(
             response_text, session_id, user_msg=_USER_MSG.pop(session_id, ""), llm=aux_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
-            action_store=core.ActionStore() if action_owner else None, action_owner=action_owner,
+            action_store=core.ActionStore(timeout=HOOK_DB_TIMEOUT) if action_owner else None,
+            action_owner=action_owner,
             session_ref=f"@session:{_profile()}/{session_id}")
         if out.get("error"):
             log.warning("user-steps extractor fell back to regex: %s", out["error"])
@@ -211,7 +237,7 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     if not _eligible(session_id, platform) or not core._worth_asking(final_response):
         return None
     owner = core.server_owner(session_id)
-    store = core.ActionStore()
+    store = core.ActionStore(timeout=HOOK_DB_TIMEOUT)
     # The open asks go to the extractor and the matcher: a reply restating a published approval in other
     # words is covered by it. Without them every paraphrase held the reply and pushed the agent to publish
     # the same approval again (hub chat 67cb2d).
@@ -277,7 +303,7 @@ def _shape_check(payload: dict) -> None:
         objects(payload['aliases'], 'aliases', _ALIAS_SHAPE)
     if 'choices' in payload:
         objects(payload['choices'], 'choices', 'objects {id, label, effect} (effect approve, revise, decline or '
-                'answer)')
+                'answer; optional explain, recommended)')
 
 
 def publish_action_request(args: dict, session_id: str = '', **_) -> str:
@@ -424,7 +450,7 @@ PRODUCER_SCHEMA = {
     'name': 'action_request',
     'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one revises that one. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
     'parameters': {'type': 'object', 'additionalProperties': False,
-                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, limits [{key, value}] (objects, optional permissionRequired), exclusions [plain strings], choices [{id, label, effect}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline), aliases: [] unless reusing a request\'s own refs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?}, never a bare card id string), state (open or needs_context).'},
+                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, limits [{key, value}] (objects, optional permissionRequired: true/false), exclusions [plain strings], choices [{id, label, effect, explain?, recommended?}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline; explain = one plain line on what happens if the user picks it, e.g. cost and what resumes; recommended: true on at most one choice, your pick), aliases: [] unless reusing a request\'s own refs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?} with type message, user_step or kanban (kanban requires board), never a bare card id string), state (open or needs_context).'},
                                   'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
                                   'decisionCard': {'type': 'object', 'additionalProperties': False,
                                                    'properties': {'board': {'type': 'string'}}, 'required': ['board'],

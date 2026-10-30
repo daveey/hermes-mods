@@ -106,8 +106,13 @@ The update proceeds in this order (`hermes_cli/update_cmd.py`):
   HEAD contains `upstream/main` and descends from `origin/main`. Without push access you get a notice; the local
   checkout is still updated.
 - **Several machines:** the first machine to update creates the merge and pushes it. The others fast-forward to
-  it in step 1. If two machines merge at the same moment, the second push loses its lease and fails harmlessly.
-  Fix that machine with `git pull origin main`.
+  it in step 1. If origin moves between the merge and the push (another machine's merge or any new fork commit),
+  the push loses its lease and fails. That machine's checkout stays on its unpushed merge, diverged from
+  `origin/main`, and core does not repair it. An unattended updater has to: the author's `hermes-sync` core pass
+  spots a checkout whose only commits ahead are these `Merge upstream/main (…) into fork` merges (second parent
+  on `upstream/main`), merges it onto the fresh `origin/main` off-tree, pushes that (no force), and fast-forwards
+  on the next update. Any other local commit still stops it with "merge by hand". Without such a pass, fix the
+  machine with `git pull origin main`.
 - **Flag off:** stock behaviour. The skip message now also says "(or set updates.fork_merge_upstream: true …)".
 
 ### 0011: `desktop.relaunch_after_rebuild`

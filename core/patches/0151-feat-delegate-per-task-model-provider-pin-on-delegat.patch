@@ -10,19 +10,12 @@ The pin resolves through the same credential path as delegation.* (a new
 provider drops the old endpoint keys). Off by default (upstream: no
 model-facing field carries a route; pins are stripped and not advertised).
 ---
- hermes_cli/config_defaults.py               |   4 +
- tests/tools/test_delegate_per_task_model.py | 141 ++++++++++++++++++++
- tools/delegate_tool.py                      | 108 ++++++++++++++-
- tools/delegate_tool_config.py               |   5 +
- 4 files changed, 252 insertions(+), 6 deletions(-)
- create mode 100644 tests/tools/test_delegate_per_task_model.py
-
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index 6f046a32c7..057f926807 100644
+index 54806301a0be4aff772de069f592f71415523599..a81124e9ddd641ef8cf1eded478f040e18eb2b84 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
-@@ -1336,6 +1336,10 @@ DEFAULT_CONFIG = {
-     "delegation": {
+@@ -1323,6 +1323,10 @@ DEFAULT_CONFIG = {
+         "backends": {},
          "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
          "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
 +        # [daveey] Let the model pin `model` (and `provider`) per tasks[] entry, overriding the two keys
@@ -34,7 +27,7 @@ index 6f046a32c7..057f926807 100644
          # A child pinned by provider, endpoint, or model gets no fallback unless this
 diff --git a/tests/tools/test_delegate_per_task_model.py b/tests/tools/test_delegate_per_task_model.py
 new file mode 100644
-index 0000000000..3b3c9fd761
+index 0000000000000000000000000000000000000000..3b3c9fd7613668cf0049863f9feb58bee6d8a051
 --- /dev/null
 +++ b/tests/tools/test_delegate_per_task_model.py
 @@ -0,0 +1,141 @@
@@ -179,203 +172,6 @@ index 0000000000..3b3c9fd761
 +
 +if __name__ == "__main__":
 +    unittest.main()
-diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
-index f393022cab..7bd10037a2 100644
---- a/tools/delegate_tool.py
-+++ b/tools/delegate_tool.py
-@@ -412,18 +412,75 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
-     }
- 
- 
-+# Route keys that drop out of a per-task route when the task names a DIFFERENT provider: they belong to the
-+# delegation.provider endpoint, and carrying them over would send the new provider's model to the old endpoint.
-+_PROVIDER_SCOPED_ROUTE_KEYS = ("base_url", "api_key", "api_mode", "command", "args")
-+
-+
-+def _task_route_cfg(task: dict[str, Any], routing_cfg: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-+    """[daveey] Per-task ``model`` / ``provider`` pin → ``(route_cfg, None)``; ``(None, None)`` when the task pins
-+    nothing (it uses the call-wide route); ``(None, error)`` for a malformed pin. The task's values win over the
-+    ``delegation`` block: ``model`` alone keeps the configured (or inherited) provider, ``provider`` alone keeps
-+    the configured model only when the provider is unchanged."""
-+    pins: dict[str, str] = {}
-+    for key in ("model", "provider"):
-+        raw = task.get(key)
-+        if raw is None:
-+            continue
-+        if not isinstance(raw, str):
-+            return None, f"Task '{key}' must be a string (e.g. \"claude-sonnet-5-5\"), got {type(raw).__name__}."
-+        if raw.strip():
-+            pins[key] = raw.strip()
-+    if not pins:
-+        return None, None
-+    cfg = dict(routing_cfg or {})
-+    provider = pins.get("provider")
-+    if provider and provider.lower() != str(cfg.get("provider") or "").strip().lower():
-+        for key in _PROVIDER_SCOPED_ROUTE_KEYS:
-+            cfg.pop(key, None)
-+        cfg["provider"] = provider
-+        cfg["model"] = ""  # the old provider's model name means nothing on the new provider
-+    if "model" in pins:
-+        cfg["model"] = pins["model"]
-+    return cfg, None
-+
-+
-+def _resolve_task_routes(
-+    task_list: list[dict[str, Any]], creds: dict[str, Any], routing_cfg: dict[str, Any], parent_agent,
-+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], Optional[str]]:
-+    """``[(creds, routing_cfg), ...]`` per task: the call-wide route, or the task's own ``model``/``provider`` pin
-+    resolved through the same credential path as ``delegation.*``. ``([], error)`` on a bad pin."""
-+    routes: list[tuple[dict[str, Any], dict[str, Any]]] = []
-+    for i, t in enumerate(task_list):
-+        task_cfg, err = _task_route_cfg(t, routing_cfg)
-+        if err:
-+            return [], f"Task {i}: {err}"
-+        if task_cfg is None:
-+            routes.append((creds, routing_cfg))
-+            continue
-+        try:
-+            task_creds = _resolve_delegation_credentials(task_cfg, parent_agent)
-+        except ValueError as exc:
-+            return [], f"Task {i}: {exc}"
-+        routes.append((task_creds, task_cfg))
-+    return routes, None
-+
-+
- def _build_children(
-     task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], creds: dict[str, Any], *,
-     top_role: str, max_iterations: int, parent_agent, routing_cfg: dict[str, Any],
-     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
-+    task_routes: Optional[list[tuple[dict[str, Any], dict[str, Any]]]] = None,
- ) -> tuple[list[tuple], Optional[str]]:
-     """Build every child on the main thread (construction is not thread-safe);
--    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
-+    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure. ``task_routes`` ([daveey])
-+    carries each task's own ``(creds, routing_cfg)`` when it pins ``model``/``provider``."""
-     from tools.delegation_live_log import wrap_progress_callback
-     from tools.delegation_output_schema import append_output_contract
--    overrides = _credential_overrides(creds, routing_cfg)
-     children = []
-     for i, t in enumerate(task_list):
-+        _creds, _routing = task_routes[i] if task_routes and i < len(task_routes) else (creds, routing_cfg)
-+        overrides = _credential_overrides(_creds, _routing)
-         _task_schema = task_schemas[i] if i < len(task_schemas) else None
-         _child_context = t.get("context")
-         if _task_schema is not None:
-@@ -432,7 +489,7 @@ def _build_children(
-             child = _build_child_preserving_parent_tools(
-                 task_index=i, goal=t["goal"], context=_child_context,
-                 toolsets=None,  # always inherit the parent's toolsets
--                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-+                model=_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
-             )
-         except ValueError as exc:
-@@ -546,6 +603,9 @@ def delegate_task(
-         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
-     if not err:
-         task_images, err = _coerce_task_images(task_list, images)
-+    if err:
-+        return tool_error(err)
-+    task_routes, err = _resolve_task_routes(task_list, creds, routing_cfg, parent_agent)
-     if err:
-         return tool_error(err)
-     err = _oneshot_spawn_budget(parent_agent, len(task_list))
-@@ -578,6 +638,7 @@ def delegate_task(
-     children, err = _build_children(
-         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
-+        task_routes=task_routes,
-     )
-     if err:
-         return tool_error(err)
-@@ -616,7 +677,9 @@ def _build_top_level_description(*, independent_completions=None) -> str:
-         "each ungrouped task / `group` returns on its own"
-         if independent_completions else "one message per call"
-     )
--    return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
-+    from tools.delegate_tool_config import _get_allow_task_model
-+    tail = _DESCRIPTION_TAIL_TASK_MODEL if _get_allow_task_model() else _DESCRIPTION_TAIL
-+    return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + tail
- 
- _DESCRIPTION_HEAD = (
-     "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
-@@ -649,6 +712,24 @@ _DESCRIPTION_HEAD = (
- _DESCRIPTION_TAIL = (
-     "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
- )
-+# [daveey] Swapped in for the tail when delegation.allow_task_model is on.
-+_DESCRIPTION_TAIL_TASK_MODEL = (
-+    "- Children run on delegation.model (else the parent's model) unless a `tasks[]` entry pins `model` (and "
-+    "optional `provider`): pin the stronger model for adversarial/architecture reviews and hard retries."
-+)
-+# [daveey] Per-task route fields, advertised only when delegation.allow_task_model is on.
-+_TASK_MODEL_PROPERTIES = {
-+    "model": {
-+        "type": "string",
-+        "description": "Optional model for THIS child (e.g. \"claude-opus-5-5\" for an adversarial review), "
-+                       "overriding delegation.model. Omit to use the configured default.",
-+    },
-+    "provider": {
-+        "type": "string",
-+        "description": "Optional provider for THIS child's `model` (e.g. \"anthropic\", \"openrouter\"). Omit to "
-+                       "keep the configured/inherited provider.",
-+    },
-+}
- 
- def _build_tasks_param_description() -> str:
-     """Compose the 'tasks' parameter description with current concurrency limit."""
-@@ -679,6 +760,10 @@ def _build_dynamic_schema_overrides() -> dict:
-         tasks["items"] = {**tasks["items"], "properties": {
-             k: v for k, v in tasks["items"]["properties"].items() if k != "group"
-         }}
-+    from tools.delegate_tool_config import _get_allow_task_model
-+    if _get_allow_task_model():
-+        tasks = overrides_params["properties"]["tasks"]
-+        tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **_TASK_MODEL_PROPERTIES}}
- 
-     return {
-         "description": _build_top_level_description(independent_completions=independent_completions),
-@@ -784,11 +869,22 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
- 
- _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
- 
-+def _model_hidden_task_fields() -> set[str]:
-+    """Task fields the model may not set: trusted-config-only fields, plus the per-task route ([daveey]) unless
-+    delegation.allow_task_model is on."""
-+    from tools.delegate_tool_config import _get_allow_task_model
-+    try:
-+        allowed = _get_allow_task_model()
-+    except Exception:
-+        allowed = False
-+    return _MODEL_HIDDEN_TASK_FIELDS if allowed else _MODEL_HIDDEN_TASK_FIELDS | set(_TASK_MODEL_PROPERTIES)
-+
- def _strip_model_hidden_task_fields(tasks: Any) -> Any:
-     """Drop trusted-config-only task fields from model-supplied tasks (same list object back when nothing changed)."""
--    if not isinstance(tasks, list) or not any(isinstance(t, dict) and _MODEL_HIDDEN_TASK_FIELDS & t.keys() for t in tasks):
-+    hidden = _model_hidden_task_fields()
-+    if not isinstance(tasks, list) or not any(isinstance(t, dict) and hidden & t.keys() for t in tasks):
-         return tasks
--    return [{k: v for k, v in t.items() if k not in _MODEL_HIDDEN_TASK_FIELDS} if isinstance(t, dict) else t for t in tasks]
-+    return [{k: v for k, v in t.items() if k not in hidden} if isinstance(t, dict) else t for t in tasks]
- 
- 
- registry.register(
-diff --git a/tools/delegate_tool_config.py b/tools/delegate_tool_config.py
-index 1f096bd220..a859761de5 100644
---- a/tools/delegate_tool_config.py
-+++ b/tools/delegate_tool_config.py
-@@ -112,6 +112,11 @@ def _get_independent_completions() -> bool:
-     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
-     return is_truthy_value(_cfg().get("independent_completions", False))
- 
-+def _get_allow_task_model() -> bool:
-+    """[daveey] delegation.allow_task_model (bool, default False): advertise and honor a per-task ``model`` /
-+    ``provider`` pin on delegate_task. Off = upstream: the fields are hidden from the schema and stripped."""
-+    return is_truthy_value(_cfg().get("allow_task_model", False))
-+
- def _get_worktree_isolation() -> bool:
-     """delegation.worktree_isolation (bool, default False): each child gets its own
-     git worktree off the parent's HEAD so parallel children never contend for one
 -- 
-2.54.0 (Apple Git-157)
+2.55.0
 

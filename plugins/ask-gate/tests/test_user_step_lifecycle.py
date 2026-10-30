@@ -79,8 +79,11 @@ def test_exact_suppression_survives_unrelated_failures(env, gate, monkeypatch, f
     def fail(*a, **k):
         raise ValueError('unrelated corrupt storage')
     monkeypatch.setattr(gate, '_user_msgs' if fault == 'history' else 'record_verdict', fail)
-    result = gate.pre_final_gate(session_id='current', final_response=source.directive(['us_abcdef'], 'current'))
-    assert result and 'replace' in result
+    draft = source.directive(['us_abcdef'], 'current')
+    held = gate.pre_final_gate(session_id='current', final_response=draft)
+    assert held and held.get('hold') and 'replace' not in held
+    result = gate.pre_final_gate(session_id='current', final_response=draft, attempt=2)
+    assert result and 'replace' in result and '::user-step' not in result['replace']
 
 
 def test_resolved_real_source_suppresses_and_never_reopens(env):

@@ -55,6 +55,7 @@ class CheckCompat(unittest.TestCase):
     def test_cli_exit_codes(self):
         script = self.plugin / 'check_compat.py'
         shutil.copy(PLUGIN / 'check_compat.py', script)
+        shutil.copy(PLUGIN / 'pins.py', script.with_name('pins.py'))  # the shared drift definition
         run = lambda core: subprocess.run([sys.executable, str(script), '--core', str(core)],
                                           capture_output=True, text=True).returncode
         self.assertEqual(run(self.core), 0)

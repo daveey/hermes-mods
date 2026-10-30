@@ -1,0 +1,129 @@
+From 7d2d5a51e093eb0f623192cdf83a84ace6a26a6d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:28:15 +0000
+Subject: [PATCH] fix(tests): check SQLite URI filenames in home I/O guard
+ [daveey]
+
+---
+ tests/hermes_cli/test_real_home_tripwire.py | 56 +++++++++++++++++++++
+ tests/home_io_guard.py                      | 30 ++++++++++-
+ 2 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_real_home_tripwire.py b/tests/hermes_cli/test_real_home_tripwire.py
+index 076d3be0d6c..e7250745d40 100644
+--- a/tests/hermes_cli/test_real_home_tripwire.py
++++ b/tests/hermes_cli/test_real_home_tripwire.py
+@@ -131,6 +131,62 @@ def test_explicit_opt_out_allows_only_the_disposable_canary(protected_home):
+     assert target.read_text(encoding="utf-8") == "opted out"
+ 
+ 
++@pytest.mark.parametrize("keyword_database", [False, True])
++def test_sqlite_uri_reads_isolated_replica_from_protected_cwd(tmp_path, monkeypatch, keyword_database):
++    from tests.home_io_guard import HomeIOGuard
++
++    replica = tmp_path / "hub # replica.db"
++    connection = sqlite3.connect(replica)
++    try:
++        connection.execute("CREATE TABLE replica (value TEXT)")
++        connection.execute("INSERT INTO replica VALUES ('isolated')")
++        connection.commit()
++    finally:
++        connection.close()
++    protected = tmp_path / "protected-cwd"
++    protected.mkdir()
++    monkeypatch.chdir(protected)
++    with monkeypatch.context() as patcher:
++        HomeIOGuard(lambda: [protected]).install(patcher)
++        uri = replica.as_uri() + "?mode=ro"
++        connection = (sqlite3.connect(database=uri, uri=True) if keyword_database
++                      else sqlite3.connect(uri, uri=True))
++        try:
++            assert connection.execute("SELECT value FROM replica").fetchone() == ("isolated",)
++        finally:
++            connection.close()
++
++
++@pytest.mark.parametrize("form", ["absolute", "encoded", "localhost", "relative", "symlink", "symlink-nul"])
++def test_sqlite_uri_denies_protected_database_from_checkout(tmp_path, monkeypatch, form):
++    from tests.home_io_guard import HomeIOGuard
++
++    protected = tmp_path / "protected uri"
++    protected.mkdir()
++    target = protected / "state.db"
++    connection = sqlite3.connect(target)
++    connection.close()
++    monkeypatch.chdir(PROJECT_ROOT)  # The checkout is an allowed source/interpreter prefix.
++    if form in ("symlink", "symlink-nul"):
++        link = tmp_path / "replica-link.db"
++        try:
++            link.symlink_to(target)
++        except OSError as exc:
++            pytest.skip(f"symlinks unavailable: {exc}")
++        uri = link.as_uri() + ("%00suffix" if form == "symlink-nul" else "")
++    else:
++        uri = {
++            "absolute": lambda: f"file:{target}",
++            "encoded": lambda: target.as_uri().replace("state.db", "%73tate.db"),
++            "localhost": lambda: target.as_uri().replace("file:///", "file://localhost/", 1),
++            "relative": lambda: "file:" + os.path.relpath(target, PROJECT_ROOT).replace(os.sep, "/"),
++        }[form]()
++    with monkeypatch.context() as patcher:
++        HomeIOGuard(lambda: [protected]).install(patcher)
++        with pytest.raises(AssertionError, match="REAL hermes home"):
++            sqlite3.connect(uri + "?mode=ro", uri=True).close()
++
++
+ def test_close_keeps_a_reused_descriptors_new_owner(tmp_path, monkeypatch):
+     from tests.home_io_guard import HomeIOGuard
+ 
+diff --git a/tests/home_io_guard.py b/tests/home_io_guard.py
+index d6953259fa1..b8b3661e25c 100644
+--- a/tests/home_io_guard.py
++++ b/tests/home_io_guard.py
+@@ -10,6 +10,7 @@ import shutil
+ import sqlite3
+ import sys
+ import threading
++from urllib.parse import unquote_to_bytes
+ 
+ 
+ def linked_worktree_git_dirs(checkout: Path) -> set[Path]:
+@@ -247,7 +248,34 @@ class HomeIOGuard:
+         for name in ("rename", "replace"):
+             wrap(os, name, (("src", "src_dir_fd"), ("dst", "dst_dir_fd")), destructive=True)
+         wrap(shutil, "rmtree", (("path", "dir_fd"),), destructive=True)
+-        wrap(sqlite3, "connect", (("database", None),))
++        original_connect = sqlite3.connect
++
++        @wraps(original_connect)
++        def guarded_connect(*args, **kwargs):
++            database = args[0] if args else kwargs.get("database")
++            # sqlite3's URI is its eighth positional argument on Python < 3.15.
++            uri = args[7] if len(args) > 7 else kwargs.get("uri", False)
++            candidate = os.fsdecode(database) if database is not None else None
++            if uri and candidate is not None and candidate.startswith("file:"):
++                # Check SQLite's effective filename, not <cwd>/file:/...?... . Split before
++                # decoding so escaped '?'/'#' stay filename bytes. Avoid urlsplit, which
++                # silently strips tabs/newlines that SQLite treats as filename characters.
++                candidate = candidate[5:].split("?", 1)[0].split("#", 1)[0]
++                if candidate.startswith("//"):
++                    authority, _, candidate = candidate[2:].partition("/")
++                    if authority not in ("", "localhost"):
++                        self.refuse(database)  # No unverified remote/UNC authority in tests.
++                    candidate = "/" + candidate
++                if (os.name == "nt" and len(candidate) > 2 and candidate[0] == "/"
++                        and candidate[1].isascii() and candidate[1].isalpha() and candidate[2] == ":"):
++                    candidate = candidate[1:]  # file:///C:/... names C:/..., not /C:/...
++                candidate = os.fsdecode(unquote_to_bytes(candidate))
++                if "\x00" in candidate:
++                    self.refuse(database)  # SQLite truncates here; realpath cannot check a NUL.
++            self.check(candidate)
++            return original_connect(*args, **kwargs)
++
++        monkeypatch.setattr(sqlite3, "connect", guarded_connect)
+ 
+         original_open, original_close = os.open, os.close
+ 
+-- 
+2.55.0
+

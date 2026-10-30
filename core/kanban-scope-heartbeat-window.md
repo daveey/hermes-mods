@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/1026-fix-kanban-derive-scope-heartbeat-freshness-from-the.patch`
+- `patches/1069-fix-kanban-derive-scope-heartbeat-freshness-from-the.patch`
 
 One rule decides how long an owner's `task_scopes[].observed_at` is trusted.
 

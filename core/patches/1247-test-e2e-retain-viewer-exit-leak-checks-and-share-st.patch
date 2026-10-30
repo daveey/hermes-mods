@@ -1,0 +1,155 @@
+From ae4adeb60e8e42f7487a51a356a0672830b75581 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 11:25:33 +0000
+Subject: [PATCH] test(e2e): retain viewer-exit leak checks and share stale-pin
+ recovery [daveey]
+
+---
+ gateway/session_kanban.py                     |  7 +++--
+ hermes_cli/kanban_skill_check.py              |  7 +++++
+ .../kanban/test_kanban_worker_contract.py     |  3 ++-
+ tests/e2e/core/terminal/_pty.py               | 26 +++++++++++++++++--
+ .../terminal/test_pty_process_lifecycle.py    | 14 ++++++++++
+ .../terminal/test_terminal_transcript_pty.py  |  2 ++
+ 6 files changed, 52 insertions(+), 7 deletions(-)
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index fdcd9d69970..9d068c511c5 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -423,11 +423,10 @@ def _run_task_turns(agent, frame, history, context):
+     skills, _loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
+     # Pins were validated when the card was created; a later removal must reach the worker,
+     # not crash it before it can report or recover the stale prerequisite.
+-    warning = ''
+-    if missing:
+-        from agent.skill_commands import format_missing_skills
++    from hermes_cli.kanban_skill_check import unavailable_pin_note
++    warning = unavailable_pin_note(missing)
++    if warning:
+         import logging
+-        warning = f'Pinned skills unavailable: {format_missing_skills(missing)}. Do not assume their instructions were loaded.'
+         logging.getLogger(__name__).warning('%s', warning)
+     prompt = '\n\n'.join(p for p in (skills, warning, context['context'], frame['text']) if p)
+     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
+diff --git a/hermes_cli/kanban_skill_check.py b/hermes_cli/kanban_skill_check.py
+index f0b44fd09bc..4316de48281 100644
+--- a/hermes_cli/kanban_skill_check.py
++++ b/hermes_cli/kanban_skill_check.py
+@@ -56,6 +56,13 @@ def missing_pin_note(missing: list[str]) -> str:
+     from agent.delegation_context import is_dispatcher_owned_worker_context
+     if not missing or not os.environ.get("HERMES_KANBAN_TASK") or not is_dispatcher_owned_worker_context():
+         return ""
++    return unavailable_pin_note(missing)
++
++
++def unavailable_pin_note(missing: list[str]) -> str:
++    """Recovery guidance for a proven dispatcher worker; no ambient owner-process state."""
++    if not missing:
++        return ""
+     from agent.skill_commands import format_missing_skills
+     return (f"[Kanban: this card pins skills this profile could not load ({format_missing_skills(missing)}). "
+             "Work without them if the task allows it; if it cannot be done without them, call kanban_block "
+diff --git a/tests/e2e/core/kanban/test_kanban_worker_contract.py b/tests/e2e/core/kanban/test_kanban_worker_contract.py
+index ed63527f9b1..3b11c800f46 100644
+--- a/tests/e2e/core/kanban/test_kanban_worker_contract.py
++++ b/tests/e2e/core/kanban/test_kanban_worker_contract.py
+@@ -179,7 +179,8 @@ def test_worker_with_unresolvable_pinned_skill_still_starts_its_session(tmp_path
+                     raise KnownGap(f"worker died before its session (exits={exits}); board:\n{board.diag(tid)}")
+             first = srv.main_requests()[0]["messages"]
+             assert SKILL_MARK not in str(first), "removed skill still loaded"
+-            assert "e2e-archived" in str(first) and "Pinned skills unavailable" in str(first)
++            assert "e2e-archived" in str(first) and "kanban_block" in str(first)
++            assert "kind='assignment'" in str(first)
+             assert board.task(tid)["status"] == "done", board.diag(tid)
+         finally:
+             board.kill_workers()
+diff --git a/tests/e2e/core/terminal/_pty.py b/tests/e2e/core/terminal/_pty.py
+index 6a5bfa44c16..bea943b09e4 100644
+--- a/tests/e2e/core/terminal/_pty.py
++++ b/tests/e2e/core/terminal/_pty.py
+@@ -58,6 +58,26 @@ def poll(fn: Callable[[], object], *, timeout: float, what: str, interval: float
+         time.sleep(interval)
+ 
+ 
++def _gateway_runtime_members(pids: set[int]) -> set[int]:
++    """Only live gateways and their exact, still-parented owner-death supervisor may survive /exit."""
++    import shlex
++    import psutil
++    from gateway.status import looks_like_gateway_command_line
++    from hermes_cli.process_identity import _POSIX_SH, _SUPERVISOR_SCRIPT
++
++    gateways = {pid for pid in pids if looks_like_gateway_command_line(cmdline(pid))}
++    allowed = set(gateways)
++    for pid in pids - gateways:
++        try:
++            parent = psutil.Process(pid).ppid()
++            if parent in gateways and shlex.split(cmdline(pid)) == [
++                    _POSIX_SH, str(_SUPERVISOR_SCRIPT), str(os.getpgid(parent))]:
++                allowed.add(pid)
++        except (psutil.NoSuchProcess, ProcessLookupError):
++            pass
++    return allowed
++
++
+ def _operator_home() -> Path:
+     import pwd
+     return Path(pwd.getpwuid(os.getuid()).pw_dir)
+@@ -299,12 +319,14 @@ class PtyHermes:
+                 except ProcessLookupError:
+                     pass
+ 
+-    def leftover_processes(self, timeout: float = 15.0) -> list[str]:
+-        """All tracked processes still alive after the viewer and sandbox runtime are stopped."""
++    def leftover_processes(self, timeout: float = 15.0, *, runtime_alive: bool = False) -> list[str]:
++        """After /exit only the shared runtime may remain; after its shutdown nothing may remain."""
+         def alive() -> list[int]:
+             pids = set(session_members(self.sid))
+             # Same pid AND same start time: a recycled pid is not our leftover.
+             pids |= {pid for pid, started in self.seen_members if _start_time(pid) == started}
++            if runtime_alive:
++                pids -= _gateway_runtime_members(pids)
+             return sorted(pids)
+         try:
+             poll(lambda: not alive(), timeout=timeout, what="the PTY session to empty")
+diff --git a/tests/e2e/core/terminal/test_pty_process_lifecycle.py b/tests/e2e/core/terminal/test_pty_process_lifecycle.py
+index 2227ade99a8..e425e520073 100644
+--- a/tests/e2e/core/terminal/test_pty_process_lifecycle.py
++++ b/tests/e2e/core/terminal/test_pty_process_lifecycle.py
+@@ -36,6 +36,20 @@ def test_sandbox_shutdown_signals_only_its_live_gateway(monkeypatch, recycled):
+     assert signals == ([] if recycled else [(gateway, signal.SIGTERM)])
+ 
+ 
++def test_viewer_exit_keeps_only_the_identified_runtime(monkeypatch):
++    import psutil
++
++    term, gateway, supervisor = _inventory(monkeypatch)
++    monkeypatch.setattr(psutil, "Process", lambda pid: MagicMock(ppid=lambda: gateway))
++    monkeypatch.setattr(_pty.os, "getpgid", lambda pid: gateway)
++    # Even a process that gateway shutdown would later reap must fail the viewer-exit check.
++    leftovers = term.leftover_processes(timeout=0, runtime_alive=True)
++    assert len(leftovers) == 1 and leftovers[0].startswith(f"{term.sid}:")
++    assert _pty._gateway_runtime_members({gateway, supervisor}) == {gateway, supervisor}
++    monkeypatch.setattr(psutil, "Process", lambda pid: MagicMock(ppid=lambda: term.sid))
++    assert _pty._gateway_runtime_members({gateway, supervisor}) == {gateway}
++
++
+ def test_exit_inventory_never_exempts_gateway_or_supervisor(monkeypatch):
+     term, gateway, supervisor = _inventory(monkeypatch)
+     leftovers = term.leftover_processes(timeout=0)
+diff --git a/tests/e2e/core/terminal/test_terminal_transcript_pty.py b/tests/e2e/core/terminal/test_terminal_transcript_pty.py
+index ef2bc98a970..5df27b75d0c 100644
+--- a/tests/e2e/core/terminal/test_terminal_transcript_pty.py
++++ b/tests/e2e/core/terminal/test_terminal_transcript_pty.py
+@@ -187,6 +187,8 @@ def test_terminal_transcript_integrity(surface: str, scenario: str, tmp_path: Pa
+ 
+             code = term.exit()
+             assert code == 0, f"[{surface}/{scenario}] /exit returned {code}\n{term.dump()}"
++            viewer_leftovers = term.leftover_processes(runtime_alive=True)
++            assert not viewer_leftovers, f"[{surface}/{scenario}] viewer processes left after /exit: {viewer_leftovers}"
+             # The viewer does not own the shared runtime's lifetime. End our sandbox's gateway
+             # gracefully, then require its entire tree (including its supervisor) to be gone.
+             term.stop_gateway()
+-- 
+2.55.0
+

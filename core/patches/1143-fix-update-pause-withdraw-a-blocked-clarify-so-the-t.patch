@@ -1,0 +1,306 @@
+From d7f23fd02e9d02b6d18281d5b7c1448190eaecdc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 05:51:36 +0000
+Subject: [PATCH 1143/1157] fix(update-pause): withdraw a blocked clarify so
+ the turn pauses for a core update [daveey]
+
+A Desktop turn waiting in clarify never reaches a step boundary, so the
+drainer's pause request ran out its 180s budget and the update cut the
+turn, which resumed with the crash note (example-hub 2026-10-30 05:37,
+session 20261030_045045_3394a8: a 41-min clarify; t_01a18ac84e3491a9).
+
+A clarify_early provider, installed with the per-turn boundary hook,
+withdraws the pending clarify (status paused_for_update, notice says to
+re-ask) when a pause is requested for a turn the next backend
+auto-continues; the hook then pauses at the boundary right after it.
+---
+ tests/tui_gateway/test_update_pause.py        |  33 +++++
+ .../tui_gateway/test_update_pause_clarify.py  | 116 ++++++++++++++++++
+ tools/clarify_early.py                        |   2 +-
+ tools/clarify_tool.py                         |   5 +-
+ tui_gateway/prompt_turn.py                    |   4 +-
+ tui_gateway/update_pause.py                   |  49 ++++++++
+ 6 files changed, 206 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_clarify.py
+
+diff --git a/tests/tui_gateway/test_update_pause.py b/tests/tui_gateway/test_update_pause.py
+index 9294d4baf5a..b5e4ee001ab 100644
+--- a/tests/tui_gateway/test_update_pause.py
++++ b/tests/tui_gateway/test_update_pause.py
+@@ -7,6 +7,7 @@ that does not use up a crash-resume attempt. Turns that cannot be auto-continued
+ 
+ from __future__ import annotations
+ 
++import json
+ import os
+ import threading
+ import time
+@@ -178,6 +179,38 @@ def test_announce_pause_frame_satisfies_the_message_complete_contract(monkeypatc
+     check_payload("status.update", emitted[0][1])
+ 
+ 
++def test_clarify_asked_during_a_pause_request_is_withdrawn_and_the_turn_pauses(turn_env, home, monkeypatch):
++    """[daveey] t_01a18ac84e3491a9: the whole turn path installs the clarify withdrawal, so a turn waiting on a
++    human no longer holds the update until the drainer's budget runs out and cuts it."""
++    from tools import clarify_early
++    from tools.clarify_tool import clarify_tool
++    monkeypatch.setattr(up, "_clarify_provider_installed", False, raising=False)
++    clarify_early.reset_for_tests()
++    asked: list = []
++    seen = {}
++
++    def _run(message, **kwargs):
++        _request_pause(home)
++        seen["clarify"] = json.loads(clarify_tool([{"question": "Which pool?"}], callback=lambda q: asked.append(q),
++                                                  session_id="session-key", tool_call_id="tc1"))
++        reason = agent.step_boundary_pause()
++        return {"final_response": "", "messages": [], "interrupted": True, "completed": False,
++                "paused_for_update": reason}
++
++    agent = types.SimpleNamespace(session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None)
++    session = _session(agent=agent, running=True, profile_home=str(home))
++    monkeypatch.setitem(server._sessions, "ui-sid", session)
++    try:
++        server._run_prompt_submit("rid", "ui-sid", session, "the prompt")
++    finally:
++        clarify_early.reset_for_tests()
++
++    assert seen["clarify"]["status"] == "paused_for_update"
++    assert asked == []  # never shown: the pause was already requested
++    marker = read_turn_marker(home, "session-key")
++    assert marker is not None and marker["reason"] == "core_update_pause"
++
++
+ def test_ordinary_stop_is_not_reported_as_a_pause(turn_env, home):
+     """An interrupted turn the update did not pause keeps the plain terminal frame: no pause flag,
+     no pause text, no in-place watcher."""
+diff --git a/tests/tui_gateway/test_update_pause_clarify.py b/tests/tui_gateway/test_update_pause_clarify.py
+new file mode 100644
+index 00000000000..4c8a26347d4
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_clarify.py
+@@ -0,0 +1,116 @@
++"""[daveey] t_01a18ac84e3491a9: a Desktop turn blocked in ``clarify`` never reaches a step boundary, so the
++drainer's pause request ran out its budget and the update cut the turn (hub 2026-10-30 05:37: a 41-min clarify,
++then a crash-resume note). While a pause is requested for a turn the next backend auto-continues, the pending
++clarify is withdrawn unanswered and the turn pauses at the boundary right after it.
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++import time
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tools import clarify_early
++from tools.clarify_tool import clarify_tool
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++QUESTIONS = [{"question": "Which runner pool?", "choices": ["org", "personal"]}]
++WAIT_S = 10
++
++
++class Blocking:
++    """A surface callback that blocks until answered or cancelled, like the TUI bridge."""
++
++    def __init__(self):
++        self.event = threading.Event()
++        self.entered = threading.Event()
++        self.cancel_reasons: list = []
++
++    def __call__(self, questions):
++        self.entered.set()
++        self.event.wait(WAIT_S)
++        return {"answers": {}, "outcome": "cancelled"}
++
++    def cancel_early(self, reason):
++        self.cancel_reasons.append(reason)
++        self.event.set()
++        return True
++
++
++@pytest.fixture()
++def env(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    monkeypatch.setattr(clarify_early, "POLL_INTERVAL_S", 0.05)
++    monkeypatch.setattr(up, "_clarify_provider_installed", False, raising=False)
++    clarify_early.reset_for_tests()
++    session = {"agent": types.SimpleNamespace(session_id="session-key"), "session_key": "session-key",
++               "history_lock": threading.RLock(), "profile_home": str(tmp_path)}
++    session["agent"].step_boundary_pause = up.boundary_pause_hook(session, "session-key")
++    monkeypatch.setitem(server._sessions, "ui-sid", session)
++    record_turn_start(tmp_path, "session-key", "the prompt")
++    yield types.SimpleNamespace(home=tmp_path, session=session)
++    clarify_early.reset_for_tests()
++
++
++def _request_pause(root):
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 120)
++
++
++def test_no_pause_request_keeps_the_clarify(env):
++    assert up.clarify_pause_provider("session-key", "tc1") is None
++
++
++def test_pause_request_withdraws_the_clarify_of_a_resumable_turn(env):
++    _request_pause(env.home)
++    early = up.clarify_pause_provider("session-key", "tc1")
++    assert early is not None
++    assert early.result["status"] == up.CLARIFY_PAUSE_STATUS
++
++
++@pytest.mark.parametrize("case", ["no_hook", "opted_out", "other_session"])
++def test_turn_that_will_not_pause_keeps_its_clarify(env, case):
++    sid = "session-key"
++    if case == "no_hook":
++        env.session["agent"].step_boundary_pause = None
++    if case == "opted_out":
++        record_turn_start(env.home, "session-key", "the prompt", auto_continue=False)
++    if case == "other_session":
++        sid = "someone-else"
++    _request_pause(env.home)
++    assert up.clarify_pause_provider(sid, "tc1") is None
++
++
++def test_blocked_clarify_ends_and_the_turn_pauses_at_the_next_boundary(env):
++    """The hub incident end to end: the clarify is already blocked when the drainer asks for the pause."""
++    # getattr keeps this test behavioural on a tree without the fix: there the clarify just keeps blocking.
++    install = getattr(up, "install_clarify_pause_provider", lambda: None)
++    install()
++    install()  # idempotent
++    surface = Blocking()
++    box: dict = {}
++    worker = threading.Thread(target=lambda: box.setdefault(
++        "result", clarify_tool(QUESTIONS, callback=surface, session_id="session-key", tool_call_id="tc1")))
++    worker.start()
++    assert surface.entered.wait(WAIT_S)
++    _request_pause(env.home)
++    worker.join(WAIT_S)
++    assert not worker.is_alive(), "clarify kept blocking while a pause was requested"
++
++    result = json.loads(box["result"])
++    assert result["status"] == up.CLARIFY_PAUSE_STATUS
++    assert "ask it again" in result["notice"]
++    assert surface.cancel_reasons == [up.CLARIFY_PAUSE_STATUS]
++    # The step boundary right after the tool result now pauses the turn instead of the update cutting it.
++    assert env.session["agent"].step_boundary_pause() == up.PAUSE_REASON
++    marker = read_turn_marker(env.home, "session-key")
++    assert marker is not None and marker["reason"] == up.PAUSE_REASON
+diff --git a/tools/clarify_early.py b/tools/clarify_early.py
+index b6401246bad..46603fb2af6 100644
+--- a/tools/clarify_early.py
++++ b/tools/clarify_early.py
+@@ -115,7 +115,7 @@ def ask(callback: Callable, normalized: list, session_id: str, tool_call_id: str
+             continue
+         cancelled = False
+         try:
+-            cancelled = bool(cancel(STATUS))
++            cancelled = bool(cancel(str(early.result.get("status") or STATUS)))
+         except Exception:
+             logger.debug("clarify cancel_early failed", exc_info=True)
+         done.wait(5)
+diff --git a/tools/clarify_tool.py b/tools/clarify_tool.py
+index 90d4d3cbd8b..4a2d6116fbb 100644
+--- a/tools/clarify_tool.py
++++ b/tools/clarify_tool.py
+@@ -123,7 +123,10 @@ def clarify_tool(questions, callback: Optional[Callable] = None, *, session_id:
+             from tools import clarify_early
+             reply, early = clarify_early.ask(callback, normalized, session_id or "", tool_call_id or "")
+             if early is not None:
+-                human.outcome = clarify_early.STATUS
++                try:
++                    human.outcome = str(json.loads(early).get("status") or clarify_early.STATUS)
++                except (ValueError, AttributeError):
++                    human.outcome = clarify_early.STATUS
+                 return early
+             human.outcome = str(reply.get("outcome") or "")
+             return _result(normalized, reply)
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index c2ffe7711ac..33d5b120a9a 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -967,8 +967,10 @@ def _invoke_agent(
+         "session.title", sid, {"session_id": _k, "title": t})
+     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+     # [daveey] Core-update pause: consulted by the agent loop at each step boundary of this turn only.
+-    from tui_gateway.update_pause import boundary_pause_hook
++    from tui_gateway.update_pause import boundary_pause_hook, install_clarify_pause_provider
+     agent.step_boundary_pause = boundary_pause_hook(session, st.marker_key) if st.marker_key else None
++    if st.marker_key:
++        install_clarify_pause_provider()  # a blocked clarify is withdrawn so the pause can land
+     try:
+         from agent.notification_presentation import notification_turn, event_presentation_muted
+         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 1d301acaeb2..dee7fb8b26e 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -260,6 +260,55 @@ def boundary_pause_hook(session: dict, marker_key: str) -> Callable[[], str | No
+     return hook
+ 
+ 
++# [daveey] t_01a18ac84e3491a9: a turn parked in a blocking clarify never reaches a step boundary, so the
++# drainer's pause budget runs out and the update cuts it (hub 2026-10-30 05:37: a clarify waited 41 min, the
++# turn crash-resumed). While a pause is requested and the turn's boundary hook would pause it, the clarify is
++# withdrawn unanswered; the hook then pauses at the boundary right after it and the continuation re-asks.
++CLARIFY_PAUSE_STATUS = "paused_for_update"
++CLARIFY_PAUSE_NOTICE = ("Hermes is pausing this turn at a step boundary for an update, so this question was "
++                        "withdrawn unanswered. The turn continues automatically after the update: ask it again then.")
++_clarify_provider_lock = threading.Lock()
++_clarify_provider_installed = False
++
++
++def _session_for(session_id: str) -> dict | None:
++    from tui_gateway import server
++    with server._sessions_lock:
++        sessions = list(server._sessions.values())
++    for session in sessions:
++        agent = session.get("agent")
++        if session.get("session_key") == session_id or getattr(agent, "session_id", None) == session_id:
++            return session
++    return None
++
++
++def clarify_pause_provider(session_id: str, tool_call_id: str):
++    """``tools.clarify_early`` provider: withdraw a blocked clarify when this turn will pause for an update."""
++    if not session_id:
++        return None
++    session = _session_for(session_id)
++    if session is None or getattr(session.get("agent"), "step_boundary_pause", None) is None:
++        return None
++    marker_key = str(session.get("session_key") or "")
++    if not marker_key or not pause_requested(session) or not_resumable_reason(session, marker_key):
++        return None
++    from tools.clarify_early import EarlyAnswer
++    logger.info("core-update pause: session %s withdrew a pending clarify to pause for a Hermes update", marker_key)
++    return EarlyAnswer({"status": CLARIFY_PAUSE_STATUS, "outcome": CLARIFY_PAUSE_STATUS,
++                        "notice": CLARIFY_PAUSE_NOTICE}, commit=lambda: None)
++
++
++def install_clarify_pause_provider() -> None:
++    """Idempotent; called when a turn installs its boundary hook."""
++    global _clarify_provider_installed
++    with _clarify_provider_lock:
++        if _clarify_provider_installed:
++            return
++        from tools import clarify_early
++        clarify_early.register_provider(clarify_pause_provider)
++        _clarify_provider_installed = True
++
++
+ def pause_note(prompt: str, killed_jobs: list | None = None) -> str:
+     from tui_gateway.session_history import _AUTO_CONTINUE_NOTE_PREFIX
+     note = (f"{_AUTO_CONTINUE_NOTE_PREFIX} — it was paused at a step boundary for a Hermes update. Every "
+-- 
+2.55.0
+

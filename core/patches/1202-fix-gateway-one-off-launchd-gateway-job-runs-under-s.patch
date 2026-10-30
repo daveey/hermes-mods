@@ -1,0 +1,185 @@
+From c2da9c7645f1fe82ef88a04f2321cc6518225b95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:39:48 -0700
+Subject: [PATCH] fix(gateway): one-off launchd gateway job runs under signed
+ Hermes Python.app, not osascript [daveey]
+
+Problem: daveey-mini showed "osascript would like to access files in your Desktop folder"
+(tccd AUTHREQ_PROMPTING 2026-10-29 23:47:16, kTCCServiceSystemPolicyDesktopFolder,
+responsible=/usr/bin/osascript pid 42849, accessing=/usr/bin/find pid 30946).
+Why 1: an agent's find/mdfind under the gateway touched ~/Desktop and macOS charged it to the
+  responsible process, osascript, which has Full Disk Access denied (system TCC.db auth_value 0).
+Why 2: osascript 42849 was the program of the one-off job gui/501/com.nousresearch.hermes.runtime.b210a8c4f37d
+  (launchd "xpcproxy spawned with pid 42849" at 22:04:47), started by start_gateway_job for an unmanaged gateway.
+Why 3: start_gateway_job called launchd_program_arguments() without responsible=, so it fell back to
+  the osascript JXA wrapper, while the installed launchd service already passes the signed
+  Hermes Python.app (com.daveey.hermes-python, which holds FDA/Accessibility/ScreenCapture).
+Root: the signed-wrapper fix covered only one of the two launchd entry points; nothing tested the
+  one-off job's wrapper identity.
+Fix: responsible_app() (stdlib-only, safe in the bare restart watcher) picks the command's signed
+  bundle executable or the signed twin of the store Python; osascript stays as the fallback.
+Tests: plist ProgramArguments for signed command / signed store twin / no bundle; the live launchd
+  test now asserts the wrapper is the signed app when installed.
+---
+ hermes_cli/gateway_launchd_runtime.py         | 35 ++++++++++-
+ .../test_gateway_launchd_runtime.py           | 59 ++++++++++++++++++-
+ 2 files changed, 89 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/gateway_launchd_runtime.py b/hermes_cli/gateway_launchd_runtime.py
+index 07aeb1f6c94..3bd1b89f9fd 100644
+--- a/hermes_cli/gateway_launchd_runtime.py
++++ b/hermes_cli/gateway_launchd_runtime.py
+@@ -6,6 +6,8 @@ every surviving descendant becomes responsible for itself: a bare venv Python, w
+ with ``EHOSTUNREACH`` on any LAN connect (a model server on another machine). A job that launchd
+ spawns through ``/usr/bin/osascript`` is attributed to osascript, an exempt Apple platform binary,
+ for its whole life, whoever asked for it (#71206; ``gateway_launchd.launchd_program_arguments``).
++[daveey] When the signed Hermes Python.app is installed it owns the job instead (``responsible_app``),
++so the gateway's children use its TCC grants rather than prompting for "osascript".
+ 
+ Nothing is installed: the plist is loaded once and deleted, it is never in ~/Library/LaunchAgents
+ and has no KeepAlive, so the job never starts at login and launchd never restarts the gateway.
+@@ -17,6 +19,7 @@ import os
+ import plistlib
+ import re
+ import subprocess
++import sys
+ import time
+ import uuid
+ from pathlib import Path
+@@ -72,7 +75,8 @@ class GatewayJob:
+         return self._status
+ 
+     def _record_gateway_pid(self, wrapper_pid: int) -> None:
+-        # The job's own process is osascript; the gateway is its only child (the shell execs it).
++        # The job's own process is the wrapper (Hermes Python.app or osascript); the gateway is its only
++        # child (the shell execs it).
+         # Its pid is what gateway_state.json names, so a startup-failure report can match it.
+         if self.pid not in (None, wrapper_pid) or not (timeout := _budget(self._deadline, 5)):
+             return
+@@ -93,6 +97,32 @@ def _remove_finished_jobs(deadline: float | None) -> None:
+             _launchctl("remove", fields[2], timeout=_budget(deadline, 10))
+ 
+ 
++def responsible_app(command: list[str]) -> Path | None:
++    """[daveey] The Developer-ID-signed Hermes Python.app executable to own the job instead of osascript.
++
++    macOS charges every privacy request of the job's descendants to its responsible process. Under
++    osascript, an agent's ``find ~`` or ``mdfind`` in the gateway's terminal tool prompted "osascript would
++    like to access files in your Desktop folder" (osascript has no Full Disk Access, and a grant for it
++    would cover every script on the Mac). The signed bundle holds the user's grants (keyed by bundle id +
++    team) and keeps Local Network access (``gateway_launchd.launchd_program_arguments``). Stdlib only: the
++    restart watcher calls this from a bare interpreter. ``None`` (no matching bundle) keeps osascript.
++    """
++    try:
++        from hermes_cli._launchers import signed_python_app
++    except Exception:  # a bare interpreter missing the checkout's helpers: osascript still works
++        return None
++    for candidate in (command[0] if command else "", sys.executable):
++        path = Path(candidate)
++        if "/Hermes Python.app/Contents/MacOS/" in str(path) and path.is_file():
++            return path  # already the signed bundle's executable
++        try:
++            if (signed := signed_python_app(path)) is not None:
++                return signed
++        except Exception:
++            continue
++    return None
++
++
+ def start_gateway_job(command: list[str], *, env: dict[str, str], cwd: str | Path,
+                       log_path: str | Path, deadline: float | None = None) -> GatewayJob | None:
+     """Run ``command`` as a one-off job in this user's GUI launchd domain. ``None`` when launchd
+@@ -112,7 +142,8 @@ def start_gateway_job(command: list[str], *, env: dict[str, str], cwd: str | Pat
+         with os.fdopen(fd, "wb") as handle:
+             plistlib.dump({
+                 "Label": label,
+-                "ProgramArguments": launchd_program_arguments(wrapped, log_path, log_path),
++                "ProgramArguments": launchd_program_arguments(wrapped, log_path, log_path,
++                                                              responsible=responsible_app(command)),
+                 "EnvironmentVariables": dict(env),
+                 "WorkingDirectory": str(cwd),
+                 "RunAtLoad": True,
+diff --git a/tests/hermes_cli/test_gateway_launchd_runtime.py b/tests/hermes_cli/test_gateway_launchd_runtime.py
+index 8ddb1859b09..8cd65754439 100644
+--- a/tests/hermes_cli/test_gateway_launchd_runtime.py
++++ b/tests/hermes_cli/test_gateway_launchd_runtime.py
+@@ -14,7 +14,11 @@ import sys
+ 
+ import pytest
+ 
+-from hermes_cli.gateway_launchd_runtime import start_gateway_job
++import plistlib
++from pathlib import Path
++
++from hermes_cli import gateway_launchd_runtime as runtime
++from hermes_cli.gateway_launchd_runtime import responsible_app, start_gateway_job
+ from tests.waiting import wait_until
+ 
+ 
+@@ -48,8 +52,10 @@ def test_gateway_job_is_a_launchd_osascript_child_that_reads_as_unsupervised(tmp
+                                  f"launchctl print:\n{state[:3000]}")
+         seen = json.loads(report.read_text(encoding="utf-8-sig"))
+         wrapper = seen["ppid"]
+-        # The caller is not an ancestor: launchd (pid 1) spawned osascript, osascript the command.
+-        assert _command_of(wrapper).startswith("/usr/bin/osascript"), _command_of(wrapper)
++        # The caller is not an ancestor: launchd (pid 1) spawned the wrapper, the wrapper the command. The
++        # wrapper is the signed Hermes Python.app when installed (its TCC grants), else osascript.
++        expected = responsible_app([sys.executable]) or "/usr/bin/osascript"
++        assert _command_of(wrapper).startswith(str(expected)), _command_of(wrapper)
+         assert subprocess.run(["ps", "-o", "ppid=", "-p", str(wrapper)], capture_output=True, text=True, encoding="utf-8",
+                               check=False, stdin=subprocess.DEVNULL).stdout.strip() == "1"
+         assert seen["marker"] == "env-carried"
+@@ -61,3 +67,50 @@ def test_gateway_job_is_a_launchd_osascript_child_that_reads_as_unsupervised(tmp
+         release.write_text("", encoding="utf-8")
+     assert wait_until(lambda: job.poll() is not None, timeout=30)
+     assert job.poll() == 0
++
++
++def _job_program_arguments(monkeypatch, tmp_path, command):
++    """ProgramArguments of the plist start_gateway_job hands to ``launchctl bootstrap``."""
++    seen = {}
++
++    def fake_launchctl(*args, timeout):
++        if args[0] == "bootstrap":
++            seen["plist"] = plistlib.loads(Path(args[2]).read_bytes())
++        return subprocess.CompletedProcess(["launchctl", *args], 0, "", "")
++
++    monkeypatch.setattr(runtime, "_launchctl", fake_launchctl)
++    assert start_gateway_job(command, env={}, cwd=tmp_path, log_path=tmp_path / "gateway-stdio.log") is not None
++    return seen["plist"]["ProgramArguments"]
++
++
++def _fake_signed_app(home: Path) -> Path:
++    exe = home / "Applications" / "Hermes Python.app" / "Contents" / "MacOS" / "python3.14"
++    exe.parent.mkdir(parents=True)
++    exe.write_text("", encoding="utf-8")
++    return exe
++
++
++def test_job_is_owned_by_the_signed_python_app_when_the_command_runs_it(monkeypatch, tmp_path):
++    # The osascript wrapper made every child's privacy request read as "osascript" (Desktop folder prompt
++    # on the mini from an agent's ``find ~``); the signed bundle holds Full Disk Access instead.
++    exe = _fake_signed_app(tmp_path)
++    args = _job_program_arguments(monkeypatch, tmp_path, [str(exe), "-m", "hermes_cli.main", "gateway", "run"])
++    assert args[0] == str(exe), args
++    assert "/usr/bin/osascript" not in args
++
++
++def test_job_is_owned_by_the_signed_twin_of_the_store_python(monkeypatch, tmp_path):
++    signed = tmp_path / "signed-python3.14"
++    signed.write_text("", encoding="utf-8")
++    store = "/x/tools/python-3.14.9+20261021-darwin-arm64/bin/python3"
++    monkeypatch.setattr("hermes_cli._launchers.signed_python_app",
++                        lambda p: signed if str(p) == store else None)
++    args = _job_program_arguments(monkeypatch, tmp_path, [store, "-m", "hermes_cli.main", "gateway", "run"])
++    assert args[0] == str(signed), args
++
++
++def test_job_keeps_the_osascript_wrapper_without_a_signed_app(monkeypatch, tmp_path):
++    monkeypatch.setattr("hermes_cli._launchers.signed_python_app", lambda p: None)
++    monkeypatch.setattr(runtime.sys, "executable", "/usr/local/bin/python3")
++    args = _job_program_arguments(monkeypatch, tmp_path, ["/usr/local/bin/python3", "-m", "hermes_cli.main"])
++    assert args[:4] == ["/usr/bin/osascript", "-l", "JavaScript", "-e"], args
+-- 
+2.55.0
+

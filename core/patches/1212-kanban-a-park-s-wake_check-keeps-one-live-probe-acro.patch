@@ -1,0 +1,619 @@
+From a308b75c5fc914dff3e008f90ebb1255f397fa6a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 11:26:53 +0000
+Subject: [PATCH] kanban: a park's wake_check keeps one live probe across
+ worker nodes; sweep lost probes [daveey]
+
+t_01a18c12ba6895b8 (created on the MacBook, run by the hub as a Board worker node) parked on
+'wait-check task t_01a18c31ab3e58f7 --gateway macbook'. The probe row (task_wake_checks,
+machine-local, never synced) was written on the hub; worker_node.evict dropped the scheduled copy
+on the next tick and run_due_wake_checks' stale sweep deleted the orphaned row. The MacBook got the
+scheduled status and event but no probe, so the card slept 43 min past its producer (7 such cards).
+
+- The probe runs on the gateway that parked the card (probe_host on the park event): only it is
+  sure to run it (a capability-owner request id lives in that host's request store). evict keeps a
+  scheduled copy whose probe is live; the wake is a status write the Board carries home. Clock wakes
+  of a copy are left to the home board.
+- A capability relay to the home names the home as probe_host: the worker registers nothing and the
+  home registers the probe from the park event.
+- restore_missing_checks (every dispatcher tick): a scheduled card whose last park carries a
+  wake_check and has no probe here is restored once (wake_check_restored); a second loss wakes it
+  with a comment (wake_check_lost). A relayed park whose probe host has not said wake_check_alive
+  (every 3 h) for 3 h + 2x check_every + 15 min is woken with a comment.
+
+Card t_01a18c702a4e8024. Tests: tests/hermes_cli/test_kanban_wake_check_home.py (RED on 7a2ccb0b4a),
+test_kanban_capability_relay.py.
+---
+ hermes_cli/kanban_capability_routing.py       |   7 +-
+ hermes_cli/kanban_continuation.py             |   6 +-
+ hermes_cli/kanban_db_schedule.py              |   2 +-
+ hermes_cli/kanban_timed_park.py               |   7 +-
+ hermes_cli/kanban_wake_check.py               | 180 ++++++++++++++-
+ hermes_cli/kanban_worker_node.py              |   8 +-
+ .../test_kanban_capability_relay.py           |   6 +
+ .../hermes_cli/test_kanban_wake_check_home.py | 209 ++++++++++++++++++
+ 8 files changed, 415 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wake_check_home.py
+
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 4ccf8e79bbb..02a449ddff2 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -32,7 +32,8 @@ Relay (gateways without a hermes-hub replica, and a holder that is briefly not l
+ * A Board worker node runs no hermes-hub sync: it has no registry to look the holder up in and no
+   ``create-task``. When it runs a card copied from another gateway (``created_on``), routing parks the
+   card on the same ``capability-owner:<card>:<need>`` ids and records a ``relay`` route to that home
+-  gateway. The idle copy is evicted, so the home's dispatcher runs the wake probe, and
++  gateway. The park names the home as ``probe_host``, so the worker registers no probe and evicts its idle
++  copy; the home's dispatcher registers the probe from the park event (``restore_missing_checks``), and
+   :func:`owner_status` there routes the need with the home's own registry: ``create-task`` to a remote
+   holder under the same request id, or, when the home holds the need itself, a local owner card keyed
+   by that id (``idempotency_key``) and pinned to the home machine. A worker node's OWN card has no home
+@@ -382,7 +383,9 @@ def _park_relay(conn, task_id: str, needs: list[str], *, reason: str, gateway: s
+         ok = ktp.park(conn, task_id, reason=park_reason, requested_kind="capability", source_status=source,
+                       expected_run_id=expected_run_id, wake_check=wake_check, check_every=WAKE_EVERY,
+                       awaiting={"kind": "card", "ref": routes[0]["request_id"], "gateway": gateway,
+-                                "why": f"capability owner for {', '.join(needs)}, routed by {gateway}"})
++                                "why": f"capability owner for {', '.join(needs)}, routed by {gateway}"},
++                      # [daveey] A home relay is routed by the home's registry: the home runs the probe.
++                      probe_host=gateway if mode == RELAY_HOME else None)
+         if not ok:
+             raise CapabilityRouteError("capability_route_invalid_state",
+                                        f"{task_id} could not be parked (claim lost?)", details={"routes": routes})
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 284d8ae3aae..d124345c4b5 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -202,7 +202,7 @@ def continue_task(
+         from hermes_cli import kanban_wake_check as kwc  # condition wake [daveey]
+         if wake_at is not None:
+             payload["wake_at"] = wake_at
+-            payload.update(kwc.park_fields(wake_check, check_every, clock_only))
++            payload.update(kwc.park_fields(wake_check, check_every, clock_only, conn=conn))
+             payload["awaiting"] = record
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now)
+@@ -257,8 +257,12 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     maybe_refresh_async()  # live-check this gateway's capabilities off-thread, throttled [daveey]
+     now = int(time.time()) if now is None else int(now)
+     woken: list[str] = []
++    from hermes_cli.kanban_wake_check import foreign_ids
++    copies = foreign_ids(conn)  # [daveey] a worker node's copy: its home board owns the clock wake
+     for row in conn.execute("SELECT id, block_kind FROM tasks WHERE status = 'scheduled'").fetchall():
+         tid = row[0]
++        if tid in copies:
++            continue
+         payload = pending_wake(conn, tid)
+         if payload is None:
+             # Invariant: every scheduled card has a wake or becomes blocked. [daveey]
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index ae8fd691a5c..41512d04e4f 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -70,7 +70,7 @@ def schedule_task(
+             metadata=meta or None, synthesize=bool(reason or meta),
+         )
+         _kb._append_event(conn, task_id, "scheduled", {
+-            **payload, **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record, **meta,
++            **payload, **kwc.park_fields(wake_check, check_every, clock_only, conn=conn), "awaiting": record, **meta,
+         }, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check, check_every)
+         return noted.keep(True)
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index 28559262756..7b509fa3bd0 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -137,7 +137,7 @@ def park(
+     source_status: str = "ready", expected_run_id: Optional[int] = None, from_untyped_block: bool = False,
+     wake_check: Optional[str] = None, check_every: Optional[int] = None, clock_only: bool = False,
+     awaiting=None, blocker_id: Optional[str] = None, run_metadata: Optional[dict] = None,
+-    blocker_wake: bool = False,
++    blocker_wake: bool = False, probe_host: Optional[str] = None,
+ ) -> bool:
+     """``running``/``ready`` -> ``scheduled`` with a wake time. Caller holds the write txn.
+     ``from_untyped_block``: an untyped ``blocked`` card with no live run (classify-in-place) instead.
+@@ -189,10 +189,11 @@ def park(
+     kb._append_event(conn, task_id, "scheduled", {
+         "reason": reason, "timed_park": True, "requested_kind": requested_kind,
+         "wake_at": wake_at, "resume_status": source_status,
+-        **kwc.park_fields(wake_check, check_every, clock_only), "awaiting": record,
++        **kwc.park_fields(wake_check, check_every, clock_only, conn=conn, probe_host=probe_host), "awaiting": record,
+         **({"blocker_id": blocker_id} if blocker_id else {}),
+         **({"blocker_wake": True} if blocker_wake else {}),
+         **({"clear_blocker": True} if meta.get("clear_blocker") else {}),
+     }, run_id=run_id)
+-    kwc.set_check(conn, task_id, wake_check, check_every, now=now)
++    # [daveey] ``probe_host``: another gateway runs this probe (a relay to the home); it registers it there.
++    kwc.set_check(conn, task_id, wake_check if kwc.probe_here(conn, probe_host) else None, check_every, now=now)
+     return True
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 714685d5c15..bcd4bfcab58 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -63,6 +63,20 @@ OUTPUT_TAIL_CHARS = 500
+ MAX_CMD_CHARS = 2000
+ CONDITION_MET_EVENT = "condition_met"
+ BROKEN_EVENT = "wake_check_broken"
++# [daveey] Probe placement on synced boards (``task_wake_checks`` is machine-local and never syncs). The probe runs
++# on the gateway that parked the card (``probe_host`` on the park event): that is where the park's dry run passed
++# and where host-only state lives (a ``wait-check capability-owner`` request id exists only in the store of the
++# gateway that opened it). A worker node keeps its scheduled copy of another gateway's card while the probe is live
++# (``kanban_worker_node.evict``); a wake there is a status write the Board carries home. The home board re-registers
++# a probe it lost (``RESTORED_EVENT``, once), and wakes the card with a comment when a probe is lost again or a
++# relayed park's probe host has gone silent (``LOST_EVENT``), so a lost probe never sleeps silently until the clock.
++RESTORED_EVENT = "wake_check_restored"
++LOST_EVENT = "wake_check_lost"
++ALIVE_EVENT = "wake_check_alive"
++# A worker node's probe on another gateway's card says it is alive at most this often (one synced event).
++ALIVE_EVERY = 3 * 3600
++SILENT_GRACE = 900
++_RESTORE_SEEN: dict[tuple[str, str], int] = {}
+ # Output that shows a probe crashed even though it exited 1 ("not yet"): a traceback, a
+ # shell syntax/lookup error, a sqlite failure, or a script's own ``error:`` line. Such a
+ # probe can never succeed, so it counts toward BROKEN_AFTER instead of looking like waiting.
+@@ -208,17 +222,175 @@ def planned_wake(conn: sqlite3.Connection, task_id: str, *, op: str, reason: Opt
+     raise ValueError(f"unknown park op {op!r}")
+ 
+ 
+-def park_fields(wake_check: Optional[str], check_every: Optional[int], clock_only: bool) -> dict:
+-    """Keys added to the parking event payload (only the ones that are set)."""
++def park_fields(wake_check: Optional[str], check_every: Optional[int], clock_only: bool,
++                *, conn: Optional[sqlite3.Connection] = None, probe_host: Optional[str] = None) -> dict:
++    """Keys added to the parking event payload (only the ones that are set). With ``conn`` on a synced board,
++    ``probe_host`` names the gateway that runs the probe: this one, unless the caller hands it to another
++    (``probe_host``, e.g. a capability relay to the card's home). [daveey]"""
+     out: dict = {}
+     if wake_check:
+         out["wake_check"] = wake_check
+         out["check_every"] = normalize_every(check_every)
++        host = probe_host or own_gateway(conn)
++        if host:
++            out["probe_host"] = host
+     if clock_only:
+         out["clock_only"] = True
+     return out
+ 
+ 
++# --- probe placement (synced boards) --------------------------------------------------------
++
++def own_gateway(conn: Optional[sqlite3.Connection]) -> Optional[str]:
++    """This gateway's id on a board that syncs to the Board service, else None."""
++    if conn is None:
++        return None
++    try:
++        row = conn.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
++    except sqlite3.OperationalError:
++        return None
++    return str(row[0]) if row and row[0] else None
++
++
++def probe_here(conn: sqlite3.Connection, probe_host: Optional[str]) -> bool:
++    """Whether this gateway registers a park's probe (False only when ``probe_host`` names another gateway)."""
++    if not probe_host:
++        return True
++    own = own_gateway(conn)
++    return not own or own == probe_host
++
++
++def foreign_ids(conn: sqlite3.Connection, own: Optional[str] = None) -> set[str]:
++    """Ids of cards in this live file that another gateway created (worker-node copies)."""
++    own = own or own_gateway(conn)
++    if not own:
++        return set()
++    try:
++        rows = conn.execute("SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?", (own,))
++        return {r[0] for r in rows.fetchall()}
++    except sqlite3.OperationalError:
++        return set()
++
++
++def foreign_copy(conn: sqlite3.Connection, task_id: str) -> bool:
++    own = own_gateway(conn)
++    if not own:
++        return False
++    try:
++        row = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    except sqlite3.OperationalError:
++        return False
++    return bool(row and row[0] and row[0] != own)
++
++
++def _note_alive(conn: sqlite3.Connection, task_id: str, cmd: str, now: int) -> None:
++    """On a worker node's copy, say (at most every ``ALIVE_EVERY``) that the relayed probe still runs, so the
++    home board can tell a live remote probe from a lost one. In the caller's txn."""
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli import kanban_db as kb
++
++    if not foreign_copy(conn, task_id):
++        return
++    kinds = (ALIVE_EVENT, *kc.SCHEDULED_ENTRY_EVENTS)
++    marks = ",".join("?" for _ in kinds)
++    last = conn.execute(f"SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind IN ({marks})",
++                        (task_id, *kinds)).fetchone()[0] or 0
++    if now - int(last) >= ALIVE_EVERY:
++        kb._append_event(conn, task_id, ALIVE_EVENT, {"wake_check": cmd, "host": own_gateway(conn)})
++
++
++def _lost_wake(conn: sqlite3.Connection, task_id: str, payload: dict, note: str) -> Optional[str]:
++    from hermes_cli import kanban_db as kb
++
++    woke = _wake(conn, task_id, LOST_EVENT, {**payload, "note": note})
++    if woke:
++        kb.add_comment(conn, task_id, "kanban-dispatcher", note)
++    return woke
++
++
++def restore_missing_checks(conn: sqlite3.Connection, *, now: Optional[int] = None) -> dict:
++    """Lint every ``scheduled`` card whose latest park carries a wake_check but has no probe on this board.
++
++    * The park ran here (``probe_host`` is this gateway, or unset on a card this gateway owns): re-register the
++      probe once (``RESTORED_EVENT``); a second loss of the same park wakes the card with a comment.
++    * The park was relayed from another gateway (a worker node ran the card): that host runs the probe and says
++      so with ``ALIVE_EVENT``; when it has been silent past ``ALIVE_EVERY`` + two intervals, wake the card with a
++      comment instead of letting it sleep until its clock.
++    A worker node's copy of another gateway's card is left to its home board. Returns ids restored and woken."""
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    out: dict = {"restored": [], "woken": []}
++    now = int(time.time()) if now is None else int(now)
++    try:
++        missing = [r[0] for r in conn.execute(
++            "SELECT t.id FROM tasks t LEFT JOIN task_wake_checks w ON w.task_id = t.id "
++            "WHERE t.status = 'scheduled' AND w.task_id IS NULL").fetchall()]
++    except sqlite3.OperationalError:
++        return out
++    if not missing:
++        return out
++    db_key = str(kbc._main_db_file(conn) or id(conn))
++    own = own_gateway(conn)
++    foreign = foreign_ids(conn, own)
++    marks = ",".join("?" for _ in kc.SCHEDULED_ENTRY_EVENTS)
++    for tid in missing:
++        park = conn.execute(
++            f"SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++            "ORDER BY id DESC LIMIT 1", (tid, *kc.SCHEDULED_ENTRY_EVENTS)).fetchone()
++        if park is None:
++            continue
++        park_id, payload, parked_at = int(park[0]), kb._json_dict(park[1]), int(park[2] or 0)
++        key = (db_key, tid)
++        if _RESTORE_SEEN.get(key) == park_id:
++            continue
++        cmd = payload.get("wake_check")
++        if not cmd or not isinstance(payload.get("wake_at"), (int, float)):
++            _RESTORE_SEEN[key] = park_id  # a clock-only park: nothing to restore until it parks again
++            continue
++        if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN ('claimed', 'spawned') "
++                        "LIMIT 1", (tid, park_id)).fetchone():
++            continue  # a later run's park has not reached this board yet
++        every = normalize_every(payload.get("check_every"))
++        host = payload.get("probe_host")
++        copy = tid in foreign
++        base = {"wake_check": cmd, "check_every": every, "probe_host": host}
++        if host and own and host != own:
++            if copy:
++                continue  # another gateway's probe on a card another gateway owns
++            last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
++                                (tid, park_id, ALIVE_EVENT)).fetchone()[0]
++            silent = now - max(parked_at, int(last or 0))
++            if silent <= ALIVE_EVERY + 2 * every + SILENT_GRACE:
++                continue
++            with kb.write_txn(conn):
++                if _lost_wake(conn, tid, {**base, "reason": "remote_probe_silent", "silent_seconds": silent},
++                              f"Woken: this card's wake_check runs on {host}, the gateway that parked it, and "
++                              f"{host} has not reported that probe for {silent // 60} min, so nothing is watching "
++                              f"the condition. Probe: `{cmd}`. Check the condition yourself, then park again."):
++                    out["woken"].append(tid)
++            continue
++        if copy and not host:
++            continue  # a legacy park on a worker node's copy: its home board restores it
++        with kb.write_txn(conn):
++            st = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
++            if st is None or st[0] != "scheduled" or get_state(conn, tid) is not None:
++                continue
++            restored = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
++                                    (tid, park_id, RESTORED_EVENT)).fetchone()[0]
++            if not restored:
++                set_check(conn, tid, cmd, every, now=now)
++                kb._append_event(conn, tid, RESTORED_EVENT, {**base, "park_event_id": park_id})
++                out["restored"].append(tid)
++            elif _lost_wake(conn, tid, {**base, "reason": "lost_again"},
++                            f"Woken: this card's wake_check probe went missing twice while it was parked, so "
++                            f"nothing was watching the condition. Probe: `{cmd}`. Check the condition yourself, "
++                            "then park again."):
++                out["woken"].append(tid)
++    return out
++
++
+ # --- state table --------------------------------------------------------------------------
+ 
+ def set_check(conn: sqlite3.Connection, task_id: str, cmd: Optional[str], every: Optional[int],
+@@ -459,6 +631,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+                 "next_at = ? WHERE task_id = ?", (now, tail, now + int(state["every"]), task_id))
++            _note_alive(conn, task_id, cmd, now)
+             return None
+         age = stale_age(rc, out)
+         if age is not None:
+@@ -476,6 +649,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, "
+                 "next_at = ? WHERE task_id = ?", (now, rc, tail, now + int(state["every"]), task_id))
++            _note_alive(conn, task_id, cmd, now)
+             return None
+         fails = int(state["fails"] or 0) + 1
+         if rc == 1:  # exit 1 with error output: a crashed probe posing as "not yet"
+@@ -487,6 +661,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+         conn.execute(
+             "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, fails = ?, "
+             "next_at = ? WHERE task_id = ?", (now, rc_col, tail, fails, now + int(state["every"]), task_id))
++        _note_alive(conn, task_id, cmd, now)
+         return None
+ 
+ 
+@@ -534,6 +709,7 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                 for row in stale:
+                     conn.execute("DELETE FROM task_wake_checks WHERE task_id = ? AND task_id NOT IN "
+                                  "(SELECT id FROM tasks WHERE status = 'scheduled')", (row[0],))
++        restore_missing_checks(conn, now=ts)  # [daveey] a park whose probe never reached this board
+         due = conn.execute(
+             "SELECT w.task_id, w.cmd, w.every, w.generation FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
+             "WHERE t.status = 'scheduled' AND w.next_at <= ? ORDER BY w.next_at", (ts,)).fetchall()
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index ce342508bfb..414e4da9863 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -248,9 +248,15 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     """Drop copied foreign cards this gateway is not running (no claim, not ``running``) and has nothing left to
+     push. Deleted with capture suppressed, so the Board never sees a delete."""
+     own = _own(conn)
++    probes = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_wake_checks'").fetchone()
++    # [daveey] A scheduled copy whose wake_check this gateway runs stays until it wakes: the probe row is
++    # machine-local, and evicting the copy let the stale sweep delete it, so the card slept until its clock
++    # (t_01a18c12ba6895b8). Its wake is a status write the Board carries to the home board.
++    keep = (" AND NOT (status = 'scheduled' AND EXISTS (SELECT 1 FROM task_wake_checks w WHERE w.task_id = tasks.id))"
++            if probes else "")
+     rows = conn.execute(
+         "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ? AND claim_lock IS NULL "
+-        "AND status != 'running'", (own,)).fetchall()
++        "AND status != 'running'" + keep, (own,)).fetchall()
+     gone: list[str] = []
+     if not rows:
+         return gone
+diff --git a/tests/hermes_cli/test_kanban_capability_relay.py b/tests/hermes_cli/test_kanban_capability_relay.py
+index f3555d33b3e..6146333693e 100644
+--- a/tests/hermes_cli/test_kanban_capability_relay.py
++++ b/tests/hermes_cli/test_kanban_capability_relay.py
+@@ -153,6 +153,12 @@ def test_worker_node_needs_relays_home_and_opens_the_owner_card_on_the_holder(pa
+     assert kb.get_task(worker.conn, tid) is None  # evicted: the home now runs the wake probe
+     home.enter()
+     assert kb.get_task(home.conn, tid).status == "scheduled"
++    # [daveey] The park names the home as its probe host; the home's sweep registers the probe from the event.
++    from hermes_cli import kanban_wake_check as kwc
++    parks = [e for e in kb.list_events(home.conn, tid) if e.kind == "scheduled"]
++    assert parks[-1].payload["probe_host"] == HOME
++    assert kwc.restore_missing_checks(home.conn)["restored"] == [tid]
++    assert kwc.get_state(home.conn, tid)["cmd"] == f"hermes kanban wait-check capability-owner {rid}"
+ 
+     # The home's wake probe routes it. The home holds host:macbook itself: the owner card is a local card
+     # pinned to this machine, keyed by the same request id. No hermes-hub request is needed for that.
+diff --git a/tests/hermes_cli/test_kanban_wake_check_home.py b/tests/hermes_cli/test_kanban_wake_check_home.py
+new file mode 100644
+index 00000000000..a62fa1820a0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_check_home.py
+@@ -0,0 +1,209 @@
++"""A park's wake_check keeps exactly one live probe, on the gateway that parked the card, and its wake reaches the
++card's home board. [daveey]
++
++t_01a18c12ba6895b8 (created on the MacBook, ``runs_on=[machine:hub]``) was picked up and run by the hub. Its worker
++parked it with ``wake_check: hermes kanban wait-check task t_01a18c31ab3e58f7 --gateway macbook``. The probe row
++(``task_wake_checks``, machine-local, never synced) was written on the hub beside the hub's copy. The hub evicted
++the copy on its next tick (``kanban_worker_node.evict``) and ``run_due_wake_checks``' stale sweep deleted the
++orphaned row. The MacBook got the ``scheduled`` status and event through the Board feed but no probe, so the card
++slept until an orchestrator woke it 43 min after its producer finished (7 such cards on the MacBook, 2026-10-30).
++
++The probe stays on the parking host: only it is sure to be able to run it (its dry run passed there; a
++``wait-check capability-owner`` request id lives only in that host's request store, t_01a18a8d2bd8cf97). The worker
++keeps its scheduled copy while the probe is live, and the wake is a status write the Board carries home. The home
++board lints every scheduled card whose park carries a wake_check: it re-registers a probe it lost once, and wakes the
++card with a comment on a second loss or when a relayed park's probe host has gone silent.
++"""
++from __future__ import annotations
++
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_timed_park as ktp
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, WORKER, Gateway
++
++BUILD = {"kind": "external", "ref": "release build 559", "why": "the build job writes the flag when it lands"}
++ALIVE, LOST, RESTORED = "wake_check_alive", "wake_check_lost", "wake_check_restored"
++
++
++def _probe(flag: Path) -> str:
++    return f"test -f {flag} && cat {flag} || exit 1"
++
++
++def _events(conn, tid, kind):
++    return [e for e in kb.list_events(conn, tid) if e.kind == kind]
++
++
++def _status(conn, tid):
++    task = kb.get_task(conn, tid)
++    return task.status if task else None
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch):
++    svc = FakeService(lease_runs=True)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    sync.consume_dispatcher_wake()
++    home = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)       # creates the card (the MacBook's role)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")  # picks it up and runs it (the hub's role)
++    getattr(kwc, "_RESTORE_SEEN", {}).clear()
++    yield home, worker
++    kwc._shutdown_for_tests()
++    for g in (home, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _relayed_park(home, worker, flag):
++    """Home creates a card, the worker runs it, parks it on a wake_check and pushes the park."""
++    home.enter()
++    tid = kb.create_task(home.conn, title="runs on the worker", assignee="default", runs_on=["linux"])
++    home.round()
++    worker.round()
++    worker.tick()
++    assert _status(worker.conn, tid) == "running"
++    run_id = kb.get_task(worker.conn, tid).current_run_id
++    with kb.write_txn(worker.conn):
++        assert ktp.park(worker.conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for build 559",
++                        requested_kind="time", source_status="running", expected_run_id=run_id,
++                        wake_check=_probe(flag), check_every=300, awaiting=BUILD)
++    worker.round()   # push the park
++    return tid
++
++
++def test_a_relayed_park_keeps_one_live_probe_and_its_wake_reaches_the_home_board(gws, tmp_path):
++    home, worker = gws
++    flag = tmp_path / "flag"
++    tid = _relayed_park(home, worker, flag)
++    worker.tick()    # pickup evicts finished copies; the wake-check sweep runs
++    worker.tick()
++    assert _status(worker.conn, tid) == "scheduled", "the worker evicted its copy, and with it the only probe"
++    state = kwc.get_state(worker.conn, tid)
++    assert state is not None and state["cmd"] == _probe(flag) and state["every"] == 300
++
++    home.round()     # the home board receives the scheduled status and the park event
++    assert _status(home.conn, tid) == "scheduled"
++    park = _events(home.conn, tid, "scheduled")[-1].payload
++    assert park["wake_check"] == _probe(flag) and park["probe_host"] == WORKER
++    home.enter()
++    kwc.run_due_wake_checks(home.conn, wait=True)
++    assert kwc.get_state(home.conn, tid) is None          # exactly one probe: the worker's
++    home.tick()
++    assert _status(home.conn, tid) == "scheduled" and _events(home.conn, tid, LOST) == []
++
++    # The producer finishes: the worker's next due probe wakes the card, and the home board sees it.
++    deadline = time.monotonic() + 30
++    while kwc.in_flight() and time.monotonic() < deadline:   # let the ticks' own probe runs land first
++        time.sleep(0.05)
++    flag.write_text("build 559 seen\n")
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + 301, wait=True)
++    assert _status(worker.conn, tid) == "ready"
++    worker.round()
++    home.round()
++    assert _status(home.conn, tid) == "ready"
++    assert "build 559 seen" in _events(home.conn, tid, "condition_met")[-1].payload["output"]
++
++
++def test_a_relayed_probe_reports_alive_to_the_home_board(gws, tmp_path):
++    home, worker = gws
++    tid = _relayed_park(home, worker, tmp_path / "flag")
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, wait=True)                 # just parked: no alive note yet
++    assert _events(worker.conn, tid, ALIVE) == []
++    later = int(time.time()) + kwc.ALIVE_EVERY + 1
++    kwc.run_due_wake_checks(worker.conn, now=later, wait=True)
++    assert _events(worker.conn, tid, ALIVE)[-1].payload["host"] == WORKER
++    worker.round()
++    home.round()
++    assert _events(home.conn, tid, ALIVE)
++
++
++def test_the_home_board_wakes_a_relayed_park_whose_probe_host_went_silent(gws, tmp_path):
++    home, worker = gws
++    flag = tmp_path / "flag"
++    tid = _relayed_park(home, worker, flag)   # the worker never ticks again (its probe never reports)
++    home.round()
++    home.enter()
++    now = int(time.time())
++    assert kwc.restore_missing_checks(home.conn, now=now + kwc.ALIVE_EVERY) == {"restored": [], "woken": []}
++    silent = now + kwc.ALIVE_EVERY + 2 * 300 + kwc.SILENT_GRACE + 5
++    assert kwc.restore_missing_checks(home.conn, now=silent) == {"restored": [], "woken": [tid]}
++    assert _status(home.conn, tid) == "ready"
++    lost = _events(home.conn, tid, LOST)[-1].payload
++    assert lost["reason"] == "remote_probe_silent" and lost["probe_host"] == WORKER
++    assert any(WORKER in c.body and _probe(flag) in c.body for c in kb.list_comments(home.conn, tid))
++
++
++# --- the lost-probe sweep on one board --------------------------------------------------------------------------
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    getattr(kwc, "_RESTORE_SEEN", {}).clear()
++    with kbc.connect_closing() as conn:
++        yield conn
++    kwc._shutdown_for_tests()
++
++
++def _parked(conn, *, wake_check):
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    with kb.write_txn(conn):
++        assert ktp.park(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait", requested_kind="time",
++                        source_status="running", wake_check=wake_check, check_every=300,
++                        awaiting=BUILD if wake_check else {"kind": "clock", "why": "a soak window"},
++                        clock_only=not wake_check)
++    return tid
++
++
++def _lose(conn, tid):
++    with kb.write_txn(conn):
++        conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (tid,))
++
++
++def test_a_lost_probe_is_restored_once_then_a_second_loss_wakes_the_card(board, tmp_path):
++    flag = tmp_path / "flag"
++    tid = _parked(board, wake_check=_probe(flag))
++    clock = _parked(board, wake_check=None)
++    _lose(board, tid)
++    assert kwc.restore_missing_checks(board) == {"restored": [tid], "woken": []}
++    state = kwc.get_state(board, tid)
++    assert state["cmd"] == _probe(flag) and state["every"] == 300
++    assert kwc.get_state(board, clock) is None                                  # clock-only: not a lost probe
++    assert kwc.restore_missing_checks(board) == {"restored": [], "woken": []}   # idempotent
++
++    _lose(board, tid)
++    assert kwc.restore_missing_checks(board) == {"restored": [], "woken": [tid]}
++    assert _status(board, tid) == "ready"
++    lost = _events(board, tid, LOST)[-1].payload
++    assert lost["wake_check"] == _probe(flag) and lost["reason"] == "lost_again"
++    assert any(_probe(flag) in c.body for c in kb.list_comments(board, tid))
++    assert _status(board, clock) == "scheduled"
++
++
++def test_the_dispatcher_tick_restores_a_lost_probe_and_runs_it(board, tmp_path):
++    tid = _parked(board, wake_check=_probe(tmp_path / "flag"))
++    _lose(board, tid)
++    kwc.run_due_wake_checks(board, wait=True)
++    state = kwc.get_state(board, tid)
++    assert state is not None and state["last_rc"] == 1
++    assert _events(board, tid, RESTORED)
+-- 
+2.55.0
+

@@ -25,52 +25,19 @@ remote open waited 2.6-8 s on SSH before anything fresh. Now:
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- apps/desktop/electron/main.ts                 |  27 ++
- apps/desktop/electron/preload.ts              |  12 +
- .../desktop/electron/transcript-cache-host.ts | 201 ++++++++
- .../desktop/electron/transcript-cache.test.ts | 175 +++++++
- apps/desktop/electron/transcript-cache.ts     | 341 +++++++++++++
- .../electron/transcript-prefetch.test.ts      | 182 +++++++
- apps/desktop/electron/transcript-prefetch.ts  | 275 +++++++++++
- .../offline-fallback.integration.test.tsx     |  22 +-
- .../app/chat/sidebar/use-offline-fallback.ts  |  21 +-
- .../src/app/chat/transcript-backfill.ts       |   4 +
- .../hooks/use-prompt-actions/index.test.tsx   |  62 +++
- .../hooks/use-prompt-actions/submit.ts        |  13 +
- .../hooks/use-session-actions.test.tsx        | 223 ++++++++-
- .../hooks/use-session-actions/index.ts        | 131 +++--
- .../provisional-transcript.ts                 |  26 +
- apps/desktop/src/global.d.ts                  |  22 +
- apps/desktop/src/lib/open-timing.test.ts      |  70 +++
- apps/desktop/src/lib/open-timing.ts           | 140 ++++++
- apps/desktop/src/store/asleep-session.ts      |  66 +++
- apps/desktop/src/store/gateway-switch.ts      |  14 +-
- .../session-states-profile-rename.test.ts     |   4 +-
- .../src/store/transcript-tail-cache.test.ts   | 241 +++-------
- .../src/store/transcript-tail-cache.ts        | 455 ++++++------------
- 23 files changed, 2192 insertions(+), 535 deletions(-)
- create mode 100644 apps/desktop/electron/transcript-cache-host.ts
- create mode 100644 apps/desktop/electron/transcript-cache.test.ts
- create mode 100644 apps/desktop/electron/transcript-cache.ts
- create mode 100644 apps/desktop/electron/transcript-prefetch.test.ts
- create mode 100644 apps/desktop/electron/transcript-prefetch.ts
- create mode 100644 apps/desktop/src/lib/open-timing.test.ts
- create mode 100644 apps/desktop/src/lib/open-timing.ts
- create mode 100644 apps/desktop/src/store/asleep-session.ts
-
 diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
-index 3927215135..19901d4fd4 100644
+index 25825fe9ed426f8cc40c367abb62041c807a2195..fc4107ab9cedecabdcf97b272a9f67ace0933a3a 100644
 --- a/apps/desktop/electron/main.ts
 +++ b/apps/desktop/electron/main.ts
-@@ -595,6 +595,7 @@ import { createStreamThrottle } from './stream-throttle'
+@@ -575,6 +575,7 @@ import { createStreamThrottle } from './stream-throttle'
  import { installSystemCaTrust } from './system-ca'
  import { registerTerminalIpc } from './terminal-ipc'
  import { nativeOverlayWidth as computeNativeOverlayWidth, titleBarOverlayOptions } from './titlebar-overlay-width'
 +import { installTranscriptCache } from './transcript-cache-host'
  import {
-   backgroundMaterialFor,
+   applyWindowsBackdrop,
    defaultTranslucencyState,
-@@ -1955,6 +1956,7 @@ function registerMediaProtocol(): void {
+@@ -1880,6 +1881,7 @@ function registerMediaProtocol(): void {
  }
  
  let mainWindow = null
@@ -78,15 +45,15 @@ index 3927215135..19901d4fd4 100644
  const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
  
  const localBackendLifecycle = createLocalBackendLifecycle<ChildProcess>({
-@@ -18278,6 +18280,7 @@ app.on('before-quit', () => {
- // hold the event loop open or leak FDs past app teardown.
+@@ -16699,6 +16701,7 @@ app.on('before-quit', () => {
  app.on('will-quit', () => {
+   closeGatewayTicketBridges()
    killTimedGitChildren()
 +  transcriptCacheHost?.stop()
    sshIsolatedKeepalives.stopAll()
    destroyKeepaliveAgents()
    nativeNotifications.dispose()
-@@ -19483,6 +19486,30 @@ app.whenReady().then(() => {
+@@ -17881,6 +17884,30 @@ app.whenReady().then(() => {
    void minimizeToTray.start()
    mainProcessLagWatchdog.start()
    f12Blocked = readPersistedDisableF12()
@@ -117,32 +84,9 @@ index 3927215135..19901d4fd4 100644
    // Seed this before the first window exists: a picker can open before
    // startHermes() finishes resolving the configured backend.
    const primaryProfile = primaryProfileKey()
-diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
-index 40077e84c0..a7482dccf0 100644
---- a/apps/desktop/electron/preload.ts
-+++ b/apps/desktop/electron/preload.ts
-@@ -44,6 +44,18 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
-   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
-   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
-   touchBackend: (profile, options) => ipcRenderer.invoke('hermes:backend:touch', profile, options),
-+  // [daveey] Local transcript cache (instant session loads). `read` is synchronous so a
-+  // click paints the cached transcript in the same tick; writes are fire-and-forget.
-+  transcriptCache: {
-+    read: key => ipcRenderer.sendSync('hermes:transcript-cache:read', key),
-+    put: (key, messages, kind) => ipcRenderer.send('hermes:transcript-cache:put', { key, messages, kind }),
-+    drop: key => ipcRenderer.send('hermes:transcript-cache:drop', { key }),
-+    dropEverywhere: sessionId => ipcRenderer.send('hermes:transcript-cache:drop', { everywhere: true, sessionId }),
-+    migrateProfile: (connectionId, from, to) =>
-+      ipcRenderer.send('hermes:transcript-cache:migrate-profile', { connectionId, from, to }),
-+    clear: () => ipcRenderer.send('hermes:transcript-cache:clear'),
-+    stats: () => ipcRenderer.invoke('hermes:transcript-cache:stats')
-+  },
-   getPoolLimits: () => ipcRenderer.invoke('hermes:pool-limits:get'),
-   setPoolLimits: limits => ipcRenderer.invoke('hermes:pool-limits:set', limits),
-   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
 diff --git a/apps/desktop/electron/transcript-cache-host.ts b/apps/desktop/electron/transcript-cache-host.ts
 new file mode 100644
-index 0000000000..d820ba2d8b
+index 0000000000000000000000000000000000000000..d820ba2d8bfbe77f0184a2603f6675af1b8d129a
 --- /dev/null
 +++ b/apps/desktop/electron/transcript-cache-host.ts
 @@ -0,0 +1,201 @@
@@ -349,7 +293,7 @@ index 0000000000..d820ba2d8b
 +}
 diff --git a/apps/desktop/electron/transcript-cache.test.ts b/apps/desktop/electron/transcript-cache.test.ts
 new file mode 100644
-index 0000000000..a9db6649f4
+index 0000000000000000000000000000000000000000..a9db6649f45c92ce2cc4b674397ae9c7e3059e31
 --- /dev/null
 +++ b/apps/desktop/electron/transcript-cache.test.ts
 @@ -0,0 +1,175 @@
@@ -530,7 +474,7 @@ index 0000000000..a9db6649f4
 +})
 diff --git a/apps/desktop/electron/transcript-cache.ts b/apps/desktop/electron/transcript-cache.ts
 new file mode 100644
-index 0000000000..2f6885f9f9
+index 0000000000000000000000000000000000000000..2f6885f9f9a98f2fa29747ef45892b8c36f2a1cd
 --- /dev/null
 +++ b/apps/desktop/electron/transcript-cache.ts
 @@ -0,0 +1,341 @@
@@ -877,7 +821,7 @@ index 0000000000..2f6885f9f9
 +}
 diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
 new file mode 100644
-index 0000000000..c60d26ba2f
+index 0000000000000000000000000000000000000000..c60d26ba2f9ac2889034c50de4540a53601e68f8
 --- /dev/null
 +++ b/apps/desktop/electron/transcript-prefetch.test.ts
 @@ -0,0 +1,182 @@
@@ -1065,7 +1009,7 @@ index 0000000000..c60d26ba2f
 +})
 diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
 new file mode 100644
-index 0000000000..e2dbc729a8
+index 0000000000000000000000000000000000000000..e2dbc729a8e46b67b62e46a6d962ca5dc57e5624
 --- /dev/null
 +++ b/apps/desktop/electron/transcript-prefetch.ts
 @@ -0,0 +1,275 @@
@@ -1345,7 +1289,7 @@ index 0000000000..e2dbc729a8
 +  return !(status >= 400 && status < 500)
 +}
 diff --git a/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx b/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx
-index 4690cfc320..6db0007144 100644
+index 4690cfc320e1784c551e46c67cd2a25f2d0049ae..6db0007144789d5210d1eb48c360a01dddd87324 100644
 --- a/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx
 +++ b/apps/desktop/src/app/chat/sidebar/offline-fallback.integration.test.tsx
 @@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router'
@@ -1392,7 +1336,7 @@ index 4690cfc320..6db0007144 100644
      const resume = vi.fn()
      mount(resume)
 diff --git a/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts b/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
-index 503ffac8fb..80081ab664 100644
+index 503ffac8fbcd0125803627676dee59768ea3808a..80081ab664a5181b5bbcf085bdf71ca80eee0ba5 100644
 --- a/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
 +++ b/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
 @@ -1,12 +1,15 @@
@@ -1437,10 +1381,10 @@ index 503ffac8fb..80081ab664 100644
  
        resumeSession(sessionId, session)
 diff --git a/apps/desktop/src/app/chat/transcript-backfill.ts b/apps/desktop/src/app/chat/transcript-backfill.ts
-index 5bac291df5..6a94bafe26 100644
+index 6e43ae91e2844a470dc0302da195622454265263..47602dd178131b86a01fcd9ab567adcea7309fad 100644
 --- a/apps/desktop/src/app/chat/transcript-backfill.ts
 +++ b/apps/desktop/src/app/chat/transcript-backfill.ts
-@@ -24,6 +24,7 @@ import {
+@@ -29,6 +29,7 @@ import {
    type TranscriptProfileScope,
    transcriptTailState
  } from '@/store/transcript-tail'
@@ -1448,7 +1392,7 @@ index 5bac291df5..6a94bafe26 100644
  import type { SessionMessage, SessionMessagesResponse } from '@/types/hermes'
  
  /**
-@@ -592,6 +593,9 @@ export function backfillOlderTranscriptPage(request: BackfillRequest): Promise<b
+@@ -623,6 +624,9 @@ export function backfillOlderTranscriptPage(request: BackfillRequest): Promise<b
      // below prepends whatever prefix the store is missing, and the recorded
      // state marks the session fully loaded so the REST action retires.
      recordTranscriptBackfillPage(storedSessionId, page, profile)
@@ -1459,10 +1403,10 @@ index 5bac291df5..6a94bafe26 100644
      request.applyOlderPage(toChatMessages(olderRows))
  
 diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
-index 34d7b6c900..0f0c9aff09 100644
+index 6ef2f9d9a19c3e0a4818cf639120bd3d4785ff0a..17716d549e198e50b095cd35e62a836fccd0ae87 100644
 --- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
 +++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
-@@ -7,6 +7,7 @@ import { getLatestSessionMessages, getSession } from '@/hermes'
+@@ -8,6 +8,7 @@ import { getLatestSessionMessages, getSession } from '@/hermes'
  import { en } from '@/i18n/en'
  import { textPart } from '@/lib/chat-messages'
  import { createClientSessionState } from '@/lib/chat-runtime'
@@ -1470,7 +1414,7 @@ index 34d7b6c900..0f0c9aff09 100644
  import { $compactingSessions, setSessionCompacting } from '@/store/compaction'
  import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
  import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
-@@ -6396,3 +6397,64 @@ describe('usePromptActions cron run write gate (#88443)', () => {
+@@ -5900,3 +5901,64 @@ describe('usePromptActions cron run write gate (#88443)', () => {
      )
    })
  })
@@ -1536,10 +1480,10 @@ index 34d7b6c900..0f0c9aff09 100644
 +  })
 +})
 diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
-index 642cd351c9..7a68869342 100644
+index 6c0c0199ab960c86472b23ac1675ad5748b5210a..8185dd04c93d197196e3ed48696626569f08b176 100644
 --- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
 +++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
-@@ -15,6 +15,7 @@ import {
+@@ -14,6 +14,7 @@ import {
    stopVoicePlayback,
    takeVoicePlaybackInterrupted
  } from '@/lib/voice-playback'
@@ -1547,7 +1491,7 @@ index 642cd351c9..7a68869342 100644
  import {
    $composerAttachments,
    type ComposerAttachment,
-@@ -166,6 +167,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+@@ -235,6 +236,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
  
    return useCallback(
      async (rawText: string, options?: SubmitTextOptions) => {
@@ -1567,7 +1511,7 @@ index 642cd351c9..7a68869342 100644
  
        // Drop undefined/null holes a session switch or draft restore can leave in
 diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
-index e67123217f..2e993a0b13 100644
+index 809b705f91c2b5d17b8c1eea5f567fd9680c297e..9d2aa5c130cecf2cf7786bcfba7103bba362b788 100644
 --- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
 +++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
 @@ -21,7 +21,10 @@ import {
@@ -1590,7 +1534,7 @@ index e67123217f..2e993a0b13 100644
  
  import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
  import { deferred } from '../../../test/deferred'
-@@ -3835,6 +3838,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
+@@ -3956,6 +3959,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
      // not-called assertions below only see this describe's traffic.
      vi.mocked(requestGatewayForProfile).mockReset()
      vi.mocked(requestGatewayForAgent).mockReset()
@@ -1598,7 +1542,7 @@ index e67123217f..2e993a0b13 100644
    })
  
    afterEach(() => {
-@@ -3971,6 +3975,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
+@@ -4092,6 +4096,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
          resumedA.resolve({ session_id: 'rt-background-A', resumed: rowA.id, messages: [], info: {} } as never)
          await pending
          window.localStorage.clear()
@@ -1606,7 +1550,7 @@ index e67123217f..2e993a0b13 100644
        }
      }
    )
-@@ -3989,26 +3994,24 @@ describe('resumeSession warm-cache mapping integrity', () => {
+@@ -4110,26 +4115,24 @@ describe('resumeSession warm-cache mapping integrity', () => {
        const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
        const resumed = deferred<SessionResumeResult>()
  
@@ -1641,7 +1585,7 @@ index e67123217f..2e993a0b13 100644
        vi.mocked(getSession).mockReturnValue(storedLookup.promise)
        vi.mocked(ensureGatewayAgent).mockClear().mockReturnValueOnce(gatewayReady.promise)
        vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise)
-@@ -4070,6 +4073,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
+@@ -4191,6 +4194,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
          } as never)
          await pending
          window.localStorage.clear()
@@ -1649,7 +1593,7 @@ index e67123217f..2e993a0b13 100644
        }
      }
    )
-@@ -4963,10 +4967,15 @@ describe('resumeSession warm-cache mapping integrity', () => {
+@@ -5159,10 +5163,15 @@ describe('resumeSession warm-cache mapping integrity', () => {
        } else {
          expect(JSON.stringify(stateMap.current.get('rt-A')?.messages)).toContain('durable background A')
          expect(stateMap.current.get('rt-A')?.transcriptProvenance?.source).toBe('persisted-display')
@@ -1666,7 +1610,7 @@ index e67123217f..2e993a0b13 100644
        setMessagingSessions([])
      }
    )
-@@ -5840,7 +5849,14 @@ describe('resumeSession warm-cache mapping integrity', () => {
+@@ -6036,7 +6045,14 @@ describe('resumeSession warm-cache mapping integrity', () => {
      const publications: Array<{ older: boolean; latest: boolean }> = []
  
      setSessions([storedSession({ message_count: 4, profile: 'default' })])
@@ -1682,7 +1626,7 @@ index e67123217f..2e993a0b13 100644
  
      const stopListening = $messages.listen(messages => {
        const snapshot = JSON.stringify(messages)
-@@ -5914,6 +5930,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
+@@ -6110,6 +6126,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
  
      stopListening()
      window.localStorage.clear()
@@ -1690,7 +1634,7 @@ index e67123217f..2e993a0b13 100644
      expect(publications.some(snapshot => snapshot.latest && snapshot.older)).toBe(true)
      expect(
        publications.filter(snapshot => snapshot.latest && !snapshot.older),
-@@ -7351,3 +7368,183 @@ describe('branchStoredSession failure retry', () => {
+@@ -7301,3 +7318,183 @@ describe('branchStoredSession failure retry', () => {
      })
    })
  })
@@ -1874,238 +1818,8 @@ index e67123217f..2e993a0b13 100644
 +    expect(asleepOpenFor('stored-uncached')).toBeNull()
 +  })
 +})
-diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
-index f674477c11..e2e9f1e10f 100644
---- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
-+++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
-@@ -24,15 +24,16 @@ import {
-   preserveLocalAssistantErrors,
-   restorePendingClarifyToolCall,
-   settlePendingClarifyToolCall,
--  stripPendingClarifyProjectionForCache,
-   textPart,
-   toChatMessages
- } from '@/lib/chat-messages'
- import { markReasoningEffortPending } from '@/lib/chat-runtime'
- import { isMissingRpcMethod } from '@/lib/gateway-rpc'
- import { purgeInFlightTurnJournals, recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
-+import { markOpenPaint, markOpenReconciled, markOpenStage, markOpenStart } from '@/lib/open-timing'
- import { latestSessionTodoSnapshot } from '@/lib/todos'
- import { setSessionYolo } from '@/lib/yolo-session'
-+import { asleepOpenFor, clearAsleepOpen } from '@/store/asleep-session'
- import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
- import {
-   announceGoneSessionDraft,
-@@ -147,7 +148,12 @@ import { forgetSessionUnread } from '@/store/session-unread'
- import { $archivedSessions } from '@/store/sidebar-archive'
- import { clearSessionSubagents } from '@/store/subagents'
- import { clearSessionTodos, restoreSessionTodosFromSnapshot } from '@/store/todos'
--import { dropTranscriptTail, dropTranscriptTailEverywhere, saveTranscriptTail } from '@/store/transcript-tail-cache'
-+import {
-+  dropTranscriptTail,
-+  dropTranscriptTailEverywhere,
-+  loadTranscriptTail,
-+  saveTranscriptTail
-+} from '@/store/transcript-tail-cache'
- import { isWatchWindow } from '@/store/windows'
- import type {
-   SessionCreateResponse,
-@@ -1234,6 +1240,8 @@ export function useSessionActions({
-         return
-       }
- 
-+      markOpenStart(storedSessionId, capturedOwner?.connectionId)
-+
-       const requestId = resumeRequestRef.current + 1
-       const routeToken = getRouteToken()
-       resumeRequestRef.current = requestId
-@@ -1403,11 +1411,73 @@ export function useSessionActions({
- 
-         if (hasPersistedDisplayTranscriptProvenance(warmAtEntry.state, entryProvenance)) {
-           setMessages(warmAtEntry.state.messages)
-+          markOpenPaint(storedSessionId, 'warm', warmAtEntry.state.messages.length)
-         }
-       }
- 
-+      // [daveey] The user opened this chat from an asleep gateway's cached row:
-+      // show every row cached on this Mac, read-only, and never dial the
-+      // gateway (that wait is the 45 s readiness timeout). No runtime binds, so
-+      // a send is refused with the asleep notice (use-prompt-actions/submit).
-+      const asleep = asleepOpenFor(storedSessionId)
-+
-+      if (asleep) {
-+        const cachedTranscript = loadTranscriptTail(
-+          storedSessionId,
-+          { connectionId: asleep.connectionId, profile: asleep.profile },
-+          { all: true }
-+        )
-+
-+        if (cachedTranscript) {
-+          setMessages(cachedTranscript)
-+          markOpenPaint(storedSessionId, 'cache', cachedTranscript.length)
-+          markOpenReconciled(storedSessionId, 'asleep')
-+
-+          return
-+        }
-+
-+        clearAsleepOpen()
-+      }
-+
-+      // [daveey] A click hands over the exact owner (connection + profile), so the
-+      // REST page need not wait out the owner lookup and gateway switch below
-+      // (seconds on a busy or remote backend). Start it now and show it as soon
-+      // as it lands, display-only like the cached paint; the cold path reuses
-+      // this same request when its resolved scope matches, so it reads once.
-+      const earlyRestScope =
-+        capturedOwner && !resumedSameSelectedSession && !warmAtEntry && !isWatchWindow()
-+          ? transcriptRestScope(ownerRoute, listedStored, ambientConnectionId)
-+          : undefined
-+
-+      const earlyRest = earlyRestScope ? getLatestSessionMessages(storedSessionId, earlyRestScope) : null
-+
-+      if (earlyRest) {
-+        earlyRest.then(
-+          page => {
-+            if (!isCurrentResume()) {
-+              return
-+            }
-+
-+            markOpenStage(storedSessionId, 'rest')
-+
-+            if (!page.session_id || page.session_id === storedSessionId) {
-+              saveTranscriptTail(storedSessionId, page.messages, earlyRestScope)
-+            }
-+
-+            const shown = provisional.replace(toChatMessages(page.messages))
-+
-+            if (shown.shown) {
-+              markOpenPaint(storedSessionId, 'rest', $messages.get().length)
-+              markOpenReconciled(storedSessionId, 'rest', shown.changed)
-+            }
-+          },
-+          () => undefined
-+        )
-+      }
-+
-       const storedForProfile = await resolveStoredSession(storedSessionId, ownerRoute)
-       const sessionProfile = storedForProfile?.profile
-+      markOpenStage(storedSessionId, 'owner')
- 
-       if (!isCurrentResume()) {
-         return
-@@ -2028,19 +2098,11 @@ export function useSessionActions({
-               }
- 
-               hydration.release()
--              // Cache backend transcript truth only. The pending/running bit and
--              // any synthetic clarify row are a live resume projection and must
--              // not survive after the server-side request expires.
--              saveTranscriptTail(
--                storedSessionId,
--                stripPendingClarifyProjectionForCache(
--                  activatedMessages,
--                  pendingClarify?.requestId ??
--                    pendingClarifyState.cleared?.requestId ??
--                    $clarifyRequests.get()[cachedRuntimeId]?.requestId
--                ),
--                sessionRestScope
--              )
-+              // The durable transcript cache holds backend rows only (REST
-+              // reads and the prefetcher write it); a warm runtime projection
-+              // is not one, so nothing is cached here.
-+              markOpenPaint(storedSessionId, 'warm', activatedMessages.length)
-+              markOpenReconciled(storedSessionId, 'warm')
- 
-               return
-             }
-@@ -2151,7 +2213,13 @@ export function useSessionActions({
-         // max(prefetch, resume) instead of their sum. The prefetch paints the
-         // transcript as soon as it lands; the RPC binds the runtime id.
-         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
--        const prefetchPromise = watchWindow ? null : getLatestSessionMessages(storedSessionId, sessionRestScope)
-+        markOpenStage(storedSessionId, 'gateway')
-+
-+        const prefetchPromise = watchWindow
-+          ? null
-+          : earlyRest && JSON.stringify(earlyRestScope) === JSON.stringify(sessionRestScope)
-+            ? earlyRest
-+            : getLatestSessionMessages(storedSessionId, sessionRestScope)
- 
-         let resumeRuntimeBaselineMessages: ChatMessage[] = []
-         const resumeStartedAt = Date.now() / 1000
-@@ -2188,6 +2256,7 @@ export function useSessionActions({
-         try {
-           if (prefetchPromise) {
-             prefetchedResult = await prefetchPromise
-+            markOpenStage(storedSessionId, 'rest')
-           }
-         } catch {
-           // Non-fatal: gateway resume below can still hydrate the session.
-@@ -2210,7 +2279,7 @@ export function useSessionActions({
-           displayRead.owns() &&
-           (!prefetchedResult.session_id || prefetchedResult.session_id === stored.id)
-         ) {
--          saveTranscriptTail(storedSessionId, toChatMessages(prefetchedResult.messages), sessionRestScope)
-+          saveTranscriptTail(storedSessionId, prefetchedResult.messages, sessionRestScope)
-         }
- 
-         // Paint the persisted transcript as soon as REST returns instead of
-@@ -2243,8 +2312,15 @@ export function useSessionActions({
-           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
- 
-           // The overlap reads await; skip painting if this resume went stale.
--          if (isCurrentResume() && !chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
--            setMessages(localSnapshot)
-+          if (isCurrentResume()) {
-+            const changed = !chatMessageArraysEquivalent($messages.get(), localSnapshot)
-+
-+            if (changed) {
-+              setMessages(localSnapshot)
-+            }
-+
-+            markOpenPaint(storedSessionId, 'rest', localSnapshot.length)
-+            markOpenReconciled(storedSessionId, 'rest', cachedTailPaint === null ? undefined : changed)
-           }
-         }
- 
-@@ -2254,6 +2330,9 @@ export function useSessionActions({
-           return
-         }
- 
-+        // No REST page (watch window, failed read): the runtime resume is the reconcile.
-+        markOpenReconciled(storedSessionId, 'rest')
-+
-         const currentMessages = viewMessagesForReconcile()
- 
-         // Keep the local snapshot when resume would only reshuffle runtime
-@@ -2517,23 +2596,13 @@ export function useSessionActions({
-           setMessages(visibleMessagesForView)
-         }
- 
--        // Refresh the durable tail cache with backend transcript truth only;
--        // the live pending clarify projection expires with the server request.
--        saveTranscriptTail(
--          storedSessionId,
--          stripPendingClarifyProjectionForCache(
--            messagesForView,
--            pendingClarify?.requestId ??
--              pendingClarifyState.cleared?.requestId ??
--              $clarifyRequests.get()[resumed.session_id]?.requestId
--          ),
--          sessionRestScope
--        )
-       } catch (err) {
-         if (!isCurrentResume()) {
-           return
-         }
- 
-+        markOpenReconciled(storedSessionId, 'failed')
-+
-         // 4007 from the gateway this resume was dispatched on: that gateway
-         // never minted the id, which proves the ROUTE wrong, not the session
-         // gone. If another connection owns it (the unified list, a hint, or a
 diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/provisional-transcript.ts b/apps/desktop/src/app/session/hooks/use-session-actions/provisional-transcript.ts
-index 33b5561016..76b9f79730 100644
+index 33b55610166d872da8bcbe728ec577c67b7c73aa..76b9f79730a8796611c5dc0614be633be59d2e53 100644
 --- a/apps/desktop/src/app/session/hooks/use-session-actions/provisional-transcript.ts
 +++ b/apps/desktop/src/app/session/hooks/use-session-actions/provisional-transcript.ts
 @@ -1,9 +1,12 @@
@@ -2152,49 +1866,9 @@ index 33b5561016..76b9f79730 100644
      }
    }
  }
-diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
-index 3a1e438214..0f249eb483 100644
---- a/apps/desktop/src/global.d.ts
-+++ b/apps/desktop/src/global.d.ts
-@@ -73,6 +73,22 @@ declare global {
-       // a prompt turn leases the backend (early skip for cooperative
-       // retirement; the backend probe is the proof).
-       touchBackend: (profile?: string | null, options?: { activeTurn?: boolean }) => Promise<{ ok: boolean }>
-+      // [daveey] Local transcript cache (Electron main, SQLite). Raw /messages rows keyed by
-+      // (connection, profile, stored session id); '' connection means the registry primary.
-+      transcriptCache?: {
-+        read: (key: TranscriptCacheBridgeKey) => null | {
-+          activity: null | number
-+          messageCount: null | number
-+          messages: unknown[]
-+          savedAt: number
-+        }
-+        put: (key: TranscriptCacheBridgeKey, messages: unknown[], kind: 'latest' | 'older') => void
-+        drop: (key: TranscriptCacheBridgeKey) => void
-+        dropEverywhere: (sessionId: string) => void
-+        migrateProfile: (connectionId: string, from: string, to: string) => void
-+        clear: () => void
-+        stats: () => Promise<{ bytes: number; sessions: number }>
-+      }
-       // Pool sizing (Settings → Advanced): device-local, live-applied by the
-       // main process. get resolves the limits currently in force; set applies
-       // (and persists) new ones, evicting/reaping to converge immediately.
-@@ -719,6 +735,12 @@ export interface DesktopMarketplaceThemeResult {
-   themes: DesktopMarketplaceThemeFile[]
- }
- 
-+export interface TranscriptCacheBridgeKey {
-+  connectionId: string
-+  profile: string
-+  sessionId: string
-+}
-+
- export interface HermesTerminalSession {
-   cwd: string
-   id: string
 diff --git a/apps/desktop/src/lib/open-timing.test.ts b/apps/desktop/src/lib/open-timing.test.ts
 new file mode 100644
-index 0000000000..66c24f866a
+index 0000000000000000000000000000000000000000..66c24f866a664e466f997a7eaace4e239851c73f
 --- /dev/null
 +++ b/apps/desktop/src/lib/open-timing.test.ts
 @@ -0,0 +1,70 @@
@@ -2270,7 +1944,7 @@ index 0000000000..66c24f866a
 +})
 diff --git a/apps/desktop/src/lib/open-timing.ts b/apps/desktop/src/lib/open-timing.ts
 new file mode 100644
-index 0000000000..2300f1374c
+index 0000000000000000000000000000000000000000..2300f1374c11658c73fc1536cdf9a77cef775181
 --- /dev/null
 +++ b/apps/desktop/src/lib/open-timing.ts
 @@ -0,0 +1,140 @@
@@ -2416,7 +2090,7 @@ index 0000000000..2300f1374c
 +}
 diff --git a/apps/desktop/src/store/asleep-session.ts b/apps/desktop/src/store/asleep-session.ts
 new file mode 100644
-index 0000000000..5ff0ef45ae
+index 0000000000000000000000000000000000000000..5ff0ef45ae988ae3ead63f346af09912f8b3206b
 --- /dev/null
 +++ b/apps/desktop/src/store/asleep-session.ts
 @@ -0,0 +1,66 @@
@@ -2487,18 +2161,18 @@ index 0000000000..5ff0ef45ae
 +  return `${open.gateway} is asleep, so this chat is read-only. You're reading the copy saved on this Mac (${syncedAgoLabel(open.syncedAt)}). Send again once ${open.gateway} is awake.`
 +}
 diff --git a/apps/desktop/src/store/gateway-switch.ts b/apps/desktop/src/store/gateway-switch.ts
-index c4d73d0753..e43a1c218d 100644
+index fa62a6cda719fd8c7d9054bd11da9adce00a766d..30a78cff270603274aaa8718322273ab7dce12b8 100644
 --- a/apps/desktop/src/store/gateway-switch.ts
 +++ b/apps/desktop/src/store/gateway-switch.ts
-@@ -35,7 +35,6 @@ import { resetSessionPinMirror } from '@/store/session-pin-sync'
- import { clearAllSessionStates } from '@/store/session-states'
+@@ -36,7 +36,6 @@ import { clearAllSessionStates } from '@/store/session-states'
+ import { reloadOpenStarmapGraph, resetStarmapGraph } from '@/store/starmap'
  import { clearAllSessionTodos } from '@/store/todos'
  import { clearTranscriptTailPaging } from '@/store/transcript-tail'
 -import { clearTranscriptTails } from '@/store/transcript-tail-cache'
  
  // True while a connection switch is mid-flight — a Settings → Gateway apply
  // (wipe → re-dial, use-gateway-boot softSwitch) or a Sessions-switcher source
-@@ -265,13 +264,12 @@ export function wipeSessionListsForGatewaySwitch(): void {
+@@ -272,13 +271,12 @@ export function wipeSessionListsForGatewaySwitch(): void {
    // registry and any rail tab pointing into it go with them.
    clearArtifactRegistry()
  
@@ -2519,10 +2193,10 @@ index c4d73d0753..e43a1c218d 100644
  
    // Narrowed: account/marketplace/onboarding caches are global, not gateway-
 diff --git a/apps/desktop/src/store/session-states-profile-rename.test.ts b/apps/desktop/src/store/session-states-profile-rename.test.ts
-index 5e1ffec4ae..d166d1b59f 100644
+index 9070849ec50c4427836a6326a248a9852867782a..828fc8412f94b3ffd936f4d95df7e41b4c224603 100644
 --- a/apps/desktop/src/store/session-states-profile-rename.test.ts
 +++ b/apps/desktop/src/store/session-states-profile-rename.test.ts
-@@ -34,12 +34,12 @@ describe('migrateTilesForProfile', () => {
+@@ -43,12 +43,12 @@ describe('migrateTilesForProfile', () => {
      ])
  
      const tails = await import('@/store/transcript-tail-cache')
@@ -2538,7 +2212,7 @@ index 5e1ffec4ae..d166d1b59f 100644
        profile: 'webdesign_bhp'
      })
 diff --git a/apps/desktop/src/store/transcript-tail-cache.test.ts b/apps/desktop/src/store/transcript-tail-cache.test.ts
-index 146a9f9e07..bf90976f60 100644
+index 146a9f9e0713846f0d8626e58a90fa6643c349df..bf90976f6022e68eec2f3b223c7669ec9d007dc6 100644
 --- a/apps/desktop/src/store/transcript-tail-cache.test.ts
 +++ b/apps/desktop/src/store/transcript-tail-cache.test.ts
 @@ -1,212 +1,117 @@
@@ -2828,7 +2502,7 @@ index 146a9f9e07..bf90976f60 100644
    })
  })
 diff --git a/apps/desktop/src/store/transcript-tail-cache.ts b/apps/desktop/src/store/transcript-tail-cache.ts
-index 5735198e74..a0872506f6 100644
+index 5735198e74bb44f7d92971f4ff0d9ec3e4135293..a0872506f62ee928e137cfbe4d6adfe0b5e3c2d6 100644
 --- a/apps/desktop/src/store/transcript-tail-cache.ts
 +++ b/apps/desktop/src/store/transcript-tail-cache.ts
 @@ -1,45 +1,32 @@

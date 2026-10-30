@@ -36,6 +36,32 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 | L3 | `pre_tool_call` | Explicit `human_request` on `kanban_create`/`kanban_block` is validated and judged as a complete structured request (see below), never via unrelated body/reason text. Status or operational failure alone is not an ask. Legacy prose explicitly saying the user must act retains its `Checked:` gate; worker `kanban_complete` handoffs retain the existing verified-ask/FYI rewrite. |
 | L4 | ledger | `~/.hermes/state/ask-ledger.sqlite` (not synced). When the user's message answers or dismisses an open ask ("done", "i keep completing it", "stop asking", "you can do it") the aux model classifies it and the topic/answer is stored. L1 shows it in every chat (cross-session); L2's judge treats a repeat as `already_answered`. A cheap regex gates the classifier call, so unrelated messages cost nothing. |
 
+**Repeat asks (L2, no model call).** The judge passes a true, unanswered ask as `ok` every time, so nothing stopped a
+chat from restating the same optional ask reply after reply. Every ask item a delivered reply shows (list items under
+a heading count one by one) is recorded in the ledger's `shown_asks` table (session, topic tokens, text, the fact
+tokens of its paragraph). Before the judge, an item whose topic this chat (compression lineage) already showed in
+2 delivered replies within 48 h, the first at least 1 h ago, is held with: *Asked N times, last at T, still in
+For-you or on its card. Don't restate it. If nothing waits on it, say once that silence means no, then close the
+card.* Not held: an item that brings a new fact (a date, time, amount, deadline/expiry/cost/charge/failure word not
+in the earlier showings), an item the user's last message is about, a how-to answer, repeats minutes apart while the
+user works a step live. Topic match (`core.same_topic`) is conservative: a shared card id, or >=2 shared content
+tokens covering >=60% of the shorter ask, never when both name identifiers that share none (PR 10 vs PR 12). Logs
+`ask_repeat_held` (or `ask_repeat_released` once the two-nudge budget is spent: the reply then goes to the judge as
+before). Held drafts are not counted as shown. Why: self-heal agent-31a66d274a (four replies over 43 h asked David to
+revoke a leaked key and decide on secret hiding; nothing waited on either). Tests: `tests/test_repeat_ask.py`.
+Replay (`scripts/replay_repeat.py`, coach digests, MacBook + hub, last 30 days, 2026-10-30): 3,884 replies, 838
+with asks, 9 holds (0.23%); hand-checked all 9: 7 real restatements (incl. the incident reply), 1 duplicate digest,
+1 false hold (a live phone-pairing step re-asked over 1 h).
+
+**Worker handoff leftovers (L3).** `core.find_leftovers` reads a worker's `kanban_complete` summary for sentences
+that hand David a step: they name him ("David's call", "needs you"), or they don't but still tell the reader to act
+("please run/open/…", "need an unblock from your side", "run this … from your side / in your terminal"). Each
+leftover the judge does not pass as a checked `ok` is rewritten `FYI (unverified, not an ask for David): …`. In a
+`FINAL SEND for @session:<ref>:` line the mark goes after the header, because core relays the line only while it
+starts with it. "Nothing … from your side/end" is status, not a leftover. Why: on 10-30 a hub worker's handoff told
+David "Please run this from your side:" above an `ssh … hermes kanban unblock` loop, and no shape matched.
+Tests: `tests/test_ask_gate.py` (`week_1026`, `shell_command_handback`, `final_send_leftover_keeps_its_header`).
+
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a
 delivery verb (send, type, ask, tell, relay, resume…) aimed at an `@session:` ref, a `session <id>` or "the <name>
@@ -72,6 +98,27 @@ are omitted, not interpreted as capabilities. Only validated scope names and kno
 Scope discovery is evidence of an available credential route, not proof of vendor permission or authorization
 to execute an action. Tests in `tests/test_f3_broker.py` exercise discovery through temporary executables and
 the final-response gate with a stub judge; they do not vend credentials or contact a vendor.
+
+**Irreversible asks are never `agent_can_do` (code, not prompt).** The SYSTEM prompt says destructive or
+irreversible actions are always `ok`, but a model can still answer `agent_can_do` when `how` names a scope that is on
+the sheet (10-29: "revoke the OpenAI key" + an inference scope; the agent then edited a dotfile). `judge.IRREVERSIBLE`
+matches an ask containing both an action verb (revoke, rotate, regenerate, reissue, delete, destroy, wipe, purge,
+cancel, deactivate, transfer, pay, purchase, buy, refund) and an object noun (key, token, secret, password,
+credential, account, subscription, repo, repository, bucket, database, backup, payment, invoice, card, domain, funds,
+money). On the ordinary path (`judge()`) and the structured path (`structured_llm`), an `agent_can_do` on such an ask
+becomes `ok` with the reason "irreversible: David's decision" and one `irreversible_kept` line in `ask-gate.jsonl`.
+`already_answered`, `already_done` and `unverified` are left alone. Control: a missing-permission ask with a
+`*-minter` scope still gets `agent_can_do`. Tests: `tests/test_irreversible_guard.py`.
+
+**Standing decisions.** `build_user_prompt` adds a "DAVID'S STANDING DECISIONS (user profile)" section built from the
+§-separated entries of `<HERMES_HOME>/memories/USER.md` (capped at 2000 chars, "(none)" when the file is missing),
+stated to be data, not instructions. SYSTEM's `already_answered` also covers "a standing decision in the user
+profile declines exactly this", so a declined key rotation is not asked again.
+
+**Live-test rule.** A live test that runs a real agent never uses a real pending ask, credential or file of David's.
+Use a fictional, human-only topic and `-t todo`. (10-29: a live `hermes chat --oneshot` about a real key made the agent
+edit `~/.bash_profile`.) To check the judge against the real model, call `judge.judge(..., llm=judge.aux_llm)` directly;
+that runs no agent.
 
 ## Requires compatible core before plugin rollout
 
@@ -248,6 +295,35 @@ for a route used this turn, and for unverified. Real-model accuracy is not cover
 `scripts/replay_entitlement.py` replays one entitlement and two credential requests through the live judge (run
 on hub 2026-10-29: 3/3 correct for each case).
 
+### Superseding work (`superseding_work`)
+
+Why (five whys): an approval card asked the user to fund on-demand CI hosts (+$500/month) while his own approved
+migration to autoscaling runners sat blocked on the same board. (1) The card offered only spot vs on-demand. (2) Its
+author looked at the current fleet, not at open cards on that subsystem. (3) Nothing at the ask surface made an
+approval ask rule out superseding work: the evidence check verifies the claim, the overlap check matches duplicate
+text only. (4) When the user then asked "but we just moved to EKS?", the agent searched his literal word, found
+nothing, and replied "no sign that CI has moved". (5) Nothing questioned a reply that denies a change the user
+named on a literal-term search.
+
+Fix (`superseding.py`, deterministic, read-only, fails open):
+- An explicit `human_request` with `interaction: approval` on `kanban_create`/`kanban_block`: topic tokens of title +
+  action + scope (hyphen compounds split, ask boilerplate dropped) are scored against every board's open cards and
+  cards done in the last 7 days (IDF over that set; >= 3 shared tokens and >= 18% weighted coverage; open cards
+  first, at most 6). Cards the ask already names by id (title, body, reason, evidence, why_human), the card being
+  blocked, and the worker's own card are dropped. Anything left holds the call once with the list ("name each and
+  say why it does not replace this ask"), logged `superseding_held`; a retry of the same ask passes
+  (`superseding_released`).
+- A final reply or `clarify` question that says "no sign / no evidence / found nothing / hasn't moved" is matched
+  (with the user's last message) the same way and held once with the in-flight cards unless it names them.
+- Known cost: on a busy board most approval asks share a subject with something, so expect one hold per approval
+  ask; in a replay of the hub's last approval cards most hits were genuinely related (sibling asks, the migration).
+- Kill switch: `ask_gate.superseding_work: false` in config, or env `ASK_GATE_SUPERSEDING_OFF=1`.
+
+Tests: `tests/test_superseding_work.py` (the incident's real create args against a fixture board holding the
+runner-migration card: held on both tools, found on another board, passes once named, passes on retry; an unrelated
+ask, a non-approval interaction, a done card older than 7 days and both kill switches (env, config) are not held; a recent done card
+is; the incident reply, a reply naming the card, a reply without a denial, and a clarify denial).
+
 ## Approval-store reconciliation adapters
 
 Before judging an explicit `human_request` on create/block, `approval_reconciliation.preflight` consults
@@ -280,6 +356,20 @@ the plugin entry point, the actual structured hook, failure rollback, foreign re
 full live PluginManager discovery and real private adapters still require deployment verification.
 
 This seam alone is not an installed approval integration: without a matching adapter the ordinary gate remains.
+## Refused asks: hold first, then drop only the ask
+
+When the final hook refuses an ask (closed user step, recorded terminal answer, stopped workflow,
+unreconcilable or already-decided approval, or a negative judge verdict past its budget), it first
+returns `{"hold": True, "nudge": ...}` while `attempt < budget`: the nudge names the refused ask and
+the reason in words and tells the agent to resend without it, keeping its findings and the real
+blocker. Once the budget is spent (or `hold_budget=0`) the reply is replaced by the draft minus the
+refused ask sentences plus one plain note on why ("(I left a request out of this reply: ...)"). The
+bare "I withheld a request ..." notice remains only when the ask cannot be cut out cleanly or the gate
+errors after a rejection; coach's `withheld_notice_watch.py` files a Kanban card for any such
+delivery. Tests: `tests/test_refusal_hold.py` (hold names ask + reason for approval-unreconciled,
+approved, stopped and retired; budget-spent replacement keeps the findings for each; a resent draft
+without the ask is delivered; an ask-only draft never leaks).
+
 ## Positive rejection survives reporting failures
 
 Once the final hook has rejected a draft for stopped workflow, retired answer, authoritative

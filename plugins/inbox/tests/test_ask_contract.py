@@ -145,3 +145,47 @@ def test_sent_notices_are_refused_even_on_resolve_types(tmp_path, title):
                          title=title, type_name="x-dm") == "content_status"
     assert policy.reason(home=tmp_path, poster="x-dm", ask=None, actions=[{"kind": "resolve"}],
                          title="Reply to Buck?", type_name="x-dm") is None
+
+
+def test_keyed_post_without_poster_gets_poster_missing_keyed_and_a_hint(tmp_path):
+    """cron-3299286b9a: the derived `key · <prefix>` poster can never pass, so say what to pass instead."""
+    policy = load("_ask_keyed", "ask_contract.py")
+    assert policy.reason(home=tmp_path, poster="key · x-reply-draft", ask=None, actions=[{"kind": "resolve"}],
+                         type_name="x-reply-draft", title="X reply draft: @a") == "poster_missing_keyed"
+    hint = policy.missing_poster_hint(tmp_path, "x-reply-draft")
+    assert "--poster" in hint and "x-post" in hint and "cron" in hint and "x-dm" not in hint
+    st = load("_ask_keyed_store", "store.py")
+    cards = []
+    box = st.Inbox(home=tmp_path, task_creator=lambda **kw: cards.append(kw) or "task-k")
+    with pytest.raises(st.AgentOwnedPost) as e:
+        box.post("Approve the spend cap", "evidence", "Raise it", key="spend-cap:2026-10", ask=ASK)
+    msg = str(e.value)
+    assert "refused: poster_missing_keyed: " in msg and "--poster" in msg and "type 'default'" in msg and "cron" in msg
+    assert cards and "poster_missing_keyed" in cards[0]["body"]
+
+
+def test_refusal_after_done_fallback_card_files_a_fresh_card(tmp_path, monkeypatch):
+    """A refusal must not become a silent comment on a finished card: a done card gets a fresh successor."""
+    import sqlite3
+    from agent import delegation_context
+    original = delegation_context.kanban_path_is_fenced
+    target = (tmp_path / "kanban.db").resolve()
+    monkeypatch.setattr(delegation_context, "kanban_path_is_fenced",
+                        lambda path: False if Path(path).resolve() == target else original(path))
+    st = load("_ask_done_writer", "store.py")
+    args = {"title": "Inbox refused: x reply", "body": "First", "assignee": "default",
+            "idempotency_key": "inbox-refused:key:x-reply-draft:1"}
+    first = st.kanban_task_creator(**args)
+    with sqlite3.connect(tmp_path / "kanban.db") as db:
+        db.execute("UPDATE tasks SET status='done' WHERE id=?", (first,))
+    second = st.kanban_task_creator(**{**args, "body": "Second"})
+    assert second != first
+    third = st.kanban_task_creator(**{**args, "body": "Third"})
+    assert third == second  # the open successor collects later repeats
+    with sqlite3.connect(tmp_path / "kanban.db") as db:
+        rows = dict(db.execute("SELECT id, status FROM tasks").fetchall())
+        assert len(rows) == 2 and rows[second] != "done"
+        old = [b for (b,) in db.execute("SELECT body FROM task_comments WHERE task_id=?", (first,))]
+        assert any(second in b for b in old), "the done card must point at its successor"
+        new = [b for (b,) in db.execute("SELECT body FROM task_comments WHERE task_id=?", (second,))]
+        assert any("Third" in b for b in new)

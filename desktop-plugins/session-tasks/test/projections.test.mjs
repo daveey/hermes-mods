@@ -702,3 +702,10 @@ test('connectionForHubGateway reads the core-learned connection -> hub name map'
   assert.equal(m.connectionForHubGateway('nas', storage), null)
   assert.equal(m.connectionForHubGateway('mini', { getItem: () => '{bad' }), null)
 })
+
+test('subagentChips carry tool count and last tool for the session panel stuck check', () => {
+  const [c] = m.subagentChips([{ subagent_id: 'a', goal: 'Drain', status: 'running', started_at: 5, tool_count: 7, last_tool: 'terminal' }])
+  assert.deepEqual([c.toolCount, c.lastTool], [7, 'terminal'])
+  const [bare] = m.subagentChips([{ subagent_id: 'b', goal: 'Idle', status: 'running' }])
+  assert.deepEqual([bare.toolCount, bare.lastTool], [0, null])
+})

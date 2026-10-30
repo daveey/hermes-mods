@@ -156,7 +156,11 @@ verify that integration before promising autonomous builds.
    `slack_workspace` to `platform_toolsets.slack`. Restart and look for `Wired native handlers from plugin
    'slack-workspace'` in the profile's agent log.
 2. Gate speaking: `platforms.slack.extra` `require_mention`, `strict_mention`, `thread_require_mention` all true;
-   `allow_bots: mentions` if it should work with other bots.
+   `allow_bots: mentions` if it should work with other bots. Set `platforms.slack.gateway_restart_notification: false`
+   too: otherwise every gateway restart (auto-updates restart it often) posts "Hermes is restarting" / "Gateway online"
+   to the home channel. To find which profile is posting them, grep each profile's `logs/gateway.log` for
+   `Sent shutdown notification`. The running gateway posts one last notice on its next shutdown before the setting
+   takes effect.
 3. App config: `channels:join` plus the `message.*` bot events, or there is nothing to observe.
 4. Join channels as the operator (direct API, ~1 s apart), then put alert/CI/bot-feed channels in
    `quiet_channels`. Those feeds are most of the volume, so this is what keeps context useful.
@@ -164,7 +168,15 @@ verify that integration before promising autonomous builds.
    loaded, while this skill only loads on demand.
 6. Set and read back the default delivery channel before the first live test:
    `hermes -p <p> config set platforms.slack.home_channel '{"platform":"slack","chat_id":"<channel-id>","name":"<channel-name>"}' --force`,
-   then `hermes -p <p> config get platforms.slack.home_channel`. A successful reply alone misses the
+   then `hermes -p <p> config get platforms.slack.home_channel`. If anyone besides the owner reads that channel
+   (a team channel, not the owner's DM), set the opt-out in the same step and read it back:
+   `hermes -p <p> config set platforms.slack.gateway_restart_notification false` →
+   `hermes -p <p> config get platforms.slack.gateway_restart_notification` must print `false`. The default is true,
+   and a home channel without it got 26 restart/online notices in 7 h. Same rule for any platform and for a home
+   channel set via `<PLATFORM>_HOME_CHANNEL` in the profile's `.env`. The hermes-hub cron "restart-notice config
+   watch" (`plugins/coach/restart_notice_config_watch.py`) files a card for any profile that misses it; a DM home
+   channel that should keep the notices goes in `~/.hermes/restart-notice-allow.txt` (`<profile>:<platform>`).
+   A successful reply alone misses the
    separate “No home channel is set” onboarding warning. Inspect the whole test thread, not just the answer;
    after correcting setup, remove only the bot's exact stale warning and verify the answer remains.
 7. Hide ambient bot/follower traffic with `hermes -p <p> config set sessions.automated_sources '["*"]' --force`

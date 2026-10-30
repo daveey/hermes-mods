@@ -1,0 +1,225 @@
+From 236b1075db504240ba927bed8a4d654e1dba83ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 23:28:11 +0000
+Subject: [PATCH] fix: reconcile fork main's new tests and spawn fence with the
+ upstream merge [daveey]
+
+- _set_worker_pid keeps upstream's publish guard but always records the claimed run's
+  worker, and treats a current_run_id a sync pull blanked as this claim's.
+- Tests stubbing _profile_capabilities accept the fork's new required arg.
+- Stamp-cache test counts parses through upstream's config backend.
+- Frontmatter-index test uses upstream's renamed locate_skill/skill_search_dirs.
+---
+ hermes_cli/kanban_db_dispatch.py                 | 16 +++++++++++-----
+ tests/gateway/fixtures/kanban_recovery_probe.py  |  4 ++--
+ ...est_bare_custom_launch_keeps_profile_route.py |  2 +-
+ tests/gateway/test_kanban_finite_admission.py    |  4 ++--
+ tests/gateway/test_session_kanban.py             |  4 ++--
+ .../gateway/test_session_kanban_run_off_loop.py  |  2 +-
+ .../test_config_version_stamp_cache.py           | 11 ++++++-----
+ .../test_kanban_worker_spawn_toolsets.py         |  2 +-
+ tests/hermes_cli/test_welcome_trial.py           |  2 +-
+ tests/tools/test_skill_frontmatter_index.py      |  8 ++++----
+ 10 files changed, 31 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 2bc8fa0ea94..0ada0cf5250 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1719,18 +1719,24 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=
+     fingerprint is what lets every later liveness/kill decision tell OUR worker from a process that
+     recycled the PID after a reboot. A failed capture is persisted as ``UNVERIFIED_WORKER_FINGERPRINT``,
+     never NULL: NULL is the legacy pre-fingerprint row whose bare-PID kill authority a new spawn must
+-    not inherit."""
++    not inherit.
++
++    [daveey] ``run_id`` is the claimed run (HERMES_KANBAN_RUN_ID): its run row always records the
++    worker it launched, and a ``current_run_id`` a sync pull blanked mid-spawn (t_01a189343dd2f6ac)
++    still counts as this claim's for the task row. A card that moved on to a newer run keeps that
++    run's task fields untouched."""
+     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+     with _kb.write_txn(conn):
+         if run_id is None:
+             run_id = _kb._current_run_id(conn, task_id)
+-        cur = conn.execute(
++        conn.execute(
+             "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ? AND status = 'running' "
+-            "AND current_run_id IS ? AND worker_pid IS NULL "
++            "AND (current_run_id IS ? OR current_run_id IS NULL) AND worker_pid IS NULL "
+             "AND (? IS NULL OR claim_lock = ?)",
+             (int(pid), started_at, task_id, run_id, claim_lock, claim_lock))
+-        if cur.rowcount:
+-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
++        if run_id is not None:
++            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ? "
++                         "AND worker_pid IS NULL",
+                          (int(pid), started_at, run_id))
+         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+ 
+diff --git a/tests/gateway/fixtures/kanban_recovery_probe.py b/tests/gateway/fixtures/kanban_recovery_probe.py
+index 0a49e1d1bb7..3ce1f0034a5 100644
+--- a/tests/gateway/fixtures/kanban_recovery_probe.py
++++ b/tests/gateway/fixtures/kanban_recovery_probe.py
+@@ -50,8 +50,8 @@ def main():
+     (owner / 'config.yaml').write_text(json.dumps(cfg))
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this recovery probe covers.
+-    import hermes_cli.kanban_capabilities as kanban_capabilities
+-    kanban_capabilities._profile_capabilities = lambda name: {'terminal', 'file', 'git', 'host_repo', 'kanban'}
++    from hermes_cli import kanban_capabilities
++    kanban_capabilities._profile_capabilities = lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'}
+     env = dict(os.environ, HERMES_HOME=str(owner), OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+     # Already-running owner deliberately has no dispatcher-specific board overrides.
+     for key in list(env):
+diff --git a/tests/gateway/test_bare_custom_launch_keeps_profile_route.py b/tests/gateway/test_bare_custom_launch_keeps_profile_route.py
+index 0d10fb224e7..9b636c5dd68 100644
+--- a/tests/gateway/test_bare_custom_launch_keeps_profile_route.py
++++ b/tests/gateway/test_bare_custom_launch_keeps_profile_route.py
+@@ -131,7 +131,7 @@ def test_a_kanban_custom_provider_override_stays_on_the_profiles_endpoint(tmp_pa
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this upstream test covers, so the assignee has them.
+     monkeypatch.setattr('hermes_cli.kanban_capabilities._profile_capabilities',
+-                        lambda name: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
++                        lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
+     kb.create_board('owned')
+     with closing(connect(board='owned')) as conn:
+         task_id = kb.create_task(conn, title='t', assignee='default', workspace_kind='dir',
+diff --git a/tests/gateway/test_kanban_finite_admission.py b/tests/gateway/test_kanban_finite_admission.py
+index 8486fc1da83..f1c734538ac 100644
+--- a/tests/gateway/test_kanban_finite_admission.py
++++ b/tests/gateway/test_kanban_finite_admission.py
+@@ -22,7 +22,7 @@ def test_kanban_submission_enters_single_query_approval_context(tmp_path, monkey
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this upstream test covers, so the assignee has them.
+     monkeypatch.setattr('hermes_cli.kanban_capabilities._profile_capabilities',
+-                        lambda name: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
++                        lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
+     workspace = tmp_path / 'workspace'
+     workspace.mkdir()
+     kb.create_board('owned')
+@@ -87,7 +87,7 @@ def kanban_owner(tmp_path, monkeypatch):
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this upstream test covers, so the assignee has them.
+     monkeypatch.setattr('hermes_cli.kanban_capabilities._profile_capabilities',
+-                        lambda name: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
++                        lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
+ 
+     def build(config):
+         (tmp_path / 'config.yaml').write_text(json.dumps(config))
+diff --git a/tests/gateway/test_session_kanban.py b/tests/gateway/test_session_kanban.py
+index efa459ab982..9dea82e4546 100644
+--- a/tests/gateway/test_session_kanban.py
++++ b/tests/gateway/test_session_kanban.py
+@@ -20,7 +20,7 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this upstream test covers, so the assignee has them.
+     monkeypatch.setattr('hermes_cli.kanban_capabilities._profile_capabilities',
+-                        lambda name: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
++                        lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
+     workspace = tmp_path / 'workspace'
+     workspace.mkdir()
+     (workspace / 'pyproject.toml').write_text('[project]\nname = "task"\n')  # a code worktree
+@@ -120,7 +120,7 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this upstream test covers, so the assignee has them.
+     monkeypatch.setattr('hermes_cli.kanban_capabilities._profile_capabilities',
+-                        lambda name: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
++                        lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
+     workspace = tmp_path / 'workspace'
+     workspace.mkdir()
+     kb.create_board('owned')  # explicit creation; connect() never creates a board (#43243)
+diff --git a/tests/gateway/test_session_kanban_run_off_loop.py b/tests/gateway/test_session_kanban_run_off_loop.py
+index 5d40c916613..634f26b1402 100644
+--- a/tests/gateway/test_session_kanban_run_off_loop.py
++++ b/tests/gateway/test_session_kanban_run_off_loop.py
+@@ -27,7 +27,7 @@ def test_run_task_kanban_write_never_blocks_the_loop(tmp_path, monkeypatch):
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this upstream test covers, so the assignee has them.
+     monkeypatch.setattr('hermes_cli.kanban_capabilities._profile_capabilities',
+-                        lambda name: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
++                        lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
+     workspace = tmp_path / 'workspace'
+     workspace.mkdir()
+     kb.create_board('owned')
+diff --git a/tests/hermes_cli/test_config_version_stamp_cache.py b/tests/hermes_cli/test_config_version_stamp_cache.py
+index 94049771d79..89593c1fe04 100644
+--- a/tests/hermes_cli/test_config_version_stamp_cache.py
++++ b/tests/hermes_cli/test_config_version_stamp_cache.py
+@@ -23,16 +23,17 @@ def hermes_home(tmp_path, monkeypatch):
+ 
+ @pytest.fixture
+ def parses(monkeypatch):
+-    from hermes_cli import config
++    # The stamp parses through upstream's config backend (read_config_doc), so count those parses.
++    from hermes_cli import config_backend
+ 
+-    real = config.fast_safe_load
++    real = config_backend.read_config_doc
+     count = [0]
+ 
+-    def counting(stream):
++    def counting(path):
+         count[0] += 1
+-        return real(stream)
++        return real(path)
+ 
+-    monkeypatch.setattr(config, "fast_safe_load", counting)
++    monkeypatch.setattr(config_backend, "read_config_doc", counting)
+     return count
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_spawn_toolsets.py b/tests/hermes_cli/test_kanban_worker_spawn_toolsets.py
+index 890c6048ae2..5a9766f7d22 100644
+--- a/tests/hermes_cli/test_kanban_worker_spawn_toolsets.py
++++ b/tests/hermes_cli/test_kanban_worker_spawn_toolsets.py
+@@ -184,7 +184,7 @@ def test_worker_toolsets_come_from_the_assignee_profile_not_the_parent_config(tm
+     # Fork: dir workspaces need terminal/file/host_repo in the assignee's profile policy; that gate
+     # (hermes_cli.kanban_capabilities) is not what this upstream test covers, so the assignee has them.
+     monkeypatch.setattr("hermes_cli.kanban_capabilities._profile_capabilities",
+-                        lambda name: {"terminal", "file", "git", "host_repo", "kanban"})
++                        lambda name, *_required: {"terminal", "file", "git", "host_repo", "kanban"})
+     workspace = tmp_path / "workspace"
+     workspace.mkdir()
+     kb.create_board("owned")  # explicit creation; connect() never creates a board (#43243)
+diff --git a/tests/hermes_cli/test_welcome_trial.py b/tests/hermes_cli/test_welcome_trial.py
+index 1e15b2d5c21..2b6db172fa3 100644
+--- a/tests/hermes_cli/test_welcome_trial.py
++++ b/tests/hermes_cli/test_welcome_trial.py
+@@ -328,7 +328,7 @@ def _kanban_worker_model(monkeypatch, tmp_path) -> str:
+     # (hermes_cli.kanban_capabilities fails closed on a missing file); that gate is not what this
+     # upstream trial-model test covers, so the assignee has them.
+     monkeypatch.setattr("hermes_cli.kanban_capabilities._profile_capabilities",
+-                        lambda name: {"terminal", "file", "git", "host_repo", "kanban"})
++                        lambda name, *_required: {"terminal", "file", "git", "host_repo", "kanban"})
+     workspace = tmp_path / "workspace"
+     workspace.mkdir()
+     kb.create_board("trial")
+diff --git a/tests/tools/test_skill_frontmatter_index.py b/tests/tools/test_skill_frontmatter_index.py
+index f1d30850faf..9abbfe43bd0 100644
+--- a/tests/tools/test_skill_frontmatter_index.py
++++ b/tests/tools/test_skill_frontmatter_index.py
+@@ -179,7 +179,7 @@ def test_content_parses_never_touch_the_index(home):
+ 
+ 
+ def test_cold_process_skill_lookup_reads_no_skill_frontmatter_twice(tmp_path):
+-    """Work bound across processes: a second cold `_locate_skill` over 40 skills parses none."""
++    """Work bound across processes: a second cold `locate_skill` over 40 skills parses none."""
+     home = tmp_path / "hermes"
+     skills = home / "skills"
+     for i in range(40):
+@@ -190,9 +190,9 @@ def test_cold_process_skill_lookup_reads_no_skill_frontmatter_twice(tmp_path):
+         from hermes_yaml import safe_load
+         n = []
+         skill_utils._yaml_load_fn = lambda t: (n.append(1), safe_load(t))[1]
+-        from tools.skills_tool import _locate_skill, _skill_search_dirs
+-        roots, _ = _skill_search_dirs()
+-        err, d, md = _locate_skill("s07", None, roots)
++        from tools.skills_tool import locate_skill, skill_search_dirs  # upstream dropped the leading underscores
++        roots, _ = skill_search_dirs()
++        err, d, md = locate_skill("s07", None, roots)
+         print("RESULT " + json.dumps({"err": err, "md": str(md), "parses": len(n)}))
+     """)
+     env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_", "PYTEST"))}
+-- 
+2.55.0
+

@@ -1,0 +1,117 @@
+From b393ab5887a094101a6496d7c29142ec189984ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:32:53 -0700
+Subject: [PATCH] perf(serve): parent-death watchdog verifies the start marker
+ once per 30s instead of forking ps every 2s
+
+---
+ hermes_cli/web_server_lifecycle.py            | 35 ++++++++++++++++++-
+ .../hermes_cli/test_serve_parent_watchdog.py  | 35 +++++++++++++++++++
+ 2 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/web_server_lifecycle.py b/hermes_cli/web_server_lifecycle.py
+index 8de136550ca..d847277a851 100644
+--- a/hermes_cli/web_server_lifecycle.py
++++ b/hermes_cli/web_server_lifecycle.py
+@@ -294,6 +294,38 @@ def _is_serve_orphaned(
+         return False
+ 
+ 
++#: Full marker verification (a ``ps`` spawn on macOS) runs at most this often; polls in
++#: between use the cheap pid-liveness check, which still catches a dead parent.
++_MARKER_RECHECK_S = 30.0
++
++
++def _make_orphan_check(desktop_pid, expected_start_marker=None, *, clock=time.monotonic, recheck_s=None, **probes):
++    """Return a no-arg orphan probe that pays for the start-marker check once per window.
++
++    PID recycling is all the marker defends against; re-verifying it every 2s (one ``ps``
++    fork each) burned idle CPU, while a dead parent is still seen on the next poll.
++    """
++    interval = _MARKER_RECHECK_S if recheck_s is None else recheck_s
++    state = {"verified_at": None}
++
++    def check() -> bool:
++        now = clock()
++        verified = state["verified_at"]
++        if expected_start_marker is not None and verified is not None and now - verified < interval:
++            pid_exists = probes.get("pid_exists")
++            if pid_exists is None:
++                from gateway.status import _pid_exists as pid_exists
++            try:
++                return not bool(pid_exists(int(desktop_pid)))
++            except Exception:
++                return False
++        orphaned = _is_serve_orphaned(desktop_pid, expected_start_marker, **probes)
++        state["verified_at"] = None if orphaned else now
++        return orphaned
++
++    return check
++
++
+ #: Ceiling on the post-orphan graceful unwind before the hard exit takes over.
+ #: The desktop is already gone, so nothing escalates for us and this is the
+ #: whole budget: comfortably past the 5s exit-flush budget
+@@ -362,7 +394,8 @@ def _start_parent_death_watchdog() -> None:
+         poll = 2.0
+ 
+     def _loop() -> None:
+-        while not _is_serve_orphaned(desktop_pid, start_marker):
++        is_orphaned = _make_orphan_check(desktop_pid, start_marker)
++        while not is_orphaned():
+             time.sleep(poll)
+         try:
+             _log.warning(
+diff --git a/tests/hermes_cli/test_serve_parent_watchdog.py b/tests/hermes_cli/test_serve_parent_watchdog.py
+index b44d54ef703..a3eba13d46a 100644
+--- a/tests/hermes_cli/test_serve_parent_watchdog.py
++++ b/tests/hermes_cli/test_serve_parent_watchdog.py
+@@ -4,6 +4,7 @@ import pytest
+ 
+ from hermes_cli.web_server_lifecycle import (
+     _is_serve_orphaned,
++    _make_orphan_check,
+     _parent_start_marker_mismatch_is_conclusive,
+     _valid_parent_start_marker,
+ )
+@@ -293,3 +294,37 @@ def test_parent_watchdog_arms_a_daemon_hard_exit_ceiling(monkeypatch):
+         assert 0 < ceiling.interval <= 30
+     finally:
+         ceiling.cancel()
++
++
++def test_orphan_check_pays_for_the_start_marker_probe_once_per_window():
++    calls = {"marker": 0}
++    now = {"t": 0.0}
++
++    def marker(pid):
++        calls["marker"] += 1
++        return "linux:1"
++
++    check = _make_orphan_check(
++        4242, "linux:1", clock=lambda: now["t"], recheck_s=30.0,
++        process_start_marker=marker, pid_exists=lambda pid: True,
++    )
++    for i in range(10):
++        now["t"] = i * 2.0
++        assert check() is False
++    assert calls["marker"] == 1
++    now["t"] = 31.0
++    assert check() is False
++    assert calls["marker"] == 2
++
++
++def test_orphan_check_still_sees_a_dead_parent_between_marker_probes():
++    alive = {"v": True}
++    now = {"t": 0.0}
++    check = _make_orphan_check(
++        4242, "linux:1", clock=lambda: now["t"], recheck_s=30.0,
++        process_start_marker=lambda pid: "linux:1", pid_exists=lambda pid: alive["v"],
++    )
++    assert check() is False
++    alive["v"] = False
++    now["t"] = 2.0
++    assert check() is True
+-- 
+2.55.0
+

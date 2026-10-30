@@ -1,0 +1,1134 @@
+From c783d99fe0e609eab96e0dfda441d40873378ed5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:37:42 +0000
+Subject: [PATCH] fix(launch): bound the launcher preflight; a slow PM check no
+ longer holds commands hostage [daveey]
+
+prepare_launch asked PM whether the venv was current with no deadline (worker
+start, runtime validation, response), and check_runtime repeated the
+plugin-union/YAML work on every dispatch. On a loaded Mac mini that made short
+`hermes kanban` calls exceed 60 s. A current launch also republished launchers
+(importing app config) whenever the launching interpreter path differed.
+
+- hermes_cli/launch_probe.py: passive currency/runtime probe in an isolated
+  worker with one monotonic 1 s deadline; its process group is SIGKILLed on
+  every exit. No answer = unknown, never current or stale.
+- prepare_launch: unknown skips repair and publication and leaves completion
+  debt (and says so on stderr when an update is still owed), but still hands
+  off once to the managed (signed) interpreter. The verdict (current/unknown)
+  rides a same-pid one-shot env handoff (venv_sync.exec_launch) so the exec'd
+  child neither re-probes nor waits out a second deadline; it is withdrawn if
+  the exec fails.
+- `hermes update` (not its report-only forms) keeps the full, unbounded check:
+  it is the remedy every deferred launch names.
+- A current launch publishes only when a checkout launcher is missing, dead
+  or pinned to a stale same-store Python (mirrors ensure_install_launchers).
+- check_runtime reuses this launch's current/unknown verdict, is bounded the
+  same way, and honors HERMES_DISABLE_LAZY_INSTALLS.
+- Windows keeps the previous (unbounded) path: no native containment yet.
+
+Tests: test_launch_preflight_bound blocks real PM client dispatch (at runtime
+preparation and at the response) both in-process and in the probe worker, and
+blocks pm.activate in the runtime diagnostic: prepare_launch and check_runtime
+each return within the probe budget, debt kept, nothing published/synced,
+blocked descendants gone. RED on base: both cases hang until the 60 s outer
+timeout. Also a real execv handoff (same pid, verdict received), failed-exec
+withdrawal, the owed-update notice, and update's unbounded path.
+---
+ hermes_bootstrap.py                           |   4 +-
+ hermes_cli/launch_probe.py                    | 144 ++++++++++++
+ hermes_cli/venv_sync.py                       | 183 ++++++++++++++-
+ tests/hermes_cli/test_borrowed_home_launch.py |   7 +-
+ .../test_hermes_home_shared_launchers.py      |   2 +-
+ .../hermes_cli/test_launch_preflight_bound.py | 220 ++++++++++++++++++
+ tests/hermes_cli/test_launch_probe.py         | 162 +++++++++++++
+ tests/hermes_cli/test_launch_relaunch_loop.py |   1 +
+ .../test_update_launch_completion.py          |   1 +
+ tests/hermes_cli/test_venv_current_launch.py  | 123 +++++++++-
+ .../hermes_cli/test_venv_sync_update_tree.py  |   2 +-
+ tests/pm/test_source_update_launch.py         |  23 +-
+ 12 files changed, 856 insertions(+), 16 deletions(-)
+ create mode 100644 hermes_cli/launch_probe.py
+ create mode 100644 tests/hermes_cli/test_launch_preflight_bound.py
+ create mode 100644 tests/hermes_cli/test_launch_probe.py
+
+diff --git a/hermes_bootstrap.py b/hermes_bootstrap.py
+index 3871ca73477..17c05251ea0 100644
+--- a/hermes_bootstrap.py
++++ b/hermes_bootstrap.py
+@@ -600,7 +600,7 @@ from hermes_cli._parser import command_argv
+ # Repair needs only stdlib. Do not activate the damaged tree to reach it.
+ _pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
+ if not _pm_repair:
+-    from hermes_cli.venv_sync import prepare_launch, relaunch_command
++    from hermes_cli.venv_sync import exec_launch, prepare_launch, relaunch_command
+ 
+     try:
+         _launch_python = prepare_launch(_root, sys.argv[1:])
+@@ -614,7 +614,7 @@ if not _pm_repair:
+                 import subprocess
+ 
+                 raise RelaunchExit(subprocess.call(_command))
+-            os.execv(str(_launch_python), _command)
++            exec_launch(_launch_python, _command)
+     except Exception as exc:
+         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
+             print(f"hermes: {message}", file=sys.stderr)
+diff --git a/hermes_cli/launch_probe.py b/hermes_cli/launch_probe.py
+new file mode 100644
+index 00000000000..a8428947f5b
+--- /dev/null
++++ b/hermes_cli/launch_probe.py
+@@ -0,0 +1,144 @@
++"""Bounded, passive dependency-environment probe for launchers.
++
++``probe(root)`` asks an isolated worker (``sys.executable -I -S``) whether the
++environment recorded for ``root`` is current, or (``operation='runtime'``) to
++activate it and report the resulting PATH. It never installs or repairs.
++
++Contract (stdlib only, so a bootstrap interpreter can import it):
++
++* ``{"schema": 1, "state": "current" | "stale"}`` for ``currency``.
++* ``{"schema": 1, "state": "runtime", "problems": [str], "path": str}`` for ``runtime``.
++* ``{"schema": 1, "state": "error", "detail": str}`` when the worker ran and failed.
++* ``None`` when the probe is unavailable, times out or answers malformed data.
++
++The worker imports PM from the *implementation* checkout that contains this
++file (``SOURCE_ROOT``), never from ``root``, which is only the project the
++question is about (it may be a fixture or another checkout). One monotonic
++deadline covers worker start-up, PM work and reading the answer. On POSIX the
++worker runs in its own process group, and that group is SIGKILLed on every
++exit, success included, so a descendant holding the stdout pipe can neither
++hang us nor outlive the probe.
++
++Windows: not implemented. ``probe`` returns ``None`` there, so callers take
++their normal "probe unavailable" fallback.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import selectors
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import Any
++
++SCHEMA = 1
++SOURCE_ROOT = Path(__file__).resolve().parents[1]
++DEFAULT_TIMEOUT = 1.0  # seconds, end to end: worker start, PM work and the answer
++_MAX_RESPONSE = 1 << 16
++_REAP_SECONDS = 1.0
++
++_WORKER = r"""
++import json, os, sys
++from pathlib import Path
++source, root, operation = sys.argv[1:4]
++root = Path(root)
++sys.path.insert(0, source)
++out = os.fdopen(os.dup(1), "w")
++sys.stdout = sys.stderr  # imports must not pollute the response channel
++try:
++    if operation == "currency":
++        import pm
++        reply = {"schema": 1, "state": "current" if pm.venv_is_current(project_root=root) else "stale"}
++    else:
++        from pm.environments import activate_dependencies
++        activate_dependencies(root)  # before any third-party import
++        import pm
++        problems = pm.activate()
++        reply = {"schema": 1, "state": "runtime", "problems": [str(p) for p in problems],
++                 "path": os.environ.get("PATH", "")}
++except BaseException as exc:
++    reply = {"schema": 1, "state": "error", "detail": f"{type(exc).__name__}: {exc}"}
++out.write(json.dumps(reply) + "\n")
++out.flush()
++"""
++
++
++def _valid(operation: str, reply: Any) -> bool:
++    if not isinstance(reply, dict) or reply.get("schema") != SCHEMA:
++        return False
++    state = reply.get("state")
++    if state == "error":
++        return isinstance(reply.get("detail"), str) and set(reply) == {"schema", "state", "detail"}
++    if operation == "currency":
++        return state in ("current", "stale") and set(reply) == {"schema", "state"}
++    problems = reply.get("problems")
++    return (state == "runtime" and isinstance(problems, list)
++            and all(isinstance(p, str) for p in problems) and isinstance(reply.get("path"), str)
++            and set(reply) == {"schema", "state", "problems", "path"})
++
++
++def _read_line(proc: subprocess.Popen, deadline: float) -> bytes | None:
++    """First stdout line, or None at the deadline/EOF/oversize. Never waits for pipe EOF
++    once a line arrived: a descendant may keep the pipe open forever."""
++    assert proc.stdout is not None
++    buffer = b""
++    with selectors.DefaultSelector() as selector:
++        selector.register(proc.stdout, selectors.EVENT_READ)
++        while b"\n" not in buffer:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0 or not selector.select(remaining):
++                return None
++            chunk = os.read(proc.stdout.fileno(), 4096)
++            if not chunk:
++                return None
++            buffer += chunk
++            if len(buffer) > _MAX_RESPONSE:
++                return None
++    return buffer.split(b"\n", 1)[0]
++
++
++def _kill_group(proc: subprocess.Popen) -> None:
++    try:
++        os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — probe() runs only on POSIX
++    except (ProcessLookupError, PermissionError):
++        pass
++    try:
++        proc.wait(timeout=_REAP_SECONDS)
++    except subprocess.TimeoutExpired:
++        pass
++
++
++def probe(root: str | os.PathLike[str], operation: str = "currency",
++          timeout: float | None = None) -> dict[str, Any] | None:
++    """Run one passive probe for ``root``; see the module docstring for the result shapes."""
++    if timeout is None:
++        timeout = DEFAULT_TIMEOUT
++    if os.name != "posix" or operation not in ("currency", "runtime") or not timeout > 0:
++        return None
++    deadline = time.monotonic() + timeout
++    try:
++        proc = subprocess.Popen(
++            [sys.executable, "-I", "-S", "-c", _WORKER, str(SOURCE_ROOT), os.fspath(root), operation],
++            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++            # detached-spawn: ok — awaited under one deadline, then its whole group is SIGKILLed on every exit
++            start_new_session=True,
++        )
++    except OSError:
++        return None
++    try:
++        line = _read_line(proc, deadline)
++        if line is None:
++            return None
++        try:
++            reply = json.loads(line)
++        except ValueError:
++            return None
++        return reply if _valid(operation, reply) else None
++    finally:
++        _kill_group(proc)
++        assert proc.stdout is not None
++        proc.stdout.close()
+diff --git a/hermes_cli/venv_sync.py b/hermes_cli/venv_sync.py
+index d6bad7a166d..b18f9fab516 100644
+--- a/hermes_cli/venv_sync.py
++++ b/hermes_cli/venv_sync.py
+@@ -51,12 +51,45 @@ def _is_sealed(project_root: Path) -> bool:
+ def check_runtime(project_root: Path) -> str | None:
+     """One passive startup verdict; callers only choose stderr or logging."""
+     import pm
+-    from hermes_cli.steward import read_install_stamp, sealed_steward
++    from hermes_cli.steward import read_install_stamp
+ 
+     if (Path(project_root) / ".git").exists() and read_install_stamp(project_root).get("updateMechanism") != "self":
+         return None  # A developer's checkout does not owe managed products.
+ 
+-    problems = pm.activate()
++    if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").lower() in ("1", "true", "yes"):
++        pm.activate(allow_incomplete=True)  # keep tool PATH without reading plugin-union inputs
++        return None
++    if Path(project_root).resolve() in _current_roots:
++        # prepare_launch just found the dependencies current in this process: only the
++        # store's tools remain to check, which reads no plugin-union inputs and starts no PM.
++        problems = pm.activate(allow_incomplete=True)
++        return _runtime_problem(project_root, problems)
++    if Path(project_root).resolve() in _unknown_roots:
++        # This launch's currency probe already ran out of time; the runtime diagnostic
++        # reads the same inputs, so defer it to a later launch rather than wait again.
++        pm.activate(allow_incomplete=True)
++        return None
++    from hermes_cli.launch_probe import probe
++
++    # The diagnostic computes plugin-union inputs (including YAML) and may start PM.
++    # It is advisory: never make command dispatch wait indefinitely for it.
++    if os.name == "nt":
++        problems = pm.activate()  # Windows retains its existing path until native containment is available.
++    else:
++        result = probe(project_root, "runtime")
++        if result is None or result["state"] == "error":
++            # Tool activation has no worker or plugin-union/YAML read; keep bundled
++            # executables available even when the advisory diagnostic times out.
++            pm.activate(allow_incomplete=True)
++            return None if result is None else f"runtime check deferred: {result['detail']}"
++        os.environ["PATH"] = result["path"]
++        problems = result["problems"]
++    return _runtime_problem(project_root, problems)
++
++
++def _runtime_problem(project_root: Path, problems: list[str]) -> str | None:
++    from hermes_cli.steward import sealed_steward
++
+     if not problems:
+         return None
+     steward = sealed_steward(Path(project_root))
+@@ -422,6 +455,138 @@ def _relaunch_target(root: Path, python: Path, *, same: bool) -> Path | None:
+     return python
+ 
+ 
++def _launchers_intact(root: Path) -> bool:
++    """Would publication leave every checkout launcher as it is? A small file read that,
++    unlike publication, imports no app config.
++
++    Mirrors ensure_install_launchers: a launcher is kept when it execs this root's own
++    store Python, or (for a checkout this home only borrows) a live interpreter outside
++    this root's store. Missing, dead and stale same-store pins republish."""
++    from hermes_cli._launchers import (
++        WINDOWS_BIN_LAUNCHERS, _is_home_checkout, _launcher_python, resolve_store_python)
++    from pm.environments import store_root
++
++    own = resolve_store_python(root, publication=True)  # what stage_launcher writes
++    if own is None:
++        return False
++    own = os.path.normcase(os.path.abspath(own))
++    try:
++        store = store_root(root).resolve()
++        owner = _is_home_checkout(root, store)
++    except (OSError, RuntimeError, ValueError):
++        return False
++    local = root / ".hermes" / "bin"
++    for name in WINDOWS_BIN_LAUNCHERS:
++        # cmd.exe resolves the .exe before the .cmd: judge the form that would run.
++        forms = [local / f"{name}.exe", local / f"{name}.cmd"] if os.name == "nt" else [local / name]
++        running = next((form for form in forms if form.exists()), None)
++        python = None if running is None else _launcher_python(running)
++        try:
++            if python is None or not python.is_file():
++                return False
++            if os.path.normcase(os.path.abspath(python)) == own:
++                continue
++            if owner or any(parent.resolve() == store for parent in python.parents):
++                return False
++        except OSError:
++            return False
++    return True
++
++
++#: Checkouts this process found current at launch; check_runtime reuses the verdict.
++_current_roots: set[Path] = set()
++#: Checkouts whose launch probe timed out in this process: check_runtime defers its own
++#: (equally slow) diagnostic instead of paying a second deadline.
++_unknown_roots: set[Path] = set()
++#: (verdict, checkout) a launch is handing off to the managed interpreter for.
++_handoff: tuple[str, Path] | None = None
++#: One-shot "<verdict>:<pid>:<checkout>" a launch hands its exec'd self (same pid), so the
++#: child neither repeats a fresh probe ("current") nor waits out a second timeout
++#: ("unknown"). Popped first thing: a later re-exec (an early-recovery restore re-runs
++#: sys.orig_argv) and every subprocess check currency for themselves.
++LAUNCH_HANDOFF_ENV = "HERMES_LAUNCH_CURRENT_HANDOFF"
++_HANDOFF_VERDICTS = {"current": True, "unknown": None}
++
++
++def launch_handoff_env() -> dict[str, str]:
++    """Environment for the exec into the managed interpreter (hermes_bootstrap)."""
++    if _handoff is None:
++        return {}
++    verdict, root = _handoff
++    return {LAUNCH_HANDOFF_ENV: f"{verdict}:{os.getpid()}:{root}"}
++
++
++def exec_launch(python: Path, command: list[str]) -> None:
++    """POSIX: exec into the managed interpreter, handing it this launch's verdict.
++
++    Only returns by raising. A failed exec keeps running in this process, so the verdict is
++    withdrawn first: it must not reach subprocesses or a later same-pid re-exec (which would
++    then skip its own currency check)."""
++    handoff = launch_handoff_env()
++    os.environ.update(handoff)
++    try:
++        os.execv(str(python), command)
++    except BaseException:
++        for name in handoff:
++            os.environ.pop(name, None)
++        raise
++
++
++def _take_handoff(root: Path) -> tuple[bool, bool | None]:
++    """(handed off, verdict) from the parent this process was exec'd from."""
++    verdict, _, rest = os.environ.pop(LAUNCH_HANDOFF_ENV, "").partition(":")
++    if verdict not in _HANDOFF_VERDICTS or rest != f"{os.getpid()}:{root}":
++        return False, None
++    return True, _HANDOFF_VERDICTS[verdict]
++
++
++def _launch_currency(root: Path, command: list[str]) -> bool | None:
++    """Unknown is not stale: a slow passive check must not start a repair.
++
++    `hermes update` (not its report-only forms) is the remedy every deferred launch names,
++    so it waits for the full answer; Windows has no native process-tree containment yet."""
++    import pm
++    from hermes_cli.launch_probe import probe
++
++    explicit_update = command[:1] == ["update"] and not _REPORT_ONLY_UPDATE_FLAGS & set(command)
++    if os.name == "nt" or explicit_update:
++        return pm.venv_is_current(project_root=root)
++    result = probe(root)
++    if result is None:
++        return None
++    if result["state"] == "error":
++        raise RuntimeError(result["detail"])
++    return result["state"] == "current"
++
++
++def _unknown_launch_target(root: Path) -> Path | None:
++    """Launch on an unknown currency verdict (the bounded probe gave no answer).
++
++    Unknown is not stale: no repair, no publication, completion debt untouched (a later
++    launch or explicit update retries). Interpreter isolation still holds: a venv or
++    foreign interpreter hands off once to the managed (signed) one, carrying the verdict
++    so the exec'd child does not wait out a second deadline."""
++    global _handoff
++    import sys
++
++    from hermes_cli._launchers import resolve_store_python, signed_python_app
++
++    _unknown_roots.add(root)
++    if completion_pending_path(root).is_file():
++        # Deferred, not dropped: the next launch retries; say so where an operator looks.
++        print("hermes: dependency check timed out; a source update is still unfinished "
++              "(retried on the next launch, or run `hermes update` to finish it now)",
++              file=sys.stderr, flush=True)
++    python = resolve_store_python(root)
++    if python is None:
++        return None
++    python = signed_python_app(python) or python
++    if os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable)):
++        return None
++    _handoff = ("unknown", root)
++    return python
++
++
+ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
+     """Finish a self-managed source update before importing app dependencies.
+ 
+@@ -438,7 +603,10 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
+     import os
+     import sys
+ 
++    global _handoff
+     root = Path(project_root).resolve()
++    handed_off, handed_verdict = _take_handoff(root)
++    _handoff = None
+     # sys.argv[0] is this process's script identity; *argv* carries only the command.
+     if _is_tail_script(root, sys.argv[0]):
+         return None
+@@ -470,7 +638,10 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
+     from hermes_cli._launchers import resolve_store_python
+     from hermes_cli.update_lock import UpdateLock, read_live_update
+ 
+-    current = pm.venv_is_current(project_root=root)
++    # The parent this process was exec'd from (same pid) probed an instant ago.
++    current = handed_verdict if handed_off else _launch_currency(root, command)
++    if current is None:
++        return _unknown_launch_target(root)
+     from pm.environments import owning_home_root
+ 
+     owner = owning_home_root(root)
+@@ -525,9 +696,13 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
+     # venv interpreter symlinked to the same binary is still a different
+     # interpreter (its own sys.prefix) and must re-exec once.
+     same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+-    if not current or not same:
++    if not current or not _launchers_intact(root):
+         publish_launchers(root)
++    if not current or not same:
++        if current:
++            _handoff = ("current", root)
+         return _relaunch_target(root, python, same=same)
++    _current_roots.add(root)
+     if owed_to_cli:
+         # Left owed, not dropped: say so (once, in the process that boots) where an
+         # operator of the unit will read it.
+diff --git a/tests/hermes_cli/test_borrowed_home_launch.py b/tests/hermes_cli/test_borrowed_home_launch.py
+index b11938e18dd..ceda51fd05e 100644
+--- a/tests/hermes_cli/test_borrowed_home_launch.py
++++ b/tests/hermes_cli/test_borrowed_home_launch.py
+@@ -28,6 +28,7 @@ def _no_tool_downloads(monkeypatch):
+     import pm.client
+ 
+     monkeypatch.setattr(pm.client, "ensure_tools_for_sync", lambda: None)
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: pm.venv_is_current(project_root=root))
+ 
+ 
+ @pytest.fixture
+@@ -175,7 +176,7 @@ def test_a_borrowing_launch_syncs_its_own_dependencies_and_nothing_of_the_checko
+     python = tmp_path / ".hermes" / "tools" / "python" / "bin" / "python3"
+     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: borrowed_facts.is_file())
+     monkeypatch.setattr(pm, "sync_venv", sync)
+-    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: python)
++    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: python)
+     monkeypatch.setattr(venv_sync, "publish_launchers", lambda *a, **kw: pytest.fail("published the owner's launchers"))
+ 
+     assert venv_sync.prepare_launch(root, ["kanban", "init"]) == python  # relaunch into the synced env
+@@ -202,7 +203,7 @@ def test_the_owner_still_owes_and_runs_its_tail(tmp_path, monkeypatch, completio
+     facts.unlink()
+     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: facts.is_file())
+     monkeypatch.setattr(pm, "sync_venv", lambda *a, **kw: facts.write_text("{}", encoding="utf-8"))
+-    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
++    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: Path(sys.executable))
+     published = []
+     monkeypatch.setattr(venv_sync, "publish_launchers", lambda r, **kw: published.append(r))
+ 
+@@ -230,7 +231,7 @@ def test_borrowed_launch_already_on_the_store_interpreter_does_not_reexec(tmp_pa
+     monkeypatch.setattr(pm, "sync_venv", lambda *a, **kw: (
+         borrowed_facts.parent.mkdir(parents=True, exist_ok=True)
+         or borrowed_facts.write_text("{}", encoding="utf-8")))
+-    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: python)
++    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: python)
+ 
+     assert venv_sync.prepare_launch(root, ["kanban", "init"]) is None
+     assert borrowed_facts.is_file()
+diff --git a/tests/hermes_cli/test_hermes_home_shared_launchers.py b/tests/hermes_cli/test_hermes_home_shared_launchers.py
+index f992f81f69a..552cbbf5cba 100644
+--- a/tests/hermes_cli/test_hermes_home_shared_launchers.py
++++ b/tests/hermes_cli/test_hermes_home_shared_launchers.py
+@@ -85,7 +85,7 @@ def test_temp_home_prepare_launch_relaunches_without_rebinding(tmp_path, monkeyp
+     before = _publish(repo)
+ 
+     _isolate(tmp_path, monkeypatch, temp_home)
+-    monkeypatch.setattr(pm, "venv_is_current", lambda **kwargs: True)
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: True)
+     target = venv_sync.prepare_launch(repo, [])
+     assert target is not None
+     assert target.resolve() == temp_python.resolve()
+diff --git a/tests/hermes_cli/test_launch_preflight_bound.py b/tests/hermes_cli/test_launch_preflight_bound.py
+new file mode 100644
+index 00000000000..c47b52701b7
+--- /dev/null
++++ b/tests/hermes_cli/test_launch_preflight_bound.py
+@@ -0,0 +1,220 @@
++"""A blocked passive PM worker must not hold a CLI command hostage."""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import venv_sync
++
++BUDGET = 4.0  # seconds: the probe deadline this test sets
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("stage", ["preparation", "response"])
++def test_command_starts_with_blocked_pm_worker(tmp_path, stage):
++    root = tmp_path / "checkout"
++    (root / ".git").mkdir(parents=True)
++    (root / "pyproject.toml").write_text("[project]\nname='fixture'\n")
++    (root / "install-stamp.json").write_text('{"updateMechanism":"self"}')
++    source = Path(__file__).resolve().parents[2]
++    script = f'''
++import sys, os, json, threading, time
++from pathlib import Path
++sys.path.insert(0, {str(source)!r})
++from hermes_cli import venv_sync
++import pm
++# Block real PM client dispatch, wherever it runs: either before its worker starts, or
++# on its response. The same block goes into this process (where an unbounded launcher
++# asks PM directly) and into the bounded probe's worker, when there is one.
++client_block = """
++import pm.client, threading
++if {stage!r} == 'preparation':
++    def prepare():
++        Path({str(tmp_path / 'probe-entered')!r}).write_text('preparation')
++        threading.Event().wait()
++    pm.client.runtime_environment = prepare
++else:
++    pm.client.runtime_environment = lambda: dict(os.environ)
++    pm.client._worker_command = lambda *a: [sys.executable, '-c', {('from pathlib import Path; import os, threading; Path(' + repr(str(tmp_path / 'probe-entered')) + ').write_text(str(os.getpid())); threading.Event().wait()')!r}]
++"""
++# The runtime diagnostic's slow part (plugin-union inputs, YAML, PM drift) sits in
++# pm.activate; block it inside the probe worker only, where the diagnostic runs.
++activate_block = """
++import pm
++def _blocked_activate(*a, **k):
++    Path({str(tmp_path / 'runtime-entered')!r}).write_text(str(os.getpid()))
++    threading.Event().wait()
++pm.activate = _blocked_activate
++"""
++exec(client_block)
++try:
++    from hermes_cli import launch_probe
++except ImportError:  # a launcher with no bounded probe: only the in-process block applies
++    launch_probe = None
++else:
++    launch_probe._WORKER = launch_probe._WORKER.replace(
++        'try:\\n', client_block + activate_block + '\\ntry:\\n', 1)
++    # A probe budget generous enough that even a loaded runner's cold worker reaches the
++    # injected block: the claim is "bounded by the budget", not "fast on a quiet host".
++    launch_probe.DEFAULT_TIMEOUT = {BUDGET!r}
++venv_sync.publish_launchers = lambda *a, **k: (_ for _ in ()).throw(AssertionError('published'))
++pm.sync_venv = lambda *a, **k: (_ for _ in ()).throw(AssertionError('synced'))
++root = Path({str(root)!r})
++pending = venv_sync.arm_completion(root)
++started = time.monotonic()
++venv_sync.prepare_launch(root, ['kanban', 'list'])
++prepared = time.monotonic()
++assert pending.is_file(), 'timeout cleared completion debt'
++# Prove the runtime diagnostic is bounded on its own too (a launch with no verdict,
++# e.g. one whose prepare_launch was skipped), not only deferred after an unknown launch.
++getattr(venv_sync, '_unknown_roots', set()).clear()
++venv_sync.check_runtime(root)
++print(json.dumps({{'prepare': prepared - started, 'runtime': time.monotonic() - prepared}}), flush=True)
++'''
++    env = dict(os.environ, HERMES_HOME=str(tmp_path / "home"))
++    env.pop("HERMES_DISABLE_LAZY_INSTALLS", None)
++    # Unbounded code never returns: the outer timeout only turns that hang into a failure.
++    result = subprocess.run([sys.executable, "-I", "-c", script], env=env,
++                            capture_output=True, text=True, timeout=60, check=False)
++    assert result.returncode == 0, result.stderr
++    timings = json.loads(result.stdout)
++    from hermes_cli.launch_probe import _REAP_SECONDS
++    allowance = BUDGET + _REAP_SECONDS + 2.0  # deadline + process-group reap + scheduling
++    assert timings["prepare"] < allowance, timings
++    assert timings["runtime"] < allowance, timings
++    assert (tmp_path / "probe-entered").is_file(), "fixture never reached the blocked PM boundary"
++    assert (tmp_path / "runtime-entered").is_file(), "runtime diagnostic never reached its blocked activation"
++    import psutil
++    from tests.waiting import wait_until
++    blocked = [int((tmp_path / "runtime-entered").read_text())]
++    if stage == "response":
++        blocked.append(int((tmp_path / "probe-entered").read_text()))
++    for pid in blocked:
++        wait_until(lambda pid=pid: not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE,
++                   timeout=3, what="blocked PM descendant terminated")
++
++
++def test_runtime_opt_out_does_not_probe(tmp_path, monkeypatch):
++    import pm
++    root = tmp_path / "checkout"
++    (root / ".git").mkdir(parents=True)
++    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
++    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
++    activated = []
++    monkeypatch.setattr(pm, "activate", lambda **kw: activated.append(kw))
++    assert venv_sync.check_runtime(root) is None
++    assert activated == [{"allow_incomplete": True}]
++
++
++def test_runtime_check_reuses_this_launchs_current_verdict(tmp_path, monkeypatch):
++    """After prepare_launch found the checkout current, dispatch checks only the store's tools."""
++    import pm
++    from hermes_cli import launch_probe
++    root = tmp_path / "checkout"
++    (root / ".git").mkdir(parents=True)
++    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
++    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
++    monkeypatch.setattr(launch_probe, "probe", lambda *a, **k: pytest.fail("probed a known-current checkout"))
++    activated = []
++    monkeypatch.setattr(pm, "activate", lambda **kw: activated.append(kw) or ["git: missing"])
++    monkeypatch.setattr(venv_sync, "_current_roots", {root.resolve()})
++    problem = venv_sync.check_runtime(root)
++    assert activated == [{"allow_incomplete": True}]
++    assert problem is not None and "git: missing" in problem
++
++
++def test_runtime_check_defers_after_this_launchs_probe_timed_out(tmp_path, monkeypatch):
++    """One deadline per launch: an unknown currency verdict is not followed by a second wait."""
++    import pm
++    from hermes_cli import launch_probe
++    root = tmp_path / "checkout"
++    (root / ".git").mkdir(parents=True)
++    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
++    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
++    monkeypatch.setattr(launch_probe, "probe", lambda *a, **k: pytest.fail("waited out a second probe"))
++    activated = []
++    monkeypatch.setattr(pm, "activate", lambda **kw: activated.append(kw) or ["git: missing"])
++    monkeypatch.setattr(venv_sync, "_unknown_roots", {root.resolve()})
++    assert venv_sync.check_runtime(root) is None
++    assert activated == [{"allow_incomplete": True}], "bundled tools must stay on PATH"
++
++
++@pytest.mark.platforms("posix")
++def test_exec_launch_hands_the_verdict_to_the_execd_self(tmp_path):
++    """Real execv: the managed interpreter starts as the same pid with this launch's verdict."""
++    root = (tmp_path / "checkout").resolve()
++    source = Path(__file__).resolve().parents[2]
++    child = ("import os, json; print(json.dumps([os.getpid(), "
++             f"os.environ.get({venv_sync.LAUNCH_HANDOFF_ENV!r})]), flush=True)")
++    script = f'''
++import os, sys
++sys.path.insert(0, {str(source)!r})
++from pathlib import Path
++from hermes_cli import venv_sync
++venv_sync._handoff = ("current", Path({str(root)!r}))
++print(os.getpid(), flush=True)
++venv_sync.exec_launch(Path(sys.executable), [sys.executable, "-I", "-c", {child!r}])
++'''
++    env = {k: v for k, v in os.environ.items() if k != venv_sync.LAUNCH_HANDOFF_ENV}
++    result = subprocess.run([sys.executable, "-I", "-c", script], env=env,
++                            capture_output=True, text=True, timeout=60, check=True)
++    parent_pid, received = result.stdout.splitlines()
++    child_pid, value = json.loads(received)
++    assert child_pid == int(parent_pid), "execv must keep the pid the handoff is bound to"
++    assert value == f"current:{parent_pid}:{root}"
++
++
++def test_failed_exec_withdraws_the_verdict(tmp_path, monkeypatch):
++    """A launch whose exec fails keeps running here: no subprocess or later re-exec may
++    inherit a verdict this process did not hand off."""
++    root = (tmp_path / "checkout").resolve()
++    monkeypatch.delenv(venv_sync.LAUNCH_HANDOFF_ENV, raising=False)
++    monkeypatch.setattr(venv_sync, "_handoff", ("unknown", root))
++    seen = []
++
++    def failing_exec(path, argv):
++        seen.append(os.environ.get(venv_sync.LAUNCH_HANDOFF_ENV))
++        raise OSError("exec format error")
++
++    monkeypatch.setattr(os, "execv", failing_exec)
++    with pytest.raises(OSError):
++        venv_sync.exec_launch(Path(sys.executable), [sys.executable])
++    assert seen == [f"unknown:{os.getpid()}:{root}"]
++    assert venv_sync.LAUNCH_HANDOFF_ENV not in os.environ
++
++
++def test_unknown_verdict_with_owed_update_says_so(tmp_path, monkeypatch, capsys):
++    """A deferred completion is never silent: the operator learns it is still owed."""
++    root = (tmp_path / "checkout").resolve()
++    (root / ".git").mkdir(parents=True)
++    monkeypatch.setattr(venv_sync, "_unknown_roots", set())
++    venv_sync._unknown_launch_target(root)
++    assert capsys.readouterr().err == "", "no debt, nothing to report"
++    pending = venv_sync.arm_completion(root)
++    venv_sync._unknown_launch_target(root)
++    assert "source update is still unfinished" in capsys.readouterr().err
++    assert pending.is_file(), "an unknown verdict must not clear the debt"
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize(("command", "bounded"), [
++    (["kanban", "list"], True),
++    (["update", "--check"], True),
++    (["update"], False),
++])
++def test_explicit_update_waits_for_the_full_answer(tmp_path, monkeypatch, command, bounded):
++    """`hermes update` is the remedy deferred launches name: it never takes the bounded
++    probe's unknown. Report-only update forms and every other command do."""
++    import pm
++    from hermes_cli import launch_probe
++    root = (tmp_path / "checkout").resolve()
++    calls = []
++    monkeypatch.setattr(launch_probe, "probe", lambda *a, **k: calls.append("probe"))
++    monkeypatch.setattr(pm, "venv_is_current", lambda **k: calls.append("full") or True)
++    assert venv_sync._launch_currency(root, command) is (None if bounded else True)
++    assert calls == (["probe"] if bounded else ["full"])
+diff --git a/tests/hermes_cli/test_launch_probe.py b/tests/hermes_cli/test_launch_probe.py
+new file mode 100644
+index 00000000000..e7c3bdadc19
+--- /dev/null
++++ b/tests/hermes_cli/test_launch_probe.py
+@@ -0,0 +1,162 @@
++"""Behaviour contract of hermes_cli.launch_probe: bounded, passive, no leaked processes."""
++
++from __future__ import annotations
++
++import os
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import launch_probe
++from tests.waiting import wait_until
++
++posix = pytest.mark.platforms("linux", "macos")
++BOUND = 3.0
++
++_HOLDER = (
++    "import subprocess, sys\n"
++    "def hold(pid_file):\n"
++    "    child = subprocess.Popen([sys.executable, '-c',\n"
++    "        'import threading; threading.Event().wait()', 'launch-probe-sentinel'])\n"
++    "    open(pid_file, 'w').write(str(child.pid))\n"
++)
++
++
++def _fake_source(tmp_path: Path, venv_is_current: str, activate_dependencies: str,
++                 activate: str = "return []") -> Path:
++    source = tmp_path / "source"
++    (source / "pm").mkdir(parents=True)
++    (source / "holder.py").write_text(_HOLDER)
++    (source / "pm" / "__init__.py").write_text(
++        "def venv_is_current(*, project_root):\n    import holder, os\n"
++        f"    {venv_is_current}\n"
++        "def activate():\n    import os\n"
++        f"    {activate}\n"
++    )
++    (source / "pm" / "environments.py").write_text(
++        "def activate_dependencies(root):\n    import holder, os\n"
++        f"    {activate_dependencies}\n"
++    )
++    return source
++
++
++def _alive(pid: int) -> bool:
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    try:
++        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
++    except OSError:
++        return True
++
++
++def _pid(pid_file: Path) -> int:
++    wait_until(pid_file.exists, timeout=5, what="descendant pid file")
++    wait_until(lambda: pid_file.read_text() != "", timeout=5, what="descendant pid")
++    return int(pid_file.read_text())
++
++
++@pytest.fixture
++def use_source(monkeypatch):
++    def use(source: Path) -> None:
++        monkeypatch.setattr(launch_probe, "SOURCE_ROOT", source)
++    return use
++
++
++@posix
++@pytest.mark.parametrize("current", [True, False])
++def test_currency_reports_pm_verdict_for_requested_root(tmp_path, use_source, current):
++    seen = tmp_path / "root.txt"
++    use_source(_fake_source(
++        tmp_path,
++        f"open({str(seen)!r}, 'w').write(str(project_root)); return {current}",
++        "pass",
++    ))
++    assert launch_probe.probe(tmp_path / "fixture-root", timeout=BOUND) == {
++        "schema": 1, "state": "current" if current else "stale"}
++    assert seen.read_text() == str(tmp_path / "fixture-root")
++
++
++@posix
++def test_runtime_activates_dependencies_before_pm_and_returns_path(tmp_path, use_source):
++    order = tmp_path / "order.txt"
++    use_source(_fake_source(
++        tmp_path, "return True",
++        f"open({str(order)!r}, 'a').write('deps:' + str(root) + ' ')",
++        f"open({str(order)!r}, 'a').write('activate '); os.environ['PATH'] = '/store/bin'; return ['broken']",
++    ))
++    assert launch_probe.probe(tmp_path / "r", "runtime", timeout=BOUND) == {
++        "schema": 1, "state": "runtime", "problems": ["broken"], "path": "/store/bin"}
++    assert order.read_text() == f"deps:{tmp_path / 'r'} activate "
++
++
++@posix
++def test_worker_failure_is_an_error_result(tmp_path, use_source):
++    use_source(_fake_source(tmp_path, "raise RuntimeError('boom')", "pass"))
++    assert launch_probe.probe(tmp_path, timeout=BOUND) == {
++        "schema": 1, "state": "error", "detail": "RuntimeError: boom"}
++
++
++@posix
++def test_stdout_noise_from_imports_does_not_corrupt_the_reply(tmp_path, use_source):
++    use_source(_fake_source(tmp_path, "print('noise'); return True", "pass"))
++    assert launch_probe.probe(tmp_path, timeout=BOUND) == {"schema": 1, "state": "current"}
++
++
++@posix
++@pytest.mark.parametrize("body", [
++    "import sys; sys.stdout.write('not json\\n')",
++    "import sys; sys.stdout.write('{\"schema\": 2, \"state\": \"current\"}\\n')",
++    "import sys; sys.stdout.write('{\"schema\": 1, \"state\": \"runtime\"}\\n')",
++    "import sys; sys.stdout.write('x' * 200000)",
++    "pass",
++])
++def test_malformed_worker_answers_are_none(monkeypatch, tmp_path, body):
++    real_popen = launch_probe.subprocess.Popen
++
++    def popen(argv, **kwargs):
++        return real_popen([sys.executable, "-I", "-S", "-c", body], **kwargs)
++
++    monkeypatch.setattr(launch_probe.subprocess, "Popen", popen)
++    assert launch_probe.probe(tmp_path, timeout=BOUND) is None
++
++
++@posix
++def test_invalid_arguments_and_missing_interpreter_are_none(monkeypatch, tmp_path):
++    assert launch_probe.probe(tmp_path, "install") is None
++    assert launch_probe.probe(tmp_path, timeout=0) is None
++    monkeypatch.setattr(launch_probe.sys, "executable", str(tmp_path / "missing-python"))
++    assert launch_probe.probe(tmp_path, timeout=BOUND) is None
++
++
++@posix
++def test_blocked_pm_runtime_preparation_times_out_and_leaves_no_descendant(tmp_path, use_source):
++    pid_file = tmp_path / "pid"
++    use_source(_fake_source(
++        tmp_path, "return True",
++        f"holder.hold({str(pid_file)!r}); import threading; threading.Event().wait()",
++    ))
++    start = time.monotonic()
++    assert launch_probe.probe(tmp_path, "runtime", timeout=0.5) is None
++    assert time.monotonic() - start <= BOUND
++    pid = _pid(pid_file)
++    wait_until(lambda: not _alive(pid), timeout=BOUND, what="sentinel descendant gone")
++
++
++@posix
++def test_descendant_holding_stdout_after_reply_neither_hangs_nor_survives(tmp_path, use_source):
++    pid_file = tmp_path / "pid"
++    use_source(_fake_source(tmp_path, f"holder.hold({str(pid_file)!r}); return True", "pass"))
++    start = time.monotonic()
++    assert launch_probe.probe(tmp_path, timeout=BOUND) == {"schema": 1, "state": "current"}
++    assert time.monotonic() - start <= BOUND
++    pid = _pid(pid_file)
++    wait_until(lambda: not _alive(pid), timeout=BOUND, what="sentinel descendant gone")
++
++
++@pytest.mark.platforms("windows")
++def test_windows_has_no_probe_and_returns_none(tmp_path):
++    assert launch_probe.probe(tmp_path) is None
+diff --git a/tests/hermes_cli/test_launch_relaunch_loop.py b/tests/hermes_cli/test_launch_relaunch_loop.py
+index 517c0ffdbd3..8a045ecd514 100644
+--- a/tests/hermes_cli/test_launch_relaunch_loop.py
++++ b/tests/hermes_cli/test_launch_relaunch_loop.py
+@@ -45,6 +45,7 @@ def sync(*_args, **_kwargs):
+ 
+ # "restore": PM's answer follows the sync; otherwise it never says current.
+ pm.venv_is_current = lambda **_kw: sync_mode == "restore" and state.read_text() == "current"
++venv_sync._launch_currency = lambda root, command: pm.venv_is_current(project_root=root)
+ pm.sync_venv = sync
+ pm.client.ensure_tools_for_sync = lambda: None
+ _launchers.resolve_store_python = lambda *_a, **_k: Path(sys.executable)
+diff --git a/tests/hermes_cli/test_update_launch_completion.py b/tests/hermes_cli/test_update_launch_completion.py
+index 9bd381acb78..f710df2e04f 100644
+--- a/tests/hermes_cli/test_update_launch_completion.py
++++ b/tests/hermes_cli/test_update_launch_completion.py
+@@ -19,6 +19,7 @@ def _no_tool_downloads(monkeypatch):
+     import pm.client
+ 
+     monkeypatch.setattr(pm.client, "ensure_tools_for_sync", lambda: None)
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: pm.venv_is_current(project_root=root))
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/hermes_cli/test_venv_current_launch.py b/tests/hermes_cli/test_venv_current_launch.py
+index 6c0c3e58818..62d65579c53 100644
+--- a/tests/hermes_cli/test_venv_current_launch.py
++++ b/tests/hermes_cli/test_venv_current_launch.py
+@@ -27,15 +27,21 @@ def launch(tmp_path, monkeypatch):
+     (root / "install-stamp.json").write_text('{"updateMechanism": "self"}', encoding="utf-8")
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+-    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: True)
+     store_python = tmp_path / "store" / "cpython-3.14" / "bin" / "python3"
+     store_python.parent.mkdir(parents=True)
+     store_python.write_text("#!/bin/sh\n", encoding="utf-8")
++    # Intact checkout launchers, as an earlier publication left them.
++    from hermes_cli._launchers import WINDOWS_BIN_LAUNCHERS
++    for name in WINDOWS_BIN_LAUNCHERS:
++        launcher = root / ".hermes" / "bin" / name
++        launcher.parent.mkdir(parents=True, exist_ok=True)
++        launcher.write_text(f"#!/bin/sh\nexec {store_python} -I -c 'pass' \"$@\"\n", encoding="utf-8")
+     published = []
+     monkeypatch.setattr(venv_sync, "publish_launchers", published.append)
+ 
+     def run(*, store_spelling: Path, executable: Path):
+-        monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: store_spelling)
++        monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: store_spelling)
+         monkeypatch.setattr(sys, "executable", str(executable))
+         return venv_sync.prepare_launch(root, []), published
+ 
+@@ -61,4 +67,115 @@ def test_venv_python_symlinked_to_the_store_binary_still_relaunches(launch):
+ 
+     target, published = run(store_spelling=store_python, executable=venv_python)
+     assert target == store_python
+-    assert published == [(tmp_path / "checkout").resolve()]
++    assert published == [], "a current interpreter handoff must not load config or republish"
++
++
++@pytest.mark.platforms("posix")
++def test_unknown_currency_still_hands_off_to_the_managed_interpreter(launch, monkeypatch):
++    """A timed-out probe skips repair and publication, never interpreter isolation."""
++    tmp_path, store_python, run = launch
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: None)
++    pending = venv_sync.arm_completion(tmp_path / "checkout")
++    venv_python = tmp_path / "venv" / "bin" / "python"
++    venv_python.parent.mkdir(parents=True)
++    venv_python.symlink_to(store_python)
++
++    assert run(store_spelling=store_python, executable=venv_python) == (store_python, [])
++    assert run(store_spelling=store_python, executable=store_python) == (None, [])
++    assert pending.is_file(), "an unknown verdict must leave completion debt for a later launch"
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("damage", ["missing", "dead interpreter", "stale store pin"])
++def test_current_launch_republishes_only_a_missing_dead_or_stale_launcher(launch, damage):
++    from pm.environments import store_root
++
++    tmp_path, store_python, run = launch
++    launcher = tmp_path / "checkout" / ".hermes" / "bin" / "hermes"
++    if damage == "missing":
++        launcher.unlink()
++    elif damage == "dead interpreter":
++        launcher.write_text(f"#!/bin/sh\nexec {tmp_path / 'gone' / 'python3'} -I -c 'pass'\n", encoding="utf-8")
++    else:
++        # A live, older Python in this root's own store: publication would repin it, so
++        # skipping publication must not keep it until that Python is collected.
++        old = store_root((tmp_path / "checkout").resolve()) / "cpython-3.13" / "bin" / "python3"
++        old.parent.mkdir(parents=True)
++        old.write_text("#!/bin/sh\n", encoding="utf-8")
++        launcher.write_text(f"#!/bin/sh\nexec {old} -I -c 'pass'\n", encoding="utf-8")
++
++    assert run(store_spelling=store_python, executable=store_python) == (
++        None, [(tmp_path / "checkout").resolve()])
++
++
++@pytest.mark.platforms("posix")
++def test_current_launch_keeps_a_shared_launcher_bound_outside_its_store(launch):
++    """A borrowed checkout's launcher bound to another home's live Python is not republished."""
++    tmp_path, store_python, run = launch
++    other = tmp_path / "other-home" / "tools" / "python3"
++    other.parent.mkdir(parents=True)
++    other.write_text("#!/bin/sh\n", encoding="utf-8")
++    launcher = tmp_path / "checkout" / ".hermes" / "bin" / "hermes"
++    launcher.write_text(f"#!/bin/sh\nexec {other} -I -c 'pass'\n", encoding="utf-8")
++
++    assert run(store_spelling=store_python, executable=store_python) == (None, [])
++
++
++@pytest.mark.platforms("posix")
++def test_current_handoff_spares_the_execd_child_a_second_probe(launch, monkeypatch):
++    """The exec'd child (same pid) trusts its parent's fresh verdict once; nobody else does."""
++    import os
++
++    tmp_path, store_python, run = launch
++    root = (tmp_path / "checkout").resolve()
++    venv_python = tmp_path / "venv" / "bin" / "python"
++    venv_python.parent.mkdir(parents=True)
++    venv_python.symlink_to(store_python)
++
++    assert run(store_spelling=store_python, executable=venv_python) == (store_python, [])
++    handoff = venv_sync.launch_handoff_env()
++    assert handoff == {venv_sync.LAUNCH_HANDOFF_ENV: f"current:{os.getpid()}:{root}"}
++
++    probes = []
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: probes.append(root) or None)
++    for name, value in handoff.items():
++        monkeypatch.setenv(name, value)
++    assert run(store_spelling=store_python, executable=store_python) == (None, [])
++    assert probes == [], "the exec'd child repeated its parent's probe"
++    assert venv_sync.LAUNCH_HANDOFF_ENV not in os.environ, "the handoff must not reach subprocesses"
++    assert venv_sync.launch_handoff_env() == {}
++
++    # A re-exec after the handoff was consumed (an early-recovery restore) and a foreign
++    # process (another pid) both probe for themselves.
++    assert run(store_spelling=store_python, executable=store_python) == (None, [])
++    monkeypatch.setenv(venv_sync.LAUNCH_HANDOFF_ENV, f"current:{os.getpid() + 1}:{root}")
++    assert run(store_spelling=store_python, executable=store_python) == (None, [])
++    assert probes == [root, root]
++
++
++@pytest.mark.platforms("posix")
++def test_unknown_currency_hands_off_as_unknown_without_a_second_wait(launch, monkeypatch):
++    """A timed-out probe is handed on as unknown: the exec'd child neither re-probes
++    (a second deadline) nor treats it as current (it still owes the debt)."""
++    import os
++
++    tmp_path, store_python, run = launch
++    root = (tmp_path / "checkout").resolve()
++    probes = []
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: probes.append(root) or None)
++    monkeypatch.setattr(venv_sync, "_unknown_roots", set())
++    monkeypatch.setattr(venv_sync, "_current_roots", set())
++    pending = venv_sync.arm_completion(root)
++    venv_python = tmp_path / "venv" / "bin" / "python"
++    venv_python.parent.mkdir(parents=True)
++    venv_python.symlink_to(store_python)
++
++    assert run(store_spelling=store_python, executable=venv_python) == (store_python, [])
++    handoff = venv_sync.launch_handoff_env()
++    assert handoff == {venv_sync.LAUNCH_HANDOFF_ENV: f"unknown:{os.getpid()}:{root}"}
++    for name, value in handoff.items():
++        monkeypatch.setenv(name, value)
++    assert run(store_spelling=store_python, executable=store_python) == (None, [])
++    assert probes == [root], "the exec'd child waited out a second probe"
++    assert root in venv_sync._unknown_roots and root not in venv_sync._current_roots
++    assert pending.is_file()
+diff --git a/tests/hermes_cli/test_venv_sync_update_tree.py b/tests/hermes_cli/test_venv_sync_update_tree.py
+index b01fd25b79a..91e24beb86b 100644
+--- a/tests/hermes_cli/test_venv_sync_update_tree.py
++++ b/tests/hermes_cli/test_venv_sync_update_tree.py
+@@ -37,7 +37,7 @@ def test_launch_refuses_while_another_process_holds_the_checkout(tmp_path, monke
+     (root / "install-stamp.json").write_text('{"updateMechanism": "self"}', encoding="utf-8")
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+     monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+-    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)  # an interrupted update's tree
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: False)  # an interrupted update's tree
+     finished = []
+     monkeypatch.setattr(venv_sync, "_finish_source_update", lambda *a, **k: finished.append(a))
+ 
+diff --git a/tests/pm/test_source_update_launch.py b/tests/pm/test_source_update_launch.py
+index 0f9c8d93938..c205ec1ead4 100644
+--- a/tests/pm/test_source_update_launch.py
++++ b/tests/pm/test_source_update_launch.py
+@@ -29,6 +29,13 @@ from tests.pm._fixtures import isolated_python
+ pytestmark = pytest.mark.real_machine_home
+ 
+ 
++@pytest.fixture(autouse=True)
++def _in_process_currency(monkeypatch):
++    # These transaction tests substitute PM's tool/runtime providers in this process;
++    # the separate launch-probe suite covers the isolated deadline boundary.
++    monkeypatch.setattr(venv_sync, "_launch_currency", lambda root, command: pm.venv_is_current(project_root=root))
++
++
+ @pytest.fixture
+ def source_launch(tmp_path, monkeypatch, isolated_python):
+     client = importlib.import_module("pm.client")
+@@ -389,7 +396,13 @@ def test_real_bootstrap_reexecs_before_app_imports(source_launch, tmp_path, isol
+         "import pm.client\n"
+         "from pm import paths\n"
+         f"paths.lockfile_path = lambda: Path({str(tmp_path / 'tool-lock.json')!r})\n"
+-        f"pm.client.runtime_command = lambda *args, **kwargs: {worker_command!r}\n",
++        f"pm.client.runtime_command = lambda *args, **kwargs: {worker_command!r}\n"
++        # The bounded currency probe asks from a fresh interpreter: give it the same tools,
++        # and room for this cold real-uv fixture (the deadline itself is tested elsewhere).
++        "import hermes_cli.launch_probe as _probe\n"
++        "_probe.DEFAULT_TIMEOUT = 30.0\n"
++        "_probe._WORKER = _probe._WORKER.replace('try:\\n', "
++        f"{'sys.path.insert(0, ' + repr(str(root)) + '); import launch_test_tools' + chr(10) + 'try:' + chr(10)!r}, 1)\n",
+         encoding="utf-8",
+     )
+     entry = root / "launch_probe.py"
+@@ -480,7 +493,13 @@ def test_failed_launch_completion_degrades_to_a_warning(source_launch, tmp_path,
+         "import pm.client\n"
+         "from pm import paths\n"
+         f"paths.lockfile_path = lambda: Path({str(tmp_path / 'tool-lock.json')!r})\n"
+-        f"pm.client.runtime_command = lambda *args, **kwargs: {worker_command!r}\n",
++        f"pm.client.runtime_command = lambda *args, **kwargs: {worker_command!r}\n"
++        # The bounded currency probe asks from a fresh interpreter: give it the same tools,
++        # and room for this cold real-uv fixture (the deadline itself is tested elsewhere).
++        "import hermes_cli.launch_probe as _probe\n"
++        "_probe.DEFAULT_TIMEOUT = 30.0\n"
++        "_probe._WORKER = _probe._WORKER.replace('try:\\n', "
++        f"{'sys.path.insert(0, ' + repr(str(root)) + '); import launch_test_tools' + chr(10) + 'try:' + chr(10)!r}, 1)\n",
+         encoding="utf-8",
+     )
+     entry = root / "launch_probe.py"
+-- 
+2.55.0
+

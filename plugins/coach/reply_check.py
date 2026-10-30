@@ -470,8 +470,64 @@ def credit_ask(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     return m.group(0).strip()
 
 
-RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask")
-DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask")
+# ---- laptop_job: the reply proposes a recurring unattended job on a Mac that sleeps ----------------------------------
+# (self-heal agent-60ca102b39: a chat offered "a small job on the MacBook every 10 hours" to rotate a Slack token;
+# David: "that should be done on the hub, mbp doesnt stay on".) Deterministic, before the judge. One sentence must
+# carry all of: a creation verb or offer (build/set up/add/plan:/want me to...), a recurring job (cron, launchd, every N hours,
+# hourly, watcher...), a Mac host (MacBook, MBP, laptop, mini), no hub target and no Mac-only reason.
+_LJ_RECUR_RE = re.compile(
+    r"\bcron(?:tab|\s+job)?s?\b|\blaunchd\b|\bLaunchAgents?\b|\bsystemd\s+timer\b"
+    r"|\bevery\s+(?:\d+|few|couple(?:\s+of)?|other)?\s*(?:min(?:ute)?s?|h(?:ou)?rs?|hours?|h|days?|nights?|mornings?)\b"
+    r"|\bhourly\b|\bnightly\b|\bdaily\b|\bperiodic(?:ally)?\b|\bon\s+a\s+(?:timer|schedule)\b"
+    r"|\b(?:scheduled|recurring|periodic)\s+(?:job|task|run|refresh)\b|\b(?:refresher|watcher|poller)s?\b", re.I)
+_LJ_MACHOST = r"(?:Mac\s*Book(?:\s+Pro)?|MBP|laptop|mac\s*mini|daveey-mini|Mac|mini)"
+# The Mac must be where the job runs: "on/from the MacBook", "on the mini", or "MacBook cron/job/watcher". A bare
+# "the MacBook poller is stuck" or "gpt-4o-mini" is not a location (backtest 2026-10-30: 8 of 9 hits were that).
+_LJ_MAC_RE = re.compile(
+    r"\b(?:on|from|onto|in)\s+(?:the\s+|your\s+|my\s+|David[\u2019']s\s+)?" + _LJ_MACHOST + r"\b"
+    r"|\b(?:Mac\s*Book|MBP|laptop|mini)(?:[\u2019']s)?\s+(?:cron(?:tab)?|launchd|LaunchAgent|job|timer|watcher|poller"
+    r"|refresher)s?\b", re.I)
+_LJ_NEGATED_RE = re.compile(r"\b(?:adds?|added|with|needs?)\s+no\b|\bno\s+(?:new\s+)?(?:LaunchAgent|cron|launchd|job|"
+                            r"MacBook|Mac)\b|\b(?:not|never)\s+(?:on|from)\s+(?:the\s+|your\s+)?Mac", re.I)
+_LJ_HUB_RE = re.compile(r"\bhermes-hub\b|\bthe\s+hub\b|\bhub\s+(?:cron|job|timer|host)\b|\bon\s+hub\b|\bworker-\d\b",
+                        re.I)
+# A job that needs a Mac's own state legitimately runs there.
+_LJ_MAC_ONLY_RE = re.compile(
+    r"\bKeychain\b|\bChrome\b|\bSafari\b|\bbrowser\b|\bApple\s+\w+|\biCloud\b|\bPhotos\b|\biMessage\b|\bMessages\s+app\b"
+    r"|\bXcode\b|\bosascript\b|\bAppleScript\b|\bScreen\s+Shar|\bper-host\b|\bthis\s+Mac[\u2019']s\b|\blocal\s+state\b"
+    r"|\bHermes\s+Desktop\b|\bDesktop\s+app\b|\bmacOS[- ]only\b|\bTCC\b|\bhermes-sync\b|\bdisk\b", re.I)
+# A creation verb, or an explicit plan/offer framing; "I'll check the MacBook poller" is not a proposal.
+_LJ_PROPOSE_RE = re.compile(
+    r"\b(?:build|set\s+up|setting\s+up|add|adding|create|creating|install|installing|schedul(?:e|ing)|deploy"
+    r"|put|move)\b"
+    r"|\bplan\s*:|\bproposal\s*:|\b(?:want|like)\s+me\s+to\b|\b(?:shall|should)\s+I\b", re.I)
+_LJ_META_RE = re.compile(r"\blaptop_job\b", re.I)
+LAPTOP_JOB_NUDGE = (
+    "[coach] laptop_job: your reply proposes a recurring unattended job on a Mac (\"{evidence}\"), but the MacBook and "
+    "mini sleep, so the job silently stops. Put it on hermes-hub (hub cron / systemd timer). If the hub lacks a "
+    "credential or write access the Mac has today, the plan is the hub job plus a one-time grant card for that access, "
+    "not a Mac job. Keep a job on a Mac only when it needs that Mac's own state (Keychain, Chrome, Apple apps, a "
+    "per-host watcher), and say so in the same sentence.")
+
+
+def laptop_job(reply: str) -> Optional[str]:
+    """The sentence proposing a recurring job on a sleeping Mac, else None (code, quotes and `>` lines ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    for s in _SENTENCE_END.split(text):
+        if not (_LJ_RECUR_RE.search(s) and _LJ_MAC_RE.search(s) and _LJ_PROPOSE_RE.search(s)):
+            continue
+        if (_LJ_HUB_RE.search(s) or _LJ_MAC_ONLY_RE.search(s) or _LJ_META_RE.search(s)
+                or _LJ_NEGATED_RE.search(s)):
+            continue
+        return s.strip(" -*\t")
+    return None
+
+
+RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
+         "laptop_job")
+DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
+                 "laptop_job")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 DEFAULT_THRESHOLDS = {"report_only": 0.5, "report_only_screen": 0.85}
@@ -1093,6 +1149,38 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
     return {"p": v["handoff"], "resolved": v["handoff"] < th, "evidence": v.get("evidence") or "", "judged": True}
 
 
+def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
+                  threshold: float = 0.8, thresholds: Optional[dict] = None,
+                  wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
+                  human_asks: Optional[Callable[[], list]] = None) -> dict:
+    """After a nudge of any rule: does the REVISED final reply (with the whole turn's tool log, revision included)
+    still trip the same rule? Re-runs check() limited to that rule, same judge and thresholds (agent-3ba1979f34).
+    Returns {"p", "resolved", "evidence", "judged"}; resolved=None when the judge gave no usable verdict or the check
+    failed (the self-heal collector then files, as it would without an outcome)."""
+    if rule == "handoff":
+        return handoff_outcome(reply, user_ask, tool_log, llm, threshold=threshold, thresholds=thresholds)
+    seen: dict = {"called": False, "v": None}
+
+    def judge(system: str, prompt: str) -> str:
+        seen["called"] = True
+        raw = llm(system, prompt)
+        seen["v"] = parse_verdict(raw)
+        return raw
+    try:
+        hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,
+                    wake=wake, kanban_down=kanban_down, human_asks=human_asks)
+    except Exception:
+        return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
+    if hit:
+        return {"p": hit["p"], "resolved": False, "evidence": hit.get("evidence") or "", "judged": seen["called"]}
+    if seen["called"] and not seen["v"]:
+        return {"p": None, "resolved": None, "evidence": "judge gave no verdict", "judged": True}
+    v = seen["v"] or {}
+    return {"p": float(v.get(rule) or 0.0), "resolved": True,
+            "evidence": (v.get("evidence") if seen["called"] else "") or f"{rule} no longer fires",
+            "judged": seen["called"]}
+
+
 def rule_threshold(rule: str, verdict: dict, thresholds: dict, default: float) -> float:
     """The threshold a verdict is held to: report_only uses its second-opinion threshold only when the strong model
     scored it, otherwise report_only_screen."""
@@ -1150,6 +1238,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "credit_ask", "p": 1.0, "evidence": phrase, "reason": "credit_ask",
                     "verdict": {"credit_ask": 1.0, "evidence": phrase},
                     "nudge": CREDIT_ASK_NUDGE.format(evidence=phrase[:160])}
+    if not only or "laptop_job" in only:
+        phrase = laptop_job(reply)
+        if phrase:  # deterministic: a recurring unattended job proposed on a Mac that sleeps
+            return {"rule": "laptop_job", "p": 1.0, "evidence": phrase, "reason": "laptop_job",
+                    "verdict": {"laptop_job": 1.0, "evidence": phrase},
+                    "nudge": LAPTOP_JOB_NUDGE.format(evidence=phrase[:160])}
     if (not only or "report_only" in only) and not scoped:
         phrase = unverified_owner(reply, tool_log)
         if phrase:  # deterministic: no judge call, no AI score at the edge of its bar

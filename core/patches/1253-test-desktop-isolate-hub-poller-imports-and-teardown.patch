@@ -1,0 +1,239 @@
+From 2dc64603e1ed4f667baa8293c4345136072ba773 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 09:09:37 +0000
+Subject: [PATCH] test(desktop): isolate hub poller imports and teardown from
+ test deadlines
+
+---
+ .../hooks/use-session-list-actions.test.tsx   | 162 ++++++++++--------
+ 1 file changed, 89 insertions(+), 73 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+index b990d03bef3..8f2408c209c 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-list-actions.test.tsx
+@@ -1,8 +1,10 @@
+-import { act, render, renderHook } from '@testing-library/react'
++import { publishOfflineSessions } from '@hermes/plugin-sdk'
++import { act, cleanup, render, renderHook } from '@testing-library/react'
+ import { Suspense } from 'react'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { type SessionInfo, setApiRequestConnection, type SidebarSessionsResponse } from '@/hermes'
++import hubSyncPlugin from '@/plugins/hub-sync/plugin'
+ import { $cronJobs, setCronJobs } from '@/store/cron'
+ import {
+   beginGatewaySwitch,
+@@ -11,6 +13,7 @@ import {
+   registerGatewaySwitchLifecycle
+ } from '@/store/gateway-switch'
+ import {
++  $offlineSessions,
+   _resetOfflineSessionsForTests,
+   mergeOfflineFallback,
+   offlineSessionsFromReplica
+@@ -1344,15 +1347,18 @@ describe('messaging profile scope', () => {
+   })
+ })
+ 
+-const replicaTransport = vi.hoisted(() => ({ reachable: true }))
++const replicaTransport = vi.hoisted(() => ({ reachable: true, delayMs: 250 }))
+ 
+ vi.mock('@/store/hub-sync', async importOriginal => ({
+   ...(await importOriginal<Record<string, unknown>>()),
+   connectionForHubGateway: (gateway: string) => (gateway === 'mini' ? 'conn-mini' : undefined),
+   hubGatewayForConnection: (id: string) => (id === 'conn-mini' ? 'mini' : 'primary'),
+   hubReplicaConnectionId: () => 'primary',
+-  hubGet: async (path: string) =>
+-    path === '/status'
++  hubGet: async (path: string) => {
++    // Exercise asynchronous transport completion rather than synchronous mocks.
++    await new Promise(resolve => setTimeout(resolve, replicaTransport.delayMs))
++
++    return path === '/status'
+       ? replicaTransport.reachable
+         ? { gateway: 'mini' }
+         : null
+@@ -1375,14 +1381,19 @@ vi.mock('@/store/hub-sync', async importOriginal => ({
+             }
+           ]
+         }
++  }
+ }))
+ 
+-vi.mock('@hermes/plugin-sdk', async importOriginal => {
+-  const actual = await importOriginal<Record<string, unknown>>()
++// Keep the real poller and freshness/publication path, not the SDK barrel's
++// unrelated app graph. Load the plugin during collection, before any test can
++// time out and resume a cold import inside the following test's React act().
++vi.mock('@hermes/plugin-sdk', async () => {
++  const actual = await import('@/sdk/hub-sync')
+   const { $sessions: rows } = await import('@/store/session')
+ 
+   return {
+     ...actual,
++    publishOfflineSessions: vi.fn(actual.publishOfflineSessions),
+     host: {
+       sessions: { rows },
+       state: { gateways: { get: () => [{ id: 'primary' }, { id: 'conn-mini' }], listen: () => () => {} } }
+@@ -1391,85 +1402,90 @@ vi.mock('@hermes/plugin-sdk', async importOriginal => {
+ })
+ 
+ describe('actual hub poller + list refresh freshness', () => {
++  const disposers: Array<() => void> = []
++
++  beforeEach(() => {
++    _resetOfflineSessionsForTests()
++    replicaTransport.reachable = true
++    vi.mocked(publishOfflineSessions).mockClear()
++    vi.useFakeTimers()
++  })
++
++  // Vitest runs hooks even when a test times out; a suspended test's finally
++  // does not run until its awaited work settles (possibly in the next case).
++  afterEach(() => {
++    disposers.splice(0).forEach(dispose => dispose())
++    cleanup()
++    vi.useRealTimers()
++    _resetOfflineSessionsForTests()
++  })
++
+   it.each(['status', 'status-and-list', 'list', 'throw', 'flags'])(
+     'retained rows become offline after %s failure, then recover once',
+     async failure => {
+-      const { default: plugin } = await import('@/plugins/hub-sync/plugin')
+-
+-      const { $offlineSessions, mergeOfflineFallback, _resetOfflineSessionsForTests } =
+-        await import('@/store/offline-sessions')
+-
+-      _resetOfflineSessionsForTests()
+-      replicaTransport.reachable = true
+-      vi.useFakeTimers()
+-      const disposers: Array<() => void> = []
+       const owner = row('retained', { connection_id: 'conn-mini', profile: 'work', is_active: true })
+       listSidebarSessions.mockResolvedValue(sidebar({ sessions: [owner] }))
+-      const { result, unmount } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
++      const { result } = renderHook(() => useSessionListActions({ profileScope: 'all' }))
+       const effective = () => mergeOfflineFallback($sessions.get(), $offlineSessions.get())
+ 
+-      try {
+-        await act(async () => {
+-          await result.current.refreshSessions()
++      await act(async () => {
++        await result.current.refreshSessions()
++      })
++      hubSyncPlugin.register({ onDispose: (fn: () => void) => disposers.push(fn) } as never)
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(replicaTransport.delayMs)
++        await vi.waitFor(() => expect(publishOfflineSessions).toHaveBeenCalledTimes(1))
++      })
++      expect(effective()).toHaveLength(1)
++      expect(effective()[0].offline_cached).not.toBe(true)
++
++      replicaTransport.reachable = !failure.startsWith('status')
++
++      if (failure === 'throw') {
++        listSidebarSessions.mockRejectedValue(new Error('connection lost'))
++      } else if (failure === 'flags') {
++        listSidebarSessions.mockResolvedValue({
++          ...sidebar({ sessions: [] }),
++          profiles_failed: { work: { failed: true, retry: true } },
++          errors: [{ profile: 'work', error: 'failed' }]
+         })
+-        plugin.register({ onDispose: (fn: () => void) => disposers.push(fn) } as never)
+-        await act(async () => {
+-          await vi.advanceTimersByTimeAsync(0)
++      } else {
++        listSidebarSessions.mockResolvedValue({
++          ...sidebar({ sessions: [] }),
++          errors: [{ profile: 'work', error: 'unreachable' }]
+         })
+-        expect(effective()).toHaveLength(1)
+-        expect(effective()[0].offline_cached).not.toBe(true)
+-
+-        replicaTransport.reachable = !failure.startsWith('status')
+-
+-        if (failure === 'throw') {
+-          listSidebarSessions.mockRejectedValue(new Error('connection lost'))
+-        } else if (failure === 'flags') {
+-          listSidebarSessions.mockResolvedValue({
+-            ...sidebar({ sessions: [] }),
+-            profiles_failed: { work: { failed: true, retry: true } },
+-            errors: [{ profile: 'work', error: 'failed' }]
+-          })
+-        } else {
+-          listSidebarSessions.mockResolvedValue({
+-            ...sidebar({ sessions: [] }),
+-            errors: [{ profile: 'work', error: 'unreachable' }]
+-          })
+-        }
++      }
+ 
+-        await act(async () => {
+-          if (failure !== 'status') {
+-            await result.current.refreshSessions().catch(() => undefined)
+-          }
++      await act(async () => {
++        if (failure !== 'status') {
++          await result.current.refreshSessions().catch(() => undefined)
++        }
+ 
+-          await vi.advanceTimersByTimeAsync(60_000)
+-        })
+-        expect($sessions.get().map(s => s.id)).toEqual(['retained'])
+-        expect(effective()).toHaveLength(1)
+-        expect(effective()[0]).toMatchObject({
+-          connection_id: 'conn-mini',
+-          profile: 'work',
+-          offline_cached: true,
+-          is_active: false
+-        })
++        // One full replica reload plus cursor/read transport completion, all
++        // on the fake clock. waitFor confirms, rather than driving the clock
++        // through real-time polling intervals on a loaded runner.
++        await vi.advanceTimersByTimeAsync(30_000 + 2 * replicaTransport.delayMs)
++        await vi.waitFor(() => expect(effective()[0]?.offline_cached).toBe(true))
++      })
++      expect($sessions.get().map(s => s.id)).toEqual(['retained'])
++      expect(effective()).toHaveLength(1)
++      expect(effective()[0]).toMatchObject({
++        connection_id: 'conn-mini',
++        profile: 'work',
++        offline_cached: true,
++        is_active: false
++      })
+ 
+-        replicaTransport.reachable = true
+-        listSidebarSessions.mockResolvedValue(sidebar({ sessions: [{ ...owner, title: 'Recovered' }] }))
+-        await act(async () => {
+-          await result.current.refreshSessions()
+-        })
+-        // Recovery must win even before the next replica poll.
+-        expect(effective()).toHaveLength(1)
+-        expect(effective()[0]).toMatchObject({ title: 'Recovered', is_active: true })
+-        expect(effective()[0].offline_cached).not.toBe(true)
+-      } finally {
+-        disposers.forEach(dispose => dispose())
+-        unmount()
+-        vi.useRealTimers()
+-        _resetOfflineSessionsForTests()
+-      }
+-    },
+-    // First case pays the cold dynamic imports; loaded CI exceeded the 15s default.
+-    60_000
++      replicaTransport.reachable = true
++      listSidebarSessions.mockResolvedValue(sidebar({ sessions: [{ ...owner, title: 'Recovered' }] }))
++      await act(async () => {
++        await result.current.refreshSessions()
++      })
++      // Recovery must win even before the next replica poll.
++      expect(effective()).toHaveLength(1)
++      expect(effective()[0]).toMatchObject({ title: 'Recovered', is_active: true })
++      expect(effective()[0].offline_cached).not.toBe(true)
++    }
+   )
+ })
+ 
+-- 
+2.55.0
+

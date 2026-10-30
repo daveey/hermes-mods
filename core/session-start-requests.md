@@ -53,7 +53,7 @@ Source commits `5c31e92ca8` and `b598614d83` are merged. The following implement
 
 ### Behavior
 
-Trusted in-process resolvers can return StartIntent(title=..., text=..., source='desktop', metadata={'runner_repair_id': repair_id}). Metadata defaults to empty, accepts at most 32 string pairs, and bounds keys to 1–64 characters and values to 0–1024 characters. Construction snapshots the dictionary into an immutable mapping. RPC clients still supply only profile, namespace, and start_request_id; no client prompt, metadata, identity, or destination-session fields are accepted.
+Trusted in-process resolvers can return StartIntent(title=..., text=..., source='desktop', metadata={'runner_repair_id': repair_id}). Metadata defaults to empty, accepts at most 32 string pairs, and bounds keys to 1–64 characters and values to 0–1067 characters. Construction snapshots the dictionary into an immutable mapping. RPC clients still supply only profile, namespace, and start_request_id; no client prompt, metadata, identity, or destination-session fields are accepted.
 
 The durable start ledger adds metadata_json with an empty-object default. Metadata, session, first transcript row and start mapping commit atomically. lookup/status return decoded metadata, including when status follows a compressed session's current ID. Nonempty metadata participates in intent conflict detection; empty metadata preserves the previous digest so old retries remain valid.
 

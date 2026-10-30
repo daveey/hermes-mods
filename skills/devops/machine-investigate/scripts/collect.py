@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import platform
+import plistlib
+import shlex
 import re
 import shutil
 import signal
@@ -34,6 +36,7 @@ MAC = platform.system() == "Darwin"
 TOP_N = 20
 MIN_CPU = 3.0
 TAG_KEYS = (
+    "HERMES_OWNER_CARD", "XPC_SERVICE_NAME",
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID",
     "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "BU_NAME",
 )
@@ -48,7 +51,81 @@ GATEWAY = re.compile(r"\b(gateway|serve|dashboard)\b")
 def ps_table() -> dict[int, dict]:
     out = subprocess.run(["ps", "-Ao", "pid=,ppid=,pcpu=,rss=,etime=,args="],
                          capture_output=True, text=True, check=True).stdout
-    return parse_ps(out)
+    table = parse_ps(out)
+    annotate_processes(table)
+    return table
+
+
+def annotate_processes(table: dict, proc_root=Path("/proc")) -> None:
+    """Read cwd and supervisor identity once per snapshot; never stop or change a job."""
+    if MAC:
+        try:
+            out = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fpn"],
+                                 capture_output=True, text=True, timeout=15).stdout
+            pid = None
+            for line in out.splitlines():
+                if line.startswith("p") and line[1:].isdigit():
+                    pid = int(line[1:])
+                elif line.startswith("n") and pid in table:
+                    table[pid]["cwd"] = line[1:]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        loaded = set()
+        try:
+            out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5).stdout
+            for line in out.splitlines():
+                fields = line.split()
+                if len(fields) != 3 or fields[0] == "PID":
+                    continue
+                loaded.add(fields[2])
+                if fields[0].isdigit() and int(fields[0]) in table:
+                    table[int(fields[0])].update(service=fields[2], service_manager="launchd")
+        except (OSError, subprocess.SubprocessError):
+            pass
+        # Jobs can be loaded without a PID in list. Match complete ProgramArguments, not script basenames.
+        for root in (HOME / "Library/LaunchAgents", Path("/Library/LaunchAgents"), Path("/Library/LaunchDaemons")):
+            for path in root.glob("*.plist"):
+                try:
+                    with path.open("rb") as f:
+                        job = plistlib.load(f)
+                    label_ = job.get("Label")
+                    argv = job.get("ProgramArguments") or [job.get("Program")]
+                    if label_ not in loaded or not argv or not all(isinstance(a, str) for a in argv):
+                        continue
+                    for row in table.values():
+                        if row["ppid"] == 1 and row["args"] in (" ".join(argv), shlex.join(argv)):
+                            row.update(service=label_, service_manager="launchd")
+                except (OSError, ValueError, plistlib.InvalidFileException):
+                    continue
+    else:
+        for pid, row in table.items():
+            try:
+                row["cwd"] = str((proc_root / str(pid) / "cwd").resolve(strict=True))
+            except OSError:
+                pass
+            try:
+                groups = (proc_root / str(pid) / "cgroup").read_text()
+                units = [u for u in re.findall(r"(?:^|/)([^/\n]+\.service)(?=/|$)", groups, re.M)
+                         if not u.startswith("user@")]
+                if units:
+                    row.update(service=units[-1], service_manager="systemd")
+            except OSError:
+                pass
+
+
+def service_info(table: dict, tags: dict, pid: int) -> dict:
+    ancestors = chain(table, pid)
+    gateways = {table[q].get("service") for q in ancestors[1:]
+                if table[q]["name"].startswith("hermes") and GATEWAY.search(table[q]["name"])}
+    for q in ancestors:
+        # A worker is not its gateway's long-lived service. Ordinary service wrappers still protect children.
+        if q != pid and table[q]["name"].startswith("hermes") and GATEWAY.search(table[q]["name"]):
+            break
+        service = table[q].get("service") or tags.get(q, {}).get("XPC_SERVICE_NAME")
+        if service and service != "0" and not service.startswith("application.") and service not in gateways:
+            return {"service": service, "service_manager": table[q].get(
+                "service_manager", "launchd" if MAC else "systemd")}
+    return {"service": "", "service_manager": ""}
 
 
 def parse_ps(out: str) -> dict[int, dict]:
@@ -114,6 +191,24 @@ def parse_env_tags(out: str) -> dict[int, dict]:
     return tags
 
 
+def valid_owner(value: str) -> str:
+    """`t_<hex>[@host]` or ''. The one validator for HERMES_OWNER_CARD values (service-owner-guard reuses it)."""
+    return value if re.fullmatch(r"t_[0-9a-f]+(?:@[A-Za-z0-9._-]+)?", value or "") else ""
+
+
+def read_owner_md(directory) -> tuple[str, str] | None:
+    """(card, path) from `<directory>/OWNER.md` whose first line is `card: t_<hex>[@host]`, else None.
+    The one OWNER.md parser (service-owner-guard sends this function's source to remote hosts)."""
+    path = Path(directory) / "OWNER.md"
+    try:
+        with path.open() as f:
+            first = f.readline(4096)
+    except OSError:
+        return None
+    match = re.match(r"^card: (t_[0-9a-f]+)(@[A-Za-z0-9._-]+)?(?:\s|$)", first)
+    return (match[1] + (match[2] or ""), str(path)) if match else None
+
+
 def owner(table: dict, tags: dict, pid: int) -> dict:
     """Tags inherited from the nearest tagged ancestor. A GUI app started from a worker keeps the dead
     worker's card id for ever, so card ids count only inside a hermes process tree."""
@@ -126,11 +221,25 @@ def owner(table: dict, tags: dict, pid: int) -> dict:
             for k in TASK_KEYS:
                 t.pop(k, None)
         agent.update(t)
+    # Explicit service ownership is independent of inherited worker tags.
+    for q in c:
+        explicit = valid_owner(tags.get(q, {}).get("HERMES_OWNER_CARD", ""))
+        if explicit:
+            agent.update(HERMES_OWNER_CARD=explicit, owner_source="env")
+            return agent
+    for q in c:
+        cwd = table[q].get("cwd")
+        found = read_owner_md(cwd) if cwd else None
+        if found:
+            agent.update(HERMES_OWNER_CARD=found[0], owner_source=found[1])
+            break
+    if "owner_source" not in agent and agent:
+        agent["owner_source"] = "env"
     return agent
 
 
 def label(agent: dict) -> str:
-    task = agent.get("HERMES_KANBAN_TASK") or agent.get("HERMES_KANBAN_WORKER_TASK")
+    task = agent.get("HERMES_OWNER_CARD") or agent.get("HERMES_KANBAN_TASK") or agent.get("HERMES_KANBAN_WORKER_TASK")
     for key, val in (("card", task), ("claude", agent.get("CLAUDE_CODE_HOST_SESSION_ID") or agent.get("CLAUDE_CODE_SESSION_ID")),
                      ("hermes-session", agent.get("HERMES_SESSION_ID")), ("codex", agent.get("CODEX_THREAD_ID")),
                      ("browser-use", agent.get("BU_NAME"))):
@@ -290,15 +399,20 @@ def attribute_runnable(snapshot: dict, table: dict, tags: dict) -> dict:
 
 def processes(table: dict, tags_fn=env_tags, extra_pids=()) -> dict:
     top = sorted((p for p in table if table[p]["cpu"] >= MIN_CPU), key=lambda p: -table[p]["cpu"])[:TOP_N]
-    tags = tags_fn(sorted({q for p in [*top, *extra_pids] for q in chain(table, p)}))
+    young_pids = [p for p in table if re.fullmatch(r"0?0:0\d", table[p]["etime"])]
+    service_pids = [p for p in table if service_info(table, {}, p)["service"]]
+    tags = tags_fn(sorted({q for p in [*top, *young_pids, *service_pids, *extra_pids] for q in chain(table, p)}))
+    def ownership(p):
+        agent = owner(table, tags, p)
+        return dict(owner=label(agent), owner_source=agent.get("owner_source", ""),
+                    **service_info(table, tags, p))
     rows = []
     for p in top:
         c = chain(table, p)
-        agent = owner(table, tags, p)
         rows.append({"pid": p, "cpu": table[p]["cpu"], "rss_mb": table[p]["rss_mb"], "etime": table[p]["etime"],
                      "name": table[p]["name"], "args": re.sub(r"\s+", " ", table[p]["args"])[:200],
                      "chain": [f"{table[q]['name']}[{q}]" for q in c[1:]],
-                     "root": table[c[-1]]["name"] if c else table[p]["name"], "owner": label(agent)})
+                     "root": table[c[-1]]["name"] if c else table[p]["name"], **ownership(p)})
     apps: dict[str, list] = {}
     for p, row in table.items():
         if row["cpu"] > 0:
@@ -307,13 +421,21 @@ def processes(table: dict, tags_fn=env_tags, extra_pids=()) -> dict:
             a[0] += row["cpu"]
             a[1] += 1
     # Short-lived churn: how many processes are under 10 s old, by name (cron/sync loops show up here).
-    young: dict[str, int] = {}
-    for row in table.values():
-        if re.fullmatch(r"0?0:0\d", row["etime"]):
-            young[row["name"]] = young.get(row["name"], 0) + 1
-    return {"top": rows,
+    young: dict[tuple, dict] = {}
+    for p in young_pids:
+        info = ownership(p)
+        key = (table[p]["name"], info["owner"], info["service"])
+        row = young.setdefault(key, dict(name=table[p]["name"], count=0, **info))
+        row["count"] += 1
+    # Include quiet owned services too: age and low CPU are not evidence of abandonment.
+    owned_services = []
+    for p in service_pids:
+        info = ownership(p)
+        if info["owner"]:
+            owned_services.append(dict(pid=p, name=table[p]["name"], cpu=table[p]["cpu"], **info))
+    return {"top": rows, "owned_services": owned_services,
             "by_app": sorted(([k, round(v[0], 1), v[1]] for k, v in apps.items()), key=lambda r: -r[1])[:15],
-            "young_by_name": sorted(young.items(), key=lambda kv: -kv[1])[:10]}
+            "young_by_name": sorted(young.values(), key=lambda r: -r["count"])[:10]}
 
 
 # ───────────────────────── machine ─────────────────────────
@@ -541,14 +663,20 @@ def kill_verdict(table: dict, tags: dict, pid: int, status_fn=card_status) -> tu
     row = table[pid]
     if row["name"].startswith("hermes") and GATEWAY.search(row["name"]):
         return False, "a Hermes gateway/serve process: ask the user"
+    info = service_info(table, tags, pid)
+    if info["service"]:
+        return False, f"a {info['service_manager']} service {info['service']}: ask on its owner card"
     exe = row["args"].split(" -", 1)[0]
     if GUI_APP.search(exe) and not re.search(r"/python[\d.]*$", exe.strip()):
         return False, "a GUI app: ask the user"
     agent = owner(table, tags, pid)
-    task = agent.get("HERMES_KANBAN_TASK") or agent.get("HERMES_KANBAN_WORKER_TASK")
+    task = agent.get("HERMES_OWNER_CARD") or agent.get("HERMES_KANBAN_TASK") or agent.get("HERMES_KANBAN_WORKER_TASK")
     if not task:
         return False, "no Kanban card owns it: ask the user"
-    status = status_fn(task)
+    card, _, host = task.partition("@")
+    local_hosts = {platform.node(), platform.node().split(".")[0]}
+    # A sync-shadow's terminal status is not authority to stop a remote-owned process.
+    status = None if host and host not in local_hosts else status_fn(card)
     if status in FINISHED:
         return True, f"card {task} is {status}; its process outlived it"
     return False, f"card {task} is {status or 'unknown here'}: still owned"

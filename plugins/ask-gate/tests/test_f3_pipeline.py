@@ -22,8 +22,13 @@ def test_direct_answer_persists_and_replaces_after_nudge_budget(gate, answer):
 def test_retired_terminal_step_never_nudges_execution(gate):
     ask = "Please run `sudo example-tool` on the mini."
     gate.ledger().add(ask, "The step was completed.", session="origin")
-    result = gate.pre_final_gate(session_id="origin", final_response=ask, attempt=0)
-    assert result and result.get("replace")
+    # First a hold whose nudge forbids re-asking and never steers toward running the step...
+    held = gate.pre_final_gate(session_id="origin", final_response=ask, attempt=0)
+    assert held and held.get("hold") and "replace" not in held
+    assert "run_in_user_terminal" not in held["nudge"] and "does not authorize" in held["nudge"]
+    # ...then, budget spent, a replacement without the step and without any nudge.
+    result = gate.pre_final_gate(session_id="origin", final_response=ask, attempt=2)
+    assert result and result.get("replace") and "sudo" not in result["replace"]
     assert "nudge" not in result
 
 

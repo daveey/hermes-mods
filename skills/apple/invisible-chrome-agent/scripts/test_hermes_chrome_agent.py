@@ -254,6 +254,79 @@ class Evict(unittest.TestCase):
 
 
 
+class LaunchUserChromeTest(unittest.TestCase):
+    INF = float("inf")
+
+    def test_agent_front_no_user_chrome_not_shown_launches(self):
+        self.assertTrue(hca.should_launch_user_chrome(True, 0.2, False, self.INF))
+
+    def test_user_chrome_running_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 0.2, True, self.INF))
+
+    def test_show_flag_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 0.2, False, 2.0))
+
+    def test_no_user_action_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 30.0, False, self.INF))
+
+    def test_agent_not_front_does_not_launch(self):
+        self.assertFalse(hca.should_launch_user_chrome(False, 0.2, False, self.INF))
+
+    def test_cooldown(self):
+        self.assertFalse(hca.should_launch_user_chrome(True, 0.2, False, self.INF, since_last_launch=5))
+
+    def test_user_chrome_detection_ignores_agent_and_helpers(self):
+        base = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        def run(lines):
+            with mock.patch.object(hca.subprocess, "run", return_value=mock.Mock(stdout="\n".join(lines))):
+                return hca.user_chrome_running()
+        agent = base + " --user-data-dir=" + hca.PROFILE + " --remote-debugging-port=1"
+        helper = base + " Helper --type=renderer --user-data-dir=/x"
+        self.assertFalse(run([agent, helper, "/bin/zsh"]))
+        self.assertTrue(run([agent, base + " --user-data-dir=/Users/d/Library/Application Support/Google/Chrome"]))
+
+
+class FocusLoopLaunchTest(unittest.TestCase):
+    """Runs the REAL Supervisor.focus_loop for one poll (only OS observations/side effects mocked): the helper
+    tests above can't catch a wrong argument at the call site."""
+
+    def run_loop(self, input_age=0.2, show_age=float("inf"), shown=False, user_running=False):
+        sup = hca.Supervisor.__new__(hca.Supervisor)
+        sup.stop = False
+        sup.chrome = mock.Mock(pid=4242)
+        sup.chrome.poll.return_value = None
+        sup.focus = mock.Mock()
+        sup.focus.step.return_value = None
+        launch = mock.Mock()
+        def sleep(_):
+            sup.stop = True
+        with mock.patch.object(hca, "front_pid", return_value=4242), \
+             mock.patch.object(hca, "user_input_age", return_value=input_age), \
+             mock.patch.object(hca, "show_age", return_value=show_age), \
+             mock.patch.object(hca, "show_active", return_value=shown), \
+             mock.patch.object(hca, "user_chrome_running", return_value=user_running), \
+             mock.patch.object(hca, "launch_user_chrome", launch), \
+             mock.patch.object(hca, "log"), \
+             mock.patch.object(hca.time, "sleep", side_effect=sleep):
+            sup.focus_loop()
+        return launch.call_count
+
+    def test_dock_click_with_no_user_chrome_launches(self):
+        self.assertEqual(self.run_loop(), 1)
+
+    def test_user_chrome_running_does_not_launch(self):
+        self.assertEqual(self.run_loop(user_running=True), 0)
+
+    def test_active_show_flag_older_than_allow_window_does_not_launch(self):
+        self.assertEqual(self.run_loop(show_age=60.0, shown=True), 0)
+
+    def test_recent_show_does_not_launch(self):
+        self.assertEqual(self.run_loop(show_age=2.0, shown=True), 0)
+
+    def test_no_user_input_does_not_launch(self):
+        self.assertEqual(self.run_loop(input_age=30.0), 0)
+
+
 class FocusGuardTest(unittest.TestCase):
     """Unrequested focus grabs by the agent Chrome are handed back; asked-for ones are left alone."""
     CHROME, HERMES = 500, 42

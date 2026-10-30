@@ -49,7 +49,8 @@ python3 -B $S <sha> --workflow release.yml --tag-glob 'v*'   # released: a v* ta
 python3 -B $S <sha> --once                            # one check: exit 0 done, 1 finished red, 2 not yet
 ```
 
-Exit codes: 0 done (prints the run URLs or tags); 1 stalled (nothing queued or running will finish it,
+Exit codes: 0 done (prints the run URLs or tags; a run that built a later commit containing yours is marked
+`(ran on <sha>, a later commit containing it)`, so cite it as CI on that commit, not on yours); 1 stalled (nothing queued or running will finish it,
 and the failing run's URL is printed), or `gh run list` failed 5 times in a row (prints `gh kept failing`: a `gh`
 auth or repo problem, not a CI failure); 2 timed out (default 120 min) or not yet with `--once` (a failed listing
 included); 3 the sha isn't on `origin/<branch>` (default `main`; `--branch` to change). `--dispatch` (requires `--workflow`) re-runs the
@@ -125,7 +126,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
   head's run `pending`. Read back `status`/`conclusion` after `gh run cancel` before reporting it done; if stuck,
   `gh api -X POST repos/O/R/actions/runs/<id>/force-cancel`. When asked about one latched run, sweep the whole
   queue with `scripts/ci_latch_sweep.py OWNER/REPO` (dry run, then `--apply`): it selects only superseded-head runs
-  whose open jobs are all gate/report jobs, re-reads each run before cancelling, and never touches re-runs
+  whose open jobs are all gate/report jobs still waiting for a runner (a gate already running is left to finish), re-reads each run before cancelling, and never touches re-runs
   (`run_attempt>1`), runs with no jobs listed, or current-head runs; it exits 1 on any failed read or cancel. A `main` group
   without cancel-in-progress serializes, so a superseded main run latched on its timing report blocks the next one.
   Root fix: `if: ${{ !cancelled() }}` and run gate/report jobs on a light runner label; PRs pick it up only after
@@ -136,6 +137,7 @@ Its acceptance is the batch's evidence, but only when all of the following hold:
 - A repo with its own wrapper (e.g. a `tools/wait_for_release.py` that knows which product tags a path
   maps to) takes precedence; check the repo's AGENTS.md first.
 - Tests: `python3 -B -m unittest discover -s tests` from this skill's dir.
+- For Hermes E2E failures on loaded runners, audit sandbox daemon ownership before raising timeouts. `hermes -z` and viewer `/exit` deliberately retain the shared gateway: each isolated test home must stop its own home/PID/start-time-verified gateway before closing fake provider/proxy servers. Assert viewer-only cleanup first, then full runtime cleanup; never hide arbitrary children as persistent infrastructure. A cold public model-metadata fetch can also reach OpenRouter during another provider's test: seed metadata for the fake model rather than broadening the foreign-provider egress allowlist. For recording/prebuilt TUI probes, pass the installed Node explicitly with supported `HERMES_NODE` through the hermetic child's overrides; obsolete `HERMES_SKIP_NODE_BOOTSTRAP` has no reader, and Node on PATH alone still falls through to `pm.ensure('node')`. Prove attach-only isolation by forbidding PM acquisition in a real child CLI while retaining exact handoff/lease assertions, rather than raising its timeout.
 - Self-hosted runners keep files between jobs. `gitleaks/gitleaks-action@v2` downloads to the fixed path
   `os.tmpdir()/gitleaks.tmp`, so one interrupted run makes every later install fail with "Destination file path
   ... already exists" on that runner. Fix in the workflow, not on the hosts: set `TMPDIR: ${{ runner.temp }}` in the

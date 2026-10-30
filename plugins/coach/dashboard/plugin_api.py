@@ -24,6 +24,26 @@ API_VERSION = 1
 BUG_BOARD = "hermes"
 
 
+def bug_board(kb=None) -> Optional[str]:
+    """The ``hermes`` board when this host has one, else None (the active board).
+
+    Hosts without a ``hermes`` board (e.g. hermes-hub) raised ValueError from connect(), so "File it once" 500'd.
+    """
+    if kb is None:
+        try:
+            from hermes_cli import kanban_db  # type: ignore
+        except Exception:
+            return None
+        db = kanban_db
+    else:
+        db = kb[0]
+    try:
+        db.init_db(board=BUG_BOARD)
+        return BUG_BOARD
+    except ValueError:
+        return None
+
+
 def _core():
     """core.py, reloaded when the file changes (edits apply without a backend restart)."""
     name = "_coach_core_api"
@@ -112,7 +132,7 @@ def create_router(llm=None, db_path=None, kb=None, store_root=None):
         core = _core()
         st = store()
         card = core.bug_card(st, body.session_id, body.sig)
-        out = core.spin_out_core().kanban_cards([card], body.session_id, "default", "", BUG_BOARD, kb=kb,
+        out = core.spin_out_core().kanban_cards([card], body.session_id, "default", "", bug_board(kb), kb=kb,
                                                 created_by="coach", key_prefix="coach-bug")
         good = [c for c in out.get("cards", []) if c.get("task_id")]
         if good:

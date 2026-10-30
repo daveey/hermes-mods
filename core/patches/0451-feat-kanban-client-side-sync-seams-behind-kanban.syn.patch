@@ -35,29 +35,8 @@ kanban_db_context.py.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- gateway/kanban_watchers.py                    |  20 +-
- hermes_cli/config_defaults.py                 |   7 +-
- hermes_cli/kanban_db.py                       | 109 +--
- hermes_cli/kanban_db_connect.py               |   1 +
- hermes_cli/kanban_db_context.py               |  76 ++
- hermes_cli/kanban_db_graph.py                 |   7 +-
- hermes_cli/kanban_db_sync.py                  | 807 ++++++++++++++++++
- .../test_kanban_dispatcher_sync_wake.py       |  53 ++
- tests/hermes_cli/kanban_sync_support.py       |  78 ++
- tests/hermes_cli/test_kanban_sync_apply.py    | 176 ++++
- tests/hermes_cli/test_kanban_sync_capture.py  | 238 ++++++
- tests/hermes_cli/test_kanban_sync_leases.py   | 220 +++++
- 12 files changed, 1708 insertions(+), 84 deletions(-)
- create mode 100644 hermes_cli/kanban_db_context.py
- create mode 100644 hermes_cli/kanban_db_sync.py
- create mode 100644 tests/gateway/test_kanban_dispatcher_sync_wake.py
- create mode 100644 tests/hermes_cli/kanban_sync_support.py
- create mode 100644 tests/hermes_cli/test_kanban_sync_apply.py
- create mode 100644 tests/hermes_cli/test_kanban_sync_capture.py
- create mode 100644 tests/hermes_cli/test_kanban_sync_leases.py
-
 diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
-index 5e686a2ab5..004bcb84c4 100644
+index 5e686a2ab517778fa5a102c5dddd655288b4358e..004bcb84c41c6f312aa43e4a5763c536ca17f6e9 100644
 --- a/gateway/kanban_watchers.py
 +++ b/gateway/kanban_watchers.py
 @@ -60,6 +60,24 @@ class GatewayKanbanWatchersMixin:
@@ -95,10 +74,10 @@ index 5e686a2ab5..004bcb84c4 100644
          finally:
              self._release_kanban_dispatcher_lock()
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index 13c8131e08..556f4c2606 100644
+index c7425dbbf0e9e6443669f4a7e65f95ba4941cd63..e168e35323ae3b2a515ecd9ee56b930cbc0c74f6 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
-@@ -1890,6 +1890,8 @@ DEFAULT_CONFIG = {
+@@ -1881,6 +1881,8 @@ DEFAULT_CONFIG = {
      },
      # Kanban coordination: one dispatcher per board reclaims, promotes, and spawns workers.
      "kanban": {
@@ -107,7 +86,7 @@ index 13c8131e08..556f4c2606 100644
          # Opt-in per-profile broker argv before gh (empty = ordinary login); never include tokens.
          "pr_acceptance": {"gh_command_prefix": []},
          # Calendar retention for terminal worktrees; archive commits to recovery
-@@ -1937,10 +1939,7 @@ DEFAULT_CONFIG = {
+@@ -1928,10 +1930,7 @@ DEFAULT_CONFIG = {
          "max_in_progress": None,
          # Per-profile cap: positive int = no single profile runs more than N workers even if the
          # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
@@ -119,246 +98,11 @@ index 13c8131e08..556f4c2606 100644
          "max_in_progress_per_profile": None,
          # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
          # this home's dispatcher may claim (list or comma-separated string). None = any existing
-diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
-index 36fda86826..553e13a5c4 100644
---- a/hermes_cli/kanban_db.py
-+++ b/hermes_cli/kanban_db.py
-@@ -29,6 +29,7 @@ from dataclasses import dataclass
- from pathlib import Path
- from typing import Any, Iterable, Optional
- 
-+from hermes_cli import kanban_db_sync as _sync
- from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
- from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
- from toolsets import get_toolset_names
-@@ -330,34 +331,6 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
-     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
- 
- 
--# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
--_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
--_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
--_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
--_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
--_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
--
--
--def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
--    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
--    reads a bare absolute timestamp as current fact — the relative age is what
--    prompts a worker to re-verify stale sibling work."""
--    try:
--        ts = int(ts)
--    except (TypeError, ValueError):
--        return ""
--    if now is None:
--        now = int(time.time())
--    delta = now - ts
--    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
--        return "just now"
--    if delta < 3600:
--        return f"{delta // 60}m ago"
--    if delta < 86400:
--        return f"{delta // 3600}h ago"
--    return f"{delta // 86400}d ago"
--
--
- # --- Paths ---
- 
- DEFAULT_BOARD = "default"
-@@ -1328,7 +1301,7 @@ def create_task(
- 
-     # Retry once on the extremely unlikely id collision.
-     for attempt in range(2):
--        task_id = _new_task_id()
-+        task_id = _sync.new_task_id(conn)
-         try:
-             # allow_nested: graph builders compose create_task under one outer
-             # commit so the dispatcher never sees a half-built graph.
-@@ -2164,7 +2137,7 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
- 
- def _claim_and_open_run(
-     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
--    *, event_extra: Optional[dict] = None,
-+    *, event_extra: Optional[dict] = None, gate: Optional[_sync.ClaimGate] = None,
- ) -> Optional[int]:
-     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-     when the CAS lost. Caller holds the txn."""
-@@ -2184,6 +2157,7 @@ def _claim_and_open_run(
-     )
-     if cur.rowcount != 1:
-         return None
-+    _sync.stage_claim(conn, task_id, gate)
-     trow = conn.execute(
-         "SELECT assignee, max_runtime_seconds, current_step_key "
-         "FROM tasks WHERE id = ?", (task_id,),
-@@ -2222,7 +2196,10 @@ def claim_task(
-     now = int(time.time())
-     lock = claimer or _claimer_id()
-     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
--    with write_txn(conn):
-+    gate = _sync.claim_gate(conn, task_id, expires)
-+    if gate.deferred:
-+        return None
-+    with gate, write_txn(conn):
-         # Single enforcement point: never ready -> running with an undone
-         # parent, whichever writer set 'ready'. Demote to 'todo';
-         # recompute_ready re-promotes when the parents finish.
-@@ -2237,7 +2214,7 @@ def claim_task(
-         _reclaim_dangling_run(
-             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-         )
--        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
-+        run_id = _claim_and_open_run(conn, task_id, "ready", lock, gate.expires, now, gate=gate)
-         if run_id is None:
-             return None
-         claimed = get_task(conn, task_id)
-@@ -2255,7 +2232,10 @@ def claim_review_task(
-     now = int(time.time())
-     lock = claimer or _claimer_id()
-     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
--    with write_txn(conn):
-+    gate = _sync.claim_gate(conn, task_id, expires)
-+    if gate.deferred:
-+        return None
-+    with gate, write_txn(conn):
-         if not _parents_satisfied(conn, task_id):
-             demoted = conn.execute(
-                 "UPDATE tasks SET status = 'todo' "
-@@ -2268,7 +2248,7 @@ def claim_review_task(
-                 )
-             return None
-         run_id = _claim_and_open_run(
--            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
-+            conn, task_id, "review", lock, gate.expires, now, event_extra={"source_status": "review"}, gate=gate,
-         )
-         if run_id is None:
-             return None
-@@ -2339,6 +2319,7 @@ def heartbeat_claim(
-     """Extend a running claim; True if we still own it."""
-     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
-     lock = claimer or _claimer_id()
-+    expires = _sync.heartbeat_expiry(conn, task_id, expires)  # bounded by the lease on synced boards
-     with write_txn(conn):
-         cur = conn.execute(
-             "UPDATE tasks SET claim_expires = ? "
-@@ -2403,9 +2384,10 @@ def release_stale_claims(
-         # Backstop: a heartbeat older than the max-stale threshold means no
-         # observable progress — reclaim even if the PID is alive (logic loop).
-         heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
-+        lease_lost = _sync.lease_lost(conn, row["id"], now)  # a live worker never outlives its lease
-         started_at = _row_get(row, "worker_started_at")
-         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
--                and not heartbeat_stale):
-+                and not heartbeat_stale and not lease_lost):
-             _extend_live_stale_claim(conn, row, now)
-             continue
- 
-@@ -2433,7 +2415,7 @@ def release_stale_claims(
-             if cur.rowcount != 1:
-                 continue
-             run_id = _record_reclaim(
--                conn, row["id"], termination,
-+                conn, row["id"], termination, outcome="lease_lost" if lease_lost else "reclaimed",
-                 error=f"stale_lock={row['claim_lock']}",
-                 payload={
-                     "stale_lock": row["claim_lock"],
-@@ -2468,11 +2450,12 @@ def release_stale_claims(
- 
- def _record_reclaim(
-     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
-+    outcome: str = "reclaimed",
- ) -> Optional[int]:
-     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
-     (payload merged with the termination report). Caller holds the txn."""
-     run_id = _end_run(
--        conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
-+        conn, task_id, outcome=outcome, status=outcome, error=error, metadata=termination,
-     )
-     payload.update(termination)
-     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
-@@ -2535,11 +2518,12 @@ def reclaim_task(
-         )
-         if cur.rowcount != 1:
-             return False
--        _record_reclaim(
-+        run_id = _record_reclaim(
-             conn, task_id, termination,
-             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
-             payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
-         )
-+    _sync.release_lease(conn, task_id, _sync.run_uid(conn, run_id))
-     # Operator intervention = fresh retry budget (own txn, runs after commit).
-     _clear_failure_counter(conn, task_id)
-     return True
-@@ -4096,43 +4080,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
-     return "\n".join(lines).rstrip() + "\n" + build_recovery_context(conn, task_id)
- 
- 
--def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
--    """Truncate to ``limit`` chars with a visible ellipsis."""
--    if not s:
--        return ""
--    s = s.strip()
--    if len(s) <= limit:
--        return s
--    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
--
--
--def _ctx_stamp(ts: int, now: int) -> str:
--    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
--    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
--    age = _relative_age(ts, now)
--    return f"{disp}, {age}" if age else disp
--
--
--def _ctx_metadata_line(metadata: Any) -> Optional[str]:
--    if not metadata:
--        return None
--    try:
--        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
--    except Exception:
--        return None
--
--
--def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
--    """Keep the newest ``cap`` items; describe the omitted head, if any."""
--    omitted = max(0, len(items) - cap)
--    if not omitted:
--        return items, None
--    return items[-cap:], (
--        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
--        f"omitted; showing most recent {cap})_"
--    )
--
--
- def _ctx_header(lines: list[str], task: Task) -> None:
-     lines.append(f"# Kanban task {task.id}: {task.title}")
-     lines.append("")
-@@ -4563,6 +4510,18 @@ from hermes_cli.kanban_db_boards import (
-     remove_board,
-     write_board_metadata,
- )
-+from hermes_cli.kanban_db_context import (
-+    _CTX_MAX_BODY_BYTES,
-+    _CTX_MAX_COMMENT_BYTES,
-+    _CTX_MAX_COMMENTS,
-+    _CTX_MAX_FIELD_BYTES,
-+    _CTX_MAX_PRIOR_ATTEMPTS,
-+    _ctx_cap,
-+    _ctx_metadata_line,
-+    _ctx_stamp,
-+    _ctx_tail,
-+    _relative_age,
-+)
- from hermes_cli.kanban_db_connect import (
-     _INITIALIZED_PATHS,
-     init_db,
 diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
-index 857ab4f1e9..7277453b1a 100644
+index 6fe4d4f4e7397971a410ae248a75f26d7ac1ea19..db38a77ef46a9b4124a5d8b4ef9178ea94101dcc 100644
 --- a/hermes_cli/kanban_db_connect.py
 +++ b/hermes_cli/kanban_db_connect.py
-@@ -788,6 +788,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
+@@ -787,6 +787,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
              if resolved not in _INITIALIZED_PATHS:
                  conn.executescript(_kb.SCHEMA_SQL)
                  _migrate_add_optional_columns(conn)
@@ -366,90 +110,8 @@ index 857ab4f1e9..7277453b1a 100644
                  _INITIALIZED_PATHS.add(resolved)
  
          conn, _ = _open_configured(path, _init_if_needed)
-diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
-new file mode 100644
-index 0000000000..e1da9c977e
---- /dev/null
-+++ b/hermes_cli/kanban_db_context.py
-@@ -0,0 +1,76 @@
-+"""Pure text helpers for :func:`kanban_db.build_worker_context`: the prompt caps,
-+truncation, timestamps with relative ages and tail-capping of long lists.
-+
-+Split out of ``hermes_cli.kanban_db`` (no board or SQLite access here).
-+"""
-+
-+from __future__ import annotations
-+
-+import json
-+import time
-+from typing import Any, Optional
-+
-+
-+# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
-+_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
-+_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
-+_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
-+_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
-+_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
-+
-+
-+def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
-+    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
-+    reads a bare absolute timestamp as current fact — the relative age is what
-+    prompts a worker to re-verify stale sibling work."""
-+    try:
-+        ts = int(ts)
-+    except (TypeError, ValueError):
-+        return ""
-+    if now is None:
-+        now = int(time.time())
-+    delta = now - ts
-+    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
-+        return "just now"
-+    if delta < 3600:
-+        return f"{delta // 60}m ago"
-+    if delta < 86400:
-+        return f"{delta // 3600}h ago"
-+    return f"{delta // 86400}d ago"
-+
-+
-+def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
-+    """Truncate to ``limit`` chars with a visible ellipsis."""
-+    if not s:
-+        return ""
-+    s = s.strip()
-+    if len(s) <= limit:
-+        return s
-+    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
-+
-+
-+def _ctx_stamp(ts: int, now: int) -> str:
-+    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
-+    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-+    age = _relative_age(ts, now)
-+    return f"{disp}, {age}" if age else disp
-+
-+
-+def _ctx_metadata_line(metadata: Any) -> Optional[str]:
-+    if not metadata:
-+        return None
-+    try:
-+        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
-+    except Exception:
-+        return None
-+
-+
-+def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
-+    """Keep the newest ``cap`` items; describe the omitted head, if any."""
-+    omitted = max(0, len(items) - cap)
-+    if not omitted:
-+        return items, None
-+    return items[-cap:], (
-+        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
-+        f"omitted; showing most recent {cap})_"
-+    )
 diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
-index aa3f5af236..4bbf5cbdb2 100644
+index aa3f5af23608b2616fcae4545f201c9c0d4a4df8..4bbf5cbdb293ee2560b4087b420a5b63508c52a0 100644
 --- a/hermes_cli/kanban_db_graph.py
 +++ b/hermes_cli/kanban_db_graph.py
 @@ -187,9 +187,8 @@ def _insert_decomposed_child(
@@ -475,7 +137,7 @@ index aa3f5af236..4bbf5cbdb2 100644
      assignee = _canonical_assignee(child.get("assignee"))
 diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
 new file mode 100644
-index 0000000000..3db6237fe4
+index 0000000000000000000000000000000000000000..3db6237fe4eceb43852bd6f8b0ce013ba193a3f8
 --- /dev/null
 +++ b/hermes_cli/kanban_db_sync.py
 @@ -0,0 +1,807 @@
@@ -1288,7 +950,7 @@ index 0000000000..3db6237fe4
 +    return [{**dict(r), "fields": json.loads(r["fields"])} for r in rows]
 diff --git a/tests/gateway/test_kanban_dispatcher_sync_wake.py b/tests/gateway/test_kanban_dispatcher_sync_wake.py
 new file mode 100644
-index 0000000000..caaa876eb6
+index 0000000000000000000000000000000000000000..caaa876eb67976014272f3bb0513a97b1de8b2e1
 --- /dev/null
 +++ b/tests/gateway/test_kanban_dispatcher_sync_wake.py
 @@ -0,0 +1,53 @@
@@ -1347,7 +1009,7 @@ index 0000000000..caaa876eb6
 +        asyncio.run(runner._sleep_until_tick_or_sync_wake(7))
 diff --git a/tests/hermes_cli/kanban_sync_support.py b/tests/hermes_cli/kanban_sync_support.py
 new file mode 100644
-index 0000000000..62365694ad
+index 0000000000000000000000000000000000000000..62365694ade58ca3917d43cf5fcd5760de953224
 --- /dev/null
 +++ b/tests/hermes_cli/kanban_sync_support.py
 @@ -0,0 +1,78 @@
@@ -1431,7 +1093,7 @@ index 0000000000..62365694ad
 +        return sum(1 for k, _ in self.calls if k == kind)
 diff --git a/tests/hermes_cli/test_kanban_sync_apply.py b/tests/hermes_cli/test_kanban_sync_apply.py
 new file mode 100644
-index 0000000000..c727f3eec8
+index 0000000000000000000000000000000000000000..c727f3eec8a6bd5a8ba48ee1cbe51b6bb0649c42
 --- /dev/null
 +++ b/tests/hermes_cli/test_kanban_sync_apply.py
 @@ -0,0 +1,176 @@
@@ -1613,7 +1275,7 @@ index 0000000000..c727f3eec8
 +            sync.apply_remote_changes(conn, [], new_cursor=1)
 diff --git a/tests/hermes_cli/test_kanban_sync_capture.py b/tests/hermes_cli/test_kanban_sync_capture.py
 new file mode 100644
-index 0000000000..551c0fccd5
+index 0000000000000000000000000000000000000000..551c0fccd5bb0cafa43ee15fba35d679de3086d8
 --- /dev/null
 +++ b/tests/hermes_cli/test_kanban_sync_capture.py
 @@ -0,0 +1,238 @@
@@ -1857,7 +1519,7 @@ index 0000000000..551c0fccd5
 +            assert uids and None not in uids and len(set(uids)) == len(uids), table
 diff --git a/tests/hermes_cli/test_kanban_sync_leases.py b/tests/hermes_cli/test_kanban_sync_leases.py
 new file mode 100644
-index 0000000000..e57a8bc40f
+index 0000000000000000000000000000000000000000..e57a8bc40f4ab292526c75997b170af6bba0e4fa
 --- /dev/null
 +++ b/tests/hermes_cli/test_kanban_sync_leases.py
 @@ -0,0 +1,220 @@

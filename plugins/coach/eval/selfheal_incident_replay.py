@@ -3,7 +3,7 @@
 
 Inputs (private, from the self-correct replay; never committed here):
   turns.jsonl      every real user turn: {sid, idx, text, prev_reply, ...}   (prev_reply = agent reply before it)
-  turns2.jsonl     per-turn telemetry: {sid, idx, api_err, interrupted, repeat, no_reply, ...}
+  turns2.jsonl     per-turn telemetry: {sid, idx, api_err, interrupted, repeat, no_reply, gap_s, ...}
   episodes.json    incident episodes: [{eid, sid, first, last, turns: [{sid, idx}, ...]}]
   fivewhys.jsonl   per-episode verdict: {eid, real_incident, explicit_fix_ask_turn}
   fpcheck.jsonl    optional relabels of sampled "false positive" turns: {sid, idx, real_incident}
@@ -115,7 +115,15 @@ def run(a, llm=None, confirm_llm=None):
         cprev = prev
         if getattr(a, "clip_at", 0) and len(prev) == a.clip_at:  # dataset clipped this reply; production won't
             cprev += " [… rest of this message clipped in the dataset]"
-        r["c_pre"] = sh.prefilter(t.get("text") or "")
+        x = X.get((t["sid"], t["idx"]), {})
+        if sh.is_resume_note(t.get("text") or ""):  # production: core's resume notes skip the judge
+            sig = sh.resume_signal(t.get("text") or "", x.get("gap_s"))
+            r["c_pre"] = False
+            if sig:
+                r.update(c_p=sig["p_defect"], c_kind=sig["kind"], c_comp=sig["component"], c_sym=sig["symptom"],
+                         c_sig=True)
+        else:
+            r["c_pre"] = sh.prefilter(t.get("text") or "")
         if r["c_pre"]:
             v = sh.complaint_verdict(cprev, t.get("text") or "", judge, log, cj) or {}
             r.update(c_p=v.get("p_defect"), c_kind=v.get("kind"), c_comp=v.get("component"),

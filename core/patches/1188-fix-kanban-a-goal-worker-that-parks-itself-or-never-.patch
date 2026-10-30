@@ -1,0 +1,950 @@
+From 9d7b8821a8ab9bb02e86c5de601f37a129a04d78 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 09:17:33 +0000
+Subject: [PATCH] fix(kanban): a goal worker that parks itself or never reaches
+ its owner is not a crash [daveey]
+
+t_82f0fe15 runs 7630/7649 (2026-10-30 08:30-08:37Z) were booked `crashed` and spent
+failure_limit=2, sending the card to triage. Both runs found the hub gateway in a restart's
+`restart_wait` drain: the dispatcher worker waited OWNER_WAIT_S for an owner that never admitted
+the claim, printed "Kanban owner refused: Kanban owner silent for ..." and exited 1. No turn ran.
+The trailing "kanban goal loop: status='superseded'; stopping" line in the log came from the
+previous run's goal loop, not from these runs.
+
+- kanban_worker_client: an owner that never answered the claim (no admission id) exits
+  KANBAN_OWNER_UNAVAILABLE_EXIT_CODE (69, EX_UNAVAILABLE). A final refusal, or an owner that
+  admitted the run and then went silent, still exits 1.
+- dispatcher: new kanban_owner_unavailable books exit 69 as outcome `owner_unavailable` and
+  requeues the run WITHOUT counting a failure. It falls back to `crashed` when the board shows
+  `owner_admitted` for the run, or after 5 such runs in a row, so an owner that never comes
+  back still reaches the breaker.
+- goal loop: a stop on a dispatcher-owned status (scheduled/superseded/blocked/archived/triage/
+  ...) stays a clean exit 0. A broken loop (status read failed, judge transport failed, a
+  follow-up turn raised or failed) is now flagged `failed`. The managed, -q and -Q workers exit
+  non-zero for it, where before they returned the last good turn's rc 0. A failed follow-up
+  turn keeps its own provider exit (75/78).
+
+Tests: test_kanban_goal_loop_clean_stop (every dispatcher-owned status exits 0; a managed
+worker that parks itself ends outcome scheduled with consecutive_failures 0; run_turn
+exception / judge / status failures exit non-zero), test_kanban_owner_unavailable, and the
+-q/-Q goal-loop cases in test_single_query_exit_contract.
+---
+ gateway/session_kanban.py                     |   6 +-
+ hermes_cli/cli_single_query.py                |  28 ++-
+ hermes_cli/gateway_client.py                  |   3 +-
+ hermes_cli/goals.py                           |  38 +++-
+ hermes_cli/kanban_db_dispatch.py              |  16 +-
+ hermes_cli/kanban_db_dispatch_dead_worker.py  |   4 +
+ hermes_cli/kanban_db_dispatch_exit_code.py    |   3 +
+ hermes_cli/kanban_owner_unavailable.py        |  83 ++++++++
+ hermes_cli/kanban_worker_client.py            |  12 +-
+ .../test_kanban_goal_loop_clean_stop.py       | 198 ++++++++++++++++++
+ .../test_kanban_owner_unavailable.py          | 194 +++++++++++++++++
+ .../test_single_query_exit_contract.py        |  51 +++++
+ 12 files changed, 610 insertions(+), 26 deletions(-)
+ create mode 100644 hermes_cli/kanban_owner_unavailable.py
+ create mode 100644 tests/hermes_cli/test_kanban_goal_loop_clean_stop.py
+ create mode 100644 tests/hermes_cli/test_kanban_owner_unavailable.py
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 74a897c278c..0d9ed676abd 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -456,7 +456,9 @@ def _run_task_turns(agent, frame, history, context):
+         result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id),
+                                         turn_author=KANBAN_TURN_AUTHOR)
+         return result.get('final_response', '')
+-    run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
++    from hermes_cli.goals import kanban_goal_loop_turn_result
++    loop = run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
+         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,
+         first_response=result.get('final_response', ''))
+-    return result
++    # A broken loop exits non-zero; a parked or dispatcher-owned stop keeps the settled result (rc 0).
++    return kanban_goal_loop_turn_result(result, loop)
+diff --git a/hermes_cli/cli_single_query.py b/hermes_cli/cli_single_query.py
+index 7d2b416ac1c..cde5caffe80 100644
+--- a/hermes_cli/cli_single_query.py
++++ b/hermes_cli/cli_single_query.py
+@@ -50,12 +50,14 @@ def _interrupt_agent_for_signal(agent, signum) -> None:
+         pass  # never block signal handling
+ 
+ 
+-def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, log=None) -> None:
++def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, log=None, turn_results=None) -> dict | None:
+     """Drive a kanban goal_mode worker through ``goals.run_kanban_goal_loop`` after its first turn.
+ 
+     ``run_turn`` defaults to the bare ``-Q`` turn (final answer only). The ``-q`` worker path
+     passes ``cli.chat`` so every follow-up turn keeps the tool activity feed that the Kanban
+     worker log is made of. The caller swallows all errors: a broken loop must never wedge a worker.
++    Returns the loop's result (``failed`` = exit non-zero), None when no loop ran; the default
++    ``-Q`` turn appends each follow-up turn's raw result to ``turn_results``.
+     """
+     from cli import _int_or, _sync_cli_session_id_from_agent
+     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+@@ -82,6 +84,8 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None,
+ 
+     def _quiet_turn(prompt: str) -> dict:
+         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
++        if turn_results is not None:
++            turn_results.append(result)
+         _sync_cli_session_id_from_agent(cli)
+         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
+         if resp:
+@@ -102,7 +106,7 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None,
+         with _kbc.connect_closing() as c:
+             _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
+ 
+-    _run_loop(
++    return _run_loop(
+         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
+         task_status_fn=_task_status, block_fn=_block,
+         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
+@@ -110,7 +114,7 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None,
+     )
+ 
+ 
+-def _run_kanban_goal_loop_chat(cli: HermesCLI, first_response: str) -> None:
++def _run_kanban_goal_loop_chat(cli: HermesCLI, first_response: str) -> dict | None:
+     """``-q`` worker variant: follow-up turns go through ``cli.chat`` (tool feed stays on stdout,
+     which is the Kanban worker log) and judge verdicts are printed there too, so a goal_mode card's
+     log reads like any other worker's instead of staying blank until the final answer."""
+@@ -120,7 +124,7 @@ def _run_kanban_goal_loop_chat(cli: HermesCLI, first_response: str) -> None:
+         logger.info("%s", msg)
+         print(msg, flush=True)
+ 
+-    _run_kanban_goal_loop_q(cli, first_response, run_turn=lambda p: cli.chat(p) or "", log=_log)
++    return _run_kanban_goal_loop_q(cli, first_response, run_turn=lambda p: cli.chat(p) or "", log=_log)
+ 
+ 
+ def _sync_cli_session_id_from_agent(cli) -> None:
+@@ -313,10 +317,17 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
+     # reports "running" and a continue verdict would re-enter the model under an
+     # authority this process can no longer prove (round-3 finding).
+     if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _exit_code == 0:
++        _goal_turns: list = []
+         try:
+-            _run_kanban_goal_loop_q(cli, response)
++            _goal_loop = _run_kanban_goal_loop_q(cli, response, turn_results=_goal_turns)
+         except Exception as _goal_exc:
+             logger.debug("kanban goal loop failed: %s", _goal_exc)
++        else:
++            # [daveey] A broken loop exits non-zero (a failed follow-up turn keeps its own provider
++            # exit); a worker that parked itself or a dispatcher-owned status stays 0.
++            from hermes_cli.goals import kanban_goal_loop_turn_result
++            _last_turn = _goal_turns[-1] if _goal_turns else result
++            _exit_code = _single_query_exit_code(kanban_goal_loop_turn_result(_last_turn, _goal_loop)) or _exit_code
+ 
+     if emitter is None:
+         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+@@ -578,16 +589,19 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool
+         # interrupt, terminal settlement) — must reach the shared exit path below with zero
+         # further model entry, because goal_run_status() checks run identity only and would
+         # otherwise continue under an authority this process can no longer prove.
++        _goal_loop = None
+         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1" and _single_query_exit_code(cli._last_turn_result) == 0:
+             try:
+-                _run_kanban_goal_loop_chat(cli, response or "")
++                _goal_loop = _run_kanban_goal_loop_chat(cli, response or "")
+             except Exception as _goal_exc:
+                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+         cli._print_exit_summary(clear_screen=False)
+         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
+         # the exit code. This path used to fall through to an implicit 0 for every outcome.
++        # [daveey] A broken goal loop exits non-zero; a parked or dispatcher-owned stop stays 0.
++        from hermes_cli.goals import kanban_goal_loop_turn_result
+         exit_single_query(_single_query_exit_code(
+-            cli._last_turn_result,
++            kanban_goal_loop_turn_result(cli._last_turn_result, _goal_loop),
+             credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),
+             credentials_terminal=getattr(cli, "_credentials_terminal", False)))
+     finally:
+diff --git a/hermes_cli/gateway_client.py b/hermes_cli/gateway_client.py
+index c5740533333..90a4c17075b 100644
+--- a/hermes_cli/gateway_client.py
++++ b/hermes_cli/gateway_client.py
+@@ -46,7 +46,8 @@ def gateway_ws_target(endpoint, ticket):
+ 
+ 
+ class GatewayClientError(ValueError):
+-    pass
++    # [daveey] Set by kanban_worker_client: the owner never admitted the claim (no turn ran).
++    owner_unavailable = False
+ 
+ 
+ DISCONNECTED = ("Gateway disconnected; turn outcome is unknown. "
+diff --git a/hermes_cli/goals.py b/hermes_cli/goals.py
+index 47d647c3c26..324a66875b1 100644
+--- a/hermes_cli/goals.py
++++ b/hermes_cli/goals.py
+@@ -1692,8 +1692,11 @@ def run_kanban_goal_loop(
+         except Exception as exc:
+             _log(f"kanban goal loop: block_fn failed ({exc})")
+ 
+-    def _result(outcome: str, reason: str) -> dict[str, Any]:
+-        return {"outcome": outcome, "turns_used": turns_used, "reason": reason}
++    def _result(outcome: str, reason: str, *, failed: bool = False) -> dict[str, Any]:
++        # [daveey] ``failed`` marks the stops a caller must exit non-zero for (the loop itself broke:
++        # status read, judge transport, a follow-up turn raised or failed). Every other stop, the
++        # dispatcher-owned statuses included, is clean: the worker exits 0.
++        return {"outcome": outcome, "turns_used": turns_used, "reason": reason, "failed": failed}
+ 
+     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
+     if max_turns < 1:
+@@ -1708,7 +1711,7 @@ def run_kanban_goal_loop(
+             status = task_status_fn()
+         except Exception as exc:
+             _log(f"kanban goal loop: status check failed ({exc}); stopping")
+-            return _result("stopped", "status check failed")
++            return _result("stopped", "status check failed", failed=True)
+ 
+         terminal = _KANBAN_TERMINAL_STATUSES.get(status)
+         if terminal is not None:
+@@ -1716,7 +1719,9 @@ def run_kanban_goal_loop(
+             _log("kanban goal loop: " + log_fmt.format(task_id=task_id, turns=turns_used))
+             return _result(outcome, reason)
+         if status not in ("running", "ready"):
+-            # Reclaimed / archived / unexpected — let the dispatcher own it.
++            # A dispatcher-owned state (scheduled / superseded / continued / triage / archived /
++            # reclaimed): the worker parked or lost the run and the dispatcher owns it now. A clean
++            # stop, never a failure: the worker exits 0 and the run keeps the outcome already booked.
+             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
+             return _result("stopped", f"status={status}")
+ 
+@@ -1729,7 +1734,7 @@ def run_kanban_goal_loop(
+                 reset_affinity_scope(affinity_token)
+         if _transport_failed:
+             _log(f"kanban goal loop: judge transport failed on turn {turns_used}; stopping")
+-            return _result("stopped", "judge transport failure")
++            return _result("stopped", "judge transport failure", failed=True)
+         if verdict == "wait":
+             verdict = "continue"
+         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+@@ -1779,13 +1784,31 @@ def run_kanban_goal_loop(
+                 failure_reason = None
+         except Exception as exc:
+             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
+-            return _result("stopped", f"run_turn error: {type(exc).__name__}")
++            return _result("stopped", f"run_turn error: {type(exc).__name__}", failed=True)
+         if failed:
+             _log(f"kanban goal loop: worker failed on turn {turns_used} (reason={failure_reason}); stopping")
+-            return _result("stopped", f"worker failed: {failure_reason}")
++            return _result("stopped", f"worker failed: {failure_reason}", failed=True)
+         turns_used += 1
+ 
+ 
++def kanban_goal_loop_turn_result(result, loop):
++    """[daveey] The turn result a goal-mode worker's exit code is read from, after its goal loop.
++
++    A loop that broke (``failed``: a follow-up turn raised, the judge or the status read failed) must
++    not exit 0 on the last good turn's result, which books the run a clean-exit protocol violation;
++    a follow-up turn that failed on its own keeps its result, so its provider reason still maps to
++    the rate-limit / terminal-provider exits. Every other stop (a worker that parked itself as
++    scheduled, a superseded/triage/archived card, a terminal board call) keeps the settled result:
++    exit 0."""
++    if not (isinstance(loop, dict) and loop.get("failed")):
++        return result
++    if isinstance(result, dict) and (result.get("failed") or result.get("partial") or result.get("completed") is False):
++        return result
++    base = result if isinstance(result, dict) else {}
++    return {**base, "failed": True, "failure_reason": "goal_loop",
++            "error": f"kanban goal loop stopped: {loop.get('reason')}"}
++
++
+ __all__ = [
+     "CONTINUATION_PROMPT_TEMPLATE",
+     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
+@@ -1804,6 +1827,7 @@ __all__ = [
+     "clear_goal",
+     "draft_contract",
+     "judge_goal",
++    "kanban_goal_loop_turn_result",
+     "load_goal",
+     "migrate_goal_to_session",
+     "parse_contract",
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index de9ec8d2e41..1eb062c298b 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -35,7 +35,7 @@ from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_started_at as
+ from hermes_cli import kanban_db_dispatch_quota as _kbq
+ from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind as _exit_code_kind
+ from hermes_cli import kanban_worker_scope as _worker_scope
+-from hermes_cli import kanban_host_reboot as _host_reboot
++from hermes_cli import kanban_host_reboot as _host_reboot, kanban_owner_unavailable as _ou  # [daveey]
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+ from hermes_cli.kanban_db_dispatch_queries import lane_rows, skip_reap
+ 
+@@ -1269,7 +1269,7 @@ def _classify_dead_worker(
+         dead = _DeadWorker(kind, None, _worker_scope.describe(failure), kind,
+                            {"pid": pid, "claimer": claimer, **failure})
+     else:
+-        dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
++        dead = _ou.noted(_classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board), conn, task_id, run_id)
+     if task_id and not dead.rate_limited:
+         worker_output = _worker_final_output(task_id, board=board)
+         if worker_output:
+@@ -1340,7 +1340,7 @@ def _classify_dead_worker_exit(
+             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
+             terminal_provider=True,
+         )
+-    if kind == "nonzero_exit":
++    if kind in ("nonzero_exit", "owner_unavailable"):  # owner_unavailable: kanban_owner_unavailable.note rebooks it
+         error_text = f"pid {pid} exited with code {code}"
+     elif kind == "signaled":
+         error_text = f"pid {pid} killed by signal {code}"
+@@ -1360,6 +1360,7 @@ class _CrashSweep:
+     crashed: list[str] = field(default_factory=list)
+     rate_limited: list[str] = field(default_factory=list)
+     host_rebooted: list[str] = field(default_factory=list)  # reboot bystanders, requeued uncounted [daveey]
++    owner_unavailable: list[str] = field(default_factory=list)  # owner never answered, requeued uncounted [daveey]
+     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
+     # ``_record_task_failure`` (needs its own write_txn).
+     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
+@@ -1442,11 +1443,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
+                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                     (dead.error_text[:500], row["id"]),
+                 )
+-            if dead.host_reboot and not dead.reboot_culprit:
+-                # A bystander of a reboot: back to its source phase, no failure counted. [daveey]
+-                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+-                             (dead.error_text[:500], row["id"]))
+-                sweep.host_rebooted.append(row["id"])
++            if (dead.host_reboot and not dead.reboot_culprit) or dead.owner_unavailable:
++                # A reboot bystander, or an owner that never answered (no turn ran): no failure counted. [daveey]
++                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (dead.error_text[:500], row["id"]))
++                (sweep.owner_unavailable if dead.owner_unavailable else sweep.host_rebooted).append(row["id"])
+             elif dead.rate_limited:
+                 sweep.rate_limited.append(row["id"])
+                 try:
+diff --git a/hermes_cli/kanban_db_dispatch_dead_worker.py b/hermes_cli/kanban_db_dispatch_dead_worker.py
+index d06d5b13c50..741d30551af 100644
+--- a/hermes_cli/kanban_db_dispatch_dead_worker.py
++++ b/hermes_cli/kanban_db_dispatch_dead_worker.py
+@@ -5,6 +5,7 @@ from dataclasses import dataclass
+ from typing import Optional
+ 
+ from hermes_cli.kanban_host_reboot import HOST_REBOOT_OUTCOME
++from hermes_cli.kanban_owner_unavailable import OWNER_UNAVAILABLE_OUTCOME
+ 
+ 
+ @dataclass
+@@ -24,11 +25,14 @@ class _DeadWorker:
+     stdlib_shadow: bool = False  # traceback from a workspace ``<stdlib>.py``: blocked at once [daveey]
+     host_reboot: bool = False  # the host rebooted under the worker: no failure counted [daveey]
+     reboot_culprit: Optional[dict] = None  # this card's own sudo shutdown (journal line): blocked at once [daveey]
++    owner_unavailable: bool = False  # the profile owner never answered the claim: no failure counted [daveey]
+ 
+     @property
+     def run_outcome(self) -> str:
+         if self.host_reboot:
+             return HOST_REBOOT_OUTCOME
++        if self.owner_unavailable:
++            return OWNER_UNAVAILABLE_OUTCOME
+         if self.event_kind in {"oom_killed", "signaled"}:
+             return self.kind
+         # A rate-limited requeue is recorded as ``rate_limited`` so board history
+diff --git a/hermes_cli/kanban_db_dispatch_exit_code.py b/hermes_cli/kanban_db_dispatch_exit_code.py
+index 11d2ca1f894..331c01116cb 100644
+--- a/hermes_cli/kanban_db_dispatch_exit_code.py
++++ b/hermes_cli/kanban_db_dispatch_exit_code.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ def exit_code_kind(code: int) -> tuple[str, int]:
+     """``(kind, code)`` for a worker's exit code, however it was observed."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_owner_unavailable import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+ 
+     if code == 0:
+         return ("clean_exit", 0)
+@@ -16,4 +17,6 @@ def exit_code_kind(code: int) -> tuple[str, int]:
+         return ("rate_limited", code)
+     if code == kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
+         return ("terminal_provider", code)
++    if code == KANBAN_OWNER_UNAVAILABLE_EXIT_CODE:
++        return ("owner_unavailable", code)
+     return ("nonzero_exit", code)
+diff --git a/hermes_cli/kanban_owner_unavailable.py b/hermes_cli/kanban_owner_unavailable.py
+new file mode 100644
+index 00000000000..830f31b2a81
+--- /dev/null
++++ b/hermes_cli/kanban_owner_unavailable.py
+@@ -0,0 +1,83 @@
++"""Tell an unreachable profile owner from a worker crash in the dead-worker sweep. [daveey]
++
++A dispatcher worker (``kanban_worker_client``) only submits its claim to the profile owner; the owner
++runs the turn. When the owner stays unreachable (a restart's ``restart_wait`` drain, a starting or
++draining gateway) for ``OWNER_WAIT_S`` before it answers ``kanban.run``, the worker exits
++``KANBAN_OWNER_UNAVAILABLE_EXIT_CODE``. No turn ran, so the card did nothing wrong: on 2026-10-30
++t_82f0fe15 runs 7630/7649 each waited out a ``restart_wait`` drain, exited 1, were booked ``crashed``
++and spent the card's whole failure budget (triage), while the next run after the restart parked cleanly.
++
++Such a run is booked ``owner_unavailable`` and requeued WITHOUT counting a failure, unless:
++
++- the board holds an ``owner_admitted`` marker for the run (the owner did admit it, so a turn may
++  have run and its loss is a real failure), or
++- the card's last ``NEUTRAL_STREAK_LIMIT`` closed runs were all ``owner_unavailable`` (an owner that
++  never comes back must still reach the breaker instead of respawning forever).
++
++Either way the run falls back to the ordinary ``crashed`` booking.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++OWNER_UNAVAILABLE_OUTCOME = "owner_unavailable"
++EXIT_KIND = "owner_unavailable"
++# The worker's exit code for it (``kanban_worker_client``). 69 == BSD EX_UNAVAILABLE.
++KANBAN_OWNER_UNAVAILABLE_EXIT_CODE = 69
++NEUTRAL_STREAK_LIMIT = 5
++
++
++def _owner_admitted(conn: sqlite3.Connection, task_id: str, run_id) -> bool:
++    if run_id is None:
++        return False
++    row = conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'owner_admitted' LIMIT 1",
++        (task_id, int(run_id)),
++    ).fetchone()
++    return row is not None
++
++
++def _neutral_streak(conn: sqlite3.Connection, task_id: str) -> int:
++    """Trailing closed runs booked ``owner_unavailable``, newest first."""
++    streak = 0
++    for row in conn.execute(
++        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT ?",
++        (task_id, NEUTRAL_STREAK_LIMIT + 1),
++    ):
++        if row[0] != OWNER_UNAVAILABLE_OUTCOME:
++            break
++        streak += 1
++    return streak
++
++
++def noted(dead, conn, task_id, run_id):
++    """``note`` then return *dead* (one expression at the call site)."""
++    note(dead, conn, task_id, run_id)
++    return dead
++
++
++def note(dead, conn, task_id, run_id) -> None:
++    """Rebook a dead worker (``_DeadWorker``) that exited owner-unavailable as a neutral requeue, or
++    turn it back into a plain nonzero-exit crash when the run cannot be proven turn-free. No-op for
++    any other exit."""
++    if dead.kind != EXIT_KIND:
++        return
++    reason = None
++    if conn is None or not task_id:
++        reason = "no board connection to check the admission"
++    elif _owner_admitted(conn, task_id, run_id):
++        reason = "the owner had admitted this run"
++    elif _neutral_streak(conn, task_id) >= NEUTRAL_STREAK_LIMIT:
++        reason = f"{NEUTRAL_STREAK_LIMIT} runs in a row found no owner"
++    if reason is not None:
++        dead.kind = "nonzero_exit"
++        dead.event_payload["exit_kind"] = "nonzero_exit"
++        dead.error_text += f" (profile owner unreachable; counted as a failure: {reason})"
++        return
++    dead.owner_unavailable = True
++    dead.event_kind = OWNER_UNAVAILABLE_OUTCOME
++    dead.event_payload["owner_unavailable"] = True
++    dead.error_text = (
++        f"pid {dead.event_payload.get('pid')}: the profile owner never answered the claim "
++        "(restarting or draining); no turn ran, requeued without counting a failure"
++    )
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index 9a8a0e61de6..70aca503f34 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -94,7 +94,14 @@ async def run(params, board_db):
+                 status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                 detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
+                     f' (HTTP {status})' if status else '')
+-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
++                message = f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}'
++                error = GatewayClientError(message)
++                # [daveey] No admission answer reached us: the host's condition, not the card's. The
++                # exit says so and the dispatcher requeues the run uncounted unless the board shows
++                # the owner did admit it (t_82f0fe15 runs 7630/7649: two restart_wait refusals
++                # spent its failure budget and sent it to triage).
++                error.owner_unavailable = claim.admission_id is None
++                raise error from exc
+         else:
+             return _exit_code(receipt, params, board_db)
+         failures = 1 if claim.answered != seen else failures + 1
+@@ -196,6 +203,9 @@ def _submit():
+         return asyncio.run(run(params, board_db))
+     except (KeyError, ValueError, OSError) as exc:
+         print(f'Kanban owner refused: {exc}', file=sys.stderr)
++        if getattr(exc, 'owner_unavailable', False):
++            from hermes_cli.kanban_owner_unavailable import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
++            return KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+         return 1
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_goal_loop_clean_stop.py b/tests/hermes_cli/test_kanban_goal_loop_clean_stop.py
+new file mode 100644
+index 00000000000..121e6528ccb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_goal_loop_clean_stop.py
+@@ -0,0 +1,198 @@
++"""A goal-mode worker whose loop stops on a dispatcher-owned status exits clean; a broken loop does not. [daveey]
++
++t_82f0fe15 (2026-10-30): a goal-mode worker that parks itself (``kanban_schedule``) ends its run as
++``scheduled``; the run's own view (``goal_run_status``) then reads ``scheduled`` and the loop stops.
++That stop must exit 0 so the dispatcher keeps the ``scheduled`` outcome and counts no failure. A loop
++that broke (a follow-up turn raised, the judge or the status read failed) must still exit non-zero
++instead of looking like a clean exit on the last good turn's result.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import goals
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.turn_exit import turn_exit_code
++
++OK_TURN = {"final_response": "parked until the PR merges", "completed": True}
++# Every lifecycle status the dispatcher (or an operator) owns once the worker's run is no longer live.
++DISPATCHER_OWNED = ["scheduled", "superseded", "continued", "blocked", "archived", "triage", "todo",
++                    "review", "done", "changes_requested", None]
++
++
++def _judge(monkeypatch, verdict="continue", transport_failed=False):
++    def fake(goal, response, subgoals=None, background_processes=None, **_kw):
++        return verdict, f"scripted:{verdict}", False, None, transport_failed
++    monkeypatch.setattr(goals, "judge_goal", fake)
++
++
++def _exit(result, loop):
++    return turn_exit_code(goals.kanban_goal_loop_turn_result(result, loop), kanban_worker=True)
++
++
++@pytest.mark.parametrize("status", DISPATCHER_OWNED)
++def test_dispatcher_owned_status_is_a_clean_stop_exit_0(monkeypatch, status):
++    _judge(monkeypatch)
++    turns = []
++    loop = goals.run_kanban_goal_loop(
++        task_id="t1", goal_text="g", run_turn=lambda p: turns.append(p) or "x",
++        task_status_fn=lambda: status, block_fn=lambda r: pytest.fail("must not block"),
++        first_response="parked")
++    assert loop["failed"] is False
++    assert turns == []
++    assert _exit(OK_TURN, loop) == 0
++
++
++def test_run_turn_exception_still_exits_nonzero(monkeypatch):
++    _judge(monkeypatch)
++
++    def boom(_prompt):
++        raise RuntimeError("model call died")
++    loop = goals.run_kanban_goal_loop(task_id="t1", goal_text="g", run_turn=boom,
++                                      task_status_fn=lambda: "running", block_fn=lambda r: None,
++                                      first_response="first")
++    assert loop["outcome"] == "stopped" and loop["reason"] == "run_turn error: RuntimeError"
++    assert loop["failed"] is True
++    assert _exit(OK_TURN, loop) == 1
++
++
++def test_judge_transport_failure_still_exits_nonzero(monkeypatch):
++    _judge(monkeypatch, verdict="wait", transport_failed=True)
++    loop = goals.run_kanban_goal_loop(task_id="t1", goal_text="g", run_turn=lambda p: "x",
++                                      task_status_fn=lambda: "running", block_fn=lambda r: None)
++    assert loop["failed"] is True
++    assert _exit(OK_TURN, loop) == 1
++
++
++def test_status_read_failure_still_exits_nonzero(monkeypatch):
++    _judge(monkeypatch)
++
++    def unreadable():
++        raise OSError("board locked")
++    loop = goals.run_kanban_goal_loop(task_id="t1", goal_text="g", run_turn=lambda p: "x",
++                                      task_status_fn=unreadable, block_fn=lambda r: None)
++    assert loop["failed"] is True
++    assert _exit(OK_TURN, loop) == 1
++
++
++def test_failed_follow_up_turn_keeps_its_provider_exit(monkeypatch):
++    """A follow-up turn that failed on a rate-limit wall keeps EX_TEMPFAIL (requeued uncounted)."""
++    _judge(monkeypatch)
++    failed = {"final_response": "", "failed": True, "failure_reason": "rate_limit"}
++    loop = goals.run_kanban_goal_loop(
++        task_id="t1", goal_text="g", run_turn=lambda p: {"response": "", "failed": True, "failure_reason": "rate_limit"},
++        task_status_fn=lambda: "running", block_fn=lambda r: None)
++    assert loop["failed"] is True
++    assert _exit(failed, loop) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
++
++
++def test_no_loop_keeps_the_turn_result():
++    assert goals.kanban_goal_loop_turn_result(OK_TURN, None) is OK_TURN
++
++
++# ---------------------------------------------------------------------------
++# Managed worker path (gateway.session_kanban._run_task_turns): the production entry point.
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    kb.init_db()
++    return home
++
++
++def _running_goal_card(conn):
++    tid = kb.create_task(conn, title="goal card", body="merge the PR", assignee="default", goal_mode=True)
++    kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w4242")
++    return tid, kb.get_task(conn, tid).current_run_id
++
++
++class _Agent:
++    session_id = "s1"
++
++    def __init__(self, on_turn):
++        self.calls, self._on_turn = 0, on_turn
++        self._session_db = type("DB", (), {"get_messages_as_conversation": lambda _s, _sid: []})()
++
++    def run_conversation(self, prompt, conversation_history=None, turn_author=None):
++        self.calls += 1
++        return self._on_turn(self.calls)
++
++
++def _managed(monkeypatch, tid, run_id, agent):
++    from agent import kanban_turn_recovery as recovery
++    from agent import skill_commands
++    from gateway import session_kanban
++    monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt", lambda *a, **k: ("", [], []))
++    monkeypatch.setattr(recovery, "recover_failed_kanban_turns", lambda *a, **k: None)
++    context = {"skills": [], "context": "", "task_id": tid, "run_id": run_id, "goal_mode": True,
++               "goal_text": "goal card\n\nmerge the PR", "goal_max_turns": 5}
++    result = session_kanban._run_task_turns(agent, {"text": "work kanban task"}, [], context)
++    return turn_exit_code(result, kanban_worker=True)
++
++
++def test_managed_worker_that_parks_itself_exits_0_and_keeps_scheduled(kanban_home, monkeypatch):
++    _judge(monkeypatch)
++    with kbc.connect() as conn:
++        tid, run_id = _running_goal_card(conn)
++
++        def turn(n):
++            # The worker's first turn parks the card (kanban_schedule / kanban_block kind=time).
++            with kbc.connect() as c:
++                assert kb.schedule_task(c, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z PR not merged",
++                                        expected_run_id=run_id, clock_only=True)
++            return dict(OK_TURN)
++        agent = _Agent(turn)
++        assert kb.goal_run_status(conn, tid, run_id) == "running"
++        code = _managed(monkeypatch, tid, run_id, agent)
++        assert agent.calls == 1  # no continuation turn after the park
++        assert code == 0
++        assert kb.goal_run_status(conn, tid, run_id) == "scheduled"  # the run's own park, not an ownership loss
++        run = conn.execute("SELECT outcome FROM task_runs WHERE id=?", (run_id,)).fetchone()
++        task = kb.get_task(conn, tid)
++        assert run["outcome"] == "scheduled"
++        assert task.status == "scheduled" and task.consecutive_failures == 0
++
++
++def test_managed_worker_whose_follow_up_turn_raises_exits_nonzero(kanban_home, monkeypatch):
++    _judge(monkeypatch)
++    with kbc.connect() as conn:
++        tid, run_id = _running_goal_card(conn)
++
++    def turn(n):
++        if n == 1:
++            return dict(OK_TURN)
++        raise RuntimeError("provider socket closed")
++    agent = _Agent(turn)
++    assert _managed(monkeypatch, tid, run_id, agent) == 1
++    assert agent.calls == 2
++
++
++# ---------------------------------------------------------------------------
++# Dispatcher booking of a parked goal worker that exits 0.
++# ---------------------------------------------------------------------------
++
++
++def test_parked_goal_worker_exit_0_is_not_booked_as_a_crash(kanban_home, monkeypatch):
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda pid: ("clean_exit", 0))
++    with kbc.connect() as conn:
++        tid, run_id = _running_goal_card(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET worker_pid=4242 WHERE id=?", (tid,))
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait",
++                                expected_run_id=run_id, clock_only=True)
++        kbd.detect_crashed_workers(conn)
++        run = conn.execute("SELECT outcome FROM task_runs WHERE id=?", (run_id,)).fetchone()
++        task = kb.get_task(conn, tid)
++        assert run["outcome"] == "scheduled"
++        assert task.status == "scheduled" and task.consecutive_failures == 0
+diff --git a/tests/hermes_cli/test_kanban_owner_unavailable.py b/tests/hermes_cli/test_kanban_owner_unavailable.py
+new file mode 100644
+index 00000000000..bc1160c7072
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_unavailable.py
+@@ -0,0 +1,194 @@
++"""A worker whose profile owner never answers its claim is requeued uncounted, not booked a crash. [daveey]
++
++t_82f0fe15 runs 7630/7649 (2026-10-30 08:30-08:37Z): the hub gateway sat in a restart's
++``restart_wait`` drain, so each dispatcher worker waited ``OWNER_WAIT_S`` for an owner that never
++admitted the claim, printed ``Kanban owner refused: Kanban owner silent for 185s: Gateway draining:
++restart_wait`` and exited 1. Both were booked ``crashed``; failure_limit=2 sent the card to triage
++although no turn ever ran. The next run after the restart (7690) parked cleanly.
++"""
++from __future__ import annotations
++
++import asyncio
++from contextlib import asynccontextmanager
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.drain_control import RESTART_WAIT_REASON
++from hermes_cli import gateway_client, kanban_worker_client
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_owner_unavailable as ou
++
++GUE = gateway_client.GatewayUnavailableError
++
++
++# ---------------------------------------------------------------------------
++# Worker client: the exit code.
++# ---------------------------------------------------------------------------
++
++
++def _fake_clock(monkeypatch):
++    clock = [0.0]
++    monkeypatch.setattr(kanban_worker_client, "time", SimpleNamespace(monotonic=lambda: clock[0]))
++
++    async def _sleep(seconds):
++        clock[0] += seconds
++    monkeypatch.setattr(kanban_worker_client.asyncio, "sleep", _sleep)
++
++
++def _owner(*, admit_first: bool):
++    """Every dial lands in a restart wait, except (``admit_first``) one that admits the claim first."""
++    dials = [0]
++
++    @asynccontextmanager
++    async def _connect(*_, **__):
++        dials[0] += 1
++        if not (admit_first and dials[0] == 1):
++            raise GUE(f"Gateway draining: {RESTART_WAIT_REASON}", "draining", RESTART_WAIT_REASON)
++
++        class _Client:
++            events = asyncio.Queue()
++
++            async def rpc(self, method, **params):
++                if method == "kanban.run":
++                    return {"session_id": "s1", "receipt": {"status": "pending", "admission_id": "a1"}}
++                raise gateway_client.GatewayClientError("Gateway disconnected; turn outcome is unknown")
++        yield _Client()
++    return _connect
++
++
++def _submit_env(monkeypatch, tmp_path):
++    monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
++    for key, value in {"HERMES_KANBAN_BOARD": "default", "HERMES_KANBAN_TASK": "t1", "HERMES_KANBAN_RUN_ID": "7",
++                       "HERMES_KANBAN_CLAIM_LOCK": "h:1", "HERMES_KANBAN_DB": str(tmp_path / "kanban.db")}.items():
++        monkeypatch.setenv(key, value)
++
++
++def test_owner_that_never_admits_exits_owner_unavailable(monkeypatch, tmp_path, capsys):
++    _fake_clock(monkeypatch)
++    _submit_env(monkeypatch, tmp_path)
++    monkeypatch.setattr(gateway_client, "connect_gateway", _owner(admit_first=False))
++    assert kanban_worker_client._submit() == ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE == 69
++    assert "Kanban owner refused: Kanban owner silent for" in capsys.readouterr().err
++
++
++def test_owner_that_admitted_then_went_silent_still_exits_1(monkeypatch, tmp_path):
++    _fake_clock(monkeypatch)
++    _submit_env(monkeypatch, tmp_path)
++    monkeypatch.setattr(gateway_client, "connect_gateway", _owner(admit_first=True))
++    assert kanban_worker_client._submit() == 1
++
++
++def test_a_final_owner_refusal_still_exits_1(monkeypatch, tmp_path):
++    _submit_env(monkeypatch, tmp_path)
++
++    @asynccontextmanager
++    async def _connect(*_, **__):
++        raise GUE("Gateway refused: unsafe peer", "inaccessible", "unsafe_control_peer")
++        yield
++    monkeypatch.setattr(gateway_client, "connect_gateway", _connect)
++    assert kanban_worker_client._submit() == 1
++
++
++# ---------------------------------------------------------------------------
++# Dispatcher: the booking.
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
++    monkeypatch.setattr(kbd, "_worker_final_output", lambda *a, **kw: "")
++    kb.init_db()
++    return home
++
++
++def _exits(monkeypatch, code):
++    from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind
++    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda pid: exit_code_kind(code))
++
++
++def _running(conn, tid=None, pid=71001):
++    tid = tid or kb.create_task(conn, title="goal card", assignee="default", goal_mode=True)
++    kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w{pid}")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
++    return tid
++
++
++def _last_run(conn, tid):
++    return conn.execute("SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                        (tid,)).fetchone()
++
++
++def test_owner_unavailable_exit_requeues_uncounted(home, monkeypatch):
++    _exits(monkeypatch, ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE)
++    with kbc.connect() as conn:
++        tid = _running(conn)
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        run = _last_run(conn, tid)
++        assert run["outcome"] == "owner_unavailable"
++        assert "no turn ran" in run["error"]
++        assert task.status == "ready" and task.consecutive_failures == 0
++
++
++def test_two_owner_unavailable_runs_do_not_spend_the_failure_budget(home, monkeypatch):
++    """The t_82f0fe15 sequence: two refusals in a row under failure_limit=2 must leave it dispatchable."""
++    _exits(monkeypatch, ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE)
++    with kbc.connect() as conn:
++        tid = _running(conn)
++        kbd.detect_crashed_workers(conn)
++        _running(conn, tid, pid=71002)
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and task.consecutive_failures == 0
++        outcomes = [r["outcome"] for r in conn.execute("SELECT outcome FROM task_runs WHERE task_id=?", (tid,))]
++        assert outcomes == ["owner_unavailable", "owner_unavailable"]
++
++
++def test_owner_unavailable_after_an_admission_is_still_a_crash(home, monkeypatch):
++    _exits(monkeypatch, ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE)
++    with kbc.connect() as conn:
++        tid = _running(conn)
++        run_id = kb.get_task(conn, tid).current_run_id
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "owner_admitted", {"db": "/nowhere"}, run_id=run_id)
++        from hermes_cli import kanban_owner_recovery
++        monkeypatch.setattr(kanban_owner_recovery, "owner_reclaim_blocked", lambda *a, **k: False)
++        kbd.detect_crashed_workers(conn)
++        run = _last_run(conn, tid)
++        assert run["outcome"] == "crashed"
++        assert "the owner had admitted this run" in run["error"]
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++
++
++def test_an_owner_that_never_returns_reaches_the_breaker(home, monkeypatch):
++    _exits(monkeypatch, ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE)
++    with kbc.connect() as conn:
++        tid = _running(conn)
++        for i in range(ou.NEUTRAL_STREAK_LIMIT):
++            kbd.detect_crashed_workers(conn)
++            _running(conn, tid, pid=72000 + i)
++        kbd.detect_crashed_workers(conn)
++        run = _last_run(conn, tid)
++        assert run["outcome"] == "crashed"
++        assert f"{ou.NEUTRAL_STREAK_LIMIT} runs in a row found no owner" in run["error"]
++        assert kb.get_task(conn, tid).consecutive_failures == 1
++
++
++def test_plain_exit_1_is_still_a_crash(home, monkeypatch):
++    _exits(monkeypatch, 1)
++    with kbc.connect() as conn:
++        tid = _running(conn)
++        kbd.detect_crashed_workers(conn)
++        assert _last_run(conn, tid)["outcome"] == "crashed"
++        assert kb.get_task(conn, tid).consecutive_failures == 1
+diff --git a/tests/hermes_cli/test_single_query_exit_contract.py b/tests/hermes_cli/test_single_query_exit_contract.py
+index 1566f025eac..3918a1d297e 100644
+--- a/tests/hermes_cli/test_single_query_exit_contract.py
++++ b/tests/hermes_cli/test_single_query_exit_contract.py
+@@ -107,3 +107,54 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
+     with pytest.raises(SystemExit) as exc:
+         cli._run_single_query_mode(stub, "do the thing", None, True, True)
+     assert exc.value.code == expected
++
++
++# [daveey] Goal-mode workers (t_82f0fe15, 2026-10-30): a loop that stops because the worker parked the
++# card (scheduled, read back as superseded) or the dispatcher owns it exits 0; a broken loop exits 1.
++_PARKED = {"outcome": "stopped", "reason": "status=superseded", "turns_used": 0, "failed": False}
++_BROKEN = {"outcome": "stopped", "reason": "run_turn error: RuntimeError", "turns_used": 1, "failed": True}
++
++
++@pytest.mark.parametrize(("loop", "expected"), [(_PARKED, 0), (_BROKEN, 1), (None, 0)])
++def test_q_goal_worker_exit_follows_the_goal_loop(monkeypatch, loop, expected):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
++    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
++    monkeypatch.setattr(cli, "_run_kanban_goal_loop_chat", lambda c, r: loop)
++    assert _run_non_quiet(monkeypatch, {"final_response": "parked", "completed": True}) == expected
++
++
++def _run_quiet_goal(monkeypatch, loop, follow_up=None):
++    """Drive the ``-Q`` driver through one settled turn and a stubbed goal loop; return the exit code."""
++    from agent import kanban_turn_recovery as recovery
++    from hermes_cli import quiet_single_query as qsq
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
++    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
++    monkeypatch.setattr(recovery, "recover_failed_kanban_turns", lambda *a, **k: None)
++    monkeypatch.setattr(qsq, "continue_quiet_notify_completions", lambda *a, **k: None)
++    monkeypatch.setattr(qsq, "quiet_notify_linger_seconds", lambda: 0)
++    monkeypatch.setattr(cli, "_sync_cli_session_id_from_agent", lambda c: None)
++
++    def _loop(c, response, turn_results=None):
++        if follow_up is not None:
++            turn_results.append(follow_up)
++        return loop
++    monkeypatch.setattr(cli, "_run_kanban_goal_loop_q", _loop)
++    agent = SimpleNamespace(run_conversation=lambda **k: {"final_response": "parked", "completed": True})
++    stub = SimpleNamespace(agent=agent, conversation_history=[], session_id="s1")
++    with pytest.raises(SystemExit) as exc:
++        cli._run_quiet_single_query(stub, "work kanban task")
++    return exc.value.code
++
++
++def test_quiet_goal_worker_that_parks_itself_exits_0(monkeypatch):
++    assert _run_quiet_goal(monkeypatch, _PARKED) == 0
++
++
++def test_quiet_goal_worker_whose_loop_broke_exits_1(monkeypatch):
++    assert _run_quiet_goal(monkeypatch, _BROKEN) == 1
++
++
++def test_quiet_goal_worker_keeps_a_follow_up_turns_provider_wall(monkeypatch):
++    wall = {"failed": True, "failure_reason": "rate_limit", "final_response": ""}
++    assert _run_quiet_goal(monkeypatch, {**_BROKEN, "reason": "worker failed: rate_limit"}, wall) \
++        == KANBAN_RATE_LIMIT_EXIT_CODE
+-- 
+2.55.0
+

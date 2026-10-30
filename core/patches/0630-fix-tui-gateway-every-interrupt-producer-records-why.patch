@@ -25,25 +25,11 @@ Tests: tests/tui_gateway/test_interrupt_reason.py drives a real AIAgent through 
 slow provider and interrupts it via session.interrupt, _stop_turns_before_exit, the
 WS-orphan path and a lease takeover; each row carries its own reason (red before).
 ---
- agent/interrupt_control.py                   |  30 +++
- agent/message_sanitization.py                |  14 +-
- agent/turn_api_call.py                       |   8 +-
- agent/turn_finalizer.py                      |  32 ++-
- tests/tui_gateway/test_interrupt_reason.py   | 205 +++++++++++++++++++
- tests/tui_gateway/test_tui_gateway_server.py |   8 +-
- tui_gateway/compute_host.py                  |   2 +-
- tui_gateway/host_supervisor.py               |   8 +-
- tui_gateway/methods_session_takeover.py      |   2 +-
- tui_gateway/session_lifecycle.py             |  21 +-
- tui_gateway/session_reaper.py                |   2 +-
- 11 files changed, 298 insertions(+), 34 deletions(-)
- create mode 100644 tests/tui_gateway/test_interrupt_reason.py
-
 diff --git a/agent/interrupt_control.py b/agent/interrupt_control.py
-index 06117c1c9a..fd0a1fd94e 100644
+index af647a1c4f1abeb639c59c13e6f18b1ad8224e2c..68633045f9c904f86d25f3c8b56e303877778ad8 100644
 --- a/agent/interrupt_control.py
 +++ b/agent/interrupt_control.py
-@@ -51,6 +51,36 @@ def interrupted_during_api_call_reason(agent) -> str:
+@@ -53,6 +53,36 @@ def interrupted_during_api_call_reason(agent) -> str:
      return f"interrupted_during_api_call({issuer})" if issuer else "interrupted_during_api_call"
  
  
@@ -80,50 +66,11 @@ index 06117c1c9a..fd0a1fd94e 100644
  def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str) -> None:
      """Call ``type(fence).cancel_before_commit(fence)`` when ``commit_in_flight`` matches.
  
-diff --git a/agent/message_sanitization.py b/agent/message_sanitization.py
-index f0eb59cb49..09368e30d8 100644
---- a/agent/message_sanitization.py
-+++ b/agent/message_sanitization.py
-@@ -285,7 +285,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
-     return "{}"
- 
- 
--def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
-+def close_interrupted_tool_sequence(messages: list, final_response: Any = None, display_metadata: Any = None) -> bool:
-     """Append a synthetic assistant turn when an interrupted tail is a tool result: a transcript
-     ending on a raw ``tool`` message makes the next user message land as ``tool → user``, an
-     alternation violation strict providers (Gemini, Claude) answer by hallucinating a
-@@ -297,7 +297,8 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None)
-     ``display_kind="hidden"`` keep it out of rendered transcripts, matching the
-     ``_INTERRUPTED_PLACEHOLDER`` shape in ``turn_api_call.py``. A caller-supplied banner
-     (truncation notices, partial-delivery text) stays visible: it is the turn's only
--    user-facing explanation."""
-+    user-facing explanation. ``display_metadata`` (the interrupt's recorded reason) rides on the
-+    closing row either way."""
-     last = messages[-1] if messages else None
-     if not isinstance(last, dict) or last.get("role") != "tool":
-         return False
-@@ -305,10 +306,11 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None)
-     from agent.message_metadata import append_message
- 
-     stripped = text.strip()
--    if not stripped or stripped == _INTERRUPTED_PLACEHOLDER:
--        append_message(messages, hidden_interrupt_placeholder_row())
--    else:
--        append_message(messages, {"role": "assistant", "content": stripped})
-+    row: dict[str, Any] = (hidden_interrupt_placeholder_row() if not stripped or stripped == _INTERRUPTED_PLACEHOLDER
-+           else {"role": "assistant", "content": stripped})
-+    if display_metadata:
-+        row["display_metadata"] = dict(display_metadata)
-+    append_message(messages, row)
-     return True
- 
- 
 diff --git a/agent/turn_api_call.py b/agent/turn_api_call.py
-index a159903513..e95433a813 100644
+index 43acf81b824004fe3bcc7d6c77eeed95640c9218..1bbe9153fd83dcebab77ceb4d3d336a023dabe3c 100644
 --- a/agent/turn_api_call.py
 +++ b/agent/turn_api_call.py
-@@ -188,6 +188,8 @@ def handle_api_interrupt(
+@@ -195,6 +195,8 @@ def handle_api_interrupt(
      api_elapsed = time.time() - api_start_time
      agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
      interrupted = True
@@ -132,7 +79,7 @@ index a159903513..e95433a813 100644
      # A Stop during the empty-response nudge request leaves the synthetic assistant+nudge
      # pair after an executed tool result; strip it so the row appended below follows the tool
      # row (the finalizer then closes the tail with this exit's own reason).
-@@ -199,11 +201,13 @@ def handle_api_interrupt(
+@@ -206,11 +208,13 @@ def handle_api_interrupt(
          # The interrupted row is replayed next turn; looped bytes there re-seed the loop
          # (#112764). Same hidden shape as the redirect placeholder: nothing visible in the
          # transcript, a neutral api_content so the pre-call sanitizer does not re-heal it.
@@ -148,73 +95,9 @@ index a159903513..e95433a813 100644
          })
          final_response = _partial
      else:
-diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
-index c38011b76e..4ce0c9e51d 100644
---- a/agent/turn_finalizer.py
-+++ b/agent/turn_finalizer.py
-@@ -184,6 +184,8 @@ def _resolve_budget_fallback(
-                 interrupted = True
-                 _turn_exit_reason = interrupted_during_api_call_reason(agent)
-                 final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
-+                from agent.interrupt_control import record_api_interrupt
-+                record_api_interrupt(agent, time.time() - _summary_start, messages)
- 
-         from agent.pre_final_gate import UnresolvedFallback
-         if _gate_budget_output and not isinstance(_pending_verification_response, UnresolvedFallback):
-@@ -269,7 +271,9 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
-     # providers don't see ``tool → user`` (placeholder: final_response is usually empty).
-     if interrupted:
-         from agent.message_sanitization import close_interrupted_tool_sequence
--        close_interrupted_tool_sequence(messages, final_response)
-+        _info = getattr(agent, "_last_api_interrupt", None)
-+        close_interrupted_tool_sequence(
-+            messages, final_response, display_metadata={"interrupt": _info} if isinstance(_info, dict) else None)
- 
-     # Recovery ``break`` sites can return a final_response with no closing assistant
-     # row; enforce "delivered final_response ⇒ assistant row" here. Compare content,
-@@ -577,6 +581,23 @@ def _prepare_final_gate_fallback(
-     return final_response, unresolved
- 
- 
-+def _stamp_interrupt_attribution(agent, result, interrupted) -> None:
-+    """Who and why for an interrupted turn, stamped on the result before ``clear_interrupt``."""
-+    # [daveey] Why a model wait was cut short ({reason, waited_s, prompt_tokens}); consumed once per turn.
-+    api_interrupt = vars(agent).pop("_last_api_interrupt", None)
-+    if not interrupted:
-+        return
-+    if agent._interrupt_message:
-+        result["interrupt_message"] = agent._interrupt_message
-+    # [daveey] Which system producer stopped the turn (None for a human stop), so clients can
-+    # tell "you pressed Stop" from "Hermes stopped this" (tui_gateway/prompt_turn surfaces it).
-+    from agent.interrupt_control import interrupt_issuer as _interrupt_issuer
-+    if _issuer_slug := _interrupt_issuer(agent):
-+        result["interrupt_issuer"] = _issuer_slug
-+    if isinstance(api_interrupt, dict):
-+        result["interrupt"] = api_interrupt
-+
-+
- def _stamp_unresolved_failure(result, goal_unresolved):
-     if goal_unresolved and not result.get("error"):
-         # Delivery adapters understand error; completed=False alone is not a
-@@ -828,14 +849,7 @@ def finalize_turn(
-         result["pending_steer"] = _leftover_steer
-     agent._response_was_previewed = False
-     agent._reused_response_text = None
--    if interrupted and agent._interrupt_message:
--        result["interrupt_message"] = agent._interrupt_message
--    if interrupted:
--        # [daveey] Which system producer stopped the turn (None for a human stop), so clients can
--        # tell "you pressed Stop" from "Hermes stopped this" (tui_gateway/prompt_turn surfaces it).
--        from agent.interrupt_control import interrupt_issuer as _interrupt_issuer
--        if _issuer_slug := _interrupt_issuer(agent):
--            result["interrupt_issuer"] = _issuer_slug
-+    _stamp_interrupt_attribution(agent, result, interrupted)
-     agent.clear_interrupt()
-     agent._stream_callback = None  # don't leak into future calls
- 
 diff --git a/tests/tui_gateway/test_interrupt_reason.py b/tests/tui_gateway/test_interrupt_reason.py
 new file mode 100644
-index 0000000000..8ed654ef29
+index 0000000000000000000000000000000000000000..90bd020d0fda81e5dd80948cbad5e2bfd72d4721
 --- /dev/null
 +++ b/tests/tui_gateway/test_interrupt_reason.py
 @@ -0,0 +1,205 @@
@@ -424,10 +307,10 @@ index 0000000000..8ed654ef29
 +    host._handle_interrupt({"sid": "s1", "request_id": "r1", "reason": "backend_exit"})
 +    assert seen.get("reason") == "backend_exit"
 diff --git a/tests/tui_gateway/test_tui_gateway_server.py b/tests/tui_gateway/test_tui_gateway_server.py
-index a68552787f..29a74cf266 100644
+index b200f32a8e38415404895fa1c61a4cc7d9c99867..3a24cde693a73d2df3af2d47bd17620f48a27fac 100644
 --- a/tests/tui_gateway/test_tui_gateway_server.py
 +++ b/tests/tui_gateway/test_tui_gateway_server.py
-@@ -5053,8 +5053,8 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
+@@ -5049,8 +5049,8 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
              return None
  
      class _Supervisor:
@@ -438,7 +321,7 @@ index a68552787f..29a74cf266 100644
  
      session = _session(
          agent=None,
-@@ -5084,7 +5084,7 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
+@@ -5080,7 +5080,7 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
          server._schedule_ws_orphan_reap("isolated-sid")
          callbacks.pop(0)()
  
@@ -447,7 +330,7 @@ index a68552787f..29a74cf266 100644
          assert session["_turn_cancel_requested"] is True
          assert session["queued_prompt"] is None
          assert session["history"] == [{"role": "assistant", "content": "partial"}]
-@@ -5092,7 +5092,7 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
+@@ -5088,7 +5088,7 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
  
          callbacks.pop(0)()
  
@@ -457,10 +340,10 @@ index a68552787f..29a74cf266 100644
  
          session["running"] = False
 diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
-index c4ef50b1f0..ead10ef4a2 100644
+index 9c8b398a025e2c767f94cc5732daa70c3061a8d4..e075c825aa81e2f1339aec9225977ddce801d694 100644
 --- a/tui_gateway/compute_host.py
 +++ b/tui_gateway/compute_host.py
-@@ -196,7 +196,7 @@ class ComputeHost:
+@@ -200,7 +200,7 @@ class ComputeHost:
                  return
              # In the child the shared helper interrupts the local agent and releases this
              # process's pending clarify Event (the parent only has a metadata mirror).
@@ -470,10 +353,10 @@ index c4ef50b1f0..ead10ef4a2 100644
          self._guarded(frame, "interrupt.ack", body, applied=False)
  
 diff --git a/tui_gateway/host_supervisor.py b/tui_gateway/host_supervisor.py
-index 76e6182f9d..be00679531 100644
+index 0900a16a7ca7a037e94848d84e4df84c539d60dd..109e46d2d088801aa31e4b37c40d4d288322a30f 100644
 --- a/tui_gateway/host_supervisor.py
 +++ b/tui_gateway/host_supervisor.py
-@@ -250,10 +250,12 @@ class HostSupervisor:
+@@ -252,10 +252,12 @@ class HostSupervisor:
              raise
          return request_id
  
@@ -490,7 +373,7 @@ index 76e6182f9d..be00679531 100644
      def has_pending_turn(self, sid: str) -> bool:
          """True when a host completion callback is still registered for ``sid``.
 diff --git a/tui_gateway/methods_session_takeover.py b/tui_gateway/methods_session_takeover.py
-index 88257691b7..566764b7bc 100644
+index 88257691b76c99b551a240d5596dad31e0b31c3e..566764b7bca3f9add3c4b430bdee86c9b17cc805 100644
 --- a/tui_gateway/methods_session_takeover.py
 +++ b/tui_gateway/methods_session_takeover.py
 @@ -96,7 +96,7 @@ def _revoke_taken_over_lease(sid: str, session: dict, lease, taker: dict) -> boo
@@ -502,87 +385,8 @@ index 88257691b7..566764b7bc 100644
      except Exception:
          logger.exception("takeover interrupt failed sid=%s", sid)
      with contextlib.suppress(Exception):
-diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
-index d0eaa29f06..b1622300d1 100644
---- a/tui_gateway/session_lifecycle.py
-+++ b/tui_gateway/session_lifecycle.py
-@@ -195,7 +195,7 @@ def _take_over_detached_runtime_lease(sid: str, session: dict, key: str) -> bool
-         _attach_lease(session, lease)
-     logger.info("Session %s took over lease for %s from detached runtime %s", sid, key, other_sid)
-     try:
--        _interrupt_session_turn(other_sid, other, request_id=f"lease-takeover-{sid}")
-+        _interrupt_session_turn(other_sid, other, request_id=f"lease-takeover-{sid}", reason="lease_takeover")
-     except Exception:
-         logger.exception("lease-takeover interrupt failed sid=%s", other_sid)
-     return True
-@@ -616,7 +616,7 @@ def _settle_isolated_turn_before_close(session: dict) -> None:
-     if not session.get("_compute_host_turn_id") or not _session_uses_compute_host(session):
-         return
-     with contextlib.suppress(Exception):
--        _interrupt_session_turn(_lifecycle_own_sid(session), session)
-+        _interrupt_session_turn(_lifecycle_own_sid(session), session, reason="session_close")
-     deadline = time.monotonic() + _TURN_SETTLE_BEFORE_CLOSE_SECONDS
-     while session.get("_compute_host_turn_id") and time.monotonic() < deadline:
-         time.sleep(0.05)
-@@ -702,14 +702,19 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
- 
- 
- def _interrupt_session_turn(
--    sid: str, session: dict, *, request_id: str | None = None, orphan: bool = False,
-+    sid: str, session: dict, *, request_id: str | None = None, orphan: bool = False, reason: str | None = None,
- ) -> bool:
-     """Apply the shared ``session.interrupt`` contract to one claimed session; returns whether the compute-host control
-     channel was used. The WS orphan reaper reuses this so a dead client gets the same partial-history/queue semantics.
- 
-     ``orphan=True`` (reaper path) labels dropped approvals ``ws_orphan_reap``; the label comes from the
-     caller, never from request_id prefix sniffing — a future orphan caller may use another id (#106678).
-+    ``reason`` [daveey]: fixed slug for WHY the turn is stopped (``user_stop`` default, ``ws_orphan`` for the
-+    orphan reaper, ``backend_exit``, ``lease_takeover``, ``session_close``). A non-user reason reaches the agent as
-+    its ``tool_reason`` so the interrupted row and agent.log name the producer, not a bare user Stop.
-     """
-+    reason = reason or ("ws_orphan" if orphan else "user_stop")
-+    agent_tool_reason = None if reason == "user_stop" else reason.replace("_", " ")
-     from tui_gateway.process_consumer_health import invalidate
-     invalidate(session)
-     use_compute_host = _session_uses_compute_host(session)
-@@ -722,7 +727,9 @@ def _interrupt_session_turn(
-         # The host owns the live turn (parent `running` can lag a blocked tool), so let it decide. Gate on
-         # `_compute_host_active`: HostSupervisor.interrupt() calls start(), so a lazy session would spawn a child to interrupt.
-         if should_interrupt or session.get("_compute_host_active"):
--            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
-+            # Only a non-default reason rides on the frame (the child defaults to user_stop).
-+            _get_compute_host_supervisor().interrupt(
-+                sid, request_id=request_id, **({} if reason == "user_stop" else {"reason": reason}))
-     else:
-         run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
-     with session["history_lock"]:
-@@ -742,21 +749,21 @@ def _interrupt_session_turn(
-             with _session_profile_runtime_scope(session, hydrate_secrets=False):
-                 _invoke_hook(
-                     "agent_loop_stopped", session_key=session.get("session_key", ""), platform="tui",
--                    reason="user_stop", invalidation_reason="session_interrupt",
-+                    reason=reason, invalidation_reason="session_interrupt",
-                 )
-         except Exception:
-             logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
-     if not use_compute_host:
-         if should_interrupt:
-             from agent.interrupt_compat import request_hard_interrupt
--            request_hard_interrupt(session.get("agent"))
-+            request_hard_interrupt(session.get("agent"), tool_reason=agent_tool_reason)
-         # Background delegations are detached from the turn's interrupt fan-out; a stop ends them too
-         # (own UI sid + spawner id only — a viewer tab must not kill gateway work). Each returns as an
-         # interrupted completion with its partial output.
-         with contextlib.suppress(Exception):
-             from tools.async_delegation import interrupt_for_session
-             interrupt_for_session(
--                origin_ui_session_id=_lifecycle_own_sid(session, sid), reason="user_stop",
-+                origin_ui_session_id=_lifecycle_own_sid(session, sid), reason=reason,
-                 parent_session_id=str(getattr(session.get("agent"), "session_id", "") or ""))
-         if not run_thread_alive and not compressing:
-             with session["history_lock"]:
 diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
-index 52dddd62f9..127b2139d0 100644
+index 5b9e5669d310799a500af824bcc24d8fedeb29dd..90999169efb63f6661948c79ba498f072da5bae7 100644
 --- a/tui_gateway/session_reaper.py
 +++ b/tui_gateway/session_reaper.py
 @@ -132,7 +132,7 @@ def _stop_turns_before_exit(budget_s: float | None = None) -> None:

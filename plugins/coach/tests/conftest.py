@@ -26,6 +26,15 @@ def _isolated_worker_context(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _reap_test_home_gateways(tmp_path):
+    """Stop gateways a test's subprocesses auto-started under tmp_path. They detach from the
+    child and would otherwise hold the tmp home's state.db WAL/SHM after pytest deletes it."""
+    yield
+    from gateway_reaper import stop_gateways_under
+    stop_gateways_under(tmp_path)
+
+
+@pytest.fixture(autouse=True)
 def _no_dependency_sync_in_tmp_home(tmp_path):
     """Regression guard: a test basetemp must never hold a uv cache or a built environment."""
     yield
@@ -52,3 +61,7 @@ def _no_system_one_network(monkeypatch, tmp_path):
     monkeypatch.setenv("COACH_SELFHEAL_NO_EXEC", "1")
     monkeypatch.delenv("COACH_SELFHEAL_HUB", raising=False)
     monkeypatch.delenv("COACH_SELFHEAL_IS_HUB", raising=False)
+    # session_commit_fix reads the fork's real git history (~/.hermes/hermes-agent origin/main) by default, so a real
+    # upstream `fix(<component>): ...` commit near a fixture's NOW gets "adopted" and the test's outcome depends on
+    # whatever the fork has fetched. Point it at a missing repo; tests that exercise it build their own repo.
+    monkeypatch.setenv("COACH_FORK_REPO", str(tmp_path / "no-fork-repo"))

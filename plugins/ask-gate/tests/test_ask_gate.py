@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from conftest import FIX, llm_returning
+from conftest import FIX, HERE, llm_returning
 
 GOOD = FIX["good"]
 
@@ -359,6 +359,54 @@ def test_worker_handoff_without_leftovers_untouched(worker):
     assert worker.pre_tool_call(tool_name="kanban_complete", args={"summary": "All done, tests pass."}, session_id="w1") is None
 
 
+# 10-30: a hub worker's handoff told David "Please run this from your side:" above an `ssh … hermes kanban unblock`
+# loop. find_leftovers matched nothing (no "David", no "needs you"), so the handoff reached his chat as a bare
+# shell-command ask: no FYI prefix, no judge.
+@pytest.mark.parametrize("text", [
+    "11 cards stuck by last night's outage are still in triage and need an unblock from your side.",
+    "Please run this from your side:\n`ssh you@example.com 'for id in t_01a18b227fc5ada3; do hermes kanban unblock $id; done'`",
+    "Run this in your terminal: `hermes kanban unblock t_01a18b227fc5ada3`.",
+    "Please open the dashboard and approve the restart.",
+])
+def test_week_1026_handoff_hands_david_a_step(gate, text):
+    assert gate.core.find_leftovers(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Nothing is needed from your side.",
+    "Nothing to do on your end.",
+    "No action needed from your side; the drain finished on its own.",
+    "I ran the unblock from the orchestrator chat, so nothing is waiting on you.",
+    "The worker reran the suite on its side and it passed.",
+])
+def test_week_1026_handoff_non_leftovers(gate, text):
+    assert gate.core.find_leftovers(text) == []
+
+
+def test_worker_shell_command_handback_becomes_fyi(worker):
+    worker.LLM = llm_returning([("unverified", "an orchestrator can unblock"), ("unverified", "same")])
+    summ = ("The hub fix is live. The 11 incident cards need an unblock from your side.\n"
+            "Please run this from your side:\n`ssh you@example.com 'hermes kanban unblock t_01a18b227fc5ada3'`")
+    r = worker.pre_tool_call(tool_name="kanban_complete", args={"summary": summ}, session_id="w1")
+    assert r["action"] == "modify"
+    out = r["args"]["summary"]
+    assert "FYI (unverified, not an ask for David): Please run this from your side:" in out
+    assert "FYI (unverified, not an ask for David): The 11 incident cards need an unblock from your side." in out
+    assert out.startswith("The hub fix is live.")
+
+
+def test_worker_final_send_leftover_keeps_its_header(worker):
+    # Core relays a FINAL SEND line only while the line starts with it (hermes_cli/kanban_final_send._HEAD), so the
+    # FYI mark goes after the header, never in front of it.
+    worker.LLM = llm_returning([("unverified", "agent work")])
+    head = "FINAL SEND for @session:default@host/20261030_000000_abcdef: "
+    r = worker.pre_tool_call(tool_name="kanban_complete", session_id="w1",
+                             args={"summary": "Done.\n" + head + "The 2 incident cards need an unblock from your side."})
+    assert r["action"] == "modify"
+    assert r["args"]["summary"] == ("Done.\n" + head + "FYI (unverified, not an ask for David): "
+                                    "The 2 incident cards need an unblock from your side.")
+
+
 def test_worker_kanban_block_needs_checked(worker):
     r = worker.pre_tool_call(tool_name="kanban_block", args={"reason": "needs David to sign in", "kind": "needs_input"}, session_id="w1")
     assert r["action"] == "block"
@@ -641,3 +689,14 @@ def test_linked_cards_include_cards_subscribed_to_the_chat(tmp_path, gate):
     core = gate.core
     ids = [x["id"] for x in core.linked_cards("chat", db_paths=[db])]
     assert ids == ["t_sub", "t_own"]
+
+
+def test_card_ids_match_current_16_hex_ids():
+    """Board ids are now t_ + 16 hex (t_01a18b22ba05938e); the 8-hex-only pattern found none of them, so the
+    deterministic live-status check never saw a current card (found while fixing self-heal agent-31a66d274a)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ask_gate_core_ids", HERE / "core.py")
+    core = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core)
+    assert core.card_ids("see t_01a18b22ba05938e and t_b0192d39, not t_01a18b22ba05938e9") == [
+        "t_01a18b22ba05938e", "t_b0192d39"]

@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from test_final_publication import ASK, Cards, Model, extraction
+from test_final_publication import ASK, Cards, Model, extraction, requests, retire
 
 
 @pytest.mark.parametrize("harness", [["user-steps"]], indirect=True)
@@ -25,7 +25,8 @@ def test_standalone_retirement_never_streams(harness, monkeypatch, verification,
     h.agent.run_conversation("Pick a case with me.")
     ledger = h.steps.core.Ledger()
     step = ledger.open_steps(h.agent.session_id)[0]
-    h.steps.core.resolve(ledger, ledger.root(h.agent.session_id), [step["id"]], "done", "test")
+    retire(h, step)
+    canonical_before = requests(h)
     cards.calls.clear()
     if verification:
         nudges = iter(["Verify before finishing.", None])
@@ -38,6 +39,7 @@ def test_standalone_retirement_never_streams(harness, monkeypatch, verification,
     assert not model.interims
     assert not cards.calls
     assert not ledger.open_steps(h.agent.session_id)
+    assert requests(h) == canonical_before
     for rows in (result["messages"], h.db.get_messages(h.agent.session_id)):
         start = next(i for i, row in enumerate(rows) if row.get("content") == "Report current status.")
         assert ASK not in str(rows[start:])

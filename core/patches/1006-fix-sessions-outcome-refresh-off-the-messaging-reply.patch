@@ -1,0 +1,326 @@
+From 16f08fdf9e54180e9a8e05a502752366b5bdff30 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:20:45 -0700
+Subject: [PATCH] fix(sessions): outcome refresh off the messaging reply path;
+ a judge's verdict survives judge-less refreshes; judges get the source
+ [daveey]
+
+- gateway turn end no longer awaits the outcome refresh before the reply reaches the adapter: it runs on a
+  daemon thread that keeps the turn's context (profile scope).
+- A judged outcome stores judged=true and the judged message id; a refresh in a process without a judge
+  (CLI outcome-audit --refresh, web ?refresh=1) keeps that verdict for the same message instead of letting
+  the heuristic overwrite it.
+- Judges are called as fn(sid, text, source=...) with the row's sessions.source; a judge without the
+  keyword is called as fn(sid, text).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/gateway/turn_outcome.py b/gateway/turn_outcome.py
+index 0808ac729b84ebee72d921bba808995ea78cf449..5a33f5dfe77880d4c69da5b10bdf018e6d0d6a0c 100644
+--- a/gateway/turn_outcome.py
++++ b/gateway/turn_outcome.py
+@@ -1,27 +1,42 @@
+ """Turn-end outcome refresh for messaging-platform turns. [daveey]
+ 
+ ``GatewayRunner._handle_message_with_agent`` refreshes the chat's stored outcome
+-(``hermes_state_outcome``) when a turn concludes, however it concluded, while the turn's profile
+-scope is still bound. The read runs off the event loop. Best-effort: never raises into the handler.
++(``hermes_state_outcome``) when a turn concludes, however it concluded. The refresh runs on a daemon
++thread that inherits the turn's context (profile scope) and is never awaited: a judge call or a slow
++store read must not hold the reply the adapter is about to send. Best-effort: never raises.
+ """
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+ import logging
++import threading
++from typing import Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-async def refresh_gateway_turn_outcome(runner, session_entry) -> None:
++def _refresh(sid: str, db) -> None:
++    try:
++        from hermes_state_outcome import refresh_outcome
++
++        refresh_outcome(sid, "turn_end", db=db)
++    except Exception:  # health: allow BLE001 -- the turn already concluded; a failed refresh is logged
++        logger.warning("gateway turn-end outcome refresh failed for %s", sid, exc_info=True)
++
++
++def refresh_gateway_turn_outcome(runner, session_entry) -> Optional[threading.Thread]:
++    """Start the refresh off the reply path; the started thread (None when there is nothing to refresh)."""
+     sid = str(getattr(session_entry, "session_id", "") or "")
+     store = getattr(runner, "_session_db", None)
+     db = getattr(store, "_db", store)
+     if not sid or db is None:
+-        return
++        return None
+     try:
+-        from hermes_state_outcome import refresh_outcome
++        from agent.memory_provider import spawn_context_thread
+ 
+-        await asyncio.to_thread(refresh_outcome, sid, "turn_end", db=db)
+-    except Exception:  # health: allow BLE001 -- the turn already concluded; a failed refresh is logged
+-        logger.warning("gateway turn-end outcome refresh failed for %s", sid, exc_info=True)
++        thread = spawn_context_thread(_refresh, name="gateway-turn-outcome", args=(sid, db))
++        thread.start()
++        return thread
++    except Exception:  # health: allow BLE001 -- a thread that can't start skips one refresh; logged
++        logger.warning("gateway turn-end outcome refresh could not start for %s", sid, exc_info=True)
++        return None
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 951a3d48c384f33e8d3ae874d10026fe84983c37..198692098e8fc089734e93339f2840704c16f081 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -46,7 +46,8 @@ _NOTICE_KIND = "kanban_notice"
+ _PROGRESS_OPENERS = ("let me ", "i'll ", "i will ", "now i", "next, i", "next i ", "working on")
+ 
+ ProviderFn = Callable[[str], Optional[dict]]
+-JudgeFn = Callable[[str, str], Optional[bool]]
++# ``fn(sid, text, *, source=None)``; a judge without the ``source`` keyword is called as ``fn(sid, text)``.
++JudgeFn = Callable[..., Optional[bool]]
+ 
+ _providers: dict[str, ProviderFn] = {}
+ _judge: list[Optional[JudgeFn]] = [None]
+@@ -64,8 +65,9 @@ def register_outcome_provider(name: str, fn: ProviderFn) -> None:
+ 
+ 
+ def register_outcome_judge(fn: Optional[JudgeFn]) -> None:
+-    """Set the summary judge ``fn(sid, last_assistant_text) -> True | False | None`` (None = can't tell,
+-    use the heuristic). One judge per process; ``None`` clears it."""
++    """Set the summary judge ``fn(sid, last_assistant_text, *, source=None) -> True | False | None`` (None =
++    can't tell, use the heuristic; ``source`` is the row's ``sessions.source``, and a judge that does not take
++    it is called without it). One judge per process; ``None`` clears it."""
+     if fn is not None and not callable(fn):
+         raise ValueError("register_outcome_judge needs a callable")
+     _judge[0] = fn
+@@ -194,7 +196,7 @@ def _parse(raw: Any) -> Optional[dict[str, Any]]:
+ 
+ 
+ def _row(db: Any, sid: str) -> Optional[dict[str, Any]]:
+-    row = db._read_one("SELECT id, outcome_json, outcome_at, muted FROM sessions WHERE id = ?", (sid,))
++    row = db._read_one("SELECT id, source, outcome_json, outcome_at, muted FROM sessions WHERE id = ?", (sid,))
+     return dict(row) if row is not None else None
+ 
+ 
+@@ -378,17 +380,34 @@ def looks_like_summary(text: str) -> bool:
+     return not text.splitlines()[-1].rstrip().endswith("?")
+ 
+ 
+-def _is_summary(sid: str, text: str) -> bool:
++def _call_judge(judge: JudgeFn, sid: str, text: str, source: Optional[str]) -> Optional[bool]:
++    try:
++        return judge(sid, text, source=source)
++    except TypeError:  # a judge written before ``source`` was passed
++        return judge(sid, text)
++
++
++def _judge_summary(sid: str, text: str, source: Optional[str]) -> Optional[bool]:
++    """The registered judge's verdict, or None when there is none or it can't tell."""
+     judge = _judge[0]
+-    if judge is not None:
+-        try:
+-            verdict = judge(sid, text)
+-        except Exception:
+-            logger.warning("session outcome judge failed for %s; using the heuristic", sid, exc_info=True)
+-            verdict = None
+-        if verdict is True or verdict is False:
+-            return verdict
+-    return looks_like_summary(text)
++    if judge is None:
++        return None
++    try:
++        verdict = _call_judge(judge, sid, text, source)
++    except Exception:
++        logger.warning("session outcome judge failed for %s; using the heuristic", sid, exc_info=True)
++        return None
++    return verdict if verdict is True or verdict is False else None
++
++
++def _prior_verdict(stored: Optional[dict], msg_id: Any) -> Optional[bool]:
++    """A judge's earlier verdict on this same last assistant message, kept by a refresh that has no judge (the
++    CLI ``outcome-audit --refresh``, the web ``?refresh=1``): the heuristic never overrides it."""
++    if not stored or msg_id is None or not stored.get("judged") or stored.get("judged_msg") != msg_id:
++        return None
++    if stored.get("kind") == "done":
++        return True
++    return False if stored.get("reason") == "no_summary" else None
+ 
+ 
+ def _outcome(kind: str, now: float, **fields: Any) -> dict[str, Any]:
+@@ -434,9 +453,16 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     if reason:
+         return _outcome("unresolved", now, reason=reason, **carry)
+     text = _text(tail[0].get("content"))
+-    if _is_summary(sid, text):
+-        return _outcome("done", now, summary=text[:SUMMARY_CHARS], **carry)
+-    return _outcome("unresolved", now, reason="no_summary", **carry)
++    msg_id = tail[0].get("id")
++    verdict = _judge_summary(sid, text, row.get("source"))
++    if verdict is None:
++        verdict = _prior_verdict(stored, msg_id)
++    judged = {"judged": True, "judged_msg": msg_id} if verdict is not None and msg_id is not None else {}
++    if verdict is None:
++        verdict = looks_like_summary(text)
++    if verdict:
++        return _outcome("done", now, summary=text[:SUMMARY_CHARS], **judged, **carry)
++    return _outcome("unresolved", now, reason="no_summary", **judged, **carry)
+ 
+ 
+ def _same(a: Optional[dict], b: Optional[dict]) -> bool:
+diff --git a/tests/gateway/test_turn_outcome_refresh.py b/tests/gateway/test_turn_outcome_refresh.py
+index 8da666b8d4901f334ebdf630bc2be0f4437e44a6..16f21359d92913b4540937dff57bcda2b9c9494f 100644
+--- a/tests/gateway/test_turn_outcome_refresh.py
++++ b/tests/gateway/test_turn_outcome_refresh.py
+@@ -1,8 +1,10 @@
+ """A messaging-platform turn refreshes the chat's stored outcome when it concludes, however it
+-concluded (``GatewayRunner._handle_message_with_agent``'s finally path)."""
++concluded (``GatewayRunner._handle_message_with_agent``'s finally path), off the reply path."""
+ 
+ from __future__ import annotations
+ 
++import threading
++import time
+ from datetime import datetime
+ from types import SimpleNamespace
+ from unittest.mock import AsyncMock
+@@ -38,6 +40,16 @@ def _runner(db, entry, source, run_agent):
+     return runner
+ 
+ 
++def _wait_for_outcome(db, sid: str, timeout: float = 5.0):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        stored = so.get_outcome(sid, db=db)
++        if stored is not None:
++            return stored
++        time.sleep(0.02)
++    return None
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("reply, kind", [(SUMMARY, "done"), (None, "unresolved")])
+ async def test_gateway_turn_end_refreshes_the_stored_outcome(tmp_path, reply, kind):
+@@ -59,9 +71,41 @@ async def test_gateway_turn_end_refreshes_the_stored_outcome(tmp_path, reply, ki
+     event = MessageEvent(text="book dinner", source=source)
+     try:
+         await runner._handle_message_with_agent(event, source, entry.session_key, 1)
+-        stored = so.get_outcome("tg-chat", db=db)
++        stored = _wait_for_outcome(db, "tg-chat")
+         assert stored is not None and stored["kind"] == kind
+         if kind == "unresolved":
+             assert stored["reason"] == "interrupted"
+     finally:
+         db.close()
++
++
++@pytest.mark.asyncio
++async def test_the_reply_returns_while_a_slow_refresh_is_still_running(tmp_path, monkeypatch):
++    so._reset_hooks_for_tests()
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session("tg-slow", source="telegram")
++    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c2", user_id="u1", user_name="Dana")
++    entry = SessionEntry(session_id="tg-slow", session_key="telegram:c2",
++                         created_at=datetime(2026, 1, 1), updated_at=datetime(2026, 1, 1))
++    started, release, finished = threading.Event(), threading.Event(), threading.Event()
++
++    def slow_refresh(sid, trigger, *, db=None):
++        started.set()
++        release.wait(10)
++        finished.set()
++
++    monkeypatch.setattr(so, "refresh_outcome", slow_refresh)
++
++    async def run_agent(**_kwargs):
++        raise RuntimeError("provider exploded")
++
++    runner = _runner(db, entry, source, run_agent)
++    try:
++        await runner._handle_message_with_agent(MessageEvent(text="hi", source=source), source,
++                                                entry.session_key, 1)
++        assert started.wait(5), "the turn end must start the refresh"
++        assert not finished.is_set(), "the handler returned only after the refresh finished"
++    finally:
++        release.set()
++        assert finished.wait(5)
++        db.close()
+diff --git a/tests/hermes_state/test_session_outcome_judge.py b/tests/hermes_state/test_session_outcome_judge.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7426f87f887e521febb10744d8486c9403b7e97a
+--- /dev/null
++++ b/tests/hermes_state/test_session_outcome_judge.py
+@@ -0,0 +1,68 @@
++"""A judge's verdict on the last assistant message survives a refresh in a process with no judge (CLI
++``outcome-audit --refresh``, web ``?refresh=1``), and judges receive the row's ``source``."""
++
++from __future__ import annotations
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_session_activity as ksa
++from hermes_state import SessionDB
++
++# The heuristic reads this as a summary (long, no question, no progress opener)...
++LOOKS_DONE = "Pushed the branch and opened the PR for the retry change; the reviewers are tagged on it."
++# ...and this as not one (too short).
++LOOKS_OPEN = "Done."
++
++
++@pytest.fixture
++def db(tmp_path, monkeypatch):
++    monkeypatch.setattr(ksa, "_board_db_paths", list)
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
++    ksa._reset_cache_for_tests()
++    so._reset_hooks_for_tests()
++    handle = SessionDB(db_path=tmp_path / "state.db")
++    handle.create_session("chat", source="telegram")
++    yield handle
++    handle.close()
++    so._reset_hooks_for_tests()
++    ksa._reset_cache_for_tests()
++
++
++def _turn(db, reply):
++    db.append_message("chat", role="user", content="ship the retry change")
++    db.append_message("chat", role="assistant", content=reply)
++
++
++@pytest.mark.parametrize("reply, verdict, kind", [(LOOKS_DONE, False, "unresolved"), (LOOKS_OPEN, True, "done")])
++def test_a_judge_verdict_survives_a_refresh_without_a_judge(db, reply, verdict, kind):
++    _turn(db, reply)
++    so.register_outcome_judge(lambda sid, text, *, source=None: verdict)
++    judged = so.refresh_outcome("chat", "turn_end", db=db)
++    assert judged["kind"] == kind and judged["judged"] is True
++
++    so.register_outcome_judge(None)  # a CLI / web refresh: no judge registered in that process
++    assert so.refresh_outcome("chat", "manual", db=db)["kind"] == kind
++    assert so.get_outcome("chat", db=db)["kind"] == kind
++
++
++def test_a_new_assistant_message_is_judged_afresh(db):
++    _turn(db, LOOKS_DONE)
++    so.register_outcome_judge(lambda sid, text, *, source=None: False)
++    assert so.refresh_outcome("chat", "turn_end", db=db)["kind"] == "unresolved"
++
++    so.register_outcome_judge(None)
++    _turn(db, LOOKS_DONE + " Also merged it.")
++    out = so.refresh_outcome("chat", "manual", db=db)
++    assert out["kind"] == "done" and "judged" not in out  # the heuristic decides a message no judge saw
++
++
++def test_judges_get_the_source_and_old_judges_still_work(db):
++    _turn(db, LOOKS_OPEN)
++    seen = []
++    so.register_outcome_judge(lambda sid, text, *, source=None: seen.append(source) or True)
++    assert so.derive_outcome("chat", db=db)["kind"] == "done"
++    assert seen == ["telegram"]
++
++    so.register_outcome_judge(lambda sid, text: True)  # written before ``source`` was passed
++    assert so.derive_outcome("chat", db=db)["kind"] == "done"
+-- 
+2.55.0
+

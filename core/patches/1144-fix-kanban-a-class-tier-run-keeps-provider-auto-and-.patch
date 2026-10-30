@@ -1,0 +1,181 @@
+From 76dedd30c8724c15c7c2a4607405076af5b64a54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:42:08 -0700
+Subject: [PATCH 1144/1157] fix(kanban): a class-tier run keeps provider auto
+ and leaves its route to the agent [daveey]
+
+Since core a00432f5b3 (10-29 22:01 PDT on example-laptop) every kanban run on the default tier
+(kanban.default_model: class:standard) died at agent build with "ModelRoutingError: Class
+selectors require provider auto": 17 managed workers in 13 minutes, 4 cards given up into
+triage/todo, the rest retried on the concrete strong tier.
+
+The owner pins the dispatcher's tier as class:standard + provider auto (owner_model_pin), but the
+launch policy read that auto as the thin client's "no pick" sentinel (_without_auto_pick) and froze
+the profile's concrete provider (anthropic) under the class. route_runtime and AIAgent then both
+asked the class router for a class on a concrete provider, which it refuses.
+
+- session_policy: under a class selector, provider auto (or no pick) stays auto, and a class pick
+  is a route change, so the profile's concrete endpoint pins are dropped. Concrete models keep
+  upstream's sentinel.
+- session_worker_construct.route_runtime: a class route is not pre-resolved (no session id there);
+  AIAgent's prepare_agent_route allocates it under the session id, as the CLI's
+  `-m class:<level> --provider auto` worker did. A launch key/URL on a class is still refused.
+
+Tests: tests/gateway/test_kanban_class_tier_route.py (5 RED before, 7/7 GREEN), plus 9 neighbouring
+files, 120 passed. Live probe on the real MacBook config: live tree raises the production error;
+this tree resolves class:standard -> claude-sonnet-5-5 on anthropic with a pool credential.
+---
+ gateway/session_policy.py                     | 19 ++++-
+ gateway/session_worker_construct.py           | 10 +++
+ tests/gateway/test_kanban_class_tier_route.py | 81 +++++++++++++++++++
+ 3 files changed, 107 insertions(+), 3 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_class_tier_route.py
+
+diff --git a/gateway/session_policy.py b/gateway/session_policy.py
+index 8fdc4a087f7..47d7366bcda 100644
+--- a/gateway/session_policy.py
++++ b/gateway/session_policy.py
+@@ -513,8 +513,18 @@ def _profile_workspace_cwd(home):
+ 
+ 
+ def _without_auto_pick(params):
+-    """`provider: auto` is the thin client's "no pick" sentinel: the profile's route stands as configured."""
+-    if isinstance(params.get('provider'), str) and params['provider'].strip().lower() == 'auto':
++    """`provider: auto` is the thin client's "no pick" sentinel: the profile's route stands as configured.
++
++    [daveey] Not under a class selector (``class:<level>``): there ``auto`` is the provider class routing
++    requires (``resolve_model_route``), and a class launched with no provider pick runs ``auto`` too. The
++    profile's concrete provider can never serve a class: freezing it under one refused every class-tier
++    kanban run at agent build ("Class selectors require provider auto")."""
++    from agent.model_routing import is_class_selector
++    picked = params.get('provider')
++    is_auto = isinstance(picked, str) and picked.strip().lower() == 'auto'
++    if is_class_selector(params.get('model')):
++        return {**params, 'provider': 'auto'} if picked is None or is_auto else params
++    if is_auto:
+         return {k: v for k, v in params.items() if k != 'provider'}
+     return params
+ 
+@@ -579,7 +589,10 @@ def _apply_launch_overrides(params, config):
+     from hermes_cli.config import resolve_turn_limit
+     from hermes_constants import parse_reasoning_effort
+     params = _with_entry_pick(_without_auto_pick(params), config)
+-    picks_profile_entry = 'provider' in params and _keeps_profile_route(params['provider'], config)
++    from agent.model_routing import is_class_selector
++    # [daveey] A class route is a route change: the class allocator picks the endpoint and credential.
++    picks_profile_entry = ('provider' in params and not is_class_selector(params.get('model'))
++                           and _keeps_profile_route(params['provider'], config))
+     if 'provider' in params and not picks_profile_entry:
+         model = config.setdefault('model', {})
+         # A provider pick is a route change: the profile's endpoint, wire protocol and
+diff --git a/gateway/session_worker_construct.py b/gateway/session_worker_construct.py
+index 8bfa4ee9933..9858152be25 100644
+--- a/gateway/session_worker_construct.py
++++ b/gateway/session_worker_construct.py
+@@ -164,6 +164,16 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
+         from hermes_cli.route_identity import normalize_route_base_url
+         if normalize_route_base_url(launch_url) != normalize_route_base_url((frozen.get('model') or {}).get('base_url')):
+             launch_url = None
++    from agent.model_routing import ModelRoutingError, is_class_selector
++    if is_class_selector(model):
++        # [daveey] A class route is the agent's own sticky allocation: AIAgent's prepare_agent_route
++        # resolves it under the session id, as the CLI's ``-m class:<level> --provider auto`` does.
++        # Resolving it here would allocate with no session id, and the concrete credentials it returns
++        # would reach the agent as explicit overrides, which class routing refuses unless managed.
++        if key or launch_url:
++            raise ModelRoutingError('Class selectors cannot use explicit credentials or endpoint overrides')
++        return {'provider': 'auto', 'requested_provider': 'auto', 'api_key': None, 'base_url': None,
++                'api_mode': None}, None
+     # Every rung reads the session's FROZEN config, never live config.yaml: a later
+     # ``model.base_url`` edit must not carry this route's frozen credential to the new host
+     # (R2-M2). The auth-store pool is not config, so refresh/rotation still applies.
+diff --git a/tests/gateway/test_kanban_class_tier_route.py b/tests/gateway/test_kanban_class_tier_route.py
+new file mode 100644
+index 00000000000..4a1bbc8467f
+--- /dev/null
++++ b/tests/gateway/test_kanban_class_tier_route.py
+@@ -0,0 +1,81 @@
++"""[daveey] A kanban run on a class tier (``kanban.default_model: class:standard``) builds its agent.
++
++The owner pins the dispatcher's tier as ``class:standard`` + provider ``auto`` (``owner_model_pin``).
++The launch policy read that ``auto`` as the thin client's "no pick" and froze the profile's concrete
++provider under the class, so every class-tier managed worker died at agent build with "Class
++selectors require provider auto" (17 MacBook runs in 13 min after core a00432f5b3, 10-29).
++"""
++import pytest
++
++PROFILE = {'model': {'default': 'claude-opus-5-5', 'provider': 'anthropic', 'base_url': 'https://api.anthropic.com',
++                     'api_mode': 'anthropic_messages', 'context_length': 200000}}
++
++
++@pytest.mark.parametrize('pick', [{'provider': 'auto'}, {'provider': 'Auto'}, {}], ids=['auto', 'Auto', 'no-pick'])
++def test_a_class_selector_launch_runs_on_provider_auto(tmp_path, pick):
++    from gateway.session_policy import build_policy
++    policy = build_policy(dict(cwd=str(tmp_path), model='class:standard', **pick), PROFILE)
++    model_cfg = policy.config()['model']
++    assert (policy.model, policy.provider) == ('class:standard', 'auto')
++    # The concrete route's pins belong to the provider the class replaced.
++    assert not {'base_url', 'api_mode', 'context_length'} & set(model_cfg), model_cfg
++
++
++def test_auto_on_a_concrete_model_still_means_the_profiles_route(tmp_path):
++    """Upstream's thin-client sentinel is unchanged for concrete models."""
++    from gateway.session_policy import build_policy
++    policy = build_policy(dict(cwd=str(tmp_path), model='claude-opus-5-5', provider='auto'), PROFILE)
++    assert (policy.provider, policy.base_url) == ('anthropic', 'https://api.anthropic.com')
++
++
++def _kanban_policy(tmp_path, monkeypatch, **overrides):
++    from contextlib import closing
++    from types import SimpleNamespace
++    from gateway.session_contract import Principal
++    from gateway.session_kanban import build_kanban_policy
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
++    monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path))
++    monkeypatch.setattr('hermes_cli.kanban_capabilities._profile_capabilities',
++                        lambda name, *_required: {'terminal', 'file', 'git', 'host_repo', 'kanban'})
++    kb.create_board('owned')
++    with closing(connect(board='owned')) as conn:
++        task_id = kb.create_task(conn, title='t', assignee='default', workspace_kind='dir',
++                                 workspace_path=str(tmp_path), **overrides)
++        kb.recompute_ready(conn)
++        task = kb.claim_task(conn, task_id)
++    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), native_owner=True,
++                                 actor=Principal('owner', str(tmp_path), frozenset({'session:create'}), 'transport'))
++    policy, _secrets = build_kanban_policy(connection, dict(board='owned', task_id=task.id, run_id=task.current_run_id,
++                                                            claim_lock=task.claim_lock), PROFILE)
++    return policy
++
++
++def test_a_kanban_class_tier_owner_policy_runs_on_provider_auto(tmp_path, monkeypatch):
++    policy = _kanban_policy(tmp_path, monkeypatch, model_override='class:standard')
++    assert (policy.model, policy.provider, policy.base_url) == ('class:standard', 'auto', None)
++
++
++def test_the_managed_worker_leaves_a_class_route_to_the_agents_sticky_allocator(tmp_path, monkeypatch):
++    """``worker_route`` must not pre-resolve a class (no session id there) nor hand the agent explicit
++    credentials, which class routing refuses outside a managed policy: AIAgent's prepare_agent_route
++    allocates it under the session id, as the CLI's ``-m class:<level> --provider auto`` does."""
++    from gateway.session_worker_construct import worker_route
++    policy = _kanban_policy(tmp_path, monkeypatch, model_override='class:standard')
++
++    def resolver_called(*_a, **_k):
++        raise AssertionError('a class selector was resolved outside the agent')
++    monkeypatch.setattr('hermes_cli.runtime_provider.resolve_runtime_with_fallback', resolver_called)
++    monkeypatch.setattr('hermes_cli.runtime_provider.resolve_runtime_provider', resolver_called)
++    assert worker_route(policy, {'api_key': None}) == {'api_key': None, 'base_url': None, 'api_mode': None}
++
++
++def test_a_launch_key_on_a_class_route_is_still_refused(tmp_path, monkeypatch):
++    from agent.model_routing import ModelRoutingError
++    from gateway.session_worker_construct import worker_route
++    policy = _kanban_policy(tmp_path, monkeypatch, model_override='class:standard')
++    with pytest.raises(ModelRoutingError, match='explicit credentials'):
++        worker_route(policy, {'api_key': 'sk-launch'})
+-- 
+2.55.0
+

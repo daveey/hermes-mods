@@ -80,7 +80,9 @@ class Execution(unittest.TestCase):
             plugin.register(ctx)
         self.assertIn('post_api_request', hooks)
         self.credentials([entry('B', source='manual').to_dict()])
-        with self.assertRaisesRegex(self.s.SelectionRejected, 'compatibility'):
+        # The refusal now names the real cause (a customized seam), not the drift text.
+        with self.assertRaisesRegex(self.s.SelectionRejected,
+                                    'install raised SelectionRejected at _create_request_openai_client'):
             self.s.SelectionService(self.home, server=self.server).put('runtime-A', provider='anthropic',
                 account_id=_identity_id_for('anthropic', entry('B')), expected_revision=0)
 
@@ -105,6 +107,37 @@ class Execution(unittest.TestCase):
             manager.unload('account-usage')
         self.assertIs(ClientLifecycleMixin._create_request_anthropic_client, original)
         self.assertFalse(manager._middleware.get('llm_execution'))
+
+    def _install_with_pins(self, rewrite):
+        """install() against a copy of the shipped pins rewritten per file."""
+        import json, tempfile
+        source = Path(__file__).parents[1]
+        pins = json.loads((source / 'execution-compatibility.json').read_text())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (Path(tmp.name) / 'execution-compatibility.json').write_text(
+            json.dumps({rel: rewrite(value) for rel, value in pins.items()}))
+        integration = self.s.ExecutionIntegration(observe=lambda *args: None)
+        with patch.dict(vars(self.s), {'__file__': str(Path(tmp.name) / 'selection.py')}):
+            integration.install()
+        self.addCleanup(integration.unload)
+        return integration
+
+    def test_install_accepts_any_audited_hash_in_a_pin_list(self):
+        # The live core matches the LAST audited hash of each list, after an unaudited one.
+        from agent.client_lifecycle import ClientLifecycleMixin
+        original = ClientLifecycleMixin._create_request_anthropic_client
+        listed = lambda value: ['0' * 64, *([value] if isinstance(value, str) else value)]
+        integration = self._install_with_pins(listed)
+        self.assertTrue(integration.active)
+        self.assertIsNot(ClientLifecycleMixin._create_request_anthropic_client, original)
+
+    def test_install_refuses_a_core_matching_no_audited_hash(self):
+        from agent.client_lifecycle import ClientLifecycleMixin
+        original = ClientLifecycleMixin._create_request_anthropic_client
+        with self.assertRaisesRegex(self.s.SelectionRejected, 'compatibility'):
+            self._install_with_pins(lambda value: ['0' * 64, '1' * 64])
+        self.assertIs(ClientLifecycleMixin._create_request_anthropic_client, original)
 
     def test_unload_keeps_factory_for_a_late_worker_snapshot(self):
         import gc

@@ -1,0 +1,312 @@
+From 87c698f2a0a34cb67fd4394578a946ad4c897bc3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:10:24 -0700
+Subject: [PATCH] perf(tui_gateway): idle Desktop backends stop re-decoding the
+ whole task replica and re-spawning git for non-repo cwds [daveey]
+
+kanban_remote_observations decodes only replica task rows whose seq moved (live hub.db: 50->11 ms/pass);
+git_probe negative cache trusts an unchanged cwd mtime for 300 s instead of re-probing every 30 s.
+Card t_01a18977df212d21.
+---
+ .../test_git_probe_negative_cache.py          | 53 +++++++++++++++
+ .../test_kanban_remote_observations.py        | 23 +++++++
+ tui_gateway/git_probe.py                      | 42 ++++++++----
+ tui_gateway/kanban_remote_notices.py          |  3 +-
+ tui_gateway/kanban_remote_observations.py     | 66 +++++++++++++++++--
+ 5 files changed, 169 insertions(+), 18 deletions(-)
+ create mode 100644 tests/tui_gateway/test_git_probe_negative_cache.py
+
+diff --git a/tests/tui_gateway/test_git_probe_negative_cache.py b/tests/tui_gateway/test_git_probe_negative_cache.py
+new file mode 100644
+index 00000000000..fc4a3df5a1b
+--- /dev/null
++++ b/tests/tui_gateway/test_git_probe_negative_cache.py
+@@ -0,0 +1,53 @@
++"""A non-repo cwd is not re-probed every 30 s; ``git init`` there is still seen at once."""
++import os
++
++from tui_gateway import git_probe
++
++
++def _counting(monkeypatch, answers):
++    calls = []
++
++    def fake(cwd, *args):
++        calls.append((cwd, args))
++        return answers.get(cwd, "")
++
++    monkeypatch.setattr(git_probe, "run_git", fake)
++    return calls
++
++
++def test_unchanged_non_repo_dir_is_not_reprobed_after_old_30s_ttl(tmp_path, monkeypatch):
++    git_probe.invalidate()
++    calls = _counting(monkeypatch, {})
++    clock = [1000.0]
++    monkeypatch.setattr(git_probe.time, "monotonic", lambda: clock[0])
++    cwd = str(tmp_path)
++    assert git_probe.repo_root(cwd) == ""
++    clock[0] += 31  # past the old 30 s negative TTL: idle Desktop polls re-spawned git here
++    assert git_probe.repo_root(cwd) == ""
++    assert len(calls) == 1
++
++
++def test_git_init_in_cwd_is_seen_without_waiting_for_ttl(tmp_path, monkeypatch):
++    git_probe.invalidate()
++    answers = {}
++    calls = _counting(monkeypatch, answers)
++    cwd = str(tmp_path)
++    assert git_probe.repo_root(cwd) == ""
++    (tmp_path / ".git").mkdir()
++    st = os.stat(cwd)
++    os.utime(cwd, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
++    answers[cwd] = cwd
++    assert git_probe.repo_root(cwd) == cwd
++    assert len(calls) == 2
++
++
++def test_negative_still_expires_after_ttl(tmp_path, monkeypatch):
++    git_probe.invalidate()
++    calls = _counting(monkeypatch, {})
++    clock = [1000.0]
++    monkeypatch.setattr(git_probe.time, "monotonic", lambda: clock[0])
++    cwd = str(tmp_path)
++    git_probe.repo_root(cwd)
++    clock[0] += git_probe._NEG_TTL + 1
++    git_probe.repo_root(cwd)
++    assert len(calls) == 2
+diff --git a/tests/tui_gateway/test_kanban_remote_observations.py b/tests/tui_gateway/test_kanban_remote_observations.py
+index bf667ee70f4..5d88f45207a 100644
+--- a/tests/tui_gateway/test_kanban_remote_observations.py
++++ b/tests/tui_gateway/test_kanban_remote_observations.py
+@@ -54,3 +54,26 @@ def test_cached_first_seen_still_ages_out(tmp_path):
+     assert len(first) == 1
+     assert krn.release(first[0], ledger=ledger)
+     assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + krn.FRESH_S + 1) == []
++
++
++def test_changed_snapshot_decodes_only_the_rows_whose_seq_moved(tmp_path, monkeypatch):
++    """A busy replica's signature moves whenever any card does. Re-decoding every task row per
++    change (~8k rows / 30 MB on David-MBP) kept idle Desktop backends busy; only moved rows decode."""
++    now = 1_800_000_000.0
++    cards = [_card(f"t_bulk_{i}", CHAT, status="done", at=now - i) for i in range(20)]
++    replica = _hub(tmp_path, cards)
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    first = obs.observe(replica, ledger, now)
++    assert len(first) == 20
++
++    decoded = []
++    real_loads = json.loads
++    monkeypatch.setattr(obs.json, "loads", lambda raw, *a, **k: decoded.append(raw) or real_loads(raw, *a, **k))
++    moved = _card("t_bulk_3", CHAT, status="blocked", at=now + 5)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE replica SET data=?, seq=seq+1000 WHERE key=?", (json.dumps(moved["task"]), moved["key"]))
++    second = obs.observe(replica, ledger, now + 10)
++    assert len(decoded) == 1
++    assert any(state.startswith("blocked@") for (_gw, key, state) in second if key == moved["key"])
++    assert len(second) == len(first)
+diff --git a/tui_gateway/git_probe.py b/tui_gateway/git_probe.py
+index 9c1430260e4..7a937e81455 100644
+--- a/tui_gateway/git_probe.py
++++ b/tui_gateway/git_probe.py
+@@ -16,7 +16,11 @@ from hermes_cli._subprocess_compat import bounded_git_probe
+ 
+ _GIT_TIMEOUT = 1.5
+ _WARM_WORKERS = 8
+-_NEG_TTL = 30.0  # "not a git repo" TTL: a fresh `git init` shows within seconds
++# "not a git repo" TTL. A negative is also dropped as soon as the cwd's own mtime moves (``git init``
++# creates ``.git`` there), so the TTL only bounds rarer cases such as a parent dir becoming a repo.
++# At 30 s, every sidebar/project poll re-spawned ``git`` for each of hundreds of non-repo session
++# cwds (kanban scratch dirs) twice a minute, a top idle cost of Desktop backends.
++_NEG_TTL = 300.0
+ 
+ 
+ def run_git(cwd: str, *args: str) -> str:
+@@ -45,7 +49,7 @@ class _RootCache:
+     def __init__(self) -> None:
+         self._lock = threading.Lock()
+         self._roots: dict[str, str] = {}
+-        self._neg: dict[str, float] = {}  # key -> monotonic expiry
++        self._neg: dict[str, tuple[float, object]] = {}  # key -> (monotonic expiry, dir stamp)
+         self._inflight: dict[str, threading.Event] = {}
+ 
+     def invalidate(self) -> None:
+@@ -54,16 +58,21 @@ class _RootCache:
+             self._neg.clear()
+             self._inflight.clear()
+ 
+-    def resolve(self, key: str, probe) -> str:
++    def resolve(self, key: str, probe, cwd: str = "") -> str:
+         while True:
+             with self._lock:
+                 if hit := self._roots.get(key):
+                     return hit
+-                expiry = self._neg.get(key)
+-                if expiry is not None:
+-                    if expiry > time.monotonic():
+-                        return ""  # recent "not a repo": trust it briefly
+-                    del self._neg[key]  # TTL elapsed: re-probe (may be a repo now)
++                neg = self._neg.get(key)
++            if neg is not None:
++                stamp = _dir_stamp(cwd)
++                with self._lock:
++                    if neg[0] > time.monotonic() and neg[1] == stamp:
++                        return ""  # recent "not a repo" and the dir has not changed: trust it
++                    self._neg.pop(key, None)  # TTL elapsed or dir moved: re-probe (may be a repo now)
++            with self._lock:
++                if hit := self._roots.get(key):
++                    return hit
+                 gate = self._inflight.get(key)
+                 leader = gate is None
+                 if leader:
+@@ -72,6 +81,7 @@ class _RootCache:
+                 gate.wait(timeout=_GIT_TIMEOUT + 0.5)
+                 continue
+             value = ""
++            stamp = _dir_stamp(cwd)
+             try:
+                 value = probe()
+             finally:
+@@ -79,12 +89,22 @@ class _RootCache:
+                     if value:
+                         self._roots[key] = value
+                     else:
+-                        self._neg[key] = time.monotonic() + _NEG_TTL
++                        self._neg[key] = (time.monotonic() + _NEG_TTL, stamp)
+                     self._inflight.pop(key, None)
+                 gate.set()
+             return value
+ 
+ 
++def _dir_stamp(cwd: str) -> object:
++    """``cwd``'s mtime (``None`` when missing): ``git init`` there moves it."""
++    if not cwd:
++        return None
++    try:
++        return os.stat(cwd).st_mtime_ns
++    except OSError:
++        return None
++
++
+ _cache = _RootCache()
+ 
+ 
+@@ -95,7 +115,7 @@ def invalidate() -> None:
+ 
+ def repo_root(cwd: str) -> str:
+     """Top-level git repo root for ``cwd`` (``""`` when not a repo)."""
+-    return _cache.resolve(cwd, lambda: run_git(cwd, "rev-parse", "--show-toplevel")) if cwd else ""
++    return _cache.resolve(cwd, lambda: run_git(cwd, "rev-parse", "--show-toplevel"), cwd) if cwd else ""
+ 
+ 
+ def common_repo_root(cwd: str) -> str:
+@@ -116,7 +136,7 @@ def common_repo_root(cwd: str) -> str:
+                 return os.path.dirname(gitdir).replace(os.sep, "/")
+         return repo_root(cwd)
+ 
+-    return _cache.resolve(f"common:{cwd}", _probe)
++    return _cache.resolve(f"common:{cwd}", _probe, cwd)
+ 
+ 
+ def resolve(cwd: str) -> dict | None:
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 896bffff124..893f4c390a3 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -586,10 +586,11 @@ def _record_swept(keys: list[tuple], ledger: Optional[Path], *, reason: str) ->
+ 
+ def _reset_for_tests() -> None:
+     """Forget this process's memos, as a restarted backend would (the ledger file stays)."""
+-    from tui_gateway.kanban_remote_observations import _memo
++    from tui_gateway.kanban_remote_observations import _decoded, _memo
+ 
+     global _index_memo
+     _memo.clear()
++    _decoded.clear()
+     _index_memo = None
+     _delivered.clear()
+     _swept_loaded.clear()
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index 1634b05879c..d5aec777844 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -37,15 +37,69 @@ def _snapshot(replica: Path, previous=None) -> tuple[bool, list[tuple] | None, t
+                 "SELECT COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll='tasks'").fetchone())
+         if signature is not None and signature == previous:
+             return True, None, signature
+-        cards = []
+-        for owner, key, _seq, raw in _canonical(_task_rows(conn, meta.get("gateway"))):
+-            with contextlib.suppress(TypeError, ValueError):
+-                task = json.loads(raw)
+-                if isinstance(task, dict) and task.get("status") in _TERMINAL:
+-                    cards.append((owner, key, task))
++        if signature is None:
++            cards = []
++            for owner, key, _seq, raw in _canonical(_task_rows(conn, meta.get("gateway"))):
++                with contextlib.suppress(TypeError, ValueError):
++                    task = json.loads(raw)
++                    if isinstance(task, dict) and task.get("status") in _TERMINAL:
++                        cards.append((owner, key, task))
++            return ready, cards, signature
++        cards = _changed_rows_cards(conn, replica, meta.get("gateway"))
+     return ready, cards, signature
+ 
+ 
++# (replica, owner, key) -> (seq, terminal summary or None). The replica holds thousands of
++# task rows (~30 MB of JSON on a busy fleet) and its signature moves whenever any card does,
++# so decoding every row per change kept the notice pollers busy while Desktop sat idle. A row
++# is re-read only when its seq moved; the summary keeps just the fields _persist reads.
++_decoded: dict[tuple, tuple] = {}
++
++
++def _summary(task) -> dict | None:
++    if not isinstance(task, dict) or task.get("status") not in _terminal_states():
++        return None
++    run = task.get("run")
++    run = run if isinstance(run, dict) else {}
++    notice = task.get("completion_notice")
++    notice = notice if isinstance(notice, dict) else {}
++    return {"status": task.get("status"), "completed_at": task.get("completed_at"),
++            "run": {"ended_at": run.get("ended_at")},
++            "completion_notice": {"created_at": notice.get("created_at")}}
++
++
++def _terminal_states():
++    from tui_gateway.kanban_remote_notices import _TERMINAL
++    return _TERMINAL
++
++
++def _changed_rows_cards(conn, replica: Path, me) -> list[tuple]:
++    from tui_gateway.kanban_remote_notices import _canonical
++
++    sql = "SELECT gw, key, seq, NULL FROM replica WHERE coll = 'tasks'"
++    rows = conn.execute(sql + " AND gw != ?", (me,)).fetchall() if me else conn.execute(sql).fetchall()
++    rows = _canonical(rows)
++    tag = str(replica)
++    seen = set()
++    cards = []
++    for owner, key, seq, _ in rows:
++        ident = (tag, owner, key)
++        seen.add(ident)
++        hit = _decoded.get(ident)
++        if hit is None or hit[0] != seq:
++            raw = conn.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?",
++                               (owner, key)).fetchone()
++            summary = None
++            with contextlib.suppress(TypeError, ValueError):
++                summary = _summary(json.loads(raw[0])) if raw else None
++            hit = _decoded[ident] = (seq, summary)
++        if hit[1] is not None:
++            cards.append((owner, key, hit[1]))
++    for ident in [ident for ident in _decoded if ident[0] == tag and ident not in seen]:
++        del _decoded[ident]
++    return cards
++
++
+ def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple, float | None]:
+     """Seed retained history once; later current-key states receive one local window."""
+     from tui_gateway.kanban_remote_notices import FRESH_S, _fresh_at, _ledger, _terminal_at
+-- 
+2.55.0
+

@@ -1,0 +1,162 @@
+From 756e69e1397c115ff0d87d3baf487bb6db1c81d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:34:39 +0000
+Subject: [PATCH] fix(kanban): offset #318's growth in kanban_db, dispatch and
+ kanban_tools; move archive flow into kanban_owner_archive_relay [daveey]
+
+#318 merged with the code health ratchet red: FILE_LINES grew in kanban_db.py,
+kanban_db_dispatch.py and tools/kanban_tools.py, and _run_reclaim_phase gained a
+blind except. The kanban_archive worker flow (forward, scope rule, remote stop)
+and the dispatcher's two remote-archive appliers now live in
+kanban_owner_archive_relay (worker_archive, apply_remote_archives); all three
+files end at or below their pre-#318 size.
+---
+ hermes_cli/kanban_db.py                  |  7 ++--
+ hermes_cli/kanban_db_dispatch.py         | 17 +++-------
+ hermes_cli/kanban_owner_archive_relay.py | 42 +++++++++++++++++++++++-
+ tools/kanban_tools.py                    | 21 ++----------
+ 4 files changed, 50 insertions(+), 37 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index ed72e4fc50c..5a813d9d283 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -4101,11 +4101,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+             conn, task_id, outcome="reclaimed", status="reclaimed",
+             summary="task archived with run still active",
+         )
+-        payload = {"source_status": row["status"]}
+-        if via:
+-            payload["via"] = via  # archived outside the creator scope (stranded-runs_on sweep) [daveey]
+-        if event_extra:
+-            payload.update(event_extra)  # e.g. the forwarding worker's run (kanban_owner_archive_relay) [daveey]
++        # [daveey] via: archived outside the creator scope; event_extra: e.g. a forwarded run (kanban_owner_archive_relay)
++        payload = {"source_status": row["status"], **({"via": via} if via else {}), **(event_extra or {})}
+         _append_event(conn, task_id, "archived", payload, run_id=run_id)
+     if was_running:
+         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 6bed47eb010..85a64785b0b 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2413,19 +2413,10 @@ def _run_reclaim_phase(
+     reap_worker_zombies()
+     result.reaped_terminal_workers = reap_terminal_workers(conn)
+     result.stopped_run_scopes = _worker_scope.stopped_scope_units(conn, board=board)  # orphans of ended runs [daveey]
+-    # Stop requests another gateway sent for cards this gateway runs under its own Board lease (kanban_archive of a
+-    # card running on this machine). Before the reclaim sweeps, so they see the archived card. [daveey]
+-    from hermes_cli.kanban_remote_stop import apply_stop_requests
+-    try:
+-        result.remote_archived = apply_stop_requests(conn)
+-    except Exception:
+-        _kb._log.warning("kanban: applying remote stop requests failed", exc_info=True)
+-    # Archives of relayed capability owner cards forwarded by a Board worker node (kanban_owner_archive_relay).
+-    from hermes_cli.kanban_owner_archive_relay import apply_requests as _apply_owner_archives
+-    try:
+-        result.remote_archived = [*result.remote_archived, *_apply_owner_archives(conn)]
+-    except Exception:
+-        _kb._log.warning("kanban: applying forwarded owner archives failed", exc_info=True)
++    # Stop requests and forwarded owner card archives other gateways sent (kanban_owner_archive_relay). Before the
++    # reclaim sweeps, so they see the archived cards. [daveey]
++    from hermes_cli.kanban_owner_archive_relay import apply_remote_archives
++    result.remote_archived = apply_remote_archives(conn)
+     # [daveey] Before any stale check: a long gap since the last pass is a host suspend, which the
+     # heartbeat backstop, the stale sweep and max_runtime must not count (``kanban_suspend_ledger``).
+     _record_dispatch_pass(conn, dry_run=dry_run)
+diff --git a/hermes_cli/kanban_owner_archive_relay.py b/hermes_cli/kanban_owner_archive_relay.py
+index 6bf82322abc..c9d86bed55d 100644
+--- a/hermes_cli/kanban_owner_archive_relay.py
++++ b/hermes_cli/kanban_owner_archive_relay.py
+@@ -23,10 +23,11 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import os
+ import sqlite3
+ import time
+ import uuid
+-from typing import Any, Optional
++from typing import Any, Callable, Optional
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -203,3 +204,42 @@ def _apply_one(conn, kcli, kb, waiting: str, owner: str, requester: str, req: di
+         return {"ok": False, "error": f"cannot archive {owner}"}
+     _log.info("kanban: archived capability owner %s forwarded by %s run %s", owner, requester, req.get("run_id"))
+     return {"ok": True, "status": "archived"}
++
++
++def worker_archive(conn: sqlite3.Connection, tid: str, *,
++                   run_id_fn: Callable[[str], Optional[int]]) -> tuple[Optional[str], Optional[dict]]:
++    """``kanban_archive`` from a worker or an orchestrator: ``(refusal, result)``.
++
++    A ``relay=home`` owner card this board lacks is forwarded home (:func:`forward`). Any other card gets the local
++    scope rule, then :func:`hermes_cli.kanban_remote_stop.archive`: a card another machine runs under its live
++    Board lease gets a stop request, since the Board would reject the status write (live_claim).
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban import worker_archive_scope
++    from hermes_cli.kanban_remote_stop import archive
++
++    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    if env_tid and env_tid != tid and kb.get_task(conn, tid) is None:
++        route = relayed_owner_route(conn, env_tid, tid)
++        if route is not None:
++            out = forward(conn, route, tid, requester=env_tid, run_id=run_id_fn(env_tid))
++            if not out.pop("ok", False):
++                return str(out.get("error") or f"cannot archive {tid}"), None
++            out.pop("task_id", None)
++            return None, out
++    refusal, via = worker_archive_scope(conn, tid)
++    return (refusal, None) if refusal else (None, archive(conn, tid, via=via))
++
++
++def apply_remote_archives(conn: sqlite3.Connection) -> list[str]:
++    """Dispatcher tick: apply stop requests (:mod:`hermes_cli.kanban_remote_stop`) and forwarded owner archives
++    (:func:`apply_requests`). Returns the ids archived; a failing source is logged and skipped."""
++    from hermes_cli.kanban_remote_stop import apply_stop_requests
++
++    done: list[str] = []
++    for label, apply in (("remote stop requests", apply_stop_requests), ("forwarded owner archives", apply_requests)):
++        try:
++            done += apply(conn)
++        except Exception:  # health: allow BLE001 -- one failing source must not stop the dispatcher tick
++            _log.warning("kanban: applying %s failed", label, exc_info=True)
++    return done
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 74b449268d0..1f6403bf7ed 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1987,26 +1987,11 @@ def _handle_archive(args: dict, **kw) -> str:
+     _check(tid, "task_id is required")
+     tid = str(tid)
+     with _board(args.get("board")) as (_kb, conn):
+-        # [daveey] A relay=home capability owner card lives only on the waiting card's home gateway: from a Board
+-        # worker node the local lookup misses, so forward the archive there (kanban_owner_archive_relay).
+-        env_tid = os.environ.get("HERMES_KANBAN_TASK")
+-        if env_tid and env_tid != tid and _kb.get_task(conn, tid) is None:
+-            from hermes_cli import kanban_owner_archive_relay as _oar
+-            route = _oar.relayed_owner_route(conn, env_tid, tid)
+-            if route is not None:
+-                out = _oar.forward(conn, route, tid, requester=env_tid, run_id=_worker_run_id(env_tid))
+-                if not out.pop("ok", False):
+-                    raise _Reject(str(out.get("error") or f"cannot archive {tid}"))
+-                out.pop("task_id", None)
+-                return _ok(task_id=tid, **out)
+-        from hermes_cli.kanban import worker_archive_scope
+-        refusal, via = worker_archive_scope(conn, tid)
++        # [daveey] Scope rule, stop request for a card leased elsewhere, relayed owner card forwarded home.
++        from hermes_cli.kanban_owner_archive_relay import worker_archive
++        refusal, out = worker_archive(conn, tid, run_id_fn=_worker_run_id)
+         if refusal:
+             raise _Reject(refusal)
+-        # A card another machine runs under its live Board lease is not archived here: the Board would reject the
+-        # status write (live_claim) and the remote worker would keep running. Send it a stop request instead. [daveey]
+-        from hermes_cli.kanban_remote_stop import archive as _archive
+-        out = _archive(conn, tid, via=via)
+         _check(out, f"cannot archive {tid}")
+         return _ok(task_id=tid, **out)
+ 
+-- 
+2.55.0
+

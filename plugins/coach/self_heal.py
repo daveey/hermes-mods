@@ -39,7 +39,9 @@ OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:\[Message from another Hermes session(?:\s|\])|\[chat-closeout\]|"
     r"⏸\ufe0f?\s+\[[^\]\n]+\]\s+(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
-    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|You've reached the maximum|[✔✓✗✖⚠] )")
+    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum|[✔✓✗✖⚠] )")
+# `[coach]` nudges are stored as user-role turns but are the coach's own text (agent-3ba1979f34): whether the nudge
+# fixed the reply is judged by its reply_nudge_outcome (signals.collect_coach), never by the complaint backstop.
 # Plugin-appended blocks that are not the user's words.
 TRAILER_RE = re.compile(r"\n?\s*(?:\[user-steps\]|--- Attached Context ---|Session link\(s\) @session).*", re.S)
 
@@ -72,6 +74,11 @@ CANCEL_LINE_RE = re.compile(r"^\s*<-\s*ERROR\b.*(?:Tool execution cancelled|Oper
 # Core's crash-recovery note (tui_gateway/session_history.py _AUTO_CONTINUE_NOTE_PREFIX): the next user turn after a
 # backend stopped mid-turn. The only trace such a stop leaves, since the cut turn never reaches post_llm_call.
 RESUME_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+# Core's update-pause note (tui_gateway/update_pause.py pause_note) shares that prefix but marks a PLANNED pause: the
+# turn stopped at a step boundary so a Hermes update could land, then continued by itself (gateway-9aaf151a15).
+PAUSE_NOTE_MARK = "paused at a step boundary for a Hermes update"
+# The update's land target: a pause that continued within this is working as designed; a longer one failed.
+PAUSE_LAND_S = 30 * 60
 ERR_LINE_RE = re.compile(r"(?:<-|->)\s*ERROR\b\s*(.*)")
 
 COMPLAINT_SYS = """You watch a power user's chats with his AI agent system "Hermes" (the coding/ops agent, its Desktop
@@ -251,14 +258,25 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
     return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal"}
 
 
+def is_resume_note(user_text) -> bool:
+    """Core's resume note (crash recovery or update pause): a machine-written turn, never a user complaint."""
+    return clean_user(user_text).lstrip().startswith(RESUME_NOTE_PREFIX)
+
+
 def resume_signal(user_text, gap_s: Optional[float] = None) -> Optional[dict]:
     """A user turn that is core's crash-recovery note: the backend stopped mid-turn and Hermes resumed the chat.
     `gap_s` = seconds since the session's last recorded activity (None when unknown)."""
     t = clean_user(user_text)
-    if not t.lstrip().startswith(RESUME_NOTE_PREFIX):
+    if not is_resume_note(t):
         return None
-    v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
-         "symptom": "turn interrupted (backend stopped)"}
+    if PAUSE_NOTE_MARK in t[:400]:
+        if gap_s is None or gap_s <= PAUSE_LAND_S:
+            return None  # a planned update pause that continued in time
+        v = {"p_defect": 0.85, "kind": "interrupted", "component": "gateway",
+             "symptom": "update pause did not continue in time"}
+    else:
+        v = {"p_defect": 0.9, "kind": "interrupted", "component": "gateway",
+             "symptom": "turn interrupted (backend stopped)"}
     return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal",
             "gap_s": None if gap_s is None else int(gap_s)}
 
@@ -450,9 +468,8 @@ def detect_complaint(prev_reply: str, user_text, llm: Optional[Callable[[str, st
     then the cascade (complaint_verdict) on (previous reply + its turn's tool log, user message). Returns
     {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open."""
     try:
-        sig = resume_signal(user_text, gap_s)
-        if sig:
-            return sig
+        if is_resume_note(user_text):
+            return resume_signal(user_text, gap_s)  # machine-written: never sent to the complaint judge
         if not prefilter(user_text):
             return None
         return _verdict(complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context),
@@ -727,6 +744,57 @@ def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = Non
             c["waiting" if now - t <= HANDOFF_GRACE_S else "no_outcome"] += 1
     c["filed"] = c["still_handed_off"] + c["no_outcome"]
     return c
+
+
+# reply_check rules whose nudges get a reply_nudge_outcome (same as signals.OUTCOME_RULES).
+OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
+                 "credit_ask", "laptop_job")
+
+
+def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
+    """reply_nudges per rule over `days`, by their reply_nudge_outcome (agent-3ba1979f34): resolved (not filed),
+    still_failing / no_outcome (filed by signals.collect_coach), waiting (inside the grace window), untracked (a
+    non-handoff nudge from a backend on the old plugin, no `outcome` marker: never filed). For `status`: a rule whose
+    nudges never get outcomes, or never resolve, shows here."""
+    root = Path(root) if root is not None else coach_root()
+    now = time.time() if now is None else now
+    since = now - days * 86400
+    nudges, outcomes = [], []
+    try:
+        with (root / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if '"reply_nudge' not in ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("rule") not in OUTCOME_RULES or float(r.get("ts") or 0) < since:
+                    continue
+                (nudges if r.get("event") == "reply_nudge" else
+                 outcomes if r.get("event") == "reply_nudge_outcome" else []).append(r)
+    except OSError:
+        pass
+    out: dict = {}
+    for n in nudges:
+        rule = n["rule"]
+        c = out.setdefault(rule, {"nudges": 0, "resolved": 0, "still_failing": 0, "no_outcome": 0, "waiting": 0,
+                                  "untracked": 0, "filed": 0})
+        c["nudges"] += 1
+        t = float(n.get("ts") or 0)
+        o = next((o for o in outcomes if o.get("session_id") == n.get("session_id") and o.get("rule") == rule
+                  and not (n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"])
+                  and -5 <= float(o.get("ts") or 0) - t <= HANDOFF_GRACE_S), None)
+        if o is not None:
+            outcomes.remove(o)
+            k = "resolved" if o.get("resolved") is True else "still_failing"
+        elif rule != "handoff" and not n.get("outcome"):
+            k = "untracked"
+        else:
+            k = "waiting" if now - t <= HANDOFF_GRACE_S else "no_outcome"
+        c[k] += 1
+        c["filed"] = c["still_failing"] + c["no_outcome"]
+    return out
 
 
 def coach_root() -> Path:
@@ -1238,14 +1306,12 @@ def _kanban_board_path(board: str, home: Path) -> Optional[Path]:
     return h / "kanban.db" if name == "default" else h / "kanban" / "boards" / name / "kanban.db"
 
 
-def kanban_trigger_closed(d: dict, home: Optional[Path] = None) -> Optional[str]:
-    """Why to drop a kanban signal: every card it names is now archived/done on its (local) board, e.g. the owner
-    closed it while the detection waited in the pending queue. None (= file as before) when the signal is not a
-    kanban one, came from another host's board, or the board/card cannot be read."""
-    trig = kanban_trigger(d)
-    if not trig or (d.get("host") and d["host"] != host_name()):
-        return None
-    board, cards = trig
+HOLD_STALE_S = 6 * 3600  # a systemic hold filed later than this after it fired, with every held card closed, is history
+
+
+def _cards_closed(board: str, cards: list, home: Optional[Path]) -> Optional[list]:
+    """["<id> now <status>", ...] when every card is archived/done on the local board; None when any is open or the
+    board/card cannot be read."""
     path = _kanban_board_path(board, Path(home) if home else _kanban_home())
     if not path or not path.is_file():
         return None
@@ -1268,7 +1334,35 @@ def kanban_trigger_closed(d: dict, home: Optional[Path] = None) -> Optional[str]
             db.close()
     except sqlite3.Error:
         return None
-    return "trigger card " + ", ".join(got)
+    return got
+
+
+def kanban_trigger_closed(d: dict, home: Optional[Path] = None, now: Optional[float] = None) -> Optional[str]:
+    """Why to drop a kanban signal: every card it names is now archived/done on its (local) board, e.g. the owner
+    closed it while the detection waited in the pending queue. A systemic hold (``kanban_hold``, signals.py
+    _systemic_holds) is dropped only when it is also older than HOLD_STALE_S: a fresh hold is filed even when its
+    held cards rerun and finish, since the crash cause may still be live (kanban-754a3e3cf1 filed a 2-day-old hold
+    whose cards were archived). None (= file as before) when the signal is not a kanban one, came from another
+    host's board, or the board/card cannot be read."""
+    if d.get("host") and d["host"] != host_name():
+        return None
+    hold = d.get("kanban_hold")
+    if isinstance(hold, dict) and hold.get("board") and hold.get("cards"):
+        at = _detected_at(d)
+        now = time.time() if now is None else now
+        if at is None or now - at <= HOLD_STALE_S:
+            return None
+        got = _cards_closed(str(hold["board"]), [str(c) for c in hold["cards"]], home)
+        if not got:
+            return None
+        return (f"stale systemic hold: cards {', '.join(got)} closed (hold {_iso(at)}, "
+                f"> {HOLD_STALE_S // 3600}h before filing)")
+    trig = kanban_trigger(d)
+    if not trig:
+        return None
+    board, cards = trig
+    got = _cards_closed(board, cards, home)
+    return "trigger card " + ", ".join(got) if got else None
 
 
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
@@ -1296,7 +1390,7 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                            "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
                 out.append({"action": "skip", "why": "stale pending"})
                 continue
-            closed = kanban_trigger_closed(d)
+            closed = kanban_trigger_closed(d, now=now)
             if closed:  # the owner closed the card while this waited: nothing is broken any more
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
@@ -1980,6 +2074,21 @@ def _corruption_comment(d: dict, st: dict, store, runner=None) -> dict:
             "why": "existing SQLite incident" if rc == 0 else "incident comment failed"}
 
 
+def _open_card_comment(d: dict, st: dict, store, runner=None) -> dict:
+    """A signal flagged ``comment_open_card`` (one occurrence of a defect whose card is open): add it there."""
+    card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card")) or st.get("card")
+    if not card:
+        return {"action": "skip", "why": "no open card"}
+    argv = ["hermes", "kanban"] + (["--board", st["board"]] if st.get("board") else [])
+    body = (f"Occurrence on {d.get('host') or '?'}: {d.get('symptom') or ''}\n"
+            f"{str(d.get('details') or '')[-1500:]}")
+    rc, out, err = _run(argv + ["comment", card, body], runner)
+    store.log({"event": "selfheal_occurrence_comment", "fingerprint": d["fingerprint"], "card": card,
+               "ok": rc == 0, "error": (err or out)[-200:] if rc else None})
+    return {"action": "skip" if rc == 0 else "error", "card": card,
+            "why": "occurrence added to the open card" if rc == 0 else "occurrence comment failed"}
+
+
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
                 owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
@@ -2031,7 +2140,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         store.log({"event": "selfheal_forward", "fingerprint": fp, "ok": rc == 0, "detail": res["out"]})
         return res
     if m == "live" and hub:
-        closed = kanban_trigger_closed(d)
+        closed = kanban_trigger_closed(d, now=now)
         if closed:
             store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": closed})
             return {"action": "skip", "why": closed}
@@ -2065,6 +2174,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         if (d.get("incident") and m == "live" and hub and not st.get("suppressed")
                 and (st.get("snooze_until") or 0) <= now and st.get("status") in ("filed", "approved", "proposed")):
             return _corruption_comment(d, st, store, runner)
+        if (d.get("comment_open_card") and m == "live" and hub and not st.get("suppressed")
+                and (st.get("snooze_until") or 0) <= now and st.get("status") in ("filed", "approved", "proposed")):
+            return _open_card_comment(d, st, store, runner)
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": dec["why"]})
         return {"action": "skip", "why": dec["why"]}
     if m == "live" and hub:
@@ -2658,6 +2770,7 @@ def main(argv=None) -> int:
                                            for k, v in st.items()},
                           "held_total": sum(len(v.get("held") or []) for v in st.values()),
                           "handoff_nudges": handoff_nudge_counts(),
+                          "nudges": nudge_counts(),
                           "deploy_grace_hours": deploy_grace_s() / 3600}, indent=1))
     return 0
 

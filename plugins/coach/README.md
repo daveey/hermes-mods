@@ -90,6 +90,9 @@ this user's agents can reach). A hit keeps the turn going with a nudge the user 
 | `status_only` (deterministic, no AI call) | the user asks about progress or to finish ("why are we waiting", "what are you doing", "whats going on", "can you just finish it", "make the corrections") and this turn's tool calls were only card bookkeeping (`kanban_show`/`list`/`comment`/`unblock`, `cross_task`/`cross_session`, `hermes kanban ...`/`hermes-hub request ...` in a terminal) plus reads, and the reply's last 1,500 chars name no wall only the user can clear (billing, a sign-in, "only you") | do the next real step on the work now (edit, test, commit, merge, deploy, prove), or name the one specific wall; don't reopen, re-review or add another watcher card |
 | `denied_ask` (deterministic, no AI call) | the reply says nothing needs the user ("no new approval request", "nothing needs you", "no action required on your side"; code and quotes ignored) while a card linked to the chat (core `session_tasks`: created, shepherded, subscribed or remote-origin) is blocked/triage with a validated `human_request` | correct the reply: say in plain words what is stuck, the one thing the user must do and where (the nudge quotes each card's `human_request.action`), and what happens after; do the step if an agent can |
 | `credit_ask` (deterministic, no AI call) | the reply asks the user to add or buy API credit (an Anthropic/OpenAI billing link, "add about $250", "add credits", "money ask") and this turn never ran the pool helper (`hermes-pool-llm` / `pool_llm` in the tool log) | run the work on the Hermes subscription account pool first (`hermes-pool-llm ask` or `serve`); ask for money only if the pool fails too, quoting its error |
+| `laptop_job` (deterministic, no AI call) | one sentence of the reply proposes a recurring unattended job (cron, launchd, "every 10 hours", hourly, a refresher/watcher/poller) on the MacBook, MBP, laptop or mini, with no hub target and no Mac-only reason in that sentence | put it on hermes-hub; if the hub lacks a credential, plan the hub job plus a one-time grant card |
+
+`laptop_job` (defect agent-60ca102b39, 2026-10-29): a chat offered "a small job on the MacBook every 10 hours" to rotate a Slack token because only the MacBook could write the secret that day; David: the MacBook doesn't stay on. It runs right after `credit_ask` and holds the reply once (attempt 0). A sentence is held only when it has all of: a creation verb or offer (build, set up, add, create, install, schedule, deploy, put, move; "plan:", "want me to", "shall I"), a recurring-job word, and a Mac as the job's location ("on/from the MacBook", "on the mini", "on your Mac", or "MacBook cron/job/watcher"; a bare "mini" is a model name such as gpt-4o-mini). A 30-day backtest over the hub's 16,105 replies (2026-10-30) holds exactly one: msg 381513. It passes when the same sentence names the hub (hermes-hub, "the hub", "hub cron", worker-N), says the job is absent ("add no LaunchAgent, cron or MacBook job"), or a Mac-only reason (Keychain, Chrome/browser, Apple apps, iCloud, Xcode, osascript, Screen Sharing, per-host, local state, Hermes Desktop, macOS-only, TCC, hermes-sync, disk). Code spans, `>` quotes, double-quoted text and sentences naming `laptop_job` are ignored, so reports about the rule and quotes of the old reply are not held. `COACH_REPLY_RULES` without it turns it off. Tests: `tests/test_laptop_job.py`.
 
 `denied_ask` (defect agent-8cecfe01cb, 2026-10-28): a chat told the user "no new approval request" while its setup card had asked him for a GitHub passkey; a todo card waiting on it kept the chat's batch unsettled, so nothing reported the ask for 18 h. It runs first (before the owner and status checks), reads the board only when the reply contains a denial phrase, fails open on any read error, and holds the reply once (attempt 0). A reply that already tells the ask (names the card id or title, or quotes most of the action) is not a denial, so "the other jobs don't need you" after presenting the ask passes. `COACH_REPLY_RULES` without it turns it off. The chat-closeout ask relay fixes the silence itself. Tests: `tests/test_reply_check.py` (`*denied_ask*`, `test_reply_check_denies_ask_while_card_human_blocked`).
 
@@ -639,14 +642,15 @@ Raw machine signals become `file_defect` calls with `source: signal` and stable 
 |---|---|---|
 | `errors` | new tracebacks in `<home>/logs/errors.log` (any level), minus tool output (`agent.tool_executor`) and provider transients (429/529/overloaded/timeouts) | exception type + innermost 4 frames as `file:function`, no line numbers (no) |
 | `hook` | `Hook '<hook>' callback <cb> raised: …` (plugin hook exceptions) | hook + callback + exception type (no) |
+| `worker` | managed kanban worker crashes in `<home>/logs/managed-worker.log` (`[pid N] ` lines, no timestamps), only as a crash storm: 3+ distinct pids dying with the same exception + normalized message (numbers, ids, paths collapsed) within 30 min on one host. State lives in the cursor, so a storm spans passes; `at` is the pass time. One signal per fingerprint per 30 min; `sk-` keys are scrubbed from the details | exception type + normalized message (no) |
 | `cron` | a job whose sticky `last_failure.at` is new (`cron/jobs.json`), even if it has recovered since | job name (yes) |
-| `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped | board + card id (yes) |
-| `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash); `gateway.exit_signal` (an unplanned SIGTERM bounce: bootout, `kickstart -k`) only as a restart storm, 3+ in 10 min per profile | tag + exception type (yes) |
-| `coach` | coach `fixloop_card` (2nd confirmed failure of a fix), and a `reply_nudge` with rule `handoff` only when its `reply_nudge_outcome` (pre_verify re-judges the revised reply once, attempt 1, same judge and threshold, never nudges again) says it still hands off, or no outcome came within 15 min. `self_heal.py status` → `handoff_nudges` counts resolved vs filed | session (+ issue) (no) |
+| `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped. Also the dispatcher's systemic breaker (3+ same-fingerprint crashes in one tick, each card crashed once): a `gave_up` event with `sticky: true` (event-id cursor per board) files one `systemic kanban crash … held N card(s) in triage` per board + normalized error head per 30 min; it names no card trigger, so the held cards finishing later doesn't drop it | board + card id (yes); systemic hold: error head (no) |
+| `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash); `gateway.exit_signal` (an unplanned SIGTERM bounce: bootout, `kickstart -k`) only as a restart storm, 3+ in 10 min per profile | tag + exception type; for `exit_nonzero`, its `cause` + reason class (a new cause is a new defect; `cause: unrecorded` = exit path missing a cause note) (yes) |
+| `coach` | coach `fixloop_card` (2nd confirmed failure of a fix), and a `reply_nudge` of any reply_check rule (handoff, status_only, report_only, denied_ask, ...) only when its `reply_nudge_outcome` (pre_verify re-runs that rule once on the revised reply and the turn's tool log, attempt 1, same judge and threshold, never nudges again) says it still fails, or no outcome came within 15 min. Non-handoff nudges without the `outcome` marker (a backend still on the old plugin) are not filed. The complaint backstop never judges `[coach]` turns (they are stored as user-role messages but are the coach's own text). `self_heal.py status` → `nudges` counts per rule (resolved / still_failing / no_outcome / waiting / untracked / filed); `handoff_nudges` is kept | session (+ issue) (no) |
 | `monitor` | a propose-only monitor's finding (`route-monitor`, below) | the monitor's own dedupe key |
 
 Profiles (`<home>/profiles/*`) are swept too. Cursor `<home>/coach/signals-cursor.json` (offset + inode per log, last
-run id per board, last failure per job); first sight looks back 7 days; a rotated log is re-read; ≤ 25 signals per
+run id and last event id per board, last failure per job, the last 30 min of worker crashes); first sight looks back 7 days; a rotated log is re-read; ≤ 25 signals per
 kind per pass, same fingerprint folded into one (`seen Nx`).
 
 - **Hub**: cron `self-heal signals (hub)` (`~/.hermes/scripts/selfheal_signals.py` → `signals.py --host hermes-hub
@@ -777,6 +781,49 @@ create-overlap-overrides:<host>:<year>-W<week>`) with the evidence, asking an ag
 matcher or skill guidance that let them through. `--dry-run` prints the JSON and files nothing. Tests:
 `tests/test_create_overlap_watch.py` (only recent archived overrides count across boards; exactly 2 files nothing,
 3 files one card with a stable week key; dry-run files nothing).
+
+### Bare ask-gate notices (`withheld_notice_watch.py`, no agent, no LLM)
+
+ask-gate used to swap a whole reply for "I withheld a request ..." (17 in 7 sessions, Oct 27-29). It now holds
+first and keeps the draft minus the refused ask, so a delivered bare notice is a defect. A hermes cron job on
+hermes-hub (no-agent, hourly) runs `withheld_notice_watch.py`: it scans `state.db` for assistant replies that start
+with "I withheld a" / "The workflow remains stopped" / "I suppressed a repeated" newer than its last scan and files
+ONE card per host and day (`--idempotency-key withheld-notice:<host>:<date>`), commenting on it for later hits.
+`--seed` marks history as seen (run once at install); `--dry-run --hours N` prints hits and files nothing. Tests:
+`tests/test_withheld_notice_watch.py` (only assistant replies starting with a notice count, not quotes or mentions;
+one card per day then a comment only on new hits; seed and dry-run file nothing).
+
+### Restart notices to a team home channel (`restart_notice_config_watch.py`, no agent, no LLM)
+
+A gateway posts "Hermes is restarting" / "Gateway online" to each platform's home channel unless
+`platforms.<platform>.gateway_restart_notification: false` (default true). alpha-askeve's home channel was a team
+Slack channel and got 26 such notices in 7 h before the opt-out was added. A hermes cron job on hermes-hub (no-agent,
+hourly, "restart-notice config watch (hub)") runs `restart_notice_config_watch.py`: it reads `<HERMES_HOME>/config.yaml`
+(profile `default`) and every `profiles/*/config.yaml`, takes each platform with a home channel (`home_channel.chat_id`
+in config.yaml or a non-empty `<PLATFORM>_HOME_CHANNEL` in the profile's `.env`), and files ONE card per host, profile
+and platform (`--idempotency-key restart-notice-config:<host>:<profile>:<platform>`) when the flag is not false (top
+level or under `extra`, read like core's `_coerce_bool`). A home channel that should keep the notices (an owner DM) is
+allow-listed in `<HERMES_HOME>/restart-notice-allow.txt` as `<profile>` or `<profile>:<platform>`. An unreadable
+config is reported, not skipped. `--dry-run` prints the JSON and files nothing; a clean real run prints nothing. Tests:
+`tests/test_restart_notice_config_watch.py` (config.yaml and `.env` home channels flagged, explicit true flagged;
+top-level/extra/string false, flow-style YAML and no home channel quiet; allow-list by profile and profile:platform;
+unreadable config reported; dry-run files nothing, a real run files one keyed card; clean run silent).
+
+### Agent probes in a person's chat (`probe_token_watch.py`, no agent, no LLM)
+
+A fix worker proved its fix with `hermes chat --resume <David's chat> --oneshot -q "... Reply exactly ROUTE_..."`
+and left the probe and its bare-token reply as the newest turns of two of his chats (self-heal agent-93a55211b1).
+The user-chat-probe-guard plugin now refuses that; this catches what gets through. A hermes cron job on hermes-hub
+(no-agent, hourly) runs `probe_token_watch.py`: it pulls `~/code/hermes-coach-data` and reads every host's digests
+written in the last 3 days, and flags a user-facing session (desktop, cli, messaging) where a real user turn is
+followed by a `Reply exactly <TOKEN>` turn, or whose `last_reply` is a bare `UPPER_token` after one. A session an agent
+opened for its own test (first user turn is the probe) is not flagged. ONE card per session
+(`--idempotency-key probe-token:<host>:<session>`), later evidence as a comment. `--seed` records current hits as known
+(run once at install); `--dry-run --days N` prints hits and files nothing. Replay over every digest on 2026-10-30
+flags exactly macbook 23ef49 and 55b17f. Tests: `tests/test_probe_token_watch.py` (incident digest and bare-token
+reply flagged; worker/oneshot sources, ordinary short answers, prose "reply exactly the same", agent-opened test
+sessions not flagged; one card per session, nothing on an unchanged rerun, a comment on newer evidence; dry-run files
+nothing).
 
 ## Files
 

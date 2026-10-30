@@ -8,7 +8,7 @@ A run is cancelled only if ALL hold, re-checked on a fresh read right before the
 - its head_sha is not the current head (the open PR head for pull_request runs, the branch HEAD for push
   runs); an unknown or ambiguous head means keep;
 - it has at least one job, and every non-completed job is a gate/report job (aggregator, timing report,
-  summary). Any open real job means keep.
+  summary) still waiting for a runner. Any open real job, or a gate already in_progress, means keep.
 Listings are fully paginated; a failed read means no action. Exit 1 if any read or cancel failed, so a
 caller never mistakes a failure for success. Prints created / first-job-start / last-real-job-done so
 timing evidence survives the cancel. Needs a token with actions:write (gh auth or GH_TOKEN).
@@ -58,8 +58,10 @@ def latched(run, jobs, head, gate):
         return False
     if head is None or run["head_sha"] == head or not jobs:
         return False
-    open_jobs = [j["name"] for j in jobs if j["status"] != "completed"]
-    return bool(open_jobs) and all(gate.search(n) for n in open_jobs)
+    open_jobs = [j for j in jobs if j["status"] != "completed"]
+    # A gate already on a runner finishes in seconds (gates run on a light lane); cancelling it would turn
+    # an all-green run into "cancelled". Only a gate still waiting for a runner is latched.
+    return bool(open_jobs) and all(gate.search(j["name"]) and j["status"] != "in_progress" for j in open_jobs)
 
 
 def main(repo, apply, gate):

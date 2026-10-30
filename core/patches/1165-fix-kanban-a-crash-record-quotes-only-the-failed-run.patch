@@ -1,0 +1,381 @@
+From d2f87c562d680fa41d4d3c4ad7ad950d50bdc8a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:17:22 -0700
+Subject: [PATCH] fix(kanban): a crash record quotes only the failed run's
+ output and names the worker's failure cause [daveey]
+
+The per-task worker log is append-only; a run that died at start was reported with the previous
+run's final message. Cut the log at the previous exit trailer. A managed worker that dies (at start
+or later, e.g. WorkerPersistenceError in flush_token_counts) books one redacted cause line on its
+attempt, and the client's 'Kanban execution unknown' refusal quotes it. (t_01a18b38b3fe3a5b)
+---
+ agent/managed_worker.py                       |   6 +-
+ gateway/session_kanban.py                     |  36 +++++-
+ hermes_cli/kanban_db_dispatch.py              |  13 +--
+ hermes_cli/kanban_worker_client.py            |  11 +-
+ hermes_cli/kanban_worker_log.py               |  27 +++++
+ tests/gateway/test_kanban_class_tier_route.py |  26 +++++
+ .../test_kanban_crash_output_current_run.py   |  42 +++++++
+ .../test_kanban_worker_start_failure_cause.py | 108 ++++++++++++++++++
+ 8 files changed, 255 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_crash_output_current_run.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_start_failure_cause.py
+
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index 4ab586ed991..02e8b90f1fc 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -459,13 +459,17 @@ def main():
+     if not logger.handlers:
+         logger.addHandler(logging.StreamHandler(sys.stderr))
+     logger.propagate = False
++    frame = None
+     try:
+         channel.send('hello', **hello())
+         frame = validate_bootstrap(read_frame(sys.stdin.buffer))
+         execute(frame, channel)
+-    except Exception:
++    except Exception as exc:
+         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
+         logger.exception('managed worker failed')
++        if frame is not None:  # [daveey] a Kanban attempt books one redacted cause line on its card
++            from gateway.session_kanban import record_worker_failure
++            record_worker_failure(frame, exc)
+         channel.send('error', reason='managed_worker_failed')
+         return 1
+     finally:
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 224184c0bf0..74a897c278c 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -298,7 +298,41 @@ def record_start_failure(frame, exc):
+     if context is None:
+         return
+     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+-    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
++    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
++                          start_failure_line(exc))
++    exc._kanban_failure_booked = True
++
++
++def record_worker_failure(frame, exc):
++    """[daveey] Any other exception that kills a managed Kanban worker (a turn, the close-time token
++    flush, store.finish): book its cause as the attempt's last word, after whatever the turn booked.
++    Run 10210 died in ``flush_token_counts`` (WorkerPersistenceError) after a class failover and its
++    card said only "Kanban execution unknown". Never raises: the worker's own exit must not depend on it."""
++    if getattr(exc, '_kanban_failure_booked', False):
++        return
++    try:
++        context = json.loads(((frame or {}).get('policy') or {}).get('kanban_json') or 'null')
++        if context is None:
++            return
++        from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
++        _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)),
++                              failure_line(exc, 'Worker failed'))
++    except Exception:
++        import logging
++        logging.getLogger(__name__).debug('could not book the worker failure cause', exc_info=True)
++
++
++def failure_line(exc, prefix):
++    from agent.redact import redact_sensitive_text
++    text = ' '.join(f'{type(exc).__name__}: {exc}'.split())
++    return f'{prefix}: ' + redact_sensitive_text(text, force=True)[:300]
++
++
++def start_failure_line(exc):
++    """[daveey] One redacted line naming why the worker could not start. Without it the card's crash
++    record read only "Kanban execution unknown; retained by owner" and the cause (e.g. a
++    ModelRoutingError) lived only in managed-worker.log, so every crashed card had to be diagnosed by hand."""
++    return failure_line(exc, 'Worker could not start')
+ 
+ 
+ def _record_worker_result(context, code, last_output):
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 0ada0cf5250..de9ec8d2e41 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1211,15 +1211,8 @@ _PROTOCOL_VIOLATION_ERROR = (
+ _LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
+ 
+ 
+-def _exit_summary_marker() -> str:
+-    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
+-    from agent.i18n import t
+-    return t("cli.session.exit_resume_hint")
+-
+-
+-def _log_noise_prefixes() -> tuple[str, ...]:
+-    from agent.i18n import t
+-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
++from hermes_cli.kanban_worker_log import (
++    current_run_log, exit_summary_marker as _exit_summary_marker, log_noise_prefixes as _log_noise_prefixes)
+ 
+ 
+ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
+@@ -1243,7 +1236,7 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
+         return ""
+     if not raw:
+         return ""
+-    raw = _EXIT_TRAILER_RE.sub("", raw)
++    raw = _EXIT_TRAILER_RE.sub("", current_run_log(raw))
+     cut = raw.rfind(_exit_summary_marker())
+     if cut != -1:
+         raw = raw[:cut]
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index 399c1c085a5..f05a67a6942 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -146,9 +146,16 @@ async def _await_receipt(client, params, board_db, claim):
+ 
+ def _exit_code(receipt, params, board_db):
+     from hermes_cli.gateway_client import GatewayClientError
+-    if receipt['status'] == 'unknown':
+-        raise GatewayClientError('Kanban execution unknown; retained by owner')
+     from gateway.session_kanban import worker_result
++    if receipt['status'] == 'unknown':
++        # [daveey] A worker that died at start booked its reason on the attempt: quote it, so the
++        # crash record names the cause instead of only the owner's unknown receipt.
++        import sqlite3
++        try:
++            cause = worker_result(board_db, params).get('last_output') or ''
++        except (OSError, sqlite3.Error, ValueError, KeyError):
++            cause = ''
++        raise GatewayClientError('Kanban execution unknown; retained by owner' + (f' ({cause})' if cause else ''))
+     result = worker_result(board_db, params)
+     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
+     if result.get('last_output'):
+diff --git a/hermes_cli/kanban_worker_log.py b/hermes_cli/kanban_worker_log.py
+index 78f1bd24a4a..467068211db 100644
+--- a/hermes_cli/kanban_worker_log.py
++++ b/hermes_cli/kanban_worker_log.py
+@@ -62,3 +62,30 @@ def rotate_worker_log(
+         log_path.rename(_rotated_log_path(log_path, 1))
+     except OSError:
+         pass
++
++
++def exit_summary_marker() -> str:
++    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
++    from agent.i18n import t
++    return t("cli.session.exit_resume_hint")
++
++
++def log_noise_prefixes() -> tuple[str, ...]:
++    from agent.i18n import t
++    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
++
++
++def current_run_log(raw: str) -> str:
++    """[daveey] Only the dead run's own part of the append-only per-task log.
++
++    Every run ends with an exit trailer (``[kanban-worker-exit] rc=N``). The dead run's own trailer
++    may already close the tail; any earlier trailer closes a PREVIOUS run. Without this cut, a run that
++    printed nothing (a worker that died at start) was reported with the previous run's final message,
++    so its crash notice read as the worker re-asking the earlier question."""
++    import re
++    from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
++    trailers = list(re.finditer(r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"\d+\s*$", raw.rstrip(), re.MULTILINE))
++    body = raw.rstrip()
++    if trailers and trailers[-1].end() == len(body):
++        body, trailers = body[:trailers[-1].start()], trailers[:-1]
++    return body[trailers[-1].end():] if trailers else body
+diff --git a/tests/gateway/test_kanban_class_tier_route.py b/tests/gateway/test_kanban_class_tier_route.py
+index 4a1bbc8467f..1ea6c15a82f 100644
+--- a/tests/gateway/test_kanban_class_tier_route.py
++++ b/tests/gateway/test_kanban_class_tier_route.py
+@@ -79,3 +79,29 @@ def test_a_launch_key_on_a_class_route_is_still_refused(tmp_path, monkeypatch):
+     policy = _kanban_policy(tmp_path, monkeypatch, model_override='class:standard')
+     with pytest.raises(ModelRoutingError, match='explicit credentials'):
+         worker_route(policy, {'api_key': 'sk-launch'})
++
++
++@pytest.mark.parametrize('frozen_provider', ['anthropic', 'auto'])
++@pytest.mark.parametrize('fallback', [True, False])
++def test_route_runtime_leaves_a_class_to_the_agent_with_no_session_id(tmp_path, monkeypatch, frozen_provider,
++                                                                     fallback):
++    """``route_runtime`` has no session id, for the Kanban worker and for the in-process turn and
++    one-shot (``fallback=False``) alike. Frozen ``anthropic`` raised "Class selectors require provider
++    auto"; frozen ``auto`` (mini bb-dev ``class:deep`` one-shot, agent.log 22:48 PDT 10/29) raised "Class
++    routing requires a durable session/job identity". Either way the class goes to AIAgent's boundary."""
++    import json
++    from gateway.session_policy import restore_policy
++    from gateway.session_worker_construct import route_runtime
++    from tests.gateway.test_managed_turn_contract import assignment
++    frame, _ = assignment(tmp_path, monkeypatch)
++    config = json.loads(frame['policy']['config_json'])
++    config['model'] = ({'default': 'class:deep', 'provider': 'auto'} if frozen_provider == 'auto' else
++                       {'default': 'claude-opus-5-5', 'provider': 'anthropic', 'base_url': 'https://api.anthropic.com'})
++    request = {k: v for k, v in json.loads(frame['policy']['request_json']).items() if k not in ('provider', 'base_url')}
++    policy = restore_policy({**frame['policy'], 'model': 'class:deep', 'config_json': json.dumps(config),
++                             'request_json': json.dumps(request)})
++    frozen, model = policy.effective()
++    runtime, fallback_entry = route_runtime(policy, frozen, model, None, fallback=fallback)
++    assert fallback_entry is None
++    assert runtime['provider'] == 'auto' and runtime['requested_provider'] == 'auto'
++    assert runtime.get('api_key') is None and runtime.get('base_url') is None
+diff --git a/tests/hermes_cli/test_kanban_crash_output_current_run.py b/tests/hermes_cli/test_kanban_crash_output_current_run.py
+new file mode 100644
+index 00000000000..ba0998e46f3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_crash_output_current_run.py
+@@ -0,0 +1,42 @@
++"""[daveey] A crash record quotes only the failed run's own output, never an earlier run's.
++
++The per-task worker log is append-only across runs. Run 10187 of t_01a18977df212d21 died at start
++having printed only ``Session: …``; its ``crashed`` event and chat notice quoted the PREVIOUS run's
++final message ("…set it to needs_input. Reply with one of: a … b …"), so it read as a re-ask.
++"""
++import pytest
++
++from hermes_cli import kanban_db_dispatch as kbd
++
++PREVIOUS = (
++    "I posted these findings as a comment on the task and set it to needs_input. Reply with one of:\n"
++    "- a: leave Desktop alone.\n"
++    "\nResume this session with:\n  hermes --resume 20261029_212549_b67f3c\n"
++    "\n[kanban-worker-exit] rc=0\n"
++)
++
++
++def _output(monkeypatch, text):
++    monkeypatch.setattr(kbd._kb, "read_worker_log", lambda task_id, tail_bytes=None, board=None: text)
++    return kbd._worker_final_output("t_x", board="default")
++
++
++@pytest.mark.parametrize("own_trailer", ["", "\n[kanban-worker-exit] rc=1\n"])
++def test_silent_failed_run_does_not_quote_the_previous_runs_message(monkeypatch, own_trailer):
++    out = _output(monkeypatch, PREVIOUS + "Session: local-0c64\n" + own_trailer)
++    assert "needs_input" not in out and "Reply with one of" not in out
++
++
++@pytest.mark.parametrize("own_trailer", ["", "\n[kanban-worker-exit] rc=1\n"])
++def test_failed_run_quotes_its_own_start_failure_cause(monkeypatch, own_trailer):
++    own = ("Session: local-0c64\nKanban owner refused: Kanban execution unknown; retained by owner "
++           "(Worker could not start: ModelRoutingError: Class selectors require provider auto)\n")
++    out = _output(monkeypatch, PREVIOUS + own + own_trailer)
++    assert "Worker could not start: ModelRoutingError" in out
++    assert "needs_input" not in out
++
++
++def test_single_run_log_keeps_its_final_message(monkeypatch):
++    """Control: the first run of a card (no earlier trailer) still reports its own final text."""
++    out = _output(monkeypatch, PREVIOUS)
++    assert "Reply with one of" in out
+diff --git a/tests/hermes_cli/test_kanban_worker_start_failure_cause.py b/tests/hermes_cli/test_kanban_worker_start_failure_cause.py
+new file mode 100644
+index 00000000000..348a953d56d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_start_failure_cause.py
+@@ -0,0 +1,108 @@
++"""A Kanban worker that dies while constructing its agent names the cause on the card's crash record.
++
++Before this, a ModelRoutingError at construction reached the card only as "Kanban execution unknown;
++retained by owner"; the exception lived in managed-worker.log alone.
++"""
++import json
++
++import pytest
++
++
++def test_start_failure_books_a_redacted_one_line_cause(monkeypatch):
++    from agent.model_routing import ModelRoutingError
++    from gateway import session_kanban
++    booked = []
++    monkeypatch.setattr(session_kanban, '_record_worker_result', lambda ctx, code, out: booked.append((code, out)))
++    frame = {'policy': {'kanban_json': json.dumps({'db': '/nonexistent', 'task_id': 't', 'run_id': 1})}}
++    session_kanban.record_start_failure(frame, ModelRoutingError('Class selectors require provider auto;\nuse a concrete model'))
++    (code, out), = booked
++    assert code == 1
++    assert out == 'Worker could not start: ModelRoutingError: Class selectors require provider auto; use a concrete model'
++
++
++def test_start_failure_line_redacts_secrets():
++    from gateway.session_kanban import start_failure_line
++    line = start_failure_line(RuntimeError('bad key sk-ant-api03-' + 'A' * 40))
++    assert 'A' * 40 not in line and line.startswith('Worker could not start: RuntimeError:')
++
++
++@pytest.mark.parametrize('cause, expected', [
++    ('Worker could not start: ModelRoutingError: x',
++     'Kanban execution unknown; retained by owner (Worker could not start: ModelRoutingError: x)'),
++    ('', 'Kanban execution unknown; retained by owner'),
++])
++def test_unknown_receipt_quotes_the_booked_cause(monkeypatch, cause, expected):
++    from hermes_cli import kanban_worker_client as client
++    from hermes_cli.gateway_client import GatewayClientError
++    monkeypatch.setattr('gateway.session_kanban.worker_result', lambda db, params: {'last_output': cause} if cause else {})
++    with pytest.raises(GatewayClientError) as raised:
++        client._exit_code({'status': 'unknown'}, {}, '/nonexistent')
++    assert str(raised.value) == expected
++
++
++def test_worker_failure_after_the_turn_books_its_cause(monkeypatch):
++    """Run 10210: a class failover's sidecar write was refused, then the close-time
++    ``flush_token_counts`` raised WorkerPersistenceError; the card booked ``last_output=''``."""
++    from agent.runtime_session_store import WorkerPersistenceError
++    from gateway import session_kanban
++    booked = []
++    monkeypatch.setattr(session_kanban, '_record_worker_result', lambda ctx, code, out: booked.append((code, out)))
++    frame = {'policy': {'kanban_json': json.dumps({'db': '/nonexistent', 'task_id': 't', 'run_id': 1})}}
++    session_kanban.record_worker_failure(frame, WorkerPersistenceError('invalid_params'))
++    assert booked == [(1, 'Worker failed: WorkerPersistenceError: invalid_params')]
++
++
++def test_start_failure_is_not_booked_twice(monkeypatch):
++    from agent.model_routing import ModelRoutingError
++    from gateway import session_kanban
++    booked = []
++    monkeypatch.setattr(session_kanban, '_record_worker_result', lambda ctx, code, out: booked.append(out))
++    frame = {'policy': {'kanban_json': json.dumps({'db': '/nonexistent', 'task_id': 't', 'run_id': 1})}}
++    exc = ModelRoutingError('boom')
++    session_kanban.record_start_failure(frame, exc)
++    session_kanban.record_worker_failure(frame, exc)
++    assert booked == ['Worker could not start: ModelRoutingError: boom']
++
++
++def test_worker_failure_outside_kanban_books_nothing_and_never_raises(monkeypatch):
++    from gateway import session_kanban
++    monkeypatch.setattr(session_kanban, '_record_worker_result', lambda *a: (_ for _ in ()).throw(OSError('db gone')))
++    session_kanban.record_worker_failure({'policy': {}}, RuntimeError('x'))  # not a Kanban attempt
++    frame = {'policy': {'kanban_json': json.dumps({'db': '/nonexistent', 'task_id': 't', 'run_id': 1})}}
++    session_kanban.record_worker_failure(frame, RuntimeError('x'))  # board write fails: swallowed
++
++
++def test_managed_worker_main_books_the_cause_of_a_late_failure(monkeypatch):
++    """Entry path: ``managed_worker.main`` catches the exception ``execute`` raised and books it."""
++    import io
++    from agent import managed_worker as mw
++    from agent.runtime_session_store import WorkerPersistenceError
++    from gateway import session_kanban
++    frame = {'policy': {'kanban_json': json.dumps({'db': '/nonexistent', 'task_id': 't', 'run_id': 1})}}
++    sent, booked = [], []
++
++    class Channel:
++        stream = io.BytesIO()
++
++        def __init__(self, *_a):
++            pass
++
++        def send(self, kind, **payload):
++            sent.append(kind)
++
++    monkeypatch.setattr(mw, 'WorkerChannel', Channel)
++    monkeypatch.setattr(mw.os, 'fdopen', lambda *a, **k: io.BytesIO())
++    monkeypatch.setattr(mw.os, 'dup', lambda fd: fd)
++    monkeypatch.setattr(mw.os, 'dup2', lambda a, b: None)
++    monkeypatch.setattr(mw, 'hello', dict)
++    monkeypatch.setattr(mw, 'read_frame', lambda stream: frame)
++    monkeypatch.setattr(mw, 'validate_bootstrap', lambda f: f)
++
++    def execute(f, channel):
++        raise WorkerPersistenceError('invalid_params')
++
++    monkeypatch.setattr(mw, 'execute', execute)
++    monkeypatch.setattr(session_kanban, '_record_worker_result', lambda ctx, code, out: booked.append(out))
++    assert mw.main() == 1
++    assert booked == ['Worker failed: WorkerPersistenceError: invalid_params']
++    assert sent[-1] == 'error'
+-- 
+2.55.0
+

@@ -118,3 +118,25 @@ def test_retitle_open_steps_reads_a_stored_reply_whose_asks_are_directives(tmp_p
                            'status': 'open', 'session': 'sess', 'created': 1})
     assert core.retitle_open_steps('sess', stored, ledger=ledger) == ['us_x']
     assert ledger.read('sess')['steps'][0]['text'] == QUESTION
+
+
+# A real ask that quotes the word to type ("Reply \"go\" and I'll ...") must survive on both paths: only an ask whose
+# match sits inside the quotes is someone else's words (review of the 2026-10-29 fix; real shape seen 2026-10-17).
+QUOTED_VALUE_ASKS = [
+    ('The plan holds 1 of 65 risky requests.\n\nReply "go" and I\'ll unblock the card to build it.',
+     'Reply "go" and I\'ll unblock the card to build it.'),
+    ('Deploy is staged.\n\nSay \u201cyes\u201d and I will merge PR 12.',
+     'Say \u201cyes\u201d and I will merge PR 12.'),
+]
+
+
+def test_ask_that_quotes_the_word_to_type_is_kept_regex_path():
+    for reply, span in QUOTED_VALUE_ASKS:
+        out = core.extract(reply, [], '', None)['steps']
+        assert [s['verbatim_span'] for s in out] == [span], reply
+
+
+def test_ask_that_quotes_the_word_to_type_is_kept_model_path():
+    for reply, span in QUOTED_VALUE_ASKS:
+        out = run(reply, steps(('Approve building it', span)))
+        assert len(out) == 1, reply

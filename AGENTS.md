@@ -31,7 +31,10 @@ the private repo `daveey/hermes` (`~/code/hermes`, branch `state`).
    - moving an existing private mod here: `git mv`-equivalent: copy it in, commit and push, then run
      `~/code/hermes/hermes-sync run`. It replaces the `~/.hermes` copy with a link (the old copy is
      kept in `~/.hermes/.hermes-sync-trash/`) and removes the copy from the private repo.
-3. Test the live copy (it's linked, so the live copy is this tree).
+3. Test the live copy (it's linked, so the live copy is this tree). The whole-repo gate is `scripts/test-all`
+   (exit 0 = every suite passed; `-k <plugin>` for one). Never a bare `pytest` at the root. On the MacBook run
+   only the targeted suite (`-k`); the full run belongs on the hub. A new plugin's tests are picked up
+   automatically; one with a non-pytest runner gets an entry in `SUITE_OVERRIDES` in that script.
 4. `git add` + `git commit` (the pre-commit hook runs gitleaks and the private denylist; enable it
    with `git config core.hooksPath .githooks` if `hermes-sync` hasn't yet). Then `git push`, or let
    the next `hermes-sync` run push it.

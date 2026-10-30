@@ -16,181 +16,9 @@ Subject: [PATCH] perf(desktop): keep remote gateways warm - always-on
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- apps/desktop/electron/main.ts                 |  62 +++-
- .../remote-lifecycle-always-on.test.ts        | 183 ++++++++++
- apps/desktop/electron/remote-lifecycle.ts     | 170 ++++++++++
- apps/desktop/electron/remote-liveness.ts      |  57 +++-
- apps/desktop/electron/remote-prewarm.ts       | 131 +++++++
- .../electron/remote-warm-dispatch.test.ts     | 192 +++++++++++
- apps/desktop/electron/ssh-connection.ts       |   3 +-
- hermes_cli/always_on_dashboard.py             | 321 ++++++++++++++++++
- hermes_cli/main.py                            |   2 +
- hermes_cli/web_server.py                      |  31 +-
- tests/hermes_cli/test_always_on_dashboard.py  | 132 +++++++
- 11 files changed, 1271 insertions(+), 13 deletions(-)
- create mode 100644 apps/desktop/electron/remote-lifecycle-always-on.test.ts
- create mode 100644 apps/desktop/electron/remote-prewarm.ts
- create mode 100644 apps/desktop/electron/remote-warm-dispatch.test.ts
- create mode 100644 hermes_cli/always_on_dashboard.py
- create mode 100644 tests/hermes_cli/test_always_on_dashboard.py
-
-diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
-index c98d0dfbfd..3927215135 100644
---- a/apps/desktop/electron/main.ts
-+++ b/apps/desktop/electron/main.ts
-@@ -533,8 +533,10 @@ import { createSshReuseProbe, wireRegistryReconnect } from './registry-reconnect
- import * as remoteLifecycle from './remote-lifecycle'
- import {
-   attachPowerResumeRemoteRevalidation,
-+  DISPATCH_PROBE_SKIP_WINDOW_MS,
-   ensureHealthyPooledRemoteBackendForDispatch,
-   REMOTE_POOLED_LIVENESS_FAILURE_WINDOW_MS,
-+  remoteAnswerLedger,
-   RemoteLivenessTracker,
-   RemoteRevalidationCoordinator,
-   revalidatePooledRemoteBackends,
-@@ -543,6 +545,7 @@ import {
- } from './remote-liveness'
- import { resolveRemoteOauthTicket, rosterSourceEnumerationTimeoutMs } from './remote-oauth-ticket'
- import { createRemoteOwnerCache } from './remote-owner-cache'
-+import { RemotePrewarmer } from './remote-prewarm'
- import { remoteSessionCookies } from './remote-session-cookies'
- import {
-   attachRemoteRequestHeaderListener,
-@@ -10172,6 +10175,8 @@ async function rollbackSshBootstrapResult(ssh, result, profile, sshConfig, bound
- 
- async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, source, metadata, fingerprint, lease) {
-   const scope = sshScopeKey(profile)
-+  const timingStartedAt = Date.now()
-+  rememberLog(`[remote-timing] ${scope} connect-start`)
-   const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
-   const existing = sshConnections.get(scope)
- 
-@@ -10210,6 +10215,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
-     )
-     removeForceCleanup = lease.onForceCleanup(() => ssh.close())
-     await ssh.open({ signal: lease.signal })
-+    rememberLog(`[remote-timing] ${scope} ssh dial +${Date.now() - timingStartedAt} ms`)
-   }
- 
-   let result: any
-@@ -10319,6 +10325,11 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
-     rollback: error => rollbackSshBootstrapResult(ssh, result, profile, sshConfig, error)
-   })
- 
-+  rememberLog(
-+    `[remote-timing] ${scope} ${result.alwaysOn ? 'reuse always-on' : result.reused ? 'reuse owned' : 'spawn'} ` +
-+      `pid=${result.pid} ssh=${created ? 'dialed' : 'master reused'} +${Date.now() - timingStartedAt} ms`
-+  )
-+  remoteFirstRequestPending.set(result.baseUrl, { scope, startedAt: timingStartedAt })
-   sshRememberLog(
-     `[ssh] connection ${result.reused ? 'REUSED' : 'spawned'} dashboard: ` +
-       `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
-@@ -11053,11 +11064,24 @@ async function ensureBackend(
- // a genuinely-local child when the v1 mode says remote; non-local connections
- // pool under the composite key from backendScopeKey() and reuse the same pool
- // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
-+// Part B (instant session loads): dial every SSH gateway at startup and keep it warm (remote-prewarm.ts).
-+const remotePrewarmer = new RemotePrewarmer({
-+  listConnectionIds: () =>
-+    process.env.HERMES_DESKTOP_REMOTE_PREWARM === '0'
-+      ? []
-+      : readDesktopConnectionsRegistry()
-+          .connections.filter(connection => connection.kind === 'ssh')
-+          .map(connection => connection.id),
-+  ensure: (connectionId, { forceProbe }) =>
-+    ensureRegistryBackend(connectionId, 'default', '', { forceProbe, spawnPriority: 'background' }),
-+  log: line => rememberLog(line)
-+})
-+
- async function ensureRegistryBackend(
-   connectionId,
-   profile,
-   managedUpdateCorrelation = '',
--  opts: { passive?: boolean; spawnPriority?: LocalBackendSpawnPriority } = {}
-+  opts: { forceProbe?: boolean; passive?: boolean; spawnPriority?: LocalBackendSpawnPriority } = {}
- ) {
-   const spawnPriority = spawnPriorityFrom(opts.spawnPriority)
-   const passive = Boolean(opts.passive)
-@@ -11266,6 +11290,13 @@ async function ensureRegistryBackend(
-         connectionPromise,
-         currentConnectionPromise: () => backendPool.get(key)?.connectionPromise || null,
-         probe: (connection, requestPath, options) => fetchJsonForBackend(connection, requestPath, options),
-+        answers: remoteAnswerLedger,
-+        skipWindowMs: opts.forceProbe ? 0 : DISPATCH_PROBE_SKIP_WINDOW_MS,
-+        onProbe: (outcome, elapsedMs) => {
-+          if (!opts.forceProbe) {
-+            rememberLog(`[remote-timing] ${key} dispatch probe ${outcome} (${elapsedMs} ms)`)
-+          }
-+        },
-         reconnect: () => ensureRegistryBackend(id, profile, '', { passive }),
-         retire: async (error: any) => {
-           // A late failure from an old descriptor must never tear down a newer
-@@ -16781,20 +16812,42 @@ async function fetchJsonForBackend(
-       headers: descriptor.headers
-     }
- 
--    return requestWithOauthFallback(descriptor.baseUrl, {
-+    const answer = await requestWithOauthFallback(descriptor.baseUrl, {
-       ensureNativeAccessToken,
-       requestWithBearer: (bearer: string) => fetchJson(url, null, { ...options, bearer }),
-       requestWithCookie: () => fetchJsonViaOauthSession(url, options)
-     })
-+
-+    noteRemoteAnswer(descriptor.baseUrl, path)
-+
-+    return answer
-   }
- 
--  return fetchJson(url, descriptor.token, {
-+  const answer = await fetchJson(url, descriptor.token, {
-     method: opts.method,
-     body: opts.body,
-     upload: opts.upload,
-     timeoutMs: opts.timeoutMs,
-     headers: descriptor.headers
-   })
-+
-+  noteRemoteAnswer(descriptor.baseUrl, path)
-+
-+  return answer
-+}
-+
-+// Remote connection timing (part B, instant session loads): connect-start, reuse/spawn and the first request a
-+// new descriptor serves, per scope, as `[remote-timing]` lines in desktop.log.
-+const remoteFirstRequestPending = new Map<string, { scope: string; startedAt: number }>()
-+
-+function noteRemoteAnswer(baseUrl: string, path: string) {
-+  remoteAnswerLedger.recordAnswer(baseUrl)
-+  const pending = remoteFirstRequestPending.get(baseUrl)
-+
-+  if (pending) {
-+    remoteFirstRequestPending.delete(baseUrl)
-+    rememberLog(`[remote-timing] ${pending.scope} first-request ${path} served +${Date.now() - pending.startedAt} ms`)
-+  }
- }
- 
- ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
-@@ -19491,6 +19544,8 @@ app.whenReady().then(() => {
-     handleDeepLink(_coldStartLink)
-   }
- 
-+  void remotePrewarmer.start().catch(error => rememberLog(`[remote-prewarm] start failed: ${String(error)}`))
-+
-   app.on('activate', () => {
-     // Recreate the primary window if it's gone. Guard on mainWindow directly
-     // (not just total window count) so a dock click still restores the main
-@@ -19691,6 +19746,7 @@ app.on('before-quit', event => {
- 
-   minimizeToTray.beginQuit()
-   mainProcessLagWatchdog.stop()
-+  remotePrewarmer.stop()
- 
-   // A detached remote updater can outlive this Electron process. Do not tear
-   // down its SSH observer/restore transaction at the generic SSH shutdown
 diff --git a/apps/desktop/electron/remote-lifecycle-always-on.test.ts b/apps/desktop/electron/remote-lifecycle-always-on.test.ts
 new file mode 100644
-index 0000000000..1185d96615
+index 0000000000000000000000000000000000000000..1185d96615c41ba30945eebbca6facc882d0a4e1
 --- /dev/null
 +++ b/apps/desktop/electron/remote-lifecycle-always-on.test.ts
 @@ -0,0 +1,183 @@
@@ -378,10 +206,10 @@ index 0000000000..1185d96615
 +  assert.equal((await readAlwaysOnState(ok))?.alive, true)
 +})
 diff --git a/apps/desktop/electron/remote-lifecycle.ts b/apps/desktop/electron/remote-lifecycle.ts
-index c96e27f466..4f657b54dd 100644
+index 7cc05449624139cf688944ea716c2fe3e080c8a9..8dce9c0825fa7e0373edd3d6981512b4d0741fc5 100644
 --- a/apps/desktop/electron/remote-lifecycle.ts
 +++ b/apps/desktop/electron/remote-lifecycle.ts
-@@ -1549,6 +1549,163 @@ async function openForward(deps, remotePort, attempts = 3) {
+@@ -1541,6 +1541,163 @@ async function openForward(deps, remotePort, attempts = 3) {
    throw lastError
  }
  
@@ -545,7 +373,7 @@ index c96e27f466..4f657b54dd 100644
  /**
   * Establish (or reuse) a remote dashboard and a tunnel to it. `deps` injects the
   * opened SshConnection, forward/pickLocalPort/waitForHermes, a token-gated
-@@ -1631,6 +1788,15 @@ async function connect(deps) {
+@@ -1622,6 +1779,15 @@ async function connect(deps) {
      log(`remote hermes version: ${hermesVersion}`)
    }
  
@@ -561,7 +389,7 @@ index c96e27f466..4f657b54dd 100644
    const reuseToken = deps.reuseToken || ''
    const lock = await readLockfile(ssh, ownershipId)
  
-@@ -1895,11 +2061,14 @@ async function connect(deps) {
+@@ -1885,11 +2051,14 @@ async function connect(deps) {
  
  export {
    adoptOwnedServedToken,
@@ -576,7 +404,7 @@ index c96e27f466..4f657b54dd 100644
    connectReservationPath,
    DEFAULT_READY_TIMEOUT_MS,
    disconnect,
-@@ -1921,6 +2090,7 @@ export {
+@@ -1911,6 +2080,7 @@ export {
    probeRemoteHermesHome,
    probeRemotePlatform,
    PROTOCOL_VERSION,
@@ -585,7 +413,7 @@ index c96e27f466..4f657b54dd 100644
    readRemoteInstallId,
    READY_RE,
 diff --git a/apps/desktop/electron/remote-liveness.ts b/apps/desktop/electron/remote-liveness.ts
-index ba1fe1e1da..9f3976c92c 100644
+index aea14f2f0e3f7a27807375fa6afd50225593fd5e..5a92fad4d1befdc46641848a138d9773936f3cdf 100644
 --- a/apps/desktop/electron/remote-liveness.ts
 +++ b/apps/desktop/electron/remote-liveness.ts
 @@ -22,6 +22,40 @@ export const REMOTE_LIVENESS_FAILURE_WINDOW_MS = 60_000
@@ -690,7 +518,7 @@ index ba1fe1e1da..9f3976c92c 100644
    }
 diff --git a/apps/desktop/electron/remote-prewarm.ts b/apps/desktop/electron/remote-prewarm.ts
 new file mode 100644
-index 0000000000..537bf30685
+index 0000000000000000000000000000000000000000..537bf30685b98c6de00011fc33077855bf3288f6
 --- /dev/null
 +++ b/apps/desktop/electron/remote-prewarm.ts
 @@ -0,0 +1,131 @@
@@ -827,7 +655,7 @@ index 0000000000..537bf30685
 +}
 diff --git a/apps/desktop/electron/remote-warm-dispatch.test.ts b/apps/desktop/electron/remote-warm-dispatch.test.ts
 new file mode 100644
-index 0000000000..1909f78bfd
+index 0000000000000000000000000000000000000000..1909f78bfd6d561b55c2bf0a67c5f3398aa65091
 --- /dev/null
 +++ b/apps/desktop/electron/remote-warm-dispatch.test.ts
 @@ -0,0 +1,192 @@
@@ -1024,7 +852,7 @@ index 0000000000..1909f78bfd
 +  })
 +})
 diff --git a/apps/desktop/electron/ssh-connection.ts b/apps/desktop/electron/ssh-connection.ts
-index f758908f57..2b60caced6 100644
+index f758908f576e5be3f00a18918375cb144c8c7e6d..2b60caced66dbbb8b441e89a1bb9a993eabd871e 100644
 --- a/apps/desktop/electron/ssh-connection.ts
 +++ b/apps/desktop/electron/ssh-connection.ts
 @@ -57,7 +57,8 @@ const REMOTE_PROBE_TIMEOUT_SECS = 15
@@ -1039,7 +867,7 @@ index f758908f57..2b60caced6 100644
  // eslint-disable-next-line no-control-regex -- deliberately reject control chars in ssh targets
 diff --git a/hermes_cli/always_on_dashboard.py b/hermes_cli/always_on_dashboard.py
 new file mode 100644
-index 0000000000..a18719177c
+index 0000000000000000000000000000000000000000..a18719177ca2ea333699aa6569134af5d7ac13e0
 --- /dev/null
 +++ b/hermes_cli/always_on_dashboard.py
 @@ -0,0 +1,321 @@
@@ -1365,10 +1193,10 @@ index 0000000000..a18719177c
 +            action.add_argument("--hermes", default="", help="Absolute path of the hermes entry point to exec")
 +        action.set_defaults(func=func)
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index 0fba5f9cb2..5e32accabd 100644
+index e4359e0fde7bc4fd9072d3004189b08121561058..fcb2cc2e6183b48ab8a10e3d37daf7e2b11e322b 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
-@@ -3437,6 +3437,8 @@ def _build_cli_parser():
+@@ -3334,6 +3334,8 @@ def _build_cli_parser():
      build_auth_parser(subparsers, cmd_auth=cmd_auth)
      build_status_parser(subparsers, cmd_status=cmd_status)
      build_pause_parser(subparsers)
@@ -1378,10 +1206,10 @@ index 0fba5f9cb2..5e32accabd 100644
      build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
  
 diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
-index a83bb8a271..505c9cf583 100644
+index 22d7960d4779769431c035f94d338c5ac648dbc7..517b8c79fef65025b48a842cb5270ed5d1b27744 100644
 --- a/hermes_cli/web_server.py
 +++ b/hermes_cli/web_server.py
-@@ -1428,6 +1428,29 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
+@@ -1206,6 +1206,29 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
      hr.cleanup_on_exit(role)
  
  
@@ -1411,7 +1239,7 @@ index a83bb8a271..505c9cf583 100644
  def _on_server_started(
      server,
      *,
-@@ -1470,13 +1493,7 @@ def _on_server_started(
+@@ -1248,13 +1271,7 @@ def _on_server_started(
      _start_parent_death_watchdog()
      # SSH-isolated backends are detached from any parent on purpose (#91668); their liveness signal
      # is "does a client still hold a WebSocket" (#101626).
@@ -1428,7 +1256,7 @@ index a83bb8a271..505c9cf583 100644
          # client holds its token and owner nonce, #91668/#101626; Desktop-owned local serve:
 diff --git a/tests/hermes_cli/test_always_on_dashboard.py b/tests/hermes_cli/test_always_on_dashboard.py
 new file mode 100644
-index 0000000000..93d32882c0
+index 0000000000000000000000000000000000000000..93d32882c0d40383cdd4fb4146ee31e09a1b0baf
 --- /dev/null
 +++ b/tests/hermes_cli/test_always_on_dashboard.py
 @@ -0,0 +1,132 @@

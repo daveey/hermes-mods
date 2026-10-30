@@ -17,6 +17,7 @@ import contextlib
 import importlib.util
 import logging
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -681,12 +682,91 @@ def file_card(title: str, body: str, key: str) -> str:
         assignee = (load_config_readonly().get("kanban") or {}).get("orchestrator_profile") or "default"
     except Exception:
         pass
-    text = (f"{body}\n\nchat-closeout watchdog incident `{key}`.\n\nFix: open the chat (resume it) and run its "
-            "close-out turn, or find why the close-out waker / unseen-result sweeper did not deliver to it "
-            "(gui.log, errors.log). Complete this card once the chat has reported its cards' results.")
+    text = (f"{body}\n\nchat-closeout watchdog incident `{key}`.\n\nFix: use cross_session send into the chat "
+            "from a Desktop-connected gateway, or the close-out waker, to run its close-out turn. "
+            "Inspect why the close-out waker / unseen-result sweeper did not deliver (gui.log, errors.log). "
+            "This is agent work: do not block on the user to resume a chat. Complete this card once the "
+            "chat has reported its cards' results; the watchdog also closes it when its condition clears.")
     with connect_closing() as conn:
+        # Core create_task deduplicates even DONE rows. Preserve their incident key
+        # in an archival namespace so a genuinely cleared/recurrent signature can file anew.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET idempotency_key=idempotency_key || ':resolved:' || id "
+                         "WHERE idempotency_key=? AND created_by='chat-closeout' "
+                         "AND status IN ('done','archived')", (key,))
         return kb.create_task(conn, title=f"chat-closeout: {title}"[:200], body=text, assignee=assignee,
                               created_by="chat-closeout", idempotency_key=key)
+
+
+_WATCHDOG_KEY = re.compile(r"^chat-closeout:(?:unseen|no-closeout|ask-failed):[^:]+:[^:]+$"
+                           r"|^chat-closeout:handoff:[^:]+$")
+
+
+def _cleared_evidence(key: str, unseen: dict[str, int], led) -> str:
+    parts = key.split(":")
+    if parts[1] == "unseen":
+        return (f"unseen count 0 for {parts[2]}" if unseen.get(parts[2], 0) == 0
+                else f"unseen episode {parts[3]} ended; a different episode is now observed")
+    if parts[1] == "no-closeout":
+        row = led.get(parts[2]) or {}
+        if row.get("done_sig") == parts[3]:
+            return f"done_sig matched {parts[3]}; done_at={row.get('done_at')}"
+        return f"batch moved on; settled_sig={row.get('settled_sig')!r}, batch={row.get('batch')!r}"
+    if parts[1] == "handoff":
+        conn = routing._conn(led)
+        try:
+            row = conn.execute('SELECT receipt FROM handoffs WHERE id=?', (parts[2],)).fetchone()
+            return f"delivery receipt for {parts[2]}: {row[0]}" if row else f"handoff row {parts[2]} absent"
+        finally:
+            conn.close()
+    return f"ask relay failure_since changed for {parts[2]}"
+
+
+def resolve_card(key: str, resolution: dict) -> bool:
+    """Close only this watchdog's own incident; never take over an active worker.
+
+    Claim ready/review cards by CAS before completing, so even a dispatcher claim
+    whose worker PID has not yet been published cannot be closed underneath it.
+    A failed resolution resumes only its own named claim on the next tick.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    summary = (f"Watchdog incident `{key}` cleared (first observed at Unix {resolution['at']}); "
+               f"evidence: {resolution['evidence']}.")
+    with connect_closing() as conn:
+        row = conn.execute("SELECT id, status FROM tasks WHERE idempotency_key=? "
+                           "AND created_by='chat-closeout' ORDER BY created_at DESC, id DESC LIMIT 1",
+                           (key,)).fetchone()
+        if row is None:
+            return False  # unavailable/deleted card is not proof of a successful close
+        tid, status = row['id'], row['status']
+        if status in core.DONE_STATUSES:
+            return True
+        run_id = kb.live_run_id(conn, tid)
+        task = kb.get_task(conn, tid)
+        own_claim = task.claim_lock == 'chat-closeout:resolution'
+        if run_id is not None and not own_claim:
+            note = summary + " A run is live; leaving it untouched and retrying on the next watchdog tick."
+            # add_comment's nested savepoint keeps check + insert atomic across backends.
+            with kb.write_txn(conn):
+                if not conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND author=? AND body=?",
+                                    (tid, 'chat-closeout', note)).fetchone():
+                    kb.add_comment(conn, tid, 'chat-closeout', note)
+            return False
+        if status in ('blocked', 'scheduled', 'triage'):
+            if not kb.unblock_task(conn, tid):
+                return False
+        if not own_claim:
+            task = kb.get_task(conn, tid)
+            claim = kb.claim_review_task if task.status == 'review' else kb.claim_task
+            claimed = claim(conn, tid, claimer='chat-closeout:resolution')
+            if claimed is None:
+                return False  # dispatcher won; never close its newly admitted run
+            run_id = claimed.current_run_id
+        return kb.complete_task(conn, tid, summary=summary, expected_run_id=run_id,
+                                metadata={'watchdog_key': key, 'cleared_at': resolution['at'],
+                                          'evidence': resolution['evidence']})
 
 
 def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
@@ -710,22 +790,31 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
         return []
     seen_mono: dict[str, float] = _state.setdefault("mono_seen", {})
     candidates: list[tuple[str, str, str]] = []
+    observed: set[str] = set()  # detection predicates, before sleep-safe age gates
+    uncertain: set[str] = set()
+    flagged = set(led.flags())
     for sid, since in led.unseen_since({s: n for s, n in unseen.items() if n > 0}, now).items():
         key = f"chat-closeout:unseen:{sid}:{int(since)}"
+        observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - since < core.STALE_S or mono - first < core.STALE_S:
             continue
         msg = (f"Chat {sid} has had {unseen[sid]} kanban result(s) nobody handed to it for "
                f"{int((now - since) / 60)} min.")
-        candidates.append((key, f"Kanban results stuck for chat {sid}", msg + " Open the chat (or check the "
-                           "unloaded-session sweeper in gui.log) so the notices land."))
+        candidates.append((key, f"Kanban results stuck for chat {sid}", msg + " Check the "
+                           "unloaded-session sweeper in gui.log and deliver the notices via an agent route."))
     for row in led.pending():
         sig, at = row.get("settled_sig"), row.get("settled_at")
         if not sig or not at or sig == row.get("done_sig"):
             continue
-        if row.get("closing") is None and core.closeout_key(row, read(row["batch"])) != sig:
-            continue  # reported since, or the batch moved on (a woken turn still in flight stays watched)
         key = f"chat-closeout:no-closeout:{row['session_id']}:{sig}"
+        cards = read(row["batch"])
+        if any(core.is_unknown(cards.get(t)) for t in row['batch']):
+            uncertain.add(key)
+            continue  # a failed inventory read cannot prove the incident cleared
+        if row.get("closing") is None and core.closeout_key(row, cards) != sig:
+            continue  # reported since, or the batch moved on (a woken turn still in flight stays watched)
+        observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - float(at) < core.STALE_S or mono - first < core.STALE_S:
             continue
@@ -741,6 +830,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
         if not sig:
             continue
         key = f"chat-closeout:ask-failed:{row['session_id']}:{int(since)}"
+        observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - since >= core.STALE_S and mono - first >= core.STALE_S:
             candidates.append((key, f"Ask relay stuck for chat {row['session_id']}",
@@ -748,6 +838,7 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                                f"{int((now-since)/60)} min (last result: {row.get('wake_result')})."))
     for handoff in routing.stalled(led, now, 0):
         key = f"chat-closeout:handoff:{handoff['id']}"
+        observed.add(key)
         first = seen_mono.setdefault(key, mono)
         if now - handoff['created_at'] < core.STALE_S or mono - first < core.STALE_S:
             continue
@@ -755,12 +846,23 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                            f"Courier request {handoff['id']} for chat {handoff['session_id']} has no "
                            "successful delivery receipt. Inspect the target before retrying; do not resend "
                            "an uncertain send automatically."))
-    live = {k for k, _, _ in candidates}
     failures: dict[str, int] = _state.setdefault("post_failures", {})
-    for k in [k for k in seen_mono if k not in live]:
-        if not _still_observed(k, unseen, led):
-            seen_mono.pop(k, None)
-            failures.pop(k, None)
+    for k in [k for k in seen_mono if k not in observed]:
+        seen_mono.pop(k, None)
+        failures.pop(k, None)
+    for key in flagged:
+        if key in uncertain or not _WATCHDOG_KEY.match(key):
+            continue  # only this watchdog's own well-formed incidents are reconciled
+        if key in observed:
+            led.reset_resolution(key)
+            continue
+        try:
+            resolution = led.resolution(key, now, _cleared_evidence(key, unseen, led))
+            if resolve_card(key, resolution):
+                led.clear_flag(key)
+        except Exception:
+            logger.warning("chat-closeout: resolving watchdog incident %s failed; retrying next tick", key,
+                           exc_info=True)
     candidates = [c for c in candidates if not led.has_flag(c[0]) and failures.get(c[0], 0) < MAX_POST_ATTEMPTS]
     if not candidates or (not force and not led.lease("watchdog", core.WATCHDOG_EVERY_S, now)):
         return []
@@ -782,22 +884,6 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
         led.flag_once(key, now)
         raised.append(key)
     return raised
-
-
-def _still_observed(key: str, unseen: dict[str, int], led) -> bool:
-    """Whether a remembered watchdog condition still holds (else its monotonic first-seen is forgotten)."""
-    parts = key.split(":")
-    if len(parts) >= 3 and parts[1] == "unseen":
-        return unseen.get(parts[2], 0) > 0
-    if len(parts) >= 3 and parts[1] == "handoff":
-        return any(r['id'] == parts[2] for r in routing.stalled(led, time.time(), 0))
-    if len(parts) >= 4 and parts[1] == "ask-failed":
-        row = led.get(parts[2]) or {}
-        return row.get("failure_since") is not None and int(row["failure_since"]) == int(parts[3])
-    if len(parts) >= 4 and parts[1] == "no-closeout":
-        row = led.get(parts[2]) or {}
-        return row.get("settled_sig") == parts[3] and row.get("done_sig") != parts[3]
-    return False
 
 
 def _loop(stop: threading.Event) -> None:

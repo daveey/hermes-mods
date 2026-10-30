@@ -1,0 +1,366 @@
+From e67b22c64347fab5ab173decceebad99f94ca38b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:13:20 +0000
+Subject: [PATCH] test(kanban,cli): port class-routing tests onto the
+ owner/gateway turn path [daveey]
+
+Upstream moved card execution to the profile owner (worker argv is just
+-m hermes_cli.kanban_worker_client) and builds every CLI turn's agent in the
+gateway (cli._init_agent is a GatewayAgent proxy; _prepare_deferred_agent_startup
+removed in 4b6a8edd6a4). The fork's class-tier, deep review/retry, provider-auto,
+native-wire and paid-entry-fails-closed assertions now read owner_model_pin and
+build through tui_gateway _make_agent, where the agent is actually constructed.
+---
+ tests/hermes_cli/test_cli_class_routing.py    | 45 ++++++----
+ tests/hermes_cli/test_kanban_class_routing.py | 90 ++++++++++---------
+ .../test_kanban_class_unroutable.py           | 19 ++--
+ tests/hermes_cli/test_managed_entry.py        | 47 +++++-----
+ 4 files changed, 111 insertions(+), 90 deletions(-)
+
+diff --git a/tests/hermes_cli/test_cli_class_routing.py b/tests/hermes_cli/test_cli_class_routing.py
+index d6b6eafae19..18ca33a68cc 100644
+--- a/tests/hermes_cli/test_cli_class_routing.py
++++ b/tests/hermes_cli/test_cli_class_routing.py
+@@ -51,7 +51,7 @@ def test_cli_empty_class_never_uses_legacy_fallback(routing_home, streaming_rout
+     s._resolve_fallback_runtime.assert_not_called()
+ 
+ 
+-def test_cli_real_construction_request_and_database_resume(routing_home, streaming_route, tmp_path):
++def test_cli_real_construction_request_and_database_resume(routing_home, streaming_route, tmp_path, monkeypatch):
+     import json
+     import anthropic
+     import httpx
+@@ -82,22 +82,35 @@ def test_cli_real_construction_request_and_database_resume(routing_home, streami
+         return sdk_class(**kwargs)
+ 
+     db = SessionDB(tmp_path / "cli-test.db")
+-    with patch("cli._prepare_deferred_agent_startup"), \
+-         patch("agent.title_generator._auto_title_enabled", return_value=False), \
+-         patch("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"), \
++    # Fork: upstream's cutover builds the turn's agent in the gateway, not the CLI (cli._init_agent now
++    # constructs a GatewayAgent proxy; cli._prepare_deferred_agent_startup is gone, 4b6a8edd6a4). The CLI
++    # sends its launch model to session.create (_gateway_launch) and the gateway's _make_agent builds the
++    # AIAgent, so construction/request/resume is asserted on that path; the CLI-side route signature and
++    # session-model restore stay on the CLI.
++    from hermes_cli.cli_agent_setup_mixin import _current_runtime, _route_signature
++    from hermes_cli.cli_init_mixin import _gateway_launch
++    from hermes_cli.config import load_config
++    from tui_gateway import server
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", load_config)
++    monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
++    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda platform: [])
++    monkeypatch.setattr(server, "_startup_system_prompt", lambda *a: "")
++    with patch("agent.title_generator._auto_title_enabled", return_value=False), \
+          patch("model_tools.get_tool_definitions", return_value=[]), \
+          patch("anthropic.Anthropic", side_effect=sdk):
+         s = cli.HermesCLI(model="class:deep", provider="auto", compact=True)
+         s.session_id = "cli-real"
+-        s._session_db = db
+-        s._install_tool_callbacks = lambda: None
+-        s.streaming_enabled = False
+-        s.ignore_rules = True
+-        assert s._init_agent()
+-        assert s.agent.model_routing["requested_class"] == "deep"
++        assert s._ensure_runtime_credentials()
++        launch = _gateway_launch(s)
++        assert launch["model"] == "class:deep" and launch["provider"] is None  # auto: the class picks it
++        agent = server._make_agent("cli-ui", s.session_id, session_db=db, model_override=launch["model"],
++                                   provider_override=launch["provider"])
++        assert agent.model_routing["requested_class"] == "deep"
++        # A class route does not rebuild the agent every turn: the turn's signature is the build's.
+         signature = s._resolve_turn_agent_config("next")["signature"]
+-        assert signature == s._active_agent_route_signature
+-        result = s.agent.run_conversation("Say ok")
++        assert signature == _route_signature(s.model, _current_runtime(s))
++        result = agent.run_conversation("Say ok")
+         assert result["final_response"] == "ok"
+         stored = db.get_session(s.session_id)
+         restored = shell()
+@@ -106,13 +119,13 @@ def test_cli_real_construction_request_and_database_resume(routing_home, streami
+         CLIModelSwitchMixin._restore_session_model(restored, stored, quiet=True)
+         assert restored.model == "class:deep"
+         assert restored.requested_provider == "auto"
+-        s.agent.switch_model(s.agent.model, s.agent.provider, api_key=s.agent.api_key,
+-                             base_url=s.agent.base_url, api_mode=s.agent.api_mode)
++        agent.switch_model(agent.model, agent.provider, api_key=agent.api_key,
++                           base_url=agent.base_url, api_mode=agent.api_mode)
+         config = db.get_session(s.session_id)["model_config"]
+         config = json.loads(config) if isinstance(config, str) else config
+         assert not config.get("model_routing")
+-        assert not s.agent._session_init_model_config.get("model_routing")
+-        s.agent.release_clients()
++        assert not agent._session_init_model_config.get("model_routing")
++        agent.release_clients()
+     db.close()
+     assert sent
+     assert all(body["model"] == "anthropic-deep" for _, _, body in sent)
+diff --git a/tests/hermes_cli/test_kanban_class_routing.py b/tests/hermes_cli/test_kanban_class_routing.py
+index 6145fc47dfb..29b80fb87ba 100644
+--- a/tests/hermes_cli/test_kanban_class_routing.py
++++ b/tests/hermes_cli/test_kanban_class_routing.py
+@@ -1,4 +1,11 @@
+-"""Class-tier dispatch must retain deep review/retry and native worker credentials."""
++"""Class-tier dispatch must retain deep review/retry and native worker credentials.
++
++Fork: upstream moved card execution to the profile owner. The dispatcher's worker is now
++``-m hermes_cli.kanban_worker_client`` (no ``-m <model> --provider <p>`` argv); the owner re-reads the
++card and builds the turn's policy from ``kanban_model_tier.owner_model_pin`` (gateway.session_kanban),
++then the gateway builds the agent (``tui_gateway`` ``_make_agent``). These tests assert the same intent
++(class tiers, deep review/retry, provider ``auto``, native subscription wire) on that path.
++"""
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -24,10 +31,25 @@ def routable(monkeypatch):
+     monkeypatch.setattr(tier, "class_unroutable_reason", lambda model, config=None: None)
+ 
+ 
+-def worker_args(task, monkeypatch):
+-    monkeypatch.setattr(dispatch, "_resolve_hermes_argv", lambda: ["hermes"])
+-    monkeypatch.setattr(dispatch, "_resolve_worker_cli_toolsets", lambda home: None)
+-    return dispatch._worker_argv(task, "default", None)
++def owner_pin(task, conn=None):
++    """``(model, provider)`` the profile owner runs *task* with (formerly the worker argv's -m/--provider)."""
++    if conn is not None:
++        return tier.owner_model_pin(conn, task)
++    with kbc.connect_closing() as own:
++        return tier.owner_model_pin(own, task)
++
++
++def gateway_agent(monkeypatch, model, provider):
++    """Build the agent the gateway runs the owner's turn on, from the pinned ``(model, provider)``."""
++    from hermes_cli.config import load_config
++    from tui_gateway import server
++    monkeypatch.setattr(server, "_load_cfg", load_config)
++    monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
++    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda platform: [])
++    monkeypatch.setattr(server, "_startup_system_prompt", lambda *a: "")
++    monkeypatch.setattr(server, "_get_db", lambda: None)
++    return server._make_agent("kanban-ui", "kanban-worker-session", model_override=model,
++                              provider_override=provider)
+ 
+ 
+ @pytest.mark.parametrize("case", ["review", "skill", "failure", "pattern", "routine"])
+@@ -45,9 +67,9 @@ def test_class_tiers_keep_strong_work_deep(board, routable, monkeypatch, case):
+             task.skills = ["sdlc-review"]
+         tier.apply_model_tier(conn, task, lane="review" if case == "review" else "ready", cfg=cfg)
+         assert kb.get_task(conn, tid).model_override is None
+-    argv = worker_args(task, monkeypatch)
+-    assert argv[argv.index("-m") + 1] == ("class:standard" if case == "routine" else "class:deep")
+-    assert argv[argv.index("--provider") + 1] == "auto"
++        model, provider = owner_pin(task, conn)
++    assert model == ("class:standard" if case == "routine" else "class:deep")
++    assert provider == "auto"
+ 
+ 
+ def test_dispatch_tick_reads_class_default_and_keeps_review_deep(board, routable, monkeypatch):
+@@ -59,14 +81,13 @@ def test_dispatch_tick_reads_class_default_and_keeps_review_deep(board, routable
+         review = kb.create_task(conn, title="review", assignee="default")
+         kb.claim_task(conn, review)
+         kb.request_review(conn, review, summary="ready")
+-        dispatch.dispatch_once(conn, dry_run=False,
+-                               spawn_fn=lambda task, workspace: seen.update({task.id: worker_args(task, monkeypatch)}))
++        dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda task, workspace: seen.update({task.id: task}))
+         assert kb.get_task(conn, routine).model_override is None
+         assert kb.get_task(conn, review).model_override is None
++        # The owner re-reads the card from the board (not the dispatcher's in-memory task).
++        pins = {tid: owner_pin(kb.get_task(conn, tid), conn) for tid in seen}
+     for tid, model in ((routine, "class:standard"), (review, "class:deep")):
+-        argv = seen[tid]
+-        assert argv[argv.index("-m") + 1] == model
+-        assert argv[argv.index("--provider") + 1] == "auto"
++        assert pins[tid] == (model, "auto")
+ 
+ 
+ def test_explicit_pin_survives_review_class_default(board, monkeypatch):
+@@ -74,51 +95,40 @@ def test_explicit_pin_survives_review_class_default(board, monkeypatch):
+         task = kb.get_task(conn, kb.create_task(conn, title="review", assignee="default",
+                             model_override="unknown-exact-model", provider_override="custom"))
+         tier.apply_model_tier(conn, task, lane="review", cfg={"default_model": "class:standard"})
+-    argv = worker_args(task, monkeypatch)
+-    assert argv[argv.index("-m") + 1] == "unknown-exact-model"
+-    assert argv[argv.index("--provider") + 1] == "custom"
++        assert owner_pin(task, conn) == ("unknown-exact-model", "custom")
+ 
+ 
+ def test_invalid_class_provider_refused_before_launch(board, monkeypatch):
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
+-    task.model_override, task.provider_override = "class:deep", "openrouter"
+-    with pytest.raises(ValueError, match="auto"):
+-        worker_args(task, monkeypatch)
++        task.model_override, task.provider_override = "class:deep", "openrouter"
++        with pytest.raises(ValueError, match="auto"):
++            owner_pin(task, conn)
+ 
+ 
+ @pytest.mark.parametrize("exhausted", [False, True])
+ def test_worker_generated_args_reach_native_wire(routing_home, streaming_route, native_transport,
+                                                 monkeypatch, tmp_path, exhausted):
+     from types import SimpleNamespace
+-    from hermes_state import SessionDB
+-    task = SimpleNamespace(id="card", skills=[], reasoning_effort=None,
++    from agent.model_routing import ModelRoutingError
++    monkeypatch.chdir(tmp_path)
++    task = SimpleNamespace(id="card", skills=[], reasoning_effort=None, current_run_id=None,
+                            model_override="class:deep", provider_override=None)
+-    argv = worker_args(task, monkeypatch)
+-    model = argv[argv.index("-m") + 1]
+-    provider = argv[argv.index("--provider") + 1]
++    model, provider = owner_pin(task)
++    assert (model, provider) == ("class:deep", "auto")
+     if exhausted:
+         monkeypatch.setattr("agent.credential_pool.CredentialPool.has_available", lambda *a, **k: False)
+-    db = SessionDB(tmp_path / "worker.db")
+-    with patch("cli._prepare_deferred_agent_startup"), \
+-         patch("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"), \
+-         patch("model_tools.get_tool_definitions", return_value=[]):
+-        shell = cli.HermesCLI(model=model, provider=provider, compact=True)
+-        shell.session_id = "kanban-worker-session"
+-        shell._session_db = db
+-        shell._install_tool_callbacks = lambda: None
+-        shell.streaming_enabled = False
+-        shell.ignore_rules = True
++    with patch("model_tools.get_tool_definitions", return_value=[]):
+         if exhausted:
+-            assert not shell._init_agent()
++            with pytest.raises(ModelRoutingError):
++                gateway_agent(monkeypatch, model, provider)
+             assert native_transport == []
+         else:
+-            assert shell._init_agent()
+-            assert shell.agent.run_conversation("Say ok")["final_response"] == "ok"
+-            assert shell.agent.model_routing["requested_class"] == "deep"
++            agent = gateway_agent(monkeypatch, model, provider)
++            assert agent.run_conversation("Say ok")["final_response"] == "ok"
++            assert agent.model_routing["requested_class"] == "deep"
+             assert native_transport
+             assert all(body["model"] == "anthropic-deep" and url.startswith("https://api.anthropic.com/")
+                        and headers.get("authorization", "").startswith("Bearer sk-ant-oat")
+                        and "x-api-key" not in headers for url, headers, body in native_transport)
+-            shell.agent.release_clients()
+-    db.close()
++            agent.release_clients()
+diff --git a/tests/hermes_cli/test_kanban_class_unroutable.py b/tests/hermes_cli/test_kanban_class_unroutable.py
+index c0726e17021..47ac7981a48 100644
+--- a/tests/hermes_cli/test_kanban_class_unroutable.py
++++ b/tests/hermes_cli/test_kanban_class_unroutable.py
+@@ -35,14 +35,16 @@ def _write(home, routing, providers=None):
+ 
+ 
+ def _tick(monkeypatch):
+-    """One dispatch tick: {task_id: worker argv} as the spawn fn saw them."""
+-    monkeypatch.setattr(dispatch, "_resolve_hermes_argv", lambda: ["hermes"])
+-    monkeypatch.setattr(dispatch, "_resolve_worker_cli_toolsets", lambda home: None)
++    """One dispatch tick: {task_id: (in-memory override, (model, provider) the owner runs)}.
++
++    Fork: upstream moved card execution to the profile owner (the worker argv is now just
++    ``-m hermes_cli.kanban_worker_client``), so the model the worker runs is the owner's
++    ``owner_model_pin`` of the re-read card, not ``-m``/``--provider`` in the argv."""
+     seen = {}
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="routine", assignee="default")
+         dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda task, ws: seen.update(
+-            {task.id: (task.model_override, dispatch._worker_argv(task, "default", None))}))
++            {task.id: (task.model_override, tier.owner_model_pin(conn, kb.get_task(conn, task.id)))}))
+         events = [e.payload for e in kb.list_events(conn, tid) if e.kind == "model_tier"]
+     return seen[tid], events
+ 
+@@ -55,19 +57,18 @@ def _tick(monkeypatch):
+ ])
+ def test_unroutable_class_tier_keeps_profile_model(board, monkeypatch, routing, providers, why):
+     _write(board, routing, providers)
+-    (override, argv), events = _tick(monkeypatch)
++    (override, pin), events = _tick(monkeypatch)
+     assert override is None
+-    assert "class:standard" not in argv  # the worker runs on its profile's model, not a dead class
++    assert pin == (None, None)  # the worker runs on its profile's model, not a dead class
+     assert events[-1]["reason"] == f"default+unroutable:class:standard:{why}"
+     assert events[-1]["model"] is None
+ 
+ 
+ def test_routable_class_tier_is_kept(board, monkeypatch):
+     _write(board, {"enabled": True, "routes": {"standard": [ROUTE]}})
+-    (override, argv), events = _tick(monkeypatch)
++    (override, pin), events = _tick(monkeypatch)
+     assert override == "class:standard"
+-    assert argv[argv.index("-m") + 1] == "class:standard"
+-    assert argv[argv.index("--provider") + 1] == "auto"
++    assert pin == ("class:standard", "auto")
+     assert events[-1]["reason"] == "default"
+ 
+ 
+diff --git a/tests/hermes_cli/test_managed_entry.py b/tests/hermes_cli/test_managed_entry.py
+index d99a368817f..decaeb10e63 100644
+--- a/tests/hermes_cli/test_managed_entry.py
++++ b/tests/hermes_cli/test_managed_entry.py
+@@ -1,4 +1,10 @@
+-"""Concrete paid CLI settings and generated Kanban worker argv fail closed."""
++"""Concrete paid CLI settings and generated Kanban worker argv fail closed.
++
++Fork: upstream's cutover runs every CLI and Kanban turn in the gateway. The CLI hands its launch model to
++``session.create`` (``cli_init_mixin._gateway_launch``) and the Kanban worker is
++``-m hermes_cli.kanban_worker_client`` whose profile owner runs the card's ``owner_model_pin``; both reach
++the gateway's ``_make_agent``. So "rejected before send" is asserted where the agent is now built.
++"""
+ from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+@@ -6,9 +12,9 @@ import cli
+ import pytest
+ 
+ from agent.model_routing import ModelRoutingError
+-from hermes_state import SessionDB
++from hermes_cli.cli_init_mixin import _gateway_launch
+ from tests.agent import test_managed_subscription as fixtures
+-from tests.hermes_cli.test_kanban_class_routing import worker_args
++from tests.hermes_cli.test_kanban_class_routing import gateway_agent, owner_pin
+ 
+ managed = fixtures.managed
+ routing_home = fixtures.routing_home
+@@ -17,28 +23,19 @@ streaming_route = fixtures.streaming_route
+ 
+ @pytest.mark.parametrize('surface', ['cli', 'kanban'])
+ def test_paid_entry_rejected_before_send(managed, tmp_path, monkeypatch, surface):
++    monkeypatch.chdir(tmp_path)
+     model, provider = 'vendor/paid', 'openrouter'
+     if surface == 'kanban':
+-        task = SimpleNamespace(id='stale-card', skills=[], reasoning_effort=None,
++        task = SimpleNamespace(id='stale-card', skills=[], reasoning_effort=None, current_run_id=None,
+                                model_override=model, provider_override=provider)
+-        argv = worker_args(task, monkeypatch)
+-        model, provider = argv[argv.index('-m') + 1], argv[argv.index('--provider') + 1]
+-    db = SessionDB(tmp_path / 'worker.db')
+-    try:
+-        with patch('cli._prepare_deferred_agent_startup'), \
+-             patch('hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build'), \
+-             patch('model_tools.get_tool_definitions', return_value=[]), \
+-             patch('httpx.Client.send') as send:
+-            try:
+-                shell = cli.HermesCLI(model=model, provider=provider, compact=True)
+-                shell.session_id = 'managed-' + surface
+-                shell._session_db = db
+-                shell._install_tool_callbacks = lambda: None
+-                shell.streaming_enabled = False
+-                shell.ignore_rules = True
+-                assert not shell._init_agent()
+-            except ModelRoutingError:
+-                pass
+-            send.assert_not_called()
+-    finally:
+-        db.close()
++        model, provider = owner_pin(task)
++    else:
++        shell = cli.HermesCLI(model=model, provider=provider, compact=True)
++        launch = _gateway_launch(shell)
++        model, provider = launch['model'], launch['provider']
++    assert (model, provider) == ('vendor/paid', 'openrouter')
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('httpx.Client.send') as send:
++        with pytest.raises(ModelRoutingError):
++            gateway_agent(monkeypatch, model, provider)
++        send.assert_not_called()
+-- 
+2.55.0
+

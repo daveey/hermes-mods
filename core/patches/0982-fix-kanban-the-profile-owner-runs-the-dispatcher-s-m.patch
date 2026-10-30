@@ -1,0 +1,178 @@
+From e6376c838d651e3611d7edc896de89ff213227c8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:50:51 +0000
+Subject: [PATCH] fix(kanban): the profile owner runs the dispatcher's model
+ tier pin [daveey]
+
+Upstream moved card execution to the profile owner (workers are -m hermes_cli.kanban_worker_client
+and the owner re-reads the card), so the fork's tier pin, set on the in-memory claimed task and
+recorded as the run's model_tier event, no longer reached the turn; nor did the class-selector
+rule (provider auto). owner_model_pin() reads this run's model_tier event (else the row's
+overrides) and applies worker_model_args' class rule; build_kanban_policy uses it.
+---
+ gateway/session_kanban.py                    |  5 +++-
+ hermes_cli/kanban_model_tier.py              | 25 ++++++++++++++++++++
+ tests/hermes_cli/test_kanban_model_tier.py   | 24 +++++++++++++------
+ tests/hermes_cli/test_kanban_pin_provider.py | 18 ++++----------
+ tests/plugins/test_kanban_model_override.py  |  9 +++++++
+ 5 files changed, 60 insertions(+), 21 deletions(-)
+
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 711fb7a06a3..224184c0bf0 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -42,6 +42,9 @@ def build_kanban_policy(connection, params, config):
+             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
+                 raise RuntimeStoreError('stale_kanban_claim')
+             context = kb.build_worker_context(conn, task.id)
++            # [daveey] The dispatcher's model tier for this run (in-memory pin + model_tier event), class → auto.
++            from hermes_cli.kanban_model_tier import owner_model_pin
++            pinned_model, pinned_provider = owner_model_pin(conn, task)
+             skills = list(task.skills or ())
+             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
+                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
+@@ -50,7 +53,7 @@ def build_kanban_policy(connection, params, config):
+         raise RuntimeStoreError('invalid_kanban_claim') from exc
+     cwd = task.workspace_path
+     params_policy = {'source': 'cli', 'cwd': cwd}
+-    for name, value in (('model', task.model_override), ('provider', task.provider_override), ('reasoning', task.reasoning_effort)):
++    for name, value in (('model', pinned_model), ('provider', pinned_provider), ('reasoning', task.reasoning_effort)):
+         if value:
+             params_policy[name] = value
+     private = {}
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 342a38894d6..9790e32355f 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -192,6 +192,31 @@ def worker_model_args(model: str, provider: Optional[str]) -> list[str]:
+     return args
+ 
+ 
++def owner_model_pin(conn: sqlite3.Connection, task: Any) -> tuple[Optional[str], Optional[str]]:
++    """``(model, provider)`` the profile owner runs *task*'s current run with. [daveey]
++
++    Workers are ``-m hermes_cli.kanban_worker_client`` (upstream) and the owner re-reads the card, so the
++    dispatcher's in-memory tier pin (:func:`apply_model_tier`) reaches it only through this run's
++    ``model_tier`` event; without one the row's overrides apply. A class selector always runs with
++    provider ``auto`` (:func:`worker_model_args`), so the profile's concrete provider never pins a class."""
++    import json
++    model, provider = _str(getattr(task, "model_override", None)) or None, _str(getattr(task, "provider_override", None)) or None
++    run_id = getattr(task, "current_run_id", None)
++    if run_id is not None:
++        row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='model_tier' "
++                           "ORDER BY id DESC LIMIT 1", (task.id, run_id)).fetchone()
++        try:
++            payload = json.loads(row[0]) if row else {}
++        except (TypeError, ValueError):
++            payload = {}
++        if isinstance(payload, dict) and _str(payload.get("model")):
++            model, provider = _str(payload["model"]), _str(payload.get("provider")) or None
++    if not model:
++        return None, None
++    args = worker_model_args(model, provider)
++    return model, (args[args.index("--provider") + 1] if "--provider" in args else None)
++
++
+ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
+     """Pin the tier's model on the in-memory ``task`` (never the DB row) and record a ``model_tier`` event.
+     Returns the reason. Never raises: a failure leaves the task on its profile's model."""
+diff --git a/tests/hermes_cli/test_kanban_model_tier.py b/tests/hermes_cli/test_kanban_model_tier.py
+index 7b7d80be108..79ab48c6984 100644
+--- a/tests/hermes_cli/test_kanban_model_tier.py
++++ b/tests/hermes_cli/test_kanban_model_tier.py
+@@ -161,15 +161,25 @@ def test_bad_pattern_is_ignored_not_fatal(board):
+     assert got == (SONNET, "anthropic", "default")
+ 
+ 
+-def test_tier_pin_reaches_worker_argv(board, monkeypatch):
+-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+-    monkeypatch.setattr(kbd, "_resolve_worker_cli_toolsets", lambda home: None)
++def test_tier_pin_reaches_owner(board):
++    """The tier pin lives on the in-memory claimed task; the profile owner (workers are
++    ``-m hermes_cli.kanban_worker_client``) re-reads the card and takes it from the run's model_tier event."""
+     with kbc.connect() as conn:
+-        t = kb.get_task(conn, kb.create_task(conn, title="routine", assignee="default"))
++        tid = kb.create_task(conn, title="routine", assignee="default")
++        t = kb.claim_task(conn, tid)
+         tier.apply_model_tier(conn, t, lane="ready", cfg={"default_model": SONNET, "default_provider": "anthropic"})
+-    argv = kbd._worker_argv(t, "default", None)
+-    assert argv[argv.index("-m") + 1] == SONNET
+-    assert argv[argv.index("--provider") + 1] == "anthropic"
++        fresh = kb.get_task(conn, tid)
++        assert (fresh.model_override, fresh.provider_override) == (None, None)  # never the DB row
++        assert tier.owner_model_pin(conn, fresh) == (SONNET, "anthropic")
++        # Another run of the same card does not inherit this run's tier decision.
++        fresh.current_run_id = (fresh.current_run_id or 0) + 1000
++        assert tier.owner_model_pin(conn, fresh) == (None, None)
++
++
++def test_owner_runs_class_selector_with_provider_auto(board):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="deep", assignee="default", model_override="class:deep")
++        assert tier.owner_model_pin(conn, kb.get_task(conn, tid)) == ("class:deep", "auto")
+ 
+ 
+ def test_unset_default_provider_is_inferred_not_the_profiles(board):
+diff --git a/tests/hermes_cli/test_kanban_pin_provider.py b/tests/hermes_cli/test_kanban_pin_provider.py
+index 98b469192ed..8acfe84aaf3 100644
+--- a/tests/hermes_cli/test_kanban_pin_provider.py
++++ b/tests/hermes_cli/test_kanban_pin_provider.py
+@@ -48,19 +48,11 @@ def auto_home(tmp_path, monkeypatch, request):
+ 
+ 
+ def _argv(monkeypatch, tmp_path, task):
+-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+-    captured = {}
+-
+-    class FakeProc:
+-        pid = 4245
+-
+-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, *a, **k: captured.setdefault("cmd", list(cmd)) and FakeProc())
+-    ws = tmp_path / "ws"
+-    ws.mkdir(exist_ok=True)
+-    kbd._default_spawn(task, str(ws))
+-    cmd = captured["cmd"]
+-    i = cmd.index("-m")
+-    return cmd[i + 1], (cmd[cmd.index("--provider") + 1] if "--provider" in cmd else None)
++    """(model, provider) the profile owner runs *task* with. Workers are ``-m hermes_cli.kanban_worker_client``
++    (upstream) and the owner builds the turn's policy from ``owner_model_pin`` (gateway.session_kanban), so the
++    pin no longer rides the worker argv."""
++    with kbc.connect_closing() as conn:
++        return tier.owner_model_pin(conn, task)
+ 
+ 
+ def _parser():
+diff --git a/tests/plugins/test_kanban_model_override.py b/tests/plugins/test_kanban_model_override.py
+index ff76633899c..e66452d4818 100644
+--- a/tests/plugins/test_kanban_model_override.py
++++ b/tests/plugins/test_kanban_model_override.py
+@@ -125,6 +125,9 @@ def test_create_task_with_model_and_provider(conn):
+         ({"reasoning_effort": "high"}, "profile-model", "custom", "high"),
+         ({"reasoning_effort": "none"}, "profile-model", "custom", None),
+         ({}, "profile-model", "custom", "low"),
++        # [daveey] The dispatcher's tier pin lives on the in-memory task and reaches the owner through
++        # the run's model_tier event (owner_model_pin), never the DB row.
++        ({"_tier": {"default_model": "glm-5", "default_provider": "openrouter"}}, "glm-5", "openrouter", "low"),
+     ],
+ )
+ def test_spawn_resolves_claimed_task_policy(
+@@ -142,10 +145,16 @@ def test_spawn_resolves_claimed_task_policy(
+     (profile / "config.yaml").write_text("{}\n")  # identity marker: a bare dir is not a live profile
+     workspace = tmp_path / "ws"
+     workspace.mkdir()
++    overrides = dict(overrides)
++    tier_cfg = overrides.pop("_tier", None)
+     tid = kb.create_task(conn, title="t", assignee="elias",
+                          workspace_kind="dir", workspace_path=str(workspace), **overrides)
+     task = kb.claim_task(conn, tid)
+     assert task is not None
++    if tier_cfg is not None:
++        from hermes_cli.kanban_model_tier import apply_model_tier
++        assert apply_model_tier(conn, task, lane="ready", cfg=tier_cfg) == "default"
++        assert kb.get_task(conn, tid).model_override is None
+     captured = {}
+ 
+     def fake_popen(cmd, **kwargs):
+-- 
+2.55.0
+

@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from contextvars import ContextVar
 from functools import wraps
+import threading
 import time
 
 # Context is copied by core into request workers. Resetting the caller's context
@@ -18,6 +19,7 @@ _install_failures = {}
 # Profile homes whose plugin load overran core's deadline in THIS process: no
 # middleware will ever consume a queued choice here, so GET rejects it visibly.
 _load_abandoned = {}
+_install_lock = threading.RLock()
 _unloaded = []  # set once any integration unloads; install() then gc.collect()s
 
 # install() proves each seam's live code object came from the audited file. A
@@ -58,6 +60,46 @@ def _code_fingerprint(code):
 def _cache_key(relative, digest):
     import sys
     return f'{_FINGERPRINT_VERSION}|{sys.implementation.cache_tag}|{sys.version}|{relative}|{digest}'
+
+
+def _load_pins():
+    """The shared drift definition (pins.py, also used by check_compat.py), loaded by path:
+    a hyphenated plugin dir is no package. Read at import, while __file__ is the real file."""
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location('account_usage_pins', Path(__file__).with_name('pins.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_pins = _load_pins()
+
+
+def audited_digests(value):
+    """A pin is one audited sha256 or a non-empty list of them (one per audited core
+    version, so mixed-core rollouts keep working). Anything else is None: fail closed."""
+    return _pins.accepted(value) or None
+
+
+def _live_owner(value, home):
+    """The live ExecutionIntegration of this plugin that wrapped `value`, else None."""
+    owner = getattr(value, '_account_usage_owner', None)
+    if isinstance(owner, ExecutionIntegration) and owner.active and owner.patches and owner.home == home:
+        return owner
+    return None
+
+
+def check_pins(root, expected):
+    """{relative: matched digest} when every pinned core file is an audited version."""
+    drift = _pins.pin_drift(root, expected)
+    if drift:
+        raise PinMismatch('Account selection compatibility changed; re-audit the execution plugin',
+                          drift[0]['file'])
+    from pathlib import Path
+    return {relative: _pins.sha(Path(root) / relative) for relative in expected}
+
+
 _IDENTITY_HEADERS = frozenset({'authorization', 'x-api-key', 'chatgpt-account-id',
     'x-openai-internal-codex-residency', 'openai-organization', 'openai-project'})
 
@@ -194,7 +236,10 @@ def codex_factory(original):
         kwargs.update(api_key=snapshot.token, base_url=snapshot.base_url,
                       max_retries=0, default_headers=headers)
         client = agent._create_openai_client(kwargs, reason=reason, shared=False)
-        actual = {str(k).lower(): v for k, v in client.default_headers.items()}
+        # The wire headers, merged the way the SDK builds a request: auth first, then
+        # default headers (openai>=2.5x keeps Authorization out of default_headers).
+        actual = {str(k).lower(): v for k, v in (getattr(client, 'auth_headers', None) or {}).items()}
+        actual.update({str(k).lower(): v for k, v in client.default_headers.items()})
         expected = {str(k).lower(): v for k, v in codex_cloudflare_headers(snapshot.token, base_url=snapshot.base_url).items()}
         conflicts = actual.get('authorization') != f'Bearer {snapshot.token}'
         conflicts |= any(actual.get(k) != v for k, v in expected.items() if k in identity_headers)
@@ -209,6 +254,13 @@ def codex_factory(original):
 
 class SelectionRejected(ValueError):
     """Safe, user-visible rejection (never include credential material)."""
+
+
+class PinMismatch(SelectionRejected):
+    """A pinned core file matches none of its audited digests (real drift)."""
+    def __init__(self, message, file):
+        super().__init__(message)
+        self.file = file
 
 
 class SelectionConflict(SelectionRejected):
@@ -720,6 +772,9 @@ class ExecutionIntegration:
         self.home = str(Path(get_hermes_home()).resolve())
         self.call_code = turn_api_call.perform_api_call.__code__
         self.error = None
+        self.core_unimportable = False  # install() failed on a missing core module: no agent can run here
+        self.failure = None  # (exception type name, seam/file) of a failed install()
+        self._at = 'setup'
         self.patches = []
         self.active = False
         import threading
@@ -741,19 +796,36 @@ class ExecutionIntegration:
                 self._restore_if_idle()
 
     def install(self):
+        self._at = 'setup'
+        try:
+            self._install()
+        except Exception as exc:
+            # Only the type and the seam: messages/args may carry secrets.
+            where = getattr(exc, 'file', None) or self._at
+            if isinstance(exc, ModuleNotFoundError) and isinstance(exc.name, str):
+                where = f'{where} ({exc.name})'  # a module name is not a secret
+            self.failure = (type(exc).__name__, where, isinstance(exc, PinMismatch))
+            self.core_unimportable = isinstance(exc, ImportError) and self._at == 'core-imports'
+            raise
+
+    def _install(self):
+        with _install_lock:  # two loads of one plugin must not interleave over the same seams
+            self._install_locked()
+
+    def _install_locked(self):
         if _unloaded:
             import gc
             gc.collect()  # release completed exception tracebacks from a prior unload
-        import hashlib
         import json
         import inspect
         from pathlib import Path
+        self._at = 'core-imports'
         from agent import client_lifecycle, turn_api_call, agent_runtime_helpers, chat_completion_helpers
         root = Path(client_lifecycle.__file__).resolve().parents[1]
-        expected = json.loads(Path(__file__).with_name('execution-compatibility.json').read_text())
-        for relative, digest in expected.items():
-            if hashlib.sha256((root / relative).read_bytes()).hexdigest() != digest:
-                raise SelectionRejected('Account selection compatibility changed; re-audit the execution plugin')
+        # Each pin lists every audited version of that file; `expected` maps a file
+        # to the digest this core actually has (one of the audited ones).
+        self._at = 'execution-compatibility.json'
+        expected = check_pins(root, json.loads(Path(__file__).with_name('execution-compatibility.json').read_text()))
         self.call_code = turn_api_call.perform_api_call.__code__
         targets = [(client_lifecycle.ClientLifecycleMixin, '_create_request_anthropic_client', anthropic_factory),
                    (client_lifecycle.ClientLifecycleMixin, '_create_request_openai_client', codex_factory),
@@ -799,11 +871,25 @@ class ExecutionIntegration:
                 cache['files'][key] = sorted({_code_fingerprint(c) for c in codes(compiled[relative])})
                 dirty.append(key)
             return any(code == original.__code__ for code in codes(compiled[relative]))
+        self._at = 'perform_api_call'
         if not verified(turn_api_call.perform_api_call):
             raise SelectionRejected('Account selection execution boundary is customized')
-        for obj, name, factory in targets:
-            if not verified(getattr(obj, name)):
+        # A seam this plugin's earlier, still-live instance already wrapped (a second
+        # load in one process) is adopted, not drift. All-or-nothing: a mix of ours
+        # and foreign wrappers is still refused below, before anything is patched.
+        owners = [_live_owner(getattr(obj, name), self.home) for obj, name, factory in targets]
+        if all(owners):
+            self.active = True
+            _install_failures.pop(self.home, None)
+            return
+        for (obj, name, factory), owner in zip(targets, owners):
+            self._at = name
+            if not owner and not verified(getattr(obj, name)):
                 raise SelectionRejected(f'Account selection execution seam is already customized: {name}')
+        for (obj, name, factory), owner in zip(targets, owners):
+            if owner:  # some seams are ours, others pristine: a half-adopted state is drift
+                self._at = name
+                raise SelectionRejected(f'Account selection execution seam is partly installed: {name}')
         if dirty:
             pins = {f'|{relative}|{digest}' for relative, digest in expected.items()}
             self._save_fingerprints(cache_path, cache, pins)
@@ -821,9 +907,11 @@ class ExecutionIntegration:
                         aliases.append((module, name, factory))
         wrappers = {}
         for obj, name, factory in targets + aliases:
+            self._at = f'patch:{name}'
             original = getattr(obj, name)
             wrapper = wrappers.setdefault(original, factory(original))
             self.patches.append((obj, name, original, wrapper))
+            wrapper._account_usage_owner = self
             setattr(obj, name, wrapper)
         self.active = True
         _install_failures.pop(self.home, None)
@@ -852,9 +940,14 @@ class ExecutionIntegration:
             pass
 
     def disable(self):
-        # Reloading never helps: the pinned core seams changed. Name the fix.
-        self.error = ('Account selection is off: Hermes core changed under its audited seams; '
-                      're-audit and refresh plugins/account-usage/execution-compatibility.json')
+        # Name the real cause: only a pinned-file mismatch is core drift.
+        kind, where, drift = self.failure or (None, None, True)
+        if drift:
+            self.error = ('Account selection is off: Hermes core changed under its audited seams; '
+                          're-audit and refresh plugins/account-usage/execution-compatibility.json'
+                          + (f' ({where})' if where else ''))
+        else:
+            self.error = f'Account selection is off: install raised {kind} at {where}'
         _install_failures[self.home] = self.error
 
     def abandon(self):

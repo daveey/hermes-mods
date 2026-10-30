@@ -1,0 +1,115 @@
+From 2693bcaed2f00325d09754e36c1ef3eff3827010 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 01:05:34 -0700
+Subject: [PATCH] test(gateway): wait for the owner's idle before /moa in the
+ cold-review test [daveey] (#262)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The test waited for every session_admissions row to read 'terminal' and then
+sent /moa. The store commits a turn terminal before the owner publishes its
+completion; until then LiveSession.settling keeps the owner's handle at
+'started' (gateway/session_settlement_recovery.py commit_and_publish), so
+session_commands.execute_command takes the busy path and /moa answers
+{'type': 'exec', 'output': 'Agent is running — wait or /stop first, then run
+/moa.'} with no 'message' -> KeyError. Measured gap: 1-54 ms on the hub; the
+10 ms DB poll lands in it often (4/7 failures on the hub, 1/3 under a 50%
+SIGSTOP duty cycle; both attempts failed on main run 41009740205).
+
+Wait instead for the DB rows AND the owner's own view (session.list live
+'running' False, which reads the same settling mask as the busy gate), at
+every settle point. Assert /moa returned a send directive so a refusal reads
+as itself, not a KeyError.
+
+Fixed: 8/8 on the loaded hub, 3/3 under the SIGSTOP duty cycle.
+
+Replaces 91edcccfb07's retry-the-refusal loop for /moa: the gate is the
+owner's settling mask, not the running-agent entry, and the same gap also
+sits in front of both /review sends (after the warm turn and after /moa),
+which the /moa-only retry did not cover. With the owner-idle wait the first
+/moa is accepted, so the loop is dropped.
+---
+ .../test_local_review_without_cached_agent.py | 40 +++++++++----------
+ 1 file changed, 19 insertions(+), 21 deletions(-)
+
+diff --git a/tests/gateway/test_local_review_without_cached_agent.py b/tests/gateway/test_local_review_without_cached_agent.py
+index 72ecf47da16..a66e73dfb34 100644
+--- a/tests/gateway/test_local_review_without_cached_agent.py
++++ b/tests/gateway/test_local_review_without_cached_agent.py
+@@ -16,6 +16,7 @@ import json
+ import signal
+ import sqlite3
+ import threading
++import time
+ from http.server import ThreadingHTTPServer
+ from pathlib import Path
+ 
+@@ -58,6 +59,19 @@ def test_local_review_reviews_the_stored_conversation_once_the_cached_agent_is_g
+         with contextlib.closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True)) as db:
+             return all(row[0] == 'terminal' for row in db.execute('SELECT status FROM session_admissions'))
+ 
++    async def idle(ws, sid, what):
++        # The store marks a turn terminal before the owner publishes its completion, and until then the
++        # owner still reads the turn as started: a command sent in that gap is refused with "Agent is
++        # running". So wait for the owner's own view (the live listing's ``running``), not only the row.
++        deadline = time.monotonic() + 60
++        while True:
++            if settled():
++                listed = (await rpc(ws, 'session.list'))['result']['sessions']
++                if [row['running'] for row in listed if row['session_id'] == sid] == [False]:
++                    return
++            assert time.monotonic() < deadline, f'timed out waiting for {what}'
++            await asyncio.sleep(0.05)
++
+     async def review(ws, sid, focus):
+         before = len(peer.requests)
+         reply = await rpc(ws, 'slash.exec', session_id=sid, command='review ' + focus)
+@@ -73,27 +87,10 @@ def test_local_review_reviews_the_stored_conversation_once_the_cached_agent_is_g
+         # The reviewer's completion comes back to this session as a delegation-completion turn.
+         await async_wait_until(lambda: any('ASYNC DELEGATION' in json.dumps(r) for r in peer.requests[before:]),
+                                timeout=60, what=f'the {focus} completion re-entering the session')
+-        await async_wait_until(settled, timeout=60, what=f'the {focus} completion turn settling')
++        await idle(ws, sid, f'the {focus} completion turn settling')
+         return {'provider': request.get('provider'), 'prefill': 'PREFILL_EXAMPLE' in text,
+                 'saw_conversation': 'OPENED_PR_42' in text}
+ 
+-    async def moa_once_idle(ws, sid):
+-        # settled() reads the admission rows; the daemon drops the finished completion turn's
+-        # running-agent entry just after, and /moa refuses mid-run ("Agent is running"). Under load
+-        # that gap is long enough to hit (run 41009740205), so retry the refusal until the session
+-        # is idle, waiting on the socket between tries.
+-        loop = asyncio.get_running_loop()
+-        deadline = loop.time() + 45
+-        while True:
+-            result = (await rpc(ws, 'slash.exec', session_id=sid, command='moa compare the options'))['result']
+-            if result.get('type') == 'send':
+-                return result
+-            assert 'Agent is running' in result.get('output', ''), result
+-            assert loop.time() < deadline, ('the session never went idle for /moa', result)
+-            with contextlib.suppress(TimeoutError):
+-                async with asyncio.timeout(0.5):
+-                    await ws.recv()
+-
+     async def probe(desc):
+         async with websocket(home, desc) as ws:
+             # A local session takes the profile's config as of its creation, not the daemon's startup copy.
+@@ -103,11 +100,12 @@ def test_local_review_reviews_the_stored_conversation_once_the_cached_agent_is_g
+                                 cwd=str(work))
+             sid = created['result']['session_id']
+             await rpc(ws, 'prompt.submit', session_id=sid, input_id='warm', text='OPENED_PR_42')
+-            await async_wait_until(settled, timeout=45, what='the warm turn settling')
++            await idle(ws, sid, 'the warm turn settling')
+             out['warm'] = await review(ws, sid, 'resident pass')
+-            moa = await moa_once_idle(ws, sid)
++            moa = (await rpc(ws, 'slash.exec', session_id=sid, command='moa compare the options'))['result']
++            assert moa.get('type') == 'send', moa
+             await rpc(ws, 'prompt.submit', session_id=sid, input_id='moa', text=moa['message'])
+-            await async_wait_until(settled, timeout=45, what='the /moa turn settling')
++            await idle(ws, sid, 'the /moa turn settling')
+             out['cold'] = await review(ws, sid, 'cold pass')
+ 
+     try:
+-- 
+2.55.0
+

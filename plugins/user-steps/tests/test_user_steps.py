@@ -243,6 +243,65 @@ def test_model_cannot_resolve_unknown_ids(home):
     assert out["resolved"] == [] and len(ledger(home).open_steps("S1")) == 1
 
 
+BUILD_ASK = "Build the combined Ask Eve /admin (Eve's desk + Control room) per build-plan.md?"
+NOTICE = ("✔ [default] @default Kanban t_0123 done — Verify and recover Eve UX handoff notification\n"
+          "Verified the original chat's completion notice.")
+RESTATED = (f"The combined design and its build plan are finished.\n\n**Your call:** \"{BUILD_ASK}\" is in your "
+            "For you queue:\n- **Go:** I build it.\n- **Hold:** nothing happens.")
+
+
+def _open_build_ask(home):
+    add_session(home, "S1")
+    run(home, f"Plan done. {BUILD_ASK}", llm=fake_llm({"steps": [{"text": BUILD_ASK, "kind": "choose",
+                                                                 "verbatim_span": BUILD_ASK,
+                                                                 "options": ["Go", "Hold"]}]}))
+    [step] = ledger(home).open_steps("S1")
+    return step["id"]
+
+
+def test_notice_turn_restating_an_open_ask_never_resolves_it(home):
+    """hub 20261030_071719_cde14c: a kanban notice started the turn, the reply quoted the open decision verbatim,
+    and the model still listed it as resolved: the tile vanished unanswered."""
+    sid = _open_build_ask(home)
+    out = run(home, RESTATED, user_msg=NOTICE, llm=fake_llm({"steps": [], "resolved": [sid]}))
+    assert out["resolved"] == []
+    assert [s["id"] for s in ledger(home).open_steps("S1")] == [sid]
+
+
+def test_notice_turn_model_listed_repeat_is_never_resolved(home):
+    sid = _open_build_ask(home)
+    reply = "Plan finished. Your go on the build is still in your For you queue."
+    out = run(home, reply, user_msg="[owner-wake] Card(s) this chat owns parked",
+              llm=fake_llm({"steps": [], "resolved": [sid],
+                            "repeats": [{"id": sid, "verbatim_span": "Your go on the build is still in your For you queue."}]}))
+    assert out["resolved"] == [] and [s["id"] for s in ledger(home).open_steps("S1")] == [sid]
+
+
+def test_typed_answer_still_resolves_when_the_reply_quotes_the_ask(home):
+    sid = _open_build_ask(home)
+    out = run(home, f"Going ahead: {BUILD_ASK} Yes, starting with the API contracts.", user_msg="go",
+              llm=fake_llm({"steps": [], "resolved": [sid]}))
+    assert out["resolved"] == [sid] and ledger(home).open_steps("S1") == []
+
+
+def test_notice_turn_can_still_resolve_a_step_the_reply_does_not_restate(home):
+    sid = _open_build_ask(home)
+    out = run(home, "The card finished and the build is merged; nothing is waiting on you.", user_msg=NOTICE,
+              llm=fake_llm({"steps": [], "resolved": [sid]}))
+    assert out["resolved"] == [sid]
+
+
+def test_runtime_message_detection():
+    assert core._runtime_message(NOTICE) and not core._runtime_message("")
+    assert core._runtime_message("[owner-wake] Card(s) this chat owns parked")
+    assert core._runtime_message("⏸ [macbook] @default Kanban t_1 blocked")
+    assert not core._runtime_message("go") and not core._runtime_message("[link] see this")
+
+
+def test_extract_prompt_says_notices_answer_nothing():
+    assert "answers no step" in core.SYSTEM and "never resolved" in core.SYSTEM
+
+
 # ---- ledger lineage ------------------------------------------------------------------------------------
 
 def test_ledger_follows_compression_lineage_not_subagents(home):

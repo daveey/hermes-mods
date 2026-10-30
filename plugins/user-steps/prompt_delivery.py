@@ -25,6 +25,16 @@ class PromptAdmission:
         if (owner['gatewayId'] != f'install:{get_install_id()}' or
                 owner['profile'] != current_profile_name()):
             raise RuntimeError('Prompt owner differs from authenticated runtime')
+        if owner['storedSessionId'].startswith('local-'):
+            # Gateway-platform chats are not inline TUI runtime sessions. Load the
+            # sibling without importing (and manufacturing) any new core runtime.
+            import importlib.util
+            from pathlib import Path
+            spec = importlib.util.spec_from_file_location('_user_steps_gateway_delivery',
+                Path(__file__).with_name('gateway_delivery.py'))
+            gateway = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(gateway)
+            return gateway.call(method, params)
         # Importing server in an agent process would manufacture a new empty runtime.
         # Only the already-loaded serve runtime can admit this operation.
         server = sys.modules.get('tui_gateway.server')
@@ -58,8 +68,10 @@ class PromptAdmission:
                 and receipt.get('dispatch') != 'failed'
                 and all(receipt.get(k) == params[k] for k in
                         ('profile', 'stored_session_id', 'operation_id', 'payload_digest'))
-                and type(receipt.get('user_row_id')) is int and receipt['user_row_id'] > 0
-                and isinstance(receipt.get('message_uid'), str) and bool(receipt['message_uid']))
+                and ((receipt.get('transport') == 'gateway_fifo'
+                      and isinstance(receipt.get('admission_id'), str) and bool(receipt['admission_id']))
+                     or (type(receipt.get('user_row_id')) is int and receipt['user_row_id'] > 0
+                         and isinstance(receipt.get('message_uid'), str) and bool(receipt['message_uid']))))
 
     def deliver(self, op):
         if op['intent']['effect'] == 'decline':

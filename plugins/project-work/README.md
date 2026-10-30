@@ -179,7 +179,14 @@ and always calls native `next()`. A background worker retries uncertain deliveri
 Deterministic invalid requests are acknowledged and retained in the journal's
 `rejected(payload, reason, rejected_at)` table, not retried forever. Transport failures
 remain pending. The journal is independent of the controller effect lock; network stalls do not block
-Bolt acknowledgement. Register refuses non-sandboxed terminal/code backends, a Docker
+Bolt acknowledgement. Every `message`/`app_mention` event the middleware sees leaves one
+`Project ingress ...` log line, including events outside the project channel
+(`outside project channel`) and other bots' posts; other event types log at debug.
+The bot's own posts never reach it: slack_bolt's built-in self-event filter drops them
+before plugin middleware (`tests/test_ingress_observability.py` drives a real `AsyncApp`).
+`project_work_request`/`project_work_status` refusals return `{"ok": false, "error":
+<type>, "message": <reason>}` naming the project channel, so the model can tell the
+requester what to do. Register refuses non-sandboxed terminal/code backends, a Docker
 cwd mount, Docker extra args other than `--runtime=runsc` (gVisor), and any Docker volume
 except a read-only single regular file `<profile home>/sandbox-bin/<file>:/usr/local/bin/<name>:ro`
 (no symlinks, owned by the gateway uid; tests in `tests/test_ingress_security.py`). Verify actual implicit mounts and profile routing in deployment.
@@ -302,7 +309,9 @@ Coverage includes scope rejection, invalid paths/owner types, plan approval and 
 hashes, duplicate requests across threads/processes, crash recovery, generation gates,
 missing/stale exact-head checks, uncertain send, late followups, native method/parameter
 contracts, Slack pagination, exact-session archive rollback, strict private config,
-native ingress parsing, and a real local Unix-socket controller/client round trip.
+native ingress parsing, ingress log lines and tool refusal messages, real slack_bolt
+`AsyncApp` dispatch through the plugin middleware (skipped unless `--with slack_bolt
+--with aiohttp`), and a real local Unix-socket controller/client round trip.
 Native RPC/Slack tests use deterministic fakes and are NOT live end-to-end proof.
 
 Before rollout independently review the source, then verify normal plugin discovery,

@@ -1,0 +1,121 @@
+From 7a2ccb0b4a9ab92a47b7fc87220fa5e45b1e034d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:48:22 -0700
+Subject: [PATCH] perf(desktop): transcript prefetch stops refetching empty/404
+ sessions every 5 s until they move [daveey]
+
+An empty latest page (or a 4xx) stored no cache row, so needsRefresh() saw
+'never fetched' and every tick refetched it: ~570 of 1207 Desktop requests in
+40 s on David-MBP were these 165-byte empty pages (t_01a18977df212d21).
+---
+ .../electron/transcript-prefetch.test.ts      | 28 ++++++++++++++++++
+ apps/desktop/electron/transcript-prefetch.ts  | 29 ++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/apps/desktop/electron/transcript-prefetch.test.ts b/apps/desktop/electron/transcript-prefetch.test.ts
+index 4aef069e76b..3efa563b541 100644
+--- a/apps/desktop/electron/transcript-prefetch.test.ts
++++ b/apps/desktop/electron/transcript-prefetch.test.ts
+@@ -191,6 +191,34 @@ describe('prefetch refresh on activity change', () => {
+     expect(await h.prefetcher.tick()).toMatchObject({ failed: 1, fetched: 2 })
+   })
+ 
++  // An empty session (a fresh cron/kanban tip: message_count > 0 in the replica, nothing displayable yet) or a
++  // 404 stores nothing, so the cache had no row and every 5 s tick fetched it again: ~1100 transcript GETs per
++  // 90 s across three gateways on David-MBP (t_01a18977df212d21).
++  it('does not refetch an empty or missing session until its activity or message_count moves', async () => {
++    const records = [record('mini', 'empty', 1), record('mini', 'gone', 2), record('mini', 'full', 3)]
++    const h = harness(records)
++
++    h.fetchLatest.mockImplementation(async key => {
++      if (key.sessionId === 'gone') {
++        throw Object.assign(new Error('not found'), { status: 404 })
++      }
++
++      return key.sessionId === 'empty' ? [] : [{ content: 'ok', id: 1 }]
++    })
++
++    await h.prefetcher.tick()
++    expect(h.fetchLatest).toHaveBeenCalledTimes(3)
++
++    h.fetchLatest.mockClear()
++    h.advance(MIN_REFETCH_MS)
++    expect(await h.prefetcher.tick()).toMatchObject({ fetched: 0, skipped: 3 })
++    expect(h.fetchLatest).not.toHaveBeenCalled()
++
++    records[0] = record('mini', 'empty', 9) // the session moved: try again
++    await h.prefetcher.tick()
++    expect(h.fetchLatest.mock.calls.map(([key]) => key.sessionId)).toEqual(['empty'])
++  })
++
+   it('does nothing without a hub replica', async () => {
+     const store = new TranscriptCacheStore(':memory:')
+     const fetchLatest = vi.fn()
+diff --git a/apps/desktop/electron/transcript-prefetch.ts b/apps/desktop/electron/transcript-prefetch.ts
+index 8cea69e42ba..903d1536972 100644
+--- a/apps/desktop/electron/transcript-prefetch.ts
++++ b/apps/desktop/electron/transcript-prefetch.ts
+@@ -146,6 +146,12 @@ export function needsRefresh(
+ export class TranscriptPrefetcher {
+   private readonly deps: PrefetchDeps
+   private readonly downUntil = new Map<string, number>()
++  /**
++   * Targets whose last fetch stored nothing (empty page, 404, unstorable): the hub meta they were tried at.
++   * The cache has no row for them, so without this needsRefresh() saw "never fetched" and every tick refetched
++   * them. They are retried once their activity/message_count moves (and MIN_REFETCH_MS passed).
++   */
++  private readonly unstored = new Map<string, { activity: null | number; messageCount: null | number; savedAt: number }>()
+   private running: null | Promise<PrefetchTickResult> = null
+   private timer: null | ReturnType<typeof setTimeout> = null
+   private stopped = true
+@@ -219,9 +225,26 @@ export class TranscriptPrefetcher {
+     const targets = selectPrefetchTargets(records, gateway => names.get(gateway))
+     result.targets = targets.length
+ 
+-    const due = targets.filter(target => needsRefresh(this.deps.store.meta(target.key), target, now))
++    const keyOf = (target: PrefetchTarget) =>
++      `${target.key.connectionId}\u0000${target.key.profile}\u0000${target.key.sessionId}`
++
++    // Forget memo entries for sessions no longer targeted, so the map stays bounded by the target set.
++    const live = new Set(targets.map(keyOf))
++
++    for (const key of this.unstored.keys()) {
++      if (!live.has(key)) {
++        this.unstored.delete(key)
++      }
++    }
++
++    const due = targets.filter(target =>
++      needsRefresh(this.deps.store.meta(target.key) ?? this.unstored.get(keyOf(target)) ?? null, target, now)
++    )
+     result.skipped = targets.length - due.length
+ 
++    const markUnstored = (target: PrefetchTarget) =>
++      this.unstored.set(keyOf(target), { ...target.meta, savedAt: this.deps.now?.() ?? Date.now() })
++
+     // Two fetches per gateway at a time: one slow SSH route never stalls the rest.
+     const queues = new Map<string, PrefetchTarget[]>()
+ 
+@@ -246,8 +269,10 @@ export class TranscriptPrefetcher {
+               const rows = await this.deps.fetchLatest(target.key, LATEST_ROWS)
+ 
+               if (rows.length > 0 && this.deps.store.putLatest(target.key, rows, target.meta)) {
++                this.unstored.delete(keyOf(target))
+                 result.fetched += 1
+               } else {
++                markUnstored(target)
+                 result.skipped += 1
+               }
+             } catch (error) {
+@@ -258,6 +283,8 @@ export class TranscriptPrefetcher {
+                 this.deps.log?.(
+                   `transcript prefetch: ${connectionId} unreachable (${(error as Error)?.message || error}); backing off`
+                 )
++              } else {
++                markUnstored(target) // a 4xx for this one session: wait for it to move
+               }
+             }
+           }
+-- 
+2.55.0
+

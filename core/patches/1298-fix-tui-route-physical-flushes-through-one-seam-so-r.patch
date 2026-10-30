@@ -1,0 +1,574 @@
+From cac7ff36f8cb01cb83ffcd71ccc9def261dc0808 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:37:03 -0700
+Subject: [PATCH] fix(tui): route physical flushes through one seam so renderer
+ tests stop timing the CI disk (#337)
+
+* fix(tui): route physical flushes through one seam so renderer tests stop timing the CI disk [daveey]
+
+Problem: PR328 run 41088210596 (job 124176079097, ec2-gwgen-3) failed ui-tui with 5000 ms
+timeouts in busyQueueAdmission, canonicalStartupImage, pendingMigrationRenderer and
+submissionDestinationRenderer. submissionDestinationRenderer then failed its second case with
+queueRef.current []. The ui-tui tree is identical at merge-base b0df706, at the PR head and on main.
+The earlier failure on the same runner (job 124096069004, receiptBusyRenderer) had the same shape.
+
+Why 1: only the test files that do real fsyncs timed out. In the same job
+CPU-heavy cursorDriftRegression (0 fsyncs) passed in 11.7 s. Every failing file performs 1-56 real
+ext4 fsyncs per run (LD_PRELOAD counter).
+Why 2: savePendingInput/removePendingInput (writeFileSync flush:true plus a directory fsync) and
+stageImagePath (FileHandle.sync) flush to the physical disk on every queue mutation. In tests
+that disk is the runner's, which is shared with the concurrent desktop/web checks. One fsync
+waits on the journal commit behind their writeback (canonicalStartupImage timed out with 1 fsync).
+Why 3: suites whose subject is queue/renderer logic ran the production flush, so their wall
+time was set by other jobs' disk traffic, not by the code under test.
+Root (happened): there was no seam between "write the journal" and "make it physically durable",
+so tests could not keep the real journal without paying the device's flush latency.
+Root (not caught): #326 reproduced with CPU stress and transport-latency seams only, never with
+flush latency, and nothing stopped new direct fsync sites. Repro: an fsync-delay LD_PRELOAD
+(400 ms per non-tmpfs fsync) fails these files on base every run; CPU-only stress passes 5/5.
+Cascade: submissionDestinationRenderer tore down in a body-owned finally. A timed-out case's late
+finally reset the next case's store and HERMES_HOME mid-assertion.
+
+Countermeasures:
+- src/lib/durableFlush.ts is the only flush site. pendingInputs writes temp, flushes the fd,
+  renames, then flushes the directory, the same ordering as before. imageAttachments flushes
+  through it.
+- vitest.setup.ts replaces the flush with no-ops for every suite. Writes, renames and reads still
+  hit the real journal. coldPendingRenderer's child process still runs the real syscalls.
+- durableFlush.test.ts pins the ordering (complete temp record flushed before rename, directory
+  flushed after rename and unlink, image bytes flushed before the path is returned) and checks
+  that the real module issues the fsyncs. Moving either flush fails it.
+- An eslint guard bans fsync/fdatasync imports, flush:true and .sync()/.datasync() outside the
+  seam, so no new direct flush site can bring the disk back into renderer tests.
+- submissionDestinationRenderer and busyQueueAdmission tear down in runner-owned afterEach.
+  busyQueueAdmission's cleanup is idempotent, so a late finally becomes a no-op.
+No assertion or timeout is changed.
+
+* fix(tui): also ban member-call fsync outside the flush seam [daveey]
+---
+ ui-tui/eslint.config.mjs                      |  19 +++
+ .../src/__tests__/busyQueueAdmission.test.tsx |  21 +++-
+ ui-tui/src/__tests__/durableFlush.test.ts     | 119 ++++++++++++++++++
+ .../submissionDestinationRenderer.test.tsx    | 101 ++++++++-------
+ ui-tui/src/lib/durableFlush.ts                |  30 +++++
+ ui-tui/src/lib/imageAttachments.ts            |   3 +-
+ ui-tui/src/lib/pendingInputs.ts               |  37 +++---
+ ui-tui/vitest.config.ts                       |   3 +-
+ ui-tui/vitest.setup.ts                        |  11 ++
+ 9 files changed, 270 insertions(+), 74 deletions(-)
+ create mode 100644 ui-tui/src/__tests__/durableFlush.test.ts
+ create mode 100644 ui-tui/src/lib/durableFlush.ts
+ create mode 100644 ui-tui/vitest.setup.ts
+
+diff --git a/ui-tui/eslint.config.mjs b/ui-tui/eslint.config.mjs
+index c3fed73f26c..6043ddc55c2 100644
+--- a/ui-tui/eslint.config.mjs
++++ b/ui-tui/eslint.config.mjs
+@@ -11,5 +11,24 @@ export default [
+       'no-redeclare': 'off',
+       'react-hooks/exhaustive-deps': 'off'
+     }
++  },
++  {
++    // Physical flushes go through src/lib/durableFlush.ts, which test suites stub: a direct
++    // fsync elsewhere makes renderer tests wait on the shared CI disk (5 s timeouts).
++    files: ['src/**/*.{ts,tsx}'],
++    ignores: ['src/lib/durableFlush.ts', 'src/__tests__/durableFlush.test.ts'],
++    rules: {
++      'no-restricted-imports': ['error', {
++        paths: ['fs', 'node:fs', 'fs/promises', 'node:fs/promises'].map(name => ({
++          name,
++          importNames: ['fsync', 'fsyncSync', 'fdatasync', 'fdatasyncSync'],
++          message: 'Flush through src/lib/durableFlush.ts.'
++        }))
++      }],
++      'no-restricted-syntax': ['error',
++        { selector: "Property[key.name='flush'][value.value=true]", message: 'Flush through src/lib/durableFlush.ts.' },
++        { selector: "CallExpression[arguments.length=0][callee.property.name=/^(sync|datasync)$/]", message: 'Flush through src/lib/durableFlush.ts.' },
++        { selector: "CallExpression[callee.property.name=/^f(data)?sync(Sync)?$/]", message: 'Flush through src/lib/durableFlush.ts.' }]
++    }
+   }
+ ]
+diff --git a/ui-tui/src/__tests__/busyQueueAdmission.test.tsx b/ui-tui/src/__tests__/busyQueueAdmission.test.tsx
+index b52b14bd905..36b275e4b84 100644
+--- a/ui-tui/src/__tests__/busyQueueAdmission.test.tsx
++++ b/ui-tui/src/__tests__/busyQueueAdmission.test.tsx
+@@ -6,7 +6,7 @@ import { PassThrough } from 'node:stream'
+ import { renderSync, Text } from '@hermes/ink'
+ import { useStore } from '@nanostores/react'
+ import React from 'react'
+-import { expect, it, vi } from 'vitest'
++import { afterEach, expect, it, vi } from 'vitest'
+ 
+ import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
+ import { captureDestination } from '../app/submissionDestination.js'
+@@ -24,6 +24,11 @@ const row = (admission_id: string, input_id: string, text: string, status = 'que
+   ref: { profile_id: '/tmp/profile', session_id: 'stored-owner' }
+ })
+ 
++const cleanups: Array<() => void> = []
++afterEach(() => {
++  for (const cleanup of cleanups.splice(0)) { cleanup() }
++})
++
+ function mount(busyInputMode: 'queue' | 'interrupt' | 'steer' = 'queue', cancel: () => Promise<unknown> = () => Promise.resolve({ status: 'terminal', outcome: 'cancelled' })) {
+   // macOS: tmpdir() is /var/..., a symlink to /private/var; captureDestination() realpaths
+   // HERMES_HOME, so receipts must carry the canonical home or target_profile_home never matches.
+@@ -93,10 +98,22 @@ function mount(busyInputMode: 'queue' | 'interrupt' | 'steer' = 'queue', cancel:
+     stderr: new PassThrough() as any, patchConsole: false
+   })
+ 
++  let mounted = true
++
++  // Idempotent: the runner tears down first, so a timed-out body's late finally is a no-op
++  // instead of resetting the next case's store and HERMES_HOME.
++  const cleanup = () => {
++    if (!mounted) { return }
++    mounted = false
++    instance.unmount(); turnController.fullReset(); resetUiState(); vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true })
++  }
++
++  cleanups.push(cleanup)
++
+   return {
+     calls, request, fanout,
+     get queue() { return queue }, get submission() { return submission },
+-    cleanup() { instance.unmount(); turnController.fullReset(); resetUiState(); vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
++    cleanup
+   }
+ }
+ 
+diff --git a/ui-tui/src/__tests__/durableFlush.test.ts b/ui-tui/src/__tests__/durableFlush.test.ts
+new file mode 100644
+index 00000000000..41aad780d51
+--- /dev/null
++++ b/ui-tui/src/__tests__/durableFlush.test.ts
+@@ -0,0 +1,119 @@
++import type * as Fs from 'node:fs'
++import { existsSync, fstatSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
++import type { FileHandle } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++
++import { afterEach, expect, it, vi } from 'vitest'
++
++import type * as DurableFlush from '../lib/durableFlush.js'
++import { flushDirectorySync, flushFileHandle, flushFileSync } from '../lib/durableFlush.js'
++import { stageImagePath } from '../lib/imageAttachments.js'
++import { removePendingInput, savePendingInput } from '../lib/pendingInputs.js'
++
++// vitest.setup.ts replaces durableFlush with no-op spies for every suite. These cases pin
++// what that replacement must not hide: each flush happens at the point that makes the
++// journal crash-safe, and the real module issues the fsyncs (recorded, not sent to the disk;
++// coldPendingRenderer's child process still runs the real syscalls).
++const fsyncs = vi.hoisted(() => [] as number[])
++vi.mock('node:fs', async importOriginal => {
++  const actual = await importOriginal<typeof Fs>()
++
++  return { ...actual, fsyncSync: vi.fn((fd: number) => { fsyncs.push(fd) }) }
++})
++
++const homes: string[] = []
++afterEach(() => {
++  vi.mocked(flushFileSync).mockReset()
++  vi.mocked(flushDirectorySync).mockReset()
++  vi.mocked(flushFileHandle).mockReset()
++  fsyncs.length = 0
++
++  for (const home of homes.splice(0)) { rmSync(home, { recursive: true, force: true }) }
++})
++
++const freshHome = () => {
++  const home = mkdtempSync(join(tmpdir(), 'ink-flush-'))
++  homes.push(home)
++
++  return home
++}
++
++const item = (home: string) => ({
++  submissionId: '00000000-0000-4000-8000-000000000001', text: 'hello', display: 'hello', createdAt: 1,
++  destination: { sid: 'S1', storedSid: 'stored', profile: 'default', profileHome: home }
++}) as any
++
++it('flushes the complete temporary record before the rename and the directory after it', () => {
++  const home = freshHome()
++  const dir = join(home, 'tui-pending-inputs')
++  const final = join(dir, '00000000-0000-4000-8000-000000000001.json')
++  const order: string[] = []
++
++  vi.mocked(flushFileSync).mockImplementation(fd => {
++    order.push('file')
++    const [temporary] = readdirSync(dir).filter(name => name.endsWith('.tmp'))
++    expect(existsSync(final)).toBe(false)
++    expect(fstatSync(fd).size).toBe(readFileSync(join(dir, temporary!)).length)
++    expect(JSON.parse(readFileSync(join(dir, temporary!), 'utf8')).text).toBe('hello')
++  })
++  vi.mocked(flushDirectorySync).mockImplementation(flushed => {
++    order.push('dir')
++    expect(flushed).toBe(dir)
++    expect(readdirSync(dir)).toEqual(['00000000-0000-4000-8000-000000000001.json'])
++  })
++
++  savePendingInput(item(home))
++  expect(order).toEqual(['file', 'dir'])
++  expect(JSON.parse(readFileSync(final, 'utf8')).text).toBe('hello')
++})
++
++it('flushes the directory after removing a record', () => {
++  const home = freshHome()
++  const dir = join(home, 'tui-pending-inputs')
++  savePendingInput(item(home))
++  vi.mocked(flushDirectorySync).mockReset()
++  vi.mocked(flushDirectorySync).mockImplementation(flushed => {
++    expect(flushed).toBe(dir)
++    expect(readdirSync(dir)).toEqual([])
++  })
++
++  removePendingInput(item(home))
++  expect(flushDirectorySync).toHaveBeenCalledTimes(1)
++})
++
++it('flushes staged image bytes before handing out their path', async () => {
++  const home = freshHome()
++  vi.stubEnv('HERMES_TUI_GATEWAY_URL', '')
++  const source = join(home, 'shot.png')
++  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nL8AAAAASUVORK5CYII=', 'base64')
++  const { writeFileSync } = await vi.importActual<typeof Fs>('node:fs')
++  writeFileSync(source, png)
++
++  vi.mocked(flushFileHandle).mockImplementation(async (handle: FileHandle) => {
++    expect((await handle.stat()).size).toBe(png.length)
++  })
++
++  try {
++    const staged = await stageImagePath(source, {} as any, { sid: 'S1', profile: 'default', profileHome: home } as any)
++    expect(flushFileHandle).toHaveBeenCalledTimes(1)
++    expect(readFileSync(staged.path)).toEqual(png)
++  } finally { vi.unstubAllEnvs() }
++})
++
++it('the real module fsyncs the file descriptor and the directory', async () => {
++  const real = await vi.importActual<typeof DurableFlush>('../lib/durableFlush.js')
++  const home = freshHome()
++  const { openSync, closeSync } = await vi.importActual<typeof Fs>('node:fs')
++  const fd = openSync(join(home, 'record'), 'w')
++
++  try { real.flushFileSync(fd) } finally { closeSync(fd) }
++  expect(fsyncs).toEqual([fd])
++
++  real.flushDirectorySync(home)
++  expect(fsyncs).toHaveLength(process.platform === 'win32' ? 1 : 2)
++
++  const sync = vi.fn(async () => {})
++  await real.flushFileHandle({ sync } as unknown as FileHandle)
++  expect(sync).toHaveBeenCalledTimes(1)
++})
+diff --git a/ui-tui/src/__tests__/submissionDestinationRenderer.test.tsx b/ui-tui/src/__tests__/submissionDestinationRenderer.test.tsx
+index 85402ac2e94..245d9c979e4 100644
+--- a/ui-tui/src/__tests__/submissionDestinationRenderer.test.tsx
++++ b/ui-tui/src/__tests__/submissionDestinationRenderer.test.tsx
+@@ -5,14 +5,26 @@ import { PassThrough } from 'node:stream'
+ 
+ import { renderSync, Text } from '@hermes/ink'
+ import React from 'react'
+-import { expect, it, vi } from 'vitest'
++import { afterEach, expect, it, vi } from 'vitest'
+ 
+ import { patchUiState, resetUiState } from '../app/uiStore.js'
+ import { useSubmission } from '../app/useSubmission.js'
+ import { useQueue } from '../hooks/useQueue.js'
+ 
++// Runner-owned: a timed-out body keeps running, and its late teardown would reset the
++// next case's store and HERMES_HOME mid-assertion.
++const cleanups: Array<() => void> = []
++afterEach(() => {
++  for (const cleanup of cleanups.splice(0).reverse()) { cleanup() }
++})
++
+ it('submits interpolated queued input only to its captured owner and removes it only after the matching receipt', async () => {
+   const home = mkdtempSync(join(tmpdir(), 'ink-submit-'))
++  cleanups.push(() => {
++    resetUiState()
++    vi.unstubAllEnvs()
++    rmSync(home, { recursive: true, force: true })
++  })
+   vi.stubEnv('HERMES_HOME', home)
+   resetUiState()
+   const info = { model: 'test', profile_name: 'alpha', stored_session_id: 'stored-owner', skills: {}, tools: {} }
+@@ -66,40 +78,40 @@ it('submits interpolated queued input only to its captured owner and removes it
+     patchConsole: false
+   })
+ 
+-  try {
+-    queue.enqueue('private {!printf data}')
+-    const item = queue.dequeue()!
+-    submission.sendQueued(item)
+-    patchUiState({ sid: 'other', busy: false })
+-    resolveShell({ stdout: 'data', code: 0 })
+-    await expect.poll(() => request.mock.calls.filter(call => call[0] === 'prompt.submit').length).toBe(1)
+-    expect(request).toHaveBeenCalledWith('prompt.submit', {
+-      session_id: 'owner',
+-      text: 'private data',
+-      submission_id: item.submissionId,
+-      queued: true
+-    })
+-    expect(appended).not.toHaveBeenCalled()
+-    expect(queue.queueRef.current).toEqual([])
+-    patchUiState({ sid: 'owner' })
+-    expect(queue.queueRef.current).toContain(item)
+-    resolveSubmit({
+-      admission_id: item.submissionId,
+-      target_session_id: 'stored-owner',
+-      target_profile_home: home,
+-      status: 'queued'
+-    })
+-    await expect.poll(() => queue.queueRef.current.length).toBe(0)
+-  } finally {
+-    instance.unmount()
+-    resetUiState()
+-    vi.unstubAllEnvs()
+-    rmSync(home, { recursive: true, force: true })
+-  }
++  cleanups.push(() => instance.unmount())
++
++  queue.enqueue('private {!printf data}')
++  const item = queue.dequeue()!
++  submission.sendQueued(item)
++  patchUiState({ sid: 'other', busy: false })
++  resolveShell({ stdout: 'data', code: 0 })
++  await expect.poll(() => request.mock.calls.filter(call => call[0] === 'prompt.submit').length).toBe(1)
++  expect(request).toHaveBeenCalledWith('prompt.submit', {
++    session_id: 'owner',
++    text: 'private data',
++    submission_id: item.submissionId,
++    queued: true
++  })
++  expect(appended).not.toHaveBeenCalled()
++  expect(queue.queueRef.current).toEqual([])
++  patchUiState({ sid: 'owner' })
++  expect(queue.queueRef.current).toContain(item)
++  resolveSubmit({
++    admission_id: item.submissionId,
++    target_session_id: 'stored-owner',
++    target_profile_home: home,
++    status: 'queued'
++  })
++  await expect.poll(() => queue.queueRef.current.length).toBe(0)
+ })
+ 
+ it('refuses the whole submit when a {!cmd} cannot run instead of sending a placeholder to the model', async () => {
+   const home = mkdtempSync(join(tmpdir(), 'ink-submit-'))
++  cleanups.push(() => {
++    resetUiState()
++    vi.unstubAllEnvs()
++    rmSync(home, { recursive: true, force: true })
++  })
+   vi.stubEnv('HERMES_HOME', home)
+   resetUiState()
+   patchUiState({ sid: 'owner', info: { model: 'test', stored_session_id: 'stored-owner', skills: {}, tools: {} } as any })
+@@ -139,20 +151,15 @@ it('refuses the whole submit when a {!cmd} cannot run instead of sending a place
+     patchConsole: false
+   })
+ 
+-  try {
+-    queue.enqueue('summarize {!rm -rf /}')
+-    const item = queue.dequeue()!
+-    submission.sendQueued(item)
+-    await expect.poll(() => sys.mock.calls.length).toBe(1)
+-    expect(request.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
+-    expect(String(sys.mock.calls[0]![0])).toContain('dangerous_command')
+-    // Retained for Alt+K / an edit, never silently dropped.
+-    expect(item.failed).toBe(true)
+-    expect(queue.queueRef.current).toContain(item)
+-  } finally {
+-    instance.unmount()
+-    resetUiState()
+-    vi.unstubAllEnvs()
+-    rmSync(home, { recursive: true, force: true })
+-  }
++  cleanups.push(() => instance.unmount())
++
++  queue.enqueue('summarize {!rm -rf /}')
++  const item = queue.dequeue()!
++  submission.sendQueued(item)
++  await expect.poll(() => sys.mock.calls.length).toBe(1)
++  expect(request.mock.calls.map(([method]) => method)).not.toContain('prompt.submit')
++  expect(String(sys.mock.calls[0]![0])).toContain('dangerous_command')
++  // Retained for Alt+K / an edit, never silently dropped.
++  expect(item.failed).toBe(true)
++  expect(queue.queueRef.current).toContain(item)
+ })
+diff --git a/ui-tui/src/lib/durableFlush.ts b/ui-tui/src/lib/durableFlush.ts
+new file mode 100644
+index 00000000000..04c361966ca
+--- /dev/null
++++ b/ui-tui/src/lib/durableFlush.ts
+@@ -0,0 +1,30 @@
++import { closeSync, fsyncSync, openSync } from 'node:fs'
++import type { FileHandle } from 'node:fs/promises'
++
++// The only places ui-tui asks the kernel to put bytes on stable storage (lint-enforced).
++// A flush waits for the whole device: on a shared CI disk one fsync behind other jobs'
++// writeback has taken over 5 s. Suites that assert queue/renderer logic swap this module
++// for no-ops (vitest.setup.ts); durableFlush.test.ts owns the ordering contract.
++
++export function flushFileSync(fd: number): void {
++  fsyncSync(fd)
++}
++
++// Makes a rename or unlink inside `dir` survive a crash.
++export function flushDirectorySync(dir: string): void {
++  if (process.platform === 'win32') {
++    return
++  }
++
++  const fd = openSync(dir, 'r')
++
++  try {
++    fsyncSync(fd)
++  } finally {
++    closeSync(fd)
++  }
++}
++
++export async function flushFileHandle(handle: FileHandle): Promise<void> {
++  await handle.sync()
++}
+diff --git a/ui-tui/src/lib/imageAttachments.ts b/ui-tui/src/lib/imageAttachments.ts
+index 32bb58dbda8..c706270b4b9 100644
+--- a/ui-tui/src/lib/imageAttachments.ts
++++ b/ui-tui/src/lib/imageAttachments.ts
+@@ -11,6 +11,7 @@ import { sessionCwd } from '../app/uiStore.js'
+ import type { GatewayClient } from '../gatewayClient.js'
+ import { t } from '../i18n/runtime.js'
+ 
++import { flushFileHandle } from './durableFlush.js'
+ import { pythonHelperPath } from './pythonHelpers.js'
+ 
+ export interface ImageAttachment { path: string; mime: string }
+@@ -126,7 +127,7 @@ export async function stageImagePath(raw: string, gw: GatewayClient, destination
+   const path = join(directory, `${randomUUID()}${ext}`)
+   const file = await open(path, 'wx', 0o600)
+ 
+-  try { await file.writeFile(bytes); await file.sync() } finally { await file.close() }
++  try { await file.writeFile(bytes); await flushFileHandle(file) } finally { await file.close() }
+ 
+   return { path, mime, name, remainder: source.remainder }
+ }
+diff --git a/ui-tui/src/lib/pendingInputs.ts b/ui-tui/src/lib/pendingInputs.ts
+index fa2f4ed7f83..51f88ecdd5a 100644
+--- a/ui-tui/src/lib/pendingInputs.ts
++++ b/ui-tui/src/lib/pendingInputs.ts
+@@ -1,7 +1,6 @@
+ import {
+   closeSync,
+   existsSync,
+-  fsyncSync,
+   mkdirSync,
+   openSync,
+   readdirSync,
+@@ -17,6 +16,8 @@ import type { SubmissionDestination } from '../app/submissionDestination.js'
+ import type { QueueItem } from '../hooks/useQueue.js'
+ import { t } from '../i18n/runtime.js'
+ 
++import { flushDirectorySync, flushFileSync } from './durableFlush.js'
++
+ const directory = (home?: string) =>
+   join(home ?? process.env.HERMES_HOME ?? join(homedir(), '.hermes'), 'tui-pending-inputs')
+ 
+@@ -70,20 +71,6 @@ export function migratePendingInputs(previous: SubmissionDestination, successorS
+   pendingInputRevision++
+ }
+ 
+-function syncDirectory(dir: string) {
+-  if (process.platform === 'win32') {
+-    return
+-  }
+-
+-  const fd = openSync(dir, 'r')
+-
+-  try {
+-    fsyncSync(fd)
+-  } finally {
+-    closeSync(fd)
+-  }
+-}
+-
+ // Separate files avoid read/modify/write loss between two native clients.
+ export function savePendingInput(item: QueueItem): void {
+   if (!item.submissionId || !item.destination?.sid) {
+@@ -97,9 +84,10 @@ export function savePendingInput(item: QueueItem): void {
+   const ownerDestination = pendingInputOwner(item.ownerDestination ?? item.destination)
+   const { submissionId, display, text, preparedText, attachments, controlMethod, executionGeneration, inFlight, failed, createdAt, queued, legacyAttempted } = item
+   const destination = inFlight || failed ? item.destination : ownerDestination
+-  writeFileSync(
+-    temporary,
+-    JSON.stringify({
++  const fd = openSync(temporary, 'w', 0o600)
++
++  try {
++    writeFileSync(fd, JSON.stringify({
+       submissionId,
+       destination,
+       ownerDestination,
+@@ -113,11 +101,14 @@ export function savePendingInput(item: QueueItem): void {
+       createdAt,
+       queued,
+       attempted: inFlight || failed
+-    }),
+-    { mode: 0o600, flush: true }
+-  )
++    }))
++    flushFileSync(fd)
++  } finally {
++    closeSync(fd)
++  }
++
+   renameSync(temporary, path)
+-  syncDirectory(dir)
++  flushDirectorySync(dir)
+ }
+ 
+ export function removePendingInput(item: QueueItem): void {
+@@ -132,7 +123,7 @@ export function removePendingInput(item: QueueItem): void {
+   }
+ 
+   rmSync(join(dir, `${item.submissionId}.json`), { force: true })
+-  syncDirectory(dir)
++  flushDirectorySync(dir)
+ }
+ 
+ export function loadPendingInputs(destination: SubmissionDestination, durableResume = false): QueueItem[] {
+diff --git a/ui-tui/vitest.config.ts b/ui-tui/vitest.config.ts
+index b3efa48af91..9ec8fac5d45 100644
+--- a/ui-tui/vitest.config.ts
++++ b/ui-tui/vitest.config.ts
+@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config'
+ 
+ export default defineConfig({
+   test: {
+-    exclude: ['dist/**', 'node_modules/**']
++    exclude: ['dist/**', 'node_modules/**'],
++    setupFiles: ['./vitest.setup.ts']
+   }
+ })
+diff --git a/ui-tui/vitest.setup.ts b/ui-tui/vitest.setup.ts
+new file mode 100644
+index 00000000000..4a58d9cd799
+--- /dev/null
++++ b/ui-tui/vitest.setup.ts
+@@ -0,0 +1,11 @@
++import { vi } from 'vitest'
++
++// A physical flush costs whatever the shared disk is doing, not what the code under test does:
++// on CI one fsync behind the concurrent checks' writeback has outlasted the 5 s test budget.
++// Suites still write, rename and read the real journal; only the flush is a no-op here.
++// src/__tests__/durableFlush.test.ts asserts flush ordering and the real module's syscalls.
++vi.mock('./src/lib/durableFlush.js', () => ({
++  flushDirectorySync: vi.fn(),
++  flushFileHandle: vi.fn(async () => {}),
++  flushFileSync: vi.fn()
++}))
+-- 
+2.55.0
+

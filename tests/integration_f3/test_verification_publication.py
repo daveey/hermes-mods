@@ -1,7 +1,7 @@
 """Verification continuations must not publish before source reconciliation."""
 import pytest
 
-from test_final_publication import ASK, Model, wire_models
+from test_final_publication import ASK, Model, wire_models, requests, retire
 
 
 @pytest.mark.parametrize("gate_name", ["_verify_on_stop_nudge", "_pre_verify_nudge"])
@@ -13,9 +13,9 @@ def test_retired_candidate_stays_private_during_verification(harness, monkeypatc
     Model(h.agent, monkeypatch, [ASK])
     h.agent.run_conversation("Pick a case with me.")
     ledger = h.steps.core.Ledger()
-    root = ledger.root(h.agent.session_id)
     step = ledger.open_steps(h.agent.session_id)[0]
-    h.steps.core.resolve(ledger, root, [step["id"]], "done", "test")
+    retire(h, step)
+    canonical_before = requests(h)
     cards.calls.clear()
     events.clear()
     nudges = iter(["Verify the result before finishing.", None])
@@ -35,7 +35,8 @@ def test_retired_candidate_stays_private_during_verification(harness, monkeypatc
     user_index = next(i for i, row in enumerate(stored) if row.get("content") == "Report the current status.")
     assert ASK not in str(stored[user_index:])
     assert cards.calls == []
-    assert ledger.open_steps(h.agent.session_id) == []
+    assert h.steps.core.open_steps(h.agent.session_id) == []
+    assert requests(h) == canonical_before
     assert result["final_response"] == (h.steps.core.HELD_REPLY if exhausted else safe)
     assert current[-1]["content"] == stored[-1]["content"] == result["final_response"]
     # Budget fallback is delivered through the returned final, not a delta.

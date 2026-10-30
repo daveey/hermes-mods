@@ -122,6 +122,19 @@ def evaluate(runs: list[dict], shas: list[str], contains, workflows: list[str] |
     return state
 
 
+def run_ref(run: dict, shas: list[str]) -> str:
+    """The run's URL, plus the commit it built when that is a later commit containing the sha(s).
+
+    A run proves (or fails) a commit when its headSha contains it, so the run printed under the requested sha's
+    label may have built a later commit. Its URL got quoted as "CI on <sha>" although that run never built <sha>,
+    and a red run on a later commit may be failing on someone else's change. So name the commit the run built.
+    """
+    head = run.get("headSha") or ""
+    if head and head not in shas:
+        return f"{run['url']} (ran on {head[:10]}, a later commit containing it)"
+    return run["url"]
+
+
 def gh_repo(repo: Path) -> str | None:
     """OWNER/NAME of the checkout's `origin` on GitHub, passed to every `gh` call as `-R`.
 
@@ -237,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             wf_state = evaluate(runs, shas, contains, a.workflow or None)
             if wf_state and all(s["done"] for s in wf_state.values()):
-                print(f"passed {label}: " + ", ".join(f"{n} {s['done']['url']}" for n, s in wf_state.items()))
+                print(f"passed {label}: " + ", ".join(f"{n} {run_ref(s['done'], shas)}" for n, s in wf_state.items()))
                 return 0
             pend = {n: s for n, s in wf_state.items() if not s["done"]}
             active = sum(s["active"] for s in pend.values())
@@ -250,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
             # (exit 1) instead of "not yet" forever.
             if failed and not active:
                 print(f"stalled: newest finished run containing the commit ended "
-                      f"{failed[0]['conclusion']}: {failed[0]['url']}")
+                      f"{failed[0]['conclusion']}: {run_ref(failed[0], shas)}")
                 return 1
             print(f"not yet: {note}")
             return 2
@@ -259,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             last = note
         idle = 0 if active else idle + 1
         if idle >= 2 and time.monotonic() - start >= STARTUP_GRACE_S:
-            reason = (f"newest finished run containing the commit ended {failed[0]['conclusion']}: {failed[0]['url']}"
+            reason = (f"newest finished run containing the commit ended {failed[0]['conclusion']}: {run_ref(failed[0], shas)}"
                       if failed else "no run containing the commit succeeded and none is queued or running")
             if a.dispatch and a.workflow and dispatches < 2:
                 for wf in a.workflow:

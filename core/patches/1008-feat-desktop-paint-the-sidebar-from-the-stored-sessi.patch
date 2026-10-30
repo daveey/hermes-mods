@@ -1,0 +1,1317 @@
+From ce2708ddeed3a67ca3252afdec999a2aa5ce9aab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:59:57 -0700
+Subject: [PATCH] feat(desktop): paint the sidebar from the stored session
+ outcome [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- sessionStatusStripe: row.outcome wins when present (done green, decision red,
+  muted grey, waiting/running grey glyph, unresolved amber); a live turn and a
+  ⌘B park still beat it; no outcome keeps the old derivation.
+- Stripe tooltip from the outcome: summary, open questions, what it waits on,
+  or the unresolved reason in words.
+- ⌘B writes through POST /api/sessions/{id}/mute and reads row.muted; the
+  local list stays as the optimistic cache and as the only record against an
+  older backend. A failed POST reverts and toasts.
+- kanban_notice rows with display_metadata.stale render dimmed, labelled
+  "outdated: card moved on".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index 541c8afa7b83580e514b62bbf6eed300b200f813..ab7a4c5ebaeb266a7f33931eaee7072cc97d459e 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -432,6 +432,27 @@ export function setSessionUnreadRemote(id: string, unread: boolean, profile?: st
+   return mutateSessionHttp(id, 'PATCH', { unread }, sessionWriteProfile(profile))
+ }
+ 
++/** [daveey] Persist a ⌘B park (session-outcome contract: `POST /api/sessions/{id}/mute`). The backend stores
++ *  `sessions.muted` and refreshes the chat's outcome to `muted`. Routes to the row's own gateway; the owning
++ *  profile travels in the body like every other session write (the handler picks its state.db from it). */
++export function setSessionMutedRemote(
++  row: Pick<SessionInfo, 'connection_id' | 'id' | 'profile'>,
++  muted: boolean
++): Promise<{ ok: boolean; muted?: boolean }> {
++  const owner = sessionWriteProfile(row.profile)
++
++  const scope: ProfileScope = row.connection_id
++    ? { connectionId: row.connection_id, profile: owner ?? 'default' }
++    : owner
++
++  return hermesApi<{ ok: boolean; muted?: boolean }>({
++    ...sessionScoped(scope),
++    path: `/api/sessions/${encodeURIComponent(row.id)}/mute`,
++    method: 'POST',
++    body: { muted, ...(owner ? { profile: owner } : {}) }
++  })
++}
++
+ // Full-text search over one profile's sessions. Pass the profile the caller is
+ // showing: an unscoped request lands on the primary backend, which searches
+ // its launch profile's state.db whatever profile the sidebar is on. `null`
+diff --git a/apps/desktop/src/app/chat/session-tab-accent.tsx b/apps/desktop/src/app/chat/session-tab-accent.tsx
+index b06147f9833214df570b9c38b6f680b5908ebe94..a9db3d1c0a07d7677e69d2c1f7bb69d72e328f93 100644
+--- a/apps/desktop/src/app/chat/session-tab-accent.tsx
++++ b/apps/desktop/src/app/chat/session-tab-accent.tsx
+@@ -2,8 +2,7 @@ import type { CSSProperties, ReactNode } from 'react'
+ 
+ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+ import { useSessionDotState } from '@/lib/use-session-dot-state'
+-import { useStoreSelector } from '@/lib/use-session-slice'
+-import { $blockedSessionIds, isSessionBlocked } from '@/store/session-blocked'
++import { useSessionParked } from '@/lib/use-session-parked'
+ import { kanbanStripeCounts, sessionStatusStripe } from '@/store/session-dot-state'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+@@ -18,7 +17,7 @@ interface SessionTabAccentProps {
+ export function SessionTabAccent({ children, session, storedSessionId }: SessionTabAccentProps) {
+   const id = session?.id ?? storedSessionId
+   const state = useSessionDotState(id, session)
+-  const blocked = useStoreSelector($blockedSessionIds, ids => (id ? isSessionBlocked(id, ids) : false))
++  const blocked = useSessionParked(id, session)
+ 
+   const stripe = session?.archived
+     ? null
+@@ -31,7 +30,8 @@ export function SessionTabAccent({ children, session, storedSessionId }: Session
+         session?.review_wait,
+         session?.kanban_attention,
+         kanbanStripeCounts(session ?? {}).waiting,
+-        kanbanStripeCounts(session ?? {}).stalled
++        kanbanStripeCounts(session ?? {}).stalled,
++        session?.outcome
+       )
+ 
+   return (
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+index fd2d040e6301a4b00a93c74efa60a7d21149d62d..c335e799436586c1cdbe5cb21f4f6ddb12d2108c 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+@@ -38,6 +38,12 @@ vi.mock('@/i18n', () => ({
+           kanbanTasks: (open: number, blocked: number) => `${open} open, ${blocked} blocked`,
+           kanbanAttention: (count: number) => `${count} dropped`,
+           kanbanStalled: (count: number) => `${count} stalled`,
++          outcomeDone: 'Done',
++          outcomeDecision: 'Waiting on your decision',
++          outcomeMuted: 'Muted',
++          outcomeRunning: 'Running',
++          outcomeWaiting: 'Waiting',
++          outcomeUnresolved: (reason: null | string) => `Unresolved: ${reason}`,
+           backgroundProcesses: (count: number) => `${count} background processes`,
+           backgroundProcessUnnamed: 'background process',
+           stopProcess: 'Stop',
+@@ -849,3 +855,59 @@ it('does not paint a retained live turn as running on an offline row', () => {
+   expect(container.querySelector('[data-sidebar-stripe]')).toBeNull()
+   act(() => clearAllSessionStates())
+ })
++
++// [daveey] session-outcome: the stored outcome paints the stripe and explains it on hover.
++describe('SidebarSessionRow stored outcome', () => {
++  afterEach(() => {
++    clearAllSessionStates()
++  })
++
++  const stripeOf = (container: HTMLElement) => container.querySelector('[data-slot="session-status-stripe"]')
++
++  it.each([
++    [{ kind: 'done', summary: 'Shipped it' }, 'done', 'emerald', 'Shipped it'],
++    [{ kind: 'decision', items: [{ id: 'us_1', question: 'Merge PR #12?' }] }, 'stuck', 'red', 'Merge PR #12?'],
++    [{ kind: 'muted' }, 'blocked', 'zinc', 'Muted'],
++    [{ kind: 'waiting', on: [{ kind: 'capacity', id: 'hub', label: 'hub slot' }] }, 'waiting', 'zinc', 'capacity: hub slot'],
++    [{ kind: 'running', on: [] }, 'waiting', 'zinc', 'Running'],
++    [{ kind: 'unresolved', reason: 'notice_tail' }, 'attention', 'amber', 'Unresolved: notice_tail']
++  ] as const)('%j paints %s (%s) with its tooltip', (outcome, stripe, colour, tip) => {
++    const { container } = renderRow(
++      // Inputs the old logic would paint green, so the outcome is what decides.
++      makeSession({ message_count: 4, outcome, title: 'Outcome' } as Partial<SessionInfo> & { title: string })
++    )
++
++    expect(container.querySelector('[data-sidebar-stripe]')?.getAttribute('data-sidebar-stripe')).toBe(stripe)
++    expect(stripeOf(container)?.getAttribute('data-outcome')).toBe(outcome.kind)
++    expect(stripeOf(container)?.className).toContain(colour)
++    expect(stripeOf(container)?.getAttribute('aria-label')).toBe(tip)
++  })
++
++  it('without an outcome the row paints as before, with no outcome tooltip', () => {
++    const { container } = renderRow(makeSession({ message_count: 4, title: 'Legacy' }))
++
++    expect(container.querySelector('[data-sidebar-stripe]')?.getAttribute('data-sidebar-stripe')).toBe('done')
++    expect(stripeOf(container)?.getAttribute('aria-label')).toBeNull()
++    expect(stripeOf(container)?.getAttribute('aria-hidden')).toBe('true')
++  })
++
++  it('a live turn still overrides the outcome', () => {
++    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
++
++    const { container } = renderRow(
++      makeSession({ message_count: 4, outcome: { kind: 'unresolved', reason: 'no_summary' }, title: 'Busy' } as Partial<
++        SessionInfo
++      > & { title: string })
++    )
++
++    expect(container.querySelector('[data-sidebar-stripe]')).toBeNull()
++  })
++
++  it('reads the park from row.muted', () => {
++    const { container } = renderRow(
++      makeSession({ message_count: 4, muted: true, title: 'Parked' } as Partial<SessionInfo> & { title: string })
++    )
++
++    expect(container.querySelector('[data-sidebar-stripe]')?.getAttribute('data-sidebar-stripe')).toBe('blocked')
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index c66f51eca182c21c9855e262769403bec7aebde5..801ca4442c8c955b316c7904161f2ebe2de391c5 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -20,12 +20,14 @@ import { pathLeaf } from '@/lib/display-path'
+ import { triggerHaptic } from '@/lib/haptics'
+ import { middleClickHandlers } from '@/lib/middle-click'
+ import { displayModelName } from '@/lib/model-status-label'
++import { outcomeStripe, outcomeTooltip } from '@/lib/session-outcome'
+ import { sessionProjectLabel } from '@/lib/session-project-label'
+ import { SESSION_ROW_AREAS } from '@/lib/session-row-slots'
+ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
+ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+ import { coarseElapsed } from '@/lib/time'
+ import { useSessionDotState } from '@/lib/use-session-dot-state'
++import { useSessionParked } from '@/lib/use-session-parked'
+ import { useStoreSelector } from '@/lib/use-session-slice'
+ import { cn } from '@/lib/utils'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+@@ -35,7 +37,6 @@ import { normalizeProfileKey } from '@/store/profile'
+ import { $projects } from '@/store/projects'
+ import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+ import { sessionPinId } from '@/store/session'
+-import { $blockedSessionIds, isSessionBlocked } from '@/store/session-blocked'
+ import {
+   hasLiveTurn,
+   kanbanStripeCounts,
+@@ -374,7 +375,8 @@ function SidebarSessionRowImpl({
+   // blocked on a human, or a PR it links waits on a review that's on you).
+   // Working: no stripe. A review only others were asked for (<24h) is grey.
+   // ⌘B parks a session as blocked: grey stripe, skipped by ⌘] / ⌘[.
+-  const userBlocked = useStoreSelector($blockedSessionIds, ids => isSessionBlocked(session.id, ids))
++  // [daveey] The park is the backend's `row.muted` now; the local ⌘B list is its optimistic cache.
++  const userBlocked = useSessionParked(session.id, session)
+ 
+   const statusStripe =
+     !rowHasLiveStatus(session)
+@@ -388,9 +390,18 @@ function SidebarSessionRowImpl({
+           session.review_wait,
+           session.kanban_attention,
+           kanbanStripeCounts(session).waiting,
+-          kanbanStripeCounts(session).stalled
++          kanbanStripeCounts(session).stalled,
++          session.outcome
+         )
+ 
++  // [daveey] The stored outcome explains the stripe on hover: the summary, the open questions, what it waits on, or
++  // why it is unresolved. Only while the outcome is what painted it (a park or a live turn beats it).
++  const outcomeKind =
++    statusStripe && !userBlocked && !liveTurn && outcomeStripe(session.outcome) ? session.outcome?.kind : undefined
++
++  const stripeTipText = outcomeKind ? outcomeTooltip(session.outcome, r) : null
++  const stripeTip = stripeTipText ? <span className="whitespace-pre-line">{stripeTipText}</span> : null
++
+   // [daveey] desktop.log trace of every stripe change with the row inputs that fed it (`stripe-transition <sid>`),
+   // so the next "green while work is queued" report has the payload. Change-only and capped inside.
+   useEffect(() => {
+@@ -580,29 +591,41 @@ function SidebarSessionRowImpl({
+         {/* [daveey] A session that owns a live cron job: a tiny grey loop
+             glyph in the stripe's place — it recurs, so it is never "done". */}
+         {(statusStripe === 'periodic' || statusStripe === 'waiting' || statusStripe === 'stalled') && (
+-          <span
+-            aria-hidden="true"
+-            className={cn(
+-              'pointer-events-none absolute top-1/2 -left-0.5 flex -translate-y-1/2 text-(--session-status-color)',
+-              sessionStatusStripeColor(statusStripe)
+-            )}
+-            data-slot="session-status-stripe"
+-            data-status-stripe={statusStripe}
+-          >
+-            {/* [daveey] `waiting`: open kanban cards hold it — the card glyph (amber when `stalled`). */}
+-            <Codicon name={statusStripe === 'periodic' ? 'sync' : 'project'} size="0.5625rem" />
+-          </span>
++          <Tip label={stripeTip}>
++            <span
++              aria-hidden={stripeTipText ? undefined : 'true'}
++              aria-label={stripeTipText ?? undefined}
++              className={cn(
++                'absolute top-1/2 -left-0.5 flex -translate-y-1/2 text-(--session-status-color)',
++                stripeTipText ? 'pointer-events-auto' : 'pointer-events-none',
++                sessionStatusStripeColor(statusStripe)
++              )}
++              data-outcome={outcomeKind}
++              data-slot="session-status-stripe"
++              data-status-stripe={statusStripe}
++              role={stripeTipText ? 'img' : undefined}
++            >
++              {/* [daveey] `waiting`: open kanban cards hold it — the card glyph (amber when `stalled`). */}
++              <Codicon name={statusStripe === 'periodic' ? 'sync' : 'project'} size="0.5625rem" />
++            </span>
++          </Tip>
+         )}
+         {statusStripe && statusStripe !== 'periodic' && statusStripe !== 'waiting' && statusStripe !== 'stalled' && (
+-          <span
+-            aria-hidden="true"
+-            className={cn(
+-              'pointer-events-none absolute top-1 bottom-1 left-0 w-[3px] rounded-full bg-(--session-status-color)',
+-              sessionStatusStripeColor(statusStripe)
+-            )}
+-            data-slot="session-status-stripe"
+-            data-status-stripe={statusStripe}
+-          />
++          <Tip label={stripeTip}>
++            <span
++              aria-hidden={stripeTipText ? undefined : 'true'}
++              aria-label={stripeTipText ?? undefined}
++              className={cn(
++                'absolute top-1 bottom-1 left-0 w-[3px] rounded-full bg-(--session-status-color)',
++                stripeTipText ? 'pointer-events-auto' : 'pointer-events-none',
++                sessionStatusStripeColor(statusStripe)
++              )}
++              data-outcome={outcomeKind}
++              data-slot="session-status-stripe"
++              data-status-stripe={statusStripe}
++              role={stripeTipText ? 'img' : undefined}
++            />
++          </Tip>
+         )}
+         {/* #38072 finding 3: the row's body is a DIV, not a button — the
+             reorder grabber (dnd-kit role="button" + tabIndex, kept for
+diff --git a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
+index 702a14b90cc2f76a3427b8bb0475cd274ba766aa..cbf4be78bad7a926e0c161566ade2c403b25c33f 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/system-message.tsx
+@@ -8,6 +8,7 @@ import { SCAFFOLD_GLYPH_CLASS, SCAFFOLD_LABEL_CLASS, ScaffoldRow } from '@/compo
+ import { Codicon } from '@/components/ui/codicon'
+ import { LogView } from '@/components/ui/log-view'
+ import { ToolIcon } from '@/components/ui/tool-icon'
++import { useI18n } from '@/i18n'
+ import { LinkifiedText } from '@/lib/external-link'
+ import { cn } from '@/lib/utils'
+ 
+@@ -67,11 +68,37 @@ export const SystemMessage: FC = () => {
+   const text = useAuiState(s => messageContentText(s.message.content))
+   const asyncResult = useAuiState(s => s.message.metadata.custom?.asyncResult)
+   const processResult = useAuiState(s => s.message.metadata.custom?.asyncResultKind === 'process')
++  const staleNotice = useAuiState(s => s.message.metadata.custom?.staleNotice === true)
++  const { t } = useI18n()
+ 
+   if (!text) {
+     return null
+   }
+ 
++  // [daveey] A blocked-card notice whose card has since left `blocked`: kept for the record, dimmed, and labelled so
++  // it no longer reads as a live ask.
++  if (staleNotice) {
++    const multiline = text.includes('\n')
++
++    return (
++      <MessagePrimitive.Root
++        className={cn(
++          'w-[60%] max-w-[44rem] self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55 opacity-60',
++          multiline ? 'text-left' : 'text-center'
++        )}
++        data-role="system"
++        data-slot="aui_system-message-root"
++        data-stale-notice=""
++      >
++        <span className="mr-1.5 font-medium text-muted-foreground/70" data-slot="stale-notice-label">
++          {t.assistant.thread.staleNotice}
++        </span>
++        <LinkifiedText className="whitespace-pre-wrap" explicitOnly pretty={false} text={text} />{' '}
++        <MessageTimelineTimestamp className={cn(multiline ? 'mt-0.5 block' : 'ml-1.5')} />
++      </MessagePrimitive.Root>
++    )
++  }
++
+   if (processResult || (typeof asyncResult === 'string' && asyncResult)) {
+     return (
+       <MessagePrimitive.Root
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index c3d6a82fda07598181d974de0d22385c449ff23a..d465d0ed68ef146b4d1ba81c1638a0a578006954 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -46,6 +46,7 @@
+   "assistant.mcpSetup.reloadFailed": ["ar","ja","zh-hant"],
+   "assistant.mcpSetup.sendFailed": ["ar","ja","zh-hant"],
+   "assistant.mcpSetup.toolCount": ["ar","ja","zh-hant"],
++  "assistant.thread.staleNotice": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "assistant.thread.errorAuthKinds.api_key.body": ["ar","ja","ru","zh","zh-hant"],
+   "assistant.thread.errorAuthKinds.api_key.title": ["ar","ja","ru","zh","zh-hant"],
+   "assistant.thread.errorAuthKinds.oauth.title": ["ar","ja","ru","zh","zh-hant"],
+@@ -2025,6 +2026,13 @@
+   "sidebar.row.kanbanTasks": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "sidebar.row.kanbanAttention": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "sidebar.row.kanbanStalled": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.outcomeDone": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.outcomeDecision": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.outcomeMuted": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.outcomeRunning": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.outcomeWaiting": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.outcomeUnresolved": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.muteFailed": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "sidebar.row.backgroundProcesses": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "sidebar.row.backgroundProcessUnnamed": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "sidebar.row.stopProcess": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 173000930a7469f75ed00dd8a0ba9b1c12c53c37..731eb1a6ee51d81a6aafcacfa7710669d92a62f0 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -2885,6 +2885,14 @@ catalog: CatalogTranslations
+       kanbanTasks: (open: number, blocked: number) => string
+       kanbanAttention: (count: number) => string
+       kanbanStalled: (count: number) => string
++      /** [daveey] Status-stripe tooltips for a row's stored outcome (session-outcome contract). */
++      outcomeDone: string
++      outcomeDecision: string
++      outcomeMuted: string
++      outcomeRunning: string
++      outcomeWaiting: string
++      outcomeUnresolved: (reason: null | string) => string
++      muteFailed: string
+       backgroundProcesses: (count: number) => string
+       backgroundProcessUnnamed: string
+       stopProcess: string
+@@ -3904,6 +3912,8 @@ catalog: CatalogTranslations
+       react: string
+       dismissError: string
+       responseStopped: string
++      /** [daveey] Label on a blocked kanban notice whose card has since moved on. */
++      staleNotice: string
+       /** Layer titles for the structured error card (agent/error_surface.py).
+        *  `generic` is the fallback when the backend sent no descriptor. */
+       errorLayers: {
+diff --git a/apps/desktop/src/lib/chat-messages.test.ts b/apps/desktop/src/lib/chat-messages.test.ts
+index 7c2b26d3ecb2b8bcadaac2e17e0d7c6240a3cc42..92535feeda684dcd68eabe9ef013c6feaf45ea6f 100644
+--- a/apps/desktop/src/lib/chat-messages.test.ts
++++ b/apps/desktop/src/lib/chat-messages.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from 'vitest'
+ 
++import { toRuntimeMessage } from '@/lib/chat-runtime'
+ import { toolResultRecord } from '@/lib/tool-result-metadata'
+ import type { SessionMessage } from '@/types/hermes'
+ 
+@@ -596,6 +597,40 @@ describe('toChatMessages', () => {
+     expect(chatMessageText(messages[1])).toBe('✔ Kanban t_1 done — shipped')
+   })
+ 
++  // [daveey] session-outcome: the backend marks a blocked notice `stale` once its card leaves `blocked`.
++  it('flags a kanban notice the backend marked stale, and only that one', () => {
++    const messages = toChatMessages([
++      { role: 'user', content: 'start the cards', timestamp: 1 },
++      {
++        role: 'user',
++        content: '⏸ Kanban t_1 blocked',
++        display_kind: 'kanban_notice',
++        display_metadata: { display_text: '⏸ Kanban t_1 blocked', stale: true },
++        timestamp: 2
++      },
++      {
++        role: 'user',
++        content: '⏸ Kanban t_2 blocked',
++        display_kind: 'kanban_notice',
++        // An older backend serves display_metadata as raw JSON text.
++        display_metadata: JSON.stringify({ display_text: '⏸ Kanban t_2 blocked', stale: true }),
++        timestamp: 3
++      },
++      {
++        role: 'user',
++        content: '✔ Kanban t_3 done',
++        display_kind: 'kanban_notice',
++        display_metadata: { display_text: '✔ Kanban t_3 done' },
++        timestamp: 4
++      }
++    ])
++
++    expect(messages.map(message => message.role)).toEqual(['user', 'system', 'system', 'system'])
++    expect(messages.map(message => message.staleNotice === true)).toEqual([false, true, true, false])
++    expect(toRuntimeMessage(messages[1]).metadata.custom).toMatchObject({ staleNotice: true })
++    expect(toRuntimeMessage(messages[3]).metadata.custom).not.toHaveProperty('staleNotice')
++  })
++
+   it('never paints a background-process heartbeat wake as a user bubble', () => {
+     // Current backends type the wake `display_kind: 'hidden'`; a row persisted by an older
+     // backend arrives untyped and must disappear the same way — the user never wrote it.
+diff --git a/apps/desktop/src/lib/chat-messages/types.ts b/apps/desktop/src/lib/chat-messages/types.ts
+index c85c0a22f8c1b4e29c605eaf3c392f71bb2555b6..2c682d382a76b56773bf0978e65369bfe0976a1f 100644
+--- a/apps/desktop/src/lib/chat-messages/types.ts
++++ b/apps/desktop/src/lib/chat-messages/types.ts
+@@ -39,6 +39,8 @@ export type ChatMessage = {
+   /** Result body only; the system text remains the compact completion label. */
+   asyncResult?: string
+   asyncResultKind?: 'process'
++  /** [daveey] A blocked kanban notice whose card has since moved on: rendered dimmed, labelled outdated. */
++  staleNotice?: boolean
+   timestamp?: number
+   completedAt?: number
+   pending?: boolean
+diff --git a/apps/desktop/src/lib/chat-runtime.ts b/apps/desktop/src/lib/chat-runtime.ts
+index 190148142ca6078a02469b9af6e92fb3b06f6ced..8293567ac5211b4bfd68d758324ecfcf24fe4cc2 100644
+--- a/apps/desktop/src/lib/chat-runtime.ts
++++ b/apps/desktop/src/lib/chat-runtime.ts
+@@ -466,7 +466,8 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
+         custom: {
+           ...timelineMeta,
+           ...(message.asyncResult ? { asyncResult: message.asyncResult } : {}),
+-          ...(message.asyncResultKind ? { asyncResultKind: message.asyncResultKind } : {})
++          ...(message.asyncResultKind ? { asyncResultKind: message.asyncResultKind } : {}),
++          ...(message.staleNotice ? { staleNotice: true } : {})
+         }
+       }
+     } as ThreadMessage
+diff --git a/apps/desktop/src/lib/session-outcome.test.ts b/apps/desktop/src/lib/session-outcome.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e8f094740738db53bc1b9fca7cdd3eed5b6b8fd
+--- /dev/null
++++ b/apps/desktop/src/lib/session-outcome.test.ts
+@@ -0,0 +1,193 @@
++import { describe, expect, it } from 'vitest'
++
++import { TRANSLATIONS } from '@/i18n/catalog'
++import { type SessionDotState, sessionStatusStripe } from '@/store/session-dot-state'
++import type { SessionOutcome } from '@/types/hermes'
++
++import { outcomeEtaLabel, outcomeStripe, outcomeTooltip, outcomeWaitingLine } from './session-outcome'
++
++const r = TRANSLATIONS.en.sidebar.row
++
++const OUTCOMES: Record<string, SessionOutcome> = {
++  done: { kind: 'done', source: 'declared', summary: 'Shipped PR #12 and closed the card.' },
++  decision: {
++    kind: 'decision',
++    items: [
++      {
++        id: 'us_1',
++        question: 'Merge PR #12?',
++        choices: [
++          { label: 'Yes', value: 'yes' },
++          { label: 'No', value: 'no' }
++        ]
++      },
++      { id: 'card:t_9', question: 'Rent a GPU for the eval?', card_id: 't_9', state: 'open' }
++    ]
++  },
++  muted: { kind: 'muted' },
++  waiting: {
++    kind: 'waiting',
++    on: [
++      { kind: 'card', id: 't_abc', state: 'scheduled', eta: 1_793_300_000 },
++      { kind: 'capacity', id: 'hub', label: 'hub slot' }
++    ]
++  },
++  running: { kind: 'running', on: [{ kind: 'subagent', id: 'sa_1', label: 'review lane', state: 'running' }] },
++  unresolved: { kind: 'unresolved', reason: 'notice_tail' }
++}
++
++// Every input the old derivation reads, in the combinations that give each of its answers.
++type Inputs = Parameters<typeof sessionStatusStripe>
++
++const OLD_LOGIC_CASES: Inputs[] = [
++  ['idle', true],
++  ['idle', false],
++  ['unread', true],
++  ['draft', false],
++  ['background', true],
++  ['working', true],
++  ['stalled', true],
++  ['needs-input', true],
++  ['idle', true, true],
++  ['idle', true, false, 1],
++  ['idle', true, false, 0, true],
++  ['idle', true, false, 0, false, 'stuck'],
++  ['idle', true, false, 0, false, 'parked'],
++  ['idle', true, false, 0, false, null, 1],
++  ['background', true, false, 0, false, null, 0, 2],
++  ['background', true, false, 0, false, null, 0, 2, 1],
++  ['working', true, false, 1, false, 'stuck', 1, 2, 1]
++]
++
++describe('sessionStatusStripe with a stored outcome', () => {
++  it.each([
++    ['done', 'done'],
++    ['decision', 'stuck'],
++    ['muted', 'blocked'],
++    ['waiting', 'waiting'],
++    ['running', 'waiting'],
++    ['unresolved', 'attention']
++  ] as const)('%s paints %s', (kind, stripe) => {
++    expect(outcomeStripe(OUTCOMES[kind])).toBe(stripe)
++    // Wins over every derived input that would otherwise paint something else.
++    expect(sessionStatusStripe('idle', true, false, 3, true, 'stuck', 2, 4, 1, OUTCOMES[kind])).toBe(stripe)
++    expect(sessionStatusStripe('background', false, false, 0, false, null, 0, 0, 0, OUTCOMES[kind])).toBe(stripe)
++    expect(sessionStatusStripe('unread', true, false, 0, false, null, 0, 0, 0, OUTCOMES[kind])).toBe(stripe)
++  })
++
++  it.each(OLD_LOGIC_CASES)('outcome absent keeps the old answer: %j', (...inputs) => {
++    const [state, hasTurns, userBlocked, kBlocked, periodic, review, attention, waiting, stalled] = inputs
++
++    const legacy = sessionStatusStripe(
++      state,
++      hasTurns,
++      userBlocked,
++      kBlocked,
++      periodic,
++      review,
++      attention,
++      waiting,
++      stalled
++    )
++
++    expect(
++      sessionStatusStripe(
++        state,
++        hasTurns,
++        userBlocked,
++        kBlocked,
++        periodic,
++        review,
++        attention,
++        waiting,
++        stalled,
++        undefined
++      )
++    ).toBe(legacy)
++    expect(
++      sessionStatusStripe(state, hasTurns, userBlocked, kBlocked, periodic, review, attention, waiting, stalled, null)
++    ).toBe(legacy)
++    // A kind this app does not know falls back too, rather than painting a guess.
++    expect(
++      sessionStatusStripe(state, hasTurns, userBlocked, kBlocked, periodic, review, attention, waiting, stalled, {
++        kind: 'from-the-future'
++      })
++    ).toBe(legacy)
++  })
++
++  it('pins the old answers the fallback must keep', () => {
++    expect(sessionStatusStripe('idle', true)).toBe('done')
++    expect(sessionStatusStripe('idle', false)).toBeNull()
++    expect(sessionStatusStripe('needs-input', true)).toBe('stuck')
++    expect(sessionStatusStripe('idle', true, true)).toBe('blocked')
++    expect(sessionStatusStripe('idle', true, false, 0, false, null, 1)).toBe('attention')
++    expect(sessionStatusStripe('background', true, false, 0, false, null, 0, 2, 1)).toBe('stalled')
++  })
++
++  it.each(['working', 'stalled', 'needs-input'] as SessionDotState[])(
++    'the live dot (%s) still overrides every outcome',
++    state => {
++      for (const outcome of Object.values(OUTCOMES)) {
++        expect(sessionStatusStripe(state, true, false, 0, false, null, 0, 0, 0, outcome)).toBe(
++          sessionStatusStripe(state, true)
++        )
++      }
++    }
++  )
++
++  it('a ⌘B park still beats the outcome', () => {
++    for (const outcome of Object.values(OUTCOMES)) {
++      expect(sessionStatusStripe('idle', true, true, 0, false, null, 0, 0, 0, outcome)).toBe('blocked')
++    }
++  })
++})
++
++describe('outcomeTooltip', () => {
++  it('done shows the summary', () => {
++    expect(outcomeTooltip(OUTCOMES.done, r)).toBe('Shipped PR #12 and closed the card.')
++    expect(outcomeTooltip({ kind: 'done' }, r)).toBe('Done')
++  })
++
++  it('decision lists the questions, one per line', () => {
++    expect(outcomeTooltip(OUTCOMES.decision, r)).toBe('Merge PR #12?\nRent a GPU for the eval?')
++    expect(outcomeTooltip({ kind: 'decision', items: [] }, r)).toBe('Waiting on your decision')
++  })
++
++  it('muted says so', () => {
++    expect(outcomeTooltip(OUTCOMES.muted, r)).toBe('Muted')
++  })
++
++  it('waiting and running list what they wait on', () => {
++    expect(outcomeTooltip(OUTCOMES.waiting, r)).toBe(
++      `t_abc scheduled · ${outcomeEtaLabel(1_793_300_000)}\ncapacity: hub slot`
++    )
++    expect(outcomeTooltip(OUTCOMES.running, r)).toBe('subagent: review lane running')
++    expect(outcomeTooltip({ kind: 'waiting' }, r)).toBe('Waiting')
++    expect(outcomeTooltip({ kind: 'running', on: [] }, r)).toBe('Running')
++  })
++
++  it.each([
++    ['notice_tail', 'Unresolved: a card update arrived and nothing answered it'],
++    ['no_summary', 'Unresolved: the last reply did not wrap the work up'],
++    ['turn_failed', 'Unresolved: the last turn failed'],
++    ['interrupted', 'Unresolved: the last turn was interrupted'],
++    ['subagent_killed', 'Unresolved: a subagent was stopped before it finished'],
++    ['empty', 'Unresolved: no messages yet'],
++    [undefined, 'Unresolved']
++  ])('unresolved{%s} gives the reason in words', (reason, text) => {
++    expect(outcomeTooltip({ kind: 'unresolved', reason }, r)).toBe(text)
++  })
++
++  it('nothing for no outcome or an unknown kind', () => {
++    expect(outcomeTooltip(undefined, r)).toBeNull()
++    expect(outcomeTooltip(null, r)).toBeNull()
++    expect(outcomeTooltip({ kind: 'from-the-future' }, r)).toBeNull()
++  })
++
++  it('formats the ETA as local HH:MM', () => {
++    const eta = new Date(2026, 9, 29, 14, 5).getTime() / 1000
++
++    expect(outcomeEtaLabel(eta)).toBe('14:05')
++    expect(outcomeWaitingLine({ kind: 'card', id: 't_1', state: 'scheduled', eta })).toBe('t_1 scheduled · 14:05')
++  })
++})
+diff --git a/apps/desktop/src/lib/session-outcome.ts b/apps/desktop/src/lib/session-outcome.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b79b2b20373a7de41a7d2a05958d239a3e5ef8f4
+--- /dev/null
++++ b/apps/desktop/src/lib/session-outcome.ts
+@@ -0,0 +1,89 @@
++/**
++ * [daveey] A chat's stored outcome (session-outcome contract): the backend keeps exactly one per non-archived chat
++ * (`row.outcome`), and the sidebar paints from it instead of guessing from idleness. This module maps it to the
++ * row's status stripe and to the stripe's tooltip. A row without `outcome` (an older backend) maps to nothing, and
++ * `sessionStatusStripe` falls back to its old derivation.
++ */
++import type { Translations } from '@/i18n'
++import type { SessionStatusStripe } from '@/store/session-dot-state'
++import type { SessionOutcome, SessionOutcomeWaitingOn } from '@/types/hermes'
++
++/** The stripe an outcome paints. done → green, decision → red, muted → grey (parked, like ⌘B), waiting / running
++ *  → the existing grey "waiting" glyph, unresolved → amber (the `attention` tone). Null for a kind this app does
++ *  not know, so the caller falls back to the old logic rather than painting a guess. */
++export const outcomeStripe = (outcome: null | SessionOutcome | undefined): null | SessionStatusStripe => {
++  switch (outcome?.kind) {
++    case 'done':
++      return 'done'
++
++    case 'decision':
++      return 'stuck'
++
++    case 'muted':
++      return 'blocked'
++
++    case 'waiting':
++
++    case 'running':
++      return 'waiting'
++
++    case 'unresolved':
++      return 'attention'
++
++    default:
++      return null
++  }
++}
++
++const pad2 = (n: number) => String(n).padStart(2, '0')
++
++/** Local wall-clock `HH:MM` for an epoch-seconds ETA. */
++export const outcomeEtaLabel = (eta: number): string => {
++  const date = new Date(eta * 1000)
++
++  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
++}
++
++/** One `on[]` entry in words: a card reads `t_… scheduled · 14:00`, anything else `capacity: hub slot`. */
++export const outcomeWaitingLine = (item: SessionOutcomeWaitingOn): string => {
++  const head = item.kind === 'card' ? item.id : `${item.kind}: ${item.label || item.id}`
++  const state = item.state ? ` ${item.state}` : ''
++  const eta = typeof item.eta === 'number' && Number.isFinite(item.eta) ? ` · ${outcomeEtaLabel(item.eta)}` : ''
++
++  return `${head}${state}${eta}`
++}
++
++type RowCopy = Pick<
++  Translations['sidebar']['row'],
++  'outcomeDecision' | 'outcomeDone' | 'outcomeMuted' | 'outcomeRunning' | 'outcomeUnresolved' | 'outcomeWaiting'
++>
++
++/** The stripe's tooltip for an outcome, or null when the row has none (old backend, or an unknown kind). */
++export const outcomeTooltip = (outcome: null | SessionOutcome | undefined, r: RowCopy): null | string => {
++  switch (outcome?.kind) {
++    case 'done':
++      return outcome.summary?.trim() || r.outcomeDone
++    case 'decision': {
++      const questions = (outcome.items ?? []).map(item => item.question?.trim()).filter(Boolean)
++
++      return questions.length ? questions.join('\n') : r.outcomeDecision
++    }
++
++    case 'muted':
++      return r.outcomeMuted
++
++    case 'waiting':
++    case 'running': {
++      const lines = (outcome.on ?? []).map(outcomeWaitingLine)
++      const fallback = outcome.kind === 'running' ? r.outcomeRunning : r.outcomeWaiting
++
++      return lines.length ? lines.join('\n') : fallback
++    }
++
++    case 'unresolved':
++      return r.outcomeUnresolved(outcome.reason ?? null)
++
++    default:
++      return null
++  }
++}
+diff --git a/apps/desktop/src/lib/use-session-parked.ts b/apps/desktop/src/lib/use-session-parked.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ede8e901b35feba0bccbcb414ec743ca9e2a178
+--- /dev/null
++++ b/apps/desktop/src/lib/use-session-parked.ts
+@@ -0,0 +1,28 @@
++import { $sessions } from '@/store/session'
++import {
++  $blockedSessionIds,
++  $muteWriteGuard,
++  isSessionBlocked,
++  muteWriteFor,
++  resolveSessionParked
++} from '@/store/session-blocked'
++import type { SessionInfo } from '@/types/hermes'
++
++import { useStoresSelector } from './use-session-slice'
++
++/** [daveey] Whether a row is parked (⌘B): a fresh ⌘B write, else the backend's `row.muted`, else the local list.
++ *  Re-renders only when that boolean flips. */
++export function useSessionParked(
++  id: null | string | undefined,
++  row: null | Partial<Pick<SessionInfo, 'muted'>> | undefined
++): boolean {
++  return useStoresSelector([$blockedSessionIds, $muteWriteGuard, $sessions], () =>
++    id
++      ? resolveSessionParked(
++          isSessionBlocked(id, $blockedSessionIds.get(), $sessions.get()),
++          row,
++          muteWriteFor(id, $muteWriteGuard.get(), $sessions.get())
++        )
++      : false
++  )
++}
+diff --git a/apps/desktop/src/store/session-blocked.test.ts b/apps/desktop/src/store/session-blocked.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6e5c891c6ab75809e620ca1b5e41f6068bb7d65
+--- /dev/null
++++ b/apps/desktop/src/store/session-blocked.test.ts
+@@ -0,0 +1,129 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { SessionInfo } from '@/types/hermes'
++
++vi.mock('./notifications', () => ({ notifyError: vi.fn() }))
++vi.mock('@/hermes', () => ({ setSessionMutedRemote: vi.fn() }))
++
++import { setSessionMutedRemote } from '@/hermes'
++
++import { notifyError } from './notifications'
++import { $sessions, setSessions } from './session'
++import {
++  $blockedSessionIds,
++  $muteWriteGuard,
++  isSessionParked,
++  MUTE_WRITE_GUARD_MS,
++  resolveSessionParked,
++  toggleSessionBlocked,
++  writeSessionMuted
++} from './session-blocked'
++
++const row = (overrides: Partial<SessionInfo> = {}): SessionInfo =>
++  ({ id: 's1', message_count: 3, profile: 'default', ...overrides }) as unknown as SessionInfo
++
++const mutedOf = (id: string) => $sessions.get().find(entry => entry.id === id)?.muted
++
++beforeEach(() => {
++  $blockedSessionIds.set([])
++  $muteWriteGuard.set(new Map())
++  setSessions([])
++  vi.mocked(notifyError).mockClear()
++  vi.mocked(setSessionMutedRemote).mockReset()
++})
++
++afterEach(() => {
++  vi.useRealTimers()
++})
++
++describe('resolveSessionParked', () => {
++  it('reads row.muted when the backend stamps it', () => {
++    expect(resolveSessionParked(false, { muted: true }, undefined)).toBe(true)
++    // The backend is the authority: a stale local entry does not park an unmuted row.
++    expect(resolveSessionParked(true, { muted: false }, undefined)).toBe(false)
++  })
++
++  it('falls back to the local ⌘B list when the row has no muted (older backend)', () => {
++    expect(resolveSessionParked(true, {}, undefined)).toBe(true)
++    expect(resolveSessionParked(false, undefined, undefined)).toBe(false)
++  })
++
++  it('a fresh write outranks the row; a stale one does not', () => {
++    const now = 1_000_000
++
++    expect(resolveSessionParked(false, { muted: false }, { at: now - 1, value: true }, now)).toBe(true)
++    expect(resolveSessionParked(false, { muted: false }, { at: now - MUTE_WRITE_GUARD_MS - 1, value: true }, now)).toBe(
++      false
++    )
++  })
++})
++
++describe('⌘B mute write-through', () => {
++  it('success: paints at once, POSTs the new value, and stamps row.muted', async () => {
++    setSessions([row({ muted: false })])
++    let resolvePost!: (value: { ok: boolean; muted?: boolean }) => void
++    vi.mocked(setSessionMutedRemote).mockImplementation(() => new Promise(resolve => (resolvePost = resolve)))
++
++    expect(toggleSessionBlocked('s1')).toBe(true)
++
++    // Optimistic: parked before the backend answers, even though row.muted still says false.
++    expect(isSessionParked('s1')).toBe(true)
++    expect($blockedSessionIds.get()).toEqual(['s1'])
++    expect(setSessionMutedRemote).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }), true)
++
++    resolvePost({ ok: true, muted: true })
++    await vi.waitFor(() => expect(mutedOf('s1')).toBe(true))
++    expect(notifyError).not.toHaveBeenCalled()
++
++    // Toggling again un-parks through the same path.
++    vi.mocked(setSessionMutedRemote).mockResolvedValue({ ok: true, muted: false })
++    expect(toggleSessionBlocked('s1')).toBe(false)
++    expect(setSessionMutedRemote).toHaveBeenLastCalledWith(expect.objectContaining({ id: 's1' }), false)
++    await vi.waitFor(() => expect(mutedOf('s1')).toBe(false))
++    expect(isSessionParked('s1')).toBe(false)
++    expect($blockedSessionIds.get()).toEqual([])
++  })
++
++  it('failure: reverts the optimistic park and shows the error toast', async () => {
++    setSessions([row({ muted: false })])
++    const error = new Error('500 Internal Server Error')
++    vi.mocked(setSessionMutedRemote).mockRejectedValue(error)
++
++    await writeSessionMuted(row({ muted: false }), true)
++
++    expect(isSessionParked('s1')).toBe(false)
++    expect($blockedSessionIds.get()).toEqual([])
++    expect($muteWriteGuard.get().size).toBe(0)
++    expect(mutedOf('s1')).toBe(false)
++    expect(notifyError).toHaveBeenCalledWith(error, 'Could not update the parked state')
++  })
++
++  it('failure on un-park: the row stays parked', async () => {
++    setSessions([row({ muted: true })])
++    $blockedSessionIds.set(['s1'])
++    vi.mocked(setSessionMutedRemote).mockRejectedValue(new Error('network down'))
++
++    await writeSessionMuted(row({ muted: true }), false)
++
++    expect(isSessionParked('s1')).toBe(true)
++    expect($blockedSessionIds.get()).toEqual(['s1'])
++    expect(notifyError).toHaveBeenCalledTimes(1)
++  })
++
++  it('an older backend without the endpoint keeps the local-only park, silently', async () => {
++    setSessions([row()])
++    vi.mocked(setSessionMutedRemote).mockRejectedValue(new Error('404 Not Found'))
++
++    await writeSessionMuted(row(), true)
++
++    expect(isSessionParked('s1')).toBe(true)
++    expect($blockedSessionIds.get()).toEqual(['s1'])
++    expect(notifyError).not.toHaveBeenCalled()
++  })
++
++  it('a draft with no persisted row stays local and never POSTs', () => {
++    expect(toggleSessionBlocked('draft-1')).toBe(true)
++    expect($blockedSessionIds.get()).toEqual(['draft-1'])
++    expect(setSessionMutedRemote).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/store/session-blocked.ts b/apps/desktop/src/store/session-blocked.ts
+index 2fcb836d29e8922e68fc42c1c31b4c95a36d589a..d8faf9b9069760e05639aa7c2a66f1aa50dbc403 100644
+--- a/apps/desktop/src/store/session-blocked.ts
++++ b/apps/desktop/src/store/session-blocked.ts
+@@ -1,6 +1,13 @@
++import { atom } from 'nanostores'
++
++import { setSessionMutedRemote } from '@/hermes'
++import { translateNow } from '@/i18n'
++import { isMissingRestEndpoint } from '@/lib/gateway-rpc'
+ import { Codecs, persistentAtom } from '@/lib/persisted'
++import type { SessionInfo } from '@/types/hermes'
+ 
+-import { $sessions, lineageAliases } from './session'
++import { notifyError } from './notifications'
++import { $sessions, lineageAliases, setSessions } from './session'
+ 
+ /**
+  * [daveey] Sessions the user marked "blocked" with ⌘B — parked on something
+@@ -9,6 +16,12 @@ import { $sessions, lineageAliases } from './session'
+  *
+  * Local to this window's storage. Compression rotates a conversation's stored
+  * id, so membership is checked across the whole lineage.
++ *
++ * [daveey] session-outcome: the backend owns the park now (`sessions.muted`,
++ * `POST /api/sessions/{id}/mute`, read back as `row.muted`). This list stays as
++ * the optimistic cache, and as the only record against a backend that predates
++ * `muted` (the row carries no `muted`, or the endpoint 404s): then ⌘B behaves
++ * exactly as before.
+  */
+ export const $blockedSessionIds = persistentAtom<string[]>(
+   'hermes.desktop.blockedSessionIds',
+@@ -16,7 +29,20 @@ export const $blockedSessionIds = persistentAtom<string[]>(
+   Codecs.stringArray
+ )
+ 
++/** [daveey] How long a ⌘B write outranks the row's `muted`: a list page already in flight when we POST can land
++ *  after the ack carrying the old value (same pattern as the unread write guard). */
++export const MUTE_WRITE_GUARD_MS = 10_000
++
++export interface MuteWrite {
++  at: number
++  value: boolean
++}
++
++/** [daveey] id → the park value we last wrote and when. Fresh entries outrank `row.muted`. */
++export const $muteWriteGuard = atom<ReadonlyMap<string, MuteWrite>>(new Map())
++
+ type LineageRows = Parameters<typeof lineageAliases>[1]
++type MuteRow = Pick<SessionInfo, 'id'> & Partial<Pick<SessionInfo, 'connection_id' | 'muted' | 'profile'>>
+ 
+ export function isSessionBlocked(
+   id: string,
+@@ -30,19 +56,131 @@ export function isSessionBlocked(
+   return lineageAliases(id, sessions).some(alias => blocked.includes(alias))
+ }
+ 
+-/** Flip the flag; returns the new state. Unblocking clears every alias. */
++/** [daveey] The park a row shows: a fresh ⌘B write, else the backend's `row.muted`, else the local list (an older
++ *  backend that stamps no `muted`). Pure, so every surface resolves it the same way. */
++export function resolveSessionParked(
++  localBlocked: boolean,
++  row: null | Partial<Pick<SessionInfo, 'muted'>> | undefined,
++  write: MuteWrite | undefined,
++  now: number = Date.now()
++): boolean {
++  if (write && now - write.at < MUTE_WRITE_GUARD_MS) {
++    return write.value
++  }
++
++  if (typeof row?.muted === 'boolean') {
++    return row.muted
++  }
++
++  return localBlocked
++}
++
++/** [daveey] The ⌘B write recorded for any alias of `id`, if any. */
++export function muteWriteFor(
++  id: string,
++  guard: ReadonlyMap<string, MuteWrite> = $muteWriteGuard.get(),
++  sessions: LineageRows = $sessions.get()
++): MuteWrite | undefined {
++  if (guard.size === 0) {
++    return undefined
++  }
++
++  for (const alias of lineageAliases(id, sessions)) {
++    const write = guard.get(alias)
++
++    if (write) {
++      return write
++    }
++  }
++
++  return undefined
++}
++
++/** [daveey] Whether `id` is parked, reading the stores. Pass `row` when the caller holds it (a project-tree row is
++ *  not in `$sessions`). */
++export function isSessionParked(id: string, row?: null | Partial<Pick<SessionInfo, 'muted'>>): boolean {
++  const sessions = $sessions.get()
++  const listed = row ?? sessions.find(entry => entry.id === id)
++
++  return resolveSessionParked(isSessionBlocked(id, $blockedSessionIds.get(), sessions), listed, muteWriteFor(id))
++}
++
++function setLocalBlocked(id: string, blocked: boolean, sessions: LineageRows): void {
++  const current = $blockedSessionIds.get()
++
++  if (blocked) {
++    if (!isSessionBlocked(id, current, sessions)) {
++      $blockedSessionIds.set([...current, id])
++    }
++
++    return
++  }
++
++  const aliases = new Set(lineageAliases(id, sessions))
++  $blockedSessionIds.set(current.filter(entry => !aliases.has(entry)))
++}
++
++function setMuteWrite(id: string, write: MuteWrite | null): void {
++  const next = new Map($muteWriteGuard.get())
++
++  if (write) {
++    next.set(id, write)
++  } else {
++    next.delete(id)
++  }
++
++  $muteWriteGuard.set(next)
++}
++
++function setRowMuted(id: string, muted: boolean): void {
++  setSessions(rows => (rows.some(row => row.id === id) ? rows.map(row => (row.id === id ? { ...row, muted } : row)) : rows))
++}
++
++/** [daveey] Write a park through to the backend. Optimistic: the local list and the guard paint at once; a failed
++ *  POST rolls both back and shows the normal error toast. A backend without the endpoint keeps the local-only
++ *  park, as before. */
++export async function writeSessionMuted(
++  row: MuteRow,
++  muted: boolean,
++  post: (row: MuteRow, muted: boolean) => Promise<unknown> = setSessionMutedRemote
++): Promise<void> {
++  const sessions = $sessions.get()
++  const previous = isSessionParked(row.id, row)
++
++  setMuteWrite(row.id, { at: Date.now(), value: muted })
++  setLocalBlocked(row.id, muted, sessions)
++
++  try {
++    await post(row, muted)
++    setRowMuted(row.id, muted)
++  } catch (error) {
++    if (isMissingRestEndpoint(error)) {
++      // An older backend: the local list is the only record, exactly as before this endpoint existed.
++      setMuteWrite(row.id, null)
++
++      return
++    }
++
++    setMuteWrite(row.id, null)
++    setLocalBlocked(row.id, previous, $sessions.get())
++    notifyError(error, translateNow('sidebar.row.muteFailed'))
++  }
++}
++
++/** Flip the flag; returns the new state. Unblocking clears every alias. [daveey] A persisted row writes through to
++ *  the backend (`writeSessionMuted`); a draft with no row stays local-only. */
+ export function toggleSessionBlocked(id: string): boolean {
+   const sessions = $sessions.get()
+-  const blocked = $blockedSessionIds.get()
++  const row = sessions.find(entry => entry.id === id)
++  const next = !isSessionParked(id, row)
+ 
+-  if (isSessionBlocked(id, blocked, sessions)) {
+-    const aliases = new Set(lineageAliases(id, sessions))
+-    $blockedSessionIds.set(blocked.filter(entry => !aliases.has(entry)))
++  if (!row) {
++    setLocalBlocked(id, next, sessions)
+ 
+-    return false
++    return next
+   }
+ 
+-  $blockedSessionIds.set([...blocked, id])
++  void writeSessionMuted(row, next)
+ 
+-  return true
++  return next
+ }
+diff --git a/apps/desktop/src/store/sidebar-automated.ts b/apps/desktop/src/store/sidebar-automated.ts
+index 1dd3c57e8010b0eddc53163524dc0f568192f2c9..8009acd5821574f4cff8c047d2752e5f27f6eb85 100644
+--- a/apps/desktop/src/store/sidebar-automated.ts
++++ b/apps/desktop/src/store/sidebar-automated.ts
+@@ -1,7 +1,7 @@
+ import type { SessionInfo } from '@/types/hermes'
+ 
+ import { $pinnedSessionIds, $sidebarShowAutomated } from './layout'
+-import { isSessionBlocked } from './session-blocked'
++import { isSessionParked } from './session-blocked'
+ import { $sessionDotStateById, kanbanStripeCounts, type SessionDotState, sessionStatusStripe } from './session-dot-state'
+ 
+ /**
+@@ -32,14 +32,15 @@ type AutomatedRow = Pick<
+   | 'message_count'
+   | 'pinned'
+   | 'review_wait'
+->
++> &
++  Partial<Pick<SessionInfo, 'muted' | 'outcome'>>
+ 
+ export interface AutomatedRowContext {
+   /** Dot state for the row; defaults to `$sessionDotStateById`. */
+   dotState?: SessionDotState
+   /** Local pin ids; defaults to `$pinnedSessionIds`. */
+   pinnedIds?: readonly string[]
+-  /** ⌘B parked flag; defaults to `isSessionBlocked(row.id)`. */
++  /** ⌘B parked flag; defaults to `isSessionParked(row.id, row)` (`row.muted`, else the local list). */
+   userBlocked?: boolean
+ }
+ 
+@@ -58,7 +59,8 @@ export function automatedRowNeedsAttention(row: AutomatedRow, state: SessionDotS
+     row.review_wait,
+     row.kanban_attention ?? 0,
+     kanbanStripeCounts(row).waiting,
+-    kanbanStripeCounts(row).stalled
++    kanbanStripeCounts(row).stalled,
++    row.outcome
+   )
+ 
+   return stripe === 'stuck' || stripe === 'blocked' || stripe === 'attention' || stripe === 'stalled'
+@@ -80,7 +82,7 @@ export function sessionHiddenAsAutomated(
+   }
+ 
+   const state = ctx.dotState ?? $sessionDotStateById.get()[row.id] ?? 'idle'
+-  const userBlocked = ctx.userBlocked ?? isSessionBlocked(row.id)
++  const userBlocked = ctx.userBlocked ?? isSessionParked(row.id, row)
+ 
+   return !automatedRowNeedsAttention(row, state, userBlocked)
+ }
+diff --git a/apps/desktop/src/store/sidebar-visible-order.ts b/apps/desktop/src/store/sidebar-visible-order.ts
+index c2f6661fbe8312054dc6ea19be61f586c0ab4f13..90001b5959cfc092772e8cd9191c360d71fc87bc 100644
+--- a/apps/desktop/src/store/sidebar-visible-order.ts
++++ b/apps/desktop/src/store/sidebar-visible-order.ts
+@@ -1,5 +1,5 @@
+ import { $messagingSessions, $sessions } from '@/store/session'
+-import { isSessionBlocked } from '@/store/session-blocked'
++import { isSessionParked } from '@/store/session-blocked'
+ import { $sessionDotStateById, kanbanStripeCounts, sessionStatusStripe, withRowActivity } from '@/store/session-dot-state'
+ import { sessionHiddenAsAutomated } from '@/store/sidebar-automated'
+ import type { SessionInfo } from '@/types/hermes'
+@@ -108,7 +108,7 @@ const sessionHasStepStripe = (stripe: null | string | undefined): boolean =>
+   stripe === 'done' || stripe === 'stuck' || stripe === 'attention'
+ 
+ export function sessionHasStatusStripe(id: string): boolean {
+-  if (isSessionBlocked(id)) {
++  if (isSessionParked(id)) {
+     return false
+   }
+ 
+@@ -151,7 +151,8 @@ export function sessionHasStatusStripe(id: string): boolean {
+         session?.review_wait,
+         session?.kanban_attention ?? 0,
+         kanbanStripeCounts(session ?? {}).waiting,
+-        kanbanStripeCounts(session ?? {}).stalled
++        kanbanStripeCounts(session ?? {}).stalled,
++        session?.outcome
+       )
+     )
+   )
+@@ -200,7 +201,7 @@ export function nextSidebarSessionId(
+ ): null | string {
+   const order = sidebarSessionOrder()
+ 
+-  const notBlocked = (id: string) => !isSessionBlocked(id)
++  const notBlocked = (id: string) => !isSessionParked(id)
+ 
+   if (anySession) {
+     return stepSessionId(order, currentId, direction, notBlocked)
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index eede7ac31e6682bd5c6122f1826054c2f7eec446..d994ba64276e85e3f3f0086063c72d0ebe4a8668 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -730,6 +730,12 @@ export interface SessionInfo {
+   review_wait?: 'parked' | 'stuck'
+   /** [daveey] The PR `review_wait` refers to. */
+   review_wait_pr?: string
++  /** [daveey] The chat's stored outcome (backend `sessions.outcome_json`, parsed): what the sidebar paints when
++   *  present, instead of deriving a status from idleness. Absent against a backend that predates it. */
++  outcome?: null | SessionOutcome
++  /** [daveey] The user parked this chat (⌘B), persisted backend-side (`sessions.muted`). Absent against a backend
++   *  that predates it: then the local ⌘B list is the only record, as before. */
++  muted?: boolean
+   /** [daveey] The owning profile's `sessions.automated_sources` matched this
+    *  row (bot / smoke-test traffic). Hidden from the sidebar unless "Show
+    *  automated & test sessions" is on; see store/sidebar-automated.ts. */
+@@ -774,6 +780,44 @@ export interface SessionInfo {
+   offline_version?: null | number
+ }
+ 
++/** [daveey] The kind of a chat's stored outcome (session-outcome contract). */
++export type SessionOutcomeKind = 'decision' | 'done' | 'muted' | 'running' | 'unresolved' | 'waiting'
++
++/** [daveey] Why an outcome is `unresolved`. */
++export type SessionOutcomeReason =
++  'empty' | 'interrupted' | 'no_summary' | 'notice_tail' | 'subagent_killed' | 'turn_failed'
++
++/** [daveey] One open question a `decision` outcome waits on the user for. */
++export interface SessionOutcomeItem {
++  id: string
++  question: string
++  choices?: { label: string; value: string }[]
++  card_id?: string
++  state?: string
++}
++
++/** [daveey] One thing a `waiting` / `running` outcome waits on. */
++export interface SessionOutcomeWaitingOn {
++  kind: 'capacity' | 'card' | 'cron' | 'process' | 'subagent' | 'time' | string
++  id: string
++  label?: string
++  state?: string
++  /** Epoch seconds. */
++  eta?: number
++}
++
++/** [daveey] A chat's stored outcome, as list rows carry it (`row.outcome`). */
++export interface SessionOutcome {
++  kind: SessionOutcomeKind | string
++  source?: 'declared' | 'derived'
++  /** Epoch seconds. */
++  at?: number
++  summary?: string
++  items?: SessionOutcomeItem[]
++  on?: SessionOutcomeWaitingOn[]
++  reason?: SessionOutcomeReason | string
++}
++
+ /** [daveey] One live background process a session row owns (backend stamp). */
+ export interface SessionBackgroundProcess {
+   /** Process-registry id (`proc_…`), what Stop names. */
+@@ -799,6 +843,8 @@ export type TimelineDisplayMetadata =
+   | { reactions: MessageReaction[] }
+   | { tool_result_metadata: ToolResultMetadata }
+   | { error?: string; error_surface?: unknown }
++  /** [daveey] A blocked `kanban_notice` whose card has since left `blocked`. */
++  | { display_text?: string; stale?: boolean }
+ 
+ /** One emoji reaction on a message. One per author, iOS-Tapback style. */
+ export interface MessageReaction {
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index aa74a3fd5ad5418aadbb6db471f3f23c014916ed..a74e6e291d7fd5571ffad5666bcdad6a38281b8c 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -354,6 +354,7 @@
+     "assistant.thread.scrollToBottom",
+     "assistant.thread.sendEdited",
+     "assistant.thread.showEarlier",
++    "assistant.thread.staleNotice",
+     "assistant.thread.stop",
+     "assistant.thread.stopReading",
+     "assistant.thread.thinking",
+@@ -4803,11 +4804,18 @@
+     "sidebar.row.markRead",
+     "sidebar.row.markUnread",
+     "sidebar.row.messageCount",
++    "sidebar.row.muteFailed",
+     "sidebar.row.needsInput",
+     "sidebar.row.newWindow",
+     "sidebar.row.openInNewTab",
+     "sidebar.row.openInSplit",
+     "sidebar.row.openInTerminal",
++    "sidebar.row.outcomeDecision",
++    "sidebar.row.outcomeDone",
++    "sidebar.row.outcomeMuted",
++    "sidebar.row.outcomeRunning",
++    "sidebar.row.outcomeUnresolved",
++    "sidebar.row.outcomeWaiting",
+     "sidebar.row.ownedByProfile",
+     "sidebar.row.pin",
+     "sidebar.row.rename",
+-- 
+2.55.0
+

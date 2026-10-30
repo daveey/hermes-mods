@@ -388,3 +388,16 @@ def test_go_word_on_a_non_run_question_grants_nothing(tmp_path):
 def test_authorizes_flag_is_only_valid_on_answer_choices():
     r = request(); r['choices'][0]['authorizes'] = True  # on an approve choice: rejected
     with pytest.raises(core.ActionError): core.validate_action(dict(r))
+
+
+def test_limit_permission_required_is_a_boolean_flag():
+    r = request()
+    r['limits'] = [dict(key='iam', value='one secret ARN', permissionRequired=True),
+                   dict(key='spend', value='none', permissionRequired=False)]
+    assert core.validate_action(r)['limits'][0]['permissionRequired'] is True
+    r['limits'] = [dict(key='iam', value='x', permissionRequired='yes')]
+    with pytest.raises(core.ActionError, match='permissionRequired must be a boolean'):
+        core.validate_action(r)
+    r['limits'] = [dict(key='iam', value='')]
+    with pytest.raises(core.ActionError, match='nonempty string'):
+        core.validate_action(r)

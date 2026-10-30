@@ -19,11 +19,11 @@ const { chromium } = require('playwright')
 test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request filter', async () => {
  const here=dirname(fileURLToPath(import.meta.url))
  const bundle=await build({stdin:{contents:`
- import React from 'react';import {createRoot} from 'react-dom/client';import {ActionQueue,refreshRequests} from './plugin.js';
+ import React from 'react';import {createRoot} from 'react-dom/client';import {ActionQueue,refreshRequests,openAskCount} from './plugin.js';
  const owner={gatewayId:'fixture',profile:'default',storedSessionId:'S1'};
  const long='Exact files, tests, acceptance criteria and deliverables. '+('long-unbroken-identifier'.repeat(60));
  let requests=Array.from({length:8},(_,i)=>({schemaVersion:2,owner,requestId:'00000000-0000-4000-8000-'+String(i+1).padStart(12,'0'),revision:1,kind:'approval',title:'Request '+i,createdAt:new Date(Date.now()-305000).toISOString(),scope:{complete:true,markdown:long+'\\n'+('Complete plan paragraph.\\n'.repeat(60)),sourceRefs:[]},limits:[{key:'CPU',value:'≤4 CPU core-hours'},{key:'RAM',value:'≤4 GiB RAM'},{key:'GPU',value:'≤2 existing GPU-hours',permissionRequired:'owner permission'}],exclusions:['No rentals or new spend','Full training requires separate budget approval'],outcomes:{approve:'Stage A only',revise:'Work remains blocked',decline:'No execution'},choices:[{id:'yes',label:'Approve Stage A',effect:'approve'},{id:'revise',label:'Request changes',effect:'revise'},{id:'no',label:'Decline',effect:'decline'}],aliases:[],state:'open'}));
- window.setRequests=async value=>{requests=value;await refreshRequests()};window.fixtureOwner=owner;window.posts=[];window.withdraws=[];window.hermesDesktop={api:async({path,...opts})=>{if(path.endsWith('/ping'))return {ok:true,api:2,features:['withdraw']};if(opts.method==='POST'&&path.endsWith('/withdraw')){window.withdraws.push({path,connectionId:opts.connectionId,profile:opts.profile,body:opts.body});const id=decodeURIComponent(path.split('/').at(-2));requests=requests.map(r=>r.requestId===id?{...r,state:'withdrawn',withdrawal:{by:'user',reason:opts.body.reason,at:new Date().toISOString()}}:r);return {request:requests.find(r=>r.requestId===id)}}if(opts.method==='POST'){window.posts.push(opts.body);return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]}}if(path.includes('/operations/'))return {operation:{operationId:'pending',dispatchState:'pending'},request:requests[0]};return {requests}}};
+ window.setRequests=async value=>{requests=value;await refreshRequests()};window.askCount=openAskCount;window.fixtureOwner=owner;window.posts=[];window.withdraws=[];window.hermesDesktop={api:async({path,...opts})=>{if(path.endsWith('/ping'))return {ok:true,api:2,features:['withdraw']};if(opts.method==='POST'&&path.endsWith('/withdraw')){window.withdraws.push({path,connectionId:opts.connectionId,profile:opts.profile,body:opts.body});const id=decodeURIComponent(path.split('/').at(-2));requests=requests.map(r=>r.requestId===id?{...r,state:'withdrawn',withdrawal:{by:'user',reason:opts.body.reason,at:new Date().toISOString()}}:r);return {request:requests.find(r=>r.requestId===id)}}if(opts.method==='POST'){window.posts.push(opts.body);return {operation:{operationId:'pending',dispatchState:window.fixtureDispatch||'pending'},request:requests[0]}}if(path.includes('/operations/'))return {operation:{operationId:'pending',dispatchState:window.fixtureDispatch||'pending'},request:requests[0]};return {requests}}};
  await refreshRequests();createRoot(document.getElementById('root')).render(React.createElement(ActionQueue));
  `,resolveDir:here,sourcefile:'fixture.mjs'},bundle:true,format:'esm',write:false,outdir:'fixture-output',nodePaths:[resolve(desktopDir,'node_modules'),resolve(desktopDir,'../../node_modules')],define:{'process.env.NODE_ENV':'"production"','import.meta.env':'{"DEV":false,"PROD":true}'},plugins:[{name:'sdk-test-only',setup(b){b.onResolve({filter:/^@hermes\/plugin-sdk$/},()=>({path:'sdk',namespace:'test'}));b.onLoad({filter:/.*/,namespace:'test'},()=>({contents:`const atom=v=>({get:()=>v});export const COMPOSER_AREAS={top:'composer.top'},TRANSCRIPT_DIRECTIVE_AREA='directives',host={state:{focusedStoredSessionId:atom('S1'),connectionId:atom('C1'),profile:atom('default'),focusedSessionOwner:atom({connectionId:'C1',profile:'default'})}},useValue=a=>a?.get();export {MessageTextContent} from ${JSON.stringify(resolve(desktopDir,'src/components/assistant-ui/markdown-text.tsx'))};`,loader:'js',resolveDir:desktopDir}))}}]})
  const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH ? {executablePath:process.env.CHROME_PATH} : {}),args:['--no-sandbox']})
@@ -71,12 +71,15 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   await page.evaluate(value=>window.setRequests([value]),fixture)
   const card=page.getByRole('article',{name:fixture.title})
   await card.waitFor()
+  // Explained options now fold their full plan; open it before checking Markdown.
+  assert.equal(await card.locator('details').first().getAttribute('open'),null)
+  await card.getByText('Full plan and limits',{exact:true}).click()
   await card.locator('[data-action-scope] [data-streamdown="strong"]').waitFor()
   assert.equal(await card.locator('[data-action-scope] [data-streamdown="strong"]').innerText(),'Review the settings update')
   assert.equal(await card.locator('[data-action-scope] li').count(),3)
   assert.equal(await card.locator('[data-action-scope] code').innerText(),'settings.js')
-  assert.equal(await card.getByRole('heading',{name:'Read this'}).count(),1)
-  assert.equal(await card.getByRole('heading',{name:'Your decision'}).count(),1)
+  assert.equal(await card.locator('[data-decision-option]').count(),2)
+  assert.match(await card.locator('[data-decision-options]').innerText(),/Open the draft pull request only/)
   const screenshots=process.env.APPROVAL_SCREENSHOTS
   if(screenshots)await mkdir(screenshots,{recursive:true})
   for(const width of [640,360]){
@@ -143,6 +146,19 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   assert.equal(await page.evaluate(()=>document.activeElement.getAttribute('aria-label')),kept.title,'focus moves to the remaining ask')
   assert.equal(await page.locator('[data-action-queue] h2').innerText(),'For you (1)')
   assert.equal(await page.evaluate(()=>window.posts.length),3,'Not needed records no decision')
+  // Real Chromium: a recorded but failed decision remains visible and counted.
+  const failed={...question,requestId:'00000000-0000-4000-8000-000000000096',title:'Undelivered answer',resolution:{operationId:'pending',choiceId:'json',revision:1}}
+  await page.evaluate(async value=>{window.fixtureDispatch='failed';await window.setRequests([value])},failed)
+  const failedCard=page.getByRole('article',{name:failed.title})
+  await failedCard.getByRole('button',{name:'Retry',exact:true}).waitFor()
+  assert.equal(await page.evaluate(()=>window.askCount()),1)
+  assert.match(await failedCard.innerText(),/delivery unconfirmed/i)
+  if(screenshots)await failedCard.screenshot({path:resolve(screenshots,'failed-retry.png')})
+  await page.evaluate(()=>window.fixtureDispatch='delivered')
+  await failedCard.getByRole('button',{name:'Retry',exact:true}).click()
+  await page.waitForFunction(()=>document.querySelectorAll('[data-action-request]').length===0)
+  assert.equal(await page.evaluate(()=>window.askCount()),0)
+  assert.equal(await page.evaluate(()=>window.posts.length),3,'Retry recovers confirmed admission by readback, without a duplicate POST')
   assert.deepEqual(errors,[])
  } finally {await browser.close()}
 })

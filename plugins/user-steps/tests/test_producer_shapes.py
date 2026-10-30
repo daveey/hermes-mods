@@ -104,3 +104,33 @@ def test_request_itself_wrong_type_never_raises(tmp_path, monkeypatch, request_v
     plugin = plugin_at(tmp_path, monkeypatch)
     out = publish(plugin, {'request': request_value})
     assert 'error' in out
+
+
+def test_choice_explain_and_recommended_round_trip(tmp_path, monkeypatch):
+    plugin = plugin_at(tmp_path, monkeypatch)
+    payload = approval_payload()
+    for c in payload['choices']:
+        c['explain'] = f'What happens on {c["effect"]}.'
+    payload['choices'][0]['recommended'] = True
+    out = publish(plugin, {'request': payload})
+    assert 'error' not in out, out
+    got = out['request']['choices']
+    assert [c['explain'] for c in got] == [f'What happens on {c["effect"]}.' for c in payload['choices']]
+    assert [bool(c.get('recommended')) for c in got] == [True] + [False] * (len(got) - 1)
+
+
+@pytest.mark.parametrize('patch', [
+    {'recommended': False}, {'recommended': 'yes'}, {'explain': ''}, {'explain': 7}])
+def test_choice_explain_and_recommended_shapes_rejected(tmp_path, monkeypatch, patch):
+    plugin = plugin_at(tmp_path, monkeypatch)
+    payload = approval_payload()
+    payload['choices'][0].update(patch)
+    assert 'error' in publish(plugin, {'request': payload})
+
+
+def test_two_recommended_choices_rejected(tmp_path, monkeypatch):
+    plugin = plugin_at(tmp_path, monkeypatch)
+    payload = approval_payload()
+    for c in payload['choices'][:2]:
+        c['recommended'] = True
+    assert 'recommended' in publish(plugin, {'request': payload})['error']

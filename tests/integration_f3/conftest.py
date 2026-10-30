@@ -1,4 +1,4 @@
-"""Opt-in, checkout-explicit integration with no live Hermes profile."""
+"""Checkout-explicit integration with no live Hermes profile."""
 import os
 from pathlib import Path
 import shutil
@@ -30,7 +30,8 @@ def pytest_configure(config):
             os.environ[key] = old_env[key]
     os.environ.update(HOME=sandbox.name, HERMES_HOME=sandbox.name,
                       HERMES_RUNTIME_DIR=str(Path(sandbox.name) / "runtime"),
-                      ASK_GATE_NO_PREWARM="1", HERMES_VERIFY_ON_STOP="0")
+                      ASK_GATE_NO_PREWARM="1", HERMES_VERIFY_ON_STOP="0",
+                      HERMES_DISABLE_LAZY_INSTALLS="1")
     sys.path.insert(0, str(root))
     config._f3_core = root
     network = {"active": True, "attempts": []}

@@ -1,0 +1,393 @@
+From e28b5d951c421857a883870a29ab99497cc06940 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:15:15 -0700
+Subject: [PATCH] fix(desktop): hold background reads while asleep and stagger
+ them after a wake [daveey]
+
+desktop.log showed 'Timed out connecting to Hermes backend' bursts at every sleep/wake (17:04 x14, 17:07 x18,
+17:48 x46 on 2026-10-29): DarkWake runs renderer timers with the network half up, and on full wake every poller
+fires at once while tunnels are rebuilt. New PowerSettleGate in front of hermes:api: background GETs fail fast
+(no dial, no timeout line) between powerMonitor suspend and the next wake, wait out a 15 s settle window plus
+0-10 s jitter after resume, and a re-fired poll of the same path fails fast instead of queueing. POSTs and
+foreground requests are never held; focus/unlock/foreground activity clears a stale suspend. Card t_01a18a578df25e6c.
+---
+diff --git a/apps/desktop/electron/power-settle.test.ts b/apps/desktop/electron/power-settle.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4edb6f247d0fccb2da369fbae2c41420d6b9759
+--- /dev/null
++++ b/apps/desktop/electron/power-settle.test.ts
+@@ -0,0 +1,175 @@
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, it } from 'vitest'
++
++import {
++  attachPowerSettle,
++  isBackgroundRead,
++  isPowerSettlingError,
++  POWER_SETTLE_MS,
++  PowerSettleGate
++} from './power-settle'
++
++function harness(opts: { random?: number } = {}) {
++  let now = 1_000_000
++  const sleeps: number[] = []
++  const pending: Array<() => void> = []
++
++  const gate = new PowerSettleGate({
++    now: () => now,
++    random: () => opts.random ?? 0,
++    sleep: ms => {
++      sleeps.push(ms)
++
++      return new Promise<void>(resolve => pending.push(resolve))
++    }
++  })
++
++  return {
++    gate,
++    sleeps,
++    advance: (ms: number) => (now += ms),
++    releaseAll: () => pending.splice(0).forEach(resolve => resolve())
++  }
++}
++
++const poll = { method: 'GET', path: '/api/plugins/hub-sync/status', connectionId: 'hermes-hub' }
++
++describe('isBackgroundRead', () => {
++  it('holds only non-foreground GETs', () => {
++    expect(isBackgroundRead({ method: 'GET' })).toBe(true)
++    expect(isBackgroundRead({})).toBe(true)
++    expect(isBackgroundRead({ method: 'POST' })).toBe(false)
++    expect(isBackgroundRead({ method: 'GET', priority: 'foreground' })).toBe(false)
++  })
++})
++
++describe('PowerSettleGate', () => {
++  it('admits everything immediately while awake and outside the settle window', async () => {
++    const { gate, sleeps } = harness()
++    await expect(gate.admit(poll)).resolves.toBeUndefined()
++    expect(sleeps).toEqual([])
++  })
++
++  it('fails background reads fast while suspended (DarkWake timers) without sleeping', async () => {
++    const { gate, sleeps } = harness()
++    gate.suspend()
++    const error = await gate.admit(poll).catch(e => e)
++    expect(isPowerSettlingError(error)).toBe(true)
++    expect(String(error.message)).not.toMatch(/Timed out connecting/)
++    expect(sleeps).toEqual([])
++  })
++
++  it('never holds user work while suspended: POSTs and foreground GETs pass', async () => {
++    const { gate } = harness()
++    gate.suspend()
++    await expect(gate.admit({ ...poll, method: 'POST' })).resolves.toBeUndefined()
++    await expect(gate.admit({ ...poll, priority: 'foreground' })).resolves.toBeUndefined()
++  })
++
++  it('a foreground request while still marked suspended clears the stale suspend', async () => {
++    const { gate } = harness()
++    gate.suspend()
++    await gate.admit({ ...poll, priority: 'foreground' })
++    expect(gate.suspended).toBe(false)
++  })
++
++  it('after resume, staggers background reads to the end of the settle window plus jitter', async () => {
++    const { gate, sleeps, releaseAll } = harness({ random: 0.5 })
++    gate.suspend()
++    gate.wake()
++    const admitted = gate.admit(poll)
++    expect(sleeps).toEqual([POWER_SETTLE_MS + 5_000])
++    releaseAll()
++    await expect(admitted).resolves.toBeUndefined()
++  })
++
++  it('coalesces a re-fired poll: the same connection/path already held fails fast instead of queueing', async () => {
++    const { gate, sleeps, releaseAll } = harness()
++    gate.wake()
++    const first = gate.admit(poll)
++    const second = await gate.admit(poll).catch(e => e)
++    expect(isPowerSettlingError(second)).toBe(true)
++    // A different path on the same connection is its own poller and is held, not dropped.
++    const other = gate.admit({ ...poll, path: '/api/plugins/inbox/items' })
++    expect(sleeps).toHaveLength(2)
++    releaseAll()
++    await expect(first).resolves.toBeUndefined()
++    await expect(other).resolves.toBeUndefined()
++    // Once released the key is free again.
++    expect(gate.settling()).toBe(true)
++  })
++
++  it('a held read that wakes into a new suspend does not dial', async () => {
++    const { gate, releaseAll } = harness()
++    gate.wake()
++    const held = gate.admit(poll)
++    gate.suspend()
++    releaseAll()
++    expect(isPowerSettlingError(await held.catch(e => e))).toBe(true)
++  })
++
++  it('stops holding once the settle window has passed', async () => {
++    const { gate, sleeps, advance } = harness()
++    gate.wake()
++    advance(POWER_SETTLE_MS + 1)
++    expect(gate.settling()).toBe(false)
++    await gate.admit(poll)
++    expect(sleeps).toEqual([])
++  })
++
++  it('noteActive is a no-op when awake (no settle window after a plain unlock)', () => {
++    const { gate } = harness()
++    gate.noteActive()
++    expect(gate.settling()).toBe(false)
++  })
++})
++
++describe('attachPowerSettle', () => {
++  it('wires suspend/resume/unlock-screen and logs the skipped count on resume', async () => {
++    const listeners = new Map<string, () => void>()
++    const monitor = { on: (event: string, fn: () => void) => listeners.set(event, fn) }
++    const { gate } = harness()
++    const lines: string[] = []
++    attachPowerSettle(gate, monitor, line => lines.push(line))
++
++    listeners.get('suspend')!()
++    expect(gate.suspended).toBe(true)
++    await gate.admit(poll).catch(() => undefined)
++    listeners.get('resume')!()
++    expect(gate.suspended).toBe(false)
++    expect(gate.settling()).toBe(true)
++    expect(lines).toEqual([expect.stringContaining('resume: 1 background read(s) skipped')])
++    expect(lines[0]).not.toMatch(/Timed out connecting/)
++
++    listeners.get('suspend')!()
++    listeners.get('unlock-screen')!()
++    expect(gate.suspended).toBe(false)
++  })
++})
++
++describe('main.ts wiring', () => {
++  const main = readFileSync(join(__dirname, 'main.ts'), 'utf8')
++
++  it('admits every hermes:api request through the power-settle gate before dispatching it', () => {
++    const handler = main.slice(main.indexOf("ipcMain.handle('hermes:api'"))
++    const admit = handler.indexOf('await powerSettleGate.admit(request)')
++    expect(admit).toBeGreaterThan(0)
++    expect(admit).toBeLessThan(handler.indexOf('handleHermesApiRequest(request)'))
++    expect(admit).toBeLessThan(handler.indexOf('dispatchConnectionScopedProfileDelete('))
++  })
++
++  it('does not write a failure line (stack) for a skipped background read', () => {
++    const handler = main.slice(main.indexOf("ipcMain.handle('hermes:api'"))
++    const skip = handler.indexOf('if (isPowerSettlingError(error))')
++    expect(skip).toBeGreaterThan(0)
++    expect(skip).toBeLessThan(handler.indexOf('rememberLog(formatApiRequestFailure(request, error))'))
++  })
++
++  it('attaches the gate to powerMonitor and clears a stale suspend on window focus', () => {
++    const register = main.slice(main.indexOf('function registerPowerResumeListeners()'))
++    expect(register).toContain('attachPowerSettle(powerSettleGate, powerMonitor, rememberLog)')
++    expect(register).toContain("app.on('browser-window-focus', () => powerSettleGate.noteActive())")
++  })
++})
+diff --git a/apps/desktop/electron/power-settle.ts b/apps/desktop/electron/power-settle.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..dddc97b6aadaef005d17166625f68837055f2c9d
+--- /dev/null
++++ b/apps/desktop/electron/power-settle.ts
+@@ -0,0 +1,190 @@
++// [daveey] Hold background reads while the Mac sleeps and for a short settle window after it wakes.
++//
++// On 2026-10-29 desktop.log showed "Timed out connecting to Hermes backend" in bursts at every sleep/wake
++// (17:04 x14, 17:07 x18, 17:48 x46): macOS DarkWake runs the app's timers for a few seconds with the network and
++// CPU half up, and on the full wake every renderer poller (hub-sync/status, user-steps, inbox, session-mentions,
++// session-kanban-tasks, ...) fires at the same instant against a CPU-starved local backend and SSH tunnels that are
++// still being rebuilt (attachPowerResumeRemoteRevalidation). Each of those reads then waits its full 4-15 s timeout.
++//
++// This gate sits in front of the `hermes:api` IPC handler:
++// - between powerMonitor 'suspend' and the next wake signal (DarkWake never emits 'resume'), a background GET fails
++//   at once with PowerSettlingError instead of dialing;
++// - for SETTLE_MS after the wake, a background GET waits until the window ends plus a random 0..SPREAD_MS, so the
++//   pollers come back staggered after the tunnels are rebuilt instead of all at once during the rebuild. A poller
++//   that fires again while its previous read is still held fails fast, so a 2 s poll does not queue a dozen copies.
++// User-driven work is never held: anything that is not a GET, or that carries priority 'foreground', passes through.
++// A user action (window focus, a foreground request) while still marked suspended counts as a wake, so a missed
++// 'resume' cannot hold background reads forever.
++
++export const POWER_SETTLE_MS = 15_000
++export const POWER_SETTLE_SPREAD_MS = 10_000
++
++export const POWER_SETTLING_CODE = 'POWER_SETTLING'
++
++export class PowerSettlingError extends Error {
++  readonly code = POWER_SETTLING_CODE
++
++  constructor() {
++    super('Background read skipped: the machine is asleep or settling after a wake; the next poll retries.')
++    this.name = 'PowerSettlingError'
++  }
++}
++
++export function isPowerSettlingError(error: unknown): error is PowerSettlingError {
++  return (error as { code?: unknown } | null)?.code === POWER_SETTLING_CODE
++}
++
++export interface PowerSettleRequest {
++  connectionId?: unknown
++  method?: unknown
++  path?: unknown
++  priority?: unknown
++  profile?: unknown
++}
++
++function heldKey(request: PowerSettleRequest): string {
++  return [request.connectionId, request.profile, request.path].map(v => String(v ?? '')).join('|')
++}
++
++export interface PowerSettleOptions {
++  now?: () => number
++  random?: () => number
++  sleep?: (ms: number) => Promise<void>
++  settleMs?: number
++  spreadMs?: number
++}
++
++/** True for a request the gate may hold: a background (non-foreground) GET. */
++export function isBackgroundRead(request: PowerSettleRequest | null | undefined): boolean {
++  const method = String(request?.method ?? 'GET').toUpperCase()
++
++  return method === 'GET' && request?.priority !== 'foreground'
++}
++
++export class PowerSettleGate {
++  readonly #now: () => number
++  readonly #random: () => number
++  readonly #sleep: (ms: number) => Promise<void>
++  readonly #settleMs: number
++  readonly #spreadMs: number
++  #suspended = false
++  #settleUntil = 0
++  #held = 0
++  #skipped = 0
++  // Background reads waiting out the settle window, by connection|profile|path. A poller that fires again while its
++  // previous read is still held gets PowerSettlingError instead of queueing a second copy.
++  readonly #waiting = new Set<string>()
++
++  constructor(options: PowerSettleOptions = {}) {
++    this.#now = options.now ?? Date.now
++    this.#random = options.random ?? Math.random
++    this.#sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
++    this.#settleMs = options.settleMs ?? POWER_SETTLE_MS
++    this.#spreadMs = options.spreadMs ?? POWER_SETTLE_SPREAD_MS
++  }
++
++  get suspended(): boolean {
++    return this.#suspended
++  }
++
++  /** powerMonitor 'suspend': hold background reads until a wake signal. */
++  suspend(): void {
++    this.#suspended = true
++  }
++
++  /** powerMonitor 'resume' (or a stale suspend cleared by user activity): start the settle window. Returns and resets
++   * the held/skipped counts. */
++  wake(): { held: number; skipped: number } {
++    this.#suspended = false
++    this.#settleUntil = this.#now() + this.#settleMs
++    const counts = { held: this.#held, skipped: this.#skipped }
++    this.#held = 0
++    this.#skipped = 0
++
++    return counts
++  }
++
++  /** Background reads held (staggered) since the last wake; diagnostics only. */
++  get heldSinceWake(): number {
++    return this.#held
++  }
++
++  /** The user is evidently active (focus, a foreground request): a still-set suspend flag is stale. */
++  noteActive(): void {
++    if (this.#suspended) {
++      this.wake()
++    }
++  }
++
++  settling(): boolean {
++    return this.#suspended || this.#now() < this.#settleUntil
++  }
++
++  /**
++   * Admit one `hermes:api` request. Resolves when it may be sent; throws PowerSettlingError for a background read
++   * while suspended. During the settle window a background read waits until the window ends plus a random spread.
++   */
++  async admit(request: PowerSettleRequest | null | undefined): Promise<void> {
++    if (!isBackgroundRead(request)) {
++      if (request?.priority === 'foreground') {
++        this.noteActive()
++      }
++
++      return
++    }
++
++    if (this.#suspended) {
++      this.#skipped += 1
++
++      throw new PowerSettlingError()
++    }
++
++    const remaining = this.#settleUntil - this.#now()
++
++    if (remaining <= 0) {
++      return
++    }
++
++    const key = heldKey(request ?? {})
++
++    if (this.#waiting.has(key)) {
++      this.#skipped += 1
++
++      throw new PowerSettlingError()
++    }
++
++    this.#held += 1
++    this.#waiting.add(key)
++
++    try {
++      await this.#sleep(remaining + Math.floor(this.#random() * this.#spreadMs))
++    } finally {
++      this.#waiting.delete(key)
++    }
++
++    if (this.#suspended) {
++      // Went back to sleep while waiting (DarkWake -> Sleep): don't dial into a sleeping network.
++      throw new PowerSettlingError()
++    }
++  }
++}
++
++export interface PowerSettleMonitor {
++  on(event: string, listener: () => void): unknown
++}
++
++/** Wire the gate to Electron's powerMonitor. `log` gets one line per wake with the held/skipped counts. */
++export function attachPowerSettle(
++  gate: PowerSettleGate,
++  powerMonitor: PowerSettleMonitor,
++  log?: (line: string) => void
++) {
++  powerMonitor.on('suspend', () => gate.suspend())
++
++  powerMonitor.on('resume', () => {
++    const { skipped } = gate.wake()
++    log?.(`[power-settle] resume: ${skipped} background read(s) skipped while asleep; staggering background reads`)
++  })
++  // Lock/unlock without a suspend needs no settle window; only a suspend the 'resume' never cleared does.
++  powerMonitor.on('unlock-screen', () => gate.noteActive())
++}
+-- 
+2.55.0
+

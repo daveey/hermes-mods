@@ -1,0 +1,612 @@
+From 9b2fb1e9dc9e59a8a14858bce2f141393ea1baa0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:51:55 -0700
+Subject: [PATCH] fix(sidebar): awake replica rows outside the projects tree
+ get their owner's activity stamps [daveey]
+
+With the hub active, this Mac's older chats come in as hub-replica rows with no
+kanban/goal/outcome/cwd stamps. db7e385651 swapped in the projects-tree copy,
+but the tree carries a few previews per project, so a parked chat outside it
+(20261026_170127_f07c32) still painted no waiting stripe.
+
+New GET /api/profiles/sessions/stamps?profile=&ids= returns the annotated
+stamps (same annotators as the list endpoints) for named sessions.
+owner-row-stamps.ts asks each awake owner for its replica rows' stamps
+(throttled 30s/row, 120s backoff on failure, batches of 100) and
+mergeOfflineFallback folds them into the replica row. Asleep (offline_cached)
+rows are untouched; a tree copy still wins.
+---
+ .../app/chat/sidebar/use-offline-fallback.ts  |  33 ++++-
+ .../src/store/offline-sessions.test.ts        |  82 ++++++++++++
+ apps/desktop/src/store/offline-sessions.ts    |  21 ++-
+ .../src/store/owner-row-stamps.test.ts        | 101 +++++++++++++++
+ apps/desktop/src/store/owner-row-stamps.ts    | 120 ++++++++++++++++++
+ hermes_cli/web_routers/profiles.py            |  40 ++++++
+ .../test_profiles_session_stamps.py           |  83 ++++++++++++
+ 7 files changed, 473 insertions(+), 7 deletions(-)
+ create mode 100644 apps/desktop/src/store/owner-row-stamps.test.ts
+ create mode 100644 apps/desktop/src/store/owner-row-stamps.ts
+ create mode 100644 tests/hermes_cli/test_profiles_session_stamps.py
+
+diff --git a/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts b/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
+index 49099a1506b..951e6183650 100644
+--- a/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
++++ b/apps/desktop/src/app/chat/sidebar/use-offline-fallback.ts
+@@ -7,7 +7,7 @@
+  * timeout, after a notice that names the connection.
+  */
+ import { useStore } from '@nanostores/react'
+-import { useCallback, useMemo } from 'react'
++import { useCallback, useEffect, useMemo, useRef } from 'react'
+ 
+ import { prepaintClickedTranscript } from '@/app/session/hooks/use-session-actions/provisional-transcript'
+ import type { SessionInfo } from '@/hermes'
+@@ -19,8 +19,11 @@ import { sessionGatewayId } from '@/store/gateway-visibility'
+ import { notify } from '@/store/notifications'
+ import { offlineOpenNotice } from '@/store/offline-session-actions'
+ import { $sessionListFreshness, mergeOfflineFallback, projectTreeSessionRows } from '@/store/offline-sessions'
++import { $ownerRowStamps, refreshOwnerRowStamps, rowsNeedingOwnerStamps } from '@/store/owner-row-stamps'
+ import { $projectTree } from '@/store/project-tree'
+ 
++const OWNER_STAMP_TICK_MS = 45_000
++
+ export function useOfflineFallback(
+   liveSessions: SessionInfo[],
+   resumeSession: (sessionId: string, session?: SessionInfo) => void
+@@ -31,11 +34,35 @@ export function useOfflineFallback(
+   const projectTree = useStore($projectTree)
+   const treeRows = useMemo(() => projectTreeSessionRows(projectTree), [projectTree])
+ 
++  const ownerStamps = useStore($ownerRowStamps)
++
+   const sessions = useMemo(
+-    () => mergeOfflineFallback(liveSessions, offlineSessions, freshness, treeRows),
+-    [liveSessions, offlineSessions, freshness, treeRows]
++    () => mergeOfflineFallback(liveSessions, offlineSessions, freshness, treeRows, ownerStamps),
++    [liveSessions, offlineSessions, freshness, treeRows, ownerStamps]
+   )
+ 
++  // [daveey] Awake replica rows the projects tree doesn't carry have no activity stamps: ask their owner for them
++  // when the rows change and on a slow tick (kanban counts change without the row changing). Throttled per row.
++  const stampRows = useMemo(() => rowsNeedingOwnerStamps(sessions), [sessions])
++  const stampRowsRef = useRef(stampRows)
++  stampRowsRef.current = stampRows
++
++  useEffect(() => {
++    if (stampRows.length) {
++      void refreshOwnerRowStamps(stampRows)
++    }
++  }, [stampRows])
++
++  useEffect(() => {
++    const timer = window.setInterval(() => {
++      if (stampRowsRef.current.length) {
++        void refreshOwnerRowStamps(stampRowsRef.current)
++      }
++    }, OWNER_STAMP_TICK_MS)
++
++    return () => window.clearInterval(timer)
++  }, [])
++
+   const onResumeSession = useCallback(
+     (sessionId: string, session?: SessionInfo) => {
+       markOpenClick(sessionId, session?.connection_id)
+diff --git a/apps/desktop/src/store/offline-sessions.test.ts b/apps/desktop/src/store/offline-sessions.test.ts
+index e271c6b5b91..ae68c1763ba 100644
+--- a/apps/desktop/src/store/offline-sessions.test.ts
++++ b/apps/desktop/src/store/offline-sessions.test.ts
+@@ -18,6 +18,8 @@ import {
+   sessionOwnerIsFresh,
+   syncedAgoLabel
+ } from './offline-sessions'
++import { $ownerRowStamps, _resetOwnerRowStampsForTests, refreshOwnerRowStamps, type StampFetcher } from './owner-row-stamps'
++import { kanbanStripeCounts } from './session-dot-state'
+ 
+ // [daveey] Cached (hermes-hub replica) sessions of an unreachable gateway feed
+ // the NORMAL sidebar pipeline as fallback rows; nothing here is a second list.
+@@ -409,6 +411,86 @@ describe('mergeOfflineFallback', () => {
+       expect(merged.find(r => r.id === 'parked')).toMatchObject({ offline_cached: true })
+     })
+   })
++
++  // [daveey] The tree carries only a few previews per project, so most of this Mac's older chats have no tree copy
++  // (20261026_170127_f07c32: 5 cards, all parked, painted no stripe). Their owner's stamps come from
++  // /api/profiles/sessions/stamps (owner-row-stamps.ts) and are folded into the replica row.
++  describe('an awake owner whose session the projects tree does not carry', () => {
++    const hubList = [live('h1', { connection_id: 'hermes-hub' })]
++    const toLocal = (gateway: string) => (gateway === 'macbook' ? 'local' : undefined)
++
++    beforeEach(() => _resetOwnerRowStampsForTests())
++
++    it("gets its owner's kanban stamps and paints the grey waiting stripe; an asleep row is unchanged", async () => {
++      const replica = offlineSessionsFromReplica(
++        [
++          rec('f07c32', { gateway: 'macbook' }),
++          rec('asleep', { gateway: 'macbook', profile: 'work', synced_at: 1_000 })
++        ],
++        toLocal,
++        9_000
++      )
++
++      const asked: [string, string, string[]][] = []
++
++      const fetcher: StampFetcher = async (connectionId, profile, wanted) => {
++        asked.push([connectionId, profile, wanted])
++
++        return wanted.map(id => ({
++          cwd: '/Users/me/code/infra',
++          id,
++          kanban_active: 5,
++          kanban_blocked: 0,
++          kanban_observed_at: 9_000,
++          kanban_parked: 5,
++          profile
++        }))
++      }
++
++      const before = mergeOfflineFallback(hubList, replica, undefined, [])
++      expect(kanbanStripeCounts(before.find(r => r.id === 'f07c32')!).waiting).toBe(0)
++
++      await refreshOwnerRowStamps(before, fetcher, 50_000)
++      // Only the awake row is asked for; the asleep (offline_cached) row's owner is unreachable.
++      expect(asked).toEqual([['local', 'default', ['f07c32']]])
++
++      const merged = mergeOfflineFallback(hubList, replica, undefined, [], $ownerRowStamps.get())
++      const row = merged.find(r => r.id === 'f07c32')!
++
++      expect(row).toMatchObject({
++        connection_id: 'local',
++        cwd: '/Users/me/code/infra',
++        kanban_active: 5,
++        kanban_parked: 5,
++        offline_synced_at: 9_000,
++        title: 'Chat f07c32'
++      })
++      expect(row.offline_cached).toBe(false)
++      expect(kanbanStripeCounts(row)).toEqual({ blocked: 0, stalled: 0, waiting: 5 })
++
++      // Control: the asleep owner's cached row is the very same row as before (no stamps, still cached).
++      const asleepRow = merged.find(r => r.id === 'asleep')!
++      expect(asleepRow).toBe(before.find(r => r.id === 'asleep'))
++      expect(asleepRow).toMatchObject({ offline_cached: true })
++      expect(asleepRow.kanban_parked).toBeUndefined()
++    })
++
++    it("a stamp keyed to an asleep row's identity is never applied to it", () => {
++      const asleep = offlineSessionsFromReplica([rec('x', { gateway: 'macbook', synced_at: 1_000 })], toLocal, 9_000)
++      const stamps = new Map([[`local\u0000default\u0000x`, { kanban_active: 2, kanban_parked: 2 }]])
++      const merged = mergeOfflineFallback(hubList, asleep, undefined, [], stamps)
++
++      expect(merged.find(r => r.id === 'x')).toBe(asleep[0])
++    })
++
++    it('a tree copy still wins over owner stamps', () => {
++      const replica = offlineSessionsFromReplica([rec('t', { gateway: 'macbook' })], toLocal, 9_000)
++      const tree = live('t', { connection_id: 'local', kanban_active: 1, kanban_parked: 1, profile: 'default' })
++      const stamps = new Map([[`local\u0000default\u0000t`, { kanban_active: 9 }]])
++
++      expect(mergeOfflineFallback(hubList, replica, undefined, [tree], stamps).find(r => r.id === 't')).toBe(tree)
++    })
++  })
+ })
+ 
+ describe('syncedAgoLabel', () => {
+diff --git a/apps/desktop/src/store/offline-sessions.ts b/apps/desktop/src/store/offline-sessions.ts
+index 57b86a1a8d7..016448fcce4 100644
+--- a/apps/desktop/src/store/offline-sessions.ts
++++ b/apps/desktop/src/store/offline-sessions.ts
+@@ -346,12 +346,15 @@ export function projectTreeSessionRows(nodes: readonly SidebarProjectTree[]): Se
+  * [daveey] `treeRows`: rows the backends' projects trees reported. A replica row carries no activity stamps
+  * (kanban_*, outcome, goal_active, ...), and the sidebar overlays fallback rows over the tree's own copies ("live
+  * wins"), so an awake owner's replica row used to blank the waiting/stuck stripe its backend row paints. When the
+- * owner's backend reported that session in its tree, that row is used instead of the replica copy. */
++ * owner's backend reported that session in its tree, that row is used instead of the replica copy; otherwise the
++ * owner's stamps for it (`stamps`, fetched by owner-row-stamps.ts) are merged into the replica copy. */
+ export function mergeOfflineFallback(
+   live: SessionInfo[],
+   offline: readonly SessionInfo[],
+   freshness = $sessionListFreshness.get(),
+-  treeRows: readonly SessionInfo[] = []
++  treeRows: readonly SessionInfo[] = [],
++  // [daveey] Owner-reported stamps for awake replica rows, keyed like `ownedIdentity` (see owner-row-stamps.ts).
++  stamps: ReadonlyMap<string, Partial<SessionInfo>> = new Map()
+ ): SessionInfo[] {
+   // [daveey] Primary-backend rows carry no connection_id while replica rows name the primary: one identity for both.
+   const primary = $connectionsRegistry.get()?.primary?.trim() || 'local'
+@@ -411,8 +414,18 @@ export function mergeOfflineFallback(
+         freshness[ownerKey(row.connection_id, row.profile)] !== true &&
+         !seen.has(ownedIdentity(row, row.id))
+     )
+-    // An asleep owner's row keeps its cached (read-only) marking; an awake one's backend row wins.
+-    .map(row => (row.offline_cached ? row : (reported.get(ownedIdentity(row, row.id)) ?? row)))
++    // An asleep owner's row keeps its cached (read-only) marking; an awake one's backend row wins. Outside the tree,
++    // the owner's own stamps (owner-row-stamps.ts) are folded into the replica row.
++    .map(row => {
++      if (row.offline_cached) {
++        return row
++      }
++
++      const key = ownedIdentity(row, row.id)
++      const own = stamps.get(key)
++
++      return reported.get(key) ?? (own ? { ...row, ...own } : row)
++    })
+ 
+   const merged = added.length ? [...rows, ...added] : changed ? rows : live
+ 
+diff --git a/apps/desktop/src/store/owner-row-stamps.test.ts b/apps/desktop/src/store/owner-row-stamps.test.ts
+new file mode 100644
+index 00000000000..3367f9aa281
+--- /dev/null
++++ b/apps/desktop/src/store/owner-row-stamps.test.ts
+@@ -0,0 +1,101 @@
++import { beforeEach, describe, expect, it } from 'vitest'
++
++import type { SessionInfo } from '@/hermes'
++
++import {
++  $ownerRowStamps,
++  _resetOwnerRowStampsForTests,
++  refreshOwnerRowStamps,
++  rowsNeedingOwnerStamps,
++  STAMP_FAILURE_BACKOFF_MS,
++  STAMP_FRESH_MS,
++  type StampFetcher
++} from './owner-row-stamps'
++
++const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
++  ({
++    connection_id: 'local',
++    id,
++    offline_cached: false,
++    offline_synced_at: 9_000,
++    profile: 'default',
++    ...extra
++  }) as SessionInfo
++
++function recorder(answer: (ids: string[]) => Partial<SessionInfo>[] = ids => ids.map(id => ({ id, kanban_active: 1 }))) {
++  const calls: [string, string, string[]][] = []
++
++  const fetcher: StampFetcher = async (connectionId, profile, ids) => {
++    calls.push([connectionId, profile, ids])
++
++    return answer(ids)
++  }
++
++  return { calls, fetcher }
++}
++
++beforeEach(() => _resetOwnerRowStampsForTests())
++
++describe('owner row stamps', () => {
++  it('only awake replica rows need stamps (not tree/live rows, not asleep cached rows)', () => {
++    const rows = [row('awake'), row('asleep', { offline_cached: true }), row('tree', { offline_synced_at: undefined })]
++
++    expect(rowsNeedingOwnerStamps(rows).map(r => r.id)).toEqual(['awake'])
++  })
++
++  it('batches per owner (connection + profile) and keys answers by owner identity', async () => {
++    const { calls, fetcher } = recorder()
++
++    await refreshOwnerRowStamps([row('a'), row('b'), row('c', { profile: 'work' }), row('d', { connection_id: 'mini' })], fetcher, 1)
++
++    expect(calls).toEqual([
++      ['local', 'default', ['a', 'b']],
++      ['local', 'work', ['c']],
++      ['mini', 'default', ['d']]
++    ])
++    expect([...$ownerRowStamps.get().keys()].sort()).toEqual(
++      ['local\u0000default\u0000a', 'local\u0000default\u0000b', 'local\u0000work\u0000c', 'mini\u0000default\u0000d'].sort()
++    )
++    expect($ownerRowStamps.get().get('local\u0000default\u0000a')).toEqual({ kanban_active: 1 })
++  })
++
++  it('re-asks a row only after STAMP_FRESH_MS', async () => {
++    const { calls, fetcher } = recorder()
++
++    await refreshOwnerRowStamps([row('a')], fetcher, 1_000)
++    await refreshOwnerRowStamps([row('a')], fetcher, 1_000 + STAMP_FRESH_MS - 1)
++    expect(calls).toHaveLength(1)
++
++    await refreshOwnerRowStamps([row('a')], fetcher, 1_000 + STAMP_FRESH_MS)
++    expect(calls).toHaveLength(2)
++  })
++
++  it('an owner whose request failed (older backend, unreachable) backs off and keeps prior stamps', async () => {
++    await refreshOwnerRowStamps([row('a')], recorder().fetcher, 0)
++
++    let failures = 0
++
++    const failing: StampFetcher = async () => {
++      failures += 1
++
++      throw new Error('404')
++    }
++
++    await refreshOwnerRowStamps([row('a')], failing, STAMP_FRESH_MS)
++    await refreshOwnerRowStamps([row('a')], failing, STAMP_FRESH_MS + STAMP_FAILURE_BACKOFF_MS - 1)
++    expect(failures).toBe(1)
++    expect($ownerRowStamps.get().get('local\u0000default\u0000a')).toEqual({ kanban_active: 1 })
++
++    await refreshOwnerRowStamps([row('a')], failing, STAMP_FRESH_MS + STAMP_FAILURE_BACKOFF_MS)
++    expect(failures).toBe(2)
++  })
++
++  it('splits more than 100 ids into several requests', async () => {
++    const { calls, fetcher } = recorder()
++    const rows = Array.from({ length: 150 }, (_, i) => row(`s${i}`))
++
++    await refreshOwnerRowStamps(rows, fetcher, 1)
++
++    expect(calls.map(([, , ids]) => ids.length)).toEqual([100, 50])
++  })
++})
+diff --git a/apps/desktop/src/store/owner-row-stamps.ts b/apps/desktop/src/store/owner-row-stamps.ts
+new file mode 100644
+index 00000000000..a32d73c0b3b
+--- /dev/null
++++ b/apps/desktop/src/store/owner-row-stamps.ts
+@@ -0,0 +1,120 @@
++/**
++ * [daveey] Activity stamps for awake-owner fallback rows the projects tree doesn't carry.
++ *
++ * With another gateway active (the hub), this Mac's older chats come into the sidebar as hub-replica rows. A replica
++ * record carries no activity stamps (kanban_*, goal/cron/background/turn, outcome, cwd), and the projects tree that
++ * `mergeOfflineFallback` swaps in for them holds only a few previews per project. So a parked chat outside the tree
++ * painted no waiting/stuck stripe and sat in Home. This store asks the owning backend for those rows' stamps
++ * (`GET /api/profiles/sessions/stamps`, annotated like its list rows) and `mergeOfflineFallback` folds them in.
++ */
++import { atom } from 'nanostores'
++
++import { hermesApi, type SessionInfo } from '@/hermes'
++
++import { $connectionsRegistry } from './connection-registry-state'
++
++export type OwnerRowStamps = Partial<SessionInfo>
++
++/** Stamps by owner identity (`connection\0profile\0id`, same spelling as `mergeOfflineFallback`). */
++export const $ownerRowStamps = atom<ReadonlyMap<string, OwnerRowStamps>>(new Map())
++
++const profileOf = (profile: null | string | undefined) => (profile ?? '').trim() || 'default'
++
++export const ownerStampKey = (row: Pick<SessionInfo, 'connection_id' | 'id' | 'profile'>, id = row.id): string =>
++  `${row.connection_id?.trim() || $connectionsRegistry.get()?.primary?.trim() || 'local'}\u0000${profileOf(row.profile)}\u0000${id}`
++
++/** A row is re-asked at most this often; its stamps (kanban counts) change without the row changing. */
++export const STAMP_FRESH_MS = 30_000
++/** An owner whose stamp request failed (older backend: 404, or unreachable) is not asked again for this long. */
++export const STAMP_FAILURE_BACKOFF_MS = 120_000
++const BATCH = 100
++
++export type StampFetcher = (connectionId: string, profile: string, ids: string[]) => Promise<OwnerRowStamps[]>
++
++const defaultFetcher: StampFetcher = async (connectionId, profile, ids) => {
++  const res = await hermesApi<{ sessions?: OwnerRowStamps[] }>({
++    connectionId,
++    path: `/api/profiles/sessions/stamps?profile=${encodeURIComponent(profile)}&ids=${ids.map(encodeURIComponent).join(',')}`,
++    // This Mac's own backend is observational here: an absent one is not a reason to start it.
++    ...(connectionId === 'local' ? { passive: true } : {}),
++    timeoutMs: 20_000
++  })
++
++  return res?.sessions ?? []
++}
++
++const askedAt = new Map<string, number>()
++const failedAt = new Map<string, number>()
++const inFlight = new Set<string>()
++
++/** Rows that need owner stamps: awake replica rows (`offline_synced_at` set, not `offline_cached`). */
++export const rowsNeedingOwnerStamps = (rows: readonly SessionInfo[]): SessionInfo[] =>
++  rows.filter(row => row.offline_synced_at !== undefined && !row.offline_cached && !!row.connection_id?.trim())
++
++/** Ask each owner (connection + profile) for the stamps of its awake replica rows; throttled per row and owner. */
++export async function refreshOwnerRowStamps(
++  rows: readonly SessionInfo[],
++  fetcher: StampFetcher = defaultFetcher,
++  now: number = Date.now()
++): Promise<void> {
++  const byOwner = new Map<string, { connectionId: string; profile: string; ids: string[] }>()
++
++  for (const row of rowsNeedingOwnerStamps(rows)) {
++    const connectionId = row.connection_id!.trim()
++    const profile = profileOf(row.profile)
++    const owner = `${connectionId}\u0000${profile}`
++    const key = ownerStampKey(row)
++
++    if (inFlight.has(owner) || now - (failedAt.get(owner) ?? -Infinity) < STAMP_FAILURE_BACKOFF_MS) {
++      continue
++    }
++
++    if (now - (askedAt.get(key) ?? -Infinity) < STAMP_FRESH_MS) {
++      continue
++    }
++
++    const entry = byOwner.get(owner) ?? { connectionId, ids: [], profile }
++    entry.ids.push(row.id)
++    byOwner.set(owner, entry)
++  }
++
++  await Promise.all(
++    [...byOwner.entries()].map(async ([owner, { connectionId, ids, profile }]) => {
++      inFlight.add(owner)
++
++      try {
++        const answered: OwnerRowStamps[] = []
++
++        for (let i = 0; i < ids.length; i += BATCH) {
++          answered.push(...(await fetcher(connectionId, profile, ids.slice(i, i + BATCH))))
++        }
++
++        for (const id of ids) {
++          askedAt.set(ownerStampKey({ connection_id: connectionId, id, profile }), now)
++        }
++
++        const next = new Map($ownerRowStamps.get())
++
++        for (const stamps of answered) {
++          if (stamps?.id) {
++            const { id, profile: _profile, ...rest } = stamps
++            next.set(ownerStampKey({ connection_id: connectionId, id, profile }), rest)
++          }
++        }
++
++        $ownerRowStamps.set(next)
++      } catch {
++        failedAt.set(owner, now)
++      } finally {
++        inFlight.delete(owner)
++      }
++    })
++  )
++}
++
++export function _resetOwnerRowStampsForTests(): void {
++  askedAt.clear()
++  failedAt.clear()
++  inFlight.clear()
++  $ownerRowStamps.set(new Map())
++}
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 06dd7842eb3..cceea587de6 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -523,6 +523,46 @@ def get_profiles_sessions(
+             "storage": _corrupt_profile_stores(targets)}
+ 
+ 
++# [daveey] Row columns a stamp answer carries besides the annotators' own keys: the project placement (cwd/git) and
++# the stored outcome, which a replica record also lacks.
++_SESSION_STAMP_COLUMNS = ("cwd", "git_branch", "git_repo_root", "outcome", "muted")
++
++
++@sessions_router.get("/api/profiles/sessions/stamps")
++def get_profiles_session_stamps(ids: str = Query(..., max_length=8000), profile: str = "default"):
++    """[daveey] Activity stamps (kanban_*, goal/cron/background/turn/review, outcome, cwd) of the named sessions of
++    one profile, read the way the list endpoints annotate their rows. The Desktop sidebar shows another gateway's
++    older chats from the hub replica, whose records carry none of these; the projects tree carries only a few
++    previews per project, so a replica row outside it painted no waiting/stuck stripe. Missing ids are omitted."""
++    from hermes_state_outcome import stamp_outcome_rows
++
++    wanted = list(dict.fromkeys(s.strip() for s in ids.split(",") if s.strip()))[:100]
++    name, home = _cron_profile_home(profile or "default")
++    now = time.time()
++
++    def _read(db) -> list[dict[str, Any]]:
++        found = []
++        for sid in wanted:
++            row = db.get_session(sid)
++            if row:
++                row["_lineage_ids"] = db.get_compression_chain(sid)
++                found.append(row)
++        return found
++
++    rows = _read_profile_db(name, home, None, _read) or []
++    stamp_outcome_rows(_tag_rows(rows, name, now))
++    stamp_automated(rows, home)
++    base = [set(row) for row in rows]
++    annotate_review_wait(annotate_turn_activity(annotate_background_activity(annotate_cron_activity(
++        annotate_goal_activity(annotate_kanban_activity(rows))))))
++    out = []
++    for row, before in zip(rows, base):
++        stamps = {key: row[key] for key in row if key not in before and not key.startswith("_")}
++        stamps.update({key: row.get(key) for key in _SESSION_STAMP_COLUMNS})
++        out.append({"id": row["id"], "profile": name, **stamps})
++    return {"sessions": out}
++
++
+ @sessions_router.get("/api/profiles/sessions/sidebar")
+ @_sidebar_singleflight_cache
+ def get_profiles_sessions_sidebar(
+diff --git a/tests/hermes_cli/test_profiles_session_stamps.py b/tests/hermes_cli/test_profiles_session_stamps.py
+new file mode 100644
+index 00000000000..cce050b4c01
+--- /dev/null
++++ b/tests/hermes_cli/test_profiles_session_stamps.py
+@@ -0,0 +1,83 @@
++"""GET /api/profiles/sessions/stamps: activity stamps for sidebar rows the projects tree doesn't carry. [daveey]"""
++
++import os
++
++import pytest
++
++from hermes_cli import turn_session_activity as tsa
++
++
++def _holder(pid, sid):
++    return f"pid={pid}:turn={sid}:{sid}:abcd1234:platform=desktop"
++
++
++@pytest.fixture
++def rest(monkeypatch, _isolate_hermes_home):
++    starlette = pytest.importorskip("starlette.testclient")
++    import hermes_state
++    from hermes_cli import profiles
++    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
++    from hermes_constants import get_hermes_home
++    from hermes_state import SessionDB
++
++    home = get_hermes_home()
++    home.mkdir(parents=True, exist_ok=True)
++    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
++    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
++    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: home / "profiles")
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        for sid in ("parked_chat", "busy_chat"):
++            db.create_session(sid, source="desktop")
++            db.append_message(sid, role="user", content="go")
++            db.append_message(sid, role="assistant", content="done")
++        db._execute_write(lambda conn: conn.execute(
++            "UPDATE sessions SET cwd = ? WHERE id = ?", ("/Users/x/code/infra", "parked_chat")))
++        assert db.try_acquire_session_turn_lease("busy_chat", _holder(os.getpid(), "busy_chat"), ttl_seconds=600)
++    finally:
++        db.close()
++
++    seen = []
++
++    def fake_kanban(rows):
++        # The real annotator reads the boards; this one proves the endpoint feeds it rows with their lineage.
++        for row in rows:
++            seen.append((row["id"], list(row.get("_lineage_ids") or [])))
++            if row["id"] == "parked_chat":
++                row.update(kanban_active=5, kanban_parked=5, kanban_blocked=0, kanban_observed_at=123.0)
++        return rows
++
++    from hermes_cli.web_routers import profiles as profiles_router
++
++    monkeypatch.setattr(profiles_router, "annotate_kanban_activity", fake_kanban)
++    tsa._reset_cache_for_tests()
++    c = starlette.TestClient(app)
++    c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
++    c.seen = seen
++    yield c
++    tsa._reset_cache_for_tests()
++
++
++def test_stamps_carry_kanban_cwd_and_turn_live_for_named_ids(rest):
++    body = rest.get("/api/profiles/sessions/stamps?profile=default&ids=parked_chat,busy_chat,missing").json()
++    rows = {row["id"]: row for row in body["sessions"]}
++
++    assert set(rows) == {"parked_chat", "busy_chat"}  # an unknown id is omitted, not an error
++    assert rows["parked_chat"] == {
++        **rows["parked_chat"],
++        "kanban_active": 5,
++        "kanban_parked": 5,
++        "kanban_observed_at": 123.0,
++        "cwd": "/Users/x/code/infra",
++        "profile": "default",
++    }
++    assert rows["busy_chat"].get("turn_live") is True
++    assert ("parked_chat", ["parked_chat"]) in rest.seen
++    # Stamps only: no display/list fields that would overwrite the sidebar row's own.
++    for row in rows.values():
++        assert not {"title", "message_count", "started_at", "is_active", "system_prompt"} & set(row)
++
++
++def test_unknown_profile_is_404(rest):
++    assert rest.get("/api/profiles/sessions/stamps?profile=nope&ids=a").status_code == 404
+-- 
+2.55.0
+

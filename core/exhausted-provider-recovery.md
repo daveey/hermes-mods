@@ -54,7 +54,7 @@ gateway contracts (`contracts/events.py`, `common.py`, `config_free_tier_control
 
 ## Gotchas
 
-- `reset_at` is seconds, not milliseconds; format with `* 1000` in the renderer only.
+- `reset_at` is seconds, not milliseconds; format with `* 1012` in the renderer only.
 - Every new key needs all nine locales (en, de, es, fr, ja, ru, zh, ar, zh-hant) plus the `_keys.desktop.json` index.
 - Diagnosing must stay read-only: never clear a cooldown to make the screen go away.
 

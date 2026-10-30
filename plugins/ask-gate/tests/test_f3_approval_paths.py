@@ -44,7 +44,9 @@ def test_reconciled_final_retires_pending_even_in_howto_context(gate, howto):
         lambda target: {"target": target, "state": "vetoed", "verified": True, "observed_at": time.time()})
     gate.LLM = llm_returning([("ok", "not authoritative")])
     try:
-        assert "replace" in gate.pre_final_gate(session_id="s1", final_response=ASK)
+        assert gate.pre_final_gate(session_id="s1", final_response=ASK).get("hold")
+        assert gate.ledger().open_asks("s1") == []
+        assert "replace" in gate.pre_final_gate(session_id="s1", final_response=ASK, attempt=2)
         assert gate.ledger().open_asks("s1") == []
         assert not gate.LLM.seen
     finally:

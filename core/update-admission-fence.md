@@ -43,9 +43,9 @@ The fence is a snapshot gate at admission time, not a proof that no turn started
 
 No: it sits inside core admission paths.
 
-## Follow-up patch (1035)
+## Follow-up patch (1078)
 
-**1035** (`161d7b6752c`): a cron job due inside a hermes-sync drain window started under the admission hold (cron took only the process retirement fence), held the gateway's deferred restart open past the window, and when the updater gave up the restart still ran on the old code (MacBook, 2026-10-29).
+**1078** (`161d7b6752c`): a cron job due inside a hermes-sync drain window started under the admission hold (cron took only the process retirement fence), held the gateway's deferred restart open past the window, and when the updater gave up the restart still ran on the old code (MacBook, 2026-10-29).
 
 - The cron tick takes the cross-process admission reservation for its scan/advance/submit; while the hold stands it dispatches nothing and due jobs stay due (nothing advanced).
 - Each cron run holds its own reservation (`admission_fence.extend`, taken inside the tick's) for its whole life, so the drainer's reservation read sees it and never publishes the intent under it.

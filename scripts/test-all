@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Run every hermes-mods Python test suite, each in its own process, and summarize.
+
+A bare repo-wide `pytest` cannot work here: ~50 plugin dirs reuse test-module basenames
+(`test_load.py`...), some suites need a core checkout, and a test that imports core's
+`hermes_bootstrap` can re-exec the interpreter and kill pytest mid-collection with exit 1
+and no output. So this runner:
+
+* gives each suite its own process and its own rootdir (no basename collisions),
+* sets HERMES_DISABLE_LAZY_INSTALLS=1 (stops that re-exec) and PYTHONPATH to core,
+* never lets a failure be silent: every non-zero suite is listed with its exit code and
+  the last lines of output, and a death without a pytest summary is labelled SILENT-EXIT,
+* exits 0 only if every suite passed (or was skipped for a stated reason).
+
+Usage:
+  scripts/test-all                      all suites, 4 at a time
+  scripts/test-all -k hub-sync          only suites whose name contains the substring
+  scripts/test-all -j 8 --timeout 900
+  scripts/test-all --list
+  scripts/test-all --hermes-core PATH   override the core checkout (default $HERMES_CORE_CHECKOUT,
+                                        then ~/.hermes/hermes-agent); F3 runs whenever core is found
+
+Python: $HERMES_MODS_PYTHON, else <core>/.venv/bin/python, else the current interpreter.
+Suites are discovered from the tree; SUITE_OVERRIDES below holds the few that need a
+different command or are skipped with a reason.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# name -> {"skip": reason} | {"cmd": [argv...] (relative to the suite dir; {py} = interpreter)}
+SUITE_OVERRIDES: dict[str, dict] = {
+    # Its tests run against a disposable snapshot of core's HEAD (its README), not in place, and
+    # need a pytest site dir outside the Hermes home (TEST_SITE, made once by ensure_test_site()).
+    "plugins/fast-rate-limit-fallback": {
+        "cmd": ["sh", "-ec",
+                '{py} -I run_tests.py --repo "{core}" --test-site-packages "{site}" '
+                '&& {py} -m unittest discover -s harness_tests'],
+        "cwd": "plugins/fast-rate-limit-fallback",
+    },
+    # unittest suite (its README); pytest mistakes the plugin's package __init__ for a test module.
+    "plugins/mcp-file-access": {
+        "cmd": ["{py}", "-m", "unittest", "discover", "-s", "tests"],
+        "cwd": "plugins/mcp-file-access",
+    },
+    # CI runs it standalone (.github/workflows/runners.yml): core's own `plugins` package would
+    # shadow plugins/ on the path, and it needs jsonschema + yaml, which core's venv lacks.
+    "plugins/runners": {
+        "cmd": ["uv", "run", "--no-project", "--python", "3.14", "--with", "pytest",
+                "--with", "jsonschema[format-nongpl]", "--with", "pyyaml", "--with", "fastapi",
+                "--with", "httpx", "python", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                "plugins/runners/tests"],
+        "no_core_path": True,
+    },
+}
+
+# pyyaml etc. that core's venv lacks but several suites import. Appended LAST on PYTHONPATH, so it
+# only fills gaps and never shadows the interpreter's own packages.
+# Env that marks "this process is an agent worker": a test that builds its own temp Kanban board
+# or hermes home must not inherit it (core fences Kanban writes of delegated children).
+SCRUB_ENV_PREFIXES = ("HERMES_KANBAN", "HERMES_DELEGATED", "HERMES_SUPERVISED", "HERMES_ORIGIN")
+TEST_SITE = Path.home() / ".cache" / "hermes-mods-test-site"  # must be outside the Hermes home
+
+
+def ensure_test_site() -> Path:
+    if not (TEST_SITE / "pytest").is_dir() and shutil.which("uv"):
+        subprocess.run(["uv", "pip", "install", "-q", "--python", "3.14", "--target", str(TEST_SITE),
+                        "pytest", "pytest-asyncio", "pyyaml"], check=True)
+    return TEST_SITE
+
+
+SUMMARY_RE = re.compile(r"\b\d+ (passed|failed|error|errors|skipped|deselected|xfailed)\b|no tests ran|^Ran \d+ tests?")
+
+
+def find_core(arg: str | None) -> tuple[Path | None, bool]:
+    """(core checkout, whether it was named explicitly rather than found at the default path)."""
+    for i, cand in enumerate((arg, os.environ.get("HERMES_CORE_CHECKOUT"), str(Path.home() / ".hermes" / "hermes-agent"))):
+        if cand and (Path(cand) / "hermes_bootstrap.py").is_file():
+            return Path(cand).resolve(), i < 2
+    return None, False
+
+
+def find_python(core: Path | None) -> str:
+    if os.environ.get("HERMES_MODS_PYTHON"):
+        return os.environ["HERMES_MODS_PYTHON"]
+    if core and (core / ".venv" / "bin" / "python").exists():
+        return str(core / ".venv" / "bin" / "python")
+    return sys.executable
+
+
+def test_files(d: Path) -> list[Path]:
+    found = set()
+    for pat in ("test_*.py", "*_test.py", "tests_*.py"):
+        for p in d.rglob(pat):
+            if not {"node_modules", "__pycache__", ".git"} & set(p.parts):
+                found.add(p)
+    return sorted(found)
+
+
+def has_tests(d: Path) -> bool:
+    return bool(test_files(d))
+
+
+def discover(root: Path, core: Path | None, explicit_core: bool) -> list[dict]:
+    suites = []
+    top = root / "tests"
+    if top.is_dir():
+        suites.append({"name": "tests", "dir": top, "args": ["--ignore=" + str(top / "integration_f3")],
+                       "targets": [str(p) for p in test_files(top) if "integration_f3" not in p.parts]})
+        f3 = top / "integration_f3"
+        if f3.is_dir():
+            if core:
+                suites.append({"name": "tests/integration_f3", "dir": f3, "args": ["--hermes-core", str(core), "--confcutdir", str(f3)],
+                               "targets": [str(f3)]})
+            else:
+                suites.append({"name": "tests/integration_f3", "dir": f3,
+                               "skip": "needs a core checkout: pass --hermes-core PATH or set HERMES_CORE_CHECKOUT"})
+    for p in sorted((root / "plugins").iterdir()) if (root / "plugins").is_dir() else []:
+        if p.is_dir() and has_tests(p):
+            suites.append({"name": f"plugins/{p.name}", "dir": p, "args": [], "targets": [str(f) for f in test_files(p)]})
+    for p in sorted((root / "tools").iterdir()) if (root / "tools").is_dir() else []:
+        if p.is_dir() and has_tests(p):
+            suites.append({"name": f"tools/{p.name}", "dir": p, "args": [], "targets": [str(f) for f in test_files(p)]})
+    for s in suites:
+        s.update(SUITE_OVERRIDES.get(s["name"], {}))
+    return suites
+
+
+def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = ROOT) -> dict:
+    res = {"name": s["name"], "status": "", "rc": None, "secs": 0.0, "tail": "", "reason": s.get("skip", "")}
+    if s.get("skip"):
+        res["status"] = "SKIP"
+        return res
+    env = {k: v for k, v in os.environ.items() if not k.startswith(SCRUB_ENV_PREFIXES)}
+    env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"  # core's bootstrap otherwise re-execs the interpreter: silent exit 1
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # cwd is the repo root (as in CI), so `from plugins.<name> import ...` resolves; each suite
+    # still gets its own process, so same-named test modules in different plugins never collide.
+    use_core = bool(core) and not s.get("no_core_path")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(root), str(core) if use_core else "", str(TEST_SITE) if use_core else ""]))
+    hub = next((c for c in (root.parent / "hermes-hub", root.parent / "hub") if (c / "client/hermes_hub.py").is_file()), None)
+    if hub:
+        env.setdefault("HERMES_HUB_CLIENT_REAL", str(hub / "client/hermes_hub.py"))
+    if core:
+        env.setdefault("HERMES_CORE_CHECKOUT", str(core))
+    cwd = root / s["cwd"] if s.get("cwd") else root
+    cmd = [x.replace("{py}", py).replace("{core}", str(core or "")).replace("{site}", str(TEST_SITE)) for x in s["cmd"]] if s.get("cmd") else \
+        [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(s["dir"]), *s["args"], *s["targets"]]
+    t0 = time.time()
+    try:
+        cp = subprocess.run(cmd, cwd=cwd, env=env, text=True, errors="replace", timeout=timeout,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        out, rc = cp.stdout or "", cp.returncode
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else e.stdout) or ""
+        rc = None
+        res["status"] = "TIMEOUT"
+        res["reason"] = f"no result within {timeout}s"
+    res["secs"] = time.time() - t0
+    res["rc"] = rc
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    res["tail"] = "\n".join(lines[-40:])
+    if res["status"]:
+        return res
+    summarized = bool(SUMMARY_RE.search(out))
+    if rc == 0:
+        res["status"] = "PASS"
+    elif rc == 5:
+        res["status"] = "PASS"
+        res["reason"] = "no tests collected"
+    elif not summarized:
+        res["status"] = "SILENT-EXIT"
+        res["reason"] = (f"exit {rc} with no pytest summary: the process died or exited during collection "
+                         "(e.g. a module-level sys.exit/os.exec); output tail below")
+    else:
+        res["status"] = "FAIL"
+    return res
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-k", dest="match", action="append", default=[], help="only suites whose name contains this")
+    ap.add_argument("-j", dest="jobs", type=int, default=4)
+    ap.add_argument("--timeout", type=int, default=1500, help="per-suite seconds (default 1500)")
+    ap.add_argument("--hermes-core", dest="core")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--root", default=str(ROOT), help=argparse.SUPPRESS)  # tests point this at a fixture tree
+    a = ap.parse_args(argv)
+
+    root = Path(a.root).resolve()
+    core, explicit_core = find_core(a.core)
+    py = find_python(core)
+    suites = discover(root, core, explicit_core=explicit_core)
+    if a.match:
+        suites = [s for s in suites if any(m in s["name"] for m in a.match)]
+    if a.list:
+        for s in suites:
+            print(s["name"] + (f"  [skip: {s['skip']}]" if s.get("skip") else ""))
+        return 0
+    if not suites:
+        print("test-all: no suites matched", file=sys.stderr)
+        return 2
+    ensure_test_site()
+    print(f"test-all: {len(suites)} suites, -j{a.jobs}, python={py}, core={core}", flush=True)
+
+    results = []
+    with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
+        futs = [ex.submit(run_suite, s, py, core, a.timeout, root) for s in suites]
+        for f in cf.as_completed(futs):
+            r = f.result()
+            results.append(r)
+            print(f"  {r['status']:<11} {r['name']}  ({r['secs']:.0f}s)", flush=True)
+
+    results.sort(key=lambda r: r["name"])
+    bad = [r for r in results if r["status"] not in ("PASS", "SKIP")]
+    for r in bad:
+        print(f"\n=== {r['status']}: {r['name']} (exit {r['rc']}) ===")
+        if r["reason"]:
+            print(r["reason"])
+        print(r["tail"])
+    for r in results:
+        if r["status"] == "SKIP":
+            print(f"skipped {r['name']}: {r['reason']}")
+    counts = {k: sum(1 for r in results if r["status"] == k) for k in ("PASS", "SKIP", "FAIL", "SILENT-EXIT", "TIMEOUT")}
+    print("\ntest-all: " + ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+          + (" -- FAILED: " + ", ".join(r["name"] for r in bad) if bad else " -- OK"))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

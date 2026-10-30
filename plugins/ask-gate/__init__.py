@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -39,6 +39,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     runtime_contract = _sib("runtime_contract")
     pr_approval_request = _sib("pr_approval_request")
     chat_delivery = _sib("chat_delivery")
+    superseding = _sib("superseding")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
@@ -123,9 +124,32 @@ def _model_cfg() -> tuple[str | None, str | None]:
     return "anthropic", "claude-haiku-5-5"
 
 
+def _is_routing_error(e: BaseException) -> bool:
+    return any(c.__name__ == "ModelRoutingError" for c in type(e).__mro__)
+
+
 def default_llm(system: str, user: str) -> str:
+    """The configured judge; when the routing policy has no usable route for its class (every subscription
+    account for it exhausted or cooling down, logged as 'No eligible fast routes'), retry on the next
+    subscription class so the prewarm, answer-classifier and gate paths do not fail open on a transient outage."""
     prov, model = _model_cfg()
-    return judge_mod.aux_llm(system, user, provider=prov, model=model)
+    try:
+        return judge_mod.aux_llm(system, user, provider=prov, model=model)
+    except Exception as first:
+        if not _is_routing_error(first):
+            raise
+        errors = [("configured", repr(first)[:200])]
+        for name, llm in FALLBACKS():
+            try:
+                out = llm(system, user)
+            except Exception as e:
+                if not _is_routing_error(e):
+                    raise
+                errors.append((name, repr(e)[:200]))
+                continue
+            core.log_event("llm_class_fallback", judge=name, errors=errors)
+            return out
+        raise
 
 
 LLM = default_llm  # tests replace this
@@ -348,22 +372,122 @@ def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, se
 
 
 # ---- L2 -----------------------------------------------------------------------------------------------
+# A refused ask (closed lifecycle, recorded terminal answer, stopped workflow, unreconcilable approval) is first
+# HELD with a nudge naming the ask and why, so the agent resends without it. Only once the hold budget is spent
+# is the reply replaced, and then by the draft minus the refused ask sentences plus one plain sentence on why.
+# A bare "I withheld a request" notice is the last resort when the ask cannot be cut out cleanly.
+_REFUSED_NOTE = ("(I left a request out of this reply: {why}. This note grants no new permission or "
+                 "execution authorization.)")
+_BARE_NOTICE = ("I withheld a request after checking authoritative approval or lifecycle state. "
+                "No new permission or execution authorization is granted by this notice.")
+
+
+def _plain_why(verdict: str, message: str) -> str:
+    """One user-facing clause for the final note, from the refusal kind / adapter message."""
+    m = (message or "").lower()
+    if verdict == "workflow_stopped":
+        return "you stopped this workflow"
+    if verdict == "unverified":
+        return "it did not pass the current-state check, so I am not asking you for it"
+    if verdict == "retired" or "is retired" in m:
+        return "you already gave a final answer on it"
+    if verdict.startswith("user_step"):
+        return ("that step is already closed" if "retired" in verdict
+                else "its current state could not be checked, so I am not asking you for it")
+    if "already approved" in m:
+        return "that exact approval scope is already approved, so there is nothing to ask"
+    if "is denied" in m:
+        return "that exact approval scope was already denied"
+    if "approval state could not be reconciled" in m:
+        return "its current approval state could not be checked, so I am not asking you for it"
+    return "its approval or lifecycle state could not be confirmed, so I am not asking you for it"
+
+
+def _user_step_directives(text: str) -> list[str]:
+    out = [m.group(0) for m in user_step_lifecycle._DIRECTIVE.finditer(text or "")]
+    return out or [ln.strip() for ln in (text or "").splitlines() if user_step_lifecycle._MARKER.search(ln)]
+
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _has_ask(text: str, howto: bool) -> bool:
+    return bool(core.find_asks(text, howto=howto) or handoff.find_handoffs(text))
+
+
+def _strip_refused(text: str, refused: list[str], howto: bool, directives_only: bool) -> str | None:
+    """The draft without the refused ask sentences, or None when they can't be cut out cleanly."""
+    out = user_step_lifecycle._DIRECTIVE.sub("", text)
+    for ask in sorted({a for a in refused if isinstance(a, str) and a.strip()}, key=len, reverse=True):
+        out = out.replace(ask, "")
+    lines = []
+    for line in out.splitlines():
+        if user_step_lifecycle._MARKER.search(line):
+            continue
+        if not directives_only and _has_ask(line, howto):
+            kept = [s for s in _SENT_SPLIT.split(line) if not _has_ask(s, howto)]
+            line = " ".join(kept)
+        if line.strip() and not re.sub(r"[\s\-*•>#.,;:)(\d]+", "", line):
+            continue  # only a dangling bullet / number left
+        lines.append(line.rstrip())
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if user_step_lifecycle._MARKER.search(result):
+        return None
+    if not directives_only and _has_ask(result, howto):
+        return None
+    if any(len(a) > 20 and a in result for a in refused):
+        return None
+    return result
+
+
+def _refuse(session_id: str, verdict: str, draft: str, refused: list[str], why: str,
+            attempt: int, budget: int, howto: bool = False, directives_only: bool = False) -> dict:
+    try:
+        ledger().set_open_asks(session_id, [])
+    except Exception as e:
+        core.log_event("pending_clear_error", session=session_id, error=repr(e))
+    reason = re.sub(r"^ask-gate:\s*", "", why or "").strip() or "Its current state could not be confirmed."
+    if attempt < budget:
+        try:
+            record_verdict(session_id, "held", draft)
+        except Exception:
+            pass
+        core.log_event("refused_held", session=session_id, verdict=verdict, attempt=attempt, asks=refused[:3])
+        listed = "\n".join(f"- {a.strip()[:300]}" for a in refused[:5]) or "- (the request in your reply)"
+        return {"hold": True, "nudge": (
+            "ask-gate: your reply was NOT delivered. It asks David to:\n" + listed + "\n"
+            f"Refused because: {reason}\n"
+            "Resend the reply without that request. Keep your findings and results, and state the real blocker "
+            "in plain words (what is stuck, and what you will do about it). Do not re-ask it in other words.")}
+    try:
+        record_verdict(session_id, verdict, draft)
+    except Exception:
+        pass
+    note = _REFUSED_NOTE.format(why=_plain_why(verdict, why))
+    try:
+        kept = _strip_refused(draft, refused, howto, directives_only)
+    except Exception as e:
+        core.log_event("refused_strip_error", session=session_id, error=repr(e))
+        kept = None
+    core.log_event("refused_replaced", session=session_id, verdict=verdict, kept=bool(kept))
+    if kept is None:
+        return {"replace": _BARE_NOTICE + " " + note}
+    return {"replace": (kept + "\n\n" + note) if kept else note}
+
+
 def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", final_response: str = "",
                    turn_messages: list | None = None, attempt: int = 0,
                    hold_budget: int | None = None, **_: Any) -> dict | None:
     if not _gate_eligible(session_id, platform) or not isinstance(final_response, str):
         return None
+    budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
     # Exact source reconciliation must not fail open when unrelated history or
     # audit storage is corrupt. Reporting is best-effort, suppression is not.
     exact = user_step_lifecycle.preflight({"session_id": session_id, "draft": final_response})
     if exact is not None:
-        try:
-            record_verdict(session_id, exact["reason"], final_response)
-            ledger().set_open_asks(session_id, [])
-        except Exception:
-            pass
-        return {"replace": "I withheld a user-step request after checking its lifecycle state. "
-                "No new permission or execution authorization is granted by this notice."}
+        return _refuse(session_id, exact.get("reason") or "user_step", final_response,
+                       _user_step_directives(final_response), exact.get("message", ""),
+                       attempt, budget, directives_only=True)
     rejected = False
     try:
         users = _user_msgs(session_id)
@@ -372,29 +496,30 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
         retirement_candidates = asks + handoff.find_handoffs(final_response)
         if not howto and retirement_candidates and ledger().workflow_stopped(session_id):
             rejected = True
-            record_verdict(session_id, "workflow_stopped", final_response)
-            return {"replace": "The workflow remains stopped. I withheld a request to act on it."}
+            return _refuse(session_id, "workflow_stopped", final_response, retirement_candidates,
+                           "David stopped this workflow, so asking him to act on it is not allowed until he "
+                           "resumes it himself.", attempt, budget, howto=howto)
         retired = core.retired_matches(retirement_candidates, ledger().retired_for(session_id, retirement_candidates))
         if retired:
             rejected = True
-            record_verdict(session_id, "retired", final_response)
-            return {"replace":
-                    "I suppressed a repeated request because this action has a recorded terminal answer. "
-                    "This record does not authorize performing or reopening it."}
+            refused = [retirement_candidates[i] for i in sorted(retired) if i < len(retirement_candidates)]
+            return _refuse(session_id, "retired", final_response, refused or retirement_candidates,
+                           "David already gave a terminal answer to this ask (revoked, cancelled, completed or "
+                           "impossible). Do not ask again; this record does not authorize doing or reopening it.",
+                           attempt, budget, howto=howto)
         reconciled = lifecycle.preflight({"session_id": session_id, "tool_name": "pre_final_gate",
                                           "draft": final_response, "howto": howto})
         if reconciled is None:
             reconciled = _reconcile_prose(session_id, "pre_final_gate", asks if howto else retirement_candidates)
         if reconciled is not None:
             rejected = True
-            record_verdict(session_id, "approval_reconciled", final_response)
-            try:
-                ledger().set_open_asks(session_id, [])
-            except Exception as e:
-                core.log_event("pending_clear_error", session=session_id, error=repr(e))
-            return {"replace": "I withheld a request after checking authoritative approval or lifecycle state. "
-                    "No new permission or execution authorization is granted by this notice."}
-        budget = MAX_NUDGES if hold_budget is None else min(MAX_NUDGES, max(0, hold_budget))
+            return _refuse(session_id, "approval_reconciled", final_response,
+                           asks if howto else retirement_candidates, reconciled.get("message", ""),
+                           attempt, budget, howto=howto)
+        denial = None if howto else _superseding_reply_hold(session_id, final_response, attempt, budget)
+        if denial is not None:
+            record_verdict(session_id, "held", final_response)
+            return denial
         held = None if howto else _handoff_gate(session_id, final_response, turn_messages, attempt)
         if held is not None and attempt < budget:
             return held
@@ -404,6 +529,9 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
             verdicts = [{"i": 0, "verdict": "unverified", "reason": "Handoff was not opened."}]
         elif asks:
             tools = core.merge_tool_logs(core.tools_from_messages(turn_messages or []), LOG.get(session_id))
+            repeat = None if howto else _repeat_gate(session_id, asks, attempt, budget, final_response)
+            if repeat is not None:
+                return repeat
             # Re-read evidence even when the draft text has not changed.
             verdicts = run_judge(session_id, asks, tools, final_response)
         else:
@@ -414,20 +542,16 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
                        verdicts=[(v["verdict"], v.get("reason", "")) for v in verdicts])
         if not bad:
             ledger().set_open_asks(session_id, asks)
+            _record_shown(session_id, asks, final_response)
             record_verdict(session_id, "ok", final_response)
             return None
         if attempt < budget:
             record_verdict(session_id, "held", final_response)
             return {"hold": True, "nudge": judge_mod.nudge(asks, verdicts)}
         record_verdict(session_id, "unverified", final_response)
-        # The entire draft is withheld, including its otherwise valid asks.
-        # Never save a pending question the user did not actually see.
-        try:
-            ledger().set_open_asks(session_id, [])
-        except Exception as e:
-            core.log_event("pending_clear_error", session=session_id, error=repr(e))
-        return {"replace": "I withheld a request that did not pass the current-state check. "
-                "No action or approval is requested by this notice."}
+        # The judge's held asks still fail after the retry budget: drop them, keep the rest of the reply.
+        return _refuse(session_id, "unverified", final_response, asks,
+                       "It did not pass the current-state check.", budget, budget, howto=howto)
     except Exception as e:
         # Reporting/pending-ledger failures must not resurrect a rejected draft.
         # Preserve the existing fail-open policy only before a rejection exists.
@@ -436,6 +560,34 @@ def pre_final_gate(session_id: str = "", platform: str = "", model: str = "", fi
                     "No action or approval is requested by this notice."}
         core.log_event("gate_error", session=session_id, error=repr(e))
         return None
+
+
+def _repeat_gate(session_id: str, asks: list[str], attempt: int, budget: int, draft: str) -> dict | None:
+    """Hold a reply that restates an ask this chat already showed REPEAT_MAX_SHOWN times in 48 h with no new fact
+    (self-heal agent-31a66d274a). Deterministic, before the judge: the judge passes a true, unanswered ask as ok
+    every time, so only a count stops the restatement. Past the hold budget the reply goes on to the judge as
+    before. Fails open."""
+    try:
+        reps = core.repeated_asks(core.ask_items(asks), ledger().shown_rows(session_id), _user_msgs(session_id),
+                                  reply=draft)
+    except Exception as e:
+        core.log_event("ask_repeat_error", session=session_id, error=repr(e)[:300])
+        return None
+    if not reps:
+        return None
+    core.log_event("ask_repeat_held" if attempt < budget else "ask_repeat_released", session=session_id,
+                   attempt=attempt, repeats=[{"item": r["item"][:200], "n": r["n"]} for r in reps[:5]])
+    if attempt >= budget:
+        return None
+    record_verdict(session_id, "held", draft)
+    return {"hold": True, "nudge": core.repeat_nudge(reps)}
+
+
+def _record_shown(session_id: str, asks: list[str], reply: str) -> None:
+    try:
+        ledger().record_shown(session_id, core.ask_items(asks), core.text_hash(reply), reply=reply)
+    except Exception as e:
+        core.log_event("ask_shown_error", session=session_id, error=repr(e)[:300])
 
 
 def _handoff_gate(session_id: str, final_response: str, turn_messages: list | None, attempt: int) -> dict | None:
@@ -533,6 +685,63 @@ def _pr_filing_hold(session_id: str, tool_name: str, args: dict, request: dict) 
               "This notice grants no approval and changes no task state."}
 
 
+# Process-local one-shot holds, like _PR_FILING_HELD: a retry of the same ask (or reply) passes this check.
+_SUPERSEDING_HELD: set[tuple[str, str, str]] = set()
+
+
+def _superseding_ask_hold(session_id: str, tool_name: str, args: dict, request: dict) -> dict | None:
+    """Hold an approval ask once when open/recently-done cards on its subject go unnamed (agent-4ee5f101e2).
+    Fails open: a board read error never blocks the ask."""
+    if request.get("interaction") != "approval" or superseding.off():
+        return None
+    try:
+        query = "\n".join([str(args.get("title") or ""), request["action"], request["scope"]])
+        named = "\n".join([query, str(args.get("body") or ""), str(args.get("reason") or ""),
+                           request["evidence"], request["why_human"]])
+        own = {str(x) for x in (args.get("task_id"), os.environ.get("HERMES_KANBAN_TASK")) if x}
+        key = (session_id, tool_name, core.text_hash(query))
+        if key in _SUPERSEDING_HELD:
+            core.log_event("superseding_released", tool=tool_name, session=session_id)
+            return None
+        hits = superseding.matches(core, query, named, exclude=own)
+    except Exception as e:
+        core.log_event("superseding_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+    if not hits:
+        return None
+    _SUPERSEDING_HELD.add(key)
+    core.log_event("superseding_held", tool=tool_name, session=session_id,
+                   cards=[(h["id"], h["score"]) for h in hits])
+    return {"action": "block", "message": superseding.ask_message(core, hits)}
+
+
+def _superseding_reply_hold(session_id: str, text: str, attempt: int, budget: int,
+                            surface: str = "reply") -> dict | None:
+    """A reply/clarify that tells David a change he named has 'no sign' of happening must name the in-flight
+    cards on that subject, or say why none is it. Held once per text; fails open."""
+    if attempt >= budget or superseding.off():
+        return None
+    try:
+        found = superseding.denials(text)
+        if not found:
+            return None
+        users = _user_msgs(session_id)
+        last = users[-1] if users else ""
+        key = (session_id, surface, core.text_hash(" ".join(found)))
+        if key in _SUPERSEDING_HELD:
+            return None
+        hits = superseding.matches(core, last + "\n" + text, text)
+    except Exception as e:
+        core.log_event("superseding_error", tool=surface, session=session_id, error=repr(e)[:300])
+        return None
+    if not hits:
+        return None
+    _SUPERSEDING_HELD.add(key)
+    core.log_event("superseding_held", tool=surface, session=session_id, denials=found[:3],
+                   cards=[(h["id"], h["score"]) for h in hits])
+    return {"hold": True, "nudge": superseding.reply_message(core, hits)}
+
+
 def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
     """Explicit asks fail closed without changing the ordinary chat/legacy prose gates."""
     try:
@@ -545,6 +754,9 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         filing = _pr_filing_hold(session_id, tool_name, args, request)
         if filing is not None:
             return filing
+        held = _superseding_ask_hold(session_id, tool_name, args, request)
+        if held is not None:
+            return held
         context = {"session_id": session_id, "tool_name": tool_name,
                    "human_request": request, "args": args}
         reconciled = lifecycle.preflight(context) or approval_reconciliation.preflight(context)
@@ -630,6 +842,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             reconciled = _reconcile_prose(session_id, tool_name, candidates) or _retired_block(session_id, candidates)
             if reconciled is not None:
                 return reconciled
+            denial = _superseding_reply_hold(session_id, "\n".join(candidates), 0, 1, surface="clarify")
+            if denial is not None:
+                return {"action": "block", "message": denial["nudge"]}
         delivery = _chat_delivery_gate(session_id, tool_name, args)
         if delivery is not None:
             return delivery
@@ -707,6 +922,14 @@ def _chat_delivery_gate(session_id: str, tool_name: str, args: dict) -> dict | N
 
 
 FYI_PREFIX = "FYI (unverified, not an ask for David): "
+# Core relays a FINAL SEND line only while the line starts with it (hermes_cli/kanban_final_send._HEAD): an FYI mark
+# on such a leftover goes after the header, or the chat never receives the line.
+_FINAL_SEND_HEAD = re.compile(r"^([\s>*`_-]*FINAL[ _]SEND\s+for\s+`?@session:[^\s:`]+`?:\s*)", re.I)
+
+
+def _fyi(s: str) -> str:
+    m = _FINAL_SEND_HEAD.match(s)
+    return m.group(1) + FYI_PREFIX + s[m.end():] if m else FYI_PREFIX + s
 
 
 def _worker_complete(session_id: str, args: dict) -> dict | None:
@@ -728,7 +951,7 @@ def _worker_complete(session_id: str, args: dict) -> dict | None:
     for s in left:
         if s in keep_ok or FYI_PREFIX in s:
             continue
-        out = out.replace(s, FYI_PREFIX + s, 1)
+        out = out.replace(s, _fyi(s), 1)
         changed = True
     core.log_event("worker_handoff", session=session_id, leftovers=left, rewritten=changed)
     if not changed:

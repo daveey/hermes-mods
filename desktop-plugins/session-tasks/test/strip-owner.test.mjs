@@ -82,3 +82,19 @@ test('rendered chips disable unresolved owners and click only their captured rou
   button.props.onClick()
   assert.deepEqual(calls, [['t_same', 'bb', 'A', 'work']])
 })
+
+test('the strip hides while the session panel is loaded and comes back without it', async () => {
+  stripHost.state.focusedStoredSessionId.value = null
+  stripHost.state.focusedSessionOwner.value = { connectionId: 'owner-a', profile: 'default' }
+  await refresh()
+  assert.ok(render(), 'strip shows on its own')
+  window.__sessionPanel = { active: true }
+  try {
+    const effects = stripEffects.length
+    assert.equal(render(), null, 'the panel shows this work instead')
+    assert.ok(stripEffects.length > effects, 'still subscribes, so polling keeps feeding the panel')
+  } finally { delete window.__sessionPanel }
+  assert.ok(render())
+  assert.equal(typeof window.__sessionTasks?.subscribe, 'function')
+  assert.equal(typeof window.__sessionTasks?.lineageIds, 'function')
+})

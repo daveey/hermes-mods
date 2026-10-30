@@ -1,0 +1,316 @@
+From 58a61ebf7738cfddc56483fa99f00065543d2cdb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:05:53 +0000
+Subject: [PATCH] fix(gateway): reap SIGKILLed gateways' stale hermes-gw-*
+ fallback dirs; test fixtures stop children with SIGTERM [daveey]
+
+A gateway killed with SIGKILL never runs cleanup_files, so its shared-temp
+hermes-gw-<hash>/control.sock dir outlived it (5 per tests/gateway/test_session_kanban.py
+run on the hub). The next fallback bind now reaps sibling hermes-gw-* dirs that are
+provably ours and dead: a real 0700 dir owned by our uid, >10 min old, holding only a
+socket that refuses connect (ECONNREFUSED), never our own target, never via symlink,
+at most 200 candidates per start.
+
+Test fixtures: local_recovery_probe.daemon() and automation_peer teardown SIGTERM and
+wait 10 s before kill(), and TMPDIR passes to children.
+---
+ gateway/control_socket.py                     |  77 ++++++++++++++
+ tests/gateway/fixtures/automation_peer.py     |   4 +-
+ .../gateway/fixtures/local_recovery_probe.py  |  24 ++++-
+ tests/gateway/test_control_socket.py          | 100 ++++++++++++++++++
+ .../test_unified_gateway_native_live.py       |   2 +-
+ 5 files changed, 199 insertions(+), 8 deletions(-)
+
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index 3123a00219f..eca3e4aa28e 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -96,6 +96,81 @@ def _squat_proof_fallback(bind_path: Path) -> Path:
+     return path
+ 
+ 
++# A gateway killed with SIGKILL (a crash, the OOM killer, a test harness's kill()) never runs
++# ``cleanup_files``, so its shared-temp ``hermes-gw-<hash>`` dir outlives it. The next fallback bind
++# reaps such siblings, but only what is provably ours and dead (``_reap_stale_fallback_dirs``).
++_FALLBACK_DIR_PREFIX = "hermes-gw-"
++_STALE_FALLBACK_AGE_S = 600.0
++_MAX_FALLBACK_REAP_SCAN = 200
++
++
++def _socket_refuses(path: Path) -> bool:
++    """True only when nothing listens at ``path``: connect fails with ECONNREFUSED. A live listener,
++    a timeout or any other error (EACCES, EAGAIN on a full backlog) reads as maybe alive."""
++    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
++        probe.settimeout(0.5)
++        try:
++            probe.connect(str(path))
++        except ConnectionRefusedError:
++            return True
++        except OSError:
++            return False
++    return False
++
++
++def _reap_stale_fallback_dirs(parent: Path, keep: str) -> int:
++    """Remove dead ``hermes-gw-*`` siblings in ``parent`` (never ``keep``) that a killed gateway
++    left behind. A sibling is reaped only when its lstat is a real directory (never a symlink)
++    owned by this uid with mode exactly 0700, older than ``_STALE_FALLBACK_AGE_S``, holding nothing
++    but ``control.sock`` (itself our own socket, not a symlink), and that socket refuses a connect.
++    At most ``_MAX_FALLBACK_REAP_SCAN`` candidates are examined per call; each failure is skipped.
++    Returns the number of directories removed."""
++    if _IS_WINDOWS:
++        return 0
++    removed = scanned = 0
++    uid = os.getuid()  # windows-footgun: ok — POSIX only (returns above on Windows)
++    try:
++        entries = os.scandir(parent)
++    except OSError:
++        return 0
++    with entries:
++        for entry in entries:
++            if not entry.name.startswith(_FALLBACK_DIR_PREFIX) or entry.name == keep:
++                continue
++            scanned += 1
++            if scanned > _MAX_FALLBACK_REAP_SCAN:
++                break
++            with contextlib.suppress(OSError):
++                directory = Path(entry.path)
++                info = directory.lstat()
++                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid
++                        or stat.S_IMODE(info.st_mode) != 0o700
++                        or time.time() - info.st_mtime < _STALE_FALLBACK_AGE_S):
++                    continue
++                names = os.listdir(directory)
++                if not set(names) <= {"control.sock"}:
++                    continue
++                sock = directory / "control.sock"
++                if names:
++                    sock_info = sock.lstat()
++                    if not stat.S_ISSOCK(sock_info.st_mode) or sock_info.st_uid != uid:
++                        continue
++                    if not _socket_refuses(sock):
++                        continue
++                    # Unlink only the very inode we probed, in a dir nobody re-bound into meanwhile.
++                    now_dir, now_sock = directory.lstat(), sock.lstat()
++                    if ((now_sock.st_dev, now_sock.st_ino) != (sock_info.st_dev, sock_info.st_ino)
++                            or now_dir.st_mtime != info.st_mtime):
++                        continue
++                    sock.unlink()
++                directory.rmdir()  # fails (ENOTEMPTY) if anything appeared since: then it stays
++                removed += 1
++    if removed:
++        logger.info("Removed %d stale control socket director%s from %s", removed,
++                    "y" if removed == 1 else "ies", parent)
++    return removed
++
++
+ def _publish_pointer(pointer_file: Path, bind_path: Path) -> None:
+     """Replace ``pointer_file`` with one naming ``bind_path``, atomically: the listener is already
+     accepting, so a client polling for it may read the pointer at any instant, and an empty or
+@@ -264,6 +339,8 @@ class GatewayControlServer:
+         """Bind the listener at ``bind_path`` (moved to a squat-proof root when its shared-temp
+         directory is not private) and return where it actually listens."""
+         if pointer_file is not None:
++            with contextlib.suppress(Exception):  # housekeeping only: never fails the bind
++                _reap_stale_fallback_dirs(bind_path.parent.parent, keep=bind_path.parent.name)
+             with contextlib.suppress(FileExistsError):
+                 bind_path.parent.mkdir(mode=0o700)
+                 info = bind_path.parent.lstat()
+diff --git a/tests/gateway/fixtures/automation_peer.py b/tests/gateway/fixtures/automation_peer.py
+index 2e5feeefff6..0895653beb2 100644
+--- a/tests/gateway/fixtures/automation_peer.py
++++ b/tests/gateway/fixtures/automation_peer.py
+@@ -14,7 +14,7 @@ import time
+ import websockets
+ from tests.gateway.test_normal_runtime_boot import control
+ from tests.waiting import async_wait_until
+-from local_recovery_probe import websocket, rpc
++from local_recovery_probe import websocket, rpc, stop_child
+ 
+ 
+ class Model(BaseHTTPRequestHandler):
+@@ -178,7 +178,7 @@ async def probe(root, base, mode):
+         model.gate.touch()
+         model.release.set()
+         if proc is not None:
+-            proc.kill(); proc.wait(timeout=10)
++            stop_child(proc)
+         model.shutdown(); model.server_close()
+ 
+ 
+diff --git a/tests/gateway/fixtures/local_recovery_probe.py b/tests/gateway/fixtures/local_recovery_probe.py
+index 4a782abd107..b77671a7dfc 100644
+--- a/tests/gateway/fixtures/local_recovery_probe.py
++++ b/tests/gateway/fixtures/local_recovery_probe.py
+@@ -46,8 +46,10 @@ class Model(BaseHTTPRequestHandler):
+             pass
+ 
+ 
+-# Windows children need the system environment (Winsock, temp, PATHEXT); POSIX uses the first three.
+-CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATHEXT',
++# Windows children need the system environment (Winsock, temp, PATHEXT); POSIX uses PATH/LANG/TZ and
++# TMPDIR, so a child's temp files (the control socket's hermes-gw-<hash> fallback dir included) land
++# in the test run's own prunable temp root instead of the shared /tmp.
++CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'TMPDIR', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATHEXT',
+                   'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE')
+ 
+ 
+@@ -55,6 +57,20 @@ def child_env():
+     return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+ 
+ 
++def stop_child(proc, timeout=10):
++    """Teardown stop: SIGTERM so the gateway runs its shutdown (control socket + fallback dir
++    cleanup), then SIGKILL only if it has not exited within ``timeout``. A test that needs a
++    crash calls ``proc.kill()`` itself."""
++    if proc.poll() is None:
++        proc.terminate()
++        try:
++            proc.wait(timeout=timeout)
++            return
++        except subprocess.TimeoutExpired:
++            proc.kill()
++    proc.wait(timeout=10)
++
++
+ async def rpc(ws, method, **params):
+     await ws.send(json.dumps({'jsonrpc': '2.0', 'id': method, 'method': method, 'params': params}))
+     async with asyncio.timeout(20):
+@@ -104,9 +120,7 @@ def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
+             assert desc.get('state') == 'ready', log.read()
+             yield proc, desc
+         finally:
+-            if proc.poll() is None:
+-                proc.kill()
+-            proc.wait(timeout=10)
++            stop_child(proc)
+ 
+ 
+ def probe(tmp_path):
+diff --git a/tests/gateway/test_control_socket.py b/tests/gateway/test_control_socket.py
+index 376fe32a928..634299de58f 100644
+--- a/tests/gateway/test_control_socket.py
++++ b/tests/gateway/test_control_socket.py
+@@ -313,6 +313,106 @@ def test_stop_keeps_a_fallback_dir_replaced_or_refilled_after_start(tmp_path: Pa
+                 d.rmdir()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Stale fallback dirs left by SIGKILLed gateways are reaped on the next fallback bind
++# ---------------------------------------------------------------------------
++
++@pytest.fixture()
++def shared_tmp(monkeypatch):
++    """A private stand-in for the shared temp dir the fallback lands in (short enough for sun_path)."""
++    import shutil
++    import tempfile
++
++    try:
++        root = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp")).resolve()  # no-tmp: ok — sun_path needs a short root
++    except OSError:
++        pytest.skip("/tmp not writable on this host")
++    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
++    monkeypatch.setattr(tempfile, "tempdir", str(root))
++    try:
++        yield root
++    finally:
++        shutil.rmtree(root, ignore_errors=True)
++
++
++def _gw_dir(parent: Path, name: str, *, sock: str | None = "dead", extra: bool = False,
++            mode: int = 0o700, age: float = 3600.0):
++    """Plant ``parent/<name>`` as a gateway fallback dir. ``sock``: "dead" (a socket file nobody
++    listens on, as a SIGKILLed gateway leaves it), "live" (a listener, returned), or None."""
++    import os
++    import time
++
++    d = parent / name
++    d.mkdir(mode=0o700)
++    live = None
++    if sock is not None:
++        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        s.bind(str(d / "control.sock"))
++        if sock == "live":
++            s.listen(1)
++            live = s
++        else:
++            s.close()  # the inode stays: connect now fails with ECONNREFUSED
++    if extra:
++        (d / "other").write_text("x")
++    d.chmod(mode)
++    stamp = time.time() - age
++    os.utime(d, (stamp, stamp))
++    return d, live
++
++
++def test_reaper_removes_only_dead_aged_private_dirs(shared_tmp: Path):
++    from gateway.control_socket import _reap_stale_fallback_dirs
++
++    dead, _ = _gw_dir(shared_tmp, "hermes-gw-dead")
++    empty, _ = _gw_dir(shared_tmp, "hermes-gw-empty", sock=None)
++    live, listener = _gw_dir(shared_tmp, "hermes-gw-live", sock="live")
++    young, _ = _gw_dir(shared_tmp, "hermes-gw-young", age=30)
++    extra, _ = _gw_dir(shared_tmp, "hermes-gw-extra", extra=True)
++    loose, _ = _gw_dir(shared_tmp, "hermes-gw-loose", mode=0o755)
++    own, _ = _gw_dir(shared_tmp, "hermes-gw-own")
++    other, _ = _gw_dir(shared_tmp, "not-a-gw-dir")
++    target, _ = _gw_dir(shared_tmp, "symlink-target")
++    (shared_tmp / "hermes-gw-link").symlink_to(target)
++    try:
++        assert _reap_stale_fallback_dirs(shared_tmp, keep="hermes-gw-own") == 2
++    finally:
++        listener.close()
++    assert not dead.exists() and not empty.exists()
++    for kept in (live, young, extra, loose, own, other, target):
++        assert kept.is_dir(), kept
++    assert (live / "control.sock").exists() and (target / "control.sock").exists()
++    assert (shared_tmp / "hermes-gw-link").is_symlink()
++
++
++def test_reaper_scan_is_bounded(shared_tmp: Path, monkeypatch):
++    import gateway.control_socket as cs
++
++    for i in range(3):
++        _gw_dir(shared_tmp, f"hermes-gw-{i}")
++    monkeypatch.setattr(cs, "_MAX_FALLBACK_REAP_SCAN", 2)
++    assert cs._reap_stale_fallback_dirs(shared_tmp, keep="none") == 2
++    assert len(list(shared_tmp.glob("hermes-gw-*"))) == 1
++    assert cs._reap_stale_fallback_dirs(shared_tmp, keep="none") == 1
++
++
++def test_fallback_bind_reaps_a_sigkilled_siblings_dir(tmp_path: Path, shared_tmp: Path):
++    """A gateway SIGKILLed mid-run (no cleanup_files) leaves hermes-gw-<hash>/control.sock behind;
++    the next gateway binding a fallback in the same temp dir removes it, and leaves a live one."""
++    home = _long_home(tmp_path)
++    bind, pointer = resolve_server_socket_path(home)
++    assert pointer is not None and bind.parent.parent == shared_tmp
++    dead, _ = _gw_dir(shared_tmp, "hermes-gw-00000000deadbeef")
++    live, listener = _gw_dir(shared_tmp, "hermes-gw-00000000aliveeee", sock="live")
++    try:
++        assert _start_stop(home) == bind
++    finally:
++        listener.close()
++    assert not dead.exists()
++    assert (live / "control.sock").exists()
++    assert not bind.parent.exists()
++
++
+ @pytest.fixture()
+ def short_home():
+     """A home short enough that the server binds IN-HOME (no pointer fallback).
+diff --git a/tests/gateway/test_unified_gateway_native_live.py b/tests/gateway/test_unified_gateway_native_live.py
+index 3f51f172971..ec75446f5ee 100644
+--- a/tests/gateway/test_unified_gateway_native_live.py
++++ b/tests/gateway/test_unified_gateway_native_live.py
+@@ -32,7 +32,7 @@ from websockets.asyncio.client import connect
+ ROOT = Path(__file__).resolve().parents[2]
+ # Windows children need the system environment (Winsock, temp, PATHEXT) that the
+ # hermetic test process still carries; POSIX only ever uses the first three.
+-_CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP',
++_CHILD_ENV_KEYS = ('PATH', 'LANG', 'TZ', 'TMPDIR', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP',
+                    'PATHEXT', 'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA', 'NUMBER_OF_PROCESSORS',
+                    'PROCESSOR_ARCHITECTURE')
+ 
+-- 
+2.55.0
+

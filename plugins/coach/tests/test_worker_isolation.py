@@ -10,6 +10,8 @@ def test_inherited_worker_context_is_isolated(tmp_path):
     suite = tmp_path / "suite"
     suite.mkdir()
     shutil.copyfile(Path(__file__).with_name("conftest.py"), suite / "conftest.py")
+    # conftest's autouse gateway reaper imports this sibling helper.
+    shutil.copyfile(Path(__file__).with_name("gateway_reaper.py"), suite / "gateway_reaper.py")
     (suite / "test_probe.py").write_text('''
 import os
 from pathlib import Path

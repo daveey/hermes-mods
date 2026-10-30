@@ -5,120 +5,8 @@ Subject: [PATCH] refactor(desktop): isolate registry reconnect wiring and
  document safety contract [daveey]
 
 ---
- apps/desktop/electron/main.ts                 | 59 +++---------
- .../registry-reconnect-service.test.ts        |  5 +-
- .../registry-reconnect-wiring.test.ts         | 44 +++++++++
- .../electron/registry-reconnect-wiring.ts     | 87 ++++++++++++++++++
- .../registry-backend-reconnect.md             | 89 +++++++++++++++++++
- 5 files changed, 233 insertions(+), 51 deletions(-)
- create mode 100644 apps/desktop/electron/registry-reconnect-wiring.test.ts
- create mode 100644 apps/desktop/electron/registry-reconnect-wiring.ts
- create mode 100644 website/docs/developer-guide/registry-backend-reconnect.md
-
-diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
-index 5662e731f3..1cf1564fd6 100644
---- a/apps/desktop/electron/main.ts
-+++ b/apps/desktop/electron/main.ts
-@@ -528,8 +528,7 @@ import {
-   createQuitTeardownCoordinator,
-   type QuitTeardownTask
- } from './quit-teardown'
--import { createRegistryReconnectService } from './registry-reconnect-service'
--import { proveRegistryOwnerStopped } from './registry-stopped-owner'
-+import { createSshReuseProbe, wireRegistryReconnect } from './registry-reconnect-wiring'
- import * as remoteLifecycle from './remote-lifecycle'
- import {
-   attachPowerResumeRemoteRevalidation,
-@@ -9853,20 +9852,6 @@ function sshRememberLog(chunk) {
-   rememberLog(redactSecrets(String(chunk == null ? '' : chunk)))
- }
- 
--async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
--  try {
--    const proof: any = await fetchJson(`${baseUrl}/api/ssh/ownership`, token)
--
--    return remoteLifecycle.classifySshReuseProof(proof, spawnNonce)
--  } catch (error: any) {
--    if (/^(401|403|404):/.test(String(error?.message || ''))) {
--      return 'authenticated-stale'
--    }
--
--    throw error
--  }
--}
--
- async function teardownSshConnection(profile) {
-   const scope = sshScopeKey(profile)
-   registryReconnectService.assertCanStop(scope)
-@@ -10246,7 +10231,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
-       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
-       pickLocalPort,
-       waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token'),
--      probeReuseProof: sshProbeReuseProof,
-+      probeReuseProof: createSshReuseProbe(fetchJson),
-       adoptServedToken: adoptServedDashboardToken,
-       rememberLog: sshRememberLog,
-       guestOnboarding: GUEST_ONBOARDING,
-@@ -11309,9 +11294,7 @@ async function ensureRegistryBackend(
-     return ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation, opts)
-   }
- 
--  if (source.kind === 'ssh') {
--    managedConnectionUpdateGate.assertCanDial(id, managedUpdateCorrelation)
--  }
-+  registryReconnectService.assertCanDial(source.kind, id, managedUpdateCorrelation)
- 
-   const entry = {
-     process: null,
-@@ -16149,39 +16132,17 @@ ipcMain.handle('hermes:secret-storage:get', async () => ({ on: secretStoragePoli
- ipcMain.handle('hermes:secret-storage:set', async (_event: any, on: any) => applySecretStorageEncryption(on === true))
- 
- // ── v2 connection registry IPC (multi-source) ───────────────────────────────
--// Storage-level CRUD for named agent sources. Routing/pooling consumption of
--// the registry lands separately; these handlers only manage the persisted
--// list, so they are safe to ship ahead of the switchover.
--const registryReconnectService = createRegistryReconnectService({
--  pool: backendPool,
--  states: sshConnections,
--  gate: managedConnectionUpdateGate,
--  key: backendScopeKey,
--  isSsh: id => readDesktopConnectionsRegistry().connections.some(source => source.id === id && source.kind === 'ssh'),
--  inFlight: key => Boolean(backendDialClaims.inFlight(key) || poolStopper.inFlight(key) || sshBootstrapCoordinator.pending.has(key)),
-+const registryReconnectService = wireRegistryReconnect({
-+  ipcMain, pool: backendPool, states: sshConnections,
-+  gate: managedConnectionUpdateGate, key: backendScopeKey,
-+  readRegistry: readDesktopConnectionsRegistry,
-+  dialClaims: backendDialClaims, poolStopper, bootstrap: sshBootstrapCoordinator,
-   request: (descriptor, requestPath, options) => fetchJsonForBackend(descriptor, requestPath, options),
--  proveStopped: state => proveRegistryOwnerStopped(state.ssh, { ...state, profile: state.remoteProfile || '' }),
--  terminate: async state => {
--    const expected = { ...state, profile: state.remoteProfile || '' }
--
--    if (state.remotePlatform !== 'Linux') { throw new Error('Unsupported registry SSH platform') }
--    await remoteLifecycle.terminateOwnedDashboardForUpdate(state.ssh, expected)
--  },
--  close: async (key, state) => {
--    sshIsolatedKeepalives.stop(key)
--    terminalIpc.disposeTerminalSessionsForSshScope(key)
--    // The owned serve is already confirmed stopped. Closing its transport
--    // must never fall back to generic remote disconnect/kill.
--    await state.ssh.close().catch(error => sshRememberLog(`[registry-reconnect] transport close: ${String(error)}`))
--  },
--  onCleanupError: error => sshRememberLog(`[registry-reconnect] cleanup: ${String(error)}`),
-+  keepalives: sshIsolatedKeepalives, disposeTerminals: key => terminalIpc.disposeTerminalSessionsForSshScope(key),
-+  log: sshRememberLog,
-   reopen: (id, profile, correlation) => ensureRegistryBackend(id, profile, correlation)
- })
- 
--ipcMain.handle('hermes:connections:reconnect-target', (_event, id, profile) =>
--  registryReconnectService.target(id, profile))
--ipcMain.handle('hermes:connections:reconnect', (_event, target) => registryReconnectService.run(target))
--
- ipcMain.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
- ipcMain.handle('hermes:connections:save', async (_event, payload) => {
-   const saved = await saveRegistryConnection(payload)
 diff --git a/apps/desktop/electron/registry-reconnect-service.test.ts b/apps/desktop/electron/registry-reconnect-service.test.ts
-index 2becf1df1c..715443384b 100644
+index 2becf1df1cc35599d584683ee50e07e0310c8c88..715443384b9989b0011d5a0dcc281fcdf341c01e 100644
 --- a/apps/desktop/electron/registry-reconnect-service.test.ts
 +++ b/apps/desktop/electron/registry-reconnect-service.test.ts
 @@ -3,17 +3,18 @@ import { expect, test, vi } from 'vitest'
@@ -144,7 +32,7 @@ index 2becf1df1c..715443384b 100644
  
 diff --git a/apps/desktop/electron/registry-reconnect-wiring.test.ts b/apps/desktop/electron/registry-reconnect-wiring.test.ts
 new file mode 100644
-index 0000000000..a1bfe730d1
+index 0000000000000000000000000000000000000000..a1bfe730d1de4e3fc8980d5c354385ed94966ba7
 --- /dev/null
 +++ b/apps/desktop/electron/registry-reconnect-wiring.test.ts
 @@ -0,0 +1,44 @@
@@ -194,7 +82,7 @@ index 0000000000..a1bfe730d1
 +})
 diff --git a/apps/desktop/electron/registry-reconnect-wiring.ts b/apps/desktop/electron/registry-reconnect-wiring.ts
 new file mode 100644
-index 0000000000..742acfc41f
+index 0000000000000000000000000000000000000000..742acfc41f3911fb1299072837ffa9267008c391
 --- /dev/null
 +++ b/apps/desktop/electron/registry-reconnect-wiring.ts
 @@ -0,0 +1,87 @@
@@ -287,7 +175,7 @@ index 0000000000..742acfc41f
 +}
 diff --git a/website/docs/developer-guide/registry-backend-reconnect.md b/website/docs/developer-guide/registry-backend-reconnect.md
 new file mode 100644
-index 0000000000..a1f819c916
+index 0000000000000000000000000000000000000000..a1f819c91613ad4e64890d7c3843945e107c4737
 --- /dev/null
 +++ b/website/docs/developer-guide/registry-backend-reconnect.md
 @@ -0,0 +1,89 @@

@@ -1,0 +1,281 @@
+From f2622abd050046323dea878e1a0dfe2d556c8606 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:48:09 +0000
+Subject: [PATCH] fix(tui): out-of-band adoption counts a merge carrier's
+ absorbed rows as seen; a woken turn no longer re-sends a passive notice
+ [daveey]
+
+A cold resume repairs a user;user run of passive kanban_notice rows (n1, n2) into one carrier that keeps
+n1's _row_id and lists n2 in _absorbed_row_ids. _adopt_out_of_band_turns took 'seen' from _row_id only,
+so n2 looked foreign, was appended again, and the turn's _merge_consecutive_users welded it into the
+carrier a second time: the model got n1+n2+n2+local (chat 20261027_134353_5ab65c, t_01a1895bbfae2d67).
+---
+ .../test_woken_turn_passive_notices_once.py   | 208 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  22 +-
+ 2 files changed, 227 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tui_gateway/test_woken_turn_passive_notices_once.py
+
+diff --git a/tests/tui_gateway/test_woken_turn_passive_notices_once.py b/tests/tui_gateway/test_woken_turn_passive_notices_once.py
+new file mode 100644
+index 00000000000..2fcaae3bad4
+--- /dev/null
++++ b/tests/tui_gateway/test_woken_turn_passive_notices_once.py
+@@ -0,0 +1,208 @@
++"""A woken turn over passive kanban notices sees each notice once and re-writes no row.
++
++Shape of chat 20261027_134353_5ab65c (t_01a1895bbfae2d67): the remote sweep appended two passive
++``kanban_notice`` rows (n1, n2) to an idle chat; later a local card's notice woke it (row ``local``,
++staged by ``_kb_persist_batch``). The woken turn's history ended user(n1), user(n2), user(local). The
++model was sent n2 twice, and after the turn state.db held a NEW merged row n1+n2+n2+local plus copies of
++the turn's rows.
++
++Real agent loop, real SessionDB, real Desktop turn path; only the provider is faked.
++"""
++import threading
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from hermes_state import SessionDB
++from tests.waiting import wait_until
++from tui_gateway import server
++
++
++def _mock_response(content):
++    message = SimpleNamespace(content=content, tool_calls=None, reasoning=None,
++                              reasoning_content=None, reasoning_details=None)
++    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
++                           model="test/model", usage=None)
++
++
++def _make_agent(home):
++    with patch("hermes_cli._early_recovery.restore_interrupted_pull", return_value=False):
++        from run_agent import AIAgent
++    with (patch("model_tools.get_tool_definitions", return_value=[]),
++          patch("model_tools.check_toolset_requirements", return_value={}),
++          patch("agent.process_bootstrap.OpenAI")):
++        agent = AIAgent(
++            api_key="test-key-1234567890", provider="openrouter",
++            base_url="https://openrouter.ai/api/v1", model="test/model",
++            quiet_mode=True, skip_context_files=True, skip_memory=True,
++            session_id="wake", platform="desktop", save_trajectories=False,
++            session_db=SessionDB(home / "state.db"), skip_background_review=True,
++        )
++    agent._owns_session_db = True
++    agent.client = MagicMock()
++    agent._cached_system_prompt = "You are helpful."
++    agent._use_prompt_caching = False
++    agent.compression_enabled = False
++    return agent
++
++
++class _KbText(str):
++    """A poller text: ``_kb_persist_batch`` reads its event keys off the string."""
++
++
++def _notice(task_id: str) -> str:
++    return f"[Kanban] {task_id} completed: done."
++
++
++def _wait_turn(session, events, n):
++    wait_until(lambda: sum(1 for k, _ in events if k == "message.complete") >= n, timeout=30)
++    if session.get("_run_thread"):
++        session["_run_thread"].join(30)
++
++
++def test_woken_turn_sees_each_passive_notice_once_and_rewrites_no_row(tmp_path, monkeypatch):
++    home = tmp_path / "profile"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    db = SessionDB(home / "state.db")
++    db.create_session("wake", source="desktop")
++    agent = _make_agent(home)
++    session = {
++        "agent": agent, "session_key": "wake", "profile_home": str(home),
++        "history": [], "history_lock": threading.Lock(), "history_version": 0,
++        "running": False, "source": "desktop", "attached_images": [],
++        "model_override": "test/model", "cwd": str(tmp_path),
++    }
++    sid = "wake-desktop"
++    monkeypatch.setitem(server._sessions, sid, session)
++    events = []
++    monkeypatch.setattr(server, "_emit", lambda kind, sid, payload=None: events.append((kind, payload)))
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a: None)
++    monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a: None)
++    sent = []
++
++    def provider(**kwargs):
++        sent.append([dict(m) for m in kwargs.get("messages") or ()])
++        return _mock_response(content=f"reply {len(sent)}")
++
++    agent.client.chat.completions.create.side_effect = provider
++    n1, n2, local = _notice("t_n1"), _notice("t_n2"), _notice("t_local")
++    try:
++        # 1) An ordinary turn: the chat is live with a stamped in-memory history.
++        first = server._methods["prompt.submit"]("first", {"session_id": sid, "text": "hello"})
++        assert first["result"]["status"] == "streaming", first
++        _wait_turn(session, events, 1)
++
++        # 2) The remote sweep appends two passive notice rows to the idle chat (no turn runs).
++        for key, text in (("n1", n1), ("n2", n2)):
++            db.record_kanban_notice("wake", text, {"notice_id": f"remote:{key}", "display_text": text,
++                                                   "kanban_event_keys": [f"remote:{key}"]})
++
++        # 3) A local card's notice wakes the chat through the real poller tail.
++        text = _KbText(local)
++        text._kb_keys = ["local:1"]
++        verdict, fresh, kwargs = server._kb_persist_batch(session, [text], False)
++        assert verdict == "written", verdict
++        before = db.get_messages("wake")
++        before_ids = {r["id"] for r in before}
++        assert server._notif_claim_turn(session)
++        assert server._notif_submit("__notif__1", sid, session, "\n".join(fresh), "wake", **kwargs) is not False
++        _wait_turn(session, events, 2)
++
++        # The model saw each notice exactly once.
++        woken = sent[-1]
++        body = "\n".join(m["content"] for m in woken if isinstance(m.get("content"), str))
++        assert body.count(n1) == 1, body
++        assert body.count(n2) == 1, body
++        assert body.count(local) == 1, body
++
++        # state.db gained only the turn's own new rows: no copy of an already-persisted row and no
++        # merged user row standing in for the notices.
++        after = db.get_messages("wake")
++        new_rows = [r for r in after if r["id"] not in before_ids]
++        old_keys = {(r["role"], r["content"], r.get("timestamp")) for r in before}
++        assert [r for r in new_rows if (r["role"], r["content"], r.get("timestamp")) in old_keys] == []
++        assert [r["role"] for r in new_rows] == ["assistant"], [(r["role"], r["content"]) for r in new_rows]
++        for t in (n1, n2, local):
++            assert sum((r["content"] or "").count(t) for r in after) == 1, [(r["id"], r["content"]) for r in after]
++
++        # The next turn still sends each notice once (the live history was not corrupted either).
++        nxt = server._methods["prompt.submit"]("next", {"session_id": sid, "text": "and now?"})
++        assert nxt["result"]["status"] == "streaming", nxt
++        _wait_turn(session, events, 3)
++        body = "\n".join(m["content"] for m in sent[-1] if isinstance(m.get("content"), str))
++        assert body.count(n2) == 1, body
++    finally:
++        if session.get("_run_thread"):
++            session["_run_thread"].join(30)
++        server._release_active_session_slot(session)
++        agent.close()
++        db.close()
++
++
++def test_cold_resumed_chat_woken_by_sweep_sees_each_passive_notice_once(tmp_path, monkeypatch):
++    """The incident shape: the chat was NOT loaded when the passive rows landed. The unloaded sweep's wake
++    (``_wake_session_turn``) runs on a history a cold resume materialized with ``repair_alternation=True``, so
++    n1;n2 arrive already merged into ONE carrier whose own ``_row_id`` is n1's (n2's id is only in
++    ``_absorbed_row_ids``)."""
++    home = tmp_path / "profile"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    db = SessionDB(home / "state.db")
++    db.create_session("wake", source="desktop")
++    agent = _make_agent(home)
++    events = []
++    monkeypatch.setattr(server, "_emit", lambda kind, sid, payload=None: events.append((kind, payload)))
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a: None)
++    monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a: None)
++    sent = []
++
++    def provider(**kwargs):
++        sent.append([dict(m) for m in kwargs.get("messages") or ()])
++        return _mock_response(content=f"reply {len(sent)}")
++
++    agent.client.chat.completions.create.side_effect = provider
++    n1, n2, local = _notice("t_n1"), _notice("t_n2"), _notice("t_local")
++    # An earlier, finished exchange in the durable transcript.
++    db.append_message("wake", "user", content="hello")
++    db.append_message("wake", "assistant", content="hi")
++    # The remote sweep appends two passive notice rows while no backend holds the chat.
++    for key, text in (("n1", n1), ("n2", n2)):
++        db.record_kanban_notice("wake", text, {"notice_id": f"remote:{key}", "display_text": text,
++                                               "kanban_event_keys": [f"remote:{key}"]})
++    # Cold resume: the model history the resume hydration builds.
++    raw_history, _display = db.get_resume_conversations("wake")
++    history = server.canonicalize_replay_history(raw_history)
++    ready = threading.Event()
++    ready.set()
++    session = {
++        "agent": agent, "agent_ready": ready, "session_key": "wake", "profile_home": str(home),
++        "history": history, "history_lock": threading.Lock(), "history_version": 0,
++        "running": False, "source": "desktop", "attached_images": [],
++        "model_override": "test/model", "cwd": str(tmp_path),
++    }
++    sid = "wake-cold"
++    monkeypatch.setitem(server._sessions, sid, session)
++    before_ids = {r["id"] for r in db.get_messages("wake")}
++    try:
++        verdict = server._wake_session_turn("wake", local, display_kind="kanban_notice",
++                                            display_metadata={"notice_id": "local:1"}, label="kanban-sweep-wake")
++        assert verdict == "started", verdict
++        _wait_turn(session, events, 1)
++        body = "\n".join(m["content"] for m in sent[-1] if isinstance(m.get("content"), str))
++        assert body.count(n1) == 1, body
++        assert body.count(n2) == 1, body
++        assert body.count(local) == 1, body
++        after = db.get_messages("wake")
++        new_rows = [(r["role"], r["content"]) for r in after if r["id"] not in before_ids]
++        assert [role for role, _ in new_rows] == ["user", "assistant"], new_rows
++        for t in (n1, n2, local):
++            assert sum((r["content"] or "").count(t) for r in after) == 1, [(r["id"], r["content"]) for r in after]
++        # The live history the next turn starts from holds each notice once too.
++        live = "\n".join(m.get("content") or "" for m in session["history"] if isinstance(m.get("content"), str))
++        assert live.count(n2) == 1, live
++    finally:
++        if session.get("_run_thread"):
++            session["_run_thread"].join(30)
++        server._release_active_session_slot(session)
++        agent.close()
++        db.close()
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index d4a5f643573..38a20ad362f 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -639,6 +639,19 @@ class _TurnRun:
+     receipt_attempted: bool = False
+ 
+ 
++def _history_row_ids(history: list) -> set:
++    """Durable row ids the in-memory history stands for: each message's own id plus the ids a merge carrier
++    absorbed (``_absorbed_row_ids``, kept by ``_merge_consecutive_users`` and the other repair passes)."""
++    held: set = set()
++    for m in history:
++        if not isinstance(m, dict):
++            continue
++        if (rid := _message_row_id(m)) is not None:
++            held.add(rid)
++        held.update(r for r in (m.get("_absorbed_row_ids") or ()) if isinstance(r, int) and not isinstance(r, bool))
++    return held
++
++
+ def _adopt_out_of_band_turns(session: dict) -> None:
+     """Fold turns another surface appended to this session (Telegram reply, cron run) into the model-facing
+     history before the turn snapshots it. The desktop already repaints them from the DB (#86588); without
+@@ -653,8 +666,11 @@ def _adopt_out_of_band_turns(session: dict) -> None:
+     boundary cannot key on anything and the store-ahead fallback takes over (#81951)."""
+     with session["history_lock"]:
+         history, version = list(session.get("history") or ()), int(session.get("history_version", 0))
+-    seen = max((rid for m in history if isinstance(m, dict) and (rid := _message_row_id(m)) is not None),
+-               default=None)
++    # A merge carrier (a cold resume repairs user;user runs into their FIRST row) holds the rows it absorbed
++    # too: they count as seen, or a newer absorbed row is "foreign", gets appended again and the turn's repair
++    # welds it into the carrier a second time (n1+n2+n2+local, t_01a1895bbfae2d67).
++    held = _history_row_ids(history)
++    seen = max(held, default=None)
+     ceiling = _message_row_id(session.get("_submit_user_row") or {})
+ 
+     def _below_ceiling(rid) -> bool:
+@@ -664,7 +680,7 @@ def _adopt_out_of_band_turns(session: dict) -> None:
+         return
+ 
+     def _foreign(rid) -> bool:
+-        return _below_ceiling(rid) and rid > seen
++        return _below_ceiling(rid) and rid > seen and rid not in held
+     # Keyset probe first: the common turn has nothing to adopt and must not pay a full transcript decode.
+     # Address the live session, not session_key: a rotation moves the tip mid-session, so the parent
+     # holds none of the foreign rows (Telegram reply, cron) this function exists to adopt and the model
+-- 
+2.55.0
+

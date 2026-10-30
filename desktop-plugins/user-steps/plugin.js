@@ -12,7 +12,7 @@ import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'user-steps'
-const VERSION = 13
+const VERSION = 14
 // The composer chrome is user-select:none app-wide; the strip and the in-message box must stay copyable.
 const SELECTABLE = { userSelect: 'text', WebkitUserSelect: 'text', cursor: 'auto' }
 const POLL_MS = 8_000
@@ -602,8 +602,8 @@ export function Strip() {
   const issues = (snap.issues || []).filter(i => !isDismissed(i))
   if (!rows.length && !issues.length) return null
   return jsxs('div', { 'data-slot': 'user-steps', style: { ...SELECTABLE, minWidth: 0, color: 'var(--foreground)' }, children: [
-    rows.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Legacy references (${rows.length}) — not approvals` }), ...rows.map(r => r.type === 'step' ? jsx(StepRow, { step: r.step }, r.key) : jsx(CardRow, { item: r.item }, r.key))] }),
-    issues.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Agent issues (${issues.length}) — no action required from you` }), jsx('button', { type: 'button', 'data-user-steps-dismiss-all': true, style: actionStyle, onClick: () => dismissIssues(issues), children: 'Dismiss agent issues' }), ...issues.map(i => jsx(IssueRow, { issue: i }, `i:${i.board}:${i.id}`))] })
+    rows.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Earlier asks (${rows.length}) — answer these in chat` }), ...rows.map(r => r.type === 'step' ? jsx(StepRow, { step: r.step }, r.key) : jsx(CardRow, { item: r.item }, r.key))] }),
+    issues.length > 0 && jsxs('details', { children: [jsx('summary', { style: { minHeight: 44, cursor: 'pointer' }, children: `Agent issues (${issues.length}) — nothing needed from you` }), jsx('button', { type: 'button', 'data-user-steps-dismiss-all': true, style: actionStyle, onClick: () => dismissIssues(issues), children: 'Dismiss agent issues' }), ...issues.map(i => jsx(IssueRow, { issue: i }, `i:${i.board}:${i.id}`))] })
   ] })
 }
 
@@ -625,7 +625,9 @@ export function validRequest(r) {
     Array.isArray(r.exclusions) && r.exclusions.every(text) &&
     (text(r.outcomes?.revise) || (['choice','input','external_step'].includes(r.kind) && text(r.outcomes?.answer))) &&
     Array.isArray(r.choices) && r.choices.length > 0 && new Set(r.choices.map(c => c?.id)).size === r.choices.length &&
-    r.choices.every(c => text(c?.id) && text(c.label) && ['approve','revise','decline','answer'].includes(c.effect))
+    r.choices.every(c => text(c?.id) && text(c.label) && ['approve','revise','decline','answer'].includes(c.effect) &&
+      (c.explain === undefined || text(c.explain)) && (c.recommended === undefined || c.recommended === true)) &&
+    r.choices.filter(c => c.recommended === true).length <= 1
 }
 export function projectRequests(requests) {
   const byId = new Map()
@@ -738,7 +740,7 @@ export async function refreshRequests(call = api) {
     readbacks.forEach(check => check())
   } catch (e) {
     if (!currentRoute(route) || generation !== requestRead) return
-    canonical = { scope, requests: canonical.scope === scope ? canonical.requests : [], error: `Action queue unavailable: ${e.message}. Legacy references are not authorization.` }
+    canonical = { scope, requests: canonical.scope === scope ? canonical.requests : [], error: `Action queue unavailable: ${e.message}. Earlier asks shown below are not approvals.` }
     publishCanonical()
   }
 }
@@ -755,6 +757,7 @@ const choiceStyle = effect => ({ ...actionStyle, fontSize: 12.5, fontWeight: eff
   borderColor: effect === 'approve' ? SUCCESS : effect === 'decline' ? DANGER : 'var(--border)',
   background: effect === 'approve' ? `color-mix(in srgb, ${SUCCESS} 22%, var(--card))` : 'transparent',
   color: effect === 'decline' ? DANGER : 'var(--foreground)' })
+const primaryStyle = { ...actionStyle, fontSize: 12.5, fontWeight: 600, borderColor: 'transparent', color: 'var(--primary-foreground, #fff)', background: 'var(--primary, #3b82f6)' }
 const needsText = c => c.effect === 'revise' || (c.effect === 'answer' && c.id === 'answer-text')
 // Missing plan/step = agent work. It never counts as something "for you".
 export const agentPending = r => !['choice','input'].includes(r.kind) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !(r.choices || []).some(c => c.effect === 'approve')))
@@ -969,30 +972,46 @@ export function DecisionRow({ request, route, call = api, unavailable = false })
     : question && !shown.length ? 'Answer in chat — this question closes once your reply is recorded there. No permission is granted.' : ''
   const phaseText = { idle: '', submitting: 'Recording decision…', checking: 'Checking authoritative delivery status…', pending: 'Decision recorded; delivery pending. Work is not confirmed resumed.', failed: sessionBusy(state.operation) ? 'Decision recorded; waiting for the session to finish its current turn.' : 'Decision recorded; delivery unconfirmed. Work may have started.', unknown: 'Delivery outcome unknown.', cancelled: 'Decision not started — no permission was delivered. Ask the agent for a replacement revision, then decide again.', confirmed: 'Confirmed — decision delivered.', stale: 'Scope updated — review required.' }[state.phase]
   const age = askedAgo(r.createdAt)
+  // What picking an option does, in one line: the producer's own explain, else what the stored scope already says.
+  // The generic "grants no permission" outcome is not repeated per option.
+  const explainOf = c => typeof c.explain === 'string' && c.explain.trim() ? c.explain.trim()
+    : c.authorizes === true ? 'Approves running exactly the plan above.'
+    : r.kind === 'approval' && ['approve','decline'].includes(c.effect) ? str(r.outcomes?.[c.effect]).trim() : ''
+  const recommended = shown.find(c => c.recommended === true)
+  const ordered = recommended ? [recommended, ...shown.filter(c => c !== recommended)] : shown
+  const explained = ordered.filter(c => !needsText(c) && explainOf(c))
+  const primary = c => recommended ? c === recommended : c.effect === 'approve' || c.authorizes === true
+  const kindLabel = { approval: 'Approval', choice: 'Question', input: 'Question', external_step: 'Your step' }[r.kind] || 'Ask'
+  const scopeView = jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) })
+  const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] })
+  const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
+  const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
   return jsxs('article', { ref: article, 'data-action-request': requestKey(r), tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
-    jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 8, rowGap: 2, minWidth: 0 }, children: [
-      jsx('h3', { style: { margin: '4px 0 0', fontSize: 14, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
-      age && jsx('time', { 'data-asked-age': '', dateTime: r.createdAt, title: new Date(r.createdAt).toLocaleString(), style: { color: 'var(--muted-foreground)', fontSize: 11, flex: 'none' }, children: age })
+    jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
+      jsx('span', { 'data-action-kind': r.kind, style: { padding: '0 6px', borderRadius: 4, color: r.kind === 'approval' ? AMBER : 'var(--muted-foreground)', background: `color-mix(in srgb, ${r.kind === 'approval' ? AMBER : 'var(--muted-foreground)'} 14%, transparent)` }, children: kindLabel }),
+      age && jsx('time', { 'data-asked-age': '', dateTime: r.createdAt, title: `${new Date(r.createdAt).toLocaleString()} · revision ${r.revision}`, style: { flex: 'none' }, children: age })
     ] }),
-    jsx('small', { style: { color: 'var(--muted-foreground)', fontSize: 11 }, children: `Revision ${r.revision}` }),
-    !locked && jsx('h4', { style: sectionLabel, children: 'Read this' }),
-    !locked && jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) }),
-    !locked && !!r.limits?.length && jsxs('div', { children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${l.permissionRequired ? ` — separately requires ${l.permissionRequired}` : ''}` }, i)) })] }),
-    !locked && !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] }),
-    !locked && jsx('h4', { style: { ...sectionLabel, paddingTop: 10, borderTop: '1px solid var(--border)' }, children: 'Your decision' }),
-    !locked && jsx('div', { style: { ...planStyle, lineHeight: 1.5 }, children: shown.map(c => r.outcomes?.[c.effect] && jsxs('div', { 'data-decision-outcome': '', children: [jsx('strong', { children: `${choiceLabel(c, choices, r.kind)}: ` }), jsx(MessageTextContent, { media: false, text: `${c.label}. ${r.outcomes[c.effect]}` })] }, c.id)) }),
+    jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
+    !locked && (explained.length
+      ? fold(r.kind === 'approval' ? 'Full plan and limits' : 'Full question', [scopeView, limitsView, exclusionsView])
+      : jsxs('div', { style: { display: 'contents' }, children: [scopeView, (limitsView || exclusionsView) && fold('Limits and exclusions', [limitsView, exclusionsView])] })),
+    !locked && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
+      jsx('strong', { style: { fontWeight: 600 }, children: choiceLabel(c, choices, r.kind) }),
+      c.recommended === true && jsx('span', { 'data-recommended': '', style: { marginLeft: 6, fontSize: 11, color: 'var(--primary, var(--accent))' }, children: 'recommended' }),
+      jsx('div', { style: { color: 'var(--muted-foreground)', fontSize: 12.5 }, children: jsx(MessageTextContent, { media: false, text: explainOf(c) }) })
+    ] }, c.id)) }),
     !locked && approvalReason && jsx('div', { 'data-approval-blocked': '', 'data-agent-completion-pending': '', style: { color: AMBER, padding: '8px 0', fontSize: 12 }, children: approvalReason }),
     jsx('div', { role: 'status', 'aria-live': 'polite', children: phaseText }),
-    selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : r.outcomes?.[selected.effect] || ''}` }),
+    selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : explainOf(selected)}` }),
     state.error && jsx('div', { role: 'alert', children: state.error }),
     !locked && jsxs('div', { style: flowStyle, children: [
-      ...shown.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, title: c.label, style: choiceStyle(c.authorizes === true ? 'approve' : c.effect), disabled: unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id)),
+      ...ordered.map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, title: explainOf(c) || c.label, style: needsText(c) ? { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' } : primary(c) ? primaryStyle : choiceStyle(c.effect === 'approve' ? 'neutral' : c.effect), disabled: unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open')), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: choiceLabel(c, choices, r.kind) }, c.id)),
       ...(approvalPending ? [
         jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),
         // An owner without the withdraw route (older backend) can only hide it on this device.
         !canWithdraw && jsx('button', { type: 'button', 'data-dismiss-request': '', style: actionStyle, title: 'Hide this until the agent posts a new revision', onClick: () => dismissRequest(r), children: 'Dismiss' }, 'dismiss')
       ] : []),
-      canWithdraw && jsx('button', { type: 'button', 'data-withdraw-request': '', style: { ...actionStyle, marginLeft: 'auto' }, title: WITHDRAW_TITLE, disabled: unavailable || dismissal.busy, onClick: () => void withdraw(), children: dismissal.busy ? 'Removing\u2026' : 'Not needed' })
+      canWithdraw && jsx('button', { type: 'button', 'data-withdraw-request': '', style: { ...actionStyle, marginLeft: 'auto', borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)', fontSize: 12 }, title: WITHDRAW_TITLE, disabled: unavailable || dismissal.busy, onClick: () => void withdraw(), children: dismissal.busy ? 'Removing\u2026' : 'Not needed' })
     ] }),
     dismissal.note && jsx('div', { role: 'status', 'data-withdraw-note': '', style: { fontSize: 12 }, children: dismissal.note }),
     dismissal.error && jsx('div', { role: 'alert', 'data-withdraw-error': '', children: dismissal.error }),
@@ -1029,7 +1048,28 @@ function readMinimized() {
 function writeMinimized(keys) {
   try { if (keys.length) window.localStorage.setItem(MINIMIZED_KEY, JSON.stringify(keys.slice(-200))); else window.localStorage.removeItem(MINIMIZED_KEY) } catch {}
 }
-export function ActionQueue() {
+/** A recorded decision whose delivery is failed/pending/unconfirmed stays on screen (with Retry) until confirmed. */
+function requestNeedsReadback(scope, r) {
+  if (r.state === 'withdrawn' && !r.resolution) return false // nothing can be pending on a withdrawn revision
+  const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
+  if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
+  return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
+}
+/** Open asks for the focused chat that need the user (agent-pending and dismissed ones excluded). */
+export function openAskCount() {
+  const scope = routeKey(decisionRoute())
+  if (!decisionRoute().session || canonical.scope !== scope) return 0
+  return canonical.requests.filter(r => {
+    const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
+    // Terminal backend state is durable confirmation, not a new ask on reload.
+    // Still read it back when the expanded queue mounts, and retain local failures.
+    if (['resolved','superseded','cancelled'].includes(r.state) && r.resolution?.revision === r.revision && !op?.decision && !recoverIntent(key, r)) return false
+    return requestNeedsReadback(scope, r) || (!r.resolution && ['open','needs_context'].includes(r.state) && !agentPending(r))
+  }).length
+}
+
+// `embedded`: drawn inside the session panel, which supplies the frame, heading and minimize control.
+export function ActionQueue({ embedded = false } = {}) {
   const [snap, setSnap] = useState(canonical), [filter, setFilter] = useState('')
   const [minimizedKeys, setMinimizedState] = useState(readMinimized)
   const setMinimized = keys => { writeMinimized(keys); setMinimizedState(keys) }
@@ -1043,29 +1083,24 @@ export function ActionQueue() {
   if (!route.session || snap.scope !== scope) return null
   // Closed requests, including withdrawn (moot) asks, are not shown or counted; they still suppress their
   // own legacy references through requestForSource.
-  const needsReadback = r => {
-    if (r.state === 'withdrawn' && !r.resolution) return false // nothing can be pending on a withdrawn revision
-    const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
-    if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
-    return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
-  }
+  const needsReadback = r => requestNeedsReadback(scope, r)
   const requests = snap.requests.filter(r => ((!r.resolution && ['open','needs_context'].includes(r.state)) || needsReadback(r)) && !(agentPending(r) && !needsReadback(r) && isRequestDismissed(r)))
   if (!requests.length && !snap.error) return null
   const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
   // Minimized holds only while every shown request was already shown when the user minimized; a new one (or a new
   // revision) reopens the panel so a fresh ask is never hidden. Persisted so it survives reloads and chat switches.
   const openKeys = requests.map(r => `${requestKey(r)}#${r.revision}`)
-  const minimized = !snap.error && openKeys.length > 0 && openKeys.every(k => minimizedKeys.includes(k))
-  return jsxs('section', { 'data-action-queue': '', 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)' }, children: [
+  const minimized = !embedded && !snap.error && openKeys.length > 0 && openKeys.every(k => minimizedKeys.includes(k))
+  return jsxs('section', { 'data-action-queue': '', 'data-embedded': embedded ? '' : undefined, 'aria-label': 'Session decisions', onKeyDown: e => { if (['Enter','Escape','ArrowDown','ArrowUp'].includes(e.key)) e.stopPropagation() }, style: embedded ? { ...SELECTABLE, width: '100%', minWidth: 0, color: 'var(--foreground)' } : { ...SELECTABLE, width: '100%', minWidth: 0, boxSizing: 'border-box', padding: 10, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--card)', color: 'var(--foreground)' }, children: [
     jsx('style', { children: '[data-action-queue] [data-streamdown="strong"]{font-weight:600}[data-decision-outcome]{margin:4px 0}[data-decision-outcome] .aui-md,[data-decision-outcome] .aui-md>div,[data-decision-outcome] p{display:inline;margin:0}[data-action-queue] button:disabled{opacity:.5;cursor:not-allowed}[data-action-queue] button:not(:disabled):hover{filter:brightness(1.15)}[data-action-scope] :is(pre,table){max-width:100%;overflow:auto}[data-action-queue] :is(button,textarea,input,[tabindex]):focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}' }),
-    jsxs('div', { 'data-action-queue-header': '', style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
+    !embedded && jsxs('div', { 'data-action-queue-header': '', style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }, children: [
       jsx('h2', { style: { margin: 0, fontSize: 14, flex: '0 1 auto', minWidth: 0, overflowWrap: 'anywhere' }, children: (n => n ? `For you (${n})` : `Waiting on the agent (${requests.length}) — nothing needed from you`)(requests.filter(r => ['open','needs_context'].includes(r.state) && !agentPending(r)).length) }),
       minimized && jsx('span', { 'data-action-queue-summary': '', style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12.5, color: 'var(--muted-foreground)' }, children: requests.map(r => r.title).join(' · ') }),
       jsx('button', { type: 'button', 'data-action-queue-toggle': '', 'aria-expanded': !minimized, 'aria-label': minimized ? 'Expand decisions' : 'Minimize decisions', title: minimized ? 'Expand' : 'Minimize (reopens when a new decision arrives)', onClick: () => setMinimized(minimized ? minimizedKeys.filter(k => !openKeys.includes(k)) : [...new Set([...minimizedKeys, ...openKeys])]), style: { ...btn(), marginLeft: 'auto', flex: 'none', minHeight: 28, minWidth: 28, padding: '2px 6px' }, children: jsx('i', { 'aria-hidden': true, className: `codicon ${minimized ? 'codicon-chevron-up' : 'codicon-chevron-down'}` }) })
     ] }),
     !minimized && snap.error && jsxs('div', { role: 'alert', children: [snap.error, jsx('button', { style: actionStyle, onClick: () => refreshRequests(), children: 'Reload actions' })] }),
     !minimized && requests.length > 1 && jsx('input', { 'aria-label': 'Filter decisions', value: filter, onChange: e => setFilter(e.target.value), onKeyDown: e => { e.stopPropagation(); if (['ArrowDown','Enter'].includes(e.key)) { e.preventDefault(); e.currentTarget.closest('section').querySelector('article')?.focus() } }, style: { width: '100%', boxSizing: 'border-box', minHeight: 44 } }),
-    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
+    !minimized && jsx('div', { 'data-action-queue-body': '', style: { maxHeight: embedded ? 'none' : '50vh', overflowY: 'auto', minWidth: 0 }, onKeyDown: e => { if (e.target.tagName !== 'ARTICLE') return; const rows = [...e.currentTarget.querySelectorAll('article')], i = rows.indexOf(e.target); if (['ArrowDown','ArrowUp','Enter'].includes(e.key)) { e.stopPropagation(); e.preventDefault(); if (e.key === 'Enter') e.target.querySelector('button:not(:disabled)')?.focus(); else rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length]?.focus() } }, children: visible.map(r => jsx(DecisionRow, { request: r, route, unavailable: !!snap.error }, `${scope}:${requestKey(r)}`)) })
   ] })
 }
 
@@ -1075,11 +1110,12 @@ export default {
   register(ctx) {
     osApi = ctx?.os || null
     previewApi = typeof ctx?.openPreview === 'function' ? (t => ctx.openPreview(t)) : null
-    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => jsxs('div', { style: { minWidth: 0, width: '100%' }, children: [jsx(ActionQueue, {}), jsx(Strip, {})] }) })
+    // With the session panel loaded, it draws these (window.__userSteps.ActionQueue / Strip) in its own sections.
+    ctx.register({ id: 'strip', area: COMPOSER_AREAS.top, order: -25, render: () => typeof window !== 'undefined' && window.__sessionPanel?.active ? null : jsxs('div', { style: { minWidth: 0, width: '100%' }, children: [jsx(ActionQueue, {}), jsx(Strip, {})] }) })
     ctx.register({ id: 'user-step-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'user-step', render: props => jsx(StepBox, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, ActionQueue, Strip, openAskCount }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)

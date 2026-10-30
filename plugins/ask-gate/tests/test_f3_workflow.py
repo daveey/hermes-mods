@@ -51,10 +51,12 @@ def test_only_explicit_resume_reopens_and_does_not_erase_retirement(gate, monkey
     gate.pre_llm_call(session_id="origin", user_message="Cancel this project.")
     gate.pre_llm_call(session_id="origin", user_message="Thanks")
     other = "Could you review the Example report?"
-    assert gate.pre_final_gate(session_id="origin", final_response=other).get("replace")
+    assert gate.pre_final_gate(session_id="origin", final_response=other).get("hold")
+    assert gate.pre_final_gate(session_id="origin", final_response=other, attempt=2).get("replace")
     gate.pre_llm_call(session_id="origin", user_message="Resume this project.")
     assert gate.pre_final_gate(session_id="origin", final_response=other) is None
-    assert gate.pre_final_gate(session_id="origin", final_response=ASK).get("replace")
+    assert gate.pre_final_gate(session_id="origin", final_response=ASK).get("hold")
+    assert gate.pre_final_gate(session_id="origin", final_response=ASK, attempt=2).get("replace")
 
 
 @pytest.mark.parametrize("directive", ["Stop this workflow.", "Resume this workflow."])
@@ -85,9 +87,10 @@ def test_compression_stop_inheritance_is_scoped_and_nearest_resume_wins(gate, mo
             ("origin", None, "compression", "cli"), ("compressed", "origin", None, "cli"),
             ("child", "origin", None, "subagent")])
     gate.pre_llm_call(session_id="origin", user_message="Stop this workflow.")
-    assert gate.pre_final_gate(session_id="compressed", final_response=ASK).get("replace")
+    assert gate.pre_final_gate(session_id="compressed", final_response=ASK).get("hold")
+    assert gate.pre_final_gate(session_id="compressed", final_response=ASK, attempt=2).get("replace")
     assert gate.pre_final_gate(session_id="unrelated", final_response=ASK) is None
     assert gate.pre_final_gate(session_id="child", final_response=ASK) is None
     gate.pre_llm_call(session_id="compressed", user_message="Resume this workflow.")
     assert gate.pre_final_gate(session_id="compressed", final_response=ASK) is None
-    assert gate.pre_final_gate(session_id="origin", final_response=ASK).get("replace")
+    assert gate.pre_final_gate(session_id="origin", final_response=ASK, attempt=2).get("replace")

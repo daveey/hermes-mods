@@ -55,7 +55,8 @@ _NOT_ASK = re.compile(
     r"you (already|have already)|you (said|answered|approved|asked|told)|no (more|further) (input|action)|"
     r"(isn'?t|is not|aren'?t|are not) waiting on you|not waiting on you|the card asks|it asked|"
     r"i'?ll stop asking|nothing from this work is waiting|nothing\b[^.]{0,60}\bneeds? (you|david)|"
-    r"no\b[^.]{0,40}\bwaiting on you|(was|were|had been|had) (waiting|blocked) (on|for) (you|david)|never (create|say|tell|ask|put))\b",
+    r"no\b[^.]{0,40}\bwaiting on you|(was|were|had been|had) (waiting|blocked) (on|for) (you|david)|never (create|say|tell|ask|put)|"
+    r"nothing\b[^.]{0,60}\b(?:from|on) your (?:side|end))\b",
     re.I)
 # --- shapes added after the week-of-10-12 corrections (imperatives, user-named headings, "I can't" claims) ---
 _VERB = (r"(?:open|check|tap|click|press|sign in|log in|go to|change|enable|disable|raise|switch (?:off|on)|"
@@ -82,7 +83,7 @@ _CANT = re.compile(
 _HOWTO_ASKED = re.compile(
     r"\bhow (?:do|can|would|should|could|to|am i supposed)\b|\bwalk me through\b|\bsteps?\b|\binstructions?\b|"
     r"\bshow me how\b|\bteach me\b|\bwhat should i do\b", re.I)
-_CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
+_CARD_ID = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")  # legacy 8-hex and current 16-hex ids
 # worker handoff leftovers that point at David
 _LEFTOVER = re.compile(
     r"\bdavid'?s (call|decision|choice)\b|\bup to david\b|\bdavid (should|must|needs to|will need to|can)\b"
@@ -91,6 +92,13 @@ _LEFTOVER = re.compile(
 _DAVID_ACTION = re.compile(
     r"\bneeds? (you|david)\b|\bdavid'?s call\b|\bdavid (must|should|needs? to)\b|\bwaiting on (you|david)\b"
     r"|\bneeds? your\b", re.I)
+# A handoff that hands the reader a step without naming David (10-30: "need an unblock from your side",
+# "Please run this from your side: `ssh …`"). Worker handoffs only; "please <verb>" is checked via _PLEASE_VERB.
+_HANDBACK = re.compile(
+    r"\b(?:needs?|requires?)\b[^.!?]{0,60}\b(?:from|on) your (?:side|end)\b"
+    r"|\b(?:run|do|unblock|approve|merge|restart|click|open)\b[^.!?]{0,60}\b(?:from|on) your "
+    r"(?:side|end|terminal|machine|mac|laptop)\b"
+    r"|\bin your (?:own )?terminal\b", re.I)
 
 
 def _strip_noise(text: str) -> str:
@@ -214,10 +222,12 @@ def _strip_quotes(text: str) -> str:
 
 
 def find_leftovers(text: str) -> list[str]:
-    """Sentences in a worker handoff that hand a decision/action to David."""
+    """Sentences in a worker handoff that hand a decision/action to David, named or not ("please run …",
+    "… from your side")."""
     out: list[str] = []
     for s in sentences(text):
-        if (_LEFTOVER.search(s) or _DAVID_ACTION.search(s)) and not _NOT_ASK.search(s) and s not in out:
+        hit = _LEFTOVER.search(s) or _DAVID_ACTION.search(s) or _PLEASE_VERB.search(s) or _HANDBACK.search(s)
+        if hit and not _NOT_ASK.search(s) and s not in out:
             out.append(s)
     return out
 
@@ -416,6 +426,136 @@ def terminal_answer(answer: str) -> bool:
         r"|\b(?:i|we)\s+(?:have\s+)?(?:revoked|cancelled|canceled|completed)\b", text))
 
 
+# --------------------------------------------------------------------------------------------------
+# repeat asks (self-heal agent-31a66d274a): the same ask restated reply after reply
+# --------------------------------------------------------------------------------------------------
+REPEAT_WINDOW_S = 48 * 3600
+REPEAT_MAX_SHOWN = 2  # a chat may see the same ask twice in the window; the 3rd showing is held
+# Only an ask that has been standing this long counts as a restatement: a step re-stated a few minutes apart while
+# the user works through it live ("tap X once more") is guidance, not a nag (replay: 27 holds -> see README).
+REPEAT_MIN_AGE_S = 3600
+_TOPIC_STOP = set("""
+a about above after again all also am an and any are as ask asked asking asks at be because been before being both but
+by can could did do does doing done each either else for from further get gets got had has have having he her here hers
+him his how i if in into is it its just let lets like make me more most my need needed needs no nor not now of off on
+once one only or other our out over own please really right same say says see she should since so some still such than
+that the their them then there these they this those through to too under until up us very want wants was we were what
+when where whether which while who why will with would yes you your yours ok okay sure also either call decide decision
+decisions item items open waiting wait thing things step steps todo needed reply chat card cards kanban task tasks
+hermes david user whenever let's i'd i'll you'd you'll i'm it's that's don't tell know again back ready more
+leave left done when
+""".split())
+_FACT = re.compile(
+    r"\$\s?\d[\d,.]*k?|\b\d[\d,.]*\s?(?:usd|dollars?|eur|gbp)\b|\b\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?\b"
+    r"|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b|\b\d{1,2}:\d{2}\b|\b\d+\s?(?:min(?:ute)?s?|h|hrs?|hours?|days?|weeks?)\b"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b"
+    r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|\b(?:today|tomorrow|tonight)\b"
+    r"|\b(?:deadline|expir\w*|due|cost\w*|charg\w*|price\w*|bill\w*|invoice\w*|fail\w*|broke\w*|disabl\w*"
+    r"|suspend\w*|outage\w*|error\w*|abus\w*|compromis\w*)\b", re.I)
+_TOKEN = re.compile(r"t_[0-9a-f]{8,}|https?://\S+|[~./]?[\w][\w./~#+-]*", re.I)
+_HEAD_PREFIX = re.compile(r"^\s*(?:still\s+)?(?:waiting on you|needs you|for you|your call|open asks?|"
+                          r"what i need from you|to confirm)\s*:\s*", re.I)
+
+
+def _stem(w: str) -> str:
+    for suf in ("ing", "ed", "es", "s"):
+        if len(w) > len(suf) + 3 and w.endswith(suf):
+            return w[: -len(suf)]
+    return w
+
+
+def _is_ident(tok: str) -> bool:
+    return bool(re.search(r"\d|/|~|#|\.\w", tok)) and not _FACT.fullmatch(tok)
+
+
+def topic_tokens(text: str) -> set[str]:
+    """Content words + identifiers (paths, card ids, numbers, urls) of one ask item, minus ask boilerplate and
+    fact tokens (dates, money, status words): those are what a repeat may add, not what names the topic."""
+    s = _FACT.sub(" ", _HEAD_PREFIX.sub("", text or ""))
+    out: set[str] = set()
+    for raw in _TOKEN.findall(s):
+        tok = raw.lower().strip(".,;:!?()[]{}'\"`*-")
+        if not tok or tok in _TOPIC_STOP:
+            continue
+        if _is_ident(tok):
+            out.add(tok)
+        elif len(tok) >= 3 and tok.isascii():
+            out.add(_stem(tok))
+    return out
+
+
+def fact_tokens(text: str) -> set[str]:
+    return {" ".join(m.lower().split()) for m in _FACT.findall(text or "")}
+
+
+def same_topic(a: str, b: str) -> bool:
+    """Conservative: a shared card id, or >=2 shared content tokens covering >=60% of the shorter ask, and never
+    when both name identifiers (PR 10 vs PR 12, two different paths) that share none."""
+    ta, tb = topic_tokens(a), topic_tokens(b)
+    ia, ib = {t for t in ta if _is_ident(t)}, {t for t in tb if _is_ident(t)}
+    if {t for t in ia if t.startswith("t_")} & {t for t in ib if t.startswith("t_")}:
+        return True
+    if ia and ib and not (ia & ib):
+        return False
+    shared = ta & tb
+    return len(shared) >= 2 and len(shared) / max(1, min(len(ta), len(tb))) >= 0.6
+
+
+def ask_items(asks: list[str]) -> list[str]:
+    """A list heading's items arrive joined with ' | ' in one unit; each item is its own ask."""
+    out: list[str] = []
+    for a in asks:
+        for part in (a or "").split(" | "):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def ask_context(item: str, reply: str) -> str:
+    """The paragraph of the reply that carries this ask item (its new facts often sit in the next sentence)."""
+    probe = " ".join((item or "").split())[:40]
+    for para in re.split(r"\n\s*\n", reply or ""):
+        if probe and probe in " ".join(para.split()):
+            return para
+    return item or ""
+
+
+def repeated_asks(items: list[str], shown: list[dict], user_msgs: list[str] | None = None,
+                  max_shown: int = REPEAT_MAX_SHOWN, reply: str = "", now: float | None = None) -> list[dict]:
+    """Items this chat already showed >= max_shown times (distinct delivered replies) in the window, first at least
+    REPEAT_MIN_AGE_S ago, that add no new fact and that the user's last message did not ask about.
+    [{item, n, last_ts}]"""
+    last_user = (user_msgs or [""])[-1] if user_msgs else ""
+    now = time.time() if now is None else now
+    out = []
+    for item in items:
+        prior = [r for r in shown if same_topic(item, r["text"])]
+        replies = {r.get("reply") or f"{r['ts']}" for r in prior}
+        if len(replies) < max_shown or now - min(r["ts"] for r in prior) < REPEAT_MIN_AGE_S:
+            continue
+        seen_facts: set[str] = set()
+        for r in prior:
+            seen_facts |= fact_tokens(r["text"]) | set(r.get("facts") or ())
+        if fact_tokens(ask_context(item, reply)) - seen_facts:
+            continue
+        if last_user and same_topic(item, last_user):
+            continue
+        out.append({"item": item, "n": len(replies), "last_ts": max(r["ts"] for r in prior)})
+    return out
+
+
+def repeat_nudge(reps: list[dict]) -> str:
+    lines = [f"- \"{r['item'][:200]}\" (asked {r['n']} times, last at {fmt_ts(r['last_ts'])})" for r in reps[:5]]
+    n = max(r["n"] for r in reps)
+    return ("ask-gate: your reply was NOT delivered. It restates an ask this chat has already shown:\n"
+            + "\n".join(lines) + "\n"
+            f"Asked {n} times, last at {fmt_ts(max(r['last_ts'] for r in reps))}, still in For-you or on its card. "
+            "Don't restate it. If nothing waits on it, say once that silence means no (or name the default you will "
+            "take), then close the card. Restate it only with a new fact (a status change, deadline or cost). Keep "
+            "the rest of the reply.")
+
+
 class Ledger:
     def __init__(self, path: Path | None = None):
         self.path = Path(path) if path else Path(os.environ.get("ASK_GATE_LEDGER") or home() / "state" / "ask-ledger.sqlite")
@@ -431,6 +571,10 @@ class Ledger:
         c.execute("create table if not exists retired_answers (answer_id integer primary key)")
         c.execute("create table if not exists workflow_state (session text primary key, stopped integer not null, "
                   "evidence text not null, ts real not null)")
+        # One row per ask item a delivered reply showed this chat (self-heal agent-31a66d274a): lets the gate count
+        # how often a chat already saw the same ask before the judge passes it as "true, unanswered" again.
+        c.execute("create table if not exists shown_asks (id integer primary key, ts real, session text, "
+                  "reply text, topic text, text text, facts text)")
         return c
 
     def _init(self) -> None:
@@ -563,6 +707,43 @@ class Ledger:
             return bool(row[0]) if row is not None else False
         finally:
             c.close()
+
+    def record_shown(self, session: str, items: list[str], reply_hash: str = "", ts: float | None = None,
+                     reply: str = "") -> None:
+        """Remember each ask item a DELIVERED reply showed this chat (held drafts are never recorded), with the
+        fact tokens of its paragraph so a later repeat can be told apart by a new fact."""
+        items = [i for i in dict.fromkeys(x.strip() for x in items if isinstance(x, str)) if i]
+        if not session or not items:
+            return
+        now = time.time() if ts is None else ts
+        with self._lock:
+            try:
+                c = self._conn()
+                c.executemany("insert into shown_asks(ts, session, reply, topic, text, facts) values (?,?,?,?,?,?)",
+                              [(now, session, reply_hash, " ".join(sorted(topic_tokens(i))), i[:1200],
+                                "\n".join(sorted(fact_tokens(ask_context(i, reply))))) for i in items])
+                c.commit()
+                c.close()
+            except sqlite3.Error:
+                pass
+
+    def shown_rows(self, session: str, window_s: float = REPEAT_WINDOW_S) -> list[dict]:
+        """Shown ask items in this chat's compression lineage within the window, newest first."""
+        try:
+            c = self._conn()
+        except sqlite3.Error:
+            return []
+        try:
+            self._scope(c, session)
+            rows = c.execute("select a.ts, a.session, a.reply, a.text, a.facts from shown_asks a "
+                             "join answer_scope s on s.session=a.session where a.ts>=? order by a.ts desc, a.id desc",
+                             (time.time() - window_s,)).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            c.close()
+        return [{"ts": r[0], "session": r[1], "reply": r[2], "text": r[3],
+                 "facts": set(filter(None, (r[4] or "").split("\n")))} for r in rows]
 
     def set_open_asks(self, session: str, asks: list[str]) -> None:
         with self._lock:

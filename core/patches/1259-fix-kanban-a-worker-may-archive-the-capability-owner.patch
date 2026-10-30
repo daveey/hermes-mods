@@ -1,0 +1,217 @@
+From b23ec4df150c7e593223528f1519698cf0c33724 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:02:51 +0000
+Subject: [PATCH] fix(kanban): a worker may archive the capability owner cards
+ of its own waiting cards [daveey]
+
+Relay owner cards (_local_owner) are created_by=capability-relay, so the
+creator rule never let the waiting card's task archive them, and every
+probe of the route left a done owner card only an orchestrator could clean.
+kanban_archive now allows a done or unclaimed card keyed
+capability-owner:<card>:... when <card> is HERMES_KANBAN_TASK or a card that
+task created. Reviewers run with the same HERMES_KANBAN_TASK, so they are
+covered. Claimed owner cards and other tasks' owner cards stay refused.
+---
+ hermes_cli/kanban.py                          |  34 +++++-
+ .../test_kanban_capability_owner_archive.py   | 115 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |   4 +-
+ 3 files changed, 151 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tools/test_kanban_capability_owner_archive.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 1f4283ec79c..a95245adec0 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1165,6 +1165,9 @@ def worker_archive_scope(conn, task_id: str) -> tuple[Optional[str], Optional[st
+     task = kb.get_task(conn, task_id)
+     if task is None:
+         return f"no such task: {task_id}", None
++    waiting = _capability_owner_waiting_card(task)
++    if waiting and (waiting == env_tid or _creator_task_id(conn, waiting) == env_tid):
++        return _worker_may_archive_capability_owner(task, waiting), f"capability owner of {waiting} by {env_tid}"
+     if _creator_task_id(conn, task_id) != env_tid:
+         if not (task.claim_lock or task.worker_pid) and _is_stranded_runs_on_copy(conn, task):
+             return None, f"stranded-runs_on sweep by {env_tid}"
+@@ -1178,13 +1181,42 @@ def worker_may_archive(conn, task_id: str) -> Optional[str]:
+ 
+     A dispatcher worker may archive an unclaimed card its own task created
+     (``creator_task_id`` is ``HERMES_KANBAN_TASK``), or a foreign card that is a
+-    provably stranded ``runs_on`` copy (see ``_is_stranded_runs_on_copy``). Every
++    provably stranded ``runs_on`` copy (see ``_is_stranded_runs_on_copy``), or a done or
++    unclaimed capability owner card (``capability-owner:<card>:...``) whose ``<card>`` is
++    ``HERMES_KANBAN_TASK`` or a card that task created. A reviewer of that task runs with the
++    same ``HERMES_KANBAN_TASK``, so it may archive them too. Every
+     other foreign card is refused — that is the "scoped worker can't archive it"
+     wall. No env task (a human or an orchestrator) may archive any card, as before.
+     """
+     return worker_archive_scope(conn, task_id)[0]
+ 
+ 
++def _capability_owner_waiting_card(task) -> Optional[str]:
++    """The waiting card of a capability owner card (``capability-owner:<card>:<need>``), else None.
++
++    Owner cards are created by the routing path (``created_by="capability-relay"`` for a
++    relayed local owner), never by the waiting card's task, so the creator rule alone
++    never lets that task clean them up. [daveey]
++    """
++    from hermes_cli.kanban_capability_routing import _task_of
++
++    return _task_of(task.idempotency_key or "")
++
++
++def _worker_may_archive_capability_owner(task, waiting: str) -> Optional[str]:
++    """The refusal for an owner card of ``waiting`` (the worker's task or a card it created), else None.
++
++    A done owner card may be archived (the readback is in; this is the cleanup), and so may an
++    unclaimed one. A claimed owner card is refused: its worker is doing the action.
++    """
++    if task.status == "archived":
++        return f"cannot archive {task.id}: status=archived"
++    if task.status != "done" and (task.status == "running" or task.claim_lock or task.worker_pid):
++        return (f"cannot archive {task.id}: capability owner card of {waiting} is claimed "
++                f"(status={task.status}). A worker may archive only a done or unclaimed owner card.")
++    return None
++
++
+ def _worker_may_archive_own(task) -> Optional[str]:
+     """The refusal for a card this worker's task created, else None."""
+     task_id = task.id
+diff --git a/tests/tools/test_kanban_capability_owner_archive.py b/tests/tools/test_kanban_capability_owner_archive.py
+new file mode 100644
+index 00000000000..251abab0193
+--- /dev/null
++++ b/tests/tools/test_kanban_capability_owner_archive.py
+@@ -0,0 +1,115 @@
++"""A worker may archive the capability owner cards of its own waiting cards. [daveey]
++
++The relay path (``_local_owner`` in ``kanban_capability_routing``) opens the owner card as
++``created_by="capability-relay"`` with ``idempotency_key=capability-owner:<card>:<need>``, so the
++creator rule never matched the waiting card's task. Every probe of that route left a done owner
++card behind that only an orchestrator could archive. Now the task whose card waited (``<card>`` is
++the task itself or a card it created) may archive a done or unclaimed owner card; claimed owner
++cards and other tasks' owner cards are still refused.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_capability_routing as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    db = home / "kanban.db"
++    conn = connect(db)
++    worker = kb.create_task(conn, title="relay live check")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", worker)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    monkeypatch.setattr(kcr, "_own_gateway", lambda conn: None)
++    yield conn, worker
++    conn.close()
++
++
++def _relay_owner(conn, waiting_id, need="host:macbook"):
++    """Open the owner card exactly as the relay path does on the waiting card's home gateway."""
++    rid = f"{kcr.OWNER_PREFIX}{waiting_id}:{need}"
++    kcr._local_owner(conn, kb.get_task(conn, waiting_id), {"generation": 1}, need=need, rid=rid,
++                     self_gw="macbook", from_gw="worker-1", reason="run sw_vers on the MacBook")
++    row = conn.execute("SELECT id, created_by FROM tasks WHERE idempotency_key = ?", (rid,)).fetchone()
++    assert row is not None and row[1] == "capability-relay"
++    return row[0]
++
++
++def _finish(conn, tid):
++    assert kb.complete_task(conn, tid, summary="sw_vers: 26.1")
++    assert kb.get_task(conn, tid).status == "done"
++
++
++def _archive(tid):
++    from tools import kanban_tools as kt
++
++    return json.loads(kt._handle_archive({"task_id": tid}))
++
++
++def _archived_payload(conn, tid):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived' "
++                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++    return json.loads(row[0]) if row and row[0] else None
++
++
++def test_worker_archives_the_relay_owner_card_of_a_probe_it_created(board):
++    conn, worker = board
++    probe = kb.create_task(conn, title="PROBE", creator_task_id=worker)
++    owner = _relay_owner(conn, probe)
++    _finish(conn, owner)
++    assert _archive(probe).get("ok") is True  # the probe goes first, as in the live check
++    out = _archive(owner)
++    assert out.get("ok") is True, out
++    assert kb.get_task(conn, owner).status == "archived"
++    assert (_archived_payload(conn, owner) or {}).get("via") == f"capability owner of {probe} by {worker}"
++
++
++def test_worker_archives_an_unclaimed_owner_card_of_its_own_task(board):
++    conn, worker = board
++    owner = _relay_owner(conn, worker)
++    assert kb.get_task(conn, owner).status in ("ready", "todo")
++    assert _archive(owner).get("ok") is True
++    assert kb.get_task(conn, owner).status == "archived"
++
++
++def test_owner_card_of_another_tasks_probe_is_refused(board):
++    conn, _worker = board
++    other = kb.create_task(conn, title="other task")
++    probe = kb.create_task(conn, title="PROBE", creator_task_id=other)
++    owner = _relay_owner(conn, probe)
++    _finish(conn, owner)
++    out = _archive(owner)
++    assert out.get("ok") is not True
++    assert "may archive only" in json.dumps(out)
++    assert kb.get_task(conn, owner).status == "done"
++
++
++def test_claimed_owner_card_is_refused(board):
++    conn, worker = board
++    probe = kb.create_task(conn, title="PROBE", creator_task_id=worker)
++    owner = _relay_owner(conn, probe)
++    assert kb.claim_task(conn, owner) is not None
++    out = _archive(owner)
++    assert out.get("ok") is not True
++    assert "is claimed" in json.dumps(out)
++    assert kb.get_task(conn, owner).status == "running"
++
++
++def test_a_plain_key_lookalike_does_not_widen_scope(board):
++    """Only the ``capability-owner:`` prefix counts; any other key falls back to the creator rule."""
++    conn, worker = board
++    other = kb.create_task(conn, title="other task")
++    tid = kb.create_task(conn, title="x", creator_task_id=other, idempotency_key=f"probe:{worker}:x")
++    assert _archive(tid).get("ok") is not True
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 75d440bebbe..f8b4643ae52 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -903,7 +903,9 @@ KANBAN_ARCHIVE_SCHEMA = _schema(
+         "its own task created (creator_task_id is the caller's task) — the "
+         "cleanup when kanban_create kept a card local because of a text "
+         "marker and the work does not need this machine. Re-create it with "
+-        "placement='hub'. A claimed card, a card another task created, and "
++        "placement='hub'. It may also archive a done or unclaimed capability "
++        "owner card (idempotency_key capability-owner:<card>:...) when <card> "
++        "is its own task or a card its task created. A claimed card, a card another task created, and "
+         "the worker's own assigned task are refused. With no "
+         "HERMES_KANBAN_TASK (an orchestrator or a human) any card may be "
+         "archived."
+-- 
+2.55.0
+

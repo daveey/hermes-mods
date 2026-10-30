@@ -1,0 +1,307 @@
+From e1947adf31aa9a427d409e8c215460dd79de7717 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:34:28 +0000
+Subject: [PATCH] ci(lint): bound optional PM tools saves outside automatic
+ post hooks
+
+---
+ .github/actions/setup-pm/action.yml           |  6 ++
+ .../workflows/cache-save-timeout-smoke.yml    | 95 +++++++++++++++++++
+ .github/workflows/lint.yml                    | 60 ++++++++++--
+ tests/ci/test_lint_cache_budget.py            | 38 ++++++++
+ tests/scripts/test_setup_toolchain.py         | 13 ++-
+ 5 files changed, 200 insertions(+), 12 deletions(-)
+ create mode 100644 .github/workflows/cache-save-timeout-smoke.yml
+ create mode 100644 tests/ci/test_lint_cache_budget.py
+
+diff --git a/.github/actions/setup-pm/action.yml b/.github/actions/setup-pm/action.yml
+index af86ab8643c..8ae2064ef40 100644
+--- a/.github/actions/setup-pm/action.yml
++++ b/.github/actions/setup-pm/action.yml
+@@ -73,6 +73,12 @@ outputs:
+   tools-cache-hit:
+     description: Exact PM store cache hit.
+     value: ${{ steps.tools-cache.outputs.cache-hit || steps.tools-cache-restore.outputs.cache-hit }}
++  tools-cache-key:
++    description: Exact tools key for an explicit bounded save after restore-only setup.
++    value: ${{ steps.tools-cache-restore.outputs.cache-primary-key }}
++  tools-cache-path:
++    description: Verified PM tools store for an explicit save.
++    value: ${{ steps.prepare.outputs.store }}
+   python-cache-hit:
+     description: Exact uv dependency cache hit.
+     value: ${{ steps.python-cache.outputs.cache-hit || steps.python-cache-restore.outputs.cache-hit }}
+diff --git a/.github/workflows/cache-save-timeout-smoke.yml b/.github/workflows/cache-save-timeout-smoke.yml
+new file mode 100644
+index 00000000000..49661fc5fee
+--- /dev/null
++++ b/.github/workflows/cache-save-timeout-smoke.yml
+@@ -0,0 +1,95 @@
++name: Cache save timeout smoke
++
++on:
++  pull_request:
++    paths:
++      - .github/workflows/cache-save-timeout-smoke.yml
++      - .github/workflows/lint.yml
++      - .github/actions/setup-pm/**
++  push:
++    branches: [main]
++    paths:
++      - .github/workflows/cache-save-timeout-smoke.yml
++      - .github/workflows/lint.yml
++      - .github/actions/setup-pm/**
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++jobs:
++  stalled-save:
++    runs-on: [self-hosted, ci-fast]
++    timeout-minutes: 4
++    steps:
++      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
++      - name: Start a cache endpoint that accepts requests but never responds
++        shell: bash
++        run: |
++          mkdir -p "$RUNNER_TEMP/cache-timeout-probe"
++          python3 -u - "$RUNNER_TEMP/cache-timeout-probe" <<'PY' &
++          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++          from pathlib import Path
++          import sys
++          import threading
++          root = Path(sys.argv[1])
++          class Blackhole(BaseHTTPRequestHandler):
++              def do_POST(self):
++                  (root / 'request').touch()
++                  threading.Event().wait()
++              def log_message(self, *args):
++                  pass
++          server = ThreadingHTTPServer(('127.0.0.1', 0), Blackhole)
++          (root / 'url').write_text(f'http://127.0.0.1:{server.server_port}/', encoding='utf-8')
++          server.serve_forever()
++          PY
++          echo "CACHE_PROBE_PID=$!" >> "$GITHUB_ENV"
++          deadline=$((SECONDS + 10))
++          until test -s "$RUNNER_TEMP/cache-timeout-probe/url"; do
++            test "$SECONDS" -lt "$deadline" || exit 1
++            sleep 0.1
++          done
++          echo "CACHE_PROBE_URL=$(cat "$RUNNER_TEMP/cache-timeout-probe/url")" >> "$GITHUB_ENV"
++          printf 'test cache payload\n' > "$RUNNER_TEMP/cache-timeout-probe/payload"
++          python3 -c 'import time, pathlib, os; pathlib.Path(os.environ["RUNNER_TEMP"], "cache-timeout-probe", "started").write_text(str(time.monotonic()), encoding="utf-8")'
++
++      # This is the same pinned save action and timeout policy used by lint.yml.
++      # Use a fake token: no real credential is sent to the test endpoint.
++      - name: Save to the unresponsive cache endpoint
++        id: save
++        continue-on-error: true
++        timeout-minutes: 1
++        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        env:
++          ACTIONS_CACHE_SERVICE_V2: 'true'
++          ACTIONS_RESULTS_URL: ${{ env.CACHE_PROBE_URL }}
++          ACTIONS_CACHE_URL: ${{ env.CACHE_PROBE_URL }}
++          ACTIONS_RUNTIME_TOKEN: cache-timeout-probe-not-a-credential
++        with:
++          path: ${{ runner.temp }}/cache-timeout-probe/payload
++          key: timeout-probe-${{ github.run_id }}-${{ github.run_attempt }}
++
++      - name: Verify a stalled save times out and the consumer still runs
++        env:
++          SAVE_OUTCOME: ${{ steps.save.outcome }}
++        shell: bash
++        run: |
++          python3 - <<'PY'
++          import os
++          from pathlib import Path
++          import time
++          root = Path(os.environ['RUNNER_TEMP']) / 'cache-timeout-probe'
++          assert (root / 'request').exists(), 'save never reached the blackhole endpoint'
++          assert os.environ['SAVE_OUTCOME'] == 'failure', 'stalled save did not time out'
++          elapsed = time.monotonic() - float((root / 'started').read_text(encoding='utf-8'))
++          assert 55 <= elapsed < 120, f'recovery outside the step timeout budget: {elapsed:.1f}s'
++          print(f'Consumer ran after stalled cache save: {elapsed:.1f}s; outcome=failure')
++          PY
++
++      - name: Stop the test endpoint
++        if: always()
++        shell: bash
++        run: |
++          if [ -n "${CACHE_PROBE_PID:-}" ]; then kill "$CACHE_PROBE_PID" || true; fi
++      - name: Check the checkout is clean
++        uses: ./.github/actions/check-clean-worktree
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index ce9228d29fc..e5f53389750 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -43,10 +43,21 @@ jobs:
+         with:
+           fetch-depth: 0 # need full history for merge-base + worktree
+ 
++      # No automatic post-save: an optional cache upload must not consume the job timeout.
+       - uses: ./.github/actions/setup-pm
++        id: pm
+         with:
+-          cache-python: true
+-          prune-python-cache: true
++          save-tools-cache: false
++          cache-python: false
++
++      - name: Save verified PM tools (best effort, bounded)
++        if: steps.pm.outputs.tools-cache-hit != 'true'
++        continue-on-error: true
++        timeout-minutes: 1
++        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        with:
++          path: ${{ steps.pm.outputs.tools-cache-path }}
++          key: ${{ steps.pm.outputs.tools-cache-key }}
+ 
+       - name: Install ruff + ty
+         uses: ./.github/actions/retry
+@@ -147,10 +158,21 @@ jobs:
+       - name: Checkout code
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+ 
++      # No automatic post-save: an optional cache upload must not consume the job timeout.
+       - uses: ./.github/actions/setup-pm
++        id: pm
++        with:
++          save-tools-cache: false
++          cache-python: false
++
++      - name: Save verified PM tools (best effort, bounded)
++        if: steps.pm.outputs.tools-cache-hit != 'true'
++        continue-on-error: true
++        timeout-minutes: 1
++        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+         with:
+-          cache-python: true
+-          prune-python-cache: true
++          path: ${{ steps.pm.outputs.tools-cache-path }}
++          key: ${{ steps.pm.outputs.tools-cache-key }}
+ 
+       - name: Install ruff
+         uses: ./.github/actions/retry
+@@ -185,10 +207,21 @@ jobs:
+         with:
+           fetch-depth: 2 # the merge commit and its first parent (the base branch tip)
+ 
++      # No automatic post-save: an optional cache upload must not consume the job timeout.
+       - uses: ./.github/actions/setup-pm
++        id: pm
+         with:
+-          cache-python: true
+-          prune-python-cache: true
++          save-tools-cache: false
++          cache-python: false
++
++      - name: Save verified PM tools (best effort, bounded)
++        if: steps.pm.outputs.tools-cache-hit != 'true'
++        continue-on-error: true
++        timeout-minutes: 1
++        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
++        with:
++          path: ${{ steps.pm.outputs.tools-cache-path }}
++          key: ${{ steps.pm.outputs.tools-cache-key }}
+ 
+       - name: Install pinned ruff
+         uses: ./.github/actions/retry
+@@ -218,10 +251,21 @@ jobs:
+       - name: Checkout code
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+ 
++      # No automatic post-save: an optional cache upload must not consume the job timeout.
+       - uses: ./.github/actions/setup-pm
++        id: pm
++        with:
++          save-tools-cache: false
++          cache-python: false
++
++      - name: Save verified PM tools (best effort, bounded)
++        if: steps.pm.outputs.tools-cache-hit != 'true'
++        continue-on-error: true
++        timeout-minutes: 1
++        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+         with:
+-          cache-python: true
+-          prune-python-cache: true
++          path: ${{ steps.pm.outputs.tools-cache-path }}
++          key: ${{ steps.pm.outputs.tools-cache-key }}
+ 
+       - name: Run footgun checker
+         run: python scripts/check-windows-footguns.py --all
+diff --git a/tests/ci/test_lint_cache_budget.py b/tests/ci/test_lint_cache_budget.py
+new file mode 100644
+index 00000000000..af4b686018b
+--- /dev/null
++++ b/tests/ci/test_lint_cache_budget.py
+@@ -0,0 +1,38 @@
++"""Lint validation must survive an optional cache-save stall.
++
++The live blackhole smoke exercises GitHub's step-timeout recovery; these contracts ensure
++all lint lanes use that policy and cannot register automatic cache/prune post hooks.
++"""
++from pathlib import Path
++
++import pytest
++from ruamel.yaml import YAML
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def load(relative):
++    return YAML(typ="safe").load((ROOT / relative).read_text(encoding="utf-8"))
++
++
++@pytest.mark.parametrize("lane", ["lint-diff", "ruff-blocking", "code-health", "windows-footguns"])
++def test_lint_cache_is_restore_only_with_a_bounded_best_effort_save(lane):
++    job = load(".github/workflows/lint.yml")["jobs"][lane]
++    setup = next(step for step in job["steps"] if step.get("uses") == "./.github/actions/setup-pm")
++    inputs = setup["with"]
++    assert str(inputs["save-tools-cache"]).lower() == "false"
++    assert str(inputs["cache-python"]).lower() == "false"
++    assert inputs.get("toolchain", "python") == "python", "npm post-save must stay disabled too"
++    assert not job.get("continue-on-error", False), "only the optional save may ignore errors"
++    save = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/cache/save@"))
++    probe = load(".github/workflows/cache-save-timeout-smoke.yml")["jobs"]["stalled-save"]
++    stalled_save = next(step for step in probe["steps"] if step.get("id") == "save")
++    assert save["uses"] == stalled_save["uses"]
++    assert 0 < save["timeout-minutes"] == stalled_save["timeout-minutes"] < job["timeout-minutes"]
++    assert save["continue-on-error"] is stalled_save["continue-on-error"] is True
++    for output in ("tools-cache-path", "tools-cache-key"):
++        assert f"steps.{setup['id']}.outputs.{output}" in " ".join(save["with"].values())
++    action = load(".github/actions/setup-pm/action.yml")
++    assert "steps.tools-cache-restore.outputs.cache-primary-key" in action["outputs"]["tools-cache-key"]["value"]
++    assert "steps.prepare.outputs.store" in action["outputs"]["tools-cache-path"]["value"]
++    assert not any(step.get("uses", "").startswith("actions/cache@") for step in job["steps"])
+diff --git a/tests/scripts/test_setup_toolchain.py b/tests/scripts/test_setup_toolchain.py
+index 9141fb00351..abcbd174ffe 100644
+--- a/tests/scripts/test_setup_toolchain.py
++++ b/tests/scripts/test_setup_toolchain.py
+@@ -129,12 +129,17 @@ def test_bootstrap_leaves_cache_key_inputs_unchanged(tmp_path):
+     shutil.copytree(root / "pm", checkout / "pm", ignore=ignore)
+     shutil.copytree(root / "scripts" / "ci", checkout / "scripts" / "ci", ignore=ignore)
+     (checkout / "scripts" / "__init__.py").touch()
++    shutil.copytree(root / ".github/actions/setup-pm", checkout / ".github/actions/setup-pm")
+ 
+     def snapshot():
+-        return sorted(
+-            str(path.relative_to(checkout)) for tree in ("pm", "scripts")
+-            for path in (checkout / tree).rglob("*") if path.is_file()
+-        )
++        import hashlib
++
++        return {
++            str(path.relative_to(checkout)): hashlib.sha256(path.read_bytes()).hexdigest()
++            for tree in ("pm", ".github/actions/setup-pm", "scripts/ci/setup_toolchain.py")
++            for path in ([checkout / tree] if (checkout / tree).is_file() else (checkout / tree).rglob("*"))
++            if path.is_file()
++        }
+ 
+     before = snapshot()
+     env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+-- 
+2.55.0
+

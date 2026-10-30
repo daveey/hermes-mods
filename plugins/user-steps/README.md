@@ -141,6 +141,11 @@ Profile-scoped storage is under `<Hermes home>/user-steps/`:
 - Existing lineage ledger JSON remains available for passive compatibility reads.
 - `actions.sqlite3` stores canonical requests, revisions, aliases and durable
   decision operations before delivery side effects.
+- `actions.sqlite3` runs in WAL mode (switched on every open, best effort), so lookups never wait on a
+  committing writer; pure reads use deferred query-only snapshots and writes keep `BEGIN IMMEDIATE` with
+  FULL sync. The per-reply hooks open it with a 5 s busy timeout (the store default stays 30 s), and in
+  `transform_llm_output` a failed `reconcile` logs `user-steps reconcile failed; still recording this reply's
+  asks` plus a `reconcile_error` trace line and still runs extraction (`tests/test_store_concurrency.py`).
 - Delivery records retain frozen payloads and destination receipts. A passive inbox
   write is not a successful execution handoff.
 
@@ -246,7 +251,10 @@ Three triggers:
 - **agent**: only the owning chat, explicitly:
   `action_request {"withdraw": {"requestId", "reason"}}`. The extractor's
   `resolved` list never withdraws a canonical ask (it retires legacy steps only, as
-  before). The per-turn context says how to withdraw, and reports each system/user
+  before). In a turn a runtime row started (a Kanban notice or auto-continue,
+  labeled `[Automatic notice, not typed by the user]` by `pre_llm_call`), it never
+  retires a step the reply still restates (quotes its text, or the model lists it
+  under `repeats`): a notice answers nothing. The per-turn context says how to withdraw, and reports each system/user
   withdrawal to the chat once.
 - **user**: `POST /requests/{id}/withdraw` (Desktop "Not needed").
 
@@ -361,8 +369,18 @@ Paste-control markers or text the core sanitizer would change are rejected with
 422 before recording a decision, including markers in the frozen scope. Text is
 never silently rewritten after the user reviews it.
 
-Production uses `prompt.admission.get`/`prompt.admit` in the already-loaded owning
-serve runtime, never `/v1/runs`, port discovery, session resume or a competing writer.
+TUI-runtime decisions use `prompt.admission.get`/`prompt.admit` in the already-loaded
+owning serve runtime. Gateway local-platform (`local-*`) decisions instead use the
+published gateway runner's profile-scoped authority and durable automation FIFO;
+`operationId` is the immutable producer request identity. Admission readback verifies
+the stored text digest, owner and request identity, including after compression.
+A committed receipt remains readable when the route later rotates; a fresh decision
+cannot target an unrelated replacement conversation. Confirmation means durable
+admission, not successful model completion. Neither path uses `/v1/runs`, port
+discovery, session resume or a competing writer. Unconfirmed delivery remains visible
+with Retry in For-you; classified backend warnings identify the operation without
+logging raw transport details. Tests cover TUI admission, real local gateway FIFO
+(including a compressed child), failed-row retention and terminal receipt outcomes.
 Card bindings are checked read-only first; approve/revise admission and readback
 then precede card decision comments. Decline never admits a turn. Card comments,
 binding decisions and receipts commit together through core's fenced transaction;
@@ -427,7 +445,13 @@ HERMES_DESKTOP_DIR=/path/to/test-dependencies node --test --test-reporter=tap de
 `sys.path`, so the real-core Kanban tests (`test_decision_card_real_core.py`, `test_card_delivery_core.py`)
 run instead of skipping. Inside a Kanban worker the delegated-write fence covers `~/.hermes`, so pass
 `--basetemp` outside it (e.g. `--basetemp ~/.cache/us-pytest`) or those tests skip. The three
-`tui_gateway` tests still need `run-core-integration.sh <core worktree>`.
+`tui_gateway` tests (`test_runtime_integration.py`, `test_dispatch_cancellation_core.py`,
+`test_mounted_runtime.py`) skip with that instruction unless core's `tests.conftest` is the
+active plugin; run them with `run-core-integration.sh <core worktree>`. `tests/core_runtime.py`
+gates them before any core import: importing `tui_gateway.server` from a self-updating install
+under a foreign interpreter (e.g. the legacy `~/.hermes/hermes-agent/.venv` python) lets core's
+bootstrap re-exec the pytest process into the install runtime, which has no pytest, and the run
+dies with exit 1 and no output.
 
 `HERMES_DESKTOP_DIR` points to a package directory containing React, react-dom,
 jsdom, esbuild and Playwright with installed Chromium. If omitted, the tests use
@@ -443,11 +467,14 @@ without bypassing that capability check.
 For the full backend suite, use an isolated core worktree with this feature:
 
 ```sh
-bash plugins/user-steps/run-core-integration.sh /path/to/isolated/core/worktree
+git -C ~/.hermes/hermes-agent worktree add --detach ~/code/hermes-core-wt-usteps HEAD   # once
+bash plugins/user-steps/run-core-integration.sh ~/code/hermes-core-wt-usteps
 ```
 
 This copies source fixtures into the core test checkout, runs the canonical isolated
-runner, and cleans those copies. It preserves the home-I/O and mutation guards.
+runner, and cleans those copies. It preserves the home-I/O and mutation guards. It refuses
+the live install itself (`$HERMES_HOME/hermes-agent`) and forwards extra arguments to
+`scripts/run_tests.sh` (e.g. `-k mounted`).
 Verified: 127 backend tests passed without skips, including actual FastAPI routing,
 runtime identity, RPC admission and durable user-row readback (model execution alone
 is suppressed), plus real-core card transactions. 115 DOM/browser/plugin tests

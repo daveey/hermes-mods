@@ -500,6 +500,18 @@ function cachedRows() {
   return dedupeRows(out)
 }
 
+export const CHANGE_DEBOUNCE_MS = 400
+export const CHANGE_REFRESH_MIN_MS = 30_000
+
+/** Delay before the trailing refresh a sessions.changed event arms: the debounce, stretched so
+ *  forced refreshes are at least CHANGE_REFRESH_MIN_MS apart. */
+export function changeRefreshDelay(now, lastForcedAt, minGap = CHANGE_REFRESH_MIN_MS, debounceMs = CHANGE_DEBOUNCE_MS) {
+  return Math.max(debounceMs, lastForcedAt + minGap - now)
+}
+
+// Set by register(): refreshes the active connection now if a sessions.changed is pending.
+let flushPendingChange = () => {}
+
 function refreshStale() {
   void connections().then(conns => conns.forEach(c => void fetchRows(c)))
 }
@@ -805,7 +817,10 @@ async function fetchTask(connectionId, taskId, board) {
       if (!is404(e)) throw e
     }
   }
-  const res = await api(connectionId, '/api/plugins/kanban/boards', { timeoutMs: 15_000 }).catch(() => null)
+  // A failed board listing means the other boards were never searched: that is "unknown", not "missing".
+  const res = await api(connectionId, '/api/plugins/kanban/boards', { timeoutMs: 15_000 }).catch(e => {
+    throw new Error(`board list unavailable after a miss on ${board || 'default'}: ${e?.message || e}`)
+  })
   for (const b of (res?.boards || []).map(x => x?.slug).filter(Boolean)) {
     if (tried.has(b)) continue
     try {
@@ -850,11 +865,27 @@ async function resolveTask(rawTarget, origin, conns) {
   const target = parseTaskRef(rawTarget, origin, conns)
   if (target.error) return { error: target.error }
   const order = target.anyGateway ? [origin, ...conns.map(c => c.id).filter(id => id !== origin)] : [target.connectionId]
+  const gwName = id => conns.find(c => c.id === id)?.key || id
+  // A gateway that answered with an error (503 gateway_not_ready while it drains for a restart, a
+  // timeout) was never searched. Reporting that as "not found" made agents conclude a live card was
+  // deleted, so name the failure and say it is retryable.
+  const unreachable = []
   for (const connectionId of order) {
-    const found = await fetchTask(connectionId, target.taskId, target.board).catch(() => null)
+    let found = null
+    try {
+      found = await fetchTask(connectionId, target.taskId, target.board)
+    } catch (e) {
+      unreachable.push(`${gwName(connectionId)}: ${clip(e?.message || e, 300)}`)
+      continue
+    }
     if (found) return { target: { ...target, connectionId, board: found.board || target.board }, found }
   }
-  return { error: `task ${target.taskId} not found${target.anyGateway ? ' on any connected gateway' : ` on ${conns.find(c => c.id === target.connectionId)?.key || target.connectionId}`}` }
+  if (unreachable.length) {
+    return { error: `could not read task ${target.taskId}: lookup failed on ${unreachable.join('; ')}. ` +
+      'This does not mean the task is missing; the gateway was unavailable (e.g. draining for a restart). Retry in a few minutes.',
+    retryable: true }
+  }
+  return { error: `task ${target.taskId} not found${target.anyGateway ? ' on any connected gateway' : ` on ${gwName(target.connectionId)}`}` }
 }
 
 async function performTaskRequest(req, origin, conns) {
@@ -893,8 +924,8 @@ async function performTaskRequest(req, origin, conns) {
     }
   }
 
-  const { target, found, error } = await resolveTask(args.target, origin, conns)
-  if (error) return { ok: false, error }
+  const { target, found, error, retryable } = await resolveTask(args.target, origin, conns)
+  if (error) return { ok: false, error, ...(retryable ? { retryable: true } : {}) }
   const gw = conns.find(c => c.id === target.connectionId)
   const ref = taskRef(target, origin, conns)
 
@@ -1320,14 +1351,31 @@ export default {
     if (stopWorker) ctx.onDispose(stopWorker)
     else every(() => void courierTick(), COURIER_INTERVAL_MS)
 
+    // sessions.changed fires every ~1-2 s while any turn streams, and a forced fetch of the
+    // active (primary) connection makes Desktop main fan /api/sessions out to EVERY connected
+    // gateway, up to 5 pages each: ~1,500 backend list reads per 40 s on a 20-gateway Desktop
+    // (David-MBP 2026-10-30). The @ list only needs to be fresh when someone types @, so a change
+    // marks rows pending; idle refreshes are capped at one per CHANGE_REFRESH_MIN_MS, and
+    // provide() refreshes a pending change at once.
     let debounce = null
-    const onChanged = () => {
+    let lastForcedAt = 0
+    let changePending = false
+    const forceActive = () => {
       if (debounce) clearTimeout(debounce)
-      debounce = setTimeout(() => {
-        const active = activeConnectionId()
-        const conn = connCache.rows.find(c => c.id === active)
-        if (conn) void fetchRows(conn, true)
-      }, 400)
+      debounce = null
+      changePending = false
+      lastForcedAt = Date.now()
+      const active = activeConnectionId()
+      const conn = connCache.rows.find(c => c.id === active)
+      if (conn) void fetchRows(conn, true)
+    }
+    flushPendingChange = () => {
+      if (changePending) forceActive()
+    }
+    const onChanged = () => {
+      changePending = true
+      if (debounce) return // the armed trailing refresh covers this change too
+      debounce = setTimeout(forceActive, changeRefreshDelay(Date.now(), lastForcedAt))
     }
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host.onEvent
     const off = subscribe('sessions.changed', onChanged)
@@ -1375,6 +1423,7 @@ export default {
       area: COMPOSER_AREAS.atCompletions,
       data: {
         provide: query => {
+          flushPendingChange()
           refreshStale()
           const conns = connCache.rows
           const status = fetchStatus(rowCache, rowInflight, rowErrors, conns)

@@ -1,0 +1,189 @@
+From 4739e83caee907b840adb038e55ac75fce6bdbe9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 05:48:52 +0000
+Subject: [PATCH 1141/1157] perf(serve): build the session-list kanban
+ annotation at boot, before the Desktop reconnect burst [daveey]
+
+A cold annotation (nothing served yet for the scope) made every annotate_kanban_activity caller wait on the
+single in-flight pass: /api/sessions, /api/profiles/sessions, the sidebar and the one-row
+GET /api/sessions/<id>. On example-hub that pass (remote-links projection over the board replicas plus the
+board counts) costs ~0.7 s CPU alone and ran 5-10 s inside the restart burst (/api/sessions 9.79 s,
+session detail 3.6-4.3 s waiting at _annotation_snapshot). The backend now starts that read on a daemon
+thread during the lifespan, like the kanban board prewarm, so the first poll finds the snapshot or joins
+the read already under way. Skipped under HERMES_TEST_ISOLATION.
+---
+ hermes_cli/kanban_annotation_prewarm.py       | 40 +++++++++++
+ hermes_cli/web_server_app.py                  |  9 +++
+ .../test_kanban_annotation_prewarm.py         | 71 +++++++++++++++++++
+ .../hermes_cli/test_serve_unloaded_sweeper.py |  3 +-
+ 4 files changed, 122 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_annotation_prewarm.py
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_prewarm.py
+
+diff --git a/hermes_cli/kanban_annotation_prewarm.py b/hermes_cli/kanban_annotation_prewarm.py
+new file mode 100644
+index 00000000000..de37e00a5e5
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_prewarm.py
+@@ -0,0 +1,40 @@
++"""Boot-time read of the session-list kanban annotation, so the Desktop's first poll burst after a backend
++start finds it built instead of every session read waiting on one cold pass under the burst's GIL contention.
++
++A cold annotation (no snapshot served yet for the scope) makes every caller of ``annotate_kanban_activity`` wait on
++the single in-flight read: ``GET /api/sessions``, ``/api/profiles/sessions``, the sidebar and the one-row
++``GET /api/sessions/<id>``. On hermes-hub that pass (origin-ledger remote-links projection over the board replicas
++plus the board counts) is ~0.7 s CPU alone and 5-10 s inside a reconnect burst; the session-detail request waited
++behind it for 4-5 s. Mirrors ``plugins/kanban/dashboard/board_prewarm.py`` for the board snapshot.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import threading
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++
++def prewarm_annotation() -> bool:
++    """Build this process's annotation snapshot (and the remote-links projection under it). Never raises."""
++    try:
++        from hermes_cli import kanban_session_activity as ksa
++
++        return ksa._annotation_snapshot() is not None
++    except Exception:  # health: allow BLE001 -- best-effort warm-up; the first real read reports its own error
++        log.debug("kanban annotation prewarm failed", exc_info=True)
++        return False
++
++
++def start_annotation_prewarm() -> Optional[threading.Thread]:
++    """Run ``prewarm_annotation`` on a daemon thread (not under the test harness)."""
++    if os.environ.get("HERMES_TEST_ISOLATION"):
++        return None
++    from agent.memory_provider import spawn_context_thread
++
++    thread = spawn_context_thread(prewarm_annotation, name="kanban-annotation-prewarm")
++    thread.start()
++    return thread
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index d531f6471ec..9c1954d24ae 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -123,6 +123,15 @@ async def standalone_lifespan(app: "FastAPI"):
+         except Exception:
+             logger.warning("kanban unloaded-session sweeper start failed", exc_info=True)
+ 
++    # Build the session-list kanban annotation now, before the Desktop's reconnect burst: a cold one made every
++    # session read, GET /api/sessions/<id> included, wait 4-10 s on one pass under that burst. [daveey]
++    try:
++        from hermes_cli.kanban_annotation_prewarm import start_annotation_prewarm
++
++        start_annotation_prewarm()
++    except Exception:
++        logger.warning("kanban annotation prewarm did not start", exc_info=True)
++
+     # Re-adopt background jobs a previous backend's chats left running (orphans of a Desktop
+     # restart) and wake each chat when its job exits (tools/process_registry_readopt.py). [daveey]
+     from hermes_cli.process_identity import is_desktop_owned_backend
+diff --git a/tests/hermes_cli/test_kanban_annotation_prewarm.py b/tests/hermes_cli/test_kanban_annotation_prewarm.py
+new file mode 100644
+index 00000000000..3bdb2e6ddda
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_prewarm.py
+@@ -0,0 +1,71 @@
++"""Backend boot builds the session-list kanban annotation before the Desktop's first poll burst.
++
++A cold annotation made every session read, GET /api/sessions/<id> included, wait on one pass that took 4-10 s
++inside a reconnect burst on hermes-hub (t_01a18b4b710b722e). [daveey]
++"""
++
++from __future__ import annotations
++
++import threading
++
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_annotation_prewarm as prewarm
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import web_server
++from tests.hermes_cli.test_serve_unloaded_sweeper import _quiet_boot
++
++
++def test_prewarm_builds_the_annotation_snapshot(monkeypatch):
++    calls = []
++    monkeypatch.setattr(ksa, "_annotation_snapshot", lambda: calls.append("snap") or ("parts",))
++    assert prewarm.prewarm_annotation() is True
++    assert calls == ["snap"]
++
++
++def test_prewarm_never_raises(monkeypatch):
++    def boom():
++        raise RuntimeError("board unreadable")
++
++    monkeypatch.setattr(ksa, "_annotation_snapshot", boom)
++    assert prewarm.prewarm_annotation() is False
++
++
++def test_prewarm_first_reader_gets_the_warm_snapshot_without_a_second_pass(monkeypatch):
++    """The point of the prewarm: a later reader is served the published parts, it does not re-read."""
++    reads = []
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: ("prewarm-test-scope",))
++    monkeypatch.setattr(ksa, "_read_annotation_parts", lambda: reads.append(1) or ("warm",))
++    monkeypatch.setattr(ksa, "_last_annotation", {})
++    assert prewarm.prewarm_annotation() is True
++    # A reader arriving while a refresh holds the lock gets the snapshot at once instead of waiting.
++    assert ksa._annotate_refresh_lock.acquire(blocking=False)
++    try:
++        assert ksa._annotation_snapshot() == ("warm",)
++    finally:
++        ksa._annotate_refresh_lock.release()
++    assert reads == [1]
++
++
++def test_start_skips_under_test_isolation(monkeypatch):
++    monkeypatch.setenv("HERMES_TEST_ISOLATION", "1")
++    assert prewarm.start_annotation_prewarm() is None
++
++
++def test_start_runs_prewarm_on_a_daemon_thread(monkeypatch):
++    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
++    ran = threading.Event()
++    monkeypatch.setattr(prewarm, "prewarm_annotation", lambda: ran.set() or True)
++    thread = prewarm.start_annotation_prewarm()
++    assert thread is not None and thread.daemon and thread.name == "kanban-annotation-prewarm"
++    thread.join(5)
++    assert ran.is_set()
++
++
++def test_serve_lifespan_starts_the_annotation_prewarm(monkeypatch):
++    _quiet_boot(monkeypatch)
++    calls = []
++    monkeypatch.setattr(prewarm, "start_annotation_prewarm", lambda: calls.append("start"))
++    with TestClient(web_server.app, raise_server_exceptions=False):
++        pass
++    assert calls == ["start"]
+diff --git a/tests/hermes_cli/test_serve_unloaded_sweeper.py b/tests/hermes_cli/test_serve_unloaded_sweeper.py
+index e0a7c16dca1..8fc5411d2f3 100644
+--- a/tests/hermes_cli/test_serve_unloaded_sweeper.py
++++ b/tests/hermes_cli/test_serve_unloaded_sweeper.py
+@@ -11,7 +11,7 @@ import os
+ 
+ from fastapi.testclient import TestClient
+ 
+-from hermes_cli import free_tier_bootstrap, web_server
++from hermes_cli import free_tier_bootstrap, kanban_annotation_prewarm, web_server
+ from hermes_cli.local_runtime import bootstrap as local_runtime_bootstrap
+ from tools import process_registry_readopt
+ from tui_gateway import kanban_unloaded
+@@ -35,6 +35,7 @@ def _quiet_boot(monkeypatch):
+     monkeypatch.setattr(methods_groups, "start_hosted_room_service", lambda: None)
+     monkeypatch.setattr(methods_groups, "stop_hosted_room_service", lambda **_k: True)
+     monkeypatch.setattr(startup_resume, "start_startup_resume_sweep", lambda: None)
++    monkeypatch.setattr(kanban_annotation_prewarm, "start_annotation_prewarm", lambda: None)
+ 
+ 
+ def test_serve_lifespan_starts_unloaded_sweeper_without_websocket(monkeypatch):
+-- 
+2.55.0
+

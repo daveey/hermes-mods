@@ -1,12 +1,14 @@
 """Real-core transaction composition; never disable delegated mutation fences."""
 import sqlite3
 import pytest
+from core_runtime import require_isolated_core
 from test_delivery import cards
 from test_decisions import OWNER, store, request, decision
 
 
 @pytest.mark.parametrize('effect', ['approve', 'revise', 'decline'])
 def test_real_core_card_binding_comment_metadata_atomic(tmp_path, monkeypatch, effect):
+    require_isolated_core()
     kb = pytest.importorskip('hermes_cli.kanban_db')
     from agent.delegation_context import kanban_path_is_fenced
     path = tmp_path / 'kanban.db'

@@ -27,99 +27,9 @@ yet showed last_status=ok. Two gaps:
 test_managed_entry: the stale paid pin is now refused at preflight
 (blocked_config); the runtime refusal is kept under cron.preflight: false.
 ---
- cron/jobs.py                                  |  27 +++-
- cron/managed_pin.py                           |  78 +++++++++++
- cron/scheduler.py                             |   6 +
- cron/scheduler_preflight.py                   |  11 ++
- hermes_cli/cron.py                            |  14 +-
- tests/cron/test_managed_entry.py              |  26 +++-
- tests/cron/test_preflight_managed_pin.py      | 122 ++++++++++++++++++
- tests/cron/test_silent_tick_keeps_streak.py   |  77 +++++++++++
- tests/hermes_cli/test_cron_managed_pin_cli.py |  96 ++++++++++++++
- tools/cronjob_job_args.py                     |  19 +++
- tools/cronjob_tools.py                        |  11 +-
- 11 files changed, 473 insertions(+), 14 deletions(-)
- create mode 100644 cron/managed_pin.py
- create mode 100644 tests/cron/test_preflight_managed_pin.py
- create mode 100644 tests/cron/test_silent_tick_keeps_streak.py
- create mode 100644 tests/hermes_cli/test_cron_managed_pin_cli.py
-
-diff --git a/cron/jobs.py b/cron/jobs.py
-index 44aff815fa..aa1fd40488 100644
---- a/cron/jobs.py
-+++ b/cron/jobs.py
-@@ -2364,7 +2364,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
- 
- def _record_run_outcome(
-     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
--    status: Optional[str], now: str,
-+    status: Optional[str], now: str, *, agent_skipped: bool = False,
- ) -> None:
-     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
-     job["last_run_at"] = now
-@@ -2372,10 +2372,16 @@ def _record_run_outcome(
-     # The transient manual-run context is single-fire: the run that just completed consumed it.
-     job.pop("manual_run_prompt", None)
-     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
--    job["last_status"] = status or (
--        "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
--    job["last_error"] = None if success else error
--    if success:
-+    # [daveey] A gated tick (agent suppressed) keeps the last real run's verdict; only a job with
-+    # no verdict yet records it as ok.
-+    keep_verdict = agent_skipped and success and job.get("last_status") is not None
-+    if not keep_verdict:
-+        job["last_status"] = status or (
-+            "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
-+        job["last_error"] = None if success else error
-+    if keep_verdict:
-+        job.pop("last_fire_error", None)
-+    elif success:
-         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
-         # the forward-failure stamp so it only describes CURRENT auto-fire health.
-         job.pop("preflight_alerted", None)
-@@ -2391,7 +2397,8 @@ def _record_run_outcome(
-         # survives success (latest failure wins); the recency window is the consumer's
-         # call. Delivery failures keep their own sticky last_delivery_error.
-         job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
--    job["last_delivery_error"] = delivery_error
-+    if not keep_verdict:
-+        job["last_delivery_error"] = delivery_error
-     # Clear both claims: the run is over, so the job is claimable again.
-     job["fire_claim"] = None
-     job.pop("pending_slot", None)
-@@ -2462,6 +2469,7 @@ def mark_job_run(
-     ladder_rung: bool = False,
-     quota_hold_seconds: Optional[float] = None,
-     recover_consumed_fire: bool = False,
-+    agent_skipped: bool = False,
- ) -> bool:
-     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
-     and retire the record as a terminal completion when the repeat limit is reached.
-@@ -2483,6 +2491,10 @@ def mark_job_run(
-     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
-     consumed fire when the provider reopens; manual runs retain the natural schedule
-     (cron/quota_hold.py, #89376).
-+
-+    ``agent_skipped``: a gate (``wakeAgent=false`` script, unchanged monitor) suppressed the agent,
-+    so this successful tick is not evidence of agent health. ``last_status``, ``last_error``,
-+    ``failure_streak`` and ``preflight_alerted`` keep the last real run's values. [daveey]
-     """
-     def apply(jobs, _i, job):
-         if expected_fire_owner is not None:
-@@ -2493,7 +2505,8 @@ def mark_job_run(
-                     job_id)
-                 return False
-         now = _hermes_now().isoformat()
--        _record_run_outcome(job, success, error, delivery_error, status, now)
-+        _record_run_outcome(job, success, error, delivery_error, status, now,
-+                            agent_skipped=agent_skipped)
-         _advance_after_run(job, now, ladder_rung=ladder_rung)
-         from cron import quota_hold
-         from cron.unreachable_retry import clear_state, plan_retry
 diff --git a/cron/managed_pin.py b/cron/managed_pin.py
 new file mode 100644
-index 0000000000..eb939c0651
+index 0000000000000000000000000000000000000000..eb939c0651ca49f724836efbd1ea70a769ecef4d
 --- /dev/null
 +++ b/cron/managed_pin.py
 @@ -0,0 +1,78 @@
@@ -201,42 +111,11 @@ index 0000000000..eb939c0651
 +def load_config() -> dict:
 +    from hermes_cli.config_effective import load_user_config_effective
 +    return load_user_config_effective()
-diff --git a/cron/scheduler.py b/cron/scheduler.py
-index 723998727e..58ef464352 100644
---- a/cron/scheduler.py
-+++ b/cron/scheduler.py
-@@ -1599,6 +1599,7 @@ def _apply_monitor_gate(
-     if not _mon.changed:
-         # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
-         logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
-+        job["_agent_skipped"] = True  # [daveey] not an agent run: mark_job_run keeps the last real outcome
-         return (
-             True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None,
-         ), extra_prompt, None
-@@ -2428,6 +2429,7 @@ def _prepare_job_prompt(
-         if _ran_ok and not _parse_wake_gate(_script_output):
-             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
-             note_cron_skipped(job)
-+            job["_agent_skipped"] = True  # [daveey] not an agent run: mark_job_run keeps the last real outcome
-             silent_doc = (
-                 f"# Cron Job: {job_name}\n\n"
-                 f"**Job ID:** {job_id}\n"
-@@ -3336,6 +3338,10 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
-         mark_kwargs["expected_fire_owner"] = fire_owner
-     if d.blocked_config:
-         mark_kwargs["status"] = "blocked_config"
-+    if job.pop("_agent_skipped", False) and d.success:
-+        # [daveey] A gate tick (wakeAgent=false / unchanged monitor) says nothing about agent health:
-+        # resetting the streak and alert marker here hid a job whose every woken run failed.
-+        mark_kwargs["agent_skipped"] = True
-     # A run that removed its own record has nothing left to mark; the delivery above is its result.
-     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
-         job["id"], d.success, d.error, **mark_kwargs)
 diff --git a/cron/scheduler_preflight.py b/cron/scheduler_preflight.py
-index e58ad3b15b..bf3e132bf6 100644
+index b731fc43006f4e6a76ce4cab7cb380c0f98a4e5f..5bad748296fd7a95ddfd69cabfd31909bf602544 100644
 --- a/cron/scheduler_preflight.py
 +++ b/cron/scheduler_preflight.py
-@@ -387,6 +387,14 @@ def _empty_requested_mcp_toolsets(job: dict, cfg: dict) -> Optional[str]:
+@@ -401,6 +401,14 @@ def _empty_requested_mcp_toolsets(job: dict, cfg: dict) -> Optional[str]:
          "the job's toolsets.")
  
  
@@ -251,7 +130,7 @@ index e58ad3b15b..bf3e132bf6 100644
  def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
      """Pre-dispatch validation: return a reason (missing key, unconfigured delivery, unready skill)
      so the caller refuses BEFORE building agent machinery or burning an LLM call. Every check fails
-@@ -396,6 +404,9 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+@@ -410,6 +418,9 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
      follows the alert-once pattern from the dead-pin auto-pause (#73506).
      """
      for name, check in (
@@ -262,10 +141,10 @@ index e58ad3b15b..bf3e132bf6 100644
          ("skills", lambda: _preflight_check_skills(job)),
          ("delivery", lambda: _preflight_check_delivery(job))):
 diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
-index 6e134b35cf..245b7d7771 100644
+index bccabd1c0dcdcd30dcbb56d86d919868bfd8fa14..563534fbaf45a8d39b4515399e996803cd950e5a 100644
 --- a/hermes_cli/cron.py
 +++ b/hermes_cli/cron.py
-@@ -695,8 +695,14 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
+@@ -700,8 +700,14 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
      return f"next_run_at is {amount} overdue — job is not firing (is the scheduler running?)"
  
  
@@ -281,7 +160,7 @@ index 6e134b35cf..245b7d7771 100644
      last_status = str(job.get("last_status") or "").strip().lower()
      # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
      if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
-@@ -736,7 +742,11 @@ def cron_doctor() -> int:
+@@ -755,7 +761,11 @@ def cron_doctor() -> int:
      """Run read-only cron health checks and return a shell-friendly status."""
      from cron.jobs import list_jobs
      jobs = list_jobs(include_disabled=False)
@@ -295,7 +174,7 @@ index 6e134b35cf..245b7d7771 100644
          print(color("✓ Cron doctor found no issues", Colors.GREEN))
          note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."
 diff --git a/tests/cron/test_managed_entry.py b/tests/cron/test_managed_entry.py
-index dc6744687d..faff7e4d7b 100644
+index dc6744687de40b401f8385a00b6fb96b19f53f68..faff7e4d7b3a879bdce74e6161135a2efab9fc9b 100644
 --- a/tests/cron/test_managed_entry.py
 +++ b/tests/cron/test_managed_entry.py
 @@ -8,7 +8,7 @@ routing_home = fixtures.routing_home
@@ -337,7 +216,7 @@ index dc6744687d..faff7e4d7b 100644
 +    send.assert_not_called()
 diff --git a/tests/cron/test_preflight_managed_pin.py b/tests/cron/test_preflight_managed_pin.py
 new file mode 100644
-index 0000000000..da74bdd4d5
+index 0000000000000000000000000000000000000000..da74bdd4d53611719cdfad6b6e19a4023ae121f7
 --- /dev/null
 +++ b/tests/cron/test_preflight_managed_pin.py
 @@ -0,0 +1,122 @@
@@ -465,7 +344,7 @@ index 0000000000..da74bdd4d5
 +    assert "claude-sonnet-5-5" in deliveries[0]
 diff --git a/tests/cron/test_silent_tick_keeps_streak.py b/tests/cron/test_silent_tick_keeps_streak.py
 new file mode 100644
-index 0000000000..70e239d65c
+index 0000000000000000000000000000000000000000..70e239d65c76503e40c522d6fab746e598c47300
 --- /dev/null
 +++ b/tests/cron/test_silent_tick_keeps_streak.py
 @@ -0,0 +1,77 @@
@@ -548,7 +427,7 @@ index 0000000000..70e239d65c
 +        assert int(stored.get("failure_streak") or 0) == 0
 diff --git a/tests/hermes_cli/test_cron_managed_pin_cli.py b/tests/hermes_cli/test_cron_managed_pin_cli.py
 new file mode 100644
-index 0000000000..54cd4109d7
+index 0000000000000000000000000000000000000000..54cd4109d7461a472b006b875e9f6ddcc3326be3
 --- /dev/null
 +++ b/tests/hermes_cli/test_cron_managed_pin_cli.py
 @@ -0,0 +1,96 @@
@@ -649,7 +528,7 @@ index 0000000000..54cd4109d7
 +    assert "claude-sonnet-5-5" in out
 +    assert good["id"] not in out
 diff --git a/tools/cronjob_job_args.py b/tools/cronjob_job_args.py
-index 046995c2a6..e33d9de66b 100644
+index 046995c2a6429ac9ef0e55861ab878667b81b24b..e33d9de66b4b160c0735e1aa6940de3d1e6ee0a5 100644
 --- a/tools/cronjob_job_args.py
 +++ b/tools/cronjob_job_args.py
 @@ -413,6 +413,25 @@ def _validate_cron_base_url(
@@ -679,7 +558,7 @@ index 046995c2a6..e33d9de66b 100644
      """Scripts must be relative paths within HERMES_HOME/scripts/ (absolute / ~ / drive-letter
      rejected — prompt-injection guard). Error string if blocked, else None; empty = clear."""
 diff --git a/tools/cronjob_tools.py b/tools/cronjob_tools.py
-index fcf41ec19f..57d0e0f91c 100644
+index c98773c49acf1f5dc4ed29fba6a21604a83e3d72..256932cfba0a1fcb2ecdb74fb1d1e835fa56e86c 100644
 --- a/tools/cronjob_tools.py
 +++ b/tools/cronjob_tools.py
 @@ -63,7 +63,8 @@ from tools.cronjob_job_args import (
@@ -692,7 +571,7 @@ index fcf41ec19f..57d0e0f91c 100644
  from tools.registry import registry, tool_error
  
  
-@@ -678,6 +679,8 @@ def _action_create(a: dict[str, Any]) -> str:
+@@ -712,6 +713,8 @@ def _action_create(a: dict[str, Any]) -> str:
          # A model-supplied base_url must not route a named provider's stored credential
          # to an attacker endpoint.
          or _validate_cron_base_url(a["provider"], a["base_url"])
@@ -701,7 +580,7 @@ index fcf41ec19f..57d0e0f91c 100644
          # bot-chat targets are machine-local: fail the CREATE, not the run.
          or _validate_bot_chat_deliver(deliver)
          # failure_deliver shares deliver's grammar and validators.
-@@ -864,6 +867,12 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
+@@ -900,6 +903,12 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
          updates["model"] = _normalize_optional_job_value(a["model"])
      if a["provider"] is not None:
          updates["provider"] = _normalize_optional_job_value(a["provider"])

@@ -47,6 +47,10 @@ ACTIONS: Dict[str, Dict[str, Dict[str, bool]]] = {
 }
 # Args kept verbatim (an empty string is a value, not a missing arg).
 RAW_ARGS = ("input", "icon", "color")
+# The owner gateway decodes a task key as <profile>/<board>/<id> only (hermes_hub.decode_task_key, never old
+# <board>/<id> aliases) and answers any other shape with invalid_task_route, but only after the request was queued
+# and sent, where the caller no longer looks. validate() refuses those shapes up front instead.
+TASK_KEYS = "task keys are <profile>/<board>/<id> (create: <profile>/<board>/new or <board>/new)"
 
 
 def _now() -> float:
@@ -651,9 +655,19 @@ def validate(body: Dict[str, Any], own_gateway: Optional[str], known: Iterable[s
         raise RequestError(400, "%s supports %s, not %r" % (coll, ", ".join(ACTIONS[coll]), action))
     a, _, b = key.partition("/")
     if not a or not b or ".." in key:
-        raise RequestError(400, "key must be <profile-or-board>/<id>")
-    if coll == "tasks" and (action == "create") != (b == "new"):
-        raise RequestError(400, "tasks create uses key <board>/new; other task actions need a task id")
+        raise RequestError(400, TASK_KEYS if coll == "tasks" else "key must be <profile-or-board>/<id>")
+    if coll == "tasks" and action == "create":
+        parts = key.split("/")
+        if parts[-1] != "new" or len(parts) not in (2, 3) or not all(parts):
+            raise RequestError(400, "tasks create uses key <profile>/<board>/new (or <board>/new); "
+                                    "other task actions need a task id")
+        if len(parts) == 2:  # the owner gateway decodes <profile>/<board>/new only
+            key = "default/" + key
+    elif coll == "tasks" and b == "new":
+        raise RequestError(400, "tasks create uses key <profile>/<board>/new (or <board>/new); "
+                                "other task actions need a task id")
+    elif coll == "tasks" and (len(key.split("/")) != 3 or not all(key.split("/"))):
+        raise RequestError(400, "%s, not %r" % (TASK_KEYS, key))
     clean = {}
     for k, req in spec.items():
         v = args.get(k)

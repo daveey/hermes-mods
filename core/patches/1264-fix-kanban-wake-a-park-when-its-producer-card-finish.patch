@@ -1,0 +1,392 @@
+From 87478c15edf0d37cb6d60dcdf88fc7473f67a722 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:06:08 +0000
+Subject: [PATCH] fix(kanban): wake a park when its producer card finishes even
+ if its wake_check can't see it [daveey]
+
+MacBook t_01a17ec75ca4f9f6 parked on hub card t_01a18cb13e96c856 with its own probe
+`hermes kanban show ... 2>/dev/null | grep done`. show reads only this host's board, so the probe
+exited a clean 1 for 18 h after the producer completed.
+
+On every clean "not yet" the wake-check runner now re-checks the producer card the park's awaiting
+record names: local refs on this board, remote refs via kanban_wait_check.check_remote (outside any
+write txn, at most once per 15 min per (gateway, ref, board); rc 2/3 never wake). done/archived wakes the
+card once with wake_probe_stale reason=producer_finished and a kanban-dispatcher comment; review and
+blocked never wake (met-set states a tracker re-parks on with --from). A probe that already runs
+wait-check on that card is not second-guessed.
+
+The wake_check description now says show/list read only this host's board, names the cross-gateway
+wait-check probe, and says to add --from <status> when the card already sits blocked/review/triage.
+---
+ hermes_cli/kanban_wake_check.py               | 129 +++++++++++++-
+ .../test_kanban_park_producer_finished.py     | 164 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |   6 +-
+ 3 files changed, 295 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_park_producer_finished.py
+
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 3b1e231996a..85791f40737 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -30,6 +30,7 @@ waited on was already true (t_9be6b361). [daveey]
+ """
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import os
+ import re
+@@ -599,6 +600,108 @@ def _probe_diagnostics(cwd: str, env: dict) -> dict:
+             "path_head": [p for p in (env.get("PATH") or "").split(os.pathsep)[:3]]}
+ 
+ 
++# [daveey] A park's own probe can be blind to its producer: MacBook t_01a17ec75ca4f9f6 probed a hub card with
++# `hermes kanban show` (this host's board only) and read a clean "not yet" for 18 h after the card was done. On
++# every "not yet" the runner re-checks the producer card the park's ``awaiting`` names. A remote check is ssh, so
++# it runs at most once per PRODUCER_RECHECK_SECONDS per (gateway, ref, board), across ticks and parks.
++PRODUCER_RECHECK_SECONDS = 15 * 60
++PRODUCER_FINISHED = "producer_finished"
++_FINISHED_STATUSES = ("done", "archived")
++_PRODUCER_CHECKED: dict[tuple[str, str, Optional[str]], tuple[float, int, str]] = {}
++
++
++def _remote_producer(gateway: str, ref: str, board: Optional[str]) -> tuple[int, str]:
++    """``check_remote`` for a producer card, rate-limited. Never raises (rc 2 = cannot tell)."""
++    from hermes_cli import kanban_wait_check as kwait
++
++    key = (gateway, ref, board)
++    with _LOCK:
++        seen = _PRODUCER_CHECKED.get(key)
++    if seen and time.monotonic() - seen[0] < PRODUCER_RECHECK_SECONDS:
++        return seen[1], seen[2]
++    try:
++        rc, out = kwait.check_remote(gateway, "task", ref, board=board)
++    except Exception as exc:  # cannot tell: never a wake
++        logger.debug("producer re-check of %s on %s failed", ref, gateway, exc_info=True)
++        rc, out = 2, f"error: {exc}"
++    with _LOCK:
++        _PRODUCER_CHECKED[key] = (time.monotonic(), rc, out)
++    return rc, out
++
++
++def _remote_completed_at(gateway: str, ref: str, board: Optional[str]) -> Optional[int]:
++    """The remote card's ``completed_at`` from this host's hermes-hub replica, when it has one. Best effort."""
++    try:
++        from hermes_cli.kanban_wait_replica import StaleReplica, read_task
++        try:
++            task = read_task(gateway, ref, board=board)
++        except StaleReplica as exc:
++            task = exc.task
++        value = task.get("completed_at")
++        return int(value) if value else None
++    except Exception:
++        logger.debug("replica completed_at for %s on %s unreadable", ref, gateway, exc_info=True)
++        return None
++
++
++def finished_producer(conn: sqlite3.Connection, task_id: str, cmd: str) -> Optional[dict]:
++    """The producer card this park's ``awaiting`` names, when it is done or archived although the park's probe
++    still exits 1; else None. A remote ref is read over ssh: call this outside any write txn. Each ref wakes a
++    card once (a ref already reported by a ``wake_probe_stale`` event on this card is skipped)."""
++    from hermes_cli.kanban_awaiting import _TASK_ID, _latest_park
++    from hermes_cli.kanban_comment_origin import WAKE_PROBE_STALE_EVENT
++
++    try:
++        awaiting, _reason = _latest_park(conn, task_id)
++        if not isinstance(awaiting, dict) or awaiting.get("kind") != "card":
++            return None
++        ref = str(awaiting.get("ref") or "")
++        if not _TASK_ID.fullmatch(ref) or ref == task_id:
++            return None
++        gateway = awaiting.get("gateway") or None
++        board = awaiting.get("board") or None
++        if gateway and "wait-check" in (cmd or "") and ref in (cmd or ""):
++            return None  # the probe already reads that card over the same path
++        for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                                       (task_id, WAKE_PROBE_STALE_EVENT)):
++            try:
++                if json.loads(payload or "{}").get("ref") == ref:
++                    return None
++            except (ValueError, AttributeError):
++                continue
++        if gateway:
++            rc, out = _remote_producer(str(gateway), ref, board)
++            if rc not in (0, 1):  # 2 cannot tell, 3 gateway offline (stale replica): unknown, never a wake
++                return None
++            words = out.split()
++            status = words[1] if len(words) >= 2 and words[0] == ref else ""
++            completed = _remote_completed_at(str(gateway), ref, board) if status in _FINISHED_STATUSES else None
++        else:
++            row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?", (ref,)).fetchone()
++            if row is None:
++                return None
++            status, completed = row[0], row[1]
++        if status not in _FINISHED_STATUSES:
++            return None  # review/blocked are a tracker's handled states, as in confirm_remote: never a wake
++        when = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(completed))) if completed
++                else "at an unrecorded time")
++        return {"ref": ref, "gateway": gateway, "board": board, "producer_status": status, "completed_at": when}
++    except Exception:
++        logger.debug("producer re-check for %s failed", task_id, exc_info=True)
++        return None
++
++
++def producer_note(hit: dict) -> str:
++    ref, gw = hit["ref"], hit.get("gateway")
++    where = gw or "this board"
++    return (f"Woken: producer card {ref} on {where} is {hit['producer_status']} (completed {hit['completed_at']}), but this park's "
++            f"wake_check still exits 1, so it can't see that card (`hermes kanban show` reads only this host's "
++            f"board). Read {ref}'s result and act on it. To wait on a card on another gateway, use "
++            f"`hermes kanban wait-check task {ref} --gateway {gw or '<gw>'}`, or omit wake_check: a card wait gets "
++            "that probe automatically. If that card is already blocked, in review or in triage, add "
++            "`--from <that status>`. Those statuses count as met, so without it the probe passes at once.")
++
++
+ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str) -> Any:
+     key = (db_path, task_id)
+     try:
+@@ -619,8 +722,13 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+                 # the probe cannot see the reply (t_01a17f81686694ec, 38 h). wake_probe_stale wakes it once.
+                 from hermes_cli.kanban_comment_origin import answered_request
+                 answered = answered_request(conn, task_id, cmd)
++            producer = None
++            if rc == 1 and not output_error(out) and not answered:
++                # [daveey] Same failure, another producer: the card this park awaits is done but the probe can't
++                # see it (a `hermes kanban show` of another gateway's card). No write txn is open here (ssh).
++                producer = finished_producer(conn, task_id, cmd)
+             apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
+-                         answered=answered)
++                         answered=answered, producer=producer)
+         finally:
+             conn.close()
+         return rc
+@@ -631,7 +739,8 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+ 
+ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str,
+                  *, generation: str, now: Optional[int] = None,
+-                 diagnostics: Optional[dict] = None, answered: Optional[dict] = None) -> Optional[str]:
++                 diagnostics: Optional[dict] = None, answered: Optional[dict] = None,
++                 producer: Optional[dict] = None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -658,6 +767,17 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             if woke:
+                 kb.add_comment(conn, task_id, "kanban-dispatcher", note)
+             return woke
++        if rc == 1 and not output_error(out) and producer:
++            from hermes_cli.kanban_comment_origin import WAKE_PROBE_STALE_EVENT
++            note = producer_note(producer)
++            woke = _wake(conn, task_id, WAKE_PROBE_STALE_EVENT, {
++                "reason": PRODUCER_FINISHED, "wake_check": cmd, "output": tail, "ref": producer["ref"],
++                "gateway": producer.get("gateway"), "board": producer.get("board"),
++                "producer_status": producer["producer_status"], "completed_at": producer["completed_at"],
++                "note": note})
++            if woke:
++                kb.add_comment(conn, task_id, "kanban-dispatcher", note)
++            return woke
+         if rc == 1 and not output_error(out):
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+@@ -814,7 +934,10 @@ def _render_wake_context(conn: sqlite3.Connection, task_id: str) -> str:
+         "ORDER BY id DESC LIMIT 1", (task_id, *kinds)).fetchone()
+     if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT):
+         payload = kb._json_dict(row[1])
+-        if row[0] == WAKE_PROBE_STALE_EVENT:
++        if row[0] == WAKE_PROBE_STALE_EVENT and payload.get("reason") == PRODUCER_FINISHED:
++            lines.append("## Woken because the awaited producer card finished but the wake check missed it")
++            lines.append(f"{payload.get('note')} Last output:")
++        elif row[0] == WAKE_PROBE_STALE_EVENT:
+             lines.append("## Woken because the awaited reply arrived but the wake check missed it")
+             lines.append(f"{payload.get('note')} Last output:")
+         elif row[0] == CONDITION_MET_EVENT:
+diff --git a/tests/hermes_cli/test_kanban_park_producer_finished.py b/tests/hermes_cli/test_kanban_park_producer_finished.py
+new file mode 100644
+index 00000000000..dd3bd881b17
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_park_producer_finished.py
+@@ -0,0 +1,164 @@
++"""A park wakes when its producer card finishes, even if its own wake_check cannot see that card. [daveey]
++
++MacBook t_01a17ec75ca4f9f6 parked on 10-30 with ``awaiting={kind:'card', ref:'t_01a18cb13e96c856', gateway:'hub'}``
++and its own probe ``test -n "$(hermes kanban show t_01a18cb13e96c856 2>/dev/null | grep -i 'status.*done')"``.
++``hermes kanban show`` reads only this host's board, where the hub card does not exist, so the probe exited a clean
++1 ("not yet") at every check after the hub card completed. The card would have slept 18 h until its timer.
++
++The wake-check runner now re-checks the declared producer card whenever the probe says "not yet":
++- remote (gateway set): ``kanban_wait_check.check_remote``, at most once per 15 min per (gateway, ref);
++  rc 3 (gateway offline) is unknown and never wakes;
++- local: the ref's status on this board;
++- ``done``/``archived`` wakes the card once (``wake_probe_stale``, reason ``producer_finished``) with a
++  ``kanban-dispatcher`` comment; ``running``/``review``/``blocked`` keep it parked.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wait_check as kwait
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_awaiting as _awaiting_tests
++from tests.hermes_cli.test_kanban_awaiting import _as_worker, _running, _tool
++
++kanban_home = _awaiting_tests.kanban_home  # the shared fixture (HERMES_HOME, board, dry run off)
++
++REMOTE = "t_01a18cb13e96c856"
++
++
++@pytest.fixture(autouse=True)
++def _fresh_producer_cache():
++    cache = getattr(kwc, "_PRODUCER_CHECKED", {})
++    cache.clear()
++    yield
++    cache.clear()
++
++
++class FakeRemote:
++    """``check_remote`` stand-in: the remote card's status (or an rc-3 offline answer), and a call count."""
++
++    def __init__(self, status: str = "running", rc: int | None = None):
++        self.status, self.rc, self.calls = status, rc, []
++
++    def __call__(self, gateway, kind, target, *, board=None, until=kwait.DEFAULT_UNTIL, since=()):
++        self.calls.append((gateway, kind, target, board))
++        if self.rc is not None:
++            return self.rc, f"{target} running (stale replica: hub offline 3600s)"
++        if self.status in until:
++            return 0, f"{target} {self.status}"
++        return 1, f"{target} {self.status}"
++
++
++def _park_remote(monkeypatch, conn, fake: FakeRemote) -> str:
++    monkeypatch.setattr(kwait, "check_remote", fake)
++    tid = _running(conn)
++    _as_worker(monkeypatch, conn, tid)
++    out = _tool("schedule", {"reason": f"waiting for the hub study {REMOTE}", "wake_check": "exit 1",
++                             "check_every": 300, "awaiting": {"kind": "card", "ref": REMOTE, "gateway": "hub"}})
++    assert out.get("status") == "scheduled", out
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    fake.calls.clear()  # the park-time confirmation is not a runner call
++    return tid
++
++
++def _stale_events(conn, tid):
++    return [e for e in kb.list_events(conn, tid) if e.kind == "wake_probe_stale"]
++
++
++def _assert_woken(conn, tid, ref, gateway_word):
++    assert kb.get_task(conn, tid).status == "ready"
++    ev = _stale_events(conn, tid)
++    assert len(ev) == 1, ev
++    p = ev[0].payload
++    assert p["reason"] == "producer_finished" and p["ref"] == ref and p["producer_status"] == "done", p
++    assert "completed_at" in p
++    note = [c for c in kb.list_comments(conn, tid) if c.author == "kanban-dispatcher"][-1].body
++    assert f"Woken: producer card {ref} on {gateway_word} is done" in note, note
++    assert "hermes kanban show` reads only this host's board" in note, note
++    assert f"hermes kanban wait-check task {ref} --gateway" in note, note
++    assert "add `--from <that status>`. Those statuses count as met" in note, note
++    ctx = kwc.render_wake_context(conn, tid)
++    assert "producer card" in ctx and ref in ctx, ctx
++
++
++def test_remote_done_producer_wakes_a_park_whose_probe_cannot_see_it(kanban_home, monkeypatch) -> None:
++    fake = FakeRemote("running")
++    with kbc.connect_closing() as conn:
++        tid = _park_remote(monkeypatch, conn, fake)
++        fake.status = "done"
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 600, wait=True)
++        assert fake.calls == [("hub", "task", REMOTE, None)]
++        _assert_woken(conn, tid, REMOTE, "hub")
++        assert _stale_events(conn, tid)[0].payload["gateway"] == "hub"
++
++
++@pytest.mark.parametrize("status,rc", [("running", None), ("review", None), ("blocked", None), ("done", 3)])
++def test_remote_producer_not_finished_or_unknown_keeps_the_park(kanban_home, monkeypatch, status, rc) -> None:
++    fake = FakeRemote("running")
++    with kbc.connect_closing() as conn:
++        tid = _park_remote(monkeypatch, conn, fake)
++        fake.status, fake.rc = status, rc
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 600, wait=True)
++        assert len(fake.calls) == 1
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert not _stale_events(conn, tid)
++        assert kwc.get_state(conn, tid)["last_rc"] == 1
++
++
++def test_remote_producer_is_checked_at_most_once_per_15_minutes(kanban_home, monkeypatch) -> None:
++    fake = FakeRemote("running")
++    with kbc.connect_closing() as conn:
++        tid = _park_remote(monkeypatch, conn, fake)
++        t0 = int(time.time())
++        kwc.run_due_wake_checks(conn, now=t0 + 600, wait=True)
++        kwc.run_due_wake_checks(conn, now=t0 + 1200, wait=True)  # the probe is due again (check_every 300)
++        assert kwc.get_state(conn, tid)["last_at"] == t0 + 1200  # the second pass really ran the probe
++        assert len(fake.calls) == 1, fake.calls
++        assert kb.get_task(conn, tid).status == "scheduled"
++
++
++def test_local_producer_completed_after_the_park_wakes_it(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        producer = _running(conn)
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": f"waiting for {producer}", "wake_check": "exit 1", "check_every": 300,
++                                 "awaiting": {"kind": "card", "ref": producer}})
++        assert out.get("status") == "scheduled", out
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 600, wait=True)
++        assert kb.get_task(conn, tid).status == "scheduled"  # producer still running
++        assert kb.complete_task(conn, producer, summary="study finished")
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 1200, wait=True)
++        _assert_woken(conn, tid, producer, "this board")
++        assert _stale_events(conn, tid)[0].payload["gateway"] is None
++        assert _stale_events(conn, tid)[0].payload["completed_at"].startswith("20")
++
++
++def test_wake_check_description_says_show_reads_only_this_board() -> None:
++    from tools import kanban_tools_schemas as kts
++
++    desc = kts._WAKE_CHECK_PROPS["wake_check"]["description"]
++    assert "`hermes kanban show`/`list` read only this host's board." in desc
++    assert "use `hermes kanban wait-check task <id> --gateway <gw>`, or omit wake_check" in desc
++    # The met set includes blocked/review/triage: an unchanged one needs --from (t_01a17ec75ca4f9f6 woke in 8 s).
++    assert "If that card is already blocked, in review or in triage, add `--from <that status>`." in desc
++    assert "without it the probe passes at once" in desc
++
++
++def test_a_wait_check_probe_on_the_same_card_is_not_second_guessed(kanban_home, monkeypatch) -> None:
++    """Root t_01a17ec75ca4f9f6, 10-30 14:02 UTC: its producer sat blocked on a spend decision, so the default
++    wait-check (met set includes blocked) woke it in 8 s; the operator re-parked with ``--from blocked``, which exits
++    1 while the card stays blocked. The producer re-check must leave that probe alone (no extra ssh, no wake)."""
++    fake = FakeRemote("blocked")
++    with kbc.connect_closing() as conn:
++        tid = _park_remote(monkeypatch, conn, fake)
++        probe = f"hermes kanban wait-check task {REMOTE} --gateway hub --from blocked"
++        assert kwc.finished_producer(conn, tid, probe) is None
++        fake.status = "done"  # even done: that probe reads the card itself and exits 0 on its own
++        assert kwc.finished_producer(conn, tid, probe) is None
++        assert fake.calls == []
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index f8b4643ae52..1d0de50df1d 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -196,7 +196,11 @@ _WAKE_CHECK_PROPS = {
+         "one that names no card or CI run is refused (opaque_probe_wait) unless `awaiting` says who "
+         "will make it pass. Never filter task_comments by author (refused: author_probe; a relayed "
+         "reply's author is 'hub:gw:<gateway>'): wait for a reply with `hermes kanban wait-comment <task> "
+-        "--after-id <last id> --from-gateway <gw>`. A wait on another card on "
++        "--after-id <last id> --from-gateway <gw>`. `hermes kanban show`/`list` read only this host's "
++        "board. For a card on another gateway, use `hermes kanban wait-check task <id> --gateway <gw>`, "
++        "or omit wake_check (a card wait gets that probe automatically). If that card is already "
++        "blocked, in review or in triage, add `--from <that status>`. Those statuses count as met, so "
++        "without it the probe passes at once. A wait on another card on "
+         "this board is a parent link (kanban_link), not a park. On a park with blocker_id the "
+         "check must test only the wall: its exit 0 clears the shared blocker and wakes every "
+         "card behind it, so never OR it with unrelated probes (Slack, other cards). A check "
+-- 
+2.55.0
+

@@ -46,7 +46,7 @@ def test_processes_attribute_owner_through_the_parent_chain(c):
     assert top[211]["root"] == "hermes gateway run"
     assert top[300]["owner"] == "" and top[300]["name"] == "WindowServer"
     assert top[400]["name"] == "BB Pod" and top[400]["owner"] == "card:t_dead0001"  # orphaned directly under launchd
-    assert dict(out["young_by_name"])["gh"] == 2
+    assert {r["name"]: r["count"] for r in out["young_by_name"]}["gh"] == 2
 
 
 def test_kill_only_a_finished_cards_leftover(c):

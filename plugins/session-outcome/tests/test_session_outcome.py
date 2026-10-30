@@ -263,9 +263,9 @@ def test_judge_sees_the_users_latest_request(plugin, home):
     # questions) "a question", and said NO. Synthetic user rows (kanban notices, auto-continue, this plugin's own
     # nudge) are not the request.
     _messages(home, [("S1", "user", "old ask", None),
+                     ("S1", "user", "Kanban card t_0 finished", "kanban_notice"),
                      ("S1", "user", "what questions should i ask to vet an earthquake model", None),
                      ("S1", "assistant", "Ask about the ETAS baseline...", None),
-                     ("S1", "user", "Kanban card t_1 finished", "kanban_notice"),
                      ("S1", "user", "continue", "auto_continue"),
                      ("S1", "user", plugin.NUDGE, None)])
     seen = []
@@ -275,6 +275,22 @@ def test_judge_sees_the_users_latest_request(plugin, home):
     assert sent == ("<request>\nwhat questions should i ask to vet an earthquake model\n</request>\n\n"
                     "<message>\n1. What does ETAS score on the same test set?\n</message>")
     assert "<request>" in system and "<message>" in system
+
+
+def test_judge_request_is_the_kanban_notice_that_started_the_turn(plugin, home):
+    # A done notice woke a chat whose last typed message was an already-answered question from days before. Judged
+    # against that question, the finished report got NO every time and the chat flipped to unresolved{no_summary}.
+    _messages(home, [("S1", "user", "why does the worker need mac access?", None),
+                     ("S1", "assistant", "It doesn't any more...", None),
+                     ("S1", "user", "Kanban t_1 done: verified the reply drafts live", "kanban_notice"),
+                     ("S1", "user", "continue", "auto_continue"),
+                     ("S1", "user", plugin.NUDGE, None)])
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    assert plugin.judge("S1", "The final live check passed; nothing was sent.") is True
+    assert seen[-1] == ("<request>\n" + plugin.NOTICE_PREFIX + "Kanban t_1 done: verified the reply drafts live\n"
+                        "</request>\n\n<message>\nThe final live check passed; nothing was sent.\n</message>")
+    assert "why does the worker" not in seen[-1]
 
 
 def test_judge_request_is_capped_and_missing_rows_send_message_only(plugin, home):
@@ -372,14 +388,128 @@ def test_call_flag_is_per_turn(plugin, fake):
     assert gate(plugin, sid="T1", platform="tui", msgs=[{"role": "tool", "tool_call_id": "call_A"}])["hold"]
 
 
-def test_gate_passes_summary_and_undecided_judge_uses_heuristic(plugin, fake):
+def _notice_turn_after_declared_turn(plugin, earlier_rows):
+    """Core's turn_messages() starts at the last TYPED user row, so a turn a kanban notice started also carries
+    every earlier turn back to that message (hub 20261030_043755_29ecb6: rows 401771-401797, then notice 402180)."""
+    return [
+        {"role": "user", "content": "stop the restart messages"},
+        *earlier_rows,
+        {"role": "assistant", "content": "Both bots stopped sending restart messages."},
+        {"role": "user", "content": "✔ Kanban t_x done — fixed", "display_kind": "kanban_notice"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_N", "function": {"name": "cross_task"}}]},
+        {"role": "tool", "tool_call_id": "call_N", "tool_name": "cross_task", "content": "{}"},
+    ]
+
+
+def test_gate_ignores_an_earlier_turns_call_in_a_notice_started_turn(plugin):
+    """The previous turn's session_outcome call must not count for the turn a notice started: that left the
+    notice turn's reply undeclared and unasked, and the judge's NO made it unresolved{no_summary}."""
+    msgs = _notice_turn_after_declared_turn(plugin, [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_D", "function": {"name": "session_outcome"}}]},
+        {"role": "tool", "tool_call_id": "call_D", "tool_name": "session_outcome", "content": "{\"ok\": true}"},
+    ])
+    out = gate(plugin, reply="The crash is fixed; one related card is still open.", msgs=msgs)
+    assert out and out["hold"] and plugin.TAG in out["nudge"]
+    # a call made inside the notice turn still counts
+    msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": "call_E",
+                                                                       "function": {"name": "session_outcome"}}]})
+    plugin._ASKED.clear()
+    assert gate(plugin, reply="The crash is fixed.", msgs=msgs) is None
+
+
+def test_gate_ignores_an_earlier_turns_call_id_in_a_notice_started_turn(plugin):
+    out = json.loads(plugin.handle({"kind": "done", "summary": "ok"}, session_id="S1", tool_call_id="call_D"))
+    assert out["declared"]
+    msgs = _notice_turn_after_declared_turn(plugin, [{"role": "tool", "tool_call_id": "call_D", "content": "{}"}])
+    assert gate(plugin, reply="The crash is fixed; one related card is still open.", msgs=msgs)["hold"]
+
+
+def test_gate_ignores_an_earlier_turns_nudge_in_a_notice_started_turn(plugin):
+    """An earlier turn's nudge is not 'asked this turn': the notice turn is still asked once."""
+    msgs = _notice_turn_after_declared_turn(plugin, [{"role": "user", "content": plugin.NUDGE,
+                                                      "_pre_final_gate_synthetic": True}])
+    out = gate(plugin, reply="The crash is fixed; one related card is still open.", msgs=msgs)
+    assert out and out["hold"]
+    # the nudge inside this turn still stops a loop
+    msgs.append({"role": "user", "content": out["nudge"], "_pre_final_gate_synthetic": True})
+    assert gate(plugin, reply="The crash is fixed.", msgs=msgs, attempt=1) is None
+
+
+def test_gate_passes_judged_summary(plugin, fake):
     plugin._llm = lambda s, u: "YES"
     assert gate(plugin, reply="Merged #12 and deployed; health check green.") is None
     assert fake.derive_calls[-1] == {"sid": "S1", "ignore_live_turn": True,
                                      "pending_reply": "Merged #12 and deployed; health check green."}
-    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
-    assert gate(plugin, reply="Rebased, fixed both failing tests and pushed; CI is green.") is None
+
+
+def test_gate_holds_when_judge_gives_up_and_only_heuristic_says_done(plugin, fake):
+    """A judge that fails in the serving process left the heuristic's `done`; a later refresh whose judge worked
+    said NO and the chat flipped to unresolved{no_summary} with nobody asked (hub 20261030_014232_cc881a). The
+    gate asks for the call instead: the declared outcome wins over any later judge."""
+    reply = "Rebased, fixed both failing tests and pushed; CI is green."
+    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("No eligible fast routes"))
+    first = gate(plugin, reply=reply)
+    assert first and first["hold"] and plugin.TAG in first["nudge"]
+    # never loops: the second miss passes
+    assert gate(plugin, reply=reply, attempt=1) is None
+    plugin._ASKED.clear()
+    # an unclear answer (cached as None) also counts as giving up, on the first call and on a cache hit
+    plugin._llm = lambda s, u: "maybe"
+    assert gate(plugin, reply="Different finished report, all green.")["hold"]
+    plugin._ASKED.clear()
+    assert gate(plugin, reply="Different finished report, all green.")["hold"]
+    plugin._ASKED.clear()
+    # the heuristic's NO still holds as before
     assert gate(plugin, reply="Hmm?")["hold"]
+
+
+def test_gate_judge_gets_longer_budget_and_timeout_holds(plugin, fake, monkeypatch):
+    monkeypatch.setattr(plugin, "JUDGE_BUDGET_S", 0.1)
+    monkeypatch.setattr(plugin, "GATE_JUDGE_BUDGET_S", 0.6)
+
+    def slowish(s, u):
+        time.sleep(0.3)
+        return "YES"
+    plugin._llm = slowish
+    # 0.3 s: over the refresh budget, within the gate's: the gate gets a real verdict and passes
+    assert gate(plugin, reply="Merged #12 and deployed; health check green.") is None
+    plugin._JUDGED.clear()
+    assert plugin.judge("S1", "Another finished report, deployed.") is None  # a refresh still uses 0.1 s
+
+    def slow(s, u):
+        time.sleep(1.0)
+        return "YES"
+    plugin._llm = slow
+    out = gate(plugin, reply="A third finished report, all deployed.")
+    assert out and out["hold"]
+
+
+def test_judge_thread_sees_the_callers_context(plugin):
+    # The profile secret scope is a ContextVar. The judge's budget thread started with an empty context, so in the
+    # Desktop serve every gate judge died at 0.0 s with UnscopedSecretError (no ANTHROPIC_TOKEN in scope).
+    from contextvars import ContextVar
+    scope = ContextVar("test_secret_scope", default=None)
+    token = scope.set({"ANTHROPIC_TOKEN": "x"})
+    try:
+        plugin._llm = lambda s, u: "YES" if scope.get() else (_ for _ in ()).throw(RuntimeError("unscoped"))
+        assert plugin.judge("S1", "Merged #12 and deployed; health check green.") is True
+    finally:
+        scope.reset(token)
+
+
+def test_gate_scope_does_not_leak_into_refresh(plugin, fake):
+    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
+    gate(plugin, reply="Rebased, fixed both failing tests and pushed; CI is green.")
+    assert plugin._GATE_SCOPE.get() is None
+    # a refresh outside the gate still falls back to the heuristic, unchanged
+    assert fake.derive_outcome("S1", ignore_live_turn=True, pending_reply="Rebased and pushed both branches; CI is green now.")[
+        "kind"] == "done"
+
+
+def test_gate_does_not_hold_judged_done_or_outranking_kinds_after_give_up(plugin, fake):
+    plugin._llm = lambda s, u: (_ for _ in ()).throw(RuntimeError("down"))
+    fake.derived["S1"] = {"kind": "waiting", "on": [{"kind": "card", "id": "t_1"}]}
+    assert gate(plugin) is None  # the judge is never reached, nothing gave up
 
 
 def test_gate_fails_open_on_old_core_signature(plugin, fake, monkeypatch):

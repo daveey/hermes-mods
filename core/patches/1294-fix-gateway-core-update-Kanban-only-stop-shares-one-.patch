@@ -1,0 +1,273 @@
+From 751d14efa102f621b0e275fe95608d3c4716550f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 16:42:22 +0000
+Subject: [PATCH] fix(gateway): core-update Kanban-only stop shares one 60s
+ admission budget (15s wait + 40s stop leash snapshotted at stop entry, no
+ second drain)
+
+---
+ gateway/restart.py                            |   5 +
+ gateway/run_shutdown.py                       |  12 +-
+ gateway/run_shutdown_restart_wait.py          |  22 +++
+ tests/gateway/test_core_update_total_drain.py | 141 ++++++++++++++++++
+ 4 files changed, 174 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_core_update_total_drain.py
+
+diff --git a/gateway/restart.py b/gateway/restart.py
+index 64bd1fc398b..de4cd952b67 100644
+--- a/gateway/restart.py
++++ b/gateway/restart.py
+@@ -195,6 +195,8 @@ def effective_stop_drain_timeout(runner: object) -> float:
+     getattr-guarded on purpose: shutdown-path tests drive ``_stop_impl``
+     from bare doubles that are not ``GatewayRunner`` instances.
+     """
++    if getattr(runner, "_stop_kanban_leash_s", None) is not None:
++        return 0.0  # the update's Kanban grace was already spent in the after-turn wait
+     drain = getattr(runner, "_restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+     if not getattr(runner, "_stop_requested_by_signal", False):
+         return drain
+@@ -213,6 +215,9 @@ def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> floa
+     duck-typing / fail-open rules as :func:`effective_stop_drain_timeout`.
+     """
+     leash = _seconds(watchdog_delay)
++    fixed = getattr(runner, "_stop_kanban_leash_s", None)
++    if fixed is not None:
++        leash = min(leash, _seconds(fixed))  # stop-relative: callers subtract ctx.elapsed()
+     if not getattr(runner, "_stop_requested_by_signal", False):
+         return leash
+     return resolve_launchd_capped_drain(
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 05b056c6850..6175e4ca476 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -2150,10 +2150,10 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         # skipped under pytest (#66892). It covers stop() only; gateway.exit_deadline covers up to os._exit.
+         _watchdog_done = threading.Event()
+         self._shutdown_watchdog_done = _watchdog_done
++        getattr(self, "_core_update_kanban_snapshot_stop_leash", lambda: None)()  # fixed leash for this stop
+         # Shutdown-path doubles may lack the deferred-worker counter.
+-        ctx = GatewayShutdownMixin._StopContext(
+-            deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
+-        )
++        _deferred = getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
++        ctx = GatewayShutdownMixin._StopContext(deferred_count=_deferred)
+         exit_deadline.arm_for_stop(
+             self, _effective_watchdog_leash(self), lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx))
+         if not os.environ.get("PYTEST_CURRENT_TEST"):
+@@ -2166,9 +2166,9 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+             timeout = effective_stop_drain_timeout(self)
+             if timeout < self._restart_drain_timeout:
+                 logger.warning(
+-                    "Shutdown drain capped to %.0fs (configured %.0fs) to fit the live launchd exit "
+-                    "timeout of %.0fs — launchd SIGKILLs past it",
+-                    timeout, self._restart_drain_timeout, self._launchd_exit_timeout_s,
++                    "Shutdown drain capped to %.0fs (configured %.0fs) to fit the shutdown budget "
++                    "(launchd exit timeout %s; spent Kanban update grace)", timeout, self._restart_drain_timeout,
++                    getattr(self, "_launchd_exit_timeout_s", None),
+                 )
+             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
+             if ctx.timed_out:
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index 578f8c8e407..8963b110952 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -20,6 +20,7 @@ from gateway.session_runtime_workers import kanban_managed_count
+ 
+ # Only the update's post-grace Kanban wait: human turns retain their normal budget.
+ CORE_UPDATE_KANBAN_WAIT_S = 15.0
++CORE_UPDATE_KANBAN_STOP_LEASH_S = 40.0  # 15 wait + 40 stop + 5 poll allowance = 60s admission
+ 
+ logger = logging.getLogger("gateway.run")
+ 
+@@ -50,6 +51,8 @@ class GatewayRestartWaitMixin:
+         since = now if since is None else since
+         expired = now - since >= CORE_UPDATE_KANBAN_WAIT_S
+         if expired:
++            # The after-turn grace is spent. Do not start another full graceful drain in stop().
++            self._core_update_kanban_cap_spent = True
+             logger.warning(
+                 "Core update Kanban-only wait capped at %.0fs with %d managed card(s); "
+                 "proceeding to restart drain (interrupted attempts requeued uncounted)",
+@@ -57,6 +60,23 @@ class GatewayRestartWaitMixin:
+             )
+         return since, expired
+ 
++    def _core_update_kanban_snapshot_stop_leash(self) -> None:
++        """Fix, once at stop() entry, the short stop-relative leash for a spent Kanban update grace.
++
++        A fixed number (callers already subtract their own stop elapsed), snapshotted so work or
++        intent changing mid-stop cannot flip the budget after the watchdog was armed. Human or
++        unknown work, a withdrawn intent or an ordinary restart keep the normal budgets.
++        """
++        self._stop_kanban_leash_s = None
++        intent = getattr(self, "_restart_update_intent", None)
++        if not getattr(self, "_core_update_kanban_cap_spent", False) or not self._restart_requested:
++            return
++        if intent is None or not intent.exists():
++            return
++        if self._awaitable_work_count() > kanban_managed_count(self):
++            return
++        self._stop_kanban_leash_s = CORE_UPDATE_KANBAN_STOP_LEASH_S
++
+     def _restart_cap_state_text(self) -> str:
+         """Log suffix naming whether this restart carries a core-update intent (the Kanban-only cap)."""
+         if getattr(self, "_restart_update_intent", None) is not None:
+@@ -148,6 +168,8 @@ class GatewayRestartWaitMixin:
+         self._restart_detached = False
+         self._restart_via_service = False
+         self._restart_update_intent = None
++        self._core_update_kanban_cap_spent = False
++        self._stop_kanban_leash_s = None
+         self._draining = False
+         self._restart_task_started = False
+         self._scale_to_zero_status("running", "restart cancel: status mark failed")
+diff --git a/tests/gateway/test_core_update_total_drain.py b/tests/gateway/test_core_update_total_drain.py
+new file mode 100644
+index 00000000000..afff0974b17
+--- /dev/null
++++ b/tests/gateway/test_core_update_total_drain.py
+@@ -0,0 +1,141 @@
++"""A spent Kanban update grace must not be followed by a second full drain (<=60s end to end).
++
++Drives the real ``_stop_impl`` with its phases recorded: the drain gets 0s, the stop leash is one
++fixed 40s snapshot taken at stop entry, and settle gets what that leash leaves.
++"""
++import asyncio
++import time
++
++import pytest
++
++
++from gateway import run_runtime, run_shutdown_restart_wait as wait
++from gateway.run import GatewayRunner
++from gateway.run_shutdown import _effective_watchdog_leash
++from gateway.restart import effective_stop_drain_timeout
++from tests.gateway.restart_test_helpers import make_restart_runner
++
++
++def _runner(tmp_path, monkeypatch, *, drain=0, total=1, managed=1, intent=True, spent=True):
++    runner, _ = make_restart_runner()
++    path = tmp_path / "intent"
++    if intent:
++        path.touch()
++    runner._restart_requested = True
++    runner._restart_update_intent = path
++    runner._restart_drain_timeout = drain
++    runner._core_update_kanban_cap_spent = spent
++    runner._awaitable_work_count = lambda: total
++    monkeypatch.setattr(wait, "kanban_managed_count", lambda _: managed)
++    return runner, path
++
++
++def _record(runner, monkeypatch, *, mutate=None):
++    seen = {}
++
++    async def noop(self, *a, **k):
++        return None
++
++    async def begin(self, ctx):
++        ctx.started_at = time.monotonic()
++        seen["leash_at_begin"] = _effective_watchdog_leash(self)
++        if mutate:
++            mutate()
++
++    async def drain(self, timeout, ctx):
++        seen["drain"] = timeout
++        ctx.timed_out = True
++
++    async def interrupt(self, ctx):
++        seen["interrupted"] = True
++
++    async def settle(r, budget=None, reason=None):
++        seen["settle_budget"] = budget
++        seen["leash_at_settle"] = _effective_watchdog_leash(r)
++
++    for name in ("_stop_finalize_agents_and_adapters", "_stop_release_runtime_state", "_stop_persist_exit_state"):
++        monkeypatch.setattr(GatewayRunner, name, noop)
++    monkeypatch.setattr(GatewayRunner, "_stop_quiesce_and_close_session_dbs", lambda *a, **k: None)
++    monkeypatch.setattr(GatewayRunner, "_stop_begin_teardown", begin)
++    monkeypatch.setattr(GatewayRunner, "_stop_drain_active_work", drain)
++    monkeypatch.setattr(GatewayRunner, "_stop_interrupt_remaining_work", interrupt)
++    monkeypatch.setattr(run_runtime, "settle_gateway_runtime", settle)
++    return seen
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("configured", [0, 120])
++async def test_stop_after_spent_kanban_grace_uses_one_short_leash(tmp_path, monkeypatch, configured):
++    runner, _ = _runner(tmp_path, monkeypatch, drain=configured)
++    seen = _record(runner, monkeypatch)
++    await GatewayRunner._stop_impl(runner)
++    assert seen["drain"] == 0.0  # no second graceful wait
++    assert seen["interrupted"]  # Stop + uncounted booking path still runs
++    assert seen["leash_at_begin"] == 40.0
++    # callers subtract ctx.elapsed() themselves: the snapshot is stop-relative, not shrinking
++    assert seen["leash_at_settle"] == 40.0
++    assert seen["settle_budget"] <= 40.0
++    # 15s after-turn + 40s stop + 5s poll allowance
++    assert wait.CORE_UPDATE_KANBAN_WAIT_S + seen["leash_at_settle"] + 5 <= 60.0
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", ["ordinary", "human", "withdrawn", "cap_not_spent"])
++async def test_stop_keeps_normal_budgets_for_other_work(tmp_path, monkeypatch, mode):
++    runner, _ = _runner(
++        tmp_path, monkeypatch, drain=120, total=2 if mode == "human" else 1,
++        intent=mode != "withdrawn", spent=mode != "cap_not_spent")
++    if mode == "ordinary":
++        runner._restart_update_intent = None
++    seen = _record(runner, monkeypatch)
++    await GatewayRunner._stop_impl(runner)
++    assert seen["drain"] == 120
++    assert seen["leash_at_begin"] == 180.0
++
++
++@pytest.mark.asyncio
++async def test_classification_is_snapshotted_at_stop_entry(tmp_path, monkeypatch):
++    runner, path = _runner(tmp_path, monkeypatch, drain=120)
++
++    def flip():  # intent withdrawn / human work appears after the watchdog was armed
++        path.unlink()
++        runner._awaitable_work_count = lambda: 5
++
++    seen = _record(runner, monkeypatch, mutate=flip)
++    await GatewayRunner._stop_impl(runner)
++    assert seen["drain"] == 0.0
++    assert seen["leash_at_settle"] == 40.0
++
++
++def test_cancelled_restart_clears_snapshot_and_spent_flag(tmp_path, monkeypatch):
++    runner, _ = _runner(tmp_path, monkeypatch)
++    runner._stop_kanban_leash_s = 40.0
++    runner._cancel_restart()
++    assert runner._core_update_kanban_cap_spent is False
++    assert runner._stop_kanban_leash_s is None
++
++
++@pytest.mark.asyncio
++async def test_real_settle_wait_fits_the_short_leash(monkeypatch):
++    """settle_gateway_runtime clamps its 45s task wait to leash - elapsed - tail reserve."""
++    waited = {}
++
++    async def fake_wait(tasks, timeout):
++        waited["timeout"] = timeout
++        return set(), set(tasks)
++
++    class T:
++        def cancelled(self):
++            return False
++
++    monkeypatch.setattr(run_runtime, "_authorities", lambda r: ["a"])
++    monkeypatch.setattr(run_runtime, "_authority_tasks", lambda a: [T()])
++    monkeypatch.setattr(run_runtime, "stop_managed_turns", lambda *a: None)
++    monkeypatch.setattr(asyncio, "wait", fake_wait)
++    import gateway.session_llm_oneshot as oneshot
++    monkeypatch.setattr(oneshot, "stop", lambda a: None)
++    try:
++        await run_runtime.settle_gateway_runtime(object(), 40.0 - 2.0, "r")
++    except Exception as exc:  # the tail after the wait needs real authorities; only the wait matters
++        waited.setdefault("tail_error", repr(exc))
++    assert waited["timeout"] <= 40.0 - 2.0 - run_runtime.STOP_TAIL_RESERVE_SECONDS
+-- 
+2.55.0
+

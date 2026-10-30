@@ -5,61 +5,9 @@ Subject: [PATCH] feat(kanban): deliver card results to chats no backend holds;
  warn on reaped chats with open subscriptions [daveey]
 
 ---
- hermes_state_messages.py                      |  30 +++
- .../tui_gateway/test_kanban_unloaded_sweep.py | 159 +++++++++++++
- tui_gateway/entry.py                          |   3 +-
- tui_gateway/kanban_unloaded.py                | 220 ++++++++++++++++++
- tui_gateway/server.py                         |   4 +-
- tui_gateway/session_reaper.py                 |  12 +
- tui_gateway/ws.py                             |   1 +
- 7 files changed, 426 insertions(+), 3 deletions(-)
- create mode 100644 tests/tui_gateway/test_kanban_unloaded_sweep.py
- create mode 100644 tui_gateway/kanban_unloaded.py
-
-diff --git a/hermes_state_messages.py b/hermes_state_messages.py
-index 19908aed18..d89a9f96f2 100644
---- a/hermes_state_messages.py
-+++ b/hermes_state_messages.py
-@@ -455,6 +455,36 @@ class SessionMessagesMixin:
- 
-         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
- 
-+    def append_kanban_notice(self, session_id: str, content: str, metadata: dict[str, Any]) -> int:
-+        """Persist a kanban completion notice into a session nobody has loaded, exactly once, and mark the row
-+        unread. ``metadata['notice_id']`` is the identity (board:task:cursor range), checked and inserted in
-+        one writer txn so two gateway processes cannot both land it. Refuses (SessionTurnLeaseLostError) while
-+        another backend runs a live turn in the session: that backend's poller owns delivery. A NULL
-+        ``last_read_at`` (never tracked = read) is stamped just before the notice so it reads unread. [daveey]"""
-+        notice_id = metadata.get("notice_id")
-+        if not notice_id:
-+            raise ValueError("Kanban notice requires a stable notice_id")
-+        msg = {"content": content, "display_kind": "kanban_notice", "display_metadata": metadata}
-+        stamp_message_uid(msg)
-+        ts = time.time()
-+        params = self._message_row_params(session_id, "user", msg, None, ts, keep_reasoning=True)
-+
-+        def _do(conn):
-+            existing = conn.execute(
-+                "SELECT m.id FROM messages m WHERE m.session_id = ? AND m.display_kind = 'kanban_notice' "
-+                "AND json_extract(m.display_metadata, '$.notice_id') = ? LIMIT 1", (session_id, notice_id)).fetchone()
-+            if existing is not None:
-+                return existing[0]
-+            self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
-+            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
-+            self._bump_session_counters(conn, session_id, 1, 0, unit=True)
-+            from hermes_state_sessions import _LINEAGE_CTE_SQL  # watermark is lineage-stamped
-+            conn.execute(_LINEAGE_CTE_SQL + "UPDATE sessions SET last_read_at = ? WHERE last_read_at IS NULL "
-+                         "AND id IN (SELECT id FROM lineage)", (session_id, session_id, ts - 0.001))
-+            return msg_id
-+
-+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
-+
-     def append_messages_batch(
-         self, session_id: str, messages: list[dict[str, Any]], compression_lock_holder: Optional[str] = None,
-         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
 diff --git a/tests/tui_gateway/test_kanban_unloaded_sweep.py b/tests/tui_gateway/test_kanban_unloaded_sweep.py
 new file mode 100644
-index 0000000000..12acadd033
+index 0000000000000000000000000000000000000000..12acadd03364231228576d186b5ce37f00488237
 --- /dev/null
 +++ b/tests/tui_gateway/test_kanban_unloaded_sweep.py
 @@ -0,0 +1,159 @@
@@ -223,10 +171,10 @@ index 0000000000..12acadd033
 +    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
 +    assert any(CHAT in m and "kanban subscriptions" in m and "plain-session" not in m for m in warned)
 diff --git a/tui_gateway/entry.py b/tui_gateway/entry.py
-index 6f7c2d23e9..12029a68ed 100644
+index ff2f9a899d33fc4466df85c4988e352b7c435228..1181e39f2519dcaa9f9fd14fba3b9ed35a2e0c29 100644
 --- a/tui_gateway/entry.py
 +++ b/tui_gateway/entry.py
-@@ -298,7 +298,8 @@ def main():
+@@ -358,7 +358,8 @@ def _serve():
      # so it must start BEFORE the sweep.
      for start, what in (
              (server._start_backend_heartbeat_refresher, "backend heartbeat refresher start"),
@@ -238,7 +186,7 @@ index 6f7c2d23e9..12029a68ed 100644
          except Exception:
 diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
 new file mode 100644
-index 0000000000..f8f158d6e8
+index 0000000000000000000000000000000000000000..f8f158d6e8cb39fb44af67ccabbcae8bf64971c5
 --- /dev/null
 +++ b/tui_gateway/kanban_unloaded.py
 @@ -0,0 +1,220 @@
@@ -462,32 +410,11 @@ index 0000000000..f8f158d6e8
 +
 +def register(server) -> None:
 +    server._start_kanban_unloaded_sweeper = start_kanban_unloaded_sweeper
-diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index c84d12e969..8e17df7e7f 100644
---- a/tui_gateway/server.py
-+++ b/tui_gateway/server.py
-@@ -3701,7 +3701,7 @@ from . import (
-     methods_display as _methods_display, methods_display_watch as _methods_display_watch,
-     methods_onboarding as _methods_onboarding, methods_i18n as _methods_i18n,
-     methods_shared_metrics as _methods_shared_metrics, methods_start_chat as _methods_start_chat,
--    methods_plugin_catalog as _methods_plugin_catalog)
-+    methods_plugin_catalog as _methods_plugin_catalog, kanban_unloaded as _kanban_unloaded)
- 
- for _m in (
-     _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
-@@ -3713,6 +3713,6 @@ for _m in (
-     _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
-     _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors,
-     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding,
--    _methods_i18n, _methods_shared_metrics, _methods_start_chat, _methods_plugin_catalog):
-+    _methods_i18n, _methods_shared_metrics, _methods_start_chat, _methods_plugin_catalog, _kanban_unloaded):
-     _m.register(sys.modules[__name__])
- del _m
 diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
-index 26cd258418..52dddd62f9 100644
+index e18a8972d691baa6ae1a9de2b9c074d54ca96a83..5b9e5669d310799a500af824bcc24d8fedeb29dd 100644
 --- a/tui_gateway/session_reaper.py
 +++ b/tui_gateway/session_reaper.py
-@@ -456,6 +456,18 @@ def _sweep_orphaned_session_rows() -> list[str]:
+@@ -433,6 +433,18 @@ def _sweep_orphaned_session_rows() -> list[str]:
          logger.info(
              "Closed %d orphaned session row(s) from a previous gateway process (startup_orphan_reap): %s",
              len(swept), ", ".join(swept))
@@ -506,18 +433,6 @@ index 26cd258418..52dddd62f9 100644
      return swept
  
  
-diff --git a/tui_gateway/ws.py b/tui_gateway/ws.py
-index 42dbd6164b..efa7dbc382 100644
---- a/tui_gateway/ws.py
-+++ b/tui_gateway/ws.py
-@@ -380,6 +380,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol:
-         for start, what in (
-             (server._start_backend_heartbeat_refresher, "backend heartbeat refresher start"),
-             (server._schedule_startup_orphan_sweep, "startup orphan sweep scheduling"),
-+            (server._start_kanban_unloaded_sweeper, "kanban unloaded-session sweeper start"),
-         ):
-             try:
-                 start()
 -- 
 2.55.0
 

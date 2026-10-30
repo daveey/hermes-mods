@@ -319,7 +319,7 @@ _DO = re.compile(r"\b(can you|could you|please) (check|click|tap|open|plug|sign|
 def regex_steps(text: str) -> list[dict]:
     out: list[dict] = []
     for s in sentences(text or ""):
-        if _ASK.search(_blank_quotes(s)) and not _NOT_ASK.search(s) and all(o["verbatim_span"] != s for o in out):
+        if _asks_outside_quotes(s) and not _NOT_ASK.search(s) and all(o["verbatim_span"] != s for o in out):
             kind = "approve" if _APPROVE.search(s) else "do" if _DO.search(s) else "input"
             out.append({"text": s[:300], "kind": kind, "verbatim_span": s, "options": []})
     return out
@@ -359,7 +359,9 @@ Rules:
   {"id": <that open step id>, "verbatim_span": <exact sentence>} in "repeats" instead. When unsure whether it is
   the same decision, list it as a new step.
 - "resolved": ids from OPEN STEPS that the USER'S LAST MESSAGE answered, did, declined or made moot, or that the
-  reply says are now done. Leave a step out when unsure.
+  reply says are now done. Leave a step out when unsure. A step this reply still asks, restates or points at is
+  never resolved (it is a repeat). An automatic notice in USER'S LAST MESSAGE (a Kanban \"✔ [...] done\" notice,
+  an \"[owner-wake]\" note) was not typed by the user and answers no step.
 - Status reports are not asks: "X is in review", "not yet approved", "still open", "waiting on CI/a worker/a
   reviewer". A Kanban card in review is checked by an automated reviewer, not by the user.
 - A sentence that lists, counts or summarizes decisions waiting in other chats, queues or cards ('your For you
@@ -438,6 +440,43 @@ def _blocks(text: str) -> list[dict]:
         b["text"] = text[b["start"]:b["end"]]
         b["quote"] = not b["code"] and all(l.lstrip().startswith(">") for l in b["text"].split("\n") if l.strip())
     return out
+
+
+def following_fence(reply: str, block: dict) -> str:
+    """The fenced code block that immediately follows ``block`` (only whitespace between), else ''. It is the
+    literal payload of the step the block asks for (a command or message to send), so it must stay with the step."""
+    blocks = _blocks(reply)
+    for i, b in enumerate(blocks):
+        if b["start"] == block["start"] and b["end"] == block["end"]:
+            nxt = blocks[i + 1] if i + 1 < len(blocks) else None
+            if nxt and nxt["code"] and not reply[block["end"]:nxt["start"]].strip():
+                return nxt["text"]
+            return ""
+    return ""
+
+
+def fence_literal(fence: str) -> str:
+    """Inner text of a fenced block (fence lines and info string removed)."""
+    lines = (fence or "").strip().split("\n")
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+PAYLOAD_TITLE_MAX = 120
+
+
+def payload_title(title: str, fence: str) -> str:
+    """A step whose payload is a following code block never gets a title that paraphrases it: keep the title only if
+    it already quotes the literal; else quote the literal (short, one line) or point at the block below."""
+    lit = fence_literal(fence)
+    if not lit or lit in (title or ""):
+        return title
+    if "\n" not in lit and len(lit) <= PAYLOAD_TITLE_MAX:
+        return f"Use this exact text: {lit}"
+    return "Use the exact text in the block below"
 
 
 def locate(reply: str, span: str) -> Optional[dict]:
@@ -662,6 +701,16 @@ def span_is_quoted(span: str, block_text: str) -> bool:
     return False
 
 
+def _asks_outside_quotes(sentence: str) -> bool:
+    """The sentence asks something in the assistant's own words: some ``_ASK`` match starts outside every quoted
+    range, and the sentence is not merely naming a quoted phrase (``span_is_quoted``, the model path's rule).
+    ``Reply "go" and I'll ship it`` asks (its match starts at the unquoted ``Reply``); ``titled "Reply yes or no
+    here."`` does not (its only match starts inside the quotes)."""
+    ranges = [m.span() for m in _QUOTE_RANGE.finditer(sentence or "")]
+    outside = any(not any(a <= m.start() < b for a, b in ranges) for m in _ASK.finditer(sentence or ""))
+    return outside and not span_is_quoted(sentence, sentence)
+
+
 def _question_in(block_text: str) -> Optional[str]:
     """Last sentence of a prose block that is a question outside quotes, without its bold label."""
     blanked = _blank_quotes(block_text)
@@ -760,7 +809,12 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
         if recommendation_without_request(span, block["text"]):
             continue  # a recommendation is not permission to manufacture a choice
         text = question_title(text, span, reply, block)
+        fence = following_fence(reply, block)
+        if fence:
+            text = payload_title(text, fence)
         candidate = {"text": text, "kind": kind, "verbatim_span": span, "options": opts}
+        if fence:
+            candidate["payload"] = fence
         key = action_identity(candidate) if continuity else _norm(text)
         if key in seen:
             continue
@@ -823,6 +877,39 @@ def without_elsewhere(steps: list[dict], mapped: list[dict]) -> list[dict]:
 LLM = Callable[[str, str], str]
 
 
+# A step text shorter than this is too generic to prove a restatement by substring ("Approve it?").
+_RESTATE_MIN_CHARS = 20
+# A turn the runtime started, not the user: Kanban notices (✔ done, ✖ failed, ⏸ blocked, [Kanban ...]), owner
+# wakes, system and chat-close notes. Such a "last message" answers nothing.
+_RUNTIME_MSG = re.compile(r"^\s*(?:[\u2714\u2716\u23f8\u26a0]\ufe0f?\s*\[|\[(?:owner-wake|System|chat-cl|Kanban|Automatic)\b)")
+
+
+def _runtime_message(user_msg: str) -> bool:
+    """The turn's last message is a runtime notice. An empty one is unknown (the hook missed it), not a notice."""
+    return bool(_RUNTIME_MSG.match(user_msg or ""))
+
+
+def _still_asked(step: dict, reply: str, repeats: list[dict], user_msg: str = "") -> bool:
+    """Does this reply still ask the open step? Then the model's "resolved" for it is wrong and is dropped.
+
+    Only in a turn a runtime notice started (nothing the user said can have answered it): the model itself listed
+    the step as a repeat, or the reply quotes the step's text (or the sentence that first asked it). The model
+    resolved an open decision whose reply ended "Your call: \\"<the step's text>\\" is in your For you queue" (a
+    kanban-notice turn): the tile vanished unanswered and the chat's outcome fell to
+    unresolved{no_summary} (hub 20261030_071719_cde14c). After a typed message the model's verdict stands: "Going
+    ahead with <step text>" after the user's "go" is an answer, and a re-ask after a decline must stay retired."""
+    if not _runtime_message(user_msg):
+        return False
+    if any(r.get("id") == step.get("id") for r in repeats):
+        return True
+    body = _norm(reply).replace('"', "")
+    for raw in (step.get("text"), step.get("verbatim_span")):
+        quoted = _norm(str(raw or "")).replace('"', "")
+        if len(quoted) >= _RESTATE_MIN_CHARS and quoted in body:
+            return True
+    return False
+
+
 def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM],
             *, continuity: bool = False, elsewhere: Optional[list] = None) -> dict:
     """{steps, resolved, source: 'model'|'regex', error?}.
@@ -831,6 +918,7 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
     one of them are omitted: neither minted nor framed.
     """
     ids = {s["id"] for s in open_steps}
+    by_id = {s["id"]: s for s in open_steps}
     titles = _elsewhere_titles(elsewhere)
     dropped: list[str] = []
     if llm is not None:
@@ -841,6 +929,7 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
             repeats = [{"id": str(x["id"]), "verbatim_span": str(x["verbatim_span"])}
                        for x in (raw if isinstance(raw, list) else []) if isinstance(x, dict) and str(x.get("id")) in ids
                        and isinstance(x.get("verbatim_span"), str) and locate(reply, x["verbatim_span"]) is not None]
+            resolved = [x for x in resolved if not _still_asked(by_id[x], reply, repeats, user_msg)]
             mapped = elsewhere_mapped(d.get("elsewhere"), reply, titles)
             steps = without_elsewhere(validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), mapped)
             return {"steps": steps, "resolved": resolved, "repeats": repeats, "elsewhere": mapped,
@@ -1023,13 +1112,45 @@ def _canonical_open(step: dict) -> bool:
 
 def open_steps(session_id: str, ledger: Optional["Ledger"] = None) -> list[dict]:
     """Public helper (session-outcome): this chat's open steps across its lineage, oldest first, public fields
-    plus ``choices``. A step whose canonical request was already decided or withdrawn is left out."""
+    plus ``choices``. A step whose canonical request was already decided or withdrawn is left out; an open
+    canonical request of the chat with no open ledger step is added (``_open_canonical_only``)."""
     if not session_id:
         return []
     lg = ledger or Ledger()
     opened = sorted(lg.open_steps(session_id), key=lambda s: s.get("created", 0))
-    return [{**public_step(s), **({"choices": s["choices"]} if s.get("choices") else {})}
-            for s in opened if _canonical_open(s)]
+    out = [{**public_step(s), **({"choices": s["choices"]} if s.get("choices") else {})}
+           for s in opened if _canonical_open(s)]
+    return out + _open_canonical_only(session_id, lg, opened)
+
+
+def _open_canonical_only(session_id: str, lg: "Ledger", opened: list[dict]) -> list[dict]:
+    """Open, undecided canonical requests of this chat's lineage that no open ledger step mirrors.
+
+    The For you queue shows canonical requests; the ledger is a legacy mirror. When the two disagree (the extractor
+    retired the ledger step of a backfilled request while the request itself stayed open), the chat's outcome must
+    follow what the user sees: a ``decision``, not unresolved{no_summary} (hub 20261030_071719_cde14c). Any error
+    adds nothing."""
+    if not (home() / "user-steps" / "actions.sqlite3").is_file():
+        return []
+    mirrored_rids = {s.get("requestId") for s in opened if s.get("requestId")}
+    mirrored_steps = {s.get("id") for s in opened}
+    out: list[dict] = []
+    try:
+        store = ActionStore()
+        for sid in lineage(session_id, lg.db) or [session_id]:
+            for r in store.requests(server_owner(sid)):
+                if r.get("state") not in ("open", "needs_context") or r.get("resolution"):
+                    continue
+                aliased = {a.get("id") for a in r.get("aliases") or [] if a.get("type") == "user_step"}
+                if r["requestId"] in mirrored_rids or aliased & mirrored_steps:
+                    continue
+                choices = [{"label": c["label"], "value": str(c.get("id") or c["label"])}
+                           for c in r.get("choices") or [] if c.get("label")]
+                out.append({"id": r["requestId"], "text": r.get("title", ""), "kind": r.get("kind"),
+                            "status": "open", "session": sid, **({"choices": choices} if choices else {})})
+    except Exception:
+        return out
+    return out
 
 
 def add_step(session_id: str, question: str, options: list, *, ledger: Optional["Ledger"] = None,
@@ -1207,7 +1328,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 if budget <= 0 or (action_store is None and _norm(candidate["text"]) in seen):
                     continue
                 step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
-                        "session": session_id, "paragraph": block["text"]}
+                        "session": session_id,
+                        "paragraph": block["text"] + ("\n\n" + candidate["payload"] if candidate.get("payload") else "")}
                 if action_store is not None:
                     canonical = action_store.migrate_step(action_owner, step)
                     step.update(requestId=canonical["requestId"], requestOwner=canonical["owner"],
@@ -1477,15 +1599,24 @@ def validate_action(value):
         if not isinstance(value[field], list): raise ActionError('Expected array')
     for limit in value['limits']:
         _object(limit, ('key', 'value'), ('permissionRequired',))
-        for text in limit.values(): _string(text)
+        _string(limit['key']); _string(limit['value'])
+        # permissionRequired is a flag, not text: a bare True used to fail as 'Expected nonempty string'.
+        if 'permissionRequired' in limit and type(limit['permissionRequired']) is not bool:
+            raise ActionError('permissionRequired must be a boolean')
     for text in value['exclusions']: _string(text)
     _object(value['outcomes'], ('revise',) if value['kind'] == 'approval' else (),
             ('approve', 'decline', 'answer') if value['kind'] == 'approval' else ('revise', 'approve', 'decline', 'answer'))
     for text in value['outcomes'].values(): _string(text)
     ids = set()
     for choice in value['choices']:
-        _object(choice, ('id', 'label', 'effect'), ('authorizes',))
+        _object(choice, ('id', 'label', 'effect'), ('authorizes', 'explain', 'recommended'))
         _string(choice['id']); _string(choice['label'])
+        # 'explain': one plain line on what happens if the user picks this (shown under the button).
+        # 'recommended': the agent's pick, at most one per request, only True.
+        if 'explain' in choice:
+            _string(choice['explain'])
+        if 'recommended' in choice and choice['recommended'] is not True:
+            raise ActionError('recommended is only valid as true')
         # 'authorizes' marks a go answer ("now") to a run-timing question: only on answers, only True.
         if 'authorizes' in choice and (choice['authorizes'] is not True or choice['effect'] != 'answer'
                                        or value['kind'] not in ('choice', 'input')):
@@ -1496,6 +1627,8 @@ def validate_action(value):
         if choice['effect'] in ('approve', 'decline') and choice['effect'] not in value['outcomes']:
             raise ActionError('Choice requires a stated outcome')
     if not ids: raise ActionError('At least one choice is required')
+    if sum(1 for c in value['choices'] if c.get('recommended')) > 1:
+        raise ActionError('At most one choice can be recommended')
     if value['state'] not in ('needs_context', 'open', 'resolved', 'superseded', 'cancelled', 'withdrawn'):
         raise ActionError('Invalid state')
     if value['state'] == 'open' and not scope['complete']:
@@ -1556,9 +1689,11 @@ class ActionStore:
     No fuzzy identity, cross-session search, or automatic compression/branch inheritance.
     Immutable revision documents are separate from resolution and delivery projections.
     """
-    def __init__(self, path=None):
+    def __init__(self, path=None, timeout=30):
         self.path = Path(path) if path else home() / 'user-steps' / 'actions.sqlite3'
+        self.timeout = timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_wal()
         with self._connect() as c:
             c.executescript('''
                 CREATE TABLE IF NOT EXISTS requests (
@@ -1587,11 +1722,37 @@ class ActionStore:
             if 'asked_revision' not in {row[1] for row in c.execute('PRAGMA table_info(lifecycle)')}:
                 c.execute('ALTER TABLE lifecycle ADD COLUMN asked_revision INTEGER')
 
+    def _ensure_wal(self):
+        # WAL so readers never wait on a committing writer (rollback journal shut every reader out for the whole
+        # busy timeout: self-heal plugin-dca5d02c20). The mode is persistent in the file; switching needs no
+        # other open connection, so it is best effort here and retried on the next open.
+        c = sqlite3.connect(self.path, timeout=min(self.timeout, 2))
+        try:
+            if c.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
+                c.execute('PRAGMA journal_mode=WAL')
+        except sqlite3.OperationalError as exc:
+            logging.getLogger('user-steps').warning('user-steps: could not switch %s to WAL yet: %s', self.path, exc)
+        finally:
+            c.close()
+
     def _connect(self):
-        c = sqlite3.connect(self.path, timeout=30)
+        c = sqlite3.connect(self.path, timeout=self.timeout)
         c.row_factory = sqlite3.Row
         c.execute('PRAGMA synchronous=FULL')
         return c
+
+    @contextmanager
+    def _read(self):
+        # Rollback-journal readers must not request RESERVED/PENDING writer locks:
+        # even a no-op BEGIN IMMEDIATE commit waits for every other shared reader,
+        # then blocks new polls at schema/PRAGMA reads for the full busy timeout.
+        c = self._connect()
+        try:
+            c.execute('PRAGMA query_only=ON')
+            c.execute('BEGIN')
+            yield c
+        finally:
+            c.close()  # Ends the snapshot, including when decoding/validation fails.
 
     @contextmanager
     def _tx(self):
@@ -1620,12 +1781,12 @@ class ActionStore:
         return body
 
     def get(self, owner, rid):
-        with self._tx() as c: return self._get(c, owner, rid)
+        with self._read() as c: return self._get(c, owner, rid)
 
     def requests(self, owner, *, include_withdrawn=False):
         # Withdrawn rows are omitted by default: route bodies mounted before this state existed call this, and
         # renderers that predate it reject a whole queue that holds an unknown state.
-        with self._tx() as c:
+        with self._read() as c:
             ids = c.execute('SELECT id, state FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
                             (self._ns(owner), owner['storedSessionId'])).fetchall()
             return [self._get(c, owner, row[0]) for row in ids if include_withdrawn or row[1] != 'withdrawn']
@@ -1657,7 +1818,7 @@ class ActionStore:
         return r
 
     def history(self, owner, rid):
-        with self._tx() as c:
+        with self._read() as c:
             self._get(c, owner, rid)
             return [json.loads(row[0]) for row in c.execute(
                 'SELECT body FROM revisions WHERE namespace=? AND id=? ORDER BY revision', (self._ns(owner), rid))]
@@ -1707,7 +1868,7 @@ class ActionStore:
         return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
     def operation(self, owner, oid=None, key=None):
-        with self._tx() as c: return self._operation(c, owner, oid, key)
+        with self._read() as c: return self._operation(c, owner, oid, key)
 
     def decide(self, owner, decision):
         _object(decision, ('requestId', 'expectedRevision', 'choiceId', 'idempotencyKey'), ('revisionText',))
@@ -1775,6 +1936,7 @@ class ActionStore:
         receipt = None
         confirmed = False
         busy = False
+        failure_class = 'unconfirmed_readback'
         try:
             if receiver is None: raise RuntimeError('No durable delivery receiver configured')
             receipt = (receiver.deliver_early(op, early_tool_call_id) if early_tool_call_id
@@ -1783,6 +1945,11 @@ class ActionStore:
         except Exception as exc:
             # Never expose credentials, receiver URLs or raw transport bodies: only classify.
             busy = 'session is busy' in str(exc).lower()
+            failure_class = 'session_busy' if busy else getattr(exc, 'reason', type(exc).__name__)
+        if not confirmed:
+            import logging
+            logging.getLogger('user-steps').warning(
+                'Decision delivery unconfirmed operation=%s classification=%s', oid, failure_class)
         with self._tx() as c:
             result = self._operation(c, owner, oid); op = result['operation']
             # A slow failed retry cannot downgrade a concurrently confirmed delivery.
@@ -1808,14 +1975,14 @@ class ActionStore:
             return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
     def pending_owners(self):
-        with self._tx() as c:
+        with self._read() as c:
             owners = {_json(op['owner']): op['owner'] for row in c.execute('SELECT body FROM operations')
                       if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')}
             return list(owners.values())
 
     def undelivered(self, gateway_id, profile):
         """Recorded-but-undelivered operations (any effect) of this gateway/profile, oldest first."""
-        with self._tx() as c:
+        with self._read() as c:
             return [op for row in c.execute('SELECT body FROM operations WHERE namespace=? ORDER BY rowid',
                                             (_json([gateway_id, profile]),))
                     if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')]
@@ -1847,17 +2014,17 @@ class ActionStore:
         return body
 
     def view(self, owner, rid):
-        with self._tx() as c: return self._view(c, owner, rid)
+        with self._read() as c: return self._view(c, owner, rid)
 
     def views(self, owner, *, include_withdrawn=False):
-        with self._tx() as c:
+        with self._read() as c:
             rows = c.execute('SELECT id, state FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
                              (self._ns(owner), owner['storedSessionId'])).fetchall()
             return [self._view(c, owner, row['id']) for row in rows
                     if include_withdrawn or row['state'] != 'withdrawn']
 
     def created_at(self, owner, rid):
-        with self._tx() as c:
+        with self._read() as c:
             life = self._life(c, owner, rid)
             return life['created_at'] if life is not None else None
 
@@ -1942,7 +2109,7 @@ class ActionStore:
 
     def unnotified_withdrawals(self, owner):
         """Withdrawals the owning chat did not make itself (system/user) and has not been told about."""
-        with self._tx() as c:
+        with self._read() as c:
             rows = c.execute("SELECT r.id FROM requests r JOIN lifecycle l ON l.namespace=r.namespace AND l.id=r.id "
                              "WHERE r.namespace=? AND r.session=? AND r.state='withdrawn' AND l.notified_at IS NULL "
                              "ORDER BY r.rowid", (self._ns(owner), owner['storedSessionId'])).fetchall()
@@ -2076,6 +2243,24 @@ def _question_alternatives(span: str, source: str) -> list[str]:
     return out
 
 
+_WHETHER = re.compile(r"\bwhether\s+to\s+(.+?)\s*,?\s+or\s+(?:to\s+)?(.+?)[\s.?!]*$", re.I)
+
+
+def _whether_alternatives(text: str) -> list[str]:
+    """The two alternatives of a 'Choose whether to A or B' step text (the title the card shows). Both are
+    verbatim slices of that title; an 'or not' / 'something else' tail, a third 'or', or a clause break inside an
+    option ('whether CI moved, then unblock X or archive it' is not two options) yields none."""
+    m = _WHETHER.search(re.sub(r"[*_`]+", "", _ws(text)))
+    if not m or re.search(r"\bor\b", m.group(1), re.I) or re.search(r"\bor\b", m.group(2), re.I):
+        return []
+    out = [part.strip(' ,;:') for part in m.groups()]
+    if any(_ALT_OTHER.match(p) or re.fullmatch(r"not", p, re.I) or len(p.split()) < 2 or len(p) > OPTION_MAX
+           or re.search(r"[;:]|,\s*(?:then|and|so|but)\b|\bthen\b", p, re.I)
+           for p in out):
+        return []
+    return [_cap(p) for p in out]
+
+
 def literal_options(step: dict) -> list[str]:
     """Answer buttons for a legacy clarification: only text literally in the source.
 
@@ -2095,6 +2280,10 @@ def literal_options(step: dict) -> list[str]:
         out = found
     else:
         out = _question_alternatives(_ws(step.get('verbatim_span') or step.get('paragraph')), source)
+        # The agent's own options were paraphrases (dropped above), but the card's title states both: use them.
+        # Live repro (hermes-hub 2026-10-28, gen-3/gen-4 spot): only 'keep spot' survived and Approve had no button.
+        if len(out) < 2 and len(whether := _whether_alternatives(step.get('text'))) == 2:
+            out = whether
         # a model option that is part of a derived alternative is the same choice, not a second button
         out += [x for x in found if not any(x.casefold() in y.casefold() for y in out)]
     return list(dict.fromkeys(out))[:4]
@@ -2129,8 +2318,13 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
     the exact plan. Nothing here grants execution permission."""
     kind = {'approve': 'approval', 'choose': 'choice', 'do': 'external_step'}.get(step.get('kind'), 'input')
     markdown = step.get('paragraph') or step['text']
+    title = step['text']
+    if step.get('payload'):
+        title = payload_title(title, step['payload'])
+        if step['payload'] not in markdown:
+            markdown = markdown + '\n\n' + step['payload']
     r = {'schemaVersion': 2, 'owner': owner, 'requestId': str(uuid.uuid4()), 'revision': 1, 'kind': kind,
-         'title': step['text'], 'scope': {'markdown': markdown, 'complete': True, 'sourceRefs': [ref]},
+         'title': title, 'scope': {'markdown': markdown, 'complete': True, 'sourceRefs': [ref]},
          'limits': [], 'exclusions': [], 'aliases': [ref], 'state': 'open'}
     no_grant = 'This does not grant execution permission.'
     if kind in ('choice', 'input'):

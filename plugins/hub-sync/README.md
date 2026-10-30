@@ -19,12 +19,15 @@ No agent hooks or tools: `register()` is a no-op; everything is `dashboard/plugi
 | GET | `/where/{session_id}` | `{hits:[{gateway, profile, local, stale, synced_at, …}]}` |
 | GET | `/session-links/{session_id}[?ids=a,b&origin_profile=work&origin_gateway=laptop]` | `{qualified_origins:true, origin_gateway, origin_profile, tasks:[{id, board, gateway, profile, ownership_state, via, local, stale, …}]}` |
 | GET | `/requests` | what this gateway asked other gateways to change |
-| POST | `/request` `{gateway, coll, key, action, args?, base_version?}` | `{id, queued_locally, state}`; 400 bad action/args, 404 unknown gateway, 503 hermes-hub missing |
+| POST | `/request` `{gateway, coll, key, action, args?, base_version?}` | `{id, queued_locally, state}`; 400 bad action/args/key shape, 404 unknown gateway, 503 hermes-hub missing |
 
 Own records come from the `published` table (`local: true`), other gateways' from `replica`; `stale` is true when
 the last successful hub pull is older than 180 s. `pending` lists this gateway's unsent/unapplied requests for the
 record. Allowed actions: sessions `rename{title}`/`archive`/`unarchive`/`pin`/`unpin`; inbox `act{action, input?}`/
-`archive`; tasks `create`/`comment`/`complete`/`block`/`unblock`/`archive`/`assign`.
+`archive`; tasks `create` (key `<profile>/<board>/new`; `<board>/new` is expanded to `default/<board>/new`)/`comment`/`complete`/`block`/`unblock`/`archive`/`assign`.
+The other task actions take the key `<profile>/<board>/<id>`, as the replica publishes it. Any other task key shape
+(`<board>/<id>`, a bare id) is refused with 400 before anything is queued; the owner gateway would only reject it as
+`invalid_task_route` after the request was sent.
 
 `published` decode caching compares each row's raw JSON across hub database writes, so an unrelated
 replica/meta commit does not re-decode all local sessions and task handoffs. Same-version content

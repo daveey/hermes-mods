@@ -352,33 +352,52 @@ def _section(build):
         return dict(state='unavailable', reason=type(exc).__name__, machines=[])
 
 
-def _shared_gateway_section():
+def _cached(entry, build):
+    """``entry``'s value while younger than FLEET_CACHE_S; else one build at a time (single-flight).
+
+    Stale-while-rebuilding: when a value exists and another thread is already rebuilding it, return the
+    previous value at once instead of parking on the lock. Every Desktop reconnect burst (ten profile polls
+    after a gap longer than the window) used to hold ten AnyIO workers on these locks behind one build slowed
+    by the burst's GIL contention; the session reads in the same burst queued behind them (hub,
+    t_01a18b4b710b722e: fleet_view lock waits were the most-sampled worker stack in every 4-5 s burst).
+    A cold entry (first poll, or after ``_fleet_invalidate``) still waits, so a create is read back.
+    """
     import time
-    with _gateway_cache['lock']:
-        if _gateway_cache['value'] is not None and time.monotonic() - _gateway_cache['at'] < FLEET_CACHE_S:
-            return _gateway_cache['value']
-        value = _section(_gateway_section)
-        _gateway_cache.update(at=time.monotonic(), value=value)
+    at, value = entry['at'], entry['value']
+    if value is not None and at is not None and time.monotonic() - at < FLEET_CACHE_S:
         return value
+    lock = entry['lock']
+    if value is not None and at is not None:
+        if not lock.acquire(blocking=False):
+            return value
+    else:
+        lock.acquire()
+    try:
+        at, value = entry['at'], entry['value']
+        if value is not None and at is not None and time.monotonic() - at < FLEET_CACHE_S:
+            return value
+        value = build()
+        entry.update(at=time.monotonic(), value=value)
+        return value
+    finally:
+        lock.release()
+
+
+def _shared_gateway_section():
+    return _cached(_gateway_cache, lambda: _section(_gateway_section))
 
 
 @router.get('/fleet')
 def fleet_view():
     """Machines and slots: gateway workers (Board registry + leases) and CI workers (collector).
 
-    One build per FLEET_CACHE_S per profile, single-flight per profile; the machine-wide gateway
+    One build per FLEET_CACHE_S per profile, single-flight per profile (a poll arriving during a rebuild gets
+    the previous value, see ``_cached``); the machine-wide gateway
     section inside it is built once per FLEET_CACHE_S for all profiles (_shared_gateway_section), so
     a poll burst over every profile costs one registry/replica read plus one CI projection each.
     """
-    import time
     profile = active_profile()
-    entry = _fleet_entry(profile)
-    with entry['lock']:
-        if entry['value'] is not None and time.monotonic() - entry['at'] < FLEET_CACHE_S:
-            return entry['value']
-        value = _build_fleet(profile)
-        entry.update(at=time.monotonic(), value=value)
-        return value
+    return _cached(_fleet_entry(profile), lambda: _build_fleet(profile))
 
 
 def _build_fleet(profile):

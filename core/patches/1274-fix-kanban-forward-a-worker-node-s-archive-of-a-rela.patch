@@ -1,0 +1,519 @@
+From 68293f0c8b5f4d1b0022805241be7759547ad2fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:07:15 +0000
+Subject: [PATCH] fix(kanban): forward a worker node's archive of a relayed
+ capability owner card home [daveey]
+
+On a relay=home route the owner card exists only on the waiting card's home
+gateway, so kanban_archive from the waiting card's run on a Board worker node
+answered 'no such task' before the owner-card scope rule ran. When the local
+lookup misses and the worker's task has a relay=home route naming that owner,
+append a capability_owner_archive_requested event on the waiting card; the
+home's dispatcher applies the same archive scope rule (archive_scope_for),
+archives with the forwarded run on the archived event, and answers with a
+capability_owner_archive_result the worker returns verbatim.
+---
+ hermes_cli/kanban.py                          |  10 +-
+ hermes_cli/kanban_db.py                       |   5 +-
+ hermes_cli/kanban_db_dispatch.py              |   6 +
+ hermes_cli/kanban_db_sync.py                  |   4 +-
+ hermes_cli/kanban_owner_archive_relay.py      | 205 ++++++++++++++++++
+ .../tools/test_kanban_owner_archive_relay.py  | 174 +++++++++++++++
+ tools/kanban_tools.py                         |  12 +
+ 7 files changed, 412 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_owner_archive_relay.py
+ create mode 100644 tests/tools/test_kanban_owner_archive_relay.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a95245adec0..91c9318da6c 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1157,7 +1157,15 @@ def worker_archive_scope(conn, task_id: str) -> tuple[Optional[str], Optional[st
+     ``refusal`` is None when allowed. ``via`` is set when the archive is allowed only
+     as a stranded-``runs_on`` sweep of a foreign card; record it on the archived event.
+     """
+-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
++    return archive_scope_for(conn, task_id, os.environ.get("HERMES_KANBAN_TASK"))
++
++
++def archive_scope_for(conn, task_id: str, env_tid: Optional[str]) -> tuple[Optional[str], Optional[str]]:
++    """:func:`worker_archive_scope` for a worker scoped to ``env_tid`` (None: unscoped, any card).
++
++    The home gateway applies it to an archive a Board worker node forwarded for a relayed capability owner
++    card (:mod:`hermes_cli.kanban_owner_archive_relay`), where the scope comes from the request, not the env.
++    """
+     if not env_tid:
+         return None, None
+     if env_tid == task_id:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index d9e2bbb2c5c..ed72e4fc50c 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -4065,7 +4065,8 @@ def specify_triage_task(
+     return True
+ 
+ 
+-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None) -> bool:
++def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None,
++                 event_extra: Optional[dict] = None) -> bool:
+     """Archive a task; a *running* task's host-local worker is terminated.
+ 
+     Clearing ``worker_pid`` in the DB alone left the OS process running past its
+@@ -4103,6 +4104,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+         payload = {"source_status": row["status"]}
+         if via:
+             payload["via"] = via  # archived outside the creator scope (stranded-runs_on sweep) [daveey]
++        if event_extra:
++            payload.update(event_extra)  # e.g. the forwarding worker's run (kanban_owner_archive_relay) [daveey]
+         _append_event(conn, task_id, "archived", payload, run_id=run_id)
+     if was_running:
+         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 1147dd3aaf3..fa009f4c803 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2422,6 +2422,12 @@ def _run_reclaim_phase(
+         result.remote_archived = apply_stop_requests(conn)
+     except Exception:
+         _kb._log.warning("kanban: applying remote stop requests failed", exc_info=True)
++    # Archives of relayed capability owner cards forwarded by a Board worker node (kanban_owner_archive_relay).
++    from hermes_cli.kanban_owner_archive_relay import apply_requests as _apply_owner_archives
++    try:
++        result.remote_archived = [*result.remote_archived, *_apply_owner_archives(conn)]
++    except Exception:
++        _kb._log.warning("kanban: applying forwarded owner archives failed", exc_info=True)
+     # [daveey] Before any stale check: a long gap since the last pass is a host suspend, which the
+     # heartbeat backstop, the stale sweep and max_runtime must not count (``kanban_suspend_ledger``).
+     _record_dispatch_pass(conn, dry_run=dry_run)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index fd759f141cc..14867507a9e 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1208,8 +1208,8 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+     names = ["uid", *cols]
+     conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                  (ch.uid, *cols.values()))
+-    if table == "task_events" and ch.fields.get("kind") == "archive_requested":
+-        result.wake_dispatcher = True  # a stop request for a card this gateway may hold (kanban_remote_stop)
++    if table == "task_events" and ch.fields.get("kind") in ("archive_requested", "capability_owner_archive_requested"):
++        result.wake_dispatcher = True  # a stop request (kanban_remote_stop) or forwarded owner archive to apply
+     return True
+ 
+ 
+diff --git a/hermes_cli/kanban_owner_archive_relay.py b/hermes_cli/kanban_owner_archive_relay.py
+new file mode 100644
+index 00000000000..6bf82322abc
+--- /dev/null
++++ b/hermes_cli/kanban_owner_archive_relay.py
+@@ -0,0 +1,205 @@
++"""Archive a relayed capability owner card from the Board worker node whose card it served. [daveey]
++
++On a ``relay=home`` route (:mod:`hermes_cli.kanban_capability_routing`) the worker node parks the waiting card
++and its home gateway opens the owner card there (``_local_owner``). That owner card exists only on the home
++gateway's board. ``kanban_archive`` reads the local board, so from the waiting card's own run on the worker
++node it answered ``no such task`` and the scope rule for owner cards never ran.
++
++Now, when the local lookup misses and the worker's task has a ``relay=home`` route whose owner is that card,
++the archive goes to the home over the same channel the route used: an event on the waiting card, which the
++Board carries both ways (events are not fenced).
++
++1. Worker node (:func:`forward`): append ``capability_owner_archive_requested`` (owner, requesting task, run id
++   and run uid, a request uid) on the waiting card. Then wait, bounded, for the matching result event.
++2. Home (:func:`apply_requests`, each dispatcher tick; the pull wakes the dispatcher): apply the same
++   ``archive_scope_for`` rule as a local worker (a done or unclaimed owner card keyed
++   ``capability-owner:<waiting>:...``, with ``<waiting>`` the requesting task or a card it created). Archive
++   with the forwarded run on the ``archived`` event, then append ``capability_owner_archive_result`` with
++   the outcome or the refusal text.
++3. The worker returns that result verbatim. If the result does not arrive in time, it reports
++   ``archive_pending``. The request stays queued, and the home still answers it.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++import uuid
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++
++REQUEST_KIND = "capability_owner_archive_requested"
++RESULT_KIND = "capability_owner_archive_result"
++WAIT_S = 60.0
++POLL_S = 1.0
++VIA = "forwarded capability owner archive"
++
++
++def _sleep(seconds: float) -> None:  # tests replace this with a fake Board round trip
++    time.sleep(seconds)
++
++
++def _events(conn: sqlite3.Connection, task_id: str, kind: str) -> list[dict]:
++    out = []
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
++                               (task_id, kind)):
++        try:
++            p = json.loads(raw or "{}")
++        except ValueError:
++            continue
++        if isinstance(p, dict):
++            out.append(p)
++    return out
++
++
++def relayed_owner_route(conn: sqlite3.Connection, env_tid: str, owner_id: str) -> Optional[dict]:
++    """``{waiting, gateway, request_id}`` when ``owner_id`` is the owner card of a ``relay=home`` route of
++    ``env_tid`` or a card it created on this board; None otherwise (the miss stays ``no such task``)."""
++    from hermes_cli import kanban_capability_routing as kcr
++
++    candidates = [env_tid]
++    for (tid, raw) in conn.execute("SELECT task_id, payload FROM task_events WHERE kind = 'created'"):
++        try:
++            if json.loads(raw or "{}").get("creator_task_id") == env_tid:
++                candidates.append(tid)
++        except (ValueError, AttributeError):
++            continue
++    for waiting in candidates:
++        routes = [r for p in _events(conn, waiting, kcr.ROUTED_EVENT) for r in (p.get("routes") or [])
++                  if isinstance(r, dict)]
++        for r in routes:
++            if r.get("owner_task") != owner_id or not r.get("request_id"):
++                continue
++            rid = r["request_id"]
++            if kcr._task_of(rid) != waiting:
++                continue
++            home = next((x for x in routes if x.get("request_id") == rid and x.get("relay") == kcr.RELAY_HOME), None)
++            if home is None:
++                continue
++            return {"waiting": waiting, "gateway": home.get("gateway") or r.get("gateway"), "request_id": rid}
++    return None
++
++
++def _outbox_rows(conn: sqlite3.Connection) -> Optional[int]:
++    try:
++        return conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name = 'task_events'").fetchone()[0]
++    except sqlite3.OperationalError:
++        return None
++
++
++def _result(conn: sqlite3.Connection, waiting: str, uid: str) -> Optional[dict]:
++    return next((p for p in _events(conn, waiting, RESULT_KIND) if p.get("request_uid") == uid), None)
++
++
++def forward(conn: sqlite3.Connection, route: dict, owner_id: str, *, requester: str, run_id: Optional[int],
++            wait_s: float = WAIT_S) -> dict:
++    """Send the archive of ``owner_id`` to the route's home gateway and wait for its answer.
++
++    Returns the home's result payload (``ok`` True with ``status``, or ``ok`` False with ``error`` verbatim), or
++    ``{"ok": True, "status": "archive_pending", ...}`` when no answer arrived within ``wait_s``.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli import kanban_capability_routing as kcr
++    from hermes_cli.kanban_remote_stop import _run_uid
++
++    waiting, gateway = route["waiting"], route["gateway"]
++    uid = uuid.uuid4().hex
++    try:
++        synced = bool(sync.sync_state(conn))
++    except Exception:  # health: allow BLE001 -- an unreadable sync state is an unsynced board
++        synced = False
++    try:
++        run_uid = _run_uid(conn, requester)
++    except sqlite3.OperationalError:  # an unsynced board has no run uids
++        run_uid = None
++    payload: dict[str, Any] = {
++        "owner_task": owner_id, "requested_by_task": requester, "run_id": run_id,
++        "run_uid": run_uid, "request_id": route["request_id"], "gateway": gateway,
++        "request_uid": uid, "from_gateway": kcr._own_gateway(conn),
++    }
++    with write_txn(conn):
++        before = _outbox_rows(conn)
++        # Run ids are per board file: the forwarded run rides in the payload, not the event's run_id column.
++        kb._append_event(conn, waiting, REQUEST_KIND, payload)
++        if synced and (before is None or (_outbox_rows(conn) or 0) <= before):
++            conn.execute("DELETE FROM task_events WHERE id = (SELECT MAX(id) FROM task_events WHERE task_id = ? "
++                         "AND kind = ?)", (waiting, REQUEST_KIND))
++            return {"ok": False, "error": f"cannot archive {owner_id}: it is the capability owner card of {waiting} "
++                                          f"on {gateway}, and this board cannot forward the request there. "
++                                          "Nothing changed."}
++    deadline = time.monotonic() + wait_s
++    while True:
++        res = _result(conn, waiting, uid)
++        if res is not None:
++            return {k: v for k, v in res.items() if k != "request_uid"}
++        if time.monotonic() >= deadline:
++            return {"ok": True, "status": "archive_pending", "forwarded_to": gateway, "request_uid": uid,
++                    "message": f"forwarded to {gateway}; it archives {owner_id} on its next dispatcher pass"}
++        _sleep(POLL_S)
++
++
++def _home_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    from hermes_cli import kanban_capability_routing as kcr
++    return kcr.card_home(conn, task_id)
++
++
++def apply_requests(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
++    """Home side (each dispatcher tick): answer every forwarded owner archive this gateway has not answered.
++
++    Only the waiting card's home answers (a worker node's copy has a home elsewhere). Returns the ids archived.
++    """
++    from hermes_cli import kanban as kcli
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import write_txn
++
++    # Per-card index probes (idx_events_task), not a scan of every event on the board.
++    rows = conn.execute(
++        "SELECT t.id FROM tasks t WHERE t.status != 'archived' AND EXISTS "
++        "(SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ?)", (REQUEST_KIND,)).fetchall()
++    done: list[str] = []
++    for (waiting,) in rows:
++        if _home_of(conn, waiting) is not None:
++            continue
++        answered = {p.get("request_uid") for p in _events(conn, waiting, RESULT_KIND)}
++        for req in _events(conn, waiting, REQUEST_KIND):
++            uid = req.get("request_uid")
++            if not uid or uid in answered:
++                continue
++            answered.add(uid)
++            owner, requester = str(req.get("owner_task") or ""), str(req.get("requested_by_task") or "")
++            try:
++                result = _apply_one(conn, kcli, kb, waiting, owner, requester, req, signal_fn=signal_fn)
++            except Exception as exc:  # health: allow BLE001 -- one request must not stop the dispatcher tick
++                _log.warning("kanban: forwarded archive of %s failed", owner, exc_info=True)
++                result = {"ok": False, "error": f"cannot archive {owner}: {exc}"}
++            if result.get("ok"):
++                done.append(owner)
++            with write_txn(conn):
++                kb._append_event(conn, waiting, RESULT_KIND, {**result, "request_uid": uid, "task_id": owner})
++    return done
++
++
++def _apply_one(conn, kcli, kb, waiting: str, owner: str, requester: str, req: dict, *, signal_fn) -> dict:
++    if not owner or not requester:
++        return {"ok": False, "error": "forwarded archive request without owner_task or requested_by_task"}
++    task = kb.get_task(conn, owner)
++    if task is None:
++        return {"ok": False, "error": f"no such task: {owner}"}
++    if kcli._capability_owner_waiting_card(task) != waiting:
++        return {"ok": False, "error": f"cannot archive {owner}: it is not a capability owner card of {waiting}. "
++                                      "Only an owner card of the card the request came from is archived this way."}
++    refusal, via = kcli.archive_scope_for(conn, owner, requester)
++    if refusal:
++        return {"ok": False, "error": refusal}
++    extra = {"forwarded_from": req.get("from_gateway") or None, "forwarded_task": requester,
++             "forwarded_run_id": req.get("run_id"), "forwarded_run_uid": req.get("run_uid")}
++    extra = {k: v for k, v in extra.items() if v is not None}
++    if not kb.archive_task(conn, owner, via=f"{via} ({VIA})" if via else VIA, signal_fn=signal_fn,
++                           event_extra=extra):
++        return {"ok": False, "error": f"cannot archive {owner}"}
++    _log.info("kanban: archived capability owner %s forwarded by %s run %s", owner, requester, req.get("run_id"))
++    return {"ok": True, "status": "archived"}
+diff --git a/tests/tools/test_kanban_owner_archive_relay.py b/tests/tools/test_kanban_owner_archive_relay.py
+new file mode 100644
+index 00000000000..fc3afb7ffc4
+--- /dev/null
++++ b/tests/tools/test_kanban_owner_archive_relay.py
+@@ -0,0 +1,174 @@
++"""kanban_archive of a relayed capability owner card from a Board worker node is forwarded home. [daveey]
++
++On a ``relay=home`` route the owner card is opened on the waiting card's home gateway (``_local_owner``) and
++exists only there. From the waiting card's own run on the worker node, ``kanban_archive`` read the local board
++and answered ``no such task`` before the owner-card scope rule ran. Now the archive is forwarded through an
++event on the waiting card, the home applies the same scope rule, and the worker returns its answer verbatim.
++
++Two board files stand in for the two gateways. The Board round trip (worker -> home -> worker) is simulated in
++the worker's wait: request events are copied to the home, the home's dispatcher step runs, results come back.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_capability_routing as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_owner_archive_relay as oar
++from hermes_cli.kanban_db_connect import connect
++
++NEED = "host:macbook"
++
++
++@pytest.fixture
++def gateways(tmp_path, monkeypatch):
++    hermes = tmp_path / ".hermes"
++    hermes.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(hermes))
++    monkeypatch.setenv("HOME", str(tmp_path))
++    home_db, worker_db = tmp_path / "macbook.db", hermes / "kanban.db"
++    home, worker = connect(home_db), connect(worker_db)
++    monkeypatch.setattr(kcr, "_own_gateway", lambda conn: None)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_db))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "192")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    # Only the home answers: the worker's copy of a card has its home elsewhere.
++    monkeypatch.setattr(oar, "_home_of", lambda conn, tid: None if conn is home else "macbook")
++
++    def round_trip(_seconds):
++        _copy_events(worker, home, oar.REQUEST_KIND)
++        oar.apply_requests(home)
++        _copy_events(home, worker, oar.RESULT_KIND)
++
++    monkeypatch.setattr(oar, "_sleep", round_trip)
++    yield home, worker, home_db
++    home.close()
++    worker.close()
++
++
++def _copy_events(src, dst, kind):
++    """The Board carrying events of ``kind`` from one gateway's board file to the other's (once each)."""
++    have = {r[0] for r in dst.execute("SELECT payload FROM task_events WHERE kind = ?", (kind,))}
++    for task_id, payload, created_at in src.execute(
++            "SELECT task_id, payload, created_at FROM task_events WHERE kind = ? ORDER BY id", (kind,)).fetchall():
++        if payload not in have:
++            with kb.write_txn(dst):
++                dst.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                            (task_id, kind, payload, created_at))
++
++
++def _copy_card(home, worker, home_db, tid):
++    """The worker node's copy of a home card (same id), as Board pickup imports it."""
++    if kb.get_task(worker, tid) is not None:
++        return
++    worker.execute("ATTACH DATABASE ? AS h", (str(home_db),))
++    try:
++        with kb.write_txn(worker):
++            worker.execute("INSERT INTO main.tasks SELECT * FROM h.tasks WHERE id = ?", (tid,))
++            worker.execute("INSERT INTO main.task_events (task_id, kind, payload, created_at) "
++                           "SELECT task_id, kind, payload, created_at FROM h.task_events WHERE task_id = ?", (tid,))
++    finally:
++        worker.execute("DETACH DATABASE h")
++
++
++def _relayed(home, worker, home_db, monkeypatch, *, creator=None):
++    """A waiting card on the home, run by the worker node, whose need the home routed to a local owner card.
++
++    Returns (waiting, owner, requester). ``creator`` makes the waiting card a probe that card created.
++    """
++    requester = kb.create_task(home, title="live verify") if creator is None else creator
++    waiting = requester if creator is None else kb.create_task(home, title="PROBE", creator_task_id=creator)
++    for tid in {requester, waiting}:
++        _copy_card(home, worker, home_db, tid)
++    rid = kcr.request_id(waiting, NEED)
++    relay = {"routes": [{"need": NEED, "gateway": "macbook", "checked_at": None, "request_id": rid, "generation": 1,
++                         "relay": kcr.RELAY_HOME, "relayed_at": 1, "from_gateway": "worker-1"}],
++             "local": [], "self_gateway": "worker-1", "relay": kcr.RELAY_HOME, "reason": "run sw_vers"}
++    for conn in (worker, home):  # _park_relay on the worker; the Board carries it home
++        with kb.write_txn(conn):
++            kb._append_event(conn, waiting, kcr.ROUTED_EVENT, relay)
++    kcr._local_owner(home, kb.get_task(home, waiting), {"generation": 1}, need=NEED, rid=rid, self_gw="macbook",
++                     from_gw="worker-1", reason="run sw_vers")
++    owner = home.execute("SELECT id FROM tasks WHERE idempotency_key = ?", (rid,)).fetchone()[0]
++    _copy_events(home, worker, kcr.ROUTED_EVENT)  # the owner_task route reaches the worker's copy
++    assert kb.get_task(worker, owner) is None  # the owner card is only on the home
++    monkeypatch.setenv("HERMES_KANBAN_TASK", requester)
++    return waiting, owner, requester
++
++
++def _archive(tid):
++    from tools import kanban_tools as kt
++
++    return json.loads(kt._handle_archive({"task_id": tid}))
++
++
++def _archived_payload(conn, tid):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived' "
++                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++    return json.loads(row[0]) if row and row[0] else None
++
++
++def test_worker_node_archive_of_relayed_done_owner_is_forwarded_and_applied_home(gateways, monkeypatch):
++    home, worker, home_db = gateways
++    waiting, owner, requester = _relayed(home, worker, home_db, monkeypatch)
++    assert kb.complete_task(home, owner, summary="sw_vers: 26.1")
++    out = _archive(owner)
++    assert out.get("ok") is True, out
++    assert out.get("status") == "archived"
++    assert kb.get_task(home, owner).status == "archived"
++    event = _archived_payload(home, owner) or {}
++    assert event.get("forwarded_task") == requester
++    assert event.get("forwarded_run_id") == 192
++    assert event.get("via", "").startswith(f"capability owner of {waiting} by {requester}")
++
++
++def test_worker_node_archive_of_its_probes_relayed_owner_is_forwarded(gateways, monkeypatch):
++    home, worker, home_db = gateways
++    parent = kb.create_task(home, title="live verify")
++    _copy_card(home, worker, home_db, parent)
++    _waiting, owner, _ = _relayed(home, worker, home_db, monkeypatch, creator=parent)
++    assert _archive(owner).get("ok") is True
++    assert kb.get_task(home, owner).status == "archived"
++
++
++def test_claimed_relayed_owner_is_refused_with_the_homes_text(gateways, monkeypatch):
++    home, worker, home_db = gateways
++    _waiting, owner, _ = _relayed(home, worker, home_db, monkeypatch)
++    assert kb.claim_task(home, owner) is not None
++    out = _archive(owner)
++    assert out.get("ok") is not True
++    assert "is claimed" in json.dumps(out)
++    assert kb.get_task(home, owner).status == "running"
++
++
++def test_another_cards_relayed_owner_is_not_forwarded(gateways, monkeypatch):
++    home, worker, home_db = gateways
++    _waiting, owner, _ = _relayed(home, worker, home_db, monkeypatch)
++    other = kb.create_task(worker, title="unrelated worker task")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", other)
++    assert kb.complete_task(home, owner, summary="done")
++    out = _archive(owner)
++    assert out.get("ok") is not True
++    assert "no such task" in json.dumps(out)
++    assert kb.get_task(home, owner).status == "done"
++    assert not worker.execute("SELECT 1 FROM task_events WHERE kind = ?", (oar.REQUEST_KIND,)).fetchone()
++
++
++def test_home_refuses_a_forged_request_for_another_cards_owner(gateways, monkeypatch):
++    """The home re-checks scope: a request riding on card A for B's owner card is refused there."""
++    home, worker, home_db = gateways
++    _a, _owner_a, requester = _relayed(home, worker, home_db, monkeypatch)
++    b = kb.create_task(home, title="other waiting card")
++    rid_b = kcr.request_id(b, NEED)
++    kcr._local_owner(home, kb.get_task(home, b), {"generation": 1}, need=NEED, rid=rid_b, self_gw="macbook",
++                     from_gw="worker-1", reason="x")
++    owner_b = home.execute("SELECT id FROM tasks WHERE idempotency_key = ?", (rid_b,)).fetchone()[0]
++    assert kb.complete_task(home, owner_b, summary="done")
++    route = {"waiting": requester, "gateway": "macbook", "request_id": kcr.request_id(requester, NEED)}
++    out = oar.forward(worker, route, owner_b, requester=requester, run_id=192, wait_s=5)
++    assert out.get("ok") is False, out
++    assert "not a capability owner card of" in out["error"]
++    assert kb.get_task(home, owner_b).status == "done"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 2b8f1774a51..99c370bc2f1 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1986,6 +1986,18 @@ def _handle_archive(args: dict, **kw) -> str:
+     _check(tid, "task_id is required")
+     tid = str(tid)
+     with _board(args.get("board")) as (_kb, conn):
++        # [daveey] A relay=home capability owner card lives only on the waiting card's home gateway: from a Board
++        # worker node the local lookup misses, so forward the archive there (kanban_owner_archive_relay).
++        env_tid = os.environ.get("HERMES_KANBAN_TASK")
++        if env_tid and env_tid != tid and _kb.get_task(conn, tid) is None:
++            from hermes_cli import kanban_owner_archive_relay as _oar
++            route = _oar.relayed_owner_route(conn, env_tid, tid)
++            if route is not None:
++                out = _oar.forward(conn, route, tid, requester=env_tid, run_id=_worker_run_id(env_tid))
++                if not out.pop("ok", False):
++                    raise _Reject(str(out.get("error") or f"cannot archive {tid}"))
++                out.pop("task_id", None)
++                return _ok(task_id=tid, **out)
+         from hermes_cli.kanban import worker_archive_scope
+         refusal, via = worker_archive_scope(conn, tid)
+         if refusal:
+-- 
+2.55.0
+

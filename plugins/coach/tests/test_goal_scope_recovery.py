@@ -24,6 +24,10 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(gd, 'aux_judge', judge)
     yield db, seen, events
     db.close()
+    # The HERMES_HOME bootstrap drops ~370MB (uv cache, installs) per test; don't leave it behind.
+    import shutil
+    for sub in ('cache', 'installs'):
+        shutil.rmtree(tmp_path / sub, ignore_errors=True)
 
 def session(db, sid, parent=None):
     from hermes_cli.profiles import get_active_profile_name

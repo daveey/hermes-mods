@@ -31,11 +31,20 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - **`pre_final_gate`** (buffered): when the turn made no `session_outcome` call, it asks core
   `derive_outcome(sid, ignore_live_turn=True, pending_reply=<the candidate reply>)`. Only
   `unresolved{no_summary}` holds the reply, once, with a request for the call. Core's own precedence decides, so
-  decisions, waits and mutes pass, and an undecided judge falls back to core's heuristic. The nudge carries
+  decisions, waits and mutes pass. Inside the gate the judge gets a 15 s budget (6 s elsewhere): the gate runs in a
+  busy Desktop serve process under a 30 s hook limit, with the reply already buffered. When the judge still gives
+  up (timeout, error, no YES/NO) and only core's heuristic called the reply a summary, the gate also holds once.
+  A later refresh whose judge works (the auditor's CLI `outcome-audit --refresh`) could otherwise flip that
+  heuristic `done` to `unresolved{no_summary}`, and nobody would have been asked. Judge give-ups are logged at
+  INFO (`session-outcome judge gave up for <sid> after Ns (gate)`). The nudge carries
   `[session-outcome]`. When it is already in the turn (or this gate held earlier in the turn), the reply passes. It
   never asks twice in a turn. A core whose `derive_outcome` lacks those keywords, or any error, passes.
 - **Per-turn call record**: a call is recorded as (session, tool call id) and counts only for a gate whose turn
   holds that call id, so it never carries into the next turn.
+- **The gate's turn starts at the last user row that is not its own nudge**, kanban notices included. Core's
+  `turn_messages` starts at the last *typed* message, so a turn a notice started also carried the earlier turns:
+  their `session_outcome` call let the notice turn's reply pass undeclared and unasked, and their nudge counted as
+  "already asked".
 - **`decide` is all or nothing**: every item is validated before any write; a failed write or a rejected
   declaration removes the steps this call added (pre-existing steps it matched are kept).
 - **No core**: without `hermes_state_outcome` the plugin loads, the tool is not offered, the gate passes and
@@ -51,10 +60,15 @@ the outcome and feeds core the two things only plugins know: open user decisions
 - decide is all or nothing: a bad later item writes nothing; a failed write or a rejected declaration keeps nothing
   this call added;
 - the call record is per turn (same turn passes, the next turn and another chat are asked);
+- a notice-started turn ignores the earlier turns' call (by tool name and by call id) and nudge, and still counts
+  its own call and nudge;
 - the judge skips non-interactive sources (by `source=` and by session row) without a model call;
 - decide writes ledger steps with options and choices, then declares;
 - the provider returns open steps as decision items;
 - the judge: YES/NO, timeout → None, failure or unclear answer → None, the default path calls pool `fast` tier;
+- the gate holds once when the judge gives up (error, unclear answer, cached unclear answer, timeout) and only the
+  heuristic said done, and the second miss passes; the gate's judge budget is longer than a refresh's; the gate's
+  scope does not leak into a later refresh; a wait that outranks the judge still passes;
 - the judge gets a long reply's head and tail (whole when short), wrapped in `<message>`;
 - the judge gets the user's latest real request (synthetic rows and the nudge skipped, capped), or none;
 - the default pool path turns thinking off (`pool-llm` `complete(thinking=...)` puts it in the Anthropic body);

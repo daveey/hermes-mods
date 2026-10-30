@@ -1,0 +1,385 @@
+From ca663706e9bf21ba4b27511049b659539799eab2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 09:17:17 +0000
+Subject: [PATCH] feat(kanban): re-check standing human asks each dispatcher
+ tick [daveey]
+
+sweep_agent_owned_blocks skips blocks that carry a human_request, and the ask
+lint runs only when an agent files the block, so a standing ask was never
+looked at again: on 10-30 11 of 25 hub asks were void.
+
+sweep_standing_asks (same tick) moves a blocked card with a human_request and
+no live run to agent triage, with an ask_rechecked event (code, reason, old
+ask), when (a) agent_relay_ask_error / agent_route_gap_error refuses it today,
+or (b) it names at least one card on this board and all are done/archived.
+Once per block event; an ask re-filed unchanged after a recheck stands.
+
+_RELAY also matches 'from an owner (Hermes) chat', 'from any owner chat' and
+'from an owner Hermes Desktop or CLI chat' (hub t_01a1848506cae619).
+ask_rechecked counts as agent triage in kanban_wait_info.
+---
+ hermes_cli/kanban_block_policy.py           | 107 +++++++++++-
+ hermes_cli/kanban_db_dispatch.py            |  11 +-
+ hermes_cli/kanban_wait_info.py              |   4 +-
+ tests/hermes_cli/test_kanban_ask_recheck.py | 180 ++++++++++++++++++++
+ 4 files changed, 293 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ask_recheck.py
+
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index 370ec3ba286..92fa94941ae 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -88,7 +88,11 @@ _RELAY = re.compile(
+     r"|\b(?:ask|tell|have|get)\s+your\s+(?:own\s+)?(?:hermes\s+)?(?:desktop\s+|cli\s+)?"
+     r"(?:chat|session|agent)\b"
+     # "or from a Hermes chat there" (MacBook card t_01a18b13ee350599): the same relay through any chat. [daveey]
+-    r"|\b(?:from|in|via|using)\s+(?:a|an|any|the)\s+hermes\s+(?:desktop\s+|cli\s+)?(?:chat|session)\b",
++    r"|\b(?:from|in|via|using)\s+(?:a|an|any|the)\s+hermes\s+(?:desktop\s+|cli\s+)?(?:chat|session)\b"
++    # "from an owner Hermes chat" (hub t_01a1848506cae619), "from any owner chat", "from an owner Hermes Desktop or
++    # CLI chat": an owner chat is an agent the ask makes David relay to. [daveey]
++    r"|\b(?:from|in|via|using)\s+(?:a|an|any|the)\s+owner\s+(?:hermes\s+)?(?:desktop\s+|cli\s+)?(?:or\s+cli\s+)?"
++    r"(?:chat|session)\b",
+     re.IGNORECASE)
+ 
+ ROUTE_GAP_CODE = "agent_route_gap"
+@@ -236,3 +240,104 @@ def sweep_agent_owned_blocks(conn: sqlite3.Connection, *, now: Optional[int] = N
+                     "reason": evidence, "kind": row["block_kind"], "blocked_at": started})
+                 escalated.append(tid)
+     return escalated
++
++
++RECHECK_EVENT = "ask_rechecked"
++NAMED_CLOSED_CODE = "named_cards_closed"
++# "macbook/t_..." is another board's card: this board cannot judge it, so it is not collected.
++_TASK_ID = re.compile(r"(?<![\w/])t_[0-9a-f]{8,16}\b")
++
++
++def _named_task_ids(title, request: dict, own_id: str) -> list[str]:
++    text = " ".join([str(title or "")] + [str(request.get(k) or "") for k in ("action", "why_human", "evidence")])
++    return sorted({m.group(0) for m in _TASK_ID.finditer(text)} - {own_id})
++
++
++def _action_line(request) -> str:
++    return " ".join(str((request or {}).get("action") or "").split())
++
++
++def standing_ask_error(conn: sqlite3.Connection, task_id: str, title, request) -> Optional[tuple[str, str, dict]]:
++    """``(code, reason, extra)`` when a standing ask no longer holds, else None.
++
++    (a) the relay / route-gap lint refuses it today (an ask filed before a rule landed is never re-linted);
++    (b) it names at least one card and every named card is done or archived on this board (its premise is gone).
++    An id this board does not hold counts as open: it cannot be verified here.
++    """
++    if not isinstance(request, dict):
++        return None
++    err = agent_relay_ask_error(_action_line(request)) or agent_route_gap_error(request)
++    if err:
++        return (RELAY_ASK_CODE if err.startswith(RELAY_ASK_CODE) else ROUTE_GAP_CODE), err, {}
++    named = _named_task_ids(title, request, task_id)
++    if not named:
++        return None
++    marks = ",".join("?" for _ in named)
++    rows = {r["id"]: r["status"] for r in conn.execute(
++        f"SELECT id, status FROM tasks WHERE id IN ({marks})", named).fetchall()}
++    if len(rows) != len(named) or any(s not in ("done", "archived") for s in rows.values()):
++        return None
++    closed = ", ".join(f"{t} ({rows[t]})" for t in named)
++    return (NAMED_CLOSED_CODE,
++            f"{NAMED_CLOSED_CODE}: every card this ask names is closed ({closed}), so its premise is likely gone.",
++            {"named": named})
++
++
++def sweep_standing_asks(conn: sqlite3.Connection) -> list[str]:
++    """Re-check blocked cards that carry a human_request; move void ones to agent triage.
++
++    ``sweep_agent_owned_blocks`` skips blocks with a human ask and the ask lint runs only when an agent files the
++    block, so a standing ask was never looked at again: on 10-30 11 of 25 hub asks were void (filed before a lint
++    rule, or every card they named long done). One ``ask_rechecked`` move per block event; a card with a live run
++    is left alone; an ask re-filed unchanged after a recheck stands (the agent that re-checked it kept it). The
++    card's ask is cleared so ``sweep_stale_triage`` hands it to an agent; the event keeps the old ask. [daveey]
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db import _json_dict
++    moved: list[str] = []
++    rows = conn.execute(
++        "SELECT id, title, human_request FROM tasks WHERE status = 'blocked' AND human_request IS NOT NULL "
++        "AND current_run_id IS NULL").fetchall()
++    for row in rows:
++        tid = row["id"]
++        request = _json_dict(row["human_request"])
++        if not request:
++            continue
++        ev = conn.execute(
++            "SELECT id FROM task_events WHERE task_id = ? AND kind IN ('blocked','block_loop_detected','created') "
++            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        ev_id = int(ev["id"]) if ev is not None else 0
++        prior = [(int(r["id"]), _json_dict(r["payload"])) for r in conn.execute(
++            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ?", (tid, RECHECK_EVENT)).fetchall()]
++        if any(pid > ev_id for pid, _ in prior):
++            continue
++        found = standing_ask_error(conn, tid, row["title"], request)
++        if found is None:
++            continue
++        code, reason, extra = found
++        if any(p.get("code") == code and _action_line(p.get("human_request")) == _action_line(request)
++               for _, p in prior):
++            continue
++        with kb.write_txn(conn):
++            changed = conn.execute(
++                "UPDATE tasks SET status = 'triage', block_kind = 'transient', human_request = NULL "
++                "WHERE id = ? AND status = 'blocked' AND human_request IS NOT NULL AND current_run_id IS NULL",
++                (tid,)).rowcount
++            if changed:
++                kb._append_event(conn, tid, RECHECK_EVENT, {
++                    "code": code, "human_request": request, **extra,
++                    "reason": reason + " Re-check the ask: finish the card, route the work to an agent, or "
++                    "re-file a real human_request."})
++                moved.append(tid)
++    return moved
++
++
++def sweep_blocked_cards(conn: sqlite3.Connection, result) -> None:
++    """Dispatcher-tick entry for both blocked-card sweeps; each is isolated so one failing never skips the other."""
++    from hermes_cli import kanban_db as kb
++    for name, sweep, out in (("agent-owned block", sweep_agent_owned_blocks, result.agent_block_escalated),
++                             ("standing-ask recheck", sweep_standing_asks, result.ask_rechecked)):
++        try:
++            out.extend(sweep(conn))
++        except sqlite3.Error:
++            kb._log.exception("kanban: %s sweep failed", name)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 1eb062c298b..cd9915f96af 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -198,6 +198,8 @@ class DispatchResult:
+     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+     agent_block_escalated: list[str] = field(default_factory=list)
+     """Agent-owned blocks older than 2h re-spawned through triage."""
++    ask_rechecked: list[str] = field(default_factory=list)
++    """Standing human asks found void (relay lint, every named card closed) and moved to agent triage."""
+     timed_out: list[str] = field(default_factory=list)
+     """Task ids whose workers exceeded ``max_runtime_seconds``."""
+     woken_continuations: list[str] = field(default_factory=list)
+@@ -2703,12 +2705,9 @@ def _dispatch_once_locked(
+         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board, dry_run=dry_run,
+     )
+     if not dry_run:
+-        # Agent-owned blocks (no human ask / wake probe) get one triage respawn after 2h.
+-        try:
+-            from hermes_cli.kanban_block_policy import sweep_agent_owned_blocks
+-            result.agent_block_escalated.extend(sweep_agent_owned_blocks(conn))
+-        except sqlite3.Error:
+-            _kb._log.exception("kanban: agent-owned block sweep failed")
++        # Agent-owned blocks get one triage respawn after 2h; standing human asks are re-checked every tick.
++        from hermes_cli.kanban_block_policy import sweep_blocked_cards
++        sweep_blocked_cards(conn, result)
+     may_spawn, spawn_budget = _tick_spawn_budget(
+         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+     )
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index 761ad744cac..89caca3438f 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -38,11 +38,11 @@ AGENT_BLOCK_KINDS = ("transient", "capability", "assignment", "needs_input")
+ # ``continued`` is a continuation checkpoint parking the card ``scheduled`` with a ``wake_at``.
+ PARK_EVENT_KINDS = ("scheduled", "blocked", "gave_up", "continuation_exhausted", "block_loop_detected",
+                     "triage_swept", "supervisor_escalated", "continued", "status", "dependency_wait",
+-                    "agent_block_escalated")
++                    "agent_block_escalated", "ask_rechecked")
+ # Triage reached this way is agent work (the worker gave up / ran out of budget / was escalated to a supervisor).
+ # Triage after a block loop waits on a human or a shared blocker; triage from intake (no park event) belongs to
+ # its specifier.
+-AGENT_TRIAGE_EVENTS = ("gave_up", "continuation_exhausted", "supervisor_escalated", "triage_swept")
++AGENT_TRIAGE_EVENTS = ("gave_up", "continuation_exhausted", "supervisor_escalated", "triage_swept", "ask_rechecked")
+ # A replicated card carries only its last run's outcome; these outcomes mean a run failed into triage.
+ _FAILED_RUN_OUTCOMES = ("gave_up", "reclaimed", "crashed", "timed_out", "oom_killed", "continuation_exhausted")
+ 
+diff --git a/tests/hermes_cli/test_kanban_ask_recheck.py b/tests/hermes_cli/test_kanban_ask_recheck.py
+new file mode 100644
+index 00000000000..54dbbcd2475
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ask_recheck.py
+@@ -0,0 +1,180 @@
++"""Standing human asks are re-checked: a void ask (relay lint, every named card closed) goes back to agent triage."""
++import json
++import time
++
++import pytest
++
++GEN3 = ("Request gen3 replacement provisioning from an owner Hermes chat so the supported system-config approval "
++        "flow can run, then unblock this card.")
++PHONE = ("Make one brief call from your cell phone to Baby Bear's number ending 0588, then reply called and "
++         "unblock this card.")
++
++
++def _ask(action, *, why="only David can", evidence="checked the board"):
++    return {"action": action, "why_human": why, "interaction": "reply", "scope": "this card", "evidence": evidence}
++
++
++@pytest.fixture
++def conn(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    c = kbc.connect()
++    yield c
++    c.close()
++
++
++def _blocked(conn, request, *, title="worker-test"):
++    from hermes_cli import kanban_db as kb
++    tid = kb.create_task(conn, title=title, assignee="test-worker")
++    kb.claim_task(conn, tid)
++    assert kb.block_task(conn, tid, reason="waiting on David", kind="needs_input", human_request=request)
++    assert kb.get_task(conn, tid).status == "blocked"
++    return tid
++
++
++def _set_status(conn, tid, status):
++    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    conn.commit()
++
++
++def _events(conn, tid):
++    return [json.loads(r["payload"] or "{}") for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'ask_rechecked' ORDER BY id", (tid,))]
++
++
++def _sweep(conn):
++    from hermes_cli.kanban_block_policy import sweep_standing_asks
++    return sweep_standing_asks(conn)
++
++
++def test_relay_lint_failure_moves_card_to_triage(conn):
++    from hermes_cli import kanban_db as kb
++    tid = _blocked(conn, _ask(GEN3))
++    assert _sweep(conn) == [tid]
++    task = kb.get_task(conn, tid)
++    assert task.status == "triage" and task.human_request is None
++    (ev,) = _events(conn, tid)
++    assert ev["code"] == "agent_relay_ask" and "agent_relay_ask" in ev["reason"]
++    assert ev["human_request"]["action"] == GEN3
++
++
++def test_route_gap_failure_moves_card_to_triage(conn):
++    tid = _blocked(conn, _ask("Run the 8 drain test files on the MacBook and paste the results here. Unblock = "
++                              "close; archive = drop.", why="No agent route to the MacBook",
++                              evidence="needs=['host:macbook'] -> no_capability_holder"))
++    assert _sweep(conn) == [tid]
++    assert _events(conn, tid)[0]["code"] == "agent_route_gap"
++
++
++def test_all_named_cards_closed_moves_card_to_triage(conn):
++    from hermes_cli import kanban_db as kb
++    a = kb.create_task(conn, title="named a")
++    b = kb.create_task(conn, title="named b")
++    tid = _blocked(conn, _ask(f"Approve the deploy once {a} lands. Unblock = deploy; archive = drop.",
++                              evidence=f"waiting on {b}"))
++    assert _sweep(conn) == []  # both named cards open: the ask stands
++    _set_status(conn, a, "done")
++    assert _sweep(conn) == []  # one still open
++    _set_status(conn, b, "archived")
++    assert _sweep(conn) == [tid]
++    assert kb.get_task(conn, tid).status == "triage"
++    (ev,) = _events(conn, tid)
++    assert ev["code"] == "named_cards_closed" and sorted(ev["named"]) == sorted([a, b])
++    assert a in ev["reason"] and b in ev["reason"]
++
++
++def test_named_id_not_on_this_board_is_untouched(conn):
++    tid = _blocked(conn, _ask("Approve once macbook/t_0123456789abcdef is done. Unblock = go; archive = drop."))
++    assert _sweep(conn) == []
++    from hermes_cli import kanban_db as kb
++    assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_real_ask_is_untouched(conn):
++    from hermes_cli import kanban_db as kb
++    tid = _blocked(conn, _ask(PHONE, why="needs David's phone", evidence="bb voice line has no agent dialer"))
++    assert _sweep(conn) == []
++    task = kb.get_task(conn, tid)
++    assert task.status == "blocked" and task.human_request["action"] == PHONE
++    assert _events(conn, tid) == []
++
++
++def test_one_escalation_per_block_event(conn):
++    from hermes_cli import kanban_db as kb
++    tid = _blocked(conn, _ask(GEN3))
++    assert _sweep(conn) == [tid]
++    # Put it back as it was without a new block event: later ticks must not escalate again.
++    conn.execute("UPDATE tasks SET status = 'blocked', human_request = ? WHERE id = ?",
++                 (json.dumps(_ask(GEN3)), tid))
++    conn.commit()
++    assert _sweep(conn) == []
++    assert _sweep(conn) == []
++    assert len(_events(conn, tid)) == 1
++    # A new block event with a different void ask is checked again.
++    _set_status(conn, tid, "ready")
++    kb.claim_task(conn, tid)
++    other = "Ask your Hermes chat to rotate the key. Unblock = rotate; archive = drop."
++    assert kb.block_task(conn, tid, reason="again", kind="needs_input", human_request=_ask(other))
++    assert _sweep(conn) == [tid]
++    assert len(_events(conn, tid)) == 2
++
++
++def test_reblocked_same_ask_after_recheck_is_not_escalated_again(conn):
++    """An agent that re-checked the ask and re-blocked it unchanged judged it still stands: no recheck loop."""
++    from hermes_cli import kanban_db as kb
++    a = kb.create_task(conn, title="named a")
++    _set_status(conn, a, "done")
++    request = _ask(f"Approve the rollout now that {a} is done. Unblock = roll out; archive = drop.")
++    tid = _blocked(conn, request)
++    assert _sweep(conn) == [tid]
++    _set_status(conn, tid, "ready")
++    kb.claim_task(conn, tid)
++    assert kb.block_task(conn, tid, reason="still needed", kind="needs_input", human_request=request)
++    assert _sweep(conn) == []
++    assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_card_with_live_run_is_untouched(conn):
++    from hermes_cli import kanban_db as kb
++    tid = _blocked(conn, _ask(GEN3))
++    run_id = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0]
++    conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, tid))
++    conn.commit()
++    assert _sweep(conn) == []
++    assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_triaged_recheck_reads_as_agent_work():
++    from hermes_cli import kanban_wait_info as kwi
++    assert "ask_rechecked" in kwi.PARK_EVENT_KINDS and "ask_rechecked" in kwi.AGENT_TRIAGE_EVENTS
++
++
++def test_relay_pattern_matches_owner_chat_phrasings():
++    from hermes_cli.kanban_block_policy import _RELAY, agent_relay_ask_error
++    assert agent_relay_ask_error(GEN3)
++    for text in ("Request it from an owner chat, then unblock.",
++                 "Ask from any owner chat. Unblock = go; archive = drop.",
++                 "Run it from an owner Hermes Desktop or CLI chat. Unblock = go; archive = drop."):
++        assert _RELAY.search(text), text
++    for text in ("Reply 'go' in the chat (or name a different agreement formula). Unblock = build all PRs per the "
++                 "plan; archive = drop the build.",
++                 "Yes/no on ONE more E1 reboot-matrix EC2 launch. Unblock (yes) = launch once; Archive (no) = hand "
++                 "off without it.",
++                 PHONE):
++        assert not _RELAY.search(text), text
++
++
++def test_dispatch_tick_runs_the_sweep(conn):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as kbd
++    tid = _blocked(conn, _ask(GEN3))
++    res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=False)
++    assert tid in res.ask_rechecked
++    assert kb.get_task(conn, tid).status == "triage"
+-- 
+2.55.0
+

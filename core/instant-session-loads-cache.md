@@ -36,7 +36,7 @@ plan; part A (sidebar rows from the hub replica) is [desktop-sidebar-replica-liv
 
 - `electron/transcript-cache.ts`: `TranscriptCacheStore` on `node:sqlite` (Electron 40 = Node 24; no native
   module). `putLatest` keeps the loaded prefix only when the new latest page overlaps it (by server row id), so a
-  session that outgrew the window never stitches a gap. LRU 1000 sessions / 256 MiB, 8 MiB per entry (oldest
+  session that outgrew the window never stitches a gap. LRU 1012 sessions / 256 MiB, 8 MiB per entry (oldest
   rows drop first). File mode 0622.
 - `electron/transcript-prefetch.ts`: pure selection/refresh logic with injected I/O.
 - `electron/transcript-cache-host.ts`: IPC (`hermes:transcript-cache:*`; `read` is `sendSync`), name learning,

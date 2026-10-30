@@ -121,3 +121,26 @@ def test_sink_writes_jsonl_and_log_line(tmp_path, caplog):
         sink(rep)
     assert "slow request GET /api/plugins/hub-sync/status 2.79s" in caplog.text and "b.py:2 g" in caplog.text
     assert json.loads((tmp_path / "logs" / "loop-watch.jsonl").read_text())["total_s"] == 2.79
+
+
+def test_sink_names_the_busy_worker_when_the_request_waits_behind_middleware(tmp_path, caplog):
+    """The parked chain of a request behind BaseHTTPMiddleware is call_next's stream wait (anyio Event.wait): it
+    names no handler, and a card once chased it as a thread-limiter wait. The log line names the busiest worker."""
+    sink = rt.default_sink(tmp_path / "loop-watch.jsonl")
+    hop = ["starlette/middleware/base.py:193 __call__", "hermes_cli/web_server.py:990 _dashboard_health_middleware",
+           "starlette/middleware/base.py:151 call_next", "anyio/streams/memory.py:126 receive",
+           "anyio/_backends/_asyncio.py:1866 wait", "3.14/asyncio/locks.py:213 wait", "<awaiting FutureIter>"]
+    rep = {"kind": "slow_request", "started": "01:42:34.600", "method": "GET", "path": "/api/sessions/x",
+           "total_s": 5.05, "responded": True, "status": 200, "samples": 14,
+           "awaiting": [{"n": 14, "chain": hop}], "other_tasks": [],
+           "worker_threads": [{"n": 6, "thread": "AnyIO", "stack": [
+               "anyio/_backends/_asyncio.py:1033 run", "a.py:1 handler", "ksa.py:1848 attention_task_counts",
+               "core.py:629 needs_attention"]}]}
+    with caplog.at_level("WARNING", logger="loop-watch"):
+        sink(rep)
+    assert "busy=AnyIO(6): a.py:1 handler > ksa.py:1848 attention_task_counts > core.py:629 needs_attention" in caplog.text
+    caplog.clear()
+    rep["awaiting"] = [{"n": 6, "chain": ["a.py:1 f", "b.py:2 g", "<awaiting Future>"]}]
+    with caplog.at_level("WARNING", logger="loop-watch"):
+        sink(rep)
+    assert "busy=" not in caplog.text  # a request parked on its own await already names it

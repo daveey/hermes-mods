@@ -1,0 +1,200 @@
+From 851380a4f11612587635923fa8ad28bf436988b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:45:25 -0700
+Subject: [PATCH] fix(kanban): release origin obligations accepted at an
+ already terminal, verified version [daveey]
+
+The accept INSERT omitted released (default 0). An obligation accepted after its owner card was already
+done with verified evidence never saw a newer replica version, so refresh_observations never advanced it
+and the origin session counted a finished card as unfinished forever.
+
+- accept_binding stores released = terminal and verified owner evidence.
+- refresh_observations heals rows left unreleased at a terminal, verified version by the old INSERT.
+- Tests: terminal+verified accept releases; terminal unverified stays unknown; nonterminal unchanged;
+  stuck legacy row heals on refresh.
+---
+ hermes_cli/kanban_origin_ledger.py            | 47 ++++++++---
+ .../test_kanban_origin_terminal_accept.py     | 77 +++++++++++++++++++
+ 2 files changed, 112 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_terminal_accept.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 08de56fa81c..9d0b20227f3 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -283,6 +283,23 @@ def _owner_evidence(task: dict) -> dict:
+     return evidence
+ 
+ 
++def _verified_terminal(task: dict) -> bool:
++    """The release invariant: a terminal owner record with verified completion evidence is released."""
++    return (isinstance(task, dict) and task.get('status') in ('done', 'archived')
++            and _owner_evidence(task).get('verified') is True)
++
++
++def _stuck_unreleased(task_raw: str, released: int) -> bool:
++    """[daveey] A row stored unreleased at a terminal, verified version (the pre-fix accept INSERT omitted
++    ``released``). No newer replica version will ever arrive for it, so the version check cannot heal it."""
++    if released:
++        return False
++    try:
++        return _verified_terminal(json.loads(task_raw))
++    except (ValueError, TypeError):
++        return False
++
++
+ def _advanced_observation(binding_raw: str, observed: int, source: sqlite3.Connection) -> tuple | None:
+     """``(task, version, released)`` when the replica holds a newer, exactly bound record for this obligation."""
+     binding = json.loads(binding_raw)
+@@ -304,9 +321,7 @@ def _advanced_observation(binding_raw: str, observed: int, source: sqlite3.Conne
+             {k: v for k, v in m.items() if k != 'publication_version'}
+             for m in markers if isinstance(m, dict)]:
+         return None
+-    released = (task.get('status') in ('done', 'archived')
+-                and _owner_evidence(task).get('verified') is True)
+-    return task, row[0], released
++    return task, row[0], _verified_terminal(task)
+ 
+ 
+ def refresh_observations(path: Path, replica: Path, *, timeout: float = 5) -> None:
+@@ -329,19 +344,24 @@ def refresh_observations(path: Path, replica: Path, *, timeout: float = 5) -> No
+         try:
+             with closing(_ro(path)) as ledger:
+                 pending = any(
+-                    _advanced_observation(raw, observed, source) is not None
+-                    for raw, observed in ledger.execute(
+-                        "SELECT binding_json,observation_version FROM origin_obligations").fetchall())
++                    _stuck_unreleased(task_raw, released)
++                    or _advanced_observation(raw, observed, source) is not None
++                    for raw, observed, task_raw, released in ledger.execute(
++                        "SELECT binding_json,observation_version,task_json,released FROM origin_obligations"
++                    ).fetchall())
+         except sqlite3.OperationalError:
+             pending = True  # no table yet (or unreadable read-only): the locked path below decides
+         if not pending:
+             return
+         with _db(path, timeout=timeout) as conn, conn:
+             conn.execute("BEGIN IMMEDIATE")
+-            for key, raw, observed in conn.execute(
+-                    "SELECT binding_id,binding_json,observation_version FROM origin_obligations").fetchall():
++            for key, raw, observed, task_raw, stored_released in conn.execute(
++                    "SELECT binding_id,binding_json,observation_version,task_json,released"
++                    " FROM origin_obligations").fetchall():
+                 advanced = _advanced_observation(raw, observed, source)
+                 if advanced is None:
++                    if _stuck_unreleased(task_raw, stored_released):
++                        conn.execute("UPDATE origin_obligations SET released=1 WHERE binding_id=?", (key,))
+                     continue
+                 task, version, released = advanced
+                 conn.execute(
+@@ -460,8 +480,8 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                         task = local
+                         released = _owner_evidence(task).get('verified') is True
+                 status = task.get('status')
+-                # Acceptance alone is not a release, including an initially
+-                # terminal publication. Unknown status also remains unfinished.
++                # Acceptance alone is not a release: an initially terminal publication releases only with
++                # verified owner evidence (checked above). Unknown status also remains unfinished.
+                 known = status in ('todo', 'ready', 'running', 'scheduled', 'review',
+                                    'blocked', 'triage', 'done', 'archived')
+                 # [daveey] A currently observed owner archive without a verified completion produces nothing: the
+@@ -558,8 +578,11 @@ def accept_binding(*, path: Path, replica: Path, binding: dict, request_id: str,
+             # An immutable binding retry acknowledges what is actually durable,
+             # not a newer resolution that this transaction did not store.
+             ack["resolved_session"], ack["publication_version"] = existing[1], existing[2]
+-        conn.execute("INSERT INTO origin_obligations (binding_id,binding_hash,binding_json,resolved_session,task_json,observation_version) VALUES (?,?,?,?,?,?) ON CONFLICT(binding_id) DO NOTHING",
+-                     (_binding_key(binding), digest, _json(binding), resolved, _json(task), row[0]))
++        # [daveey] An obligation accepted after its owner task already finished (terminal + verified) is released
++        # at write time: no newer replica version will ever arrive for refresh_observations to advance it.
++        conn.execute("INSERT INTO origin_obligations (binding_id,binding_hash,binding_json,resolved_session,task_json,observation_version,released) VALUES (?,?,?,?,?,?,?) ON CONFLICT(binding_id) DO NOTHING",
++                     (_binding_key(binding), digest, _json(binding), resolved, _json(task), row[0],
++                      int(_verified_terminal(task))))
+         conn.execute("INSERT INTO origin_receipts VALUES (?,?,?)", (request_id, digest, _json(ack)))
+     readback = receipt(path, request_id)
+     assert readback is not None
+diff --git a/tests/hermes_cli/test_kanban_origin_terminal_accept.py b/tests/hermes_cli/test_kanban_origin_terminal_accept.py
+new file mode 100644
+index 00000000000..4da3ce23a0e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_terminal_accept.py
+@@ -0,0 +1,77 @@
++"""An obligation accepted when its owner task is already terminal releases on accept.
++
++[daveey] The accept INSERT used to omit ``released`` (default 0). An obligation accepted after its card was
++already done+verified never got a newer replica version, so ``refresh_observations`` never advanced it and the
++origin session counted a finished card as unfinished forever (session 20261026_170127_f07c32).
++"""
++import sqlite3
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_ledger as ledger
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414 -- pytest fixture registration
++from tests.hermes_cli.test_kanban_origin_ledger import world as world, accept  # noqa: PLC0414 -- pytest fixture registration
++from tests.hermes_cli.test_kanban_origin_evidence import create_bound, publish_observed
++
++
++def _project(path, replica):
++    return ledger.project(path, replica=replica, gateway='origin', profile='default', now=1001)[0]
++
++
++def _released(path):
++    with sqlite3.connect(path) as db:
++        return db.execute('SELECT released FROM origin_obligations').fetchone()[0]
++
++
++def test_accept_of_terminal_verified_task_releases(world, board):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, replica, binding, version=3)
++    accept(world)
++    assert _released(path) == 1
++    row = _project(path, replica)
++    assert row['status'] == 'done'
++    assert row['unfinished'] is False
++    assert ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]['unfinished'] is False
++
++
++def test_accept_of_terminal_unverified_task_stays_unknown(world, board):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))  # no completion event = no proof
++        publish_observed(conn, replica, binding, version=3)
++    accept(world)
++    assert _released(path) == 0
++    row = _project(path, replica)
++    assert row['reported_status'] == 'done'
++    assert row['status'] == 'unknown'
++    assert row['unfinished'] is True
++
++
++def test_accept_of_nonterminal_task_is_unchanged(world, board):
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++    accept(world)
++    assert _released(path) == 0
++    row = _project(path, replica)
++    assert row['status'] in ('ready', 'todo', 'running')
++    assert row['unfinished'] is True
++
++
++def test_stuck_terminal_verified_row_is_repaired(world, board):
++    """A row written by the old INSERT (released=0 at a terminal verified version) heals on the next refresh."""
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        tid = create_bound(conn, binding)
++        assert kb.complete_task(conn, tid, summary='Built and tested')
++        publish_observed(conn, replica, binding, version=3)
++    accept(world)
++    with sqlite3.connect(path) as db:
++        db.execute('UPDATE origin_obligations SET released=0')
++    row = _project(path, replica)
++    assert row['status'] == 'done' and row['unfinished'] is False
++    assert _released(path) == 1
+-- 
+2.55.0
+

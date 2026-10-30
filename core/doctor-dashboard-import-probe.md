@@ -2,7 +2,7 @@
 
 Patches:
 
-- `patches/0981-fix-doctor-the-dashboard-import-probe-launches-like-.patch`
+- `patches/0985-fix-doctor-the-dashboard-import-probe-launches-like-.patch`
 
 On a store install the interpreter runs isolated and `hermes_bootstrap` supplies the dependency path, so the bare `sys.executable -c` probe reported "No module named ruamel" while the dashboard served 200.
 

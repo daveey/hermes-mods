@@ -25,16 +25,25 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only).
    - `load`, `cpus`, `cpu_pct` (= load1 / cores, what the panel shows), `memory`
    - `processes.top`: top processes with parent `chain`, top-level `root` app and `owner`
      (`card:t_…`, `claude:…`, `hermes-session:…`, `codex:…`, `browser-use:…`); `by_app` CPU per top-level app;
-     `young_by_name`: processes under 10 s old (a cron/sync/poll loop shows up here as many short-lived
-     python/gh/git processes, not in the top list)
+     `young_by_name`: processes under 10 s old, grouped as objects with `name`, `count`, `owner`,
+     `owner_source` and `service` (a cron/sync/poll loop shows up here as many short-lived processes).
+     `top` also includes `service` and `owner_source`; `owned_services` includes quiet owned service processes
+     below the top-CPU threshold. Ownership comes from `HERMES_OWNER_CARD=t_<hex>[@host]` or the first line
+     `card: t_<hex>[@host]` of `OWNER.md` in a process's cwd or an ancestor process's cwd
    - `runnable` (macOS): R-state threads by priority and top priority-4 PIDs with owner/chain; load average includes the E-core background queue even when P-cores are idle. Collected via libproc (own processes) + setuid `ps -M -p` (others) in ~0.1 s; never run the probe at Background QoS (launchd ProcessType=Background / `taskpolicy -b`), or it waits in the E-core queue it counts.
    - `disk`: volume free, APFS local snapshots, `cleanable` caches with sizes, `largest_in_home`, other users' homes
    - `recorder`: load percentiles and per-agent CPU during recorded spikes (last 24 h)
-3. Sample twice more 30 s apart (`report --no-du`) before blaming a process: one ps snapshot is noise.
-4. For each real consumer, follow the chain to whoever started it: a card (`hermes kanban show t_…`), a launchd
-   job (`launchctl list | grep`, `launchctl print gui/$UID/<label>` for its interval), a systemd unit, a cron
-   (`crontab -l`, `~/.hermes/cron/jobs.json`). A loop that spawns `gh`/`git`/`python` every few seconds is a
-   polling interval problem: find the job and its interval.
+3. Sample twice more 30 s apart (`report --no-du`), and collect cumulative CPU time alongside each report
+   (`ps -Ao pid=,time=,args=`). Attribute CPU with CPU-time deltas over at least 60 s: CPU seconds gained /
+   measured elapsed wall seconds × 100 is percent of one core. Never infer cost or improvement from two
+   `ps %cpu` snapshots. Re-measure the same PIDs (check identity/start time) the same way after a fix.
+4. A long-lived process is not a leftover just because it is old. Find its owner first: `OWNER.md` in its cwd
+   or an ancestor process's cwd, `HERMES_OWNER_CARD` in its env, and open cards on every board and gateway
+   (MacBook, hub, mini in a three-host fleet) naming its label, script or directory. Read the owner card with
+   `kanban_show`, not a shell board command. Follow the chain to the launchd job (`launchctl list`,
+   `launchctl print gui/$UID/<label>` for its interval), systemd unit, or cron (`crontab -l`,
+   `~/.hermes/cron/jobs.json`). Any ask to stop an owned service goes on its owner card, with measured cost.
+   A loop spawning `gh`/`git`/`python` every few seconds may be a polling interval problem: find its job first.
 5. Disk: for a macOS disk question also follow `mac-disk-cleanup` (its repo-deletion rules and known big
    hitters); its deletions still go through the ask below.
 6. Write the diagnosis with the `five-whys` skill: every why cites evidence from the report; stop at a
@@ -46,9 +55,15 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only).
   foreground call with a short timeout): package/build caches only (uv, pip, npm/_npx, go build, cargo registry cache,
   Homebrew, Xcode DerivedData, pnpm store prune, unavailable simulators). Report before/after free space.
 - `collect.py kill PID --apply`: refuses unless the process belongs to a Kanban card that is done, archived or
-  blocked, and it never kills a GUI app or a Hermes gateway/serve. Use it for those leftovers only.
+  blocked, and it never kills a GUI app, Hermes gateway/serve, or launchd/systemd-managed service (even if
+  the card is done). Unknown card status, including a card on another host, counts as owned, not abandoned.
+  Explicit owner markers work outside Hermes process trees. Use it for non-service leftovers only.
 
 ## Ask first (blocked card, exact command, size or owner, what yes/no mean)
+
+A user's general go-ahead to fix the machine is not approval to stop or disable an owned service.
+Do not bypass a refused `collect.py kill` with raw kill, launchctl disable/bootout, or systemctl stop.
+Put an owned-service ask on its owner card with the measured cost and exact action, rather than a new duplicate ask.
 
 Everything else: worktrees, repos, app data, logs, model/browser downloads, APFS snapshots, other users'
 files, launchd/systemd/cron changes (including a polling interval), untagged or still-owned processes, app

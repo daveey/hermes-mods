@@ -7,16 +7,22 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               rotates) only as a storm: 3+ in 10 min per host, fingerprinted by status + reason class
               (revoked/expired/invalid/other); the e0a5909348 credential-guard warnings (no traceback) always;
 - hook        plugin hook exceptions (`Hook '<name>' callback <cb> raised: ...` from hermes_cli/plugins_dispatch);
+- worker      managed kanban worker crashes in <home>/logs/managed-worker.log (`[pid N] ` lines, no timestamps) only
+              as a storm: 3+ distinct pids dying with the same exception + normalized message within 30 min per
+              host (state in the cursor, `at` = pass time), filed once per fingerprint per 30 min;
 - cron        a cron job whose sticky `last_failure.at` is newer than the cursor (cron/jobs.json), filed only while
               failure_streak >= cron.failure_nudge_threshold (default 3) or after that many recovered failures in
               24 h (cursor `cron_fails`); a one-off failure the next run recovered from is only counted;
-- kanban      a card with >= 2 runs that crashed / timed out / failed to spawn (every board db);
+- kanban      a card with >= 2 runs that crashed / timed out / failed to spawn (every board db); and the dispatcher's
+              systemic breaker holding cards in triage (`gave_up` events with `sticky: true`, event-id cursor),
+              one signal per board + normalized error head per 30 min;
 - gateway     gateway crash-restarts: `gateway.previous_unclean_exit`, `asyncio.run.exception`,
-              `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log; a `gateway.exit_signal`
+              `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log (fingerprinted by its `cause` +
+              reason class; `cause: unrecorded` = an exit path with no cause note); a `gateway.exit_signal`
               (unplanned SIGTERM bounce) or `gateway.start_refused` (second start refused next to a live
               gateway) only as a storm: 3+ in 10 min per profile; a refusal by a dead owner pid always;
-- coach       coach `fixloop_card` (2nd confirmed failure of a fix) and handoff `reply_nudge` events whose
-              `reply_nudge_outcome` says the revised reply still hands off (or none came within 15 min).
+- coach       coach `fixloop_card` (2nd confirmed failure of a fix) and reply_check `reply_nudge` events (any
+              rule) whose `reply_nudge_outcome` says the revised reply still fails (or none came within 15 min).
 Profiles (<home>/profiles/*) are swept too, except the coach log, which lives in <home>/coach only.
 
 Every collector reads from a cursor (<home>/coach/signals-cursor.json: byte offsets + inode per log, last seen
@@ -49,6 +55,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 BACKFILL_S = 7 * 86400
+HOLD_BACKFILL_S = 86400  # first sight of a board: sticky holds older than this were already handled (kanban-754a3e3cf1)
 MAX_READ = 4 * 1024 * 1024        # never read more than this from one log per pass (start at the tail instead)
 MAX_PER_KIND = 25                 # cap per collector per pass: a log storm files a handful, not hundreds
 FAIL_OUTCOMES = ("crashed", "timed_out", "spawn_failed")
@@ -59,7 +66,7 @@ GATEWAY_TAGS = ("gateway.previous_unclean_exit", "asyncio.run.exception", "gatew
 # the home/host (already_running / pid_claim / host_refused). One of either is a bounce, not a defect; only a
 # storm is filed, plus a refusal by an owner pid that is not running (a stale record blocking every start).
 SIGNAL_STORM_N, SIGNAL_STORM_S = 3, 600
-KINDS = ("errors", "hook", "cron", "kanban", "gateway", "coach", "monitor")
+KINDS = ("errors", "hook", "worker", "cron", "kanban", "gateway", "coach", "monitor")
 SELF_DIR = Path(__file__).resolve().parent
 HUB_CMD = "python3 ~/code/hermes-mods/plugins/coach/signals.py ingest"
 
@@ -162,8 +169,9 @@ def homes(home: Path) -> List[Tuple[str, Path]]:
     return out
 
 
-def read_new(path: Path, cur: dict, key: str, now: float) -> List[str]:
-    """New complete lines of `path` since cur[key] = {"ino", "off"}; updates cur. First sight: the last MAX_READ."""
+def read_new(path: Path, cur: dict, key: str, now: float, span: Optional[list] = None) -> List[str]:
+    """New complete lines of `path` since cur[key] = {"ino", "off"}; updates cur. First sight: the last MAX_READ.
+    `span`, if given, receives the [start, end) byte range consumed."""
     try:
         st = path.stat()
     except OSError:
@@ -181,10 +189,27 @@ def read_new(path: Path, cur: dict, key: str, now: float) -> List[str]:
         data = f.read(st.st_size - off)
     end = data.rfind(b"\n") + 1  # leave a half-written last line for the next pass
     cur[key] = {"ino": st.st_ino, "off": off + end}
+    if span is not None:
+        span[:] = [off, off + end]
     lines = data[:end].decode("utf-8", "replace").splitlines()
     if off and lines and not c:  # started mid-file: the first line may be partial
         lines = lines[1:]
     return lines
+
+
+def seed_only_first_sight(path: Path, cur: dict, key: str) -> bool:
+    """For logs whose lines carry no timestamp: on first sight (no cursor for `key`) set the cursor at the end of
+    `path` and return True, so the caller files nothing. A backlog read on first sight (new host, new profile,
+    cursor reset) cannot be told from new lines and would replay old events as live (kanban-e001f2d4a0). A log
+    that does not exist yet is seeded at offset 0 (ino None), so everything later written to it counts as new."""
+    if cur.get(key):
+        return False
+    try:
+        st = path.stat()
+        cur[key] = {"ino": st.st_ino, "off": st.st_size}
+    except OSError:
+        cur[key] = {"ino": None, "off": 0}
+    return True
 
 
 # ── collectors: each returns raw signals {kind, key, component, symptom, details, at, session_id?, quote?, fp} ─
@@ -411,6 +436,114 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
     return out
 
 
+# Managed kanban workers (agent/managed_worker.py) log their crash to <home>/logs/managed-worker.log, every line
+# prefixed "[pid N] ", with no timestamps; errors.log never sees it. One crash is the card's business (its run
+# fails, the retry tier or failure limit handles it). The same exception killing WORKER_STORM_N distinct workers
+# within WORKER_STORM_S is a fleet-wide defect (10-29: ~40 workers died at agent build with ModelRoutingError and
+# nothing was filed), so that files one signal per (exception, normalized message) per window.
+WORKER_STORM_N, WORKER_STORM_S = 3, 1800
+PID_LINE_RE = re.compile(r"^\[pid (\d+)\] ?(.*)$")
+WORKER_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*): (.*)$")
+SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}")
+
+
+def _scrub(s: str) -> str:
+    return SECRET_RE.sub("sk-***", home_tilde(s or ""))
+
+
+def _norm_msg(msg: str) -> str:
+    """A message with homes, paths, card ids, hex ids and numbers collapsed, so one crash compares equal."""
+    s = _scrub(msg)
+    s = re.sub(r"(?:~|/)[\w.\-]*(?:/[\w.\-]+)+", lambda m: ".../" + m.group(0).rsplit("/", 1)[-1], s)
+    s = re.sub(r"\bt_[0-9a-zA-Z]+", "t_#", s)
+    s = re.sub(r"\b[0-9a-f]{8,}\b", "#", s)
+    return re.sub(r"\d+", "N", s).strip()
+
+
+def parse_worker_crashes(lines: List[str]) -> List[dict]:
+    """managed-worker.log lines -> one {pid, exc, msg, block} per pid block that holds a traceback, from its last
+    `Type: msg` line after the last `Traceback` line. Provider transients and exit noise are not crashes."""
+    by_pid: Dict[str, List[str]] = {}
+    for ln in lines:
+        m = PID_LINE_RE.match(ln)
+        if m:
+            by_pid.setdefault(m.group(1), []).append(m.group(2))
+    out = []
+    for pid, blk in by_pid.items():
+        tbs = [i for i, l in enumerate(blk) if l.startswith("Traceback (most recent call last)")]
+        if not tbs:
+            continue
+        tail = blk[tbs[-1]:]
+        em = next((m for l in reversed(tail) for m in [WORKER_EXC_RE.match(l)] if m), None)
+        if em is None:
+            continue
+        exc, msg = em.group(1), em.group(2)
+        if TRANSIENT_RE.search(f"{exc}: {msg}") or EXIT_NOISE_RE.search(msg):
+            continue
+        out.append({"pid": pid, "exc": exc, "msg": msg, "block": tail})
+    return out
+
+
+def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List[dict]:
+    """Keep this host's recent worker crashes in the cursor (a storm spans passes; `at` is the pass time, the log
+    has none); WORKER_STORM_N distinct pids with the same (exception, normalized message) within WORKER_STORM_S
+    file one signal, and the same fingerprint is not filed again within WORKER_STORM_S."""
+    st = cur.get("worker_storm") or {}
+    evs = [e for e in st.get("ev") or [] if e.get("at", 0) > now - WORKER_STORM_S]
+    filed = {k: v for k, v in (st.get("filed") or {}).items() if v > now - WORKER_STORM_S}
+    out = []
+    latest: Dict[str, dict] = {}
+    for c in crashes:
+        k = h10(c["exc"], _norm_msg(c["msg"]))
+        evs.append({"at": now, "pid": c["pid"], "k": k})
+        latest[k] = c
+    for k, c in latest.items():
+        pids = sorted({e["pid"] for e in evs if e["k"] == k}, key=lambda p: (len(p), p))
+        if len(pids) < WORKER_STORM_N or k in filed:
+            continue
+        filed[k] = now
+        evs = [e for e in evs if e["k"] != k]
+        norm = _norm_msg(c["msg"])
+        tb = "\n".join(c["block"][-15:])
+        out.append({"kind": "worker", "component": "kanban", "at": now, "session_id": "",
+                    "symptom": f"managed-worker crash storm on {host or 'this host'}: {len(pids)} workers died "
+                               f"with {c['exc'].split('.')[-1]}: {_scrub(c['msg'])[:120]}",
+                    "details": _scrub(f"{len(pids)} managed kanban workers died with {c['exc']} within "
+                                      f"{WORKER_STORM_S // 60} min (logs/managed-worker.log). pids: "
+                                      f"{', '.join(pids)}\n{_span_note(c)}"
+                                      f"Latest (pid {c['pid']}):\n{tb}")[:1500],
+                    "fp": fp("kanban", "worker-storm", c["exc"], norm)})
+    if evs or filed:
+        cur["worker_storm"] = {"ev": evs[-200:], "filed": filed}
+    else:
+        cur.pop("worker_storm", None)
+    return out
+
+
+def _span_note(c: dict) -> str:
+    """Where the latest crash came from: the log has no timestamps, so the byte range read this pass is what
+    shows a late or replayed signal in the card evidence (kanban-e001f2d4a0)."""
+    if not c.get("span"):
+        return ""
+    prof = c.get("profile") or "default"
+    return (f"Latest crash first seen this pass in {prof} logs/managed-worker.log bytes "
+            f"{c['span'][0]}-{c['span'][1]} (log lines carry no timestamps).\n")
+
+
+def collect_worker(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
+    crashes: List[dict] = []
+    for prof, h in homes(home):
+        path, key = h / "logs" / "managed-worker.log", f"worker:{prof}"
+        if seed_only_first_sight(path, cur, key):
+            continue  # first sight: the backlog is old crashes, not a live storm (kanban-e001f2d4a0)
+        span: list = []
+        for c in parse_worker_crashes(read_new(path, cur, key, now, span)):
+            c["pid"] = c["pid"] if prof == "default" else f"{prof}:{c['pid']}"
+            c["profile"], c["span"] = prof, list(span)
+            crashes.append(c)
+    return worker_storms(cur, crashes, now, host)
+
+
 CRON_WINDOW_S = 86400
 
 
@@ -525,6 +658,7 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
         except Exception:
             continue
         seen[board] = top
+        out += _systemic_holds(cur, board, db, now, host)
         groups: Dict[tuple, list] = {}
         for row in rows:
             tid, n, _mx, ended, outcomes, errs, title, ikey, status = row
@@ -573,6 +707,76 @@ def _err_key(errs: Optional[str]) -> str:
     return " | ".join(sorted(p for p in parts if p))
 
 
+def _hold_head(err: Optional[str]) -> str:
+    """The card-independent head of a run error (what precedes "Worker's last output"), normalized."""
+    head = re.split(r"\s*Worker's last output\b", str(err or ""), maxsplit=1)[0][:200]
+    return _norm_msg(head) or "unknown"
+
+
+def _systemic_holds(cur: dict, board: str, db: Path, now: float, host: str) -> List[dict]:
+    """The dispatcher's systemic breaker (3+ same-fingerprint crashes in one tick) holds each card in triage with a
+    `gave_up` event whose payload has `sticky: true`; every card crashed only once, so the >= 2 failed-runs rule
+    never sees it. One signal per (board, normalized error head) per WORKER_STORM_S, by event time. Event ids are
+    the cursor (cur["kanban_ev"][board]); a first sight looks back only HOLD_BACKFILL_S (24 h): an older hold on a
+    board seen for the first time was handled long ago (kanban-754a3e3cf1 filed a 2-day-old hold whose cards the
+    operator had archived and rerun clean). The held cards ride in ``kanban_hold`` (not ``kanban``: they are no
+    per-card trigger) so self_heal.kanban_trigger_closed can drop a stale hold whose cards are all closed."""
+    evc = cur.setdefault("kanban_ev", {})
+    filed = cur.setdefault("kanban_hold", {})
+    try:
+        c = _ro(db)
+        try:
+            last = evc.get(board)
+            top = c.execute("select coalesce(max(id),0) from task_events").fetchone()[0]
+            if last is None:
+                rows = c.execute("select id, task_id, payload, created_at from task_events where kind='gave_up' "
+                                 "and created_at >= ? order by id", (int(now - HOLD_BACKFILL_S),)).fetchall()
+            else:
+                rows = c.execute("select id, task_id, payload, created_at from task_events where kind='gave_up' "
+                                 "and id > ? order by id", (int(last),)).fetchall()
+        finally:
+            c.close()
+    except Exception:
+        return []  # an old board without task_events: nothing to read
+    evc[board] = top
+    clusters: Dict[str, dict] = {}
+    out = []
+    for _id, tid, payload, at in rows:
+        try:
+            p = json.loads(payload or "{}")
+        except Exception:
+            continue
+        if not isinstance(p, dict) or p.get("sticky") is not True:
+            continue
+        head = _hold_head(p.get("error"))
+        k = f"{board}\x1f{head}"
+        at = float(at or now)
+        cl = clusters.get(k)
+        if cl is not None and at - cl["at0"] < WORKER_STORM_S:
+            cl["tids"].append(tid)
+            cl["at"] = at
+            continue
+        if float(filed.get(k) or 0) > at - WORKER_STORM_S:
+            continue  # filed for this window by an earlier pass
+        filed[k] = at
+        clusters[k] = cl = {"at0": at, "at": at, "head": head, "tids": [tid], "err": str(p.get("error") or "")}
+        out.append(cl)
+    for k in [k for k, v in filed.items() if float(v or 0) < now - BACKFILL_S]:
+        filed.pop(k, None)
+    sigs = []
+    for cl in out:
+        tids = list(dict.fromkeys(cl["tids"]))
+        sigs.append({"kind": "kanban", "component": "kanban", "at": cl["at"],
+                     "symptom": f"systemic kanban crash on {host or 'this host'}: dispatcher held {len(tids)} "
+                                f"card(s) in triage",
+                     "details": _scrub(f"The dispatcher's systemic breaker (3+ same-fingerprint worker crashes in one "
+                                       f"tick) held these cards on {host}/{board} with a sticky gave_up: "
+                                       f"{', '.join(tids)}\nerror: {cl['err']}")[:1500],
+                     "kanban_hold": {"board": board, "cards": tids, "at0": cl["at0"]},
+                     "fp": fp("kanban", "systemic-hold", cl["head"])})
+    return sigs
+
+
 def _signal_storm(cur: dict, prof: str, r: dict, at: float, host: str) -> Optional[dict]:
     """Count one ``gateway.exit_signal`` / ``gateway.start_refused``; return a signal only for the
     SIGNAL_STORM_N-th within SIGNAL_STORM_S."""
@@ -587,6 +791,44 @@ def _signal_storm(cur: dict, prof: str, r: dict, at: float, host: str) -> Option
                        f"{SIGNAL_STORM_S // 60} min (last {last})",
             "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
             "fp": fp("gateway", host, prof, "gateway.exit_signal", "storm")}
+
+
+# A supervised start refused by the SAME live owner pid again and again is not a copy still draining (that one
+# leaves within its drain budget): the owner holds the home and the supervisor loops forever (gateway-e2cd786685,
+# a client-spawned gateway beside the mini's KeepAlive job). The core now asks a manual owner to drain; if one
+# owner is still refusing WEDGE_N+ supervised starts WEDGE_S after its first refusal (no gap over WEDGE_S), that
+# handback failed or the owner is not draining: file it as its own defect (own fingerprint, never folded into the
+# open storm card as a comment). Launchd retries every ~10 s, so a real wedge reaches this in ~10 min.
+WEDGE_N, WEDGE_S = 3, 600
+
+
+def _wedged_owner(cur: dict, prof: str, r: dict, at: float, host: str) -> Optional[dict]:
+    owner = r.get("owner_pid")
+    if owner is None:
+        return None
+    seen = cur.setdefault("gw_wedge", {})
+    for key in [k for k, v in seen.items() if not isinstance(v, list) or len(v) != 3 or at - v[1] > WEDGE_S]:
+        seen.pop(key, None)  # owners that stopped refusing; keeps the cursor small
+    key = f"{prof}:{owner}"
+    first, _last, count = seen.get(key) or (at, at, 0)
+    count += 1
+    if count < WEDGE_N or at - first < WEDGE_S:
+        seen[key] = [first, at, count]
+        return None
+    seen.pop(key, None)  # one signal per wedge; the fingerprint dedupes a later one
+    handback = r.get("handback") or "none"
+    return {"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
+            "symptom": f"gateway ({prof}) on {host} supervisor wedged behind a live owner: {count} supervised "
+                       f"starts refused by owner_pid={owner} over {int(at - first) // 60} min (handback {handback})",
+            "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
+            "fp": fp("gateway", host, prof, "gateway.start_refused", "wedged-owner")}
+
+
+def _reason_class(reason: str) -> str:
+    """A gateway exit_reason with its volatile parts (numbers, paths) removed, so one cause with the same text
+    keeps one fingerprint across pids and ports."""
+    s = re.sub(r"(/[^\s'\"]+)+", "<path>", reason.lower())
+    return re.sub(r"\d+", "#", s).strip()[:80]
 
 
 def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
@@ -610,34 +852,68 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                             "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
                             "fp": fp("gateway", host, prof, tag, str(r.get("reason") or ""))})
                 continue
+            if tag == "gateway.start_refused" and r.get("owner_alive") is True and r.get("external_supervisor"):
+                # The service manager restarted into a gateway still draining (its main pid ended first):
+                # the restart-storm defect itself, so it goes to that lane at once and, while its card is open,
+                # lands there as a comment instead of a new card (gateway-cc28b19bca).
+                out.append({"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
+                            "symptom": f"gateway ({prof}) on {host} supervisor restarted into a live gateway: start "
+                                       f"refused by owner_pid={r.get('owner_pid')} ({r.get('reason')})",
+                            "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
+                            "fp": fp("gateway", host, prof, "gateway.exit_signal", "storm"),
+                            "comment_open_card": True})
+                if (sig := _wedged_owner(cur, prof, r, at, host)) is not None:
+                    out.append(sig)
+                continue
             if tag in ("gateway.exit_signal", "gateway.start_refused"):
                 if (sig := _signal_storm(cur, prof, r, at, host)) is not None:
                     out.append(sig)
                 continue
             why = r.get("exc_type") or ("suspected OOM" if r.get("suspected_oom") else "") or tag.split(".")[-1]
+            fp_key = r.get("exc_type") or ""
+            cause = str(r.get("cause") or "") if tag == "gateway.exit_nonzero" else ""
+            if cause == "unrecorded":
+                # The exit path returned False without note_exit_cause(): that missing note is the defect.
+                why, fp_key = "exit path missing a cause note (cause=unrecorded)", "unrecorded"
+            elif cause:
+                # gateway-3cf2256311: each cause (and reason class) is its own defect, never a "recurrence" of
+                # another cause's fixed crash. Records without a cause (old core) keep the old fingerprint.
+                reason = str(r.get("exit_reason") or "")
+                why = f"cause={cause}" + (f": {reason[:200]}" if reason else "")
+                fp_key = f"{cause}:{_reason_class(reason)}"
             out.append({"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
                         "symptom": f"gateway ({prof}) on {host} died uncleanly: {tag} {why}",
                         "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
-                        "fp": fp("gateway", host, prof, tag, r.get("exc_type") or "")})
+                        "fp": fp("gateway", host, prof, tag, fp_key)})
     return out
 
 
-HANDOFF_GRACE_S = 15 * 60  # a handoff nudge waits this long for its reply_nudge_outcome before it files anyway
+HANDOFF_GRACE_S = 15 * 60  # a nudge waits this long for its reply_nudge_outcome before it files anyway
+# reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
+OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
+                 "credit_ask", "laptop_job")
+NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}
 
 
 def _handoff_signal(r: dict, why: str) -> dict:
     ev = str(r.get("evidence") or "")
+    rule = r.get("rule") or "handoff"
+    what = NUDGE_WHAT.get(rule) or f"agent's revised reply still failed the coach {rule} check"
+    reply = str(r.get("reply") or "")
     return {"kind": "coach", "component": "agent", "at": float(r.get("ts") or 0),
             "session_id": r.get("session_id") or "",
-            "symptom": f"agent handed the user a step it could do itself: {ev[:120]}",
-            "details": f"coach reply_check handoff nudge (p={r.get('p')}): {ev}; {why}"[:1500],
-            "fp": fp("agent", "handoff", r.get("session_id") or "")}
+            "symptom": f"{what}: {ev[:120]}",
+            "details": (f"coach reply_check {rule} nudge (p={r.get('p')}): {ev}; {why}"
+                        + (f"; revised reply: {reply}" if reply else ""))[:1500],
+            "fp": fp("agent", rule, r.get("session_id") or "")}
 
 
 def _outcome_matches(n: dict, o: dict) -> bool:
     """The reply_nudge_outcome `o` judges the revision of nudge `n`: same session, same draft when both carry one,
     and logged within the grace window after the nudge."""
     if (o.get("session_id") or "") != (n.get("session_id") or ""):
+        return False
+    if (o.get("rule") or "handoff") != (n.get("rule") or "handoff"):
         return False
     if n.get("draft_id") and o.get("draft_id") and n["draft_id"] != o["draft_id"]:
         return False
@@ -646,10 +922,12 @@ def _outcome_matches(n: dict, o: dict) -> bool:
 
 
 def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
-    """fixloop_card events file at once. A handoff reply_nudge is the guard WORKING (the agent was sent back to fix
-    its reply), so it files only when its reply_nudge_outcome says the revised reply still hands off, or when no
-    outcome arrived within HANDOFF_GRACE_S (crash, a host on the old plugin): a real failure is never lost. Nudges
-    still waiting for an outcome live in cur["coach_handoff_pending"] across passes."""
+    """fixloop_card events file at once. A reply_check nudge (any rule in OUTCOME_RULES) is the guard WORKING (the
+    agent was sent back to fix its reply), so it files only when its reply_nudge_outcome says the revised reply still
+    fails the same rule, or when no outcome arrived within HANDOFF_GRACE_S (crash, a lost continuation): an ignored
+    nudge is never lost. A non-handoff nudge without the `outcome` marker comes from a backend still on the old
+    plugin, where no outcome will ever come: not filed (handoff nudges always were). Nudges still waiting for an
+    outcome live in cur["coach_handoff_pending"] across passes."""
     out = []
     pending: List[dict] = list(cur.get("coach_handoff_pending") or [])
     for ln in read_new(home / "coach" / "log.jsonl", cur, "coach", now):
@@ -662,6 +940,7 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
         at = float(r.get("ts") or now)
         if at < now - BACKFILL_S:
             continue
+        rule = r.get("rule")
         if r.get("event") == "fixloop_card":
             issue = str(r.get("issue") or "a fix that keeps failing")
             out.append({"kind": "coach", "component": "agent", "at": at, "session_id": r.get("session_id") or "",
@@ -669,15 +948,17 @@ def collect_coach(home: Path, cur: dict, now: float) -> List[dict]:
                         "details": f"coach fix_loop opened review card {r.get('task_id')} after the "
                                    f"{r.get('n') or 2}nd confirmed failure: {issue}"[:1500],
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
-        elif r.get("event") == "reply_nudge" and r.get("rule") == "handoff":
-            pending.append({**{k: r.get(k) for k in ("session_id", "p", "evidence", "draft_id")}, "ts": at})
-        elif r.get("event") == "reply_nudge_outcome" and r.get("rule") == "handoff":
+        elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
+            pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id")}, "ts": at})
+        elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
             if n is None:
                 continue
             pending.remove(n)
             if r.get("resolved") is not True:  # only an explicit "resolved" clears it
-                out.append(_handoff_signal(n, f"the revised reply still handed off (outcome p={r.get('p')})"))
+                still = "still handed off" if rule == "handoff" else f"still failed {rule}"
+                out.append(_handoff_signal({**n, "reply": r.get("reply") or ""},
+                                           f"the revised reply {still} (outcome p={r.get('p')})"))
     keep = []
     for n in pending:
         if now - float(n.get("ts") or 0) > HANDOFF_GRACE_S:
@@ -695,6 +976,7 @@ def collect(home: Path, cur: dict, host: str, now: Optional[float] = None) -> Li
     now = now or time.time()
     out = []
     for kind, fn in (("errors", lambda: collect_errors(home, cur, now, host)),
+                     ("worker", lambda: collect_worker(home, cur, now, host)),
                      ("cron", lambda: collect_cron(home, cur, now, host)),
                      ("kanban", lambda: collect_kanban(home, cur, now, host)),
                      ("gateway", lambda: collect_gateway(home, cur, now, host)),
@@ -725,7 +1007,7 @@ def to_defect(s: dict) -> dict:
          "quote": s.get("quote") or ""}
     if (s.get("count") or 1) > 1:
         d["details"] = f"(seen {s['count']}x this pass)\n" + d["details"]
-    for k in ("profile", "monitor", "kanban"):
+    for k in ("profile", "monitor", "kanban", "kanban_hold", "comment_open_card"):
         if s.get(k):
             d[k] = s[k]
     return d

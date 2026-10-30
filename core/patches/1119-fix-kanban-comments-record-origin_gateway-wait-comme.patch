@@ -1,0 +1,780 @@
+From 04d3c59674d2dcebea79b4091d41dc84ff20562c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:30:13 +0000
+Subject: [PATCH] fix(kanban): comments record origin_gateway; wait-comment
+ probe; refuse author-matching wake checks; wake_probe_stale [daveey]
+
+A parked card's wake check counted comments WHERE author='macbook'; the Mac's reply arrived through the
+hermes-hub relay as 'hub:gw:macbook', so t_01a17f81686694ec stayed parked 38 h after the answer
+(self-heal desktop-00c4a3bda2).
+
+- task_comments.origin_gateway (nullable, machine-local, back-filled from hub:gw:<x> / <x>/t_... authors);
+  add_comment(origin_gateway=) / 'kanban comment --origin-gateway' (relay sender), default from the author
+  spelling, else this gateway.
+- 'hermes kanban wait-comment <task> --after-id N [--from-gateway X] [--contains T]': 0 match, 1 not yet,
+  2 cannot tell; a gateway matches origin_gateway or any author spelling of it.
+- Park guard (kanban_awaiting.resolve): a wake_check filtering task_comments by author (=, like, glob, in)
+  is refused with code author_probe naming the wait-comment command; author != own still parks.
+  Off switch: kanban.author_probe_guard: false. wake_check tool description says so.
+- Detection: wake_probe_stale. A parked card whose reason/probe names a hermes-hub request whose owner card
+  is done, while its probe still exits 1, wakes once with a dispatcher comment.
+
+Tests: tests/hermes_cli/test_kanban_comment_origin.py (16 red before, 19 green after).
+---
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 0f23cfda00bbfb51da8eaaa378c6f8f73149528b..ab0ed5bf83a81e4f7abe95093e7957c6d7b042f2 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -655,6 +655,11 @@ def _cmd_wait_check(args: argparse.Namespace) -> int:
+     return kanban_wait_check.run(args)
+ 
+ 
++def _cmd_wait_comment(args: argparse.Namespace) -> int:
++    from hermes_cli import kanban_comment_origin
++    return kanban_comment_origin.run_wait_comment(args)
++
++
+ def _cmd_capabilities(args: argparse.Namespace) -> int:
+     from hermes_cli import kanban_capability_registry
+     return kanban_capability_registry.run_cli(args)
+@@ -1011,7 +1016,11 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
+     author = args.author or _profile_author()
+     with kbc.connect_closing() as conn:
+-        kb.add_comment(conn, args.task_id, author, body)
++        try:
++            kb.add_comment(conn, args.task_id, author, body,
++                           origin_gateway=getattr(args, "origin_gateway", None))
++        except ValueError as exc:
++            return _err(f"kanban comment: {exc}", 2)
+         live = kb.live_run_id(conn, args.task_id)
+     print(f"Comment added to {args.task_id}")
+     own_run = os.environ.get("HERMES_KANBAN_TASK") == args.task_id
+@@ -1866,6 +1875,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
+ _HANDLERS = {
+     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "wait-check": _cmd_wait_check,
++    "wait-comment": _cmd_wait_comment,
+     "capabilities": _cmd_capabilities,
+     "assign": _cmd_assign, "set-model": _cmd_set_model,
+     "reclaim": _cmd_reclaim, "move": _cmd_move, "reassign": _cmd_reassign,
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 9182f9b5476e053407dd89cbed62dbc2a2c6ca84..143976043644fcb03ee11619efa112fff10d1665 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -474,6 +474,9 @@ def resolve(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Op
+             wake_check: Optional[str] = None, clock_only: bool = False, op: str = "schedule",
+             wake_in: Optional[int] = None) -> dict:
+     """The ``awaiting`` record for a park, or ``AwaitingError``. Read-only."""
++    # [daveey] A probe that matches comment authors misses relayed replies (hub:gw:<gw>): author_probe.
++    from hermes_cli.kanban_comment_origin import check_park
++    check_park(conn, task_id, wake_check)
+     declared = normalize(awaiting)
+     if declared is None:
+         return _infer(conn, task_id, reason=reason, wake_check=wake_check, clock_only=clock_only,
+diff --git a/hermes_cli/kanban_comment_origin.py b/hermes_cli/kanban_comment_origin.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..130c0a0fe1b9abb78708074e8acbbbd9d6c405fd
+--- /dev/null
++++ b/hermes_cli/kanban_comment_origin.py
+@@ -0,0 +1,241 @@
++"""Which gateway a Kanban comment came from, and waits that use it instead of the author. [daveey]
++
++A comment's ``author`` is free text: the hermes-hub relay writes ``hub:gw:<gateway>``, other paths pass
++``--author macbook``, ``macbook-chat``, ``macbook/t_...`` or even a card title. A wake check that counts
++comments ``WHERE author = 'macbook'`` therefore never sees the relay's ``hub:gw:macbook`` reply: on
++2026-10-27 t_01a17f81686694ec stayed parked 38 h after the Mac answered (self-heal desktop-00c4a3bda2).
++
++* ``task_comments.origin_gateway`` (nullable, machine-local): the relay's sender gateway, else the gateway
++  an author spelling names (``hub:gw:<x>``, ``<x>/t_...``), else this gateway's own name;
++* ``hermes kanban wait-comment <task> --after-id N [--from-gateway X] [--contains TEXT]``: the wake probe
++  for "a reply arrived": exit 0 on a match, 1 not yet, 2 cannot tell. A gateway matches on
++  ``origin_gateway`` or on any author spelling containing it;
++* ``author_probe``: the park guard refuses a wake check that filters ``task_comments`` by author
++  (``=``, ``like``, ``glob``, ``in``; ``!=`` to skip one's own notes is fine) and names the wait-comment
++  command to use. Off switch: ``kanban.author_probe_guard: false``;
++* ``answered_request``: the detector behind ``wake_probe_stale``: a parked card whose reason or probe
++  names a hermes-hub request whose owner card finished, while its probe still says "not yet".
++"""
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++from typing import Any, Optional
++
++AUTHOR_PROBE = "author_probe"
++WAKE_PROBE_STALE_EVENT = "wake_probe_stale"
++
++_RELAY_AUTHOR = re.compile(r"^hub:gw:([A-Za-z0-9][A-Za-z0-9._-]{0,63})$")
++_CARD_AUTHOR = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]{0,63})/t_[0-9a-f]{6,}$")
++_GATEWAY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
++
++
++def gateway_from_author(author: Optional[str]) -> Optional[str]:
++    """The gateway an author spelling names for certain (relay sender, ``<gw>/t_...``), else None."""
++    text = (author or "").strip()
++    m = _RELAY_AUTHOR.match(text) or _CARD_AUTHOR.match(text)
++    return m.group(1) if m else None
++
++
++def _local_gateway() -> Optional[str]:
++    try:
++        from hermes_cli.kanban_origin import gateway_names
++        me = gateway_names()[0]
++    except Exception:
++        return None
++    return me if me and _GATEWAY_NAME.match(me) else None
++
++
++def resolve_origin(author: Optional[str], explicit: Optional[str] = None) -> Optional[str]:
++    """``origin_gateway`` for a new comment: explicit (the relay's sender), the author's gateway, else this one."""
++    if explicit and str(explicit).strip():
++        name = str(explicit).strip()
++        if not _GATEWAY_NAME.match(name):
++            raise ValueError(f"origin gateway {name!r} is not a gateway name")
++        return name
++    return gateway_from_author(author) or _local_gateway()
++
++
++def backfill(conn: sqlite3.Connection) -> int:
++    """Set ``origin_gateway`` on old rows whose author names a gateway for certain. Idempotent."""
++    n = 0
++    rows = conn.execute("SELECT id, author FROM task_comments WHERE origin_gateway IS NULL "
++                        "AND (author LIKE 'hub:gw:%' OR author LIKE '%/t\\_%' ESCAPE '\\')").fetchall()
++    for cid, author in rows:
++        gw = gateway_from_author(author)
++        if gw:
++            conn.execute("UPDATE task_comments SET origin_gateway = ? WHERE id = ?", (gw, cid))
++            n += 1
++    return n
++
++
++# --- wait-comment -----------------------------------------------------------------------------
++
++def find_comment(conn: sqlite3.Connection, task_id: str, *, after_id: int = 0, from_gateway: Optional[str] = None,
++                 contains: Optional[str] = None) -> Optional[dict]:
++    """The first comment on ``task_id`` after ``after_id`` from ``from_gateway`` containing ``contains``."""
++    sql = "SELECT id, author, origin_gateway, body FROM task_comments WHERE task_id = ? AND id > ?"
++    params: list[Any] = [task_id, int(after_id or 0)]
++    if from_gateway:
++        gw = from_gateway.strip().lower()
++        sql += " AND (lower(coalesce(origin_gateway, '')) = ? OR instr(lower(author), ?) > 0)"
++        params += [gw, gw]
++    if contains:
++        sql += " AND instr(lower(body), ?) > 0"
++        params.append(contains.lower())
++    row = conn.execute(sql + " ORDER BY id LIMIT 1", params).fetchone()
++    if row is None:
++        return None
++    return {"id": row[0], "author": row[1], "origin_gateway": row[2], "body": row[3]}
++
++
++def run_wait_comment(args) -> int:
++    """CLI ``hermes kanban wait-comment``: 0 a matching comment exists, 1 not yet, 2 cannot tell."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    try:
++        with kbc.connect_closing() as conn:
++            if kb.get_task(conn, args.task_id) is None:
++                print(f"error: no task {args.task_id}")
++                return 2
++            hit = find_comment(conn, args.task_id, after_id=args.after_id, from_gateway=args.from_gateway,
++                               contains=args.contains)
++    except sqlite3.Error as exc:
++        print(f"error: {exc}")
++        return 2
++    if hit is None:
++        print(f"not yet: no comment on {args.task_id} after {args.after_id}"
++              + (f" from {args.from_gateway}" if args.from_gateway else "")
++              + (f" containing {args.contains!r}" if args.contains else ""))
++        return 1
++    body = " ".join(str(hit["body"]).split())
++    print(f"comment {hit['id']} by {hit['author']} (gateway {hit['origin_gateway'] or '?'}): {body[:300]}")
++    return 0
++
++
++# --- park guard -------------------------------------------------------------------------------
++
++_COMMENTS = re.compile(r"\btask_comments\b", re.IGNORECASE)
++_AUTHOR_FILTER = re.compile(
++    r"\bauthor\b\s*(?:==?(?!=)|\bnot\s+like\b|\blike\b|\bglob\b|\bin\s*\(|\bis\b(?!\s+not))", re.IGNORECASE)
++_TASK_ID = re.compile(r"\bt_[0-9a-f]{6,}\b")
++
++
++def author_probe(wake_check: Optional[str]) -> bool:
++    """True when the probe reads ``task_comments`` and filters on who wrote them by name."""
++    if not isinstance(wake_check, str) or not _COMMENTS.search(wake_check):
++        return False
++    return bool(_AUTHOR_FILTER.search(wake_check))
++
++
++def _author_probe_guard_enabled() -> bool:
++    try:
++        from hermes_cli.config import load_config_readonly
++        cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
++        return cfg.get("author_probe_guard", True) is not False
++    except Exception:
++        return True
++
++
++def author_probe_error(task_id: str, wake_check: str, conn: Optional[sqlite3.Connection] = None):
++    from hermes_cli.kanban_awaiting import AwaitingError
++    after = 0
++    if conn is not None:
++        try:
++            row = conn.execute("SELECT max(id) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()
++            after = int(row[0] or 0) if row else 0
++        except sqlite3.Error:
++            after = 0
++    target = task_id
++    m = _TASK_ID.search(wake_check or "")
++    if m:
++        target = m.group(0)
++    return AwaitingError(AUTHOR_PROBE, (
++        "this wake_check filters task_comments by author. Authors are free text: a reply relayed through "
++        "hermes-hub arrives as 'hub:gw:<gateway>' (others as '<gateway>', '<gateway>-chat', '<gateway>/t_...'), "
++        "so an author match can miss the reply forever (t_01a17f81686694ec slept 38 h that way). Wait on the "
++        f"sending gateway instead: `hermes kanban wait-comment {target} --after-id {after} --from-gateway "
++        "<gateway>` (add --contains '<text>' to require a marker). It matches the comment's origin_gateway or "
++        "any author spelling of that gateway."))
++
++
++def check_park(conn: Optional[sqlite3.Connection], task_id: str, wake_check: Optional[str]) -> None:
++    """Raise ``AwaitingError(author_probe)`` for an author-filtering comment probe."""
++    if wake_check and author_probe(wake_check) and _author_probe_guard_enabled():
++        raise author_probe_error(task_id, wake_check, conn)
++
++
++# --- wake_probe_stale -------------------------------------------------------------------------
++
++_REQUEST_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{4,95}")
++
++
++def _park_text(conn: sqlite3.Connection, task_id: str) -> str:
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued') "
++                       "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    try:
++        p = json.loads(row[0] or "{}") if row else {}
++    except ValueError:
++        p = {}
++    if not isinstance(p, dict):
++        return ""
++    raw = p.get("awaiting")
++    awaiting: dict = raw if isinstance(raw, dict) else {}
++    return " ".join(str(x) for x in (p.get("reason"), p.get("checkpoint"), awaiting.get("ref"),
++                                     awaiting.get("why")) if x)
++
++
++def answered_request(conn: sqlite3.Connection, task_id: str, cmd: str) -> Optional[dict]:
++    """A hermes-hub request this park names (reason or probe) whose owner card is done, or None.
++
++    Read-only on ``hub.db``; any error means "cannot tell" (None). A request already reported by a
++    ``wake_probe_stale`` event on this card is skipped, so each answered request wakes the card once."""
++    if "capability-owner" in (cmd or ""):
++        return None  # that probe already reads the same request state
++    text = f"{_park_text(conn, task_id)} {cmd or ''}"
++    tokens = {t for t in _REQUEST_TOKEN.findall(text) if "-" in t and not t.startswith("t_")}
++    if not tokens:
++        return None
++    try:
++        from hermes_cli import kanban_capability_registry as reg
++        from hermes_cli.kanban_capability_routing import owner_status
++        path = reg.hub_db_path()
++        if path is None or not path.is_file():
++            return None
++        db = reg._ro(path)
++        try:
++            ph = ",".join("?" * len(tokens))
++            ids = [r[0] for r in db.execute(f"SELECT id FROM sent WHERE id IN ({ph}) AND state = 'done'",
++                                            sorted(tokens))]
++        finally:
++            db.close()
++    except Exception:
++        return None
++    if not ids:
++        return None
++    seen = set()
++    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                                   (task_id, WAKE_PROBE_STALE_EVENT)):
++        try:
++            seen.add(json.loads(payload or "{}").get("request"))
++        except (ValueError, AttributeError):
++            continue
++    for rid in sorted(ids):
++        if rid in seen:
++            continue
++        try:
++            rc, msg = owner_status(rid)
++        except Exception:
++            continue
++        if rc == 0:
++            return {"request": rid, "owner": msg}
++    return None
++
++
++def stale_note(hit: dict, cmd: str) -> str:
++    return (f"wake_probe_stale: hermes-hub request {hit['request']} that this park waits on is answered "
++            f"({hit['owner']}), but the wake_check still exits 1 (not yet). Woken once so the reply is not "
++            f"missed. Read the reply (comments, the owner card), then finish or re-park with a probe that "
++            f"matches it, e.g. `hermes kanban wait-comment <task> --after-id <last id> --from-gateway <gw>`. "
++            f"Probe was: {cmd[:300]}")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 7b77ae704a0d0b84dbe4b7459376a6cfbf1dab24..27603090c602df8795350ab56f90f79caf5b3662 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -909,7 +909,8 @@ CREATE TABLE IF NOT EXISTS task_comments (
+     task_id    TEXT NOT NULL,
+     author     TEXT NOT NULL,
+     body       TEXT NOT NULL,
+-    created_at INTEGER NOT NULL
++    created_at INTEGER NOT NULL,
++    origin_gateway TEXT
+ );
+ 
+ CREATE TABLE IF NOT EXISTS task_events (
+@@ -1734,11 +1735,16 @@ def _writer_run_id(task_id: str) -> Optional[int]:
+         return None
+ 
+ 
+-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
++def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
++                origin_gateway: Optional[str] = None) -> int:
++    """Append a comment. ``origin_gateway``: the gateway it came from (the hermes-hub relay passes the
++    sender); default: the gateway the author spelling names, else this gateway (kanban_comment_origin). [daveey]"""
+     if not body or not body.strip():
+         raise ValueError("comment body is required")
+     if not author or not author.strip():
+         raise ValueError("comment author is required")
++    from hermes_cli.kanban_comment_origin import resolve_origin
++    origin = resolve_origin(author, origin_gateway)
+     now = int(time.time())
+     # [daveey] A comment written from inside a worker run records that run on its
+     # ``commented`` event, so the live comment bridge can skip exactly the run's own notes
+@@ -1749,8 +1755,8 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str)
+     with write_txn(conn, allow_nested=True):
+         _require_task(conn, task_id)
+         cur = conn.execute(
+-            "INSERT INTO task_comments (task_id, author, body, created_at) "
+-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
++            "INSERT INTO task_comments (task_id, author, body, created_at, origin_gateway) "
++            "VALUES (?, ?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now, origin),
+         )
+         cid = int(cur.lastrowid or 0)
+         payload: dict = {"author": author, "len": len(body), "comment_id": cid}
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index e85e1950a6a6a0d3c17a88aad31a8613c6dd76ea..0c0436b9fd59d01881ed7a39dcb2c8997b059e3b 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1130,6 +1130,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+ 
++    # [daveey] task_comments.origin_gateway: which gateway a comment came from (relay sender), so wake
++    # probes match the gateway, not a free-text author. Back-filled from ``hub:gw:<x>`` / ``<x>/t_...``.
++    if _table_exists(conn, "task_comments") and "origin_gateway" not in _column_names(conn, "task_comments"):
++        if _add_column_if_missing(conn, "task_comments", "origin_gateway", "origin_gateway TEXT"):
++            from hermes_cli.kanban_comment_origin import backfill
++            backfill(conn)
++
+     # task_events.run_id back-fills as NULL for historical events (they predate
+     # runs and can't be attributed).
+     if "run_id" not in _column_names(conn, "task_events"):
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index c76e89cf85d0e3d8dcc6d534bb66535e2434a859..766508be5748fb5784eb8a151c8620f35088c08a 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -84,7 +84,8 @@ LOCAL_COLUMNS: dict[str, frozenset[str]] = {
+         "lease_expires", "lease_version",
+     }),
+     "task_links": frozenset(),
+-    "task_comments": frozenset(),
++    # ``origin_gateway``: the sending gateway as this gateway saw it (relay sender); peers keep their own.
++    "task_comments": frozenset({"origin_gateway"}),
+     "task_events": frozenset(),
+     # ``sync_version``: the Board version of the row this gateway last applied or had acknowledged (the fence that
+     # keeps an older copy of a run from the feed off a newer local row).
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 7748c2e8b17ee4daf15764d8a90cfc1ae17b231c..aba08f166d43f562be4b84d4aa031b5735056247 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -691,7 +691,7 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
+ # the classic ready transitions plus every claim/park/wake on the way back.
+ _READY_WAIT_FLOOR_KINDS = frozenset({
+     "created", "promoted", "reclaimed", "unblocked",
+-    "claimed", "spawned", "continuation_woken", "condition_met",
++    "claimed", "spawned", "continuation_woken", "condition_met", "wake_probe_stale",
+ })
+ 
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 1b98bc80d424f46111a269301f9bb115ad99d449..bd81f5c907470af0468ada684322d3d56225e9cb 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -391,7 +391,20 @@ _SPECS = [
+         _arg("text", nargs="+", help="Comment body"),
+         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
+         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
++        _arg("--origin-gateway", default=None,
++             help="Gateway the comment came from (the hermes-hub relay passes the sender). Default: the gateway "
++                  "the author names (hub:gw:<gw>, <gw>/t_...), else this gateway"),
+     ], help="Append a comment"),
++    _cmd("wait-comment", [
++        _TASK_ID,
++        _arg("--after-id", type=int, default=0,
++             help="Only comments with a higher id (the last comment id when you parked)"),
++        _arg("--from-gateway", default=None,
++             help="Only comments from this gateway: its origin_gateway, or any author spelling of it "
++                  "(hub:gw:<gw>, <gw>, <gw>-chat, <gw>/t_...)"),
++        _arg("--contains", default=None, help="Only comments whose body contains this text (case-insensitive)"),
++    ], help="Wake-probe primitive for a reply: exit 0 a matching comment exists, 1 not yet, 2 cannot tell. "
++            "Use it instead of matching task_comments.author (the park guard refuses that: author_probe)"),
+     _cmd("attach", [
+         _TASK_ID,
+         _arg("path", help="Path to the local file to attach"),
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 69fc4049db63760c431c892d670619de2610b2fd..714685d5c15496f69bd18a34ef19c738439a32a9 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -410,7 +410,14 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+         from hermes_cli import kanban_db_connect as kbc
+         conn = kbc.connect(Path(db_path))
+         try:
+-            apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag)
++            answered = None
++            if rc == 1 and not output_error(out):
++                # [daveey] The probe says "not yet" but the hermes-hub request this park names is answered:
++                # the probe cannot see the reply (t_01a17f81686694ec, 38 h). wake_probe_stale wakes it once.
++                from hermes_cli.kanban_comment_origin import answered_request
++                answered = answered_request(conn, task_id, cmd)
++            apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
++                         answered=answered)
+         finally:
+             conn.close()
+         return rc
+@@ -421,7 +428,7 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+ 
+ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str,
+                  *, generation: str, now: Optional[int] = None,
+-                 diagnostics: Optional[dict] = None) -> Optional[str]:
++                 diagnostics: Optional[dict] = None, answered: Optional[dict] = None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -439,6 +446,15 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+         if rc == 0:
+             return _wake(conn, task_id, CONDITION_MET_EVENT, {
+                 "wake_check": cmd, "output": tail, **({"diagnostics": diagnostics} if diagnostics else {})})
++        if rc == 1 and not output_error(out) and answered:
++            from hermes_cli.kanban_comment_origin import WAKE_PROBE_STALE_EVENT, stale_note
++            note = stale_note(answered, cmd)
++            woke = _wake(conn, task_id, WAKE_PROBE_STALE_EVENT, {
++                "wake_check": cmd, "output": tail, "request": answered["request"], "owner": answered["owner"],
++                "note": note})
++            if woke:
++                kb.add_comment(conn, task_id, "kanban-dispatcher", note)
++            return woke
+         if rc == 1 and not output_error(out):
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+@@ -582,14 +598,19 @@ def _render_wake_context(conn: sqlite3.Connection, task_id: str) -> str:
+     from hermes_cli.kanban_continuation import SCHEDULED_ENTRY_EVENTS
+ 
+     lines: list[str] = []
+-    kinds = (*SCHEDULED_ENTRY_EVENTS, CONDITION_MET_EVENT, BROKEN_EVENT)
++    from hermes_cli.kanban_comment_origin import WAKE_PROBE_STALE_EVENT
++
++    kinds = (*SCHEDULED_ENTRY_EVENTS, CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT)
+     marks = ",".join("?" for _ in kinds)
+     row = conn.execute(
+         f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+         "ORDER BY id DESC LIMIT 1", (task_id, *kinds)).fetchone()
+-    if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT):
++    if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT):
+         payload = kb._json_dict(row[1])
+-        if row[0] == CONDITION_MET_EVENT:
++        if row[0] == WAKE_PROBE_STALE_EVENT:
++            lines.append("## Woken because the awaited reply arrived but the wake check missed it")
++            lines.append(f"{payload.get('note')} Last output:")
++        elif row[0] == CONDITION_MET_EVENT:
+             lines.append("## Woken by wake check (condition met)")
+             lines.append(f"The park's wake_check `{payload.get('wake_check')}` exited 0, so this card "
+                          "woke before its deadline. Its output:")
+diff --git a/tests/hermes_cli/test_kanban_comment_origin.py b/tests/hermes_cli/test_kanban_comment_origin.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c259e4def411d0f4059edc311572d7e4583b653
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_comment_origin.py
+@@ -0,0 +1,269 @@
++"""Cross-gateway replies: comments carry ``origin_gateway`` and parks never filter on the author. [daveey]
++
++Regression for t_01a17f81686694ec (self-heal desktop-00c4a3bda2): the card parked on a probe counting
++comments with ``author='macbook'``; the Mac's reply arrived through the hermes-hub relay as author
++``hub:gw:macbook``, so the probe never passed and the card sat parked 38 h until David typed "resume".
++
++(a) a park whose wake_check filters ``task_comments`` by author is refused (``author_probe``) and the
++    error names ``hermes kanban wait-comment``; ``author !=`` (skip my own notes) still parks;
++(b) ``hermes kanban wait-comment --from-gateway macbook`` passes for a relay comment ``hub:gw:macbook``
++    and for ``macbook``, not for ``default``; ``comment --origin-gateway`` stores the column;
++(c) the migration backfills ``origin_gateway`` from relay/``<gw>/t_...`` authors on a legacy board;
++(d) ``wake_probe_stale``: a parked card whose linked hermes-hub request is answered (owner card done)
++    while its probe still exits 1 wakes once with a comment.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++
++INCIDENT_PROBE = (
++    "python3 -c \"import sqlite3,os,sys;c=sqlite3.connect('file:'+os.path.expanduser('~/.hermes/kanban.db')"
++    "+'?mode=ro',uri=True);sys.exit(0 if c.execute(\\\"select count(*) from task_comments where "
++    "task_id='{tid}' and author='macbook'\\\").fetchone()[0]>=2 else 1)\"")
++INCIDENT_REASON = ("SCHEDULED_UNTIL=2099-11-01T00:00:00Z — fix shipped; waiting for the Mac read-only verification "
++                   "(hermes-hub request t01a17f81-mac-verify) to post a second `macbook` comment here.")
++MAC = {"kind": "external", "ref": "macbook gateway", "why": "hub request t01a17f81-mac-verify asks it to reply"}
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "no-mail.json"))
++    monkeypatch.setenv("ASK_GATE_LEDGER", str(home / "state" / "ask-ledger.sqlite"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    yield home
++    kwc._shutdown_for_tests()
++
++
++def _running(conn) -> str:
++    tid = kb.create_task(conn, title="t", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    return tid
++
++
++def _as_worker(monkeypatch, conn, tid):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
++
++
++def _tool(name, args):
++    from tools import kanban_tools as kt
++    return json.loads(getattr(kt, f"_handle_{name}")(args))
++
++
++def _cli():
++    from hermes_cli import kanban as kcli
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    return lambda *argv: kcli.kanban_command(parser.parse_args(["kanban", *argv]))
++
++
++# -- (a) park guard ----------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("op", ["schedule", "block", "continue"])
++def test_park_on_an_author_probe_is_refused(kanban_home, monkeypatch, op) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        probe = INCIDENT_PROBE.replace("{tid}", tid)
++        args = {"schedule": {"reason": INCIDENT_REASON, "wake_check": probe, "awaiting": MAC},
++                "block": {"reason": INCIDENT_REASON, "kind": "time", "wake_check": probe, "awaiting": MAC},
++                "continue": {"checkpoint": INCIDENT_REASON, "resume_after_seconds": 86400, "wake_check": probe,
++                             "awaiting": MAC}}[op]
++        out = _tool(op, args)
++        assert "author_probe" in (out.get("code"), out.get("rejection")) or "author_probe" in str(out), out
++        assert f"hermes kanban wait-comment {tid}" in out["error"] and "--from-gateway" in out["error"], out
++        assert kb.get_task(conn, tid).status == "running" and kwc.get_state(conn, tid) is None
++
++
++@pytest.mark.parametrize("probe", [
++    "sqlite3 ~/.hermes/kanban.db \"select 1 from task_comments where task_id='{tid}' and author like 'daveey-mini%'\" | grep -q 1",
++    "sqlite3 ~/.hermes/kanban.db \"SELECT count(*) FROM task_comments WHERE author IN ('macbook','mac')\" | grep -qv '^0$'",
++])
++def test_author_like_and_in_probes_are_refused_on_the_cli(kanban_home, capsys, probe) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++    rc = run("schedule", tid, INCIDENT_REASON, "--wake-check", probe.replace("{tid}", tid),
++             "--awaiting", "external:macbook gateway", "--awaiting-why", "hub request asks it to reply")
++    assert rc != 0
++    assert "author_probe" in capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_author_not_equal_own_notes_still_parks(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        probe = (f"sqlite3 ~/.hermes/kanban.db \"select count(*) from task_comments where task_id='{tid}' "
++                 f"and author != 'default'\" | grep -qv '^0$'")
++        out = _tool("schedule", {"reason": INCIDENT_REASON, "wake_check": probe, "awaiting": MAC})
++        assert out.get("status") == "scheduled", out
++
++
++def test_wait_comment_probe_parks(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": INCIDENT_REASON, "awaiting": MAC,
++                                 "wake_check": f"hermes kanban wait-comment {tid} --after-id 0 --from-gateway macbook"})
++        assert out.get("status") == "scheduled", out
++
++
++def test_guard_can_be_switched_off(kanban_home, monkeypatch) -> None:
++    # The documented undo: ``kanban.author_probe_guard: false`` in config.yaml.
++    (kanban_home / "config.yaml").write_text("kanban:\n  author_probe_guard: false\n")
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": INCIDENT_REASON, "awaiting": MAC,
++                                 "wake_check": INCIDENT_PROBE.replace("{tid}", tid)})
++        assert out.get("status") == "scheduled", out
++
++
++# -- (b) wait-comment + origin_gateway ---------------------------------------------------------------
++
++@pytest.mark.parametrize("author,origin,want", [
++    ("hub:gw:macbook", None, 0),       # the hub relay (the 10-27 reply)
++    ("macbook", None, 0),              # a free-form --author
++    ("macbook/t_01a18013d59457e9", None, 0),
++    ("hub:gw:macbook", "macbook", 0),
++    ("default", None, 1),              # the card's own worker
++    ("default", "hermes-hub", 1),
++])
++def test_wait_comment_matches_any_author_spelling_of_the_gateway(kanban_home, capsys, author, origin, want) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        kb.add_comment(conn, tid, author, "verification: fix live", origin_gateway=origin)
++    assert run("wait-comment", tid, "--after-id", "0", "--from-gateway", "macbook") == want
++    capsys.readouterr()
++
++
++def test_wait_comment_after_id_and_contains(kanban_home, capsys) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        first = kb.add_comment(conn, tid, "hub:gw:macbook", "evidence: row lacked connection_id")
++    assert run("wait-comment", tid, "--after-id", str(first), "--from-gateway", "macbook") == 1
++    with kbc.connect_closing() as conn:
++        second = kb.add_comment(conn, tid, "hub:gw:macbook", "VERIFIED: deploy live")
++    assert run("wait-comment", tid, "--after-id", str(first), "--from-gateway", "macbook") == 0
++    out = capsys.readouterr().out
++    assert f"comment {second}" in out and "hub:gw:macbook" in out
++    assert run("wait-comment", tid, "--after-id", str(first), "--contains", "verified") == 0
++    assert run("wait-comment", tid, "--after-id", str(first), "--contains", "rollback") == 1
++    assert run("wait-comment", "t_nope", "--after-id", "0") == 2
++
++
++def test_comment_cli_stores_origin_gateway(kanban_home, capsys) -> None:
++    run = _cli()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++    assert run("comment", tid, "--author", "hub:gw:macbook", "--origin-gateway", "macbook", "hello") == 0
++    assert run("comment", tid, "--author", "hub:gw:daveey-mini", "relay") == 0
++    with kbc.connect_closing() as conn:
++        rows = conn.execute("SELECT author, origin_gateway FROM task_comments WHERE task_id = ? ORDER BY id",
++                            (tid,)).fetchall()
++    assert [tuple(r) for r in rows] == [("hub:gw:macbook", "macbook"), ("hub:gw:daveey-mini", "daveey-mini")]
++
++
++# -- (c) backfill ------------------------------------------------------------------------------------
++
++def test_migration_backfills_origin_gateway(kanban_home) -> None:
++    db = kb.kanban_db_path()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++    raw = sqlite3.connect(str(db))
++    if "origin_gateway" in {r[1] for r in raw.execute("PRAGMA table_info(task_comments)")}:
++        raw.execute("ALTER TABLE task_comments DROP COLUMN origin_gateway")
++    for author in ("hub:gw:macbook", "macbook/t_01a18013d59457e9", "default", "hub:op:david"):
++        raw.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, 'x', 1)",
++                    (tid, author))
++    raw.commit()
++    raw.close()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        got = {r[0]: r[1] for r in conn.execute("SELECT author, origin_gateway FROM task_comments")}
++    assert got == {"hub:gw:macbook": "macbook", "macbook/t_01a18013d59457e9": "macbook", "default": None,
++                   "hub:op:david": None}
++
++
++# -- (d) wake_probe_stale ----------------------------------------------------------------------------
++
++def _hub(tmp_path: Path, owner_status: str) -> None:
++    state = tmp_path / "hub-state"
++    state.mkdir(exist_ok=True)
++    db = sqlite3.connect(str(state / "hub.db"))
++    db.executescript(
++        "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);"
++        "CREATE TABLE IF NOT EXISTS sent (id TEXT PRIMARY KEY, body TEXT, state TEXT, result TEXT, "
++        "created_at REAL, done_at REAL, posted INTEGER DEFAULT 0);"
++        "CREATE TABLE IF NOT EXISTS replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT,"
++        " updated_at INTEGER, PRIMARY KEY (gw, coll, key));")
++    db.execute("INSERT OR REPLACE INTO sent VALUES (?, ?, 'done', ?, 1, 2, 0)", (
++        "t01a17f81-mac-verify",
++        json.dumps({"id": "t01a17f81-mac-verify", "to_gw": "macbook", "coll": "tasks", "key": "default/default/new",
++                    "action": "create"}),
++        json.dumps({"output": json.dumps({"id": "t_01a18013d59457e9"}), "task": "t_01a18013d59457e9"})))
++    db.execute("INSERT OR REPLACE INTO replica VALUES ('macbook', 'tasks', 'default/default/t_01a18013d59457e9', 1, 1,"
++               " ?, 1)", (json.dumps({"id": "t_01a18013d59457e9", "status": owner_status}),))
++    db.commit()
++    db.close()
++
++
++def _park_on_stuck_probe(monkeypatch, conn) -> str:
++    tid = _running(conn)
++    _as_worker(monkeypatch, conn, tid)
++    out = _tool("schedule", {"reason": INCIDENT_REASON, "wake_check": "exit 1", "check_every": 300, "awaiting": MAC})
++    assert out.get("status") == "scheduled", out
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    return tid
++
++
++def test_answered_hub_request_wakes_a_card_whose_probe_still_fails(kanban_home, tmp_path, monkeypatch) -> None:
++    _hub(tmp_path, "done")
++    with kbc.connect_closing() as conn:
++        tid = _park_on_stuck_probe(monkeypatch, conn)
++        kwc.run_due_wake_checks(conn, now=int(time.time()), wait=True)
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready", task.status
++        ev = [e for e in kb.list_events(conn, tid) if e.kind == "wake_probe_stale"]
++        assert len(ev) == 1 and ev[0].payload["request"] == "t01a17f81-mac-verify", ev
++        note = kb.list_comments(conn, tid)[-1]
++        assert "t01a17f81-mac-verify" in note.body and "wake_check" in note.body
++        # Once: re-parked on the same request and probe, it stays parked.
++        _as_worker(monkeypatch, conn, tid) if kb.claim_task(conn, tid, claimer="worker") else None
++        out = _tool("schedule", {"reason": INCIDENT_REASON, "wake_check": "exit 1", "check_every": 300,
++                                 "awaiting": MAC})
++        assert out.get("status") == "scheduled", out
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 10_000, wait=True)
++        assert kb.get_task(conn, tid).status == "scheduled"
++
++
++def test_pending_hub_request_keeps_the_card_parked(kanban_home, tmp_path, monkeypatch) -> None:
++    _hub(tmp_path, "running")
++    with kbc.connect_closing() as conn:
++        tid = _park_on_stuck_probe(monkeypatch, conn)
++        kwc.run_due_wake_checks(conn, now=int(time.time()), wait=True)
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == "wake_probe_stale"]
+-- 
+2.55.0
+

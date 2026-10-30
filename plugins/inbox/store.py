@@ -232,12 +232,25 @@ def kanban_task_creator(*, title: str, body: str, assignee: str, board=None, ski
     if board and not kb.board_exists(board):
         raise TaskError(f"kanban board {board!r} does not exist")
     with kbc.connect_closing(board=board) as conn:
-        existing = (conn.execute("SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived' "
-                                 "ORDER BY created_at DESC LIMIT 1", (idempotency_key,)).fetchone()
+        # Repeats of one refusal collect on one card. Its successors carry "<key>#after:<done id>", so the newest
+        # card in that chain is the one to use (cron-3299286b9a).
+        existing = (conn.execute("SELECT id, status FROM tasks WHERE status!='archived' AND (idempotency_key=? OR "
+                                 "substr(idempotency_key, 1, length(?) + 7) = ? || '#after:') "
+                                 "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                                 (idempotency_key, idempotency_key, idempotency_key)).fetchone()
                     if idempotency_key and idempotency_key.startswith(("inbox-refused:", "inbox-junk:")) else None)
-        if existing:
+        if existing and existing["status"] != "done":
             kb.add_comment(conn, existing["id"], "inbox", body)
             return existing["id"]
+        if existing:
+            # A comment on a finished card is read by no one: the refusals kept coming after a worker closed it.
+            # File a fresh card (the done one points at it) so a recurring refusal is worked again.
+            fresh = kb.create_task(conn, title=title, body=f"The earlier card {existing['id']} is done, yet this "
+                                   f"refusal recurred.\n\n{body}", assignee=assignee, board=board,
+                                   skills=list(skills or []) or None,
+                                   idempotency_key=f"{idempotency_key}#after:{existing['id']}", created_by="inbox")
+            kb.add_comment(conn, existing["id"], "inbox", f"Refused again after this card was done; follow-up: {fresh}")
+            return fresh
         return kb.create_task(conn, title=title, body=body, assignee=assignee, board=board,
                               skills=list(skills or []) or None, idempotency_key=idempotency_key,
                               created_by="inbox")
@@ -525,15 +538,16 @@ class Inbox:
             raise ValueError("accept_prompt is required (the instruction 'Do it' sends)")
         snap = ct.snapshot(tdef)
         from_hr = False
-        if policy.family(poster) == "kanban" and os.environ.get("HERMES_KANBAN_TASK"):
+        task_id = os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK")
+        if policy.family(poster) == "kanban" and task_id:
             # A blocked card's human_request IS the owner ask: no second hand-written copy to forget.
-            hr_ask = policy.ask_from_human_request(card_human_request(os.environ["HERMES_KANBAN_TASK"]))
+            hr_ask = policy.ask_from_human_request(card_human_request(task_id))
             if hr_ask and (not ask or ask == hr_ask):
                 ask, from_hr = hr_ask, True
         refusal = policy.reason(home=self.home, poster=poster, ask=ask, actions=snap["actions"],
                                 type_name=snap["name"], title=title, body=body, key=key, from_human_request=from_hr)
         if refusal:
-            self._refuse(refusal, title, body, accept_prompt, poster, key)
+            self._refuse(refusal, title, body, accept_prompt, poster, key, type_name=snap["name"])
         tname, fjson, ajson = snap["name"], json.dumps(fvals), json.dumps(snap)
         legacy = ct.is_builtin_default(snap)  # by content: a look-alike type can't borrow the legacy text
         # A type with resolve actions is a decision card: after the user acted on it, a re-post is a
@@ -632,7 +646,7 @@ class Inbox:
                 side.close()
                 self._close(db)
 
-    def _refuse(self, reason, title, body, prompt, poster, key, error_class=AgentOwnedPost):
+    def _refuse(self, reason, title, body, prompt, poster, key, error_class=AgentOwnedPost, type_name=None):
         pol = policy_module()
         family = pol.family(poster)
         event = {"at": self.clock(), "family": family, "poster": poster, "key": key,
@@ -641,6 +655,8 @@ class Inbox:
             reason = f"{reason}: {pol.RETRY_SHAPE}"
         elif reason == "ask_self_attested":
             reason = f"{reason}: {pol.SELF_ATTESTED_MSG}"
+        elif reason == "poster_missing_keyed":
+            reason = f"{reason}: {pol.missing_poster_hint(self.home, type_name)}"
         declared = pol.declared_label(poster)
         if declared:
             reason += (f"\n\nThe poster declared itself `{declared}` but this post came from a {family} run, so the "

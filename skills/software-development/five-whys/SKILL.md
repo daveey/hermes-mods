@@ -72,11 +72,19 @@ level: snapshot the alert store's row count, run the suite, and confirm the coun
 one real run (for example `systemctl --user start <svc>`) and confirm its success line, instead of waiting
 for the next scheduled run.
 
+For multi-gateway queue alerts, distinguish the originating chat's gateway from the card's execution owner before comparing saturation: a local session can wait on hub-only cards. Verify card presence in the owner's fresh snapshot and read that owner's dispatcher logs. A failed `kanban_show` on the origin does not mean the card disappeared. When recovering a claim hold, inspect its child update process and use the updater's existing cooldown with safe holder termination; killing an idle drainer alone can immediately recreate the hold and strand the repair workers.
+
 **Validate what the metric measures before attributing its cause.** Preserve the original report and its
 measurement timestamp before rerunning a detector: even a dry run may overwrite its report, and concurrent
 workers can create or remove evidence. Reconcile every group in the machine-readable report, not just the
 notification's truncated list. Separate creation rate, retained inventory and actual leaks; a burst alone does
 not prove failed cleanup.
+
+For Hermes transcript-row counts in `state.db` ("notice stored twice", "duplicate row"), check `active`,
+`compacted` and `message_uid` before hunting a second writer: in-place compaction rewinds each retained tail row
+to `active=0, compacted=0` and re-inserts it as a new active row with the same `message_uid` and timestamp
+(`_archive_and_compact_on_conn` in `hermes_state_messages.py`). Count visible rows (`active=1` or
+`compacted=1`) per session; two visible rows are a real double insert, one visible plus superseded copies is not.
 
 For filesystem-age alerts, inspect the timestamp implementation on the running OS. On Linux, `st_ctime` is
 metadata-change time, not creation time, and Git activity makes old worktrees look new; compare GNU
@@ -163,6 +171,8 @@ why it needs that person; keep missing/unknown metadata visible as an agent-owne
 Test both rejection of non-actionable capability/initial blocks and preservation of genuine approvals. Inspect
 existing tests for assertions that enshrine the faulty default; passing them alone does not validate the fix.
 
+For synced Kanban workspace cleanup, inspect sync-shadow replicas before calling a directory orphaned: gateway-local primary boards can evict remote-owned cards while their scratch directories remain. Protect any active copy across primary/profile/replica boards, use the latest finished activity, and abort retention on unreadable ownership sources. Test replica-only completion and active-copy veto; absence from the primary is not proof of abandonment.
+
 For cleanup incidents, distinguish a creator's lifecycle reaper from a generic age-based GC backstop. Trace
 creator ownership from markers, task records or creation commands; directory names alone are not attribution.
 Before exempting a creator from burst monitoring, verify its reaper is discovered and enabled in the actual
@@ -190,9 +200,9 @@ the update's diff changed the module that broke) and the process was in the vuln
 the update). Write that precondition into the live-check acceptance and confirm it before citing the result; when
 it was absent, report "no regression; prevention not yet observed live". The reverse holds for a check that the old
 symptom stopped: count only hits from processes started after the fix landed (a worker spawned before the update keeps
-the old code until it exits; date each line by its session-id stamp or the run's `spawned` time), and match the
-emitting logger plus message, never the bare phrase, because card titles and comments quoting it land in the same
-log. Dry-run the probe on the live log and on one synthetic hit right after filing it, before parking. A guard that "works"
+the old code until it exits; date each line by its session-id stamp or the run's `spawned` time), and anchor the
+match at line start (timestamp, level, emitting logger, then the message), never the bare phrase: card titles,
+comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same logs. Dry-run the probe on the live log and on one synthetic hit right after filing it, before parking. A guard that "works"
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
@@ -255,6 +265,15 @@ Countermeasures:
 
 ## Pitfalls
 
+- For a protected-branch merge incident, recover the exact transcript command before inferring an explicit override from the admin actor. Ordinary `gh pr merge` can land red when server admin enforcement is disabled. Test the invariant across ordinary and override merge paths; a test asserting ordinary merges are unchecked encodes the trust gap. Prefer server-side enforcement as the non-client-dependent barrier, with hook checks as defense in depth. Verify live hook discovery and a read-only replay of the historical failing head; do not risk a red merge into production merely to prove rejection.
+
+- For synthetic recurring occurrences, do not allocate identities with `floor(now) - counter`: a one-second scheduling gap cancels a one-step counter increment and reuses a completed slot. Anchor offsets to an immutable per-job timestamp, keep slots inside grace, and exercise exact 0/1/2-second clock advances through the real dedup path. A completed-occurrence warning plus a missing downstream failure stamp can be correct scheduler dedup acting on a broken fixture, not a timeout defect.
+
+- For native-process ownership tests, `Popen` returning does not guarantee that psutil can already observe nonempty argv: the close-on-exec handshake can precede argv publication. Synchronize on the raw argv precondition, not by retrying the ownership verdict (which could mask a parser defect). For a bounded Linux scheduling-gap reproduction, have a controller inspect only the test parent's newborn children, SIGSTOP those with empty `/proc/<pid>/cmdline`, then SIGCONT after a short hold; always resume stopped children in `finally`. An untargeted duty cycle may miss this narrow window, so record baseline failures and fixed passes separately.
+
+- For procfs liveness-test failures, distinguish a missed deadline from a successful process reap between `exists()` and `read_text()`: catch only `FileNotFoundError` at the read boundary. Reproduce deterministically by intercepting the target stat read, killing and waiting for a real child, then performing the original read; retain a live-child control. Broad SIGSTOP/SIGCONT duty cycling can validate load tolerance but does not reliably hit this narrow race.
+
+- For stat-only cache fingerprints, distinguish semantic inputs from generated metadata: creating an ignored `__pycache__` still moves its parent's mtime. Reproduce at the exact record-write/read boundary by creating the ignored directory and explicitly moving the parent mtime, while retaining real plugin/config invalidation checks. Check a reported CI run's head ancestry before treating a newly delivered flake notice as a post-fix recurrence. A starvation controller must pause all descendants, not only the runner's process group: per-file runners may create new sessions.
 - Writing the chain after the fix is chosen, so the chain is built to justify it. Do the chain first; let it pick
   the fix.
 - Answers that restate the question ("it failed because it errored"). Each why must add new information.
@@ -262,6 +281,19 @@ Countermeasures:
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
 - Skipping the "wasn't caught" chain. It is often the cheapest fix with the widest reach.
+- Checking for a parallel fix only during diagnosis. Right before you implement, fetch the repo, read its branch log
+  since the incident and search open cards on every board for the same symptom: another session reading the same
+  logs often lands the fix first. If one did, run your tests against its commit instead of pushing a second fix.
+- For startup-cancellation tests, scope a process-global `threading.Thread` capture to scheduling the controlled worker, then restore real threads before executing the foreground wrapper: lazy plugin discovery may need `args` and real `start/join` semantics. Keep ordering scenarios' event/join and cancellation watchdogs generous and test-local; retain separate production-deadline coverage. Reproduce with external SIGSTOP/SIGCONT on pytest descendants, selecting exact argv tokens (`-m pytest`), not substring matches: compileall's source-file arguments can themselves contain `pytest` and accidentally throttle setup instead of the test.
+- Model non-returning lifecycle calls accurately in tests: a mocked `os._exit` that returns lets a watchdog loop fire again while the assertion thread is descheduled. Disarm synchronously in the fake exit, handshaking handle publication first; don't rely on the waiting test thread to stop it. Distinguish durable admission terminality from later completion-event publication and wait on the exact contract being asserted.
+- For renderer-only React/Vitest scenarios whose transport is controlled by deferred promises, wrap staging, replies, events and enqueue operations in async React `act`, await the exact reply, then assert after the real effect flush; this makes negative no-drain assertions meaningful without fixed sleeps. Split looped scenarios into runner-owned cases and put cleanup in `afterEach`: a timed-out body is not cancelled, so a late body-owned `finally` can reset the next case's store. For startup byte staging, await the submit/error callback through real fsync instead of racing a one-second assertion poll. Prove slow-fsync and slow-transport seams separately; a passing 30+10 pause matrix alone is not a RED reproduction, and cleanup idempotency does not prove cancellation of arbitrary suspended bodies.
+- For timeout cascades in async React/Vitest tests, distinguish real import/transform cost from virtual timer advancement. Reproduce a slow dependency import before blaming the poll interval; load cold module graphs during collection and mock only the SDK slice the test consumes. Put resource teardown in runner-owned `afterEach`, not solely in a suspended body's `finally`: a timeout does not cancel that body. Prove containment with a forced suspension after registration and check later cases still pass. Advance delayed fake transport explicitly before `vi.waitFor`; its real-time polling can otherwise reintroduce load sensitivity.
+- A test that "times out under CI load" needs a CPU-stress repro (e.g. 4x-nproc `while :; do :; done` loops around `vitest run <file>`), not only injected I/O latency: a delay mock proves an I/O race but never exercises cold transform/import cost, so a fix verified on an idle host can still time out on the runner. Instrument phase timings in the failing test under that stress, and verify the fix under the same stress.
+- In parallel-download pause tests, gate the range workers after a real partial write, outside the coverage lock, on the same Event the pause route sets. Gating only the coordinator/progress callback leaves writers running and can pause an already-complete file. Assert `0 < done_bytes < total_bytes` at pause and new range requests on resume; file size alone is not coverage because partials may be preallocated. Reproduce scheduling gaps with an external SIGSTOP/SIGCONT controller while the assertion thread yields, and disable file retries for the proof.
+- For drain/dispatcher tests, do not end a Desktop turn on a fixed timer and then assert a minimum background claim count: runner scheduling can expire the timer before refills happen. Drive real dispatcher ticks at drain observations, force/reap worker turnover, and clear the turn only after verified refills. Check no-hold at its publication boundary as well as the filesystem; polling alone misses transient holds. Prove the fixture tolerates delayed ticks and rejects both hold-publication and stopped-refill mutations.
+- For background-worker overlap/coalescing tests, handshake at actual publication boundaries: wait for the first job to enter its blocked worker before admitting followers, and release only after all follower jobs are enqueued. A land/commit callback may precede queue publication; releasing there can legitimately split one expected batch into two. Keep the real queue/worker and original outcome assertions, and inject a scheduling gap before final publication to prove the old fixture fails and the synchronized fixture passes.
+- Replacing assertion sleeps with positive-condition waits can make negative checks vacuous: an incorrect debounced write may not have run yet. Verify the invariant at its synchronous ownership/pending-state boundary, or explicitly exercise the scheduled work before asserting absence. Mutation-test the forbidden action (for example, adopting a live sibling's outbox or enqueueing a provisional preference) to prove the new wait still catches it; retain the original expected values. Distinguish newly introduced defaults from values the client already owned: an owned value can legitimately enter the outbox during a slow seed, so a blanket empty-outbox assertion can falsely fail. Awaiting a join/seed promise or generation marker does not prove the following snapshot-apply continuation ran; poll the exact cache value when the assertion depends on apply.
+- For SQLite poll stalls, inspect transaction mode even when the SQL is SELECT-only. In rollback-journal mode, `BEGIN IMMEDIATE` followed by a no-op commit still requests an exclusive lock; an existing shared reader can strand it at commit and block new readers at their first PRAGMA/schema access. Reproduce with a held shared transaction on an isolated database. Move purely read-only methods to a query-only deferred snapshot, preserve immediate/FULL-sync mutation transactions, and test populated decoding plus connection cleanup. Do not identify the initial long-lived lock holder from this contention pattern alone.
 - Recovering a damaged SQLite database by hand as the symptom fix. Several agents chasing the same alert
   each swap a rebuilt copy in, and every `mv` or sidecar `rm` under open WAL connections corrupts the next
   copy. For a Kanban board, the symptom fix is `hermes kanban [--board <slug>]

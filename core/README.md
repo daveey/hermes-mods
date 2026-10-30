@@ -14,15 +14,71 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1037 patches, one entry per non-merge source commit through `2d5bfe43a17d5b78233980cfa36e1873da26ff01` (0961-1037 added 2026-10-29/30).
-Canonical ordinals follow `git log --reverse --no-merges upstream/main..origin/main`.
-Base: `4957bbd0a0f6a1c3fe8217dc4a66d072971f5b63`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
+1301 patches, one entry per non-merge source commit through `7fbf27b309d3da51a1c6e54a26c61c5e1aca2a2d`.
+Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
+in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
+first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
+later-dated mainline commits: ordinals 1203 onward include such entries, and 1282 (`3c2af6ee2e`, merged with PR #312)
+follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
+position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
+to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
+Upstream exclusion tip: `2d2808ee84549f9836b0056750265058e5488a8a`; merge-base: `5608b5faf19ac22d023e62a8fd9675a42d1a61c6`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
+The current snapshot's executed checks are in [mirror-1301-verification.md](mirror-1301-verification.md), with its policy [mirror-policy-1301.json](mirror-policy-1301.json) (previous snapshots: [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
 
+## Frozen-decision reset and fresh-tip follow-ups
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Frozen decisions stop at reset](frozen-decision-reset.md) | 1239 1273 1301 | Exact two-part user-steps decisions survive compression but cancel at a genuinely new LOCAL conversation, with event/waiter settlement. 1301 keeps the old owner's lock past a cancelled caller in the native rehome branch. |
+| [Admission, restart and test isolation](mirror-admission-and-test-followups.md) | 1236–1238 1240–1253 | Memory-aware CI, drain/crash isolation, cron and replica guards, bounded restart settlement, missing pins and source test synchronization. |
+
+## Append-only follow-ups after 1134
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Bounded update pauses and pending clarification](update-pause-followups.md) | 1135 1143 | Pause cap and clarify withdrawal. |
+| [Stable discovery records](plugin-metadata-fingerprint.md) | 1137 1138 | Ignore metadata-only ctime; preserve inode invalidation. |
+| [CI prerequisites](ci-planner-and-tmux.md) | 1139 1156 | Planner source graph and test-job tmux. |
+| [Runtime test synchronization](runtime-test-synchronization.md) | 1136 1140 1146 1147 1148 1155 1157 | Event-based tests and current gateway fixtures. |
+| [Annotation prewarm](annotation-prewarm.md) | 1141 | Read the session-list annotation during serve boot. |
+| [Source tags and class routing](session-source-class-routing.md) | 1142 1144 1149 1152 1153 | Refusal fields, tool labels, worker and CLI class policy. |
+| [Remote notice acknowledgement evidence](remote-notice-ack-evidence.md) | 1145 | Distinguish keyed delivery from stale settlement. |
+| [Worker capability relay](worker-capability-relay.md) | 1150 | Route needs through the card's home gateway. |
+| [Managed worker environment identity](managed-worker-env-identity.md) | 1151 | Recognize the bound live worker ancestor. |
+| [Custom-label launchd gateway](custom-label-launchd-gateway.md) | 1154 1193 1194 1195 | Exact-home supervisor discovery, detached restart and manual-owner handback; a supervised start attaching to a manual owner of its own home records a refusal and hands the home back, and `hermes update` returns a manual gateway to the KeepAlive job serving its home. |
+
+## Newly reconciled feature and compatibility entries
+
+These rows document the 67 source commits absent from the previous 1067-entry mirror. Existing rows below were renumbered by source SHA, not by filename slug.
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Owner execution](mirror-kanban-owner-execution.md) | 0982 1022 1027 1028 | Owner model-tier policy, safe worker imports and routing fixtures. |
+| [Kanban merge compatibility](mirror-kanban-merge-compatibility.md) | 0993 1031 1035 1040 | Capability, recovery and managed-worker-loss fixture contracts. |
+| [Local placement reasons](mirror-kanban-placement-reasons.md) | 1112 | Local-result explanations and alternate-placement advisory. |
+| [Gateway-aware comment waits](mirror-kanban-comment-waits.md) | 1119 1120 | Comment origin, wait-comment, stale probes and extracted queries. |
+| [Cold plugin records](mirror-kanban-cold-plugin-records.md) | 1121 1130 | Hook-presence and capability records avoid unnecessary discovery/auth probes. |
+| [Obsolete remote claims](mirror-kanban-stale-notice-claims.md) | 1131 | Settle dead-holder claims after replica state changes. |
+| [Human-request guidance](mirror-kanban-human-request-guidance.md) | 1133 | Structured human asks and verified continuation-exhaustion routing. |
+| [Merge renames and integration](mirror-runtime-merge-renames.md) | 0981 0994 1037 1051 1056 1058 1062 | Upstream APIs, safe spawns, build stamps and compatibility fixes. |
+| [Worker and config isolation](mirror-runtime-worker-isolation.md) | 0988 0990 0991 0992 1099 1125 | Managed store/config ownership, cron verdicts and checkpoint lock recovery. |
+| [Session moves and delegation](mirror-runtime-session-move-delegate.md) | 1034 1042 1043 1044 | Stop identity, re-import, moved-session exit and explicit child pins. |
+| [Desktop sidebar stamps](mirror-runtime-desktop-sidebar-stamps.md) | 0984 1113 1114 1124 | Project defaults and owner-authoritative replica activity. |
+| [CI and health caps](mirror-runtime-ci-health-caps.md) | 0983 1052 1054 1127 | Concurrency, setup-error counts, catalog descriptions and module extraction. |
+| [Merge test compatibility](mirror-runtime-merge-test-ports.md) | 0987 0989 1018 1023 1025 1026 1029 1030 1032 1036 1038 1041 1045 1047 1049 1057 1115 1122 1126 1129 | Source test adaptations; no blanket fresh-test claim. |
+| [Deleted working directory](mirror-runtime-deleted-cwd.md) | 1118 | Execute-code and file tools tolerate a removed process cwd. |
+| [Background review exit](mirror-runtime-cli-background-review-exit.md) | 1123 | Cancel CLI background review on exit and omit it in one-shot mode. |
+| [Startup performance](mirror-runtime-startup-perf.md) | 1116 1117 1128 | Parent-marker checks and provider AST fast paths. |
+| [Restart notification opt-out](mirror-runtime-restart-notice-optout.md) | 1132 | Re-read an explicit opt-out at shutdown. |
+| [Session probe copies](sessions-branch-probe.md) | 1134 | Standalone hidden root copy; original transcript remains untouched. |
+
 ## Merge-aware mirror verification
 
-Documentation coverage (`python3 -B core/check_coverage.py`) remains unchanged.
+Documentation coverage (`python3 -B core/check_coverage.py`, the pre-commit gate) also refuses
+two staged patches with the same first-line SHA header, naming both ordinals. It needs no source
+repository, so it cannot see omitted commits; the verifier below does.
 It is not a source-equivalence check. Before publishing a new series, separately run:
 
 ```sh
@@ -30,18 +86,31 @@ python3 -B core/verify_mirror.py \
   --source-repo /path/to/source-repo \
   --source-tip FROZEN_FORK_COMMIT \
   --base FROZEN_UPSTREAM_COMMIT \
-  --patch-dir core/patches
+  --patch-dir core/patches \
+  --policy core/mirror-policy-NNNN.json
 ```
 
-Use frozen commit IDs, not moving refs, in publication evidence. `--base` is the
+Exit 0 is the acceptance step for every mirror pass; record its JSON line in the snapshot's
+`mirror-NNNN-verification.md`. Use frozen commit IDs, not moving refs, in publication evidence. `--base` is the
 upstream exclusion tip for `base..source-tip`; the replay starts at its merge-base
 with the source tip, not at an upstream tip that may have advanced. The verifier
-resolves inputs once, checks exact non-merge SHA headers and unique contiguous
-ordinals, applies all mail patches with `git am -3 --empty=keep`, then checks the
+resolves inputs once and checks the inventory: patch ordinals contiguous from
+0001, every patch's first line a `From <sha>` header, no header repeated, and the
+header set equal to the set of `git rev-list --no-merges base..source-tip`. A
+duplicate names both ordinals and an omission names the missing source commits.
+The order of the series is not compared with rev-list order, since published
+ordinals never move and merged-branch commits are appended after later-dated
+mainline ones. It then applies all mail patches in published order with
+`git am -3 --empty=keep`, and checks the
 complete committed tree (paths, modes, object kinds and blob content). Successful
 application alone cannot hide a merge-only runtime resolution or a removed test.
 It verifies final source equivalence, not each intermediate commit's contents or
 commit metadata: curated merge-linearization overlays remain supported.
+The source repository must hold every blob the curated overlay patches name in their
+`index` lines (0378 is the first): a fresh clone of the fork lacks some of them, and
+`git am -3` then stops with "sha1 information is lacking". Point `--source-repo` at the
+long-lived fork checkout, or give a scratch clone its objects as an alternate
+(`echo <checkout>/.git/objects > <clone>/objects/info/alternates`).
 
 The source checkout HEAD is never changed. A uniquely owned detached worktree is
 removed in `finally` on replay/comparison success or failure; other worktrees are
@@ -78,17 +147,29 @@ match, and every fingerprint must be used; an altered blob or stale snapshot
 fails. Fingerprints require independent review for semantic equivalence: they
 are exact reviewed pairs, not a semantic-equivalence algorithm or path exemptions.
 
-Run the stdlib-only fixture suite (also used by the core-mirror CI workflow):
+A public rename of a file whose source name is private (the contributor-marker files
+under `contributors/emails/`) goes in the optional `renames` list:
+`{"applied": "public/path", "source_blob": "BLOB_ID", "applied_blob": "BLOB_ID"}`.
+The rule names only the public path. Its source side is the one source-only path in the
+same directory with the same mode and exactly `source_blob`, so no private file name enters
+the policy. Every rule must be used, and any source-only or applied-only path left unpaired
+still fails as a path-inventory difference.
+
+Run the stdlib-only fixture suites (also used by the core-mirror CI workflow):
 
 ```sh
-python3 -B -m unittest discover -s core -p test_verify_mirror.py -v
+python3 -B -m unittest discover -s core -p 'test_*.py' -v
 ```
 
-The fixtures exercise faithful replay, missing/duplicated/reordered headers,
-missing/duplicate/gapped ordinals, omitted merge-only runtime resolution, deleted
+The fixtures exercise faithful replay, missing and duplicated headers (naming both
+ordinals), headers outside the source range, omitted commits (named), a merged-branch
+commit appended after later-dated mainline commits (passes), the same series with that
+slot holding a duplicate or left out (fails), missing/duplicate/gapped ordinals, omitted merge-only runtime resolution, deleted
 regression tests despite successful replay, explicit directional privacy rules,
-snapshot-bound fingerprints and altered content, malformed policies, file modes,
+snapshot-bound fingerprints and altered content, content-pinned public renames, malformed policies, file modes,
 advanced upstream bases, CLI privacy, and cleanup after replay/comparison failure.
+`test_check_coverage.py` covers the pre-commit gate: duplicate staged SHA headers fail
+naming both ordinals, the staged copy is what counts, and uncovered patches still fail.
 Cleanup fixtures preserve source HEAD and a sibling worktree, inject transient
 and persistent removal errors, and explicitly clean up their own recovery fixture.
 No private repository, network, runtime change or third-party Python package is
@@ -407,10 +488,10 @@ not something the public fixture CI can perform without the source repository.
 | [prompt-admission.md](prompt-admission.md) | 0447, 0448, 0449, 0450, 0452 | Durable exact-owner prompt admission with atomic cancel/reopen and a projected admitted user-row event. |
 | [provider-fallback-and-token-routing.md](provider-fallback-and-token-routing.md) | 0486, 0487, 0511, 0527 | Fallback failures preserved, quota holds bounded to whole chains; routing caps compare token estimates, not bytes. |
 | [model-pill-stored-model.md](model-pill-stored-model.md) | 0473, 0484, 0495 | Composer pill and effort menu use the chat's stored model while its agent is unloaded. |
-| [update-admission-fence.md](update-admission-fence.md) | 0503 1035 | Cross-process admission fence for Desktop reservations and Kanban claims during `hermes update`. |
+| [update-admission-fence.md](update-admission-fence.md) | 0503 1078 | Cross-process admission fence for Desktop reservations and Kanban claims during `hermes update`. |
 | [final-output-withhold-and-submit-survival.md](final-output-withhold-and-submit-survival.md) | 0479, 0500 | Rejected final output withheld until final transforms; an accepted submit survives a client socket drop. |
 | [scratch-home-metrics-and-ci-stability.md](scratch-home-metrics-and-ci-stability.md) | 0471, 0485, 0496, 0498, 0499, 0501, 0502, 0506, 0526, 0531 | Scratch-home isolation, shared-metrics offer never shown, and CI/portability fixes. |
-| [kanban-claim-lease-fencing.md](kanban-claim-lease-fencing.md) | 0530 0543 1029 | Reset heartbeat at claim and fence stale lease echoes with the authoritative grant version, without dropping unrelated task updates. |
+| [kanban-claim-lease-fencing.md](kanban-claim-lease-fencing.md) | 0530 0543 1072 | Reset heartbeat at claim and fence stale lease echoes with the authoritative grant version, without dropping unrelated task updates. |
 | [pm-target-gap-no-worker.md](pm-target-gap-no-worker.md) | 0624 | `pm.ensure()` refuses a package's target gap (POSIX git) in-process instead of spawning a PM worker per call; `selected_git_env` no longer starts an interpreter on every internal git call. |
 | [test-runner-host-slots.md](test-runner-host-slots.md) | 0542 0544 0569 0572 | Concurrent `run_tests.sh` runs share a host-wide cap of `cpu_count` pytest file processes (flock slots in `/tmp/hermes-test-slots-<uid>`), instead of each starting `cpu_count`; nested runs skip it. |
 | [gateway-launchd-core-update-launcher.md](gateway-launchd-core-update-launcher.md) | 0539 | The launchd gateway plist runs `stderr_timestamp` under an installed core-update launcher (`<root>/bin/hermes-gateway-launcher`), inside the shim's `sh -c exec` string, so plist refreshes keep the launcher; `gateway.status` never takes the launcher's process for the gateway. |
@@ -702,22 +783,61 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Session start requests](session-start-requests.md) | 0381, 0382 | Trusted metadata, authenticated SSH principal and persisted-owner preservation. |
 | [Session-start toolset allowlist](session-start-toolsets.md) | 0483 0493 0488 | A durable start can pin a closed toolset allowlist (validated, persisted, kept across resume, compression and branches; reloads cannot widen it). Runners repair chats use it to get only the runners tools. |
 | [Blocked clarify answered elsewhere](clarify-early-answer.md) | 0814 | A decision recorded in the user-steps For-you queue ends a session's blocked `clarify` within seconds (`answered_elsewhere`) instead of at its timeout |
-| [Per-callback hook budgets and a host deadline/abandon signal](hook-callback-budget.md) | 1017 | A plugin hook callback may declare its own bound: `callback.hermes_hook_timeout = N` seconds. The value is clamped to 600, applies to bounded hooks only, and never turns the threaded path on when `plugins.hook_callback_timeout` is 0 or lowe |
-| [Stored chat outcome, server-side mute and sidebar stripe](session-outcome.md) | 0993 0994 0995 0996 0997 0998 0999 1003 1034 1036 | `sessions.outcome_json` / `outcome_at` hold one outcome per chat, and `sessions.muted` is a lineage-wide mute flag. `hermes_state_outcome` derives it by contract precedence 1-8: muted, live turn, open decisions, live work, a held declaratio |
-| [Kanban stale checks count awake time only](kanban-suspend-ledger.md) | 0991 1002 1005 | Each dispatcher pass stamps `kanban.db`; a gap over `max(300, 3 x kanban.dispatch_interval_seconds)` is recorded as a suspend (pruned after 7 days). `awake_seconds()` subtracts recorded suspends. |
-| [Kanban sync: pickup publish, partition repair, lease renewal, claim fence](kanban-sync-fixes.md) | 0967 0984 0992 1013 1021 | 967: the sync client posts `kanban.sync.pickup` (null when unset) once per round and only when it changed, because the Board gives a machine pin `runs_on` only when `/v2/machines` advertises pickup. |
-| [Remote notices: stale and superseded cards stop replaying](kanban-remote-notice-sweep.md) | 0969 0976 1020 | The sweep ignores superseded legacy replica rows, bounds terminal time with the freshness window and checks the delivered ledger (0969). |
-| [create_overlap ignores URL slugs; ci-flaky-cards owner rules](kanban-overlap-url-slug-and-flaky-cards.md) | 1000 1009 1010 1011 1012 1014 | 1009: a plain-word slug is referenced only by `board <slug>`, `--board <slug>`, `<slug> board`, `@task:<slug>@gw/...` or `<gateway>/<slug>` as a whole token; `/<slug>` in a URL, path or slash list no longer counts. Naming a plain-word board |
+| [Per-callback hook budgets and a host deadline/abandon signal](hook-callback-budget.md) | 1059 | A plugin hook callback may declare its own bound: `callback.hermes_hook_timeout = N` seconds. The value is clamped to 600, applies to bounded hooks only, and never turns the threaded path on when `plugins.hook_callback_timeout` is 0 or lowe |
+| [Stored chat outcome, server-side mute and sidebar stripe](session-outcome.md) | 1005 1006 1007 1008 1009 1010 1011 1015 1077 1079 | `sessions.outcome_json` / `outcome_at` hold one outcome per chat, and `sessions.muted` is a lineage-wide mute flag. `hermes_state_outcome` derives it by contract precedence 1-8: muted, live turn, open decisions, live work, a held declaratio |
+| [Kanban stale checks count awake time only](kanban-suspend-ledger.md) | 1003 1014 1017 | Each dispatcher pass stamps `kanban.db`; a gap over `max(300, 3 x kanban.dispatch_interval_seconds)` is recorded as a suspend (pruned after 7 days). `awake_seconds()` subtracts recorded suspends. |
+| [Kanban sync: pickup publish, partition repair, lease renewal, claim fence](kanban-sync-fixes.md) | 0967 0996 1004 1048 1064 | 967: the sync client posts `kanban.sync.pickup` (null when unset) once per round and only when it changed, because the Board gives a machine pin `runs_on` only when `/v2/machines` advertises pickup. |
+| [Remote notices: stale and superseded cards stop replaying](kanban-remote-notice-sweep.md) | 0969 0976 1063 | The sweep ignores superseded legacy replica rows, bounds terminal time with the freshness window and checks the delivered ledger (0969). |
+| [create_overlap ignores URL slugs; ci-flaky-cards owner rules](kanban-overlap-url-slug-and-flaky-cards.md) | 1012 1024 1033 1039 1046 1050 | 1024: a plain-word slug is referenced only by `board <slug>`, `--board <slug>`, `<slug> board`, `@task:<slug>@gw/...` or `<gateway>/<slug>` as a whole token; `/<slug>` in a URL, path or slash list no longer counts. Naming a plain-word board |
 | [Capped turns parked for a core update keep continuation eligibility](core-update-capped-pause.md) | 0962 | The live writer restamps `parked_at` while parking (and once as parking ends); the in-place continue, the startup sweep and the notice hold measure `core_update_pause` freshness through `turn_marker.freshness_since`. |
 | [Worker-terminal write refusal names the worker fence](kanban-worker-fence-refusal.md) | 0963 | The env-inherited refusal now names the worker-terminal fence, the owning agent pid and card, and the authorized paths (kanban_* tools, or gateway/dispatcher board-repair code). In-process delegate children keep their text; leaked markers k |
-| [A block on a human must say what unblock and archive mean](kanban-user-ask-lint.md) | 0982 | `kanban_block` and `kanban_create` (tool entry points) refuse a `human_request` whose `action` does not state what unblocking and what archiving do (rejection `user_ask_incomplete`). Internal trackers (`kb.create_task`) are not linted. The  |
-| [Class routes: gateway rows, API reuse and resume ordering](class-route-resume.md) | 0971 0974 1015 | 971: when the lease adopts the gateway's bare session row it seeds the agent's init `model_config` (`SessionDB.seed_session_model_config` fills only missing keys atomically), so gateway rows under `class:deep` resume as a class, not a pin.  |
+| [A block on a human must say what unblock and archive mean](kanban-user-ask-lint.md) | 0986 | `kanban_block` and `kanban_create` (tool entry points) refuse a `human_request` whose `action` does not state what unblocking and what archiving do (rejection `user_ask_incomplete`). Internal trackers (`kb.create_task`) are not linted. The  |
+| [Class routes: gateway rows, API reuse and resume ordering](class-route-resume.md) | 0971 0974 1053 | 971: when the lease adopts the gateway's bare session row it seeds the agent's init `model_config` (`SessionDB.seed_session_model_config` fills only missing keys atomically), so gateway rows under `class:deep` resume as a class, not a pin.  |
 | [Cold kanban admission helper reuses recorded discovery](cold-admission-helper.md) | 0977 | Each is done once and reused by later cold processes with identical results: the `OPTIONAL_ENV_VARS` additions run lazily on first use under a re-entrant lock; `plugins_snapshot` records plugin toolset keys and portable MCP names; skill fro |
-| [Desktop wake burst and board snapshot cost](backend-burst-perf.md) | 0983 1016 1023 1028 1032 | `/api/status` caches the `_config_version` parse on the file signature (errors still re-read, warn and raise); `stale_ok` reaches `_ledger_owners` so the session strip no longer waits on the links lock; `GET /board` refreshes its snapshot a |
-| [doctor dashboard import probe launches like the runtime](doctor-dashboard-import-probe.md) | 0981 | The probe uses `runtime_command(code=...)`, the same launch as the update import probe. |
-| [CI lanes and test deflakes, 0961-1014](ci-test-stability-0961-1014.md) | 0961 0964 0965 0966 0968 0970 0973 0975 0978 0979 0980 0985 0986 0987 0988 0989 0990 1001 1004 | 965 (source fix): the deterministic compression fallback waits out its local work instead of inheriting the LLM idle window. |
-| [Pull requests run only the Python tests their change can reach](ci-affected-tests.md) | 1006 1007 1008 | Pull requests run only the tests a change can reach (import closure + smoke set); full suite on main, dispatch, release, risky paths or any planner failure. Reads are BOM-tolerant, git calls are bounded, slice count is pinned to the matrix. |
-| [CI lanes and test deflakes, 1018-1037](ci-test-stability-1018-1037.md) | 1018 1019 1022 1027 1030 1031 1037 | Deflake fixes (test-only) plus one CI-card wording change from the 1018-1037 range. |
-| [Placement placeholders never route chats or become a child card's origin](kanban-placement-placeholders.md) | 1024 1025 1033 | A card the MacBook places on the hub carries the creator placeholder session `kanban-placement-<gateway>`, which is attribution only, not a chat. These patches keep it out of every chat-routing path. |
-| [Scope-heartbeat freshness follows the owner's published collector period](kanban-scope-heartbeat-window.md) | 1026 | One rule decides how long an owner's `task_scopes[].observed_at` is trusted. |
+| [Desktop wake burst and board snapshot cost](backend-burst-perf.md) | 0995 1055 1066 1071 1075 | `/api/status` caches the `_config_version` parse on the file signature (errors still re-read, warn and raise); `stale_ok` reaches `_ledger_owners` so the session strip no longer waits on the links lock; `GET /board` refreshes its snapshot a |
+| [doctor dashboard import probe launches like the runtime](doctor-dashboard-import-probe.md) | 0985 | The probe uses `runtime_command(code=...)`, the same launch as the update import probe. |
+| [CI lanes and test deflakes, 0961-1050](ci-test-stability-0961-1050.md) | 0961 0964 0965 0966 0968 0970 0973 0975 0978 0979 0980 0997 0998 0999 1000 1001 1002 1013 1016 | 965 (source fix): the deterministic compression fallback waits out its local work instead of inheriting the LLM idle window. |
+| [Pull requests run only the Python tests their change can reach](ci-affected-tests.md) | 1019 1020 1021 | Pull requests run only the tests a change can reach (import closure + smoke set); full suite on main, dispatch, release, risky paths or any planner failure. Reads are BOM-tolerant, git calls are bounded, slice count is pinned to the matrix. |
+| [CI lanes and test deflakes, 1060-1080](ci-test-stability-1060-1080.md) | 1060 1061 1065 1070 1073 1074 1080 | Deflake fixes (test-only) plus one CI-card wording change from the 1060-1080 range. |
+| [Placement placeholders never route chats or become a child card's origin](kanban-placement-placeholders.md) | 1067 1068 1076 | A card the MacBook places on the hub carries the creator placeholder session `kanban-placement-<gateway>`, which is attribution only, not a chat. These patches keep it out of every chat-routing path. |
+| [Scope-heartbeat freshness follows the owner's published collector period](kanban-scope-heartbeat-window.md) | 1069 | One rule decides how long an owner's `task_scopes[].observed_at` is trusted. |
+| [Auxiliary class routing rotates OAuth accounts before excluding a route](auxiliary-oauth-account-rotation.md) | 1111 | An account 429/402 rotates within the fenced OAuth pool (once per account per call, never to a paid key, no replay after delivery) before the route is excluded. Mirror only: live deployment is tracked on the routing recovery card. |
+| [CI lanes, cache budget and test deflakes, 1081-1111](ci-test-stability-1081-1111.md) | 1081 1083 1085 1091 1093 1094 1095 1096 1097 1098 1101 | Deflake fixes (test-only) plus CI changes: completion gates split from comment pollers, stable PM cache key, bounded cache saves with a timeout smoke. |
+| [Kanban sync keeps dependency and chat-link edges; placement no longer pins Linux work local](kanban-sync-links-and-placement.md) | 1082 1084 1110 | Foreign copies keep Board dependency edges; chat-link deletes are captured; a product name alone no longer pins Linux-only work to the MacBook. |
+| [Kanban board prewarm and per-scope attention caches](kanban-board-read-perf.md) | 1086 1109 | Board prewarm at boot and per-scope attention-count caches cut cold and polled reads from seconds to tenths of a second. |
+| [Kanban capability, PR hold, origin-ledger and relay-ask fixes](kanban-worker-policy-fixes.md) | 1087 1088 1090 1102 | Queue-only assignees skip the capability check; PR holds scope to comment writers; terminal accepts release obligations; agent-relay human asks are refused. |
+| [Plugin module eviction walks a snapshot of sys.modules](plugin-module-eviction-snapshot.md) | 1089 | Plugin loading survives concurrent imports. |
+| [Gateway exit deadline, launchd signal forwarding and cron update admission](gateway-exit-deadline-and-signals.md) | 1092 1106 1107 | One exit deadline tied to the supervisor stop budget, launchd wrapper forwards stop signals, scoped cron runs drop the update reservation. |
+| [Session-state and Desktop wake fixes: passive notices, live-turn rows, change-watcher throttle, power settle](desktop-tui-session-state-fixes.md) | 1100 1103 1104 1105 1108 | No duplicate passive notice on a woken turn, background reads held across sleep/wake, rows of externally running turns show working, throttled change-watcher digest. |
+| [Gateway exit causes, start-race refusals and fallback-dir cleanup](gateway-start-ownership-and-exit-cause.md) | 1158 1168 1174 1175 1192 1198 1200 1202 | Every failed gateway start names its cause in the exit log, losing the profile-reservation race to a live gateway is a recorded refusal, stale `hermes-gw-<hash>` dirs are removed, a one-off launchd gateway job runs under the signed Hermes Python.app, and several gateway tests are made deterministic. |
+| [Kanban worker requeue grants and crash records](kanban-worker-requeue-and-crash-records.md) | 1162 1163 1164 1165 1166 1177 | Shared worker sidecar validation, scoped supervisor requeue grants, deferred class routing, and failed-run-only crash records with flushed replies. |
+| [Kanban goal-loop exits, sweeps and remote notice acks](kanban-goal-loop-sweeps-and-remote-notices.md) | 1176 1183 1184 1188 1189 1190 1197 | Stops goal-mode workers that park themselves or can't reach their owner being booked as crashes, re-checks standing human asks and stale triage on each dispatch, and acks remote notices only once their transcript row exists. |
+| [Boot revision, plugin fingerprints and backend idle work](code-skew-plugin-fingerprint-and-backend-perf.md) | 1160 1161 1180 1181 1185 1186 1191 | Record the boot revision, stabilize plugin discovery fingerprints, and reduce cold-start and idle backend work. |
+| [CI apt/Nix-sandbox, code_health merge judging, termux APT keys and test deflakes](ci-and-test-deflakes-1159-1201.md) | 1159 1167 1169 1170 1171 1172 1173 1178 1179 1182 1187 1196 1199 1201 | JS CI refreshes apt indexes and fails closed, the Nix flake check requires a real sandbox, code_health judges merges against each parent, termux signing imports protected keys attended, plus test-only deflakes and reproductions. |
+| [Gateway restart drain holds, cron gate and sandbox job re-attach](gateway-restart-drain-holds-and-reattach.md) | 1228 1211 1213 1231 | A restart's drain no longer kills or charges the Kanban runs it waits on, agent cron jobs are held rather than failed while the gateway restarts, a claimed admission runs after a drain flip, and a restart re-attaches sandbox background jobs or tells the session its watcher is lost. |
+| [Kanban wake probes, remote notice re-offers and ask re-checks](kanban-wake-probes-remote-notices-and-ask-recheck.md) | 1205 1207 1212 1232 | A woken remote notice whose turn ended without its row is re-offered, standing-ask re-checks read named cards from title/action/why_human, a park's wake_check keeps one live probe across worker nodes, and the origin ledger strips both sides of its evidence comparison. |
+| [CI fast lane, test slices and the upstream-sync gate](ci-fast-lane-test-slices-and-upstream-sync-gate.md) | 1203 1204 1222 1206 1221 | An upstream sync reaches main only after a full suite, Python tests run as 8 slices on one-VM-per-job runners, light PR checks and aggregates run on the fast lane, and the sync resolves gh under a service PATH. |
+| [Desktop remote-primary windows never cold-start a local serve](desktop-remote-primary-no-local-serve.md) | 1208 1209 1210 | A remote-primary window no longer cold-starts a local `hermes serve` for hub replica and retained-Kanban reads; follow-ups keep gateway.ts within its size gate and the connection id a string. |
+| [Dashboard host-attach stale-while-revalidate and update idle probe](dashboard-host-attach-swr-and-update-idle-probe.md) | 1215 1216 1218 1219 1220 | The host-gateway memo is served stale-while-revalidate, control verbs get their own executor, pid liveness uses psutil, and an unanswered idle probe while waiting on a review is not the review ending. |
+| [Test deflakes and the sidecar chmod race](test-deflakes-and-sidecar-chmod-race.md) | 1214 1217 1223 1224 1225 1226 1227 1229 1230 1233 1235 | Deflakes for browser, local-model, desktop send-then-close and preference-store, gateway compression and local-recovery tests, plus the state-db sidecar unlink-between-lstat-and-chmod fix with its test. |
+| [Desktop ConfirmDialog unmount guard](desktop-confirm-dialog-unmount-guard.md) | 1234 | `ConfirmDialog` arms no 600 ms close timer when it unmounts while `onConfirm` is still pending, so no timer fires after teardown. |
+| [Kanban restart, reaper and false-signal fixes](kanban-restart-reaper-and-false-signal-fixes.md) | 1254 1265 1266 1269 1272 | Reject foreign fingerprints safely, drain claims during deferred restart, declare worker restart safety and avoid phantom-reference reports on partial synced boards. |
+| [Cron planned-pause one-shot slots](cron-planned-pause-oneshot-slots.md) | 1255 | Preserve specific one-shot occurrences across planned admission holds and gateway drains without exempting unrelated stale schedules. |
+| [Test-only deflakes and regression coverage, 1254–1277](test-deflakes-batch-1254-1277.md) | 1256 1257 1260 1261 1263 1267 1268 1271 1275 1276 1277 | Test-only readiness, cancellation, evidence, process-reaping, database-handle, admission, cron-slot and teardown-order follow-ups. |
+| [Kanban park and owner-archive fixes](kanban-park-and-owner-archive-fixes.md) | 1258 1259 1264 1274 | Refuse already-met parks, wake on producer completion and allow scoped capability-owner cleanup locally or through a home-relay request. |
+| [Sandbox background watcher idle-reap fixes](sandbox-bg-watcher-idle-reap.md) | 1262 | Keep active sandbox environments through idle cleanup and reattach a failed poller handle before declaring its process lost. |
+| [Affected tests include PM toolchain changes](ci-affected-tests-pm-toolchain.md) | 1270 | Select the full Python suite for shared PM interpreter and activation inputs while leaving unrelated PM data narrow. |
+| [Kanban supervisor requests](kanban-supervisor-requests.md) | 1278 1279 1280 1281 | A worker files a durable, deduplicated `kanban_supervisor_request` to unlink edges between cards its task created; the dispatcher tick executes it with a lease and receipts, link ops are refused up front, and a worker's shell `unlink` is guarded. |
+| [1281-entry mirror snapshot](mirror-1281-verification.md) | verification report | Replay and tree-comparison evidence for the 28 entries appended after the 1253 snapshot. |
+| [Attach e2e probe uses installed Node](attach-probe-node.md) | 1282 | The attach-handshake e2e helper passes the suite's Node as `HERMES_NODE`, and a new test fails if attach ever reaches PM provisioning. |
+| [1299-entry mirror snapshot](mirror-1299-verification.md) | verification report | Duplicate 1282 replaced by the omitted `3c2af6ee2e`; `verify_mirror.py` exits 0 end to end with policy [mirror-policy-1299.json](mirror-policy-1299.json). |
+| [1301-entry mirror snapshot](mirror-1301-verification.md) | verification report | Appends 1300 (`642d2c6878`) and 1301 (`7fbf27b309`); `verify_mirror.py` exits 0 with policy [mirror-policy-1301.json](mirror-policy-1301.json). |
+| [Kanban scratch archive](kanban-scratch-archive.md) | 1299 | `gc_task_scratch` archives (bundle, diff, untracked tar, meta) then removes aged terminal scratch holding git clones; retention `kanban.worktree_retention_days` (default 7, 0 disables). |
+| [Bounded launcher preflight](launch-preflight-bound.md) | 1284 1285 1286 1287 1300 | The launch-time PM currency probe has a 1 s deadline; unknown defers repair and `hermes update` keeps the full check. 1300 keeps a permission error's denied path across the probe and PM workers. |
+| [TUI/e2e CI timing stability](tui-ci-timing-stability.md) | 1283 1297 1298 | A single durable-flush seam for the TUI, no-op in tests, plus synchronized receipt tests and a glyph-layout tolerance. |
+| [Core-update Kanban-only stop budget](gateway-core-update-kanban-stop-budget.md) | 1288 1294 | A spent Kanban update grace gets one 40 s stop leash so the whole restart fits 60 s. |
+| [Kanban owner-archive relay split](kanban-owner-archive-relay-split.md) | 1289 | Pure move of the kanban_archive worker flow to keep the code-health ratchet green. |
+| [Home I/O guard: SQLite URIs](home-io-guard-sqlite-uri.md) | 1290 1291 | The test home-I/O guard checks SQLite URI filenames, including encoded Windows drives. |
+| [Serve update-gate log](serve-update-gate-log.md) | 1292 | Gate waits and re-execs are appended to `logs/serve-update-gate.log`. |
+| [Upstream sync lands via PR](upstream-sync-land-via-pr.md) | 1293 1295 1296 | `land()` merges a PR pinned to the head once the required check is green; GitHub refusals are reported verbatim. |
 | [Kubernetes terminal backend: one pod per session](kubernetes-terminal-backend.md) | pending (fork PR #242) | `terminal.backend: kubernetes`: a hardened pod per session in a profile-configured namespace, exec over the pod API, existing-claim or emptyDir workspace, no PVC rights needed. |

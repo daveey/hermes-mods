@@ -1,0 +1,399 @@
+From 713bc221262ed8170be646b009ea9651cf039eb3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:51:19 +0000
+Subject: [PATCH] fix(process): keep a sandbox job's env through the idle
+ reaper and re-attach a dead poller handle
+
+The idle reaper asked has_active_processes(<container key>), which matches the raw owner id, so a
+profile-scoped Docker env (profile:<name>) was torn down ~5 min after its session went idle while a
+background job still ran in it. The poller's next execute() raised and the session was told the job
+ended (exit -1, lost/backend_lost) while it kept running (hub alpha-askeve proc_eb13cdee12de,
+2026-10-30 12:55). The reaper now keeps any env whose container key hosts a running process, and a
+poller whose handle dies re-attaches via the recorded sandbox handle (running, not restarted, wrapper
+pid file present) before it reports lost.
+---
+ ...t_sandbox_bg_watcher_survives_idle_reap.py | 147 ++++++++++++++++++
+ tools/process_registry.py                     |  62 +-------
+ tools/process_registry_env_log.py             | 108 ++++++++++++-
+ tools/terminal_tool_lifecycle.py              |  11 +-
+ 4 files changed, 263 insertions(+), 65 deletions(-)
+ create mode 100644 tests/tools/test_sandbox_bg_watcher_survives_idle_reap.py
+
+diff --git a/tests/tools/test_sandbox_bg_watcher_survives_idle_reap.py b/tests/tools/test_sandbox_bg_watcher_survives_idle_reap.py
+new file mode 100644
+index 00000000000..ed6eb4d8d5b
+--- /dev/null
++++ b/tests/tools/test_sandbox_bg_watcher_survives_idle_reap.py
+@@ -0,0 +1,147 @@
++"""A running sandbox background job must keep its watcher while the session sits idle. [daveey]
++
++Live, hub alpha-askeve, 2026-10-30: a gateway-owned session started a notify_on_complete job in the
++profile's persistent Docker container (proc_eb13cdee12de, owner ``local-c407…``, container key
++``profile:alpha-askeve``) and ended its turn. ~7 min later the idle reaper tore the environment down,
++the poller's next ``env.execute`` raised, and the session was told the job ended
++(``exit_code -1, completion_reason=lost, termination_source=backend_lost``) while it was still
++running in the container.
++
++Why: ``_cleanup_inactive_envs`` asks ``has_active_processes(<container key>)``, which matches the RAW
++owner id (#120546), never the collapsed container key; the container-key check only ran for
++workspace keys. Two guards, one test each:
++  1. the reaper keeps any container key that hosts a running background process;
++  2. a poller whose environment handle dies anyway re-attaches through the recorded sandbox
++     handle and delivers the real exit, and only reports "lost" when the sandbox is really gone.
++"""
++
++from __future__ import annotations
++
++import shlex
++import subprocess
++import tempfile
++import time
++
++import pytest
++
++from tools import terminal_tool as tt
++from tools.process_registry import ProcessRegistry, ProcessSession
++from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
++from tests.waiting import wait_until
++
++CONTAINER_KEY = "profile:alpha-askeve"
++OWNER = "local-c407191ced81e5b0977a23a282e835d4e12b0c09bfe247e85912e4b5b783228d"
++
++
++class _Env:
++    """A sandbox env stand-in: runs commands in a local bash until it is cleaned up."""
++
++    def __init__(self, temp_dir: str = ""):
++        self.cleaned = False
++        self.temp_dir = temp_dir
++
++    def cleanup(self, **_kw):
++        self.cleaned = True
++
++    def execute(self, command, cwd="", timeout=10, **_kw):
++        if self.cleaned:
++            raise RuntimeError("environment was cleaned up")
++        # Output through a file: the spawn wrapper's backgrounded job inherits stdout, and a pipe
++        # would keep subprocess.run waiting for the job itself (docker exec returns at the shell's exit).
++        with tempfile.TemporaryFile("w+") as out:
++            res = subprocess.run(["bash", "-c", command], stdout=out, stderr=subprocess.STDOUT, text=True,
++                                 timeout=timeout, check=False)
++            out.seek(0)
++            return {"output": out.read(), "returncode": res.returncode}
++
++    def get_temp_dir(self):
++        return self.temp_dir
++
++
++@pytest.fixture()
++def registry(monkeypatch):
++    reg = ProcessRegistry()
++    monkeypatch.setattr("tools.process_registry.process_registry", reg)
++    return reg
++
++
++@pytest.fixture()
++def envs(monkeypatch):
++    monkeypatch.setattr(tt, "_active_environments", {})
++    monkeypatch.setattr(tt, "_last_activity", {})
++    monkeypatch.setattr(tt, "_creation_locks", {})
++    monkeypatch.setattr(tt, "_calls_in_flight", {})
++    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
++    return tt._active_environments
++
++
++def test_reaper_keeps_a_profile_container_env_while_its_background_job_runs(registry, envs):
++    env = _Env()
++    envs[CONTAINER_KEY] = env
++    tt._last_activity[CONTAINER_KEY] = time.time() - 600
++    session = ProcessSession(id="proc_eb13", command="sleep 600", task_id=CONTAINER_KEY, owner_task_id=OWNER,
++                             pid=43086, pid_scope="sandbox", env_ref=env, started_at=time.time())
++    registry._running[session.id] = session
++
++    _cleanup_inactive_envs(lifetime_seconds=300)
++
++    assert not env.cleaned, "the idle reaper tore down the env of a running background job"
++    assert envs.get(CONTAINER_KEY) is env
++
++    # Once the job is gone the env is idle again and is reaped as before.
++    session.exited = True
++    tt._last_activity[CONTAINER_KEY] = time.time() - 600
++    _cleanup_inactive_envs(lifetime_seconds=300)
++    assert env.cleaned
++
++
++def _spawn(registry, env, tmp_path, script):
++    env.temp_dir = str(tmp_path)
++    session = registry.spawn_via_env(env, script, task_id=CONTAINER_KEY, owner_task_id=OWNER,
++                                     session_key=f"agent:alpha-askeve:local:dm:{OWNER}")
++    session.notify_on_complete = True
++    return session
++
++
++def _wait_exit(session, timeout=20.0):
++    deadline = time.monotonic() + timeout
++    while not session.exited and time.monotonic() < deadline:
++        time.sleep(0.2)
++    assert session.exited, "the poller never settled the job"
++
++
++def test_poller_whose_env_dies_reattaches_and_delivers_the_real_exit(registry, tmp_path, monkeypatch, caplog):
++    env = _Env()
++    go = tmp_path / "go"
++    session = _spawn(registry, env, tmp_path,
++                     f"while [ ! -f {shlex.quote(str(go))} ]; do sleep 0.2; done; echo RESTART-PROOF-DONE; exit 3")
++    reattached = _Env(str(tmp_path))
++    handles = []
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment",
++                        lambda handle: handles.append(handle) or reattached)
++    session.sandbox_handle = {"backend": "docker", "container_id": "214b16909172", "docker_exe": "docker"}
++
++    caplog.set_level("INFO", logger="tools.process_registry")
++    env.cleaned = True  # the env handle dies under the poller (idle reap, gateway teardown, ...)
++    # The next poll fails on the dead handle; the poller must re-attach, not settle the job.
++    wait_until(lambda: handles or session.exited, timeout=15, what="the poller reacting to its dead env")
++    assert not session.exited, f"declared {session.completion_reason!r} while the job still runs"
++    go.touch()
++    _wait_exit(session)
++
++    assert handles == [session.sandbox_handle]
++    assert session.exit_code == 3 and session.completion_reason == "exited"
++    assert "RESTART-PROOF-DONE" in session.output_buffer
++    assert any("proc_" in r.getMessage() and "re-attached" in r.getMessage().lower() and OWNER in r.getMessage()
++               for r in caplog.records)
++
++
++def test_poller_reports_lost_only_when_the_sandbox_cannot_be_reattached(registry, tmp_path, monkeypatch):
++    env = _Env()
++    session = _spawn(registry, env, tmp_path, "sleep 30")
++    session.sandbox_handle = {"backend": "docker", "container_id": "gone", "docker_exe": "docker"}
++    monkeypatch.setattr("tools.environments.reattach.reattach_environment", lambda handle: None)
++
++    env.cleaned = True
++    _wait_exit(session)
++    assert session.completion_reason == "lost" and session.termination_source == "backend_lost"
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 3a9743c5a22..10eaccd2bf4 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -40,7 +40,7 @@ from tools.process_registry_output_log import ProcessOutputLogMixin, open_output
+ from tools.process_registry_ownership import ProcessOwnershipMixin
+ from tools.process_registry_termination import ProcessTerminationMixin
+ from tools.process_registry_results import load_completed_results, save_completed_result
+-from tools.process_registry_env_log import log_delta_command
++from tools.process_registry_env_log import env_poller_loop, log_delta_command
+ from tools.process_registry_wsl import _is_wsl_launcher_command
+ 
+ logger = logging.getLogger(__name__)
+@@ -1430,64 +1430,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessRe
+     _log_delta_command = staticmethod(log_delta_command)
+ 
+     def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
+-        """Background thread: poll a sandbox log file for non-local backends."""
+-        q = shlex.quote
+-        # Byte offset already read from the log (bytes, not chars: the shell counts bytes).
+-        prev_output_bytes = 0
+-        while not session.exited:
+-            time.sleep(2)
+-            try:
+-                # Read only the bytes written since the last poll.
+-                raw = env.execute(self._log_delta_command(q(log_path), prev_output_bytes),
+-                                  timeout=10).get("output", "")
+-                header, _, delta = raw.partition("\n")
+-                try:
+-                    size_str, offset_str = header.split()
+-                    new_size = int(size_str)
+-                    used_offset = int(offset_str)
+-                except ValueError:
+-                    # No usable header (command failed, shell missing a tool): skip this
+-                    # poll rather than act on a half-read value.
+-                    new_size = None
+-                    used_offset = None
+-                    delta = ""
+-                if new_size is not None:
+-                    if used_offset < prev_output_bytes:
+-                        # Log rotated/truncated: what we hold no longer lines up. Restart.
+-                        with session._lock:
+-                            if session.exited:
+-                                return
+-                            session.output_buffer = ""
+-                    prev_output_bytes = new_size
+-                if delta:
+-                    # A kill that landed after this fetch already published its output
+-                    # snapshot: leave the output as the kill reported it (as the PTY reader does).
+-                    with session._lock:
+-                        if session.exited:
+-                            return
+-                        session.output_buffer += delta
+-                        if len(session.output_buffer) > session.max_output_chars:
+-                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
+-                    self._check_watch_patterns(session, delta)
+-                    self._emit_output(session, delta)
+-
+-                check = env.execute(
+-                    f"kill -0 \"$(cat {q(pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?", timeout=5)
+-                check_output = check.get("output", "").strip()
+-                if check_output and check_output.splitlines()[-1].strip() != "0":
+-                    # Exited -- read the exit code captured by the wrapper shell.
+-                    exit_str = env.execute(f"cat {q(exit_path)} 2>/dev/null", timeout=5).get("output", "").strip()
+-                    try:
+-                        exit_code = int(exit_str.splitlines()[-1].strip())
+-                    except (ValueError, IndexError):
+-                        exit_code = -1
+-                    self._finish_exited(session, exit_code)
+-                    return
+-            except Exception:
+-                # Environment might be gone (sandbox reaped, etc.). A kill that already
+-                # settled the session keeps its result.
+-                self._finish_exited(session, -1, reason="lost", source="backend_lost")
+-                return
++        """Background thread: poll a sandbox log file for non-local backends (see ``env_poller_loop``)."""
++        env_poller_loop(self, session, env, log_path, pid_path, exit_path)
+ 
+     def _pty_reader_loop(self, session: ProcessSession):
+         """Background thread: read output from a PTY process."""
+diff --git a/tools/process_registry_env_log.py b/tools/process_registry_env_log.py
+index a9cac46b1a7..1adc9d7bcce 100644
+--- a/tools/process_registry_env_log.py
++++ b/tools/process_registry_env_log.py
+@@ -1,4 +1,11 @@
+-"""Incremental sandbox log reads for ProcessRegistry's non-local poller."""
++"""Incremental sandbox log reads and the poller loop for ProcessRegistry's non-local backends."""
++
++import logging
++import shlex
++import time
++from typing import Any
++
++logger = logging.getLogger("tools.process_registry")
+ 
+ 
+ def log_delta_command(quoted_log_path: str, offset: int) -> str:
+@@ -32,3 +39,102 @@ def log_delta_command(quoted_log_path: str, offset: int) -> str:
+         f'if [ "$S" -gt "$O" ]; then '
+         f"tail -c +$((O+1)) {quoted_log_path} 2>/dev/null | head -c $((S-O)); fi"
+     )
++
++
++def env_poller_loop(registry, session, env, log_path: str, pid_path: str, exit_path: str) -> None:
++    """Background thread: poll a sandbox log file for non-local backends (``ProcessRegistry._env_poller_loop``)."""
++    q = shlex.quote
++    # Byte offset already read from the log (bytes, not chars: the shell counts bytes).
++    prev_output_bytes = 0
++    reattaches = 0  # consecutive handle re-attaches without a successful poll in between
++    while not session.exited:
++        time.sleep(2)
++        try:
++            # Read only the bytes written since the last poll.
++            raw = env.execute(registry._log_delta_command(q(log_path), prev_output_bytes),
++                              timeout=10).get("output", "")
++            header, _, delta = raw.partition("\n")
++            try:
++                size_str, offset_str = header.split()
++                new_size = int(size_str)
++                used_offset = int(offset_str)
++            except ValueError:
++                # No usable header (command failed, shell missing a tool): skip this
++                # poll rather than act on a half-read value.
++                new_size = None
++                used_offset = None
++                delta = ""
++            if new_size is not None:
++                if used_offset < prev_output_bytes:
++                    # Log rotated/truncated: what we hold no longer lines up. Restart.
++                    with session._lock:
++                        if session.exited:
++                            return
++                        session.output_buffer = ""
++                prev_output_bytes = new_size
++            if delta:
++                # A kill that landed after this fetch already published its output
++                # snapshot: leave the output as the kill reported it (as the PTY reader does).
++                with session._lock:
++                    if session.exited:
++                        return
++                    session.output_buffer += delta
++                    if len(session.output_buffer) > session.max_output_chars:
++                        session.output_buffer = session.output_buffer[-session.max_output_chars:]
++                registry._check_watch_patterns(session, delta)
++                registry._emit_output(session, delta)
++
++            check = env.execute(
++                f"kill -0 \"$(cat {q(pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?", timeout=5)
++            check_output = check.get("output", "").strip()
++            if check_output and check_output.splitlines()[-1].strip() != "0":
++                # Exited -- read the exit code captured by the wrapper shell.
++                exit_str = env.execute(f"cat {q(exit_path)} 2>/dev/null", timeout=5).get("output", "").strip()
++                try:
++                    exit_code = int(exit_str.splitlines()[-1].strip())
++                except (ValueError, IndexError):
++                    exit_code = -1
++                registry._finish_exited(session, exit_code)
++                return
++        except Exception as exc:  # health: allow BLE001 -- any backend failure: re-attach below or report lost
++            logger.debug("Poller of %s: environment call failed", session.id, exc_info=True)
++            # The environment handle died (idle reap, teardown, sandbox reaped, ...). A sandbox that is
++            # still up keeps the job running: re-attach through the recorded handle and keep watching,
++            # so the session gets the real exit instead of a false "lost". [daveey]
++            reattached = reattach_poller_env(session, pid_path, exc) if reattaches < 3 else None
++            if reattached is not None:
++                env, reattaches = reattached, reattaches + 1
++                continue
++            # A kill that already settled the session keeps its result.
++            registry._finish_exited(session, -1, reason="lost", source="backend_lost")
++            return
++        reattaches = 0
++
++
++def reattach_poller_env(session, pid_path: str, exc: BaseException) -> Any:
++    """A fresh ``execute()`` handle on *session*'s still-running sandbox, or None. [daveey]
++
++    Only when the spawn recorded a re-attach handle, the sandbox is running, it did not restart
++    after the job started, and the job's wrapper PID file is still there."""
++    if session.exited or not session.sandbox_handle:
++        return None
++    from tools.environments import reattach as _reattach
++    try:
++        env = _reattach.reattach_environment(session.sandbox_handle)
++        if env is None:
++            return None
++        started = getattr(env, "started_at", None)
++        if isinstance(started, (int, float)) and isinstance(session.started_at, (int, float)) \
++                and started > session.started_at + 5:
++            return None
++        probe = env.execute(f"test -e {shlex.quote(pid_path)} && echo hermes-bg-present", timeout=10)
++        if "hermes-bg-present" not in str(probe.get("output", "")):
++            return None
++    except Exception:  # health: allow BLE001 -- any failure means "cannot re-attach"; logged with traceback
++        logger.debug("Poller re-attach of %s failed", session.id, exc_info=True)
++        return None
++    session.env_ref = env
++    logger.info("Re-attached sandbox process %s (pid=%s) of session %s after its environment handle failed "
++                "(%s): %s", session.id, session.pid, session.session_key or session.owner_task_id or "-",
++                str(exc)[:120], session.command[:60])
++    return env
+diff --git a/tools/terminal_tool_lifecycle.py b/tools/terminal_tool_lifecycle.py
+index 5bb9d6137f3..b502553a9c4 100644
+--- a/tools/terminal_tool_lifecycle.py
++++ b/tools/terminal_tool_lifecycle.py
+@@ -144,11 +144,12 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
+     try:
+         from tools.process_registry import process_registry
+         for task_id in list(_last_activity.keys()):
+-            # A workspace container is keyed by its digest, not the spawning task id: also keep it
+-            # while any process it hosts is still running (stopping it would kill that process).
+-            if process_registry.has_active_processes(task_id) or (
+-                    _is_workspace_key(task_id)
+-                    and process_registry._any_running(lambda s, key=task_id: s.task_id == key)):
++            # ``has_active_processes`` matches the RAW owner id, but envs are keyed by the collapsed
++            # container key (``profile:<name>``, ``default``, a workspace digest): also keep the env
++            # while any process it hosts is still running. Reaping it kills the job's watcher, which
++            # then reported a still-running job as lost (alpha-askeve, 2026-10-30). [daveey]
++            if process_registry.has_active_processes(task_id) or process_registry._any_running(
++                    lambda s, key=task_id: s.task_id == key):
+                 _last_activity[task_id] = current_time
+     except ImportError:
+         pass
+-- 
+2.55.0
+

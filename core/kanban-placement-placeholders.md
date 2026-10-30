@@ -2,17 +2,17 @@
 
 Patches:
 
-- `patches/1024-fix-kanban-keep-placement-attribution-out-of-chat-ro.patch`
-- `patches/1025-fix-kanban-exclude-placement-placeholders-from-live-.patch`
-- `patches/1033-fix-kanban-never-hand-a-placement-placeholder-or-for.patch`
+- `patches/1067-fix-kanban-keep-placement-attribution-out-of-chat-ro.patch`
+- `patches/1068-fix-kanban-exclude-placement-placeholders-from-live-.patch`
+- `patches/1076-fix-kanban-never-hand-a-placement-placeholder-or-for.patch`
 
 A card the MacBook places on the hub carries the creator placeholder session `kanban-placement-<gateway>`, which is attribution only, not a chat. These patches keep it out of every chat-routing path.
 
 ## Behavior
 
-- 1024: `kanban_chat_links`, `kanban_db_notify`, `kanban_origin_adapter`, `kanban_origin_creation`, `kanban_placement`, `kanban_remote_notices` and `kanban_unloaded` treat a placement placeholder as no chat (no notify subscription, link, origin or unloaded-sweep target).
-- 1025: live pollers (`kanban_remote_notices`, `session_notifications`) exclude placeholders too.
-- 1033 (defect kanban-69709bcf16): a hub worker on a MacBook-placed card called `kanban_create`; `_handle_create` used the parent's placeholder `session_id` as the child's origin, hub refused (`origin_session_missing`) and the rejection reached the Inbox. The parent's session id now goes through `_persisted_session_id` like every other source, and that function rejects placement placeholders (a stray completion notice had left a `kanban-placement-macbook` row in hub's `state.db`, so presence alone is not proof).
+- 1067: `kanban_chat_links`, `kanban_db_notify`, `kanban_origin_adapter`, `kanban_origin_creation`, `kanban_placement`, `kanban_remote_notices` and `kanban_unloaded` treat a placement placeholder as no chat (no notify subscription, link, origin or unloaded-sweep target).
+- 1068: live pollers (`kanban_remote_notices`, `session_notifications`) exclude placeholders too.
+- 1076 (defect kanban-69709bcf16): a hub worker on a MacBook-placed card called `kanban_create`; `_handle_create` used the parent's placeholder `session_id` as the child's origin, hub refused (`origin_session_missing`) and the rejection reached the Inbox. The parent's session id now goes through `_persisted_session_id` like every other source, and that function rejects placement placeholders (a stray completion notice had left a `kanban-placement-macbook` row in hub's `state.db`, so presence alone is not proof).
 
 ## How it works
 

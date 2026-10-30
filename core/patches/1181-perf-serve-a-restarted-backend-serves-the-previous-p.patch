@@ -1,0 +1,447 @@
+From 29ee06eb82a31703b1e7594a7f3a0a457baa7ec2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 08:48:28 +0000
+Subject: [PATCH] perf(serve): a restarted backend serves the previous
+ process's kanban annotation instead of waiting cold [daveey]
+
+After 4739e83caee (boot prewarm) the 2 h soak on hermes-hub (t_01a18b5c8b3db19c) still had 2811 AnyIO worker
+samples blocked at _annotation_snapshot's cold lock wait, all in the ~20 s after each of the three
+hermes-always-on-dashboard restarts (07:12, 07:52, 08:39Z): the Desktop reconnects ~3 s after start, so the
+prewarm read (~1.2 s uncontended) ran 15-17 s under the burst and up to 11 /api/profiles/sessions polls waited
+5-6 s.
+
+The stale-while-refresh snapshot lived only in memory, so every restart started cold. kanban_annotation_disk now
+writes the last published annotation to <HERMES_HOME>/cache/kanban-annotation/<scope-hash>.json (when it changes,
+or at half its max age), and a cold poll that finds a read under way serves a same-scope copy at most 300 s old.
+Rows served from the copy are stamped kanban_observed_at = the copy's time, never now; the process's own first
+read replaces it. Off under HERMES_TEST_ISOLATION (tests set FORCE) so tests sharing a scope cannot leak a copy.
+_mark_kanban_unknown moves to kanban_activity_identity.mark_unknown to keep the module under its line cap.
+---
+ hermes_cli/kanban_activity_identity.py        |  12 ++
+ hermes_cli/kanban_annotation_disk.py          | 152 ++++++++++++++++++
+ hermes_cli/kanban_session_activity.py         |  21 ++-
+ .../hermes_cli/test_kanban_annotation_disk.py | 150 +++++++++++++++++
+ 4 files changed, 324 insertions(+), 11 deletions(-)
+ create mode 100644 hermes_cli/kanban_annotation_disk.py
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_disk.py
+
+diff --git a/hermes_cli/kanban_activity_identity.py b/hermes_cli/kanban_activity_identity.py
+index e84010355ac..e46c7e58a4e 100644
+--- a/hermes_cli/kanban_activity_identity.py
++++ b/hermes_cli/kanban_activity_identity.py
+@@ -58,3 +58,15 @@ def freeze_annotation(parts):
+         {sid: frozenset(ids) for sid, ids in extra.items()},
+         dict(attention),
+     )
++
++
++def mark_unknown(rows):
++    """Drop the counts and stamp ``kanban_unknown`` (a failed read is unknown, never \"no work\")."""
++    for row in rows:
++        for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale",
++                    "kanban_parked", "kanban_held", "kanban_stalled"):
++            row.pop(key, None)
++        row.pop("kanban_observed_at", None)
++        row.pop("kanban_waiting_on", None)
++        row["kanban_unknown"] = True
++    return rows
+diff --git a/hermes_cli/kanban_annotation_disk.py b/hermes_cli/kanban_annotation_disk.py
+new file mode 100644
+index 00000000000..07d3bad9557
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_disk.py
+@@ -0,0 +1,152 @@
++"""Durable copy of the session-list kanban annotation, so a backend restart does not start cold.
++
++``kanban_session_activity._annotation_snapshot`` serves the last good annotation while one refresh runs, but that
++copy lived only in process memory. Every restart (the core updater restarts the always-on dashboard several times
++an hour) began cold, and a cold annotation makes every session poll wait on the one in-flight read. The Desktop
++reconnects about 3 s after the backend starts, so the boot prewarm and the reconnect burst run together under the
++GIL: on hermes-hub the ~1.2 s read took 15-17 s and up to 11 ``/api/profiles/sessions`` workers sat in
++``_annotation_snapshot`` for 5-6 s (t_01a18b5c8b3db19c). The last published annotation is now written here and a
++cold poll serves it (when recent) while the first read of the new process runs. [daveey]
++
++The copy only seeds a cold start: it is never served once this process has its own read, it is ignored past
++``MAX_AGE_S`` or for another scope, and the caller stamps rows with the copy's own time, never "now".
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import os
++import time
++from pathlib import Path
++from typing import Any, Callable
++
++log = logging.getLogger(__name__)
++
++# A restart gap is seconds; a copy older than this describes a backend that has been down, not one restarting.
++MAX_AGE_S = 300.0
++_PARTS = 11
++_VERSION = 1
++
++
++# Off under the test harness, where many tests share one scope and a copy would leak between them; the copy's own
++# tests set ``FORCE``.
++FORCE = False
++# The copy this process loaded per scope, served until its own read publishes: ``(parts, saved_at)``.
++_seeded: dict[tuple[str, ...], tuple[tuple, float]] = {}
++# The last ``(parts, time)`` written per scope, so an unchanged read is not rewritten on every poll.
++_saved: dict[tuple[str, ...], tuple[tuple, float]] = {}
++
++
++def enabled() -> bool:
++    return FORCE or not os.environ.get("HERMES_TEST_ISOLATION")
++
++
++def reset() -> None:
++    _seeded.clear()
++    _saved.clear()
++
++
++def published(scope: tuple[str, ...], parts: tuple) -> None:
++    """This process read ``parts`` itself: retire any loaded copy and persist a changed (or half-aged) read."""
++    _seeded.pop(scope, None)
++    saved = _saved.get(scope)
++    now = time.time()
++    if saved is not None and saved[0] == parts and now - saved[1] < MAX_AGE_S / 2:
++        return
++    if save(scope, parts):
++        _saved[scope] = (parts, now)
++
++
++def seed(scope: tuple[str, ...], last: dict[tuple[str, ...], tuple], freeze: Callable[[tuple], tuple]) -> tuple | None:
++    """Publish the previous process's recent copy into ``last`` (unless a read beat it there) and return what
++    ``last`` now holds for ``scope``; None when there is no usable copy."""
++    loaded = load(scope)
++    if loaded is None:
++        return None
++    parts = freeze(loaded[0])
++    current = last.setdefault(scope, parts)
++    if current is parts:
++        _seeded[scope] = (parts, loaded[1])
++    return current
++
++
++def observed_at(parts: Any) -> float | None:
++    """The saved time of ``parts`` when it is a loaded copy rather than this process's own read."""
++    for seeded, saved_at in list(_seeded.values()):
++        if seeded is parts:
++            return saved_at
++    return None
++
++
++def _path(scope: tuple[str, ...]) -> Path:
++    from hermes_constants import get_hermes_home
++
++    digest = hashlib.sha256(json.dumps(list(scope)).encode("utf-8")).hexdigest()[:16]
++    return Path(get_hermes_home()) / "cache" / "kanban-annotation" / f"{digest}.json"
++
++
++def _encode(value: Any) -> Any:
++    if isinstance(value, (set, frozenset, tuple, list)):
++        items = [_encode(v) for v in value]
++        if isinstance(value, (set, frozenset)):
++            items.sort(key=lambda v: json.dumps(v, sort_keys=True))
++        return {"s": items} if isinstance(value, (set, frozenset)) else {"t": items}
++    return value
++
++
++def _decode(value: Any) -> Any:
++    if isinstance(value, dict):
++        if set(value) == {"s"}:
++            return frozenset(_decode(v) for v in value["s"])
++        if set(value) == {"t"}:
++            return tuple(_decode(v) for v in value["t"])
++    return value
++
++
++def save(scope: tuple[str, ...], parts: tuple) -> bool:
++    """Write ``parts`` for ``scope`` atomically. Never raises: the copy only speeds a cold start."""
++    if not enabled():
++        return False
++    try:
++        if len(parts) != _PARTS:
++            return False
++        body = {
++            "version": _VERSION,
++            "scope": list(scope),
++            "saved_at": time.time(),
++            "parts": [{str(k): _encode(v) for k, v in part.items()} for part in parts],
++        }
++        path = _path(scope)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
++        tmp.write_text(json.dumps(body, separators=(",", ":")), encoding="utf-8")
++        os.replace(tmp, path)
++        return True
++    except Exception:  # health: allow BLE001 -- best-effort cache write; the in-memory annotation is unaffected
++        log.debug("kanban annotation copy not saved", exc_info=True)
++        return False
++
++
++def load(scope: tuple[str, ...], *, max_age_s: float = MAX_AGE_S) -> tuple[tuple, float] | None:
++    """``(parts, saved_at)`` for ``scope`` when a copy at most ``max_age_s`` old exists, else None. Never raises."""
++    if not enabled():
++        return None
++    try:
++        body = json.loads(_path(scope).read_text(encoding="utf-8-sig"))
++        if body.get("version") != _VERSION or body.get("scope") != list(scope):
++            return None
++        saved_at = float(body["saved_at"])
++        if not 0 <= time.time() - saved_at <= max_age_s:
++            return None
++        raw = body["parts"]
++        if not isinstance(raw, list) or len(raw) != _PARTS or not all(isinstance(p, dict) for p in raw):
++            return None
++        parts = tuple({k: _decode(v) for k, v in part.items()} for part in raw)
++        return parts, saved_at
++    except FileNotFoundError:
++        return None
++    except Exception:  # health: allow BLE001 -- a bad copy is no copy; the poll waits for the real read
++        log.debug("kanban annotation copy unreadable", exc_info=True)
++        return None
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8383ac562d3..babba1b40fb 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -16,6 +16,7 @@ from __future__ import annotations
+ 
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ from hermes_cli import kanban_activity_identity as _identity
++from hermes_cli import kanban_annotation_disk as _annotation_copy
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+ from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbeats
+ from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases, _moved_evidence, _retire_moved
+@@ -1871,6 +1872,7 @@ def _refresh_annotation_locked(scope: tuple[str, ...]) -> tuple:
+     parts = _read_annotation_parts()
+     _last_annotation[scope] = parts
+     _annotate_flight_result = parts
++    _annotation_copy.published(scope, parts)  # [daveey] a restart serves it while its first read runs
+     return parts
+ 
+ 
+@@ -1893,6 +1895,7 @@ def _annotation_snapshot() -> tuple:
+         _annotate_waiters += 1
+         try:
+             stale = _last_annotation.get(scope)
++            stale = stale or _annotation_copy.seed(scope, _last_annotation, _identity.freeze_annotation)
+             if stale is not None:
+                 return stale
+             _annotate_refresh_lock.acquire()
+@@ -1934,15 +1937,7 @@ def one_annotation_snapshot() -> Iterator[None]:
+         _annotation_scope.reads = _annotation_scope.attention = _annotation_scope.links = None
+ 
+ 
+-def _mark_kanban_unknown(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+-    for row in rows:
+-        for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale",
+-                    "kanban_parked", "kanban_held", "kanban_stalled"):
+-            row.pop(key, None)
+-        row.pop("kanban_observed_at", None)
+-        row.pop("kanban_waiting_on", None)
+-        row["kanban_unknown"] = True
+-    return rows
++_mark_kanban_unknown = _identity.mark_unknown
+ 
+ 
+ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+@@ -1959,9 +1954,11 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+     attention = None
+     try:
+         if shared:
+-            active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra = shared[0]
++            *parts, copy_at = shared[0]
++            active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys, extra = parts
+         else:
+             parts = _annotation_snapshot()
++            copy_at = _annotation_copy.observed_at(parts)  # [daveey] a previous process's copy keeps its own date
+             if parts is None:
+                 # [daveey] Not a read error (those raise with their own traceback): one line, no synthetic
+                 # traceback for self-heal to chase.
+@@ -1971,7 +1968,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+              attention) = parts
+             if shared is not None:
+                 shared.append((active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys,
+-                               extra))
++                               extra, copy_at))
+                 _annotation_scope.attention = attention
+     except Exception:
+         # [daveey] A failed read is "unknown", never "no work": stamp ``kanban_unknown`` (the sidebar keeps the
+@@ -1988,6 +1985,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
+             attention = {}
+         if shared is not None:
+             _annotation_scope.attention = attention
++    observed_at = observed_at if copy_at is None else min(observed_at, copy_at)
+     for row in rows:
+         row["kanban_observed_at"] = observed_at
+         row.pop("kanban_unknown", None)
+@@ -2041,6 +2039,7 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+     _annotate_flight_result = None
+     _annotate_waiters = 0
+     _last_annotation.clear()
++    _annotation_copy.reset()
+     with _pairs_lock:
+         _board_memo.clear()
+     with _links_lock:
+diff --git a/tests/hermes_cli/test_kanban_annotation_disk.py b/tests/hermes_cli/test_kanban_annotation_disk.py
+new file mode 100644
+index 00000000000..5d4ee80895a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_disk.py
+@@ -0,0 +1,150 @@
++"""A backend restart serves the previous process's kanban annotation instead of starting cold.
++
++On hermes-hub every dashboard restart left up to 11 session-list workers waiting 5-6 s in ``_annotation_snapshot``
++behind the first read, which ran 15-17 s under the Desktop's reconnect burst (t_01a18b5c8b3db19c). [daveey]
++"""
++
++from __future__ import annotations
++
++import json
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_annotation_disk as disk
++from hermes_cli import kanban_session_activity as ksa
++
++SCOPE = ("annotation-disk-test", "default")
++
++
++def _parts(active=None):
++    return ksa._identity.freeze_annotation((
++        active or {"s1": 2}, {"s1": 1}, {}, {}, {"s1": frozenset({"t_a", "t_b"})}, {"s1": 1}, {}, {},
++        {"s1": frozenset({("gw/default/default/t_x", "blocked", False)})}, {"s2": frozenset({"t_c"})}, {"s1": 1}))
++
++
++def _load(scope=SCOPE):
++    loaded = disk.load(scope)
++    assert loaded is not None
++    return loaded
++
++
++@pytest.fixture
++def copy_on(monkeypatch):
++    monkeypatch.setattr(disk, "FORCE", True)
++    monkeypatch.setattr(ksa, "_origin_scope", lambda: SCOPE)
++    ksa._reset_cache_for_tests()
++    yield
++    ksa._reset_cache_for_tests()
++
++
++def test_round_trip_keeps_sets_and_tuples(copy_on):
++    parts = _parts()
++    assert disk.save(SCOPE, parts)
++    loaded, saved_at = _load()
++    assert loaded == parts
++    assert abs(time.time() - saved_at) < 5
++
++
++def test_old_other_scope_or_corrupt_copy_is_no_copy(copy_on):
++    assert disk.save(SCOPE, _parts())
++    assert disk.load(("another", "scope")) is None
++    assert disk.load(SCOPE, max_age_s=-1) is None
++    disk._path(SCOPE).write_text("{not json", encoding="utf-8")
++    assert disk.load(SCOPE) is None
++    body = {"version": 1, "scope": list(SCOPE), "saved_at": time.time(), "parts": [{}] * 3}
++    disk._path(SCOPE).write_text(json.dumps(body), encoding="utf-8")
++    assert disk.load(SCOPE) is None
++
++
++def test_off_under_the_test_harness_by_default(monkeypatch, copy_on):
++    monkeypatch.setattr(disk, "FORCE", False)
++    assert not disk.save(SCOPE, _parts())
++    assert disk.load(SCOPE) is None
++
++
++def test_refresh_writes_the_copy_once_per_change(copy_on, monkeypatch):
++    reads = [_parts({"s1": 2}), _parts({"s1": 2}), _parts({"s1": 3})]
++    monkeypatch.setattr(ksa, "_read_annotation_parts", lambda: reads.pop(0))
++    writes = []
++    real = disk.save
++    monkeypatch.setattr(disk, "save", lambda scope, parts: writes.append(parts) or real(scope, parts))
++    for _ in range(3):
++        ksa._annotation_snapshot()
++    assert [w[0] for w in writes] == [{"s1": 2}, {"s1": 3}]
++    assert _load()[0][0] == {"s1": 3}
++
++
++def test_cold_poll_during_the_first_read_serves_the_copy_without_waiting(copy_on, monkeypatch):
++    """The reconnect burst: a read holds the refresh lock and nothing was served yet in this process."""
++    saved = _parts({"s1": 7})
++    assert disk.save(SCOPE, saved)
++    saved_at = _load()[1]
++    started, release = threading.Event(), threading.Event()
++
++    def slow_read():
++        started.set()
++        release.wait(10)
++        return _parts({"s1": 9})
++
++    monkeypatch.setattr(ksa, "_read_annotation_parts", slow_read)
++    first = threading.Thread(target=ksa._annotation_snapshot)
++    first.start()
++    try:
++        assert started.wait(5)
++        t0 = time.monotonic()
++        rows = ksa.annotate_kanban_activity([{"id": "s1"}])
++        assert time.monotonic() - t0 < 1.0
++        assert rows[0]["kanban_active"] == 7
++        assert "kanban_unknown" not in rows[0]
++        # Dated by the copy, never as a fresh observation.
++        assert rows[0]["kanban_observed_at"] <= saved_at
++    finally:
++        release.set()
++        first.join(5)
++    # The process's own read replaces the copy and is dated normally.
++    rows = ksa.annotate_kanban_activity([{"id": "s1"}])
++    assert rows[0]["kanban_active"] == 9
++    assert rows[0]["kanban_observed_at"] > saved_at - ksa._CACHE_TTL_S
++    assert disk._seeded == {}
++
++
++def test_shared_block_keeps_the_copy_date(copy_on, monkeypatch):
++    assert disk.save(SCOPE, _parts({"s1": 7}))
++    saved_at = _load()[1]
++    started, release = threading.Event(), threading.Event()
++    monkeypatch.setattr(ksa, "_read_annotation_parts",
++                        lambda: (started.set(), release.wait(10), _parts({"s1": 9}))[2])
++    first = threading.Thread(target=ksa._annotation_snapshot)
++    first.start()
++    try:
++        assert started.wait(5)
++        with ksa.one_annotation_snapshot():
++            a = ksa.annotate_kanban_activity([{"id": "s1"}])[0]
++            b = ksa.annotate_kanban_activity([{"id": "s1"}])[0]
++        assert a["kanban_active"] == b["kanban_active"] == 7
++        assert a["kanban_observed_at"] <= saved_at and b["kanban_observed_at"] <= saved_at
++    finally:
++        release.set()
++        first.join(5)
++
++
++def test_cold_poll_without_a_copy_still_waits_for_the_read(copy_on, monkeypatch):
++    started, release = threading.Event(), threading.Event()
++    monkeypatch.setattr(ksa, "_read_annotation_parts",
++                        lambda: (started.set(), release.wait(10), _parts({"s1": 9}))[2])
++    first = threading.Thread(target=ksa._annotation_snapshot)
++    first.start()
++    got = []
++    try:
++        assert started.wait(5)
++        waiter = threading.Thread(target=lambda: got.append(ksa._annotation_snapshot()))
++        waiter.start()
++        waiter.join(0.3)
++        assert waiter.is_alive() and not got
++    finally:
++        release.set()
++        first.join(5)
++    waiter.join(5)
++    assert got and got[0][0] == {"s1": 9}
+-- 
+2.55.0
+

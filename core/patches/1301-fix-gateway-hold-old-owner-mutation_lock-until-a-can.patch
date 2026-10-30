@@ -1,0 +1,135 @@
+From 7fbf27b309d3da51a1c6e54a26c61c5e1aca2a2d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 17:22:22 +0000
+Subject: [PATCH] fix(gateway): hold old-owner mutation_lock until a cancelled
+ caller's native rehome write commits
+
+reset_and_rehome_messages' non-LOCAL branch released the old owner's mutation_lock when the caller was cancelled, while the shielded tracked_write was still moving queued messaging rows; the old drain could claim a row about to be transferred. Acquire explicitly and release in the write's done callback (PR309 pattern).
+---
+ gateway/session_automation.py            | 35 ++++++++-----
+ tests/gateway/test_rehome_cancel_lock.py | 67 ++++++++++++++++++++++++
+ 2 files changed, 89 insertions(+), 13 deletions(-)
+ create mode 100644 tests/gateway/test_rehome_cancel_lock.py
+
+diff --git a/gateway/session_automation.py b/gateway/session_automation.py
+index 1a0cccb74d5..0dca2d74c39 100644
+--- a/gateway/session_automation.py
++++ b/gateway/session_automation.py
+@@ -702,19 +702,28 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
+         await fresh.claim_gate.acquire()
+         return result, fresh
+ 
+-    async with live.mutation_lock:
+-        write = asyncio.ensure_future(tracked_write(authority, rotate_and_move, fence, ordered=True))
+-        try:
+-            (entry, new, moved), fresh = await asyncio.shield(write)
+-        except asyncio.CancelledError:
+-            # The rotation still commits and takes the fence: lift it, or the fresh FIFO never runs.
+-            def lift(done):
+-                gate = None if done.cancelled() or done.exception() else done.result()[1]
+-                if gate is not None:
+-                    gate.claim_gate.release()
+-                    authority._schedule(done.result()[0][1])
+-            write.add_done_callback(lift)
+-            raise
++    # The old owner's lock fences its drain's claim until the move commits, so it must outlive a
++    # cancelled caller: ``tracked_write`` is shielded and keeps writing, and a lock released by the
++    # cancellation would let the old drain claim a queued row the move is about to transfer.
++    await live.mutation_lock.acquire()
++    write = asyncio.ensure_future(tracked_write(authority, rotate_and_move, fence, ordered=True))
++
++    def committed(done):
++        live.mutation_lock.release()
++        if not done.cancelled():
++            done.exception()  # a cancelled caller no longer observes it
++    write.add_done_callback(committed)
++    try:
++        (entry, new, moved), fresh = await asyncio.shield(write)
++    except asyncio.CancelledError:
++        # The rotation still commits and takes the fence: lift it, or the fresh FIFO never runs.
++        def lift(done):
++            gate = None if done.cancelled() or done.exception() else done.result()[1]
++            if gate is not None:
++                gate.claim_gate.release()
++                authority._schedule(done.result()[0][1])
++        write.add_done_callback(lift)
++        raise
+     if fresh is None:
+         return entry, lambda: None
+     if moved:
+diff --git a/tests/gateway/test_rehome_cancel_lock.py b/tests/gateway/test_rehome_cancel_lock.py
+new file mode 100644
+index 00000000000..262ac810335
+--- /dev/null
++++ b/tests/gateway/test_rehome_cancel_lock.py
+@@ -0,0 +1,67 @@
++"""A cancelled reset caller must not release the old owner's mutation_lock before the rehome commits."""
++import asyncio
++import threading
++
++import pytest
++
++
++@pytest.mark.asyncio
++async def test_caller_cancelled_during_native_rehome_keeps_old_owner_lock(tmp_path, monkeypatch):
++    import hermes_state_runtime
++    from gateway.config import GatewayConfig, Platform, PlatformConfig
++    from gateway.platforms.event import MessageEvent
++    from gateway.run import GatewayRunner
++    from gateway.session_authority import SessionAuthority, initialize_session_authority
++    from gateway.session_automation import reset_and_rehome_messages
++    from gateway.session_ingress_context import native_callback
++    from gateway.session_runtime_workers import mutation_tasks
++    from hermes_constants import get_hermes_home
++    from hermes_state_runtime import list_session_admissions
++    from plugins.platforms.discord.adapter import DiscordAdapter
++
++    monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
++    monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
++    runner = GatewayRunner(GatewayConfig())
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
++    runner.adapters = {Platform.DISCORD: adapter}
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
++    runner._wire_adapter_handlers(adapter)
++    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
++    receipts = []
++    for name in ('first', 'second'):
++        event = MessageEvent(text=name, source=source, message_id=name)
++        with native_callback(runner, event, get_hermes_home()):
++            receipts.append(await authority.admit_native(event))
++    key = runner.session_store._generate_session_key(source)
++    old = runner.session_store.peek_session_id(key)
++    live = authority.sessions[old]
++
++    entered, release = threading.Event(), threading.Event()
++    real = hermes_state_runtime.rehome_queued_inputs
++
++    def suspended(*args, **kwargs):
++        entered.set()
++        assert release.wait(30)
++        return real(*args, **kwargs)
++    monkeypatch.setattr(hermes_state_runtime, 'rehome_queued_inputs', suspended)
++    try:
++        caller = asyncio.ensure_future(reset_and_rehome_messages(runner, key, old))
++        assert await asyncio.to_thread(entered.wait, 30)
++        caller.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await caller
++        # The move is still suspended: the old drain's claim fence must still be held.
++        assert len(mutation_tasks(authority)) == 1
++        assert live.mutation_lock.locked()
++        assert len(list_session_admissions(authority.db, session_id=old, pending_only=True)) == 2
++        release.set()
++        await asyncio.gather(*mutation_tasks(authority))
++        await asyncio.wait_for(live.mutation_lock.acquire(), 30)
++        live.mutation_lock.release()
++        fresh = runner.session_store.lookup_by_session_key(key).session_id
++        assert fresh != old
++        assert list_session_admissions(authority.db, session_id=old, pending_only=True) == []
++        assert len(list_session_admissions(authority.db, session_id=fresh, pending_only=True)) == 2
++    finally:
++        release.set()
++        runner.session_store.close_all_db_handles()
+-- 
+2.55.0
+

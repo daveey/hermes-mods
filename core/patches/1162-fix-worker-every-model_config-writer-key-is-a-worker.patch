@@ -1,0 +1,376 @@
+From c9a4e3485708b400b7684b7a8763ee7c25dc23f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:08:56 -0700
+Subject: [PATCH] fix(worker): every model_config writer key is a worker
+ sidecar key; class failover survives a failed row mirror [daveey]
+
+A managed worker's class failover (402/429 on a class route) mirrored model_routing onto
+the session row via session.sidecars; the owner refused the key (invalid_params), the refusal
+latched in the receipt journal and close() re-raised it, so the worker exited 1 instead of
+answering on the fallback route (run 10210).
+
+- hermes_state_sidecar_keys: one registry for owner validation and the worker pre-check; adds
+  model_routing, prompt_refresh_epoch, _fallback_probe_at, reasoning_rejected_carriers,
+  onboarding_run, codex_thread_id. Lineage keys stay owner-reserved.
+- RuntimeSessionStore.patch_session_model_config refuses an unregistered key before journaling,
+  so it fails one call instead of poisoning every later write and the close-time flush.
+- try_class_fallback: the row mirror is best-effort; a failure logs and the turn continues.
+- tests: AST drift guard over every patch_session_model_config writer; managed-store failover
+  wire test (mirror ok / mirror refused); unregistered key does not latch.
+---
+ agent/model_routing_agent.py                  |  11 +-
+ agent/runtime_session_store.py                |   6 +
+ hermes_state_sidecar_keys.py                  |  26 ++++
+ hermes_state_worker_context.py                |   5 +-
+ .../test_managed_class_fallback_sidecars.py   | 115 ++++++++++++++++
+ .../test_sidecar_keys_registry.py             | 128 ++++++++++++++++++
+ 6 files changed, 287 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_state_sidecar_keys.py
+ create mode 100644 tests/agent/test_managed_class_fallback_sidecars.py
+ create mode 100644 tests/hermes_state/test_sidecar_keys_registry.py
+
+diff --git a/agent/model_routing_agent.py b/agent/model_routing_agent.py
+index c755e5505db..190857664d2 100644
+--- a/agent/model_routing_agent.py
++++ b/agent/model_routing_agent.py
+@@ -131,7 +131,16 @@ def try_class_fallback(agent):
+     _reset_stale_streak(agent)
+     agent._fallback_activated = False
+     _snapshot_primary_runtime(agent)
+-    persist_class_metadata(agent)
++    # The failover is committed in memory and in the routing allocation store; the session-row mirror is
++    # best-effort here. A failed mirror write must not turn a recoverable route failure (402, 429) into a
++    # dead turn: the retry continues on the new route and the next persist re-syncs the row.
++    try:
++        persist_class_metadata(agent)
++    except Exception:
++        import logging
++        logging.getLogger(__name__).warning(
++            "Class failover to %s/%s: session row mirror failed; continuing on the new route",
++            agent.provider, agent.model, exc_info=True)
+     return True
+ 
+ 
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index 643cf95bc6a..515a5c43a81 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -491,6 +491,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+ 
+     def patch_session_model_config(self, session_id, patch):
+         self._session(session_id)
++        # The owner refuses any key outside the shared registry; refusing here, before the patch is
++        # journaled, fails only this call. A journaled refusal latches ``failure`` and every later write
++        # and the close-time flush re-raise it, turning a best-effort sidecar into a dead worker.
++        from hermes_state_sidecar_keys import SIDECAR_KEYS
++        if not isinstance(patch, dict) or set(patch) - SIDECAR_KEYS:
++            raise WorkerPersistenceError('invalid_params')
+         self._apply('session.sidecars', {'patch': patch})
+ 
+     def update_session_tool_names(self, session_id, pin):
+diff --git a/hermes_state_sidecar_keys.py b/hermes_state_sidecar_keys.py
+new file mode 100644
+index 00000000000..3f37e49690a
+--- /dev/null
++++ b/hermes_state_sidecar_keys.py
+@@ -0,0 +1,26 @@
++"""The ``sessions.model_config`` keys a managed worker may write on its own session row.
++
++One registry for both sides of the worker boundary: the owner validates ``session.sidecars`` and a
++compaction ``model_config_patch`` against it (``hermes_state_worker_context``,
++``hermes_state_worker_compression``), and the worker's ``RuntimeSessionStore`` checks a patch before
++journaling it, so an unregistered key fails that one call instead of poisoning the receipt journal.
++
++Every key the agent writes through ``patch_session_model_config`` / ``update_conversation_model_config_value``
++must be listed here; ``tests/hermes_state/test_sidecar_keys_registry.py`` scans the tree and fails on drift.
++Identity and lineage markers stay owner-reserved and must never be added.
++"""
++
++SIDECAR_KEYS = frozenset({
++    '_usage_anchor',                  # agent/usage_anchor.py
++    '_proactive_prune_rearm_tokens',  # agent/context_compressor.py (+ compaction model_config_patch)
++    '_anthropic_rejected_thinking',   # agent/anthropic_thinking_replay.py
++    '_fallback_probe_at',             # agent/context_compressor_prellm.py
++    'model_routing',                  # agent/model_routing_agent.py (class failover / clear)
++    'prompt_refresh_epoch',           # agent/prompt_refresh.py
++    'reasoning_rejected_carriers',    # agent/message_sanitization.py
++    'onboarding_run',                 # agent/onboarding_record.py
++    'codex_thread_id',                # agent/codex_runtime.py
++})
++
++# Lineage/identity markers only the owner writes (session creation, branch, delegate reservation).
++OWNER_RESERVED_KEYS = frozenset({'_delegate_from', '_branched_from'})
+diff --git a/hermes_state_worker_context.py b/hermes_state_worker_context.py
+index e59b9dd2233..263ff01cd9d 100644
+--- a/hermes_state_worker_context.py
++++ b/hermes_state_worker_context.py
+@@ -8,9 +8,8 @@ from hermes_state_runtime import RuntimeStoreError
+ 
+ 
+ # model_config sidecars a worker may patch: every key the agent persists via
+-# ``patch_session_model_config`` (``_anthropic_rejected_thinking``: main's rejected-signature
+-# fingerprints, agent/anthropic_thinking_replay.py) or a compaction ``model_config_patch``.
+-SIDECAR_KEYS = frozenset({'_usage_anchor', '_proactive_prune_rearm_tokens', '_anthropic_rejected_thinking'})
++# ``patch_session_model_config`` or a compaction ``model_config_patch`` (one registry, drift-tested).
++from hermes_state_sidecar_keys import SIDECAR_KEYS  # re-exported for the owner validators
+ 
+ 
+ def worker_context(db, conn, session_id, payload):
+diff --git a/tests/agent/test_managed_class_fallback_sidecars.py b/tests/agent/test_managed_class_fallback_sidecars.py
+new file mode 100644
+index 00000000000..f559190512e
+--- /dev/null
++++ b/tests/agent/test_managed_class_fallback_sidecars.py
+@@ -0,0 +1,115 @@
++"""A managed worker whose class route fails over must keep its turn and its receipt journal.
++
++Live failure (run 10210): a class:standard route answered 402 (out of credits), ``try_class_fallback``
++mirrored ``model_routing`` onto the session row through the worker's ``RuntimeSessionStore``, the owner
++refused ``session.sidecars`` with ``invalid_params``, the refusal latched in the journal and ``close()``
++re-raised it, so the worker exited 1 instead of answering on the fallback route.
++"""
++import json
++from copy import deepcopy
++from unittest.mock import patch
++
++import anthropic
++import httpx
++import pytest
++
++from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
++from hermes_cli.config import atomic_config_write
++from hermes_state import SessionDB
++from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
++from tests.agent import test_model_routing_agent
++from tests.agent.test_class_failure_wire import completion
++from tests.agent.test_model_routing_agent import build_agent
++
++routing_home = test_model_routing_agent.routing_home
++streaming_route = test_model_routing_agent.streaming_route
++
++
++@pytest.fixture
++def worker_store(tmp_path):
++    db = SessionDB(tmp_path / "owner-state.db")
++    db.create_session("managed-class", "cli", model="class:deep")
++    epoch = begin_runtime_epoch(db, instance_id="fixture")
++    scope = dict(epoch=epoch, execution_id="worker", session_id="managed-class", generation=0)
++    register_worker_execution(db, **scope, kind="compute", adoption_secret="test-secret")
++    store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / "outbox")
++    try:
++        yield db, store
++    finally:
++        try:
++            store.close()
++        finally:
++            db.close()
++
++
++@pytest.mark.parametrize("mirror_fails", [False, True])
++def test_class_route_quota_failure_fails_over_and_worker_persists_model_routing(routing_home, streaming_route, tmp_path,
++                                                                     worker_store, mirror_fails):
++    """``mirror_fails``: the best-effort row mirror of the failover raises; the turn still answers."""
++    db, store = worker_store
++    second = deepcopy(routing_home["model_routing"]["routes"]["deep"][0])
++    second["model"] = "z-anthropic-deep"
++    routing_home["model_routing"]["routes"]["deep"].append(second)
++    routing_home["agent"] = {"max_iterations": 4}
++    atomic_config_write(tmp_path / "config.yaml", routing_home)
++    sent = []
++
++    def respond(request):
++        body = json.loads(request.content)
++        sent.append(body["model"])
++        if body["model"] == "anthropic-deep":
++            # 429 quota, not the live 402: this fixture's two routes share ONE pooled credential, and a
++            # 402 marks that credential exhausted for both, so no class route would remain. The live 402
++            # came from a different provider; the persist path after try_class_fallback is the same.
++            return httpx.Response(429, json={"type": "error", "error": {
++                "type": "rate_limit_error",
++                "message": "You have run out of credits (personal-team-blocked:spending-limit)"}})
++        return completion(body["model"])
++
++    sdk_class = anthropic.Anthropic
++
++    def sdk(**kwargs):
++        kwargs["http_client"] = httpx.Client(transport=httpx.MockTransport(respond))
++        kwargs["max_retries"] = 0
++        return sdk_class(**kwargs)
++
++    with patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("agent.turn_recovery.interruptible_backoff_sleep", return_value=None), \
++         patch("anthropic.Anthropic", side_effect=sdk):
++        agent = build_agent(session_id="managed-class", session_db=store, max_iterations=4)
++        if mirror_fails:
++            real_patch = store.patch_session_model_config
++
++            def refusing_patch(session_id, patch):
++                if "model_routing" in patch:
++                    raise WorkerPersistenceError("invalid_params")
++                return real_patch(session_id, patch)
++            store.patch_session_model_config = refusing_patch
++        try:
++            result = agent.run_conversation("Say ok")
++        finally:
++            agent.release_clients()
++    assert result["final_response"] == "ok", result
++    assert sent[0] == "anthropic-deep" and sent[-1] == "z-anthropic-deep", sent
++    assert agent.model == "z-anthropic-deep"
++    # Nothing is latched: the close-time flush succeeds.
++    assert store.failure is None
++    assert store.flush_token_counts() is True
++    if mirror_fails:
++        return
++    # The failover reached the owner's row.
++    routing = db.get_session_model_config_value("managed-class", "model_routing")
++    assert routing and routing["requested_class"] == "deep", routing
++    assert db.get_session("managed-class")["model"] == "z-anthropic-deep"
++
++
++def test_unregistered_sidecar_key_fails_one_call_without_poisoning_the_journal(worker_store):
++    db, store = worker_store
++    with pytest.raises(WorkerPersistenceError, match="invalid_params"):
++        store.patch_session_model_config("managed-class", {"_not_a_registered_sidecar": 1})
++    assert store.failure is None and not store.journal["pending"]
++    store.patch_session_model_config("managed-class", {"model_routing": {"requested_class": "deep"}})
++    assert db.get_session_model_config_value("managed-class", "model_routing") == {"requested_class": "deep"}
++    assert store.flush_token_counts() is True
++
+diff --git a/tests/hermes_state/test_sidecar_keys_registry.py b/tests/hermes_state/test_sidecar_keys_registry.py
+new file mode 100644
+index 00000000000..ec90698ba76
+--- /dev/null
++++ b/tests/hermes_state/test_sidecar_keys_registry.py
+@@ -0,0 +1,128 @@
++"""Every ``sessions.model_config`` key the agent writes through ``patch_session_model_config`` must be one a
++managed worker may write (``SIDECAR_KEYS``): a missing key makes the owner refuse ``session.sidecars`` with
++``invalid_params`` and the managed worker dies (a class fallback's ``model_routing`` write did exactly that).
++
++The scan is static (AST) over the whole tree, so a new writer cannot drift silently: a key it writes must
++resolve to a string literal or a module constant, and that string must be registered.
++"""
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++from hermes_state_sidecar_keys import OWNER_RESERVED_KEYS, SIDECAR_KEYS
++
++ROOT = Path(__file__).resolve().parents[2]
++SKIP_DIRS = {"tests", "node_modules", "apps", "website", ".git", "venv", ".venv", "build", "dist", ".worktrees"}
++
++# Writers that run only in an owner process (never through a worker RuntimeSessionStore), with the reason.
++OWNER_ONLY_WRITERS = {
++    # Interactive CLI ``/model``: HermesCLI owns a SessionDB directly; no managed worker runs this mixin.
++    "hermes_cli/cli_model_switch_mixin.py",
++    # The store implementations themselves (their own forwarding calls take a caller's dict).
++    "agent/runtime_session_store.py",
++    "hermes_state_sessions.py",
++}
++
++
++def _py_files():
++    for path in ROOT.rglob("*.py"):
++        rel = path.relative_to(ROOT)
++        if not rel.parts or rel.parts[0] in SKIP_DIRS or any(p.startswith(".") for p in rel.parts[:-1]):
++            continue
++        yield rel, path
++
++
++def _module_constants(tree):
++    out = {}
++    for node in tree.body:
++        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
++            for target in node.targets:
++                if isinstance(target, ast.Name):
++                    out[target.id] = node.value.value
++    return out
++
++
++def _writes(tree):
++    """Yield (lineno, dict_node_or_None, key_node_or_None) for each model_config write call in *tree*."""
++    patchers = set()
++    for node in ast.walk(tree):
++        # ``patcher = getattr(db, "patch_session_model_config", None)``
++        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) \
++                and isinstance(node.value.func, ast.Name) and node.value.func.id == "getattr" \
++                and len(node.value.args) >= 2 and isinstance(node.value.args[1], ast.Constant) \
++                and node.value.args[1].value == "patch_session_model_config":
++            patchers.update(t.id for t in node.targets if isinstance(t, ast.Name))
++    for node in ast.walk(tree):
++        if not isinstance(node, ast.Call):
++            continue
++        func = node.func
++        name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else None
++        if name == "patch_session_model_config" or name in patchers:
++            yield node.lineno, node.args[1] if len(node.args) > 1 else None, None
++        elif name == "update_conversation_model_config_value":
++            yield node.lineno, None, node.args[1] if len(node.args) > 1 else None
++        elif name == "_durable_write" and node.args and isinstance(node.args[0], ast.Constant) \
++                and node.args[0].value == "patch_session_model_config":
++            yield node.lineno, node.args[2] if len(node.args) > 2 else None, None
++        elif name == "_call_guarded" and node.args and isinstance(node.args[0], ast.Attribute) \
++                and node.args[0].attr == "patch_session_model_config":
++            argtuple = next((k.value for k in node.keywords if k.arg == "args"), None)
++            yield node.lineno, argtuple.elts[1] if isinstance(argtuple, ast.Tuple) and len(argtuple.elts) > 1 else None, None
++
++
++def _collect():
++    trees = {rel: ast.parse(path.read_text(encoding="utf-8"), str(rel)) for rel, path in _py_files()}
++    constants = {rel: _module_constants(tree) for rel, tree in trees.items()}
++    global_constants: dict[str, set[str]] = {}
++    for consts in constants.values():
++        for k, v in consts.items():
++            global_constants.setdefault(k, set()).add(v)
++
++    def resolve(rel, key):
++        if isinstance(key, ast.Constant) and isinstance(key.value, str):
++            return {key.value}
++        ident = key.id if isinstance(key, ast.Name) else key.attr if isinstance(key, ast.Attribute) else None
++        if ident is None:
++            return None
++        if ident in constants[rel]:
++            return {constants[rel][ident]}
++        return global_constants.get(ident)
++
++    found, unresolved = {}, []
++    for rel, tree in trees.items():
++        if rel.as_posix() in OWNER_ONLY_WRITERS:
++            continue
++        for lineno, dict_node, key_node in _writes(tree):
++            where = f"{rel.as_posix()}:{lineno}"
++            keys = [key_node] if key_node is not None else (
++                dict_node.keys if isinstance(dict_node, ast.Dict) else None)
++            if keys is None or any(k is None for k in keys):  # non-literal dict or ``**spread``
++                unresolved.append(where)
++                continue
++            for key in keys:
++                values = resolve(rel, key)
++                if not values:
++                    unresolved.append(where)
++                for value in values or ():
++                    found.setdefault(value, []).append(where)
++    return found, unresolved
++
++
++def test_every_model_config_writer_key_is_a_worker_sidecar_key():
++    found, unresolved = _collect()
++    # The scan is live: it must see the known writers, or a refactor silently blinded it.
++    assert {"model_routing", "_usage_anchor", "_proactive_prune_rearm_tokens"} <= set(found), sorted(found)
++    assert not unresolved, f"model_config writes whose keys the guard cannot resolve: {unresolved}"
++    missing = {k: v for k, v in found.items() if k not in SIDECAR_KEYS}
++    assert not missing, f"keys written via patch_session_model_config but refused by session.sidecars: {missing}"
++
++
++def test_owner_reserved_lineage_keys_stay_out_of_the_worker_set():
++    assert not (OWNER_RESERVED_KEYS & SIDECAR_KEYS)
++    assert {"_delegate_from", "_branched_from"} <= OWNER_RESERVED_KEYS
++
++
++def test_owner_validator_and_compaction_patch_share_the_registry():
++    import hermes_state_worker_context
++    assert hermes_state_worker_context.SIDECAR_KEYS is SIDECAR_KEYS
+-- 
+2.55.0
+

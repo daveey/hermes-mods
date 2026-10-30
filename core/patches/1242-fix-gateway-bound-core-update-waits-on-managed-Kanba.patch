@@ -1,0 +1,402 @@
+From ee48c7b12f64e624ddd01697b7045cf137e9ddee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:57:35 +0000
+Subject: [PATCH] fix(gateway): bound core-update waits on managed Kanban runs
+ [daveey]
+
+---
+ gateway/run_shutdown.py                       |  12 +-
+ gateway/run_shutdown_restart_wait.py          |  32 ++++++
+ gateway/session_kanban_restart.py             |  28 +++++
+ gateway/session_managed_worker.py             |  18 ++-
+ gateway/session_runtime_workers.py            |  11 ++
+ tests/gateway/test_core_update_kanban_wait.py | 105 ++++++++++++++++++
+ .../test_kanban_restart_stop_booking.py       |  66 +++++++++++
+ 7 files changed, 262 insertions(+), 10 deletions(-)
+ create mode 100644 gateway/session_kanban_restart.py
+ create mode 100644 tests/gateway/test_core_update_kanban_wait.py
+ create mode 100644 tests/gateway/test_kanban_restart_stop_booking.py
+
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 2871a0726e4..bc1fb3ee613 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -1480,14 +1480,6 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+             env=GatewayShutdownMixin._restart_watcher_env(), start_new_session=True,  # detached-spawn: ok — restart watcher, must outlive the gateway it restarts
+         )
+ 
+-    def _wedged_agent_count(self) -> int:
+-        """Work units the restart wait may skip: chat agents idle past ``agent.gateway_timeout`` and
+-        cron runs older than the scheduler's stale-inflight allowance (#115469).
+-
+-        API work has no activity clock and pending sentinels are brand-new, so neither counts.
+-        """
+-        return self._wedged_chat_agent_count() + self._wedged_cron_job_count()
+-
+     def _restart_wait_cron_counts(self) -> dict:
+         """``cron.scheduler.get_restart_wait_cron_counts``, counted per profile-scoped run.
+ 
+@@ -1600,10 +1592,14 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         deadline = loop.time() + timeout
+         last_status_at = 0.0
+         intent = getattr(self, "_restart_update_intent", None)
++        kanban_since = None
+         while self._awaitable_work_count() > 0:
+             now = loop.time()
+             if self._update_intent_withdrawn(intent):
+                 return RESTART_CANCELLED
++            kanban_since, kanban_expired = self._kanban_restart_wait_state(intent, now, kanban_since)
++            if kanban_expired:
++                return False
+             if now >= deadline:
+                 logger.warning(
+                     "Restart after-turn wait timed out after %.0fs with %d "
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index 7dfd8477b56..48783a5d6b5 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -16,6 +16,11 @@ from contextlib import suppress
+ from pathlib import Path
+ from typing import Optional
+ 
++from gateway.session_runtime_workers import kanban_managed_count
++
++# Only the update's post-grace Kanban wait: human turns retain their normal budget.
++CORE_UPDATE_KANBAN_WAIT_S = 15.0
++
+ logger = logging.getLogger("gateway.run")
+ 
+ # ``_await_active_work_before_restart`` result: the core update behind the restart gave up.
+@@ -25,6 +30,33 @@ RESTART_CANCELLED = object()
+ class GatewayRestartWaitMixin:
+     """Mixed into ``GatewayShutdownMixin``; methods use the runner's restart/drain state."""
+ 
++    def _wedged_agent_count(self) -> int:
++        """Work units the restart wait may skip: chat agents idle past ``agent.gateway_timeout`` and
++        cron runs older than the scheduler's stale-inflight allowance (#115469).
++
++        API work has no activity clock and pending sentinels are brand-new, so neither counts.
++        """
++        return self._wedged_chat_agent_count() + self._wedged_cron_job_count()
++
++    def _kanban_restart_wait_state(self, intent, now, since):
++        """15 monotonic seconds with ONLY confirmed cards left, only for an update's restart.
++
++        Unknown claims/mutations/managed human turns keep their original wait. Reset if other
++        work appears. Withdrawing the intent is checked by the caller before this cap.
++        """
++        kanban = kanban_managed_count(self) if intent is not None else 0
++        if kanban <= 0 or self._awaitable_work_count() != kanban:
++            return None, False
++        since = now if since is None else since
++        expired = now - since >= CORE_UPDATE_KANBAN_WAIT_S
++        if expired:
++            logger.warning(
++                "Core update Kanban-only wait capped at %.0fs with %d managed card(s); "
++                "proceeding to restart drain (interrupted attempts requeued uncounted)",
++                CORE_UPDATE_KANBAN_WAIT_S, kanban,
++            )
++        return since, expired
++
+     def _describe_active_work(self) -> list:
+         """One dict per in-flight work unit the restart wait is holding for, so an observer
+         (``hermes update``, ``hermes gateway status``) can name it instead of printing a bare count.
+diff --git a/gateway/session_kanban_restart.py b/gateway/session_kanban_restart.py
+new file mode 100644
+index 00000000000..9700ec2062f
+--- /dev/null
++++ b/gateway/session_kanban_restart.py
+@@ -0,0 +1,28 @@
++"""Owner-side disposition of a Kanban turn that cooperatively accepted a runtime Stop."""
++import json
++from pathlib import Path
++
++
++def record_restart_interruption(policy):
++    """Supersede the child's interrupted exit with an uncounted owner-restart exit.
++
++    Called before admission settlement, including a Stop before worker bootstrap. Fence on
++    BOTH the task and run claim: an old owner's completion must never touch a newer attempt.
++    Unlike the child's writer, the owner is not the worker_bound PID.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.kanban_db_dispatch_exit_code import KANBAN_OWNER_RESTART_EXIT_CODE
++    context = json.loads(policy.kanban_json)
++    with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
++        task = kb.get_task(conn, context['task_id'])
++        run = conn.execute('SELECT status,claim_lock,task_id FROM task_runs WHERE id=?',
++                           (context['run_id'],)).fetchone()
++        if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
++                or task.claim_lock != context['claim_lock'] or run is None
++                or tuple(run) != ('running', context['claim_lock'], context['task_id'])):
++            return
++        kb._append_event(conn, task.id, 'worker_result', {
++            'claim_lock': context['claim_lock'], 'exit_code': KANBAN_OWNER_RESTART_EXIT_CODE,
++            'last_output': 'Kanban attempt interrupted by gateway restart/shutdown; requeued uncounted.',
++            'owner_restart': True}, run_id=context['run_id'])
+diff --git a/gateway/session_managed_worker.py b/gateway/session_managed_worker.py
+index 12ea1cdf18b..85442376842 100644
+--- a/gateway/session_managed_worker.py
++++ b/gateway/session_managed_worker.py
+@@ -164,6 +164,7 @@ class ManagedWorker:
+         self.stopped_at = None
+         # The gateway restart/shutdown reason when that stop (not a user's) signalled this worker.
+         self.stop_cause = None
++        self.kanban_card = False  # owner stamps the frozen launch policy before yielding
+         self.writer = threading.Thread(target=self._write_controls, name='managed-control-writer', daemon=True)
+         # One dedicated reader thread per worker (never the loop's shared default executor, which
+         # parked pipe reads would exhaust). It reads one frame per demand, so the pipe keeps its
+@@ -454,7 +455,7 @@ def _launch_env_only_credentials(home, env):
+ def _interrupted_before_bootstrap(authority, row, cause=None):
+     authority.pending_results[row['admission_id']] = {
+         'result': {'final_response': '', 'interrupted': True, **({'interrupt_message': cause} if cause else {})},
+-        'usage': {}}
++        'usage': {}, 'runtime_stop_cause': cause}
+     return ''
+ 
+ 
+@@ -625,7 +626,18 @@ async def admit_managed(authority, ref, row, policy):
+         result = workspace_unavailable_result(policy)
+         authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
+         return result['final_response']
+-    return await execute_managed(authority, ref, row, policy)
++    reply = await execute_managed(authority, ref, row, policy)
++    pending = authority.pending_results.get(row['admission_id'], {})
++    result = pending.get('result', {})
++    from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
++    if (policy.kanban_json and result.get('interrupted') and pending.get('runtime_stop_cause') in
++            (_INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN)):
++        # The child booked exit 130 (or never bootstrapped). Supersede it BEFORE the
++        # receipt becomes terminal: a runtime Stop must not spend the card's retries.
++        from gateway.session_kanban_restart import record_restart_interruption
++        from gateway.session_runtime_workers import tracked_write
++        await tracked_write(authority, partial(record_restart_interruption, policy))
++    return reply
+ 
+ 
+ async def execute_managed(authority, ref, row, policy):
+@@ -648,6 +660,7 @@ async def execute_managed(authority, ref, row, policy):
+     if spawned is None:
+         return ''
+     worker, process = spawned
++    worker.kanban_card = getattr(policy, 'source', None) == 'kanban' and bool(policy.kanban_json)
+     workers = authority._managed_workers
+     # A Stop acknowledged during the env/spawn awaits found no worker and was latched for this
+     # generation; consume it in the same step that makes the worker reachable to interrupt_managed.
+@@ -707,6 +720,7 @@ async def execute_managed(authority, ref, row, policy):
+                 # Like in-process execution, settlement belongs to the drain's stream lock.
+                 authority.pending_results[row['admission_id']] = {
+                     'result': {**accepted, 'local_viewer': True}, 'usage': usage,
++                    'runtime_stop_cause': worker.stop_cause,
+                     **await asyncio.to_thread(_settled_session_usage, authority, scope['session_id'], accepted, scope['execution_id'])}
+                 return accepted['final_response']
+             raise RuntimeStoreError('invalid_worker_frame')
+diff --git a/gateway/session_runtime_workers.py b/gateway/session_runtime_workers.py
+index a22f82587ed..fdb5b16ad20 100644
+--- a/gateway/session_runtime_workers.py
++++ b/gateway/session_runtime_workers.py
+@@ -23,6 +23,17 @@ def uncounted_runtime_work(runner):
+             + sum(len(mutation_tasks(authority)) + len(side_agents(authority)) for authority in authorities))
+ 
+ 
++def kanban_managed_count(runner):
++    """Confirmed Kanban workers only; unknown/pre-bootstrap claims and mutations stay awaitable.
++
++    The owner stamps the frozen launch policy at registration, avoiding profile-sensitive
++    adapter lookups during a whole-runtime restart. A managed Desktop turn is NOT a card.
++    """
++    return sum(getattr(worker, 'kanban_card', False) is True and not worker.closed.is_set()
++               for authority in all_authorities(runner)
++               for worker in getattr(authority, '_managed_workers', {}).values())
++
++
+ def side_agents(authority):
+     """``(thread, holder)`` for each detached side agent (/bg, /btw, preview restart) whose thread
+     has not unwound (``gateway/session_tui_side.py`` ``_spawn``). A stopped ``/btw`` whose fork
+diff --git a/tests/gateway/test_core_update_kanban_wait.py b/tests/gateway/test_core_update_kanban_wait.py
+new file mode 100644
+index 00000000000..bafa6604df2
+--- /dev/null
++++ b/tests/gateway/test_core_update_kanban_wait.py
+@@ -0,0 +1,105 @@
++"""Only confirmed Kanban work gets a short core-update restart wait."""
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from gateway import run_shutdown_restart_wait as wait
++from gateway.session_authorities import SessionAuthorities
++from gateway.session_runtime_workers import kanban_managed_count
++from tests.gateway.restart_test_helpers import make_restart_runner
++
++
++def worker(*, kanban=True, closed=False):
++    return SimpleNamespace(kanban_card=kanban, closed=SimpleNamespace(is_set=lambda: closed))
++
++
++def test_count_confirmed_workers_across_profiles(tmp_path):
++    runner = SimpleNamespace(session_authorities=SessionAuthorities(tmp_path))
++    runner.session_authorities.add(tmp_path, SimpleNamespace(_managed_workers={
++        'card': worker(), 'chat': worker(kanban=False), 'closed': worker(closed=True),
++        'unclassified': SimpleNamespace(closed=SimpleNamespace(is_set=lambda: False))}))
++    runner.session_authorities.add(tmp_path / 'profiles' / 'other',
++                                   SimpleNamespace(_managed_workers={'card': worker()}))
++    assert kanban_managed_count(runner) == 2
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('other', [None, 'chat', 'cron', 'api', 'mutation', 'unclassified'])
++async def test_core_update_caps_only_kanban_wait(monkeypatch, tmp_path, other):
++    runner, _ = make_restart_runner()
++    intent = tmp_path / 'intent'
++    intent.touch()
++    runner._restart_update_intent = intent
++    runner._restart_after_turn_timeout = 1800
++    runner._active_work_count = lambda: 2 if other else 1
++    runner._awaitable_work_count = runner._active_work_count
++    runner._describe_active_work = list
++    monkeypatch.setattr(wait, 'kanban_managed_count', lambda _: 1, raising=False)
++    # Virtual monotonic time: no real 15s/1800s wait and no wall-clock dependence.
++    clock = [0.0]
++    loop = SimpleNamespace(time=lambda: clock[0])
++    monkeypatch.setattr(asyncio, 'get_running_loop', lambda: loop)
++    async def advance(seconds):
++        clock[0] += seconds
++    monkeypatch.setattr(asyncio, 'sleep', advance)
++    assert await runner._await_active_work_before_restart() is False
++    assert (15 <= clock[0] < 15.2) if other is None else (1800 <= clock[0] < 1800.2)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('mode', ['ordinary', 'mixed_to_kanban', 'finished', 'cancelled'])
++async def test_wait_transition_and_cancellation(monkeypatch, tmp_path, mode):
++    runner, _ = make_restart_runner()
++    intent = tmp_path / 'intent'
++    intent.touch()
++    runner._restart_update_intent = None if mode == 'ordinary' else intent
++    runner._restart_after_turn_timeout = 60
++    runner._describe_active_work = list
++    clock = [0.0]
++    def count():
++        if mode == 'finished' and clock[0] >= 3:
++            return 0
++        return 2 if mode == 'mixed_to_kanban' and clock[0] < 5 else 1
++    runner._active_work_count = count
++    runner._awaitable_work_count = count
++    monkeypatch.setattr(wait, 'kanban_managed_count', lambda _: 1, raising=False)
++    monkeypatch.setattr(asyncio, 'get_running_loop', lambda: SimpleNamespace(time=lambda: clock[0]))
++    async def advance(seconds):
++        clock[0] += seconds
++        if mode == 'cancelled' and clock[0] >= 3 and intent.exists():
++            intent.unlink()
++    monkeypatch.setattr(asyncio, 'sleep', advance)
++    result = await runner._await_active_work_before_restart()
++    if mode == 'ordinary':
++        assert result is False and 60 <= clock[0] < 60.2
++    elif mode == 'mixed_to_kanban':
++        assert result is False and 20 <= clock[0] < 20.3
++    elif mode == 'finished':
++        assert result is True and clock[0] < 4
++    else:
++        assert result is wait.RESTART_CANCELLED and clock[0] < 4
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('cause,interrupted,expected', [
++    ('Gateway restarting', True, True), ('Gateway shutting down', True, True),
++    (None, True, False), ('Gateway restarting', False, False)])
++async def test_cooperative_stop_booking_before_admission_settlement(monkeypatch, cause, interrupted, expected):
++    from gateway import session_managed_worker as managed
++    from gateway import session_kanban_restart as booking
++    authority = SimpleNamespace(pending_results={}, _mutation_tasks=set())
++    row = {'admission_id': 'a'}
++    policy = SimpleNamespace(kanban_json='{}')
++    async def execute(*_):
++        authority.pending_results['a'] = {
++            'result': {'interrupted': interrupted, 'interrupt_message': 'untrusted worker text'},
++            'runtime_stop_cause': cause}
++        return 'reply'
++    monkeypatch.setattr(managed, 'execute_managed', execute)
++    monkeypatch.setattr('gateway.session_policy.workspace_ready', lambda _: True)
++    recorded = MagicMock()
++    monkeypatch.setattr(booking, 'record_restart_interruption', recorded)
++    assert await managed.admit_managed(authority, None, row, policy) == 'reply'
++    assert recorded.call_count == int(expected)
+diff --git a/tests/gateway/test_kanban_restart_stop_booking.py b/tests/gateway/test_kanban_restart_stop_booking.py
+new file mode 100644
+index 00000000000..c4dfbe331f7
+--- /dev/null
++++ b/tests/gateway/test_kanban_restart_stop_booking.py
+@@ -0,0 +1,66 @@
++"""Restart Stop disposition reaches the real worker client and dead-worker sweep."""
++import json
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_kanban import worker_result
++from gateway.session_kanban_restart import record_restart_interruption
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_dispatch as kbd
++from hermes_cli.kanban_worker_client import _exit_code
++
++
++@pytest.mark.parametrize('bootstrapped', [True, False])
++def test_restart_stop_requeues_uncounted(tmp_path, monkeypatch, bootstrapped):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    monkeypatch.setattr(kb, '_pid_alive', lambda _: False)
++    monkeypatch.setattr(kbd, '_worker_final_output', lambda *a, **kw: '')
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='restart card', assignee='default', max_retries=1)
++        lock = kb._claimer_id().split(':', 1)[0] + ':restart-test'
++        kb.claim_task(conn, tid, claimer=lock)
++        task = kb.get_task(conn, tid)
++        params = {'task_id': tid, 'run_id': task.current_run_id, 'claim_lock': lock}
++        context = dict(params, db=str(tmp_path / 'kanban.db'))
++        policy = SimpleNamespace(kanban_json=json.dumps(context))
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET worker_pid=?,started_at=? WHERE id=?',
++                         (79101, int(time.time()) - 600, tid))
++            if bootstrapped:
++                kb._append_event(conn, tid, 'worker_result', {'claim_lock': lock, 'exit_code': 130},
++                                 run_id=task.current_run_id)
++        record_restart_interruption(policy)
++        code = _exit_code({'status': 'terminal', 'outcome': 'interrupted'}, params, context['db'])
++        assert code == 76
++        monkeypatch.setattr(kbd, '_recent_worker_exits', {79101: ((code & 0xff) << 8, time.time())})
++        assert kbd.detect_crashed_workers(conn) == []
++        task = kb.get_task(conn, tid)
++        assert (task.status, task.consecutive_failures, task.block_kind) == ('ready', 0, None)
++        assert conn.execute('SELECT outcome FROM task_runs WHERE id=?', (params['run_id'],)).fetchone()[0] == 'reclaimed'
++        kinds = [r[0] for r in conn.execute('SELECT kind FROM task_events WHERE task_id=?', (tid,))]
++        assert kinds.count('owner_restart_lost') == 1
++        assert 'crashed' not in kinds and 'gave_up' not in kinds
++
++
++@pytest.mark.parametrize('mismatch', ['task_lock', 'run_lock', 'run_id', 'done'])
++def test_old_attempt_cannot_overwrite_result(tmp_path, monkeypatch, mismatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='fenced card', assignee='default')
++        kb.claim_task(conn, tid, claimer='host:1')
++        task = kb.get_task(conn, tid)
++        context = {'task_id': tid, 'run_id': task.current_run_id, 'claim_lock': 'host:1',
++                   'db': str(tmp_path / 'kanban.db')}
++        with kb.write_txn(conn):
++            if mismatch == 'task_lock':
++                conn.execute('UPDATE tasks SET claim_lock=? WHERE id=?', ('other', tid))
++            elif mismatch == 'run_lock':
++                conn.execute('UPDATE task_runs SET claim_lock=? WHERE id=?', ('other', task.current_run_id))
++            elif mismatch == 'run_id':
++                context['run_id'] += 1
++            else:
++                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        record_restart_interruption(SimpleNamespace(kanban_json=json.dumps(context)))
++        assert worker_result(context['db'], context) == {}
+-- 
+2.55.0
+
