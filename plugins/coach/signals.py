@@ -17,7 +17,8 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               systemic breaker holding cards in triage (`gave_up` events with `sticky: true`, event-id cursor),
               one signal per board + normalized error head per 30 min;
 - gateway     gateway crash-restarts: `gateway.previous_unclean_exit`, `asyncio.run.exception`,
-              `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log; a `gateway.exit_signal`
+              `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log (fingerprinted by its `cause` +
+              reason class; `cause: unrecorded` = an exit path with no cause note); a `gateway.exit_signal`
               (unplanned SIGTERM bounce) or `gateway.start_refused` (second start refused next to a live
               gateway) only as a storm: 3+ in 10 min per profile; a refusal by a dead owner pid always;
 - coach       coach `fixloop_card` (2nd confirmed failure of a fix) and handoff `reply_nudge` events whose
@@ -784,6 +785,13 @@ def _wedged_owner(cur: dict, prof: str, r: dict, at: float, host: str) -> Option
             "fp": fp("gateway", host, prof, "gateway.start_refused", "wedged-owner")}
 
 
+def _reason_class(reason: str) -> str:
+    """A gateway exit_reason with its volatile parts (numbers, paths) removed, so one cause with the same text
+    keeps one fingerprint across pids and ports."""
+    s = re.sub(r"(/[^\s'\"]+)+", "<path>", reason.lower())
+    return re.sub(r"\d+", "#", s).strip()[:80]
+
+
 def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
     out = []
     for prof, h in homes(home):
@@ -823,10 +831,21 @@ def collect_gateway(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                     out.append(sig)
                 continue
             why = r.get("exc_type") or ("suspected OOM" if r.get("suspected_oom") else "") or tag.split(".")[-1]
+            fp_key = r.get("exc_type") or ""
+            cause = str(r.get("cause") or "") if tag == "gateway.exit_nonzero" else ""
+            if cause == "unrecorded":
+                # The exit path returned False without note_exit_cause(): that missing note is the defect.
+                why, fp_key = "exit path missing a cause note (cause=unrecorded)", "unrecorded"
+            elif cause:
+                # gateway-3cf2256311: each cause (and reason class) is its own defect, never a "recurrence" of
+                # another cause's fixed crash. Records without a cause (old core) keep the old fingerprint.
+                reason = str(r.get("exit_reason") or "")
+                why = f"cause={cause}" + (f": {reason[:200]}" if reason else "")
+                fp_key = f"{cause}:{_reason_class(reason)}"
             out.append({"kind": "gateway", "component": "gateway", "at": at, "profile": prof,
                         "symptom": f"gateway ({prof}) on {host} died uncleanly: {tag} {why}",
                         "details": home_tilde(json.dumps({k: v for k, v in r.items() if k != "argv"}))[:1500],
-                        "fp": fp("gateway", host, prof, tag, r.get("exc_type") or "")})
+                        "fp": fp("gateway", host, prof, tag, fp_key)})
     return out
 
 
