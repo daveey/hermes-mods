@@ -136,7 +136,7 @@ def test_missing_plan_returns_agent_work(monkeypatch, env):
     monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
     monkeypatch.delenv('HERMES_USER_STEPS_OFF', raising=False)
     monkeypatch.setattr(plugin.core, 'server_owner', lambda _: OWNER)
-    monkeypatch.setattr(plugin.core, 'ActionStore', lambda: st)
+    monkeypatch.setattr(plugin.core, 'ActionStore', lambda **kw: st)
     monkeypatch.setattr(plugin.core, '_worth_asking', lambda _: True)
     monkeypatch.setattr(plugin.core, 'extract', lambda *_, **__: {'steps': [{'kind': 'approve', 'text': 'Approve the changes?'}]})
     assert plugin.publication_buffer(session_id='session', final_response='Approve?')['hold']

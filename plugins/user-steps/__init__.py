@@ -35,6 +35,8 @@ log = logging.getLogger("user-steps")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 _USER_MSG: dict[str, str] = {}
 _BACKFILLED = False
+# Hooks that sit in front of every reply wait at most this long for the asks DB, never the store's 30 s default.
+HOOK_DB_TIMEOUT = 5
 
 
 def _eligible(session_id: str, platform: str = "", parent_session_id: str = "") -> bool:
@@ -116,7 +118,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
     try:
         _USER_MSG[session_id] = user_message if isinstance(user_message, str) else ""
         own = core.server_owner(session_id)
-        st = core.ActionStore()
+        st = core.ActionStore(timeout=HOOK_DB_TIMEOUT)
         global _BACKFILLED
         if not _BACKFILLED:
             _BACKFILLED = True
@@ -184,11 +186,18 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
         except core.ActionError:
             action_owner = None  # no authenticated owner: ledger-only, no canonical request is minted
         if action_owner:
-            chat.reconcile(core, core.ActionStore(), action_owner, aux_llm)
+            # Own try block: a lookup failure (e.g. "database is locked") must not skip recording this
+            # reply's asks below (self-heal plugin-dca5d02c20).
+            try:
+                chat.reconcile(core, core.ActionStore(timeout=HOOK_DB_TIMEOUT), action_owner, aux_llm)
+            except Exception as exc:
+                log.warning("user-steps reconcile failed; still recording this reply's asks: %r", exc)
+                _trace(hook="transform", session=session_id, platform=platform, reconcile_error=repr(exc)[:300])
         out = core.process_reply(
             response_text, session_id, user_msg=_USER_MSG.pop(session_id, ""), llm=aux_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
-            action_store=core.ActionStore() if action_owner else None, action_owner=action_owner,
+            action_store=core.ActionStore(timeout=HOOK_DB_TIMEOUT) if action_owner else None,
+            action_owner=action_owner,
             session_ref=f"@session:{_profile()}/{session_id}")
         if out.get("error"):
             log.warning("user-steps extractor fell back to regex: %s", out["error"])
@@ -211,7 +220,7 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     if not _eligible(session_id, platform) or not core._worth_asking(final_response):
         return None
     owner = core.server_owner(session_id)
-    store = core.ActionStore()
+    store = core.ActionStore(timeout=HOOK_DB_TIMEOUT)
     # The open asks go to the extractor and the matcher: a reply restating a published approval in other
     # words is covered by it. Without them every paraphrase held the reply and pushed the agent to publish
     # the same approval again (hub chat 67cb2d).

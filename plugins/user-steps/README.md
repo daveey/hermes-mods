@@ -141,6 +141,11 @@ Profile-scoped storage is under `<Hermes home>/user-steps/`:
 - Existing lineage ledger JSON remains available for passive compatibility reads.
 - `actions.sqlite3` stores canonical requests, revisions, aliases and durable
   decision operations before delivery side effects.
+- `actions.sqlite3` runs in WAL mode (switched on every open, best effort), so lookups never wait on a
+  committing writer; pure reads use deferred query-only snapshots and writes keep `BEGIN IMMEDIATE` with
+  FULL sync. The per-reply hooks open it with a 5 s busy timeout (the store default stays 30 s), and in
+  `transform_llm_output` a failed `reconcile` logs `user-steps reconcile failed; still recording this reply's
+  asks` plus a `reconcile_error` trace line and still runs extraction (`tests/test_store_concurrency.py`).
 - Delivery records retain frozen payloads and destination receipts. A passive inbox
   write is not a successful execution handoff.
 

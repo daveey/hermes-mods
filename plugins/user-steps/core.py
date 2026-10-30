@@ -1620,9 +1620,11 @@ class ActionStore:
     No fuzzy identity, cross-session search, or automatic compression/branch inheritance.
     Immutable revision documents are separate from resolution and delivery projections.
     """
-    def __init__(self, path=None):
+    def __init__(self, path=None, timeout=30):
         self.path = Path(path) if path else home() / 'user-steps' / 'actions.sqlite3'
+        self.timeout = timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_wal()
         with self._connect() as c:
             c.executescript('''
                 CREATE TABLE IF NOT EXISTS requests (
@@ -1651,8 +1653,21 @@ class ActionStore:
             if 'asked_revision' not in {row[1] for row in c.execute('PRAGMA table_info(lifecycle)')}:
                 c.execute('ALTER TABLE lifecycle ADD COLUMN asked_revision INTEGER')
 
+    def _ensure_wal(self):
+        # WAL so readers never wait on a committing writer (rollback journal shut every reader out for the whole
+        # busy timeout: self-heal plugin-dca5d02c20). The mode is persistent in the file; switching needs no
+        # other open connection, so it is best effort here and retried on the next open.
+        c = sqlite3.connect(self.path, timeout=min(self.timeout, 2))
+        try:
+            if c.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
+                c.execute('PRAGMA journal_mode=WAL')
+        except sqlite3.OperationalError as exc:
+            logging.getLogger('user-steps').warning('user-steps: could not switch %s to WAL yet: %s', self.path, exc)
+        finally:
+            c.close()
+
     def _connect(self):
-        c = sqlite3.connect(self.path, timeout=30)
+        c = sqlite3.connect(self.path, timeout=self.timeout)
         c.row_factory = sqlite3.Row
         c.execute('PRAGMA synchronous=FULL')
         return c
