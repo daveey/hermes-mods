@@ -1,0 +1,660 @@
+From 35b214a8ee1700ac94fe2793d184491499eb5bb4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:47:09 -0700
+Subject: [PATCH] ci(js-tests): probe temp-dir fsync and cgroup PSI during
+ workspace checks (#335)
+
+* ci(js-tests): probe temp-dir fsync and cgroup PSI during workspace checks
+
+Main run 41087044980 failed on four tests that each froze 24-34 s while the
+same sha passed twice; total test time was equal across runs. The summary now
+says whether the disk, memory reclaim or CPU stalled.
+
+* ci(js-tests): probe temp-dir fsync and cgroup PSI during workspace checks
+
+Main run 41087044980 failed on four tests that each froze 24-34 s while the
+same sha passed twice; total test time was equal across runs. The summary now
+says whether the disk, memory reclaim or CPU stalled.
+
+* fix(ci): isolate disposable JS fixtures from overlay fsync stalls
+
+* fix(ci): detach busy temporary mounts and retain backing-disk probe
+
+* ci(js): fall back to /dev/shm when the runner denies tmpfs mount
+
+* ci(js): keep fixture roots short enough for Unix sockets
+---
+ .github/scripts/run-workspace-checks.mjs      |  82 +++++++-
+ .github/scripts/workspace-check-admission.mjs |   6 +-
+ .../scripts/workspace-check-stall-probe.mjs   | 183 ++++++++++++++++++
+ .../scripts/workspace-check-temp-memory.mjs   |  13 ++
+ .github/workflows/js-tests.yml                |  35 +++-
+ tests-js/workspace-check-stall-probe.test.mjs | 114 +++++++++++
+ tests-js/workspace-check-temp-memory.test.mjs |  15 ++
+ tests-js/workspace-check-temp-shell.test.mjs  |  55 ++++++
+ 8 files changed, 493 insertions(+), 10 deletions(-)
+ create mode 100644 .github/scripts/workspace-check-stall-probe.mjs
+ create mode 100644 .github/scripts/workspace-check-temp-memory.mjs
+ create mode 100644 tests-js/workspace-check-stall-probe.test.mjs
+ create mode 100644 tests-js/workspace-check-temp-memory.test.mjs
+ create mode 100644 tests-js/workspace-check-temp-shell.test.mjs
+
+diff --git a/.github/scripts/run-workspace-checks.mjs b/.github/scripts/run-workspace-checks.mjs
+index ee94d1ae6b..38cfc0e8d4 100644
+--- a/.github/scripts/run-workspace-checks.mjs
++++ b/.github/scripts/run-workspace-checks.mjs
+@@ -20,10 +20,12 @@
+ 
+ import { execFileSync, spawn } from 'node:child_process'
+ import { readFileSync } from 'node:fs'
+-import { availableParallelism, totalmem } from 'node:os'
++import { availableParallelism, tmpdir, totalmem } from 'node:os'
+ import { join } from 'node:path'
+ 
+ import { memoryBudgetMiB, oomKills, schedule, unitsOf } from './workspace-check-admission.mjs'
++import { readCounters, startStallProbe, summarize } from './workspace-check-stall-probe.mjs'
++import { temporaryMemoryMiB } from './workspace-check-temp-memory.mjs'
+ 
+ const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
+ const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+@@ -43,8 +45,8 @@ function discoverUnits() {
+   )
+ }
+ 
+-/** The job cgroup's memory files (Linux cgroup v2), or null. */
+-function cgroupMemory() {
++/** Reads one file of the job's cgroup (Linux cgroup v2), or null without a cgroup. */
++function cgroupReader() {
+   let rel
+   try {
+     rel = readFileSync('/proc/self/cgroup', 'utf-8').match(/^0::(.*)$/m)?.[1]
+@@ -52,16 +54,37 @@ function cgroupMemory() {
+     return null
+   }
+   if (rel === undefined) return null
+-  const read = (/** @type {string} */ f) => {
++  return (/** @type {string} */ f) => {
+     try {
+       return readFileSync(join('/sys/fs/cgroup', rel, f), 'utf-8').trim()
+     } catch {
+       return null
+     }
+   }
++}
++
++/** The job cgroup's memory files, or null. */
++function cgroupMemory() {
++  const read = cgroupReader()
++  if (!read) return null
+   return { max: read('memory.max'), peak: read('memory.peak'), oomKill: oomKills(read('memory.events')) }
+ }
+ 
++/** The filesystem the tests' temp directory lives on, from /proc/self/mounts. */
++function tmpMount() {
++  const dir = tmpdir()
++  try {
++    const mount = readFileSync('/proc/self/mounts', 'utf-8')
++      .split('\n')
++      .map((l) => l.split(' '))
++      .filter((m) => m[1] && (m[1] === '/' || dir === m[1] || dir.startsWith(`${m[1]}/`)))
++      .sort((a, b) => b[1].length - a[1].length)[0]
++    return mount ? `${dir} on ${mount[1]} (${mount[2]}, ${mount[3]})` : dir
++  } catch {
++    return dir
++  }
++}
++
+ /** @param {Unit} unit */
+ function runUnit(unit) {
+   return new Promise((resolve) => {
+@@ -112,7 +135,7 @@ async function main() {
+     1,
+     flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
+   )
+-  const budgetMiB = memoryBudgetMiB({ constrained: process.constrainedMemory?.(), total: totalmem() })
++  const budgetMiB = memoryBudgetMiB({ constrained: process.constrainedMemory?.(), total: totalmem(), temporaryMiB: temporaryMemoryMiB(tmpdir()) })
+   // A runner container can serve many jobs, so its counters start where the
+   // last job left them; this run's OOM kills are the difference.
+   const oomBefore = cgroupMemory()?.oomKill ?? null
+@@ -132,7 +155,45 @@ async function main() {
+     if (IS_CI) console.log('::endgroup::')
+   }
+ 
+-  const results = await schedule(units, { concurrency, budgetMiB, run: runUnit, onDone: report })
++  // Single operations freeze for 20-35 s on the CI runners and time tests
++  // out (run 41087044980). This records whether the disk, memory reclaim or
++  // the CPU did it: see workspace-check-stall-probe.mjs.
++  const read = cgroupReader() ?? (() => null)
++  const countersBefore = readCounters(read)
++  /** @type {Set<string>} */
++  const live = new Set()
++  const probe = startStallProbe({
++    dir: tmpdir(),
++    running: () => [...live],
++    onStall: (s) =>
++      console.log(
++        `::warning::stall probe: temp-dir write+fsync took ${Math.round(s.fsyncMs)} ms while ${s.running.join(', ') || 'nothing'} ran`,
++      ),
++  })
++  // Keep measuring the backing checkout disk after fixtures move to tmpfs.
++  // This distinguishes isolation from repair of the EBS/overlay layer.
++  const diskProbe = IS_CI ? startStallProbe({
++    dir: process.cwd(),
++    running: () => [...live],
++    onStall: (s) => console.log(`::warning::checkout disk write+fsync took ${Math.round(s.fsyncMs)} ms`),
++  }) : null
++  /** @param {Unit} unit */
++  const runTracked = async (unit) => {
++    const label = `${unit.pkg} :: ${unit.script}`
++    live.add(label)
++    try {
++      return await runUnit(unit)
++    } finally {
++      live.delete(label)
++    }
++  }
++
++  const results = await schedule(units, { concurrency, budgetMiB, run: runTracked, onDone: report })
++  const stall = summarize(await probe.stop(), countersBefore, readCounters(read))
++  if (diskProbe) {
++    const disk = summarize(await diskProbe.stop(), countersBefore, readCounters(read))
++    console.log(`  checkout disk probe: ${disk.samples} samples, max fsync ${disk.maxFsyncMs} ms, ${disk.severeStalls} >= 5 s`)
++  }
+ 
+   const failed = results.filter((r) => r.code !== 0)
+   console.log('\n=== summary ===')
+@@ -156,6 +217,15 @@ async function main() {
+     }
+   }
+ 
++  console.log(`  temp dir: ${tmpMount()}`)
++  console.log(
++    `  stall probe: ${stall.samples} samples, max fsync ${stall.maxFsyncMs} ms, ${stall.stalls} >= 1 s, ${stall.severeStalls} >= 5 s, max event-loop lag ${stall.maxLagMs} ms`,
++  )
++  for (const w of stall.worst) {
++    console.log(`    ${new Date(w.at).toISOString()} fsync ${Math.round(w.fsyncMs)} ms during ${w.running.join(', ') || 'nothing'}`)
++  }
++  console.log(`  stalled ms (cgroup PSI, this run): ${JSON.stringify(stall.stalledMs)} memory.events delta: ${JSON.stringify(stall.events)}`)
++
+   if (failed.length > 0) {
+     for (const r of failed) console.error(`::error::${r.unit.pkg} :: ${r.unit.script} failed`)
+     console.error(`::error::${failed.length} of ${results.length} checks failed`)
+diff --git a/.github/scripts/workspace-check-admission.mjs b/.github/scripts/workspace-check-admission.mjs
+index 95a89071cd..6887af0778 100644
+--- a/.github/scripts/workspace-check-admission.mjs
++++ b/.github/scripts/workspace-check-admission.mjs
+@@ -63,12 +63,12 @@ export function unitsOf(pkgs, readMemory) {
+  * The memory the checks may use, in MiB: the cgroup limit when there is one
+  * (a runner container's `--memory`), else physical memory, less the reserve.
+  *
+- * @param {{constrained?: number, total: number}} machine bytes
++ * @param {{constrained?: number, total: number, temporaryMiB?: number}} machine bytes and tmpfs reserve
+  */
+-export function memoryBudgetMiB({ constrained, total }) {
++export function memoryBudgetMiB({ constrained, total, temporaryMiB = 0 }) {
+   // constrainedMemory() is 0 or 2^64-1 with no limit set.
+   const limit = constrained && constrained > 0 && constrained < total ? constrained : total
+-  return Math.max(1, Math.floor(limit / MIB) - RESERVED_MIB)
++  return Math.max(1, Math.floor(limit / MIB) - RESERVED_MIB - temporaryMiB)
+ }
+ 
+ /**
+diff --git a/.github/scripts/workspace-check-stall-probe.mjs b/.github/scripts/workspace-check-stall-probe.mjs
+new file mode 100644
+index 0000000000..7bff1bdb57
+--- /dev/null
++++ b/.github/scripts/workspace-check-stall-probe.mjs
+@@ -0,0 +1,183 @@
++// A stall probe for run-workspace-checks.mjs.
++//
++// Main CI run 41087044980 failed on four tests that each sat for 24-34 s
++// (a git init, a scripted ssh close, a bash spawn, a store rewrite) while the
++// same sha passed twice. Total test time was the same in all three runs, so
++// the runner did not run slower. Single operations froze, in passing runs too
++// (`ensureGitRepo` 26 s, checkout-handoff 35 s). Nothing in the job log says
++// whether the freeze is the disk (fsync), memory reclaim at the cgroup limit,
++// or CPU. This probe measures all three on the runner itself:
++//
++//   - every second it writes and fsyncs a small file in the temp directory the
++//     tests use, and records how long that took;
++//   - it reads the cgroup's PSI files (io, memory, cpu) and memory.events at
++//     the start and the end, so the summary carries the time tasks spent
++//     stalled on each resource during this run.
++//
++// Pure functions and an injectable fsync, so tests run without a cgroup.
++
++import { open, unlink } from 'node:fs/promises'
++import { join } from 'node:path'
++
++/** A probe write+fsync slower than this is a stall worth naming. */
++export const STALL_MS = 1000
++/** ... and slower than this is long enough to time out a 5 s test on its own. */
++export const SEVERE_STALL_MS = 5000
++
++/**
++ * The cumulative stall time of a cgroup v2 PSI file, in microseconds.
++ * `full` is absent on cpu.pressure of older kernels.
++ *
++ * @param {string | null} text
++ * @returns {{some: number, full: number | null} | null}
++ */
++export function parsePressure(text) {
++  if (!text) return null
++  const total = (/** @type {string} */ kind) => {
++    const n = text.match(new RegExp(`^${kind} .*\\btotal=(\\d+)`, 'm'))?.[1]
++    return n === undefined ? null : Number(n)
++  }
++  const some = total('some')
++  return some === null ? null : { some, full: total('full') }
++}
++
++/**
++ * The counters of a cgroup v2 `memory.events` file.
++ *
++ * @param {string | null} text
++ * @returns {Record<string, number>}
++ */
++export function parseEvents(text) {
++  /** @type {Record<string, number>} */
++  const out = {}
++  for (const line of (text ?? '').split('\n')) {
++    const [key, value] = line.trim().split(/\s+/)
++    if (key && /^\d+$/.test(value ?? '')) out[key] = Number(value)
++  }
++  return out
++}
++
++/**
++ * One reading of everything the summary compares.
++ *
++ * @param {(file: string) => string | null} read reads a file of the job's cgroup
++ */
++export function readCounters(read) {
++  return {
++    io: parsePressure(read('io.pressure')),
++    memory: parsePressure(read('memory.pressure')),
++    cpu: parsePressure(read('cpu.pressure')),
++    events: parseEvents(read('memory.events')),
++  }
++}
++
++/** @typedef {{at: number, fsyncMs: number, lagMs: number, running: string[]}} Sample */
++
++/**
++ * @param {Sample[]} samples
++ * @param {ReturnType<typeof readCounters>} before
++ * @param {ReturnType<typeof readCounters>} after
++ */
++export function summarize(samples, before, after) {
++  const sorted = [...samples].sort((a, b) => b.fsyncMs - a.fsyncMs)
++  const delta = (/** @type {'io'|'memory'|'cpu'} */ k, /** @type {'some'|'full'} */ f) => {
++    const a = after[k]?.[f]
++    const b = before[k]?.[f]
++    return a == null || b == null ? null : Math.round((a - b) / 1000)
++  }
++  const event = (/** @type {string} */ k) =>
++    k in after.events && k in before.events ? after.events[k] - before.events[k] : null
++  return {
++    samples: samples.length,
++    maxFsyncMs: sorted[0] ? Math.round(sorted[0].fsyncMs) : null,
++    maxLagMs: samples.reduce((m, s) => Math.max(m, Math.round(s.lagMs)), 0),
++    stalls: samples.filter((s) => s.fsyncMs >= STALL_MS).length,
++    severeStalls: samples.filter((s) => s.fsyncMs >= SEVERE_STALL_MS).length,
++    worst: sorted.slice(0, 5).filter((s) => s.fsyncMs >= STALL_MS),
++    // Milliseconds any task / all tasks of the cgroup spent stalled.
++    stalledMs: {
++      ioSome: delta('io', 'some'),
++      ioFull: delta('io', 'full'),
++      memorySome: delta('memory', 'some'),
++      memoryFull: delta('memory', 'full'),
++      cpuSome: delta('cpu', 'some'),
++    },
++    // Times the cgroup crossed memory.high / hit memory.max during this run.
++    events: { high: event('high'), max: event('max') },
++  }
++}
++
++/** @param {string} dir */
++async function defaultFsync(dir) {
++  const path = join(dir, `.stall-probe-${process.pid}`)
++  const handle = await open(path, 'w')
++  try {
++    await handle.write(Buffer.alloc(4096, 1))
++    await handle.sync()
++  } finally {
++    await handle.close()
++    await unlink(path).catch(() => {})
++  }
++}
++
++/**
++ * Start sampling. `stop()` ends it and returns the samples.
++ *
++ * @param {{dir: string, intervalMs?: number, running?: () => string[], onStall?: (s: Sample) => void,
++ *   fsyncOnce?: (dir: string) => Promise<void>, now?: () => number}} opts
++ * @returns {{stop: () => Promise<Sample[]>}}
++ */
++export function startStallProbe({
++  dir,
++  intervalMs = 1000,
++  running = () => [],
++  onStall,
++  fsyncOnce = defaultFsync,
++  now = () => performance.now(),
++}) {
++  /** @type {Sample[]} */
++  const samples = []
++  let stopped = false
++  /** @type {ReturnType<typeof setTimeout> | undefined} */
++  let timer
++  /** @type {Promise<void>} */
++  let loop = Promise.resolve()
++
++  function schedule() {
++    const due = now() + intervalMs
++    timer = setTimeout(() => {
++      loop = tick(due)
++    }, intervalMs)
++    // The probe must never keep the process alive.
++    timer.unref?.()
++  }
++
++  /** @param {number} due */
++  async function tick(due) {
++    const started = now()
++    // How late the timer fired: the event loop of this process was stuck.
++    const lagMs = Math.max(0, started - due)
++    try {
++      await fsyncOnce(dir)
++    } catch {
++      // A probe that cannot write says nothing about the disk; skip the sample.
++      if (!stopped) schedule()
++      return
++    }
++    /** @type {Sample} */
++    const sample = { at: Date.now(), fsyncMs: now() - started, lagMs, running: running() }
++    samples.push(sample)
++    if (sample.fsyncMs >= SEVERE_STALL_MS) onStall?.(sample)
++    if (!stopped) schedule()
++  }
++
++  schedule()
++  return {
++    async stop() {
++      stopped = true
++      clearTimeout(timer)
++      await loop
++      return samples
++    },
++  }
++}
+diff --git a/.github/scripts/workspace-check-temp-memory.mjs b/.github/scripts/workspace-check-temp-memory.mjs
+new file mode 100644
+index 0000000000..efb2fe1b2c
+--- /dev/null
++++ b/.github/scripts/workspace-check-temp-memory.mjs
+@@ -0,0 +1,13 @@
++import { statfsSync } from 'node:fs'
++
++/**
++ * tmpfs pages count against the same cgroup as the check processes. Reserve
++ * the whole bounded mount, not its current use, before starting those writers.
++ * @param {string} dir
++ * @param {(dir: string) => {type: number, bsize: number, blocks: number}} read
++ */
++export function temporaryMemoryMiB(dir, read = statfsSync) {
++  if (process.platform !== 'linux') return 0
++  const fs = read(dir)
++  return fs.type === 0x01021994 ? Math.ceil(fs.bsize * fs.blocks / 2 ** 20) : 0
++}
+diff --git a/.github/workflows/js-tests.yml b/.github/workflows/js-tests.yml
+index 309d6b42d4..1f0140597e 100644
+--- a/.github/workflows/js-tests.yml
++++ b/.github/workflows/js-tests.yml
+@@ -117,7 +117,40 @@ jobs:
+         # the sum stays inside that cgroup limit.
+         env:
+           NODE_OPTIONS: --max-old-space-size=4096
+-        run: node .github/scripts/run-workspace-checks.mjs
++        shell: bash
++        run: |
++          # CI overlay /tmp measured 32-35s write+fsync stalls (#335).
++          # Disposable fixtures need executable storage, not durable EBS writes.
++          # The scheduler reserves this full 1 GiB inside the 8 GiB cgroup.
++          # The runner container may lack CAP_SYS_ADMIN (PR 335 run 41100984332: mount denied).
++          # Then fall back to an executable /dev/shm of at least 512 MiB, else the default disk.
++          mounted=""
++          if temp_root="$(mktemp -d /tmp/wc.XXXXXX)" &&
++            sudo mount -t tmpfs -o size=1G,mode=1777,exec,nosuid,nodev tmpfs "$temp_root"; then
++            mounted="$temp_root"
++          else
++            rmdir "$temp_root" 2>/dev/null || true
++            echo "::warning::tmpfs mount denied; probing /dev/shm"
++            grep -E ' /dev/shm ' /proc/mounts || true
++            shm_kib="$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2{print $2}')"
++            if [ "${shm_kib:-0}" -ge 524288 ] && ! grep -E ' /dev/shm .*[ ,(]noexec[ ,)]' /proc/mounts >/dev/null; then
++              temp_root="$(mktemp -d /dev/shm/wc.XXXXXX)"
++            else
++              echo "::warning::no executable tmpfs available; fixtures stay on the runner disk"
++              temp_root="$(mktemp -d /tmp/wc.XXXXXX)"
++            fi
++          fi
++          cleanup() {
++            df -h "$temp_root"
++            if [ -n "$mounted" ]; then
++              # Job-end process cleanup follows this step. Detach even if a test
++              # daemon still holds its cwd; don't leak a mount into the next job.
++              sudo umount "$temp_root" || sudo umount -l "$temp_root"
++            fi
++            rm -rf "$temp_root" 2>/dev/null || true
++          }
++          trap cleanup EXIT
++          TMPDIR="$temp_root" node .github/scripts/run-workspace-checks.mjs
+       - name: Check the checkout is clean
+         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
+         # leaves an untracked or modified file in the checkout is reported here. Runs only when
+diff --git a/tests-js/workspace-check-stall-probe.test.mjs b/tests-js/workspace-check-stall-probe.test.mjs
+new file mode 100644
+index 0000000000..c7866893d9
+--- /dev/null
++++ b/tests-js/workspace-check-stall-probe.test.mjs
+@@ -0,0 +1,114 @@
++import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++
++import { expect, test } from 'vitest'
++
++import {
++  SEVERE_STALL_MS,
++  parseEvents,
++  parsePressure,
++  readCounters,
++  startStallProbe,
++  summarize,
++} from '../.github/scripts/workspace-check-stall-probe.mjs'
++
++const PSI = 'some avg10=0.00 avg60=1.20 avg300=0.50 total=2500000\nfull avg10=0.00 avg60=0.10 avg300=0.05 total=400000\n'
++
++test('PSI totals are read as microseconds, and a missing or empty file is null', () => {
++  expect(parsePressure(PSI)).toEqual({ some: 2500000, full: 400000 })
++  expect(parsePressure('some avg10=0.00 avg60=0.00 avg300=0.00 total=7\n')).toEqual({ some: 7, full: null })
++  expect(parsePressure(null)).toBeNull()
++  expect(parsePressure('')).toBeNull()
++})
++
++test('memory.events counters are read by name', () => {
++  expect(parseEvents('low 0\nhigh 4\nmax 12\noom 0\noom_kill 0\n')).toMatchObject({ high: 4, max: 12 })
++  expect(parseEvents(null)).toEqual({})
++})
++
++test('the summary reports stall time per resource as the difference over the run', () => {
++  const files = (io, memory, high) => (f) =>
++    ({
++      'io.pressure': `some avg10=0 avg60=0 avg300=0 total=${io}\nfull avg10=0 avg60=0 avg300=0 total=${io / 2}\n`,
++      'memory.pressure': `some avg10=0 avg60=0 avg300=0 total=${memory}\nfull avg10=0 avg60=0 avg300=0 total=${memory}\n`,
++      'memory.events': `high ${high}\nmax 0\n`,
++    })[f] ?? null
++  const before = readCounters(files(1_000_000, 0, 1))
++  const after = readCounters(files(31_000_000, 2_000_000, 4))
++  const samples = [
++    { at: 1, fsyncMs: 12, lagMs: 1, running: [] },
++    { at: 2, fsyncMs: 31_400, lagMs: 30_000, running: ['apps/desktop :: check:test:ui'] },
++    { at: 3, fsyncMs: 1_200, lagMs: 0, running: [] },
++  ]
++  const s = summarize(samples, before, after)
++  expect(s).toMatchObject({
++    samples: 3,
++    maxFsyncMs: 31_400,
++    maxLagMs: 30_000,
++    stalls: 2,
++    severeStalls: 1,
++    stalledMs: { ioSome: 30_000, ioFull: 15_000, memorySome: 2_000, memoryFull: 2_000, cpuSome: null },
++    events: { high: 3, max: 0 },
++  })
++  expect(s.worst.map((w) => w.at)).toEqual([2, 3])
++})
++
++test('a runner without a cgroup gives null stall times, never zero', () => {
++  const none = readCounters(() => null)
++  expect(summarize([], none, none).stalledMs).toEqual({
++    ioSome: null,
++    ioFull: null,
++    memorySome: null,
++    memoryFull: null,
++    cpuSome: null,
++  })
++})
++
++test('the probe reports a slow write with the checks that were running, and stops sampling on stop()', async () => {
++  let clock = 0
++  const stalls = []
++  const probe = startStallProbe({
++    dir: '/unused',
++    intervalMs: 1,
++    now: () => clock,
++    running: () => ['ui-tui :: check'],
++    fsyncOnce: async () => {
++      clock += SEVERE_STALL_MS + 1
++    },
++    onStall: (s) => stalls.push(s),
++  })
++  await new Promise((r) => setTimeout(r, 40))
++  const samples = await probe.stop()
++  expect(samples.length).toBeGreaterThan(0)
++  expect(stalls.length).toBe(samples.length)
++  expect(stalls[0]).toMatchObject({ fsyncMs: SEVERE_STALL_MS + 1, running: ['ui-tui :: check'] })
++  await new Promise((r) => setTimeout(r, 20))
++  expect(await probe.stop()).toHaveLength(samples.length)
++})
++
++test('a write that fails is skipped, not recorded as a fast disk', async () => {
++  const probe = startStallProbe({
++    dir: '/unused',
++    intervalMs: 1,
++    fsyncOnce: async () => {
++      throw new Error('ENOSPC')
++    },
++  })
++  await new Promise((r) => setTimeout(r, 20))
++  expect(await probe.stop()).toEqual([])
++})
++
++test('the real write+fsync path measures the temp dir and leaves nothing behind', async () => {
++  const dir = mkdtempSync(join(tmpdir(), 'stall-probe-'))
++  try {
++    const probe = startStallProbe({ dir, intervalMs: 5 })
++    await new Promise((r) => setTimeout(r, 150))
++    const samples = await probe.stop()
++    expect(samples.length).toBeGreaterThan(2)
++    expect(samples.every((s) => s.fsyncMs >= 0 && s.fsyncMs < SEVERE_STALL_MS)).toBe(true)
++    expect(readdirSync(dir)).toEqual([])
++  } finally {
++    rmSync(dir, { recursive: true, force: true })
++  }
++})
+diff --git a/tests-js/workspace-check-temp-memory.test.mjs b/tests-js/workspace-check-temp-memory.test.mjs
+new file mode 100644
+index 0000000000..d8dfd1dad9
+--- /dev/null
++++ b/tests-js/workspace-check-temp-memory.test.mjs
+@@ -0,0 +1,15 @@
++import { expect, test } from 'vitest'
++import { temporaryMemoryMiB } from '../.github/scripts/workspace-check-temp-memory.mjs'
++import { memoryBudgetMiB } from '../.github/scripts/workspace-check-admission.mjs'
++
++test.runIf(process.platform === 'linux')('tmpfs capacity is reserved in addition to the normal runner reserve', () => {
++  const reserve = temporaryMemoryMiB('/fixture', () => ({ type: 0x01021994, bsize: 4096, blocks: 262144 }))
++  expect(reserve).toBe(1024)
++  expect(memoryBudgetMiB({ constrained: 8 * 2 ** 30, total: 64 * 2 ** 30, temporaryMiB: reserve })).toBe(6144)
++})
++
++test('disk-backed temporary storage leaves the memory budget unchanged', () => {
++  const reserve = temporaryMemoryMiB('/fixture', () => ({ type: 0x794c7630, bsize: 4096, blocks: 262144 }))
++  expect(reserve).toBe(0)
++  expect(memoryBudgetMiB({ constrained: 8 * 2 ** 30, total: 64 * 2 ** 30, temporaryMiB: reserve })).toBe(7168)
++})
+diff --git a/tests-js/workspace-check-temp-shell.test.mjs b/tests-js/workspace-check-temp-shell.test.mjs
+new file mode 100644
+index 0000000000..ec683345fd
+--- /dev/null
++++ b/tests-js/workspace-check-temp-shell.test.mjs
+@@ -0,0 +1,55 @@
++import { spawnSync } from 'node:child_process';
++import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { load } from 'js-yaml';
++import { expect, test } from 'vitest';
++
++const root = fileURLToPath(new URL('../', import.meta.url));
++const workflow = load(readFileSync(join(root, '.github/workflows/js-tests.yml'), 'utf8'));
++const step = workflow.jobs.check.steps.find((entry) => entry.name === 'Run all workspace checks');
++
++// Execute the workflow itself: a temporary root must support nested Unix sockets,
++// executable helpers, cleanup, and a failing check's original exit status.
++test.runIf(process.platform === 'linux')('disk fallback keeps fixture sockets below AF_UNIX limits', () => {
++  const scratch = mkdtempSync(join(tmpdir(), 'temp-shell-'));
++  try {
++    const bin = join(scratch, 'bin');
++    mkdirSync(bin);
++    writeFileSync(join(bin, 'sudo'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
++    // Force the noexec-shm branch, independent of this machine's shm policy.
++    writeFileSync(join(bin, 'grep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
++    const runnerTemp = join(scratch, 'opt/runner/_work/_temp');
++    mkdirSync(runnerTemp, { recursive: true });
++    const selected = join(scratch, 'selected');
++    const probe = `
++      printf '%s' "$temp_root" > "$SELECTED"
++      printf '#!/bin/sh\\nexit 0\\n' > "$temp_root/helper"
++      chmod +x "$temp_root/helper"
++      "$temp_root/helper"
++      TMPDIR="$temp_root" node --input-type=module -e '
++        import { tmpdir } from "node:os";
++        import { mkdirSync } from "node:fs";
++        import { createServer } from "node:net";
++        const path = tmpdir() + "/vitest-MadqlD/desktop-gw-1YBcT6/hermes-gw-f639440fe47be53d/control.sock";
++        mkdirSync(path.slice(0, path.lastIndexOf("/")), { recursive: true });
++        const server = createServer();
++        server.on("error", () => process.exit(3));
++        server.listen(path, () => server.close());
++      '
++      exit 7
++    `;
++    const script = step.run.replace('TMPDIR="$temp_root" node .github/scripts/run-workspace-checks.mjs', probe);
++    const result = spawnSync('bash', ['-e', '-o', 'pipefail', '-c', script], {
++      cwd: root,
++      env: { ...process.env, RUNNER_TEMP: runnerTemp, SELECTED: selected, PATH: `${bin}:${process.env.PATH}` },
++      encoding: 'utf8',
++      timeout: 20_000,
++    });
++    expect(result.status, result.stdout + result.stderr).toBe(7);
++    expect(existsSync(readFileSync(selected, 'utf8'))).toBe(false);
++  } finally {
++    rmSync(scratch, { recursive: true, force: true });
++  }
++});
+-- 
+2.54.0 (Apple Git-157)
+

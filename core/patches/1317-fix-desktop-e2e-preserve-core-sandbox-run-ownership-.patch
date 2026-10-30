@@ -1,0 +1,191 @@
+From 6f476918c35312587e318060a4f8f5d924be8905 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:13:47 -0700
+Subject: [PATCH] fix(desktop-e2e): preserve core sandbox run ownership
+ [daveey] (#352)
+
+---
+ apps/desktop/e2e/core/harness.ts              |   3 +
+ apps/desktop/e2e/core/reaper-runner.ts        |  33 +++++
+ .../e2e/run-tmp-reaper.gateway.unit.test.ts   | 115 ++++++++++++++++++
+ 3 files changed, 151 insertions(+)
+ create mode 100644 apps/desktop/e2e/core/reaper-runner.ts
+ create mode 100644 apps/desktop/e2e/run-tmp-reaper.gateway.unit.test.ts
+
+diff --git a/apps/desktop/e2e/core/harness.ts b/apps/desktop/e2e/core/harness.ts
+index 9da05d167c..dafa42557c 100644
+--- a/apps/desktop/e2e/core/harness.ts
++++ b/apps/desktop/e2e/core/harness.ts
+@@ -146,6 +146,9 @@ export function coreAppEnv(sandbox: CoreSandbox, extra: Record<string, string> =
+     PATH: `${sandbox.bin}${path.delimiter}${env.PATH ?? ''}`,
+     HOME: sandbox.home,
+     HERMES_HOME: sandbox.hermesHome,
++    // Lifecycle ownership is not an agent runtime knob. The run/host reapers need it even
++    // after gateway ensure detaches the daemon and a killed worker cannot clean its sandbox.
++    ...(process.env.HERMES_E2E_RUN_TMP ? { HERMES_E2E_RUN_TMP: process.env.HERMES_E2E_RUN_TMP } : {}),
+     HERMES_DESKTOP_USER_DATA_DIR: sandbox.userDataDir,
+     HERMES_DESKTOP_IGNORE_EXISTING: '1',
+     HERMES_DESKTOP_HERMES_ROOT: REPO_ROOT,
+diff --git a/apps/desktop/e2e/core/reaper-runner.ts b/apps/desktop/e2e/core/reaper-runner.ts
+new file mode 100644
+index 0000000000..8508a6cdf0
+--- /dev/null
++++ b/apps/desktop/e2e/core/reaper-runner.ts
+@@ -0,0 +1,33 @@
++import '../run-tmp'
++
++/** Real runner subprocess for run-tmp-reaper.gateway.unit.test.ts (no Electron needed). */
++import { spawnSync } from 'node:child_process'
++import fs from 'node:fs'
++
++import { coreAppEnv, createCoreSandbox, REPO_ROOT, writeProviderHome } from './harness'
++
++const [mode, python] = process.argv.slice(2)
++
++if (mode === 'reap') {
++  console.log(JSON.stringify({ reaped: true }))
++} else {
++  const sandbox = createCoreSandbox('reattach-reaper')
++  writeProviderHome(sandbox.hermesHome, 'http://127.0.0.1:1')
++
++  const result = spawnSync(python, ['-m', 'hermes_cli.main', 'gateway', 'ensure', '--json', '--timeout', '60'], {
++    cwd: REPO_ROOT,
++    env: coreAppEnv(sandbox, { PYTHONPATH: REPO_ROOT }),
++    encoding: 'utf8',
++    timeout: 90_000
++  })
++
++  if (result.status !== 0) {
++    throw new Error(`gateway ensure failed: ${result.stdout}\n${result.stderr}`)
++  }
++
++  const { pid } = JSON.parse(fs.readFileSync(`${sandbox.hermesHome}/gateway.lock`, 'utf8'))
++  console.log(JSON.stringify({ pid, root: process.env.HERMES_E2E_RUN_TMP, home: sandbox.home }))
++  // The parent chooses SIGKILL (no teardown/exit hook) or a normal exit without sandbox cleanup.
++  process.stdin.once('data', () => process.exit(0))
++  process.stdin.resume()
++}
+diff --git a/apps/desktop/e2e/run-tmp-reaper.gateway.unit.test.ts b/apps/desktop/e2e/run-tmp-reaper.gateway.unit.test.ts
+new file mode 100644
+index 0000000000..a750aaa19f
+--- /dev/null
++++ b/apps/desktop/e2e/run-tmp-reaper.gateway.unit.test.ts
+@@ -0,0 +1,115 @@
++import { type ChildProcess, spawn } from 'node:child_process'
++import fs from 'node:fs'
++import path from 'node:path'
++import { createInterface } from 'node:readline'
++
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { readProc } from './core/process-census'
++
++interface StartedGateway {
++  pid: number
++  root: string
++  home: string
++}
++
++const runners: ChildProcess[] = []
++const gateways: StartedGateway[] = []
++
++async function exitOf(child: ChildProcess): Promise<void> {
++  if (child.exitCode !== null || child.signalCode !== null) {
++    return
++  }
++
++  await new Promise<void>(resolve => child.once('exit', () => resolve()))
++}
++
++function runner(mode: string): { child: ChildProcess; ready: Promise<StartedGateway> } {
++  const env = { ...process.env }
++  // A new Playwright runner owns its own root, rather than inheriting vitest's.
++  delete env.HERMES_E2E_RUN_TMP
++  delete env.HERMES_E2E_CORE_ROOT
++
++  const child = spawn(process.execPath, ['--import', 'tsx', path.join(import.meta.dirname, 'core/reaper-runner.ts'), mode, process.env.HERMES_PYTHON!], {
++    env,
++    stdio: ['pipe', 'pipe', 'pipe']
++  })
++
++  runners.push(child)
++  let stderr = ''
++  child.stderr!.on('data', chunk => { stderr += chunk })
++
++  const ready = new Promise<StartedGateway>((resolve, reject) => {
++    const lines = createInterface({ input: child.stdout! })
++    lines.on('line', line => {
++      if (line.startsWith('{')) {
++        const value = JSON.parse(line)
++
++        if (value.pid) {
++          gateways.push(value)
++        }
++
++        resolve(value)
++      }
++    })
++    child.once('error', reject)
++    child.once('exit', code => {
++      if (code !== 0) {
++        reject(new Error(`runner exited ${code}: ${stderr}`))
++      }
++    })
++  })
++
++  return { child, ready }
++}
++
++afterEach(async () => {
++  for (const child of runners.splice(0)) {
++    if (child.exitCode === null && child.signalCode === null) {
++      child.kill('SIGKILL')
++    }
++
++    await exitOf(child)
++  }
++
++  for (const gateway of gateways.splice(0)) {
++    // RED must not itself leak a detached gateway. Re-check exact sandbox ownership.
++    if (readProc(gateway.pid)?.environ.split('\0').includes(`HOME=${gateway.home}`)) {
++      process.kill(gateway.pid, 'SIGKILL')
++    }
++
++    fs.rmSync(gateway.root, { recursive: true, force: true })
++  }
++})
++
++describe.runIf(process.platform === 'linux')('real core gateway lifecycle', () => {
++  it('reaps gateway ensure after a SIGKILLed runner when the next runner starts, but not a concurrent runner', async () => {
++    const abandoned = runner('launch')
++    const old = await abandoned.ready
++    // Observe that ensure really detached a running gateway before killing its owner.
++    expect(readProc(old.pid)?.cmdline).toContain('gateway run')
++    abandoned.child.kill('SIGKILL')
++    await exitOf(abandoned.child)
++    expect(readProc(old.pid)?.cmdline).toContain('gateway run')
++
++    const next = runner('launch')
++    const current = await next.ready
++    await expect.poll(() => readProc(old.pid)?.cmdline ?? '', { timeout: 20_000 }).toBe('')
++    expect(fs.existsSync(old.root)).toBe(false)
++
++    const concurrent = runner('reap')
++    await concurrent.ready
++    await exitOf(concurrent.child)
++    expect(readProc(current.pid)?.cmdline).toContain('gateway run')
++    expect(fs.existsSync(current.root)).toBe(true)
++  }, 180_000)
++
++  it('stops an unfinished fixture gateway on normal runner exit', async () => {
++    const active = runner('launch')
++    const gateway = await active.ready
++    active.child.stdin!.end('exit\n')
++    await exitOf(active.child)
++    await expect.poll(() => readProc(gateway.pid)?.cmdline ?? '', { timeout: 20_000 }).toBe('')
++    expect(fs.existsSync(gateway.root)).toBe(false)
++  }, 120_000)
++})
+-- 
+2.54.0 (Apple Git-157)
+

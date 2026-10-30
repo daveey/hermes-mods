@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1301 patches, one entry per non-merge source commit through `7fbf27b309d3da51a1c6e54a26c61c5e1aca2a2d`.
+1326 patches, one entry per non-merge source commit through `ff727b789d071d615d9225ba3c80c460580422af`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -22,10 +22,39 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `2d2808ee84549f9836b0056750265058e5488a8a`; merge-base: `5608b5faf19ac22d023e62a8fd9675a42d1a61c6`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
-The current snapshot's executed checks are in [mirror-1301-verification.md](mirror-1301-verification.md), with its policy [mirror-policy-1301.json](mirror-policy-1301.json) (previous snapshots: [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+Upstream exclusion tip: `6bb377a51d5c8e279a7a5e34d717d653d421d064`; merge-base: `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
+The current snapshot's executed checks are in [mirror-1326-verification.md](mirror-1326-verification.md), with its policy [mirror-policy-1326.json](mirror-policy-1326.json) (previous snapshots: [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 1302–1326
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [fix(cron): defer due jobs under the core-update drain hold; cut cron runs in an update restart past hermes-sync's cron bound ](mirror-runtime-hardening-1302.md) | 1302 | Source `ead069dd57`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(tests): sigterm-mid-copy preflight test outlasts starved runner; lock wait configurable for the standalone script](mirror-ci-hardening-1303.md) | 1303 | Source `7f5538e27a`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(tests): pass lock wait by argv, not env](mirror-ci-hardening-1303.md) | 1304 | Source `49f25091b1`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(notices): a blocked notice whose card moved on never wakes a close-out turn ](mirror-runtime-hardening-1302.md) | 1305 | Source `e555afdb33`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(kanban): restore the code-health caps #318 merged past; dispatcher entry test for forwarded owner archives  (#328)](mirror-ci-hardening-1303.md) | 1306 | Source `5be6ef3079`; behavior, implementation and source test inventory in the linked feature section. |
+| [ci(upstream-sync): run all eight Python slices; two slices hit tests.yml's 30 min timeout](mirror-ci-hardening-1303.md) | 1307 | Source `0a91e5a5cd`; behavior, implementation and source test inventory in the linked feature section. |
+| [hosts/hermes-ci-runners: runner AMI source and probe (#132)](mirror-ci-hardening-1303.md) | 1308 | Source `50731967b2`; behavior, implementation and source test inventory in the linked feature section. |
+| [test(js): symlinked workspace-check CLI test no longer assumes apps/desktop is installed (#341)](mirror-ci-hardening-1303.md) | 1309 | Source `bbae9719e0`; behavior, implementation and source test inventory in the linked feature section. |
+| [test(web): avoid repeated library checks in freshness fixture ](mirror-runtime-hardening-1302.md) | 1310 | Source `20c094bf67`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(kanban): a frozen legacy alias no longer restores links on an open card ](mirror-runtime-hardening-1302.md) | 1311 | Source `7af0b82411`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(kanban): an external gateway drain holds dispatcher claims like a deferred restart ](mirror-runtime-hardening-1302.md) | 1312 | Source `ddc3f813f3`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(kanban): a worker may archive a done card its own task created ](mirror-runtime-hardening-1302.md) | 1313 | Source `bb08052cd8`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(kanban): archiving a placement-forwarded card archives its remote copy ](mirror-runtime-hardening-1302.md) | 1314 | Source `b357101aee`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(sessions): a lost request outranks live work, a cron is not a wait, a refused turn is replayed ](mirror-runtime-hardening-1302.md) | 1315 | Source `2185d7299c`; behavior, implementation and source test inventory in the linked feature section. |
+| [feat(terminal): kubernetes backend — pod per session, existing-claim workspace  (#242)](mirror-runtime-hardening-1302.md) | 1316 | Source `a969258dc2`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(desktop-e2e): preserve core sandbox run ownership  (#352)](mirror-ci-hardening-1303.md) | 1317 | Source `6f476918c3`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(dashboard-auth): let core session-header service calls pass the gated dashboard ](mirror-runtime-hardening-1302.md) | 1318 | Source `b99ddb8156`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(kanban): order respawn holds by event occurrence ](mirror-runtime-hardening-1302.md) | 1319 | Source `397d5e3077`; behavior, implementation and source test inventory in the linked feature section. |
+| [ci(js-tests): run the Prebuilt TUI install-shape checks on frontend PRs ](mirror-ci-hardening-1303.md) | 1320 | Source `5974f72bb3`; behavior, implementation and source test inventory in the linked feature section. |
+| [ci(js-tests): probe temp-dir fsync and cgroup PSI during workspace checks (#335)](mirror-ci-hardening-1303.md) | 1321 | Source `35b214a8ee`; behavior, implementation and source test inventory in the linked feature section. |
+| [test(acp): tolerate exiting MCP peers during liveness scans (#361)](mirror-ci-hardening-1303.md) | 1322 | Source `abf5f8578a`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(kanban): archive a placed copy whose remote id resolves after its card is archived ](mirror-runtime-hardening-1302.md) | 1324 | Source `96698fb109`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(worker): derive the worker receipt bound from the owner's write patience; log slow worker.persist ](mirror-runtime-hardening-1302.md) | 1325 | Source `01a8fe0b30`; behavior, implementation and source test inventory in the linked feature section. |
+| [fix(worker): WorkerRPC connect steps share the owner-stall budget, not fixed 5 s deadlines ](mirror-runtime-hardening-1302.md) | 1326 | Source `ff727b789d`; behavior, implementation and source test inventory in the linked feature section. |
 
 ## Frozen-decision reset and fresh-tip follow-ups
 
@@ -594,7 +623,7 @@ not something the public fixture CI can perform without the source repository.
 | [hidden-preview-open.md](hidden-preview-open.md) | 0118 0119 | An agent in a chat you're not viewing (including another profile's) gets "opened" only once its preview page has actually loaded off screen, so its next read/act works and focusing the chat shows the same page |
 | [kanban-soft-deadline.md](kanban-soft-deadline.md) | 0121 | Kanban workers near their runtime cap checkpoint with `kanban_continue` and a fresh run resumes from it instead of being killed and counted as a failure; long waits hand off with a wake time instead of polling |
 | [kanban-worktree-validation.md](kanban-worktree-validation.md) | 0122 | `kanban_create` / `hermes kanban create` reject a worktree workspace that can never resolve, naming the fix; such a card blocks on its first spawn failure instead of burning retries |
-| [turn-stop-notice.md](turn-stop-notice.md) | 0126 | A turn stopped from a client ends with a visible "Stopped by <login>" line, and the log names who sent the Stop |
+| [turn-stop-notice.md](turn-stop-notice.md) | 0126, 1323 | A turn stopped from a client ends with a visible "Stopped by <login>" line, and the log names who sent the Stop; an SSH-attached Desktop reads "Stopped by Desktop", and the session.interrupt log line + turn_stopped metadata carry the Stop gesture (stop_button/esc/tile/slash/delete/plugin:<id>) |
 | [kanban-open-task-hook.md](kanban-open-task-hook.md) | 0127 | `window.__hermesKanbanOpenTask(taskId, board?, gateway?)` lets disk plugins open a card's drawer on its own board and gateway |
 | [review-evidence-gate.md](review-evidence-gate.md) | 0129 | `auxiliary.background_review.require_evidence` makes background skill review edit a skill only when a specific moment in the conversation justifies it; "Nothing to save." becomes a neutral outcome |
 | [kanban-block-instructions.md](kanban-block-instructions.md) | 0130 | `kanban_block`'s `reason` asks for ask-first, numbered, concrete unblock steps (what the blocked-panel Desktop plugin shows above the composer) |
@@ -831,7 +860,7 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [1281-entry mirror snapshot](mirror-1281-verification.md) | verification report | Replay and tree-comparison evidence for the 28 entries appended after the 1253 snapshot. |
 | [Attach e2e probe uses installed Node](attach-probe-node.md) | 1282 | The attach-handshake e2e helper passes the suite's Node as `HERMES_NODE`, and a new test fails if attach ever reaches PM provisioning. |
 | [1299-entry mirror snapshot](mirror-1299-verification.md) | verification report | Duplicate 1282 replaced by the omitted `3c2af6ee2e`; `verify_mirror.py` exits 0 end to end with policy [mirror-policy-1299.json](mirror-policy-1299.json). |
-| [1301-entry mirror snapshot](mirror-1301-verification.md) | verification report | Appends 1300 (`642d2c6878`) and 1301 (`7fbf27b309`); `verify_mirror.py` exits 0 with policy [mirror-policy-1301.json](mirror-policy-1301.json). |
+| [1301-entry mirror snapshot](mirror-1326-verification.md) | verification report | Appends 1300 (`642d2c6878`) and 1301 (`7fbf27b309`); `verify_mirror.py` exits 0 with policy [mirror-policy-1326.json](mirror-policy-1326.json). |
 | [Kanban scratch archive](kanban-scratch-archive.md) | 1299 | `gc_task_scratch` archives (bundle, diff, untracked tar, meta) then removes aged terminal scratch holding git clones; retention `kanban.worktree_retention_days` (default 7, 0 disables). |
 | [Bounded launcher preflight](launch-preflight-bound.md) | 1284 1285 1286 1287 1300 | The launch-time PM currency probe has a 1 s deadline; unknown defers repair and `hermes update` keeps the full check. 1300 keeps a permission error's denied path across the probe and PM workers. |
 | [TUI/e2e CI timing stability](tui-ci-timing-stability.md) | 1283 1297 1298 | A single durable-flush seam for the TUI, no-op in tests, plus synchronized receipt tests and a glyph-layout tolerance. |

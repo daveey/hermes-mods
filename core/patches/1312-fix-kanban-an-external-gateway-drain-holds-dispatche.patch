@@ -1,0 +1,317 @@
+From ddc3f813f34aeacd332551e9133b597ecff5cf58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 18:43:47 +0000
+Subject: [PATCH] fix(kanban): an external gateway drain holds dispatcher
+ claims like a deferred restart [daveey]
+
+The embedded dispatcher gated only on _restart_requested, so an external
+drain (.drain_request.json) kept claiming into a gateway that refuses
+every new worker: MacBook 10-30 09:12-09:26 and 09:39-10:06 spawned 0 for
+up to 48 ticks and the stuck warning blamed profile health.
+
+_external_drain_active now sets gate=drain (suppress_spawn ticks,
+bad_ticks 0), the hold logs one INFO line at start naming the drain
+principal and since-time (read via gateway.drain_control) and one at
+release, and stuck_warning only fires on ungated ticks.
+---
+ gateway/kanban_watchers.py                    |  21 +-
+ gateway/kanban_watchers_dispatcher.py         |  18 ++
+ .../test_kanban_external_drain_hold.py        | 207 ++++++++++++++++++
+ 3 files changed, 245 insertions(+), 1 deletion(-)
+ create mode 100644 tests/gateway/test_kanban_external_drain_hold.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index f958856a7a..8bac100d3a 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -30,6 +30,7 @@ from gateway.kanban_watchers_common import (
+ from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
+ from gateway.kanban_watchers_dispatcher import (
+     _KanbanDispatcher,
++    _external_drain_hold,
+     _log_spawn_results,
+     _resolve_dispatcher_settings,
+ )
+@@ -310,6 +311,7 @@ class GatewayKanbanWatchersMixin:
+             # broken PATH, missing venv, or credential loss.
+             bad_ticks = 0
+             last_warn_at = 0
++            external_hold: Optional[tuple[str, str]] = None  # (principal, since) while an external drain holds
+             results: Optional[list] = None
+             dispatcher = _KanbanDispatcher(_kb, settings)
+ 
+@@ -338,6 +340,22 @@ class GatewayKanbanWatchersMixin:
+                         # claim hold (core declares GATEWAY_RESTART_SAFE) a claim made now only adds a
+                         # run the restart must carry. A cancelled restart clears the flag. [daveey]
+                         gate = "drain"
++                    # An external drain (``.drain_request.json``, gateway/drain_control.py) refuses new
++                    # turns the same way, so it holds claims the same way; without this the MacBook's
++                    # stale-plugin restarts claimed into the drain for 48 ticks and the stuck warning
++                    # blamed profile health. [daveey]
++                    external = bool(getattr(self, "_external_drain_active", False))
++                    if gate is None and external:
++                        gate = "drain"
++                    if external and external_hold is None:
++                        principal, since = external_hold = await asyncio.to_thread(_external_drain_hold, time.time())
++                        logger.info("kanban dispatch held: external drain (%s, since %s); "
++                                    "running workers continue", principal, since)
++                    elif not external and external_hold is not None:
++                        principal, since = external_hold
++                        logger.info("kanban dispatch released: external drain (%s, since %s) ended; "
++                                    "claims resume", principal, since)
++                        external_hold = None
+                     if gate == "estop":
+                         bad_ticks = 0
+                     elif gate == "drain":
+@@ -360,7 +378,8 @@ class GatewayKanbanWatchersMixin:
+                         capped = _kbd.all_at_capacity(res for _slug, res in (results or []))
+                         bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned and not capped else 0
+                     now = int(time.time())
+-                    if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
++                    # Only an ungated tick can be "stuck": an estop or drain hold spawns 0 on purpose.
++                    if gate is None and bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+                         # Names deferred Board claims / unleasable cards when those explain the zero.
+                         logger.warning("%s", _kbd.stuck_warning(bad_ticks, (res for _slug, res in (results or []))))
+                         last_warn_at = now
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 1b7ec9e0e7..9d70227289 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -436,3 +436,21 @@ def _log_spawn_results(results: Optional[list]) -> bool:
+                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+             )
+     return any_spawned
++
++
++def _external_drain_hold(observed_at: float) -> tuple[str, str]:
++    """``(principal, since HH:MM:SS)`` of the external drain (``.drain_request.json``) holding dispatch.
++
++    Read through ``gateway.drain_control`` only to name the hold in the log; the gate itself is the runner's
++    ``_external_drain_active`` flag, so an unreadable marker degrades the line, never the hold. ``since`` is
++    the marker's ``requested_at`` in local time, else *observed_at* (when the dispatcher first saw it). [daveey]"""
++    from datetime import datetime
++
++    from gateway.drain_control import read_drain_request
++    from gateway.memory_status import _parse_iso
++
++    body = read_drain_request() or {}  # never raises: absent -> None, garbled -> {}
++    principal = str(body.get("principal") or "unknown principal")
++    since = _parse_iso(body.get("requested_at"))  # None when missing or unparseable
++    when = since.astimezone() if since is not None else datetime.fromtimestamp(observed_at)
++    return principal, when.strftime("%H:%M:%S")
+diff --git a/tests/gateway/test_kanban_external_drain_hold.py b/tests/gateway/test_kanban_external_drain_hold.py
+new file mode 100644
+index 0000000000..097eb1585c
+--- /dev/null
++++ b/tests/gateway/test_kanban_external_drain_hold.py
+@@ -0,0 +1,207 @@
++"""The embedded Kanban dispatcher holds claims during an EXTERNAL gateway drain (``.drain_request.json``).
++
++MacBook 10-30 09:12-09:26 and 09:39-10:06: a stale-plugin restart helper drained the gateway externally.
++The dispatcher kept claiming into it (the draining owner refuses every new worker), spawned 0 for up to 48
++ticks, and ``stuck_warning`` blamed profile health. An external drain must hold claims exactly like the
++deferred-restart drain (``_restart_requested``): spawn-suppressed ticks, ``bad_ticks`` 0, no stuck warning,
++and one INFO line at the start and one at the end of the hold. [daveey]
++"""
++
++import asyncio
++import logging
++from datetime import datetime
++
++import pytest
++
++from agent import core_update_drain as core_drain
++
++HOLD = "kanban dispatch held: external drain"
++RELEASED = "kanban dispatch released: external drain"
++STUCK = "kanban dispatcher stuck"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    from pathlib import Path
++
++    monkeypatch.setattr(core_drain, "_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(core_drain, "_canonical_root", lambda: tmp_path)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    return tmp_path
++
++
++def _board(monkeypatch):
++    """One spawnable ready card on the default board; returns (card id, spawned list)."""
++    from types import SimpleNamespace
++
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda **kw: [SimpleNamespace(name="default")])
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "default")
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
++    spawned = []
++    monkeypatch.setattr(kbd, "_default_spawn", lambda task, ws, *, board=None: spawned.append(task.id) or None)
++    with kbc.connect_closing(board="default") as conn:
++        ready = kb.create_task(conn, title="ready", assignee="default")
++        assert kb.get_task(conn, ready).status == "ready"
++    return ready, spawned
++
++
++def _status(task_id):
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    with kbc.connect_closing(board="default") as conn:
++        return kb.get_task(conn, task_id).status
++
++
++def _run_ticks(monkeypatch, drained_per_tick, *, restart_requested=False):
++    """Run one dispatcher tick per entry; entry i is ``_external_drain_active`` during tick i."""
++    from gateway import kanban_watchers as watchers
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    runner._external_drain_active = drained_per_tick[0]
++    runner._restart_requested = restart_requested
++    cfg = {"auto_decompose": False, "dispatch_interval_seconds": 1}
++    monkeypatch.setattr(runner, "_kanban_dispatcher_boot", lambda: (lambda: {"kanban": cfg}, kb, cfg))
++    tick = {"n": 0}
++
++    async def no_sleep(delay):
++        return None
++
++    async def next_tick(interval):
++        tick["n"] += 1
++        if tick["n"] >= len(drained_per_tick):
++            runner._running = False
++        else:
++            runner._external_drain_active = drained_per_tick[tick["n"]]
++
++    monkeypatch.setattr(watchers.asyncio, "sleep", no_sleep)
++    monkeypatch.setattr(runner, "_sleep_until_tick_or_sync_wake", next_tick)
++    try:
++        asyncio.run(runner._kanban_dispatcher_watcher())
++    finally:
++        kwc._shutdown_for_tests()
++    return tick["n"]
++
++
++def _lines(caplog, needle, level=None):
++    return [r for r in caplog.records if needle in r.getMessage() and (level is None or r.levelno == level)]
++
++
++def _since(requested_at_iso):
++    return datetime.fromisoformat(requested_at_iso).astimezone().strftime("%H:%M:%S")
++
++
++class _NoSpawnDispatcher:
++    """A dispatcher whose ready queue never empties and whose ticks spawn nothing: the MacBook case, where
++    the draining owner refused every worker. Records the ``suppress_spawn`` of each tick."""
++
++    calls: list = []
++
++    def __init__(self, kb, settings):
++        self.successful_scopes = ()
++
++    def tick_once(self, *, suppress_spawn=False):
++        type(self).calls.append(suppress_spawn)
++        return []
++
++    def ready_nonempty(self):
++        return True
++
++    def auto_decompose_tick(self, per_tick):
++        return None
++
++
++def test_external_drain_suppresses_spawns_and_never_reports_stuck(home, monkeypatch, caplog):
++    """Many held ticks with a non-empty ready queue: every tick is spawn-suppressed, bad_ticks never reaches
++    the stuck window, and the hold is announced once."""
++    from gateway import drain_control
++    from gateway import kanban_watchers as watchers
++
++    marker = drain_control.write_drain_request(principal="stale-plugin-restart", home=home)
++    _NoSpawnDispatcher.calls = []
++    monkeypatch.setattr(watchers, "_KanbanDispatcher", _NoSpawnDispatcher)
++    caplog.set_level(logging.INFO, logger="gateway")
++    ticks = watchers._HEALTH_WINDOW + 4
++    assert _run_ticks(monkeypatch, [True] * ticks) == ticks
++    assert _NoSpawnDispatcher.calls == [True] * ticks
++    assert _lines(caplog, STUCK) == []
++    held = _lines(caplog, HOLD, logging.INFO)
++    assert [r.getMessage() for r in held] == [
++        f"{HOLD} (stale-plugin-restart, since {_since(marker['requested_at'])}); running workers continue"]
++
++
++def test_external_drain_claims_nothing_on_a_real_board(home, monkeypatch, caplog):
++    from gateway import drain_control
++
++    drain_control.write_drain_request(principal="stale-plugin-restart", home=home)
++    ready, spawned = _board(monkeypatch)
++    caplog.set_level(logging.INFO, logger="gateway")
++    _run_ticks(monkeypatch, [True] * 3)
++    assert spawned == [] and _status(ready) == "ready"
++    assert len(_lines(caplog, HOLD, logging.INFO)) == 1
++    assert _lines(caplog, STUCK) == []
++
++
++def test_drain_release_spawns_on_the_next_tick_and_logs_the_release(home, monkeypatch, caplog):
++    from gateway import drain_control
++
++    drain_control.write_drain_request(principal="stale-plugin-restart", home=home)
++    ready, spawned = _board(monkeypatch)
++    caplog.set_level(logging.INFO, logger="gateway")
++    _run_ticks(monkeypatch, [True, True, False])
++    assert spawned == [ready] and _status(ready) == "running"
++    msgs = [r.getMessage() for r in caplog.records]
++    hold_at = next(i for i, m in enumerate(msgs) if HOLD in m)
++    release = [i for i, m in enumerate(msgs) if RELEASED in m]
++    assert len(release) == 1 and release[0] > hold_at
++    assert "stale-plugin-restart" in msgs[release[0]]
++    assert [r.levelno for r in _lines(caplog, RELEASED)] == [logging.INFO]
++
++
++def test_external_drain_without_a_readable_marker_still_holds(home, monkeypatch, caplog):
++    """The flag is the gate; a missing/garbled marker only degrades the log line, never the hold."""
++    from gateway import kanban_watchers as watchers
++
++    _NoSpawnDispatcher.calls = []
++    monkeypatch.setattr(watchers, "_KanbanDispatcher", _NoSpawnDispatcher)
++    caplog.set_level(logging.INFO, logger="gateway")
++    _run_ticks(monkeypatch, [True] * 2)
++    assert _NoSpawnDispatcher.calls == [True, True]
++    (line,) = [r.getMessage() for r in _lines(caplog, HOLD, logging.INFO)]
++    assert "(unknown principal, since " in line and line.endswith("); running workers continue")
++
++
++def test_no_drain_control_ticks_spawn_and_still_report_stuck(home, monkeypatch, caplog):
++    """Control: without a drain the same no-spawn queue does trip the stuck warning, so the held test's
++    silence is the hold's doing, and no hold line is logged."""
++    from gateway import kanban_watchers as watchers
++
++    _NoSpawnDispatcher.calls = []
++    monkeypatch.setattr(watchers, "_KanbanDispatcher", _NoSpawnDispatcher)
++    caplog.set_level(logging.INFO, logger="gateway")
++    _run_ticks(monkeypatch, [False] * (watchers._HEALTH_WINDOW + 1))
++    assert set(_NoSpawnDispatcher.calls) == {False}
++    assert len(_lines(caplog, STUCK)) == 1
++    assert _lines(caplog, HOLD) == [] and _lines(caplog, RELEASED) == []
++
++
++def test_deferred_restart_drain_is_unchanged_and_never_reports_stuck(home, monkeypatch, caplog):
++    from gateway import kanban_watchers as watchers
++
++    _NoSpawnDispatcher.calls = []
++    monkeypatch.setattr(watchers, "_KanbanDispatcher", _NoSpawnDispatcher)
++    caplog.set_level(logging.INFO, logger="gateway")
++    ticks = watchers._HEALTH_WINDOW + 2
++    _run_ticks(monkeypatch, [False] * ticks, restart_requested=True)
++    assert _NoSpawnDispatcher.calls == [True] * ticks
++    assert _lines(caplog, STUCK) == []
++    assert _lines(caplog, HOLD) == []  # the external-drain line names only the external drain
+-- 
+2.54.0 (Apple Git-157)
+

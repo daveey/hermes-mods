@@ -1,0 +1,724 @@
+From 2185d7299cc7e72178f612d4b85754efba7943d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 11:31:46 -0700
+Subject: [PATCH] fix(sessions): a lost request outranks live work, a cron is
+ not a wait, a refused turn is replayed [daveey]
+
+A chat ended on 'Your request was not processed', painted as waiting because it
+owned a cron, so the person's two requests sat unseen for 18 h. Reading the
+outcome: any open card or cron beat the failed turn, and a recurring cron can
+never end, so that wait was permanent.
+
+- _lost_request: a typed or steered message that failed or got no answer is
+  unresolved even with open cards (a held declaration and a real reply close it).
+- Crons leave the wait list; a finished chat is done and names them in crons;
+  the Desktop keeps the loop glyph, in the green of done.
+- A retryable refusal keeps its turn marker and replays through auto-continue
+  after 45 s and 180 s with the existing guards, boot sweep included.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../app/chat/sidebar/session-row-stripe.tsx   |   9 +-
+ .../desktop/src/i18n/en_session_row_status.ts |   1 +
+ apps/desktop/src/i18n/overlay-gaps.json       |   1 +
+ .../src/i18n/types_session_row_status.ts      |   1 +
+ apps/desktop/src/lib/session-outcome.test.ts  |  21 ++-
+ apps/desktop/src/lib/session-outcome.ts       |  21 ++-
+ apps/desktop/src/types/session-outcome.ts     |   2 +
+ hermes_state_outcome.py                       |  36 +++-
+ locales/_keys.desktop.json                    |   1 +
+ tests/hermes_state/test_session_outcome.py    | 104 +++++++++++
+ tests/tui_gateway/conftest.py                 |   8 +
+ tests/tui_gateway/test_refused_turn_retry.py  | 172 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |   9 +
+ tui_gateway/session_auto_continue.py          |  52 +++++-
+ 14 files changed, 425 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tui_gateway/test_refused_turn_retry.py
+
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+index 7036fbb414..b9b7ad23f6 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+@@ -4,7 +4,7 @@ import { Codicon } from '@/components/ui/codicon'
+ import { Tip } from '@/components/ui/tooltip'
+ import type { SessionInfo } from '@/hermes'
+ import { useI18n } from '@/i18n'
+-import { outcomeStripe, outcomeTooltip } from '@/lib/session-outcome'
++import { outcomeHasCrons, outcomeStripe, outcomeTooltip } from '@/lib/session-outcome'
+ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+ import { useSessionParked } from '@/lib/use-session-parked'
+ import { cn } from '@/lib/utils'
+@@ -76,7 +76,8 @@ export function SessionRowStatusStripe({ session, statusStripe, outcomePainted }
+ 
+   const outcomeKind = outcomePainted && outcomeStripe(session.outcome) ? session.outcome?.kind : undefined
+   const tipText = outcomeKind ? outcomeTooltip(session.outcome, t.sidebar.row) : null
+-  const glyph = GLYPH_STRIPES.has(statusStripe)
++  const doneCron = Boolean(outcomeKind) && outcomeHasCrons(session.outcome)
++  const glyph = GLYPH_STRIPES.has(statusStripe) || doneCron
+ 
+   return (
+     <Tip label={tipText ? <span className="whitespace-pre-line">{tipText}</span> : null}>
+@@ -96,8 +97,8 @@ export function SessionRowStatusStripe({ session, statusStripe, outcomePainted }
+         role={tipText ? 'img' : undefined}
+       >
+         {/* `periodic`: a live cron job, it recurs so it is never "done". `waiting`: open kanban cards hold it — the
+-            card glyph (amber when `stalled`). */}
+-        {glyph && <Codicon name={statusStripe === 'periodic' ? 'sync' : 'project'} size="0.5625rem" />}
++            card glyph (amber when `stalled`). A finished chat's cron keeps the loop glyph, in the green of `done`. */}
++        {glyph && <Codicon name={statusStripe === 'periodic' || doneCron ? 'sync' : 'project'} size="0.5625rem" />}
+       </span>
+     </Tip>
+   )
+diff --git a/apps/desktop/src/i18n/en_session_row_status.ts b/apps/desktop/src/i18n/en_session_row_status.ts
+index 7257572e0e..cb7e180a7c 100644
+--- a/apps/desktop/src/i18n/en_session_row_status.ts
++++ b/apps/desktop/src/i18n/en_session_row_status.ts
+@@ -21,6 +21,7 @@ export const enSessionRowStatus = {
+   kanbanStalled: count =>
+     `${count} ${count === 1 ? 'card has' : 'cards have'} stalled: waiting over 2 h on something only an agent can do, with nothing producing it`,
+   outcomeDone: 'Done',
++  outcomeCrons: names => `Keeps running: ${names.join(', ')}`,
+   outcomeDecision: 'Waiting on your decision',
+   outcomeMuted: 'Muted',
+   outcomeRunning: 'Running',
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index d465d0ed68..0fd9b63abe 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -1,4 +1,5 @@
+ {
++  "sidebar.row.outcomeCrons": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "agents.ageDays": ["ar"],
+   "appTour.capabilities.text": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "appTour.capabilities.title": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+diff --git a/apps/desktop/src/i18n/types_session_row_status.ts b/apps/desktop/src/i18n/types_session_row_status.ts
+index 66da8345d7..0d8dc3725e 100644
+--- a/apps/desktop/src/i18n/types_session_row_status.ts
++++ b/apps/desktop/src/i18n/types_session_row_status.ts
+@@ -5,6 +5,7 @@ export interface SessionRowStatusCopy {
+   kanbanAttention: (count: number) => string
+   kanbanStalled: (count: number) => string
+   outcomeDone: string
++  outcomeCrons: (names: string[]) => string
+   outcomeDecision: string
+   outcomeMuted: string
+   outcomeRunning: string
+diff --git a/apps/desktop/src/lib/session-outcome.test.ts b/apps/desktop/src/lib/session-outcome.test.ts
+index 33b65fb30f..1d4ea0facd 100644
+--- a/apps/desktop/src/lib/session-outcome.test.ts
++++ b/apps/desktop/src/lib/session-outcome.test.ts
+@@ -4,7 +4,7 @@ import { TRANSLATIONS } from '@/i18n/catalog'
+ import { type SessionDotState, sessionStatusStripe } from '@/store/session-dot-state'
+ import type { SessionOutcome } from '@/types/session-outcome'
+ 
+-import { outcomeEtaLabel, outcomeStripe, outcomeTooltip, outcomeWaitingLine } from './session-outcome'
++import { outcomeEtaLabel, outcomeHasCrons, outcomeStripe, outcomeTooltip, outcomeWaitingLine } from './session-outcome'
+ 
+ const r = TRANSLATIONS.en.sidebar.row
+ 
+@@ -191,3 +191,22 @@ describe('outcomeTooltip', () => {
+     expect(outcomeWaitingLine({ kind: 'card', id: 't_1', state: 'scheduled', eta })).toBe('t_1 scheduled · 14:05')
+   })
+ })
++
++describe('a finished chat that owns a cron', () => {
++  const outcome: SessionOutcome = {
++    kind: 'done',
++    summary: 'Sweep is live.',
++    crons: [{ kind: 'cron', id: 'j1', label: 'gmail-psfc-sweep' }, { kind: 'cron', id: 'j2' }]
++  }
++
++  it('stays green and names what keeps running', () => {
++    expect(outcomeStripe(outcome)).toBe('done')
++    expect(outcomeHasCrons(outcome)).toBe(true)
++    expect(outcomeTooltip(outcome, r)).toBe('Sweep is live.\nKeeps running: gmail-psfc-sweep, j2')
++  })
++
++  it('leaves a plain done alone', () => {
++    expect(outcomeHasCrons(OUTCOMES.done)).toBe(false)
++    expect(outcomeTooltip(OUTCOMES.done, r)).toBe('Shipped PR #12 and closed the card.')
++  })
++})
+diff --git a/apps/desktop/src/lib/session-outcome.ts b/apps/desktop/src/lib/session-outcome.ts
+index 5d3385d184..6b0deceb57 100644
+--- a/apps/desktop/src/lib/session-outcome.ts
++++ b/apps/desktop/src/lib/session-outcome.ts
+@@ -44,6 +44,10 @@ export const outcomeEtaLabel = (eta: number): string => {
+   return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+ }
+ 
++/** A finished chat whose cron keeps running: it draws the loop glyph on the green stripe, not the grey wait. */
++export const outcomeHasCrons = (outcome: null | SessionOutcome | undefined): boolean =>
++  outcome?.kind === 'done' && Boolean(outcome.crons?.length)
++
+ /** One `on[]` entry in words: a card reads `t_… scheduled · 14:00`, anything else `capacity: hub slot`. */
+ export const outcomeWaitingLine = (item: SessionOutcomeWaitingOn): string => {
+   const head = item.kind === 'card' ? item.id : `${item.kind}: ${item.label || item.id}`
+@@ -55,14 +59,25 @@ export const outcomeWaitingLine = (item: SessionOutcomeWaitingOn): string => {
+ 
+ type RowCopy = Pick<
+   Translations['sidebar']['row'],
+-  'outcomeDecision' | 'outcomeDone' | 'outcomeMuted' | 'outcomeRunning' | 'outcomeUnresolved' | 'outcomeWaiting'
++  | 'outcomeCrons'
++  | 'outcomeDecision'
++  | 'outcomeDone'
++  | 'outcomeMuted'
++  | 'outcomeRunning'
++  | 'outcomeUnresolved'
++  | 'outcomeWaiting'
+ >
+ 
+ /** The stripe's tooltip for an outcome, or null when the row has none (old backend, or an unknown kind). */
+ export const outcomeTooltip = (outcome: null | SessionOutcome | undefined, r: RowCopy): null | string => {
+   switch (outcome?.kind) {
+-    case 'done':
+-      return outcome.summary?.trim() || r.outcomeDone
++    case 'done': {
++      const names = (outcome.crons ?? []).map(job => job.label || job.id)
++      const summary = outcome.summary?.trim() || r.outcomeDone
++
++      return names.length ? `${summary}\n${r.outcomeCrons(names)}` : summary
++    }
++
+     case 'decision': {
+       const questions = (outcome.items ?? []).map(item => item.question?.trim()).filter(Boolean)
+ 
+diff --git a/apps/desktop/src/types/session-outcome.ts b/apps/desktop/src/types/session-outcome.ts
+index a3e482787e..d818af931a 100644
+--- a/apps/desktop/src/types/session-outcome.ts
++++ b/apps/desktop/src/types/session-outcome.ts
+@@ -35,5 +35,7 @@ export interface SessionOutcome {
+   summary?: string
+   items?: SessionOutcomeItem[]
+   on?: SessionOutcomeWaitingOn[]
++  /** Recurring jobs a `done` chat owns: they never end, so they are named, not waited on. */
++  crons?: SessionOutcomeWaitingOn[]
+   reason?: SessionOutcomeReason | string
+ }
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index b4226d8d5d..cc5e4c5929 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -43,6 +43,8 @@ _ERROR_FINISH_REASONS = frozenset({"error", "agent_error", "content_filter"})
+ # The declaration tool's own result row follows the declaration; it does not supersede it.
+ _OUTCOME_TOOL = "session_outcome"
+ _NOTICE_KIND = "kanban_notice"
++# ``messages.display_kind`` of a row a person wrote: a plain message, or one steered into a running turn.
++_TYPED_KINDS = frozenset({None, "steer"})
+ _PROGRESS_OPENERS = ("let me ", "i'll ", "i will ", "now i", "next, i", "next i ", "working on")
+ 
+ ProviderFn = Callable[[str], Optional[dict]]
+@@ -358,6 +360,27 @@ def _declaration_holds(declared: dict, tail: list[dict]) -> bool:
+     return not (last["role"] == "tool" and (last.get("tool_name") or "") != _OUTCOME_TOOL)
+ 
+ 
++def _lost_request(tail: list[dict]) -> Optional[str]:
++    """Why a person's latest request got no answer, or None. It outranks live work: an open card says nothing about
++    the message that failed, and a chat painted "waiting" hides it from the only person who can resend it. Automated
++    rows after the failure (a process completion refused the same way) don't close it; only a real reply does."""
++    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE, FAILED_TURN_DISPLAY_KIND
++
++    failed = False
++    for row in tail:
++        kind = row.get("display_kind")
++        if row["role"] == "assistant":
++            if kind == FAILED_TURN_DISPLAY_KIND:
++                if _text(row.get("content")).strip() == AUTOMATION_INTERRUPTED_NOTICE:
++                    return None
++                failed = True
++            elif _text(row.get("content")).strip() and not row.get("tool_calls"):
++                return None
++        elif row["role"] == "user" and kind in _TYPED_KINDS:
++            return "turn_failed" if failed else "interrupted"
++    return None
++
++
+ def _tail_reason(tail: list[dict]) -> Optional[str]:
+     last = tail[0]
+     if last.get("display_kind") == _NOTICE_KIND:
+@@ -417,11 +440,11 @@ def _outcome(kind: str, now: float, **fields: Any) -> dict[str, Any]:
+ 
+ 
+ def _live_work(db: Any, sid: str, ids: list[str]) -> tuple[list[dict], list[dict]]:
+-    """(open decision items, named waits) across every live-work source."""
++    """(open decision items, named waits) across every live-work source. A recurring cron is not one: it never
++    ends, so a chat that owns one would wait forever (see ``_derive``, which names it on the outcome instead)."""
+     card_decisions, card_waits = _guarded("kanban cards", sid, lambda: _card_items(ids), ([], []))
+     prov_decisions, prov_waits = _provider_items(sid)
+     waits = (card_waits + _guarded("processes", sid, lambda: _process_items(sid, ids), [])
+-             + _guarded("cron", sid, lambda: _cron_items(ids), [])
+              + _guarded("subagents", sid, lambda: _subagent_items(db, ids), [])
+              + _guarded("goal", sid, lambda: _goal_items(sid, ids), []) + prov_waits)
+     return prov_decisions + card_decisions, waits
+@@ -445,10 +468,15 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     carry = {"declared": declared} if holds else {}
+     if decisions:
+         return _outcome("decision", now, items=decisions, **carry)
++    lost = None if holds else _lost_request(tail)  # a turn that declared its outcome answered the request
++    if lost:
++        return _outcome("unresolved", now, reason=lost, **carry)
+     if waits:
+         return _outcome("waiting", now, on=waits, **carry)
++    crons = _guarded("cron", sid, lambda: _cron_items(_lineage_ids(db, sid)), [])
++    named = {"crons": crons} if crons else {}
+     if holds and declared.get("kind") in ("done", "waiting"):
+-        return declared
++        return {**declared, **(named if declared.get("kind") == "done" else {})}
+     if not tail:
+         return _outcome("unresolved", now, reason="empty", **carry)
+     reason = _tail_reason(tail)
+@@ -463,7 +491,7 @@ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     if verdict is None:
+         verdict = looks_like_summary(text)
+     if verdict:
+-        return _outcome("done", now, summary=text[:SUMMARY_CHARS], **judged, **carry)
++        return _outcome("done", now, summary=text[:SUMMARY_CHARS], **judged, **named, **carry)
+     return _outcome("unresolved", now, reason="no_summary", **judged, **carry)
+ 
+ 
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 724c50f2dc..c50e85d919 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -4829,6 +4829,7 @@
+     "sidebar.row.openInNewTab",
+     "sidebar.row.openInSplit",
+     "sidebar.row.openInTerminal",
++    "sidebar.row.outcomeCrons",
+     "sidebar.row.outcomeDecision",
+     "sidebar.row.outcomeDone",
+     "sidebar.row.outcomeMuted",
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 86c5cc0bfb..6770a3c025 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -238,3 +238,107 @@ def test_list_sessions_rich_rows_carry_outcome_and_muted(db):
+     so.set_muted("chat", True, db=db)
+     row = next(r for r in db.list_sessions_rich(limit=5) if r["id"] == "chat")
+     assert row["outcome"]["kind"] == "muted" and row["muted"] is True
++
++
++# ── A lost request and a recurring cron do not hide behind live work ───────
++
++def failed_turn(db, text=None, **kw):
++    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
++    say(db, "assistant", text or FAILED_TURN_NOTICE, display_kind=FAILED_TURN_DISPLAY_KIND, **kw)
++
++
++def test_failed_typed_request_outranks_an_open_card(db, board):
++    add_card(board, "t_run", "chat", "scheduled")
++    say(db, "user", "archive my receipts")
++    failed_turn(db)
++    out = so.refresh_outcome("chat", "turn_end", db=db)
++    assert (out["kind"], out["reason"]) == ("unresolved", "turn_failed")
++
++
++def test_failed_request_outranks_a_cron_and_a_later_refused_automation_row(db, board, monkeypatch):
++    monkeypatch.setattr(so, "_cron_items", lambda ids: [{"kind": "cron", "id": "j", "label": "sweep"}])
++    say(db, "user", "and mercury notices")
++    failed_turn(db)
++    say(db, "user", "[IMPORTANT: Background process done]", display_kind="process_complete")
++    failed_turn(db)
++    out = so.refresh_outcome("chat", "turn_end", db=db)
++    assert (out["kind"], out["reason"]) == ("unresolved", "turn_failed")
++
++
++def test_failed_turn_with_no_live_work_is_turn_failed_not_judged(db):
++    so.register_outcome_judge(lambda sid, text, source=None: True)
++    say(db, "user", "archive my receipts")
++    failed_turn(db)
++    assert so.derive_outcome("chat", db=db)["reason"] == "turn_failed"
++
++
++def test_a_real_reply_after_the_failure_clears_it(db, board):
++    add_card(board, "t_run", "chat", "scheduled")
++    say(db, "user", "archive my receipts")
++    failed_turn(db)
++    say(db, "user", "try again")
++    say(db, "assistant", SUMMARY)
++    assert so.derive_outcome("chat", db=db)["kind"] == "waiting"
++
++
++def test_interrupted_automation_delivery_does_not_paint_a_waiting_chat(db, board):
++    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
++    add_card(board, "t_run", "chat", "scheduled")
++    say(db, "user", "a cron delivery with no display kind")
++    failed_turn(db, AUTOMATION_INTERRUPTED_NOTICE)
++    assert so.derive_outcome("chat", db=db)["kind"] == "waiting"
++
++
++def test_a_typed_row_nobody_answered_outranks_an_open_card(db, board):
++    add_card(board, "t_run", "chat", "scheduled")
++    say(db, "user", "are you there")
++    out = so.derive_outcome("chat", db=db)
++    assert (out["kind"], out["reason"]) == ("unresolved", "interrupted")
++
++
++def test_a_kanban_notice_tail_stays_a_wait_when_the_card_is_open(db, board):
++    add_card(board, "t_run", "chat", "scheduled")
++    say(db, "assistant", SUMMARY)
++    say(db, "user", "card moved", display_kind=so._NOTICE_KIND)
++    assert so.derive_outcome("chat", db=db)["kind"] == "waiting"
++
++
++def test_an_open_decision_still_outranks_a_failed_request(db, board):
++    add_card(board, "t_ask", "chat", "blocked", request=HUMAN_REQUEST)
++    say(db, "user", "archive my receipts")
++    failed_turn(db)
++    assert so.derive_outcome("chat", db=db)["kind"] == "decision"
++
++
++def test_a_recurring_cron_is_not_a_wait_a_finished_chat_is_done_and_names_it(db, monkeypatch):
++    monkeypatch.setattr(so, "_cron_items", lambda ids: [{"kind": "cron", "id": "j1", "label": "sweep"}])
++    so.register_outcome_judge(lambda sid, text, source=None: True)
++    turn(db, SUMMARY)
++    out = so.refresh_outcome("chat", "turn_end", db=db)
++    assert out["kind"] == "done"
++    assert [(c["id"], c["label"]) for c in out["crons"]] == [("j1", "sweep")]
++
++
++def test_a_declared_done_keeps_naming_its_cron(db, monkeypatch):
++    monkeypatch.setattr(so, "_cron_items", lambda ids: [{"kind": "cron", "id": "j1", "label": "sweep"}])
++    say(db, "user", "do it")
++    so.declare_outcome("chat", {"kind": "done", "summary": "Shipped."}, db=db)
++    say(db, "tool", "ok", tool_name="session_outcome", tool_call_id="c1")
++    out = so.derive_outcome("chat", db=db)
++    assert (out["kind"], out["source"]) == ("done", "declared")
++    assert out["crons"][0]["id"] == "j1"
++
++
++def test_an_open_card_still_waits_beside_a_cron(db, board, monkeypatch):
++    monkeypatch.setattr(so, "_cron_items", lambda ids: [{"kind": "cron", "id": "j1", "label": "sweep"}])
++    add_card(board, "t_run", "chat", "scheduled")
++    turn(db, SUMMARY)
++    out = so.derive_outcome("chat", db=db)
++    assert out["kind"] == "waiting" and [w["id"] for w in out["on"]] == ["t_run"]
++
++
++def test_a_declared_wait_on_a_cron_is_still_honoured(db):
++    say(db, "user", "do it")
++    so.declare_outcome("chat", {"kind": "waiting", "on": [{"kind": "cron", "id": "j1"}]}, db=db)
++    say(db, "tool", "ok", tool_name="session_outcome", tool_call_id="c1")
++    assert so.derive_outcome("chat", db=db)["kind"] == "waiting"
+diff --git a/tests/tui_gateway/conftest.py b/tests/tui_gateway/conftest.py
+index 76f9ce41a2..5d5e468d3f 100644
+--- a/tests/tui_gateway/conftest.py
++++ b/tests/tui_gateway/conftest.py
+@@ -8,3 +8,11 @@ Importing it once here, before any window opens, keeps boot out of the mocked im
+ """
+ 
+ import hermes_bootstrap
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def _no_refused_turn_replay(monkeypatch):
++    """A real 45 s timer would outlive its test and replay into the next one; ``test_refused_turn_retry`` turns it on."""
++    from tui_gateway import server
++    monkeypatch.setattr(server, "_REFUSED_RETRY_DELAYS_S", ())
+diff --git a/tests/tui_gateway/test_refused_turn_retry.py b/tests/tui_gateway/test_refused_turn_retry.py
+new file mode 100644
+index 0000000000..6dc3d91ccc
+--- /dev/null
++++ b/tests/tui_gateway/test_refused_turn_retry.py
+@@ -0,0 +1,172 @@
++"""A turn refused for a retryable reason is replayed through the crash path, not left on "send it again". [daveey]"""
++
++from __future__ import annotations
++
++import threading
++import types
++
++import pytest
++
++from tui_gateway import server
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++from .test_auto_continue import _InlineThread, _session
++
++LEASE = "Chat ownership lease is unavailable"
++
++
++@pytest.fixture()
++def emits(monkeypatch):
++    captured: list = []
++    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: captured.append((event, sid, payload)))
++    return captured
++
++
++@pytest.fixture()
++def marker_home(monkeypatch, tmp_path):
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    return tmp_path
++
++
++@pytest.fixture()
++def turn_env(monkeypatch, tmp_path, marker_home):
++    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_register_session_cwd", lambda session: None)
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++
++
++class _Timers(list):
++    """Records the wait instead of running it."""
++
++    def __call__(self, delay, fn):
++        self.append((delay, fn))
++        return types.SimpleNamespace(start=lambda: None, daemon=False)
++
++
++@pytest.fixture()
++def timers(monkeypatch):
++    fake = _Timers()
++    monkeypatch.setattr(threading, "Timer", fake)
++    monkeypatch.setattr(server, "_REFUSED_RETRY_DELAYS_S", (45.0, 180.0))
++    monkeypatch.setattr(server, "_active_goal_manager", lambda session: None)
++    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 900.0, 2))
++    return fake
++
++
++def _refused(message, **kwargs):
++    return {"failed": True, "error": LEASE, "final_response": None}
++
++
++def _agent(run=_refused):
++    return types.SimpleNamespace(session_id="session-key", run_conversation=run, clear_interrupt=lambda: None)
++
++
++def test_retryable_refusal_keeps_the_marker_and_waits(emits, turn_env, marker_home, timers):
++    session = _session(agent=_agent(), running=True)
++    server._run_prompt_submit("rid", "sid", session, "archive my receipts")
++    marker = read_turn_marker(marker_home, "session-key")
++    assert marker["prompt"] == "archive my receipts" and marker["attempts"] == 0
++    assert [t[0] for t in timers] == [45.0]
++
++
++def test_non_retryable_failure_clears_the_marker_and_never_waits(emits, turn_env, marker_home, timers):
++    def bad_model(message, **kwargs):
++        return {"failed": True, "error": "HTTP 400: claude-opus-5-5 is not a valid model ID", "final_response": None,
++                "failure_reason": "invalid_request", "failure_retryable": False}
++
++    session = _session(agent=_agent(bad_model), running=True)
++    server._run_prompt_submit("rid", "sid", session, "archive my receipts")
++    assert read_turn_marker(marker_home, "session-key") is None and not timers
++
++
++def test_a_replay_waits_longer_and_the_last_one_gives_up(emits, turn_env, marker_home, timers):
++    session = _session(agent=_agent(), running=True, _auto_continue_attempt=1, _auto_continue_prompt="p")
++    server._run_prompt_submit("rid", "sid", session, server._auto_continue_note("p"), display_kind="auto_continue")
++    assert read_turn_marker(marker_home, "session-key")["attempts"] == 1
++    assert [t[0] for t in timers] == [180.0]
++
++    timers.clear()
++    session = _session(agent=_agent(), running=True, _auto_continue_attempt=2, _auto_continue_prompt="p")
++    server._run_prompt_submit("rid", "sid", session, server._auto_continue_note("p"), display_kind="auto_continue")
++    assert read_turn_marker(marker_home, "session-key") is None and not timers
++
++
++@pytest.mark.parametrize("kind", ["process_complete", "kanban_notice"])
++def test_automation_turns_are_not_replayed(emits, turn_env, marker_home, timers, kind):
++    session = _session(agent=_agent(), running=True)
++    server._run_prompt_submit("rid", "sid", session, "a delivery", display_kind=kind)
++    assert read_turn_marker(marker_home, "session-key") is None and not timers
++
++
++def test_a_goal_keeps_its_own_retry(emits, turn_env, marker_home, timers, monkeypatch):
++    monkeypatch.setattr(server, "_active_goal_manager", lambda session: object())
++    session = _session(agent=_agent(), running=True)
++    server._run_prompt_submit("rid", "sid", session, "archive my receipts")
++    assert read_turn_marker(marker_home, "session-key") is None and not timers
++
++
++def test_a_second_refused_message_joins_the_first(emits, turn_env, marker_home, timers):
++    session = _session(agent=_agent(), running=True)
++    server._run_prompt_submit("rid", "sid", session, "archive waymo")
++    session["running"] = True
++    server._run_prompt_submit("rid", "sid", session, "and mercury")
++    assert read_turn_marker(marker_home, "session-key")["prompt"] == "archive waymo\n\nand mercury"
++
++
++def test_a_new_message_that_works_ends_the_replay(emits, turn_env, marker_home, timers, monkeypatch):
++    calls = []
++    results = iter([_refused("x"), {"final_response": "done"}])
++    session = _session(agent=_agent(lambda message, **kw: next(results)), running=True)
++    server._run_prompt_submit("rid", "sid", session, "archive waymo")
++    session["running"] = True
++    server._run_prompt_submit("rid", "sid", session, "something else")
++    assert read_turn_marker(marker_home, "session-key") is None
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: calls.append(a))
++    monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
++    monkeypatch.setattr("tui_gateway.turn_outcome.refresh_turn_outcome", lambda *a: None)
++    timers[0][1]()
++    assert len(calls) == 1  # it looks, and the guard finds no marker
++
++
++def _armed(marker_home, timers, monkeypatch):
++    session = _session(agent=_agent(), running=False, _refused_turn_delay=45.0)
++    record_turn_start(marker_home, "session-key", "archive waymo")
++    server._schedule_refused_turn_retry("sid", session, "session-key")
++    return session, timers[-1][1]
++
++
++def test_the_wait_replays_through_auto_continue(emits, turn_env, marker_home, timers, monkeypatch):
++    seen = []
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: seen.append(a) or {"attempt": 1})
++    monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
++    session, fire = _armed(marker_home, timers, monkeypatch)
++    fire()
++    assert seen == [("sid", session, "session-key")]
++
++
++def test_a_skewed_backend_leaves_the_marker_for_the_boot_sweep(emits, turn_env, marker_home, timers, monkeypatch):
++    seen = []
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: seen.append(a))
++    monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: "skew")
++    _, fire = _armed(marker_home, timers, monkeypatch)
++    fire()
++    assert not seen and read_turn_marker(marker_home, "session-key")["prompt"] == "archive waymo"
++
++
++def test_a_marker_that_aged_out_settles_the_outcome(emits, turn_env, marker_home, timers, monkeypatch):
++    refreshed = []
++    monkeypatch.setattr("tui_gateway.update_pause._detect_skew", lambda: None)
++    monkeypatch.setattr("tui_gateway.turn_outcome.refresh_turn_outcome", lambda *a: refreshed.append(a))
++    _, fire = _armed(marker_home, timers, monkeypatch)
++
++    def aged_out(sid, sess, key):
++        server.clear_turn_marker(marker_home, key)
++
++    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", aged_out)
++    fire()
++    assert len(refreshed) == 1
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 33d5b120a9..240f2e9e2a 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -257,6 +257,11 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     marker_pauses = int(session.pop("_auto_continue_pauses", 0) or 0)
+     killed_jobs = session.pop("_auto_continue_killed_jobs", None)
+     marker_text = session.pop("_auto_continue_prompt", None) or text
++    session.pop("_refused_turn_marker_key", None)
++    refused_prompt = session.pop("_refused_turn_prompt", None)
++    session.pop("_refused_turn_earlier", None)
++    if refused_prompt and not marker_attempt:  # a new message overtook the replay: if it is refused too, it carries it
++        session["_refused_turn_earlier"] = refused_prompt
+     session.pop("_paused_marker_carried", None)
+     synthesized = session.pop("_synthesized_turn", False)
+     until_tool = bool(session.pop("_marker_until_tool", False))
+@@ -641,6 +646,7 @@ class _TurnRun:
+     error_detail: str = ""
+     prompt_text: str = ""
+     marker_key: str = ""
++    display_kind: Any = None
+     receipt_attempted: bool = False
+ 
+ 
+@@ -1155,6 +1161,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
+             **({"error": str(error_value or raw)} if status == "error" else {})})
+         st.receipt_committed = True
+     if st.receipt_committed:
++        _hold_refused_turn(session, st.marker_key, getattr(st, "display_kind", None), _error_surface)
+         _retire_turn_marker(session, st.marker_key)
+     return payload, raw, status
+ 
+@@ -1338,6 +1345,7 @@ def _run_admitted_prompt(
+             receipt_committed=terminal_callback is None)
+         st.marker_key = _record_turn_marker(session, text, auto_continue=auto_continue and terminal_callback is None,
+             notification_category=(display_metadata or {}).get("notification_category"))
++        st.display_kind = display_kind
+         goal_followup = None
+         try:
+             prepared = _prepare_turn_input(sid, session, st, text, images)
+@@ -1367,6 +1375,7 @@ def _run_admitted_prompt(
+                 from tui_gateway.free_tier_task_done import note_task_done
+                 note_task_done(session, st.result, st.agent, display_kind)
+             _emit("message.complete", sid, payload)
++            _schedule_refused_turn_retry(sid, session, st.marker_key)
+             if paused_for_update:
+                 # The new backend continues it; if no update replaces this one, continue it here.
+                 from tui_gateway import update_pause
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index e68e83be3e..90bce6ac57 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -17,6 +17,9 @@ from .method_ctx import bind_module
+ # done this for restart-interrupted sessions since #27856); if it's stale, clear the marker and let the
+ # recovered partial transcript speak for itself — the user can ask to continue manually.
+ _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
++# [daveey] Waits before each replay of a turn refused for a retryable reason (a stale ownership lease during a core
++# update, a rate limit). One per attempt; ``desktop.auto_continue.max_attempts`` can only lower the count.
++_REFUSED_RETRY_DELAYS_S = (45.0, 180.0)
+ 
+ 
+ def _resume_reuse_live_locked(ctx, sid: str, session: dict) -> dict:
+@@ -67,7 +70,7 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
+     client's answer, and quitting in that window would leave a marker that re-runs a finished turn). Extra ``keys``
+     cover a session_key that compression rotated mid-turn. A turn stopped by backend shutdown keeps its marker
+     (``_stop_turns_before_exit`` flags it) so the next boot auto-continues it like a crash."""
+-    if session.get("_exit_keeps_turn_marker"):
++    if session.get("_exit_keeps_turn_marker") or session.get("_refused_turn_marker_key"):
+         return
+     # [daveey] A core-update pause keeps its marker: the next backend (or the in-place watcher) continues it.
+     if session.get("_update_pause_marker_key") or session.get("_paused_marker_carried"):
+@@ -78,6 +81,53 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
+             clear_turn_marker(home, key)
+ 
+ 
++def _hold_refused_turn(session: dict, marker_key: str, display_kind, error_surface) -> None:
++    """[daveey] Keep the marker of a turn refused for a retryable reason, so the crash path replays it instead of the
++    user's message ending on "send it again": ``_schedule_refused_turn_retry`` replays it here, the boot sweep replays
++    it if the backend goes first. Both keep the auto-continue guards. Only a person's turn or its replay; a later
++    refused turn joins the earlier prompt, because one marker carries one replay."""
++    if not (error_surface or {}).get("retryable") or display_kind not in (None, "auto_continue"):
++        return
++    if session.get("source") == "bot_room":
++        return
++    home = _session_home(session)
++    marker = read_turn_marker(home, marker_key) if marker_key else None
++    enabled, _fresh, max_attempts = _auto_continue_config()
++    if not enabled or marker is None or not marker.get("auto_continue", True):
++        return
++    attempts = marker["attempts"]
++    if attempts >= min(max_attempts, len(_REFUSED_RETRY_DELAYS_S)) or _active_goal_manager(session) is not None:
++        return  # a goal has its own bounded retry (``_goal_followup_after_turn``)
++    prompt, earlier = marker["prompt"], session.pop("_refused_turn_earlier", None)
++    if earlier:
++        prompt = f"{earlier}\n\n{prompt}"
++        record_turn_start(home, marker_key, prompt, attempts=attempts)
++    delay = _REFUSED_RETRY_DELAYS_S[attempts]
++    session.update(_refused_turn_marker_key=marker_key, _refused_turn_prompt=prompt, _refused_turn_delay=delay,
++                   _auto_continue_retry_after=time.monotonic() + delay - 1.0)
++
++
++def _schedule_refused_turn_retry(sid: str, session: dict, marker_key: str) -> None:
++    """Start the wait ``_hold_refused_turn`` armed. A skewed backend leaves the marker for its replacement's boot
++    sweep; a replay that can no longer run (the marker aged out) settles the chat's outcome."""
++    delay = session.pop("_refused_turn_delay", None)
++    if delay is None:
++        return
++
++    def fire() -> None:
++        from tui_gateway.update_pause import _detect_skew
++        if _detect_skew() is not None:
++            return
++        if _maybe_schedule_auto_continue(sid, session, marker_key) is None \
++                and read_turn_marker(_session_home(session), marker_key) is None:
++            from tui_gateway.turn_outcome import refresh_turn_outcome
++            refresh_turn_outcome(session, session.get("agent"))
++
++    timer = threading.Timer(delay, fire)
++    timer.daemon = True
++    timer.start()
++
++
+ def _auto_continue_note(prompt: str) -> str:
+     # Same opening as the gateway's recovery notes (transcript tooling recognizes both). The prompt is embedded: a hard
+     # crash persists nothing else of the turn.
+-- 
+2.54.0 (Apple Git-157)
+

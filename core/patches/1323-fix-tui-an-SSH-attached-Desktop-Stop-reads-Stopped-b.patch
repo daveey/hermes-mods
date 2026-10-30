@@ -1,0 +1,954 @@
+From d8c6b5f378c11b078622ca1ef5e0a036a3af8c77 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 12:59:56 -0700
+Subject: [PATCH] fix(tui): an SSH-attached Desktop Stop reads "Stopped by
+ Desktop", and every Stop names its gesture [daveey]
+
+A Desktop attached over SSH logs in with its per-connection ownership id (provider desktop-ssh), so
+the stop notice read "Stopped by 5caca28140205b2b8f1f5cabb2aaf8ba". And every Stop door (Stop
+button, Esc, tile, /stop, delete) sent an identical session.interrupt, so "why did this stop?" had
+no answer in agent.log.
+
+- _stop_issuer_label: a desktop-ssh identity is "Desktop"; real logins still show the login.
+- session.interrupt accepts an optional free-form `origin` (contract + regenerated TS/OpenRPC).
+  The gateway logs it on the session.interrupt line (origin=<x> or origin=-) and keeps it in the
+  turn_stopped notice metadata as stop_origin; made log-safe, capped at 64 chars, never inherited
+  by a later turn's Stop.
+- Desktop sends it: stop_button, esc, tile / tile:esc, slash, delete, send_now, transcript,
+  rewind, plugin:hermes-bots (lib/stop-origin.ts). The canonical protocol strips it (its control
+  contract forbids unknown keys).
+---
+ .../src/api/canonical-protocol.test.ts        |   2 +
+ apps/desktop/src/api/canonical-protocol.ts    |   6 +-
+ .../hooks/use-composer-esc-cancel.test.tsx    |   2 +
+ .../composer/hooks/use-composer-esc-cancel.ts |   6 +-
+ .../hooks/use-composer-queue.test.tsx         |   5 +
+ .../chat/composer/hooks/use-composer-queue.ts |   2 +-
+ .../hooks/use-composer-submit.test.tsx        |   2 +
+ .../composer/hooks/use-composer-submit.ts     |   2 +-
+ apps/desktop/src/app/chat/composer/index.tsx  |   5 +-
+ apps/desktop/src/app/chat/composer/types.ts   |   4 +-
+ apps/desktop/src/app/chat/index.tsx           |   9 +-
+ .../src/app/chat/session-tile-actions.test.ts |  21 +++-
+ .../src/app/chat/session-tile-actions.ts      |   7 +-
+ .../hooks/use-session-tile-delegate.test.ts   |   2 +-
+ .../hooks/use-session-tile-delegate.ts        |   5 +-
+ .../index.stop-origin.test.tsx                |  37 ++++++
+ .../hooks/use-prompt-actions/index.test.tsx   |   6 +-
+ .../session/hooks/use-prompt-actions/index.ts |   5 +-
+ .../hooks/use-prompt-actions/rewind.ts        |   3 +-
+ .../session/hooks/use-prompt-actions/slash.ts |   3 +-
+ .../hooks/use-session-actions.test.tsx        |   4 +-
+ .../hooks/use-session-actions/index.ts        |   6 +-
+ apps/desktop/src/lib/stop-origin.ts           |  38 ++++++
+ .../plugins/hermes-bots/group-rounds.test.ts  |   1 +
+ .../src/plugins/hermes-bots/group-rounds.ts   |   2 +
+ apps/desktop/src/store/session-states.ts      |   4 +-
+ apps/shared/src/gateway-contract.generated.ts |   1 +
+ apps/shared/src/gateway-contract.openrpc.json |  12 ++
+ tests/tui_gateway/test_stop_notice.py         | 118 ++++++++++++++++++
+ tui_gateway/contracts/sessions.py             |   3 +
+ tui_gateway/methods_session_interrupt.py      |  39 +++++-
+ 31 files changed, 324 insertions(+), 38 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-prompt-actions/index.stop-origin.test.tsx
+ create mode 100644 apps/desktop/src/lib/stop-origin.ts
+
+diff --git a/apps/desktop/src/api/canonical-protocol.test.ts b/apps/desktop/src/api/canonical-protocol.test.ts
+index ad967256b7..f96cb729e0 100644
+--- a/apps/desktop/src/api/canonical-protocol.test.ts
++++ b/apps/desktop/src/api/canonical-protocol.test.ts
+@@ -120,6 +120,8 @@ test('canonical receipts preserve admission identity and replay restores fenced
+   expect(resumed.pending_approval).toMatchObject({ request_id: 'p', execution_generation: 3 })
+   expect(protocol.prepare('approval.respond', { session_id: 's', request_id: 'p', choice: 'once' })).toEqual({ session_id: 's', execution_generation: 3, prompt_id: 'p', choice: 'once' })
+   expect(protocol.prepare('session.interrupt', { session_id: 's' })).toEqual({ session_id: 's', execution_generation: 3 })
++  // The legacy gateway's Stop gesture never rides the canonical control wire (its contract forbids unknown keys).
++  expect(protocol.prepare('session.interrupt', { session_id: 's', origin: 'esc' })).toEqual({ session_id: 's', execution_generation: 3 })
+   protocol.event({ type: 'message.start', session_id: 's', payload: { execution_generation: 4 } })
+   expect(() => protocol.prepare('approval.respond', { session_id: 's', request_id: 'p', choice: 'once' })).toThrow('stale')
+ })
+diff --git a/apps/desktop/src/api/canonical-protocol.ts b/apps/desktop/src/api/canonical-protocol.ts
+index 4450f76eb6..86f7eff08b 100644
+--- a/apps/desktop/src/api/canonical-protocol.ts
++++ b/apps/desktop/src/api/canonical-protocol.ts
+@@ -416,7 +416,11 @@ export class CanonicalDesktopProtocol {
+ 
+       if (typeof generation !== 'number') { throw new Error('Session execution identity unavailable; reconnect before controlling this turn') }
+ 
+-      return { ...params, session_id: params.session_id, execution_generation: generation }
++      // The Stop gesture (`origin`, lib/stop-origin.ts) is a legacy-gateway log field; the canonical control
++      // contract forbids unknown keys, so it never rides this wire.
++      const { origin: _origin, ...control } = params
++
++      return { ...control, session_id: params.session_id, execution_generation: generation }
+     }
+ 
+     if (method === 'prompt.resolve_unknown') {
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.test.tsx
+index 903826d3f3..be61e3d401 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.test.tsx
+@@ -22,6 +22,8 @@ describe('useComposerEscCancel', () => {
+     fireEvent.keyDown(window, { key: 'Escape' })
+ 
+     expect(onCancel).toHaveBeenCalledTimes(1)
++    // The gesture is named so agent.log can tell Esc from the Stop button.
++    expect(onCancel).toHaveBeenCalledWith('esc')
+   })
+ 
+   it('does not cancel on Esc when the turn is not busy', () => {
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.ts
+index 6aaaba57ce..3ebbf0baee 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-esc-cancel.ts
+@@ -2,13 +2,15 @@ import { useEffect, useRef } from 'react'
+ 
+ import { triggerHaptic } from '@/lib/haptics'
+ import { composerFocusBlockedBySurface } from '@/lib/keybinds/composer-focus-keys'
++import { type StopOrigin } from '@/lib/stop-origin'
+ 
+ import { type ComposerTarget, getActiveComposer } from '../focus'
+ 
+ interface UseComposerEscCancelOptions {
+   awaitingInput: boolean
+   busy: boolean
+-  onCancel: () => unknown
++  /** Called with `'esc'` so the gateway log names the gesture (lib/stop-origin.ts). */
++  onCancel: (origin?: StopOrigin) => unknown
+   /** This composer's focus-bus key. With N composers mounted (main + tiles),
+    *  only the active one's Esc cancels — otherwise every busy tile stops. */
+   target: ComposerTarget
+@@ -57,7 +59,7 @@ export function useComposerEscCancel({ awaitingInput, busy, onCancel, target }:
+ 
+     event.preventDefault()
+     triggerHaptic('cancel')
+-    void Promise.resolve(onCancel())
++    void Promise.resolve(onCancel('esc'))
+   }
+ 
+   useEffect(() => {
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx
+index 52a543154a..325e744acc 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx
+@@ -278,6 +278,7 @@ describe('useComposerQueue park integration', () => {
+     // The interrupt fired and the park lifted — this interrupt exists to reach
+     // the queue, not to halt it.
+     expect(onCancel).toHaveBeenCalledTimes(1)
++    expect(onCancel).toHaveBeenCalledWith('send_now')
+     expect(isQueueParked(SESSION_KEY)).toBe(false)
+ 
+     // Turn settles → the promoted entry drains.
+@@ -635,8 +636,10 @@ describe('useComposerQueue scope', () => {
+     ])
+     clearNotifications()
+     const replies = [deferred(), deferred(), deferred()]
++
+     const replaceServerQueued = vi.fn((_admissionId: string, _text: string, _submissionId: string) =>
+       replies[replaceServerQueued.mock.calls.length - 1]!.promise)
++
+     const { draftRef, hook } = renderQueueHook({ busy: true, draft: 'my draft', replaceServerQueued })
+ 
+     act(() => hook.result.current.beginQueuedEdit(getQueuedPrompts(SESSION_KEY)[0]!))
+@@ -672,9 +675,11 @@ describe('useComposerQueue scope', () => {
+     reconcilePendingSubmissions(SESSION_KEY, [
+       { admission_id: 'adm-1', status: 'queued', user: 'old words', controls: ['steer', 'replace'] }
+     ])
++
+     const replaceServerQueued = vi.fn(async (_admissionId: string, _text: string, _submissionId: string) => {
+       throw new Error('socket closed')
+     })
++
+     const { draftRef, hook } = renderQueueHook({ busy: true, replaceServerQueued })
+ 
+     act(() => hook.result.current.beginQueuedEdit(getQueuedPrompts(SESSION_KEY)[0]!))
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts
+index 0df53ffa90..5aa04a2a0d 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts
+@@ -581,7 +581,7 @@ export function useComposerQueue({
+         promoteQueuedPrompt(activeQueueSessionKey, id)
+         unparkQueuedPrompts(activeQueueSessionKey)
+         triggerHaptic('selection')
+-        void Promise.resolve(onCancel())
++        void Promise.resolve(onCancel('send_now'))
+ 
+         return true
+       }
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx
+index f3411c2749..e96cd3b0ef 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx
+@@ -505,6 +505,8 @@ describe('useComposerSubmit busy-turn routing', () => {
+     })
+ 
+     expect(onCancel).toHaveBeenCalledTimes(1)
++    // The gesture is named so agent.log can tell the Stop button from Esc.
++    expect(onCancel).toHaveBeenCalledWith('stop_button')
+     expect(onSteer).not.toHaveBeenCalled()
+     expect(onSubmit).not.toHaveBeenCalled()
+     expect(queueCurrentDraft).not.toHaveBeenCalled()
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
+index 58ea5e56f5..e826ca5788 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
+@@ -367,7 +367,7 @@ export function useComposerSubmit({
+       // Stop button (the only way to reach here while busy with an empty
+       // composer — empty Enter is short-circuited in the keydown handler).
+       triggerHaptic('cancel')
+-      void Promise.resolve(onCancel())
++      void Promise.resolve(onCancel('stop_button'))
+     }
+ 
+     return true
+diff --git a/apps/desktop/src/app/chat/composer/index.tsx b/apps/desktop/src/app/chat/composer/index.tsx
+index 10d312ba25..3b422d5a72 100644
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -24,6 +24,7 @@ import { chatMessageText } from '@/lib/chat-messages'
+ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+ import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
+ import { triggerHaptic } from '@/lib/haptics'
++import { type StopOrigin } from '@/lib/stop-origin'
+ import { $touchPointer } from '@/lib/touch-interaction'
+ import { useStoreSelector, useStoresSelector } from '@/lib/use-session-slice'
+ import { cn } from '@/lib/utils'
+@@ -398,10 +399,10 @@ export function ChatBar({
+   // only trace). Interrupts that exist to advance the queue (send-now-while-
+   // busy) call the raw onCancel and keep draining on settle. Parked entries
+   // stay in the panel until resumed, sent, edited, or deleted.
+-  const haltRun = useCallback(() => {
++  const haltRun = useCallback((origin?: StopOrigin) => {
+     parkQueuedPrompts(activeQueueSessionKeyRef.current)
+ 
+-    return onCancel()
++    return onCancel(origin)
+   }, [activeQueueSessionKeyRef, onCancel])
+ 
+   const { compactPill, foldVoice, minimal, stacked, singleColumn } = useComposerMetrics({
+diff --git a/apps/desktop/src/app/chat/composer/types.ts b/apps/desktop/src/app/chat/composer/types.ts
+index 5a840ea009..6f3e06a20c 100644
+--- a/apps/desktop/src/app/chat/composer/types.ts
++++ b/apps/desktop/src/app/chat/composer/types.ts
+@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
+ 
+ import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
+ import type { HermesGateway, ResolvedOwner } from '@/hermes'
++import { type StopOrigin } from '@/lib/stop-origin'
+ 
+ import type { DroppedFile } from '../hooks/use-composer-actions'
+ 
+@@ -50,7 +51,8 @@ export interface ChatBarProps {
+   /** The tile's routed profile: scopes the slash palette while a draft has no session yet. */
+   profile?: string | null
+   cwd?: string | null
+-  onCancel: () => Promise<void> | void
++  /** `origin` names the Stop gesture for the gateway log (lib/stop-origin.ts). */
++  onCancel: (origin?: StopOrigin) => Promise<void> | void
+   onAddContextRef?: (refText: string, label?: string, detail?: string) => void
+   onAddUrl?: (url: string) => void
+   onAttachImageBlob?: (blob: Blob, isCurrent?: () => boolean) => Promise<boolean | void> | boolean | void
+diff --git a/apps/desktop/src/app/chat/index.tsx b/apps/desktop/src/app/chat/index.tsx
+index 89ac18e354..438d8175d5 100644
+--- a/apps/desktop/src/app/chat/index.tsx
++++ b/apps/desktop/src/app/chat/index.tsx
+@@ -23,6 +23,7 @@ import { useI18n } from '@/i18n'
+ import type { ChatMessage } from '@/lib/chat-messages'
+ import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
+ import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
++import { type StopOrigin } from '@/lib/stop-origin'
+ import { useStoreSelector } from '@/lib/use-session-slice'
+ import { cn } from '@/lib/utils'
+ import { migrateSessionDraft } from '@/store/composer'
+@@ -100,7 +101,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
+   requestModelOptionsForOwner?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+   onToggleSelectedPin: () => void
+   onDeleteSelectedSession: () => void
+-  onCancel: () => Promise<void> | void
++  onCancel: (origin?: StopOrigin) => Promise<void> | void
+   onAddContextRef: (refText: string, label?: string, detail?: string) => void
+   onAddUrl: (url: string) => void
+   onBranchInNewChat?: (messageId: string) => void
+@@ -202,7 +203,7 @@ function ChatHeader({
+ interface ChatRuntimeBoundaryProps {
+   busy: boolean
+   children: React.ReactNode
+-  onCancel: () => Promise<void> | void
++  onCancel: (origin?: StopOrigin) => Promise<void> | void
+   onEdit: (message: AppendMessage) => Promise<void>
+   onReload: (parentId: string | null) => Promise<void>
+   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
+@@ -453,7 +454,7 @@ export function ChatRuntimeBoundary({
+     // (use-prompt-actions), never the display page, so the edit is correct;
+     // sending one rewinds the live transcript and drops the page.
+     onEdit,
+-    onCancel: isHistorical ? undefined : async () => onCancel(),
++    onCancel: isHistorical ? undefined : async () => onCancel('transcript'),
+     onReload: isHistorical ? undefined : onReload
+   })
+ 
+@@ -615,7 +616,7 @@ const ChatViewContent = memo(function ChatViewContent({
+   const haltRun = useCallback(() => {
+     parkQueuedPrompts(queueSessionKey || activeSessionId)
+ 
+-    return onCancel()
++    return onCancel('transcript')
+   }, [activeSessionId, onCancel, queueSessionKey])
+ 
+   // A tile IS its session — no route involved, never "mismatched".
+diff --git a/apps/desktop/src/app/chat/session-tile-actions.test.ts b/apps/desktop/src/app/chat/session-tile-actions.test.ts
+index 7c4db845f6..c2ceb4efa6 100644
+--- a/apps/desktop/src/app/chat/session-tile-actions.test.ts
++++ b/apps/desktop/src/app/chat/session-tile-actions.test.ts
+@@ -122,6 +122,23 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
+     vi.restoreAllMocks()
+   })
+ 
++  // A tile's Stop names the tile in agent.log; its composer's Esc keeps the gesture (`tile:esc`).
++  it.each([
++    [undefined, 'tile'],
++    ['stop_button', 'tile'],
++    ['esc', 'tile:esc']
++  ] as const)('a tile Stop (gesture %o) sends origin %s', async (gesture, origin) => {
++    requestGatewayMock.mockImplementation(async () => ({}))
++
++    const { result } = renderTileActions()
++
++    await act(async () => {
++      await result.current.cancelRun(gesture)
++    })
++
++    expect(requestGatewayMock).toHaveBeenCalledWith('session.interrupt', { origin, session_id: RUNTIME_SESSION_ID })
++  })
++
+   it('resumes the stored session and retries once when session.interrupt reports "session not found"', async () => {
+     const calls: { method: string; params?: Record<string, unknown> }[] = []
+     let interruptAttempts = 0
+@@ -154,9 +171,9 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
+ 
+     // First interrupt (stale id) → session.resume (stored id) → retry interrupt (fresh id).
+     expect(calls.map(c => c.method)).toEqual(['session.interrupt', 'session.resume', 'session.interrupt'])
+-    expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID })
++    expect(calls[0]?.params).toEqual({ origin: 'tile', session_id: RUNTIME_SESSION_ID })
+     expect(calls[1]?.params).toMatchObject({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
+-    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
++    expect(calls[2]?.params).toEqual({ origin: 'tile', session_id: RECOVERED_SESSION_ID })
+     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
+   })
+ 
+diff --git a/apps/desktop/src/app/chat/session-tile-actions.ts b/apps/desktop/src/app/chat/session-tile-actions.ts
+index 1a55f969ac..b369568d32 100644
+--- a/apps/desktop/src/app/chat/session-tile-actions.ts
++++ b/apps/desktop/src/app/chat/session-tile-actions.ts
+@@ -18,6 +18,7 @@ import { useI18n } from '@/i18n'
+ import { type ChatMessage, textPart } from '@/lib/chat-messages'
+ import { isSlashCommandText } from '@/lib/chat-runtime'
+ import { triggerHaptic } from '@/lib/haptics'
++import { asStopOrigin, interruptParams, type StopOrigin } from '@/lib/stop-origin'
+ import { clearClarifyRequest } from '@/store/clarify'
+ import type { ComposerAttachment } from '@/store/composer'
+ import { resetSessionBackground } from '@/store/composer-status'
+@@ -356,8 +357,10 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
+     [listTileSession, scope.attachments.$attachments, submitPromptText]
+   )
+ 
+-  const cancelRun = useCallback(async () => {
++  // A tile's Stop names the tile; its composer's Esc keeps the gesture too (`tile:esc`).
++  const cancelRun = useCallback(async (gesture?: StopOrigin) => {
+     const sessionId = runtimeIdRef.current
++    const origin: StopOrigin = asStopOrigin(gesture) === 'esc' ? 'tile:esc' : 'tile'
+ 
+     // Frontend busy clears immediately; gateway wind-down can lag (#83855).
+     markSessionRecentlyInterrupted(sessionId)
+@@ -384,7 +387,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
+       await withSessionNotFoundResume(
+         sessionId,
+         storedIdRef.current,
+-        liveId => requestSessionGateway('session.interrupt', { session_id: liveId }),
++        liveId => requestSessionGateway('session.interrupt', interruptParams(liveId, origin)),
+         {
+           requestGateway: requestSessionGateway,
+           onRecovered: bindRecoveredRuntime
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts
+index b3fa07674d..9488191fbb 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.test.ts
+@@ -782,7 +782,7 @@ describe('useSessionTileDelegate interruptSession', () => {
+     renderTile(requestGateway)
+     await sessionTileDelegate()!.interruptSession('runtime-tile-1')
+ 
+-    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { session_id: 'runtime-tile-1' })
++    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { origin: 'tile', session_id: 'runtime-tile-1' })
+     // Same 3s cooldown the primary chat's Stop sets: busy reads false while the
+     // gateway winds down, so the rewind path must still interrupt-first.
+     expect(isSessionRecentlyInterrupted('runtime-tile-1')).toBe(true)
+diff --git a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+index 1a793475da..0ce035f64b 100644
+--- a/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
++++ b/apps/desktop/src/app/contrib/hooks/use-session-tile-delegate.ts
+@@ -16,6 +16,7 @@ import { translateNow } from '@/i18n/runtime'
+ import { type ChatMessage, chatMessageText, toChatMessages } from '@/lib/chat-messages'
+ import { markReasoningEffortPending } from '@/lib/chat-runtime'
+ import { type GuardedModelSwitchResult, surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
++import { interruptParams } from '@/lib/stop-origin'
+ import { noteMessageSent } from '@/store/desktop-metrics'
+ import { notify } from '@/store/notifications'
+ import {
+@@ -357,7 +358,7 @@ export function useSessionTileDelegate({
+ 
+         return true
+       },
+-      interruptSession: async runtimeId => {
++      interruptSession: async (runtimeId, origin = 'tile') => {
+         // Read-only stored-transcript tiles have no live turn to interrupt.
+         if (isReadOnlyRuntimeId(runtimeId)) {
+           return
+@@ -380,7 +381,7 @@ export function useSessionTileDelegate({
+         await withSessionNotFoundResume(
+           runtimeId,
+           storedSessionId,
+-          liveId => routedRequest('session.interrupt', { session_id: liveId }),
++          liveId => routedRequest('session.interrupt', interruptParams(liveId, origin)),
+           {
+             requestGateway: routedRequest,
+             onRecovered: recoveredId => {
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.stop-origin.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.stop-origin.test.tsx
+new file mode 100644
+index 0000000000..605285c480
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.stop-origin.test.tsx
+@@ -0,0 +1,37 @@
++import { cleanup } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { actRender, Harness, type HarnessHandle, RUNTIME_SESSION_ID } from './index-test-utils'
++
++// [daveey] Kept out of index.test.tsx, which is over the file-length cap.
++describe('cancelRun names the Stop gesture', () => {
++  afterEach(cleanup)
++
++  // Stop button and Esc both land on cancelRun; the gesture it is handed must reach the gateway so agent.log
++  // can tell them apart. A MouseEvent (cancelRun wired straight to onClick) or no argument sends no origin.
++  it.each([
++    ['stop_button', { origin: 'stop_button', session_id: RUNTIME_SESSION_ID }],
++    ['esc', { origin: 'esc', session_id: RUNTIME_SESSION_ID }],
++    [undefined, { session_id: RUNTIME_SESSION_ID }],
++    [{ type: 'click' }, { session_id: RUNTIME_SESSION_ID }]
++  ])('origin %o', async (origin, params) => {
++    const requestGateway = vi.fn(
++      async (method: string, p?: Record<string, unknown>) =>
++        (method === 'prompt.submit' ? { admission_id: p?.submission_id, status: 'started' } : {}) as never
++    )
++
++    let handle: HarnessHandle | null = null
++    await actRender(
++      <Harness
++        onReady={h => (handle = h)}
++        rawAdmissionReceipts
++        refreshSessions={async () => undefined}
++        requestGateway={requestGateway}
++      />
++    )
++    await handle!.submitText('first turn')
++    await (handle!.cancelRun as (o?: unknown) => Promise<void>)(origin)
++
++    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', params)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+index 17716d549e..ff94e62397 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+@@ -530,7 +530,7 @@ describe('usePromptActions /stop', () => {
+     await handle!.submitText('/stop', { sessionId: 'rt-target-session' })
+ 
+     expect(calls).toEqual([
+-      { method: 'session.interrupt', params: { session_id: 'rt-target-session' } },
++      { method: 'session.interrupt', params: { origin: 'slash', session_id: 'rt-target-session' } },
+       { method: 'process.stop', params: { session_id: 'rt-target-session' } }
+     ])
+     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+@@ -557,7 +557,7 @@ describe('usePromptActions /stop', () => {
+ 
+     await handle!.submitText('/stop')
+ 
+-    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { session_id: RUNTIME_SESSION_ID })
++    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { origin: 'slash', session_id: RUNTIME_SESSION_ID })
+     expect(requestGateway).toHaveBeenCalledWith('process.stop', { session_id: RUNTIME_SESSION_ID })
+   })
+ })
+@@ -3276,7 +3276,7 @@ describe('usePromptActions restoreToMessage', () => {
+ 
+     await handle!.restoreToMessage('u1')
+ 
+-    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { session_id: RUNTIME_SESSION_ID })
++    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { origin: 'rewind', session_id: RUNTIME_SESSION_ID })
+     expect(submitAttempts).toBe(2)
+     expect(requestGateway).toHaveBeenCalledWith(
+       'prompt.submit',
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
+index 7b223e2cf5..a1c6edfb99 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
+@@ -12,6 +12,7 @@ import { isSlashCommandText, pathLabel } from '@/lib/chat-runtime'
+ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+ import { triggerHaptic } from '@/lib/haptics'
+ import { setMutableRef } from '@/lib/mutable-ref'
++import { interruptParams, type StopOrigin } from '@/lib/stop-origin'
+ import { normalize } from '@/lib/text'
+ import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
+ import { clearClarifyRequest } from '@/store/clarify'
+@@ -750,7 +751,7 @@ export function usePromptActions({
+     [copy.sttDisabled, sttEnabled]
+   )
+ 
+-  const cancelRun = useCallback(async () => {
++  const cancelRun = useCallback(async (origin?: StopOrigin) => {
+     // Read from the ref, not the closure-captured `activeSessionId`. The
+     // actions bag is a stable ref mutated in place (Object.assign on each
+     // ContribWiring render), and ChatRoutesSurface is memoized on that stable
+@@ -825,7 +826,7 @@ export function usePromptActions({
+       await withSessionNotFoundResume(
+         sessionId,
+         selectedStoredSessionIdRef.current,
+-        liveId => requestGateway('session.interrupt', { session_id: liveId }),
++        liveId => requestGateway('session.interrupt', interruptParams(liveId, origin)),
+         {
+           requestGateway,
+           onRecovered: recoveredId => {
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/rewind.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/rewind.ts
+index b5761de12c..1b8e4ff8d2 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/rewind.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/rewind.ts
+@@ -23,6 +23,7 @@ import {
+   hasUnresolvedToolCall,
+   textPart
+ } from '@/lib/chat-messages'
++import { interruptParams } from '@/lib/stop-origin'
+ import type { ConfirmRequest } from '@/store/confirm'
+ 
+ import {
+@@ -338,7 +339,7 @@ export async function runRewindSubmit(
+ 
+   const interrupt = async () => {
+     try {
+-      await requestGateway('session.interrupt', { session_id: liveSessionId })
++      await requestGateway('session.interrupt', interruptParams(liveSessionId, 'rewind'))
+     } catch {
+       // Best-effort. The submit path still gates on the gateway state.
+     }
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts
+index 5bb14c63cc..33ebe2ff89 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts
+@@ -23,6 +23,7 @@ import {
+ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+ import { type GuardedModelSwitchResult, surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
+ import { applyReasoningSlashResult, reasoningSlashParams } from '@/lib/reasoning-slash'
++import { interruptParams } from '@/lib/stop-origin'
+ import { setSessionYolo } from '@/lib/yolo-session'
+ import { openCommandPalettePage } from '@/store/command-palette'
+ import { markCompressDeferred } from '@/store/compaction'
+@@ -674,7 +675,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
+             ;({ sessionId: stopSessionId } = await withSessionNotFoundResume(
+               initialSessionId,
+               storedSessionId,
+-              liveId => requestGateway('session.interrupt', { session_id: liveId }),
++              liveId => requestGateway('session.interrupt', interruptParams(liveId, 'slash')),
+               {
+                 requestGateway,
+                 onRecovered: recoveredId => {
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+index 715bdd8d6c..ff1076dd65 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions.test.tsx
+@@ -568,10 +568,10 @@ describe('connection-qualified session deletion', () => {
+       await actions?.removeSession('background-session')
+     })
+ 
+-    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { session_id: 'runtime-bg' })
++    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { origin: 'delete', session_id: 'runtime-bg' })
+     expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-bg' })
+     // The selected session's runtime must not be touched by another row's delete.
+-    expect(requestGateway).not.toHaveBeenCalledWith('session.interrupt', { session_id: 'runtime-foreground' })
++    expect(requestGateway).not.toHaveBeenCalledWith('session.interrupt', expect.objectContaining({ session_id: 'runtime-foreground' }))
+     expect(requestGateway).not.toHaveBeenCalledWith('session.close', { session_id: 'runtime-foreground' })
+     // Marked interrupted BEFORE the RPCs so a queued blocking-input frame is
+     // declined instead of parked.
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index fec7dfa9e0..4dc6c5cbc0 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -32,6 +32,7 @@ import { markReasoningEffortPending } from '@/lib/chat-runtime'
+ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+ import { purgeInFlightTurnJournals, recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+ import { markOpenPaint, markOpenReconciled, markOpenStage, markOpenStart } from '@/lib/open-timing'
++import { interruptParams } from '@/lib/stop-origin'
+ import { latestSessionTodoSnapshot } from '@/lib/todos'
+ import { setSessionYolo } from '@/lib/yolo-session'
+ import { asleepOpenFor, clearAsleepOpen } from '@/store/asleep-session'
+@@ -3320,9 +3321,8 @@ export function useSessionActions({
+           })
+ 
+           try {
+-            await requestForSessionProfile(removedOwner, requestGateway, 'session.interrupt', {
+-              session_id: closingRuntimeId
+-            })
++            const stop = interruptParams(closingRuntimeId, 'delete')
++            await requestForSessionProfile(removedOwner, requestGateway, 'session.interrupt', stop)
+           } catch (error) {
+             // A missing runtime has no turn left to stop. Any other failure means
+             // deletion cannot safely continue: restore the live state and let the
+diff --git a/apps/desktop/src/lib/stop-origin.ts b/apps/desktop/src/lib/stop-origin.ts
+new file mode 100644
+index 0000000000..5b21bb25ff
+--- /dev/null
++++ b/apps/desktop/src/lib/stop-origin.ts
+@@ -0,0 +1,38 @@
++/**
++ * [daveey] The gesture that sent a Stop. Rides `session.interrupt` as `origin`; the gateway logs it on the
++ * `session.interrupt:` line and keeps it in the turn's `turn_stopped` notice metadata, so "why did this
++ * stop?" has an answer in agent.log. Without it every Stop door sent an identical RPC.
++ *
++ * - `stop_button`: the composer's Stop button
++ * - `esc`: Esc in the chat (composer Esc-to-cancel)
++ * - `tile`: a split tile's Stop (button or Esc; `tile:esc` when the tile composer's Esc sent it)
++ * - `slash`: the `/stop` command
++ * - `delete`: deleting a chat whose turn is running
++ * - `send_now`: send-now on a queued prompt while busy (interrupts to reach the queue)
++ * - `transcript`: the streaming message's own stop (assistant runtime cancel)
++ * - `rewind`: edit / reload / restore interrupting the live turn first
++ * - `plugin:<id>`: a desktop plugin
++ *
++ * The gateway accepts any value (unknown ones are kept, made log-safe), so adding one needs no backend change.
++ */
++export type StopOrigin =
++  | 'delete'
++  | 'esc'
++  | 'rewind'
++  | 'send_now'
++  | 'slash'
++  | 'stop_button'
++  | 'tile'
++  | 'tile:esc'
++  | 'transcript'
++  | `plugin:${string}`
++
++/** `session.interrupt` params carrying the gesture. `origin` is typed `unknown` because cancel handlers are
++ *  also wired straight to `onClick`, which passes a MouseEvent: anything but a non-empty string is dropped. */
++export function interruptParams(sessionId: string, origin?: unknown): { origin?: string; session_id: string } {
++  return typeof origin === 'string' && origin.trim() ? { origin, session_id: sessionId } : { session_id: sessionId }
++}
++
++export function asStopOrigin(origin: unknown): StopOrigin | undefined {
++  return typeof origin === 'string' && origin.trim() ? (origin as StopOrigin) : undefined
++}
+diff --git a/apps/desktop/src/plugins/hermes-bots/group-rounds.test.ts b/apps/desktop/src/plugins/hermes-bots/group-rounds.test.ts
+index e06470e5e3..62fcdf348a 100644
+--- a/apps/desktop/src/plugins/hermes-bots/group-rounds.test.ts
++++ b/apps/desktop/src/plugins/hermes-bots/group-rounds.test.ts
+@@ -1531,6 +1531,7 @@ describe('stopGroupThread (#91868/#94569)', () => {
+     // Exactly one — the serial loop has one member in flight.
+     expect(interrupts).toHaveLength(1)
+     expect(interrupts[0].params.session_id).toBe('live-alpha-sid')
++    expect(interrupts[0].params.origin).toBe('plugin:hermes-bots')
+   })
+ 
+   it('stops a room with nobody on turn without any interrupt RPC', async () => {
+diff --git a/apps/desktop/src/plugins/hermes-bots/group-rounds.ts b/apps/desktop/src/plugins/hermes-bots/group-rounds.ts
+index c14a558ea2..4db36e141f 100644
+--- a/apps/desktop/src/plugins/hermes-bots/group-rounds.ts
++++ b/apps/desktop/src/plugins/hermes-bots/group-rounds.ts
+@@ -603,7 +603,9 @@ export async function stopGroupThread(group: string, thread: null | string, memb
+ 
+   if (onTurn && sessionId) {
+     try {
++      // `origin` names this Stop in the gateway log (desktop lib/stop-origin.ts).
+       await requestForBot(onTurn, 'session.interrupt', {
++        origin: 'plugin:hermes-bots',
+         session_id: sessionId
+       })
+     } catch {
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index a2a656335b..325bfd7df8 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -37,6 +37,7 @@ import { dropBrowserProfilePrefs, migrateBrowserProfilePrefs } from '@/lib/brows
+ import { finalizeInterruptedMessages, sealOpenToolParts } from '@/lib/chat-messages'
+ import { tileFocusStampOnFocusChange } from '@/lib/session-timer-since'
+ import { stableArray } from '@/lib/stable-array'
++import { type StopOrigin } from '@/lib/stop-origin'
+ import { readJson, writeJson } from '@/lib/storage'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+@@ -2237,8 +2238,7 @@ export interface SessionTileDelegate {
+   deleteSession(storedSessionId: string): Promise<void>
+   /** Run a slash command against a tile's session (app-level effects, e.g. branch/handoff, act on the main surface). */
+   executeSlash(rawCommand: string, sessionId: string, options?: { typed?: boolean }): Promise<void>
+-  /** Interrupt a tile's running turn. */
+-  interruptSession(runtimeId: string): Promise<void>
++  interruptSession(runtimeId: string, origin?: StopOrigin): Promise<void> // origin: the Stop gesture (default `tile`)
+   switchSessionModel?(runtimeId: string, model: string, provider: string): Promise<boolean>
+   /** Drop the wiring cache's stored→runtime bindings. Called on gateway
+    *  reconnect: a respawned backend re-mints runtime ids, so every binding
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index 30c209fc7e..b540136ff4 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -3670,6 +3670,7 @@ export interface SessionInterruptParams {
+   session_id: string
+   profile?: string | null
+   expected_hosted_task_id?: string | null
++  origin?: string | null
+ }
+ export interface SessionInterruptResult {
+   status: InterruptStatus
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index ff77c9bda6..5badea8ab2 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -38177,6 +38177,18 @@
+             ],
+             "default": null,
+             "title": "Expected Hosted Task Id"
++          },
++          "origin": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Origin"
+           }
+         },
+         "required": [
+diff --git a/tests/tui_gateway/test_stop_notice.py b/tests/tui_gateway/test_stop_notice.py
+index 980e6a8a76..cb14c140da 100644
+--- a/tests/tui_gateway/test_stop_notice.py
++++ b/tests/tui_gateway/test_stop_notice.py
+@@ -202,3 +202,121 @@ def test_turn_that_completes_adds_no_notice(sid, emitted):
+ 
+     assert not [h for h in session["history"] if h.get("display_kind") == "turn_stopped"]
+     assert fake.rows == []
++
++
++# ── SSH-attached Desktop identity + the stop gesture (origin) ─────────────────────────────────────
++# A Desktop attached over SSH logs in with a per-connection ownership id (provider ``desktop-ssh``), so
++# the notice read "Stopped by 5caca28140205b2b8f1f5cabb2aaf8ba". And every Stop gesture sent the same
++# RPC, so "why did this stop?" had no answer in agent.log.
++
++SSH_DESKTOP = {"user_id": "5caca28140205b2b8f1f5cabb2aaf8ba", "provider": "desktop-ssh"}
++
++
++def interrupt_with(sid: str, transport, **extra) -> dict:
++    token = bind_transport(transport)
++    try:
++        return server._methods["session.interrupt"](1, {"session_id": sid, **extra})
++    finally:
++        reset_transport(token)
++
++
++def test_stop_from_an_ssh_attached_desktop_reads_desktop(sid, db, caplog):
++    fake, agent = db
++    session = record(sid, running=True, agent=agent)
++    caplog.set_level("INFO")
++
++    interrupt_as(sid, _transport(SSH_DESKTOP))
++    entry = server._record_stop_notice(session, "interrupted")
++
++    assert entry["display_metadata"]["display_text"] == "Stopped by Desktop"
++    assert fake.rows[0]["display_metadata"]["display_text"] == "Stopped by Desktop"
++    assert SSH_DESKTOP["user_id"] not in entry["content"]
++    assert any("by=Desktop" in r.getMessage() and sid in r.getMessage() for r in caplog.records)
++
++
++def test_ssh_desktop_turn_end_to_end_reads_desktop(sid, emitted):
++    session, _fake = _run_turn(sid, SSH_DESKTOP, stop=True)
++
++    notices = [h for h in session["history"] if h.get("display_kind") == "turn_stopped"]
++    assert [n["display_metadata"]["display_text"] for n in notices] == ["Stopped by Desktop"]
++
++
++@pytest.mark.parametrize("origin", ["stop_button", "esc", "tile", "slash", "delete", "plugin:hermes-bots"])
++def test_each_stop_origin_is_logged_and_kept_in_the_notice(sid, db, caplog, origin):
++    fake, agent = db
++    session = record(sid, running=True, agent=agent)
++    caplog.set_level("INFO")
++
++    response = interrupt_with(sid, _transport(SSH_DESKTOP), origin=origin)
++    entry = server._record_stop_notice(session, "interrupted")
++
++    assert response.get("result", {}).get("status") == "interrupted", response
++    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("session.interrupt: ")]
++    assert any(sid in line and "by=Desktop" in line and line.endswith(f"origin={origin}") for line in lines), lines
++    assert entry["display_metadata"] == {"display_text": "Stopped by Desktop", "stopped_by": "Desktop",
++                                         "stop_origin": origin}
++    assert fake.rows[0]["display_metadata"]["stop_origin"] == origin
++    assert "_stop_origin" not in session
++
++
++def test_absent_origin_logs_a_dash_and_adds_no_metadata_key(sid, db, caplog):
++    _fake, agent = db
++    session = record(sid, running=True, agent=agent)
++    caplog.set_level("INFO")
++
++    interrupt_as(sid, _transport({"user_id": "redde", "provider": "basic"}))
++    entry = server._record_stop_notice(session, "interrupted")
++
++    assert any(sid in r.getMessage() and r.getMessage().endswith("origin=-") for r in caplog.records)
++    assert "stop_origin" not in entry["display_metadata"]
++
++
++@pytest.mark.parametrize("raw, kept", [("some new gesture!\n", "some_new_gesture_"), (42, None), ("", None),
++                                       ("x" * 200, "x" * 64)])
++def test_unknown_or_odd_origin_is_accepted_and_made_log_safe(sid, db, caplog, raw, kept):
++    _fake, agent = db
++    session = record(sid, running=True, agent=agent)
++    caplog.set_level("INFO")
++
++    response = interrupt_with(sid, _transport(None), origin=raw)
++    entry = server._record_stop_notice(session, "interrupted")
++
++    assert response.get("result", {}).get("status") == "interrupted", response
++    assert entry["display_metadata"].get("stop_origin") == kept
++    assert any(r.getMessage().endswith(f"origin={kept or '-'}") for r in caplog.records)
++
++
++def test_origin_of_an_earlier_stop_never_labels_a_later_one(sid, db):
++    """A later turn's Stop without an origin must not inherit the earlier turn's gesture."""
++    _fake, agent = db
++    session = record(sid, running=True, agent=agent)
++
++    interrupt_with(sid, _transport(None), origin="esc")
++    first = server._record_stop_notice(session, "interrupted")
++    session["running"] = True  # the next turn
++    interrupt_as(sid, _transport(None))
++    second = server._record_stop_notice(session, "interrupted")
++
++    assert first["display_metadata"]["stop_origin"] == "esc"
++    assert "stop_origin" not in second["display_metadata"]
++
++
++def test_a_repeat_stop_on_an_already_stopped_turn_keeps_the_gesture_that_stopped_it(sid, db):
++    """Interrupt clears ``running``; a second Stop on the same turn changes neither who nor how."""
++    _fake, agent = db
++    session = record(sid, running=True, agent=agent)
++
++    interrupt_with(sid, _transport(SSH_DESKTOP), origin="esc")
++    interrupt_with(sid, _transport({"user_id": "redde", "provider": "basic"}), origin="stop_button")
++    entry = server._record_stop_notice(session, "interrupted")
++
++    assert entry["display_metadata"] == {"display_text": "Stopped by Desktop", "stopped_by": "Desktop",
++                                         "stop_origin": "esc"}
++
++
++def test_contract_accepts_origin_on_session_interrupt():
++    """The wire contract refuses unknown keys (4000); ``origin`` must be a declared one."""
++    from tui_gateway.contracts.registry import METHODS, validate_params
++
++    params, problem = validate_params(METHODS["session.interrupt"], {"session_id": "s", "origin": "esc"})
++    assert problem is None and params is not None
+diff --git a/tui_gateway/contracts/sessions.py b/tui_gateway/contracts/sessions.py
+index 3af6382149..134ec7023f 100644
+--- a/tui_gateway/contracts/sessions.py
++++ b/tui_gateway/contracts/sessions.py
+@@ -665,6 +665,9 @@ method("session.compress", params=SessionCompressParams, result=SessionCompressR
+ 
+ class SessionInterruptParams(SessionParams):
+     expected_hosted_task_id: str | None = None  # only interrupt if this hosted task is the running one
++    # [daveey] the client gesture that sent the Stop (stop_button, esc, tile, slash, delete, plugin:<id>); logged
++    # and kept in the turn_stopped notice. Free-form: an unknown value is accepted.
++    origin: str | None = None
+ 
+ 
+ class InterruptStatus(WireEnum):
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index 5d4c4a52ea..716d9bc953 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -6,6 +6,8 @@ bodies close over server.py globals through ``method_ctx.bind_module`` exactly a
+ from the parent's ``register()`` via ``HandlerRegistry``.
+ """
+ 
++import re
++
+ from .method_ctx import HandlerRegistry, bind_module
+ 
+ _registry = HandlerRegistry()
+@@ -46,18 +48,42 @@ def _stop_issuer_label(transport) -> str:
+     identity = getattr(transport, "auth_identity", None)
+     if not is_authenticated_identity(identity):
+         return "Desktop"
++    # An SSH-attached Desktop logs in with its per-connection ownership id (a 32-hex ``desktop-ssh`` subject,
++    # one per ``~/.hermes/desktop-ssh/<id>``): that is a credential, not a person, so name the client.
++    if str((identity or {}).get("provider") or "").strip() == _SSH_DESKTOP_PROVIDER:
++        return "Desktop"
+     return str((identity or {}).get("user_id")).strip()
+ 
+ 
+-def _note_stop_issuer(sid: str, session: dict, transport) -> None:
+-    """Remember who stopped the running turn and log it; an idle session queues nothing."""
++# The client gesture that sent a Stop (``stop_button``, ``esc``, ``tile``, ``slash``, ``delete``,
++# ``plugin:<id>``). Optional and open-ended: an unknown value is kept (made log-safe), a missing one logs ``-``.
++_SSH_DESKTOP_PROVIDER = "desktop-ssh"
++_STOP_ORIGIN_MAX = 64
++_STOP_ORIGIN_UNSAFE = re.compile(r"[^A-Za-z0-9_.:-]")
++
++
++def _stop_origin(params: dict) -> str | None:
++    raw = params.get("origin")
++    if not isinstance(raw, str) or not raw.strip():
++        return None
++    return _STOP_ORIGIN_UNSAFE.sub("_", raw.strip())[:_STOP_ORIGIN_MAX] or None
++
++
++def _note_stop_issuer(sid: str, session: dict, transport, origin: str | None = None) -> None:
++    """Remember who stopped the running turn (and with which gesture) and log it; an idle session queues
++    nothing. A Stop without an origin clears an earlier one, so a gesture never labels a later Stop."""
+     label = _stop_issuer_label(transport)
+     with session["history_lock"]:
+         running = bool(session.get("running"))
+         if running:
+             session["_stop_issuer"] = label
+-    logger.info("session.interrupt: ui_session=%s session_key=%s by=%s peer=%s running=%s", sid,
+-                session.get("session_key") or "", label, getattr(transport, "_peer", "-"), running)
++            if origin:
++                session["_stop_origin"] = origin
++            else:
++                session.pop("_stop_origin", None)
++    logger.info("session.interrupt: ui_session=%s session_key=%s by=%s peer=%s running=%s origin=%s", sid,
++                session.get("session_key") or "", label, getattr(transport, "_peer", "-"), running,
++                origin or "-")
+ 
+ 
+ def _record_stop_notice(session: dict, status: str) -> dict | None:
+@@ -65,11 +91,14 @@ def _record_stop_notice(session: dict, status: str) -> dict | None:
+     consumes the recorded issuer so a Stop that raced a finishing turn never labels a later one."""
+     with session["history_lock"]:
+         label = session.pop("_stop_issuer", None)
++        origin = session.pop("_stop_origin", None)
+     if not label or status != "interrupted":
+         return None
+     text = f"Stopped by {label}"
+     content = f"[Turn stopped by {label} before it finished.]"
+     metadata = {"display_text": text, "stopped_by": label}
++    if origin:
++        metadata["stop_origin"] = origin
+     entry: dict = {"role": "user", "content": content, "display_kind": _STOP_NOTICE_KIND,
+                    "display_metadata": metadata}
+     with session["history_lock"]:
+@@ -148,7 +177,7 @@ def _(rid, params: dict) -> dict:
+                     return _ok(rid, {"status": "not_interrupted", "interrupted": False})
+         sid = str(params.get("session_id") or "")
+         _note_user_input(session)
+-        _note_stop_issuer(sid, session, current_transport())
++        _note_stop_issuer(sid, session, current_transport(), _stop_origin(params))
+         if _session_uses_compute_host(session):
+             with session["history_lock"]:
+                 inflight_at_interrupt = session.get("inflight_turn")
+-- 
+2.54.0 (Apple Git-157)
+

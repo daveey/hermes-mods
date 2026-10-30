@@ -1,6 +1,7 @@
 # "Stopped by <login>": a client Stop names who stopped the turn
 
-Patch: `patches/0126-feat-tui-name-who-stopped-a-turn-and-leave-a-visible.patch`.
+Patches: `patches/0126-feat-tui-name-who-stopped-a-turn-and-leave-a-visible.patch`; 1323 (SSH-attached Desktop reads
+"Desktop"; every Stop names its gesture).
 
 What you see: when a running turn is stopped from a client, the chat ends with a system line such as
 "Stopped by alice" (a remote client logged in as `alice`, for example a phone app) or "turn stopped" (the local
@@ -11,11 +12,22 @@ just went quiet and looked stuck. The gateway log also names who sent each Stop.
 
 - `session.interrupt` on a session with a live turn records the issuer: the transport's login with the provider
   prefix dropped (`basic:alice` → `alice`), or `Desktop` for the local credential (no login).
+- A Desktop attached over SSH logs in with its per-connection ownership id (provider `desktop-ssh`, a 32-hex id
+  matching `~/.hermes/desktop-ssh/<id>`). That is a credential, not a person, so its Stop reads "Stopped by Desktop"
+  (before patch 1323 it read "Stopped by 5caca281…"). Real logins still show the login.
+- `session.interrupt` takes an optional free-form `origin`: the client gesture that sent the Stop. Desktop sends
+  `stop_button` (composer Stop button), `esc` (Esc in the chat), `tile` / `tile:esc` (a split tile's Stop or Esc),
+  `slash` (`/stop`), `delete` (deleting a chat mid-turn), `send_now` (send-now on a queued prompt while busy),
+  `transcript` (the assistant runtime's own cancel), `rewind` (edit/reload/restore interrupting first) and
+  `plugin:hermes-bots` (group-chat stop). An unknown value is accepted and made log-safe (`[^A-Za-z0-9_.:-]` → `_`,
+  capped at 64 chars); a missing or non-string one is fine.
 - Every `session.interrupt` logs one INFO line: `session.interrupt: ui_session=<sid> session_key=<key> by=<label>
-  peer=<address> running=<bool>`.
+  peer=<address> running=<bool> origin=<origin or ->`.
 - When that turn then ends with status `interrupted`, the gateway appends and persists a notice row: role `user`,
   `display_kind` `turn_stopped`, content `[Turn stopped by <label> before it finished.]`, metadata
-  `{display_text: "Stopped by <label>", stopped_by: <label>}`.
+  `{display_text: "Stopped by <label>", stopped_by: <label>}`, plus `stop_origin: <origin>` when the Stop carried one.
+  A later turn's Stop never inherits an earlier gesture; a repeat Stop on an already-stopped turn changes neither
+  the label nor the origin (the interrupt cleared `running`).
 - Desktop renders `turn_stopped` rows as a system line with `display_text`; a row without it shows "turn stopped".
 - No notice when: the session was idle at Stop time (nothing queued for a later turn); the turn completed anyway
   (a Stop that raced the end); or the turn was interrupted by the system (reapers, lease loss, shutdown), since only a
@@ -24,9 +36,22 @@ just went quiet and looked stuck. The gateway log also names who sent each Stop.
 
 ## How it works
 
-- `tui_gateway/methods_session_interrupt.py`: `_stop_issuer_label(transport)` uses `_transport_auth_user_id`.
-  `_note_stop_issuer(sid, session, transport)`, called from the `session.interrupt` handler, sets
-  `session["_stop_issuer"]` under `history_lock` only when `session["running"]`, and logs the line.
+- `tui_gateway/methods_session_interrupt.py`: `_stop_issuer_label(transport)` reads the transport's own
+  `auth_identity`: no login → `Desktop`; provider `desktop-ssh` → `Desktop`; else the `user_id`.
+  `_stop_origin(params)` sanitizes `origin`. `_note_stop_issuer(sid, session, transport, origin)`, called from the
+  `session.interrupt` handler, sets `session["_stop_issuer"]` and `session["_stop_origin"]` (or pops it) under
+  `history_lock` only when `session["running"]`, and logs the line.
+- `tui_gateway/contracts/sessions.py`: `SessionInterruptParams.origin: str | None` (the contract is
+  `extra="forbid"`, so without it an `origin` answers 4000); the generated `apps/shared/src/gateway-contract.*`
+  carry it.
+- Desktop: `apps/desktop/src/lib/stop-origin.ts` (`StopOrigin`, `interruptParams(sessionId, origin)`, which drops a
+  non-string such as a MouseEvent when a cancel handler is wired to `onClick`). Call sites: `cancelRun(origin)` in
+  `use-prompt-actions/index.ts` (fed `stop_button` by `use-composer-submit.ts`, `esc` by `use-composer-esc-cancel.ts`,
+  `send_now` by `use-composer-queue.ts`, `transcript` by `app/chat/index.tsx`), `session-tile-actions.ts`
+  (`tile`/`tile:esc`), `use-session-tile-delegate.ts` (`interruptSession(id, origin='tile')`), `slash.ts` (`slash`),
+  `use-session-actions/index.ts` (`delete`), `rewind.ts` (`rewind`), `plugins/hermes-bots/group-rounds.ts`.
+  `api/canonical-protocol.ts` strips `origin` from the canonical `session.interrupt` (that control contract forbids
+  unknown keys).
   `_record_stop_notice(session, status)` pops the issuer; for `interrupted` it appends the entry to the in-memory
   history (bumping `history_version`) and persists it through the agent's `_session_db` (or the session's own DB
   handle) with `append_message(..., display_kind="turn_stopped", message_uid=...)`, marking it DB-persisted so later
@@ -60,6 +85,27 @@ Python, `tests/tui_gateway/test_stop_notice.py` (8 cases, all pass Oct 17, 2026 
   `_run_prompt_submit` turn (threads inlined, agent faked) stopped mid-run by a logged-in client ends `interrupted`
   with exactly one persisted notice; a completed turn adds none.
 
+Added with patch 1323 (SSH Desktop label + Stop gesture), same file, all pass Oct 30, 2026 PT (existing cases
+unedited):
+
+- `test_stop_from_an_ssh_attached_desktop_reads_desktop` and `test_ssh_desktop_turn_end_to_end_reads_desktop`: a
+  `desktop-ssh` identity yields "Stopped by Desktop", the hex id appears nowhere, the log says `by=Desktop`.
+- `test_each_stop_origin_is_logged_and_kept_in_the_notice` (stop_button, esc, tile, slash, delete,
+  plugin:hermes-bots): the log line ends `origin=<x>` and `display_metadata.stop_origin` is `<x>`, in memory and in
+  the DB row.
+- `test_absent_origin_logs_a_dash_and_adds_no_metadata_key`, `test_unknown_or_odd_origin_is_accepted_and_made_log_safe`,
+  `test_origin_of_an_earlier_stop_never_labels_a_later_one`,
+  `test_a_repeat_stop_on_an_already_stopped_turn_keeps_the_gesture_that_stopped_it`,
+  `test_contract_accepts_origin_on_session_interrupt`.
+
+Desktop vitest, one per call site (all pass): `use-composer-submit.test.tsx` (Stop button → `stop_button`),
+`use-composer-esc-cancel.test.tsx` (`esc`), `use-composer-queue.test.tsx` (`send_now`), `use-prompt-actions/index.test.tsx`
+("cancelRun names the Stop gesture": stop_button/esc forwarded, none or a click event sends none; `/stop` → `slash`;
+rewind → `rewind`), `session-tile-actions.test.ts` (`tile`, `tile:esc`), `use-session-tile-delegate.test.ts` (`tile`),
+`use-session-actions.test.tsx` (delete → `delete`), `group-rounds.test.ts` (`plugin:hermes-bots`),
+`canonical-protocol.test.ts` (stripped on the canonical wire). Untested: the `transcript` origin (assistant runtime
+cancel in `app/chat/index.tsx`).
+
 Desktop, `apps/desktop/src/lib/chat-messages.test.ts` "renders a client Stop notice as a system line naming who
 stopped the turn" (passes): hydrated `turn_stopped` rows become system messages showing `display_text`, or "turn
 stopped" without it.
@@ -79,7 +125,9 @@ merge-base `4957bbd0a0` (Oct 17, 2026 PT).
 
 - The notice is a `user`-role row (like other notice kinds such as `model_switch`), so it is part of the stored
   history the next turn loads.
-- The label is the login, not a device name. Two devices on the same login read the same.
+- The label is the login, not a device name. Two devices on the same login read the same. To tell which door
+  stopped a turn, read `origin=` on the `session.interrupt:` line in agent.log (or `stop_origin` on the notice row).
+- The canonical session protocol drops `origin`; a Stop over it logs nothing gesture-specific.
 - A local Stop with no login says "Desktop" even if it came from another local client.
 
 ## Plugin?

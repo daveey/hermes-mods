@@ -1,0 +1,440 @@
+From ead069dd57ddcb9001f53163068dc7fa90623baa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 17:12:56 +0000
+Subject: [PATCH] fix(cron): defer due jobs under the core-update drain hold;
+ cut cron runs in an update restart past hermes-sync's cron bound [daveey]
+
+hermes-hub 2026-10-30 16:19-16:53 UTC: cron runs that started while hermes-sync's drain held new
+kanban claims kept the drain busy; the update applied after 34.1 min against a 30 min target
+(t_01a18dbde9f8b2f0).
+
+- cron tick honours <home>/core-update/drain-hold (the signal the kanban dispatcher reads): due
+  jobs stay due, each is named once per hold, recurring jobs catch up once after the hold and
+  one-shots are covered by the planned pause. A dead drainer's hold does not count.
+- restart wait: an update intent marked "cron_cut": true puts awaitable cron runs under the
+  15 s core-update cap, logging each cut run (job id, start time). A chat turn keeps its wait.
+---
+ cron/scheduler_tick.py                     |  56 +++++++++
+ gateway/run_shutdown_restart_wait.py       |  44 ++++++-
+ tests/cron/test_drain_hold_defers_tick.py  | 139 +++++++++++++++++++++
+ tests/gateway/test_core_update_cron_cut.py |  98 +++++++++++++++
+ 4 files changed, 333 insertions(+), 4 deletions(-)
+ create mode 100644 tests/cron/test_drain_hold_defers_tick.py
+ create mode 100644 tests/gateway/test_core_update_cron_cut.py
+
+diff --git a/cron/scheduler_tick.py b/cron/scheduler_tick.py
+index 7977f1c1dd..689da867fd 100644
+--- a/cron/scheduler_tick.py
++++ b/cron/scheduler_tick.py
+@@ -4,6 +4,7 @@ import concurrent.futures
+ import contextlib
+ import logging
+ import time
++from datetime import datetime
+ 
+ from cron import store_health
+ from cron.constants import is_recurring
+@@ -39,6 +40,10 @@ def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None
+     with retirement.work() as admitted:
+         if not admitted:
+             return 0
++        if drain_held():
++            from cron.planned_pause import begin
++            begin()
++            return 0  # as under the admission hold: due jobs stay due and run once after the drain
+         with update_admission() as update_admitted:
+             if not update_admitted:
+                 from cron.planned_pause import begin
+@@ -48,6 +53,57 @@ def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None
+                                   headless=headless)
+ 
+ 
++_drain_deferred_logged: set = set()
++
++
++def drain_held() -> bool:
++    """True while hermes-sync's core-update drain holds new kanban claims (``<home>/core-update/drain-hold``,
++    the signal the kanban dispatcher reads). [daveey]
++
++    A cron run that starts mid-drain keeps the drain busy: hermes-hub 2026-10-30 16:19-16:53 UTC, four runs
++    started during the drain and the update landed after 34.1 min against a 30 min target
++    (t_01a18dbde9f8b2f0). While the hold stands the tick dispatches nothing and names each due job once;
++    recurring jobs keep their slot (catch-up runs them once after the hold, however many slots passed) and
++    one-shots are covered by the planned pause. A hold whose writer died does not count, and a read error
++    fails open: cron must not stop because the hold file is unreadable.
++    """
++    try:
++        from agent.core_update_drain import check_drain_hold
++        held = check_drain_hold("cron", logger)
++    except Exception as exc:  # fail open
++        logger.debug("Cron drain-hold check failed (%s); dispatching", exc, exc_info=True)
++        return False
++    if not held:
++        if _drain_deferred_logged:
++            logger.info("cron dispatch resumed: core update drain hold released; deferred jobs run now: %s",
++                        ", ".join(sorted(_drain_deferred_logged)))
++            _drain_deferred_logged.clear()
++        return False
++    _log_drain_deferred_jobs()
++    return True
++
++
++def _log_drain_deferred_jobs() -> None:
++    """Name each job that is due while the drain hold stands, once per hold. Read-only (no advance, no claim)."""
++    try:
++        from cron import jobs as _jobs
++        now = _jobs._hermes_now()
++        for job in _jobs.load_jobs():
++            job_id = job.get("id")
++            if not job_id or job_id in _drain_deferred_logged or not job.get("enabled", True):
++                continue
++            if _jobs._has_pause_marker(job) or not job.get("next_run_at"):
++                continue
++            due = _jobs._ensure_aware(datetime.fromisoformat(job["next_run_at"]))
++            if due > now:
++                continue
++            _drain_deferred_logged.add(job_id)
++            logger.info("cron job %s (%s) due at %s deferred by the core-update drain hold; it runs once after "
++                        "the hold", job_id, job.get("name") or "?", job["next_run_at"])
++    except Exception as exc:  # naming is diagnostics only
++        logger.debug("Could not list cron jobs deferred by the drain hold: %s", exc, exc_info=True)
++
++
+ _update_hold_logged: set = set()
+ 
+ 
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index 8963b11095..81f0173118 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -9,6 +9,7 @@ its wait. The deferred restart used to run anyway once the last work unit ended,
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import os
+ import time
+@@ -44,9 +45,15 @@ class GatewayRestartWaitMixin:
+ 
+         Unknown claims/mutations/managed human turns keep their original wait. Reset if other
+         work appears. Withdrawing the intent is checked by the caller before this cap.
++
++        An intent marked ``"cron_cut": true`` (hermes-sync applied past its cron bound,
++        t_01a18dbde9f8b2f0) also puts awaitable cron runs under the cap: the update was decided over
++        them, and waiting up to restart_after_turn_timeout for them would land it past the drain's target.
++        Each cut run is logged with its job id and start time; its next tick reruns it.
+         """
+         kanban = kanban_managed_count(self) if intent is not None else 0
+-        if kanban <= 0 or self._awaitable_work_count() != kanban:
++        cron = self._restart_wait_cron_counts()["awaitable"] if self._intent_cuts_cron(intent) else 0
++        if kanban + cron <= 0 or self._awaitable_work_count() != kanban + cron:
+             return None, False
+         since = now if since is None else since
+         expired = now - since >= CORE_UPDATE_KANBAN_WAIT_S
+@@ -54,10 +61,12 @@ class GatewayRestartWaitMixin:
+             # The after-turn grace is spent. Do not start another full graceful drain in stop().
+             self._core_update_kanban_cap_spent = True
+             logger.warning(
+-                "Core update Kanban-only wait capped at %.0fs with %d managed card(s); "
++                "Core update %s wait capped at %.0fs with %d managed card(s) and %d cron run(s); "
+                 "proceeding to restart drain (interrupted attempts requeued uncounted)",
+-                CORE_UPDATE_KANBAN_WAIT_S, kanban,
++                "Kanban/cron-only" if cron else "Kanban-only", CORE_UPDATE_KANBAN_WAIT_S, kanban, cron,
+             )
++            if cron:
++                self._log_cut_cron_runs()
+         return since, expired
+ 
+     def _core_update_kanban_snapshot_stop_leash(self) -> None:
+@@ -73,10 +82,37 @@ class GatewayRestartWaitMixin:
+             return
+         if intent is None or not intent.exists():
+             return
+-        if self._awaitable_work_count() > kanban_managed_count(self):
++        # Under a "cron_cut" intent the cron runs were cut with the cards (t_01a18dbde9f8b2f0).
++        cron = self._restart_wait_cron_counts()["awaitable"] if self._intent_cuts_cron(intent) else 0
++        if self._awaitable_work_count() > kanban_managed_count(self) + cron:
+             return
+         self._stop_kanban_leash_s = CORE_UPDATE_KANBAN_STOP_LEASH_S
+ 
++    def _intent_cuts_cron(self, intent: Optional[Path]) -> bool:
++        """The update intent says cron runs in flight are cut, not awaited (``"cron_cut": true``). Read per
++        intent (re-read each poll: tiny file); a missing or unreadable intent never cuts."""
++        if intent is None:
++            return False
++        with suppress(Exception):
++            data = json.loads(Path(intent).read_text(encoding="utf-8-sig"))
++            return isinstance(data, dict) and data.get("cron_cut") is True
++        return False
++
++    def _log_cut_cron_runs(self) -> None:
++        """One line per cron run the update's restart cuts: job id and start time."""
++        with suppress(Exception):
++            from cron.scheduler import get_running_job_details
++            now = time.time()
++            for job in get_running_job_details():
++                if job.get("restart_safe"):
++                    continue  # a scoped worker outlives the restart; it is not cut
++                elapsed = job.get("elapsed_s")
++                started = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - elapsed))
++                           if isinstance(elapsed, (int, float)) else "unknown")
++                logger.warning("Core update restart cutting cron run %s (started %s, %ss ago); its next tick "
++                               "reruns it", job.get("job_id"), started,
++                               round(elapsed) if isinstance(elapsed, (int, float)) else "?")
++
+     def _restart_cap_state_text(self) -> str:
+         """Log suffix naming whether this restart carries a core-update intent (the Kanban-only cap)."""
+         if getattr(self, "_restart_update_intent", None) is not None:
+diff --git a/tests/cron/test_drain_hold_defers_tick.py b/tests/cron/test_drain_hold_defers_tick.py
+new file mode 100644
+index 0000000000..f074e7629c
+--- /dev/null
++++ b/tests/cron/test_drain_hold_defers_tick.py
+@@ -0,0 +1,139 @@
++"""Cron defers newly due jobs while hermes-sync's core-update drain holds new claims (t_01a18dbde9f8b2f0).
++
++hermes-hub 2026-10-30 16:19-16:53 UTC: the drain held new kanban claims through
++``<home>/core-update/drain-hold`` but cron kept dispatching. Three runs that started mid-drain
++(cron:1663d7c8440f, cron:6043b9450f3e, cron:coach:eae6027397cb, plus x-reply-discovery at 16:37) kept the
++drain busy, so the update applied after 34.1 min against a 30 min target. The ticker now honours the same
++hold the kanban dispatcher reads (``agent.core_update_drain``): due jobs stay due, are named once in the
++log, and run once on the first tick after the hold (the restarted gateway's ticker).
++"""
++
++import json
++import logging
++import os
++from datetime import UTC, datetime, timedelta
++
++
++def _quiet(monkeypatch):
++    from cron import scheduler
++
++    for name in ("_maybe_run_worktree_maintenance", "_sweep_mcp_orphans", "_maybe_reap_dead_owners"):
++        monkeypatch.setattr(scheduler, name, lambda: None)
++    monkeypatch.setattr(scheduler, "_should_yield_tick_to_fresh_gateway", lambda: None)
++
++
++def _set_drain_hold(pid=None):
++    from agent.core_update_drain import hold_paths
++
++    path = hold_paths()[0]
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({"pid": pid or os.getpid(), "started_at": 0, "reason": "hermes-sync core update drain"}))
++    return path
++
++
++def _job(tmp_path, schedule="every 15m", due=None):
++    from cron import jobs
++
++    script = tmp_path / "job.py"
++    script.write_text("print('x')\n")
++    job = jobs.create_job(prompt=None, schedule=schedule, script=str(script), no_agent=True, name="nightly-digest")
++    jobs.update_job(job["id"], {"next_run_at": (due or datetime.now(UTC)).isoformat()})
++    return job
++
++
++def test_a_job_due_during_the_drain_does_not_start(tmp_path, monkeypatch, caplog):
++    """(a) While the drain hold stands the tick starts nothing and leaves the job due (nothing advanced)."""
++    from cron import jobs, scheduler
++
++    _quiet(monkeypatch)
++    ran = []
++    monkeypatch.setattr(scheduler, "_process_due_job", lambda job, *a: ran.append(job["id"]) or True)
++    job = _job(tmp_path)
++    before = jobs.get_job(job["id"])["next_run_at"]
++    hold = _set_drain_hold()
++    try:
++        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
++            for _ in range(3):
++                assert scheduler.tick(verbose=False) == 0
++        assert ran == []
++        assert jobs.get_job(job["id"])["next_run_at"] == before, "a deferred job is not advanced or skipped"
++        named = [r.getMessage() for r in caplog.records if "deferred by the core-update drain hold" in r.getMessage()]
++        assert len(named) == 1, f"the deferred job is named once per hold, not per tick: {named}"
++        assert job["id"] in named[0] and "nightly-digest" in named[0]
++    finally:
++        hold.unlink()
++
++
++def test_deferred_job_runs_exactly_once_after_the_hold(tmp_path, monkeypatch):
++    """(c) A job that missed several slots while held runs once on the first tick after the hold ends (the
++    restarted gateway's first tick), then is not due again until its next slot."""
++    from cron import jobs, scheduler
++
++    _quiet(monkeypatch)
++    ran = []
++
++    def fire(job, *a):  # the real fire claim (it advances the slot); only the run itself is stubbed
++        assert jobs.claim_job_for_fire(job["id"])
++        ran.append(job["id"])
++        jobs.mark_job_run(job["id"], True)
++        return True
++
++    monkeypatch.setattr(scheduler, "_process_due_job", fire)
++    # Due 40 min ago: the hold spanned the slot and two more; only one catch-up run, never three.
++    job = _job(tmp_path, due=datetime.now(UTC) - timedelta(minutes=40))
++    hold = _set_drain_hold()
++    try:
++        assert scheduler.tick(verbose=False) == 0
++    finally:
++        hold.unlink()
++    assert scheduler.tick(verbose=False) == 1
++    assert scheduler.tick(verbose=False) == 0
++    assert scheduler.tick(verbose=False) == 0
++    assert ran == [job["id"]]
++    nxt = datetime.fromisoformat(jobs.get_job(job["id"])["next_run_at"])
++    assert nxt > datetime.now(UTC), "re-armed for a future slot after the one catch-up run"
++
++
++def test_a_dead_drainer_does_not_freeze_cron(tmp_path, monkeypatch):
++    """The hold only counts while its writer lives (as for the dispatcher): a crashed drainer never stops cron."""
++    import subprocess
++    import sys
++    from cron import scheduler
++
++    _quiet(monkeypatch)
++    ran = []
++    monkeypatch.setattr(scheduler, "_process_due_job", lambda job, *a: ran.append(job["id"]) or True)
++    job = _job(tmp_path)
++    dead = subprocess.Popen([sys.executable, "-c", "pass"])
++    dead.wait()
++    hold = _set_drain_hold(pid=dead.pid)
++    try:
++        assert scheduler.tick(verbose=False) == 1
++        assert ran == [job["id"]]
++    finally:
++        hold.unlink()
++
++
++def test_a_deferred_one_shot_survives_the_hold(tmp_path, monkeypatch):
++    """A one-shot due inside the hold is recorded as a planned pause, so it fires after the hold instead of being
++    retired as missed (same path as the admission hold)."""
++    import time
++    from cron import jobs, scheduler
++
++    _quiet(monkeypatch)
++    monkeypatch.setattr(jobs, "ONESHOT_GRACE_SECONDS", 1)
++    ran = []
++    monkeypatch.setattr(scheduler, "_process_due_job", lambda job, *a: ran.append(job["id"]) or True)
++    script = tmp_path / "once.py"
++    script.write_text("print('x')\n")
++    job = jobs.create_job(prompt=None, schedule=(datetime.now(UTC) + timedelta(seconds=2)).isoformat(),
++                          script=str(script), no_agent=True)
++    hold = _set_drain_hold()
++    try:
++        assert scheduler.tick(verbose=False) == 0
++        time.sleep(4)  # health: allow HX013 -- the slot must pass inside the hold and outlive its (1 s) grace
++        assert scheduler.tick(verbose=False) == 0
++    finally:
++        hold.unlink()
++    assert scheduler.tick(verbose=False) == 1
++    assert ran == [job["id"]]
+diff --git a/tests/gateway/test_core_update_cron_cut.py b/tests/gateway/test_core_update_cron_cut.py
+new file mode 100644
+index 0000000000..3b55a0d7c3
+--- /dev/null
++++ b/tests/gateway/test_core_update_cron_cut.py
+@@ -0,0 +1,98 @@
++"""A core update decided past hermes-sync's cron bound cuts cron runs instead of waiting for them
++(t_01a18dbde9f8b2f0).
++
++hermes-sync stops counting in-flight cron runs as busy once its drain has waited CORE_DRAIN_TARGET_S minus the
++apply budget, and marks that apply's update intent ``"cron_cut": true``. The gateway's restart wait otherwise
++waits up to restart_after_turn_timeout (1800 s) for every cron run, so the update would still land past the
++target (hermes-hub 2026-10-30 14:38 UTC: one apply blocked 30 min in that wait). Under such an intent, cron
++runs (and confirmed Kanban cards) get the same short cap, and every cut run is logged with its job id and
++start time; its next tick reruns it. A plain intent keeps waiting for cron (test_core_update_kanban_wait.py).
++"""
++import asyncio
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import run_shutdown_restart_wait as wait
++from tests.gateway.restart_test_helpers import make_restart_runner
++
++
++def _virtual_clock(monkeypatch):
++    clock = [0.0]
++    monkeypatch.setattr(asyncio, 'get_running_loop', lambda: SimpleNamespace(time=lambda: clock[0]))
++
++    async def advance(seconds):
++        clock[0] += seconds
++    monkeypatch.setattr(asyncio, 'sleep', advance)
++    return clock
++
++
++def _runner(tmp_path, monkeypatch, intent_body, *, cron=1, kanban=0, chat=0):
++    runner, _ = make_restart_runner()
++    intent = tmp_path / 'intent'
++    intent.write_text(json.dumps(intent_body) + '\n')
++    runner._restart_update_intent = intent
++    runner._restart_after_turn_timeout = 1800
++    total = cron + kanban + chat
++    runner._active_work_count = runner._awaitable_work_count = lambda: total
++    runner._restart_wait_cron_counts = lambda: {'awaitable': cron, 'wedged': 0, 'restart_safe': 0}
++    runner._describe_active_work = list
++    monkeypatch.setattr(wait, 'kanban_managed_count', lambda _: kanban, raising=False)
++    from cron import scheduler
++    monkeypatch.setattr(scheduler, 'get_running_job_details', lambda: [
++        {'job_id': f'job{i}', 'elapsed_s': 600.0 + i, 'worker_pid': None, 'restart_safe': False}
++        for i in range(cron)])
++    return runner
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('kanban', [0, 2])
++async def test_cron_cut_intent_caps_the_cron_wait_and_logs_each_cut(monkeypatch, tmp_path, caplog, kanban):
++    runner = _runner(tmp_path, monkeypatch, {'pid': 1, 'kind': 'unfenced', 'cron_cut': True}, cron=2, kanban=kanban)
++    clock = _virtual_clock(monkeypatch)
++    with caplog.at_level('INFO', logger='gateway.run'):
++        assert await runner._await_active_work_before_restart() is False
++    assert 15 <= clock[0] < 15.2, f'waited {clock[0]}s for cron runs the update decided to cut'
++    cut = [r.getMessage() for r in caplog.records if 'cutting cron run' in r.getMessage()]
++    assert len(cut) == 2, cut
++    assert 'job0' in cut[0] and 'started' in cut[0] and 'next tick reruns it' in cut[0]
++    assert 'job1' in cut[1]
++
++
++@pytest.mark.asyncio
++async def test_plain_intent_still_waits_for_cron(monkeypatch, tmp_path):
++    runner = _runner(tmp_path, monkeypatch, {'pid': 1, 'kind': 'unfenced'}, cron=1)
++    clock = _virtual_clock(monkeypatch)
++    assert await runner._await_active_work_before_restart() is False
++    assert 1800 <= clock[0] < 1800.2
++
++
++@pytest.mark.asyncio
++async def test_cron_cut_never_cuts_a_chat_turn(monkeypatch, tmp_path):
++    runner = _runner(tmp_path, monkeypatch, {'pid': 1, 'kind': 'unfenced', 'cron_cut': True}, cron=1, chat=1)
++    clock = _virtual_clock(monkeypatch)
++    assert await runner._await_active_work_before_restart() is False
++    assert 1800 <= clock[0] < 1800.2, 'a chat turn keeps its full wait even when cron may be cut'
++
++
++def test_unreadable_intent_does_not_cut_cron(tmp_path):
++    runner, _ = make_restart_runner()
++    intent = tmp_path / 'intent'
++    intent.write_text('not json')
++    assert runner._intent_cuts_cron(intent) is False
++    assert runner._intent_cuts_cron(None) is False
++    intent.write_text(json.dumps({'pid': 1, 'cron_cut': True}))
++    assert runner._intent_cuts_cron(intent) is True
++
++
++@pytest.mark.parametrize('cron_cut, leash', [(True, wait.CORE_UPDATE_KANBAN_STOP_LEASH_S), (False, None)])
++def test_stop_leash_after_a_cron_cut_covers_the_cut_runs(monkeypatch, tmp_path, cron_cut, leash):
++    """After the capped wait, stop() takes the short leash over the cut cron runs instead of a second full
++    drain; a plain intent keeps the normal stop budget while a cron run is in flight."""
++    body = {'pid': 1, 'kind': 'unfenced', **({'cron_cut': True} if cron_cut else {})}
++    runner = _runner(tmp_path, monkeypatch, body, cron=1, kanban=1)
++    runner._restart_requested = True
++    runner._core_update_kanban_cap_spent = True
++    runner._core_update_kanban_snapshot_stop_leash()
++    assert runner._stop_kanban_leash_s == leash
+-- 
+2.54.0 (Apple Git-157)
+

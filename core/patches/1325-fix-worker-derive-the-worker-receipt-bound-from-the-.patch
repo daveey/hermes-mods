@@ -1,0 +1,489 @@
+From 01a8fe0b30533653d59c46d62dcd3c53194053fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 20:47:24 +0000
+Subject: [PATCH] fix(worker): derive the worker receipt bound from the owner's
+ write patience; log slow worker.persist [daveey]
+
+Problem: David-MBP lost 3 Kanban worker runs on 10-30 (11:56, 12:44 PDT) to
+`WorkerPersistenceError: worker_receipt_timeout`. The worker waited a literal
+20 s (`link.receive(20)`) for a `worker.persist` reply while the owner may wait
+up to `_TRANSCRIPT_WRITE_PATIENCE_S` (60 s) for the state.db write lock, and
+then commit the write anyway. The worker never resends (outcome unknown), so a
+slow but successful owner write killed the run.
+
+Why 1: finalize_turn's persist got no reply inside 20 s.
+Why 2: the owner was still inside its 20/60 s write patience (load 150, 26
+       Hermes processes on one state.db; owner loop stalled >10 s at 11:56).
+Root (happened): client and server bounds of one contract were set
+       independently; the client's was not longer than the server's.
+Root (not caught): no test paired the two bounds, and the owner logged nothing
+       for a slow worker.persist, so stalls were invisible until a worker died.
+
+Fix:
+- hermes_state_runtime.worker_receipt_timeout_s(): the longest owner write
+  patience of any worker.register/adopt/persist handler + 30 s margin
+  (WORKER_RECEIPT_MARGIN_S; owner-loop stalls) = 90 s today. WorkerRPC uses it.
+- gateway.session_worker.timed_persist: one WARNING per worker.persist slower
+  than 5 s with operation, session, state.db lock wait (recorded by
+  apply_worker_receipt through WORKER_RECEIPT_TIMING), total and outcome.
+
+Tests (RED on main, and each fails under its mutation: `receive(20)` back, or
+the log line dropped):
+- tests/agent/test_worker_receipt_bound_contract.py: the bound outlasts every
+  patience the real register/adopt/persist handlers pass to _execute_write;
+  the derivation; the slow-persist WARNING fields; no WARNING when fast.
+- tests/gateway/test_worker_slow_owner_persist.py: a real owner daemon + real
+  worker AIAgent; a foreign writer holds the state.db write lock for 25 s
+  mid-turn. The worker exits 0, its assistant row is stored once, and the
+  owner logs exactly one slow-persist WARNING (lock_wait/total > 20 s).
+---
+ agent/runtime_session_store.py                |   9 +-
+ gateway/session_worker.py                     |  40 +++++-
+ hermes_state_runtime.py                       |  29 ++++
+ .../test_worker_receipt_bound_contract.py     | 132 ++++++++++++++++++
+ .../agent/test_worker_rpc_connection_reuse.py |   2 +-
+ .../gateway/test_worker_slow_owner_persist.py | 130 +++++++++++++++++
+ 6 files changed, 339 insertions(+), 3 deletions(-)
+ create mode 100644 tests/agent/test_worker_receipt_bound_contract.py
+ create mode 100644 tests/gateway/test_worker_slow_owner_persist.py
+
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index 515a5c43a8..06c56fb482 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -47,6 +47,11 @@ class WorkerPersistenceError(RuntimeError):
+     pass
+ 
+ 
++def _receipt_timeout_s():
++    from hermes_state_runtime import worker_receipt_timeout_s
++    return worker_receipt_timeout_s()
++
++
+ def _caller_summary(limit=8):
+     """module:function:line of the frames above this store (its own frames skipped), never
+     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
+@@ -194,7 +199,9 @@ class WorkerRPC:
+                     self._drop()
+                     link = self._connection()
+                     link.send(request_id, message)
+-                response = link.receive(20)
++                # Never shorter than the owner may take to answer (its write patience + a loop-stall
++                # margin): giving up first kills the run while the owner may still commit the write.
++                response = link.receive(_receipt_timeout_s())
+             except BaseException:
+                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
+                 self._drop()
+diff --git a/gateway/session_worker.py b/gateway/session_worker.py
+index aa527defc4..b576321389 100644
+--- a/gateway/session_worker.py
++++ b/gateway/session_worker.py
+@@ -5,16 +5,48 @@ the owner on its parent's receipt stream (gateway/session_worker_child.py), neve
+ """
+ import asyncio
+ import hmac
++import logging
+ import os
++import time
+ 
+ from gateway.session_admission import admission_fingerprint
+ from hermes_state_runtime import (
+-    RuntimeStoreError, _secret_digest, adopt_worker_execution,
++    WORKER_RECEIPT_TIMING, RuntimeStoreError, _secret_digest, adopt_worker_execution,
+     mutate_worker_execution, register_worker_execution,
+ )
+ 
++logger = logging.getLogger(__name__)
++
+ _SCOPE = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret'}
+ 
++#: A ``worker.persist`` slower than this is logged: the worker waits ``worker_receipt_timeout_s()``
++#: for the reply, and before this line a stall stayed invisible until a worker died of it.
++SLOW_WORKER_PERSIST_S = 5.0
++
++
++async def timed_persist(params, persist):
++    """Await ``persist()`` (one ``worker.persist`` request) and log it once if it was slow.
++
++    The WARNING names the operation, the session, how long its write waited for the state.db lock
++    (``n/a`` when it never reached the write), the total handler time and the outcome.
++    """
++    timing = {}
++    token = WORKER_RECEIPT_TIMING.set(timing)
++    started, outcome = time.monotonic(), 'ok'
++    try:
++        return await persist()
++    except BaseException as exc:
++        outcome = getattr(exc, 'reason', None) or type(exc).__name__
++        raise
++    finally:
++        WORKER_RECEIPT_TIMING.reset(token)
++        total = time.monotonic() - started
++        if total >= SLOW_WORKER_PERSIST_S:
++            lock_wait = timing.get('lock_wait_s')
++            logger.warning('slow worker.persist: operation=%s session=%s lock_wait=%s total=%.1fs outcome=%s',
++                           params.get('operation'), params.get('session_id'),
++                           'n/a' if lock_wait is None else f'{lock_wait:.1f}s', total, outcome)
++
+ 
+ def _claim(connection, ref, params):
+     import psutil
+@@ -63,6 +95,12 @@ def _verify(connection, ref, params, claim):
+ 
+ 
+ async def worker_request(connection, ref, params, *, operation):
++    if operation == 'persist':
++        return await timed_persist(params, lambda: _worker_request(connection, ref, params, operation=operation))
++    return await _worker_request(connection, ref, params, operation=operation)
++
++
++async def _worker_request(connection, ref, params, *, operation):
+     from gateway.session_authorities import require_serving
+     require_serving(connection.authority)  # adopt/persist would write with the released epoch
+     if operation == "persist" and isinstance(params.get("operation"), str) and params["operation"].startswith("delegation."):
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index 3ca6f869f0..ad65f4e729 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -3,7 +3,9 @@
+ No execution, transport, or authority objects live here. Every mutation uses the
+ SessionDB transaction owner, including its inode guard and SQLite retry policy.
+ """
++import contextvars
+ import json
++import time
+ import uuid
+ from typing import NamedTuple, Optional
+ 
+@@ -13,6 +15,29 @@ from agent.message_metadata import (
+ )
+ from hermes_state_keys import admission_fingerprint
+ 
++#: Slack the worker adds on top of the owner's longest write patience: the owner's event loop can
++#: stall 10-20 s under load before a ``worker.*`` handler even starts (David-MBP, load 150).
++WORKER_RECEIPT_MARGIN_S = 30.0
++
++
++def worker_receipt_timeout_s() -> float:
++    """How long a worker waits for the owner's reply to one ``worker.*`` RPC.
++
++    Derived, never a literal: the longest state.db write patience any owner handler of
++    ``worker.register`` / ``worker.adopt`` (default patience) or ``worker.persist`` (every family
++    goes through ``apply_worker_receipt``: transcript patience) may spend, plus
++    ``WORKER_RECEIPT_MARGIN_S``. A worker that gave up first would die on ``worker_receipt_timeout``
++    while the owner is still allowed to commit the write (outcome unknown, never resent).
++    """
++    from hermes_state import SessionDB
++    return max(SessionDB._WRITE_PATIENCE_S, SessionDB._TRANSCRIPT_WRITE_PATIENCE_S) + WORKER_RECEIPT_MARGIN_S
++
++
++#: A mutable dict the owner's ``worker.persist`` dispatcher installs for one request;
++#: ``apply_worker_receipt`` records into it how long the write waited for the state.db lock.
++#: ``asyncio.to_thread`` copies the context, so the same dict object is shared with the thread.
++WORKER_RECEIPT_TIMING: contextvars.ContextVar = contextvars.ContextVar('worker_receipt_timing', default=None)
++
+ 
+ class SessionGoneEvent(NamedTuple):
+     """The ``on_session_delete`` event a committed runtime mutation owes its plugins."""
+@@ -989,7 +1014,11 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
+         raise RuntimeStoreError('invalid_params')
+     digest = admission_fingerprint(canonical_target=session_id,
+                                   payload={'operation': operation, 'payload': json.loads(encoded)})
++    timing = WORKER_RECEIPT_TIMING.get()
++    asked = time.monotonic()
+     def write(conn):
++        if timing is not None:  # the last (successful) attempt wins: lock waits and retries included
++            timing['lock_wait_s'] = time.monotonic() - asked
+         _epoch(conn, epoch)
+         row = worker_receipt_assignment(conn, execution_id, session_id, generation, sequence, digest)
+         if row['owner_epoch'] != epoch:
+diff --git a/tests/agent/test_worker_receipt_bound_contract.py b/tests/agent/test_worker_receipt_bound_contract.py
+new file mode 100644
+index 0000000000..791a03ac8d
+--- /dev/null
++++ b/tests/agent/test_worker_receipt_bound_contract.py
+@@ -0,0 +1,132 @@
++"""The worker's receipt bound is derived from, and longer than, every owner write patience a
++``worker.*`` RPC can spend.
++
++A worker that gives up first kills its run with ``worker_receipt_timeout`` while the owner is still
++allowed to wait for the state.db write lock, and may then commit the write anyway (outcome unknown,
++never resent). David-MBP lost three runs that way when the bound was a literal 20 s and the owner's
++transcript patience was 60 s.
++"""
++import threading
++from types import SimpleNamespace
++
++
++def _owner_patience_spent(tmp_path):
++    """Every ``patience_s`` the owner's real register / adopt / persist handlers pass to the write path."""
++    from agent.runtime_session_store import RuntimeSessionStore
++    from hermes_state import SessionDB
++    from hermes_state_runtime import (
++        adopt_worker_execution, begin_runtime_epoch, mutate_worker_execution, register_worker_execution,
++    )
++    db = SessionDB(tmp_path / 'state.db')
++    spent, real = [], db._execute_write
++
++    def spy(fn, patience_s=None):
++        spent.append(db._WRITE_PATIENCE_S if patience_s is None else patience_s)
++        return real(fn, patience_s=patience_s)
++    try:
++        db.create_session('owned', 'cli', system_prompt='prefix')
++        epoch = begin_runtime_epoch(db, instance_id='fixture')
++        scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
++        db._execute_write = spy
++        register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
++        adopt_worker_execution(db, **scope, adoption_secret='secret')
++        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / 'outbox')
++        try:
++            store.append_messages_batch('owned', [{'role': 'assistant', 'content': 'done', 'finish_reason': 'stop'}])
++            store.finish()
++        finally:
++            store.close()
++    finally:
++        db._execute_write = real
++        db.close()
++    return spent
++
++
++def test_receipt_bound_is_derived_from_the_owner_patience_plus_margin():
++    from hermes_state import SessionDB
++    from hermes_state_runtime import WORKER_RECEIPT_MARGIN_S, worker_receipt_timeout_s
++    longest = max(SessionDB._WRITE_PATIENCE_S, SessionDB._TRANSCRIPT_WRITE_PATIENCE_S)
++    assert WORKER_RECEIPT_MARGIN_S == 30.0
++    assert worker_receipt_timeout_s() == longest + WORKER_RECEIPT_MARGIN_S
++
++
++def test_worker_receipt_bound_outlasts_every_owner_write_patience(tmp_path, monkeypatch):
++    from agent import runtime_session_store
++    from agent.runtime_session_store import WorkerRPC
++
++    spent = _owner_patience_spent(tmp_path)
++    # register + adopt (default patience) and at least two persist receipts (transcript patience).
++    assert len(spent) >= 4, spent
++
++    waited = []
++
++    class Link:
++        reader = SimpleNamespace(is_alive=lambda: True)
++
++        def send(self, request_id, message):
++            self.request_id = request_id
++
++        def receive(self, timeout):
++            waited.append(timeout)
++            return {'jsonrpc': '2.0', 'id': self.request_id, 'result': {}}
++    rpc = WorkerRPC(tmp_path)
++    rpc.link = Link()
++    for method in ('worker.register', 'worker.adopt', 'worker.persist'):
++        rpc(method, pid=-1)
++    assert len(waited) == 3
++    # The worker must still be listening when the owner's longest write wait ends.
++    assert min(waited) > max(spent), (waited, spent)
++
++
++def test_slow_worker_persist_logs_operation_lock_wait_total_and_session(tmp_path, monkeypatch, caplog):
++    """One WARNING per worker.persist slower than the threshold, naming what the owner waited on."""
++    import asyncio
++    import logging
++    from gateway import session_worker
++    import sqlite3
++    from hermes_state import SessionDB
++    from hermes_state_runtime import apply_worker_receipt, begin_runtime_epoch, register_worker_execution
++    monkeypatch.setattr(session_worker, 'SLOW_WORKER_PERSIST_S', 0.2)
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        db.create_session('owned', 'cli')
++        epoch = begin_runtime_epoch(db, instance_id='fixture')
++        scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
++        register_worker_execution(db, **scope, kind='compute', adoption_secret='secret')
++        holder = sqlite3.connect(str(tmp_path / 'state.db'), isolation_level=None, check_same_thread=False)
++        holder.execute('BEGIN IMMEDIATE')
++        threading.Timer(0.5, holder.rollback).start()
++
++        def persist():
++            return apply_worker_receipt(db, **scope, sequence=1, operation='noop', payload={},
++                                        handlers={'noop': lambda db, conn, sid, p: {'ok': True}})
++        params = dict(session_id='owned', operation='noop')
++        with caplog.at_level(logging.WARNING, logger='gateway.session_worker'):
++            result = asyncio.run(session_worker.timed_persist(params, lambda: asyncio.to_thread(persist)))
++        holder.close()
++        assert result == {'ok': True}
++        slow = [r for r in caplog.records if 'slow worker.persist' in r.getMessage()]
++        assert len(slow) == 1, [r.getMessage() for r in caplog.records]
++        record = slow[0]
++        assert record.levelno == logging.WARNING
++        message = record.getMessage()
++        assert 'operation=noop' in message and 'session=owned' in message, message
++        fields = dict(part.split('=', 1) for part in message.split() if '=' in part)
++        lock_wait, total = float(fields['lock_wait'].rstrip('s')), float(fields['total'].rstrip('s'))
++        assert 0.4 <= lock_wait <= total, message
++        assert fields['outcome'] == 'ok', message
++    finally:
++        db.close()
++
++
++def test_fast_worker_persist_logs_nothing(tmp_path, caplog):
++    import asyncio
++    import logging
++    from gateway import session_worker
++
++    async def quick():
++        return {'ok': True}
++    with caplog.at_level(logging.WARNING, logger='gateway.session_worker'):
++        assert asyncio.run(session_worker.timed_persist(
++            {'session_id': 's', 'operation': 'transcript.append'}, quick)) == {'ok': True}
++    assert not [r for r in caplog.records if 'slow worker.persist' in r.getMessage()]
+diff --git a/tests/agent/test_worker_rpc_connection_reuse.py b/tests/agent/test_worker_rpc_connection_reuse.py
+index 4b1d2668ee..4b46e82be0 100644
+--- a/tests/agent/test_worker_rpc_connection_reuse.py
++++ b/tests/agent/test_worker_rpc_connection_reuse.py
+@@ -219,7 +219,7 @@ def test_idle_broadcasts_past_the_receive_high_water_mark_keep_the_connection(ow
+ 
+ 
+ def test_owner_stall_shorter_than_the_receipt_budget_does_not_fail_on_a_ping_deadline(owner, tmp_path, monkeypatch):
+-    """The receipt budget (20 s) is the only per-call deadline: a library keepalive whose pong is held
++    """The receipt budget (``worker_receipt_timeout_s()``) is the only per-call deadline: a library keepalive whose pong is held
+     by the same stall must not close the connection first. The library defaults (20 s / 20 s) are
+     scaled down so an inherited keepalive would fire inside the stall."""
+     from websockets.sync import client
+diff --git a/tests/gateway/test_worker_slow_owner_persist.py b/tests/gateway/test_worker_slow_owner_persist.py
+new file mode 100644
+index 0000000000..3d07544fdc
+--- /dev/null
++++ b/tests/gateway/test_worker_slow_owner_persist.py
+@@ -0,0 +1,130 @@
++"""A real worker survives an owner whose state.db write lock is held past the old 20 s receipt bound.
++
++The owner may wait up to its transcript write patience (60 s) for the lock. While a foreign writer
++holds it for 25 s, the worker's next ``worker.persist`` reply arrives late but well inside that
++patience: the worker must still be listening, finish its turn and exit 0, and the owner must log the
++slow request (operation, lock wait, total, session).
++"""
++import asyncio
++from contextlib import closing
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++import json
++import os
++from pathlib import Path
++import re
++import sqlite3
++import subprocess
++import sys
++import threading
++import time
++
++import pytest
++
++from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
++
++HOLD_S = 25.0
++
++
++class Model(BaseHTTPRequestHandler):
++    def log_message(self, *args):
++        pass
++
++    def do_POST(self):
++        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
++        if body.get('messages'):
++            self.server.requests.append(body)
++            if not self.server.held.is_set():
++                # Another Hermes process takes the write lock while the worker waits on inference;
++                # the worker's next persist (the assistant row) queues behind it.
++                holder = sqlite3.connect(str(self.server.db), isolation_level=None, check_same_thread=False,
++                                         timeout=30)
++                holder.execute('BEGIN IMMEDIATE')
++                self.server.held.set()
++                self.server.held_at = time.monotonic()
++
++                def release():
++                    holder.rollback()
++                    holder.close()
++                    self.server.released_at = time.monotonic()
++                threading.Timer(HOLD_S, release).start()
++        message = {'role': 'assistant', 'content': 'SLOW_OWNER_ACK'}
++        usage = {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
++        frame = {'id': 'worker-reply', 'model': 'worker-model', 'usage': usage,
++                 'choices': [{'index': 0, 'message': message, 'finish_reason': 'stop'}]}
++        kind = 'application/json'
++        if body.get('stream'):
++            frame['choices'][0]['delta'] = frame['choices'][0].pop('message')
++            payload = ('data: ' + json.dumps(frame) + '\n\ndata: [DONE]\n\n').encode()
++            kind = 'text/event-stream'
++        else:
++            payload = json.dumps(frame).encode()
++        self.send_response(200)
++        self.send_header('Content-Type', kind)
++        self.send_header('Content-Length', str(len(payload)))
++        self.end_headers()
++        self.wfile.write(payload)
++
++
++@pytest.mark.platforms("linux")
++def test_worker_outlives_an_owner_write_wait_longer_than_twenty_seconds(tmp_path):
++    root = Path(__file__).resolve().parents[2]
++    home, user = tmp_path / 'state', tmp_path / 'user'
++    home.mkdir(mode=0o700)
++    user.mkdir()
++    peer = ThreadingHTTPServer(('127.0.0.1', 0), Model)
++    peer.requests, peer.held, peer.db = [], threading.Event(), home / 'state.db'
++    peer.held_at = peer.released_at = None
++    thread = threading.Thread(target=peer.serve_forever, daemon=True)
++    thread.start()
++    url = f'http://127.0.0.1:{peer.server_port}/v1'
++    (home / 'config.yaml').write_text(json.dumps({'gateway': {'multiplex_profiles': False},
++        'model': {'provider': 'custom', 'default': 'worker-model', 'base_url': url},
++        'auxiliary': {'title_generation': {'enabled': False}}, 'platform_toolsets': {'cli': []}}))
++    env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
++    env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
++               OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
++
++    async def create(desc):
++        async with websocket(home, desc) as ws:
++            response = await rpc(ws, 'session.create', request_id='worker-session', source='cli',
++                                 model='worker-model', toolsets=[])
++            assert 'result' in response, response
++            return response['result']['session_id']
++    try:
++        with daemon(root, home, env, barrier=False) as (_, desc):
++            sid = asyncio.run(create(desc))
++            receipt = tmp_path / 'receipt.json'
++            result = subprocess.run([sys.executable, str(root / 'tests/gateway/fixtures/agent_persistence_worker.py')],
++                cwd=root, env=env, input=json.dumps({'home': str(home), 'url': url, 'session_id': sid,
++                                                   'receipt': str(receipt)}) + '\n',
++                text=True, capture_output=True, timeout=150, check=False)
++            assert peer.held.is_set(), 'the lock was never taken: the test did not exercise a slow owner'
++            assert result.returncode == 0, result.stdout + result.stderr
++            assert 'worker_receipt_timeout' not in result.stderr, result.stderr
++            assert peer.released_at is not None and peer.released_at - peer.held_at >= HOLD_S - 0.5
++            proof = json.loads(receipt.read_text())
++            assert not proof['failed'], proof
++            assert 'SLOW_OWNER_ACK' in proof['result'], proof
++            assert proof['finished']['status'] == 'terminal'
++            with closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True)) as db:
++                rows = db.execute('SELECT role,content FROM messages WHERE session_id=? ORDER BY id', (sid,)).fetchall()
++            assert sum(1 for role, content in rows if role == 'assistant' and 'SLOW_OWNER_ACK' in content) == 1, rows
++            # The owner names the slow request, once: operation, lock wait, total and session.
++            agent_log = home / 'logs' / 'agent.log'
++            slow = [line for line in agent_log.read_text(errors='replace').splitlines()
++                    if 'slow worker.persist' in line]
++            assert len(slow) == 1, slow or agent_log.read_text(errors='replace')[-4000:]
++            waits = []
++            for line in slow:
++                match = re.search(r'operation=(\S+) session=(\S+) lock_wait=([\d.]+)s total=([\d.]+)s outcome=(\S+)',
++                                  line)
++                assert match, line
++                waits.append((float(match[4]), float(match[3]), match[2], match[5]))
++            total, lock_wait, session, outcome = max(waits)
++            assert total > 20.0 and lock_wait > 20.0 and outcome == 'ok', slow
++            assert session == sid, slow
++            print(json.dumps({'slow': slow, 'held_s': peer.released_at - peer.held_at}))
++    finally:
++        peer.shutdown()
++        peer.server_close()
++        thread.join(timeout=5)
+-- 
+2.54.0 (Apple Git-157)
+

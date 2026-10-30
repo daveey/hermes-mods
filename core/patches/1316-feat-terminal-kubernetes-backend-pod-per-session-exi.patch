@@ -1,0 +1,1767 @@
+From a969258dc2216abeae44a074b50d6451c30a87ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 13:05:35 -0700
+Subject: [PATCH] =?UTF-8?q?feat(terminal):=20kubernetes=20backend=20?=
+ =?UTF-8?q?=E2=80=94=20pod=20per=20session,=20existing-claim=20workspace?=
+ =?UTF-8?q?=20[daveey]=20(#242)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* feat(terminal): kubernetes backend — pod per session, PVC per profile [daveey]
+
+New built-in terminal backend `kubernetes` (tools/environments/kubernetes.py):
+
+- One pod per (profile, session), named hermes-<profile>-<sha>, labelled
+  app.kubernetes.io/managed-by=hermes + hermes/profile; reused while running,
+  recreated when missing/failed; bounded Ready wait that fails fast on
+  image-pull / container-config errors (EnvironmentConnectionError).
+- One ReadWriteOnce PVC per profile (hermes-ws-<profile>) at /workspace,
+  created when missing, never deleted by the backend.
+- Pod hardening: runAsNonRoot uid 1000, no privilege escalation, drop ALL
+  caps, RuntimeDefault seccomp, no service-account token, requests=limits.
+- Commands run through the exec websocket (kubernetes.stream) under the base
+  snapshot/cwd wrapping; exit code from the status channel; stdin is
+  length-framed; a timeout kills the remote process tree via a pidfile.
+- Idle past terminal.kubernetes.idle_timeout or cleanup() deletes the pod (PVC
+  kept); hermes/last-used annotation stamped for an external reaper.
+- Namespace/image/resources come only from the profile's terminal.kubernetes
+  config. Auth: in-cluster, else kubeconfig (optional context).
+- kubernetes==36.0.0 as the optional `kubernetes` extra (37.x needs a newer
+  certifi than core pins); registered in the builder/requirement tables,
+  backend sets, doctor, setup wizard, dashboard probe/picker, docs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* feat(terminal): kubernetes backend needs no PVC rights; uid, kubeconfig, scheduling knobs [daveey]
+
+The first consumer's ServiceAccount can only manage pods (+ pods/exec, pods/log)
+in its namespace, so the backend no longer creates a per-profile PVC:
+
+- terminal.kubernetes.workspace_pvc / workspace_subpath mount an EXISTING claim
+  (e.g. RWX/EFS) at /workspace; unset = emptyDir. No PVC API is ever called
+  (pvc_size / storage_class removed).
+- run_as_user / run_as_group / fs_group (default 1000, uid 0 refused) so the
+  pod uid matches existing workspace ownership.
+- kubeconfig: explicit path wins; else in-cluster, else KUBECONFIG/default.
+- node_selector / tolerations passthrough; ephemeral_storage request=limit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* feat(terminal): kubernetes backend — configurable workspace_mount; pod HOME on its own emptyDir [daveey]
+
+A shared workspace claim mounted at workspace_mount (default /workspace) with
+its subPath; HOME and the ~/.hermes sync move to an emptyDir at /home/hermes
+so skills, cache and credential files never land on the shared claim.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* fix(terminal): kubernetes backend sends its token with kubernetes 36.0.0
+
+36.0.0's kubeconfig and in-cluster loaders store the token under api_key['authorization'], but
+Configuration.auth_settings() reads only api_key['BearerToken'], so every request went without
+Authorization and EKS answered 401 (first live pool sandbox, 2026-10-30). Mirror the key on
+the default configuration, and after every token refresh. A no-op for clients that read
+'authorization'. New test uses the real client (skips without the kubernetes extra).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/prompt_builder.py                       |   4 +-
+ agent/terminal_env_registry.py                |   2 +-
+ apps/desktop/src/app/settings/constants.ts    |   2 +-
+ cli-config.yaml.example                       |  27 +
+ hermes_cli/config_defaults.py                 |  38 +-
+ hermes_cli/doctor_tools.py                    |  19 +-
+ .../hermes.shared_metrics.v4.schema.json      |   3 +
+ .../observability/shared_metrics_contract.py  |   2 +-
+ hermes_cli/plugins_registrars.py              |   2 +-
+ hermes_cli/setup_terminal.py                  |  19 +-
+ hermes_cli/web_routers/tools.py               |   9 +
+ hermes_cli/web_server_config.py               |   2 +-
+ hermes_cli/web_server_profiles.py             |   1 +
+ nix/packages.nix                              |   1 +
+ pm/extras.py                                  |   1 +
+ pyproject.toml                                |   1 +
+ tests/tools/test_kubernetes_environment.py    | 470 +++++++++++++++++
+ tools/credential_files.py                     |   2 +-
+ tools/env_probe.py                            |   2 +-
+ tools/environments/kubernetes.py              | 490 ++++++++++++++++++
+ tools/file_tools_paths.py                     |   4 +-
+ tools/skills_tool_setup.py                    |   2 +-
+ tools/terminal_tool.py                        |   2 +-
+ tools/terminal_tool_backends.py               |  30 +-
+ tools/terminal_tool_config.py                 |   2 +-
+ uv.lock                                       |  36 +-
+ website/docs/user-guide/configuration.md      |  39 +-
+ website/docs/user-guide/features/tools.md     |   3 +-
+ 28 files changed, 1172 insertions(+), 43 deletions(-)
+ create mode 100644 tests/tools/test_kubernetes_environment.py
+ create mode 100644 tools/environments/kubernetes.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 08c105d11a..eff196ed36 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -772,7 +772,7 @@ WSL_ENVIRONMENT_HINT = (
+ 
+ # Backends that run commands (and every file tool) in a separate container / remote host: host OS/$HOME/cwd
+ # would mislead, so the agent only sees the machine it can touch.
+-_REMOTE_TERMINAL_BACKENDS = frozenset({"docker", "modal", "daytona", "ssh", "vercel_sandbox", "managed_modal"})
++_REMOTE_TERMINAL_BACKENDS = frozenset({"docker", "modal", "daytona", "ssh", "vercel_sandbox", "managed_modal", "kubernetes"})
+ 
+ # Used when the live probe fails: only what the backend choice implies — never an invented cwd/user/$HOME.
+ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
+@@ -781,7 +781,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
+     "managed_modal": "a managed Modal sandbox (Linux)",
+     "daytona": "a Daytona workspace (Linux)",
+     "vercel_sandbox": "a Vercel sandbox (Linux)",
+-    "ssh": "a remote host reached over SSH (likely Linux)",
++    "ssh": "a remote host reached over SSH (likely Linux)", "kubernetes": "a Kubernetes pod (Linux)",
+ }
+ 
+ # Per-process probe cache keyed by (home key, env_type, cwd_hint) so a mid-process backend switch
+diff --git a/agent/terminal_env_registry.py b/agent/terminal_env_registry.py
+index 24e3e0b253..a5115dec04 100644
+--- a/agent/terminal_env_registry.py
++++ b/agent/terminal_env_registry.py
+@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
+ #: registrable by plugins. Includes internal-mode aliases (managed_modal).
+ BUILTIN_BACKEND_NAMES = frozenset({
+     "local", "docker", "modal", "managed_modal",
+-    "daytona", "vercel_sandbox", "ssh",
++    "daytona", "vercel_sandbox", "ssh", "kubernetes",
+ })
+ 
+ 
+diff --git a/apps/desktop/src/app/settings/constants.ts b/apps/desktop/src/app/settings/constants.ts
+index 80bac5ba9a..ee05087a4e 100644
+--- a/apps/desktop/src/app/settings/constants.ts
++++ b/apps/desktop/src/app/settings/constants.ts
+@@ -246,7 +246,7 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
+   // Terminal execution backends — kept in sync with the dispatch ladder in
+   // tools/terminal_tool.py::_create_environment (local/docker/singularity/
+   // modal/daytona/ssh). Remote backends need extra env (image, tokens, host).
+-  'terminal.backend': ['local', 'docker', 'singularity', 'modal', 'daytona', 'ssh'],
++  'terminal.backend': ['local', 'docker', 'singularity', 'modal', 'daytona', 'ssh', 'kubernetes'],
+   'stt.elevenlabs.model_id': ['scribe_v2', 'scribe_v1'],
+   'stt.local.model': ['tiny', 'base', 'small', 'medium', 'large-v3', 'turbo'],
+   // Speech-to-text backends — kept in sync with BUILTIN_STT_PROVIDERS in
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 9386b5a043..a14f2e0312 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -542,6 +542,33 @@ terminal:
+ #   daytona_image: "nousresearch/hermes-sandbox:desktop"
+ #   container_disk: 10240          # Daytona max is 10GB per sandbox
+ 
++# -----------------------------------------------------------------------------
++# OPTION 7: Kubernetes pods
++# One pod per session in the namespace below. /workspace is an existing claim
++# (workspace_pvc, optional subPath) or an emptyDir; no PVC is ever created.
++# Requires: the optional 'kubernetes' extra (hermes setup terminal -> Kubernetes)
++# and in-cluster credentials or a kubeconfig.
++# -----------------------------------------------------------------------------
++# terminal:
++#   backend: "kubernetes"
++#   kubernetes:
++#     namespace: "agents"            # required
++#     image: "ghcr.io/you/sandbox:1" # required; needs bash
++#     kubeconfig: ""                 # "" = in-cluster, else KUBECONFIG / ~/.kube/config
++#     context: ""
++#     cpu: "1"
++#     memory: "2Gi"
++#     ephemeral_storage: "10Gi"
++#     idle_timeout: 1800             # seconds
++#     workspace_pvc: ""              # existing claim; "" = emptyDir
++#     workspace_subpath: ""
++#     run_as_user: 1000
++#     run_as_group: 1000
++#     fs_group: 1000
++#     node_selector: {}
++#     tolerations: []
++#     labels: {}
++
+ #
+ # --- Container resource limits (docker, modal, daytona, container plugin backends -- ignored for local/ssh) ---
+ # These settings apply to all container backends. They control the resources
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 363c0a8a2c..baacc40939 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -340,17 +340,14 @@ DEFAULT_CONFIG = {
+         # HERMES_HOME/home; "real" = force real HOME; "profile" = force HERMES_HOME/home when it
+         # exists (strict per-profile isolation).
+         "home_mode": "auto",
+-        # Extra files sourced in the login shell when building the per-session env snapshot — for
+-        # nvm/pyenv/asdf/PATH entries registered by files a bash login shell skips (~/.bashrc,
+-        # ~/.zshrc, ~/.zprofile). Supports ~ and ${VAR}; missing files skipped. When empty and the
+-        # shell is bash, ~/.profile, ~/.bash_profile, ~/.bashrc are auto-sourced in that order (see
+-        # auto_source_bashrc).
++        # Extra files sourced in the login shell when building the per-session env snapshot — for nvm/pyenv/asdf/PATH
++        # entries registered by files a bash login shell skips (~/.bashrc, ~/.zshrc, ~/.zprofile). Supports ~ and
++        # ${VAR}; missing files skipped. When empty and the shell is bash, ~/.profile, ~/.bash_profile, ~/.bashrc are
++        # auto-sourced in that order (see auto_source_bashrc).
+         "shell_init_files": [],
+-        # Source ~/.profile, ~/.bash_profile, ~/.bashrc in the snapshot login shell to capture PATH
+-        # additions, functions, and aliases that `bash -l -c` misses (bash skips bashrc when
+-        # non-interactive; Debian/Ubuntu ~/.bashrc short-circuits). ~/.profile and ~/.bash_profile
+-        # go first because n/nvm/asdf write PATH exports there without an interactivity guard. Turn
+-        # off if an rc file misbehaves when sourced non-interactively (exits on TTY check).
++        # Source ~/.profile, ~/.bash_profile, ~/.bashrc in the snapshot login shell for PATH, functions and aliases
++        # `bash -l -c` misses (non-interactive bash skips bashrc; Debian ~/.bashrc short-circuits). The profiles go
++        # first (n/nvm/asdf write PATH there unguarded). Turn off if an rc file misbehaves non-interactively.
+         "auto_source_bashrc": True,
+         # The default sandbox for every container backend: the nikolaik/python-nodejs base
+         # (Python 3.13 / Node 26) plus a display stack, so Bot Screen, computer_use and the
+@@ -377,14 +374,12 @@ DEFAULT_CONFIG = {
+         "docker_mount_cwd_to_workspace": False,  # mount host cwd at /workspace (weakens isolation)
+         "docker_network": True,  # false = --network=none, no network access from commands
+         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
+-        # /dev/shm size for the Docker sandbox. Docker's 64 MB default silently breaks
+-        # Chromium/Playwright and PyTorch DataLoader workers; tmpfs is lazily allocated so the
+-        # higher ceiling is free until used. "" or "0" = omit the flag (Docker default).
++        # /dev/shm size for the Docker sandbox. Docker's 64 MB default silently breaks Chromium/Playwright and
++        # PyTorch DataLoader workers; tmpfs is lazily allocated. "" or "0" = omit the flag (Docker default).
+         "docker_shm_size": "1g",
+-        # Run the container as the host uid:gid (`--user`) so files written to bind mounts
+-        # (docker_volumes, persistent workspace, mounted cwd) are owned by you, not root. Off by
+-        # default for images whose entrypoints must start as root (e.g. the bundled Hermes image,
+-        # which drops to `hermes` via s6-setuidgid). When on, SETUID/SETGID caps are omitted.
++        # Run the container as the host uid:gid (`--user`) so bind-mount writes (docker_volumes, persistent
++        # workspace, mounted cwd) are yours, not root's. Off by default for images whose entrypoints must start
++        # as root (the bundled image drops to `hermes` via s6-setuidgid). On omits the SETUID/SETGID caps.
+         "docker_run_as_host_user": False,
+         # Snap-packaged Docker under AppArmor (Ubuntu cloud images; LP#1908448) refuses to exec
+         # anything under `--init` or `--security-opt no-new-privileges` ("operation not
+@@ -392,9 +387,14 @@ DEFAULT_CONFIG = {
+         "docker_snap_compat": False,
+         # Trusted profiles sharing one Docker container identity; empty = per-profile boundary.
+         "docker_shared_container_key": "",
+-        # SSH: carry exported env vars between commands (cwd always carries). false = every command
+-        # starts from the login env, profile functions included. Local: TERMINAL_LOCAL_PERSISTENT.
++        # SSH: carry exported env vars between commands (cwd always carries). false = every command starts from the
++        # login env, profile functions included. Local: TERMINAL_LOCAL_PERSISTENT.
+         "persistent_shell": True,
++        # kubernetes: pod per session; namespace+image required (namespace only from here); workspace_pvc: existing
++        "kubernetes": {"namespace": "", "image": "", "cpu": "1", "memory": "2Gi", "ephemeral_storage": "10Gi",
++                       "idle_timeout": 1800, "context": "", "kubeconfig": "", "labels": {}, "workspace_pvc": "",
++                       "workspace_subpath": "", "run_as_user": 1000, "run_as_group": 1000, "fs_group": 1000,
++                       "node_selector": {}, "tolerations": []},
+     },
+ 
+     "web": {
+diff --git a/hermes_cli/doctor_tools.py b/hermes_cli/doctor_tools.py
+index 0003eb83f4..2c1ff6fbc4 100644
+--- a/hermes_cli/doctor_tools.py
++++ b/hermes_cli/doctor_tools.py
+@@ -184,7 +184,8 @@ def _check_git_and_rg(should_fix: bool, f: Finding) -> None:
+         check_info(f"Install for faster search: {_system_package_install_cmd('ripgrep')}")
+ 
+ 
+-_BUILTIN_TERMINAL_BACKENDS = {"local", "docker", "modal", "managed_modal", "daytona", "vercel_sandbox", "ssh"}
++_BUILTIN_TERMINAL_BACKENDS = {"local", "docker", "modal", "managed_modal", "daytona", "vercel_sandbox", "ssh",
++                              "kubernetes"}
+ 
+ 
+ def _check_docker_backend(terminal_env: str, running_in_container: bool, issues: list[str]) -> None:
+@@ -246,6 +247,19 @@ def _check_daytona_backend(issues: list[str]) -> None:
+         _fail_and_issue("daytona SDK not installed", "(run hermes setup terminal)", "Run hermes setup terminal and select Daytona, then restart Hermes", issues)
+ 
+ 
++def _check_kubernetes_backend(issues: list[str]) -> None:
++    from hermes_cli.config import load_config_readonly
++    from tools.environments.kubernetes import settings_from_config
++    settings = settings_from_config((load_config_readonly().get("terminal") or {}).get("kubernetes"))
++    _require(settings["namespace"] and settings["image"],
++             ("Kubernetes namespace/image", f"({settings['namespace']}, {settings['image']})"),
++             ("Kubernetes namespace/image missing", "(terminal.kubernetes.namespace / .image)"),
++             "Set terminal.kubernetes.namespace and terminal.kubernetes.image in config.yaml", issues)
++    _require(importlib.util.find_spec("kubernetes") is not None, ("kubernetes client", "(installed)"),
++             ("kubernetes client not installed", "(optional 'kubernetes' extra)"),
++             "Run hermes setup terminal and select Kubernetes, then restart Hermes", issues)
++
++
+ def _check_vercel_backend(issues: list[str]) -> None:
+     from tools.terminal_tool_backends import _SUPPORTED_VERCEL_RUNTIMES
+     runtime = os.getenv("TERMINAL_VERCEL_RUNTIME", "node24").strip() or "node24"
+@@ -287,7 +301,8 @@ def _check_plugin_backend(terminal_env: str, issues: list[str]) -> None:
+         _require(ok, (label, detail), (label, detail), detail.strip("()"), issues)
+ 
+ 
+-_BACKEND_CHECKS = {"ssh": _check_ssh_backend, "daytona": _check_daytona_backend, "vercel_sandbox": _check_vercel_backend}
++_BACKEND_CHECKS = {"ssh": _check_ssh_backend, "daytona": _check_daytona_backend, "vercel_sandbox": _check_vercel_backend,
++                   "kubernetes": _check_kubernetes_backend}
+ 
+ 
+ @doctor_check()
+diff --git a/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json b/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json
+index 63cd120720..18e19d4ec6 100644
+--- a/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json
++++ b/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json
+@@ -1159,6 +1159,7 @@
+               "enum": [
+                 "daytona",
+                 "docker",
++                "kubernetes",
+                 "local",
+                 "managed_modal",
+                 "modal",
+@@ -2186,6 +2187,7 @@
+                 "docker",
+                 "extension",
+                 "firecrawl",
++                "kubernetes",
+                 "lightpanda",
+                 "local",
+                 "managed_modal",
+@@ -3240,6 +3242,7 @@
+               "enum": [
+                 "daytona",
+                 "docker",
++                "kubernetes",
+                 "local",
+                 "managed_modal",
+                 "modal",
+diff --git a/hermes_cli/observability/shared_metrics_contract.py b/hermes_cli/observability/shared_metrics_contract.py
+index 3ba33ea41b..37113e1b49 100644
+--- a/hermes_cli/observability/shared_metrics_contract.py
++++ b/hermes_cli/observability/shared_metrics_contract.py
+@@ -251,7 +251,7 @@ EXTENSION_SOURCES = frozenset({"bundled", "catalog", "hub", "local", "other", "u
+ EXTENSION_OUTCOMES = frozenset({"failed", "success"})
+ # Every built-in backend in tools/terminal_tool_config.py::_BUILTIN_BACKENDS.
+ TERMINAL_BACKENDS = frozenset({
+-    "daytona", "docker", "local", "managed_modal", "modal", "other", "singularity", "ssh", "vercel_sandbox",
++    "daytona", "docker", "kubernetes", "local", "managed_modal", "modal", "other", "singularity", "ssh", "vercel_sandbox",
+ })
+ AUX_TASKS = _CatalogValues("aux_task_names", extra=frozenset({"none", "other"}))
+ SLASH_COMMANDS = _CatalogValues("slash_command_names", extra=frozenset({"plugin", "skill", "unknown"}))
+diff --git a/hermes_cli/plugins_registrars.py b/hermes_cli/plugins_registrars.py
+index 3bf95e6f7b..f2d34bd468 100644
+--- a/hermes_cli/plugins_registrars.py
++++ b/hermes_cli/plugins_registrars.py
+@@ -61,7 +61,7 @@ _SCOPED_PROVIDER_REGISTRARS: tuple[tuple[str, str, str, str, str, str, dict[str,
+      "terminal environment provider",
+      "Register a :class:`agent.terminal_env_provider.TerminalEnvironmentProvider`; ``provider.name`` "
+      "is matched by ``terminal.backend`` when no built-in backend has that name. Built-in names (local, "
+-     "docker, modal, daytona, vercel_sandbox, ssh) are rejected — plugins never shadow "
++     "docker, modal, daytona, vercel_sandbox, ssh, kubernetes) are rejected — plugins never shadow "
+      "in-tree backends.",
+      {"normalize": "lower", "reject_message": "Plugin '%s' terminal environment provider rejected: %s"}),
+     ("register_secret_source", "secret_source", "agent.secret_sources.registry",
+diff --git a/hermes_cli/setup_terminal.py b/hermes_cli/setup_terminal.py
+index fa92244a92..c248c009e0 100644
+--- a/hermes_cli/setup_terminal.py
++++ b/hermes_cli/setup_terminal.py
+@@ -201,6 +201,19 @@ def _setup_backend_daytona(config: dict) -> None:
+     config["terminal"].setdefault("daytona_image", _SANDBOX_IMAGE)
+ 
+ 
++def _setup_backend_kubernetes(config: dict) -> None:
++    _setup.print_success("Terminal backend: Kubernetes")
++    _setup._info("One pod per session in a namespace you choose; /workspace can be an existing claim.",
++                 "Auth: in-cluster service account, else your kubeconfig (KUBECONFIG or ~/.kube/config).")
++    _ensure_sdk("kubernetes")
++    section = config["terminal"].setdefault("kubernetes", {})
++    for key, label in (("namespace", "  Namespace"), ("image", "  Container image"), ("kubeconfig", "  Kubeconfig path"),
++                       ("context", "  Kubeconfig context"), ("workspace_pvc", "  Existing workspace PVC (blank = none)")):
++        value = _setup.prompt(label, section.get(key) or "")
++        if value:
++            section[key] = value
++
++
+ def _setup_backend_vercel(config: dict) -> None:
+     _setup.print_success("Terminal backend: Vercel Sandbox")
+     _setup._info("Cloud microVM sandboxes with snapshot-backed filesystem persistence.",
+@@ -259,10 +272,12 @@ _BUILTIN_TERMINAL_BACKENDS = [
+     ("docker", "Docker/Podman - isolated container with configurable resources"),
+     ("modal", "Modal - serverless cloud sandbox"), ("ssh", "SSH - run on a remote machine"),
+     ("daytona", "Daytona - persistent cloud development environment"),
+-    ("vercel_sandbox", "Vercel Sandbox - cloud microVM with snapshot filesystem persistence")]
++    ("vercel_sandbox", "Vercel Sandbox - cloud microVM with snapshot filesystem persistence"),
++    ("kubernetes", "Kubernetes - per-session pod on a cluster")]
+ _TERMINAL_BACKEND_SETUP = {
+     "local": _setup_backend_local, "docker": _setup_backend_docker, "modal": _setup_backend_modal,
+-    "daytona": _setup_backend_daytona, "vercel_sandbox": _setup_backend_vercel, "ssh": _setup_backend_ssh}
++    "daytona": _setup_backend_daytona, "vercel_sandbox": _setup_backend_vercel, "ssh": _setup_backend_ssh,
++    "kubernetes": _setup_backend_kubernetes}
+ # Backend -> env var mirrored from config after setup (config.yaml is the source of truth, but
+ # terminal_tool reads these from .env).
+ _BACKEND_ENV_MIRROR = {"modal": ("TERMINAL_MODAL_MODE", "modal_mode", "auto"),
+diff --git a/hermes_cli/web_routers/tools.py b/hermes_cli/web_routers/tools.py
+index cb01e4c201..e11eae91cf 100644
+--- a/hermes_cli/web_routers/tools.py
++++ b/hermes_cli/web_routers/tools.py
+@@ -115,12 +115,21 @@ def _probe_daytona_backend(_cfg) -> tuple:
+     return ("needs_setup", "Set DAYTONA_API_KEY to use the Daytona backend.")
+ 
+ 
++def _probe_kubernetes_backend(cfg) -> tuple:
++    section = cfg.get("kubernetes") if isinstance(cfg, dict) else None
++    section = section if isinstance(section, dict) else {}
++    if section.get("namespace") and section.get("image"):
++        return ("ready", f"{section['namespace']}: {section['image']}")
++    return ("needs_setup", "Set terminal.kubernetes.namespace and terminal.kubernetes.image to use the Kubernetes backend.")
++
++
+ _BACKEND_PROBES = {
+     "local": lambda _cfg: ("ready", ""),
+     "docker": _probe_docker_backend,
+     "ssh": _probe_ssh_backend,
+     "modal": _probe_modal_backend,
+     "daytona": _probe_daytona_backend,
++    "kubernetes": _probe_kubernetes_backend,
+ }
+ 
+ 
+diff --git a/hermes_cli/web_server_config.py b/hermes_cli/web_server_config.py
+index 3f94a923fa..0b9e9535a0 100644
+--- a/hermes_cli/web_server_config.py
++++ b/hermes_cli/web_server_config.py
+@@ -82,7 +82,7 @@ _SCHEMA_OVERRIDES: dict[str, dict[str, Any]] = {
+     },
+     "terminal.backend": _select(
+         "Terminal execution backend",
+-        "local", "docker", "ssh", "modal", "daytona", "vercel_sandbox",
++        "local", "docker", "ssh", "modal", "daytona", "vercel_sandbox", "kubernetes",
+     ),
+     # sync with _SUPPORTED_VERCEL_RUNTIMES in terminal_tool.py
+     "terminal.vercel_image": {
+diff --git a/hermes_cli/web_server_profiles.py b/hermes_cli/web_server_profiles.py
+index 91ab029a06..69a67a06ac 100644
+--- a/hermes_cli/web_server_profiles.py
++++ b/hermes_cli/web_server_profiles.py
+@@ -340,6 +340,7 @@ _TERMINAL_BACKENDS: list[dict[str, str]] = [
+          "Run commands in an isolated Docker or Podman container with a persistent workspace."),
+         ("modal", "Modal", "Run commands in a Modal cloud sandbox."),
+         ("daytona", "Daytona", "Run commands in a Daytona cloud sandbox."),
++        ("kubernetes", "Kubernetes", "Run commands in a per-session pod on a Kubernetes cluster."),
+         ("ssh", "SSH", "Run commands on a remote host over SSH."))]
+ 
+ 
+diff --git a/nix/packages.nix b/nix/packages.nix
+index 47f310f4ff..9c77f08ccf 100644
+--- a/nix/packages.nix
++++ b/nix/packages.nix
+@@ -65,6 +65,7 @@
+           "fal"
+           "feishu"
+           "firecrawl"
++          "kubernetes"
+           "messaging"
+           "modal"
+           "parallel-web"
+diff --git a/pm/extras.py b/pm/extras.py
+index 4c176c5076..f4df26fac3 100644
+--- a/pm/extras.py
++++ b/pm/extras.py
+@@ -51,6 +51,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
+     "teams": "microsoft_teams.apps",
+     "modal": "modal",
+     "daytona": "daytona",
++    "kubernetes": "kubernetes",
+     "vercel": "vercel",
+     "google": ("googleapiclient", "google.auth", "google_auth_oauthlib.flow", "google_auth_httplib2"),
+     "google-chat": "google.cloud.pubsub_v1",
+diff --git a/pyproject.toml b/pyproject.toml
+index 778f801c95..b04d0de214 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -265,6 +265,7 @@ piper = [
+ ]
+ modal = ["modal==1.6.2"]
+ daytona = ["daytona==0.225.0"]
++kubernetes = ["kubernetes==36.0.0"]
+ vercel = ["vercel==0.12.0"]
+ google-meet = ["playwright==1.64.0; sys_platform != 'android'", "websockets==15.0.1; sys_platform != 'android'"]
+ messaging = [
+diff --git a/tests/tools/test_kubernetes_environment.py b/tests/tools/test_kubernetes_environment.py
+new file mode 100644
+index 0000000000..f2d93427ab
+--- /dev/null
++++ b/tests/tools/test_kubernetes_environment.py
+@@ -0,0 +1,470 @@
++"""Behaviour contracts for the ``kubernetes`` terminal backend against a fake cluster.
++
++The fake ``kubernetes`` package keeps pods/PVCs in dicts and runs each pod exec as a real local
++``bash`` (``/workspace`` and ``/tmp`` mapped into a temp dir), so command wrapping, cwd tracking,
++exit codes and the timeout kill path are exercised end to end without a cluster.
++"""
++
++import json
++import re
++import subprocess
++import sys
++import threading
++import types
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import hermes_yaml as yaml
++
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms("linux", "macos")  # pod execs run as local bash
++
++
++class FakeApiException(Exception):
++    def __init__(self, status=0, reason=""):
++        super().__init__(f"{status} {reason}")
++        self.status, self.reason = status, reason
++
++
++class FakeConfigException(Exception):
++    pass
++
++
++def _pod_view(body):
++    waiting = body.get("fake_waiting")  # e.g. "ImagePullBackOff": the container never starts
++    statuses = [SimpleNamespace(state=SimpleNamespace(waiting=SimpleNamespace(reason=waiting, message="pull failed")))]
++    return SimpleNamespace(
++        metadata=SimpleNamespace(name=body["metadata"]["name"], deletion_timestamp=None),
++        status=SimpleNamespace(
++            phase=body.get("fake_phase", "Pending" if waiting else "Running"),
++            container_statuses=statuses if waiting else [],
++            conditions=[] if waiting else [SimpleNamespace(type="Ready", status="True", reason=None, message=None)]))
++
++
++class FakeExec:
++    """WSClient surface (binary mode) over a local process standing in for the pod exec."""
++
++    def __init__(self, cluster, argv, stdin):
++        self.argv = argv
++        self._cluster = cluster
++        self.proc = subprocess.Popen(
++            [cluster.to_local(a) for a in argv], cwd=cluster.workspace, start_new_session=True,
++            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(cluster.workspace), "LANG": "C.UTF-8"},
++            stdin=subprocess.PIPE if stdin else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        self._buf = {1: bytearray(), 2: bytearray()}
++        self._lock = threading.Lock()
++        self._readers = [threading.Thread(target=self._pump, args=(ch, pipe), daemon=True)
++                         for ch, pipe in ((1, self.proc.stdout), (2, self.proc.stderr))]
++        for t in self._readers:
++            t.start()
++
++    def _pump(self, channel, pipe):
++        for chunk in iter(lambda: pipe.read1(4096), b""):
++            with self._lock:
++                self._buf[channel] += chunk
++
++    def write_stdin(self, data):
++        self.proc.stdin.write(data)
++        self.proc.stdin.flush()
++
++    def close_channel(self, channel):
++        assert channel == 0
++        self.proc.stdin.close()
++
++    def is_open(self):
++        return self.proc.poll() is None or any(t.is_alive() for t in self._readers)
++
++    def update(self, timeout=0):
++        try:
++            self.proc.wait(timeout=timeout)
++        except subprocess.TimeoutExpired:
++            pass
++        if self.proc.poll() is not None:
++            for t in self._readers:
++                t.join(timeout)
++
++    def _read(self, channel):
++        with self._lock:
++            data, self._buf[channel] = bytes(self._buf[channel]), bytearray()
++        return self._cluster.from_local(data)
++
++    def read_stdout(self, timeout=None):
++        return self._read(1)
++
++    def read_stderr(self, timeout=None):
++        return self._read(2)
++
++    @property
++    def returncode(self):
++        return None if self.is_open() else self.proc.returncode
++
++    def close(self):
++        pass
++
++
++class FakeCluster:
++    """CoreV1Api subset + the stream() entry point, recording every mutating call."""
++
++    def __init__(self, root: Path):
++        self.workspace, self.tmp, self.home = root / "workspace", root / "tmp", root / "home"
++        self.workspace.mkdir()
++        self.tmp.mkdir()
++        self.home.mkdir()
++        self.pods, self.calls, self.execs = {}, [], []
++        self.kube_context = self.kubeconfig_file = None
++        self.fake_waiting = None  # applied to pods created from now on
++
++    def to_local(self, text):  # one pass: the temp root itself may contain "/tmp"
++        local = {"/workspace": self.workspace, "/tmp": self.tmp, "/home/hermes": self.home}
++        return re.sub(r"/home/hermes|/workspace|/tmp", lambda m: str(local[m.group()]), text)
++
++    def from_local(self, data: bytes) -> bytes:
++        return (data.replace(str(self.home).encode(), b"/home/hermes").replace(str(self.workspace).encode(), b"/workspace")
++                .replace(str(self.tmp).encode(), b"/tmp"))
++
++    def _get(self, store, namespace, name):
++        if (namespace, name) not in store:
++            raise FakeApiException(404, "Not Found")
++        return store[(namespace, name)]
++
++    def read_namespaced_pod(self, name, namespace):
++        return _pod_view(self._get(self.pods, namespace, name))
++
++    def create_namespaced_pod(self, namespace, body):
++        self.calls.append(("create_pod", namespace, body["metadata"]["name"]))
++        self.pods[(namespace, body["metadata"]["name"])] = {**body, "fake_waiting": self.fake_waiting}
++
++    def delete_namespaced_pod(self, name, namespace, grace_period_seconds=None):
++        self.calls.append(("delete_pod", namespace, name))
++        self.pods.pop((namespace, name), None)
++
++    def patch_namespaced_pod(self, name, namespace, body):
++        pod = self._get(self.pods, namespace, name)
++        pod["metadata"].setdefault("annotations", {}).update(body["metadata"]["annotations"])
++
++    # The backend's ServiceAccount has no PVC rights: any claim API call is a contract violation.
++    def read_namespaced_persistent_volume_claim(self, name, namespace):
++        self.calls.append(("read_pvc", namespace, name))
++        raise FakeApiException(403, "Forbidden")
++
++    def create_namespaced_persistent_volume_claim(self, namespace, body):
++        self.calls.append(("create_pvc", namespace, body["metadata"]["name"]))
++        raise FakeApiException(403, "Forbidden")
++
++    def delete_namespaced_persistent_volume_claim(self, name, namespace, **_):
++        self.calls.append(("delete_pvc", namespace, name))
++        raise FakeApiException(403, "Forbidden")
++
++    def pvc_calls(self):
++        return [c for c in self.calls if c[0].endswith("_pvc")]
++
++    def connect_get_namespaced_pod_exec(self, *a, **kw):
++        raise AssertionError("exec must go through kubernetes.stream.stream")
++
++    def stream(self, fn, name, namespace, *, command, container, stdin, binary, _preload_content, **_):
++        assert fn == self.connect_get_namespaced_pod_exec and binary and not _preload_content
++        assert container == "workspace"
++        self._get(self.pods, namespace, name)
++        ex = FakeExec(self, command, stdin)
++        self.execs.append(ex)
++        return ex
++
++
++@pytest.fixture
++def cluster(tmp_path, monkeypatch):
++    fake = FakeCluster(tmp_path.resolve())
++    pkg = types.ModuleType("kubernetes")
++    client = types.ModuleType("kubernetes.client")
++    exceptions = types.ModuleType("kubernetes.client.exceptions")
++    config = types.ModuleType("kubernetes.config")
++    stream_mod = types.ModuleType("kubernetes.stream")
++    exceptions.ApiException = FakeApiException
++    client.CoreV1Api = lambda: fake
++    client.exceptions = exceptions
++    config.ConfigException = FakeConfigException
++
++    def _no_incluster():
++        raise FakeConfigException("not in a cluster")
++
++    config.load_incluster_config = _no_incluster
++    def _load_kube_config(config_file=None, context=None):
++        fake.kubeconfig_file, fake.kube_context = config_file, context
++
++    config.load_kube_config = _load_kube_config
++    stream_mod.stream = fake.stream
++    pkg.client, pkg.config, pkg.stream = client, config, stream_mod
++    for name, mod in (("kubernetes", pkg), ("kubernetes.client", client), ("kubernetes.client.exceptions", exceptions),
++                      ("kubernetes.config", config), ("kubernetes.stream", stream_mod)):
++        monkeypatch.setitem(sys.modules, name, mod)
++    yield fake
++    for ex in fake.execs:
++        if ex.proc.poll() is None:
++            ex.proc.kill()
++
++
++@pytest.fixture
++def make_env(cluster):
++    from tools.environments.kubernetes import KubernetesEnvironment
++    envs = []
++
++    def _make(**kw):
++        kwargs = dict(namespace="agents", image="example.org/sandbox:1", profile="alice", task_id="session-1",
++                      timeout=30)
++        kwargs.update(kw)
++        env = KubernetesEnvironment(**kwargs)
++        envs.append(env)
++        return env
++
++    yield _make
++    for env in envs:
++        env.cleanup()
++
++
++def test_exec_returns_stdout_and_real_exit_code(make_env):
++    env = make_env()
++
++    ok = env.execute("echo hello-from-pod")
++    failed = env.execute("echo about-to-fail; exit 7")
++
++    assert ok["returncode"] == 0
++    assert "hello-from-pod" in ok["output"]
++    assert failed["returncode"] == 7
++    assert "about-to-fail" in failed["output"]
++
++
++def test_cwd_persists_across_commands(make_env):
++    env = make_env()
++
++    env.execute("mkdir -p /workspace/x && cd /workspace/x")
++    result = env.execute("pwd")
++
++    assert result["returncode"] == 0
++    assert result["output"].strip() == "/workspace/x"
++    assert env.cwd == "/workspace/x"
++
++
++def test_command_past_timeout_is_killed_and_reported(make_env, cluster):
++    env = make_env()
++
++    result = env.execute("sleep 60", timeout=2)
++
++    assert result["returncode"] == 124
++    assert result.get("hermes_timed_out") is True
++    assert "timed out" in result["output"]
++    command_exec = next(ex for ex in cluster.execs if len(ex.argv) > 6 and "sleep 60" in ex.argv[6])
++    kill_exec = next(ex for ex in cluster.execs if "kill -KILL" in ex.argv[2])
++    assert kill_exec.argv[4] == command_exec.argv[4]  # the kill targets this command's pidfile
++    wait_until(lambda: command_exec.proc.poll() is not None, timeout=10, what="remote command tree killed")
++
++
++def test_idle_pod_is_deleted_without_any_pvc_api_call(make_env, cluster):
++    env = make_env(idle_timeout=1)
++    pod_key = ("agents", env.pod_name)
++    assert pod_key in cluster.pods
++
++    wait_until(lambda: pod_key not in cluster.pods, timeout=15, what="idle pod reaped")
++
++    again = env.execute("echo back")  # next use recreates the pod
++    assert again["returncode"] == 0 and "back" in again["output"]
++    assert again.get("environment_recreated") is True
++    assert pod_key in cluster.pods
++
++    env.cleanup()
++    assert pod_key not in cluster.pods
++    assert cluster.pvc_calls() == []
++
++
++def test_profile_config_drives_namespace_image_resources_and_security(cluster, monkeypatch):
++    from hermes_constants import get_hermes_home
++    from tools.terminal_tool_backends import _create_environment
++
++    get_hermes_home().mkdir(parents=True, exist_ok=True)
++    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump({"terminal": {"backend": "kubernetes", "kubernetes": {
++        "namespace": "team-ns", "image": "registry.example/agent:7", "cpu": "2", "memory": "3Gi",
++        "ephemeral_storage": "4Gi", "context": "prod-ctx", "kubeconfig": "/etc/owner/kubeconfig",
++        "labels": {"team": "research"}, "node_selector": {"pool": "agents"},
++        "tolerations": [{"key": "agents", "operator": "Exists", "effect": "NoSchedule"}]}}}))
++    monkeypatch.setenv("HERMES_PROFILE_NAME", "Research_Bot")
++
++    env = _create_environment("kubernetes", image="", cwd="/workspace", timeout=30, task_id="sess-9")
++    try:
++        pod = cluster.pods[("team-ns", env.pod_name)]
++    finally:
++        env.cleanup()
++
++    assert env.pod_name.startswith("hermes-research-bot-") and len(env.pod_name) <= 63
++    assert (cluster.kubeconfig_file, cluster.kube_context) == ("/etc/owner/kubeconfig", "prod-ctx")
++    assert pod["metadata"]["labels"] == {"team": "research", "app.kubernetes.io/managed-by": "hermes",
++                                         "hermes/profile": "research-bot"}
++    assert "hermes/last-used" in pod["metadata"]["annotations"]
++    spec = pod["spec"]
++    (container,) = spec["containers"]
++    assert container["image"] == "registry.example/agent:7"
++    limits = {"cpu": "2", "memory": "3Gi", "ephemeral-storage": "4Gi"}
++    assert container["resources"] == {"requests": limits, "limits": limits}
++    assert spec["nodeSelector"] == {"pool": "agents"}
++    assert spec["tolerations"] == [{"key": "agents", "operator": "Exists", "effect": "NoSchedule"}]
++    assert spec["automountServiceAccountToken"] is False
++    assert spec["securityContext"]["runAsNonRoot"] is True and spec["securityContext"]["runAsUser"] == 1000
++    sc = container["securityContext"]
++    assert sc["runAsNonRoot"] is True and sc["runAsUser"] == 1000
++    assert sc["allowPrivilegeEscalation"] is False
++    assert sc["capabilities"] == {"drop": ["ALL"]}
++    assert sc["seccompProfile"] == {"type": "RuntimeDefault"}
++    # No workspace_pvc configured: an emptyDir workspace, plus the pod's own HOME.
++    assert spec["volumes"] == [{"name": "workspace", "emptyDir": {}}, {"name": "home", "emptyDir": {}}]
++    assert container["volumeMounts"] == [{"name": "workspace", "mountPath": "/workspace"},
++                                         {"name": "home", "mountPath": "/home/hermes"}]
++    assert container["env"] == [{"name": "HOME", "value": "/home/hermes"}]
++    assert cluster.pvc_calls() == []
++
++
++def test_workspace_pvc_and_subpath_mount_existing_claim_without_pvc_api(make_env, cluster):
++    env = make_env(workspace_pvc="assistants-efs", workspace_subpath="owner-42/assistant-7")
++
++    spec = cluster.pods[("agents", env.pod_name)]["spec"]
++    env.cleanup()
++
++    assert spec["volumes"] == [{"name": "workspace", "persistentVolumeClaim": {"claimName": "assistants-efs"}},
++                               {"name": "home", "emptyDir": {}}]
++    assert spec["containers"][0]["volumeMounts"] == [
++        {"name": "workspace", "mountPath": "/workspace", "subPath": "owner-42/assistant-7"},
++        {"name": "home", "mountPath": "/home/hermes"}]
++    assert cluster.pvc_calls() == []
++
++
++def test_workspace_mount_path_and_home_stay_apart(make_env, cluster):
++    """A shared claim mounted at a chosen path; HOME (and the ~/.hermes sync) never lands on it."""
++    env = make_env(workspace_pvc="workspaces", workspace_subpath="ada", workspace_mount="/workspace/ada")
++
++    spec = cluster.pods[("agents", env.pod_name)]["spec"]
++    container = spec["containers"][0]
++    env.cleanup()
++
++    assert container["volumeMounts"][0] == {"name": "workspace", "mountPath": "/workspace/ada", "subPath": "ada"}
++    assert container["workingDir"] == "/workspace/ada"
++    assert container["env"] == [{"name": "HOME", "value": "/home/hermes"}]
++    for bad in ("relative", "/", "/home/hermes"):
++        with pytest.raises(ValueError, match="workspace_mount"):
++            make_env(workspace_mount=bad)
++
++
++def test_run_as_ids_land_in_pod_security_context(make_env, cluster):
++    env = make_env(run_as_user=4242, run_as_group=4343, fs_group=4444)
++
++    spec = cluster.pods[("agents", env.pod_name)]["spec"]
++
++    assert spec["securityContext"] == {"runAsNonRoot": True, "runAsUser": 4242, "runAsGroup": 4343, "fsGroup": 4444,
++                                       "seccompProfile": {"type": "RuntimeDefault"}}
++    sc = spec["containers"][0]["securityContext"]
++    assert (sc["runAsUser"], sc["runAsGroup"], sc["runAsNonRoot"]) == (4242, 4343, True)
++
++
++def test_running_pod_is_reused_not_recreated(make_env, cluster):
++    first = make_env()
++    first.execute("echo marker > /workspace/state")  # fake pods share one local dir standing in for a claim
++    pod_body = cluster.pods[("agents", first.pod_name)]
++    first._closed.set()  # drop the object without deleting its pod, like a restarted Hermes process
++
++    second = make_env()
++
++    assert second.pod_name == first.pod_name
++    assert cluster.pods[("agents", second.pod_name)] is pod_body
++    assert [c for c in cluster.calls if c[0] == "create_pod"] == [("create_pod", "agents", first.pod_name)]
++    assert second.execute("cat /workspace/state")["output"].strip() == "marker"
++
++
++def test_missing_kubernetes_package_names_the_extra(monkeypatch):
++    from tools.environments.kubernetes import KubernetesEnvironment
++
++    monkeypatch.setitem(sys.modules, "kubernetes", None)  # import fails as if the extra were absent
++
++    with pytest.raises(ImportError, match=r"'kubernetes' extra"):
++        KubernetesEnvironment(namespace="agents", image="img", profile="alice")
++
++
++def test_requirements_check_names_the_extra_when_package_missing(monkeypatch):
++    from hermes_constants import get_hermes_home
++    from tools.terminal_tool_backends import _REQUIREMENT_CHECKERS, terminal_backend_unavailable_reason
++
++    get_hermes_home().mkdir(parents=True, exist_ok=True)
++    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(
++        {"terminal": {"kubernetes": {"namespace": "agents", "image": "img"}}}))
++    monkeypatch.setitem(sys.modules, "kubernetes", None)
++
++    assert _REQUIREMENT_CHECKERS["kubernetes"]({}) is False
++    assert "'kubernetes' extra" in terminal_backend_unavailable_reason()
++
++
++def test_fetch_file_streams_over_exec_with_size_cap(make_env, tmp_path):
++    from tools.environments.base import FileFetchError
++
++    env = make_env()
++    env.execute("printf 'artifact-bytes' > /workspace/out.bin && head -c 4096 /dev/zero > /workspace/big.bin")
++
++    dest = tmp_path / "fetched.bin"
++    env.fetch_file("/workspace/out.bin", dest, max_bytes=1024)
++    assert dest.read_bytes() == b"artifact-bytes"
++    with pytest.raises(FileFetchError, match="exceeds"):
++        env.fetch_file("/workspace/big.bin", tmp_path / "big.bin", max_bytes=1024)
++
++
++def test_image_pull_failure_surfaces_connection_error(make_env, cluster):
++    from tools.environments.base import EnvironmentConnectionError
++
++    cluster.fake_waiting = "ImagePullBackOff"
++
++    with pytest.raises(EnvironmentConnectionError, match="ImagePullBackOff"):
++        make_env()
++
++
++def test_failed_pod_is_replaced(make_env, cluster):
++    from tools.environments.kubernetes import pod_name
++
++    name = pod_name("alice", "session-1")
++    cluster.pods[("agents", name)] = {"metadata": {"name": name}, "fake_phase": "Failed"}
++
++    env = make_env()
++
++    assert ("delete_pod", "agents", name) in cluster.calls
++    assert ("create_pod", "agents", name) in cluster.calls
++    assert env.execute("echo fresh")["returncode"] == 0
++
++
++def test_root_uid_is_refused(cluster):
++    from tools.environments.kubernetes import KubernetesEnvironment
++
++    with pytest.raises(ValueError, match="non-zero"):
++        KubernetesEnvironment(namespace="agents", image="img", profile="alice", run_as_user=0)
++    assert cluster.pods == {}
++
++
++def test_without_explicit_kubeconfig_falls_back_to_default_kubeconfig(make_env, cluster):
++    make_env(context="dev")  # fake: in-cluster config unavailable
++
++    assert (cluster.kubeconfig_file, cluster.kube_context) == (None, "dev")
++
++
++def test_kubeconfig_token_reaches_the_request_header_with_the_real_client(tmp_path):
++    """Live 2026-10-30: kubernetes 36.0.0 loaded the token but sent no Authorization header (401)."""
++    pytest.importorskip("kubernetes")
++    from kubernetes import client
++
++    from tools.environments import kubernetes as k8s_env
++
++    kubeconfig = tmp_path / "config"
++    kubeconfig.write_text(json.dumps({
++        "apiVersion": "v1", "kind": "Config", "current-context": "c",
++        "clusters": [{"name": "c", "cluster": {"server": "https://k.invalid"}}],
++        "users": [{"name": "u", "user": {"token": "t0k"}}],
++        "contexts": [{"name": "c", "context": {"cluster": "c", "user": "u"}}],
++    }))
++    try:
++        k8s_env._load_kubernetes("", kubeconfig=str(kubeconfig))
++        auth = client.Configuration.get_default_copy().auth_settings().values()
++        assert any(a["in"] == "header" and a["key"].lower() == "authorization" and a["value"] == "Bearer t0k"
++                   for a in auth), list(auth)
++    finally:
++        client.Configuration.set_default(None)
+diff --git a/tools/credential_files.py b/tools/credential_files.py
+index 9995902bf3..f5431576c2 100644
+--- a/tools/credential_files.py
++++ b/tools/credential_files.py
+@@ -345,7 +345,7 @@ def from_agent_visible_cache_path(container_path: str, container_base: str = "/r
+ 
+ # Backends whose file-sync lands under the remote home: ``~/.hermes`` is
+ # expanded by the remote shell, so it resolves regardless of the actual home.
+-_HOME_RELATIVE_BACKENDS = frozenset({"ssh", "daytona", "vercel_sandbox"})
++_HOME_RELATIVE_BACKENDS = frozenset({"ssh", "daytona", "vercel_sandbox", "kubernetes"})
+ 
+ 
+ def _terminal_backend() -> str:
+diff --git a/tools/env_probe.py b/tools/env_probe.py
+index af12ebc005..de508e5b89 100644
+--- a/tools/env_probe.py
++++ b/tools/env_probe.py
+@@ -35,7 +35,7 @@ _WAIT_ALREADY_TIMED_OUT = False  # after one full wait, later callers only peek
+ # Duplicated rather than imported to avoid a circular import.
+ _REMOTE_BACKENDS = frozenset({
+     "docker", "modal", "daytona", "ssh", "managed_modal",
+-    "vercel_sandbox",
++    "vercel_sandbox", "kubernetes",
+ })
+ 
+ 
+diff --git a/tools/environments/kubernetes.py b/tools/environments/kubernetes.py
+new file mode 100644
+index 0000000000..568750ca22
+--- /dev/null
++++ b/tools/environments/kubernetes.py
+@@ -0,0 +1,490 @@
++"""Kubernetes pod execution environment.
++
++One pod per (profile, session) in the namespace the PROFILE config names (``terminal.kubernetes``),
++never one the model or a command chooses. ``/workspace`` is an EXISTING claim (``workspace_pvc``,
++optionally at ``workspace_subpath``) or, without one, an emptyDir: the backend never creates or deletes
++a PersistentVolumeClaim, so it needs only pod + pods/exec rights. Idling out or cleaning up deletes
++the pod. Commands run spawn-per-call through the pod exec websocket
++(``kubernetes.stream``) under the base class's snapshot/CWD wrapping, like the other remote backends.
++"""
++
++import hashlib
++import io
++import logging
++import re
++import tarfile
++import threading
++import time
++import uuid
++import weakref
++from datetime import UTC, datetime
++from pathlib import Path
++
++from tools.environments.base import BaseEnvironment, EnvironmentConnectionError
++from tools.environments.base_output import _ThreadedProcessHandle
++from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command
++from tools.environments.remote_common import ensure_lazy_dep
++
++logger = logging.getLogger(__name__)
++
++# Tests patch these instead of the shared ``time`` module.
++_sleep = time.sleep
++_monotonic = time.monotonic
++
++WORKSPACE = "/workspace"
++# The pod's own HOME (an emptyDir): ~/.hermes sync lands here, never on a shared workspace claim.
++HOME_DIR = "/home/hermes"
++DEFAULTS = {"cpu": "1", "memory": "2Gi", "ephemeral_storage": "10Gi", "idle_timeout": 1800, "context": "",
++            "kubeconfig": "", "labels": {}, "workspace_pvc": "", "workspace_subpath": "", "workspace_mount": WORKSPACE,
++            "run_as_user": 1000,
++            "run_as_group": 1000, "fs_group": 1000, "node_selector": {}, "tolerations": []}
++MISSING_EXTRA_MESSAGE = ("The kubernetes terminal backend needs the optional 'kubernetes' extra "
++                         "(run `hermes setup terminal` and pick Kubernetes, or install hermes-agent[kubernetes])")
++MANAGED_BY_LABEL = ("app.kubernetes.io/managed-by", "hermes")
++PROFILE_LABEL = "hermes/profile"
++LAST_USED_ANNOTATION = "hermes/last-used"
++_CONTAINER = "workspace"
++_READY_TIMEOUT_S = 300
++_POLL_S = 1.0
++_STAMP_EVERY_S = 60.0
++_CANCEL_GRACE_S = 5.0
++_STDIN_CHANNEL = 0
++# Waiting reasons that never resolve by themselves: fail fast instead of burning the Ready timeout.
++_FATAL_WAITING = frozenset({"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull",
++                            "CreateContainerConfigError", "CreateContainerError", "RunContainerError"})
++# PID 1 traps TERM so a pod delete finishes at once instead of waiting out the grace period.
++_KEEPALIVE = "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"
++# $1 pidfile, $2 stdin byte count, $3 command, $4 "-l" or "". The pidfile names the wrapper so a
++# timeout can kill the whole tree; stdin is length-framed (``head -c``) so EOF needs no channel close.
++_RUN_WRAPPER = """echo $$ > "${1:?}" || exit 125
++if [ "$2" -gt 0 ]; then
++  # no-tmp: ok — pod-side path inside the sandbox, never the host
++  f="/tmp/.hermes-stdin-$$"
++  (umask 077; head -c "$2" > "$f") || exit 125
++  exec 0< "$f"
++  rm -f -- "${f:?}"
++else
++  exec 0< /dev/null
++fi
++bash $4 -c "$3" 2>&1
++rc=$?
++rm -f -- "${1:?}"
++exit $rc
++"""
++# Freeze each process before walking its children so the tree cannot grow while it is killed.
++_KILL_TREE = """p=$(cat "${1:?}" 2>/dev/null) || exit 0
++kt() {
++  local c
++  kill -STOP "$1" 2>/dev/null
++  for c in $(cat /proc/"$1"/task/*/children 2>/dev/null || pgrep -P "$1" 2>/dev/null); do kt "$c"; done
++  kill -KILL "$1" 2>/dev/null
++}
++kt "$p"
++rm -f -- "${1:?}"
++"""
++
++
++def dns_label(text: str, max_len: int = 63) -> str:
++    """``text`` as a DNS-1123 label fragment (lowercase alnum and '-', no edge dashes)."""
++    label = re.sub(r"[^a-z0-9-]+", "-", str(text).lower()).strip("-")
++    return label[:max_len].strip("-") or "default"
++
++
++def pod_name(profile: str, session: str) -> str:
++    """Deterministic pod name for one (profile, session): ``hermes-<profile>-<10 hex>``, <= 63 chars."""
++    digest = hashlib.sha256(str(session).encode()).hexdigest()[:10]
++    return f"hermes-{dns_label(profile, 63 - len('hermes--') - len(digest))}-{digest}"
++
++
++def settings_from_config(raw: dict) -> dict:
++    """Constructor kwargs from the profile's ``terminal.kubernetes`` section (defaults filled in)."""
++    raw = raw if isinstance(raw, dict) else {}
++    settings = {key: raw[key] if raw.get(key) not in (None, "") else default for key, default in DEFAULTS.items()}
++    settings.update(labels=dict(settings["labels"] or {}), node_selector=dict(settings["node_selector"] or {}),
++                    tolerations=list(settings["tolerations"] or []))
++    settings.update(namespace=str(raw.get("namespace") or "").strip(), image=str(raw.get("image") or "").strip())
++    return settings
++
++
++def _load_kubernetes(context: str, kubeconfig: str = ""):
++    """(CoreV1Api, stream fn, ApiException). An explicit ``kubeconfig`` path wins; otherwise in-cluster
++    auth, else KUBECONFIG / ~/.kube/config. ``context`` picks a kubeconfig context."""
++    try:
++        ensure_lazy_dep("kubernetes")
++        from kubernetes import client, config
++        from kubernetes.client.exceptions import ApiException
++        from kubernetes.stream import stream
++    except ImportError as exc:
++        raise ImportError(f"{MISSING_EXTRA_MESSAGE}: {exc}") from exc
++    try:
++        if kubeconfig:
++            config.load_kube_config(config_file=str(Path(kubeconfig).expanduser()), context=context or None)
++        else:
++            try:
++                config.load_incluster_config()
++            except config.ConfigException:
++                config.load_kube_config(context=context or None)
++    except (config.ConfigException, OSError) as exc:
++        raise EnvironmentConnectionError(f"Kubernetes: no usable kubeconfig or in-cluster config: {exc}") from exc
++    _mirror_bearer_token(client)
++    return client.CoreV1Api(), stream, ApiException
++
++
++def _mirror_bearer_token(client) -> None:
++    """kubernetes 36.0.0's loaders store the token under ``api_key['authorization']`` but its
++    ``auth_settings()`` reads only ``api_key['BearerToken']``, so requests go without a token and the
++    API server answers 401. Mirror the key on the default configuration, and again after every
++    token refresh (in-cluster and exec tokens rotate). A no-op for clients that read 'authorization'."""
++    cfg_cls = getattr(client, "Configuration", None)
++    if cfg_cls is None:
++        return
++    cfg = cfg_cls.get_default_copy()
++    if "authorization" not in cfg.api_key or "BearerToken" in cfg.api_key:
++        return
++    inner = cfg.refresh_api_key_hook
++
++    def refresh(c) -> None:
++        if inner is not None:
++            inner(c)
++        if "authorization" in c.api_key:
++            c.api_key["BearerToken"] = c.api_key["authorization"]
++
++    cfg.api_key["BearerToken"] = cfg.api_key["authorization"]
++    cfg.refresh_api_key_hook = refresh
++    cfg_cls.set_default(cfg)
++
++
++def _now_iso() -> str:
++    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def _pod_failure(pod) -> str | None:
++    """Why *pod* can never become Ready, or None while it still might."""
++    status = pod.status
++    if status.phase in ("Failed", "Succeeded"):
++        return f"pod phase is {status.phase}"
++    for cs in status.container_statuses or ():
++        waiting = cs.state.waiting if cs.state else None
++        if waiting is not None and waiting.reason in _FATAL_WAITING:
++            return f"container {waiting.reason}: {waiting.message or ''}".strip()
++    return None
++
++
++def _pod_pending_detail(pod) -> str:
++    for cond in pod.status.conditions or ():
++        if cond.type == "PodScheduled" and cond.status != "True":
++            return f"not scheduled ({cond.reason}): {cond.message or ''}".strip()
++    return f"phase {pod.status.phase}"
++
++
++def _pod_ready(pod) -> bool:
++    return any(c.type == "Ready" and c.status == "True" for c in pod.status.conditions or ())
++
++
++def _idle_watch(env_ref, closed: threading.Event, idle_timeout: float) -> None:
++    """Reap the env's pod once idle. Holds only a weak reference so the env can still be collected."""
++    while not closed.wait(max(0.25, min(60.0, idle_timeout / 4))):
++        env = env_ref()
++        if env is None:
++            return
++        try:
++            env._reap_if_idle()
++        except EnvironmentConnectionError:
++            logger.warning("Kubernetes: idle reap of %s failed; will retry", env.pod_name, exc_info=True)
++        del env
++
++
++class KubernetesEnvironment(BaseEnvironment):
++    """Per-session pod; see the module docstring."""
++
++    _stdin_mode = "payload"  # length-framed over the exec stdin channel (see _RUN_WRAPPER)
++    _persistent = True  # the pod lives across turns; idle_timeout / cleanup() delete it
++
++    def __init__(self, *, namespace: str, image: str, profile: str, task_id: str = "default", cwd: str = WORKSPACE,
++                 timeout: int = 60, cpu: str = "1", memory: str = "2Gi", ephemeral_storage: str = "10Gi",
++                 idle_timeout: int = 1800, context: str = "", kubeconfig: str = "", labels: dict | None = None,
++                 workspace_pvc: str = "", workspace_subpath: str = "", workspace_mount: str = WORKSPACE,
++                 run_as_user: int = 1000,
++                 run_as_group: int = 1000, fs_group: int = 1000, node_selector: dict | None = None,
++                 tolerations: list | None = None):
++        if not namespace or not image:
++            raise ValueError("Kubernetes backend requires terminal.kubernetes.namespace and terminal.kubernetes.image "
++                             "in the profile's config.yaml")
++        if int(run_as_user) == 0:
++            raise ValueError("terminal.kubernetes.run_as_user must be non-zero: pods run with runAsNonRoot")
++        super().__init__(cwd=cwd or WORKSPACE, timeout=timeout)
++        self._core, self._stream, self._api_exc = _load_kubernetes(context, kubeconfig)
++        self.namespace, self.image, self.profile = namespace, image, profile
++        self.pod_name = pod_name(profile, task_id)
++        self.workspace_pvc, self._workspace_subpath = str(workspace_pvc or ""), str(workspace_subpath or "")
++        self._workspace_mount = str(workspace_mount or WORKSPACE)
++        if not self._workspace_mount.startswith("/") or self._workspace_mount.rstrip("/") in ("", HOME_DIR):
++            raise ValueError(f"Kubernetes: workspace_mount must be an absolute path other than / and {HOME_DIR}")
++        self._resources = {"cpu": str(cpu), "memory": str(memory), "ephemeral-storage": str(ephemeral_storage)}
++        self._ids = (int(run_as_user), int(run_as_group), int(fs_group))
++        self._node_selector, self._tolerations = dict(node_selector or {}), list(tolerations or [])
++        self._idle_timeout = float(idle_timeout)
++        self._labels = {**{str(k): str(v) for k, v in (labels or {}).items()},
++                        MANAGED_BY_LABEL[0]: MANAGED_BY_LABEL[1], PROFILE_LABEL: dns_label(profile)}
++        # _lock serialises pod lifecycle (it is held across init_session); _use_lock guards only the
++        # in-flight/last-used counters, which exec workers update without waiting on _lock.
++        self._lock = threading.RLock()
++        self._use_lock = threading.Lock()
++        self._inflight = 0
++        self._last_used = _monotonic()
++        self._last_stamp = 0.0
++        self._pod_live = False
++        self._closed = threading.Event()
++        self._ensure_pod()
++        self._sync_manager = FileSyncManager(
++            get_files_fn=lambda: iter_sync_files(f"{HOME_DIR}/.hermes"), upload_fn=self._upload,
++            delete_fn=self._delete_remote, bulk_upload_fn=self._bulk_upload, bulk_download_fn=self._bulk_download)
++        self._sync_manager.sync(force=True)
++        self.init_session()
++        from agent.memory_provider import spawn_context_thread
++        spawn_context_thread(_idle_watch, args=(weakref.ref(self), self._closed, self._idle_timeout),
++                             name=f"k8s-idle-{self.pod_name}").start()
++
++    # --- Kubernetes objects ---
++    def _read(self, fn, name):
++        try:
++            return fn(name, self.namespace)
++        except self._api_exc as exc:
++            if exc.status == 404:
++                return None
++            raise EnvironmentConnectionError(f"Kubernetes API error reading {name}: {exc.status} {exc.reason}") from exc
++
++    def _create(self, fn, body) -> None:
++        try:
++            fn(self.namespace, body)
++        except self._api_exc as exc:
++            if exc.status != 409:  # 409: a concurrent creator won the race; use theirs
++                raise EnvironmentConnectionError(
++                    f"Kubernetes: could not create {body['kind']} {body['metadata']['name']}: {exc.status} {exc.reason}") from exc
++
++    def _workspace_volume(self) -> tuple[dict, dict]:
++        """(volume, mount): the configured existing claim (never created here), else an emptyDir."""
++        mount = {"name": "workspace", "mountPath": self._workspace_mount}
++        if not self.workspace_pvc:
++            return {"name": "workspace", "emptyDir": {}}, mount
++        if self._workspace_subpath:
++            mount["subPath"] = self._workspace_subpath
++        return {"name": "workspace", "persistentVolumeClaim": {"claimName": self.workspace_pvc}}, mount
++
++    def pod_spec(self) -> dict:
++        uid, gid, fs_group = self._ids
++        seccomp = {"type": "RuntimeDefault"}
++        volume, mount = self._workspace_volume()
++        container = {
++            "name": _CONTAINER, "image": self.image, "command": ["sh", "-c", _KEEPALIVE],
++            "workingDir": self._workspace_mount, "env": [{"name": "HOME", "value": HOME_DIR}],
++            "resources": {"requests": dict(self._resources), "limits": dict(self._resources)},
++            "securityContext": {"runAsNonRoot": True, "runAsUser": uid, "runAsGroup": gid,
++                                "allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]},
++                                "seccompProfile": seccomp},
++            "volumeMounts": [mount, {"name": "home", "mountPath": HOME_DIR}]}
++        spec = {"automountServiceAccountToken": False, "restartPolicy": "Never", "terminationGracePeriodSeconds": 5,
++                "containers": [container], "volumes": [volume, {"name": "home", "emptyDir": {}}],
++                "securityContext": {"runAsNonRoot": True, "runAsUser": uid, "runAsGroup": gid, "fsGroup": fs_group,
++                                    "seccompProfile": seccomp}}
++        if self._node_selector:
++            spec["nodeSelector"] = dict(self._node_selector)
++        if self._tolerations:
++            spec["tolerations"] = list(self._tolerations)
++        return {"apiVersion": "v1", "kind": "Pod",
++                "metadata": {"name": self.pod_name, "namespace": self.namespace, "labels": dict(self._labels),
++                             "annotations": {LAST_USED_ANNOTATION: _now_iso()}},
++                "spec": spec}
++
++    def _ensure_pod(self) -> None:
++        """Reuse the session's running pod or create it; block until Ready."""
++        pod = self._read(self._core.read_namespaced_pod, self.pod_name)
++        if pod is not None and (pod.metadata.deletion_timestamp or _pod_failure(pod)):
++            self._delete_pod(wait=True)
++            pod = None
++        if pod is None:
++            self._create(self._core.create_namespaced_pod, self.pod_spec())
++            logger.info("Kubernetes: created pod %s/%s", self.namespace, self.pod_name)
++        self._wait_ready()
++        self._pod_live = True
++        self._stamp(force=True)
++
++    def _wait_ready(self) -> None:
++        deadline = _monotonic() + _READY_TIMEOUT_S
++        while True:
++            pod = self._read(self._core.read_namespaced_pod, self.pod_name)
++            if pod is None:
++                raise EnvironmentConnectionError(f"Kubernetes: pod {self.pod_name} disappeared while starting")
++            failure = _pod_failure(pod)
++            if failure:
++                raise EnvironmentConnectionError(f"Kubernetes: pod {self.namespace}/{self.pod_name} cannot start: {failure}")
++            if _pod_ready(pod):
++                return
++            if _monotonic() > deadline:
++                raise EnvironmentConnectionError(f"Kubernetes: pod {self.namespace}/{self.pod_name} not Ready after "
++                                                 f"{_READY_TIMEOUT_S}s: {_pod_pending_detail(pod)}")
++            _sleep(_POLL_S)
++
++    def _delete_pod(self, *, wait: bool = False) -> None:
++        try:
++            self._core.delete_namespaced_pod(self.pod_name, self.namespace, grace_period_seconds=5)
++        except self._api_exc as exc:
++            if exc.status != 404:
++                raise EnvironmentConnectionError(f"Kubernetes: could not delete pod {self.pod_name}: {exc.status} {exc.reason}") from exc
++        self._pod_live = False
++        deadline = _monotonic() + _READY_TIMEOUT_S
++        while wait and self._read(self._core.read_namespaced_pod, self.pod_name) is not None and _monotonic() < deadline:
++            _sleep(_POLL_S)
++
++    def _stamp(self, *, force: bool = False) -> None:
++        """Annotate ``hermes/last-used`` (at most once a minute) for an external reaper."""
++        if not force and _monotonic() - self._last_stamp < _STAMP_EVERY_S:
++            return
++        self._last_stamp = _monotonic()
++        patch = {"metadata": {"annotations": {LAST_USED_ANNOTATION: _now_iso()}}}
++        try:
++            self._core.patch_namespaced_pod(self.pod_name, self.namespace, patch)
++        except self._api_exc as exc:
++            logger.warning("Kubernetes: could not stamp %s on %s: %s", LAST_USED_ANNOTATION, self.pod_name, exc.reason)
++
++    # --- Idle reaping ---
++    def _reap_if_idle(self) -> bool:
++        """Delete the pod once idle past ``idle_timeout``; the next command recreates it."""
++        with self._lock:
++            with self._use_lock:
++                idle = not self._inflight and _monotonic() - self._last_used >= self._idle_timeout
++            if not (self._pod_live and idle):
++                return False
++            logger.info("Kubernetes: pod %s idle for %.0fs; deleting it", self.pod_name, self._idle_timeout)
++            self._delete_pod()
++            return True
++
++    def _touch(self, delta: int = 0) -> None:
++        with self._use_lock:
++            self._inflight += delta
++            self._last_used = _monotonic()
++
++    def _before_execute(self) -> None:
++        with self._lock:
++            self._touch()
++            pod = self._read(self._core.read_namespaced_pod, self.pod_name) if self._pod_live else None
++            if pod is None or pod.metadata.deletion_timestamp or _pod_failure(pod) or not _pod_ready(pod):
++                self._ensure_pod()
++                self._mark_recreated()
++                self._snapshot_ready = False
++                self.init_session()
++                self._sync_manager.sync(force=True)
++            else:
++                self._stamp()
++        self._sync_manager.sync()
++
++    # --- Exec ---
++    def _exec(self, argv: list[str], stdin: bytes | None = None, *, stop=None) -> tuple[bytes, int]:
++        """Run *argv* in the pod; ``(stdout + stderr bytes, exit code)``. 255 = no exit status (stream lost)."""
++        resp = self._stream(self._core.connect_get_namespaced_pod_exec, self.pod_name, self.namespace,
++                            command=argv, container=_CONTAINER, stdin=stdin is not None, stdout=True, stderr=True,
++                            tty=False, _preload_content=False, binary=True)
++        out, err = bytearray(), bytearray()
++        try:
++            if stdin is not None:
++                resp.write_stdin(stdin)
++                resp.close_channel(_STDIN_CHANNEL)
++            while resp.is_open() and not (stop and stop()):
++                resp.update(timeout=0.2)
++                out += resp.read_stdout(timeout=0)
++                err += resp.read_stderr(timeout=0)
++            out += resp.read_stdout(timeout=0)
++            err += resp.read_stderr(timeout=0)
++            if resp.is_open():
++                return bytes(out + err), 137
++            try:
++                code = resp.returncode
++            except (TypeError, KeyError, IndexError, ValueError):
++                code = None
++            if code is None:
++                return bytes(out + err) + b"\n[kubernetes exec stream closed without an exit status]", 255
++            return bytes(out + err), int(code)
++        finally:
++            resp.close()
++
++    def _exec_checked(self, argv: list[str], stdin: bytes | None = None) -> bytes:
++        try:
++            output, code = self._exec(argv, stdin)
++        except self._api_exc as exc:
++            raise EnvironmentConnectionError(f"Kubernetes exec {argv[:3]} failed: {exc.status} {exc.reason}") from exc
++        if code != 0:
++            raise EnvironmentConnectionError(f"Kubernetes exec {argv[:3]} failed ({code}): "
++                                             f"{output[-500:].decode('utf-8', 'replace')}")
++        return output
++
++    def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120, stdin_data: str | None = None):
++        payload = (stdin_data or "").encode("utf-8", "surrogateescape")
++        pidfile = f"{self.get_temp_dir()}/hermes-k8s-{uuid.uuid4().hex[:12]}.pid"
++        argv = ["bash", "-c", _RUN_WRAPPER, "hermes", pidfile, str(len(payload)), cmd_string, "-l" if login else ""]
++        cancelled_at: list[float] = []
++
++        def stop() -> bool:  # cancel() killed the tree; give the stream a grace period to report it
++            return bool(cancelled_at) and _monotonic() - cancelled_at[0] > _CANCEL_GRACE_S
++
++        def exec_fn() -> tuple[str, int]:
++            self._touch(+1)
++            try:
++                output, code = self._exec(argv, payload or None, stop=stop)
++            except self._api_exc as exc:
++                output, code = f"[kubernetes exec failed: {exc.status} {exc.reason}]".encode(), 255
++            finally:
++                self._touch(-1)
++            return output.decode("utf-8", "replace"), code
++
++        def cancel() -> None:
++            started = _monotonic()
++            cancelled_at.append(started)
++            try:
++                self._exec(["bash", "-c", _KILL_TREE, "hermes", pidfile],
++                           stop=lambda: _monotonic() - started > _CANCEL_GRACE_S * 3)
++            except self._api_exc as exc:
++                logger.warning("Kubernetes: killing timed-out command in %s failed: %s", self.pod_name, exc.reason)
++
++        return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
++
++    # --- File sync (host ~/.hermes -> pod $HOME/.hermes) ---
++    def _upload(self, host_path: str, remote_path: str) -> None:
++        data = Path(host_path).read_bytes()
++        self._exec_checked(["sh", "-c", 'mkdir -p "$(dirname "$1")" && head -c "$2" > "$1"', "sh",
++                            remote_path, str(len(data))], data)
++
++    def _bulk_upload(self, files: list[tuple[str, str]]) -> None:
++        if not files:
++            return
++        buf = io.BytesIO()
++        with tarfile.open(fileobj=buf, mode="w") as tar:
++            for host_path, remote_path in files:
++                tar.add(host_path, arcname=remote_path.lstrip("/"), recursive=False)
++        data = buf.getvalue()
++        self._exec_checked(["sh", "-c", 'head -c "$1" | tar xf - -C /', "sh", str(len(data))], data)
++
++    def _bulk_download(self, dest: Path) -> None:
++        tar = self._exec_checked(["tar", "cf", "-", "--exclude=*.sock", "-C", "/", f"{HOME_DIR.lstrip('/')}/.hermes"])
++        Path(dest).write_bytes(tar)
++
++    def _delete_remote(self, remote_paths: list[str]) -> None:
++        self._exec_checked(["sh", "-c", quoted_rm_command(remote_paths)])
++
++    def cleanup(self):
++        """Delete the session pod (a workspace claim is never touched)."""
++        closed = getattr(self, "_closed", None)
++        if closed is None or closed.is_set():
++            return
++        closed.set()
++        with self._lock:
++            if not self._pod_live:
++                return
++            try:
++                self._sync_manager.sync_back()
++            except (OSError, RuntimeError) as exc:
++                logger.warning("Kubernetes: sync_back from %s failed: %s", self.pod_name, exc)
++            try:
++                self._delete_pod()
++                logger.info("Kubernetes: deleted pod %s/%s", self.namespace, self.pod_name)
++            except EnvironmentConnectionError as exc:
++                logger.warning("Kubernetes: cleanup of %s failed: %s", self.pod_name, exc)
+diff --git a/tools/file_tools_paths.py b/tools/file_tools_paths.py
+index d1abab1507..897eb61a10 100644
+--- a/tools/file_tools_paths.py
++++ b/tools/file_tools_paths.py
+@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
+ # ``TERMINAL_CWD`` values that mean "not configured" ("." from a stale config;
+ # "auto"/"cwd" are wizard placeholders). gateway/run.py sanitizes the same set.
+ _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
+-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "modal", "daytona", "vercel_sandbox"})
++_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "modal", "daytona", "vercel_sandbox", "kubernetes"})
+ # Backend name inferred from the live environment's class name (first match wins).
+-_ENV_CLASS_NAME_HINTS = ("local", "ssh", "docker", "modal", "daytona")
++_ENV_CLASS_NAME_HINTS = ("local", "ssh", "docker", "modal", "daytona", "kubernetes")
+ # Container task id -> monotonic time of the last failed environment bring-up in path resolution (an SSH
+ # home, or a plugin sandbox's ``~`` home).
+ _SSH_HOME_RETRY_AFTER = 30.0
+diff --git a/tools/skills_tool_setup.py b/tools/skills_tool_setup.py
+index ba6354dc52..cc819f34b5 100644
+--- a/tools/skills_tool_setup.py
++++ b/tools/skills_tool_setup.py
+@@ -13,7 +13,7 @@ from utils import env_var_enabled
+ logger = logging.getLogger("tools.skills_tool")
+ 
+ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+-_REMOTE_ENV_BACKENDS = frozenset({"docker", "modal", "ssh", "daytona", "vercel_sandbox"})
++_REMOTE_ENV_BACKENDS = frozenset({"docker", "modal", "ssh", "daytona", "vercel_sandbox", "kubernetes"})
+ 
+ 
+ class SkillReadinessStatus(str, Enum):
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index dcd0776a5d..3396595445 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -719,7 +719,7 @@ def _ensure_terminal_env_bridged() -> None:
+ 
+ 
+ # Default cwd per backend; plugins may declare ``default_cwd``; anything else (container backends) is "/root".
+-_DEFAULT_CWD_BY_BACKEND = {"ssh": "~", "vercel_sandbox": _VERCEL_SANDBOX_DEFAULT_CWD}
++_DEFAULT_CWD_BY_BACKEND = {"ssh": "~", "vercel_sandbox": _VERCEL_SANDBOX_DEFAULT_CWD, "kubernetes": "/workspace"}
+ 
+ 
+ def _backend_default_cwd(env_type: str) -> str:
+diff --git a/tools/terminal_tool_backends.py b/tools/terminal_tool_backends.py
+index 5c752c5b14..3fecfa0195 100644
+--- a/tools/terminal_tool_backends.py
++++ b/tools/terminal_tool_backends.py
+@@ -49,7 +49,7 @@ def terminal_backend_unavailable_reason() -> Optional[str]:
+ 
+ _VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
+ _SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
+-_BUILTIN_BACKENDS = "local, docker, modal, daytona, vercel_sandbox, ssh"
++_BUILTIN_BACKENDS = "local, docker, modal, daytona, vercel_sandbox, ssh, kubernetes"
+ 
+ # Config -> kwargs shapers, driven by (out_key, config_key, default) tables. The container table's
+ # (key, default) literal is intentionally greppable; tools/terminal_tool.py keeps its own for the AST test.
+@@ -210,6 +210,20 @@ def _build_ssh_env(*, cwd, timeout, ssh_config, probe_only=False, **_):
+                            persistent=ssh_config.get("persistent", True))
+ 
+ 
++def _kubernetes_section() -> dict:
++    """The served profile's ``terminal.kubernetes`` section: namespace/image never come from the model."""
++    from hermes_cli.config import load_config_readonly
++    section = (load_config_readonly().get("terminal") or {}).get("kubernetes")
++    return section if isinstance(section, dict) else {}
++
++
++def _build_kubernetes_env(*, cwd, timeout, task_id, **_):
++    from hermes_cli.profiles import current_profile_name
++    from tools.environments.kubernetes import KubernetesEnvironment, settings_from_config
++    return KubernetesEnvironment(cwd=cwd, timeout=timeout, task_id=task_id, profile=current_profile_name("default"),
++                                 **settings_from_config(_kubernetes_section()))
++
++
+ def _stamp_sandbox_home(env_obj, provider, cwd) -> None:
+     """Record the provider's declared home on this environment: a declared absolute path whatever ``cwd`` the
+     environment started in (``terminal.cwd`` may pick another directory), or, for ``~``, the path it resolved
+@@ -268,7 +282,7 @@ def _build_plugin_env(*, env_type, image, cwd, timeout, cc, task_id, **_):
+ # Built-in backend -> builder. Anything else is looked up in the plugin registry.
+ _ENV_BUILDERS = {"local": _build_local_env, "docker": _build_docker_env, "modal": _build_modal_env,
+                  "daytona": _build_daytona_env, "vercel_sandbox": _build_vercel_env,
+-                 "ssh": _build_ssh_env}
++                 "ssh": _build_ssh_env, "kubernetes": _build_kubernetes_env}
+ 
+ 
+ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
+@@ -341,6 +355,15 @@ def _ssh_pre(config: dict[str, Any]) -> bool:
+                    "run `hermes setup terminal` to enter them or pick the 'local' backend")
+ 
+ 
++def _kubernetes_pre(config: dict[str, Any]) -> Optional[bool]:
++    from tools.environments.kubernetes import settings_from_config
++    settings = settings_from_config(_kubernetes_section())
++    if settings["namespace"] and settings["image"]:
++        return None
++    return _reject("the kubernetes backend needs terminal.kubernetes.namespace and terminal.kubernetes.image "
++                   "in this profile's config.yaml")
++
++
+ def _daytona_post(config: dict[str, Any]) -> bool:
+     from daytona import Daytona
+     from agent.secret_scope import get_secret
+@@ -356,6 +379,9 @@ _BACKEND_SPECS: dict[str, dict[str, Any]] = {
+               "module": ("modal", "modal is required for direct modal terminal backend. Run hermes setup terminal and select Modal.")},
+     "vercel_sandbox": {"pre": _check_vercel},
+     "daytona": {"post": _daytona_post},
++    "kubernetes": {"pre": _kubernetes_pre,
++                   "module": ("kubernetes", "the kubernetes Python client is missing: install the optional "
++                              "'kubernetes' extra (run hermes setup terminal and select Kubernetes)")},
+ }
+ 
+ 
+diff --git a/tools/terminal_tool_config.py b/tools/terminal_tool_config.py
+index bf7c841fd9..1e98b4f0a6 100644
+--- a/tools/terminal_tool_config.py
++++ b/tools/terminal_tool_config.py
+@@ -115,7 +115,7 @@ def cwd_follows_host_mount(cwd: str, mount: str) -> bool:
+         return True
+     return cwd == "/workspace" and mount != "/workspace"
+ 
+-_CONTAINER_BACKENDS = frozenset({"docker", "modal", "daytona", "vercel_sandbox"})
++_CONTAINER_BACKENDS = frozenset({"docker", "modal", "daytona", "vercel_sandbox", "kubernetes"})
+ _BUILTIN_BACKENDS = _CONTAINER_BACKENDS | {"local", "ssh", "managed_modal"}
+ 
+ 
+diff --git a/uv.lock b/uv.lock
+index 90887dcd4b..4e98ad70a1 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1693,6 +1693,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/a7/5f/ed01f9a3cdffbd5a008556fc7b2a08ddb1cc6ace7effa7340604b1d16699/docstring_parser-0.18.0-py3-none-any.whl", hash = "sha256:b3fcbed555c47d8479be0796ef7e19c2670d428d72e96da63f3a40122860374b", size = 22484, upload-time = "2026-04-14T04:09:18.638Z" },
+ ]
+ 
++[[package]]
++name = "durationpy"
++version = "0.11"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/b0/5d/5f8571bd5dedc80863191621ac4be001f3f3dd8315d2ec078705dab7dec1/durationpy-0.11.tar.gz", hash = "sha256:181898e1ae282e288f0a2291829656bf1b6b3aadf30a97993b85db4943642905", size = 3582, upload-time = "2026-08-26T13:56:00.991Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e6/c4/ebdf7837bc4ef6fd98cfb013c28855bb358467bf86c1af011bbc21e21df0/durationpy-0.11-py3-none-any.whl", hash = "sha256:a739fe2b8972c250ff72f8e2c488d18cf25f7b852f49ee76048775d5171df30c", size = 4133, upload-time = "2026-08-26T13:55:59.456Z" },
++]
++
+ [[package]]
+ name = "edge-tts"
+ version = "7.3.1"
+@@ -2453,6 +2462,9 @@ kittentts = [
+     { name = "misaki", extra = ["en"], marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'ARM64' and sys_platform == 'win32') or (sys_platform != 'android' and sys_platform != 'darwin' and sys_platform != 'win32')" },
+     { name = "soundfile", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin') or (platform_machine != 'ARM64' and sys_platform == 'win32') or (sys_platform != 'android' and sys_platform != 'darwin' and sys_platform != 'win32')" },
+ ]
++kubernetes = [
++    { name = "kubernetes" },
++]
+ matrix = [
+     { name = "aiohttp", marker = "sys_platform == 'linux'" },
+     { name = "aiohttp-socks", marker = "sys_platform == 'linux'" },
+@@ -2678,6 +2690,7 @@ requires-dist = [
+     { name = "jinja2", marker = "python_full_version >= '3.14'", specifier = "==3.1.6" },
+     { name = "keyring", marker = "extra == 'keychain'", specifier = "==25.7.0" },
+     { name = "kittentts", marker = "(platform_machine != 'x86_64' and sys_platform == 'darwin' and extra == 'kittentts') or (platform_machine != 'ARM64' and sys_platform == 'win32' and extra == 'kittentts') or (sys_platform != 'android' and sys_platform != 'darwin' and sys_platform != 'win32' and extra == 'kittentts')", url = "https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl" },
++    { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = "==36.0.0" },
+     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = "==1.7.5" },
+     { name = "markdown", marker = "python_full_version >= '3.14'", specifier = "==3.11.2" },
+     { name = "mautrix", extras = ["encryption"], marker = "sys_platform == 'linux' and extra == 'matrix'", specifier = "==0.21.1" },
+@@ -2775,7 +2788,7 @@ requires-dist = [
+     { name = "winrt-windows-services-store", marker = "python_full_version >= '3.14' and sys_platform == 'win32'", specifier = ">=3.2.1,<4" },
+     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
+ ]
+-provides-extras = ["uvloop", "anthropic", "exa", "firecrawl", "parallel-web", "ddgs", "fal", "edge-tts", "neutts", "kittentts", "piper", "modal", "daytona", "vercel", "google-meet", "messaging", "cron", "slack", "matrix", "wecom", "keychain", "tts-premium", "voice", "wake", "telegram", "discord", "stt-whisper", "audio-io", "silk", "wake-openwakeword", "wake-sherpa", "wake-porcupine", "google-chat", "doc-extract", "documents", "documents-pdf", "trace-upload", "vision", "pty", "mcp", "nemo-relay", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
++provides-extras = ["uvloop", "anthropic", "exa", "firecrawl", "parallel-web", "ddgs", "fal", "edge-tts", "neutts", "kittentts", "piper", "modal", "daytona", "kubernetes", "vercel", "google-meet", "messaging", "cron", "slack", "matrix", "wecom", "keychain", "tts-premium", "voice", "wake", "telegram", "discord", "stt-whisper", "audio-io", "silk", "wake-openwakeword", "wake-sherpa", "wake-porcupine", "google-chat", "doc-extract", "documents", "documents-pdf", "trace-upload", "vision", "pty", "mcp", "nemo-relay", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+ 
+ [package.metadata.requires-dev]
+ dev = [
+@@ -3285,6 +3298,27 @@ requires-dist = [
+     { name = "spacy" },
+ ]
+ 
++[[package]]
++name = "kubernetes"
++version = "36.0.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "aiohttp" },
++    { name = "certifi" },
++    { name = "durationpy" },
++    { name = "python-dateutil" },
++    { name = "pyyaml" },
++    { name = "requests" },
++    { name = "requests-oauthlib" },
++    { name = "six" },
++    { name = "urllib3" },
++    { name = "websocket-client" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/bf/59/dc635e4e9afb3884bc5c57f14fe23783e4c04601aa20b835ac75c41d1625/kubernetes-36.0.0.tar.gz", hash = "sha256:027b606bb8032e6c6464a53236bdd9bd9a94c237e1063bc45a303c25b304ced9", size = 2346728, upload-time = "2026-05-20T20:44:24.28Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/cd/d2/6f99ca9c7eb961dfdd45b9643101399a8ee20922c662c362c91e9cc7e832/kubernetes-36.0.0-py2.py3-none-any.whl", hash = "sha256:a766433357ec9f90db7565cccf52e28e7fca40b0ef366c80a6022adbc0ac0425", size = 4660469, upload-time = "2026-05-20T20:44:20.893Z" },
++]
++
+ [[package]]
+ name = "language-tags"
+ version = "1.3.1"
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 7e6b08a5aa..7e42ac6f54 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -222,11 +222,11 @@ Before that stash step, Hermes also restores tracked `package-lock.json` diffs l
+ 
+ ## Terminal Backend Configuration
+ 
+-Hermes ships six terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, or a Vercel Sandbox. Plugins add more, such as the official [Singularity/Apptainer](#singularityapptainer-backend) backend.
++Hermes ships seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, or a pod on a Kubernetes cluster. Plugins add more, such as the official [Singularity/Apptainer](#singularityapptainer-backend) backend.
+ 
+ ```yaml
+ terminal:
+-  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | <plugin backend>
++  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | kubernetes | <plugin backend>
+   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
+   temp_dir: ""      # Session temp root; empty = TMPDIR, else ~/.hermes/cache/terminal
+   font_family: ""   # Desktop terminal font; e.g. "MesloLGS NF"
+@@ -301,6 +301,7 @@ For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persi
+ | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
+ | **vercel_sandbox** | Vercel Sandbox | Full (cloud microVM) | Cloud execution with snapshot-backed filesystem persistence |
+ | **singularity** (plugin) | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
++| **kubernetes** | One pod per session on your cluster | Full (pod, non-root, no capabilities) | Running agents on shared cluster capacity |
+ 
+ ### Local Backend
+ 
+@@ -561,6 +562,40 @@ terminal:
+ 
+ **Disk limit:** Daytona enforces a 10 GiB maximum. Requests above this are capped with a warning.
+ 
++### Kubernetes Backend
++
++Runs each session's commands in its own pod, in a namespace you configure. The backend only creates, reads, deletes and execs into pods, so a ServiceAccount limited to `pods` (create/get/list/watch/delete), `pods/exec` and `pods/log` in that namespace is enough; it never creates or deletes a PersistentVolumeClaim.
++
++```yaml
++terminal:
++  backend: kubernetes
++  kubernetes:
++    namespace: agents              # required; read only from config, never from a command
++    image: ghcr.io/you/sandbox:1   # required; needs bash
++    kubeconfig: ""                 # explicit kubeconfig path; "" = in-cluster, else KUBECONFIG / ~/.kube/config
++    context: ""                    # kubeconfig context
++    cpu: "1"                       # requests = limits for cpu, memory and ephemeral storage
++    memory: 2Gi
++    ephemeral_storage: 10Gi
++    idle_timeout: 1800             # seconds idle before the pod is deleted
++    workspace_pvc: ""              # an EXISTING claim (e.g. RWX/EFS) to mount at /workspace; "" = emptyDir
++    workspace_subpath: ""          # subPath inside that claim
++    run_as_user: 1000              # match the uid that owns the workspace files (must be non-zero)
++    run_as_group: 1000
++    fs_group: 1000
++    node_selector: {}
++    tolerations: []
++    labels: {}                     # extra pod labels
++```
++
++**Install:** the `kubernetes` Python client is an optional extra; `hermes setup terminal` (Kubernetes) installs it.
++
++**Pods:** one per (profile, session), named `hermes-<profile>-<hash>` and labelled `app.kubernetes.io/managed-by=hermes` and `hermes/profile=<profile>`. A running pod is reused; a missing or failed one is created and Hermes waits up to 5 minutes for it to be Ready, failing fast on image-pull and container-config errors. Pods run with `runAsNonRoot` under the configured uid/gid, no privilege escalation, all capabilities dropped, the `RuntimeDefault` seccomp profile and no service-account token.
++
++**Workspace:** `/workspace` (the default cwd and `$HOME`) is the claim named by `workspace_pvc`, mounted at `workspace_subpath`, or an emptyDir that disappears with the pod when no claim is set.
++
++**Lifecycle:** a pod idle for `idle_timeout` seconds, or whose session is cleaned up (including the terminal tool's own `lifetime_seconds` reaper), is deleted and the next command recreates it. Each use stamps the pod annotation `hermes/last-used` (at most once a minute) so an external reaper can act on abandoned pods.
++
+ ### Vercel Sandbox Backend
+ 
+ Runs commands in a [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) cloud microVM. Hermes uses the normal terminal and file tool surfaces; there are no Vercel-specific model-facing tools.
+diff --git a/website/docs/user-guide/features/tools.md b/website/docs/user-guide/features/tools.md
+index 9059cffeef..a1c448590b 100644
+--- a/website/docs/user-guide/features/tools.md
++++ b/website/docs/user-guide/features/tools.md
+@@ -77,13 +77,14 @@ The terminal tool can execute commands in different environments:
+ | `modal` | Cloud execution | Serverless, scale |
+ | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
+ | `vercel_sandbox` | Vercel Sandbox cloud microVM | Cloud execution with snapshot-backed filesystem persistence |
++| `kubernetes` | One pod per session on a Kubernetes cluster | Agents on shared cluster capacity, optional existing workspace claim |
+ 
+ ### Configuration
+ 
+ ```yaml
+ # In ~/.hermes/config.yaml
+ terminal:
+-  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, or a plugin backend (singularity)
++  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, kubernetes, or a plugin backend (singularity)
+   cwd: "."          # Working directory
+   timeout: 180      # Command timeout in seconds
+ ```
+-- 
+2.54.0 (Apple Git-157)
+

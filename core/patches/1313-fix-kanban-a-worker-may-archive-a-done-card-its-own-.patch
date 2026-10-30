@@ -1,0 +1,528 @@
+From bb08052cd8c4fc1bba16eb7be32ef460a0befb19 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 18:29:32 +0000
+Subject: [PATCH] fix(kanban): a worker may archive a done card its own task
+ created [daveey]
+
+A scratch waiter a worker creates for a live proof is claimed when it wakes and
+completed by its own worker. The creator rule only allowed unclaimed cards
+(the misplaced-copy cleanup from 4f6e223fe84, which refused done cards with no
+stated reason), so the creator could never archive it and six such waiters
+leaked on 10-30. A done card with no live claim and no open card listing it
+as a parent may now be archived by its creator, as done capability owner cards
+already could. Running/claimed cards, done cards with open children, foreign
+cards and the worker's own task are still refused.
+
+The archive-scope rules move to hermes_cli/kanban_archive_scope.py (re-exported
+from hermes_cli.kanban) to keep kanban.py under its line cap.
+---
+ hermes_cli/kanban.py                          | 150 ++--------------
+ hermes_cli/kanban_archive_scope.py            | 169 ++++++++++++++++++
+ .../test_kanban_creator_archive_done.py       | 114 ++++++++++++
+ tools/kanban_tools.py                         |   2 +-
+ tools/kanban_tools_schemas.py                 |  10 +-
+ 5 files changed, 300 insertions(+), 145 deletions(-)
+ create mode 100644 hermes_cli/kanban_archive_scope.py
+ create mode 100644 tests/hermes_cli/test_kanban_creator_archive_done.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index f2c917edbd..ce21a4e7b8 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -41,6 +41,16 @@ from hermes_cli.kanban_ops import (
+ )
+ from hermes_cli.kanban_parser import build_parser
+ from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
++from hermes_cli.kanban_archive_scope import (  # moved here from this module; re-exported for callers
++    _capability_owner_waiting_card,
++    _creator_task_id,
++    _is_stranded_runs_on_copy,
++    _worker_may_archive_capability_owner,
++    _worker_may_archive_own,
++    archive_scope_for,
++    worker_archive_scope,
++    worker_may_archive,
++)
+ from hermes_cli.kanban_requeue import (  # moved here from this module; re-exported for callers
+     OWNER_WAKE_REQUEUE_STATUSES, _is_owner_wake_supervisor, _is_self_heal_fix_card, has_requeue_grant,
+     named_defect_card, owner_wake_listed_cards, requeue_grant, self_heal_requeue_grant,
+@@ -1104,146 +1114,6 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
+         return None
+ 
+ 
+-def _creator_task_id(conn, task_id: str) -> Optional[str]:
+-    """The task that created ``task_id``, from the created-event payload (not a column)."""
+-    row = conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+-        "ORDER BY id ASC LIMIT 1",
+-        (task_id,),
+-    ).fetchone()
+-    if not row or not row[0]:
+-        return None
+-    try:
+-        return json.loads(row[0]).get("creator_task_id")
+-    except (TypeError, ValueError):
+-        return None
+-
+-
+-_TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{16}\b")
+-_REFILED_RE = re.compile(r"\bre-?filed\b", re.IGNORECASE)
+-
+-
+-def _is_stranded_runs_on_copy(conn, task) -> bool:
+-    """A foreign card no machine will ever run, already re-filed elsewhere. [daveey]
+-
+-    All must hold: ``ready``; no ``claimed`` event ever; ``runs_on`` has at least one
+-    ``machine:<m>`` label and every such ``<m>`` is another gateway that
+-    ``placement_runs_on`` refuses today (no advertised pickup), read from a reachable
+-    machine registry; and a comment says it was re-filed, naming another task id.
+-    """
+-    from hermes_cli import kanban_db_sync as ksync
+-    from hermes_cli import kanban_worker_node as wn
+-
+-    if task.status != "ready":
+-        return False
+-    if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' LIMIT 1",
+-                    (task.id,)).fetchone():
+-        return False
+-    try:
+-        if "runs_on" not in ksync.table_columns(conn, "tasks"):
+-            return False
+-        row = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (task.id,)).fetchone()
+-        machines = [label.split(":", 1)[1] for label in (wn._parse(row[0] if row else None) or [])
+-                    if label.startswith("machine:")]
+-        if not machines or wn.registry() is None:
+-            return False
+-        own = wn._own(conn)
+-        if any(not m or m == own or wn.placement_runs_on(conn, m) for m in machines):
+-            return False
+-    except Exception:  # health: allow BLE001 -- unreadable sync state: not provably stranded, refuse
+-        return False
+-    for (body,) in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (task.id,)):
+-        body = body or ""
+-        if _REFILED_RE.search(body) and any(t != task.id for t in _TASK_ID_RE.findall(body)):
+-            return True
+-    return False
+-
+-
+-def worker_archive_scope(conn, task_id: str) -> tuple[Optional[str], Optional[str]]:
+-    """``(refusal, via)`` for archiving ``task_id`` from this process.
+-
+-    ``refusal`` is None when allowed. ``via`` is set when the archive is allowed only
+-    as a stranded-``runs_on`` sweep of a foreign card; record it on the archived event.
+-    """
+-    return archive_scope_for(conn, task_id, os.environ.get("HERMES_KANBAN_TASK"))
+-
+-
+-def archive_scope_for(conn, task_id: str, env_tid: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+-    """:func:`worker_archive_scope` for a worker scoped to ``env_tid`` (None: unscoped, any card).
+-
+-    The home gateway applies it to an archive a Board worker node forwarded for a relayed capability owner
+-    card (:mod:`hermes_cli.kanban_owner_archive_relay`), where the scope comes from the request, not the env.
+-    """
+-    if not env_tid:
+-        return None, None
+-    if env_tid == task_id:
+-        return ("refusing to archive the assigned task; finish it with kanban_complete"), None
+-    task = kb.get_task(conn, task_id)
+-    if task is None:
+-        return f"no such task: {task_id}", None
+-    waiting = _capability_owner_waiting_card(task)
+-    if waiting and (waiting == env_tid or _creator_task_id(conn, waiting) == env_tid):
+-        return _worker_may_archive_capability_owner(task, waiting), f"capability owner of {waiting} by {env_tid}"
+-    if _creator_task_id(conn, task_id) != env_tid:
+-        if not (task.claim_lock or task.worker_pid) and _is_stranded_runs_on_copy(conn, task):
+-            return None, f"stranded-runs_on sweep by {env_tid}"
+-        return (f"worker is scoped to task {env_tid}; refusing to archive {task_id}. "
+-                "A worker may archive only an unclaimed card its own task created."), None
+-    return _worker_may_archive_own(task), None
+-
+-
+-def worker_may_archive(conn, task_id: str) -> Optional[str]:
+-    """None if this process may archive ``task_id``, else the refusal.
+-
+-    A dispatcher worker may archive an unclaimed card its own task created
+-    (``creator_task_id`` is ``HERMES_KANBAN_TASK``), or a foreign card that is a
+-    provably stranded ``runs_on`` copy (see ``_is_stranded_runs_on_copy``), or a done or
+-    unclaimed capability owner card (``capability-owner:<card>:...``) whose ``<card>`` is
+-    ``HERMES_KANBAN_TASK`` or a card that task created. A reviewer of that task runs with the
+-    same ``HERMES_KANBAN_TASK``, so it may archive them too. Every
+-    other foreign card is refused — that is the "scoped worker can't archive it"
+-    wall. No env task (a human or an orchestrator) may archive any card, as before.
+-    """
+-    return worker_archive_scope(conn, task_id)[0]
+-
+-
+-def _capability_owner_waiting_card(task) -> Optional[str]:
+-    """The waiting card of a capability owner card (``capability-owner:<card>:<need>``), else None.
+-
+-    Owner cards are created by the routing path (``created_by="capability-relay"`` for a
+-    relayed local owner), never by the waiting card's task, so the creator rule alone
+-    never lets that task clean them up. [daveey]
+-    """
+-    from hermes_cli.kanban_capability_routing import _task_of
+-
+-    return _task_of(task.idempotency_key or "")
+-
+-
+-def _worker_may_archive_capability_owner(task, waiting: str) -> Optional[str]:
+-    """The refusal for an owner card of ``waiting`` (the worker's task or a card it created), else None.
+-
+-    A done owner card may be archived (the readback is in; this is the cleanup), and so may an
+-    unclaimed one. A claimed owner card is refused: its worker is doing the action.
+-    """
+-    if task.status == "archived":
+-        return f"cannot archive {task.id}: status=archived"
+-    if task.status != "done" and (task.status == "running" or task.claim_lock or task.worker_pid):
+-        return (f"cannot archive {task.id}: capability owner card of {waiting} is claimed "
+-                f"(status={task.status}). A worker may archive only a done or unclaimed owner card.")
+-    return None
+-
+-
+-def _worker_may_archive_own(task) -> Optional[str]:
+-    """The refusal for a card this worker's task created, else None."""
+-    task_id = task.id
+-    if task.status == "running" or task.claim_lock or task.worker_pid:
+-        return (f"cannot archive {task_id}: it is claimed (status={task.status}). "
+-                "A worker may archive only an unclaimed card its own task created.")
+-    if task.status in ("done", "archived"):
+-        return f"cannot archive {task_id}: status={task.status}"
+-    return None
+-
+-
+ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str,
+                                  handoff_tool: str = "kanban_complete", *, verified=None):
+     """Goal judge for every terminal worker handoff (including review).
+diff --git a/hermes_cli/kanban_archive_scope.py b/hermes_cli/kanban_archive_scope.py
+new file mode 100644
+index 0000000000..6771b19089
+--- /dev/null
++++ b/hermes_cli/kanban_archive_scope.py
+@@ -0,0 +1,169 @@
++"""Who a scoped Kanban worker may archive. [daveey]
++
++Moved out of :mod:`hermes_cli.kanban` (which re-exports every name) to keep that module under
++its line cap. A dispatcher worker (``HERMES_KANBAN_TASK`` set) may archive an unclaimed or done
++card its own task created, a done or unclaimed capability owner card of its task (or of a card
++its task created), or a provably stranded foreign ``runs_on`` copy; every other card is refused.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++from typing import Optional
++
++from hermes_cli import kanban_db as kb
++
++
++def _creator_task_id(conn, task_id: str) -> Optional[str]:
++    """The task that created ``task_id``, from the created-event payload (not a column)."""
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
++        "ORDER BY id ASC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if not row or not row[0]:
++        return None
++    try:
++        return json.loads(row[0]).get("creator_task_id")
++    except (TypeError, ValueError):
++        return None
++
++
++_TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{16}\b")
++_REFILED_RE = re.compile(r"\bre-?filed\b", re.IGNORECASE)
++
++
++def _is_stranded_runs_on_copy(conn, task) -> bool:
++    """A foreign card no machine will ever run, already re-filed elsewhere. [daveey]
++
++    All must hold: ``ready``; no ``claimed`` event ever; ``runs_on`` has at least one
++    ``machine:<m>`` label and every such ``<m>`` is another gateway that
++    ``placement_runs_on`` refuses today (no advertised pickup), read from a reachable
++    machine registry; and a comment says it was re-filed, naming another task id.
++    """
++    from hermes_cli import kanban_db_sync as ksync
++    from hermes_cli import kanban_worker_node as wn
++
++    if task.status != "ready":
++        return False
++    if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' LIMIT 1",
++                    (task.id,)).fetchone():
++        return False
++    try:
++        if "runs_on" not in ksync.table_columns(conn, "tasks"):
++            return False
++        row = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (task.id,)).fetchone()
++        machines = [label.split(":", 1)[1] for label in (wn._parse(row[0] if row else None) or [])
++                    if label.startswith("machine:")]
++        if not machines or wn.registry() is None:
++            return False
++        own = wn._own(conn)
++        if any(not m or m == own or wn.placement_runs_on(conn, m) for m in machines):
++            return False
++    except Exception:  # health: allow BLE001 -- unreadable sync state: not provably stranded, refuse
++        return False
++    for (body,) in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (task.id,)):
++        body = body or ""
++        if _REFILED_RE.search(body) and any(t != task.id for t in _TASK_ID_RE.findall(body)):
++            return True
++    return False
++
++
++def worker_archive_scope(conn, task_id: str) -> tuple[Optional[str], Optional[str]]:
++    """``(refusal, via)`` for archiving ``task_id`` from this process.
++
++    ``refusal`` is None when allowed. ``via`` is set when the archive is allowed only
++    as a stranded-``runs_on`` sweep of a foreign card; record it on the archived event.
++    """
++    return archive_scope_for(conn, task_id, os.environ.get("HERMES_KANBAN_TASK"))
++
++
++def archive_scope_for(conn, task_id: str, env_tid: Optional[str]) -> tuple[Optional[str], Optional[str]]:
++    """:func:`worker_archive_scope` for a worker scoped to ``env_tid`` (None: unscoped, any card).
++
++    The home gateway applies it to an archive a Board worker node forwarded for a relayed capability owner
++    card (:mod:`hermes_cli.kanban_owner_archive_relay`), where the scope comes from the request, not the env.
++    """
++    if not env_tid:
++        return None, None
++    if env_tid == task_id:
++        return ("refusing to archive the assigned task; finish it with kanban_complete"), None
++    task = kb.get_task(conn, task_id)
++    if task is None:
++        return f"no such task: {task_id}", None
++    waiting = _capability_owner_waiting_card(task)
++    if waiting and (waiting == env_tid or _creator_task_id(conn, waiting) == env_tid):
++        return _worker_may_archive_capability_owner(task, waiting), f"capability owner of {waiting} by {env_tid}"
++    if _creator_task_id(conn, task_id) != env_tid:
++        if not (task.claim_lock or task.worker_pid) and _is_stranded_runs_on_copy(conn, task):
++            return None, f"stranded-runs_on sweep by {env_tid}"
++        return (f"worker is scoped to task {env_tid}; refusing to archive {task_id}. "
++                "A worker may archive only an unclaimed or done card its own task created."), None
++    return _worker_may_archive_own(conn, task), None
++
++
++def worker_may_archive(conn, task_id: str) -> Optional[str]:
++    """None if this process may archive ``task_id``, else the refusal.
++
++    A dispatcher worker may archive an unclaimed card its own task created
++    (``creator_task_id`` is ``HERMES_KANBAN_TASK``), or a done one with no open card
++    listing it as a parent, or a foreign card that is a
++    provably stranded ``runs_on`` copy (see ``_is_stranded_runs_on_copy``), or a done or
++    unclaimed capability owner card (``capability-owner:<card>:...``) whose ``<card>`` is
++    ``HERMES_KANBAN_TASK`` or a card that task created. A reviewer of that task runs with the
++    same ``HERMES_KANBAN_TASK``, so it may archive them too. Every
++    other foreign card is refused — that is the "scoped worker can't archive it"
++    wall. No env task (a human or an orchestrator) may archive any card, as before.
++    """
++    return worker_archive_scope(conn, task_id)[0]
++
++
++def _capability_owner_waiting_card(task) -> Optional[str]:
++    """The waiting card of a capability owner card (``capability-owner:<card>:<need>``), else None.
++
++    Owner cards are created by the routing path (``created_by="capability-relay"`` for a
++    relayed local owner), never by the waiting card's task, so the creator rule alone
++    never lets that task clean them up. [daveey]
++    """
++    from hermes_cli.kanban_capability_routing import _task_of
++
++    return _task_of(task.idempotency_key or "")
++
++
++def _worker_may_archive_capability_owner(task, waiting: str) -> Optional[str]:
++    """The refusal for an owner card of ``waiting`` (the worker's task or a card it created), else None.
++
++    A done owner card may be archived (the readback is in; this is the cleanup), and so may an
++    unclaimed one. A claimed owner card is refused: its worker is doing the action.
++    """
++    if task.status == "archived":
++        return f"cannot archive {task.id}: status=archived"
++    if task.status != "done" and (task.status == "running" or task.claim_lock or task.worker_pid):
++        return (f"cannot archive {task.id}: capability owner card of {waiting} is claimed "
++                f"(status={task.status}). A worker may archive only a done or unclaimed owner card.")
++    return None
++
++
++def _worker_may_archive_own(conn, task) -> Optional[str]:
++    """The refusal for a card this worker's task created, else None.
++
++    An unclaimed card may be archived (the misplaced-copy cleanup), and so may a done one with
++    no live claim and no open card waiting on it: a scratch waiter is claimed and completed by
++    its own worker, so without this its creator could never clean it up. [daveey]
++    """
++    task_id = task.id
++    if task.status == "archived":
++        return f"cannot archive {task_id}: status=archived"
++    if task.status == "running" or task.claim_lock or task.worker_pid:
++        return (f"cannot archive {task_id}: it is claimed (status={task.status}). "
++                "A worker may archive only an unclaimed or done card its own task created.")
++    if task.status == "done":
++        open_children = [row[0] for row in conn.execute(
++            "SELECT l.child_id FROM task_links l JOIN tasks c ON c.id = l.child_id "
++            "WHERE l.parent_id = ? AND c.status NOT IN ('done', 'archived') ORDER BY l.child_id",
++            (task_id,))]
++        if open_children:
++            return (f"cannot archive {task_id}: open card(s) {', '.join(open_children)} list it as a parent. "
++                    "Archive it once they finish.")
++    return None
+diff --git a/tests/hermes_cli/test_kanban_creator_archive_done.py b/tests/hermes_cli/test_kanban_creator_archive_done.py
+new file mode 100644
+index 0000000000..90f1dbb153
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_creator_archive_done.py
+@@ -0,0 +1,114 @@
++"""A worker may archive a DONE card its own task created. [daveey]
++
++A scratch waiter a worker creates for a live proof is claimed when it wakes and completed
++by its own worker; after that the creator could never archive it (the creator rule only
++allowed unclaimed cards), so every such waiter leaked onto the board. A done card with no
++live claim and no open child is cleanup, like a done capability owner card.
++
++Still refused: a running/claimed card, a done card an open card waits on, a card another
++task created, and the worker's own task.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++
++
++def _board(tmp_path, monkeypatch):
++    db = tmp_path / "board.db"
++    conn = connect(db)
++    owner = kb.create_task(conn, title="owner")
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
++    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++    monkeypatch.setenv("HOME", str(tmp_path))
++    return conn, owner
++
++
++def _done(conn, creator, title="waiter"):
++    tid = kb.create_task(conn, title=title, creator_task_id=creator)
++    assert kb.claim_task(conn, tid) is not None
++    assert kb.complete_task(conn, tid, summary="proof done", force=True)
++    task = kb.get_task(conn, tid)
++    assert task.status == "done" and not task.claim_lock and not task.worker_pid, task
++    return tid
++
++
++def _archive(tid):
++    from tools import kanban_tools as kt
++
++    return json.loads(kt._handle_archive({"task_id": tid}))
++
++
++def test_worker_archives_its_own_done_scratch_card(tmp_path, monkeypatch):
++    conn, owner = _board(tmp_path, monkeypatch)
++    waiter = _done(conn, owner)
++    out = _archive(waiter)
++    assert out.get("ok") and out["task_id"] == waiter, out
++    assert kb.get_task(conn, waiter).status == "archived"
++    conn.close()
++
++
++def test_worker_cli_archives_its_own_done_card(tmp_path, monkeypatch):
++    from hermes_cli.kanban import _cmd_archive
++
++    conn, owner = _board(tmp_path, monkeypatch)
++    waiter = _done(conn, owner)
++    assert _cmd_archive(SimpleNamespace(task_ids=[waiter], purge_ids=[])) == 0
++    assert kb.get_task(conn, waiter).status == "archived"
++    conn.close()
++
++
++def test_worker_still_refused_its_own_running_card(tmp_path, monkeypatch):
++    conn, owner = _board(tmp_path, monkeypatch)
++    running = kb.create_task(conn, title="running", creator_task_id=owner)
++    kb.claim_task(conn, running)
++    out = _archive(running)
++    assert out.get("ok") is not True and "claim" in out["error"].lower(), out
++    assert kb.get_task(conn, running).status == "running"
++    conn.close()
++
++
++def test_worker_still_refused_its_own_done_card_with_an_open_child(tmp_path, monkeypatch):
++    conn, owner = _board(tmp_path, monkeypatch)
++    waiter = _done(conn, owner)
++    child = kb.create_task(conn, title="follow-up", parents=[waiter], creator_task_id=owner)
++    assert kb.get_task(conn, child).status not in ("done", "archived")
++    out = _archive(waiter)
++    assert out.get("ok") is not True and child in out["error"], out
++    assert kb.get_task(conn, waiter).status == "done"
++    conn.close()
++
++
++def test_worker_archives_its_own_done_card_once_its_child_is_done(tmp_path, monkeypatch):
++    conn, owner = _board(tmp_path, monkeypatch)
++    waiter = _done(conn, owner)
++    child = kb.create_task(conn, title="follow-up", parents=[waiter], creator_task_id=owner)
++    kb.claim_task(conn, child)
++    assert kb.complete_task(conn, child, summary="ok", force=True)
++    out = _archive(waiter)
++    assert out.get("ok") and out["task_id"] == waiter, out
++    conn.close()
++
++
++def test_worker_still_refused_a_foreign_done_card(tmp_path, monkeypatch):
++    conn, owner = _board(tmp_path, monkeypatch)
++    other = kb.create_task(conn, title="other owner")
++    foreign = _done(conn, other, "foreign waiter")
++    out = _archive(foreign)
++    assert out.get("ok") is not True and owner in out["error"], out
++    assert kb.get_task(conn, foreign).status == "done"
++    conn.close()
++
++
++def test_worker_still_refused_its_own_task(tmp_path, monkeypatch):
++    conn, owner = _board(tmp_path, monkeypatch)
++    out = _archive(owner)
++    assert out.get("ok") is not True and "assigned task" in out["error"], out
++    assert kb.get_task(conn, owner).status != "archived"
++    conn.close()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 1f6403bf7e..d96fb0fc87 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1981,7 +1981,7 @@ def _maybe_subscribe_on_touch(conn: Any, task_id: str) -> bool:
+ 
+ @_kanban_handler("kanban_archive")
+ def _handle_archive(args: dict, **kw) -> str:
+-    """Archive an unclaimed card this worker's task created, or any card for an orchestrator."""
++    """Archive an unclaimed or done card this worker's task created, or any card for an orchestrator."""
+     _reject_delegated_child_mutation("kanban_archive")
+     tid = args.get("task_id")
+     _check(tid, "task_id is required")
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 43c2b90b76..83e8d742fa 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -903,11 +903,13 @@ KANBAN_UNLINK_SCHEMA = _schema(
+ KANBAN_ARCHIVE_SCHEMA = _schema(
+     "kanban_archive",
+     (
+-        "Archive a card. A dispatcher worker may archive an unclaimed card "
+-        "its own task created (creator_task_id is the caller's task) — the "
++        "Archive a card. A dispatcher worker may archive an unclaimed or done card "
++        "its own task created (creator_task_id is the caller's task): the "
+         "cleanup when kanban_create kept a card local because of a text "
+-        "marker and the work does not need this machine. Re-create it with "
+-        "placement='hub'. It may also archive a done or unclaimed capability "
++        "marker and the work does not need this machine (re-create it with "
++        "placement='hub'), or of a scratch card (e.g. a live-proof waiter) that "
++        "has finished. A done card is refused while an open card lists it as a "
++        "parent. It may also archive a done or unclaimed capability "
+         "owner card (idempotency_key capability-owner:<card>:...) when <card> "
+         "is its own task or a card its task created. A claimed card, a card another task created, and "
+         "the worker's own assigned task are refused. With no "
+-- 
+2.54.0 (Apple Git-157)
+

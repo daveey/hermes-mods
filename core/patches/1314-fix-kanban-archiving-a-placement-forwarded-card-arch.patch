@@ -1,0 +1,348 @@
+From b357101aee0cd15ef848b0b181f6a68b2f919a1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 18:25:39 +0000
+Subject: [PATCH] fix(kanban): archiving a placement-forwarded card archives
+ its remote copy [daveey]
+
+---
+ hermes_cli/kanban_db.py                   | 48 +-------------
+ hermes_cli/kanban_db_archive.py           | 60 +++++++++++++++++
+ hermes_cli/kanban_owner_archive_relay.py  | 10 ++-
+ hermes_cli/kanban_placement_forward.py    | 81 +++++++++++++++++++++++
+ tests/hermes_cli/test_kanban_placement.py | 77 +++++++++++++++++++++
+ 5 files changed, 229 insertions(+), 47 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_archive.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 5a813d9d28..48738c9101 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -4067,52 +4067,8 @@ def specify_triage_task(
+ 
+ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None,
+                  event_extra: Optional[dict] = None) -> bool:
+-    """Archive a task; a *running* task's host-local worker is terminated.
+-
+-    Clearing ``worker_pid`` in the DB alone left the OS process running past its
+-    own archive — it kept executing (and pushing work) against a task nothing
+-    tracked anymore (#76196). Snapshot pid+claim inside the archive txn so the
+-    kill is contingent on THIS caller winning the archive transition (a losing
+-    concurrent archiver must never signal the pid); the kill itself runs after
+-    commit — ``_poll_worker_exit`` can wait ~5 s and must not hold the write
+-    lock. Post-release kill is safe here because ``archived`` is terminal: no
+-    dispatcher can spawn a duplicate worker off the released claim. The
+-    termination outcome lands as its own ``archive_worker_termination`` event so
+-    the ``archived`` event stays atomic with the status flip.
+-    """
+-    with write_txn(conn):
+-        row = conn.execute(
+-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+-            (task_id,),
+-        ).fetchone()
+-        if not row:
+-            return False
+-        was_running = row["status"] == "running"
+-        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+-        cur = conn.execute(
+-            "UPDATE tasks SET status = 'archived', human_request = NULL, "
+-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+-            "WHERE id = ? AND status != 'archived'", (task_id,),
+-        )
+-        if cur.rowcount != 1:
+-            return False
+-        # Archived mid-run (dashboard): close the run so history isn't orphaned.
+-        run_id = _end_run(
+-            conn, task_id, outcome="reclaimed", status="reclaimed",
+-            summary="task archived with run still active",
+-        )
+-        # [daveey] via: archived outside the creator scope; event_extra: e.g. a forwarded run (kanban_owner_archive_relay)
+-        payload = {"source_status": row["status"], **({"via": via} if via else {}), **(event_extra or {})}
+-        _append_event(conn, task_id, "archived", payload, run_id=run_id)
+-    if was_running:
+-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+-        with write_txn(conn):
+-            _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
+-    # ``archived`` parents no longer block children; promote them now.
+-    recompute_ready(conn)
+-    # Reap the workspace on archive too (never-completed tasks kept it forever).
+-    _cleanup_workspace(conn, task_id)
+-    return True
++    from hermes_cli.kanban_db_archive import archive_task as archive
++    return archive(conn, task_id, signal_fn=signal_fn, via=via, event_extra=event_extra)
+ 
+ 
+ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
+diff --git a/hermes_cli/kanban_db_archive.py b/hermes_cli/kanban_db_archive.py
+new file mode 100644
+index 0000000000..e1a90225d1
+--- /dev/null
++++ b/hermes_cli/kanban_db_archive.py
+@@ -0,0 +1,60 @@
++"""Task archive transition and post-commit cleanup."""
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++
++def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None,
++                 event_extra: Optional[dict] = None) -> bool:
++    """Archive a task; a *running* task's host-local worker is terminated.
++
++    Clearing ``worker_pid`` in the DB alone left the OS process running past its
++    own archive — it kept executing (and pushing work) against a task nothing
++    tracked anymore (#76196). Snapshot pid+claim inside the archive txn so the
++    kill is contingent on THIS caller winning the archive transition (a losing
++    concurrent archiver must never signal the pid); the kill itself runs after
++    commit — ``_poll_worker_exit`` can wait ~5 s and must not hold the write
++    lock. Post-release kill is safe here because ``archived`` is terminal: no
++    dispatcher can spawn a duplicate worker off the released claim. The
++    termination outcome lands as its own ``archive_worker_termination`` event so
++    the ``archived`` event stays atomic with the status flip.
++    """
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        row = conn.execute(
++            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
++            (task_id,),
++        ).fetchone()
++        if not row:
++            return False
++        was_running = row["status"] == "running"
++        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
++        cur = conn.execute(
++            "UPDATE tasks SET status = 'archived', human_request = NULL, "
++            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
++            "WHERE id = ? AND status != 'archived'", (task_id,),
++        )
++        if cur.rowcount != 1:
++            return False
++        # Archived mid-run (dashboard): close the run so history isn't orphaned.
++        run_id = kb._end_run(
++            conn, task_id, outcome="reclaimed", status="reclaimed",
++            summary="task archived with run still active",
++        )
++        # [daveey] via: archived outside the creator scope; event_extra: e.g. a forwarded run (kanban_owner_archive_relay)
++        payload = {"source_status": row["status"], **({"via": via} if via else {}), **(event_extra or {})}
++        kb._append_event(conn, task_id, "archived", payload, run_id=run_id)
++    if was_running:
++        termination = kb._terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
++        with kb.write_txn(conn):
++            kb._append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
++    # ``archived`` parents no longer block children; promote them now.
++    kb.recompute_ready(conn)
++    # Reap the workspace on archive too (never-completed tasks kept it forever).
++    kb._cleanup_workspace(conn, task_id)
++    # [daveey] A card placement forwarded to another gateway: archive that copy too (kanban_placement_forward).
++    from hermes_cli.kanban_placement_forward import forward_archive
++    forward_archive(conn, task_id)
++    return True
++
+diff --git a/hermes_cli/kanban_owner_archive_relay.py b/hermes_cli/kanban_owner_archive_relay.py
+index c9d86bed55..dd84f4293c 100644
+--- a/hermes_cli/kanban_owner_archive_relay.py
++++ b/hermes_cli/kanban_owner_archive_relay.py
+@@ -228,7 +228,15 @@ def worker_archive(conn: sqlite3.Connection, tid: str, *,
+             out.pop("task_id", None)
+             return None, out
+     refusal, via = worker_archive_scope(conn, tid)
+-    return (refusal, None) if refusal else (None, archive(conn, tid, via=via))
++    if refusal:
++        return refusal, None
++    out = archive(conn, tid, via=via)
++    if out and out.get("status") == "archived":
++        from hermes_cli.kanban_placement_forward import archive_forward_view
++        placed = archive_forward_view(conn, tid)  # [daveey] the placed copy on another gateway, if any
++        if placed:
++            out = {**out, "placed_copy": placed}
++    return None, out
+ 
+ 
+ def apply_remote_archives(conn: sqlite3.Connection) -> list[str]:
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index d0507988a1..79c21dbfa7 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -34,6 +34,7 @@ DEFERRED = "placement_deferred"
+ FORWARDED = "placement_forwarded"
+ CANCELLED = "placement_deferred_cancelled"
+ NOT_LIVE = "placement_forward_not_live"
++ARCHIVE_FORWARDED = "placement_archive_forwarded"
+ MAX_NOT_LIVE = 3
+ REQUEUE_SECONDS = 600          # retry a not-live target / a still-queued request after this long
+ SETTLE_PARK_SECONDS = 14 * 86400  # timer backstop of the settle park; the wake probe ends it first
+@@ -101,6 +102,86 @@ def forward_argv(task, board: Optional[str], worker_cmd: list) -> Optional[list]
+         return None
+ 
+ 
++# --- lifecycle: archive the placed copy ---------------------------------------------------------
++
++def _archive_request_id(self_gw: str, task_id: str) -> str:
++    return f"placement-archive:{self_gw}:{task_id}"
++
++
++def _archive_events(conn: sqlite3.Connection, task_id: str) -> list:
++    out = []
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
++                               (task_id, ARCHIVE_FORWARDED)).fetchall():
++        try:
++            out.append(json.loads(raw or "{}"))
++        except ValueError:
++            continue
++    return out
++
++
++def archive_forward_view(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """What ``kanban_archive`` reports about the placed copy of ``task_id``: ``{gateway, task_id, status}`` with
++    status ``archived`` (the target applied the request), ``pending`` (queued or sent, not applied yet) or
++    ``unresolved`` (the target had not made the card when this one was archived), else None (never forwarded)."""
++    events = _archive_events(conn, task_id)
++    if not events:
++        return None
++    last = events[-1]
++    status = last.get("status") or "pending"
++    rid = last.get("request_id")
++    if status == "pending" and rid:
++        from hermes_cli import kanban_placement as kp
++        if kp.remote_state(rid) == "done":
++            status = "archived"
++    view = {"gateway": last.get("gateway"), "task_id": last.get("remote_task_id"), "status": status}
++    if last.get("error"):
++        view["error"] = last["error"]
++    if last.get("note"):
++        view["note"] = last["note"]
++    return view
++
++
++def forward_archive(conn: sqlite3.Connection, task_id: str, *, runner: Optional[Callable] = None) -> Optional[dict]:
++    """Archive the copy of ``task_id`` that placement forwarded to another gateway. Never raises.
++
++    Sends ``hermes-hub request <gw> tasks default/<remote id> archive``: the hub client queues it durably
++    (rc 3 = target or hub unreachable, applied when it reconnects). Records ``placement_archive_forwarded``
++    on the local card and returns :func:`archive_forward_view`. None when the card was never forwarded."""
++    try:
++        st = state(conn, task_id)
++        if not st or not (st.get("request_id") or st.get("remote_task_id")):
++            return None
++        prior = _archive_events(conn, task_id)
++        if prior and prior[-1].get("status") in ("pending", "archived"):
++            return archive_forward_view(conn, task_id)  # one request per card
++        from hermes_cli import kanban_capability_registry as reg
++        from hermes_cli import kanban_placement as kp
++        target = st["target"]
++        rtid = st.get("remote_task_id") or (kp.remote_task_id(st["request_id"]) if st.get("request_id") else None)
++        payload: dict = {"gateway": target, "request_id": None, "remote_task_id": rtid, "status": "pending"}
++        if not rtid:
++            payload.update(status="unresolved", note=(
++                f"{target} had not made the card for request {st.get('request_id')} yet, so there is nothing to "
++                f"archive there by id; check `hermes-hub tasks --gw {target}` for the copy."))
++        else:
++            cfg = kp.config()
++            self_gw = reg.self_gateway() or "local"
++            rid = _archive_request_id(self_gw, task_id)
++            argv = [reg.hub_cli_path(cfg.get("hub_cli")), "request", target, "tasks", f"default/default/{rtid}",
++                    "archive", "--id", rid]
++            rc, out, err = (runner or kp.hub_runner)(argv)
++            payload["request_id"] = rid
++            if rc not in (0, 3):  # 3: queued, sent on the next sync
++                payload.update(status="failed", error=(err or out or f"rc {rc}")[-300:])
++        from hermes_cli import kanban_db as kb
++        with kb.write_txn(conn):
++            kb._append_event(conn, task_id, ARCHIVE_FORWARDED, payload)
++        return archive_forward_view(conn, task_id)
++    except Exception as exc:  # health: allow BLE001 -- an archive must never fail on the courtesy forward
++        print(f"placement archive forward failed: {exc!r}", file=sys.stderr)
++        return None
++
++
+ # --- the forwarder -----------------------------------------------------------------------------
+ 
+ def _iso(ts: float) -> str:
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 32ad358010..ce6800e7c9 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1404,3 +1404,80 @@ def test_foreign_pin_with_parents_is_deferred_to_the_pinned_gateway():
+ def test_foreign_pin_for_an_origin_bound_card_is_not_forwarded():
+     d = decide({"title": "x", "placement": "macbook"}, cfg=HUB_CFG, self_gw="hub", origin_intent="chat")
+     assert d["where"] == "local", d
++
++
++def _forwarded_card(mac, monkeypatch, conn):
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++    parent = kb.create_task(conn, title="Orchestrate", assignee="default")
++    created = json.loads(kt._handle_create({"title": "Fix the flaky lint", "body": "Push it.", "parents": [parent],
++                                            "session_id": "20261027_183000_abc123"}))
++    kb.complete_task(conn, parent, summary="fanned out", force=True)
++    kb.recompute_ready(conn)
++    child = created["task_id"]
++    assert _forwarder(conn, child, mac, monkeypatch).run() == "parked"
++    mac["calls"].clear()
++    return child
++
++
++def test_archiving_a_forwarded_card_archives_the_remote_copy(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++    out = json.loads(kt._handle_archive({"task_id": child}))
++    assert out["ok"] and out["status"] == "archived", out
++    argv = mac["calls"][0]
++    assert argv[1:6] == ["request", "hub", "tasks", f"default/default/{HUB_TID}", "archive"], argv
++    assert out["placed_copy"] == {"gateway": "hub", "task_id": HUB_TID, "status": "pending"}, out
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, child).status == "archived"
++        assert [e["status"] for e in kpf._archive_events(conn, child)] == ["pending"]
++    # The hub client applied it: the view now says archived, and a second archive sends nothing new.
++    rid = argv[argv.index("--id") + 1]
++    mac["hub"].execute("UPDATE sent SET state='done' WHERE id=?", (rid,))
++    mac["hub"].commit()
++    with kbc.connect_closing() as conn:
++        assert kpf.archive_forward_view(conn, child)["status"] == "archived"
++        assert kpf.forward_archive(conn, child)["status"] == "archived"
++    assert len(mac["calls"]) == 1
++
++
++def test_archive_forward_is_queued_when_the_target_is_offline(mac, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++    mac["result"]["rc"] = 3  # hub unreachable: the client queues the request durably
++    out = json.loads(kt._handle_archive({"task_id": child}))
++    assert out["ok"] and out["placed_copy"]["status"] == "pending", out
++    rid = mac["calls"][0][mac["calls"][0].index("--id") + 1]
++    assert mac["hub"].execute("SELECT state FROM sent WHERE id=?", (rid,)).fetchone()[0] == "sent"
++    with kbc.connect_closing() as conn:
++        assert kpf.archive_forward_view(conn, child)["status"] == "pending"
++    mac["hub"].execute("UPDATE sent SET state='done' WHERE id=?", (rid,))  # reconnected, target applied it
++    mac["hub"].commit()
++    with kbc.connect_closing() as conn:
++        assert kpf.archive_forward_view(conn, child)["status"] == "archived"
++
++
++def test_archive_forward_failure_is_reported_and_retried_and_plain_cards_are_untouched(mac, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        child = _forwarded_card(mac, monkeypatch, conn)
++        plain = kb.create_task(conn, title="plain", assignee="default")
++    mac["result"]["rc"] = 1
++    out = json.loads(kt._handle_archive({"task_id": child}))
++    assert out["ok"] and out["placed_copy"]["status"] == "failed" and out["placed_copy"]["error"], out
++    mac["result"]["rc"] = 0
++    with kbc.connect_closing() as conn:
++        assert kpf.forward_archive(conn, child)["status"] == "pending"  # a failed forward is sent again
++    mac["calls"].clear()
++    assert "placed_copy" not in json.loads(kt._handle_archive({"task_id": plain}))
++    assert mac["calls"] == []
+-- 
+2.54.0 (Apple Git-157)
+
