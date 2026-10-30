@@ -105,7 +105,7 @@ def main():
                 if not new["archived"] and m >= cutoff:
                     changes.append(f"{sid} new session: {new['title']!r}")
                 continue
-            quiet = ("title", "status") if new["status"] == EMPTY_STATUS else ("title",)
+            quiet = ("title", "status", "turns") if new["status"] == EMPTY_STATUS else ("title",)
             if args.ignore_title_only and {k: v for k, v in old.items() if k not in quiet} == {
                 k: v for k, v in new.items() if k not in quiet
             }:

@@ -190,9 +190,9 @@ the update's diff changed the module that broke) and the process was in the vuln
 the update). Write that precondition into the live-check acceptance and confirm it before citing the result; when
 it was absent, report "no regression; prevention not yet observed live". The reverse holds for a check that the old
 symptom stopped: count only hits from processes started after the fix landed (a worker spawned before the update keeps
-the old code until it exits; date each line by its session-id stamp or the run's `spawned` time), and match the
-emitting logger plus message, never the bare phrase, because card titles and comments quoting it land in the same
-log. Dry-run the probe on the live log and on one synthetic hit right after filing it, before parking. A guard that "works"
+the old code until it exits; date each line by its session-id stamp or the run's `spawned` time), and anchor the
+match at line start (timestamp, level, emitting logger, then the message), never the bare phrase: card titles,
+comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same logs. Dry-run the probe on the live log and on one synthetic hit right after filing it, before parking. A guard that "works"
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
