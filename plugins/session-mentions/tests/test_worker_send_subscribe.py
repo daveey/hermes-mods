@@ -34,6 +34,16 @@ class Subs:
         self.rows.setdefault((kw["task_id"], kw["platform"], kw["chat_id"]), kw)
 
 
+@pytest.fixture(autouse=True)
+def isolated_board(monkeypatch, tmp_path):
+    # HERMES_HOME does not isolate the shared, cross-profile Kanban board.
+    # CI and dispatched workers inherit an explicit live DB pin.
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+
 @pytest.fixture
 def subs(monkeypatch):
     s = Subs()
@@ -128,6 +138,7 @@ def test_real_kanban_db_gets_exactly_one_row(tmp_path, monkeypatch):
     kbn = pytest.importorskip("hermes_cli.kanban_db_notify")
     kb = pytest.importorskip("hermes_cli.kanban_db")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert kb.kanban_db_path().resolve() == (tmp_path / "kanban.db").resolve()
     kb.init_db()
     from hermes_cli import kanban_db_connect as kbc
 
@@ -152,6 +163,7 @@ def test_default_add_sub_refuses_a_task_this_board_does_not_own(monkeypatch, tmp
     kbc = pytest.importorskip("hermes_cli.kanban_db_connect")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert kb.kanban_db_path().resolve() == (tmp_path / "kanban.db").resolve()
     with kbc.connect_closing() as conn:
         mine = kb.create_task(conn, title="mine", assignee="default")
     rf._default_add_sub(task_id=mine, platform="tui", chat_id="s1", notifier_profile="default")
