@@ -228,8 +228,16 @@ def test_request_online_is_sent(hub, fake_client):
      "<board>/new"),
     ({"gateway": "mini", "coll": "tasks", "key": "x/new/extra", "action": "create", "args": {"title": "x"}}, 400,
      "<board>/new"),
-    ({"gateway": "mini", "coll": "tasks", "key": "bb/t_mini", "action": "comment", "args": {"text": "x", "evil": 1}},
-     400, "unexpected args"),
+    ({"gateway": "mini", "coll": "tasks", "key": "default/bb/t_mini", "action": "comment",
+      "args": {"text": "x", "evil": 1}}, 400, "unexpected args"),
+    # The owner decodes task keys as <profile>/<board>/<id> only and rejects anything else as invalid_task_route
+    # after the request was sent; these are refused here instead, before anything is queued.
+    ({"gateway": "mini", "coll": "tasks", "key": "bb/t_mini", "action": "comment", "args": {"text": "x"}}, 400,
+     "<profile>/<board>/<id>"),
+    ({"gateway": "mini", "coll": "tasks", "key": "default/t_mini", "action": "unblock"}, 400,
+     "<profile>/<board>/<id>"),
+    ({"gateway": "mini", "coll": "tasks", "key": "a/b/c/t_mini", "action": "archive"}, 400, "<profile>/<board>/<id>"),
+    ({"gateway": "mini", "coll": "tasks", "key": "t_mini", "action": "archive"}, 400, "<profile>/<board>/<id>"),
     ({"gateway": "mini", "coll": "inbox", "key": "default/s_mcard", "action": "archive", "base_version": "v"}, 400,
      "integer"),
 ])
@@ -260,6 +268,13 @@ def test_tasks_create_key_is_the_owners_shape(hub, key, sent_key):
     assert req["key"] == sent_key
     res = hv.request({"gateway": "mini", "coll": "tasks", "key": key, "action": "create", "args": {"title": "x"}})
     assert _sent(state)[res["id"]][0]["key"] == sent_key
+
+
+@pytest.mark.parametrize("action,args", [("comment", {"text": "x"}), ("unblock", {}), ("archive", {})])
+def test_task_actions_send_the_owners_key(hub, action, args):
+    hv, state = hub
+    res = hv.request({"gateway": "mini", "coll": "tasks", "key": "default/bb/t_mini", "action": action, "args": args})
+    assert _sent(state)[res["id"]][0]["key"] == "default/bb/t_mini"
 
 
 def test_inbox_act_keeps_input_verbatim(hub):
@@ -294,6 +309,10 @@ def test_rest_post_request(api_client):
     assert r.status_code == 400 and "supports" in r.json()["detail"]
     r = c.post("/request", json={"gateway": "zzz", "coll": "sessions", "key": "default/s", "action": "pin"})
     assert r.status_code == 404
+    before = set(_sent(state))
+    r = c.post("/request", json={"gateway": "mini", "coll": "tasks", "key": "default/t_mini", "action": "unblock"})
+    assert r.status_code == 400 and "<profile>/<board>/<id>" in r.json()["detail"]
+    assert set(_sent(state)) == before  # refused before anything was queued
 
 
 # ---------------------------------------------------------------- decoded-row cache
