@@ -434,7 +434,10 @@ test('run-timing question marks its go options as approving (self-heal agent-aa8
  await show(React.createElement(m.DecisionRow,{key:r.requestId,request:r,route,call:async()=>({})}))
  const labels=[...el().querySelectorAll('button[data-decision-effect]')].map(b=>b.textContent)
  assert.deepEqual(labels,['✓ now','later','Answer in your own words'])
- assert.match(el().textContent,/Options marked ✓ approve running exactly the scope above/)
+ // the go option says it approves; the others carry no such line (no per-option disclaimer either)
+ assert.equal(el().querySelector('[data-decision-option="answer-0"]').textContent,'✓ nowApproves running exactly the plan above.')
+ assert.equal(el().querySelector('[data-decision-option="answer-1"]'),null)
+ assert.doesNotMatch(el().textContent,/grants no execution permission/)
 })
 
 // ── Withdrawn asks: retired without a decision; nothing is sent to the agent ──
@@ -638,7 +641,7 @@ test('Not needed: a 409 refreshes with an inline note; other failures keep the t
  assert.equal(calls.filter(([, o]) => o.method === 'POST').length, 2)
 })
 
-test('askedAgo reads just now, minutes, hours and days; the tile shows it beside the title only when createdAt is known', async () => {
+test('askedAgo reads just now, minutes, hours and days; the tile shows it above the title only when createdAt is known', async () => {
  const now = Date.parse('2026-10-27T12:00:00Z'), ago = ms => new Date(now - ms).toISOString()
  const cases = [[0, 'asked just now'], [59_999, 'asked just now'], [60_000, 'asked 1 min ago'], [59 * 60_000 + 59_000, 'asked 59 min ago'], [3_600_000, 'asked 1 h ago'], [23 * 3_600_000 + 3_599_000, 'asked 23 h ago'], [86_400_000, 'asked 1 d ago'], [9 * 86_400_000 + 5_000, 'asked 9 d ago'], [-120_000, 'asked just now']]
  for (const [ms, text] of cases) assert.equal(m.askedAgo?.(ago(ms), now), text, `${ms} ms`)
@@ -648,7 +651,7 @@ test('askedAgo reads just now, minutes, hours and days; the tile shows it beside
  await show(React.createElement(m.DecisionRow, { key: 'aged', request: aged, route, call: async () => ({}) }))
  const age = el().querySelector('[data-asked-age]')
  assert.equal(age?.textContent, 'asked 5 min ago')
- assert.equal(age.parentElement, el().querySelector('h3').parentElement, 'beside the title')
+ assert.equal(age.closest('[data-action-meta]')?.nextElementSibling, el().querySelector('h3'), 'on the line right above the title')
  assert.equal(age.getAttribute('datetime'), aged.createdAt)
  assert.equal(el().querySelector('h3').textContent, 'Aged ask')
  await show(React.createElement(m.DecisionRow, { key: 'unaged', request: freshRequest({ title: 'Legacy row' }), route, call: async () => ({}) }))
@@ -742,4 +745,72 @@ test('withdrawing the last tile hands keyboard focus back to the composer', asyn
   assert.equal(el().querySelector('article'), null)
   assert.deepEqual(focused, ['S1'])
  } finally { host.composer.focus = prev; await show(null); delete window.hermesDesktop }
+})
+
+test('explained options: one line each, the recommended one first and primary, plan folded behind Full plan', async () => {
+ const r = freshRequest({ title: 'Switch gen-3 and gen-4 to on-demand?', choices: [
+  { id: 'no', label: 'Keep spot', effect: 'decline', explain: 'No cost change; slots stay reclaimable.' },
+  { id: 'edit', label: 'Revise', effect: 'revise' },
+  { id: 'yes', label: 'Approve', effect: 'approve', explain: '+$500/month; 6 runner slots back today.', recommended: true }] })
+ assert.equal(m.validRequest(r), true)
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
+ const options = [...el().querySelectorAll('[data-decision-option]')]
+ assert.deepEqual(options.map(o => o.getAttribute('data-decision-option')), ['yes', 'no'], 'recommended first; free-text revise has no line')
+ assert.equal(options[0].textContent, 'Approverecommended+$500/month; 6 runner slots back today.')
+ const buttons = [...el().querySelectorAll('button[data-decision-effect]')]
+ assert.deepEqual(buttons.map(b => b.textContent), ['Approve', 'Keep spot', 'Request changes'])
+ assert.deepEqual(buttons.map(b => b.hasAttribute('data-primary')), [true, false, false], 'exactly one primary button')
+ const fold = el().querySelector('[data-action-fold]')
+ assert.equal(fold.querySelector('summary').textContent, 'Full plan and limits')
+ assert.ok(fold.contains(el().querySelector('[data-action-scope]')) && fold.contains(el().querySelector('[data-action-limits]')))
+ assert.equal(fold.open, false, 'folded until opened')
+ assert.doesNotMatch(el().textContent, /Revision 1|Read this|Your decision/)
+ assert.equal(el().querySelector('[data-action-kind]').textContent, 'Approval')
+})
+
+test('a legacy question without explanations keeps its question inline and adds no option lines', async () => {
+ const r = freshRequest({ kind: 'choice', title: 'Switch or keep spot?', limits: [], exclusions: [], scope: { complete: true, markdown: 'Switch gen-3 or keep spot?', sourceRefs: [] }, outcomes: { answer: 'Send this answer to the agent. This does not grant execution permission.' }, choices: [{ id: 'answer-0', label: 'Switch gen-3', effect: 'answer' }, { id: 'answer-1', label: 'Keep spot', effect: 'answer' }, { id: 'answer-text', label: 'Answer in your own words', effect: 'answer' }] })
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call: async () => ({}) }))
+ assert.equal(el().querySelector('[data-action-fold]'), null)
+ assert.equal(el().querySelector('[data-action-scope]').textContent, 'Switch gen-3 or keep spot?')
+ assert.equal(el().querySelectorAll('[data-decision-option]').length, 0)
+ assert.doesNotMatch(el().textContent, /does not grant execution permission/)
+ assert.equal(el().querySelector('[data-action-kind]').textContent, 'Question')
+})
+
+test('validRequest mirrors the server: explain is non-empty text, recommended is true on at most one choice', () => {
+ const base = request().choices
+ const withChoices = choices => m.validRequest(request({ choices }))
+ assert.equal(withChoices(base.map(c => ({ ...c, explain: 'x' }))), true)
+ assert.equal(withChoices([{ ...base[0], explain: '' }, ...base.slice(1)]), false)
+ assert.equal(withChoices([{ ...base[0], recommended: false }, ...base.slice(1)]), false)
+ assert.equal(withChoices([{ ...base[0], recommended: true }, { ...base[1], recommended: true }, base[2]]), false)
+})
+
+test('with the session panel loaded, the For you strip yields to it and its parts are exported for embedding', async () => {
+ const areas = []
+ const dispose = m.default.register({ register: a => areas.push(a) })
+ try {
+  const strip = areas.find(a => a.id === 'strip')
+  assert.notEqual(strip.render(), null, 'draws itself without the panel')
+  window.__sessionPanel = { active: true }
+  assert.equal(strip.render(), null, 'the panel draws the asks instead')
+  assert.equal(window.__userSteps.ActionQueue, m.ActionQueue)
+  assert.equal(window.__userSteps.Strip, m.Strip)
+  assert.equal(typeof window.__userSteps.openAskCount, 'function')
+ } finally { delete window.__sessionPanel; dispose() }
+})
+
+test('embedded queue drops its own frame, heading and minimize control', async () => {
+ const r = freshRequest({ title: 'Embedded ask' })
+ const calls = []
+ const call = async (path, opts) => { calls.push(path); if (path.includes('/ping')) return { ok: true, api: 2, features: [] }; return { requests: [r] } }
+ await m.refreshRequests(call)
+ await show(React.createElement(m.ActionQueue, { key: 'embedded', embedded: true }))
+ const section = el().querySelector('[data-action-queue]')
+ assert.ok(section.hasAttribute('data-embedded'))
+ assert.equal(section.querySelector('[data-action-queue-header]'), null)
+ assert.equal(section.style.border, '')
+ assert.equal(el().querySelector('h3').textContent, 'Embedded ask')
+ assert.equal(m.openAskCount(), 1)
 })

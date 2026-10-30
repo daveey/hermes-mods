@@ -277,7 +277,7 @@ def _shape_check(payload: dict) -> None:
         objects(payload['aliases'], 'aliases', _ALIAS_SHAPE)
     if 'choices' in payload:
         objects(payload['choices'], 'choices', 'objects {id, label, effect} (effect approve, revise, decline or '
-                'answer)')
+                'answer; optional explain, recommended)')
 
 
 def publish_action_request(args: dict, session_id: str = '', **_) -> str:
@@ -424,7 +424,7 @@ PRODUCER_SCHEMA = {
     'name': 'action_request',
     'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one revises that one. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
     'parameters': {'type': 'object', 'additionalProperties': False,
-                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, limits [{key, value}] (objects, optional permissionRequired), exclusions [plain strings], choices [{id, label, effect}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline), aliases: [] unless reusing a request\'s own refs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?}, never a bare card id string), state (open or needs_context).'},
+                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, limits [{key, value}] (objects, optional permissionRequired), exclusions [plain strings], choices [{id, label, effect, explain?, recommended?}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline; explain = one plain line on what happens if the user picks it, e.g. cost and what resumes; recommended: true on at most one choice, your pick), aliases: [] unless reusing a request\'s own refs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?}, never a bare card id string), state (open or needs_context).'},
                                   'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
                                   'decisionCard': {'type': 'object', 'additionalProperties': False,
                                                    'properties': {'board': {'type': 'string'}}, 'required': ['board'],

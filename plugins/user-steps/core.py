@@ -1494,8 +1494,14 @@ def validate_action(value):
     for text in value['outcomes'].values(): _string(text)
     ids = set()
     for choice in value['choices']:
-        _object(choice, ('id', 'label', 'effect'), ('authorizes',))
+        _object(choice, ('id', 'label', 'effect'), ('authorizes', 'explain', 'recommended'))
         _string(choice['id']); _string(choice['label'])
+        # 'explain': one plain line on what happens if the user picks this (shown under the button).
+        # 'recommended': the agent's pick, at most one per request, only True.
+        if 'explain' in choice:
+            _string(choice['explain'])
+        if 'recommended' in choice and choice['recommended'] is not True:
+            raise ActionError('recommended is only valid as true')
         # 'authorizes' marks a go answer ("now") to a run-timing question: only on answers, only True.
         if 'authorizes' in choice and (choice['authorizes'] is not True or choice['effect'] != 'answer'
                                        or value['kind'] not in ('choice', 'input')):
@@ -1506,6 +1512,8 @@ def validate_action(value):
         if choice['effect'] in ('approve', 'decline') and choice['effect'] not in value['outcomes']:
             raise ActionError('Choice requires a stated outcome')
     if not ids: raise ActionError('At least one choice is required')
+    if sum(1 for c in value['choices'] if c.get('recommended')) > 1:
+        raise ActionError('At most one choice can be recommended')
     if value['state'] not in ('needs_context', 'open', 'resolved', 'superseded', 'cancelled', 'withdrawn'):
         raise ActionError('Invalid state')
     if value['state'] == 'open' and not scope['complete']:
@@ -2086,6 +2094,22 @@ def _question_alternatives(span: str, source: str) -> list[str]:
     return out
 
 
+_WHETHER = re.compile(r"\bwhether\s+(?:or\s+not\s+)?(?:to\s+)?(.+?)\s*,?\s+or\s+(?:to\s+)?(.+?)[\s.?!]*$", re.I)
+
+
+def _whether_alternatives(text: str) -> list[str]:
+    """The two alternatives of a 'Choose whether to A or B' step text (the title the card shows). Both are
+    verbatim slices of that title; an 'or not' / 'something else' tail, or a third 'or', yields none."""
+    m = _WHETHER.search(re.sub(r"[*_`]+", "", _ws(text)))
+    if not m or re.search(r"\bor\b", m.group(1), re.I) or re.search(r"\bor\b", m.group(2), re.I):
+        return []
+    out = [part.strip(' ,;:') for part in m.groups()]
+    if any(_ALT_OTHER.match(p) or re.fullmatch(r"not", p, re.I) or len(p.split()) < 2 or len(p) > OPTION_MAX
+           for p in out):
+        return []
+    return [_cap(p) for p in out]
+
+
 def literal_options(step: dict) -> list[str]:
     """Answer buttons for a legacy clarification: only text literally in the source.
 
@@ -2105,6 +2129,10 @@ def literal_options(step: dict) -> list[str]:
         out = found
     else:
         out = _question_alternatives(_ws(step.get('verbatim_span') or step.get('paragraph')), source)
+        # The agent's own options were paraphrases (dropped above), but the card's title states both: use them.
+        # Live repro (hermes-hub 2026-10-28, gen-3/gen-4 spot): only 'keep spot' survived and Approve had no button.
+        if len(out) < 2 and len(whether := _whether_alternatives(step.get('text'))) == 2:
+            out = whether
         # a model option that is part of a derived alternative is the same choice, not a second button
         out += [x for x in found if not any(x.casefold() in y.casefold() for y in out)]
     return list(dict.fromkeys(out))[:4]

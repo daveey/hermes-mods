@@ -192,7 +192,7 @@ test('strip: lists open steps + other blocked cards for the focused chat, hides 
   assert.ok(strip, el().innerHTML)
   // the composer chrome is user-select:none; the strip must opt back in so its text can be copied
   assert.equal(strip.style.userSelect || strip.style.webkitUserSelect, 'text')
-  assert.match(strip.textContent, /Legacy references \(2\)/)
+  assert.match(strip.textContent, /Earlier asks \(2\) — answer these in chat/)
   assert.ok(strip.querySelector('[data-user-steps-step="us_eeeeee01"]'))
   assert.ok(strip.querySelector('[data-user-steps-card="t_human001"]'))
   assert.equal(strip.querySelector('[data-user-steps-card="t_rolling9"]'), null)
@@ -348,7 +348,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await show(React.createElement(m.Strip, { key: 'issues' }))
   const strip = el().querySelector('[data-slot="user-steps"]')
   assert.ok(strip, el().innerHTML)
-  assert.match(strip.textContent, /Legacy references/)
+  assert.match(strip.textContent, /Earlier asks/)
   assert.equal(strip.querySelectorAll('[data-user-steps-card]').length, 1)
   const issue = strip.querySelector('[data-user-steps-issue="t_failed01"]')
   assert.ok(issue)
@@ -373,7 +373,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await m.refresh(fakeRest([], {}))
   await show(React.createElement(m.Strip, { key: 'issues2' }))
   const only = el().querySelector('[data-slot="user-steps"]')
-  assert.match(only.textContent, /Agent issues .* no action required from you/)
+  assert.match(only.textContent, /Agent issues .* nothing needed from you/)
   assert.doesNotMatch(only.textContent, /For you/)
   // The user can dismiss an issue they can't act on; it stays hidden until a NEW failure lands on the card.
   const onlyIssues = bpm.agentIssues(tasks, details)
@@ -395,7 +395,7 @@ test('strip: a worker failure shows as an agent issue with no unblock buttons; h
   await m.refresh(fakeRest([], {}))
   await show(React.createElement(m.Strip, { key: 'issues5' }))
   const mixed = el().querySelector('[data-slot="user-steps"]')
-  assert.match(mixed.textContent, /Legacy references/)
+  assert.match(mixed.textContent, /Earlier asks/)
   assert.ok(mixed.querySelector('[data-user-steps-dismiss-all]'), 'agent issues stay separately dismissible')
   window.__blockedPanel.snapshot = { stored: 'S1', items: [], issues: onlyIssues }
   // A coordinator explicitly pauses recovery after the failure. It remains an issue, not an ask.

@@ -138,7 +138,10 @@ export function subagentChips(subagents) {
         state: 'running',
         label: goal,
         title: str(s.goal) || goal,
-        since: Number(s.started_at) || 0
+        since: Number(s.started_at) || 0,
+        // The session panel judges a sub-agent stuck when this stops changing (subagent.list has no activity time).
+        toolCount: Number(s.tool_count) || 0,
+        lastTool: str(s.last_tool) || null
       }
     })
 }
@@ -942,7 +945,8 @@ function Strip() {
   useEffect(() => subscribe(next => (setSnap(next), setNow(Date.now()))), [])
   useEffect(() => void refresh(), [focused, scope])
   const chips = snap.runtime === focused && snap.scope === scope ? progressChips(snap.chips) : []
-  if (!chips.length) return null
+  // The session panel shows this work in its own sections; the strip stays subscribed so polling keeps running.
+  if (!chips.length || (typeof window !== 'undefined' && window.__sessionPanel?.active)) return null
   const cards = chips.filter(c => c.kind === 'kanban')
   const others = chips.filter(c => c.kind !== 'kanban')
   return jsxs('details', {
@@ -999,7 +1003,7 @@ export default {
     ctx.registerArchiveGuard?.(archiveGuard)
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh }
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       document.getElementById(`${ID}-style`)?.remove()

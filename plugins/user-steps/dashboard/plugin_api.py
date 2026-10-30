@@ -64,7 +64,8 @@ class WithdrawBody(BaseModel):
 
 
 def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
-                  cards=None, *, action_store=None, owner_resolver=None, receiver=None, kanban_boards=None):
+                  cards=None, *, action_store=None, owner_resolver=None, receiver=None, kanban_boards=None,
+                  session_tasks=None):
     recovered = set()
     recovery_lock = threading.Lock()
 
@@ -270,6 +271,23 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         found = next((x for x in lg._read(root).get('steps', [])
                       if x.get('id') == id and x.get('session') == s), None)
         return {'root': root, 'step': _load('core').public_step(found) if found else None}
+
+    @router.get('/session-cards')
+    def session_cards(ids: str):
+        # Every card the lineage created or shepherds, finished ones included, for the Desktop session panel's
+        # progress counts (core's /api/session-kanban-tasks lists only unfinished ones).
+        wanted = [s.strip() for s in ids.split(',') if s.strip()][:50]
+        # 'includes' tells the client this list has finished cards (core's list never does).
+        if not wanted:
+            return {'tasks': [], 'includes': ['done']}
+        read = session_tasks
+        if read is None:
+            try:
+                from hermes_cli import kanban_session_activity as ksa
+            except ImportError:
+                raise HTTPException(501, 'This backend has no kanban session reader')
+            read = lambda ids: ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done',), stale_ok=True)
+        return {'tasks': read(wanted), 'includes': ['done']}
 
     @router.post('/resolve')
     def resolve():

@@ -204,3 +204,36 @@ def test_upgraded_diplomacy_retires_from_chat_only_with_evidence(env, tmp_path):
     out = chat.reconcile(core, st, OWNER, judge, db)
     assert out[0]['request']['requestId'] == row['requestId'] and out[0]['request']['state'] == 'superseded'
     assert out[0]['chatEvidence']['executionAuthorized'] is False
+
+
+# Live repro (hermes-hub 2026-10-28): the model's first option paraphrased the switch, so only "keep spot" became
+# a button and the For you card had no way to approve the switch the paragraph asked about.
+SPOT_TEXT = ('Choose whether to switch gen-3 and gen-4 from spot to on-demand (about $500/month more) or keep spot '
+             'and wait out the queue')
+SPOT = dict(id='us_42ee91436d', session='s1', kind='choose', status='open', text=SPOT_TEXT,
+            options=['Switch gen-3 and gen-4 to on-demand (~$500/month more)', 'Keep spot and wait out the queue'],
+            verbatim_span='**Decision for you:** card **t_01a18535bec5be35** asks whether to switch gen-3 and gen-4 '
+                          '(both c6a.4xlarge) from spot to on-demand.',
+            paragraph='**Decision for you:** card **t_01a18535bec5be35** asks whether to switch gen-3 and gen-4 '
+                      '(both c6a.4xlarge) from spot to on-demand. That brings back 6 test slots for about '
+                      '**$500/month more** than today. Unblock it to approve. Archive it to keep spot and wait out '
+                      'the queue.')
+
+
+def test_whether_title_gives_both_options(env):
+    st, _ = env
+    both = ['Switch gen-3 and gen-4 from spot to on-demand (about $500/month more)', 'Keep spot and wait out the queue']
+    assert core.literal_options(SPOT) == both
+    for label in both:
+        assert label[1:] in SPOT_TEXT  # verbatim slices of the title the card shows
+    assert labels(st.migrate_step(OWNER, dict(SPOT))) == both + ['Answer in your own words']
+
+
+@pytest.mark.parametrize('text,expected', [
+    ('Decide whether to merge it or not', []),
+    ('Choose whether to use A or B or C', []),
+    ('Choose whether to restart the box now, or something else', []),
+    ('Decide whether to keep the volume or shut it down', ['Keep the volume', 'Shut it down']),
+])
+def test_whether_alternatives(text, expected):
+    assert core._whether_alternatives(text) == expected
