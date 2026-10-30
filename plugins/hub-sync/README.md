@@ -29,6 +29,14 @@ The other task actions take the key `<profile>/<board>/<id>`, as the replica pub
 (`<board>/<id>`, a bare id) is refused with 400 before anything is queued; the owner gateway would only reject it as
 `invalid_task_route` after the request was sent.
 
+Reads run out of the gateway process. Each GET is answered by one of two `hubview_worker.py` children (niced +5)
+over a pipe, and the gateway relays the child's JSON bytes unchanged. Inside the gateway, hubview's pure-Python
+decode held the GIL against the asyncio loop that serves the whole API. At load ~100 on 2026-10-30 that made
+`/status` (2 ms of CPU) miss the Desktop's 4 s timeout 338 times in 20 min. If a child dies, hangs (60 s) or fails
+to spawn, that read is answered in-process and the children stay off for 30 s. A change to `hubview.py` or the
+worker on disk replaces the children on their next read. `HUB_SYNC_INPROC=1` keeps every read in-process. Covered
+by `tests/test_read_child.py`.
+
 `published` decode caching compares each row's raw JSON across hub database writes, so an unrelated
 replica/meta commit does not re-decode all local sessions and task handoffs. Same-version content
 changes, additions, deletions and invalid JSON remain visible on the next read. Covered by

@@ -20,16 +20,23 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import importlib.util
+import json
 import logging
+import os
+import select
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException
+from fastapi.responses import Response
 
 router = APIRouter()
 _VIEW = Path(__file__).resolve().parents[1] / "hubview.py"
+_WORKER = Path(__file__).resolve().parents[1] / "hubview_worker.py"
 
 
 def _hv():
@@ -61,11 +68,168 @@ WARMING: Dict[str, Any] = {"available": False, "warming": True}
 # other work fills that executor (min(32, cpu+4) threads, ~370 core call sites), and the
 # Desktop's first cold polls, which have no snapshot to fall back on, queued past the 4 s timeout
 # even though each read takes under 0.1 s.
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="hub-sync")
+#
+# The pool threads only relay: each read runs in a hubview_worker.py child (see _Reader) and the thread waits on its
+# pipe with the GIL released. One thread per child, so a thread entering always finds its own child free.
+_CHILDREN = 2
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=_CHILDREN, thread_name_prefix="hub-sync")
 _SLOW_LOG_S = 1.0
 _BOOT_LOG_S = 60.0
 _LOADED_AT = time.monotonic()
 log = logging.getLogger(__name__)
+
+
+class ChildUnavailable(RuntimeError):
+    """The read child could not answer (spawn failed, died, timed out, or reported an error)."""
+
+
+class ChildReadError(ChildUnavailable):
+    """The child is healthy but hubview raised; the in-process retry raises the same error as before."""
+
+
+class _Child:
+    """One hubview_worker.py process, used by one thread at a time (``lock``)."""
+
+    def __init__(self, argv: List[str]):
+        self.lock = threading.Lock()
+        self.argv = argv
+        self.proc: Optional[subprocess.Popen] = None
+        self.sig: Any = None
+        self.buf = b""
+
+    def close(self) -> None:
+        p, self.proc, self.buf = self.proc, None, b""
+        if p is None:
+            return
+        try:
+            p.kill()
+        except OSError:
+            pass
+        for f in (p.stdin, p.stdout):
+            try:
+                f.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            p.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _read_exact(self, n: int, deadline: float, until_newline: bool = False) -> bytes:
+        fd = self.proc.stdout.fileno()
+        while True:
+            if until_newline:
+                i = self.buf.find(b"\n")
+                if i >= 0:
+                    out, self.buf = self.buf[:i], self.buf[i + 1:]
+                    return out
+            elif len(self.buf) >= n:
+                out, self.buf = self.buf[:n], self.buf[n:]
+                return out
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ChildUnavailable("timed out")
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                raise ChildUnavailable("exited (rc=%s)" % self.proc.poll())
+            self.buf += chunk
+
+    def call(self, sig: Any, fn: str, args: list, timeout: float) -> bytes:
+        if self.proc is not None and (self.sig != sig or self.proc.poll() is not None):
+            self.close()  # hubview.py or the worker changed on disk, or the child died: start a fresh one
+        if self.proc is None:
+            try:
+                self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, close_fds=True, bufsize=0)
+            except OSError as e:
+                raise ChildUnavailable("spawn failed: %s" % e) from e
+            self.sig = sig
+        try:
+            self.proc.stdin.write(json.dumps({"fn": fn, "args": args}).encode() + b"\n")
+            deadline = time.monotonic() + timeout
+            head = json.loads(self._read_exact(0, deadline, until_newline=True))
+            body = self._read_exact(int(head.get("len") or 0), deadline)
+        except ChildUnavailable:
+            self.close()
+            raise
+        except (OSError, ValueError) as e:
+            self.close()
+            raise ChildUnavailable("pipe: %s" % e) from e
+        if not head.get("ok"):
+            raise ChildReadError("read failed: %s" % head.get("error"))
+        return body
+
+
+class _Reader:
+    """hubview reads in child processes (hubview_worker.py), so their CPU never holds the gateway's GIL.
+
+    Any child failure answers that one read in-process (the old path) and keeps children off for
+    ``backoff_s``; a hubview.py/worker change on disk replaces the children on their next read."""
+
+    def __init__(self, view: Path, worker: Path, children: int = _CHILDREN, timeout_s: float = 60.0,
+                 backoff_s: float = 30.0, python: Optional[str] = None):
+        self.view, self.worker = Path(view), Path(worker)
+        self.timeout_s, self.backoff_s = timeout_s, backoff_s
+        argv = [python or sys.executable, "-u", str(self.worker), str(self.view)]
+        self.children = [_Child(argv) for _ in range(max(1, children))]
+        self.down_until = 0.0
+        self.failures = 0
+
+    def _sig(self):
+        try:
+            return (self.view.stat().st_mtime_ns, self.worker.stat().st_mtime_ns)
+        except OSError:
+            return None
+
+    def call(self, fn: str, args: list) -> bytes:
+        if time.monotonic() < self.down_until:
+            raise ChildUnavailable("backing off after a failure")
+        child = next((c for c in self.children if c.lock.acquire(blocking=False)), None)
+        if child is None:
+            child = self.children[0]
+            child.lock.acquire()
+        try:
+            return child.call(self._sig(), fn, args, self.timeout_s)
+        except ChildReadError:
+            raise
+        except ChildUnavailable as e:
+            self.failures += 1
+            self.down_until = time.monotonic() + self.backoff_s
+            log.warning("hub-sync read child failed (%s: %s); reading in-process for %.0fs",
+                        fn, e, self.backoff_s)
+            raise
+        finally:
+            child.lock.release()
+
+    def close(self) -> None:
+        for c in self.children:
+            with c.lock:
+                c.close()
+
+
+# None = in-process reads only (tests that patch _hv; HUB_SYNC_INPROC=1 as an escape hatch).
+_READER: Optional[_Reader] = None if os.environ.get("HUB_SYNC_INPROC") == "1" else _Reader(_VIEW, _WORKER)
+
+
+def _read(fn: str, *args) -> bytes:
+    """One hubview read as JSON bytes: from a child when possible, else in this process. Called on a pool thread."""
+    reader = _READER
+    if reader is not None:
+        try:
+            return reader.call(fn, list(args))
+        except ChildUnavailable:
+            pass
+    return json.dumps(getattr(_hv(), fn)(*args), separators=(",", ":"), default=str).encode()
+
+
+def _respond(result: Any) -> Any:
+    """Bytes from _read go out as-is; dicts (WARMING, test fns) go through FastAPI's encoder."""
+    if isinstance(result, (bytes, bytearray)):
+        return Response(content=bytes(result), media_type="application/json")
+    return result
 
 
 def _default_backlog(loop) -> Any:
@@ -144,7 +308,7 @@ async def ping() -> Dict[str, Any]:
 
 @router.get("/status")
 async def get_status() -> Dict[str, Any]:
-    return await _poll("status", lambda: _hv().status())
+    return _respond(await _poll("status", lambda: _read("status")))
 
 
 @router.get("/sessions")
@@ -152,14 +316,14 @@ async def get_sessions(gateway: Optional[str] = None, exclude: Optional[str] = N
                        limit: int = 500) -> Dict[str, Any]:
     excluded = _split(exclude)
     key = ("sessions", gateway, tuple(excluded), bool(archived), limit)
-    return await _poll(key, lambda: _hv().sessions(gateway, excluded, bool(archived), limit))
+    return _respond(await _poll(key, lambda: _read("sessions", gateway, excluded, bool(archived), limit)))
 
 
 @router.get("/inbox")
 async def get_inbox(gateway: Optional[str] = None, exclude: Optional[str] = None, all: int = 0) -> Dict[str, Any]:  # noqa: A002
     excluded = _split(exclude)
     key = ("inbox", gateway, tuple(excluded), bool(all))
-    return await _poll(key, lambda: _hv().inbox(gateway, excluded, bool(all)))
+    return _respond(await _poll(key, lambda: _read("inbox", gateway, excluded, bool(all))))
 
 
 @router.get("/projects")
@@ -167,7 +331,7 @@ async def get_projects(gateway: Optional[str] = None, exclude: Optional[str] = N
     excluded = _split(exclude)
     preview = max(0, min(preview_limit, 50))
     key = ("projects", gateway, tuple(excluded), preview)
-    return await _poll(key, lambda: _hv().projects(gateway, excluded, preview))
+    return _respond(await _poll(key, lambda: _read("projects", gateway, excluded, preview)))
 
 
 @router.get("/tasks")
@@ -175,12 +339,12 @@ async def get_tasks(gateway: Optional[str] = None, exclude: Optional[str] = None
                     all: int = 0) -> Dict[str, Any]:  # noqa: A002
     excluded = _split(exclude)
     key = ("tasks", gateway, tuple(excluded), board, bool(all))
-    return await _poll(key, lambda: _hv().tasks(gateway, excluded, board, bool(all)))
+    return _respond(await _poll(key, lambda: _read("tasks", gateway, excluded, board, bool(all))))
 
 
 @router.get("/where/{session_id}")
 async def get_where(session_id: str) -> Dict[str, Any]:
-    return await _poll(("where", session_id), lambda: _hv().where(session_id))
+    return _respond(await _poll(("where", session_id), lambda: _read("where", session_id)))
 
 
 @router.get("/session-links/{session_id}")
@@ -189,12 +353,13 @@ async def get_session_links(session_id: str, ids: Optional[str] = None, all: int
                             origin_profile: Optional[str] = None) -> Dict[str, Any]:  # noqa: A002
     id_list = [session_id] + _split(ids)
     key = ("session-links", tuple(id_list), bool(all), origin_gateway, origin_profile)
-    return await _poll(key, lambda: _hv().session_links(id_list, bool(all), origin_gateway, origin_profile))
+    return _respond(await _poll(key, lambda: _read("session_links", id_list, bool(all), origin_gateway,
+                                                          origin_profile)))
 
 
 @router.get("/requests")
 async def get_requests(limit: int = 50) -> Dict[str, Any]:
-    return await _poll(("requests", limit), lambda: _hv().requests(limit))
+    return _respond(await _poll(("requests", limit), lambda: _read("requests", limit)))
 
 
 @router.post("/request")

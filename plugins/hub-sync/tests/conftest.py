@@ -110,6 +110,10 @@ def api_client(hub, monkeypatch):
     hv, state = hub
     api = _load(PLUGIN / "dashboard" / "plugin_api.py", "hub_sync_api_under_test")
     monkeypatch.setattr(api, "_hv", lambda: hv)
+    # These tests pin hv's clock and client in-process; the read child is covered by test_read_child.py.
+    if api._READER is not None:
+        api._READER.close()
+    monkeypatch.setattr(api, "_READER", None)
     app = fastapi.FastAPI()
     app.include_router(api.router)
     return TestClient(app), hv, state
