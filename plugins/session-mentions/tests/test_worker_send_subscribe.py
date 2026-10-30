@@ -10,6 +10,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -35,13 +36,18 @@ class Subs:
 
 
 @pytest.fixture(autouse=True)
-def isolated_board(monkeypatch, tmp_path):
-    # HERMES_HOME does not isolate the shared, cross-profile Kanban board.
-    # CI and dispatched workers inherit an explicit live DB pin.
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+def isolated_board(monkeypatch):
+    # TMPDIR may live under the worker's fenced ~/.hermes root. A test board
+    # directly under the user home stays outside that root, including in CI.
+    # Keep the descendant fence intact; a DB env pin is itself fenced, so use
+    # the isolated Kanban home instead. TemporaryDirectory cleans up on failure.
+    with TemporaryDirectory(prefix="session-mentions-test-", dir=Path.home()) as directory:
+        board_home = Path(directory)
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_home))
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        yield board_home
 
 
 @pytest.fixture
@@ -134,11 +140,14 @@ def test_tool_refusal_end_to_end(subs):
     assert len(subs.rows) == 1
 
 
-def test_real_kanban_db_gets_exactly_one_row(tmp_path, monkeypatch):
+def test_real_kanban_db_gets_exactly_one_row(isolated_board, monkeypatch):
     kbn = pytest.importorskip("hermes_cli.kanban_db_notify")
     kb = pytest.importorskip("hermes_cli.kanban_db")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    assert kb.kanban_db_path().resolve() == (tmp_path / "kanban.db").resolve()
+    from agent.delegation_context import kanban_path_is_fenced
+
+    monkeypatch.setenv("HERMES_HOME", str(isolated_board))
+    assert kb.kanban_db_path().resolve() == (isolated_board / "kanban.db").resolve()
+    assert not kanban_path_is_fenced(kb.kanban_db_path())
     kb.init_db()
     from hermes_cli import kanban_db_connect as kbc
 
@@ -157,13 +166,16 @@ def test_real_kanban_db_gets_exactly_one_row(tmp_path, monkeypatch):
     ]
 
 
-def test_default_add_sub_refuses_a_task_this_board_does_not_own(monkeypatch, tmp_path):
+def test_default_add_sub_refuses_a_task_this_board_does_not_own(monkeypatch, isolated_board):
     """enqueue() sees foreign worker cards; a refusal must not leave an orphan row in this DB."""
     kb = pytest.importorskip("hermes_cli.kanban_db")  # needs the Hermes runtime, like the test above
     kbc = pytest.importorskip("hermes_cli.kanban_db_connect")
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    assert kb.kanban_db_path().resolve() == (tmp_path / "kanban.db").resolve()
+    from agent.delegation_context import kanban_path_is_fenced
+
+    monkeypatch.setenv("HERMES_HOME", str(isolated_board))
+    assert kb.kanban_db_path().resolve() == (isolated_board / "kanban.db").resolve()
+    assert not kanban_path_is_fenced(kb.kanban_db_path())
     with kbc.connect_closing() as conn:
         mine = kb.create_task(conn, title="mine", assignee="default")
     rf._default_add_sub(task_id=mine, platform="tui", chat_id="s1", notifier_profile="default")
