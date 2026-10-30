@@ -40,26 +40,42 @@ class InstallCause(test_execution.Execution):
         self.addCleanup(self.s._install_failures.pop, integration.home, None)
         return integration
 
-    def test_unimportable_core_module_is_not_reported_as_drift(self):
+    def test_unimportable_core_leaves_selection_inactive_not_off(self):
+        # A bare interpreter (hermes-sync's plugin-cache warm runs core's stale venv, which has
+        # no psutil) cannot run an agent turn, so there is nothing to refuse: selection stays
+        # inactive and quiet instead of printing "Account selection is off" on every warm.
         integration = self.integration()
         with patch.object(builtins, '__import__', failing_core_import('psutil')):
             with self.assertRaises(ModuleNotFoundError):
                 integration.install()
-        integration.disable()
-        self.assertNotIn(DRIFT, integration.error)
-        self.assertIn('install raised ModuleNotFoundError at core-imports (psutil)', integration.error)
-        self.assertNotIn(SECRET, integration.error)
+        self.assertEqual(integration.failure[:2], ('ModuleNotFoundError', 'core-imports (psutil)'))
+        self.assertTrue(integration.core_unimportable)
 
-    def test_register_logs_type_and_seam_never_the_message(self):
+    def test_register_stays_quiet_when_core_is_unimportable(self):
         plugin = load_plugin('account_usage_cause_register')
         ctx = Ctx()
         self.addCleanup(lambda: [fn() for fn in reversed(ctx.cleanup)])
         self.addCleanup(self.s._install_failures.clear)
         with patch.object(builtins, '__import__', failing_core_import('psutil')), \
-                self.assertLogs(level=logging.WARNING) as logs:
+                self.assertLogs(level=logging.INFO) as logs:
             plugin.register(ctx)
         text = '\n'.join(logs.output)
         self.assertIn('ModuleNotFoundError at core-imports (psutil)', text)
+        self.assertNotIn('Account selection is off', text)
+        self.assertNotIn(SECRET, text)
+        self.assertEqual(self.s._install_failures, {})
+        self.assertEqual(len(ctx.middleware), 1)  # observation stays registered
+
+    def test_other_install_failures_still_log_a_warning_with_type_and_seam(self):
+        plugin = load_plugin('account_usage_cause_register2')
+        ctx = Ctx()
+        self.addCleanup(lambda: [fn() for fn in reversed(ctx.cleanup)])
+        self.addCleanup(self.s._install_failures.clear)
+        with patch.object(self.s, 'check_pins', side_effect=RuntimeError(SECRET)), \
+                self.assertLogs(level=logging.WARNING) as logs:
+            plugin.register(ctx)
+        text = '\n'.join(logs.output)
+        self.assertIn('install raised RuntimeError at execution-compatibility.json', text)
         self.assertNotIn(SECRET, text)
         self.assertNotIn(DRIFT, text)
 

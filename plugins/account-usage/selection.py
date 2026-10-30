@@ -772,6 +772,7 @@ class ExecutionIntegration:
         self.home = str(Path(get_hermes_home()).resolve())
         self.call_code = turn_api_call.perform_api_call.__code__
         self.error = None
+        self.core_unimportable = False  # install() failed on a missing core module: no agent can run here
         self.failure = None  # (exception type name, seam/file) of a failed install()
         self._at = 'setup'
         self.patches = []
@@ -804,6 +805,7 @@ class ExecutionIntegration:
             if isinstance(exc, ModuleNotFoundError) and isinstance(exc.name, str):
                 where = f'{where} ({exc.name})'  # a module name is not a secret
             self.failure = (type(exc).__name__, where, isinstance(exc, PinMismatch))
+            self.core_unimportable = isinstance(exc, ImportError) and self._at == 'core-imports'
             raise
 
     def _install(self):
