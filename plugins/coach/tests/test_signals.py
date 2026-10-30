@@ -901,3 +901,183 @@ def test_handoff_outcome_of_another_session_does_not_resolve_it(tmp_path):
     other = {**_outcome(True), "session_id": "someone_else", "draft_id": "d9"}
     h = _coach_home(tmp_path, [NUDGE, other])
     assert len(_handoffs(sg.collect_coach(h, {}, NUDGE["ts"] + sg.HANDOFF_GRACE_S + 1))) == 1
+
+
+# ── managed-worker crash storm + dispatcher systemic hold (the 10-29 ModelRoutingError outage) ────────────────
+
+MR_MSG = "Class selectors require provider auto; use a concrete model to pin a provider"
+
+
+def _worker_block(pid, exc="agent.model_routing.ModelRoutingError", msg=MR_MSG):
+    lines = ["managed worker failed", "Traceback (most recent call last):",
+             '  File "/home/you/.hermes/hermes-agent/agent/managed_worker.py", line 464, in main',
+             "    execute(frame, channel)",
+             '  File "/home/you/.hermes/hermes-agent/agent/model_routing.py", line 125, in resolve_model_route',
+             f'    raise {exc.split(".")[-1]}("{msg}")',
+             f"{exc}: {msg}"]
+    return "".join(f"[pid {pid}] {l}\n" for l in lines)
+
+
+def _worker_home(tmp_path):
+    h = tmp_path / "home"
+    (h / "logs").mkdir(parents=True)
+    (h / "logs" / "managed-worker.log").write_text("")
+    return h
+
+
+def _append_worker(h, *blocks):
+    with (h / "logs" / "managed-worker.log").open("a") as f:
+        f.write("".join(blocks))
+
+
+def _storms(sigs):
+    return [s for s in sigs if s["kind"] == "worker"]
+
+
+def test_worker_crash_storm_across_two_passes_files_one_signal(tmp_path):
+    """(a) 3 pids dying with the same exception over two passes file exactly one storm signal."""
+    h, cur = _worker_home(tmp_path), {}
+    _append_worker(h, _worker_block(101), _worker_block(102))
+    assert _storms(sg.collect(h, cur, "hubhost", NOW)) == []
+    _append_worker(h, _worker_block(103))
+    st = _storms(sg.collect(h, cur, "hubhost", NOW + 60))
+    assert len(st) == 1, st
+    s = st[0]
+    assert s["component"] == "kanban"
+    assert ("managed-worker crash storm on hubhost: 3 workers died with ModelRoutingError: Class selectors"
+            in s["symptom"])
+    assert all(p in s["details"] for p in ("101", "102", "103"))
+    assert "Traceback (most recent call last):" in s["details"] and len(s["details"]) <= 1500
+    norm = sg._norm_msg(MR_MSG)
+    assert s["fp"] == sg.fp("kanban", "worker-storm", "agent.model_routing.ModelRoutingError", norm)
+    # the defect it becomes keeps its kind, so the hub's ingest/drain accept it
+    assert "worker" in sg.KINDS and sg.to_defect(s)["kind"] == "worker"
+
+
+def test_two_worker_crashes_are_not_a_storm(tmp_path):
+    """(b) 2 pids give none."""
+    h = _worker_home(tmp_path)
+    _append_worker(h, _worker_block(101), _worker_block(102))
+    assert _storms(sg.collect(h, {}, "hubhost", NOW)) == []
+
+
+def test_three_different_worker_exceptions_are_not_a_storm(tmp_path):
+    """(c) 3 pids with 3 different exceptions give none."""
+    h = _worker_home(tmp_path)
+    _append_worker(h, _worker_block(101, "agent.a.FooError", "foo broke"),
+                   _worker_block(102, "agent.b.BarError", "bar broke"),
+                   _worker_block(103, "ValueError", "baz broke"))
+    assert _storms(sg.collect(h, {}, "hubhost", NOW)) == []
+
+
+def test_worker_storm_message_numbers_are_normalized(tmp_path):
+    """the same crash with a different pid/number in its message is still one storm"""
+    h = _worker_home(tmp_path)
+    _append_worker(h, *[_worker_block(p, "RuntimeError", f"worker {p} lost lease 7{p}") for p in (101, 102, 103)])
+    assert len(_storms(sg.collect(h, {}, "hubhost", NOW))) == 1
+
+
+def test_worker_storm_continuing_inside_the_window_files_no_second_signal(tmp_path):
+    """(d) the storm keeps going in the next pass inside WORKER_STORM_S: no second signal; after it, one again."""
+    h, cur = _worker_home(tmp_path), {}
+    _append_worker(h, *[_worker_block(p) for p in (101, 102, 103)])
+    assert len(_storms(sg.collect(h, cur, "hubhost", NOW))) == 1
+    _append_worker(h, *[_worker_block(p) for p in (104, 105, 106, 107)])
+    assert _storms(sg.collect(h, cur, "hubhost", NOW + 300)) == []
+    _append_worker(h, *[_worker_block(p) for p in (108, 109, 110)])
+    assert len(_storms(sg.collect(h, cur, "hubhost", NOW + sg.WORKER_STORM_S + 400))) == 1
+
+
+def test_worker_crashes_outside_the_window_do_not_add_up(tmp_path):
+    h, cur = _worker_home(tmp_path), {}
+    _append_worker(h, _worker_block(101), _worker_block(102))
+    sg.collect(h, cur, "hubhost", NOW)
+    _append_worker(h, _worker_block(103))
+    assert _storms(sg.collect(h, cur, "hubhost", NOW + sg.WORKER_STORM_S + 1)) == []
+
+
+def test_worker_log_cursor_advances_so_lines_are_never_reread(tmp_path):
+    """(f) a pass reads each line once: the same 2 crashes never count twice, and the cursor offset moves."""
+    h, cur = _worker_home(tmp_path), {}
+    _append_worker(h, _worker_block(101), _worker_block(102))
+    sg.collect(h, cur, "hubhost", NOW)
+    size = (h / "logs" / "managed-worker.log").stat().st_size
+    assert cur["worker:default"]["off"] == size
+    # nothing appended: a re-run reads no lines, so the two old pids never become three
+    assert sg.read_new(h / "logs" / "managed-worker.log", dict(cur), "worker:default", NOW) == []
+    for i in range(3):
+        assert _storms(sg.collect(h, cur, "hubhost", NOW + 10 * (i + 1))) == []
+    assert cur["worker:default"]["off"] == size
+
+
+def test_worker_storm_scrubs_secrets_from_details(tmp_path):
+    h = _worker_home(tmp_path)
+    _append_worker(h, *[_worker_block(p, "RuntimeError", "bad key sk-ant-abc123DEF456ghi789") for p in (1, 2, 3)])
+    st = _storms(sg.collect(h, {}, "hubhost", NOW))
+    assert len(st) == 1 and "sk-ant-abc123" not in st[0]["details"] + st[0]["symptom"]
+
+
+def _hold_board(db, events):
+    db.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(db)
+    c.execute("create table tasks (id text primary key, title text, status text, idempotency_key text)")
+    c.execute("create table task_runs (id integer primary key autoincrement, task_id text, status text, "
+              "started_at integer, ended_at integer, outcome text, error text)")
+    c.execute("create table task_events (id integer primary key autoincrement, task_id text not null, run_id integer,"
+              " kind text not null, payload text, created_at integer not null, uid text)")
+    for tid, payload, at in events:
+        c.execute("insert or ignore into tasks values (?,?,?,?)", (tid, f"card {tid}", "triage", None))
+        c.execute("insert into task_events (task_id, kind, payload, created_at) values (?,?,?,?)",
+                  (tid, "gave_up", json.dumps(payload), int(at)))
+    c.commit()
+    c.close()
+
+
+HOLD_ERR = ("pid {pid} exited with code 1 [managed worker lost: managed_worker_failed] Worker's last output: "
+            "'something card-specific {pid}'")
+
+
+def _holds(sigs):
+    return [s for s in sigs if s["kind"] == "kanban" and "systemic" in s["symptom"]]
+
+
+def test_sticky_gave_up_files_one_systemic_hold_signal(tmp_path):
+    """(e) the dispatcher's systemic breaker held 3 cards (sticky gave_up): one signal naming the cards."""
+    h = tmp_path / "home"
+    evs = [(f"t_hold{i}", {"failures": 1, "effective_limit": 1, "sticky": True, "pid": 3210800 + i,
+                            "error": HOLD_ERR.format(pid=3210800 + i)}, NOW - 120) for i in range(3)]
+    _hold_board(h / "kanban.db", evs)
+    cur = {}
+    hs = _holds(sg.collect_kanban(h, cur, NOW, "hubhost"))
+    assert len(hs) == 1, hs
+    s = hs[0]
+    assert s["symptom"] == "systemic kanban crash on hubhost: dispatcher held 3 card(s) in triage"
+    assert all(f"t_hold{i}" in s["details"] for i in range(3)) and "managed_worker_failed" in s["details"]
+    head = sg._hold_head(HOLD_ERR.format(pid=1))
+    assert s["fp"] == sg.fp("kanban", "systemic-hold", head)
+    # no card trigger: the held cards finishing later (they rerun after the hold) must not drop the defect
+    assert "kanban" not in s and sh.kanban_trigger(sg.to_defect(s)) is None
+    # the event cursor moved: the same events are not filed again
+    assert _holds(sg.collect_kanban(h, cur, NOW + 60, "hubhost")) == []
+
+
+def test_non_sticky_gave_up_files_no_systemic_hold(tmp_path):
+    """(e) an ordinary gave_up (one card used up its own retries) keeps today's behavior: no signal."""
+    h = tmp_path / "home"
+    _hold_board(h / "kanban.db", [("t_plain", {"failures": 3, "effective_limit": 3,
+                                               "error": HOLD_ERR.format(pid=5)}, NOW - 120)])
+    assert _holds(sg.collect_kanban(h, {}, NOW, "hubhost")) == []
+
+
+def test_sticky_holds_inside_the_window_are_not_refiled(tmp_path):
+    h = tmp_path / "home"
+    db = h / "kanban.db"
+    _hold_board(db, [("t_a", {"sticky": True, "error": HOLD_ERR.format(pid=1)}, NOW - 100)])
+    cur = {}
+    assert len(_holds(sg.collect_kanban(h, cur, NOW, "hubhost"))) == 1
+    c = sqlite3.connect(db)
+    c.execute("insert into task_events (task_id, kind, payload, created_at) values (?,?,?,?)",
+              ("t_b", "gave_up", json.dumps({"sticky": True, "error": HOLD_ERR.format(pid=2)}), int(NOW) + 200))
+    c.commit()
+    c.close()
+    assert _holds(sg.collect_kanban(h, cur, NOW + 300, "hubhost")) == []

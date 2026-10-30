@@ -642,14 +642,15 @@ Raw machine signals become `file_defect` calls with `source: signal` and stable 
 |---|---|---|
 | `errors` | new tracebacks in `<home>/logs/errors.log` (any level), minus tool output (`agent.tool_executor`) and provider transients (429/529/overloaded/timeouts) | exception type + innermost 4 frames as `file:function`, no line numbers (no) |
 | `hook` | `Hook '<hook>' callback <cb> raised: …` (plugin hook exceptions) | hook + callback + exception type (no) |
+| `worker` | managed kanban worker crashes in `<home>/logs/managed-worker.log` (`[pid N] ` lines, no timestamps), only as a crash storm: 3+ distinct pids dying with the same exception + normalized message (numbers, ids, paths collapsed) within 30 min on one host. State lives in the cursor, so a storm spans passes; `at` is the pass time. One signal per fingerprint per 30 min; `sk-` keys are scrubbed from the details | exception type + normalized message (no) |
 | `cron` | a job whose sticky `last_failure.at` is new (`cron/jobs.json`), even if it has recovered since | job name (yes) |
-| `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped | board + card id (yes) |
+| `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped. Also the dispatcher's systemic breaker (3+ same-fingerprint crashes in one tick, each card crashed once): a `gave_up` event with `sticky: true` (event-id cursor per board) files one `systemic kanban crash … held N card(s) in triage` per board + normalized error head per 30 min; it names no card trigger, so the held cards finishing later doesn't drop it | board + card id (yes); systemic hold: error head (no) |
 | `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash); `gateway.exit_signal` (an unplanned SIGTERM bounce: bootout, `kickstart -k`) only as a restart storm, 3+ in 10 min per profile | tag + exception type (yes) |
 | `coach` | coach `fixloop_card` (2nd confirmed failure of a fix), and a `reply_nudge` with rule `handoff` only when its `reply_nudge_outcome` (pre_verify re-judges the revised reply once, attempt 1, same judge and threshold, never nudges again) says it still hands off, or no outcome came within 15 min. `self_heal.py status` → `handoff_nudges` counts resolved vs filed | session (+ issue) (no) |
 | `monitor` | a propose-only monitor's finding (`route-monitor`, below) | the monitor's own dedupe key |
 
 Profiles (`<home>/profiles/*`) are swept too. Cursor `<home>/coach/signals-cursor.json` (offset + inode per log, last
-run id per board, last failure per job); first sight looks back 7 days; a rotated log is re-read; ≤ 25 signals per
+run id and last event id per board, last failure per job, the last 30 min of worker crashes); first sight looks back 7 days; a rotated log is re-read; ≤ 25 signals per
 kind per pass, same fingerprint folded into one (`seen Nx`).
 
 - **Hub**: cron `self-heal signals (hub)` (`~/.hermes/scripts/selfheal_signals.py` → `signals.py --host hermes-hub

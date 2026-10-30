@@ -7,10 +7,15 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               rotates) only as a storm: 3+ in 10 min per host, fingerprinted by status + reason class
               (revoked/expired/invalid/other); the e0a5909348 credential-guard warnings (no traceback) always;
 - hook        plugin hook exceptions (`Hook '<name>' callback <cb> raised: ...` from hermes_cli/plugins_dispatch);
+- worker      managed kanban worker crashes in <home>/logs/managed-worker.log (`[pid N] ` lines, no timestamps) only
+              as a storm: 3+ distinct pids dying with the same exception + normalized message within 30 min per
+              host (state in the cursor, `at` = pass time), filed once per fingerprint per 30 min;
 - cron        a cron job whose sticky `last_failure.at` is newer than the cursor (cron/jobs.json), filed only while
               failure_streak >= cron.failure_nudge_threshold (default 3) or after that many recovered failures in
               24 h (cursor `cron_fails`); a one-off failure the next run recovered from is only counted;
-- kanban      a card with >= 2 runs that crashed / timed out / failed to spawn (every board db);
+- kanban      a card with >= 2 runs that crashed / timed out / failed to spawn (every board db); and the dispatcher's
+              systemic breaker holding cards in triage (`gave_up` events with `sticky: true`, event-id cursor),
+              one signal per board + normalized error head per 30 min;
 - gateway     gateway crash-restarts: `gateway.previous_unclean_exit`, `asyncio.run.exception`,
               `gateway.exit_nonzero` in <home>/logs/gateway-exit-diag.log; a `gateway.exit_signal`
               (unplanned SIGTERM bounce) or `gateway.start_refused` (second start refused next to a live
@@ -59,7 +64,7 @@ GATEWAY_TAGS = ("gateway.previous_unclean_exit", "asyncio.run.exception", "gatew
 # the home/host (already_running / pid_claim / host_refused). One of either is a bounce, not a defect; only a
 # storm is filed, plus a refusal by an owner pid that is not running (a stale record blocking every start).
 SIGNAL_STORM_N, SIGNAL_STORM_S = 3, 600
-KINDS = ("errors", "hook", "cron", "kanban", "gateway", "coach", "monitor")
+KINDS = ("errors", "hook", "worker", "cron", "kanban", "gateway", "coach", "monitor")
 SELF_DIR = Path(__file__).resolve().parent
 HUB_CMD = "python3 ~/code/hermes-mods/plugins/coach/signals.py ingest"
 
@@ -411,6 +416,98 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
     return out
 
 
+# Managed kanban workers (agent/managed_worker.py) log their crash to <home>/logs/managed-worker.log, every line
+# prefixed "[pid N] ", with no timestamps; errors.log never sees it. One crash is the card's business (its run
+# fails, the retry tier or failure limit handles it). The same exception killing WORKER_STORM_N distinct workers
+# within WORKER_STORM_S is a fleet-wide defect (10-29: ~40 workers died at agent build with ModelRoutingError and
+# nothing was filed), so that files one signal per (exception, normalized message) per window.
+WORKER_STORM_N, WORKER_STORM_S = 3, 1800
+PID_LINE_RE = re.compile(r"^\[pid (\d+)\] ?(.*)$")
+WORKER_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*): (.*)$")
+SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}")
+
+
+def _scrub(s: str) -> str:
+    return SECRET_RE.sub("sk-***", home_tilde(s or ""))
+
+
+def _norm_msg(msg: str) -> str:
+    """A message with homes, paths, card ids, hex ids and numbers collapsed, so one crash compares equal."""
+    s = _scrub(msg)
+    s = re.sub(r"(?:~|/)[\w.\-]*(?:/[\w.\-]+)+", lambda m: ".../" + m.group(0).rsplit("/", 1)[-1], s)
+    s = re.sub(r"\bt_[0-9a-zA-Z]+", "t_#", s)
+    s = re.sub(r"\b[0-9a-f]{8,}\b", "#", s)
+    return re.sub(r"\d+", "N", s).strip()
+
+
+def parse_worker_crashes(lines: List[str]) -> List[dict]:
+    """managed-worker.log lines -> one {pid, exc, msg, block} per pid block that holds a traceback, from its last
+    `Type: msg` line after the last `Traceback` line. Provider transients and exit noise are not crashes."""
+    by_pid: Dict[str, List[str]] = {}
+    for ln in lines:
+        m = PID_LINE_RE.match(ln)
+        if m:
+            by_pid.setdefault(m.group(1), []).append(m.group(2))
+    out = []
+    for pid, blk in by_pid.items():
+        tbs = [i for i, l in enumerate(blk) if l.startswith("Traceback (most recent call last)")]
+        if not tbs:
+            continue
+        tail = blk[tbs[-1]:]
+        em = next((m for l in reversed(tail) for m in [WORKER_EXC_RE.match(l)] if m), None)
+        if em is None:
+            continue
+        exc, msg = em.group(1), em.group(2)
+        if TRANSIENT_RE.search(f"{exc}: {msg}") or EXIT_NOISE_RE.search(msg):
+            continue
+        out.append({"pid": pid, "exc": exc, "msg": msg, "block": tail})
+    return out
+
+
+def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List[dict]:
+    """Keep this host's recent worker crashes in the cursor (a storm spans passes; `at` is the pass time, the log
+    has none); WORKER_STORM_N distinct pids with the same (exception, normalized message) within WORKER_STORM_S
+    file one signal, and the same fingerprint is not filed again within WORKER_STORM_S."""
+    st = cur.get("worker_storm") or {}
+    evs = [e for e in st.get("ev") or [] if e.get("at", 0) > now - WORKER_STORM_S]
+    filed = {k: v for k, v in (st.get("filed") or {}).items() if v > now - WORKER_STORM_S}
+    out = []
+    latest: Dict[str, dict] = {}
+    for c in crashes:
+        k = h10(c["exc"], _norm_msg(c["msg"]))
+        evs.append({"at": now, "pid": c["pid"], "k": k})
+        latest[k] = c
+    for k, c in latest.items():
+        pids = sorted({e["pid"] for e in evs if e["k"] == k}, key=lambda p: (len(p), p))
+        if len(pids) < WORKER_STORM_N or k in filed:
+            continue
+        filed[k] = now
+        evs = [e for e in evs if e["k"] != k]
+        norm = _norm_msg(c["msg"])
+        tb = "\n".join(c["block"][-15:])
+        out.append({"kind": "worker", "component": "kanban", "at": now, "session_id": "",
+                    "symptom": f"managed-worker crash storm on {host or 'this host'}: {len(pids)} workers died "
+                               f"with {c['exc'].split('.')[-1]}: {_scrub(c['msg'])[:120]}",
+                    "details": _scrub(f"{len(pids)} managed kanban workers died with {c['exc']} within "
+                                      f"{WORKER_STORM_S // 60} min (logs/managed-worker.log). pids: "
+                                      f"{', '.join(pids)}\nLatest (pid {c['pid']}):\n{tb}")[:1500],
+                    "fp": fp("kanban", "worker-storm", c["exc"], norm)})
+    if evs or filed:
+        cur["worker_storm"] = {"ev": evs[-200:], "filed": filed}
+    else:
+        cur.pop("worker_storm", None)
+    return out
+
+
+def collect_worker(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
+    crashes: List[dict] = []
+    for prof, h in homes(home):
+        for c in parse_worker_crashes(read_new(h / "logs" / "managed-worker.log", cur, f"worker:{prof}", now)):
+            c["pid"] = c["pid"] if prof == "default" else f"{prof}:{c['pid']}"
+            crashes.append(c)
+    return worker_storms(cur, crashes, now, host)
+
+
 CRON_WINDOW_S = 86400
 
 
@@ -525,6 +622,7 @@ def collect_kanban(home: Path, cur: dict, now: float, host: str) -> List[dict]:
         except Exception:
             continue
         seen[board] = top
+        out += _systemic_holds(cur, board, db, now, host)
         groups: Dict[tuple, list] = {}
         for row in rows:
             tid, n, _mx, ended, outcomes, errs, title, ikey, status = row
@@ -571,6 +669,72 @@ def _err_key(errs: Optional[str]) -> str:
     """The distinct run errors of a card with ids, numbers and pids masked, so sibling cards compare equal."""
     parts = {re.sub(r"\bt_[0-9a-zA-Z]+|\d+", "#", p.strip()) for p in (errs or "").split(" | ")}
     return " | ".join(sorted(p for p in parts if p))
+
+
+def _hold_head(err: Optional[str]) -> str:
+    """The card-independent head of a run error (what precedes "Worker's last output"), normalized."""
+    head = re.split(r"\s*Worker's last output\b", str(err or ""), maxsplit=1)[0][:200]
+    return _norm_msg(head) or "unknown"
+
+
+def _systemic_holds(cur: dict, board: str, db: Path, now: float, host: str) -> List[dict]:
+    """The dispatcher's systemic breaker (3+ same-fingerprint crashes in one tick) holds each card in triage with a
+    `gave_up` event whose payload has `sticky: true`; every card crashed only once, so the >= 2 failed-runs rule
+    never sees it. One signal per (board, normalized error head) per WORKER_STORM_S, by event time. Event ids are
+    the cursor (cur["kanban_ev"][board]); a first sight looks back BACKFILL_S."""
+    evc = cur.setdefault("kanban_ev", {})
+    filed = cur.setdefault("kanban_hold", {})
+    try:
+        c = _ro(db)
+        try:
+            last = evc.get(board)
+            top = c.execute("select coalesce(max(id),0) from task_events").fetchone()[0]
+            if last is None:
+                rows = c.execute("select id, task_id, payload, created_at from task_events where kind='gave_up' "
+                                 "and created_at >= ? order by id", (int(now - BACKFILL_S),)).fetchall()
+            else:
+                rows = c.execute("select id, task_id, payload, created_at from task_events where kind='gave_up' "
+                                 "and id > ? order by id", (int(last),)).fetchall()
+        finally:
+            c.close()
+    except Exception:
+        return []  # an old board without task_events: nothing to read
+    evc[board] = top
+    clusters: Dict[str, dict] = {}
+    out = []
+    for _id, tid, payload, at in rows:
+        try:
+            p = json.loads(payload or "{}")
+        except Exception:
+            continue
+        if not isinstance(p, dict) or p.get("sticky") is not True:
+            continue
+        head = _hold_head(p.get("error"))
+        k = f"{board}\x1f{head}"
+        at = float(at or now)
+        cl = clusters.get(k)
+        if cl is not None and at - cl["at0"] < WORKER_STORM_S:
+            cl["tids"].append(tid)
+            cl["at"] = at
+            continue
+        if float(filed.get(k) or 0) > at - WORKER_STORM_S:
+            continue  # filed for this window by an earlier pass
+        filed[k] = at
+        clusters[k] = cl = {"at0": at, "at": at, "head": head, "tids": [tid], "err": str(p.get("error") or "")}
+        out.append(cl)
+    for k in [k for k, v in filed.items() if float(v or 0) < now - BACKFILL_S]:
+        filed.pop(k, None)
+    sigs = []
+    for cl in out:
+        tids = list(dict.fromkeys(cl["tids"]))
+        sigs.append({"kind": "kanban", "component": "kanban", "at": cl["at"],
+                     "symptom": f"systemic kanban crash on {host or 'this host'}: dispatcher held {len(tids)} "
+                                f"card(s) in triage",
+                     "details": _scrub(f"The dispatcher's systemic breaker (3+ same-fingerprint worker crashes in one "
+                                       f"tick) held these cards on {host}/{board} with a sticky gave_up: "
+                                       f"{', '.join(tids)}\nerror: {cl['err']}")[:1500],
+                     "fp": fp("kanban", "systemic-hold", cl["head"])})
+    return sigs
 
 
 def _signal_storm(cur: dict, prof: str, r: dict, at: float, host: str) -> Optional[dict]:
@@ -739,6 +903,7 @@ def collect(home: Path, cur: dict, host: str, now: Optional[float] = None) -> Li
     now = now or time.time()
     out = []
     for kind, fn in (("errors", lambda: collect_errors(home, cur, now, host)),
+                     ("worker", lambda: collect_worker(home, cur, now, host)),
                      ("cron", lambda: collect_cron(home, cur, now, host)),
                      ("kanban", lambda: collect_kanban(home, cur, now, host)),
                      ("gateway", lambda: collect_gateway(home, cur, now, host)),
