@@ -376,6 +376,8 @@ JUDGE_SYSTEM = (
 REQUEST_CHARS = 2000
 # Synthetic user rows (kanban done notices, auto-continue) are not the user's request.
 _SYNTHETIC_KINDS = ("kanban_notice", "auto_continue")
+# ...except a kanban notice that started the judged turn: then it is the request, labeled as automatic.
+NOTICE_PREFIX = "[Automatic notice, not typed by the user; it started this turn]\n"
 
 
 def _pool_llm(system: str, user: str) -> str:
@@ -401,7 +403,8 @@ def _clip(text: str) -> str:
 
 def _last_request(session_id: str) -> str:
     """The user's latest real message in this chat (compression lineage, newest first), or "" when unknown.
-    Skips synthetic rows (kanban notices, auto-continue) and this plugin's own nudge."""
+    Skips auto-continue rows, this plugin's own nudge and kanban notices older than a real message; a kanban
+    notice newer than every real message started the judged turn and is returned, labeled as automatic."""
     us = _user_steps()
     if us is None or not session_id:
         return ""
@@ -419,7 +422,14 @@ def _last_request(session_id: str) -> str:
                         (sid,)).fetchall()]
                 for content, kind in rows:
                     text = _text(content).strip()
-                    if text and (kind or "") not in _SYNTHETIC_KINDS and TAG not in text:
+                    if not text or TAG in text or (kind or "") == "auto_continue":
+                        continue
+                    if (kind or "") == "kanban_notice":
+                        # A notice newer than any real message started this turn: the reply answers the notice.
+                        # Judged against an older, already-answered question instead, a finished report got NO
+                        # every time (and still NO with both shown), flipping the chat to unresolved{no_summary}.
+                        return (NOTICE_PREFIX + text)[:REQUEST_CHARS]
+                    if (kind or "") not in _SYNTHETIC_KINDS:
                         return text[:REQUEST_CHARS]
         finally:
             c.close()

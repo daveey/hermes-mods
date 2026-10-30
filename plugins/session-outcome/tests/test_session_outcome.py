@@ -263,9 +263,9 @@ def test_judge_sees_the_users_latest_request(plugin, home):
     # questions) "a question", and said NO. Synthetic user rows (kanban notices, auto-continue, this plugin's own
     # nudge) are not the request.
     _messages(home, [("S1", "user", "old ask", None),
+                     ("S1", "user", "Kanban card t_0 finished", "kanban_notice"),
                      ("S1", "user", "what questions should i ask to vet an earthquake model", None),
                      ("S1", "assistant", "Ask about the ETAS baseline...", None),
-                     ("S1", "user", "Kanban card t_1 finished", "kanban_notice"),
                      ("S1", "user", "continue", "auto_continue"),
                      ("S1", "user", plugin.NUDGE, None)])
     seen = []
@@ -275,6 +275,22 @@ def test_judge_sees_the_users_latest_request(plugin, home):
     assert sent == ("<request>\nwhat questions should i ask to vet an earthquake model\n</request>\n\n"
                     "<message>\n1. What does ETAS score on the same test set?\n</message>")
     assert "<request>" in system and "<message>" in system
+
+
+def test_judge_request_is_the_kanban_notice_that_started_the_turn(plugin, home):
+    # A done notice woke a chat whose last typed message was an already-answered question from days before. Judged
+    # against that question, the finished report got NO every time and the chat flipped to unresolved{no_summary}.
+    _messages(home, [("S1", "user", "why does the worker need mac access?", None),
+                     ("S1", "assistant", "It doesn't any more...", None),
+                     ("S1", "user", "Kanban t_1 done: verified the reply drafts live", "kanban_notice"),
+                     ("S1", "user", "continue", "auto_continue"),
+                     ("S1", "user", plugin.NUDGE, None)])
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    assert plugin.judge("S1", "The final live check passed; nothing was sent.") is True
+    assert seen[-1] == ("<request>\n" + plugin.NOTICE_PREFIX + "Kanban t_1 done: verified the reply drafts live\n"
+                        "</request>\n\n<message>\nThe final live check passed; nothing was sent.\n</message>")
+    assert "why does the worker" not in seen[-1]
 
 
 def test_judge_request_is_capped_and_missing_rows_send_message_only(plugin, home):
