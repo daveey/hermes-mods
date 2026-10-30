@@ -74,10 +74,17 @@ def main() -> int:
         return 0
     if payload.get("hook_event_name", "PreToolUse") != "PreToolUse":
         return 0
-    guard = load_guard()
-    why = guard.classify("terminal", payload.get("tool_input")) if guard.enabled() else None
-    if why:
-        print(f"{guard.MESSAGE}\n({why})", file=sys.stderr)
+    try:
+        guard = load_guard()
+        verdict = guard._pre_tool_call("terminal", payload.get("tool_input"))
+    except Exception as exc:
+        print(f"backend-restart-guard failed open: {exc}", file=sys.stderr)
+        return 0
+    if verdict:
+        message = verdict['message']
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+              "permissionDecision": "deny", "permissionDecisionReason": message}}))
+        print(message, file=sys.stderr)
         return 2
     return 0
 

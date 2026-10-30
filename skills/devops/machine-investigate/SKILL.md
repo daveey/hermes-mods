@@ -49,6 +49,17 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only).
 6. Write the diagnosis with the `five-whys` skill: every why cites evidence from the report; stop at a
    process/guard/design gap.
 
+## Live gateway stacks and restarts
+
+Never signal a live Hermes gateway, its launcher/wrapper, or a Desktop serve/dashboard backend,
+including SIGUSR2, SIGQUIT, SIGABRT and SIGKILL. Only signal 0 is a safe existence probe.
+For a stack sample use `sample <pid> 5` on macOS or
+`py-spy dump --nonblocking --pid <pid>` on Linux. Do not substitute a signal if sampling is unavailable.
+For a gateway restart use
+`python3 ~/.hermes/sync-runner/hermes-sync pause-turns --timeout 180 -- hermes gateway restart`.
+The backend-restart-guard enforces recognized literal signal commands on both Hermes and Claude Bash;
+its fail-open discovery and lexical limits are not permission to bypass it.
+
 ## What you may fix without asking
 
 - `collect.py clean --apply` (can take several minutes: run it in the background and wait for it, not in a
