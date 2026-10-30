@@ -1,0 +1,263 @@
+From 7540a0a5a5d2eb784f66aa7dda2df04665435465 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:33:19 -0700
+Subject: [PATCH] fix(kanban): a woken remote notice is acked when its row is
+ durable, not at turn admission [daveey]
+
+The unloaded sweeper's waker called started() -> _settle_claim when _wake_session_turn returned
+"started". That only means the turn passed admission (_notif_submit); the notice's kanban_notice user
+row is written later on the turn thread. A backend dying in between left delivered=1 (DELIVERED = "in
+the transcript") with no row: the failure class of ledger row 1245.
+
+- started() now runs _settle_started: ack only if the notice's own key is already in the transcript,
+  else the claim stays in flight (holder = this process).
+- _claim_notice's holder-is-me branch acks this process's own claim once its key is in the
+  transcript (swept reason=delivered). The sweep pass does it for an unloaded chat, collect() (the live
+  poller) once the woken chat is live here. No new thread.
+- A holder that dies first keeps the existing dead-holder path: the keyed check finds no row, so the
+  successor re-offers it (at-least-once).
+
+test_kanban_remote_wake: RED on the old code (3 failed): started-without-row is not acked; the next
+pass acks once the row lands; a dead admitting backend is redelivered. Controls: a started turn whose
+row landed is acked in the same pass; the live poller acks a started claim. The existing
+"wakes once" test faked a turn that never wrote its row and asserted delivered=1 (it enshrined the
+gap); its fake now writes the row like the real turn.
+---
+ tests/tui_gateway/test_kanban_remote_wake.py | 118 ++++++++++++++++++-
+ tui_gateway/kanban_remote_notices.py         |  50 +++++++-
+ 2 files changed, 162 insertions(+), 6 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_wake.py b/tests/tui_gateway/test_kanban_remote_wake.py
+index ce9827b829e..8789af13ffe 100644
+--- a/tests/tui_gateway/test_kanban_remote_wake.py
++++ b/tests/tui_gateway/test_kanban_remote_wake.py
+@@ -12,6 +12,7 @@ state.db paths of the sandboxed home; only the agent turn (``wake_turn``) and th
+ 
+ import contextlib
+ import json
++import os
+ import sqlite3
+ import threading
+ import time
+@@ -79,12 +80,23 @@ def _blocked_on_david(tid, at):
+             "sessions": [{"gw": "macbook", "profile": "default", "session": CHAT, "rel": "shepherd"}]}
+ 
+ 
+-def _one_pass(monkeypatch, wake_verdict="started"):
+-    """One iteration of the production sweeper loop; returns the faked wakes it requested."""
++def _turn_writes_row(tip, text, metadata):
++    """What the real woken turn persists on its thread (``prompt_turn._invoke_agent``): its user row, typed
++    ``kanban_notice`` with the wake's display metadata."""
++    with SessionDB(get_hermes_home() / "state.db") as db:
++        db.append_message(tip, "user", text, display_kind="kanban_notice", display_metadata=metadata)
++
++
++def _one_pass(monkeypatch, wake_verdict="started", row_lands=True):
++    """One iteration of the production sweeper loop; returns the faked wakes it requested. ``row_lands`` makes
++    a started turn persist its notice row before the waker hears "started" (False: admitted, row not yet
++    written, as when the backend dies between admission and the turn thread's write)."""
+     wakes = []
+ 
+     def wake(tip, text, metadata):
+         wakes.append((tip, text, metadata))
++        if wake_verdict == "started" and row_lands:
++            _turn_writes_row(tip, text, metadata)
+         return wake_verdict
+ 
+     monkeypatch.setattr(ku, "wake_turn", wake)
+@@ -118,7 +130,7 @@ def test_remote_done_notice_wakes_an_idle_chat_once(home, monkeypatch):
+     assert "t_01a1873edd84d3fc" in wakes[0][1] and "shipped the fix" in wakes[0][1]
+     assert wakes[0][2]["kanban_event_keys"] == ["remote:hub:default/default/t_01a1873edd84d3fc:81053"]
+     assert wakes[0][2]["woken"] is True
+-    assert _notice_rows() == []  # the started turn records the notice; no passive duplicate row
++    assert len(_notice_rows()) == 1  # the started turn's own row records the notice; no passive duplicate
+     assert _ledger("hub/default/default/t_01a1873edd84d3fc")["delivered"] == 1
+     # Next pass (and a restarted backend): nothing is woken or written again.
+     assert _one_pass(monkeypatch) == []
+@@ -162,3 +174,103 @@ def test_card_blocked_on_david_writes_the_row_without_waking(home, monkeypatch):
+     assert _one_pass(monkeypatch) == []
+     rows = _notice_rows()
+     assert len(rows) == 1 and "t_needs_david" in rows[0]["content"]
++
++
++# [daveey] "started" means the turn was ADMITTED (``_notif_submit``); its notice row is written later, on the
++# turn thread. The waker acked the ledger at admission, so a backend that died in between left delivered=1
++# (DELIVERED = "in the transcript") with no row: the failure class of ledger row 1245 (t_01a18bf35767bcd9).
++
++def _orphan(ref):
++    from tests.tui_gateway.test_kanban_remote_notices import _dead_pid
++    with sqlite3.connect(krn.ledger_path()) as conn:
++        conn.execute("UPDATE notices SET holder_pid=?, holder_start=NULL WHERE session=? AND ref=?",
++                     (_dead_pid(), CHAT, ref))
++
++
++def _swept_reason(notice_id):
++    with contextlib.closing(sqlite3.connect(krn.ledger_path())) as conn:
++        row = conn.execute("SELECT reason FROM swept WHERE session=? AND notice_id=?", (CHAT, notice_id)).fetchone()
++        return row[0] if row else None
++
++
++def test_started_turn_whose_row_is_not_written_is_not_acked(home, monkeypatch):
++    """RED before the fix: admission alone acked delivered=1 with no transcript row."""
++    now = time.time()
++    ref = "hub/default/default/t_admitted"
++    _publish(home, [_done("t_admitted", now - 90)])
++
++    wakes = _one_pass(monkeypatch, row_lands=False)
++
++    assert len(wakes) == 1 and _notice_rows() == []
++    row = _ledger(ref)
++    assert row["delivered"] == 0 and row["holder_pid"] == os.getpid()  # still in flight, held by this backend
++    assert _swept_reason(wakes[0][2]["notice_id"]) is None
++    # The claim's live holder is this process, so the next pass neither wakes the chat again nor writes a row.
++    assert _one_pass(monkeypatch, row_lands=False) == []
++    assert _notice_rows() == [] and _ledger(ref)["delivered"] == 0
++
++
++def test_started_turn_is_acked_by_the_next_pass_once_its_row_lands(home, monkeypatch):
++    """The turn thread writes the row after admission: the next sweep pass acks DELIVERED, with no second wake."""
++    now = time.time()
++    ref = "hub/default/default/t_late_row"
++    _publish(home, [_done("t_late_row", now - 90)])
++    wakes = _one_pass(monkeypatch, row_lands=False)
++    assert _ledger(ref)["delivered"] == 0
++
++    _turn_writes_row(*wakes[0])  # the turn thread's write
++
++    assert _one_pass(monkeypatch) == []
++    assert len(_notice_rows()) == 1
++    row = _ledger(ref)
++    assert row["delivered"] == krn.DELIVERED and row["holder_pid"] is None
++    assert _swept_reason(wakes[0][2]["notice_id"]) == "delivered"
++
++
++def test_live_poller_acks_a_started_claim_once_its_row_lands(home, monkeypatch):
++    """A woken chat is live in this backend, so the sweep skips it; its poller (``collect``) acks the claim this
++    process holds once the key is in the transcript, and offers nothing new."""
++    now = time.time()
++    ref = "hub/default/default/t_live_ack"
++    _publish(home, [_done("t_live_ack", now - 90)])
++    wakes = _one_pass(monkeypatch, row_lands=False)
++    _turn_writes_row(*wakes[0])
++
++    with SessionDB(get_hermes_home() / "state.db") as db:
++        got = krn.collect(CHAT, "default", now=time.time(),
++                          transcript_has=lambda key, tid: krn.notice_in_transcript(db, CHAT, key, tid))
++
++    assert got == []
++    assert _ledger(ref)["delivered"] == krn.DELIVERED
++    assert len(_notice_rows()) == 1
++
++
++def test_backend_dies_before_the_started_turns_row_is_redelivered(home, monkeypatch):
++    """At-least-once: the admitting backend dies before the turn writes its row. A successor finds the dead
++    holder, the key is not in the transcript, so it re-offers (wakes again) instead of acking."""
++    now = time.time()
++    ref = "hub/default/default/t_died"
++    _publish(home, [_done("t_died", now - 90)])
++    assert len(_one_pass(monkeypatch, row_lands=False)) == 1
++    _orphan(ref)
++    krn._reset_for_tests()  # the successor process
++    ku._reset_wake_budget_for_tests()
++
++    wakes = _one_pass(monkeypatch)
++
++    assert len(wakes) == 1
++    assert len(_notice_rows()) == 1
++    assert _ledger(ref)["delivered"] == krn.DELIVERED
++
++
++def test_started_turn_whose_row_landed_is_acked_in_the_same_pass(home, monkeypatch):
++    """Control: when the row is already durable as the waker hears "started", the ack is immediate."""
++    now = time.time()
++    ref = "hub/default/default/t_fast_row"
++    _publish(home, [_done("t_fast_row", now - 90)])
++
++    wakes = _one_pass(monkeypatch, row_lands=True)
++
++    assert len(wakes) == 1 and len(_notice_rows()) == 1
++    assert _ledger(ref)["delivered"] == krn.DELIVERED
++    assert _swept_reason(wakes[0][2]["notice_id"]) == "delivered"
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 893f4c390a3..522a04c4440 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -368,7 +368,25 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+     if row["delivered"]:
+         return "skip"
+     holder = row["holder_pid"]
+-    if _holder_is_me(holder) or _holder_alive(holder, row["holder_start"]):
++    if _holder_is_me(holder):
++        # [daveey] This process's own claim: a woken turn was admitted and its row is written later, on the
++        # turn thread (``_settle_started`` leaves the claim in flight until then). Ack it once its own key is
++        # in the transcript; until then it stays in flight, and a death re-offers it below in the successor.
++        key = notice_key or row["notice_key"] or ""
++        if key and transcript_has is not None and transcript_has(key, ""):
++            with conn:
++                cur = conn.execute(
++                    "UPDATE notices SET delivered=?, holder_pid=NULL, holder_start=NULL, notice_key=? "
++                    "WHERE session=? AND ref=? AND state=? AND delivered=0 AND holder_pid IS ?",
++                    (DELIVERED, key, session, ref, state, holder))
++                if cur.rowcount == 1:
++                    _swept_row(conn, swept_key, "delivered")
++            if cur.rowcount == 1:
++                logger.info("remote kanban: started turn's notice %s %s for chat %s is in the transcript; acked",
++                            ref, state, session)
++                return "acked"
++        return "skip"
++    if _holder_alive(holder, row["holder_start"]):
+         return "skip"
+     if holder is None:
+         return "skip"  # old silent delivered=0 record: never announced, do not flood
+@@ -744,12 +762,38 @@ def _sweep_cards(rows: list[tuple], me: str):
+ 
+ 
+ def _settle_claim(claim: dict, memo_key: tuple, ledger) -> None:
+-    """The notice reached the chat (a started turn or a written row): ledger delivered, memo and ``swept`` set."""
++    """The notice is in the chat's transcript (a written row, or a started turn's row found by its key): ledger
++    delivered, memo and ``swept`` set."""
+     ack(claim, ledger=ledger)
+     _record_swept([memo_key], ledger, reason="delivered")
+     _remember_delivered(memo_key)
+ 
+ 
++def _settle_started(session_db, profile: str, sid: str, event_key: str, claim: dict, memo_key: tuple,
++                    ledger) -> bool:
++    """A woken turn was ADMITTED: ack only if its notice row is already durable, else leave the claim in flight.
++
++    [daveey] ``_RemoteWaker`` calls this when ``_wake_session_turn`` returns "started", which means the turn
++    passed admission (``_notif_submit``); the turn's ``kanban_notice`` user row is written later, on the turn
++    thread (``prompt_turn._invoke_agent``). Acking here wrote DELIVERED ("in the transcript") with no row, so a
++    backend that died in between lost the notice for good (the failure class of ledger row 1245). A claim left
++    in flight is acked by this process's next pass once the key lands (``_claim_notice``, holder-is-me branch:
++    the sweep, or ``collect`` once the woken chat is live here); if this process dies first, the successor's
++    dead-holder check finds no key in the transcript and re-offers it. Never raises."""
++    try:
++        with session_db(profile, sid) as (db, tip):
++            durable = db is not None and notice_in_transcript(db, tip, event_key, "")
++    except Exception:
++        logger.debug("remote kanban: transcript check after a started wake failed", exc_info=True)
++        durable = False
++    if durable:
++        _settle_claim(claim, memo_key, ledger)
++        return True
++    logger.info("remote kanban notice %s %s for chat %s: turn admitted, row not yet written; claim stays in "
++                "flight until it is", claim["ref"], claim["state"], sid)
++    return False
++
++
+ def _persist_claimed(session_db, profile: str, sid: str, text: str, metadata: dict, claim: dict, memo_key: tuple,
+                      ledger) -> bool:
+     """The passive row for a claimed notice whose wake did not start. A chat mid-turn (or any failure) hands the
+@@ -831,7 +875,7 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+         result = waker.deliver(
+             tip, text, metadata, task, now or time.time(),
+             persist=lambda: _persist_claimed(session_db, profile, sid, text, metadata, claim, memo_key, ledger),
+-            started=lambda: _settle_claim(claim, memo_key, ledger))
++            started=lambda: _settle_started(session_db, profile, sid, event_key, claim, memo_key, ledger))
+         delivered.append({"task_id": task["id"], "session_id": tip, "wake": result})
+     except Exception:
+         logger.debug("remote Kanban notice deferred for %s/%s", owner, key, exc_info=True)
+-- 
+2.55.0
+

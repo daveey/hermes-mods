@@ -1,0 +1,536 @@
+From 84030f99ffcce723481d21482547046d5842a22a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:46:39 +0000
+Subject: [PATCH] fix(code-skew): record the boot revision in hermes_bootstrap,
+ before main imports the tree [daveey]
+
+The boot-pin guard took its boot commit in start_gateway / the serve lifespan, after
+hermes_cli.main had already imported much of the tree. A hermes update landing in that gap
+passed as the boot commit, so the finder saw no skew and a lazy import (code_kernel) loaded
+new code next to old eager modules (process_identity): ImportError 'spawn_owned'
+(agent-529f2244ac, mini 2026-10-29; first occurrence t_01a1824adc287c5a).
+
+- hermes_cli/git_fingerprint.py: stdlib-only fingerprint reader (moved from main.py, aliases kept)
+  plus a per-process first-value-wins boot record.
+- hermes_bootstrap records it right after the interrupted-update repair, before any other
+  tree import; code_skew.record_boot_fingerprint prefers it and warns when HEAD already moved.
+- Detection: code_skew.note_import_error logs one 'code-skew import mix' WARNING naming both
+  shas when a tool dispatch or execute_code session kernel raises ImportError under skew.
+- Tests: update-between-start-and-bootstrap regression, bootstrap wiring subprocess test,
+  import-mix warning on the registry and session-kernel paths.
+---
+ gateway/code_skew.py                       |  63 ++++++++++++-
+ hermes_bootstrap.py                        |  18 ++++
+ hermes_cli/git_fingerprint.py              |  96 +++++++++++++++++++
+ hermes_cli/main.py                         |  68 ++------------
+ tests/gateway/test_boot_pinned_imports.py  |  54 +++++++++++
+ tests/gateway/test_code_skew_import_mix.py | 102 +++++++++++++++++++++
+ tools/code_kernel.py                       |   5 +
+ tools/registry.py                          |   6 ++
+ 8 files changed, 348 insertions(+), 64 deletions(-)
+ create mode 100644 hermes_cli/git_fingerprint.py
+ create mode 100644 tests/gateway/test_code_skew_import_mix.py
+
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+index a73693d819d..81c3531dffb 100644
+--- a/gateway/code_skew.py
++++ b/gateway/code_skew.py
+@@ -28,10 +28,39 @@ def _fingerprint() -> str | None:
+ 
+ 
+ def record_boot_fingerprint() -> None:
+-    """Snapshot the checkout revision at gateway startup (idempotent)."""
++    """Snapshot the checkout revision at gateway startup (idempotent).
++
++    Prefers the revision ``hermes_bootstrap`` read when the process started: by the time a gateway
++    or serve lifespan gets here, ``hermes_cli.main`` has already imported much of the tree, and an
++    update that landed meanwhile must not pass as the boot commit (agent-529f2244ac)."""
+     global _boot_fingerprint
+     if _boot_fingerprint is None:
+-        _boot_fingerprint = _fingerprint()
++        _boot_fingerprint = _process_boot_fingerprint() or _fingerprint()
++        current = _fingerprint()
++        if _boot_fingerprint and current and current != _boot_fingerprint:
++            import logging
++
++            logging.getLogger(__name__).warning(
++                "code-skew at startup: checkout moved from %s to %s while this process was starting; "
++                "modules imported so far may mix both, later first-time imports load from %s",
++                _short(_boot_fingerprint), _short(current), _short(_boot_fingerprint))
++
++
++def _process_boot_fingerprint() -> str | None:
++    """The revision ``hermes_bootstrap`` read at process start. A pytest process honours it only
++    with ``HERMES_BOOT_PINNED_IMPORTS=1`` (as ``boot_pinned_imports.install`` does): tests stand in
++    their own revisions through ``_fingerprint`` and must not get the worktree's real HEAD."""
++    import os
++
++    if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get(
++            "HERMES_BOOT_PINNED_IMPORTS", "").strip().lower() not in {"1", "true", "yes", "on"}:
++        return None
++    try:
++        from hermes_cli.git_fingerprint import process_boot_fingerprint
++
++        return process_boot_fingerprint(_PROJECT_ROOT)
++    except Exception:
++        return None
+ 
+ 
+ def install_boot_pinned_imports() -> None:
+@@ -71,3 +100,33 @@ def detect_code_skew() -> tuple[str, str] | None:
+     if current is None or current == _boot_fingerprint:
+         return None
+     return _short(_boot_fingerprint), _short(current)
++
++
++_import_mix_noted: set[tuple[str, str]] = set()
++
++
++def note_import_error(exc: BaseException, where: str) -> bool:
++    """Name an ImportError raised while the checkout differs from this process's boot revision.
++
++    One ``code-skew import mix`` WARNING per (boot, disk) pair, so the error signal shows the cause
++    (a process running two revisions; restart it) instead of a bare ``cannot import name``
++    (agent-529f2244ac). Returns True when the error happened under skew. Never raises."""
++    try:
++        if not isinstance(exc, ImportError):
++            return False
++        boot = _boot_fingerprint or _process_boot_fingerprint()
++        current = _fingerprint() if boot else None
++        if not current or current == boot:
++            return False
++        pair = (boot, current)
++        if pair not in _import_mix_noted:
++            _import_mix_noted.add(pair)
++            import logging
++
++            logging.getLogger(__name__).warning(
++                "code-skew import mix: %s raised %s: %s; this process booted on %s but the checkout "
++                "is now %s, so it runs two revisions — restart it to load one",
++                where, type(exc).__name__, exc, _short(boot), _short(current))
++        return True
++    except Exception:
++        return False
+diff --git a/hermes_bootstrap.py b/hermes_bootstrap.py
+index 619dc5747b4..3b8f689c852 100644
+--- a/hermes_bootstrap.py
++++ b/hermes_bootstrap.py
+@@ -544,6 +544,24 @@ def _settle_interrupted_update() -> None:
+ _settle_interrupted_update()
+ 
+ 
++def _record_boot_revision() -> None:
++    """Read the checkout revision before the rest of the tree is imported. The boot-pin guard
++    (``gateway.code_skew``) installs much later, in ``start_gateway``/the serve lifespan; a
++    ``hermes update`` landing in between used to pass as the boot commit, so the finder saw no skew
++    and lazy imports mixed revisions (agent-529f2244ac). Runs after ``_settle_interrupted_update``:
++    that repair may move the tree back (and drops ``hermes_cli.*`` modules in its moved-aside path),
++    so a revision read before it would not be the one this process loads. Stdlib-only, never fatal."""
++    try:
++        from hermes_cli.git_fingerprint import record_process_boot_fingerprint
++
++        record_process_boot_fingerprint(_root)
++    except Exception:
++        return  # older tree (mid-update) or unreadable .git: the guard records late, as before
++
++
++_record_boot_revision()
++
++
+ def _pin_launcher_home() -> None:
+     """A minted launcher (``hermes_cli._launchers``) pins ``HERMES_HOME`` to the install's default
+     root. That needs ``hermes_constants`` from the checkout, so the launcher asks for it here, after
+diff --git a/hermes_cli/git_fingerprint.py b/hermes_cli/git_fingerprint.py
+new file mode 100644
+index 00000000000..729f47503d0
+--- /dev/null
++++ b/hermes_cli/git_fingerprint.py
+@@ -0,0 +1,96 @@
++"""Cheap checkout fingerprint (``git:<ref>:<sha>``) read from ``.git`` files, without spawning git.
++
++Stdlib only on purpose: ``hermes_bootstrap`` imports this before any other Hermes module so the
++process records the revision it actually started on (``record_process_boot_fingerprint``). The
++boot-pin guard (``gateway.code_skew`` / ``gateway.boot_pinned_imports``) installs later, in
++``start_gateway`` or the serve lifespan; reading the revision only then let a ``hermes update`` that
++landed during startup pass as the boot commit, so lazy imports mixed revisions (agent-529f2244ac).
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++# Resolved checkout root -> fingerprint read when the process started (first value wins).
++_process_boot: dict[str, str | None] = {}
++
++
++def read_packed_ref(common_dir: Path, ref: str) -> str | None:
++    """Look up a ref in .git/packed-refs without spawning git.
++
++    packed-refs lines look like ``<sha> <ref>`` with optional ``^<sha>``
++    peel lines and ``#``-prefixed comments / ``# pack-refs with:`` header.
++    """
++    try:
++        text = (common_dir / "packed-refs").read_text(encoding="utf-8-sig", errors="replace")
++    except OSError:
++        return None
++    for line in text.splitlines():
++        if not line or line.startswith("#") or line.startswith("^"):
++            continue
++        parts = line.split(" ", 1)
++        if len(parts) == 2 and parts[1].strip() == ref:
++            return parts[0].strip()
++    return None
++
++
++def read_git_revision_fingerprint(repo_root: Path) -> str | None:
++    """Return a cheap checkout fingerprint without spawning git."""
++    git_dir = repo_root / ".git"
++    try:
++        if git_dir.is_file():
++            for line in git_dir.read_text(encoding="utf-8-sig", errors="replace").splitlines():
++                key, _, value = line.partition(":")
++                if key.strip() == "gitdir" and value.strip():
++                    git_dir = (repo_root / value.strip()).resolve()
++                    break
++        # Worktrees point HEAD at a per-worktree gitdir but pack their refs
++        # in the main repo's gitdir (referenced via ``commondir``). Resolve
++        # that up front so packed-refs lookups hit the right file.
++        common_dir = git_dir
++        commondir_file = git_dir / "commondir"
++        if commondir_file.exists():
++            try:
++                rel = commondir_file.read_text(encoding="utf-8-sig", errors="replace").strip()
++                if rel:
++                    common_dir = (git_dir / rel).resolve()
++            except OSError:
++                pass
++        head = (git_dir / "HEAD").read_text(encoding="utf-8-sig", errors="replace").strip()
++        if head.startswith("ref:"):
++            ref = head.split(":", 1)[1].strip()
++            # Loose refs may live in the worktree gitdir OR the common dir
++            # (branches created via `git worktree add` typically live in the
++            # common dir's refs/heads/).
++            for candidate in (git_dir, common_dir):
++                ref_file = candidate / ref
++                if ref_file.exists():
++                    return f"git:{ref}:{ref_file.read_text(encoding='utf-8-sig', errors='replace').strip()}"
++            packed_sha = read_packed_ref(common_dir, ref)
++            if packed_sha:
++                return f"git:{ref}:{packed_sha}"
++            # Ref name is known but unresolved — still stable across launches,
++            # and the version/release fallback in the caller will invalidate
++            # after `hermes update`.
++            return f"git:{ref}:unresolved"
++        return f"git:HEAD:{head}"
++    except OSError:
++        return None
++
++
++def _key(root) -> str:
++    return os.path.realpath(str(root))
++
++
++def record_process_boot_fingerprint(root) -> str | None:
++    """Read ``root``'s revision once per process; later calls keep the first value."""
++    key = _key(root)
++    if key not in _process_boot:
++        _process_boot[key] = read_git_revision_fingerprint(Path(key))
++    return _process_boot[key]
++
++
++def process_boot_fingerprint(root) -> str | None:
++    """The revision ``record_process_boot_fingerprint`` read at process start, else None."""
++    return _process_boot.get(_key(root))
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index dfa068b69c6..dfdd91f66f2 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -862,68 +862,12 @@ def _is_termux_startup_environment(env: dict[str, str] | None = None) -> bool:
+     )
+ 
+ 
+-def _read_packed_ref(common_dir: Path, ref: str) -> str | None:
+-    """Look up a ref in .git/packed-refs without spawning git.
+-
+-    packed-refs lines look like ``<sha> <ref>`` with optional ``^<sha>``
+-    peel lines and ``#``-prefixed comments / ``# pack-refs with:`` header.
+-    """
+-    try:
+-        text = (common_dir / "packed-refs").read_text(encoding="utf-8-sig", errors="replace")
+-    except OSError:
+-        return None
+-    for line in text.splitlines():
+-        if not line or line.startswith("#") or line.startswith("^"):
+-            continue
+-        parts = line.split(" ", 1)
+-        if len(parts) == 2 and parts[1].strip() == ref:
+-            return parts[0].strip()
+-    return None
+-
+-
+-def _read_git_revision_fingerprint(repo_root: Path) -> str | None:
+-    """Return a cheap checkout fingerprint without spawning git."""
+-    git_dir = repo_root / ".git"
+-    try:
+-        if git_dir.is_file():
+-            for line in git_dir.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+-                key, _, value = line.partition(":")
+-                if key.strip() == "gitdir" and value.strip():
+-                    git_dir = (repo_root / value.strip()).resolve()
+-                    break
+-        # Worktrees point HEAD at a per-worktree gitdir but pack their refs
+-        # in the main repo's gitdir (referenced via ``commondir``). Resolve
+-        # that up front so packed-refs lookups hit the right file.
+-        common_dir = git_dir
+-        commondir_file = git_dir / "commondir"
+-        if commondir_file.exists():
+-            try:
+-                rel = commondir_file.read_text(encoding="utf-8-sig", errors="replace").strip()
+-                if rel:
+-                    common_dir = (git_dir / rel).resolve()
+-            except OSError:
+-                pass
+-        head = (git_dir / "HEAD").read_text(encoding="utf-8-sig", errors="replace").strip()
+-        if head.startswith("ref:"):
+-            ref = head.split(":", 1)[1].strip()
+-            # Loose refs may live in the worktree gitdir OR the common dir
+-            # (branches created via `git worktree add` typically live in the
+-            # common dir's refs/heads/).
+-            for candidate in (git_dir, common_dir):
+-                ref_file = candidate / ref
+-                if ref_file.exists():
+-                    return f"git:{ref}:{ref_file.read_text(encoding='utf-8-sig', errors='replace').strip()}"
+-            packed_sha = _read_packed_ref(common_dir, ref)
+-            if packed_sha:
+-                return f"git:{ref}:{packed_sha}"
+-            # Ref name is known but unresolved — still stable across launches,
+-            # and the version/release fallback in the caller will invalidate
+-            # after `hermes update`.
+-            return f"git:{ref}:unresolved"
+-        return f"git:HEAD:{head}"
+-    except OSError:
+-        return None
+-
++# Moved to the stdlib-only hermes_cli.git_fingerprint so hermes_bootstrap can read the boot revision
++# before any other in-tree import; the private names stay for existing callers and test patches.
++from hermes_cli.git_fingerprint import (
++    read_git_revision_fingerprint as _read_git_revision_fingerprint,
++    read_packed_ref as _read_packed_ref,
++)
+ 
+ 
+ def _termux_bundled_skills_fingerprint() -> str:
+diff --git a/tests/gateway/test_boot_pinned_imports.py b/tests/gateway/test_boot_pinned_imports.py
+index d9b726e6a23..f23b95a40fa 100644
+--- a/tests/gateway/test_boot_pinned_imports.py
++++ b/tests/gateway/test_boot_pinned_imports.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ 
+ import importlib
+ import inspect
++import os
+ import subprocess
+ import sys
+ import uuid
+@@ -192,3 +193,56 @@ def test_code_skew_wiring_installs_a_finder_bound_to_the_boot_commit(tree, monke
+ 
+     _core_update(repo, pkg)
+     assert importlib.import_module(f"{pkg}.assign").validate() == "old:ModelRoutingError"
++
++
++def test_an_update_between_process_start_and_gateway_bootstrap_still_pins_the_boot_revision(
++        tree, monkeypatch):
++    """Regression for agent-529f2244ac (mini, 2026-10-29): ``hermes_cli.main`` imported the old
++    ``process_identity`` at process start, ``hermes update`` moved the checkout before
++    ``start_gateway`` recorded the boot commit, so the finder took the NEW commit as "boot", saw no
++    skew, and the lazy ``code_kernel`` import loaded new code that wants ``spawn_owned``.
++
++    Real order: ``hermes_bootstrap`` reads the revision before any other in-tree import, eager
++    imports follow, the update lands, then ``start_gateway`` records + installs."""
++    from gateway import code_skew
++    from hermes_cli import git_fingerprint
++
++    pkg, repo, boot, finders = tree
++    monkeypatch.setenv("HERMES_BOOT_PINNED_IMPORTS", "1")
++    monkeypatch.setattr(boot_pinned_imports, "_installed", None)
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", repo)
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
++    monkeypatch.setattr(git_fingerprint, "_process_boot", {})
++
++    git_fingerprint.record_process_boot_fingerprint(repo)  # hermes_bootstrap, first thing
++    importlib.import_module(f"{pkg}.routing")  # hermes_cli.main's eager imports (old code)
++    _core_update(repo, pkg)  # `hermes update` lands while the process is still starting
++    code_skew.record_boot_fingerprint()  # start_gateway / web_server_app lifespan
++    code_skew.install_boot_pinned_imports()
++    finder = boot_pinned_imports._installed
++    assert finder is not None
++    finders.append(finder)
++
++    assert finder.boot_sha == boot  # the commit the process actually started on
++    assert importlib.import_module(f"{pkg}.assign").validate() == "old:ModelRoutingError"
++    assert finder.pinned == [f"{pkg}.assign"]
++
++
++def test_hermes_bootstrap_records_the_boot_revision_before_hermes_cli_main_loads():
++    """Entry-point wiring: importing ``hermes_bootstrap`` (the first import of every entry point)
++    leaves the checkout's revision recorded, before ``hermes_cli.main`` and its eager imports run."""
++    root = Path(__file__).resolve().parents[2]
++    probe = ("import sys, hermes_bootstrap\n"
++             "import hermes_cli.git_fingerprint as g\n"
++             "print('main-loaded' if 'hermes_cli.main' in sys.modules else 'main-not-loaded')\n"
++             f"print(g.process_boot_fingerprint({str(root)!r}))\n"
++             # Read the reference in the child too: this worktree's .git lives in the real hermes
++             # home, which the in-process home-I/O guard refuses to touch.
++             f"from pathlib import Path\nprint(g.read_git_revision_fingerprint(Path({str(root)!r})))\n")
++    env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
++    done = subprocess.run([sys.executable, "-c", probe], cwd=root, env=env, capture_output=True, check=False,
++                          text=True, timeout=120)
++    assert done.returncode == 0, done.stderr
++    lines = done.stdout.strip().splitlines()
++    assert lines[-3] == "main-not-loaded"
++    assert lines[-2].startswith("git:") and lines[-2] == lines[-1]
+diff --git a/tests/gateway/test_code_skew_import_mix.py b/tests/gateway/test_code_skew_import_mix.py
+new file mode 100644
+index 00000000000..5a941d7a565
+--- /dev/null
++++ b/tests/gateway/test_code_skew_import_mix.py
+@@ -0,0 +1,102 @@
++"""An ImportError raised while the checkout has moved past the process's boot commit is named as a
++code-skew import mix (agent-529f2244ac): one WARNING with both shas, on each path that catches tool
++errors, so the coach signal shows the cause instead of a bare ``cannot import name``."""
++
++from __future__ import annotations
++
++import json
++import logging
++
++import pytest
++
++from gateway import code_skew
++
++BOOT = "a" * 40
++DISK = "b" * 40
++
++
++@pytest.fixture
++def skewed(monkeypatch):
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{BOOT}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{DISK}")
++    monkeypatch.setattr(code_skew, "_import_mix_noted", set())
++
++
++def _mix_lines(caplog):
++    return [r for r in caplog.records
++            if r.levelno == logging.WARNING and r.getMessage().startswith("code-skew import mix")]
++
++
++def test_an_import_error_after_the_checkout_moved_is_named_once_with_both_shas(skewed, caplog):
++    caplog.set_level(logging.WARNING, logger="gateway.code_skew")
++    exc = ImportError("cannot import name 'spawn_owned' from 'hermes_cli.process_identity'")
++    assert code_skew.note_import_error(exc, "code_kernel") is True
++    assert code_skew.note_import_error(exc, "code_kernel") is True  # still a mix, logged once
++    lines = _mix_lines(caplog)
++    assert len(lines) == 1
++    text = lines[0].getMessage()
++    assert BOOT[:10] in text and DISK[:10] in text and "spawn_owned" in text
++
++
++def test_no_note_when_the_checkout_did_not_move_or_the_error_is_not_an_import_error(
++        monkeypatch, caplog):
++    caplog.set_level(logging.WARNING, logger="gateway.code_skew")
++    monkeypatch.setattr(code_skew, "_import_mix_noted", set())
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{BOOT}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{BOOT}")
++    assert code_skew.note_import_error(ImportError("x"), "tool") is False
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{DISK}")
++    assert code_skew.note_import_error(ValueError("x"), "tool") is False
++    assert _mix_lines(caplog) == []
++
++
++def test_a_process_that_never_ran_the_gateway_record_uses_the_bootstrap_revision(monkeypatch, caplog):
++    """CLI / kanban-worker processes never call ``record_boot_fingerprint``; the revision
++    ``hermes_bootstrap`` read at process start still names the mix."""
++    from hermes_cli import git_fingerprint
++
++    caplog.set_level(logging.WARNING, logger="gateway.code_skew")
++    monkeypatch.setenv("HERMES_BOOT_PINNED_IMPORTS", "1")  # pytest processes ignore it otherwise
++    monkeypatch.setattr(code_skew, "_import_mix_noted", set())
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", None)
++    monkeypatch.setattr(git_fingerprint, "_process_boot",
++                        {str(code_skew._PROJECT_ROOT.resolve()): f"git:refs/heads/main:{BOOT}"})
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{DISK}")
++    assert code_skew.note_import_error(ImportError("cannot import name 'x'"), "tool") is True
++    assert len(_mix_lines(caplog)) == 1
++
++
++def test_registry_dispatch_path_names_the_mix(skewed, caplog):
++    from tools.registry import ToolRegistry
++
++    caplog.set_level(logging.WARNING, logger="gateway.code_skew")
++    reg = ToolRegistry()
++
++    def handler(args, **_):
++        raise ImportError("cannot import name 'spawn_owned' from 'hermes_cli.process_identity'")
++
++    reg.register("mix_probe", "test", {"name": "mix_probe", "description": "probe",
++                                       "parameters": {"type": "object", "properties": {}}}, handler)
++    out = reg.dispatch("mix_probe", {})
++    assert "spawn_owned" in (out if isinstance(out, str) else json.dumps(out))
++    assert len(_mix_lines(caplog)) == 1
++
++
++def test_execute_code_session_kernel_path_names_the_mix(skewed, caplog, monkeypatch):
++    """The incident's path: ``code_kernel._run_cell`` catches the ImportError from ``_spawn``."""
++    import sys
++
++    from tools import code_kernel
++
++    caplog.set_level(logging.WARNING, logger="gateway.code_skew")
++
++    def boom(*_a, **_k):
++        raise ImportError("cannot import name 'spawn_owned' from 'hermes_cli.process_identity'")
++
++    monkeypatch.setattr(code_kernel, "_spawn", boom)
++    out = code_kernel.execute_in_session_kernel(
++        "print(1)", task_id="mix-probe", mode="project", child_python=sys.executable, child_cwd="",
++        sandbox_tools=frozenset(), timeout=10, max_tool_calls=1, reset=True,
++        is_interrupted=lambda: False)
++    assert "spawn_owned" in out
++    assert len(_mix_lines(caplog)) == 1
+diff --git a/tools/code_kernel.py b/tools/code_kernel.py
+index a36de8686c3..f1db91abab8 100644
+--- a/tools/code_kernel.py
++++ b/tools/code_kernel.py
+@@ -859,6 +859,11 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
+         except Exception as exc:  # pragma: no cover - defensive parity with per-call
+             from tools.code_execution_tool import _error_result
+             logger.error("session kernel failed: %s: %s", type(exc).__name__, exc, exc_info=True)
++            try:
++                from gateway.code_skew import note_import_error
++                note_import_error(exc, "execute_code session kernel")
++            except Exception:
++                pass  # the skew note must never mask the cell's own error
+             _REGISTRY.discard(key, kernel)
+             return _error_result(str(exc), tool_calls_made=kernel.tool_call_counter[0],
+                                  duration=round(time.monotonic() - exec_start, 2))
+diff --git a/tools/registry.py b/tools/registry.py
+index f272b26bc09..5facbbcfd69 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -946,6 +946,12 @@ class ToolRegistry:
+         except Exception as e:
+             # exc_info already renders the exception, so keep the message copy bounded.
+             logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
++            if isinstance(e, ImportError):
++                try:
++                    from gateway.code_skew import note_import_error
++                    note_import_error(e, f"tool {name}")
++                except Exception:
++                    pass  # a skew note must never change how the tool error is returned
+             # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.
+             raw = f"Tool execution failed: {type(e).__name__}: {e}"
+             try:
+-- 
+2.55.0
+

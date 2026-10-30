@@ -1,0 +1,217 @@
+From 08843b5c95cb9a913d6d0ac4a79891f40eb56501 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 03:29:53 -0700
+Subject: [PATCH] code_health: judge a merge commit against each parent; block
+ only on findings worse than both [daveey] (#252)
+
+---
+ scripts/code_health/cli.py            | 71 +++++++++++++++++++++------
+ scripts/code_health/gitio.py          |  6 +++
+ tests/scripts/test_code_health_cli.py | 51 ++++++++++++++++++-
+ 3 files changed, 111 insertions(+), 17 deletions(-)
+
+diff --git a/scripts/code_health/cli.py b/scripts/code_health/cli.py
+index 2d54a167010..e4f11740125 100644
+--- a/scripts/code_health/cli.py
++++ b/scripts/code_health/cli.py
+@@ -64,6 +64,9 @@ def enforcement(repo: Path, rev: str) -> str:
+ def _parser() -> argparse.ArgumentParser:
+     p = argparse.ArgumentParser(prog="code_health", description=__doc__)
+     p.add_argument("--base", help="base revision (default: merge-base of HEAD with origin/main)")
++    p.add_argument("--also-base", action="append", default=[], metavar="REV",
++                   help="extra base (repeatable): a finding blocks only if it blocks against the "
++                        "base and every --also-base. A merge head does this against its parents")
+     p.add_argument("--head", help="head commit or tree (default: the working tree, untracked included)")
+     p.add_argument("--report", action="store_true", help="burn-down summary of the whole head tree")
+     p.add_argument("--json", action="store_true", help="machine-readable findings")
+@@ -86,22 +89,13 @@ def _skipped(why: str, as_json: bool) -> None:
+     print(why, file=sys.stderr if as_json else sys.stdout)
+ 
+ 
+-def run(repo: Path, base: str, head: str | None, as_json: bool = False,
+-        switch_rev: str | None = None) -> int:
+-    """Judge ``head`` against ``base``; the ENFORCEMENT switch is read from ``switch_rev``
+-    (default: the base), never from the head under test."""
+-    started = time.monotonic()
+-    switch_rev = switch_rev or base
+-    mode = enforcement(repo, switch_rev)
+-    if mode == "off":
+-        _skipped(f"code health: off (ENFORCEMENT in {_SWITCH_FILE} on {switch_rev[:12]})", as_json)
+-        return 0
++def _findings_against(repo: Path, base: str, head: str | None):
++    """(findings, head_paths) of ``head`` measured against ``base``; None when nothing measurable."""
+     changes = gitio.changed_files(repo, base, head)
+     head_paths = sorted({c.new for c in changes if c.new and in_scope(c.new)})
+     base_paths = sorted({c.old for c in changes if c.old and in_scope(c.old)})
+     if not head_paths:
+-        _skipped("code health: no measured files changed", as_json)
+-        return 0
++        return None
+     # Base files are measured too: a deleted .py still needs ruff on the base side.
+     needs_ruff = any(p.endswith(".py") for p in (*head_paths, *base_paths))
+     ruff = resolve_ruff(repo) if needs_ruff else []
+@@ -110,6 +104,44 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
+     head_m = measurer.measure(head, head_paths)
+     findings = compare(base_m, head_m, changes)
+     apply_allows(findings, head_m)
++    return findings, head_paths
++
++
++def _key(f) -> tuple[str, str, str]:
++    return (f.path, f.rule, f.scope)
++
++
++def _relax_to_most_permissive(findings, others) -> None:  # [daveey]
++    """A merge is judged against every parent: a finding stays blocking only if it also blocks
++    against each other parent (its cap is the most permissive parent's value). A finding the
++    other parent does not report at all is within that parent's cap, so it is relaxed too."""
++    for other_base, other in others:
++        still = {_key(f) for f in other if f.blocking and f.allowed_reason is None}
++        for f in findings:
++            if f.blocking and f.allowed_reason is None and _key(f) not in still:
++                f.blocking = False
++                f.detail += f" (within the cap against parent {other_base[:12]})"
++
++
++def run(repo: Path, base: str, head: str | None, as_json: bool = False,
++        switch_rev: str | None = None, also_bases: tuple[str, ...] = ()) -> int:
++    """Judge ``head`` against ``base``; the ENFORCEMENT switch is read from ``switch_rev``
++    (default: the base), never from the head under test. With ``also_bases`` (the other parents
++    of a merge) a finding blocks only if it blocks against ``base`` and every one of them."""
++    started = time.monotonic()
++    switch_rev = switch_rev or base
++    mode = enforcement(repo, switch_rev)
++    if mode == "off":
++        _skipped(f"code health: off (ENFORCEMENT in {_SWITCH_FILE} on {switch_rev[:12]})", as_json)
++        return 0
++    first = _findings_against(repo, base, head)
++    if first is None:
++        _skipped("code health: no measured files changed", as_json)
++        return 0
++    findings, head_paths = first
++    if any(f.blocking and f.allowed_reason is None for f in findings):
++        others = [(b, (_findings_against(repo, b, head) or ([], []))[0]) for b in also_bases]
++        _relax_to_most_permissive(findings, others)
+     blocking, advisory = verdict(findings)
+     failed = bool(blocking) and mode == "blocking"
+     if as_json:
+@@ -119,7 +151,8 @@ def run(repo: Path, base: str, head: str | None, as_json: bool = False,
+     if body:
+         print(body)
+     elapsed = time.monotonic() - started
+-    print(f"\ncode health: {len(head_paths)} files vs {base[:12]}: {blocking} blocking, "
++    vs = " + ".join(b[:12] for b in (base, *also_bases))
++    print(f"\ncode health: {len(head_paths)} files vs {vs}: {blocking} blocking, "
+           f"{advisory} advisory ({elapsed:.1f}s)")
+     if blocking:
+         print(_FOOTER)
+@@ -138,14 +171,20 @@ def main(argv: list[str] | None = None) -> int:
+         head = gitio.resolve_tree(repo, args.head) if args.head else None
+         if args.report:
+             return _report(repo, head)
++        also = tuple(gitio.resolve_rev(repo, r) for r in args.also_base)
+         if args.base:  # CI: the base is the target branch tip, which also holds the switch
+-            return run(repo, gitio.resolve_rev(repo, args.base), head, as_json=args.json)
++            return run(repo, gitio.resolve_rev(repo, args.base), head, as_json=args.json,
++                       also_bases=also)
+         # Locally the base is the merge-base, which lags main; the switch comes from the main tip
+         # so a flip on main reaches a branch without a rebase. The head never supplies it.
+         tip = gitio.commit_or_none(repo, args.head) if args.head else None
+-        base = gitio.default_base(repo, tip or "HEAD")
++        parents = gitio.merge_parents(repo, tip) if tip else []
++        if parents:  # a merge (e.g. an upstream sync) is judged against each parent  [daveey]
++            base, also = parents[0], (*parents[1:], *also)
++        else:
++            base = gitio.default_base(repo, tip or "HEAD")
+         switch_rev = gitio.commit_or_none(repo, "origin/main") or base
+-        return run(repo, base, head, as_json=args.json, switch_rev=switch_rev)
++        return run(repo, base, head, as_json=args.json, switch_rev=switch_rev, also_bases=also)
+     except RuntimeError as exc:
+         print(f"code health: {exc}", file=sys.stderr)
+         return 2
+diff --git a/scripts/code_health/gitio.py b/scripts/code_health/gitio.py
+index 24d746db5ae..5d0a841c5c4 100644
+--- a/scripts/code_health/gitio.py
++++ b/scripts/code_health/gitio.py
+@@ -56,6 +56,12 @@ def default_base(repo: Path, tip: str = "HEAD") -> str:
+     raise RuntimeError("no merge-base with origin/main or main; pass --base")
+ 
+ 
++def merge_parents(repo: Path, commit: str) -> list[str]:
++    """The parents of ``commit`` when it is a merge, else []."""
++    parts = git(repo, "rev-list", "--parents", "-n", "1", commit).split()
++    return parts[1:] if len(parts) > 2 else []
++
++
+ @dataclass(frozen=True)
+ class Change:
+     status: str  # A, M, D, R
+diff --git a/tests/scripts/test_code_health_cli.py b/tests/scripts/test_code_health_cli.py
+index 6612e87d894..16c82653ff4 100644
+--- a/tests/scripts/test_code_health_cli.py
++++ b/tests/scripts/test_code_health_cli.py
+@@ -18,7 +18,7 @@ from pathlib import Path
+ 
+ import pytest
+ 
+-from scripts.code_health import cli
++from scripts.code_health import cli, gitio
+ from scripts.code_health.config import ENFORCEMENT
+ 
+ REPO = Path(__file__).resolve().parents[2]
+@@ -499,3 +499,52 @@ def test_tooling_failure_exits_2_without_a_traceback(tmp_path, monkeypatch, caps
+     assert cli.main(["--base", base, "--head", "HEAD"]) == 2
+     err = capsys.readouterr().err
+     assert err.startswith("code health:") and "npm" in err
++
++
++# --- a merge is judged against each parent (upstream syncs)  [daveey] --------------------------
++
++
++def _merge_repo(tmp_path: Path, merged: str) -> tuple[Path, str, str, str]:
++    """main (parent 1) and a side branch (parent 2) both start from _LEGACY; the side branch
++    grows pkg/a.py to _GROWN. Returns the repo, both parents and a merge whose pkg/a.py is
++    ``merged``."""
++    repo, root = _ratchet_repo(tmp_path)
++    _git(repo, "checkout", "-q", "-b", "side")
++    side = _commit(repo, {"pkg/a.py": _GROWN})
++    _git(repo, "checkout", "-q", "main")
++    first = _commit(repo, {"pkg/other.py": "def other():\n    return 3\n"})
++    _git(repo, "merge", "--no-commit", "--no-ff", "-X", "theirs", "side")
++    _write(repo, {"pkg/a.py": merged})
++    _git(repo, "add", "pkg/a.py")
++    _git(repo, "commit", "-q", "-m", "merge")
++    assert root and len(_git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
++    return repo, first, side, _git(repo, "rev-parse", "HEAD")
++
++
++def test_merge_growth_within_one_parents_cap_does_not_block(tmp_path, capsys):
++    repo, first, side, head = _merge_repo(tmp_path, _GROWN)
++    assert cli.run(repo, first, head) == 1  # against parent 1 alone it blocks
++    capsys.readouterr()
++    assert cli.run(repo, first, head, also_bases=(side,)) == 0, capsys.readouterr().out
++
++
++def test_merge_growth_over_both_parents_blocks(tmp_path, capsys):
++    repo, first, side, head = _merge_repo(tmp_path, _GROWN + "    if x == 100:\n        return 100\n")
++    assert cli.run(repo, first, head, also_bases=(side,)) == 1, capsys.readouterr().out
++
++
++def test_non_merge_commit_is_judged_against_its_base_only(tmp_path, capsys):
++    repo, base = _ratchet_repo(tmp_path)
++    head = _commit(repo, {"pkg/a.py": _GROWN})
++    assert cli.run(repo, base, head) == 1
++    assert gitio.merge_parents(repo, head) == []
++    capsys.readouterr()
++
++
++def test_main_uses_a_merge_commits_parents_automatically(tmp_path, monkeypatch, capsys):
++    repo, _first, _side, head = _merge_repo(tmp_path, _GROWN)
++    monkeypatch.chdir(repo)
++    assert cli.main(["--head", head]) == 0, capsys.readouterr().out
++    bad = _commit(repo, {"pkg/a.py": _GROWN + "    if x == 100:\n        return 100\n"})
++    assert gitio.merge_parents(repo, bad) == []
++    assert cli.main(["--head", bad, "--base", head]) == 1
+-- 
+2.55.0
+

@@ -1,0 +1,146 @@
+From 388cc5a9c1b8b29669ce7784e918dfa01785a240 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 09:39:28 +0000
+Subject: [PATCH] fix(update): a manual gateway of a home a KeepAlive launchd
+ job serves goes back to that job [daveey]
+
+Self-heal defect gateway-e2cd786685, second occurrence. The client-spawned manual gateway (42853) held
+the mini's ~/.bb-hermes when hermes-sync ran `hermes update` at 00:39 PDT. _prepare_profile_gateway_update_restart
+saw a manual gateway and armed the detached watcher, which relaunched it manual again (7751,
+`--profile default gateway run --quiet`), so com.daveey.myapp.hermes stayed locked out after the update
+(exit 75 loop) until a planned-stop marker drained 7751 at 01:30 PDT.
+
+_prepare_profile_gateway_update_restart now asks gateway_runtime_service.custom_launchd_supervisor_for_home
+(macOS; the 0e47c674ec any-label discovery: loaded, KeepAlive, not Disabled, HERMES_HOME == this home, runs
+`gateway run`) before arming a relaunch; when a job serves the home it returns "external-supervisor": the
+manual gateway is drained/stopped and the KeepAlive job respawns it. No job, or any probe error, keeps the
+old detached relaunch.
+
+Tests: test_gateway_runtime_custom_launchd.py: update hands a manual gateway of a supervised home back
+(red before), and still relaunches when no job serves the home.
+---
+ hermes_cli/gateway.py                         | 24 ++++++++++++
+ hermes_cli/gateway_runtime_service.py         | 17 ++++++++
+ .../test_gateway_runtime_custom_launchd.py    | 39 +++++++++++++++++++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 7e1d1850405..8a82903fd9b 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -1011,6 +1011,8 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
+     argv = _capture_gateway_argv(pid)
+     if argv_declares_external_supervisor(argv):
+         return "external-supervisor"
++    if _home_has_custom_launchd_supervisor(profile):
++        return "external-supervisor"
+     if launch_detached_profile_gateway_restart(profile, pid):
+         return "detached"
+     if argv and launch_detached_gateway_restart_by_cmdline(pid, list(argv)):
+@@ -1018,6 +1020,28 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
+     return None
+ 
+ 
++def _home_has_custom_launchd_supervisor(profile: str) -> bool:
++    """[daveey] A KeepAlive LaunchAgent under any label serves this profile's home.
++
++    gateway-e2cd786685 (second occurrence): a client-spawned MANUAL gateway held the mini's
++    ``~/.bb-hermes`` when hermes-sync ran ``hermes update``; the updater armed a detached watcher that
++    relaunched it manual again, so ``com.daveey.myapp.hermes`` stayed locked out (exit 75 loop).
++    Stopping it and letting the KeepAlive job respawn hands the home back instead."""
++    import time
++    try:
++        from hermes_cli.gateway_runtime_service import custom_launchd_supervisor_for_home
++        from hermes_cli.profiles import get_profile_dir
++        service = custom_launchd_supervisor_for_home(get_profile_dir(profile), deadline=time.monotonic() + 10)
++    except Exception:  # health: allow BLE001 -- unknown supervisor state keeps the old relaunch path
++        logger.debug("custom launchd supervisor probe failed for %s", profile, exc_info=True)
++        return False
++    if service is None:
++        return False
++    print(f"  → {profile}: its home is served by a KeepAlive launchd job "
++          f"({service.start_argv[-1]}); stopping the manual gateway so that job takes the home back")
++    return True
++
++
+ def launch_detached_gateway_restart_by_cmdline(old_pid: int, run_argv: list[str], home: str | None = None) -> bool:
+     """Relaunch a gateway with no profile→PID-file mapping by replaying its captured argv (on Windows under ``home``, the one it ran on) after exit."""
+     return old_pid > 0 and bool(run_argv) and _spawn_gateway_restart_watcher(old_pid, list(run_argv), home=home)
+diff --git a/hermes_cli/gateway_runtime_service.py b/hermes_cli/gateway_runtime_service.py
+index 59e69475317..88ea709bf5d 100644
+--- a/hermes_cli/gateway_runtime_service.py
++++ b/hermes_cli/gateway_runtime_service.py
+@@ -241,6 +241,23 @@ def _custom_job_runs_gateway_for(argv: list, home: Path) -> bool:
+     return entry == "hermes_cli.main" or Path(entry).name in {"hermes", "hermes.exe"}
+ 
+ 
++def custom_launchd_supervisor_for_home(home: Path, *, deadline: float) -> ExistingService | None:
++    """[daveey] The loaded KeepAlive LaunchAgent (any label) that serves ``home``, else None.
++
++    ``hermes update`` asks this before relaunching a MANUAL gateway: a home that such a job serves is
++    that job's to restart (gateway-e2cd786685, second occurrence). macOS only; any probe failure
++    answers None so the caller keeps its old behavior."""
++    if sys.platform != "darwin":
++        return None
++    import pwd
++    try:
++        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — native launchd only
++        return _custom_launchd_job(Path(home).expanduser().resolve(), account_home / "Library/LaunchAgents",
++                                   f"gui/{os.getuid()}", deadline)  # windows-footgun: ok — native launchd only
++    except (OSError, ValueError, subprocess.SubprocessError):
++        return None
++
++
+ def _custom_launchd_job(home: Path, agents: Path, domain: str, deadline: float) -> ExistingService | None:
+     """[daveey] A KeepAlive LaunchAgent that serves THIS home under a label Hermes did not install.
+ 
+diff --git a/tests/hermes_cli/test_gateway_runtime_custom_launchd.py b/tests/hermes_cli/test_gateway_runtime_custom_launchd.py
+index a453b88fe79..73aea4243aa 100644
+--- a/tests/hermes_cli/test_gateway_runtime_custom_launchd.py
++++ b/tests/hermes_cli/test_gateway_runtime_custom_launchd.py
+@@ -162,3 +162,42 @@ def test_detached_replacement_without_any_service_still_spawns(account, monkeypa
+     monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda target, **k: spawned.append(Path(target)))
+     assert start.start_detached_replacement(link) == 0
+     assert spawned == [link]
++
++
++# --- hermes update: who relaunches a manual gateway of a supervised home --------------------------------------
++# Second occurrence of gateway-e2cd786685: hermes-sync ran ``hermes update`` while the client-spawned manual
++# gateway held ~/.bb-hermes. The updater saw a manual gateway and armed a detached watcher that relaunched it
++# manual again (``--profile default gateway run --quiet``), so the KeepAlive job stayed locked out after the
++# update too. A home that a KeepAlive job serves is that job's to restart.
++
++_MANUAL_ARGV = ["/Applications/Hermes Python.app/Contents/MacOS/python3.14", "-m", "hermes_cli.main",
++                "--profile", "default", "gateway", "run", "--quiet"]
++
++
++def _update_fixture(account, monkeypatch, *, with_agent=True):
++    from hermes_cli import gateway, gateway_runtime_service as service
++    link, real = _mini_home(account)
++    if with_agent:
++        _agent(account, real)
++    _launchctl(monkeypatch, service)
++    monkeypatch.setenv("HERMES_HOME", str(link))
++    monkeypatch.setattr(service.sys, "platform", "darwin")  # os-marker: ok — launchctl and the plist dir are stubbed; the logic is host-independent
++    monkeypatch.setattr(gateway, "_capture_gateway_argv", lambda _pid: list(_MANUAL_ARGV))
++    return gateway
++
++
++def test_update_hands_a_manual_gateway_of_a_supervised_home_back_to_its_job(account, monkeypatch):
++    gateway = _update_fixture(account, monkeypatch)
++    monkeypatch.setattr(gateway, "launch_detached_profile_gateway_restart",
++                        lambda *_a: pytest.fail("update relaunched a manual gateway beside a KeepAlive job"))
++    monkeypatch.setattr(gateway, "launch_detached_gateway_restart_by_cmdline",
++                        lambda *_a: pytest.fail("update replayed a manual gateway beside a KeepAlive job"))
++
++    assert gateway._prepare_profile_gateway_update_restart("default", 4242) == "external-supervisor"
++
++
++def test_update_still_relaunches_a_manual_gateway_when_no_job_serves_the_home(account, monkeypatch):
++    gateway = _update_fixture(account, monkeypatch, with_agent=False)
++    monkeypatch.setattr(gateway, "launch_detached_profile_gateway_restart", lambda *_a: True)
++
++    assert gateway._prepare_profile_gateway_update_restart("default", 4242) == "detached"
+-- 
+2.55.0
+

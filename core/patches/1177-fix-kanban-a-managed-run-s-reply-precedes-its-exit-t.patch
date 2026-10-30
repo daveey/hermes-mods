@@ -1,0 +1,128 @@
+From cf5c27aedfdb20943f60ff3376fef03da6c719e4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 01:35:50 -0700
+Subject: [PATCH] fix(kanban): a managed run's reply precedes its exit trailer,
+ and the crash cut starts at the run's Session line [daveey]
+
+The managed client printed its reply on block-buffered stdout and the exit trailer on flushed stderr,
+both redirected to the per-task log, so the reply landed after its own trailer. The next run's crash
+record (cut at the previous trailer, d2f87c562d) then began with that reply: run 10258 of
+t_01a188a461c0178c quoted run 10246's final message. Flush the reply, and cut a run's own part at its
+own Session line so logs written by the old client are read right too. (t_01a18b38b3fe3a5b)
+---
+ hermes_cli/kanban_worker_client.py            |  4 +-
+ hermes_cli/kanban_worker_log.py               |  7 +-
+ ...est_kanban_crash_output_interleaved_log.py | 71 +++++++++++++++++++
+ 3 files changed, 80 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_crash_output_interleaved_log.py
+
+diff --git a/hermes_cli/kanban_worker_client.py b/hermes_cli/kanban_worker_client.py
+index f05a67a6942..9a8a0e61de6 100644
+--- a/hermes_cli/kanban_worker_client.py
++++ b/hermes_cli/kanban_worker_client.py
+@@ -159,7 +159,9 @@ def _exit_code(receipt, params, board_db):
+     result = worker_result(board_db, params)
+     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
+     if result.get('last_output'):
+-        print(result['last_output'])
++        # Flushed: stdout is block-buffered into the log file, and an unflushed reply landed after
++        # this run's (stderr) exit trailer, where the next run's crash record quoted it.
++        print(result['last_output'], flush=True)
+     return result.get('exit_code', 1)
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_log.py b/hermes_cli/kanban_worker_log.py
+index 467068211db..f6a7347e76e 100644
+--- a/hermes_cli/kanban_worker_log.py
++++ b/hermes_cli/kanban_worker_log.py
+@@ -88,4 +88,9 @@ def current_run_log(raw: str) -> str:
+     body = raw.rstrip()
+     if trailers and trailers[-1].end() == len(body):
+         body, trailers = body[:trailers[-1].start()], trailers[:-1]
+-    return body[trailers[-1].end():] if trailers else body
++    body = body[trailers[-1].end():] if trailers else body
++    # A managed client's run starts with its ``Session: <id>`` line. A client before the reply-flush
++    # fix wrote its reply after its own trailer (stdout flushed at exit), so text between the previous
++    # trailer and this run's Session line is the previous run's reply (t_01a188a461c0178c run 10258).
++    starts = list(re.finditer(r"^Session: \S+[ \t]*$", body, re.MULTILINE))
++    return body[starts[-1].start():] if starts else body
+diff --git a/tests/hermes_cli/test_kanban_crash_output_interleaved_log.py b/tests/hermes_cli/test_kanban_crash_output_interleaved_log.py
+new file mode 100644
+index 00000000000..f3b54d54926
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_crash_output_interleaved_log.py
+@@ -0,0 +1,71 @@
++"""[daveey] A crash record never quotes the previous run's reply, in the log layout the managed client really writes.
++
++Run 10258 of t_01a188a461c0178c (01:25 PDT 10-30, core 11834422cd, which already cut the log at the
++previous exit trailer) was booked with run 10246's final message. The managed worker client prints its
++reply on stdout (block-buffered: the dispatcher redirects it to the per-task log file) and ``Session:``
++plus the exit trailer on stderr (flushed). So the reply reached the file at interpreter exit, AFTER the
++run's own trailer, and the next run's "own part" (everything after the previous trailer) began with it.
++"""
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_worker_log import current_run_log
++
++# Shape of ~/.hermes/kanban/logs/t_01a188a461c0178c.log lines 1630-1639 (written by the pre-fix client).
++PREVIOUS_REPLY = "The card has gone back to a fresh run that starts on iroh and the two Swift apps now."
++LIVE_LAYOUT = (
++    "Session: local-f001\n"
++    "\n[kanban-worker-exit] rc=0\n"
++    f"{PREVIOUS_REPLY}\n"
++    "Session: local-d566\n"
++    "Kanban owner refused: Kanban owner silent for 188s: Gateway draining: restart_wait\n"
++    "\n[kanban-worker-exit] rc=1\n"
++)
++
++
++def test_current_run_starts_at_its_own_session_line():
++    own = current_run_log(LIVE_LAYOUT)
++    assert PREVIOUS_REPLY not in own
++    assert "Kanban owner silent for 188s" in own
++
++
++def test_crash_output_of_live_layout_omits_previous_reply(monkeypatch):
++    monkeypatch.setattr(kbd._kb, "read_worker_log", lambda task_id, tail_bytes=None, board=None: LIVE_LAYOUT)
++    out = kbd._worker_final_output("t_x", board="default")
++    assert "Swift apps" not in out
++    assert "restart_wait" in out
++
++
++def test_first_run_reply_is_kept():
++    """Control: a card's only run (no earlier trailer) keeps its reply, in either order."""
++    assert PREVIOUS_REPLY in current_run_log(f"Session: local-a\n{PREVIOUS_REPLY}\n\n[kanban-worker-exit] rc=0\n")
++    assert PREVIOUS_REPLY in current_run_log(f"Session: local-a\n\n[kanban-worker-exit] rc=0\n{PREVIOUS_REPLY}\n")
++
++
++def test_client_writes_its_reply_before_its_exit_trailer(tmp_path):
++    """The real client's streams, redirected to one file as the dispatcher does, keep reply < trailer."""
++    repo = Path(__file__).resolve().parents[2]
++    script = textwrap.dedent(f"""
++        import sys
++        sys.path.insert(0, {str(repo)!r})
++        import gateway.session_kanban as sk
++        from hermes_cli import kanban_worker_client as c
++        sk.worker_result = lambda board_db, params: {{'last_output': 'REPLY-TEXT', 'exit_code': 0}}
++        def _submit():
++            print('Session: local-x', file=sys.stderr)
++            return c._exit_code({{'status': 'terminal'}}, {{}}, 'db')
++        c._submit = _submit
++        sys.exit(c.main())
++    """)
++    log = tmp_path / "t.log"
++    with log.open("w") as fh:
++        rc = subprocess.run([sys.executable, "-c", script], stdout=fh, stderr=subprocess.STDOUT,
++                            env={k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"},
++                            timeout=120, check=False).returncode
++    text = log.read_text()
++    assert rc == 0, text
++    assert text.index("REPLY-TEXT") < text.index("[kanban-worker-exit] rc=0"), text
+-- 
+2.55.0
+
