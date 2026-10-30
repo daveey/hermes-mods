@@ -61,22 +61,30 @@ def check(dg: dict) -> Optional[dict]:
         return None
     # A person's chat = a real (non-probe) user turn came BEFORE the first probe. A session an agent opened for its
     # own live test starts with the probe (Session Mentions transport tests, pause/resume probes): not flagged.
-    evidence, real_before = [], False
+    evidence, real_before, probe_ts = [], False, 0.0
     for t in dg.get("user_turns") or []:
         text = str(t.get("text") or "")
         if _probe_ask(text):
             if real_before:
                 evidence.append(f"user turn at {_pt(t.get('t'))}: {text[:200]!r}")
+                try:
+                    probe_ts = max(probe_ts, float(t.get("t") or 0))
+                except (TypeError, ValueError):
+                    pass
         elif text.strip():
             real_before = True
     last = str(dg.get("last_reply") or "").strip()
+    ts = float(dg.get("last_activity_at") or 0)
     if TOKEN_REPLY.match(last) and real_before:
         evidence.append(f"last reply is a bare token: {last!r}")
+        probe_ts = max(probe_ts, ts)  # the digest has no reply time; a token that is still the last reply is "now"
     if not evidence:
         return None
+    # ``ts`` is chat activity (the person keeps talking after a probe); ``probe_ts`` is the newest PROBE evidence.
+    # Only new evidence lines / ``probe_ts`` decide whether a hit is new (see _is_new).
     return {"session": dg.get("id"), "host": dg.get("host") or "", "profile": dg.get("profile") or "default",
-            "source": dg.get("source"), "title": dg.get("title") or "", "ts": float(dg.get("last_activity_at") or 0),
-            "evidence": "\n".join(evidence[-6:])}
+            "source": dg.get("source"), "title": dg.get("title") or "", "ts": ts, "probe_ts": probe_ts or ts,
+            "evidence": "\n".join(evidence[-6:]), "evidence_lines": evidence}
 
 
 def _pt(ts) -> str:
@@ -156,7 +164,9 @@ probe and token reply are what the user sees. The user-chat-probe-guard plugin r
 ## Do this
 1. Find the sender: grep Kanban comments/cards and `state.db` tool calls on host {h['host']} around
    {_pt(h['ts'])} for the token and `--resume {h['session'][-6:]}`.
-2. Find why the guard did not stop it (plugin not enabled on that host, ssh/remote path, Claude Code without the
+2. If every probe turn above predates the guard (hermes-mods 5910070, 2026-10-30 05:11 UTC), it was not a bypass:
+   say so and stop at step 3. Otherwise find why the guard did not stop it (plugin not enabled on that host,
+   ssh/remote path, Claude Code without the
    adapter, an opt-out, a command form the classifier misses) and fix that in
    `~/code/hermes-mods/plugins/user-chat-probe-guard` with a regression test for the exact command (five-whys).
 3. If the probe buried a real question the user still has to answer, tell the agent that owns that question
@@ -169,11 +179,36 @@ probe and token reply are what the user sees. The user-chat-probe-guard plugin r
 """
 
 
+def _seen_lines(known: dict) -> set:
+    return set(known.get("evidence_lines") or [])
+
+
+def _is_new(h: dict, known: dict) -> bool:
+    """New PROBE evidence since the recorded state, not merely newer chat activity.
+
+    The person keeps chatting after a probe, so the digest's last_activity_at moves on while the evidence (the same
+    old probe turns) does not. Keying on activity re-filed a card for an incident already fixed (t_01a18b702067f62d:
+    a seeded session re-fired at the user's next message). Entries written before evidence_lines existed fall back
+    to the newest probe time vs the recorded time."""
+    if known.get("evidence_lines") is not None:
+        return bool(set(h.get("evidence_lines") or []) - _seen_lines(known))
+    # digest turn times are whole seconds while last_activity_at is a float: allow the rounding
+    return float(h.get("probe_ts") or h["ts"]) > float(known.get("ts") or 0) + 1
+
+
+def _record(h: dict, task_id: Optional[str] = None, known: Optional[dict] = None, **extra) -> dict:
+    rec = {"ts": h["ts"], "probe_ts": h.get("probe_ts") or h["ts"],
+           "evidence_lines": sorted(_seen_lines(known or {}) | set(h.get("evidence_lines") or [])), **extra}
+    if task_id:
+        rec["task_id"] = task_id
+    return rec
+
+
 def file_card(home: Path, h: dict, runner: Callable) -> dict:
     key = f"probe-token:{h['host']}:{h['session']}"
     st = load_state(home)
     known = (st.get("sessions") or {}).get(key) or {}
-    if known and h["ts"] <= float(known.get("ts") or 0):
+    if known and not _is_new(h, known):
         return {"key": key, "action": "known"}
     tid = known.get("task_id")
     if not tid:
@@ -186,13 +221,13 @@ def file_card(home: Path, h: dict, runner: Callable) -> dict:
             tid = json.loads(r.stdout).get("id")
         except (ValueError, TypeError, AttributeError):
             return {"key": key, "action": "create_unparsed", "out": (r.stdout or "")[-300:]}
-        st.setdefault("sessions", {})[key] = {"task_id": tid, "ts": h["ts"]}
+        st.setdefault("sessions", {})[key] = _record(h, task_id=tid, known=known)
         save_state(home, st)
         return {"key": key, "action": "created", "task_id": tid}
     r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", AUTHOR,
                       f"Newer probe evidence in {h['session']} (last activity {_pt(h['ts'])}):\n{h['evidence']}"])
     if r.returncode == 0:
-        st.setdefault("sessions", {})[key] = {"task_id": tid, "ts": h["ts"]}
+        st.setdefault("sessions", {})[key] = _record(h, task_id=tid, known=known)
         save_state(home, st)
     return {"key": key, "action": "commented" if r.returncode == 0 else "comment_failed", "task_id": tid}
 
@@ -218,7 +253,7 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[float] = No
         st = load_state(home)
         for h in hits:
             st.setdefault("sessions", {}).setdefault(f"probe-token:{h['host']}:{h['session']}",
-                                                     {"ts": h["ts"], "seeded": True})
+                                                     _record(h, seeded=True))
         save_state(home, st)
         rep["seeded"] = len(hits)
     elif not a.dry_run:

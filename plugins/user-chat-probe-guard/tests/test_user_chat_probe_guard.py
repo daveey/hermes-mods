@@ -100,6 +100,12 @@ class GuardTests(unittest.TestCase):
         self.assertIn(DESKTOP, r["message"])
         self.assertIn(f"hermes sessions branch {DESKTOP}", r["message"])
 
+    def test_incident_first_probe_is_refused(self):
+        # t_01a18b702067f62d: the earlier ROUTE_ACCEPTED probe from the same card (t_01a189b19f7a10d2), 22:39
+        self.assertBlocked("terminal", command=(
+            f"hermes chat --resume {DESKTOP} --oneshot -q 'Routing acceptance check only for t_01a189b19f7a10d2. "
+            "Do not call tools, continue prior work, or change anything. Reply exactly ROUTE_ACCEPTED_23ef49.'"))
+
     def test_probe_forms_into_user_chats_refused(self):
         for cmd in (
             f"hermes chat -r {DESKTOP} -q hi",

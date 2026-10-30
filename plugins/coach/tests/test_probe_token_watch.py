@@ -111,6 +111,43 @@ class WatchTests(unittest.TestCase):
         w.main(["--data", str(self.data), "--home", str(self.home), "--no-pull"], runner=run3)
         self.assertEqual([c[0][:3] for c in run3.calls], [["hermes", "kanban", "comment"]])
 
+    def test_user_activity_after_old_probe_is_not_new_evidence(self):
+        """t_01a18b702067f62d: 23ef49 was seeded at install ({ts, seeded}); David's next message moved
+        last_activity_at on, and the watcher filed a card for the same two pre-guard probe turns."""
+        key = "probe-token:macbook:20261026_000514_23ef49"
+        state = w.state_path(self.home)
+        state.parent.mkdir(parents=True)
+        # the legacy seeded record exactly as it sat on the hub (no evidence_lines)
+        state.write_text(json.dumps({"sessions": {key: {"ts": INCIDENT["last_activity_at"], "seeded": True}}}))
+        later = dict(INCIDENT, last_activity_at=INCIDENT["last_activity_at"] + 20000, last_reply="Sure, here's the plan.")
+        later["user_turns"] = INCIDENT["user_turns"] + [{"t": later["last_activity_at"], "text": "continue"}]
+        self.put(later)
+        run = FakeRun()
+        w.main(["--data", str(self.data), "--home", str(self.home), "--no-pull"], runner=run)
+        self.assertEqual(run.calls, [])
+        # a record written by the new code (evidence_lines) also ignores more chatting...
+        state.write_text(json.dumps({"sessions": {key: w._record(w.check(later), task_id="t_x")}}))
+        more = dict(later, last_activity_at=later["last_activity_at"] + 900)
+        more["user_turns"] = later["user_turns"] + [{"t": more["last_activity_at"], "text": "thanks"}]
+        self.put(more)
+        w.main(["--data", str(self.data), "--home", str(self.home), "--no-pull"], runner=run)
+        self.assertEqual(run.calls, [])
+        # ...but a NEW probe turn in the chat still comments on the existing card
+        again = dict(more, user_turns=more["user_turns"] + [
+            {"t": more["last_activity_at"] + 5, "text": "Reply exactly ROUTE_THIRD_23ef49."}])
+        self.put(again)
+        w.main(["--data", str(self.data), "--home", str(self.home), "--no-pull"], runner=run)
+        self.assertEqual([c[0][:4] for c in run.calls], [["hermes", "kanban", "comment", "t_x"]])
+        self.assertIn("ROUTE_THIRD_23ef49", run.calls[0][0][-1])
+
+    def test_legacy_seed_tolerates_whole_second_turn_times(self):
+        # hub state: 55b17f seeded ts 1793321276.74 (float activity); its probe turn's digest time is 1793321277
+        h = w.check(digest("20261025_073850_55b17f", last_reply="ROUTE_INSTALLED_55b17f", t=1793321276.7395048,
+                           texts=("can BB answer calls?", "Reply exactly ROUTE_INSTALLED_55b17f")))
+        h["probe_ts"] = 1793321277.0
+        self.assertFalse(w._is_new(h, {"ts": 1793321276.7395048, "seeded": True}))
+        self.assertTrue(w._is_new(h, {"ts": 1793321000.0, "seeded": True}))
+
     def test_dry_run_files_nothing(self):
         self.put(INCIDENT)
         run = FakeRun()
