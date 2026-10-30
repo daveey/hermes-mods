@@ -1081,3 +1081,53 @@ def test_sticky_holds_inside_the_window_are_not_refiled(tmp_path):
     c.commit()
     c.close()
     assert _holds(sg.collect_kanban(h, cur, NOW + 300, "hubhost")) == []
+
+
+def _set_status(db, status, tids):
+    c = sqlite3.connect(db)
+    c.executemany("update tasks set status=? where id=?", [(status, t) for t in tids])
+    c.commit()
+    c.close()
+
+
+def test_first_sight_skips_sticky_holds_older_than_24h(tmp_path):
+    """(kanban-754a3e3cf1) the collector's first pass over a board with history (no cursor) filed a 45 h old hold
+    the operator had already cleared. A first sight looks back at most 24 h for sticky holds."""
+    h = tmp_path / "home"
+    _hold_board(h / "kanban.db", [(f"t_old{i}", {"sticky": True, "error": HOLD_ERR.format(pid=i)}, NOW - 45 * 3600)
+                                  for i in range(2)])
+    assert _holds(sg.collect_kanban(h, {}, NOW, "hubhost")) == []
+    # a hold inside the 24 h window on a first sight is still filed
+    h2 = tmp_path / "home2"
+    _hold_board(h2 / "kanban.db", [("t_new", {"sticky": True, "error": HOLD_ERR.format(pid=1)}, NOW - 20 * 3600)])
+    assert len(_holds(sg.collect_kanban(h2, {}, NOW, "hubhost"))) == 1
+
+
+def _filed_hold(tmp_path, at):
+    h = tmp_path / "home"
+    db = h / "kanban.db"
+    tids = ["t_held1", "t_held2"]
+    _hold_board(db, [(t, {"sticky": True, "error": HOLD_ERR.format(pid=i)}, at) for i, t in enumerate(tids)])
+    hs = _holds(sg.collect_kanban(h, {}, at + 60, "hubhost"))
+    assert len(hs) == 1, hs
+    return h, db, tids, sg.to_defect(hs[0])
+
+
+def test_stale_hold_with_closed_cards_is_dropped(tmp_path):
+    """(kanban-754a3e3cf1) a hold filed 48 h after it fired, whose cards were all archived: nothing is broken."""
+    h, db, tids, d = _filed_hold(tmp_path, NOW - 48 * 3600)
+    _set_status(db, "archived", tids)
+    why = sh.kanban_trigger_closed(d, home=h, now=NOW)
+    assert why and "stale systemic hold" in why and all(t in why for t in tids), why
+    # one held card still open: file it
+    _set_status(db, "triage", tids[:1])
+    assert sh.kanban_trigger_closed(d, home=h, now=NOW) is None
+
+
+def test_fresh_hold_with_done_cards_still_files(tmp_path):
+    """A fresh hold is filed even when its cards rerun and finish right after: the crash cause may still be live."""
+    h, db, tids, d = _filed_hold(tmp_path, NOW - 600)
+    _set_status(db, "done", tids)
+    assert sh.kanban_trigger_closed(d, home=h, now=NOW) is None
+    # the held cards are not a per-card trigger (their finishing must never drop a fresh hold)
+    assert sh.kanban_trigger(d) is None

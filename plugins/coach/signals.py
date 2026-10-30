@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 BACKFILL_S = 7 * 86400
+HOLD_BACKFILL_S = 86400  # first sight of a board: sticky holds older than this were already handled (kanban-754a3e3cf1)
 MAX_READ = 4 * 1024 * 1024        # never read more than this from one log per pass (start at the tail instead)
 MAX_PER_KIND = 25                 # cap per collector per pass: a log storm files a handful, not hundreds
 FAIL_OUTCOMES = ("crashed", "timed_out", "spawn_failed")
@@ -682,7 +683,10 @@ def _systemic_holds(cur: dict, board: str, db: Path, now: float, host: str) -> L
     """The dispatcher's systemic breaker (3+ same-fingerprint crashes in one tick) holds each card in triage with a
     `gave_up` event whose payload has `sticky: true`; every card crashed only once, so the >= 2 failed-runs rule
     never sees it. One signal per (board, normalized error head) per WORKER_STORM_S, by event time. Event ids are
-    the cursor (cur["kanban_ev"][board]); a first sight looks back BACKFILL_S."""
+    the cursor (cur["kanban_ev"][board]); a first sight looks back only HOLD_BACKFILL_S (24 h): an older hold on a
+    board seen for the first time was handled long ago (kanban-754a3e3cf1 filed a 2-day-old hold whose cards the
+    operator had archived and rerun clean). The held cards ride in ``kanban_hold`` (not ``kanban``: they are no
+    per-card trigger) so self_heal.kanban_trigger_closed can drop a stale hold whose cards are all closed."""
     evc = cur.setdefault("kanban_ev", {})
     filed = cur.setdefault("kanban_hold", {})
     try:
@@ -692,7 +696,7 @@ def _systemic_holds(cur: dict, board: str, db: Path, now: float, host: str) -> L
             top = c.execute("select coalesce(max(id),0) from task_events").fetchone()[0]
             if last is None:
                 rows = c.execute("select id, task_id, payload, created_at from task_events where kind='gave_up' "
-                                 "and created_at >= ? order by id", (int(now - BACKFILL_S),)).fetchall()
+                                 "and created_at >= ? order by id", (int(now - HOLD_BACKFILL_S),)).fetchall()
             else:
                 rows = c.execute("select id, task_id, payload, created_at from task_events where kind='gave_up' "
                                  "and id > ? order by id", (int(last),)).fetchall()
@@ -734,6 +738,7 @@ def _systemic_holds(cur: dict, board: str, db: Path, now: float, host: str) -> L
                      "details": _scrub(f"The dispatcher's systemic breaker (3+ same-fingerprint worker crashes in one "
                                        f"tick) held these cards on {host}/{board} with a sticky gave_up: "
                                        f"{', '.join(tids)}\nerror: {cl['err']}")[:1500],
+                     "kanban_hold": {"board": board, "cards": tids, "at0": cl["at0"]},
                      "fp": fp("kanban", "systemic-hold", cl["head"])})
     return sigs
 
@@ -968,7 +973,7 @@ def to_defect(s: dict) -> dict:
          "quote": s.get("quote") or ""}
     if (s.get("count") or 1) > 1:
         d["details"] = f"(seen {s['count']}x this pass)\n" + d["details"]
-    for k in ("profile", "monitor", "kanban", "comment_open_card"):
+    for k in ("profile", "monitor", "kanban", "kanban_hold", "comment_open_card"):
         if s.get(k):
             d[k] = s[k]
     return d

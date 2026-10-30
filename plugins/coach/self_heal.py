@@ -1306,14 +1306,12 @@ def _kanban_board_path(board: str, home: Path) -> Optional[Path]:
     return h / "kanban.db" if name == "default" else h / "kanban" / "boards" / name / "kanban.db"
 
 
-def kanban_trigger_closed(d: dict, home: Optional[Path] = None) -> Optional[str]:
-    """Why to drop a kanban signal: every card it names is now archived/done on its (local) board, e.g. the owner
-    closed it while the detection waited in the pending queue. None (= file as before) when the signal is not a
-    kanban one, came from another host's board, or the board/card cannot be read."""
-    trig = kanban_trigger(d)
-    if not trig or (d.get("host") and d["host"] != host_name()):
-        return None
-    board, cards = trig
+HOLD_STALE_S = 6 * 3600  # a systemic hold filed later than this after it fired, with every held card closed, is history
+
+
+def _cards_closed(board: str, cards: list, home: Optional[Path]) -> Optional[list]:
+    """["<id> now <status>", ...] when every card is archived/done on the local board; None when any is open or the
+    board/card cannot be read."""
     path = _kanban_board_path(board, Path(home) if home else _kanban_home())
     if not path or not path.is_file():
         return None
@@ -1336,7 +1334,35 @@ def kanban_trigger_closed(d: dict, home: Optional[Path] = None) -> Optional[str]
             db.close()
     except sqlite3.Error:
         return None
-    return "trigger card " + ", ".join(got)
+    return got
+
+
+def kanban_trigger_closed(d: dict, home: Optional[Path] = None, now: Optional[float] = None) -> Optional[str]:
+    """Why to drop a kanban signal: every card it names is now archived/done on its (local) board, e.g. the owner
+    closed it while the detection waited in the pending queue. A systemic hold (``kanban_hold``, signals.py
+    _systemic_holds) is dropped only when it is also older than HOLD_STALE_S: a fresh hold is filed even when its
+    held cards rerun and finish, since the crash cause may still be live (kanban-754a3e3cf1 filed a 2-day-old hold
+    whose cards were archived). None (= file as before) when the signal is not a kanban one, came from another
+    host's board, or the board/card cannot be read."""
+    if d.get("host") and d["host"] != host_name():
+        return None
+    hold = d.get("kanban_hold")
+    if isinstance(hold, dict) and hold.get("board") and hold.get("cards"):
+        at = _detected_at(d)
+        now = time.time() if now is None else now
+        if at is None or now - at <= HOLD_STALE_S:
+            return None
+        got = _cards_closed(str(hold["board"]), [str(c) for c in hold["cards"]], home)
+        if not got:
+            return None
+        return (f"stale systemic hold: cards {', '.join(got)} closed (hold {_iso(at)}, "
+                f"> {HOLD_STALE_S // 3600}h before filing)")
+    trig = kanban_trigger(d)
+    if not trig:
+        return None
+    board, cards = trig
+    got = _cards_closed(board, cards, home)
+    return "trigger card " + ", ".join(got) if got else None
 
 
 def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
@@ -1364,7 +1390,7 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                            "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
                 out.append({"action": "skip", "why": "stale pending"})
                 continue
-            closed = kanban_trigger_closed(d)
+            closed = kanban_trigger_closed(d, now=now)
             if closed:  # the owner closed the card while this waited: nothing is broken any more
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
@@ -2114,7 +2140,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         store.log({"event": "selfheal_forward", "fingerprint": fp, "ok": rc == 0, "detail": res["out"]})
         return res
     if m == "live" and hub:
-        closed = kanban_trigger_closed(d)
+        closed = kanban_trigger_closed(d, now=now)
         if closed:
             store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": closed})
             return {"action": "skip", "why": closed}
