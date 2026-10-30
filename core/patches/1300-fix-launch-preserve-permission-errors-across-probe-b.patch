@@ -1,0 +1,164 @@
+From 642d2c68783efdc04864492dc80086c00e077e80 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:57:29 -0700
+Subject: [PATCH] fix(launch): preserve permission errors across probe
+ boundaries [daveey] (#339)
+
+---
+ hermes_cli/launch_probe.py            | 15 ++++++++++++++-
+ hermes_cli/venv_sync.py               |  2 ++
+ pm/client.py                          |  5 ++++-
+ pm/worker.py                          |  5 ++++-
+ tests/hermes_cli/test_launch_probe.py | 23 +++++++++++++++++++++++
+ tests/pm/test_worker.py               | 16 ++++++++++++++++
+ 6 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/launch_probe.py b/hermes_cli/launch_probe.py
+index a8428947f5b..ac664275aa4 100644
+--- a/hermes_cli/launch_probe.py
++++ b/hermes_cli/launch_probe.py
+@@ -9,6 +9,8 @@ Contract (stdlib only, so a bootstrap interpreter can import it):
+ * ``{"schema": 1, "state": "current" | "stale"}`` for ``currency``.
+ * ``{"schema": 1, "state": "runtime", "problems": [str], "path": str}`` for ``runtime``.
+ * ``{"schema": 1, "state": "error", "detail": str}`` when the worker ran and failed.
++  Permission failures with a denied path also carry ``permission_error`` with
++  ``errno``, ``strerror`` and ``filename`` so launchers retain actionable diagnostics.
+ * ``None`` when the probe is unavailable, times out or answers malformed data.
+ 
+ The worker imports PM from the *implementation* checkout that contains this
+@@ -62,6 +64,8 @@ try:
+                  "path": os.environ.get("PATH", "")}
+ except BaseException as exc:
+     reply = {"schema": 1, "state": "error", "detail": f"{type(exc).__name__}: {exc}"}
++    if isinstance(exc, PermissionError) and exc.filename is not None:
++        reply["permission_error"] = {"errno": exc.errno, "strerror": exc.strerror, "filename": str(exc.filename)}
+ out.write(json.dumps(reply) + "\n")
+ out.flush()
+ """
+@@ -72,7 +76,16 @@ def _valid(operation: str, reply: Any) -> bool:
+         return False
+     state = reply.get("state")
+     if state == "error":
+-        return isinstance(reply.get("detail"), str) and set(reply) == {"schema", "state", "detail"}
++        if not isinstance(reply.get("detail"), str):
++            return False
++        if set(reply) == {"schema", "state", "detail"}:
++            return True
++        error = reply.get("permission_error")
++        return (set(reply) == {"schema", "state", "detail", "permission_error"}
++                and isinstance(error, dict) and set(error) == {"errno", "strerror", "filename"}
++                and (error["errno"] is None or type(error["errno"]) is int)
++                and (error["strerror"] is None or isinstance(error["strerror"], str))
++                and isinstance(error["filename"], str))
+     if operation == "currency":
+         return state in ("current", "stale") and set(reply) == {"schema", "state"}
+     problems = reply.get("problems")
+diff --git a/hermes_cli/venv_sync.py b/hermes_cli/venv_sync.py
+index 6883a4f7311..5a5a29b038d 100644
+--- a/hermes_cli/venv_sync.py
++++ b/hermes_cli/venv_sync.py
+@@ -555,6 +555,8 @@ def _launch_currency(root: Path, command: list[str]) -> bool | None:
+     if result is None:
+         return None
+     if result["state"] == "error":
++        if error := result.get("permission_error"):
++            raise PermissionError(error["errno"], error["strerror"], error["filename"])
+         raise RuntimeError(result["detail"])
+     return result["state"] == "current"
+ 
+diff --git a/pm/client.py b/pm/client.py
+index d0130d1e2a2..a545092911a 100644
+--- a/pm/client.py
++++ b/pm/client.py
+@@ -109,7 +109,10 @@ def _raise_worker_error(error: dict):
+     if error["type"] == "DownloadPaused":
+         from pm.downloader import DownloadPaused
+         raise DownloadPaused(error["message"])
+-    raise _WORKER_ERRORS.get(error["type"], RuntimeError)(error["message"])
++    kind = _WORKER_ERRORS.get(error["type"], RuntimeError)
++    if issubclass(kind, OSError) and error.get("filename") is not None:
++        raise kind(error.get("errno"), error.get("strerror"), error["filename"])
++    raise kind(error["message"])
+ 
+ 
+ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_root=None):
+diff --git a/pm/worker.py b/pm/worker.py
+index 7b49ce305d6..6dd230e3cbb 100644
+--- a/pm/worker.py
++++ b/pm/worker.py
+@@ -113,7 +113,10 @@ def main():
+                 result = str(result)
+             response = {"result": result}
+         except BaseException as exc:
+-            error = {"type": type(exc).__name__, "message": str(exc)}
++            error: dict = {"type": type(exc).__name__, "message": str(exc)}
++            if isinstance(exc, OSError) and exc.filename is not None:
++                # Launch permission diagnostics classify the denied path, not its rendered text.
++                error.update(errno=exc.errno, strerror=exc.strerror, filename=str(exc.filename))
+             if isinstance(exc, InstallError):
+                 error.update(package=exc.package, cause=exc.cause, remedy=exc.remedy)
+             response = {"error": error}
+diff --git a/tests/hermes_cli/test_launch_probe.py b/tests/hermes_cli/test_launch_probe.py
+index e7c3bdadc19..e7bd50fcf72 100644
+--- a/tests/hermes_cli/test_launch_probe.py
++++ b/tests/hermes_cli/test_launch_probe.py
+@@ -100,6 +100,29 @@ def test_worker_failure_is_an_error_result(tmp_path, use_source):
+         "schema": 1, "state": "error", "detail": "RuntimeError: boom"}
+ 
+ 
++@posix
++def test_currency_permission_error_keeps_denied_path(tmp_path, use_source, monkeypatch):
++    from pm.environments import install_state_dir, install_state_permission_message
++    from hermes_cli import venv_sync
++
++    root = tmp_path / "project"
++    denied = install_state_dir(root) / "pm-runtime" / ".prepare.lock"
++    denied.parent.mkdir(parents=True)
++    denied.write_text("")
++    denied.chmod(0o444)
++    use_source(_fake_source(tmp_path, f"open({str(denied)!r}, 'a+b')", "pass"))
++    real_probe = launch_probe.probe
++    monkeypatch.setattr(launch_probe, "probe", lambda root: real_probe(root, timeout=BOUND))
++    try:
++        with pytest.raises(PermissionError) as caught:
++            venv_sync._launch_currency(root, ["-z", "hello"])
++        assert caught.value.errno == 13
++        assert caught.value.filename == str(denied)
++        assert install_state_permission_message(root, caught.value) is not None
++    finally:
++        denied.chmod(0o644)
++
++
+ @posix
+ def test_stdout_noise_from_imports_does_not_corrupt_the_reply(tmp_path, use_source):
+     use_source(_fake_source(tmp_path, "print('noise'); return True", "pass"))
+diff --git a/tests/pm/test_worker.py b/tests/pm/test_worker.py
+index 2a0e696ca1a..120e2ca72f8 100644
+--- a/tests/pm/test_worker.py
++++ b/tests/pm/test_worker.py
+@@ -445,6 +445,22 @@ def _patch_worker_apply(client, monkeypatch, isolated_python, body):
+     monkeypatch.setattr(client, "runtime_command", lambda path, **kwargs: [str(isolated_python), "-I", "-B", "-c", script])
+ 
+ 
++def test_permission_error_survives_worker_with_denied_path(client, tmp_path, monkeypatch, isolated_python):
++    import errno
++    from pm.environments import install_state_dir, install_state_permission_message
++
++    repo = _current_environment(tmp_path, monkeypatch, [])
++    denied = install_state_dir(repo) / "pm-runtime" / ".prepare.lock"
++    (repo / "uv.lock").write_text("version = 2\n")
++    _patch_worker_apply(client, monkeypatch, isolated_python,
++                        f"raise PermissionError({errno.EACCES}, 'Permission denied', {str(denied)!r})")
++    with pytest.raises(PermissionError) as caught:
++        client.sync_venv([], explicit=True, plugins=Members([]))
++    assert caught.value.errno == errno.EACCES
++    assert caught.value.filename == str(denied)
++    assert install_state_permission_message(repo, caught.value) is not None
++
++
+ def test_resolution_conflict_survives_worker_and_receipt(client, tmp_path, monkeypatch, isolated_python, capfd):
+     from pm import receipt
+     from pm.workspace import ResolutionConflict
+-- 
+2.55.0
+

@@ -14,7 +14,7 @@ The last public/private series reconciliation (what was already equivalent, what
 
 ## Current inventory
 
-1299 patches, one entry per non-merge source commit through `1e40faadc04282fa17694def89b6e0f1c51847d4`.
+1301 patches, one entry per non-merge source commit through `7fbf27b309d3da51a1c6e54a26c61c5e1aca2a2d`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -23,7 +23,7 @@ follows 1281 although it sorts at position 1259 by date. Each patch is identifie
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `2d2808ee84549f9836b0056750265058e5488a8a`; merge-base: `5608b5faf19ac22d023e62a8fd9675a42d1a61c6`. Empty duplicate entries are retained; apply with `git am -3 --empty=keep`.
-The current snapshot's executed checks are in [mirror-1299-verification.md](mirror-1299-verification.md), with its policy [mirror-policy-1299.json](mirror-policy-1299.json) (previous snapshots: [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
+The current snapshot's executed checks are in [mirror-1301-verification.md](mirror-1301-verification.md), with its policy [mirror-policy-1301.json](mirror-policy-1301.json) (previous snapshots: [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
 
@@ -31,7 +31,7 @@ See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation,
 
 | Feature | Patches | Scope |
 |---|---|---|
-| [Frozen decisions stop at reset](frozen-decision-reset.md) | 1239 1273 | Exact two-part user-steps decisions survive compression but cancel at a genuinely new LOCAL conversation, with event/waiter settlement. |
+| [Frozen decisions stop at reset](frozen-decision-reset.md) | 1239 1273 1301 | Exact two-part user-steps decisions survive compression but cancel at a genuinely new LOCAL conversation, with event/waiter settlement. 1301 keeps the old owner's lock past a cancelled caller in the native rehome branch. |
 | [Admission, restart and test isolation](mirror-admission-and-test-followups.md) | 1236–1238 1240–1253 | Memory-aware CI, drain/crash isolation, cron and replica guards, bounded restart settlement, missing pins and source test synchronization. |
 
 ## Append-only follow-ups after 1134
@@ -831,8 +831,9 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [1281-entry mirror snapshot](mirror-1281-verification.md) | verification report | Replay and tree-comparison evidence for the 28 entries appended after the 1253 snapshot. |
 | [Attach e2e probe uses installed Node](attach-probe-node.md) | 1282 | The attach-handshake e2e helper passes the suite's Node as `HERMES_NODE`, and a new test fails if attach ever reaches PM provisioning. |
 | [1299-entry mirror snapshot](mirror-1299-verification.md) | verification report | Duplicate 1282 replaced by the omitted `3c2af6ee2e`; `verify_mirror.py` exits 0 end to end with policy [mirror-policy-1299.json](mirror-policy-1299.json). |
+| [1301-entry mirror snapshot](mirror-1301-verification.md) | verification report | Appends 1300 (`642d2c6878`) and 1301 (`7fbf27b309`); `verify_mirror.py` exits 0 with policy [mirror-policy-1301.json](mirror-policy-1301.json). |
 | [Kanban scratch archive](kanban-scratch-archive.md) | 1299 | `gc_task_scratch` archives (bundle, diff, untracked tar, meta) then removes aged terminal scratch holding git clones; retention `kanban.worktree_retention_days` (default 7, 0 disables). |
-| [Bounded launcher preflight](launch-preflight-bound.md) | 1284 1285 1286 1287 | The launch-time PM currency probe has a 1 s deadline; unknown defers repair and `hermes update` keeps the full check. |
+| [Bounded launcher preflight](launch-preflight-bound.md) | 1284 1285 1286 1287 1300 | The launch-time PM currency probe has a 1 s deadline; unknown defers repair and `hermes update` keeps the full check. 1300 keeps a permission error's denied path across the probe and PM workers. |
 | [TUI/e2e CI timing stability](tui-ci-timing-stability.md) | 1283 1297 1298 | A single durable-flush seam for the TUI, no-op in tests, plus synchronized receipt tests and a glyph-layout tolerance. |
 | [Core-update Kanban-only stop budget](gateway-core-update-kanban-stop-budget.md) | 1288 1294 | A spent Kanban update grace gets one 40 s stop leash so the whole restart fits 60 s. |
 | [Kanban owner-archive relay split](kanban-owner-archive-relay-split.md) | 1289 | Pure move of the kanban_archive worker flow to keep the code-health ratchet green. |
