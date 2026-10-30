@@ -123,9 +123,32 @@ def _model_cfg() -> tuple[str | None, str | None]:
     return "anthropic", "claude-haiku-5-5"
 
 
+def _is_routing_error(e: BaseException) -> bool:
+    return any(c.__name__ == "ModelRoutingError" for c in type(e).__mro__)
+
+
 def default_llm(system: str, user: str) -> str:
+    """The configured judge; when the routing policy has no usable route for its class (every subscription
+    account for it exhausted or cooling down, logged as 'No eligible fast routes'), retry on the next
+    subscription class so the prewarm, answer-classifier and gate paths do not fail open on a transient outage."""
     prov, model = _model_cfg()
-    return judge_mod.aux_llm(system, user, provider=prov, model=model)
+    try:
+        return judge_mod.aux_llm(system, user, provider=prov, model=model)
+    except Exception as first:
+        if not _is_routing_error(first):
+            raise
+        errors = [("configured", repr(first)[:200])]
+        for name, llm in FALLBACKS():
+            try:
+                out = llm(system, user)
+            except Exception as e:
+                if not _is_routing_error(e):
+                    raise
+                errors.append((name, repr(e)[:200]))
+                continue
+            core.log_event("llm_class_fallback", judge=name, errors=errors)
+            return out
+        raise
 
 
 LLM = default_llm  # tests replace this

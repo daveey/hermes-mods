@@ -108,3 +108,43 @@ def test_internal_gate_error_never_carries_the_park_advice(verified, monkeypatch
     r = call(gate, human())
     assert r["action"] == "block"
     assert PARK_ADVICE not in r["message"] and "not a verdict" in r["message"]
+
+
+def test_default_llm_falls_back_across_classes_on_routing_error(gate, monkeypatch, tmp_path):
+    """The prewarm, answer-classifier and gate paths use default_llm; a fast-class outage must not fail them."""
+    calls = []
+
+    def fake_aux(system, user, **kw):
+        calls.append(kw.get("model"))
+        if kw.get("model") != "class:standard":
+            raise ModelRoutingError("No eligible fast routes under billing/capability policy")
+        return "judged"
+
+    monkeypatch.setattr(gate.judge_mod, "aux_llm", fake_aux)
+    gate.FALLBACKS = lambda: [
+        ("class:fast", lambda s, u: fake_aux(s, u, model="class:fast")),
+        ("class:standard", lambda s, u: fake_aux(s, u, model="class:standard")),
+    ]
+    assert gate.default_llm("sys", "usr") == "judged"
+    assert calls[-1] == "class:standard"
+    assert any(e["kind"] == "llm_class_fallback" for e in events(gate, tmp_path))
+
+
+def test_default_llm_reraises_when_every_class_is_down(gate, monkeypatch):
+    def down(system, user, **kw):
+        raise ModelRoutingError("No eligible fast routes under billing/capability policy")
+
+    monkeypatch.setattr(gate.judge_mod, "aux_llm", down)
+    gate.FALLBACKS = lambda: [("class:standard", lambda s, u: down(s, u))]
+    with pytest.raises(ModelRoutingError):
+        gate.default_llm("sys", "usr")
+
+
+def test_default_llm_does_not_mask_other_errors(gate, monkeypatch):
+    def boom(system, user, **kw):
+        raise RuntimeError("network")
+
+    monkeypatch.setattr(gate.judge_mod, "aux_llm", boom)
+    gate.FALLBACKS = lambda: [("class:standard", lambda s, u: "x")]
+    with pytest.raises(RuntimeError):
+        gate.default_llm("sys", "usr")
