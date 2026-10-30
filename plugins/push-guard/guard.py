@@ -186,14 +186,24 @@ def _broker() -> Optional[str]:
     return str(p) if p.exists() else None
 
 
+def _gh() -> str:
+    """gh by absolute path: PATH first, then the usual install dirs. Service processes (hermes-hub's gateway and its
+    kanban workers, where the hook runs) have no ~/bin on PATH, and gh lives there: a bare "gh" fails, the broker
+    retry execs the same bare name, every check reads as unreadable, and even a green sha is blocked."""
+    dirs = (Path.home() / "bin", Path.home() / ".local/bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin"),
+            Path("/usr/bin"))
+    return shutil.which("gh") or shutil.which("gh", path=os.pathsep.join(map(str, dirs))) or "gh"
+
+
 def _gh_json(args: list[str], cwd: Optional[str] = None):
     """Run `gh <args>` and parse its JSON stdout: (data, None) or (None, error text). A gh with no login (hermes-hub,
     worker hosts) is retried through the token-broker `user/github` scope, the same token agents use there."""
-    attempts = [["gh", *args]]
+    gh = _gh()
+    attempts = [[gh, *args]]
     b = _broker()
     if b:
         attempts.append([b, "exec", "--scope", "user/github", "--reason", "push-guard: read CI state", "--",
-                         "gh", *args])
+                         gh, *args])
     err = "gh not available"
     for argv in attempts:
         try:

@@ -231,6 +231,45 @@ def test_unreadable_check_status_is_blocked(core):
     assert got and "unreadable" in got["message"] and "Bad credentials" in got["message"]
 
 
+def _fake_gh(path, needs_token):
+    """An executable gh that prints one successful CHECK run; with needs_token it fails like a gh with no login."""
+    body = json.dumps({"total_count": 1, "check_runs": [run("completed", "success")]})
+    gate = ('[ -n "$GH_TOKEN" ] || { echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4; }\n'
+            if needs_token else "")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\n{gate}echo '{body}'\n")
+    path.chmod(0o755)
+
+
+def _service_env(tmp_path, monkeypatch):
+    """HOME with nothing installed yet, and a PATH without gh: how hermes-hub's gateway and kanban workers run."""
+    home, empty = tmp_path / "home", tmp_path / "empty"
+    home.mkdir()
+    empty.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    return home
+
+
+def test_gh_missing_from_path_is_found_in_the_usual_install_dirs(tmp_path, monkeypatch):
+    home = _service_env(tmp_path, monkeypatch)
+    _fake_gh(home / "bin" / "gh", needs_token=False)
+    assert guard.check_state("acme/core", "a" * 40, CHECK) == "success"
+
+
+def test_broker_retry_runs_gh_by_absolute_path(tmp_path, monkeypatch):
+    """gh with no login is retried through token-broker, which execs under the same PATH: it needs gh's full path."""
+    home = _service_env(tmp_path, monkeypatch)
+    _fake_gh(home / "bin" / "gh", needs_token=True)
+    broker = home / ".local" / "bin" / "token-broker"
+    broker.parent.mkdir(parents=True)
+    broker.write_text('#!/bin/sh\nwhile [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\n'
+                      'GH_TOKEN=from-broker exec "$@"\n')
+    broker.chmod(0o755)
+    assert guard.check_state("acme/core", "a" * 40, CHECK) == "success"
+
+
 def test_unresolvable_source_is_blocked_and_no_op_push_is_allowed(core):
     work, gh = core
     got = block("terminal", {"command": "git push origin nosuchref:main", "workdir": str(work)})
