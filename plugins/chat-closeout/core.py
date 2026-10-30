@@ -429,6 +429,7 @@ CREATE TABLE IF NOT EXISTS waiting (
 );
 CREATE TABLE IF NOT EXISTS unseen_seen (session_id TEXT PRIMARY KEY, since REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS flag_resolutions (key TEXT PRIMARY KEY, at REAL NOT NULL, evidence TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -531,6 +532,43 @@ class Ledger:
             c = self._conn()
             try:
                 return c.execute("INSERT OR IGNORE INTO flags (key, at) VALUES (?, ?)", (key, now)).rowcount == 1
+            finally:
+                c.close()
+
+    def flags(self) -> list[str]:
+        with self._lock:
+            c = self._conn()
+            try:
+                return [r[0] for r in c.execute("SELECT key FROM flags ORDER BY key")]
+            finally:
+                c.close()
+
+    def resolution(self, key: str, now: float, evidence: str) -> dict:
+        """Persist the first observed-clear time across retries and backend restarts."""
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("INSERT OR IGNORE INTO flag_resolutions VALUES (?, ?, ?)", (key, now, evidence))
+                return dict(c.execute("SELECT * FROM flag_resolutions WHERE key=?", (key,)).fetchone())
+            finally:
+                c.close()
+
+    def reset_resolution(self, key: str) -> None:
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("DELETE FROM flag_resolutions WHERE key=?", (key,))
+            finally:
+                c.close()
+
+    def clear_flag(self, key: str) -> None:
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                c.execute("DELETE FROM flags WHERE key=?", (key,))
+                c.execute("DELETE FROM flag_resolutions WHERE key=?", (key,))
+                c.execute("COMMIT")
             finally:
                 c.close()
 
