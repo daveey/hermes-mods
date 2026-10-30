@@ -840,3 +840,4 @@ Merged branches inserted earlier commits: existing patch bytes and slugs are pre
 | [Home I/O guard: SQLite URIs](home-io-guard-sqlite-uri.md) | 1290 1291 | The test home-I/O guard checks SQLite URI filenames, including encoded Windows drives. |
 | [Serve update-gate log](serve-update-gate-log.md) | 1292 | Gate waits and re-execs are appended to `logs/serve-update-gate.log`. |
 | [Upstream sync lands via PR](upstream-sync-land-via-pr.md) | 1293 1295 1296 | `land()` merges a PR pinned to the head once the required check is green; GitHub refusals are reported verbatim. |
+| [Kubernetes terminal backend: one pod per session](kubernetes-terminal-backend.md) | pending (fork PR #242) | `terminal.backend: kubernetes`: a hardened pod per session in a profile-configured namespace, exec over the pod API, existing-claim or emptyDir workspace, no PVC rights needed. |
