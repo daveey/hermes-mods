@@ -156,7 +156,11 @@ verify that integration before promising autonomous builds.
    `slack_workspace` to `platform_toolsets.slack`. Restart and look for `Wired native handlers from plugin
    'slack-workspace'` in the profile's agent log.
 2. Gate speaking: `platforms.slack.extra` `require_mention`, `strict_mention`, `thread_require_mention` all true;
-   `allow_bots: mentions` if it should work with other bots.
+   `allow_bots: mentions` if it should work with other bots. Set `platforms.slack.gateway_restart_notification: false`
+   too: otherwise every gateway restart (auto-updates restart it often) posts "Hermes is restarting" / "Gateway online"
+   to the home channel. To find which profile is posting them, grep each profile's `logs/gateway.log` for
+   `Sent shutdown notification`. The running gateway posts one last notice on its next shutdown before the setting
+   takes effect.
 3. App config: `channels:join` plus the `message.*` bot events, or there is nothing to observe.
 4. Join channels as the operator (direct API, ~1 s apart), then put alert/CI/bot-feed channels in
    `quiet_channels`. Those feeds are most of the volume, so this is what keeps context useful.
