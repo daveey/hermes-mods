@@ -313,7 +313,7 @@ def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None =
                 pass
             for r in rows:
                 out.append({"id": r[0], "title": r[1], "status": r[2], "assignee": r[3],
-                            "created": r[4], "completed": r[5]})
+                            "created": r[4], "completed": r[5], "db": str(p)})
             c.close()
         except sqlite3.Error:
             continue
@@ -341,11 +341,66 @@ def card_status(ids: list[str], db_paths: list[Path] | None = None) -> dict[str,
     return out
 
 
-def render_cards(cards: list[dict]) -> str:
+def placed_copy(db: str | Path, task_id: str) -> dict | None:
+    """The copy placement forwarded to another gateway: {gateway, task_id} from the card's events, else None."""
+    try:
+        c = _ro(Path(db))
+        rows = c.execute("select kind, payload from task_events where task_id=? and kind in "
+                         "('placement_deferred','placement_forwarded','placement_cancelled',"
+                         "'placement_archive_forwarded') order by id", (task_id,)).fetchall()
+        c.close()
+    except sqlite3.Error:
+        return None
+    gw = rid = None
+    for kind, raw in rows:
+        try:
+            p = json.loads(raw or "{}")
+        except ValueError:
+            continue
+        if kind == "placement_cancelled":
+            gw = rid = None
+        elif kind == "placement_deferred":
+            gw = p.get("target") or gw
+        else:
+            gw = p.get("gateway") or gw
+            rid = p.get("remote_task_id") or rid
+    return {"gateway": gw, "task_id": rid} if gw and rid else None
+
+
+def hub_replica(gateway: str, timeout: float = 8) -> list[dict] | None:
+    """Tasks of another gateway as the hub replica sees them (`hermes-hub tasks --gw X --all --json`)."""
+    import subprocess
+    try:
+        r = subprocess.run(["hermes-hub", "tasks", "--gw", gateway, "--all", "--json"],
+                           capture_output=True, text=True, timeout=timeout)
+        data = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def render_cards(cards: list[dict], replica=None) -> str:
+    """One line per card; a card whose copy was forwarded to another gateway gets `-> gw:id <live status>`.
+    ``replica(gateway)`` returns that gateway's task dicts (default: the hub replica); None = unreachable."""
+    replica = replica or hub_replica
+    cache: dict[str, list[dict] | None] = {}
     lines = []
     for c in cards:
         when = f", completed {fmt_ts(c['completed'])}" if c.get("completed") else ""
-        lines.append(f"- {c['id']} [{c['status']}{when}] {str(c.get('title') or '')[:90]}")
+        line = f"- {c['id']} [{c['status']}{when}] {str(c.get('title') or '')[:90]}"
+        pc = placed_copy(c["db"], c["id"]) if c.get("db") else None
+        if pc:
+            gw = pc["gateway"]
+            if gw not in cache:
+                try:
+                    cache[gw] = replica(gw)
+                except Exception:
+                    cache[gw] = None
+            rows = cache[gw]
+            hit = next((t for t in rows or [] if t.get("id") == pc["task_id"]), None)
+            live = (hit or {}).get("status") or ("not in replica" if rows is not None else "status unknown")
+            line += f" -> {gw}:{pc['task_id']} {live}"
+        lines.append(line)
     return "\n".join(lines)
 
 
