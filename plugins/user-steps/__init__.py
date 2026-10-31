@@ -34,6 +34,17 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
 log = logging.getLogger("user-steps")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 _USER_MSG: dict[str, str] = {}
+# Request ids the producer tool published or revised per stored session during the turn in flight. Server-side
+# provenance: only these may absorb the reply's restatement of their title or menu (core.same_open_ask).
+# Consumed by the turn's final reply transform; the gate only reads it.
+_TURN_PUBLISHED: dict[str, set] = {}
+
+
+def _published(owner: dict, request: dict) -> dict:
+    sid = (owner or {}).get('storedSessionId')
+    if sid and isinstance(request, dict) and request.get('requestId'):
+        _TURN_PUBLISHED.setdefault(sid, set()).add(request['requestId'])
+    return request
 _BACKFILLED = False
 # Hooks that sit in front of every reply wait at most this long for the asks DB, never the store's 30 s default.
 HOOK_DB_TIMEOUT = 5
@@ -133,6 +144,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
     if not _eligible(session_id, platform, parent_session_id):
         return None
     try:
+        _TURN_PUBLISHED.pop(session_id, None)  # a new turn: earlier turns' publications are no provenance
         _USER_MSG[session_id] = _turn_message(user_message, conversation_history)
         own = core.server_owner(session_id)
         st = core.ActionStore(timeout=HOOK_DB_TIMEOUT)
@@ -214,7 +226,7 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
             response_text, session_id, user_msg=_USER_MSG.pop(session_id, ""), llm=aux_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
             action_store=core.ActionStore(timeout=HOOK_DB_TIMEOUT) if action_owner else None,
-            action_owner=action_owner,
+            action_owner=action_owner, turn_requests=_TURN_PUBLISHED.pop(session_id, set()),
             session_ref=f"@session:{_profile()}/{session_id}")
         if out.get("error"):
             log.warning("user-steps extractor fell back to regex: %s", out["error"])
@@ -254,7 +266,8 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     mapped: dict = {}
 
     def covered(step):
-        same = core.same_open_ask(step, open_asks, res.get('repeats') or (), mapped)
+        same = core.same_open_ask(step, open_asks, res.get('repeats') or (), mapped,
+                                  _TURN_PUBLISHED.get(session_id, ()))
         if same is not None:
             mapped.setdefault(core.ask_key(step.get('verbatim_span')), same)
         return same is not None and same['id'] in ready
@@ -379,23 +392,39 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         else:
             if 'expectedRevision' in args: raise core.ActionError('New requests have no expectedRevision')
             if refs: raise core.ActionError('Card aliases must be created by decisionCard, not supplied')
-            key = core.ask_key(payload.get('title'))
-            scope_md = (payload.get('scope') or {}).get('markdown') if isinstance(payload.get('scope'), dict) else None
-            same = [] if 'decisionCard' in args or len(key) < 20 else [
+            # Identity is provenance, never the title. A new publication revises an open request in place only
+            # when it cites that request's own extracted step (an exact qualified user_step ref of this owner in
+            # aliases or scope.sourceRefs), or re-sends the exact same request (a retry). An equal title alone is
+            # a different request: publish it and name the same-title ones so the agent can withdraw a replaced
+            # one itself. Nothing here withdraws another request.
+            def qualified(ref):
+                return (ref.get('gatewayId'), ref.get('profile'), ref.get('type'), str(ref.get('id')))
+            scope_obj = payload.get('scope') if isinstance(payload.get('scope'), dict) else None
+            cited = {qualified(ref) for ref in list(payload.get('aliases') or []) + list((scope_obj or {}).get('sourceRefs') or [])
+                     if isinstance(ref, dict) and ref.get('type') == 'user_step'
+                     and ref.get('gatewayId') == owner['gatewayId'] and ref.get('profile') == owner['profile']}
+            undecided = [] if 'decisionCard' in args else [
                 r for r in st.requests(owner)
                 if r['state'] in ('open', 'needs_context') and not r.get('resolution')
-                and not any(a['type'] == 'kanban' for a in r['aliases']) and core.ask_key(r['title']) == key]
-            # Revise in place only what is provably the same ask: an extracted or plan-less tile (the agent now
-            # supplies its plan) or the same plan re-sent. A complete plan with different scope under the same
-            # title may be a different decision: keep both and tell the agent.
-            fold = [r for r in same if any(a['type'] == 'user_step' for a in r['aliases'])
-                    or not r['scope']['complete'] or r['scope']['markdown'] == scope_md]
-            others = [r for r in same if r not in fold]
+                and not any(a['type'] == 'kanban' for a in r['aliases'])]
+            fold = [r for r in undecided if cited & {qualified(a) for a in r['aliases'] if a['type'] == 'user_step'}]
+            if len(fold) > 1:
+                raise core.ActionError('scope.sourceRefs/aliases cite steps of more than one open request; publish '
+                                       'one request per decision (revise each by its requestId).')
+            body_keys = ('schemaVersion', 'kind', 'title', 'scope', 'limits', 'exclusions', 'outcomes', 'choices',
+                         'state')
+            probe = core.validate_action(json.loads(json.dumps(payload)))
+            exact = [r for r in undecided if r not in fold and all(r.get(k) == probe.get(k) for k in body_keys)]
+            if not fold and exact:
+                # The same request re-sent (lost response, retried tool call): nothing new to publish.
+                out = _published(owner, exact[-1])
+                return json.dumps({'request': out, 'note': f"Already open with exactly this content: "
+                                   f"{out['requestId']} revision {out['revision']}. Nothing new was published."})
+            key = core.ask_key(payload.get('title'))
+            others = [r for r in undecided if r not in fold and len(key) >= 20 and core.ask_key(r['title']) == key]
             note = None
             if fold:
-                # A re-ask of an open, undecided request revises that tile (newest one) and withdraws older
-                # duplicates, instead of publishing another tile. Never a decision; a decision always wins.
-                target = fold[-1]
+                target = fold[0]
                 payload.update(requestId=target['requestId'],
                                aliases=target['aliases'] + [a for a in payload.get('aliases', [])
                                                             if a not in target['aliases']])
@@ -404,30 +433,25 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
                                     bind=adapter.bind_request, undecided=True)
                 except core.ActionError as exc:
                     if exc.status != 409: raise
+                    # Decided or moved on meanwhile: the decision wins. Publish a separate request that does not
+                    # reuse the decided request's refs.
                     payload.update(requestId=rid, aliases=[a for a in payload['aliases'] if a not in target['aliases']])
-                    fold = []  # decided or moved on meanwhile: publish as a new request below
+                    if isinstance(payload.get('scope'), dict):
+                        payload['scope'] = {**payload['scope'], 'sourceRefs': [
+                            ref for ref in payload['scope'].get('sourceRefs') or [] if ref not in target['aliases']]}
+                    fold = []
                 else:
-                    gone = []
-                    for r in fold[:-1]:
-                        try:
-                            core.withdraw_request(st, _ledger(), owner, r['requestId'], by='agent',
-                                                  reason=f"Duplicate of {target['requestId']}",
-                                                  expected_revision=r['revision'])
-                            gone.append(r['requestId'])
-                        except core.ActionError:
-                            pass  # decided or moved on meanwhile: the decision wins, keep it
-                    note = (f"An open request with this title already existed, so it was revised in place: "
-                            f"{target['requestId']} revision {out['revision']}.")
-                    if gone:
-                        note += ' Withdrew duplicates: ' + ', '.join(gone) + '.'
+                    note = (f"Revised in place the open request whose step this cites: {target['requestId']} "
+                            f"revision {out['revision']}.")
                     if others:
-                        note += (' Also open with the same title and a different plan: '
-                                 + ', '.join(r['requestId'] for r in others) + '; withdraw any it replaces.')
-                    return json.dumps({'request': out, 'note': note})
+                        note += (' Also open with the same title (separate requests): '
+                                 + ', '.join(r['requestId'] for r in others) + '; withdraw any this replaces.')
+                    return json.dumps({'request': _published(owner, out), 'note': note})
             if others:
-                note = ('Published as a new request. Also open with the same title and a different plan: '
-                        + ', '.join(r['requestId'] for r in others) + '. If this replaces it, withdraw it '
-                        '(or revise it instead of publishing a new one).')
+                note = ('Published as a separate request. Also open with the same title: '
+                        + ', '.join(r['requestId'] for r in others) + '. A matching title does not make them one '
+                        'request: if this replaces one, withdraw it (or revise it by its requestId and '
+                        'expectedRevision instead of publishing a new one).')
             payload = core.validate_action(payload)
             if 'decisionCard' in args:
                 core._object(args['decisionCard'], ('board',))
@@ -435,8 +459,8 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
                 payload['aliases'].append(ref)
             out = st.create(owner, payload, bind=adapter.bind_request)
             if note:
-                return json.dumps({'request': out, 'note': note})
-        return json.dumps({'request': out})
+                return json.dumps({'request': _published(owner, out), 'note': note})
+        return json.dumps({'request': _published(owner, out)})
     except (ValueError, TypeError, RuntimeError) as exc:
         return json.dumps({'error': str(exc), 'status': getattr(exc, 'status', 422)})
     except (AttributeError, KeyError) as exc:
@@ -448,9 +472,9 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
 
 PRODUCER_SCHEMA = {
     'name': 'action_request',
-    'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one revises that one. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
+    'description': 'Publish a complete, inline ActionRequest v2 for the current session. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one is a separate request; revise an existing one by its requestId and expectedRevision. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
     'parameters': {'type': 'object', 'additionalProperties': False,
-                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, limits [{key, value}] (objects, optional permissionRequired: true/false), exclusions [plain strings], choices [{id, label, effect, explain?, recommended?}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline; explain = one plain line on what happens if the user picks it, e.g. cost and what resumes; recommended: true on at most one choice, your pick), aliases: [] unless reusing a request\'s own refs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?} with type message, user_step or kanban (kanban requires board), never a bare card id string), state (open or needs_context).'},
+                   'properties': {'request': {'type': 'object', 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, limits [{key, value}] (objects, optional permissionRequired: true/false), exclusions [plain strings], choices [{id, label, effect, explain?, recommended?}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline; explain = one plain line on what happens if the user picks it, e.g. cost and what resumes; recommended: true on at most one choice, your pick), aliases: [] unless reusing a request\'s own refs. Identity is never the title: a new request with an open request\'s title is published as a separate request. To supply the plan for an open extracted tile, revise it by requestId and expectedRevision, or cite its user_step ref in scope.sourceRefs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?} with type message, user_step or kanban (kanban requires board), never a bare card id string), state (open or needs_context).'},
                                   'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
                                   'decisionCard': {'type': 'object', 'additionalProperties': False,
                                                    'properties': {'board': {'type': 'string'}}, 'required': ['board'],

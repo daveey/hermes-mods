@@ -32,7 +32,7 @@ def env(tmp_path):
     return core.ActionStore(tmp_path / 'actions.sqlite3'), core.Ledger(tmp_path / 'ledger', tmp_path / 'missing.db')
 
 
-def reply(store, ledger, text, steps, repeats=None, session='session-a', seen=None):
+def reply(store, ledger, text, steps, repeats=None, session='session-a', seen=None, turn=(), user_msg=''):
     payload = {'steps': steps, 'resolved': []}
     if repeats is not None:
         payload['repeats'] = repeats
@@ -41,8 +41,8 @@ def reply(store, ledger, text, steps, repeats=None, session='session-a', seen=No
         if seen is not None:
             seen.append((system, user))
         return json.dumps(payload)
-    return core.process_reply(text, session, ledger=ledger, action_store=store,
-                              action_owner=dict(OWNER, storedSessionId=session), llm=llm)
+    return core.process_reply(text, session, ledger=ledger, action_store=store, user_msg=user_msg,
+                              action_owner=dict(OWNER, storedSessionId=session), llm=llm, turn_requests=turn)
 
 
 def live(store, session='session-a'):
@@ -74,28 +74,37 @@ def card_steps(lines, titles):
     return [{'text': t, 'kind': 'approve', 'verbatim_span': s, 'options': []} for t, s in zip(titles, lines)]
 
 
-def test_extractor_same_title_on_a_later_reply_reuses_the_open_tile(tmp_path):
-    # Hub chat ..37ae77: round 2 re-extracted both card asks with the SAME text and a new span: two more tiles.
+def test_extractor_same_title_on_a_later_reply_is_its_own_ask_unless_the_model_names_the_tile(tmp_path):
+    # Hub chat ..37ae77: round 2 re-extracted both card asks with the SAME text and a new span. An equal title
+    # is not identity (two decisions can share one), so without provenance each is its own request. The
+    # extractor's explicit channel ("repeats" naming the open tile's id for that sentence) maps it.
     store, ledger = env(tmp_path)
     titles = ['Decide on t_aaaa1111: register one spare test runner',
               'Decide on t_bbbb2222: approve a dedicated build machine']
     first = reply(store, ledger, CARDS_1, card_steps(CARDS_1.split('\n')[1:], titles))
-    second = reply(store, ledger, CARDS_2, card_steps(CARDS_2.split('\n')[1:], titles))
+    lines = CARDS_2.split('\n')[1:]
+    named = reply(store, ledger, CARDS_2, card_steps(lines, titles),
+                  repeats=[{'id': s['id'], 'verbatim_span': line} for s, line in zip(first['steps'], lines)])
     assert len(live(store)) == 2
-    assert [s['id'] for s in second['steps']] == [s['id'] for s in first['steps']]  # framed onto the same tiles
+    assert [s['id'] for s in named['steps']] == [s['id'] for s in first['steps']]  # framed onto the same tiles
+    unnamed = reply(store, ledger, CARDS_3, card_steps(CARDS_3.split('\n')[1:], titles))
+    assert len(live(store)) == 4 and not {s['id'] for s in unnamed['steps']} & {s['id'] for s in first['steps']}
+    assert all(not r.get('resolution') for r in store.requests(OWNER))
 
 
-def test_extractor_reworded_ask_naming_the_same_card_reuses_the_open_tile(tmp_path):
-    # Round 3 of the same chat reworded the title ("Decide whether to register ... (t_aaaa1111)").
+def test_extractor_reworded_ask_naming_the_same_card_is_a_separate_ask(tmp_path):
+    # Round 3 of the same chat reworded the title ("Decide whether to register ... (t_aaaa1111)"). A card both
+    # name is context, not identity: the old word-overlap rule folded it. Without provenance both stay.
     store, ledger = env(tmp_path)
     reply(store, ledger, CARDS_1, card_steps(CARDS_1.split('\n')[1:], [
         'Decide on t_aaaa1111: register one spare test runner',
         'Decide on t_bbbb2222: approve a dedicated build machine']))
+    before = {r['requestId']: r for r in live(store)}
     reply(store, ledger, CARDS_3, card_steps(CARDS_3.split('\n')[1:], [
         'Decide whether to register one spare test runner (t_aaaa1111)',
         'Approve a dedicated build machine (t_bbbb2222)']))
-    assert sorted(r['title'] for r in live(store)) == ['Decide on t_aaaa1111: register one spare test runner',
-                                                       'Decide on t_bbbb2222: approve a dedicated build machine']
+    assert len(live(store)) == 4
+    assert all(store.get(OWNER, rid) == r for rid, r in before.items())  # earlier requests untouched
 
 
 def test_extractor_same_evidence_sentence_reworded_reuses_the_open_tile(tmp_path):
@@ -110,40 +119,71 @@ def test_extractor_same_evidence_sentence_reworded_reuses_the_open_tile(tmp_path
     assert len(live(store)) == 1
 
 
-def test_extractor_restating_a_published_title_does_not_mint_a_second_tile(tmp_path):
-    # Hub chat ..67cb2d: the reply bolded the producer request's own title; the model paraphrased it.
+def test_extractor_restating_this_turns_published_title_does_not_mint_a_second_tile(tmp_path):
+    # Hub chat ..67cb2d: the reply bolded the producer request's own title; the model paraphrased it. The
+    # producer published it in this turn (server-recorded), so the reply relays it.
     store, ledger = env(tmp_path)
     title = 'Approve the notify fix (accept not-found exit 1 + regression test)?'
-    store.create(OWNER, approval(title))
-    out = reply(store, ledger, f'**{title}**\n\nThe plan is in the request.', [{
-        'text': 'Approve the notify fix (exit-1 not-found handling, regression tests)', 'kind': 'approve',
-        'verbatim_span': f'**{title}**', 'options': []}])
+    r = store.create(OWNER, approval(title))
+    step = [{'text': 'Approve the notify fix (exit-1 not-found handling, regression tests)', 'kind': 'approve',
+             'verbatim_span': f'**{title}**', 'options': []}]
+    out = reply(store, ledger, f'**{title}**\n\nThe plan is in the request.', step, turn={r['requestId']})
     assert len(live(store)) == 1 and out['steps'] == []
 
 
-def test_extractor_choice_menu_of_the_open_approval_is_not_a_second_ask(tmp_path):
+def test_extractor_same_title_as_an_earlier_turns_request_is_its_own_ask(tmp_path):
+    # Same text, but the request was published in an earlier turn and the model named no repeat: a title is not
+    # provenance, so this is a distinct request and the original is untouched.
+    store, ledger = env(tmp_path)
+    title = 'Approve the notify fix (accept not-found exit 1 + regression test)?'
+    r = store.create(OWNER, approval(title))
+    out = reply(store, ledger, f'**{title}**\n\nThe plan is in the request.', [{
+        'text': 'Approve the notify fix (exit-1 not-found handling, regression tests)', 'kind': 'approve',
+        'verbatim_span': f'**{title}**', 'options': []}])
+    assert len(live(store)) == 2 and len(out['steps']) == 1 and out['steps'][0]['requestId'] != r['requestId']
+    assert store.get(OWNER, r['requestId']) == r
+
+
+def test_extractor_choice_menu_of_this_turns_approval_is_not_a_second_ask(tmp_path):
     # Same chat: "**Your choices:** Approve fix / Change plan / Decline" became its own choice tile.
     store, ledger = env(tmp_path)
-    store.create(OWNER, approval('Approve the notify fix?', labels=('Approve fix', 'Change plan', 'Decline')))
+    r = store.create(OWNER, approval('Approve the notify fix?', labels=('Approve fix', 'Change plan', 'Decline')))
     text = ('**Your choices:**\n- **Approve fix:** an agent does steps 1-6.\n- **Change plan:** tell me what to '
             'change.\n- **Decline:** nothing changes.')
-    reply(store, ledger, text, [{'text': 'Choose: approve fix, change plan, or decline the notify repair',
-                                 'kind': 'choose', 'verbatim_span': '**Your choices:**',
-                                 'options': ['Approve fix', 'Change plan', 'Decline']}])
+    menu = [{'text': 'Choose: approve fix, change plan, or decline the notify repair',
+             'kind': 'choose', 'verbatim_span': '**Your choices:**',
+             'options': ['Approve fix', 'Change plan', 'Decline']}]
+    reply(store, ledger, text, menu, turn={r['requestId']})
     assert len(live(store)) == 1
+    # Same labels, but the approval came from an earlier turn: the menu is not proven to be its menu.
+    reply(store, ledger, text, menu)
+    assert len(live(store)) == 2
 
 
 def test_extractor_two_readings_of_one_reminder_sentence_mint_nothing(tmp_path):
     # Same chat, 21:39: one sentence produced an approve AND a choose step next to the open approval.
     store, ledger = env(tmp_path)
-    store.create(OWNER, approval('Approve the notify fix (accept not-found exit 1 + regression tests)?'))
+    r = store.create(OWNER, approval('Approve the notify fix (accept not-found exit 1 + regression tests)?'))
     span = 'The fix to `notify.py` is still waiting for your approval.'
-    reply(store, ledger, "I've updated the plan. " + span, [
+    steps = [
         {'text': 'Approve the notify fix (accept not-found exit 1 + regression tests)', 'kind': 'approve',
          'verbatim_span': span, 'options': []},
         {'text': 'Choose whether to approve the notify repair, change the plan, or decline it', 'kind': 'choose',
-         'verbatim_span': span, 'options': ['Approve', 'Change the plan', 'Decline']}])
+         'verbatim_span': span, 'options': ['Approve', 'Change the plan', 'Decline']}]
+    reply(store, ledger, "I've updated the plan. " + span, steps, turn={r['requestId']})
     assert len(live(store)) == 1
+
+
+def test_two_readings_of_one_new_sentence_mint_one_tile(tmp_path):
+    # No open request to relay: the approve reading mints one tile and the menu reading of the SAME sentence in
+    # the same reply lands on it (exact sentence provenance), not on a second tile.
+    store, ledger = env(tmp_path)
+    span = 'The fix to `notify.py` needs your approval before I run it.'
+    out = reply(store, ledger, "I've drafted the plan. " + span, [
+        {'text': 'Approve the notify fix', 'kind': 'approve', 'verbatim_span': span, 'options': []},
+        {'text': 'Choose whether to approve the notify repair, change the plan, or decline it', 'kind': 'choose',
+         'verbatim_span': span, 'options': ['Approve', 'Change the plan', 'Decline']}])
+    assert len(live(store)) == 1 and len({s['id'] for s in out['steps']}) == 1
 
 
 def test_extractor_model_marked_repeat_is_not_minted_and_prompt_lists_open_requests(tmp_path):
@@ -239,13 +279,15 @@ def test_gate_still_holds_an_approval_ask_with_no_published_plan(plugin, monkeyp
 
 # ---- tool path (action_request) ---------------------------------------------------------------------------
 
-def test_tool_reask_with_the_same_title_and_plan_revises_the_open_request(plugin, tmp_path):
+def test_tool_exact_retry_returns_the_open_request_unchanged(plugin, tmp_path):
+    # A lost response / retried tool call re-sends the identical request: nothing new, no new revision.
     first = publish(plugin, {'request': payload_of(approval('Approve the notify fix?'))})['request']
     again = publish(plugin, {'request': payload_of(approval('Approve the notify fix?'))})
     store = plugin.core.ActionStore()
     assert [r['requestId'] for r in live(store)] == [first['requestId']]
-    assert again['request']['requestId'] == first['requestId'] and again['request']['revision'] == 2
-    assert 'revised' in again['note'] and first['requestId'] in again['note']
+    assert again['request']['requestId'] == first['requestId'] and again['request']['revision'] == 1
+    assert 'Nothing new' in again['note'] and first['requestId'] in again['note']
+    assert not store.get(OWNER, first['requestId']).get('resolution')  # a retry is never a decision
 
 
 def test_tool_same_title_with_a_different_complete_plan_keeps_both_and_says_so(plugin):
@@ -263,21 +305,88 @@ def test_tool_short_generic_titles_are_never_folded(plugin):
     assert len(live(plugin.core.ActionStore())) == 2
 
 
-def test_tool_reask_collapses_existing_duplicates_and_keeps_extracted_aliases(plugin, tmp_path):
-    store, ledger = plugin.core.ActionStore(), plugin.core.Ledger()
+def extracted(plugin, store, title, session='session-a'):
+    step = {'text': title, 'kind': 'approve', 'verbatim_span': title, 'options': [], 'session': session,
+            'id': plugin.core.new_step_id(), 'status': 'open', 'created': 1, 'paragraph': title}
+    owner = dict(OWNER, storedSessionId=session)
+    return plugin.core.ActionStore.create(store, owner, plugin.core.legacy_request(owner, step, dict(
+        gatewayId=OWNER['gatewayId'], profile='default', type='user_step', id=step['id'])))
+
+
+def test_tool_same_title_as_extracted_planless_requests_is_a_separate_request(plugin, tmp_path):
+    # Was: the publish folded into an extracted/plan-less request by normalized title and withdrew the others
+    # (__init__ fold). An equal title proves nothing: both extracted requests stay open and untouched.
+    store = plugin.core.ActionStore()
     title = 'Approve the notify fix?'
-    for _ in range(2):  # two extracted duplicates, as the extractor left them before this fix
-        step = {'text': title, 'kind': 'approve', 'verbatim_span': title, 'options': [], 'session': 'session-a',
-                'id': plugin.core.new_step_id(), 'status': 'open', 'created': 1, 'paragraph': title}
-        plugin.core.ActionStore.create(store, OWNER, plugin.core.legacy_request(OWNER, step, dict(
-            gatewayId=OWNER['gatewayId'], profile='default', type='user_step', id=step['id'])))
-    older, newer = live(store)
-    out = publish(plugin, {'request': payload_of(approval(title, markdown='The full exact plan.'))})['request']
-    assert out['requestId'] == newer['requestId'] and out['scope']['complete'] and out['aliases'] == newer['aliases']
-    assert [r['requestId'] for r in live(store)] == [newer['requestId']]
-    gone = store.view(OWNER, older['requestId'])
-    assert gone['state'] == 'withdrawn' and newer['requestId'] in gone['withdrawal']['reason']
-    assert 'resolution' not in gone  # supersede is not a decision
+    older, newer = extracted(plugin, store, title), extracted(plugin, store, title)
+    out = publish(plugin, {'request': payload_of(approval(title, markdown='The full exact plan.'))})
+    assert out['request']['requestId'] not in (older['requestId'], newer['requestId'])
+    assert {older['requestId'], newer['requestId']} <= set(out['note'].split(': ', 1)[1].replace('.', ' ').replace(',', ' ').split())
+    assert store.get(OWNER, older['requestId']) == older and store.get(OWNER, newer['requestId']) == newer
+    assert len(live(store)) == 3 and all(not r.get('resolution') for r in store.requests(OWNER))
+
+
+def test_tool_citing_the_extracted_step_revises_that_request_only(plugin, tmp_path):
+    # Provenance: scope.sourceRefs names the exact qualified user_step of ONE extracted request. That request
+    # gets the plan (aliases kept); the other same-title request is left alone, never withdrawn.
+    store = plugin.core.ActionStore()
+    title = 'Approve the notify fix?'
+    older, newer = extracted(plugin, store, title), extracted(plugin, store, title)
+    ref = next(a for a in older['aliases'] if a['type'] == 'user_step')
+    body = payload_of(approval(title, markdown='The full exact plan.'))
+    body['scope'] = dict(body['scope'], sourceRefs=[ref])
+    out = publish(plugin, {'request': body})
+    assert out['request']['requestId'] == older['requestId'] and out['request']['scope']['complete']
+    assert ref in out['request']['aliases'] and newer['requestId'] in out['note']
+    assert store.get(OWNER, newer['requestId']) == newer
+    assert not store.get(OWNER, older['requestId']).get('resolution')
+
+
+@pytest.mark.parametrize('field,value', [('gatewayId', 'other-gateway'), ('profile', 'other-profile'),
+                                         ('id', 'us_000000000000')])
+def test_tool_a_ref_from_another_gateway_profile_or_step_folds_nothing(plugin, field, value):
+    store = plugin.core.ActionStore()
+    title = 'Approve the notify fix?'
+    target = extracted(plugin, store, title)
+    ref = dict(next(a for a in target['aliases'] if a['type'] == 'user_step'), **{field: value})
+    body = payload_of(approval(title, markdown='The full exact plan.'))
+    body['scope'] = dict(body['scope'], sourceRefs=[ref])
+    out = publish(plugin, {'request': body})
+    assert out['request']['requestId'] != target['requestId'], out
+    assert store.get(OWNER, target['requestId']) == target
+
+
+def test_tool_extracted_tile_in_another_session_is_never_a_fold_target(plugin):
+    store = plugin.core.ActionStore()
+    title = 'Approve the notify fix?'
+    other = extracted(plugin, store, title, session='session-b')
+    ref = next(a for a in other['aliases'] if a['type'] == 'user_step')
+    body = payload_of(approval(title, markdown='The full exact plan.'))
+    body['scope'] = dict(body['scope'], sourceRefs=[ref])
+    out = publish(plugin, {'request': body})
+    assert out.get('request', {}).get('requestId') != other['requestId'], out
+    assert store.get(dict(OWNER, storedSessionId='session-b'), other['requestId']) == other
+
+
+def test_published_then_relayed_through_the_real_hooks_is_one_tile(plugin, monkeypatch):
+    # Real producer + transform path: the tool publishes in this turn, the final reply restates it, and the
+    # turn's recorded provenance keeps it to one request. The next turn's same-title ask is a separate request.
+    title = 'Approve deploying build 412 to the test environment'
+    monkeypatch.setattr(plugin, '_eligible', lambda *a, **k: True)
+    monkeypatch.setattr(plugin, '_framed', lambda *a: True)
+    monkeypatch.setattr(plugin.core, '_worth_asking', lambda *a: True)
+    plugin.pre_llm_call(session_id='session-a', user_message='deploy it', platform='cli')
+    first = publish(plugin, {'request': payload_of(approval(title))})['request']
+    step = {'text': title, 'kind': 'approve', 'verbatim_span': f'**{title}?**', 'options': []}
+    monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps({'steps': [step], 'resolved': []}))
+    plugin.transform_llm_output(response_text=f'**{title}?**\n\nPick in For you.', session_id='session-a',
+                                platform='cli')
+    store = plugin.core.ActionStore()
+    assert [r['requestId'] for r in live(store)] == [first['requestId']]
+    plugin.pre_llm_call(session_id='session-a', user_message='and the other env?', platform='cli')
+    plugin.transform_llm_output(response_text=f'**{title}?**\n\nThis one is for staging.', session_id='session-a',
+                                platform='cli')
+    assert len(live(store)) == 2 and all(not r.get('resolution') for r in store.requests(OWNER))
 
 
 def test_tool_reask_never_lands_on_a_decided_or_card_bound_request(plugin):

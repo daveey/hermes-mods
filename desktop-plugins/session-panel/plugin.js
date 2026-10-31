@@ -302,7 +302,9 @@ export function Panel() {
   const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
   const finished = doneState.scope === scope ? doneState.rows : null
   const n = counts(sorted, { asks, done: finished ? finished.length : null })
-  const legacy = US?.Strip ? jsx(US.Strip, {}) : null
+  // A legacy card listed above as an unasked row is the same exact qualified card the strip's "Earlier asks"
+  // would show again: hand those identities to the strip so each card renders once. Exact identity only.
+  const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }) : null
   const anything = asks || sorted.unasked.length || chips.length || finished?.length || US?.snapshot?.ledger?.steps?.length || US?.snapshot?.issues?.length
   if (!anything) return null
   const attention = attentionKeys(asks, sorted)

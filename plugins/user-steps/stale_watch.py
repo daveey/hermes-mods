@@ -50,11 +50,13 @@ def card(item):
 
 def dup_card(d):
     lines = '\n'.join('- ' + ', '.join(g) for g in d['groups'])
-    body = (f"A session holds more than one open user-steps request for the same decision (the one-tile rule, "
-            f"core.same_open_ask, was bypassed: a regression).\n\n- Namespace: {d['namespace']}\n"
-            f"- Session: {d['session']}\n- Duplicate groups (request ids, oldest first):\n{lines}\n\n"
-            f"Find which path minted the extra request (extractor, action_request tool, plan gate) and fix it, "
-            f"then withdraw the newer duplicates with a reason. This watcher never withdraws anything.\n"
+    body = (f"A session holds more than one open user-steps request that look like the same decision (the "
+            f"core.restates_open_ask detector: title, word or menu overlap). Overlap is NOT identity: two requests "
+            f"with the same title can be different decisions.\n\n- Namespace: {d['namespace']}\n"
+            f"- Session: {d['session']}\n- Possible duplicate groups (request ids, oldest first):\n{lines}\n\n"
+            f"Trace each request to its source (originating reply, tool call, notice). Withdraw a newer one with a "
+            f"reason only when that source proves it re-asks the same decision; otherwise leave both open. "
+            f"This watcher never withdraws anything.\n"
             f"Source: plugins/user-steps/stale_watch.py. Done when /ping stale.duplicateOpen no longer counts "
             f"this session.")
     return {'title': f"user-steps: duplicate open requests in session {d['session']}", 'body': body,
@@ -64,11 +66,11 @@ def dup_card(d):
 def cross_dup_card(p):
     a, b = p['ids']
     sessions = ', '.join(p['sessions'])
-    body = (f"Two sessions on this gateway hold open user-steps requests for the same decision "
-            f"(core.same_open_ask matched them across chats). A status reply in one chat can restate the "
-            f"other's ask and mint a copy.\n\n- Namespace: {p['namespace']}\n"
+    body = (f"Two sessions on this gateway hold open user-steps requests that look like the same decision "
+            f"(the core.restates_open_ask detector; overlap is not identity).\n\n- Namespace: {p['namespace']}\n"
             f"- Sessions: {sessions}\n- Request ids: {a}, {b}\n\n"
-            f"Find which path minted the extra request and withdraw the newer duplicate with a reason. "
+            f"Trace both to their source. Withdraw the newer one with a reason only when its source proves it "
+            f"relays the other's ask (e.g. a notice relay); otherwise leave both open. "
             f"This watcher never withdraws anything.\n"
             f"Source: plugins/user-steps/stale_watch.py.")
     return {'title': 'user-steps: duplicate open requests across sessions', 'body': body,

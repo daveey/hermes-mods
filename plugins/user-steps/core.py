@@ -1229,15 +1229,19 @@ NO_LONGER_NEEDED = "No longer needed"
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
                   ledger: Ledger, cards: Optional[Cards] = None, framed: bool = True,
                   session_ref: str = "", now: Optional[float] = None,
-                  action_store=None, action_owner=None) -> dict:
-    """Run one final reply through the pipeline. Returns {text (None = unchanged), steps, resolved, source}."""
+                  action_store=None, action_owner=None, turn_requests=()) -> dict:
+    """Run one final reply through the pipeline. Returns {text (None = unchanged), steps, resolved, source}.
+
+    ``turn_requests``: ids of requests the producer tool published or revised for this session in the turn
+    this reply ends (server-recorded provenance). Only those can absorb a title or menu restatement."""
     # A positive retirement finding must survive later persistence/card failures.
     # Local state is not model-supplied and grants no reopen/execution authority.
     retired = []
     try:
         return _process_reply(reply, session_id, user_msg=user_msg, llm=llm, ledger=ledger,
                               cards=cards, framed=framed, session_ref=session_ref, now=now,
-                              retired=retired, action_store=action_store, action_owner=action_owner)
+                              retired=retired, action_store=action_store, action_owner=action_owner,
+                              turn_requests=turn_requests)
     except Exception:
         if not retired:
             raise
@@ -1248,7 +1252,7 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
 def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[LLM],
                    ledger: Ledger, cards: Optional[Cards], framed: bool,
                    session_ref: str, now: Optional[float], retired: list,
-                   action_store=None, action_owner=None) -> dict:
+                   action_store=None, action_owner=None, turn_requests=()) -> dict:
     """Reconcile exact actions under the source lock before creation/publication.
 
     Resolution is suppression-only. Neither model metadata nor a later repeated
@@ -1309,7 +1313,9 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             # The prompt's bounded ELSEWHERE list is advisory, not a publication guard.
             # Recheck all other-session titles after extraction; suppression only, never
             # borrow their ownership, frame their ids, or decide/revise their requests.
-            other_keys = elsewhere_open_keys(action_store, action_owner)
+            # Relay provenance required: only a turn a runtime notice started relays another chat's ask. In a
+            # turn the user started, an equal title is no source association: that ask stays its own request.
+            other_keys = elsewhere_open_keys(action_store, action_owner) if _runtime_message(user_msg) else set()
             mapped: dict[str, dict] = {}
             # Retain old label dedup only for genuinely new actions, never use it
             # as an authority binding or to bypass exact retirement/reuse.
@@ -1322,7 +1328,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                         or (len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5 and span in other_keys)):
                     continue
                 if action_store is not None:
-                    same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped)
+                    same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped, turn_requests)
                     if same is not None:
                         # A re-ask of an open tile: frame it onto that tile, never mint a second one.
                         mapped.setdefault(ask_key(candidate["verbatim_span"]), same)
@@ -1482,8 +1488,67 @@ def open_asks(store, owner, steps=()) -> list[dict]:
             if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
 
 
-def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None) -> Optional[dict]:
-    """The open ask ``candidate`` (an extracted step) repeats, or None (it is a new ask).
+def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None,
+                  turn_requests=()) -> Optional[dict]:
+    """The open ask ``candidate`` (an extracted step) provably repeats, or None (it is its own ask).
+
+    Exact provenance only, never title, word or menu similarity on its own:
+    - the model marked this exact sentence as a repeat of an open id (request id or extracted step id);
+    - the evidence sentence (a specific one) is the sentence an open extracted ask came from in an EARLIER reply;
+    - the request was published or revised by the producer tool in this very turn (``turn_requests``,
+      server-recorded) and the candidate restates its title, or is the approve/change/decline menu of the only
+      such approval (or its sentence was already read as that approval in this reply).
+    Two open requests with the same title are different requests: an equal title alone maps onto neither, and
+    a card both name is context, not identity. With several candidates the newest open ask wins."""
+    text, span = ask_key(candidate.get('text')), ask_key(candidate.get('verbatim_span'))
+    long_span = len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5
+    turn = {str(x) for x in turn_requests or ()}
+
+    def pick(xs):
+        return xs[-1] if xs else None
+
+    ids = {}
+    for a in asks:  # the model sees extracted tiles under their ledger step id, producer ones under the request id
+        ids[a['id']] = a
+        if a['step'] is not None and a['step'].get('id'):
+            ids[a['step']['id']] = a
+    if len(span) >= _ASK_KEY_MIN:
+        for r in repeats or ():
+            if isinstance(r, dict) and r.get('id') in ids and ask_key(r.get('verbatim_span')) == span:
+                return ids[r['id']]
+    # One sentence can carry two different asks: the same-sentence rule is for LATER replies only.
+    hit = pick([a for a in asks if long_span and a['step'] is not None and not a.get('fresh')
+                and span == ask_key(a['step'].get('verbatim_span'))])
+    if hit:
+        return hit
+    mine = [a for a in asks if a['id'] in turn]
+    hit = pick([a for a in mine if (len(text) >= _ASK_KEY_MIN and text == ask_key(a['title']))
+                or (long_span and span == ask_key(a['title']))])
+    if hit:
+        return hit
+    options = [str(o) for o in candidate.get('options') or []]
+    if candidate.get('kind') == 'choose' and _MENU.search(' '.join([str(candidate.get('text') or '')] + options)):
+        # The same sentence already read as an approval in this reply (minted from it just now, or mapped by one
+        # of the provenance rules above): one sentence, one approval. ``mapped`` only ever holds such entries.
+        prior = (mapped or {}).get(span)
+        if prior is not None and prior['kind'] == 'approval':
+            return prior
+        approvals = [a for a in mine if a['kind'] == 'approval']
+        if len(approvals) == 1:
+            a = approvals[0]
+            labels = {ask_key(x) for x in a.get('labels') or []}
+            topic = _words(candidate.get('text'), _MENU_WORDS)
+            if (len(labels & {ask_key(o) for o in options}) >= 2
+                    and (not topic or _overlap(topic, _words(a['title'])) >= 0.5)):
+                return a
+    return None
+
+
+def restates_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None) -> Optional[dict]:
+    """Detector only (chat.py duplicate watchers): the open ask ``candidate`` looks like it restates, or None.
+
+    NEVER an identity: nothing may be framed onto, folded into or suppressed by this match, because title,
+    word and menu overlap are not provenance. Identity is ``same_open_ask``. Heuristics kept for detection:
 
     Same decision when: its text IS an open ask's title; its evidence sentence (a specific one) is an open
     ask's title or the sentence an open ask was extracted from in an earlier reply; the model marked that
