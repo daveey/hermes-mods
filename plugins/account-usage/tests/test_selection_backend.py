@@ -392,6 +392,106 @@ class Backend(unittest.TestCase):
             service.get('runtime-A')
         self.assertFalse((self.home/'account_usage_selection.sqlite3').exists())
 
+    # --- self-heal agent-c46bf512ae: a lease id missing from the registry killed every turn of the chat ---
+    def _registry(self):
+        from hermes_cli import active_sessions as registry
+        return registry, registry._state_path(self.home)
+
+    def _drop_registry_entry(self, lease):
+        """Simulate the unknown writer: the chat keeps its in-memory lease, the registry loses its entry."""
+        registry, path = self._registry()
+        entries = [e for e in registry._read_entries(path, strict=True) if e['lease_id'] != lease.lease_id]
+        registry._write_entries(path, entries)
+
+    def test_missing_lease_is_reregistered_for_the_same_writer(self):
+        lease = self.lease()
+        self._drop_registry_entry(lease)
+        with self.assertLogs(self.s.__name__, 'WARNING') as logs:
+            owner = self.s.resolve_owner('runtime-A', profile_home=self.home, server=self.server)
+        self.assertEqual(owner.runtime_id, 'runtime-A')
+        self.assertIn('selection_lease_missing', '\n'.join(logs.output))
+        registry, path = self._registry()
+        back = [e for e in registry._read_entries(path, strict=True) if e['lease_id'] == lease.lease_id]
+        self.assertEqual(len(back), 1)
+        self.assertEqual((back[0]['pid'], back[0]['session_id'], back[0]['metadata']['live_session_id']),
+                         (os.getpid(), 'durable-A', 'runtime-A'))
+        # The restored entry is a real fence: another runtime is refused the chat.
+        _lease, refusal = try_acquire_active_session(session_id='durable-A', surface='desktop', config={},
+            registry_home=self.home, metadata={'live_session_id': 'runtime-B'})
+        self.assertIsNotNone(refusal)
+
+    def test_missing_lease_with_same_writer_replacement_is_owned(self):
+        lease = self.lease()
+        # Same pid + same live session id re-acquired: core swapped the entry for a new lease id.
+        again, refusal = try_acquire_active_session(session_id='durable-A', surface='desktop', config={},
+            registry_home=self.home, metadata={'live_session_id': 'runtime-A'})
+        self.assertIsNone(refusal)
+        self.assertNotEqual(again.lease_id, lease.lease_id)
+        owner = self.s.resolve_owner('runtime-A', profile_home=self.home, server=self.server)
+        self.assertEqual(owner.runtime_id, 'runtime-A')
+
+    def test_missing_lease_with_a_different_owner_still_refuses(self):
+        lease = self.lease()
+        registry, path = self._registry()
+        entries = registry._read_entries(path, strict=True)
+        entries[0].update(lease_id='other-lease', metadata={'live_session_id': 'runtime-B'})
+        registry._write_entries(path, entries)
+        with self.assertRaises(self.s.SelectionRejected):
+            self.s.resolve_owner('runtime-A', profile_home=self.home, server=self.server)
+        self.assertEqual([e['lease_id'] for e in registry._read_entries(path, strict=True)], ['other-lease'])
+
+    def test_unrepairable_missing_lease_takes_the_default_route_without_failing_the_turn(self):
+        lease = self.lease()
+        self._drop_registry_entry(lease)
+        service = self.s.SelectionService(self.home, server=self.server)
+        with patch.object(self.s, '_recover_missing_lease', side_effect=OSError('registry write failed')), \
+             self.assertLogs(self.s.__name__, 'WARNING') as logs:
+            self.assertIsNone(service.consume_for_agent(self.agent))  # default route, no exception
+        self.assertIn('selection_lease_missing', '\n'.join(logs.output))
+
+    def test_unrepairable_missing_lease_still_refuses_a_queued_selection(self):
+        lease = self.lease()
+        row = entry(source='manual')
+        self.credentials([row.to_dict()])
+        from agent.account_usage_cache import _identity_id_for
+        service = self.s.SelectionService(self.home, server=self.server)
+        service.put('runtime-A', provider='anthropic', account_id=_identity_id_for('anthropic', row),
+                    expected_revision=0)
+        self._drop_registry_entry(lease)
+        with patch.object(self.s, '_recover_missing_lease', side_effect=OSError('registry write failed')):
+            with self.assertRaises(self.s.SelectionRejected):
+                service.consume_for_agent(self.agent)  # a chosen account is never silently ignored
+
+    def test_suspended_owner_keeps_its_registry_entry_through_every_prune_path(self):
+        """The investigation's hypothesis (a sleep/SIGSTOP lets another process prune a live owner) does not
+        hold: a stopped holder stays in the registry. Guards that invariant; the selection repair above covers
+        the entry going missing for any other reason."""
+        import signal
+        import subprocess
+        from hermes_cli import active_sessions as registry
+        code = ('import os,sys,time; import hermes_bootstrap\n'
+                'from hermes_cli.active_sessions import try_acquire_active_session as t\n'
+                f'l, r = t(session_id="held", surface="desktop", config={{}}, registry_home={str(self.home)!r}, '
+                'metadata={"live_session_id": "rt"}, track_liveness=True)\n'
+                'assert r is None, r\nprint("ok", flush=True)\ntime.sleep(60)\n')
+        proc = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, text=True,
+                                env={**os.environ, 'PYTHONPATH': os.pathsep.join(p for p in sys.path if p)})
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), 'ok')
+        os.kill(proc.pid, signal.SIGSTOP)
+        self.addCleanup(os.kill, proc.pid, signal.SIGCONT)
+        path = registry._state_path(self.home)
+        before = {e['lease_id'] for e in registry._read_entries(path, strict=True)}
+        registry.active_session_registry_snapshot(self.home, strict=True)
+        registry.release_orphaned_leases(set())
+        with registry.active_session_liveness_guard('held', registry_home=self.home, own_live_lease_ids=set()) as held:
+            self.assertTrue(held)
+        _lease, refusal = try_acquire_active_session(session_id='held', surface='desktop', config={},
+            registry_home=self.home, metadata={'live_session_id': 'contender'})
+        self.assertIsNotNone(refusal)
+        self.assertEqual({e['lease_id'] for e in registry._read_entries(path, strict=True)}, before)
+
     def test_ambiguous_compression_siblings_are_not_aliases(self):
         self.lease()
         db = self.database()

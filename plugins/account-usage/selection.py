@@ -583,6 +583,61 @@ def _mirror_route(home, session):
                            base_url=config['base_url'])
 
 
+LEASE_UNAVAILABLE = 'Chat ownership lease is unavailable'
+
+
+class LeaseMissing(SelectionRejected):
+    """The chat's own lease is gone from the registry, no other writer holds the session, and the registry
+    could not be repaired. Only a queued selection must refuse on it; otherwise the call takes the default
+    route (``consume_for_agent``)."""
+
+
+def _lease_holders(entries, session_ids):
+    return [f"pid={e.get('pid')} lease={str(e.get('lease_id') or '')[:8]} surface={e.get('surface')} "
+            f"live={(e.get('metadata') or {}).get('live_session_id')}"
+            for e in entries if str(e.get('session_id') or '') in session_ids]
+
+
+def _recover_missing_lease(registry, home, lease, runtime_id, entries):
+    """The chat's live lease id is absent from the registry (self-heal agent-c46bf512ae: every later turn of the
+    chat died on it, and selection only picks which account pays). Account selection is not the ownership
+    authority, so it repairs the bookkeeping instead of failing the turn:
+    - a same-writer entry (this pid + this runtime id, core's ``_is_same_writer``) for the session proves
+      ownership: core swapped the lease id under a stale session record;
+    - no entry for the session: re-register this exact lease under the registry lock (restores the fence);
+    - a different writer holds the session: still refused by the caller (empty result).
+    Returns the matching entries ([] = unrecoverable). Logs ``selection_lease_missing`` with the holders, so the
+    writer that dropped it can be found from the log."""
+    import logging
+    import os
+    from pathlib import Path
+    log = logging.getLogger(__name__)
+    sids = {str(lease.session_id)}
+    held = [e for e in entries if str(e.get('session_id') or '') in sids]
+    same = [e for e in held if e.get('pid') == os.getpid()
+            and (e.get('metadata') or {}).get('live_session_id') == runtime_id]
+    tag = f'session={lease.session_id} runtime={runtime_id} lease={str(lease.lease_id)[:8]} pid={os.getpid()}'
+    if held:
+        log.warning('selection_lease_missing: %s; registry holders: %s -> %s', tag, _lease_holders(held, sids),
+                    'same writer, owned' if len(held) == 1 and same else 'other owner, refused')
+        return same if len(held) == 1 else []
+    state_path, lock_path = registry._lease_paths(lease)
+    if Path(state_path).resolve() != Path(registry._state_path(home)).resolve():
+        log.warning('selection_lease_missing: %s; lease is pinned to another registry %s', tag, state_path)
+        return []
+    with registry._FileLock(lock_path, timeout=5):
+        current = registry._read_entries(state_path, strict=True)
+        back = [e for e in current if e.get('lease_id') == lease.lease_id]
+        if back or any(str(e.get('session_id') or '') in sids for e in current):
+            return back  # raced with a writer: decide on what is there now
+        entry = registry._lease_entry(lease_id=lease.lease_id, session_id=lease.session_id, surface=lease.surface,
+                                      metadata={'live_session_id': runtime_id},
+                                      track_liveness=bool(getattr(lease, 'track_liveness', False)))
+        registry._write_entries(state_path, [*current, entry])
+    log.warning('selection_lease_missing: %s; no registry holder, re-registered the lease', tag)
+    return [entry]
+
+
 def _resolve_owner_locked(runtime_id, *, profile_home, server, agent=None):
     import os
     from pathlib import Path
@@ -625,8 +680,17 @@ def _resolve_owner_locked(runtime_id, *, profile_home, server, agent=None):
             raise SelectionRejected('Chat ownership lease is not current')
         lease_id = lease.lease_id.removeprefix('borrowed:') if borrowed else lease.lease_id
         matches = [e for e in entries if e.get('lease_id') == lease_id]
+        if not matches and not borrowed:
+            try:
+                matches = _recover_missing_lease(registry, home, lease, runtime_id, entries)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    'selection_lease_missing: session=%s runtime=%s; registry repair failed: %s',
+                    lease.session_id, runtime_id, exc)
+                raise LeaseMissing(LEASE_UNAVAILABLE) from None
         if len(matches) != 1:
-            raise SelectionRejected('Chat ownership lease is unavailable')
+            raise SelectionRejected(LEASE_UNAVAILABLE)
         holder = matches[0]
         if (not borrowed and holder.get('pid') != os.getpid()
                 or holder.get('metadata', {}).get('live_session_id') != runtime_id
@@ -1256,18 +1320,31 @@ class SelectionService:
         refusal, not permission to send on some other account. Caller must leave
         this method before invoking downstream or constructing request clients.
         """
-        with owner_scope(profile_home=self.home, server=self.server, agent=agent) as owner:
-            store = self.store()
-            if store.invalidate_route(owner.key, model=owner.model):
-                raise SelectionRejected('Chat provider or model changed; account selection was rejected')
-            row = store.consume(owner.key, model=owner.model)
-            if row is None:
-                return None
-            try:
-                return read_snapshot(owner, row['account_id'])
-            except Exception:
-                store.reject_consumed(owner.key, revision=row['revision'] + 1)
-                raise SelectionRejected('Selected account is no longer available; refresh usage and choose again') from None
+        try:
+            with owner_scope(profile_home=self.home, server=self.server, agent=agent) as owner:
+                return self._consume(owner)
+        except LeaseMissing:  # raised only by owner resolution, never by _consume
+            from pathlib import Path
+            path = Path(self.home) / 'account_usage_selection.sqlite3'
+            if path.exists() and PendingStore(path).has_pending(self.home):
+                raise  # a chosen account must never be silently ignored
+            import logging
+            logging.getLogger(__name__).warning(
+                'selection_lease_missing: no queued selection in %s; default route for this call', self.home)
+            return None
+
+    def _consume(self, owner):
+        store = self.store()
+        if store.invalidate_route(owner.key, model=owner.model):
+            raise SelectionRejected('Chat provider or model changed; account selection was rejected')
+        row = store.consume(owner.key, model=owner.model)
+        if row is None:
+            return None
+        try:
+            return read_snapshot(owner, row['account_id'])
+        except Exception:
+            store.reject_consumed(owner.key, revision=row['revision'] + 1)
+            raise SelectionRejected('Selected account is no longer available; refresh usage and choose again') from None
 
     def put(self, runtime_id, *, provider, account_id, expected_revision):
         if self.home in _install_failures:
